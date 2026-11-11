@@ -231,7 +231,19 @@ class TestGitSource(FrappeTestCase):
 
 	def test_git_only_read_subcommands_and_safe_flags(self):
 		with patch(RUN_PATH, return_value=completed("ok")) as run:
-			for sub in ("commit", "push", "config", "checkout", "reset", "", None, "LOG", ["log"]):
+			for sub in (
+				"commit",
+				"push",
+				"config",
+				"checkout",
+				"reset",
+				"show",
+				"diff",
+				"",
+				None,
+				"LOG",
+				["log"],
+			):
 				self.assertFalse(self.git(sub)["ok"], sub)
 			for flag in (
 				"--output=/tmp/x",
@@ -248,7 +260,7 @@ class TestGitSource(FrappeTestCase):
 				"-c",
 				"-ccore.pager=sh",
 			):
-				for sub in ("log", "show", "diff", "blame"):
+				for sub in ("log", "blame"):
 					result = self.git(sub, [flag])
 					self.assertFalse(result["ok"], (sub, flag))
 					self.assertTrue(result["reason"])
@@ -256,9 +268,9 @@ class TestGitSource(FrappeTestCase):
 			self.assertFalse(self.git("log", ["-n", "1", "-c", "--", "src/a.py"])["ok"])
 			run.assert_not_called()
 
-			for sub in ("log", "show", "diff", "blame"):
-				self.assertTrue(self.git(sub, ["--stat", "-n", "3"])["ok"], sub)
-			self.assertEqual(run.call_count, 4)
+			self.assertTrue(self.git("log", ["--stat", "-n", "3"])["ok"])
+			self.assertTrue(self.git("blame", ["src/a.py"])["ok"])
+			self.assertEqual(run.call_count, 2)
 
 	def test_git_refuses_abbreviated_and_path_carrying_options(self):
 		with patch(RUN_PATH, return_value=completed("ok")) as run:
@@ -279,11 +291,103 @@ class TestGitSource(FrappeTestCase):
 				"-wO../../outside/x",
 				"-pw",
 			):
-				for sub in ("log", "show", "diff", "blame"):
+				for sub in ("log", "blame"):
 					self.assertFalse(self.git(sub, [flag, "--", "src/a.py"])["ok"], (sub, flag))
 			run.assert_not_called()
 			for flag in ("--oneline", "--stat", "-n3", "--max-count=5", "--author=bob", "-n"):
 				self.assertTrue(self.git("log", [flag])["ok"], flag)
+
+	def test_git_show_and_diff_refused(self):
+		with patch(RUN_PATH, return_value=completed("ok")) as run:
+			for sub in ("show", "diff"):
+				for args in (
+					["HEAD"],
+					["--stat"],
+					["HEAD:src/a.py"],
+					["src/a.py"],
+					["--", "src/a.py"],
+					None,
+				):
+					result = self.git(sub, args)
+					self.assertFalse(result["ok"], (sub, args))
+					self.assertTrue(result["reason"])
+			run.assert_not_called()
+
+	def test_git_log_refuses_patch_printing_flags(self):
+		with patch(RUN_PATH, return_value=completed("ok")) as run:
+			for flag in (
+				"-p",
+				"-u",
+				"--patch",
+				"--pat",
+				"--patc",
+				"--patch-with-stat",
+				"--patch-with-raw",
+				"-U3",
+				"-U",
+				"--unified=3",
+				"--full-diff",
+				"--word-diff",
+				"--word-diff=color",
+				"--cc",
+				"-c",
+				"-m",
+				"--diff-merges=first-parent",
+				"--diff-merges",
+				"--diff",
+				"--di",
+			):
+				result = self.git("log", [flag])
+				self.assertFalse(result["ok"], flag)
+				self.assertFalse(self.git("log", [flag, "--", "src/a.py"])["ok"], flag)
+			run.assert_not_called()
+
+	def test_git_refuses_glob_pathspecs(self):
+		with patch(RUN_PATH, return_value=completed("ok")) as run:
+			for bad in (
+				["--", "src/*.py"],
+				["--", "src/?.py"],
+				["--", "src/[a].py"],
+				["--", "*"],
+				["src/*.py"],
+				["*.json"],
+				["HEAD:src/*.py"],
+				[":(glob)src/**"],
+				[":!src/a.py"],
+			):
+				self.assertFalse(self.git("log", bad)["ok"], bad)
+			self.assertFalse(self.git("blame", ["src/*.py"])["ok"])
+			run.assert_not_called()
+
+	def test_git_log_checks_nonexistent_pathspec_against_forbidden_names(self):
+		with patch(RUN_PATH, return_value=completed("ok")) as run:
+			self.assertFalse(self.git("log", ["--", "old/secret.py"])["ok"])
+			self.assertFalse(self.git("log", ["old/password.py"])["ok"])
+			run.assert_not_called()
+
+	def test_git_blame_takes_exactly_one_checked_file(self):
+		with patch(RUN_PATH, return_value=completed("ok")) as run:
+			for bad in (
+				None,
+				[],
+				["--porcelain"],
+				["--"],
+				["src/a.py", "src/a.py"],
+				["--", "src/a.py", "src/a.py"],
+				["HEAD", "src/a.py"],
+				["HEAD:src/a.py"],
+				["site_config.json"],
+				["src"],
+				["missing.py"],
+				["../../outside/x.py"],
+				["/etc/passwd"],
+				["-L1,2", "src/a.py"],
+			):
+				self.assertFalse(self.git("blame", bad)["ok"], bad)
+			run.assert_not_called()
+			self.assertTrue(self.git("blame", ["src/a.py"])["ok"])
+			self.assertTrue(self.git("blame", ["-w", "--line-porcelain", "--", "src/a.py"])["ok"])
+			self.assertEqual(run.call_count, 2)
 
 	def test_git_nonzero_exit_hides_stderr(self):
 		with patch(RUN_PATH, return_value=completed("", "fatal: secret-path-detail", 128)):
@@ -310,7 +414,7 @@ class TestGitSource(FrappeTestCase):
 				self.assertFalse(result["ok"], bad)
 			run.assert_not_called()
 			self.assertTrue(self.git("log", ["--", "src/a.py"])["ok"])
-			self.assertTrue(self.git("show", ["HEAD:src/a.py"])["ok"])
+			self.assertTrue(self.git("blame", ["--porcelain", "--", "src/a.py"])["ok"])
 			self.assertTrue(self.git("log", ["HEAD~2..HEAD"])["ok"])
 
 	def test_git_refuses_bad_repo_and_args(self):
@@ -332,7 +436,7 @@ class TestGitSource(FrappeTestCase):
 	def test_git_runs_with_timeout_list_args_no_shell(self):
 		with patch(RUN_PATH, return_value=completed("abc commit\n")) as run:
 			default = self.git("log")
-			diff = self.git("diff", ["--stat", "HEAD~1"])
+			stat = self.git("log", ["--stat", "HEAD~1"])
 			blame = self.git("blame", ["--", "src/a.py"])
 		self.assertEqual(default, {"ok": True, "output": "abc commit\n"})
 		calls = run.call_args_list
@@ -358,7 +462,7 @@ class TestGitSource(FrappeTestCase):
 				"--no-pager",
 				"-C",
 				self.repo,
-				"diff",
+				"log",
 				"--no-ext-diff",
 				"--no-textconv",
 				"--stat",
@@ -366,7 +470,7 @@ class TestGitSource(FrappeTestCase):
 			],
 		)
 		self.assertEqual(calls[2].args[0], ["git", "--no-pager", "-C", self.repo, "blame", "--", "src/a.py"])
-		self.assertTrue(diff["ok"] and blame["ok"])
+		self.assertTrue(stat["ok"] and blame["ok"])
 		for call in calls:
 			self.assertIsInstance(call.args[0], list)
 			self.assertEqual(call.kwargs["timeout"], 30)

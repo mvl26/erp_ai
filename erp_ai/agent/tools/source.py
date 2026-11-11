@@ -23,8 +23,8 @@ PATTERN_MIN_CHARS = 2
 PATTERN_MAX_CHARS = 200
 SKIPPED_DIRS = {"node_modules"}
 
-GIT_SUBCOMMANDS = {"log", "show", "diff", "blame"}
-GIT_NO_EXT_SUBCOMMANDS = {"diff", "show", "log"}
+GIT_SUBCOMMANDS = {"log", "blame"}
+GIT_NO_EXT_SUBCOMMANDS = {"log"}
 GIT_ALLOWED_FLAGS = {
 	"--oneline",
 	"--stat",
@@ -38,10 +38,6 @@ GIT_ALLOWED_FLAGS = {
 	"--decorate",
 	"--abbrev-commit",
 	"--follow",
-	"--patch",
-	"--porcelain",
-	"--line-porcelain",
-	"-p",
 	"-w",
 	"-n",
 	"--max-count",
@@ -50,7 +46,9 @@ GIT_ALLOWED_FLAGS = {
 	"--author",
 	"--date",
 }
+GIT_BLAME_FLAGS = {"--porcelain", "--line-porcelain", "-w"}
 GIT_COUNT_FLAG = re.compile(r"-n\d+")
+GIT_GLOB_CHARS = re.compile(r"[*?\[\]]")
 GIT_TIMEOUT_S = 30
 GIT_MAX_ARGS = 10
 GIT_OUTPUT_MAX_CHARS = 8000
@@ -183,13 +181,14 @@ def _git_repo(root, app):
 
 
 def _git_path_ok(root, repo, path):
-	if not path:
-		return True
+	"""A pathspec is safe when it has no glob/magic and passes resolve_safe_path like read_source."""
+	if not path or GIT_GLOB_CHARS.search(path):
+		return False
 	return resolve_safe_path(os.path.relpath(os.path.join(repo, path), root)) is not None
 
 
-def _git_args_ok(root, repo, git_args):
-	"""True when every option is on the exact-name allowlist and every path-like arg passes resolve_safe_path."""
+def _git_log_args_ok(root, repo, git_args):
+	"""True when every option is on the exact-name allowlist and every other arg passes the path check."""
 	only_paths = False
 	for arg in git_args:
 		if only_paths:
@@ -200,12 +199,34 @@ def _git_args_ok(root, repo, git_args):
 		elif arg.startswith("-"):
 			if arg.split("=", 1)[0] not in GIT_ALLOWED_FLAGS and not GIT_COUNT_FLAG.fullmatch(arg):
 				return False
-		elif ":" in arg:
-			if not _git_path_ok(root, repo, arg.split(":", 1)[1]):
-				return False
-		elif os.path.exists(os.path.join(repo, arg)) and not _git_path_ok(root, repo, arg):
+		elif arg.startswith(":") or GIT_GLOB_CHARS.search(arg):
+			return False
+		elif not _git_path_ok(root, repo, arg.split(":", 1)[1] if ":" in arg else arg):
 			return False
 	return True
+
+
+def _git_blame_args_ok(root, repo, git_args):
+	"""True for blame flags on the allowlist followed by exactly one readable file."""
+	files = []
+	only_paths = False
+	for arg in git_args:
+		if only_paths:
+			files.append(arg)
+		elif arg == "--":
+			only_paths = True
+		elif arg.startswith("-"):
+			if arg not in GIT_BLAME_FLAGS:
+				return False
+		else:
+			files.append(arg)
+	if len(files) != 1 or not _git_path_ok(root, repo, files[0]):
+		return False
+	full = resolve_safe_path(os.path.relpath(os.path.join(repo, files[0]), root))
+	return full is not None and os.path.isfile(full)
+
+
+GIT_ARGS_CHECKERS = {"log": _git_log_args_ok, "blame": _git_blame_args_ok}
 
 
 def git_source(args, ctx):
@@ -213,7 +234,7 @@ def git_source(args, ctx):
 		args = args or {}
 		sub = args.get("subcommand")
 		if not isinstance(sub, str) or sub not in GIT_SUBCOMMANDS:
-			return _refuse("Chỉ cho phép git log, show, diff, blame")
+			return _refuse("Chỉ cho phép git log và blame")
 		git_args = args.get("args")
 		if git_args is None:
 			git_args = ["--oneline", "-n", "15"] if sub == "log" else []
@@ -227,7 +248,8 @@ def git_source(args, ctx):
 		repo = _git_repo(root, args.get("app"))
 		if repo is None:
 			return _refuse("Không tìm thấy kho git của app")
-		if not _git_args_ok(root, repo, git_args):
+		args_ok = GIT_ARGS_CHECKERS.get(sub)
+		if args_ok is None or not args_ok(root, repo, git_args):
 			return _refuse("Tham số git bị cấm hoặc đường dẫn không được phép")
 
 		extra = ["--no-ext-diff", "--no-textconv"] if sub in GIT_NO_EXT_SUBCOMMANDS else []

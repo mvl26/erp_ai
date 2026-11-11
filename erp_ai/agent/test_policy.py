@@ -1,4 +1,5 @@
 from datetime import datetime, timedelta
+from unittest.mock import patch
 
 import frappe
 from frappe.tests.utils import FrappeTestCase
@@ -25,23 +26,18 @@ TEAMS = (TEAM, "IT")
 
 
 class TestPolicy(FrappeTestCase):
-	@classmethod
-	def setUpClass(cls):
-		super().setUpClass()
-		cls._teams_before = {name for name in TEAMS if frappe.db.exists("HD Team", name)}
-
-	@classmethod
-	def tearDownClass(cls):
-		super().tearDownClass()
-		# Teams are created inside each test transaction and rolled back; none may be committed.
-		leaked = [n for n in TEAMS if n not in cls._teams_before and frappe.db.exists("HD Team", n)]
-		assert not leaked, f"test committed HD Team rows: {leaked}"
-
 	def setUp(self):
 		# HD Team.after_insert makes an Assignment Rule that Frappe caches in Redis; the DB
 		# rollback leaves that entry stale. Registered first so it runs AFTER the rollback.
 		# (Never delete_doc HD Team: HDTeam.on_trash commits the transaction.)
 		self.addCleanup(frappe.cache.hdel, "assignment_rule_map", "HD Ticket")
+		# Teams are created inside each test transaction and rolled back; any commit during a
+		# test would leak them (FrappeTestCase's own class-level commits happen outside setUp).
+		commit_guard = patch.object(
+			frappe.db, "commit", side_effect=AssertionError("test must not commit the transaction")
+		)
+		commit_guard.start()
+		self.addCleanup(commit_guard.stop)
 		# FrappeTestCase rolls back only after the whole class: undo each test.
 		self.addCleanup(frappe.db.rollback)
 		self.addCleanup(frappe.set_user, "Administrator")

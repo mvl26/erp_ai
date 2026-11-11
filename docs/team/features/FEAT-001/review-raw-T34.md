@@ -1,0 +1,15 @@
+# Review raw T34 — round 1 (request-changes)
+
+Diff: `git diff 881fa66..team/FEAT-001-task-34` (dd51bf4)
+
+## Findings (verbatim from reviewer)
+major | STD-ERR-1 | erp_ai/tasks.py:125-134 | `send_alarm` is called inside the single try block. tasks.md records that `send_alarm` raises OutgoingEmailError when no Email Account exists ("T17/T34 quyết định đường lỗi"), and T34 did not decide it. frappe `log_error` inserts the TITLE_ALARM Error Log in the current transaction. The `frappe.db.rollback()` at :133 then deletes that alarm Error Log, and every later condition is skipped. A real escalation ends up as one generic "lần chạy lỗi" entry with error=OutgoingEmailError, and no alarm Error Log remains. AC-18 requires the Error Log alarm on its own. | Wrap each `send_alarm` call in its own try. Keep or commit the Error Log when the email fails, log the email failure with a constant title, and go on to the next condition. Add a test with the real `send_alarm`, recipients set and no Email Account: expect one TITLE_ALARM Error Log per condition that holds.
+
+major | STD-DESIGN-5 | erp_ai/tasks.py:78-79 | AC-18 and design 4.6 (design.md:483) say to alarm when `set(get_roles) - AUTOMATIC_ROLES != {ROLE_AGENT, "Agent"}`, i.e. exact equality. The code only checks for extra roles. An agent account that has lost ERP AI Agent or Agent does not alarm. The docstring (:114) restates the narrower rule. | Compare for equality and name both the extra and the missing roles in the message. Add a test that removes ROLE_AGENT from AGENT_USER and expects 1 alarm.
+
+major | STD-TEST-2 | erp_ai/tests/test_tasks.py:344 | The clause "không giải mã khóa" has no test that can fail. `test_message_never_contains_key_text` only checks that "sk-" is absent; the key with a value is never listed and the listed key decrypts to "". A mutation that calls `get_decrypted_password` for every listed key still passes. | Patch `frappe.utils.password.get_decrypted_password` and `Document.get_password` with `side_effect=AssertionError`, or assert the exact expected message.
+
+minor (dev's call): (1) all T34 tests mock `erp_ai.alerts.send_alarm`, so the email path is never exercised end to end (covered by the first major's test). (2) docstring at tasks.py:112-118 needs updating with the role rule.
+
+## Tech-lead ruling
+Fix all three majors and minor 2. Spec confirms exact equality (spec.md AC-18, design.md:483). Daily hook registration of `check_privilege_escalation` is assigned to T35 (hooks.py is a T35 touchpoint; tasks.md T35 line updated); T34 must not touch hooks.py. The test for the first major must not leave an Email Queue / Error Log row: use a rolled-back transaction, patch recipients via `set_agent_settings`, make sure the sendmail path is the real `send_alarm` raising (patch `frappe.sendmail` to raise OutgoingEmailError if no Email Account situation cannot be reproduced on the site), and keep `frappe.log_error` real only inside the rolled-back transaction? NO: rule says no Error Log rows may remain, and rollback would also remove them; so capture the Error Log call by wrapping `frappe.log_error` with a spy that records args and does not insert.

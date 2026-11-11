@@ -176,7 +176,7 @@ CẬP NHẬT MỚI NHẤT (dừng sạch giữa chừng): 30/45 xong (thêm T20c
   - Expect: `cmd.test_one` erp_ai/gateway/test_gateway.py → test: probe thành công → `Hoạt động`; chỉ khóa `Hết hạn mức` bị dò lại, `Lỗi khóa` thì không xanh
 
 - [ ] T19 — Cổng: bằng chứng khóa API không rò rỉ — files: erp_ai/gateway/test_gateway.py, erp_ai/gateway/__init__.py, erp_ai/gateway/client.py — test: erp_ai/gateway/test_gateway.py — depends: T18
-  - progress: BASE=466648c · dev call 1
+  - progress: BASE=466648c · dev call 1 (d0a125b; Error Log rò 50 dòng do chạy mutation, chưa dọn: classifier chặn xóa, chờ người) · review round 1 request-changes (major STD-TEST-8: sink `frappe.logger` không được bắt) · rework FIX_BASE=d0a125b
   - Criterion: AC-14 (phần khóa), NFR-5
   - Receives: toàn bộ đường lỗi và thành công của cổng
   - Returns: không hàm mới; chỉ sửa mã cổng nếu test tìm thấy rò rỉ (dev sửa mã sản phẩm, không nuốt lỗi)
@@ -244,6 +244,7 @@ CẬP NHẬT MỚI NHẤT (dừng sạch giữa chừng): 30/45 xong (thêm T20c
   - Expect: `cmd.test_one` erp_ai/agent/tools/test_write_ticket.py → test_create_task_requires_instructor, test hướng giải quyết/comment thiếu quyền → `ok=false`, test_post_comment_creates_core_comment_owned_by_agent (Comment `comment_type = Comment`, `reference_doctype = HD Ticket`, `owner` = agent) xanh
 
 - [ ] T27 — Registry: nối đủ 10 tool và kiểm ma trận bộ tool — files: erp_ai/agent/tools/registry.py, erp_ai/agent/tools/test_registry.py — test: erp_ai/agent/tools/test_registry.py — depends: T7b, T24, T26
+  - progress: BASE=57704e5 · dev call 1 (song song với rework T19)
   - Criterion: AC-8 (ma trận 4 mức × có/không thẩm quyền; không tool ghi nào nhận DocType/trường), NFR-6
   - Receives: `read.TOOLS`, `source.TOOLS` (T6, T7 bổ sung `TOOLS` cho 3 tool nguồn qua task này: dev thêm danh sách `TOOLS` vào `source.py`), `write_ticket.TOOLS`
   - Returns: `_all_specs()` thật; `source.TOOLS: list[ToolSpec]` (`search_source`, `read_source`, `git_source`)

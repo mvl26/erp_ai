@@ -1,5 +1,6 @@
 import ast
 import pathlib
+import time
 from unittest.mock import patch
 
 import frappe
@@ -8,6 +9,7 @@ import pytz
 from frappe.tests.utils import FrappeTestCase
 from frappe.utils import add_to_date, get_datetime, get_system_timezone, now_datetime
 
+from erp_ai import gateway
 from erp_ai.constants import (
 	CREDENTIAL_DOCTYPE,
 	KEY_STATUS_ACTIVE,
@@ -16,9 +18,9 @@ from erp_ai.constants import (
 	KEY_STATUS_QUOTA_EXHAUSTED,
 	SETTING_DOCTYPE,
 )
-from erp_ai.gateway import client, cost, credentials
+from erp_ai.gateway import GatewayError, client, cost, credentials
 from erp_ai.gateway.breaker import Action, ApiFailure
-from erp_ai.test_utils import add_credential, fake_anthropic_client
+from erp_ai.test_utils import add_credential, fake_anthropic_client, set_agent_settings
 
 PRICES = {
 	"price_input_per_mtok": 3.0,
@@ -323,3 +325,297 @@ class TestCredentials(FrappeTestCase):
 	def to_utc_header(naive_system_time):
 		aware = pytz.timezone(get_system_timezone()).localize(naive_system_time)
 		return aware.astimezone(pytz.UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+MESSAGE = {
+	"type": "message",
+	"model": "claude-served",
+	"stop_reason": "end_turn",
+	"content": [{"type": "text", "text": "xin "}, {"type": "text", "text": "chào"}],
+	"usage": {"input_tokens": 1000, "output_tokens": 2000},
+}
+CALL = {"system": "sys", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 50}
+
+
+class ScriptedSend:
+	"""Replaces `client.send`: plays the scripted outcomes in order (exception -> raised)."""
+
+	def __init__(self, *outcomes):
+		self.outcomes = list(outcomes)
+		self.calls = []
+
+	def __call__(self, api_key, *, timeout, request):
+		self.calls.append({"api_key": api_key, "timeout": timeout, "request": request})
+		outcome = self.outcomes.pop(0)
+		if isinstance(outcome, BaseException):
+			raise outcome
+		return outcome
+
+
+def ok_reply(message=None, headers=None, request_id="req_ok"):
+	return client.RawReply(message=message or MESSAGE, headers=headers or {}, request_id=request_id)
+
+
+def err(status, **kw):
+	return make_status_error(status, headers={"request-id": "req_err"}, **kw)
+
+
+class TestCallModel(FrappeTestCase):
+	def setUp(self):
+		self.addCleanup(frappe.db.rollback)
+		frappe.db.delete(CREDENTIAL_DOCTYPE, {"parent": SETTING_DOCTYPE})
+		set_agent_settings(
+			max_keys_per_call=3,
+			request_timeout_s=60,
+			model_classify_default="default-model",
+			**PRICES,
+		)
+		self.alarm = self.enterContext(patch("erp_ai.alerts.send_alarm"))
+		self.notice = self.enterContext(patch("erp_ai.alerts.send_notice"))
+
+	def run_call(self, *outcomes, task="classify", **kw):
+		send = ScriptedSend(*outcomes)
+		with patch.object(client, "send", send):
+			try:
+				result = gateway.call_model(task, **{**CALL, **kw})
+			except GatewayError as exc:
+				result = exc
+		return send, result
+
+	def row(self, name):
+		return frappe.db.get_value(CREDENTIAL_DOCTYPE, name, "*", as_dict=True)
+
+	def first_row(self):
+		return frappe.db.get_value(CREDENTIAL_DOCTYPE, {"parent": SETTING_DOCTYPE}, "name")
+
+	def test_invalid_task_raises_value_error(self):
+		add_credential("k1")
+		send = ScriptedSend()
+		with patch.object(client, "send", send), self.assertRaises(ValueError):
+			gateway.call_model("summarize", **CALL)
+		self.assertEqual(send.calls, [])
+
+	def test_success_builds_result_and_records_success(self):
+		name = add_credential("k1", error_count=2, last_error="x")
+		reply = ok_reply(headers={"anthropic-ratelimit-tokens-remaining": "50000"})
+		send, result = self.run_call(reply, tools=[{"name": "t"}])
+		self.assertEqual(send.calls[0]["api_key"], "sk-k1")
+		self.assertEqual(send.calls[0]["timeout"], 60)
+		self.assertEqual(
+			send.calls[0]["request"],
+			{**CALL, "model": "default-model", "tools": [{"name": "t"}]},
+		)
+		self.assertEqual(result.text, "xin chào")
+		self.assertEqual(result.content, MESSAGE["content"])
+		self.assertEqual((result.stop_reason, result.model), ("end_turn", "claude-served"))
+		self.assertEqual(result.credential_label, "k1")
+		self.assertEqual(result.request_id, "req_ok")
+		self.assertEqual(result.keys_tried, [{"label": "k1", "outcome": "ok"}])
+		self.assertIsInstance(result.latency_ms, int)
+		self.assertGreaterEqual(result.latency_ms, 0)
+		# usage thiếu khóa -> 0; chi phí theo đơn giá trong Setting: (1000*3 + 2000*15) / 1e6
+		self.assertEqual(
+			result.usage,
+			{
+				"input_tokens": 1000,
+				"output_tokens": 2000,
+				"cache_creation_input_tokens": 0,
+				"cache_read_input_tokens": 0,
+			},
+		)
+		self.assertEqual(result.cost_usd, 0.033)
+		row = self.row(name)
+		self.assertEqual((row.status, row.error_count, row.tokens_remaining), (KEY_STATUS_ACTIVE, 0, 50000))
+		self.assertFalse(row.last_error)
+
+	def test_none_usage_values_count_as_zero(self):
+		add_credential("k1")
+		usage = {"input_tokens": 10, "output_tokens": 0, "cache_creation_input_tokens": None}
+		_, result = self.run_call(ok_reply(message={**MESSAGE, "usage": usage}))
+		self.assertEqual(result.usage["cache_creation_input_tokens"], 0)
+		self.assertEqual(result.usage["cache_read_input_tokens"], 0)
+		self.assertEqual(result.cost_usd, 0.00003)
+		_, result = self.run_call(ok_reply(message={**MESSAGE, "usage": None}))
+		self.assertEqual((result.usage["input_tokens"], result.cost_usd), (0, 0))
+
+	def test_model_follows_task_and_key(self):
+		add_credential("k1", model_classify="key-classify", model_reason="key-reason")
+		send, _ = self.run_call(ok_reply(), task="classify")
+		self.assertEqual(send.calls[0]["request"]["model"], "key-classify")
+		self.assertNotIn("tools", send.calls[0]["request"])
+		send, _ = self.run_call(ok_reply(), task="reason")
+		self.assertEqual(send.calls[0]["request"]["model"], "key-reason")
+		frappe.db.set_value(CREDENTIAL_DOCTYPE, self.first_row(), "model_classify", "")
+		send, _ = self.run_call(ok_reply(), task="classify")
+		self.assertEqual(send.calls[0]["request"]["model"], "default-model")
+
+	def test_rate_limit_switches_to_next_key_without_notification(self):
+		first = add_credential("k1", try_order=1)
+		second = add_credential("k2", try_order=2)
+		send, result = self.run_call(err(429), ok_reply())
+		self.assertEqual([c["api_key"] for c in send.calls], ["sk-k1", "sk-k2"])
+		self.assertEqual(result.credential_label, "k2")
+		self.assertEqual(
+			result.keys_tried,
+			[{"label": "k1", "outcome": "rate_limit"}, {"label": "k2", "outcome": "ok"}],
+		)
+		row = self.row(first)
+		self.assertEqual((row.status, row.error_count), (KEY_STATUS_PAUSED, 1))
+		self.assertEqual(row.last_error, "rate_limit status=429 request_id=req_err")
+		self.assertGreater(get_datetime(row.paused_until), now_datetime())
+		self.assertEqual(self.row(second).status, KEY_STATUS_ACTIVE)
+		self.alarm.assert_not_called()
+		self.notice.assert_not_called()
+
+	def test_overloaded_pause_uses_incremented_error_count(self):
+		name = add_credential("k1", error_count=1)
+		self.run_call(err(529))
+		row = self.row(name)
+		# error_count mới = 2 -> nghỉ 60 s (không phải 30 s của lần đếm cũ)
+		paused = (get_datetime(row.paused_until) - now_datetime()).total_seconds()
+		self.assertTrue(55 <= paused <= 61, paused)
+
+	def test_timeout_error_switches_key(self):
+		import anthropic
+
+		add_credential("k1", try_order=1)
+		add_credential("k2", try_order=2)
+		request = httpx.Request("POST", API_URL)
+		send, result = self.run_call(anthropic.APITimeoutError(request=request), ok_reply())
+		self.assertEqual(result.keys_tried[0], {"label": "k1", "outcome": "timeout"})
+		self.assertEqual(len(send.calls), 2)
+
+	def test_max_keys_per_call(self):
+		for index in range(5):
+			add_credential(f"k{index}", try_order=index + 1)
+		send, error = self.run_call(*[err(529) for _ in range(5)])
+		self.assertEqual(len(send.calls), 3)
+		self.assertIsInstance(error, GatewayError)
+		self.assertEqual(error.kind, "all_keys_failed")
+		self.assertEqual([k["label"] for k in error.keys_tried], ["k0", "k1", "k2"])
+		self.assertEqual((error.status, error.credential_label, error.request_id), (529, "k2", "req_err"))
+		self.alarm.assert_called_once()
+		self.assertIn("Hết khóa dùng được cho việc 'classify'", self.alarm.call_args.args[0])
+
+	def test_all_keys_failing_before_max_keys_is_all_keys_failed(self):
+		add_credential("k1")
+		_, error = self.run_call(err(529))
+		self.assertEqual(error.kind, "all_keys_failed")
+		self.alarm.assert_called_once()
+
+	def test_bad_request_does_not_switch_key(self):
+		first = add_credential("k1", try_order=1, error_count=2)
+		second = add_credential("k2", try_order=2)
+		send, error = self.run_call(err(400), ok_reply())
+		self.assertEqual(len(send.calls), 1)
+		self.assertEqual(error.kind, "bad_request")
+		self.assertEqual((error.status, error.credential_label, error.request_id), (400, "k1", "req_err"))
+		self.assertEqual(error.keys_tried, [{"label": "k1", "outcome": "bad_request"}])
+		row = self.row(first)
+		self.assertEqual((row.status, row.error_count), (KEY_STATUS_ACTIVE, 2))
+		self.assertEqual(self.row(second).status, KEY_STATUS_ACTIVE)
+		self.alarm.assert_not_called()
+		self.notice.assert_not_called()
+
+	def test_no_usable_key_alarm(self):
+		add_credential("disabled", enabled=0)
+		send, error = self.run_call()
+		self.assertEqual(send.calls, [])
+		self.assertEqual(error.kind, "no_key")
+		self.assertEqual(error.keys_tried, [])
+		self.alarm.assert_called_once()
+		self.assertIn("Hết khóa dùng được cho việc 'classify'", self.alarm.call_args.args[0])
+		self.notice.assert_not_called()
+
+	def test_bad_key_401_marks_key_alarms_and_switches(self):
+		first = add_credential("k1", try_order=1)
+		add_credential("k2", try_order=2)
+		_, result = self.run_call(err(401), ok_reply())
+		self.assertEqual(self.row(first).status, KEY_STATUS_BAD_KEY)
+		self.assertEqual(result.credential_label, "k2")
+		self.alarm.assert_called_once()
+		self.assertIn("k1", self.alarm.call_args.args[0] + self.alarm.call_args.args[1])
+		self.notice.assert_not_called()
+
+	def test_quota_402_marks_key_sends_notice_and_switches(self):
+		first = add_credential("k1", try_order=1)
+		add_credential("k2", try_order=2)
+		_, result = self.run_call(err(402), ok_reply())
+		self.assertEqual(self.row(first).status, KEY_STATUS_QUOTA_EXHAUSTED)
+		self.assertEqual(result.credential_label, "k2")
+		self.notice.assert_called_once()
+		self.assertIn("k1", self.notice.call_args.args[0] + self.notice.call_args.args[1])
+		self.alarm.assert_not_called()
+
+	def test_notification_only_when_status_really_changes(self):
+		name = add_credential("k1", status=KEY_STATUS_BAD_KEY)
+		stale_row = frappe.db.get_all(CREDENTIAL_DOCTYPE, filters={"name": name}, fields=["*"])
+		with patch.object(credentials, "select_keys", side_effect=[stale_row, []]):
+			self.run_call(err(401))
+		self.alarm.assert_called_once()  # chỉ báo động hết khóa, không có báo động lỗi khóa
+		self.assertIn("Hết khóa", self.alarm.call_args.args[0])
+		self.notice.assert_not_called()
+
+	def test_notification_failure_does_not_break_the_call(self):
+		add_credential("k1", try_order=1)
+		add_credential("k2", try_order=2)
+		self.alarm.side_effect = RuntimeError("no email account")
+		_, result = self.run_call(err(401), ok_reply())
+		self.assertEqual(result.credential_label, "k2")
+
+	def test_deadline_under_five_seconds_makes_no_call(self):
+		add_credential("k1")
+		send, error = self.run_call(deadline=time.monotonic() + 3)
+		self.assertEqual(send.calls, [])
+		self.assertEqual(error.kind, "deadline")
+
+	def test_deadline_limits_attempt_timeout(self):
+		add_credential("k1")
+		send, _ = self.run_call(ok_reply(), deadline=time.monotonic() + 30)
+		self.assertTrue(25 < send.calls[0]["timeout"] <= 30, send.calls[0]["timeout"])
+		send, _ = self.run_call(ok_reply(), deadline=time.monotonic() + 600)
+		self.assertEqual(send.calls[0]["timeout"], 60)
+
+	def test_deadline_checked_before_every_attempt(self):
+		add_credential("k1", try_order=1)
+		add_credential("k2", try_order=2)
+		clock = [900.0]
+		calls = []
+
+		def failing_send(api_key, *, timeout, request):
+			calls.append(api_key)
+			clock[0] = 996.0
+			raise err(529)
+
+		with (
+			patch.object(gateway.time, "monotonic", lambda: clock[0]),
+			patch.object(client, "send", failing_send),
+			self.assertRaises(GatewayError) as caught,
+		):
+			gateway.call_model("classify", deadline=1000.0, **CALL)
+		self.assertEqual(len(calls), 1)
+		self.assertEqual(caught.exception.kind, "deadline")
+		self.assertEqual(caught.exception.keys_tried, [{"label": "k1", "outcome": "overloaded"}])
+
+	def test_unexpected_exception_hides_cause_and_does_not_switch(self):
+		name = add_credential("k1", try_order=1)
+		add_credential("k2", try_order=2)
+		send, error = self.run_call(RuntimeError("leak sk-k1 here"))
+		self.assertEqual(len(send.calls), 1)
+		self.assertEqual(error.kind, "unexpected")
+		self.assertEqual(error.credential_label, "k1")
+		self.assertEqual(error.keys_tried, [{"label": "k1", "outcome": "unexpected"}])
+		self.assertIsNone(error.__cause__)
+		self.assertTrue(error.__suppress_context__)
+		self.assertNotIn("sk-k1", str(error))
+		self.assertEqual(self.row(name).status, KEY_STATUS_ACTIVE)
+		self.alarm.assert_not_called()
+
+	def test_key_without_stored_secret_is_skipped(self):
+		first = add_credential("k1", try_order=1)
+		add_credential("k2", try_order=2)
+		real = credentials.get_api_key
+		with patch.object(credentials, "get_api_key", side_effect=lambda n: None if n == first else real(n)):
+			send, result = self.run_call(ok_reply())
+		self.assertEqual([c["api_key"] for c in send.calls], ["sk-k2"])
+		self.assertEqual(result.credential_label, "k2")

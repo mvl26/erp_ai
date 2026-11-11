@@ -1,0 +1,253 @@
+{
+ "actions": [],
+ "autoname": "hash",
+ "creation": "2026-11-11 12:00:00.000000",
+ "doctype": "DocType",
+ "engine": "InnoDB",
+ "field_order": [
+  "ticket",
+  "run_id",
+  "entry_type",
+  "turn",
+  "trigger",
+  "instructor",
+  "model",
+  "input_tokens",
+  "output_tokens",
+  "cache_creation_input_tokens",
+  "cache_read_input_tokens",
+  "cost_usd",
+  "credential_label",
+  "keys_tried",
+  "latency_ms",
+  "stop_reason",
+  "tools_called",
+  "actions",
+  "value_before",
+  "value_after",
+  "predicted_category",
+  "predicted_confidence",
+  "predicted_ticket_type",
+  "predicted_agent_group",
+  "predicted_priority",
+  "applied",
+  "human_corrected_to",
+  "human_corrected_by",
+  "human_corrected_at",
+  "error"
+ ],
+ "fields": [
+  {
+   "fieldname": "ticket",
+   "fieldtype": "Link",
+   "label": "Phiếu",
+   "options": "HD Ticket",
+   "search_index": 1,
+   "read_only": 1
+  },
+  {
+   "fieldname": "run_id",
+   "fieldtype": "Data",
+   "label": "Mã lần chạy",
+   "search_index": 1,
+   "read_only": 1
+  },
+  {
+   "fieldname": "entry_type",
+   "fieldtype": "Select",
+   "label": "Loại bản ghi",
+   "options": "classify\nreason\nskip",
+   "read_only": 1
+  },
+  {
+   "fieldname": "turn",
+   "fieldtype": "Int",
+   "label": "Lượt",
+   "read_only": 1
+  },
+  {
+   "fieldname": "trigger",
+   "fieldtype": "Select",
+   "label": "Nguồn kích hoạt",
+   "options": "ticket_insert\ncomment_mention",
+   "read_only": 1
+  },
+  {
+   "fieldname": "instructor",
+   "fieldtype": "Link",
+   "label": "Người ra lệnh",
+   "options": "User",
+   "read_only": 1
+  },
+  {
+   "fieldname": "model",
+   "fieldtype": "Data",
+   "label": "Model",
+   "read_only": 1
+  },
+  {
+   "fieldname": "input_tokens",
+   "fieldtype": "Int",
+   "label": "Token input",
+   "read_only": 1
+  },
+  {
+   "fieldname": "output_tokens",
+   "fieldtype": "Int",
+   "label": "Token output",
+   "read_only": 1
+  },
+  {
+   "fieldname": "cache_creation_input_tokens",
+   "fieldtype": "Int",
+   "label": "Token ghi cache",
+   "read_only": 1
+  },
+  {
+   "fieldname": "cache_read_input_tokens",
+   "fieldtype": "Int",
+   "label": "Token đọc cache",
+   "read_only": 1
+  },
+  {
+   "fieldname": "cost_usd",
+   "fieldtype": "Float",
+   "label": "Chi phí (USD)",
+   "precision": "6",
+   "read_only": 1
+  },
+  {
+   "fieldname": "credential_label",
+   "fieldtype": "Data",
+   "label": "Khóa đã trả lời",
+   "read_only": 1
+  },
+  {
+   "fieldname": "keys_tried",
+   "fieldtype": "Small Text",
+   "label": "Các khóa đã thử",
+   "read_only": 1
+  },
+  {
+   "fieldname": "latency_ms",
+   "fieldtype": "Int",
+   "label": "Độ trễ (ms)",
+   "read_only": 1
+  },
+  {
+   "fieldname": "stop_reason",
+   "fieldtype": "Data",
+   "label": "Lý do dừng",
+   "read_only": 1
+  },
+  {
+   "fieldname": "tools_called",
+   "fieldtype": "Small Text",
+   "label": "Tool đã gọi",
+   "read_only": 1
+  },
+  {
+   "fieldname": "actions",
+   "fieldtype": "Small Text",
+   "label": "Hành động",
+   "read_only": 1
+  },
+  {
+   "fieldname": "value_before",
+   "fieldtype": "Code",
+   "label": "Giá trị trước",
+   "options": "JSON",
+   "read_only": 1
+  },
+  {
+   "fieldname": "value_after",
+   "fieldtype": "Code",
+   "label": "Giá trị sau",
+   "options": "JSON",
+   "read_only": 1
+  },
+  {
+   "fieldname": "predicted_category",
+   "fieldtype": "Data",
+   "label": "Đầu mục dự đoán",
+   "read_only": 1
+  },
+  {
+   "fieldname": "predicted_confidence",
+   "fieldtype": "Data",
+   "label": "Độ tin cậy dự đoán",
+   "read_only": 1
+  },
+  {
+   "fieldname": "predicted_ticket_type",
+   "fieldtype": "Data",
+   "label": "Loại phiếu dự đoán",
+   "read_only": 1
+  },
+  {
+   "fieldname": "predicted_agent_group",
+   "fieldtype": "Data",
+   "label": "Nhóm xử lý dự đoán",
+   "read_only": 1
+  },
+  {
+   "fieldname": "predicted_priority",
+   "fieldtype": "Data",
+   "label": "Ưu tiên dự đoán",
+   "read_only": 1
+  },
+  {
+   "fieldname": "applied",
+   "fieldtype": "Check",
+   "label": "Đã áp dụng",
+   "read_only": 1
+  },
+  {
+   "fieldname": "human_corrected_to",
+   "fieldtype": "Small Text",
+   "label": "Người sửa thành",
+   "read_only": 1
+  },
+  {
+   "fieldname": "human_corrected_by",
+   "fieldtype": "Link",
+   "label": "Người sửa",
+   "options": "User",
+   "read_only": 1
+  },
+  {
+   "fieldname": "human_corrected_at",
+   "fieldtype": "Datetime",
+   "label": "Thời điểm sửa đầu tiên",
+   "read_only": 1
+  },
+  {
+   "fieldname": "error",
+   "fieldtype": "Small Text",
+   "label": "Lỗi",
+   "read_only": 1
+  }
+ ],
+ "links": [],
+ "modified": "2026-11-11 12:00:00.000000",
+ "modified_by": "Administrator",
+ "module": "ERP AI agent",
+ "name": "ERP AI Log",
+ "owner": "Administrator",
+ "permissions": [
+  {
+   "export": 1,
+   "read": 1,
+   "report": 1,
+   "role": "System Manager"
+  },
+  {
+   "create": 1,
+   "read": 1,
+   "role": "ERP AI Agent"
+  }
+ ],
+ "sort_field": "modified",
+ "sort_order": "DESC",
+ "states": []
+}

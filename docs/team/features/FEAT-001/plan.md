@@ -67,6 +67,8 @@ Quyết định của kế hoạch (bổ sung cho design, để các task khớp
 - Touchpoint test bổ sung ngoài 65 của design: `erp_ai/erp_ai_agent/doctype/erp_ai_credential/test_erp_ai_credential.py` (T8), `erp_ai/erp_ai_agent/doctype/erp_ai_log/test_erp_ai_log.py` (T10), `erp_ai/test_alerts.py` (T14), `erp_ai/agent/test_run_log.py` (T22). Đều dưới `erp_ai/` (nằm trong `allowed_new_file_roots`), không chạm `protected_paths`.
 - Hộp ngữ cảnh dev: chỉ sửa trong touchpoint của task; tên module/đường dẫn dưới `erp_ai/erp_ai_agent/` (không `erp_ai/erp_ai/`).
 
+Điều chỉnh D2 (2026-11-11): test nằm ở gốc gói `erp_ai/` không được `bench run-tests --app erp_ai` tìm thấy (Frappe `_add_test`). Thêm T1b: chuyển `test_handlers.py` vào `erp_ai/tests/`; `test_install.py`, `test_alerts.py`, `test_tasks.py`, `test_architecture.py` cũng nằm ở `erp_ai/tests/`. `test_utils.py` (helper) giữ ở `erp_ai/`. Mọi tham chiếu `erp_ai/test_*.py` trong tasks.md đã đổi theo.
+
 ## Bảng một file, một chủ
 
 Chỉ liệt các file có nhiều hơn một task chạm. Các file còn lại (khoảng 40) chỉ có một task.

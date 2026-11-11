@@ -14,13 +14,18 @@ Tiến độ: 1/40. Việc tiếp theo: T2..T7 (không chung file), rồi chuỗ
 
 ## Walking skeleton (cỡ L)
 
-- [x] T1 — Walking skeleton: phiếu mới → handler → hàng đợi → runner (cổng giả) — files: erp_ai/constants.py, erp_ai/hooks.py, erp_ai/handlers.py, erp_ai/agent/__init__.py, erp_ai/agent/queue.py, erp_ai/agent/runner.py, erp_ai/gateway/__init__.py, erp_ai/test_utils.py, erp_ai/test_handlers.py — test: erp_ai/test_handlers.py — depends: —
+- [x] T1 — Walking skeleton: phiếu mới → handler → hàng đợi → runner (cổng giả) — files: erp_ai/constants.py, erp_ai/hooks.py, erp_ai/handlers.py, erp_ai/agent/__init__.py, erp_ai/agent/queue.py, erp_ai/agent/runner.py, erp_ai/gateway/__init__.py, erp_ai/test_utils.py, erp_ai/tests/test_handlers.py — test: erp_ai/tests/test_handlers.py — depends: —
   - progress: BASE=34e4c8f · dev call 1 · review round 1 request-changes (STD-DESIGN-2 guard) · round 2 request-changes (STD-TEST-5) · round 3 approve (head 12e8c92) · merged into team/FEAT-001 · test_handlers 6 OK; `--app erp_ai` runs 0 tests (xem journal)
   - Ngoại lệ cỡ: 9 file vì skeleton chạy xuyên mọi tầng; mỗi file chỉ là bản tối thiểu, các task sau mở rộng theo bảng một-file-một-chủ trong plan.md.
   - Criterion: AC-5(a) phần đường chính, NFR-1, NFR-2 (đường đầu-cuối với lõi giả)
   - Receives: `frappe.db.get_single_value("ERP AI Setting", "enabled")` (test patch trả 1 vì DocType chưa có); HD Ticket tạo bởi `helpdesk.test_utils.make_ticket`
   - Returns: `constants.py` (toàn bộ hằng ở mục 3 của design, đủ để các task sau chỉ import); `handlers.ticket_after_insert(doc, method=None)` (chỉ điều kiện: bật, `doc.owner != AGENT_USER`); `queue.enqueue_agent_run(ticket_name: str, trigger: str) -> bool` (đúng lời gọi `frappe.enqueue` của design 3.2, chưa có chặn trùng trong giao dịch); `runner.run_for_ticket(ticket_name: str, trigger: str) -> None` (gọi `gateway.call_model("classify", system=[...], messages=[...], max_tokens=400)` một lần rồi dừng; chưa ghi nhật ký); `gateway.ModelResult` (frozen dataclass đủ trường design 3.4.1), `gateway.GatewayError(kind, status, credential_label, request_id, keys_tried)`, `gateway.call_model(task, *, system, messages, max_tokens, tools=None, deadline=None)` (ném `NotImplementedError`, test patch); `test_utils.FakeGateway` (hàng đợi `ModelResult`/`GatewayError`, đếm lời gọi), `test_utils.make_model_result(**kw)`; `hooks.py`: `required_apps = ["helpdesk"]`, `doc_events["HD Ticket"]["after_insert"]`
-  - Expect: `cmd.test_one` erp_ai/test_handlers.py → test: tạo phiếu (agent "bật" qua patch) → đúng 1 lời gọi `frappe.enqueue` có `queue="long"`, `timeout=600`, `enqueue_after_commit=True`, `deduplicate=True`; chạy `run_for_ticket` trực tiếp với `FakeGateway` → đúng 1 lời gọi `call_model`; lưu phiếu không gọi `call_model` lần nào. Đỏ trước khi viết mã (ImportError/AssertionError), xanh sau.
+  - Expect: `cmd.test_one` erp_ai/tests/test_handlers.py → test: tạo phiếu (agent "bật" qua patch) → đúng 1 lời gọi `frappe.enqueue` có `queue="long"`, `timeout=600`, `enqueue_after_commit=True`, `deduplicate=True`; chạy `run_for_ticket` trực tiếp với `FakeGateway` → đúng 1 lời gọi `call_model`; lưu phiếu không gọi `call_model` lần nào. Đỏ trước khi viết mã (ImportError/AssertionError), xanh sau.
+
+- [ ] T1b — Chuyển test vào gói `erp_ai/tests/` để `--app erp_ai` tìm thấy test (D2: lỗi `_add_test` của Frappe) — files: erp_ai/tests/__init__.py, erp_ai/tests/test_handlers.py, erp_ai/test_handlers.py (xóa/di chuyển bằng `git mv`) — test: erp_ai/tests/test_handlers.py — depends: T1
+  - Criterion: `cmd.test` (`--app erp_ai`) chạy thật các test (không còn "NO TESTS RAN")
+  - Returns: `git mv erp_ai/test_handlers.py erp_ai/tests/test_handlers.py`, thêm `erp_ai/tests/__init__.py` rỗng; sửa import nếu cần; `test_utils.py` giữ nguyên tại `erp_ai/`
+  - Expect: `bench --site miyano run-tests --app erp_ai` → "Ran 6 tests … OK"; `--module erp_ai.tests.test_handlers` xanh. Mọi task sau dùng đường dẫn test `erp_ai/tests/test_*.py` (test_handlers, test_install, test_alerts, test_tasks, test_architecture).
 
 ## Nhóm thuần (không migrate, không file chung)
 
@@ -82,19 +87,19 @@ Tiến độ: 1/40. Việc tiếp theo: T2..T7 (không chung file), rồi chuỗ
   - Returns: DocType `ERP AI Log` đúng trường design 2.3, `autoname = hash`, chỉ mục `search_index` cho `ticket`, `run_id`; quyền: System Manager đọc/báo cáo/export, `ERP AI Agent` đọc/tạo, không ai write/delete
   - Expect: `cmd.migrate` exit 0, rồi `cmd.test_one` → test: tạo bản ghi dưới tài khoản có role agent được; HD Agent thường bị `PermissionError`; không role nào có quyền write/delete xanh
 
-- [ ] T11 — Cài đặt: role, tài khoản agent, cấu hình mặc định, hook cài [migrate] — files: erp_ai/install.py, erp_ai/hooks.py, erp_ai/test_install.py — test: erp_ai/test_install.py — depends: T10
+- [ ] T11 — Cài đặt: role, tài khoản agent, cấu hình mặc định, hook cài [migrate] — files: erp_ai/install.py, erp_ai/hooks.py, erp_ai/tests/test_install.py — test: erp_ai/tests/test_install.py — depends: T10
   - Criterion: AC-4 (role, tài khoản không có System Manager, mặc định tắt/L0, chạy lặp lại không lỗi), A-13, ADR-006 #4
   - Receives: `constants.AGENT_USER`, `ROLE_AGENT`, `ROLE_INSTRUCTOR`, `HELPDESK_AGENT_ROLE`
   - Returns: `install.ensure_setup() -> None` (bước 1, 2, 5 của design mục 6; bước 3, 4, 6 là T12, T13), `install.after_install()`, `install.after_migrate()`; `hooks.py`: `after_install`, `after_migrate`
   - Expect: `cmd.migrate` exit 0 hai lần liên tiếp, rồi `cmd.test_one` → test_setup_twice_is_idempotent, test_agent_user_has_exact_roles_without_system_manager, test_default_settings_disabled_level_l0 (giá trị người đã đặt không bị ghi đè), test_setup_never_writes_existing_tickets xanh
 
-- [ ] T12 — Cài đặt: custom field AI trên HD Ticket và dòng template [migrate] — files: erp_ai/install.py, erp_ai/test_install.py — test: erp_ai/test_install.py — depends: T11
+- [ ] T12 — Cài đặt: custom field AI trên HD Ticket và dòng template [migrate] — files: erp_ai/install.py, erp_ai/tests/test_install.py — test: erp_ai/tests/test_install.py — depends: T11
   - Criterion: AC-4 (trường AI có trên HD Ticket), AC-20 (phần tự động: permlevel 8, `visible_to = Agents`, HD Customer không có quyền pl 8), ADR-006 #3
   - Receives: `ensure_setup` từ T11
   - Returns: bước 3, 4 của design mục 6: 6 custom field `ai_section`, `ai_resolution_hint`, `ai_confidence`, `ai_classified_by`, `ai_updated_at`, `ai_opt_out` (permlevel 8, `module = "ERP AI agent"`, `create_custom_fields(update=True)`); thêm 5 dòng vào template `Default` (không sửa dòng có sẵn); template không tồn tại → logger warning
   - Expect: `cmd.migrate` exit 0 hai lần, rồi `cmd.test_one` → test_ai_fields_permlevel_8_and_template_rows_agents_only, test_existing_template_row_preserved, test_setup_twice_is_idempotent (đủ 6 field và k + 5 dòng sau lần 2) xanh
 
-- [ ] T13 — Cài đặt: quyền Task cho role agent [migrate] — files: erp_ai/install.py, erp_ai/test_install.py — test: erp_ai/test_install.py — depends: T12
+- [ ] T13 — Cài đặt: quyền Task cho role agent [migrate] — files: erp_ai/install.py, erp_ai/tests/test_install.py — test: erp_ai/tests/test_install.py — depends: T12
   - Criterion: AC-8 (nền cho `create_task`), D-14
   - Receives: `ensure_setup` từ T12
   - Returns: bước 6 của design mục 6: nếu có DocType `Task` → `setup_custom_perms("Task")` + 1 Custom DocPerm {role `ERP AI Agent`, permlevel 0, read/write/create = 1, `if_owner = 1`}, `frappe.clear_cache(doctype="Task")`; không có Task → bỏ qua, ghi logger warning (báo tech-lead nếu `frappe.db.exists("DocType", "Task")` sai trên `miyano`)
@@ -102,12 +107,12 @@ Tiến độ: 1/40. Việc tiếp theo: T2..T7 (không chung file), rồi chuỗ
 
 ## Cổng model và lõi agent
 
-- [ ] T14 — Cảnh báo: báo động và thông báo — files: erp_ai/alerts.py, erp_ai/test_alerts.py — test: erp_ai/test_alerts.py — depends: T9
+- [ ] T14 — Cảnh báo: báo động và thông báo — files: erp_ai/alerts.py, erp_ai/tests/test_alerts.py — test: erp_ai/tests/test_alerts.py — depends: T9
   - Ghi chú: `test_alerts.py` là touchpoint bổ sung (test).
   - Criterion: AC-17 (báo động hết khóa), AC-18 (kênh email), NFR-5 (nội dung không chứa khóa), D-2, D-21
   - Receives: `set_agent_settings` (T9), `constants.TITLE_ALARM`, `TITLE_NOTICE`, `LOGGER_NAME`
   - Returns: `alerts.send_alarm(subject: str, message: str) -> None` (Error Log tiêu đề `TITLE_ALARM` có message tường minh + `frappe.sendmail(..., delayed=True)` tới các dòng `alert_recipients`), `alerts.send_notice(subject, message) -> None` (logger info + email, không Error Log)
-  - Expect: `cmd.test_one` erp_ai/test_alerts.py → test: patch `frappe.sendmail` đếm 1 lần cho mỗi lệnh gọi; `log_error` luôn có 2 đối số; người nhận lấy từ cấu hình xanh
+  - Expect: `cmd.test_one` erp_ai/tests/test_alerts.py → test: patch `frappe.sendmail` đếm 1 lần cho mỗi lệnh gọi; `log_error` luôn có 2 đối số; người nhận lấy từ cấu hình xanh
 
 - [ ] T15 — Cổng: tính chi phí, client SDK, khai phụ thuộc — files: erp_ai/gateway/cost.py, erp_ai/gateway/client.py, erp_ai/gateway/test_gateway.py, pyproject.toml, erp_ai/test_utils.py — test: erp_ai/gateway/test_gateway.py — depends: T4, T9
   - Criterion: AC-15 (chi phí = token × đơn giá), NFR-7 (`max_retries=0`, có timeout), NFR-5 (client là chỗ duy nhất `import anthropic`), STD-DEP-1 (`anthropic>=0.103.1,<1`)
@@ -211,35 +216,35 @@ Tiến độ: 1/40. Việc tiếp theo: T2..T7 (không chung file), rồi chuỗ
 
 ## Handler, scheduler, báo cáo, eval
 
-- [ ] T31 — Handler: điều kiện xếp job cho phiếu và comment — files: erp_ai/handlers.py, erp_ai/hooks.py, erp_ai/test_handlers.py — test: erp_ai/test_handlers.py — depends: T2, T20
+- [ ] T31 — Handler: điều kiện xếp job cho phiếu và comment — files: erp_ai/handlers.py, erp_ai/hooks.py, erp_ai/tests/test_handlers.py — test: erp_ai/tests/test_handlers.py — depends: T2, T20
   - Criterion: AC-5(a)–(e), AC-4 (agent tắt → 0 job, 0 lời gọi), NFR-1 (không gọi model trong luồng lưu), NFR-4
   - Receives: `policy.is_enabled`, `can_send_ticket`, `contains_keyword`, `queue.enqueue_agent_run`
   - Returns: `ticket_before_insert(doc, method=None)` (cờ `erp_ai_prefilled`), `ticket_after_insert` thay điều kiện tạm của T1 bằng `policy.*`, `comment_after_insert(doc, method=None)`; `hooks.py`: `before_insert`, `comment after_insert`; mỗi quyết định → `frappe.logger(LOGGER_NAME).info` không chứa nội dung phiếu
-  - Expect: `cmd.test_one` erp_ai/test_handlers.py → test_disabled_agent_new_ticket_no_job_no_model_call, test_new_unclassified_ticket_enqueues_one_job (kể cả khi Helpdesk tự điền mặc định), test_prefilled_ticket_no_job, test_agent_created_ticket_and_comment_no_job, test_comment_keyword_case_insensitive, test_opt_out_or_excluded_team_no_job_no_model_call, test_save_ticket_and_comment_make_no_model_call xanh
+  - Expect: `cmd.test_one` erp_ai/tests/test_handlers.py → test_disabled_agent_new_ticket_no_job_no_model_call, test_new_unclassified_ticket_enqueues_one_job (kể cả khi Helpdesk tự điền mặc định), test_prefilled_ticket_no_job, test_agent_created_ticket_and_comment_no_job, test_comment_keyword_case_insensitive, test_opt_out_or_excluded_team_no_job_no_model_call, test_save_ticket_and_comment_make_no_model_call xanh
 
-- [ ] T32 — Handler: ghi nhận người sửa phân loại — files: erp_ai/handlers.py, erp_ai/hooks.py, erp_ai/test_handlers.py — test: erp_ai/test_handlers.py — depends: T22, T31
+- [ ] T32 — Handler: ghi nhận người sửa phân loại — files: erp_ai/handlers.py, erp_ai/hooks.py, erp_ai/tests/test_handlers.py — test: erp_ai/tests/test_handlers.py — depends: T22, T31
   - Criterion: AC-11 (người sửa → nhật ký gần nhất lưu giá trị, "phân loại bởi" thành Người; agent sửa thì không), ADR-004 #5
   - Receives: `ERP AI Log` có bản ghi `classify`
   - Returns: `ticket_validate(doc, method=None)`, `ticket_on_update(doc, method=None)`; `human_corrected_at` chỉ đặt lần đầu; ghi bằng `frappe.db.set_value(..., update_modified=False)`; `hooks.py`: `validate`, `on_update`
-  - Expect: `cmd.test_one` erp_ai/test_handlers.py → test_human_correction_updates_latest_log (sửa 2 lần → giá trị cuối, `human_corrected_at` lần đầu), test_agent_correction_not_recorded xanh
+  - Expect: `cmd.test_one` erp_ai/tests/test_handlers.py → test_human_correction_updates_latest_log (sửa 2 lần → giá trị cuối, `human_corrected_at` lần đầu), test_agent_correction_not_recorded xanh
 
-- [ ] T33 — Job hằng ngày: tính lại chi phí tháng — files: erp_ai/tasks.py, erp_ai/hooks.py, erp_ai/test_tasks.py — test: erp_ai/test_tasks.py — depends: T20, T22, T32
+- [ ] T33 — Job hằng ngày: tính lại chi phí tháng — files: erp_ai/tasks.py, erp_ai/hooks.py, erp_ai/tests/test_tasks.py — test: erp_ai/tests/test_tasks.py — depends: T20, T22, T32
   - Criterion: AC-16 (cộng chi phí; vượt ngân sách → mức hiệu lực lùi; đầu tháng reset), D-19
   - Receives: `ERP AI Log.cost_usd`, `credential_label`
   - Returns: `tasks.recompute_monthly_spend(now=None) -> None`; `hooks.py`: `scheduler_events.daily`
-  - Expect: `cmd.test_one` erp_ai/test_tasks.py → test_recompute_spend_from_log (tổng chung + theo khóa), test_month_start_resets_to_zero xanh
+  - Expect: `cmd.test_one` erp_ai/tests/test_tasks.py → test_recompute_spend_from_log (tổng chung + theo khóa), test_month_start_resets_to_zero xanh
 
-- [ ] T34 — Job hằng ngày: kiểm nâng quyền — files: erp_ai/tasks.py, erp_ai/test_tasks.py — test: erp_ai/test_tasks.py — depends: T14, T33
+- [ ] T34 — Job hằng ngày: kiểm nâng quyền — files: erp_ai/tasks.py, erp_ai/tests/test_tasks.py — test: erp_ai/tests/test_tasks.py — depends: T14, T33
   - Criterion: AC-18 (role ≠ {ERP AI Agent, Agent}; bản ghi phân quyền do agent sửa; Server Script/Webhook do agent tạo đang bật; khóa bật mà rỗng)
   - Receives: `alerts.send_alarm`
   - Returns: `tasks.check_privilege_escalation() -> None` (một báo động cho mỗi điều kiện đúng; liệt kê ≤ 5 tên; không giải mã khóa)
-  - Expect: `cmd.test_one` erp_ai/test_tasks.py → test_alarm_on_role_drift, test_alarm_on_permission_records_modified_by_agent, test_alarm_on_enabled_server_script_or_webhook_by_agent, test_alarm_on_enabled_key_without_secret (không có điều kiện → 0 email) xanh
+  - Expect: `cmd.test_one` erp_ai/tests/test_tasks.py → test_alarm_on_role_drift, test_alarm_on_permission_records_modified_by_agent, test_alarm_on_enabled_server_script_or_webhook_by_agent, test_alarm_on_enabled_key_without_secret (không có điều kiện → 0 email) xanh
 
-- [ ] T35 — Job mỗi giờ: dò lại khóa hết hạn mức — files: erp_ai/tasks.py, erp_ai/hooks.py, erp_ai/test_tasks.py — test: erp_ai/test_tasks.py — depends: T18, T34
+- [ ] T35 — Job mỗi giờ: dò lại khóa hết hạn mức — files: erp_ai/tasks.py, erp_ai/hooks.py, erp_ai/tests/test_tasks.py — test: erp_ai/tests/test_tasks.py — depends: T18, T34
   - Criterion: AC-18 (chỉ dò `Hết hạn mức`; hồi phục → `Hoạt động` + 1 email tin)
   - Receives: `gateway.reprobe_exhausted_keys()`
   - Returns: `tasks.reprobe_exhausted_keys() -> None`; `hooks.py`: `scheduler_events.hourly`
-  - Expect: `cmd.test_one` erp_ai/test_tasks.py → test_reprobe_only_exhausted_keys xanh
+  - Expect: `cmd.test_one` erp_ai/tests/test_tasks.py → test_reprobe_only_exhausted_keys xanh
 
 - [ ] T36 — Nút "Kiểm tra khóa" (`check_keys`) — files: erp_ai/erp_ai_agent/doctype/erp_ai_setting/erp_ai_setting.py, erp_ai/erp_ai_agent/doctype/erp_ai_setting/erp_ai_setting.js, erp_ai/erp_ai_agent/doctype/erp_ai_setting/test_erp_ai_setting.py — test: erp_ai/erp_ai_agent/doctype/erp_ai_setting/test_erp_ai_setting.py — depends: T9, T18
   - Criterion: AC-19 (chỉ System Manager gọi được; kết quả từng khóa; `label` lạ → lỗi)
@@ -268,8 +273,8 @@ Tiến độ: 1/40. Việc tiếp theo: T2..T7 (không chung file), rồi chuỗ
 
 ## Kiểm kiến trúc và CI
 
-- [ ] T40 — Test kiến trúc (quét mã) và CI — files: erp_ai/test_architecture.py, .github/workflows/ci.yml — test: erp_ai/test_architecture.py — depends: T30, T35, T36, T38, T39
+- [ ] T40 — Test kiến trúc (quét mã) và CI — files: erp_ai/tests/test_architecture.py, .github/workflows/ci.yml — test: erp_ai/tests/test_architecture.py — depends: T30, T35, T36, T38, T39
   - Criterion: ADR-001..005, NFR-1, NFR-5, DoD "CI xanh" (D-23)
   - Receives: toàn bộ cây `erp_ai/**`
   - Returns: test_layer_imports, test_single_enqueue_call_site, test_no_save_on_settings_in_product_code, test_tools_never_bypass_permissions, test_subprocess_only_in_source_tool, test_level_and_send_policy_fields_only_in_policy, test_handlers_do_not_import_gateway_or_runner, test_secret_handling_rules, test_ci_installs_required_apps (đọc `ci.yml`: có `helpdesk` tag `v15.1.0`, `erpnext` `version-15`, `telephony`, `bench init` nhánh `version-15`); `ci.yml` cài thêm các app đó trước `install-app erp_ai`, không nâng version action
-  - Expect: `cmd.test_one` erp_ai/test_architecture.py → các test trên xanh; `cmd.test` toàn app xanh; `cmd.lint` sạch; `grep` các dấu skip trong `test.skip_markers` → rỗng (điểm kiểm CP-5, cuối build)
+  - Expect: `cmd.test_one` erp_ai/tests/test_architecture.py → các test trên xanh; `cmd.test` toàn app xanh; `cmd.lint` sạch; `grep` các dấu skip trong `test.skip_markers` → rỗng (điểm kiểm CP-5, cuối build)

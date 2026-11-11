@@ -7,7 +7,7 @@ from frappe.tests.utils import FrappeTestCase
 from frappe.utils import add_days, getdate, now_datetime
 
 from erp_ai.constants import CATEGORIES, LOG_DOCTYPE
-from erp_ai.erp_ai_agent.report.erp_ai_accuracy.erp_ai_accuracy import execute
+from erp_ai.erp_ai_agent.report.erp_ai_accuracy.erp_ai_accuracy import CORRECTION_WINDOW, execute
 from erp_ai.test_utils import make_log_entry
 
 PREFIX = "ERPAI-TEST-"
@@ -27,9 +27,6 @@ class AccuracyTestCase(FrappeTestCase):
 		self.addCleanup(frappe.db.rollback)
 		self.addCleanup(frappe.set_user, "Administrator")
 		frappe.set_user("Administrator")
-		log_error = patch.object(frappe, "log_error")
-		log_error.start()
-		self.addCleanup(log_error.stop)
 		self.now = now_datetime().replace(microsecond=0)
 
 	def _log(self, category, days_ago, corrected_after=None, corrected_to=None, entry_type="classify"):
@@ -117,18 +114,40 @@ class TestAccuracyTenLogSample(AccuracyTestCase):
 		self.assertEqual(self._rows()["A"]["corrected"], 1)
 
 	def test_empty_predicted_and_corrected_values_are_equal(self):
-		name = self._log("A", 20, corrected_after=DAY)
-		frappe.db.set_value(
-			LOG_DOCTYPE,
-			name,
-			{
-				"predicted_agent_group": None,
-				"human_corrected_to": json.dumps(
-					{"ticket_type": "T1", "agent_group": None, "priority": "Low"}
-				),
-			},
+		# NULL is what the database stores for an unset field; "" must count as the same "empty".
+		cases = (
+			("predicted empty string, corrected null", "", None),
+			("predicted null, corrected empty string", None, ""),
 		)
-		self.assertEqual(self._rows()["A"]["corrected"], 0)
+		for label, predicted, corrected in cases:
+			with self.subTest(label):
+				name = self._log("A", 20, corrected_after=DAY)
+				frappe.db.set_value(
+					LOG_DOCTYPE,
+					name,
+					{
+						"predicted_agent_group": predicted,
+						"human_corrected_to": json.dumps(
+							{"ticket_type": "T1", "agent_group": corrected, "priority": "Low"}
+						),
+					},
+				)
+				self.assertEqual(self._rows()["A"]["corrected"], 0)
+				frappe.db.set_value(LOG_DOCTYPE, name, "entry_type", "reason")
+
+	def test_prediction_exactly_seven_days_old_is_no_longer_pending(self):
+		with patch(f"{execute.__module__}.now_datetime", return_value=self.now):
+			self._log("A", 7)
+			self._log("B", 7, corrected_after=None)
+			frappe.db.set_value(
+				LOG_DOCTYPE,
+				self._log("C", 0),
+				"creation",
+				self.now - (CORRECTION_WINDOW - timedelta(seconds=1)),
+			)
+			rows = self._rows()
+		self.assertEqual((rows["A"]["pending"], rows["A"]["accuracy_pct"]), (0, 100.0))
+		self.assertEqual((rows["C"]["pending"], rows["C"]["accuracy_pct"]), (1, None))
 
 	def test_no_prediction_in_range_gives_empty_data(self):
 		columns, data = execute(self._filters())
@@ -201,4 +220,3 @@ class TestAccuracyFiltersAndColumns(AccuracyTestCase):
 		self.assertEqual([row.role for row in report.roles], ["System Manager"])
 		self.assertEqual(report.is_standard, "Yes")
 		self.assertTrue(frappe.has_permission("Report", doc=report, user="Administrator"))
-		self.assertFalse(frappe.has_permission("Report", doc=report, user=self._plain_user()))

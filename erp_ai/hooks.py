@@ -144,6 +144,9 @@ doc_events = {
 	},
 }
 
+# Deleting a ticket must not be blocked by its audit-log rows (the log is kept)
+ignore_links_on_delete = ["ERP AI Log"]
+
 # Scheduled Tasks
 # ---------------
 

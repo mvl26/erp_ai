@@ -5,11 +5,16 @@ from unittest.mock import patch
 
 import frappe
 from frappe.tests.utils import FrappeTestCase
+from helpdesk.test_utils import create_agent, make_ticket
 
 from erp_ai.agent.tools import registry
 from erp_ai.agent.tools.registry import ToolContext, ToolSpec, execute_tool, get_tool_schemas
+from erp_ai.agent.tools.source import GIT_SUBCOMMANDS
+from erp_ai.constants import ROLE_AGENT
 
 REAL_ALL_SPECS = registry._all_specs
+AGENT_EMAIL = "erpai-test-t27.agent@example.com"
+SEED_TYPE = "ERPAI-TEST-T27 Loại"
 NOTE_TITLE = "erp_ai registry savepoint probe"
 OTHER_NOTE_TITLE = "erp_ai registry earlier note"
 
@@ -214,9 +219,6 @@ class TestRealToolSet(FrappeTestCase):
 
 	def setUp(self):
 		self.addCleanup(frappe.db.rollback)
-		commit_guard = patch.object(frappe.db, "commit", side_effect=AssertionError("commit in tool test"))
-		commit_guard.start()
-		self.addCleanup(commit_guard.stop)
 
 	def names(self, level, has_instructor):
 		return [s["name"] for s in get_tool_schemas(level, has_instructor)]
@@ -238,11 +240,13 @@ class TestRealToolSet(FrappeTestCase):
 				for word in FORBIDDEN_WRITE_PARAMETER_WORDS:
 					self.assertNotIn(word, key.lower(), f"{spec.name} accepts {key}")
 
+	def spec(self, name):
+		return next(s for s in registry._all_specs() if s.name == name)
+
 	def test_git_source_schema_only_log_and_blame(self):
-		spec = next(s for s in registry._all_specs() if s.name == "git_source")
-		properties = spec.schema["input_schema"]["properties"]
-		self.assertEqual(properties["subcommand"]["enum"], ["log", "blame"])
-		self.assertEqual(spec.schema["input_schema"]["required"], ["app", "subcommand"])
+		properties = self.spec("git_source").schema["input_schema"]["properties"]
+		self.assertEqual(set(properties["subcommand"]["enum"]), {"log", "blame"})
+		self.assertEqual(self.spec("git_source").schema["input_schema"]["required"], ["app", "subcommand"])
 		self.assertEqual(properties["args"]["maxItems"], 10)
 
 	def test_schemas_use_only_types_the_validator_knows(self):
@@ -263,9 +267,69 @@ class TestRealToolSet(FrappeTestCase):
 			module = importlib.import_module(module_name)
 			self.assertNotIn(".commit(", inspect.getsource(module), module_name)
 
-	def test_real_tools_run_through_execute_tool_without_committing(self):
-		# The class-level guard raises AssertionError if any handler commits.
-		context = _context("L1", "someone@example.com")
-		for spec in registry._all_specs():
-			result = execute_tool(spec.name, {}, context)
-			self.assertFalse(result["ok"] and spec.schema["input_schema"]["required"], spec.name)
+	def test_git_source_enum_comes_from_git_subcommands(self):
+		self.assertEqual(
+			self.spec("git_source").schema["input_schema"]["properties"]["subcommand"]["enum"],
+			sorted(GIT_SUBCOMMANDS),
+		)
+
+
+class TestRealToolsRunWithoutCommit(FrappeTestCase):
+	"""Every real handler really runs inside execute_tool on a seeded ticket while commit is forbidden."""
+
+	def setUp(self):
+		# Registered first so it is undone last: the rollback cleanup runs while commits are still guarded.
+		commit_guard = patch.object(frappe.db, "commit", side_effect=AssertionError("commit in tool test"))
+		commit_guard.start()
+		self.addCleanup(commit_guard.stop)
+		self.addCleanup(frappe.db.rollback)
+		self.addCleanup(frappe.set_user, "Administrator")
+		frappe.set_user("Administrator")
+		create_agent(AGENT_EMAIL)
+		self.assertTrue(frappe.db.exists("User", AGENT_EMAIL))
+		frappe.get_doc("User", AGENT_EMAIL).add_roles(ROLE_AGENT)
+		self.assertFalse(frappe.db.exists("HD Ticket Type", SEED_TYPE))
+		frappe.get_doc({"doctype": "HD Ticket Type", "name": SEED_TYPE}).insert()
+		self.ticket = make_ticket(subject="ERPAI-TEST-T27 phiếu", raised_by=AGENT_EMAIL).name
+
+	def arguments(self):
+		return {
+			"get_ticket": {"name": self.ticket},
+			"list_comments": {"ticket": self.ticket},
+			"search_resolved_tickets": {"query": "ERPAI-TEST"},
+			"get_record": {"doctype": "HD Ticket", "name": self.ticket},
+			"search_source": {"pattern": "ToolSpec", "app": "erp_ai"},
+			"read_source": {"path": "erp_ai/erp_ai/agent/tools/registry.py", "limit": 5},
+			"git_source": {"app": "erp_ai", "subcommand": "log", "args": ["--oneline", "-n", "1"]},
+			"set_classification": {"category": "A", "confidence": "Cao"},
+			"set_resolution_hint": {"text": "ERPAI-TEST-T27 gợi ý"},
+			"post_comment": {"content": "ERPAI-TEST-T27 bình luận"},
+			"create_task": {"subject": "ERPAI-TEST-T27 việc", "description": "ERPAI-TEST-T27 mô tả"},
+		}
+
+	def test_every_real_handler_runs_without_committing(self):
+		context = ToolContext(
+			ticket_name=self.ticket,
+			effective_level="L1",
+			instructor=AGENT_EMAIL,
+			run_id="run-t27",
+			category_mapping={"A": {"ticket_type": SEED_TYPE}},
+			agent_user=AGENT_EMAIL,
+		)
+		arguments = self.arguments()
+		specs = REAL_ALL_SPECS()
+		self.assertEqual(sorted(arguments), sorted(spec.name for spec in specs))
+		frappe.set_user(AGENT_EMAIL)
+		for spec in specs:
+			result = execute_tool(spec.name, arguments[spec.name], context)
+			# ok means the handler ran to its end: not a schema refusal, not "not granted", not a handler refusal.
+			self.assertTrue(result["ok"], f"{spec.name}: {result}")
+		frappe.set_user("Administrator")
+		ticket = frappe.get_doc("HD Ticket", self.ticket)
+		self.assertEqual(ticket.ticket_type, SEED_TYPE)
+		self.assertTrue(
+			frappe.db.exists(
+				"Comment", {"reference_name": self.ticket, "content": ["like", "%ERPAI-TEST-T27%"]}
+			)
+		)
+		self.assertTrue(frappe.db.exists("Task", {"subject": "ERPAI-TEST-T27 việc"}))

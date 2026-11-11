@@ -5,6 +5,7 @@ import time
 
 import frappe
 
+from erp_ai.agent.tools.read import _schema
 from erp_ai.agent.tools.registry import ToolSpec
 
 logger = frappe.logger("erp_ai.source")
@@ -278,14 +279,6 @@ def git_source(args, ctx):
 		return _refuse("Không chạy được git")
 
 
-def _schema(name, description, properties, required):
-	return {
-		"name": name,
-		"description": description,
-		"input_schema": {"type": "object", "properties": properties, "required": required},
-	}
-
-
 TOOLS: list[ToolSpec] = [
 	ToolSpec(
 		"search_source",
@@ -325,7 +318,7 @@ TOOLS: list[ToolSpec] = [
 			"Chạy git log hoặc git blame (chỉ đọc) trên kho git của một app.",
 			{
 				"app": {"type": "string", "minLength": 1},
-				"subcommand": {"type": "string", "enum": ["log", "blame"]},
+				"subcommand": {"type": "string", "enum": sorted(GIT_SUBCOMMANDS)},
 				"args": {"type": "array", "maxItems": GIT_MAX_ARGS, "items": {"type": "string"}},
 			},
 			["app", "subcommand"],

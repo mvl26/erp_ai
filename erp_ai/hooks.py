@@ -140,7 +140,11 @@ after_migrate = "erp_ai.install.after_migrate"
 
 doc_events = {
 	"HD Ticket": {
+		"before_insert": "erp_ai.handlers.ticket_before_insert",
 		"after_insert": "erp_ai.handlers.ticket_after_insert",
+	},
+	"Comment": {
+		"after_insert": "erp_ai.handlers.comment_after_insert",
 	},
 }
 

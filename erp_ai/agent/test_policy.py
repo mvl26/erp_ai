@@ -13,10 +13,13 @@ TEAM = "Nhân sự & Hành chính"
 
 
 def _ensure_team(name):
-	if not frappe.db.exists("HD Team", name):
-		frappe.get_doc(
-			{"doctype": "HD Team", "team_name": name, "users": [{"user": "Administrator"}]}
-		).insert(ignore_permissions=True)
+	"""Create the HD Team if missing; return True when this call created it."""
+	if frappe.db.exists("HD Team", name):
+		return False
+	frappe.get_doc({"doctype": "HD Team", "team_name": name, "users": [{"user": "Administrator"}]}).insert(
+		ignore_permissions=True
+	)
+	return True
 
 
 class TestPolicy(FrappeTestCase):
@@ -33,8 +36,15 @@ class TestPolicy(FrappeTestCase):
 			monthly_budget_usd=10,
 			spent_this_month_usd=0,
 		)
-		_ensure_team(TEAM)
-		_ensure_team("IT")
+		created = [name for name in (TEAM, "IT") if _ensure_team(name)]
+		self.addCleanup(self._drop_teams, created)
+
+	def _drop_teams(self, names):
+		# HD Team.after_insert makes an Assignment Rule that Frappe caches in Redis;
+		# a DB rollback leaves that cache entry stale and breaks later HD Ticket inserts.
+		for name in names:
+			frappe.delete_doc("HD Team", name, force=True, ignore_permissions=True)
+		frappe.cache.hdel("assignment_rule_map", "HD Ticket")
 
 	def _ticket(self, **values):
 		ticket = make_ticket(subject="T20 policy ticket")

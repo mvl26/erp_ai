@@ -49,3 +49,54 @@ def set_agent_settings(**fields) -> None:
 	"""Set ERP AI Setting values directly in the DB (no validate), for tests."""
 	for fieldname, value in fields.items():
 		frappe.db.set_single_value(SETTING_DOCTYPE, fieldname, value)
+
+
+class _FakeRawResponse:
+	def __init__(self, message, headers, request_id):
+		self._message = message
+		self.headers = headers
+		self.request_id = request_id
+
+	def parse(self):
+		return _FakeMessage(self._message, self.request_id)
+
+
+class _FakeMessage:
+	def __init__(self, message, request_id):
+		self._message = message
+		self._request_id = request_id
+
+	def model_dump(self) -> dict:
+		return dict(self._message)
+
+
+class _FakeRawMessages:
+	def __init__(self, owner):
+		self._owner = owner
+
+	def create(self, **request):
+		self._owner.requests.append(request)
+		if self._owner.error is not None:
+			raise self._owner.error
+		return _FakeRawResponse(self._owner.message, self._owner.headers, self._owner.request_id)
+
+
+class _FakeMessages:
+	def __init__(self, owner):
+		self.with_raw_response = _FakeRawMessages(owner)
+
+
+class FakeAnthropicClient:
+	"""Thay `anthropic.Anthropic` trong test: không mạng, ghi lại mọi `messages.create(**request)`."""
+
+	def __init__(self, message=None, headers=None, request_id="req_fake", error=None):
+		self.message = message if message is not None else {"type": "message", "content": []}
+		self.headers = headers or {}
+		self.request_id = request_id
+		self.error = error
+		self.requests = []
+		self.messages = _FakeMessages(self)
+
+
+def fake_anthropic_client(**kwargs) -> FakeAnthropicClient:
+	return FakeAnthropicClient(**kwargs)

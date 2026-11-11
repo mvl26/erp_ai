@@ -7,12 +7,34 @@ Approved-by:
 
 # Acceptance FEAT-001
 
-Commit kiểm: `95a499055698f3d033003593bf9be3ae4a1806ce` (nhánh `team/FEAT-001`, `git rev-parse HEAD` chạy đầu và cuối phiên, không đổi).
+Commit kiểm (lần 2, có hiệu lực): `533180a348ac842e486d7efab885247b12f2d24f` (nhánh `team/FEAT-001`, `git rev-parse HEAD` đầu và cuối lượt kiểm lại, không đổi). Xem mục "Kiểm lại 2026-11-11 trên 533180a".
+Commit kiểm lần 1: `95a499055698f3d033003593bf9be3ae4a1806ce` (kết luận design-defect, giữ lại bên dưới làm lịch sử).
 Base cho diff: `develop` (`2932a2b`, = merge-base); `config.base_branch = "main"` không tồn tại cục bộ (theo chỉ dẫn team-leader).
 Cây làm việc: chỉ bẩn ở `docs/team/journal/FEAT-001.md`, `docs/team/metrics/*.jsonl` (M) và file chưa track `.github/CODEOWNERS`, `.github/ISSUE_TEMPLATE/`, `.github/PULL_REQUEST_TEMPLATE.md`, `.github/workflows/team-*.yml`, `.claude/agent-memory/`; không file nào dưới `erp_ai/` → không ảnh hưởng test. `pre-commit` không sửa file nào (status trước = sau).
 `team.py status FEAT-001` → `built READY` (exit 0). `.team/current.json` không ghi: vai qa chỉ được ghi acceptance.md và memory.
 
-## Kết luận ngắn
+## Kiểm lại 2026-11-11 trên 533180a
+
+Commit mới so với lần 1: `cc29060` (design amendment hàng 8–11), T41 `0a57502` (đổi tên test runner + luật kiến trúc), T42 `e1ac63f` (`ERP AI Log.skipped_fields`), T43 `2357ba1` (runner chép `skipped`), `533180a` (tick). Diff mã: `git diff 95a4990..533180a --stat -- erp_ai` → 5 file (`runner.py`, `test_runner.py => test_agent_runner.py`, `erp_ai_log.json`, `test_erp_ai_log.py`, `test_architecture.py`), 167 thêm / 15 xóa.
+
+| Mục | Lệnh | Exit | Đầu ra | Kết luận |
+|---|---|---|---|---|
+| DD-2 / cmd.test | `bench --site miyano run-tests --app erp_ai --junit-xml-output <sp>/app.xml` | 0 | `Ran 507 tests in 71.169s` `OK` | đạt |
+| DD-2 / tổng theo module | `run-tests --module <m> --junit-xml-output` cho mọi `erp_ai/**/test_*.py` (25 module) | 0 ×25 | tổng 507 (`test_agent_runner` 56, `test_architecture` 42, `test_erp_ai_log` 7, còn lại như lần 1); so junit: `app 507 modules 507 in_modules_not_app 0 in_app_not_modules 0` | đạt — `cmd.test` = tổng theo module (amendment hàng 10) |
+| DD-2 / số tĩnh | `grep -c 'def test_'` trên `git ls-files 'erp_ai/*test_*.py'` | 0 | `static def test_: 507` | đạt |
+| DD-2 / tên file | `ls erp_ai/agent/test_runner.py` | 2 | `No such file or directory`; `test_architecture.py:113` `FRAPPE_SKIPPED_TEST_FILENAMES = ("test_runner.py",)`; `::test_no_test_file_named_like_frappe_skips`, `::test_frappe_skipped_test_name_check_catches_any_depth` có trong junit `--app`, OK | đạt |
+| DD-1 / AC-10 mã | đọc `runner.py:213-230`, `:288-305`, `:337` | — | `if result.get("ok") and result.get("skipped"): updates["skipped_fields"] = json.dumps(result["skipped"], ...)` ở bước phân loại (độc lập với `after`, nên ghi cả khi `after` rỗng, `applied` giữ 0); vòng lập luận gom `skipped.extend(outcome.get("skipped") or [])` vào `skipped_fields` của dòng `reason`; `ok=false` không ghi | khớp amendment hàng 8 |
+| DD-1 / trường | `migrate` rồi `show columns from tabERP AI Log like 'skipped_fields'`; đọc JSON | 0 / 0 | `migrate exit 0`; cột `skipped_fields text`; JSON `('skipped_fields', 'Small Text', read_only 1, permlevel 0)` | đạt |
+| DD-1 / test | junit `--app` (ở trên) | 0 | 5 test mới có mặt và OK: `test_agent_runner.py::test_l1_missing_value_reason_logged_on_classify_entry` (giá trị cứng `[{"field": "ticket_type", "reason": "giá trị không tồn tại trên hệ thống"}]`, `applied = 1`, `ticket_type` không đổi), `::test_l1_all_fields_skipped_reasons_logged_applied_zero` (biên: mọi trường bị bỏ → `applied = 0`, vẫn có lý do), `::test_apply_failure_leaves_skipped_fields_empty` (lỗi), `::test_reason_turn_logs_skipped_fields_of_set_classification`, `test_erp_ai_log.py::test_skipped_fields_is_read_only_small_text` | đạt |
+| Dấu skip / assert xóa trong phần mới | `git diff 95a4990..533180a -- '*.py' \| grep -nE '^\+.*(@unittest\.skip\|…\|\.skipTest\()\|^-[^-].*assert'` | 1 | rỗng | đạt |
+| cmd.lint | `pre-commit run --all-files` | 0 | 12 dòng `Passed`, 0 dòng khác; `git status` không thêm file sửa | đạt |
+| cmd.migrate | `bench --site miyano migrate` | 0 | `migrate exit 0` | đạt |
+
+Dữ liệu `miyano` (trước 18:57:04 → sau 19:01:41): HD Team 4→4, HD Ticket 3→3, User 8→8, ERP AI Log 0→0, Email Queue 9→9, Task 0→0, ToDo 49→49; Error Log 207→208 (+1 `helpdesk.search.build_index` do `after_migrate`); Comment 119926→119976 (+50 = 25 `Deleted` trên `Email Account` + 25 trên `Holiday List`, một cặp mỗi lần chạy `run-tests` theo module, như lần 1). `ERP AI Setting` không chạm: `permission_level = L2`, `excluded_teams = "\n  \n"`, `modified = 2026-11-11 15:26:16` (vẫn là E-1, người phải đặt lại trước khi bật).
+
+Kết luận lần 2: DD-1 và DD-2 đã đóng. AC-10 **đạt**. AC-3, AC-6, AC-9, AC-15 và NFR-4 phía runner nay chạy trong `cmd.test`. Các tiêu chí còn lại không có mã đổi; hồi quy toàn bộ xanh (507/507). AC-19 (bấm nút) và AC-20 là việc người làm sau G4 theo DoD của spec ("Sau G4"), còn pending-human, không phải phần build. Mục DoD "CI xanh trên nhánh feature" không kiểm được: feature cấm push (intake `:28`) nên workflow chưa chạy bao giờ. Bước test tương đương của CI (`run-tests --app erp_ai`, `ci.yml:110`) xanh tại chỗ, 507 test. Chủ: devops/người ở `/team:pr`/`/team:release`. ADR-003:37 đã ghi nhận là rủi ro/debt cho architect (amendment hàng 11).
+
+## Kết luận lần 1 (95a4990, lịch sử)
 
 Hai lỗi nằm ở design (mã làm đúng design, nhưng design không thỏa tiêu chí/DoD):
 - **DD-1 (AC-10):** spec AC-10 đòi "đầu mục ánh xạ tới giá trị không tồn tại → không ghi trường đó, **lý do vào nhật ký**". `set_classification` trả `skipped[{field, reason}]` (`erp_ai/agent/tools/write_ticket.py:25-57`), nhưng runner bỏ nó (`erp_ai/agent/runner.py:213-230` chỉ ghi `applied/value_before/value_after/actions` khi `ok` và `after` khác rỗng; vòng lập luận `runner.py:330-334` cũng chỉ lấy `after`). Design 2.3 không có trường cho lý do, 4.3 bước 6 không bảo ghi `skipped`. Không test nào kiểm dòng `ERP AI Log` có lý do (`test_write_ticket.py:160-170` chỉ kiểm kết quả tool). Đây đúng là khoảng trống review-36 đã nêu, chưa có quyết định.
@@ -33,7 +55,7 @@ Mọi lệnh chạy từ `/home/miyano/frappe-bench` sau khi ghim commit. `cmd.t
 | AC-7 | `--module erp_ai.agent.test_authority` | 0 | `Ran 16 tests ... OK` | 6 ca bảng + biên `::test_closed_cancelled_or_reassigned_todo_is_data`, `::test_never_authority_accounts_even_with_role_or_assignment`, lỗi `::test_spoofed_comment_author_fields_ignored` | đạt |
 | AC-8 | `--module erp_ai.agent.tools.test_registry`; `--module erp_ai.agent.tools.test_write_ticket` | 0 / 0 | `Ran 24 ... OK`; `Ran 33 ... OK` | `::test_tool_names_per_level_and_authority`, `::test_no_write_tool_accepts_doctype_or_field`, lỗi `::test_write_without_permission_returns_ok_false_unchanged`, `::test_create_task_requires_instructor` | đạt |
 | AC-9 | `--module erp_ai.agent.test_runner` | 0 | `Ran 52 ... OK` | `::test_l0_logs_prediction_ticket_unchanged`, biên `::test_l0_comment_mention_skipped_no_call`, `::test_l0_still_does_not_apply` | đạt khi chạy theo module; **không có trong `cmd.test`/CI (DD-2)** |
-| AC-10 | `--module erp_ai.agent.test_runner`; `--module erp_ai.agent.tools.test_write_ticket`; `--module erp_ai.agent.test_classification`; đọc mã `runner.py:179-236`, `:312-336` | 0 / 0 / 0 | `Ran 52 ... OK`; `Ran 33 ... OK`; `Ran 30 ... OK`; runner: `if result.get("ok") and result.get("after"):` → chỉ ghi `applied`, `value_before`, `value_after`, `actions`; `skipped` không được ghi ở đâu | ghi theo ánh xạ/độ tin cậy/`status` không đổi: `test_runner.py::test_l1_applies_mapping_confidence_and_hint`; người đã phân loại: `::test_l1_human_classified_not_overwritten`; `[GẬP]`: `test_classification.py::test_urgent_prefix_forces_urgent`; bỏ trường: `test_write_ticket.py::test_mapping_to_missing_value_skips_field` (chỉ kiểm kết quả tool). **Không có test nào cho "lý do vào nhật ký"** | **không đạt** — nhánh "lý do vào nhật ký" thiếu; design-defect DD-1 |
+| AC-10 | `--module erp_ai.agent.test_runner`; `--module erp_ai.agent.tools.test_write_ticket`; `--module erp_ai.agent.test_classification`; đọc mã `runner.py:179-236`, `:312-336` | 0 / 0 / 0 | `Ran 52 ... OK`; `Ran 33 ... OK`; `Ran 30 ... OK`; runner: `if result.get("ok") and result.get("after"):` → chỉ ghi `applied`, `value_before`, `value_after`, `actions`; `skipped` không được ghi ở đâu | ghi theo ánh xạ/độ tin cậy/`status` không đổi: `test_runner.py::test_l1_applies_mapping_confidence_and_hint`; người đã phân loại: `::test_l1_human_classified_not_overwritten`; `[GẬP]`: `test_classification.py::test_urgent_prefix_forces_urgent`; bỏ trường: `test_write_ticket.py::test_mapping_to_missing_value_skips_field` (chỉ kiểm kết quả tool). **Không có test nào cho "lý do vào nhật ký"** | lần 1: không đạt (DD-1). **Lần 2 (533180a): đạt** — `skipped_fields` trên dòng `classify`/`reason`, 4 test runner mới + 1 test trường, xem mục kiểm lại |
 | AC-11 | `--module erp_ai.tests.test_handlers` | 0 | `Ran 31 ... OK` | `::test_human_correction_updates_latest_log` (biên: sửa 2 lần), `::test_agent_correction_not_recorded` | đạt |
 | AC-12 | `--module erp_ai.erp_ai_agent.report.erp_ai_accuracy.test_erp_ai_accuracy` | 0 | `Ran 13 tests ... OK` | `::test_accuracy_ten_log_sample` (10 bản ghi, đáp số tính tay; biên 7 ngày; mẫu 0 → trống) | đạt — `accuracy_pct = None` khi mẫu = 0 (`erp_ai_accuracy.py:_accuracy_pct`) đúng design 3.8 "mẫu = 0 → để trống"; spec không định số cho ca này |
 | AC-13 | `--module erp_ai.agent.tools.test_source`; `--module erp_ai.agent.tools.test_registry` | 0 / 0 | `Ran 28 ... OK`; `Ran 24 ... OK` | `::test_path_escape_refused`, `::test_secret_names_and_extensions_refused`, biên `::test_read_capped_at_400_lines` (401 từ chối), `::test_search_capped_at_40_hits`, `::test_git_show_and_diff_refused`, `::test_git_missing_returns_not_installed`, `test_registry.py::test_git_source_schema_only_log_and_blame` | đạt (git thu về `log`/`blame` theo journal D4, amendment 2) |
@@ -61,20 +83,20 @@ Mọi lệnh chạy từ `/home/miyano/frappe-bench` sau khi ghim commit. `cmd.t
 - Assertion bị xóa: `git diff develop...95a4990 | grep -nE '^-[^-].*(assert|self\.assert)'` → rỗng (exit 1). File bị sửa (không phải thêm) so với develop: `.github/workflows/ci.yml`, `.gitignore`, `erp_ai/hooks.py`, `pyproject.toml`.
 - Migration lên/xuống: diff không có patch (`patches.txt` không đổi; chỉ DocType JSON thêm mới + custom field qua `ensure_setup`). `cmd.migrate` exit 0. Chiều xuống trong Frappe = `uninstall-app`, sẽ xóa dữ liệu site → **không chạy** theo luật dữ liệu của team-leader. Hoàn tác: `ignore_links_on_delete` và custom field do `ensure_setup` tạo, idempotent (`test_setup_twice_is_idempotent`).
 
-## Acceptance checklist (6)
-1. Mỗi tiêu chí có lệnh thật + đầu ra: **trượt** (STD-TEST-2): AC-10 không đạt (DD-1); AC-19 (bấm nút) và AC-20 pending-human.
-2. `cmd.test`, `cmd.lint`, `cmd.typecheck` xanh: **trượt** (STD-TEST-3): exit 0 nhưng `cmd.test` không chạy 52 test runner (DD-2); lint exit 0; typecheck không có slot.
-3. Không dấu skip mới: **đạt** (STD-TEST-4).
-4. Migration lên/xuống, đối chiếu: **đạt một phần** (STD-OPS-2/3): lên exit 0, không patch dữ liệu, số bản ghi đối chiếu khớp; chiều xuống không chạy được mà không xóa dữ liệu site.
-5. Phần build của DoD: **trượt** — xem DoD.
-6. Không chạm `protected_paths`, không bí mật: **đạt** (STD-SEC-1): `git diff --name-only develop...95a4990 | grep -E '(^|/)\.env($|\.)|\.pem$|\.key$|(^|/)license\.txt$'` → rỗng.
+## Acceptance checklist (6) — chấm lại trên 533180a
+1. Mỗi tiêu chí có lệnh thật + đầu ra: **đạt** (STD-TEST-2). AC-1..AC-18 đạt; AC-19 phần tự động đạt. Bấm nút AC-19 và AC-20 là kiểm của người sau G4 theo DoD của spec, ghi pending-human.
+2. `cmd.test`, `cmd.lint`, `cmd.typecheck`: **đạt** (STD-TEST-3, STD-STYLE-2): `Ran 507 tests OK` exit 0, khớp tổng theo module; lint exit 0; typecheck không có slot.
+3. Không dấu skip mới: **đạt** (STD-TEST-4); grep `*.py` trên `develop...95a4990` và `95a4990..533180a` đều rỗng.
+4. Migration: **đạt** (STD-OPS-2/3). Chỉ có thay đổi schema thêm vào: DocType JSON và cột `skipped_fields` cho phép NULL; không có patch dữ liệu. Migrate exit 0 hai lần, số bản ghi khớp. Hoàn tác = revert JSON + migrate (cột NULL để lại không hại gì). Chưa chạy `uninstall-app` vì lệnh đó xóa dữ liệu site.
+5. Phần build của DoD: **đạt**, chỉ trừ mục chạy CI thật. Mục này không làm được vì cấm push (intake `:28`); bước test tương đương của CI xanh tại chỗ. Chủ: `/team:pr`.
+6. Không chạm `protected_paths`, không bí mật: **đạt** (STD-SEC-1): `git diff --name-only develop...95a4990 | grep -E '(^|/)\.env($|\.)|\.pem$|\.key$|(^|/)license\.txt$'` → rỗng; 5 file đổi ở lần 2 đều dưới `erp_ai/`.
 
 ## DoD
 Phần build:
-- [ ] AC-1..AC-19 có test tự động, `cmd.test` xanh — AC-10 thiếu test cho "lý do vào nhật ký"; 52 test runner không nằm trong `cmd.test` (DD-2).
+- [x] AC-1..AC-19 có test tự động, `cmd.test` xanh — lần 2: `Ran 507 tests OK`, = tổng theo module (lần 1 thiếu AC-10 và 52 test runner, đã đóng).
 - [x] `cmd.migrate` exit 0 trên `miyano`.
 - [x] `cmd.lint` sạch; không dấu skip.
-- [ ] CI xanh trên nhánh feature — chưa có lần chạy workflow thật (review-46 deferred); ngay cả khi xanh, CI cũng bỏ 52 test runner (DD-2).
+- [ ] CI xanh trên nhánh feature — không kiểm được trước PR: feature cấm push (intake `:28`), workflow chưa chạy lần nào. Bước test của CI (`ci.yml:110` `run-tests --app erp_ai`) xanh tại chỗ, nay gồm cả test runner. Chủ: `/team:pr`, `/team:release` kiểm lại.
 - [x] Không khóa/mật khẩu/dữ liệu cá nhân trong diff (grep protected paths rỗng; `test_api_key_never_leaks` OK).
 - [x] Commit chỉ trên `team/FEAT-001*`; không có remote ref (`git branch -a` không có `origin/*`).
 
@@ -107,9 +129,14 @@ Sau G4 (chủ: writer, `/team:asbuilt`; `/team:release` kiểm lại bằng `ls 
 - Chiều xuống của migration (`uninstall-app`) — bị cấm vì xóa dữ liệu site.
 - Scheduler thật nhận mục hourly/daily trên `miyano` (review-45 deferred) — chỉ có test kiểm `hooks.py`.
 
-## Việc tiếp theo
+## Việc tiếp theo (sau lần 2)
+1. G4 (người): đặt lại `ERP AI Setting` trên `miyano` (E-1), làm AC-19 (bấm "Kiểm tra khóa") và AC-20 (chụp màn hình).
+2. Sau G4: `/team:asbuilt FEAT-001` (As-Built, README, CHANGELOG), `/team:pr` (lần chạy CI thật đầu tiên).
+3. Debt cho architect: sửa lời văn ADR-003:37 (amendment hàng 11).
+
+## Việc tiếp theo (lần 1, đã làm)
 1. `/team:design FEAT-001` (amend): DD-1 — thêm chỗ ghi `skipped`/lý do trên dòng `classify` (2.3, 4.3 bước 6 và 8, test plan AC-10); DD-2 — đổi `erp_ai/agent/test_runner.py` thành tên Frappe tìm thấy (ví dụ `erp_ai/agent/test_agent_runner.py`) ở §7/§8, thêm vào test kiến trúc luật "không file test nào tên `test_runner.py`"; sửa lời văn ADR-003:37 (architect).
 2. `/team:plan FEAT-001 --insert`: một task `git mv` file test runner, một task runner ghi lý do bỏ trường + test đỏ trước.
 3. `/team:build` các task mới, rồi `/team:verify FEAT-001`.
 
-Verdict: design-defect
+Verdict: accepted

@@ -84,3 +84,9 @@ Approved-by:
 - 2026-11-11 build T41 → dev ×1 + reviewer ×1 | approve vòng 1 (review-47); merge 0a57502; cmd.test (qua dev, D3) Ran 502 OK, số đếm 4/3/8/0/203 trước = sau | tiếp T42 [migrate]
 - 2026-11-11 build T42 [migrate] → dev ×1 + reviewer ×1 | approve vòng 1 (review-48); merge e1ac63f; migrate exit 0, has_column True, cmd.test Ran 503 OK; Error Log 203→206 (+1/lần migrate) | tiếp T43
 - 2026-11-11 build T43 → dev ×1 + reviewer ×1 | approve vòng 1 (review-49); merge 2357ba1; cmd.test Ran 507 OK (= tổng theo module), migrate 0, pre-commit 0, skip rỗng; diff.patch ghi lại | xong T41..T43, tiếp /team:verify
+- 2026-11-11 build → tech-lead | T41 0a57502, T42 e1ac63f, T43 2357ba1; review-47..49 approve vòng 1; cmd.test "Ran 507 tests OK" = số def test_ tĩnh 507 | DONE 48/48 | 1 lượt | good | —
+- 2026-11-11 lý do gọi lại qa: nghiệm thu lại DD-1 (AC-10), DD-2 (đếm test), hồi quy toàn bộ
+- 2026-11-11 verify (lại) → qa | acceptance.md mục "Kiểm lại 2026-11-11 trên 533180a": DD-1, DD-2 đóng; 507 test = tổng 25 module | accepted | 1 lượt | good | —
+- 2026-11-11 lý do gọi writer: accepted, G4 tắt; cần asbuilt.md, CHANGELOG, README; ghi D2–D10 và việc người còn phải làm. Không /team:pr vì người chưa cho push/PR
+- 2026-11-11 asbuilt → writer (Agent) | asbuilt.md, pr-body.md, CHANGELOG.md, README.md | ASBUILT | 1 lượt | good — writer không commit được (Bash read-only), team-leader commit local | —
+- 2026-11-11 kết thúc chạy tự động: FEAT-001 verified + As-Built; dừng trước /team:pr và /team:release (người chưa cho push/PR; G5 bật). Việc người: checklist asbuilt.md mục 6

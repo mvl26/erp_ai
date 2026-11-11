@@ -1,6 +1,7 @@
 import frappe
 from frappe.model.document import Document
 
+from erp_ai import gateway
 from erp_ai.agent.classification import validate_mapping
 from erp_ai.constants import CREDENTIAL_DOCTYPE, KEY_STATUS_ACTIVE, KEY_STATUS_BAD_KEY, SETTING_DOCTYPE
 
@@ -39,6 +40,7 @@ PRICE_FIELDS = (
 	"price_cache_read_per_mtok",
 	"price_output_per_mtok",
 )
+PROBE_RESULT_FIELDS = ("label", "ok", "error_kind", "status")
 
 
 class ERPAISetting(Document):
@@ -100,3 +102,24 @@ class ERPAISetting(Document):
 			frappe.throw("Không thể bật agent khi chưa nhập đủ 4 đơn giá lớn hơn 0")
 		if not (self.trigger_keyword or "").strip():
 			frappe.throw("Không thể bật agent khi từ khóa kích hoạt rỗng")
+
+
+@frappe.whitelist(methods=["POST"])
+def check_keys(label: str | None = None) -> list[dict]:
+	"""Probe every key row (or the one with this label); return only the safe result fields (AC-19)."""
+	frappe.only_for("System Manager")
+	rows = frappe.get_all(
+		CREDENTIAL_DOCTYPE,
+		filters={"parent": SETTING_DOCTYPE, "parenttype": SETTING_DOCTYPE, "parentfield": "credentials"},
+		fields=["name", "label"],
+		order_by="idx",
+	)
+	if label is not None:
+		rows = [row for row in rows if row.label == label]
+		if not rows:
+			frappe.throw(f"Không có khóa '{frappe.utils.escape_html(label)}'")
+	results = []
+	for row in rows:
+		probed = gateway.probe_credential(row.name)
+		results.append({fieldname: probed.get(fieldname) for fieldname in PROBE_RESULT_FIELDS})
+	return results

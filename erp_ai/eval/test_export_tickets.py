@@ -7,6 +7,7 @@ import frappe
 from frappe.tests.utils import FrappeTestCase
 from helpdesk.test_utils import make_ticket
 
+from erp_ai.agent import policy
 from erp_ai.eval import export_tickets
 from erp_ai.test_utils import set_agent_settings
 
@@ -102,26 +103,53 @@ class TestExportTickets(FrappeTestCase):
 
 		self.assertEqual([row["subject"] for row in self._rows(path)], [PREFIX + "keep"])
 
-	def test_export_skips_unlabeled_tickets(self):
+	def test_export_skips_tickets_without_ticket_type(self):
 		self._ticket("labeled")
-		self._ticket("nogroup", team="")
+		self._ticket("notype", ticket_type="")
 		path = self._path()
 
 		export_tickets.export(path)
 
 		self.assertEqual([row["subject"] for row in self._rows(path)], [PREFIX + "labeled"])
 
+	def test_export_keeps_labeled_ticket_with_empty_group_and_priority(self):
+		self._ticket("partial", team="", priority="")
+		path = self._path()
+
+		export_tickets.export(path)
+
+		self.assertEqual([row["subject"] for row in self._rows(path)], [PREFIX + "partial"])
+
+	def test_export_queries_every_send_policy_field(self):
+		self._ticket("fields")
+		seen = []
+
+		def spy(ticket):
+			seen.append(set(policy.SEND_POLICY_FIELDS) - set(ticket))
+			return True
+
+		with patch.object(policy, "can_send_ticket", side_effect=spy):
+			export_tickets.export(self._path())
+
+		self.assertTrue(seen)
+		self.assertEqual([missing for missing in seen if missing], [])
+
 	def test_export_never_writes_attachment_content(self):
 		name = self._ticket("attach")
-		frappe.get_doc(
+		attachment = frappe.get_doc(
 			{
 				"doctype": "File",
 				"file_name": "ERPAI-TEST-secret.txt",
 				"attached_to_doctype": "HD Ticket",
 				"attached_to_name": name,
+				"is_private": 1,
 				"content": "ERPAI-TEST-FILE-CONTENT",
 			}
-		).insert(ignore_permissions=True)
+		)
+		attachment.insert(ignore_permissions=True)
+		# Rollback drops the record, not the physical file: remove exactly the file we created.
+		physical = attachment.get_full_path()
+		self.addCleanup(lambda: os.path.exists(physical) and os.remove(physical))
 		path = self._path()
 
 		export_tickets.export(path)

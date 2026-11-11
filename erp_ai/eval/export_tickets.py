@@ -22,8 +22,9 @@ def export(path: str) -> int:
 	if _inside_repo(path):
 		raise ValueError(REPO_ERROR)
 
-	filters = {field: ("is", "set") for field in CLASSIFICATION_FIELDS}
-	tickets = frappe.get_all("HD Ticket", filters=filters, fields=["name", "ai_opt_out", *EXPORT_FIELDS])
+	# "Labeled" = ticket_type set, the same definition compute_metrics uses.
+	fields = list(dict.fromkeys(["name", *policy.SEND_POLICY_FIELDS, *EXPORT_FIELDS]))
+	tickets = frappe.get_all("HD Ticket", filters={"ticket_type": ("is", "set")}, fields=fields)
 	written = 0
 	with open(path, "w", encoding="utf-8") as handle:
 		for ticket in tickets:

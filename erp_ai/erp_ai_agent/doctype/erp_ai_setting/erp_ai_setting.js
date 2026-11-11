@@ -5,8 +5,8 @@ frappe.ui.form.on("ERP AI Setting", {
 				method: "erp_ai.erp_ai_agent.doctype.erp_ai_setting.erp_ai_setting.check_keys",
 				freeze: true,
 				freeze_message: __("Đang thử từng khóa..."),
-				callback: (r) => {
-					show_key_check_results(r.message || []);
+				callback: (response) => {
+					show_key_check_results(response.message || []);
 					frm.reload_doc();
 				},
 			});

@@ -40,6 +40,7 @@ PRICE_FIELDS = (
 	"price_cache_read_per_mtok",
 	"price_output_per_mtok",
 )
+PROBE_RESULT_FIELDS = ("label", "ok", "error_kind", "status")
 
 
 class ERPAISetting(Document):
@@ -103,10 +104,7 @@ class ERPAISetting(Document):
 			frappe.throw("Không thể bật agent khi từ khóa kích hoạt rỗng")
 
 
-PROBE_RESULT_FIELDS = ("label", "ok", "error_kind", "status")
-
-
-@frappe.whitelist()
+@frappe.whitelist(methods=["POST"])
 def check_keys(label: str | None = None) -> list[dict]:
 	"""Probe every key row (or the one with this label); return only the safe result fields (AC-19)."""
 	frappe.only_for("System Manager")
@@ -119,7 +117,7 @@ def check_keys(label: str | None = None) -> list[dict]:
 	if label is not None:
 		rows = [row for row in rows if row.label == label]
 		if not rows:
-			frappe.throw(f"Không có khóa '{label}'")
+			frappe.throw(f"Không có khóa '{frappe.utils.escape_html(label)}'")
 	results = []
 	for row in rows:
 		probed = gateway.probe_credential(row.name)

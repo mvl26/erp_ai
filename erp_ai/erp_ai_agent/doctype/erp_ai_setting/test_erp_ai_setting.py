@@ -311,8 +311,8 @@ class TestCheckKeys(FrappeTestCase):
 				[self.rows["ERPAI-TEST-A"], self.rows["ERPAI-TEST-B"]],
 			)
 			probe.reset_mock()
-			one = erp_ai_setting.check_keys("ERPAI-TEST-B")
-			self.assertEqual([r["label"] for r in one], ["ERPAI-TEST-B"])
+			single_result = erp_ai_setting.check_keys("ERPAI-TEST-B")
+			self.assertEqual([item["label"] for item in single_result], ["ERPAI-TEST-B"])
 			probe.assert_called_once_with(self.rows["ERPAI-TEST-B"])
 			probe.reset_mock()
 			with self.assertRaises(frappe.ValidationError):
@@ -321,6 +321,18 @@ class TestCheckKeys(FrappeTestCase):
 
 	def test_check_keys_whitelisted_for_post(self):
 		self.assertIn(erp_ai_setting.check_keys, frappe.whitelisted)
+		self.assertEqual(
+			frappe.allowed_http_methods_for_whitelisted_func[erp_ai_setting.check_keys], ["POST"]
+		)
+
+	def test_check_keys_escapes_the_label_in_the_unknown_label_error(self):
+		with patch.object(erp_ai_setting.gateway, "probe_credential") as probe:
+			with self.assertRaises(frappe.ValidationError) as caught:
+				erp_ai_setting.check_keys("<img src=x onerror=alert(1)>")
+		message = str(caught.exception)
+		self.assertNotIn("<img", message)
+		self.assertIn("&lt;img", message)
+		probe.assert_not_called()
 
 	def test_check_keys_refuses_hd_agent_before_reading_or_probing(self):
 		self._become_hd_agent()

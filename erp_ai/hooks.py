@@ -83,7 +83,8 @@ required_apps = ["helpdesk"]
 # ------------
 
 # before_install = "erp_ai.install.before_install"
-# after_install = "erp_ai.install.after_install"
+after_install = "erp_ai.install.after_install"
+after_migrate = "erp_ai.install.after_migrate"
 
 # Uninstallation
 # ------------

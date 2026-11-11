@@ -109,6 +109,9 @@ CI_REQUIRED_APPS = (
 	("erpnext", "version-15"),
 )
 
+# frappe/test_runner.py:160 skips any file with this name when running `run-tests --app`
+FRAPPE_SKIPPED_TEST_FILENAMES = ("test_runner.py",)
+
 
 # ---------------------------------------------------------------------------------------------------
 # Scanning helpers
@@ -568,6 +571,15 @@ def check_no_legacy_ticket_comment(sources: dict) -> list:
 	return violations
 
 
+def check_no_frappe_skipped_test_files(rel_paths) -> list:
+	"""D-34: no file, at any depth, is named like a file Frappe skips when collecting tests."""
+	return [
+		f"{rel}: file name {Path(rel).name} is skipped by Frappe's test runner, rename it"
+		for rel in rel_paths
+		if Path(rel).name in FRAPPE_SKIPPED_TEST_FILENAMES
+	]
+
+
 def check_ci_workflow(text: str) -> list:
 	"""D-23: bench init on version-15; helpdesk v15.1.0, erpnext version-15, telephony installed before erp_ai."""
 	violations = []
@@ -705,6 +717,16 @@ class TestArchitecture(unittest.TestCase):
 		text = CI_WORKFLOW.read_text(encoding="utf-8")
 		self.assertGreater(len(text.splitlines()), 0)
 		self.assertEqual(check_ci_workflow(text), [])
+
+	def test_no_test_file_named_like_frappe_skips(self):
+		rel_paths = [
+			path.relative_to(PACKAGE_ROOT).as_posix()
+			for path in sorted(PACKAGE_ROOT.rglob("*.py"))
+			if "__pycache__" not in path.parts
+		]
+		self.assertGreater(len(rel_paths), 0)
+		self.assertEqual(check_no_frappe_skipped_test_files(rel_paths), [])
+		self.assertIn("agent/test_agent_runner.py", rel_paths)
 
 
 # ---------------------------------------------------------------------------------------------------
@@ -1084,6 +1106,27 @@ class TestScannersCatchViolations(unittest.TestCase):
 	def test_ci_check_ignores_commented_commands(self):
 		commented = self.GOOD_CI.replace("bench get-app erpnext", "# bench get-app erpnext")
 		self.assertCaught(check_ci_workflow(commented), "get-app erpnext")
+
+	# Frappe-skipped test file names ------------------------------------------------------------
+
+	def test_frappe_skipped_test_name_check_catches_any_depth(self):
+		violating = [
+			"agent/test_runner.py",
+			"tests/test_runner.py",
+			"erp_ai_agent/doctype/x/test_runner.py",
+			"test_runner.py",
+		]
+		clean = [
+			"agent/test_agent_runner.py",
+			"tests/test_runner_utils.py",
+			"agent/runner.py",
+			"agent/my_test_runner.py",
+		]
+		violations = check_no_frappe_skipped_test_files(violating)
+		self.assertEqual(len(violations), len(violating))
+		for rel in violating:
+			self.assertCaught(violations, rel)
+		self.assertEqual(check_no_frappe_skipped_test_files(clean), [])
 
 
 if __name__ == "__main__":

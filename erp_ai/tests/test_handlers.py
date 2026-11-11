@@ -6,7 +6,7 @@ from helpdesk.test_utils import make_ticket
 
 from erp_ai.agent import runner
 from erp_ai.constants import SETTING_DOCTYPE
-from erp_ai.test_utils import FakeGateway, make_model_result
+from erp_ai.test_utils import FakeGateway, make_model_result, set_agent_settings
 
 RUN_FOR_TICKET_PATH = "erp_ai.agent.runner.run_for_ticket"
 
@@ -112,11 +112,11 @@ class TestTicketHandlers(FrappeTestCase):
 
 	def test_run_for_ticket_calls_classify_once(self):
 		fake_gateway = FakeGateway(make_model_result(text="{}"))
-		with (
-			patch.object(frappe.db, "get_single_value", side_effect=_setting_value(0)),
-			patch("erp_ai.gateway.call_model", fake_gateway),
-		):
-			ticket = make_ticket(subject="erp_ai T1 runner")
+		self.addCleanup(frappe.db.rollback)
+		self.addCleanup(frappe.set_user, "Administrator")
+		with patch("erp_ai.gateway.call_model", fake_gateway):
+			ticket = make_ticket(subject="ERPAI-TEST-T1 runner")
+			set_agent_settings(enabled=1, permission_level="L0")
 			runner.run_for_ticket(ticket.name, "ticket_insert")
 
 		self.assertEqual(fake_gateway.call_count, 1)

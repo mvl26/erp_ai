@@ -274,12 +274,22 @@ class TestGitSource(FrappeTestCase):
 				"--no-ind",
 				"--ext",
 				"--text",
+				"-pS../../outside/x",
+				"-nS../../outside/x",
+				"-wO../../outside/x",
+				"-pw",
 			):
 				for sub in ("log", "show", "diff", "blame"):
 					self.assertFalse(self.git(sub, [flag, "--", "src/a.py"])["ok"], (sub, flag))
 			run.assert_not_called()
 			for flag in ("--oneline", "--stat", "-n3", "--max-count=5", "--author=bob", "-n"):
 				self.assertTrue(self.git("log", [flag])["ok"], flag)
+
+	def test_git_nonzero_exit_hides_stderr(self):
+		with patch(RUN_PATH, return_value=completed("", "fatal: secret-path-detail", 128)):
+			result = self.git("log")
+		self.assertFalse(result["ok"])
+		self.assertNotIn("secret-path-detail", result["reason"])
 
 	def test_git_runs_with_closed_stdin(self):
 		with patch(RUN_PATH, return_value=completed("ok")) as run:

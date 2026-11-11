@@ -80,6 +80,9 @@ class TestPolicy(FrappeTestCase):
 	def test_missing_ticket_cannot_send(self):
 		self.assertFalse(policy.can_send_ticket("T20-NOT-A-TICKET"))
 
+	def test_empty_ticket_cannot_send(self):
+		self.assertFalse(policy.can_send_ticket(None))
+
 	def test_accepts_dict_and_document(self):
 		name = self._ticket(agent_group=TEAM)
 		self.assertFalse(policy.can_send_ticket({"agent_group": TEAM}))
@@ -91,6 +94,10 @@ class TestPolicy(FrappeTestCase):
 		self.assertTrue(policy.contains_keyword("xin chào @AI giúp tôi"))
 		self.assertFalse(policy.contains_keyword("không nhắc ai"))
 		self.assertFalse(policy.contains_keyword(None))
+
+	def test_contains_keyword_ignores_case_of_configured_keyword(self):
+		set_agent_settings(trigger_keyword="@AI")
+		self.assertTrue(policy.contains_keyword("xin chào @ai giúp tôi"))
 
 	def test_empty_keyword_never_matches(self):
 		set_agent_settings(trigger_keyword="")
@@ -141,3 +148,10 @@ class TestPolicy(FrappeTestCase):
 		tomorrow = datetime.combine(now_datetime().date() + timedelta(days=1), datetime.min.time())
 		self.assertEqual(policy.runs_today(ticket, now=tomorrow + timedelta(hours=1)), 0)
 		self.assertEqual(policy.runs_today(ticket, now=now_datetime()), 1)
+
+	def test_runs_today_counts_creation_exactly_at_midnight(self):
+		ticket = self._ticket()
+		midnight = datetime.combine(now_datetime().date(), datetime.min.time())
+		self._log(ticket, "edge", "classify", created=midnight)
+		self._log(ticket, "before", "classify", created=midnight - timedelta(seconds=1))
+		self.assertEqual(policy.runs_today(ticket, now=midnight + timedelta(hours=12)), 1)

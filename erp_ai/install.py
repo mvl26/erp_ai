@@ -2,6 +2,7 @@ import frappe
 from frappe.custom.doctype.custom_field.custom_field import create_custom_fields
 from frappe.permissions import setup_custom_perms
 
+from erp_ai.agent.policy import OPT_OUT_FIELD
 from erp_ai.constants import (
 	AGENT_USER,
 	HELPDESK_AGENT_ROLE,
@@ -15,7 +16,6 @@ TICKET_DOCTYPE = "HD Ticket"
 TEMPLATE_NAME = "Default"
 AI_MODULE = "ERP AI agent"
 AI_SECTION_FIELD = "ai_section"
-OPT_OUT_FIELD = "ai_opt_out"
 AI_PERMLEVEL = 8
 
 

@@ -21,6 +21,8 @@ def _normalize(name) -> str:
 
 def can_send_ticket(ticket) -> bool:
 	"""The only send condition: not opted out and not in an excluded team."""
+	if not ticket:
+		return False
 	if isinstance(ticket, str):
 		values = frappe.db.get_value("HD Ticket", ticket, list(SEND_POLICY_FIELDS), as_dict=True)
 		if not values:
@@ -33,7 +35,7 @@ def can_send_ticket(ticket) -> bool:
 	if not team:
 		return True
 	excluded = frappe.db.get_single_value(SETTING_DOCTYPE, EXCLUDED_TEAMS_FIELD) or ""
-	return team not in {_normalize(line) for line in excluded.splitlines()} - {""}
+	return team not in {_normalize(line) for line in excluded.splitlines()}
 
 
 def contains_keyword(content) -> bool:

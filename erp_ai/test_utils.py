@@ -51,6 +51,15 @@ def set_agent_settings(**fields) -> None:
 		frappe.db.set_single_value(SETTING_DOCTYPE, fieldname, value)
 
 
+def add_credential(label, **fields) -> str:
+	"""Append a key row to ERP AI Setting without validation and return the child row name."""
+	settings = frappe.get_single(SETTING_DOCTYPE)
+	settings.append("credentials", {"label": label, "api_key": f"sk-{label}", **fields})
+	settings.flags.ignore_validate = True
+	settings.save(ignore_permissions=True)
+	return settings.credentials[-1].name
+
+
 class _FakeRawResponse:
 	def __init__(self, message, headers, request_id):
 		self._message = message

@@ -10,6 +10,9 @@ from erp_ai.agent.prompts import build_classify_request
 from erp_ai.agent.run_log import write_entry
 from erp_ai.constants import (
 	AGENT_USER,
+	JOB_SAFETY_MARGIN_S,
+	JOB_TIMEOUT_S,
+	LEVELS,
 	SETTING_DOCTYPE,
 	TITLE_RUN_FAILED,
 	TITLE_WRONG_USER,
@@ -17,7 +20,6 @@ from erp_ai.constants import (
 	TRIGGER_TICKET_INSERT,
 )
 
-RUN_DEADLINE_S = 540
 CLASSIFY_MAX_TOKENS = 400
 UNPARSEABLE_ERROR = "UNPARSEABLE: không phân loại được"
 BAD_MAPPING_ERROR = "category_mapping không hợp lệ, không có giá trị dự đoán"
@@ -73,17 +75,18 @@ def _run(ticket_name, trigger):
 		return
 	# (e)
 	level = policy.effective_level(settings)
-	deadline = time.monotonic() + RUN_DEADLINE_S
+	deadline = time.monotonic() + JOB_TIMEOUT_S - JOB_SAFETY_MARGIN_S
 
 	if trigger == TRIGGER_TICKET_INSERT:
 		_classify(ticket_name, trigger, run_id, settings, deadline)
-	elif trigger == TRIGGER_COMMENT_MENTION and level == "L0":
+	elif trigger == TRIGGER_COMMENT_MENTION and level == LEVELS[0]:
 		_log_skip(ticket_name, trigger, run_id, "level_L0")
 
 
 def _log_skip(ticket_name, trigger, run_id, stop_reason):
+	# a ticket deleted before the job ran cannot be a Link target; keep the skip entry without it
 	write_entry(
-		ticket=ticket_name,
+		ticket=ticket_name if frappe.db.exists("HD Ticket", ticket_name) else None,
 		run_id=run_id,
 		entry_type="skip",
 		trigger=trigger,

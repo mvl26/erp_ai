@@ -6,13 +6,16 @@ import frappe
 from frappe.tests.utils import FrappeTestCase
 from helpdesk.test_utils import make_ticket
 
-from erp_ai.agent import runner
+from erp_ai.agent import authority, runner
 from erp_ai.agent.classification import DEFAULT_CATEGORY_MAPPING
 from erp_ai.agent.prompts import build_classify_request
 from erp_ai.agent.run_log import write_entry
 from erp_ai.constants import (
 	AGENT_USER,
+	CLASSIFIED_BY_HUMAN,
 	CREDENTIAL_DOCTYPE,
+	JOB_SAFETY_MARGIN_S,
+	JOB_TIMEOUT_S,
 	KEY_STATUS_BAD_KEY,
 	LOG_DOCTYPE,
 	TITLE_RUN_FAILED,
@@ -23,7 +26,19 @@ from erp_ai.test_utils import FakeGateway, add_credential, make_model_result, se
 
 PREFIX = "ERPAI-TEST-"
 CLASSIFY_A = json.dumps({"dau_muc": "A", "do_tin_cay": "Cao", "ly_do": "x"})
-TICKET_FIELDS = ["ticket_type", "agent_group", "priority", "status", "subject", "modified"]
+TICKET_FIELDS = [
+	"ticket_type",
+	"agent_group",
+	"priority",
+	"status",
+	"subject",
+	"modified",
+	"ai_classified_by",
+	"ai_confidence",
+	"ai_updated_at",
+	"ai_resolution_hint",
+]
+DAILY_LIMIT = 2  # not the DocType default (5), so the run must read the Setting
 
 
 class TestRunner(FrappeTestCase):
@@ -38,7 +53,7 @@ class TestRunner(FrappeTestCase):
 		set_agent_settings(
 			enabled=1,
 			permission_level="L0",
-			max_runs_per_ticket_per_day=5,
+			max_runs_per_ticket_per_day=DAILY_LIMIT,
 			category_mapping=json.dumps(DEFAULT_CATEGORY_MAPPING),
 		)
 		self.gateway = FakeGateway(make_model_result(text=CLASSIFY_A))
@@ -56,6 +71,9 @@ class TestRunner(FrappeTestCase):
 
 	def _run(self, trigger="ticket_insert"):
 		runner.run_for_ticket(self.ticket.name, trigger)
+
+	def _comment_count(self):
+		return frappe.db.count("Comment", authority.ticket_comment_filters(self.ticket.name))
 
 	def _seed_runs(self, count):
 		for index in range(count):
@@ -119,37 +137,79 @@ class TestRunner(FrappeTestCase):
 		self.assertEqual([(e.entry_type, e.stop_reason) for e in entries], [("skip", "not_sendable")])
 		self.assertEqual(entries[0].trigger, "ticket_insert")
 
-	def test_sixth_run_same_day_no_call(self):
-		self._seed_runs(5)
+	def test_run_over_setting_limit_same_day_no_call(self):
+		self._seed_runs(DAILY_LIMIT)
 		self._run()
 
 		self.assertEqual(self.gateway.call_count, 0)
 		skips = self._entries(entry_type="skip")
 		self.assertEqual([e.stop_reason for e in skips], ["daily_limit"])
 
-	def test_fifth_run_same_day_still_calls(self):
-		self._seed_runs(4)
+	def test_last_run_within_setting_limit_still_calls(self):
+		self._seed_runs(DAILY_LIMIT - 1)
 		self._run()
 
 		self.assertEqual(self.gateway.call_count, 1)
 		self.assertEqual(self._entries(entry_type="skip"), [])
 
+	def test_disabled_and_not_sendable_writes_no_log(self):
+		set_agent_settings(enabled=0)
+		frappe.db.set_value("HD Ticket", self.ticket.name, "ai_opt_out", 1)
+		self._run()
+
+		self.assertEqual(self._entries(), [])
+
+	def test_not_sendable_wins_over_daily_limit(self):
+		frappe.db.set_value("HD Ticket", self.ticket.name, "ai_opt_out", 1)
+		self._seed_runs(DAILY_LIMIT)
+		self._run()
+
+		self.assertEqual([e.stop_reason for e in self._entries(entry_type="skip")], ["not_sendable"])
+
+	def test_deleted_ticket_logs_skip_without_failing(self):
+		missing = f"{PREFIX}missing-ticket"
+		before = set(frappe.get_all(LOG_DOCTYPE, pluck="name"))
+		with patch.object(frappe, "log_error") as log_error:
+			runner.run_for_ticket(missing, "ticket_insert")
+
+		log_error.assert_not_called()
+		new_rows = [
+			row
+			for row in frappe.get_all(LOG_DOCTYPE, fields=["name", "entry_type", "stop_reason", "ticket"])
+			if row.name not in before
+		]
+		self.assertEqual(
+			[(r.entry_type, r.stop_reason, r.ticket) for r in new_rows], [("skip", "not_sendable", None)]
+		)
+		self.assertEqual(self.gateway.call_count, 0)
+
 	# (e) and classification step at L0
 
 	def test_l0_logs_prediction_ticket_unchanged(self):
+		self.ticket.add_comment("Comment", f"{PREFIX}human comment")
+		frappe.db.set_value(
+			"HD Ticket",
+			self.ticket.name,
+			{
+				"ai_classified_by": CLASSIFIED_BY_HUMAN,
+				"ai_confidence": "Cao",
+				"ai_resolution_hint": f"{PREFIX}hint",
+			},
+		)
 		before = frappe.db.get_value("HD Ticket", self.ticket.name, TICKET_FIELDS, as_dict=True)
+		comments_before = self._comment_count()
+		self.assertEqual(comments_before, 1)
 		self._run()
 
 		after = frappe.db.get_value("HD Ticket", self.ticket.name, TICKET_FIELDS, as_dict=True)
 		self.assertEqual(before, after)
+		self.assertEqual(self._comment_count(), comments_before)
 		self.assertEqual(self.gateway.call_count, 1)
 		call = self.gateway.calls[0]
 		self.assertEqual(call["task"], "classify")
 		self.assertEqual(call["max_tokens"], 400)
 		expected = build_classify_request(self.ticket.subject, self.ticket.description)
 		self.assertEqual((call["system"], call["messages"]), (expected["system"], expected["messages"]))
-		self.assertGreater(call["deadline"] - time.monotonic(), 530)
-		self.assertLessEqual(call["deadline"] - time.monotonic(), 540)
 
 		(entry,) = self._entries()
 		mapped = DEFAULT_CATEGORY_MAPPING["A"]
@@ -165,6 +225,24 @@ class TestRunner(FrappeTestCase):
 			(entry.applied, entry.model, entry.credential_label, entry.stop_reason),
 			(0, "fake-model", "fake", "end_turn"),
 		)
+
+	def test_deadline_follows_job_timeout_constants(self):
+		with (
+			patch.object(runner, "JOB_TIMEOUT_S", 100, create=True),
+			patch.object(runner, "JOB_SAFETY_MARGIN_S", 30, create=True),
+		):
+			self._run()
+
+		remaining = self.gateway.calls[0]["deadline"] - time.monotonic()
+		self.assertGreater(remaining, 60)
+		self.assertLessEqual(remaining, 70)
+
+	def test_default_deadline_is_job_timeout_minus_margin(self):
+		self._run()
+
+		remaining = self.gateway.calls[0]["deadline"] - time.monotonic()
+		self.assertGreater(remaining, JOB_TIMEOUT_S - JOB_SAFETY_MARGIN_S - 10)
+		self.assertLessEqual(remaining, JOB_TIMEOUT_S - JOB_SAFETY_MARGIN_S)
 
 	def test_classify_entry_records_usage_cost_and_keys(self):
 		usage = {
@@ -224,7 +302,7 @@ class TestRunner(FrappeTestCase):
 			[("skip", "level_L0", "comment_mention")],
 		)
 
-	def test_over_budget_l3_is_not_l0_for_comment_mention(self):
+	def test_l1_comment_mention_is_not_skipped_as_level_l0(self):
 		set_agent_settings(permission_level="L1")
 		self._run("comment_mention")
 

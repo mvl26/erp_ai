@@ -115,7 +115,7 @@ class TestTicketHandlers(FrappeTestCase):
 		self.addCleanup(frappe.db.rollback)
 		self.addCleanup(frappe.set_user, "Administrator")
 		with patch("erp_ai.gateway.call_model", fake_gateway):
-			ticket = make_ticket(subject="erp_ai T1 runner")
+			ticket = make_ticket(subject="ERPAI-TEST-T1 runner")
 			set_agent_settings(enabled=1, permission_level="L0")
 			runner.run_for_ticket(ticket.name, "ticket_insert")
 

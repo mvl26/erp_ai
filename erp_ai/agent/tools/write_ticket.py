@@ -1,5 +1,5 @@
 import frappe
-from frappe.utils import now_datetime
+from frappe.utils import escape_html, now_datetime
 
 from erp_ai.agent.classification import Classification, resolve_ticket_values
 from erp_ai.agent.tools.registry import ToolContext, ToolSpec
@@ -66,7 +66,8 @@ def set_resolution_hint(args: dict, ctx: ToolContext) -> dict:
 	before = doc.get(HINT_FIELD)
 	doc.set(HINT_FIELD, args["text"])
 	doc.save()
-	return {"ok": True, "before": before, "after": args["text"]}
+	# Frappe sanitizes Text Editor values on save: report what was stored, not the raw input.
+	return {"ok": True, "before": before, "after": doc.get(HINT_FIELD)}
 
 
 def post_comment(args: dict, ctx: ToolContext) -> dict:
@@ -92,12 +93,15 @@ def create_task(args: dict, ctx: ToolContext) -> dict:
 		return _fail("thiếu quyền đọc phiếu")
 	if not frappe.has_permission(TASK_DOCTYPE, "create"):
 		return _fail("thiếu quyền tạo Task")
-	link = f"Phiếu {doc.name}: /helpdesk/tickets/{doc.name}"
+	# Task.description is a Text Editor (HTML) field: a clickable link paragraph first, then the escaped text.
+	path = f"/helpdesk/tickets/{doc.name}"
+	link = f'<p>Phiếu {escape_html(doc.name)}: <a href="{escape_html(path)}">{escape_html(path)}</a></p>'
+	text = escape_html(args["description"]).replace("\r\n", "\n").replace("\n", "<br>")
 	task = frappe.get_doc(
 		{
 			"doctype": TASK_DOCTYPE,
 			"subject": args["subject"],
-			"description": f"{link}\n\n{args['description']}",
+			"description": f"{link}\n<p>{text}</p>",
 		}
 	)
 	task.insert()

@@ -8,7 +8,7 @@ from helpdesk.test_utils import create_agent, make_ticket
 
 from erp_ai.agent.tools import registry, write_ticket
 from erp_ai.agent.tools.registry import ToolContext, execute_tool
-from erp_ai.constants import AGENT_USER, CLASSIFIED_BY_AI, CLASSIFIED_BY_HUMAN
+from erp_ai.constants import AGENT_USER, CLASSIFIED_BY_AI, CLASSIFIED_BY_HUMAN, ROLE_AGENT
 
 AGENT = "t25.agent@example.com"
 CUSTOMER = "t25.customer@example.com"
@@ -42,6 +42,10 @@ class TestWriteTicket(FrappeTestCase):
 		assert not leftovers, f"test data was committed: {leftovers}"
 
 	def setUp(self):
+		# Registered first so it is undone last: the rollback cleanup below runs while commits are still guarded.
+		commit_guard = patch.object(frappe.db, "commit", side_effect=AssertionError("commit in test"))
+		commit_guard.start()
+		self.addCleanup(commit_guard.stop)
 		# FrappeTestCase rolls back only after the whole class: undo each test. Cleanups run LIFO:
 		# set_user, then rollback, then the stale Redis rule map (HD Team.after_insert caches an Assignment Rule).
 		self.addCleanup(frappe.cache.hdel, "assignment_rule_map", "HD Ticket")
@@ -220,6 +224,7 @@ class TestWriteTicket(FrappeTestCase):
 T26_AGENT = "erpai-test-t26.agent@example.com"
 T26_CUSTOMER = "erpai-test-t26.customer@example.com"
 T26_OUTSIDER = "erpai-test-t26.outsider@example.com"
+T26_AGENT_ONLY = "erpai-test-t26.agent-only@example.com"
 T26_INSTRUCTOR = "erpai-test-t26.instructor@example.com"
 HINT_FIELD = "ai_resolution_hint"
 
@@ -239,7 +244,9 @@ class TestWriteTicketTools(FrappeTestCase):
 		self.addCleanup(frappe.set_user, "Administrator")
 		frappe.set_user("Administrator")
 		create_agent(T26_AGENT)
-		_make_user(T26_AGENT, "Projects User")
+		# The production agent has only ROLE_AGENT + Agent: Task create comes from the if_owner Custom DocPerm.
+		_make_user(T26_AGENT, ROLE_AGENT)
+		_make_user(T26_AGENT_ONLY, "Agent")
 		_make_user(T26_CUSTOMER, "HD Customer")
 		_make_user(T26_OUTSIDER)
 		self.ticket = make_ticket(subject="ERPAI-TEST-T26 phiếu", raised_by=T26_CUSTOMER).name
@@ -275,6 +282,15 @@ class TestWriteTicketTools(FrappeTestCase):
 		self.assertEqual(self._hint(), "Khởi động lại máy in")
 		self.assertEqual(result["before"], before)
 		self.assertEqual(result["after"], "Khởi động lại máy in")
+
+	def test_set_resolution_hint_returns_the_stored_value_as_after(self):
+		# Text Editor values are sanitized on save: `after` must be what was stored, not the raw input.
+		result = self._call(
+			write_ticket.set_resolution_hint, T26_AGENT, {"text": "Khởi động <script>alert(1)</script>lại"}
+		)
+		self.assertTrue(result["ok"], result)
+		self.assertNotIn("<script", self._hint())
+		self.assertEqual(result["after"], self._hint())
 
 	def test_set_resolution_hint_without_write_permission_returns_ok_false_unchanged(self):
 		before = self._hint()
@@ -383,6 +399,24 @@ class TestWriteTicketTools(FrappeTestCase):
 		self.assertIn(self.ticket, first_line)
 		self.assertIn(f"/helpdesk/tickets/{self.ticket}", first_line)
 		self.assertIn("Kiểm tra máy in", task.description)
+
+	def test_create_task_description_is_html_with_clickable_link_and_separated_text(self):
+		args = {"subject": "ERPAI-TEST-T26 việc", "description": "Dòng 1\nDòng 2 <b>x</b>"}
+		result = self._call(write_ticket.create_task, T26_AGENT, args)
+		self.assertTrue(result["ok"], result)
+		description = frappe.db.get_value("Task", result["task"], "description")
+		self.assertIn(f'<a href="/helpdesk/tickets/{self.ticket}"', description)
+		self.assertTrue(description.startswith("<p>"), description)
+		self.assertIn("Dòng 1<br>Dòng 2", description)
+		self.assertNotIn("<b>x</b>", description)
+		self.assertLess(description.index("/helpdesk/tickets/"), description.index("Dòng 1"))
+
+	def test_create_task_without_task_role_perm_for_agent_only_user_is_refused(self):
+		before = frappe.db.count("Task")
+		result = self._call(write_ticket.create_task, T26_AGENT_ONLY, {"subject": "s", "description": "d"})
+		self._assert_refused(result)
+		self.assertIn("Task", result["reason"])
+		self.assertEqual(frappe.db.count("Task"), before)
 
 	def test_create_task_requires_instructor(self):
 		before = frappe.db.count("Task")

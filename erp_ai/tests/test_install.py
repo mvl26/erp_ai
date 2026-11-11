@@ -68,6 +68,9 @@ class TestInstall(FrappeTestCase):
 		frappe.db.delete("Custom Field", {"dt": "HD Ticket", "fieldname": ("like", "ai\\_%")})
 		frappe.db.delete("HD Ticket Template Field", {"parent": TEMPLATE, "fieldname": ("like", "ai\\_%")})
 		frappe.clear_cache(doctype="HD Ticket")
+		# Same for the agent's Task permission (Custom DocPerm insert has no DDL, so it stays in the transaction).
+		frappe.db.delete("Custom DocPerm", {"parent": "Task", "role": ROLE_AGENT})
+		frappe.clear_cache(doctype="Task")
 		install.ensure_setup()
 
 	def test_setup_twice_is_idempotent(self):
@@ -162,6 +165,56 @@ class TestInstall(FrappeTestCase):
 		self.assertIn("not found", logger.return_value.warning.call_args.args[0])
 		self.assertEqual(logger.return_value.warning.call_args.args[1], TEMPLATE)
 		self.assertFalse(frappe.db.exists("HD Ticket Template", TEMPLATE))
+
+	def _agent_task_perms(self):
+		return frappe.get_all(
+			"Custom DocPerm",
+			filters={"parent": "Task", "role": ROLE_AGENT},
+			fields=["permlevel", "read", "write", "create", "if_owner", "delete", "submit"],
+		)
+
+	def _other_task_perms(self):
+		return frappe.db.sql(
+			"select name, role, permlevel, `read`, `write`, `create`, `delete`, if_owner, modified "
+			"from `tabCustom DocPerm` where parent='Task' and role != %s order by name",
+			ROLE_AGENT,
+		)
+
+	def test_agent_task_perm_created_once_if_owner(self):
+		other = self._other_task_perms()
+		self.assertTrue(other)
+		install.ensure_setup()
+		install.after_migrate()
+		perms = self._agent_task_perms()
+		self.assertEqual(len(perms), 1)
+		perm = perms[0]
+		self.assertEqual((perm.permlevel, perm.read, perm.write, perm.create, perm.if_owner), (0, 1, 1, 1, 1))
+		self.assertEqual((perm.delete, perm.submit), (0, 0))
+		self.assertEqual(self._other_task_perms(), other)
+
+	def test_task_perm_copies_standard_perms_when_no_custom_yet(self):
+		frappe.db.delete("Custom DocPerm", {"parent": "Task"})
+		standard = frappe.db.count("DocPerm", {"parent": "Task"})
+		install.ensure_setup()
+		self.assertEqual(len(self._agent_task_perms()), 1)
+		self.assertEqual(frappe.db.count("Custom DocPerm", {"parent": "Task"}), standard + 1)
+
+	def test_missing_task_doctype_is_skipped_with_warning(self):
+		frappe.db.delete("Custom DocPerm", {"parent": "Task", "role": ROLE_AGENT})
+		real = frappe.db.exists
+		with (
+			patch.object(
+				install.frappe.db,
+				"exists",
+				side_effect=lambda *a, **k: None if a[:2] == ("DocType", "Task") else real(*a, **k),
+			),
+			patch.object(install.frappe, "logger") as logger,
+		):
+			install.ensure_setup()
+		warnings = [c.args for c in logger.return_value.warning.call_args_list if "Task" in c.args[0]]
+		self.assertEqual(len(warnings), 1)
+		self.assertIn("not found", warnings[0][0])
+		self.assertEqual(self._agent_task_perms(), [])
 
 	def test_agent_user_has_exact_roles_without_system_manager(self):
 		user = frappe.get_doc("User", AGENT_USER)

@@ -1,5 +1,6 @@
 import frappe
 from frappe.custom.doctype.custom_field.custom_field import create_custom_fields
+from frappe.permissions import setup_custom_perms
 
 from erp_ai.constants import (
 	AGENT_USER,
@@ -33,6 +34,7 @@ def ensure_setup() -> None:
 	_ensure_default_settings()
 	_ensure_ticket_custom_fields()
 	_ensure_template_rows()
+	_ensure_task_permission()
 
 
 def _ensure_roles() -> None:
@@ -157,3 +159,27 @@ def _ensure_template_rows() -> None:
 	if missing:
 		template.flags.ignore_permissions = True
 		template.save()
+
+
+def _ensure_task_permission() -> None:
+	if not frappe.db.exists("DocType", "Task"):
+		frappe.logger(LOGGER_NAME).warning("DocType Task not found; agent permission not added")
+		return
+	setup_custom_perms("Task")
+	if frappe.db.exists("Custom DocPerm", {"parent": "Task", "role": ROLE_AGENT}):
+		return
+	frappe.get_doc(
+		{
+			"doctype": "Custom DocPerm",
+			"parent": "Task",
+			"parenttype": "DocType",
+			"parentfield": "permissions",
+			"role": ROLE_AGENT,
+			"permlevel": 0,
+			"read": 1,
+			"write": 1,
+			"create": 1,
+			"if_owner": 1,
+		}
+	).insert(ignore_permissions=True)
+	frappe.clear_cache(doctype="Task")

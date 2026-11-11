@@ -1,18 +1,21 @@
+import json
 import time
 import uuid
 
 import frappe
 
 from erp_ai import gateway
-from erp_ai.agent import policy
+from erp_ai.agent import authority, policy
 from erp_ai.agent.classification import load_mapping, parse_classification, resolve_ticket_values
 from erp_ai.agent.prompts import build_classify_request
 from erp_ai.agent.run_log import write_entry
+from erp_ai.agent.tools.registry import ToolContext, execute_tool
 from erp_ai.constants import (
 	AGENT_USER,
 	JOB_SAFETY_MARGIN_S,
 	JOB_TIMEOUT_S,
 	LEVELS,
+	LOG_DOCTYPE,
 	SETTING_DOCTYPE,
 	TITLE_RUN_FAILED,
 	TITLE_WRONG_USER,
@@ -23,6 +26,7 @@ from erp_ai.constants import (
 CLASSIFY_MAX_TOKENS = 400
 UNPARSEABLE_ERROR = "UNPARSEABLE: không phân loại được"
 BAD_MAPPING_ERROR = "category_mapping không hợp lệ, không có giá trị dự đoán"
+APPLY_SAVEPOINT = "erp_ai_apply"
 USAGE_COLUMNS = ("input_tokens", "output_tokens", "cache_creation_input_tokens", "cache_read_input_tokens")
 
 
@@ -78,7 +82,7 @@ def _run(ticket_name, trigger):
 	deadline = time.monotonic() + JOB_TIMEOUT_S - JOB_SAFETY_MARGIN_S
 
 	if trigger == TRIGGER_TICKET_INSERT:
-		_classify(ticket_name, trigger, run_id, settings, deadline)
+		_classify(ticket_name, trigger, run_id, settings, level, deadline)
 	elif trigger == TRIGGER_COMMENT_MENTION and level == LEVELS[0]:
 		_log_skip(ticket_name, trigger, run_id, "level_L0")
 
@@ -97,8 +101,8 @@ def _log_skip(ticket_name, trigger, run_id, stop_reason):
 	)
 
 
-def _classify(ticket_name, trigger, run_id, settings, deadline):
-	"""Classification step (design 4.3 step 6). Writes one `classify` entry; the ticket is not changed."""
+def _classify(ticket_name, trigger, run_id, settings, level, deadline):
+	"""Classification step (design 4.3 step 6). Writes one `classify` entry; at L1+ also applies it to the ticket."""
 	subject, description = frappe.db.get_value("HD Ticket", ticket_name, ["subject", "description"])
 	base = {"ticket": ticket_name, "run_id": run_id, "entry_type": "classify", "trigger": trigger, "turn": 0}
 	try:
@@ -133,7 +137,8 @@ def _classify(ticket_name, trigger, run_id, settings, deadline):
 
 	mapping = load_mapping(settings.category_mapping)
 	values = resolve_ticket_values(classification, subject, mapping)
-	write_entry(
+	# The entry is written first with applied=0 and committed before the ticket is touched (D-20).
+	log_name = write_entry(
 		**base,
 		**call_fields,
 		stop_reason=result.stop_reason,
@@ -145,3 +150,54 @@ def _classify(ticket_name, trigger, run_id, settings, deadline):
 		predicted_priority=values["priority"],
 		applied=0,
 	)
+	if level == LEVELS[0]:
+		return
+	context = ToolContext(
+		ticket_name=ticket_name,
+		effective_level=level,
+		instructor=authority.latest_instructor(ticket_name),
+		run_id=run_id,
+		category_mapping=mapping,
+		agent_user=AGENT_USER,
+	)
+	_apply_classification(log_name, classification, context)
+
+
+def _apply_classification(log_name, classification, context):
+	"""Run `set_classification` and record its outcome on the entry as one unit.
+
+	The ticket change and the entry update share a savepoint: an exception between them undoes the
+	ticket change, so the entry never says applied=0 over a changed ticket (the entry row itself was
+	committed before and survives). Nothing is committed until both are written.
+	"""
+	frappe.db.savepoint(APPLY_SAVEPOINT)
+	try:
+		result = execute_tool(
+			"set_classification",
+			{"category": classification.category, "confidence": classification.confidence},
+			context,
+		)
+		if result.get("ok") and result.get("after"):
+			action = {
+				"tool": "set_classification",
+				"doctype": "HD Ticket",
+				"name": context.ticket_name,
+				"ok": True,
+			}
+			frappe.db.set_value(
+				LOG_DOCTYPE,
+				log_name,
+				{
+					"applied": 1,
+					"value_before": json.dumps(result["before"], ensure_ascii=False),
+					"value_after": json.dumps(result["after"], ensure_ascii=False),
+					"actions": json.dumps([action], ensure_ascii=False),
+				},
+				update_modified=False,
+			)
+	except Exception:
+		frappe.db.rollback(save_point=APPLY_SAVEPOINT)
+		raise
+	frappe.db.release_savepoint(APPLY_SAVEPOINT)
+	if not frappe.flags.in_test:
+		frappe.db.commit()

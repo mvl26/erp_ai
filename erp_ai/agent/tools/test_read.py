@@ -81,6 +81,50 @@ class TestReadTools(FrappeTestCase):
 		other = make_ticket(subject="T24 other").name
 		self.assertEqual(read.get_ticket({"name": other}, _ctx(self.ticket))["ticket"]["name"], other)
 
+	def test_get_ticket_description_truncated_to_prompt_limit(self):
+		frappe.db.set_value("HD Ticket", self.ticket, "description", "<p>" + "d" * 6500 + "</p>")
+		description = read.get_ticket({}, _ctx(self.ticket))["ticket"]["description"]
+		self.assertEqual(len(description), 6000)
+
+	def _restrict_to_permlevel_zero(self):
+		# Non-Administrator who can read the ticket but holds no permlevel 7/8 read access.
+		patcher = patch("frappe.model.document.Document.get_permlevel_access", return_value=[0])
+		patcher.start()
+		self.addCleanup(patcher.stop)
+		frappe.set_user(AGENT_A)
+
+	def test_get_record_hides_fields_above_users_permlevel(self):
+		self._resolve(self.ticket, "secret-resolution")  # resolution_details is permlevel 8
+		meta = frappe.get_meta("HD Ticket")
+		self.assertEqual(meta.get_field("resolution_details").permlevel, 8)
+		self.assertEqual(meta.get_field("status_category").permlevel, 7)
+		self._restrict_to_permlevel_zero()
+		record = read.get_record({"doctype": "HD Ticket", "name": self.ticket}, _ctx(self.ticket))
+		self.assertTrue(record["ok"], record)
+		self.assertEqual(record["record"]["subject"], "T24 open ticket")
+		self.assertIsNone(record["record"].get("resolution_details"))
+		self.assertIsNone(record["record"].get("status_category"))
+
+	def test_get_ticket_hides_fields_above_users_permlevel(self):
+		# get_ticket's fixed fields are permlevel 0 today; raise `priority` so the call must hide it.
+		self.assertTrue(read.get_ticket({}, _ctx(self.ticket))["ticket"]["priority"])
+		frappe.make_property_setter(
+			{
+				"doctype": "HD Ticket",
+				"fieldname": "priority",
+				"property": "permlevel",
+				"value": 7,
+				"property_type": "Int",
+			}
+		)
+		self.addCleanup(lambda: (frappe.db.rollback(), frappe.clear_cache(doctype="HD Ticket")))
+		frappe.clear_cache(doctype="HD Ticket")
+		self._restrict_to_permlevel_zero()
+		result = read.get_ticket({}, _ctx(self.ticket))
+		self.assertTrue(result["ok"], result)
+		self.assertEqual(result["ticket"]["subject"], "T24 open ticket")
+		self.assertIsNone(result["ticket"]["priority"])
+
 	def test_get_ticket_missing_or_no_permission_refused(self):
 		self.assertFalse(read.get_ticket({"name": "NOPE-999"}, _ctx(self.ticket))["ok"])
 		self._outsider()
@@ -145,14 +189,14 @@ class TestReadTools(FrappeTestCase):
 	# --- search_resolved_tickets ---
 
 	def test_search_resolved_only_matching_resolved_with_trimmed_details(self):
-		match = make_ticket(subject="T24 printer jam", description="<p>paper stuck</p>").name
-		by_description = make_ticket(subject="T24 other", description="the printer is dead").name
-		unresolved = make_ticket(subject="T24 printer open").name
+		match = make_ticket(subject="T24 zq7printer jam", description="<p>paper stuck</p>").name
+		by_description = make_ticket(subject="T24 other", description="the zq7printer is dead").name
+		unresolved = make_ticket(subject="T24 zq7printer open").name
 		unrelated = make_ticket(subject="T24 keyboard").name
 		self._resolve(match, "<p>" + "d" * 2000 + "</p>")
 		self._resolve(by_description)
 		self._resolve(unrelated)
-		result = read.search_resolved_tickets({"query": "printer"}, _ctx(self.ticket))
+		result = read.search_resolved_tickets({"query": "zq7printer"}, _ctx(self.ticket))
 		self.assertTrue(result["ok"], result)
 		names = {row["name"] for row in result["tickets"]}
 		self.assertEqual(names, {match, by_description})
@@ -175,6 +219,18 @@ class TestReadTools(FrappeTestCase):
 		self.assertEqual(len(read.search_resolved_tickets({"query": "T24 lit"}, ctx)["tickets"]), 3)
 		limited = read.search_resolved_tickets({"query": "T24 lit", "limit": 2}, ctx)
 		self.assertEqual(len(limited["tickets"]), 2)
+
+	def test_search_resolved_limit_skips_newest_excluded_and_fills_from_older(self):
+		older = make_ticket(subject="T24 skip older").name
+		newest = self._excluded_ticket("T24 skip newest")
+		self._resolve(older)
+		self._resolve(newest)
+		frappe.db.set_value("HD Ticket", older, "modified", "2000-01-01 00:00:00", update_modified=False)
+		result = read.search_resolved_tickets({"query": "T24 skip", "limit": 1}, _ctx(self.ticket))
+		self.assertEqual([r["name"] for r in result["tickets"]], [older])
+
+	def test_like_pattern_escapes_backslash(self):
+		self.assertEqual(read._like_pattern("a\\b%c_d"), "%a\\\\b\\%c\\_d%")
 
 	def test_search_resolved_argument_bounds(self):
 		ctx = _ctx(self.ticket)
@@ -199,7 +255,29 @@ class TestReadTools(FrappeTestCase):
 				result = read.get_record({"doctype": doctype, "name": "x"}, _ctx(self.ticket))
 				self.assertFalse(result["ok"])
 				self.assertIn("bị cấm", result["reason"])
-		self.assertTrue({"Salary Slip", "User", "Custom DocPerm", "Employee"} <= read.DENIED_DOCTYPES)
+		self.assertEqual(
+			read.DENIED_DOCTYPES,
+			{
+				"ERP AI Setting",
+				"ERP AI Credential",
+				"ERP AI Log",
+				"Salary Slip",
+				"Employee",
+				"Purchase Invoice",
+				"Payment Entry",
+				"GL Entry",
+				"User",
+				"Role Permission",
+				"Custom DocPerm",
+			},
+		)
+
+	def test_echoed_doctype_is_bounded(self):
+		result = read.get_record({"doctype": "X" * 5000, "name": "x"}, _ctx(self.ticket))
+		self.assertFalse(result["ok"])
+		self.assertLessEqual(len(result["reason"]), 200)
+		props = {s.name: s.schema["input_schema"]["properties"] for s in read.TOOLS}
+		self.assertEqual(props["get_record"]["doctype"]["maxLength"], 140)
 
 	def test_every_doctype_of_ai_module_denied(self):
 		# All current AI DocTypes are also listed by name; prove the module rule on its own.
@@ -322,6 +400,6 @@ class TestReadTools(FrappeTestCase):
 			for args in ({}, bad, None):
 				try:
 					result = handler(args, ctx)
-				except Exception as error:  # noqa: BLE001
+				except Exception as error:
 					self.fail(f"{handler.__name__}({args}) raised {error!r}")
 				self.assertIn("ok", result)

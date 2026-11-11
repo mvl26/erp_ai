@@ -1,7 +1,7 @@
 import frappe
-from frappe.utils import strip_html
+from frappe.utils import get_fullname
 
-from erp_ai.agent import authority, policy
+from erp_ai.agent import authority, policy, prompts
 from erp_ai.agent.tools.registry import ToolContext, ToolSpec
 
 AI_MODULE = "ERP AI agent"
@@ -25,7 +25,7 @@ ALLOWED_READ_DOCTYPES = frozenset(
 )
 COMMENT_HIDDEN_FIELDS = ("comment_email", "comment_by")
 TOOL_RESULT_MAX_CHARS = 20000
-COMMENT_MAX_CHARS = 2000
+COMMENT_MAX_CHARS = prompts.COMMENT_MAX_CHARS
 RESOLUTION_MAX_CHARS = 1500
 DEFAULT_COMMENT_LIMIT = 20
 MAX_COMMENT_LIMIT = authority.MAX_COMMENT_LIMIT
@@ -34,6 +34,7 @@ MAX_SEARCH_LIMIT = 10
 QUERY_MIN_CHARS = 2
 QUERY_MAX_CHARS = 100
 SEARCH_SCAN_MAX = 50
+MAX_DOCTYPE_ECHO = 80
 
 
 def _refuse(reason: str) -> dict:
@@ -44,8 +45,7 @@ def _is_int(value) -> bool:
 	return isinstance(value, int) and not isinstance(value, bool)
 
 
-def _clean(text, limit: int) -> str:
-	return strip_html(text or "")[:limit]
+_clean = prompts._clean
 
 
 def _check_ticket(name) -> dict | None:
@@ -69,7 +69,7 @@ def get_ticket(args: dict, ctx: ToolContext) -> dict:
 	doc.apply_fieldlevel_read_permissions()
 	fields = ("name", "subject", "status", "priority", "ticket_type", "agent_group", "creation")
 	ticket = {field: doc.get(field) for field in fields}
-	ticket["description"] = strip_html(doc.get("description") or "")
+	ticket["description"] = _clean(doc.get("description"), prompts.DESCRIPTION_MAX_CHARS)
 	return {"ok": True, "ticket": ticket}
 
 
@@ -85,7 +85,7 @@ def list_comments(args: dict, ctx: ToolContext) -> dict:
 	labelled = authority.label_comments(name, authority.fetch_ticket_comments(name, limit))
 	comments = [
 		{
-			"author": frappe.db.get_value("User", row["author"], "full_name") or row["author"],
+			"author": get_fullname(row["author"]),
 			"role": row["role"],
 			"creation": row["creation"],
 			"content": _clean(row["content"], COMMENT_MAX_CHARS),
@@ -152,16 +152,16 @@ def get_record(args: dict, ctx: ToolContext) -> dict:
 	if not isinstance(doctype, str) or not isinstance(name, str) or not doctype or not name:
 		return _refuse("thiếu doctype hoặc name")
 	if doctype in denied_doctypes():
-		return _refuse(f"DocType {doctype} bị cấm")
+		return _refuse(f"DocType {doctype[:MAX_DOCTYPE_ECHO]} bị cấm")
 	if doctype not in ALLOWED_READ_DOCTYPES:
-		return _refuse(f"DocType {doctype} chưa được mở")
+		return _refuse(f"DocType {doctype[:MAX_DOCTYPE_ECHO]} chưa được mở")
 	if not frappe.db.exists(doctype, name):
 		return _refuse("không tìm thấy bản ghi")
 	if not frappe.has_permission(doctype, "read", doc=name):
 		return _refuse("không có quyền đọc bản ghi")
 	ticket_name = _owning_ticket(doctype, name)
 	if ticket_name is False:
-		return _refuse(f"DocType {doctype} chưa được mở")
+		return _refuse(f"DocType {doctype[:MAX_DOCTYPE_ECHO]} chưa được mở")
 	if ticket_name and not policy.can_send_ticket(ticket_name):
 		return _refuse("bản ghi thuộc phiếu không được phép đưa cho AI")
 	doc = frappe.get_doc(doctype, name)
@@ -245,7 +245,10 @@ TOOLS: list[ToolSpec] = [
 		_schema(
 			"get_record",
 			"Đọc một bản ghi của DocType được phép (phiếu, comment của phiếu, nhóm, loại, ưu tiên, bài viết).",
-			{"doctype": {"type": "string", "minLength": 1}, "name": {"type": "string", "minLength": 1}},
+			{
+				"doctype": {"type": "string", "minLength": 1, "maxLength": 140},
+				"name": {"type": "string", "minLength": 1},
+			},
 			["doctype", "name"],
 		),
 		get_record,

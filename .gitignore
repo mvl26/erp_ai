@@ -5,3 +5,11 @@
 tags
 node_modules
 __pycache__
+
+# team (plugin automation-ai) — local runtime files
+.team/current.json
+.team/plugin_root
+.team/active-build
+.team/session/
+.claude/settings.local.json
+.claude/worktrees/

@@ -25,6 +25,7 @@
   "actions",
   "value_before",
   "value_after",
+  "skipped_fields",
   "predicted_category",
   "predicted_confidence",
   "predicted_ticket_type",
@@ -164,6 +165,12 @@
    "fieldtype": "Code",
    "label": "Giá trị sau",
    "options": "JSON",
+   "read_only": 1
+  },
+  {
+   "fieldname": "skipped_fields",
+   "fieldtype": "Small Text",
+   "label": "Trường bỏ qua khi phân loại",
    "read_only": 1
   },
   {

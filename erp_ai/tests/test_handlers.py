@@ -1,3 +1,4 @@
+import json
 from unittest.mock import MagicMock, patch
 
 import frappe
@@ -6,8 +7,8 @@ from helpdesk.test_utils import make_ticket
 
 from erp_ai import handlers
 from erp_ai.agent import runner
-from erp_ai.constants import AGENT_USER, LOGGER_NAME
-from erp_ai.test_utils import FakeGateway, make_model_result, set_agent_settings
+from erp_ai.constants import AGENT_USER, LOG_DOCTYPE, LOGGER_NAME
+from erp_ai.test_utils import FakeGateway, make_log_entry, make_model_result, set_agent_settings
 
 PREFIX = "ERPAI-TEST-"
 RUN_FOR_TICKET_PATH = "erp_ai.agent.runner.run_for_ticket"
@@ -333,3 +334,143 @@ class TestCommentHandler(HandlerTestCase):
 		logged = " ".join(str(arg) for call in logger.info.call_args_list for arg in call.args)
 		self.assertNotIn("SECRET", logged)
 		self.assertIn("comment_mention", logged)
+
+
+class TestHumanCorrection(HandlerTestCase):
+	"""AC-11: a person's change to the classification is recorded on the latest `classify` log row."""
+
+	FIRST_CORRECTION_AT = "2026-01-01 08:00:00"
+
+	def _classified_ticket(self, **log_fields):
+		ticket = self._ticket_without_job(priority="Low")
+		fields = {"ticket": ticket.name, "entry_type": "classify", "predicted_category": "A"}
+		fields.update(log_fields)
+		return ticket, make_log_entry(**fields)
+
+	def _log(self, name):
+		return frappe.db.get_value(
+			LOG_DOCTYPE,
+			name,
+			["human_corrected_to", "human_corrected_by", "human_corrected_at"],
+			as_dict=True,
+		)
+
+	def _classified_by(self, ticket):
+		return frappe.db.get_value("HD Ticket", ticket.name, "ai_classified_by")
+
+	def _save_priority(self, ticket, priority):
+		ticket.reload()
+		ticket.priority = priority
+		ticket.save(ignore_permissions=True)
+
+	def test_human_correction_updates_latest_log(self):
+		ticket, older_log = self._classified_ticket(run_id=f"{PREFIX}old")
+		latest_log = make_log_entry(
+			ticket=ticket.name,
+			entry_type="classify",
+			predicted_category="B",
+			run_id=f"{PREFIX}new",
+			creation="2099-01-01 00:00:00",
+		)
+
+		self._save_priority(ticket, "High")
+
+		first = self._log(latest_log)
+		self.assertEqual(
+			json.loads(first.human_corrected_to),
+			{"ticket_type": ticket.ticket_type, "agent_group": ticket.agent_group, "priority": "High"},
+		)
+		self.assertEqual(first.human_corrected_by, "Administrator")
+		self.assertTrue(first.human_corrected_at)
+		self.assertEqual(self._classified_by(ticket), "Người")
+		self.assertIsNone(self._log(older_log).human_corrected_to)
+
+		# Second correction: the value is the last one, the time stays the first one.
+		frappe.db.set_value(
+			LOG_DOCTYPE, latest_log, "human_corrected_at", self.FIRST_CORRECTION_AT, update_modified=False
+		)
+		self._save_priority(ticket, "Urgent")
+
+		second = self._log(latest_log)
+		self.assertEqual(json.loads(second.human_corrected_to)["priority"], "Urgent")
+		self.assertEqual(str(second.human_corrected_at), self.FIRST_CORRECTION_AT)
+
+	def test_correction_does_not_touch_modified_of_the_log(self):
+		ticket, log = self._classified_ticket()
+		frappe.db.set_value(LOG_DOCTYPE, log, "modified", "2026-01-01 00:00:00", update_modified=False)
+
+		self._save_priority(ticket, "High")
+
+		self.assertEqual(str(frappe.db.get_value(LOG_DOCTYPE, log, "modified")), "2026-01-01 00:00:00")
+
+	def test_agent_correction_not_recorded(self):
+		ticket, log = self._classified_ticket()
+		frappe.set_user(AGENT_USER)
+
+		self._save_priority(ticket, "High")
+
+		frappe.set_user("Administrator")
+		self.assertIsNone(self._log(log).human_corrected_to)
+		self.assertNotEqual(self._classified_by(ticket), "Người")
+
+	def test_ticket_without_classify_log_saves_without_error(self):
+		ticket = self._ticket_without_job(priority="Low")
+		make_log_entry(ticket=ticket.name, entry_type="skip", run_id=f"{PREFIX}skip")
+
+		self._save_priority(ticket, "High")
+
+		self.assertEqual(frappe.db.get_value("HD Ticket", ticket.name, "priority"), "High")
+		self.assertNotEqual(self._classified_by(ticket), "Người")
+
+	def test_log_without_predicted_category_not_recorded(self):
+		ticket, log = self._classified_ticket(predicted_category="")
+
+		self._save_priority(ticket, "High")
+
+		self.assertIsNone(self._log(log).human_corrected_to)
+		self.assertNotEqual(self._classified_by(ticket), "Người")
+
+	def test_change_outside_classification_fields_not_recorded(self):
+		ticket, log = self._classified_ticket()
+
+		ticket.reload()
+		ticket.subject = f"{PREFIX}renamed"
+		ticket.save(ignore_permissions=True)
+
+		self.assertIsNone(self._log(log).human_corrected_to)
+		self.assertNotEqual(self._classified_by(ticket), "Người")
+
+	def test_on_update_skips_insert(self):
+		ticket, log = self._classified_ticket()
+		ticket.reload()
+		ticket.flags.erp_ai_human_corrected = True
+		ticket.flags.in_insert = True
+
+		handlers.ticket_on_update(ticket)
+
+		self.assertIsNone(self._log(log).human_corrected_to)
+
+	def test_flag_is_consumed_so_a_plain_resave_changes_nothing(self):
+		ticket, log = self._classified_ticket()
+		self._save_priority(ticket, "High")
+		frappe.db.set_value(LOG_DOCTYPE, log, "human_corrected_to", "", update_modified=False)
+
+		ticket.reload()
+		ticket.subject = f"{PREFIX}resaved"
+		ticket.save(ignore_permissions=True)
+
+		self.assertFalse(self._log(log).human_corrected_to)
+
+	def test_correction_decisions_are_logged_without_content(self):
+		ticket, _log = self._classified_ticket()
+		ticket.reload()
+		ticket.subject = f"{PREFIX}SECRET subject"
+		ticket.priority = "High"
+		logger = MagicMock()
+		with patch.object(frappe, "logger", return_value=logger):
+			ticket.save(ignore_permissions=True)
+
+		self.assertGreaterEqual(logger.info.call_count, 1)
+		logged = " ".join(str(arg) for call in logger.info.call_args_list for arg in call.args)
+		self.assertNotIn("SECRET", logged)
+		self.assertIn("human_correction", logged)

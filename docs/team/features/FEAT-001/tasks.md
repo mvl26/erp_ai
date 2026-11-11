@@ -10,7 +10,7 @@ Approved-by:
 Mỗi task 2–5 phút. Hai task chung file thì phụ thuộc nhau. Đánh dấu `BLOCKED: <lý do>` cuối dòng khi bị chặn.
 Đường dẫn trong `files:` tính từ gốc repo `apps/erp_ai/`. `test:` là file chạy bằng `cmd.test_one` (dạng chạy trong worktree: xem `plan.md` mục Ràng buộc chung). Task có `[migrate]` đụng DocType/hook cần `bench migrate` trước khi test → chạy tuần tự. Tên hằng, hàm, trường dùng đúng `plan.md` mục Ràng buộc chung và `design.md`; không đổi tên.
 
-Tiến độ: 2/41 (T1, T1b xong). Việc tiếp theo: T2..T7 (không chung file), rồi chuỗi migrate T8..T13. Lưu ý: T31 phải bỏ guard `frappe.db.exists("DocType", SETTING_DOCTYPE)` trong handlers.py (tạm thời từ T1). BASE của từng task ghi vào dòng tiến độ ở đây trước khi gọi dev.
+Tiến độ: 7/41 (T1, T1b, T2..T6 xong; cmd.test trên 212f77b: Ran 65 tests OK, pre-commit exit 0). Việc tiếp theo: T7 (source.py), rồi chuỗi migrate T8..T13 tuần tự. Deferred: xem review-02..06 (limit=401 phải bị registry từ chối ở T23/T27; T9 đặt mặc định category_mapping = DEFAULT_CATEGORY_MAPPING; runner T28 gọi validate_mapping). Lưu ý: T31 phải bỏ guard `frappe.db.exists("DocType", SETTING_DOCTYPE)` trong handlers.py (tạm thời từ T1). BASE của từng task ghi vào dòng tiến độ ở đây trước khi gọi dev.
 
 ## Walking skeleton (cỡ L)
 
@@ -30,37 +30,43 @@ Tiến độ: 2/41 (T1, T1b xong). Việc tiếp theo: T2..T7 (không chung file
 
 ## Nhóm thuần (không migrate, không file chung)
 
-- [ ] T2 — Chặn trùng job trong cùng giao dịch — files: erp_ai/agent/queue.py, erp_ai/agent/test_queue.py — test: erp_ai/agent/test_queue.py — depends: T1
+- [x] T2 — Chặn trùng job trong cùng giao dịch — files: erp_ai/agent/queue.py, erp_ai/agent/test_queue.py — test: erp_ai/agent/test_queue.py — depends: T1
+  - progress: BASE=a351af1 · dev call 1 (song song với T3)
   - Criterion: AC-5(f), NFR-1, NFR-2 (D-3)
   - Receives: `queue.enqueue_agent_run` từ T1
   - Returns: cùng chữ ký; lần gọi thứ hai cùng `job_id` trong một giao dịch → `False`, không gọi `frappe.enqueue`; tập `frappe.flags.erp_ai_pending_job_ids` xóa ở `after_commit`/`after_rollback`; `trigger` ngoài {`ticket_insert`, `comment_mention`} → `ValueError`
   - Expect: `cmd.test_one` erp_ai/agent/test_queue.py → test_duplicate_trigger_same_transaction_one_job, test_enqueue_parameters, và test sau rollback xếp lại được đều xanh
 
-- [ ] T3 — Prompt và bộ đọc phân loại — files: erp_ai/agent/prompts.py, erp_ai/agent/classification.py, erp_ai/agent/test_classification.py — test: erp_ai/agent/test_classification.py — depends: T1
+- [x] T3 — Prompt và bộ đọc phân loại — files: erp_ai/agent/prompts.py, erp_ai/agent/classification.py, erp_ai/agent/test_classification.py — test: erp_ai/agent/test_classification.py — depends: T1
+  - progress: BASE=a351af1 · dev call 1 (song song với T2)
   - Criterion: AC-3 (JSON sai → `None`), AC-10 (nhánh thuần: ánh xạ, `[GẬP]`)
   - Receives: `constants.CATEGORIES`, `CONFIDENCE_VALUES`
   - Returns: `prompts.build_classify_request(subject: str, description: str) -> dict`, `prompts.ticket_text`, `prompts.build_reason_system(prompt_digest: str) -> list[dict]`, `prompts.build_initial_message(ticket: dict, comments: list[dict], trigger: str, classification: dict | None) -> str`; `classification.Classification`, `parse_classification(text: str) -> Classification | None`, `load_mapping(raw) -> dict`, `validate_mapping(raw) -> None`, `resolve_ticket_values(classification, subject, mapping) -> dict`; ánh xạ mặc định D-8 là hằng `DEFAULT_CATEGORY_MAPPING` trong `classification.py`
   - Expect: `cmd.test_one` erp_ai/agent/test_classification.py → test_parse_rejects_non_json_and_bad_values, test_urgent_prefix_forces_urgent, test mapping sai schema → ValidationError, xanh
 
-- [ ] T4 — Bảng cầu dao (hàm thuần) — files: erp_ai/gateway/breaker.py, erp_ai/gateway/test_breaker.py — test: erp_ai/gateway/test_breaker.py — depends: T1
+- [x] T4 — Bảng cầu dao (hàm thuần) — files: erp_ai/gateway/breaker.py, erp_ai/gateway/test_breaker.py — test: erp_ai/gateway/test_breaker.py — depends: T1
+  - progress: BASE=a85f798 · dev call 1 (song song với T5)
   - Criterion: AC-17 (hàng 1–9 của design 3.4.3), NFR-8 (một phần, nghỉ khi token < 20.000 làm ở T16)
   - Receives: không
   - Returns: `ApiFailure(status, kind, error_type, error_code, message_prefix, retry_after)` (dataclass), `Action(new_status, pause_seconds, switch_key, notify, kind)`, `decide(failure: ApiFailure, error_count: int) -> Action`
   - Expect: `cmd.test_one` erp_ai/gateway/test_breaker.py → test_breaker_table (subTest 9 hàng; 529 trần 600 s; 429 thiếu `retry-after` → 61 s) xanh
 
-- [ ] T5 — Số liệu đánh giá offline (hàm thuần) — files: erp_ai/eval/__init__.py, erp_ai/eval/run_eval.py, erp_ai/eval/test_run_eval.py — test: erp_ai/eval/test_run_eval.py — depends: T1
+- [x] T5 — Số liệu đánh giá offline (hàm thuần) — files: erp_ai/eval/__init__.py, erp_ai/eval/run_eval.py, erp_ai/eval/test_run_eval.py — test: erp_ai/eval/test_run_eval.py — depends: T1
+  - progress: BASE=a85f798 · dev call 1 (song song với T4)
   - Criterion: AC-1, NFR-9 (phép đo)
   - Receives: không (mapping truyền vào dạng dict)
   - Returns: `compute_metrics(rows: list[dict], mapping: dict) -> dict` (khóa đúng design 3.7: `labeled`, `correct`, `accuracy`, `per_category`, `confusion`, `unclassified`, `top_owner`, `non_top_owner`, `verdict`, `skipped_unlabeled`), `format_report(metrics: dict) -> str`
   - Expect: `cmd.test_one` erp_ai/eval/test_run_eval.py → test_metrics_twelve_ticket_sample (10/12 → 83,3% → "70–85%"), test_verdict_thresholds_at_85_and_70, test_unparseable_and_unlabeled_rows xanh
 
-- [ ] T6 — Tool mã nguồn: chặn đường dẫn, đọc, tìm — files: erp_ai/agent/tools/source.py, erp_ai/agent/tools/test_source.py — test: erp_ai/agent/tools/test_source.py — depends: T1
+- [x] T6 — Tool mã nguồn: chặn đường dẫn, đọc, tìm — files: erp_ai/agent/tools/source.py, erp_ai/agent/tools/test_source.py — test: erp_ai/agent/tools/test_source.py — depends: T1
+  - progress: BASE=be71629 · dev call 1 (song song với rework T5)
   - Criterion: AC-13 (trừ git), NFR-6 (400 dòng / 40 kết quả)
   - Receives: `constants.py`
   - Returns: `get_source_root() -> str`, `resolve_safe_path(rel: str) -> str | None`, `search_source(args: dict, ctx) -> dict`, `read_source(args: dict, ctx) -> dict` (trả `{"ok": bool, ...}` hoặc `{"ok": False, "reason": str}`; không ném lỗi), hằng `DUOI_CHO_PHEP`, `TEN_CAM` đúng guide `:342-345`; chưa có `ToolSpec` (T23 định nghĩa, T27 nối)
   - Expect: `cmd.test_one` erp_ai/agent/tools/test_source.py → test_path_escape_refused, test_secret_names_and_extensions_refused, test_read_capped_at_400_lines, test_search_capped_at_40_hits xanh (thư mục tạm, patch `get_source_root`)
 
 - [ ] T7 — Tool mã nguồn: git chỉ đọc — files: erp_ai/agent/tools/source.py, erp_ai/agent/tools/test_source.py — test: erp_ai/agent/tools/test_source.py — depends: T6
+  - progress: BASE=212f77b · dev call 1
   - Criterion: AC-13 (git), NFR-6 (30 s)
   - Receives: `get_source_root`, `resolve_safe_path` từ T6
   - Returns: `git_source(args: dict, ctx) -> dict`: danh sách lệnh, không `shell`, `timeout=30`, chỉ `log`/`show`/`diff`/`blame`, từ chối các cờ ở design 5.4, `FileNotFoundError` → `ok=false` "chưa cài git"

@@ -40,3 +40,4 @@ Approved-by:
 - 2026-11-11 quyết định (decide): D5 giữ thẻ khẩn `[GẬP]` đúng guide/spec, resolver nhận cả `[GẬP]` và `[GẤP]`. Vì: đổi chính tả ảnh hưởng eval NFR-9, là việc của người. Hoàn tác: sửa prompt + spec
 - 2026-11-11 lý do gọi tech-lead (lượt 4): thêm T7b (D4) rồi chuỗi migrate T8..
 - 2026-11-11 build T7b → dev ×2 + reviewer ×2 | vòng 1 request-changes (major STD-TEST-2: test show/diff bị che), vòng 2 approve; merge a97adc1 | cmd.test (qua dev) Ran 80 tests OK, pre-commit exit 0 | design.md 3.5/5.4 còn ghi show/diff, cần cập nhật theo D4 | tiếp T8
+- 2026-11-11 build T8 → dev ×1 + reviewer ×1 | approve vòng 1 (18 trường khớp design 2.2); merge aac62a0 | migrate exit 0, cmd.test (qua dev) Ran 85 tests OK, pre-commit exit 0 | — | tiếp T9

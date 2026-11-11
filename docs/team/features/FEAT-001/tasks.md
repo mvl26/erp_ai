@@ -10,7 +10,7 @@ Approved-by:
 Mỗi task 2–5 phút. Hai task chung file thì phụ thuộc nhau. Đánh dấu `BLOCKED: <lý do>` cuối dòng khi bị chặn.
 Đường dẫn trong `files:` tính từ gốc repo `apps/erp_ai/`. `test:` là file chạy bằng `cmd.test_one` (dạng chạy trong worktree: xem `plan.md` mục Ràng buộc chung). Task có `[migrate]` đụng DocType/hook cần `bench migrate` trước khi test → chạy tuần tự. Tên hằng, hàm, trường dùng đúng `plan.md` mục Ràng buộc chung và `design.md`; không đổi tên.
 
-Tiến độ: 9/42 (T1, T1b, T2..T7, T7b xong; cmd.test sau merge T7b: Ran 80 tests OK, pre-commit exit 0). Việc tiếp theo: T8 (DocType ERP AI Credential, [migrate]), rồi chuỗi migrate T8..T13 tuần tự (T14 song song được sau T9). Cần người xem: deferred của review-07 (design 5.4 vs allowlist git, git có thể lộ bí mật đã commit). Deferred: xem review-02..06 (limit=401 phải bị registry từ chối ở T23/T27; T9 đặt mặc định category_mapping = DEFAULT_CATEGORY_MAPPING; runner T28 gọi validate_mapping). Lưu ý: T31 phải bỏ guard `frappe.db.exists("DocType", SETTING_DOCTYPE)` trong handlers.py (tạm thời từ T1). BASE của từng task ghi vào dòng tiến độ ở đây trước khi gọi dev.
+Tiến độ: 10/42 (T1, T1b, T2..T7, T7b, T8 xong; cmd.test sau merge T8: Ran 85 tests OK, pre-commit exit 0). Việc tiếp theo: T9 (DocType ERP AI Setting, [migrate]; ghi chú review-09: kiểm Currency `monthly_budget_usd`/`budget_month_usd` theo tiền tệ site, và validate() phải khôi phục trường tự quản của dòng credential), rồi chuỗi migrate T9..T13 tuần tự (T14 song song được sau T9). Cần người xem: deferred của review-07 (design 5.4 vs allowlist git, git có thể lộ bí mật đã commit). Deferred: xem review-02..06 (limit=401 phải bị registry từ chối ở T23/T27; T9 đặt mặc định category_mapping = DEFAULT_CATEGORY_MAPPING; runner T28 gọi validate_mapping). Lưu ý: T31 phải bỏ guard `frappe.db.exists("DocType", SETTING_DOCTYPE)` trong handlers.py (tạm thời từ T1). BASE của từng task ghi vào dòng tiến độ ở đây trước khi gọi dev.
 
 ## Walking skeleton (cỡ L)
 
@@ -80,7 +80,8 @@ Tiến độ: 9/42 (T1, T1b, T2..T7, T7b xong; cmd.test sau merge T7b: Ran 80 te
 
 ## Chuỗi migrate: DocType và cài đặt (tuần tự)
 
-- [ ] T8 — DocType ERP AI Credential (bảng con) [migrate] — files: erp_ai/erp_ai_agent/doctype/__init__.py, erp_ai/erp_ai_agent/doctype/erp_ai_credential/__init__.py, erp_ai/erp_ai_agent/doctype/erp_ai_credential/erp_ai_credential.json, erp_ai/erp_ai_agent/doctype/erp_ai_credential/erp_ai_credential.py, erp_ai/erp_ai_agent/doctype/erp_ai_credential/test_erp_ai_credential.py — test: erp_ai/erp_ai_agent/doctype/erp_ai_credential/test_erp_ai_credential.py — depends: T4, T5, T6, T7
+- [x] T8 — DocType ERP AI Credential (bảng con) [migrate] — files: erp_ai/erp_ai_agent/doctype/__init__.py, erp_ai/erp_ai_agent/doctype/erp_ai_credential/__init__.py, erp_ai/erp_ai_agent/doctype/erp_ai_credential/erp_ai_credential.json, erp_ai/erp_ai_agent/doctype/erp_ai_credential/erp_ai_credential.py, erp_ai/erp_ai_agent/doctype/erp_ai_credential/test_erp_ai_credential.py — test: erp_ai/erp_ai_agent/doctype/erp_ai_credential/test_erp_ai_credential.py — depends: T4, T5, T6, T7
+  - progress: BASE=b27a20b · dev call 1 · review round 1 approve (head b80fb7b) · merged aac62a0 · migrate exit 0 · cmd.test Ran 85 tests OK, pre-commit exit 0
   - Ghi chú: `test_erp_ai_credential.py` là touchpoint bổ sung (test) so với design; ghi trong plan.md.
   - Criterion: AC-4 (nền), NFR-5 (`api_key` kiểu Password), AC-19 (trường tự quản read_only)
   - Receives: `constants` 4 hằng trạng thái khóa

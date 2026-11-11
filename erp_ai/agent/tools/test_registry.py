@@ -7,7 +7,9 @@ from frappe.tests.utils import FrappeTestCase
 from erp_ai.agent.tools import registry
 from erp_ai.agent.tools.registry import ToolContext, ToolSpec, execute_tool, get_tool_schemas
 
+REAL_ALL_SPECS = registry._all_specs
 NOTE_TITLE = "erp_ai registry savepoint probe"
+OTHER_NOTE_TITLE = "erp_ai registry earlier note"
 
 
 def _schema(name, properties=None, required=None):
@@ -61,16 +63,16 @@ def _context(level="L1", instructor=None):
 
 
 def _insert_note():
-	frappe.get_doc({"doctype": "Note", "title": NOTE_TITLE, "public": 1}).insert(ignore_permissions=True)
+	frappe.get_doc({"doctype": "Note", "title": NOTE_TITLE, "public": 1}).insert()
 
 
 class TestRegistry(FrappeTestCase):
 	def setUp(self):
 		# FrappeTestCase rolls back only after the whole class: undo each test.
 		self.addCleanup(frappe.db.rollback)
-		patcher = patch.object(registry, "_all_specs", _specs)
-		patcher.start()
-		self.addCleanup(patcher.stop)
+		specs_patcher = patch.object(registry, "_all_specs", _specs)
+		specs_patcher.start()
+		self.addCleanup(specs_patcher.stop)
 
 	def names(self, level, has_instructor):
 		return [s["name"] for s in get_tool_schemas(level, has_instructor)]
@@ -99,6 +101,13 @@ class TestRegistry(FrappeTestCase):
 	def test_execute_runs_granted_tool(self):
 		result = execute_tool("do_read", {"query": "abc"}, _context())
 		self.assertEqual(result, {"ok": True, "echo": {"query": "abc"}, "ticket": "TKT-1"})
+
+	def test_execute_rejects_tool_not_granted_and_bad_arguments(self):
+		denied = execute_tool("do_task", {}, _context("L1", None))
+		self.assertFalse(denied["ok"])
+		self.assertIn("không được cấp", denied["reason"])
+		invalid = execute_tool("do_read", {"query": "abc", "extra": 1}, _context())
+		self.assertEqual(invalid, {"ok": False, "reason": "tham số không hợp lệ: extra"})
 
 	def test_execute_rejects_tool_not_granted(self):
 		for name, context in (
@@ -142,6 +151,11 @@ class TestRegistry(FrappeTestCase):
 			result = execute_tool("do_read", arguments, _context())
 			self.assertEqual(result["reason"], f"tham số không hợp lệ: {key}", arguments)
 
+	def test_invalid_reason_cuts_model_supplied_key(self):
+		result = execute_tool("do_read", {"query": "abc", "x" * 5000: 1}, _context())
+		self.assertFalse(result["ok"])
+		self.assertLessEqual(len(result["reason"]), 200)
+
 	def test_execute_rejects_non_dict_arguments(self):
 		result = execute_tool("do_read", ["query"], _context())
 		self.assertFalse(result["ok"])
@@ -153,6 +167,8 @@ class TestRegistry(FrappeTestCase):
 		self.assertTrue(execute_tool("do_read", {"query": "abcde", "limit": 1}, _context())["ok"])
 
 	def test_unexpected_exception_rolls_back_to_savepoint_and_raises(self):
+		frappe.get_doc({"doctype": "Note", "title": OTHER_NOTE_TITLE, "public": 1}).insert()
+
 		def boom(arguments, context):
 			_insert_note()
 			raise RuntimeError("boom")
@@ -162,6 +178,7 @@ class TestRegistry(FrappeTestCase):
 			with self.assertRaises(RuntimeError):
 				execute_tool("do_read", {}, _context())
 		self.assertFalse(frappe.db.exists("Note", {"title": NOTE_TITLE}))
+		self.assertTrue(frappe.db.exists("Note", {"title": OTHER_NOTE_TITLE}))
 
 	def test_successful_write_is_kept(self):
 		def write(arguments, context):
@@ -173,27 +190,10 @@ class TestRegistry(FrappeTestCase):
 			execute_tool("do_read", {}, _context())
 		self.assertTrue(frappe.db.exists("Note", {"title": NOTE_TITLE}))
 
-	def test_all_specs_collects_tools_of_each_module_and_skips_missing_ones(self):
-		patch.stopall()
-		fakes = {
-			"erp_ai.agent.tools.read": SimpleNamespace(TOOLS=[_spec("r", "read")]),
-			"erp_ai.agent.tools.source": SimpleNamespace(TOOLS=[_spec("s", "read")]),
-		}
-
-		def fake_import(name):
-			if name in fakes:
-				return fakes[name]
-			raise ModuleNotFoundError(name=name)
-
-		with patch.object(registry.importlib, "import_module", fake_import):
-			self.assertEqual([s.name for s in registry._all_specs()], ["r", "s"])
-
-	def test_all_specs_propagates_import_error_inside_a_module(self):
-		patch.stopall()
-
-		def fake_import(name):
-			raise ModuleNotFoundError(name="somebody_else")
-
-		with patch.object(registry.importlib, "import_module", fake_import):
-			with self.assertRaises(ModuleNotFoundError):
-				registry._all_specs()
+	def test_all_specs_collects_tools_of_each_module(self):
+		fakes = {name: SimpleNamespace(TOOLS=[_spec(name, "read")]) for name in registry.TOOL_MODULES}
+		with (
+			patch.object(registry, "_all_specs", REAL_ALL_SPECS),
+			patch.object(registry.importlib, "import_module", fakes.__getitem__),
+		):
+			self.assertEqual([s.name for s in registry._all_specs()], list(registry.TOOL_MODULES))

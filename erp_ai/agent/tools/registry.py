@@ -33,6 +33,7 @@ TOOL_MODULES = (
 	"erp_ai.agent.tools.write_ticket",
 )
 SAVEPOINT = "erp_ai_tool"
+KEY_REASON_MAX = 100  # model-supplied argument names are cut so reason stays short
 GROUPS_BY_LEVEL = ("read", "ticket_write")
 
 
@@ -40,13 +41,7 @@ def _all_specs() -> list[ToolSpec]:
 	# Imported lazily: tool modules import ToolContext from this file.
 	specs = []
 	for module_name in TOOL_MODULES:
-		try:
-			module = importlib.import_module(module_name)
-		except ModuleNotFoundError as error:
-			if error.name != module_name:
-				raise
-			continue  # tool module of a later task, not written yet
-		specs.extend(module.TOOLS)
+		specs.extend(importlib.import_module(module_name).TOOLS)
 	return specs
 
 
@@ -62,7 +57,7 @@ def get_tool_schemas(effective_level: str, has_instructor: bool) -> list[dict]:
 
 
 def _invalid(key) -> dict:
-	return {"ok": False, "reason": f"tham số không hợp lệ: {key}"}
+	return {"ok": False, "reason": f"tham số không hợp lệ: {str(key)[:KEY_REASON_MAX]}"}
 
 
 def _is_number(value) -> bool:
@@ -72,10 +67,8 @@ def _is_number(value) -> bool:
 JSON_TYPES = {
 	"string": lambda v: isinstance(v, str),
 	"integer": lambda v: isinstance(v, int) and not isinstance(v, bool),
-	"number": _is_number,
 	"boolean": lambda v: isinstance(v, bool),
 	"array": lambda v: isinstance(v, list),
-	"object": lambda v: isinstance(v, dict),
 }
 
 

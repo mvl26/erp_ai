@@ -13,8 +13,8 @@ from erp_ai.agent import runner
 from erp_ai.agent.classification import DEFAULT_CATEGORY_MAPPING
 from erp_ai.agent.prompts import build_classify_request
 from erp_ai.constants import CATEGORIES, LOG_DOCTYPE
-from erp_ai.eval import run_eval
 from erp_ai.eval.run_eval import compute_metrics, format_report
+from erp_ai.eval.run_eval import run as run_eval_run
 from erp_ai.gateway import GatewayError
 from erp_ai.test_utils import FakeGateway, make_model_result, set_agent_settings
 
@@ -209,7 +209,7 @@ class TestRunEvalRun(FrappeTestCase):
 			patch("erp_ai.gateway.call_model", gateway),
 			contextlib.redirect_stdout(io.StringIO()) as out,
 		):
-			metrics = run_eval.run(self.path)
+			metrics = run_eval_run(self.path)
 		return metrics, out.getvalue()
 
 	def test_run_uses_given_predictions_without_gateway(self):
@@ -284,7 +284,10 @@ class TestRunEvalRun(FrappeTestCase):
 		self.assertEqual(gateway.call_count, 3)
 		self.assertEqual((metrics["labeled"], metrics["correct"], metrics["unclassified"]), (3, 2, 1))
 		logger.return_value.warning.assert_called_once()
-		self.assertIn("all_keys_failed", str(logger.return_value.warning.call_args))
+		warning = str(logger.return_value.warning.call_args)
+		self.assertIn("all_keys_failed", warning)
+		self.assertIn("line 2", warning)
+		self.assertNotIn(PREFIX, warning)
 		self.log_error.assert_not_called()
 
 	def test_unparseable_reply_counts_unclassified(self):
@@ -298,17 +301,22 @@ class TestRunEvalRun(FrappeTestCase):
 	def test_mapping_comes_from_setting_with_default_fallback(self):
 		custom = {c: {**DEFAULT_CATEGORY_MAPPING[c], "ticket_type": f"Custom {c}"} for c in CATEGORIES}
 		set_agent_settings(category_mapping=json.dumps(custom))
-		self._write(
-			[
-				{**eval_row("A", predicted_category="A"), "ticket_type": "Custom A"},
-				eval_row("A", predicted_category="A"),
-			]
-		)
+		custom_row = {**eval_row("A", predicted_category="A"), "ticket_type": "Custom A"}
+		self._write([custom_row, custom_row, eval_row("A", predicted_category="A")])
 
 		metrics, _out = self._run(FakeGateway())
-		self.assertEqual((metrics["labeled"], metrics["skipped_unlabeled"]), (1, 1))
+		self.assertEqual((metrics["labeled"], metrics["skipped_unlabeled"]), (2, 1))
 
 		set_agent_settings(category_mapping="")
 		metrics, _out = self._run(FakeGateway())
-		self.assertEqual((metrics["labeled"], metrics["skipped_unlabeled"]), (1, 1))
+		self.assertEqual((metrics["labeled"], metrics["skipped_unlabeled"]), (1, 2))
 		self.assertEqual(metrics["per_category"]["A"]["count"], 1)
+
+	def test_malformed_line_names_its_line_number(self):
+		with open(self.path, "w", encoding="utf-8") as handle:
+			handle.write(json.dumps(eval_row("A", predicted_category="A")) + "\n{not json\n")
+
+		with self.assertRaises(ValueError) as ctx:
+			self._run(FakeGateway())
+
+		self.assertIn("line 2", str(ctx.exception))

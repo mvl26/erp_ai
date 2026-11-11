@@ -135,7 +135,7 @@ def _predict(row):
 		)
 	except gateway.GatewayError as exc:
 		frappe.logger("erp_ai").warning(
-			f"eval: classify failed subject={row.get('subject')!r} kind={exc.kind} status={exc.status}"
+			f"eval: classify failed line {row.get('_line')} kind={exc.kind} status={exc.status}"
 		)
 		return None
 	classification = parse_classification(result.text)
@@ -147,8 +147,17 @@ def run(path):
 
 	Rows that already carry `predicted_category` are not sent. Nothing is written: no ERP AI Log, no ticket.
 	"""
+	rows = []
 	with open(path, encoding="utf-8") as handle:
-		rows = [json.loads(line) for line in handle if line.strip()]
+		for line_number, line in enumerate(handle, start=1):
+			if not line.strip():
+				continue
+			try:
+				row = json.loads(line)
+			except json.JSONDecodeError as exc:
+				raise ValueError(f"{path}: line {line_number}: invalid JSON ({exc.msg})") from exc
+			row["_line"] = line_number
+			rows.append(row)
 	for row in rows:
 		if not row.get("predicted_category"):
 			row["predicted_category"] = _predict(row)

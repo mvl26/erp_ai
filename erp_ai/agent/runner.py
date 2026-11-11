@@ -285,9 +285,9 @@ def _reason(ticket_name, trigger, run_id, settings, context, classification, dea
 			return
 
 		tool_blocks = [block for block in result.content if block.get("type") == "tool_use"]
-		tool_results, actions, before, after = [], [], {}, {}
+		tool_results, actions, before, after, tool_errors = [], [], {}, {}, []
 		for block in tool_blocks:
-			tool_results.append(_run_tool(block, context, actions, before, after))
+			tool_results.append(_run_tool(block, context, actions, before, after, tool_errors))
 		stop_reason = result.stop_reason
 		wants_tools = stop_reason == STOP_TOOL_USE
 		if wants_tools and turn == max_turns:
@@ -298,6 +298,7 @@ def _reason(ticket_name, trigger, run_id, settings, context, classification, dea
 			turn=turn,
 			stop_reason=stop_reason,
 			tools_called=[block["name"] for block in tool_blocks] or None,
+			error="; ".join(tool_errors) or None,
 			actions=actions or None,
 			value_before=before or None,
 			value_after=after or None,
@@ -308,12 +309,16 @@ def _reason(ticket_name, trigger, run_id, settings, context, classification, dea
 		messages.append({"role": "user", "content": tool_results})
 
 
-def _run_tool(block, context, actions, before, after):
-	"""Execute one `tool_use` block; record write outcomes in the turn's accumulators; return its `tool_result`."""
+def _run_tool(block, context, actions, before, after, tool_errors):
+	"""Execute one `tool_use` block; record write outcomes and crashes in the turn's accumulators; return its `tool_result`.
+
+	A crash is logged as tool name + exception class only (D-20, STD-SEC-6); the model sees the class too.
+	"""
 	name = block["name"]
 	try:
 		outcome = execute_tool(name, block.get("input") or {}, context)
 	except Exception as exc:
+		tool_errors.append(f"tool {name}: {type(exc).__name__}")
 		if name in WRITE_TOOL_TARGETS:
 			actions.append(_action(name, context, None, False))
 		return {

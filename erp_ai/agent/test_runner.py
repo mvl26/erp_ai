@@ -598,6 +598,7 @@ class TestRunnerReasoning(RunnerTestBase):
 	# AC-15
 
 	def test_stops_after_max_turns(self):
+		set_agent_settings(max_turns_per_run=8)
 		self.gateway.results = [tool_turn(tool_use(f"toolu_{i}", "get_ticket")) for i in range(12)]
 		self._run("comment_mention")
 
@@ -697,7 +698,8 @@ class TestRunnerReasoning(RunnerTestBase):
 			(7, 3, 0, 5),
 		)
 		self.assertFalse(second.tools_called or second.actions or second.value_after)
-		self.assertEqual(round(first.cost_usd + second.cost_usd, 6), 0.02)
+		# the cost is the gateway's figure stored as given; the run total is the hand-added 0.0125 + 0.0075
+		self.assertAlmostEqual(first.cost_usd + second.cost_usd, 0.02, places=6)
 		self.assertEqual(first.run_id, second.run_id)
 
 	# AC-8, request shape
@@ -789,7 +791,23 @@ class TestRunnerReasoning(RunnerTestBase):
 		)
 		first, second = self._reason_entries()
 		self.assertEqual(json.loads(first.tools_called), ["get_ticket"])
+		self.assertEqual(first.error, "tool get_ticket: KeyError")
+		self.assertNotIn("bí mật", first.error)
+		self.assertFalse(second.error)
 		self.assertEqual(second.stop_reason, "end_turn")
+
+	def test_several_failed_tools_are_joined_in_the_turn_error(self):
+		self.gateway.results = [
+			tool_turn(
+				tool_use("toolu_1", "get_ticket"), tool_use("toolu_2", "set_resolution_hint", text="x")
+			),
+			make_model_result(),
+		]
+		with patch.object(runner, "execute_tool", side_effect=RuntimeError("bí mật")):
+			self._run("comment_mention")
+
+		first = self._reason_entries()[0]
+		self.assertEqual(first.error, "tool get_ticket: RuntimeError; tool set_resolution_hint: RuntimeError")
 
 	def test_failed_write_tool_is_logged_as_not_ok(self):
 		self.gateway.results = [

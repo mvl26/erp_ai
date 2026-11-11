@@ -49,8 +49,8 @@ def _ensure_default_settings() -> None:
 		if field.default is None or field.default == "":
 			continue
 		stored = frappe.db.sql(
-			"select 1 from `tabSingles` where doctype=%s and field=%s",
+			"select value from `tabSingles` where doctype=%s and field=%s",
 			(SETTING_DOCTYPE, field.fieldname),
 		)
-		if not stored:
+		if not stored or stored[0][0] is None:
 			frappe.db.set_single_value(SETTING_DOCTYPE, field.fieldname, field.default)

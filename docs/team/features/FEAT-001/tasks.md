@@ -207,6 +207,7 @@ CẬP NHẬT MỚI NHẤT (dừng sạch giữa chừng): 30/45 xong (thêm T20c
   - Expect: `cmd.test_one` erp_ai/agent/test_authority.py → 5 test cũ (test_instructor_role_has_authority_on_any_ticket, test_assigned_by_other_authority_only_on_that_ticket, test_self_assigned_is_data, test_contact_and_plain_agent_are_data, test_latest_instructor_prefers_latest_comment_then_owner) + 5 test mới: test_closed_cancelled_or_reassigned_todo_is_data (ToDo Closed; Cancelled; ToDo cũ gán bởi người khác rồi ToDo mới tự gán), test_self_assign_on_other_ticket_is_data, test_never_authority_accounts_even_with_role_or_assignment (Guest/AGENT_USER có role và/hoặc được gán → False), test_spoofed_comment_author_fields_ignored, test_comments_read_from_core_comment_only (comment `Info`/`Assigned` và dòng `HD Ticket Comment` bị bỏ qua; đúng `limit`, mới nhất trước) xanh; thêm test khóa `role` ghi đè; bỏ `except ValueError` không lý do (STD-ERR-1); mỗi guard của `is_instruction` có test riêng đỏ khi bỏ guard đó
 
 - [ ] T22 — Ghi nhật ký lượt gọi — files: erp_ai/agent/run_log.py, erp_ai/agent/test_run_log.py, erp_ai/test_utils.py — test: erp_ai/agent/test_run_log.py — depends: T11, T16
+  - progress: BASE=a902d83 · dev call 1 (105b419, song song với T26) · review round 1 request-changes (major STD-ERR-2: write_entry không bắt buộc entry_type/trigger) · rework FIX_BASE=105b419
   - Ghi chú: `test_run_log.py` là touchpoint bổ sung (test).
   - Criterion: AC-15 (đủ trường nhật ký mỗi lượt), ADR-004 (nơi duy nhất tạo `ERP AI Log`), D-20 (commit khi `not frappe.flags.in_test`)
   - Receives: DocType `ERP AI Log` (T10)
@@ -235,6 +236,7 @@ CẬP NHẬT MỚI NHẤT (dừng sạch giữa chừng): 30/45 xong (thêm T20c
   - Expect: `cmd.test_one` erp_ai/agent/tools/test_write_ticket.py → test_write_without_permission_returns_ok_false_unchanged, test_mapping_to_missing_value_skips_field, test người đã phân loại không bị ghi đè xanh
 
 - [ ] T26 — Tool ghi: hướng giải quyết, comment, Task — files: erp_ai/agent/tools/write_ticket.py, erp_ai/agent/tools/test_write_ticket.py — test: erp_ai/agent/tools/test_write_ticket.py — depends: T13, T25
+  - progress: BASE=a902d83 · dev call 1 (song song với T22)
   - Criterion: AC-8 (`create_task` chỉ khi có người ra lệnh; thiếu quyền → `ok=false`), A-5, D-14
   - Receives: `set_classification` và `TOOLS` từ T25
   - Returns: `set_resolution_hint(args, ctx) -> dict`, `post_comment(args, ctx) -> dict` (tạo core `Comment` qua `ticket.new_comment`, kiểm quyền tạo `Comment`; D8), `create_task(args, ctx) -> dict` (dòng đầu `description` có tên và đường dẫn phiếu; không có người ra lệnh hoặc không có DocType `Task` → `ok=false`); `TOOLS` đủ 4 tool, nhóm `task_write` cho `create_task`

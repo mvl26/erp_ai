@@ -1,1 +1,4 @@
 {"ts":"2026-11-11T10:50:16+07:00","event":"end","session_id":"a007cb94-da64-4b33-828a-f4eaaaf7e22c","feature":"FEAT-001","stage":"intake","reason":"other","duration_s":null,"compactions":0}
+{"ts":"2026-11-11T13:40:02+07:00","event":"end","session_id":"c3221b5d-6799-489f-974e-70d74b1212c2","feature":"FEAT-001","stage":"build","reason":"other","duration_s":1,"compactions":0}
+{"ts":"2026-11-11T13:40:04+07:00","event":"end","session_id":"c07880a4-501f-453e-b0dd-a16814c0e01d","feature":"FEAT-001","stage":"build","reason":"other","duration_s":1,"compactions":0}
+{"ts":"2026-11-11T13:44:10+07:00","event":"end","session_id":"f6862095-61ce-400d-8b57-ce584684efe4","feature":"FEAT-001","stage":"build","reason":"other","duration_s":4,"compactions":0}

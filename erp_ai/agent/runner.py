@@ -210,6 +210,7 @@ def _apply_classification(log_name, classification, context):
 			{"category": classification.category, "confidence": classification.confidence},
 			context,
 		)
+		updates = {}
 		if result.get("ok") and result.get("after"):
 			action = {
 				"tool": "set_classification",
@@ -217,17 +218,16 @@ def _apply_classification(log_name, classification, context):
 				"name": context.ticket_name,
 				"ok": True,
 			}
-			frappe.db.set_value(
-				LOG_DOCTYPE,
-				log_name,
-				{
-					"applied": 1,
-					"value_before": json.dumps(result["before"], ensure_ascii=False),
-					"value_after": json.dumps(result["after"], ensure_ascii=False),
-					"actions": json.dumps([action], ensure_ascii=False),
-				},
-				update_modified=False,
-			)
+			updates = {
+				"applied": 1,
+				"value_before": json.dumps(result["before"], ensure_ascii=False),
+				"value_after": json.dumps(result["after"], ensure_ascii=False),
+				"actions": json.dumps([action], ensure_ascii=False),
+			}
+		if result.get("ok") and result.get("skipped"):
+			updates["skipped_fields"] = json.dumps(result["skipped"], ensure_ascii=False)
+		if updates:
+			frappe.db.set_value(LOG_DOCTYPE, log_name, updates, update_modified=False)
 	except Exception:
 		frappe.db.rollback(save_point=APPLY_SAVEPOINT)
 		raise
@@ -285,9 +285,9 @@ def _reason(ticket_name, trigger, run_id, settings, context, classification, dea
 			return
 
 		tool_blocks = [block for block in result.content if block.get("type") == "tool_use"]
-		tool_results, actions, before, after, tool_errors = [], [], {}, {}, []
+		tool_results, actions, before, after, tool_errors, skipped = [], [], {}, {}, [], []
 		for block in tool_blocks:
-			tool_results.append(_run_tool(block, context, actions, before, after, tool_errors))
+			tool_results.append(_run_tool(block, context, actions, before, after, tool_errors, skipped))
 		stop_reason = result.stop_reason
 		wants_tools = stop_reason == STOP_TOOL_USE
 		if wants_tools and turn == max_turns:
@@ -302,6 +302,7 @@ def _reason(ticket_name, trigger, run_id, settings, context, classification, dea
 			actions=actions or None,
 			value_before=before or None,
 			value_after=after or None,
+			skipped_fields=skipped or None,
 		)
 		if not wants_tools or not tool_results:
 			return
@@ -309,8 +310,8 @@ def _reason(ticket_name, trigger, run_id, settings, context, classification, dea
 		messages.append({"role": "user", "content": tool_results})
 
 
-def _run_tool(block, context, actions, before, after, tool_errors):
-	"""Execute one `tool_use` block; record write outcomes and crashes in the turn's accumulators; return its `tool_result`.
+def _run_tool(block, context, actions, before, after, tool_errors, skipped):
+	"""Execute one `tool_use` block; record write outcomes, skipped fields and crashes in the turn's accumulators; return its `tool_result`.
 
 	A crash is logged as tool name + exception class only (D-20, STD-SEC-6); the model sees the class too.
 	"""
@@ -332,6 +333,8 @@ def _run_tool(block, context, actions, before, after, tool_errors):
 		if outcome.get("ok") and "after" in outcome:
 			before[name] = outcome.get("before")
 			after[name] = outcome["after"]
+		if name == "set_classification" and outcome.get("ok"):
+			skipped.extend(outcome.get("skipped") or [])
 	content = json.dumps(outcome, ensure_ascii=False, default=str)[:TOOL_RESULT_MAX_CHARS]
 	return {"type": "tool_result", "tool_use_id": block["id"], "content": content}
 

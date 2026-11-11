@@ -241,6 +241,7 @@ class TestRunner(RunnerTestBase):
 			(entry.applied, entry.model, entry.credential_label, entry.stop_reason),
 			(0, "fake-model", "fake", "end_turn"),
 		)
+		self.assertFalse(entry.skipped_fields)
 
 	def test_deadline_follows_job_timeout_constants(self):
 		with (
@@ -497,6 +498,7 @@ class TestRunnerL1Classification(RunnerTestBase):
 			[{"tool": "set_classification", "doctype": "HD Ticket", "name": self.ticket.name, "ok": True}],
 		)
 		self.assertEqual((entry.predicted_category, entry.predicted_confidence), ("A", "Cao"))
+		self.assertFalse(entry.skipped_fields)
 
 	def test_l1_human_classified_not_overwritten(self):
 		frappe.db.set_value("HD Ticket", self.ticket.name, "ai_classified_by", CLASSIFIED_BY_HUMAN)
@@ -508,6 +510,7 @@ class TestRunnerL1Classification(RunnerTestBase):
 		self.assertEqual(entry.applied, 0)
 		self.assertFalse(entry.value_after)
 		self.assertFalse(entry.actions)
+		self.assertFalse(entry.skipped_fields)
 
 	def test_l1_empty_after_keeps_applied_zero(self):
 		unknown = {"A": {"ticket_type": f"{PREFIX}không-có", "agent_group": "", "priority": ""}}
@@ -520,6 +523,65 @@ class TestRunnerL1Classification(RunnerTestBase):
 		self.assertEqual(entry.applied, 0)
 		self.assertFalse(entry.value_after)
 		self.assertFalse(entry.actions)
+		skipped = json.loads(entry.skipped_fields)
+		self.assertIn("ticket_type", [item["field"] for item in skipped])
+
+	def test_l1_missing_value_reason_logged_on_classify_entry(self):
+		self.mapping["A"]["ticket_type"] = f"{PREFIX}không-có"
+		set_agent_settings(category_mapping=json.dumps(self.mapping))
+		before = self._ticket_row()
+		self._run()
+
+		row = self._ticket_row()
+		self.assertEqual(row.ticket_type, before.ticket_type)
+		self.assertEqual((row.agent_group, row.priority), (L1_TEAM, "High"))
+		entry = self._single_entry()
+		self.assertEqual(entry.applied, 1)
+		self.assertNotIn("ticket_type", json.loads(entry.value_after))
+		self.assertEqual(
+			json.loads(entry.skipped_fields),
+			[{"field": "ticket_type", "reason": "giá trị không tồn tại trên hệ thống"}],
+		)
+
+	def test_l1_all_fields_skipped_reasons_logged_applied_zero(self):
+		unknown = {"A": {"ticket_type": f"{PREFIX}không-có", "agent_group": "", "priority": ""}}
+		set_agent_settings(category_mapping=json.dumps(unknown))
+		before = self._ticket_row()
+		self._run()
+
+		self.assertEqual(self._ticket_row(), before)
+		entry = self._single_entry()
+		self.assertEqual(entry.applied, 0)
+		self.assertFalse(entry.value_after or entry.actions)
+		self.assertEqual(
+			json.loads(entry.skipped_fields),
+			[
+				{"field": "ticket_type", "reason": "giá trị không tồn tại trên hệ thống"},
+				{"field": "agent_group", "reason": "ánh xạ không có giá trị"},
+				{"field": "priority", "reason": "ánh xạ không có giá trị"},
+			],
+		)
+
+	def test_apply_failure_leaves_skipped_fields_empty(self):
+		self.mapping["A"]["ticket_type"] = f"{PREFIX}không-có"
+		set_agent_settings(category_mapping=json.dumps(self.mapping))
+		before = self._ticket_row()
+		real_set_value = frappe.db.set_value
+
+		def failing_set_value(doctype, *args, **kwargs):
+			if doctype == LOG_DOCTYPE:
+				raise RuntimeError("boom")
+			return real_set_value(doctype, *args, **kwargs)
+
+		with patch.object(frappe.db, "set_value", side_effect=failing_set_value):
+			self._run()
+
+		self.log_error.assert_called_once()
+		self.assertEqual(self.log_error.call_args.args[0], TITLE_RUN_FAILED)
+		self.assertEqual(self._ticket_row(), before)
+		entry = self._single_entry()
+		self.assertEqual(entry.applied, 0)
+		self.assertFalse(entry.skipped_fields)
 
 	def test_not_ok_result_with_after_is_not_applied(self):
 		failed = {"ok": False, "reason": "x", "before": {}, "after": {"priority": "High"}}
@@ -937,3 +999,23 @@ class TestRunnerReasoning(RunnerTestBase):
 
 		# per turn: the gateway call commits its key state (0, 1 rows), then the entry commits itself (1, 2 rows)
 		self.assertEqual(commits, [0, 1, 1, 2])
+
+	# AC-10: skipped fields of set_classification on a reason turn
+
+	def test_reason_turn_logs_skipped_fields_of_set_classification(self):
+		if not frappe.db.exists("HD Ticket Type", L1_TYPE):
+			frappe.get_doc({"doctype": "HD Ticket Type", "name": L1_TYPE}).insert()
+		mapping = {"A": {"ticket_type": L1_TYPE, "agent_group": f"{PREFIX}không-có", "priority": "High"}}
+		set_agent_settings(category_mapping=json.dumps(mapping))
+		self.gateway.results = [
+			tool_turn(tool_use("toolu_cls", "set_classification", category="A", confidence="Cao")),
+			make_model_result(stop_reason="end_turn"),
+		]
+		self._run("comment_mention")
+
+		first, second = self._reason_entries()
+		self.assertEqual(
+			json.loads(first.skipped_fields),
+			[{"field": "agent_group", "reason": "giá trị không tồn tại trên hệ thống"}],
+		)
+		self.assertFalse(second.skipped_fields)

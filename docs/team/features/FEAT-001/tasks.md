@@ -175,8 +175,8 @@ CẬP NHẬT MỚI NHẤT (dừng sạch giữa chừng): 30/45 xong (thêm T20c
   - Returns: `gateway.probe_credential(row_name: str) -> dict` (`{"label","ok","error_kind","status"}`), `gateway.reprobe_exhausted_keys() -> list[dict]`; `provider ≠ Anthropic` → `error_kind="unsupported_provider"`, trạng thái không đổi
   - Expect: `cmd.test_one` erp_ai/gateway/test_gateway.py → test: probe thành công → `Hoạt động`; chỉ khóa `Hết hạn mức` bị dò lại, `Lỗi khóa` thì không xanh
 
-- [ ] T19 — Cổng: bằng chứng khóa API không rò rỉ — files: erp_ai/gateway/test_gateway.py, erp_ai/gateway/__init__.py, erp_ai/gateway/client.py — test: erp_ai/gateway/test_gateway.py — depends: T18
-  - progress: BASE=466648c · dev call 1 (d0a125b; Error Log rò 50 dòng do chạy mutation, chưa dọn: classifier chặn xóa, chờ người) · review round 1 request-changes (major STD-TEST-8: sink `frappe.logger` không được bắt) · rework FIX_BASE=d0a125b
+- [x] T19 — Cổng: bằng chứng khóa API không rò rỉ — files: erp_ai/gateway/test_gateway.py, erp_ai/gateway/__init__.py, erp_ai/gateway/client.py — test: erp_ai/gateway/test_gateway.py — depends: T18
+  - progress: BASE=466648c · dev call 1 (d0a125b; Error Log rò 50 dòng do chạy mutation, chưa dọn: classifier chặn xóa, chờ người) · review round 1 request-changes (major STD-TEST-8: sink `frappe.logger` không được bắt) · rework FIX_BASE=d0a125b · round 2 approve (head 84e794c, review-32) · merged b2fdf26 · cmd.test Ran 304 OK x2
   - Criterion: AC-14 (phần khóa), NFR-5
   - Receives: toàn bộ đường lỗi và thành công của cổng
   - Returns: không hàm mới; chỉ sửa mã cổng nếu test tìm thấy rò rỉ (dev sửa mã sản phẩm, không nuốt lỗi)
@@ -207,8 +207,8 @@ CẬP NHẬT MỚI NHẤT (dừng sạch giữa chừng): 30/45 xong (thêm T20c
   - Returns: `authority.ticket_comment_filters(ticket_name) -> dict`, `fetch_ticket_comments(ticket_name, limit=MAX_COMMENTS) -> list[dict]` (`frappe.get_list("Comment", ...)`, trả `[{name, author=owner, creation, content}]` mới nhất trước, `limit` ngoài 1..50 → `ValueError`), `is_instruction(author, ticket_name) -> bool` (ToDo mới nhất `Open`, `_assign` chứa tác giả, `assigned_by` ≠ tác giả; `Administrator`/`Guest`/`AGENT_USER` luôn `False`), `latest_instructor(ticket_name) -> str | None`, `label_comments(ticket_name, comments) -> list[dict]` (ghi đè khóa `role`, gọi `is_instruction` một lần cho mỗi tác giả); không đọc `commented_by`/`comment_email`/`comment_by`
   - Expect: `cmd.test_one` erp_ai/agent/test_authority.py → 5 test cũ (test_instructor_role_has_authority_on_any_ticket, test_assigned_by_other_authority_only_on_that_ticket, test_self_assigned_is_data, test_contact_and_plain_agent_are_data, test_latest_instructor_prefers_latest_comment_then_owner) + 5 test mới: test_closed_cancelled_or_reassigned_todo_is_data (ToDo Closed; Cancelled; ToDo cũ gán bởi người khác rồi ToDo mới tự gán), test_self_assign_on_other_ticket_is_data, test_never_authority_accounts_even_with_role_or_assignment (Guest/AGENT_USER có role và/hoặc được gán → False), test_spoofed_comment_author_fields_ignored, test_comments_read_from_core_comment_only (comment `Info`/`Assigned` và dòng `HD Ticket Comment` bị bỏ qua; đúng `limit`, mới nhất trước) xanh; thêm test khóa `role` ghi đè; bỏ `except ValueError` không lý do (STD-ERR-1); mỗi guard của `is_instruction` có test riêng đỏ khi bỏ guard đó
 
-- [ ] T22 — Ghi nhật ký lượt gọi — files: erp_ai/agent/run_log.py, erp_ai/agent/test_run_log.py, erp_ai/test_utils.py — test: erp_ai/agent/test_run_log.py — depends: T11, T16
-  - progress: BASE=a902d83 · dev call 1 (105b419, song song với T26) · review round 1 request-changes (major STD-ERR-2: write_entry không bắt buộc entry_type/trigger) · rework FIX_BASE=105b419
+- [x] T22 — Ghi nhật ký lượt gọi — files: erp_ai/agent/run_log.py, erp_ai/agent/test_run_log.py, erp_ai/test_utils.py — test: erp_ai/agent/test_run_log.py — depends: T11, T16
+  - progress: BASE=a902d83 · dev call 1 (105b419, song song với T26) · review round 1 request-changes (major STD-ERR-2: write_entry không bắt buộc entry_type/trigger) · rework FIX_BASE=105b419 · round 2 approve (head a64eee1, review-30) · merged 466648c · cmd.test Ran 309 OK x2
   - Ghi chú: `test_run_log.py` là touchpoint bổ sung (test).
   - Criterion: AC-15 (đủ trường nhật ký mỗi lượt), ADR-004 (nơi duy nhất tạo `ERP AI Log`), D-20 (commit khi `not frappe.flags.in_test`)
   - Receives: DocType `ERP AI Log` (T10)
@@ -236,15 +236,15 @@ CẬP NHẬT MỚI NHẤT (dừng sạch giữa chừng): 30/45 xong (thêm T20c
   - Returns: `set_classification(args: dict, ctx) -> dict` (`{"ok": True, "before", "after", "skipped": [{"field","reason"}]}`); kiểm `has_permission("write")` và `has_permlevel_access_to(field, permission_type="write")` trước khi ghi; hằng `TOOLS: list[ToolSpec]` (mới có 1 tool)
   - Expect: `cmd.test_one` erp_ai/agent/tools/test_write_ticket.py → test_write_without_permission_returns_ok_false_unchanged, test_mapping_to_missing_value_skips_field, test người đã phân loại không bị ghi đè xanh
 
-- [ ] T26 — Tool ghi: hướng giải quyết, comment, Task — files: erp_ai/agent/tools/write_ticket.py, erp_ai/agent/tools/test_write_ticket.py — test: erp_ai/agent/tools/test_write_ticket.py — depends: T13, T25
-  - progress: BASE=a902d83 · dev call 1 (3a7d884, song song với T22) · review round 1 request-changes (major STD-TEST-2: create_task test dùng Projects User thay vì ROLE_AGENT) · rework FIX_BASE=3a7d884
+- [x] T26 — Tool ghi: hướng giải quyết, comment, Task — files: erp_ai/agent/tools/write_ticket.py, erp_ai/agent/tools/test_write_ticket.py — test: erp_ai/agent/tools/test_write_ticket.py — depends: T13, T25
+  - progress: BASE=a902d83 · dev call 1 (3a7d884, song song với T22) · review round 1 request-changes (major STD-TEST-2: create_task test dùng Projects User thay vì ROLE_AGENT) · rework FIX_BASE=3a7d884 · round 2 approve (head 0cea3ac, review-31) · merged 57704e5 · cmd.test Ran 309 OK x2
   - Criterion: AC-8 (`create_task` chỉ khi có người ra lệnh; thiếu quyền → `ok=false`), A-5, D-14
   - Receives: `set_classification` và `TOOLS` từ T25
   - Returns: `set_resolution_hint(args, ctx) -> dict`, `post_comment(args, ctx) -> dict` (tạo core `Comment` qua `ticket.new_comment`, kiểm quyền tạo `Comment`; D8), `create_task(args, ctx) -> dict` (dòng đầu `description` có tên và đường dẫn phiếu; không có người ra lệnh hoặc không có DocType `Task` → `ok=false`); `TOOLS` đủ 4 tool, nhóm `task_write` cho `create_task`
   - Expect: `cmd.test_one` erp_ai/agent/tools/test_write_ticket.py → test_create_task_requires_instructor, test hướng giải quyết/comment thiếu quyền → `ok=false`, test_post_comment_creates_core_comment_owned_by_agent (Comment `comment_type = Comment`, `reference_doctype = HD Ticket`, `owner` = agent) xanh
 
 - [ ] T27 — Registry: nối đủ 10 tool và kiểm ma trận bộ tool — files: erp_ai/agent/tools/registry.py, erp_ai/agent/tools/test_registry.py — test: erp_ai/agent/tools/test_registry.py — depends: T7b, T24, T26
-  - progress: BASE=57704e5 · dev call 1 (song song với rework T19)
+  - progress: BASE=57704e5 · dev call 1 (87f6f4b; 11 tool, không phải 10) · review round 1 request-changes (major STD-TEST-5: test commit chạy với `{}` nên handler ghi không chạy) · rework FIX_BASE=87f6f4b
   - Criterion: AC-8 (ma trận 4 mức × có/không thẩm quyền; không tool ghi nào nhận DocType/trường), NFR-6
   - Receives: `read.TOOLS`, `source.TOOLS` (T6, T7 bổ sung `TOOLS` cho 3 tool nguồn qua task này: dev thêm danh sách `TOOLS` vào `source.py`), `write_ticket.TOOLS`
   - Returns: `_all_specs()` thật; `source.TOOLS: list[ToolSpec]` (`search_source`, `read_source`, `git_source`)
@@ -255,6 +255,7 @@ CẬP NHẬT MỚI NHẤT (dừng sạch giữa chừng): 30/45 xong (thêm T20c
 ## Runner (tuần tự: cùng file)
 
 - [ ] T28 — Runner: chốt tài khoản, điều kiện dừng, bước phân loại ở L0 — files: erp_ai/agent/runner.py, erp_ai/agent/test_runner.py — test: erp_ai/agent/test_runner.py — depends: T2, T3, T19, T20, T22
+  - progress: BASE=b2fdf26 · dev call 1 (song song với review T27). Nợ nhận từ T17: trạng thái khóa (cầu dao) phải sống sót khi runner rollback lượt hỏng
   - Criterion: AC-6, AC-9 (L0: phiếu trước = sau), AC-3 (UNPARSEABLE, lần chạy không hỏng), AC-15 (`daily_limit`), NFR-4 (không gửi khi `can_send_ticket` sai lúc chạy), ADR-003 (a)–(e)
   - Receives: `policy.*`, `prompts.build_classify_request`, `classification.parse_classification`, `resolve_ticket_values`, `run_log.write_entry`, `gateway.call_model`, `test_utils.FakeGateway`
   - Returns: `run_for_ticket(ticket_name, trigger)` thân bọc `try/except Exception` → `frappe.log_error(TITLE_RUN_FAILED, <message tường minh>)`; bước (a)–(e) và bước phân loại của design 4.3; nhật ký `skip` với `stop_reason` ∈ {`not_sendable`, `daily_limit`, `level_L0`}

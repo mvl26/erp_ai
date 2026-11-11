@@ -59,6 +59,15 @@ class TestInstall(FrappeTestCase):
 		frappe.db.delete("Has Role", {"parent": AGENT_USER, "parenttype": "User"})
 		frappe.db.delete("User", {"name": AGENT_USER})
 		frappe.db.delete("Role", {"name": ("in", [ROLE_AGENT, ROLE_INSTRUCTOR])})
+		# Creating a Custom Field runs ALTER TABLE, an implicit commit that would leak the deletes below.
+		# The columns already exist (migrate), so skip the DDL and keep everything in the transaction.
+		patcher = patch.object(frappe.db, "updatedb")
+		patcher.start()
+		self.addCleanup(patcher.stop)
+		# Committed by migrate; remove so the create path runs inside the rolled-back transaction.
+		frappe.db.delete("Custom Field", {"dt": "HD Ticket", "fieldname": ("like", "ai\\_%")})
+		frappe.db.delete("HD Ticket Template Field", {"parent": TEMPLATE, "fieldname": ("like", "ai\\_%")})
+		frappe.clear_cache(doctype="HD Ticket")
 		install.ensure_setup()
 
 	def test_setup_twice_is_idempotent(self):
@@ -96,10 +105,13 @@ class TestInstall(FrappeTestCase):
 			self.assertEqual(row.visible_to, "Agents")
 			self.assertEqual(row.required, 0)
 			self.assertEqual(row.editable_after_creation, 1 if row.fieldname == "ai_opt_out" else 0)
-		role_perms = frappe.get_all(
-			"Custom DocPerm", filters={"parent": "HD Ticket", "permlevel": 8, "role": "HD Customer"}
+		frappe.clear_cache(doctype="HD Ticket")
+		meta = frappe.get_meta("HD Ticket")
+		for name in AI_FIELDS:
+			self.assertEqual(meta.get_field(name).permlevel, 8, name)
+		self.assertNotIn(
+			8, {perm.permlevel for perm in meta.permissions if perm.role == "HD Customer" and perm.read}
 		)
-		self.assertFalse(role_perms)
 
 	def test_existing_template_row_preserved(self):
 		frappe.db.delete("HD Ticket Template Field", {"parent": TEMPLATE})
@@ -130,6 +142,16 @@ class TestInstall(FrappeTestCase):
 			("erp-ai-t12-keep", 1, "priority", 1, "Everyone", 1),
 		)
 		self.assertEqual([r.idx for r in rows], [1, 2, 3, 4, 5, 6])
+		self.assertEqual(
+			[r.fieldname for r in rows[1:]],
+			["ai_resolution_hint", "ai_confidence", "ai_classified_by", "ai_updated_at", "ai_opt_out"],
+		)
+		for row in rows[1:]:
+			self.assertEqual(row.visible_to, "Agents", row.fieldname)
+			self.assertEqual(row.required, 0, row.fieldname)
+			self.assertEqual(
+				row.editable_after_creation, 1 if row.fieldname == "ai_opt_out" else 0, row.fieldname
+			)
 
 	def test_missing_template_is_skipped_with_warning(self):
 		frappe.db.delete("HD Ticket Template", {"name": TEMPLATE})
@@ -137,6 +159,8 @@ class TestInstall(FrappeTestCase):
 			install.ensure_setup()
 		logger.assert_called_with(LOGGER_NAME)
 		logger.return_value.warning.assert_called_once()
+		self.assertIn("not found", logger.return_value.warning.call_args.args[0])
+		self.assertEqual(logger.return_value.warning.call_args.args[1], TEMPLATE)
 		self.assertFalse(frappe.db.exists("HD Ticket Template", TEMPLATE))
 
 	def test_agent_user_has_exact_roles_without_system_manager(self):

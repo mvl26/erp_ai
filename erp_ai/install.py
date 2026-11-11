@@ -79,12 +79,23 @@ def _ensure_ticket_custom_fields() -> None:
 		"Custom Field", {"dt": TICKET_DOCTYPE, "fieldname": AI_SECTION_FIELD}, "insert_after"
 	) or (frappe.get_meta(TICKET_DOCTYPE).fields[-1].fieldname)
 	common = {"permlevel": AI_PERMLEVEL, "module": AI_MODULE}
-	fields = [
+	fields = _ai_field_specs()
+	fields[0]["insert_after"] = insert_after
+	previous = None
+	for field in fields:
+		field.update(common)
+		field.setdefault("insert_after", previous)
+		previous = field["fieldname"]
+	create_custom_fields({TICKET_DOCTYPE: fields}, update=True)
+
+
+def _ai_field_specs() -> list[dict]:
+	"""Single source of the AI fields; the first one is the section break."""
+	return [
 		{
 			"fieldname": AI_SECTION_FIELD,
 			"label": "ERP AI",
 			"fieldtype": "Section Break",
-			"insert_after": insert_after,
 		},
 		{
 			"fieldname": "ai_resolution_hint",
@@ -118,12 +129,6 @@ def _ensure_ticket_custom_fields() -> None:
 			"fieldtype": "Check",
 		},
 	]
-	previous = None
-	for field in fields:
-		field.update(common)
-		field.setdefault("insert_after", previous)
-		previous = field["fieldname"]
-	create_custom_fields({TICKET_DOCTYPE: fields}, update=True)
 
 
 def _ensure_template_rows() -> None:
@@ -136,13 +141,7 @@ def _ensure_template_rows() -> None:
 	present = {row.fieldname for row in template.fields}
 	missing = [
 		name
-		for name in (
-			"ai_resolution_hint",
-			"ai_confidence",
-			"ai_classified_by",
-			"ai_updated_at",
-			OPT_OUT_FIELD,
-		)
+		for name in (spec["fieldname"] for spec in _ai_field_specs() if spec["fieldname"] != AI_SECTION_FIELD)
 		if name not in present
 	]
 	for name in missing:

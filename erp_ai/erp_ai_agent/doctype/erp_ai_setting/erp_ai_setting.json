@@ -1,0 +1,167 @@
+{
+ "actions": [],
+ "creation": "2026-11-11 11:00:00.000000",
+ "doctype": "DocType",
+ "engine": "InnoDB",
+ "field_order": [
+  "enabled",
+  "permission_level",
+  "max_turns_per_run",
+  "max_runs_per_ticket_per_day",
+  "max_keys_per_call",
+  "request_timeout_s",
+  "monthly_budget_usd",
+  "spent_this_month_usd",
+  "price_input_per_mtok",
+  "price_cache_write_per_mtok",
+  "price_cache_read_per_mtok",
+  "price_output_per_mtok",
+  "model_classify_default",
+  "trigger_keyword",
+  "excluded_teams",
+  "category_mapping",
+  "prompt_digest",
+  "alert_recipients",
+  "credentials"
+ ],
+ "fields": [
+  {
+   "fieldname": "enabled",
+   "fieldtype": "Check",
+   "label": "Bật agent",
+   "default": "0"
+  },
+  {
+   "fieldname": "permission_level",
+   "fieldtype": "Select",
+   "label": "Mức quyền",
+   "options": "L0\nL1\nL2\nL3",
+   "default": "L0"
+  },
+  {
+   "fieldname": "max_turns_per_run",
+   "fieldtype": "Int",
+   "label": "Số lượt tối đa mỗi lần chạy",
+   "default": "8"
+  },
+  {
+   "fieldname": "max_runs_per_ticket_per_day",
+   "fieldtype": "Int",
+   "label": "Số lần chạy tối đa mỗi phiếu mỗi ngày",
+   "default": "5"
+  },
+  {
+   "fieldname": "max_keys_per_call",
+   "fieldtype": "Int",
+   "label": "Số khóa tối đa mỗi lời gọi",
+   "default": "3"
+  },
+  {
+   "fieldname": "request_timeout_s",
+   "fieldtype": "Int",
+   "label": "Timeout mỗi lời gọi API (giây)",
+   "default": "60"
+  },
+  {
+   "fieldname": "monthly_budget_usd",
+   "fieldtype": "Currency",
+   "label": "Ngân sách tháng (USD)",
+   "default": "10"
+  },
+  {
+   "fieldname": "spent_this_month_usd",
+   "fieldtype": "Float",
+   "label": "Đã chi tháng này (USD)",
+   "default": "0",
+   "precision": "6",
+   "read_only": 1
+  },
+  {
+   "fieldname": "price_input_per_mtok",
+   "fieldtype": "Float",
+   "label": "Đơn giá input (USD / 1 triệu token)",
+   "default": "0"
+  },
+  {
+   "fieldname": "price_cache_write_per_mtok",
+   "fieldtype": "Float",
+   "label": "Đơn giá ghi cache (USD / 1 triệu token)",
+   "default": "0"
+  },
+  {
+   "fieldname": "price_cache_read_per_mtok",
+   "fieldtype": "Float",
+   "label": "Đơn giá đọc cache (USD / 1 triệu token)",
+   "default": "0"
+  },
+  {
+   "fieldname": "price_output_per_mtok",
+   "fieldtype": "Float",
+   "label": "Đơn giá output (USD / 1 triệu token)",
+   "default": "0"
+  },
+  {
+   "fieldname": "model_classify_default",
+   "fieldtype": "Data",
+   "label": "Model phân loại mặc định",
+   "default": "claude-haiku-5-5"
+  },
+  {
+   "fieldname": "trigger_keyword",
+   "fieldtype": "Data",
+   "label": "Từ khóa kích hoạt",
+   "default": "@ai"
+  },
+  {
+   "fieldname": "excluded_teams",
+   "fieldtype": "Small Text",
+   "label": "Nhóm loại trừ",
+   "default": "Nhân sự & Hành chính\nTài chính Kế toán"
+  },
+  {
+   "fieldname": "category_mapping",
+   "fieldtype": "Code",
+   "label": "Ánh xạ đầu mục",
+   "options": "JSON",
+   "default": "{\"A\": {\"ticket_type\": \"Sự cố & lỗi hệ thống\", \"agent_group\": \"IT\", \"priority\": \"High\"}, \"B\": {\"ticket_type\": \"Quản trị & cấu hình hệ thống\", \"agent_group\": \"IT\", \"priority\": \"Medium\"}, \"C\": {\"ticket_type\": \"Phát triển tính năng & tự động hóa\", \"agent_group\": \"IT\", \"priority\": \"Medium\"}, \"D\": {\"ticket_type\": \"Chuẩn hóa dữ liệu & quy trình trên ERP\", \"agent_group\": \"\", \"priority\": \"Medium\"}, \"E\": {\"ticket_type\": \"Công việc nghiệp vụ ngoài IT\", \"agent_group\": \"\", \"priority\": \"\"}, \"F\": {\"ticket_type\": \"Câu hỏi, phiếu nhiễu\", \"agent_group\": \"IT\", \"priority\": \"Low\"}}"
+  },
+  {
+   "fieldname": "prompt_digest",
+   "fieldtype": "Long Text",
+   "label": "Trích yếu HDSD"
+  },
+  {
+   "fieldname": "alert_recipients",
+   "fieldtype": "Small Text",
+   "label": "Người nhận cảnh báo",
+   "default": "info@miyano.com.vn"
+  },
+  {
+   "fieldname": "credentials",
+   "fieldtype": "Table",
+   "label": "Khóa API",
+   "options": "ERP AI Credential"
+  }
+ ],
+ "issingle": 1,
+ "links": [],
+ "modified": "2026-11-11 11:00:00.000000",
+ "modified_by": "Administrator",
+ "module": "ERP AI agent",
+ "name": "ERP AI Setting",
+ "owner": "Administrator",
+ "permissions": [
+  {
+   "create": 1,
+   "email": 1,
+   "print": 1,
+   "read": 1,
+   "role": "System Manager",
+   "share": 1,
+   "write": 1
+  }
+ ],
+ "sort_field": "modified",
+ "sort_order": "DESC",
+ "states": []
+}

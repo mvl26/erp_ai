@@ -1,3 +1,6 @@
+import frappe
+
+from erp_ai.constants import SETTING_DOCTYPE
 from erp_ai.gateway import GatewayError, ModelResult
 
 
@@ -40,3 +43,9 @@ class FakeGateway:
 		if isinstance(result, GatewayError):
 			raise result
 		return result
+
+
+def set_agent_settings(**fields) -> None:
+	"""Set ERP AI Setting values directly in the DB (no validate), for tests."""
+	for fieldname, value in fields.items():
+		frappe.db.set_single_value(SETTING_DOCTYPE, fieldname, value)

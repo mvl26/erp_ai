@@ -365,8 +365,8 @@ class TestCallModel(FrappeTestCase):
 		self.addCleanup(frappe.db.rollback)
 		frappe.db.delete(CREDENTIAL_DOCTYPE, {"parent": SETTING_DOCTYPE})
 		set_agent_settings(
-			max_keys_per_call=3,
-			request_timeout_s=60,
+			max_keys_per_call=2,
+			request_timeout_s=45,
 			model_classify_default="default-model",
 			**PRICES,
 		)
@@ -400,7 +400,7 @@ class TestCallModel(FrappeTestCase):
 		reply = ok_reply(headers={"anthropic-ratelimit-tokens-remaining": "50000"})
 		send, result = self.run_call(reply, tools=[{"name": "t"}])
 		self.assertEqual(send.calls[0]["api_key"], "sk-k1")
-		self.assertEqual(send.calls[0]["timeout"], 60)
+		self.assertEqual(send.calls[0]["timeout"], 45)
 		self.assertEqual(
 			send.calls[0]["request"],
 			{**CALL, "model": "default-model", "tools": [{"name": "t"}]},
@@ -411,8 +411,6 @@ class TestCallModel(FrappeTestCase):
 		self.assertEqual(result.credential_label, "k1")
 		self.assertEqual(result.request_id, "req_ok")
 		self.assertEqual(result.keys_tried, [{"label": "k1", "outcome": "ok"}])
-		self.assertIsInstance(result.latency_ms, int)
-		self.assertGreaterEqual(result.latency_ms, 0)
 		# usage thiếu khóa -> 0; chi phí theo đơn giá trong Setting: (1000*3 + 2000*15) / 1e6
 		self.assertEqual(
 			result.usage,
@@ -427,6 +425,21 @@ class TestCallModel(FrappeTestCase):
 		row = self.row(name)
 		self.assertEqual((row.status, row.error_count, row.tokens_remaining), (KEY_STATUS_ACTIVE, 0, 50000))
 		self.assertFalse(row.last_error)
+
+	def test_latency_ms_is_elapsed_milliseconds(self):
+		add_credential("k1")
+		clock = [100.0]
+
+		def slow_send(api_key, *, timeout, request):
+			clock[0] += 1.5
+			return ok_reply()
+
+		with (
+			patch.object(gateway.time, "monotonic", lambda: clock[0]),
+			patch.object(client, "send", slow_send),
+		):
+			result = gateway.call_model("classify", **CALL)
+		self.assertEqual(result.latency_ms, 1500)
 
 	def test_none_usage_values_count_as_zero(self):
 		add_credential("k1")
@@ -489,13 +502,30 @@ class TestCallModel(FrappeTestCase):
 		for index in range(5):
 			add_credential(f"k{index}", try_order=index + 1)
 		send, error = self.run_call(*[err(529) for _ in range(5)])
-		self.assertEqual(len(send.calls), 3)
+		self.assertEqual(len(send.calls), 2)
 		self.assertIsInstance(error, GatewayError)
 		self.assertEqual(error.kind, "all_keys_failed")
-		self.assertEqual([k["label"] for k in error.keys_tried], ["k0", "k1", "k2"])
-		self.assertEqual((error.status, error.credential_label, error.request_id), (529, "k2", "req_err"))
+		self.assertEqual([k["label"] for k in error.keys_tried], ["k0", "k1"])
+		self.assertEqual((error.status, error.credential_label, error.request_id), (529, "k1", "req_err"))
 		self.alarm.assert_called_once()
 		self.assertIn("Hết khóa dùng được cho việc 'classify'", self.alarm.call_args.args[0])
+
+	def test_empty_settings_fall_back_to_defaults(self):
+		set_agent_settings(max_keys_per_call=0, request_timeout_s=0)
+		for index in range(5):
+			add_credential(f"k{index}", try_order=index + 1)
+		send, error = self.run_call(*[err(529) for _ in range(5)])
+		self.assertEqual(len(send.calls), 3)
+		self.assertEqual({call["timeout"] for call in send.calls}, {60})
+		self.assertEqual(error.kind, "all_keys_failed")
+
+	def test_non_positive_max_keys_still_tries_one_key(self):
+		set_agent_settings(max_keys_per_call=-2)
+		add_credential("k1", try_order=1)
+		add_credential("k2", try_order=2)
+		send, error = self.run_call(err(529), ok_reply())
+		self.assertEqual(len(send.calls), 1)
+		self.assertEqual(error.kind, "all_keys_failed")
 
 	def test_all_keys_failing_before_max_keys_is_all_keys_failed(self):
 		add_credential("k1")
@@ -509,6 +539,8 @@ class TestCallModel(FrappeTestCase):
 		send, error = self.run_call(err(400), ok_reply())
 		self.assertEqual(len(send.calls), 1)
 		self.assertEqual(error.kind, "bad_request")
+		self.assertIsNone(error.__cause__)
+		self.assertTrue(error.__suppress_context__)
 		self.assertEqual((error.status, error.credential_label, error.request_id), (400, "k1", "req_err"))
 		self.assertEqual(error.keys_tried, [{"label": "k1", "outcome": "bad_request"}])
 		row = self.row(first)
@@ -560,8 +592,25 @@ class TestCallModel(FrappeTestCase):
 		add_credential("k1", try_order=1)
 		add_credential("k2", try_order=2)
 		self.alarm.side_effect = RuntimeError("no email account")
-		_, result = self.run_call(err(401), ok_reply())
+		with patch.object(frappe, "log_error") as log_error:
+			_, result = self.run_call(err(401), ok_reply())
 		self.assertEqual(result.credential_label, "k2")
+		log_error.assert_called_once()
+		title, message = log_error.call_args.args
+		self.assertEqual(title, "erp_ai: không gửi được thông báo khóa")
+		self.assertIn("RuntimeError", message)
+		self.assertNotIn("no email account", message)
+
+	def test_alarm_failure_when_no_key_still_raises_no_key(self):
+		add_credential("disabled", enabled=0)
+		self.alarm.side_effect = RuntimeError("no email account")
+		with patch.object(frappe, "log_error") as log_error:
+			_, error = self.run_call()
+		self.assertEqual(error.kind, "no_key")
+		log_error.assert_called_once()
+		title, message = log_error.call_args.args
+		self.assertEqual(title, "erp_ai: không gửi được thông báo khóa")
+		self.assertIn("RuntimeError", message)
 
 	def test_deadline_under_five_seconds_makes_no_call(self):
 		add_credential("k1")
@@ -574,7 +623,7 @@ class TestCallModel(FrappeTestCase):
 		send, _ = self.run_call(ok_reply(), deadline=time.monotonic() + 30)
 		self.assertTrue(25 < send.calls[0]["timeout"] <= 30, send.calls[0]["timeout"])
 		send, _ = self.run_call(ok_reply(), deadline=time.monotonic() + 600)
-		self.assertEqual(send.calls[0]["timeout"], 60)
+		self.assertEqual(send.calls[0]["timeout"], 45)
 
 	def test_deadline_checked_before_every_attempt(self):
 		add_credential("k1", try_order=1)
@@ -615,7 +664,12 @@ class TestCallModel(FrappeTestCase):
 		first = add_credential("k1", try_order=1)
 		add_credential("k2", try_order=2)
 		real = credentials.get_api_key
-		with patch.object(credentials, "get_api_key", side_effect=lambda n: None if n == first else real(n)):
+		with (
+			patch.object(credentials, "get_api_key", side_effect=lambda n: None if n == first else real(n)),
+			patch.object(gateway.frappe, "logger") as logger,
+		):
 			send, result = self.run_call(ok_reply())
+		logger.return_value.warning.assert_called_once()
+		self.assertIn("k1", logger.return_value.warning.call_args.args)
 		self.assertEqual([c["api_key"] for c in send.calls], ["sk-k2"])
 		self.assertEqual(result.credential_label, "k2")

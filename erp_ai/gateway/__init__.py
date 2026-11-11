@@ -66,16 +66,20 @@ def _notify(action, row, failure) -> None:
 			alerts.send_alarm(subject, message)
 		else:
 			alerts.send_notice(subject, message)
-	except Exception:
-		frappe.log_error("erp_ai: không gửi được thông báo khóa", f"{subject}; gửi thông báo lỗi")
+	except Exception as exc:
+		frappe.log_error(
+			"erp_ai: không gửi được thông báo khóa", f"{subject}; gửi thông báo lỗi: {type(exc).__name__}"
+		)
 
 
 def _alarm_no_key(task) -> None:
 	subject = f"Hết khóa dùng được cho việc '{task}'"
 	try:
 		alerts.send_alarm(subject, subject)
-	except Exception:
-		frappe.log_error("erp_ai: không gửi được thông báo khóa", f"{subject}; gửi báo động lỗi")
+	except Exception as exc:
+		frappe.log_error(
+			"erp_ai: không gửi được thông báo khóa", f"{subject}; gửi báo động lỗi: {type(exc).__name__}"
+		)
 
 
 def call_model(task, *, system, messages, max_tokens, tools=None, deadline=None) -> ModelResult:
@@ -102,6 +106,7 @@ def call_model(task, *, system, messages, max_tokens, tools=None, deadline=None)
 		tried_labels.add(row.label)
 		api_key = credentials.get_api_key(row.name)
 		if api_key is None:
+			frappe.logger(LOGGER_NAME).warning("gateway key has no stored secret key=%s", row.label)
 			continue
 		model = (
 			row.model_reason if task == "reason" else row.model_classify or settings["model_classify_default"]

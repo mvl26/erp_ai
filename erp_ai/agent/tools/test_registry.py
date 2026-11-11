@@ -1,3 +1,5 @@
+import importlib
+import inspect
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -197,3 +199,73 @@ class TestRegistry(FrappeTestCase):
 			patch.object(registry.importlib, "import_module", fakes.__getitem__),
 		):
 			self.assertEqual([s.name for s in registry._all_specs()], list(registry.TOOL_MODULES))
+
+
+READ_TOOL_NAMES = ["get_ticket", "list_comments", "search_resolved_tickets", "get_record"]
+SOURCE_TOOL_NAMES = ["search_source", "read_source", "git_source"]
+TICKET_WRITE_TOOL_NAMES = ["set_classification", "set_resolution_hint", "post_comment"]
+TASK_WRITE_TOOL_NAMES = ["create_task"]
+FORBIDDEN_WRITE_PARAMETER_WORDS = ("doctype", "field")
+SCHEMA_TYPES = {"string", "integer", "boolean", "array"}
+
+
+class TestRealToolSet(FrappeTestCase):
+	"""AC-8 / NFR-6 against the real specs of read.py, source.py and write_ticket.py."""
+
+	def setUp(self):
+		self.addCleanup(frappe.db.rollback)
+		commit_guard = patch.object(frappe.db, "commit", side_effect=AssertionError("commit in tool test"))
+		commit_guard.start()
+		self.addCleanup(commit_guard.stop)
+
+	def names(self, level, has_instructor):
+		return [s["name"] for s in get_tool_schemas(level, has_instructor)]
+
+	def test_tool_names_per_level_and_authority(self):
+		granted = READ_TOOL_NAMES + SOURCE_TOOL_NAMES + TICKET_WRITE_TOOL_NAMES
+		for has_instructor in (False, True):
+			self.assertEqual(self.names("L0", has_instructor), [])
+		for level in ("L1", "L2", "L3"):
+			self.assertEqual(self.names(level, False), granted)
+			self.assertEqual(self.names(level, True), granted + TASK_WRITE_TOOL_NAMES)
+		self.assertEqual(len(registry._all_specs()), 11)
+
+	def test_no_write_tool_accepts_doctype_or_field(self):
+		write_specs = [s for s in registry._all_specs() if s.group in ("ticket_write", "task_write")]
+		self.assertEqual([s.name for s in write_specs], TICKET_WRITE_TOOL_NAMES + TASK_WRITE_TOOL_NAMES)
+		for spec in write_specs:
+			for key in spec.schema["input_schema"]["properties"]:
+				for word in FORBIDDEN_WRITE_PARAMETER_WORDS:
+					self.assertNotIn(word, key.lower(), f"{spec.name} accepts {key}")
+
+	def test_git_source_schema_only_log_and_blame(self):
+		spec = next(s for s in registry._all_specs() if s.name == "git_source")
+		properties = spec.schema["input_schema"]["properties"]
+		self.assertEqual(properties["subcommand"]["enum"], ["log", "blame"])
+		self.assertEqual(spec.schema["input_schema"]["required"], ["app", "subcommand"])
+		self.assertEqual(properties["args"]["maxItems"], 10)
+
+	def test_schemas_use_only_types_the_validator_knows(self):
+		def types_of(rule):
+			found = {rule["type"]} if "type" in rule else set()
+			if "items" in rule:
+				found |= types_of(rule["items"])
+			return found
+
+		for spec in registry._all_specs():
+			self.assertEqual(spec.schema["name"], spec.name)
+			for key, rule in spec.schema["input_schema"]["properties"].items():
+				self.assertLessEqual(types_of(rule), SCHEMA_TYPES, f"{spec.name}.{key}")
+
+	def test_no_tool_module_commits(self):
+		# Handlers run inside execute_tool's savepoint; a commit would release it.
+		for module_name in registry.TOOL_MODULES:
+			module = importlib.import_module(module_name)
+			self.assertNotIn(".commit(", inspect.getsource(module), module_name)
+
+	def test_real_tools_run_through_execute_tool_without_committing(self):
+		# The class-level guard raises AssertionError if any handler commits.
+		context = _context("L1", "someone@example.com")
+		for spec in registry._all_specs():
+			result = execute_tool(spec.name, {}, context)
+			self.assertFalse(result["ok"] and spec.schema["input_schema"]["required"], spec.name)

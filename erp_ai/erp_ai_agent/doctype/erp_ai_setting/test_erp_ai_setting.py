@@ -81,6 +81,12 @@ class TestERPAISetting(FrappeTestCase):
 		self.assertEqual(doc.permission_level, "L0")
 		self.assertEqual(json.loads(doc.category_mapping), DEFAULT_CATEGORY_MAPPING)
 
+	def test_monthly_budget_is_float_precision_6_usd(self):
+		field = frappe.get_meta(SETTING_DOCTYPE).get_field("monthly_budget_usd")
+		self.assertEqual(field.fieldtype, "Float")
+		self.assertEqual(str(field.precision), "6")
+		self.assertIn("(USD)", field.label)
+
 	def test_hd_agent_cannot_read_or_write_settings(self):
 		email = "erp-ai-hd-agent@example.com"
 		if not frappe.db.exists("User", email):

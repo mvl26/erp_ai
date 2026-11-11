@@ -29,6 +29,12 @@ class TestERPAICredential(FrappeTestCase):
 		self.assertEqual(int(self.meta.get_field("try_order").default), 10)
 		self.assertEqual(int(self.meta.get_field("enabled").default), 1)
 
+	def test_budget_month_is_float_precision_6_usd(self):
+		field = self.meta.get_field("budget_month_usd")
+		self.assertEqual(field.fieldtype, "Float")
+		self.assertEqual(str(field.precision), "6")
+		self.assertIn("(USD)", field.label)
+
 	def test_status_options_and_read_only_rule(self):
 		status = self.meta.get_field("status")
 		self.assertEqual(

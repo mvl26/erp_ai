@@ -34,3 +34,21 @@ Nhánh `team/FEAT-001-task-21` (từ 1d6976e). Files: `erp_ai/agent/authority.py
 - N+1: `latest_instructor` còn gọi `is_instruction` mỗi comment (≤ 30, minor review-17, giữ đơn giản).
 - Không đọc `commented_by`/`comment_email`/`comment_by`; dữ liệu test qua `new_comment`/`add_comment`.
 - Đã thêm test riêng cho `label_comments` ghi đè `role` + một lần/tác giả; test limit ngoài 1..50.
+
+## Vòng 1/3 - sửa finding STD-TEST-8 (major) + 2 minor
+Không đổi `authority.py`; chỉ thêm test trong `test_authority.py`.
+
+| Finding | Test phủ |
+|---|---|
+| ToDo filter `allocated_to` không bị test bắt | `test_newest_todo_is_the_authors_own_on_this_ticket` (ASSIGNEE tự giao, ToDo mới hơn của PLAIN do ASSIGNER giao -> False); `test_newer_self_assigned_todo_of_someone_else_does_not_revoke` (ASSIGNEE do ASSIGNER giao, ToDo mới hơn của PLAIN assigned_by rỗng -> True; dùng assigned_by rỗng vì self-assign của PLAIN vẫn != ASSIGNEE nên không phân biệt được) |
+| `reference_type` | `test_todo_of_another_reference_type_is_ignored` (ToDo mới hơn tự giao cho ASSIGNEE, reference_type đổi sang "User" -> vẫn True) |
+| minor a: `<` vs `<=` | `test_comments_read_from_core_comment_only`: limit=1 và 50 được chấp nhận |
+| minor b: get_list permission | `test_fetch_ticket_comments_as_non_administrator_uses_permissions` (set_user PLAIN) |
+
+## Mutation (đỏ)
+- bỏ `allocated_to`: FAIL test_newer_self_assigned_todo_of_someone_else_does_not_revoke, FAIL test_newest_todo_is_the_authors_own_on_this_ticket (2 failures)
+- bỏ `reference_type`: FAIL test_todo_of_another_reference_type_is_ignored (1 failure)
+- `limit < MAX`: ERROR test_comments_read_from_core_comment_only; `MIN < limit`: cùng test đỏ
+
+## Green
+`bench --site miyano run-tests --module erp_ai.agent.test_authority` -> Ran 16 tests OK. pre-commit: all Passed.

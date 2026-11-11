@@ -89,6 +89,25 @@ class TestAuthority(FrappeTestCase):
 		self._force_assign_list(self.ticket_p, [])
 		self.assertFalse(authority.is_instruction(ASSIGNEE, self.ticket_p))
 
+	def test_newest_todo_is_the_authors_own_on_this_ticket(self):
+		self._force_assign_list(self.ticket_p, [ASSIGNEE, PLAIN])
+		# Self-assigned, then a newer ToDo for someone else assigned by another: not this author's.
+		self._assign(self.ticket_p, ASSIGNEE, ASSIGNEE, creation="2024-01-01 10:00:00")
+		self._assign(self.ticket_p, PLAIN, ASSIGNER, creation="2024-01-02 10:00:00")
+		self.assertFalse(authority.is_instruction(ASSIGNEE, self.ticket_p))
+
+	def test_newer_self_assigned_todo_of_someone_else_does_not_revoke(self):
+		self._force_assign_list(self.ticket_p, [ASSIGNEE, PLAIN])
+		self._assign(self.ticket_p, ASSIGNEE, ASSIGNER, creation="2024-01-01 10:00:00")
+		self._assign(self.ticket_p, PLAIN, "", creation="2024-01-02 10:00:00")
+		self.assertTrue(authority.is_instruction(ASSIGNEE, self.ticket_p))
+
+	def test_todo_of_another_reference_type_is_ignored(self):
+		self._assign(self.ticket_p, ASSIGNEE, ASSIGNER, creation="2024-01-01 10:00:00")
+		other = self._assign(self.ticket_p, ASSIGNEE, ASSIGNEE, creation="2024-01-02 10:00:00")
+		frappe.db.set_value("ToDo", other, "reference_type", "User", update_modified=False)
+		self.assertTrue(authority.is_instruction(ASSIGNEE, self.ticket_p))
+
 	def test_self_assign_on_other_ticket_is_data(self):
 		self._assign(self.ticket_p, ASSIGNEE, ASSIGNER)
 		self._assign(self.ticket_q, ASSIGNEE, ASSIGNEE)
@@ -173,6 +192,9 @@ class TestAuthority(FrappeTestCase):
 		self.assertEqual({c["author"] for c in fetched}, {ASSIGNEE})
 		self.assertEqual(len(authority.fetch_ticket_comments(self.ticket_p, limit=2)), 2)
 		self.assertIsNone(authority.latest_instructor(self.ticket_p))
+		for edge in (1, 50):
+			self.assertLessEqual(len(authority.fetch_ticket_comments(self.ticket_p, limit=edge)), edge)
+		self.assertEqual(len(authority.fetch_ticket_comments(self.ticket_p, limit=1)), 1)
 		for bad in (0, 51, -1):
 			with self.assertRaises(ValueError):
 				authority.fetch_ticket_comments(self.ticket_p, limit=bad)
@@ -208,3 +230,9 @@ class TestAuthority(FrappeTestCase):
 			labelled = authority.label_comments(self.ticket_p, comments)
 		self.assertEqual([c["role"] for c in labelled], ["dữ liệu", "dữ liệu", "chỉ thị", "chỉ thị"])
 		self.assertCountEqual(calls, [PLAIN, ASSIGNEE])
+
+	def test_fetch_ticket_comments_as_non_administrator_uses_permissions(self):
+		self._comment(self.ticket_p, ASSIGNEE, "2024-01-01 10:00:00")
+		frappe.set_user(PLAIN)
+		fetched = authority.fetch_ticket_comments(self.ticket_p)
+		self.assertEqual([c["author"] for c in fetched], [ASSIGNEE])

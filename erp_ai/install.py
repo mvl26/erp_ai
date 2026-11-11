@@ -1,6 +1,21 @@
 import frappe
+from frappe.custom.doctype.custom_field.custom_field import create_custom_fields
 
-from erp_ai.constants import AGENT_USER, HELPDESK_AGENT_ROLE, ROLE_AGENT, ROLE_INSTRUCTOR, SETTING_DOCTYPE
+from erp_ai.constants import (
+	AGENT_USER,
+	HELPDESK_AGENT_ROLE,
+	LOGGER_NAME,
+	ROLE_AGENT,
+	ROLE_INSTRUCTOR,
+	SETTING_DOCTYPE,
+)
+
+TICKET_DOCTYPE = "HD Ticket"
+TEMPLATE_NAME = "Default"
+AI_MODULE = "ERP AI agent"
+AI_SECTION_FIELD = "ai_section"
+OPT_OUT_FIELD = "ai_opt_out"
+AI_PERMLEVEL = 8
 
 
 def after_install():
@@ -16,6 +31,8 @@ def ensure_setup() -> None:
 	_ensure_roles()
 	_ensure_agent_user()
 	_ensure_default_settings()
+	_ensure_ticket_custom_fields()
+	_ensure_template_rows()
 
 
 def _ensure_roles() -> None:
@@ -54,3 +71,89 @@ def _ensure_default_settings() -> None:
 		)
 		if not stored or stored[0][0] is None:
 			frappe.db.set_single_value(SETTING_DOCTYPE, field.fieldname, field.default)
+
+
+def _ensure_ticket_custom_fields() -> None:
+	# Keep the section where it was first placed; the last field of the meta changes once ours exist.
+	insert_after = frappe.db.get_value(
+		"Custom Field", {"dt": TICKET_DOCTYPE, "fieldname": AI_SECTION_FIELD}, "insert_after"
+	) or (frappe.get_meta(TICKET_DOCTYPE).fields[-1].fieldname)
+	common = {"permlevel": AI_PERMLEVEL, "module": AI_MODULE}
+	fields = _ai_field_specs()
+	fields[0]["insert_after"] = insert_after
+	previous = None
+	for field in fields:
+		field.update(common)
+		field.setdefault("insert_after", previous)
+		previous = field["fieldname"]
+	create_custom_fields({TICKET_DOCTYPE: fields}, update=True)
+
+
+def _ai_field_specs() -> list[dict]:
+	"""Single source of the AI fields; the first one is the section break."""
+	return [
+		{
+			"fieldname": AI_SECTION_FIELD,
+			"label": "ERP AI",
+			"fieldtype": "Section Break",
+		},
+		{
+			"fieldname": "ai_resolution_hint",
+			"label": "Hướng giải quyết (AI)",
+			"fieldtype": "Text Editor",
+			"read_only": 1,
+		},
+		{
+			"fieldname": "ai_confidence",
+			"label": "Độ tin cậy (AI)",
+			"fieldtype": "Select",
+			"options": "\nCao\nTrung bình\nThấp",
+			"read_only": 1,
+		},
+		{
+			"fieldname": "ai_classified_by",
+			"label": "Phân loại bởi",
+			"fieldtype": "Select",
+			"options": "\nAI\nNgười",
+			"read_only": 1,
+		},
+		{
+			"fieldname": "ai_updated_at",
+			"label": "AI cập nhật lúc",
+			"fieldtype": "Datetime",
+			"read_only": 1,
+		},
+		{
+			"fieldname": OPT_OUT_FIELD,
+			"label": "Không dùng AI cho phiếu này",
+			"fieldtype": "Check",
+		},
+	]
+
+
+def _ensure_template_rows() -> None:
+	if not frappe.db.exists("HD Ticket Template", TEMPLATE_NAME):
+		frappe.logger(LOGGER_NAME).warning(
+			"HD Ticket Template %s not found; AI rows not added", TEMPLATE_NAME
+		)
+		return
+	template = frappe.get_doc("HD Ticket Template", TEMPLATE_NAME)
+	present = {row.fieldname for row in template.fields}
+	missing = [
+		name
+		for name in (spec["fieldname"] for spec in _ai_field_specs() if spec["fieldname"] != AI_SECTION_FIELD)
+		if name not in present
+	]
+	for name in missing:
+		template.append(
+			"fields",
+			{
+				"fieldname": name,
+				"required": 0,
+				"visible_to": "Agents",
+				"editable_after_creation": 1 if name == OPT_OUT_FIELD else 0,
+			},
+		)
+	if missing:
+		template.flags.ignore_permissions = True
+		template.save()

@@ -44,6 +44,7 @@ class TestRunLog(FrappeTestCase):
 		name = run_log.write_entry(
 			run_id="ERPAI-TEST-run",
 			entry_type="reason",
+			trigger="comment_mention",
 			turn=1,
 			model="fake-model",
 			input_tokens=7,
@@ -57,7 +58,7 @@ class TestRunLog(FrappeTestCase):
 		)
 
 		doc = frappe.get_doc(LOG_DOCTYPE, name)
-		self.assertNotRegex(name, r"^ERP-AI-LOG|^\d+$")
+		self.assertRegex(name, r"^[0-9a-z]{10}$")
 		self.assertEqual(doc.owner, AI_USER)
 		self.assertEqual(json.loads(doc.keys_tried), KEYS_TRIED)
 		self.assertEqual(json.loads(doc.tools_called), TOOLS_CALLED)
@@ -69,33 +70,64 @@ class TestRunLog(FrappeTestCase):
 
 		frappe.set_user(HD_AGENT_USER)
 		with self.assertRaises(frappe.PermissionError):
-			run_log.write_entry(run_id="ERPAI-TEST-run", entry_type="classify", turn=0)
+			run_log.write_entry(
+				run_id="ERPAI-TEST-run", entry_type="classify", trigger="ticket_insert", turn=0
+			)
 
-	def test_write_entry_keeps_strings_and_omits_json_fields_when_absent(self):
+	def test_write_entry_keeps_string_values_and_non_ascii_json(self):
 		frappe.set_user(AI_USER)
 		name = run_log.write_entry(
-			run_id="ERPAI-TEST-run", entry_type="skip", turn=0, keys_tried='[{"a": 1}]'
+			run_id="ERPAI-TEST-run",
+			entry_type="skip",
+			trigger="ticket_insert",
+			turn=0,
+			keys_tried='[{"a": 1}]',
+			actions=[{"note": "Không phân loại"}],
 		)
 
 		doc = frappe.get_doc(LOG_DOCTYPE, name)
 		self.assertEqual(doc.keys_tried, '[{"a": 1}]')
-		self.assertFalse(doc.tools_called)
-		self.assertFalse(doc.actions)
+		self.assertIn("Không phân loại", doc.actions)
+
+	def test_write_entry_rejects_missing_or_unknown_entry_type(self):
+		frappe.set_user(AI_USER)
+		with self.assertRaises(ValueError):
+			run_log.write_entry(run_id="ERPAI-TEST-run", trigger="ticket_insert", turn=0)
+		with self.assertRaises(ValueError):
+			run_log.write_entry(run_id="ERPAI-TEST-run", entry_type="bogus", trigger="ticket_insert", turn=0)
+
+	def test_write_entry_rejects_missing_or_unknown_trigger(self):
+		frappe.set_user(AI_USER)
+		with self.assertRaises(ValueError):
+			run_log.write_entry(run_id="ERPAI-TEST-run", entry_type="skip", turn=0)
+		with self.assertRaises(ValueError):
+			run_log.write_entry(run_id="ERPAI-TEST-run", entry_type="skip", trigger="bogus", turn=0)
+
+	def test_write_entry_ignores_doctype_override(self):
+		frappe.set_user(AI_USER)
+		name = run_log.write_entry(
+			doctype="User", run_id="ERPAI-TEST-run", entry_type="skip", trigger="ticket_insert", turn=0
+		)
+
+		self.assertTrue(frappe.db.exists(LOG_DOCTYPE, name))
 
 	def test_write_entry_commits_outside_tests(self):
 		frappe.set_user(AI_USER)
 		self.addCleanup(setattr, frappe.flags, "in_test", frappe.flags.in_test)
 		frappe.flags.in_test = False
 		with patch.object(frappe.db, "commit") as commit:
-			run_log.write_entry(run_id="ERPAI-TEST-run", entry_type="skip", turn=0)
+			run_log.write_entry(run_id="ERPAI-TEST-run", entry_type="skip", trigger="ticket_insert", turn=0)
 		commit.assert_called_once_with()
 
 	def test_write_entry_does_not_commit_in_tests(self):
 		frappe.set_user(AI_USER)
-		run_log.write_entry(run_id="ERPAI-TEST-run", entry_type="skip", turn=0)
+		with patch.object(frappe.db, "commit") as commit:
+			run_log.write_entry(run_id="ERPAI-TEST-run", entry_type="skip", trigger="ticket_insert", turn=0)
+		commit.assert_not_called()
 
 	def test_make_log_entry_returns_name_of_saved_log(self):
 		name = make_log_entry(model="fake-model")
 
+		self.assertEqual(frappe.db.get_value(LOG_DOCTYPE, name, "trigger"), "ticket_insert")
 		self.assertEqual(frappe.db.get_value(LOG_DOCTYPE, name, "model"), "fake-model")
 		self.assertTrue(frappe.db.get_value(LOG_DOCTYPE, name, "run_id"))

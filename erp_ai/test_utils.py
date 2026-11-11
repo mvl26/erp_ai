@@ -114,6 +114,6 @@ def fake_anthropic_client(**kwargs) -> FakeAnthropicClient:
 
 def make_log_entry(**fields) -> str:
 	"""Write an ERP AI Log row through `run_log.write_entry` (current session user must be allowed) and return its name."""
-	values = {"run_id": "ERPAI-TEST-run", "entry_type": "skip", "turn": 0}
+	values = {"run_id": "ERPAI-TEST-run", "entry_type": "skip", "trigger": "ticket_insert", "turn": 0}
 	values.update(fields)
 	return write_entry(**values)

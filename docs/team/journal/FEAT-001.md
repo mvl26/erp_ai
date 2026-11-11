@@ -60,3 +60,4 @@ Approved-by:
 - 2026-11-11 lý do gọi designer (amend): sửa design 2/3.3/D-24 theo D8, đồng thời đưa D4/D6/D7 vào design.md cho reviewer/qa đối chiếu
 - 2026-11-11 design (amend) → designer | design.md + mục Amendments 2026-11-11 (13 dòng): D8, D4, D6, D7, D2; touchpoint 65→71; ảnh hưởng T21/T24/T26/T27/T30/T31/T40 | DESIGNED | 1 lượt | good | —
 - 2026-11-11 lý do gọi tech-lead (lượt 7): cập nhật tasks.md theo design amend, làm lại T21, rồi T15/T20/T23..
+- 2026-11-11 build T15, T20, T21 (làm lại), T23, T20b → dev ×9 + reviewer ×9 | T15 approve vòng 1; T20, T21, T23 request-changes 1 vòng rồi approve (STD-TEST-8 ×3, STD-DESIGN-4/2/5); T20b thêm sau merge vì test_policy tạo HD Team thật làm rò Redis `assignment_rule_map` → 7 lỗi ở test khác | merge b4122ab, c7df05b, 2da5abb, 3b412e7, 2706f13; cmd.test (qua dev, D3) Ran 186 tests OK hai lần, pre-commit exit 0 | thêm T20b (44 task); install.py thêm vào touchpoint T20 | tiếp T16/T24/T25

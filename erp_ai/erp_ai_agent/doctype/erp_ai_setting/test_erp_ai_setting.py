@@ -1,4 +1,5 @@
 import json
+from unittest.mock import MagicMock, patch
 
 import frappe
 from frappe.tests.utils import FrappeTestCase
@@ -12,6 +13,7 @@ from erp_ai.constants import (
 	KEY_STATUS_PAUSED,
 	SETTING_DOCTYPE,
 )
+from erp_ai.erp_ai_agent.doctype.erp_ai_setting import erp_ai_setting
 from erp_ai.test_utils import set_agent_settings
 
 PRICES = {
@@ -248,3 +250,115 @@ class TestERPAISetting(FrappeTestCase):
 	def test_set_agent_settings_writes_values(self):
 		set_agent_settings(enabled=1, permission_level="L1")
 		self.assertEqual(frappe.db.get_single_value(SETTING_DOCTYPE, "permission_level"), "L1")
+
+
+CHECK_KEYS_HD_AGENT = "erpai-test-check-keys-agent@example.com"
+FAKE_SECRET = "sk-ant-ERPAI-TEST-SECRET-0001"
+
+
+class TestCheckKeys(FrappeTestCase):
+	def setUp(self):
+		# Undo each test (user, keys); log_error is patched so no Error Log row is left on the site.
+		self.addCleanup(frappe.db.rollback)
+		self.addCleanup(frappe.set_user, frappe.session.user)
+		log_error = patch("frappe.log_error")
+		log_error.start()
+		self.addCleanup(log_error.stop)
+		frappe.db.delete(CREDENTIAL_DOCTYPE, {"parent": SETTING_DOCTYPE})
+		set_agent_settings(
+			enabled=0,
+			max_turns_per_run=8,
+			max_runs_per_ticket_per_day=5,
+			max_keys_per_call=3,
+			request_timeout_s=60,
+			monthly_budget_usd=10,
+			trigger_keyword="@ai",
+			category_mapping=json.dumps(DEFAULT_CATEGORY_MAPPING),
+			spent_this_month_usd=0,
+			**PRICES,
+		)
+		self.setting = _settings_with_keys("ERPAI-TEST-A", "ERPAI-TEST-B")
+		self.rows = {row.label: row.name for row in self.setting.credentials}
+
+	def _become_hd_agent(self):
+		user = frappe.new_doc("User")
+		user.update({"email": CHECK_KEYS_HD_AGENT, "first_name": "HD Agent", "send_welcome_email": 0})
+		user.append("roles", {"role": "Agent"})
+		user.insert(ignore_permissions=True)
+		frappe.set_user(CHECK_KEYS_HD_AGENT)
+		# only_for returns early while flags.in_test is set; switch it off to exercise the real guard.
+		self.addCleanup(setattr, frappe.local.flags, "in_test", frappe.local.flags.in_test)
+		frappe.local.flags.in_test = False
+
+	def _fake_probe(self, row_name):
+		label = frappe.db.get_value(CREDENTIAL_DOCTYPE, row_name, "label")
+		if label == "ERPAI-TEST-B":
+			return {"label": label, "ok": False, "error_kind": "auth", "status": 401}
+		return {"label": label, "ok": True, "error_kind": None, "status": None}
+
+	def test_check_keys_system_manager_only_and_per_key_result(self):
+		with patch("erp_ai.gateway.probe_credential", side_effect=self._fake_probe) as probe:
+			result = erp_ai_setting.check_keys()
+			self.assertEqual(
+				result,
+				[
+					{"label": "ERPAI-TEST-A", "ok": True, "error_kind": None, "status": None},
+					{"label": "ERPAI-TEST-B", "ok": False, "error_kind": "auth", "status": 401},
+				],
+			)
+			self.assertEqual(
+				[call.args[0] for call in probe.call_args_list],
+				[self.rows["ERPAI-TEST-A"], self.rows["ERPAI-TEST-B"]],
+			)
+			probe.reset_mock()
+			one = erp_ai_setting.check_keys("ERPAI-TEST-B")
+			self.assertEqual([r["label"] for r in one], ["ERPAI-TEST-B"])
+			probe.assert_called_once_with(self.rows["ERPAI-TEST-B"])
+			probe.reset_mock()
+			with self.assertRaises(frappe.ValidationError):
+				erp_ai_setting.check_keys("ERPAI-TEST-NOPE")
+			probe.assert_not_called()
+
+	def test_check_keys_whitelisted_for_post(self):
+		self.assertIn(erp_ai_setting.check_keys, frappe.whitelisted)
+
+	def test_check_keys_refuses_hd_agent_before_reading_or_probing(self):
+		self._become_hd_agent()
+		with (
+			patch("erp_ai.gateway.probe_credential") as probe,
+			patch.object(erp_ai_setting.frappe, "get_all") as get_all,
+		):
+			with self.assertRaises(frappe.PermissionError):
+				erp_ai_setting.check_keys()
+			with self.assertRaises(frappe.PermissionError):
+				erp_ai_setting.check_keys("ERPAI-TEST-NOPE")
+		get_all.assert_not_called()
+		probe.assert_not_called()
+
+	def test_check_keys_never_saves_the_setting(self):
+		with (
+			patch("erp_ai.gateway.probe_credential", side_effect=self._fake_probe),
+			patch("frappe.model.document.Document.save", MagicMock()) as save,
+		):
+			erp_ai_setting.check_keys()
+			erp_ai_setting.check_keys("ERPAI-TEST-A")
+		save.assert_not_called()
+
+	def test_check_keys_result_has_only_the_four_fields_no_secret_or_exception_text(self):
+		def leaky_probe(row_name):
+			return {
+				"label": frappe.db.get_value(CREDENTIAL_DOCTYPE, row_name, "label"),
+				"ok": False,
+				"error_kind": "auth",
+				"status": 401,
+				"error": f"AuthenticationError: invalid x-api-key {FAKE_SECRET}",
+				"api_key": FAKE_SECRET,
+			}
+
+		with patch("erp_ai.gateway.probe_credential", side_effect=leaky_probe):
+			result = erp_ai_setting.check_keys()
+		self.assertEqual(len(result), 2)
+		for item in result:
+			self.assertEqual(set(item), {"label", "ok", "error_kind", "status"})
+		self.assertNotIn(FAKE_SECRET, json.dumps(result))
+		self.assertNotIn("AuthenticationError", json.dumps(result))

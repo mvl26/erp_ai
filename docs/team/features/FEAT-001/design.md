@@ -11,6 +11,8 @@ Approved-by:
 
 **Sửa đổi 2026-11-11** (sau design-defect ở T21, `review-17.md`): nguồn comment chuyển sang core `Comment`, tác giả = `owner` (journal D8); `git_source` chỉ còn `log`/`blame` (journal D4); trường tiền USD là Float precision 6 (journal D6); `ignore_links_on_delete` (journal D7); test ở gốc gói nằm trong `erp_ai/tests/` (journal D2). Danh sách đầy đủ ở mục "Amendments 2026-11-11" cuối file. Mã "journal Dn" (không gạch nối) là quyết định trong `docs/team/journal/FEAT-001.md`; mã "D-n" là giả định của design.
 
+**Sửa đổi lần 2, 2026-11-11** (sau verify, `acceptance.md` DD-1, DD-2): `ERP AI Log` thêm trường `skipped_fields` ghi lý do bỏ trường của `set_classification` (journal D9, AC-10; mục 2.3, 4.3, 5.2, 6, 8); file test runner đổi tên thành `erp_ai/agent/test_agent_runner.py` vì Frappe bỏ qua file tên `test_runner.py`, thêm luật test kiến trúc cấm tên đó (journal D10; mục 1, 7, 8). Các hàng 8–11 của bảng Amendments.
+
 ## 1. Bối cảnh
 
 **Vấn đề (spec Mục tiêu):** phiếu Helpdesk mới được agent đọc và phân loại vào 1 trong 6 đầu mục A–F. Ở `L1`, agent ghi thêm hướng giải quyết và comment. Agent không được tự nâng quyền, không gửi dữ liệu nhạy cảm ra ngoài, không vượt ngân sách. Kèm theo là bộ đánh giá offline để đo độ chính xác trước khi bật.
@@ -53,11 +55,13 @@ Approved-by:
 - Test:
   - `FrappeTestCase` (`frappe/tests/utils.py:20`) với `self.set_user`, `self.freeze_time`, `change_settings`; rollback sau mỗi class; không commit trong test;
   - factory của Helpdesk dùng lại được: `helpdesk.test_utils.make_ticket`, `make_team`, `create_agent`, `create_contact`, `make_todo` (`helpdesk/tests/AGENTS.md`); `frappe.flags.in_test`;
-  - (sửa 2026-11-11, journal D2) Frappe 15 import file test nằm ngay ở gốc gói `erp_ai/test_*.py` thành module `erp_ai` nên `--app erp_ai` chạy 0 test (`frappe/test_runner.py:304-307`). Test ở gốc gói đặt trong `erp_ai/tests/` (có `__init__.py`); test trong gói con (`erp_ai/agent/`, `erp_ai/gateway/`…) vẫn đặt cạnh mã. Helper `erp_ai/test_utils.py` giữ ở gốc.
+  - (sửa 2026-11-11, journal D2) Frappe 15 import file test nằm ngay ở gốc gói `erp_ai/test_*.py` thành module `erp_ai` nên `--app erp_ai` chạy 0 test (`frappe/test_runner.py:304-307`). Test ở gốc gói đặt trong `erp_ai/tests/` (có `__init__.py`); test trong gói con (`erp_ai/agent/`, `erp_ai/gateway/`…) vẫn đặt cạnh mã. Helper `erp_ai/test_utils.py` giữ ở gốc;
+  - (sửa 2026-11-11 lần 2, journal D10, acceptance.md DD-2) `run_all_tests` của Frappe đi `os.walk(frappe.get_app_path(app))` = cây `erp_ai/`, bỏ thư mục `locals`, `.git`, `public`, `__pycache__` và **bỏ mọi file tên `test_runner.py`** (`frappe/test_runner.py:150-160`, `filename != "test_runner.py"`). Chạy `--module` thì không bỏ, nên `erp_ai.agent.test_runner` xanh khi chạy theo module (52 test) mà vắng hẳn trong `cmd.test` (448 thay vì 500).
 - `frappe.log_error(title)` mà không có `message` sẽ gọi `get_traceback(with_context=True)` (`frappe/utils/error.py:54`). Site `miyano` bật `developer_mode` → in biến cục bộ (ADR-002) → D-20.
 - `frappe.permissions.AUTOMATIC_ROLES` = Guest, All, Desk User, Administrator (`permissions.py:31-37`).
 - Webhook dùng cờ `enabled`, Server Script dùng cờ `disabled` (khác guide `:516`, xem mục 4.6).
 - `ignore_links_on_delete` (hook) bỏ qua kiểm liên kết của các DocType liệt kê khi xóa **bất kỳ** bản ghi nào (`frappe/model/delete_doc.py:288,364`) → D-29.
+- (thêm 2026-11-11 lần 2, journal D9) `set_classification` trả `skipped: [{field, reason}]` với hai lý do cố định: `"ánh xạ không có giá trị"`, `"giá trị không tồn tại trên hệ thống"` (`erp_ai/agent/tools/write_ticket.py:25-36`); mọi trường bị bỏ → `{"ok": true, "before": {}, "after": {}, "skipped": [...]}` (`:46-47`). Runner hiện bỏ `skipped` ở cả bước phân loại (`runner.py:213-230`, chỉ cập nhật khi `ok` và `after` khác rỗng) lẫn vòng lập luận (`runner.py:330-334`, chỉ lấy `before`/`after`). Test hiện có `test_l1_empty_after_keeps_applied_zero` chốt `applied = 0`, `actions` rỗng khi `after` rỗng.
 
 ## 2. Mô hình dữ liệu
 
@@ -136,10 +140,11 @@ Không có các trường guide `model_reason_default` (D-7), `doctype_duoc_ghi`
 | `tools_called` | Small Text (JSON) | danh sách tên tool trong lượt |
 | `actions` | Small Text (JSON) | `[{"tool", "doctype", "name", "ok"}]` |
 | `value_before`, `value_after` | Code (JSON) | trước/sau do tool ghi trả về (ADR-004) |
+| `skipped_fields` | Small Text (JSON), `read_only = 1`, permlevel 0, nhãn "Trường bỏ qua khi phân loại"; nằm ngay sau `value_after` trong `field_order` | **Thêm 2026-11-11 lần 2 (journal D9, AC-10, D-32).** `[{"field": "<ticket_type\|agent_group\|priority>", "reason": "<lý do tool trả>"}]` — chép **nguyên** danh sách `skipped` mà `set_classification` trả khi `ok = true`, giữ thứ tự tool trả; runner không lọc, không dịch lý do. `NULL` khi không gọi `set_classification`, khi tool trả `ok = false`, hoặc khi không có trường nào bị bỏ. Dòng `classify`: runner ghi cùng lúc với `applied`/`value_*` (mục 4.3 bước 6). Dòng `reason`: `write_entry` ghi lúc tạo, gộp `skipped` của mọi lần gọi `set_classification` trong lượt (mục 4.3 bước 8). Dòng `skip`: luôn `NULL`. Chỉ chứa tên trường và lý do cố định, không có nội dung phiếu (STD-SEC-6) |
 | `predicted_category` | Data | `A`..`F`; rỗng khi không phân loại được |
 | `predicted_confidence` | Data | |
 | `predicted_ticket_type`, `predicted_agent_group`, `predicted_priority` | Data | giá trị sau ánh xạ, đúng giá trị mà `L1` sẽ ghi |
-| `applied` | Check | 1 khi tool ghi phân loại trả `ok=true` |
+| `applied` | Check | 1 khi tool ghi phân loại trả `ok=true` **và** `after` khác rỗng (phiếu thật sự đổi; làm rõ 2026-11-11 lần 2 cho khớp mã và `test_l1_empty_after_keeps_applied_zero`). Mọi trường bị bỏ → 0, lý do nằm ở `skipped_fields` |
 | `human_corrected_to` | Small Text (JSON) | `{"ticket_type", "agent_group", "priority"}`, lần sửa gần nhất (AC-11) |
 | `human_corrected_by` | Link User | |
 | `human_corrected_at` | Datetime | thời điểm sửa **đầu tiên**, dùng cho cửa sổ 7 ngày (A-12) |
@@ -149,6 +154,7 @@ Mẫu truy cập → chỉ mục:
 - (1) đếm số lần chạy hôm nay của một phiếu: `ticket` + `creation`. `creation` đã có chỉ mục trên Frappe 15; thêm `search_index` cho `ticket`.
 - (2) bản ghi `classify` gần nhất của phiếu (AC-11): cùng chỉ mục.
 - (3) tổng chi phí trong tháng theo `credential_label` (AC-16): quét theo `creation`. Khối lượng ≤ 40 dòng/phiếu/ngày, nên không cần chỉ mục thêm.
+- (4) (thêm 2026-11-11 lần 2) đọc lý do bỏ trường của một lần chạy: người mở dòng nhật ký theo `ticket`/`run_id` (chỉ mục có sẵn). Không lọc theo `skipped_fields` → không thêm chỉ mục.
 
 Không có bộ đếm thứ hai (ADR-004 #2).
 
@@ -175,7 +181,7 @@ Bộ lọc `from_date`, `to_date` (bắt buộc, tính cả hai đầu, theo `cr
 
 ### 2.6 Đối chiếu tên guide → design (D-1)
 
-`muc_quyen`→`permission_level`, `max_key_thu`→`max_keys_per_call`, `uu_tien`→`try_order`, `muc_dich`→`purpose`, `budget_thang_usd`→`budget_month_usd`, `da_dung_thang_usd`→`spent_month_usd`, `trang_thai`→`status`, `tam_nghi_den`→`paused_until`, `token_con_lai`→`tokens_remaining`, `han_muc_reset_luc`→`limit_reset_at`, `so_lan_loi`→`error_count`, `loi_gan_nhat`→`last_error`, `dung_thanh_cong_luc`→`last_success_at`, `ghi_chu`→`note`, `dau_muc_mapping`→`category_mapping`, `nguoi_ra_lenh`→`instructor`, `da_chuyen_key`→`keys_tried`, `hanh_dong`→`actions`, `gia_tri_truoc/sau`→`value_before/after`, `ai_huong_giai_quyet`→`ai_resolution_hint`, `ai_do_tin_cay`→`ai_confidence`, `ai_phan_loai_boi`→`ai_classified_by`, `ai_cap_nhat_luc`→`ai_updated_at`, `ai_bo_qua`→`ai_opt_out`.
+`muc_quyen`→`permission_level`, `max_key_thu`→`max_keys_per_call`, `uu_tien`→`try_order`, `muc_dich`→`purpose`, `budget_thang_usd`→`budget_month_usd`, `da_dung_thang_usd`→`spent_month_usd`, `trang_thai`→`status`, `tam_nghi_den`→`paused_until`, `token_con_lai`→`tokens_remaining`, `han_muc_reset_luc`→`limit_reset_at`, `so_lan_loi`→`error_count`, `loi_gan_nhat`→`last_error`, `dung_thanh_cong_luc`→`last_success_at`, `ghi_chu`→`note`, `dau_muc_mapping`→`category_mapping`, `nguoi_ra_lenh`→`instructor`, `da_chuyen_key`→`keys_tried`, `hanh_dong`→`actions`, `gia_tri_truoc/sau`→`value_before/after`, `ai_huong_giai_quyet`→`ai_resolution_hint`, `ai_do_tin_cay`→`ai_confidence`, `ai_phan_loai_boi`→`ai_classified_by`, `ai_cap_nhat_luc`→`ai_updated_at`, `ai_bo_qua`→`ai_opt_out`. `skipped_fields` (thêm lần 2) không có tên tương ứng trong guide.
 
 ### 2.7 Comment của phiếu — core `Comment` (không phải DocType của app; thêm 2026-11-11, journal D8, D-26)
 
@@ -276,7 +282,7 @@ Mỗi lần xếp job hoặc quyết định bỏ qua (từ sau bước 0) → `
 - `validate_mapping(raw) -> None`: ném `frappe.ValidationError` có thông báo cụ thể; controller Setting gọi hàm này.
 - `resolve_ticket_values(classification, subject, mapping) -> dict`: trả `{"ticket_type", "agent_group", "priority"}` lấy từ `mapping[category]` (thiếu → `None`); tiêu đề chứa `[GẬP]` (hoặc `[GẤP]`, journal D5) → `priority = "Urgent"` (guide `:1337`). Giá trị model trả trong `nhom`/`uu_tien` không dùng để ghi (D-8).
 
-`erp_ai/agent/run_log.py`: `write_entry(**fields) -> str`. Hàm này là nơi duy nhất tạo `ERP AI Log` (ADR-004): serialize JSON, insert có phân quyền dưới tài khoản agent, commit khi `not frappe.flags.in_test` (D-20).
+`erp_ai/agent/run_log.py`: `write_entry(**fields) -> str`. Hàm này là nơi duy nhất tạo `ERP AI Log` (ADR-004): serialize JSON, insert có phân quyền dưới tài khoản agent, commit khi `not frappe.flags.in_test` (D-20). Hợp đồng không đổi ở lần sửa 2: `skipped_fields` truyền vào dưới dạng `list` được serialize JSON như `actions`/`keys_tried` (quy tắc list/dict → JSON có sẵn); `None` → cột `NULL`.
 
 ### 3.4 Cổng model (`erp_ai/gateway/`) — ADR-002
 
@@ -362,7 +368,7 @@ Mỗi lần xếp job hoặc quyết định bỏ qua (từ sau bước 0) → `
 | `search_source` | `pattern: string 2..200` (chuỗi cố định, không phân biệt hoa thường), `app?: string`, `extension?: enum DUOI_CHO_PHEP` | ≤ 40 `{path, line, text ≤ 300}` | gốc ngoài `apps/`; tên bí mật |
 | `read_source` | `path: string`, `offset?: int ≥ 1 = 1`, `limit?: int 1..400 = 200` | `{path, from_line, total_lines, content}` | ngoài `apps/` (kể cả `../`, symlink); tên bí mật; đuôi không cho phép; không phải file |
 | `git_source` | `app: string`, `subcommand: enum log/blame`, `args?: string[] ≤ 10` (sửa 2026-11-11, journal D4: bỏ `show`/`diff`) | `{output ≤ 8000}` | subcommand khác (kể cả `show`, `diff`); cờ ngoài allowlist (mục 5.4); đường dẫn không qua `resolve_safe_path`; glob/pathspec đặc biệt; repo ngoài `apps/`; thiếu `git` → "chưa cài git"; quá 30 s → "quá thời gian"; mã thoát ≠ 0 → từ chối, không trả stderr |
-| `set_classification` | `category: enum A–F`, `confidence: enum Cao/Trung bình/Thấp` | `{before, after, skipped: [{field, reason}]}` | phiếu có `ai_classified_by = Người` → "người đã phân loại, không ghi đè"; thiếu quyền ghi bất kỳ trường đích nào |
+| `set_classification` | `category: enum A–F`, `confidence: enum Cao/Trung bình/Thấp` | `{before, after, skipped: [{field, reason}]}` — hợp đồng không đổi ở lần sửa 2; `skipped` nay được runner ghi vào `ERP AI Log.skipped_fields` (mục 2.3, 4.3) | phiếu có `ai_classified_by = Người` → "người đã phân loại, không ghi đè"; thiếu quyền ghi bất kỳ trường đích nào |
 | `set_resolution_hint` | `text: string 1..5000` | `{before, after}` | thiếu quyền ghi |
 | `post_comment` | `content: string 1..5000` | `{comment: name}` — tạo core `Comment` bằng `ticket.new_comment(content)` của Helpdesk (cùng đường với UI; `owner` = `AGENT_USER`) (sửa 2026-11-11, journal D8) | thiếu quyền đọc phiếu hoặc `frappe.has_permission("Comment", "create")` = false |
 | `create_task` | `subject: string 1..140`, `description: string 1..5000` | `{task: name}` | không có người ra lệnh; DocType `Task` không có trên site; thiếu quyền |
@@ -414,6 +420,7 @@ Controller `ERPAISetting.validate()`:
 - `pending`: chưa `corrected` và `creation > now − 7 ngày`.
 - `accuracy_pct = (predictions − pending − corrected) / (predictions − pending) × 100`; mẫu = 0 → để trống.
 - Cùng công thức cho từng dòng A–F và dòng `Tổng`.
+- Report không đọc `skipped_fields` (lần sửa 2 không đổi công thức).
 
 ## 4. Luồng
 
@@ -457,17 +464,22 @@ Toàn bộ thân hàm nằm trong `try/except Exception`. Khi bắt được l�
    - `call_model("classify", **build_classify_request(subject, description), max_tokens=400, deadline=deadline)`.
    - `GatewayError` → nhật ký `classify` có `error`, `stop_reason = gateway_error` → dừng.
    - `parse_classification(text)`: `None` → nhật ký có `error = "UNPARSEABLE: không phân loại được"`, `stop_reason = unparseable`, không có giá trị dự đoán → dừng ở `L0`; ở `L1` vẫn chạy tiếp bước lập luận (AC-3: lần chạy không hỏng).
-   - Có kết quả → `values = resolve_ticket_values(...)` → nhật ký `classify` với `predicted_*`, `applied = 0`.
-   - `level = L0` → dừng (AC-9: phiếu trước = sau).
-   - `level ≥ L1` → `execute_tool("set_classification", {category, confidence}, ctx)`. `ok=true` → cập nhật `applied = 1`, `value_before/after`, `actions` của đúng bản ghi `classify` vừa tạo (`frappe.db.set_value` trên bản ghi do runner tạo, trong `erp_ai/agent/`).
+   - Có kết quả → `values = resolve_ticket_values(...)` → nhật ký `classify` với `predicted_*`, `applied = 0`, `skipped_fields` rỗng.
+   - `level = L0` → dừng (AC-9: phiếu trước = sau). Ở `L0` không gọi tool nên `skipped_fields` luôn rỗng.
+   - `level ≥ L1` → trong savepoint `erp_ai_apply`: `result = execute_tool("set_classification", {category, confidence}, ctx)`, rồi cập nhật **một lần** bản ghi `classify` vừa tạo bằng `frappe.db.set_value(LOG_DOCTYPE, log_name, {...}, update_modified=False)` (bản ghi do runner tạo, trong `erp_ai/agent/`; ADR-004). Tập trường cập nhật (sửa 2026-11-11 lần 2, journal D9):
+     - `result.ok = true` và `result.after` khác rỗng → `applied = 1`, `value_before`, `value_after`, `actions` (như trước);
+     - `result.ok = true` và `result.skipped` khác rỗng → thêm `skipped_fields = json(result.skipped)`. Áp **cả khi `after` rỗng** (mọi trường bị bỏ): khi đó chỉ ghi `skipped_fields`, `applied` giữ 0, `actions`/`value_*` giữ rỗng (hành vi `test_l1_empty_after_keeps_applied_zero` không đổi);
+     - `result.ok = false` (người đã phân loại, thiếu quyền) → không cập nhật gì (ngoài phạm vi journal D9, D-33);
+     - không có trường nào để cập nhật → không gọi `set_value`.
+     - Ngoại lệ giữa tool và cập nhật → rollback về savepoint (bỏ cả thay đổi phiếu lẫn `skipped_fields`), ném lên khối bắt lỗi của job; dòng `classify` (đã commit trước) còn với `applied = 0`, `skipped_fields` rỗng. Hết savepoint mới commit (khi `not frappe.flags.in_test`).
 7. `trigger = comment_mention` và `level = L0` → nhật ký `skip`/`level_L0`, 0 lời gọi (A-3) → dừng.
 8. **Bước lập luận** (`level ≥ L1`):
    - `comments = fetch_ticket_comments(ticket)` (một lần, dưới tài khoản agent); `instructor = latest_instructor(ticket)`; `ctx = ToolContext(...)`; `tools = get_tool_schemas(level, bool(instructor))` (gắn `cache_control` vào tool cuối); `system = build_reason_system(settings.prompt_digest)`; `messages = [user: build_initial_message(ticket, label_comments(ticket, comments) với author = họ tên, …)]`.
    - Với `turn` = 1..`max_turns_per_run`:
      - `call_model("reason", system=system, messages=messages, tools=tools, max_tokens=4096, deadline=deadline)`.
      - `GatewayError(kind = deadline)` → nhật ký `reason`, `stop_reason = time_budget` → dừng. Kind khác → nhật ký có `error`, `stop_reason = gateway_error` → dừng.
-     - Với từng khối `tool_use`: `execute_tool(...)`; ngoại lệ → `{"type": "tool_result", "tool_use_id": id, "content": "Lỗi: <tên lớp lỗi>", "is_error": true}`.
-     - Nhật ký `reason`: usage, `cost_usd`, `credential_label`, `keys_tried`, `latency_ms`, `stop_reason`, `tools_called`, `actions`, `value_before/after`, `instructor` (AC-15).
+     - Với từng khối `tool_use`: `execute_tool(...)`; ngoại lệ → `{"type": "tool_result", "tool_use_id": id, "content": "Lỗi: <tên lớp lỗi>", "is_error": true}`. Khối là `set_classification` trả `ok = true` có `skipped` khác rỗng → nối `skipped` vào danh sách `skipped` của lượt, theo thứ tự khối `tool_use` (sửa 2026-11-11 lần 2, journal D9). Tool khác không có `skipped`.
+     - Nhật ký `reason`: usage, `cost_usd`, `credential_label`, `keys_tried`, `latency_ms`, `stop_reason`, `tools_called`, `actions`, `value_before/after`, `instructor` (AC-15), `skipped_fields` = danh sách `skipped` của lượt hoặc `None` khi rỗng (truyền qua `write_entry`, không cập nhật sau).
      - `stop_reason ≠ tool_use` → dừng. Nếu không, nối `assistant: content`, `user: tool_results` (`tool_use_id` khớp `id`, guide `:1141-1143`).
    - Hết `max_turns_per_run` mà lượt cuối vẫn là `tool_use` → sửa `stop_reason` của bản ghi lượt cuối thành `max_turns` (AC-15).
 9. Mỗi bản ghi nhật ký được commit ngay khi `not frappe.flags.in_test`, để chi phí không mất nếu worker chết (D-20).
@@ -503,6 +515,7 @@ Mỗi giờ, `reprobe_exhausted_keys`: với từng khóa `Hết hạn mức` �
 |---|---|
 | Handler xếp/bỏ job | `frappe.logger("erp_ai")` info: ticket, trigger, lý do (comment: chỉ sau bước 0) |
 | Mỗi lượt / mỗi quyết định bỏ qua của runner | 1 bản ghi `ERP AI Log` (chi phí, khóa, lý do dừng) |
+| Trường phân loại bị bỏ vì ánh xạ rỗng / giá trị không tồn tại (thêm lần 2, journal D9) | `ERP AI Log.skipped_fields` trên dòng `classify` hoặc `reason` của lượt đó; người lọc danh sách nhật ký theo `ticket` để xem |
 | Lỗi job, sai tài khoản | Error Log tiêu đề `TITLE_RUN_FAILED` / `TITLE_WRONG_USER` |
 | Chuyển trạng thái khóa | logger info: label, kind, trạng thái mới; email tin/động |
 | Job ngày / giờ | logger info: tổng chi phí tính lại, số điều kiện báo động, số khóa dò |
@@ -523,13 +536,13 @@ Không log nào chứa khóa, mật khẩu hay nội dung phiếu/comment (STD-S
 | `Comment` của HD Ticket (sửa 2026-11-11) | theo core | qua role `Agent`: CRUD do Helpdesk cấp (`add_comment_permissions`); đọc khi đọc được phiếu (`extends/comment.py`). App không thêm quyền nào | như cột trước | **không** (Helpdesk chặn) | — |
 | Task (ERPNext) | theo ERPNext | Custom DocPerm đọc/tạo/ghi, `if_owner = 1` (D-14) | — | — | — |
 
-Không ai có quyền xóa `ERP AI Log` (A-10). `ERP AI Instructor` không mang quyền DocType nào. Thẩm quyền của role này chỉ do `authority.is_instruction` đọc. App không cấp role này cho ai (A-15).
+Không ai có quyền xóa `ERP AI Log` (A-10). `ERP AI Instructor` không mang quyền DocType nào. Thẩm quyền của role này chỉ do `authority.is_instruction` đọc. App không cấp role này cho ai (A-15). `skipped_fields` ở permlevel 0 như mọi trường khác của `ERP AI Log`: ai đọc được dòng nhật ký thì đọc được trường này; không role nào thêm/bớt (lần sửa 2 không đổi ma trận).
 
 ### 5.2 Chủ ghi (ADR-004)
 - Trường người đặt: chỉ form.
 - `spent_*`: chỉ `tasks.recompute_monthly_spend`.
 - Trạng thái khóa: chỉ `erp_ai/gateway/**`.
-- Nhật ký: tạo ở `run_log.write_entry`; cập nhật `applied`/`value_*` của bản ghi `classify` bởi runner; cập nhật `human_corrected_*` bởi handler.
+- Nhật ký: tạo ở `run_log.write_entry` (kể cả `skipped_fields` của dòng `reason`); cập nhật `applied`/`value_*`/`actions`/`skipped_fields` của bản ghi `classify` bởi runner (`_apply_classification`, sửa 2026-11-11 lần 2, journal D9); cập nhật `human_corrected_*` bởi handler. Không chỗ nào khác ghi `skipped_fields`.
 - HD Ticket/`Comment`/Task: chỉ tool ghi ở `L1+`, dưới tài khoản agent, có phân quyền.
 - `ignore_permissions=True` / `frappe.db.set_value` chỉ có ở `erp_ai/gateway/**`, `erp_ai/tasks.py::recompute_monthly_spend`, `erp_ai/install.py`, `erp_ai/handlers.py::ticket_on_update`, và cập nhật bản ghi `classify` trong `erp_ai/agent/runner.py` (bản ghi do runner tạo). (`ticket.new_comment` của Helpdesk tự insert với `ignore_permissions` bên trong Helpdesk; tool kiểm quyền tạo `Comment` trước khi gọi, mục 3.5.)
 - Test giả lập "người lưu form" có `.save()` trên cấu hình trong `test_erp_ai_setting.py`. Đó là đường "Lưu form" mà ADR-004 cho phép, không phải mã sản phẩm.
@@ -540,6 +553,7 @@ Không ai có quyền xóa `ERP AI Log` (A-10). `ERP AI Instructor` không mang 
 - Tool: kiểm schema tham số (registry), rồi kiểm quyền Frappe dưới tài khoản agent (tool). Phản hồi của model là dữ liệu không tin cậy: chỉ tên tool trong bộ được cấp mới chạy, và JSON phân loại sai → `None`.
 - Handler: không tin nội dung comment. Từ khóa chỉ quyết định có chạy hay không; thẩm quyền theo role của tác giả (guide `:1037`). **Tác giả = `Comment.owner`** (server đặt); `comment_email`, `comment_by`, `HD Ticket Comment.commented_by` client đặt được nên không bao giờ dùng (sửa 2026-11-11, review-17 STD-SEC-4).
 - Truy vấn: chỉ ORM có tham số. `search_resolved_tickets` dùng filter `like` của ORM, không ghép SQL (STD-SEC-3).
+- `skipped_fields` lấy từ kết quả tool của app (tên trường trong `LINKED_DOCTYPES` + lý do là hằng chuỗi trong `write_ticket.py`), không từ model; model chỉ chọn `category`/`confidence` đã qua enum của registry.
 
 ### 5.4 Tool mã nguồn (AC-13, NFR-6) — ADR-005 #5
 - `get_source_root()` = `realpath(dirname(dirname(frappe.get_app_path("frappe"))))` (test patch hàm này sang thư mục tạm).
@@ -588,15 +602,22 @@ Thay đổi dữ liệu có `cmd.migrate`: tạo 3 DocType + 1 Report mới, 6 c
 | `Custom DocPerm` parent Task, role ERP AI Agent | 0 → 1 | 1 | 1 |
 | `tabERP AI Log` | (không có) → 0 | 0 | (không có) |
 
+**Sửa 2026-11-11 lần 2 — cột `skipped_fields` (journal D9).** Thêm 1 trường Small Text vào `erp_ai_log.json` (sau `value_after`); `cmd.migrate` thêm 1 cột vào `tabERP AI Log`. Không patch, không điền dữ liệu cũ: dòng có trước để `NULL` = "chưa ghi nhận" (đúng nghĩa: lúc đó runner chưa ghi lý do). Trên `miyano` `tabERP AI Log` = 0 dòng (acceptance.md), feature chưa phát hành, nên không có bảng lớn → không chia lô. Không đụng HD Ticket, `Comment`, custom field hay template.
+- **Lên:** `cmd.migrate` thoát 0; meta có `skipped_fields` (test meta ở mục 8); cột tồn tại (`frappe.db.has_column("ERP AI Log", "skipped_fields")` = True, qa kiểm bằng console).
+- **Xuống:** trả `erp_ai_log.json` và mã runner về bản trước rồi `cmd.migrate`. Frappe không tự xóa cột khi trường bị bỏ khỏi meta, nên cột còn lại, không mã nào đọc; không mất dòng nào. Xóa hẳn cột (mất lý do đã ghi) cần người duyệt và không thuộc design này.
+- **Đối soát (qa, trước/sau mỗi chiều):** số dòng `tabERP AI Log` trước = sau; ngay sau "lên", số dòng có `skipped_fields` khác `NULL` = 0 (không điền ngược); sau "lên" lần 2 (chạy lại `cmd.migrate`) không đổi.
+- **Kích hoạt rollback:** `cmd.migrate` thoát ≠ 0, hoặc test meta `ERP AI Log` / test AC-10 của runner đỏ sau migrate. **Thành công khi:** `cmd.migrate` thoát 0, số đếm khớp, các dòng test plan AC-10 xanh trong `cmd.test`.
+- Đổi tên file test (journal D10) không đổi dữ liệu → không có migration; hoàn tác = đổi tên lại (không có lý do nào để làm vậy, vì Frappe sẽ lại bỏ file).
+
 ## 7. Touchpoints
 
-`structure.tests = colocated`, `naming.test_file = test_{name}.py`. Tên module test cho `cmd.test_one` lấy từ đường dẫn file. Các file ADR-001 bắt buộc nằm ở đúng tầng. **Sửa 2026-11-11 (journal D2):** test của mã nằm ngay ở gốc gói `erp_ai/` đặt trong `erp_ai/tests/` (có `__init__.py`); test của gói con đặt cạnh mã; helper `erp_ai/test_utils.py` giữ ở gốc.
+`structure.tests = colocated`, `naming.test_file = test_{name}.py`. Tên module test cho `cmd.test_one` lấy từ đường dẫn file. Các file ADR-001 bắt buộc nằm ở đúng tầng. **Sửa 2026-11-11 (journal D2):** test của mã nằm ngay ở gốc gói `erp_ai/` đặt trong `erp_ai/tests/` (có `__init__.py`); test của gói con đặt cạnh mã; helper `erp_ai/test_utils.py` giữ ở gốc. **Sửa 2026-11-11 lần 2 (journal D10):** không file test nào được tên `test_runner.py` (Frappe bỏ qua, mục 1); test của `runner.py` tên `test_agent_runner.py`, vẫn khớp `naming.test_file` (`test_{name}.py` với `name = agent_runner`).
 
 | file | change | ghi chú |
 |---|---|---|
 | `pyproject.toml` | sửa | `dependencies = ["anthropic>=0.103.1,<1"]` (ADR-002; lý do STD-DEP-1: research Q1 — giữ bản env dùng chung, không làm vỡ `workflowcore`); `[tool.bench.frappe-dependencies] frappe = ">=15.126.1,<16.0.0"` |
 | `erp_ai/hooks.py` | sửa | `required_apps = ["helpdesk"]`, `doc_events` (mục 3.1: HD Ticket 4 sự kiện + **`Comment` `after_insert`**, journal D8), `scheduler_events` (mục 3.7), `after_install`, `after_migrate`, `ignore_links_on_delete = ["ERP AI Log"]` (journal D7, mục 2.3); không có `fixtures` (D-11) |
-| `.github/workflows/ci.yml` | sửa | Chỉ phần "CI xanh" của DoD: `bench init` nhánh `version-15`, cài thêm `telephony`, `helpdesk` (tag `v15.1.0`), `erpnext` (`version-15`) trước `install-app erp_ai` (D-23). Không nâng version action (debt riêng) |
+| `.github/workflows/ci.yml` | sửa | Chỉ phần "CI xanh" của DoD: `bench init` nhánh `version-15`, cài thêm `telephony`, `helpdesk` (tag `v15.1.0`), `erpnext` (`version-15`) trước `install-app erp_ai` (D-23). Không nâng version action (debt riêng). Lần sửa 2 không đụng file này: CI chạy `run-tests --app erp_ai`, sau khi đổi tên sẽ tự gồm test runner |
 | `erp_ai/constants.py` | mới | Hằng dùng chung (mục 3, D-2) |
 | `erp_ai/alerts.py` | mới | `send_alarm`, `send_notice` (mục 4.6, D-2) |
 | `erp_ai/handlers.py` | mới | Cửa vào `doc_events` (mục 3.1); `comment_after_insert` nhận core `Comment`, tác giả = `owner` |
@@ -609,26 +630,26 @@ Thay đổi dữ liệu có `cmd.migrate`: tạo 3 DocType + 1 Report mới, 6 c
 | `erp_ai/tests/test_install.py` | mới | Test AC-4, ADR-006 |
 | `erp_ai/tests/test_alerts.py` | mới | Test `send_alarm`/`send_notice` (mục 4.6) |
 | `erp_ai/tests/test_ticket_delete.py` | mới | Test xóa phiếu có nhật ký (journal D7) |
-| `erp_ai/tests/test_architecture.py` | mới | Test quét mã nguồn cho các Ràng buộc ADR-001..005 |
+| `erp_ai/tests/test_architecture.py` | mới | Test quét mã nguồn cho các Ràng buộc ADR-001..005. Lần sửa 2 (journal D10): thêm hằng `FRAPPE_SKIPPED_TEST_FILENAMES = ("test_runner.py",)` (chú thích trích `frappe/test_runner.py:160`), hàm thuần `check_no_frappe_skipped_test_files(rel_paths) -> list[str]` (một vi phạm cho mỗi đường dẫn có **tên file** thuộc hằng, mọi độ sâu), test trên cây thật duyệt `PACKAGE_ROOT.rglob("*.py")` **gồm cả file test** (không dùng `load_product_sources`, vốn bỏ test), và test của chính bộ quét (mục 8) |
 | `erp_ai/agent/__init__.py` | mới | Gói lõi agent |
 | `erp_ai/agent/queue.py` | mới | `enqueue_agent_run` (mục 3.2) |
 | `erp_ai/agent/policy.py` | mới | Điều kiện gửi, mức hiệu lực, giới hạn ngày (mục 3.3) |
 | `erp_ai/agent/authority.py` | mới | Thẩm quyền; nơi duy nhất đọc comment phiếu từ core `Comment` (mục 2.7, 3.3) |
 | `erp_ai/agent/prompts.py` | mới | Prompt chung runner/eval (mục 3.3) |
 | `erp_ai/agent/classification.py` | mới | Bộ đọc JSON, ánh xạ (mục 3.3) |
-| `erp_ai/agent/run_log.py` | mới | Tạo `ERP AI Log` (mục 3.3) |
-| `erp_ai/agent/runner.py` | mới | `run_for_ticket` (mục 4.3) |
+| `erp_ai/agent/run_log.py` | mới | Tạo `ERP AI Log` (mục 3.3). Lần sửa 2: không đổi mã — `skipped_fields` (list) đi qua quy tắc serialize JSON có sẵn |
+| `erp_ai/agent/runner.py` | mới | `run_for_ticket` (mục 4.3). Lần sửa 2 (journal D9): `_apply_classification` ghi `skipped_fields` của dòng `classify` cả khi `after` rỗng (4.3 bước 6); vòng lập luận gom `skipped` của `set_classification` mỗi lượt và truyền `skipped_fields` cho `write_entry` (4.3 bước 8) |
 | `erp_ai/agent/test_queue.py` | mới | Test chặn trùng trong giao dịch, 5 tham số |
 | `erp_ai/agent/test_policy.py` | mới | Test mục 3.3 policy |
 | `erp_ai/agent/test_authority.py` | mới | Test AC-7 trên core `Comment` |
 | `erp_ai/agent/test_classification.py` | mới | Test AC-3, AC-10 (phần thuần) |
 | `erp_ai/agent/test_run_log.py` | mới | Test `write_entry` (AC-15, ADR-004) |
-| `erp_ai/agent/test_runner.py` | mới | Test AC-6, AC-9, AC-10, AC-15, ADR-003 (b)–(e) |
+| `erp_ai/agent/test_agent_runner.py` | mới (**đổi tên** từ `erp_ai/agent/test_runner.py` bằng `git mv`, giữ lịch sử; journal D10) | Test AC-6, AC-9, AC-10 (gồm "lý do vào nhật ký", journal D9), AC-15, ADR-003 (b)–(e). Nội dung giữ nguyên khi đổi tên (52 test), chỉ thêm test mới của D9. Không để lại file `test_runner.py` nào; tên module mới `erp_ai.agent.test_agent_runner` |
 | `erp_ai/agent/tools/__init__.py` | mới | Gói tool; export `get_tool_schemas`, `execute_tool`, `ToolContext` |
 | `erp_ai/agent/tools/registry.py` | mới | Schema, bộ tool theo mức × thẩm quyền, kiểm tham số (mục 3.5); enum `git_source` = log/blame |
 | `erp_ai/agent/tools/read.py` | mới | `get_ticket`, `list_comments`, `search_resolved_tickets`, `get_record`, `DENIED_DOCTYPES`, `ALLOWED_READ_DOCTYPES` (có `Comment`) |
 | `erp_ai/agent/tools/source.py` | mới | `search_source`, `read_source`, `git_source` (log/blame), chặn đường dẫn (mục 5.4) |
-| `erp_ai/agent/tools/write_ticket.py` | mới | `set_classification`, `set_resolution_hint`, `post_comment` (core `Comment` qua `new_comment`), `create_task` |
+| `erp_ai/agent/tools/write_ticket.py` | mới | `set_classification`, `set_resolution_hint`, `post_comment` (core `Comment` qua `new_comment`), `create_task`. Lần sửa 2: không đổi (hợp đồng `skipped` đã có) |
 | `erp_ai/agent/tools/test_registry.py` | mới | Test AC-8 (ma trận, schema) |
 | `erp_ai/agent/tools/test_read.py` | mới | Test AC-14, NFR-4, NFR-5 (đọc), comment core |
 | `erp_ai/agent/tools/test_source.py` | mới | Test AC-13, NFR-6 |
@@ -656,9 +677,9 @@ Thay đổi dữ liệu có `cmd.migrate`: tạo 3 DocType + 1 Report mới, 6 c
 | `erp_ai/erp_ai_agent/doctype/erp_ai_credential/erp_ai_credential.py` | mới | Lớp controller rỗng (bảng con) |
 | `erp_ai/erp_ai_agent/doctype/erp_ai_credential/test_erp_ai_credential.py` | mới | Test meta mục 2.2, journal D6 |
 | `erp_ai/erp_ai_agent/doctype/erp_ai_log/__init__.py` | mới | |
-| `erp_ai/erp_ai_agent/doctype/erp_ai_log/erp_ai_log.json` | mới | Mục 2.3, quyền mục 5.1 |
+| `erp_ai/erp_ai_agent/doctype/erp_ai_log/erp_ai_log.json` | mới | Mục 2.3, quyền mục 5.1. Lần sửa 2 (journal D9): thêm trường `skipped_fields` (Small Text, `read_only = 1`, permlevel 0, nhãn "Trường bỏ qua khi phân loại") ngay sau `value_after` trong `field_order`; `[migrate]` |
 | `erp_ai/erp_ai_agent/doctype/erp_ai_log/erp_ai_log.py` | mới | Lớp controller rỗng |
-| `erp_ai/erp_ai_agent/doctype/erp_ai_log/test_erp_ai_log.py` | mới | Test meta mục 2.3, quyền A-10, journal D6 |
+| `erp_ai/erp_ai_agent/doctype/erp_ai_log/test_erp_ai_log.py` | mới | Test meta mục 2.3, quyền A-10, journal D6. Lần sửa 2: `LOG_FIELDS` thêm `skipped_fields`; thêm test kiểu/quyền của trường (mục 8) |
 | `erp_ai/erp_ai_agent/report/__init__.py` | mới | Gói Report của module |
 | `erp_ai/erp_ai_agent/report/erp_ai_accuracy/__init__.py` | mới | |
 | `erp_ai/erp_ai_agent/report/erp_ai_accuracy/erp_ai_accuracy.json` | mới | Script Report, role System Manager |
@@ -667,6 +688,14 @@ Thay đổi dữ liệu có `cmd.migrate`: tạo 3 DocType + 1 Report mới, 6 c
 | `erp_ai/erp_ai_agent/report/erp_ai_accuracy/test_erp_ai_accuracy.py` | mới | Test AC-12 |
 
 Tổng: 71 touchpoint (3 sửa, 68 mới; bản trước 65 — thêm `erp_ai/tests/__init__.py`, `test_alerts.py`, `test_ticket_delete.py`, `test_run_log.py`, `test_erp_ai_credential.py`, `test_erp_ai_log.py`; 4 file test gốc chuyển vào `erp_ai/tests/`). Không có file nào ở `erp_ai/erp_ai/` (ADR-001). Không có touchpoint trong `apps/helpdesk` hay `apps/frappe` (chỉ đọc).
+
+**Lần sửa 2 (journal D9, D10) chạm 6 file, đều đã có trong bảng trên, không thêm file mới; tổng vẫn 71** (đổi tên thay `erp_ai/agent/test_runner.py` bằng `erp_ai/agent/test_agent_runner.py`, số file không đổi):
+- `erp_ai/erp_ai_agent/doctype/erp_ai_log/erp_ai_log.json` — thêm trường (`[migrate]`);
+- `erp_ai/erp_ai_agent/doctype/erp_ai_log/test_erp_ai_log.py` — test meta;
+- `erp_ai/agent/runner.py` — ghi `skipped_fields`;
+- `erp_ai/agent/test_runner.py` → `erp_ai/agent/test_agent_runner.py` — đổi tên + test D9;
+- `erp_ai/tests/test_architecture.py` — luật tên file test.
+- Không đổi: `run_log.py`, `write_ticket.py`, `test_write_ticket.py`, `ci.yml`, `hooks.py`. Ràng buộc thứ tự cho người lập kế hoạch: test mới của D9 đặt trong `test_agent_runner.py`, nên đổi tên phải có trước hoặc cùng lúc với chúng, nếu không các test đó cũng vắng trong `cmd.test`.
 
 **Kiểm đường dẫn mới với `structure.allowed_new_file_roots` = [`erp_ai`, `docs`, `.github`]:**
 ```
@@ -680,8 +709,11 @@ erp_ai/eval/** (3 mã + 2 test)                                    -> erp_ai
 erp_ai/erp_ai_agent/doctype/** (14 file)                          -> erp_ai
 erp_ai/erp_ai_agent/report/** (6 file)                            -> erp_ai
 Mới: 6+7+14+9+7+5+14+6 = 68, ngoài 3 gốc: 0. Sửa (đã tồn tại): pyproject.toml, erp_ai/hooks.py, .github/workflows/ci.yml
+Lần sửa 2 — đường dẫn mới duy nhất:
+erp_ai/agent/test_agent_runner.py                                 -> erp_ai   (thay erp_ai/agent/test_runner.py; agent/** vẫn 8 mã + 6 test)
+Tên file khớp naming.test_file "test_{name}.py" (name = agent_runner); không phải "test_runner.py".
 ```
-**Kiểm với `protected_paths` = [`.env`, `.env.*`, `**/*.pem`, `**/*.key`, `license.txt`]:** không đường dẫn nào ở trên có đuôi `.pem`/`.key`, tên `.env*` hay là `license.txt` → **0 in protected_paths**.
+**Kiểm với `protected_paths` = [`.env`, `.env.*`, `**/*.pem`, `**/*.key`, `license.txt`]:** không đường dẫn nào ở trên (kể cả `erp_ai/agent/test_agent_runner.py`) có đuôi `.pem`/`.key`, tên `.env*` hay là `license.txt` → **0 in protected_paths**.
 
 ## 8. Test plan
 
@@ -692,6 +724,8 @@ Mọi test chạy bằng `cmd.test_one` (từng file) và `cmd.test` (toàn app)
 - xếp hàng: patch `erp_ai.agent.queue.frappe.enqueue` và đếm.
 
 Không có test nào commit hay đọc Redis (STD-TEST-6, ADR-003). Lớp test kế thừa `FrappeTestCase`; dữ liệu có tên duy nhất (`frappe.generate_hash`). **Comment trong test (sửa 2026-11-11):** dựng qua đường thật của Helpdesk — `ticket.new_comment(content)` dưới `self.set_user(<agent>)`, hoặc `ticket.add_comment("Comment", text, comment_email=..., comment_by=...)` cho ca giả mạo — không chèn thẳng `HD Ticket Comment` hay `tabComment`.
+
+**Sửa 2026-11-11 lần 2:** mọi dòng trước ghi `erp_ai/agent/test_runner.py::…` nay là `erp_ai/agent/test_agent_runner.py::…` (journal D10; tên test giữ nguyên). Test "lý do vào nhật ký" (journal D9) phải **đọc lại dòng `ERP AI Log` từ DB** (`frappe.get_all(LOG_DOCTYPE, filters={"ticket": …, "entry_type": …}, fields=["*"])`, như helper `_entries` có sẵn) và `json.loads(skipped_fields)`, không kiểm kết quả tool. Hai dòng AC-15 trước ghi `test_sixth_run_same_day_no_call` (tên không có trong mã) nay trỏ đúng test đang có.
 
 | Tiêu chí | Test | Loại | Đường lỗi / biên |
 |---|---|---|---|
@@ -704,7 +738,7 @@ Không có test nào commit hay đọc Redis (STD-TEST-6, ADR-003). Lớp test k
 | AC-2 | `erp_ai/eval/test_export_tickets.py::test_export_refuses_path_inside_repo` | unit | lỗi: `ValueError` |
 | AC-3 | `erp_ai/agent/test_classification.py::test_eval_and_runner_share_classify_request` | unit | — (request của runner == của eval với cùng phiếu) |
 | AC-3 | `erp_ai/agent/test_classification.py::test_parse_rejects_non_json_and_bad_values` | unit | lỗi: không phải JSON, `dau_muc = "G"`, `do_tin_cay` lạ → `None`; JSON trong rào → hợp lệ |
-| AC-3 | `erp_ai/agent/test_runner.py::test_unparseable_classification_logged_run_continues` | integration | lỗi: stub trả chuỗi thường → nhật ký `UNPARSEABLE`, không có ngoại lệ |
+| AC-3 | `erp_ai/agent/test_agent_runner.py::test_unparseable_classification_logged_run_continues` | integration | lỗi: stub trả chuỗi thường → nhật ký `UNPARSEABLE`, không có ngoại lệ |
 | AC-4 | `erp_ai/tests/test_install.py::test_setup_twice_is_idempotent` | integration | biên: chạy 2 lần, không trùng role/user/field/dòng template |
 | AC-4 | `erp_ai/tests/test_install.py::test_agent_user_has_exact_roles_without_system_manager` | integration | — |
 | AC-4 | `erp_ai/tests/test_install.py::test_ai_fields_permlevel_8_and_template_rows_agents_only` | integration | — |
@@ -718,8 +752,8 @@ Không có test nào commit hay đọc Redis (STD-TEST-6, ADR-003). Lớp test k
 | AC-5 | `erp_ai/tests/test_handlers.py::test_comment_on_other_doctype_or_type_no_job` | integration | biên (thêm 2026-11-11): `Comment` có từ khóa trên ToDo → 0; `comment_type = Info` trên phiếu → 0; dòng `HD Ticket Comment` có từ khóa → 0 (không có hook) |
 | AC-5 | `erp_ai/tests/test_handlers.py::test_opt_out_or_excluded_team_no_job_no_model_call` | integration | (e) tên nhóm khác hoa thường/khoảng trắng vẫn bị loại |
 | AC-5 | `erp_ai/agent/test_queue.py::test_duplicate_trigger_same_transaction_one_job` | integration | (f); sau `after_rollback` xếp lại được |
-| AC-6 | `erp_ai/agent/test_runner.py::test_wrong_session_user_stops_before_model` | integration | lỗi: `frappe.set_user` bị patch thành không làm gì → 0 lời gọi, 1 Error Log chứa tên tài khoản thật |
-| AC-6 | `erp_ai/agent/test_runner.py::test_missing_agent_user_stops` | integration | biên: user agent bị tắt |
+| AC-6 | `erp_ai/agent/test_agent_runner.py::test_wrong_session_user_stops_before_model` | integration | lỗi: `frappe.set_user` bị patch thành không làm gì → 0 lời gọi, 1 Error Log chứa tên tài khoản thật |
+| AC-6 | `erp_ai/agent/test_agent_runner.py::test_missing_agent_user_stops` | integration | biên: user agent bị tắt |
 | AC-7 | `erp_ai/agent/test_authority.py::test_instructor_role_has_authority_on_any_ticket` | integration | — |
 | AC-7 | `erp_ai/agent/test_authority.py::test_assigned_by_other_authority_only_on_that_ticket` | integration | P → chỉ thị, Q → dữ liệu |
 | AC-7 | `erp_ai/agent/test_authority.py::test_self_assigned_is_data` | integration | biên: `assigned_by` = chính mình; `assigned_by` rỗng |
@@ -736,11 +770,18 @@ Không có test nào commit hay đọc Redis (STD-TEST-6, ADR-003). Lớp test k
 | AC-8 | `erp_ai/agent/tools/test_write_ticket.py::test_write_without_permission_returns_ok_false_unchanged` | integration | lỗi: thu quyền ghi pl 7 → `ok=false`, DB không đổi |
 | AC-8 | `erp_ai/agent/tools/test_write_ticket.py::test_create_task_requires_instructor` | integration | lỗi: không có người ra lệnh → `ok=false` |
 | AC-8 | `erp_ai/agent/tools/test_write_ticket.py::test_post_comment_creates_core_comment_owned_by_agent` | integration | thêm 2026-11-11: tạo đúng 1 `Comment` (`reference_doctype = HD Ticket`, `comment_type = Comment`, `owner = AGENT_USER`), 0 dòng `HD Ticket Comment`; lỗi: thu quyền tạo `Comment` → `ok=false`, 0 dòng mới |
-| AC-9 | `erp_ai/agent/test_runner.py::test_l0_logs_prediction_ticket_unchanged` | integration | số comment (`Comment` của phiếu), 3 trường, trường AI trước = sau; `applied = 0` |
-| AC-9 | `erp_ai/agent/test_runner.py::test_l0_comment_mention_skipped_no_call` | integration | biên: A-3 |
-| AC-10 | `erp_ai/agent/test_runner.py::test_l1_applies_mapping_confidence_and_hint` | integration | `status` không đổi |
-| AC-10 | `erp_ai/agent/test_runner.py::test_l1_human_classified_not_overwritten` | integration | lỗi: `ai_classified_by = Người` |
-| AC-10 | `erp_ai/agent/tools/test_write_ticket.py::test_mapping_to_missing_value_skips_field` | integration | lỗi: HD Team không tồn tại → bỏ trường, lý do vào `skipped`/nhật ký |
+| AC-9 | `erp_ai/agent/test_agent_runner.py::test_l0_logs_prediction_ticket_unchanged` | integration | số comment (`Comment` của phiếu), 3 trường, trường AI trước = sau; `applied = 0`; (lần sửa 2) `skipped_fields` rỗng ở `L0` |
+| AC-9 | `erp_ai/agent/test_agent_runner.py::test_l0_comment_mention_skipped_no_call` | integration | biên: A-3 |
+| AC-10 | `erp_ai/agent/test_agent_runner.py::test_l1_applies_mapping_confidence_and_hint` | integration | `status` không đổi; biên (lần sửa 2, journal D9): ánh xạ đủ, mọi giá trị tồn tại → `skipped_fields` của dòng `classify` rỗng |
+| AC-10 | `erp_ai/agent/test_agent_runner.py::test_l1_human_classified_not_overwritten` | integration | lỗi: `ai_classified_by = Người`; (lần sửa 2) tool `ok=false` → `skipped_fields` rỗng |
+| AC-10 | `erp_ai/agent/test_agent_runner.py::test_l1_missing_value_reason_logged_on_classify_entry` | integration | **thêm lần 2 (journal D9, DD-1) — lỗi:** ánh xạ A có `ticket_type` không tồn tại, nhóm/ưu tiên tồn tại → đọc lại dòng `classify` từ DB: `json.loads(skipped_fields) == [{"field": "ticket_type", "reason": "giá trị không tồn tại trên hệ thống"}]`, `applied = 1`, `value_after` không có khóa `ticket_type`; phiếu giữ `ticket_type` cũ, nhóm/ưu tiên đã ghi |
+| AC-10 | `erp_ai/agent/test_agent_runner.py::test_l1_all_fields_skipped_reasons_logged_applied_zero` | integration | **thêm lần 2 — biên:** `ticket_type` không tồn tại, `agent_group` và `priority` rỗng trong ánh xạ → `after` rỗng; dòng `classify`: `applied = 0`, `value_after`/`actions` rỗng, `skipped_fields` đủ 3 mục theo thứ tự `ticket_type, agent_group, priority` với lý do lần lượt "giá trị không tồn tại trên hệ thống", "ánh xạ không có giá trị", "ánh xạ không có giá trị"; phiếu trước = sau |
+| AC-10 | `erp_ai/agent/test_agent_runner.py::test_l1_empty_after_keeps_applied_zero` | integration | có sẵn; lần sửa 2 thêm kiểm `skipped_fields` có mục `ticket_type` (ánh xạ của test có giá trị không tồn tại); các assert cũ (`applied = 0`, `value_after`/`actions` rỗng) giữ nguyên |
+| AC-10 | `erp_ai/agent/test_agent_runner.py::test_apply_failure_leaves_skipped_fields_empty` | integration | **thêm lần 2 — lỗi:** ánh xạ có giá trị không tồn tại và `frappe.db.set_value` trên `LOG_DOCTYPE` ném lỗi → Error Log `TITLE_RUN_FAILED` 1 lần; phiếu trước = sau; dòng `classify` còn với `applied = 0`, `skipped_fields` rỗng (savepoint bỏ cả hai) |
+| AC-10 | `erp_ai/agent/test_agent_runner.py::test_reason_turn_logs_skipped_fields_of_set_classification` | integration | **thêm lần 2 — lỗi (vòng lập luận):** `trigger = comment_mention`, `L1`, lượt 1 model gọi `set_classification` với ánh xạ có `agent_group` không tồn tại, lượt 2 `end_turn` → dòng `reason` lượt 1 có `skipped_fields` = `[{"field": "agent_group", "reason": "giá trị không tồn tại trên hệ thống"}]`; biên: dòng `reason` lượt 2 (không gọi tool) có `skipped_fields` rỗng |
+| AC-10 | `erp_ai/erp_ai_agent/doctype/erp_ai_log/test_erp_ai_log.py::test_meta_has_all_log_fields_and_hash_naming` | integration | có sẵn; lần sửa 2: `LOG_FIELDS` có `skipped_fields` |
+| AC-10 | `erp_ai/erp_ai_agent/doctype/erp_ai_log/test_erp_ai_log.py::test_skipped_fields_is_read_only_small_text` | integration | **thêm lần 2:** `fieldtype = "Small Text"`, `read_only = 1`, `permlevel = 0`, đứng ngay sau `value_after` trong `field_order`; biên: role `ERP AI Agent` vẫn không ghi được dòng đã tạo (A-10, như `test_no_role_can_write_or_delete`) |
+| AC-10 | `erp_ai/agent/tools/test_write_ticket.py::test_mapping_to_missing_value_skips_field` | integration | lỗi: HD Team không tồn tại → bỏ trường, lý do vào `skipped` của kết quả tool (phần "vào nhật ký" do các test `test_agent_runner.py` ở trên kiểm) |
 | AC-10 | `erp_ai/agent/test_classification.py::test_urgent_prefix_forces_urgent` | unit | biên: `[GẬP]` ở giữa tiêu đề |
 | AC-11 | `erp_ai/tests/test_handlers.py::test_human_correction_updates_latest_log` | integration | biên: sửa 2 lần → giá trị cuối, `human_corrected_at` lần đầu |
 | AC-11 | `erp_ai/tests/test_handlers.py::test_agent_correction_not_recorded` | integration | — |
@@ -761,9 +802,11 @@ Không có test nào commit hay đọc Redis (STD-TEST-6, ADR-003). Lớp test k
 | AC-14 | `erp_ai/agent/tools/test_read.py::test_list_comments_reads_core_comment_author_from_owner` | integration | thêm 2026-11-11: comment qua `new_comment` có mặt, `author` = họ tên của `owner`, có `role`; comment giả `comment_by` vẫn mang tác giả thật; `limit` 0/51 → `ok=false` (registry) |
 | AC-14 | `erp_ai/agent/tools/test_read.py::test_get_record_comment_only_for_ticket_comments` | integration | lỗi (thêm 2026-11-11): `Comment` trên DocType khác → "chưa được mở"; `HD Ticket Comment` → "chưa được mở"; kết quả `Comment` không có `comment_email`/`comment_by` |
 | AC-14 | `erp_ai/gateway/test_gateway.py::test_api_key_never_leaks` | integration | đường thành công + 401 + ngoại lệ lạ; tìm chuỗi khóa trong `ERP AI Log`, `Comment`, Error Log, email đã gửi, `last_error` → 0 |
-| AC-15 | `erp_ai/agent/test_runner.py::test_stops_after_max_turns` | integration | biên: stub luôn `tool_use` → đúng 8 bản ghi `reason`, bản cuối `max_turns` |
-| AC-15 | `erp_ai/agent/test_runner.py::test_sixth_run_same_day_no_call` | integration | biên: lần 6 → 0 lời gọi, nhật ký `daily_limit`; hôm sau chạy lại được (`freeze_time`) |
-| AC-15 | `erp_ai/agent/test_runner.py::test_turn_log_fields` | integration | đủ trường mục 2.3 |
+| AC-15 | `erp_ai/agent/test_agent_runner.py::test_stops_after_max_turns` | integration | biên: stub luôn `tool_use` → đúng 8 bản ghi `reason`, bản cuối `max_turns` |
+| AC-15 | `erp_ai/agent/test_agent_runner.py::test_run_over_setting_limit_same_day_no_call` | integration | biên (sửa tên lần 2; trước ghi `test_sixth_run_same_day_no_call`): đã đủ `max_runs_per_ticket_per_day` lần trong ngày → 0 lời gọi, đúng 1 nhật ký `skip`/`daily_limit` |
+| AC-15 | `erp_ai/agent/test_agent_runner.py::test_last_run_within_setting_limit_still_calls` | integration | biên: lần thứ `max_runs_per_ticket_per_day` (còn trong giới hạn) vẫn gọi 1 lần, 0 nhật ký `skip` |
+| AC-15 | `erp_ai/agent/test_policy.py::test_runs_today_ignores_yesterday`, `::test_runs_today_counts_creation_exactly_at_midnight` | unit | biên "hôm sau chạy lại được" (trước gộp trong tên test không tồn tại): lần chạy hôm qua không tính; đúng 00:00 tính cho hôm nay |
+| AC-15 | `erp_ai/agent/test_agent_runner.py::test_turn_log_fields` | integration | đủ trường mục 2.3 |
 | AC-15 | `erp_ai/agent/test_run_log.py::test_write_entry_serializes_json_and_requires_agent_role` | integration | lỗi: người không có role agent → `PermissionError` |
 | AC-15 | `erp_ai/gateway/test_gateway.py::test_cost_uses_four_token_prices` | unit | biên: usage `None` → 0 |
 | AC-16 | `erp_ai/tests/test_tasks.py::test_recompute_spend_from_log` | integration | tổng chung + theo khóa |
@@ -796,7 +839,7 @@ Không có test nào commit hay đọc Redis (STD-TEST-6, ADR-003). Lớp test k
 | NFR-2 | `erp_ai/gateway/test_gateway.py::test_deadline_limits_attempt_timeout` | unit | biên: còn 3 s → `GatewayError(deadline)`, 0 lời gọi client |
 | NFR-3 | AC-15, AC-16 ở trên + `erp_ai/erp_ai_agent/doctype/erp_ai_setting/test_erp_ai_setting.py::test_validation_rejects_bad_mapping_limits_and_missing_prices` | integration | biên giới hạn số |
 | NFR-4 | `erp_ai/tests/test_handlers.py::test_opt_out_or_excluded_team_no_job_no_model_call` | integration | cả phiếu mới và comment `@ai` trên phiếu nhóm loại trừ |
-| NFR-4 | `erp_ai/agent/test_runner.py::test_not_sendable_at_run_time_no_model_call` | integration | biên: đổi nhóm sau khi xếp hàng |
+| NFR-4 | `erp_ai/agent/test_agent_runner.py::test_not_sendable_at_run_time_no_model_call` | integration | biên: đổi nhóm sau khi xếp hàng |
 | NFR-4 | `erp_ai/agent/tools/test_read.py::test_excluded_tickets_never_returned` | integration | `get_ticket`, `list_comments`, `get_record` (HD Ticket và `Comment` của phiếu loại trừ), `search_resolved_tickets` |
 | NFR-5 | `erp_ai/gateway/test_gateway.py::test_api_key_never_leaks` | integration | xem AC-14 |
 | NFR-5 | `erp_ai/tests/test_architecture.py::test_secret_handling_rules` | unit | `get_decrypted_password`/`import anthropic` chỉ ở `erp_ai/gateway/**`; không có `with_context=True`; mọi `frappe.log_error(` có 2 đối số |
@@ -806,12 +849,16 @@ Không có test nào commit hay đọc Redis (STD-TEST-6, ADR-003). Lớp test k
 | NFR-9 | `erp_ai/eval/test_run_eval.py::test_metrics_twelve_ticket_sample` + `erp_ai/erp_ai_agent/report/erp_ai_accuracy/test_erp_ai_accuracy.py::test_accuracy_ten_log_sample` (bảo đảm phép đo đúng); con số ≥ 85% đo sau G4 trên dữ liệu thật (spec NFR-9) | integration | — |
 | ADR-001..005 | `erp_ai/tests/test_architecture.py::test_layer_imports`, `::test_single_enqueue_call_site`, `::test_no_save_on_settings_in_product_code`, `::test_tools_never_bypass_permissions`, `::test_subprocess_only_in_source_tool`, `::test_level_and_send_policy_fields_only_in_policy` | unit | — |
 | ADR-001 / journal D8 | `erp_ai/tests/test_architecture.py::test_no_legacy_ticket_comment_or_spoofable_author` | unit | thêm 2026-11-11: chuỗi `"HD Ticket Comment"`, `commented_by`, `comment_email`, `comment_by` không xuất hiện trong mã sản phẩm `erp_ai/**` (trừ test và danh sách bỏ trường của `get_record` ở `read.py`) |
-| ADR-003 (b) | `erp_ai/agent/test_runner.py::test_disabled_at_run_time_no_model_call` | integration | — |
+| ADR-003 (b) | `erp_ai/agent/test_agent_runner.py::test_disabled_at_run_time_no_model_call` | integration | — |
+| ADR-004 / journal D9 | `erp_ai/agent/test_agent_runner.py::test_l1_all_fields_skipped_reasons_logged_applied_zero` + `::test_reason_turn_logs_skipped_fields_of_set_classification` | integration | chủ ghi: dòng `classify` cập nhật bởi runner, dòng `reason` tạo bởi `write_entry` (đếm đúng 1 dòng `classify` mỗi lần chạy, không có dòng mới cho lý do) |
 | ADR-006 | `erp_ai/tests/test_install.py::test_setup_never_writes_existing_tickets` | integration | đếm phiếu/`Comment` của phiếu trước = sau |
 | journal D7 | `erp_ai/tests/test_ticket_delete.py::test_ticket_with_log_can_be_deleted_and_log_survives`, `::test_log_doctype_still_has_no_delete_permission` | integration | biên: xóa phiếu có log → phiếu mất, log còn; A-10 giữ nguyên |
+| DoD "`cmd.test` xanh" / journal D10 | `erp_ai/tests/test_architecture.py::test_no_test_file_named_like_frappe_skips` | unit | **thêm lần 2 (DD-2):** cây thật `PACKAGE_ROOT.rglob("*.py")` (gồm cả `tests/` và file test cạnh mã) → `check_no_frappe_skipped_test_files(...) == []`; đồng thời `agent/test_agent_runner.py` tồn tại (đổi tên chứ không xóa test) |
+| DoD "`cmd.test` xanh" / journal D10 | `erp_ai/tests/test_architecture.py::test_frappe_skipped_test_name_check_catches_any_depth` (lớp `TestScannersCatchViolations`) | unit | **thêm lần 2 — lỗi:** `agent/test_runner.py`, `tests/test_runner.py`, `erp_ai_agent/doctype/x/test_runner.py`, `test_runner.py` (gốc) → mỗi đường dẫn đúng 1 vi phạm có tên đường dẫn; **biên (không báo):** `agent/test_agent_runner.py`, `tests/test_runner_utils.py`, `agent/runner.py`, `agent/my_test_runner.py` |
+| DoD "`cmd.test` xanh" / journal D10 | Kiểm của qa (không phải file test): `cmd.test` chạy đủ mọi module — số test của `cmd.test` = tổng số test khi chạy từng file bằng `cmd.test_one`, so tên trong junit, 0 vắng; riêng `erp_ai.agent.test_agent_runner` có mặt trong `cmd.test` (trước: 448/500, thiếu 52) | kiểm | biên: CI (`ci.yml`, `run-tests --app erp_ai`) cùng số test với `cmd.test` cục bộ khi có lần chạy thật |
 
 **AC-n trong spec:** AC-1, AC-2, AC-3, AC-4, AC-5, AC-6, AC-7, AC-8, AC-9, AC-10, AC-11, AC-12, AC-13, AC-14, AC-15, AC-16, AC-17, AC-18, AC-19, AC-20 (20).
-**AC-n trong test plan:** AC-1, AC-2, AC-3, AC-4, AC-5, AC-6, AC-7, AC-8, AC-9, AC-10, AC-11, AC-12, AC-13, AC-14, AC-15, AC-16, AC-17, AC-18, AC-19, AC-20 (20) — khớp. NFR-1..NFR-9: 9/9 có dòng.
+**AC-n trong test plan:** AC-1, AC-2, AC-3, AC-4, AC-5, AC-6, AC-7, AC-8, AC-9, AC-10, AC-11, AC-12, AC-13, AC-14, AC-15, AC-16, AC-17, AC-18, AC-19, AC-20 (20) — khớp. NFR-1..NFR-9: 9/9 có dòng. AC-10 nay có 11 dòng; nhánh "lý do vào nhật ký" có 5 dòng đọc lại `ERP AI Log` (3 lỗi, 2 biên) + 2 dòng meta.
 
 ## Assumptions decided by the team
 
@@ -848,17 +895,24 @@ Không có test nào commit hay đọc Redis (STD-TEST-6, ADR-003). Lớp test k
 - **D-29 `ignore_links_on_delete = ["ERP AI Log"]` (= journal D7).** Vì: nhật ký không được chặn việc xóa phiếu; nhật ký vẫn không xóa được (A-10) | Hệ quả đã chấp nhận: cũng xóa được User có trong `instructor`/`human_corrected_by`; nhật ký giữ chuỗi tên cũ | Khác: không cho xóa phiếu; xóa log theo phiếu | Sai thì: bỏ dòng hook.
 - **D-30 Test ở gốc gói nằm trong `erp_ai/tests/` (= journal D2).** Vì: Frappe 15 không tìm thấy test ở `erp_ai/test_*.py` khi chạy `--app` | Khác: `cmd.test` là danh sách `--module` | Sai thì: chuyển file về gốc.
 - **D-31 ToDo còn hiệu lực = `status = "Open"`.** Chọn: điều kiện gán của `is_instruction` là ToDo mới nhất `Open` **và** tác giả trong `_assign` (hai điều kiện độc lập, mỗi điều kiện có test riêng) | Vì: Frappe bỏ người khỏi `_assign` khi ToDo `Closed`/`Cancelled`; ghi rõ để test bắt được khi bỏ một điều kiện (review-17 STD-TEST-8). Trước ghi "status ≠ Cancelled" — kết quả không đổi nhờ điều kiện `_assign`, đây chỉ là làm rõ | Khác: chỉ dựa `_assign` | Sai thì: đổi một bộ lọc trong `authority.py`.
+- **D-32 Hình dạng `skipped_fields` (= journal D9).** Chọn: một trường Small Text chứa JSON list `[{field, reason}]`, chép nguyên `skipped` của tool (gồm cả lý do "ánh xạ không có giá trị" lẫn "giá trị không tồn tại trên hệ thống"), không lọc, không thêm giá trị bị bỏ; cùng trường cho dòng `classify` và `reason`; `applied` chỉ = 1 khi `after` khác rỗng | Vì: cùng kiểu với `keys_tried`/`tools_called`/`actions`/`human_corrected_to` (Small Text JSON, STD-NAME-7); tool là nguồn sự thật của kết quả ghi (ADR-004), runner chỉ chép; giá trị dự đoán đã có ở `predicted_*` của dòng `classify` nên không lặp (STD-DESIGN-5); bảng con bị loại vì nhật ký không có quyền write và thêm DocType chỉ để chứa ≤ 3 dòng. Để cả "ánh xạ không có giá trị" thì đầu mục D/E (ánh xạ mặc định không có nhóm/ưu tiên, D-8) sẽ luôn có mục trong `skipped_fields` — đúng sự thật, người đọc phân biệt bằng lý do | Khác: ghi vào `error` dạng `SKIPPED: …` (qa đề xuất; trộn lỗi với kết quả bình thường, làm sai bộ lọc "dòng có lỗi"); thêm khóa `skipped` vào `value_after` (đổi nghĩa trường trước/sau của ADR-004); Long Text (không cần, ≤ vài trăm ký tự) | Sai thì: lọc bỏ lý do "ánh xạ không có giá trị" trong runner (1 điều kiện + sửa kỳ vọng của `test_l1_all_fields_skipped_reasons_logged_applied_zero`).
+- **D-33 Kết quả `ok=false` của `set_classification` không vào `skipped_fields`.** Vì: journal D9 và AC-10 chỉ đòi lý do cho "đầu mục ánh xạ tới giá trị không tồn tại"; nhánh "người đã phân loại" đã có test riêng và phiếu không đổi; vòng lập luận vẫn ghi `actions[].ok = false` cho tool ghi thất bại (như trước) | Khác: ghi `reason` của `ok=false` vào `skipped_fields` hoặc `error` | Sai thì: thêm một nhánh trong `_apply_classification` + 1 test.
+- **D-34 Luật tên file test (= journal D10).** Chọn: hằng `FRAPPE_SKIPPED_TEST_FILENAMES = ("test_runner.py",)`, so **tên file** ở mọi độ sâu dưới `erp_ai/` (gốc Frappe đi khi chạy `--app`), gồm cả `tests/`; không quét thư mục `locals/`, `public/` (Frappe cũng bỏ các thư mục đó, nhưng app không có test ở đó và spec không đòi) | Vì: đúng điều kiện bỏ qua ở `frappe/test_runner.py:160`; tên mới `test_agent_runner.py` vẫn khớp `naming.test_file`; một hằng để thêm tên khác nếu Frappe đổi | Khác: đổi `cmd.test` thành danh sách `--module` (D-30 đã loại cách này); chỉ đổi tên mà không có luật (lỗi sẽ lặp lại với file mới) | Sai thì: thêm tên/thư mục vào hằng + 1 ca trong test bộ quét.
 
 Rủi ro còn mở (không chặn thiết kế):
 - tên header hạn mức với API `2023-06-01` (`UNVERIFIED`, guide `:1518`);
 - `excluded_teams` gõ sai tên nhóm sẽ không loại được phiếu (form không kiểm vì ADR-003 chỉ cho hàm điều kiện gửi đọc trường này; người phải đối chiếu tên HD Team);
 - comment của agent có mention sẽ gửi email cho người được mention (guide `:1218`; core `Comment.after_insert` gọi `notify_mentions`);
 - production có thể chạy Helpdesk cũ hơn 15.1.0, vẫn ghi `HD Ticket Comment` → trigger `comment_mention` và đọc comment sẽ không thấy gì. Người kiểm phiên bản Helpdesk production trước khi bật (guide `:1506`, open-questions câu 6; D-26);
-- xóa User có trong nhật ký giờ không bị chặn (D-29); người duyệt nếu cần chặn.
+- xóa User có trong nhật ký giờ không bị chặn (D-29); người duyệt nếu cần chặn;
+- (lần sửa 2) ADR-003:37 trích sai ADR-001 ("controller DocType không import `erp_ai.gateway`"), mâu thuẫn mục 3.6 — mã đúng ADR-001 và mục 3.6; journal D10 ghi debt cho architect sửa lời văn ADR (minor, STD-DOC-4). Design không đổi;
+- (lần sửa 2) sau khi đổi tên, 52 test runner lần đầu chạy chung với 448 test khác trong một tiến trình `cmd.test`; rò trạng thái giữa module (Redis, giao dịch) có thể lộ ra mà chạy riêng không thấy. qa so junit `cmd.test` với từng module (mục 8, dòng kiểm DoD).
 
 ## Amendments 2026-11-11
 
 Lý do: build dừng do design-defect ở T21 (`review-17.md`). Áp các quyết định trong `docs/team/journal/FEAT-001.md`. Số mục giữ nguyên; không có thay đổi phá vỡ hợp đồng công khai (mọi hợp đồng vẫn là v1 nội bộ, chưa phát hành).
+
+Lần 2 (hàng 8–11): verify trả design-defect (`acceptance.md` DD-1, DD-2); áp journal D9, D10. Số mục giữ nguyên. Không có thay đổi phá vỡ: `skipped_fields` là trường **thêm** vào `ERP AI Log` (dòng cũ `NULL`), hợp đồng tool `set_classification` và `write_entry` không đổi; đổi tên file test không phải hợp đồng công khai.
 
 | # | Quyết định | Thay đổi trong design | Mục | Task bị ảnh hưởng |
 |---|---|---|---|---|
@@ -875,3 +929,7 @@ Lý do: build dừng do design-defect ở T21 (`review-17.md`). Áp các quyết
 | 5 | journal D2 | Test ở gốc gói trong `erp_ai/tests/` (+`__init__.py`); `test_utils.py` giữ gốc | 1 (Explore, ADR-001), 7, 8, D-30 | **T1b**: đã xong. Đường dẫn test của T31–T35, T40 trong design nay khớp `tasks.md` |
 | 6 | (dọn) | Bổ sung touchpoint test đã có trong `tasks.md`: `test_alerts.py`, `test_ticket_delete.py`, `test_run_log.py`, `test_erp_ai_credential.py`, `test_erp_ai_log.py`; tổng 65 → 71 | 7, 8 | — |
 | 7 | (dọn) | `resolve_ticket_values` nhận cả `[GẬP]` và `[GẤP]` (journal D5, T3 đã làm) | 3.3 | — |
+| 8 | journal D9 (DD-1, AC-10) | `ERP AI Log` thêm `skipped_fields` (Small Text JSON `[{field, reason}]`, `read_only`, permlevel 0, sau `value_after`); runner chép nguyên `skipped` của `set_classification` (`ok=true`) vào dòng `classify` — cả khi `after` rỗng, `applied` khi đó giữ 0 — và vào dòng `reason` của lượt gọi tool; `ok=false` không ghi (D-33); `applied` làm rõ = 1 chỉ khi `after` khác rỗng | 1 (Explore), 2.3, 2.6, 3.3, 3.5, 3.8, 4.3 bước 6 và 8, 4.9, 5.1, 5.2, 5.3, 6, 7, 8, D-32, D-33 | Mã đã merge: `runner.py` (bước phân loại và vòng lập luận), `erp_ai_log.json` (`[migrate]`), `test_erp_ai_log.py`. Test mới nằm trong `test_agent_runner.py` (sau hàng 9): `test_l1_missing_value_reason_logged_on_classify_entry`, `test_l1_all_fields_skipped_reasons_logged_applied_zero`, `test_apply_failure_leaves_skipped_fields_empty`, `test_reason_turn_logs_skipped_fields_of_set_classification`, `test_erp_ai_log.py::test_skipped_fields_is_read_only_small_text`; thêm assert vào 4 test có sẵn (mục 8). Task mới do tech-lead chèn (`/team:plan --insert`) |
+| 9 | journal D10 (DD-2, DoD) | Đổi tên `erp_ai/agent/test_runner.py` → `erp_ai/agent/test_agent_runner.py` (`git mv`, nội dung giữ nguyên); mọi dòng test plan trỏ đường dẫn mới; ràng buộc: đổi tên trước hoặc cùng lúc với test hàng 8 | 1 (Explore), 6 (không migration), 7, 8 | Task mới do tech-lead chèn; không đổi mã sản phẩm |
+| 10 | journal D10 | Test kiến trúc: `FRAPPE_SKIPPED_TEST_FILENAMES`, `check_no_frappe_skipped_test_files`, `test_no_test_file_named_like_frappe_skips` (cây thật, gồm file test), `test_frappe_skipped_test_name_check_catches_any_depth` (bộ quét); dòng kiểm DoD của qa: số test `cmd.test` = tổng theo module | 7 (`test_architecture.py`), 8, D-34, rủi ro | Task mới do tech-lead chèn (cùng hoặc sau hàng 9, vì test cây thật chỉ xanh khi đã đổi tên) |
+| 11 | (dọn, lần 2) | Test plan AC-15: `test_sixth_run_same_day_no_call` (không có trong mã) → `test_run_over_setting_limit_same_day_no_call`, `test_last_run_within_setting_limit_still_calls`; biên "hôm sau" → `test_policy.py::test_runs_today_ignores_yesterday`, `::test_runs_today_counts_creation_exactly_at_midnight` (test có sẵn). ADR-003:37 trích sai ADR-001 → rủi ro/debt cho architect, design không đổi | 8, rủi ro | — (chỉ tài liệu) |

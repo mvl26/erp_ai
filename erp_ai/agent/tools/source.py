@@ -4,6 +4,8 @@ import time
 
 import frappe
 
+logger = frappe.logger("erp_ai.source")
+
 DUOI_CHO_PHEP = {".py", ".js", ".vue", ".json", ".md", ".html", ".css", ".txt"}
 TEN_CAM = re.compile(
 	r"(site_config\.json|common_site_config\.json|\.env|\.pem|\.key|" r"id_rsa|credential|secret|password)",
@@ -61,8 +63,6 @@ def read_source(args, ctx):
 		full = resolve_safe_path(args.get("path"))
 		if full is None or not os.path.isfile(full):
 			return _refuse("Đường dẫn không hợp lệ hoặc không được phép đọc")
-		if os.path.splitext(full)[1].lower() not in DUOI_CHO_PHEP:
-			return _refuse("Đuôi file không được phép đọc")
 		offset = max(_to_int(args.get("offset"), 1), 1)
 		limit = min(max(_to_int(args.get("limit"), READ_DEFAULT_LINES), 1), READ_MAX_LINES)
 		with open(full, encoding="utf-8", errors="replace") as handle:
@@ -76,6 +76,7 @@ def read_source(args, ctx):
 			"content": "\n".join(chunk),
 		}
 	except Exception:
+		logger.exception("read_source failed")
 		return _refuse("Không đọc được file")
 
 
@@ -135,4 +136,5 @@ def search_source(args, ctx):
 				_scan_file(full, os.path.relpath(full, root), needle, hits)
 		return {"ok": True, "hits": hits}
 	except Exception:
+		logger.exception("search_source failed")
 		return _refuse("Không tìm được trong mã nguồn")

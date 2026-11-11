@@ -1,4 +1,5 @@
 import os
+import re
 import shutil
 import tempfile
 from unittest.mock import patch
@@ -68,6 +69,43 @@ class TestSourceTools(FrappeTestCase):
 		self.assertEqual(
 			source.DUOI_CHO_PHEP, {".py", ".js", ".vue", ".json", ".md", ".html", ".css", ".txt"}
 		)
+
+	def test_each_forbidden_name_pattern_blocked_with_allowed_extension(self):
+		for rel in (
+			"myapp/site_config.json",
+			"myapp/common_site_config.json",
+			"myapp/prod.env.json",
+			"myapp/server.pem.txt",
+			"myapp/deploy.key.md",
+			"myapp/id_rsa.txt",
+			"myapp/my_credential.py",
+			"myapp/client_secret.json",
+			"myapp/Password.py",
+		):
+			self.write(rel, "data\n")
+			with self.subTest(rel=rel):
+				self.assertIsNone(source.resolve_safe_path(rel))
+				self.assertFalse(source.read_source({"path": rel}, None)["ok"])
+
+	def test_forbidden_name_regex_matches_guide(self):
+		self.assertEqual(
+			source.TEN_CAM.pattern,
+			r"(site_config\.json|common_site_config\.json|\.env|\.pem|\.key|id_rsa|credential|secret|password)",
+		)
+		self.assertTrue(source.TEN_CAM.flags & re.I)
+
+	def test_sibling_prefix_directory_refused(self):
+		self.write("ok.py", "x = 1\n", root=self.root + "_evil")
+		self.addCleanup(shutil.rmtree, self.root + "_evil", True)
+		self.assertIsNone(source.resolve_safe_path("../apps_evil/ok.py"))
+
+	def test_unexpected_error_is_refused_and_logged(self):
+		self.write("myapp/a.py", "a\n")
+		with patch("erp_ai.agent.tools.source.open", side_effect=RuntimeError("boom"), create=True):
+			with patch("erp_ai.agent.tools.source.logger") as logger:
+				result = source.read_source({"path": "myapp/a.py"}, None)
+		self.assertFalse(result["ok"])
+		logger.exception.assert_called_once()
 
 	def test_directory_and_missing_file_refused(self):
 		self.assertFalse(source.read_source({"path": "myapp"}, None)["ok"])

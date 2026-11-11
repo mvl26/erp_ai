@@ -176,7 +176,13 @@ class TestCredentials(FrappeTestCase):
 	def test_selection_ties_keep_row_order(self):
 		add_credential("a", try_order=7)
 		add_credential("b", try_order=7)
-		self.assertEqual(self.labels(), ["a", "b"])
+		real_get_all = frappe.db.get_all
+
+		def reversed_rows(*args, **kwargs):
+			return sorted(real_get_all(*args, **kwargs), key=lambda r: -r.idx)
+
+		with patch.object(frappe.db, "get_all", reversed_rows):
+			self.assertEqual(self.labels(), ["a", "b"])
 
 	def test_selection_returns_row_name_and_never_the_key(self):
 		name = add_credential("k1", model_classify="m-c")
@@ -214,6 +220,12 @@ class TestCredentials(FrappeTestCase):
 		self.assertEqual(row.last_error, "rate_limit status=429")
 		paused = (get_datetime(row.paused_until) - before).total_seconds()
 		self.assertTrue(60 <= paused <= 63, paused)
+
+	def test_apply_failure_records_request_id_in_last_error(self):
+		name = add_credential("k1")
+		action = Action(KEY_STATUS_PAUSED, 61, True, None, "rate_limit")
+		credentials.apply_failure(name, action, self.failure(), request_id="req_9")
+		self.assertEqual(self.row(name).last_error, "rate_limit status=429 request_id=req_9")
 
 	def test_apply_failure_without_pause_keeps_paused_until_empty(self):
 		name = add_credential("k1")
@@ -268,11 +280,11 @@ class TestCredentials(FrappeTestCase):
 		self.assertEqual(get_datetime(row.limit_reset_at), reset)
 		self.assertIsNone(row.paused_until)
 
-		bare = add_credential("bare", tokens_remaining=5)
+		bare = add_credential("bare", tokens_remaining=5, limit_reset_at=reset)
 		credentials.apply_success(bare, {})
 		row = self.row(bare)
 		self.assertEqual((row.status, row.tokens_remaining), (KEY_STATUS_ACTIVE, 5))
-		self.assertIsNone(row.limit_reset_at)
+		self.assertEqual(get_datetime(row.limit_reset_at), reset)
 
 		no_reset = add_credential("no_reset")
 		credentials.apply_success(no_reset, {"anthropic-ratelimit-tokens-remaining": "10"})
@@ -281,7 +293,8 @@ class TestCredentials(FrappeTestCase):
 		self.assertIsNone(row.paused_until)
 
 	def test_malformed_rate_limit_headers_are_ignored(self):
-		name = add_credential("k1", tokens_remaining=7)
+		stored_reset = add_to_date(now_datetime(), hours=1).replace(microsecond=0)
+		name = add_credential("k1", tokens_remaining=7, limit_reset_at=stored_reset)
 		credentials.apply_success(
 			name,
 			{
@@ -291,7 +304,7 @@ class TestCredentials(FrappeTestCase):
 		)
 		row = self.row(name)
 		self.assertEqual((row.status, row.tokens_remaining), (KEY_STATUS_ACTIVE, 7))
-		self.assertIsNone(row.limit_reset_at)
+		self.assertEqual(get_datetime(row.limit_reset_at), stored_reset)
 
 		for reset in ("tomorrow", "2030-01-01T00:00:00"):
 			credentials.apply_success(
@@ -303,7 +316,7 @@ class TestCredentials(FrappeTestCase):
 			)
 			row = self.row(name)
 			self.assertEqual((row.status, row.tokens_remaining), (KEY_STATUS_ACTIVE, 100), reset)
-			self.assertIsNone(row.limit_reset_at, reset)
+			self.assertEqual(get_datetime(row.limit_reset_at), stored_reset, reset)
 			self.assertIsNone(row.paused_until, reset)
 
 	@staticmethod

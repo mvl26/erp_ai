@@ -19,6 +19,26 @@ DEFAULT_TRY_ORDER = 99
 LOW_TOKENS_THRESHOLD = 20000
 TOKENS_REMAINING_HEADER = "anthropic-ratelimit-tokens-remaining"
 TOKENS_RESET_HEADER = "anthropic-ratelimit-tokens-reset"
+ROW_FIELDS = [
+	"name",
+	"idx",
+	"label",
+	"provider",
+	"model_classify",
+	"model_reason",
+	"try_order",
+	"purpose",
+	"budget_month_usd",
+	"spent_month_usd",
+	"enabled",
+	"status",
+	"paused_until",
+	"tokens_remaining",
+	"limit_reset_at",
+	"error_count",
+	"last_error",
+	"last_success_at",
+]
 UNUSABLE_STATUSES = (KEY_STATUS_BAD_KEY, KEY_STATUS_QUOTA_EXHAUSTED)
 
 
@@ -43,7 +63,7 @@ def select_keys(task: str, exclude: set[str]) -> list[dict]:
 			"parenttype": SETTING_DOCTYPE,
 			"parentfield": "credentials",
 		},
-		fields=["*"],
+		fields=ROW_FIELDS,
 	)
 	now = now_datetime()
 	usable = [row for row in rows if _is_usable(row, task, exclude, now)]
@@ -59,15 +79,18 @@ def _write(row_name, values):
 	frappe.db.set_value(CREDENTIAL_DOCTYPE, row_name, values, update_modified=False)
 
 
-def apply_failure(row_name, action, failure) -> None:
+def apply_failure(row_name, action, failure, request_id=None) -> None:
 	"""Record a breaker `action`; no new status means the failure is not the key's fault."""
 	if action.new_status is None:
 		return
 	error_count = frappe.db.get_value(CREDENTIAL_DOCTYPE, row_name, "error_count") or 0
+	last_error = f"{action.kind} status={failure.status}"
+	if request_id:
+		last_error += f" request_id={request_id}"
 	values = {
 		"status": action.new_status,
 		"error_count": error_count + 1,
-		"last_error": f"{action.kind} status={failure.status}",
+		"last_error": last_error,
 	}
 	if action.pause_seconds is not None:
 		values["paused_until"] = add_to_date(now_datetime(), seconds=action.pause_seconds)

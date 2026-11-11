@@ -1,0 +1,199 @@
+from types import SimpleNamespace
+from unittest.mock import patch
+
+import frappe
+from frappe.tests.utils import FrappeTestCase
+
+from erp_ai.agent.tools import registry
+from erp_ai.agent.tools.registry import ToolContext, ToolSpec, execute_tool, get_tool_schemas
+
+NOTE_TITLE = "erp_ai registry savepoint probe"
+
+
+def _schema(name, properties=None, required=None):
+	return {
+		"name": name,
+		"description": name,
+		"input_schema": {
+			"type": "object",
+			"properties": properties or {},
+			"required": required or [],
+		},
+	}
+
+
+def _echo(arguments, context):
+	return {"ok": True, "echo": arguments, "ticket": context.ticket_name}
+
+
+def _spec(name, group, properties=None, required=None, handler=_echo):
+	return ToolSpec(name, group, _schema(name, properties, required), handler)
+
+
+def _specs():
+	return [
+		_spec(
+			"do_read",
+			"read",
+			{
+				"limit": {"type": "integer", "minimum": 1, "maximum": 50},
+				"query": {"type": "string", "minLength": 2, "maxLength": 5},
+				"mode": {"type": "string", "enum": ["a", "b"]},
+				"flag": {"type": "boolean"},
+				"tags": {"type": "array", "maxItems": 2, "items": {"type": "string"}},
+			},
+			["query"],
+		),
+		_spec("do_ticket", "ticket_write"),
+		_spec("do_task", "task_write"),
+	]
+
+
+def _context(level="L1", instructor=None):
+	return ToolContext(
+		ticket_name="TKT-1",
+		effective_level=level,
+		instructor=instructor,
+		run_id="run-1",
+		category_mapping={},
+		agent_user="ai.agent@miyano.com.vn",
+	)
+
+
+def _insert_note():
+	frappe.get_doc({"doctype": "Note", "title": NOTE_TITLE, "public": 1}).insert(ignore_permissions=True)
+
+
+class TestRegistry(FrappeTestCase):
+	def setUp(self):
+		# FrappeTestCase rolls back only after the whole class: undo each test.
+		self.addCleanup(frappe.db.rollback)
+		patcher = patch.object(registry, "_all_specs", _specs)
+		patcher.start()
+		self.addCleanup(patcher.stop)
+
+	def names(self, level, has_instructor):
+		return [s["name"] for s in get_tool_schemas(level, has_instructor)]
+
+	def test_l0_has_no_tools(self):
+		self.assertEqual(self.names("L0", True), [])
+
+	def test_unknown_level_has_no_tools(self):
+		self.assertEqual(self.names("L9", True), [])
+
+	def test_l1_to_l3_get_read_and_ticket_write_only(self):
+		for level in ("L1", "L2", "L3"):
+			self.assertEqual(self.names(level, False), ["do_read", "do_ticket"], level)
+
+	def test_instructor_adds_task_write(self):
+		self.assertEqual(self.names("L1", True), ["do_read", "do_ticket", "do_task"])
+
+	def test_returned_schemas_are_copies(self):
+		first = get_tool_schemas("L1", False)
+		first[0]["cache_control"] = {"type": "ephemeral"}
+		first[0]["input_schema"]["properties"].clear()
+		second = get_tool_schemas("L1", False)
+		self.assertNotIn("cache_control", second[0])
+		self.assertIn("query", second[0]["input_schema"]["properties"])
+
+	def test_execute_runs_granted_tool(self):
+		result = execute_tool("do_read", {"query": "abc"}, _context())
+		self.assertEqual(result, {"ok": True, "echo": {"query": "abc"}, "ticket": "TKT-1"})
+
+	def test_execute_rejects_tool_not_granted(self):
+		for name, context in (
+			("nope", _context()),
+			("do_task", _context("L1", None)),
+			("do_read", _context("L0", "boss@x.com")),
+		):
+			result = execute_tool(name, {"query": "abc"}, context)
+			self.assertFalse(result["ok"], name)
+			self.assertIn("không được cấp", result["reason"])
+
+	def test_instructor_context_may_run_task_write(self):
+		result = execute_tool("do_task", {}, _context("L1", "boss@x.com"))
+		self.assertTrue(result["ok"])
+
+	def test_execute_rejects_bad_arguments(self):
+		cases = {
+			"query": {},
+			"mode": {"query": "abc", "mode": "z"},
+			"limit": {"query": "abc", "limit": 51},
+			"flag": {"query": "abc", "flag": "yes"},
+			"tags": {"query": "abc", "tags": ["a", "b", "c"]},
+			"extra": {"query": "abc", "extra": 1},
+		}
+		for key, arguments in cases.items():
+			result = execute_tool("do_read", arguments, _context())
+			self.assertFalse(result["ok"], key)
+			self.assertEqual(result["reason"], f"tham số không hợp lệ: {key}")
+
+	def test_execute_rejects_length_and_type_edges(self):
+		for key, arguments in (
+			("query", {"query": "toolong"}),
+			("query", {"query": "a"}),
+			("query", {"query": 5}),
+			("limit", {"query": "abc", "limit": 0}),
+			("limit", {"query": "abc", "limit": True}),
+			("limit", {"query": "abc", "limit": 1.5}),
+			("tags", {"query": "abc", "tags": "a"}),
+			("tags", {"query": "abc", "tags": [1]}),
+		):
+			result = execute_tool("do_read", arguments, _context())
+			self.assertEqual(result["reason"], f"tham số không hợp lệ: {key}", arguments)
+
+	def test_execute_rejects_non_dict_arguments(self):
+		result = execute_tool("do_read", ["query"], _context())
+		self.assertFalse(result["ok"])
+		self.assertIn("tham số không hợp lệ", result["reason"])
+
+	def test_execute_accepts_boundary_values(self):
+		arguments = {"query": "ab", "limit": 50, "mode": "b", "flag": False, "tags": ["x", "y"]}
+		self.assertTrue(execute_tool("do_read", arguments, _context())["ok"])
+		self.assertTrue(execute_tool("do_read", {"query": "abcde", "limit": 1}, _context())["ok"])
+
+	def test_unexpected_exception_rolls_back_to_savepoint_and_raises(self):
+		def boom(arguments, context):
+			_insert_note()
+			raise RuntimeError("boom")
+
+		specs = [_spec("do_read", "read", handler=boom)]
+		with patch.object(registry, "_all_specs", lambda: specs):
+			with self.assertRaises(RuntimeError):
+				execute_tool("do_read", {}, _context())
+		self.assertFalse(frappe.db.exists("Note", {"title": NOTE_TITLE}))
+
+	def test_successful_write_is_kept(self):
+		def write(arguments, context):
+			_insert_note()
+			return {"ok": True}
+
+		specs = [_spec("do_read", "read", handler=write)]
+		with patch.object(registry, "_all_specs", lambda: specs):
+			execute_tool("do_read", {}, _context())
+		self.assertTrue(frappe.db.exists("Note", {"title": NOTE_TITLE}))
+
+	def test_all_specs_collects_tools_of_each_module_and_skips_missing_ones(self):
+		patch.stopall()
+		fakes = {
+			"erp_ai.agent.tools.read": SimpleNamespace(TOOLS=[_spec("r", "read")]),
+			"erp_ai.agent.tools.source": SimpleNamespace(TOOLS=[_spec("s", "read")]),
+		}
+
+		def fake_import(name):
+			if name in fakes:
+				return fakes[name]
+			raise ModuleNotFoundError(name=name)
+
+		with patch.object(registry.importlib, "import_module", fake_import):
+			self.assertEqual([s.name for s in registry._all_specs()], ["r", "s"])
+
+	def test_all_specs_propagates_import_error_inside_a_module(self):
+		patch.stopall()
+
+		def fake_import(name):
+			raise ModuleNotFoundError(name="somebody_else")
+
+		with patch.object(registry.importlib, "import_module", fake_import):
+			with self.assertRaises(ModuleNotFoundError):
+				registry._all_specs()

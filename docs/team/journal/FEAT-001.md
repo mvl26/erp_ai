@@ -83,3 +83,4 @@ Approved-by:
 - 2026-11-11 lý do gọi tech-lead: chèn task D10 (đổi tên trước) + D9 vào tasks.md rồi build, xong thì qa nghiệm thu lại
 - 2026-11-11 build T41 → dev ×1 + reviewer ×1 | approve vòng 1 (review-47); merge 0a57502; cmd.test (qua dev, D3) Ran 502 OK, số đếm 4/3/8/0/203 trước = sau | tiếp T42 [migrate]
 - 2026-11-11 build T42 [migrate] → dev ×1 + reviewer ×1 | approve vòng 1 (review-48); merge e1ac63f; migrate exit 0, has_column True, cmd.test Ran 503 OK; Error Log 203→206 (+1/lần migrate) | tiếp T43
+- 2026-11-11 build T43 → dev ×1 + reviewer ×1 | approve vòng 1 (review-49); merge 2357ba1; cmd.test Ran 507 OK (= tổng theo module), migrate 0, pre-commit 0, skip rỗng; diff.patch ghi lại | xong T41..T43, tiếp /team:verify

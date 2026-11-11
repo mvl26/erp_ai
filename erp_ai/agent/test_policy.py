@@ -13,17 +13,35 @@ TEAM = "Nhân sự & Hành chính"
 
 
 def _ensure_team(name):
-	"""Create the HD Team if missing; return True when this call created it."""
+	"""Create the HD Team inside the current transaction if missing."""
 	if frappe.db.exists("HD Team", name):
-		return False
+		return
 	frappe.get_doc({"doctype": "HD Team", "team_name": name, "users": [{"user": "Administrator"}]}).insert(
 		ignore_permissions=True
 	)
-	return True
+
+
+TEAMS = (TEAM, "IT")
 
 
 class TestPolicy(FrappeTestCase):
+	@classmethod
+	def setUpClass(cls):
+		super().setUpClass()
+		cls._teams_before = {name for name in TEAMS if frappe.db.exists("HD Team", name)}
+
+	@classmethod
+	def tearDownClass(cls):
+		super().tearDownClass()
+		# Teams are created inside each test transaction and rolled back; none may be committed.
+		leaked = [n for n in TEAMS if n not in cls._teams_before and frappe.db.exists("HD Team", n)]
+		assert not leaked, f"test committed HD Team rows: {leaked}"
+
 	def setUp(self):
+		# HD Team.after_insert makes an Assignment Rule that Frappe caches in Redis; the DB
+		# rollback leaves that entry stale. Registered first so it runs AFTER the rollback.
+		# (Never delete_doc HD Team: HDTeam.on_trash commits the transaction.)
+		self.addCleanup(frappe.cache.hdel, "assignment_rule_map", "HD Ticket")
 		# FrappeTestCase rolls back only after the whole class: undo each test.
 		self.addCleanup(frappe.db.rollback)
 		self.addCleanup(frappe.set_user, "Administrator")
@@ -36,15 +54,8 @@ class TestPolicy(FrappeTestCase):
 			monthly_budget_usd=10,
 			spent_this_month_usd=0,
 		)
-		created = [name for name in (TEAM, "IT") if _ensure_team(name)]
-		self.addCleanup(self._drop_teams, created)
-
-	def _drop_teams(self, names):
-		# HD Team.after_insert makes an Assignment Rule that Frappe caches in Redis;
-		# a DB rollback leaves that cache entry stale and breaks later HD Ticket inserts.
-		for name in names:
-			frappe.delete_doc("HD Team", name, force=True, ignore_permissions=True)
-		frappe.cache.hdel("assignment_rule_map", "HD Ticket")
+		for name in TEAMS:
+			_ensure_team(name)
 
 	def _ticket(self, **values):
 		ticket = make_ticket(subject="T20 policy ticket")

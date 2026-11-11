@@ -22,6 +22,8 @@ def _verdict(accuracy):
 
 
 def _expected_category(ticket_type, mapping):
+	if not ticket_type:
+		return None
 	for category in CATEGORIES:
 		if (mapping.get(category) or {}).get("ticket_type") == ticket_type:
 			return category

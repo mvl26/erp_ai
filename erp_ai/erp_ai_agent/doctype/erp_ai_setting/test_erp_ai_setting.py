@@ -2,6 +2,7 @@ import json
 
 import frappe
 from frappe.tests.utils import FrappeTestCase
+from frappe.utils import get_datetime
 
 from erp_ai.agent.classification import DEFAULT_CATEGORY_MAPPING
 from erp_ai.constants import (
@@ -21,6 +22,19 @@ PRICES = {
 }
 
 
+SELF_MANAGED_FIELDS = (
+	"status",
+	"paused_until",
+	"tokens_remaining",
+	"limit_reset_at",
+	"error_count",
+	"last_error",
+	"last_success_at",
+	"spent_month_usd",
+)
+DATETIME_FIELDS = ("paused_until", "limit_reset_at", "last_success_at")
+
+
 def _settings_with_keys(*labels):
 	"""Save the setting with the given key labels and return the reloaded document."""
 	doc = frappe.get_doc(SETTING_DOCTYPE)
@@ -37,6 +51,21 @@ class TestERPAISetting(FrappeTestCase):
 			frappe.db.exists("DocType", SETTING_DOCTYPE),
 			"DocType ERP AI Setting is missing",
 		)
+		# FrappeTestCase rolls back only after the whole class: undo each test, then start from a known valid baseline.
+		self.addCleanup(frappe.db.rollback)
+		frappe.db.delete(CREDENTIAL_DOCTYPE, {"parent": SETTING_DOCTYPE})
+		set_agent_settings(
+			enabled=0,
+			max_turns_per_run=8,
+			max_runs_per_ticket_per_day=5,
+			max_keys_per_call=3,
+			request_timeout_s=60,
+			monthly_budget_usd=10,
+			trigger_keyword="@ai",
+			category_mapping=json.dumps(DEFAULT_CATEGORY_MAPPING),
+			spent_this_month_usd=0,
+			**PRICES,
+		)
 
 	def test_default_mapping_and_default_disabled_l0(self):
 		meta = frappe.get_meta(SETTING_DOCTYPE)
@@ -46,6 +75,7 @@ class TestERPAISetting(FrappeTestCase):
 		self.assertEqual(int(meta.get_field("enabled").default), 0)
 		self.assertEqual(meta.get_field("permission_level").default, "L0")
 		self.assertEqual(meta.get_field("credentials").options, CREDENTIAL_DOCTYPE)
+		frappe.db.delete("Singles", {"doctype": SETTING_DOCTYPE})
 		doc = frappe.get_doc(SETTING_DOCTYPE)
 		self.assertFalse(doc.enabled)
 		self.assertEqual(doc.permission_level, "L0")
@@ -68,23 +98,40 @@ class TestERPAISetting(FrappeTestCase):
 		set_agent_settings(spent_this_month_usd=3.5)
 		doc = _settings_with_keys("k1")
 		row = doc.credentials[0]
-		frappe.db.set_value(
-			CREDENTIAL_DOCTYPE,
-			row.name,
-			{"status": KEY_STATUS_PAUSED, "error_count": 4, "last_error": "rate_limit 429 req_1"},
-		)
+		in_db = {
+			"status": KEY_STATUS_PAUSED,
+			"paused_until": "2030-05-01 10:00:00",
+			"tokens_remaining": 77,
+			"limit_reset_at": "2030-05-02 11:00:00",
+			"error_count": 4,
+			"last_error": "rate_limit 429 req_1",
+			"last_success_at": "2030-04-30 09:00:00",
+			"spent_month_usd": 2.5,
+		}
+		from_form = {
+			"status": KEY_STATUS_ACTIVE,
+			"paused_until": "2031-01-01 00:00:00",
+			"tokens_remaining": 1,
+			"limit_reset_at": "2031-01-02 00:00:00",
+			"error_count": 0,
+			"last_error": "",
+			"last_success_at": "2031-01-03 00:00:00",
+			"spent_month_usd": 9,
+		}
+		self.assertEqual(set(in_db), set(SELF_MANAGED_FIELDS))
+		frappe.db.set_value(CREDENTIAL_DOCTYPE, row.name, in_db)
 		doc = frappe.get_doc(SETTING_DOCTYPE)
-		doc.credentials[0].status = KEY_STATUS_ACTIVE
-		doc.credentials[0].error_count = 0
-		doc.credentials[0].last_error = ""
+		doc.credentials[0].update(from_form)
 		doc.spent_this_month_usd = 0
 		doc.save()
-		stored = frappe.db.get_value(
-			CREDENTIAL_DOCTYPE, row.name, ["status", "error_count", "last_error"], as_dict=True
-		)
-		self.assertEqual(stored.status, KEY_STATUS_PAUSED)
-		self.assertEqual(stored.error_count, 4)
-		self.assertEqual(stored.last_error, "rate_limit 429 req_1")
+		stored = frappe.db.get_value(CREDENTIAL_DOCTYPE, row.name, list(SELF_MANAGED_FIELDS), as_dict=True)
+		for fieldname in SELF_MANAGED_FIELDS:
+			expected = in_db[fieldname]
+			actual = stored[fieldname]
+			if fieldname in DATETIME_FIELDS:
+				expected, actual = get_datetime(expected), get_datetime(actual)
+			with self.subTest(fieldname=fieldname):
+				self.assertEqual(actual, expected)
 		self.assertEqual(float(frappe.db.get_single_value(SETTING_DOCTYPE, "spent_this_month_usd")), 3.5)
 
 	def test_new_key_row_gets_default_self_managed_fields(self):
@@ -92,12 +139,29 @@ class TestERPAISetting(FrappeTestCase):
 		doc.set("credentials", [])
 		doc.append(
 			"credentials",
-			{"label": "fresh", "api_key": "sk-x", "status": KEY_STATUS_BAD_KEY, "error_count": 9},
+			{
+				"label": "fresh",
+				"api_key": "sk-x",
+				"status": KEY_STATUS_BAD_KEY,
+				"paused_until": "2031-01-01 00:00:00",
+				"tokens_remaining": 50,
+				"limit_reset_at": "2031-01-02 00:00:00",
+				"error_count": 9,
+				"last_error": "auth 401 req_9",
+				"last_success_at": "2031-01-03 00:00:00",
+				"spent_month_usd": 7,
+			},
 		)
 		doc.save()
 		row = frappe.get_doc(SETTING_DOCTYPE).credentials[0]
 		self.assertEqual(row.status, KEY_STATUS_ACTIVE)
+		self.assertIsNone(row.paused_until)
+		self.assertFalse(row.tokens_remaining)
+		self.assertIsNone(row.limit_reset_at)
 		self.assertEqual(row.error_count, 0)
+		self.assertFalse(row.last_error)
+		self.assertIsNone(row.last_success_at)
+		self.assertEqual(row.spent_month_usd, 0)
 
 	def test_human_can_move_key_error_to_active_only(self):
 		doc = _settings_with_keys("k1", "k2")
@@ -131,30 +195,48 @@ class TestERPAISetting(FrappeTestCase):
 			doc.update(fields)
 			doc.save()
 
-		bad_values = [
-			{"category_mapping": "not json"},
-			{"category_mapping": json.dumps({"Z": {}})},
-			{"max_turns_per_run": 0},
-			{"max_turns_per_run": 21},
-			{"max_runs_per_ticket_per_day": 51},
-			{"max_keys_per_call": 11},
-			{"request_timeout_s": 4},
-			{"request_timeout_s": 301},
-			{"monthly_budget_usd": -1},
-			{"price_output_per_mtok": -1},
-			{"enabled": 1, **PRICES, "price_output_per_mtok": 0},
-			{"enabled": 1, **PRICES, "trigger_keyword": " "},
+		turns = "Số lượt tối đa mỗi lần chạy phải từ 1 đến 20"
+		runs = "Số lần chạy tối đa mỗi phiếu mỗi ngày phải từ 1 đến 50"
+		keys = "Số khóa tối đa mỗi lời gọi phải từ 1 đến 10"
+		timeout = "Timeout mỗi lời gọi API phải từ 5 đến 300"
+		cases = [
+			({"category_mapping": "not json"}, "không phải JSON hợp lệ"),
+			({"category_mapping": json.dumps({"Z": {}})}, "Đầu mục 'Z' không hợp lệ"),
+			({"max_turns_per_run": 0}, turns),
+			({"max_turns_per_run": 21}, turns),
+			({"max_runs_per_ticket_per_day": 0}, runs),
+			({"max_runs_per_ticket_per_day": 51}, runs),
+			({"max_keys_per_call": 0}, keys),
+			({"max_keys_per_call": 11}, keys),
+			({"request_timeout_s": 4}, timeout),
+			({"request_timeout_s": 301}, timeout),
+			({"monthly_budget_usd": -1}, "Ngân sách tháng phải không nhỏ hơn 0"),
+			({"enabled": 1, "trigger_keyword": " "}, "từ khóa kích hoạt rỗng"),
 		]
-		for fields in bad_values:
-			with self.subTest(fields=fields), self.assertRaises(frappe.ValidationError):
+		for fieldname in PRICES:
+			cases.append(({fieldname: -1}, "Đơn giá không được âm"))
+			cases.append(({"enabled": 1, fieldname: 0}, "chưa nhập đủ 4 đơn giá"))
+		for fields, message in cases:
+			with self.subTest(fields=fields), self.assertRaisesRegex(frappe.ValidationError, message):
 				saved_with(**fields)
+
+	def test_validation_rejects_empty_and_duplicate_key_labels(self):
 		doc = frappe.get_doc(SETTING_DOCTYPE)
 		doc.set("credentials", [])
+		doc.append("credentials", {"label": "  ", "api_key": "a"})
+		with self.assertRaisesRegex(frappe.ValidationError, "nhãn khóa không được để trống"):
+			doc.save()
+		doc = frappe.get_doc(SETTING_DOCTYPE)
 		doc.append("credentials", {"label": "Dup", "api_key": "a"})
 		doc.append("credentials", {"label": "dup", "api_key": "b"})
-		with self.assertRaises(frappe.ValidationError):
+		with self.assertRaisesRegex(frappe.ValidationError, "bị trùng"):
 			doc.save()
-		saved_with(enabled=1, credentials=[], **PRICES)
+
+	def test_valid_settings_can_be_enabled(self):
+		self.assertEqual(frappe.db.get_single_value(SETTING_DOCTYPE, "enabled"), 0)
+		doc = frappe.get_doc(SETTING_DOCTYPE)
+		doc.enabled = 1
+		doc.save()
 		self.assertEqual(frappe.db.get_single_value(SETTING_DOCTYPE, "enabled"), 1)
 
 	def test_set_agent_settings_writes_values(self):

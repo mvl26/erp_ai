@@ -364,7 +364,7 @@ Ràng buộc chung: tên hằng/hàm/test đúng `design.md` mục 7, 8, D-32, D
   - Expect: `cmd.test_one` test_architecture.py → 2 test mới xanh (đỏ trước khi `git mv`); `--module erp_ai.agent.test_agent_runner` → `Ran 52 ... OK`; `--app erp_ai` ghi nhận 500 test (448 + 52), OK
 
 - [ ] T42 — `ERP AI Log.skipped_fields` [migrate] (D9, DD-1) — files: erp_ai/erp_ai_agent/doctype/erp_ai_log/erp_ai_log.json, erp_ai/erp_ai_agent/doctype/erp_ai_log/test_erp_ai_log.py — test: erp_ai/erp_ai_agent/doctype/erp_ai_log/test_erp_ai_log.py — depends: T41
-  - progress: BASE=0a57502 · dev call 1
+  - progress: BASE=c4955eb · dev call 1
   - Criterion: AC-10 ("lý do vào nhật ký": chỗ lưu), design 2.3 / D-32
   - Receives: trường `value_after` (đã có) làm mốc thứ tự
   - Returns: trường `skipped_fields` trong `erp_ai_log.json`: Small Text, `read_only = 1`, permlevel 0, nhãn "Trường bỏ qua khi phân loại", đứng ngay sau `value_after` trong `field_order`; `test_erp_ai_log.py`: `LOG_FIELDS` thêm `skipped_fields`; `test_skipped_fields_is_read_only_small_text` (`fieldtype = "Small Text"`, `read_only = 1`, `permlevel = 0`, ngay sau `value_after`; biên: role `ERP AI Agent` vẫn không ghi được dòng đã tạo, như `test_no_role_can_write_or_delete`)

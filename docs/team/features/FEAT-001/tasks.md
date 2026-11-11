@@ -176,6 +176,7 @@ CẬP NHẬT MỚI NHẤT (dừng sạch giữa chừng): 30/45 xong (thêm T20c
   - Expect: `cmd.test_one` erp_ai/gateway/test_gateway.py → test: probe thành công → `Hoạt động`; chỉ khóa `Hết hạn mức` bị dò lại, `Lỗi khóa` thì không xanh
 
 - [ ] T19 — Cổng: bằng chứng khóa API không rò rỉ — files: erp_ai/gateway/test_gateway.py, erp_ai/gateway/__init__.py, erp_ai/gateway/client.py — test: erp_ai/gateway/test_gateway.py — depends: T18
+  - progress: BASE=466648c · dev call 1
   - Criterion: AC-14 (phần khóa), NFR-5
   - Receives: toàn bộ đường lỗi và thành công của cổng
   - Returns: không hàm mới; chỉ sửa mã cổng nếu test tìm thấy rò rỉ (dev sửa mã sản phẩm, không nuốt lỗi)
@@ -236,7 +237,7 @@ CẬP NHẬT MỚI NHẤT (dừng sạch giữa chừng): 30/45 xong (thêm T20c
   - Expect: `cmd.test_one` erp_ai/agent/tools/test_write_ticket.py → test_write_without_permission_returns_ok_false_unchanged, test_mapping_to_missing_value_skips_field, test người đã phân loại không bị ghi đè xanh
 
 - [ ] T26 — Tool ghi: hướng giải quyết, comment, Task — files: erp_ai/agent/tools/write_ticket.py, erp_ai/agent/tools/test_write_ticket.py — test: erp_ai/agent/tools/test_write_ticket.py — depends: T13, T25
-  - progress: BASE=a902d83 · dev call 1 (song song với T22)
+  - progress: BASE=a902d83 · dev call 1 (3a7d884, song song với T22) · review round 1 request-changes (major STD-TEST-2: create_task test dùng Projects User thay vì ROLE_AGENT) · rework FIX_BASE=3a7d884
   - Criterion: AC-8 (`create_task` chỉ khi có người ra lệnh; thiếu quyền → `ok=false`), A-5, D-14
   - Receives: `set_classification` và `TOOLS` từ T25
   - Returns: `set_resolution_hint(args, ctx) -> dict`, `post_comment(args, ctx) -> dict` (tạo core `Comment` qua `ticket.new_comment`, kiểm quyền tạo `Comment`; D8), `create_task(args, ctx) -> dict` (dòng đầu `description` có tên và đường dẫn phiếu; không có người ra lệnh hoặc không có DocType `Task` → `ok=false`); `TOOLS` đủ 4 tool, nhóm `task_write` cho `create_task`

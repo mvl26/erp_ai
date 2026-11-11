@@ -12,6 +12,7 @@ from erp_ai.agent.prompts import build_classify_request
 from erp_ai.agent.run_log import write_entry
 from erp_ai.constants import (
 	AGENT_USER,
+	CLASSIFIED_BY_AI,
 	CLASSIFIED_BY_HUMAN,
 	CREDENTIAL_DOCTYPE,
 	JOB_SAFETY_MARGIN_S,
@@ -41,7 +42,7 @@ TICKET_FIELDS = [
 DAILY_LIMIT = 2  # not the DocType default (5), so the run must read the Setting
 
 
-class TestRunner(FrappeTestCase):
+class RunnerTestBase(FrappeTestCase):
 	def setUp(self):
 		self.addCleanup(frappe.db.rollback)
 		self.addCleanup(frappe.set_user, "Administrator")
@@ -85,6 +86,8 @@ class TestRunner(FrappeTestCase):
 				turn=0,
 			)
 
+
+class TestRunner(RunnerTestBase):
 	# (a) account
 
 	def test_wrong_session_user_stops_before_model(self):
@@ -414,3 +417,135 @@ class TestRunner(FrappeTestCase):
 		events = self._simulate_key_failure_then(RuntimeError("boom"))
 
 		self.assertEqual(events, [("gateway_write",), ("commit", KEY_STATUS_BAD_KEY)])
+
+
+L1_TYPE = f"{PREFIX}loại"
+L1_TEAM = f"{PREFIX}nhóm"
+CLASSIFY_FIELDS = ("ticket_type", "agent_group", "priority", "ai_confidence", "ai_classified_by", "status")
+
+
+class TestRunnerL1Classification(RunnerTestBase):
+	"""Classification step at L1 (T29): the tool applies it, the run itself records the outcome."""
+
+	def setUp(self):
+		super().setUp()
+		# Cleanups run LIFO: set_user, rollback, then the stale Redis rule map (HD Team.after_insert).
+		self.addCleanup(frappe.cache.hdel, "assignment_rule_map", "HD Ticket")
+		frappe.set_user("Administrator")
+		if not frappe.db.exists("HD Ticket Type", L1_TYPE):
+			frappe.get_doc({"doctype": "HD Ticket Type", "name": L1_TYPE}).insert()
+		if not frappe.db.exists("HD Team", L1_TEAM):
+			frappe.get_doc(
+				{"doctype": "HD Team", "team_name": L1_TEAM, "users": [{"user": AGENT_USER}]}
+			).insert()
+		self.mapping = {"A": {"ticket_type": L1_TYPE, "agent_group": L1_TEAM, "priority": "High"}}
+		set_agent_settings(permission_level="L1", category_mapping=json.dumps(self.mapping))
+		log_error = patch.object(frappe, "log_error")
+		self.log_error = log_error.start()
+		self.addCleanup(log_error.stop)
+
+	def _ticket_row(self):
+		return frappe.db.get_value("HD Ticket", self.ticket.name, CLASSIFY_FIELDS, as_dict=True)
+
+	def _single_entry(self):
+		(entry,) = self._entries(entry_type="classify")
+		return entry
+
+	def test_l1_applies_mapping_confidence_and_hint(self):
+		before = self._ticket_row()
+		self._run()
+
+		self.log_error.assert_not_called()
+		row = self._ticket_row()
+		self.assertEqual((row.ticket_type, row.agent_group, row.priority), (L1_TYPE, L1_TEAM, "High"))
+		self.assertEqual((row.ai_confidence, row.ai_classified_by), ("Cao", CLASSIFIED_BY_AI))
+		self.assertEqual(row.status, before.status)
+		entry = self._single_entry()
+		self.assertEqual(entry.applied, 1)
+		self.assertEqual(json.loads(entry.value_before)["ticket_type"], before.ticket_type)
+		self.assertEqual(
+			json.loads(entry.value_after),
+			{"ticket_type": L1_TYPE, "agent_group": L1_TEAM, "priority": "High", "ai_confidence": "Cao"},
+		)
+		self.assertEqual(
+			json.loads(entry.actions),
+			[{"tool": "set_classification", "doctype": "HD Ticket", "name": self.ticket.name, "ok": True}],
+		)
+		self.assertEqual((entry.predicted_category, entry.predicted_confidence), ("A", "Cao"))
+
+	def test_l1_human_classified_not_overwritten(self):
+		frappe.db.set_value("HD Ticket", self.ticket.name, "ai_classified_by", CLASSIFIED_BY_HUMAN)
+		before = self._ticket_row()
+		self._run()
+
+		self.assertEqual(self._ticket_row(), before)
+		entry = self._single_entry()
+		self.assertEqual(entry.applied, 0)
+		self.assertFalse(entry.value_after)
+		self.assertFalse(entry.actions)
+
+	def test_l1_empty_after_keeps_applied_zero(self):
+		unknown = {"A": {"ticket_type": f"{PREFIX}không-có", "agent_group": "", "priority": ""}}
+		set_agent_settings(category_mapping=json.dumps(unknown))
+		before = self._ticket_row()
+		self._run()
+
+		self.assertEqual(self._ticket_row(), before)
+		entry = self._single_entry()
+		self.assertEqual(entry.applied, 0)
+		self.assertFalse(entry.value_after)
+		self.assertFalse(entry.actions)
+
+	def test_not_ok_result_with_after_is_not_applied(self):
+		failed = {"ok": False, "reason": "x", "before": {}, "after": {"priority": "High"}}
+		with patch.object(runner, "execute_tool", return_value=failed):
+			self._run()
+
+		self.assertEqual(self._single_entry().applied, 0)
+
+	def test_failure_after_tool_rolls_ticket_back_and_keeps_entry(self):
+		before = self._ticket_row()
+		real_set_value = frappe.db.set_value
+
+		def failing_set_value(doctype, *args, **kwargs):
+			if doctype == LOG_DOCTYPE:
+				raise RuntimeError("boom")
+			return real_set_value(doctype, *args, **kwargs)
+
+		with patch.object(frappe.db, "set_value", side_effect=failing_set_value):
+			self._run()
+
+		self.log_error.assert_called_once()
+		self.assertEqual(self.log_error.call_args.args[0], TITLE_RUN_FAILED)
+		self.assertEqual(self._ticket_row(), before)
+		entry = self._single_entry()
+		self.assertEqual(entry.applied, 0)
+		self.assertEqual(entry.predicted_category, "A")
+
+	def test_ticket_change_is_never_committed_before_its_log_outcome(self):
+		snapshots = []
+
+		def record_commit():
+			ticket_by = frappe.db.get_value("HD Ticket", self.ticket.name, "ai_classified_by")
+			applied = frappe.db.get_value(LOG_DOCTYPE, {"ticket": self.ticket.name}, "applied")
+			snapshots.append((ticket_by, applied))
+
+		self.addCleanup(setattr, frappe.flags, "in_test", frappe.flags.in_test)
+		frappe.flags.in_test = False
+		with patch.object(frappe.db, "commit", side_effect=record_commit):
+			self._run()
+
+		self.assertTrue(snapshots)
+		self.assertEqual(snapshots[-1], (CLASSIFIED_BY_AI, 1))
+		self.assertNotIn((CLASSIFIED_BY_AI, 0), snapshots)
+		self.assertNotIn((CLASSIFIED_BY_AI, None), snapshots)
+
+	def test_l0_still_does_not_apply(self):
+		set_agent_settings(permission_level="L0")
+		before = self._ticket_row()
+		with patch.object(runner, "execute_tool") as execute_tool:
+			self._run()
+
+		execute_tool.assert_not_called()
+		self.assertEqual(self._ticket_row(), before)
+		self.assertEqual(self._single_entry().applied, 0)

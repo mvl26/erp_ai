@@ -116,6 +116,13 @@ Tiến độ: 14/42 (T1, T1b, T2..T7, T7b, T8, T9, T9b, T10, T11 xong; cmd.test 
   - Returns: `install.ensure_setup() -> None` (bước 1, 2, 5 của design mục 6; bước 3, 4, 6 là T12, T13), `install.after_install()`, `install.after_migrate()`; `hooks.py`: `after_install`, `after_migrate`
   - Expect: `cmd.migrate` exit 0 hai lần liên tiếp, rồi `cmd.test_one` → test_setup_twice_is_idempotent, test_agent_user_has_exact_roles_without_system_manager, test_default_settings_disabled_level_l0 (giá trị người đã đặt không bị ghi đè), test_setup_never_writes_existing_tickets xanh
 
+- [x] T11b — Xóa được HD Ticket có nhật ký (D7) — files: erp_ai/hooks.py, erp_ai/tests/test_ticket_delete.py — test: erp_ai/tests/test_ticket_delete.py — depends: T11
+  - progress: BASE=7415abd · dev call 1 (4f302e2, song song với T14) · review round 1 approve (review-14) · merged (không [migrate]) · cmd.test Ran 116 tests OK, pre-commit exit 0
+  - Ghi chú: `test_ticket_delete.py` là touchpoint bổ sung (test); không [migrate].
+  - Criterion: D7 (journal): `ignore_links_on_delete = ["ERP AI Log"]` trong hooks.py; nhật ký không chặn thao tác nghiệp vụ, dòng log vẫn không xóa được và còn sau khi phiếu bị xóa
+  - Returns: `hooks.py`: `ignore_links_on_delete = ["ERP AI Log"]` (đúng một dòng thêm)
+  - Expect: `cmd.test_one` erp_ai/tests/test_ticket_delete.py → test_ticket_with_log_row_can_be_deleted_and_log_survives (đỏ trước: `LinkExistsError`; xanh sau: phiếu mất, dòng ERP AI Log còn, `ticket` vẫn trỏ tên phiếu cũ)
+
 - [ ] T12 — Cài đặt: custom field AI trên HD Ticket và dòng template [migrate] — files: erp_ai/install.py, erp_ai/tests/test_install.py — test: erp_ai/tests/test_install.py — depends: T11
   - Criterion: AC-4 (trường AI có trên HD Ticket), AC-20 (phần tự động: permlevel 8, `visible_to = Agents`, HD Customer không có quyền pl 8), ADR-006 #3
   - Receives: `ensure_setup` từ T11
@@ -130,7 +137,8 @@ Tiến độ: 14/42 (T1, T1b, T2..T7, T7b, T8, T9, T9b, T10, T11 xong; cmd.test 
 
 ## Cổng model và lõi agent
 
-- [ ] T14 — Cảnh báo: báo động và thông báo — files: erp_ai/alerts.py, erp_ai/tests/test_alerts.py — test: erp_ai/tests/test_alerts.py — depends: T9
+- [x] T14 — Cảnh báo: báo động và thông báo — files: erp_ai/alerts.py, erp_ai/tests/test_alerts.py — test: erp_ai/tests/test_alerts.py — depends: T9
+  - progress: BASE=7415abd · dev call 1 (8fb14a8, song song với T11b) · review round 1 approve (review-15) · merged cbaf7c7 · cmd.test Ran 116 tests OK, pre-commit exit 0
   - Ghi chú: `test_alerts.py` là touchpoint bổ sung (test).
   - Criterion: AC-17 (báo động hết khóa), AC-18 (kênh email), NFR-5 (nội dung không chứa khóa), D-2, D-21
   - Receives: `set_agent_settings` (T9), `constants.TITLE_ALARM`, `TITLE_NOTICE`, `LOGGER_NAME`

@@ -673,3 +673,146 @@ class TestCallModel(FrappeTestCase):
 		self.assertIn("k1", logger.return_value.warning.call_args.args)
 		self.assertEqual([c["api_key"] for c in send.calls], ["sk-k2"])
 		self.assertEqual(result.credential_label, "k2")
+
+
+class TestProbe(FrappeTestCase):
+	def setUp(self):
+		self.addCleanup(frappe.db.rollback)
+		frappe.db.delete(CREDENTIAL_DOCTYPE, {"parent": SETTING_DOCTYPE})
+		set_agent_settings(model_classify_default="default-model")
+		self.alarm = self.enterContext(patch("erp_ai.alerts.send_alarm"))
+		self.notice = self.enterContext(patch("erp_ai.alerts.send_notice"))
+
+	def probe(self, name, *outcomes):
+		send = ScriptedSend(*outcomes)
+		with patch.object(client, "send", send):
+			return send, gateway.probe_credential(name)
+
+	def reprobe(self, *outcomes):
+		send = ScriptedSend(*outcomes)
+		with patch.object(client, "send", send):
+			return send, gateway.reprobe_exhausted_keys()
+
+	def row(self, name):
+		return frappe.db.get_value(CREDENTIAL_DOCTYPE, name, "*", as_dict=True)
+
+	def test_probe_success_activates_key_and_sends_one_token_ping(self):
+		name = add_credential(
+			"k1", status=KEY_STATUS_QUOTA_EXHAUSTED, error_count=4, last_error="quota", model_classify="m-own"
+		)
+		send, result = self.probe(name, ok_reply())
+		self.assertEqual(result, {"label": "k1", "ok": True, "error_kind": None, "status": None})
+		call = send.calls[0]
+		self.assertEqual(call["api_key"], "sk-k1")
+		self.assertEqual(call["timeout"], 10)
+		self.assertEqual(
+			call["request"],
+			{"model": "m-own", "max_tokens": 1, "messages": [{"role": "user", "content": "ping"}]},
+		)
+		row = self.row(name)
+		self.assertEqual((row.status, row.error_count, row.last_error), (KEY_STATUS_ACTIVE, 0, ""))
+
+	def test_probe_uses_default_model_when_key_has_none(self):
+		name = add_credential("k1")
+		send, _ = self.probe(name, ok_reply())
+		self.assertEqual(send.calls[0]["request"]["model"], "default-model")
+
+	def test_probe_failure_reports_kind_and_status_and_applies_breaker(self):
+		name = add_credential("k1", status=KEY_STATUS_QUOTA_EXHAUSTED)
+		_, result = self.probe(name, err(401))
+		self.assertEqual(result, {"label": "k1", "ok": False, "error_kind": "auth", "status": 401})
+		self.assertEqual(self.row(name).status, KEY_STATUS_BAD_KEY)
+		self.assertEqual(self.row(name).error_count, 1)
+		self.alarm.assert_called_once()
+
+	def test_probe_rate_limit_pauses_key(self):
+		name = add_credential("k1")
+		_, result = self.probe(name, err(429))
+		self.assertEqual((result["ok"], result["error_kind"], result["status"]), (False, "rate_limit", 429))
+		self.assertEqual(self.row(name).status, KEY_STATUS_PAUSED)
+
+	def test_probe_bad_request_leaves_status(self):
+		name = add_credential("k1", status=KEY_STATUS_QUOTA_EXHAUSTED)
+		_, result = self.probe(name, err(422))
+		self.assertEqual((result["error_kind"], result["status"]), ("bad_request", 422))
+		self.assertEqual(self.row(name).status, KEY_STATUS_QUOTA_EXHAUSTED)
+
+	def test_probe_unexpected_exception_has_no_status_and_hides_text(self):
+		name = add_credential("k1", status=KEY_STATUS_QUOTA_EXHAUSTED)
+		_, result = self.probe(name, RuntimeError("leak sk-k1"))
+		self.assertEqual(result, {"label": "k1", "ok": False, "error_kind": "unexpected", "status": None})
+		self.assertEqual(self.row(name).status, KEY_STATUS_QUOTA_EXHAUSTED)
+
+	def test_probe_unsupported_provider_does_not_send_or_change_status(self):
+		name = add_credential("k1", provider="OpenAI", status=KEY_STATUS_QUOTA_EXHAUSTED)
+		send, result = self.probe(name)
+		self.assertEqual(
+			result, {"label": "k1", "ok": False, "error_kind": "unsupported_provider", "status": None}
+		)
+		self.assertEqual(send.calls, [])
+		self.assertEqual(self.row(name).status, KEY_STATUS_QUOTA_EXHAUSTED)
+
+	def test_probe_missing_secret_does_not_send(self):
+		name = add_credential("k1", status=KEY_STATUS_QUOTA_EXHAUSTED)
+		with patch.object(credentials, "get_api_key", return_value=None):
+			send, result = self.probe(name)
+		self.assertEqual(result, {"label": "k1", "ok": False, "error_kind": "no_secret", "status": None})
+		self.assertEqual(send.calls, [])
+		self.assertEqual(self.row(name).status, KEY_STATUS_QUOTA_EXHAUSTED)
+
+	def test_probe_unknown_row(self):
+		send, result = self.probe("no-such-row")
+		self.assertEqual(result, {"label": None, "ok": False, "error_kind": "not_found", "status": None})
+		self.assertEqual(send.calls, [])
+
+	def test_reprobe_only_exhausted_enabled_keys(self):
+		exhausted = add_credential("ex", status=KEY_STATUS_QUOTA_EXHAUSTED)
+		bad = add_credential("bad", status=KEY_STATUS_BAD_KEY)
+		active = add_credential("act")
+		paused = add_credential("pau", status=KEY_STATUS_PAUSED)
+		disabled = add_credential("dis", status=KEY_STATUS_QUOTA_EXHAUSTED, enabled=0)
+		other = add_credential("oth", status=KEY_STATUS_QUOTA_EXHAUSTED, provider="OpenAI")
+		send, results = self.reprobe(ok_reply(), ok_reply())
+		self.assertEqual(
+			results,
+			[
+				{"label": "ex", "ok": True, "error_kind": None, "status": None},
+				{"label": "oth", "ok": False, "error_kind": "unsupported_provider", "status": None},
+			],
+		)
+		self.assertEqual(len(send.calls), 1)
+		self.assertEqual(send.calls[0]["api_key"], "sk-ex")
+		self.assertEqual(self.row(exhausted).status, KEY_STATUS_ACTIVE)
+		self.assertEqual(self.row(bad).status, KEY_STATUS_BAD_KEY)
+		self.assertEqual(self.row(active).status, KEY_STATUS_ACTIVE)
+		self.assertEqual(self.row(paused).status, KEY_STATUS_PAUSED)
+		self.assertEqual(self.row(disabled).status, KEY_STATUS_QUOTA_EXHAUSTED)
+		self.assertEqual(self.row(other).status, KEY_STATUS_QUOTA_EXHAUSTED)
+
+	def test_reprobe_orders_by_idx_and_keeps_failed_key_exhausted_without_notice(self):
+		first = add_credential("a", status=KEY_STATUS_QUOTA_EXHAUSTED)
+		second = add_credential("b", status=KEY_STATUS_QUOTA_EXHAUSTED)
+		send, results = self.reprobe(err(402), ok_reply())
+		self.assertEqual([r["label"] for r in results], ["a", "b"])
+		self.assertEqual([c["api_key"] for c in send.calls], ["sk-a", "sk-b"])
+		self.assertEqual((results[0]["ok"], results[0]["error_kind"]), (False, "quota"))
+		self.assertEqual(self.row(first).status, KEY_STATUS_QUOTA_EXHAUSTED)
+		self.assertEqual(self.row(second).status, KEY_STATUS_ACTIVE)
+		self.notice.assert_called_once()
+		self.assertIn("b", self.notice.call_args.args[0])
+
+	def test_reprobe_with_nothing_exhausted_returns_empty(self):
+		add_credential("k1")
+		send, results = self.reprobe()
+		self.assertEqual((results, send.calls), ([], []))
+		self.notice.assert_not_called()
+
+	def test_reprobe_notice_failure_is_logged_and_does_not_stop_loop(self):
+		add_credential("a", status=KEY_STATUS_QUOTA_EXHAUSTED)
+		add_credential("b", status=KEY_STATUS_QUOTA_EXHAUSTED)
+		self.notice.side_effect = RuntimeError("smtp down")
+		with patch.object(gateway.frappe, "log_error") as log_error:
+			_, results = self.reprobe(ok_reply(), ok_reply())
+		self.assertEqual([r["ok"] for r in results], [True, True])
+		self.assertEqual(log_error.call_count, 2)
+		self.assertIn("RuntimeError", log_error.call_args.args[1])

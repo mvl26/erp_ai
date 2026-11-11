@@ -156,23 +156,9 @@ ignore_links_on_delete = ["ERP AI Log"]
 # Scheduled Tasks
 # ---------------
 
-# scheduler_events = {
-# 	"all": [
-# 		"erp_ai.tasks.all"
-# 	],
-# 	"daily": [
-# 		"erp_ai.tasks.daily"
-# 	],
-# 	"hourly": [
-# 		"erp_ai.tasks.hourly"
-# 	],
-# 	"weekly": [
-# 		"erp_ai.tasks.weekly"
-# 	],
-# 	"monthly": [
-# 		"erp_ai.tasks.monthly"
-# 	],
-# }
+scheduler_events = {
+	"daily": ["erp_ai.tasks.recompute_monthly_spend"],
+}
 
 # Testing
 # -------

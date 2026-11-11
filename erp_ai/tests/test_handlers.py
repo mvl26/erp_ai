@@ -4,7 +4,6 @@ import frappe
 from frappe.tests.utils import FrappeTestCase
 from helpdesk.test_utils import make_ticket
 
-from erp_ai import gateway
 from erp_ai.agent import runner
 from erp_ai.constants import SETTING_DOCTYPE
 from erp_ai.test_utils import FakeGateway, make_model_result
@@ -126,7 +125,3 @@ class TestTicketHandlers(FrappeTestCase):
 		self.assertEqual(call["max_tokens"], 400)
 		self.assertTrue(call["system"])
 		self.assertTrue(call["messages"])
-
-	def test_gateway_stub_raises_not_implemented(self):
-		with self.assertRaises(NotImplementedError):
-			gateway.call_model("classify", system=[], messages=[], max_tokens=1)

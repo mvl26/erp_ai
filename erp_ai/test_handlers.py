@@ -99,6 +99,7 @@ class TestTicketHandlers(FrappeTestCase):
 	def test_saving_ticket_never_calls_the_model(self):
 		fake_gateway = FakeGateway()
 		with (
+			patch.object(frappe.db, "exists", side_effect=_setting_doctype_exists()),
 			patch.object(frappe.db, "get_single_value", side_effect=_setting_value(1)),
 			patch("erp_ai.gateway.call_model", fake_gateway),
 			patch.object(frappe, "enqueue"),

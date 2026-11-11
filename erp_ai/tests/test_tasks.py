@@ -9,6 +9,9 @@ from erp_ai.constants import (
 	AGENT_USER,
 	CREDENTIAL_DOCTYPE,
 	HELPDESK_AGENT_ROLE,
+	KEY_STATUS_ACTIVE,
+	KEY_STATUS_BAD_KEY,
+	KEY_STATUS_QUOTA_EXHAUSTED,
 	LOG_DOCTYPE,
 	ROLE_AGENT,
 	SETTING_DOCTYPE,
@@ -16,6 +19,7 @@ from erp_ai.constants import (
 	TITLE_RUN_FAILED,
 	TRIGGER_TICKET_INSERT,
 )
+from erp_ai.gateway import client
 from erp_ai.test_utils import add_credential, set_agent_settings
 
 # Far-future months cannot hold real ERP AI Log rows, so sums only see rows the test inserts.
@@ -439,4 +443,86 @@ class TestCheckPrivilegeEscalation(FrappeTestCase):
 		self.assertEqual(titles.count(TITLE_RUN_FAILED), 3)
 		self.log_error.assert_any_call(
 			TITLE_RUN_FAILED, "check_privilege_escalation email error=OutgoingEmailError"
+		)
+
+
+class TestReprobeExhaustedKeys(FrappeTestCase):
+	def setUp(self):
+		self.addCleanup(frappe.db.rollback)
+		commit_guard = patch.object(frappe.db, "commit", side_effect=AssertionError("commit in test"))
+		commit_guard.start()
+		self.addCleanup(commit_guard.stop)
+		self.log_error = self.enterContext(patch("frappe.log_error"))
+		self.notice = self.enterContext(patch("erp_ai.alerts.send_notice"))
+		self.alarm = self.enterContext(patch("erp_ai.alerts.send_alarm"))
+		# Keys already on the site must not be probed.
+		frappe.db.set_value(CREDENTIAL_DOCTYPE, {"parent": SETTING_DOCTYPE}, "enabled", 0)
+		set_agent_settings(model_classify_default="ERPAI-TEST-model")
+		self.exhausted_label = self._label()
+		self.exhausted = add_credential(self.exhausted_label, status=KEY_STATUS_QUOTA_EXHAUSTED)
+		self.bad = add_credential(self._label(), status=KEY_STATUS_BAD_KEY)
+		self.active = add_credential(self._label(), status=KEY_STATUS_ACTIVE)
+
+	def _label(self):
+		return f"ERPAI-TEST-{frappe.generate_hash(length=8)}"
+
+	def _status(self, row):
+		return frappe.db.get_value(CREDENTIAL_DOCTYPE, row, "status")
+
+	def _run_recovering(self):
+		keys_sent = []
+
+		def send(api_key, *, timeout, request):
+			keys_sent.append(api_key)
+			return client.RawReply(message={"type": "message", "content": []}, headers={}, request_id="r")
+
+		with patch.object(client, "send", send):
+			tasks.reprobe_exhausted_keys()
+		return keys_sent
+
+	def test_reprobe_only_exhausted_keys(self):
+		keys_sent = self._run_recovering()
+
+		self.assertEqual(keys_sent, [f"sk-{self.exhausted_label}"])
+		self.assertEqual(self._status(self.exhausted), KEY_STATUS_ACTIVE)
+		self.assertEqual(self._status(self.bad), KEY_STATUS_BAD_KEY)
+		self.assertEqual(self._status(self.active), KEY_STATUS_ACTIVE)
+		self.log_error.assert_not_called()
+
+	def test_recovered_key_sends_exactly_one_notice(self):
+		self._run_recovering()
+
+		self.assertEqual(self.notice.call_count, 1)
+
+	def test_still_exhausted_key_sends_no_notice(self):
+		failed = [{"label": "x", "ok": False, "error_kind": "quota", "status": 402}]
+		with patch("erp_ai.gateway.reprobe_exhausted_keys", return_value=failed):
+			tasks.reprobe_exhausted_keys()
+
+		self.notice.assert_not_called()
+		self.log_error.assert_not_called()
+
+	def test_gateway_error_is_logged_and_rolled_back_not_raised(self):
+		frappe.db.savepoint("t35_before_job")
+		real_rollback = frappe.db.rollback
+
+		def rollback_to_savepoint(*args, **kwargs):
+			real_rollback(save_point="t35_before_job")
+
+		with (
+			patch("erp_ai.gateway.reprobe_exhausted_keys", side_effect=frappe.QueryTimeoutError("boom")),
+			patch.object(frappe.db, "rollback", side_effect=rollback_to_savepoint) as rollback,
+		):
+			tasks.reprobe_exhausted_keys()
+
+		rollback.assert_called_once()
+		self.log_error.assert_called_once_with(
+			TITLE_RUN_FAILED, "reprobe_exhausted_keys error=QueryTimeoutError"
+		)
+
+	def test_hooks_register_hourly_and_daily_order(self):
+		self.assertEqual(hooks.scheduler_events["hourly"], ["erp_ai.tasks.reprobe_exhausted_keys"])
+		self.assertEqual(
+			hooks.scheduler_events["daily"],
+			["erp_ai.tasks.recompute_monthly_spend", "erp_ai.tasks.check_privilege_escalation"],
 		)

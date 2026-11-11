@@ -157,7 +157,8 @@ ignore_links_on_delete = ["ERP AI Log"]
 # ---------------
 
 scheduler_events = {
-	"daily": ["erp_ai.tasks.recompute_monthly_spend"],
+	"hourly": ["erp_ai.tasks.reprobe_exhausted_keys"],
+	"daily": ["erp_ai.tasks.recompute_monthly_spend", "erp_ai.tasks.check_privilege_escalation"],
 }
 
 # Testing

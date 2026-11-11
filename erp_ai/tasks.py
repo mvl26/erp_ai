@@ -5,7 +5,7 @@ from frappe.permissions import AUTOMATIC_ROLES
 from frappe.query_builder.functions import Sum
 from frappe.utils import add_months, get_datetime, now_datetime
 
-from erp_ai import alerts
+from erp_ai import alerts, gateway
 from erp_ai.constants import (
 	AGENT_USER,
 	CREDENTIAL_DOCTYPE,
@@ -145,3 +145,19 @@ def check_privilege_escalation() -> None:
 	except Exception as exc:
 		frappe.db.rollback()
 		frappe.log_error(TITLE_RUN_FAILED, f"check_privilege_escalation error={type(exc).__name__}")
+
+
+def reprobe_exhausted_keys() -> None:
+	"""Hourly job (AC-18): re-probe keys in status 'Hết hạn mức'.
+
+	The gateway probes only those keys, sets a recovered key back to 'Hoạt động' and sends the one
+	notice itself, so this job sends nothing. On any error it rolls back, logs a constant title with
+	an explicit message and returns (D-20).
+	"""
+	try:
+		gateway.reprobe_exhausted_keys()
+		if not frappe.flags.in_test:
+			frappe.db.commit()
+	except Exception as exc:
+		frappe.db.rollback()
+		frappe.log_error(TITLE_RUN_FAILED, f"reprobe_exhausted_keys error={type(exc).__name__}")

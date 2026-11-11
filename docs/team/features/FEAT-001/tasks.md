@@ -10,7 +10,7 @@ Approved-by:
 Mỗi task 2–5 phút. Hai task chung file thì phụ thuộc nhau. Đánh dấu `BLOCKED: <lý do>` cuối dòng khi bị chặn.
 Đường dẫn trong `files:` tính từ gốc repo `apps/erp_ai/`. `test:` là file chạy bằng `cmd.test_one` (dạng chạy trong worktree: xem `plan.md` mục Ràng buộc chung). Task có `[migrate]` đụng DocType/hook cần `bench migrate` trước khi test → chạy tuần tự. Tên hằng, hàm, trường dùng đúng `plan.md` mục Ràng buộc chung và `design.md`; không đổi tên.
 
-Tiến độ: 7/41 (T1, T1b, T2..T6 xong; cmd.test trên 212f77b: Ran 65 tests OK, pre-commit exit 0). Việc tiếp theo: T7 (source.py), rồi chuỗi migrate T8..T13 tuần tự. Deferred: xem review-02..06 (limit=401 phải bị registry từ chối ở T23/T27; T9 đặt mặc định category_mapping = DEFAULT_CATEGORY_MAPPING; runner T28 gọi validate_mapping). Lưu ý: T31 phải bỏ guard `frappe.db.exists("DocType", SETTING_DOCTYPE)` trong handlers.py (tạm thời từ T1). BASE của từng task ghi vào dòng tiến độ ở đây trước khi gọi dev.
+Tiến độ: 8/41 (T1, T1b, T2..T7 xong; cmd.test sau merge T7: Ran 75 tests OK, pre-commit exit 0). Việc tiếp theo: T8 (DocType ERP AI Credential, [migrate]), rồi chuỗi migrate T8..T13 tuần tự (T14 song song được sau T9). Cần người xem: deferred của review-07 (design 5.4 vs allowlist git, git có thể lộ bí mật đã commit). Deferred: xem review-02..06 (limit=401 phải bị registry từ chối ở T23/T27; T9 đặt mặc định category_mapping = DEFAULT_CATEGORY_MAPPING; runner T28 gọi validate_mapping). Lưu ý: T31 phải bỏ guard `frappe.db.exists("DocType", SETTING_DOCTYPE)` trong handlers.py (tạm thời từ T1). BASE của từng task ghi vào dòng tiến độ ở đây trước khi gọi dev.
 
 ## Walking skeleton (cỡ L)
 
@@ -65,8 +65,8 @@ Tiến độ: 7/41 (T1, T1b, T2..T6 xong; cmd.test trên 212f77b: Ran 65 tests O
   - Returns: `get_source_root() -> str`, `resolve_safe_path(rel: str) -> str | None`, `search_source(args: dict, ctx) -> dict`, `read_source(args: dict, ctx) -> dict` (trả `{"ok": bool, ...}` hoặc `{"ok": False, "reason": str}`; không ném lỗi), hằng `DUOI_CHO_PHEP`, `TEN_CAM` đúng guide `:342-345`; chưa có `ToolSpec` (T23 định nghĩa, T27 nối)
   - Expect: `cmd.test_one` erp_ai/agent/tools/test_source.py → test_path_escape_refused, test_secret_names_and_extensions_refused, test_read_capped_at_400_lines, test_search_capped_at_40_hits xanh (thư mục tạm, patch `get_source_root`)
 
-- [ ] T7 — Tool mã nguồn: git chỉ đọc — files: erp_ai/agent/tools/source.py, erp_ai/agent/tools/test_source.py — test: erp_ai/agent/tools/test_source.py — depends: T6
-  - progress: BASE=212f77b · dev call 1
+- [x] T7 — Tool mã nguồn: git chỉ đọc — files: erp_ai/agent/tools/source.py, erp_ai/agent/tools/test_source.py — test: erp_ai/agent/tools/test_source.py — depends: T6
+  - progress: BASE=212f77b · dev call 1 · round 1 request-changes (blocker STD-SEC-3 abbreviation) · round 2 request-changes (STD-TEST-8) · round 3 approve (head 12229e3) · merged · cmd.test Ran 75 tests OK, pre-commit exit 0
   - Criterion: AC-13 (git), NFR-6 (30 s)
   - Receives: `get_source_root`, `resolve_safe_path` từ T6
   - Returns: `git_source(args: dict, ctx) -> dict`: danh sách lệnh, không `shell`, `timeout=30`, chỉ `log`/`show`/`diff`/`blame`, từ chối các cờ ở design 5.4, `FileNotFoundError` → `ok=false` "chưa cài git"

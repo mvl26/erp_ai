@@ -85,8 +85,10 @@ def _run(ticket_name, trigger):
 
 def _log_skip(ticket_name, trigger, run_id, stop_reason):
 	# a ticket deleted before the job ran cannot be a Link target; keep the skip entry without it
+	exists = frappe.db.exists("HD Ticket", ticket_name)
 	write_entry(
-		ticket=ticket_name if frappe.db.exists("HD Ticket", ticket_name) else None,
+		ticket=ticket_name if exists else None,
+		error=None if exists else f"ticket_missing {ticket_name}",
 		run_id=run_id,
 		entry_type="skip",
 		trigger=trigger,

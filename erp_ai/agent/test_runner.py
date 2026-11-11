@@ -175,11 +175,14 @@ class TestRunner(FrappeTestCase):
 		log_error.assert_not_called()
 		new_rows = [
 			row
-			for row in frappe.get_all(LOG_DOCTYPE, fields=["name", "entry_type", "stop_reason", "ticket"])
+			for row in frappe.get_all(
+				LOG_DOCTYPE, fields=["name", "entry_type", "stop_reason", "ticket", "error"]
+			)
 			if row.name not in before
 		]
 		self.assertEqual(
-			[(r.entry_type, r.stop_reason, r.ticket) for r in new_rows], [("skip", "not_sendable", None)]
+			[(r.entry_type, r.stop_reason, r.ticket, r.error) for r in new_rows],
+			[("skip", "not_sendable", None, f"ticket_missing {missing}")],
 		)
 		self.assertEqual(self.gateway.call_count, 0)
 
@@ -192,7 +195,7 @@ class TestRunner(FrappeTestCase):
 			self.ticket.name,
 			{
 				"ai_classified_by": CLASSIFIED_BY_HUMAN,
-				"ai_confidence": "Cao",
+				"ai_confidence": "Thấp",
 				"ai_resolution_hint": f"{PREFIX}hint",
 			},
 		)
@@ -228,8 +231,8 @@ class TestRunner(FrappeTestCase):
 
 	def test_deadline_follows_job_timeout_constants(self):
 		with (
-			patch.object(runner, "JOB_TIMEOUT_S", 100, create=True),
-			patch.object(runner, "JOB_SAFETY_MARGIN_S", 30, create=True),
+			patch.object(runner, "JOB_TIMEOUT_S", 100),
+			patch.object(runner, "JOB_SAFETY_MARGIN_S", 30),
 		):
 			self._run()
 

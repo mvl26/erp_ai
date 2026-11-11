@@ -840,6 +840,8 @@ class TestApiKeyLeak(FrappeTestCase):
 		self.sendmail = self.enterContext(patch.object(frappe, "sendmail"))
 		# an Error Log insert is not undone by rollback on this site: capture the calls instead of writing rows
 		self.log_error = self.enterContext(patch.object(frappe, "log_error"))
+		# the gateway's file logger (logs/erp_ai.log) is a store too: capture what it is asked to write
+		self.logger = self.enterContext(patch.object(frappe, "logger"))
 
 	def stores_containing(self, marker, outputs):
 		like = f"%{marker}%"
@@ -853,20 +855,29 @@ class TestApiKeyLeak(FrappeTestCase):
 			LOG_DOCTYPE: (LOG_DOCTYPE, [[LOG_DOCTYPE, f, "like", like] for f in log_fields]),
 			"HD Ticket Comment": ("HD Ticket Comment", [["HD Ticket Comment", "content", "like", like]]),
 			"Comment": ("Comment", [["Comment", "content", "like", like]]),
-			"Error Log": (
-				"Error Log",
-				[["Error Log", "error", "like", like], ["Error Log", "method", "like", like]],
-			),
 			"last_error": (CREDENTIAL_DOCTYPE, [[CREDENTIAL_DOCTYPE, "last_error", "like", like]]),
 		}
 		for store, (doctype, or_filters) in stores.items():
 			found[store] = len(frappe.get_all(doctype, or_filters=or_filters, pluck="name"))
 		found["sendmail"] = int(marker in repr(self.sendmail.call_args_list))
 		found["log_error calls"] = int(marker in repr(self.log_error.call_args_list))
+		found["frappe.logger"] = int(marker in repr(self.logger.mock_calls))
 		found["gateway output"] = int(marker in outputs)
 		return {store: count for store, count in found.items() if count}
 
+	def used_sinks(self):
+		last_errors = frappe.get_all(CREDENTIAL_DOCTYPE, filters={"last_error": ["is", "set"]}, pluck="name")
+		used = {
+			"sendmail": self.sendmail.called,
+			"log_error": self.log_error.called,
+			"frappe.logger": self.logger.called,
+			"last_error": bool(last_errors),
+		}
+		return {sink for sink, was_used in used.items() if was_used}
+
 	def run_path(self, label, outcomes, markers):
+		for sink in (self.sendmail, self.log_error, self.logger):
+			sink.reset_mock()
 		frappe.db.delete(CREDENTIAL_DOCTYPE, {"parent": SETTING_DOCTYPE})
 		for index, marker in enumerate(markers, start=1):
 			add_credential(f"ERPAI-TEST-leak-{label}-{index}", api_key=marker, try_order=index)
@@ -892,9 +903,11 @@ class TestApiKeyLeak(FrappeTestCase):
 		)
 		return send, result, error, outputs
 
-	def assert_no_leak(self, label, outcomes, markers, expect_error=None):
+	def assert_no_leak(self, label, outcomes, markers, expect_error=None, expect_sinks=()):
 		send, result, error, outputs = self.run_path(label, outcomes, markers)
 		self.assertEqual(error.kind if error else None, expect_error)
+		# every sink this path writes to was really used, so its "no marker" check is not vacuous
+		self.assertEqual(self.used_sinks(), set(expect_sinks), label)
 		self.assertEqual(send.calls[0]["api_key"], markers[0])  # the marker really was sent to the SDK
 		for marker in markers:
 			self.assertEqual(self.stores_containing(marker, outputs), {}, label)
@@ -911,11 +924,20 @@ class TestApiKeyLeak(FrappeTestCase):
 			self.assert_no_leak("success", [ok_reply()], [key.format("success")])
 		with self.subTest("401 then next key succeeds"):
 			markers = [key.format("401-a"), key.format("401-b")]
-			self.assert_no_leak("401", [failing(401, markers[0]), ok_reply()], markers)
+			self.assert_no_leak(
+				"401",
+				[failing(401, markers[0]), ok_reply()],
+				markers,
+				expect_sinks={"sendmail", "log_error", "last_error"},
+			)
 		with self.subTest("unexpected exception"):
 			marker = key.format("unexpected")
 			self.assert_no_leak(
-				"unexpected", [RuntimeError(f"boom {marker}")], [marker], expect_error="unexpected"
+				"unexpected",
+				[RuntimeError(f"boom {marker}")],
+				[marker],
+				expect_error="unexpected",
+				expect_sinks={"frappe.logger"},
 			)
 		with self.subTest("all keys failed (529 alarm)"):
 			markers = [key.format("all-a"), key.format("all-b")]
@@ -924,4 +946,5 @@ class TestApiKeyLeak(FrappeTestCase):
 				[failing(529, markers[0]), failing(529, markers[1])],
 				markers,
 				expect_error="all_keys_failed",
+				expect_sinks={"sendmail", "log_error", "last_error"},
 			)

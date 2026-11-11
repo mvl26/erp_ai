@@ -340,6 +340,7 @@ class TestHumanCorrection(HandlerTestCase):
 	"""AC-11: a person's change to the classification is recorded on the latest `classify` log row."""
 
 	FIRST_CORRECTION_AT = "2026-01-01 08:00:00"
+	PAST = "2020-01-01 00:00:00"
 
 	def _classified_ticket(self, **log_fields):
 		ticket = self._ticket_without_job(priority="Low")
@@ -370,8 +371,8 @@ class TestHumanCorrection(HandlerTestCase):
 			entry_type="classify",
 			predicted_category="B",
 			run_id=f"{PREFIX}new",
-			creation="2099-01-01 00:00:00",
 		)
+		frappe.db.set_value(LOG_DOCTYPE, older_log, "creation", self.PAST, update_modified=False)
 
 		self._save_priority(ticket, "High")
 
@@ -413,6 +414,62 @@ class TestHumanCorrection(HandlerTestCase):
 		self.assertIsNone(self._log(log).human_corrected_to)
 		self.assertNotEqual(self._classified_by(ticket), "Người")
 
+	def test_latest_classify_row_wins_over_newer_reason_row(self):
+		ticket, classify_log = self._classified_ticket(run_id=f"{PREFIX}classify")
+		reason_log = make_log_entry(
+			ticket=ticket.name, entry_type="reason", turn=1, run_id=f"{PREFIX}classify"
+		)
+		frappe.db.set_value(LOG_DOCTYPE, classify_log, "creation", self.PAST, update_modified=False)
+
+		self._save_priority(ticket, "High")
+
+		self.assertEqual(json.loads(self._log(classify_log).human_corrected_to)["priority"], "High")
+		self.assertIsNone(self._log(reason_log).human_corrected_to)
+		self.assertEqual(self._classified_by(ticket), "Người")
+
+	def _save_as_helpdesk_agent(self, **changes):
+		"""A real form save by a user holding only the `Agent` role, no ignore_permissions."""
+		email = f"{PREFIX}agent@example.com"
+		frappe.get_doc(
+			{
+				"doctype": "User",
+				"email": email,
+				"first_name": f"{PREFIX}agent",
+				"send_welcome_email": 0,
+				"roles": [{"role": "Agent"}],
+			}
+		).insert(ignore_permissions=True)
+		ticket, log = self._classified_ticket()
+		frappe.set_user(email)
+		doc = frappe.get_doc("HD Ticket", ticket.name)
+		doc.update(changes)
+		doc.save()
+		frappe.set_user("Administrator")
+		return email, ticket, log
+
+	def test_helpdesk_agent_save_is_recorded(self):
+		email, ticket, log = self._save_as_helpdesk_agent(priority="High")
+
+		self.assertEqual(self._classified_by(ticket), "Người")
+		recorded = self._log(log)
+		self.assertEqual(json.loads(recorded.human_corrected_to)["priority"], "High")
+		self.assertEqual(recorded.human_corrected_by, email)
+
+	def test_save_by_user_without_permlevel_8_access_still_records_correction(self):
+		# Frappe resets permlevel 8 fields (ai_*) before the validate hook runs, so the hook's
+		# value must survive. Control: a permlevel 8 field this user typed is reset in the same save.
+		real = frappe.model.document.Document.get_permlevel_access
+
+		def without_level_8(doc, permission_type="write"):
+			return [level for level in real(doc, permission_type) if level != 8]
+
+		with patch("frappe.model.document.Document.get_permlevel_access", without_level_8):
+			email, ticket, log = self._save_as_helpdesk_agent(priority="High", ai_confidence="Cao")
+
+		self.assertFalse(frappe.db.get_value("HD Ticket", ticket.name, "ai_confidence"))
+		self.assertEqual(self._classified_by(ticket), "Người")
+		self.assertEqual(self._log(log).human_corrected_by, email)
+
 	def test_ticket_without_classify_log_saves_without_error(self):
 		ticket = self._ticket_without_job(priority="Low")
 		make_log_entry(ticket=ticket.name, entry_type="skip", run_id=f"{PREFIX}skip")
@@ -443,12 +500,22 @@ class TestHumanCorrection(HandlerTestCase):
 	def test_on_update_skips_insert(self):
 		ticket, log = self._classified_ticket()
 		ticket.reload()
-		ticket.flags.erp_ai_human_corrected = True
+		ticket.flags.erp_ai_human_corrected = log
 		ticket.flags.in_insert = True
 
 		handlers.ticket_on_update(ticket)
 
 		self.assertIsNone(self._log(log).human_corrected_to)
+
+	def test_validate_clears_a_stale_flag_on_an_early_return(self):
+		ticket, log = self._classified_ticket()
+		ticket.reload()
+		ticket.load_doc_before_save()
+		ticket.flags.erp_ai_human_corrected = log
+
+		handlers.ticket_validate(ticket)
+
+		self.assertFalse(ticket.flags.erp_ai_human_corrected)
 
 	def test_flag_is_consumed_so_a_plain_resave_changes_nothing(self):
 		ticket, log = self._classified_ticket()

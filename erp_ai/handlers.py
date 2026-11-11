@@ -60,6 +60,8 @@ def _latest_classify_log(ticket):
 
 
 def ticket_validate(doc, method=None):
+	# The flag carries the name of the classify log row to update; stale on a re-used doc object.
+	doc.flags.erp_ai_human_corrected = None
 	# Runs for every ticket save: leave before any DB read unless a classification field changed.
 	if doc.is_new() or not any(doc.has_value_changed(field) for field in CLASSIFICATION_FIELDS):
 		return
@@ -76,25 +78,22 @@ def ticket_validate(doc, method=None):
 		_log_decision(doc.name, TRIGGER_HUMAN_CORRECTION, "skipped", skip_reason)
 		return
 	doc.ai_classified_by = CLASSIFIED_BY_HUMAN
-	doc.flags.erp_ai_human_corrected = True
+	doc.flags.erp_ai_human_corrected = latest.name
 
 
 def ticket_on_update(doc, method=None):
-	if doc.flags.in_insert or not doc.flags.erp_ai_human_corrected:
+	log_name = doc.flags.erp_ai_human_corrected
+	if doc.flags.in_insert or not log_name:
 		return
-	doc.flags.erp_ai_human_corrected = False
+	doc.flags.erp_ai_human_corrected = None
 
-	latest = _latest_classify_log(doc.name)
-	if not latest:
-		_log_decision(doc.name, TRIGGER_HUMAN_CORRECTION, "skipped", "no_classify_log")
-		return
 	values = {
 		"human_corrected_to": json.dumps({field: doc.get(field) for field in CLASSIFICATION_FIELDS}),
 		"human_corrected_by": frappe.session.user,
 	}
-	if not latest.human_corrected_at:
+	if not frappe.db.get_value(LOG_DOCTYPE, log_name, "human_corrected_at"):
 		values["human_corrected_at"] = frappe.utils.now_datetime()
-	frappe.db.set_value(LOG_DOCTYPE, latest.name, values, update_modified=False)
+	frappe.db.set_value(LOG_DOCTYPE, log_name, values, update_modified=False)
 	_log_decision(doc.name, TRIGGER_HUMAN_CORRECTION, "recorded", "human_changed_classification")
 
 

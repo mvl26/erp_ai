@@ -38,8 +38,6 @@ GIT_ALLOWED_FLAGS = {
 	"--decorate",
 	"--abbrev-commit",
 	"--follow",
-	"--porcelain",
-	"--line-porcelain",
 	"-w",
 	"-n",
 	"--max-count",
@@ -224,7 +222,11 @@ def _git_blame_args_ok(root, repo, git_args):
 			files.append(arg)
 	if len(files) != 1 or not _git_path_ok(root, repo, files[0]):
 		return False
-	return os.path.isfile(resolve_safe_path(os.path.relpath(os.path.join(repo, files[0]), root)))
+	full = resolve_safe_path(os.path.relpath(os.path.join(repo, files[0]), root))
+	return full is not None and os.path.isfile(full)
+
+
+GIT_ARGS_CHECKERS = {"log": _git_log_args_ok, "blame": _git_blame_args_ok}
 
 
 def git_source(args, ctx):
@@ -246,8 +248,8 @@ def git_source(args, ctx):
 		repo = _git_repo(root, args.get("app"))
 		if repo is None:
 			return _refuse("Không tìm thấy kho git của app")
-		args_ok = _git_log_args_ok if sub == "log" else _git_blame_args_ok
-		if not args_ok(root, repo, git_args):
+		args_ok = GIT_ARGS_CHECKERS.get(sub)
+		if args_ok is None or not args_ok(root, repo, git_args):
 			return _refuse("Tham số git bị cấm hoặc đường dẫn không được phép")
 
 		extra = ["--no-ext-diff", "--no-textconv"] if sub in GIT_NO_EXT_SUBCOMMANDS else []

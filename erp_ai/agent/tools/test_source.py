@@ -300,7 +300,14 @@ class TestGitSource(FrappeTestCase):
 	def test_git_show_and_diff_refused(self):
 		with patch(RUN_PATH, return_value=completed("ok")) as run:
 			for sub in ("show", "diff"):
-				for args in (["HEAD"], ["--stat"], ["HEAD:src/a.py"], None):
+				for args in (
+					["HEAD"],
+					["--stat"],
+					["HEAD:src/a.py"],
+					["src/a.py"],
+					["--", "src/a.py"],
+					None,
+				):
 					result = self.git(sub, args)
 					self.assertFalse(result["ok"], (sub, args))
 					self.assertTrue(result["reason"])

@@ -5,6 +5,9 @@ import time
 
 import frappe
 
+from erp_ai.agent.tools.read import _schema
+from erp_ai.agent.tools.registry import ToolSpec
+
 logger = frappe.logger("erp_ai.source")
 
 DUOI_CHO_PHEP = {".py", ".js", ".vue", ".json", ".md", ".html", ".css", ".txt"}
@@ -274,3 +277,52 @@ def git_source(args, ctx):
 	except Exception:
 		logger.exception("git_source failed")
 		return _refuse("Không chạy được git")
+
+
+TOOLS: list[ToolSpec] = [
+	ToolSpec(
+		"search_source",
+		"read",
+		_schema(
+			"search_source",
+			"Tìm chuỗi cố định (không phân biệt hoa thường) trong mã nguồn các app.",
+			{
+				"pattern": {"type": "string", "minLength": PATTERN_MIN_CHARS, "maxLength": PATTERN_MAX_CHARS},
+				"app": {"type": "string", "minLength": 1},
+				"extension": {"type": "string", "enum": sorted(DUOI_CHO_PHEP)},
+			},
+			["pattern"],
+		),
+		search_source,
+	),
+	ToolSpec(
+		"read_source",
+		"read",
+		_schema(
+			"read_source",
+			"Đọc một đoạn file mã nguồn theo dòng.",
+			{
+				"path": {"type": "string", "minLength": 1},
+				"offset": {"type": "integer", "minimum": 1},
+				"limit": {"type": "integer", "minimum": 1, "maximum": READ_MAX_LINES},
+			},
+			["path"],
+		),
+		read_source,
+	),
+	ToolSpec(
+		"git_source",
+		"read",
+		_schema(
+			"git_source",
+			"Chạy git log hoặc git blame (chỉ đọc) trên kho git của một app.",
+			{
+				"app": {"type": "string", "minLength": 1},
+				"subcommand": {"type": "string", "enum": sorted(GIT_SUBCOMMANDS)},
+				"args": {"type": "array", "maxItems": GIT_MAX_ARGS, "items": {"type": "string"}},
+			},
+			["app", "subcommand"],
+		),
+		git_source,
+	),
+]

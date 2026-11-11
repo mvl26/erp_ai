@@ -10,12 +10,12 @@ Approved-by:
 Mỗi task 2–5 phút. Hai task chung file thì phụ thuộc nhau. Đánh dấu `BLOCKED: <lý do>` cuối dòng khi bị chặn.
 Đường dẫn trong `files:` tính từ gốc repo `apps/erp_ai/`. `test:` là file chạy bằng `cmd.test_one` (dạng chạy trong worktree: xem `plan.md` mục Ràng buộc chung). Task có `[migrate]` đụng DocType/hook cần `bench migrate` trước khi test → chạy tuần tự. Tên hằng, hàm, trường dùng đúng `plan.md` mục Ràng buộc chung và `design.md`; không đổi tên.
 
-Tiến độ: 0/40. BASE của từng task ghi vào dòng tiến độ ở đây trước khi gọi dev.
+Tiến độ: 1/40. Việc tiếp theo: T2..T7 (không chung file), rồi chuỗi migrate T8..T13. Lưu ý: T31 phải bỏ guard `frappe.db.exists("DocType", SETTING_DOCTYPE)` trong handlers.py (tạm thời từ T1). BASE của từng task ghi vào dòng tiến độ ở đây trước khi gọi dev.
 
 ## Walking skeleton (cỡ L)
 
-- [ ] T1 — Walking skeleton: phiếu mới → handler → hàng đợi → runner (cổng giả) — files: erp_ai/constants.py, erp_ai/hooks.py, erp_ai/handlers.py, erp_ai/agent/__init__.py, erp_ai/agent/queue.py, erp_ai/agent/runner.py, erp_ai/gateway/__init__.py, erp_ai/test_utils.py, erp_ai/test_handlers.py — test: erp_ai/test_handlers.py — depends: —
-  - progress: BASE=34e4c8f · dev call 1
+- [x] T1 — Walking skeleton: phiếu mới → handler → hàng đợi → runner (cổng giả) — files: erp_ai/constants.py, erp_ai/hooks.py, erp_ai/handlers.py, erp_ai/agent/__init__.py, erp_ai/agent/queue.py, erp_ai/agent/runner.py, erp_ai/gateway/__init__.py, erp_ai/test_utils.py, erp_ai/test_handlers.py — test: erp_ai/test_handlers.py — depends: —
+  - progress: BASE=34e4c8f · dev call 1 · review round 1 request-changes (STD-DESIGN-2 guard) · round 2 request-changes (STD-TEST-5) · round 3 approve (head 12e8c92) · merged into team/FEAT-001 · test_handlers 6 OK; `--app erp_ai` runs 0 tests (xem journal)
   - Ngoại lệ cỡ: 9 file vì skeleton chạy xuyên mọi tầng; mỗi file chỉ là bản tối thiểu, các task sau mở rộng theo bảng một-file-một-chủ trong plan.md.
   - Criterion: AC-5(a) phần đường chính, NFR-1, NFR-2 (đường đầu-cuối với lõi giả)
   - Receives: `frappe.db.get_single_value("ERP AI Setting", "enabled")` (test patch trả 1 vì DocType chưa có); HD Ticket tạo bởi `helpdesk.test_utils.make_ticket`

@@ -27,6 +27,7 @@ LOG_FIELDS = (
 	"actions",
 	"value_before",
 	"value_after",
+	"skipped_fields",
 	"predicted_category",
 	"predicted_confidence",
 	"predicted_ticket_type",
@@ -85,6 +86,22 @@ class TestERPAILog(FrappeTestCase):
 				self.assertEqual(field.fieldtype, "Float")
 				self.assertEqual(str(field.precision), "6")
 				self.assertIn("(USD)", field.label)
+
+	def test_skipped_fields_is_read_only_small_text(self):
+		meta = frappe.get_meta(LOG_DOCTYPE)
+		field = meta.get_field("skipped_fields")
+		self.assertIsNotNone(field, "skipped_fields is missing")
+		self.assertEqual(field.fieldtype, "Small Text")
+		self.assertEqual(field.read_only, 1)
+		self.assertEqual(field.permlevel or 0, 0)
+		order = [f.fieldname for f in meta.fields]
+		self.assertEqual(order.index("skipped_fields"), order.index("value_after") + 1)
+		# Read-only does not open a write path: the agent role still cannot update an existing row.
+		doc = _new_log(skipped_fields='[{"field": "ticket_type", "reason": "x"}]').insert(
+			ignore_permissions=True
+		)
+		frappe.set_user(AI_USER)
+		self.assertFalse(frappe.has_permission(LOG_DOCTYPE, "write", doc=doc))
 
 	def test_erp_ai_agent_account_can_create_and_read(self):
 		frappe.set_user(AI_USER)

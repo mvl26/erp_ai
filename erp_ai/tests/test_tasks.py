@@ -12,6 +12,7 @@ from erp_ai.constants import (
 	LOG_DOCTYPE,
 	ROLE_AGENT,
 	SETTING_DOCTYPE,
+	TITLE_ALARM,
 	TITLE_RUN_FAILED,
 	TRIGGER_TICKET_INSERT,
 )
@@ -173,9 +174,9 @@ class TestCheckPrivilegeEscalation(FrappeTestCase):
 		log_error = patch("frappe.log_error")
 		self.log_error = log_error.start()
 		self.addCleanup(log_error.stop)
-		send_alarm = patch("erp_ai.alerts.send_alarm")
-		self.send_alarm = send_alarm.start()
-		self.addCleanup(send_alarm.stop)
+		self.send_alarm_patch = patch("erp_ai.alerts.send_alarm")
+		self.send_alarm = self.send_alarm_patch.start()
+		self.addCleanup(self.send_alarm_patch.stop)
 		# Keys already on the site must not influence the key condition.
 		frappe.db.set_value(CREDENTIAL_DOCTYPE, {"parent": SETTING_DOCTYPE}, "enabled", 0)
 
@@ -289,6 +290,17 @@ class TestCheckPrivilegeEscalation(FrappeTestCase):
 		self.assertEqual(self.send_alarm.call_count, 1)
 		self.assertIn(AGENT_USER, self._alarm_messages()[0])
 
+	def test_alarm_when_agent_lost_a_required_role(self):
+		for role in (ROLE_AGENT, HELPDESK_AGENT_ROLE):
+			if not frappe.db.exists("Has Role", {"parent": AGENT_USER, "role": role}):
+				self._add_role(role)
+		frappe.db.delete("Has Role", {"parent": AGENT_USER, "role": ROLE_AGENT})
+
+		self._run()
+
+		self.assertEqual(self.send_alarm.call_count, 1)
+		self.assertIn(ROLE_AGENT, self._alarm_messages()[0])
+
 	def test_alarm_on_permission_records_modified_by_agent(self):
 		name = self._add_perm(AGENT_USER)
 
@@ -349,6 +361,18 @@ class TestCheckPrivilegeEscalation(FrappeTestCase):
 
 		self.assertNotIn("sk-", self._alarm_messages()[0])
 
+	def test_listed_keys_are_never_decrypted(self):
+		self._add_empty_key()
+		add_credential(f"ERPAI-TEST-{frappe.generate_hash(length=8)}", enabled=1)
+
+		with (
+			patch("frappe.utils.password.get_decrypted_password", side_effect=AssertionError("decrypt")),
+			patch("frappe.model.document.Document.get_password", side_effect=AssertionError("decrypt")),
+		):
+			self._run()
+
+		self.assertEqual(self.send_alarm.call_count, 1)
+
 	def test_one_alarm_per_condition(self):
 		self._add_role("System Manager")
 		self._add_perm(AGENT_USER)
@@ -394,3 +418,25 @@ class TestCheckPrivilegeEscalation(FrappeTestCase):
 			TITLE_RUN_FAILED, "check_privilege_escalation error=QueryTimeoutError"
 		)
 		self.send_alarm.assert_not_called()
+
+	def test_email_failure_keeps_alarm_logs_failure_and_continues(self):
+		self.send_alarm_patch.stop()
+		set_agent_settings(alert_recipients="erpai-test@example.invalid")
+		self._add_role("System Manager")
+		self._add_perm(AGENT_USER)
+		self._add_empty_key()
+
+		with (
+			patch("frappe.sendmail", side_effect=frappe.OutgoingEmailError("no account")) as sendmail,
+			patch.object(frappe.db, "rollback") as rollback,
+		):
+			tasks.check_privilege_escalation()
+
+		rollback.assert_not_called()
+		self.assertEqual(sendmail.call_count, 3)
+		titles = [call.args[0] for call in self.log_error.call_args_list]
+		self.assertEqual(titles.count(TITLE_ALARM), 3)
+		self.assertEqual(titles.count(TITLE_RUN_FAILED), 3)
+		self.log_error.assert_any_call(
+			TITLE_RUN_FAILED, "check_privilege_escalation email error=OutgoingEmailError"
+		)

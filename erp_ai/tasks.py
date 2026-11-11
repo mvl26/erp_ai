@@ -75,8 +75,10 @@ def _agent_role_drift() -> list[str]:
 	if not frappe.db.exists("User", AGENT_USER):
 		return [f"tài khoản {AGENT_USER} không tồn tại"]
 	roles = frappe.get_all("Has Role", filters={"parent": AGENT_USER, "parenttype": "User"}, pluck="role")
-	allowed = {ROLE_AGENT, HELPDESK_AGENT_ROLE, *AUTOMATIC_ROLES}
-	return sorted(set(roles) - allowed)
+	expected = {ROLE_AGENT, HELPDESK_AGENT_ROLE}
+	actual = set(roles) - set(AUTOMATIC_ROLES)
+	extra, missing = sorted(actual - expected), sorted(expected - actual)
+	return [f"thừa role {role}" for role in extra] + [f"thiếu role {role}" for role in missing]
 
 
 def _permission_records_by_agent() -> list[str]:
@@ -108,12 +110,23 @@ def _enabled_keys_without_value() -> list[str]:
 	return [row.label for row in rows if not row.api_key]
 
 
+def _raise_alarm(subject: str, names: list[str]) -> None:
+	"""Record and mail one alarm; an email failure is logged and must not stop later conditions."""
+	try:
+		alerts.send_alarm(subject, f"{subject}: {_list_names(names)}")
+	except Exception as exc:
+		# `send_alarm` writes the Error Log before mailing, so the alarm record is already kept.
+		frappe.log_error(TITLE_RUN_FAILED, f"check_privilege_escalation email error={type(exc).__name__}")
+
+
 def check_privilege_escalation() -> None:
 	"""Daily job (AC-18): one alarm per escalation condition that holds.
 
-	Conditions: the agent account holds a role outside {ERP AI Agent, Agent}; permission records
+	Conditions: the agent account's roles (minus automatic ones) differ from {ERP AI Agent, Agent}
+	(extra or missing, or the account is gone); permission records
 	modified by the agent; enabled Server Script/Webhook owned by the agent; an enabled key with an
-	empty `api_key`. Messages list at most 5 names and never any key text.
+	empty `api_key`. Messages list at most 5 names and never any key text. A failing alarm email is
+	logged under TITLE_RUN_FAILED and the alarm Error Log is kept; the remaining conditions still run.
 	On any error it rolls back, logs a constant title with an explicit message and returns (D-20).
 	"""
 	checks = (
@@ -126,7 +139,7 @@ def check_privilege_escalation() -> None:
 		for subject, find in checks:
 			names = find()
 			if names:
-				alerts.send_alarm(subject, f"{subject}: {_list_names(names)}")
+				_raise_alarm(subject, names)
 		if not frappe.flags.in_test:
 			frappe.db.commit()
 	except Exception as exc:

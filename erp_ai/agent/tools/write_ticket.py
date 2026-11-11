@@ -1,11 +1,13 @@
 import frappe
-from frappe.utils import now_datetime
+from frappe.utils import escape_html, now_datetime
 
 from erp_ai.agent.classification import Classification, resolve_ticket_values
 from erp_ai.agent.tools.registry import ToolContext, ToolSpec
 from erp_ai.constants import CATEGORIES, CLASSIFIED_BY_AI, CLASSIFIED_BY_HUMAN, CONFIDENCE_VALUES
 
 TICKET_DOCTYPE = "HD Ticket"
+TASK_DOCTYPE = "Task"
+HINT_FIELD = "ai_resolution_hint"
 # Target field -> DocType holding its allowed values (design 3.5).
 LINKED_DOCTYPES = {
 	"ticket_type": "HD Ticket Type",
@@ -55,6 +57,57 @@ def set_classification(args: dict, ctx: ToolContext) -> dict:
 	return {"ok": True, "before": before, "after": dict(values), "skipped": skipped}
 
 
+def set_resolution_hint(args: dict, ctx: ToolContext) -> dict:
+	doc = frappe.get_doc(TICKET_DOCTYPE, ctx.ticket_name)
+	if not doc.has_permission("write"):
+		return _fail("thiếu quyền ghi phiếu")
+	if not doc.has_permlevel_access_to(HINT_FIELD, permission_type="write"):
+		return _fail(f"thiếu quyền ghi trường {HINT_FIELD}")
+	before = doc.get(HINT_FIELD)
+	doc.set(HINT_FIELD, args["text"])
+	doc.save()
+	# Frappe sanitizes Text Editor values on save: report what was stored, not the raw input.
+	return {"ok": True, "before": before, "after": doc.get(HINT_FIELD)}
+
+
+def post_comment(args: dict, ctx: ToolContext) -> dict:
+	doc = frappe.get_doc(TICKET_DOCTYPE, ctx.ticket_name)
+	if not doc.has_permission("read"):
+		return _fail("thiếu quyền đọc phiếu")
+	if not frappe.has_permission("Comment", "create"):
+		return _fail("thiếu quyền tạo comment")
+	try:
+		name = doc.new_comment(args["content"])
+	except frappe.PermissionError:
+		return _fail("không được phép thêm comment vào phiếu")
+	return {"ok": True, "comment": name}
+
+
+def create_task(args: dict, ctx: ToolContext) -> dict:
+	if not ctx.instructor:
+		return _fail("không có người ra lệnh")
+	if not frappe.db.exists("DocType", TASK_DOCTYPE):
+		return _fail("hệ thống không có DocType Task")
+	doc = frappe.get_doc(TICKET_DOCTYPE, ctx.ticket_name)
+	if not doc.has_permission("read"):
+		return _fail("thiếu quyền đọc phiếu")
+	if not frappe.has_permission(TASK_DOCTYPE, "create"):
+		return _fail("thiếu quyền tạo Task")
+	# Task.description is a Text Editor (HTML) field: a clickable link paragraph first, then the escaped text.
+	path = f"/helpdesk/tickets/{doc.name}"
+	link = f'<p>Phiếu {escape_html(doc.name)}: <a href="{escape_html(path)}">{escape_html(path)}</a></p>'
+	text = escape_html(args["description"]).replace("\r\n", "\n").replace("\n", "<br>")
+	task = frappe.get_doc(
+		{
+			"doctype": TASK_DOCTYPE,
+			"subject": args["subject"],
+			"description": f"{link}\n<p>{text}</p>",
+		}
+	)
+	task.insert()
+	return {"ok": True, "task": task.name}
+
+
 TOOLS: list[ToolSpec] = [
 	ToolSpec(
 		name="set_classification",
@@ -75,5 +128,50 @@ TOOLS: list[ToolSpec] = [
 			},
 		},
 		handler=set_classification,
-	)
+	),
+	ToolSpec(
+		name="set_resolution_hint",
+		group="ticket_write",
+		schema={
+			"name": "set_resolution_hint",
+			"description": "Ghi hướng giải quyết gợi ý cho phiếu hiện tại.",
+			"input_schema": {
+				"type": "object",
+				"properties": {"text": {"type": "string", "minLength": 1, "maxLength": 5000}},
+				"required": ["text"],
+			},
+		},
+		handler=set_resolution_hint,
+	),
+	ToolSpec(
+		name="post_comment",
+		group="ticket_write",
+		schema={
+			"name": "post_comment",
+			"description": "Đăng một comment lên phiếu hiện tại.",
+			"input_schema": {
+				"type": "object",
+				"properties": {"content": {"type": "string", "minLength": 1, "maxLength": 5000}},
+				"required": ["content"],
+			},
+		},
+		handler=post_comment,
+	),
+	ToolSpec(
+		name="create_task",
+		group="task_write",
+		schema={
+			"name": "create_task",
+			"description": "Tạo một Task cho phiếu hiện tại; chỉ dùng khi có người ra lệnh.",
+			"input_schema": {
+				"type": "object",
+				"properties": {
+					"subject": {"type": "string", "minLength": 1, "maxLength": 140},
+					"description": {"type": "string", "minLength": 1, "maxLength": 5000},
+				},
+				"required": ["subject", "description"],
+			},
+		},
+		handler=create_task,
+	),
 ]

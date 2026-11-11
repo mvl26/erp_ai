@@ -208,6 +208,9 @@ class TestResolveTicketValues(FrappeTestCase):
 		values = classification.resolve_ticket_values(result, "[GẤP] việc", {})
 		self.assertEqual(values["priority"], "Urgent")
 
+	def test_parse_deeply_nested_json_returns_none(self):
+		self.assertIsNone(classification.parse_classification("[" * 100000))
+
 	def test_no_urgent_without_bracketed_tag(self):
 		result = self._result(dau_muc="A")
 		for subject in ("GẤP lỗi", "gấp", "[GẤP lỗi", "", None):
@@ -238,7 +241,10 @@ class TestPrompts(FrappeTestCase):
 			request["messages"],
 			[{"role": "user", "content": prompts.ticket_text("Lỗi", "<p>nội dung</p>")}],
 		)
-		self.assertIn("[GẤP]", prompts.CLASSIFY_PROMPT)
+		self.assertIn("[GẬP]", prompts.CLASSIFY_PROMPT)
+		self.assertNotIn("[GẤP]", prompts.CLASSIFY_PROMPT)
+		self.assertIn("[GẬP]", prompts.CONVENTIONS)
+		self.assertNotIn("[GẤP]", prompts.CONVENTIONS)
 		self.assertIn("dau_muc", prompts.CLASSIFY_PROMPT)
 
 	def test_build_reason_system(self):

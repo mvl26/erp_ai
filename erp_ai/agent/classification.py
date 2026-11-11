@@ -8,7 +8,7 @@ from erp_ai.constants import CATEGORIES, CLASSIFICATION_FIELDS, CONFIDENCE_VALUE
 
 PRIORITIES = ("Low", "Medium", "High", "Urgent")
 PRIORITY_URGENT = "Urgent"
-# The guide spells the tag "[GẬP]"; "[GẤP]" is the correct Vietnamese word. Accept both.
+# The guide spells the tag "[GẬP]"; "[GẤP]" is the standard spelling. Accept both.
 URGENT_TAGS = ("[GẤP]", "[GẬP]")
 
 # D-8: ticket_type = category name; agent_group and priority per guide 16.1-16.2.
@@ -45,7 +45,7 @@ def _load_json_object(text):
 		body = fenced.group(1).strip()
 	try:
 		data = json.loads(body)
-	except ValueError:
+	except (ValueError, RecursionError):
 		return None
 	return data if isinstance(data, dict) else None
 

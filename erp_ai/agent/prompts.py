@@ -10,7 +10,7 @@ MAX_COMMENTS = 30
 
 _CACHE = {"type": "ephemeral"}
 
-# Guide 16.4. The urgent tag is written "[GẤP]" here (the guide has the typo "[GẬP]").
+# Guide 16.4, verbatim (including the guide's spelling of the urgent tag).
 CLASSIFY_PROMPT = """Bạn phân loại phiếu Helpdesk nội bộ của Công ty TNHH Miyano
 Việt Nam — doanh nghiệp phân phối vật tư y tế và làm phần mềm quản lý y tế, chạy
 ERPNext tại erp.miyano.com.vn.
@@ -49,7 +49,7 @@ Phân biệt hai cặp dễ lẫn:
 Quy ước:
 - Tiêu đề có tiền tố trong ngoặc vuông thì đọc tiền tố trước: [HR] nghiêng về E,
   [Kế toán] nghiêng về E hoặc D, [tracecore] nghiêng về A hoặc C.
-- Tiêu đề có [GẤP] thì uu_tien = "Urgent", bất kể đầu mục.
+- Tiêu đề có [GẬP] thì uu_tien = "Urgent", bất kể đầu mục.
 - Phiếu chứa nhiều yêu cầu rời nhau thì đặt can_tach = true và nêu từng yêu cầu.
 
 Trả về DUY NHẤT một object JSON, không giải thích thêm:
@@ -146,7 +146,7 @@ ROUTING_TABLE = """BẢNG ROUTING
 # Guide 16.3.
 CONVENTIONS = """BỐN QUY ƯỚC BẮT BUỘC
 
-1. **Tiền tố tiêu đề đọc trước nội dung.** `[HR]`, `[Kế toán]`, `[tracecore]`, `[GẤP]`. `[GẤP]` luôn thành Urgent.
+1. **Tiền tố tiêu đề đọc trước nội dung.** `[HR]`, `[Kế toán]`, `[tracecore]`, `[GẬP]`. `[GẬP]` luôn thành Urgent.
 2. **`Nguồn phát sinh = Chỉ đạo BGĐ` thì không bao giờ tự đóng.** Luôn có người phụ trách là con người; agent chỉ làm trợ lý.
 3. **Phiếu đầu mục C, D phải có ít nhất 1 Task liên kết trong 3 ngày.**
 4. **Một phiếu một việc.** Phiếu gộp nhiều yêu cầu (#1764 "4 nội dung") thì agent đề xuất tách, người tạo xác nhận. Agent không tự tách."""

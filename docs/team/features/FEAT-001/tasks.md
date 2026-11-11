@@ -15,6 +15,7 @@ Tiến độ: 0/40. BASE của từng task ghi vào dòng tiến độ ở đây
 ## Walking skeleton (cỡ L)
 
 - [ ] T1 — Walking skeleton: phiếu mới → handler → hàng đợi → runner (cổng giả) — files: erp_ai/constants.py, erp_ai/hooks.py, erp_ai/handlers.py, erp_ai/agent/__init__.py, erp_ai/agent/queue.py, erp_ai/agent/runner.py, erp_ai/gateway/__init__.py, erp_ai/test_utils.py, erp_ai/test_handlers.py — test: erp_ai/test_handlers.py — depends: —
+  - progress: BASE=34e4c8f · dev call 1
   - Ngoại lệ cỡ: 9 file vì skeleton chạy xuyên mọi tầng; mỗi file chỉ là bản tối thiểu, các task sau mở rộng theo bảng một-file-một-chủ trong plan.md.
   - Criterion: AC-5(a) phần đường chính, NFR-1, NFR-2 (đường đầu-cuối với lõi giả)
   - Receives: `frappe.db.get_single_value("ERP AI Setting", "enabled")` (test patch trả 1 vì DocType chưa có); HD Ticket tạo bởi `helpdesk.test_utils.make_ticket`

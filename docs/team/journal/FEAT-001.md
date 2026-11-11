@@ -22,3 +22,7 @@ Approved-by:
 - 2026-11-11 quyết định (decide): dev chạy test trong worktree bằng `PYTHONPATH=<worktree>` + đường dẫn bench tuyệt đối (probe exit 0, erp_ai.__file__ trong worktree); base_branch = develop (repo không có main). Khác: build ngay trên checkout chính. Hoàn tác: đổi lại cmd.* trong profile. Người chạy script vì hook chặn sửa profile/config
 - 2026-11-11 lý do gọi tech-lead (plan): design READY, cần plan.md + tasks.md, task 1 là walking skeleton
 - 2026-11-11 plan → tech-lead | skill /team:plan (cỡ L) | 40 task, T1 walking skeleton; 65 touchpoint đều có task; task chạm migrate chạy tuần tự
+- 2026-11-11 base → team-leader | commit local 34e4c8f trên team/FEAT-001 (onboard + artifact FEAT-001) để worktree của dev thấy profile/docs; .github/* mới để lại chờ người | — | — | good | —
+- 2026-11-11 lý do gọi tech-lead (build): plan READY, G3 tắt; chạy vòng dev → reviewer cho 40 task, tuần tự với task [migrate]
+- 2026-11-11 build T1 → dev (2 lượt) | c03d70f skeleton (5 test OK) + cfb160b guard DoesNotExistError trên nhánh team/FEAT-001-task-1-r2 (6 test OK) | DONE_WITH_CONCERNS | 2 lượt | slow — fork /team:build kết thúc ngay sau khi gọi agent nền nên team-leader phải nối tay | chạy tech-lead như Agent riêng để tự chờ dev/reviewer
+- 2026-11-11 lý do gọi tech-lead (Agent): tiếp vòng build từ review T1 tới T40 trong một ngữ cảnh chờ được agent con

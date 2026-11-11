@@ -3,7 +3,7 @@ from unittest.mock import patch
 import frappe
 from frappe.model.document import Document
 from frappe.tests.utils import FrappeTestCase
-from frappe.utils import get_datetime
+from frappe.utils import now_datetime
 from helpdesk.test_utils import create_agent, make_ticket
 
 from erp_ai.agent.tools import registry, write_ticket
@@ -30,8 +30,21 @@ def _make_user(email, *roles):
 
 
 class TestWriteTicket(FrappeTestCase):
+	@classmethod
+	def tearDownClass(cls):
+		super().tearDownClass()
+		# Nothing may have been committed: the team and the ticket types must be gone after the rollback.
+		leftovers = [
+			(doctype, name)
+			for doctype, name in (("HD Team", TEAM), ("HD Ticket Type", TICKET_TYPE), ("User", AGENT))
+			if frappe.db.exists(doctype, name)
+		]
+		assert not leftovers, f"test data was committed: {leftovers}"
+
 	def setUp(self):
-		# FrappeTestCase rolls back only after the whole class: undo each test.
+		# FrappeTestCase rolls back only after the whole class: undo each test. Cleanups run LIFO:
+		# set_user, then rollback, then the stale Redis rule map (HD Team.after_insert caches an Assignment Rule).
+		self.addCleanup(frappe.cache.hdel, "assignment_rule_map", "HD Ticket")
 		self.addCleanup(frappe.db.rollback)
 		self.addCleanup(frappe.set_user, "Administrator")
 		frappe.set_user("Administrator")
@@ -42,14 +55,8 @@ class TestWriteTicket(FrappeTestCase):
 			frappe.get_doc({"doctype": "HD Ticket Type", "name": TICKET_TYPE}).insert()
 		if not frappe.db.exists("HD Team", TEAM):
 			frappe.get_doc({"doctype": "HD Team", "team_name": TEAM, "users": [{"user": AGENT}]}).insert()
-			self.addCleanup(self._drop_team)
 		self.ticket = make_ticket(subject="T25 phiếu", raised_by=CUSTOMER).name
 		self.mapping = {"A": {"ticket_type": TICKET_TYPE, "agent_group": TEAM, "priority": "High"}}
-
-	def _drop_team(self):
-		# HD Team.after_insert makes an Assignment Rule cached in Redis; rollback leaves the cache stale.
-		frappe.delete_doc("HD Team", TEAM, force=True)
-		frappe.cache.hdel("assignment_rule_map", "HD Ticket")
 
 	def _ctx(self, mapping=None):
 		return ToolContext(
@@ -71,12 +78,14 @@ class TestWriteTicket(FrappeTestCase):
 
 	def test_agent_writes_mapped_fields_and_ai_marks(self):
 		before = self._row()
+		started = now_datetime().replace(microsecond=0)
 		result = self._run(AGENT)
 		self.assertTrue(result["ok"], result)
 		row = self._row()
 		self.assertEqual((row.ticket_type, row.agent_group, row.priority), (TICKET_TYPE, TEAM, "High"))
 		self.assertEqual((row.ai_confidence, row.ai_classified_by), ("Cao", CLASSIFIED_BY_AI))
-		self.assertTrue(get_datetime(row.ai_updated_at))
+		self.assertIsNotNone(row.ai_updated_at)
+		self.assertGreaterEqual(row.ai_updated_at, started)
 		self.assertEqual(row.status, before.status)
 		self.assertEqual(result["skipped"], [])
 		self.assertEqual(result["before"]["ticket_type"], before.ticket_type)
@@ -93,7 +102,7 @@ class TestWriteTicket(FrappeTestCase):
 		self.assertEqual(self._row(), before)
 
 	def test_field_without_permlevel_access_returns_ok_false_unchanged(self):
-		# The ticket's customer may write permlevel 0 but has no access to the permlevel 8 AI fields.
+		# The ticket's customer may write permlevel 0 but not the higher-permlevel fields; the refusal comes at ticket_type.
 		frappe.set_user(CUSTOMER)
 		doc = frappe.get_doc("HD Ticket", self.ticket)
 		self.assertTrue(doc.has_permission("write"))
@@ -118,19 +127,22 @@ class TestWriteTicket(FrappeTestCase):
 		self.assertLessEqual(len(result["reason"]), 200)
 		self.assertEqual(self._row(), before)
 
-	def test_permlevel_denied_on_one_mapped_field_writes_nothing(self):
+	def test_permlevel_denied_on_one_written_field_writes_nothing(self):
 		real = Document.has_permlevel_access_to
+		for denied in ("priority", "ai_classified_by", "ai_updated_at"):
+			with self.subTest(denied=denied):
 
-		def deny_priority(doc, fieldname=None, df=None, permission_type="read"):
-			if fieldname == "priority":
-				return False
-			return real(doc, fieldname, df, permission_type)
+				def deny_one(doc, fieldname=None, df=None, permission_type="read", denied=denied):
+					if fieldname == denied:
+						return False
+					return real(doc, fieldname, df, permission_type)
 
-		before = self._row()
-		with patch.object(Document, "has_permlevel_access_to", deny_priority):
-			result = self._run(AGENT)
-		self.assertFalse(result["ok"])
-		self.assertEqual(self._row(), before)
+				before = self._row()
+				with patch.object(Document, "has_permlevel_access_to", deny_one):
+					result = self._run(AGENT)
+				self.assertFalse(result["ok"])
+				self.assertIn(denied, result["reason"])
+				self.assertEqual(self._row(), before)
 
 	def test_human_classified_ticket_is_not_overwritten(self):
 		frappe.db.set_value("HD Ticket", self.ticket, "ai_classified_by", CLASSIFIED_BY_HUMAN)
@@ -152,6 +164,12 @@ class TestWriteTicket(FrappeTestCase):
 		self.assertEqual(row.ticket_type, before.ticket_type)
 		self.assertEqual((row.agent_group, row.priority), (TEAM, "High"))
 		self.assertEqual(row.ai_classified_by, CLASSIFIED_BY_AI)
+
+	def test_mapping_with_none_value_skips_field_with_reason(self):
+		mapping = {"A": {"ticket_type": None, "agent_group": TEAM, "priority": "High"}}
+		result = self._run(AGENT, mapping)
+		self.assertTrue(result["ok"], result)
+		self.assertEqual(result["skipped"], [{"field": "ticket_type", "reason": "ánh xạ không có giá trị"}])
 
 	def test_category_without_mapped_values_writes_nothing(self):
 		before = self._row()

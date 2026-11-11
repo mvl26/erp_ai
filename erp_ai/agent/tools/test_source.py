@@ -260,6 +260,32 @@ class TestGitSource(FrappeTestCase):
 				self.assertTrue(self.git(sub, ["--stat", "-n", "3"])["ok"], sub)
 			self.assertEqual(run.call_count, 4)
 
+	def test_git_refuses_abbreviated_and_path_carrying_options(self):
+		with patch(RUN_PATH, return_value=completed("ok")) as run:
+			for flag in (
+				"--cont=../../outside/x",
+				"--conte=../../outside/x",
+				"--conten=x",
+				"--content=x",
+				"--ignore-revs-file=../../outside/x",
+				"--ignore-rev=x",
+				"-S../../outside/x",
+				"--out=/tmp/x",
+				"--no-ind",
+				"--ext",
+				"--text",
+			):
+				for sub in ("log", "show", "diff", "blame"):
+					self.assertFalse(self.git(sub, [flag, "--", "src/a.py"])["ok"], (sub, flag))
+			run.assert_not_called()
+			for flag in ("--oneline", "--stat", "-n3", "--max-count=5", "--author=bob", "-n"):
+				self.assertTrue(self.git("log", [flag])["ok"], flag)
+
+	def test_git_runs_with_closed_stdin(self):
+		with patch(RUN_PATH, return_value=completed("ok")) as run:
+			self.git("log")
+		self.assertEqual(run.call_args.kwargs["stdin"], subprocess.DEVNULL)
+
 	def test_git_paths_go_through_safe_path_check(self):
 		with patch(RUN_PATH, return_value=completed("ok")) as run:
 			for bad in (

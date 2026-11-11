@@ -25,17 +25,32 @@ SKIPPED_DIRS = {"node_modules"}
 
 GIT_SUBCOMMANDS = {"log", "show", "diff", "blame"}
 GIT_NO_EXT_SUBCOMMANDS = {"diff", "show", "log"}
-GIT_BANNED_FLAGS = (
-	"--output",
-	"--no-index",
-	"--ext-diff",
-	"--textconv",
-	"-O",
-	"--contents",
-	"--exec",
-	"--upload-pack",
-	"-c",
-)
+GIT_ALLOWED_FLAGS = {
+	"--oneline",
+	"--stat",
+	"--shortstat",
+	"--numstat",
+	"--name-only",
+	"--name-status",
+	"--no-merges",
+	"--merges",
+	"--graph",
+	"--decorate",
+	"--abbrev-commit",
+	"--follow",
+	"--patch",
+	"--porcelain",
+	"--line-porcelain",
+	"-p",
+	"-w",
+	"-n",
+	"--max-count",
+	"--since",
+	"--until",
+	"--author",
+	"--date",
+}
+GIT_COUNT_FLAG = re.compile(r"-n\d+")
 GIT_TIMEOUT_S = 30
 GIT_MAX_ARGS = 10
 GIT_OUTPUT_MAX_CHARS = 8000
@@ -174,7 +189,7 @@ def _git_path_ok(root, repo, path):
 
 
 def _git_args_ok(root, repo, git_args):
-	"""True when no arg is a banned flag and every path-like arg passes resolve_safe_path."""
+	"""True when every option is on the exact-name allowlist and every path-like arg passes resolve_safe_path."""
 	only_paths = False
 	for arg in git_args:
 		if only_paths:
@@ -183,7 +198,7 @@ def _git_args_ok(root, repo, git_args):
 		elif arg == "--":
 			only_paths = True
 		elif arg.startswith("-"):
-			if arg.startswith(GIT_BANNED_FLAGS):
+			if arg.split("=", 1)[0] not in GIT_ALLOWED_FLAGS and not GIT_COUNT_FLAG.fullmatch(arg):
 				return False
 		elif ":" in arg:
 			if not _git_path_ok(root, repo, arg.split(":", 1)[1]):
@@ -220,13 +235,14 @@ def git_source(args, ctx):
 		done = subprocess.run(
 			command,
 			capture_output=True,
+			stdin=subprocess.DEVNULL,
 			text=True,
 			timeout=GIT_TIMEOUT_S,
 			env={**os.environ, "GIT_PAGER": "cat"},
 		)
 		if done.returncode != 0:
 			logger.warning("git_source %s exit %s", sub, done.returncode)
-			return _refuse(f"git báo lỗi (mã {done.returncode}): {(done.stderr or '').strip()[:120]}")
+			return _refuse(f"git báo lỗi (mã {done.returncode})")
 		return {"ok": True, "output": (done.stdout or "")[:GIT_OUTPUT_MAX_CHARS]}
 	except FileNotFoundError:
 		return _refuse("chưa cài git trên máy chủ")

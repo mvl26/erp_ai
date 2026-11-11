@@ -10,7 +10,7 @@ Approved-by:
 Mỗi task 2–5 phút. Hai task chung file thì phụ thuộc nhau. Đánh dấu `BLOCKED: <lý do>` cuối dòng khi bị chặn.
 Đường dẫn trong `files:` tính từ gốc repo `apps/erp_ai/`. `test:` là file chạy bằng `cmd.test_one` (dạng chạy trong worktree: xem `plan.md` mục Ràng buộc chung). Task có `[migrate]` đụng DocType/hook cần `bench migrate` trước khi test → chạy tuần tự. Tên hằng, hàm, trường dùng đúng `plan.md` mục Ràng buộc chung và `design.md`; không đổi tên.
 
-Tiến độ: 8/41 (T1, T1b, T2..T7 xong; cmd.test sau merge T7: Ran 75 tests OK, pre-commit exit 0). Việc tiếp theo: T8 (DocType ERP AI Credential, [migrate]), rồi chuỗi migrate T8..T13 tuần tự (T14 song song được sau T9). Cần người xem: deferred của review-07 (design 5.4 vs allowlist git, git có thể lộ bí mật đã commit). Deferred: xem review-02..06 (limit=401 phải bị registry từ chối ở T23/T27; T9 đặt mặc định category_mapping = DEFAULT_CATEGORY_MAPPING; runner T28 gọi validate_mapping). Lưu ý: T31 phải bỏ guard `frappe.db.exists("DocType", SETTING_DOCTYPE)` trong handlers.py (tạm thời từ T1). BASE của từng task ghi vào dòng tiến độ ở đây trước khi gọi dev.
+Tiến độ: 9/42 (T1, T1b, T2..T7, T7b xong; cmd.test sau merge T7b: Ran 80 tests OK, pre-commit exit 0). Việc tiếp theo: T8 (DocType ERP AI Credential, [migrate]), rồi chuỗi migrate T8..T13 tuần tự (T14 song song được sau T9). Cần người xem: deferred của review-07 (design 5.4 vs allowlist git, git có thể lộ bí mật đã commit). Deferred: xem review-02..06 (limit=401 phải bị registry từ chối ở T23/T27; T9 đặt mặc định category_mapping = DEFAULT_CATEGORY_MAPPING; runner T28 gọi validate_mapping). Lưu ý: T31 phải bỏ guard `frappe.db.exists("DocType", SETTING_DOCTYPE)` trong handlers.py (tạm thời từ T1). BASE của từng task ghi vào dòng tiến độ ở đây trước khi gọi dev.
 
 ## Walking skeleton (cỡ L)
 
@@ -71,6 +71,12 @@ Tiến độ: 8/41 (T1, T1b, T2..T7 xong; cmd.test sau merge T7: Ran 75 tests OK
   - Receives: `get_source_root`, `resolve_safe_path` từ T6
   - Returns: `git_source(args: dict, ctx) -> dict`: danh sách lệnh, không `shell`, `timeout=30`, chỉ `log`/`show`/`diff`/`blame`, từ chối các cờ ở design 5.4, `FileNotFoundError` → `ok=false` "chưa cài git"
   - Expect: `cmd.test_one` erp_ai/agent/tools/test_source.py → test_git_only_read_subcommands_and_safe_flags, test_git_missing_returns_not_installed, test_git_runs_with_timeout_list_args_no_shell xanh
+
+- [x] T7b — Tool git: thu hẹp còn `log` và `blame` (D4) — files: erp_ai/agent/tools/source.py, erp_ai/agent/tools/test_source.py — test: erp_ai/agent/tools/test_source.py — depends: T7
+  - progress: BASE=9010e38 · dev call 1 (2b523ac) · review round 1 request-changes (major STD-TEST-2: test show/diff bị che bởi blame checker) · rework FIX_BASE=2b523ac · round 2 approve (head 34d1450) · merged a97adc1 · cmd.test Ran 80 tests OK, pre-commit exit 0
+  - Criterion: AC-13 (git), NFR-6; D4 (journal): `show`/`diff`/`log -p` in được nội dung file bí mật đã commit
+  - Returns: `git_source` chỉ còn `log` và `blame` (bỏ `show`, `diff`); `log` từ chối mọi cờ in patch kể cả viết tắt (-p, -u, --patch*, -U*, --full-diff, --word-diff*, --cc, -m, --diff-merges*); mọi pathspec/file arg phải qua `resolve_safe_path`/`TEN_CAM`, ký tự glob bị từ chối; `blame` nhận đúng một file, kiểm như `read_source`
+  - Expect: `cmd.test_one` erp_ai/agent/tools/test_source.py → test mới: `show HEAD`, `log -p`, `log --pat`, pathspec glob đều bị từ chối; test cũ về `show`/`diff` được sửa theo D4 (spec đổi, STD-TEST-5)
 
 ## Chuỗi migrate: DocType và cài đặt (tuần tự)
 
@@ -194,7 +200,7 @@ Tiến độ: 8/41 (T1, T1b, T2..T7 xong; cmd.test sau merge T7: Ran 75 tests OK
   - Returns: `set_resolution_hint(args, ctx) -> dict`, `post_comment(args, ctx) -> dict`, `create_task(args, ctx) -> dict` (dòng đầu `description` có tên và đường dẫn phiếu; không có người ra lệnh hoặc không có DocType `Task` → `ok=false`); `TOOLS` đủ 4 tool, nhóm `task_write` cho `create_task`
   - Expect: `cmd.test_one` erp_ai/agent/tools/test_write_ticket.py → test_create_task_requires_instructor và test hướng giải quyết/comment thiếu quyền → `ok=false` xanh
 
-- [ ] T27 — Registry: nối đủ 10 tool và kiểm ma trận bộ tool — files: erp_ai/agent/tools/registry.py, erp_ai/agent/tools/test_registry.py — test: erp_ai/agent/tools/test_registry.py — depends: T7, T24, T26
+- [ ] T27 — Registry: nối đủ 10 tool và kiểm ma trận bộ tool — files: erp_ai/agent/tools/registry.py, erp_ai/agent/tools/test_registry.py — test: erp_ai/agent/tools/test_registry.py — depends: T7b, T24, T26
   - Criterion: AC-8 (ma trận 4 mức × có/không thẩm quyền; không tool ghi nào nhận DocType/trường), NFR-6
   - Receives: `read.TOOLS`, `source.TOOLS` (T6, T7 bổ sung `TOOLS` cho 3 tool nguồn qua task này: dev thêm danh sách `TOOLS` vào `source.py`), `write_ticket.TOOLS`
   - Returns: `_all_specs()` thật; `source.TOOLS: list[ToolSpec]` (`search_source`, `read_source`, `git_source`)

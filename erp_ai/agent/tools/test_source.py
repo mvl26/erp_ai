@@ -1,6 +1,7 @@
 import os
 import re
 import shutil
+import subprocess
 import tempfile
 from unittest.mock import patch
 
@@ -194,3 +195,205 @@ class TestSourceTools(FrappeTestCase):
 			result = source.search_source({"pattern": "needle"}, None)
 		self.assertTrue(result["ok"])
 		self.assertEqual(result["hits"], [])
+
+
+RUN_PATH = "erp_ai.agent.tools.source.subprocess.run"
+
+
+def completed(stdout="", stderr="", returncode=0):
+	return subprocess.CompletedProcess(args=[], returncode=returncode, stdout=stdout, stderr=stderr)
+
+
+class TestGitSource(FrappeTestCase):
+	def setUp(self):
+		base = os.path.realpath(tempfile.mkdtemp())
+		self.addCleanup(shutil.rmtree, base, True)
+		self.root = os.path.join(base, "apps")
+		self.outside = os.path.join(base, "outside")
+		os.makedirs(os.path.join(self.root, "myapp", ".git"))
+		os.makedirs(os.path.join(self.root, "nogit"))
+		os.makedirs(os.path.join(self.outside, ".git"))
+		os.makedirs(os.path.join(self.root, "myapp", "src"))
+		with open(os.path.join(self.root, "myapp", "src", "a.py"), "w", encoding="utf-8") as handle:
+			handle.write("x = 1\n")
+		with open(os.path.join(self.root, "myapp", "site_config.json"), "w", encoding="utf-8") as handle:
+			handle.write("{}\n")
+		self.repo = os.path.join(self.root, "myapp")
+		patcher = patch(ROOT_PATH, return_value=self.root)
+		patcher.start()
+		self.addCleanup(patcher.stop)
+
+	def git(self, subcommand, args=None, app="myapp"):
+		payload = {"app": app, "subcommand": subcommand}
+		if args is not None:
+			payload["args"] = args
+		return source.git_source(payload, None)
+
+	def test_git_only_read_subcommands_and_safe_flags(self):
+		with patch(RUN_PATH, return_value=completed("ok")) as run:
+			for sub in ("commit", "push", "config", "checkout", "reset", "", None, "LOG", ["log"]):
+				self.assertFalse(self.git(sub)["ok"], sub)
+			for flag in (
+				"--output=/tmp/x",
+				"--output",
+				"--no-index",
+				"--ext-diff",
+				"--textconv",
+				"-Ofile",
+				"-O",
+				"--contents",
+				"--exec-path=/tmp",
+				"--exec",
+				"--upload-pack=x",
+				"-c",
+				"-ccore.pager=sh",
+			):
+				for sub in ("log", "show", "diff", "blame"):
+					result = self.git(sub, [flag])
+					self.assertFalse(result["ok"], (sub, flag))
+					self.assertTrue(result["reason"])
+			self.assertFalse(self.git("log", ["--oneline", "--output=/tmp/x"])["ok"])
+			self.assertFalse(self.git("log", ["-n", "1", "-c", "--", "src/a.py"])["ok"])
+			run.assert_not_called()
+
+			for sub in ("log", "show", "diff", "blame"):
+				self.assertTrue(self.git(sub, ["--stat", "-n", "3"])["ok"], sub)
+			self.assertEqual(run.call_count, 4)
+
+	def test_git_refuses_abbreviated_and_path_carrying_options(self):
+		with patch(RUN_PATH, return_value=completed("ok")) as run:
+			for flag in (
+				"--cont=../../outside/x",
+				"--conte=../../outside/x",
+				"--conten=x",
+				"--content=x",
+				"--ignore-revs-file=../../outside/x",
+				"--ignore-rev=x",
+				"-S../../outside/x",
+				"--out=/tmp/x",
+				"--no-ind",
+				"--ext",
+				"--text",
+				"-pS../../outside/x",
+				"-nS../../outside/x",
+				"-wO../../outside/x",
+				"-pw",
+			):
+				for sub in ("log", "show", "diff", "blame"):
+					self.assertFalse(self.git(sub, [flag, "--", "src/a.py"])["ok"], (sub, flag))
+			run.assert_not_called()
+			for flag in ("--oneline", "--stat", "-n3", "--max-count=5", "--author=bob", "-n"):
+				self.assertTrue(self.git("log", [flag])["ok"], flag)
+
+	def test_git_nonzero_exit_hides_stderr(self):
+		with patch(RUN_PATH, return_value=completed("", "fatal: secret-path-detail", 128)):
+			result = self.git("log")
+		self.assertFalse(result["ok"])
+		self.assertNotIn("secret-path-detail", result["reason"])
+
+	def test_git_runs_with_closed_stdin(self):
+		with patch(RUN_PATH, return_value=completed("ok")) as run:
+			self.git("log")
+		self.assertEqual(run.call_args.kwargs["stdin"], subprocess.DEVNULL)
+
+	def test_git_paths_go_through_safe_path_check(self):
+		with patch(RUN_PATH, return_value=completed("ok")) as run:
+			for bad in (
+				["--", "site_config.json"],
+				["site_config.json"],
+				["HEAD:site_config.json"],
+				["/etc/passwd"],
+				["--", "../../outside/x.py"],
+				["--", "src/../../../outside/x.py"],
+			):
+				result = self.git("log", bad)
+				self.assertFalse(result["ok"], bad)
+			run.assert_not_called()
+			self.assertTrue(self.git("log", ["--", "src/a.py"])["ok"])
+			self.assertTrue(self.git("show", ["HEAD:src/a.py"])["ok"])
+			self.assertTrue(self.git("log", ["HEAD~2..HEAD"])["ok"])
+
+	def test_git_refuses_bad_repo_and_args(self):
+		with patch(RUN_PATH, return_value=completed("ok")) as run:
+			for app in ("nogit", "missing", "../outside", "/etc", "", None, "myapp/src", "."):
+				self.assertFalse(self.git("log", app=app)["ok"], app)
+			self.assertFalse(self.git("log", ["a"] * 11)["ok"])
+			self.assertFalse(self.git("log", "--oneline")["ok"])
+			self.assertFalse(self.git("log", [1])["ok"])
+			self.assertFalse(source.git_source(None, None)["ok"])
+			run.assert_not_called()
+
+	def test_git_missing_returns_not_installed(self):
+		with patch(RUN_PATH, side_effect=FileNotFoundError("git")):
+			result = self.git("log")
+		self.assertEqual(result["ok"], False)
+		self.assertIn("chưa cài git", result["reason"])
+
+	def test_git_runs_with_timeout_list_args_no_shell(self):
+		with patch(RUN_PATH, return_value=completed("abc commit\n")) as run:
+			default = self.git("log")
+			diff = self.git("diff", ["--stat", "HEAD~1"])
+			blame = self.git("blame", ["--", "src/a.py"])
+		self.assertEqual(default, {"ok": True, "output": "abc commit\n"})
+		calls = run.call_args_list
+		self.assertEqual(
+			calls[0].args[0],
+			[
+				"git",
+				"--no-pager",
+				"-C",
+				self.repo,
+				"log",
+				"--no-ext-diff",
+				"--no-textconv",
+				"--oneline",
+				"-n",
+				"15",
+			],
+		)
+		self.assertEqual(
+			calls[1].args[0],
+			[
+				"git",
+				"--no-pager",
+				"-C",
+				self.repo,
+				"diff",
+				"--no-ext-diff",
+				"--no-textconv",
+				"--stat",
+				"HEAD~1",
+			],
+		)
+		self.assertEqual(calls[2].args[0], ["git", "--no-pager", "-C", self.repo, "blame", "--", "src/a.py"])
+		self.assertTrue(diff["ok"] and blame["ok"])
+		for call in calls:
+			self.assertIsInstance(call.args[0], list)
+			self.assertEqual(call.kwargs["timeout"], 30)
+			self.assertTrue(call.kwargs["capture_output"])
+			self.assertTrue(call.kwargs["text"])
+			self.assertFalse(call.kwargs.get("shell", False))
+			self.assertEqual(call.kwargs["env"]["GIT_PAGER"], "cat")
+
+	def test_git_timeout_nonzero_and_unexpected_errors_are_refusals(self):
+		with patch(RUN_PATH, side_effect=subprocess.TimeoutExpired(cmd="git", timeout=30)):
+			result = self.git("log")
+		self.assertFalse(result["ok"])
+		self.assertIn("quá thời gian", result["reason"])
+
+		with patch(RUN_PATH, return_value=completed("", "fatal: bad revision 'zzz'", 128)):
+			result = self.git("log", ["zzz"])
+		self.assertFalse(result["ok"])
+		self.assertIn("128", result["reason"])
+		self.assertLessEqual(len(result["reason"]), 200)
+
+		with patch(RUN_PATH, side_effect=OSError("boom")):
+			result = self.git("log")
+		self.assertFalse(result["ok"])
+		self.assertTrue(result["reason"])
+
+	def test_git_output_capped(self):
+		with patch(RUN_PATH, return_value=completed("x" * 9000)):
+			result = self.git("log")
+		self.assertTrue(result["ok"])
+		self.assertEqual(len(result["output"]), 8000)

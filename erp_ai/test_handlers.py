@@ -57,6 +57,21 @@ class TestTicketHandlers(FrappeTestCase):
 
 		self.assertEqual(_agent_calls(enqueue), [])
 
+	def test_ticket_insert_without_setting_doctype_enqueues_nothing(self):
+		def missing_doctype(doctype, fieldname=None, *args, **kwargs):
+			if doctype == SETTING_DOCTYPE:
+				raise frappe.DoesNotExistError(f"DocType {SETTING_DOCTYPE} not found")
+			return _real_get_single_value(doctype, fieldname, *args, **kwargs)
+
+		with (
+			patch.object(frappe.db, "get_single_value", side_effect=missing_doctype),
+			patch.object(frappe, "enqueue") as enqueue,
+		):
+			ticket = make_ticket(subject="erp_ai T1 setting doctype missing")
+
+		self.assertTrue(frappe.db.exists("HD Ticket", ticket.name))
+		self.assertEqual(_agent_calls(enqueue), [])
+
 	def test_saving_ticket_never_calls_the_model(self):
 		fake_gateway = FakeGateway()
 		with (

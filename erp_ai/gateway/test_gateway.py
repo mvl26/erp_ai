@@ -10,12 +10,14 @@ from frappe.tests.utils import FrappeTestCase
 from frappe.utils import add_to_date, get_datetime, get_system_timezone, now_datetime
 
 from erp_ai import gateway
+from erp_ai.agent.run_log import write_entry
 from erp_ai.constants import (
 	CREDENTIAL_DOCTYPE,
 	KEY_STATUS_ACTIVE,
 	KEY_STATUS_BAD_KEY,
 	KEY_STATUS_PAUSED,
 	KEY_STATUS_QUOTA_EXHAUSTED,
+	LOG_DOCTYPE,
 	SETTING_DOCTYPE,
 )
 from erp_ai.gateway import GatewayError, client, cost, credentials
@@ -816,3 +818,110 @@ class TestProbe(FrappeTestCase):
 		self.assertEqual([r["ok"] for r in results], [True, True])
 		self.assertEqual(log_error.call_count, 2)
 		self.assertIn("RuntimeError", log_error.call_args.args[1])
+
+
+class TestApiKeyLeak(FrappeTestCase):
+	"""AC-14 (key part), NFR-5: a fake key's marker never reaches any store, on success or on any failure path."""
+
+	TEXT_FIELD_TYPES = ("Data", "Small Text", "Text", "Long Text", "Code")
+
+	def setUp(self):
+		self.addCleanup(frappe.db.rollback)
+		self.enterContext(
+			patch.object(frappe.db, "commit", side_effect=AssertionError("test must not commit"))
+		)
+		frappe.db.delete(CREDENTIAL_DOCTYPE, {"parent": SETTING_DOCTYPE})
+		set_agent_settings(
+			max_keys_per_call=2,
+			model_classify_default="default-model",
+			alert_recipients="ops@example.com",
+			**PRICES,
+		)
+		self.sendmail = self.enterContext(patch.object(frappe, "sendmail"))
+		# an Error Log insert is not undone by rollback on this site: capture the calls instead of writing rows
+		self.log_error = self.enterContext(patch.object(frappe, "log_error"))
+
+	def stores_containing(self, marker, outputs):
+		like = f"%{marker}%"
+		found = {}
+		log_fields = [
+			df.fieldname
+			for df in frappe.get_meta(LOG_DOCTYPE).fields
+			if df.fieldtype in self.TEXT_FIELD_TYPES
+		]
+		stores = {
+			LOG_DOCTYPE: (LOG_DOCTYPE, [[LOG_DOCTYPE, f, "like", like] for f in log_fields]),
+			"HD Ticket Comment": ("HD Ticket Comment", [["HD Ticket Comment", "content", "like", like]]),
+			"Comment": ("Comment", [["Comment", "content", "like", like]]),
+			"Error Log": (
+				"Error Log",
+				[["Error Log", "error", "like", like], ["Error Log", "method", "like", like]],
+			),
+			"last_error": (CREDENTIAL_DOCTYPE, [[CREDENTIAL_DOCTYPE, "last_error", "like", like]]),
+		}
+		for store, (doctype, or_filters) in stores.items():
+			found[store] = len(frappe.get_all(doctype, or_filters=or_filters, pluck="name"))
+		found["sendmail"] = int(marker in repr(self.sendmail.call_args_list))
+		found["log_error calls"] = int(marker in repr(self.log_error.call_args_list))
+		found["gateway output"] = int(marker in outputs)
+		return {store: count for store, count in found.items() if count}
+
+	def run_path(self, label, outcomes, markers):
+		frappe.db.delete(CREDENTIAL_DOCTYPE, {"parent": SETTING_DOCTYPE})
+		for index, marker in enumerate(markers, start=1):
+			add_credential(f"ERPAI-TEST-leak-{label}-{index}", api_key=marker, try_order=index)
+		send = ScriptedSend(*outcomes)
+		with patch.object(client, "send", send):
+			try:
+				result = gateway.call_model("classify", **CALL)
+				error = None
+			except GatewayError as exc:
+				result, error = None, exc
+		outputs = repr(result) + repr(error) + str(error) + repr(getattr(error, "keys_tried", None))
+		if error is not None:
+			outputs += repr(error.__cause__) + repr(error.__context__)
+		# the runner (T28) logs what the gateway returns/raises: do the same so the log store is exercised
+		write_entry(
+			run_id=f"ERPAI-TEST-leak-{label}",
+			entry_type="classify",
+			trigger="ticket_insert",
+			credential_label=error.credential_label if error else result.credential_label,
+			keys_tried=error.keys_tried if error else result.keys_tried,
+			error=str(error) if error else None,
+			stop_reason=error.kind if error else result.stop_reason,
+		)
+		return send, result, error, outputs
+
+	def assert_no_leak(self, label, outcomes, markers, expect_error=None):
+		send, result, error, outputs = self.run_path(label, outcomes, markers)
+		self.assertEqual(error.kind if error else None, expect_error)
+		self.assertEqual(send.calls[0]["api_key"], markers[0])  # the marker really was sent to the SDK
+		for marker in markers:
+			self.assertEqual(self.stores_containing(marker, outputs), {}, label)
+
+	def test_api_key_never_leaks(self):
+		key = f"ERPAI-TEST-SECRET-KEY-{frappe.generate_hash(length=8)}-{{}}"  # unique per run
+		leaking_body = {"type": "error", "error": {"type": "authentication_error", "message": ""}}
+
+		def failing(status, marker):
+			body = {**leaking_body, "error": {**leaking_body["error"], "message": f"bad key {marker}"}}
+			return make_status_error(status, body=body, headers={"request-id": "req_err"})
+
+		with self.subTest("success"):
+			self.assert_no_leak("success", [ok_reply()], [key.format("success")])
+		with self.subTest("401 then next key succeeds"):
+			markers = [key.format("401-a"), key.format("401-b")]
+			self.assert_no_leak("401", [failing(401, markers[0]), ok_reply()], markers)
+		with self.subTest("unexpected exception"):
+			marker = key.format("unexpected")
+			self.assert_no_leak(
+				"unexpected", [RuntimeError(f"boom {marker}")], [marker], expect_error="unexpected"
+			)
+		with self.subTest("all keys failed (529 alarm)"):
+			markers = [key.format("all-a"), key.format("all-b")]
+			self.assert_no_leak(
+				"all",
+				[failing(529, markers[0]), failing(529, markers[1])],
+				markers,
+				expect_error="all_keys_failed",
+			)

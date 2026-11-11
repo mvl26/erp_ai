@@ -1,5 +1,6 @@
 import frappe
 
+from erp_ai.agent.run_log import write_entry
 from erp_ai.constants import SETTING_DOCTYPE
 from erp_ai.gateway import GatewayError, ModelResult
 
@@ -109,3 +110,10 @@ class FakeAnthropicClient:
 
 def fake_anthropic_client(**kwargs) -> FakeAnthropicClient:
 	return FakeAnthropicClient(**kwargs)
+
+
+def make_log_entry(**fields) -> str:
+	"""Write an ERP AI Log row through `run_log.write_entry` (current session user must be allowed) and return its name."""
+	values = {"run_id": "ERPAI-TEST-run", "entry_type": "skip", "turn": 0}
+	values.update(fields)
+	return write_entry(**values)

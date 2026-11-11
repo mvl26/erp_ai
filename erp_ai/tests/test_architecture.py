@@ -14,6 +14,7 @@ synthetic violating code (must be caught) and clean code (must not be flagged).
 import ast
 import re
 import shlex
+import sys
 import unittest
 from pathlib import Path
 
@@ -35,13 +36,20 @@ TOOLS_PREFIX = "agent/tools/"
 LAYER_RULES = (
 	(
 		"erp_ai.gateway",
-		("erp_ai.agent", "erp_ai.eval", "erp_ai.handlers", "erp_ai.tasks", "erp_ai.install"),
-		"ADR-001: gateway must not import agent, eval, handlers, scheduler or install code",
+		(
+			"erp_ai.agent",
+			"erp_ai.eval",
+			"erp_ai.handlers",
+			"erp_ai.tasks",
+			"erp_ai.install",
+			"erp_ai.erp_ai_agent",
+		),
+		"ADR-001: gateway must not import agent, eval, handlers, scheduler, install or doctype controllers",
 	),
 	(
 		"erp_ai.agent",
-		("erp_ai.eval", "erp_ai.handlers", "erp_ai.tasks", "erp_ai.install"),
-		"ADR-001: agent core must not import eval, handlers, scheduler or install code",
+		("erp_ai.eval", "erp_ai.handlers", "erp_ai.tasks", "erp_ai.install", "erp_ai.erp_ai_agent"),
+		"ADR-001: agent core must not import eval, handlers, scheduler, install or doctype controllers",
 	),
 	(
 		"erp_ai.agent.tools",
@@ -72,6 +80,11 @@ DOC_GETTERS = ("get_doc", "get_single", "get_cached_doc", "new_doc")
 TOOL_FORBIDDEN_CALL_SUFFIXES = ("db.set_value", "set_user", "db.multisql")
 SQL_READ_ONLY = re.compile(r"^\s*(select|show|describe)\b", re.IGNORECASE)
 
+# ADR-001: product code imports only the standard library, frappe, helpdesk and itself; `anthropic` (declared
+# in pyproject.toml `dependencies`) only in gateway/client.py (NFR-5). Anything else, any other app, is a violation.
+ALLOWED_TOP_LEVEL_MODULES = frozenset({PACKAGE, "frappe", "helpdesk", *sys.stdlib_module_names})
+ANTHROPIC_MODULE = "anthropic"
+
 POLICY_FIELDS = ("permission_level", "excluded_teams", "ai_opt_out")
 
 SECRET_READERS = ("get_decrypted_password", "get_password")
@@ -85,7 +98,8 @@ LEGACY_NAMES = ("HD Ticket Comment", "commented_by", "comment_email", "comment_b
 LEGACY_ALLOWED_ASSIGNMENTS = {READ_TOOL_FILE: "COMMENT_HIDDEN_FIELDS"}
 
 SUBPROCESS_RUN_FUNCTIONS = ("run", "call", "check_call", "check_output")
-OS_SHELL_FUNCTIONS = ("system", "popen", "execv", "execve", "execl", "execlp", "execvp", "spawnl", "spawnv")
+OS_SHELL_FUNCTIONS = ("system", "popen", "posix_spawn", "posix_spawnp")
+OS_SHELL_PREFIXES = ("exec", "spawn")  # os.execv*, os.execl*, os.spawnv*, os.spawnl*
 
 CI_BENCH_BRANCH = "version-15"
 CI_REQUIRED_APPS = (
@@ -170,6 +184,28 @@ def dotted_name(node):
 	return None
 
 
+def import_aliases(tree: ast.AST) -> dict:
+	"""`{local name: real dotted name}` for imports: `import subprocess as sp` -> {"sp": "subprocess"};
+	`from subprocess import run as r` -> {"r": "subprocess.run"}."""
+	aliases = {}
+	for node in ast.walk(tree):
+		if isinstance(node, ast.Import):
+			for alias in node.names:
+				if alias.asname:
+					aliases[alias.asname] = alias.name
+		elif isinstance(node, ast.ImportFrom) and node.module and not node.level:
+			for alias in node.names:
+				aliases[alias.asname or alias.name] = f"{node.module}.{alias.name}"
+	return aliases
+
+
+def resolved_name(node, aliases: dict) -> str:
+	"""dotted_name with its first segment replaced by the real module it was imported as."""
+	name = dotted_name(node) or ""
+	head, dot, rest = name.partition(".")
+	return aliases[head] + dot + rest if head in aliases else name
+
+
 def referenced_name(node):
 	"""The bare name of a Name/Attribute node (`frappe.enqueue` -> "enqueue"), else None."""
 	if isinstance(node, ast.Name):
@@ -213,15 +249,18 @@ def check_layer_imports(sources: dict, rules=LAYER_RULES) -> list:
 
 
 def check_import_boundaries(sources: dict) -> list:
-	"""NFR-5/ADR-002: only gateway/client.py imports `anthropic`; ADR-001: no `workflowcore`."""
+	"""ADR-001 allowlist: stdlib, frappe, helpdesk, erp_ai; NFR-5/ADR-002: `anthropic` only in gateway/client.py."""
 	violations = []
 	for rel, source in only_python(sources).items():
 		imports = imported_modules(parse(rel, source), module_name(rel), rel.endswith("__init__.py"))
 		for lineno, target in imports:
-			if module_in(target, "anthropic") and rel != CLIENT_FILE:
-				violations.append(f"{rel}:{lineno}: imports {target} outside {CLIENT_FILE} (NFR-5)")
-			if module_in(target, "workflowcore"):
-				violations.append(f"{rel}:{lineno}: imports {target} (ADR-001: no other app)")
+			if module_in(target, ANTHROPIC_MODULE):
+				if rel != CLIENT_FILE:
+					violations.append(f"{rel}:{lineno}: imports {target} outside {CLIENT_FILE} (NFR-5)")
+			elif target.split(".")[0] not in ALLOWED_TOP_LEVEL_MODULES:
+				violations.append(
+					f"{rel}:{lineno}: imports {target}, not stdlib/frappe/helpdesk/erp_ai (ADR-001: no other app or library)"
+				)
 	return violations
 
 
@@ -267,15 +306,26 @@ def check_enqueue_call_shape(sources: dict) -> list:
 
 
 def _is_config_doc_expr(node, config_vars: set) -> bool:
-	"""True for `frappe.get_doc("ERP AI Setting")`, `frappe.get_single(SETTING_DOCTYPE)`, or a tracked name."""
+	"""True for `frappe.get_doc("ERP AI Setting")`, `get_doc({"doctype": ...})`, `get_doc(doctype=...)`,
+	`frappe.get_single(SETTING_DOCTYPE)` / `constants.SETTING_DOCTYPE`, or a tracked name."""
 	if isinstance(node, ast.Name):
 		return node.id in config_vars
 	if isinstance(node, ast.Call) and referenced_name(node.func) in DOC_GETTERS:
 		first = node.args[0] if node.args else None
+		if isinstance(first, ast.Dict):  # get_doc({"doctype": ...})
+			first = next(
+				(
+					value
+					for key, value in zip(first.keys, first.values, strict=True)
+					if isinstance(key, ast.Constant) and key.value == "doctype"
+				),
+				None,
+			)
+		elif first is None:  # get_doc(doctype=...)
+			first = next((keyword.value for keyword in node.keywords if keyword.arg == "doctype"), None)
 		if isinstance(first, ast.Constant):
 			return first.value in CONFIG_DOCTYPES
-		if isinstance(first, ast.Name):
-			return first.id in CONFIG_DOCTYPE_CONSTANTS
+		return referenced_name(first) in CONFIG_DOCTYPE_CONSTANTS
 	return False
 
 
@@ -327,6 +377,7 @@ def check_tools_never_bypass_permissions(sources: dict) -> list:
 					isinstance(first, ast.Constant)
 					and isinstance(first.value, str)
 					and SQL_READ_ONLY.match(first.value)
+					and ";" not in first.value.strip().removesuffix(";")
 				)
 				if not read_only:
 					violations.append(violation(rel, node, "db.sql that is not a constant SELECT in a tool"))
@@ -342,14 +393,18 @@ def check_subprocess_only_in_source_tool(sources: dict) -> list:
 	for rel, source in only_python(sources).items():
 		if rel == SOURCE_TOOL_FILE:
 			continue
-		for lineno, target in imported_modules(parse(rel, source), module_name(rel), False):
+		tree = parse(rel, source)
+		aliases = import_aliases(tree)
+		for lineno, target in imported_modules(tree, module_name(rel), False):
 			if module_in(target, "subprocess"):
 				violations.append(f"{rel}:{lineno}: imports {target} outside {SOURCE_TOOL_FILE}")
-		for node in ast.walk(parse(rel, source)):
+		for node in ast.walk(tree):
 			if isinstance(node, ast.Call):
-				name = dotted_name(node.func) or ""
+				name = resolved_name(node.func, aliases)
+				function = name.split(".")[-1]
 				if name.startswith("subprocess.") or (
-					name.startswith("os.") and name.split(".")[-1] in OS_SHELL_FUNCTIONS
+					name.startswith("os.")
+					and (function in OS_SHELL_FUNCTIONS or function.startswith(OS_SHELL_PREFIXES))
 				):
 					violations.append(violation(rel, node, f"{name} outside {SOURCE_TOOL_FILE}"))
 	return violations
@@ -361,10 +416,12 @@ def check_subprocess_call_shape(sources: dict) -> list:
 	if source is None:
 		return [f"{SOURCE_TOOL_FILE}: file missing"]
 	violations = []
-	for node in ast.walk(parse(SOURCE_TOOL_FILE, source)):
+	tree = parse(SOURCE_TOOL_FILE, source)
+	aliases = import_aliases(tree)
+	for node in ast.walk(tree):
 		if not isinstance(node, ast.Call):
 			continue
-		name = dotted_name(node.func) or ""
+		name = resolved_name(node.func, aliases)
 		if not name.startswith("subprocess.") or name.split(".")[-1] not in (
 			*SUBPROCESS_RUN_FUNCTIONS,
 			"Popen",
@@ -416,6 +473,16 @@ def _identifiers(node) -> set:
 	return found
 
 
+def _has_explicit_message(call: ast.Call) -> bool:
+	"""`log_error(title, message)` or `log_error(title, message=...)`; a missing, None or empty message is not."""
+	message = call.args[1] if len(call.args) >= 2 else None
+	if message is None:
+		message = next((keyword.value for keyword in call.keywords if keyword.arg == "message"), None)
+	if message is None:
+		return False
+	return not (isinstance(message, ast.Constant) and not message.value)
+
+
 def check_secret_handling(sources: dict) -> list:
 	"""NFR-5/ADR-002: password reads only in gateway/credentials.py; no key in logs; no local-var tracebacks."""
 	violations = []
@@ -436,6 +503,14 @@ def check_secret_handling(sources: dict) -> list:
 			):
 				violations.append(
 					violation(rel, node, "get_traceback(with_context=...) leaks local variables")
+				)
+			if call_name.split(".")[-1] == "log_error" and not _has_explicit_message(node):
+				violations.append(
+					violation(
+						rel,
+						node,
+						"log_error without an explicit message (frappe then logs get_traceback(with_context=True))",
+					)
 				)
 			is_sink = call_name in LOG_SINK_CALLS or call_name.split(".")[-1] in LOG_SINK_METHODS
 			if is_sink:
@@ -655,6 +730,8 @@ class TestScannersCatchViolations(unittest.TestCase):
 			"agent/tools/registry.py": "from erp_ai.agent.runner import run_for_ticket\n",
 			"agent/tools/write_ticket.py": "from erp_ai.agent import runner\n",
 			"handlers.py": "from erp_ai.gateway import call_model\n",
+			"gateway/breaker.py": "from erp_ai.erp_ai_agent.doctype.erp_ai_setting import erp_ai_setting\n",
+			"agent/authority.py": "from erp_ai.erp_ai_agent import doctype\n",
 		}
 		for rel, source in cases.items():
 			with self.subTest(rel=rel):
@@ -688,6 +765,27 @@ class TestScannersCatchViolations(unittest.TestCase):
 			check_import_boundaries({"agent/runner.py": "import workflowcore.x\n"}), "workflowcore"
 		)
 		self.assertEqual(check_import_boundaries({CLIENT_FILE: "import anthropic\n"}), [])
+
+	def test_import_boundaries_allowlist_catches_any_other_top_level_module(self):
+		cases = {
+			"erpnext": "import erpnext\n",
+			"telephony": "from telephony.x import y\n",
+			"hrms": "import hrms\n",
+			"requests": "import requests.adapters\n",
+			"erpnext.stock": "def f():\n\tfrom erpnext import stock\n",
+		}
+		for fragment, source in cases.items():
+			with self.subTest(fragment=fragment):
+				self.assertCaught(check_import_boundaries({"agent/runner.py": source}), fragment)
+
+	def test_import_boundaries_allowlist_accepts_stdlib_frappe_helpdesk_and_relative(self):
+		clean = (
+			"from __future__ import annotations\n"
+			"import json\nimport os.path\nfrom datetime import datetime\n"
+			"import frappe\nfrom frappe.utils import now\nfrom helpdesk.helpdesk.doctype import hd_ticket\n"
+			"from erp_ai import alerts\nfrom . import policy\nfrom .prompts import build\n"
+		)
+		self.assertEqual(check_import_boundaries({"agent/runner.py": clean}), [])
 
 	# enqueue -----------------------------------------------------------------------------------
 
@@ -730,6 +828,10 @@ class TestScannersCatchViolations(unittest.TestCase):
 			"import frappe\nfrappe.get_single('ERP AI Setting').save()\n",
 			"import frappe\nfrom erp_ai.constants import SETTING_DOCTYPE\nd = frappe.get_cached_doc(SETTING_DOCTYPE)\nd.save()\n",
 			"import frappe\nc = frappe.new_doc('ERP AI Credential')\nc.save(ignore_permissions=True)\n",
+			"import frappe\nfrom erp_ai import constants\nd = frappe.get_doc(constants.SETTING_DOCTYPE)\nd.save()\n",
+			"import frappe\nd = frappe.get_doc({'doctype': 'ERP AI Credential', 'label': 'x'})\nd.save()\n",
+			"import frappe\nd = frappe.get_doc(doctype='ERP AI Credential')\nd.save()\n",
+			"import frappe\nfrappe.get_doc({'doctype': CREDENTIAL_DOCTYPE}).save()\n",
 			"def f(settings):\n\tsettings.save()\n",
 		)
 		for source in cases:
@@ -756,6 +858,7 @@ class TestScannersCatchViolations(unittest.TestCase):
 			"import frappe\nfrappe.db.set_value('HD Ticket', 'T', 'status', 'Open')\n",
 			"import frappe\nfrappe.db.sql('UPDATE `tabHD Ticket` SET status = 1')\n",
 			"import frappe\nfrappe.db.sql(query)\n",
+			"import frappe\nfrappe.db.sql('SELECT 1; UPDATE `tabHD Ticket` SET status = 1')\n",
 			"import frappe\nfrappe.set_user('Administrator')\n",
 			"import frappe\nfrappe.get_all('HD Ticket', fields=['name'])\n",
 			"import frappe\nfrappe.db.get_all('HD Ticket')\n",
@@ -794,6 +897,32 @@ class TestScannersCatchViolations(unittest.TestCase):
 			),
 			[],
 		)
+
+	def test_subprocess_catches_aliased_imports_and_more_os_exec_names(self):
+		for source in (
+			"import subprocess as sp\nsp.run(['ls'])\n",
+			"from subprocess import run as r\nr(['ls'])\n",
+			"import os\nos.posix_spawn('a', ['a'], {})\n",
+			"import os\nos.execvpe('a', ['a'], {})\n",
+			"import os\nos.spawnlp(os.P_WAIT, 'a', 'a')\n",
+			"from os import system\nsystem('ls')\n",
+			"import os as o\no.system('ls')\n",
+		):
+			with self.subTest(source=source):
+				self.assertCaught(
+					check_subprocess_only_in_source_tool({"agent/runner.py": source}), "outside"
+				)
+
+	def test_subprocess_call_shape_checks_aliased_calls(self):
+		for source in (
+			"import subprocess as sp\nsp.run(['git'])\n",
+			"from subprocess import run\nrun(['git'])\n",
+			"from subprocess import check_output as co\nco('git log', timeout=3)\n",
+		):
+			with self.subTest(source=source):
+				self.assertCaught(check_subprocess_call_shape({SOURCE_TOOL_FILE: source}))
+		good = "from subprocess import run\nrun(['git'], timeout=3)\n"
+		self.assertEqual(check_subprocess_call_shape({SOURCE_TOOL_FILE: good}), [])
 
 	def test_subprocess_call_shape_requires_timeout_list_and_no_shell(self):
 		good = "import subprocess\nsubprocess.run(['git', 'log'], timeout=30, capture_output=True)\n"
@@ -855,6 +984,29 @@ class TestScannersCatchViolations(unittest.TestCase):
 		for fragment, source in cases.items():
 			with self.subTest(fragment=fragment):
 				self.assertCaught(check_secret_handling({"gateway/__init__.py": source}), fragment)
+
+	def test_secret_handling_catches_log_error_without_explicit_message(self):
+		cases = (
+			"import frappe\nfrappe.log_error(TITLE)\n",
+			"import frappe\nfrappe.log_error(title=T)\n",
+			"import frappe\nfrappe.log_error()\n",
+			"from frappe import log_error\nlog_error(TITLE)\n",
+			"import frappe\nfrappe.log_error(TITLE, '')\n",
+			"import frappe\nfrappe.log_error(TITLE, message=None)\n",
+		)
+		for source in cases:
+			with self.subTest(source=source):
+				self.assertCaught(check_secret_handling({"tasks.py": source}), "log_error")
+
+	def test_secret_handling_allows_log_error_with_explicit_message(self):
+		safe = (
+			"import frappe\n"
+			"frappe.log_error(TITLE, 'msg')\n"
+			"frappe.log_error(TITLE, f'error={type(exc).__name__}')\n"
+			"frappe.log_error(title=T, message='m')\n"
+			"frappe.log_error(TITLE, message=text)\n"
+		)
+		self.assertEqual(check_secret_handling({"tasks.py": safe}), [])
 
 	def test_secret_handling_allows_credentials_module_and_label_logging(self):
 		reader = "from frappe.utils.password import get_decrypted_password\nget_decrypted_password('a', 'b', 'api_key')\n"

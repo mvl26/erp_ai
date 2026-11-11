@@ -64,9 +64,10 @@
   },
   {
    "fieldname": "monthly_budget_usd",
-   "fieldtype": "Currency",
+   "fieldtype": "Float",
    "label": "Ngân sách tháng (USD)",
-   "default": "10"
+   "default": "10",
+   "precision": "6"
   },
   {
    "fieldname": "spent_this_month_usd",

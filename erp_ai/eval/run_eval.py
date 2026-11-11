@@ -1,6 +1,13 @@
+import json
 from collections import Counter
 
-from erp_ai.constants import CATEGORIES
+import frappe
+
+from erp_ai import gateway
+from erp_ai.agent.classification import DEFAULT_CATEGORY_MAPPING, load_mapping, parse_classification
+from erp_ai.agent.prompts import build_classify_request
+from erp_ai.agent.runner import CLASSIFY_MAX_TOKENS
+from erp_ai.constants import CATEGORIES, SETTING_DOCTYPE
 
 VERDICT_HIGH = "≥ 85%"
 VERDICT_MID = "70\u201385%"
@@ -116,3 +123,38 @@ def format_report(metrics):
 		f"Verdict: {metrics['verdict']}",
 	]
 	return "\n".join(lines)
+
+
+def _predict(row):
+	"""Category the runner's classify step would give this ticket; None when it cannot classify."""
+	try:
+		result = gateway.call_model(
+			"classify",
+			**build_classify_request(row.get("subject"), row.get("description")),
+			max_tokens=CLASSIFY_MAX_TOKENS,
+		)
+	except gateway.GatewayError as exc:
+		frappe.logger("erp_ai").warning(
+			f"eval: classify failed subject={row.get('subject')!r} kind={exc.kind} status={exc.status}"
+		)
+		return None
+	classification = parse_classification(result.text)
+	return classification.category if classification else None
+
+
+def run(path):
+	"""Classify a labeled JSONL with the runner's own prompt and print the accuracy report (design 3.7).
+
+	Rows that already carry `predicted_category` are not sent. Nothing is written: no ERP AI Log, no ticket.
+	"""
+	with open(path, encoding="utf-8") as handle:
+		rows = [json.loads(line) for line in handle if line.strip()]
+	for row in rows:
+		if not row.get("predicted_category"):
+			row["predicted_category"] = _predict(row)
+	mapping = load_mapping(frappe.db.get_single_value(SETTING_DOCTYPE, "category_mapping")) or (
+		DEFAULT_CATEGORY_MAPPING
+	)
+	metrics = compute_metrics(rows, mapping)
+	print(format_report(metrics))
+	return metrics

@@ -1,5 +1,6 @@
 import os
 import re
+import subprocess
 import time
 
 import frappe
@@ -21,6 +22,23 @@ SEARCH_TEXT_MAX_CHARS = 300
 PATTERN_MIN_CHARS = 2
 PATTERN_MAX_CHARS = 200
 SKIPPED_DIRS = {"node_modules"}
+
+GIT_SUBCOMMANDS = {"log", "show", "diff", "blame"}
+GIT_NO_EXT_SUBCOMMANDS = {"diff", "show", "log"}
+GIT_BANNED_FLAGS = (
+	"--output",
+	"--no-index",
+	"--ext-diff",
+	"--textconv",
+	"-O",
+	"--contents",
+	"--exec",
+	"--upload-pack",
+	"-c",
+)
+GIT_TIMEOUT_S = 30
+GIT_MAX_ARGS = 10
+GIT_OUTPUT_MAX_CHARS = 8000
 
 
 def get_source_root():
@@ -138,3 +156,83 @@ def search_source(args, ctx):
 	except Exception:
 		logger.exception("search_source failed")
 		return _refuse("Không tìm được trong mã nguồn")
+
+
+def _git_repo(root, app):
+	if not isinstance(app, str) or not app or os.sep in app or app in {".", ".."}:
+		return None
+	repo = os.path.join(root, app)
+	if os.path.realpath(repo) != repo or not os.path.isdir(os.path.join(repo, ".git")):
+		return None
+	return repo
+
+
+def _git_path_ok(root, repo, path):
+	if not path:
+		return True
+	return resolve_safe_path(os.path.relpath(os.path.join(repo, path), root)) is not None
+
+
+def _git_args_ok(root, repo, git_args):
+	"""True when no arg is a banned flag and every path-like arg passes resolve_safe_path."""
+	only_paths = False
+	for arg in git_args:
+		if only_paths:
+			if not _git_path_ok(root, repo, arg):
+				return False
+		elif arg == "--":
+			only_paths = True
+		elif arg.startswith("-"):
+			if arg.startswith(GIT_BANNED_FLAGS):
+				return False
+		elif ":" in arg:
+			if not _git_path_ok(root, repo, arg.split(":", 1)[1]):
+				return False
+		elif os.path.exists(os.path.join(repo, arg)) and not _git_path_ok(root, repo, arg):
+			return False
+	return True
+
+
+def git_source(args, ctx):
+	try:
+		args = args or {}
+		sub = args.get("subcommand")
+		if not isinstance(sub, str) or sub not in GIT_SUBCOMMANDS:
+			return _refuse("Chỉ cho phép git log, show, diff, blame")
+		git_args = args.get("args")
+		if git_args is None:
+			git_args = ["--oneline", "-n", "15"] if sub == "log" else []
+		if (
+			not isinstance(git_args, list)
+			or len(git_args) > GIT_MAX_ARGS
+			or not all(isinstance(a, str) and "\0" not in a for a in git_args)
+		):
+			return _refuse("Tham số git không hợp lệ (tối đa 10 chuỗi)")
+		root = os.path.realpath(get_source_root())
+		repo = _git_repo(root, args.get("app"))
+		if repo is None:
+			return _refuse("Không tìm thấy kho git của app")
+		if not _git_args_ok(root, repo, git_args):
+			return _refuse("Tham số git bị cấm hoặc đường dẫn không được phép")
+
+		extra = ["--no-ext-diff", "--no-textconv"] if sub in GIT_NO_EXT_SUBCOMMANDS else []
+		command = ["git", "--no-pager", "-C", repo, sub, *extra, *git_args]
+		done = subprocess.run(
+			command,
+			capture_output=True,
+			text=True,
+			timeout=GIT_TIMEOUT_S,
+			env={**os.environ, "GIT_PAGER": "cat"},
+		)
+		if done.returncode != 0:
+			logger.warning("git_source %s exit %s", sub, done.returncode)
+			return _refuse(f"git báo lỗi (mã {done.returncode}): {(done.stderr or '').strip()[:120]}")
+		return {"ok": True, "output": (done.stdout or "")[:GIT_OUTPUT_MAX_CHARS]}
+	except FileNotFoundError:
+		return _refuse("chưa cài git trên máy chủ")
+	except subprocess.TimeoutExpired:
+		logger.warning("git_source timed out")
+		return _refuse("git chạy quá thời gian cho phép")
+	except Exception:
+		logger.exception("git_source failed")
+		return _refuse("Không chạy được git")

@@ -11,14 +11,26 @@ from erp_ai.test_utils import FakeGateway, make_model_result
 
 RUN_FOR_TICKET_PATH = "erp_ai.agent.runner.run_for_ticket"
 
-_real_get_single_value = frappe.db.get_single_value
-
 
 def _setting_value(enabled):
+	real_get_single_value = frappe.db.get_single_value
+
 	def fake(doctype, fieldname=None, *args, **kwargs):
 		if doctype == SETTING_DOCTYPE:
 			return enabled
-		return _real_get_single_value(doctype, fieldname, *args, **kwargs)
+		return real_get_single_value(doctype, fieldname, *args, **kwargs)
+
+	return fake
+
+
+def _setting_doctype_exists():
+	"""The DocType is created in T9; until then pretend it exists so the handler reads the setting."""
+	real_exists = frappe.db.exists
+
+	def fake(dt, dn=None, *args, **kwargs):
+		if dt == "DocType" and dn == SETTING_DOCTYPE:
+			return SETTING_DOCTYPE
+		return real_exists(dt, dn, *args, **kwargs)
 
 	return fake
 
@@ -31,6 +43,7 @@ class TestTicketHandlers(FrappeTestCase):
 	def test_new_ticket_enqueues_one_agent_job(self):
 		fake_gateway = FakeGateway()
 		with (
+			patch.object(frappe.db, "exists", side_effect=_setting_doctype_exists()),
 			patch.object(frappe.db, "get_single_value", side_effect=_setting_value(1)),
 			patch("erp_ai.gateway.call_model", fake_gateway),
 			patch.object(frappe, "enqueue") as enqueue,
@@ -46,10 +59,12 @@ class TestTicketHandlers(FrappeTestCase):
 		self.assertIs(kwargs["deduplicate"], True)
 		self.assertEqual(kwargs["ticket_name"], ticket.name)
 		self.assertEqual(kwargs["trigger"], "ticket_insert")
+		self.assertEqual(kwargs["job_id"], f"erp_ai::{ticket.name}::ticket_insert")
 		self.assertEqual(fake_gateway.call_count, 0)
 
 	def test_new_ticket_with_agent_disabled_enqueues_nothing(self):
 		with (
+			patch.object(frappe.db, "exists", side_effect=_setting_doctype_exists()),
 			patch.object(frappe.db, "get_single_value", side_effect=_setting_value(0)),
 			patch.object(frappe, "enqueue") as enqueue,
 		):
@@ -58,18 +73,27 @@ class TestTicketHandlers(FrappeTestCase):
 		self.assertEqual(_agent_calls(enqueue), [])
 
 	def test_ticket_insert_without_setting_doctype_enqueues_nothing(self):
-		def missing_doctype(doctype, fieldname=None, *args, **kwargs):
+		real_exists = frappe.db.exists
+		real_get_single_value = frappe.db.get_single_value
+
+		def missing_doctype(dt, dn=None, *args, **kwargs):
+			if dt == "DocType" and dn == SETTING_DOCTYPE:
+				return None
+			return real_exists(dt, dn, *args, **kwargs)
+
+		def must_not_read(doctype, fieldname=None, *args, **kwargs):
 			if doctype == SETTING_DOCTYPE:
-				raise frappe.DoesNotExistError(f"DocType {SETTING_DOCTYPE} not found")
-			return _real_get_single_value(doctype, fieldname, *args, **kwargs)
+				raise AssertionError("setting must not be read when its DocType is absent")
+			return real_get_single_value(doctype, fieldname, *args, **kwargs)
 
 		with (
-			patch.object(frappe.db, "get_single_value", side_effect=missing_doctype),
+			patch.object(frappe.db, "exists", side_effect=missing_doctype),
+			patch.object(frappe.db, "get_single_value", side_effect=must_not_read),
 			patch.object(frappe, "enqueue") as enqueue,
 		):
 			ticket = make_ticket(subject="erp_ai T1 setting doctype missing")
 
-		self.assertTrue(frappe.db.exists("HD Ticket", ticket.name))
+		self.assertTrue(real_exists("HD Ticket", ticket.name))
 		self.assertEqual(_agent_calls(enqueue), [])
 
 	def test_saving_ticket_never_calls_the_model(self):

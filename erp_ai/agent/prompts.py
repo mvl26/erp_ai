@@ -52,6 +52,14 @@ Quy ước:
 - Tiêu đề có [GẬP] thì uu_tien = "Urgent", bất kể đầu mục.
 - Phiếu chứa nhiều yêu cầu rời nhau thì đặt can_tach = true và nêu từng yêu cầu.
 
+Chấm hai điểm nguyên 1, 2 hoặc 3 theo thang sau:
+
+| Điểm | Độ phức tạp | Độ quan trọng |
+|---|---|---|
+| 1 | Làm xong dưới 1 giờ làm việc, không cần đổi hệ thống: hỏi đáp, thao tác có sẵn | Ảnh hưởng một người, không chặn việc, không có hạn gần |
+| 2 | Trong 1 ngày làm việc: cấu hình có sẵn, sửa một lỗi xác định, một đợt dữ liệu nhỏ | Chặn việc của một người hoặc một bộ phận; hoặc có hạn trong 24 giờ; hoặc (đầu mục D) có Hạn hoàn thành |
+| 3 | Nhiều ngày, cần phân tích trước (BA), xây mới hoặc tích hợp | Chặn nghiệp vụ kế toán, kho hoặc bán hàng; hoặc nhiều bộ phận ngừng việc |
+
 Trả về DUY NHẤT một object JSON, không giải thích thêm:
 
 {
@@ -61,7 +69,11 @@ Trả về DUY NHẤT một object JSON, không giải thích thêm:
   "nhom": "<tên nhóm theo bảng routing>",
   "uu_tien": "Low"|"Medium"|"High"|"Urgent",
   "can_tach": true|false,
-  "cac_yeu_cau": ["<nếu can_tach = true>"]
+  "cac_yeu_cau": ["<nếu can_tach = true>"],
+  "do_phuc_tap": 1|2|3,
+  "do_quan_trong": 1|2|3,
+  "ly_do_diem": "<một câu, tối đa 25 từ, vì sao chấm hai điểm này>",
+  "bo_phan": "<chỉ với D/E: một tên trong DANH SÁCH BỘ PHẬN; không thì rỗng>"
 }
 
 Đặt do_tin_cay = "Thấp" khi nội dung quá ngắn hoặc mơ hồ để quyết. Thà nói không
@@ -163,10 +175,13 @@ def ticket_text(subject: str, description: str) -> str:
 	return f"Tiêu đề: {subject or ''}\n\nNội dung:\n{_clean(description, DESCRIPTION_MAX_CHARS)}"
 
 
-def build_classify_request(subject: str, description: str) -> dict:
+def build_classify_request(subject: str, description: str, departments: tuple[str, ...] = ()) -> dict:
 	"""Single source of the classify request, shared by the runner and the offline eval."""
+	system_text = CLASSIFY_PROMPT
+	if departments:
+		system_text = f"{CLASSIFY_PROMPT}\n\nDANH SÁCH BỘ PHẬN: {', '.join(departments)}"
 	return {
-		"system": [{"type": "text", "text": CLASSIFY_PROMPT, "cache_control": dict(_CACHE)}],
+		"system": [{"type": "text", "text": system_text, "cache_control": dict(_CACHE)}],
 		"messages": [{"role": "user", "content": ticket_text(subject, description)}],
 	}
 

@@ -1,4 +1,7 @@
+import json
 from dataclasses import dataclass
+
+import frappe
 
 from erp_ai.agent.classification import (
 	PRIORITY_URGENT,
@@ -6,9 +9,36 @@ from erp_ai.agent.classification import (
 	Classification,
 	resolve_ticket_values,
 )
-from erp_ai.constants import AGENT_USER
+from erp_ai.constants import AGENT_USER, CATEGORIES
 
 PRIORITIES = ("Low", "Medium", "High", "Urgent")
+
+# Default routing_rules (design 3.3, D-11). People lists stay empty: System Manager fills them in.
+DEFAULT_ROUTING_RULES = json.dumps(
+	{
+		"assignees": {
+			"A": {"default": "", "prefixes": {"[tracecore]": ""}},
+			"B": {"default": "", "prefixes": {}},
+			"C": {"default": "", "prefixes": {}},
+			"F": {"default": "", "prefixes": {}},
+		},
+		"departments": {},
+		"importance_priority": {"1": "", "2": "High", "3": "High"},
+		"expected_sla": {
+			"A": {"response_min": 15, "resolution_min": 480},
+			"B": {"response_min": 15, "resolution_min": 240},
+			"C": {"response_min": 60, "resolution_min": 1440},
+			"D": {"response_min": 60, "resolution_min": None},
+			"E": {"response_min": 60, "resolution_min": None},
+			"F": {"response_min": 5, "resolution_min": 60},
+		},
+	},
+	ensure_ascii=False,
+	indent=2,
+)
+ROOT_KEYS = ("assignees", "departments", "importance_priority", "expected_sla")
+ASSIGNEE_CATEGORIES = ("A", "B", "C", "F")
+SLA_KEYS = ("response_min", "resolution_min")
 
 
 @dataclass(frozen=True)
@@ -49,7 +79,7 @@ def decide_route(
 	)
 
 
-# Same normalization as policy.py (copied: routing does not import frappe yet).
+# Same normalization as policy.py (kept local so routing does not import policy).
 def _normalize(name) -> str:
 	return " ".join((name or "").split()).casefold()
 
@@ -127,3 +157,116 @@ def _priority(classification: Classification, subject, mapping: dict, config: di
 
 def _rank(priority: str) -> int:
 	return PRIORITIES.index(priority) if priority in PRIORITIES else -1
+
+
+def _is_minutes(value) -> bool:
+	return value is None or (type(value) is int and value > 0)
+
+
+def _user_error(path, user, check_users):
+	if not isinstance(user, str):
+		return f"{path}: người phải là chuỗi"
+	if check_users and user and not frappe.db.exists("User", user):
+		return f"{path}: người '{user}' không tồn tại"
+	return None
+
+
+def _assignees_error(assignees, check_users):
+	if not isinstance(assignees, dict):
+		return "assignees phải là object"
+	for category, entry in assignees.items():
+		if category not in ASSIGNEE_CATEGORIES:
+			return f"assignees: đầu mục '{category}' không hợp lệ (D, E lấy người theo departments)"
+		path = f"assignees.{category}"
+		if not (
+			isinstance(entry, dict)
+			and isinstance(entry.get("default"), str)
+			and isinstance(entry.get("prefixes"), dict)
+		):
+			return f"{path} phải là object có default (chuỗi) và prefixes (object)"
+		error = _user_error(f"{path}.default", entry["default"], check_users)
+		for prefix, user in entry["prefixes"].items():
+			error = error or _user_error(f"{path}.prefixes.{prefix}", user, check_users)
+		if error:
+			return error
+	return None
+
+
+def _departments_error(departments, check_users):
+	if not isinstance(departments, dict):
+		return "departments phải là object"
+	for name, entry in departments.items():
+		if not (
+			_normalize(name)
+			and isinstance(entry, dict)
+			and isinstance(entry.get("team"), str)
+			and isinstance(entry.get("head"), str)
+		):
+			return f"departments.{name} phải là object có team và head (chuỗi)"
+		error = _user_error(f"departments.{name}.head", entry["head"], check_users)
+		if error:
+			return error
+	return None
+
+
+def _importance_error(table):
+	if not isinstance(table, dict) or sorted(table) != ["1", "2", "3"]:
+		return "importance_priority phải có đúng các khóa 1, 2, 3"
+	for level, value in table.items():
+		if value != "" and value not in PRIORITIES:
+			return (
+				f"importance_priority.{level}: mức '{value}' không hợp lệ, "
+				"chỉ nhận Low, Medium, High, Urgent hoặc rỗng"
+			)
+	return None
+
+
+def _sla_error(table):
+	if not isinstance(table, dict):
+		return "expected_sla phải là object"
+	for category, entry in table.items():
+		if category not in CATEGORIES or not isinstance(entry, dict):
+			return f"expected_sla.{category} phải là object theo đầu mục {', '.join(CATEGORIES)}"
+		for key, value in entry.items():
+			if key not in SLA_KEYS or not _is_minutes(value):
+				return f"expected_sla.{category}.{key} phải là số nguyên dương (phút) hoặc null"
+	return None
+
+
+def _config_error(raw, check_users):
+	"""Message naming the bad key path, or None when raw is a valid routing_rules."""
+	try:
+		data = json.loads(raw) if isinstance(raw, str) else None
+	except ValueError:
+		data = None
+	if not isinstance(data, dict):
+		return "Cấu hình định tuyến không phải JSON object hợp lệ"
+	for key in data:
+		if key not in ROOT_KEYS:
+			return f"Cấu hình định tuyến có khóa lạ '{key}', chỉ nhận {', '.join(ROOT_KEYS)}"
+	checks = (
+		("assignees", lambda value: _assignees_error(value, check_users)),
+		("departments", lambda value: _departments_error(value, check_users)),
+		("importance_priority", _importance_error),
+		("expected_sla", _sla_error),
+	)
+	for key, check in checks:
+		error = key in data and check(data[key])
+		if error:
+			return error
+	return None
+
+
+def validate_routing_config(raw) -> None:
+	"""Raise frappe.ValidationError naming the bad key path. Does not check teams or block the agent account."""
+	error = _config_error(raw, check_users=True)
+	if error:
+		frappe.throw(error)
+
+
+def load_routing_config(raw) -> dict:
+	"""Parse routing_rules with every root key present; a bad schema gives {} and never raises."""
+	if _config_error(raw, check_users=False):
+		return {}
+	data = json.loads(raw)
+	return {key: data.get(key, {}) for key in ROOT_KEYS}

@@ -1,3 +1,6 @@
+import json
+
+import frappe
 from frappe.tests.utils import FrappeTestCase
 
 from erp_ai.agent import routing
@@ -316,3 +319,181 @@ class TestDecideAssignee(FrappeTestCase):
 		self.assertFalse(_decide_assignee("C", config={}).needs_task)
 		self.assertFalse(_decide_assignee("D", department="HR").needs_task)
 		self.assertFalse(_decide_assignee("C", is_active_agent=lambda user: False).needs_task)
+
+
+def _bad(mutate):
+	config = json.loads(routing.DEFAULT_ROUTING_RULES)
+	mutate(config)
+	return json.dumps(config)
+
+
+def _set(*path_and_value):
+	"""Mutator setting config[p0][p1]... = value (last argument is the value)."""
+	*path, value = path_and_value
+
+	def mutate(config):
+		node = config
+		for key in path[:-1]:
+			node = node[key]
+		node[path[-1]] = value
+
+	return mutate
+
+
+class TestRoutingConfig(FrappeTestCase):
+	def test_default_valid_and_loads(self):
+		routing.validate_routing_config(routing.DEFAULT_ROUTING_RULES)
+		config = routing.load_routing_config(routing.DEFAULT_ROUTING_RULES)
+		self.assertEqual(config, json.loads(routing.DEFAULT_ROUTING_RULES))
+		self.assertEqual(config["importance_priority"], {"1": "", "2": "High", "3": "High"})
+		self.assertEqual(
+			config["expected_sla"],
+			{
+				"A": {"response_min": 15, "resolution_min": 480},
+				"B": {"response_min": 15, "resolution_min": 240},
+				"C": {"response_min": 60, "resolution_min": 1440},
+				"D": {"response_min": 60, "resolution_min": None},
+				"E": {"response_min": 60, "resolution_min": None},
+				"F": {"response_min": 5, "resolution_min": 60},
+			},
+		)
+		for category in "ABCF":
+			self.assertEqual(config["assignees"][category]["default"], "")
+		self.assertEqual(config["departments"], {})
+
+	def test_bad_configs_raise_with_path(self):
+		def set_level(c):
+			c["importance_priority"]["2"] = "Hgh"
+
+		def drop_three(c):
+			del c["importance_priority"]["3"]
+
+		def add_d(c):
+			c["assignees"]["D"] = {"default": "", "prefixes": {}}
+
+		def unknown_default(c):
+			c["assignees"]["A"]["default"] = "khong.ton.tai@example.com"
+
+		def unknown_prefix(c):
+			c["assignees"]["A"]["prefixes"]["[x]"] = "khong.ton.tai@example.com"
+
+		def unknown_head(c):
+			c["departments"]["Kế toán"] = {"team": "", "head": "khong.ton.tai@example.com"}
+
+		def negative(c):
+			c["expected_sla"]["A"]["response_min"] = -5
+
+		def boolean(c):
+			c["expected_sla"]["B"]["resolution_min"] = True
+
+		def bad_department(c):
+			c["departments"]["Kế toán"] = "x"
+
+		cases = (
+			(
+				"assignees prefixes not object",
+				_bad(_set("assignees", "A", "prefixes", [])),
+				"assignees.A phải là object",
+			),
+			(
+				"assignees default missing",
+				_bad(_set("assignees", "A", {"prefixes": {}})),
+				"assignees.A phải là object",
+			),
+			("assignees entry shape", _bad(_set("assignees", "A", "x")), "assignees.A phải là object"),
+			("assignees root list", _bad(_set("assignees", [])), "assignees phải là object"),
+			("departments root list", _bad(_set("departments", [])), "departments phải là object"),
+			(
+				"departments empty name",
+				_bad(_set("departments", "  ", {"team": "", "head": ""})),
+				"departments.  ",
+			),
+			(
+				"importance root list",
+				_bad(_set("importance_priority", ["1", "2", "3"])),
+				"importance_priority phải có đúng các khóa 1, 2, 3",
+			),
+			("sla root list", _bad(_set("expected_sla", [])), "expected_sla phải là object"),
+			("sla unknown category", _bad(_set("expected_sla", "G", {})), "expected_sla.G"),
+			("sla entry not object", _bad(_set("expected_sla", "A", 5)), "expected_sla.A phải là object"),
+			(
+				"sla unknown key",
+				_bad(_set("expected_sla", "A", "resolution", 5)),
+				"expected_sla.A.resolution",
+			),
+			(
+				"user not string",
+				_bad(_set("assignees", "A", "prefixes", "[x]", 5)),
+				"assignees.A.prefixes.[x]: người phải là chuỗi",
+			),
+			("not json", "{khong phai json", "không phải JSON object"),
+			("list root", "[]", "không phải JSON object"),
+			("root key", json.dumps({"lạ": {}}), "'lạ'"),
+			("level", _bad(set_level), "importance_priority.2"),
+			("missing 3", _bad(drop_three), "importance_priority"),
+			("assignees.D", _bad(add_d), "assignees: đầu mục 'D'"),
+			("user default", _bad(unknown_default), "assignees.A.default"),
+			("user prefix", _bad(unknown_prefix), "assignees.A.prefixes.[x]"),
+			("user head", _bad(unknown_head), "departments.Kế toán.head"),
+			("negative", _bad(negative), "expected_sla.A.response_min"),
+			("bool", _bad(boolean), "expected_sla.B.resolution_min"),
+			("department shape", _bad(bad_department), "departments.Kế toán"),
+		)
+		for name, raw, path in cases:
+			with self.subTest(case=name):
+				with self.assertRaises(frappe.ValidationError) as caught:
+					routing.validate_routing_config(raw)
+				self.assertIn(path, str(caught.exception))
+
+	def test_user_checked_only_when_non_empty_and_agent_not_blocked(self):
+		def fill(c):
+			c["assignees"]["A"]["default"] = "Administrator"
+			c["assignees"]["B"]["default"] = AGENT_USER
+			c["departments"]["Kế toán"] = {"team": "Nhóm chưa tạo", "head": ""}
+
+		routing.validate_routing_config(_bad(fill))
+
+	def test_load_bad_returns_empty(self):
+		def add_d(c):
+			c["assignees"]["D"] = {"default": "", "prefixes": {}}
+
+		nested_junk = (
+			_bad(_set("assignees", "A", "prefixes", [])),
+			_bad(_set("assignees", "A", {"prefixes": {}})),
+			_bad(_set("assignees", "A", "x")),
+			_bad(_set("assignees", [])),
+			_bad(_set("departments", [])),
+			_bad(_set("departments", "  ", {"team": "", "head": ""})),
+			_bad(_set("importance_priority", ["1", "2", "3"])),
+			_bad(_set("expected_sla", "A", 5)),
+			_bad(_set("expected_sla", "A", "resolution", 5)),
+			_bad(_set("assignees", "A", "prefixes", "[x]", 5)),
+		)
+		for raw in (None, "", "khong phai json", "[]", "3", json.dumps({"lạ": 1}), _bad(add_d), *nested_junk):
+			with self.subTest(raw=raw):
+				self.assertEqual(routing.load_routing_config(raw), {})
+
+	def test_load_partial_config_fills_all_root_keys(self):
+		partial = {"assignees": {"A": {"default": "a@x.com", "prefixes": {}}}}
+		config = routing.load_routing_config(json.dumps(partial))
+		self.assertEqual(
+			config,
+			{
+				"assignees": partial["assignees"],
+				"departments": {},
+				"importance_priority": {},
+				"expected_sla": {},
+			},
+		)
+
+	def test_load_does_not_check_users(self):
+		raw = _bad(_set("assignees", "A", "default", "khong.ton.tai@example.com"))
+		with self.assertRaises(frappe.ValidationError):
+			routing.validate_routing_config(raw)
+		self.assertEqual(
+			routing.load_routing_config(raw)["assignees"]["A"]["default"], "khong.ton.tai@example.com"
+		)
+
+	def test_default_rules_have_tracecore_prefix(self):
+		prefixes = json.loads(routing.DEFAULT_ROUTING_RULES)["assignees"]["A"]["prefixes"]
+		self.assertEqual(prefixes, {"[tracecore]": ""})

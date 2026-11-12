@@ -66,7 +66,8 @@ class TestRoutingEndToEnd(RunnerTestBase):
 		self.assertEqual((scores.ai_complexity, scores.ai_importance), (2, 3))
 		self.assertEqual(scores.ai_score_reason, SCORE_REASON)
 		row = self._ticket_row()
-		self.assertEqual((row.ticket_type, row.agent_group, row.priority), (ROUTE_TYPE, ROUTE_TEAM, "High"))
+		# R4/AC-3: category A with importance 3 routes to Urgent (not the mapping's High).
+		self.assertEqual((row.ticket_type, row.agent_group, row.priority), (ROUTE_TYPE, ROUTE_TEAM, "Urgent"))
 		entry = self._single_entry()
 		self.assertEqual(entry.applied, 1)
 		self.assertEqual(

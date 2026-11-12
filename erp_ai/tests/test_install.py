@@ -254,6 +254,32 @@ class TestInstall(FrappeTestCase):
 		install.ensure_setup()
 		self.assertEqual(frappe.db.get_single_value(SETTING_DOCTYPE, "permission_level"), "L0")
 
+	def _stored(self, fieldname):
+		rows = frappe.db.sql(
+			"select value from `tabSingles` where doctype=%s and field=%s", (SETTING_DOCTYPE, fieldname)
+		)
+		return rows[0][0] if rows else "<missing>"
+
+	def test_status_defaults_filled_only_when_missing(self):
+		self.assertEqual(self._stored("thinking_text"), "Đang suy nghĩ…")
+		self.assertEqual(self._stored("answer_delay_min_s"), "3")
+		self.assertEqual(self._stored("answer_delay_max_s"), "5")
+		frappe.db.set_single_value(SETTING_DOCTYPE, "thinking_text", "Chờ chút")
+		frappe.db.set_single_value(SETTING_DOCTYPE, "answer_delay_min_s", 0)
+		frappe.db.set_single_value(SETTING_DOCTYPE, "answer_delay_max_s", 0)
+		frappe.db.delete("Singles", {"doctype": SETTING_DOCTYPE, "field": "trigger_keyword"})
+		install.ensure_setup()
+		self.assertEqual(self._stored("thinking_text"), "Chờ chút")
+		self.assertEqual(self._stored("answer_delay_min_s"), "0")
+		self.assertEqual(self._stored("answer_delay_max_s"), "0")
+		self.assertEqual(self._stored("trigger_keyword"), "@ai")
+
+	def test_emptied_thinking_text_survives_setup(self):
+		frappe.db.set_single_value(SETTING_DOCTYPE, "thinking_text", "")
+		install.ensure_setup()
+		install.after_migrate()
+		self.assertEqual(self._stored("thinking_text"), "")
+
 	def test_setup_never_writes_existing_tickets(self):
 		ticket = make_ticket(subject="erp_ai T11 existing")
 		frappe.get_doc(

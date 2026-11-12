@@ -3,7 +3,13 @@ from frappe.model.document import Document
 
 from erp_ai import gateway
 from erp_ai.agent.classification import validate_mapping
-from erp_ai.constants import CREDENTIAL_DOCTYPE, KEY_STATUS_ACTIVE, KEY_STATUS_BAD_KEY, SETTING_DOCTYPE
+from erp_ai.constants import (
+	ANSWER_DELAY_MAX_S,
+	CREDENTIAL_DOCTYPE,
+	KEY_STATUS_ACTIVE,
+	KEY_STATUS_BAD_KEY,
+	SETTING_DOCTYPE,
+)
 
 SELF_MANAGED_KEY_FIELDS = (
 	"status",
@@ -33,7 +39,10 @@ INT_LIMITS = {
 	"max_keys_per_call": ("Số khóa tối đa mỗi lời gọi", 1, 10),
 	"request_timeout_s": ("Timeout mỗi lời gọi API", 5, 300),
 	"monthly_budget_usd": ("Ngân sách tháng", 0, None),
+	"answer_delay_min_s": ("Trễ trả lời tối thiểu", 0, ANSWER_DELAY_MAX_S),
+	"answer_delay_max_s": ("Trễ trả lời tối đa", 0, ANSWER_DELAY_MAX_S),
 }
+THINKING_TEXT_MAX_CHARS = 5000
 PRICE_FIELDS = (
 	"price_input_per_mtok",
 	"price_cache_write_per_mtok",
@@ -49,6 +58,7 @@ class ERPAISetting(Document):
 		self.check_labels()
 		validate_mapping(self.category_mapping)
 		self.check_limits()
+		self.check_status_settings()
 		self.check_enabled_requirements()
 
 	def restore_self_managed_fields(self):
@@ -94,6 +104,14 @@ class ERPAISetting(Document):
 		for fieldname in PRICE_FIELDS:
 			if (self.get(fieldname) or 0) < 0:
 				frappe.throw("Đơn giá không được âm")
+
+	def check_status_settings(self):
+		# Saved as "" (not NULL) so that _ensure_default_settings never re-enables a switched-off indicator.
+		self.thinking_text = self.thinking_text or ""
+		if (self.answer_delay_min_s or 0) > (self.answer_delay_max_s or 0):
+			frappe.throw("Trễ trả lời tối thiểu không được lớn hơn trễ trả lời tối đa")
+		if len(self.thinking_text) > THINKING_TEXT_MAX_CHARS:
+			frappe.throw(f"Chữ chỉ báo khi đang suy nghĩ không được dài quá {THINKING_TEXT_MAX_CHARS} ký tự")
 
 	def check_enabled_requirements(self):
 		if not self.enabled:

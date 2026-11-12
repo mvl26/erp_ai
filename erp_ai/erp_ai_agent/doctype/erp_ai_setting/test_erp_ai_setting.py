@@ -228,6 +228,68 @@ class TestERPAISetting(FrappeTestCase):
 			with self.subTest(fields=fields), self.assertRaisesRegex(frappe.ValidationError, message):
 				saved_with(**fields)
 
+	def test_status_fields_defaults(self):
+		meta = frappe.get_meta(SETTING_DOCTYPE)
+		self.assertEqual(meta.get_field("thinking_text").fieldtype, "Small Text")
+		self.assertEqual(meta.get_field("thinking_text").default, "Đang suy nghĩ…")
+		for fieldname, default in (("answer_delay_min_s", "3"), ("answer_delay_max_s", "5")):
+			with self.subTest(fieldname=fieldname):
+				self.assertEqual(meta.get_field(fieldname).fieldtype, "Int")
+				self.assertEqual(meta.get_field(fieldname).default, default)
+		order = [field.fieldname for field in meta.fields]
+		after = order.index("trigger_keyword")
+		self.assertEqual(
+			order[after + 1 : after + 4], ["thinking_text", "answer_delay_min_s", "answer_delay_max_s"]
+		)
+
+	def test_status_fields_rejections(self):
+		min_msg = "Trễ trả lời tối thiểu phải từ 0 đến 30"
+		max_msg = "Trễ trả lời tối đa phải từ 0 đến 30"
+		order_msg = "Trễ trả lời tối thiểu không được lớn hơn trễ trả lời tối đa"
+		text_msg = "Chữ chỉ báo khi đang suy nghĩ không được dài quá 5000 ký tự"
+		cases = [
+			({"answer_delay_min_s": -1, "answer_delay_max_s": 5}, min_msg),
+			({"answer_delay_min_s": 31, "answer_delay_max_s": 31}, min_msg),
+			({"answer_delay_min_s": 3, "answer_delay_max_s": -1}, max_msg),
+			({"answer_delay_min_s": 3, "answer_delay_max_s": 31}, max_msg),
+			({"answer_delay_min_s": 6, "answer_delay_max_s": 5}, order_msg),
+			({"thinking_text": "x" * 5001}, text_msg),
+		]
+		for fields, message in cases:
+			with self.subTest(fields=fields):
+				doc = frappe.get_doc(SETTING_DOCTYPE)
+				doc.update(fields)
+				with self.assertRaises(frappe.ValidationError) as caught:
+					doc.save()
+				self.assertEqual(frappe.utils.strip_html(str(caught.exception)), message)
+
+	def test_status_fields_valid_edges_save(self):
+		cases = [
+			{"answer_delay_min_s": 0, "answer_delay_max_s": 0},
+			{"answer_delay_min_s": 30, "answer_delay_max_s": 30},
+			{"answer_delay_min_s": 3, "answer_delay_max_s": 3},
+			{"answer_delay_min_s": 0, "answer_delay_max_s": 30},
+			{"thinking_text": ""},
+			{"thinking_text": "x" * 5000},
+		]
+		for fields in cases:
+			with self.subTest(fields=fields):
+				doc = frappe.get_doc(SETTING_DOCTYPE)
+				doc.update(fields)
+				doc.save()
+				saved = frappe.get_doc(SETTING_DOCTYPE)
+				for fieldname, value in fields.items():
+					self.assertEqual(
+						saved.get(fieldname) or ("" if fieldname == "thinking_text" else 0), value
+					)
+		doc = frappe.get_doc(SETTING_DOCTYPE)
+		doc.thinking_text = None
+		doc.save()
+		stored = frappe.db.sql(
+			"select value from `tabSingles` where doctype=%s and field='thinking_text'", SETTING_DOCTYPE
+		)
+		self.assertEqual(stored, (("",),))
+
 	def test_validation_rejects_empty_and_duplicate_key_labels(self):
 		doc = frappe.get_doc(SETTING_DOCTYPE)
 		doc.set("credentials", [])

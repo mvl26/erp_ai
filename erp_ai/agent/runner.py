@@ -25,8 +25,10 @@ from erp_ai.agent.tools.route_ticket import (
 	NO_SLA,
 	REASON_ASSIGN_FAILED,
 	REASON_NO_VALID_ASSIGNEE,
+	REASON_TASK_FAILED,
 	REASON_TASK_NOT_ASSIGNED,
 	TASK_REQUEST,
+	TaskSharingDisabled,
 	apply_route,
 	assign_owner,
 	create_routed_task,
@@ -394,16 +396,26 @@ def _task_unit(user, subject, classification, context, actions, lines, errors):
 	"""(u3): one linked Task for `user`, created and given in one savepoint. Returns the Task name or None.
 
 	A ticket that already has a Task, whoever made it, gets no second one. An exception (document sharing
-	off) undoes the Task and its ToDo, and adds the sentence asking the team lead to act (ADR-020 QĐ 7).
+	off) undoes the Task and its ToDo, and adds the sentence asking the team lead to act (ADR-020 QĐ 7); the
+	sentence names sharing only for `TaskSharingDisabled`, any other exception gets the general reason.
 	"""
 	ticket = context.ticket_name
 	if site_facts.has_linked_task(ticket):
 		actions.append(_route_action("create_routed_task", "Task", None, False, REASON_TASK_EXISTS))
 		return None
 	failures = len(errors)
+	sharing_off = []
+
+	def create():
+		try:
+			return create_routed_task(user, subject, classification, context)
+		except TaskSharingDisabled:
+			sharing_off.append(True)
+			raise
+
 	result = _run_unit(
 		"create_routed_task",
-		lambda: create_routed_task(user, subject, classification, context),
+		create,
 		"Task",
 		None,
 		actions,
@@ -411,7 +423,8 @@ def _task_unit(user, subject, classification, context, actions, lines, errors):
 	)
 	if result is None:
 		if len(errors) > failures:
-			lines.append(TASK_REQUEST.format(reason=REASON_TASK_NOT_ASSIGNED))
+			reason = REASON_TASK_NOT_ASSIGNED if sharing_off else REASON_TASK_FAILED
+			lines.append(TASK_REQUEST.format(reason=reason))
 		return None
 	actions.append(_route_action("create_routed_task", "Task", result["task"], True))
 	return result["task"]

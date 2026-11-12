@@ -25,9 +25,14 @@ TASK_REQUEST = (
 REASON_NO_VALID_ASSIGNEE = "cấu hình không có người hợp lệ"
 REASON_ASSIGN_FAILED = "gán người không thành công"
 REASON_TASK_NOT_ASSIGNED = "chia sẻ tài liệu đang tắt"
+REASON_TASK_FAILED = "giao Task không thành công"
 NO_SLA = "Chưa có SLA áp vào phiếu, cần System Manager cấu hình."
 SCORE_LINE = "Độ phức tạp {complexity}/3, độ quan trọng {importance}/3: {reason}"
 TASK_SUBJECT_MAX = 140
+
+
+class TaskSharingDisabled(frappe.ValidationError):
+	"""The person cannot read the Task and document sharing is off, so the Task cannot be given to them."""
 
 
 def _fail(reason: str) -> dict:
@@ -88,7 +93,8 @@ def create_routed_task(
 ) -> dict:
 	"""Create the Task for a C/D ticket and give it to `user` (ADR-021 QĐ 2, 5). Not a model tool.
 
-	A sharing failure from `assign_to.add` is not caught: it reaches the runner's savepoint.
+	Sharing off with a person who cannot read the Task raises `TaskSharingDisabled` (checked here, before
+	`assign_to.add`, which would fail the same way); it and any other failure reach the runner's savepoint.
 	"""
 	if refusal := _task_refusal(ctx):
 		return refusal
@@ -106,5 +112,9 @@ def create_routed_task(
 		}
 	)
 	task.insert()
+	if frappe.get_system_settings("disable_document_sharing") and not frappe.has_permission(
+		doc=task, user=user
+	):
+		raise TaskSharingDisabled
 	assign_to.add({"assign_to": [user], "doctype": TASK_DOCTYPE, "name": task.name})
 	return {"ok": True, "task": task.name}

@@ -16,6 +16,7 @@ from erp_ai.agent.tools.route_ticket import (
 	REASON_NO_VALID_ASSIGNEE,
 	REASON_TASK_NOT_ASSIGNED,
 	TASK_REQUEST,
+	TaskSharingDisabled,
 	apply_route,
 	assign_owner,
 	create_routed_task,
@@ -515,7 +516,7 @@ class TestCreateRoutedTask(RouteTicketTestCase):
 			return 1 if key == "disable_document_sharing" else real(key)
 
 		with patch.object(frappe, "get_system_settings", settings):
-			with self.assertRaises(frappe.ValidationError):
+			with self.assertRaises(TaskSharingDisabled):
 				self._create_as_agent(ticket, owner)
 
 	def test_no_task_doctype_refused(self):

@@ -25,6 +25,7 @@ from erp_ai.agent.tools.route_ticket import (
 	NO_SLA,
 	REASON_ASSIGN_FAILED,
 	REASON_NO_VALID_ASSIGNEE,
+	REASON_TASK_FAILED,
 	REASON_TASK_NOT_ASSIGNED,
 	TASK_REQUEST,
 	create_routed_task,
@@ -1132,10 +1133,48 @@ class TestRoutingTask(AssignTestBase):
 			[("apply_route", True), ("assign_owner", False), ("post_routing_comment", True)],
 		)
 
+	def _disable_document_sharing(self):
+		"""Turn System Settings `disable_document_sharing` on for real; the old value comes back in the cleanup."""
+		previous = frappe.db.get_single_value("System Settings", "disable_document_sharing")
+
+		def drop_cache():
+			frappe.clear_document_cache("System Settings", "System Settings")
+			frappe.local.system_settings = None
+
+		def restore():
+			frappe.db.set_single_value("System Settings", "disable_document_sharing", previous)
+
+		self.addCleanup(drop_cache)
+		self.addCleanup(restore)
+		frappe.db.set_single_value("System Settings", "disable_document_sharing", 1)
+		drop_cache()
+
 	def test_sharing_disabled_no_task_one_comment(self):
+		# the person only has the Agent role: no Task permission, so Frappe must share the Task, and sharing is off
+		self.assertFalse(frappe.has_permission("Task", "read", user=self.person))
+		self._disable_document_sharing()
+		before_comments = self._comment_count()
+		before_todos = self._task_todos()
+		self._run()
+
+		self.assertEqual(self._tasks(), [])
+		self.assertEqual(self._task_todos(), before_todos)
+		self.assertEqual(self._assigned_to(), [self.person])
+		(action,) = self._action("create_routed_task")
+		self.assertEqual((action["ok"], action["reason"]), (False, "TaskSharingDisabled"))
+		entry = self._single_entry()
+		self.assertEqual(entry.applied, 1)
+		self.assertIn("route create_routed_task: TaskSharingDisabled", entry.error)
+		self.assertNotIn(self.ticket.subject, entry.error)
+		self.assertNotIn(self.ticket.subject, entry.actions)
+		self.assertNotIn("task", json.loads(entry.value_after))
+		self.assertEqual(self._comment_count(), before_comments + 1)
+		self.assertEqual(self._comment_text(), TASK_REQUEST.format(reason=REASON_TASK_NOT_ASSIGNED))
+
+	def test_other_exception_generic_reason_not_sharing(self):
 		def write_then_raise(user, subject, classification, context):
 			create_routed_task(user, subject, classification, context)
-			raise PermissionError("chia sẻ tắt")
+			raise RuntimeError("deadlock found when trying to get lock")
 
 		before_comments = self._comment_count()
 		before_todos = self._task_todos()
@@ -1147,16 +1186,15 @@ class TestRoutingTask(AssignTestBase):
 		self.assertEqual(self._task_todos(), before_todos)
 		self.assertEqual(self._assigned_to(), [self.person])
 		(action,) = self._action("create_routed_task")
-		self.assertEqual((action["ok"], action["reason"]), (False, "PermissionError"))
+		self.assertEqual((action["ok"], action["reason"]), (False, "RuntimeError"))
 		entry = self._single_entry()
-		self.assertEqual(entry.applied, 1)
-		self.assertIn("route create_routed_task: PermissionError", entry.error)
-		self.assertNotIn(self.ticket.subject, entry.error)
-		self.assertNotIn(self.ticket.subject, entry.actions)
-		self.assertNotIn("task", json.loads(entry.value_after))
+		self.assertIn("route create_routed_task: RuntimeError", entry.error)
+		self.assertNotIn("deadlock", entry.error + entry.actions)
 		self.assertEqual(self._comment_count(), before_comments + 1)
 		text = self._comment_text()
-		self.assertEqual(text, TASK_REQUEST.format(reason=REASON_TASK_NOT_ASSIGNED))
+		self.assertEqual(text, TASK_REQUEST.format(reason=REASON_TASK_FAILED))
+		self.assertNotIn(REASON_TASK_NOT_ASSIGNED, text)
+		self.assertNotIn("deadlock", text)
 
 	def test_refused_task_without_exception_no_task_no_comment(self):
 		refusal = {"ok": False, "reason": "thiếu quyền tạo Task"}

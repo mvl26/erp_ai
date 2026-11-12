@@ -321,6 +321,10 @@ class TestRunEvalRun(FrappeTestCase):
 		tmp = tempfile.TemporaryDirectory()
 		self.addCleanup(tmp.cleanup)
 		self.path = os.path.join(tmp.name, "labeled.jsonl")
+		# never read the site's live mapping/routing; tests that need their own override it
+		set_agent_settings(
+			category_mapping=json.dumps(DEFAULT_CATEGORY_MAPPING), routing_rules=make_routing_rules()
+		)
 
 	def _write(self, rows):
 		with open(self.path, "w", encoding="utf-8") as handle:

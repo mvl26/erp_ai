@@ -286,6 +286,33 @@ class TestPrompts(FrappeTestCase):
 		self.assertNotIn("[GẤP]", prompts.CONVENTIONS)
 		self.assertIn("dau_muc", prompts.CLASSIFY_PROMPT)
 
+	def test_classify_prompt_has_score_keys_and_scale(self):
+		prompt = prompts.CLASSIFY_PROMPT
+		for key in ("do_phuc_tap", "do_quan_trong", "ly_do_diem", "bo_phan"):
+			self.assertIn(f'"{key}"', prompt)
+		for row in (
+			"| 1 | Làm xong dưới 1 giờ làm việc, không cần đổi hệ thống: hỏi đáp, thao tác có sẵn | Ảnh hưởng một người, không chặn việc, không có hạn gần |",
+			"| 2 | Trong 1 ngày làm việc: cấu hình có sẵn, sửa một lỗi xác định, một đợt dữ liệu nhỏ | Chặn việc của một người hoặc một bộ phận; hoặc có hạn trong 24 giờ; hoặc (đầu mục D) có Hạn hoàn thành |",
+			"| 3 | Nhiều ngày, cần phân tích trước (BA), xây mới hoặc tích hợp | Chặn nghiệp vụ kế toán, kho hoặc bán hàng; hoặc nhiều bộ phận ngừng việc |",
+		):
+			self.assertIn(row, prompt)
+		self.assertIn("| Điểm | Độ phức tạp | Độ quan trọng |", prompt)
+
+	def test_classify_request_appends_departments_only_when_given(self):
+		base = prompts.build_classify_request("Lỗi", "nội dung")
+		self.assertEqual(base["system"][0]["text"], prompts.CLASSIFY_PROMPT)
+		self.assertNotIn("\n\nDANH SÁCH BỘ PHẬN:", base["system"][0]["text"])
+		empty = prompts.build_classify_request("Lỗi", "nội dung", ())
+		self.assertEqual(empty, base)
+
+		request = prompts.build_classify_request("Lỗi", "nội dung", ("Kế toán", "Mua hàng"))
+		self.assertEqual(len(request["system"]), 1)
+		block = request["system"][0]
+		self.assertEqual(block["cache_control"], {"type": "ephemeral"})
+		self.assertTrue(block["text"].startswith(prompts.CLASSIFY_PROMPT))
+		self.assertTrue(block["text"].endswith("DANH SÁCH BỘ PHẬN: Kế toán, Mua hàng"))
+		self.assertEqual(request["messages"], base["messages"])
+
 	def test_build_reason_system(self):
 		blocks = prompts.build_reason_system("DIGEST-XYZ")
 		self.assertEqual(len(blocks), 1)

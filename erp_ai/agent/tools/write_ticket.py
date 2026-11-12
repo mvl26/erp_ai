@@ -21,10 +21,8 @@ def _fail(reason: str) -> dict:
 	return {"ok": False, "reason": reason[:REASON_MAX]}
 
 
-def _mapped_values(doc, args: dict, ctx: ToolContext) -> tuple[dict, list]:
+def _existing_values(wanted: dict) -> tuple[dict, list]:
 	"""Values to write (only those that exist on the site) and the skipped fields with a reason."""
-	classification = Classification(category=args["category"], confidence=args["confidence"])
-	wanted = resolve_ticket_values(classification, doc.subject, ctx.category_mapping)
 	values, skipped = {}, []
 	for field, value in wanted.items():
 		if not value:
@@ -34,6 +32,11 @@ def _mapped_values(doc, args: dict, ctx: ToolContext) -> tuple[dict, list]:
 		else:
 			values[field] = value
 	return values, skipped
+
+
+def _mapped_values(doc, args: dict, ctx: ToolContext) -> tuple[dict, list]:
+	classification = Classification(category=args["category"], confidence=args["confidence"])
+	return _existing_values(resolve_ticket_values(classification, doc.subject, ctx.category_mapping))
 
 
 def set_classification(args: dict, ctx: ToolContext) -> dict:
@@ -83,24 +86,35 @@ def post_comment(args: dict, ctx: ToolContext) -> dict:
 	return {"ok": True, "comment": name}
 
 
-def create_task(args: dict, ctx: ToolContext) -> dict:
-	if not ctx.instructor:
-		return _fail("không có người ra lệnh")
+def _ticket_link_html(name: str) -> str:
+	"""The clickable ticket paragraph that opens a Task description (Text Editor, HTML)."""
+	path = f"/helpdesk/tickets/{name}"
+	return f'<p>Phiếu {escape_html(name)}: <a href="{escape_html(path)}">{escape_html(path)}</a></p>'
+
+
+def _task_refusal(ctx: ToolContext) -> dict | None:
+	"""`ok=false` result when a Task cannot be created for the ticket, else None."""
 	if not frappe.db.exists("DocType", TASK_DOCTYPE):
 		return _fail("hệ thống không có DocType Task")
-	doc = frappe.get_doc(TICKET_DOCTYPE, ctx.ticket_name)
-	if not doc.has_permission("read"):
+	if not frappe.get_doc(TICKET_DOCTYPE, ctx.ticket_name).has_permission("read"):
 		return _fail("thiếu quyền đọc phiếu")
 	if not frappe.has_permission(TASK_DOCTYPE, "create"):
 		return _fail("thiếu quyền tạo Task")
-	# Task.description is a Text Editor (HTML) field: a clickable link paragraph first, then the escaped text.
-	path = f"/helpdesk/tickets/{doc.name}"
-	link = f'<p>Phiếu {escape_html(doc.name)}: <a href="{escape_html(path)}">{escape_html(path)}</a></p>'
+	return None
+
+
+def create_task(args: dict, ctx: ToolContext) -> dict:
+	if not ctx.instructor:
+		return _fail("không có người ra lệnh")
+	if refusal := _task_refusal(ctx):
+		return refusal
+	link = _ticket_link_html(ctx.ticket_name)
 	text = escape_html(args["description"]).replace("\r\n", "\n").replace("\n", "<br>")
 	task = frappe.get_doc(
 		{
 			"doctype": TASK_DOCTYPE,
 			"subject": args["subject"],
+			"ai_ticket": ctx.ticket_name,
 			"description": f"{link}\n<p>{text}</p>",
 		}
 	)

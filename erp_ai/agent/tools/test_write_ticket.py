@@ -506,3 +506,31 @@ class TestWriteTicketTools(FrappeTestCase):
 			no_instructor = execute_tool("create_task", {"subject": "s", "description": "d"}, self._ctx(None))
 			self.assertFalse(no_instructor["ok"])
 		self.assertEqual(frappe.db.count("Task"), before)
+
+
+class TestCreateTask(FrappeTestCase):
+	def setUp(self):
+		commit_guard = patch.object(frappe.db, "commit", side_effect=AssertionError("commit in test"))
+		commit_guard.start()
+		self.addCleanup(commit_guard.stop)
+		self.addCleanup(frappe.db.rollback)
+		self.addCleanup(frappe.set_user, "Administrator")
+		frappe.set_user("Administrator")
+		create_agent(T26_AGENT)
+		_make_user(T26_AGENT, ROLE_AGENT)
+		_make_user(T26_CUSTOMER, "HD Customer")
+		self.ticket = make_ticket(subject="ERPAI-TEST-T16 phiếu", raised_by=T26_CUSTOMER).name
+
+	def test_sets_ai_ticket(self):
+		ctx = ToolContext(
+			ticket_name=self.ticket,
+			effective_level="L1",
+			instructor=T26_INSTRUCTOR,
+			run_id="run-t16",
+			category_mapping={},
+			agent_user=AGENT_USER,
+		)
+		frappe.set_user(T26_AGENT)
+		result = write_ticket.create_task({"subject": "ERPAI-TEST-T16 việc", "description": "mô tả"}, ctx)
+		self.assertTrue(result["ok"], result)
+		self.assertEqual(frappe.db.get_value("Task", result["task"], "ai_ticket"), self.ticket)

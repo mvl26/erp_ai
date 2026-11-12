@@ -41,9 +41,15 @@ def apply_route(decision: RouteDecision, classification: Classification, ctx: To
 		if not doc.has_permlevel_access_to(field, permission_type="write"):
 			del values[field]
 			skipped.append({"field": field, "reason": "thiếu quyền ghi trường"})
-	before = {field: doc.get(field) for field in values}
+	changed = [field for field, value in values.items() if doc.get(field) != value]
+	before = {field: doc.get(field) for field in changed}
 	doc.update(values)
 	doc.ai_classified_by = CLASSIFIED_BY_AI
 	doc.ai_updated_at = now_datetime()
 	doc.save()
-	return {"ok": True, "before": before, "after": dict(values), "skipped": skipped}
+	return {
+		"ok": True,
+		"before": before,
+		"after": {field: values[field] for field in changed},
+		"skipped": skipped,
+	}

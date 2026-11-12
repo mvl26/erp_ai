@@ -100,7 +100,8 @@ class RouteTicketTestCase(FrappeTestCase):
 
 class TestApplyRoute(RouteTicketTestCase):
 	def test_scores_written_readable_by_agent_role_user(self):
-		ticket = self._ticket()
+		# Priority is set explicitly so the changed set does not depend on the site's default SLA priority.
+		ticket = self._ticket(priority="Low")
 		result = self._apply_as_agent(ticket)
 		self.assertTrue(result["ok"], result)
 		self.assertEqual(result["skipped"], [])
@@ -117,6 +118,7 @@ class TestApplyRoute(RouteTicketTestCase):
 			},
 		)
 		self.assertEqual(set(result["before"]), set(result["after"]))
+		self.assertEqual(result["before"]["priority"], "Low")
 		row = self._row(ticket)
 		self.assertEqual((row.ai_complexity, row.ai_importance, row.ai_score_reason), (2, 3, REASON_TEXT))
 		self.assertEqual(row.ai_classified_by, CLASSIFIED_BY_AI)
@@ -169,12 +171,33 @@ class TestApplyRoute(RouteTicketTestCase):
 		self.assertLessEqual(len(result["reason"]), 200)
 		self.assertEqual(self._row(ticket), before)
 
+	def test_marker_write_permission_missing_refused_though_readable(self):
+		# Read without write on the marker (design: Agent reads permlevel 8) must still refuse the whole write.
+		ticket = self._ticket()
+		original = Document.has_permlevel_access_to
+
+		def deny_marker_write(doc, fieldname, df=None, permission_type="read"):
+			if permission_type == "write" and fieldname == "ai_classified_by":
+				return False
+			return original(doc, fieldname, df=df, permission_type=permission_type)
+
+		before = self._row(ticket)
+		pin_agent_roles(self)
+		frappe.set_user(AGENT_USER)
+		doc = frappe.get_doc("HD Ticket", ticket)
+		self.assertTrue(doc.has_permlevel_access_to("ai_classified_by", permission_type="read"))
+		with patch.object(Document, "has_permlevel_access_to", deny_marker_write):
+			result = apply_route(self._decision(), self._classification(), self._ctx(ticket))
+		self.assertFalse(result["ok"])
+		self.assertIn("ai_classified_by", result["reason"])
+		self.assertEqual(self._row(ticket), before)
+
 	def test_missing_field_permission_skipped(self):
 		ticket = self._ticket(priority="Low")
 		original = Document.has_permlevel_access_to
 
 		def deny_priority_and_reason(doc, fieldname, df=None, permission_type="read"):
-			if fieldname in ("priority", "ai_score_reason"):
+			if permission_type == "write" and fieldname in ("priority", "ai_score_reason"):
 				return False
 			return original(doc, fieldname, df=df, permission_type=permission_type)
 
@@ -194,7 +217,7 @@ class TestApplyRoute(RouteTicketTestCase):
 		self.assertEqual(row.ai_classified_by, CLASSIFIED_BY_AI)
 
 	def test_value_missing_on_site_not_written(self):
-		ticket = self._ticket()
+		ticket = self._ticket(priority="Low")
 		before = self._row(ticket)
 		decision = self._decision(agent_group=f"{PREFIX}Nhóm không có", ticket_type="Loại không có")
 		result = self._apply_as_agent(ticket, decision=decision)
@@ -205,6 +228,16 @@ class TestApplyRoute(RouteTicketTestCase):
 		row = self._row(ticket)
 		self.assertEqual((row.agent_group, row.ticket_type), (before.agent_group, before.ticket_type))
 		self.assertEqual(row.priority, "Medium")
+
+	def test_unchanged_field_left_out_of_before_after(self):
+		ticket = self._ticket(priority="Medium")
+		result = self._apply_as_agent(ticket)
+		self.assertTrue(result["ok"], result)
+		self.assertNotIn("priority", result["before"])
+		self.assertNotIn("priority", result["after"])
+		self.assertEqual(set(result["before"]), set(result["after"]))
+		self.assertEqual(result["after"]["agent_group"], self.team)
+		self.assertEqual(self._row(ticket).priority, "Medium")
 
 	def test_before_after_only_changed_fields_and_one_save(self):
 		ticket = self._ticket(priority="Low")
@@ -282,7 +315,7 @@ class TestSlaFromHelpdesk(RouteTicketTestCase):
 		# A new ticket (no score yet) is created with the `>=` condition active, and does not pick that SLA.
 		ticket = self._ticket()
 		self.assertNotEqual(self._sla_of(ticket).sla, ge_sla)
-		# L0 writes no score: complexity 0 saves cleanly and still does not pick it.
+		# Complexity 0 (apply_route still writes the marker; the real L0 path is T20) saves cleanly and still does not pick it.
 		result = self._apply_as_agent(
 			ticket, classification=self._classification(complexity=0, importance=0, score_reason="")
 		)

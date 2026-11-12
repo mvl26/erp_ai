@@ -182,6 +182,27 @@ STATUS_SCRIPT_REQUIRED = (
 	# A failed reload clears both lists (no new AI fields beside an old thread); reset tolerates an old panel state.
 	r"panel\.threadEl\.replaceChildren\(\);\s*panel\.errorEl\.textContent = TEXT_LOAD_FAILED",
 	r"panel\.threadEl\?\.replaceChildren\(\)",
+	# T13 send box: fixed texts, then the use sites (declaration-only pins were rejected in review).
+	r'TEXT_SEND_FAILED = "Không gửi được tin\. Chữ bạn gõ vẫn còn, hãy thử lại\."',
+	r'TEXT_EMPTY_MESSAGE = "Hãy nhập nội dung trước khi gửi\."',
+	r'TEXT_TOO_LONG = "Tin dài quá 2000 ký tự\."',
+	r'TEXT_SENDING = "Đang gửi…"',
+	r"MAX_MESSAGE_CHARS = 2000",
+	r'event\.key === "Enter" && !event\.shiftKey && !event\.isComposing',
+	r'sendEl\.addEventListener\("click"',
+	r"const value = panel\.inputEl\.value\.trim\(\)",
+	r"if \(!value\) \{\s*panel\.errorEl\.textContent = TEXT_EMPTY_MESSAGE;\s*return;",
+	r"value\.length > MAX_MESSAGE_CHARS\) \{\s*panel\.errorEl\.textContent = TEXT_TOO_LONG;\s*return;",
+	r"if \(panel\.sending \|\| !panel\.open",
+	r"panel\.sending = true",
+	r"panel\.sending = false",
+	r'state\s*\.call\("erp_ai\.ticket_panel\.send_message", \{ ticket, text: value \}\)',
+	r'panel\.inputEl\.value = "";\s*panel\.errorEl\.textContent = "";\s*reload\(\)',
+	# Failure only shows the fixed text: nothing else (such as clearing the box) happens in that branch.
+	r"if \(!isStale\(\)\) \{\s*panel\.errorEl\.textContent = TEXT_SEND_FAILED;\s*\}",
+	r"sendEl\.textContent = TEXT_SENDING",
+	r"sendEl\.textContent = TEXT_SEND\b",
+	r"inputEl\.placeholder = TEXT_INPUT_PLACEHOLDER",
 )
 
 # ADR-009: every `call(` in the page script passes a string literal naming one of PANEL_METHODS.

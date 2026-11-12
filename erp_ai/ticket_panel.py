@@ -1,5 +1,7 @@
 """Ticket-page panel (ADR-009, ADR-010): the AI fields of a ticket, read under the caller's own permissions."""
 
+import html
+
 import frappe
 from frappe import _
 from frappe.core.utils import html_to_plain_text
@@ -7,8 +9,8 @@ from frappe.desk.form.activity import get_activity_timeline
 from frappe.utils import cstr, format_datetime
 from helpdesk.utils import is_agent
 
-from erp_ai.agent.policy import contains_keyword
-from erp_ai.constants import AGENT_USER, LOGGER_NAME
+from erp_ai.agent.policy import contains_keyword, get_trigger_keyword
+from erp_ai.constants import AGENT_USER, LOGGER_NAME, PANEL_MAX_MESSAGE_CHARS
 
 TICKET_DOCTYPE = "HD Ticket"
 AI_FIELDS = ("ai_resolution_hint", "ai_confidence", "ai_classified_by", "ai_updated_at")
@@ -89,3 +91,27 @@ def get_panel_data(ticket: str) -> dict:
 	messages = _thread(ticket)
 	frappe.logger(LOGGER_NAME).debug(f"erp_ai panel read ticket={ticket} messages={len(messages)}")
 	return {"ticket": ticket, "ai_fields": _ai_fields(ticket), "messages": messages}
+
+
+def _message_content(text) -> str:
+	"""B-6: the typed text escaped, line breaks kept, the trigger keyword appended when missing."""
+	if not isinstance(text, str) or not text.strip():
+		frappe.throw(_("Nội dung tin trống."), frappe.ValidationError)
+	text = text.strip()
+	if len(text) > PANEL_MAX_MESSAGE_CHARS:
+		frappe.throw(_("Tin dài quá {0} ký tự.").format(PANEL_MAX_MESSAGE_CHARS), frappe.ValidationError)
+	body = "<br>".join(html.escape(line, quote=False) for line in text.splitlines())
+	keyword = get_trigger_keyword()
+	if keyword and not contains_keyword(body):
+		body = f"{body} {html.escape(keyword, quote=False)}"
+	return f"<p>{body}</p>"
+
+
+@frappe.whitelist(methods=["POST"])
+def send_message(ticket: str, text: str) -> dict:
+	if not isinstance(ticket, str) or not ticket.strip():
+		frappe.throw(_("Thiếu mã phiếu."), frappe.ValidationError)
+	ticket = ticket.strip()
+	_require_panel_access(ticket, forbid_agent_user=True)
+	content = _message_content(text)
+	return {"comment": frappe.get_doc(TICKET_DOCTYPE, ticket).new_comment(content)}

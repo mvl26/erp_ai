@@ -11,7 +11,14 @@ from erp_ai.agent import answer_delay, runner
 from erp_ai.agent.policy import contains_keyword
 from erp_ai.agent.queue import PENDING_JOB_IDS_FLAG
 from erp_ai.agent.run_log import write_entry
-from erp_ai.constants import AGENT_USER, LOG_DOCTYPE, LOGGER_NAME, PANEL_METHODS, ROLE_INSTRUCTOR
+from erp_ai.constants import (
+	AGENT_USER,
+	LOG_DOCTYPE,
+	LOGGER_NAME,
+	PANEL_METHODS,
+	ROLE_INSTRUCTOR,
+	TITLE_RUN_FAILED,
+)
 from erp_ai.test_utils import FakeGateway, make_model_result, record_status_signals, set_agent_settings
 
 AI_FIELD_LABELS = (
@@ -567,7 +574,7 @@ class TestTicketPanelGateParity(FrappeTestCase):
 		commit_guard.start()
 		self.addCleanup(commit_guard.stop)
 		log_error = patch.object(frappe, "log_error")
-		log_error.start()
+		self.log_error = log_error.start()
 		self.addCleanup(log_error.stop)
 		record_status_signals(self)
 		sleep_patch = patch.object(answer_delay, "_sleep")
@@ -593,7 +600,14 @@ class TestTicketPanelGateParity(FrappeTestCase):
 
 	def _branches(self):
 		"""name -> (settings, ticket values, seeded runs, assigned agent, commenter, gateway results, expected jobs, expected gateway calls, expected instructor)."""
-		l1 = {"permission_level": "L1", "max_runs_per_ticket_per_day": 5, "max_turns_per_run": 4}
+		l1 = {
+			"permission_level": "L1",
+			"max_runs_per_ticket_per_day": 5,
+			"max_turns_per_run": 4,
+			"monthly_budget_usd": 0,
+			"spent_this_month_usd": 0,
+			"excluded_teams": "",
+		}
 		return {
 			"agent_off": (
 				{**l1, "enabled": 0},
@@ -686,8 +700,12 @@ class TestTicketPanelGateParity(FrappeTestCase):
 		self.gateway.results = list(results)
 		frappe.flags.pop(PENDING_JOB_IDS_FLAG, None)
 		frappe.set_user(user)
+		decisions = []
+		logger = MagicMock()
+		logger.info.side_effect = lambda message, *args, **kwargs: decisions.append(str(message))
 		try:
-			content_of = act()
+			with patch.object(frappe, "logger", return_value=logger):
+				content_of = act()
 			jobs = [
 				call.kwargs
 				for call in self.enqueue.call_args_list
@@ -715,7 +733,8 @@ class TestTicketPanelGateParity(FrappeTestCase):
 				for call in self.gateway.calls
 			],
 			"log": [(e.entry_type, e.trigger, e.turn, e.stop_reason, e.instructor) for e in entries],
-			"content": frappe.db.get_value("Comment", content_of, "content"),
+			"decisions": [line for line in decisions if line.startswith("erp_ai handler ")],
+			"comment": frappe.db.get_value("Comment", content_of, ["owner", "comment_type", "content"]),
 		}
 		frappe.flags.pop(PENDING_JOB_IDS_FLAG, None)
 		frappe.db.rollback(save_point=self.SAVEPOINT)

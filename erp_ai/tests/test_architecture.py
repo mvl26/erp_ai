@@ -158,6 +158,18 @@ STATUS_SCRIPT_REQUIRED = (
 	r"if \(state\.socket !== socket\)",
 	r"state\.ticket = null",
 	r"if \(state\.ticket\)",
+	# T12: message thread, labels, B-8 guidance, close button, indicator moved into the panel and back.
+	r"threadEl",
+	r"renderMessages",
+	r'TEXT_EMPTY_THREAD = "Chưa có tin nào\."',
+	r'TEXT_BOT_LABEL = "Bot"',
+	r'TEXT_CLOSE = "Đóng"',
+	r"Bot có thể không trả lời khi đang tắt, đang ở chế độ chỉ ghi nhận, "
+	r"phiếu không dùng AI hoặc thuộc nhóm loại trừ, hoặc đã hết lượt hôm nay\.",
+	r'TEXT_LOAD_FAILED = "Không tải được dữ liệu của khu vực\. Hãy đóng rồi mở lại\."',
+	r"\(docked \? state\.panel\.slotEl : document\.body\)\.appendChild\(el\)",
+	# T12: stale-result guard (design F1 reload).
+	r"seq !== panel\.seq \|\| ticket !== state\.ticket \|\| !panel\.open",
 )
 
 # ADR-009: every `call(` in the page script passes a string literal naming one of PANEL_METHODS.

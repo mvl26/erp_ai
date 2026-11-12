@@ -18,6 +18,9 @@
   "price_output_per_mtok",
   "model_classify_default",
   "trigger_keyword",
+  "thinking_text",
+  "answer_delay_min_s",
+  "answer_delay_max_s",
   "excluded_teams",
   "category_mapping",
   "prompt_digest",
@@ -114,6 +117,25 @@
    "default": "@ai"
   },
   {
+   "fieldname": "thinking_text",
+   "fieldtype": "Small Text",
+   "label": "Chữ chỉ báo khi đang suy nghĩ",
+   "default": "Đang suy nghĩ…",
+   "description": "Hiện trên chỉ báo trạng thái ở trang phiếu. Để trống để tắt chỉ báo; khoảng trễ vẫn áp dụng."
+  },
+  {
+   "fieldname": "answer_delay_min_s",
+   "fieldtype": "Int",
+   "label": "Trễ trả lời tối thiểu (giây)",
+   "default": "3"
+  },
+  {
+   "fieldname": "answer_delay_max_s",
+   "fieldtype": "Int",
+   "label": "Trễ trả lời tối đa (giây)",
+   "default": "5"
+  },
+  {
    "fieldname": "excluded_teams",
    "fieldtype": "Small Text",
    "label": "Nhóm loại trừ",
@@ -146,7 +168,7 @@
  ],
  "issingle": 1,
  "links": [],
- "modified": "2026-11-11 11:00:00.000000",
+ "modified": "2026-11-12 10:00:00.000000",
  "modified_by": "Administrator",
  "module": "ERP AI agent",
  "name": "ERP AI Setting",

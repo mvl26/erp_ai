@@ -116,3 +116,52 @@ class TestRunStatus(FrappeTestCase):
 
 		self.assertEqual(status.take_errors(), ["status_working: RuntimeError"])
 		self.assertEqual(status.take_errors(), [])
+
+	def test_emit_never_raises_and_records_class(self):
+		marker = "MARKERXYZ"
+		failures = {
+			"publish_realtime": (
+				RuntimeError,
+				patch.object(frappe, "publish_realtime", side_effect=RuntimeError(marker)),
+			),
+			"get_fullname": (
+				KeyError,
+				patch("erp_ai.agent.run_status.get_fullname", side_effect=KeyError(marker)),
+			),
+			"get_doc_room": (
+				ValueError,
+				patch("erp_ai.agent.run_status.get_doc_room", side_effect=ValueError(marker)),
+			),
+		}
+		for name, (error_class, failure) in failures.items():
+			with self.subTest(name):
+				status = RunStatus("HD-TICKET-1", "run1", "Đang suy nghĩ…")
+
+				with failure:
+					status.start()
+					status.working("get_ticket")
+					status.thinking()
+					status.done()
+
+				errors = status.take_errors()
+				self.assertEqual(
+					errors,
+					[
+						f"status_{state}: {error_class.__name__}"
+						for state in ("thinking", "working", "thinking", "done")
+					],
+				)
+				self.assertNotIn(marker, " ".join(errors))
+				self.assertEqual(status.signal_count, 4)
+				self.assertEqual(self.signals, [])
+
+	def test_done_sent_after_failed_start(self):
+		status = RunStatus("HD-TICKET-1", "run1", "Đang suy nghĩ…")
+
+		with patch.object(frappe, "publish_realtime", side_effect=RuntimeError("down")):
+			status.start()
+		status.done()
+
+		self.assertEqual(status.take_errors(), ["status_thinking: RuntimeError"])
+		self.assertEqual([s["message"]["state"] for s in self.signals], ["done"])
+		self.assertTrue(status.finished)

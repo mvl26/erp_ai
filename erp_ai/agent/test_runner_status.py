@@ -7,7 +7,7 @@ import frappe
 from frappe.utils import get_fullname
 
 from erp_ai.agent import answer_delay, policy, runner
-from erp_ai.agent.run_status import FALLBACK_WORK_LABEL, PAYLOAD_KEYS
+from erp_ai.agent.run_status import FALLBACK_WORK_LABEL, PAYLOAD_KEYS, WORK_LABELS
 from erp_ai.agent.test_agent_runner import (
 	CLASSIFY_A,
 	DAILY_LIMIT,
@@ -560,9 +560,10 @@ class TestRunnerStatus(RunnerTestBase):
 		self.assertEqual(self._states()[-1], "done")
 		self.assertEqual(self.signals_at_entry[-1], len(self.signals) - 1)
 
-	def test_leftover_status_errors_go_to_error_log_class_only(self):
+	def test_done_signal_failure_logged_to_error_log_class_only(self):
 		self._set_delay(4, 4)
-		self._gateway(make_model_result(text="xong"))
+		self._gateway(*self._answer_turns())
+		comments_before = self._comment_count()
 
 		run_ids = []
 
@@ -574,6 +575,8 @@ class TestRunnerStatus(RunnerTestBase):
 		with patch("frappe.realtime.emit_via_redis", side_effect=failing_done):
 			lines = self._run_closing("comment_mention")
 
+		# the run still answered; the lost `done` is only reported
+		self.assertEqual(self._comment_count(), comments_before + 1)
 		run_id = run_ids[0]
 		self.assertEqual(
 			self.log_error.call_args_list,
@@ -584,7 +587,161 @@ class TestRunnerStatus(RunnerTestBase):
 				)
 			],
 		)
-		self.assertEqual(lines[0][3:], ("comment_mention", 2, 1, 4, 0))
+		self.assertEqual(lines[0][3:], ("comment_mention", 4, 1, 4, 4))
+
+	def _fail_signals(self, failing_state):
+		"""Patch the emit so that signals of `failing_state` raise; the others are recorded in `self.signals`."""
+
+		def emit(event, message, room=None):
+			if message["state"] == failing_state:
+				raise RuntimeError("MARKERXYZ")
+			self.signals.append({"event": event, "message": message, "room": room})
+
+		return patch("frappe.realtime.emit_via_redis", side_effect=emit)
+
+	def test_start_signal_failure_still_answers_and_logs_class(self):
+		self._gateway(*self._answer_turns())
+		comments_before = self._comment_count()
+
+		with self._fail_signals("thinking"):
+			lines = self._run_closing("comment_mention")
+
+		self.assertEqual(self._comment_count(), comments_before + 1)
+		reasons = self._entries(entry_type="reason")
+		self.assertEqual(reasons[0].error, "status_thinking: RuntimeError")
+		self.assertNotIn("MARKERXYZ", json.dumps([entry.error for entry in reasons]))
+		# `done` is still attempted and delivered although the start signal was lost
+		self.assertEqual(self._states(), ["working", "done"])
+		# four signals tried (the failed ones count), every failure already went into an entry
+		self.assertEqual(lines[0][3:6], ("comment_mention", 4, 0))
+
+	def test_working_signal_failure_still_answers_and_logs_class(self):
+		self._gateway(*self._answer_turns())
+		comments_before = self._comment_count()
+
+		with self._fail_signals("working"):
+			self._run_closing("comment_mention")
+
+		self.assertEqual(self._comment_count(), comments_before + 1)
+		reasons = self._entries(entry_type="reason")
+		self.assertEqual(reasons[0].error, "status_working: RuntimeError")
+		self.assertFalse(reasons[1].error)
+		self.assertEqual(self._states(), ["thinking", "thinking", "done"])
+
+	def _fail_first_working(self):
+		"""Patch the emit so that only the first `working` signal raises; the others are recorded in `self.signals`."""
+		seen = []
+
+		def emit(event, message, room=None):
+			if message["state"] == "working" and not seen:
+				seen.append(message)
+				raise RuntimeError("MARKERXYZ")
+			self.signals.append({"event": event, "message": message, "room": room})
+
+		return patch("frappe.realtime.emit_via_redis", side_effect=emit)
+
+	def test_working_failure_on_classify_goes_into_the_classify_entry(self):
+		self._gateway(make_model_result(text=CLASSIFY_A))
+
+		with self._fail_first_working():
+			self._run_closing("ticket_insert")
+
+		# D-9: the fragment is in the entry of the step that follows the failed signal, not in the Error Log
+		entries = self._entries()
+		self.assertEqual([entry.entry_type for entry in entries], ["classify", "reason"])
+		self.assertEqual(entries[0].error, "status_working: RuntimeError")
+		self.assertEqual(entries[0].applied, 1)
+		self.assertFalse(entries[1].error)
+		self.assertEqual(self.log_error.call_args_list, [])
+
+	def test_thinking_failure_joins_the_classify_gateway_error(self):
+		self._gateway(GatewayError("server_error", status=500))
+
+		with self._fail_signals("thinking"):
+			self._run_closing("ticket_insert")
+
+		entry = self._entries(entry_type="classify")[-1]
+		self.assertEqual(entry.error, "server_error status=500; status_thinking: RuntimeError")
+		self.assertEqual(self.log_error.call_args_list, [])
+
+	def test_thinking_failure_joins_the_unparseable_classify_error(self):
+		self._gateway(make_model_result(text="không phải JSON"))
+
+		with self._fail_signals("thinking"):
+			self._run_closing("ticket_insert")
+
+		entry = self._entries(entry_type="classify")[-1]
+		self.assertEqual(entry.error, f"{runner.UNPARSEABLE_ERROR}; status_thinking: RuntimeError")
+		self.assertEqual(self.log_error.call_args_list, [])
+
+	def test_thinking_failure_joins_the_reason_gateway_error(self):
+		self._gateway(GatewayError("server_error", status=500))
+
+		with self._fail_signals("thinking"):
+			self._run_closing("comment_mention")
+
+		entry = self._entries(entry_type="reason")[-1]
+		self.assertEqual(entry.error, "server_error status=500; status_thinking: RuntimeError")
+		self.assertEqual(self.log_error.call_args_list, [])
+
+	def test_working_failure_joins_the_tool_error_with_semicolon(self):
+		self._gateway(tool_turn(tool_use("t1", "get_ticket")), make_model_result(text="xong"))
+
+		with patch.object(runner, "execute_tool", side_effect=RuntimeError), self._fail_signals("working"):
+			self._run_closing("comment_mention")
+
+		reasons = self._entries(entry_type="reason")
+		self.assertEqual(reasons[0].error, "tool get_ticket: RuntimeError; status_working: RuntimeError")
+		self.assertFalse(reasons[1].error)
+
+	def test_pending_fragment_after_a_crash_goes_to_the_error_log(self):
+		self._gateway(make_model_result(text="xong"))
+
+		with (
+			self._fail_signals("thinking"),
+			patch.object(runner, "build_initial_message", side_effect=RuntimeError),
+		):
+			lines = self._run_closing("comment_mention")
+
+		# no entry was written, so the closing step reports the fragment (D-9), class only; it runs before the crash is logged
+		titles = [invocation.args[0] for invocation in self.log_error.call_args_list]
+		self.assertEqual(titles, [TITLE_STATUS_FAILED, TITLE_RUN_FAILED])
+		run_id = self.signals[0]["message"]["run_id"]
+		self.assertEqual(
+			self.log_error.call_args_list[0].args[1],
+			f"ticket={self.ticket.name} run_id={run_id} status_thinking: RuntimeError",
+		)
+		self.assertEqual(lines[0][5], 1)
+
+	def test_status_text_never_in_logs(self):
+		marker = "MARKERXYZ"
+		frappe.db.set_single_value(SETTING_DOCTYPE, "thinking_text", f"{marker} thinking")
+		self._gateway(*self._answer_turns())
+
+		def failing(event, message, room=None):
+			raise RuntimeError(f"{marker} {message['text']}")
+
+		with (
+			patch("frappe.realtime.emit_via_redis", side_effect=failing),
+			patch.object(frappe, "logger") as get_logger,
+			patch.object(frappe, "log_error") as log_error,
+		):
+			self._run("comment_mention")
+
+		entries = json.dumps(self._entries(), default=str, ensure_ascii=False)
+		error_log = json.dumps(
+			[list(invocation.args) for invocation in log_error.call_args_list], ensure_ascii=False
+		)
+		logger_lines = json.dumps(
+			[list(invocation.args) for invocation in get_logger.return_value.mock_calls], ensure_ascii=False
+		)
+		# non-vacuous: the failed `done` reached the Error Log and the summary line was written
+		self.assertEqual(len(log_error.call_args_list), 1)
+		self.assertIn("run_status", logger_lines)
+		for name, text in (("run log", entries), ("Error Log", error_log), ("logger", logger_lines)):
+			for forbidden in (marker, "Đang làm", *WORK_LABELS.values()):
+				with self.subTest(name=name, forbidden=forbidden):
+					self.assertNotIn(forbidden, text)
 
 	def _count_changes(self):
 		"""Run one mention run and return what it changed: (new Comments, new Tasks, ticket `modified` changed?)."""

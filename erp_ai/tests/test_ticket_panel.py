@@ -3,13 +3,16 @@ from unittest.mock import MagicMock, patch
 
 import frappe
 from frappe.tests.utils import FrappeTestCase
-from helpdesk.test_utils import create_agent, make_ticket
+from helpdesk.test_utils import create_agent, make_ticket, make_todo
 from helpdesk.utils import is_agent
 
 from erp_ai import ticket_panel
+from erp_ai.agent import answer_delay, runner
 from erp_ai.agent.policy import contains_keyword
-from erp_ai.constants import AGENT_USER, LOGGER_NAME, PANEL_METHODS
-from erp_ai.test_utils import FakeGateway, set_agent_settings
+from erp_ai.agent.queue import PENDING_JOB_IDS_FLAG
+from erp_ai.agent.run_log import write_entry
+from erp_ai.constants import AGENT_USER, LOG_DOCTYPE, LOGGER_NAME, PANEL_METHODS, ROLE_INSTRUCTOR
+from erp_ai.test_utils import FakeGateway, make_model_result, record_status_signals, set_agent_settings
 
 AI_FIELD_LABELS = (
 	("ai_resolution_hint", "Hướng giải quyết (AI)"),
@@ -542,3 +545,222 @@ class TestTicketPanelSend(FrappeTestCase):
 		logged = str(logger.mock_calls)
 		for leak in ("Secret", "Other", "a&b", self.KEYWORD, AGENT_EMAIL, AGENT_USER):
 			self.assertNotIn(leak, logged)
+
+
+class TestTicketPanelGateParity(FrappeTestCase):
+	"""AC-10, NFR-4: the panel and the Comments box reach the same agent decision in every gate branch."""
+
+	KEYWORD = "xin-bot"
+	TEXT = "Please look at this"
+	EXCLUDED_TEAM = "ERPAI-TEST-Parity-Excluded"
+	INSTRUCTOR_EMAIL = "panel.instructor@example.com"
+	SAVEPOINT = "erp_ai_gate_parity"
+	RUN_ROUTE = "erp_ai.agent.runner.run_for_ticket"
+
+	def setUp(self):
+		# Cleanups run LIFO: set_user, rollback, then the roles cache that the rollback leaves stale.
+		self.addCleanup(frappe.clear_cache, user=self.INSTRUCTOR_EMAIL)
+		self.addCleanup(frappe.db.rollback)
+		self.addCleanup(frappe.set_user, "Administrator")
+		frappe.set_user("Administrator")
+		commit_guard = patch.object(frappe.db, "commit", side_effect=AssertionError("test must not commit"))
+		commit_guard.start()
+		self.addCleanup(commit_guard.stop)
+		log_error = patch.object(frappe, "log_error")
+		log_error.start()
+		self.addCleanup(log_error.stop)
+		record_status_signals(self)
+		sleep_patch = patch.object(answer_delay, "_sleep")
+		sleep_patch.start()
+		self.addCleanup(sleep_patch.stop)
+		self.gateway = FakeGateway()
+		gateway_patch = patch("erp_ai.gateway.call_model", self.gateway)
+		gateway_patch.start()
+		self.addCleanup(gateway_patch.stop)
+		enqueue_patch = patch.object(frappe, "enqueue")
+		self.enqueue = enqueue_patch.start()
+		self.addCleanup(enqueue_patch.stop)
+
+		if not frappe.db.exists("Role", ROLE_INSTRUCTOR):
+			frappe.get_doc({"doctype": "Role", "role_name": ROLE_INSTRUCTOR}).insert(ignore_permissions=True)
+		create_agent(AGENT_EMAIL)
+		create_agent(self.INSTRUCTOR_EMAIL)
+		frappe.get_doc("User", self.INSTRUCTOR_EMAIL).add_roles(ROLE_INSTRUCTOR)
+
+	def _tool_turn(self):
+		block = {"type": "tool_use", "id": "toolu_1", "name": "get_ticket", "input": {}}
+		return make_model_result(content=[block], stop_reason="tool_use")
+
+	def _branches(self):
+		"""name -> (settings, ticket values, seeded runs, assigned agent, commenter, gateway results, expected jobs, expected gateway calls, expected instructor)."""
+		l1 = {"permission_level": "L1", "max_runs_per_ticket_per_day": 5, "max_turns_per_run": 4}
+		return {
+			"agent_off": (
+				{**l1, "enabled": 0},
+				{},
+				0,
+				False,
+				AGENT_EMAIL,
+				[],
+				0,
+				0,
+				None,
+			),
+			"level_L0": (
+				{**l1, "permission_level": "L0"},
+				{},
+				0,
+				False,
+				AGENT_EMAIL,
+				[],
+				1,
+				0,
+				None,
+			),
+			"excluded_group": (
+				{**l1, "excluded_teams": self.EXCLUDED_TEAM},
+				{"agent_group": self.EXCLUDED_TEAM},
+				0,
+				False,
+				AGENT_EMAIL,
+				[],
+				0,
+				0,
+				None,
+			),
+			"ai_opt_out": (l1, {"ai_opt_out": 1}, 0, False, AGENT_EMAIL, [], 0, 0, None),
+			"daily_limit": (
+				{**l1, "max_runs_per_ticket_per_day": 1},
+				{},
+				1,
+				False,
+				AGENT_EMAIL,
+				[],
+				1,
+				0,
+				None,
+			),
+			"turn_limit": (
+				{**l1, "max_turns_per_run": 1},
+				{},
+				0,
+				False,
+				AGENT_EMAIL,
+				[self._tool_turn()],
+				1,
+				1,
+				None,
+			),
+			"over_budget": (
+				{**l1, "permission_level": "L2", "monthly_budget_usd": 1, "spent_this_month_usd": 2},
+				{},
+				0,
+				False,
+				AGENT_EMAIL,
+				[],
+				1,
+				1,
+				None,
+			),
+			"instructor_role": (
+				{**l1, "permission_level": "L2"},
+				{},
+				0,
+				False,
+				self.INSTRUCTOR_EMAIL,
+				[],
+				1,
+				1,
+				self.INSTRUCTOR_EMAIL,
+			),
+			"assignee": ({**l1, "permission_level": "L2"}, {}, 0, True, AGENT_EMAIL, [], 1, 1, AGENT_EMAIL),
+			"other_person": (l1, {}, 0, False, AGENT_EMAIL, [], 1, 1, None),
+		}
+
+	def _decision(self, ticket, user, act, results):
+		"""Run `act` as `user`, then every agent job it queued; return what the decision looks like, then undo it all."""
+		frappe.db.savepoint(self.SAVEPOINT)
+		known = set(frappe.get_all(LOG_DOCTYPE, filters={"ticket": ticket}, pluck="name"))
+		self.enqueue.reset_mock()
+		self.gateway.calls.clear()
+		self.gateway.results = list(results)
+		frappe.flags.pop(PENDING_JOB_IDS_FLAG, None)
+		frappe.set_user(user)
+		try:
+			content_of = act()
+			jobs = [
+				call.kwargs
+				for call in self.enqueue.call_args_list
+				if call.args and call.args[0] == self.RUN_ROUTE
+			]
+		finally:
+			frappe.set_user("Administrator")
+		for job in jobs:
+			runner.run_for_ticket(job["ticket_name"], job["trigger"])
+		frappe.set_user("Administrator")
+		entries = [
+			row
+			for row in frappe.get_all(
+				LOG_DOCTYPE,
+				filters={"ticket": ticket},
+				fields=["name", "entry_type", "trigger", "turn", "stop_reason", "instructor"],
+				order_by="creation asc, name asc",
+			)
+			if row.name not in known
+		]
+		outcome = {
+			"jobs": [(job["ticket_name"], job["trigger"], job["job_id"]) for job in jobs],
+			"gateway": [
+				(call["task"], [tool["name"] for tool in call.get("tools") or []])
+				for call in self.gateway.calls
+			],
+			"log": [(e.entry_type, e.trigger, e.turn, e.stop_reason, e.instructor) for e in entries],
+			"content": frappe.db.get_value("Comment", content_of, "content"),
+		}
+		frappe.flags.pop(PENDING_JOB_IDS_FLAG, None)
+		frappe.db.rollback(save_point=self.SAVEPOINT)
+		return outcome
+
+	def test_send_matches_comments_box_in_every_gate_branch(self):
+		for name, branch in self._branches().items():
+			settings, ticket_values, seeded, assigned, user, results, want_jobs, want_calls, want_who = branch
+			with self.subTest(branch=name):
+				set_agent_settings(enabled=1, trigger_keyword=self.KEYWORD)
+				ticket = make_ticket(subject=f"Parity {name}").name
+				if ticket_values:
+					frappe.db.set_value("HD Ticket", ticket, ticket_values)
+				if assigned:
+					todo = make_todo(ticket, AGENT_EMAIL)
+					frappe.db.set_value("ToDo", todo, "assigned_by", "Administrator")
+				for index in range(seeded):
+					write_entry(
+						ticket=ticket,
+						run_id=f"ERPAI-TEST-parity-{index}",
+						entry_type="classify",
+						trigger="ticket_insert",
+						turn=0,
+					)
+				set_agent_settings(**settings)
+
+				def comments_box():
+					return frappe.get_doc("HD Ticket", ticket).new_comment(
+						f"<p>{self.TEXT} {self.KEYWORD}</p>"
+					)
+
+				def panel():
+					return ticket_panel.send_message(ticket, self.TEXT)["comment"]
+
+				via_box = self._decision(ticket, user, comments_box, results)
+				via_panel = self._decision(ticket, user, panel, results)
+
+				self.assertEqual(via_panel, via_box)
+				self.assertEqual(len(via_panel["jobs"]), want_jobs)
+				self.assertEqual(len(via_panel["gateway"]), want_calls)
+				if want_jobs:
+					self.assertTrue(via_panel["log"])
+				self.assertEqual(
+					{entry[4] for entry in via_panel["log"] if entry[0] == "reason"} or {None},
+					{want_who},
+				)
+				if name in ("excluded_group", "ai_opt_out"):
+					self.assertEqual(self.gateway.call_count, 0)

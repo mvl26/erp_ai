@@ -79,7 +79,7 @@ def decide_route(
 	)
 
 
-# Same normalization as policy.py (copied: routing does not import frappe yet).
+# Same normalization as policy.py (kept local so routing does not import policy).
 def _normalize(name) -> str:
 	return " ".join((name or "").split()).casefold()
 

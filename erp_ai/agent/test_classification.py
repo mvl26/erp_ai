@@ -43,6 +43,45 @@ class TestParseClassification(FrappeTestCase):
 			),
 		)
 
+	def test_scores_valid_each_level(self):
+		for level in classification.SCORE_VALUES:
+			result = classification.parse_classification(
+				_text(do_phuc_tap=level, do_quan_trong=level, ly_do_diem="Vì sao", bo_phan="Kế toán")
+			)
+			self.assertEqual(result.complexity, level)
+			self.assertEqual(result.importance, level)
+			self.assertEqual(result.score_reason, "Vì sao")
+			self.assertEqual(result.department, "Kế toán")
+		mixed = classification.parse_classification(_text(do_phuc_tap=1, do_quan_trong=3))
+		self.assertEqual((mixed.complexity, mixed.importance), (1, 3))
+
+	def test_bad_scores_mean_no_score(self):
+		missing_both = json.dumps(VALID)
+		bad_values = [0, 4, "2", True, 2.0, None, [2]]
+		cases = [missing_both]
+		for bad in bad_values:
+			cases.append(_text(do_phuc_tap=bad, do_quan_trong=2, ly_do_diem="Lý do"))
+			cases.append(_text(do_phuc_tap=2, do_quan_trong=bad, ly_do_diem="Lý do"))
+		for text in cases:
+			result = classification.parse_classification(text)
+			self.assertIsNotNone(result, text)
+			self.assertEqual(result.category, "A", text)
+			self.assertEqual((result.complexity, result.importance, result.score_reason), (0, 0, ""), text)
+
+	def test_score_reason_cut_to_25_words(self):
+		words = [f"từ{i}" for i in range(40)]
+		result = classification.parse_classification(
+			_text(do_phuc_tap=2, do_quan_trong=2, ly_do_diem=" ".join(words))
+		)
+		self.assertEqual(result.score_reason, " ".join(words[: classification.SCORE_REASON_MAX_WORDS]))
+		self.assertEqual(classification.SCORE_REASON_MAX_WORDS, 25)
+		short = classification.parse_classification(_text(do_phuc_tap=2, do_quan_trong=2, ly_do_diem="a b c"))
+		self.assertEqual(short.score_reason, "a b c")
+
+	def test_department_not_string_is_none(self):
+		for bad in (1, ["IT"], True, {}):
+			self.assertIsNone(classification.parse_classification(_text(bo_phan=bad)).department)
+
 	def test_parse_accepts_single_json_fence(self):
 		for fence in ("```json\n{}\n```", "```\n{}\n```", "  ```json\n{}\n```  "):
 			result = classification.parse_classification(fence.format(_text(dau_muc="C")))

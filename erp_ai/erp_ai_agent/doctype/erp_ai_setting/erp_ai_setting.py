@@ -98,9 +98,7 @@ class ERPAISetting(Document):
 			seen.add(label.lower())
 
 	def check_routing_rules(self):
-		# Blank is allowed: install writes the default when the DB value is NULL (T12); the loader treats blank as {}.
-		if (self.routing_rules or "").strip():
-			validate_routing_config(self.routing_rules)
+		validate_routing_config(self.routing_rules)
 
 	def check_limits(self):
 		for fieldname, (label, low, high) in INT_LIMITS.items():

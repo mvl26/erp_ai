@@ -1,6 +1,6 @@
 # Progress FEAT-006
 
-Edit không có trong bộ công cụ của tech-lead; tick và đổi touchpoint nằm ở đây, gộp vào `tasks.md` khi xong. Dòng ở đây thắng `tasks.md` khi lệch.
+Edit không có trong bộ công cụ của tech-lead; tick và đổi touchpoint nằm ở đây, gộp vào `tasks.md` khi xong. Dòng ở đây thắng `tasks.md` khi lệch. Chặng 4b (T20..T22) đã gộp vào file này ngày 2026-11-13; chặng 5 ghi ở `progress-c5.md` rồi gộp thẳng vào `tasks.md` ở C5.
 
 Quy trình:
 
@@ -9,7 +9,7 @@ Quy trình:
 - Nhánh task đang được checkout trong worktree dev cũ thì dev sửa vòng sau tạo nhánh `-reworkN` (hoặc `-cont`); tech-lead `merge --ff-only` vào nhánh task từ worktree của dev cũ, hoặc merge thẳng nhánh mới.
 - `review-NN.md`: NN = số task (T9b → `review-09b.md`).
 - BASE của task = `git rev-parse team/FEAT-006` ngay trước lần gọi dev (commit docs đứng trước lần gọi dev nên BASE là đầu nhánh sau commit docs đó).
-- role-policy chặn tech-lead ghi `.team/active-build` (chỉ cho `docs/team/**`, `.team/current.json`, `.team/session/**`): chặng 4a không tạo được cờ này; `stop-check.sh` không chạy lint/test cho lần dừng này (đã báo team-leader).
+- role-policy chặn tech-lead ghi `.team/active-build` ở các chặng trước (chỉ cho `docs/team/**`, `.team/current.json`, `.team/session/**`); chặng 5 dùng `touch` qua Bash.
 
 ## Đổi touchpoint
 
@@ -20,6 +20,7 @@ Quy trình:
 - T14 (tech-lead, cần team-leader xác nhận ở C3): thêm `erp_ai/agent/test_agent_runner.py`, chỉ sửa kỳ vọng `after` của 3 test (bỏ `ai_complexity`/`ai_importance` không đổi) vì `before`/`after` nay chỉ chứa trường đã đổi (tiêu chí T14, AC-16); cùng kiểu T1/T6/T11 (STD-TEST-5).
 - T18 (tech-lead, cần team-leader xác nhận ở C4a, ngày 2026-11-12): thêm `erp_ai/agent/routing.py`, chỉ thay lời gọi `resolve_ticket_values` (đã xóa) bằng tra thẳng `mapping` (`ticket_type`, `agent_group or None`) và bỏ import thừa; hành vi `decide_route` không đổi. Design mục 7 giao việc đổi chỗ gọi này cho T18.
 - T19 (tech-lead, cần team-leader xác nhận ở C4a, ngày 2026-11-12): thêm `erp_ai/tests/test_doctype_descriptions.py` (chỉ dữ liệu ghim cho 4 cột mới: `field_count` 31 → 35, 4 khóa `phrases`, `read_only_fields`), `erp_ai/agent/test_agent_runner.py` (dòng 240: `max_tokens` 400 → 600 theo D-8; setUp thêm `routing_rules=make_routing_rules()` theo finding review), `erp_ai/tests/test_handlers.py` (dòng 241: 400 → 600). Cùng kiểu T1/T6/T11/T14 (STD-TEST-5).
+- T20: thêm `erp_ai/agent/test_agent_runner.py` (kỳ vọng cũ của `TestRunnerL1Classification`). T21: thêm `erp_ai/erp_ai_agent/doctype/erp_ai_setting/erp_ai_setting.json` (description `auto_assign_enabled`), `erp_ai/tests/test_doctype_descriptions.py`.
 
 ## Tick
 
@@ -44,6 +45,15 @@ Quy trình:
 - [x] T17 — BASE=ebe8431, 2 vòng (1 vòng sửa), merge 6ab22a8, review-17; cmd.test đầu nhánh task 68da7fc: Ran 783 tests, OK
 - [x] T18 — BASE=5718e2f (docs commit 5718e2f là đầu nhánh sau review-17; dev dựng nhánh từ a62944e... xem dưới), 1 vòng, merge efba510, review-18; cmd.test đầu nhánh task 029890e: Ran 783 tests, OK
 - [x] T19 — BASE=a62944e, 2 vòng (1 vòng sửa; hai DESIGN_CONFLICT được giải bằng mở rộng touchpoint), merge 13a67f1, review-19; cmd.test đầu nhánh task c4d821f: Ran 792 tests, OK
+- [x] T20 — BASE=77dce93, 2 vòng (1 vòng sửa; 1 DESIGN_CONFLICT giải bằng mở rộng touchpoint `test_agent_runner.py`), merge 31d1dba, review-20; cmd.test đầu nhánh task d9fad65: Ran 807 tests, OK
+  - Quyết định: `value_before`/`value_after` lồng `{"ticket": {...}}` theo design 3.5 dòng 244 (T21 thêm "assign", T22 thêm "task").
+  - Ghi chú nhánh: `team/FEAT-006-task-20` giữ cc82977 (worktree dev trước còn giữ); đầu thật là `team/FEAT-006-task-20-rework1` d9fad65.
+- [x] T21 — BASE=b6d3504, 2 vòng (1 vòng sửa), merge f6a7f21, review-21; cmd.test đầu nhánh task 9dc0ca8: Ran 826 tests, OK
+  - Mở rộng touchpoint: `erp_ai_setting.json` (description `auto_assign_enabled`), `test_doctype_descriptions.py`. Đầu thật là `team/FEAT-006-task-21-rework1`.
+  - Concern: callback `after_commit`/realtime của `assign_to.add` không bị rollback savepoint hủy (thông báo ma rất hiếm, không rò dữ liệu).
+  - Deferred cho designer: design 4.2 và tasks.md dòng 143 ghi savepoint `erp_ai_route` từng đơn vị; mã dùng `erp_ai_route_unit` lồng.
+- [x] T22 — BASE=1b79b96, 2 vòng (1 vòng sửa), merge 5c6efd5, review-22; cmd.test đầu nhánh task 3db98bf: Ran 834 tests, OK
+  - Đầu thật là `team/FEAT-006-task-22-rework1`. Bị từ chối không ném: không Task, không comment, chỉ log (deferred cho designer).
 
 Ghi chú BASE T18: tech-lead ghi `BASE=5718e2f` (đầu nhánh `team/FEAT-006` ngay trước lần gọi dev T18, sau commit docs review-17); diff của review là `5718e2f..029890e`. Đầu nhánh sau docs review-18 là a62944e (BASE của T19).
 
@@ -70,6 +80,12 @@ Ghi chú BASE T18: tech-lead ghi `BASE=5718e2f` (đầu nhánh `team/FEAT-006` n
 - `migrate` (dev T19, `PYTHONPATH=<worktree> bench --site miyano migrate`): exit 0; `show columns` của `tabERP AI Log` có `predicted_complexity` int, `predicted_importance` int, `predicted_score_reason` text, `predicted_assignee` varchar.
 - Đã thêm ở chặng 4a: `set_classification` dùng `decide_route` (R1–R5 một chỗ, T17); `resolve_ticket_values` đã xóa, `grep` rỗng (T18); runner nạp `routing_rules`/`auto_assign`/`departments`, 600 token, 4 cột nhật ký, `decide_route` dùng `site_facts`/`policy` thật (T19). Chưa có (u1)–(u4) trong runner: `_route` nhận `auto_assign` và `subject` nhưng chưa dùng (T20/T21).
 
+## Checkpoint C4 (trên đầu nhánh sau merge 5c6efd5; cây mã trùng 3db98bf)
+
+- `cmd.test` (`bench --site miyano run-tests --app erp_ai`, dev chạy một mình trên đầu nhánh T22 rework 3db98bf): `Ran 834 tests in 157.432s`, `OK`. Tech-lead: `git diff --stat 3db98bf 5c6efd5 -- . ':!docs'` rỗng, tức cây mã sau merge trùng cây đã chạy xanh.
+- Đầu-cuối qua runner với FakeGateway (`TestRoutingTask::test_c_ticket_one_linked_task_assigned`): phiếu C → `actions` = `apply_route`, `assign_owner`, `create_routed_task`; 1 Task có ToDo của người cấu hình; phiếu gán đúng 1 người; `value_after` có `ticket`, `assign`, `task`; 0 comment; dòng info `assigned=1 task=1 comment=0 sla=ok`. SLA chỉ vào `actions` khi thiếu hoặc lệch (design 4.2 bước 2); ca có `sla_check`: `TestRoutingSla::test_slow_sla_warning_in_log`, `test_no_sla_one_warning_one_comment`. Ưu tiên/nhóm từ điểm: `TestRoutingEndToEnd::test_priority_from_scores_through_runner`.
+- Chưa chạy `migrate` ở C4: chặng 4b không đổi schema (chỉ `description` của `auto_assign_enabled`, JSON mô tả).
+
 ## Quyết định của team-leader sau C2 (journal "quyết định 4 điểm")
 
 1. `routing_rules` trống: bộ kiểm từ chối khi lưu (T9b, xong).
@@ -79,18 +95,10 @@ Ghi chú BASE T18: tech-lead ghi `BASE=5718e2f` (đầu nhánh `team/FEAT-006` n
 
 ## Việc dặn trước cho các task sau (từ review)
 
-- T20: `applied` của bản ghi `classify` dùng `result["ok"]`, không dùng "`after` khác rỗng" (review-14, `runner.py:276`); `applied_sla` có thể trả `resolution_s=None` khi phiếu có `sla` mà không có `priority`, T20 phải xử lý (review-13).
-- T20: `skipped_fields` = `skipped` của (u1) cộng `decision.notes` (design 4.2); `apply_route` (`route_ticket.py:41`) gọi `_existing_values` không truyền `notes` nên có thể ghi lý do "ánh xạ không có giá trị" cho D/E không bộ phận: bảo đảm bản ghi không có hai lý do mâu thuẫn (review-17).
-- T21: chỉ gọi `post_routing_comment` khi `lines` khác rỗng (review-15; `post_routing_comment([], ctx)` sẽ đăng comment rỗng).
-- T21/T26: sửa `description` của `auto_assign_enabled` (`erp_ai_setting.json:207`) cho khớp hành vi: "chưa có ai được gán" xét sau (u1) nên Assignment Rule của nhóm gán trong cùng lần save thì bot không gán; Task chỉ tạo khi bot tự gán được người, phiếu chưa có Task, chia sẻ tài liệu bật (review-19).
-- T22: lỗi chia sẻ ném `frappe.ValidationError` từ `create_routed_task` (không bị bắt); runner rollback Task + ToDo trong savepoint (review-16).
 - T26: thêm kiểm tĩnh `test_assign_to_only_in_route_module`, `test_no_share_bypass` (review-15, review-16).
-- design.md: bổ sung 2 hàng lỗi mới ở 3.3 (trống; khóa tiền tố rỗng, review-09b) và chỉnh 3.4 cho khớp tasks.md T14 (review-14); chỉnh dòng 108 ("không đọc bảng hệ thống trong `tools/`") cho khớp dòng 234 (`tools/` truyền `site_facts.is_active_agent`, review-17); việc của designer/khi gộp.
+- design.md: bổ sung 2 hàng lỗi mới ở 3.3 (trống; khóa tiền tố rỗng, review-09b) và chỉnh 3.4 cho khớp tasks.md T14 (review-14); chỉnh dòng 108 ("không đọc bảng hệ thống trong `tools/`") cho khớp dòng 234 (`tools/` truyền `site_facts.is_active_agent`, review-17); savepoint `erp_ai_route_unit` (review-21); ca bị từ chối không ném chỉ có log (review-22); việc của designer/khi gộp.
 - Dọn minor khi gộp: review-18 (`test_routing.py:92-104` dùng `_decide`; ca khẩn trùng), review-17 (không có ca phân biệt `routing_config or {}`).
-
-## Đang build
-
-Dừng ở C4a theo `--decide` (chặng 4a: T17, T18, T19 xong). Việc kế tiếp: T20 (depends T19, T14, T13), T21 (T20, T15, T8), T22.. theo `depends:`; MỘT dev mỗi lần.
+- (Đã làm ở T20..T22: `applied` dùng `result["ok"]`, `skipped_fields`, `applied_sla` `resolution_s=None`, chỉ đăng comment khi `lines` khác rỗng, `description` của `auto_assign_enabled`, rollback Task + ToDo.)
 
 ## Nhật ký
 
@@ -105,7 +113,7 @@ Dừng ở C4a theo `--decide` (chặng 4a: T17, T18, T19 xong). Việc kế ti�
 - 2026-11-12 C2: migrate exit 0, ensure_setup lần hai không đổi gì, cmd.test 738 OK; dừng báo cáo.
 - 2026-11-12 T9b: vòng 1 request-changes (major STD-ERR-3: thông báo trống nhắc tên hằng Python; minor: `.strip()` trên giá trị không phải chuỗi); vòng 2 approve; merge 4dc14d7; 744 OK.
 - 2026-11-12 T13: vòng 1 request-changes (major STD-TEST-2: bộ lọc `reference_type` không có ca mồi; 3 minor); vòng 2 approve; merge 43cca1f; 751 OK.
-- 2026-11-12 T14: vòng 1 request-changes (2 major: `before`/`after` liệt kê trường không đổi; test giả quyền bỏ qua `permission_type`); dev sửa DESIGN_CONFLICT vì 3 test `test_agent_runner.py` (kỳ vọng cũ) → tech-lead mở rộng touchpoint 1 file, dev khác sửa kỳ vọng; vòng 2 approve; merge 8fdc05f; 764 OK.
+- 2026-11-12 T14: vòng 1 request-changes (2 major: `before`/`after` liệt kê trường không đổi; test giả quyền bỏ qua `permission_type`); dev sửa DESIGN_CONFLICT vì 3 test `test_agent_runner.py` (kỳ vọng cũ) → tech-lead mở 1 file, dev khác sửa kỳ vọng; vòng 2 approve; merge 8fdc05f; 764 OK.
 - 2026-11-12 T15: reviewer approve vòng 1 (minor: `deny_read` của test từ chối đọc bỏ qua đối số user); merge 434fa4e; 769 OK.
 - 2026-11-12 T16: reviewer approve vòng 1 (3 minor); merge 7fdf122; 780 OK.
 - 2026-11-12 C3: dừng báo cáo; vai đã dùng: dev, reviewer (không tính lần gọi lại).
@@ -113,3 +121,7 @@ Dừng ở C4a theo `--decide` (chặng 4a: T17, T18, T19 xong). Việc kế ti�
 - 2026-11-12 T18: tech-lead phát hiện ở preflight `routing.py` còn import/gọi `resolve_ticket_values` (ngoài touchpoint) nên mở rộng touchpoint; reviewer approve vòng 1 (đủ 8 ca cũ); merge efba510; 783 OK.
 - 2026-11-12 T19: dev DESIGN_CONFLICT hai lần (kỳ vọng `test_doctype_descriptions` 31 trường; kỳ vọng `max_tokens` 400 ở `test_agent_runner`, `test_handlers`) → tech-lead mở rộng touchpoint và commit phần dở; dev lần 3 DONE; reviewer vòng 1 request-changes (major STD-TEST-6: test phụ thuộc cấu hình định tuyến của site); dev sửa và gom thành một commit; vòng 2 approve; merge 13a67f1; 792 OK; soát `description` của `auto_assign_enabled` xong, lệch ghi vào việc dặn trước (T21/T26).
 - 2026-11-12 C4a: dừng báo cáo sau T19; vai đã dùng: dev, reviewer (không tính lần gọi lại).
+- 2026-11-12 T20: dev lần 1 DESIGN_CONFLICT (5 test cũ `TestRunnerL1Classification` đổi kỳ vọng theo design) → tech-lead mở rộng touchpoint; dev lần 2 DONE_WITH_CONCERNS; reviewer vòng 1 request-changes (3 major STD-TEST-6/2/8); dev sửa; vòng 2 approve; merge 31d1dba; 807 OK.
+- 2026-11-12 T21: dev DONE (đột biến 13 test đỏ); reviewer vòng 1 request-changes (3 major: STD-TEST-8, STD-TEST-2 x2, đều ở test); dev sửa (chỉ test); vòng 2 approve; merge f6a7f21; 826 OK; khắc phục deferred review-19 (description `auto_assign_enabled`).
+- 2026-11-13 T22: dev DONE; reviewer vòng 1 request-changes (2 major: STD-TEST-8 ca bị từ chối không ném, STD-TEST-6 đếm ToDo toàn site); dev sửa (chỉ test); vòng 2 approve; merge 5c6efd5; 834 OK.
+- 2026-11-13 C4: dừng báo cáo sau T22; vai đã dùng: dev, reviewer (không tính lần gọi lại).

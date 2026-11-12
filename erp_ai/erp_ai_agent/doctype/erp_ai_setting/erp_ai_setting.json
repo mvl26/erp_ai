@@ -204,7 +204,7 @@
    "fieldtype": "Check",
    "label": "Tự gán người và tạo Task",
    "default": "0",
-   "description": "Bật thì từ L1, phiếu mới chưa có ai được gán sẽ được bot gán người theo Quy tắc định tuyến, và tạo 1 Task cho đầu mục C/D. Tắt thì không gán, không tạo Task. Trước khi bật: gỡ role thừa của tài khoản agent, tạo HD Agent cho người trong bảng."
+   "description": "Bật thì từ L1, bot gán người theo Quy tắc định tuyến nếu sau lần lưu định tuyến phiếu chưa có ai được gán (Assignment Rule của nhóm gán ngay trong lần lưu đó thì bot không gán). Task C/D chỉ tạo khi bot tự gán được người, phiếu chưa có Task, chia sẻ tài liệu bật. Tắt thì không gán, không tạo Task. Trước khi bật: gỡ role thừa của tài khoản agent, tạo HD Agent cho người trong bảng."
   },
   {
    "fieldname": "routing_rules",

@@ -3,6 +3,7 @@ import sys
 from unittest.mock import MagicMock, patch
 
 import frappe
+from frappe.desk.form import assign_to
 from helpdesk.test_utils import make_ticket
 
 from erp_ai.agent import runner
@@ -10,12 +11,19 @@ from erp_ai.agent.prompts import build_classify_request
 from erp_ai.agent.routing import departments, load_routing_config
 from erp_ai.agent.runner import BAD_ROUTING_ERROR, NO_SLA_REASON
 from erp_ai.agent.test_agent_runner import CLASSIFY_A, CLASSIFY_FIELDS, PREFIX, RunnerTestBase
+from erp_ai.agent.tools.route_ticket import (
+	ASSIGN_REQUEST,
+	NO_SLA,
+	REASON_ASSIGN_FAILED,
+	REASON_NO_VALID_ASSIGNEE,
+)
 from erp_ai.constants import AGENT_USER, CLASSIFIED_BY_HUMAN, LOGGER_NAME
 from erp_ai.test_utils import (
 	make_active_agent,
 	make_model_result,
 	make_routing_rules,
 	make_sla,
+	make_team,
 	set_agent_settings,
 )
 
@@ -300,9 +308,10 @@ class TestRoutingUnit(RoutingTestBase):
 		factory.assert_called_with(LOGGER_NAME)
 		lines = [call.args for call in logger.info.call_args_list if call.args[0].startswith("erp_ai route")]
 		self.assertEqual(len(lines), 1)
-		template, ticket, run_id, applied, sla = lines[0]
+		template, ticket, run_id, applied, assigned, comment, sla = lines[0]
 		self.assertNotIn("lines=", template)
 		self.assertEqual((ticket, applied, sla), (self.ticket.name, 1, "ok"))
+		self.assertEqual((assigned, comment), (0, 0))
 		self.assertTrue(run_id)
 
 	def test_broken_routing_rules_skip_sla_check_and_log_skipped(self):
@@ -321,7 +330,7 @@ class TestRoutingUnit(RoutingTestBase):
 		)
 		logger.warning.assert_not_called()
 		(info,) = [c.args for c in logger.info.call_args_list if c.args[0].startswith("erp_ai route")]
-		self.assertEqual((info[3], info[4]), (1, "skipped"))
+		self.assertEqual((info[3], info[6]), (1, "skipped"))
 
 	def test_apply_exception_keeps_earlier_error_and_adds_its_own(self):
 		set_agent_settings(routing_rules="{không phải json")
@@ -385,7 +394,7 @@ class TestRoutingSla(RoutingTestBase):
 		self.assertEqual(self._sla_actions(), [])
 		logger.warning.assert_not_called()
 
-	def test_no_sla_one_action_one_warning_and_no_sentence_posted_yet(self):
+	def test_no_sla_one_action_one_warning_and_one_line_gathered(self):
 		self._only_sla(condition=None)
 		set_agent_settings(auto_assign_enabled=1)
 		self._two_calls()
@@ -397,7 +406,6 @@ class TestRoutingSla(RoutingTestBase):
 			captured.append(real_route(*args))
 			return captured[-1]
 
-		before_comments = self._comment_count()
 		with (
 			patch.object(frappe, "logger", return_value=logger) as factory,
 			patch.object(runner, "_route", spy),
@@ -410,8 +418,60 @@ class TestRoutingSla(RoutingTestBase):
 		logger.warning.assert_called_once()
 		self.assertEqual(factory.call_args_list[-1].args, (LOGGER_NAME,))
 		self.assertIn(NO_SLA_REASON, logger.warning.call_args.args)
-		self.assertEqual(captured, [["Chưa có SLA áp vào phiếu, cần System Manager cấu hình."]])
-		self.assertEqual(self._comment_count(), before_comments)
+		self.assertEqual(captured, [[NO_SLA]])
+
+	def _configure_person(self, person):
+		mapping = {"A": {"ticket_type": ROUTE_TYPE, "agent_group": make_team(self), "priority": "High"}}
+		assignees = {cat: {"default": person, "prefixes": {}} for cat in "ABCF"}
+		set_agent_settings(
+			auto_assign_enabled=1,
+			category_mapping=json.dumps(mapping),
+			routing_rules=make_routing_rules(assignees=assignees),
+		)
+
+	def _comments_posted(self):
+		(posted,) = [
+			a for a in json.loads(self._single_entry().actions) if a["tool"] == "post_routing_comment"
+		]
+		self.assertEqual((posted["doctype"], posted["ok"]), ("Comment", True))
+		return frappe.db.get_value("Comment", posted["name"], "content")
+
+	def test_no_sla_one_warning_one_comment(self):
+		self._only_sla(condition=None)
+		person = make_active_agent(self)
+		self._configure_person(person)
+		self._two_calls()
+		logger = MagicMock()
+		before_comments = self._comment_count()
+		with patch.object(frappe, "logger", return_value=logger):
+			self._run()
+
+		logger.warning.assert_called_once()
+		self.assertEqual(self._comment_count(), before_comments + 1)
+		self.assertIn(NO_SLA, self._comments_posted())
+		self.assertNotIn(ASSIGN_REQUEST.split("{")[0], self._comments_posted())
+
+	def test_no_sla_and_assign_request_share_one_comment(self):
+		self._only_sla(condition=None)
+		self._configure_person(AGENT_USER)
+		self._two_calls()
+		before_comments = self._comment_count()
+		self._run()
+
+		self.assertEqual(self._comment_count(), before_comments + 1)
+		text = self._comments_posted()
+		self.assertIn(NO_SLA, text)
+		self.assertIn(ASSIGN_REQUEST.format(reason=REASON_NO_VALID_ASSIGNEE), text)
+
+	def test_switch_off_no_sla_still_one_comment(self):
+		self._only_sla(condition=None)
+		set_agent_settings(auto_assign_enabled=0)
+		self._two_calls()
+		before_comments = self._comment_count()
+		self._run()
+
+		self.assertEqual(self._comment_count(), before_comments + 1)
+		self.assertIn(NO_SLA, self._comments_posted())
 
 	def test_sla_without_priority_or_resolution_is_not_a_lag(self):
 		self._two_calls()
@@ -468,6 +528,286 @@ class TestRoutingSla(RoutingTestBase):
 		self.assertEqual(frappe.db.count("ToDo", {"reference_name": self.ticket.name}), 0)
 		self.assertEqual(self._comment_count(), before_comments)
 		self.assertEqual([call["task"] for call in self.gateway.calls], ["classify", "reason"])
+
+
+class AssignTestBase(RoutingTestBase):
+	"""(u2)/(u4): a configured person, a team with no Assignment Rule, a fixed SLA fact, the switch on."""
+
+	def setUp(self):
+		super().setUp()
+		self.person = make_active_agent(self)
+		self.team = make_team(self)
+		self._configure(self.team, self.person)
+		set_agent_settings(auto_assign_enabled=1)
+		# a fact with no resolution time never lags and never lacks: no SLA sentence joins the comment
+		sla = patch.object(
+			runner.site_facts,
+			"applied_sla",
+			return_value={"sla": f"{PREFIX}SLA", "priority": "High", "resolution_s": None},
+		)
+		sla.start()
+		self.addCleanup(sla.stop)
+		self.gateway.results = [
+			make_model_result(text=CLASSIFY_SCORED),
+			make_model_result(stop_reason="end_turn"),
+		]
+
+	def _configure(self, team, person):
+		mapping = {"A": {"ticket_type": ROUTE_TYPE, "agent_group": team, "priority": "High"}}
+		assignees = {cat: {"default": person, "prefixes": {}} for cat in "ABCF"}
+		set_agent_settings(
+			category_mapping=json.dumps(mapping), routing_rules=make_routing_rules(assignees=assignees)
+		)
+
+	def _assigned_to(self, ticket=None):
+		return frappe.get_all(
+			"ToDo",
+			filters={"reference_type": "HD Ticket", "reference_name": (ticket or self.ticket).name},
+			pluck="allocated_to",
+			order_by="creation, name",
+		)
+
+	def _notifications(self, user):
+		return frappe.db.count(
+			"Notification Log",
+			{"for_user": user, "document_type": "HD Ticket", "document_name": self.ticket.name},
+		)
+
+	def _action(self, tool):
+		return [a for a in json.loads(self._single_entry().actions) if a["tool"] == tool]
+
+	def _comment_text(self):
+		(posted,) = self._action("post_routing_comment")
+		self.assertEqual((posted["doctype"], posted["ok"]), ("Comment", True))
+		return frappe.db.get_value("Comment", posted["name"], "content")
+
+	def _task_count(self):
+		return frappe.db.count("Task", {"ai_ticket": self.ticket.name})
+
+
+class TestRoutingAssign(AssignTestBase):
+	def test_assigns_configured_person_one_notification(self):
+		before_comments = self._comment_count()
+		self._run()
+
+		self.assertEqual(self._assigned_to(), [self.person])
+		self.assertEqual(self._notifications(self.person), 1)
+		(action,) = self._action("assign_owner")
+		self.assertEqual((action["doctype"], action["name"], action["ok"]), ("HD Ticket", self.person, True))
+		entry = self._single_entry()
+		self.assertEqual(json.loads(entry.value_after)["assign"], [self.person])
+		self.assertEqual(entry.predicted_assignee, self.person)
+		self.assertEqual(self._comment_count(), before_comments)
+		self.assertEqual(self._task_count(), 0)
+		self.assertEqual([a["tool"] for a in json.loads(entry.actions)], ["apply_route", "assign_owner"])
+
+	def test_info_line_has_assigned_and_comment_flags(self):
+		logger = MagicMock()
+		with patch.object(frappe, "logger", return_value=logger):
+			self._run()
+
+		(info,) = [c.args for c in logger.info.call_args_list if c.args[0].startswith("erp_ai route")]
+		self.assertIn("assigned=%d comment=%d", info[0])
+		self.assertEqual(info[3:], (1, 1, 0, "ok"))
+
+	def test_info_line_counts_the_posted_comment(self):
+		self._configure(self.team, AGENT_USER)
+		logger = MagicMock()
+		with patch.object(frappe, "logger", return_value=logger):
+			self._run()
+
+		(info,) = [c.args for c in logger.info.call_args_list if c.args[0].startswith("erp_ai route")]
+		self.assertEqual(info[3:], (1, 0, 1, "ok"))
+
+	def test_team_rule_assigns_bot_does_not(self):
+		member = make_active_agent(self)
+		team = make_team(self, with_rule=True, rule_users=(member,))
+		self._configure(team, self.person)
+		with patch.object(runner, "assign_owner") as assign:
+			self._run()
+
+		assign.assert_not_called()
+		self.assertEqual(self._assigned_to(), [member])
+		self.assertEqual(self._notifications(self.person), 0)
+		(action,) = self._action("assign_owner")
+		self.assertFalse(action["ok"])
+		self.assertEqual(action["reason"], f"phiếu đã có người được gán: {member}")
+		self.assertEqual(action["rule"], frappe.db.get_value("HD Team", team, "assignment_rule"))
+
+	def test_agent_account_never_assigned_one_comment(self):
+		self._configure(self.team, AGENT_USER)
+		before_comments = self._comment_count()
+		with patch.object(runner, "assign_owner") as assign:
+			self._run()
+
+		assign.assert_not_called()
+		self.assertEqual(self._assigned_to(), [])
+		(action,) = self._action("assign_owner")
+		self.assertEqual((action["ok"], action["reason"]), (False, "không gán tài khoản agent"))
+		self.assertEqual(self._comment_count(), before_comments + 1)
+		self.assertIn(ASSIGN_REQUEST.format(reason=REASON_NO_VALID_ASSIGNEE), self._comment_text())
+		self.assertFalse(self._single_entry().predicted_assignee)
+		self.assertEqual(self._task_count(), 0)
+
+	def test_failed_assign_one_comment_and_no_second_try(self):
+		before_comments = self._comment_count()
+		with patch.object(runner, "assign_owner", side_effect=ValueError("x")) as assign:
+			self._run()
+
+		assign.assert_called_once()
+		(action,) = self._action("assign_owner")
+		self.assertEqual((action["ok"], action["reason"]), (False, "ValueError"))
+		self.assertIn("route assign_owner: ValueError", self._single_entry().error)
+		self.assertEqual(self._comment_count(), before_comments + 1)
+		self.assertIn(ASSIGN_REQUEST.format(reason=REASON_ASSIGN_FAILED), self._comment_text())
+		self.assertEqual(self._assigned_to(), [])
+
+	def test_assign_that_wrote_then_raised_is_undone_but_route_kept(self):
+		def write_then_raise(user, context):
+			assign_to.add({"assign_to": [user], "doctype": "HD Ticket", "name": context.ticket_name})
+			raise ValueError("x")
+
+		with patch.object(runner, "assign_owner", side_effect=write_then_raise) as assign:
+			self._run()
+
+		assign.assert_called_once()
+		self.assertEqual(self._assigned_to(), [])
+		row = self._ticket_row()
+		self.assertEqual((row.agent_group, row.priority), (self.team, "Urgent"))
+		entry = self._single_entry()
+		self.assertEqual(entry.applied, 1)
+		self.assertEqual([a["ok"] for a in json.loads(entry.actions)][:2], [True, False])
+		self.assertIn("route assign_owner: ValueError", entry.error)
+
+	def test_comment_that_wrote_then_raised_is_undone_but_route_kept(self):
+		self._configure(self.team, AGENT_USER)
+		real_post = runner.post_routing_comment
+
+		def write_then_raise(lines, context):
+			real_post(lines, context)
+			raise ValueError("x")
+
+		before_comments = self._comment_count()
+		with patch.object(runner, "post_routing_comment", side_effect=write_then_raise):
+			self._run()
+
+		self.assertEqual(self._comment_count(), before_comments)
+		row = self._ticket_row()
+		self.assertEqual((row.agent_group, row.priority), (self.team, "Urgent"))
+		entry = self._single_entry()
+		self.assertEqual(entry.applied, 1)
+		self.assertIn("route post_routing_comment: ValueError", entry.error)
+
+	def test_refused_assign_one_comment(self):
+		before_comments = self._comment_count()
+		refusal = {"ok": False, "reason": "thiếu quyền đọc phiếu"}
+		with patch.object(runner, "assign_owner", return_value=refusal):
+			self._run()
+
+		(action,) = self._action("assign_owner")
+		self.assertEqual((action["ok"], action["reason"]), (False, "thiếu quyền đọc phiếu"))
+		self.assertEqual(self._comment_count(), before_comments + 1)
+		self.assertIn(ASSIGN_REQUEST.format(reason=REASON_ASSIGN_FAILED), self._comment_text())
+
+	def test_comment_exception_recorded_not_raised_not_retried(self):
+		self._configure(self.team, AGENT_USER)
+		with patch.object(runner, "post_routing_comment", side_effect=ValueError("x")) as post:
+			self._run()
+
+		post.assert_called_once()
+		self.log_error.assert_not_called()
+		(action,) = self._action("post_routing_comment")
+		self.assertEqual((action["ok"], action["reason"]), (False, "ValueError"))
+		self.assertIn("route post_routing_comment: ValueError", self._single_entry().error)
+		self.assertEqual([call["task"] for call in self.gateway.calls], ["classify", "reason"])
+
+	def test_changed_default_person_assigned_next_run(self):
+		self._run()
+		self.assertEqual(self._assigned_to(), [self.person])
+
+		other = make_active_agent(self)
+		self._configure(self.team, other)
+		second = make_ticket(subject=f"{PREFIX}runner second ticket")
+		self.gateway.results = [
+			make_model_result(text=CLASSIFY_SCORED),
+			make_model_result(stop_reason="end_turn"),
+		]
+		runner.run_for_ticket(second.name, "ticket_insert")
+
+		self.assertEqual(self._assigned_to(second), [other])
+		self.assertEqual(self._assigned_to(), [self.person])
+
+
+class TestRoutingNoOverride(AssignTestBase):
+	def test_existing_assignment_kept(self):
+		earlier = make_active_agent(self)
+		assign_to.add({"assign_to": [earlier], "doctype": "HD Ticket", "name": self.ticket.name})
+		before_comments = self._comment_count()
+		with patch.object(runner, "assign_owner") as assign:
+			self._run()
+
+		assign.assert_not_called()
+		self.assertEqual(self._assigned_to(), [earlier])
+		(action,) = self._action("assign_owner")
+		self.assertEqual((action["ok"], action["reason"]), (False, f"phiếu đã có người được gán: {earlier}"))
+		self.assertNotIn("rule", action)
+		self.assertEqual(self._comment_count(), before_comments)
+		self.assertEqual(self._task_count(), 0)
+
+	def test_rule_assignment_in_route_save_kept(self):
+		member = make_active_agent(self)
+		team = make_team(self, with_rule=True, rule_users=(member,))
+		self._configure(team, self.person)
+		before_comments = self._comment_count()
+		self._run()
+
+		# one ToDo in total, the rule's; the configured person got nothing and no request was posted
+		self.assertEqual(self._assigned_to(), [member])
+		self.assertEqual(self._notifications(self.person), 0)
+		self.assertEqual(self._comment_count(), before_comments)
+		self.assertEqual(self._task_count(), 0)
+		self.assertNotIn("assign", json.loads(self._single_entry().value_after))
+
+	def test_human_classified_no_route_writes(self):
+		frappe.db.set_value("HD Ticket", self.ticket.name, "ai_classified_by", CLASSIFIED_BY_HUMAN)
+		before_comments = self._comment_count()
+		with (
+			patch.object(runner, "assign_owner") as assign,
+			patch.object(runner, "post_routing_comment") as post,
+		):
+			self._run()
+
+		assign.assert_not_called()
+		post.assert_not_called()
+		self.assertEqual(self._assigned_to(), [])
+		self.assertEqual(self._comment_count(), before_comments)
+		self.assertEqual([a["tool"] for a in json.loads(self._single_entry().actions)], ["apply_route"])
+
+	def test_switch_off_no_todo_no_task(self):
+		set_agent_settings(auto_assign_enabled=0)
+		before_comments = self._comment_count()
+		with patch.object(runner, "assign_owner") as assign:
+			self._run()
+
+		assign.assert_not_called()
+		self.assertEqual(self._assigned_to(), [])
+		self.assertEqual(self._task_count(), 0)
+		self.assertEqual(self._comment_count(), before_comments)
+		self.assertEqual([a["tool"] for a in json.loads(self._single_entry().actions)], ["apply_route"])
+
+	def test_l0_no_todo_no_task(self):
+		set_agent_settings(permission_level="L0")
+		before_comments = self._comment_count()
+		with patch.object(runner, "assign_owner") as assign:
+			self._run()
+
+		assign.assert_not_called()
+		self.assertEqual(self._assigned_to(), [])
+		self.assertEqual(self._task_count(), 0)
+		self.assertEqual(self._comment_count(), before_comments)
+		entry = self._single_entry()
+		self.assertFalse(entry.actions)
+		self.assertEqual(entry.predicted_assignee, self.person)
 
 
 class TestRoutingLog(RoutingTestBase):

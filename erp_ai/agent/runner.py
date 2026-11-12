@@ -15,7 +15,15 @@ from erp_ai.agent.run_log import write_entry
 from erp_ai.agent.run_status import CLASSIFY_STEP, RunStatus
 from erp_ai.agent.tools.read import TOOL_RESULT_MAX_CHARS
 from erp_ai.agent.tools.registry import ToolContext, execute_tool, get_tool_schemas
-from erp_ai.agent.tools.route_ticket import NO_SLA, apply_route
+from erp_ai.agent.tools.route_ticket import (
+	ASSIGN_REQUEST,
+	NO_SLA,
+	REASON_ASSIGN_FAILED,
+	REASON_NO_VALID_ASSIGNEE,
+	apply_route,
+	assign_owner,
+	post_routing_comment,
+)
 from erp_ai.constants import (
 	AGENT_USER,
 	JOB_SAFETY_MARGIN_S,
@@ -53,6 +61,8 @@ BAD_ROUTING_ERROR = "routing_rules không hợp lệ, định tuyến dùng giá
 NO_SCORE_REASON = "không có điểm"
 NO_SLA_REASON = "chưa có SLA áp vào phiếu"
 ROUTE_SAVEPOINT = "erp_ai_route"
+# One write unit after (u1) (assign, comment) nests inside the savepoint above.
+ROUTE_UNIT_SAVEPOINT = "erp_ai_route_unit"
 USAGE_COLUMNS = ("input_tokens", "output_tokens", "cache_creation_input_tokens", "cache_read_input_tokens")
 
 
@@ -281,20 +291,27 @@ def _classify(ticket_name, trigger, run_id, mapping, routing, context, auto_assi
 def _route(log_name, classification, decision, context, auto_assign, subject):
 	"""Run the route unit (u1), check the SLA and record the outcome on the entry as one unit (design 4.2).
 
-	Returns `lines`, the fixed sentences the later steps will post as one comment. Nothing here raises for
-	an unusable (u1): it is rolled back, recorded as `ok=false` with the exception class only (D-16).
+	Returns `lines`, the fixed sentences gathered for the one routing comment (already posted by (u4)).
+	Nothing here raises for an unusable unit: it is rolled back, recorded as `ok=false` with the exception
+	class only (D-16). (u1) failing or refusing stops the SLA check and (u2)-(u4).
 
 	The ticket change and the entry update share a savepoint: an exception between them undoes the
 	ticket change, so the entry never says applied=0 over a changed ticket (the entry row itself was
 	committed before and survives). Nothing is committed until both are written.
 	"""
 	actions, lines, errors = [], [], []
+	assigned = commented = None
+	sla = None
 	frappe.db.savepoint(ROUTE_SAVEPOINT)
 	try:
 		result = _apply_route_unit(decision, classification, context, actions, errors)
-		sla = _check_sla(classification.category, context, actions, lines) if result else None
-		_record_route(log_name, result, decision, actions, errors)
-		_log_route_summary(context, result, sla)
+		if result:
+			sla = _check_sla(classification.category, context, actions, lines)
+			if auto_assign:
+				assigned = _assign_unit(decision, context, actions, lines, errors)
+			commented = _comment_unit(lines, context, actions, errors)
+		_record_route(log_name, result, decision, assigned, actions, errors)
+		_log_route_summary(context, result, assigned, commented, sla)
 	except Exception:
 		frappe.db.rollback(save_point=ROUTE_SAVEPOINT)
 		raise
@@ -304,14 +321,80 @@ def _route(log_name, classification, decision, context, auto_assign, subject):
 	return lines
 
 
-def _route_action(tool, doctype, name, ok, reason=None):
+def _route_action(tool, doctype, name, ok, reason=None, rule=None):
 	return {
 		"tool": tool,
 		"doctype": doctype,
 		"name": name,
 		"ok": ok,
 		**({"reason": reason} if reason else {}),
+		**({"rule": rule} if rule else {}),
 	}
+
+
+def _run_unit(tool, call, doctype, name, actions, errors):
+	"""Run one write unit in its own savepoint. Returns its result when ok, else None (recorded in `actions`).
+
+	An exception undoes the unit, is recorded by class only and is not retried (ADR-020 QĐ 6).
+	"""
+	frappe.db.savepoint(ROUTE_UNIT_SAVEPOINT)
+	try:
+		result = call()
+	except Exception as exc:
+		frappe.db.rollback(save_point=ROUTE_UNIT_SAVEPOINT)
+		error = type(exc).__name__
+		errors.append(f"route {tool}: {error}")
+		actions.append(_route_action(tool, doctype, name, False, error))
+		return None
+	frappe.db.release_savepoint(ROUTE_UNIT_SAVEPOINT)
+	if not result.get("ok"):
+		actions.append(_route_action(tool, doctype, name, False, result.get("reason")))
+		return None
+	return result
+
+
+def _assign_unit(decision, context, actions, lines, errors):
+	"""(u2): give the ticket to the configured person unless someone already owns it. Returns the user or None.
+
+	Looked at after (u1): a team's Assignment Rule fires inside (u1)'s save, and then the bot stays out (ADR-020 QĐ 2).
+	"""
+	ticket = context.ticket_name
+	existing = site_facts.ticket_assignments(ticket)
+	if existing:
+		users = ", ".join(dict.fromkeys(row["allocated_to"] for row in existing))
+		rule = next((row["assignment_rule"] for row in existing if row["assignment_rule"]), None)
+		reason = f"phiếu đã có người được gán: {users}"
+		actions.append(_route_action("assign_owner", "HD Ticket", ticket, False, reason, rule))
+		return None
+	user = decision.assignee
+	if user is None:
+		note = next((item["reason"] for item in decision.notes if item["field"] == "assignee"), None)
+		actions.append(_route_action("assign_owner", "HD Ticket", ticket, False, note))
+		lines.append(ASSIGN_REQUEST.format(reason=REASON_NO_VALID_ASSIGNEE))
+		return None
+	if _run_unit("assign_owner", lambda: assign_owner(user, context), "HD Ticket", user, actions, errors):
+		actions.append(_route_action("assign_owner", "HD Ticket", user, True))
+		return user
+	lines.append(ASSIGN_REQUEST.format(reason=REASON_ASSIGN_FAILED))
+	return None
+
+
+def _comment_unit(lines, context, actions, errors):
+	"""(u4): post the gathered sentences as at most one comment. Returns True when it was posted."""
+	if not lines:
+		return False
+	result = _run_unit(
+		"post_routing_comment",
+		lambda: post_routing_comment(lines, context),
+		"Comment",
+		None,
+		actions,
+		errors,
+	)
+	if result is None:
+		return False
+	actions.append(_route_action("post_routing_comment", "Comment", result["comment"], True))
+	return True
 
 
 def _apply_route_unit(decision, classification, context, actions, errors):
@@ -353,13 +436,17 @@ def _check_sla(category, context, actions, lines):
 	return state
 
 
-def _record_route(log_name, result, decision, actions, errors):
+def _record_route(log_name, result, decision, assigned, actions, errors):
 	"""Update the `classify` entry once (design 3.5)."""
 	updates = {"applied": 1 if result else 0, "actions": json.dumps(actions, ensure_ascii=False)}
 	if result:
-		for column, key in (("value_before", "before"), ("value_after", "after")):
-			if result.get(key):
-				updates[column] = json.dumps({"ticket": result[key]}, ensure_ascii=False)
+		before = {"ticket": result["before"]} if result.get("before") else {}
+		after = {"ticket": result["after"]} if result.get("after") else {}
+		if assigned:
+			after["assign"] = [assigned]
+		for column, value in (("value_before", before), ("value_after", after)):
+			if value:
+				updates[column] = json.dumps(value, ensure_ascii=False)
 		# a route note names the reason a field was left empty; it replaces the generic reason for that field
 		noted = {note["field"] for note in decision.notes}
 		skipped = [item for item in result.get("skipped") or [] if item["field"] not in noted]
@@ -372,13 +459,15 @@ def _record_route(log_name, result, decision, actions, errors):
 	frappe.db.set_value(LOG_DOCTYPE, log_name, updates, update_modified=False)
 
 
-def _log_route_summary(context, result, sla):
+def _log_route_summary(context, result, assigned, commented, sla):
 	"""One info line, codes and numbers only (STD-OPS-5, NFR-4')."""
 	frappe.logger(LOGGER_NAME).info(
-		"erp_ai route ticket=%s run_id=%s applied=%d sla=%s",
+		"erp_ai route ticket=%s run_id=%s applied=%d assigned=%d comment=%d sla=%s",
 		context.ticket_name,
 		context.run_id,
 		1 if result else 0,
+		1 if assigned else 0,
+		1 if commented else 0,
 		sla or "-",
 	)
 

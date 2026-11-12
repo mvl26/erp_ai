@@ -17,8 +17,9 @@ import shlex
 import sys
 import unittest
 from pathlib import Path
+from typing import ClassVar
 
-from erp_ai.constants import PANEL_METHODS
+from erp_ai.constants import AGENT_STATUS_EVENT, PANEL_METHODS
 
 PACKAGE_ROOT = Path(__file__).resolve().parent.parent
 REPO_ROOT = PACKAGE_ROOT.parent
@@ -1094,6 +1095,306 @@ def check_install_deletes_only_status_script(sources: dict) -> list:
 	return violations
 
 
+# ---------------------------------------------------------------------------------------------------
+# FEAT-003 (ADR-009, ADR-010 Amendment 1): the ticket-page panel script and the two whitelisted methods
+# ---------------------------------------------------------------------------------------------------
+
+PANEL_FILE = "ticket_panel.py"
+PANEL_MODULE = "erp_ai.ticket_panel"
+STATUS_SCRIPT_STATE_NAME = "__erpAiAgentStatus"
+STATUS_SCRIPT_ONCE_BLOCK = "if (state.socket !== socket) {"
+STATUS_SCRIPT_SOCKET_EVENTS = ("docinfo_update", "doc_update", "connect", "disconnect")
+STATUS_SCRIPT_QUERY_CALLS = re.compile(r"\b(querySelector(?:All)?|getElementById|getElementsBy\w+)\(")
+STATUS_SCRIPT_ALLOWED_QUERIES = {"querySelector": "#app", "getElementById": "app"}
+# ADR-010 Amendment 1 (read writes nothing, one comment call) and Decision 8 (no agent gates in the panel).
+PANEL_FORBIDDEN_NAMES = frozenset(
+	{
+		"ignore_permissions",
+		"set_user",
+		"get_all",
+		"get_values",
+		"sql",
+		"set_value",
+		"db_set",
+		"insert",
+		"save",
+		"commit",
+		"rollback",
+		"cache",
+		"publish_realtime",
+	}
+)
+PANEL_FORBIDDEN_PREFIXES = ("delete",)
+PANEL_SEND_FUNCTION = "send_message"
+PANEL_COMMENT_CALL = "new_comment"
+PANEL_GATE_NAMES = (
+	"is_enabled",
+	"can_send_ticket",
+	"effective_level",
+	"runs_today",
+	"enqueue",
+	"permission_level",
+	"excluded_teams",
+	"ai_opt_out",
+)
+
+
+def mask_js(script: str) -> str:
+	"""The script with comments and the inside of string literals blanked (same length, newlines kept), so
+	positions and braces can be found without matching text that sits in a string or a comment."""
+	out = []
+	i, n = 0, len(script)
+	while i < n:
+		ch = script[i]
+		pair = script[i : i + 2]
+		if pair == "//":
+			end = script.find("\n", i)
+			end = n if end == -1 else end
+			out.append(" " * (end - i))
+			i = end
+		elif pair == "/*":
+			end = script.find("*/", i + 2)
+			end = n if end == -1 else end + 2
+			out.append("".join(c if c == "\n" else " " for c in script[i:end]))
+			i = end
+		elif ch in "\"'`":
+			j = i + 1
+			while j < n and script[j] != ch:
+				j += 2 if script[j] == "\\" else 1
+			out.append(ch + "".join(c if c == "\n" else " " for c in script[i + 1 : j]) + script[j : j + 1])
+			i = j + 1
+		else:
+			out.append(ch)
+			i += 1
+	return "".join(out)
+
+
+def js_line(script: str, offset: int) -> int:
+	return script.count("\n", 0, offset) + 1
+
+
+def whitelisted_functions(sources: dict) -> list:
+	"""`[(rel, function node, decorator node)]` for every function decorated with `frappe.whitelist`."""
+	found = []
+	for rel, source in only_python(sources).items():
+		tree = parse(rel, source)
+		aliases = import_aliases(tree)
+		for node in ast.walk(tree):
+			if not isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
+				continue
+			for decorator in node.decorator_list:
+				target = decorator.func if isinstance(decorator, ast.Call) else decorator
+				if resolved_name(target, aliases) == "frappe.whitelist":
+					found.append((rel, node, decorator))
+	return found
+
+
+def whitelisted_paths(sources: dict) -> set:
+	return {f"{module_name(rel)}.{node.name}" for rel, node, _decorator in whitelisted_functions(sources)}
+
+
+def check_call_allow_list(script: str, allowed_methods, sources: dict) -> list:
+	"""ADR-009: the literals passed to `call(` are exactly the allowed methods, each a whitelisted function."""
+	violations = check_status_script_calls(script, allowed_methods)
+	literals = {m.group(2) for m in STATUS_SCRIPT_CALL.finditer(script) if m.group(1) is not None}
+	for missing in sorted(set(allowed_methods) - literals):
+		violations.append(f"{missing} is in PANEL_METHODS but the script never calls it")
+	paths = whitelisted_paths(sources)
+	for literal in sorted(literals):
+		if literal not in paths:
+			violations.append(f"{literal} does not point to a @frappe.whitelist function")
+	return violations
+
+
+def check_status_script_queries(script: str) -> list:
+	"""ADR-009: element lookups only for the Vue root (`#app`), never into Helpdesk's own DOM."""
+	violations = []
+	masked = mask_js(script)
+	for match in STATUS_SCRIPT_QUERY_CALLS.finditer(masked):
+		line = js_line(script, match.start())
+		argument = re.match(r"\s*([\"'])(.*?)\1\s*\)", script[match.end() :])
+		if argument is None or STATUS_SCRIPT_ALLOWED_QUERIES.get(match.group(1)) != argument.group(2):
+			violations.append(f"line {line}: {match.group(1)}( is only allowed with the Vue root (#app)")
+	return violations
+
+
+def check_status_script_window_state(script: str) -> list:
+	"""ADR-009: one `window.__erpAi…` state object and no other property written on `window`."""
+	violations = []
+	names = set(re.findall(r"__erpAi\w*", script))
+	if names != {STATUS_SCRIPT_STATE_NAME}:
+		violations.append(f"window state names are {sorted(names)}, expected only {STATUS_SCRIPT_STATE_NAME}")
+	masked = mask_js(script)
+	for match in re.finditer(r"\bwindow\.(\w+)\s*=(?!=)", masked):
+		if match.group(1) != STATUS_SCRIPT_STATE_NAME:
+			violations.append(f"line {js_line(script, match.start())}: window.{match.group(1)} is written")
+	for match in re.finditer(r"\bwindow\s*\[", masked):
+		violations.append(f"line {js_line(script, match.start())}: window[...] access hides a second state")
+	return violations
+
+
+def _matching_brace(masked: str, open_at: int) -> int:
+	depth = 0
+	for i in range(open_at, len(masked)):
+		if masked[i] == "{":
+			depth += 1
+		elif masked[i] == "}":
+			depth -= 1
+			if depth == 0:
+				return i
+	return -1
+
+
+def socket_on_registrations(script: str) -> list:
+	"""`[(line, inside the once-per-socket block, event name or None)]` for every `.on(` call."""
+	masked = mask_js(script)
+	start = masked.find(STATUS_SCRIPT_ONCE_BLOCK)
+	block = (-1, -1)
+	if start != -1:
+		open_at = start + len(STATUS_SCRIPT_ONCE_BLOCK) - 1
+		block = (open_at, _matching_brace(masked, open_at))
+	declared = re.search(r"const EVENT = \"([^\"]*)\"", script)
+	found = []
+	for match in re.finditer(r"\.on\(", masked):
+		argument = re.match(r"\s*(?:\"([^\"]*)\"|([A-Za-z_$][\w$]*))", script[match.end() :])
+		name = None
+		if argument is not None and argument.group(1) is not None:
+			name = argument.group(1)
+		elif argument is not None and argument.group(2) == "EVENT" and declared:
+			name = declared.group(1)
+		inside = block[0] < match.start() < block[1]
+		found.append((js_line(script, match.start()), inside, name))
+	return found
+
+
+def check_socket_on_only_in_once_block(script: str, status_event: str) -> list:
+	"""ADR-009: every `.on(` sits in the `if (state.socket !== socket)` block and names an allowed event."""
+	violations = []
+	if mask_js(script).find(STATUS_SCRIPT_ONCE_BLOCK) == -1:
+		violations.append(f"the once-per-socket block {STATUS_SCRIPT_ONCE_BLOCK} is missing")
+	allowed = {status_event, *STATUS_SCRIPT_SOCKET_EVENTS}
+	for line, inside, name in socket_on_registrations(script):
+		if not inside:
+			violations.append(f"line {line}: .on( is outside the once-per-socket block")
+		if name not in allowed:
+			violations.append(f"line {line}: event {name!r} is not one of {sorted(allowed)}")
+	return violations
+
+
+def check_whitelisted_methods_declare_http_methods(sources: dict) -> list:
+	"""ADR-010: every `@frappe.whitelist` in the app names its HTTP methods and never allows guests."""
+	violations = []
+	for rel, node, decorator in whitelisted_functions(sources):
+		if not isinstance(decorator, ast.Call):
+			violations.append(
+				violation(rel, decorator, f"{node.name}: bare @frappe.whitelist, methods= missing")
+			)
+			continue
+		keywords = {kw.arg: kw.value for kw in decorator.keywords}
+		if "allow_guest" in keywords:
+			violations.append(violation(rel, decorator, f"{node.name}: allow_guest is not allowed"))
+		methods = keywords.get("methods")
+		if not (
+			isinstance(methods, ast.List | ast.Tuple)
+			and methods.elts
+			and all(isinstance(e, ast.Constant) and isinstance(e.value, str) for e in methods.elts)
+		):
+			violations.append(violation(rel, decorator, f"{node.name}: methods= must list HTTP methods"))
+	return violations
+
+
+def check_ticket_panel_whitelist(sources: dict, expected=PANEL_METHODS) -> list:
+	"""ADR-010 Amendment 1: exactly the two panel methods, each `methods=["POST"]` and nothing else."""
+	if PANEL_FILE not in sources:
+		return [f"{PANEL_FILE} is missing"]
+	violations = []
+	own = whitelisted_functions({PANEL_FILE: sources[PANEL_FILE]})
+	paths = sorted(f"{PANEL_MODULE}.{node.name}" for _rel, node, _decorator in own)
+	if paths != sorted(expected):
+		violations.append(f"whitelisted functions are {paths}, expected {sorted(expected)}")
+	for rel, node, decorator in own:
+		methods = None
+		if isinstance(decorator, ast.Call):
+			methods = {kw.arg: kw.value for kw in decorator.keywords}.get("methods")
+		values = (
+			[e.value if isinstance(e, ast.Constant) else None for e in methods.elts]
+			if isinstance(methods, ast.List | ast.Tuple)
+			else None
+		)
+		if values != ["POST"]:
+			violations.append(violation(rel, decorator, f'{node.name}: methods must be exactly ["POST"]'))
+	return violations
+
+
+def _panel_identifiers(tree: ast.AST):
+	"""`(node, name)` for every identifier-like use: names, attributes, keyword names, imported names."""
+	for node in ast.walk(tree):
+		if isinstance(node, ast.Name):
+			yield node, node.id
+		elif isinstance(node, ast.Attribute):
+			yield node, node.attr
+		elif isinstance(node, ast.keyword) and node.arg:
+			yield node, node.arg
+		elif isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
+			yield node, node.name
+		elif isinstance(node, ast.Import | ast.ImportFrom):
+			for alias in node.names:
+				yield node, alias.name.rpartition(".")[2]
+
+
+def _comment_calls(root: ast.AST) -> list:
+	return [
+		n
+		for n in ast.walk(root)
+		if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) and n.func.attr == PANEL_COMMENT_CALL
+	]
+
+
+def check_ticket_panel_forbidden_calls(sources: dict) -> list:
+	"""ADR-010 Amendment 1: no permission bypass, user switch, raw query, write, commit, cache or realtime in
+	the panel module; exactly one `.new_comment(` and it sits in `send_message`."""
+	if PANEL_FILE not in sources:
+		return [f"{PANEL_FILE} is missing"]
+	tree = parse(PANEL_FILE, sources[PANEL_FILE])
+	violations = []
+	for node, name in _panel_identifiers(tree):
+		if name in PANEL_FORBIDDEN_NAMES or name.startswith(PANEL_FORBIDDEN_PREFIXES):
+			violations.append(violation(PANEL_FILE, node, f"{name} is not allowed in the panel module"))
+	for node in constant_strings(tree):
+		if node.value in PANEL_FORBIDDEN_NAMES:
+			violations.append(
+				violation(PANEL_FILE, node, f"string {node.value!r} is not allowed in the panel")
+			)
+	total = _comment_calls(tree)
+	if len(total) != 1:
+		violations.append(
+			f"{PANEL_FILE}: expected exactly one .{PANEL_COMMENT_CALL}( call, found {len(total)}"
+		)
+	send = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == PANEL_SEND_FUNCTION]
+	if len(send) != 1 or len(_comment_calls(send[0])) != 1:
+		violations.append(
+			f"{PANEL_FILE}: the one .{PANEL_COMMENT_CALL}( call must be inside {PANEL_SEND_FUNCTION}"
+		)
+	return violations
+
+
+def check_ticket_panel_does_not_evaluate_agent_gates(sources: dict) -> list:
+	"""ADR-010 Decision 8: the panel never evaluates the agent's gates (the comment handler and runner do)."""
+	if PANEL_FILE not in sources:
+		return [f"{PANEL_FILE} is missing"]
+	tree = parse(PANEL_FILE, sources[PANEL_FILE])
+	violations = []
+	for node, name in _panel_identifiers(tree):
+		for gate in PANEL_GATE_NAMES:
+			if gate in name:
+				violations.append(violation(PANEL_FILE, node, f"{name} evaluates an agent gate ({gate})"))
+	for node in constant_strings(tree):
+		for gate in PANEL_GATE_NAMES:
+			if re.search(rf"\b{gate}\b", node.value):
+				violations.append(violation(PANEL_FILE, node, f"string mentions agent gate {gate}"))
+	return violations
+
+
 class TestArchitecture(unittest.TestCase):
 	@classmethod
 	def setUpClass(cls):
@@ -1211,6 +1512,68 @@ class TestArchitecture(unittest.TestCase):
 		self.assertEqual(len(check_status_script_calls("state.call(METHOD, {})", allowed)), 1)
 		self.assertEqual(len(check_status_script_calls('state.call("other.method", {})', allowed)), 1)
 		self.assertEqual(len(check_status_script_calls("state\n.call(\n  METHOD)", allowed)), 1)
+
+	def status_script(self):
+		script = load_product_sources(suffixes=(".js",)).get(STATUS_SCRIPT_FILE)
+		self.assertIsNotNone(script, f"{STATUS_SCRIPT_FILE} is missing")
+		return script
+
+	def test_status_script_calls_only_panel_methods(self):
+		script = self.status_script()
+		literals = {m.group(2) for m in STATUS_SCRIPT_CALL.finditer(script) if m.group(1) is not None}
+		self.assertEqual(literals, set(PANEL_METHODS))
+		self.assertEqual(
+			whitelisted_paths(self.sources) & set(PANEL_METHODS),
+			set(PANEL_METHODS),
+		)
+		self.assertEqual(check_call_allow_list(script, PANEL_METHODS, self.sources), [])
+
+	def test_status_script_queries_only_app_root(self):
+		script = self.status_script()
+		self.assertIn('document.querySelector("#app")', script)
+		self.assertEqual(check_status_script_queries(script), [])
+
+	def test_status_script_has_one_window_state(self):
+		script = self.status_script()
+		self.assertIn(f"window.{STATUS_SCRIPT_STATE_NAME} = window.{STATUS_SCRIPT_STATE_NAME} ||", script)
+		self.assertEqual(check_status_script_window_state(script), [])
+
+	def test_status_script_socket_events_only_in_once_block(self):
+		script = self.status_script()
+		registered = socket_on_registrations(script)
+		self.assertEqual(
+			{name for _line, inside, name in registered if inside},
+			{AGENT_STATUS_EVENT, "docinfo_update", "doc_update", "connect"},
+		)
+		self.assertEqual(check_socket_on_only_in_once_block(script, AGENT_STATUS_EVENT), [])
+
+	def test_whitelisted_methods_declare_http_methods_without_guest(self):
+		found = {(rel, node.name) for rel, node, _decorator in whitelisted_functions(self.sources)}
+		self.assertTrue({(PANEL_FILE, "get_panel_data"), (PANEL_FILE, "send_message")} <= found, found)
+		self.assertEqual(check_whitelisted_methods_declare_http_methods(self.sources), [])
+
+	def test_ticket_panel_has_exactly_two_whitelisted_methods(self):
+		self.assertEqual(
+			sorted(PANEL_METHODS),
+			["erp_ai.ticket_panel.get_panel_data", "erp_ai.ticket_panel.send_message"],
+		)
+		self.assertEqual(check_ticket_panel_whitelist(self.sources), [])
+
+	def test_ticket_panel_forbidden_calls(self):
+		self.assertIn(".new_comment(", self.sources[PANEL_FILE])
+		self.assertEqual(check_ticket_panel_forbidden_calls(self.sources), [])
+
+	def test_ticket_panel_does_not_evaluate_agent_gates(self):
+		self.assertIn(PANEL_FILE, self.sources)
+		self.assertEqual(check_ticket_panel_does_not_evaluate_agent_gates(self.sources), [])
+
+	def test_layer_rules_forbid_ticket_panel_from_gateway_and_agent(self):
+		rules = {scope: forbidden for scope, forbidden, _reason in LAYER_RULES}
+		for scope in ("erp_ai.gateway", "erp_ai.agent"):
+			self.assertIn("erp_ai.ticket_panel", rules[scope])
+		self.assertEqual(
+			rules["erp_ai.ticket_panel"], ("erp_ai.gateway", "erp_ai.agent.runner", "erp_ai.agent.queue")
+		)
 
 	def test_status_event_name_matches_script(self):
 		match = re.search(r'^AGENT_STATUS_EVENT = "([^"]+)"', self.sources[CONSTANTS_FILE], re.MULTILINE)
@@ -1860,6 +2223,195 @@ class TestScannersCatchViolations(unittest.TestCase):
 		):
 			with self.subTest(fragment=fragment, source=source):
 				self.assertCaught(check_install_deletes_only_status_script({INSTALL_FILE: source}), fragment)
+
+	# ticket panel (ADR-009, ADR-010 Amendment 1) -------------------------------------------------
+
+	PANEL_SOURCES: ClassVar[dict] = {
+		"ticket_panel.py": (
+			"import frappe\n"
+			"@frappe.whitelist(methods=['POST'])\n"
+			"def get_panel_data(ticket):\n\treturn 1\n"
+			"@frappe.whitelist(methods=['POST'])\n"
+			"def send_message(ticket, text):\n\treturn frappe.get_doc('HD Ticket', ticket).new_comment(text)\n"
+		)
+	}
+
+	def test_call_allow_list_scanner_catches_unlisted_method(self):
+		allowed = tuple(PANEL_METHODS)
+		good = 'state.call("erp_ai.ticket_panel.get_panel_data", {});\nstate.call("erp_ai.ticket_panel.send_message", {});'
+		self.assertEqual(check_call_allow_list(good, allowed, self.PANEL_SOURCES), [])
+		self.assertCaught(
+			check_call_allow_list(
+				good + 'state.call("erp_ai.handlers.other", {});', allowed, self.PANEL_SOURCES
+			),
+			"erp_ai.handlers.other is not in PANEL_METHODS",
+			"does not point to a @frappe.whitelist function",
+		)
+		self.assertCaught(
+			check_call_allow_list(good.split("\n")[0], allowed, self.PANEL_SOURCES),
+			"erp_ai.ticket_panel.send_message is in PANEL_METHODS but the script never calls it",
+		)
+		self.assertCaught(
+			check_call_allow_list(good + "state.call(METHOD, {});", allowed, self.PANEL_SOURCES),
+			"not a string literal",
+		)
+		undecorated = {
+			"ticket_panel.py": self.PANEL_SOURCES["ticket_panel.py"].replace(
+				"@frappe.whitelist(methods=['POST'])\ndef send", "def send"
+			)
+		}
+		self.assertCaught(
+			check_call_allow_list(good, allowed, undecorated),
+			"erp_ai.ticket_panel.send_message does not point to a @frappe.whitelist function",
+		)
+
+	def test_socket_on_scanner_catches_outside_once_block(self):
+		block = 'if (state.socket !== socket) {\n\tsocket.on(EVENT, a);\n\tsocket.on("connect", () => { b(); });\n}\n'
+		head = 'const EVENT = "erp_ai:agent_status";\n'
+		self.assertEqual(check_socket_on_only_in_once_block(head + block, "erp_ai:agent_status"), [])
+		self.assertCaught(
+			check_socket_on_only_in_once_block(
+				head + block + 'socket.on("doc_update", c);\n', "erp_ai:agent_status"
+			),
+			"outside the once-per-socket block",
+		)
+		self.assertCaught(
+			check_socket_on_only_in_once_block(
+				head + block.replace("EVENT, a", '"typing", a'), "erp_ai:agent_status"
+			),
+			"event 'typing' is not one of",
+		)
+		self.assertCaught(
+			check_socket_on_only_in_once_block(head + "socket.on(EVENT, a);\n", "erp_ai:agent_status"),
+			"block if (state.socket !== socket) { is missing",
+		)
+		self.assertCaught(
+			check_socket_on_only_in_once_block(
+				head + block.replace("EVENT, a", "OTHER, a"), "erp_ai:agent_status"
+			),
+			"event None is not one of",
+		)
+		# an `.on(` in a comment or string is not a registration
+		self.assertEqual(
+			check_socket_on_only_in_once_block(
+				head + block + '// socket.on("x", y)\nconst s = "socket.on(";\n', "erp_ai:agent_status"
+			),
+			[],
+		)
+
+	def test_status_script_query_scanner_catches_other_selectors(self):
+		self.assertEqual(check_status_script_queries('document.querySelector("#app")'), [])
+		self.assertEqual(check_status_script_queries('document.getElementById("app")'), [])
+		for source in (
+			'document.querySelector(".ticket")',
+			'document.querySelector("#app .x")',
+			'document.querySelectorAll("#app")',
+			'document.getElementById("other")',
+			'document.getElementsByClassName("x")',
+			"document.querySelector(selector)",
+		):
+			with self.subTest(source=source):
+				self.assertCaught(check_status_script_queries(source), "only allowed with the Vue root")
+
+	def test_status_script_window_scanner_catches_second_state(self):
+		good = "window.__erpAiAgentStatus = window.__erpAiAgentStatus || {};\nwindow.addEventListener(1, 2);"
+		self.assertEqual(check_status_script_window_state(good), [])
+		self.assertCaught(
+			check_status_script_window_state(good + "window.__erpAiPanel = {};"), "window state names are"
+		)
+		self.assertCaught(
+			check_status_script_window_state(good + "window.other = 1;"), "window.other is written"
+		)
+		self.assertCaught(check_status_script_window_state(good + 'window["x"] = 1;'), "window[...]")
+		self.assertCaught(check_status_script_window_state("var a = 1;"), "window state names are")
+
+	def test_whitelist_scanner_catches_guest_bare_and_missing_methods(self):
+		for decorator, fragment in (
+			("@frappe.whitelist()", "methods= must list"),
+			("@frappe.whitelist", "bare @frappe.whitelist"),
+			("@frappe.whitelist(allow_guest=True, methods=['POST'])", "allow_guest"),
+			("@frappe.whitelist(allow_guest=False, methods=['POST'])", "allow_guest"),
+			("@frappe.whitelist(methods=[])", "methods= must list"),
+			("@whitelist(methods=METHODS)", "methods= must list"),
+		):
+			with self.subTest(decorator=decorator):
+				source = f"import frappe\nfrom frappe import whitelist\n{decorator}\ndef f():\n\tpass\n"
+				self.assertCaught(check_whitelisted_methods_declare_http_methods({"x.py": source}), fragment)
+		ok = "import frappe\n@frappe.whitelist(methods=['POST'])\ndef f():\n\tpass\n"
+		self.assertEqual(check_whitelisted_methods_declare_http_methods({"x.py": ok}), [])
+
+	def test_ticket_panel_whitelist_scanner_catches_third_method_and_get(self):
+		self.assertEqual(check_ticket_panel_whitelist(self.PANEL_SOURCES), [])
+		source = self.PANEL_SOURCES["ticket_panel.py"]
+		extra = source + "@frappe.whitelist(methods=['POST'])\ndef third():\n\tpass\n"
+		self.assertCaught(check_ticket_panel_whitelist({PANEL_FILE: extra}), "whitelisted functions are")
+		self.assertCaught(
+			check_ticket_panel_whitelist({PANEL_FILE: source.replace("'POST'", "'GET'", 1)}),
+			'exactly ["POST"]',
+		)
+		self.assertCaught(
+			check_ticket_panel_whitelist({PANEL_FILE: source.replace("['POST']", "['POST', 'GET']", 1)}),
+			'exactly ["POST"]',
+		)
+		self.assertCaught(
+			check_ticket_panel_whitelist({PANEL_FILE: source.replace("def get_panel_data", "def get_data")}),
+			"whitelisted functions are",
+		)
+
+	def test_ticket_panel_forbidden_scanner_catches_each_name(self):
+		for snippet in (
+			"frappe.get_doc('X', 1, ignore_permissions=True)",
+			"frappe.set_user('a')",
+			"frappe.get_all('X')",
+			"frappe.db.get_values('X')",
+			"frappe.db.sql('select 1')",
+			"frappe.db.set_value('X', 1, 'a', 2)",
+			"doc.db_set('a', 1)",
+			"doc.insert()",
+			"doc.save()",
+			"frappe.delete_doc('X', 1)",
+			"frappe.db.delete('X')",
+			"frappe.db.commit()",
+			"frappe.db.rollback()",
+			"frappe.cache.get('k')",
+			"frappe.publish_realtime('e')",
+		):
+			with self.subTest(snippet=snippet):
+				source = self.PANEL_SOURCES["ticket_panel.py"] + f"def extra():\n\t{snippet}\n"
+				self.assertCaught(
+					check_ticket_panel_forbidden_calls({PANEL_FILE: source}), "not allowed in the panel"
+				)
+		source = self.PANEL_SOURCES["ticket_panel.py"]
+		self.assertCaught(
+			check_ticket_panel_forbidden_calls({PANEL_FILE: source + "def x(d):\n\td.new_comment('a')\n"}),
+			"found 2",
+		)
+		self.assertCaught(
+			check_ticket_panel_forbidden_calls({PANEL_FILE: source.replace("new_comment", "other")}),
+			"found 0",
+		)
+		moved = source.replace("return frappe.get_doc('HD Ticket', ticket).new_comment(text)", "return 1")
+		moved += "def helper(d):\n\td.new_comment('a')\n"
+		self.assertCaught(
+			check_ticket_panel_forbidden_calls({PANEL_FILE: moved}), "must be inside send_message"
+		)
+		self.assertEqual(check_ticket_panel_forbidden_calls({PANEL_FILE: source}), [])
+
+	def test_ticket_panel_gate_scanner_catches_each_gate(self):
+		for gate in PANEL_GATE_NAMES:
+			for snippet in (f"policy.{gate}()", f"{gate} = 1", f"d.get('{gate}')"):
+				with self.subTest(snippet=snippet):
+					source = self.PANEL_SOURCES["ticket_panel.py"] + f"def extra(d, policy):\n\t{snippet}\n"
+					self.assertCaught(
+						check_ticket_panel_does_not_evaluate_agent_gates({PANEL_FILE: source}), gate
+					)
+		self.assertCaught(
+			check_ticket_panel_does_not_evaluate_agent_gates(
+				{PANEL_FILE: "from erp_ai.agent.queue import enqueue_agent_run\n"}
+			),
+			"enqueue",
+		)
+		self.assertEqual(check_ticket_panel_does_not_evaluate_agent_gates(self.PANEL_SOURCES), [])
 
 
 if __name__ == "__main__":

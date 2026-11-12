@@ -60,6 +60,17 @@ class TestRunnerStatus(RunnerTestBase):
 		tool_patch = patch.object(runner, "execute_tool", side_effect=recording_execute_tool)
 		tool_patch.start()
 		self.addCleanup(tool_patch.stop)
+		real_apply_route = runner.apply_route
+
+		def recording_apply_route(*args, **kwargs):
+			self.tool_starts.append(
+				("apply_route", self.signals[-1]["message"]["text"] if self.signals else None)
+			)
+			return real_apply_route(*args, **kwargs)
+
+		route_patch = patch.object(runner, "apply_route", side_effect=recording_apply_route)
+		route_patch.start()
+		self.addCleanup(route_patch.stop)
 
 		def sleeper(seconds):
 			self.sleeps.append(seconds)
@@ -353,7 +364,7 @@ class TestRunnerStatus(RunnerTestBase):
 		self.assertEqual(self._texts()[1:3], ["Đang làm: phân loại phiếu…", "Đang làm: ghi phân loại…"])
 		# classify work signal before the classify call; the second call comes after both work signals
 		self.assertEqual(self.signals_on_model_call, [2, 4])
-		self.assertEqual(self.tool_starts, [("set_classification", "Đang làm: ghi phân loại…")])
+		self.assertEqual(self.tool_starts, [("apply_route", "Đang làm: ghi phân loại…")])
 
 	def test_ticket_insert_never_waits(self):
 		self._set_delay(3, 5)

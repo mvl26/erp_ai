@@ -8,12 +8,14 @@ from frappe.utils import get_fullname
 from erp_ai import gateway
 from erp_ai.agent import authority, policy
 from erp_ai.agent.answer_delay import AnswerDelay
-from erp_ai.agent.classification import load_mapping, parse_classification, resolve_ticket_values
+from erp_ai.agent.classification import load_mapping, parse_classification
 from erp_ai.agent.prompts import build_classify_request, build_initial_message, build_reason_system
+from erp_ai.agent.routing import decide_route
 from erp_ai.agent.run_log import write_entry
 from erp_ai.agent.run_status import CLASSIFY_STEP, RunStatus
 from erp_ai.agent.tools.read import TOOL_RESULT_MAX_CHARS
 from erp_ai.agent.tools.registry import ToolContext, execute_tool, get_tool_schemas
+from erp_ai.agent.tools.route_ticket import apply_route
 from erp_ai.constants import (
 	AGENT_USER,
 	JOB_SAFETY_MARGIN_S,
@@ -47,7 +49,7 @@ WRITE_TOOL_TARGETS = {
 }
 UNPARSEABLE_ERROR = "UNPARSEABLE: không phân loại được"
 BAD_MAPPING_ERROR = "category_mapping không hợp lệ, không có giá trị dự đoán"
-APPLY_SAVEPOINT = "erp_ai_apply"
+ROUTE_SAVEPOINT = "erp_ai_route"
 USAGE_COLUMNS = ("input_tokens", "output_tokens", "cache_creation_input_tokens", "cache_read_input_tokens")
 
 
@@ -225,7 +227,21 @@ def _classify(ticket_name, trigger, run_id, mapping, context, deadline, status):
 		write_entry(**base, **call_fields, error=error, stop_reason="unparseable")
 		return True, None
 
-	values = resolve_ticket_values(classification, subject, mapping)
+	# Skeleton collaborators: the real site checks arrive with T5, T8, T13.
+	decision = decide_route(
+		classification,
+		subject,
+		mapping,
+		{},
+		team_exists=lambda team: bool(frappe.db.exists("HD Team", team)),
+		is_excluded_team=lambda team: False,
+		is_active_agent=lambda user: False,
+	)
+	values = {
+		"ticket_type": decision.ticket_type,
+		"agent_group": decision.agent_group,
+		"priority": decision.priority,
+	}
 	# The entry is written first with applied=0 and committed before the ticket is touched (D-20).
 	log_name = write_entry(
 		**base,
@@ -241,29 +257,25 @@ def _classify(ticket_name, trigger, run_id, mapping, context, deadline, status):
 	)
 	if context is not None:
 		status.working("set_classification")
-		_apply_classification(log_name, classification, context)
+		_route(log_name, classification, decision, context)
 	summary = {"category": classification.category, "confidence": classification.confidence, **values}
 	return True, summary
 
 
-def _apply_classification(log_name, classification, context):
-	"""Run `set_classification` and record its outcome on the entry as one unit.
+def _route(log_name, classification, decision, context):
+	"""Run `apply_route` and record its outcome on the entry as one unit (skeleton: the ticket write only).
 
 	The ticket change and the entry update share a savepoint: an exception between them undoes the
 	ticket change, so the entry never says applied=0 over a changed ticket (the entry row itself was
 	committed before and survives). Nothing is committed until both are written.
 	"""
-	frappe.db.savepoint(APPLY_SAVEPOINT)
+	frappe.db.savepoint(ROUTE_SAVEPOINT)
 	try:
-		result = execute_tool(
-			"set_classification",
-			{"category": classification.category, "confidence": classification.confidence},
-			context,
-		)
+		result = apply_route(decision, classification, context)
 		updates = {}
 		if result.get("ok") and result.get("after"):
 			action = {
-				"tool": "set_classification",
+				"tool": "apply_route",
 				"doctype": "HD Ticket",
 				"name": context.ticket_name,
 				"ok": True,
@@ -279,9 +291,9 @@ def _apply_classification(log_name, classification, context):
 		if updates:
 			frappe.db.set_value(LOG_DOCTYPE, log_name, updates, update_modified=False)
 	except Exception:
-		frappe.db.rollback(save_point=APPLY_SAVEPOINT)
+		frappe.db.rollback(save_point=ROUTE_SAVEPOINT)
 		raise
-	frappe.db.release_savepoint(APPLY_SAVEPOINT)
+	frappe.db.release_savepoint(ROUTE_SAVEPOINT)
 	if not frappe.flags.in_test:
 		frappe.db.commit()
 

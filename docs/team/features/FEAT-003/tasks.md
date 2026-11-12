@@ -11,7 +11,7 @@ Mỗi task 2–5 phút. Hai task chung file thì phụ thuộc nhau. Đánh dấ
 `cmd.test_one` = lệnh của profile với `{file}` là file ở `test:`. Mọi task: viết test đỏ trước (STD-TEST-1), chỉ sửa trong `files:`. Tên hàm, hằng, chuỗi chính xác: `plan.md` mục Ràng buộc chung và `design.md` mục 3.
 
 Tiến độ: BASE ghi ở đây trước mỗi lần gọi dev.
-- BASE T1=8c6d925 · T3=8c6d925 · T2=1560098 · T4=f7dc6b1 · T5=b433459 · T6=3cfa6bf · T7=3cfa6bf · T8=da2d63e · T12=da2d63e · T9=c3f32b5 · T13=c3f32b5 (r2 approve, merged 260db00 / 1f6787c) · T10=1f6787c · T14=1f6787c (merged to b075d2d) · T11=b075d2d · T15=b075d2d
+- BASE T1=8c6d925 · T3=8c6d925 · T2=1560098 · T4=f7dc6b1 · T5=b433459 · T6=3cfa6bf · T7=3cfa6bf · T8=da2d63e · T12=da2d63e · T9=c3f32b5 · T13=c3f32b5 (r2 approve, merged 260db00 / 1f6787c) · T10=1f6787c · T14=1f6787c (merged to b075d2d) · T11=b075d2d · T15=b075d2d. All 15 ticked. Final suite on fe8abcd: `Ran 658 tests ... OK` (snapshots equal). Merged head after diff.patch: see git log.
 - Ticked T1..T7 on `Ran 621 tests ... OK` (da2d63e, T1..T7 merged). T8, T12 merged (92aef2f), tick after the full run in the T9 step 0. Ruling D-1 (T3): see review-03.md.
 
 ## Phần 2, walking skeleton (T1 rồi T2; không task phần 2 nào khác bắt đầu trước khi review T2 là approve)
@@ -72,7 +72,7 @@ Tiến độ: BASE ghi ở đây trước mỗi lần gọi dev.
   - Receives: `frappe.utils.html_utils.sanitize_html(content, always_sanitize=True)` (đối chiếu tham số với `frappe/core/doctype/comment/comment.py:69-74`, không tự viết bộ escape)
   - Returns: từ khóa không rỗng mà `contains_keyword(stored)` False → `frappe.ValidationError` (thông báo của design 3.2, không chứa từ khóa), không gọi `new_comment`; log `info` "erp_ai panel send ticket=… comment=… keyword_added=…", "erp_ai panel denied method=send … reason=<not_agent|no_read|agent_user>", "erp_ai panel send rejected ticket=… reason=keyword_not_storable"
   - Expect: `cmd.test_one` → `test_send_stored_content_passes_contains_keyword` (đọc lại từ DB bằng `frappe.db.get_value`), `test_send_keyword_with_special_chars_rejected` (`a&b`, `a<b`; patch đếm `new_comment` = 0; lỗi không chứa từ khóa), `test_send_logs_without_content_or_email` đạt
-- [ ] T11 — Test so đường ngăn với ô Comments qua 9 nhánh chốt — files: erp_ai/tests/test_ticket_panel.py — test: erp_ai/tests/test_ticket_panel.py — depends: T10
+- [x] T11 — Test so đường ngăn với ô Comments qua 9 nhánh chốt — files: erp_ai/tests/test_ticket_panel.py — test: erp_ai/tests/test_ticket_panel.py — depends: T10
   - Criterion: AC-10, NFR-4
   - Receives: `send_message` (T10), `ticket.new_comment`, `FakeGateway`, cách bắt job như `erp_ai/tests/test_handlers.py`
   - Returns: `test_send_matches_comments_box_in_every_gate_branch` (9 `subTest`: agent tắt; L0; nhóm loại trừ; `ai_opt_out`; đủ lượt/ngày; vượt ngân sách; `ERP AI Instructor`; người được giao; người còn lại; từ khóa thường; nhóm loại trừ và opt-out: 0 lời gọi gateway). Không thêm mã sản xuất; bằng chứng đỏ-đúng-lý-do: dev dán kết quả khi tạm làm đường ngăn lệch (đột biến, không commit)
@@ -98,7 +98,7 @@ Tiến độ: BASE ghi ở đây trước mỗi lần gọi dev.
 
 ## Phần 2, luật tĩnh cuối
 
-- [ ] T15 — Luật tĩnh cho module ngăn và `call` của trang — files: erp_ai/tests/test_architecture.py — test: erp_ai/tests/test_architecture.py — depends: T10, T14
+- [x] T15 — Luật tĩnh cho module ngăn và `call` của trang — files: erp_ai/tests/test_architecture.py — test: erp_ai/tests/test_architecture.py — depends: T10, T14
   - Criterion: ADR-009, ADR-010 (Amendment 1), AC-12, AC-14, AC-15
   - Receives: `ticket_panel.py` (T10), `agent_status_indicator.js` (T14), `PANEL_METHODS` (T1)
   - Returns: `test_status_script_calls_only_panel_methods`, `test_status_script_queries_only_app_root`, `test_status_script_has_one_window_state`, `test_status_script_socket_events_only_in_once_block`, `test_whitelisted_methods_declare_http_methods_without_guest`, `test_ticket_panel_has_exactly_two_whitelisted_methods`, `test_ticket_panel_forbidden_calls`, `test_ticket_panel_does_not_evaluate_agent_gates`, mở rộng `LAYER_RULES` chiều ngược từ `erp_ai.agent`/`erp_ai.gateway`, và trong `TestScannersCatchViolations`: `test_call_allow_list_scanner_catches_unlisted_method`, `test_socket_on_scanner_catches_outside_once_block`

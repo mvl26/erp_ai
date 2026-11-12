@@ -2,6 +2,7 @@ from unittest.mock import patch
 
 import frappe
 from frappe.tests.utils import FrappeTestCase
+from helpdesk.helpdesk.doctype.hd_form_script.hd_form_script import get_form_script
 from helpdesk.test_utils import make_ticket
 
 from erp_ai import install
@@ -40,6 +41,7 @@ def _counts():
 		"comments": frappe.db.count("HD Ticket Comment"),
 		"ai_fields": frappe.db.count("Custom Field", {"dt": "HD Ticket", "fieldname": ("like", "ai\\_%")}),
 		"template_rows": frappe.db.count("HD Ticket Template Field", {"parent": TEMPLATE}),
+		"status_scripts": frappe.db.count(install.FORM_SCRIPT_DOCTYPE, {"name": install.AGENT_STATUS_SCRIPT}),
 	}
 
 
@@ -71,6 +73,8 @@ class TestInstall(FrappeTestCase):
 		# Same for the agent's Task permission (Custom DocPerm insert has no DDL, so it stays in the transaction).
 		frappe.db.delete("Custom DocPerm", {"parent": "Task", "role": ROLE_AGENT})
 		frappe.clear_cache(doctype="Task")
+		# The app-owned form script, removed so the create path runs inside the rolled-back transaction.
+		frappe.db.delete(install.FORM_SCRIPT_DOCTYPE, {"name": install.AGENT_STATUS_SCRIPT})
 		install.ensure_setup()
 
 	def test_setup_twice_is_idempotent(self):
@@ -295,3 +299,83 @@ class TestInstall(FrappeTestCase):
 		self.assertTrue(before[1])
 		install.ensure_setup()
 		self.assertEqual(_ticket_rows(), before)
+
+	def _script_file(self):
+		path = frappe.get_app_path("erp_ai", *install.AGENT_STATUS_SCRIPT_FILE)
+		with open(path, encoding="utf-8") as handle:
+			return handle.read()
+
+	def _status_script(self):
+		return frappe.get_doc(install.FORM_SCRIPT_DOCTYPE, install.AGENT_STATUS_SCRIPT)
+
+	def test_status_script_installed_once_matching_repo_file(self):
+		install.ensure_setup()
+		install.after_migrate()
+		self.assertEqual(_counts()["status_scripts"], 1)
+		doc = self._status_script()
+		for key, value in install.AGENT_STATUS_SCRIPT_FLAGS.items():
+			self.assertEqual(doc.get(key), value, key)
+		self.assertEqual(
+			set(install.AGENT_STATUS_SCRIPT_FLAGS),
+			{"dt", "apply_to", "enabled", "apply_to_customer_portal", "apply_on_new_page", "is_standard"},
+		)
+		self.assertEqual(doc.script, self._script_file())
+		self.assertTrue(doc.script.strip())
+
+	def test_status_script_reset_when_changed_on_site(self):
+		for field, changed in (
+			("script", "// edited by hand"),
+			("enabled", 0),
+			("apply_to_customer_portal", 1),
+		):
+			with self.subTest(field=field):
+				frappe.db.set_value(install.FORM_SCRIPT_DOCTYPE, install.AGENT_STATUS_SCRIPT, field, changed)
+				install.ensure_setup()
+				self.assertEqual(_counts()["status_scripts"], 1)
+				doc = self._status_script()
+				self.assertEqual(doc.script, self._script_file())
+				self.assertEqual(doc.enabled, 1)
+				self.assertEqual(doc.apply_to_customer_portal, 0)
+
+	def test_status_script_served_to_agent_page_only(self):
+		self.assertIn(self._script_file(), get_form_script("HD Ticket") or [])
+		self.assertNotIn(self._script_file(), get_form_script("HD Ticket", is_customer_portal=True) or [])
+
+	def test_unchanged_status_script_is_not_saved_again(self):
+		old = "2020-01-01 00:00:00"
+		frappe.db.set_value(
+			install.FORM_SCRIPT_DOCTYPE, install.AGENT_STATUS_SCRIPT, "modified", old, update_modified=False
+		)
+		install.ensure_setup()
+		self.assertEqual(
+			str(frappe.db.get_value(install.FORM_SCRIPT_DOCTYPE, install.AGENT_STATUS_SCRIPT, "modified")),
+			old,
+		)
+
+	def test_uninstall_removes_only_status_script(self):
+		other = frappe.get_doc(
+			{
+				"doctype": install.FORM_SCRIPT_DOCTYPE,
+				"name": "erp_ai test other script",
+				"dt": "HD Ticket",
+				"apply_to": "Form",
+				"enabled": 0,
+				"script": "function setupForm() { return {actions: []} }",
+			}
+		).insert(ignore_permissions=True)
+		before = _counts()
+		install.before_uninstall()
+		self.assertEqual(
+			frappe.db.count(install.FORM_SCRIPT_DOCTYPE, {"name": install.AGENT_STATUS_SCRIPT}), 0
+		)
+		self.assertTrue(frappe.db.exists(install.FORM_SCRIPT_DOCTYPE, other.name))
+		after = _counts()
+		self.assertEqual(after.pop("status_scripts"), 0)
+		before.pop("status_scripts")
+		self.assertEqual(after, before)
+
+	def test_uninstall_without_record_is_noop(self):
+		frappe.db.delete(install.FORM_SCRIPT_DOCTYPE, {"name": install.AGENT_STATUS_SCRIPT})
+		install.before_uninstall()
+		install.before_uninstall()
+		self.assertEqual(_counts()["status_scripts"], 0)

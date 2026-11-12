@@ -17,6 +17,17 @@ TEMPLATE_NAME = "Default"
 AI_MODULE = "ERP AI agent"
 AI_SECTION_FIELD = "ai_section"
 AI_PERMLEVEL = 8
+FORM_SCRIPT_DOCTYPE = "HD Form Script"
+AGENT_STATUS_SCRIPT = "ERP AI Agent Status"
+AGENT_STATUS_SCRIPT_FILE = ("public", "js", "agent_status_indicator.js")
+AGENT_STATUS_SCRIPT_FLAGS = {
+	"dt": "HD Ticket",
+	"apply_to": "Form",
+	"enabled": 1,
+	"apply_to_customer_portal": 0,
+	"apply_on_new_page": 0,
+	"is_standard": 0,
+}
 
 
 def after_install():
@@ -28,13 +39,25 @@ def after_migrate():
 
 
 def ensure_setup() -> None:
-	"""Create what is missing; never overwrite or remove anything a human set."""
+	"""Create what is missing; never overwrite or remove anything a human set.
+
+	Exception: the app-owned HD Form Script is reset from the repo file (ADR-007).
+	"""
 	_ensure_roles()
 	_ensure_agent_user()
 	_ensure_default_settings()
 	_ensure_ticket_custom_fields()
 	_ensure_template_rows()
 	_ensure_task_permission()
+	_ensure_agent_status_script()
+
+
+def before_uninstall() -> None:
+	"""Remove the app-owned form script; the only delete in the app (ADR-007)."""
+	if not frappe.db.exists("DocType", FORM_SCRIPT_DOCTYPE):
+		return
+	if frappe.db.exists(FORM_SCRIPT_DOCTYPE, AGENT_STATUS_SCRIPT):
+		frappe.delete_doc(FORM_SCRIPT_DOCTYPE, AGENT_STATUS_SCRIPT, ignore_permissions=True)
 
 
 def _ensure_roles() -> None:
@@ -183,3 +206,23 @@ def _ensure_task_permission() -> None:
 		}
 	).insert(ignore_permissions=True)
 	frappe.clear_cache(doctype="Task")
+
+
+def _ensure_agent_status_script() -> None:
+	if not frappe.db.exists("DocType", FORM_SCRIPT_DOCTYPE):
+		frappe.logger(LOGGER_NAME).warning(
+			"DocType %s not found; status script not installed", FORM_SCRIPT_DOCTYPE
+		)
+		return
+	with open(frappe.get_app_path("erp_ai", *AGENT_STATUS_SCRIPT_FILE), encoding="utf-8") as handle:
+		wanted = {**AGENT_STATUS_SCRIPT_FLAGS, "script": handle.read()}
+	if not frappe.db.exists(FORM_SCRIPT_DOCTYPE, AGENT_STATUS_SCRIPT):
+		frappe.get_doc({"doctype": FORM_SCRIPT_DOCTYPE, "name": AGENT_STATUS_SCRIPT, **wanted}).insert(
+			ignore_permissions=True
+		)
+		return
+	doc = frappe.get_doc(FORM_SCRIPT_DOCTYPE, AGENT_STATUS_SCRIPT)
+	if all(doc.get(key) == value for key, value in wanted.items()):
+		return
+	doc.update(wanted)
+	doc.save(ignore_permissions=True)

@@ -27,11 +27,11 @@ DOCTYPE_CONFIG = {
 		"phrases": {
 			"enabled": ("Tắt", "4 đơn giá", "từ khóa kích hoạt"),
 			"permission_level": ("L0", "L1", "L2", "L3", "ngân sách"),
-			"max_turns_per_run": ("1", "20", "dừng"),
-			"max_runs_per_ticket_per_day": ("1", "50", "00:00"),
-			"max_keys_per_call": ("1", "10", "báo lỗi"),
-			"request_timeout_s": ("5", "300", "giây", "khóa kế tiếp"),
-			"monthly_budget_usd": ("USD", "L1", "0", "không phải"),
+			"max_turns_per_run": ("từ 1 đến 20", "dừng"),
+			"max_runs_per_ticket_per_day": ("từ 1 đến 50", "00:00"),
+			"max_keys_per_call": ("từ 1 đến 10", "báo lỗi"),
+			"request_timeout_s": ("từ 5 đến 300", "giây", "khóa kế tiếp"),
+			"monthly_budget_usd": ("USD", "L1", "Nhập 0", "không phải"),
 			"spent_this_month_usd": ("mỗi ngày", "tổng chi phí"),
 			"price_input_per_mtok": ("USD", "triệu token", "không được âm"),
 			"price_cache_write_per_mtok": ("USD", "triệu token", "không được âm"),
@@ -40,10 +40,10 @@ DOCTYPE_CONFIG = {
 			"model_classify_default": ("phân loại", "model"),
 			"trigger_keyword": ("@ai", "không phân biệt hoa thường"),
 			"thinking_text": ("Để trống", "giây"),
-			"answer_delay_min_s": ("giây", "0", "30", "bình luận"),
-			"answer_delay_max_s": ("giây", "0", "30", "bình luận"),
+			"answer_delay_min_s": ("giây", "từ 0 đến 30", "bình luận"),
+			"answer_delay_max_s": ("giây", "từ 0 đến 30", "bình luận"),
 			"excluded_teams": ("mỗi dòng", "không phân biệt hoa thường"),
-			"category_mapping": ("JSON", "A", "F", "[GẤP]", "Urgent"),
+			"category_mapping": ("JSON", "A đến F", "[GẤP]", "Urgent"),
 			"prompt_digest": ("lập luận", "phân loại"),
 			"alert_recipients": ("mỗi dòng", "canhbao@congty.vn", "dấu phẩy"),
 			"credentials": ("không trùng", "Kiểm tra khóa"),
@@ -57,6 +57,46 @@ DOCTYPE_CONFIG = {
 			("section_model", "Model, từ khóa và chỉ báo trả lời", "model_classify_default"),
 			("section_routing", "Phân loại và nhóm loại trừ", "excluded_teams"),
 			("section_alerts", "Cảnh báo và khóa API", "alert_recipients"),
+		),
+	},
+	"ERP AI Credential": {
+		"folder": "erp_ai_credential",
+		"field_count": 18,
+		"phrases": {
+			"label": ("không trùng", "không phân biệt hoa thường"),
+			"provider": ("nhà cung cấp", "Anthropic", "OpenAI", "bỏ qua"),
+			"api_key": ("khóa bí mật", "mã hóa", "không hiện lại", "Log"),
+			"model_classify": ("Setting", "phân loại"),
+			"model_reason": ("lập luận", "không dùng"),
+			"try_order": ("99", "nhỏ", "Để trống", "hoặc 0", "lớn hơn 99"),
+			"purpose": ("ghi chú", "không ảnh hưởng"),
+			"budget_month_usd": ("USD", "Nhập 0", "không giới hạn", "ngược"),
+			"spent_month_usd": ("mỗi ngày", "Log"),
+			"enabled": ("Tắt", "không được thử", "không xóa"),
+			"status": ("Tạm nghỉ", "Hết hạn mức", "Lỗi khóa", "Hoạt động"),
+			"paused_until": ("tạm nghỉ",),
+			"tokens_remaining": ("số token còn lại", "lần gọi gần nhất"),
+			"limit_reset_at": ("hạn mức", "nhà cung cấp", "đặt lại"),
+			"error_count": ("lỗi liên tiếp", "về 0"),
+			"last_error": ("không bao giờ chứa khóa",),
+			"last_success_at": ("thành công",),
+			"note": ("ghi chú",),
+		},
+		"section_count": 4,
+		"read_only_fields": (
+			"spent_month_usd",
+			"paused_until",
+			"tokens_remaining",
+			"limit_reset_at",
+			"error_count",
+			"last_error",
+			"last_success_at",
+		),
+		"sections": (
+			("section_key", "Khóa và model", "label"),
+			("section_usage", "Thứ tự thử và ngân sách", "try_order"),
+			("section_state", "Trạng thái khóa", "status"),
+			("section_note", "Ghi chú", "note"),
 		),
 	},
 }
@@ -163,8 +203,6 @@ class TestDoctypeDescriptions(FrappeTestCase):
 		for field in visible_fields(doctype_json):
 			description = (field.get("description") or "").lower()
 			for source, value in stored.items():
-				if source == field["fieldname"] and value == description:
-					continue
 				self.assertNotIn(
 					value, description, f"{field['fieldname']} chứa giá trị đang lưu của {source}"
 				)

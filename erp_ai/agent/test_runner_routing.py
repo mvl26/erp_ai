@@ -314,7 +314,7 @@ class TestRoutingEndToEnd(RoutingTestBase):
 		rows = frappe.get_all("Has Role", {"parent": AGENT_USER, "parenttype": "User"}, pluck="role")
 		return set(rows) - set(AUTOMATIC_ROLES)
 
-	def test_agent_roles_are_the_pinned_set_in_every_case(self):
+	def test_agent_roles_are_the_pinned_set_in_the_base_setup(self):
 		# AC-17: the base class pins the roles, so every success case of this file runs under them
 		self.assertEqual(self._agent_role_set(), PINNED_ROLES)
 
@@ -335,6 +335,22 @@ class TestRoutingEndToEnd(RoutingTestBase):
 	def _assert_no_key(self, text):
 		for place, content in text.items():
 			self.assertNotIn(FAKE_KEY, content, place)
+
+	def test_fake_key_in_prefixes_absent_from_the_posted_comment(self):
+		# NFR-4, comment path: no SLA applies, so the run really posts a comment; the key in the read config must not reach it
+		add_credential(f"{PREFIX}leak-label", api_key=FAKE_KEY)
+		person, _team = _arrange_c_writes(self, None)
+		assignees = {cat: {"default": person, "prefixes": {FAKE_KEY: person}} for cat in "ABCF"}
+		set_agent_settings(routing_rules=make_routing_rules(assignees=assignees))
+		logger = MagicMock()
+		with patch.object(frappe, "logger", return_value=logger):
+			self._run()
+
+		surface, text = self._leak_surface(self.ticket.name, logger)
+		(entry,) = [e for e in surface["log"] if e.entry_type == "classify"]
+		self.assertIn("post_routing_comment", [a["tool"] for a in json.loads(entry.actions)])
+		self.assertEqual(len(surface["comment"]), 1)
+		self._assert_no_key(text)
 
 	def test_fake_key_in_read_config_absent_from_comment_log_task_logger(self):
 		# NFR-4: the key sits in the routing_rules the run really reads, not in a table nobody reads

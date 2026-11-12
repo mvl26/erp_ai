@@ -82,6 +82,62 @@ class TestDecidePriority(FrappeTestCase):
 		self.assertEqual(decision.ticket_type, DEFAULT_CATEGORY_MAPPING["B"]["ticket_type"])
 		self.assertEqual(decision.agent_group, "IT")
 
+	def _values(self, decision):
+		return {
+			"ticket_type": decision.ticket_type,
+			"agent_group": decision.agent_group,
+			"priority": decision.priority,
+		}
+
+	def test_values_come_from_mapping_not_from_model(self):
+		result = Classification(category="B", confidence="Cao", team="Kế toán", priority="Low")
+		decision = routing.decide_route(
+			result,
+			"Thêm trường",
+			DEFAULT_CATEGORY_MAPPING,
+			{},
+			team_exists=lambda team: True,
+			is_excluded_team=lambda team: False,
+			is_active_agent=lambda user: True,
+		)
+		self.assertEqual(
+			self._values(decision),
+			{"ticket_type": "Quản trị & cấu hình hệ thống", "agent_group": "IT", "priority": "Medium"},
+		)
+
+	def test_missing_category_in_mapping_gives_none(self):
+		decision = _decide("C", 0, "x", mapping={"A": DEFAULT_CATEGORY_MAPPING["A"]})
+		self.assertEqual(self._values(decision), {"ticket_type": None, "agent_group": None, "priority": None})
+
+	def test_missing_key_inside_entry_gives_none(self):
+		decision = _decide("A", 0, "x", mapping={"A": {"ticket_type": "T"}})
+		self.assertEqual(self._values(decision), {"ticket_type": "T", "agent_group": None, "priority": None})
+
+	def test_empty_mapping(self):
+		decision = _decide("A", 0, "x", mapping={})
+		self.assertEqual(self._values(decision), {"ticket_type": None, "agent_group": None, "priority": None})
+
+	def test_urgent_prefix_forces_urgent(self):
+		for subject in (
+			"[GẤP] Lỗi đơn bán",
+			"[GẬP] Lỗi đơn bán",
+			"[HR][GẤP] Cấp tài khoản",
+			"Lỗi đơn bán [GẤP] ở kho",
+			"lỗi [gấp] ở kho",
+		):
+			decision = _decide("F", 0, subject)
+			self.assertEqual(decision.priority, "Urgent", subject)
+			self.assertEqual(decision.ticket_type, "Câu hỏi, phiếu nhiễu", subject)
+
+	def test_urgent_prefix_overrides_empty_priority_and_missing_category(self):
+		self.assertEqual(DEFAULT_CATEGORY_MAPPING["E"]["priority"], "")
+		self.assertEqual(_decide("E", 0, "[GẤP] việc").priority, "Urgent")
+		self.assertEqual(_decide("E", 0, "[GẤP] việc", mapping={}).priority, "Urgent")
+
+	def test_no_urgent_without_bracketed_tag(self):
+		for subject in ("GẤP lỗi", "gấp", "[GẤP lỗi", "", None):
+			self.assertEqual(_decide("A", 0, subject).priority, "High", repr(subject))
+
 
 DEPT_CONFIG = {
 	"departments": {"Kế toán": {"team": "Accounting", "head": "head@x.com"}, "HR": {"team": "", "head": ""}}

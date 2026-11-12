@@ -1,0 +1,134 @@
+diff --git a/erp_ai/erp_ai_agent/report/erp_ai_accuracy/test_erp_ai_accuracy.py b/erp_ai/erp_ai_agent/report/erp_ai_accuracy/test_erp_ai_accuracy.py
+index 6e5839e..2971fae 100644
+--- a/erp_ai/erp_ai_agent/report/erp_ai_accuracy/test_erp_ai_accuracy.py
++++ b/erp_ai/erp_ai_agent/report/erp_ai_accuracy/test_erp_ai_accuracy.py
+@@ -27,6 +27,9 @@ class AccuracyTestCase(FrappeTestCase):
+ 		self.addCleanup(frappe.db.rollback)
+ 		self.addCleanup(frappe.set_user, "Administrator")
+ 		frappe.set_user("Administrator")
++		# Rows from real use of the site must not reach the report: hide every existing prediction
++		# inside this transaction (rolled back in cleanup), so the rows made by the test are the only ones.
++		frappe.db.sql(f"update `tab{LOG_DOCTYPE}` set entry_type = 'reason' where entry_type = 'classify'")
+ 		self.now = now_datetime().replace(microsecond=0)
+
+ 	def _log(self, category, days_ago, corrected_after=None, corrected_to=None, entry_type="classify"):
+diff --git a/erp_ai/gateway/breaker.py b/erp_ai/gateway/breaker.py
+index 4b3d4cc..6ea107f 100644
+--- a/erp_ai/gateway/breaker.py
++++ b/erp_ai/gateway/breaker.py
+@@ -23,7 +23,7 @@ class Action:
+
+
+ SPEND_LIMIT_ERROR_CODE = "enforced_spend_limit_reached"
+-QUOTA_MESSAGE_PREFIX = "You have reached your specified"
++QUOTA_MESSAGE_PREFIXES = ("You have reached your specified", "Your credit balance is too low")
+ RATE_LIMIT_DEFAULT_PAUSE_S = 61
+ SERVER_PAUSE_S = 30
+ OVERLOADED_STEP_S = 30
+@@ -54,7 +54,7 @@ def decide(failure, error_count):
+ 		return Action(constants.KEY_STATUS_PAUSED, SERVER_PAUSE_S, True, None, "timeout")
+ 	if status == 402:
+ 		return _quota()
+-	if status == 400 and failure.message_prefix.startswith(QUOTA_MESSAGE_PREFIX):
++	if status == 400 and failure.message_prefix.startswith(QUOTA_MESSAGE_PREFIXES):
+ 		return _quota()
+ 	if status in (401, 403):
+ 		return Action(constants.KEY_STATUS_BAD_KEY, None, True, "alarm", "auth")
+diff --git a/erp_ai/gateway/test_breaker.py b/erp_ai/gateway/test_breaker.py
+index fea8cb8..a90bb03 100644
+--- a/erp_ai/gateway/test_breaker.py
++++ b/erp_ai/gateway/test_breaker.py
+@@ -5,6 +5,10 @@ from erp_ai.gateway.breaker import Action, ApiFailure, decide
+
+ SPEND_CODE = "enforced_spend_limit_reached"
+ QUOTA_PREFIX = "You have reached your specified"
++CREDIT_PREFIX = (
++	"Your credit balance is too low to access the Anthropic API. "
++	"Please go to Plans & Billing to upgrade or purchase credits."
++)[:100]
+ PAUSED = constants.KEY_STATUS_PAUSED
+ QUOTA = constants.KEY_STATUS_QUOTA_EXHAUSTED
+ BAD_KEY = constants.KEY_STATUS_BAD_KEY
+@@ -49,6 +53,12 @@ class TestBreaker(FrappeTestCase):
+ 				1,
+ 				Action(QUOTA, None, True, "message", "quota"),
+ 			),
++			(
++				"row6 400 credit balance",
++				failure(400, message_prefix=CREDIT_PREFIX),
++				1,
++				Action(QUOTA, None, True, "message", "quota"),
++			),
+ 			("row7 401", failure(401), 1, Action(BAD_KEY, None, True, "alarm", "auth")),
+ 			("row7 403", failure(403), 1, Action(BAD_KEY, None, True, "alarm", "auth")),
+ 			(
+diff --git a/erp_ai/tests/test_tasks.py b/erp_ai/tests/test_tasks.py
+index 9f1419f..508fa20 100644
+--- a/erp_ai/tests/test_tasks.py
++++ b/erp_ai/tests/test_tasks.py
+@@ -183,6 +183,27 @@ class TestCheckPrivilegeEscalation(FrappeTestCase):
+ 		self.addCleanup(self.send_alarm_patch.stop)
+ 		# Keys already on the site must not influence the key condition.
+ 		frappe.db.set_value(CREDENTIAL_DOCTYPE, {"parent": SETTING_DOCTYPE}, "enabled", 0)
++		# The agent's real roles on the site must not influence the role condition: start from
++		# exactly the allowed set (rolled back with the test transaction).
++		frappe.db.delete("Has Role", {"parent": AGENT_USER, "parenttype": "User"})
++		for role in (ROLE_AGENT, HELPDESK_AGENT_ROLE):
++			self._add_role(role)
++		self._neutralize_agent_rows()
++
++	def _neutralize_agent_rows(self):
++		# Live rows attributed to the agent must not influence the permission-record and
++		# script/webhook conditions: reattribute or disable them (rolled back with the test).
++		for doctype in tasks.PERMISSION_DOCTYPES:
++			if frappe.db.exists("DocType", doctype):
++				frappe.db.set_value(
++					doctype,
++					{"modified_by": AGENT_USER},
++					"modified_by",
++					"Administrator",
++					update_modified=False,
++				)
++		frappe.db.set_value("Server Script", {"owner": AGENT_USER}, "disabled", 1)
++		frappe.db.set_value("Webhook", {"owner": AGENT_USER}, "enabled", 0)
+
+ 	def _run(self):
+ 		tasks.check_privilege_escalation()
+@@ -272,9 +293,7 @@ class TestCheckPrivilegeEscalation(FrappeTestCase):
+ 		self.assertIn("System Manager", self._alarm_messages()[0])
+
+ 	def test_allowed_roles_do_not_alarm(self):
+-		for role in (ROLE_AGENT, HELPDESK_AGENT_ROLE):
+-			if not frappe.db.exists("Has Role", {"parent": AGENT_USER, "role": role}):
+-				self._add_role(role)
++		self._add_role("Desk User")
+
+ 		self._run()
+
+@@ -295,9 +314,6 @@ class TestCheckPrivilegeEscalation(FrappeTestCase):
+ 		self.assertIn(AGENT_USER, self._alarm_messages()[0])
+
+ 	def test_alarm_when_agent_lost_a_required_role(self):
+-		for role in (ROLE_AGENT, HELPDESK_AGENT_ROLE):
+-			if not frappe.db.exists("Has Role", {"parent": AGENT_USER, "role": role}):
+-				self._add_role(role)
+ 		frappe.db.delete("Has Role", {"parent": AGENT_USER, "role": ROLE_AGENT})
+
+ 		self._run()
+@@ -320,6 +336,16 @@ class TestCheckPrivilegeEscalation(FrappeTestCase):
+
+ 		self.send_alarm.assert_not_called()
+
++	def test_setup_neutralizes_live_rows_attributed_to_agent(self):
++		self._add_perm(AGENT_USER)
++		self._add_server_script(AGENT_USER, disabled=0)
++		self._add_webhook(AGENT_USER, enabled=1)
++
++		self._neutralize_agent_rows()
++		self._run()
++
++		self.send_alarm.assert_not_called()
++
+ 	def test_alarm_on_enabled_server_script_or_webhook_by_agent(self):
+ 		script = self._add_server_script(AGENT_USER, disabled=0)
+ 		hook = self._add_webhook(AGENT_USER, enabled=1)

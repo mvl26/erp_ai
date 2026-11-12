@@ -93,7 +93,7 @@ def _ensure_default_settings() -> None:
 		for field in frappe.get_meta(SETTING_DOCTYPE).fields
 		if field.default is not None and field.default != ""
 	}
-	# Too long for a DocType JSON default, so it lives in code (D-11).
+	# Too long for a DocType JSON default, so it lives in code (design 2.4/3.3).
 	defaults["routing_rules"] = DEFAULT_ROUTING_RULES
 	for fieldname, default in defaults.items():
 		stored = frappe.db.sql(
@@ -234,21 +234,21 @@ def _ensure_task_ticket_field() -> None:
 
 
 def _ensure_task_permission() -> None:
-	if not frappe.db.exists("DocType", "Task"):
+	if not frappe.db.exists("DocType", TASK_DOCTYPE):
 		frappe.logger(LOGGER_NAME).warning("DocType Task not found; agent permission not added")
 		return
-	setup_custom_perms("Task")
-	row = {"parent": "Task", "role": ROLE_AGENT, "permlevel": 0, "if_owner": 1}
-	if frappe.db.exists("Custom DocPerm", {"parent": "Task", "role": ROLE_AGENT}):
+	setup_custom_perms(TASK_DOCTYPE)
+	row = {"parent": TASK_DOCTYPE, "role": ROLE_AGENT, "permlevel": 0, "if_owner": 1}
+	if frappe.db.exists("Custom DocPerm", {"parent": TASK_DOCTYPE, "role": ROLE_AGENT}):
 		# Only the share flag is ours to turn on; every other flag stays as found.
 		if frappe.db.exists("Custom DocPerm", {**row, "share": 0}):
 			frappe.db.set_value("Custom DocPerm", {**row, "share": 0}, "share", 1)
-			frappe.clear_cache(doctype="Task")
+			frappe.clear_cache(doctype=TASK_DOCTYPE)
 		return
 	frappe.get_doc(
 		{
 			"doctype": "Custom DocPerm",
-			"parent": "Task",
+			"parent": TASK_DOCTYPE,
 			"parenttype": "DocType",
 			"parentfield": "permissions",
 			"role": ROLE_AGENT,
@@ -260,7 +260,7 @@ def _ensure_task_permission() -> None:
 			"if_owner": 1,
 		}
 	).insert(ignore_permissions=True)
-	frappe.clear_cache(doctype="Task")
+	frappe.clear_cache(doctype=TASK_DOCTYPE)
 
 
 def _ensure_agent_status_script() -> None:

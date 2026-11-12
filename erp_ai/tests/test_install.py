@@ -194,7 +194,7 @@ class TestInstall(FrappeTestCase):
 
 	def _other_task_perms(self):
 		return frappe.db.sql(
-			"select name, role, permlevel, `read`, `write`, `create`, `delete`, if_owner, modified "
+			"select name, role, permlevel, `read`, `write`, `create`, `delete`, `share`, if_owner, modified "
 			"from `tabCustom DocPerm` where parent='Task' and role != %s order by name",
 			ROLE_AGENT,
 		)
@@ -228,7 +228,26 @@ class TestInstall(FrappeTestCase):
 	def test_task_permission_share_off_is_turned_on_only_that_flag(self):
 		perm = self._agent_task_perm_row()
 		frappe.db.set_value("Custom DocPerm", perm.name, {"share": 0, "write": 0})
+		# get_meta below caches the in-transaction state (write=0) in redis; rollback does not clear it.
+		self.addCleanup(frappe.clear_cache, doctype="Task")
 		frappe.clear_cache(doctype="Task")
+		decoys = [
+			{"role": ROLE_AGENT, "permlevel": 0, "if_owner": 0},
+			{"role": ROLE_AGENT, "permlevel": 1, "if_owner": 1},
+			{"role": "Blogger", "permlevel": 0, "if_owner": 1},
+		]
+		for decoy in decoys:
+			frappe.get_doc(
+				{
+					"doctype": "Custom DocPerm",
+					"parent": "Task",
+					"parenttype": "DocType",
+					"parentfield": "permissions",
+					"read": 1,
+					"share": 0,
+					**decoy,
+				}
+			).insert(ignore_permissions=True)
 		other = self._other_task_perms()
 		with patch.object(install.frappe, "clear_cache", wraps=frappe.clear_cache) as clear_cache:
 			install.ensure_setup()
@@ -236,7 +255,20 @@ class TestInstall(FrappeTestCase):
 		now = self._agent_task_perm_row()
 		self.assertEqual((now.share, now.write, now.read, now.create), (1, 0, 1, 1))
 		self.assertEqual(self._other_task_perms(), other)
-		shared = [p.share for p in frappe.get_meta("Task").permissions if p.role == ROLE_AGENT and p.if_owner]
+		decoy_shares = frappe.get_all(
+			"Custom DocPerm",
+			filters={"parent": "Task", "share": 0, "role": ("in", [ROLE_AGENT, "Blogger"])},
+			fields=["role", "permlevel", "if_owner"],
+		)
+		self.assertCountEqual(
+			[(d.role, d.permlevel, d.if_owner) for d in decoy_shares],
+			[(d["role"], d["permlevel"], d["if_owner"]) for d in decoys],
+		)
+		shared = [
+			p.share
+			for p in frappe.get_meta("Task").permissions
+			if p.role == ROLE_AGENT and p.if_owner and not p.permlevel
+		]
 		self.assertEqual(shared, [1])
 
 	def test_task_permission_share_already_on_is_not_saved_again(self):
@@ -270,9 +302,10 @@ class TestInstall(FrappeTestCase):
 				"parent": TEMPLATE,
 				"fieldname": ("in", ("ai_complexity", "ai_importance", "ai_score_reason")),
 			},
-			fields=["visible_to", "required"],
+			fields=["fieldname", "visible_to", "required"],
 		)
 		self.assertEqual(len(rows), 3)
+		self.assertEqual({r.fieldname for r in rows}, {"ai_complexity", "ai_importance", "ai_score_reason"})
 		self.assertEqual({(r.visible_to, r.required) for r in rows}, {("Agents", 0)})
 
 	def _task_ticket_field(self):
@@ -336,6 +369,7 @@ class TestInstall(FrappeTestCase):
 
 	def test_missing_task_doctype_is_skipped_with_warning(self):
 		frappe.db.delete("Custom DocPerm", {"parent": "Task", "role": ROLE_AGENT})
+		frappe.db.delete("Custom Field", {"dt": "Task", "fieldname": "ai_ticket"})
 		real = frappe.db.exists
 		with (
 			patch.object(
@@ -350,6 +384,7 @@ class TestInstall(FrappeTestCase):
 		self.assertEqual(len(warnings), 1)
 		self.assertIn("not found", warnings[0][0])
 		self.assertEqual(self._agent_task_perms(), [])
+		self.assertIsNone(self._task_ticket_field())
 
 	def test_agent_user_has_exact_roles_without_system_manager(self):
 		user = frappe.get_doc("User", AGENT_USER)

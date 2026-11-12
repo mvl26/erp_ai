@@ -17,6 +17,7 @@ from erp_ai.agent.tools.route_ticket import (
 	REASON_TASK_NOT_ASSIGNED,
 	apply_route,
 	assign_owner,
+	create_routed_task,
 	post_routing_comment,
 )
 from erp_ai.constants import AGENT_USER, CLASSIFIED_BY_AI, CLASSIFIED_BY_HUMAN
@@ -424,3 +425,122 @@ class TestRoutingComment(RouteTicketTestCase):
 					ASSIGN_REQUEST.format(reason=reason),
 					f"Bot chưa gán được người phụ trách cho phiếu này: {text}. Nhờ trưởng nhóm phân công.",
 				)
+
+
+class TestCreateRoutedTask(RouteTicketTestCase):
+	def _create_as_agent(self, ticket: str, user: str, subject: str = "ERPAI-TEST việc", classification=None):
+		pin_agent_roles(self)
+		frappe.set_user(AGENT_USER)
+		return create_routed_task(user, subject, classification or self._classification(), self._ctx(ticket))
+
+	def _task_count(self) -> int:
+		return frappe.db.count("Task", {"subject": ("like", f"{PREFIX}%")})
+
+	def _assert_refused(self, result, add):
+		self.assertFalse(result["ok"], result)
+		self.assertTrue(result["reason"])
+		self.assertLessEqual(len(result["reason"]), 200)
+		add.assert_not_called()
+		self.assertEqual(self._task_count(), 0)
+
+	def test_assignee_without_projects_user_gets_share(self):
+		ticket = self._ticket()
+		owner = make_active_agent(self)
+		self.assertNotIn("Projects User", frappe.get_roles(owner))
+		result = self._create_as_agent(ticket, owner)
+		self.assertTrue(result["ok"], result)
+		share = {"share_doctype": "Task", "share_name": result["task"], "user": owner, "read": 1}
+		self.assertEqual(frappe.db.count("DocShare", share), 1)
+		self.assertTrue(frappe.has_permission("Task", "read", doc=result["task"], user=owner))
+
+	def test_assign_to_add_called_on_task_with_one_todo(self):
+		ticket = self._ticket()
+		owner = make_active_agent(self)
+		with patch.object(assign_to, "add", wraps=assign_to.add) as add:
+			result = self._create_as_agent(ticket, owner)
+		self.assertTrue(result["ok"], result)
+		add.assert_called_once_with({"assign_to": [owner], "doctype": "Task", "name": result["task"]})
+		todo = {"reference_type": "Task", "reference_name": result["task"], "allocated_to": owner}
+		self.assertEqual(frappe.db.count("ToDo", {**todo, "status": "Open"}), 1)
+
+	def test_task_references_ticket(self):
+		ticket = self._ticket()
+		result = self._create_as_agent(ticket, make_active_agent(self))
+		self.assertTrue(result["ok"], result)
+		self.assertEqual(frappe.db.get_value("Task", result["task"], "ai_ticket"), ticket)
+
+	def test_subject_cut_to_140_chars(self):
+		ticket = self._ticket()
+		long_subject = f"{PREFIX}" + "".join(chr(97 + i % 26) for i in range(200))
+		result = self._create_as_agent(ticket, make_active_agent(self), subject=long_subject)
+		self.assertTrue(result["ok"], result)
+		self.assertEqual(frappe.db.get_value("Task", result["task"], "subject"), long_subject[:140])
+
+	def test_description_has_ticket_link_first(self):
+		ticket = self._ticket()
+		result = self._create_as_agent(ticket, make_active_agent(self))
+		self.assertTrue(result["ok"], result)
+		description = frappe.db.get_value("Task", result["task"], "description")
+		self.assertIn(f'<a href="/helpdesk/tickets/{ticket}"', description)
+		self.assertLess(description.index("/helpdesk/tickets/"), description.index("Độ phức tạp"))
+
+	def test_description_escaped_and_has_scores(self):
+		ticket = self._ticket()
+		classification = self._classification(
+			complexity=2, importance=3, score_reason="<img src=x onerror=alert(1)> & lý do"
+		)
+		result = self._create_as_agent(ticket, make_active_agent(self), classification=classification)
+		self.assertTrue(result["ok"], result)
+		description = frappe.db.get_value("Task", result["task"], "description")
+		self.assertIn("Độ phức tạp 2/3, độ quan trọng 3/3: ", description)
+		self.assertIn("&lt;img src=x onerror=alert(1)&gt; &amp; lý do", description)
+		self.assertNotIn("<img", description)
+
+	def test_sharing_disabled_raises(self):
+		ticket = self._ticket()
+		owner = make_active_agent(self)
+		real = frappe.get_system_settings
+
+		def settings(key):
+			return 1 if key == "disable_document_sharing" else real(key)
+
+		with patch.object(frappe, "get_system_settings", settings):
+			with self.assertRaises(frappe.ValidationError):
+				self._create_as_agent(ticket, owner)
+
+	def test_no_task_doctype_refused(self):
+		ticket = self._ticket()
+		real = frappe.db.exists
+
+		def no_task(dt, *args, **kwargs):
+			return None if dt == "DocType" and args == ("Task",) else real(dt, *args, **kwargs)
+
+		with patch.object(frappe.db, "exists", no_task), patch.object(assign_to, "add") as add:
+			result = self._create_as_agent(ticket, make_active_agent(self))
+		self._assert_refused(result, add)
+
+	def test_no_task_create_permission_refused(self):
+		ticket = self._ticket()
+		real = frappe.has_permission
+
+		def deny_create(doctype=None, ptype="read", *args, user=None, **kwargs):
+			if doctype == "Task" and ptype == "create" and user in (None, AGENT_USER):
+				return False
+			return real(doctype, ptype, *args, user=user, **kwargs)
+
+		with patch.object(frappe, "has_permission", deny_create), patch.object(assign_to, "add") as add:
+			result = self._create_as_agent(ticket, make_active_agent(self))
+		self._assert_refused(result, add)
+
+	def test_no_ticket_read_permission_refused(self):
+		ticket = self._ticket()
+		real = Document.has_permission
+
+		def deny_read(doc, permtype="read", *args, **kwargs):
+			if permtype == "read" and doc.doctype == "HD Ticket" and frappe.session.user == AGENT_USER:
+				return False
+			return real(doc, permtype, *args, **kwargs)
+
+		with patch.object(Document, "has_permission", deny_read), patch.object(assign_to, "add") as add:
+			result = self._create_as_agent(ticket, make_active_agent(self))
+		self._assert_refused(result, add)

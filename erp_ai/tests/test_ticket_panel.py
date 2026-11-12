@@ -306,6 +306,7 @@ class TestTicketPanelReadOnly(FrappeTestCase):
 	def test_read_logs_ids_only_at_debug(self):
 		_add_comment(self.ticket, f"{KEYWORD} secret body text")
 		_add_comment(self.ticket, "bot secret reply", AGENT_USER)
+		_add_comment(self.ticket, "plain human note without the trigger")
 		logger, get_logger = self._logger()
 		frappe.set_user(AGENT_EMAIL)
 		ticket_panel.get_panel_data(self.ticket)
@@ -313,7 +314,8 @@ class TestTicketPanelReadOnly(FrappeTestCase):
 		logger.debug.assert_called_once_with(f"erp_ai panel read ticket={self.ticket} messages=2")
 		logger.info.assert_not_called()
 		logged = str(logger.mock_calls)
-		for leak in ("secret", AGENT_EMAIL, AGENT_USER, "Administrator"):
+		bot_name = frappe.utils.get_fullname(AGENT_USER)
+		for leak in ("secret", KEYWORD, bot_name, AGENT_EMAIL, AGENT_USER, "Administrator"):
 			self.assertNotIn(leak, logged)
 
 	def test_denied_read_logs_reason_without_content_or_email(self):
@@ -338,6 +340,7 @@ class TestTicketPanelReadOnly(FrappeTestCase):
 		logger.info.assert_called_once_with(
 			f"erp_ai panel denied method=get ticket={self.ticket} reason=no_read"
 		)
+		logger.debug.assert_not_called()
 		logged = str(logger.mock_calls)
-		for leak in ("secret", WEBSITE_EMAIL, NO_READ_EMAIL):
+		for leak in ("secret", KEYWORD, WEBSITE_EMAIL, NO_READ_EMAIL):
 			self.assertNotIn(leak, logged)

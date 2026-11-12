@@ -8,7 +8,7 @@ Quy trình:
 - Site `miyano` dùng chung: hai `cmd.test` đồng thời gây `QueryDeadlockError 1213` giả (R1: 37 error; T4/T5 song song: 45 và 34 error). Từ sau T5: MỘT dev mỗi lần; reviewer chạy song song với dev kế tiếp được vì reviewer không chạy bench.
 - Nhánh task đang được checkout trong worktree dev cũ thì dev sửa vòng sau tạo nhánh `-reworkN` (hoặc `-cont`); tech-lead `merge --ff-only` vào nhánh task từ worktree của dev cũ, hoặc merge thẳng nhánh mới.
 - `review-NN.md`: NN = số task (T9b → `review-09b.md`).
-- BASE của task = `git rev-parse team/FEAT-006` ngay trước lần gọi dev; ghi vào dòng tick (commit docs đứng trước lần gọi dev nên BASE là đầu nhánh sau commit docs đó).
+- BASE của task = `git rev-parse team/FEAT-006` ngay trước lần gọi dev (commit docs đứng trước lần gọi dev nên BASE là đầu nhánh sau commit docs đó).
 
 ## Đổi touchpoint
 
@@ -16,6 +16,7 @@ Quy trình:
 - T6 (tech-lead; team-leader chấp nhận ngày 2026-11-12, journal "quyết định 4 điểm"): thêm `erp_ai/agent/test_runner_routing.py`, chỉ đổi `priority == "High"` → `"Urgent"` cho A + quan trọng 3 (kỳ vọng của bản giả T1 trái R4/AC-3).
 - T11 (tech-lead; team-leader chấp nhận ngày 2026-11-12): thêm `erp_ai/tests/test_doctype_descriptions.py`, chỉ thêm dữ liệu ghim (`field_count` 22 → 24 và `phrases` cho `auto_assign_enabled`, `routing_rules`); không nới khẳng định cũ.
 - T9b (task chèn mới, quyết định (1)+(3) của team-leader): touchpoint `erp_ai/agent/routing.py`, `erp_ai/agent/test_routing.py`, `erp_ai/erp_ai_agent/doctype/erp_ai_setting/erp_ai_setting.py`, `erp_ai/erp_ai_agent/doctype/erp_ai_setting/test_erp_ai_setting.py`; depends: T9, T11.
+- T14 (tech-lead, cần team-leader xác nhận ở C3): thêm `erp_ai/agent/test_agent_runner.py`, chỉ sửa kỳ vọng `after` của 3 test (bỏ `ai_complexity`/`ai_importance` không đổi) vì `before`/`after` nay chỉ chứa trường đã đổi (tiêu chí T14, AC-16); cùng kiểu T1/T6/T11 (STD-TEST-5).
 
 ## Tick
 
@@ -33,6 +34,8 @@ Quy trình:
 - [x] T11 — BASE=f1a732b, 1 vòng (sau DESIGN_CONFLICT được giải), merge 27d18fe, review-11; cmd.test đầu nhánh task 776839a: Ran 728 tests, OK
 - [x] T12 — BASE=449e2b5, 2 vòng, merge 1f0b3f7, review-12; cmd.test đầu nhánh task 1db4533: Ran 738 tests, OK
 - [x] T9b — BASE=8a1bd31, 2 vòng (1 vòng sửa), merge 4dc14d7, review-09b; cmd.test đầu nhánh task 566f796: Ran 744 tests, OK
+- [x] T13 — BASE=5688f13, 2 vòng (1 vòng sửa), merge 43cca1f, review-13; cmd.test đầu nhánh task 388f562: Ran 751 tests, OK
+- [x] T14 — BASE=b74303f, 2 vòng (1 vòng sửa, một lần DESIGN_CONFLICT được giải), merge 8fdc05f, review-14; cmd.test đầu nhánh task 809fac6: Ran 764 tests, OK
 
 ## Checkpoint C2 (trên 1f0b3f7)
 
@@ -48,9 +51,14 @@ Quy trình:
 3. Khóa tiền tố rỗng `""`: T8 giữ bỏ qua; bộ kiểm từ chối khi lưu (T9b, xong).
 4. 99 Has Role của tài khoản agent: ngoài FEAT-006.
 
+## Việc dặn trước cho các task sau (từ review)
+
+- T20: `applied` của bản ghi `classify` dùng `result["ok"]`, không dùng "`after` khác rỗng" (review-14, `runner.py:276`); `applied_sla` có thể trả `resolution_s=None` khi phiếu có `sla` mà không có `priority`, T20 phải xử lý (review-13).
+- design.md: bổ sung 2 hàng lỗi mới ở 3.3 (trống; khóa tiền tố rỗng, review-09b) và chỉnh 3.4 cho khớp tasks.md T14 (review-14); việc của designer/khi gộp.
+
 ## Đang build
 
-Chặng 3 (`--decide`): T9b xong; kế tiếp T13 → T14 → T15 → T16 (MỘT dev mỗi lần), dừng ở checkpoint C3 rồi báo cáo.
+Chặng 3 (`--decide`): T9b, T13, T14 xong; kế tiếp T15 → T16 (MỘT dev mỗi lần), dừng ở checkpoint C3 rồi báo cáo.
 
 ## Nhật ký
 
@@ -64,3 +72,5 @@ Chặng 3 (`--decide`): T9b xong; kế tiếp T13 → T14 → T15 → T16 (MỘT
 - 2026-11-12 T12: reviewer vòng 1 request-changes (3 major: bảo vệ Task bị che, thiếu dòng mồi share, nghi cache meta); vòng 2 approve (finding cache được reviewer rút lại); merge 1f0b3f7; 738 OK.
 - 2026-11-12 C2: migrate exit 0, ensure_setup lần hai không đổi gì, cmd.test 738 OK; dừng báo cáo.
 - 2026-11-12 T9b: vòng 1 request-changes (major STD-ERR-3: thông báo trống nhắc tên hằng Python; minor: `.strip()` trên giá trị không phải chuỗi); vòng 2 approve; merge 4dc14d7; 744 OK.
+- 2026-11-12 T13: vòng 1 request-changes (major STD-TEST-2: bộ lọc `reference_type` không có ca mồi; 3 minor); vòng 2 approve; merge 43cca1f; 751 OK.
+- 2026-11-12 T14: vòng 1 request-changes (2 major: `before`/`after` liệt kê trường không đổi; test giả quyền bỏ qua `permission_type`); dev sửa DESIGN_CONFLICT vì 3 test `test_agent_runner.py` (kỳ vọng cũ) → tech-lead mở rộng touchpoint 1 file, dev khác sửa kỳ vọng; vòng 2 approve; merge 8fdc05f; 764 OK.

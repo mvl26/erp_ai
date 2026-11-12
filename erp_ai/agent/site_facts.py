@@ -1,6 +1,6 @@
 """Read-only facts about the site that routing decisions depend on (ADR-019 QĐ 5, ADR-021 QĐ 4).
 
-Everything goes through `frappe.db`, never through document permissions, so the agent account can
+Everything goes through `frappe.db` / `frappe.get_all`, which skip document permissions, so the agent account can
 read facts (such as the applied SLA) that its roles may not open as documents. The results only
 feed decisions; they are not handed to the model or written into comments.
 """

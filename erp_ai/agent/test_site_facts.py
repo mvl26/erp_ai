@@ -24,8 +24,10 @@ class TestSiteFacts(FrappeTestCase):
 		frappe.set_user("Administrator")
 		self.ticket = make_ticket(subject="T13 site facts").name
 
-	def _todo(self, allocated_to, status="Open", assignment_rule=None, ticket=None):
-		return frappe.get_doc(
+	def _todo(
+		self, allocated_to, status="Open", assignment_rule=None, ticket=None, reference_type="HD Ticket"
+	):
+		todo = frappe.get_doc(
 			{
 				"doctype": "ToDo",
 				"reference_type": "HD Ticket",
@@ -35,7 +37,12 @@ class TestSiteFacts(FrappeTestCase):
 				"assignment_rule": assignment_rule,
 				"description": "T13",
 			}
-		).insert(ignore_permissions=True)
+		)
+		todo.insert(ignore_permissions=True)
+		if reference_type != "HD Ticket":
+			# ToDo hooks load the referenced document, so retarget the row after the insert
+			frappe.db.set_value("ToDo", todo.name, "reference_type", reference_type, update_modified=False)
+		return todo
 
 	def test_assignments_include_closed_exclude_cancelled(self):
 		open_user, closed_user, cancelled_user = (make_active_agent(self) for _ in range(3))
@@ -45,10 +52,13 @@ class TestSiteFacts(FrappeTestCase):
 		self._todo(closed_user, "Closed")
 		self._todo(cancelled_user, "Cancelled")
 		self._todo(open_user, "Open", ticket=other_ticket)
+		# same reference_name, other doctype: must not count as an owner of the ticket
+		self._todo(cancelled_user, "Open", reference_type="Task")
 
 		rows = site_facts.ticket_assignments(self.ticket)
 
-		self.assertCountEqual(
+		# oldest first (order_by "creation, name"), so assertEqual and not assertCountEqual
+		self.assertEqual(
 			[(row["allocated_to"], row["assignment_rule"]) for row in rows],
 			[(open_user, rule), (closed_user, None)],
 		)
@@ -63,6 +73,10 @@ class TestSiteFacts(FrappeTestCase):
 
 		self.assertTrue(site_facts.has_linked_task(self.ticket))
 		self.assertFalse(site_facts.has_linked_task(make_ticket(subject="T13 untouched").name))
+
+		pin_agent_roles(self)
+		frappe.set_user(AGENT_USER)
+		self.assertTrue(site_facts.has_linked_task(self.ticket))
 
 	def test_is_active_agent_flags(self):
 		user = make_active_agent(self)
@@ -83,7 +97,21 @@ class TestSiteFacts(FrappeTestCase):
 		self.assertIsNone(site_facts.applied_sla(self.ticket))
 
 	def test_applied_sla_reads_priority_row(self):
+		# The target SLA sits between two decoys with other High resolution times, so without the
+		# `parent` filter get_value returns a decoy whichever way it orders by `modified`.
+		def decoy_sla(hours):
+			decoy = make_sla(self)
+			frappe.db.set_value(
+				"HD Service Level Priority",
+				{"parent": decoy, "priority": "High"},
+				"resolution_time",
+				hours * 3600,
+				update_modified=False,
+			)
+
+		decoy_sla(99)
 		sla = make_sla(self)
+		decoy_sla(77)
 		frappe.db.set_value("HD Ticket", self.ticket, {"sla": sla, "priority": "High"})
 
 		# High: response 2h, resolution 4 * 2h (make_sla)
@@ -103,6 +131,8 @@ class TestSiteFacts(FrappeTestCase):
 		pin_agent_roles(self)
 		frappe.set_user(AGENT_USER)
 
+		# premise: the agent cannot open the SLA as a document, yet the facts still read it
+		self.assertFalse(frappe.has_permission("HD Service Level Agreement", "read", user=AGENT_USER))
 		self.assertEqual([row["allocated_to"] for row in site_facts.ticket_assignments(self.ticket)], [user])
 		self.assertTrue(site_facts.has_linked_task(self.ticket))
 		self.assertTrue(site_facts.is_active_agent(user))

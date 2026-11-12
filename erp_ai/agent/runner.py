@@ -359,7 +359,7 @@ def _record_route(log_name, result, decision, actions, errors):
 	if result:
 		for column, key in (("value_before", "before"), ("value_after", "after")):
 			if result.get(key):
-				updates[column] = json.dumps(result[key], ensure_ascii=False)
+				updates[column] = json.dumps({"ticket": result[key]}, ensure_ascii=False)
 		# a route note names the reason a field was left empty; it replaces the generic reason for that field
 		noted = {note["field"] for note in decision.notes}
 		skipped = [item for item in result.get("skipped") or [] if item["field"] not in noted]

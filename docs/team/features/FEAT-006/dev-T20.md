@@ -1,6 +1,6 @@
 # dev-T20 — Runner `_route` (u1) và kiểm SLA (FEAT-006)
 
-Nhánh `team/FEAT-006-task-20` (từ `team/FEAT-006` 77dce93). Trạng thái: **DESIGN_CONFLICT** (5 test cũ ở `test_agent_runner.py` đỏ vì hành vi mới theo spec).
+Nhánh `team/FEAT-006-task-20` (từ `team/FEAT-006` 77dce93). Trạng thái: **DONE** (lần gọi 2, touchpoint mở rộng; nhánh làm việc `team/FEAT-006-task-20-r2` từ cc82977 vì nhánh task-20 đang được worktree khác giữ).
 
 ## RED (đúng lý do: thiếu hành vi)
 Lệnh: `PYTHONPATH=<worktree> bench --site miyano run-tests --module erp_ai.agent.test_runner_routing`
@@ -43,3 +43,8 @@ Cần tech-lead cho phép sửa các kỳ vọng này (hoặc giao task riêng).
 ## Lưu ý
 - `value_before/after` giữ dạng phẳng như T19 (test cũ so bằng từng khóa); design 3.5 viết dạng lồng `{"ticket": ...}`. Đổi sang dạng lồng khi T21 thêm `assign`/`task` sẽ phải sửa thêm test cũ ở `test_agent_runner.py`. Chờ quyết định.
 - Savepoint `erp_ai_route` bao (u1) + kiểm SLA + cập nhật bản ghi: lỗi khi ghi bản ghi vẫn hoàn tác phiếu và ném lên (giữ test cũ `test_failure_after_tool_rolls_ticket_back_and_keeps_entry`).
+
+## Lần gọi 2: giải DESIGN_CONFLICT
+- Runner: `value_before`/`value_after` lồng `{"ticket": {...}}` (design 3.5), chỉ ghi khi (u1) có ghi.
+- Cập nhật kỳ vọng 5 test `TestRunnerL1Classification` theo design, giữ độ chặt (so sánh bằng toàn bộ): `value_*` lồng `ticket`; `actions` thêm `sla_check` ok=false + lý do SLA; `skipped_fields` thêm note `assignee`; từ chối ghi: action `ok=false` + lý do "người đã phân loại, không ghi đè". Các truy cập `value_*` trong `test_agent_runner.py` và `test_runner_routing.py` đổi sang `["ticket"]`. Không skip/xfail.
+- GREEN: test_agent_runner 56 OK; test_runner_routing 24 OK; toàn app: xem báo cáo trả về.

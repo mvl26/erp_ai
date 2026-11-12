@@ -100,7 +100,7 @@ class TestRoutingEndToEnd(RoutingTestBase):
 			json.loads(entry.actions),
 			[{"tool": "apply_route", "doctype": "HD Ticket", "name": self.ticket.name, "ok": True}],
 		)
-		after = json.loads(entry.value_after)
+		after = json.loads(entry.value_after)["ticket"]
 		self.assertEqual((after["ai_complexity"], after["ai_importance"]), (2, 3))
 
 	def test_l0_ticket_unchanged_scores_zero_not_null(self):
@@ -193,8 +193,8 @@ class TestRoutingEndToEnd(RoutingTestBase):
 
 		entry = self._single_entry()
 		self.assertEqual(entry.applied, 1)
-		self.assertEqual(json.loads(entry.value_after)["priority"], "High")
-		self.assertEqual(json.loads(entry.value_before)["priority"], self.ticket.priority)
+		self.assertEqual(json.loads(entry.value_after)["ticket"]["priority"], "High")
+		self.assertEqual(json.loads(entry.value_before)["ticket"]["priority"], self.ticket.priority)
 		self.assertEqual(json.loads(entry.actions)[0]["tool"], "apply_route")
 
 	def test_changed_importance_table_used_next_run(self):

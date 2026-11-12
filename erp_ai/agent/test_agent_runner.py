@@ -459,6 +459,9 @@ CLASSIFY_FIELDS = (
 )
 
 
+ASSIGNEE_NOTE = {"field": "assignee", "reason": "cấu hình không có người cho đầu mục A"}
+
+
 class TestRunnerL1Classification(RunnerTestBase):
 	"""Classification step at L1 (T29): the tool applies it, the run itself records the outcome."""
 
@@ -504,15 +507,17 @@ class TestRunnerL1Classification(RunnerTestBase):
 		self.assertEqual(row.status, before.status)
 		entry = self._single_entry()
 		self.assertEqual(entry.applied, 1)
-		self.assertEqual(json.loads(entry.value_before)["ticket_type"], before.ticket_type)
+		self.assertEqual(json.loads(entry.value_before)["ticket"]["ticket_type"], before.ticket_type)
 		self.assertEqual(
 			json.loads(entry.value_after),
 			{
-				"ticket_type": L1_TYPE,
-				"agent_group": L1_TEAM,
-				"priority": "High",
-				"ai_confidence": "Cao",
-				"ai_score_reason": "",
+				"ticket": {
+					"ticket_type": L1_TYPE,
+					"agent_group": L1_TEAM,
+					"priority": "High",
+					"ai_confidence": "Cao",
+					"ai_score_reason": "",
+				}
 			},
 		)
 		self.assertEqual(
@@ -520,7 +525,7 @@ class TestRunnerL1Classification(RunnerTestBase):
 			[{"tool": "apply_route", "doctype": "HD Ticket", "name": self.ticket.name, "ok": True}],
 		)
 		self.assertEqual((entry.predicted_category, entry.predicted_confidence), ("A", "Cao"))
-		self.assertFalse(entry.skipped_fields)
+		self.assertEqual(json.loads(entry.skipped_fields), [ASSIGNEE_NOTE])
 
 	def test_l1_human_classified_not_overwritten(self):
 		frappe.db.set_value("HD Ticket", self.ticket.name, "ai_classified_by", CLASSIFIED_BY_HUMAN)
@@ -531,7 +536,18 @@ class TestRunnerL1Classification(RunnerTestBase):
 		entry = self._single_entry()
 		self.assertEqual(entry.applied, 0)
 		self.assertFalse(entry.value_after)
-		self.assertFalse(entry.actions)
+		self.assertEqual(
+			json.loads(entry.actions),
+			[
+				{
+					"tool": "apply_route",
+					"doctype": "HD Ticket",
+					"name": self.ticket.name,
+					"ok": False,
+					"reason": "người đã phân loại, không ghi đè",
+				}
+			],
+		)
 		self.assertFalse(entry.skipped_fields)
 
 	def test_l1_empty_route_still_saves_ai_fields_applied_one(self):
@@ -549,14 +565,24 @@ class TestRunnerL1Classification(RunnerTestBase):
 		self.assertEqual(entry.applied, 1)
 		self.assertEqual(
 			json.loads(entry.value_after),
-			{"ai_confidence": "Cao", "ai_score_reason": ""},
+			{"ticket": {"ai_confidence": "Cao", "ai_score_reason": ""}},
 		)
 		self.assertEqual(
 			json.loads(entry.actions),
-			[{"tool": "apply_route", "doctype": "HD Ticket", "name": self.ticket.name, "ok": True}],
+			[
+				{"tool": "apply_route", "doctype": "HD Ticket", "name": self.ticket.name, "ok": True},
+				{
+					"tool": "sla_check",
+					"doctype": "HD Ticket",
+					"name": self.ticket.name,
+					"ok": False,
+					"reason": "SLA Standard xử lý 1440 phút > mong đợi 480 phút (A)",
+				},
+			],
 		)
 		skipped = json.loads(entry.skipped_fields)
 		self.assertIn("ticket_type", [item["field"] for item in skipped])
+		self.assertIn(ASSIGNEE_NOTE, skipped)
 
 	def test_l1_missing_value_reason_logged_on_classify_entry(self):
 		self.mapping["A"]["ticket_type"] = f"{PREFIX}không-có"
@@ -569,10 +595,13 @@ class TestRunnerL1Classification(RunnerTestBase):
 		self.assertEqual((row.agent_group, row.priority), (L1_TEAM, "High"))
 		entry = self._single_entry()
 		self.assertEqual(entry.applied, 1)
-		self.assertNotIn("ticket_type", json.loads(entry.value_after))
+		self.assertNotIn("ticket_type", json.loads(entry.value_after)["ticket"])
 		self.assertEqual(
 			json.loads(entry.skipped_fields),
-			[{"field": "ticket_type", "reason": "giá trị không tồn tại trên hệ thống"}],
+			[
+				{"field": "ticket_type", "reason": "giá trị không tồn tại trên hệ thống"},
+				ASSIGNEE_NOTE,
+			],
 		)
 
 	def test_l1_all_fields_skipped_reasons_logged_saves_ai_fields_applied_one(self):
@@ -589,12 +618,21 @@ class TestRunnerL1Classification(RunnerTestBase):
 		entry = self._single_entry()
 		self.assertEqual(entry.applied, 1)
 		self.assertEqual(
-			set(json.loads(entry.value_after)),
+			set(json.loads(entry.value_after)["ticket"]),
 			{"ai_confidence", "ai_score_reason"},
 		)
 		self.assertEqual(
 			json.loads(entry.actions),
-			[{"tool": "apply_route", "doctype": "HD Ticket", "name": self.ticket.name, "ok": True}],
+			[
+				{"tool": "apply_route", "doctype": "HD Ticket", "name": self.ticket.name, "ok": True},
+				{
+					"tool": "sla_check",
+					"doctype": "HD Ticket",
+					"name": self.ticket.name,
+					"ok": False,
+					"reason": "SLA Standard xử lý 1440 phút > mong đợi 480 phút (A)",
+				},
+			],
 		)
 		self.assertEqual(
 			json.loads(entry.skipped_fields),
@@ -602,6 +640,7 @@ class TestRunnerL1Classification(RunnerTestBase):
 				{"field": "ticket_type", "reason": "giá trị không tồn tại trên hệ thống"},
 				{"field": "agent_group", "reason": "ánh xạ không có giá trị"},
 				{"field": "priority", "reason": "ánh xạ không có giá trị"},
+				ASSIGNEE_NOTE,
 			],
 		)
 

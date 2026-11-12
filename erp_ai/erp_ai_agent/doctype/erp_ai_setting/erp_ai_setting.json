@@ -4,73 +4,101 @@
  "doctype": "DocType",
  "engine": "InnoDB",
  "field_order": [
+  "section_activation",
   "enabled",
   "permission_level",
+  "section_limits",
   "max_turns_per_run",
   "max_runs_per_ticket_per_day",
   "max_keys_per_call",
   "request_timeout_s",
+  "section_budget",
   "monthly_budget_usd",
   "spent_this_month_usd",
   "price_input_per_mtok",
   "price_cache_write_per_mtok",
   "price_cache_read_per_mtok",
   "price_output_per_mtok",
+  "section_model",
   "model_classify_default",
   "trigger_keyword",
   "thinking_text",
   "answer_delay_min_s",
   "answer_delay_max_s",
+  "section_routing",
   "excluded_teams",
   "category_mapping",
   "prompt_digest",
+  "section_alerts",
   "alert_recipients",
   "credentials"
  ],
  "fields": [
   {
+   "fieldname": "section_activation",
+   "fieldtype": "Section Break",
+   "label": "Bật và mức quyền"
+  },
+  {
    "fieldname": "enabled",
    "fieldtype": "Check",
    "label": "Bật agent",
-   "default": "0"
+   "default": "0",
+   "description": "Bật hoặc tắt agent. Tắt thì không xếp lần chạy mới cho phiếu hay bình luận. Muốn bật phải có đủ 4 đơn giá lớn hơn 0 và từ khóa kích hoạt không rỗng, nếu thiếu thì không lưu được."
   },
   {
    "fieldname": "permission_level",
    "fieldtype": "Select",
    "label": "Mức quyền",
    "options": "L0\nL1\nL2\nL3",
-   "default": "L0"
+   "default": "L0",
+   "description": "L0: chỉ phân loại phiếu mới và ghi vào Log, không sửa phiếu, không trả lời bình luận. L1: đọc dữ liệu, ghi phân loại hoặc gợi ý lên phiếu, đăng bình luận. L2 và L3 hiện có đúng bộ công cụ như L1. Khi đã chi vượt ngân sách tháng thì tự hạ về L1 (L0 giữ nguyên)."
+  },
+  {
+   "fieldname": "section_limits",
+   "fieldtype": "Section Break",
+   "label": "Giới hạn mỗi lần chạy"
   },
   {
    "fieldname": "max_turns_per_run",
    "fieldtype": "Int",
    "label": "Số lượt tối đa mỗi lần chạy",
-   "default": "8"
+   "default": "8",
+   "description": "Số lượt lập luận tối đa của một lần chạy, từ 1 đến 20. Chạm giới hạn thì agent dừng vòng lặp và kết thúc lần chạy đó."
   },
   {
    "fieldname": "max_runs_per_ticket_per_day",
    "fieldtype": "Int",
    "label": "Số lần chạy tối đa mỗi phiếu mỗi ngày",
-   "default": "5"
+   "default": "5",
+   "description": "Số lần agent được chạy trên một phiếu trong một ngày, từ 1 đến 50. Chạm giới hạn thì bỏ qua phiếu đó đến hết ngày (ngày tính từ 00:00)."
   },
   {
    "fieldname": "max_keys_per_call",
    "fieldtype": "Int",
    "label": "Số khóa tối đa mỗi lời gọi",
-   "default": "3"
+   "default": "3",
+   "description": "Số khóa API tối đa được thử cho một lời gọi, từ 1 đến 10. Thử hết số khóa này mà vẫn không được thì báo lỗi và gửi cảnh báo."
   },
   {
    "fieldname": "request_timeout_s",
    "fieldtype": "Int",
    "label": "Timeout mỗi lời gọi API (giây)",
-   "default": "60"
+   "default": "60",
+   "description": "Thời gian chờ tối đa của mỗi lời gọi API, tính bằng giây, từ 5 đến 300. Quá thời gian thì khóa đó tạm nghỉ và chuyển sang khóa kế tiếp."
+  },
+  {
+   "fieldname": "section_budget",
+   "fieldtype": "Section Break",
+   "label": "Ngân sách và đơn giá"
   },
   {
    "fieldname": "monthly_budget_usd",
    "fieldtype": "Float",
    "label": "Ngân sách tháng (USD)",
    "default": "10",
-   "precision": "6"
+   "precision": "6",
+   "description": "Ngân sách mỗi tháng dương lịch, tính bằng USD, không âm. Chi vượt thì quyền hạ về L1, không chặn chạy. Nhập 0 nghĩa là hạ về L1 ngay khi có chi phí, không phải là không giới hạn."
   },
   {
    "fieldname": "spent_this_month_usd",
@@ -78,97 +106,126 @@
    "label": "Đã chi tháng này (USD)",
    "default": "0",
    "precision": "6",
-   "read_only": 1
+   "read_only": 1,
+   "description": "Hệ thống tự ghi: mỗi ngày tự tính bằng tổng chi phí trong Log của tháng hiện tại, nên ngày 1 bắt đầu lại từ khoảng 0. Đơn vị USD, không sửa được; giá trị gõ vào bị bỏ khi lưu."
   },
   {
    "fieldname": "price_input_per_mtok",
    "fieldtype": "Float",
    "label": "Đơn giá input (USD / 1 triệu token)",
-   "default": "0"
+   "default": "0",
+   "description": "Đơn giá token đầu vào, tính bằng USD cho 1 triệu token. Dùng để tính chi phí ghi vào Log. Không được âm; bằng 0 thì không bật được agent."
   },
   {
    "fieldname": "price_cache_write_per_mtok",
    "fieldtype": "Float",
    "label": "Đơn giá ghi cache (USD / 1 triệu token)",
-   "default": "0"
+   "default": "0",
+   "description": "Đơn giá ghi cache, tính bằng USD cho 1 triệu token. Dùng để tính chi phí ghi vào Log. Không được âm; bằng 0 thì không bật được agent."
   },
   {
    "fieldname": "price_cache_read_per_mtok",
    "fieldtype": "Float",
    "label": "Đơn giá đọc cache (USD / 1 triệu token)",
-   "default": "0"
+   "default": "0",
+   "description": "Đơn giá đọc cache, tính bằng USD cho 1 triệu token. Dùng để tính chi phí ghi vào Log. Không được âm; bằng 0 thì không bật được agent."
   },
   {
    "fieldname": "price_output_per_mtok",
    "fieldtype": "Float",
    "label": "Đơn giá output (USD / 1 triệu token)",
-   "default": "0"
+   "default": "0",
+   "description": "Đơn giá token đầu ra, tính bằng USD cho 1 triệu token. Dùng để tính chi phí ghi vào Log. Không được âm; bằng 0 thì không bật được agent."
+  },
+  {
+   "fieldname": "section_model",
+   "fieldtype": "Section Break",
+   "label": "Model, từ khóa và chỉ báo trả lời"
   },
   {
    "fieldname": "model_classify_default",
    "fieldtype": "Data",
    "label": "Model phân loại mặc định",
-   "default": "claude-haiku-5-5"
+   "default": "claude-haiku-5-5",
+   "description": "Tên model dùng để phân loại phiếu khi dòng khóa API không ghi model phân loại riêng. Nhập đúng tên model của nhà cung cấp."
   },
   {
    "fieldname": "trigger_keyword",
    "fieldtype": "Data",
    "label": "Từ khóa kích hoạt",
-   "default": "@ai"
+   "default": "@ai",
+   "description": "Bình luận trên phiếu chứa cụm này (không phân biệt hoa thường) thì agent được gọi. Ví dụ: @ai. Không được để trống khi bật agent."
   },
   {
    "fieldname": "thinking_text",
    "fieldtype": "Small Text",
    "label": "Chữ chỉ báo khi đang suy nghĩ",
    "default": "Đang suy nghĩ…",
-   "description": "Hiện trên chỉ báo trạng thái ở trang phiếu. Để trống để tắt chỉ báo; khoảng trễ vẫn áp dụng."
+   "description": "Hiện trên chỉ báo trạng thái ở trang phiếu. Để trống để tắt chỉ báo; khoảng trễ (tính bằng giây, đặt ở hai ô kế tiếp) vẫn áp dụng."
   },
   {
    "fieldname": "answer_delay_min_s",
    "fieldtype": "Int",
    "label": "Trễ trả lời tối thiểu (giây)",
-   "default": "3"
+   "default": "3",
+   "description": "Độ trễ tối thiểu trước khi trả lời, tính bằng giây, từ 0 đến 30, không lớn hơn mức tối đa. Chỉ áp dụng khi agent được gọi bằng bình luận."
   },
   {
    "fieldname": "answer_delay_max_s",
    "fieldtype": "Int",
    "label": "Trễ trả lời tối đa (giây)",
-   "default": "5"
+   "default": "5",
+   "description": "Độ trễ tối đa trước khi trả lời, tính bằng giây, từ 0 đến 30, không nhỏ hơn mức tối thiểu. Chỉ áp dụng khi agent được gọi bằng bình luận."
+  },
+  {
+   "fieldname": "section_routing",
+   "fieldtype": "Section Break",
+   "label": "Phân loại và nhóm loại trừ"
   },
   {
    "fieldname": "excluded_teams",
    "fieldtype": "Small Text",
    "label": "Nhóm loại trừ",
-   "default": "Nhân sự & Hành chính\nTài chính Kế toán"
+   "default": "Nhân sự & Hành chính\nTài chính Kế toán",
+   "description": "Mỗi dòng một tên nhóm, so với Nhóm xử lý của phiếu, không phân biệt hoa thường. Phiếu thuộc các nhóm này thì agent bỏ qua."
   },
   {
    "fieldname": "category_mapping",
    "fieldtype": "Code",
    "label": "Ánh xạ đầu mục",
    "options": "JSON",
-   "default": "{\"A\": {\"ticket_type\": \"Sự cố & lỗi hệ thống\", \"agent_group\": \"IT\", \"priority\": \"High\"}, \"B\": {\"ticket_type\": \"Quản trị & cấu hình hệ thống\", \"agent_group\": \"IT\", \"priority\": \"Medium\"}, \"C\": {\"ticket_type\": \"Phát triển tính năng & tự động hóa\", \"agent_group\": \"IT\", \"priority\": \"Medium\"}, \"D\": {\"ticket_type\": \"Chuẩn hóa dữ liệu & quy trình trên ERP\", \"agent_group\": \"\", \"priority\": \"Medium\"}, \"E\": {\"ticket_type\": \"Công việc nghiệp vụ ngoài IT\", \"agent_group\": \"\", \"priority\": \"\"}, \"F\": {\"ticket_type\": \"Câu hỏi, phiếu nhiễu\", \"agent_group\": \"IT\", \"priority\": \"Low\"}}"
+   "default": "{\"A\": {\"ticket_type\": \"Sự cố & lỗi hệ thống\", \"agent_group\": \"IT\", \"priority\": \"High\"}, \"B\": {\"ticket_type\": \"Quản trị & cấu hình hệ thống\", \"agent_group\": \"IT\", \"priority\": \"Medium\"}, \"C\": {\"ticket_type\": \"Phát triển tính năng & tự động hóa\", \"agent_group\": \"IT\", \"priority\": \"Medium\"}, \"D\": {\"ticket_type\": \"Chuẩn hóa dữ liệu & quy trình trên ERP\", \"agent_group\": \"\", \"priority\": \"Medium\"}, \"E\": {\"ticket_type\": \"Công việc nghiệp vụ ngoài IT\", \"agent_group\": \"\", \"priority\": \"\"}, \"F\": {\"ticket_type\": \"Câu hỏi, phiếu nhiễu\", \"agent_group\": \"IT\", \"priority\": \"Low\"}}",
+   "description": "JSON gồm các đầu mục A đến F. Mỗi đầu mục có thể có loại phiếu, nhóm xử lý, ưu tiên. Sai cú pháp thì không lưu được. Tiêu đề phiếu có [GẤP] thì ưu tiên thành Urgent."
   },
   {
    "fieldname": "prompt_digest",
    "fieldtype": "Long Text",
-   "label": "Trích yếu HDSD"
+   "label": "Trích yếu HDSD",
+   "description": "Người tự nhập, hệ thống không tự điền. Được nối vào cuối hướng dẫn của bước lập luận, không dùng ở bước phân loại."
+  },
+  {
+   "fieldname": "section_alerts",
+   "fieldtype": "Section Break",
+   "label": "Cảnh báo và khóa API"
   },
   {
    "fieldname": "alert_recipients",
    "fieldtype": "Small Text",
    "label": "Người nhận cảnh báo",
-   "default": "info@miyano.com.vn"
+   "default": "info@miyano.com.vn",
+   "description": "Mỗi dòng một email, không tách bằng dấu phẩy, ví dụ canhbao@congty.vn. Nhận cảnh báo: khóa lỗi, khóa hết hạn mức, hết khóa dùng được, khóa hoạt động lại, cảnh báo leo quyền hằng ngày."
   },
   {
    "fieldname": "credentials",
    "fieldtype": "Table",
    "label": "Khóa API",
-   "options": "ERP AI Credential"
+   "options": "ERP AI Credential",
+   "description": "Danh sách khóa API. Nhãn bắt buộc và không trùng nhau (không phân biệt hoa thường). Có nút Kiểm tra khóa."
   }
  ],
  "issingle": 1,
  "links": [],
- "modified": "2026-11-12 10:00:00.000000",
+ "modified": "2026-11-12 18:00:00.000000",
  "modified_by": "Administrator",
  "module": "ERP AI agent",
  "name": "ERP AI Setting",

@@ -23,7 +23,7 @@ class Action:
 
 
 SPEND_LIMIT_ERROR_CODE = "enforced_spend_limit_reached"
-QUOTA_MESSAGE_PREFIX = "You have reached your specified"
+QUOTA_MESSAGE_PREFIXES = ("You have reached your specified", "Your credit balance is too low")
 RATE_LIMIT_DEFAULT_PAUSE_S = 61
 SERVER_PAUSE_S = 30
 OVERLOADED_STEP_S = 30
@@ -54,7 +54,7 @@ def decide(failure, error_count):
 		return Action(constants.KEY_STATUS_PAUSED, SERVER_PAUSE_S, True, None, "timeout")
 	if status == 402:
 		return _quota()
-	if status == 400 and failure.message_prefix.startswith(QUOTA_MESSAGE_PREFIX):
+	if status == 400 and failure.message_prefix.startswith(QUOTA_MESSAGE_PREFIXES):
 		return _quota()
 	if status in (401, 403):
 		return Action(constants.KEY_STATUS_BAD_KEY, None, True, "alarm", "auth")

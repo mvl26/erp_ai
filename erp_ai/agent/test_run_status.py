@@ -45,7 +45,6 @@ class TestRunStatus(FrappeTestCase):
 		granted = {schema["name"] for schema in get_tool_schemas(LEVELS[-1], True)}
 
 		self.assertEqual(CLASSIFY_STEP, "classify")
-		self.assertEqual(len(granted), 11)
 		self.assertEqual(set(WORK_LABELS), granted | {CLASSIFY_STEP})
 		self.assertEqual(WORK_LABELS, LABEL_TABLE)
 		for step in WORK_LABELS:

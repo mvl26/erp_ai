@@ -57,8 +57,11 @@ class RunStatus:
 
 	def working(self, step: str) -> None:
 		if self.started and not self.finished:
-			# an unknown name (invented by the model) never reaches the text (D-5)
-			label = WORK_LABELS.get(step, FALLBACK_WORK_LABEL)
+			try:
+				# an unknown name (invented by the model) never reaches the text (D-5)
+				label = WORK_LABELS.get(step, FALLBACK_WORK_LABEL)
+			except TypeError:
+				label = FALLBACK_WORK_LABEL
 			self._emit(STATE_WORKING, WORKING_TEXT.format(label=label))
 
 	def take_errors(self) -> list[str]:

@@ -7,6 +7,7 @@ from helpdesk.test_utils import create_agent, make_ticket
 from helpdesk.utils import is_agent
 
 from erp_ai import ticket_panel
+from erp_ai.agent.policy import contains_keyword
 from erp_ai.constants import AGENT_USER, LOGGER_NAME, PANEL_METHODS
 from erp_ai.test_utils import FakeGateway, set_agent_settings
 
@@ -469,3 +470,75 @@ class TestTicketPanelSend(FrappeTestCase):
 		with self.assertRaises(frappe.PermissionError):
 			self._send("Hi", user=AGENT_USER)
 		self.assertEqual(self._comment_count(), 0)
+
+	def _logger(self):
+		logger = MagicMock()
+		patcher = patch.object(ticket_panel.frappe, "logger", return_value=logger)
+		patcher.start()
+		self.addCleanup(patcher.stop)
+		return logger
+
+	def test_send_stored_content_passes_contains_keyword(self):
+		for text in ("Hello", "<b>x</b> & y", f"Hi {self.KEYWORD.upper()} there", "one\ntwo"):
+			with self.subTest(text=text):
+				stored = self._content(self._send(text))
+				self.assertTrue(contains_keyword(stored), stored)
+
+	def test_send_checks_keyword_on_sanitized_form(self):
+		# The check must run on what sanitize_html(always_sanitize=True) returns, not on our own escaping.
+		with (
+			patch.object(ticket_panel, "sanitize_html", return_value="<p>stripped</p>") as sanitize,
+			patch("helpdesk.helpdesk.doctype.hd_ticket.hd_ticket.HDTicket.new_comment") as new_comment,
+		):
+			with self.assertRaises(frappe.ValidationError):
+				self._send("Hello")
+		sanitize.assert_called_once_with(f"<p>Hello {self.KEYWORD}</p>", always_sanitize=True)
+		new_comment.assert_not_called()
+
+	def test_send_keyword_with_special_chars_rejected(self):
+		for keyword in ("a&b", "a<b"):
+			with self.subTest(keyword=keyword):
+				set_agent_settings(trigger_keyword=keyword)
+				with (
+					patch(
+						"helpdesk.helpdesk.doctype.hd_ticket.hd_ticket.HDTicket.new_comment"
+					) as new_comment,
+					self.assertRaises(frappe.ValidationError) as caught,
+				):
+					self._send("Hello")
+				new_comment.assert_not_called()
+				self.assertNotIn(keyword, str(caught.exception))
+				self.assertNotIn(keyword.casefold(), str(caught.exception).casefold())
+				self.assertEqual(self._comment_count(), 0)
+
+	def test_send_logs_without_content_or_email(self):
+		logger = self._logger()
+		added = self._send("Secret body")["comment"]
+		kept = self._send(f"Other {self.KEYWORD}")["comment"]
+		set_agent_settings(trigger_keyword="a&b")
+		with self.assertRaises(frappe.ValidationError):
+			self._send("Secret body")
+		set_agent_settings(trigger_keyword=self.KEYWORD)
+		with self.assertRaises(frappe.PermissionError):
+			self._send("Secret body", user="Guest")
+		frappe.set_user("Administrator")
+		create_agent(AGENT_USER)
+		with self.assertRaises(frappe.PermissionError):
+			self._send("Secret body", user=AGENT_USER)
+		# The FEAT-001 handler logs through the same logger name: keep only the panel's lines.
+		lines = [
+			call.args[0] for call in logger.info.call_args_list if call.args[0].startswith("erp_ai panel")
+		]
+		self.assertEqual(
+			lines,
+			[
+				f"erp_ai panel send ticket={self.ticket} comment={added} keyword_added=true",
+				f"erp_ai panel send ticket={self.ticket} comment={kept} keyword_added=false",
+				f"erp_ai panel send rejected ticket={self.ticket} reason=keyword_not_storable",
+				f"erp_ai panel denied method=send ticket={self.ticket} reason=not_agent",
+				f"erp_ai panel denied method=send ticket={self.ticket} reason=agent_user",
+			],
+		)
+		logged = str(logger.mock_calls)
+		for leak in ("Secret", "Other", "a&b", self.KEYWORD, AGENT_EMAIL, AGENT_USER):
+			self.assertNotIn(leak, logged)

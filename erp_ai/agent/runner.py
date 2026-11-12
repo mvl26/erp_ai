@@ -20,8 +20,10 @@ from erp_ai.constants import (
 	JOB_TIMEOUT_S,
 	LEVELS,
 	LOG_DOCTYPE,
+	LOGGER_NAME,
 	SETTING_DOCTYPE,
 	TITLE_RUN_FAILED,
+	TITLE_STATUS_FAILED,
 	TITLE_WRONG_USER,
 	TRIGGER_COMMENT_MENTION,
 	TRIGGER_TICKET_INSERT,
@@ -104,10 +106,10 @@ def _run(ticket_name, trigger):
 		_log_skip(ticket_name, trigger, run_id, "level_L0")
 		return
 	status = RunStatus(ticket_name, run_id, settings.get("thinking_text"))
+	delay = None
 	try:
 		status.start()
 		# anchor of the delay = right after the start signal (AC-3); ticket_insert never waits
-		delay = None
 		if trigger == TRIGGER_COMMENT_MENTION:
 			delay = AnswerDelay.start(settings.answer_delay_min_s, settings.answer_delay_max_s)
 		mapping = load_mapping(settings.category_mapping)
@@ -132,7 +134,29 @@ def _run(ticket_name, trigger):
 		if level != LEVELS[0]:
 			_reason(ticket_name, trigger, run_id, settings, context, classification, deadline, status, delay)
 	finally:
-		status.done()
+		_end_status(status, delay, ticket_name, run_id, trigger)
+
+
+def _end_status(status, delay, ticket_name, run_id, trigger):
+	"""Close the run's status (design 4.5): `done`, leftover emit failures to the Error Log, one summary line.
+
+	Codes and numbers only, never the status text (NFR-4'). No commit, no rollback: a signal never
+	changes data, and `done` is out of the transaction so a rollback cannot take it back (R-2).
+	"""
+	status.done()
+	errors = status.take_errors()
+	for piece in errors:
+		frappe.log_error(TITLE_STATUS_FAILED, f"ticket={ticket_name} run_id={run_id} {piece}")
+	frappe.logger(LOGGER_NAME).info(
+		"erp_ai run_status ticket=%s run_id=%s trigger=%s signals=%d errors=%d delay_s=%.1f waited_s=%.1f",
+		ticket_name,
+		run_id,
+		trigger,
+		status.signal_count,
+		len(errors),
+		delay.delay_s if delay else 0,
+		delay.waited_s if delay else 0,
+	)
 
 
 def _log_skip(ticket_name, trigger, run_id, stop_reason):

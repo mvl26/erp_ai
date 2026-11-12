@@ -42,6 +42,7 @@ class RunStatus:
 		self.started = False
 		self.finished = False
 		self.last_state = None
+		self.signal_count = 0
 		self._errors = []
 
 	def start(self) -> None:
@@ -75,6 +76,7 @@ class RunStatus:
 
 	def _emit(self, state: str, text: str) -> None:
 		self.last_state = state
+		self.signal_count += 1
 		try:
 			payload = dict(
 				zip(

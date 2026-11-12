@@ -1,15 +1,32 @@
 import copy
 import json
 import re
-from unittest.mock import patch
+from unittest.mock import call, patch
 
 import frappe
 from frappe.utils import get_fullname
 
 from erp_ai.agent import answer_delay, policy, runner
 from erp_ai.agent.run_status import FALLBACK_WORK_LABEL, PAYLOAD_KEYS
-from erp_ai.agent.test_agent_runner import CLASSIFY_A, DAILY_LIMIT, RunnerTestBase, tool_turn, tool_use
-from erp_ai.constants import AGENT_STATUS_EVENT, AGENT_USER, JOB_TIMEOUT_S, SETTING_DOCTYPE
+from erp_ai.agent.test_agent_runner import (
+	CLASSIFY_A,
+	DAILY_LIMIT,
+	TICKET_FIELDS,
+	RunnerTestBase,
+	tool_turn,
+	tool_use,
+)
+from erp_ai.constants import (
+	AGENT_STATUS_EVENT,
+	AGENT_USER,
+	JOB_TIMEOUT_S,
+	LOG_DOCTYPE,
+	LOGGER_NAME,
+	SETTING_DOCTYPE,
+	TITLE_RUN_FAILED,
+	TITLE_STATUS_FAILED,
+)
+from erp_ai.gateway import GatewayError
 from erp_ai.test_utils import FakeGateway, make_model_result, set_agent_settings
 
 THINKING_TEXT = "Đang suy nghĩ…"
@@ -377,3 +394,187 @@ class TestRunnerStatus(RunnerTestBase):
 		self.assertIn("working", self._states())
 		self.assertNotIn(marker, json.dumps(self.signals, ensure_ascii=False))
 		self.assertIn(f"Đang làm: {FALLBACK_WORK_LABEL}…", self._texts())
+
+	# T6: `done` is the last signal on every ending (AC-4), one summary line per run (design 4.5)
+
+	def _run_closing(self, trigger, run=None):
+		"""Run once; return the arguments of each `run_status` summary line; sets `self.log_error` and `self.signals_at_entry` (signals out when each entry was written)."""
+		self.signals_at_entry = []
+		real_write_entry = runner.write_entry
+
+		def recording_write_entry(**fields):
+			self.signals_at_entry.append(len(self.signals))
+			return real_write_entry(**fields)
+
+		with (
+			patch.object(runner, "write_entry", side_effect=recording_write_entry),
+			patch.object(frappe, "logger") as get_logger,
+			patch.object(frappe, "log_error") as log_error,
+		):
+			(run or (lambda: self._run(trigger)))()
+		self.log_error = log_error
+		lines = [
+			call.args
+			for call in get_logger.return_value.info.call_args_list
+			if call.args and str(call.args[0]).startswith("erp_ai run_status")
+		]
+		get_logger.assert_any_call(LOGGER_NAME)
+		return lines
+
+	def _assert_done_last_and_summarised(self, lines, trigger, errors=0):
+		states = self._states()
+		self.assertEqual(states[0], "thinking")
+		self.assertEqual(states.count("done"), 1)
+		self.assertEqual(states[-1], "done")
+		# no entry is written after `done` (NFR-5)
+		self.assertTrue(self.signals_at_entry)
+		self.assertLess(self.signals_at_entry[-1], len(self.signals))
+		run_id = self.signals[0]["message"]["run_id"]
+		self.assertEqual(len(lines), 1)
+		fmt, *values = lines[0]
+		self.assertEqual(
+			fmt,
+			"erp_ai run_status ticket=%s run_id=%s trigger=%s signals=%d errors=%d delay_s=%.1f waited_s=%.1f",
+		)
+		self.assertEqual(values[:5], [self.ticket.name, run_id, trigger, len(self.signals), errors])
+
+	def test_done_last_when_no_post_comment(self):
+		self._gateway(make_model_result(text="xong"))
+
+		lines = self._run_closing("comment_mention")
+
+		self._assert_done_last_and_summarised(lines, "comment_mention")
+		self.assertEqual(self._states(), ["thinking", "done"])
+
+	def test_done_last_on_gateway_error(self):
+		self._gateway(GatewayError("server_error", status=500))
+
+		lines = self._run_closing("comment_mention")
+
+		self._assert_done_last_and_summarised(lines, "comment_mention")
+		self.assertEqual(self._entries(entry_type="reason")[-1].stop_reason, "gateway_error")
+
+	def test_done_last_on_deadline(self):
+		self._gateway(GatewayError("deadline"))
+
+		lines = self._run_closing("comment_mention")
+
+		self._assert_done_last_and_summarised(lines, "comment_mention")
+		self.assertEqual(self._entries(entry_type="reason")[-1].stop_reason, "time_budget")
+
+	def test_done_last_on_max_turns(self):
+		set_agent_settings(max_turns_per_run=2)
+		self._gateway(tool_turn(tool_use("t1", "get_ticket")), tool_turn(tool_use("t2", "get_ticket")))
+
+		lines = self._run_closing("comment_mention")
+
+		self._assert_done_last_and_summarised(lines, "comment_mention")
+		self.assertEqual(self._entries(entry_type="reason")[-1].stop_reason, "max_turns")
+
+	def test_done_last_after_tool_exception(self):
+		self._gateway(tool_turn(tool_use("t1", "get_ticket")), make_model_result(text="xong"))
+
+		with patch.object(runner, "execute_tool", side_effect=RuntimeError):
+			lines = self._run_closing("comment_mention")
+
+		self._assert_done_last_and_summarised(lines, "comment_mention")
+		self.assertEqual(self.gateway.call_count, 2)
+		self.assertIn("tool get_ticket: RuntimeError", self._entries(entry_type="reason")[0].error)
+
+	def test_done_last_on_classify_gateway_error(self):
+		self._gateway(GatewayError("server_error", status=500))
+
+		lines = self._run_closing("ticket_insert")
+
+		self._assert_done_last_and_summarised(lines, "ticket_insert")
+		self.assertEqual(self._entries()[-1].stop_reason, "gateway_error")
+
+	def test_done_last_on_unexpected_runner_exception(self):
+		self._gateway(make_model_result(text="xong"))
+
+		with patch.object(runner, "build_initial_message", side_effect=RuntimeError):
+			lines = self._run_closing("comment_mention")
+
+		# the run died before any entry: `done` is still last and the summary line is still written
+		self.assertEqual(self._states(), ["thinking", "done"])
+		self.assertEqual(self.signals_at_entry, [])
+		self.assertEqual(len(lines), 1)
+		self.assertEqual(lines[0][3:6], ("comment_mention", 2, 0))
+		# the failure still reaches the log as before, with the class only
+		self.assertEqual([call.args[0] for call in self.log_error.call_args_list], [TITLE_RUN_FAILED])
+
+	def test_done_reaches_page_on_rollback_branch(self):
+		before = tuple(frappe.db.get_value("HD Ticket", self.ticket.name, TICKET_FIELDS))
+		real_set_value = frappe.db.set_value
+
+		def failing_set_value(doctype, *args, **kwargs):
+			if doctype == LOG_DOCTYPE:
+				raise RuntimeError("boom")
+			return real_set_value(doctype, *args, **kwargs)
+
+		self._gateway(make_model_result(text=CLASSIFY_A))
+		with patch.object(frappe.db, "set_value", side_effect=failing_set_value):
+			lines = self._run_closing("ticket_insert")
+
+		# the ticket change was rolled back, the classify entry kept, and `done` is out last
+		self.assertEqual(tuple(frappe.db.get_value("HD Ticket", self.ticket.name, TICKET_FIELDS)), before)
+		self.assertEqual(self._entries(entry_type="classify")[0].applied, 0)
+		self.assertEqual(self._states(), ["thinking", "working", "working", "done"])
+		self.assertEqual([call.args[0] for call in self.log_error.call_args_list], [TITLE_RUN_FAILED])
+		self.assertEqual(len(lines), 1)
+
+	def test_done_after_last_log_entry(self):
+		self._gateway(
+			tool_turn(tool_use("t1", "get_ticket")),
+			tool_turn(tool_use("t2", "post_comment", content="Đã xử lý")),
+			make_model_result(text="xong"),
+		)
+
+		self._run_closing("comment_mention")
+
+		# three reason entries, each written before `done`; the last one just before it
+		self.assertEqual(len(self.signals_at_entry), 3)
+		self.assertEqual(len(self._states()), len(self.signals))
+		self.assertEqual(self._states()[-1], "done")
+		self.assertLess(self.signals_at_entry[-1], len(self.signals))
+		self.assertEqual(self.signals_at_entry[-1], len(self.signals) - 1)
+
+	def test_leftover_status_errors_go_to_error_log_class_only(self):
+		self._gateway(make_model_result(text="xong"))
+
+		run_ids = []
+
+		def failing_done(event, message, room=None):
+			run_ids.append(message["run_id"])
+			if message["state"] == "done":
+				raise RuntimeError("MARKERXYZ")
+
+		with patch("frappe.realtime.emit_via_redis", side_effect=failing_done):
+			lines = self._run_closing("comment_mention")
+
+		run_id = run_ids[0]
+		self.assertEqual(
+			self.log_error.call_args_list,
+			[
+				call(
+					TITLE_STATUS_FAILED,
+					f"ticket={self.ticket.name} run_id={run_id} status_done: RuntimeError",
+				)
+			],
+		)
+		self.assertEqual(lines[0][3:6], ("comment_mention", 2, 1))
+
+	def test_feature_adds_no_comment_task_or_ticket_change(self):
+		self._set_delay(3, 5)
+		self._gateway(make_model_result(text="xong"))
+
+		def snapshot():
+			ticket = tuple(frappe.db.get_value("HD Ticket", self.ticket.name, TICKET_FIELDS))
+			return (frappe.db.count("Comment"), frappe.db.count("Task"), ticket)
+
+		before = snapshot()
+
+		self._run("comment_mention")
+
+		self.assertEqual(self._states(), ["thinking", "done"])
+		self.assertEqual(snapshot(), before)

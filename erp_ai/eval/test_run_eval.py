@@ -457,14 +457,29 @@ class TestRunEvalRun(FrappeTestCase):
 	def test_predict_failures_give_none_fields(self):
 		with patch("erp_ai.gateway.call_model", FakeGateway(GatewayError("all_keys_failed", status=529))):
 			failed = _predict(eval_row("A"), {}, DEFAULT_CATEGORY_MAPPING)
-		with patch("erp_ai.gateway.call_model", FakeGateway(make_model_result(text="không phải JSON"))):
+		cut_off = make_model_result(
+			text='{"dau_muc": "A", "do_tin', usage={"output_tokens": 600}, stop_reason="max_tokens"
+		)
+		with patch("erp_ai.gateway.call_model", FakeGateway(cut_off)):
 			unparsed = _predict(eval_row("A"), {}, DEFAULT_CATEGORY_MAPPING)
 
 		self.assertEqual(set(failed), set(unparsed))
 		self.assertTrue(all(value is None for value in failed.values()))
 		self.assertIsNone(unparsed["category"])
 		self.assertIsNone(unparsed["priority"])
-		self.assertEqual(unparsed["stop_reason"], "end_turn")
+		self.assertEqual((unparsed["output_tokens"], unparsed["stop_reason"]), (600, "max_tokens"))
+
+	def test_run_counts_cut_off_reply_in_token_metrics(self):
+		self._write([eval_row("A"), eval_row("B")])
+		cut_off = make_model_result(
+			text='{"dau_muc": "A", "do_tin', usage={"output_tokens": 600}, stop_reason="max_tokens"
+		)
+
+		metrics, _out = self._run(FakeGateway(cut_off, scored_reply("B", 1, 1, 120)))
+
+		self.assertEqual(metrics["unclassified"], 1)
+		self.assertEqual(metrics["classify_output_tokens_max"], 600)
+		self.assertEqual(metrics["classify_max_tokens_hits"], 1)
 
 	def test_run_reports_priority_team_scores_and_tokens(self):
 		rows = [
@@ -472,6 +487,9 @@ class TestRunEvalRun(FrappeTestCase):
 			eval_row("F", priority="Medium", agent_group="IT"),
 			eval_row("B", agent_group="HR"),
 		]
+		set_agent_settings(
+			category_mapping=json.dumps(DEFAULT_CATEGORY_MAPPING), routing_rules=make_routing_rules()
+		)
 		self._write(rows)
 		gateway = FakeGateway(
 			scored_reply("A", 1, 3, 200),
@@ -496,21 +514,26 @@ class TestRunEvalRun(FrappeTestCase):
 		self.assertIs(run_eval.decide_route, decide_route)
 		rules = make_routing_rules(departments={"Kế toán": {"team": "IT", "head": ""}})
 		ticket = make_ticket(subject=f"{PREFIX}route parity", description="<p>Không in được phiếu</p>")
+		# differs from the default in agent_group and priority, so a wrong `mapping` argument shows up
+		entry_a = {**DEFAULT_CATEGORY_MAPPING["A"], "agent_group": "HR", "priority": "Low"}
+		mapping = {**DEFAULT_CATEGORY_MAPPING, "A": entry_a}
 		set_agent_settings(
 			enabled=1,
 			permission_level="L0",
-			category_mapping=json.dumps(DEFAULT_CATEGORY_MAPPING),
+			category_mapping=json.dumps(mapping),
 			routing_rules=rules,
 		)
-		runner_gateway = FakeGateway(scored_reply("A", 1, 2, 100))
+		runner_gateway = FakeGateway(scored_reply("A", 1, 1, 100))
 		with (
 			patch("erp_ai.agent.runner.decide_route", wraps=decide_route) as runner_route,
 			patch("erp_ai.gateway.call_model", runner_gateway),
 		):
 			runner.run_for_ticket(ticket.name, "ticket_insert")
 		subject, description = frappe.db.get_value("HD Ticket", ticket.name, ["subject", "description"])
-		self._write([eval_row("A", subject=subject, description=description, priority="High")])
-		eval_gateway = FakeGateway(scored_reply("A", 1, 2, 100))
+		self._write(
+			[eval_row("A", subject=subject, description=description, priority="Low", agent_group="HR")]
+		)
+		eval_gateway = FakeGateway(scored_reply("A", 1, 1, 100))
 		with patch("erp_ai.eval.run_eval.decide_route", wraps=decide_route) as eval_route:
 			metrics, _out = self._run(eval_gateway)
 
@@ -518,11 +541,13 @@ class TestRunEvalRun(FrappeTestCase):
 		eval_route.assert_called_once()
 		self.assertEqual(eval_route.call_args.args, runner_route.call_args.args)
 		self.assertEqual(eval_route.call_args.kwargs, runner_route.call_args.kwargs)
+		self.assertEqual(eval_route.call_args.args[2], mapping)
 		expected = build_classify_request(subject, description, ("Kế toán",))
 		self.assertEqual(eval_gateway.calls[0]["system"], expected["system"])
 		self.assertEqual(runner_gateway.calls[0]["system"], expected["system"])
-		# importance 2 raises A (High) to High through importance_priority: same decision as the runner
+		# importance 1 adds no priority floor, so Low/HR can only come from the seeded mapping
 		self.assertEqual((metrics["priority"]["count"], metrics["priority"]["correct"]), (1, 1))
+		self.assertEqual((metrics["team"]["count"], metrics["team"]["correct"]), (1, 1))
 
 	def test_malformed_line_names_its_line_number(self):
 		with open(self.path, "w", encoding="utf-8") as handle:

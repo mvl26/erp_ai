@@ -810,13 +810,19 @@ def check_run_status_writes_nothing(sources: dict) -> list:
 		return []
 	violations = []
 	tree = parse(RUN_STATUS_FILE, source)
+	aliases = import_aliases(tree)
 	for node in ast.walk(tree):
 		if isinstance(node, ast.Call) and referenced_name(node.func) in RUN_STATUS_WRITE_NAMES:
 			violations.append(
 				violation(RUN_STATUS_FILE, node, f"calls {referenced_name(node.func)}: writes (NFR-6)")
 			)
-		elif isinstance(node, ast.Attribute) and dotted_name(node) in RUN_STATUS_FORBIDDEN_ATTRIBUTES:
-			violations.append(violation(RUN_STATUS_FILE, node, f"uses {dotted_name(node)}: writes (NFR-6)"))
+		elif (
+			isinstance(node, ast.Attribute)
+			and resolved_name(node, aliases) in RUN_STATUS_FORBIDDEN_ATTRIBUTES
+		):
+			violations.append(
+				violation(RUN_STATUS_FILE, node, f"uses {resolved_name(node, aliases)}: writes (NFR-6)")
+			)
 	for lineno, target in imported_modules(tree, module_name(RUN_STATUS_FILE), False):
 		if module_in(target, "erp_ai.gateway"):
 			violations.append(f"{RUN_STATUS_FILE}:{lineno}: imports {target} (ADR-008)")
@@ -1616,6 +1622,7 @@ class TestScannersCatchViolations(unittest.TestCase):
 			("uses frappe.cache", "import frappe\nfrappe.cache.hset('k', 'f', 1)\n"),
 			("uses frappe.cache", "import frappe\nfrappe.cache.get_value('k')\n"),
 			("uses frappe.db", "import frappe\nfrappe.db.set_single_value('X', 'f', 1)\n"),
+			("uses frappe.cache", "import frappe as f\nf.cache.hset('k', 'f', 1)\n"),
 		):
 			with self.subTest(fragment=fragment, source=source):
 				self.assertCaught(check_run_status_writes_nothing({RUN_STATUS_FILE: source}), fragment)

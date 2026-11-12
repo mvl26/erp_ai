@@ -92,6 +92,32 @@ SECRET_NAMES = ("api_key", "apikey", "secret", "password", "token")
 LOG_SINK_CALLS = ("print", "frappe.log_error", "frappe.msgprint", "frappe.throw")
 LOG_SINK_METHODS = ("debug", "info", "warning", "error", "exception", "critical")
 
+STATUS_SCRIPT_FILE = "public/js/agent_status_indicator.js"
+CONSTANTS_FILE = "constants.py"
+# Design 3.7: Helpdesk loads the page script through `new Function`, so none of these may appear in it.
+STATUS_SCRIPT_FORBIDDEN = (
+	r"innerHTML",
+	r"outerHTML",
+	r"insertAdjacentHTML",
+	r"document\.write",
+	r"eval\(",
+	r"new Function",
+	r"doc_unsubscribe",
+	r"localStorage",
+	r"sessionStorage",
+	r"document\.cookie",
+	r"fetch\(",
+	r"XMLHttpRequest",
+	r"frappe\.call",
+	r"updateField",
+	r"open_doc:",
+	r"\bcall\b",
+	r"600",
+	r"HD Form Script",
+	r"^\s*(import|export)\b",
+)
+STATUS_SCRIPT_REQUIRED = ("textContent", "doc_subscribe", '"connect"', "setTimeout", "try", "expires_in_s")
+
 LEGACY_NAMES = ("HD Ticket Comment", "commented_by", "comment_email", "comment_by")
 # Design 3.5 (amendment 1c) tells `get_record` to DROP comment_email/comment_by from a Comment; this one
 # hide-list constant is the only place these names may appear.
@@ -727,6 +753,22 @@ class TestArchitecture(unittest.TestCase):
 		self.assertGreater(len(rel_paths), 0)
 		self.assertEqual(check_no_frappe_skipped_test_files(rel_paths), [])
 		self.assertIn("agent/test_agent_runner.py", rel_paths)
+
+	def test_status_script_static_rules(self):
+		script = load_product_sources(suffixes=(".js",)).get(STATUS_SCRIPT_FILE)
+		self.assertIsNotNone(script, f"{STATUS_SCRIPT_FILE} is missing")
+		self.assertIn("function setupForm({ doc, router })", script)
+		for pattern in STATUS_SCRIPT_FORBIDDEN:
+			self.assertIsNone(re.search(pattern, script, re.MULTILINE), f"forbidden in script: {pattern}")
+		for token in STATUS_SCRIPT_REQUIRED:
+			self.assertIn(token, script)
+
+	def test_status_event_name_matches_script(self):
+		match = re.search(r'^AGENT_STATUS_EVENT = "([^"]+)"', self.sources[CONSTANTS_FILE], re.MULTILINE)
+		self.assertIsNotNone(match, "AGENT_STATUS_EVENT not found in constants.py")
+		script = load_product_sources(suffixes=(".js",)).get(STATUS_SCRIPT_FILE)
+		self.assertIsNotNone(script, f"{STATUS_SCRIPT_FILE} is missing")
+		self.assertIn(f'"{match.group(1)}"', script)
 
 
 # ---------------------------------------------------------------------------------------------------

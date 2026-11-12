@@ -1,7 +1,6 @@
 function setupForm({ doc, call, router }) {
 	try {
 		const EVENT = "erp_ai:agent_status";
-		const METHOD_GET_PANEL_DATA = "erp_ai.ticket_panel.get_panel_data";
 		const ACTION_LABEL = "Trao đổi với bot";
 		const TEXT_PANEL_TITLE = "Hướng giải quyết & trao đổi với bot";
 		const TEXT_CLOSE = "Đóng";
@@ -21,6 +20,14 @@ function setupForm({ doc, call, router }) {
 			bottom: "",
 			zIndex: "",
 		};
+		const newPanelState = () => ({
+			el: null,
+			open: false,
+			slotEl: null,
+			aiListEl: null,
+			errorEl: null,
+			seq: 0,
+		});
 		const socket =
 			document.querySelector("#app")?.__vue_app__?.config?.globalProperties?.$socket;
 		if (!socket || typeof socket.on !== "function" || !doc?.name) {
@@ -36,16 +43,11 @@ function setupForm({ doc, call, router }) {
 			textEl: null,
 			socket: null,
 			call: null,
-			panel: {
-				el: null,
-				open: false,
-				slotEl: null,
-				aiListEl: null,
-				errorEl: null,
-				seq: 0,
-			},
+			panel: newPanelState(),
 		});
 		state.call = call;
+		// A state object left by an older script version has no panel part.
+		state.panel = state.panel || newPanelState();
 
 		const ensureElement = () => {
 			if (state.el) {
@@ -223,24 +225,29 @@ function setupForm({ doc, call, router }) {
 			const seq = ++panel.seq;
 			const ticket = state.ticket;
 			const isStale = () => seq !== panel.seq || ticket !== state.ticket || !panel.open;
-			state
-				.call(METHOD_GET_PANEL_DATA, { ticket })
-				.then((data) => {
-					try {
-						if (isStale()) {
-							return;
+			const showLoadFailed = () => {
+				if (!isStale()) {
+					panel.errorEl.textContent = TEXT_LOAD_FAILED;
+				}
+			};
+			try {
+				state
+					.call("erp_ai.ticket_panel.get_panel_data", { ticket })
+					.then((data) => {
+						try {
+							if (isStale()) {
+								return;
+							}
+							renderAiFields(data);
+							panel.errorEl.textContent = "";
+						} catch (e) {
+							panel.errorEl.textContent = TEXT_LOAD_FAILED;
 						}
-						renderAiFields(data);
-						panel.errorEl.textContent = "";
-					} catch (e) {
-						panel.errorEl.textContent = TEXT_LOAD_FAILED;
-					}
-				})
-				.catch(() => {
-					if (!isStale()) {
-						panel.errorEl.textContent = TEXT_LOAD_FAILED;
-					}
-				});
+					})
+					.catch(showLoadFailed);
+			} catch (e) {
+				showLoadFailed();
+			}
 		};
 
 		const togglePanel = () => {

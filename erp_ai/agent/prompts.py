@@ -2,7 +2,7 @@ import json
 
 from frappe.utils import strip_html
 
-from erp_ai.constants import TRIGGER_COMMENT_MENTION
+from erp_ai.constants import CATEGORIES, TRIGGER_COMMENT_MENTION
 
 DESCRIPTION_MAX_CHARS = 6000
 COMMENT_MAX_CHARS = 2000
@@ -143,18 +143,6 @@ CATEGORY_TABLE = """SÁU ĐẦU MỤC
 | E | Công việc nghiệp vụ ngoài IT | Việc của HCNS, Kế toán, Mua hàng; không cần thay đổi hệ thống | #1773, #1742, #1739, #1701 |
 | F | Câu hỏi, phiếu nhiễu | Tiêu đề rỗng/không rõ, phiếu test, hỏi cách dùng | #1741, #1207, #1060 |"""
 
-# Guide 16.2.
-ROUTING_TABLE = """BẢNG ROUTING
-
-| Đầu mục | Nhóm nhận | Người mặc định | Ưu tiên | SLA phản hồi / xử lý |
-|---|---|---|---|---|
-| A | IT | Việt (ERP core), Tiến (tracecore/app riêng) | High; Urgent nếu chặn nghiệp vụ kế toán/kho | 15 phút / 8 giờ làm việc |
-| B | IT | Việt | Medium; High nếu có hạn trong 24h | 15 phút / 4 giờ làm việc |
-| C | IT | Hiếu | Theo COO đặt; mặc định Medium | 1 giờ / BA note 24h, kế hoạch Task 3 ngày |
-| D | Nhóm của bộ phận chủ dữ liệu | Trưởng bộ phận; IT là watcher | High nếu có Hạn hoàn thành | 1 giờ / theo Hạn hoàn thành |
-| E | HCNS / Kế toán / Mua hàng / Marketing | Lan / Hà / Thư / Chi | Theo COO đặt | 1 giờ / theo Hạn hoàn thành |
-| F | IT | `ai.agent` | Low | 5 phút / 1 giờ |"""
-
 # Guide 16.3.
 CONVENTIONS = """BỐN QUY ƯỚC BẮT BUỘC
 
@@ -186,8 +174,63 @@ def build_classify_request(subject: str, description: str, departments: tuple[st
 	}
 
 
-def build_reason_system(prompt_digest: str) -> list[dict]:
-	parts = [CORE_PROMPT, CATEGORY_TABLE, ROUTING_TABLE, CONVENTIONS]
+def _cell(text) -> str:
+	return str(text).replace("|", "/").replace("\n", " ").strip() or "-"
+
+
+def _person(user, names) -> str:
+	return names.get(user) or user
+
+
+def _people(category, config, names) -> str:
+	"""Default people of one category: the default assignee, then `prefix: person` per title prefix."""
+	entry = ((config.get("assignees") or {}).get(category)) or {}
+	people = [_person(entry["default"], names)] if entry.get("default") else []
+	people += [
+		f"{prefix}: {_person(user, names)}" for prefix, user in (entry.get("prefixes") or {}).items() if user
+	]
+	return "; ".join(people)
+
+
+def _sla_text(entry) -> str:
+	response, resolution = (entry or {}).get("response_min"), (entry or {}).get("resolution_min")
+	if response is None:
+		return "-"
+	return f"{response} phút / " + (f"{resolution} phút" if resolution is not None else "theo Hạn hoàn thành")
+
+
+def build_routing_table(mapping: dict, config: dict, names: dict[str, str]) -> str:
+	"""Routing table of the reason prompt (guide 16.2 columns), built from category_mapping and routing_rules.
+
+	`names` maps a user ID to its display name; an ID missing there is shown as the ID itself.
+	"""
+	mapping, config, names = mapping or {}, config or {}, names or {}
+	if not mapping and not config:
+		return ""
+	departments = config.get("departments") or {}
+	rows = []
+	for category in CATEGORIES:
+		entry = mapping.get(category) or {}
+		if category in ("D", "E"):
+			# team and person come from the department of the ticket, so list every configured department
+			team = ", ".join(dict.fromkeys(d["team"] for d in departments.values() if d.get("team")))
+			people = "; ".join(
+				f"Trưởng bộ phận: {_person(d['head'], names)} ({name})"
+				for name, d in departments.items()
+				if d.get("head")
+			)
+		else:
+			team, people = entry.get("agent_group") or "", _people(category, config, names)
+		sla = _sla_text((config.get("expected_sla") or {}).get(category))
+		cells = (category, team, people, entry.get("priority") or "", sla)
+		rows.append("| " + " | ".join(_cell(cell) for cell in cells) + " |")
+	header = "| Đầu mục | Nhóm nhận | Người mặc định | Ưu tiên | SLA phản hồi / xử lý |"
+	return "\n".join(["BẢNG ROUTING", "", header, "|---|---|---|---|---|", *rows])
+
+
+def build_reason_system(prompt_digest: str, routing_table: str = "") -> list[dict]:
+	parts = [CORE_PROMPT, CATEGORY_TABLE, routing_table, CONVENTIONS]
+	parts = [part for part in parts if part]
 	if prompt_digest:
 		parts.append(prompt_digest)
 	return [{"type": "text", "text": "\n\n".join(parts), "cache_control": dict(_CACHE)}]

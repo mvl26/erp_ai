@@ -8,7 +8,13 @@ from helpdesk.test_utils import make_ticket
 
 from erp_ai.agent import answer_delay, authority, runner
 from erp_ai.agent.classification import DEFAULT_CATEGORY_MAPPING
-from erp_ai.agent.prompts import TASK_COMMENT, TASK_NEW_TICKET, build_classify_request, build_reason_system
+from erp_ai.agent.prompts import (
+	TASK_COMMENT,
+	TASK_NEW_TICKET,
+	build_classify_request,
+	build_reason_system,
+	build_routing_table,
+)
 from erp_ai.agent.run_log import write_entry
 from erp_ai.agent.tools.read import TOOL_RESULT_MAX_CHARS
 from erp_ai.agent.tools.registry import get_tool_schemas
@@ -28,6 +34,7 @@ from erp_ai.gateway import GatewayError
 from erp_ai.test_utils import (
 	FakeGateway,
 	add_credential,
+	make_active_agent,
 	make_model_result,
 	make_routing_rules,
 	record_status_signals,
@@ -861,13 +868,27 @@ class TestRunnerReasoning(RunnerTestBase):
 		self.assertEqual(call["task"], "reason")
 		self.assertEqual(call["max_tokens"], 4096)
 		self.assertGreater(call["deadline"], time.monotonic())
-		self.assertEqual(call["system"], build_reason_system(f"{PREFIX}digest"))
+		table = build_routing_table(DEFAULT_CATEGORY_MAPPING, json.loads(make_routing_rules()), {})
+		self.assertEqual(call["system"], build_reason_system(f"{PREFIX}digest", table))
 		names = [tool["name"] for tool in call["tools"]]
 		self.assertIn("set_resolution_hint", names)
 		self.assertNotIn("create_task", names)
 		self.assertEqual(call["tools"][-1]["cache_control"], {"type": "ephemeral"})
 		self.assertTrue(all("cache_control" not in tool for tool in call["tools"][:-1]))
 		self.assertTrue(all("cache_control" not in tool for tool in get_tool_schemas("L1", False)))
+
+	def test_reason_system_shows_configured_people(self):
+		user = make_active_agent(self)
+		rules = json.loads(make_routing_rules())
+		rules["assignees"]["A"]["default"] = user
+		set_agent_settings(permission_level="L1", routing_rules=json.dumps(rules))
+		with patch.object(runner, "get_fullname", side_effect=lambda uid: f"{PREFIX}Tên của {uid}"):
+			self._run("comment_mention")
+
+		(call,) = self.gateway.calls
+		text = call["system"][0]["text"]
+		self.assertIn("BẢNG ROUTING", text)
+		self.assertIn(f"{PREFIX}Tên của {user}", text)
 
 	def test_create_task_offered_only_with_instructor(self):
 		with patch.object(authority, "latest_instructor", return_value="Administrator"):

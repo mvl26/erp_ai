@@ -9,7 +9,12 @@ from erp_ai import gateway
 from erp_ai.agent import authority, policy, site_facts
 from erp_ai.agent.answer_delay import AnswerDelay
 from erp_ai.agent.classification import load_mapping, parse_classification
-from erp_ai.agent.prompts import build_classify_request, build_initial_message, build_reason_system
+from erp_ai.agent.prompts import (
+	build_classify_request,
+	build_initial_message,
+	build_reason_system,
+	build_routing_table,
+)
 from erp_ai.agent.routing import decide_route, departments, load_routing_config, sla_lag
 from erp_ai.agent.run_log import write_entry
 from erp_ai.agent.run_status import CLASSIFY_STEP, RunStatus
@@ -508,6 +513,23 @@ def _log_route_summary(context, result, assigned, task, commented, sla):
 	)
 
 
+def _config_users(routing: dict) -> set[str]:
+	"""Every user ID the routing config names: default and prefix assignees, department heads."""
+	users = set()
+	for entry in ((routing or {}).get("assignees") or {}).values():
+		users.add(entry.get("default"))
+		users.update((entry.get("prefixes") or {}).values())
+	users.update(entry.get("head") for entry in ((routing or {}).get("departments") or {}).values())
+	return {user for user in users if user}
+
+
+def _routing_table(context) -> str:
+	"""Routing table of the reason prompt, from the config and mapping already loaded for this run."""
+	routing = context.routing_config
+	names = {user: get_fullname(user) for user in _config_users(routing)}
+	return build_routing_table(context.category_mapping, routing, names)
+
+
 def _reason(ticket_name, trigger, run_id, settings, context, classification, deadline, status, delay):
 	"""Reasoning step (design 4.3 step 8): at most `max_turns_per_run` model turns, one `reason` entry each."""
 	comments = authority.fetch_ticket_comments(ticket_name)
@@ -525,7 +547,7 @@ def _reason(ticket_name, trigger, run_id, settings, context, classification, dea
 	tools = get_tool_schemas(context.effective_level, bool(context.instructor))
 	if tools:
 		tools[-1]["cache_control"] = {"type": "ephemeral"}
-	system = build_reason_system(settings.prompt_digest)
+	system = build_reason_system(settings.prompt_digest, _routing_table(context))
 	messages = [{"role": "user", "content": build_initial_message(ticket, labelled, trigger, classification)}]
 	base = {
 		"ticket": ticket_name,

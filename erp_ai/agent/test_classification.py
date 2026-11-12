@@ -11,6 +11,7 @@ from erp_ai.constants import (
 	TRIGGER_COMMENT_MENTION,
 	TRIGGER_TICKET_INSERT,
 )
+from erp_ai.test_utils import make_routing_rules
 
 VALID = {
 	"dau_muc": "A",
@@ -257,15 +258,67 @@ class TestPrompts(FrappeTestCase):
 		self.assertTrue(block["text"].endswith("DANH SÁCH BỘ PHẬN: Kế toán, Mua hàng"))
 		self.assertEqual(request["messages"], base["messages"])
 
+	def _routing_inputs(self, **override):
+		mapping = json.loads(json.dumps(classification.DEFAULT_CATEGORY_MAPPING))
+		config = json.loads(make_routing_rules())
+		config["assignees"]["A"] = {"default": "a1@x.com", "prefixes": {"[tracecore]": "a2@x.com"}}
+		config["assignees"]["B"]["default"] = "b1@x.com"
+		config["departments"] = {"Kế toán": {"team": "Kế toán", "head": "k1@x.com"}}
+		config.update(override)
+		names = {
+			"a1@x.com": "Người A1",
+			"a2@x.com": "Người A2",
+			"b1@x.com": "Người B1",
+			"k1@x.com": "Người K1",
+		}
+		return mapping, config, names
+
+	def test_routing_table_shows_configured_people(self):
+		mapping, config, names = self._routing_inputs()
+		table = prompts.build_routing_table(mapping, config, names)
+		self.assertTrue(table.startswith("BẢNG ROUTING"))
+		self.assertIn("| Đầu mục | Nhóm nhận | Người mặc định | Ưu tiên | SLA phản hồi / xử lý |", table)
+		self.assertIn("| A | IT | Người A1; [tracecore]: Người A2 | High | 15 phút / 480 phút |", table)
+		self.assertIn("| B | IT | Người B1 | Medium | 15 phút / 240 phút |", table)
+		self.assertIn(
+			"| D | Kế toán | Trưởng bộ phận: Người K1 (Kế toán) | Medium | 60 phút / theo Hạn hoàn thành |",
+			table,
+		)
+		self.assertIn("| F | IT | - | Low | 5 phút / 60 phút |", table)
+
+		# the default person changes: the new name shows, the old one is gone
+		config["assignees"]["A"]["default"] = "new@x.com"
+		table = prompts.build_routing_table(mapping, config, {**names, "new@x.com": "Người Mới"})
+		self.assertIn("Người Mới", table)
+		self.assertNotIn("Người A1", table)
+
+	def test_routing_table_falls_back_to_user_id_without_name(self):
+		mapping, config, names = self._routing_inputs()
+		table = prompts.build_routing_table(mapping, config, {})
+		self.assertIn("a1@x.com", table)
+
+	def test_routing_table_empty_without_config(self):
+		self.assertEqual(prompts.build_routing_table({}, {}, {}), "")
+
 	def test_build_reason_system(self):
-		blocks = prompts.build_reason_system("DIGEST-XYZ")
+		blocks = prompts.build_reason_system("DIGEST-XYZ", "ROUTING-ABC")
 		self.assertEqual(len(blocks), 1)
 		self.assertEqual(blocks[0]["type"], "text")
 		self.assertEqual(blocks[0]["cache_control"], {"type": "ephemeral"})
 		text = blocks[0]["text"]
-		for part in (prompts.CORE_PROMPT, prompts.CATEGORY_TABLE, prompts.ROUTING_TABLE, prompts.CONVENTIONS):
+		for part in (prompts.CORE_PROMPT, prompts.CATEGORY_TABLE, "ROUTING-ABC", prompts.CONVENTIONS):
 			self.assertIn(part, text)
+		self.assertLess(text.index(prompts.CATEGORY_TABLE), text.index("ROUTING-ABC"))
+		self.assertLess(text.index("ROUTING-ABC"), text.index(prompts.CONVENTIONS))
 		self.assertTrue(text.endswith("DIGEST-XYZ"))
+
+	def test_reason_system_without_routing_table(self):
+		text = prompts.build_reason_system("DIGEST-XYZ")[0]["text"]
+		self.assertNotIn("BẢNG ROUTING", text)
+		self.assertEqual(
+			text,
+			"\n\n".join([prompts.CORE_PROMPT, prompts.CATEGORY_TABLE, prompts.CONVENTIONS, "DIGEST-XYZ"]),
+		)
 
 	def test_build_reason_system_empty_digest(self):
 		text = prompts.build_reason_system("")[0]["text"]

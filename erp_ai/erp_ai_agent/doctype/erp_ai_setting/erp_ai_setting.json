@@ -28,6 +28,8 @@
   "section_routing",
   "excluded_teams",
   "category_mapping",
+  "auto_assign_enabled",
+  "routing_rules",
   "prompt_digest",
   "section_alerts",
   "alert_recipients",
@@ -196,6 +198,20 @@
    "options": "JSON",
    "default": "{\"A\": {\"ticket_type\": \"Sự cố & lỗi hệ thống\", \"agent_group\": \"IT\", \"priority\": \"High\"}, \"B\": {\"ticket_type\": \"Quản trị & cấu hình hệ thống\", \"agent_group\": \"IT\", \"priority\": \"Medium\"}, \"C\": {\"ticket_type\": \"Phát triển tính năng & tự động hóa\", \"agent_group\": \"IT\", \"priority\": \"Medium\"}, \"D\": {\"ticket_type\": \"Chuẩn hóa dữ liệu & quy trình trên ERP\", \"agent_group\": \"\", \"priority\": \"Medium\"}, \"E\": {\"ticket_type\": \"Công việc nghiệp vụ ngoài IT\", \"agent_group\": \"\", \"priority\": \"\"}, \"F\": {\"ticket_type\": \"Câu hỏi, phiếu nhiễu\", \"agent_group\": \"IT\", \"priority\": \"Low\"}}",
    "description": "JSON gồm các đầu mục A đến F. Mỗi đầu mục có thể có loại phiếu, nhóm xử lý, ưu tiên. Sai cú pháp thì không lưu được. Tiêu đề phiếu có [GẤP] thì ưu tiên thành Urgent."
+  },
+  {
+   "fieldname": "auto_assign_enabled",
+   "fieldtype": "Check",
+   "label": "Tự gán người và tạo Task",
+   "default": "0",
+   "description": "Bật thì từ L1, phiếu mới chưa có ai được gán sẽ được bot gán người theo Quy tắc định tuyến, và tạo 1 Task cho đầu mục C/D. Tắt thì không gán, không tạo Task. Trước khi bật: gỡ role thừa của tài khoản agent, tạo HD Agent cho người trong bảng."
+  },
+  {
+   "fieldname": "routing_rules",
+   "fieldtype": "Code",
+   "label": "Quy tắc định tuyến",
+   "options": "JSON",
+   "description": "Bảng người mặc định theo đầu mục, bảng bộ phận sang nhóm và trưởng bộ phận, bảng độ quan trọng sang mức ưu tiên tối thiểu, SLA mong đợi (phút). Cấu hình sai bị chặn khi lưu."
   },
   {
    "fieldname": "prompt_digest",

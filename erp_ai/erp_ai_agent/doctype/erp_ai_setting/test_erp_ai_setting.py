@@ -6,6 +6,7 @@ from frappe.tests.utils import FrappeTestCase
 from frappe.utils import get_datetime
 
 from erp_ai.agent.classification import DEFAULT_CATEGORY_MAPPING
+from erp_ai.agent.routing import DEFAULT_ROUTING_RULES
 from erp_ai.constants import (
 	CREDENTIAL_DOCTYPE,
 	KEY_STATUS_ACTIVE,
@@ -312,6 +313,81 @@ class TestERPAISetting(FrappeTestCase):
 	def test_set_agent_settings_writes_values(self):
 		set_agent_settings(enabled=1, permission_level="L1")
 		self.assertEqual(frappe.db.get_single_value(SETTING_DOCTYPE, "permission_level"), "L1")
+
+
+DESCRIPTION_MAX_CHARS = 400
+
+
+class TestRoutingRules(FrappeTestCase):
+	def setUp(self):
+		self.addCleanup(frappe.db.rollback)
+		frappe.db.delete(CREDENTIAL_DOCTYPE, {"parent": SETTING_DOCTYPE})
+		set_agent_settings(
+			enabled=0,
+			max_turns_per_run=8,
+			max_runs_per_ticket_per_day=5,
+			max_keys_per_call=3,
+			request_timeout_s=60,
+			monthly_budget_usd=10,
+			trigger_keyword="@ai",
+			category_mapping=json.dumps(DEFAULT_CATEGORY_MAPPING),
+			spent_this_month_usd=0,
+			**PRICES,
+		)
+
+	def _save_rules(self, raw):
+		doc = frappe.get_doc(SETTING_DOCTYPE)
+		doc.routing_rules = raw
+		doc.save()
+		return frappe.get_doc(SETTING_DOCTYPE)
+
+	def test_fields_in_section_routing_with_type_options_default(self):
+		meta = frappe.get_meta(SETTING_DOCTYPE)
+		order = [f.fieldname for f in meta.fields]
+		self.assertGreater(order.index("auto_assign_enabled"), order.index("section_routing"))
+		self.assertGreater(order.index("routing_rules"), order.index("section_routing"))
+		switch = meta.get_field("auto_assign_enabled")
+		self.assertEqual(switch.fieldtype, "Check")
+		self.assertEqual(str(switch.default), "0")
+		rules = meta.get_field("routing_rules")
+		self.assertEqual(rules.fieldtype, "Code")
+		self.assertEqual(rules.options, "JSON")
+		self.assertFalse(rules.default)
+
+	def test_new_field_descriptions_at_most_400_chars(self):
+		meta = frappe.get_meta(SETTING_DOCTYPE)
+		for fieldname in ("auto_assign_enabled", "routing_rules"):
+			with self.subTest(fieldname=fieldname):
+				description = (meta.get_field(fieldname).description or "").strip()
+				self.assertTrue(description, "description is empty")
+				self.assertLessEqual(len(description), DESCRIPTION_MAX_CHARS)
+
+	def test_default_rules_valid(self):
+		doc = self._save_rules(DEFAULT_ROUTING_RULES)
+		self.assertEqual(json.loads(doc.routing_rules), json.loads(DEFAULT_ROUTING_RULES))
+
+	def test_blank_rules_save_until_install_writes_default(self):
+		for blank in (None, "", "  \n"):
+			with self.subTest(blank=blank):
+				self._save_rules(blank)
+
+	def test_bad_rules_blocked_with_location(self):
+		rules = json.loads(DEFAULT_ROUTING_RULES)
+		rules["importance_priority"]["2"] = "Critical"
+		cases = (
+			("not json", "không phải JSON object hợp lệ"),
+			(json.dumps(["x"]), "không phải JSON object hợp lệ"),
+			(json.dumps({"assign": {}}), "khóa lạ 'assign'"),
+			(json.dumps(rules), "importance_priority.2"),
+			(
+				json.dumps({"assignees": {"A": {"default": "no-such-user@example.com", "prefixes": {}}}}),
+				"assignees.A.default",
+			),
+			(json.dumps({"expected_sla": {"A": {"response_min": 0}}}), "expected_sla.A.response_min"),
+		)
+		for raw, message in cases:
+			with self.subTest(raw=raw), self.assertRaisesRegex(frappe.ValidationError, message):
+				self._save_rules(raw)
 
 
 CHECK_KEYS_HD_AGENT = "erpai-test-check-keys-agent@example.com"

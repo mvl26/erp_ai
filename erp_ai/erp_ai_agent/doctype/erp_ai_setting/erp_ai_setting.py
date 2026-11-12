@@ -3,6 +3,7 @@ from frappe.model.document import Document
 
 from erp_ai import gateway
 from erp_ai.agent.classification import validate_mapping
+from erp_ai.agent.routing import validate_routing_config
 from erp_ai.constants import (
 	ANSWER_DELAY_MAX_S,
 	CREDENTIAL_DOCTYPE,
@@ -57,6 +58,7 @@ class ERPAISetting(Document):
 		self.restore_self_managed_fields()
 		self.check_labels()
 		validate_mapping(self.category_mapping)
+		self.check_routing_rules()
 		self.check_limits()
 		self.check_status_settings()
 		self.check_enabled_requirements()
@@ -94,6 +96,11 @@ class ERPAISetting(Document):
 			if label.lower() in seen:
 				frappe.throw(f"Nhãn khóa '{label}' bị trùng")
 			seen.add(label.lower())
+
+	def check_routing_rules(self):
+		# Blank is allowed: install writes the default when the DB value is NULL (T12); the loader treats blank as {}.
+		if (self.routing_rules or "").strip():
+			validate_routing_config(self.routing_rules)
 
 	def check_limits(self):
 		for fieldname, (label, low, high) in INT_LIMITS.items():

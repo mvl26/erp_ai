@@ -12,11 +12,13 @@ from helpdesk.test_utils import make_ticket
 from erp_ai.agent import runner
 from erp_ai.agent.classification import DEFAULT_CATEGORY_MAPPING
 from erp_ai.agent.prompts import build_classify_request
+from erp_ai.agent.routing import decide_route
 from erp_ai.constants import CATEGORIES, LOG_DOCTYPE
-from erp_ai.eval.run_eval import compute_metrics, format_report
+from erp_ai.eval import run_eval
+from erp_ai.eval.run_eval import _predict, compute_metrics, format_report
 from erp_ai.eval.run_eval import run as run_eval_run
 from erp_ai.gateway import GatewayError
-from erp_ai.test_utils import FakeGateway, make_model_result, set_agent_settings
+from erp_ai.test_utils import FakeGateway, make_model_result, make_routing_rules, set_agent_settings
 
 PREFIX = "ERPAI-TEST-"
 
@@ -31,6 +33,11 @@ METRIC_KEYS = {
 	"non_top_owner",
 	"verdict",
 	"skipped_unlabeled",
+	"priority",
+	"team",
+	"score_distribution",
+	"classify_output_tokens_max",
+	"classify_max_tokens_hits",
 }
 
 MAPPING = {c: {"ticket_type": f"Type {c}", "agent_group": "IT", "priority": "Medium"} for c in CATEGORIES}
@@ -163,6 +170,107 @@ class TestRunEval(FrappeTestCase):
 		self.assertEqual(metrics["labeled"], 1)
 		self.assertEqual(metrics["per_category"]["F"]["count"], 0)
 
+	def test_priority_team_match_and_score_distribution(self):
+		rows = [
+			{
+				"priority": "High",
+				"predicted_priority": "High",
+				"agent_group": "IT",
+				"predicted_agent_group": "IT",
+			},
+			{
+				"priority": "High",
+				"predicted_priority": "Low",
+				"agent_group": "IT",
+				"predicted_agent_group": "HR",
+			},
+			{
+				"priority": "Low",
+				"predicted_priority": "Low",
+				"agent_group": "HR",
+				"predicted_agent_group": "HR",
+			},
+			# prediction None: out of the denominator of both
+			{
+				"priority": "Low",
+				"predicted_priority": None,
+				"agent_group": "IT",
+				"predicted_agent_group": None,
+			},
+			# no label: out of both
+			{"predicted_priority": "High", "predicted_agent_group": "IT"},
+			{
+				"priority": "",
+				"predicted_priority": "High",
+				"agent_group": None,
+				"predicted_agent_group": "IT",
+			},
+		]
+		for row, (complexity, importance) in zip(
+			rows, [(1, 0), (1, 2), (3, 2), (None, None), (5, 7), (0, 3)], strict=True
+		):
+			row["predicted_complexity"] = complexity
+			row["predicted_importance"] = importance
+
+		metrics = compute_metrics(rows, MAPPING)
+
+		for key, count, correct in (("priority", 3, 2), ("team", 3, 2)):
+			cell = metrics[key]
+			self.assertEqual(set(cell), {"count", "correct", "accuracy"}, key)
+			self.assertEqual((cell["count"], cell["correct"]), (count, correct), key)
+			self.assertAlmostEqual(cell["accuracy"], correct / count, msg=key)
+		# every bin 0..3 exists, empty ones are 0; None and out-of-range values are not counted
+		self.assertEqual(metrics["score_distribution"]["complexity"], {0: 1, 1: 2, 2: 0, 3: 1})
+		self.assertEqual(metrics["score_distribution"]["importance"], {0: 1, 1: 0, 2: 2, 3: 1})
+
+	def test_priority_and_team_with_no_comparable_rows(self):
+		metrics = compute_metrics([{"predicted_priority": "High"}, {"priority": "High"}], MAPPING)
+
+		self.assertEqual(metrics["priority"], {"count": 0, "correct": 0, "accuracy": 0.0})
+		self.assertEqual(metrics["team"], {"count": 0, "correct": 0, "accuracy": 0.0})
+		self.assertEqual(metrics["score_distribution"]["complexity"], dict.fromkeys(range(4), 0))
+		self.assertEqual(metrics["score_distribution"]["importance"], dict.fromkeys(range(4), 0))
+
+	def test_classify_token_ceiling_and_max_tokens_hits(self):
+		rows = [
+			{"output_tokens": 120, "stop_reason": "end_turn"},
+			{"output_tokens": 600, "stop_reason": "max_tokens"},
+			{"output_tokens": 350, "stop_reason": "max_tokens"},
+			{"output_tokens": None, "stop_reason": None},
+			{"stop_reason": "MAX_TOKENS"},
+			{"output_tokens": 599, "stop_reason": "gateway_error"},
+		]
+
+		metrics = compute_metrics(rows, MAPPING)
+
+		self.assertEqual(metrics["classify_output_tokens_max"], 600)
+		self.assertEqual(metrics["classify_max_tokens_hits"], 2)
+		empty = compute_metrics([], MAPPING)
+		self.assertEqual((empty["classify_output_tokens_max"], empty["classify_max_tokens_hits"]), (0, 0))
+
+	def test_report_prints_the_four_new_blocks(self):
+		rows = [
+			{
+				"priority": "High",
+				"predicted_priority": "High",
+				"agent_group": "IT",
+				"predicted_agent_group": "HR",
+				"predicted_complexity": 2,
+				"predicted_importance": 3,
+				"output_tokens": 412,
+				"stop_reason": "max_tokens",
+			}
+		]
+
+		report = format_report(compute_metrics(rows, MAPPING))
+
+		self.assertIn("Priority match: 100.0% (1/1)", report)
+		self.assertIn("Team match: 0.0% (0/1)", report)
+		self.assertIn("Complexity distribution: 0:0 1:0 2:1 3:0", report)
+		self.assertIn("Importance distribution: 0:0 1:0 2:0 3:1", report)
+		self.assertIn("Classify output tokens max: 412", report)
+		self.assertIn("Classify max_tokens hits: 1", report)
+
 	def test_empty_input(self):
 		metrics = compute_metrics([], MAPPING)
 		self.assertEqual(metrics["labeled"], 0)
@@ -174,6 +282,21 @@ class TestRunEval(FrappeTestCase):
 
 def classify_reply(category):
 	return make_model_result(text=json.dumps({"dau_muc": category, "do_tin_cay": "Cao", "ly_do": "x"}))
+
+
+def scored_reply(category, complexity, importance, output_tokens, stop_reason="end_turn"):
+	text = json.dumps(
+		{
+			"dau_muc": category,
+			"do_tin_cay": "Cao",
+			"ly_do": "x",
+			"do_phuc_tap": complexity,
+			"do_quan_trong": importance,
+			"ly_do_diem": "y",
+		}
+	)
+	usage = {"input_tokens": 1, "output_tokens": output_tokens}
+	return make_model_result(text=text, usage=usage, stop_reason=stop_reason)
 
 
 def eval_row(category, **extra):
@@ -311,6 +434,95 @@ class TestRunEvalRun(FrappeTestCase):
 		metrics, _out = self._run(FakeGateway())
 		self.assertEqual((metrics["labeled"], metrics["skipped_unlabeled"]), (1, 2))
 		self.assertEqual(metrics["per_category"]["A"]["count"], 1)
+
+	def test_predict_returns_route_and_token_fields(self):
+		gateway = FakeGateway(scored_reply("A", 2, 3, 310, "max_tokens"))
+
+		with patch("erp_ai.gateway.call_model", gateway):
+			predicted = _predict(eval_row("A"), {}, DEFAULT_CATEGORY_MAPPING)
+
+		self.assertEqual(
+			predicted,
+			{
+				"category": "A",
+				"complexity": 2,
+				"importance": 3,
+				"priority": "Urgent",
+				"agent_group": "IT",
+				"output_tokens": 310,
+				"stop_reason": "max_tokens",
+			},
+		)
+
+	def test_predict_failures_give_none_fields(self):
+		with patch("erp_ai.gateway.call_model", FakeGateway(GatewayError("all_keys_failed", status=529))):
+			failed = _predict(eval_row("A"), {}, DEFAULT_CATEGORY_MAPPING)
+		with patch("erp_ai.gateway.call_model", FakeGateway(make_model_result(text="không phải JSON"))):
+			unparsed = _predict(eval_row("A"), {}, DEFAULT_CATEGORY_MAPPING)
+
+		self.assertEqual(set(failed), set(unparsed))
+		self.assertTrue(all(value is None for value in failed.values()))
+		self.assertIsNone(unparsed["category"])
+		self.assertIsNone(unparsed["priority"])
+		self.assertEqual(unparsed["stop_reason"], "end_turn")
+
+	def test_run_reports_priority_team_scores_and_tokens(self):
+		rows = [
+			eval_row("A", priority="Urgent", agent_group="IT"),
+			eval_row("F", priority="Medium", agent_group="IT"),
+			eval_row("B", agent_group="HR"),
+		]
+		self._write(rows)
+		gateway = FakeGateway(
+			scored_reply("A", 1, 3, 200),
+			scored_reply("F", 0, 0, 598, "max_tokens"),
+			scored_reply("B", 2, 1, 150),
+		)
+
+		metrics, out = self._run(gateway)
+
+		# A: Urgent vs Urgent; F: Low vs Medium
+		self.assertEqual((metrics["priority"]["count"], metrics["priority"]["correct"]), (2, 1))
+		# IT/IT, IT/IT, HR vs IT
+		self.assertEqual((metrics["team"]["count"], metrics["team"]["correct"]), (3, 2))
+		self.assertEqual(metrics["score_distribution"]["complexity"], {0: 1, 1: 1, 2: 1, 3: 0})
+		self.assertEqual(metrics["score_distribution"]["importance"], {0: 1, 1: 1, 2: 0, 3: 1})
+		self.assertEqual(metrics["classify_output_tokens_max"], 598)
+		self.assertEqual(metrics["classify_max_tokens_hits"], 1)
+		self.assertIn("Priority match: 50.0% (1/2)", out)
+
+	def test_eval_uses_runner_route_function(self):
+		self.assertIs(run_eval.decide_route, runner.decide_route)
+		self.assertIs(run_eval.decide_route, decide_route)
+		rules = make_routing_rules(departments={"Kế toán": {"team": "IT", "head": ""}})
+		ticket = make_ticket(subject=f"{PREFIX}route parity", description="<p>Không in được phiếu</p>")
+		set_agent_settings(
+			enabled=1,
+			permission_level="L0",
+			category_mapping=json.dumps(DEFAULT_CATEGORY_MAPPING),
+			routing_rules=rules,
+		)
+		runner_gateway = FakeGateway(scored_reply("A", 1, 2, 100))
+		with (
+			patch("erp_ai.agent.runner.decide_route", wraps=decide_route) as runner_route,
+			patch("erp_ai.gateway.call_model", runner_gateway),
+		):
+			runner.run_for_ticket(ticket.name, "ticket_insert")
+		subject, description = frappe.db.get_value("HD Ticket", ticket.name, ["subject", "description"])
+		self._write([eval_row("A", subject=subject, description=description, priority="High")])
+		eval_gateway = FakeGateway(scored_reply("A", 1, 2, 100))
+		with patch("erp_ai.eval.run_eval.decide_route", wraps=decide_route) as eval_route:
+			metrics, _out = self._run(eval_gateway)
+
+		runner_route.assert_called_once()
+		eval_route.assert_called_once()
+		self.assertEqual(eval_route.call_args.args, runner_route.call_args.args)
+		self.assertEqual(eval_route.call_args.kwargs, runner_route.call_args.kwargs)
+		expected = build_classify_request(subject, description, ("Kế toán",))
+		self.assertEqual(eval_gateway.calls[0]["system"], expected["system"])
+		self.assertEqual(runner_gateway.calls[0]["system"], expected["system"])
+		# importance 2 raises A (High) to High through importance_priority: same decision as the runner
+		self.assertEqual((metrics["priority"]["count"], metrics["priority"]["correct"]), (1, 1))
 
 	def test_malformed_line_names_its_line_number(self):
 		with open(self.path, "w", encoding="utf-8") as handle:

@@ -29,6 +29,7 @@ from erp_ai.test_utils import (
 	FakeGateway,
 	add_credential,
 	make_model_result,
+	make_routing_rules,
 	record_status_signals,
 	set_agent_settings,
 )
@@ -74,6 +75,7 @@ class RunnerTestBase(FrappeTestCase):
 			category_mapping=json.dumps(DEFAULT_CATEGORY_MAPPING),
 			answer_delay_min_s=0,
 			answer_delay_max_s=0,
+			routing_rules=make_routing_rules(),
 		)
 		# No status signal reaches Redis and no run sleeps for real (the delay is 0 here; a test that sets one reads `sleeps`).
 		self.signals = record_status_signals(self)
@@ -237,7 +239,7 @@ class TestRunner(RunnerTestBase):
 		self.assertEqual(self.gateway.call_count, 1)
 		call = self.gateway.calls[0]
 		self.assertEqual(call["task"], "classify")
-		self.assertEqual(call["max_tokens"], 400)
+		self.assertEqual(call["max_tokens"], 600)
 		expected = build_classify_request(self.ticket.subject, self.ticket.description)
 		self.assertEqual((call["system"], call["messages"]), (expected["system"], expected["messages"]))
 

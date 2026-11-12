@@ -29,10 +29,25 @@ Quy trình:
 - [x] T9 — BASE=8c5af9c, 3 vòng (2 vòng sửa), merge 896b7ac, review-09; cmd.test đầu nhánh task 989c37d: Ran 710 tests, OK
 - [x] T10 — BASE=7fa9ad9, 1 vòng, merge a9e7e2e, review-10; cmd.test đầu nhánh task 2f0b871: Ran 723 tests, OK
 - [x] T11 — BASE=f1a732b, 1 vòng (sau DESIGN_CONFLICT được giải), merge 27d18fe, review-11; cmd.test đầu nhánh task 776839a: Ran 728 tests, OK
+- [x] T12 — BASE=449e2b5, 2 vòng, merge 1f0b3f7, review-12; cmd.test đầu nhánh task 1db4533: Ran 738 tests, OK
+
+## Checkpoint C2 (trên 1f0b3f7)
+
+- `bench --site miyano migrate` (cmd.migrate): exit 0; chỉ có dòng `Updating DocTypes for erp_ai ... 100%` và `Updating Dashboard for erp_ai`, không lỗi.
+- `ensure_setup` chạy hai lần (sau migrate đã chạy một lần qua after_migrate): ảnh chụp 2 và 3 bằng nhau ở `Task-ai_ticket` (mọi cột, kể cả modified), dòng Custom DocPerm Task/ERP AI Agent (share 1, if_owner 1), `routing_rules` và `auto_assign_enabled` trong tabSingles, 11 field `ai_*` của HD Ticket, Has Role của tài khoản agent (99 dòng), HD Form Script, User; tổng Custom Field 247, Custom DocPerm 1360.
+- `cmd.test` (`bench --site miyano run-tests --app erp_ai`) trên 1f0b3f7: exit 0, `Ran 738 tests in 116.196s`, `OK`.
+- `routing_rules` trong DB là JSON mặc định; `auto_assign_enabled` = 0; `validate_routing_config` chấp nhận.
+
+## Câu hỏi cần người xác nhận ở C2
+
+1. Quyết định "routing_rules để trống" (review-11): (a) trống = tắt routing, sửa `description`; hay (b) từ chối trống sau khi T12 ghi mặc định. Kèm câu thực nghiệm: form desk lưu trống là `""` hay NULL.
+2. Mở rộng touchpoint ở T6 và T11 (xem trên).
+3. T8: bỏ qua khóa tiền tố rỗng `""` (design 3.2/3.3 không nói).
+4. Tài khoản agent giữ 99 dòng Has Role (đã có từ trước, `ensure_setup` không đổi); ngoài FEAT-006, chỉ ghi nhận.
 
 ## Đang build
 
-T12 (BASE = đầu `team/FEAT-006` sau commit docs này). Sau T12: C2 = `cmd.migrate` + `ensure_setup` lần hai không đổi gì + `cmd.test` xanh, rồi DỪNG báo cáo.
+Dừng ở C2 theo `--decide`. Việc kế tiếp sau khi người xác nhận: T13 (depends T12, T2), T14 (T2, T12), rồi T15..T26 theo `depends:`; MỘT dev mỗi lần.
 
 ## Nhật ký
 
@@ -43,3 +58,5 @@ T12 (BASE = đầu `team/FEAT-006` sau commit docs này). Sau T12: C2 = `cmd.mig
 - 2026-11-12 T9: vòng 1 request-changes (major STD-TEST-8: 5 hàng bộ kiểm không có ca); vòng 2 còn thiếu bảo vệ `default`/`prefixes` của `assignees`; vòng 3 approve. Nền nối tiếp 703 OK nhờ dev T9 chạy trước khi sửa.
 - 2026-11-12 T10: dev DONE, reviewer approve vòng 1; merge a9e7e2e; 723 OK.
 - 2026-11-12 T11: dev DESIGN_CONFLICT (`test_doctype_descriptions` ghim 22 trường); tech-lead mở rộng touchpoint 1 file và commit phần dở; dev sau DONE; reviewer approve vòng 1; reviewer nêu quyết định thiết kế "routing_rules trống" cần người chốt (review-11); merge 27d18fe; 728 OK.
+- 2026-11-12 T12: reviewer vòng 1 request-changes (3 major: bảo vệ Task bị che, thiếu dòng mồi share, nghi cache meta); vòng 2 approve (finding cache được reviewer rút lại); merge 1f0b3f7; 738 OK.
+- 2026-11-12 C2: migrate exit 0, ensure_setup lần hai không đổi gì, cmd.test 738 OK; dừng báo cáo.

@@ -24,6 +24,9 @@ Approved-by:
 | Tên repo trong guide (`mvl26/erp-ai`, SSH) khác remote thật (`mvl26/erp_ai`, HTTPS) | STD-DOC | guide `:610`, `:1279`; `git remote -v` | Sửa guide |
 | Guide và `.claude/settings.json` chưa commit | STD-DOC | `git status --porcelain` lúc bắt đầu: `?? .claude/`, `?? docs/` | Commit cùng PR đầu tiên |
 | `cmd.lint` đỏ: ruff-format muốn xóa dòng trống cuối `erp_ai/hooks.py` | STD-STYLE | Onboard 2026-11-11: `pre-commit run --all-files` exit 1, "1 file reformatted" (diff: `erp_ai/hooks.py:249` dòng trống thừa); onboard đã hoàn tác | Chạy `pre-commit run --files erp_ai/hooks.py` và commit trong PR đầu tiên |
+| `test_setup_neutralizes_live_rows_attributed_to_agent` tự gọi `_neutralize_agent_rows()` nên vẫn xanh nếu bỏ lệnh gọi trong `setUp` (BUG-002, minor hoãn) | STD-TEST-5 | `erp_ai/tests/test_tasks.py:339-347`; acceptance BUG-002 | Đổi tên test cho đúng việc kiểm, hoặc tạo dòng ở `setUpClass` rồi kiểm `setUp` đã vô hiệu hóa chúng |
+| Guard `frappe.db.exists("DocType", doctype)` luôn đúng trên Frappe v15 (BUG-002, minor hoãn) | STD-STYLE-5 | `erp_ai/tests/test_tasks.py:197`; acceptance BUG-002 | Bỏ guard khi dọn |
+| FEAT-001 `design.md` §3.4.3 hàng 6 chưa ghi tiền tố `Your credit balance is too low` (BUG-001) | STD-DOC | `docs/team/features/FEAT-001/design.md:330`, D-6 `:872` | Thêm tiền tố vào hàng 6 và D-6 (writer không có công cụ sửa trong lượt này) |
 
 ## Để sau
 | Mục | STD | Bằng chứng | Đề xuất |

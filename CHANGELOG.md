@@ -16,3 +16,7 @@ Mọi thay đổi đáng chú ý của app `erp_ai` được ghi ở đây. Đ�
 
 ### Changed
 - Câu trả lời đầu tiên của comment `@ai` được giữ lại một khoảng ngẫu nhiên 3–5 giây (mặc định, chỉnh được) kể từ lúc chỉ báo bắt đầu; không có độ trễ cho phiếu mới, và không vượt hạn chót của lần chạy (FEAT-002)
+
+### Fixed
+- Lỗi 400 "Your credit balance is too low" (tổ chức hết credit) giờ được nhận là hết hạn mức: khóa chuyển `Hết hạn mức`, chuyển sang khóa kế tiếp, gửi tin báo và được dò lại mỗi giờ, thay vì bị coi là `bad_request` và để khóa ở `Hoạt động` (BUG-001)
+- Bộ test không còn đỏ trên site có dữ liệu thật (role của tài khoản agent, `ERP AI Log`): test tự dựng trạng thái trong transaction và không để lại thay đổi trên site; không đổi hành vi sản phẩm (BUG-002)

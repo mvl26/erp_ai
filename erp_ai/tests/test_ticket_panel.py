@@ -1,10 +1,13 @@
+from unittest.mock import patch
+
 import frappe
 from frappe.tests.utils import FrappeTestCase
 from helpdesk.test_utils import create_agent, make_ticket
 from helpdesk.utils import is_agent
 
 from erp_ai import ticket_panel
-from erp_ai.constants import PANEL_METHODS
+from erp_ai.constants import AGENT_USER, PANEL_METHODS
+from erp_ai.test_utils import set_agent_settings
 
 AI_FIELD_LABELS = (
 	("ai_resolution_hint", "Hướng giải quyết (AI)"),
@@ -17,6 +20,8 @@ NO_READ_EMAIL = "panel.noread@example.com"
 INACTIVE_EMAIL = "panel.inactive@example.com"
 WEBSITE_EMAIL = "panel.website@example.com"
 CUSTOMER_EMAIL = "panel.customer@example.com"
+KEYWORD = "@ai"
+THREAD_KEYS = {"name", "author", "is_bot", "created_at", "text"}
 
 
 def _make_user(email, user_type="Website User"):
@@ -31,6 +36,25 @@ def _make_user(email, user_type="Website User"):
 			}
 		).insert(ignore_permissions=True)
 	return email
+
+
+def _add_comment(ticket, content, owner="Administrator", creation=None, comment_type="Comment"):
+	"""A Comment as the timeline stores it; owner and creation are set directly, like the DB would hold them."""
+	with patch.object(frappe, "enqueue"):
+		doc = frappe.get_doc(
+			{
+				"doctype": "Comment",
+				"comment_type": comment_type,
+				"reference_doctype": "HD Ticket",
+				"reference_name": ticket,
+				"content": "placeholder",
+			}
+		).insert(ignore_permissions=True)
+	values = {"content": content, "owner": owner}
+	if creation:
+		values["creation"] = creation
+	frappe.db.set_value("Comment", doc.name, values, update_modified=False)
+	return doc.name
 
 
 class TestTicketPanelRead(FrappeTestCase):
@@ -140,3 +164,81 @@ class TestTicketPanelRead(FrappeTestCase):
 	def test_read_denied_for_missing_ticket(self):
 		with self.assertRaises(frappe.PermissionError):
 			self._read(ticket="999999999")
+
+
+class TestTicketPanelThread(FrappeTestCase):
+	def setUp(self):
+		self.addCleanup(frappe.db.rollback)
+		self.addCleanup(frappe.set_user, "Administrator")
+		frappe.set_user("Administrator")
+		create_agent(AGENT_EMAIL)
+		set_agent_settings(trigger_keyword=KEYWORD)
+		self.ticket = make_ticket(subject="Panel thread ticket").name
+
+	def _messages(self):
+		frappe.set_user(AGENT_EMAIL)
+		return ticket_panel.get_panel_data(self.ticket)["messages"]
+
+	def test_thread_selects_b5_comments_in_creation_order(self):
+		# AC-8 data: 3 human keyword (1 other case), 2 human plain, 2 agent, 1 keyword on ANOTHER ticket.
+		# Inserted out of order on purpose: the result must follow `creation`, not insertion.
+		other_ticket = make_ticket(subject="Another ticket").name
+		late = _add_comment(self.ticket, f"{KEYWORD} late human", creation="2026-11-12 10:05:00")
+		_add_comment(self.ticket, "plain human chat", creation="2026-11-12 10:01:00")
+		bot_plain = _add_comment(self.ticket, "bot says hi", AGENT_USER, "2026-11-12 10:03:00")
+		early = _add_comment(self.ticket, f"early {KEYWORD.upper()} human", creation="2026-11-12 10:02:00")
+		_add_comment(self.ticket, "another plain human", creation="2026-11-12 10:04:00")
+		bot_kw = _add_comment(self.ticket, f"bot {KEYWORD}", AGENT_USER, "2026-11-12 10:06:00")
+		last = _add_comment(self.ticket, f"last {KEYWORD} human", creation="2026-11-12 10:07:00")
+		_add_comment(other_ticket, f"{KEYWORD} on another ticket", creation="2026-11-12 10:04:30")
+
+		messages = self._messages()
+
+		self.assertEqual([m["name"] for m in messages], [early, bot_plain, late, bot_kw, last])
+		for message in messages:
+			self.assertEqual(set(message), THREAD_KEYS)
+			self.assertNotIn("@", message["author"])
+		self.assertEqual(messages[0]["text"], f"early {KEYWORD.upper()} human")
+		self.assertEqual(messages[0]["created_at"], frappe.utils.format_datetime("2026-11-12 10:02:00"))
+		self.assertRegex(messages[0]["created_at"], r"^\d{2}-\d{2}-\d{4} 10:02:00$")
+		self.assertEqual(messages[0]["author"], frappe.utils.get_fullname("Administrator"))
+
+	def test_thread_selects_nothing_for_humans_when_keyword_is_empty(self):
+		set_agent_settings(trigger_keyword="")
+		_add_comment(self.ticket, f"{KEYWORD} human")
+		bot = _add_comment(self.ticket, "bot reply", AGENT_USER)
+		self.assertEqual([m["name"] for m in self._messages()], [bot])
+
+	def test_thread_ignores_non_comment_types(self):
+		for comment_type in ("Info", "Assignment Completed", "Like", "Label"):
+			_add_comment(self.ticket, f"{KEYWORD} {comment_type}", comment_type=comment_type)
+		_add_comment(self.ticket, "bot info", AGENT_USER, comment_type="Info")
+		kept = _add_comment(self.ticket, f"{KEYWORD} real comment")
+		self.assertEqual([m["name"] for m in self._messages()], [kept])
+
+	def test_thread_marks_bot_messages(self):
+		_add_comment(self.ticket, f"{KEYWORD} human", creation="2026-11-12 10:00:00")
+		_add_comment(self.ticket, "bot answer", AGENT_USER, "2026-11-12 10:01:00")
+		messages = self._messages()
+		self.assertEqual([m["is_bot"] for m in messages], [False, True])
+		self.assertEqual(messages[1]["author"], frappe.utils.get_fullname(AGENT_USER))
+
+	def test_read_strips_xss_payloads_to_text(self):
+		payload = (
+			f'<script>alert(1)</script><img src=x onerror="alert(2)">'
+			f'<a href="javascript:alert(3)">link</a> <b>{KEYWORD}</b> bold'
+		)
+		_add_comment(self.ticket, payload)
+		_add_comment(self.ticket, f"<p>one</p><p>two</p>{payload}", AGENT_USER)
+		xss, bot = self._messages()
+		# Markup that can run (img/a handlers, javascript: urls) is gone; whatever text is left (an escaped
+		# <script> literal) is inert because the page renders it with textContent only.
+		for message in (xss, bot):
+			with self.subTest(is_bot=message["is_bot"]):
+				for tag in ("<img", "<a ", "</a", "<b>"):
+					self.assertNotIn(tag, message["text"])
+				self.assertNotIn("onerror", message["text"])
+				self.assertNotIn("javascript:", message["text"])
+				self.assertIn("link", message["text"])
+				self.assertEqual(message["text"].split()[-3:], ["link", KEYWORD, "bold"])
+		self.assertEqual(bot["text"].split()[:2], ["one", "two"])

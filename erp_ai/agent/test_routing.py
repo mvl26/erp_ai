@@ -2,6 +2,7 @@ from frappe.tests.utils import FrappeTestCase
 
 from erp_ai.agent import routing
 from erp_ai.agent.classification import DEFAULT_CATEGORY_MAPPING, Classification
+from erp_ai.constants import AGENT_USER
 
 CONFIG = {"importance_priority": {"1": "", "2": "High", "3": "High"}}
 
@@ -119,7 +120,7 @@ class TestDecideTeam(FrappeTestCase):
 				is_excluded_team=lambda team: True,
 			)
 			self.assertEqual(decision.agent_group, "IT")
-			self.assertEqual(decision.notes, ())
+			self.assertEqual(_team_notes(decision), [])
 		empty = routing.decide_route(
 			Classification(category="B", confidence="Cao"),
 			"x",
@@ -172,3 +173,146 @@ class TestDecideTeam(FrappeTestCase):
 			"D", department="Kế toán", team_exists=lambda team: False, is_excluded_team=lambda team: True
 		)
 		self.assertEqual(reason(both), "nhóm 'Accounting' không tồn tại")
+
+
+ASSIGN_CONFIG = {
+	"assignees": {
+		"A": {"default": "a.default@x.com", "prefixes": {"[tracecore]": "trace@x.com", "[kho]": "kho@x.com"}},
+		"B": {"default": "b.default@x.com", "prefixes": {}},
+		"C": {"default": "c.default@x.com", "prefixes": {"[hr]": ""}},
+		"F": {"default": "", "prefixes": {}},
+	},
+	"departments": {
+		"Kế toán": {"team": "Accounting", "head": "head@x.com"},
+		"HR": {"team": "HR", "head": ""},
+	},
+}
+
+
+def _decide_assignee(category, subject="Thông thường", department=None, config=None, is_active_agent=None):
+	return routing.decide_route(
+		Classification(category=category, confidence="Cao", importance=1, department=department),
+		subject,
+		DEFAULT_CATEGORY_MAPPING,
+		ASSIGN_CONFIG if config is None else config,
+		team_exists=lambda team: True,
+		is_excluded_team=lambda team: False,
+		is_active_agent=is_active_agent or (lambda user: True),
+	)
+
+
+def _assignee_notes(decision):
+	return [note["reason"] for note in decision.notes if note["field"] == "assignee"]
+
+
+class TestDecideAssignee(FrappeTestCase):
+	def test_default_when_no_prefix_matches(self):
+		for category, want in (("A", "a.default@x.com"), ("B", "b.default@x.com"), ("C", "c.default@x.com")):
+			decision = _decide_assignee(category, "Không có tiền tố")
+			self.assertEqual(decision.assignee, want)
+			self.assertEqual(_assignee_notes(decision), [])
+
+	def test_prefix_overrides_default(self):
+		for subject in (
+			"[tracecore] lỗi",
+			"[GẤP] [tracecore] lỗi",
+			"[TraceCore] lỗi",
+			"lỗi [TRACECORE] giữa",
+		):
+			with self.subTest(subject=subject):
+				self.assertEqual(_decide_assignee("A", subject).assignee, "trace@x.com")
+		# Reverse: another category's prefix is not used; no prefix -> default.
+		self.assertEqual(_decide_assignee("B", "[tracecore] lỗi").assignee, "b.default@x.com")
+		self.assertEqual(_decide_assignee("A", "[trace] lỗi").assignee, "a.default@x.com")
+		self.assertEqual(_decide_assignee("A", None).assignee, "a.default@x.com")
+
+	def test_first_declared_prefix_with_person_wins(self):
+		self.assertEqual(_decide_assignee("A", "[kho] [tracecore] x").assignee, "trace@x.com")
+		self.assertEqual(_decide_assignee("A", "[tracecore] [kho] x").assignee, "trace@x.com")
+		self.assertEqual(_decide_assignee("A", "[kho] x").assignee, "kho@x.com")
+		# Prefix matched but empty person is passed over: falls to default.
+		self.assertEqual(_decide_assignee("C", "[hr] việc").assignee, "c.default@x.com")
+		# D-13: the first matching prefix WITH a person wins; an empty one is skipped.
+		config = {"assignees": {"A": {"default": "d@x.com", "prefixes": {"[x]": "", "[y]": "y@x.com"}}}}
+		self.assertEqual(_decide_assignee("A", "[x] [y]", config=config).assignee, "y@x.com")
+
+	def test_config_prefix_casefolded(self):
+		config = {"assignees": {"A": {"default": "d@x.com", "prefixes": {"[TraceCore]": "trace@x.com"}}}}
+		self.assertEqual(_decide_assignee("A", "[tracecore] x", config=config).assignee, "trace@x.com")
+
+	def test_empty_prefix_key_ignored(self):
+		config = {"assignees": {"A": {"default": "d@x.com", "prefixes": {"": "any@x.com"}}}}
+		self.assertEqual(_decide_assignee("A", "bất kỳ", config=config).assignee, "d@x.com")
+
+	def test_invalid_chosen_candidate_does_not_fall_back_to_default(self):
+		def not_trace(user):
+			return user != "trace@x.com"
+
+		decision = _decide_assignee("A", "[tracecore] x", is_active_agent=not_trace)
+		self.assertIsNone(decision.assignee)
+		self.assertEqual(_assignee_notes(decision), ["trace@x.com không phải HD Agent đang hoạt động"])
+
+	def test_de_assignee_is_department_head(self):
+		for category in "DE":
+			with self.subTest(category=category):
+				decision = _decide_assignee(category, department="  KẾ toán ")
+				self.assertEqual(decision.assignee, "head@x.com")
+				self.assertEqual(_assignee_notes(decision), [])
+		decision = _decide_assignee("D", department="HR")
+		self.assertIsNone(decision.assignee)
+		self.assertEqual(_assignee_notes(decision), ["cấu hình không có người cho đầu mục D"])
+
+	def test_empty_candidate_note(self):
+		decision = _decide_assignee("F")
+		self.assertIsNone(decision.assignee)
+		self.assertEqual(_assignee_notes(decision), ["cấu hình không có người cho đầu mục F"])
+		decision = _decide_assignee("E", department="Kho")
+		self.assertIsNone(decision.assignee)
+		self.assertEqual(_assignee_notes(decision), ["cấu hình không có người cho đầu mục E"])
+		self.assertIsNone(_decide_assignee("A", config={}).assignee)
+
+	def test_inactive_or_missing_agent_not_chosen(self):
+		decision = _decide_assignee("A", "[tracecore] lỗi", is_active_agent=lambda user: False)
+		self.assertIsNone(decision.assignee)
+		self.assertEqual(_assignee_notes(decision), ["trace@x.com không phải HD Agent đang hoạt động"])
+		decision = _decide_assignee("D", department="Kế toán", is_active_agent=lambda user: False)
+		self.assertIsNone(decision.assignee)
+		self.assertEqual(_assignee_notes(decision), ["head@x.com không phải HD Agent đang hoạt động"])
+
+		# Only the failing user is rejected; others stay valid.
+		def only_trace(user):
+			return user == "trace@x.com"
+
+		self.assertEqual(
+			_decide_assignee("A", "[tracecore] x", is_active_agent=only_trace).assignee, "trace@x.com"
+		)
+		self.assertIsNone(_decide_assignee("B", is_active_agent=only_trace).assignee)
+
+	def test_agent_user_never_chosen(self):
+		config = {
+			"assignees": {"A": {"default": AGENT_USER, "prefixes": {"[tracecore]": AGENT_USER}}},
+			"departments": {"Kế toán": {"team": "Accounting", "head": AGENT_USER}},
+		}
+		for category, subject in (("A", "[tracecore] x"), ("A", "x"), ("D", "x")):
+			with self.subTest(category=category, subject=subject):
+				decision = _decide_assignee(category, subject, department="Kế toán", config=config)
+				self.assertIsNone(decision.assignee)
+				self.assertFalse(decision.needs_task)
+				self.assertEqual(_assignee_notes(decision), ["không gán tài khoản agent"])
+
+	def test_agent_user_variants_never_chosen(self):
+		for variant in (AGENT_USER.upper(), f"  {AGENT_USER} ", AGENT_USER.title()):
+			with self.subTest(variant=repr(variant)):
+				config = {"assignees": {"A": {"default": variant, "prefixes": {}}}}
+				decision = _decide_assignee("A", config=config)
+				self.assertIsNone(decision.assignee)
+				self.assertEqual(_assignee_notes(decision), ["không gán tài khoản agent"])
+
+	def test_needs_task_only_c_d_with_assignee(self):
+		for category in "ABCDEF":
+			with self.subTest(category=category):
+				decision = _decide_assignee(category, department="Kế toán")
+				self.assertEqual(decision.needs_task, category in ("C", "D"))
+		self.assertFalse(_decide_assignee("C", config={}).needs_task)
+		self.assertFalse(_decide_assignee("D", department="HR").needs_task)
+		self.assertFalse(_decide_assignee("C", is_active_agent=lambda user: False).needs_task)

@@ -390,11 +390,17 @@ class TestCallModel(FrappeTestCase):
 	def first_row(self):
 		return frappe.db.get_value(CREDENTIAL_DOCTYPE, {"parent": SETTING_DOCTYPE}, "name")
 
-	def test_classify_request_turns_thinking_off(self):
+	def test_classify_request_turns_thinking_off_for_haiku(self):
 		# Haiku 5.5 thinks by default and the hidden thinking tokens count against max_tokens (FEAT-006 rw1 R1).
-		add_credential("k1")
+		add_credential("k1", model_classify="claude-haiku-5-5")
 		send, _ = self.run_call(ok_reply())
 		self.assertEqual(send.calls[0]["request"]["thinking"], {"type": "disabled"})
+
+	def test_classify_request_leaves_thinking_unset_for_non_haiku(self):
+		# Sonnet/Opus/Fable reject thinking disabled with a 400, so classify must not send it (FEAT-006 rw1 R1 review).
+		add_credential("k1", model_classify="claude-sonnet-5-5")
+		send, _ = self.run_call(ok_reply())
+		self.assertNotIn("thinking", send.calls[0]["request"])
 
 	def test_reason_request_leaves_thinking_unset(self):
 		add_credential("k1", model_reason="reason-model")
@@ -416,7 +422,7 @@ class TestCallModel(FrappeTestCase):
 		self.assertEqual(send.calls[0]["timeout"], 45)
 		self.assertEqual(
 			send.calls[0]["request"],
-			{**CALL, "model": "default-model", "thinking": {"type": "disabled"}, "tools": [{"name": "t"}]},
+			{**CALL, "model": "default-model", "tools": [{"name": "t"}]},
 		)
 		self.assertEqual(result.text, "xin chào")
 		self.assertEqual(result.content, MESSAGE["content"])

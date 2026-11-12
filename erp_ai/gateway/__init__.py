@@ -19,7 +19,9 @@ DEFAULT_REQUEST_TIMEOUT_S = 60
 MIN_REMAINING_S = 5
 # Classify answers with one short JSON object. Haiku 5.5 thinks by default and its (hidden) thinking
 # tokens count against max_tokens, so with thinking on a 600 ceiling is hit about 1 call in 4.
+# Only Haiku accepts `disabled`; Sonnet, Opus and Fable answer 400 to it, so other models get no field.
 CLASSIFY_THINKING = {"type": "disabled"}
+THINKING_OFF_MODEL_PREFIX = "claude-haiku-"
 USAGE_FIELDS = ("input_tokens", "output_tokens", "cache_creation_input_tokens", "cache_read_input_tokens")
 PRICE_FIELDS = (
 	"price_input_per_mtok",
@@ -149,7 +151,7 @@ def call_model(task, *, system, messages, max_tokens, tools=None, deadline=None)
 			row.model_reason if task == "reason" else row.model_classify or settings["model_classify_default"]
 		)
 		request = {"model": model, "max_tokens": max_tokens, "system": system, "messages": messages}
-		if task == "classify":
+		if task == "classify" and model.startswith(THINKING_OFF_MODEL_PREFIX):
 			request["thinking"] = CLASSIFY_THINKING
 		if tools:
 			request["tools"] = tools

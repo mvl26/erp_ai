@@ -366,6 +366,19 @@ class TestRoutingConfig(FrappeTestCase):
 			with self.subTest(blank=blank), self.assertRaisesRegex(frappe.ValidationError, "JSON mặc định"):
 				routing.validate_routing_config(blank)
 
+	def test_blank_message_embeds_default_json_without_constant_name(self):
+		with self.assertRaises(frappe.ValidationError) as ctx:
+			routing.validate_routing_config("")
+		message = str(ctx.exception)
+		self.assertIn(routing.DEFAULT_ROUTING_RULES, message)
+		self.assertNotIn("DEFAULT_ROUTING_RULES", message)
+		self.assertIn("chưa bị đổi", message)
+
+	def test_non_string_raw_raises_validation_error_not_attribute_error(self):
+		for raw in ({"assignees": {}}, 5, ["x"], 0, {}):
+			with self.subTest(raw=raw), self.assertRaises(frappe.ValidationError):
+				routing.validate_routing_config(raw)
+
 	def test_load_blank_still_returns_empty_without_raising(self):
 		for blank in (None, "", "  \n\t"):
 			with self.subTest(blank=blank):

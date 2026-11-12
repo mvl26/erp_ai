@@ -281,12 +281,13 @@ def _config_error(raw, check_users):
 def validate_routing_config(raw) -> None:
 	"""Raise frappe.ValidationError naming the bad key path. Does not check teams or block the agent account.
 
-	Blank raw is rejected too: the message tells the admin to paste DEFAULT_ROUTING_RULES back in.
+	Blank raw is rejected too: the message carries the default JSON so the admin can paste it back in.
 	"""
-	if not (raw or "").strip():
+	if raw is None or (isinstance(raw, str) and not raw.strip()):
 		frappe.throw(
-			"Quy tắc định tuyến không được để trống. "
-			"Hãy dán lại JSON mặc định (DEFAULT_ROUTING_RULES) rồi điền người phụ trách."
+			"Quy tắc định tuyến không được để trống. Cấu hình đã lưu chưa bị đổi; "
+			"tải lại trang để giữ lại bản đã lưu. Muốn khôi phục, hãy dán JSON mặc định sau "
+			f"rồi điền người phụ trách:\n{DEFAULT_ROUTING_RULES}"
 		)
 	error = _config_error(raw, check_users=True)
 	if error:

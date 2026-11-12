@@ -7,7 +7,7 @@ import frappe
 from frappe.tests.utils import FrappeTestCase
 from helpdesk.test_utils import create_agent, make_ticket
 
-from erp_ai.agent.tools import registry
+from erp_ai.agent.tools import registry, route_ticket
 from erp_ai.agent.tools.registry import ToolContext, ToolSpec, execute_tool, get_tool_schemas
 from erp_ai.agent.tools.source import GIT_SUBCOMMANDS
 from erp_ai.constants import ROLE_AGENT
@@ -15,6 +15,28 @@ from erp_ai.constants import ROLE_AGENT
 REAL_ALL_SPECS = registry._all_specs
 AGENT_EMAIL = "erpai-test-t27.agent@example.com"
 SEED_TYPE = "ERPAI-TEST-T27 Loại"
+FORBIDDEN_ROUTE_PARAMETER_WORDS = (
+	"assign",
+	"allocat",
+	"owner",
+	"person",
+	"user",
+	"agent",
+	"sla",
+	"priority",
+	"response",
+	"resolution_by",
+	"score",
+	"complexity",
+	"importance",
+)
+ROUTE_FUNCTION_NAMES = (
+	"apply_route",
+	"assign_owner",
+	"create_routed_task",
+	"post_routing_comment",
+	"route_ticket",
+)
 NOTE_TITLE = "erp_ai registry savepoint probe"
 OTHER_NOTE_TITLE = "erp_ai registry earlier note"
 
@@ -67,6 +89,17 @@ def _context(level="L1", instructor=None):
 		category_mapping={},
 		agent_user="ai.agent@miyano.com.vn",
 	)
+
+
+def _schema_keys(rule):
+	"""Every property name in a JSON-schema fragment, nested ones included."""
+	keys = []
+	for key, sub in (rule.get("properties") or {}).items():
+		keys.append(key)
+		keys.extend(_schema_keys(sub))
+	if "items" in rule:
+		keys.extend(_schema_keys(rule["items"]))
+	return keys
 
 
 def _insert_note():
@@ -204,6 +237,41 @@ class TestRegistry(FrappeTestCase):
 			patch.object(registry.importlib, "import_module", fakes.__getitem__),
 		):
 			self.assertEqual([s.name for s in registry._all_specs()], list(registry.TOOL_MODULES))
+
+	def test_no_tool_schema_takes_person_sla_priority_or_score(self):
+		# AC-9: the model cannot choose a person, an SLA, a priority or a score through any tool.
+		specs = REAL_ALL_SPECS()
+		self.assertTrue(specs)
+		for spec in specs:
+			for key in _schema_keys(spec.schema["input_schema"]):
+				for word in FORBIDDEN_ROUTE_PARAMETER_WORDS:
+					self.assertNotIn(word, key.lower(), f"{spec.name} accepts {key}")
+		classification = next(s for s in specs if s.name == "set_classification")
+		self.assertEqual(
+			classification.schema["input_schema"]["properties"].keys(), {"category", "confidence"}
+		)
+		self.assertEqual(classification.schema["input_schema"]["required"], ["category", "confidence"])
+
+	def test_route_functions_not_executable_as_tools(self):
+		# AC-9: a tool call naming a route function is "not granted" and no route function runs.
+		context = _context("L3", "boss@x.com")
+		arguments = ({}, {"user": "Administrator"}, {"assignee": "Administrator", "priority": "Urgent"})
+		with (
+			patch.object(registry, "_all_specs", REAL_ALL_SPECS),
+			patch.object(route_ticket, "apply_route") as apply_route,
+			patch.object(route_ticket, "assign_owner") as assign_owner,
+			patch.object(route_ticket, "create_routed_task") as create_routed_task,
+			patch.object(route_ticket, "post_routing_comment") as post_routing_comment,
+		):
+			granted = [spec["name"] for spec in get_tool_schemas("L3", True)]
+			for name in ROUTE_FUNCTION_NAMES:
+				self.assertNotIn(name, granted)
+				for given in arguments:
+					result = execute_tool(name, given, context)
+					self.assertFalse(result["ok"], name)
+					self.assertIn("không được cấp", result["reason"], name)
+		for function in (apply_route, assign_owner, create_routed_task, post_routing_comment):
+			function.assert_not_called()
 
 
 READ_TOOL_NAMES = ["get_ticket", "list_comments", "search_resolved_tickets", "get_record"]

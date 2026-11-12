@@ -1,9 +1,12 @@
+import json
 from unittest.mock import patch
 
 import frappe
+from frappe.permissions import AUTOMATIC_ROLES
+from helpdesk.test_utils import create_agent
 
 from erp_ai.agent.run_log import write_entry
-from erp_ai.constants import AGENT_STATUS_EVENT, SETTING_DOCTYPE
+from erp_ai.constants import AGENT_STATUS_EVENT, AGENT_USER, HELPDESK_AGENT_ROLE, ROLE_AGENT, SETTING_DOCTYPE
 from erp_ai.gateway import GatewayError, ModelResult
 
 
@@ -142,3 +145,138 @@ def make_log_entry(**fields) -> str:
 	values = {"run_id": "ERPAI-TEST-run", "entry_type": "skip", "trigger": "ticket_insert", "turn": 0}
 	values.update(fields)
 	return write_entry(**values)
+
+
+PREFIX = "ERPAI-TEST-"
+PINNED_AGENT_ROLES = (ROLE_AGENT, HELPDESK_AGENT_ROLE)
+SLA_RESPONSE_HOURS_BY_PRIORITY = {"Low": 4, "Medium": 3, "High": 2, "Urgent": 1}
+WEEKDAYS = ("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday")
+
+
+def _agent_role_rows() -> list[dict]:
+	return frappe.get_all(
+		"Has Role",
+		filters={"parent": AGENT_USER, "parenttype": "User"},
+		fields=["*"],
+		order_by="creation, name",
+	)
+
+
+def pin_agent_roles(testcase) -> None:
+	"""Pin the agent account's Has Role set to exactly {ERP AI Agent, Agent} (plus automatic roles) for one test.
+
+	`addCleanup` puts back the exact rows that were there. Call it
+	after `testcase.addCleanup(frappe.db.rollback)` so the restore runs first (cleanups run last-in first-out).
+	"""
+	rows = _agent_role_rows()
+	if not frappe.db.exists("User", AGENT_USER):
+		raise AssertionError(f"{AGENT_USER} does not exist on this site")
+
+	def restore():
+		frappe.db.delete("Has Role", {"parent": AGENT_USER, "parenttype": "User"})
+		for row in rows:
+			frappe.get_doc({**row, "doctype": "Has Role"}).db_insert()
+
+	# Registered before `restore` so it runs after it, and still runs when `restore` fails.
+	testcase.addCleanup(frappe.clear_cache, user=AGENT_USER)
+	testcase.addCleanup(restore)
+
+	keep = set(PINNED_AGENT_ROLES) | set(AUTOMATIC_ROLES)
+	frappe.db.delete("Has Role", {"parent": AGENT_USER, "parenttype": "User", "role": ("not in", list(keep))})
+	present = {row["role"] for row in rows}
+	for role in PINNED_AGENT_ROLES:
+		if role not in present:
+			frappe.get_doc(
+				{
+					"doctype": "Has Role",
+					"parent": AGENT_USER,
+					"parenttype": "User",
+					"parentfield": "roles",
+					"role": role,
+				}
+			).db_insert()
+	frappe.clear_cache(user=AGENT_USER)
+
+
+def make_routing_rules(**overrides) -> str:
+	"""JSON of `routing_rules` in the design 3.3 shape, with no people filled in; `overrides` replace top-level keys."""
+	rules = {
+		"assignees": {cat: {"default": "", "prefixes": {}} for cat in "ABCF"},
+		"departments": {},
+		"importance_priority": {"1": "", "2": "High", "3": "High"},
+		"expected_sla": {
+			"A": {"response_min": 15, "resolution_min": 480},
+			"B": {"response_min": 15, "resolution_min": 240},
+			"C": {"response_min": 60, "resolution_min": 1440},
+			"D": {"response_min": 60, "resolution_min": None},
+			"E": {"response_min": 60, "resolution_min": None},
+			"F": {"response_min": 5, "resolution_min": 60},
+		},
+	}
+	rules.update(overrides)
+	return json.dumps(rules, ensure_ascii=False)
+
+
+def _unique(label: str) -> str:
+	return f"{PREFIX}{label}-{frappe.generate_hash(length=8)}"
+
+
+def make_sla(testcase, *, condition: str = "", default: bool = False, enabled: bool = True) -> str:
+	"""Insert a self-made HD Service Level Agreement (own holiday list) and return its name. Rolled back by the test."""
+	holiday_list = frappe.get_doc(
+		{
+			"doctype": "HD Service Holiday List",
+			"holiday_list_name": _unique("Holidays"),
+			"from_date": "2020-01-01",
+			"to_date": "2099-12-31",
+		}
+	).insert(ignore_permissions=True)
+	sla = frappe.get_doc(
+		{
+			"doctype": "HD Service Level Agreement",
+			"service_level": _unique("SLA"),
+			"holiday_list": holiday_list.name,
+			"condition": condition,
+			"default_sla": 1 if default else 0,
+			"enabled": 1 if enabled else 0,
+			"apply_sla_for_resolution": 1,
+			"support_and_resolution": [
+				{"workday": day, "start_time": "00:00:00", "end_time": "23:59:00"} for day in WEEKDAYS
+			],
+			"priorities": [
+				{
+					"priority": priority,
+					"default_priority": 1 if priority == "Medium" else 0,
+					"response_time": 3600 * hours,
+					"resolution_time": 4 * 3600 * hours,
+				}
+				for priority, hours in SLA_RESPONSE_HOURS_BY_PRIORITY.items()
+			],
+		}
+	)
+	sla.insert(ignore_permissions=True)
+	return sla.name
+
+
+def make_active_agent(testcase) -> str:
+	"""Create a user with the Agent role and an active HD Agent row; return the user ID. Rolled back by the test."""
+	email = f"{_unique('agent').lower()}@example.com"
+	create_agent(email)
+	return email
+
+
+def make_team(testcase, *, with_rule: bool = False, rule_users: tuple[str, ...] = ()) -> str:
+	"""Insert a self-made HD Team and return its name.
+
+	Helpdesk always creates an Assignment Rule for a new team; `with_rule=False` removes it again, so the team
+	has none. `rule_users` are the members (and rule users); empty means one fresh active agent.
+	"""
+	members = tuple(rule_users) or (make_active_agent(testcase),)
+	team = frappe.get_doc(
+		{"doctype": "HD Team", "team_name": _unique("Team"), "users": [{"user": user} for user in members]}
+	).insert(ignore_permissions=True)
+	if not with_rule:
+		rule = team.assignment_rule
+		frappe.db.set_value("HD Team", team.name, "assignment_rule", None, update_modified=False)
+		frappe.delete_doc("Assignment Rule", rule, force=True, ignore_permissions=True)
+	return team.name

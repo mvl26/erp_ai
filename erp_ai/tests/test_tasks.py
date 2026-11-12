@@ -188,6 +188,22 @@ class TestCheckPrivilegeEscalation(FrappeTestCase):
 		frappe.db.delete("Has Role", {"parent": AGENT_USER, "parenttype": "User"})
 		for role in (ROLE_AGENT, HELPDESK_AGENT_ROLE):
 			self._add_role(role)
+		self._neutralize_agent_rows()
+
+	def _neutralize_agent_rows(self):
+		# Live rows attributed to the agent must not influence the permission-record and
+		# script/webhook conditions: reattribute or disable them (rolled back with the test).
+		for doctype in tasks.PERMISSION_DOCTYPES:
+			if frappe.db.exists("DocType", doctype):
+				frappe.db.set_value(
+					doctype,
+					{"modified_by": AGENT_USER},
+					"modified_by",
+					"Administrator",
+					update_modified=False,
+				)
+		frappe.db.set_value("Server Script", {"owner": AGENT_USER}, "disabled", 1)
+		frappe.db.set_value("Webhook", {"owner": AGENT_USER}, "enabled", 0)
 
 	def _run(self):
 		tasks.check_privilege_escalation()
@@ -277,9 +293,7 @@ class TestCheckPrivilegeEscalation(FrappeTestCase):
 		self.assertIn("System Manager", self._alarm_messages()[0])
 
 	def test_allowed_roles_do_not_alarm(self):
-		for role in (ROLE_AGENT, HELPDESK_AGENT_ROLE):
-			if not frappe.db.exists("Has Role", {"parent": AGENT_USER, "role": role}):
-				self._add_role(role)
+		self._add_role("Desk User")
 
 		self._run()
 
@@ -300,9 +314,6 @@ class TestCheckPrivilegeEscalation(FrappeTestCase):
 		self.assertIn(AGENT_USER, self._alarm_messages()[0])
 
 	def test_alarm_when_agent_lost_a_required_role(self):
-		for role in (ROLE_AGENT, HELPDESK_AGENT_ROLE):
-			if not frappe.db.exists("Has Role", {"parent": AGENT_USER, "role": role}):
-				self._add_role(role)
 		frappe.db.delete("Has Role", {"parent": AGENT_USER, "role": ROLE_AGENT})
 
 		self._run()
@@ -321,6 +332,16 @@ class TestCheckPrivilegeEscalation(FrappeTestCase):
 	def test_permission_record_modified_by_someone_else_does_not_alarm(self):
 		self._add_perm("Administrator")
 
+		self._run()
+
+		self.send_alarm.assert_not_called()
+
+	def test_setup_neutralizes_live_rows_attributed_to_agent(self):
+		self._add_perm(AGENT_USER)
+		self._add_server_script(AGENT_USER, disabled=0)
+		self._add_webhook(AGENT_USER, enabled=1)
+
+		self._neutralize_agent_rows()
 		self._run()
 
 		self.send_alarm.assert_not_called()

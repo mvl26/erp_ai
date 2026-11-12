@@ -1,7 +1,6 @@
 from unittest.mock import patch
 
 import frappe
-from frappe.realtime import get_doc_room
 from frappe.utils import get_fullname
 
 from erp_ai.agent.run_status import PAYLOAD_KEYS
@@ -38,7 +37,7 @@ class TestRunnerStatus(RunnerTestBase):
 		self.assertTrue(self.signals, "no status signal was emitted")
 		first = self.signals[0]
 		self.assertEqual(first["event"], AGENT_STATUS_EVENT)
-		self.assertEqual(first["room"], get_doc_room("HD Ticket", self.ticket.name))
+		self.assertEqual(first["room"], f"doc:HD Ticket/{self.ticket.name}")
 		self.assertEqual(list(first["message"]), list(PAYLOAD_KEYS))
 		self.assertEqual(len(first["message"]), 7)
 		self.assertEqual(
@@ -59,11 +58,14 @@ class TestRunnerStatus(RunnerTestBase):
 
 	def test_done_last_when_answered(self):
 		self._gateway(
-			tool_turn(tool_use("t1", "get_ticket")),
+			tool_turn(tool_use("t1", "post_comment", content="Đã xử lý")),
 			make_model_result(text="xong"),
 		)
+		comments_before = self._comment_count()
 
 		self._run("comment_mention")
+
+		self.assertEqual(self._comment_count(), comments_before + 1)
 
 		states = [signal["message"]["state"] for signal in self.signals]
 		self.assertTrue(states, "no status signal was emitted")
@@ -72,6 +74,8 @@ class TestRunnerStatus(RunnerTestBase):
 		self.assertEqual(states[-1], "done")
 		self.assertEqual(len({signal["message"]["run_id"] for signal in self.signals}), 1)
 		self.assertEqual(self.signals[-1]["message"]["text"], "")
+		self.assertEqual(list(self.signals[-1]["message"]), list(PAYLOAD_KEYS))
+		self.assertEqual(len(self.signals[-1]["message"]), 7)
 		self.assertEqual({entry.run_id for entry in self._entries()}, {self.signals[0]["message"]["run_id"]})
 
 	def test_no_signal_when_run_skipped_at_level_l0(self):

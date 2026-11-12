@@ -11,7 +11,7 @@ from erp_ai.agent.answer_delay import AnswerDelay
 from erp_ai.agent.classification import load_mapping, parse_classification, resolve_ticket_values
 from erp_ai.agent.prompts import build_classify_request, build_initial_message, build_reason_system
 from erp_ai.agent.run_log import write_entry
-from erp_ai.agent.run_status import RunStatus
+from erp_ai.agent.run_status import CLASSIFY_STEP, RunStatus
 from erp_ai.agent.tools.read import TOOL_RESULT_MAX_CHARS
 from erp_ai.agent.tools.registry import ToolContext, execute_tool, get_tool_schemas
 from erp_ai.constants import (
@@ -124,7 +124,9 @@ def _run(ticket_name, trigger):
 			)
 		classification = None
 		if trigger == TRIGGER_TICKET_INSERT:
-			proceed, classification = _classify(ticket_name, trigger, run_id, mapping, context, deadline)
+			proceed, classification = _classify(
+				ticket_name, trigger, run_id, mapping, context, deadline, status
+			)
 			if not proceed:
 				return
 		if level != LEVELS[0]:
@@ -158,7 +160,7 @@ def _call_fields(result):
 	}
 
 
-def _classify(ticket_name, trigger, run_id, mapping, context, deadline):
+def _classify(ticket_name, trigger, run_id, mapping, context, deadline, status):
 	"""Classification step (design 4.3 step 6). Writes one `classify` entry; with a context (L1+) also applies it.
 
 	Returns `(proceed, classification)`: `proceed` is False when the run must end here (gateway error);
@@ -166,6 +168,7 @@ def _classify(ticket_name, trigger, run_id, mapping, context, deadline):
 	"""
 	subject, description = frappe.db.get_value("HD Ticket", ticket_name, ["subject", "description"])
 	base = {"ticket": ticket_name, "run_id": run_id, "entry_type": "classify", "trigger": trigger, "turn": 0}
+	status.working(CLASSIFY_STEP)
 	try:
 		result = _call_model(
 			"classify",
@@ -176,7 +179,7 @@ def _classify(ticket_name, trigger, run_id, mapping, context, deadline):
 	except gateway.GatewayError as exc:
 		write_entry(
 			**base,
-			error=f"{exc.kind} status={exc.status}",
+			error="; ".join([f"{exc.kind} status={exc.status}", *status.take_errors()]),
 			stop_reason="gateway_error",
 			credential_label=exc.credential_label,
 			keys_tried=exc.keys_tried,
@@ -186,7 +189,8 @@ def _classify(ticket_name, trigger, run_id, mapping, context, deadline):
 	call_fields = _call_fields(result)
 	classification = parse_classification(result.text)
 	if classification is None:
-		write_entry(**base, **call_fields, error=UNPARSEABLE_ERROR, stop_reason="unparseable")
+		error = "; ".join([UNPARSEABLE_ERROR, *status.take_errors()])
+		write_entry(**base, **call_fields, error=error, stop_reason="unparseable")
 		return True, None
 
 	values = resolve_ticket_values(classification, subject, mapping)
@@ -195,7 +199,7 @@ def _classify(ticket_name, trigger, run_id, mapping, context, deadline):
 		**base,
 		**call_fields,
 		stop_reason=result.stop_reason,
-		error=None if mapping else BAD_MAPPING_ERROR,
+		error="; ".join([*([] if mapping else [BAD_MAPPING_ERROR]), *status.take_errors()]) or None,
 		predicted_category=classification.category,
 		predicted_confidence=classification.confidence,
 		predicted_ticket_type=values["ticket_type"],
@@ -204,6 +208,7 @@ def _classify(ticket_name, trigger, run_id, mapping, context, deadline):
 		applied=0,
 	)
 	if context is not None:
+		status.working("set_classification")
 		_apply_classification(log_name, classification, context)
 	summary = {"category": classification.category, "confidence": classification.confidence, **values}
 	return True, summary
@@ -291,7 +296,7 @@ def _reason(ticket_name, trigger, run_id, settings, context, classification, dea
 			write_entry(
 				**base,
 				turn=turn,
-				error=f"{exc.kind} status={exc.status}",
+				error="; ".join([f"{exc.kind} status={exc.status}", *status.take_errors()]),
 				stop_reason=STOP_TIME_BUDGET if exc.kind == DEADLINE_KIND else STOP_GATEWAY_ERROR,
 				credential_label=exc.credential_label,
 				keys_tried=exc.keys_tried,
@@ -304,6 +309,7 @@ def _reason(ticket_name, trigger, run_id, settings, context, classification, dea
 		if delay is not None and any(block["name"] == ANSWER_TOOL for block in tool_blocks):
 			delay.wait_before_answer(deadline)
 		for block in tool_blocks:
+			status.working(block["name"])
 			tool_results.append(_run_tool(block, context, actions, before, after, tool_errors, skipped))
 		stop_reason = result.stop_reason
 		wants_tools = stop_reason == STOP_TOOL_USE
@@ -315,7 +321,7 @@ def _reason(ticket_name, trigger, run_id, settings, context, classification, dea
 			turn=turn,
 			stop_reason=stop_reason,
 			tools_called=[block["name"] for block in tool_blocks] or None,
-			error="; ".join(tool_errors) or None,
+			error="; ".join([*tool_errors, *status.take_errors()]) or None,
 			actions=actions or None,
 			value_before=before or None,
 			value_after=after or None,

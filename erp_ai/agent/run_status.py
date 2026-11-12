@@ -11,7 +11,26 @@ from erp_ai.constants import AGENT_STATUS_EVENT, AGENT_USER, JOB_TIMEOUT_S
 
 PAYLOAD_KEYS = ("ticket_id", "run_id", "agent_user", "agent_name", "state", "text", "expires_in_s")
 STATE_THINKING = "thinking"
+STATE_WORKING = "working"
 STATE_DONE = "done"
+CLASSIFY_STEP = "classify"
+WORKING_TEXT = "Đang làm: {label}…"
+FALLBACK_WORK_LABEL = "xử lý yêu cầu"
+# The only table of work labels (A-15): the text of a "working" signal comes from here, never from the model.
+WORK_LABELS = {
+	"get_ticket": "đọc phiếu",
+	"list_comments": "đọc comment",
+	"search_resolved_tickets": "tìm phiếu đã giải quyết",
+	"get_record": "tra bản ghi",
+	"search_source": "tra mã nguồn",
+	"read_source": "đọc mã nguồn",
+	"git_source": "xem lịch sử mã nguồn",
+	"set_classification": "ghi phân loại",
+	"set_resolution_hint": "ghi hướng giải quyết",
+	"post_comment": "viết trả lời",
+	"create_task": "tạo task",
+	CLASSIFY_STEP: "phân loại phiếu",
+}
 
 
 class RunStatus:
@@ -35,6 +54,16 @@ class RunStatus:
 	def thinking(self) -> None:
 		if self.started and not self.finished and self.last_state != STATE_THINKING:
 			self._emit(STATE_THINKING, self.text)
+
+	def working(self, step: str) -> None:
+		if self.started and not self.finished:
+			# an unknown name (invented by the model) never reaches the text (D-5)
+			label = WORK_LABELS.get(step, FALLBACK_WORK_LABEL)
+			self._emit(STATE_WORKING, WORKING_TEXT.format(label=label))
+
+	def take_errors(self) -> list[str]:
+		errors, self._errors = self._errors, []
+		return errors
 
 	def done(self) -> None:
 		if self.started and not self.finished:

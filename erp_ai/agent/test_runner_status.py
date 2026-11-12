@@ -7,8 +7,8 @@ import frappe
 from frappe.utils import get_fullname
 
 from erp_ai.agent import answer_delay, policy, runner
-from erp_ai.agent.run_status import PAYLOAD_KEYS
-from erp_ai.agent.test_agent_runner import DAILY_LIMIT, RunnerTestBase, tool_turn, tool_use
+from erp_ai.agent.run_status import FALLBACK_WORK_LABEL, PAYLOAD_KEYS
+from erp_ai.agent.test_agent_runner import CLASSIFY_A, DAILY_LIMIT, RunnerTestBase, tool_turn, tool_use
 from erp_ai.constants import AGENT_STATUS_EVENT, AGENT_USER, JOB_TIMEOUT_S, SETTING_DOCTYPE
 from erp_ai.test_utils import FakeGateway, make_model_result, set_agent_settings
 
@@ -117,6 +117,12 @@ class TestRunnerStatus(RunnerTestBase):
 
 		self.assertEqual(self.signals, [])
 
+	def _states(self):
+		return [signal["message"]["state"] for signal in self.signals]
+
+	def _texts(self):
+		return [signal["message"]["text"] for signal in self.signals]
+
 	def _answer_turns(self, cost_usd=0.0):
 		return (
 			tool_turn(tool_use("t1", "post_comment", content="Đã xử lý"), cost_usd=cost_usd),
@@ -145,6 +151,9 @@ class TestRunnerStatus(RunnerTestBase):
 		self.assertEqual(self.sleeps, [2.5])
 		self.assertEqual(self.at_sleep, [(["thinking"], comments_before)])
 		self.assertEqual(self._comment_count(), comments_before + 1)
+		# the "working" signal of the answer comes only after the wait
+		self.assertEqual(self._states(), ["thinking", "working", "thinking", "done"])
+		self.assertEqual(self.signals[1]["message"]["text"], "Đang làm: viết trả lời…")
 
 	def test_whole_turn_waits_before_its_first_tool(self):
 		"""D-6: the wait sits before every tool of the answer turn, not just before the post_comment block."""
@@ -180,6 +189,9 @@ class TestRunnerStatus(RunnerTestBase):
 		self.assertEqual(set(states), {"thinking"})
 		# no signal between the model call and the sleep
 		self.assertEqual(len(states), self.signals_on_model_call[0])
+		# the sleep ends, then the answer is announced as work
+		self.assertEqual(self._states()[:2], ["thinking", "working"])
+		self.assertEqual(self.signals[1]["message"]["text"], "Đang làm: viết trả lời…")
 
 	def test_skipped_runs_emit_nothing_and_never_wait(self):
 		self._set_delay(3, 5)
@@ -264,3 +276,78 @@ class TestRunnerStatus(RunnerTestBase):
 		self.assertEqual(on[1], 2)
 		self.assertAlmostEqual(on[2], off[2])
 		self.assertAlmostEqual(on[2], 0.5)
+
+	def test_signal_sequence_read_tool_then_answer(self):
+		self._gateway(
+			tool_turn(tool_use("t1", "get_ticket")),
+			tool_turn(tool_use("t2", "post_comment", content="Đã xử lý")),
+			make_model_result(text="xong"),
+		)
+
+		self._run("comment_mention")
+
+		self.assertEqual(self._states(), ["thinking", "working", "thinking", "working", "thinking", "done"])
+		self.assertEqual(
+			self._texts(),
+			[
+				THINKING_TEXT,
+				"Đang làm: đọc phiếu…",
+				THINKING_TEXT,
+				"Đang làm: viết trả lời…",
+				THINKING_TEXT,
+				"",
+			],
+		)
+
+	def test_ticket_insert_l0_gets_start_signal(self):
+		set_agent_settings(permission_level="L0")
+		self._gateway(make_model_result(text=CLASSIFY_A))
+
+		self._run("ticket_insert")
+
+		self.assertEqual(self._states(), ["thinking", "working", "done"])
+		self.assertEqual(self._texts()[1], "Đang làm: phân loại phiếu…")
+
+	def test_ticket_insert_l1_signal_sequence(self):
+		self._gateway(make_model_result(text=CLASSIFY_A), make_model_result(text="xong"))
+
+		self._run("ticket_insert")
+
+		self.assertEqual(self._states(), ["thinking", "working", "working", "thinking", "done"])
+		self.assertEqual(self._texts()[1:3], ["Đang làm: phân loại phiếu…", "Đang làm: ghi phân loại…"])
+
+	def test_ticket_insert_never_waits(self):
+		self._set_delay(3, 5)
+		for level in ("L0", "L1"):
+			with self.subTest(level):
+				frappe.db.savepoint("erp_ai_insert_case")
+				try:
+					set_agent_settings(permission_level=level)
+					self._gateway(
+						make_model_result(text=CLASSIFY_A),
+						tool_turn(tool_use("t1", "post_comment", content="Đã xử lý")),
+						make_model_result(text="xong"),
+					)
+
+					self._run("ticket_insert")
+
+					self.assertEqual(self.sleeps, [])
+				finally:
+					frappe.db.rollback(save_point="erp_ai_insert_case")
+
+	def test_tool_arguments_and_ticket_text_never_in_payload(self):
+		marker = "MARKERXYZ"
+		frappe.db.set_value("HD Ticket", self.ticket.name, "subject", f"{marker} subject")
+		self._gateway(
+			tool_turn(
+				tool_use("t1", f"tool_{marker}", secret=marker),
+				tool_use("t2", "post_comment", content=f"{marker} answer"),
+			),
+			make_model_result(text="xong"),
+		)
+
+		self._run("comment_mention")
+
+		self.assertIn("working", self._states())
+		self.assertNotIn(marker, json.dumps(self.signals, ensure_ascii=False))
+		self.assertIn(f"Đang làm: {FALLBACK_WORK_LABEL}…", self._texts())

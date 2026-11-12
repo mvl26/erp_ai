@@ -15,7 +15,6 @@ function setupForm({ doc, router }) {
 			nameEl: null,
 			textEl: null,
 			socket: null,
-			bound: false,
 		});
 
 		const ensureElement = () => {
@@ -133,7 +132,13 @@ function setupForm({ doc, router }) {
 						return;
 					}
 					run = {
-						timer: setTimeout(() => finish(runId), ms),
+						timer: setTimeout(() => {
+							try {
+								finish(runId);
+							} catch (e) {
+								// A timer callback must never throw to the console (AC-10 g).
+							}
+						}, ms),
 						text: "",
 						name: "",
 						at: 0,
@@ -158,10 +163,28 @@ function setupForm({ doc, router }) {
 		if (state.socket !== socket) {
 			state.socket = socket;
 			socket.on(EVENT, onStatus);
-			socket.on("connect", () => socket.emit("doc_subscribe", "HD Ticket", state.ticket));
+			socket.on("connect", () => {
+				try {
+					// Re-join the room after a reconnect; never subscribe with no ticket open.
+					if (state.ticket) {
+						socket.emit("doc_subscribe", "HD Ticket", state.ticket);
+					}
+				} catch (e) {
+					// A socket callback must never throw to the console (AC-10 g).
+				}
+			});
 			router?.afterEach((to) => {
-				if (to?.name !== "TicketAgent" || String(to?.params?.ticketId) !== state.ticket) {
-					reset();
+				try {
+					if (
+						to?.name !== "TicketAgent" ||
+						String(to?.params?.ticketId) !== state.ticket
+					) {
+						// Left the viewed ticket: forget it so its signals are ignored (ADR-008 decision 6).
+						reset();
+						state.ticket = null;
+					}
+				} catch (e) {
+					// A router hook must never throw to the console (AC-10 g).
 				}
 			});
 		}

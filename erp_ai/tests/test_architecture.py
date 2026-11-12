@@ -116,7 +116,20 @@ STATUS_SCRIPT_FORBIDDEN = (
 	r"HD Form Script",
 	r"^\s*(import|export)\b",
 )
-STATUS_SCRIPT_REQUIRED = ("textContent", "doc_subscribe", '"connect"', "setTimeout", "try", "expires_in_s")
+# Regexes: the socket guard keeps setupForm (run many times) from registering listeners twice; the
+# `state.ticket = null` leave-page step keeps a left ticket's signals from showing (ADR-008 decision 6).
+STATUS_SCRIPT_REQUIRED = (
+	r"textContent",
+	r"doc_subscribe",
+	r'"connect"',
+	r"setTimeout",
+	r"try \{",
+	r"catch \(",
+	r"expires_in_s",
+	r"if \(state\.socket !== socket\)",
+	r"state\.ticket = null",
+	r"if \(state\.ticket\)",
+)
 
 LEGACY_NAMES = ("HD Ticket Comment", "commented_by", "comment_email", "comment_by")
 # Design 3.5 (amendment 1c) tells `get_record` to DROP comment_email/comment_by from a Comment; this one
@@ -760,8 +773,8 @@ class TestArchitecture(unittest.TestCase):
 		self.assertIn("function setupForm({ doc, router })", script)
 		for pattern in STATUS_SCRIPT_FORBIDDEN:
 			self.assertIsNone(re.search(pattern, script, re.MULTILINE), f"forbidden in script: {pattern}")
-		for token in STATUS_SCRIPT_REQUIRED:
-			self.assertIn(token, script)
+		for pattern in STATUS_SCRIPT_REQUIRED:
+			self.assertIsNotNone(re.search(pattern, script), f"missing in script: {pattern}")
 
 	def test_status_event_name_matches_script(self):
 		match = re.search(r'^AGENT_STATUS_EVENT = "([^"]+)"', self.sources[CONSTANTS_FILE], re.MULTILINE)

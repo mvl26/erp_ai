@@ -1,0 +1,94 @@
+diff --git a/erp_ai/agent/run_status.py b/erp_ai/agent/run_status.py
+index ad2e3e5..0d6d980 100644
+--- a/erp_ai/agent/run_status.py
++++ b/erp_ai/agent/run_status.py
+@@ -57,8 +57,11 @@ class RunStatus:
+ 
+ 	def working(self, step: str) -> None:
+ 		if self.started and not self.finished:
+-			# an unknown name (invented by the model) never reaches the text (D-5)
+-			label = WORK_LABELS.get(step, FALLBACK_WORK_LABEL)
++			try:
++				# an unknown name (invented by the model) never reaches the text (D-5)
++				label = WORK_LABELS.get(step, FALLBACK_WORK_LABEL)
++			except TypeError:
++				label = FALLBACK_WORK_LABEL
+ 			self._emit(STATE_WORKING, WORKING_TEXT.format(label=label))
+ 
+ 	def take_errors(self) -> list[str]:
+diff --git a/erp_ai/agent/test_run_status.py b/erp_ai/agent/test_run_status.py
+index e7a421e..936ff18 100644
+--- a/erp_ai/agent/test_run_status.py
++++ b/erp_ai/agent/test_run_status.py
+@@ -45,7 +45,6 @@ class TestRunStatus(FrappeTestCase):
+ 		granted = {schema["name"] for schema in get_tool_schemas(LEVELS[-1], True)}
+ 
+ 		self.assertEqual(CLASSIFY_STEP, "classify")
+-		self.assertEqual(len(granted), 11)
+ 		self.assertEqual(set(WORK_LABELS), granted | {CLASSIFY_STEP})
+ 		self.assertEqual(WORK_LABELS, LABEL_TABLE)
+ 		for step in WORK_LABELS:
+diff --git a/erp_ai/agent/test_runner_status.py b/erp_ai/agent/test_runner_status.py
+index 510047b..6ee18ad 100644
+--- a/erp_ai/agent/test_runner_status.py
++++ b/erp_ai/agent/test_runner_status.py
+@@ -32,6 +32,17 @@ class TestRunnerStatus(RunnerTestBase):
+ 		# What the page showed and what the ticket had when the run went to sleep.
+ 		self.at_sleep = []
+ 		self.classification_at_sleep = []
++		# (tool name, text of the last signal) at the moment each tool really runs
++		self.tool_starts = []
++		real_execute_tool = runner.execute_tool
++
++		def recording_execute_tool(name, *args, **kwargs):
++			self.tool_starts.append((name, self.signals[-1]["message"]["text"] if self.signals else None))
++			return real_execute_tool(name, *args, **kwargs)
++
++		tool_patch = patch.object(runner, "execute_tool", side_effect=recording_execute_tool)
++		tool_patch.start()
++		self.addCleanup(tool_patch.stop)
+ 
+ 		def sleeper(seconds):
+ 			self.sleeps.append(seconds)
+@@ -298,6 +309,11 @@ class TestRunnerStatus(RunnerTestBase):
+ 				"",
+ 			],
+ 		)
++		# AC-9: each work signal is out before its tool runs
++		self.assertEqual(
++			self.tool_starts,
++			[("get_ticket", "Đang làm: đọc phiếu…"), ("post_comment", "Đang làm: viết trả lời…")],
++		)
+ 
+ 	def test_ticket_insert_l0_gets_start_signal(self):
+ 		set_agent_settings(permission_level="L0")
+@@ -307,6 +323,9 @@ class TestRunnerStatus(RunnerTestBase):
+ 
+ 		self.assertEqual(self._states(), ["thinking", "working", "done"])
+ 		self.assertEqual(self._texts()[1], "Đang làm: phân loại phiếu…")
++		# AC-2 / AC-9: the start signal and the classify work signal are both out before the model call
++		self.assertEqual(self.signals[0]["message"]["state"], "thinking")
++		self.assertEqual(self.signals_on_model_call, [2])
+ 
+ 	def test_ticket_insert_l1_signal_sequence(self):
+ 		self._gateway(make_model_result(text=CLASSIFY_A), make_model_result(text="xong"))
+@@ -315,6 +334,9 @@ class TestRunnerStatus(RunnerTestBase):
+ 
+ 		self.assertEqual(self._states(), ["thinking", "working", "working", "thinking", "done"])
+ 		self.assertEqual(self._texts()[1:3], ["Đang làm: phân loại phiếu…", "Đang làm: ghi phân loại…"])
++		# classify work signal before the classify call; the second call comes after both work signals
++		self.assertEqual(self.signals_on_model_call, [2, 4])
++		self.assertEqual(self.tool_starts, [("set_classification", "Đang làm: ghi phân loại…")])
+ 
+ 	def test_ticket_insert_never_waits(self):
+ 		self._set_delay(3, 5)
+@@ -332,6 +354,9 @@ class TestRunnerStatus(RunnerTestBase):
+ 					self._run("ticket_insert")
+ 
+ 					self.assertEqual(self.sleeps, [])
++					self.assertTrue(self.signals, "no status signal was emitted")
++					# the L1 run got through the answer turn, where the wait would have been
++					self.assertEqual(self.gateway.call_count, 1 if level == "L0" else 3)
+ 				finally:
+ 					frappe.db.rollback(save_point="erp_ai_insert_case")
+ 

@@ -575,6 +575,7 @@ class TestRoutingSla(RoutingTestBase):
 		logger = MagicMock()
 		captured = []
 		real_route = runner._route
+		before_slas = frappe.db.count(SLA_DOCTYPE)
 
 		def spy(*args):
 			captured.append(real_route(*args))
@@ -586,6 +587,8 @@ class TestRoutingSla(RoutingTestBase):
 		):
 			self._run()
 
+		self._assert_saved_with_priority()
+		self.assertEqual(frappe.db.count(SLA_DOCTYPE), before_slas)
 		(action,) = self._sla_actions()
 		self.assertEqual((action["ok"], action["name"]), (False, self.ticket.name))
 		self.assertEqual(action["reason"], NO_SLA_REASON)
@@ -593,6 +596,11 @@ class TestRoutingSla(RoutingTestBase):
 		self.assertEqual(factory.call_args_list[-1].args, (LOGGER_NAME,))
 		self.assertIn(NO_SLA_REASON, logger.warning.call_args.args)
 		self.assertEqual(captured, [[NO_SLA]])
+
+	def _assert_saved_with_priority(self):
+		# AC-11: no SLA does not stop the save; A with importance 3 is raised to Urgent (A-11)
+		self.assertEqual(frappe.db.get_value("HD Ticket", self.ticket.name, "priority"), "Urgent")
+		self.assertEqual(self._single_entry().applied, 1)
 
 	def _configure_person(self, person):
 		mapping = {"A": {"ticket_type": ROUTE_TYPE, "agent_group": make_team(self), "priority": "High"}}
@@ -617,9 +625,12 @@ class TestRoutingSla(RoutingTestBase):
 		self._two_calls()
 		logger = MagicMock()
 		before_comments = self._comment_count()
+		before_slas = frappe.db.count(SLA_DOCTYPE)
 		with patch.object(frappe, "logger", return_value=logger):
 			self._run()
 
+		self._assert_saved_with_priority()
+		self.assertEqual(frappe.db.count(SLA_DOCTYPE), before_slas)
 		logger.warning.assert_called_once()
 		self.assertEqual(self._comment_count(), before_comments + 1)
 		self.assertIn(NO_SLA, self._comments_posted())
@@ -630,8 +641,11 @@ class TestRoutingSla(RoutingTestBase):
 		self._configure_person(AGENT_USER)
 		self._two_calls()
 		before_comments = self._comment_count()
+		before_slas = frappe.db.count(SLA_DOCTYPE)
 		self._run()
 
+		self._assert_saved_with_priority()
+		self.assertEqual(frappe.db.count(SLA_DOCTYPE), before_slas)
 		self.assertEqual(self._comment_count(), before_comments + 1)
 		text = self._comments_posted()
 		self.assertIn(NO_SLA, text)
@@ -642,8 +656,11 @@ class TestRoutingSla(RoutingTestBase):
 		set_agent_settings(auto_assign_enabled=0)
 		self._two_calls()
 		before_comments = self._comment_count()
+		before_slas = frappe.db.count(SLA_DOCTYPE)
 		self._run()
 
+		self._assert_saved_with_priority()
+		self.assertEqual(frappe.db.count(SLA_DOCTYPE), before_slas)
 		self.assertEqual(self._comment_count(), before_comments + 1)
 		self.assertIn(NO_SLA, self._comments_posted())
 
@@ -896,18 +913,32 @@ class TestRoutingAssign(AssignTestBase):
 		self.assertEqual([call["task"] for call in self.gateway.calls], ["classify", "reason"])
 
 	def test_changed_default_person_assigned_next_run(self):
+		# A and B both route to the team; only B's default person changes between the two runs
+		mapping = {
+			cat: {"ticket_type": ROUTE_TYPE, "agent_group": self.team, "priority": "High"} for cat in "AB"
+		}
+		other = make_active_agent(self)
+
+		def configure(person_b):
+			assignees = {cat: {"default": self.person, "prefixes": {}} for cat in "ABCF"}
+			assignees["B"]["default"] = person_b
+			set_agent_settings(
+				category_mapping=json.dumps(mapping), routing_rules=make_routing_rules(assignees=assignees)
+			)
+
+		configure(self.person)
 		self._run()
 		self.assertEqual(self._assigned_to(), [self.person])
 
-		other = make_active_agent(self)
-		self._configure(self.team, other)
+		configure(other)
 		second = make_ticket(subject=f"{PREFIX}runner second ticket")
 		self.gateway.results = [
-			make_model_result(text=CLASSIFY_SCORED),
+			make_model_result(text=CLASSIFY_B2),
 			make_model_result(stop_reason="end_turn"),
 		]
 		runner.run_for_ticket(second.name, "ticket_insert")
 
+		self.assertEqual(frappe.db.get_value("HD Ticket", second.name, "agent_group"), self.team)
 		self.assertEqual(self._assigned_to(second), [other])
 		self.assertEqual(self._assigned_to(), [self.person])
 
@@ -968,6 +999,11 @@ class TestRoutingNoOverride(AssignTestBase):
 		self.assertEqual(self._task_count(), 0)
 		self.assertEqual(self._comment_count(), before_comments)
 		self.assertEqual([a["tool"] for a in json.loads(self._single_entry().actions)], ["apply_route"])
+		# the classification is still written: the route action succeeded and the ticket holds it
+		(route,) = self._action("apply_route")
+		self.assertTrue(route["ok"])
+		row = frappe.db.get_value("HD Ticket", self.ticket.name, ["agent_group", "priority"], as_dict=True)
+		self.assertEqual((row.agent_group, row.priority), (self.team, "Urgent"))
 
 	def test_l0_no_todo_no_task(self):
 		set_agent_settings(permission_level="L0")

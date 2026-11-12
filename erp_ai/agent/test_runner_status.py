@@ -342,6 +342,7 @@ class TestRunnerStatus(RunnerTestBase):
 		self._set_delay(3, 5)
 		for level in ("L0", "L1"):
 			with self.subTest(level):
+				self.signals.clear()
 				frappe.db.savepoint("erp_ai_insert_case")
 				try:
 					set_agent_settings(permission_level=level)

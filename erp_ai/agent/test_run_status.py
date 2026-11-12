@@ -65,6 +65,16 @@ class TestRunStatus(FrappeTestCase):
 		self.assertEqual(text, f"Đang làm: {FALLBACK_WORK_LABEL}…")
 		self.assertNotIn("drop_all_tables", text)
 
+	def test_unhashable_step_never_throws(self):
+		for step in (["x"], {}):
+			with self.subTest(repr(step)):
+				status = self._status()
+
+				status.working(step)
+
+				self.assertEqual(len(self.signals), 1)
+				self.assertEqual(self.signals[0]["message"]["text"], f"Đang làm: {FALLBACK_WORK_LABEL}…")
+
 	def test_payload_has_exactly_seven_keys(self):
 		status = self._status()
 

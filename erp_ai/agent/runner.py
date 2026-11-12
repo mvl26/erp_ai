@@ -20,8 +20,10 @@ from erp_ai.agent.tools.route_ticket import (
 	NO_SLA,
 	REASON_ASSIGN_FAILED,
 	REASON_NO_VALID_ASSIGNEE,
+	REASON_TASK_NOT_ASSIGNED,
 	apply_route,
 	assign_owner,
+	create_routed_task,
 	post_routing_comment,
 )
 from erp_ai.constants import (
@@ -60,6 +62,7 @@ BAD_MAPPING_ERROR = "category_mapping không hợp lệ, không có giá trị d
 BAD_ROUTING_ERROR = "routing_rules không hợp lệ, định tuyến dùng giá trị rỗng"
 NO_SCORE_REASON = "không có điểm"
 NO_SLA_REASON = "chưa có SLA áp vào phiếu"
+REASON_TASK_EXISTS = "phiếu đã có Task liên kết"
 ROUTE_SAVEPOINT = "erp_ai_route"
 # One write unit after (u1) (assign, comment) nests inside the savepoint above.
 ROUTE_UNIT_SAVEPOINT = "erp_ai_route_unit"
@@ -300,7 +303,7 @@ def _route(log_name, classification, decision, context, auto_assign, subject):
 	committed before and survives). Nothing is committed until both are written.
 	"""
 	actions, lines, errors = [], [], []
-	assigned = commented = None
+	assigned = task = commented = None
 	sla = None
 	frappe.db.savepoint(ROUTE_SAVEPOINT)
 	try:
@@ -309,9 +312,11 @@ def _route(log_name, classification, decision, context, auto_assign, subject):
 			sla = _check_sla(classification.category, context, actions, lines)
 			if auto_assign:
 				assigned = _assign_unit(decision, context, actions, lines, errors)
+			if assigned and decision.needs_task:
+				task = _task_unit(assigned, subject, classification, context, actions, lines, errors)
 			commented = _comment_unit(lines, context, actions, errors)
-		_record_route(log_name, result, decision, assigned, actions, errors)
-		_log_route_summary(context, result, assigned, commented, sla)
+		_record_route(log_name, result, decision, assigned, task, actions, errors)
+		_log_route_summary(context, result, assigned, task, commented, sla)
 	except Exception:
 		frappe.db.rollback(save_point=ROUTE_SAVEPOINT)
 		raise
@@ -379,6 +384,33 @@ def _assign_unit(decision, context, actions, lines, errors):
 	return None
 
 
+def _task_unit(user, subject, classification, context, actions, lines, errors):
+	"""(u3): one linked Task for `user`, created and given in one savepoint. Returns the Task name or None.
+
+	A ticket that already has a Task, whoever made it, gets no second one. An exception (document sharing
+	off) undoes the Task and its ToDo, and adds the sentence asking the team lead to act (ADR-020 QĐ 7).
+	"""
+	ticket = context.ticket_name
+	if site_facts.has_linked_task(ticket):
+		actions.append(_route_action("create_routed_task", "Task", None, False, REASON_TASK_EXISTS))
+		return None
+	failures = len(errors)
+	result = _run_unit(
+		"create_routed_task",
+		lambda: create_routed_task(user, subject, classification, context),
+		"Task",
+		None,
+		actions,
+		errors,
+	)
+	if result is None:
+		if len(errors) > failures:
+			lines.append(ASSIGN_REQUEST.format(reason=REASON_TASK_NOT_ASSIGNED))
+		return None
+	actions.append(_route_action("create_routed_task", "Task", result["task"], True))
+	return result["task"]
+
+
 def _comment_unit(lines, context, actions, errors):
 	"""(u4): post the gathered sentences as at most one comment. Returns True when it was posted."""
 	if not lines:
@@ -436,7 +468,7 @@ def _check_sla(category, context, actions, lines):
 	return state
 
 
-def _record_route(log_name, result, decision, assigned, actions, errors):
+def _record_route(log_name, result, decision, assigned, task, actions, errors):
 	"""Update the `classify` entry once (design 3.5)."""
 	updates = {"applied": 1 if result else 0, "actions": json.dumps(actions, ensure_ascii=False)}
 	if result:
@@ -444,6 +476,8 @@ def _record_route(log_name, result, decision, assigned, actions, errors):
 		after = {"ticket": result["after"]} if result.get("after") else {}
 		if assigned:
 			after["assign"] = [assigned]
+		if task:
+			after["task"] = task
 		for column, value in (("value_before", before), ("value_after", after)):
 			if value:
 				updates[column] = json.dumps(value, ensure_ascii=False)
@@ -459,14 +493,15 @@ def _record_route(log_name, result, decision, assigned, actions, errors):
 	frappe.db.set_value(LOG_DOCTYPE, log_name, updates, update_modified=False)
 
 
-def _log_route_summary(context, result, assigned, commented, sla):
+def _log_route_summary(context, result, assigned, task, commented, sla):
 	"""One info line, codes and numbers only (STD-OPS-5, NFR-4')."""
 	frappe.logger(LOGGER_NAME).info(
-		"erp_ai route ticket=%s run_id=%s applied=%d assigned=%d comment=%d sla=%s",
+		"erp_ai route ticket=%s run_id=%s applied=%d assigned=%d task=%d comment=%d sla=%s",
 		context.ticket_name,
 		context.run_id,
 		1 if result else 0,
 		1 if assigned else 0,
+		1 if task else 0,
 		1 if commented else 0,
 		sla or "-",
 	)

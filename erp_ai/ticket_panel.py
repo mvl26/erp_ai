@@ -109,6 +109,13 @@ def _message_content(text) -> str:
 
 @frappe.whitelist(methods=["POST"])
 def send_message(ticket: str, text: str) -> dict:
+	"""Post the typed text as a Comment on the ticket, owned by the caller (B-6).
+
+	Input: ticket name; text, 1-PANEL_MAX_MESSAGE_CHARS characters after strip().
+	Output: {"comment": <Comment name>}.
+	Errors: PermissionError (not an active agent, no read on the ticket, or the agent account);
+	ValidationError (missing ticket, empty or too long text); FrappeTypeError (text not a string).
+	"""
 	if not isinstance(ticket, str) or not ticket.strip():
 		frappe.throw(_("Thiếu mã phiếu."), frappe.ValidationError)
 	ticket = ticket.strip()

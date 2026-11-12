@@ -15,6 +15,7 @@ from erp_ai.agent.tools.route_ticket import (
 	REASON_ASSIGN_FAILED,
 	REASON_NO_VALID_ASSIGNEE,
 	REASON_TASK_NOT_ASSIGNED,
+	TASK_REQUEST,
 	apply_route,
 	assign_owner,
 	create_routed_task,
@@ -416,7 +417,6 @@ class TestRoutingComment(RouteTicketTestCase):
 		reasons = {
 			REASON_NO_VALID_ASSIGNEE: "cấu hình không có người hợp lệ",
 			REASON_ASSIGN_FAILED: "gán người không thành công",
-			REASON_TASK_NOT_ASSIGNED: "không giao được Task cho người phụ trách (chia sẻ tài liệu đang tắt)",
 		}
 		for reason, text in reasons.items():
 			with self.subTest(reason=text):
@@ -425,6 +425,16 @@ class TestRoutingComment(RouteTicketTestCase):
 					ASSIGN_REQUEST.format(reason=reason),
 					f"Bot chưa gán được người phụ trách cho phiếu này: {text}. Nhờ trưởng nhóm phân công.",
 				)
+
+	def test_task_refused_sentence_is_its_own(self):
+		self.assertEqual(REASON_TASK_NOT_ASSIGNED, "chia sẻ tài liệu đang tắt")
+		sentence = TASK_REQUEST.format(reason=REASON_TASK_NOT_ASSIGNED)
+		self.assertEqual(
+			sentence,
+			"Bot đã gán người phụ trách cho phiếu nhưng không giao được Task: chia sẻ tài liệu đang tắt. "
+			"Nhờ trưởng nhóm giao Task.",
+		)
+		self.assertNotIn("chưa gán được người", sentence)
 
 
 class TestCreateRoutedTask(RouteTicketTestCase):

@@ -32,7 +32,7 @@ Cài và migrate (chạy lại được, không ghi đè cấu hình đã lưu) 
 
 ### Cấu hình và bật
 
-Mở `/app/erp-ai-setting` (chỉ System Manager):
+Mở `/app/erp-ai-setting` (chỉ System Manager). Mỗi field trên các form `ERP AI Setting`, `ERP AI Credential` và `ERP AI Log` có mô tả ngay dưới ô nhập (đơn vị, khoảng hợp lệ, ví dụ, field nào do hệ thống tự ghi), và form chia thành các nhóm có tiêu đề.
 
 1. Thêm khóa API ở bảng khóa; bấm "Kiểm tra khóa" để thử từng khóa.
 2. Đặt `monthly_budget_usd` (mặc định 10), bốn đơn giá token (mặc định 0; phải > 0 mới bật được) và model (không có giá trị nào viết cứng trong mã).
@@ -58,6 +58,25 @@ Ba trường trên `/app/erp-ai-setting`:
 Trễ được tính từ lúc chỉ báo bắt đầu (thời gian model chạy được trừ vào), và không áp dụng cho phiếu mới. Đặt `0` và `0` để không trễ.
 
 **Cảnh báo:** chỉ báo chạy bằng bản ghi HD Form Script `ERP AI Agent Status`, nội dung lấy từ `erp_ai/public/js/agent_status_indicator.js`. Mỗi lần `bench --site <site> migrate` (và `install-app`) đặt lại bản ghi này theo tệp trong repo, nên mọi sửa tay trên site bị ghi đè; gỡ app thì bản ghi bị xóa. Sửa tệp `.js` xong phải chạy `migrate`, restart là không đủ. Sau mỗi lần nâng cấp Helpdesk hoặc Frappe, kiểm lại chỉ báo bằng tay: các bước ở `docs/team/features/FEAT-002/acceptance.md`, mục "Bước tay cho người".
+
+### Khu vực trao đổi với bot trên trang phiếu
+
+Khu vực "Hướng giải quyết & trao đổi với bot" cho HD Agent đọc hướng giải quyết của AI, xem các lần hỏi–đáp với bot và hỏi bot ngay trên trang phiếu, không phải nhớ từ khóa. Chạy bằng cùng bản ghi HD Form Script `ERP AI Agent Status` ở mục trên (cùng cảnh báo: sửa `.js` xong phải `migrate`).
+
+**Mở khu vực.** Mở phiếu ở `/helpdesk/tickets/<id>` trên máy tính (cửa sổ rộng từ 640 px), bấm nút "Trao đổi với bot" ở đầu trang. Một ngăn hiện bên phải, bấm "Đóng" để đóng. Nút không có trên cửa sổ hẹp hoặc bản di động, và không có trên cổng khách (`/helpdesk/my-tickets/<id>`).
+
+**Trong khu vực có:**
+- 4 mục AI chỉ đọc: hướng giải quyết, độ tin cậy, phân loại bởi, AI cập nhật lúc. Mục chưa có giá trị hiện "Chưa có". Không sửa được ở đây.
+- Luồng tin: các comment có từ khóa kích hoạt và các comment của bot trên phiếu này, cũ ở trên, mới ở dưới; tin của bot có nhãn "Bot". Nội dung hiện dạng chữ thuần.
+- Chỉ báo "Đang suy nghĩ…" khi bot đang chạy (nằm trong ngăn khi ngăn mở).
+
+**Gửi câu hỏi.** Gõ câu hỏi vào ô nhập rồi nhấn Enter (hoặc bấm "Gửi"); Shift+Enter để xuống dòng. Không cần gõ từ khóa: hệ thống tự thêm từ khóa kích hoạt vào cuối tin nếu bạn chưa gõ. Tin dài tối đa 2000 ký tự, không gửi được tin rỗng. Tin gửi đi là một comment bình thường của chính bạn trên phiếu (hiện cả ở tab Comments), chữ như `<b>` được hiện nguyên chữ chứ không thành định dạng. Gửi thất bại (mất mạng, hết quyền) thì ngăn báo "Không gửi được tin" và giữ nguyên chữ bạn đã gõ. Khu vực tự cập nhật khi có comment mới hoặc khi bot đổi field AI, không cần tải lại trang.
+
+**Khi nào bot không trả lời.** Gửi tin chỉ tạo comment; việc bot có trả lời hay không do cùng các chốt như khi gõ từ khóa ở tab Comments, và khu vực không tự báo lý do. Bot có thể không trả lời khi: agent đang tắt; mức đang là `L0` (chỉ ghi nhận); phiếu có cờ "không dùng AI" hoặc thuộc nhóm loại trừ; hoặc đã hết lượt hôm nay (xem `ERP AI Log` để biết lý do bỏ qua). Ngăn cũng hiện dòng nhắc này. Nếu quản trị đặt `trigger_keyword` có ký tự `<`, `>` hoặc `&`, khu vực từ chối gửi và báo quản trị viên đổi từ khóa (ô Comments cũng không kích hoạt được bot với từ khóa đó).
+
+**Quyền.** Chỉ HD Agent đang hoạt động và có quyền đọc phiếu dùng được khu vực. Khu vực chỉ đọc và chỉ gửi qua hai method `erp_ai.ticket_panel.get_panel_data` và `erp_ai.ticket_panel.send_message` (POST, không cho Guest); không bao giờ hiện từ khóa hay cấu hình agent, không sửa hay xóa tin, không đính kèm, không nhắc tên.
+
+**Sau mỗi lần nâng cấp Helpdesk hoặc Frappe**, chạy lại bằng tay hai bước ở `docs/team/features/FEAT-003/acceptance.md`, mục "Bước tay J1 cho người": J1 AC-6 (nút, tiêu đề, gửi bằng Enter, các tab cũ vẫn chạy) và J1 AC-11 (cập nhật trực tiếp bằng hai phiên, chỉ báo chỉ một nơi). Khu vực dựa vào điểm mở rộng `actions` của HD Form Script và hai sự kiện `docinfo_update`, `doc_update` của Frappe; nâng cấp có thể làm chúng đổi.
 
 ### Bộ đánh giá offline
 

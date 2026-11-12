@@ -22,7 +22,6 @@
   "section_model",
   "model_classify_default",
   "trigger_keyword",
-  "section_reply",
   "thinking_text",
   "answer_delay_min_s",
   "answer_delay_max_s",
@@ -141,7 +140,7 @@
   {
    "fieldname": "section_model",
    "fieldtype": "Section Break",
-   "label": "Model và từ khóa kích hoạt"
+   "label": "Model, từ khóa và chỉ báo trả lời"
   },
   {
    "fieldname": "model_classify_default",
@@ -156,11 +155,6 @@
    "label": "Từ khóa kích hoạt",
    "default": "@ai",
    "description": "Bình luận trên phiếu chứa cụm này (không phân biệt hoa thường) thì agent được gọi. Ví dụ: @ai. Không được để trống khi bật agent."
-  },
-  {
-   "fieldname": "section_reply",
-   "fieldtype": "Section Break",
-   "label": "Chỉ báo và độ trễ trả lời"
   },
   {
    "fieldname": "thinking_text",

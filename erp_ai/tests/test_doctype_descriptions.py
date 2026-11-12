@@ -48,13 +48,13 @@ DOCTYPE_CONFIG = {
 			"alert_recipients": ("mỗi dòng", "canhbao@congty.vn", "dấu phẩy"),
 			"credentials": ("không trùng", "Kiểm tra khóa"),
 		},
+		"section_count": 6,
 		"read_only_fields": ("spent_this_month_usd",),
 		"sections": (
 			("section_activation", "Bật và mức quyền", "enabled"),
 			("section_limits", "Giới hạn mỗi lần chạy", "max_turns_per_run"),
 			("section_budget", "Ngân sách và đơn giá", "monthly_budget_usd"),
-			("section_model", "Model và từ khóa kích hoạt", "model_classify_default"),
-			("section_reply", "Chỉ báo và độ trễ trả lời", "thinking_text"),
+			("section_model", "Model, từ khóa và chỉ báo trả lời", "model_classify_default"),
 			("section_routing", "Phân loại và nhóm loại trừ", "excluded_teams"),
 			("section_alerts", "Cảnh báo và khóa API", "alert_recipients"),
 		),
@@ -129,6 +129,7 @@ class TestDoctypeDescriptions(FrappeTestCase):
 			with self.subTest(doctype=doctype):
 				breaks = section_breaks(doctype_json)
 				self.assertGreaterEqual(len(breaks), 2)
+				self.assertEqual(len(breaks), config["section_count"])
 				expected = [(name, label) for name, label, _first in config["sections"]]
 				self.assertEqual([(b["fieldname"], b.get("label")) for b in breaks], expected)
 				for section in breaks:

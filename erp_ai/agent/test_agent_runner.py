@@ -489,6 +489,21 @@ class TestRunnerL1Classification(RunnerTestBase):
 		(entry,) = self._entries(entry_type="classify")
 		return entry
 
+	def _slow_sla_action(self):
+		"""Patch the applied SLA to a fixed slow one; return the `sla_check` action built from that fact."""
+		fact = {"sla": f"{PREFIX}SLA", "priority": "High", "resolution_s": 86400}
+		patcher = patch.object(runner.site_facts, "applied_sla", return_value=fact)
+		patcher.start()
+		self.addCleanup(patcher.stop)
+		expected = json.loads(make_routing_rules())["expected_sla"]["A"]["resolution_min"]
+		return {
+			"tool": "sla_check",
+			"doctype": "HD Ticket",
+			"name": self.ticket.name,
+			"ok": False,
+			"reason": f"SLA {fact['sla']} xử lý {fact['resolution_s'] // 60} phút > mong đợi {expected} phút (A)",
+		}
+
 	def test_l1_applies_mapping_confidence_and_hint(self):
 		before = self._ticket_row()
 		self.gateway.results = [
@@ -554,6 +569,7 @@ class TestRunnerL1Classification(RunnerTestBase):
 		unknown = {"A": {"ticket_type": f"{PREFIX}không-có", "agent_group": "", "priority": ""}}
 		set_agent_settings(category_mapping=json.dumps(unknown))
 		before = self._ticket_row()
+		sla_action = self._slow_sla_action()
 		self._run()
 
 		# ADR-020 QĐ 1, QĐ 6: the ticket is always saved with the AI fields, even when no route value applies.
@@ -571,13 +587,7 @@ class TestRunnerL1Classification(RunnerTestBase):
 			json.loads(entry.actions),
 			[
 				{"tool": "apply_route", "doctype": "HD Ticket", "name": self.ticket.name, "ok": True},
-				{
-					"tool": "sla_check",
-					"doctype": "HD Ticket",
-					"name": self.ticket.name,
-					"ok": False,
-					"reason": "SLA Standard xử lý 1440 phút > mong đợi 480 phút (A)",
-				},
+				sla_action,
 			],
 		)
 		skipped = json.loads(entry.skipped_fields)
@@ -608,6 +618,7 @@ class TestRunnerL1Classification(RunnerTestBase):
 		unknown = {"A": {"ticket_type": f"{PREFIX}không-có", "agent_group": "", "priority": ""}}
 		set_agent_settings(category_mapping=json.dumps(unknown))
 		before = self._ticket_row()
+		sla_action = self._slow_sla_action()
 		self._run()
 
 		# ADR-020 QĐ 1, QĐ 6: the ticket is always saved with the AI fields; no route field changes.
@@ -625,13 +636,7 @@ class TestRunnerL1Classification(RunnerTestBase):
 			json.loads(entry.actions),
 			[
 				{"tool": "apply_route", "doctype": "HD Ticket", "name": self.ticket.name, "ok": True},
-				{
-					"tool": "sla_check",
-					"doctype": "HD Ticket",
-					"name": self.ticket.name,
-					"ok": False,
-					"reason": "SLA Standard xử lý 1440 phút > mong đợi 480 phút (A)",
-				},
+				sla_action,
 			],
 		)
 		self.assertEqual(

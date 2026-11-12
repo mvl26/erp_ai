@@ -294,7 +294,7 @@ def _route(log_name, classification, decision, context, auto_assign, subject):
 		result = _apply_route_unit(decision, classification, context, actions, errors)
 		sla = _check_sla(classification.category, context, actions, lines) if result else None
 		_record_route(log_name, result, decision, actions, errors)
-		_log_route_summary(context, result, sla, lines)
+		_log_route_summary(context, result, sla)
 	except Exception:
 		frappe.db.rollback(save_point=ROUTE_SAVEPOINT)
 		raise
@@ -372,15 +372,14 @@ def _record_route(log_name, result, decision, actions, errors):
 	frappe.db.set_value(LOG_DOCTYPE, log_name, updates, update_modified=False)
 
 
-def _log_route_summary(context, result, sla, lines):
+def _log_route_summary(context, result, sla):
 	"""One info line, codes and numbers only (STD-OPS-5, NFR-4')."""
 	frappe.logger(LOGGER_NAME).info(
-		"erp_ai route ticket=%s run_id=%s applied=%d sla=%s lines=%d",
+		"erp_ai route ticket=%s run_id=%s applied=%d sla=%s",
 		context.ticket_name,
 		context.run_id,
 		1 if result else 0,
 		sla or "-",
-		len(lines),
 	)
 
 

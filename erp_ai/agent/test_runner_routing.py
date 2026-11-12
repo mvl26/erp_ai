@@ -8,8 +8,9 @@ from helpdesk.test_utils import make_ticket
 from erp_ai.agent import runner
 from erp_ai.agent.prompts import build_classify_request
 from erp_ai.agent.routing import departments, load_routing_config
+from erp_ai.agent.runner import BAD_ROUTING_ERROR, NO_SLA_REASON
 from erp_ai.agent.test_agent_runner import CLASSIFY_A, CLASSIFY_FIELDS, PREFIX, RunnerTestBase
-from erp_ai.constants import AGENT_USER, CLASSIFIED_BY_HUMAN
+from erp_ai.constants import AGENT_USER, CLASSIFIED_BY_HUMAN, LOGGER_NAME
 from erp_ai.test_utils import (
 	make_active_agent,
 	make_model_result,
@@ -289,12 +290,49 @@ class TestRoutingUnit(RoutingTestBase):
 	def test_route_info_line_has_codes_only(self):
 		self._two_calls()
 		logger = MagicMock()
+		fact = {"sla": f"{PREFIX}SLA", "priority": "High", "resolution_s": 60}
+		with (
+			patch.object(frappe, "logger", return_value=logger) as factory,
+			patch.object(runner.site_facts, "applied_sla", return_value=fact),
+		):
+			self._run()
+
+		factory.assert_called_with(LOGGER_NAME)
+		lines = [call.args for call in logger.info.call_args_list if call.args[0].startswith("erp_ai route")]
+		self.assertEqual(len(lines), 1)
+		template, ticket, run_id, applied, sla = lines[0]
+		self.assertNotIn("lines=", template)
+		self.assertEqual((ticket, applied, sla), (self.ticket.name, 1, "ok"))
+		self.assertTrue(run_id)
+
+	def test_broken_routing_rules_skip_sla_check_and_log_skipped(self):
+		set_agent_settings(routing_rules="{không phải json")
+		self._two_calls()
+		logger = MagicMock()
 		with patch.object(frappe, "logger", return_value=logger):
 			self._run()
 
-		lines = [call.args for call in logger.info.call_args_list if call.args[0].startswith("erp_ai route")]
-		self.assertEqual(len(lines), 1)
-		self.assertIn(self.ticket.name, lines[0])
+		entry = self._single_entry()
+		self.assertEqual(entry.applied, 1)
+		self.assertIn(BAD_ROUTING_ERROR, entry.error)
+		self.assertEqual(
+			[a["tool"] for a in json.loads(entry.actions)],
+			["apply_route"],
+		)
+		logger.warning.assert_not_called()
+		(info,) = [c.args for c in logger.info.call_args_list if c.args[0].startswith("erp_ai route")]
+		self.assertEqual((info[3], info[4]), (1, "skipped"))
+
+	def test_apply_exception_keeps_earlier_error_and_adds_its_own(self):
+		set_agent_settings(routing_rules="{không phải json")
+		self._two_calls()
+		with patch.object(runner, "apply_route", side_effect=ValueError("x")):
+			self._run()
+
+		entry = self._single_entry()
+		self.assertEqual(entry.applied, 0)
+		self.assertIn(BAD_ROUTING_ERROR, entry.error)
+		self.assertIn("route apply_route: ValueError", entry.error)
 
 
 class TestRoutingSla(RoutingTestBase):
@@ -360,12 +398,18 @@ class TestRoutingSla(RoutingTestBase):
 			return captured[-1]
 
 		before_comments = self._comment_count()
-		with patch.object(frappe, "logger", return_value=logger), patch.object(runner, "_route", spy):
+		with (
+			patch.object(frappe, "logger", return_value=logger) as factory,
+			patch.object(runner, "_route", spy),
+		):
 			self._run()
 
 		(action,) = self._sla_actions()
 		self.assertEqual((action["ok"], action["name"]), (False, self.ticket.name))
+		self.assertEqual(action["reason"], NO_SLA_REASON)
 		logger.warning.assert_called_once()
+		self.assertEqual(factory.call_args_list[-1].args, (LOGGER_NAME,))
+		self.assertIn(NO_SLA_REASON, logger.warning.call_args.args)
 		self.assertEqual(captured, [["Chưa có SLA áp vào phiếu, cần System Manager cấu hình."]])
 		self.assertEqual(self._comment_count(), before_comments)
 
@@ -393,10 +437,26 @@ class TestRoutingSla(RoutingTestBase):
 			return set_value(doctype, *args, **kwargs)
 
 		before_comments = self._comment_count()
-		with patch.object(frappe.db, "set_value", side_effect=spy):
+		logger = MagicMock()
+		routed = []
+		real_route = runner._route
+
+		def route_spy(*args):
+			routed.append(real_route(*args))
+			return routed[-1]
+
+		with (
+			patch.object(frappe.db, "set_value", side_effect=spy),
+			patch.object(frappe, "logger", return_value=logger),
+			patch.object(runner, "_route", route_spy),
+		):
 			self._run()
 
 		self.log_error.assert_not_called()
+		# the SLA check stops after (u1) fails: no sla_check action, no warning, no sentence
+		self.assertEqual([a["tool"] for a in json.loads(self._single_entry().actions)], ["apply_route"])
+		logger.warning.assert_not_called()
+		self.assertEqual(routed, [[]])
 		self.assertNotIn("HD Ticket", ticket_writes)
 		self.assertEqual(ticket_writes, ["ERP AI Log"])
 		self.assertEqual(self._ticket_row(), before)

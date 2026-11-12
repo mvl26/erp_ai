@@ -1,7 +1,7 @@
 import frappe
 from frappe.tests.utils import FrappeTestCase
-from frappe.utils import format_datetime
 from helpdesk.test_utils import create_agent, make_ticket
+from helpdesk.utils import is_agent
 
 from erp_ai import ticket_panel
 from erp_ai.constants import PANEL_METHODS
@@ -16,6 +16,7 @@ AGENT_EMAIL = "panel.agent@example.com"
 NO_READ_EMAIL = "panel.noread@example.com"
 INACTIVE_EMAIL = "panel.inactive@example.com"
 WEBSITE_EMAIL = "panel.website@example.com"
+CUSTOMER_EMAIL = "panel.customer@example.com"
 
 
 def _make_user(email, user_type="Website User"):
@@ -73,7 +74,7 @@ class TestTicketPanelRead(FrappeTestCase):
 		self.assertIn("\n", by_name["ai_resolution_hint"].strip())
 		self.assertEqual(by_name["ai_confidence"], "Cao")
 		self.assertEqual(by_name["ai_classified_by"], "AI")
-		self.assertEqual(by_name["ai_updated_at"], format_datetime("2026-11-12 10:05:00"))
+		self.assertEqual(by_name["ai_updated_at"], "12-11-2026 10:05:00")
 
 	def test_read_empty_ai_fields_are_null(self):
 		data = self._read()
@@ -94,13 +95,37 @@ class TestTicketPanelRead(FrappeTestCase):
 			with self.subTest(user=user), self.assertRaises(frappe.PermissionError):
 				self._read(user)
 
+	def test_read_denied_for_customer_who_can_read_the_ticket(self):
+		# Only a non-agent that HD Ticket's permission hook lets in shows that the is_agent() gate is needed.
+		_make_user(CUSTOMER_EMAIL)
+		frappe.get_doc("User", CUSTOMER_EMAIL).add_roles("HD Customer")
+		ticket = make_ticket(subject="Customer own ticket", raised_by=CUSTOMER_EMAIL)
+		frappe.set_user(CUSTOMER_EMAIL)
+		self.assertFalse(is_agent())
+		self.assertTrue(frappe.has_permission("HD Ticket", "read", doc=ticket.name))
+		with self.assertRaises(frappe.PermissionError):
+			ticket_panel.get_panel_data(ticket.name)
+
+	def test_read_rejects_empty_or_wrong_type_ticket(self):
+		frappe.set_user(AGENT_EMAIL)
+		for value in ("", "   "):
+			with self.subTest(ticket=value), self.assertRaises(frappe.ValidationError):
+				ticket_panel.get_panel_data(value)
+
+	def test_read_hides_fields_above_the_callers_permlevel(self):
+		frappe.db.set_value("HD Ticket", self.ticket.name, "ai_updated_at", "2026-11-12 10:05:00")
+		self.assertEqual(self._read()["ai_fields"][3]["text"], "12-11-2026 10:05:00")
+		self.addCleanup(frappe.clear_cache, doctype="HD Ticket")
+		permlevel = frappe.get_meta("HD Ticket").get_field("ai_updated_at").permlevel
+		frappe.permissions.update_permission_property("HD Ticket", "Agent", permlevel, "read", 0)
+		frappe.clear_cache(doctype="HD Ticket")
+		self.assertIsNone(self._read()["ai_fields"][3]["text"])
+
 	def test_read_denied_for_agent_without_ticket_read(self):
 		frappe.set_user("Administrator")
 		create_agent(NO_READ_EMAIL)
 		frappe.get_doc("User", NO_READ_EMAIL).remove_roles("Agent", "Agent Manager")
 		frappe.set_user(NO_READ_EMAIL)
-		from helpdesk.utils import is_agent
-
 		self.assertTrue(is_agent())
 		self.assertFalse(frappe.has_permission("HD Ticket", "read", doc=self.ticket.name))
 		with self.assertRaises(frappe.PermissionError):

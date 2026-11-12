@@ -45,7 +45,7 @@ LAYER_RULES = (
 			"erp_ai.install",
 			"erp_ai.erp_ai_agent",
 		),
-		"ADR-001: gateway must not import agent, eval, handlers, scheduler, install or doctype controllers",
+		"ADR-001: gateway must not import agent, eval, handlers, ticket_panel, scheduler, install or doctype controllers",
 	),
 	(
 		"erp_ai.agent",
@@ -57,7 +57,7 @@ LAYER_RULES = (
 			"erp_ai.install",
 			"erp_ai.erp_ai_agent",
 		),
-		"ADR-001: agent core must not import eval, handlers, scheduler, install or doctype controllers",
+		"ADR-001: agent core must not import eval, handlers, ticket_panel, scheduler, install or doctype controllers",
 	),
 	(
 		"erp_ai.agent.tools",
@@ -1164,6 +1164,7 @@ class TestScannersCatchViolations(unittest.TestCase):
 		}
 		for rel, source in cases.items():
 			with self.subTest(rel=rel):
+				rel = rel.partition("#")[0]
 				self.assertCaught(check_layer_imports({rel: source}), rel)
 
 	def test_layer_imports_catches_lazy_and_relative_imports(self):

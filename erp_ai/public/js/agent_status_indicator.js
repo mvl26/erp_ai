@@ -5,7 +5,12 @@ function setupForm({ doc, call, router }) {
 		const TEXT_PANEL_TITLE = "Hướng giải quyết & trao đổi với bot";
 		const TEXT_CLOSE = "Đóng";
 		const TEXT_AI_SECTION = "Hướng giải quyết của AI";
+		const TEXT_CHAT_SECTION = "Trao đổi với bot";
 		const TEXT_EMPTY_FIELD = "Chưa có";
+		const TEXT_EMPTY_THREAD = "Chưa có tin nào.";
+		const TEXT_BOT_LABEL = "Bot";
+		const TEXT_BOT_GUIDANCE =
+			"Bot có thể không trả lời khi đang tắt, đang ở chế độ chỉ ghi nhận, phiếu không dùng AI hoặc thuộc nhóm loại trừ, hoặc đã hết lượt hôm nay.";
 		const TEXT_LOAD_FAILED = "Không tải được dữ liệu của khu vực. Hãy đóng rồi mở lại.";
 		const NARROW_SCREEN_PX = 640;
 		const INDICATOR_FLOATING_STYLE = {
@@ -25,8 +30,12 @@ function setupForm({ doc, call, router }) {
 			open: false,
 			slotEl: null,
 			aiListEl: null,
+			threadEl: null,
 			errorEl: null,
+			inputEl: null,
+			sendEl: null,
 			seq: 0,
+			sending: false,
 		});
 		const socket =
 			document.querySelector("#app")?.__vue_app__?.config?.globalProperties?.$socket;
@@ -171,14 +180,21 @@ function setupForm({ doc, call, router }) {
 			const aiTitle = document.createElement("strong");
 			aiTitle.textContent = TEXT_AI_SECTION;
 			const aiListEl = document.createElement("div");
+			const chatTitle = document.createElement("strong");
+			chatTitle.textContent = TEXT_CHAT_SECTION;
+			const guidanceEl = document.createElement("div");
+			guidanceEl.style.color = "#6b7280";
+			guidanceEl.textContent = TEXT_BOT_GUIDANCE;
+			const threadEl = document.createElement("div");
 			const errorEl = document.createElement("div");
 			errorEl.style.color = "#b91c1c";
 			const slotEl = document.createElement("div");
-			el.append(header, aiTitle, aiListEl, errorEl, slotEl);
+			el.append(header, aiTitle, aiListEl, chatTitle, guidanceEl, threadEl, errorEl, slotEl);
 			document.body.appendChild(el);
 			panel.el = el;
 			panel.slotEl = slotEl;
 			panel.aiListEl = aiListEl;
+			panel.threadEl = threadEl;
 			panel.errorEl = errorEl;
 			return el;
 		};
@@ -217,6 +233,41 @@ function setupForm({ doc, call, router }) {
 			state.panel.aiListEl.replaceChildren(...nodes);
 		};
 
+		const renderMessages = (data) => {
+			const messages = data?.messages;
+			if (!Array.isArray(messages)) {
+				throw new Error("messages is not a list");
+			}
+			if (messages.length === 0) {
+				const empty = document.createElement("div");
+				empty.style.marginTop = "8px";
+				empty.textContent = TEXT_EMPTY_THREAD;
+				state.panel.threadEl.replaceChildren(empty);
+				return;
+			}
+			const nodes = messages.map((message) => {
+				const row = document.createElement("div");
+				row.style.marginTop = "8px";
+				row.style.padding = "6px 8px";
+				row.style.borderRadius = "6px";
+				row.style.background = message?.is_bot ? "#eef2ff" : "#f9fafb";
+				const head = document.createElement("strong");
+				head.textContent = [
+					message?.is_bot ? TEXT_BOT_LABEL : "",
+					message?.author,
+					message?.created_at,
+				]
+					.filter(Boolean)
+					.join(" · ");
+				const body = document.createElement("div");
+				body.style.whiteSpace = "pre-wrap";
+				body.textContent = message?.text ?? "";
+				row.append(head, body);
+				return row;
+			});
+			state.panel.threadEl.replaceChildren(...nodes);
+		};
+
 		const reload = () => {
 			const panel = state.panel;
 			if (!panel.open || !state.ticket) {
@@ -239,8 +290,11 @@ function setupForm({ doc, call, router }) {
 								return;
 							}
 							renderAiFields(data);
+							renderMessages(data);
 							panel.errorEl.textContent = "";
 						} catch (e) {
+							panel.aiListEl.replaceChildren();
+							panel.threadEl.replaceChildren();
 							panel.errorEl.textContent = TEXT_LOAD_FAILED;
 						}
 					})
@@ -279,8 +333,9 @@ function setupForm({ doc, call, router }) {
 			const panel = state.panel;
 			panel.seq++;
 			closePanel();
-			if (panel.aiListEl) {
-				panel.aiListEl.replaceChildren();
+			panel.aiListEl?.replaceChildren();
+			panel.threadEl?.replaceChildren();
+			if (panel.errorEl) {
 				panel.errorEl.textContent = "";
 			}
 		};

@@ -901,12 +901,13 @@ class TestRoutingTask(AssignTestBase):
 				"description": "có sẵn",
 			}
 		).insert()
+		before_todos = self._task_todos(self.person)
 		with patch.object(runner, "create_routed_task") as create:
 			self._run()
 
 		create.assert_not_called()
 		self.assertEqual(self._tasks(), [earlier.name])
-		self.assertEqual(self._task_todos(), 0)
+		self.assertEqual(self._task_todos(self.person), before_todos)
 		self.assertEqual(self._assigned_to(), [self.person])
 		(action,) = self._action("create_routed_task")
 		self.assertEqual(
@@ -966,6 +967,22 @@ class TestRoutingTask(AssignTestBase):
 		self.assertNotIn("task", json.loads(entry.value_after))
 		self.assertEqual(self._comment_count(), before_comments + 1)
 		self.assertIn(ASSIGN_REQUEST.format(reason=REASON_TASK_NOT_ASSIGNED), self._comment_text())
+
+	def test_refused_task_without_exception_no_task_no_comment(self):
+		refusal = {"ok": False, "reason": "thiếu quyền tạo Task"}
+		before_comments = self._comment_count()
+		before_todos = self._task_todos(self.person)
+		with patch.object(runner, "create_routed_task", return_value=refusal) as create:
+			self._run()
+
+		create.assert_called_once()
+		self.assertEqual(self._tasks(), [])
+		self.assertEqual(self._task_todos(self.person), before_todos)
+		self.assertEqual(self._assigned_to(), [self.person])
+		(action,) = self._action("create_routed_task")
+		self.assertEqual((action["ok"], action["reason"]), (False, "thiếu quyền tạo Task"))
+		self.assertEqual(self._comment_count(), before_comments)
+		self.assertNotIn("task", json.loads(self._single_entry().value_after))
 
 	def test_preassigned_by_human_no_task_no_comment(self):
 		earlier = make_active_agent(self)

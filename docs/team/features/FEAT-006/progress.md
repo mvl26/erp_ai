@@ -7,13 +7,15 @@ Quy trình:
 - role-policy chặn tech-lead chạy `PYTHONPATH=... bench ...`: `cmd.test` do dev chạy trên đầu nhánh task. Tech-lead kiểm cây mã sau merge bằng `git diff --stat <head task> team/FEAT-006 -- . ':!docs'` (rỗng = cây mã trùng đầu nhánh đã chạy xanh).
 - Site `miyano` dùng chung: hai `cmd.test` đồng thời gây `QueryDeadlockError 1213` giả (R1: 37 error; T4/T5 song song: 45 và 34 error). Từ sau T5: MỘT dev mỗi lần; reviewer chạy song song với dev kế tiếp được vì reviewer không chạy bench.
 - Nhánh task đang được checkout trong worktree dev cũ thì dev sửa vòng sau tạo nhánh `-reworkN` (hoặc `-cont`); tech-lead `merge --ff-only` vào nhánh task từ worktree của dev cũ, hoặc merge thẳng nhánh mới.
-- `review-NN.md`: NN = số task.
+- `review-NN.md`: NN = số task (T9b → `review-09b.md`).
+- BASE của task = `git rev-parse team/FEAT-006` ngay trước lần gọi dev; ghi vào dòng tick (commit docs đứng trước lần gọi dev nên BASE là đầu nhánh sau commit docs đó).
 
 ## Đổi touchpoint
 
 - T1 (người duyệt 2026-11-12): thêm `erp_ai/agent/test_agent_runner.py`, `erp_ai/agent/test_runner_status.py`, `erp_ai/tests/test_install.py`. Chỉ sửa kỳ vọng cũ (STD-TEST-5).
-- T6 (tech-lead, cần người xác nhận ở lần dừng): thêm `erp_ai/agent/test_runner_routing.py`, chỉ đổi `priority == "High"` → `"Urgent"` cho A + quan trọng 3 (kỳ vọng của bản giả T1 trái R4/AC-3).
-- T11 (tech-lead, cần người xác nhận ở lần dừng): thêm `erp_ai/tests/test_doctype_descriptions.py`, chỉ thêm dữ liệu ghim (`field_count` 22 → 24 và `phrases` cho `auto_assign_enabled`, `routing_rules`); không nới khẳng định cũ.
+- T6 (tech-lead; team-leader chấp nhận ngày 2026-11-12, journal "quyết định 4 điểm"): thêm `erp_ai/agent/test_runner_routing.py`, chỉ đổi `priority == "High"` → `"Urgent"` cho A + quan trọng 3 (kỳ vọng của bản giả T1 trái R4/AC-3).
+- T11 (tech-lead; team-leader chấp nhận ngày 2026-11-12): thêm `erp_ai/tests/test_doctype_descriptions.py`, chỉ thêm dữ liệu ghim (`field_count` 22 → 24 và `phrases` cho `auto_assign_enabled`, `routing_rules`); không nới khẳng định cũ.
+- T9b (task chèn mới, quyết định (1)+(3) của team-leader): touchpoint `erp_ai/agent/routing.py`, `erp_ai/agent/test_routing.py`, `erp_ai/erp_ai_agent/doctype/erp_ai_setting/erp_ai_setting.py`, `erp_ai/erp_ai_agent/doctype/erp_ai_setting/test_erp_ai_setting.py`; depends: T9, T11.
 
 ## Tick
 
@@ -30,6 +32,7 @@ Quy trình:
 - [x] T10 — BASE=7fa9ad9, 1 vòng, merge a9e7e2e, review-10; cmd.test đầu nhánh task 2f0b871: Ran 723 tests, OK
 - [x] T11 — BASE=f1a732b, 1 vòng (sau DESIGN_CONFLICT được giải), merge 27d18fe, review-11; cmd.test đầu nhánh task 776839a: Ran 728 tests, OK
 - [x] T12 — BASE=449e2b5, 2 vòng, merge 1f0b3f7, review-12; cmd.test đầu nhánh task 1db4533: Ran 738 tests, OK
+- [x] T9b — BASE=8a1bd31, 2 vòng (1 vòng sửa), merge 4dc14d7, review-09b; cmd.test đầu nhánh task 566f796: Ran 744 tests, OK
 
 ## Checkpoint C2 (trên 1f0b3f7)
 
@@ -38,16 +41,16 @@ Quy trình:
 - `cmd.test` (`bench --site miyano run-tests --app erp_ai`) trên 1f0b3f7: exit 0, `Ran 738 tests in 116.196s`, `OK`.
 - `routing_rules` trong DB là JSON mặc định; `auto_assign_enabled` = 0; `validate_routing_config` chấp nhận.
 
-## Câu hỏi cần người xác nhận ở C2
+## Quyết định của team-leader sau C2 (journal "quyết định 4 điểm")
 
-1. Quyết định "routing_rules để trống" (review-11): (a) trống = tắt routing, sửa `description`; hay (b) từ chối trống sau khi T12 ghi mặc định. Kèm câu thực nghiệm: form desk lưu trống là `""` hay NULL.
-2. Mở rộng touchpoint ở T6 và T11 (xem trên).
-3. T8: bỏ qua khóa tiền tố rỗng `""` (design 3.2/3.3 không nói).
-4. Tài khoản agent giữ 99 dòng Has Role (đã có từ trước, `ensure_setup` không đổi); ngoài FEAT-006, chỉ ghi nhận.
+1. `routing_rules` trống: bộ kiểm từ chối khi lưu (T9b, xong).
+2. Mở rộng touchpoint T6 và T11: chấp nhận (ghi ở trên).
+3. Khóa tiền tố rỗng `""`: T8 giữ bỏ qua; bộ kiểm từ chối khi lưu (T9b, xong).
+4. 99 Has Role của tài khoản agent: ngoài FEAT-006.
 
 ## Đang build
 
-Dừng ở C2 theo `--decide`. Việc kế tiếp sau khi người xác nhận: T13 (depends T12, T2), T14 (T2, T12), rồi T15..T26 theo `depends:`; MỘT dev mỗi lần.
+Chặng 3 (`--decide`): T9b xong; kế tiếp T13 → T14 → T15 → T16 (MỘT dev mỗi lần), dừng ở checkpoint C3 rồi báo cáo.
 
 ## Nhật ký
 
@@ -60,3 +63,4 @@ Dừng ở C2 theo `--decide`. Việc kế tiếp sau khi người xác nhận: 
 - 2026-11-12 T11: dev DESIGN_CONFLICT (`test_doctype_descriptions` ghim 22 trường); tech-lead mở rộng touchpoint 1 file và commit phần dở; dev sau DONE; reviewer approve vòng 1; reviewer nêu quyết định thiết kế "routing_rules trống" cần người chốt (review-11); merge 27d18fe; 728 OK.
 - 2026-11-12 T12: reviewer vòng 1 request-changes (3 major: bảo vệ Task bị che, thiếu dòng mồi share, nghi cache meta); vòng 2 approve (finding cache được reviewer rút lại); merge 1f0b3f7; 738 OK.
 - 2026-11-12 C2: migrate exit 0, ensure_setup lần hai không đổi gì, cmd.test 738 OK; dừng báo cáo.
+- 2026-11-12 T9b: vòng 1 request-changes (major STD-ERR-3: thông báo trống nhắc tên hằng Python; minor: `.strip()` trên giá trị không phải chuỗi); vòng 2 approve; merge 4dc14d7; 744 OK.

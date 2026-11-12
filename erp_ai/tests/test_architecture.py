@@ -218,6 +218,24 @@ STATUS_SCRIPT_REQUIRED = (
 	r"isComposing\) \{\s*event\.preventDefault\(\);\s*submit\(\);",
 	r'addEventListener\("click", \(\) => \{\s*try \{\s*submit\(\);',
 	r"formEl,\s*slotEl",
+	# T14 live updates (design F3): both listeners are named handlers registered once per socket, in the guard block.
+	r'state\.socket = socket;\s*socket\.on\(EVENT, onStatus\);\s*socket\.on\("docinfo_update", onDocinfo\);\s*socket\.on\("doc_update", onDocUpdate\);',
+	r"docinfo_update",
+	r"doc_update",
+	# Payload keys: frappe comment.py:59-67 (key, doc.reference_doctype/name) and document.py:1370-1385 (doctype, name).
+	r'const onDocinfo = \(msg\) => \{\s*try \{\s*if \(\s*msg\?\.key === "comments" &&\s*msg\.doc\?\.reference_doctype === "HD Ticket" &&\s*String\(msg\.doc\.reference_name\) === state\.ticket\s*\) \{\s*reload\(\);',
+	r'const onDocUpdate = \(msg\) => \{\s*try \{\s*if \(msg\?\.doctype === "HD Ticket" && String\(msg\.name\) === state\.ticket\) \{\s*reload\(\);',
+	# Reconnect: re-join the room, then refill an open panel.
+	r'socket\.emit\("doc_subscribe", "HD Ticket", state\.ticket\);\s*\}\s*if \(state\.panel\.open\) \{\s*reload\(\);',
+	# Reset (ticket change or leaving the page): cancel pending loads, close the panel (returns the indicator), clear texts and the input.
+	r"const panel = state\.panel;\s*panel\.seq\+\+;\s*closePanel\(\);",
+	r'if \(panel\.inputEl\) \{\s*panel\.inputEl\.value = "";\s*\}',
+	r"String\(doc\.name\) !== state\.ticket\) \{\s*reset\(\);\s*state\.ticket = String\(doc\.name\)",
+	r"reset\(\);\s*state\.ticket = null",
+	# Narrow screen: one resize listener for the page lifetime, closing the panel under the width limit.
+	r"const onResize = \(\) => \{\s*try \{\s*if \(window\.innerWidth < NARROW_SCREEN_PX\) \{\s*closePanel\(\);",
+	r'if \(!state\.resizeBound\) \{\s*state\.resizeBound = true;\s*window\.addEventListener\("resize", onResize\);',
+	r"if \(window\.innerWidth < NARROW_SCREEN_PX\) \{\s*return \{ actions: \[\] \};",
 )
 
 # ADR-009: every `call(` in the page script passes a string literal naming one of PANEL_METHODS.

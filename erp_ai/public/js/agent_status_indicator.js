@@ -61,6 +61,7 @@ function setupForm({ doc, call, router }) {
 			socket: null,
 			call: null,
 			panel: newPanelState(),
+			resizeBound: false,
 		});
 		state.call = call;
 		// A state object left by an older script version has no panel part.
@@ -441,6 +442,9 @@ function setupForm({ doc, call, router }) {
 			closePanel();
 			panel.aiListEl?.replaceChildren();
 			panel.threadEl?.replaceChildren();
+			if (panel.inputEl) {
+				panel.inputEl.value = "";
+			}
 			if (panel.errorEl) {
 				panel.errorEl.textContent = "";
 			}
@@ -491,6 +495,40 @@ function setupForm({ doc, call, router }) {
 			}
 		};
 
+		const onDocinfo = (msg) => {
+			try {
+				if (
+					msg?.key === "comments" &&
+					msg.doc?.reference_doctype === "HD Ticket" &&
+					String(msg.doc.reference_name) === state.ticket
+				) {
+					reload();
+				}
+			} catch (e) {
+				// A socket callback must never throw to the console (AC-10 g).
+			}
+		};
+
+		const onDocUpdate = (msg) => {
+			try {
+				if (msg?.doctype === "HD Ticket" && String(msg.name) === state.ticket) {
+					reload();
+				}
+			} catch (e) {
+				// A socket callback must never throw to the console (AC-10 g).
+			}
+		};
+
+		const onResize = () => {
+			try {
+				if (window.innerWidth < NARROW_SCREEN_PX) {
+					closePanel();
+				}
+			} catch (e) {
+				// A resize callback must never throw to the console (AC-10 g).
+			}
+		};
+
 		if (String(doc.name) !== state.ticket) {
 			reset();
 			state.ticket = String(doc.name);
@@ -500,11 +538,16 @@ function setupForm({ doc, call, router }) {
 		if (state.socket !== socket) {
 			state.socket = socket;
 			socket.on(EVENT, onStatus);
+			socket.on("docinfo_update", onDocinfo);
+			socket.on("doc_update", onDocUpdate);
 			socket.on("connect", () => {
 				try {
 					// Re-join the room after a reconnect; never subscribe with no ticket open.
 					if (state.ticket) {
 						socket.emit("doc_subscribe", "HD Ticket", state.ticket);
+					}
+					if (state.panel.open) {
+						reload();
 					}
 				} catch (e) {
 					// A socket callback must never throw to the console (AC-10 g).
@@ -524,6 +567,10 @@ function setupForm({ doc, call, router }) {
 					// A router hook must never throw to the console (AC-10 g).
 				}
 			});
+		}
+		if (!state.resizeBound) {
+			state.resizeBound = true;
+			window.addEventListener("resize", onResize);
 		}
 		if (window.innerWidth < NARROW_SCREEN_PX) {
 			return { actions: [] };

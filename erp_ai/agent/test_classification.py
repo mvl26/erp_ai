@@ -116,6 +116,9 @@ class TestParseClassification(FrappeTestCase):
 		for value in (None, 5, b"{}", {"dau_muc": "A"}):
 			self.assertIsNone(classification.parse_classification(value))
 
+	def test_parse_deeply_nested_json_returns_none(self):
+		self.assertIsNone(classification.parse_classification("[" * 100000))
+
 	def test_unknown_priority_becomes_none(self):
 		for value in ("Critical", None, 3, ""):
 			result = classification.parse_classification(_text(uu_tien=value))
@@ -196,65 +199,6 @@ class TestMapping(FrappeTestCase):
 		self.assertEqual(classification.load_mapping(raw), json.loads(raw))
 		for bad in (None, "", "garbage", '{"Z": {}}', "[]"):
 			self.assertEqual(classification.load_mapping(bad), {}, repr(bad))
-
-
-class TestResolveTicketValues(FrappeTestCase):
-	def setUp(self):
-		self.mapping = classification.DEFAULT_CATEGORY_MAPPING
-
-	def _result(self, **override):
-		return classification.parse_classification(_text(**override))
-
-	def test_values_come_from_mapping_not_from_model(self):
-		result = self._result(dau_muc="B", nhom="Kế toán", uu_tien="Low")
-		self.assertEqual(
-			classification.resolve_ticket_values(result, "Thêm trường", self.mapping),
-			{"ticket_type": "Quản trị & cấu hình hệ thống", "agent_group": "IT", "priority": "Medium"},
-		)
-
-	def test_missing_category_in_mapping_gives_none(self):
-		result = self._result(dau_muc="C")
-		values = classification.resolve_ticket_values(result, "x", {"A": self.mapping["A"]})
-		self.assertEqual(values, {"ticket_type": None, "agent_group": None, "priority": None})
-
-	def test_missing_key_inside_entry_gives_none(self):
-		result = self._result(dau_muc="A")
-		values = classification.resolve_ticket_values(result, "x", {"A": {"ticket_type": "T"}})
-		self.assertEqual(values, {"ticket_type": "T", "agent_group": None, "priority": None})
-
-	def test_empty_mapping(self):
-		values = classification.resolve_ticket_values(self._result(), "x", {})
-		self.assertEqual(values, {"ticket_type": None, "agent_group": None, "priority": None})
-
-	def test_urgent_prefix_forces_urgent(self):
-		result = self._result(dau_muc="F", uu_tien="Low")
-		for subject in (
-			"[GẤP] Lỗi đơn bán",
-			"[GẬP] Lỗi đơn bán",
-			"[HR][GẤP] Cấp tài khoản",
-			"Lỗi đơn bán [GẤP] ở kho",
-			"lỗi [gấp] ở kho",
-		):
-			values = classification.resolve_ticket_values(result, subject, self.mapping)
-			self.assertEqual(values["priority"], "Urgent", subject)
-			self.assertEqual(values["ticket_type"], "Câu hỏi, phiếu nhiễu", subject)
-
-	def test_urgent_prefix_overrides_empty_priority_and_missing_category(self):
-		result = self._result(dau_muc="E")
-		self.assertEqual(self.mapping["E"]["priority"], "")
-		values = classification.resolve_ticket_values(result, "[GẤP] việc", self.mapping)
-		self.assertEqual(values["priority"], "Urgent")
-		values = classification.resolve_ticket_values(result, "[GẤP] việc", {})
-		self.assertEqual(values["priority"], "Urgent")
-
-	def test_parse_deeply_nested_json_returns_none(self):
-		self.assertIsNone(classification.parse_classification("[" * 100000))
-
-	def test_no_urgent_without_bracketed_tag(self):
-		result = self._result(dau_muc="A")
-		for subject in ("GẤP lỗi", "gấp", "[GẤP lỗi", "", None):
-			values = classification.resolve_ticket_values(result, subject, self.mapping)
-			self.assertEqual(values["priority"], "High", repr(subject))
 
 
 class TestPrompts(FrappeTestCase):

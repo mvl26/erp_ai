@@ -3,12 +3,7 @@ from dataclasses import dataclass
 
 import frappe
 
-from erp_ai.agent.classification import (
-	PRIORITY_URGENT,
-	URGENT_TAGS,
-	Classification,
-	resolve_ticket_values,
-)
+from erp_ai.agent.classification import PRIORITY_URGENT, URGENT_TAGS, Classification
 from erp_ai.constants import AGENT_USER, CATEGORIES
 
 PRIORITIES = ("Low", "Medium", "High", "Urgent")
@@ -62,15 +57,15 @@ def decide_route(
 	is_active_agent,
 ) -> RouteDecision:
 	"""Priority per R1-R5; team per mapping or department; assignee by category/prefix; needs_task for C/D."""
-	values = resolve_ticket_values(classification, subject, mapping)
+	entry = mapping.get(classification.category) or {}
 	notes = []
 	if classification.category in ("D", "E"):
 		agent_group = _department_team(classification, config, team_exists, is_excluded_team, notes)
 	else:
-		agent_group = values["agent_group"] or None
+		agent_group = entry.get("agent_group") or None
 	assignee = _assignee(classification, subject, config, is_active_agent, notes)
 	return RouteDecision(
-		ticket_type=values["ticket_type"],
+		ticket_type=entry.get("ticket_type"),
 		agent_group=agent_group,
 		priority=_priority(classification, subject, mapping, config),
 		assignee=assignee,

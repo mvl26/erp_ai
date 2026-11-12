@@ -136,12 +136,3 @@ def load_mapping(raw) -> dict:
 	if _mapping_error(raw):
 		return {}
 	return json.loads(raw)
-
-
-def resolve_ticket_values(classification: Classification, subject, mapping: dict) -> dict:
-	"""Ticket values to write: from the mapping only (D-8); an urgent tag in the subject forces Urgent."""
-	entry = mapping.get(classification.category) or {}
-	values = {name: entry.get(name) for name in CLASSIFICATION_FIELDS}
-	if isinstance(subject, str) and any(tag in subject.upper() for tag in URGENT_TAGS):
-		values["priority"] = PRIORITY_URGENT
-	return values

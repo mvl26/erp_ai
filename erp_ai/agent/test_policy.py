@@ -120,6 +120,17 @@ class TestPolicy(FrappeTestCase):
 		set_agent_settings(trigger_keyword="")
 		self.assertFalse(policy.contains_keyword("anything @ai"))
 
+	def test_get_trigger_keyword_matches_contains_keyword(self):
+		for configured in ("@AI", " @ai ", "", None):
+			with self.subTest(configured=configured):
+				set_agent_settings(trigger_keyword=configured)
+				keyword = policy.get_trigger_keyword()
+				self.assertEqual(keyword, configured or "")
+				if keyword:
+					self.assertTrue(policy.contains_keyword(f"hi {keyword.upper()} there"))
+				else:
+					self.assertFalse(policy.contains_keyword("anything @ai"))
+
 	def test_effective_level_over_budget_never_raises(self):
 		cases = [("L3", "L1"), ("L2", "L1"), ("L1", "L1"), ("L0", "L0")]
 		for level, expected in cases:

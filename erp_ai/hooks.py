@@ -89,7 +89,7 @@ after_migrate = "erp_ai.install.after_migrate"
 # Uninstallation
 # ------------
 
-# before_uninstall = "erp_ai.uninstall.before_uninstall"
+before_uninstall = "erp_ai.install.before_uninstall"
 # after_uninstall = "erp_ai.uninstall.after_uninstall"
 
 # Integration Setup

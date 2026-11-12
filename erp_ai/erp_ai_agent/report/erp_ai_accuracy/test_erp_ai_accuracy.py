@@ -27,6 +27,9 @@ class AccuracyTestCase(FrappeTestCase):
 		self.addCleanup(frappe.db.rollback)
 		self.addCleanup(frappe.set_user, "Administrator")
 		frappe.set_user("Administrator")
+		# Rows from real use of the site must not reach the report: hide every existing prediction
+		# inside this transaction (rolled back in cleanup), so the rows made by the test are the only ones.
+		frappe.db.sql(f"update `tab{LOG_DOCTYPE}` set entry_type = 'reason' where entry_type = 'classify'")
 		self.now = now_datetime().replace(microsecond=0)
 
 	def _log(self, category, days_ago, corrected_after=None, corrected_to=None, entry_type="classify"):

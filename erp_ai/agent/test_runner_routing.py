@@ -610,6 +610,15 @@ class TestRoutingAssign(AssignTestBase):
 		self.assertIn("assigned=%d comment=%d", info[0])
 		self.assertEqual(info[3:], (1, 1, 0, "ok"))
 
+	def test_info_line_counts_the_posted_comment(self):
+		self._configure(self.team, AGENT_USER)
+		logger = MagicMock()
+		with patch.object(frappe, "logger", return_value=logger):
+			self._run()
+
+		(info,) = [c.args for c in logger.info.call_args_list if c.args[0].startswith("erp_ai route")]
+		self.assertEqual(info[3:], (1, 0, 1, "ok"))
+
 	def test_team_rule_assigns_bot_does_not(self):
 		member = make_active_agent(self)
 		team = make_team(self, with_rule=True, rule_users=(member,))
@@ -623,7 +632,7 @@ class TestRoutingAssign(AssignTestBase):
 		(action,) = self._action("assign_owner")
 		self.assertFalse(action["ok"])
 		self.assertEqual(action["reason"], f"phiếu đã có người được gán: {member}")
-		self.assertTrue(action["rule"])
+		self.assertEqual(action["rule"], frappe.db.get_value("HD Team", team, "assignment_rule"))
 
 	def test_agent_account_never_assigned_one_comment(self):
 		self._configure(self.team, AGENT_USER)
@@ -652,6 +661,42 @@ class TestRoutingAssign(AssignTestBase):
 		self.assertEqual(self._comment_count(), before_comments + 1)
 		self.assertIn(ASSIGN_REQUEST.format(reason=REASON_ASSIGN_FAILED), self._comment_text())
 		self.assertEqual(self._assigned_to(), [])
+
+	def test_assign_that_wrote_then_raised_is_undone_but_route_kept(self):
+		def write_then_raise(user, context):
+			assign_to.add({"assign_to": [user], "doctype": "HD Ticket", "name": context.ticket_name})
+			raise ValueError("x")
+
+		with patch.object(runner, "assign_owner", side_effect=write_then_raise) as assign:
+			self._run()
+
+		assign.assert_called_once()
+		self.assertEqual(self._assigned_to(), [])
+		row = self._ticket_row()
+		self.assertEqual((row.agent_group, row.priority), (self.team, "Urgent"))
+		entry = self._single_entry()
+		self.assertEqual(entry.applied, 1)
+		self.assertEqual([a["ok"] for a in json.loads(entry.actions)][:2], [True, False])
+		self.assertIn("route assign_owner: ValueError", entry.error)
+
+	def test_comment_that_wrote_then_raised_is_undone_but_route_kept(self):
+		self._configure(self.team, AGENT_USER)
+		real_post = runner.post_routing_comment
+
+		def write_then_raise(lines, context):
+			real_post(lines, context)
+			raise ValueError("x")
+
+		before_comments = self._comment_count()
+		with patch.object(runner, "post_routing_comment", side_effect=write_then_raise):
+			self._run()
+
+		self.assertEqual(self._comment_count(), before_comments)
+		row = self._ticket_row()
+		self.assertEqual((row.agent_group, row.priority), (self.team, "Urgent"))
+		entry = self._single_entry()
+		self.assertEqual(entry.applied, 1)
+		self.assertIn("route post_routing_comment: ValueError", entry.error)
 
 	def test_refused_assign_one_comment(self):
 		before_comments = self._comment_count()

@@ -1,6 +1,7 @@
 from unittest.mock import patch
 
 import frappe
+from frappe.desk.form import assign_to
 from frappe.model.document import Document
 from frappe.tests.utils import FrappeTestCase
 from helpdesk.test_utils import make_ticket
@@ -8,7 +9,16 @@ from helpdesk.test_utils import make_ticket
 from erp_ai.agent.classification import Classification
 from erp_ai.agent.routing import RouteDecision
 from erp_ai.agent.tools.registry import ToolContext
-from erp_ai.agent.tools.route_ticket import apply_route
+from erp_ai.agent.tools.route_ticket import (
+	ASSIGN_REQUEST,
+	NO_SLA,
+	REASON_ASSIGN_FAILED,
+	REASON_NO_VALID_ASSIGNEE,
+	REASON_TASK_NOT_ASSIGNED,
+	apply_route,
+	assign_owner,
+	post_routing_comment,
+)
 from erp_ai.constants import AGENT_USER, CLASSIFIED_BY_AI, CLASSIFIED_BY_HUMAN
 from erp_ai.test_utils import PREFIX, make_active_agent, make_sla, make_team, pin_agent_roles
 
@@ -325,3 +335,92 @@ class TestSlaFromHelpdesk(RouteTicketTestCase):
 		result = self._apply_as_agent(ticket, classification=self._classification(complexity=3))
 		self.assertTrue(result["ok"], result)
 		self.assertEqual(self._sla_of(ticket).sla, ge_sla)
+
+
+class TestAssignOwner(RouteTicketTestCase):
+	def _count(self, doctype: str, **filters) -> int:
+		return frappe.db.count(doctype, filters)
+
+	def _assign_as_agent(self, ticket: str, user: str) -> dict:
+		pin_agent_roles(self)
+		frappe.set_user(AGENT_USER)
+		return assign_owner(user, self._ctx(ticket))
+
+	def test_ticket_never_shared_one_todo_one_notification(self):
+		ticket = self._ticket()
+		owner = make_active_agent(self)
+		todo = {"reference_type": "HD Ticket", "reference_name": ticket, "allocated_to": owner}
+		note = {"document_type": "HD Ticket", "document_name": ticket, "for_user": owner}
+		real_add = assign_to.add
+		with patch.object(assign_to, "add", wraps=real_add) as add:
+			result = self._assign_as_agent(ticket, owner)
+		self.assertEqual(result, {"ok": True, "assignee": owner})
+		# Exactly Frappe's public `add` with exactly these args: no extra flag, no private variant.
+		add.assert_called_once_with({"assign_to": [owner], "doctype": "HD Ticket", "name": ticket})
+		self.assertEqual(self._count("ToDo", status="Open", **todo), 1)
+		self.assertEqual(self._count("Notification Log", type="Assignment", **note), 1)
+		self.assertEqual(self._count("DocShare", share_doctype="HD Ticket", share_name=ticket), 0)
+
+	def test_no_read_permission_refused(self):
+		ticket = self._ticket()
+		owner = make_active_agent(self)
+		real = Document.has_permission
+
+		def deny_read(doc, permtype="read", *args, **kwargs):
+			return False if permtype == "read" else real(doc, permtype, *args, **kwargs)
+
+		with patch.object(Document, "has_permission", deny_read), patch.object(assign_to, "add") as add:
+			result = self._assign_as_agent(ticket, owner)
+		self.assertFalse(result["ok"])
+		self.assertTrue(result["reason"])
+		self.assertLessEqual(len(result["reason"]), 200)
+		add.assert_not_called()
+		self.assertEqual(self._count("ToDo", reference_type="HD Ticket", reference_name=ticket), 0)
+
+	def test_denied_write_does_not_block_assignment(self):
+		# Only `read` on the ticket gates the assignment: a write denial alone must not refuse it.
+		ticket = self._ticket()
+		owner = make_active_agent(self)
+		real = Document.has_permission
+
+		def deny_write(doc, permtype="read", *args, **kwargs):
+			return False if permtype == "write" else real(doc, permtype, *args, **kwargs)
+
+		with patch.object(Document, "has_permission", deny_write):
+			result = self._assign_as_agent(ticket, owner)
+		self.assertEqual(result, {"ok": True, "assignee": owner})
+
+
+class TestRoutingComment(RouteTicketTestCase):
+	def _comments(self, ticket: str) -> list[str]:
+		return frappe.get_all(
+			"Comment",
+			filters={"reference_doctype": "HD Ticket", "reference_name": ticket, "comment_type": "Comment"},
+			pluck="content",
+		)
+
+	def test_lines_joined_in_one_comment(self):
+		ticket = self._ticket()
+		lines = [ASSIGN_REQUEST.format(reason=REASON_ASSIGN_FAILED), NO_SLA]
+		pin_agent_roles(self)
+		frappe.set_user(AGENT_USER)
+		result = post_routing_comment(lines, self._ctx(ticket))
+		self.assertTrue(result["ok"], result)
+		contents = self._comments(ticket)
+		self.assertEqual(len(contents), 1)
+		self.assertEqual(frappe.utils.strip_html(contents[0]).strip(), "\n".join(lines))
+
+	def test_fixed_sentences(self):
+		self.assertEqual(NO_SLA, "Chưa có SLA áp vào phiếu, cần System Manager cấu hình.")
+		reasons = {
+			REASON_NO_VALID_ASSIGNEE: "cấu hình không có người hợp lệ",
+			REASON_ASSIGN_FAILED: "gán người không thành công",
+			REASON_TASK_NOT_ASSIGNED: "không giao được Task cho người phụ trách (chia sẻ tài liệu đang tắt)",
+		}
+		for reason, text in reasons.items():
+			with self.subTest(reason=text):
+				self.assertEqual(reason, text)
+				self.assertEqual(
+					ASSIGN_REQUEST.format(reason=reason),
+					f"Bot chưa gán được người phụ trách cho phiếu này: {text}. Nhờ trưởng nhóm phân công.",
+				)

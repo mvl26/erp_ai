@@ -1,11 +1,19 @@
 import frappe
+from frappe.desk.form import assign_to
 from frappe.utils import now_datetime
 
 from erp_ai.agent.classification import Classification
 from erp_ai.agent.routing import RouteDecision
 from erp_ai.agent.tools.registry import ToolContext
-from erp_ai.agent.tools.write_ticket import LINKED_DOCTYPES, REASON_MAX, TICKET_DOCTYPE
+from erp_ai.agent.tools.write_ticket import LINKED_DOCTYPES, REASON_MAX, TICKET_DOCTYPE, post_comment
 from erp_ai.constants import CLASSIFIED_BY_AI, CLASSIFIED_BY_HUMAN
+
+# Fixed sentences for the routing comment (design 3.6). They never carry ticket content or raw configuration.
+ASSIGN_REQUEST = "Bot chưa gán được người phụ trách cho phiếu này: {reason}. Nhờ trưởng nhóm phân công."
+REASON_NO_VALID_ASSIGNEE = "cấu hình không có người hợp lệ"
+REASON_ASSIGN_FAILED = "gán người không thành công"
+REASON_TASK_NOT_ASSIGNED = "không giao được Task cho người phụ trách (chia sẻ tài liệu đang tắt)"
+NO_SLA = "Chưa có SLA áp vào phiếu, cần System Manager cấu hình."
 
 
 def _fail(reason: str) -> dict:
@@ -53,3 +61,17 @@ def apply_route(decision: RouteDecision, classification: Classification, ctx: To
 		"after": {field: values[field] for field in changed},
 		"skipped": skipped,
 	}
+
+
+def assign_owner(user: str, ctx: ToolContext) -> dict:
+	"""Assign the ticket to `user` through Frappe's own `assign_to.add` (ADR-021 QĐ 3). Not a model tool."""
+	doc = frappe.get_doc(TICKET_DOCTYPE, ctx.ticket_name)
+	if not doc.has_permission("read"):
+		return _fail("thiếu quyền đọc phiếu")
+	assign_to.add({"assign_to": [user], "doctype": TICKET_DOCTYPE, "name": ctx.ticket_name})
+	return {"ok": True, "assignee": user}
+
+
+def post_routing_comment(lines: list[str], ctx: ToolContext) -> dict:
+	"""Post the fixed sentences as ONE comment, reusing `post_comment`."""
+	return post_comment({"content": "\n".join(lines)}, ctx)

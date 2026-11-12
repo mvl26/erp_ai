@@ -1,7 +1,9 @@
 import frappe
 from frappe.utils import escape_html, now_datetime
 
-from erp_ai.agent.classification import Classification, resolve_ticket_values
+from erp_ai.agent import policy, site_facts
+from erp_ai.agent.classification import Classification
+from erp_ai.agent.routing import decide_route
 from erp_ai.agent.tools.registry import ToolContext, ToolSpec
 from erp_ai.constants import CATEGORIES, CLASSIFIED_BY_AI, CLASSIFIED_BY_HUMAN, CONFIDENCE_VALUES
 
@@ -21,12 +23,16 @@ def _fail(reason: str) -> dict:
 	return {"ok": False, "reason": reason[:REASON_MAX]}
 
 
-def _existing_values(wanted: dict) -> tuple[dict, list]:
-	"""Values to write (only those that exist on the site) and the skipped fields with a reason."""
+def _existing_values(wanted: dict, reasons: dict | None = None) -> tuple[dict, list]:
+	"""Values to write (only those that exist on the site) and the skipped fields with a reason.
+
+	`reasons` holds the routing reason for fields the route left empty on purpose.
+	"""
+	reasons = reasons or {}
 	values, skipped = {}, []
 	for field, value in wanted.items():
 		if not value:
-			skipped.append({"field": field, "reason": "ánh xạ không có giá trị"})
+			skipped.append({"field": field, "reason": reasons.get(field, "ánh xạ không có giá trị")})
 		elif not frappe.db.exists(LINKED_DOCTYPES[field], value):
 			skipped.append({"field": field, "reason": "giá trị không tồn tại trên hệ thống"})
 		else:
@@ -35,8 +41,28 @@ def _existing_values(wanted: dict) -> tuple[dict, list]:
 
 
 def _mapped_values(doc, args: dict, ctx: ToolContext) -> tuple[dict, list]:
-	classification = Classification(category=args["category"], confidence=args["confidence"])
-	return _existing_values(resolve_ticket_values(classification, doc.subject, ctx.category_mapping))
+	classification = Classification(
+		category=args["category"],
+		confidence=args["confidence"],
+		complexity=doc.ai_complexity or 0,
+		importance=doc.ai_importance or 0,
+	)
+	decision = decide_route(
+		classification,
+		doc.subject,
+		ctx.category_mapping,
+		ctx.routing_config or {},
+		team_exists=site_facts.team_exists,
+		is_excluded_team=policy.is_excluded_team,
+		is_active_agent=site_facts.is_active_agent,
+	)
+	wanted = {
+		"ticket_type": decision.ticket_type,
+		"agent_group": decision.agent_group,
+		"priority": decision.priority,
+	}
+	reasons = {note["field"]: note["reason"] for note in decision.notes if note["field"] in wanted}
+	return _existing_values(wanted, reasons)
 
 
 def set_classification(args: dict, ctx: ToolContext) -> dict:

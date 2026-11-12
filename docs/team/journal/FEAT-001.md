@@ -90,3 +90,4 @@ Approved-by:
 - 2026-11-11 lý do gọi writer: accepted, G4 tắt; cần asbuilt.md, CHANGELOG, README; ghi D2–D10 và việc người còn phải làm. Không /team:pr vì người chưa cho push/PR
 - 2026-11-11 asbuilt → writer (Agent) | asbuilt.md, pr-body.md, CHANGELOG.md, README.md | ASBUILT | 1 lượt | good — writer không commit được (Bash read-only), team-leader commit local | —
 - 2026-11-11 kết thúc chạy tự động: FEAT-001 verified + As-Built; dừng trước /team:pr và /team:release (người chưa cho push/PR; G5 bật). Việc người: checklist asbuilt.md mục 6
+- 2026-11-12 cấu hình local → team-leader | ERP AI Setting trên miyano: L1, enabled, excluded_teams 2 nhóm, đơn giá Haiku 5.5 (0.10/0.125/0.01/0.50), 1 dòng khóa "Chính" chưa có secret; tạo 6 HD Ticket Type theo category_mapping; restart web + worker | — | — | good | người yêu cầu cấu hình để tự nghiệm thu; khóa do người tự dán

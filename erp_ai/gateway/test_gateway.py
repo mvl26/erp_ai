@@ -390,6 +390,17 @@ class TestCallModel(FrappeTestCase):
 	def first_row(self):
 		return frappe.db.get_value(CREDENTIAL_DOCTYPE, {"parent": SETTING_DOCTYPE}, "name")
 
+	def test_classify_request_turns_thinking_off(self):
+		# Haiku 5.5 thinks by default and the hidden thinking tokens count against max_tokens (FEAT-006 rw1 R1).
+		add_credential("k1")
+		send, _ = self.run_call(ok_reply())
+		self.assertEqual(send.calls[0]["request"]["thinking"], {"type": "disabled"})
+
+	def test_reason_request_leaves_thinking_unset(self):
+		add_credential("k1", model_reason="reason-model")
+		send, _ = self.run_call(ok_reply(), task="reason")
+		self.assertNotIn("thinking", send.calls[0]["request"])
+
 	def test_invalid_task_raises_value_error(self):
 		add_credential("k1")
 		send = ScriptedSend()
@@ -405,7 +416,7 @@ class TestCallModel(FrappeTestCase):
 		self.assertEqual(send.calls[0]["timeout"], 45)
 		self.assertEqual(
 			send.calls[0]["request"],
-			{**CALL, "model": "default-model", "tools": [{"name": "t"}]},
+			{**CALL, "model": "default-model", "thinking": {"type": "disabled"}, "tools": [{"name": "t"}]},
 		)
 		self.assertEqual(result.text, "xin chào")
 		self.assertEqual(result.content, MESSAGE["content"])

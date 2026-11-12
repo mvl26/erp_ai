@@ -149,7 +149,7 @@
    "fieldtype": "Data",
    "label": "Model phân loại mặc định",
    "default": "claude-haiku-5-5",
-   "description": "Tên model dùng để phân loại phiếu khi dòng khóa API không ghi model phân loại riêng. Nhập đúng tên model của nhà cung cấp."
+   "description": "Tên model dùng để phân loại phiếu khi dòng khóa API không ghi model phân loại riêng. Nhập đúng tên model của nhà cung cấp. Chỉ model claude-haiku-* được tắt thinking ở bước phân loại; model khác có thể bị cắt ở trần token."
   },
   {
    "fieldname": "trigger_keyword",

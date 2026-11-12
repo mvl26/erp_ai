@@ -12,6 +12,14 @@ function setupForm({ doc, call, router }) {
 		const TEXT_BOT_GUIDANCE =
 			"Bot có thể không trả lời khi đang tắt, đang ở chế độ chỉ ghi nhận, phiếu không dùng AI hoặc thuộc nhóm loại trừ, hoặc đã hết lượt hôm nay.";
 		const TEXT_LOAD_FAILED = "Không tải được dữ liệu của khu vực. Hãy đóng rồi mở lại.";
+		const TEXT_INPUT_PLACEHOLDER =
+			"Nhập câu hỏi cho bot. Enter để gửi, Shift+Enter để xuống dòng.";
+		const TEXT_SEND = "Gửi";
+		const TEXT_SENDING = "Đang gửi…";
+		const TEXT_EMPTY_MESSAGE = "Hãy nhập nội dung trước khi gửi.";
+		const TEXT_TOO_LONG = "Tin dài quá 2000 ký tự.";
+		const TEXT_SEND_FAILED = "Không gửi được tin. Chữ bạn gõ vẫn còn, hãy thử lại.";
+		const MAX_MESSAGE_CHARS = 2000;
 		const NARROW_SCREEN_PX = 640;
 		const INDICATOR_FLOATING_STYLE = {
 			position: "fixed",
@@ -188,14 +196,53 @@ function setupForm({ doc, call, router }) {
 			const threadEl = document.createElement("div");
 			const errorEl = document.createElement("div");
 			errorEl.style.color = "#b91c1c";
+			const formEl = document.createElement("div");
+			Object.assign(formEl.style, { display: "flex", gap: "8px", marginTop: "8px" });
+			const inputEl = document.createElement("textarea");
+			inputEl.rows = 2;
+			inputEl.style.flex = "1";
+			inputEl.placeholder = TEXT_INPUT_PLACEHOLDER;
+			inputEl.addEventListener("keydown", (event) => {
+				try {
+					if (event.key === "Enter" && !event.shiftKey && !event.isComposing) {
+						event.preventDefault();
+						submit();
+					}
+				} catch (e) {
+					// A panel handler must never break the ticket page (ADR-009 decision 4).
+				}
+			});
+			const sendEl = document.createElement("button");
+			sendEl.type = "button";
+			sendEl.textContent = TEXT_SEND;
+			sendEl.addEventListener("click", () => {
+				try {
+					submit();
+				} catch (e) {
+					// A panel handler must never break the ticket page (ADR-009 decision 4).
+				}
+			});
+			formEl.append(inputEl, sendEl);
 			const slotEl = document.createElement("div");
-			el.append(header, aiTitle, aiListEl, chatTitle, guidanceEl, threadEl, errorEl, slotEl);
+			el.append(
+				header,
+				aiTitle,
+				aiListEl,
+				chatTitle,
+				guidanceEl,
+				threadEl,
+				errorEl,
+				formEl,
+				slotEl
+			);
 			document.body.appendChild(el);
 			panel.el = el;
 			panel.slotEl = slotEl;
 			panel.aiListEl = aiListEl;
 			panel.threadEl = threadEl;
 			panel.errorEl = errorEl;
+			panel.inputEl = inputEl;
+			panel.sendEl = sendEl;
 			return el;
 		};
 
@@ -301,6 +348,65 @@ function setupForm({ doc, call, router }) {
 					.catch(showLoadFailed);
 			} catch (e) {
 				showLoadFailed();
+			}
+		};
+
+		const submit = () => {
+			const panel = state.panel;
+			if (panel.sending || !panel.open || !state.ticket) {
+				return;
+			}
+			const value = panel.inputEl.value.trim();
+			if (!value) {
+				panel.errorEl.textContent = TEXT_EMPTY_MESSAGE;
+				return;
+			}
+			if (value.length > MAX_MESSAGE_CHARS) {
+				panel.errorEl.textContent = TEXT_TOO_LONG;
+				return;
+			}
+			const ticket = state.ticket;
+			const isStale = () => ticket !== state.ticket;
+			const unlock = () => {
+				panel.sending = false;
+				panel.inputEl.disabled = false;
+				panel.sendEl.disabled = false;
+				panel.sendEl.textContent = TEXT_SEND;
+			};
+			const onSent = () => {
+				try {
+					unlock();
+					if (isStale()) {
+						return;
+					}
+					panel.inputEl.value = "";
+					panel.errorEl.textContent = "";
+					reload();
+				} catch (e) {
+					// A panel handler must never break the ticket page (ADR-009 decision 4).
+				}
+			};
+			const onSendFailed = () => {
+				try {
+					unlock();
+					if (!isStale()) {
+						panel.errorEl.textContent = TEXT_SEND_FAILED;
+					}
+				} catch (e) {
+					// A panel handler must never break the ticket page (ADR-009 decision 4).
+				}
+			};
+			panel.errorEl.textContent = "";
+			panel.sending = true;
+			panel.inputEl.disabled = true;
+			panel.sendEl.disabled = true;
+			panel.sendEl.textContent = TEXT_SENDING;
+			try {
+				state
+					.call("erp_ai.ticket_panel.send_message", { ticket, text: value })
+					.then(onSent, onSendFailed);
+			} catch (e) {
+				onSendFailed();
 			}
 		};
 

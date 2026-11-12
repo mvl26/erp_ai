@@ -182,6 +182,42 @@ STATUS_SCRIPT_REQUIRED = (
 	# A failed reload clears both lists (no new AI fields beside an old thread); reset tolerates an old panel state.
 	r"panel\.threadEl\.replaceChildren\(\);\s*panel\.errorEl\.textContent = TEXT_LOAD_FAILED",
 	r"panel\.threadEl\?\.replaceChildren\(\)",
+	# T13 send box: fixed texts, then the use sites (declaration-only pins were rejected in review).
+	r'TEXT_SEND_FAILED = "Không gửi được tin\. Chữ bạn gõ vẫn còn, hãy thử lại\."',
+	r'TEXT_EMPTY_MESSAGE = "Hãy nhập nội dung trước khi gửi\."',
+	r'TEXT_TOO_LONG = "Tin dài quá 2000 ký tự\."',
+	r'TEXT_SENDING = "Đang gửi…"',
+	r"MAX_MESSAGE_CHARS = 2000",
+	r'event\.key === "Enter" && !event\.shiftKey && !event\.isComposing',
+	r'sendEl\.addEventListener\("click"',
+	r"const value = panel\.inputEl\.value\.trim\(\)",
+	r"if \(!value\) \{\s*panel\.errorEl\.textContent = TEXT_EMPTY_MESSAGE;\s*return;",
+	r"value\.length > MAX_MESSAGE_CHARS\) \{\s*panel\.errorEl\.textContent = TEXT_TOO_LONG;\s*return;",
+	r"if \(panel\.sending \|\| !panel\.open",
+	r"panel\.sending = true",
+	r"panel\.sending = false",
+	r'state\s*\.call\("erp_ai\.ticket_panel\.send_message", \{ ticket, text: value \}\)',
+	r'panel\.inputEl\.value = "";\s*panel\.errorEl\.textContent = "";\s*reload\(\)',
+	# Failure only shows the fixed text: nothing else (such as clearing the box) happens in that branch.
+	r"if \(!isStale\(\)\) \{\s*panel\.errorEl\.textContent = TEXT_SEND_FAILED;\s*\}",
+	r"sendEl\.textContent = TEXT_SENDING",
+	r"sendEl\.textContent = TEXT_SEND\b",
+	r"inputEl\.placeholder = TEXT_INPUT_PLACEHOLDER",
+	# T13 r1: fixed values of the remaining texts, and the box is locked while a send is pending.
+	r'TEXT_SEND = "Gửi";',
+	r'TEXT_INPUT_PLACEHOLDER =\s*"Nhập câu hỏi cho bot\. Enter để gửi, Shift\+Enter để xuống dòng\."',
+	r"panel\.sendEl\.disabled = true;\s*panel\.sendEl\.textContent = TEXT_SENDING",
+	r"panel\.inputEl\.disabled = true",
+	# T13 r1: each wiring point pinned at its use site (a declaration or a copy elsewhere must not satisfy it).
+	r"const isStale = \(\) => ticket !== state\.ticket;",
+	r"unlock = \(\) => \{\s*panel\.sending = false;\s*panel\.inputEl\.disabled = false;\s*panel\.sendEl\.disabled = false;\s*panel\.sendEl\.textContent = TEXT_SEND;\s*\}",
+	r'unlock\(\);\s*if \(isStale\(\)\) \{\s*return;\s*\}\s*panel\.inputEl\.value = ""',
+	r"onSendFailed = \(\) => \{\s*try \{\s*unlock\(\);\s*if \(!isStale\(\)\)",
+	r"\.then\(onSent, onSendFailed\)",
+	r"catch \(e\) \{\s*onSendFailed\(\);",
+	r"isComposing\) \{\s*event\.preventDefault\(\);\s*submit\(\);",
+	r'addEventListener\("click", \(\) => \{\s*try \{\s*submit\(\);',
+	r"formEl,\s*slotEl",
 )
 
 # ADR-009: every `call(` in the page script passes a string literal naming one of PANEL_METHODS.

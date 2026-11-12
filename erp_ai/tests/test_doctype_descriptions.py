@@ -99,6 +99,85 @@ DOCTYPE_CONFIG = {
 			("section_note", "Ghi chú", "note"),
 		),
 	},
+	"ERP AI Log": {
+		"folder": "erp_ai_log",
+		"field_count": 31,
+		"phrases": {
+			"ticket": ("HD Ticket", "mã phiếu", "lọc"),
+			"run_id": ("cùng một lần chạy", "gom"),
+			"entry_type": ("classify", "reason", "skip", "phân loại", "lập luận"),
+			"turn": ("Lượt 0", "lượt 1", "lập luận"),
+			"trigger": ("ticket_insert", "comment_mention", "bình luận"),
+			"instructor": ("bình luận", "người ra lệnh"),
+			"model": ("model", "lần gọi"),
+			"input_tokens": ("token", "gửi lên"),
+			"output_tokens": ("token", "model trả về"),
+			"cache_creation_input_tokens": ("ghi vào cache", "token"),
+			"cache_read_input_tokens": ("đọc từ cache", "token"),
+			"cost_usd": ("USD", "đơn giá", "Setting"),
+			"credential_label": ("nhãn", "khóa", "trả lời"),
+			"keys_tried": ("danh sách", "nhãn khóa", "kết quả"),
+			"latency_ms": ("mili giây", "lần gọi"),
+			"stop_reason": ("max_turns", "time_budget", "gateway_error"),
+			"tools_called": ("tool", "lần chạy"),
+			"actions": ("hành động", "phiếu"),
+			"value_before": ("JSON", "trước khi"),
+			"value_after": ("JSON", "sau khi"),
+			"skipped_fields": ("bỏ qua", "phân loại"),
+			"predicted_category": ("đầu mục", "A đến F"),
+			"predicted_confidence": ("Cao", "Trung bình", "Thấp"),
+			"predicted_ticket_type": ("loại phiếu", "dự đoán"),
+			"predicted_agent_group": ("nhóm xử lý", "dự đoán"),
+			"predicted_priority": ("ưu tiên", "dự đoán"),
+			"applied": ("đã ghi", "phiếu"),
+			"human_corrected_to": ("loại phiếu", "nhóm xử lý", "ưu tiên", "AI đã dự đoán"),
+			"human_corrected_by": ("người đổi", "AI đã dự đoán"),
+			"human_corrected_at": ("lần sửa đầu", "AI đã dự đoán"),
+			"error": ("lỗi", "không có khóa"),
+		},
+		"section_count": 6,
+		"read_only_fields": (
+			"ticket",
+			"run_id",
+			"entry_type",
+			"turn",
+			"trigger",
+			"instructor",
+			"model",
+			"input_tokens",
+			"output_tokens",
+			"cache_creation_input_tokens",
+			"cache_read_input_tokens",
+			"cost_usd",
+			"credential_label",
+			"keys_tried",
+			"latency_ms",
+			"stop_reason",
+			"tools_called",
+			"actions",
+			"value_before",
+			"value_after",
+			"skipped_fields",
+			"predicted_category",
+			"predicted_confidence",
+			"predicted_ticket_type",
+			"predicted_agent_group",
+			"predicted_priority",
+			"applied",
+			"human_corrected_to",
+			"human_corrected_by",
+			"human_corrected_at",
+			"error",
+		),
+		"sections": (
+			("section_run", "Lần chạy", "ticket"),
+			("section_usage", "Token, chi phí và khóa", "input_tokens"),
+			("section_changes", "Tool và thay đổi trên phiếu", "tools_called"),
+			("section_prediction", "Dự đoán phân loại", "predicted_category"),
+			("section_correction", "Người sửa sau dự đoán", "human_corrected_to"),
+			("section_error", "Lỗi", "error"),
+		),
+	},
 }
 
 
@@ -206,6 +285,13 @@ class TestDoctypeDescriptions(FrappeTestCase):
 				self.assertNotIn(
 					value, description, f"{field['fieldname']} chứa giá trị đang lưu của {source}"
 				)
+
+	def test_skipped_fields_still_follows_value_after(self):
+		doctype_json = load_doctype(DOCTYPE_CONFIG["ERP AI Log"])
+		order = doctype_json["field_order"]
+		self.assertEqual(order.index("skipped_fields"), order.index("value_after") + 1)
+		names = [f["fieldname"] for f in doctype_json["fields"]]
+		self.assertEqual(names, order)
 
 	def test_section_breaks_carry_only_label(self):
 		for doctype, _config, doctype_json in self.each_doctype():

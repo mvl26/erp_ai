@@ -23,11 +23,12 @@ def _fail(reason: str) -> dict:
 	return {"ok": False, "reason": reason[:REASON_MAX]}
 
 
-def _existing_values(wanted: dict, reasons: dict) -> tuple[dict, list]:
+def _existing_values(wanted: dict, reasons: dict | None = None) -> tuple[dict, list]:
 	"""Values to write (only those that exist on the site) and the skipped fields with a reason.
 
 	`reasons` holds the routing reason for fields the route left empty on purpose.
 	"""
+	reasons = reasons or {}
 	values, skipped = {}, []
 	for field, value in wanted.items():
 		if not value:

@@ -131,6 +131,53 @@ STATUS_SCRIPT_REQUIRED = (
 	r"if \(state\.ticket\)",
 )
 
+# ADR-008 (status signals) and ADR-007 (the one form script): who may publish, import, write or delete.
+RUN_STATUS_FILE = "agent/run_status.py"
+RUN_STATUS_MODULE = "erp_ai.agent.run_status"
+RUNNER_FILE = "agent/runner.py"
+INSTALL_FILE = "install.py"
+HOOKS_FILE = "hooks.py"
+REALTIME_NAMES = ("publish_realtime", "publish_progress", "emit_via_redis")
+REALTIME_MODULE = "frappe.realtime"
+# Attribute/function names that write a record, the cache, a file or the transaction (NFR-6, ADR-008 decision 5).
+RUN_STATUS_WRITE_NAMES = (
+	"insert",
+	"save",
+	"delete",
+	"delete_doc",
+	"set_value",
+	"db_set",
+	"sql",
+	"multisql",
+	"commit",
+	"rollback",
+	"write",
+	"write_text",
+	"write_bytes",
+	"open",
+	"touch",
+	"mkdir",
+)
+RUN_STATUS_FORBIDDEN_ATTRIBUTES = ("frappe.db", "frappe.cache")
+OPEN_DOC_ROOM_PREFIX = "open_doc:"
+ALL_ROOM = "all"
+FORM_SCRIPT_DOCTYPE_NAME = "HD Form Script"
+AGENT_STATUS_SCRIPT_NAME = "ERP AI Agent Status"
+# ADR-007: Helpdesk's SPA ignores these hooks; the one channel is the form script record (install.py).
+PAGE_INJECTION_HOOKS = (
+	"app_include_js",
+	"web_include_js",
+	"app_include_css",
+	"web_include_css",
+	"after_request",
+	"website_route_rules",
+	"fixtures",
+)
+UNINSTALL_HOOK = "erp_ai.install.before_uninstall"
+UNINSTALL_FUNCTION = "before_uninstall"
+DELETE_NAMES = ("delete", "delete_doc", "delete_doc_if_exists")
+SQL_DELETE = re.compile(r"^\s*delete\b", re.IGNORECASE)
+
 LEGACY_NAMES = ("HD Ticket Comment", "commented_by", "comment_email", "comment_by")
 # Design 3.5 (amendment 1c) tells `get_record` to DROP comment_email/comment_by from a Comment; this one
 # hide-list constant is the only place these names may appear.
@@ -673,6 +720,257 @@ def check_ci_workflow(text: str) -> list:
 # ---------------------------------------------------------------------------------------------------
 
 
+def _call_keywords(call: ast.Call) -> dict:
+	return {kw.arg: kw.value for kw in call.keywords if kw.arg}
+
+
+def _is_constant(node, value) -> bool:
+	return isinstance(node, ast.Constant) and node.value == value and type(node.value) is type(value)
+
+
+def check_publish_realtime_only_in_run_status(sources: dict) -> list:
+	"""ADR-008: only run_status.py touches frappe.realtime; its publish calls pin `room=` and `after_commit=False`."""
+	violations = []
+	for rel, source in only_python(sources).items():
+		tree = parse(rel, source)
+		aliases = import_aliases(tree)
+		if rel != RUN_STATUS_FILE:
+			for node in ast.walk(tree):
+				if referenced_name(node) in REALTIME_NAMES:
+					violations.append(
+						violation(rel, node, f"uses {referenced_name(node)} outside {RUN_STATUS_FILE}")
+					)
+				elif isinstance(node, ast.ImportFrom):
+					for alias in node.names:
+						if alias.name in REALTIME_NAMES:
+							violations.append(
+								violation(rel, node, f"imports {alias.name} outside {RUN_STATUS_FILE}")
+							)
+				elif (
+					isinstance(node, ast.Name | ast.Attribute)
+					and resolved_name(node, aliases) == REALTIME_MODULE
+				):
+					violations.append(
+						violation(rel, node, f"uses {REALTIME_MODULE} outside {RUN_STATUS_FILE}")
+					)
+				elif isinstance(node, ast.Constant) and isinstance(node.value, str):
+					# getattr(frappe, "publish_realtime"), frappe.get_attr("frappe.realtime..."), import_module(...)
+					for name in (*REALTIME_NAMES, REALTIME_MODULE):
+						if name in node.value:
+							violations.append(
+								violation(rel, node, f"names {name} in a string outside {RUN_STATUS_FILE}")
+							)
+			for lineno, target in imported_modules(tree, module_name(rel), rel.endswith("__init__.py")):
+				if module_in(target, REALTIME_MODULE):
+					violations.append(f"{rel}:{lineno}: imports {target} outside {RUN_STATUS_FILE}")
+			continue
+		called = set()
+		for node in ast.walk(tree):
+			if (
+				isinstance(node, ast.Call)
+				and resolved_name(node.func, aliases).rpartition(".")[2] == "publish_realtime"
+			):
+				called.add(id(node.func))
+				keywords = _call_keywords(node)
+				if "room" not in keywords:
+					violations.append(violation(rel, node, "publish_realtime without an explicit room="))
+				if not _is_constant(keywords.get("after_commit"), False):
+					violations.append(violation(rel, node, "publish_realtime without after_commit=False"))
+		for node in ast.walk(tree):
+			# any other mention (alias import, `publish = frappe.publish_realtime`) hides calls from the check above
+			if (referenced_name(node) == "publish_realtime" and id(node) not in called) or (
+				isinstance(node, ast.alias) and node.name == "publish_realtime" and node.asname
+			):
+				violations.append(violation(rel, node, "binds publish_realtime to another name"))
+	return violations
+
+
+def check_run_status_imported_only_by_runner(sources: dict) -> list:
+	"""ADR-008 decision 2: tools, handlers, tasks, gateway and eval never import the status module."""
+	violations = []
+	for rel, source in only_python(sources).items():
+		if rel in (RUNNER_FILE, RUN_STATUS_FILE):
+			continue
+		tree = parse(rel, source)
+		for lineno, target in imported_modules(tree, module_name(rel), rel.endswith("__init__.py")):
+			if module_in(target, RUN_STATUS_MODULE):
+				violations.append(f"{rel}:{lineno}: imports {target}; only {RUNNER_FILE} may (ADR-008)")
+		for node in constant_strings(tree):
+			if RUN_STATUS_MODULE in node.value:
+				violations.append(
+					violation(rel, node, f"names {RUN_STATUS_MODULE}; only {RUNNER_FILE} may (ADR-008)")
+				)
+	return violations
+
+
+def check_run_status_writes_nothing(sources: dict) -> list:
+	"""NFR-6, ADR-008 decision 5: the status module writes no record, cache entry, file or transaction state."""
+	source = sources.get(RUN_STATUS_FILE)
+	if source is None:
+		return []
+	violations = []
+	tree = parse(RUN_STATUS_FILE, source)
+	aliases = import_aliases(tree)
+	for node in ast.walk(tree):
+		if isinstance(node, ast.Call) and referenced_name(node.func) in RUN_STATUS_WRITE_NAMES:
+			violations.append(
+				violation(RUN_STATUS_FILE, node, f"calls {referenced_name(node.func)}: writes (NFR-6)")
+			)
+		elif (
+			isinstance(node, ast.Name | ast.Attribute)
+			and resolved_name(node, aliases) in RUN_STATUS_FORBIDDEN_ATTRIBUTES
+		):
+			violations.append(
+				violation(RUN_STATUS_FILE, node, f"uses {resolved_name(node, aliases)}: writes (NFR-6)")
+			)
+	for lineno, target in imported_modules(tree, module_name(RUN_STATUS_FILE), False):
+		if module_in(target, "erp_ai.gateway"):
+			violations.append(f"{RUN_STATUS_FILE}:{lineno}: imports {target} (ADR-008)")
+	return violations
+
+
+def check_no_open_doc_or_all_room(sources: dict) -> list:
+	"""R-1: no `open_doc:` room, no room="all" and no publish without an explicit room."""
+	violations = []
+	for rel, source in sources.items():
+		if not rel.endswith(".py"):
+			if OPEN_DOC_ROOM_PREFIX in source:
+				violations.append(f"{rel}:0: contains {OPEN_DOC_ROOM_PREFIX} (R-1)")
+			continue
+		tree = parse(rel, source)
+		aliases = import_aliases(tree)
+		constants = {
+			target.id: node.value.value
+			for node in tree.body
+			if isinstance(node, ast.Assign) and isinstance(node.value, ast.Constant)
+			for target in node.targets
+			if isinstance(target, ast.Name)
+		}
+		for node in constant_strings(tree):
+			if OPEN_DOC_ROOM_PREFIX in node.value:
+				violations.append(violation(rel, node, f"contains {OPEN_DOC_ROOM_PREFIX} (R-1)"))
+		for node in ast.walk(tree):
+			if (
+				isinstance(node, ast.Call)
+				and resolved_name(node.func, aliases).rpartition(".")[2] in REALTIME_NAMES
+			):
+				room = _call_keywords(node).get("room")
+				if (
+					room is None
+					or _is_constant(room, None)
+					or _is_constant(room, ALL_ROOM)
+					or (
+						isinstance(room, ast.Name)
+						and room.id in constants
+						and constants[room.id] in (None, ALL_ROOM)
+					)
+				):
+					violations.append(
+						violation(rel, node, "publishes without a document room or to room all (R-1)")
+					)
+	return violations
+
+
+def check_form_script_only_in_install(sources: dict) -> list:
+	"""ADR-007: the HD Form Script doctype is named only by install.py."""
+	violations = []
+	for rel, source in sources.items():
+		if rel == INSTALL_FILE:
+			continue
+		if not rel.endswith(".py"):
+			if FORM_SCRIPT_DOCTYPE_NAME in source:
+				violations.append(
+					f"{rel}:0: names {FORM_SCRIPT_DOCTYPE_NAME} outside {INSTALL_FILE} (ADR-007)"
+				)
+			continue
+		tree = parse(rel, source)
+		for node in constant_strings(tree):
+			if FORM_SCRIPT_DOCTYPE_NAME in node.value:
+				violations.append(
+					violation(rel, node, f"names {FORM_SCRIPT_DOCTYPE_NAME} outside {INSTALL_FILE} (ADR-007)")
+				)
+		for lineno, target in imported_modules(tree, module_name(rel), rel.endswith("__init__.py")):
+			if "hd_form_script" in target:
+				violations.append(f"{rel}:{lineno}: imports {target} outside {INSTALL_FILE} (ADR-007)")
+	return violations
+
+
+def check_hooks_have_no_page_injection(sources: dict) -> list:
+	"""ADR-007: hooks.py injects nothing into the page; the status script is not referenced there."""
+	source = sources.get(HOOKS_FILE)
+	if source is None:
+		return []
+	violations = []
+	tree = parse(HOOKS_FILE, source)
+	for node in tree.body:
+		targets = node.targets if isinstance(node, ast.Assign) else [getattr(node, "target", None)]
+		for target in targets:
+			if isinstance(target, ast.Name) and target.id in PAGE_INJECTION_HOOKS:
+				value = getattr(node, "value", None)
+				strings = [n.value for n in constant_strings(value)] if value is not None else []
+				if target.id == "fixtures" and not any(FORM_SCRIPT_DOCTYPE_NAME in text for text in strings):
+					continue
+				if target.id == "website_route_rules" and not any("helpdesk" in text for text in strings):
+					continue
+				violations.append(
+					violation(HOOKS_FILE, node, f"sets {target.id} (ADR-007: no page injection)")
+				)
+	for node in constant_strings(tree):
+		if "agent_status_indicator" in node.value or AGENT_STATUS_SCRIPT_NAME in node.value:
+			violations.append(violation(HOOKS_FILE, node, "references the status script (ADR-007)"))
+	return violations
+
+
+def check_install_deletes_only_status_script(sources: dict) -> list:
+	"""ADR-007 decision 4: install.py has exactly one delete, in before_uninstall, of the status script record."""
+	source = sources.get(INSTALL_FILE)
+	if source is None:
+		return []
+	tree = parse(INSTALL_FILE, source)
+	constants = {}
+	for node in tree.body:
+		if isinstance(node, ast.Assign) and isinstance(node.value, ast.Constant):
+			for target in node.targets:
+				if isinstance(target, ast.Name):
+					constants[target.id] = node.value.value
+
+	def resolve(arg):
+		if isinstance(arg, ast.Constant):
+			return arg.value
+		return constants.get(arg.id) if isinstance(arg, ast.Name) else None
+
+	owners = {}
+	for function in ast.walk(tree):
+		if isinstance(function, ast.FunctionDef | ast.AsyncFunctionDef):
+			for node in ast.walk(function):
+				owners[id(node)] = function.name
+	violations = []
+	deletes = []
+	for node in ast.walk(tree):
+		if isinstance(node, ast.Call) and referenced_name(node.func) in DELETE_NAMES:
+			deletes.append(node)
+		elif isinstance(node, ast.Constant) and isinstance(node.value, str) and SQL_DELETE.match(node.value):
+			violations.append(violation(INSTALL_FILE, node, "SQL delete in install code (ADR-007)"))
+	if len(deletes) != 1:
+		violations.append(f"{INSTALL_FILE}:0: expected exactly one delete, found {len(deletes)} (ADR-007)")
+	for call in deletes:
+		if owners.get(id(call)) != UNINSTALL_FUNCTION:
+			violations.append(violation(INSTALL_FILE, call, f"delete outside {UNINSTALL_FUNCTION} (ADR-007)"))
+		args = [resolve(arg) for arg in call.args[:2]]
+		if referenced_name(call.func) != "delete_doc" or args != [
+			FORM_SCRIPT_DOCTYPE_NAME,
+			AGENT_STATUS_SCRIPT_NAME,
+		]:
+			violations.append(
+				violation(
+					INSTALL_FILE,
+					call,
+					f"delete must be delete_doc of {FORM_SCRIPT_DOCTYPE_NAME} {AGENT_STATUS_SCRIPT_NAME}",
+				)
+			)
+	return violations
+
+
 class TestArchitecture(unittest.TestCase):
 	@classmethod
 	def setUpClass(cls):
@@ -782,6 +1080,44 @@ class TestArchitecture(unittest.TestCase):
 		script = load_product_sources(suffixes=(".js",)).get(STATUS_SCRIPT_FILE)
 		self.assertIsNotNone(script, f"{STATUS_SCRIPT_FILE} is missing")
 		self.assertIn(f'"{match.group(1)}"', script)
+
+	def test_publish_realtime_only_in_run_status(self):
+		self.assertIn(RUN_STATUS_FILE, self.sources)
+		self.assertIn("publish_realtime", self.sources[RUN_STATUS_FILE])
+		self.assertEqual(check_publish_realtime_only_in_run_status(self.sources), [])
+
+	def test_run_status_imported_only_by_runner(self):
+		self.assertIn(RUN_STATUS_FILE, self.sources)
+		runner_imports = imported_modules(
+			parse(RUNNER_FILE, self.sources[RUNNER_FILE]), module_name(RUNNER_FILE), False
+		)
+		self.assertIn(RUN_STATUS_MODULE, [target for _lineno, target in runner_imports])
+		self.assertEqual(check_run_status_imported_only_by_runner(self.sources), [])
+
+	def test_run_status_writes_nothing(self):
+		self.assertIn(RUN_STATUS_FILE, self.sources)
+		self.assertEqual(check_run_status_writes_nothing(self.sources), [])
+
+	def test_no_open_doc_or_all_room(self):
+		scanned = load_product_sources(suffixes=(".py", ".json", ".js", ".html"))
+		self.assertIn(RUN_STATUS_FILE, scanned)
+		self.assertIn(STATUS_SCRIPT_FILE, scanned)
+		self.assertEqual(check_no_open_doc_or_all_room(scanned), [])
+
+	def test_form_script_only_in_install(self):
+		scanned = load_product_sources(suffixes=(".py", ".json", ".js", ".html"))
+		self.assertIn(FORM_SCRIPT_DOCTYPE_NAME, scanned[INSTALL_FILE])
+		self.assertIn(STATUS_SCRIPT_FILE, scanned)
+		self.assertEqual(check_form_script_only_in_install(scanned), [])
+
+	def test_hooks_have_no_page_injection(self):
+		self.assertIn(HOOKS_FILE, self.sources)
+		self.assertEqual(check_hooks_have_no_page_injection(self.sources), [])
+
+	def test_install_deletes_only_status_script_on_uninstall(self):
+		self.assertIn(INSTALL_FILE, self.sources)
+		self.assertEqual(check_install_deletes_only_status_script(self.sources), [])
+		self.assertIn(f'before_uninstall = "{UNINSTALL_HOOK}"', self.sources[HOOKS_FILE])
 
 
 # ---------------------------------------------------------------------------------------------------
@@ -1182,6 +1518,206 @@ class TestScannersCatchViolations(unittest.TestCase):
 		for rel in violating:
 			self.assertCaught(violations, rel)
 		self.assertEqual(check_no_frappe_skipped_test_files(clean), [])
+
+	# status signals and form script (ADR-007, ADR-008) -----------------------------------------
+
+	GOOD_PUBLISH = (
+		"import frappe\nfrom frappe.realtime import get_doc_room\n"
+		"frappe.publish_realtime('e', message={}, room=get_doc_room('HD Ticket', 'T'), after_commit=False)\n"
+	)
+
+	def test_publish_realtime_scanner_catches_violations(self):
+		# publish_realtime / frappe.realtime only in run_status.py, with room= and after_commit=False
+		self.assertEqual(check_publish_realtime_only_in_run_status({RUN_STATUS_FILE: self.GOOD_PUBLISH}), [])
+		for source in (
+			"import frappe\nfrappe.publish_realtime('e', room='r', after_commit=False)\n",
+			"from frappe import publish_realtime\n",
+			"import frappe\nfrappe.publish_progress(1)\n",
+			"from frappe.realtime import emit_via_redis\n",
+			"import frappe\nfrappe.realtime.get_doc_room('HD Ticket', 'T')\n",
+			"from frappe.realtime import get_doc_room\n",
+			"import frappe\ngetattr(frappe, 'publish_realtime')('e')\n",
+			"import frappe\nfrappe.get_attr('frappe.publish_realtime')('e')\n",
+			"import importlib\nimportlib.import_module('frappe.realtime')\n",
+			"import frappe as f\nf.realtime.get_doc_room('HD Ticket', 'T')\n",
+			"from frappe import realtime as rt\nrt.get_doc_room('HD Ticket', 'T')\n",
+		):
+			with self.subTest(source=source):
+				self.assertCaught(check_publish_realtime_only_in_run_status({"agent/runner.py": source}))
+		for fragment, source in {
+			"room=": "import frappe\nfrappe.publish_realtime('e', after_commit=False)\n",
+			"after_commit=False": "import frappe\nfrappe.publish_realtime('e', room='r')\n",
+		}.items():
+			with self.subTest(fragment=fragment):
+				self.assertCaught(
+					check_publish_realtime_only_in_run_status({RUN_STATUS_FILE: source}), fragment
+				)
+		self.assertCaught(
+			check_publish_realtime_only_in_run_status(
+				{
+					RUN_STATUS_FILE: "import frappe\nfrappe.publish_realtime('e', room='r', after_commit=True)\n"
+				}
+			),
+			"after_commit=False",
+		)
+		# aliased or rebound publish_realtime inside run_status is still pinned to room= and after_commit=False
+		for fragment, source in {
+			"room=": "from frappe import publish_realtime as publish\npublish('e', after_commit=False)\n",
+			"binds publish_realtime": "from frappe import publish_realtime as publish\n",
+		}.items():
+			with self.subTest(fragment=fragment, source=source):
+				self.assertCaught(
+					check_publish_realtime_only_in_run_status({RUN_STATUS_FILE: source}), fragment
+				)
+		self.assertCaught(
+			check_publish_realtime_only_in_run_status(
+				{
+					RUN_STATUS_FILE: "import frappe\npublish = frappe.publish_realtime\n"
+					"publish('e', room='r', after_commit=False)\n"
+				}
+			),
+			"binds publish_realtime",
+		)
+		self.assertCaught(
+			check_publish_realtime_only_in_run_status(
+				{RUN_STATUS_FILE: "import frappe as f\nf.publish_realtime('e', room='r')\n"}
+			),
+			"after_commit=False",
+		)
+
+	def test_run_status_import_scanner_catches_violations(self):
+		# the status module is imported only by the runner
+		for rel, source in {
+			"agent/tools/read.py": "from erp_ai.agent import run_status\n",
+			"handlers.py": "from erp_ai.agent.run_status import RunStatus\n",
+			"tasks.py": "import erp_ai.agent.run_status\n",
+			"agent/queue.py": "from . import run_status\n",
+			"eval/run_eval.py": "import importlib\nimportlib.import_module('erp_ai.agent.run_status')\n",
+		}.items():
+			with self.subTest(rel=rel):
+				self.assertCaught(check_run_status_imported_only_by_runner({rel: source}), rel)
+		self.assertEqual(
+			check_run_status_imported_only_by_runner(
+				{RUNNER_FILE: "from erp_ai.agent.run_status import RunStatus\n"}
+			),
+			[],
+		)
+
+	def test_run_status_writes_nothing_scanner_catches_violations(self):
+		# the status module writes nothing
+		for source in (
+			"import frappe\nfrappe.db.set_value('X', 'y', 'z', 1)\n",
+			"import frappe\nfrappe.delete_doc('X', 'y')\n",
+			"import frappe\nfrappe.cache.set_value('k', 1)\n",
+			"import frappe\nfrappe.get_doc({}).insert()\n",
+			"def f(doc):\n\tdoc.save()\n",
+			"def f():\n\twith open('x', 'w') as handle:\n\t\thandle.write('1')\n",
+			"from erp_ai.gateway import call_model\n",
+			"import frappe\nfrappe.db.commit()\n",
+		):
+			with self.subTest(source=source):
+				self.assertCaught(check_run_status_writes_nothing({RUN_STATUS_FILE: source}))
+		# no banned write name is called here: only the frappe.cache / frappe.db attribute rule catches these
+		for fragment, source in (
+			("uses frappe.cache", "import frappe\nfrappe.cache.hset('k', 'f', 1)\n"),
+			("uses frappe.cache", "import frappe\nfrappe.cache.get_value('k')\n"),
+			("uses frappe.db", "import frappe\nfrappe.db.set_single_value('X', 'f', 1)\n"),
+			("uses frappe.cache", "import frappe as f\nf.cache.hset('k', 'f', 1)\n"),
+			("uses frappe.db", "from frappe import db\ndb.set_single_value('X', 'f', 1)\n"),
+			("uses frappe.cache", "from frappe import cache\ncache().hset('k', 'f', 1)\n"),
+		):
+			with self.subTest(fragment=fragment, source=source):
+				self.assertCaught(check_run_status_writes_nothing({RUN_STATUS_FILE: source}), fragment)
+		clean = self.GOOD_PUBLISH + "def f(errors):\n\terrors.append('x')\n"
+		self.assertEqual(check_run_status_writes_nothing({RUN_STATUS_FILE: clean}), [])
+		self.assertEqual(check_run_status_writes_nothing({"agent/runner.py": "def f(d):\n\td.save()\n"}), [])
+
+	def test_document_room_scanner_catches_violations(self):
+		# no open_doc: room, no room "all", no publish without a document room
+		for rel, source in {
+			"agent/runner.py": "room = 'open_doc:HD Ticket/T'\n",
+			"x/y.js": "socket.emit('open_doc:HD Ticket')",
+			RUN_STATUS_FILE: "import frappe\nfrappe.publish_realtime('e', room='all', after_commit=False)\n",
+			"tasks.py": "import frappe\nfrappe.publish_realtime('e', after_commit=False)\n",
+			"handlers.py": "import frappe\nfrappe.publish_realtime('e', room=None)\n",
+			"agent/queue.py": "from frappe import publish_realtime as publish\npublish('e', after_commit=False)\n",
+			"agent/policy.py": "import frappe as f\nf.publish_realtime('e', after_commit=False)\n",
+			"agent/tools/read.py": "import frappe\nROOM = 'all'\n"
+			"frappe.publish_realtime('e', room=ROOM, after_commit=False)\n",
+		}.items():
+			with self.subTest(rel=rel):
+				self.assertCaught(check_no_open_doc_or_all_room({rel: source}), rel)
+		self.assertEqual(check_no_open_doc_or_all_room({RUN_STATUS_FILE: self.GOOD_PUBLISH}), [])
+
+	def test_form_script_scanner_catches_violations(self):
+		# HD Form Script only in install.py
+		for rel, source in {
+			"agent/runner.py": "import frappe\nfrappe.get_doc('HD Form Script', 'x')\n",
+			"tasks.py": "DT = 'HD Form Script'\n",
+			"x/y.json": '{"doctype": "HD Form Script"}',
+			"x/y.html": "<p>HD Form Script</p>",
+			"handlers.py": "from helpdesk.helpdesk.doctype.hd_form_script import hd_form_script\n",
+		}.items():
+			with self.subTest(rel=rel):
+				self.assertCaught(check_form_script_only_in_install({rel: source}), rel)
+		self.assertEqual(check_form_script_only_in_install({INSTALL_FILE: "DT = 'HD Form Script'\n"}), [])
+
+	def test_hooks_scanner_catches_violations(self):
+		# hooks.py injects nothing into the page
+		for fragment, source in {
+			"app_include_js": "app_include_js = '/assets/erp_ai/js/agent_status_indicator.js'\n",
+			"web_include_js": "web_include_js = ['x.js']\n",
+			"app_include_css": "app_include_css = 'x.css'\n",
+			"after_request": "after_request = ['erp_ai.x.inject']\n",
+			"website_route_rules": "website_route_rules = [{'from_route': '/helpdesk/<path:app_path>', 'to_route': 'x'}]\n",
+			"fixtures": "fixtures = [{'dt': 'HD Form Script'}]\n",
+			"status script": "doc_events = {'x': 'agent_status_indicator'}\n",
+		}.items():
+			with self.subTest(fragment=fragment):
+				self.assertCaught(check_hooks_have_no_page_injection({HOOKS_FILE: source}), fragment)
+		self.assertCaught(
+			check_hooks_have_no_page_injection({HOOKS_FILE: f"x = '{AGENT_STATUS_SCRIPT_NAME}'\n"}),
+			"references the status script",
+		)
+		hooks_ok = (
+			"fixtures = [{'dt': 'Custom Field'}]\n"
+			"website_route_rules = [{'from_route': '/a', 'to_route': 'b'}]\n"
+			"# app_include_js = '/assets/erp_ai/js/x.js'\n"
+			"before_uninstall = 'erp_ai.install.before_uninstall'\n"
+		)
+		self.assertEqual(check_hooks_have_no_page_injection({HOOKS_FILE: hooks_ok}), [])
+
+	def test_install_scanner_catches_violations(self):
+		# install.py has exactly one delete: delete_doc of the status script in before_uninstall
+		good_install = (
+			"import frappe\n"
+			"FORM_SCRIPT_DOCTYPE = 'HD Form Script'\n"
+			"AGENT_STATUS_SCRIPT = 'ERP AI Agent Status'\n"
+			"def before_uninstall():\n"
+			"\tfrappe.delete_doc(FORM_SCRIPT_DOCTYPE, AGENT_STATUS_SCRIPT, ignore_permissions=True)\n"
+		)
+		self.assertEqual(check_install_deletes_only_status_script({INSTALL_FILE: good_install}), [])
+		moved_outside = (
+			"import frappe\n"
+			"FORM_SCRIPT_DOCTYPE = 'HD Form Script'\n"
+			"AGENT_STATUS_SCRIPT = 'ERP AI Agent Status'\n"
+			"def before_uninstall():\n"
+			"\tpass\n"
+			"def ensure_setup():\n"
+			"\tfrappe.delete_doc(FORM_SCRIPT_DOCTYPE, AGENT_STATUS_SCRIPT, ignore_permissions=True)\n"
+		)
+		for fragment, source in (
+			("found 0", good_install.replace("frappe.delete_doc(", "print(")),
+			("found 2", good_install + "\tfrappe.delete_doc('ToDo', 'x')\n"),
+			("outside before_uninstall", moved_outside),
+			("outside before_uninstall", good_install + "def ensure_setup():\n\tfrappe.db.delete('X', {})\n"),
+			("SQL delete", good_install + "def f():\n\tfrappe.db.sql('DELETE FROM `tabX`')\n"),
+			("delete must be", good_install.replace("AGENT_STATUS_SCRIPT,", "'Other',")),
+			("delete must be", good_install.replace("frappe.delete_doc(", "frappe.db.delete(")),
+			("delete must be", good_install.replace("FORM_SCRIPT_DOCTYPE,", "'HD Ticket',")),
+		):
+			with self.subTest(fragment=fragment, source=source):
+				self.assertCaught(check_install_deletes_only_status_script({INSTALL_FILE: source}), fragment)
 
 
 if __name__ == "__main__":

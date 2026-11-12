@@ -3,9 +3,11 @@
 import frappe
 from frappe import _
 from frappe.core.utils import html_to_plain_text
+from frappe.desk.form.activity import get_activity_timeline
 from frappe.utils import cstr, format_datetime
 from helpdesk.utils import is_agent
 
+from erp_ai.agent.policy import contains_keyword
 from erp_ai.constants import AGENT_USER, LOGGER_NAME
 
 TICKET_DOCTYPE = "HD Ticket"
@@ -55,10 +57,33 @@ def _ai_fields(ticket: str) -> list[dict]:
 	]
 
 
+def _thread(ticket: str) -> list[dict]:
+	"""B-5 (ADR-010): Comment items of the timeline written by the agent or containing the keyword, old to new."""
+	items = get_activity_timeline(TICKET_DOCTYPE, ticket, ["comment"])["activities"]
+	messages = []
+	for item in items:
+		if item["type"] != "comment":
+			continue
+		content = item["data"]["content"]
+		is_bot = item["author"]["email"] == AGENT_USER
+		if not is_bot and not contains_keyword(content):
+			continue
+		messages.append(
+			{
+				"name": item["data"]["name"],
+				"author": item["author"]["fullname"],
+				"is_bot": is_bot,
+				"created_at": format_datetime(item["timestamp"]),
+				"text": html_to_plain_text(content),
+			}
+		)
+	return messages
+
+
 @frappe.whitelist(methods=["POST"])
 def get_panel_data(ticket: str) -> dict:
 	if not isinstance(ticket, str) or not ticket.strip():
 		frappe.throw(_("Thiếu mã phiếu."), frappe.ValidationError)
 	ticket = ticket.strip()
 	_require_panel_access(ticket)
-	return {"ticket": ticket, "ai_fields": _ai_fields(ticket), "messages": []}
+	return {"ticket": ticket, "ai_fields": _ai_fields(ticket), "messages": _thread(ticket)}

@@ -878,9 +878,11 @@ class TestRunnerReasoning(RunnerTestBase):
 		self.assertTrue(all("cache_control" not in tool for tool in get_tool_schemas("L1", False)))
 
 	def test_reason_system_shows_configured_people(self):
-		user = make_active_agent(self)
+		user, prefix_user, head = (make_active_agent(self) for _ in range(3))
 		rules = json.loads(make_routing_rules())
 		rules["assignees"]["A"]["default"] = user
+		rules["assignees"]["B"]["prefixes"] = {"[pfx]": prefix_user}
+		rules["departments"] = {"Kế toán": {"team": "Nhóm KT", "head": head}}
 		set_agent_settings(permission_level="L1", routing_rules=json.dumps(rules))
 		with patch.object(runner, "get_fullname", side_effect=lambda uid: f"{PREFIX}Tên của {uid}"):
 			self._run("comment_mention")
@@ -888,7 +890,11 @@ class TestRunnerReasoning(RunnerTestBase):
 		(call,) = self.gateway.calls
 		text = call["system"][0]["text"]
 		self.assertIn("BẢNG ROUTING", text)
-		self.assertIn(f"{PREFIX}Tên của {user}", text)
+		# default, prefix assignee and department head: all three sources show the name, not the email
+		for uid in (user, prefix_user, head):
+			self.assertIn(f"{PREFIX}Tên của {uid}", text)
+			self.assertNotIn(f"| {uid}", text)
+			self.assertNotIn(f": {uid}", text)
 
 	def test_create_task_offered_only_with_instructor(self):
 		with patch.object(authority, "latest_instructor", return_value="Administrator"):

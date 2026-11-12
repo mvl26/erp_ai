@@ -263,13 +263,19 @@ class TestPrompts(FrappeTestCase):
 		config = json.loads(make_routing_rules())
 		config["assignees"]["A"] = {"default": "a1@x.com", "prefixes": {"[tracecore]": "a2@x.com"}}
 		config["assignees"]["B"]["default"] = "b1@x.com"
-		config["departments"] = {"Kế toán": {"team": "Kế toán", "head": "k1@x.com"}}
+		config["departments"] = {
+			"Kế toán": {"team": "Nhóm KT", "head": "k1@x.com"},
+			"Kho": {"team": "Nhóm Kho", "head": "k2@x.com"},
+			"Mua hàng": {"team": "Nhóm KT", "head": "k3@x.com"},
+		}
 		config.update(override)
 		names = {
 			"a1@x.com": "Người A1",
 			"a2@x.com": "Người A2",
 			"b1@x.com": "Người B1",
 			"k1@x.com": "Người K1",
+			"k2@x.com": "Người K2",
+			"k3@x.com": "Người K3",
 		}
 		return mapping, config, names
 
@@ -280,17 +286,30 @@ class TestPrompts(FrappeTestCase):
 		self.assertIn("| Đầu mục | Nhóm nhận | Người mặc định | Ưu tiên | SLA phản hồi / xử lý |", table)
 		self.assertIn("| A | IT | Người A1; [tracecore]: Người A2 | High | 15 phút / 480 phút |", table)
 		self.assertIn("| B | IT | Người B1 | Medium | 15 phút / 240 phút |", table)
-		self.assertIn(
-			"| D | Kế toán | Trưởng bộ phận: Người K1 (Kế toán) | Medium | 60 phút / theo Hạn hoàn thành |",
-			table,
+		self.assertIn("| C | IT | - | Medium | 60 phút / 1440 phút |", table)
+		heads = (
+			"Trưởng bộ phận: Người K1 (Kế toán); Trưởng bộ phận: Người K2 (Kho); "
+			"Trưởng bộ phận: Người K3 (Mua hàng)"
 		)
+		# D and E list every department: teams deduplicated (two departments share "Nhóm KT"), heads joined
+		self.assertIn(f"| D | Nhóm KT, Nhóm Kho | {heads} | Medium | 60 phút / theo Hạn hoàn thành |", table)
+		self.assertIn(f"| E | Nhóm KT, Nhóm Kho | {heads} | - | 60 phút / theo Hạn hoàn thành |", table)
 		self.assertIn("| F | IT | - | Low | 5 phút / 60 phút |", table)
 
-		# the default person changes: the new name shows, the old one is gone
+		# the default person changes: only that cell changes, the rest of the table is the same
+		table1 = table
 		config["assignees"]["A"]["default"] = "new@x.com"
-		table = prompts.build_routing_table(mapping, config, {**names, "new@x.com": "Người Mới"})
-		self.assertIn("Người Mới", table)
-		self.assertNotIn("Người A1", table)
+		table2 = prompts.build_routing_table(mapping, config, {**names, "new@x.com": "Người Mới"})
+		self.assertEqual(table2, table1.replace("Người A1", "Người Mới"))
+		self.assertNotEqual(table2, table1)
+
+	def test_routing_table_cell_escapes_pipe_and_newline(self):
+		mapping, config, names = self._routing_inputs()
+		names["a1@x.com"] = "Người|A1\nHai"
+		table = prompts.build_routing_table(mapping, config, names)
+		self.assertIn("| A | IT | Người/A1 Hai; [tracecore]: Người A2 | High |", table)
+		for line in table.splitlines()[4:]:
+			self.assertEqual(line.count("|"), 6, line)
 
 	def test_routing_table_falls_back_to_user_id_without_name(self):
 		mapping, config, names = self._routing_inputs()

@@ -34,9 +34,13 @@ def apply_route(decision: RouteDecision, classification: Classification, ctx: To
 		ai_importance=classification.importance,
 		ai_score_reason=classification.score_reason,
 	)
-	for field in (*values, "ai_classified_by", "ai_updated_at"):
+	for field in ("ai_classified_by", "ai_updated_at"):
 		if not doc.has_permlevel_access_to(field, permission_type="write"):
 			return _fail(f"thiếu quyền ghi trường {field}")
+	for field in list(values):
+		if not doc.has_permlevel_access_to(field, permission_type="write"):
+			del values[field]
+			skipped.append({"field": field, "reason": "thiếu quyền ghi trường"})
 	before = {field: doc.get(field) for field in values}
 	doc.update(values)
 	doc.ai_classified_by = CLASSIFIED_BY_AI

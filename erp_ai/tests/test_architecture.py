@@ -817,7 +817,7 @@ def check_run_status_writes_nothing(sources: dict) -> list:
 				violation(RUN_STATUS_FILE, node, f"calls {referenced_name(node.func)}: writes (NFR-6)")
 			)
 		elif (
-			isinstance(node, ast.Attribute)
+			isinstance(node, ast.Name | ast.Attribute)
 			and resolved_name(node, aliases) in RUN_STATUS_FORBIDDEN_ATTRIBUTES
 		):
 			violations.append(
@@ -1623,6 +1623,8 @@ class TestScannersCatchViolations(unittest.TestCase):
 			("uses frappe.cache", "import frappe\nfrappe.cache.get_value('k')\n"),
 			("uses frappe.db", "import frappe\nfrappe.db.set_single_value('X', 'f', 1)\n"),
 			("uses frappe.cache", "import frappe as f\nf.cache.hset('k', 'f', 1)\n"),
+			("uses frappe.db", "from frappe import db\ndb.set_single_value('X', 'f', 1)\n"),
+			("uses frappe.cache", "from frappe import cache\ncache().hset('k', 'f', 1)\n"),
 		):
 			with self.subTest(fragment=fragment, source=source):
 				self.assertCaught(check_run_status_writes_nothing({RUN_STATUS_FILE: source}), fragment)

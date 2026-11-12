@@ -5,6 +5,10 @@ from erp_ai.gateway.breaker import Action, ApiFailure, decide
 
 SPEND_CODE = "enforced_spend_limit_reached"
 QUOTA_PREFIX = "You have reached your specified"
+CREDIT_PREFIX = (
+	"Your credit balance is too low to access the Anthropic API. "
+	"Please go to Plans & Billing to upgrade or purchase credits."
+)[:100]
 PAUSED = constants.KEY_STATUS_PAUSED
 QUOTA = constants.KEY_STATUS_QUOTA_EXHAUSTED
 BAD_KEY = constants.KEY_STATUS_BAD_KEY
@@ -46,6 +50,12 @@ class TestBreaker(FrappeTestCase):
 			(
 				"row6 400 quota message",
 				failure(400, message_prefix=QUOTA_PREFIX),
+				1,
+				Action(QUOTA, None, True, "message", "quota"),
+			),
+			(
+				"row6 400 credit balance",
+				failure(400, message_prefix=CREDIT_PREFIX),
 				1,
 				Action(QUOTA, None, True, "message", "quota"),
 			),

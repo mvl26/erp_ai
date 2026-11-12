@@ -45,6 +45,10 @@ def contains_keyword(content) -> bool:
 	return keyword.casefold() in (content or "").casefold()
 
 
+def get_trigger_keyword() -> str:
+	return frappe.db.get_single_value(SETTING_DOCTYPE, "trigger_keyword") or ""
+
+
 def effective_level(settings) -> str:
 	"""The only reader of permission_level; over budget caps at L1 but never raises L0."""
 	level = settings.permission_level

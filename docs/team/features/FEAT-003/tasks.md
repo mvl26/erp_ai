@@ -11,16 +11,17 @@ Mỗi task 2–5 phút. Hai task chung file thì phụ thuộc nhau. Đánh dấ
 `cmd.test_one` = lệnh của profile với `{file}` là file ở `test:`. Mọi task: viết test đỏ trước (STD-TEST-1), chỉ sửa trong `files:`. Tên hàm, hằng, chuỗi chính xác: `plan.md` mục Ràng buộc chung và `design.md` mục 3.
 
 Tiến độ: BASE ghi ở đây trước mỗi lần gọi dev.
-- BASE T1=3dd7358 · BASE T3=3dd7358
+- BASE T1=8c6d925 · T3=8c6d925 · T2=1560098 · T4=f7dc6b1 · T5=b433459 · T6=3cfa6bf · T7=3cfa6bf · T8=da2d63e · T12=da2d63e · T9=92aef2f · T13=92aef2f
+- Ticked T1..T7 on `Ran 621 tests ... OK` (da2d63e, T1..T7 merged). T8, T12 merged (92aef2f), tick after the full run in the T9 step 0. Ruling D-1 (T3): see review-03.md.
 
 ## Phần 2, walking skeleton (T1 rồi T2; không task phần 2 nào khác bắt đầu trước khi review T2 là approve)
 
-- [ ] T1 — Skeleton server: `get_panel_data` trả 4 mục AI qua cổng quyền — files: erp_ai/constants.py, erp_ai/ticket_panel.py, erp_ai/tests/test_ticket_panel.py, erp_ai/tests/test_architecture.py — test: erp_ai/tests/test_ticket_panel.py — depends: —
+- [x] T1 — Skeleton server: `get_panel_data` trả 4 mục AI qua cổng quyền — files: erp_ai/constants.py, erp_ai/ticket_panel.py, erp_ai/tests/test_ticket_panel.py, erp_ai/tests/test_architecture.py — test: erp_ai/tests/test_ticket_panel.py — depends: —
   - Criterion: AC-7 (4 mục đúng label/giá trị/null), AC-13 (đọc: từ chối non-agent, Guest, Agent không quyền đọc phiếu, HD Agent `is_active = 0`, phiếu không tồn tại), ADR-010 QĐ 2 (POST, không guest)
   - Receives: `AGENT_USER` (hiện có), `helpdesk.utils.is_agent`
   - Returns: `PANEL_METHODS`, `PANEL_MAX_MESSAGE_CHARS` (cả hai trong constants.py, đủ 2 chuỗi method ngay từ đây); `get_panel_data(ticket: str) -> dict` trả `{"ticket", "ai_fields": [4 phần tử], "messages": []}`; `_require_panel_access(ticket: str, *, forbid_agent_user: bool = False) -> None`; dòng `LAYER_RULES` cho `erp_ai.ticket_panel` (tầng Cửa vào)
   - Expect: `cmd.test_one` với erp_ai/tests/test_ticket_panel.py: `test_methods_whitelisted_post_without_guest` (chỉ kiểm `get_panel_data` ở task này), `test_read_returns_ai_fields_as_stored_text`, `test_read_empty_ai_fields_are_null`, `test_read_ai_fields_use_hd_ticket_labels`, `test_read_denied_for_non_agents_and_guest`, `test_read_denied_for_agent_without_ticket_read`, `test_inactive_hd_agent_denied` đạt; `test_architecture::test_layer_imports` vẫn xanh
-- [ ] T2 — Skeleton trang: action "Trao đổi với bot" mở ngăn tối thiểu hiện 4 mục AI — files: erp_ai/public/js/agent_status_indicator.js, erp_ai/tests/test_architecture.py — test: erp_ai/tests/test_architecture.py — depends: T1
+- [x] T2 — Skeleton trang: action "Trao đổi với bot" mở ngăn tối thiểu hiện 4 mục AI — files: erp_ai/public/js/agent_status_indicator.js, erp_ai/tests/test_architecture.py — test: erp_ai/tests/test_architecture.py — depends: T1
   - Criterion: AC-6 (≤ 1 lần bấm, tiêu đề ngăn), AC-7 (chữ "Chưa có"), AC-12 (chỉ `textContent`)
   - Receives: `PANEL_METHODS` (T1), khóa action `label`/`onClick` (đối chiếu `TicketHeader.vue:24-30`)
   - Returns: `function setupForm({ doc, call, router })` trả `{ actions: [{ label: "Trao đổi với bot", onClick }] }` (như cũ `{ actions: [] }` khi không socket hoặc `innerWidth < 640`); `state.call`; `togglePanel()`; `reload()` bản tối thiểu (gọi `state.call("erp_ai.ticket_panel.get_panel_data", { ticket })`, vẽ `ai_fields`); trong test_architecture.py: sửa `STATUS_SCRIPT_FORBIDDEN` (bỏ đúng `\bcall\b`, thêm các chuỗi cấm ADR-009 ở design mục 8 C dòng đầu) và ghim chữ ký mới; mọi chuỗi cấm cũ còn nguyên
@@ -28,17 +29,17 @@ Tiến độ: BASE ghi ở đây trước mỗi lần gọi dev.
 
 ## Phần 1, mô tả field (độc lập với phần 2; đi song song được)
 
-- [ ] T3 — Mô tả và nhóm cho ERP AI Setting (22 field, 7 Section Break) — files: erp_ai/tests/test_doctype_descriptions.py, erp_ai/erp_ai_agent/doctype/erp_ai_setting/erp_ai_setting.json — test: erp_ai/tests/test_doctype_descriptions.py — depends: —
+- [x] T3 — Mô tả và nhóm cho ERP AI Setting (22 field, 7 Section Break) — files: erp_ai/tests/test_doctype_descriptions.py, erp_ai/erp_ai_agent/doctype/erp_ai_setting/erp_ai_setting.json — test: erp_ai/tests/test_doctype_descriptions.py — depends: —
   - Criterion: AC-1, AC-2, AC-3, AC-4, AC-5, NFR-1 (phạm vi ERP AI Setting)
   - Receives: bảng "Dữ liệu" của spec (dòng 56-80), bảng chia nhóm design mục 2.1
   - Returns: file test mới có hằng `DOCTYPE_CONFIG` (khóa theo tên DocType: số field kỳ vọng, cụm bắt buộc, tên Section Break) và các test `test_every_visible_field_has_description`, `test_descriptions_at_most_400_chars`, `test_required_phrases_present`, `test_read_only_fields_say_system_writes`, `test_section_breaks_labelled_in_vietnamese`, `test_descriptions_have_no_sensitive_data`, `test_descriptions_contain_no_stored_setting_values`, `test_section_breaks_carry_only_label` lặp bằng `subTest` trên `DOCTYPE_CONFIG`; T3 chỉ đăng ký ERP AI Setting
   - Expect: đỏ (trước): thiếu 21/22 mô tả; xanh (sau): `cmd.test_one` OK; `test_erp_ai_setting.py` hiện có xanh
-- [ ] T4 — Mô tả và nhóm cho ERP AI Credential (18 field, 4 Section Break) — files: erp_ai/tests/test_doctype_descriptions.py, erp_ai/erp_ai_agent/doctype/erp_ai_credential/erp_ai_credential.json — test: erp_ai/tests/test_doctype_descriptions.py — depends: T3
+- [x] T4 — Mô tả và nhóm cho ERP AI Credential (18 field, 4 Section Break) — files: erp_ai/tests/test_doctype_descriptions.py, erp_ai/erp_ai_agent/doctype/erp_ai_credential/erp_ai_credential.json — test: erp_ai/tests/test_doctype_descriptions.py — depends: T3
   - Criterion: AC-1..AC-5, NFR-1 (phạm vi ERP AI Credential; `budget_month_usd` có "0" và "không giới hạn"; `api_key` không có `sk-`)
   - Receives: `DOCTYPE_CONFIG` (T3)
   - Returns: mục mới của `DOCTYPE_CONFIG` cho ERP AI Credential
   - Expect: đỏ rồi xanh với `cmd.test_one`; `test_erp_ai_credential.py` hiện có xanh
-- [ ] T5 — Mô tả và nhóm cho ERP AI Log (31 field, 6 Section Break) — files: erp_ai/tests/test_doctype_descriptions.py, erp_ai/erp_ai_agent/doctype/erp_ai_log/erp_ai_log.json — test: erp_ai/tests/test_doctype_descriptions.py — depends: T4
+- [x] T5 — Mô tả và nhóm cho ERP AI Log (31 field, 6 Section Break) — files: erp_ai/tests/test_doctype_descriptions.py, erp_ai/erp_ai_agent/doctype/erp_ai_log/erp_ai_log.json — test: erp_ai/tests/test_doctype_descriptions.py — depends: T4
   - Criterion: AC-1..AC-5, NFR-1 (phạm vi ERP AI Log; `skipped_fields` ngay sau `value_after`, không Break giữa hai field; mọi field có "Hệ thống tự ghi" và "không sửa được")
   - Receives: `DOCTYPE_CONFIG` (T4)
   - Returns: mục mới của `DOCTYPE_CONFIG` cho ERP AI Log; test `test_skipped_fields_still_follows_value_after`
@@ -46,12 +47,12 @@ Tiến độ: BASE ghi ở đây trước mỗi lần gọi dev.
 
 ## Phần 2, server và policy
 
-- [ ] T6 — `get_trigger_keyword()` trong policy — files: erp_ai/agent/policy.py, erp_ai/agent/test_policy.py — test: erp_ai/agent/test_policy.py — depends: —
+- [x] T6 — `get_trigger_keyword()` trong policy — files: erp_ai/agent/policy.py, erp_ai/agent/test_policy.py — test: erp_ai/agent/test_policy.py — depends: —
   - Criterion: AC-9, AC-15 (`contains_keyword` không sửa một dòng)
   - Receives: cách `contains_keyword` đọc `trigger_keyword` (`policy.py:41-45`)
   - Returns: `get_trigger_keyword() -> str` (chỉ đọc `trigger_keyword`; rỗng → `""`)
   - Expect: `cmd.test_one` với erp_ai/agent/test_policy.py → `test_get_trigger_keyword_matches_contains_keyword` đạt; test cũ của `contains_keyword` không đổi
-- [ ] T7 — `get_panel_data` trả luồng tin theo B-5 — files: erp_ai/ticket_panel.py, erp_ai/tests/test_ticket_panel.py — test: erp_ai/tests/test_ticket_panel.py — depends: T1
+- [x] T7 — `get_panel_data` trả luồng tin theo B-5 — files: erp_ai/ticket_panel.py, erp_ai/tests/test_ticket_panel.py — test: erp_ai/tests/test_ticket_panel.py — depends: T1
   - Criterion: AC-8, AC-12 (phía server)
   - Receives: `get_activity_timeline` (`frappe/desk/form/activity.py`, khóa mục dev đọc ở dòng 254-271,331-337), `policy.contains_keyword`, `AGENT_USER`, `html_to_plain_text`
   - Returns: `messages`: danh sách `{name, author, is_bot, created_at, text}`, cũ → mới; không khóa email

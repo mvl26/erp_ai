@@ -14,4 +14,5 @@ Thứ tự còn lại: T26, MỘT dev.
   - Đầu thật là `team/FEAT-006-task-24-rework2`. Không đổi mã sản xuất. `RoutingTestBase.setUp` nay ghim role (AC-17). Deferred cho designer: `value_before` vs design 3.5; hàng test-plan 493.
 - [x] T25 — BASE=601ebe7, 3 vòng (2 vòng sửa), merge 89523a1, review-25; cmd.test đầu nhánh task e8db035: Ran 860 tests, OK
   - Đầu thật là `team/FEAT-006-task-25-rework2`. `TestRunEvalRun.setUp` gieo `category_mapping` + `routing_rules` (A-13). Lệnh eval thật thuộc qa (AC-15).
-- [ ] T26 — BASE=ghi ở dòng "BASE T26" bên dưới; dev đang chạy (2026-11-13, chặng 6). Touchpoint: `erp_ai/tests/test_architecture.py`.
+- [x] T26 — BASE=2cd3ba3, 2 vòng (1 vòng sửa), merge e5d9b38, review-26; cmd.test đầu nhánh task 136abf5: Ran 880 tests, OK
+  - Đầu thật là `team/FEAT-006-task-26-rework1`. Không đổi mã sản xuất; 10 luật + 10 ca bộ quét, `POLICY_FIELDS` có `auto_assign_enabled`; `authority.py:53` (`_assign`, FEAT-002) được miễn đúng một hàm. Deferred cho designer: xem review-26.md.

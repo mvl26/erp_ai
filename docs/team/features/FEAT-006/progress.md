@@ -36,6 +36,8 @@ Quy trình:
 - [x] T9b — BASE=8a1bd31, 2 vòng (1 vòng sửa), merge 4dc14d7, review-09b; cmd.test đầu nhánh task 566f796: Ran 744 tests, OK
 - [x] T13 — BASE=5688f13, 2 vòng (1 vòng sửa), merge 43cca1f, review-13; cmd.test đầu nhánh task 388f562: Ran 751 tests, OK
 - [x] T14 — BASE=b74303f, 2 vòng (1 vòng sửa, một lần DESIGN_CONFLICT được giải), merge 8fdc05f, review-14; cmd.test đầu nhánh task 809fac6: Ran 764 tests, OK
+- [x] T15 — BASE=6b4b9f7, 1 vòng, merge 434fa4e, review-15; cmd.test đầu nhánh task e3e2500: Ran 769 tests, OK
+- [x] T16 — BASE=24f04a4, 1 vòng, merge 7fdf122, review-16; cmd.test đầu nhánh task a24b9a2: Ran 780 tests, OK
 
 ## Checkpoint C2 (trên 1f0b3f7)
 
@@ -43,6 +45,16 @@ Quy trình:
 - `ensure_setup` chạy hai lần (sau migrate đã chạy một lần qua after_migrate): ảnh chụp 2 và 3 bằng nhau ở `Task-ai_ticket` (mọi cột, kể cả modified), dòng Custom DocPerm Task/ERP AI Agent (share 1, if_owner 1), `routing_rules` và `auto_assign_enabled` trong tabSingles, 11 field `ai_*` của HD Ticket, Has Role của tài khoản agent (99 dòng), HD Form Script, User; tổng Custom Field 247, Custom DocPerm 1360.
 - `cmd.test` (`bench --site miyano run-tests --app erp_ai`) trên 1f0b3f7: exit 0, `Ran 738 tests in 116.196s`, `OK`.
 - `routing_rules` trong DB là JSON mặc định; `auto_assign_enabled` = 0; `validate_routing_config` chấp nhận.
+
+## Checkpoint C3 (trên 7fdf122; cây mã trùng a24b9a2, đầu nhánh T16)
+
+- `cmd.test` (`bench --site miyano run-tests --app erp_ai`, dev chạy một mình trên đầu nhánh T16 a24b9a2): `Ran 780 tests in 129.264s`, `OK`. Tech-lead: `git diff --stat a24b9a2 team/FEAT-006 -- . ':!docs'` rỗng, tức cây mã sau merge 7fdf122 trùng cây đã chạy xanh (role-policy chặn tech-lead chạy bench với PYTHONPATH).
+- Lớp ghi chạy qua Helpdesk thật (không giả lập), mỗi ca có đột biến đỏ rồi xanh trong review:
+  - SLA do Helpdesk chọn theo `condition`: `TestSlaFromHelpdesk::test_sla_chosen_by_complexity_condition`, `test_ge_condition_saves_l0_and_new_ticket` (review-14).
+  - Assignment Rule / gán người qua `assign_to.add` thật: `TestAssignOwner::test_ticket_never_shared_one_todo_one_notification` (1 ToDo, 1 Notification Log, DocShare của phiếu = 0; review-15). Rule do Helpdesk chạy trong cùng lần `doc.save()` của `apply_route` là việc của T20/T21 (runner), chưa thuộc C3.
+  - Chia sẻ Task: `TestCreateRoutedTask::test_assignee_without_projects_user_gets_share` (người được giao không có Projects User vẫn thấy Task nhờ DocShare read=1), `test_sharing_disabled_raises` (lỗi chia sẻ ném lên, không bị bắt; review-16).
+- Đã thêm ở chặng 3: `erp_ai/agent/site_facts.py` (T13), `apply_route` đầy đủ (T14), `assign_owner`/`post_routing_comment` (T15), `create_routed_task` + `create_task` đặt `ai_ticket` (T16), bộ kiểm `routing_rules` từ chối trống và khóa tiền tố rỗng (T9b).
+- Chưa chạy `migrate` ở C3: chặng 3 không đổi schema/DocType/install (chỉ `agent/` và `routing.py`, `erp_ai_setting.py` logic kiểm).
 
 ## Quyết định của team-leader sau C2 (journal "quyết định 4 điểm")
 
@@ -54,11 +66,14 @@ Quy trình:
 ## Việc dặn trước cho các task sau (từ review)
 
 - T20: `applied` của bản ghi `classify` dùng `result["ok"]`, không dùng "`after` khác rỗng" (review-14, `runner.py:276`); `applied_sla` có thể trả `resolution_s=None` khi phiếu có `sla` mà không có `priority`, T20 phải xử lý (review-13).
+- T21: chỉ gọi `post_routing_comment` khi `lines` khác rỗng (review-15; `post_routing_comment([], ctx)` sẽ đăng comment rỗng).
+- T22: lỗi chia sẻ ném `frappe.ValidationError` từ `create_routed_task` (không bị bắt); runner rollback Task + ToDo trong savepoint (review-16).
+- T26: thêm kiểm tĩnh `test_assign_to_only_in_route_module`, `test_no_share_bypass` (review-15, review-16).
 - design.md: bổ sung 2 hàng lỗi mới ở 3.3 (trống; khóa tiền tố rỗng, review-09b) và chỉnh 3.4 cho khớp tasks.md T14 (review-14); việc của designer/khi gộp.
 
 ## Đang build
 
-Chặng 3 (`--decide`): T9b, T13, T14 xong; kế tiếp T15 → T16 (MỘT dev mỗi lần), dừng ở checkpoint C3 rồi báo cáo.
+Dừng ở C3 theo `--decide` (chặng 3: T9b, T13, T14, T15, T16 xong). Việc kế tiếp: T17 (depends T16, T8), T18, T19 (T4, T5, T10, T11), T20..T26 theo `depends:`; MỘT dev mỗi lần.
 
 ## Nhật ký
 
@@ -74,3 +89,6 @@ Chặng 3 (`--decide`): T9b, T13, T14 xong; kế tiếp T15 → T16 (MỘT dev m
 - 2026-11-12 T9b: vòng 1 request-changes (major STD-ERR-3: thông báo trống nhắc tên hằng Python; minor: `.strip()` trên giá trị không phải chuỗi); vòng 2 approve; merge 4dc14d7; 744 OK.
 - 2026-11-12 T13: vòng 1 request-changes (major STD-TEST-2: bộ lọc `reference_type` không có ca mồi; 3 minor); vòng 2 approve; merge 43cca1f; 751 OK.
 - 2026-11-12 T14: vòng 1 request-changes (2 major: `before`/`after` liệt kê trường không đổi; test giả quyền bỏ qua `permission_type`); dev sửa DESIGN_CONFLICT vì 3 test `test_agent_runner.py` (kỳ vọng cũ) → tech-lead mở rộng touchpoint 1 file, dev khác sửa kỳ vọng; vòng 2 approve; merge 8fdc05f; 764 OK.
+- 2026-11-12 T15: reviewer approve vòng 1 (minor: `deny_read` của test từ chối đọc bỏ qua đối số user); merge 434fa4e; 769 OK.
+- 2026-11-12 T16: reviewer approve vòng 1 (3 minor); merge 7fdf122; 780 OK.
+- 2026-11-12 C3: dừng báo cáo; vai đã dùng: dev, reviewer (không tính lần gọi lại).

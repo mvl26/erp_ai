@@ -12,6 +12,7 @@ synthetic violating code (must be caught) and clean code (must not be flagged).
 """
 
 import ast
+import json
 import re
 import shlex
 import sys
@@ -93,7 +94,7 @@ CONFIG_CONTROLLER_FILES = (
 CONFIG_VARIABLE_NAMES = ("settings", "setting", "credential", "credentials")
 DOC_GETTERS = ("get_doc", "get_single", "get_cached_doc", "new_doc")
 
-TOOL_FORBIDDEN_CALL_SUFFIXES = ("db.set_value", "set_user", "db.multisql")
+TOOL_FORBIDDEN_CALL_SUFFIXES = ("db.set_value", "set_user", "db.multisql", "db_update")
 SQL_READ_ONLY = re.compile(r"^\s*(select|show|describe)\b", re.IGNORECASE)
 
 # ADR-001: product code imports only the standard library, frappe, helpdesk and itself; `anthropic` (declared
@@ -101,7 +102,7 @@ SQL_READ_ONLY = re.compile(r"^\s*(select|show|describe)\b", re.IGNORECASE)
 ALLOWED_TOP_LEVEL_MODULES = frozenset({PACKAGE, "frappe", "helpdesk", *sys.stdlib_module_names})
 ANTHROPIC_MODULE = "anthropic"
 
-POLICY_FIELDS = ("permission_level", "excluded_teams", "ai_opt_out")
+POLICY_FIELDS = ("permission_level", "excluded_teams", "ai_opt_out", "auto_assign_enabled")
 
 SECRET_READERS = ("get_decrypted_password", "get_password")
 SECRET_NAMES = ("api_key", "apikey", "secret", "password", "token")
@@ -662,9 +663,13 @@ def check_policy_fields_only_in_policy(sources: dict) -> list:
 	for rel, source in only_python(sources).items():
 		if rel == POLICY_FILE:
 			continue
-		for node in ast.walk(parse(rel, source)):
+		tree = parse(rel, source)
+		aliases = import_aliases(tree)
+		for node in ast.walk(tree):
 			name = referenced_name(node)
 			if name in POLICY_FIELDS:
+				if resolved_name(node, aliases) == f"{module_name(POLICY_FILE)}.{name}":
+					continue  # `policy.auto_assign_enabled(...)` is the function of policy.py, not a field read
 				violations.append(violation(rel, node, f"reads {name} outside {POLICY_FILE}"))
 			elif isinstance(node, ast.Constant) and node.value in POLICY_FIELDS:
 				violations.append(violation(rel, node, f"reads {node.value!r} outside {POLICY_FILE}"))
@@ -1395,6 +1400,296 @@ def check_ticket_panel_does_not_evaluate_agent_gates(sources: dict) -> list:
 	return violations
 
 
+# ---------------------------------------------------------------------------------------------------
+# FEAT-006 rules (ADR-019..021 "Ràng buộc", AC-7c, AC-10, AC-14)
+# ---------------------------------------------------------------------------------------------------
+
+ROUTE_FILE = "agent/tools/route_ticket.py"
+ROUTE_MODULE_NAME = "route_ticket"
+REGISTRY_FILE = "agent/tools/registry.py"
+RUN_LOG_FILE = "agent/run_log.py"
+LOG_DOCTYPE_FILE = "erp_ai_agent/doctype/erp_ai_log/erp_ai_log.json"
+AUTHORITY_FILE = "agent/authority.py"
+AGENT_PREFIX = "agent/"
+
+ROUTE_NOT_A_TOOL_NAMES = ("TOOLS", "ToolSpec")
+ROUTE_SAVE_FUNCTION = "apply_route"
+ASSIGN_MODULE = "frappe.desk.form.assign_to"
+ASSIGN_CALL_SUFFIXES = ("assign_to.add", "assign_to.add_multiple", "assign_agent")
+ASSIGN_AGENT_NAME = "assign_agent"
+ROUTE_WRITE_FUNCTIONS = ("apply_route", "assign_owner", "post_routing_comment", "create_routed_task")
+TODO_DOCTYPE = "ToDo"
+DOC_CREATE_CALLS = ("get_doc", "new_doc")
+SHARE_BYPASS_NAMES = ("ignore_share_permission", "add_docshare")
+SHARE_BYPASS_SUFFIXES = ("assign_to._add", "frappe.share.add")
+ENTRY_TYPES_EXPECTED = ("classify", "reason", "skip")
+
+# `_assign` is the denormalised JSON column of HD Ticket. Routing must read ToDo through site_facts instead.
+# authority.py (FEAT-002, "who may instruct the bot") predates routing and is the one reader allowed.
+ASSIGN_FIELD = re.compile(r"(?<![A-Za-z0-9])_assign(?![A-Za-z0-9_])")
+ASSIGN_FIELD_ALLOWED_FILE = AUTHORITY_FILE
+ASSIGN_FIELD_ALLOWED_FUNCTION = "_assigned_by_other"
+
+SLA_DATE_FIELDS = ("response_by", "resolution_by")
+SLA_WRITE_CALLS = ("setattr", "set", "set_value", "db_set", "update")
+
+# Names of the people the old hard-coded routing table listed (spec 16.2), matched as whole words.
+DEFAULT_PEOPLE = ("Việt", "Tiến", "Hiếu", "Lan", "Hà", "Thư", "Chi")
+PERSON_NAME = re.compile(r"(?<!\w)(?:" + "|".join(DEFAULT_PEOPLE) + r")(?!\w)")
+# Same letters, other meaning: "Việt Nam" (prompts.py), "Tiếng Việt" (prompts.py), "Thư mục" (tools/source.py).
+NAME_COINCIDENCES = re.compile(r"(?<!\w)(?:Việt Nam|Tiếng Việt|Thư mục)(?!\w)")
+# The bot's own account as a string literal; `erp_ai.agent...` module paths do not match (`_` is a word char).
+AGENT_ACCOUNT = re.compile(r"(?<![\w.])ai\.agent(?!\w)")
+
+
+def _missing(rel: str) -> list:
+	return [f"{rel}: file missing"]
+
+
+def _node_names(node) -> list:
+	"""Every bare name a node carries: Name/Attribute, import alias, keyword argument, string constant."""
+	names = []
+	if (name := referenced_name(node)) is not None:
+		names.append(name)
+	if isinstance(node, ast.alias):
+		names.append(node.name.split(".")[-1])
+	elif isinstance(node, ast.keyword) and node.arg:
+		names.append(node.arg)
+	elif isinstance(node, ast.Constant) and isinstance(node.value, str):
+		names.append(node.value)
+	return names
+
+
+def check_route_module_is_not_a_tool(sources: dict) -> list:
+	"""ADR-019: route_ticket.py is no tool: no TOOLS / ToolSpec in it, not listed by the registry."""
+	registry, route = sources.get(REGISTRY_FILE), sources.get(ROUTE_FILE)
+	if registry is None:
+		return _missing(REGISTRY_FILE)
+	if route is None:
+		return _missing(ROUTE_FILE)
+	violations = []
+	for node in constant_strings(parse(REGISTRY_FILE, registry)):
+		if ROUTE_MODULE_NAME in node.value:
+			violations.append(
+				violation(REGISTRY_FILE, node, f"the registry lists {ROUTE_MODULE_NAME} (ADR-019)")
+			)
+	for node in ast.walk(parse(ROUTE_FILE, route)):
+		for name in _node_names(node):
+			if name in ROUTE_NOT_A_TOOL_NAMES and not isinstance(node, ast.Constant):
+				violations.append(violation(ROUTE_FILE, node, f"{name} in the routing module (ADR-019)"))
+	# No other tool module may expose a routing write function as a tool handler either.
+	for rel, source in only_python(scoped(sources, TOOLS_PREFIX)).items():
+		if rel == ROUTE_FILE:
+			continue
+		for node in ast.walk(parse(rel, source)):
+			handlers = []
+			if isinstance(node, ast.keyword) and node.arg == "handler":
+				handlers.append(node.value)
+			elif (
+				isinstance(node, ast.Call) and referenced_name(node.func) == "ToolSpec" and len(node.args) > 3
+			):
+				handlers.append(node.args[3])
+			for handler in handlers:
+				if referenced_name(handler) in ROUTE_WRITE_FUNCTIONS:
+					violations.append(
+						violation(rel, handler, f"{referenced_name(handler)} is a tool handler (ADR-019)")
+					)
+	return violations
+
+
+def check_route_module_single_ticket_save(sources: dict) -> list:
+	"""ADR-020 QĐ 1/6: exactly one `.save()` in route_ticket.py, inside apply_route; no `db_update` at all."""
+	route = sources.get(ROUTE_FILE)
+	if route is None:
+		return _missing(ROUTE_FILE)
+	tree = parse(ROUTE_FILE, route)
+	inside = set()
+	for node in tree.body:
+		if isinstance(node, ast.FunctionDef) and node.name == ROUTE_SAVE_FUNCTION:
+			inside = {id(child) for child in ast.walk(node)}
+	saves = [
+		node
+		for node in ast.walk(tree)
+		if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "save"
+	]
+	violations = [
+		violation(ROUTE_FILE, node, f"`.save()` outside {ROUTE_SAVE_FUNCTION} (ADR-020)")
+		for node in saves
+		if id(node) not in inside
+	]
+	if len(saves) != 1:
+		violations.append(
+			f"{ROUTE_FILE}: found {len(saves)} `.save()` calls, exactly one ticket save (ADR-020)"
+		)
+	violations.extend(
+		violation(ROUTE_FILE, node, "`db_update` in the routing module (ADR-020)")
+		for node in ast.walk(tree)
+		if isinstance(node, ast.Call) and referenced_name(node.func) == "db_update"
+	)
+	return violations
+
+
+def check_assign_to_only_in_route_module(sources: dict) -> list:
+	"""ADR-021 QĐ 3 / ADR-015: `assign_to.add` is called only in route_ticket.py."""
+	violations = []
+	for rel, source in only_python(sources).items():
+		if rel == ROUTE_FILE:
+			continue
+		tree = parse(rel, source)
+		aliases = import_aliases(tree)
+		for lineno, target in imported_modules(tree, module_name(rel), rel.endswith("__init__.py")):
+			if module_in(target, ASSIGN_MODULE):
+				violations.append(f"{rel}:{lineno}: imports {target} outside {ROUTE_FILE} (ADR-021)")
+		for node in ast.walk(tree):
+			if isinstance(node, ast.Name | ast.Attribute) and resolved_name(node, aliases).endswith(
+				ASSIGN_CALL_SUFFIXES
+			):
+				violations.append(violation(rel, node, f"assigns people outside {ROUTE_FILE} (ADR-021)"))
+			elif isinstance(node, ast.Constant) and node.value == ASSIGN_AGENT_NAME:
+				violations.append(
+					violation(rel, node, f"names {ASSIGN_AGENT_NAME} outside {ROUTE_FILE} (ADR-021)")
+				)
+			elif _creates_todo(node):
+				violations.append(violation(rel, node, f"creates a ToDo outside {ROUTE_FILE} (ADR-021)"))
+	return violations
+
+
+def _creates_todo(node) -> bool:
+	"""`get_doc("ToDo", ...)`, `get_doc({"doctype": "ToDo", ...})`, `new_doc("ToDo")`."""
+	if not (isinstance(node, ast.Call) and referenced_name(node.func) in DOC_CREATE_CALLS and node.args):
+		return False
+	first = node.args[0]
+	if isinstance(first, ast.Dict):
+		return any(
+			isinstance(key, ast.Constant)
+			and key.value == "doctype"
+			and isinstance(value, ast.Constant)
+			and value.value == TODO_DOCTYPE
+			for key, value in zip(first.keys, first.values, strict=True)
+		)
+	return isinstance(first, ast.Constant) and first.value == TODO_DOCTYPE
+
+
+def check_no_share_bypass(sources: dict) -> list:
+	"""ADR-021 QĐ 3: sharing is never forced (ignore_share_permission, assign_to._add, add_docshare, frappe.share.add)."""
+	violations = []
+	for rel, source in only_python(sources).items():
+		tree = parse(rel, source)
+		aliases = import_aliases(tree)
+		for node in ast.walk(tree):
+			bypass = [name for name in _node_names(node) if name in SHARE_BYPASS_NAMES]
+			if isinstance(node, ast.Name | ast.Attribute) and resolved_name(node, aliases).endswith(
+				SHARE_BYPASS_SUFFIXES
+			):
+				bypass.append(resolved_name(node, aliases))
+			violations.extend(
+				violation(rel, node, f"{name} bypasses sharing rules (ADR-021)") for name in bypass
+			)
+	return violations
+
+
+def check_no_assign_column_for_decisions(sources: dict) -> list:
+	"""ADR-019 QĐ 5: nothing under agent/ reads `_assign` (except authority.py, see ASSIGN_FIELD_ALLOWED_FILE)."""
+	violations = []
+	for rel, source in only_python(scoped(sources, AGENT_PREFIX)).items():
+		tree = parse(rel, source)
+		exempt = set()
+		if rel == ASSIGN_FIELD_ALLOWED_FILE:
+			for func in ast.walk(tree):
+				if isinstance(func, ast.FunctionDef) and func.name == ASSIGN_FIELD_ALLOWED_FUNCTION:
+					exempt |= {id(child) for child in ast.walk(func)}
+		for node in ast.walk(tree):
+			if id(node) in exempt:
+				continue
+			if referenced_name(node) == "_assign" or (
+				isinstance(node, ast.Constant)
+				and isinstance(node.value, str)
+				and ASSIGN_FIELD.search(node.value)
+			):
+				violations.append(violation(rel, node, "reads `_assign` (decide from ToDo, ADR-019)"))
+	return violations
+
+
+def _sla_date_writes(tree: ast.AST):
+	for node in ast.walk(tree):
+		targets = []
+		if isinstance(node, ast.Assign):
+			targets = node.targets
+		elif isinstance(node, ast.AugAssign | ast.AnnAssign):
+			targets = [node.target]
+		for target in targets:
+			for part in ast.walk(target):
+				if referenced_name(part) in SLA_DATE_FIELDS or (
+					isinstance(part, ast.Constant) and part.value in SLA_DATE_FIELDS
+				):
+					yield part, "assigns"
+		# The field name held in a constant (`F = "response_by"`, `F = ("response_by", ...)`), written later.
+		if isinstance(node, ast.Assign | ast.AnnAssign | ast.AugAssign) and node.value is not None:
+			held = node.value.elts if isinstance(node.value, ast.Tuple | ast.List | ast.Set) else [node.value]
+			for part in held:
+				if isinstance(part, ast.Constant) and part.value in SLA_DATE_FIELDS:
+					yield part, "holds the name of"
+		if isinstance(node, ast.keyword) and node.arg in SLA_DATE_FIELDS:
+			yield node.value, "passes"
+		elif isinstance(node, ast.Dict):
+			for key in node.keys:
+				if isinstance(key, ast.Constant) and key.value in SLA_DATE_FIELDS:
+					yield key, "sets"
+		elif isinstance(node, ast.Call) and (dotted_name(node.func) or "").split(".")[-1] in SLA_WRITE_CALLS:
+			for arg in node.args:
+				if isinstance(arg, ast.Constant) and arg.value in SLA_DATE_FIELDS:
+					yield arg, "writes"
+
+
+def check_feature_never_assigns_sla_dates(sources: dict) -> list:
+	"""AC-10: Helpdesk computes `response_by`/`resolution_by`; nothing under agent/ writes them."""
+	violations = []
+	for rel, source in only_python(scoped(sources, AGENT_PREFIX)).items():
+		for node, verb in _sla_date_writes(parse(rel, source)):
+			violations.append(violation(rel, node, f"{verb} an SLA date (AC-10)"))
+	return violations
+
+
+def check_no_default_people_in_agent_python(sources: dict) -> list:
+	"""AC-14: no hard-coded person (spec 16.2 names, the bot account) in a string under agent/."""
+	violations = []
+	for rel, source in only_python(scoped(sources, AGENT_PREFIX)).items():
+		for node in constant_strings(parse(rel, source)):
+			text = NAME_COINCIDENCES.sub(" ", node.value)
+			for match in (*PERSON_NAME.finditer(text), *AGENT_ACCOUNT.finditer(text)):
+				violations.append(violation(rel, node, f"hard-coded person {match.group(0)!r} (AC-14)"))
+	return violations
+
+
+def check_entry_types_unchanged(sources: dict) -> list:
+	"""ADR-019 QĐ 7: the log keeps its three entry types, in the code and in the DocType options."""
+	run_log, doctype = sources.get(RUN_LOG_FILE), sources.get(LOG_DOCTYPE_FILE)
+	if run_log is None:
+		return _missing(RUN_LOG_FILE)
+	if doctype is None:
+		return _missing(LOG_DOCTYPE_FILE)
+	violations = []
+	found = None
+	for node in parse(RUN_LOG_FILE, run_log).body:
+		if isinstance(node, ast.Assign) and any(
+			getattr(t, "id", None) == "ENTRY_TYPES" for t in node.targets
+		):
+			try:
+				found = ast.literal_eval(node.value)
+			except ValueError:
+				found = "not a literal"
+	if found != ENTRY_TYPES_EXPECTED:
+		violations.append(f"{RUN_LOG_FILE}: ENTRY_TYPES is {found!r}, expected {ENTRY_TYPES_EXPECTED!r}")
+	options = [
+		field.get("options")
+		for field in json.loads(doctype)["fields"]
+		if field.get("fieldname") == "entry_type"
+	]
+	if options != ["\n".join(ENTRY_TYPES_EXPECTED)]:
+		violations.append(f"{LOG_DOCTYPE_FILE}: entry_type options are {options!r}")
+	return violations
+
+
 class TestArchitecture(unittest.TestCase):
 	@classmethod
 	def setUpClass(cls):
@@ -1620,6 +1915,58 @@ class TestArchitecture(unittest.TestCase):
 		self.assertEqual(check_install_deletes_only_status_script(self.sources), [])
 		self.assertIn(f'before_uninstall = "{UNINSTALL_HOOK}"', self.sources[HOOKS_FILE])
 
+	# FEAT-006: routing (ADR-019..021) ------------------------------------------------------------
+
+	def test_route_module_not_in_tool_modules_and_has_no_tools(self):
+		self.assertIn("TOOL_MODULES", self.sources[REGISTRY_FILE])
+		self.assertIn(ROUTE_FILE, self.sources)
+		self.assertEqual(check_route_module_is_not_a_tool(self.sources), [])
+
+	def test_route_module_single_ticket_save(self):
+		self.assertIn(".save()", self.sources[ROUTE_FILE])
+		self.assertEqual(check_route_module_single_ticket_save(self.sources), [])
+
+	def test_assign_to_only_in_route_module(self):
+		self.assertIn("assign_to.add(", self.sources[ROUTE_FILE])
+		self.assertEqual(check_assign_to_only_in_route_module(self.sources), [])
+
+	def test_no_share_bypass(self):
+		self.assertGreater(len(only_python(self.sources)), 0)
+		self.assertEqual(check_no_share_bypass(self.sources), [])
+
+	def test_auto_assign_switch_only_in_policy(self):
+		self.assertIn("auto_assign_enabled", POLICY_FIELDS)
+		self.assertIn("auto_assign_enabled", self.sources[POLICY_FILE])
+		# The runner gets the switch only by calling the policy function, never by reading the field.
+		self.assertIn("policy.auto_assign_enabled(", self.sources[RUNNER_FILE])
+		self.assertEqual(check_policy_fields_only_in_policy(self.sources), [])
+
+	def test_entry_types_unchanged(self):
+		scanned = load_product_sources(suffixes=(".py", ".json"))
+		self.assertIn(LOG_DOCTYPE_FILE, scanned)
+		self.assertEqual(check_entry_types_unchanged(scanned), [])
+
+	def test_assign_field_not_used_for_decision(self):
+		self.assertEqual(
+			(ASSIGN_FIELD_ALLOWED_FILE, ASSIGN_FIELD_ALLOWED_FUNCTION), (AUTHORITY_FILE, "_assigned_by_other")
+		)
+		self.assertIn("_assign", self.sources[AUTHORITY_FILE])
+		self.assertEqual(check_no_assign_column_for_decisions(self.sources), [])
+
+	def test_route_module_bypass_rules_apply(self):
+		route_only = {ROUTE_FILE: self.sources[ROUTE_FILE]}
+		self.assertTrue(ROUTE_FILE.startswith(TOOLS_PREFIX))
+		self.assertEqual(check_tools_never_bypass_permissions(route_only), [])
+		self.assertEqual(check_no_share_bypass(route_only), [])
+
+	def test_feature_never_assigns_sla_dates(self):
+		self.assertGreater(len(only_python(scoped(self.sources, AGENT_PREFIX))), 0)
+		self.assertEqual(check_feature_never_assigns_sla_dates(self.sources), [])
+
+	def test_no_default_people_in_agent_python(self):
+		self.assertIn("Việt Nam", self.sources["agent/prompts.py"])  # the coincidence the scan must tolerate
+		self.assertEqual(check_no_default_people_in_agent_python(self.sources), [])
+
 
 # ---------------------------------------------------------------------------------------------------
 # Tests of the scanners themselves (STD-TEST-8): violating code is caught, clean code is not flagged
@@ -1780,6 +2127,7 @@ class TestScannersCatchViolations(unittest.TestCase):
 			"import frappe\nfrappe.set_user('Administrator')\n",
 			"import frappe\nfrappe.get_all('HD Ticket', fields=['name'])\n",
 			"import frappe\nfrappe.db.get_all('HD Ticket')\n",
+			"def f(doc):\n\tdoc.db_update()\n",
 		)
 		for source in cases:
 			with self.subTest(source=source):
@@ -2412,6 +2760,286 @@ class TestScannersCatchViolations(unittest.TestCase):
 			"enqueue",
 		)
 		self.assertEqual(check_ticket_panel_does_not_evaluate_agent_gates(self.PANEL_SOURCES), [])
+
+	# FEAT-006: routing rules --------------------------------------------------------------------
+
+	ROUTE_SOURCES: ClassVar[dict] = {
+		REGISTRY_FILE: 'TOOL_MODULES = (\n\t"erp_ai.agent.tools.read",\n\t"erp_ai.agent.tools.write_ticket",\n)\n',
+		ROUTE_FILE: (
+			"import frappe\n"
+			"from frappe.desk.form import assign_to\n\n"
+			"def apply_route(decision, classification, ctx):\n"
+			"\tdoc = frappe.get_doc('HD Ticket', ctx.ticket_name)\n"
+			"\tdoc.save()\n\n"
+			"def assign_owner(user, ctx):\n"
+			"\tassign_to.add({'assign_to': [user], 'doctype': 'HD Ticket', 'name': ctx.ticket_name})\n"
+		),
+	}
+
+	def test_route_module_scanner_catches_registry_listing_and_tool_names(self):
+		self.assertEqual(check_route_module_is_not_a_tool(self.ROUTE_SOURCES), [])
+		listed = {
+			**self.ROUTE_SOURCES,
+			REGISTRY_FILE: 'TOOL_MODULES = ("erp_ai.agent.tools.route_ticket",)\n',
+		}
+		self.assertCaught(check_route_module_is_not_a_tool(listed), "lists route_ticket")
+		for extra in (
+			"TOOLS = []\n",
+			"from erp_ai.agent.tools.registry import ToolSpec\n",
+			"spec = ToolSpec\n",
+		):
+			with self.subTest(extra=extra):
+				routed = {**self.ROUTE_SOURCES, ROUTE_FILE: self.ROUTE_SOURCES[ROUTE_FILE] + extra}
+				self.assertCaught(check_route_module_is_not_a_tool(routed), "routing module")
+		self.assertCaught(check_route_module_is_not_a_tool({ROUTE_FILE: ""}), REGISTRY_FILE)
+		wrapper = "TOOLS = [ToolSpec(name='n', group='g', schema={}, handler=%s)]\n"
+		for handler in (
+			"apply_route",
+			"route_ticket.assign_owner",
+			"post_routing_comment",
+			"create_routed_task",
+		):
+			with self.subTest(handler=handler):
+				others = {**self.ROUTE_SOURCES, "agent/tools/write_ticket.py": wrapper % handler}
+				self.assertCaught(
+					check_route_module_is_not_a_tool(others), "write_ticket.py", handler.split(".")[-1]
+				)
+		positional = {
+			**self.ROUTE_SOURCES,
+			"agent/tools/write_ticket.py": "TOOLS = [ToolSpec('n', 'g', {}, apply_route)]\n",
+		}
+		self.assertCaught(check_route_module_is_not_a_tool(positional), "write_ticket.py", "apply_route")
+		harmless = {**self.ROUTE_SOURCES, "agent/tools/write_ticket.py": wrapper % "set_classification"}
+		self.assertEqual(check_route_module_is_not_a_tool(harmless), [])
+
+	def test_route_single_save_scanner_catches_second_and_misplaced_saves(self):
+		self.assertEqual(check_route_module_single_ticket_save(self.ROUTE_SOURCES), [])
+		route = self.ROUTE_SOURCES[ROUTE_FILE]
+		second = route + "\ndef other(doc):\n\tdoc.save()\n"
+		self.assertCaught(
+			check_route_module_single_ticket_save({ROUTE_FILE: second}), "outside apply_route", "found 2"
+		)
+		twice = route.replace("\tdoc.save()\n", "\tdoc.save()\n\tdoc.save()\n")
+		self.assertCaught(check_route_module_single_ticket_save({ROUTE_FILE: twice}), "found 2")
+		moved = route.replace("def apply_route", "def other_name")
+		self.assertCaught(check_route_module_single_ticket_save({ROUTE_FILE: moved}), "outside apply_route")
+		none = route.replace("\tdoc.save()\n", "\tpass\n")
+		self.assertCaught(check_route_module_single_ticket_save({ROUTE_FILE: none}), "found 0")
+		for extra in (
+			"\ndef assign_owner_again(doc):\n\tdoc.db_update()\n",
+			"\ndef retry(doc):\n\tdoc.db_update(x=1)\n",
+		):
+			with self.subTest(extra=extra):
+				self.assertCaught(
+					check_route_module_single_ticket_save({ROUTE_FILE: route + extra}), "db_update"
+				)
+		inside = route.replace("\tdoc.save()\n", "\tdoc.save()\n\tdoc.db_update()\n")
+		self.assertCaught(check_route_module_single_ticket_save({ROUTE_FILE: inside}), "db_update")
+
+	def test_assign_to_scanner_catches_every_way_to_call_it_outside_route_module(self):
+		for source in (
+			"from frappe.desk.form import assign_to\nassign_to.add({})\n",
+			"from frappe.desk.form.assign_to import add\nadd({})\n",
+			"from frappe.desk.form.assign_to import add as put\nput({})\n",
+			"import frappe\nfrappe.desk.form.assign_to.add({})\n",
+			"from frappe.desk.form import assign_to as a\na.add_multiple({})\n",
+			"from frappe.desk.form import assign_to\n",
+			# no import of the module at all: only the call suffix can catch these
+			"def f(a):\n\ta.assign_to.add_multiple({})\n",
+			"def f(a):\n\ta.assign_to.add({})\n",
+			"def f(doc):\n\tdoc.assign_agent('u')\n",
+			"import frappe\nfrappe.get_doc('HD Ticket', t).assign_agent(u)\n",
+			"f = getattr(doc, 'assign_agent')\n",
+			# ADR-021: no ToDo created by hand either
+			"import frappe\nfrappe.get_doc('ToDo').insert()\n",
+			"import frappe\nfrappe.get_doc({'doctype': 'ToDo', 'allocated_to': u}).insert()\n",
+			"import frappe\nfrappe.new_doc('ToDo')\n",
+		):
+			with self.subTest(source=source):
+				self.assertCaught(
+					check_assign_to_only_in_route_module({"agent/runner.py": source}), "agent/runner.py"
+				)
+		self.assertEqual(check_assign_to_only_in_route_module(self.ROUTE_SOURCES), [])
+		clean = (
+			"import frappe\nitems = [].add\nfrappe.get_all('ToDo', filters={})\n"
+			"frappe.get_doc('HD Ticket', t).save()\nfrappe.get_doc({'doctype': 'Task'}).insert()\n"
+		)
+		self.assertEqual(check_assign_to_only_in_route_module({"agent/runner.py": clean}), [])
+
+	def test_share_bypass_scanner_catches_each_forbidden_name(self):
+		for source in (
+			"assign_to.add({}, ignore_share_permission=True)\n",
+			"d = {'ignore_share_permission': 1}\n",
+			"from frappe.desk.form import assign_to\nassign_to._add({})\n",
+			"from frappe.desk.form.assign_to import _add\n_add({})\n",
+			"from frappe.share import add_docshare\nadd_docshare('T', 'x', 'u')\n",
+			"import frappe\nfrappe.share.add('T', 'x', 'u')\n",
+			"from frappe import share\nshare.add('T', 'x', 'u')\n",
+			"from frappe.share import add\nadd('T', 'x', 'u')\n",
+		):
+			with self.subTest(source=source):
+				self.assertCaught(check_no_share_bypass({"agent/tools/route_ticket.py": source}), "sharing")
+		self.assertEqual(check_no_share_bypass(self.ROUTE_SOURCES), [])
+		self.assertEqual(check_no_share_bypass({"x.py": "s = set()\ns.add(1)\nshare = 1\n"}), [])
+
+	def test_policy_scanner_catches_auto_assign_switch_read_outside_policy(self):
+		for source in (
+			"def f(settings):\n\treturn settings.auto_assign_enabled\n",
+			"def f(settings):\n\treturn getattr(settings, 'auto_assign_enabled', 0)\n",
+			"def f(settings):\n\treturn settings.get('auto_assign_enabled')\n",
+			"import frappe\nfrappe.db.get_single_value('ERP AI Setting', 'auto_assign_enabled')\n",
+			"auto_assign_enabled = 1\n",
+		):
+			with self.subTest(source=source):
+				self.assertCaught(
+					check_policy_fields_only_in_policy({"agent/runner.py": source}), "auto_assign_enabled"
+				)
+		through_policy = "from erp_ai.agent import policy\n\ndef f(settings):\n\treturn policy.auto_assign_enabled(settings)\n"
+		self.assertEqual(check_policy_fields_only_in_policy({"agent/runner.py": through_policy}), [])
+		self.assertEqual(
+			check_policy_fields_only_in_policy({POLICY_FILE: "def x(s):\n\treturn s.auto_assign_enabled\n"}),
+			[],
+		)
+
+	def test_entry_types_scanner_catches_new_type_in_code_or_doctype(self):
+		run_log = 'ENTRY_TYPES = ("classify", "reason", "skip")\n'
+		doctype = json.dumps({"fields": [{"fieldname": "entry_type", "options": "classify\nreason\nskip"}]})
+		good = {RUN_LOG_FILE: run_log, LOG_DOCTYPE_FILE: doctype}
+		self.assertEqual(check_entry_types_unchanged(good), [])
+		extra = {**good, RUN_LOG_FILE: 'ENTRY_TYPES = ("classify", "reason", "skip", "route")\n'}
+		self.assertCaught(check_entry_types_unchanged(extra), "ENTRY_TYPES")
+		options = json.dumps(
+			{"fields": [{"fieldname": "entry_type", "options": "classify\nreason\nskip\nroute"}]}
+		)
+		self.assertCaught(check_entry_types_unchanged({**good, LOG_DOCTYPE_FILE: options}), "options")
+		computed = {**good, RUN_LOG_FILE: "ENTRY_TYPES = tuple(x)\n"}
+		self.assertCaught(check_entry_types_unchanged(computed), "ENTRY_TYPES")
+		self.assertCaught(check_entry_types_unchanged({RUN_LOG_FILE: run_log}), LOG_DOCTYPE_FILE)
+
+	def test_assign_column_scanner_catches_reads_and_allows_authority(self):
+		for source in (
+			"import frappe\nfrappe.db.get_value('HD Ticket', t, '_assign')\n",
+			"def f(doc):\n\treturn doc._assign\n",
+			"def f(doc):\n\treturn doc.get('_assign')\n",
+			"import frappe\nfrappe.db.sql('select _assign from `tabHD Ticket`')\n",
+			"_assign = 1\n",
+		):
+			with self.subTest(source=source):
+				self.assertCaught(
+					check_no_assign_column_for_decisions({"agent/routing.py": source}), "_assign"
+				)
+		source = "import frappe\nfrappe.db.get_value('HD Ticket', t, '_assign')\n"
+		allowed = f"def {ASSIGN_FIELD_ALLOWED_FUNCTION}(a, t):\n\treturn frappe.db.get_value('HD Ticket', t, '_assign')\n"
+		self.assertEqual(check_no_assign_column_for_decisions({AUTHORITY_FILE: allowed}), [])
+		self.assertEqual(check_no_assign_column_for_decisions({"handlers.py": source}), [])
+		# authority.py is exempt only inside its one function
+		self.assertCaught(check_no_assign_column_for_decisions({AUTHORITY_FILE: source}), "_assign")
+		other = allowed.replace(ASSIGN_FIELD_ALLOWED_FUNCTION, "is_instruction")
+		self.assertCaught(check_no_assign_column_for_decisions({AUTHORITY_FILE: other}), "_assign")
+		both = allowed + "\ndef other(t):\n\treturn frappe.db.get_value('HD Ticket', t, '_assign')\n"
+		self.assertCaught(check_no_assign_column_for_decisions({AUTHORITY_FILE: both}), "_assign")
+		self.assertEqual(
+			check_no_assign_column_for_decisions(
+				{"agent/site_facts.py": "x = 'assigned_by'\ny = 'reassign'\n"}
+			),
+			[],
+		)
+		# the pattern's own edges: a letter or digit before, a letter, digit or `_` after, is another word
+		for text in ("ai_assign", "9_assign", "_assigned", "_assign_to", "_assign9", "x_assign_y"):
+			with self.subTest(text=text):
+				self.assertEqual(check_no_assign_column_for_decisions({"agent/a.py": f"x = {text!r}\n"}), [])
+		for text in ("(_assign)", " _assign ", "`_assign`", "select _assign,x", "_assign"):
+			with self.subTest(text=text):
+				self.assertCaught(
+					check_no_assign_column_for_decisions({"agent/a.py": f"x = {text!r}\n"}), "_assign"
+				)
+
+	def test_route_module_bypass_rules_catch_violations_in_route_module(self):
+		route = self.ROUTE_SOURCES[ROUTE_FILE]
+		self.assertEqual(check_tools_never_bypass_permissions({ROUTE_FILE: route}), [])
+		for extra in (
+			"def x(doc):\n\tdoc.save(ignore_permissions=True)\n",
+			"def x():\n\tfrappe.db.set_value('HD Ticket', 'T', 'a', 1)\n",
+			"def x():\n\tfrappe.set_user('Administrator')\n",
+			"def x():\n\tfrappe.db.sql('update `tabHD Ticket` set a = 1')\n",
+			"def x():\n\tfrappe.get_all('ToDo')\n",
+		):
+			with self.subTest(extra=extra):
+				self.assertCaught(check_tools_never_bypass_permissions({ROUTE_FILE: route + extra}))
+
+	def test_sla_dates_scanner_catches_each_way_to_write_them(self):
+		for source in (
+			"def f(doc):\n\tdoc.response_by = 1\n",
+			"def f(doc):\n\tdoc.resolution_by += 1\n",
+			"def f(doc):\n\tdoc['response_by'] = 1\n",
+			"def f(doc):\n\tdoc.update({'resolution_by': 1})\n",
+			"def f(doc):\n\tdoc.update(response_by=1)\n",
+			"def f(doc):\n\tsetattr(doc, 'response_by', 1)\n",
+			"import frappe\nfrappe.db.set_value('HD Ticket', t, 'resolution_by', 1)\n",
+			"def f(doc):\n\tdoc.db_set('response_by', 1)\n",
+			"response_by: int = 1\n",
+			"def f(doc):\n\tdoc.set('response_by', 1)\n",
+			"def f(doc):\n\tdoc.set('resolution_by', 1)\n",
+			# the field name held in a constant, then used by a generic writer
+			"F = 'resolution_by'\n",
+			"F: str = 'response_by'\n",
+			"FIELDS = ('response_by', 'x')\n",
+			"FIELDS = ['x', 'resolution_by']\n",
+			"FIELDS = {'response_by'}\n",
+			"def f(doc, v):\n\tF = 'response_by'\n\tdoc.set(F, v)\n",
+		):
+			with self.subTest(source=source):
+				self.assertCaught(
+					check_feature_never_assigns_sla_dates({"agent/routing.py": source}), "SLA date"
+				)
+		reads = (
+			"def f(doc):\n\tx = doc.get('resolution_by')\n\ty = doc.response_by\n"
+			"\treturn doc.response_by, doc.get('resolution_by'), x, y, s.set('other', 1)\n"
+		)
+		self.assertEqual(check_feature_never_assigns_sla_dates({"agent/site_facts.py": reads}), [])
+		self.assertEqual(check_feature_never_assigns_sla_dates({"tasks.py": "x.response_by = 1\n"}), [])
+
+	def test_default_people_scanner_matches_whole_words_only(self):
+		for text in (
+			"Việt",
+			"Tiến",
+			"Hiếu",
+			"Lan",
+			"Hà",
+			"Thư",
+			"Chi",
+			"gán cho Hiếu",
+			"A: Lan, Hà",
+			"ai.agent",
+		):
+			with self.subTest(text=text):
+				source = f"DEFAULT = {text!r}\n"
+				self.assertCaught(
+					check_no_default_people_in_agent_python({"agent/routing.py": source}), "AC-14"
+				)
+		self.assertCaught(
+			check_no_default_people_in_agent_python(
+				{"agent/run_status.py": "U = 'ai.agent@miyano.com.vn'\n"}
+			),
+			"ai.agent",
+		)
+		self.assertCaught(
+			check_no_default_people_in_agent_python({"agent/prompts.py": 'P = f"Giao cho {x} là Hiếu"\n'}),
+			"Hiếu",
+		)
+		self.assertCaught(
+			check_no_default_people_in_agent_python({"agent/prompts.py": '"""Việt Nam, nhờ Việt xử lý"""\n'}),
+			"Việt",
+		)
+		clean = (
+			"A = 'Công ty Miyano Việt Nam'\nB = 'Tiếng Việt, ngắn'\nC = 'Thư mục nằm ngoài mã nguồn'\n"
+			"D = 'erp_ai.agent.runner.run_for_ticket'\nE = 'Chiều', 'Hàng', 'Lanh', 'Thưa', 'Chính', 'Hiếm'\n"
+			"F = 'chi tiết', 'lan can', 'ai.agents'\n"
+			"G = 'ThanhLan', 'ThiHà', 'AnhChi', '2Thư', 'ai_Việt', 'xHiếu', 'NhàTiến'\n"
+		)
+		self.assertEqual(check_no_default_people_in_agent_python({"agent/prompts.py": clean}), [])
+		outside = "DEFAULT = 'Hiếu'\n"
+		self.assertEqual(check_no_default_people_in_agent_python({"constants.py": outside}), [])
 
 
 if __name__ == "__main__":

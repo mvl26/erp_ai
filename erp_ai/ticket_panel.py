@@ -7,6 +7,7 @@ from frappe import _
 from frappe.core.utils import html_to_plain_text
 from frappe.desk.form.activity import get_activity_timeline
 from frappe.utils import cstr, format_datetime
+from frappe.utils.html_utils import sanitize_html
 from helpdesk.utils import is_agent
 
 from erp_ai.agent.policy import contains_keyword, get_trigger_keyword
@@ -93,8 +94,10 @@ def get_panel_data(ticket: str) -> dict:
 	return {"ticket": ticket, "ai_fields": _ai_fields(ticket), "messages": messages}
 
 
-def _message_content(text) -> str:
-	"""B-6: the typed text escaped, line breaks kept, the trigger keyword appended when missing."""
+def _message_content(text) -> tuple[str, bool]:
+	"""B-6: the typed text escaped, line breaks kept, the trigger keyword appended when missing.
+
+	Returns the content and whether the keyword was appended."""
 	if not isinstance(text, str) or not text.strip():
 		frappe.throw(_("Nội dung tin trống."), frappe.ValidationError)
 	text = text.strip()
@@ -102,9 +105,10 @@ def _message_content(text) -> str:
 		frappe.throw(_("Tin dài quá {0} ký tự.").format(PANEL_MAX_MESSAGE_CHARS), frappe.ValidationError)
 	body = "<br>".join(html.escape(line, quote=False) for line in text.splitlines())
 	keyword = get_trigger_keyword()
-	if keyword and not contains_keyword(body):
+	keyword_added = bool(keyword) and not contains_keyword(body)
+	if keyword_added:
 		body = f"{body} {html.escape(keyword, quote=False)}"
-	return f"<p>{body}</p>"
+	return f"<p>{body}</p>", keyword_added
 
 
 @frappe.whitelist(methods=["POST"])
@@ -114,11 +118,27 @@ def send_message(ticket: str, text: str) -> dict:
 	Input: ticket name; text, 1-PANEL_MAX_MESSAGE_CHARS characters after strip().
 	Output: {"comment": <Comment name>}.
 	Errors: PermissionError (not an active agent, no read on the ticket, or the agent account);
-	ValidationError (missing ticket, empty or too long text); FrappeTypeError (text not a string).
+	ValidationError (missing ticket, empty or too long text, or a trigger keyword that does not survive
+	storage as a Comment); FrappeTypeError (text not a string).
 	"""
 	if not isinstance(ticket, str) or not ticket.strip():
 		frappe.throw(_("Thiếu mã phiếu."), frappe.ValidationError)
 	ticket = ticket.strip()
 	_require_panel_access(ticket, forbid_agent_user=True)
-	content = _message_content(text)
-	return {"comment": frappe.get_doc(TICKET_DOCTYPE, ticket).new_comment(content)}
+	content, keyword_added = _message_content(text)
+	# Same call as Comment.validate: the stored form must still trigger the agent handler (ADR-010 Amendment 1).
+	if get_trigger_keyword() and not contains_keyword(sanitize_html(content, always_sanitize=True)):
+		frappe.logger(LOGGER_NAME).info(
+			f"erp_ai panel send rejected ticket={ticket} reason=keyword_not_storable"
+		)
+		frappe.throw(
+			_(
+				"Từ khóa kích hoạt trong ERP AI Setting có ký tự không dùng được. Quản trị viên cần đổi từ khóa này."
+			),
+			frappe.ValidationError,
+		)
+	comment = frappe.get_doc(TICKET_DOCTYPE, ticket).new_comment(content)
+	frappe.logger(LOGGER_NAME).info(
+		f"erp_ai panel send ticket={ticket} comment={comment} keyword_added={str(keyword_added).lower()}"
+	)
+	return {"comment": comment}

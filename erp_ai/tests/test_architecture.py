@@ -124,10 +124,24 @@ STATUS_SCRIPT_FORBIDDEN = (
 	r"frappe\.call",
 	r"updateField",
 	r"open_doc:",
-	r"\bcall\b",
 	r"600",
 	r"HD Form Script",
 	r"^\s*(import|export)\b",
+	# ADR-009: the panel script must not parse markup, poll, unbind listeners or create navigable elements.
+	r"DOMParser",
+	r"createContextualFragment",
+	r"setInterval",
+	r"MutationObserver",
+	r"\.off\(",
+	r"removeListener",
+	r"removeAllListeners",
+	r'createElement\("a"',
+	r'createElement\("img"',
+	r'createElement\("iframe"',
+	r'createElement\("script"',
+	r"\.src =",
+	r"\.href =",
+	r"innerText =",
 )
 # Regexes: the socket guard keeps setupForm (run many times) from registering listeners twice; the
 # `state.ticket = null` leave-page step keeps a left ticket's signals from showing (ADR-008 decision 6).
@@ -1081,7 +1095,7 @@ class TestArchitecture(unittest.TestCase):
 	def test_status_script_static_rules(self):
 		script = load_product_sources(suffixes=(".js",)).get(STATUS_SCRIPT_FILE)
 		self.assertIsNotNone(script, f"{STATUS_SCRIPT_FILE} is missing")
-		self.assertIn("function setupForm({ doc, router })", script)
+		self.assertIn("function setupForm({ doc, call, router })", script)
 		for pattern in STATUS_SCRIPT_FORBIDDEN:
 			self.assertIsNone(re.search(pattern, script, re.MULTILINE), f"forbidden in script: {pattern}")
 		for pattern in STATUS_SCRIPT_REQUIRED:

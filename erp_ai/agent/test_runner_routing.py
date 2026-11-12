@@ -17,6 +17,7 @@ from erp_ai.agent.tools.route_ticket import (
 	REASON_ASSIGN_FAILED,
 	REASON_NO_VALID_ASSIGNEE,
 	REASON_TASK_NOT_ASSIGNED,
+	TASK_REQUEST,
 	create_routed_task,
 )
 from erp_ai.constants import AGENT_USER, CLASSIFIED_BY_HUMAN, LOG_DOCTYPE, LOGGER_NAME
@@ -966,7 +967,8 @@ class TestRoutingTask(AssignTestBase):
 		self.assertNotIn(self.ticket.subject, entry.actions)
 		self.assertNotIn("task", json.loads(entry.value_after))
 		self.assertEqual(self._comment_count(), before_comments + 1)
-		self.assertIn(ASSIGN_REQUEST.format(reason=REASON_TASK_NOT_ASSIGNED), self._comment_text())
+		text = self._comment_text()
+		self.assertEqual(text, TASK_REQUEST.format(reason=REASON_TASK_NOT_ASSIGNED))
 
 	def test_refused_task_without_exception_no_task_no_comment(self):
 		refusal = {"ok": False, "reason": "thiếu quyền tạo Task"}

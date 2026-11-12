@@ -21,6 +21,7 @@ from erp_ai.agent.tools.route_ticket import (
 	REASON_ASSIGN_FAILED,
 	REASON_NO_VALID_ASSIGNEE,
 	REASON_TASK_NOT_ASSIGNED,
+	TASK_REQUEST,
 	apply_route,
 	assign_owner,
 	create_routed_task,
@@ -405,7 +406,7 @@ def _task_unit(user, subject, classification, context, actions, lines, errors):
 	)
 	if result is None:
 		if len(errors) > failures:
-			lines.append(ASSIGN_REQUEST.format(reason=REASON_TASK_NOT_ASSIGNED))
+			lines.append(TASK_REQUEST.format(reason=REASON_TASK_NOT_ASSIGNED))
 		return None
 	actions.append(_route_action("create_routed_task", "Task", result["task"], True))
 	return result["task"]

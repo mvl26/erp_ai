@@ -19,9 +19,12 @@ from erp_ai.constants import CLASSIFIED_BY_AI, CLASSIFIED_BY_HUMAN
 
 # Fixed sentences for the routing comment (design 3.6). They never carry ticket content or raw configuration.
 ASSIGN_REQUEST = "Bot chưa gán được người phụ trách cho phiếu này: {reason}. Nhờ trưởng nhóm phân công."
+TASK_REQUEST = (
+	"Bot đã gán người phụ trách cho phiếu nhưng không giao được Task: {reason}. Nhờ trưởng nhóm giao Task."
+)
 REASON_NO_VALID_ASSIGNEE = "cấu hình không có người hợp lệ"
 REASON_ASSIGN_FAILED = "gán người không thành công"
-REASON_TASK_NOT_ASSIGNED = "không giao được Task cho người phụ trách (chia sẻ tài liệu đang tắt)"
+REASON_TASK_NOT_ASSIGNED = "chia sẻ tài liệu đang tắt"
 NO_SLA = "Chưa có SLA áp vào phiếu, cần System Manager cấu hình."
 SCORE_LINE = "Độ phức tạp {complexity}/3, độ quan trọng {importance}/3: {reason}"
 TASK_SUBJECT_MAX = 140

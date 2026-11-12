@@ -28,7 +28,7 @@ bench --site <site> install-app erp_ai
 bench --site <site> migrate
 ```
 
-Cài và migrate (chạy lại được, không ghi đè cấu hình đã lưu) tạo: role `ERP AI Agent` và `ERP AI Instructor`; tài khoản `ai.agent@miyano.com.vn` chỉ có role `ERP AI Agent` và `Agent` (không có System Manager); các trường AI trên HD Ticket (permlevel 8, ẩn với khách); `ERP AI Setting` ở trạng thái tắt, mức `L0`.
+Cài và migrate (chạy lại được, không ghi đè cấu hình đã lưu) tạo: role `ERP AI Agent` và `ERP AI Instructor`; tài khoản `ai.agent@miyano.com.vn` chỉ có role `ERP AI Agent` và `Agent` (không có System Manager); các trường AI trên HD Ticket (permlevel 8, ẩn với khách); `ERP AI Setting` ở trạng thái tắt, mức `L0`; bản ghi HD Form Script `ERP AI Agent Status` (xem mục "Chỉ báo trạng thái trên trang phiếu").
 
 ### Cấu hình và bật
 
@@ -42,6 +42,22 @@ Mở `/app/erp-ai-setting` (chỉ System Manager):
 Cấp role `ERP AI Instructor` cho người được phép ra lệnh agent trên mọi phiếu; người được giao phiếu chỉ có thẩm quyền trên đúng phiếu đó.
 
 Chi tiết các việc phải làm trước khi bật: `docs/team/features/FEAT-001/asbuilt.md`, mục 6.
+
+### Chỉ báo trạng thái trên trang phiếu
+
+Khi agent đang chạy (comment có từ khóa `@ai`, hoặc phiếu mới), trang phiếu của HD Agent hiện một chỉ báo nổi ở góc dưới phải, kèm tên tài khoản agent: `Đang suy nghĩ…`, đổi thành `Đang làm: <việc>…` khi agent chạy một tool, rồi tự mất khi lần chạy kết thúc (kể cả lỗi). Các nhãn việc: đọc phiếu, đọc comment, tìm phiếu đã giải quyết, tra bản ghi, tra mã nguồn, đọc mã nguồn, xem lịch sử mã nguồn, ghi phân loại, ghi hướng giải quyết, viết trả lời, tạo task, phân loại phiếu. Chỉ báo không tạo comment hay bản ghi nào và không hiện trên cổng khách. Cần tiến trình `socketio` của bench; thiếu nó thì chỉ báo không hiện, lần chạy vẫn bình thường.
+
+Ba trường trên `/app/erp-ai-setting`:
+
+| Trường | Mặc định | Ý nghĩa |
+|---|---|---|
+| `thinking_text` | `Đang suy nghĩ…` | Chữ hiện khi agent đang suy nghĩ (tối đa 5000 ký tự). Để trống để tắt chỉ báo |
+| `answer_delay_min_s` | `3` | Trễ tối thiểu (giây, 0 đến 30) trước khi đăng câu trả lời đầu tiên của `@ai` |
+| `answer_delay_max_s` | `5` | Trễ tối đa (giây, 0 đến 30, không nhỏ hơn mức tối thiểu) |
+
+Trễ được tính từ lúc chỉ báo bắt đầu (thời gian model chạy được trừ vào), và không áp dụng cho phiếu mới. Đặt `0` và `0` để không trễ.
+
+**Cảnh báo:** chỉ báo chạy bằng bản ghi HD Form Script `ERP AI Agent Status`, nội dung lấy từ `erp_ai/public/js/agent_status_indicator.js`. Mỗi lần `bench --site <site> migrate` (và `install-app`) đặt lại bản ghi này theo tệp trong repo, nên mọi sửa tay trên site bị ghi đè; gỡ app thì bản ghi bị xóa. Sửa tệp `.js` xong phải chạy `migrate`, restart là không đủ. Sau mỗi lần nâng cấp Helpdesk hoặc Frappe, kiểm lại chỉ báo bằng tay: các bước ở `docs/team/features/FEAT-002/acceptance.md`, mục "Bước tay cho người".
 
 ### Bộ đánh giá offline
 

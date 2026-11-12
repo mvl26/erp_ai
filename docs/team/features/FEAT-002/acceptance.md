@@ -90,15 +90,15 @@ Chất lượng test (bước 7): giá trị kỳ vọng viết cứng. Ví dụ
 **(a) `Has Role` của `ai.agent@miyano.com.vn`**
 - Có 99 dòng. **Có `System Manager`.**
 - Mọi dòng có `creation = 2026-11-11 13:46:15.267139`, bằng `creation` của User. Frappe chép `creation` của cha sang dòng con, nên `creation` không cho biết lúc thêm role.
-- `owner`: `ERP AI Agent` và `Agent` là `Administrator` (do bước cài). 97 dòng còn lại là `chuvanhieu357@gmail.com`. `modified_by` của mọi dòng: `chuvanhieu357@gmail.com`.
-- Version `spr34j6nam`, `2026-11-12 11:21:13`, owner `chuvanhieu357@gmail.com`: `added: 97`, `removed: 0`, trong đó có `System Manager`. `User.modified = 2026-11-12 11:21:12.894204`, `modified_by = chuvanhieu357@gmail.com`.
+- `owner`: `ERP AI Agent` và `Agent` là `Administrator` (do bước cài). 97 dòng còn lại là `tài khoản quản trị của người dùng`. `modified_by` của mọi dòng: `tài khoản quản trị của người dùng`.
+- Version `spr34j6nam`, `2026-11-12 11:21:13`, owner `tài khoản quản trị của người dùng`: `added: 97`, `removed: 0`, trong đó có `System Manager`. `User.modified = 2026-11-12 11:21:12.894204`, `modified_by = tài khoản quản trị của người dùng`.
 - Version cũ hơn `o7au09q55s`, `2026-11-11 13:22:41`, Administrator: chỉ thêm `ERP AI Agent`, `Agent`.
 - Kết luận:
-  - 97 role thừa được thêm trong **một lần lưu User**, phiên của tài khoản người `chuvanhieu357@gmail.com`, lúc 2026-11-12 11:21. Đây không phải rò rỉ từ test: test chạy với user Administrator, và Version ghi user của phiên.
+  - 97 role thừa được thêm trong **một lần lưu User**, phiên của tài khoản người `tài khoản quản trị của người dùng`, lúc 2026-11-12 11:21. Đây không phải rò rỉ từ test: test chạy với user Administrator, và Version ghi user của phiên.
   - Giả thuyết "test commit làm rò rỉ" **không được xác nhận**. Các lệnh commit trong mã đều có điều kiện `if not frappe.flags.in_test`: `erp_ai/agent/runner.py:73-74`, `erp_ai/agent/run_log.py:31-32`.
   - Test thêm role (`erp_ai/tests/test_tasks.py:267,381,429` `_add_role("System Manager")`, `erp_ai/tests/test_install.py:240`) chạy trong `addCleanup(frappe.db.rollback)` (`test_tasks.py:173-174`).
 
-**(b) `ERP AI Setting` hiện tại** (`tabSingles`; `modified = 2026-11-12 13:54:34.793007`, `modified_by = chuvanhieu357@gmail.com`)
+**(b) `ERP AI Setting` hiện tại** (`tabSingles`; `modified = 2026-11-12 13:54:34.793007`, `modified_by = tài khoản quản trị của người dùng`)
 | Mục | Hiện tại | Người đặt sáng nay |
 |---|---|---|
 | enabled | `1` | 1 |
@@ -111,7 +111,7 @@ Chất lượng test (bước 7): giá trị kỳ vọng viết cứng. Ví dụ
 
 - `tabVersion` không có dòng nào cho `ERP AI Setting`. Doctype Single này không lưu lịch sử, nên không biết từng mục đổi lúc nào.
 - `ERP AI Log` có 3 dòng `stop_reason='level_L0'`, `trigger=comment_mention`, trên phiếu thật `43067`/`43068`, lúc 13:49:34–13:51:20. Vậy lúc đó mức đang là `L0`, khớp với việc người thấy `level_L0`.
-- Lần lưu cuối là phiên `chuvanhieu357@gmail.com` lúc 13:54:34, ngay sau đó. Lần lưu này để lại L3 / excluded rỗng / budget 100. Có hai khả năng không phân biệt được: người tự đổi các mục này, hoặc form mở ra đã mang sẵn giá trị lạ rồi được lưu lại.
+- Lần lưu cuối là phiên `tài khoản quản trị của người dùng` lúc 13:54:34, ngay sau đó. Lần lưu này để lại L3 / excluded rỗng / budget 100. Có hai khả năng không phân biệt được: người tự đổi các mục này, hoặc form mở ra đã mang sẵn giá trị lạ rồi được lưu lại.
 - Ai đặt `L0` trước 13:49: **không xác định được**.
   - Các test có đặt mức: `test_handlers.py:234` `set_agent_settings(enabled=1, permission_level="L0")`; `test_install.py:247` (L2) và `:255` (NULL, rồi `ensure_setup` điền L0).
   - Có lượt chạy test ngay trước đó (`base.log` 13:36, `base2.log` 13:37), nhưng không tìm được đường commit nào trong mã app. Chỉ là giả thuyết, cần dev kiểm (BUG-002, ý 3).
@@ -122,7 +122,7 @@ Chất lượng test (bước 7): giá trị kỳ vọng viết cứng. Ví dụ
 | severity | STD | file:line | description | fix |
 |---|---|---|---|---|
 | major (BUG-002) | STD-TEST-6 | `erp_ai/tests/test_tasks.py:172-301` (`TestCheckPrivilegeEscalation`); `erp_ai/erp_ai_agent/report/erp_ai_accuracy/test_erp_ai_accuracy.py` (`TestAccuracyTenLogSample`) | Test phụ thuộc dữ liệu sống của site: role thật của `ai.agent@…` (97 role thừa) và các dòng `ERP AI Log` thật (`Lists differ … != []`, `11 != 10`). Trên `miyano` hiện tại 19 test đỏ, giống hệt ở code FEAT-001. Có từ FEAT-001, không phải hồi quy FEAT-002 | Trong `setUp`, cô lập dữ liệu: chụp và đặt lại role của agent; lọc log theo bản ghi do test tạo hoặc theo khoảng thời gian riêng. `/team:intake` thành bug riêng |
-| critical (sự cố cấu hình, cho người) | STD-SEC-4 | site `miyano`: `tabHas Role` parent `ai.agent@miyano.com.vn` | Tài khoản agent đang có `System Manager` cùng 96 role ngoài danh sách cho phép (FEAT-001 có kiểm leo quyền), và đang chạy ở `L3`, `enabled=1`. Lần lưu User lúc 2026-11-12 11:21 của phiên `chuvanhieu357@gmail.com` đã thêm các role này | Người xác nhận lần thêm role có chủ ý không; nếu không, gỡ các role thừa và đặt lại `permission_level` / `excluded_teams` / `monthly_budget_usd` theo cấu hình sáng nay. Đội không tự sửa dữ liệu site |
+| critical (sự cố cấu hình, cho người) | STD-SEC-4 | site `miyano`: `tabHas Role` parent `ai.agent@miyano.com.vn` | Tài khoản agent đang có `System Manager` cùng 96 role ngoài danh sách cho phép (FEAT-001 có kiểm leo quyền), và đang chạy ở `L3`, `enabled=1`. Lần lưu User lúc 2026-11-12 11:21 của phiên `tài khoản quản trị của người dùng` đã thêm các role này | Người xác nhận lần thêm role có chủ ý không; nếu không, gỡ các role thừa và đặt lại `permission_level` / `excluded_teams` / `monthly_budget_usd` theo cấu hình sáng nay. Đội không tự sửa dữ liệu site |
 | minor (ý 3 của BUG-002) | STD-TEST-6 | `erp_ai/tests/test_handlers.py:234`, `erp_ai/tests/test_install.py:247,255` | `permission_level=L0` có trên site lúc 13:49–13:51 mà không rõ nguồn; có lượt chạy test ngay trước đó. Không có Version để quy trách nhiệm | Dev kiểm có đường commit nào ngoài mã app không (ví dụ commit ngầm do DDL trong test runner); bật track changes hoặc thêm log khi đổi mức |
 | minor (design, journal D-6) | STD-DESIGN-5 | `docs/team/features/FEAT-002/design.md` D-13 và mục 3.6 | D-13 nói "cảnh báo cả lúc cài và lúc gỡ"; mục 3.6 nói lúc gỡ "không có thì không làm gì". Code theo 3.6 (review-09, deferred). Hành vi chấp nhận được, không làm AC-12 sai | Designer chọn một và sửa design (`/team:design FEAT-002 --amend`), cùng lúc làm As-Built |
 

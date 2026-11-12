@@ -10,3 +10,9 @@ Mọi thay đổi đáng chú ý của app `erp_ai` được ghi ở đây. Đ�
 - Form `ERP AI Setting`: quản lý nhiều khóa API (cầu dao theo loại lỗi, hạn mức, nghỉ/dò lại khóa mỗi giờ), nút "Kiểm tra khóa" cho System Manager, báo động khi tài khoản agent bị nâng quyền (FEAT-001)
 - Báo cáo `ERP AI Accuracy` và nhật ký `ERP AI Log`: độ chính xác phân loại theo đầu mục A–F dựa trên phân loại do người sửa trong 7 ngày (FEAT-001)
 - Bộ đánh giá offline `erp_ai.eval.export_tickets` và `erp_ai.eval.run_eval`: xuất phiếu đã gán nhãn (bỏ nhóm loại trừ) và in độ chính xác tổng, theo đầu mục, ma trận nhầm lẫn, kết luận theo ngưỡng 85%/70% (FEAT-001)
+- Chỉ báo trạng thái trực tiếp trên trang phiếu của HD Agent: "Đang suy nghĩ…" rồi "Đang làm: <việc>…" khi `@ai` chạy, tự mất khi lần chạy kết thúc kể cả lỗi hoặc hết thời gian; không tạo comment, task hay bản ghi nào; không hiện trên cổng khách (FEAT-002)
+- Ba trường mới trên `ERP AI Setting`: `thinking_text` (chữ chỉ báo, để trống để tắt chỉ báo), `answer_delay_min_s` và `answer_delay_max_s` (0 đến 30 giây, min không lớn hơn max), có kiểm khi lưu (FEAT-002)
+- Bản ghi HD Form Script `ERP AI Agent Status` do app sở hữu: tạo hoặc đặt lại từ `erp_ai/public/js/agent_status_indicator.js` mỗi lần cài hoặc `bench migrate` (sửa tay trên site bị ghi đè), xóa khi gỡ app (FEAT-002)
+
+### Changed
+- Câu trả lời đầu tiên của comment `@ai` được giữ lại một khoảng ngẫu nhiên 3–5 giây (mặc định, chỉnh được) kể từ lúc chỉ báo bắt đầu; không có độ trễ cho phiếu mới, và không vượt hạn chót của lần chạy (FEAT-002)

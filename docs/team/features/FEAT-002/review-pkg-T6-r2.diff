@@ -1,0 +1,240 @@
+diff --git a/erp_ai/agent/runner.py b/erp_ai/agent/runner.py
+index 676509d..940e53a 100644
+--- a/erp_ai/agent/runner.py
++++ b/erp_ai/agent/runner.py
+@@ -145,18 +145,26 @@ def _end_status(status, delay, ticket_name, run_id, trigger):
+ 	"""
+ 	status.done()
+ 	errors = status.take_errors()
++	# Runs in a `finally`: a failing log call must never replace the run's own exception (or the normal
++	# return). There is no better place left to report a failure of the log itself, so it is dropped.
+ 	for piece in errors:
+-		frappe.log_error(TITLE_STATUS_FAILED, f"ticket={ticket_name} run_id={run_id} {piece}")
+-	frappe.logger(LOGGER_NAME).info(
+-		"erp_ai run_status ticket=%s run_id=%s trigger=%s signals=%d errors=%d delay_s=%.1f waited_s=%.1f",
+-		ticket_name,
+-		run_id,
+-		trigger,
+-		status.signal_count,
+-		len(errors),
+-		delay.delay_s if delay else 0,
+-		delay.waited_s if delay else 0,
+-	)
++		try:
++			frappe.log_error(TITLE_STATUS_FAILED, f"ticket={ticket_name} run_id={run_id} {piece}")
++		except Exception:
++			pass
++	try:
++		frappe.logger(LOGGER_NAME).info(
++			"erp_ai run_status ticket=%s run_id=%s trigger=%s signals=%d errors=%d delay_s=%.1f waited_s=%.1f",
++			ticket_name,
++			run_id,
++			trigger,
++			status.signal_count,
++			len(errors),
++			delay.delay_s if delay else 0,
++			delay.waited_s if delay else 0,
++		)
++	except Exception:
++		pass
+ 
+ 
+ def _log_skip(ticket_name, trigger, run_id, stop_reason):
+diff --git a/erp_ai/agent/test_runner_status.py b/erp_ai/agent/test_runner_status.py
+index d0986a7..05e7f21 100644
+--- a/erp_ai/agent/test_runner_status.py
++++ b/erp_ai/agent/test_runner_status.py
+@@ -397,7 +397,7 @@ class TestRunnerStatus(RunnerTestBase):
+ 
+ 	# T6: `done` is the last signal on every ending (AC-4), one summary line per run (design 4.5)
+ 
+-	def _run_closing(self, trigger, run=None):
++	def _run_closing(self, trigger):
+ 		"""Run once; return the arguments of each `run_status` summary line; sets `self.log_error` and `self.signals_at_entry` (signals out when each entry was written)."""
+ 		self.signals_at_entry = []
+ 		real_write_entry = runner.write_entry
+@@ -411,17 +411,17 @@ class TestRunnerStatus(RunnerTestBase):
+ 			patch.object(frappe, "logger") as get_logger,
+ 			patch.object(frappe, "log_error") as log_error,
+ 		):
+-			(run or (lambda: self._run(trigger)))()
++			self._run(trigger)
+ 		self.log_error = log_error
+ 		lines = [
+-			call.args
+-			for call in get_logger.return_value.info.call_args_list
+-			if call.args and str(call.args[0]).startswith("erp_ai run_status")
++			invocation.args
++			for invocation in get_logger.return_value.info.call_args_list
++			if invocation.args and str(invocation.args[0]).startswith("erp_ai run_status")
+ 		]
+ 		get_logger.assert_any_call(LOGGER_NAME)
+ 		return lines
+ 
+-	def _assert_done_last_and_summarised(self, lines, trigger, errors=0):
++	def _assert_done_last_and_summarised(self, lines, trigger, errors=0, delay_s=0, waited_s=0):
+ 		states = self._states()
+ 		self.assertEqual(states[0], "thinking")
+ 		self.assertEqual(states.count("done"), 1)
+@@ -437,15 +437,30 @@ class TestRunnerStatus(RunnerTestBase):
+ 			"erp_ai run_status ticket=%s run_id=%s trigger=%s signals=%d errors=%d delay_s=%.1f waited_s=%.1f",
+ 		)
+ 		self.assertEqual(values[:5], [self.ticket.name, run_id, trigger, len(self.signals), errors])
++		# delay_s and waited_s, in that order (design 4.5)
++		self.assertEqual(values[5:], [delay_s, waited_s])
+ 
+ 	def test_done_last_when_no_post_comment(self):
++		self._set_delay(4, 4)
+ 		self._gateway(make_model_result(text="xong"))
+ 
+ 		lines = self._run_closing("comment_mention")
+ 
+-		self._assert_done_last_and_summarised(lines, "comment_mention")
++		# the model never answered, so the delay was picked but nothing waited
++		self._assert_done_last_and_summarised(lines, "comment_mention", delay_s=4, waited_s=0)
+ 		self.assertEqual(self._states(), ["thinking", "done"])
+ 
++	def test_summary_line_reports_delay_and_wait(self):
++		self._set_delay(4, 4)
++		self.model_seconds = 1
++		self._gateway(*self._answer_turns())
++
++		lines = self._run_closing("comment_mention")
++
++		# 4 s of delay, 1 s spent in the model: the run slept the other 3 s
++		self.assertEqual(self.sleeps, [3])
++		self._assert_done_last_and_summarised(lines, "comment_mention", delay_s=4, waited_s=3)
++
+ 	def test_done_last_on_gateway_error(self):
+ 		self._gateway(GatewayError("server_error", status=500))
+ 
+@@ -482,6 +497,8 @@ class TestRunnerStatus(RunnerTestBase):
+ 		self.assertIn("tool get_ticket: RuntimeError", self._entries(entry_type="reason")[0].error)
+ 
+ 	def test_done_last_on_classify_gateway_error(self):
++		# ticket_insert has no delay, whatever the settings say: the summary reports 0 and 0
++		self._set_delay(4, 4)
+ 		self._gateway(GatewayError("server_error", status=500))
+ 
+ 		lines = self._run_closing("ticket_insert")
+@@ -490,6 +507,7 @@ class TestRunnerStatus(RunnerTestBase):
+ 		self.assertEqual(self._entries()[-1].stop_reason, "gateway_error")
+ 
+ 	def test_done_last_on_unexpected_runner_exception(self):
++		self._set_delay(4, 4)
+ 		self._gateway(make_model_result(text="xong"))
+ 
+ 		with patch.object(runner, "build_initial_message", side_effect=RuntimeError):
+@@ -499,9 +517,11 @@ class TestRunnerStatus(RunnerTestBase):
+ 		self.assertEqual(self._states(), ["thinking", "done"])
+ 		self.assertEqual(self.signals_at_entry, [])
+ 		self.assertEqual(len(lines), 1)
+-		self.assertEqual(lines[0][3:6], ("comment_mention", 2, 0))
++		self.assertEqual(lines[0][3:], ("comment_mention", 2, 0, 4, 0))
+ 		# the failure still reaches the log as before, with the class only
+-		self.assertEqual([call.args[0] for call in self.log_error.call_args_list], [TITLE_RUN_FAILED])
++		self.assertEqual(
++			[invocation.args[0] for invocation in self.log_error.call_args_list], [TITLE_RUN_FAILED]
++		)
+ 
+ 	def test_done_reaches_page_on_rollback_branch(self):
+ 		before = tuple(frappe.db.get_value("HD Ticket", self.ticket.name, TICKET_FIELDS))
+@@ -520,7 +540,9 @@ class TestRunnerStatus(RunnerTestBase):
+ 		self.assertEqual(tuple(frappe.db.get_value("HD Ticket", self.ticket.name, TICKET_FIELDS)), before)
+ 		self.assertEqual(self._entries(entry_type="classify")[0].applied, 0)
+ 		self.assertEqual(self._states(), ["thinking", "working", "working", "done"])
+-		self.assertEqual([call.args[0] for call in self.log_error.call_args_list], [TITLE_RUN_FAILED])
++		self.assertEqual(
++			[invocation.args[0] for invocation in self.log_error.call_args_list], [TITLE_RUN_FAILED]
++		)
+ 		self.assertEqual(len(lines), 1)
+ 
+ 	def test_done_after_last_log_entry(self):
+@@ -536,10 +558,10 @@ class TestRunnerStatus(RunnerTestBase):
+ 		self.assertEqual(len(self.signals_at_entry), 3)
+ 		self.assertEqual(len(self._states()), len(self.signals))
+ 		self.assertEqual(self._states()[-1], "done")
+-		self.assertLess(self.signals_at_entry[-1], len(self.signals))
+ 		self.assertEqual(self.signals_at_entry[-1], len(self.signals) - 1)
+ 
+ 	def test_leftover_status_errors_go_to_error_log_class_only(self):
++		self._set_delay(4, 4)
+ 		self._gateway(make_model_result(text="xong"))
+ 
+ 		run_ids = []
+@@ -562,19 +584,66 @@ class TestRunnerStatus(RunnerTestBase):
+ 				)
+ 			],
+ 		)
+-		self.assertEqual(lines[0][3:6], ("comment_mention", 2, 1))
++		self.assertEqual(lines[0][3:], ("comment_mention", 2, 1, 4, 0))
++
++	def _count_changes(self):
++		"""Run one mention run and return what it changed: (new Comments, new Tasks, ticket `modified` changed?)."""
++		comments, tasks = frappe.db.count("Comment"), frappe.db.count("Task")
++		modified = frappe.db.get_value("HD Ticket", self.ticket.name, "modified")
++		self._gateway(*self._answer_turns())
++		self._run("comment_mention")
++		return (
++			frappe.db.count("Comment") - comments,
++			frappe.db.count("Task") - tasks,
++			frappe.db.get_value("HD Ticket", self.ticket.name, "modified") != modified,
++		)
+ 
+ 	def test_feature_adds_no_comment_task_or_ticket_change(self):
+-		self._set_delay(3, 5)
+-		self._gateway(make_model_result(text="xong"))
++		frappe.db.savepoint("erp_ai_changes")
++		try:
++			self._set_delay(3, 5)
++			on = self._count_changes()
++			signals_on = len(self.signals)
++			frappe.db.rollback(save_point="erp_ai_changes")
++
++			self.signals.clear()
++			frappe.db.set_single_value(SETTING_DOCTYPE, "thinking_text", "")
++			self._set_delay(0, 0)
++			off = self._count_changes()
++		finally:
++			frappe.db.rollback(save_point="erp_ai_changes")
+ 
+-		def snapshot():
+-			ticket = tuple(frappe.db.get_value("HD Ticket", self.ticket.name, TICKET_FIELDS))
+-			return (frappe.db.count("Comment"), frappe.db.count("Task"), ticket)
++		# the same stub answered in both runs; only the status signals differ
++		self.assertEqual(on[0], 1)
++		self.assertGreater(signals_on, 0)
++		self.assertEqual(self.signals, [])
++		self.assertEqual(on, off)
+ 
+-		before = snapshot()
++	def test_end_status_never_raises_when_logging_fails(self):
++		status = runner.RunStatus(self.ticket.name, "run1", THINKING_TEXT)
++		status.start()
++		status._errors.append("status_done: RuntimeError")
++		delay = answer_delay.AnswerDelay(4, 0)
+ 
+-		self._run("comment_mention")
++		with (
++			patch.object(frappe, "log_error", side_effect=RuntimeError("log_error down")),
++			patch.object(frappe, "logger", side_effect=RuntimeError("logger down")),
++		):
++			runner._end_status(status, delay, self.ticket.name, "run1", "comment_mention")
+ 
+ 		self.assertEqual(self._states(), ["thinking", "done"])
+-		self.assertEqual(snapshot(), before)
++
++	def test_failing_error_log_does_not_replace_the_run_exception(self):
++		self._gateway(make_model_result(text="xong"))
++
++		def failing_done(event, message, room=None):
++			if message["state"] == "done":
++				raise RuntimeError("done failed")
++
++		with (
++			patch("frappe.realtime.emit_via_redis", side_effect=failing_done),
++			patch.object(frappe, "log_error", side_effect=OSError("log_error down")),
++			patch.object(runner, "build_initial_message", side_effect=ValueError("the run's own error")),
++		):
++			with self.assertRaises(ValueError):
++				runner._run(self.ticket.name, "comment_mention")

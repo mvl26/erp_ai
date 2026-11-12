@@ -86,4 +86,6 @@ def get_panel_data(ticket: str) -> dict:
 		frappe.throw(_("Thiếu mã phiếu."), frappe.ValidationError)
 	ticket = ticket.strip()
 	_require_panel_access(ticket)
-	return {"ticket": ticket, "ai_fields": _ai_fields(ticket), "messages": _thread(ticket)}
+	messages = _thread(ticket)
+	frappe.logger(LOGGER_NAME).debug(f"erp_ai panel read ticket={ticket} messages={len(messages)}")
+	return {"ticket": ticket, "ai_fields": _ai_fields(ticket), "messages": messages}

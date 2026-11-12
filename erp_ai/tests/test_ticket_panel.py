@@ -1,4 +1,5 @@
-from unittest.mock import patch
+import json
+from unittest.mock import MagicMock, patch
 
 import frappe
 from frappe.tests.utils import FrappeTestCase
@@ -6,8 +7,8 @@ from helpdesk.test_utils import create_agent, make_ticket
 from helpdesk.utils import is_agent
 
 from erp_ai import ticket_panel
-from erp_ai.constants import AGENT_USER, PANEL_METHODS
-from erp_ai.test_utils import set_agent_settings
+from erp_ai.constants import AGENT_USER, LOGGER_NAME, PANEL_METHODS
+from erp_ai.test_utils import FakeGateway, set_agent_settings
 
 AI_FIELD_LABELS = (
 	("ai_resolution_hint", "Hướng giải quyết (AI)"),
@@ -242,3 +243,104 @@ class TestTicketPanelThread(FrappeTestCase):
 				self.assertIn("link", message["text"])
 				self.assertEqual(message["text"].split()[-3:], ["link", KEYWORD, "bold"])
 		self.assertEqual(bot["text"].split()[:2], ["one", "two"])
+
+
+class TestTicketPanelReadOnly(FrappeTestCase):
+	"""AC-14, NFR-4, STD-OPS-5: the read changes nothing, calls no model, and logs ids only."""
+
+	def setUp(self):
+		self.addCleanup(frappe.db.rollback)
+		self.addCleanup(frappe.set_user, "Administrator")
+		frappe.set_user("Administrator")
+		create_agent(AGENT_EMAIL)
+		set_agent_settings(trigger_keyword=KEYWORD)
+		self.ticket = make_ticket(subject="Panel read-only ticket").name
+
+	def _logger(self):
+		logger = MagicMock()
+		patcher = patch.object(ticket_panel.frappe, "logger", return_value=logger)
+		get_logger = patcher.start()
+		self.addCleanup(patcher.stop)
+		return logger, get_logger
+
+	def _counts(self):
+		return {
+			"comments": frappe.db.count("Comment"),
+			"logs": frappe.db.count("ERP AI Log"),
+			"todos": frappe.db.count("ToDo"),
+			"tasks": frappe.db.count("Task"),
+			"modified": frappe.db.get_value("HD Ticket", self.ticket, "modified"),
+		}
+
+	def test_read_writes_nothing_and_calls_no_gateway(self):
+		_add_comment(self.ticket, f"{KEYWORD} human")
+		_add_comment(self.ticket, "bot reply", AGENT_USER)
+		gateway = FakeGateway()
+		frappe.set_user(AGENT_EMAIL)
+		self.assertNotEqual(frappe.session.user, "Administrator")
+		before = self._counts()
+		with patch("erp_ai.gateway.call_model", gateway), patch("frappe.enqueue") as enqueue:
+			for _ in range(3):
+				writes = frappe.db.transaction_writes
+				ticket_panel.get_panel_data(self.ticket)
+				self.assertEqual(frappe.db.transaction_writes, writes)
+		self.assertEqual(self._counts(), before)
+		self.assertEqual(gateway.call_count, 0)
+		enqueue.assert_not_called()
+
+	def test_read_never_returns_keyword_or_settings(self):
+		set_agent_settings(
+			trigger_keyword="zq-unique-keyword",
+			alert_recipients="zq-unique-recipient@example.com",
+			thinking_text="zq-unique-thinking",
+		)
+		frappe.db.set_value("HD Ticket", self.ticket, "ai_confidence", "Cao")
+		_add_comment(self.ticket, "bot reply", AGENT_USER)
+		frappe.set_user(AGENT_EMAIL)
+		result = json.dumps(ticket_panel.get_panel_data(self.ticket), ensure_ascii=False)
+		for secret in ("zq-unique-keyword", "zq-unique-recipient", "zq-unique-thinking"):
+			with self.subTest(secret=secret):
+				self.assertNotIn(secret, result)
+		self.assertEqual(set(json.loads(result)), {"ticket", "ai_fields", "messages"})
+
+	def test_read_logs_ids_only_at_debug(self):
+		_add_comment(self.ticket, f"{KEYWORD} secret body text")
+		_add_comment(self.ticket, "bot secret reply", AGENT_USER)
+		_add_comment(self.ticket, "plain human note without the trigger")
+		logger, get_logger = self._logger()
+		frappe.set_user(AGENT_EMAIL)
+		ticket_panel.get_panel_data(self.ticket)
+		get_logger.assert_called_with(LOGGER_NAME)
+		logger.debug.assert_called_once_with(f"erp_ai panel read ticket={self.ticket} messages=2")
+		logger.info.assert_not_called()
+		logged = str(logger.mock_calls)
+		bot_name = frappe.utils.get_fullname(AGENT_USER)
+		for leak in ("secret", KEYWORD, bot_name, AGENT_EMAIL, AGENT_USER, "Administrator"):
+			self.assertNotIn(leak, logged)
+
+	def test_denied_read_logs_reason_without_content_or_email(self):
+		_make_user(WEBSITE_EMAIL)
+		_add_comment(self.ticket, f"{KEYWORD} secret body text")
+		logger, _ = self._logger()
+		frappe.set_user(WEBSITE_EMAIL)
+		with self.assertRaises(frappe.PermissionError):
+			ticket_panel.get_panel_data(self.ticket)
+		logger.info.assert_called_once_with(
+			f"erp_ai panel denied method=get ticket={self.ticket} reason=not_agent"
+		)
+		logger.debug.assert_not_called()
+
+		frappe.set_user("Administrator")
+		create_agent(NO_READ_EMAIL)
+		frappe.get_doc("User", NO_READ_EMAIL).remove_roles("Agent", "Agent Manager")
+		frappe.set_user(NO_READ_EMAIL)
+		logger.reset_mock()
+		with self.assertRaises(frappe.PermissionError):
+			ticket_panel.get_panel_data(self.ticket)
+		logger.info.assert_called_once_with(
+			f"erp_ai panel denied method=get ticket={self.ticket} reason=no_read"
+		)
+		logger.debug.assert_not_called()
+		logged = str(logger.mock_calls)
+		for leak in ("secret", KEYWORD, WEBSITE_EMAIL, NO_READ_EMAIL):
+			self.assertNotIn(leak, logged)

@@ -203,6 +203,21 @@ STATUS_SCRIPT_REQUIRED = (
 	r"sendEl\.textContent = TEXT_SENDING",
 	r"sendEl\.textContent = TEXT_SEND\b",
 	r"inputEl\.placeholder = TEXT_INPUT_PLACEHOLDER",
+	# T13 r1: fixed values of the remaining texts, and the box is locked while a send is pending.
+	r'TEXT_SEND = "Gửi";',
+	r'TEXT_INPUT_PLACEHOLDER =\s*"Nhập câu hỏi cho bot\. Enter để gửi, Shift\+Enter để xuống dòng\."',
+	r"panel\.sendEl\.disabled = true;\s*panel\.sendEl\.textContent = TEXT_SENDING",
+	r"panel\.inputEl\.disabled = true",
+	# T13 r1: each wiring point pinned at its use site (a declaration or a copy elsewhere must not satisfy it).
+	r"const isStale = \(\) => ticket !== state\.ticket;",
+	r"unlock = \(\) => \{\s*panel\.sending = false;\s*panel\.inputEl\.disabled = false;\s*panel\.sendEl\.disabled = false;\s*panel\.sendEl\.textContent = TEXT_SEND;\s*\}",
+	r'unlock\(\);\s*if \(isStale\(\)\) \{\s*return;\s*\}\s*panel\.inputEl\.value = ""',
+	r"onSendFailed = \(\) => \{\s*try \{\s*unlock\(\);\s*if \(!isStale\(\)\)",
+	r"\.then\(onSent, onSendFailed\)",
+	r"catch \(e\) \{\s*onSendFailed\(\);",
+	r"isComposing\) \{\s*event\.preventDefault\(\);\s*submit\(\);",
+	r'addEventListener\("click", \(\) => \{\s*try \{\s*submit\(\);',
+	r"formEl,\s*slotEl",
 )
 
 # ADR-009: every `call(` in the page script passes a string literal naming one of PANEL_METHODS.

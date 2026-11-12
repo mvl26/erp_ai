@@ -369,6 +369,7 @@ function setupForm({ doc, call, router }) {
 			const isStale = () => ticket !== state.ticket;
 			const unlock = () => {
 				panel.sending = false;
+				panel.inputEl.disabled = false;
 				panel.sendEl.disabled = false;
 				panel.sendEl.textContent = TEXT_SEND;
 			};
@@ -397,6 +398,7 @@ function setupForm({ doc, call, router }) {
 			};
 			panel.errorEl.textContent = "";
 			panel.sending = true;
+			panel.inputEl.disabled = true;
 			panel.sendEl.disabled = true;
 			panel.sendEl.textContent = TEXT_SENDING;
 			try {

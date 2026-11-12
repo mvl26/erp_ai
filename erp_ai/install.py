@@ -3,6 +3,7 @@ from frappe.custom.doctype.custom_field.custom_field import create_custom_fields
 from frappe.permissions import setup_custom_perms
 
 from erp_ai.agent.policy import OPT_OUT_FIELD
+from erp_ai.agent.routing import DEFAULT_ROUTING_RULES
 from erp_ai.constants import (
 	AGENT_USER,
 	HELPDESK_AGENT_ROLE,
@@ -17,6 +18,8 @@ TEMPLATE_NAME = "Default"
 AI_MODULE = "ERP AI agent"
 AI_SECTION_FIELD = "ai_section"
 AI_PERMLEVEL = 8
+TASK_DOCTYPE = "Task"
+TASK_TICKET_FIELD = "ai_ticket"
 FORM_SCRIPT_DOCTYPE = "HD Form Script"
 AGENT_STATUS_SCRIPT = "ERP AI Agent Status"
 AGENT_STATUS_SCRIPT_FILE = ("public", "js", "agent_status_indicator.js")
@@ -45,6 +48,7 @@ def ensure_setup() -> None:
 	_ensure_default_settings()
 	_ensure_ticket_custom_fields()
 	_ensure_template_rows()
+	_ensure_task_ticket_field()
 	_ensure_task_permission()
 	_ensure_agent_status_script()
 
@@ -84,15 +88,20 @@ def _ensure_agent_user() -> None:
 
 
 def _ensure_default_settings() -> None:
-	for field in frappe.get_meta(SETTING_DOCTYPE).fields:
-		if field.default is None or field.default == "":
-			continue
+	defaults = {
+		field.fieldname: field.default
+		for field in frappe.get_meta(SETTING_DOCTYPE).fields
+		if field.default is not None and field.default != ""
+	}
+	# Too long for a DocType JSON default, so it lives in code (design 2.4/3.3).
+	defaults["routing_rules"] = DEFAULT_ROUTING_RULES
+	for fieldname, default in defaults.items():
 		stored = frappe.db.sql(
 			"select value from `tabSingles` where doctype=%s and field=%s",
-			(SETTING_DOCTYPE, field.fieldname),
+			(SETTING_DOCTYPE, fieldname),
 		)
 		if not stored or stored[0][0] is None:
-			frappe.db.set_single_value(SETTING_DOCTYPE, field.fieldname, field.default)
+			frappe.db.set_single_value(SETTING_DOCTYPE, fieldname, default)
 
 
 def _ensure_ticket_custom_fields() -> None:
@@ -201,17 +210,45 @@ def _ensure_template_rows() -> None:
 		template.save()
 
 
+def _ensure_task_ticket_field() -> None:
+	if not frappe.db.exists("DocType", TASK_DOCTYPE):
+		return  # _ensure_task_permission logs the missing DocType once
+	# update=False: a field that exists is left as the human set it.
+	create_custom_fields(
+		{
+			TASK_DOCTYPE: [
+				{
+					"fieldname": TASK_TICKET_FIELD,
+					"label": "Phiếu Helpdesk",
+					"fieldtype": "Link",
+					"options": TICKET_DOCTYPE,
+					"permlevel": 0,
+					"search_index": 1,
+					"module": AI_MODULE,
+					"insert_after": "description",
+				}
+			]
+		},
+		update=False,
+	)
+
+
 def _ensure_task_permission() -> None:
-	if not frappe.db.exists("DocType", "Task"):
+	if not frappe.db.exists("DocType", TASK_DOCTYPE):
 		frappe.logger(LOGGER_NAME).warning("DocType Task not found; agent permission not added")
 		return
-	setup_custom_perms("Task")
-	if frappe.db.exists("Custom DocPerm", {"parent": "Task", "role": ROLE_AGENT}):
+	setup_custom_perms(TASK_DOCTYPE)
+	row = {"parent": TASK_DOCTYPE, "role": ROLE_AGENT, "permlevel": 0, "if_owner": 1}
+	if frappe.db.exists("Custom DocPerm", {"parent": TASK_DOCTYPE, "role": ROLE_AGENT}):
+		# Only the share flag is ours to turn on; every other flag stays as found.
+		if frappe.db.exists("Custom DocPerm", {**row, "share": 0}):
+			frappe.db.set_value("Custom DocPerm", {**row, "share": 0}, "share", 1)
+			frappe.clear_cache(doctype=TASK_DOCTYPE)
 		return
 	frappe.get_doc(
 		{
 			"doctype": "Custom DocPerm",
-			"parent": "Task",
+			"parent": TASK_DOCTYPE,
 			"parenttype": "DocType",
 			"parentfield": "permissions",
 			"role": ROLE_AGENT,
@@ -219,10 +256,11 @@ def _ensure_task_permission() -> None:
 			"read": 1,
 			"write": 1,
 			"create": 1,
+			"share": 1,
 			"if_owner": 1,
 		}
 	).insert(ignore_permissions=True)
-	frappe.clear_cache(doctype="Task")
+	frappe.clear_cache(doctype=TASK_DOCTYPE)
 
 
 def _ensure_agent_status_script() -> None:

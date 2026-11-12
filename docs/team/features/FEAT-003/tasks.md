@@ -11,7 +11,7 @@ Mỗi task 2–5 phút. Hai task chung file thì phụ thuộc nhau. Đánh dấ
 `cmd.test_one` = lệnh của profile với `{file}` là file ở `test:`. Mọi task: viết test đỏ trước (STD-TEST-1), chỉ sửa trong `files:`. Tên hàm, hằng, chuỗi chính xác: `plan.md` mục Ràng buộc chung và `design.md` mục 3.
 
 Tiến độ: BASE ghi ở đây trước mỗi lần gọi dev.
-- BASE T1=8c6d925 · T3=8c6d925 · T2=1560098 · T4=f7dc6b1 · T5=b433459 · T6=3cfa6bf · T7=3cfa6bf · T8=da2d63e · T12=da2d63e · T9=92aef2f · T13=92aef2f
+- BASE T1=8c6d925 · T3=8c6d925 · T2=1560098 · T4=f7dc6b1 · T5=b433459 · T6=3cfa6bf · T7=3cfa6bf · T8=da2d63e · T12=da2d63e · T9=c3f32b5 · T13=c3f32b5 (r2 approve, merged 260db00 / 1f6787c) · T10=1f6787c · T14=1f6787c (merged to b075d2d) · T11=b075d2d · T15=b075d2d
 - Ticked T1..T7 on `Ran 621 tests ... OK` (da2d63e, T1..T7 merged). T8, T12 merged (92aef2f), tick after the full run in the T9 step 0. Ruling D-1 (T3): see review-03.md.
 
 ## Phần 2, walking skeleton (T1 rồi T2; không task phần 2 nào khác bắt đầu trước khi review T2 là approve)
@@ -57,17 +57,17 @@ Tiến độ: BASE ghi ở đây trước mỗi lần gọi dev.
   - Receives: `get_activity_timeline` (`frappe/desk/form/activity.py`, khóa mục dev đọc ở dòng 254-271,331-337), `policy.contains_keyword`, `AGENT_USER`, `html_to_plain_text`
   - Returns: `messages`: danh sách `{name, author, is_bot, created_at, text}`, cũ → mới; không khóa email
   - Expect: `cmd.test_one` → `test_thread_selects_b5_comments_in_creation_order` (5 tin), `test_thread_ignores_non_comment_types`, `test_thread_marks_bot_messages`, `test_read_strips_xss_payloads_to_text` đạt
-- [ ] T8 — Đọc chỉ-đọc: log quan sát và test không ghi — files: erp_ai/ticket_panel.py, erp_ai/tests/test_ticket_panel.py — test: erp_ai/tests/test_ticket_panel.py — depends: T7
+- [x] T8 — Đọc chỉ-đọc: log quan sát và test không ghi — files: erp_ai/ticket_panel.py, erp_ai/tests/test_ticket_panel.py — test: erp_ai/tests/test_ticket_panel.py — depends: T7
   - Criterion: AC-14, NFR-4, STD-OPS-5 (phần đọc)
   - Receives: `get_panel_data` đầy đủ (T7), `LOGGER_NAME` (như `handlers.py:24`)
   - Returns: log `debug` "erp_ai panel read ticket=<tên> messages=<n>" và `info` "erp_ai panel denied method=get ticket=<tên> reason=<not_agent|no_read>"
   - Expect: `cmd.test_one` → `test_read_writes_nothing_and_calls_no_gateway` (gồm `frappe.db.transaction_writes` bằng nhau trước/sau, phiên agent thường), `test_read_never_returns_keyword_or_settings`, test log đọc/từ chối (không nội dung, không email) đạt
-- [ ] T9 — `send_message`: kiểm đầu vào, dựng nội dung, gọi `new_comment` — files: erp_ai/ticket_panel.py, erp_ai/tests/test_ticket_panel.py — test: erp_ai/tests/test_ticket_panel.py — depends: T6, T8
+- [x] T9 — `send_message`: kiểm đầu vào, dựng nội dung, gọi `new_comment` — files: erp_ai/ticket_panel.py, erp_ai/tests/test_ticket_panel.py — test: erp_ai/tests/test_ticket_panel.py — depends: T6, T8
   - Criterion: AC-9 (rỗng, biên 2000, thêm từ khóa cuối tin, từ khóa viết hoa khác, escape HTML, ngắt dòng, đúng 1 Comment `owner` = người gửi, từ khóa rỗng), AC-13 (gửi: non-agent, Guest, không quyền đọc, `AGENT_USER` → `PermissionError`, 0 Comment)
   - Receives: `policy.get_trigger_keyword`, `policy.contains_keyword` (T6), `_require_panel_access(..., forbid_agent_user=True)` (T1), `PANEL_MAX_MESSAGE_CHARS`
   - Returns: `send_message(ticket: str, text: str) -> dict` (`@frappe.whitelist(methods=["POST"])`) trả `{"comment": <tên>}`; đúng 1 lời gọi `frappe.get_doc("HD Ticket", ticket).new_comment(content)`; chưa có bước sanitize (T10)
   - Expect: `cmd.test_one` → `test_methods_whitelisted_post_without_guest` (nay cả 2 method), `test_send_empty_or_whitespace_is_rejected`, `test_send_length_boundary`, `test_send_appends_configured_keyword_when_missing`, `test_send_keeps_text_when_keyword_present_other_case`, `test_send_escapes_html`, `test_send_multiline_keeps_line_breaks`, `test_send_creates_one_comment_owned_by_sender`, `test_send_with_empty_keyword_creates_comment_without_keyword`, `test_send_denied_for_same_accounts_creates_nothing`, `test_send_denied_for_agent_user` đạt
-- [ ] T10 — `send_message`: kiểm từ khóa trên dạng sẽ lưu và log gửi — files: erp_ai/ticket_panel.py, erp_ai/tests/test_ticket_panel.py — test: erp_ai/tests/test_ticket_panel.py — depends: T9
+- [x] T10 — `send_message`: kiểm từ khóa trên dạng sẽ lưu và log gửi — files: erp_ai/ticket_panel.py, erp_ai/tests/test_ticket_panel.py — test: erp_ai/tests/test_ticket_panel.py — depends: T9
   - Criterion: AC-9 (bất biến: nội dung lưu phải vượt qua `contains_keyword`), ADR-010 Amendment 1 (QĐ 7), STD-OPS-5 (phần gửi)
   - Receives: `frappe.utils.html_utils.sanitize_html(content, always_sanitize=True)` (đối chiếu tham số với `frappe/core/doctype/comment/comment.py:69-74`, không tự viết bộ escape)
   - Returns: từ khóa không rỗng mà `contains_keyword(stored)` False → `frappe.ValidationError` (thông báo của design 3.2, không chứa từ khóa), không gọi `new_comment`; log `info` "erp_ai panel send ticket=… comment=… keyword_added=…", "erp_ai panel denied method=send … reason=<not_agent|no_read|agent_user>", "erp_ai panel send rejected ticket=… reason=keyword_not_storable"
@@ -80,17 +80,17 @@ Tiến độ: BASE ghi ở đây trước mỗi lần gọi dev.
 
 ## Phần 2, trang (JS; không có `cmd.test_js`, kiểm bằng luật tĩnh và bước tay J1)
 
-- [ ] T12 — Ngăn đầy đủ: luồng tin, đóng/mở, chuyển chỉ báo, chống kết quả cũ — files: erp_ai/public/js/agent_status_indicator.js, erp_ai/tests/test_architecture.py — test: erp_ai/tests/test_architecture.py — depends: T2, T7
+- [x] T12 — Ngăn đầy đủ: luồng tin, đóng/mở, chuyển chỉ báo, chống kết quả cũ — files: erp_ai/public/js/agent_status_indicator.js, erp_ai/tests/test_architecture.py — test: erp_ai/tests/test_architecture.py — depends: T2, T7
   - Criterion: AC-6 (nút Đóng, một chỉ báo), AC-7, AC-8 (nhãn "Bot", dòng hướng dẫn B-8, "Chưa có tin nào."), AC-11 (d)(g)
   - Receives: hợp đồng `messages` (T7), bảng chữ cố định design 3.3, F1 và `reload()` của design mục 4
   - Returns: `panel` = `{ el, open, slotEl, aiListEl, threadEl, errorEl, inputEl, sendEl, seq, sending }`; `togglePanel()` chuyển `state.el` vào `panel.slotEl` khi mở và trả về `document.body` khi đóng; `reload()` bỏ kết quả khi `seq`, `ticket` hoặc trạng thái mở đã đổi, lỗi → "Không tải được dữ liệu của khu vực. Hãy đóng rồi mở lại."; test_architecture.py: giữ các luật tĩnh xanh, thêm chuỗi vào `STATUS_SCRIPT_REQUIRED` chỉ khi có trong JS ở task này
   - Expect: `cmd.test_one` với erp_ai/tests/test_architecture.py đạt (không `innerHTML`, không số `600`, không `setInterval`)
-- [ ] T13 — Ô nhập và gửi tin trong ngăn — files: erp_ai/public/js/agent_status_indicator.js, erp_ai/tests/test_architecture.py — test: erp_ai/tests/test_architecture.py — depends: T12
+- [x] T13 — Ô nhập và gửi tin trong ngăn — files: erp_ai/public/js/agent_status_indicator.js, erp_ai/tests/test_architecture.py — test: erp_ai/tests/test_architecture.py — depends: T12
   - Criterion: AC-9 (rỗng/quá 2000 không gọi server; giữ chữ khi lỗi), AC-11 (g)
   - Receives: `panel.inputEl`, `panel.sendEl`, `reload()` (T12); chữ cố định design 3.3; F2 design mục 4
   - Returns: `submit()` (Enter không Shift và `event.isComposing` false, hoặc nút Gửi) gọi `state.call("erp_ai.ticket_panel.send_message", { ticket: state.ticket, text: value })`; `panel.sending` chặn bấm lặp; thành công xóa ô và `reload()`; lỗi hiện "Không gửi được tin. Chữ bạn gõ vẫn còn, hãy thử lại." và giữ chữ
   - Expect: `cmd.test_one` với erp_ai/tests/test_architecture.py đạt
-- [ ] T14 — Cập nhật trực tiếp, đặt lại khi đổi phiếu, ẩn khi màn hẹp — files: erp_ai/public/js/agent_status_indicator.js, erp_ai/tests/test_architecture.py — test: erp_ai/tests/test_architecture.py — depends: T13
+- [x] T14 — Cập nhật trực tiếp, đặt lại khi đổi phiếu, ẩn khi màn hẹp — files: erp_ai/public/js/agent_status_indicator.js, erp_ai/tests/test_architecture.py — test: erp_ai/tests/test_architecture.py — depends: T13
   - Criterion: AC-11 (a)(b)(c)(e)(f)(g), NFR-3, AC-14 (không storage, không polling)
   - Receives: `reload()`, `panel` (T12), F3 và F4 design mục 4; khóa payload `docinfo_update` (`comment.py:59-67,85-104`) và `doc_update` (`document.py:1370-1385`)
   - Returns: hàm có tên `onDocinfo`, `onDocUpdate` đăng ký bằng `socket.on` trong khối `if (state.socket !== socket)`; `connect` thêm `if (state.panel.open) reload()`; `reset()` mở rộng (đóng ngăn, trả chỉ báo, xóa nội dung và ô nhập, `panel.seq++`); `onResize` đóng ngăn khi `innerWidth < 640`, cờ `state.resizeBound`; `STATUS_SCRIPT_REQUIRED` thêm `"docinfo_update"`, `"doc_update"`

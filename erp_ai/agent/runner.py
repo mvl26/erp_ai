@@ -6,11 +6,11 @@ import frappe
 from frappe.utils import get_fullname
 
 from erp_ai import gateway
-from erp_ai.agent import authority, policy
+from erp_ai.agent import authority, policy, site_facts
 from erp_ai.agent.answer_delay import AnswerDelay
 from erp_ai.agent.classification import load_mapping, parse_classification
 from erp_ai.agent.prompts import build_classify_request, build_initial_message, build_reason_system
-from erp_ai.agent.routing import decide_route
+from erp_ai.agent.routing import decide_route, departments, load_routing_config
 from erp_ai.agent.run_log import write_entry
 from erp_ai.agent.run_status import CLASSIFY_STEP, RunStatus
 from erp_ai.agent.tools.read import TOOL_RESULT_MAX_CHARS
@@ -31,7 +31,7 @@ from erp_ai.constants import (
 	TRIGGER_TICKET_INSERT,
 )
 
-CLASSIFY_MAX_TOKENS = 400
+CLASSIFY_MAX_TOKENS = 600
 REASON_MAX_TOKENS = 4096
 STOP_TOOL_USE = "tool_use"
 STOP_MAX_TURNS = "max_turns"
@@ -49,6 +49,8 @@ WRITE_TOOL_TARGETS = {
 }
 UNPARSEABLE_ERROR = "UNPARSEABLE: không phân loại được"
 BAD_MAPPING_ERROR = "category_mapping không hợp lệ, không có giá trị dự đoán"
+BAD_ROUTING_ERROR = "routing_rules không hợp lệ, định tuyến dùng giá trị rỗng"
+NO_SCORE_REASON = "không có điểm"
 ROUTE_SAVEPOINT = "erp_ai_route"
 USAGE_COLUMNS = ("input_tokens", "output_tokens", "cache_creation_input_tokens", "cache_read_input_tokens")
 
@@ -90,6 +92,7 @@ def _run(ticket_name, trigger):
 	settings = frappe.get_single(SETTING_DOCTYPE)
 	if not settings.enabled:
 		return
+	routing = load_routing_config(settings.routing_rules)
 
 	run_id = uuid.uuid4().hex
 	# (c) the single send condition, re-checked at run time (NFR-4)
@@ -102,6 +105,7 @@ def _run(ticket_name, trigger):
 		return
 	# (e)
 	level = policy.effective_level(settings)
+	auto_assign = policy.auto_assign_enabled(settings)
 	deadline = time.monotonic() + JOB_TIMEOUT_S - JOB_SAFETY_MARGIN_S
 
 	if trigger == TRIGGER_COMMENT_MENTION and level == LEVELS[0]:
@@ -125,11 +129,12 @@ def _run(ticket_name, trigger):
 				run_id=run_id,
 				category_mapping=mapping,
 				agent_user=AGENT_USER,
+				routing_config=routing,
 			)
 		classification = None
 		if trigger == TRIGGER_TICKET_INSERT:
 			proceed, classification = _classify(
-				ticket_name, trigger, run_id, mapping, context, deadline, status
+				ticket_name, trigger, run_id, mapping, routing, context, auto_assign, deadline, status
 			)
 			if not proceed:
 				return
@@ -194,7 +199,7 @@ def _call_fields(result):
 	}
 
 
-def _classify(ticket_name, trigger, run_id, mapping, context, deadline, status):
+def _classify(ticket_name, trigger, run_id, mapping, routing, context, auto_assign, deadline, status):
 	"""Classification step (design 4.3 step 6). Writes one `classify` entry; with a context (L1+) also applies it.
 
 	Returns `(proceed, classification)`: `proceed` is False when the run must end here (gateway error);
@@ -206,7 +211,7 @@ def _classify(ticket_name, trigger, run_id, mapping, context, deadline, status):
 	try:
 		result = _call_model(
 			"classify",
-			**build_classify_request(subject, description),
+			**build_classify_request(subject, description, departments(routing)),
 			max_tokens=CLASSIFY_MAX_TOKENS,
 			deadline=deadline,
 		)
@@ -227,15 +232,14 @@ def _classify(ticket_name, trigger, run_id, mapping, context, deadline, status):
 		write_entry(**base, **call_fields, error=error, stop_reason="unparseable")
 		return True, None
 
-	# Skeleton collaborators: the real site checks arrive with T5, T8, T13.
 	decision = decide_route(
 		classification,
 		subject,
 		mapping,
-		{},
-		team_exists=lambda team: bool(frappe.db.exists("HD Team", team)),
-		is_excluded_team=lambda team: False,
-		is_active_agent=lambda user: False,
+		routing,
+		team_exists=site_facts.team_exists,
+		is_excluded_team=policy.is_excluded_team,
+		is_active_agent=site_facts.is_active_agent,
 	)
 	values = {
 		"ticket_type": decision.ticket_type,
@@ -247,22 +251,33 @@ def _classify(ticket_name, trigger, run_id, mapping, context, deadline, status):
 		**base,
 		**call_fields,
 		stop_reason=result.stop_reason,
-		error="; ".join([*([] if mapping else [BAD_MAPPING_ERROR]), *status.take_errors()]) or None,
+		error="; ".join(
+			[
+				*([] if mapping else [BAD_MAPPING_ERROR]),
+				*([] if routing else [BAD_ROUTING_ERROR]),
+				*status.take_errors(),
+			]
+		)
+		or None,
 		predicted_category=classification.category,
 		predicted_confidence=classification.confidence,
 		predicted_ticket_type=values["ticket_type"],
 		predicted_agent_group=values["agent_group"],
 		predicted_priority=values["priority"],
+		predicted_complexity=classification.complexity,
+		predicted_importance=classification.importance,
+		predicted_score_reason=classification.score_reason or NO_SCORE_REASON,
+		predicted_assignee=decision.assignee,
 		applied=0,
 	)
 	if context is not None:
 		status.working("set_classification")
-		_route(log_name, classification, decision, context)
+		_route(log_name, classification, decision, context, auto_assign, subject)
 	summary = {"category": classification.category, "confidence": classification.confidence, **values}
 	return True, summary
 
 
-def _route(log_name, classification, decision, context):
+def _route(log_name, classification, decision, context, auto_assign, subject):
 	"""Run `apply_route` and record its outcome on the entry as one unit (skeleton: the ticket write only).
 
 	The ticket change and the entry update share a savepoint: an exception between them undoes the

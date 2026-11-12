@@ -35,6 +35,10 @@
   "predicted_ticket_type",
   "predicted_agent_group",
   "predicted_priority",
+  "predicted_complexity",
+  "predicted_importance",
+  "predicted_score_reason",
+  "predicted_assignee",
   "applied",
   "section_correction",
   "human_corrected_to",
@@ -253,6 +257,34 @@
    "fieldtype": "Data",
    "label": "Ưu tiên dự đoán",
    "description": "Mức ưu tiên mà agent dự đoán. Tiêu đề phiếu có [GẤP] thì ưu tiên là Urgent. Dùng để đo độ chính xác của dự đoán. Hệ thống tự ghi khi agent chạy, không sửa được.",
+   "read_only": 1
+  },
+  {
+   "fieldname": "predicted_complexity",
+   "fieldtype": "Int",
+   "label": "Độ phức tạp dự đoán",
+   "description": "Độ phức tạp từ 1 đến 3 mà agent chấm cho phiếu. Không có điểm thì ghi 0. Ở L0 đây là chỗ duy nhất giữ điểm, vì phiếu không bị sửa. Hệ thống tự ghi khi agent chạy, không sửa được.",
+   "read_only": 1
+  },
+  {
+   "fieldname": "predicted_importance",
+   "fieldtype": "Int",
+   "label": "Độ quan trọng dự đoán",
+   "description": "Độ quan trọng từ 1 đến 3 mà agent chấm cho phiếu. Không có điểm thì ghi 0. Dùng để đối chiếu với ưu tiên đã chọn. Hệ thống tự ghi khi agent chạy, không sửa được.",
+   "read_only": 1
+  },
+  {
+   "fieldname": "predicted_score_reason",
+   "fieldtype": "Small Text",
+   "label": "Lý do chấm điểm",
+   "description": "Lý do agent đưa ra cho hai điểm trên. Không có điểm thì ghi \"không có điểm\". Hệ thống tự ghi khi agent chạy, không sửa được.",
+   "read_only": 1
+  },
+  {
+   "fieldname": "predicted_assignee",
+   "fieldtype": "Data",
+   "label": "Người phụ trách dự đoán",
+   "description": "Người phụ trách mà agent dự đoán theo Quy tắc định tuyến, ghi bằng mã người dùng. Để trống nếu cấu hình không có người hợp lệ. Hệ thống tự ghi khi agent chạy, không sửa được.",
    "read_only": 1
   },
   {

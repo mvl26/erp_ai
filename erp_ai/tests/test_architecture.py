@@ -18,6 +18,8 @@ import sys
 import unittest
 from pathlib import Path
 
+from erp_ai.constants import PANEL_METHODS
+
 PACKAGE_ROOT = Path(__file__).resolve().parent.parent
 REPO_ROOT = PACKAGE_ROOT.parent
 CI_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "ci.yml"
@@ -124,10 +126,24 @@ STATUS_SCRIPT_FORBIDDEN = (
 	r"frappe\.call",
 	r"updateField",
 	r"open_doc:",
-	r"\bcall\b",
 	r"600",
 	r"HD Form Script",
 	r"^\s*(import|export)\b",
+	# ADR-009: the panel script must not parse markup, poll, unbind listeners or create navigable elements.
+	r"DOMParser",
+	r"createContextualFragment",
+	r"setInterval",
+	r"MutationObserver",
+	r"\.off\(",
+	r"removeListener",
+	r"removeAllListeners",
+	r'createElement\("a"',
+	r'createElement\("img"',
+	r'createElement\("iframe"',
+	r'createElement\("script"',
+	r"\.src =",
+	r"\.href =",
+	r"innerText =",
 )
 # Regexes: the socket guard keeps setupForm (run many times) from registering listeners twice; the
 # `state.ticket = null` leave-page step keeps a left ticket's signals from showing (ADR-008 decision 6).
@@ -143,6 +159,22 @@ STATUS_SCRIPT_REQUIRED = (
 	r"state\.ticket = null",
 	r"if \(state\.ticket\)",
 )
+
+# ADR-009: every `call(` in the page script passes a string literal naming one of PANEL_METHODS.
+STATUS_SCRIPT_CALL = re.compile(r"\bcall\(\s*(\"([^\"]*)\")?")
+
+
+def check_status_script_calls(script: str, allowed_methods) -> list:
+	"""Violations: a `call(` whose first argument is not a literal in `allowed_methods`."""
+	violations = []
+	for match in STATUS_SCRIPT_CALL.finditer(script):
+		line = script.count("\n", 0, match.start()) + 1
+		if match.group(1) is None:
+			violations.append(f"line {line}: first argument of call( is not a string literal")
+		elif match.group(2) not in allowed_methods:
+			violations.append(f"line {line}: {match.group(2)} is not in PANEL_METHODS")
+	return violations
+
 
 # ADR-008 (status signals) and ADR-007 (the one form script): who may publish, import, write or delete.
 RUN_STATUS_FILE = "agent/run_status.py"
@@ -1081,11 +1113,26 @@ class TestArchitecture(unittest.TestCase):
 	def test_status_script_static_rules(self):
 		script = load_product_sources(suffixes=(".js",)).get(STATUS_SCRIPT_FILE)
 		self.assertIsNotNone(script, f"{STATUS_SCRIPT_FILE} is missing")
-		self.assertIn("function setupForm({ doc, router })", script)
+		self.assertIn("function setupForm({ doc, call, router })", script)
 		for pattern in STATUS_SCRIPT_FORBIDDEN:
 			self.assertIsNone(re.search(pattern, script, re.MULTILINE), f"forbidden in script: {pattern}")
 		for pattern in STATUS_SCRIPT_REQUIRED:
 			self.assertIsNotNone(re.search(pattern, script), f"missing in script: {pattern}")
+
+	def test_status_script_calls_use_literal_panel_methods(self):
+		script = load_product_sources(suffixes=(".js",)).get(STATUS_SCRIPT_FILE)
+		self.assertIsNotNone(script, f"{STATUS_SCRIPT_FILE} is missing")
+		self.assertGreater(len(STATUS_SCRIPT_CALL.findall(script)), 0, "no call( found in script")
+		self.assertEqual(check_status_script_calls(script, PANEL_METHODS), [])
+
+	def test_status_script_call_check_catches_variable_and_unknown_method(self):
+		allowed = ("erp_ai.ticket_panel.get_panel_data",)
+		self.assertEqual(
+			check_status_script_calls('state.call("erp_ai.ticket_panel.get_panel_data", {})', allowed), []
+		)
+		self.assertEqual(len(check_status_script_calls("state.call(METHOD, {})", allowed)), 1)
+		self.assertEqual(len(check_status_script_calls('state.call("other.method", {})', allowed)), 1)
+		self.assertEqual(len(check_status_script_calls("state\n.call(\n  METHOD)", allowed)), 1)
 
 	def test_status_event_name_matches_script(self):
 		match = re.search(r'^AGENT_STATUS_EVENT = "([^"]+)"', self.sources[CONSTANTS_FILE], re.MULTILINE)

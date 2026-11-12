@@ -1,7 +1,9 @@
+from unittest.mock import patch
+
 import frappe
 
 from erp_ai.agent.run_log import write_entry
-from erp_ai.constants import SETTING_DOCTYPE
+from erp_ai.constants import AGENT_STATUS_EVENT, SETTING_DOCTYPE
 from erp_ai.gateway import GatewayError, ModelResult
 
 
@@ -28,10 +30,14 @@ def make_model_result(**kw) -> ModelResult:
 
 
 class FakeGateway:
-	"""Thay `erp_ai.gateway.call_model`: trả lần lượt các kết quả đã xếp, ném nếu là GatewayError."""
+	"""Thay `erp_ai.gateway.call_model`: trả lần lượt các kết quả đã xếp, ném nếu là GatewayError.
 
-	def __init__(self, *results):
+	`on_call(task, kwargs)` chạy trước khi trả kết quả (ghi thứ tự lời gọi, đẩy đồng hồ giả).
+	"""
+
+	def __init__(self, *results, on_call=None):
 		self.results = list(results)
+		self.on_call = on_call
 		self.calls = []
 
 	@property
@@ -40,10 +46,29 @@ class FakeGateway:
 
 	def __call__(self, task, **kwargs):
 		self.calls.append({"task": task, **kwargs})
+		if self.on_call is not None:
+			self.on_call(task, kwargs)
 		result = self.results.pop(0) if self.results else make_model_result()
 		if isinstance(result, GatewayError):
 			raise result
 		return result
+
+
+def record_status_signals(testcase) -> list[dict]:
+	"""Patch `frappe.realtime.emit_via_redis`; return the list that collects `{"event", "message", "room"}` of every agent status signal.
+
+	Other events are dropped, so nothing reaches Redis. The patch is removed by `addCleanup`.
+	"""
+	signals = []
+
+	def record(event, message, room=None):
+		if event == AGENT_STATUS_EVENT:
+			signals.append({"event": event, "message": message, "room": room})
+
+	emit_patch = patch("frappe.realtime.emit_via_redis", side_effect=record)
+	emit_patch.start()
+	testcase.addCleanup(emit_patch.stop)
+	return signals
 
 
 def set_agent_settings(**fields) -> None:

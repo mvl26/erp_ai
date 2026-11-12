@@ -6,6 +6,7 @@ from helpdesk.helpdesk.doctype.hd_form_script.hd_form_script import get_form_scr
 from helpdesk.test_utils import make_ticket
 
 from erp_ai import install
+from erp_ai.agent.routing import DEFAULT_ROUTING_RULES
 from erp_ai.constants import (
 	AGENT_USER,
 	HELPDESK_AGENT_ROLE,
@@ -76,6 +77,8 @@ class TestInstall(FrappeTestCase):
 		# Same for the agent's Task permission (Custom DocPerm insert has no DDL, so it stays in the transaction).
 		frappe.db.delete("Custom DocPerm", {"parent": "Task", "role": ROLE_AGENT})
 		frappe.clear_cache(doctype="Task")
+		# Same for the Task link field (DDL skipped above).
+		frappe.db.delete("Custom Field", {"dt": "Task", "fieldname": "ai_ticket"})
 		# The app-owned form script, removed so the create path runs inside the rolled-back transaction.
 		frappe.db.delete(install.FORM_SCRIPT_DOCTYPE, {"name": install.AGENT_STATUS_SCRIPT})
 		install.ensure_setup()
@@ -196,6 +199,122 @@ class TestInstall(FrappeTestCase):
 			ROLE_AGENT,
 		)
 
+	def _agent_task_perm_row(self):
+		return frappe.db.get_value(
+			"Custom DocPerm",
+			{"parent": "Task", "role": ROLE_AGENT, "permlevel": 0, "if_owner": 1},
+			["name", "share", "read", "write", "create", "delete", "submit", "cancel", "amend", "modified"],
+			as_dict=True,
+		)
+
+	def test_task_permission_share_and_role_set(self):
+		other = self._other_task_perms()
+		install.ensure_setup()
+		install.ensure_setup()
+		self.assertEqual(len(self._agent_task_perms()), 1)
+		perm = self._agent_task_perm_row()
+		self.assertEqual((perm.read, perm.write, perm.create, perm.share), (1, 1, 1, 1))
+		self.assertEqual((perm.delete, perm.submit, perm.cancel, perm.amend), (0, 0, 0, 0))
+		self.assertEqual(self._other_task_perms(), other)
+		self.assertEqual(_agent_roles() - AUTOMATIC_ROLES, {ROLE_AGENT, HELPDESK_AGENT_ROLE})
+
+	def test_task_permission_missing_row_is_created_with_share(self):
+		frappe.db.delete("Custom DocPerm", {"parent": "Task", "role": ROLE_AGENT})
+		install.ensure_setup()
+		perm = self._agent_task_perm_row()
+		self.assertIsNotNone(perm)
+		self.assertEqual(perm.share, 1)
+
+	def test_task_permission_share_off_is_turned_on_only_that_flag(self):
+		perm = self._agent_task_perm_row()
+		frappe.db.set_value("Custom DocPerm", perm.name, {"share": 0, "write": 0})
+		frappe.clear_cache(doctype="Task")
+		other = self._other_task_perms()
+		with patch.object(install.frappe, "clear_cache", wraps=frappe.clear_cache) as clear_cache:
+			install.ensure_setup()
+		clear_cache.assert_any_call(doctype="Task")
+		now = self._agent_task_perm_row()
+		self.assertEqual((now.share, now.write, now.read, now.create), (1, 0, 1, 1))
+		self.assertEqual(self._other_task_perms(), other)
+		shared = [p.share for p in frappe.get_meta("Task").permissions if p.role == ROLE_AGENT and p.if_owner]
+		self.assertEqual(shared, [1])
+
+	def test_task_permission_share_already_on_is_not_saved_again(self):
+		perm = self._agent_task_perm_row()
+		old = "2020-01-01 00:00:00"
+		frappe.db.set_value("Custom DocPerm", perm.name, "modified", old, update_modified=False)
+		install.ensure_setup()
+		self.assertEqual(str(self._agent_task_perm_row().modified), old)
+
+	def test_score_fields_int_default_zero_permlevel_8(self):
+		for name in ("ai_complexity", "ai_importance"):
+			field = frappe.db.get_value(
+				"Custom Field",
+				{"dt": "HD Ticket", "fieldname": name},
+				["fieldtype", "default", "permlevel", "read_only"],
+				as_dict=True,
+			)
+			self.assertEqual(
+				(field.fieldtype, field.default, field.permlevel, field.read_only), ("Int", "0", 8, 1)
+			)
+		reason = frappe.db.get_value(
+			"Custom Field",
+			{"dt": "HD Ticket", "fieldname": "ai_score_reason"},
+			["fieldtype", "permlevel", "read_only"],
+			as_dict=True,
+		)
+		self.assertEqual((reason.fieldtype, reason.permlevel, reason.read_only), ("Small Text", 8, 1))
+		rows = frappe.get_all(
+			"HD Ticket Template Field",
+			filters={
+				"parent": TEMPLATE,
+				"fieldname": ("in", ("ai_complexity", "ai_importance", "ai_score_reason")),
+			},
+			fields=["visible_to", "required"],
+		)
+		self.assertEqual(len(rows), 3)
+		self.assertEqual({(r.visible_to, r.required) for r in rows}, {("Agents", 0)})
+
+	def _task_ticket_field(self):
+		return frappe.db.get_value(
+			"Custom Field",
+			{"dt": "Task", "fieldname": "ai_ticket"},
+			[
+				"name",
+				"fieldtype",
+				"options",
+				"permlevel",
+				"search_index",
+				"label",
+				"module",
+				"insert_after",
+				"read_only",
+			],
+			as_dict=True,
+		)
+
+	def test_task_ticket_field(self):
+		field = self._task_ticket_field()
+		self.assertIsNotNone(field)
+		self.assertEqual(
+			(field.fieldtype, field.options, field.permlevel, field.search_index, field.read_only),
+			("Link", "HD Ticket", 0, 1, 0),
+		)
+		self.assertEqual(
+			(field.label, field.module, field.insert_after),
+			("Phiếu Helpdesk", "ERP AI agent", "description"),
+		)
+		install.ensure_setup()
+		self.assertEqual(frappe.db.count("Custom Field", {"dt": "Task", "fieldname": "ai_ticket"}), 1)
+
+	def test_task_ticket_field_existing_is_not_changed(self):
+		name = self._task_ticket_field().name
+		frappe.db.set_value("Custom Field", name, {"label": "Do người sửa", "search_index": 0})
+		install.ensure_setup()
+		field = self._task_ticket_field()
+		self.assertEqual((field.label, field.search_index), ("Do người sửa", 0))
+		self.assertEqual(frappe.db.count("Custom Field", {"dt": "Task", "fieldname": "ai_ticket"}), 1)
+
 	def test_agent_task_perm_created_once_if_owner(self):
 		other = self._other_task_perms()
 		self.assertTrue(other)
@@ -261,6 +380,30 @@ class TestInstall(FrappeTestCase):
 		install.ensure_setup()
 		self.assertEqual(frappe.db.get_single_value(SETTING_DOCTYPE, "permission_level"), "L2")
 		self.assertEqual(int(frappe.db.get_single_value(SETTING_DOCTYPE, "max_turns_per_run")), 3)
+
+	def test_default_routing_rules_written_when_null(self):
+		self.assertEqual(self._stored("routing_rules"), DEFAULT_ROUTING_RULES)
+		self.assertEqual(self._stored("auto_assign_enabled"), "0")
+
+	def test_default_routing_rules_not_overwritten(self):
+		for kept in ('{"assignees": {}}', ""):
+			with self.subTest(kept=kept):
+				frappe.db.set_single_value(SETTING_DOCTYPE, "routing_rules", kept)
+				frappe.db.set_single_value(SETTING_DOCTYPE, "auto_assign_enabled", 1)
+				install.ensure_setup()
+				install.after_migrate()
+				self.assertEqual(self._stored("routing_rules"), kept)
+				self.assertEqual(self._stored("auto_assign_enabled"), "1")
+
+	def test_null_routing_rules_refilled(self):
+		frappe.db.sql(
+			"update `tabSingles` set value=NULL where doctype=%s "
+			"and field in ('routing_rules', 'auto_assign_enabled')",
+			SETTING_DOCTYPE,
+		)
+		install.ensure_setup()
+		self.assertEqual(self._stored("routing_rules"), DEFAULT_ROUTING_RULES)
+		self.assertEqual(self._stored("auto_assign_enabled"), "0")
 
 	def test_cleared_default_is_refilled(self):
 		frappe.db.sql(

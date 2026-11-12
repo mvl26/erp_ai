@@ -733,6 +733,7 @@ def check_publish_realtime_only_in_run_status(sources: dict) -> list:
 	violations = []
 	for rel, source in only_python(sources).items():
 		tree = parse(rel, source)
+		aliases = import_aliases(tree)
 		if rel != RUN_STATUS_FILE:
 			for node in ast.walk(tree):
 				if referenced_name(node) in REALTIME_NAMES:
@@ -745,21 +746,42 @@ def check_publish_realtime_only_in_run_status(sources: dict) -> list:
 							violations.append(
 								violation(rel, node, f"imports {alias.name} outside {RUN_STATUS_FILE}")
 							)
-				elif isinstance(node, ast.Attribute) and dotted_name(node) == REALTIME_MODULE:
+				elif (
+					isinstance(node, ast.Name | ast.Attribute)
+					and resolved_name(node, aliases) == REALTIME_MODULE
+				):
 					violations.append(
 						violation(rel, node, f"uses {REALTIME_MODULE} outside {RUN_STATUS_FILE}")
 					)
+				elif isinstance(node, ast.Constant) and isinstance(node.value, str):
+					# getattr(frappe, "publish_realtime"), frappe.get_attr("frappe.realtime..."), import_module(...)
+					for name in (*REALTIME_NAMES, REALTIME_MODULE):
+						if name in node.value:
+							violations.append(
+								violation(rel, node, f"names {name} in a string outside {RUN_STATUS_FILE}")
+							)
 			for lineno, target in imported_modules(tree, module_name(rel), rel.endswith("__init__.py")):
 				if module_in(target, REALTIME_MODULE):
 					violations.append(f"{rel}:{lineno}: imports {target} outside {RUN_STATUS_FILE}")
 			continue
+		called = set()
 		for node in ast.walk(tree):
-			if isinstance(node, ast.Call) and referenced_name(node.func) == "publish_realtime":
+			if (
+				isinstance(node, ast.Call)
+				and resolved_name(node.func, aliases).rpartition(".")[2] == "publish_realtime"
+			):
+				called.add(id(node.func))
 				keywords = _call_keywords(node)
 				if "room" not in keywords:
 					violations.append(violation(rel, node, "publish_realtime without an explicit room="))
 				if not _is_constant(keywords.get("after_commit"), False):
 					violations.append(violation(rel, node, "publish_realtime without after_commit=False"))
+		for node in ast.walk(tree):
+			# any other mention (alias import, `publish = frappe.publish_realtime`) hides calls from the check above
+			if (referenced_name(node) == "publish_realtime" and id(node) not in called) or (
+				isinstance(node, ast.alias) and node.name == "publish_realtime" and node.asname
+			):
+				violations.append(violation(rel, node, "binds publish_realtime to another name"))
 	return violations
 
 
@@ -810,13 +832,33 @@ def check_no_open_doc_or_all_room(sources: dict) -> list:
 				violations.append(f"{rel}:0: contains {OPEN_DOC_ROOM_PREFIX} (R-1)")
 			continue
 		tree = parse(rel, source)
+		aliases = import_aliases(tree)
+		constants = {
+			target.id: node.value.value
+			for node in tree.body
+			if isinstance(node, ast.Assign) and isinstance(node.value, ast.Constant)
+			for target in node.targets
+			if isinstance(target, ast.Name)
+		}
 		for node in constant_strings(tree):
 			if OPEN_DOC_ROOM_PREFIX in node.value:
 				violations.append(violation(rel, node, f"contains {OPEN_DOC_ROOM_PREFIX} (R-1)"))
 		for node in ast.walk(tree):
-			if isinstance(node, ast.Call) and referenced_name(node.func) in REALTIME_NAMES:
+			if (
+				isinstance(node, ast.Call)
+				and resolved_name(node.func, aliases).rpartition(".")[2] in REALTIME_NAMES
+			):
 				room = _call_keywords(node).get("room")
-				if room is None or _is_constant(room, None) or _is_constant(room, ALL_ROOM):
+				if (
+					room is None
+					or _is_constant(room, None)
+					or _is_constant(room, ALL_ROOM)
+					or (
+						isinstance(room, ast.Name)
+						and room.id in constants
+						and constants[room.id] in (None, ALL_ROOM)
+					)
+				):
 					violations.append(
 						violation(rel, node, "publishes without a document room or to room all (R-1)")
 					)
@@ -1478,7 +1520,7 @@ class TestScannersCatchViolations(unittest.TestCase):
 		"frappe.publish_realtime('e', message={}, room=get_doc_room('HD Ticket', 'T'), after_commit=False)\n"
 	)
 
-	def test_status_scanners_catch_violations(self):
+	def test_publish_realtime_scanner_catches_violations(self):
 		# publish_realtime / frappe.realtime only in run_status.py, with room= and after_commit=False
 		self.assertEqual(check_publish_realtime_only_in_run_status({RUN_STATUS_FILE: self.GOOD_PUBLISH}), [])
 		for source in (
@@ -1488,6 +1530,11 @@ class TestScannersCatchViolations(unittest.TestCase):
 			"from frappe.realtime import emit_via_redis\n",
 			"import frappe\nfrappe.realtime.get_doc_room('HD Ticket', 'T')\n",
 			"from frappe.realtime import get_doc_room\n",
+			"import frappe\ngetattr(frappe, 'publish_realtime')('e')\n",
+			"import frappe\nfrappe.get_attr('frappe.publish_realtime')('e')\n",
+			"import importlib\nimportlib.import_module('frappe.realtime')\n",
+			"import frappe as f\nf.realtime.get_doc_room('HD Ticket', 'T')\n",
+			"from frappe import realtime as rt\nrt.get_doc_room('HD Ticket', 'T')\n",
 		):
 			with self.subTest(source=source):
 				self.assertCaught(check_publish_realtime_only_in_run_status({"agent/runner.py": source}))
@@ -1507,7 +1554,32 @@ class TestScannersCatchViolations(unittest.TestCase):
 			),
 			"after_commit=False",
 		)
+		# aliased or rebound publish_realtime inside run_status is still pinned to room= and after_commit=False
+		for fragment, source in {
+			"room=": "from frappe import publish_realtime as publish\npublish('e', after_commit=False)\n",
+			"binds publish_realtime": "from frappe import publish_realtime as publish\n",
+		}.items():
+			with self.subTest(fragment=fragment, source=source):
+				self.assertCaught(
+					check_publish_realtime_only_in_run_status({RUN_STATUS_FILE: source}), fragment
+				)
+		self.assertCaught(
+			check_publish_realtime_only_in_run_status(
+				{
+					RUN_STATUS_FILE: "import frappe\npublish = frappe.publish_realtime\n"
+					"publish('e', room='r', after_commit=False)\n"
+				}
+			),
+			"binds publish_realtime",
+		)
+		self.assertCaught(
+			check_publish_realtime_only_in_run_status(
+				{RUN_STATUS_FILE: "import frappe as f\nf.publish_realtime('e', room='r')\n"}
+			),
+			"after_commit=False",
+		)
 
+	def test_run_status_import_scanner_catches_violations(self):
 		# the status module is imported only by the runner
 		for rel, source in {
 			"agent/tools/read.py": "from erp_ai.agent import run_status\n",
@@ -1525,6 +1597,7 @@ class TestScannersCatchViolations(unittest.TestCase):
 			[],
 		)
 
+	def test_run_status_writes_nothing_scanner_catches_violations(self):
 		# the status module writes nothing
 		for source in (
 			"import frappe\nfrappe.db.set_value('X', 'y', 'z', 1)\n",
@@ -1538,10 +1611,19 @@ class TestScannersCatchViolations(unittest.TestCase):
 		):
 			with self.subTest(source=source):
 				self.assertCaught(check_run_status_writes_nothing({RUN_STATUS_FILE: source}))
+		# no banned write name is called here: only the frappe.cache / frappe.db attribute rule catches these
+		for fragment, source in (
+			("uses frappe.cache", "import frappe\nfrappe.cache.hset('k', 'f', 1)\n"),
+			("uses frappe.cache", "import frappe\nfrappe.cache.get_value('k')\n"),
+			("uses frappe.db", "import frappe\nfrappe.db.set_single_value('X', 'f', 1)\n"),
+		):
+			with self.subTest(fragment=fragment, source=source):
+				self.assertCaught(check_run_status_writes_nothing({RUN_STATUS_FILE: source}), fragment)
 		clean = self.GOOD_PUBLISH + "def f(errors):\n\terrors.append('x')\n"
 		self.assertEqual(check_run_status_writes_nothing({RUN_STATUS_FILE: clean}), [])
 		self.assertEqual(check_run_status_writes_nothing({"agent/runner.py": "def f(d):\n\td.save()\n"}), [])
 
+	def test_document_room_scanner_catches_violations(self):
 		# no open_doc: room, no room "all", no publish without a document room
 		for rel, source in {
 			"agent/runner.py": "room = 'open_doc:HD Ticket/T'\n",
@@ -1549,11 +1631,16 @@ class TestScannersCatchViolations(unittest.TestCase):
 			RUN_STATUS_FILE: "import frappe\nfrappe.publish_realtime('e', room='all', after_commit=False)\n",
 			"tasks.py": "import frappe\nfrappe.publish_realtime('e', after_commit=False)\n",
 			"handlers.py": "import frappe\nfrappe.publish_realtime('e', room=None)\n",
+			"agent/queue.py": "from frappe import publish_realtime as publish\npublish('e', after_commit=False)\n",
+			"agent/policy.py": "import frappe as f\nf.publish_realtime('e', after_commit=False)\n",
+			"agent/tools/read.py": "import frappe\nROOM = 'all'\n"
+			"frappe.publish_realtime('e', room=ROOM, after_commit=False)\n",
 		}.items():
 			with self.subTest(rel=rel):
 				self.assertCaught(check_no_open_doc_or_all_room({rel: source}), rel)
 		self.assertEqual(check_no_open_doc_or_all_room({RUN_STATUS_FILE: self.GOOD_PUBLISH}), [])
 
+	def test_form_script_scanner_catches_violations(self):
 		# HD Form Script only in install.py
 		for rel, source in {
 			"agent/runner.py": "import frappe\nfrappe.get_doc('HD Form Script', 'x')\n",
@@ -1566,6 +1653,7 @@ class TestScannersCatchViolations(unittest.TestCase):
 				self.assertCaught(check_form_script_only_in_install({rel: source}), rel)
 		self.assertEqual(check_form_script_only_in_install({INSTALL_FILE: "DT = 'HD Form Script'\n"}), [])
 
+	def test_hooks_scanner_catches_violations(self):
 		# hooks.py injects nothing into the page
 		for fragment, source in {
 			"app_include_js": "app_include_js = '/assets/erp_ai/js/agent_status_indicator.js'\n",
@@ -1578,6 +1666,10 @@ class TestScannersCatchViolations(unittest.TestCase):
 		}.items():
 			with self.subTest(fragment=fragment):
 				self.assertCaught(check_hooks_have_no_page_injection({HOOKS_FILE: source}), fragment)
+		self.assertCaught(
+			check_hooks_have_no_page_injection({HOOKS_FILE: f"x = '{AGENT_STATUS_SCRIPT_NAME}'\n"}),
+			"references the status script",
+		)
 		hooks_ok = (
 			"fixtures = [{'dt': 'Custom Field'}]\n"
 			"website_route_rules = [{'from_route': '/a', 'to_route': 'b'}]\n"
@@ -1586,6 +1678,7 @@ class TestScannersCatchViolations(unittest.TestCase):
 		)
 		self.assertEqual(check_hooks_have_no_page_injection({HOOKS_FILE: hooks_ok}), [])
 
+	def test_install_scanner_catches_violations(self):
 		# install.py has exactly one delete: delete_doc of the status script in before_uninstall
 		good_install = (
 			"import frappe\n"
@@ -1595,17 +1688,27 @@ class TestScannersCatchViolations(unittest.TestCase):
 			"\tfrappe.delete_doc(FORM_SCRIPT_DOCTYPE, AGENT_STATUS_SCRIPT, ignore_permissions=True)\n"
 		)
 		self.assertEqual(check_install_deletes_only_status_script({INSTALL_FILE: good_install}), [])
-		for fragment, source in {
-			"found 0": good_install.replace("frappe.delete_doc(", "print("),
-			"found 2": good_install + "\tfrappe.delete_doc('ToDo', 'x')\n",
-			"outside before_uninstall": good_install + "def ensure_setup():\n\tfrappe.db.delete('X', {})\n",
-			"SQL delete": good_install + "def f():\n\tfrappe.db.sql('DELETE FROM `tabX`')\n",
-			"delete must be": good_install.replace("AGENT_STATUS_SCRIPT,", "'Other',"),
-			"delete_doc of": good_install.replace("frappe.delete_doc(", "frappe.db.delete("),
-			"other doctype": good_install.replace("FORM_SCRIPT_DOCTYPE,", "'HD Ticket',"),
-		}.items():
-			with self.subTest(fragment=fragment):
-				self.assertCaught(check_install_deletes_only_status_script({INSTALL_FILE: source}))
+		moved_outside = (
+			"import frappe\n"
+			"FORM_SCRIPT_DOCTYPE = 'HD Form Script'\n"
+			"AGENT_STATUS_SCRIPT = 'ERP AI Agent Status'\n"
+			"def before_uninstall():\n"
+			"\tpass\n"
+			"def ensure_setup():\n"
+			"\tfrappe.delete_doc(FORM_SCRIPT_DOCTYPE, AGENT_STATUS_SCRIPT, ignore_permissions=True)\n"
+		)
+		for fragment, source in (
+			("found 0", good_install.replace("frappe.delete_doc(", "print(")),
+			("found 2", good_install + "\tfrappe.delete_doc('ToDo', 'x')\n"),
+			("outside before_uninstall", moved_outside),
+			("outside before_uninstall", good_install + "def ensure_setup():\n\tfrappe.db.delete('X', {})\n"),
+			("SQL delete", good_install + "def f():\n\tfrappe.db.sql('DELETE FROM `tabX`')\n"),
+			("delete must be", good_install.replace("AGENT_STATUS_SCRIPT,", "'Other',")),
+			("delete must be", good_install.replace("frappe.delete_doc(", "frappe.db.delete(")),
+			("delete must be", good_install.replace("FORM_SCRIPT_DOCTYPE,", "'HD Ticket',")),
+		):
+			with self.subTest(fragment=fragment, source=source):
+				self.assertCaught(check_install_deletes_only_status_script({INSTALL_FILE: source}), fragment)
 
 
 if __name__ == "__main__":

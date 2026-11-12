@@ -159,6 +159,25 @@ def _rank(priority: str) -> int:
 	return PRIORITIES.index(priority) if priority in PRIORITIES else -1
 
 
+def sla_lag(category: str, resolution_s: int | None, config: dict) -> tuple[int, int] | None:
+	"""(actual_min, expected_min) when the applied SLA resolves slower than expected, else None.
+
+	actual_min is resolution_s rounded UP to whole minutes, so it is always above expected_min.
+	D/E, a null resolution_min, a missing category/config and resolution_s None are not checked.
+	"""
+	if resolution_s is None or category in ("D", "E"):
+		return None
+	expected_min = (((config or {}).get("expected_sla") or {}).get(category) or {}).get("resolution_min")
+	if expected_min is None or resolution_s <= expected_min * 60:
+		return None
+	return (-(-resolution_s // 60), expected_min)
+
+
+def departments(config: dict) -> tuple[str, ...]:
+	"""Department names in declared order (for the classify prompt)."""
+	return tuple((config or {}).get("departments") or {})
+
+
 def _is_minutes(value) -> bool:
 	return value is None or (type(value) is int and value > 0)
 

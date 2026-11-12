@@ -497,3 +497,71 @@ class TestRoutingConfig(FrappeTestCase):
 	def test_default_rules_have_tracecore_prefix(self):
 		prefixes = json.loads(routing.DEFAULT_ROUTING_RULES)["assignees"]["A"]["prefixes"]
 		self.assertEqual(prefixes, {"[tracecore]": ""})
+
+
+SLA_CONFIG = json.loads(routing.DEFAULT_ROUTING_RULES)
+
+
+class TestSlaLag(FrappeTestCase):
+	def test_slower_sla_returns_two_numbers(self):
+		# A expects 480 min; 36000 s = 600 min.
+		self.assertEqual(routing.sla_lag("A", 36000, SLA_CONFIG), (600, 480))
+
+	def test_matching_sla_none(self):
+		self.assertIsNone(routing.sla_lag("A", 28800, SLA_CONFIG))
+		self.assertIsNone(routing.sla_lag("A", 3600, SLA_CONFIG))
+
+	def test_d_e_not_checked(self):
+		# Default config has resolution_min null for D/E; a number must still not be checked.
+		config = {"expected_sla": {"D": {"resolution_min": 10}, "E": {"resolution_min": 10}}}
+		for category in "DE":
+			self.assertIsNone(routing.sla_lag(category, 36000, SLA_CONFIG), category)
+			self.assertIsNone(routing.sla_lag(category, 36000, config), category)
+
+	def test_resolution_none_not_checked(self):
+		self.assertIsNone(routing.sla_lag("A", None, SLA_CONFIG))
+
+	def test_resolution_min_null_not_checked(self):
+		config = {"expected_sla": {"A": {"response_min": 15, "resolution_min": None}}}
+		self.assertIsNone(routing.sla_lag("A", 36000, config))
+
+	def test_empty_or_partial_config_not_checked(self):
+		for config in ({}, None, {"expected_sla": {}}, {"departments": {}}):
+			self.assertIsNone(routing.sla_lag("A", 36000, config), repr(config))
+
+	def test_category_absent_from_expected_sla(self):
+		config = {"expected_sla": {"B": {"resolution_min": 240}}}
+		self.assertIsNone(routing.sla_lag("A", 36000, config))
+		self.assertIsNone(routing.sla_lag("Z", 36000, config))
+
+	def test_boundary_equal_is_not_lag_one_second_over_is(self):
+		self.assertIsNone(routing.sla_lag("A", 480 * 60, SLA_CONFIG))
+		self.assertEqual(routing.sla_lag("A", 480 * 60 + 1, SLA_CONFIG), (481, 480))
+
+	def test_seconds_round_up_to_whole_minutes(self):
+		# Rule: actual_min = ceil(seconds / 60), so the reported actual is always above expected.
+		self.assertEqual(routing.sla_lag("F", 3601, SLA_CONFIG), (61, 60))
+		self.assertEqual(routing.sla_lag("F", 3660, SLA_CONFIG), (61, 60))
+		self.assertEqual(routing.sla_lag("F", 3661, SLA_CONFIG), (62, 60))
+
+	def test_zero_seconds_not_lag(self):
+		self.assertIsNone(routing.sla_lag("A", 0, SLA_CONFIG))
+
+
+class TestDepartments(FrappeTestCase):
+	def test_names_in_declared_order(self):
+		config = {
+			"departments": {
+				"Kế toán": {"team": "T1", "head": ""},
+				"HR": {"team": "T2", "head": ""},
+				"Kho": {"team": "T3", "head": ""},
+			}
+		}
+		self.assertEqual(routing.departments(config), ("Kế toán", "HR", "Kho"))
+
+	def test_returns_tuple(self):
+		self.assertIsInstance(routing.departments(DEPT_CONFIG), tuple)
+
+	def test_empty_or_missing_section(self):
+		for config in ({}, None, {"departments": {}}, {"expected_sla": {}}):
+			self.assertEqual(routing.departments(config), (), repr(config))

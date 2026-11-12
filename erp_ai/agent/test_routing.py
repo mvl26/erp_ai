@@ -77,3 +77,98 @@ class TestDecidePriority(FrappeTestCase):
 		decision = _decide("B", 2)
 		self.assertEqual(decision.ticket_type, DEFAULT_CATEGORY_MAPPING["B"]["ticket_type"])
 		self.assertEqual(decision.agent_group, "IT")
+
+
+DEPT_CONFIG = {
+	"departments": {"Kế toán": {"team": "Accounting", "head": "head@x.com"}, "HR": {"team": "", "head": ""}}
+}
+
+
+# D/E carry a decoy mapping group: routing must ignore it and use the department table (AC-5).
+DECOY_MAPPING = {
+	**DEFAULT_CATEGORY_MAPPING,
+	"D": {**DEFAULT_CATEGORY_MAPPING["D"], "agent_group": "IT"},
+	"E": {**DEFAULT_CATEGORY_MAPPING["E"], "agent_group": "IT"},
+}
+
+
+def _decide_team(category, department=None, config=None, team_exists=None, is_excluded_team=None):
+	return routing.decide_route(
+		Classification(category=category, confidence="Cao", importance=1, department=department),
+		"Thông thường",
+		DECOY_MAPPING,
+		DEPT_CONFIG if config is None else config,
+		team_exists=team_exists or (lambda team: True),
+		is_excluded_team=is_excluded_team or (lambda team: False),
+		is_active_agent=lambda user: True,
+	)
+
+
+def _team_notes(decision):
+	return [note for note in decision.notes if note["field"] == "agent_group"]
+
+
+class TestDecideTeam(FrappeTestCase):
+	def test_abcf_team_from_mapping(self):
+		# A/B/C/F are not filtered by team_exists / is_excluded_team: behaviour as today.
+		for category in "ABCF":
+			decision = _decide_team(
+				category,
+				department="Kế toán",
+				team_exists=lambda team: False,
+				is_excluded_team=lambda team: True,
+			)
+			self.assertEqual(decision.agent_group, "IT")
+			self.assertEqual(decision.notes, ())
+		empty = routing.decide_route(
+			Classification(category="B", confidence="Cao"),
+			"x",
+			{"B": {"agent_group": ""}},
+			{},
+			team_exists=lambda team: True,
+			is_excluded_team=lambda team: False,
+			is_active_agent=lambda user: True,
+		)
+		self.assertIsNone(empty.agent_group)
+
+	def test_de_team_from_department(self):
+		for category in "DE":
+			for department in ("Kế toán", "KẾ TOÁN", "  kế   toán ", "Kế\ttoán"):
+				with self.subTest(category=category, department=department):
+					decision = _decide_team(category, department=department)
+					self.assertEqual(decision.agent_group, "Accounting")
+					self.assertEqual(_team_notes(decision), [])
+
+	def test_de_config_key_case_and_spaces(self):
+		config = {"departments": {"  KẾ TOÁN ": {"team": "Accounting", "head": ""}}}
+		for category in "DE":
+			for department in ("Kế toán", "kế  toán"):
+				with self.subTest(category=category, department=department):
+					decision = _decide_team(category, department=department, config=config)
+					self.assertEqual(decision.agent_group, "Accounting")
+					self.assertEqual(_team_notes(decision), [])
+
+	def test_de_team_skip_reasons(self):
+		def reason(decision):
+			self.assertIsNone(decision.agent_group)
+			self.assertEqual(len(_team_notes(decision)), 1)
+			return _team_notes(decision)[0]["reason"]
+
+		self.assertEqual(reason(_decide_team("D", department=None)), "không có bộ phận")
+		self.assertEqual(reason(_decide_team("D", department="   ")), "không có bộ phận")
+		self.assertEqual(
+			reason(_decide_team("E", department="Kho")), "bộ phận 'Kho' không có trong bảng bộ phận"
+		)
+		self.assertEqual(reason(_decide_team("D", department="HR")), "nhóm '' không tồn tại")
+		self.assertEqual(
+			reason(_decide_team("D", department="Kế toán", team_exists=lambda team: False)),
+			"nhóm 'Accounting' không tồn tại",
+		)
+		self.assertEqual(
+			reason(_decide_team("E", department="Kế toán", is_excluded_team=lambda team: True)),
+			"nhóm 'Accounting' bị loại trừ",
+		)
+		both = _decide_team(
+			"D", department="Kế toán", team_exists=lambda team: False, is_excluded_team=lambda team: True
+		)
+		self.assertEqual(reason(both), "nhóm 'Accounting' không tồn tại")

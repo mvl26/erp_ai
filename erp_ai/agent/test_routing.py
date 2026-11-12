@@ -361,6 +361,26 @@ class TestRoutingConfig(FrappeTestCase):
 			self.assertEqual(config["assignees"][category]["default"], "")
 		self.assertEqual(config["departments"], {})
 
+	def test_blank_rules_rejected_with_restore_hint(self):
+		for blank in (None, "", "  \n\t"):
+			with self.subTest(blank=blank), self.assertRaisesRegex(frappe.ValidationError, "JSON mặc định"):
+				routing.validate_routing_config(blank)
+
+	def test_load_blank_still_returns_empty_without_raising(self):
+		for blank in (None, "", "  \n\t"):
+			with self.subTest(blank=blank):
+				self.assertEqual(routing.load_routing_config(blank), {})
+
+	def test_empty_prefix_key_rejected_with_path(self):
+		for category in "ABCF":
+			for key in ("", "   "):
+				raw = _bad(_set("assignees", category, "prefixes", {key: ""}))
+				with (
+					self.subTest(category=category, key=key),
+					self.assertRaisesRegex(frappe.ValidationError, f"assignees\\.{category}\\.prefixes"),
+				):
+					routing.validate_routing_config(raw)
+
 	def test_bad_configs_raise_with_path(self):
 		def set_level(c):
 			c["importance_priority"]["2"] = "Hgh"

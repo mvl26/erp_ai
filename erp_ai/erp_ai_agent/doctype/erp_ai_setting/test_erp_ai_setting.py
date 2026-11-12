@@ -366,9 +366,9 @@ class TestRoutingRules(FrappeTestCase):
 		doc = self._save_rules(DEFAULT_ROUTING_RULES)
 		self.assertEqual(json.loads(doc.routing_rules), json.loads(DEFAULT_ROUTING_RULES))
 
-	def test_blank_rules_save_until_install_writes_default(self):
+	def test_blank_rules_blocked_with_restore_hint(self):
 		for blank in (None, "", "  \n"):
-			with self.subTest(blank=blank):
+			with self.subTest(blank=blank), self.assertRaisesRegex(frappe.ValidationError, "JSON mặc định"):
 				self._save_rules(blank)
 
 	def test_bad_rules_blocked_with_location(self):

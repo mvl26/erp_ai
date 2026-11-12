@@ -205,6 +205,8 @@ def _assignees_error(assignees, check_users):
 			return f"{path} phải là object có default (chuỗi) và prefixes (object)"
 		error = _user_error(f"{path}.default", entry["default"], check_users)
 		for prefix, user in entry["prefixes"].items():
+			if not prefix.strip():
+				return f"{path}.prefixes: khóa tiền tố không được để trống"
 			error = error or _user_error(f"{path}.prefixes.{prefix}", user, check_users)
 		if error:
 			return error
@@ -277,7 +279,15 @@ def _config_error(raw, check_users):
 
 
 def validate_routing_config(raw) -> None:
-	"""Raise frappe.ValidationError naming the bad key path. Does not check teams or block the agent account."""
+	"""Raise frappe.ValidationError naming the bad key path. Does not check teams or block the agent account.
+
+	Blank raw is rejected too: the message tells the admin to paste DEFAULT_ROUTING_RULES back in.
+	"""
+	if not (raw or "").strip():
+		frappe.throw(
+			"Quy tắc định tuyến không được để trống. "
+			"Hãy dán lại JSON mặc định (DEFAULT_ROUTING_RULES) rồi điền người phụ trách."
+		)
 	error = _config_error(raw, check_users=True)
 	if error:
 		frappe.throw(error)

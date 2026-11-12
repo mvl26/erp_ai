@@ -604,3 +604,11 @@ class TestSetClassification(FrappeTestCase):
 		self.assertEqual(row.agent_group, before.agent_group)
 		self.assertEqual((row.ticket_type, row.priority), (TICKET_TYPE, "High"))
 		self.assertEqual([item["field"] for item in result["skipped"]], ["agent_group"])
+		self.assertEqual(result["skipped"][0]["reason"], "không có bộ phận")
+
+	def test_category_a_without_team_in_mapping_keeps_mapping_reason(self):
+		mapping = {"A": {"ticket_type": TICKET_TYPE, "agent_group": None, "priority": "High"}}
+		frappe.set_user(AGENT)
+		result = write_ticket.set_classification({"category": "A", "confidence": "Cao"}, self._ctx(mapping))
+		self.assertTrue(result["ok"], result)
+		self.assertEqual(result["skipped"], [{"field": "agent_group", "reason": "ánh xạ không có giá trị"}])

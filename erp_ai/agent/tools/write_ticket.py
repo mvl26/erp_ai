@@ -23,12 +23,15 @@ def _fail(reason: str) -> dict:
 	return {"ok": False, "reason": reason[:REASON_MAX]}
 
 
-def _existing_values(wanted: dict) -> tuple[dict, list]:
-	"""Values to write (only those that exist on the site) and the skipped fields with a reason."""
+def _existing_values(wanted: dict, reasons: dict) -> tuple[dict, list]:
+	"""Values to write (only those that exist on the site) and the skipped fields with a reason.
+
+	`reasons` holds the routing reason for fields the route left empty on purpose.
+	"""
 	values, skipped = {}, []
 	for field, value in wanted.items():
 		if not value:
-			skipped.append({"field": field, "reason": "ánh xạ không có giá trị"})
+			skipped.append({"field": field, "reason": reasons.get(field, "ánh xạ không có giá trị")})
 		elif not frappe.db.exists(LINKED_DOCTYPES[field], value):
 			skipped.append({"field": field, "reason": "giá trị không tồn tại trên hệ thống"})
 		else:
@@ -57,7 +60,8 @@ def _mapped_values(doc, args: dict, ctx: ToolContext) -> tuple[dict, list]:
 		"agent_group": decision.agent_group,
 		"priority": decision.priority,
 	}
-	return _existing_values(wanted)
+	reasons = {note["field"]: note["reason"] for note in decision.notes if note["field"] in wanted}
+	return _existing_values(wanted, reasons)
 
 
 def set_classification(args: dict, ctx: ToolContext) -> dict:

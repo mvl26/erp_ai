@@ -510,8 +510,6 @@ class TestRunnerL1Classification(RunnerTestBase):
 				"agent_group": L1_TEAM,
 				"priority": "High",
 				"ai_confidence": "Cao",
-				"ai_complexity": 0,
-				"ai_importance": 0,
 				"ai_score_reason": "",
 			},
 		)
@@ -549,7 +547,7 @@ class TestRunnerL1Classification(RunnerTestBase):
 		self.assertEqual(entry.applied, 1)
 		self.assertEqual(
 			json.loads(entry.value_after),
-			{"ai_confidence": "Cao", "ai_complexity": 0, "ai_importance": 0, "ai_score_reason": ""},
+			{"ai_confidence": "Cao", "ai_score_reason": ""},
 		)
 		self.assertEqual(
 			json.loads(entry.actions),
@@ -590,7 +588,7 @@ class TestRunnerL1Classification(RunnerTestBase):
 		self.assertEqual(entry.applied, 1)
 		self.assertEqual(
 			set(json.loads(entry.value_after)),
-			{"ai_confidence", "ai_complexity", "ai_importance", "ai_score_reason"},
+			{"ai_confidence", "ai_score_reason"},
 		)
 		self.assertEqual(
 			json.loads(entry.actions),

@@ -183,6 +183,11 @@ class TestCheckPrivilegeEscalation(FrappeTestCase):
 		self.addCleanup(self.send_alarm_patch.stop)
 		# Keys already on the site must not influence the key condition.
 		frappe.db.set_value(CREDENTIAL_DOCTYPE, {"parent": SETTING_DOCTYPE}, "enabled", 0)
+		# The agent's real roles on the site must not influence the role condition: start from
+		# exactly the allowed set (rolled back with the test transaction).
+		frappe.db.delete("Has Role", {"parent": AGENT_USER, "parenttype": "User"})
+		for role in (ROLE_AGENT, HELPDESK_AGENT_ROLE):
+			self._add_role(role)
 
 	def _run(self):
 		tasks.check_privilege_escalation()

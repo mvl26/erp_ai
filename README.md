@@ -1,13 +1,13 @@
 ### ERP AI agent
 
-Agent AI hỗ trợ công việc trên ERP Miyano. Giai đoạn 1: Helpdesk. Agent đọc phiếu mới (và comment có từ khóa), phân loại vào 1 trong 6 đầu mục A–F, và ở mức `L1` ghi hướng giải quyết, comment trên phiếu. App cài xong ở trạng thái **tắt**.
+Agent AI hỗ trợ công việc trên ERP Miyano. Giai đoạn 1: Helpdesk. Agent đọc phiếu mới (và comment có từ khóa), phân loại vào 1 trong 6 đầu mục A–F, chấm độ phức tạp và độ quan trọng, và ở mức `L1` ghi hướng giải quyết, comment trên phiếu. App cài xong ở trạng thái **tắt**.
 
 Phạm vi hiện tại: mức `L0` và `L1`. Mức `L2`/`L3` chọn được trên form nhưng chỉ cấp đúng bộ tool của `L1`.
 
 | Mức | Agent làm gì |
 |---|---|
-| `L0` (shadow) | Chỉ chạy bước phân loại, ghi dự đoán vào `ERP AI Log`, không đổi phiếu. Comment có từ khóa được ghi nhật ký "bỏ qua do L0", không gọi API |
-| `L1` | Ghi loại phiếu, nhóm, ưu tiên, độ tin cậy, hướng giải quyết, comment; tạo Task khi có người có role `ERP AI Instructor` ra lệnh. Không đổi `status`, không ghi đè phân loại do người đã đặt |
+| `L0` (shadow) | Chỉ chạy bước phân loại, ghi dự đoán (đầu mục, nhóm, ưu tiên, hai điểm, người dự kiến) vào `ERP AI Log`, không đổi phiếu. Comment có từ khóa được ghi nhật ký "bỏ qua do L0", không gọi API |
+| `L1` | Ghi loại phiếu, nhóm, ưu tiên (tính từ hai điểm, xem mục "Định tuyến theo điểm"), độ tin cậy, hai điểm và lý do chấm, hướng giải quyết, comment; tạo Task khi có người có role `ERP AI Instructor` ra lệnh. Khi công tắc `auto_assign_enabled` bật (tắt sẵn): gán người phụ trách và tạo Task cho đầu mục C/D. Không đổi `status`, không ghi đè phân loại do người đã đặt, không giành phiếu đã có người được gán |
 
 Khi vượt ngân sách tháng, mức hiệu lực lui về `L1` (không bao giờ nâng `L0` lên `L1`).
 
@@ -28,20 +28,54 @@ bench --site <site> install-app erp_ai
 bench --site <site> migrate
 ```
 
-Cài và migrate (chạy lại được, không ghi đè cấu hình đã lưu) tạo: role `ERP AI Agent` và `ERP AI Instructor`; tài khoản `ai.agent@miyano.com.vn` chỉ có role `ERP AI Agent` và `Agent` (không có System Manager); các trường AI trên HD Ticket (permlevel 8, ẩn với khách); `ERP AI Setting` ở trạng thái tắt, mức `L0`; bản ghi HD Form Script `ERP AI Agent Status` (xem mục "Chỉ báo trạng thái trên trang phiếu").
+Cài và migrate (chạy lại được, không ghi đè cấu hình đã lưu) tạo: role `ERP AI Agent` và `ERP AI Instructor`; tài khoản `ai.agent@miyano.com.vn` chỉ có role `ERP AI Agent` và `Agent` (không có System Manager); các trường AI trên HD Ticket (permlevel 8, ẩn với khách), gồm ba trường điểm `ai_complexity`, `ai_importance`, `ai_score_reason`; trường `ai_ticket` trên Task và quyền `share` cho dòng quyền Task của app; `ERP AI Setting` ở trạng thái tắt, mức `L0`, công tắc `auto_assign_enabled` tắt; bản ghi HD Form Script `ERP AI Agent Status` (xem mục "Chỉ báo trạng thái trên trang phiếu").
 
 ### Cấu hình và bật
 
 Mở `/app/erp-ai-setting` (chỉ System Manager). Mỗi field trên các form `ERP AI Setting`, `ERP AI Credential` và `ERP AI Log` có mô tả ngay dưới ô nhập (đơn vị, khoảng hợp lệ, ví dụ, field nào do hệ thống tự ghi), và form chia thành các nhóm có tiêu đề.
 
 1. Thêm khóa API ở bảng khóa; bấm "Kiểm tra khóa" để thử từng khóa.
-2. Đặt `monthly_budget_usd` (mặc định 10), bốn đơn giá token (mặc định 0; phải > 0 mới bật được) và model (không có giá trị nào viết cứng trong mã).
-3. Rà các giá trị mặc định: `excluded_teams` (mặc định "Nhân sự & Hành chính" và "Tài chính Kế toán", mỗi nhóm một dòng: phiếu các nhóm này và phiếu có cờ "không dùng AI" không bao giờ được gửi lên API), `trigger_keyword` (mặc định `@ai`), `category_mapping` (đầu mục A–F sang loại phiếu/nhóm/ưu tiên), `alert_recipients` (mặc định `info@miyano.com.vn`).
+2. Đặt `monthly_budget_usd` (mặc định 10), bốn đơn giá token (mặc định 0; phải > 0 mới bật được) và model (không có giá trị nào viết cứng trong mã). Model phân loại nên là `claude-haiku-*`: chỉ với model này bước phân loại tắt thinking; model khác không được tắt thinking và có thể bị cắt ở trần token.
+3. Rà các giá trị mặc định: `excluded_teams` (mặc định "Nhân sự & Hành chính" và "Tài chính Kế toán", mỗi nhóm một dòng: phiếu các nhóm này và phiếu có cờ "không dùng AI" không bao giờ được gửi lên API), `trigger_keyword` (mặc định `@ai`), `category_mapping` (đầu mục A–F sang loại phiếu, nhóm và ưu tiên mặc định của đầu mục; ưu tiên cuối cùng của phiếu còn phụ thuộc hai điểm và bảng `importance_priority` trong `routing_rules`, không chỉ ánh xạ này), `routing_rules` (mục "Định tuyến theo điểm"), `alert_recipients` (mặc định `info@miyano.com.vn`).
 4. Giữ `L0` đủ lâu để đo độ chính xác (báo cáo `ERP AI Accuracy`), rồi mới tích `enabled` và chuyển `L1`.
+5. Công tắc `auto_assign_enabled` ("Tự gán người và tạo Task") để tắt cho tới khi xong các việc chuẩn bị trong `docs/HuongDan_QuanTri_DinhTuyen.md`.
 
 Cấp role `ERP AI Instructor` cho người được phép ra lệnh agent trên mọi phiếu; người được giao phiếu chỉ có thẩm quyền trên đúng phiếu đó.
 
 Chi tiết các việc phải làm trước khi bật: `docs/team/features/FEAT-001/asbuilt.md`, mục 6.
+
+### Định tuyến theo điểm
+
+Mỗi phiếu mới được chấm hai điểm 1–3 trong cùng lời gọi phân loại: độ phức tạp (1: dưới 1 giờ làm việc; 2: trong 1 ngày; 3: nhiều ngày, cần phân tích hoặc xây mới) và độ quan trọng (1: ảnh hưởng một người, không chặn việc; 2: chặn việc của một người hoặc bộ phận, hoặc có hạn trong 24 giờ; 3: chặn nghiệp vụ kế toán, kho, bán hàng hoặc nhiều bộ phận). Điểm có ở `ERP AI Log` (các cột `predicted_complexity`, `predicted_importance`, `predicted_score_reason`) ở mọi mức; từ `L1` có thêm trên phiếu ở ba trường chỉ đọc `ai_complexity`, `ai_importance`, `ai_score_reason`, HD Agent (role `Agent`) đọc được. Điểm 0 nghĩa là chưa chấm hoặc model trả điểm sai; ưu tiên khi đó theo `category_mapping`.
+
+**Mức ưu tiên** (từ `L1`), xét lần lượt, quy tắc nào khớp trước thì dừng:
+
+| Điều kiện | Ưu tiên |
+|---|---|
+| Tiêu đề có `[GẤP]` hoặc `[GẬP]` | `Urgent` |
+| Đầu mục F | `Low` |
+| Đầu mục E | Bot không ghi ưu tiên (COO đặt) |
+| Đầu mục A và độ quan trọng 3 | `Urgent` |
+| Còn lại | Mức cao hơn giữa ưu tiên của đầu mục trong `category_mapping` và mức theo độ quan trọng trong `importance_priority` (mặc định: 2 và 3 là `High`, 1 không nâng) |
+
+Độ phức tạp không đổi mức ưu tiên; nó dành cho `condition` của SLA. Sửa `importance_priority` là lần chạy sau dùng giá trị mới, không cần deploy. Đặt `{"1": "", "2": "", "3": ""}` để quay về ưu tiên theo ánh xạ đầu mục.
+
+**Nhóm.** A, B, C, F lấy nhóm trong `category_mapping`. D và E lấy nhóm của bộ phận model chọn, chỉ khi bộ phận có trong bảng `departments`, nhóm có tồn tại và không nằm trong `excluded_teams`; không thì bot không ghi nhóm và `ERP AI Log` ghi lý do.
+
+**Cấu hình `routing_rules`** (một trường JSON trên `ERP AI Setting`; sai dạng thì không lưu được, thông báo nêu chỗ sai):
+
+| Khóa | Nội dung |
+|---|---|
+| `assignees` | Đầu mục A, B, C, F: `default` (user ID người mặc định) và `prefixes` (tiền tố tiêu đề, ví dụ `[tracecore]`, sang user ID). Danh sách người để trống khi cài |
+| `departments` | Cho D/E: `"<bộ phận>": {"team": "<HD Team>", "head": "<user ID trưởng bộ phận>"}` |
+| `importance_priority` | Độ quan trọng "1", "2", "3" sang `Low`/`Medium`/`High`/`Urgent` hoặc rỗng (mức tối thiểu) |
+| `expected_sla` | Mỗi đầu mục `response_min` và `resolution_min` (phút, hoặc `null` thì không kiểm); mặc định theo bảng 16.2 (A 15/480, B 15/240, C 60/1440, D và E 60/null, F 5/60) |
+
+**Gán người và Task** (chỉ khi công tắc `auto_assign_enabled` bật, từ `L1`): bot gán đúng một người theo `assignees` (tiền tố tiêu đề được ưu tiên hơn `default`; D/E dùng trưởng bộ phận) bằng cơ chế gán của Helpdesk, người đó nhận một thông báo. Bot không gán khi: phiếu đã có người được gán (kể cả Assignment Rule của nhóm gán ngay lúc bot lưu nhóm; muốn dùng bảng người mặc định cho nhóm nào thì tắt rule của nhóm đó); người trong bảng không phải HD Agent đang hoạt động; người đó là tài khoản agent (không bao giờ); người đã phân loại phiếu. Không có người hợp lệ: một comment nhờ trưởng nhóm phân công. Đầu mục C/D, khi chính bot vừa gán được người: một Task có trường `ai_ticket` trỏ tới phiếu, giao cho người đó; chạy lại hoặc đã có Task liên kết thì không tạo thêm. Site tắt chia sẻ tài liệu mà người đó không đọc được Task: không Task, một comment nhờ trưởng nhóm giao Task. Mọi lần ghi và từ chối nằm ở cột `actions` của bản ghi `classify` trong `ERP AI Log`.
+
+**SLA.** Bot không tạo, sửa SLA và không tự gán `response_by`, `resolution_by`; Helpdesk chọn và tính SLA mỗi lần lưu phiếu. Bot báo: phiếu không có SLA nào áp vào thì một comment "Chưa có SLA áp vào phiếu, cần System Manager cấu hình." và một dòng cảnh báo; SLA đang áp xử lý chậm hơn `expected_sla` thì một dòng cảnh báo (`sla_check` trong `actions`). Muốn SLA khác nhau theo độ phức tạp, tạo SLA với `condition` đọc `doc.ai_complexity`; mẫu an toàn và cảnh báo ở `docs/HuongDan_QuanTri_DinhTuyen.md`, mục 3. Một `condition` lỗi chặn mọi lần lưu phiếu, của cả người lẫn bot.
+
+**Trước khi bật công tắc** làm các việc ở `docs/HuongDan_QuanTri_DinhTuyen.md`, mục 2 (gỡ role thừa của tài khoản agent, tắt SLA test, sửa team trỏ Assignment Rule đã mất, tạo HD Agent, điền người cho từng đầu mục kể cả F). Chi tiết thiết kế và các giới hạn đã biết: `docs/team/features/FEAT-006/asbuilt.md`.
 
 ### Chỉ báo trạng thái trên trang phiếu
 
@@ -87,7 +121,7 @@ bench --site <site> execute erp_ai.eval.export_tickets.export --args '["<đườ
 bench --site <site> execute erp_ai.eval.run_eval.run --args '["<đường dẫn .jsonl>"]'
 ```
 
-`export` từ chối đường dẫn nằm trong repo. `run` gửi nội dung lên API bằng cùng prompt với agent thật và in: độ chính xác tổng, theo từng đầu mục, ma trận nhầm lẫn 6×6, độ chính xác trên phiếu không do người viết nhiều nhất tạo, và kết luận (≥ 85% / 70–85% / < 70%).
+`export` từ chối đường dẫn nằm trong repo. `run` gửi nội dung lên API bằng cùng prompt với agent thật và in: độ chính xác tổng, theo từng đầu mục, ma trận nhầm lẫn 6×6, độ chính xác trên phiếu không do người viết nhiều nhất tạo, tỷ lệ khớp ưu tiên và khớp nhóm so với giá trị người đã đặt, phân bố hai điểm, token đầu ra lớn nhất của bước phân loại, số lần bị cắt ở `max_tokens` (`Classify max_tokens hits`), và kết luận (≥ 85% / 70–85% / < 70%). Số lần bị cắt khác 0 nghĩa là trần token đang chạm: kiểm model phân loại (mục "Cấu hình và bật", bước 2).
 
 ### Running tests
 

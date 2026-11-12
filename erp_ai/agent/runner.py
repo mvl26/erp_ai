@@ -145,18 +145,26 @@ def _end_status(status, delay, ticket_name, run_id, trigger):
 	"""
 	status.done()
 	errors = status.take_errors()
+	# Runs in a `finally`: a failing log call must never replace the run's own exception (or the normal
+	# return). There is no better place left to report a failure of the log itself, so it is dropped.
 	for piece in errors:
-		frappe.log_error(TITLE_STATUS_FAILED, f"ticket={ticket_name} run_id={run_id} {piece}")
-	frappe.logger(LOGGER_NAME).info(
-		"erp_ai run_status ticket=%s run_id=%s trigger=%s signals=%d errors=%d delay_s=%.1f waited_s=%.1f",
-		ticket_name,
-		run_id,
-		trigger,
-		status.signal_count,
-		len(errors),
-		delay.delay_s if delay else 0,
-		delay.waited_s if delay else 0,
-	)
+		try:
+			frappe.log_error(TITLE_STATUS_FAILED, f"ticket={ticket_name} run_id={run_id} {piece}")
+		except Exception:
+			pass
+	try:
+		frappe.logger(LOGGER_NAME).info(
+			"erp_ai run_status ticket=%s run_id=%s trigger=%s signals=%d errors=%d delay_s=%.1f waited_s=%.1f",
+			ticket_name,
+			run_id,
+			trigger,
+			status.signal_count,
+			len(errors),
+			delay.delay_s if delay else 0,
+			delay.waited_s if delay else 0,
+		)
+	except Exception:
+		pass
 
 
 def _log_skip(ticket_name, trigger, run_id, stop_reason):

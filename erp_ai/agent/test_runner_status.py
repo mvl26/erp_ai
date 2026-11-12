@@ -7,7 +7,7 @@ import frappe
 from frappe.utils import get_fullname
 
 from erp_ai.agent import answer_delay, policy, runner
-from erp_ai.agent.run_status import FALLBACK_WORK_LABEL, PAYLOAD_KEYS
+from erp_ai.agent.run_status import FALLBACK_WORK_LABEL, PAYLOAD_KEYS, WORK_LABELS
 from erp_ai.agent.test_agent_runner import (
 	CLASSIFY_A,
 	DAILY_LIMIT,
@@ -628,6 +628,91 @@ class TestRunnerStatus(RunnerTestBase):
 		self.assertFalse(reasons[1].error)
 		self.assertEqual(self._states(), ["thinking", "thinking", "done"])
 
+	def _fail_first_working(self):
+		"""Patch the emit so that only the first `working` signal raises; the others are recorded in `self.signals`."""
+		seen = []
+
+		def emit(event, message, room=None):
+			if message["state"] == "working" and not seen:
+				seen.append(message)
+				raise RuntimeError("MARKERXYZ")
+			self.signals.append({"event": event, "message": message, "room": room})
+
+		return patch("frappe.realtime.emit_via_redis", side_effect=emit)
+
+	def test_working_failure_on_classify_goes_into_the_classify_entry(self):
+		self._gateway(make_model_result(text=CLASSIFY_A))
+
+		with self._fail_first_working():
+			self._run_closing("ticket_insert")
+
+		# D-9: the fragment is in the entry of the step that follows the failed signal, not in the Error Log
+		entries = self._entries()
+		self.assertEqual([entry.entry_type for entry in entries], ["classify", "reason"])
+		self.assertEqual(entries[0].error, "status_working: RuntimeError")
+		self.assertEqual(entries[0].applied, 1)
+		self.assertFalse(entries[1].error)
+		self.assertEqual(self.log_error.call_args_list, [])
+
+	def test_thinking_failure_joins_the_classify_gateway_error(self):
+		self._gateway(GatewayError("server_error", status=500))
+
+		with self._fail_signals("thinking"):
+			self._run_closing("ticket_insert")
+
+		entry = self._entries(entry_type="classify")[-1]
+		self.assertEqual(entry.error, "server_error status=500; status_thinking: RuntimeError")
+		self.assertEqual(self.log_error.call_args_list, [])
+
+	def test_thinking_failure_joins_the_unparseable_classify_error(self):
+		self._gateway(make_model_result(text="không phải JSON"))
+
+		with self._fail_signals("thinking"):
+			self._run_closing("ticket_insert")
+
+		entry = self._entries(entry_type="classify")[-1]
+		self.assertEqual(entry.error, f"{runner.UNPARSEABLE_ERROR}; status_thinking: RuntimeError")
+		self.assertEqual(self.log_error.call_args_list, [])
+
+	def test_thinking_failure_joins_the_reason_gateway_error(self):
+		self._gateway(GatewayError("server_error", status=500))
+
+		with self._fail_signals("thinking"):
+			self._run_closing("comment_mention")
+
+		entry = self._entries(entry_type="reason")[-1]
+		self.assertEqual(entry.error, "server_error status=500; status_thinking: RuntimeError")
+		self.assertEqual(self.log_error.call_args_list, [])
+
+	def test_working_failure_joins_the_tool_error_with_semicolon(self):
+		self._gateway(tool_turn(tool_use("t1", "get_ticket")), make_model_result(text="xong"))
+
+		with patch.object(runner, "execute_tool", side_effect=RuntimeError), self._fail_signals("working"):
+			self._run_closing("comment_mention")
+
+		reasons = self._entries(entry_type="reason")
+		self.assertEqual(reasons[0].error, "tool get_ticket: RuntimeError; status_working: RuntimeError")
+		self.assertFalse(reasons[1].error)
+
+	def test_pending_fragment_after_a_crash_goes_to_the_error_log(self):
+		self._gateway(make_model_result(text="xong"))
+
+		with (
+			self._fail_signals("thinking"),
+			patch.object(runner, "build_initial_message", side_effect=RuntimeError),
+		):
+			lines = self._run_closing("comment_mention")
+
+		# no entry was written, so the closing step reports the fragment (D-9), class only; it runs before the crash is logged
+		titles = [invocation.args[0] for invocation in self.log_error.call_args_list]
+		self.assertEqual(titles, [TITLE_STATUS_FAILED, TITLE_RUN_FAILED])
+		run_id = self.signals[0]["message"]["run_id"]
+		self.assertEqual(
+			self.log_error.call_args_list[0].args[1],
+			f"ticket={self.ticket.name} run_id={run_id} status_thinking: RuntimeError",
+		)
+		self.assertEqual(lines[0][5], 1)
+
 	def test_status_text_never_in_logs(self):
 		marker = "MARKERXYZ"
 		frappe.db.set_single_value(SETTING_DOCTYPE, "thinking_text", f"{marker} thinking")
@@ -650,15 +735,11 @@ class TestRunnerStatus(RunnerTestBase):
 		logger_lines = json.dumps(
 			[list(invocation.args) for invocation in get_logger.return_value.mock_calls], ensure_ascii=False
 		)
-		logger_lines += json.dumps(
-			[list(invocation.args) for invocation in get_logger.return_value.info.call_args_list],
-			ensure_ascii=False,
-		)
 		# non-vacuous: the failed `done` reached the Error Log and the summary line was written
 		self.assertEqual(len(log_error.call_args_list), 1)
 		self.assertIn("run_status", logger_lines)
 		for name, text in (("run log", entries), ("Error Log", error_log), ("logger", logger_lines)):
-			for forbidden in (marker, "Đang làm", THINKING_TEXT):
+			for forbidden in (marker, "Đang làm", *WORK_LABELS.values()):
 				with self.subTest(name=name, forbidden=forbidden):
 					self.assertNotIn(forbidden, text)
 

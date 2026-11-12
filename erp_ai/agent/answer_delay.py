@@ -19,6 +19,12 @@ def _pick(low: float, high: float) -> float:
 
 
 class AnswerDelay:
+	"""Random delay before the answer is released.
+
+	Input: min/max seconds (clamped to 0..ANSWER_DELAY_MAX_S, reordered if min > max).
+	Output: `delay_s` picked once at start; `wait_before_answer(deadline)` returns seconds slept.
+	"""
+
 	def __init__(self, delay_s: float, anchor: float):
 		self.delay_s = delay_s
 		self.anchor = anchor
@@ -26,7 +32,7 @@ class AnswerDelay:
 		self._done = False
 
 	@classmethod
-	def start(cls, low_s, high_s) -> "AnswerDelay":
+	def start(cls, low_s: float | None, high_s: float | None) -> "AnswerDelay":
 		low, high = (min(max(v or 0, 0), ANSWER_DELAY_MAX_S) for v in (low_s, high_s))
 		if low > high:
 			low, high = high, low

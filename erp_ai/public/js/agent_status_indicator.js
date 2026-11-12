@@ -293,6 +293,8 @@ function setupForm({ doc, call, router }) {
 							renderMessages(data);
 							panel.errorEl.textContent = "";
 						} catch (e) {
+							panel.aiListEl.replaceChildren();
+							panel.threadEl.replaceChildren();
 							panel.errorEl.textContent = TEXT_LOAD_FAILED;
 						}
 					})
@@ -331,9 +333,9 @@ function setupForm({ doc, call, router }) {
 			const panel = state.panel;
 			panel.seq++;
 			closePanel();
-			if (panel.aiListEl) {
-				panel.aiListEl.replaceChildren();
-				panel.threadEl.replaceChildren();
+			panel.aiListEl?.replaceChildren();
+			panel.threadEl?.replaceChildren();
+			if (panel.errorEl) {
 				panel.errorEl.textContent = "";
 			}
 		};

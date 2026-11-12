@@ -170,6 +170,18 @@ STATUS_SCRIPT_REQUIRED = (
 	r"\(docked \? state\.panel\.slotEl : document\.body\)\.appendChild\(el\)",
 	# T12: stale-result guard (design F1 reload).
 	r"seq !== panel\.seq \|\| ticket !== state\.ticket \|\| !panel\.open",
+	# T12 use sites (the pins above match declarations; these match where each is used).
+	r"renderMessages\(data\)",
+	r"if \(isStale\(\)\) \{\s*return;",
+	r"dockIndicator\(true\)",
+	r"dockIndicator\(false\)",
+	r"textContent = TEXT_BOT_GUIDANCE",
+	r"textContent = TEXT_EMPTY_THREAD",
+	r"textContent = TEXT_CLOSE",
+	r"\? TEXT_BOT_LABEL :",
+	# A failed reload clears both lists (no new AI fields beside an old thread); reset tolerates an old panel state.
+	r"panel\.threadEl\.replaceChildren\(\);\s*panel\.errorEl\.textContent = TEXT_LOAD_FAILED",
+	r"panel\.threadEl\?\.replaceChildren\(\)",
 )
 
 # ADR-009: every `call(` in the page script passes a string literal naming one of PANEL_METHODS.

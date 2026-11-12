@@ -5,6 +5,7 @@
  "doctype": "DocType",
  "engine": "InnoDB",
  "field_order": [
+  "section_run",
   "ticket",
   "run_id",
   "entry_type",
@@ -12,6 +13,7 @@
   "trigger",
   "instructor",
   "model",
+  "section_usage",
   "input_tokens",
   "output_tokens",
   "cache_creation_input_tokens",
@@ -21,27 +23,37 @@
   "keys_tried",
   "latency_ms",
   "stop_reason",
+  "section_changes",
   "tools_called",
   "actions",
   "value_before",
   "value_after",
   "skipped_fields",
+  "section_prediction",
   "predicted_category",
   "predicted_confidence",
   "predicted_ticket_type",
   "predicted_agent_group",
   "predicted_priority",
   "applied",
+  "section_correction",
   "human_corrected_to",
   "human_corrected_by",
   "human_corrected_at",
+  "section_error",
   "error"
  ],
  "fields": [
   {
+   "fieldname": "section_run",
+   "fieldtype": "Section Break",
+   "label": "Lần chạy"
+  },
+  {
    "fieldname": "ticket",
    "fieldtype": "Link",
    "label": "Phiếu",
+   "description": "Phiếu HD Ticket mà lần chạy này xử lý, hiện bằng mã phiếu. Dùng để lọc các bản ghi theo phiếu. Hệ thống tự ghi khi agent chạy, không sửa được.",
    "options": "HD Ticket",
    "search_index": 1,
    "read_only": 1
@@ -50,6 +62,7 @@
    "fieldname": "run_id",
    "fieldtype": "Data",
    "label": "Mã lần chạy",
+   "description": "Mã chung của một lần chạy agent. Các bản ghi cùng một lần chạy có cùng mã, dùng để gom chúng lại với nhau. Hệ thống tự ghi khi agent chạy, không sửa được.",
    "search_index": 1,
    "read_only": 1
   },
@@ -57,6 +70,7 @@
    "fieldname": "entry_type",
    "fieldtype": "Select",
    "label": "Loại bản ghi",
+   "description": "Loại bản ghi: classify là phân loại phiếu, reason là một lượt lập luận, skip là phiếu bị bỏ qua nên không chạy. Hệ thống tự ghi khi agent chạy, không sửa được.",
    "options": "classify\nreason\nskip",
    "read_only": 1
   },
@@ -64,12 +78,14 @@
    "fieldname": "turn",
    "fieldtype": "Int",
    "label": "Lượt",
+   "description": "Số thứ tự lượt. Lượt 0 là phân loại hoặc bỏ qua; lượt 1 đến N là các lượt lập luận của vòng lặp agent. Hệ thống tự ghi khi agent chạy, không sửa được.",
    "read_only": 1
   },
   {
    "fieldname": "trigger",
    "fieldtype": "Select",
    "label": "Nguồn kích hoạt",
+   "description": "Nguồn kích hoạt: ticket_insert khi phiếu mới được tạo, comment_mention khi có bình luận chứa từ khóa kích hoạt. Hệ thống tự ghi khi agent chạy, không sửa được.",
    "options": "ticket_insert\ncomment_mention",
    "read_only": 1
   },
@@ -77,6 +93,7 @@
    "fieldname": "instructor",
    "fieldtype": "Link",
    "label": "Người ra lệnh",
+   "description": "Người chỉ đạo agent: người viết bình luận mới nhất có vai trò ERP AI Instructor hoặc được người khác giao việc; nếu không có thì là chủ phiếu khi chủ phiếu đủ điều kiện đó. Có thể có cả khi nguồn là ticket_insert, và có thể khác người viết từ khóa kích hoạt. Chỉ dòng reason mới ghi. Hệ thống tự ghi khi agent chạy, không sửa được.",
    "options": "User",
    "read_only": 1
   },
@@ -84,36 +101,47 @@
    "fieldname": "model",
    "fieldtype": "Data",
    "label": "Model",
+   "description": "Tên model đã xử lý lần gọi này, lấy từ dòng khóa API đã trả lời (hoặc model mặc định của Setting khi phân loại). Hệ thống tự ghi khi agent chạy, không sửa được.",
    "read_only": 1
+  },
+  {
+   "fieldname": "section_usage",
+   "fieldtype": "Section Break",
+   "label": "Token, chi phí và khóa"
   },
   {
    "fieldname": "input_tokens",
    "fieldtype": "Int",
    "label": "Token input",
+   "description": "Số token gửi lên model trong lần gọi này, không tính phần đọc hoặc ghi cache. Dùng để tính chi phí. Hệ thống tự ghi khi agent chạy, không sửa được.",
    "read_only": 1
   },
   {
    "fieldname": "output_tokens",
    "fieldtype": "Int",
    "label": "Token output",
+   "description": "Số token model trả về trong lần gọi này. Dùng để tính chi phí. Hệ thống tự ghi khi agent chạy, không sửa được.",
    "read_only": 1
   },
   {
    "fieldname": "cache_creation_input_tokens",
    "fieldtype": "Int",
    "label": "Token ghi cache",
+   "description": "Số token được ghi vào cache của nhà cung cấp trong lần gọi này. Tính theo đơn giá ghi cache. Hệ thống tự ghi khi agent chạy, không sửa được.",
    "read_only": 1
   },
   {
    "fieldname": "cache_read_input_tokens",
    "fieldtype": "Int",
    "label": "Token đọc cache",
+   "description": "Số token được đọc từ cache của nhà cung cấp trong lần gọi này. Tính theo đơn giá đọc cache. Hệ thống tự ghi khi agent chạy, không sửa được.",
    "read_only": 1
   },
   {
    "fieldname": "cost_usd",
    "fieldtype": "Float",
    "label": "Chi phí (USD)",
+   "description": "Chi phí lần gọi, tính bằng USD từ số token và đơn giá trong Setting. Tổng chi phí các dòng trong tháng được cộng vào số đã chi trong tháng của Setting. Hệ thống tự ghi khi agent chạy, không sửa được.",
    "precision": "6",
    "read_only": 1
   },
@@ -121,42 +149,54 @@
    "fieldname": "credential_label",
    "fieldtype": "Data",
    "label": "Khóa đã trả lời",
+   "description": "Nhãn của khóa API đã dùng cho lần gọi này. Ở dòng gateway_error đó là khóa thử cuối cùng, chưa trả lời được. Chỉ ghi nhãn, không bao giờ ghi nội dung khóa. Hệ thống tự ghi khi agent chạy, không sửa được.",
    "read_only": 1
   },
   {
    "fieldname": "keys_tried",
    "fieldtype": "Small Text",
    "label": "Các khóa đã thử",
+   "description": "Danh sách nhãn khóa đã thử trong lần gọi này, kèm kết quả của từng khóa (thành công hoặc lý do bị bỏ qua). Hệ thống tự ghi khi agent chạy, không sửa được.",
    "read_only": 1
   },
   {
    "fieldname": "latency_ms",
    "fieldtype": "Int",
    "label": "Độ trễ (ms)",
+   "description": "Thời gian chờ của lần gọi, tính bằng mili giây, từ lúc gửi đến lúc nhận trả lời. Lần gọi lỗi ghi 0, không có thời gian đo. Hệ thống tự ghi khi agent chạy, không sửa được.",
    "read_only": 1
   },
   {
    "fieldname": "stop_reason",
    "fieldtype": "Data",
    "label": "Lý do dừng",
+   "description": "Lý do dừng của dòng này, ví dụ: tool_use (model muốn gọi tool), end_turn (model trả lời xong), max_turns, time_budget, gateway_error, unparseable (không đọc được kết quả phân loại); dòng bỏ qua ghi not_sendable, daily_limit hoặc level_L0. Hệ thống tự ghi khi agent chạy, không sửa được.",
    "read_only": 1
+  },
+  {
+   "fieldname": "section_changes",
+   "fieldtype": "Section Break",
+   "label": "Tool và thay đổi trên phiếu"
   },
   {
    "fieldname": "tools_called",
    "fieldtype": "Small Text",
    "label": "Tool đã gọi",
+   "description": "Danh sách tool agent đã gọi trong lượt này, theo thứ tự gọi; mỗi dòng reason chỉ ghi tool của lượt đó. Để trống nếu không gọi tool nào. Hệ thống tự ghi khi agent chạy, không sửa được.",
    "read_only": 1
   },
   {
    "fieldname": "actions",
    "fieldtype": "Small Text",
    "label": "Hành động",
+   "description": "Các hành động agent đã thực hiện trên phiếu, ví dụ ghi phân loại hoặc đăng bình luận. Để trống nếu chỉ đọc. Hệ thống tự ghi khi agent chạy, không sửa được.",
    "read_only": 1
   },
   {
    "fieldname": "value_before",
    "fieldtype": "Code",
    "label": "Giá trị trước",
+   "description": "Giá trị các trường của phiếu trước khi agent sửa, ở dạng JSON. Dùng để đối chiếu và hoàn tác thủ công. Hệ thống tự ghi khi agent chạy, không sửa được.",
    "options": "JSON",
    "read_only": 1
   },
@@ -164,6 +204,7 @@
    "fieldname": "value_after",
    "fieldtype": "Code",
    "label": "Giá trị sau",
+   "description": "Giá trị các trường của phiếu sau khi agent sửa, ở dạng JSON. So sánh với giá trị trước để thấy thay đổi. Hệ thống tự ghi khi agent chạy, không sửa được.",
    "options": "JSON",
    "read_only": 1
   },
@@ -171,54 +212,73 @@
    "fieldname": "skipped_fields",
    "fieldtype": "Small Text",
    "label": "Trường bỏ qua khi phân loại",
+   "description": "Các trường bị bỏ qua khi phân loại vì giá trị không hợp lệ hoặc không có trong hệ thống. Để trống nếu không bỏ qua trường nào. Hệ thống tự ghi khi agent chạy, không sửa được.",
    "read_only": 1
+  },
+  {
+   "fieldname": "section_prediction",
+   "fieldtype": "Section Break",
+   "label": "Dự đoán phân loại"
   },
   {
    "fieldname": "predicted_category",
    "fieldtype": "Data",
    "label": "Đầu mục dự đoán",
+   "description": "Đầu mục A đến F mà agent dự đoán cho phiếu, theo bảng đầu mục trong Setting. Để trống nếu không phân loại được. Hệ thống tự ghi khi agent chạy, không sửa được.",
    "read_only": 1
   },
   {
    "fieldname": "predicted_confidence",
    "fieldtype": "Data",
    "label": "Độ tin cậy dự đoán",
+   "description": "Độ tin cậy của dự đoán: Cao, Trung bình hoặc Thấp. Khi dự đoán được áp dụng, giá trị này được ghi vào trường ai_confidence của phiếu. Hệ thống tự ghi khi agent chạy, không sửa được.",
    "read_only": 1
   },
   {
    "fieldname": "predicted_ticket_type",
    "fieldtype": "Data",
    "label": "Loại phiếu dự đoán",
+   "description": "Loại phiếu mà agent dự đoán, theo đầu mục đã chọn. Đối chiếu với loại phiếu người sửa để đo độ chính xác. Hệ thống tự ghi khi agent chạy, không sửa được.",
    "read_only": 1
   },
   {
    "fieldname": "predicted_agent_group",
    "fieldtype": "Data",
    "label": "Nhóm xử lý dự đoán",
+   "description": "Nhóm xử lý mà agent dự đoán, theo đầu mục đã chọn. Đối chiếu với nhóm người sửa để đo độ chính xác. Hệ thống tự ghi khi agent chạy, không sửa được.",
    "read_only": 1
   },
   {
    "fieldname": "predicted_priority",
    "fieldtype": "Data",
    "label": "Ưu tiên dự đoán",
+   "description": "Mức ưu tiên mà agent dự đoán. Tiêu đề phiếu có [GẤP] thì ưu tiên là Urgent. Dùng để đo độ chính xác của dự đoán. Hệ thống tự ghi khi agent chạy, không sửa được.",
    "read_only": 1
   },
   {
    "fieldname": "applied",
    "fieldtype": "Check",
    "label": "Đã áp dụng",
+   "description": "Được chọn khi dự đoán đã ghi vào phiếu; bỏ trống nghĩa là chỉ ghi nhận dự đoán, phiếu không bị sửa (ví dụ ở mức quyền L0). Hệ thống tự ghi khi agent chạy, không sửa được.",
    "read_only": 1
+  },
+  {
+   "fieldname": "section_correction",
+   "fieldtype": "Section Break",
+   "label": "Người sửa sau dự đoán"
   },
   {
    "fieldname": "human_corrected_to",
    "fieldtype": "Small Text",
    "label": "Người sửa thành",
+   "description": "Giá trị mới khi người đổi loại phiếu, nhóm xử lý hoặc ưu tiên sau khi AI đã dự đoán. Hệ thống tự ghi khi người đổi, không sửa được.",
    "read_only": 1
   },
   {
    "fieldname": "human_corrected_by",
    "fieldtype": "Link",
    "label": "Người sửa",
+   "description": "Người đổi loại phiếu, nhóm xử lý hoặc ưu tiên sau khi AI đã dự đoán. Hệ thống tự ghi khi người đổi, không sửa được.",
    "options": "User",
    "read_only": 1
   },
@@ -226,17 +286,24 @@
    "fieldname": "human_corrected_at",
    "fieldtype": "Datetime",
    "label": "Thời điểm sửa đầu tiên",
+   "description": "Thời điểm của lần sửa đầu tiên sau khi AI đã dự đoán; chỉ ghi ở lần sửa đầu, các lần sau không đổi. Hệ thống tự ghi, không sửa được.",
    "read_only": 1
+  },
+  {
+   "fieldname": "section_error",
+   "fieldtype": "Section Break",
+   "label": "Lỗi"
   },
   {
    "fieldname": "error",
    "fieldtype": "Small Text",
    "label": "Lỗi",
+   "description": "Nội dung lỗi khi lần chạy thất bại. Không có khóa API hay nội dung bí mật trong trường này; để trống nếu lần chạy không lỗi. Hệ thống tự ghi khi agent chạy, không sửa được.",
    "read_only": 1
   }
  ],
  "links": [],
- "modified": "2026-11-11 12:00:00.000000",
+ "modified": "2026-11-12 12:00:00.000000",
  "modified_by": "Administrator",
  "module": "ERP AI agent",
  "name": "ERP AI Log",

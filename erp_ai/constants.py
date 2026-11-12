@@ -37,3 +37,9 @@ TITLE_STATUS_FAILED = "erp_ai: chỉ báo trạng thái lỗi"
 AGENT_STATUS_EVENT = "erp_ai:agent_status"
 
 LOGGER_NAME = "erp_ai"
+
+PANEL_METHODS = (
+	"erp_ai.ticket_panel.get_panel_data",
+	"erp_ai.ticket_panel.send_message",
+)
+PANEL_MAX_MESSAGE_CHARS = 2000

@@ -40,6 +40,7 @@ LAYER_RULES = (
 			"erp_ai.agent",
 			"erp_ai.eval",
 			"erp_ai.handlers",
+			"erp_ai.ticket_panel",
 			"erp_ai.tasks",
 			"erp_ai.install",
 			"erp_ai.erp_ai_agent",
@@ -48,7 +49,14 @@ LAYER_RULES = (
 	),
 	(
 		"erp_ai.agent",
-		("erp_ai.eval", "erp_ai.handlers", "erp_ai.tasks", "erp_ai.install", "erp_ai.erp_ai_agent"),
+		(
+			"erp_ai.eval",
+			"erp_ai.handlers",
+			"erp_ai.ticket_panel",
+			"erp_ai.tasks",
+			"erp_ai.install",
+			"erp_ai.erp_ai_agent",
+		),
 		"ADR-001: agent core must not import eval, handlers, scheduler, install or doctype controllers",
 	),
 	(
@@ -60,6 +68,11 @@ LAYER_RULES = (
 		"erp_ai.handlers",
 		("erp_ai.gateway", "erp_ai.agent.runner"),
 		"ADR-001/ADR-003: handlers enqueue by path string, never import gateway or runner",
+	),
+	(
+		"erp_ai.ticket_panel",
+		("erp_ai.gateway", "erp_ai.agent.runner", "erp_ai.agent.queue"),
+		"ADR-001/ADR-010: the panel is an entry layer, it never calls the model, runs the agent or enqueues",
 	),
 )
 # NOT forbidden on purpose: erp_ai.eval -> erp_ai.agent.runner (entry layer -> agent core, ADR-001).
@@ -1145,6 +1158,9 @@ class TestScannersCatchViolations(unittest.TestCase):
 			"handlers.py": "from erp_ai.gateway import call_model\n",
 			"gateway/breaker.py": "from erp_ai.erp_ai_agent.doctype.erp_ai_setting import erp_ai_setting\n",
 			"agent/authority.py": "from erp_ai.erp_ai_agent import doctype\n",
+			"ticket_panel.py": "from erp_ai.gateway import call_model\n",
+			"gateway/cache.py": "from erp_ai import ticket_panel\n",
+			"agent/context.py": "from erp_ai.ticket_panel import get_panel_data\n",
 		}
 		for rel, source in cases.items():
 			with self.subTest(rel=rel):

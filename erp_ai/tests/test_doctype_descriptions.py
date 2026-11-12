@@ -108,24 +108,35 @@ DOCTYPE_CONFIG = {
 			"entry_type": ("classify", "reason", "skip", "phân loại", "lập luận"),
 			"turn": ("Lượt 0", "lượt 1", "lập luận"),
 			"trigger": ("ticket_insert", "comment_mention", "bình luận"),
-			"instructor": ("bình luận", "người ra lệnh"),
+			"instructor": ("ERP AI Instructor", "giao việc", "chủ phiếu", "ticket_insert", "dòng reason"),
 			"model": ("model", "lần gọi"),
 			"input_tokens": ("token", "gửi lên"),
 			"output_tokens": ("token", "model trả về"),
 			"cache_creation_input_tokens": ("ghi vào cache", "token"),
 			"cache_read_input_tokens": ("đọc từ cache", "token"),
-			"cost_usd": ("USD", "đơn giá", "Setting"),
-			"credential_label": ("nhãn", "khóa", "trả lời"),
+			"cost_usd": ("USD", "đơn giá", "Setting", "đã chi trong tháng"),
+			"credential_label": ("nhãn", "khóa", "thử cuối cùng", "gateway_error"),
 			"keys_tried": ("danh sách", "nhãn khóa", "kết quả"),
-			"latency_ms": ("mili giây", "lần gọi"),
-			"stop_reason": ("max_turns", "time_budget", "gateway_error"),
-			"tools_called": ("tool", "lần chạy"),
+			"latency_ms": ("mili giây", "lần gọi", "ghi 0"),
+			"stop_reason": (
+				"ví dụ",
+				"tool_use",
+				"end_turn",
+				"max_turns",
+				"time_budget",
+				"gateway_error",
+				"unparseable",
+				"not_sendable",
+				"daily_limit",
+				"level_L0",
+			),
+			"tools_called": ("tool", "trong lượt này"),
 			"actions": ("hành động", "phiếu"),
 			"value_before": ("JSON", "trước khi"),
 			"value_after": ("JSON", "sau khi"),
 			"skipped_fields": ("bỏ qua", "phân loại"),
 			"predicted_category": ("đầu mục", "A đến F"),
-			"predicted_confidence": ("Cao", "Trung bình", "Thấp"),
+			"predicted_confidence": ("Cao", "Trung bình", "Thấp", "ai_confidence"),
 			"predicted_ticket_type": ("loại phiếu", "dự đoán"),
 			"predicted_agent_group": ("nhóm xử lý", "dự đoán"),
 			"predicted_priority": ("ưu tiên", "dự đoán"),
@@ -180,6 +191,17 @@ DOCTYPE_CONFIG = {
 	},
 }
 
+# Wordings that contradicted the code that writes the field (T5 review round 1).
+FORBIDDEN_PHRASES = {
+	"ERP AI Log": {
+		"instructor": ("người ra lệnh", "khi phiếu mới tạo"),
+		"tools_called": ("lần chạy này",),
+		"predicted_confidence": ("thường khiến", "không được áp dụng"),
+		"stop_reason": ("là lỗi khi gọi nhà cung cấp",),
+		"latency_ms": ("có thể để trống",),
+	},
+}
+
 
 def load_doctype(config):
 	path = DOCTYPE_DIR / config["folder"] / f"{config['folder']}.json"
@@ -227,10 +249,24 @@ class TestDoctypeDescriptions(FrappeTestCase):
 			with self.subTest(doctype=doctype):
 				by_name = {f["fieldname"]: f for f in visible_fields(doctype_json)}
 				self.assertEqual(set(config["phrases"]), set(by_name), f"{doctype}: cấu hình test lệch field")
+				missing = {}
 				for fieldname, phrases in config["phrases"].items():
 					description = by_name[fieldname].get("description") or ""
-					missing = [p for p in phrases if p.lower() not in description.lower()]
-					self.assertEqual(missing, [], f"{doctype}.{fieldname}: thiếu cụm {missing}")
+					absent = [p for p in phrases if p.lower() not in description.lower()]
+					if absent:
+						missing[fieldname] = absent
+				self.assertEqual(missing, {}, f"{doctype}: thiếu cụm")
+
+	def test_forbidden_phrases_absent(self):
+		for doctype, forbidden in FORBIDDEN_PHRASES.items():
+			by_name = {f["fieldname"]: f for f in visible_fields(load_doctype(DOCTYPE_CONFIG[doctype]))}
+			present = {}
+			for fieldname, phrases in forbidden.items():
+				description = (by_name[fieldname].get("description") or "").lower()
+				found = [p for p in phrases if p.lower() in description]
+				if found:
+					present[fieldname] = found
+			self.assertEqual(present, {}, f"{doctype}: còn cụm sai")
 
 	def test_read_only_fields_say_system_writes(self):
 		for doctype, config, doctype_json in self.each_doctype():

@@ -93,7 +93,7 @@
    "fieldname": "instructor",
    "fieldtype": "Link",
    "label": "Người ra lệnh",
-   "description": "Người viết bình luận đã gọi agent. Chỉ có khi nguồn là comment_mention; để trống khi phiếu mới tạo, vì khi đó chưa có người ra lệnh. Hệ thống tự ghi khi agent chạy, không sửa được.",
+   "description": "Người chỉ đạo agent: người viết bình luận mới nhất có vai trò ERP AI Instructor hoặc được người khác giao việc; nếu không có thì là chủ phiếu khi chủ phiếu đủ điều kiện đó. Có thể có cả khi nguồn là ticket_insert, và có thể khác người viết từ khóa kích hoạt. Chỉ dòng reason mới ghi. Hệ thống tự ghi khi agent chạy, không sửa được.",
    "options": "User",
    "read_only": 1
   },
@@ -141,7 +141,7 @@
    "fieldname": "cost_usd",
    "fieldtype": "Float",
    "label": "Chi phí (USD)",
-   "description": "Chi phí lần gọi, tính bằng USD từ số token và đơn giá trong Setting. Tổng chi phí trong tháng được cộng vào ngân sách tháng. Hệ thống tự ghi khi agent chạy, không sửa được.",
+   "description": "Chi phí lần gọi, tính bằng USD từ số token và đơn giá trong Setting. Tổng chi phí các dòng trong tháng được cộng vào số đã chi trong tháng của Setting. Hệ thống tự ghi khi agent chạy, không sửa được.",
    "precision": "6",
    "read_only": 1
   },
@@ -149,7 +149,7 @@
    "fieldname": "credential_label",
    "fieldtype": "Data",
    "label": "Khóa đã trả lời",
-   "description": "Nhãn của khóa API đã trả lời lần gọi này. Chỉ ghi nhãn, không bao giờ ghi nội dung khóa. Hệ thống tự ghi khi agent chạy, không sửa được.",
+   "description": "Nhãn của khóa API đã dùng cho lần gọi này. Ở dòng gateway_error đó là khóa thử cuối cùng, chưa trả lời được. Chỉ ghi nhãn, không bao giờ ghi nội dung khóa. Hệ thống tự ghi khi agent chạy, không sửa được.",
    "read_only": 1
   },
   {
@@ -163,14 +163,14 @@
    "fieldname": "latency_ms",
    "fieldtype": "Int",
    "label": "Độ trễ (ms)",
-   "description": "Thời gian chờ của lần gọi, tính bằng mili giây, từ lúc gửi đến lúc nhận trả lời. Lần gọi lỗi có thể để trống. Hệ thống tự ghi khi agent chạy, không sửa được.",
+   "description": "Thời gian chờ của lần gọi, tính bằng mili giây, từ lúc gửi đến lúc nhận trả lời. Lần gọi lỗi ghi 0, không có thời gian đo. Hệ thống tự ghi khi agent chạy, không sửa được.",
    "read_only": 1
   },
   {
    "fieldname": "stop_reason",
    "fieldtype": "Data",
    "label": "Lý do dừng",
-   "description": "Lý do vòng lặp dừng: max_turns là hết số lượt cho phép, time_budget là hết thời gian, gateway_error là lỗi khi gọi nhà cung cấp. Hệ thống tự ghi khi agent chạy, không sửa được.",
+   "description": "Lý do dừng của dòng này, ví dụ: tool_use (model muốn gọi tool), end_turn (model trả lời xong), max_turns, time_budget, gateway_error, unparseable (không đọc được kết quả phân loại); dòng bỏ qua ghi not_sendable, daily_limit hoặc level_L0. Hệ thống tự ghi khi agent chạy, không sửa được.",
    "read_only": 1
   },
   {
@@ -182,7 +182,7 @@
    "fieldname": "tools_called",
    "fieldtype": "Small Text",
    "label": "Tool đã gọi",
-   "description": "Danh sách tool agent đã gọi trong lần chạy này, theo thứ tự gọi. Để trống nếu không gọi tool nào. Hệ thống tự ghi khi agent chạy, không sửa được.",
+   "description": "Danh sách tool agent đã gọi trong lượt này, theo thứ tự gọi; mỗi dòng reason chỉ ghi tool của lượt đó. Để trống nếu không gọi tool nào. Hệ thống tự ghi khi agent chạy, không sửa được.",
    "read_only": 1
   },
   {
@@ -231,7 +231,7 @@
    "fieldname": "predicted_confidence",
    "fieldtype": "Data",
    "label": "Độ tin cậy dự đoán",
-   "description": "Độ tin cậy của dự đoán: Cao, Trung bình hoặc Thấp. Độ tin cậy thấp thường khiến dự đoán không được áp dụng. Hệ thống tự ghi khi agent chạy, không sửa được.",
+   "description": "Độ tin cậy của dự đoán: Cao, Trung bình hoặc Thấp. Khi dự đoán được áp dụng, giá trị này được ghi vào trường ai_confidence của phiếu. Hệ thống tự ghi khi agent chạy, không sửa được.",
    "read_only": 1
   },
   {
@@ -303,7 +303,7 @@
   }
  ],
  "links": [],
- "modified": "2026-11-11 12:00:00.000000",
+ "modified": "2026-11-12 12:00:00.000000",
  "modified_by": "Administrator",
  "module": "ERP AI agent",
  "name": "ERP AI Log",

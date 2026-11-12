@@ -10,12 +10,12 @@ from erp_ai.agent import authority, policy, site_facts
 from erp_ai.agent.answer_delay import AnswerDelay
 from erp_ai.agent.classification import load_mapping, parse_classification
 from erp_ai.agent.prompts import build_classify_request, build_initial_message, build_reason_system
-from erp_ai.agent.routing import decide_route, departments, load_routing_config
+from erp_ai.agent.routing import decide_route, departments, load_routing_config, sla_lag
 from erp_ai.agent.run_log import write_entry
 from erp_ai.agent.run_status import CLASSIFY_STEP, RunStatus
 from erp_ai.agent.tools.read import TOOL_RESULT_MAX_CHARS
 from erp_ai.agent.tools.registry import ToolContext, execute_tool, get_tool_schemas
-from erp_ai.agent.tools.route_ticket import apply_route
+from erp_ai.agent.tools.route_ticket import NO_SLA, apply_route
 from erp_ai.constants import (
 	AGENT_USER,
 	JOB_SAFETY_MARGIN_S,
@@ -51,6 +51,7 @@ UNPARSEABLE_ERROR = "UNPARSEABLE: không phân loại được"
 BAD_MAPPING_ERROR = "category_mapping không hợp lệ, không có giá trị dự đoán"
 BAD_ROUTING_ERROR = "routing_rules không hợp lệ, định tuyến dùng giá trị rỗng"
 NO_SCORE_REASON = "không có điểm"
+NO_SLA_REASON = "chưa có SLA áp vào phiếu"
 ROUTE_SAVEPOINT = "erp_ai_route"
 USAGE_COLUMNS = ("input_tokens", "output_tokens", "cache_creation_input_tokens", "cache_read_input_tokens")
 
@@ -278,39 +279,109 @@ def _classify(ticket_name, trigger, run_id, mapping, routing, context, auto_assi
 
 
 def _route(log_name, classification, decision, context, auto_assign, subject):
-	"""Run `apply_route` and record its outcome on the entry as one unit (skeleton: the ticket write only).
+	"""Run the route unit (u1), check the SLA and record the outcome on the entry as one unit (design 4.2).
+
+	Returns `lines`, the fixed sentences the later steps will post as one comment. Nothing here raises for
+	an unusable (u1): it is rolled back, recorded as `ok=false` with the exception class only (D-16).
 
 	The ticket change and the entry update share a savepoint: an exception between them undoes the
 	ticket change, so the entry never says applied=0 over a changed ticket (the entry row itself was
 	committed before and survives). Nothing is committed until both are written.
 	"""
+	actions, lines, errors = [], [], []
 	frappe.db.savepoint(ROUTE_SAVEPOINT)
 	try:
-		result = apply_route(decision, classification, context)
-		updates = {}
-		if result.get("ok") and result.get("after"):
-			action = {
-				"tool": "apply_route",
-				"doctype": "HD Ticket",
-				"name": context.ticket_name,
-				"ok": True,
-			}
-			updates = {
-				"applied": 1,
-				"value_before": json.dumps(result["before"], ensure_ascii=False),
-				"value_after": json.dumps(result["after"], ensure_ascii=False),
-				"actions": json.dumps([action], ensure_ascii=False),
-			}
-		if result.get("ok") and result.get("skipped"):
-			updates["skipped_fields"] = json.dumps(result["skipped"], ensure_ascii=False)
-		if updates:
-			frappe.db.set_value(LOG_DOCTYPE, log_name, updates, update_modified=False)
+		result = _apply_route_unit(decision, classification, context, actions, errors)
+		sla = _check_sla(classification.category, context, actions, lines) if result else None
+		_record_route(log_name, result, decision, actions, errors)
+		_log_route_summary(context, result, sla, lines)
 	except Exception:
 		frappe.db.rollback(save_point=ROUTE_SAVEPOINT)
 		raise
 	frappe.db.release_savepoint(ROUTE_SAVEPOINT)
 	if not frappe.flags.in_test:
 		frappe.db.commit()
+	return lines
+
+
+def _route_action(tool, doctype, name, ok, reason=None):
+	return {
+		"tool": tool,
+		"doctype": doctype,
+		"name": name,
+		"ok": ok,
+		**({"reason": reason} if reason else {}),
+	}
+
+
+def _apply_route_unit(decision, classification, context, actions, errors):
+	"""(u1): the ticket write. Returns its result when ok, else None (the failure is already in `actions`)."""
+	ticket = context.ticket_name
+	try:
+		result = apply_route(decision, classification, context)
+	except Exception as exc:
+		frappe.db.rollback(save_point=ROUTE_SAVEPOINT)
+		name = type(exc).__name__
+		errors.append(f"route apply_route: {name}")
+		actions.append(_route_action("apply_route", "HD Ticket", ticket, False, name))
+		return None
+	if not result.get("ok"):
+		actions.append(_route_action("apply_route", "HD Ticket", ticket, False, result.get("reason")))
+		return None
+	actions.append(_route_action("apply_route", "HD Ticket", ticket, True))
+	return result
+
+
+def _check_sla(category, context, actions, lines):
+	"""Read-only SLA check (D-9). Returns "none" / "slow" / "ok", or "skipped" without a routing config."""
+	routing = context.routing_config
+	if not routing:
+		return "skipped"
+	ticket = context.ticket_name
+	fact = site_facts.applied_sla(ticket)
+	if fact is None:
+		reason, state = NO_SLA_REASON, "none"
+		lines.append(NO_SLA)
+	else:
+		lag = sla_lag(category, fact["resolution_s"], routing)
+		if lag is None:
+			return "ok"
+		reason = f"SLA {fact['sla']} xử lý {int(lag[0])} phút > mong đợi {lag[1]} phút ({category})"
+		state = "slow"
+	actions.append(_route_action("sla_check", "HD Ticket", ticket, False, reason))
+	frappe.logger(LOGGER_NAME).warning("erp_ai sla ticket=%s run_id=%s %s", ticket, context.run_id, reason)
+	return state
+
+
+def _record_route(log_name, result, decision, actions, errors):
+	"""Update the `classify` entry once (design 3.5)."""
+	updates = {"applied": 1 if result else 0, "actions": json.dumps(actions, ensure_ascii=False)}
+	if result:
+		for column, key in (("value_before", "before"), ("value_after", "after")):
+			if result.get(key):
+				updates[column] = json.dumps(result[key], ensure_ascii=False)
+		# a route note names the reason a field was left empty; it replaces the generic reason for that field
+		noted = {note["field"] for note in decision.notes}
+		skipped = [item for item in result.get("skipped") or [] if item["field"] not in noted]
+		skipped.extend(decision.notes)
+		if skipped:
+			updates["skipped_fields"] = json.dumps(skipped, ensure_ascii=False)
+	if errors:
+		previous = frappe.db.get_value(LOG_DOCTYPE, log_name, "error")
+		updates["error"] = "; ".join([*([previous] if previous else []), *errors])
+	frappe.db.set_value(LOG_DOCTYPE, log_name, updates, update_modified=False)
+
+
+def _log_route_summary(context, result, sla, lines):
+	"""One info line, codes and numbers only (STD-OPS-5, NFR-4')."""
+	frappe.logger(LOGGER_NAME).info(
+		"erp_ai route ticket=%s run_id=%s applied=%d sla=%s lines=%d",
+		context.ticket_name,
+		context.run_id,
+		1 if result else 0,
+		sla or "-",
+		len(lines),
+	)
 
 
 def _reason(ticket_name, trigger, run_id, settings, context, classification, deadline, status, delay):

@@ -180,23 +180,27 @@ class TestTicketPanelThread(FrappeTestCase):
 		return ticket_panel.get_panel_data(self.ticket)["messages"]
 
 	def test_thread_selects_b5_comments_in_creation_order(self):
+		# AC-8 data: 3 human keyword (1 other case), 2 human plain, 2 agent, 1 keyword on ANOTHER ticket.
 		# Inserted out of order on purpose: the result must follow `creation`, not insertion.
+		other_ticket = make_ticket(subject="Another ticket").name
 		late = _add_comment(self.ticket, f"{KEYWORD} late human", creation="2026-11-12 10:05:00")
 		_add_comment(self.ticket, "plain human chat", creation="2026-11-12 10:01:00")
 		bot_plain = _add_comment(self.ticket, "bot says hi", AGENT_USER, "2026-11-12 10:03:00")
 		early = _add_comment(self.ticket, f"early {KEYWORD.upper()} human", creation="2026-11-12 10:02:00")
 		_add_comment(self.ticket, "another plain human", creation="2026-11-12 10:04:00")
 		bot_kw = _add_comment(self.ticket, f"bot {KEYWORD}", AGENT_USER, "2026-11-12 10:06:00")
-		_add_comment(self.ticket, "last plain human", creation="2026-11-12 10:07:00")
+		last = _add_comment(self.ticket, f"last {KEYWORD} human", creation="2026-11-12 10:07:00")
+		_add_comment(other_ticket, f"{KEYWORD} on another ticket", creation="2026-11-12 10:04:30")
 
 		messages = self._messages()
 
-		self.assertEqual([m["name"] for m in messages], [early, bot_plain, late, bot_kw])
+		self.assertEqual([m["name"] for m in messages], [early, bot_plain, late, bot_kw, last])
 		for message in messages:
 			self.assertEqual(set(message), THREAD_KEYS)
 			self.assertNotIn("@", message["author"])
 		self.assertEqual(messages[0]["text"], f"early {KEYWORD.upper()} human")
-		self.assertEqual(messages[0]["created_at"], "12-11-2026 10:02:00")
+		self.assertEqual(messages[0]["created_at"], frappe.utils.format_datetime("2026-11-12 10:02:00"))
+		self.assertRegex(messages[0]["created_at"], r"^\d{2}-\d{2}-\d{4} 10:02:00$")
 		self.assertEqual(messages[0]["author"], frappe.utils.get_fullname("Administrator"))
 
 	def test_thread_selects_nothing_for_humans_when_keyword_is_empty(self):
@@ -225,15 +229,16 @@ class TestTicketPanelThread(FrappeTestCase):
 			f'<a href="javascript:alert(3)">link</a> <b>{KEYWORD}</b> bold'
 		)
 		_add_comment(self.ticket, payload)
-		_add_comment(self.ticket, "<p>one</p><p>two</p>", AGENT_USER)
+		_add_comment(self.ticket, f"<p>one</p><p>two</p>{payload}", AGENT_USER)
 		xss, bot = self._messages()
 		# Markup that can run (img/a handlers, javascript: urls) is gone; whatever text is left (an escaped
 		# <script> literal) is inert because the page renders it with textContent only.
-		self.assertNotRegex(bot["text"], r"[<>]")
-		for tag in ("<img", "<a ", "</a", "<b>"):
-			self.assertNotIn(tag, xss["text"])
-		self.assertNotIn("onerror", xss["text"])
-		self.assertNotIn("javascript:", xss["text"])
-		self.assertIn("link", xss["text"])
-		self.assertEqual(xss["text"].split()[-3:], ["link", KEYWORD, "bold"])
-		self.assertEqual(bot["text"].split(), ["one", "two"])
+		for message in (xss, bot):
+			with self.subTest(is_bot=message["is_bot"]):
+				for tag in ("<img", "<a ", "</a", "<b>"):
+					self.assertNotIn(tag, message["text"])
+				self.assertNotIn("onerror", message["text"])
+				self.assertNotIn("javascript:", message["text"])
+				self.assertIn("link", message["text"])
+				self.assertEqual(message["text"].split()[-3:], ["link", KEYWORD, "bold"])
+		self.assertEqual(bot["text"].split()[:2], ["one", "two"])

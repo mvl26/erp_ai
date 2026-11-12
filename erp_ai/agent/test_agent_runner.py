@@ -6,7 +6,7 @@ import frappe
 from frappe.tests.utils import FrappeTestCase
 from helpdesk.test_utils import make_ticket
 
-from erp_ai.agent import authority, runner
+from erp_ai.agent import answer_delay, authority, runner
 from erp_ai.agent.classification import DEFAULT_CATEGORY_MAPPING
 from erp_ai.agent.prompts import TASK_COMMENT, TASK_NEW_TICKET, build_classify_request, build_reason_system
 from erp_ai.agent.run_log import write_entry
@@ -25,7 +25,13 @@ from erp_ai.constants import (
 	TITLE_WRONG_USER,
 )
 from erp_ai.gateway import GatewayError
-from erp_ai.test_utils import FakeGateway, add_credential, make_model_result, set_agent_settings
+from erp_ai.test_utils import (
+	FakeGateway,
+	add_credential,
+	make_model_result,
+	record_status_signals,
+	set_agent_settings,
+)
 
 PREFIX = "ERPAI-TEST-"
 CLASSIFY_A = json.dumps({"dau_muc": "A", "do_tin_cay": "Cao", "ly_do": "x"})
@@ -66,7 +72,15 @@ class RunnerTestBase(FrappeTestCase):
 			permission_level="L0",
 			max_runs_per_ticket_per_day=DAILY_LIMIT,
 			category_mapping=json.dumps(DEFAULT_CATEGORY_MAPPING),
+			answer_delay_min_s=0,
+			answer_delay_max_s=0,
 		)
+		# No status signal reaches Redis and no run sleeps for real (the delay is 0 here; a test that sets one reads `sleeps`).
+		self.signals = record_status_signals(self)
+		self.sleeps = []
+		sleep_patch = patch.object(answer_delay, "_sleep", side_effect=self.sleeps.append)
+		sleep_patch.start()
+		self.addCleanup(sleep_patch.stop)
 		self.gateway = FakeGateway(make_model_result(text=CLASSIFY_A))
 		gateway_patch = patch("erp_ai.gateway.call_model", self.gateway)
 		gateway_patch.start()

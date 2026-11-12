@@ -4,8 +4,10 @@ from collections import Counter
 import frappe
 
 from erp_ai import gateway
+from erp_ai.agent import policy, site_facts
 from erp_ai.agent.classification import DEFAULT_CATEGORY_MAPPING, load_mapping, parse_classification
 from erp_ai.agent.prompts import build_classify_request
+from erp_ai.agent.routing import decide_route, departments, load_routing_config
 from erp_ai.agent.runner import CLASSIFY_MAX_TOKENS
 from erp_ai.constants import CATEGORIES, SETTING_DOCTYPE
 
@@ -14,6 +16,9 @@ VERDICT_MID = "70\u201385%"
 VERDICT_LOW = "< 70%"
 THRESHOLD_HIGH = 0.85
 THRESHOLD_MID = 0.70
+SCORE_BINS = range(4)
+MAX_TOKENS_STOP = "max_tokens"
+PREDICTION_KEYS = ("category", "complexity", "importance", "priority", "agent_group")
 
 
 def _ratio(correct, count):
@@ -35,6 +40,26 @@ def _expected_category(ticket_type, mapping):
 		if (mapping.get(category) or {}).get("ticket_type") == ticket_type:
 			return category
 	return None
+
+
+def _match(rows, label_key, predicted_key):
+	"""Accuracy over rows that carry a label and a prediction; the others are left out."""
+	pairs = [
+		(row[label_key], row[predicted_key])
+		for row in rows
+		if row.get(label_key) and row.get(predicted_key) is not None
+	]
+	correct = sum(1 for label, predicted in pairs if label == predicted)
+	return {"count": len(pairs), "correct": correct, "accuracy": _ratio(correct, len(pairs))}
+
+
+def _score_distribution(rows, key):
+	counts = dict.fromkeys(SCORE_BINS, 0)
+	for row in rows:
+		value = row.get(key)
+		if type(value) is int and value in counts:
+			counts[value] += 1
+	return counts
 
 
 def compute_metrics(rows, mapping):
@@ -93,11 +118,29 @@ def compute_metrics(rows, mapping):
 		},
 		"verdict": _verdict(accuracy),
 		"skipped_unlabeled": skipped_unlabeled,
+		"priority": _match(rows, "priority", "predicted_priority"),
+		"team": _match(rows, "agent_group", "predicted_agent_group"),
+		"score_distribution": {
+			"complexity": _score_distribution(rows, "predicted_complexity"),
+			"importance": _score_distribution(rows, "predicted_importance"),
+		},
+		"classify_output_tokens_max": max(
+			(row["output_tokens"] for row in rows if isinstance(row.get("output_tokens"), int)), default=0
+		),
+		"classify_max_tokens_hits": sum(1 for row in rows if row.get("stop_reason") == MAX_TOKENS_STOP),
 	}
 
 
 def _pct(value):
 	return f"{value * 100:.1f}%"
+
+
+def _match_line(title, cell):
+	return f"{title}: {_pct(cell['accuracy'])} ({cell['correct']}/{cell['count']})"
+
+
+def _distribution_line(title, counts):
+	return f"{title}: " + " ".join(f"{score}:{n}" for score, n in counts.items())
 
 
 def format_report(metrics):
@@ -115,7 +158,15 @@ def format_report(metrics):
 	for expected, row in metrics["confusion"].items():
 		lines.append(f"  {expected}  " + " ".join(f"{row[c]:>3}" for c in CATEGORIES))
 	non_top = metrics["non_top_owner"]
+	distribution = metrics["score_distribution"]
 	lines += [
+		"",
+		_match_line("Priority match", metrics["priority"]),
+		_match_line("Team match", metrics["team"]),
+		_distribution_line("Complexity distribution", distribution["complexity"]),
+		_distribution_line("Importance distribution", distribution["importance"]),
+		f"Classify output tokens max: {metrics['classify_output_tokens_max']}",
+		f"Classify max_tokens hits: {metrics['classify_max_tokens_hits']}",
 		"",
 		f"Top author: {metrics['top_owner']}",
 		f"Tickets by other authors: {_pct(non_top['accuracy'])} ({non_top['correct']}/{non_top['count']})",
@@ -125,21 +176,42 @@ def format_report(metrics):
 	return "\n".join(lines)
 
 
-def _predict(row):
-	"""Category the runner's classify step would give this ticket; None when it cannot classify."""
+def _predict(row, routing, mapping):
+	"""What the runner's classify and route steps would give this ticket; None values when it cannot classify."""
+	prediction = dict.fromkeys((*PREDICTION_KEYS, "output_tokens", "stop_reason"))
 	try:
 		result = gateway.call_model(
 			"classify",
-			**build_classify_request(row.get("subject"), row.get("description")),
+			**build_classify_request(row.get("subject"), row.get("description"), departments(routing)),
 			max_tokens=CLASSIFY_MAX_TOKENS,
 		)
 	except gateway.GatewayError as exc:
 		frappe.logger("erp_ai").warning(
 			f"eval: classify failed line {row.get('_line')} kind={exc.kind} status={exc.status}"
 		)
-		return None
+		return prediction
+	# The call was made and paid for: its tokens and stop reason count even when the text is unreadable.
+	prediction.update(output_tokens=(result.usage or {}).get("output_tokens"), stop_reason=result.stop_reason)
 	classification = parse_classification(result.text)
-	return classification.category if classification else None
+	if classification is None:
+		return prediction
+	decision = decide_route(
+		classification,
+		row.get("subject"),
+		mapping,
+		routing,
+		team_exists=site_facts.team_exists,
+		is_excluded_team=policy.is_excluded_team,
+		is_active_agent=site_facts.is_active_agent,
+	)
+	prediction.update(
+		category=classification.category,
+		complexity=classification.complexity,
+		importance=classification.importance,
+		priority=decision.priority,
+		agent_group=decision.agent_group,
+	)
+	return prediction
 
 
 def run(path):
@@ -158,12 +230,17 @@ def run(path):
 				raise ValueError(f"{path}: line {line_number}: invalid JSON ({exc.msg})") from exc
 			row["_line"] = line_number
 			rows.append(row)
-	for row in rows:
-		if not row.get("predicted_category"):
-			row["predicted_category"] = _predict(row)
 	mapping = load_mapping(frappe.db.get_single_value(SETTING_DOCTYPE, "category_mapping")) or (
 		DEFAULT_CATEGORY_MAPPING
 	)
+	routing = load_routing_config(frappe.db.get_single_value(SETTING_DOCTYPE, "routing_rules"))
+	for row in rows:
+		if not row.get("predicted_category"):
+			prediction = _predict(row, routing, mapping)
+			for key in PREDICTION_KEYS:
+				row[f"predicted_{key}"] = prediction[key]
+			row["output_tokens"] = prediction["output_tokens"]
+			row["stop_reason"] = prediction["stop_reason"]
 	metrics = compute_metrics(rows, mapping)
 	print(format_report(metrics))
 	return metrics

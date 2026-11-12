@@ -19,6 +19,9 @@ AI_FIELDS = (
 	"ai_section",
 	"ai_resolution_hint",
 	"ai_confidence",
+	"ai_complexity",
+	"ai_importance",
+	"ai_score_reason",
 	"ai_classified_by",
 	"ai_updated_at",
 	"ai_opt_out",
@@ -84,7 +87,7 @@ class TestInstall(FrappeTestCase):
 		self.assertEqual(_counts(), before)
 		self.assertEqual(before["roles"], 2)
 		self.assertEqual(before["users"], 1)
-		self.assertEqual(before["ai_fields"], 6)
+		self.assertEqual(before["ai_fields"], 9)
 
 	def test_ai_fields_permlevel_8_and_template_rows_agents_only(self):
 		for name in AI_FIELDS:
@@ -107,7 +110,7 @@ class TestInstall(FrappeTestCase):
 			fields=["fieldname", "visible_to", "required", "editable_after_creation"],
 		)
 		self.assertEqual({r.fieldname for r in rows}, set(AI_FIELDS) - {"ai_section"})
-		self.assertEqual(len(rows), 5)
+		self.assertEqual(len(rows), 8)
 		for row in rows:
 			self.assertEqual(row.visible_to, "Agents")
 			self.assertEqual(row.required, 0)
@@ -135,7 +138,7 @@ class TestInstall(FrappeTestCase):
 			fields=["name", "idx", "fieldname", "required", "visible_to", "editable_after_creation"],
 			order_by="idx",
 		)
-		self.assertEqual(len(rows), 6)
+		self.assertEqual(len(rows), 9)
 		first = rows[0]
 		self.assertEqual(
 			(
@@ -148,10 +151,19 @@ class TestInstall(FrappeTestCase):
 			),
 			("erp-ai-t12-keep", 1, "priority", 1, "Everyone", 1),
 		)
-		self.assertEqual([r.idx for r in rows], [1, 2, 3, 4, 5, 6])
+		self.assertEqual([r.idx for r in rows], [1, 2, 3, 4, 5, 6, 7, 8, 9])
 		self.assertEqual(
 			[r.fieldname for r in rows[1:]],
-			["ai_resolution_hint", "ai_confidence", "ai_classified_by", "ai_updated_at", "ai_opt_out"],
+			[
+				"ai_resolution_hint",
+				"ai_confidence",
+				"ai_complexity",
+				"ai_importance",
+				"ai_score_reason",
+				"ai_classified_by",
+				"ai_updated_at",
+				"ai_opt_out",
+			],
 		)
 		for row in rows[1:]:
 			self.assertEqual(row.visible_to, "Agents", row.fieldname)

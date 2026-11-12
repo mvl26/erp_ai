@@ -133,6 +133,26 @@ def _ai_field_specs() -> list[dict]:
 			"read_only": 1,
 		},
 		{
+			"fieldname": "ai_complexity",
+			"label": "Độ phức tạp (AI)",
+			"fieldtype": "Int",
+			"default": "0",
+			"read_only": 1,
+		},
+		{
+			"fieldname": "ai_importance",
+			"label": "Độ quan trọng (AI)",
+			"fieldtype": "Int",
+			"default": "0",
+			"read_only": 1,
+		},
+		{
+			"fieldname": "ai_score_reason",
+			"label": "Lý do chấm điểm (AI)",
+			"fieldtype": "Small Text",
+			"read_only": 1,
+		},
+		{
 			"fieldname": "ai_classified_by",
 			"label": "Phân loại bởi",
 			"fieldtype": "Select",

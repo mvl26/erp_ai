@@ -33,6 +33,10 @@ class Classification:
 	priority: str | None = None
 	needs_split: bool = False
 	requests: list = field(default_factory=list)
+	complexity: int = 0
+	importance: int = 0
+	score_reason: str = ""
+	department: str | None = None
 
 
 def _load_json_object(text):
@@ -65,6 +69,10 @@ def parse_classification(text: str) -> Classification | None:
 	team = data.get("nhom")
 	priority = data.get("uu_tien")
 	requests = data.get("cac_yeu_cau")
+	complexity = data.get("do_phuc_tap")
+	importance = data.get("do_quan_trong")
+	score_reason = data.get("ly_do_diem")
+	department = data.get("bo_phan")
 	return Classification(
 		category=category,
 		confidence=confidence,
@@ -73,6 +81,10 @@ def parse_classification(text: str) -> Classification | None:
 		priority=priority if isinstance(priority, str) and priority in PRIORITIES else None,
 		needs_split=data.get("can_tach") is True,
 		requests=[r for r in requests if isinstance(r, str)] if isinstance(requests, list) else [],
+		complexity=complexity if type(complexity) is int else 0,
+		importance=importance if type(importance) is int else 0,
+		score_reason=score_reason if isinstance(score_reason, str) else "",
+		department=department if isinstance(department, str) else None,
 	)
 
 

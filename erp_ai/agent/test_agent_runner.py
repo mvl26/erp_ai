@@ -505,11 +505,19 @@ class TestRunnerL1Classification(RunnerTestBase):
 		self.assertEqual(json.loads(entry.value_before)["ticket_type"], before.ticket_type)
 		self.assertEqual(
 			json.loads(entry.value_after),
-			{"ticket_type": L1_TYPE, "agent_group": L1_TEAM, "priority": "High", "ai_confidence": "Cao"},
+			{
+				"ticket_type": L1_TYPE,
+				"agent_group": L1_TEAM,
+				"priority": "High",
+				"ai_confidence": "Cao",
+				"ai_complexity": 0,
+				"ai_importance": 0,
+				"ai_score_reason": "",
+			},
 		)
 		self.assertEqual(
 			json.loads(entry.actions),
-			[{"tool": "set_classification", "doctype": "HD Ticket", "name": self.ticket.name, "ok": True}],
+			[{"tool": "apply_route", "doctype": "HD Ticket", "name": self.ticket.name, "ok": True}],
 		)
 		self.assertEqual((entry.predicted_category, entry.predicted_confidence), ("A", "Cao"))
 		self.assertFalse(entry.skipped_fields)
@@ -526,17 +534,27 @@ class TestRunnerL1Classification(RunnerTestBase):
 		self.assertFalse(entry.actions)
 		self.assertFalse(entry.skipped_fields)
 
-	def test_l1_empty_after_keeps_applied_zero(self):
+	def test_l1_empty_route_still_saves_ai_fields_applied_one(self):
 		unknown = {"A": {"ticket_type": f"{PREFIX}không-có", "agent_group": "", "priority": ""}}
 		set_agent_settings(category_mapping=json.dumps(unknown))
 		before = self._ticket_row()
 		self._run()
 
-		self.assertEqual(self._ticket_row(), before)
+		# ADR-020 QĐ 1, QĐ 6: the ticket is always saved with the AI fields, even when no route value applies.
+		self.assertEqual(
+			self._ticket_row(),
+			{**before, "ai_confidence": "Cao", "ai_classified_by": CLASSIFIED_BY_AI},
+		)
 		entry = self._single_entry()
-		self.assertEqual(entry.applied, 0)
-		self.assertFalse(entry.value_after)
-		self.assertFalse(entry.actions)
+		self.assertEqual(entry.applied, 1)
+		self.assertEqual(
+			json.loads(entry.value_after),
+			{"ai_confidence": "Cao", "ai_complexity": 0, "ai_importance": 0, "ai_score_reason": ""},
+		)
+		self.assertEqual(
+			json.loads(entry.actions),
+			[{"tool": "apply_route", "doctype": "HD Ticket", "name": self.ticket.name, "ok": True}],
+		)
 		skipped = json.loads(entry.skipped_fields)
 		self.assertIn("ticket_type", [item["field"] for item in skipped])
 
@@ -557,16 +575,27 @@ class TestRunnerL1Classification(RunnerTestBase):
 			[{"field": "ticket_type", "reason": "giá trị không tồn tại trên hệ thống"}],
 		)
 
-	def test_l1_all_fields_skipped_reasons_logged_applied_zero(self):
+	def test_l1_all_fields_skipped_reasons_logged_saves_ai_fields_applied_one(self):
 		unknown = {"A": {"ticket_type": f"{PREFIX}không-có", "agent_group": "", "priority": ""}}
 		set_agent_settings(category_mapping=json.dumps(unknown))
 		before = self._ticket_row()
 		self._run()
 
-		self.assertEqual(self._ticket_row(), before)
+		# ADR-020 QĐ 1, QĐ 6: the ticket is always saved with the AI fields; no route field changes.
+		self.assertEqual(
+			self._ticket_row(),
+			{**before, "ai_confidence": "Cao", "ai_classified_by": CLASSIFIED_BY_AI},
+		)
 		entry = self._single_entry()
-		self.assertEqual(entry.applied, 0)
-		self.assertFalse(entry.value_after or entry.actions)
+		self.assertEqual(entry.applied, 1)
+		self.assertEqual(
+			set(json.loads(entry.value_after)),
+			{"ai_confidence", "ai_complexity", "ai_importance", "ai_score_reason"},
+		)
+		self.assertEqual(
+			json.loads(entry.actions),
+			[{"tool": "apply_route", "doctype": "HD Ticket", "name": self.ticket.name, "ok": True}],
+		)
 		self.assertEqual(
 			json.loads(entry.skipped_fields),
 			[
@@ -599,7 +628,7 @@ class TestRunnerL1Classification(RunnerTestBase):
 
 	def test_not_ok_result_with_after_is_not_applied(self):
 		failed = {"ok": False, "reason": "x", "before": {}, "after": {"priority": "High"}}
-		with patch.object(runner, "execute_tool", return_value=failed):
+		with patch.object(runner, "apply_route", return_value=failed):
 			self._run()
 
 		self.assertEqual(self._single_entry().applied, 0)
@@ -944,8 +973,13 @@ class TestRunnerReasoning(RunnerTestBase):
 			contexts.append(context)
 			return {"ok": True}
 
+		def spy_route(decision, classification, context):
+			contexts.append(context)
+			return {"ok": True}
+
 		with (
 			patch.object(runner, "execute_tool", side_effect=spy),
+			patch.object(runner, "apply_route", side_effect=spy_route),
 			patch.object(runner, "ToolContext", wraps=runner.ToolContext) as make_context,
 		):
 			self._run()

@@ -94,6 +94,24 @@ class TestPolicy(FrappeTestCase):
 		set_agent_settings(excluded_teams="\n  \n")
 		self.assertTrue(policy.can_send_ticket(self._ticket(agent_group=TEAM)))
 
+	def test_is_excluded_team_same_normalization(self):
+		set_agent_settings(excluded_teams="  nhân  sự &   HÀNH chính \n\nIT  Support")
+		self.assertTrue(policy.is_excluded_team(TEAM))
+		self.assertTrue(policy.is_excluded_team("  NHÂN sự & hành   CHÍNH "))
+		self.assertTrue(policy.is_excluded_team("it support"))
+		self.assertFalse(policy.is_excluded_team("IT"))
+		self.assertFalse(policy.is_excluded_team(""))
+		self.assertFalse(policy.is_excluded_team(None))
+		set_agent_settings(excluded_teams="\n  \n")
+		self.assertFalse(policy.is_excluded_team(TEAM))
+
+	def test_auto_assign_enabled_reads_switch(self):
+		self.assertTrue(policy.auto_assign_enabled(frappe._dict(auto_assign_enabled=1)))
+		self.assertFalse(policy.auto_assign_enabled(frappe._dict(auto_assign_enabled=0)))
+		self.assertFalse(policy.auto_assign_enabled(frappe._dict(auto_assign_enabled=None)))
+		self.assertFalse(policy.auto_assign_enabled(frappe._dict()))
+		self.assertFalse(policy.auto_assign_enabled(object()))
+
 	def test_missing_ticket_cannot_send(self):
 		self.assertFalse(policy.can_send_ticket("T20-NOT-A-TICKET"))
 

@@ -31,11 +31,21 @@ def can_send_ticket(ticket) -> bool:
 		values = {field: ticket.get(field) for field in SEND_POLICY_FIELDS}
 	if values.get(OPT_OUT_FIELD):
 		return False
-	team = _normalize(values.get(TEAM_FIELD))
+	return not is_excluded_team(values.get(TEAM_FIELD))
+
+
+def is_excluded_team(team) -> bool:
+	"""True when the team is listed in excluded_teams (same normalization as can_send_ticket)."""
+	team = _normalize(team)
 	if not team:
-		return True
+		return False
 	excluded = frappe.db.get_single_value(SETTING_DOCTYPE, EXCLUDED_TEAMS_FIELD) or ""
-	return team not in {_normalize(line) for line in excluded.splitlines()}
+	return team in {_normalize(line) for line in excluded.splitlines()}
+
+
+def auto_assign_enabled(settings) -> bool:
+	"""The only reader of the auto-assign switch; missing or 0 means off."""
+	return bool(getattr(settings, "auto_assign_enabled", 0))
 
 
 def contains_keyword(content) -> bool:

@@ -22,6 +22,7 @@ TRIGGER_TICKET_INSERT = "ticket_insert"
 TRIGGER_COMMENT_MENTION = "comment_mention"
 
 JOB_TIMEOUT_S = 600
+ANSWER_DELAY_MAX_S = 30
 JOB_SAFETY_MARGIN_S = 60
 PROBE_TIMEOUT_S = 10
 
@@ -31,5 +32,8 @@ TITLE_WRONG_USER = "erp_ai: sai tài khoản job"
 TITLE_RUN_FAILED = "erp_ai: lần chạy lỗi"
 TITLE_ALARM = "erp_ai: CẢNH BÁO"
 TITLE_NOTICE = "erp_ai: thông báo"
+TITLE_STATUS_FAILED = "erp_ai: chỉ báo trạng thái lỗi"
+
+AGENT_STATUS_EVENT = "erp_ai:agent_status"
 
 LOGGER_NAME = "erp_ai"

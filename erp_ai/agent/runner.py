@@ -10,6 +10,7 @@ from erp_ai.agent import authority, policy
 from erp_ai.agent.classification import load_mapping, parse_classification, resolve_ticket_values
 from erp_ai.agent.prompts import build_classify_request, build_initial_message, build_reason_system
 from erp_ai.agent.run_log import write_entry
+from erp_ai.agent.run_status import RunStatus
 from erp_ai.agent.tools.read import TOOL_RESULT_MAX_CHARS
 from erp_ai.agent.tools.registry import ToolContext, execute_tool, get_tool_schemas
 from erp_ai.constants import (
@@ -99,25 +100,30 @@ def _run(ticket_name, trigger):
 	if trigger == TRIGGER_COMMENT_MENTION and level == LEVELS[0]:
 		_log_skip(ticket_name, trigger, run_id, "level_L0")
 		return
-	mapping = load_mapping(settings.category_mapping)
-	# One context for the whole run (classification and reasoning); never built at L0, which calls no tool.
-	context = None
-	if level != LEVELS[0]:
-		context = ToolContext(
-			ticket_name=ticket_name,
-			effective_level=level,
-			instructor=authority.latest_instructor(ticket_name),
-			run_id=run_id,
-			category_mapping=mapping,
-			agent_user=AGENT_USER,
-		)
-	classification = None
-	if trigger == TRIGGER_TICKET_INSERT:
-		proceed, classification = _classify(ticket_name, trigger, run_id, mapping, context, deadline)
-		if not proceed:
-			return
-	if level != LEVELS[0]:
-		_reason(ticket_name, trigger, run_id, settings, context, classification, deadline)
+	status = RunStatus(ticket_name, run_id, settings.get("thinking_text"))
+	try:
+		status.start()
+		mapping = load_mapping(settings.category_mapping)
+		# One context for the whole run (classification and reasoning); never built at L0, which calls no tool.
+		context = None
+		if level != LEVELS[0]:
+			context = ToolContext(
+				ticket_name=ticket_name,
+				effective_level=level,
+				instructor=authority.latest_instructor(ticket_name),
+				run_id=run_id,
+				category_mapping=mapping,
+				agent_user=AGENT_USER,
+			)
+		classification = None
+		if trigger == TRIGGER_TICKET_INSERT:
+			proceed, classification = _classify(ticket_name, trigger, run_id, mapping, context, deadline)
+			if not proceed:
+				return
+		if level != LEVELS[0]:
+			_reason(ticket_name, trigger, run_id, settings, context, classification, deadline, status)
+	finally:
+		status.done()
 
 
 def _log_skip(ticket_name, trigger, run_id, stop_reason):
@@ -236,7 +242,7 @@ def _apply_classification(log_name, classification, context):
 		frappe.db.commit()
 
 
-def _reason(ticket_name, trigger, run_id, settings, context, classification, deadline):
+def _reason(ticket_name, trigger, run_id, settings, context, classification, deadline, status):
 	"""Reasoning step (design 4.3 step 8): at most `max_turns_per_run` model turns, one `reason` entry each."""
 	comments = authority.fetch_ticket_comments(ticket_name)
 	# the role is decided on the owner; only then is the author replaced by the full name shown to the model
@@ -264,6 +270,7 @@ def _reason(ticket_name, trigger, run_id, settings, context, classification, dea
 	}
 	max_turns = settings.max_turns_per_run
 	for turn in range(1, max_turns + 1):
+		status.thinking()
 		try:
 			result = _call_model(
 				"reason",

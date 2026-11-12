@@ -11,6 +11,7 @@ Mỗi task 2–5 phút. Hai task chung file thì phụ thuộc nhau. Đánh dấ
 `cmd.test_one` = lệnh của profile với `{file}` là file ở `test:`. Mọi task: viết test đỏ trước (STD-TEST-1), chỉ sửa trong `files:`. Tên hàm, hằng, chuỗi chính xác: `plan.md` mục Ràng buộc chung và `design.md` mục 3.
 
 Tiến độ: BASE ghi ở đây trước mỗi lần gọi dev.
+- BASE T1=3dd7358 · BASE T3=3dd7358
 
 ## Phần 2, walking skeleton (T1 rồi T2; không task phần 2 nào khác bắt đầu trước khi review T2 là approve)
 

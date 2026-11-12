@@ -390,6 +390,16 @@ class TestRoutingConfig(FrappeTestCase):
 			c["departments"]["Kế toán"] = "x"
 
 		cases = (
+			(
+				"assignees prefixes not object",
+				_bad(_set("assignees", "A", "prefixes", [])),
+				"assignees.A phải là object",
+			),
+			(
+				"assignees default missing",
+				_bad(_set("assignees", "A", {"prefixes": {}})),
+				"assignees.A phải là object",
+			),
 			("assignees entry shape", _bad(_set("assignees", "A", "x")), "assignees.A phải là object"),
 			("assignees root list", _bad(_set("assignees", [])), "assignees phải là object"),
 			("departments root list", _bad(_set("departments", [])), "departments phải là object"),
@@ -401,7 +411,7 @@ class TestRoutingConfig(FrappeTestCase):
 			(
 				"importance root list",
 				_bad(_set("importance_priority", ["1", "2", "3"])),
-				"importance_priority",
+				"importance_priority phải có đúng các khóa 1, 2, 3",
 			),
 			("sla root list", _bad(_set("expected_sla", [])), "expected_sla phải là object"),
 			("sla unknown category", _bad(_set("expected_sla", "G", {})), "expected_sla.G"),
@@ -448,6 +458,8 @@ class TestRoutingConfig(FrappeTestCase):
 			c["assignees"]["D"] = {"default": "", "prefixes": {}}
 
 		nested_junk = (
+			_bad(_set("assignees", "A", "prefixes", [])),
+			_bad(_set("assignees", "A", {"prefixes": {}})),
 			_bad(_set("assignees", "A", "x")),
 			_bad(_set("assignees", [])),
 			_bad(_set("departments", [])),

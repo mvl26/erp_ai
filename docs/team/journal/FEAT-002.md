@@ -19,3 +19,4 @@ Approved-by:
 - 2026-11-12 build T5+T9 (tiếp tục sau nén ngữ cảnh) | dev + reviewer | T5 approve vòng 3 (merge 06132f0), T9 approve vòng 2 (merge 8d61533); tick sau khi đọc review-05/09 | D-6: design D-13 mâu thuẫn 3.6 (cảnh báo khi gỡ), code theo 3.6, deferred review-09 | full suite cuối chạy sau T10 trên cây đã merge
 - 2026-11-12 build T6 | dev×2 (lần 2 sau khi gỡ worktree cũ giữ nhánh), reviewer×2 | approve vòng 2 (2 major STD-TEST-2 đã sửa), merge fc9f072 | D-7: full suite vòng 1 Ran 563 failures=16 errors=3 (giống nền), Comment +20 cần so lại ở full suite cuối
 - 2026-11-12 build T7 | dev×2, reviewer×2 | approve vòng 2 (1 major STD-TEST-2: 5 chỗ nối mảnh lỗi D-9), merge 533f93f; mã sản phẩm không đổi, chỉ test
+- 2026-11-12 build T10 | dev×3, reviewer×3 | approve vòng 3 (max_rework=3, không lặp lỗi cũ: mỗi vòng một lỗ hổng bộ quét khác), merge 8231347; chỉ sửa test_architecture.py

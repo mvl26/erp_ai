@@ -72,13 +72,15 @@ class TestTicketPanelRead(FrappeTestCase):
 		return ticket_panel.get_panel_data(ticket or self.ticket.name)
 
 	def test_methods_whitelisted_post_without_guest(self):
-		method = PANEL_METHODS[0]
-		self.assertEqual(method, "erp_ai.ticket_panel.get_panel_data")
-		self.assertIn("erp_ai.ticket_panel.send_message", PANEL_METHODS)
-		fn = frappe.get_attr(method)
-		self.assertIn(fn, frappe.whitelisted)
-		self.assertEqual(frappe.allowed_http_methods_for_whitelisted_func[fn], ["POST"])
-		self.assertNotIn(fn, frappe.guest_methods)
+		self.assertEqual(
+			PANEL_METHODS, ("erp_ai.ticket_panel.get_panel_data", "erp_ai.ticket_panel.send_message")
+		)
+		for method in PANEL_METHODS:
+			with self.subTest(method=method):
+				fn = frappe.get_attr(method)
+				self.assertIn(fn, frappe.whitelisted)
+				self.assertEqual(frappe.allowed_http_methods_for_whitelisted_func[fn], ["POST"])
+				self.assertNotIn(fn, frappe.guest_methods)
 
 	def test_read_returns_ai_fields_as_stored_text(self):
 		frappe.db.set_value(
@@ -344,3 +346,126 @@ class TestTicketPanelReadOnly(FrappeTestCase):
 		logged = str(logger.mock_calls)
 		for leak in ("secret", KEYWORD, WEBSITE_EMAIL, NO_READ_EMAIL):
 			self.assertNotIn(leak, logged)
+
+
+class TestTicketPanelSend(FrappeTestCase):
+	"""AC-9, AC-13 (send): input checks, content building, one Comment owned by the sender."""
+
+	KEYWORD = "!hoibot"
+
+	def setUp(self):
+		self.addCleanup(frappe.db.rollback)
+		self.addCleanup(frappe.set_user, "Administrator")
+		frappe.set_user("Administrator")
+		create_agent(AGENT_EMAIL)
+		set_agent_settings(trigger_keyword=self.KEYWORD)
+		self.ticket = make_ticket(subject="Panel send ticket").name
+		# The Comment handler (FEAT-001) is not under test here: keep it from queueing a job.
+		enqueue = patch.object(frappe, "enqueue")
+		enqueue.start()
+		self.addCleanup(enqueue.stop)
+
+	def _send(self, text, user=AGENT_EMAIL, ticket=None):
+		frappe.set_user(user)
+		return ticket_panel.send_message(ticket or self.ticket, text)
+
+	def _content(self, result):
+		return frappe.db.get_value("Comment", result["comment"], "content")
+
+	def _comment_count(self):
+		return frappe.db.count("Comment", {"reference_doctype": "HD Ticket", "reference_name": self.ticket})
+
+	def test_send_empty_or_whitespace_is_rejected(self):
+		for text in ("", "   ", "\n\t \n"):
+			with self.subTest(text=text), self.assertRaises(frappe.ValidationError):
+				self._send(text)
+		# Frappe's own annotation check turns a wrong type away before the function body runs.
+		for text in (None, 5):
+			with self.subTest(text=text), self.assertRaises(frappe.FrappeTypeError):
+				self._send(text)
+		self.assertEqual(self._comment_count(), 0)
+
+	def test_send_length_boundary(self):
+		self.assertIn("comment", self._send("a" * 2000))
+		# The limit counts the text after strip().
+		self.assertIn("comment", self._send("  " + "a" * 2000 + "  "))
+		with self.assertRaises(frappe.ValidationError):
+			self._send("a" * 2001)
+		self.assertEqual(self._comment_count(), 2)
+
+	def test_send_appends_configured_keyword_when_missing(self):
+		self.assertEqual(self._content(self._send("Hello there")), f"<p>Hello there {self.KEYWORD}</p>")
+
+	def test_send_keeps_text_when_keyword_present_other_case(self):
+		self.assertEqual(
+			self._content(self._send(f"Hi {self.KEYWORD.upper()} please")),
+			f"<p>Hi {self.KEYWORD.upper()} please</p>",
+		)
+
+	def test_send_escapes_html(self):
+		# <b> is an allowed tag: only our own escaping keeps it from being stored as markup.
+		result = self._send("<b>x</b> & y")
+		self.assertEqual(self._content(result), f"<p>&lt;b&gt;x&lt;/b&gt; &amp; y {self.KEYWORD}</p>")
+		frappe.set_user(AGENT_EMAIL)
+		texts = [m["text"] for m in ticket_panel.get_panel_data(self.ticket)["messages"]]
+		self.assertEqual(texts, [f"<b>x</b> & y {self.KEYWORD}"])
+
+	def test_send_multiline_keeps_line_breaks(self):
+		content = self._content(self._send("one\ntwo\r\nthree"))
+		self.assertEqual(content, f"<p>one<br>two<br>three {self.KEYWORD}</p>")
+
+	def test_send_creates_one_comment_owned_by_sender(self):
+		result = self._send("Question")
+		self.assertEqual(list(result), ["comment"])
+		self.assertEqual(self._comment_count(), 1)
+		values = frappe.db.get_value(
+			"Comment", result["comment"], ["owner", "comment_type", "comment_email"], as_dict=True
+		)
+		self.assertEqual(values.owner, AGENT_EMAIL)
+		self.assertNotEqual(values.owner, AGENT_USER)
+		self.assertEqual(values.comment_type, "Comment")
+		self.assertEqual(values.comment_email, AGENT_EMAIL)
+
+	def test_send_with_empty_keyword_creates_comment_without_keyword(self):
+		set_agent_settings(trigger_keyword="")
+		self.assertEqual(self._content(self._send("No keyword")), "<p>No keyword</p>")
+		self.assertEqual(self._comment_count(), 1)
+
+	def test_send_calls_new_comment_once_with_built_content(self):
+		with patch("helpdesk.helpdesk.doctype.hd_ticket.hd_ticket.HDTicket.new_comment") as new_comment:
+			new_comment.return_value = "COMMENT-1"
+			self.assertEqual(self._send("Hi"), {"comment": "COMMENT-1"})
+		new_comment.assert_called_once_with(f"<p>Hi {self.KEYWORD}</p>")
+
+	def test_send_denied_for_same_accounts_creates_nothing(self):
+		_make_user(WEBSITE_EMAIL)
+		frappe.set_user("Administrator")
+		create_agent(NO_READ_EMAIL)
+		frappe.get_doc("User", NO_READ_EMAIL).remove_roles("Agent", "Agent Manager")
+		create_agent(INACTIVE_EMAIL)
+		frappe.db.set_value("HD Agent", INACTIVE_EMAIL, "is_active", 0)
+		_make_user(CUSTOMER_EMAIL)
+		frappe.get_doc("User", CUSTOMER_EMAIL).add_roles("HD Customer")
+		own = make_ticket(subject="Customer own ticket", raised_by=CUSTOMER_EMAIL).name
+		frappe.set_user(NO_READ_EMAIL)
+		self.assertTrue(is_agent())
+		self.assertFalse(frappe.has_permission("HD Ticket", "read", doc=self.ticket))
+		frappe.set_user(CUSTOMER_EMAIL)
+		self.assertFalse(is_agent())
+		self.assertTrue(frappe.has_permission("HD Ticket", "read", doc=own))
+		with self.assertRaises(frappe.PermissionError):
+			ticket_panel.send_message(own, "Hi")
+		for user in (WEBSITE_EMAIL, "Guest", NO_READ_EMAIL, INACTIVE_EMAIL):
+			with self.subTest(user=user), self.assertRaises(frappe.PermissionError):
+				self._send("Hi", user=user)
+		with self.assertRaises(frappe.PermissionError):
+			self._send("Hi", ticket="999999999")
+		self.assertEqual(self._comment_count(), 0)
+		self.assertEqual(frappe.db.count("Comment", {"reference_name": own}), 0)
+
+	def test_send_denied_for_agent_user(self):
+		frappe.set_user("Administrator")
+		create_agent(AGENT_USER)
+		with self.assertRaises(frappe.PermissionError):
+			self._send("Hi", user=AGENT_USER)
+		self.assertEqual(self._comment_count(), 0)

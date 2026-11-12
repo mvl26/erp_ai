@@ -17,6 +17,7 @@ class ToolContext:
 	run_id: str
 	category_mapping: dict
 	agent_user: str
+	routing_config: dict | None = None
 
 
 @dataclass(frozen=True)

@@ -6,6 +6,9 @@ from frappe.tests.utils import FrappeTestCase
 from frappe.utils import now_datetime
 from helpdesk.test_utils import create_agent, make_ticket
 
+from erp_ai.agent import policy, site_facts
+from erp_ai.agent.classification import Classification
+from erp_ai.agent.routing import decide_route
 from erp_ai.agent.tools import registry, write_ticket
 from erp_ai.agent.tools.registry import ToolContext, execute_tool
 from erp_ai.constants import AGENT_USER, CLASSIFIED_BY_AI, CLASSIFIED_BY_HUMAN, ROLE_AGENT
@@ -534,3 +537,70 @@ class TestCreateTask(FrappeTestCase):
 		result = write_ticket.create_task({"subject": "ERPAI-TEST-T16 việc", "description": "mô tả"}, ctx)
 		self.assertTrue(result["ok"], result)
 		self.assertEqual(frappe.db.get_value("Task", result["task"], "ai_ticket"), self.ticket)
+
+
+class TestSetClassification(FrappeTestCase):
+	def setUp(self):
+		commit_guard = patch.object(frappe.db, "commit", side_effect=AssertionError("commit in test"))
+		commit_guard.start()
+		self.addCleanup(commit_guard.stop)
+		self.addCleanup(frappe.cache.hdel, "assignment_rule_map", "HD Ticket")
+		self.addCleanup(frappe.db.rollback)
+		self.addCleanup(frappe.set_user, "Administrator")
+		frappe.set_user("Administrator")
+		create_agent(AGENT)
+		_make_user(CUSTOMER, "HD Customer")
+		if not frappe.db.exists("HD Ticket Type", TICKET_TYPE):
+			frappe.get_doc({"doctype": "HD Ticket Type", "name": TICKET_TYPE}).insert()
+		if not frappe.db.exists("HD Team", TEAM):
+			frappe.get_doc({"doctype": "HD Team", "team_name": TEAM, "users": [{"user": AGENT}]}).insert()
+		self.ticket = make_ticket(subject="T17 phiếu", raised_by=CUSTOMER).name
+
+	def _ctx(self, mapping, routing_config=None):
+		return ToolContext(
+			ticket_name=self.ticket,
+			effective_level="L1",
+			instructor=None,
+			run_id="run-t17",
+			category_mapping=mapping,
+			agent_user=AGENT_USER,
+			routing_config=routing_config,
+		)
+
+	def _row(self):
+		return frappe.db.get_value(
+			"HD Ticket", self.ticket, ["ticket_type", "agent_group", "priority"], as_dict=True
+		)
+
+	def test_same_priority_as_route(self):
+		mapping = {"A": {"ticket_type": TICKET_TYPE, "agent_group": TEAM, "priority": "Medium"}}
+		config = {"importance_priority": {"2": "Urgent"}}
+		frappe.db.set_value("HD Ticket", self.ticket, {"ai_complexity": 1, "ai_importance": 2})
+		expected = decide_route(
+			Classification("A", "Cao", complexity=1, importance=2),
+			"T17 phiếu",
+			mapping,
+			config,
+			team_exists=site_facts.team_exists,
+			is_excluded_team=policy.is_excluded_team,
+			is_active_agent=site_facts.is_active_agent,
+		)
+		self.assertEqual(expected.priority, "Urgent")
+		frappe.set_user(AGENT)
+		result = write_ticket.set_classification(
+			{"category": "A", "confidence": "Cao"}, self._ctx(mapping, config)
+		)
+		self.assertTrue(result["ok"], result)
+		self.assertEqual(self._row().priority, expected.priority)
+		self.assertEqual(result["after"]["priority"], expected.priority)
+
+	def test_de_skips_team_without_department(self):
+		mapping = {"D": {"ticket_type": TICKET_TYPE, "agent_group": TEAM, "priority": "High"}}
+		before = self._row()
+		frappe.set_user(AGENT)
+		result = write_ticket.set_classification({"category": "D", "confidence": "Cao"}, self._ctx(mapping))
+		self.assertTrue(result["ok"], result)
+		row = self._row()
+		self.assertEqual(row.agent_group, before.agent_group)
+		self.assertEqual((row.ticket_type, row.priority), (TICKET_TYPE, "High"))
+		self.assertEqual([item["field"] for item in result["skipped"]], ["agent_group"])

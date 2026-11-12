@@ -968,8 +968,7 @@ class TestRoutingTask(AssignTestBase):
 		self.assertNotIn("task", json.loads(entry.value_after))
 		self.assertEqual(self._comment_count(), before_comments + 1)
 		text = self._comment_text()
-		self.assertIn(TASK_REQUEST.format(reason=REASON_TASK_NOT_ASSIGNED), text)
-		self.assertNotIn("chưa gán được người", text)
+		self.assertEqual(text, TASK_REQUEST.format(reason=REASON_TASK_NOT_ASSIGNED))
 
 	def test_refused_task_without_exception_no_task_no_comment(self):
 		refusal = {"ok": False, "reason": "thiếu quyền tạo Task"}

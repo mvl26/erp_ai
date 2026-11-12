@@ -7,6 +7,7 @@ from frappe.utils import get_fullname
 
 from erp_ai import gateway
 from erp_ai.agent import authority, policy
+from erp_ai.agent.answer_delay import AnswerDelay
 from erp_ai.agent.classification import load_mapping, parse_classification, resolve_ticket_values
 from erp_ai.agent.prompts import build_classify_request, build_initial_message, build_reason_system
 from erp_ai.agent.run_log import write_entry
@@ -33,6 +34,8 @@ STOP_MAX_TURNS = "max_turns"
 STOP_TIME_BUDGET = "time_budget"
 STOP_GATEWAY_ERROR = "gateway_error"
 DEADLINE_KIND = "deadline"
+# The tool whose call is the answer the delay holds back (D-6).
+ANSWER_TOOL = "post_comment"
 # Write tools -> (doctype of the record they touch, key of the result that names it; None = the ticket).
 WRITE_TOOL_TARGETS = {
 	"set_classification": ("HD Ticket", None),
@@ -103,6 +106,10 @@ def _run(ticket_name, trigger):
 	status = RunStatus(ticket_name, run_id, settings.get("thinking_text"))
 	try:
 		status.start()
+		# anchor of the delay = right after the start signal (AC-3); ticket_insert never waits
+		delay = None
+		if trigger == TRIGGER_COMMENT_MENTION:
+			delay = AnswerDelay.start(settings.answer_delay_min_s, settings.answer_delay_max_s)
 		mapping = load_mapping(settings.category_mapping)
 		# One context for the whole run (classification and reasoning); never built at L0, which calls no tool.
 		context = None
@@ -121,7 +128,7 @@ def _run(ticket_name, trigger):
 			if not proceed:
 				return
 		if level != LEVELS[0]:
-			_reason(ticket_name, trigger, run_id, settings, context, classification, deadline, status)
+			_reason(ticket_name, trigger, run_id, settings, context, classification, deadline, status, delay)
 	finally:
 		status.done()
 
@@ -242,7 +249,7 @@ def _apply_classification(log_name, classification, context):
 		frappe.db.commit()
 
 
-def _reason(ticket_name, trigger, run_id, settings, context, classification, deadline, status):
+def _reason(ticket_name, trigger, run_id, settings, context, classification, deadline, status, delay):
 	"""Reasoning step (design 4.3 step 8): at most `max_turns_per_run` model turns, one `reason` entry each."""
 	comments = authority.fetch_ticket_comments(ticket_name)
 	# the role is decided on the owner; only then is the author replaced by the full name shown to the model
@@ -293,6 +300,9 @@ def _reason(ticket_name, trigger, run_id, settings, context, classification, dea
 
 		tool_blocks = [block for block in result.content if block.get("type") == "tool_use"]
 		tool_results, actions, before, after, tool_errors, skipped = [], [], {}, {}, [], []
+		# the whole turn waits, before any of its tools runs (D-6)
+		if delay is not None and any(block["name"] == ANSWER_TOOL for block in tool_blocks):
+			delay.wait_before_answer(deadline)
 		for block in tool_blocks:
 			tool_results.append(_run_tool(block, context, actions, before, after, tool_errors, skipped))
 		stop_reason = result.stop_reason

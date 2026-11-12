@@ -6,9 +6,15 @@ from frappe.tests.utils import FrappeTestCase
 from helpdesk.test_utils import make_ticket
 
 from erp_ai import handlers
-from erp_ai.agent import runner
+from erp_ai.agent import answer_delay, runner
 from erp_ai.constants import AGENT_USER, LOG_DOCTYPE, LOGGER_NAME
-from erp_ai.test_utils import FakeGateway, make_log_entry, make_model_result, set_agent_settings
+from erp_ai.test_utils import (
+	FakeGateway,
+	make_log_entry,
+	make_model_result,
+	record_status_signals,
+	set_agent_settings,
+)
 
 PREFIX = "ERPAI-TEST-"
 RUN_FOR_TICKET_PATH = "erp_ai.agent.runner.run_for_ticket"
@@ -55,6 +61,12 @@ class HandlerTestCase(FrappeTestCase):
 		log_error.start()
 		self.addCleanup(log_error.stop)
 
+		# A run started by a handler test must neither publish to Redis nor sleep for real.
+		record_status_signals(self)
+		sleep_patch = patch.object(answer_delay, "_sleep")
+		sleep_patch.start()
+		self.addCleanup(sleep_patch.stop)
+
 		self.gateway = FakeGateway()
 		gateway_patch = patch("erp_ai.gateway.call_model", self.gateway)
 		gateway_patch.start()
@@ -64,7 +76,13 @@ class HandlerTestCase(FrappeTestCase):
 		self.enqueue = enqueue_patch.start()
 		self.addCleanup(enqueue_patch.stop)
 
-		set_agent_settings(enabled=1, trigger_keyword=KEYWORD, excluded_teams=EXCLUDED_TEAM)
+		set_agent_settings(
+			enabled=1,
+			trigger_keyword=KEYWORD,
+			excluded_teams=EXCLUDED_TEAM,
+			answer_delay_min_s=0,
+			answer_delay_max_s=0,
+		)
 		for team in (EXCLUDED_TEAM, OPEN_TEAM):
 			_ensure_team(team)
 		_ensure_ticket_type(TICKET_TYPE)

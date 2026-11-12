@@ -8,6 +8,8 @@ from erp_ai.constants import CATEGORIES, CLASSIFICATION_FIELDS, CONFIDENCE_VALUE
 
 PRIORITIES = ("Low", "Medium", "High", "Urgent")
 PRIORITY_URGENT = "Urgent"
+SCORE_VALUES = (1, 2, 3)
+SCORE_REASON_MAX_WORDS = 25
 # The guide spells the tag "[GẬP]"; "[GẤP]" is the standard spelling. Accept both.
 URGENT_TAGS = ("[GẤP]", "[GẬP]")
 
@@ -54,6 +56,19 @@ def _load_json_object(text):
 	return data if isinstance(data, dict) else None
 
 
+def _read_scores(data):
+	"""(complexity, importance, reason): a bad score in the pair means no score at all (D-4)."""
+	complexity = data.get("do_phuc_tap")
+	importance = data.get("do_quan_trong")
+	for score in (complexity, importance):
+		if type(score) is not int or score not in SCORE_VALUES:
+			return 0, 0, ""
+	reason = data.get("ly_do_diem")
+	if not isinstance(reason, str):
+		reason = ""
+	return complexity, importance, " ".join(reason.split()[:SCORE_REASON_MAX_WORDS])
+
+
 def parse_classification(text: str) -> Classification | None:
 	"""Read the model's classification reply. Never raises; None when it cannot be trusted."""
 	data = _load_json_object(text)
@@ -69,9 +84,7 @@ def parse_classification(text: str) -> Classification | None:
 	team = data.get("nhom")
 	priority = data.get("uu_tien")
 	requests = data.get("cac_yeu_cau")
-	complexity = data.get("do_phuc_tap")
-	importance = data.get("do_quan_trong")
-	score_reason = data.get("ly_do_diem")
+	complexity, importance, score_reason = _read_scores(data)
 	department = data.get("bo_phan")
 	return Classification(
 		category=category,
@@ -81,9 +94,9 @@ def parse_classification(text: str) -> Classification | None:
 		priority=priority if isinstance(priority, str) and priority in PRIORITIES else None,
 		needs_split=data.get("can_tach") is True,
 		requests=[r for r in requests if isinstance(r, str)] if isinstance(requests, list) else [],
-		complexity=complexity if type(complexity) is int else 0,
-		importance=importance if type(importance) is int else 0,
-		score_reason=score_reason if isinstance(score_reason, str) else "",
+		complexity=complexity,
+		importance=importance,
+		score_reason=score_reason,
 		department=department if isinstance(department, str) else None,
 	)
 

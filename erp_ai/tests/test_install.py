@@ -313,12 +313,17 @@ class TestInstall(FrappeTestCase):
 		install.after_migrate()
 		self.assertEqual(_counts()["status_scripts"], 1)
 		doc = self._status_script()
-		for key, value in install.AGENT_STATUS_SCRIPT_FLAGS.items():
+		expected = {
+			"dt": "HD Ticket",
+			"apply_to": "Form",
+			"enabled": 1,
+			"apply_to_customer_portal": 0,
+			"apply_on_new_page": 0,
+			"is_standard": 0,
+		}
+		self.assertEqual(install.AGENT_STATUS_SCRIPT_FLAGS, expected)
+		for key, value in expected.items():
 			self.assertEqual(doc.get(key), value, key)
-		self.assertEqual(
-			set(install.AGENT_STATUS_SCRIPT_FLAGS),
-			{"dt", "apply_to", "enabled", "apply_to_customer_portal", "apply_on_new_page", "is_standard"},
-		)
 		self.assertEqual(doc.script, self._script_file())
 		self.assertTrue(doc.script.strip())
 
@@ -353,18 +358,19 @@ class TestInstall(FrappeTestCase):
 		)
 
 	def test_uninstall_removes_only_status_script(self):
+		# Same flags as the app's record, only the name differs: a human's identical script must survive.
 		other = frappe.get_doc(
 			{
 				"doctype": install.FORM_SCRIPT_DOCTYPE,
 				"name": "erp_ai test other script",
-				"dt": "HD Ticket",
-				"apply_to": "Form",
-				"enabled": 0,
+				**install.AGENT_STATUS_SCRIPT_FLAGS,
 				"script": "function setupForm() { return {actions: []} }",
 			}
 		).insert(ignore_permissions=True)
 		before = _counts()
+		total_before = frappe.db.count(install.FORM_SCRIPT_DOCTYPE)
 		install.before_uninstall()
+		self.assertEqual(frappe.db.count(install.FORM_SCRIPT_DOCTYPE), total_before - 1)
 		self.assertEqual(
 			frappe.db.count(install.FORM_SCRIPT_DOCTYPE, {"name": install.AGENT_STATUS_SCRIPT}), 0
 		)
@@ -373,6 +379,34 @@ class TestInstall(FrappeTestCase):
 		self.assertEqual(after.pop("status_scripts"), 0)
 		before.pop("status_scripts")
 		self.assertEqual(after, before)
+
+	def test_missing_form_script_doctype_is_skipped_with_warning(self):
+		real = frappe.db.exists
+
+		def exists(*args, **kwargs):
+			if args[:2] == ("DocType", install.FORM_SCRIPT_DOCTYPE):
+				return None
+			return real(*args, **kwargs)
+
+		frappe.db.delete(install.FORM_SCRIPT_DOCTYPE, {"name": install.AGENT_STATUS_SCRIPT})
+		with (
+			patch.object(install.frappe.db, "exists", side_effect=exists),
+			patch.object(install.frappe, "logger") as logger,
+		):
+			install.ensure_setup()
+		warnings = [
+			c.args
+			for c in logger.return_value.warning.call_args_list
+			if "not found" in c.args[0] and c.args[1] == install.FORM_SCRIPT_DOCTYPE
+		]
+		self.assertEqual(len(warnings), 1)
+		self.assertEqual(_counts()["status_scripts"], 0)
+		# Uninstall does nothing while the doctype is missing.
+		install.ensure_setup()
+		self.assertEqual(_counts()["status_scripts"], 1)
+		with patch.object(install.frappe.db, "exists", side_effect=exists):
+			install.before_uninstall()
+		self.assertEqual(_counts()["status_scripts"], 1)
 
 	def test_uninstall_without_record_is_noop(self):
 		frappe.db.delete(install.FORM_SCRIPT_DOCTYPE, {"name": install.AGENT_STATUS_SCRIPT})

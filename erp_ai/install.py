@@ -39,10 +39,7 @@ def after_migrate():
 
 
 def ensure_setup() -> None:
-	"""Create what is missing; never overwrite or remove anything a human set.
-
-	Exception: the app-owned HD Form Script is reset from the repo file (ADR-007).
-	"""
+	"""Create what is missing, never overwrite what a human set; except the app-owned form script (ADR-007)."""
 	_ensure_roles()
 	_ensure_agent_user()
 	_ensure_default_settings()

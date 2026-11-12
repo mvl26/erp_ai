@@ -151,7 +151,7 @@ def call_model(task, *, system, messages, max_tokens, tools=None, deadline=None)
 			row.model_reason if task == "reason" else row.model_classify or settings["model_classify_default"]
 		)
 		request = {"model": model, "max_tokens": max_tokens, "system": system, "messages": messages}
-		if task == "classify" and model.startswith(THINKING_OFF_MODEL_PREFIX):
+		if task == "classify" and (model or "").startswith(THINKING_OFF_MODEL_PREFIX):
 			request["thinking"] = CLASSIFY_THINKING
 		if tools:
 			request["tools"] = tools

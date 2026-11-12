@@ -402,6 +402,16 @@ class TestCallModel(FrappeTestCase):
 		send, _ = self.run_call(ok_reply())
 		self.assertNotIn("thinking", send.calls[0]["request"])
 
+	def test_classify_with_no_model_anywhere_raises_gateway_error_not_attribute_error(self):
+		# Both the key and the Setting default are empty: the provider answers 400, as before rw1 (FEAT-006 rw1 R4).
+		name = add_credential("k1")
+		frappe.db.delete("Singles", {"doctype": SETTING_DOCTYPE, "field": "model_classify_default"})
+		frappe.db.set_value(CREDENTIAL_DOCTYPE, name, "model_classify", None)
+		send, result = self.run_call(err(400))
+		self.assertIsInstance(result, GatewayError)
+		self.assertEqual(result.kind, "bad_request")
+		self.assertNotIn("thinking", send.calls[0]["request"])
+
 	def test_reason_request_leaves_thinking_unset(self):
 		add_credential("k1", model_reason="reason-model")
 		send, _ = self.run_call(ok_reply(), task="reason")

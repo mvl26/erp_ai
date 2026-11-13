@@ -9,6 +9,44 @@ from erp_ai.agent.tools import change_guard, source
 from erp_ai.test_utils import TempAppsRoot
 
 ALLOWED = ("myapp",)
+SITE = "site1.test"
+
+# Refusal sentences of design 3.1 / 3.2, typed here so the tests do not compare a constant with itself.
+SHELL_REFUSAL = "đối số chứa ký tự điều khiển shell"
+FORCE_REFUSAL = "cờ --force bị cấm"
+OTHER_SITE_REFUSAL = "chỉ chạy cho site đang chạy"
+NOT_LISTED_REFUSAL = "lệnh không có trong danh sách cho phép"
+NEEDS_APP_REFUSAL = "lệnh build cần app"
+TAKES_NO_APP_REFUSAL = "lệnh này không nhận app"
+APP_NOT_ALLOWED_REFUSAL = "app không có trong danh sách được sửa"
+APP_FORBIDDEN_REFUSAL = "không được sửa app erp_ai hoặc kho git của nó"
+
+# Denied list of spec A-6 plus ADR-022 QĐ 2 (design 8.1): 23 names.
+A6_DENIED_COMMANDS = (
+	"execute",
+	"console",
+	"mariadb",
+	"db-console",
+	"backup",
+	"restore",
+	"drop-site",
+	"reinstall",
+	"set-config",
+	"set-admin-password",
+	"add-system-manager",
+	"add-user",
+	"install-app",
+	"uninstall-app",
+	"remove-app",
+	"get-app",
+	"update",
+	"setup",
+	"restart",
+	"run-tests",
+	"switch-to-branch",
+	"new-app",
+	"init",
+)
 
 
 def release_fifo_reader(fifo):
@@ -313,3 +351,217 @@ class TestCheckWritePath(FrappeTestCase):
 			with self.subTest(rel=rel):
 				self.assertEqual(self.reason(rel, allowed, new_file=new_file), change_guard.APP_FORBIDDEN)
 		self.assertIsNone(self.reason("myapp/ok.py", allowed))
+
+
+class TestBenchArgs(FrappeTestCase):
+	def setUp(self):
+		self.apps = TempAppsRoot(self, apps=("myapp", "otherapp"))
+		self.root = self.apps.root
+
+	def build(self, command, app=None, allowed=ALLOWED, site=SITE):
+		return change_guard.build_bench_args(command, app, allowed, site)
+
+	def check(self, args, allowed=ALLOWED, site=SITE):
+		return change_guard.check_bench_args(args, allowed, site)
+
+	def fake_erp_ai_repo(self):
+		"""A temp `erp_ai` repo (`.git` dir) and a worktree of it named `erp_ai-wt`, plain file writes only."""
+		self.apps.write("erp_ai/.git/HEAD", "ref: refs/heads/main\n")
+		admin = os.path.join(self.root, "erp_ai", ".git", "worktrees", "wt")
+		self.apps.write(os.path.join(admin, "commondir"), "../..\n")
+		self.apps.write("erp_ai-wt/.git", f"gitdir: {admin}\n")
+
+	def test_build_args_for_each_allowed_command(self):
+		for command, app, expected in (
+			("migrate", None, ["--site", "site1.test", "migrate"]),
+			("build", "myapp", ["build", "--app", "myapp"]),
+			("clear-cache", None, ["--site", "site1.test", "clear-cache"]),
+			("clear-website-cache", None, ["--site", "site1.test", "clear-website-cache"]),
+			("list-apps", None, ["--site", "site1.test", "list-apps"]),
+			("version", None, ["version"]),
+		):
+			with self.subTest(command=command):
+				self.assertEqual(self.build(command, app), expected)
+				self.assertIsNone(self.check(expected))
+		self.assertEqual(
+			self.build("build", "otherapp", ("myapp", "otherapp")), ["build", "--app", "otherapp"]
+		)
+		self.assertIsNone(self.check(["build", "--app", "otherapp"], ("myapp", "otherapp")))
+		self.assertEqual(self.build("version", None, ALLOWED, None), ["version"])
+		self.assertIsNone(self.check(["version"], ALLOWED, None))
+
+	def test_bench_refusal_wording_matches_design(self):
+		self.assertEqual(
+			(
+				change_guard.CMD_SHELL,
+				change_guard.CMD_FORCE,
+				change_guard.CMD_OTHER_SITE,
+				change_guard.CMD_NOT_LISTED,
+				change_guard.CMD_NEEDS_APP,
+				change_guard.CMD_TAKES_NO_APP,
+			),
+			(
+				"đối số chứa ký tự điều khiển shell",
+				"cờ --force bị cấm",
+				"chỉ chạy cho site đang chạy",
+				"lệnh không có trong danh sách cho phép",
+				"lệnh build cần app",
+				"lệnh này không nhận app",
+			),
+		)
+
+	def test_bench_args_refuse_every_a6_denied_command(self):
+		self.assertEqual(len(A6_DENIED_COMMANDS), 23)
+		self.assertEqual(len(set(A6_DENIED_COMMANDS)), 23)
+		for name in A6_DENIED_COMMANDS:
+			with self.subTest(command=name):
+				self.assertEqual(self.build(name), NOT_LISTED_REFUSAL)
+				self.assertEqual(self.build(name, "myapp"), NOT_LISTED_REFUSAL)
+				self.assertEqual(self.check(["--site", "site1.test", name]), NOT_LISTED_REFUSAL)
+				self.assertEqual(self.check([name]), NOT_LISTED_REFUSAL)
+				self.assertEqual(self.check([name, "--app", "myapp"]), NOT_LISTED_REFUSAL)
+				self.assertEqual(self.check(["--site", "site1.test", name, "myapp"]), NOT_LISTED_REFUSAL)
+
+	def test_bench_allow_list_is_exactly_the_six_design_commands(self):
+		# Design 3.2 / spec A-6: the allow-list is the mechanism; every other command is refused.
+		self.assertEqual(
+			set(change_guard.BENCH_COMMANDS),
+			{"migrate", "build", "clear-cache", "clear-website-cache", "list-apps", "version"},
+		)
+		self.assertEqual(len(change_guard.BENCH_COMMANDS), 6)
+		for name in ("trim-database", "doctor", "show-config", "destroy-all-sessions"):
+			with self.subTest(command=name):
+				self.assertNotIn(name, A6_DENIED_COMMANDS)
+				self.assertEqual(self.build(name), NOT_LISTED_REFUSAL)
+				self.assertEqual(self.build(name, "myapp"), NOT_LISTED_REFUSAL)
+				self.assertEqual(self.check(["--site", "site1.test", name]), NOT_LISTED_REFUSAL)
+				self.assertEqual(self.check([name]), NOT_LISTED_REFUSAL)
+
+	def test_bench_args_refuse_shell_metacharacters(self):
+		for char in (";", "|", "&", "`", "$(", ">", "<", "\n"):
+			with self.subTest(char=char):
+				self.assertEqual(self.check(["--site", "site1.test", f"migrate{char}ls"]), SHELL_REFUSAL)
+				self.assertEqual(self.check([f"version{char}"]), SHELL_REFUSAL)
+				self.assertEqual(self.check(["build", "--app", f"myapp{char}x"]), SHELL_REFUSAL)
+				# Step 1 comes before every other check: force, other site, unlisted command.
+				self.assertEqual(
+					self.check(["--site", "other", "execute", "--force", f"x{char}y"]), SHELL_REFUSAL
+				)
+				self.assertEqual(self.check(["--site", f"site1.test{char}", "migrate"]), SHELL_REFUSAL)
+				app = f"my{char}app"
+				self.assertEqual(self.build("build", app, (app,)), SHELL_REFUSAL)
+				self.assertEqual(self.build("migrate", None, ALLOWED, f"site1.test{char}"), SHELL_REFUSAL)
+		self.assertEqual(self.check(["--site", "site1.test", "migrate$x"]), NOT_LISTED_REFUSAL)
+
+	def test_bench_args_refuse_other_site_and_force(self):
+		for args in (
+			["--site", "site1.test", "migrate", "--force"],
+			["--force", "--site", "site1.test", "migrate"],
+			["build", "--app", "myapp", "--force"],
+			["--site", "site1.test", "migrate", "--force=1"],
+			# Step 2 comes before steps 3 and 4.
+			["--site", "other", "migrate", "--force"],
+			["--force", "--site", "other", "execute"],
+		):
+			with self.subTest(args=args):
+				self.assertEqual(self.check(args), FORCE_REFUSAL)
+		for args in (
+			["--site", "other", "migrate"],
+			["--site", "SITE1.TEST", "migrate"],
+			["--site=other", "migrate"],
+			["--site", "site1.test", "--site", "other", "migrate"],
+			["migrate", "--site"],
+			["site1.test", "--site", "migrate"],
+			# Step 3 comes before step 4.
+			["--site", "other", "execute"],
+			["--site", "other", "build", "--app", "myapp"],
+		):
+			with self.subTest(args=args):
+				self.assertEqual(self.check(args), OTHER_SITE_REFUSAL)
+		for site in (None, "", "  ", 5):
+			with self.subTest(site=site):
+				self.assertEqual(
+					self.check(["--site", "site1.test", "migrate"], ALLOWED, site), OTHER_SITE_REFUSAL
+				)
+				self.assertEqual(self.build("migrate", None, ALLOWED, site), OTHER_SITE_REFUSAL)
+				self.assertEqual(self.build("list-apps", None, ALLOWED, site), OTHER_SITE_REFUSAL)
+		# Step 3 refuses a blank running site even when `--site` repeats it exactly.
+		for site in ("", "  "):
+			with self.subTest(site=site):
+				self.assertEqual(self.check(["--site", site, "migrate"], ALLOWED, site), OTHER_SITE_REFUSAL)
+
+	def test_bench_args_refuse_unlisted_and_build_of_disallowed_app(self):
+		self.fake_erp_ai_repo()
+		listed = ("myapp", "erp_ai", "erp_ai-wt")
+		self.assertEqual(self.build("build", "otherapp"), APP_NOT_ALLOWED_REFUSAL)
+		self.assertEqual(self.build("build", "MyApp"), APP_NOT_ALLOWED_REFUSAL)
+		self.assertEqual(self.build("build", "myapp", ()), APP_NOT_ALLOWED_REFUSAL)
+		self.assertEqual(self.build("build", "erp_ai", listed), APP_FORBIDDEN_REFUSAL)
+		self.assertEqual(self.build("build", "erp_ai-wt", listed), APP_FORBIDDEN_REFUSAL)
+		self.assertEqual(self.build("build", "erp_ai"), APP_NOT_ALLOWED_REFUSAL)
+		os.symlink(os.path.join(self.root, "erp_ai"), os.path.join(self.root, "aliased"))
+		self.assertEqual(self.build("build", "aliased", ("aliased", "erp_ai")), APP_NOT_ALLOWED_REFUSAL)
+		for app in ("../myapp", "myapp/", "myapp/sub", ".", "..", "/myapp", "my\0app"):
+			with self.subTest(app=app):
+				self.assertEqual(self.build("build", app, (app, "myapp")), APP_NOT_ALLOWED_REFUSAL)
+		for args, allowed in (
+			(["build", "--app", "otherapp"], ALLOWED),
+			(["build", "--app", "erp_ai"], listed),
+			(["build", "--app", "erp_ai-wt"], listed),
+			(["build", "--app", "aliased"], ("aliased",)),
+			(["build", "--app", "../myapp"], ("../myapp",)),
+			(["build"], ALLOWED),
+			(["build", "--app"], ALLOWED),
+			(["build", "--app", "myapp", "--production"], ALLOWED),
+			(["build", "--apps", "myapp"], ALLOWED),
+			(["--site", "site1.test", "build", "--app", "myapp"], ALLOWED),
+			(["--site", "site1.test", "migrate", "--skip-failing"], ALLOWED),
+			(["--site", "site1.test", "version"], ALLOWED),
+			(["version", "--site", "site1.test"], ALLOWED),
+			(["migrate"], ALLOWED),
+			(["--site", "site1.test"], ALLOWED),
+			(["bench", "version"], ALLOWED),
+			([" version"], ALLOWED),
+		):
+			with self.subTest(args=args):
+				self.assertEqual(self.check(args, allowed), NOT_LISTED_REFUSAL)
+		self.assertEqual(self.build("build"), NEEDS_APP_REFUSAL)
+		self.assertEqual(self.build("build", ""), NEEDS_APP_REFUSAL)
+		self.assertEqual(self.build("build", "   "), NEEDS_APP_REFUSAL)
+		for command in ("migrate", "clear-cache", "clear-website-cache", "list-apps", "version"):
+			with self.subTest(command=command):
+				self.assertEqual(self.build(command, "myapp"), TAKES_NO_APP_REFUSAL)
+				self.assertEqual(self.build(command, ""), TAKES_NO_APP_REFUSAL)
+		for command in ("Migrate", " migrate", "migrate ", "", "bench"):
+			with self.subTest(command=command):
+				self.assertEqual(self.build(command), NOT_LISTED_REFUSAL)
+
+	def test_bench_args_refuse_wrong_types(self):
+		for args in (
+			None,
+			"version",
+			("version",),
+			[],
+			[None],
+			["version", 1],
+			[["version"]],
+			{"version": 1},
+		):
+			with self.subTest(args=args):
+				self.assertEqual(self.check(args), NOT_LISTED_REFUSAL)
+		for command in (None, 5, ["migrate"]):
+			with self.subTest(command=command):
+				self.assertEqual(self.build(command), NOT_LISTED_REFUSAL)
+		for app in (5, ["myapp"], b"myapp"):
+			with self.subTest(app=app):
+				self.assertEqual(self.build("build", app), APP_NOT_ALLOWED_REFUSAL)
+				self.assertEqual(self.build("migrate", app), TAKES_NO_APP_REFUSAL)
+		# `allowed_apps` must be a collection of names: a plain string would match by substring.
+		for allowed in ("myapp", "xmyappx", None, ("myapp", 1), {"myapp": 1}):
+			with self.subTest(allowed=allowed):
+				self.assertEqual(self.build("build", "myapp", allowed), APP_NOT_ALLOWED_REFUSAL)
+				self.assertEqual(self.check(["build", "--app", "myapp"], allowed), NOT_LISTED_REFUSAL)
+				self.assertEqual(self.build("migrate", None, allowed), ["--site", "site1.test", "migrate"])
+		self.assertEqual(self.build("build", "app", "myapp"), APP_NOT_ALLOWED_REFUSAL)
+		self.assertEqual(self.build("build", "myapp", ["myapp"]), ["build", "--app", "myapp"])
+		self.assertEqual(self.build("build", "myapp", frozenset({"myapp"})), ["build", "--app", "myapp"])

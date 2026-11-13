@@ -654,7 +654,36 @@ def check_subprocess_call_shape(sources: dict) -> list:
 		command = node.args[0] if node.args else keywords.get("args")
 		if isinstance(command, ast.Constant | ast.JoinedStr):
 			violations.append(violation(SOURCE_TOOL_FILE, node, f"{name} with a string command, not a list"))
+		if is_timeout_wrapped(command):
+			violations.extend(
+				violation(SOURCE_TOOL_FILE, node, f"{name} {problem}")
+				for problem in timeout_wrapped_call_problems(keywords, aliases)
+			)
 	return violations
+
+
+def is_timeout_wrapped(command) -> bool:
+	"""ADR-022 QĐ 4: a `[TIMEOUT_EXECUTABLE, ...]` / `["timeout", ...]` command is a new FEAT-004 git call."""
+	first = command.elts[0] if isinstance(command, ast.List) and command.elts else None
+	return (isinstance(first, ast.Name) and first.id == "TIMEOUT_EXECUTABLE") or (
+		isinstance(first, ast.Constant) and first.value == "timeout"
+	)
+
+
+def timeout_wrapped_call_problems(keywords: dict, aliases: dict) -> list:
+	"""Own process group, explicit cwd= and an env= that never copies os.environ (ADR-022 QĐ 4, Ràng buộc)."""
+	problems = []
+	group = keywords.get("start_new_session")
+	if not (isinstance(group, ast.Constant) and group.value is True):
+		problems.append("without start_new_session=True")
+	if "cwd" not in keywords:
+		problems.append("without cwd=")
+	env = keywords.get("env")
+	if env is None:
+		problems.append("without env=")
+	elif any(resolved_name(part, aliases) == "os.environ" for part in ast.walk(env)):
+		problems.append("env= uses os.environ")
+	return problems
 
 
 def check_policy_fields_only_in_policy(sources: dict) -> list:
@@ -1745,6 +1774,12 @@ class TestArchitecture(unittest.TestCase):
 		self.assertIn("subprocess", self.sources[SOURCE_TOOL_FILE])
 		self.assertEqual(check_subprocess_only_in_source_tool(self.sources), [])
 		self.assertEqual(check_subprocess_call_shape(self.sources), [])
+		wrapped = [
+			node
+			for node in ast.walk(parse(SOURCE_TOOL_FILE, self.sources[SOURCE_TOOL_FILE]))
+			if isinstance(node, ast.Call) and node.args and is_timeout_wrapped(node.args[0])
+		]
+		self.assertEqual(len(wrapped), 1, "run_git_read must pass its argv inline so the shape rule sees it")
 
 	def test_level_and_send_policy_fields_only_in_policy(self):
 		scanned = only_python(self.sources)
@@ -2202,6 +2237,33 @@ class TestScannersCatchViolations(unittest.TestCase):
 		for fragment, source in cases.items():
 			with self.subTest(fragment=fragment):
 				self.assertCaught(check_subprocess_call_shape({SOURCE_TOOL_FILE: source}), fragment)
+
+	def test_subprocess_call_shape_timeout_wrapped_git_needs_group_cwd_and_own_env(self):
+		head = "import os\nimport subprocess\nsubprocess.run([TIMEOUT_EXECUTABLE, '-s', 'KILL', '5', 'git'], timeout=10"
+		good = f"{head}, cwd=repo, env=git_env(identity=False), start_new_session=True)\n"
+		self.assertEqual(check_subprocess_call_shape({SOURCE_TOOL_FILE: good}), [])
+		literal = good.replace("TIMEOUT_EXECUTABLE", "'timeout'")
+		self.assertEqual(check_subprocess_call_shape({SOURCE_TOOL_FILE: literal}), [])
+		cases = (
+			("without start_new_session=True", f"{head}, cwd=repo, env=git_env(identity=False))\n"),
+			(
+				"without start_new_session=True",
+				f"{head}, cwd=repo, env=git_env(identity=False), start_new_session=False)\n",
+			),
+			("without cwd=", f"{head}, env=git_env(identity=False), start_new_session=True)\n"),
+			("without env=", f"{head}, cwd=repo, start_new_session=True)\n"),
+			("env= uses os.environ", f"{head}, cwd=repo, env={{**os.environ}}, start_new_session=True)\n"),
+			("env= uses os.environ", f"{head}, cwd=repo, env=dict(os.environ), start_new_session=True)\n"),
+			("env= uses os.environ", f"{head}, cwd=repo, env=os.environ, start_new_session=True)\n"),
+		)
+		for fragment, source in cases:
+			for variant in (source, source.replace("TIMEOUT_EXECUTABLE", "'timeout'")):
+				with self.subTest(variant=variant):
+					self.assertCaught(check_subprocess_call_shape({SOURCE_TOOL_FILE: variant}), fragment)
+		plain_git = (
+			"import os\nimport subprocess\nsubprocess.run(['git', 'log'], timeout=3, env={**os.environ})\n"
+		)
+		self.assertEqual(check_subprocess_call_shape({SOURCE_TOOL_FILE: plain_git}), [])
 
 	# policy fields -----------------------------------------------------------------------------
 

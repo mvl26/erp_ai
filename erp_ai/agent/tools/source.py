@@ -2,11 +2,13 @@ import os
 import re
 import subprocess
 import time
+from dataclasses import dataclass
 
 import frappe
 
 from erp_ai.agent.tools.read import _schema
 from erp_ai.agent.tools.registry import ToolSpec
+from erp_ai.constants import BOT_GIT_EMAIL, BOT_GIT_NAME
 
 logger = frappe.logger("erp_ai.source")
 
@@ -55,6 +57,19 @@ GIT_GLOB_CHARS = re.compile(r"[*?\[\]]")
 GIT_TIMEOUT_S = 30
 GIT_MAX_ARGS = 10
 GIT_OUTPUT_MAX_CHARS = 8000
+
+# ADR-022 QĐ 2, 4: the git read set and the one definition of git options and environment.
+GIT_READ_SUBCOMMANDS = frozenset(
+	{"rev-parse", "rev-list", "status", "check-ignore", "ls-files", "merge-base", "diff-tree", "cat-file"}
+)
+TIMEOUT_EXECUTABLE = "timeout"
+BENCH_EXECUTABLE = "bench"
+GIT_HOOKS_DIR = os.path.realpath(
+	os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "git_no_hooks")
+)
+GIT_BACKSTOP_EXTRA_S = 5
+GIT_DEFAULT_PATH = "/usr/bin:/bin"
+KILLED_EXIT_CODES = (-9, 124, 137)
 
 
 def get_source_root():
@@ -277,6 +292,100 @@ def git_source(args, ctx):
 	except Exception:
 		logger.exception("git_source failed")
 		return _refuse("Không chạy được git")
+
+
+@dataclass(frozen=True)
+class GitRun:
+	exit_code: int | None
+	stdout: bytes
+	timed_out: bool
+
+
+def git_global_options(*, read: bool) -> list[str]:
+	"""Options in front of every git subcommand of FEAT-004: no repo hooks, no fsmonitor, no auto gc (ADR-022 QĐ 4)."""
+	options = [
+		"--no-pager",
+		"-c",
+		f"core.hooksPath={GIT_HOOKS_DIR}",
+		"-c",
+		"core.fsmonitor=false",
+		"-c",
+		"maintenance.auto=false",
+		"-c",
+		"gc.auto=0",
+	]
+	return [*options, "--no-optional-locks"] if read else options
+
+
+def git_env(*, identity: bool) -> dict[str, str]:
+	"""An explicit git environment: no HOME, no global/system config, nothing from os.environ but PATH (NFR-8)."""
+	env = {
+		"PATH": os.environ.get("PATH") or GIT_DEFAULT_PATH,
+		"LC_ALL": "C",
+		"GIT_CONFIG_GLOBAL": "/dev/null",
+		"GIT_CONFIG_NOSYSTEM": "1",
+		"GIT_TERMINAL_PROMPT": "0",
+	}
+	if identity:
+		env.update(
+			{
+				"GIT_AUTHOR_NAME": BOT_GIT_NAME,
+				"GIT_COMMITTER_NAME": BOT_GIT_NAME,
+				"GIT_AUTHOR_EMAIL": BOT_GIT_EMAIL,
+				"GIT_COMMITTER_EMAIL": BOT_GIT_EMAIL,
+			}
+		)
+	return env
+
+
+def _check_git_read_call(repo_root, subcommand, args, limit_s) -> None:
+	if not isinstance(subcommand, str) or subcommand not in GIT_READ_SUBCOMMANDS:
+		raise ValueError(f"git read subcommand not allowed: {subcommand!r}")
+	if (
+		not isinstance(repo_root, str)
+		or "\0" in repo_root
+		or not os.path.isabs(repo_root)
+		or not os.path.isdir(repo_root)
+	):
+		raise ValueError(f"repo_root must be an existing absolute directory: {repo_root!r}")
+	if not all(isinstance(arg, str) and "\0" not in arg for arg in args):
+		raise ValueError("every git argument must be a string without NUL")
+	if not isinstance(limit_s, int) or isinstance(limit_s, bool) or not 1 <= limit_s <= GIT_TIMEOUT_S:
+		raise ValueError(f"limit_s must be an integer from 1 to {GIT_TIMEOUT_S}: {limit_s!r}")
+
+
+def run_git_read(repo_root: str, subcommand: str, *args: str, limit_s: int = GIT_TIMEOUT_S) -> GitRun:
+	"""Run one read-only git subcommand in repo_root, killed with its process group after limit_s (ADR-022 QĐ 2, 4)."""
+	_check_git_read_call(repo_root, subcommand, args, limit_s)
+	started = time.monotonic()
+	try:
+		done = subprocess.run(
+			[
+				TIMEOUT_EXECUTABLE,
+				"-s",
+				"KILL",
+				str(limit_s),
+				"git",
+				*git_global_options(read=True),
+				subcommand,
+				*args,
+			],
+			cwd=repo_root,
+			env=git_env(identity=False),
+			stdin=subprocess.DEVNULL,
+			stdout=subprocess.PIPE,
+			stderr=subprocess.DEVNULL,
+			timeout=limit_s + GIT_BACKSTOP_EXTRA_S,
+			start_new_session=True,
+		)
+	except subprocess.TimeoutExpired:
+		logger.warning("git %s timed out after the backstop", subcommand)
+		return GitRun(exit_code=None, stdout=b"", timed_out=True)
+	except OSError as error:
+		logger.warning("git %s could not start: %s", subcommand, type(error).__name__)
+		return GitRun(exit_code=None, stdout=b"", timed_out=False)
+	timed_out = done.returncode in KILLED_EXIT_CODES and time.monotonic() - started >= limit_s
+	return GitRun(exit_code=done.returncode, stdout=done.stdout or b"", timed_out=timed_out)
 
 
 TOOLS: list[ToolSpec] = [

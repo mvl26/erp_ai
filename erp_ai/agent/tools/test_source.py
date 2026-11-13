@@ -981,3 +981,351 @@ class TestRealCoreReposUntouchedMixin(unittest.TestCase):
 		probe.setUpClass()
 		self.assertEqual(sorted(probe._real_core_repos_before), ["erpnext", "frappe", "helpdesk", "hrms"])
 		probe.tearDownClass()
+
+
+EXPECTED_HOOKS_DIR = os.path.realpath(
+	os.path.join(os.path.dirname(os.path.abspath(source.__file__)), "..", "git_no_hooks")
+)
+EXPECTED_READ_SUBCOMMANDS = {
+	"rev-parse",
+	"rev-list",
+	"status",
+	"check-ignore",
+	"ls-files",
+	"merge-base",
+	"diff-tree",
+	"cat-file",
+}
+FORBIDDEN_GIT_SUBCOMMANDS = (
+	"push",
+	"fetch",
+	"pull",
+	"clone",
+	"checkout",
+	"switch",
+	"restore",
+	"branch",
+	"reset",
+	"rebase",
+	"merge",
+	"cherry-pick",
+	"revert",
+	"am",
+	"apply",
+	"stash",
+	"clean",
+	"tag",
+	"remote",
+	"config",
+	"update-ref",
+	"symbolic-ref",
+	"reflog",
+	"gc",
+	"maintenance",
+	"worktree",
+	"notes",
+	"replace",
+	"filter-branch",
+	"prune",
+)
+RUN_PATH = "erp_ai.agent.tools.source.subprocess.run"
+
+
+class TestGitReadOptions(unittest.TestCase):
+	"""ADR-022 QĐ 2, 4; NFR-8; D-13: the one definition of git options, env and the read runner."""
+
+	def test_git_global_options_contents(self):
+		self.assertEqual(source.GIT_HOOKS_DIR, EXPECTED_HOOKS_DIR)
+		self.assertTrue(EXPECTED_HOOKS_DIR.endswith(os.path.join("erp_ai", "agent", "git_no_hooks")))
+		write = [
+			"--no-pager",
+			"-c",
+			f"core.hooksPath={EXPECTED_HOOKS_DIR}",
+			"-c",
+			"core.fsmonitor=false",
+			"-c",
+			"maintenance.auto=false",
+			"-c",
+			"gc.auto=0",
+		]
+		self.assertEqual(source.git_global_options(read=False), write)
+		self.assertEqual(source.git_global_options(read=True), [*write, "--no-optional-locks"])
+		self.assertIsNot(source.git_global_options(read=True), source.git_global_options(read=True))
+
+	def test_git_read_constants(self):
+		self.assertEqual(source.GIT_READ_SUBCOMMANDS, EXPECTED_READ_SUBCOMMANDS)
+		self.assertIsInstance(source.GIT_READ_SUBCOMMANDS, frozenset)
+		self.assertEqual(source.TIMEOUT_EXECUTABLE, "timeout")
+		self.assertEqual(source.BENCH_EXECUTABLE, "bench")
+		self.assertEqual(source.GIT_BACKSTOP_EXTRA_S, 5)
+		self.assertEqual(source.GIT_TIMEOUT_S, 30)
+		self.assertEqual(source.GIT_SUBCOMMANDS, {"log", "blame"})
+
+	def test_git_env_has_no_home_and_ignores_global_config(self):
+		leaky = {
+			"PATH": "/opt/x/bin:/usr/bin",
+			"HOME": "/home/someone",
+			"XDG_CONFIG_HOME": "/home/someone/.config",
+			"GIT_DIR": "/elsewhere/.git",
+			"GIT_CONFIG_PARAMETERS": "'user.email'='real.person@example.com'",
+			"OPENAI_API_KEY": "sk-fake",
+		}
+		base = {
+			"PATH": "/opt/x/bin:/usr/bin",
+			"LC_ALL": "C",
+			"GIT_CONFIG_GLOBAL": "/dev/null",
+			"GIT_CONFIG_NOSYSTEM": "1",
+			"GIT_TERMINAL_PROMPT": "0",
+		}
+		with patch.dict(os.environ, leaky):
+			self.assertEqual(source.git_env(identity=False), base)
+			self.assertEqual(
+				source.git_env(identity=True),
+				{
+					**base,
+					"GIT_AUTHOR_NAME": "ERP AI Agent",
+					"GIT_COMMITTER_NAME": "ERP AI Agent",
+					"GIT_AUTHOR_EMAIL": "erp-ai-agent@bot.invalid",
+					"GIT_COMMITTER_EMAIL": "erp-ai-agent@bot.invalid",
+				},
+			)
+
+	def test_git_env_path_defaults_when_worker_has_none(self):
+		with patch.dict(os.environ, {}, clear=True):
+			self.assertEqual(source.git_env(identity=False)["PATH"], "/usr/bin:/bin")
+		with patch.dict(os.environ, {"PATH": ""}, clear=True):
+			self.assertEqual(source.git_env(identity=False)["PATH"], "/usr/bin:/bin")
+
+	def test_hooks_dir_has_no_hook_files(self):
+		self.assertTrue(os.path.isdir(source.GIT_HOOKS_DIR))
+		self.assertEqual(os.listdir(source.GIT_HOOKS_DIR), ["README.md"])
+		readme = os.path.join(source.GIT_HOOKS_DIR, "README.md")
+		self.assertFalse(os.access(readme, os.X_OK))
+		with open(readme, encoding="utf-8") as handle:
+			text = handle.read()
+		self.assertIn("core.hooksPath", text)
+		self.assertIn("README.md", text)
+
+		host = unittest.TestCase()
+		self.addCleanup(host.doCleanups)
+		sandbox = GitSandbox(host, apps=("custom_app",), erp_ai_worktree=None)
+		for temp_root in (sandbox.base, os.path.realpath(tempfile.gettempdir())):
+			with self.subTest(temp_root=temp_root):
+				self.assertNotEqual(os.path.commonpath([temp_root, source.GIT_HOOKS_DIR]), temp_root)
+
+	def test_run_git_read_rejects_unlisted_subcommand(self):
+		repo = os.path.realpath(tempfile.gettempdir())
+		outsiders = (
+			*FORBIDDEN_GIT_SUBCOMMANDS,
+			"log",
+			"blame",
+			"show",
+			"diff",
+			"grep",
+			"hash-object",
+			"commit",
+			"add",
+			"rm",
+			"init",
+			"REV-PARSE",
+			" status",
+			"status ",
+			"--version",
+			"-c",
+			"",
+			None,
+			1,
+			b"status",
+		)
+		with patch(RUN_PATH) as run:
+			for subcommand in outsiders:
+				with self.subTest(subcommand=subcommand):
+					with self.assertRaisesRegex(ValueError, "subcommand"):
+						source.run_git_read(repo, subcommand)
+		run.assert_not_called()
+
+	def test_run_git_read_rejects_bad_repo_root(self):
+		missing = os.path.join(os.path.realpath(tempfile.gettempdir()), "erp-ai-no-such-dir-T37")
+		a_file = tempfile.NamedTemporaryFile(delete=False)
+		a_file.close()
+		self.addCleanup(os.remove, a_file.name)
+		with patch(RUN_PATH) as run:
+			for repo_root in ("", "relative/dir", missing, a_file.name, "/tmp\0x", None, 3):
+				with self.subTest(repo_root=repo_root):
+					with self.assertRaisesRegex(ValueError, "repo_root"):
+						source.run_git_read(repo_root, "status")
+		run.assert_not_called()
+
+	def test_run_git_read_rejects_bad_args(self):
+		repo = os.path.realpath(tempfile.gettempdir())
+		with patch(RUN_PATH) as run:
+			for args in (("HEAD\0",), (None,), (1,), (b"HEAD",), ("HEAD", ["x"])):
+				with self.subTest(args=args):
+					with self.assertRaisesRegex(ValueError, "argument"):
+						source.run_git_read(repo, "rev-parse", *args)
+		run.assert_not_called()
+
+	def test_run_git_read_rejects_bad_limit(self):
+		repo = os.path.realpath(tempfile.gettempdir())
+		with patch(RUN_PATH) as run:
+			for limit_s in (0, -1, 31, True, 1.5, "5", None):
+				with self.subTest(limit_s=limit_s):
+					with self.assertRaisesRegex(ValueError, "limit_s"):
+						source.run_git_read(repo, "status", limit_s=limit_s)
+		run.assert_not_called()
+
+	def test_run_git_read_argv_and_process_options(self):
+		repo = os.path.realpath(tempfile.gettempdir())
+		done = subprocess.CompletedProcess([], 0, stdout=b"out\n")
+		with patch.dict(os.environ, {"PATH": "/usr/bin:/bin", "HOME": "/home/someone"}):
+			with patch(RUN_PATH, return_value=done) as run:
+				result = source.run_git_read(repo, "rev-parse", "--verify", "-q", "HEAD", limit_s=7)
+		self.assertEqual(result, source.GitRun(exit_code=0, stdout=b"out\n", timed_out=False))
+		run.assert_called_once()
+		args, kwargs = run.call_args
+		self.assertEqual(
+			args,
+			(
+				[
+					"timeout",
+					"-s",
+					"KILL",
+					"7",
+					"git",
+					"--no-pager",
+					"-c",
+					f"core.hooksPath={EXPECTED_HOOKS_DIR}",
+					"-c",
+					"core.fsmonitor=false",
+					"-c",
+					"maintenance.auto=false",
+					"-c",
+					"gc.auto=0",
+					"--no-optional-locks",
+					"rev-parse",
+					"--verify",
+					"-q",
+					"HEAD",
+				],
+			),
+		)
+		self.assertEqual(
+			kwargs,
+			{
+				"cwd": repo,
+				"env": {
+					"PATH": "/usr/bin:/bin",
+					"LC_ALL": "C",
+					"GIT_CONFIG_GLOBAL": "/dev/null",
+					"GIT_CONFIG_NOSYSTEM": "1",
+					"GIT_TERMINAL_PROMPT": "0",
+				},
+				"stdin": subprocess.DEVNULL,
+				"stdout": subprocess.PIPE,
+				"stderr": subprocess.DEVNULL,
+				"timeout": 12,
+				"start_new_session": True,
+			},
+		)
+
+	def test_run_git_read_default_limit_is_git_timeout(self):
+		repo = os.path.realpath(tempfile.gettempdir())
+		done = subprocess.CompletedProcess([], 0, stdout=b"")
+		with patch(RUN_PATH, return_value=done) as run:
+			source.run_git_read(repo, "status")
+		args, kwargs = run.call_args
+		self.assertEqual(args[0][:5], ["timeout", "-s", "KILL", "30", "git"])
+		self.assertEqual(kwargs["timeout"], 35)
+
+	def test_run_git_read_backstop_timeout_is_timed_out(self):
+		repo = os.path.realpath(tempfile.gettempdir())
+		expired = subprocess.TimeoutExpired(["timeout"], 35)
+		with patch(RUN_PATH, side_effect=expired):
+			self.assertEqual(
+				source.run_git_read(repo, "status"),
+				source.GitRun(exit_code=None, stdout=b"", timed_out=True),
+			)
+
+	def test_run_git_read_killed_by_timeout_is_timed_out(self):
+		repo = os.path.realpath(tempfile.gettempdir())
+		for code in (-9, 124, 137):
+			with self.subTest(code=code):
+				done = subprocess.CompletedProcess([], code, stdout=b"part")
+				with patch(RUN_PATH, return_value=done):
+					with patch("erp_ai.agent.tools.source.time.monotonic", side_effect=[100.0, 107.0]):
+						self.assertEqual(
+							source.run_git_read(repo, "status", limit_s=7),
+							source.GitRun(exit_code=code, stdout=b"part", timed_out=True),
+						)
+
+	def test_run_git_read_kill_codes_before_limit_are_not_timed_out(self):
+		repo = os.path.realpath(tempfile.gettempdir())
+		for code in (-9, 124, 137):
+			with self.subTest(code=code):
+				done = subprocess.CompletedProcess([], code, stdout=b"")
+				with patch(RUN_PATH, return_value=done):
+					with patch("erp_ai.agent.tools.source.time.monotonic", side_effect=[100.0, 101.0]):
+						self.assertEqual(
+							source.run_git_read(repo, "status", limit_s=7),
+							source.GitRun(exit_code=code, stdout=b"", timed_out=False),
+						)
+
+	def test_run_git_read_missing_executable_is_unknown_exit(self):
+		repo = os.path.realpath(tempfile.gettempdir())
+		with patch(RUN_PATH, side_effect=FileNotFoundError("timeout")):
+			with patch.object(source.logger, "warning") as warning:
+				self.assertEqual(
+					source.run_git_read(repo, "status"),
+					source.GitRun(exit_code=None, stdout=b"", timed_out=False),
+				)
+		warning.assert_called_once()
+
+	def test_git_run_is_frozen(self):
+		result = source.GitRun(exit_code=0, stdout=b"", timed_out=False)
+		with self.assertRaises(AttributeError):
+			result.exit_code = 1
+
+
+class TestRunGitReadInSandbox(RealCoreReposUntouchedMixin, unittest.TestCase):
+	"""run_git_read against GitSandbox repos only (NFR-9)."""
+
+	def make_fake_home(self) -> str:
+		"""A HOME whose `.gitconfig` hides untracked files and points hooks at its own directory."""
+		home = os.path.realpath(tempfile.mkdtemp())
+		self.addCleanup(shutil.rmtree, home, True)
+		with open(os.path.join(home, ".gitconfig"), "w", encoding="utf-8") as handle:
+			handle.write(
+				f"[status]\n\tshowUntrackedFiles = no\n[core]\n\thooksPath = {home}/hooks\n"
+				f"[user]\n\temail = {LEAKED_EMAIL}\n"
+			)
+		return home
+
+	def test_run_git_read_ignores_home_global_config_and_inherited_git_dir(self):
+		sandbox = GitSandbox(self, apps=("custom_app",), erp_ai_worktree=None)
+		repo = sandbox.repo("custom_app")
+		sandbox._write("custom_app", "new.txt", "x\n")
+		fake_home = self.make_fake_home()
+		stray = os.path.realpath(tempfile.mkdtemp())
+		self.addCleanup(shutil.rmtree, stray, True)
+		inherited = {
+			"HOME": fake_home,
+			"XDG_CONFIG_HOME": fake_home,
+			"GIT_DIR": os.path.join(stray, ".git"),
+			"GIT_WORK_TREE": stray,
+		}
+		with patch.dict(os.environ, inherited):
+			status = source.run_git_read(repo, "status", "--porcelain=v1")
+			hooks = source.run_git_read(repo, "rev-parse", "--git-path", "hooks")
+			top = source.run_git_read(repo, "rev-parse", "--show-toplevel")
+
+		self.assertEqual(status, source.GitRun(exit_code=0, stdout=b"?? new.txt\n", timed_out=False))
+		self.assertEqual(
+			hooks, source.GitRun(exit_code=0, stdout=f"{EXPECTED_HOOKS_DIR}\n".encode(), timed_out=False)
+		)
+		self.assertEqual(top, source.GitRun(exit_code=0, stdout=f"{repo}\n".encode(), timed_out=False))
+		self.assertFalse(os.path.exists(os.path.join(stray, ".git")))
+
+	def test_run_git_read_nonzero_exit_is_returned_not_raised(self):
+		sandbox = GitSandbox(self, apps=("custom_app",), erp_ai_worktree=None)
+		result = source.run_git_read(sandbox.repo("custom_app"), "rev-parse", "--verify", "-q", "no-such-ref")
+		self.assertEqual(result, source.GitRun(exit_code=1, stdout=b"", timed_out=False))

@@ -9,8 +9,9 @@ from unittest.mock import patch
 import frappe
 from frappe.tests.utils import FrappeTestCase
 
+from erp_ai import test_utils
 from erp_ai.agent.tools import source
-from erp_ai.test_utils import GitSandbox
+from erp_ai.test_utils import GitSandbox, RealCoreReposUntouchedMixin
 
 ROOT_PATH = "erp_ai.agent.tools.source.get_source_root"
 
@@ -512,7 +513,7 @@ SANDBOX_IDENTITY = f"ERP AI Test\n{SANDBOX_EMAIL}\nERP AI Test\n{SANDBOX_EMAIL}\
 LEAKED_EMAIL = "real.person@example.com"
 
 
-class TestGitSandbox(FrappeTestCase):
+class TestGitSandbox(RealCoreReposUntouchedMixin, FrappeTestCase):
 	def make_fake_home(self) -> str:
 		"""A HOME whose `.gitconfig` sets a real-looking identity and a global commit-msg hook that adds it."""
 		home = os.path.realpath(tempfile.mkdtemp())
@@ -534,6 +535,7 @@ class TestGitSandbox(FrappeTestCase):
 		self.assertEqual(source.get_source_root(), real_root)
 
 		host = unittest.TestCase()
+		self.addCleanup(host.doCleanups)
 		sandbox = GitSandbox(host)
 		self.assertEqual(source.get_source_root(), sandbox.root)
 		self.assertNotEqual(sandbox.root, real_root)
@@ -649,3 +651,269 @@ class TestGitSandbox(FrappeTestCase):
 			with self.subTest(app=app):
 				with self.assertRaises(ValueError):
 					sandbox.git(app, "status")
+
+	def test_git_sandbox_refuses_root_and_missing_repo(self):
+		sandbox = GitSandbox(self, apps=("custom_app",), erp_ai_worktree=None)
+		for app in ("", ".", "custom_app/.."):
+			with self.subTest(app=app):
+				with self.assertRaisesRegex(ValueError, "outside"):
+					sandbox.git(app, "status")
+		with self.assertRaisesRegex(ValueError, "no repo missing_app"):
+			sandbox.git("missing_app", "status")
+		self.assertFalse(os.path.exists(sandbox.repo("missing_app")))
+
+	def test_git_sandbox_never_searches_above_its_apps_root(self):
+		sandbox = GitSandbox(self, apps=("custom_app",), erp_ai_worktree=None)
+		self.assertEqual(sandbox.env()["GIT_CEILING_DIRECTORIES"], sandbox.root)
+		shutil.copytree(os.path.join(sandbox.repo("custom_app"), ".git"), os.path.join(sandbox.root, ".git"))
+		os.makedirs(sandbox.repo("plain"))
+		with self.assertRaisesRegex(AssertionError, "not a git repository"):
+			sandbox.git("plain", "rev-parse", "--show-toplevel")
+
+	def test_git_sandbox_write_keeps_path_inside_repo(self):
+		sandbox = GitSandbox(self, apps=("custom_app", "frappe"), erp_ai_worktree=None)
+		escape = os.path.join(sandbox.root, "escape.py")
+		cases = {
+			"commit_file": lambda rel: sandbox.commit_file("custom_app", rel, "x = 1\n"),
+			"stage": lambda rel: sandbox.stage("custom_app", rel, "x = 1\n"),
+			"write_unstaged": lambda rel: sandbox.write_unstaged("custom_app", rel, "x = 1\n"),
+		}
+		for name, call in cases.items():
+			for rel in ("../escape.py", escape, "../frappe/README.md", "", "."):
+				with self.subTest(helper=name, rel=rel):
+					with self.assertRaisesRegex(ValueError, "outside"):
+						call(rel)
+		self.assertFalse(os.path.exists(escape))
+		with open(os.path.join(sandbox.repo("frappe"), "README.md"), encoding="utf-8") as handle:
+			self.assertEqual(handle.read(), "# frappe\n")
+		self.assertEqual(sandbox.git("custom_app", "status", "--porcelain"), "")
+
+	def test_sandbox_state_helpers_produce_expected_git_state(self):
+		sandbox = GitSandbox(self, apps=("custom_app",), erp_ai_worktree=None)
+		app = "custom_app"
+		first = sandbox.git(app, "rev-parse", "HEAD").strip()
+		git_dir = os.path.join(sandbox.repo(app), ".git")
+
+		with self.subTest(helper="add_remote"):
+			sandbox.add_remote(app)
+			self.assertEqual(sandbox.git(app, "rev-list", "--count", "@{u}..HEAD"), "2\n")
+			self.assertEqual(sandbox.git(app, "rev-parse", "--abbrev-ref", "@{u}"), "origin/main\n")
+			self.assertEqual(sandbox.git(app, "rev-parse", "@{u}"), first + "\n")
+			self.assertEqual(
+				sandbox.git(app, "config", "--get", "remote.origin.url"), "https://x-token-FAKE@host/r.git\n"
+			)
+			bare = sandbox.remote_dir(app)
+			self.assertEqual(os.path.commonpath([sandbox.base, bare]), sandbox.base)
+			self.assertNotEqual(os.path.commonpath([sandbox.root, bare]), sandbox.root)
+			self.assertEqual(sandbox.git(app, "ls-remote", "--heads", bare), f"{first}\trefs/heads/main\n")
+			with open(os.path.join(git_dir, "config"), encoding="utf-8") as handle:
+				config = handle.read()
+			self.assertNotIn(bare, config)
+			self.assertEqual(
+				sandbox.git(app, "log", "--format=%s", "@{u}..HEAD"), "ahead commit 2\nahead commit 1\n"
+			)
+
+		with self.subTest(helper="switch_branch"):
+			head = sandbox.git(app, "rev-parse", "HEAD")
+			sandbox.switch_branch(app, "feature")
+			self.assertEqual(sandbox.git(app, "rev-parse", "--abbrev-ref", "HEAD"), "feature\n")
+			self.assertEqual(sandbox.git(app, "rev-parse", "HEAD"), head)
+			sandbox.switch_branch(app, "main", create=False)
+			self.assertEqual(sandbox.git(app, "rev-parse", "--abbrev-ref", "HEAD"), "main\n")
+
+		with self.subTest(helper="detach"):
+			head = sandbox.git(app, "rev-parse", "HEAD")
+			sandbox.detach(app)
+			self.assertEqual(sandbox.git(app, "rev-parse", "--abbrev-ref", "HEAD"), "HEAD\n")
+			self.assertEqual(sandbox.git(app, "rev-parse", "HEAD"), head)
+			sandbox.switch_branch(app, "main", create=False)
+
+		head = sandbox.git(app, "rev-parse", "HEAD")
+		for kind in ("MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD"):
+			with self.subTest(helper="mark_in_progress", kind=kind):
+				sandbox.mark_in_progress(app, kind)
+				with open(os.path.join(git_dir, kind), encoding="utf-8") as handle:
+					self.assertEqual(handle.read(), head)
+		with self.subTest(helper="mark_in_progress", kind="rebase-merge"):
+			sandbox.mark_in_progress(app, "rebase-merge")
+			rebase = os.path.join(git_dir, "rebase-merge")
+			self.assertTrue(os.path.isdir(rebase))
+			with open(os.path.join(rebase, "head-name"), encoding="utf-8") as handle:
+				self.assertEqual(handle.read(), "refs/heads/main\n")
+			with open(os.path.join(rebase, "onto"), encoding="utf-8") as handle:
+				self.assertEqual(handle.read(), head)
+
+		with self.subTest(helper="hold_index_lock"):
+			sandbox.hold_index_lock(app)
+			self.assertTrue(os.path.isfile(os.path.join(git_dir, "index.lock")))
+			with self.assertRaisesRegex(AssertionError, "index.lock"):
+				sandbox.stage(app, "blocked.py", "x = 1\n")
+
+	def test_mark_in_progress_is_seen_by_git_status(self):
+		expected = {
+			"MERGE_HEAD": "All conflicts fixed but you are still merging.",
+			"rebase-merge": "You are currently rebasing branch 'main'",
+			"CHERRY_PICK_HEAD": "You are currently cherry-picking commit",
+			"REVERT_HEAD": "You are currently reverting commit",
+		}
+		for kind, line in expected.items():
+			with self.subTest(kind=kind):
+				sandbox = GitSandbox(self, apps=("custom_app",), erp_ai_worktree=None)
+				self.assertNotIn(line, sandbox.git("custom_app", "status"))
+				sandbox.mark_in_progress("custom_app", kind)
+				self.assertIn(line, sandbox.git("custom_app", "status"))
+
+	def test_state_helpers_on_worktree_use_its_own_git_dir(self):
+		sandbox = GitSandbox(self, apps=("erp_ai",))
+		admin = os.path.join(sandbox.repo("erp_ai"), ".git", "worktrees", "erp_ai-wt")
+		sandbox.mark_in_progress("erp_ai-wt", "MERGE_HEAD")
+		sandbox.hold_index_lock("erp_ai-wt")
+		self.assertTrue(os.path.isfile(os.path.join(admin, "MERGE_HEAD")))
+		self.assertTrue(os.path.isfile(os.path.join(admin, "index.lock")))
+		self.assertFalse(os.path.exists(os.path.join(sandbox.repo("erp_ai"), ".git", "MERGE_HEAD")))
+
+	def test_state_helpers_error_branches(self):
+		sandbox = GitSandbox(self, apps=("custom_app",), erp_ai_worktree=None)
+		app = "custom_app"
+		with self.subTest(case="unknown kind"):
+			with self.assertRaisesRegex(ValueError, "unknown in-progress kind: 'bisect'"):
+				sandbox.mark_in_progress(app, "bisect")
+		with self.subTest(case="negative ahead"):
+			with self.assertRaisesRegex(ValueError, "ahead must be >= 0"):
+				sandbox.add_remote(app, ahead=-1)
+			self.assertEqual(sandbox.git(app, "remote"), "")
+		with self.subTest(case="ahead zero"):
+			sandbox.add_remote(app, name="mirror", ahead=0)
+			self.assertEqual(sandbox.git(app, "rev-list", "--count", "@{u}..HEAD"), "0\n")
+			self.assertEqual(sandbox.git(app, "rev-parse", "--abbrev-ref", "@{u}"), "mirror/main\n")
+		with self.subTest(case="duplicate remote"):
+			with self.assertRaisesRegex(AssertionError, "already exists"):
+				sandbox.add_remote(app, name="mirror")
+		with self.subTest(case="switch to missing branch"):
+			with self.assertRaisesRegex(AssertionError, "nope"):
+				sandbox.switch_branch(app, "nope", create=False)
+			self.assertEqual(sandbox.git(app, "rev-parse", "--abbrev-ref", "HEAD"), "main\n")
+		with self.subTest(case="create existing branch"):
+			with self.assertRaisesRegex(AssertionError, "already exists"):
+				sandbox.switch_branch(app, "main")
+		with self.subTest(case="add_remote on detached HEAD"):
+			sandbox.detach(app)
+			with self.assertRaisesRegex(AssertionError, "symbolic-ref"):
+				sandbox.add_remote(app, name="other")
+		for helper in ("add_remote", "switch_branch", "detach", "mark_in_progress", "hold_index_lock"):
+			with self.subTest(case="app without repo", helper=helper):
+				args = {"switch_branch": ("x",), "mark_in_progress": ("MERGE_HEAD",)}.get(helper, ())
+				with self.assertRaisesRegex(ValueError, "no repo missing_app"):
+					getattr(sandbox, helper)("missing_app", *args)
+		with self.assertRaisesRegex(ValueError, "no repo missing_app"):
+			sandbox.install_marker_hooks("missing_app")
+
+	def test_install_marker_hooks_records_hooks_only_when_asked(self):
+		sandbox = GitSandbox(self, apps=("custom_app",), erp_ai_worktree=None)
+		app = "custom_app"
+		markers = sandbox.install_marker_hooks(app)
+		self.assertEqual(os.path.commonpath([sandbox.base, markers]), sandbox.base)
+		self.assertEqual(os.listdir(markers), [])
+		hooks_dir = os.path.join(sandbox.repo(app), ".git", "hooks")
+		for hook in test_utils.MARKER_HOOKS:
+			with self.subTest(hook=hook):
+				self.assertTrue(os.access(os.path.join(hooks_dir, hook), os.X_OK))
+		self.assertEqual(
+			test_utils.MARKER_HOOKS,
+			(
+				"pre-commit",
+				"prepare-commit-msg",
+				"commit-msg",
+				"post-commit",
+				"post-index-change",
+				"reference-transaction",
+			),
+		)
+
+		sandbox.commit_file(app, "quiet.py", "x = 1\n")
+		sandbox.switch_branch(app, "side")
+		sandbox.add_remote(app)
+		self.assertEqual(os.listdir(markers), [])
+
+		sandbox.write_unstaged(app, "loud.py", "x = 2\n")
+		with self.assertRaisesRegex(AssertionError, "git commit"):
+			sandbox.git(app, "add", "--", "loud.py", run_hooks=True)
+			sandbox.git(app, "commit", "--quiet", "-m", "loud", "--", "loud.py", run_hooks=True)
+		self.assertEqual(sorted(os.listdir(markers)), ["post-index-change", "pre-commit"])
+		self.assertEqual(sandbox.git(app, "log", "-1", "--format=%s"), "ahead commit 2\n")
+
+		sandbox.git(app, "commit", "--quiet", "--no-verify", "-m", "loud", "--", "loud.py", run_hooks=True)
+		self.assertEqual(
+			sorted(os.listdir(markers)),
+			["post-commit", "post-index-change", "pre-commit", "prepare-commit-msg", "reference-transaction"],
+		)
+
+	def test_commit_file_runs_marker_hooks_when_asked(self):
+		sandbox = GitSandbox(self, apps=("custom_app",), erp_ai_worktree=None)
+		markers = sandbox.install_marker_hooks("custom_app")
+		with self.assertRaisesRegex(AssertionError, "git commit"):
+			sandbox.commit_file("custom_app", "loud.py", "x = 1\n", run_hooks=True)
+		self.assertIn("pre-commit", os.listdir(markers))
+
+
+class TestRealCoreReposUntouchedMixin(unittest.TestCase):
+	def make_probe(self):
+		return type("Probe", (RealCoreReposUntouchedMixin, unittest.TestCase), {"runTest": lambda self: None})
+
+	def test_real_core_repos_snapshot_reads_the_four_core_repos(self):
+		snapshot = test_utils.real_core_repos_snapshot()
+		self.assertEqual(sorted(snapshot), ["erpnext", "frappe", "helpdesk", "hrms"])
+		for app, (head, _status) in snapshot.items():
+			with self.subTest(app=app):
+				self.assertRegex(head, r"^[0-9a-f]{40}$")
+		self.assertEqual(test_utils.real_core_repos_snapshot(), snapshot)
+
+	def test_real_core_repos_snapshot_runs_only_read_commands(self):
+		calls = []
+
+		def fake_run(args, **kwargs):
+			calls.append((args, kwargs))
+			return subprocess.CompletedProcess(args, 0, stdout="abc\n", stderr="")
+
+		with patch("erp_ai.test_utils.subprocess.run", side_effect=fake_run):
+			snapshot = test_utils.real_core_repos_snapshot()
+		apps_dir = os.path.join(frappe.utils.get_bench_path(), "apps")
+		expected = []
+		for app in ("frappe", "erpnext", "helpdesk", "hrms"):
+			repo = os.path.join(apps_dir, app)
+			expected.append(["git", "-C", repo, "--no-optional-locks", "rev-parse", "HEAD"])
+			expected.append(["git", "-C", repo, "--no-optional-locks", "status", "--porcelain"])
+		self.assertEqual([args for args, _ in calls], expected)
+		for _, kwargs in calls:
+			self.assertEqual(kwargs["stdin"], subprocess.DEVNULL)
+			self.assertNotIn("GIT_DIR", kwargs["env"])
+		self.assertEqual(snapshot["hrms"], ("abc", "abc\n"))
+
+	def test_real_core_repos_snapshot_fails_on_git_error(self):
+		failed = subprocess.CompletedProcess([], 128, stdout="", stderr="fatal: not a git repository")
+		with patch("erp_ai.test_utils.subprocess.run", return_value=failed):
+			with self.assertRaisesRegex(AssertionError, "not a git repository"):
+				test_utils.real_core_repos_snapshot()
+
+	def test_real_core_repos_mixin_detects_change(self):
+		probe = self.make_probe()
+		clean = {app: ("a" * 40, "") for app in ("frappe", "erpnext", "helpdesk", "hrms")}
+		marked = dict(clean, hrms=("a" * 40, "?? erp_ai_marker.txt\n"))
+		moved = dict(clean, frappe=("b" * 40, ""))
+		with patch("erp_ai.test_utils.real_core_repos_snapshot", side_effect=[clean, marked]):
+			probe.setUpClass()
+			with self.assertRaisesRegex(AssertionError, r"hrms.*erp_ai_marker\.txt"):
+				probe.tearDownClass()
+		with patch("erp_ai.test_utils.real_core_repos_snapshot", side_effect=[clean, moved]):
+			probe.setUpClass()
+			with self.assertRaisesRegex(AssertionError, "frappe"):
+				probe.tearDownClass()
+		with patch("erp_ai.test_utils.real_core_repos_snapshot", side_effect=[clean, dict(clean)]):
+			probe.setUpClass()
+			probe.tearDownClass()
+
+	def test_real_core_repos_mixin_on_real_repos_passes_when_untouched(self):
+		probe = self.make_probe()
+		probe.setUpClass()
+		self.assertEqual(sorted(probe._real_core_repos_before), ["erpnext", "frappe", "helpdesk", "hrms"])
+		probe.tearDownClass()

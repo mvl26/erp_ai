@@ -22,7 +22,9 @@ frappe.ui.form.on("ERP AI Change Proposal", {
 			add_action_button(
 				frm,
 				__("Từ chối"),
-				frappe.utils.escape_html(__("Từ chối đề xuất này? Không có gì được ghi.")),
+				frappe.utils.escape_html(
+					__("Từ chối đề xuất này? Không có file nào được ghi, không có lệnh nào chạy.")
+				),
 				"erp_ai.erp_ai_agent.doctype.erp_ai_change_proposal.erp_ai_change_proposal.reject"
 			);
 		}
@@ -32,7 +34,7 @@ frappe.ui.form.on("ERP AI Change Proposal", {
 				__("Hoàn tác"),
 				frappe.utils.escape_html(
 					__(
-						"Hoàn tác thay đổi này? File được ghi lại như cũ và có một commit hoàn tác."
+						"Hoàn tác thay đổi này? File trở lại như trước khi áp dụng (file mới thì bị xóa) và có một commit hoàn tác."
 					)
 				),
 				"erp_ai.erp_ai_agent.doctype.erp_ai_change_proposal.erp_ai_change_proposal.undo"
@@ -42,7 +44,11 @@ frappe.ui.form.on("ERP AI Change Proposal", {
 });
 
 function approve_confirm_message(frm, notes) {
-	const lines = [__("Duyệt đề xuất này? File sẽ được ghi và có một commit.")];
+	// A bench command runs and cannot be undone; only a code change writes a file and commits.
+	const lines =
+		frm.doc.change_kind === "Lệnh bench"
+			? [__("Duyệt đề xuất này? Lệnh bench sẽ chạy."), __("Lệnh bench không hoàn tác được.")]
+			: [__("Duyệt đề xuất này? File sẽ được ghi và có một commit.")];
 	const branch_note = notes.find((note) => note.startsWith(BRANCH_NOTE_PREFIX));
 	if (branch_note) {
 		lines.push(branch_note);

@@ -824,6 +824,33 @@ UNDO_PATH = "erp_ai.erp_ai_agent.doctype.erp_ai_change_proposal.erp_ai_change_pr
 ROLE_CHECK = 'frappe.user.has_role("ERP AI Instructor")'
 
 
+def _without_comments(source: str) -> str:
+	"""The script text with `//` and `/* */` comments removed; string literals are kept as they are."""
+	return re.sub(
+		r'("(?:\\.|[^"\\\n])*")|/\*.*?\*/|//[^\n]*',
+		lambda match: match.group(1) or "",
+		source,
+		flags=re.DOTALL,
+	)
+
+
+def _statement(code: str) -> str:
+	"""Regex for `code` written in full, allowing any line breaks and indent the formatter adds."""
+	parts = []
+	for token in re.split(r"(\s+|[\(\)\[\]])", code):
+		if not token:
+			continue
+		if token.isspace():
+			parts.append(r"\s+")
+		elif token in "([":
+			parts.append(re.escape(token) + r"\s*")
+		elif token in ")]":
+			parts.append(r"\s*,?\s*" + re.escape(token))
+		else:
+			parts.append(re.escape(token))
+	return "".join(parts)
+
+
 def _button_pattern(label: str, method_path: str) -> str:
 	"""One `add_action_button(frm, __("<label>"), <confirm>, "<method>")` call site."""
 	return (
@@ -851,7 +878,8 @@ class TestChangeProposalFormScript(FrappeTestCase):
 	def setUp(self):
 		if not FORM_SCRIPT_PATH.exists():
 			self.fail(f"form script missing: {FORM_SCRIPT_PATH.name}")
-		self.source = FORM_SCRIPT_PATH.read_text(encoding="utf-8")
+		# Every static check reads code only: a call written inside a comment does not count.
+		self.source = _without_comments(FORM_SCRIPT_PATH.read_text(encoding="utf-8"))
 
 	def test_form_script_static_rules(self):
 		source = self.source
@@ -904,6 +932,8 @@ class TestChangeProposalFormScript(FrappeTestCase):
 			self.assertIn("method,", call)
 			self.assertIn("args: { name: frm.doc.name },", call)
 			self.assertIn('type: "POST",', call)
+			self.assertRegex(body[call_at:], _statement("callback: () => frm.reload_doc(),"))
+			self.assertEqual(source.count("frm.reload_doc()"), 1)
 			self.assertEqual(source.count("frappe.call("), 1)
 			self.assertEqual(source.count('type: "POST"'), 1)
 			self.assertEqual(source.count("frappe.confirm("), 1)
@@ -942,11 +972,62 @@ class TestChangeProposalFormScript(FrappeTestCase):
 					"file_path": "myapp/x.js",
 				}
 			)
-			for prefix_name in ("BRANCH_NOTE_PREFIX", "CORE_WARNING_PREFIX"):
+			for prefix_name, note_name in (
+				("BRANCH_NOTE_PREFIX", "Commit sẽ vào nhánh "),
+				("CORE_WARNING_PREFIX", "Cảnh báo app lõi: "),
+			):
 				literal = re.search(r"const " + prefix_name + r' = "([^"]+)";', source)
 				self.assertIsNotNone(literal, prefix_name)
+				self.assertEqual(literal.group(1), note_name)
 				self.assertTrue(any(note.startswith(literal.group(1)) for note in notes), literal.group(1))
-				self.assertIn(prefix_name, body)
+			self.assertRegex(
+				body,
+				_statement(
+					"const branch_note = notes.find((note) => note.startsWith(BRANCH_NOTE_PREFIX));"
+					" if (branch_note) { lines.push(branch_note); }"
+				),
+			)
+			self.assertRegex(
+				body,
+				_statement(
+					"const core_warning = notes.find((note) => note.startsWith(CORE_WARNING_PREFIX));"
+					' if (frm.doc.is_core_app && core_warning) { lines.push(core_warning.split(". ")[0] + "."); }'
+				),
+			)
+			self.assertRegex(body, _statement('return lines.map(frappe.utils.escape_html).join("<br>");'))
+			self.assertEqual(body.count("lines.push("), 2)
+
+		with self.subTest(rule="approve confirmation sentence follows change_kind"):
+			builder = re.search(
+				r"function approve_confirm_message\(frm, notes\) \{\n(.*?)\n\}", source, re.DOTALL
+			)
+			self.assertIsNotNone(builder, "approve_confirm_message missing")
+			body = builder.group(1)
+			command_note = "Lệnh bench không hoàn tác được."
+			self.assertIn(command_note, change_text.proposal_notes({"change_kind": CHANGE_KIND_COMMAND}))
+			# A bench command runs and cannot be undone; only a code change writes a file and commits.
+			self.assertRegex(
+				body,
+				_statement(
+					"const lines = frm.doc.change_kind === "
+					+ json.dumps(CHANGE_KIND_COMMAND, ensure_ascii=False)
+					+ ' ? [__("Duyệt đề xuất này? Lệnh bench sẽ chạy."), __('
+					+ json.dumps(command_note, ensure_ascii=False)
+					+ ')] : [__("Duyệt đề xuất này? File sẽ được ghi và có một commit.")];'
+				),
+			)
+			self.assertEqual(source.count("File sẽ được ghi"), 1)
+
+		with self.subTest(rule="Từ chối and Hoàn tác confirmations state what is written"):
+			pending = _block_after(source, r'frm\.doc\.change_status === "Chờ duyệt"')
+			self.assertNotIn("Không có gì được ghi", source)
+			self.assertIn("Không có file nào được ghi, không có lệnh nào chạy.", pending)
+			applied = _block_after(
+				source,
+				r'frm\.doc\.change_status === "Đã áp dụng" &&\s*frm\.doc\.change_kind === "Thay đổi code"',
+			)
+			self.assertNotIn("File được ghi lại như cũ", source)
+			self.assertIn("file mới thì bị xóa", applied)
 
 		with self.subTest(rule="no HTML built by concatenation"):
 			self.assertNotIn("`", source)

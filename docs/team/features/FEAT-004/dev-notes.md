@@ -106,8 +106,11 @@ ui false, người kiểm sau G4. Test tự động chỉ đọc chữ của `er
 
 - [ ] Người có role `ERP AI Instructor`, đề xuất `Chờ duyệt`: thấy `Duyệt` và `Từ chối`, không thấy `Hoàn tác`.
 - [ ] `Đã áp dụng` + `Thay đổi code`: chỉ thấy `Hoàn tác`. `Đã áp dụng` + `Lệnh bench`, và các trạng thái khác: không có nút.
-- [ ] Người không có role đó (kể cả `Administrator` nếu không gán role): không có nút nào.
+- [ ] Người dùng thường không có role đó: không có nút nào.
+- [ ] `Administrator`: Frappe cho `Administrator` mọi role (`frappe/permissions.py:519-520`), nên `frappe.user.has_role` trả về đúng và các nút VẪN HIỆN. Bấm `Có` thì server trả 403 (`NEVER_AUTHORITY`, `erp_ai/agent/authority.py:12`), trạng thái đề xuất và git không đổi (AC-5). Đây là kết quả đúng, không phải lỗi.
 - [ ] Bấm nút nào cũng hiện hộp xác nhận trước; bấm "Không" thì không có request. Bấm "Có" thì có 1 request POST, rồi form tải lại và đổi trạng thái.
-- [ ] Hộp xác nhận của `Duyệt` lặp lại câu "Commit sẽ vào nhánh …" và, với app lõi, câu đầu của cảnh báo app lõi.
+- [ ] Hộp xác nhận của `Duyệt` trên đề xuất `Thay đổi code` nói "File sẽ được ghi và có một commit.", lặp lại câu "Commit sẽ vào nhánh …" và, với app lõi, câu đầu của cảnh báo app lõi.
+- [ ] Hộp xác nhận của `Duyệt` trên đề xuất `Lệnh bench` nói "Lệnh bench sẽ chạy." và "Lệnh bench không hoàn tác được."; không có câu "File sẽ được ghi".
+- [ ] Hộp xác nhận của `Từ chối` nói "Không có file nào được ghi, không có lệnh nào chạy."; của `Hoàn tác` nói file trở lại như trước khi áp dụng (file mới thì bị xóa).
 - [ ] Dòng giới thiệu đầu form hiện đủ câu của `change_notes`, mỗi câu một dòng; màu cam khi `is_core_app`, xanh khi không. Câu có ký tự `<`, `&` hiện đúng chữ, không thành thẻ HTML.
 - [ ] Server vẫn từ chối khi gọi thẳng method (đã có test tự động ở `TestChangeProposalMethods`; nút chỉ để tiện, AC-5).

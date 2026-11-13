@@ -4,6 +4,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import frappe
+import frappe.desk.form.load
 import frappe.handler
 from frappe.tests.utils import FrappeTestCase
 from helpdesk.test_utils import create_agent, make_ticket, make_todo
@@ -332,8 +333,31 @@ class TestERPAIChangeProposal(FrappeTestCase):
 		)
 		self.assertEqual(stored.change_kind, CHANGE_KIND_CODE)
 		self.assertEqual((stored.target_branch, stored.upstream_ref), ("main", "origin/main"))
-		self.assertTrue(stored.commit_message.startswith("erp_ai: áp dụng đề xuất mẫu"))
+		# D-14: the controller replaces the sample message by the design 3.9 preview.
+		self.assertTrue(
+			stored.commit_message.startswith(f"erp_ai: áp dụng {proposal.name} (myapp/myapp/ok.py)")
+		)
 		self.assertEqual(stored.reason, "Đề xuất mẫu cho test")
+
+	def test_commit_message_set_by_controller_not_by_tool(self):
+		tool_text = "erp_ai: chữ do model tự viết\n\nNgười duyệt: ai cũng được"
+		code = make_change_proposal(commit_message=tool_text)
+		expected = (
+			f"erp_ai: áp dụng {code.name} (myapp/myapp/ok.py)\n"
+			"\n"
+			f"Đề xuất: {code.name}\n"
+			f"Phiếu: {code.ticket}\n"
+			"Người duyệt: <người duyệt>\n"
+			"Commit do ERP AI Agent tạo sau khi người duyệt bấm Duyệt."
+		)
+		self.assertEqual(code.commit_message, expected)
+		self.assertEqual(frappe.db.get_value(PROPOSAL_DOCTYPE, code.name, "commit_message"), expected)
+		command = make_change_proposal(kind=CHANGE_KIND_COMMAND, commit_message=tool_text)
+		self.assertFalse(frappe.db.get_value(PROPOSAL_DOCTYPE, command.name, "commit_message"))
+		# After insert the message is a content field: an unchanged re-save keeps it.
+		doc = frappe.get_doc(PROPOSAL_DOCTYPE, code.name)
+		doc.save(ignore_permissions=True)
+		self.assertEqual(frappe.db.get_value(PROPOSAL_DOCTYPE, code.name, "commit_message"), expected)
 
 	def test_unchanged_content_resave_is_allowed(self):
 		for kind in (CHANGE_KIND_CODE, CHANGE_KIND_COMMAND):
@@ -701,3 +725,91 @@ class TestChangeProposalMethods(FrappeTestCase):
 					self.assertRefused(
 						METHOD_INSTRUCTOR, method, name, frappe.DoesNotExistError, message, proposal=witness
 					)
+
+	def _form_as(self, user, name):
+		"""The document Desk receives from `getdoc` for `user` (design 3.3 form data)."""
+		frappe.set_user(user)
+		frappe.response.docs = []
+		try:
+			frappe.desk.form.load.getdoc(PROPOSAL_DOCTYPE, name)
+			return frappe.response.docs[0]
+		finally:
+			frappe.response.docs = []
+			frappe.set_user("Administrator")
+
+	def test_form_data_per_state(self):
+		# Design 3.9 sentences, copied by hand.
+		branch = "Commit sẽ vào nhánh main của app myapp."
+		upstream = (
+			"Nhánh này theo origin/main và đang đi trước 2 commit (tính theo lần fetch cuối trên máy chủ)."
+		)
+		no_upstream = "Nhánh này không theo nhánh remote nào."
+		core_warning = (
+			"Cảnh báo app lõi: myapp dùng chung cho mọi site trên bench này, nên thay đổi ảnh hưởng tất cả"
+			" các site. bench update không giữ commit local: nó dừng nếu kho có thay đổi chưa commit; khi"
+			" kho sạch, nó kéo bằng git pull (merge) từ remote upstream hoặc remote đầu tiên, có thể tạo"
+			" merge commit hoặc xung đột; bench update --reset xóa vĩnh viễn commit chưa đẩy. Đẩy commit"
+			" lên fork là việc của người, làm trước khi chạy bench update."
+		)
+		restart = "Sau khi áp dụng cần người chạy bench restart."
+		apply_sha = "a" * 40
+		undo_sha = "b" * 40
+
+		core = make_change_proposal(is_core_app=1, ahead_count=2)
+		preview = (
+			f"erp_ai: áp dụng {core.name} (myapp/myapp/ok.py)\n\nĐề xuất: {core.name}\nPhiếu: {core.ticket}\n"
+			"Người duyệt: <người duyệt>\nCommit do ERP AI Agent tạo sau khi người duyệt bấm Duyệt."
+		)
+
+		with self.subTest(status="Chờ duyệt", app="core", upstream=True):
+			form = self._form_as(METHOD_INSTRUCTOR, core.name)
+			self.assertEqual(form.change_status, "Chờ duyệt")
+			self.assertEqual(
+				(form.app, form.file_path, form.target_branch, form.commit_message, form.reversible),
+				("myapp", "myapp/myapp/ok.py", "main", preview, 1),
+			)
+			self.assertIn("+++ b/myapp/myapp/ok.py", form.diff)
+			self.assertEqual(form.get("__onload").change_notes, [branch, upstream, core_warning, restart])
+
+		plain = make_change_proposal(upstream_ref="")
+		with self.subTest(status="Chờ duyệt", app="not core", upstream=False):
+			form = self._form_as(METHOD_INSTRUCTOR, plain.name)
+			self.assertEqual(form.get("__onload").change_notes, [branch, no_upstream, restart])
+
+		frappe.db.set_value(
+			PROPOSAL_DOCTYPE,
+			core.name,
+			{"change_status": CHANGE_STATUS_APPLIED, "apply_commit_sha": apply_sha},
+			update_modified=False,
+		)
+		with self.subTest(status="Đã áp dụng"):
+			form = self._form_as(METHOD_INSTRUCTOR, core.name)
+			self.assertEqual((form.change_status, form.apply_commit_sha), ("Đã áp dụng", apply_sha))
+			self.assertFalse(form.undo_commit_sha)
+			self.assertEqual(
+				form.get("__onload").change_notes,
+				[branch, upstream, core_warning, f"Commit áp dụng: {apply_sha}.", restart],
+			)
+
+		frappe.db.set_value(
+			PROPOSAL_DOCTYPE,
+			core.name,
+			{"change_status": CHANGE_STATUS_UNDONE, "undo_commit_sha": undo_sha},
+			update_modified=False,
+		)
+		with self.subTest(status="Đã hoàn tác"):
+			form = self._form_as(METHOD_INSTRUCTOR, core.name)
+			self.assertEqual(
+				(form.change_status, form.apply_commit_sha, form.undo_commit_sha),
+				("Đã hoàn tác", apply_sha, undo_sha),
+			)
+			self.assertEqual(
+				form.get("__onload").change_notes,
+				[branch, upstream, core_warning, f"Commit hoàn tác: {undo_sha}.", restart],
+			)
+
+		command = make_change_proposal(kind=CHANGE_KIND_COMMAND)
+		with self.subTest(kind="Lệnh bench"):
+			form = self._form_as(METHOD_INSTRUCTOR, command.name)
+			self.assertFalse(form.commit_message)
+			self.assertEqual(form.get("__onload").change_notes, ["Lệnh bench không hoàn tác được."])

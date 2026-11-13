@@ -8,8 +8,15 @@ Approved-by:
 # Review 39 — FEAT-004 T39
 
 - Diff: `git diff 99f17b6..team/FEAT-004-task-39` (1 commit `8ff4278`; 2 file, +696/-3)
-- Vòng: 1 (max_rework=3)
-- Verdict: design-defect (T39 ĐỖ, chưa merge; mã không cần đổi; chặn T42, T19)
+- Vòng: 2 (max_rework=3)
+- Verdict: approve (vòng 2, 2026-11-14; vòng 1 là design-defect, gỡ bằng `design-addendum-3.md` QĐ-B1, QĐ-B2; mã `8ff4278` không đổi, merge `0b802ec`)
+
+## Vòng 2 — approve (`git diff 99f17b6..8ff4278`, chấm lại theo phụ lục 3; reviewer chấm lại 2026-11-14 vì lượt approve ở round 44 chưa được ghi vào file)
+- design-defect 1 (STD-DESIGN-2, remote là URL không che được): ADDRESSED bởi QĐ-B1 (`design-addendum-3.md:10-11`); Returns của T39 nay ghi "không theo, `""`/0, URL không xuất hiện"; mã khớp ở bước 7 của `source.py`; ghim bởi `test_branch_remote_set_to_url_never_leaks_it` và `test_upstream_with_url_like_name_is_masked`
+- design gap 2 (STD-DOC-7, hợp đồng lỗi của các hàm đọc): ADDRESSED bởi QĐ-B2 (`design-addendum-3.md:14-19`); `git_head` → `None` khi lỗi, `git_commit_summary` và `git_blob` ném `RuntimeError(GIT_ERROR…)`, `git_blob` → `None` chỉ khi mã 128 sau khi commit đã xác nhận, `git_is_ancestor` → `None` khi lỗi
+- Mọi test của Expect có trong diff (gồm `author_email`, ca commit của người đứng trước commit bot, luật 3 cờ mỗi cờ một subTest với 0 tiến trình con)
+- Review checklist (10): phủ 10/10, không blocker/major mới; 3 điểm nhỏ của vòng 1 giữ nguyên
+- `cmd.test` trên `6cf568e` (chứa merge `0b802ec`): `Ran 1241 tests in 304.203s` / `OK`
 
 ## Vòng 1 — design-defect
 Lớp 1: AC-17, AC-20, AC-21, NFR-8 và luật 3 cờ (`--filters`, `--textconv`, `--ext-diff`) đều có; chỉ 2 file touchpoint. Một câu Returns không thể đạt.
@@ -39,4 +46,4 @@ minor | — | — | 3 điểm nhỏ: test mới gọi `GitSandbox._write` (hàm 
 - `cmd.test` sau merge: chưa có vì chưa merge.
 
 ## deferred
-- Không có.
+- Cho designer: `design.md:348` và `design.md:920` còn chữ cũ của bước 7 và AC-21; gộp QĐ-B1, QĐ-B2 vào (phụ lục 3 đang là căn cứ; không chặn).

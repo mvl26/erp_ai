@@ -20,6 +20,40 @@ class TestCheckWritePath(FrappeTestCase):
 		self.assertEqual(source.get_source_root(), self.root)
 		self.assertTrue(self.root.startswith(self.apps.base + os.sep))
 
+	def test_refusal_wording_matches_design_table(self):
+		self.assertEqual(
+			(
+				change_guard.PATH_INVALID,
+				change_guard.APP_NOT_ALLOWED,
+				change_guard.NAME_FORBIDDEN,
+				change_guard.EXT_FORBIDDEN,
+				change_guard.GIT_DIR,
+			),
+			(
+				"đường dẫn không hợp lệ hoặc nằm ngoài apps/",
+				"app không có trong danh sách được sửa",
+				"tên file thuộc loại bí mật hoặc được bảo vệ",
+				"đuôi file không được phép",
+				"không được chạm thư mục .git",
+			),
+		)
+
+	def test_double_refusal_returns_earlier_reason_of_table_order(self):
+		for rel, expected in (
+			("otherapp/.env", change_guard.APP_NOT_ALLOWED),
+			("otherapp/run.sh", change_guard.APP_NOT_ALLOWED),
+			("otherapp/.git/x.py", change_guard.APP_NOT_ALLOWED),
+			("myapp/.git/run.sh", change_guard.EXT_FORBIDDEN),
+			("myapp/.git/config", change_guard.EXT_FORBIDDEN),
+			("myapp/.git/secret.py", change_guard.NAME_FORBIDDEN),
+		):
+			with self.subTest(rel=rel):
+				self.assertEqual(self.reason(rel, new_file=True), expected)
+
+	def test_refuses_absolute_path_even_inside_root(self):
+		self.apps.write("myapp/ok.py", "x = 1\n")
+		self.assertEqual(self.reason(os.path.join(self.root, "myapp", "ok.py")), change_guard.PATH_INVALID)
+
 	def test_refuses_app_not_in_allowed_list(self):
 		self.assertEqual(self.reason("otherapp/ok.py"), change_guard.APP_NOT_ALLOWED)
 		self.assertEqual(self.reason("myapp/ok.py", allowed=()), change_guard.APP_NOT_ALLOWED)
@@ -81,8 +115,6 @@ class TestCheckWritePath(FrappeTestCase):
 		self.assertEqual(self.reason("myapp/.git/info.txt"), change_guard.GIT_DIR)
 		self.assertEqual(self.reason("myapp/.git/hooks/pre_commit.py", new_file=True), change_guard.GIT_DIR)
 		self.assertEqual(self.reason("myapp/sub/.git/x.json", new_file=True), change_guard.GIT_DIR)
-		# No extension: refused earlier by the table order (EXT_FORBIDDEN before GIT_DIR), never allowed.
-		self.assertIsNotNone(self.reason("myapp/.git/config", new_file=True))
 		os.symlink(os.path.join(self.root, "myapp", ".git"), os.path.join(self.root, "myapp", "gitlink"))
 		self.assertEqual(self.reason("myapp/gitlink/info.txt"), change_guard.GIT_DIR)
 

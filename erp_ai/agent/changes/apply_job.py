@@ -44,7 +44,6 @@ APPROVER_LOST_ROLE = "người duyệt không còn quyền"
 SWITCH_OFF = "công tắc đang tắt"
 DIGEST_CHANGED = "nội dung đề xuất đã bị sửa sau khi duyệt"
 STORED_HASH_MISMATCH = "nội dung lưu không khớp dấu"
-BRANCH_CHANGED = "nhánh đang checkout đã đổi từ lúc đề xuất"
 TARGET_CHANGED = "file đích đã đổi kể từ lúc đề xuất"
 FILE_CHANGED_AFTER_APPLY = "file đã đổi sau khi áp dụng, không hoàn tác tự động được"
 WRITE_MISMATCH = "đọc lại sau khi ghi không khớp"
@@ -53,19 +52,10 @@ COMMIT_TIMED_OUT = "git commit quá giờ, file đã được trả lại như c
 COMMIT_UNEXPECTED = "commit vừa tạo không đúng một file của đề xuất"
 # Design table 3.2 (exact wording).
 GIT_COMMIT_MISMATCH = "commit không đúng nội dung đã duyệt, cần người kiểm"
+GIT_BRANCH_CHANGED = "nhánh đang checkout đã đổi kể từ lúc đề xuất"
 COMMAND_FAILED = "lệnh thoát với mã {0}"
 COMMAND_TIMED_OUT = "lệnh chạy quá giờ và đã bị dừng"
 COMMAND_NOT_FOUND = "không tìm thấy lệnh bench"
-# Git states that mean the repo moved since the proposal was made: the proposal is stale, not broken.
-GIT_MOVED_REASONS = (
-	source.GIT_NOT_REPO,
-	source.GIT_NO_COMMIT,
-	source.GIT_DETACHED,
-	source.GIT_LOCKED,
-	source.GIT_IN_PROGRESS,
-	source.GIT_IGNORED,
-	source.GIT_DIRTY,
-)
 
 
 class _Stop(Exception):
@@ -327,12 +317,14 @@ def _apply_code(proposal, actor: str, allowed_apps, deadline: float) -> None:
 		raise _Stop(CHANGE_STATUS_STALE, TARGET_CHANGED)
 	if not new_file and on_disk != proposal.base_hash:
 		raise _Stop(CHANGE_STATUS_STALE, TARGET_CHANGED)
-	state = source.read_git_state(full, new_file=new_file)
+	# Git pre-check (design 4.3 step 4.3 item 2): a git refusal is `Lỗi` (AC-18, ADR-022 decision 7); only
+	# a changed branch is `Hết hiệu lực` (spec D-1, ADR-022 decision 6). A held `index.lock` is refused at
+	# once and never removed; `limit_s` bounds every git read by the job deadline (NFR-3).
+	state = source.read_git_state(full, new_file=new_file, limit_s=_git_limit(deadline))
 	if state.refusal:
-		status = CHANGE_STATUS_STALE if state.refusal in GIT_MOVED_REASONS else CHANGE_STATUS_FAILED
-		raise _Stop(status, state.refusal)
+		raise _Stop(CHANGE_STATUS_FAILED, state.refusal)
 	if state.branch != proposal.target_branch:
-		raise _Stop(CHANGE_STATUS_STALE, BRANCH_CHANGED)
+		raise _Stop(CHANGE_STATUS_STALE, GIT_BRANCH_CHANGED)
 	repo, rel = state.repo_root, state.rel_in_repo
 
 	def give_back():

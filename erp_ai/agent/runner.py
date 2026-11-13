@@ -557,7 +557,7 @@ def _reason(ticket_name, trigger, run_id, settings, context, classification, dea
 		["subject", "description", "status", "priority", "ticket_type", "agent_group", "creation"],
 		as_dict=True,
 	)
-	tools = get_tool_schemas(context.effective_level, bool(context.instructor))
+	tools = get_tool_schemas(context.effective_level, bool(context.instructor), False)
 	if tools:
 		tools[-1]["cache_control"] = {"type": "ephemeral"}
 	system = build_reason_system(settings.prompt_digest, _routing_table(context))

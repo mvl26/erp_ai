@@ -1,3 +1,4 @@
+import dataclasses
 import importlib
 import inspect
 from types import SimpleNamespace
@@ -80,7 +81,11 @@ def _specs():
 	]
 
 
-def _context(level="L1", instructor=None):
+def _specs_with_change():
+	return [*_specs(), _spec("do_change", "change_propose")]
+
+
+def _context(level="L1", instructor=None, change_enabled=False):
 	return ToolContext(
 		ticket_name="TKT-1",
 		effective_level=level,
@@ -88,6 +93,7 @@ def _context(level="L1", instructor=None):
 		run_id="run-1",
 		category_mapping={},
 		agent_user="ai.agent@miyano.com.vn",
+		change_enabled=change_enabled,
 	)
 
 
@@ -115,7 +121,7 @@ class TestRegistry(FrappeTestCase):
 		self.addCleanup(specs_patcher.stop)
 
 	def names(self, level, has_instructor):
-		return [s["name"] for s in get_tool_schemas(level, has_instructor)]
+		return [s["name"] for s in get_tool_schemas(level, has_instructor, False)]
 
 	def test_l0_has_no_tools(self):
 		self.assertEqual(self.names("L0", True), [])
@@ -131,10 +137,10 @@ class TestRegistry(FrappeTestCase):
 		self.assertEqual(self.names("L1", True), ["do_read", "do_ticket", "do_task"])
 
 	def test_returned_schemas_are_copies(self):
-		first = get_tool_schemas("L1", False)
+		first = get_tool_schemas("L1", False, False)
 		first[0]["cache_control"] = {"type": "ephemeral"}
 		first[0]["input_schema"]["properties"].clear()
-		second = get_tool_schemas("L1", False)
+		second = get_tool_schemas("L1", False, False)
 		self.assertNotIn("cache_control", second[0])
 		self.assertIn("query", second[0]["input_schema"]["properties"])
 
@@ -263,7 +269,7 @@ class TestRegistry(FrappeTestCase):
 			patch.object(route_ticket, "create_routed_task") as create_routed_task,
 			patch.object(route_ticket, "post_routing_comment") as post_routing_comment,
 		):
-			granted = [spec["name"] for spec in get_tool_schemas("L3", True)]
+			granted = [spec["name"] for spec in get_tool_schemas("L3", True, False)]
 			for name in ROUTE_FUNCTION_NAMES:
 				self.assertNotIn(name, granted)
 				for given in arguments:
@@ -272,6 +278,76 @@ class TestRegistry(FrappeTestCase):
 					self.assertIn("không được cấp", result["reason"], name)
 		for function in (apply_route, assign_owner, create_routed_task, post_routing_comment):
 			function.assert_not_called()
+
+	def test_tool_context_appends_change_fields_after_routing_config(self):
+		fields = [(f.name, f.default) for f in dataclasses.fields(ToolContext)]
+		self.assertEqual(
+			fields[-3:],
+			[("routing_config", None), ("change_enabled", False), ("allowed_apps", ())],
+		)
+		self.assertEqual(len(fields), 9)
+
+	def test_grant_functions_take_change_enabled_without_default(self):
+		for function in (registry._granted_specs, get_tool_schemas, registry.grants_change_tools):
+			parameters = inspect.signature(function).parameters
+			self.assertEqual(
+				list(parameters), ["effective_level", "has_instructor", "change_enabled"], function.__name__
+			)
+			self.assertIs(parameters["change_enabled"].default, inspect.Parameter.empty, function.__name__)
+
+	def test_change_group_only_when_switch_l3_and_instructor(self):
+		# AC-2 full matrix: 4 levels (+ unknown) x authority x switch; change_propose only at
+		# switch on, L3 and an instructor. Each dropped condition flips one row below.
+		base = ["do_read", "do_ticket"]
+		with_task = ["do_read", "do_ticket", "do_task"]
+		expected = {
+			("L0", False, False): [],
+			("L0", False, True): [],
+			("L0", True, False): [],
+			("L0", True, True): [],
+			("L9", True, True): [],
+			("L1", False, False): base,
+			("L1", False, True): base,
+			("L1", True, False): with_task,
+			("L1", True, True): with_task,
+			("L2", False, False): base,
+			("L2", False, True): base,
+			("L2", True, False): with_task,
+			("L2", True, True): with_task,
+			("L3", False, False): base,
+			("L3", False, True): base,
+			("L3", True, False): with_task,
+			("L3", True, True): ["do_read", "do_ticket", "do_task", "do_change"],
+		}
+		with patch.object(registry, "_all_specs", _specs_with_change):
+			for (level, has_instructor, change_enabled), names in expected.items():
+				key = (level, has_instructor, change_enabled)
+				schemas = get_tool_schemas(level, has_instructor, change_enabled)
+				self.assertEqual([s["name"] for s in schemas], names, key)
+				self.assertIs(
+					registry.grants_change_tools(level, has_instructor, change_enabled),
+					key == ("L3", True, True),
+					key,
+				)
+
+	def test_execute_rejects_change_tool_when_not_granted(self):
+		denied = (
+			_context("L3", "boss@x.com", change_enabled=False),
+			_context("L3", None, change_enabled=True),
+			_context("L2", "boss@x.com", change_enabled=True),
+			_context("L1", "boss@x.com", change_enabled=True),
+			_context("L0", "boss@x.com", change_enabled=True),
+		)
+		with patch.object(registry, "_all_specs", _specs_with_change):
+			for context in denied:
+				result = execute_tool("do_change", {}, context)
+				self.assertEqual(
+					result,
+					{"ok": False, "reason": "tool không được cấp ở mức/thẩm quyền hiện tại"},
+					context,
+				)
+			granted = execute_tool("do_change", {}, _context("L3", "boss@x.com", change_enabled=True))
+		self.assertEqual(granted, {"ok": True, "echo": {}, "ticket": "TKT-1"})
 
 
 READ_TOOL_NAMES = ["get_ticket", "list_comments", "search_resolved_tickets", "get_record"]
@@ -289,7 +365,7 @@ class TestRealToolSet(FrappeTestCase):
 		self.addCleanup(frappe.db.rollback)
 
 	def names(self, level, has_instructor):
-		return [s["name"] for s in get_tool_schemas(level, has_instructor)]
+		return [s["name"] for s in get_tool_schemas(level, has_instructor, False)]
 
 	def test_tool_names_per_level_and_authority(self):
 		granted = READ_TOOL_NAMES + SOURCE_TOOL_NAMES + TICKET_WRITE_TOOL_NAMES
@@ -299,6 +375,37 @@ class TestRealToolSet(FrappeTestCase):
 			self.assertEqual(self.names(level, False), granted)
 			self.assertEqual(self.names(level, True), granted + TASK_WRITE_TOOL_NAMES)
 		self.assertEqual(len(registry._all_specs()), 11)
+
+	def test_switch_off_tool_names_match_base_for_all_levels_and_authority(self):
+		# AC-1: switch off = the exact tool names of the FEAT-006 base, written out as literals.
+		base = [
+			"get_ticket",
+			"list_comments",
+			"search_resolved_tickets",
+			"get_record",
+			"search_source",
+			"read_source",
+			"git_source",
+			"set_classification",
+			"set_resolution_hint",
+			"post_comment",
+		]
+		expected = {
+			("L0", False): [],
+			("L0", True): [],
+			("L1", False): base,
+			("L1", True): [*base, "create_task"],
+			("L2", False): base,
+			("L2", True): [*base, "create_task"],
+			("L3", False): base,
+			("L3", True): [*base, "create_task"],
+		}
+		for (level, has_instructor), names in expected.items():
+			schemas = get_tool_schemas(level, has_instructor, False)
+			self.assertEqual([s["name"] for s in schemas], names, (level, has_instructor))
+			self.assertFalse(
+				registry.grants_change_tools(level, has_instructor, False), (level, has_instructor)
+			)
 
 	def test_no_write_tool_accepts_doctype_or_field(self):
 		write_specs = [s for s in registry._all_specs() if s.group in ("ticket_write", "task_write")]

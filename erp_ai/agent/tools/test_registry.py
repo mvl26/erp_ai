@@ -511,7 +511,8 @@ class TestRealToolsRunWithoutCommit(FrappeTestCase):
 			"create_task": {"subject": "ERPAI-TEST-T27 việc", "description": "ERPAI-TEST-T27 mô tả"},
 			"propose_file_change": {
 				"path": "erp_ai/README.md",
-				"edits": [{"old": "a", "new": "b"}],
+				"find": ["a"],
+				"replace": ["b"],
 				"reason": "ERPAI-TEST-T27",
 			},
 			"propose_new_file": {"path": "erp_ai/t27.md", "content": "x", "reason": "ERPAI-TEST-T27"},

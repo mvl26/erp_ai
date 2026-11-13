@@ -43,6 +43,12 @@ class TestProposeGrant(FrappeTestCase):
 		for case in (("L3", True, False), ("L3", False, True), ("L2", True, True), ("L0", True, True)):
 			self.assertEqual(names(*case), [], case)
 
+	def test_propose_tool_names_are_the_three_tools(self):
+		names = ("propose_file_change", "propose_new_file", "propose_bench_command")
+		self.assertEqual(propose_change.PROPOSE_TOOL_NAMES, names)
+		self.assertEqual(tuple(spec.name for spec in propose_change.TOOLS), names)
+		self.assertNotIn("propose_delete_file", propose_change.PROPOSE_TOOL_NAMES)
+
 
 class TestProposeChange(FrappeTestCase):
 	def setUp(self):
@@ -77,14 +83,28 @@ class TestProposeChange(FrappeTestCase):
 	def run_tool(self, name, arguments, **context):
 		return execute_tool(name, arguments, self.context(**context))
 
-	def change(self, edits, path=PATH, **context):
-		return self.run_tool(
-			"propose_file_change", {"path": path, "edits": edits, "reason": "sửa theo yêu cầu"}, **context
-		)
+	def change(self, find, replace, path=PATH, **context):
+		arguments = {"path": path, "find": find, "replace": replace, "reason": "sửa theo yêu cầu"}
+		return self.run_tool("propose_file_change", arguments, **context)
 
 	def on_disk(self, rel=REL):
 		with open(os.path.join(self.sandbox.repo(APP), rel), encoding="utf-8", newline="") as handle:
 			return handle.read()
+
+	def disk_hash(self, rel=REL):
+		with open(os.path.join(self.sandbox.repo(APP), rel), "rb") as handle:
+			return hashlib.sha256(handle.read()).hexdigest()
+
+	def git_snapshot(self):
+		return (
+			self.sandbox.git(APP, "rev-parse", "HEAD"),
+			self.sandbox.git(APP, "status", "--porcelain", "--untracked-files=all"),
+		)
+
+	def assert_nothing_created(self):
+		self.assertEqual(self.proposals(), [])
+		self.assertEqual(self.comments(), [])
+		self.assertEqual(self.on_disk(), BEFORE)
 
 	def proposals(self):
 		frappe.set_user("Administrator")
@@ -95,17 +115,19 @@ class TestProposeChange(FrappeTestCase):
 	def comments(self):
 		frappe.set_user("Administrator")
 		rows = frappe.get_all(
-			"Comment", filters=authority.ticket_comment_filters(self.ticket), fields=["content", "owner"]
+			"Comment",
+			filters=authority.ticket_comment_filters(self.ticket),
+			fields=["name", "content", "owner"],
 		)
 		frappe.set_user(AGENT)
 		return rows
 
-	def test_file_change_creates_a_pending_proposal_and_touches_nothing(self):
-		head = self.sandbox.git(APP, "rev-parse", "HEAD")
-		result = self.change([{"old": "x = 1", "new": "x = 2"}, {"old": "y = 1", "new": "y = 3"}])
+	def test_file_change_creates_pending_proposal_and_comment_without_touching_disk(self):
+		file_hash, git_before = self.disk_hash(), self.git_snapshot()
+		result = self.change(["x = 1", "y = 1"], ["x = 2", "y = 3"])
 
-		self.assertEqual(result["ok"], True, result)
-		self.assertEqual(result["status"], CHANGE_STATUS_PENDING)
+		self.assertEqual(set(result), {"ok", "proposal", "status", "comment"}, result)
+		self.assertEqual((result["ok"], result["status"]), (True, "Chờ duyệt"))
 		after = "x = 2\r\n# Tiếng Việt\r\ny = 3\r\n"
 		frappe.set_user("Administrator")
 		doc = frappe.get_doc(PROPOSAL_DOCTYPE, result["proposal"])
@@ -122,61 +144,175 @@ class TestProposeChange(FrappeTestCase):
 		self.assertIn("+x = 2", doc.diff)
 		self.assertIn(doc.name, doc.commit_message)
 		# nothing on disk or in git changed
-		self.assertEqual(self.on_disk(), BEFORE)
-		self.assertEqual(self.sandbox.git(APP, "rev-parse", "HEAD"), head)
-		self.assertEqual(self.sandbox.git(APP, "status", "--porcelain").strip(), "")
+		self.assertEqual(self.disk_hash(), file_hash)
+		self.assertEqual(self.git_snapshot(), git_before)
+		self.assertEqual(self.proposals(), [doc.name])
 		(comment,) = self.comments()
+		self.assertEqual(result["comment"], comment.name)
 		self.assertEqual(comment.owner, AGENT)
-		self.assertIn(doc.name, comment.content)
-		self.assertIn("Chờ duyệt", comment.content)
 		link = f"/app/erp-ai-change-proposal/{doc.name}"
-		self.assertIn(f'<a href="{link}">', comment.content)
+		first = f'<p>Đề xuất <a href="{link}">{doc.name}</a> đang chờ duyệt: sửa <code>{PATH}</code>.</p>'
+		self.assertTrue(comment.content.startswith(first), comment.content)
 		approve = frappe.utils.escape_html(change_link.decision_path(doc.name, "approve"))
 		reject = frappe.utils.escape_html(change_link.decision_path(doc.name, "reject"))
 		self.assertIn(f'<a href="{approve}"><strong>Duyệt</strong></a>', comment.content)
 		self.assertIn(f'<a href="{reject}"><strong>Từ chối</strong></a>', comment.content)
 		self.assertLess(comment.content.index(approve), comment.content.index(reject))
-		self.assertIn("bench restart", comment.content)
+		self.assertIn("<p>Sau khi áp dụng cần người chạy bench restart.</p>", comment.content)
 
-	def test_file_change_refusals_create_nothing(self):
+	def test_finds_replace_by_position_on_the_original_content(self):
+		# out of order, swapping each other's text, and touching without overlapping
+		swapped = self.change(["y = 1", "x = 1"], ["x = 1", "y = 1"])
+		touching = self.change(["x = 1", "\r\n# Tiếng"], ["a", "|"])
+
+		frappe.set_user("Administrator")
+		for result, after in (
+			(swapped, "y = 1\r\n# Tiếng Việt\r\nx = 1\r\n"),
+			(touching, "a| Việt\r\ny = 1\r\n"),
+		):
+			self.assertTrue(result["ok"], result)
+			self.assertEqual(
+				frappe.db.get_value(PROPOSAL_DOCTYPE, result["proposal"], "content_after"), after
+			)
+
+	def test_edit_errors_create_nothing(self):
+		shape = "find và replace phải cùng số phần tử, từ 1 đến 10"
+		no_change = "nội dung sau trùng nội dung trước"
 		cases = (
-			([{"old": "không có", "new": "x"}], PATH, "xuất hiện 0 lần"),
-			([{"old": "= 1", "new": "= 2"}], PATH, "xuất hiện 2 lần"),
-			([{"old": "x = 1", "new": "x = 1"}], PATH, "giống hệt"),
-			([{"old": "", "new": "x"}], PATH, "old không rỗng"),
-			([{"old": "x = 1"}], PATH, "old không rỗng"),
-			([{"old": "x = 1", "new": "x = 2"}], f"{APP}/pkg/missing.py", "không tồn tại"),
-			([{"old": "x", "new": "y"}], "helpdesk/README.md", "không có trong danh sách"),
-			([{"old": "x", "new": "y"}], "erp_ai/README.md", "không có trong danh sách"),
-			([{"old": "x", "new": "y"}], "../etc/passwd", "không hợp lệ"),
+			(["không có"], ["x"], "đoạn find[0] không có trong file"),
+			(["x = 1", "không có"], ["x = 2", "z"], "đoạn find[1] không có trong file"),
+			(["= 1"], ["= 2"], "đoạn find[0] xuất hiện nhiều hơn một lần"),
+			(["x = 1", "= 1"], ["x = 2", "= 2"], "đoạn find[1] xuất hiện nhiều hơn một lần"),
+			(["x = 1\r\n#", "\n# Tiếng"], ["a", "b"], "các đoạn find chồng nhau"),
+			(["# Tiếng Việt", "Tiếng"], ["a", "b"], "các đoạn find chồng nhau"),
+			(["x = 1", "y = 1"], ["x = 2"], shape),
+			(["x = 1"], ["x = 2", "y = 2"], shape),
+			([], [], shape),
+			(["x = 1"], ["x = 1"], no_change),
+			(["x = 1", "y = 1"], ["x = 1", "y = 1"], no_change),
 		)
-		for edits, path, phrase in cases:
-			result = self.change(edits, path)
-			self.assertFalse(result["ok"], (edits, path))
-			self.assertIn(phrase, result["reason"], (edits, path))
-		# an edit that is not an object never reaches the handler
-		self.assertEqual(self.change(["x = 1"]), {"ok": False, "reason": "tham số không hợp lệ: edits"})
+		for find, replace, reason in cases:
+			with self.subTest(find=find, replace=replace):
+				self.assertEqual(self.change(find, replace), {"ok": False, "reason": reason})
+		# shapes the schema refuses before the handler runs
+		for find, replace, key in (
+			(["x = 1"] * 11, ["x = 2"] * 11, "find"),
+			([""], ["x"], "find"),
+			([1], ["x"], "find"),
+			(["x = 1"], ["x" * 20001], "replace"),
+		):
+			with self.subTest(key=key, find=find[:1]):
+				refused = self.change(find, replace)
+				self.assertEqual(refused, {"ok": False, "reason": f"tham số không hợp lệ: {key}"})
+		old_shape = {"path": PATH, "edits": [{"old": "x = 1", "new": "x = 2"}], "reason": "x"}
+		self.assertEqual(
+			self.run_tool("propose_file_change", old_shape),
+			{"ok": False, "reason": "tham số không hợp lệ: find"},
+		)
+		self.assert_nothing_created()
+
+	def test_tool_cannot_insert_non_pending_state(self):
+		real_values = propose_change._code_values
+
+		def forged(*args, **kwargs):
+			return {**real_values(*args, **kwargs), "change_status": "Đã duyệt", "commit_message": "forged"}
+
+		with patch.object(propose_change, "_code_values", side_effect=forged):
+			result = self.change(["x = 1"], ["x = 2"])
+
+		self.assertEqual((result["ok"], result["status"]), (True, "Chờ duyệt"), result)
+		frappe.set_user("Administrator")
+		doc = frappe.get_doc(PROPOSAL_DOCTYPE, result["proposal"])
+		self.assertEqual(doc.change_status, "Chờ duyệt")
+		self.assertEqual(
+			doc.commit_message,
+			f"erp_ai: áp dụng {doc.name} ({PATH})\n\n"
+			f"Đề xuất: {doc.name}\nPhiếu: {self.ticket}\nNgười duyệt: <người duyệt>\n"
+			"Commit do ERP AI Agent tạo sau khi người duyệt bấm Duyệt.",
+		)
+
+	def test_each_guard_refusal_creates_zero_proposals(self):
+		self.sandbox.commit_file(APP, "pkg/big.txt", "a" * (1024 * 1024 + 1))
+		self.sandbox.commit_file(APP, "pkg/latin1.py", b"x = '\xe9'\n")
+		cases = (
+			("../etc/passwd", "đường dẫn không hợp lệ hoặc nằm ngoài apps/"),
+			("helpdesk/README.md", "app không có trong danh sách được sửa"),
+			("erp_ai/README.md", "không được sửa app erp_ai hoặc kho git của nó"),
+			(f"{APP}/pkg/secret_key.py", "tên file thuộc loại bí mật hoặc được bảo vệ"),
+			(f"{APP}/pkg/tool.sh", "đuôi file không được phép"),
+			(f"{APP}/.git/notes.md", "không được chạm thư mục .git"),
+			(
+				f"{APP}/pkg/star*.py",
+				'tên file có ký tự * ? [ ] hoặc bắt đầu bằng ":" hay "-", git không commit an toàn được',
+			),
+			(f"{APP}/pkg/missing.py", "file không tồn tại"),
+			(f"{APP}/pkg/big.txt", "file lớn hơn 1 MiB"),
+			(f"{APP}/pkg/latin1.py", "file không phải UTF-8"),
+		)
+		# erp_ai is on the list here: it is refused all the same
+		allowed = (APP, "erp_ai")
+		for path, reason in cases:
+			with self.subTest(path=path):
+				result = self.change(["x"], ["y"], path, allowed_apps=allowed)
+				self.assertEqual(result, {"ok": False, "reason": reason})
+		self.assert_nothing_created()
+
+	def test_file_of_exactly_one_mib_is_read(self):
+		self.sandbox.commit_file(APP, "pkg/edge.txt", "b" + "a" * (1024 * 1024 - 1))
+		result = self.change(["b"], ["c"], f"{APP}/pkg/edge.txt")
+		self.assertTrue(result["ok"], result)
+
+	def test_git_refusal_creates_zero_proposals(self):
+		target = "pkg/mod.py"
+		for app in ("frappe", "erpnext", "helpdesk"):
+			self.sandbox.commit_file(app, target, BEFORE)
+		self.sandbox.write_unstaged(APP, REL, "x = 9\n")
+		self.sandbox.detach("frappe")
+		self.sandbox.mark_in_progress("erpnext", "MERGE_HEAD")
+		self.sandbox.hold_index_lock("helpdesk")
+		self.sandbox.commit_file("hrms", ".gitignore", "pkg/ignored.py\n")
+		self.sandbox.write_unstaged("hrms", "pkg/ignored.py", BEFORE)
+		cases = (
+			(PATH, "file đích có thay đổi chưa commit"),
+			(f"frappe/{target}", "HEAD của kho git không nằm trên nhánh nào (detached)"),
+			(f"erpnext/{target}", "kho git đang dở merge, rebase, cherry-pick hoặc revert"),
+			(
+				f"helpdesk/{target}",
+				"kho git đang bị khóa (index.lock): có thao tác git khác đang chạy hoặc bị dừng giữa chừng",
+			),
+			("hrms/pkg/ignored.py", "file đích bị git bỏ qua (.gitignore)"),
+		)
+		allowed = (APP, "frappe", "erpnext", "helpdesk", "hrms")
+		for path, reason in cases:
+			with self.subTest(path=path):
+				result = self.change(["x = 1"], ["x = 2"], path, allowed_apps=allowed)
+				self.assertEqual(result, {"ok": False, "reason": reason})
 		self.assertEqual(self.proposals(), [])
 		self.assertEqual(self.comments(), [])
-		self.assertEqual(self.on_disk(), BEFORE)
 
-	def test_erp_ai_is_refused_even_when_listed(self):
-		result = self.change([{"old": "x", "new": "y"}], "erp_ai/README.md", allowed_apps=(APP, "erp_ai"))
-		self.assertFalse(result["ok"])
-		self.assertIn("erp_ai", result["reason"])
-		self.assertEqual(self.proposals(), [])
+	def test_comment_escapes_html_and_adds_restart_note_for_py(self):
+		# `<` and `>` are left out of the path and branch: Frappe's XSS filter rewrites them in Data fields
+		self.sandbox.switch_branch(APP, "a&b\"c'd")
+		self.sandbox.commit_file(APP, "pkg/x&y'z.py", "v = 1\n")
+		self.sandbox.commit_file(APP, "pkg/notes.md", "v = 1\n")
+		python = self.change(["v = 1"], ["v = 2"], f"{APP}/pkg/x&y'z.py")
+		markdown = self.change(["v = 1"], ["v = 2"], f"{APP}/pkg/notes.md")
+		with patch.object(propose_change.change_text, "proposal_notes", return_value=["<script>x</script>"]):
+			scripted = self.change(["y = 1"], ["y = 2"])
+		self.assertTrue(python["ok"], python)
+		self.assertTrue(markdown["ok"], markdown)
+		self.assertTrue(scripted["ok"], scripted)
 
-	def test_dirty_target_and_too_long_file_are_refused(self):
-		with open(os.path.join(self.sandbox.repo(APP), REL), "a", encoding="utf-8") as handle:
-			handle.write("z = 1\n")
-		dirty = self.change([{"old": "x = 1", "new": "x = 2"}])
-		self.assertFalse(dirty["ok"])
-		self.assertIn("chưa commit", dirty["reason"])
-		self.sandbox.commit_file(APP, "pkg/big.py", "a = 1\n" * 4000)
-		big = self.change([{"old": "a = 1\n" * 4000, "new": "b"}], f"{APP}/pkg/big.py")
-		self.assertFalse(big["ok"])
-		self.assertIn("vượt", big["reason"])
-		self.assertEqual(self.proposals(), [])
+		contents = {row.name: row.content for row in self.comments()}
+		python_comment, markdown_comment = contents[python["comment"]], contents[markdown["comment"]]
+		self.assertIn(f"sửa <code>{APP}/pkg/x&amp;y&apos;z.py</code>.</p>", python_comment)
+		self.assertIn(f"<p>Commit sẽ vào nhánh a&amp;b&quot;c&apos;d của app {APP}.</p>", python_comment)
+		self.assertIn("<p>&lt;script&gt;x&lt;/script&gt;</p>", contents[scripted["comment"]])
+		self.assertNotIn("<script>", contents[scripted["comment"]])
+		restart = "<p>Sau khi áp dụng cần người chạy bench restart.</p>"
+		self.assertIn(restart, python_comment)
+		self.assertIn(f"sửa <code>{APP}/pkg/notes.md</code>.</p>", markdown_comment)
+		self.assertNotIn("bench restart", markdown_comment)
 
 	def test_new_file_proposal_and_its_refusals(self):
 		arguments = {"path": f"{APP}/pkg/new_mod.py", "content": "z = 1\n", "reason": "thêm module"}
@@ -237,17 +373,24 @@ class TestProposeChange(FrappeTestCase):
 		self.assertEqual(len(self.proposals()), 2)
 
 	def test_not_granted_without_switch_instructor_or_l3(self):
-		edits = [{"old": "x = 1", "new": "x = 2"}]
-		self.assertEqual(self.change(edits, change_enabled=False), NOT_GRANTED)
-		self.assertEqual(self.change(edits, instructor=None), NOT_GRANTED)
-		self.assertEqual(self.change(edits, effective_level="L2"), NOT_GRANTED)
+		edit = (["x = 1"], ["x = 2"])
+		self.assertEqual(self.change(*edit, change_enabled=False), NOT_GRANTED)
+		self.assertEqual(self.change(*edit, instructor=None), NOT_GRANTED)
+		self.assertEqual(self.change(*edit, effective_level="L2"), NOT_GRANTED)
 		self.assertEqual(self.proposals(), [])
 
 	def test_handler_itself_refuses_without_instructor_or_create_permission(self):
-		arguments = {"path": PATH, "edits": [{"old": "x = 1", "new": "x = 2"}], "reason": "x"}
+		arguments = {"path": PATH, "find": ["x = 1"], "replace": ["x = 2"], "reason": "x"}
 		no_instructor = propose_change.propose_file_change(arguments, self.context(instructor=None))
 		self.assertEqual(no_instructor, {"ok": False, "reason": "không có người ra lệnh"})
 		with patch.object(frappe, "has_permission", return_value=False):
 			no_permission = propose_change.propose_file_change(arguments, self.context())
 		self.assertEqual(no_permission, {"ok": False, "reason": "thiếu quyền tạo đề xuất"})
-		self.assertEqual(self.proposals(), [])
+
+		def comment_refused(doctype, *args, **kwargs):
+			return doctype != "Comment"
+
+		with patch.object(frappe, "has_permission", side_effect=comment_refused):
+			no_comment = propose_change.propose_file_change(arguments, self.context())
+		self.assertEqual(no_comment, {"ok": False, "reason": "thiếu quyền tạo comment"})
+		self.assert_nothing_created()

@@ -143,6 +143,7 @@ POLICY_FIELDS = (
 	"auto_assign_enabled",
 	"code_change_enabled",
 	"code_change_apps",
+	"unrestricted_enabled",
 )
 
 SECRET_READERS = ("get_decrypted_password", "get_password")

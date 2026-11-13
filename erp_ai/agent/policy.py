@@ -53,6 +53,11 @@ def auto_assign_enabled(settings) -> bool:
 	return bool(getattr(settings, "auto_assign_enabled", 0))
 
 
+def unrestricted_enabled(settings) -> bool:
+	"""The only reader of the unrestricted switch; missing or 0 means off."""
+	return bool(getattr(settings, "unrestricted_enabled", 0))
+
+
 def contains_keyword(content) -> bool:
 	keyword = frappe.db.get_single_value(SETTING_DOCTYPE, "trigger_keyword") or ""
 	if not keyword:

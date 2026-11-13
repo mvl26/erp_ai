@@ -381,16 +381,83 @@ class TestPrompts(FrappeTestCase):
 		self.assertEqual(len(blocks), 1)
 		self.assertEqual(blocks[0]["cache_control"], {"type": "ephemeral"})
 		text = blocks[0]["text"]
-		self.assertEqual(text, "\n\n".join([old, block, "DIGEST-XYZ"]))
+		self.assertEqual(text, "\n\n".join([old, block, prompts.ACT_NOW_BLOCK, "DIGEST-XYZ"]))
 		self.assertTrue(text.startswith(prompts.CORE_PROMPT))
 		self.assertEqual(text[: text.index(block)], old + "\n\n")
 
 		no_digest = prompts.build_reason_system("", "", change_tools=True)[0]["text"]
 		self.assertEqual(
-			no_digest, "\n\n".join([prompts.CORE_PROMPT, prompts.CATEGORY_TABLE, prompts.CONVENTIONS, block])
+			no_digest,
+			"\n\n".join(
+				[
+					prompts.CORE_PROMPT,
+					prompts.CATEGORY_TABLE,
+					prompts.CONVENTIONS,
+					block,
+					prompts.ACT_NOW_BLOCK,
+				]
+			),
 		)
 		with self.assertRaises(TypeError):
 			prompts.build_reason_system("DIGEST-XYZ", "ROUTING-ABC", True)
+
+	def test_reason_system_with_site_admin_tools_adds_record_block(self):
+		block = prompts.SITE_ADMIN_TOOLS_BLOCK
+		for tool in ("api_list_records", "api_get_record", "api_create_record", "api_update_record"):
+			self.assertIn(tool, block)
+		for phrase in ("người ra lệnh", "System Manager", "không đặt mật khẩu", "Không xóa", "dữ liệu"):
+			self.assertIn(phrase, block)
+
+		old = prompts.build_reason_system("", "ROUTING-ABC")[0]["text"]
+		text = prompts.build_reason_system("DIGEST-XYZ", "ROUTING-ABC", site_admin_tools=True)[0]["text"]
+		self.assertEqual(text, "\n\n".join([old, block, prompts.ACT_NOW_BLOCK, "DIGEST-XYZ"]))
+		both = prompts.build_reason_system("", "", change_tools=True, site_admin_tools=True)[0]["text"]
+		self.assertTrue(
+			both.endswith("\n\n".join([prompts.CHANGE_TOOLS_BLOCK, block, prompts.ACT_NOW_BLOCK]))
+		)
+		self.assertNotIn(block, prompts.build_reason_system("DIGEST-XYZ", "ROUTING-ABC")[0]["text"])
+
+	def test_reason_system_with_unrestricted_tools_adds_full_access_block(self):
+		block = prompts.UNRESTRICTED_TOOLS_BLOCK
+		for tool in (
+			"api_list_records",
+			"api_get_record",
+			"api_create_record",
+			"api_update_record",
+			"api_delete_record",
+			"api_submit_record",
+			"api_call_method",
+		):
+			self.assertIn(tool, block)
+		for phrase in ("TOÀN QUYỀN", "người ra lệnh", "dữ liệu", "ERP AI Setting", "mật khẩu"):
+			self.assertIn(phrase, block)
+
+		old = prompts.build_reason_system("", "ROUTING-ABC")[0]["text"]
+		text = prompts.build_reason_system("DIGEST-XYZ", "ROUTING-ABC", unrestricted_tools=True)[0]["text"]
+		self.assertEqual(text, "\n\n".join([old, block, prompts.ACT_NOW_BLOCK, "DIGEST-XYZ"]))
+		# the full-access block replaces the record block, never joins it
+		both = prompts.build_reason_system("", "", site_admin_tools=True, unrestricted_tools=True)[0]["text"]
+		self.assertIn(block, both)
+		self.assertNotIn(prompts.SITE_ADMIN_TOOLS_BLOCK, both)
+
+	def test_act_now_block_only_with_action_tools(self):
+		block = prompts.ACT_NOW_BLOCK
+		for phrase in (
+			"LÀM LUÔN, KHÔNG HỎI LẠI",
+			"quy tắc 6",
+			"Cần ai quyết",
+			"Không hỏi lại",
+			"tạo đề xuất luôn",
+			"Nút Duyệt / Từ chối",
+			"xác nhận duy nhất",
+			"người ra lệnh",
+		):
+			self.assertIn(phrase, block)
+		self.assertNotIn(block, prompts.build_reason_system("DIGEST-XYZ", "ROUTING-ABC")[0]["text"])
+		for flags in ({"change_tools": True}, {"site_admin_tools": True}, {"unrestricted_tools": True}):
+			text = prompts.build_reason_system("", "", **flags)[0]["text"]
+			self.assertEqual(text.count(block), 1, flags)
+			self.assertTrue(text.endswith(block), flags)
 
 	def _ticket(self, **override):
 		return {

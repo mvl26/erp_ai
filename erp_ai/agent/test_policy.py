@@ -108,6 +108,12 @@ class TestPolicy(FrappeTestCase):
 		set_agent_settings(excluded_teams="\n  \n")
 		self.assertFalse(policy.is_excluded_team(TEAM))
 
+	def test_unrestricted_enabled_reads_switch(self):
+		self.assertTrue(policy.unrestricted_enabled(frappe._dict(unrestricted_enabled=1)))
+		self.assertFalse(policy.unrestricted_enabled(frappe._dict(unrestricted_enabled=0)))
+		self.assertFalse(policy.unrestricted_enabled(frappe._dict(unrestricted_enabled=None)))
+		self.assertFalse(policy.unrestricted_enabled(frappe._dict()))
+
 	def test_auto_assign_enabled_reads_switch(self):
 		self.assertTrue(policy.auto_assign_enabled(frappe._dict(auto_assign_enabled=1)))
 		self.assertFalse(policy.auto_assign_enabled(frappe._dict(auto_assign_enabled=0)))

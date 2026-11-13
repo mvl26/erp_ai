@@ -8,6 +8,7 @@ from frappe.utils import get_fullname
 from erp_ai import gateway
 from erp_ai.agent import authority, policy, site_facts
 from erp_ai.agent.answer_delay import AnswerDelay
+from erp_ai.agent.changes import transitions
 from erp_ai.agent.classification import load_mapping, parse_classification
 from erp_ai.agent.prompts import (
 	build_classify_request,
@@ -19,7 +20,14 @@ from erp_ai.agent.routing import decide_route, departments, load_routing_config,
 from erp_ai.agent.run_log import write_entry
 from erp_ai.agent.run_status import CLASSIFY_STEP, RunStatus
 from erp_ai.agent.tools.read import TOOL_RESULT_MAX_CHARS
-from erp_ai.agent.tools.registry import ToolContext, execute_tool, get_tool_schemas
+from erp_ai.agent.tools.registry import (
+	ToolContext,
+	execute_tool,
+	get_tool_schemas,
+	get_unrestricted_tool_schemas,
+	grants_change_tools,
+	grants_site_admin_tools,
+)
 from erp_ai.agent.tools.route_ticket import (
 	ASSIGN_REQUEST,
 	NO_SLA,
@@ -41,6 +49,7 @@ from erp_ai.constants import (
 	LEVELS,
 	LOG_DOCTYPE,
 	LOGGER_NAME,
+	PROPOSAL_DOCTYPE,
 	SETTING_DOCTYPE,
 	TITLE_RUN_FAILED,
 	TITLE_STATUS_FAILED,
@@ -59,12 +68,23 @@ DEADLINE_KIND = "deadline"
 # The tool whose call is the answer the delay holds back (D-6).
 ANSWER_TOOL = "post_comment"
 # Write tools -> (doctype of the record they touch, key of the result that names it; None = the ticket).
+# A doctype of None means the model names it: it is read from the result, else from the call's arguments.
 WRITE_TOOL_TARGETS = {
 	"set_classification": ("HD Ticket", None),
 	"set_resolution_hint": ("HD Ticket", None),
 	"post_comment": ("Comment", "comment"),
 	"create_task": ("Task", "task"),
+	"propose_file_change": (PROPOSAL_DOCTYPE, "proposal"),
+	"propose_new_file": (PROPOSAL_DOCTYPE, "proposal"),
+	"propose_bench_command": (PROPOSAL_DOCTYPE, "proposal"),
+	"api_create_record": (None, "name"),
+	"api_update_record": (None, "name"),
+	"api_delete_record": (None, "name"),
+	"api_submit_record": (None, "name"),
+	"api_call_method": ("Method", "method"),
 }
+ACTION_DOCTYPE_MAX = 80
+PROPOSE_TOOLS = ("propose_file_change", "propose_new_file", "propose_bench_command")
 UNPARSEABLE_ERROR = "UNPARSEABLE: không phân loại được"
 BAD_MAPPING_ERROR = "category_mapping không hợp lệ, không có giá trị dự đoán"
 BAD_ROUTING_ERROR = "routing_rules không hợp lệ, định tuyến dùng giá trị rỗng"
@@ -144,6 +164,7 @@ def _run(ticket_name, trigger):
 		# One context for the whole run (classification and reasoning); never built at L0, which calls no tool.
 		context = None
 		if level != LEVELS[0]:
+			change = policy.change_settings(settings)
 			context = ToolContext(
 				ticket_name=ticket_name,
 				effective_level=level,
@@ -152,6 +173,9 @@ def _run(ticket_name, trigger):
 				category_mapping=mapping,
 				agent_user=AGENT_USER,
 				routing_config=routing,
+				change_enabled=change.enabled,
+				allowed_apps=change.allowed_apps,
+				unrestricted=policy.unrestricted_enabled(settings),
 			)
 		classification = None
 		if trigger == TRIGGER_TICKET_INSERT:
@@ -557,10 +581,22 @@ def _reason(ticket_name, trigger, run_id, settings, context, classification, dea
 		["subject", "description", "status", "priority", "ticket_type", "agent_group", "creation"],
 		as_dict=True,
 	)
-	tools = get_tool_schemas(context.effective_level, bool(context.instructor), False)
+	grant = (context.effective_level, bool(context.instructor), context.change_enabled)
+	tools = get_tool_schemas(*grant)
+	offered = {tool["name"] for tool in tools}
+	unrestricted_tools = get_unrestricted_tool_schemas(
+		context.effective_level, bool(context.instructor), context.unrestricted
+	)
+	tools.extend(tool for tool in unrestricted_tools if tool["name"] not in offered)
 	if tools:
 		tools[-1]["cache_control"] = {"type": "ephemeral"}
-	system = build_reason_system(settings.prompt_digest, _routing_table(context))
+	system = build_reason_system(
+		settings.prompt_digest,
+		_routing_table(context),
+		change_tools=grants_change_tools(*grant),
+		site_admin_tools=grants_site_admin_tools(*grant),
+		unrestricted_tools=bool(unrestricted_tools),
+	)
 	messages = [{"role": "user", "content": build_initial_message(ticket, labelled, trigger, classification)}]
 	base = {
 		"ticket": ticket_name,
@@ -628,20 +664,24 @@ def _run_tool(block, context, actions, before, after, tool_errors, skipped):
 	A crash is logged as tool name + exception class only (D-20, STD-SEC-6); the model sees the class too.
 	"""
 	name = block["name"]
+	arguments = block.get("input") or {}
 	try:
-		outcome = execute_tool(name, block.get("input") or {}, context)
+		outcome = execute_tool(name, arguments, context)
 	except Exception as exc:
 		tool_errors.append(f"tool {name}: {type(exc).__name__}")
 		if name in WRITE_TOOL_TARGETS:
-			actions.append(_action(name, context, None, False))
+			actions.append(_action(name, context, None, False, arguments))
 		return {
 			"type": "tool_result",
 			"tool_use_id": block["id"],
 			"content": f"Lỗi: {type(exc).__name__}",
 			"is_error": True,
 		}
+	if name in PROPOSE_TOOLS and outcome.get("ok"):
+		# the `propose` step of the proposal's own log trail, written by the agent account
+		transitions.log_step(outcome["proposal"], "propose", context.agent_user)
 	if name in WRITE_TOOL_TARGETS:
-		actions.append(_action(name, context, outcome, bool(outcome.get("ok"))))
+		actions.append(_action(name, context, outcome, bool(outcome.get("ok")), arguments))
 		if outcome.get("ok") and "after" in outcome:
 			before[name] = outcome.get("before")
 			after[name] = outcome["after"]
@@ -651,7 +691,10 @@ def _run_tool(block, context, actions, before, after, tool_errors, skipped):
 	return {"type": "tool_result", "tool_use_id": block["id"], "content": content}
 
 
-def _action(name, context, outcome, ok):
+def _action(name, context, outcome, ok, arguments):
 	doctype, key = WRITE_TOOL_TARGETS[name]
+	if doctype is None:
+		requested = arguments.get("doctype") if isinstance(arguments, dict) else None
+		doctype = str((outcome or {}).get("doctype") or requested or "")[:ACTION_DOCTYPE_MAX] or None
 	record = context.ticket_name if key is None else (outcome or {}).get(key)
 	return {"tool": name, "doctype": doctype, "name": record, "ok": ok}

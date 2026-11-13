@@ -23,10 +23,20 @@ VIETNAMESE_ACCENTS = re.compile(
 DOCTYPE_CONFIG = {
 	"ERP AI Setting": {
 		"folder": "erp_ai_setting",
-		"field_count": 26,
+		"field_count": 27,
 		"phrases": {
 			"enabled": ("Tắt", "4 đơn giá", "từ khóa kích hoạt"),
 			"permission_level": ("L0", "L1", "L2", "L3", "ngân sách"),
+			"unrestricted_enabled": (
+				"L1",
+				"người ra lệnh",
+				"xóa",
+				"System Manager",
+				"Vẫn đóng",
+				"mật khẩu",
+				"Log",
+				"cần gấp",
+			),
 			"max_turns_per_run": ("từ 1 đến 20", "dừng"),
 			"max_runs_per_ticket_per_day": ("từ 1 đến 50", "00:00"),
 			"max_keys_per_call": ("từ 1 đến 10", "báo lỗi"),
@@ -256,9 +266,10 @@ CODE_CHANGE_FIELDS = {
 		"fieldtype": "Check",
 		"label": "Cho phép sửa code và lệnh bench",
 		"default": "0",
-		"description": "Bật thì bot được đề xuất sửa code và lệnh bench, chỉ ở mức L3 và khi có người ra lệnh; "
-		"mọi thay đổi phải được duyệt trên form đề xuất. Mỗi thay đổi đã áp dụng thành một commit git local; "
-		"bot không push. Tắt thì bot trở lại như cũ.",
+		"description": "Bật thì ở mức L3 và khi có người ra lệnh, bot được: (1) tạo và sửa bản ghi trực tiếp theo "
+		"quyền của tài khoản agent, không qua duyệt (không xóa, không submit, không gán vai trò quản trị); "
+		"(2) đề xuất sửa code và lệnh bench, mọi thay đổi code phải được duyệt trên form đề xuất. "
+		"Mỗi thay đổi code đã áp dụng thành một commit git local; bot không push. Tắt thì bot trở lại như cũ.",
 	},
 	"code_change_apps": {
 		"fieldtype": "Small Text",

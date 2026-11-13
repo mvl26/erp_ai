@@ -15,7 +15,7 @@ from erp_ai.constants import (
 	SETTING_DOCTYPE,
 )
 from erp_ai.erp_ai_agent.doctype.erp_ai_setting import erp_ai_setting
-from erp_ai.test_utils import set_agent_settings
+from erp_ai.test_utils import TempAppsRoot, set_agent_settings
 
 PRICES = {
 	"price_input_per_mtok": 1,
@@ -395,6 +395,69 @@ class TestRoutingRules(FrappeTestCase):
 		for raw, message in cases:
 			with self.subTest(raw=raw), self.assertRaisesRegex(frappe.ValidationError, message):
 				self._save_rules(raw)
+
+
+MISSING_DIR_MSG = "Không có thư mục apps/{0}"
+OWN_APP_MSG = "Không được thêm erp_ai vào danh sách app được sửa"
+BAD_NAME_MSG = "Tên app '{0}' không hợp lệ"
+
+
+class TestChangeApps(FrappeTestCase):
+	def setUp(self):
+		self.addCleanup(frappe.db.rollback)
+		frappe.db.delete(CREDENTIAL_DOCTYPE, {"parent": SETTING_DOCTYPE})
+		set_agent_settings(
+			enabled=0,
+			max_turns_per_run=8,
+			max_runs_per_ticket_per_day=5,
+			max_keys_per_call=3,
+			request_timeout_s=60,
+			monthly_budget_usd=10,
+			trigger_keyword="@ai",
+			category_mapping=json.dumps(DEFAULT_CATEGORY_MAPPING),
+			spent_this_month_usd=0,
+			**PRICES,
+		)
+
+	def _save_apps(self, raw):
+		doc = frappe.get_doc(SETTING_DOCTYPE)
+		doc.code_change_apps = raw
+		doc.save()
+		return frappe.db.get_single_value(SETTING_DOCTYPE, "code_change_apps", cache=False)
+
+	def _refusal(self, raw):
+		with self.assertRaises(frappe.ValidationError) as caught:
+			self._save_apps(raw)
+		return frappe.utils.strip_html(str(caught.exception))
+
+	def test_validate_checks_dirs_under_source_root(self):
+		TempAppsRoot(self, apps=("myapp",))
+		self.assertEqual(self._save_apps("myapp"), "myapp")
+		# `erpnext` exists under the real apps/ but not under the patched root: only the given root counts.
+		for name in ("otherapp", "erpnext"):
+			with self.subTest(name=name):
+				self.assertEqual(self._refusal(name), MISSING_DIR_MSG.format(name))
+
+	def test_change_apps_validation(self):
+		sandbox = TempAppsRoot(self, apps=("frappe", "hrms", "erp_ai"))
+		# `../x` resolves to an existing directory, so only the name rule can refuse it.
+		sandbox.write("x/ok.py", "x = 1\n", root=sandbox.base)
+		refusals = [
+			("erp_ai", OWN_APP_MSG),
+			("../x", BAD_NAME_MSG.format("../x")),
+			("nosuch", MISSING_DIR_MSG.format("nosuch")),
+			# Every name/erp_ai line is checked before any directory.
+			("nosuch\nerp_ai", OWN_APP_MSG),
+		]
+		for raw, message in refusals:
+			with self.subTest(raw=raw):
+				self.assertEqual(self._refusal(raw), message)
+		for raw in (None, "", "  \n"):
+			with self.subTest(raw=raw):
+				self.assertEqual(self._save_apps(raw) or "", raw or "")
+		for raw in ("frappe", "hrms", "frappe\nhrms"):
+			with self.subTest(raw=raw):
+				self.assertEqual(self._save_apps(raw), raw)
 
 
 CHECK_KEYS_HD_AGENT = "erpai-test-check-keys-agent@example.com"

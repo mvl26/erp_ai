@@ -2,8 +2,10 @@ import frappe
 from frappe.model.document import Document
 
 from erp_ai import gateway
+from erp_ai.agent import policy
 from erp_ai.agent.classification import validate_mapping
 from erp_ai.agent.routing import validate_routing_config
+from erp_ai.agent.tools import source
 from erp_ai.constants import (
 	ANSWER_DELAY_MAX_S,
 	CREDENTIAL_DOCTYPE,
@@ -59,6 +61,7 @@ class ERPAISetting(Document):
 		self.check_labels()
 		validate_mapping(self.category_mapping)
 		self.check_routing_rules()
+		policy.validate_change_apps(self, source.get_source_root())
 		self.check_limits()
 		self.check_status_settings()
 		self.check_enabled_requirements()

@@ -69,8 +69,22 @@ LAYER_RULES = (
 	),
 	(
 		"erp_ai.agent.tools",
-		("erp_ai.gateway", "erp_ai.agent.runner", "erp_ai.agent.queue"),
-		"ADR-001/ADR-005: tools never call the model, run the agent or enqueue jobs",
+		("erp_ai.gateway", "erp_ai.agent.runner", "erp_ai.agent.queue", "erp_ai.agent.changes"),
+		"ADR-001/ADR-005/ADR-011: tools never call the model, run the agent, enqueue jobs or reach the change job/state machine",
+	),
+	(
+		"erp_ai.agent.changes",
+		(
+			"erp_ai.gateway",
+			"erp_ai.agent.runner",
+			"erp_ai.agent.run_status",
+			"erp_ai.eval",
+			"erp_ai.handlers",
+			"erp_ai.tasks",
+			"erp_ai.install",
+			"erp_ai.erp_ai_agent",
+		),
+		"ADR-012/ADR-013: the change job and state machine never call the model, run the agent or import entry layers and doctype controllers",
 	),
 	(
 		"erp_ai.handlers",
@@ -2074,6 +2088,39 @@ class TestScannersCatchViolations(unittest.TestCase):
 			with self.subTest(rel=rel):
 				rel = rel.partition("#")[0]
 				self.assertCaught(check_layer_imports({rel: source}), rel)
+
+	def test_layer_imports_catches_changes_directions(self):
+		forbidden_from_changes = (
+			"erp_ai.gateway",
+			"erp_ai.agent.runner",
+			"erp_ai.agent.run_status",
+			"erp_ai.eval",
+			"erp_ai.handlers",
+			"erp_ai.tasks",
+			"erp_ai.install",
+			"erp_ai.erp_ai_agent",
+		)
+		for target in forbidden_from_changes:
+			with self.subTest(target=target):
+				source = f"import {target}.x\n"
+				self.assertCaught(check_layer_imports({"agent/changes/transitions.py": source}), target)
+		for rel in ("agent/tools/propose_change.py", "agent/tools/change_guard.py"):
+			with self.subTest(rel=rel):
+				source = "from erp_ai.agent.changes import transitions\n"
+				self.assertCaught(check_layer_imports({rel: source}), "erp_ai.agent.changes")
+		allowed = {
+			"agent/changes/transitions.py": (
+				"from erp_ai.agent.run_log import write_entry\nfrom erp_ai.constants import PROPOSAL_DOCTYPE\n"
+			),
+			"agent/changes/apply_job.py": (
+				"from erp_ai.agent import policy, queue\nfrom erp_ai.agent.changes import transitions\n"
+				"from erp_ai.agent.tools import change_guard, source\nfrom erp_ai.agent import change_text\n"
+			),
+			"erp_ai_agent/doctype/erp_ai_change_proposal/erp_ai_change_proposal.py": (
+				"from erp_ai.agent.changes import transitions\n"
+			),
+		}
+		self.assertEqual(check_layer_imports(allowed), [])
 
 	def test_layer_imports_catches_lazy_and_relative_imports(self):
 		lazy = "def f():\n\tfrom erp_ai.agent.runner import run_for_ticket\n"

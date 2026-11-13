@@ -273,6 +273,59 @@ class TestERPAIChangeProposal(FrappeTestCase):
 			with self.subTest(fieldname=fieldname):
 				self.assertEqual(str(stored[fieldname]), str(value))
 
+	def test_insert_with_non_pending_status_is_forced_pending(self):
+		statuses = (
+			CHANGE_STATUS_REJECTED,
+			CHANGE_STATUS_APPROVED,
+			CHANGE_STATUS_APPLYING,
+			CHANGE_STATUS_APPLIED,
+			CHANGE_STATUS_FAILED,
+			CHANGE_STATUS_STALE,
+			CHANGE_STATUS_UNDOING,
+			CHANGE_STATUS_UNDONE,
+		)
+		self.assertEqual(len(statuses), 8)
+		cleared = {
+			"change_status": "Chờ duyệt",
+			"decided_by": None,
+			"decided_at": None,
+			"approved_digest": None,
+			"undo_by": None,
+			"undo_at": None,
+			"finished_at": None,
+			"exit_code": 0,
+			"duration_ms": 0,
+			"command_output": None,
+			"failure_reason": None,
+			"applied_branch": None,
+			"applied_ahead_count": 0,
+			"apply_commit_sha": None,
+			"undo_commit_sha": None,
+		}
+		self.assertEqual(set(cleared), set(STATE_FIELD_NEW_VALUES))
+		for kind in (CHANGE_KIND_CODE, CHANGE_KIND_COMMAND):
+			for status in statuses:
+				with self.subTest(kind=kind, status=status):
+					proposal = make_change_proposal(
+						kind=kind, **dict(STATE_FIELD_NEW_VALUES, change_status=status)
+					)
+					self.assertEqual(proposal.change_status, CHANGE_STATUS_PENDING)
+					stored = frappe.db.get_value(PROPOSAL_DOCTYPE, proposal.name, list(cleared), as_dict=True)
+					self.assertEqual(stored, cleared)
+
+	def test_insert_keeps_content_fields(self):
+		proposal = make_change_proposal(**dict(STATE_FIELD_NEW_VALUES))
+		stored = frappe.db.get_value(
+			PROPOSAL_DOCTYPE,
+			proposal.name,
+			["change_kind", "target_branch", "upstream_ref", "commit_message", "reason"],
+			as_dict=True,
+		)
+		self.assertEqual(stored.change_kind, CHANGE_KIND_CODE)
+		self.assertEqual((stored.target_branch, stored.upstream_ref), ("main", "origin/main"))
+		self.assertTrue(stored.commit_message.startswith("erp_ai: áp dụng đề xuất mẫu"))
+		self.assertEqual(stored.reason, "Đề xuất mẫu cho test")
+
 	def test_unchanged_content_resave_is_allowed(self):
 		for kind in (CHANGE_KIND_CODE, CHANGE_KIND_COMMAND):
 			with self.subTest(kind=kind):

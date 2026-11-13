@@ -3,6 +3,8 @@ from frappe import _
 from frappe.model.document import Document
 from frappe.utils import cint, cstr
 
+from erp_ai.agent.changes import transitions
+
 # Design 2.1 content group (ADR-012 QĐ 1): written once at insert, never changed afterwards.
 CONTENT_FIELDS = (
 	"ticket",
@@ -37,6 +39,9 @@ def _stored_form(fieldname: str, value):
 
 
 class ERPAIChangeProposal(Document):
+	def before_insert(self):
+		transitions.prepare_new(self)
+
 	def validate(self):
 		if self.is_new():
 			return

@@ -67,6 +67,12 @@ function setupForm({ doc, call, router }) {
 		// A state object left by an older script version has no panel part.
 		state.panel = state.panel || newPanelState();
 
+		// Helpdesk's `[hidden]{display:none}` loses to an inline display, so both are written together.
+		const setIndicatorVisible = (el, visible) => {
+			el.hidden = !visible;
+			el.style.display = visible ? "flex" : "none";
+		};
+
 		const ensureElement = () => {
 			if (state.el) {
 				return state.el;
@@ -74,9 +80,7 @@ function setupForm({ doc, call, router }) {
 			const el = document.createElement("div");
 			el.setAttribute("role", "status");
 			el.setAttribute("aria-live", "polite");
-			el.hidden = true;
 			Object.assign(el.style, INDICATOR_FLOATING_STYLE, {
-				display: "flex",
 				alignItems: "center",
 				gap: "8px",
 				padding: "8px 12px",
@@ -86,6 +90,7 @@ function setupForm({ doc, call, router }) {
 				boxShadow: "0 1px 4px rgba(0, 0, 0, 0.12)",
 				fontSize: "13px",
 			});
+			setIndicatorVisible(el, false);
 			const dots = document.createElement("span");
 			dots.style.display = "inline-flex";
 			dots.style.gap = "3px";
@@ -120,7 +125,7 @@ function setupForm({ doc, call, router }) {
 		const render = () => {
 			const el = ensureElement();
 			if (state.runs.size === 0) {
-				el.hidden = true;
+				setIndicatorVisible(el, false);
 				return;
 			}
 			let latest = null;
@@ -131,7 +136,7 @@ function setupForm({ doc, call, router }) {
 			}
 			state.nameEl.textContent = latest.name || "";
 			state.textEl.textContent = latest.text || "";
-			el.hidden = false;
+			setIndicatorVisible(el, true);
 		};
 
 		const finish = (runId) => {
@@ -435,7 +440,7 @@ function setupForm({ doc, call, router }) {
 			state.runs.clear();
 			state.finished.clear();
 			if (state.el) {
-				state.el.hidden = true;
+				setIndicatorVisible(state.el, false);
 			}
 			const panel = state.panel;
 			panel.seq++;

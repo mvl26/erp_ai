@@ -151,6 +151,12 @@ LOG_SINK_CALLS = ("print", "frappe.log_error", "frappe.msgprint", "frappe.throw"
 LOG_SINK_METHODS = ("debug", "info", "warning", "error", "exception", "critical")
 
 STATUS_SCRIPT_FILE = "public/js/agent_status_indicator.js"
+STATUS_INDICATOR_VISIBILITY = "setIndicatorVisible"
+STATUS_INDICATOR_FUNCTIONS = ("ensureElement", "render", "reset", "dockIndicator")
+# `el.style.display = …` or `Object.assign(el.style, …, { display: … })` on the indicator itself.
+STATUS_INDICATOR_DISPLAY_WRITE = re.compile(
+	r"\b(?:state\.)?el\.style\.display\s*=(?!=)|Object\.assign\((?:state\.)?el\.style\b[^;]*?\bdisplay\s*:"
+)
 CONSTANTS_FILE = "constants.py"
 # Design 3.7: Helpdesk loads the page script through `new Function`, so none of these may appear in it.
 STATUS_SCRIPT_FORBIDDEN = (
@@ -1382,6 +1388,70 @@ def check_socket_on_only_in_once_block(script: str, status_event: str) -> list:
 	return violations
 
 
+def _js_arrow_body_span(masked: str, name: str):
+	"""`(start, end)` of the body of `const <name> = (...) => { … }` in the masked script, or None."""
+	match = re.search(rf"\bconst {name} = \([^)]*\) => \{{", masked)
+	if not match:
+		return None
+	end = _matching_brace(masked, match.end() - 1)
+	return None if end == -1 else (match.end(), end)
+
+
+def check_status_indicator_hides(script: str) -> list:
+	"""BUG-003: Helpdesk's `[hidden]{display:none}` loses to an inline `display`, so the indicator is shown and
+	hidden only through one helper that writes `hidden` and `style.display` together."""
+	violations = []
+	masked = mask_js(script)
+	helper = STATUS_INDICATOR_VISIBILITY
+	span = _js_arrow_body_span(masked, helper)
+	if span is None:
+		violations.append(f"{helper} is missing")
+	else:
+		body = script[span[0] : span[1]]
+		for required in ("el.hidden = !visible;", 'el.style.display = visible ? "flex" : "none";'):
+			if required not in body:
+				violations.append(f"{helper} does not write {required}")
+	spans = {}
+	for name in STATUS_INDICATOR_FUNCTIONS:
+		spans[name] = _js_arrow_body_span(masked, name)
+		if spans[name] is None:
+			violations.append(f"function {name} is missing")
+			continue
+		start, end = spans[name]
+		for match in re.finditer(r"\.hidden\s*=(?!=)", masked[start:end]):
+			violations.append(
+				f"line {js_line(script, start + match.start())}: {name} sets hidden without display,"
+				" an inline display keeps the indicator on screen"
+			)
+		for match in STATUS_INDICATOR_DISPLAY_WRITE.finditer(masked[start:end]):
+			violations.append(
+				f"line {js_line(script, start + match.start())}: {name} writes display outside {helper}"
+			)
+	if spans.get("render"):
+		body = masked[spans["render"][0] : spans["render"][1]]
+		if not re.search(
+			rf"if \(state\.runs\.size === 0\) \{{\s*{helper}\(el, false\);\s*return;\s*\}}", body
+		):
+			violations.append("render does not hide the indicator when no run is active")
+		if not body.rstrip().endswith(f"{helper}(el, true);"):
+			violations.append(f"render does not end with {helper}(el, true)")
+	if spans.get("ensureElement"):
+		body = masked[spans["ensureElement"][0] : spans["ensureElement"][1]]
+		hide_at = body.rfind(f"{helper}(el, false)")
+		if hide_at == -1 or hide_at < body.rfind("Object.assign(el.style"):
+			violations.append("ensureElement does not hide the new indicator after its inline style")
+	for name, call in (("render", "(el, false)"), ("render", "(el, true)"), ("reset", "(state.el, false)")):
+		if spans.get(name) and f"{helper}{call}" not in masked[spans[name][0] : spans[name][1]]:
+			violations.append(f"{name} does not call {helper}{call}")
+	for const in ("INDICATOR_FLOATING_STYLE", "INDICATOR_DOCKED_STYLE"):
+		match = re.search(rf"\bconst {const} = \{{", masked)
+		if not match:
+			violations.append(f"{const} is missing")
+		elif re.search(r"\bdisplay\s*:", masked[match.end() : _matching_brace(masked, match.end() - 1)]):
+			violations.append(f"{const} sets display, docking would show a hidden indicator")
+	return violations
+
+
 def check_whitelisted_methods_declare_http_methods(sources: dict) -> list:
 	"""ADR-010: every `@frappe.whitelist` in the app names its HTTP methods and never allows guests."""
 	violations = []
@@ -1949,6 +2019,9 @@ class TestArchitecture(unittest.TestCase):
 			{AGENT_STATUS_EVENT, "docinfo_update", "doc_update", "connect"},
 		)
 		self.assertEqual(check_socket_on_only_in_once_block(script, AGENT_STATUS_EVENT), [])
+
+	def test_status_script_indicator_hides_with_display_none(self):
+		self.assertEqual(check_status_indicator_hides(self.status_script()), [])
 
 	def test_whitelisted_methods_declare_http_methods_without_guest(self):
 		found = {(rel, node.name) for rel, node, _decorator in whitelisted_functions(self.sources)}
@@ -3047,6 +3120,88 @@ class TestScannersCatchViolations(unittest.TestCase):
 		)
 		self.assertCaught(check_status_script_window_state(good + 'window["x"] = 1;'), "window[...]")
 		self.assertCaught(check_status_script_window_state("var a = 1;"), "window state names are")
+
+	def test_status_indicator_scanner_catches_hidden_without_display(self):
+		good = (
+			'const INDICATOR_FLOATING_STYLE = { position: "fixed" };\n'
+			'const INDICATOR_DOCKED_STYLE = { position: "static" };\n'
+			"const setIndicatorVisible = (el, visible) => {\n"
+			"\tel.hidden = !visible;\n"
+			'\tel.style.display = visible ? "flex" : "none";\n'
+			"};\n"
+			"const ensureElement = () => {\n"
+			"\tObject.assign(el.style, INDICATOR_FLOATING_STYLE);\n"
+			"\tsetIndicatorVisible(el, false);\n"
+			"};\n"
+			"const render = () => {\n"
+			"\tif (state.runs.size === 0) {\n"
+			"\t\tsetIndicatorVisible(el, false);\n"
+			"\t\treturn;\n"
+			"\t}\n"
+			"\tsetIndicatorVisible(el, true);\n"
+			"};\n"
+			"const dockIndicator = (docked) => {\n"
+			"\tObject.assign(el.style, INDICATOR_DOCKED_STYLE);\n"
+			"};\n"
+			"const reset = () => {\n"
+			"\tif (state.el) { setIndicatorVisible(state.el, false); }\n"
+			"};\n"
+		)
+		self.assertEqual(check_status_indicator_hides(good), [])
+		for old, new, fragment in (
+			("setIndicatorVisible(state.el, false);", "state.el.hidden = true;", "reset sets hidden without"),
+			("setIndicatorVisible(el, true);", "el.hidden = false;", "render sets hidden without"),
+			(
+				"\tsetIndicatorVisible(el, false);\n};\nconst render",
+				"\tel.hidden = true;\n};\nconst render",
+				"ensureElement does not hide",
+			),
+			(
+				"\tObject.assign(el.style, INDICATOR_FLOATING_STYLE);\n\tsetIndicatorVisible(el, false);",
+				"\tsetIndicatorVisible(el, false);\n\tObject.assign(el.style, INDICATOR_FLOATING_STYLE);",
+				"ensureElement does not hide",
+			),
+			(
+				'{ position: "static" }',
+				'{ position: "static", display: "flex" }',
+				"INDICATOR_DOCKED_STYLE sets",
+			),
+			('\tel.style.display = visible ? "flex" : "none";\n', "", "setIndicatorVisible does not write"),
+			("const dockIndicator = (docked)", "const dock = (docked)", "function dockIndicator is missing"),
+			(
+				"\t\tsetIndicatorVisible(el, false);\n\t\treturn;\n\t}\n\tsetIndicatorVisible(el, true);\n",
+				"\t\tsetIndicatorVisible(el, true);\n\t\treturn;\n\t}\n\tsetIndicatorVisible(el, false);\n",
+				"render does not hide the indicator when no run is active",
+			),
+			(
+				"\t\tsetIndicatorVisible(el, false);\n\t\treturn;\n\t}\n\tsetIndicatorVisible(el, true);\n",
+				"\t\tsetIndicatorVisible(el, true);\n\t\treturn;\n\t}\n\tsetIndicatorVisible(el, false);\n",
+				"render does not end with setIndicatorVisible(el, true)",
+			),
+			(
+				"\tsetIndicatorVisible(el, true);\n};",
+				"\tsetIndicatorVisible(el, true);\n\tel.title = name;\n};",
+				"render does not end with setIndicatorVisible(el, true)",
+			),
+			(
+				"if (state.el) { setIndicatorVisible(state.el, false); }",
+				"if (state.el) { state.el.remove(); }",
+				"reset does not call setIndicatorVisible(state.el, false)",
+			),
+			(
+				"\tsetIndicatorVisible(el, true);\n};",
+				'\tsetIndicatorVisible(el, true);\n\tel.style.display = "flex";\n};',
+				"render writes display outside setIndicatorVisible",
+			),
+			(
+				"Object.assign(el.style, INDICATOR_DOCKED_STYLE);",
+				'Object.assign(el.style, INDICATOR_DOCKED_STYLE, { display: "flex" });',
+				"dockIndicator writes display outside setIndicatorVisible",
+			),
+		):
+			with self.subTest(fragment=fragment):
+				self.assertIn(old, good)
+				self.assertCaught(check_status_indicator_hides(good.replace(old, new)), fragment)
 
 	def test_whitelist_scanner_catches_guest_bare_and_missing_methods(self):
 		for decorator, fragment in (

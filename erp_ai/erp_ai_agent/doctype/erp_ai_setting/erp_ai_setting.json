@@ -31,6 +31,9 @@
   "auto_assign_enabled",
   "routing_rules",
   "prompt_digest",
+  "section_code_change",
+  "code_change_enabled",
+  "code_change_apps",
   "section_alerts",
   "alert_recipients",
   "credentials"
@@ -218,6 +221,24 @@
    "fieldtype": "Long Text",
    "label": "Trích yếu HDSD",
    "description": "Người tự nhập, hệ thống không tự điền. Được nối vào cuối hướng dẫn của bước lập luận, không dùng ở bước phân loại."
+  },
+  {
+   "fieldname": "section_code_change",
+   "fieldtype": "Section Break",
+   "label": "Sửa code và lệnh bench"
+  },
+  {
+   "fieldname": "code_change_enabled",
+   "fieldtype": "Check",
+   "label": "Cho phép sửa code và lệnh bench",
+   "default": "0",
+   "description": "Bật thì bot được đề xuất sửa code và lệnh bench, chỉ ở mức L3 và khi có người ra lệnh; mọi thay đổi phải được duyệt trên form đề xuất. Mỗi thay đổi đã áp dụng thành một commit git local; bot không push. Tắt thì bot trở lại như cũ."
+  },
+  {
+   "fieldname": "code_change_apps",
+   "fieldtype": "Small Text",
+   "label": "App được phép sửa",
+   "description": "Mỗi dòng một tên thư mục app trong apps/. Có thể thêm app lõi frappe, erpnext, helpdesk, hrms; sửa app lõi ảnh hưởng mọi site trên bench. Không bao giờ được thêm erp_ai. Bỏ trống thì không file nào được sửa."
   },
   {
    "fieldname": "section_alerts",

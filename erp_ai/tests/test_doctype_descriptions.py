@@ -23,7 +23,7 @@ VIETNAMESE_ACCENTS = re.compile(
 DOCTYPE_CONFIG = {
 	"ERP AI Setting": {
 		"folder": "erp_ai_setting",
-		"field_count": 24,
+		"field_count": 26,
 		"phrases": {
 			"enabled": ("Tắt", "4 đơn giá", "từ khóa kích hoạt"),
 			"permission_level": ("L0", "L1", "L2", "L3", "ngân sách"),
@@ -58,8 +58,24 @@ DOCTYPE_CONFIG = {
 			"prompt_digest": ("lập luận", "phân loại"),
 			"alert_recipients": ("mỗi dòng", "canhbao@congty.vn", "dấu phẩy"),
 			"credentials": ("không trùng", "Kiểm tra khóa"),
+			"code_change_enabled": (
+				"L3",
+				"người ra lệnh",
+				"được duyệt",
+				"commit git local",
+				"không push",
+				"Tắt",
+			),
+			"code_change_apps": (
+				"Mỗi dòng",
+				"apps/",
+				"frappe, erpnext, helpdesk, hrms",
+				"mọi site trên bench",
+				"erp_ai",
+				"Bỏ trống",
+			),
 		},
-		"section_count": 6,
+		"section_count": 7,
 		"read_only_fields": ("spent_this_month_usd",),
 		"sections": (
 			("section_activation", "Bật và mức quyền", "enabled"),
@@ -67,6 +83,7 @@ DOCTYPE_CONFIG = {
 			("section_budget", "Ngân sách và đơn giá", "monthly_budget_usd"),
 			("section_model", "Model, từ khóa và chỉ báo trả lời", "model_classify_default"),
 			("section_routing", "Phân loại và nhóm loại trừ", "excluded_teams"),
+			("section_code_change", "Sửa code và lệnh bench", "code_change_enabled"),
 			("section_alerts", "Cảnh báo và khóa API", "alert_recipients"),
 		),
 	},
@@ -209,6 +226,27 @@ DOCTYPE_CONFIG = {
 		),
 	},
 }
+
+# FEAT-004 design 2.4: exact contract of the code-change block of ERP AI Setting.
+CODE_CHANGE_FIELDS = {
+	"code_change_enabled": {
+		"fieldtype": "Check",
+		"label": "Cho phép sửa code và lệnh bench",
+		"default": "0",
+		"description": "Bật thì bot được đề xuất sửa code và lệnh bench, chỉ ở mức L3 và khi có người ra lệnh; "
+		"mọi thay đổi phải được duyệt trên form đề xuất. Mỗi thay đổi đã áp dụng thành một commit git local; "
+		"bot không push. Tắt thì bot trở lại như cũ.",
+	},
+	"code_change_apps": {
+		"fieldtype": "Small Text",
+		"label": "App được phép sửa",
+		"default": None,
+		"description": "Mỗi dòng một tên thư mục app trong apps/. Có thể thêm app lõi frappe, erpnext, helpdesk, hrms; "
+		"sửa app lõi ảnh hưởng mọi site trên bench. Không bao giờ được thêm erp_ai. "
+		"Bỏ trống thì không file nào được sửa.",
+	},
+}
+
 
 # Wordings that contradicted the code that writes the field (T5 review round 1).
 FORBIDDEN_PHRASES = {
@@ -355,3 +393,26 @@ class TestDoctypeDescriptions(FrappeTestCase):
 					self.assertEqual(
 						set(section), {"fieldname", "fieldtype", "label"}, f"{doctype}.{section['fieldname']}"
 					)
+
+	def test_code_change_block_follows_feat006_fields(self):
+		doctype_json = load_doctype(DOCTYPE_CONFIG["ERP AI Setting"])
+		order = doctype_json["field_order"]
+		start = order.index("prompt_digest")
+		self.assertEqual(
+			order[start : start + 5],
+			[
+				"prompt_digest",
+				"section_code_change",
+				"code_change_enabled",
+				"code_change_apps",
+				"section_alerts",
+			],
+		)
+		self.assertLess(order.index("routing_rules"), order.index("section_code_change"))
+		by_name = {f["fieldname"]: f for f in doctype_json["fields"]}
+		actual = {
+			fieldname: {key: by_name[fieldname].get(key) for key in expected}
+			for fieldname, expected in CODE_CHANGE_FIELDS.items()
+		}
+		self.assertEqual(actual, CODE_CHANGE_FIELDS)
+		self.assertFalse(any(by_name[name].get("read_only") for name in CODE_CHANGE_FIELDS))

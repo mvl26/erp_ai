@@ -254,10 +254,10 @@ class TestPolicy(FrappeTestCase):
 			policy.ChangeSettings(enabled=True, allowed_apps=("myapp", "frappe", "hrms")),
 		)
 
-	def test_change_settings_drops_names_validate_would_refuse(self):
-		# A value written past validate (db.set_value) must never hand a path-like name to the tools.
-		settings = frappe._dict(code_change_enabled=1, code_change_apps="erp_ai\n../x\nmy app\na/b\nmyapp\n.")
-		self.assertEqual(policy.change_settings(settings).allowed_apps, ("myapp",))
+	def test_change_settings_keeps_names_validate_would_refuse(self):
+		# Refusing erp_ai or a bad name is the tools' guard (APP_FORBIDDEN), not this reader's job.
+		settings = frappe._dict(code_change_enabled=1, code_change_apps="erp_ai\n../x\n\nmyapp\nerp_ai\n../x")
+		self.assertEqual(policy.change_settings(settings).allowed_apps, ("erp_ai", "../x", "myapp"))
 
 	def _assert_refused(self, apps, message):
 		with self.assertRaises(frappe.ValidationError) as caught:

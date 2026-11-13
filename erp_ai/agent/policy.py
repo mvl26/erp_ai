@@ -90,7 +90,7 @@ def runs_today(ticket_name, now=None) -> int:
 
 CODE_CHANGE_ENABLED_FIELD = "code_change_enabled"
 CODE_CHANGE_APPS_FIELD = "code_change_apps"
-APP_NAME = re.compile(r"[A-Za-z0-9_-]+")
+APP_NAME_PATTERN = re.compile(r"[A-Za-z0-9_-]+")
 OWN_APP = "erp_ai"
 
 
@@ -106,7 +106,7 @@ def _change_app_lines(raw) -> tuple[str, ...]:
 
 
 def _app_name_error(name) -> str | None:
-	if not APP_NAME.fullmatch(name):
+	if not APP_NAME_PATTERN.fullmatch(name):
 		return _("Tên app '{0}' không hợp lệ").format(name)
 	if name == OWN_APP:
 		return _("Không được thêm erp_ai vào danh sách app được sửa")
@@ -114,11 +114,10 @@ def _app_name_error(name) -> str | None:
 
 
 def change_settings(settings) -> ChangeSettings:
-	"""The only reader of the code-change switch and app list; a name validate would refuse is dropped."""
-	apps = _change_app_lines(getattr(settings, CODE_CHANGE_APPS_FIELD, None))
+	"""The only reader of the code-change switch and app list; names are kept as given (the tools refuse bad ones)."""
 	return ChangeSettings(
 		enabled=bool(getattr(settings, CODE_CHANGE_ENABLED_FIELD, 0)),
-		allowed_apps=tuple(name for name in apps if _app_name_error(name) is None),
+		allowed_apps=_change_app_lines(getattr(settings, CODE_CHANGE_APPS_FIELD, None)),
 	)
 
 

@@ -3,6 +3,7 @@ from dataclasses import dataclass
 
 import erp_ai
 from erp_ai.agent.tools import source
+from erp_ai.constants import CORE_APPS
 
 PROTECTED_FILE_NAME = "license.txt"
 GIT_DIR_NAME = ".git"
@@ -19,6 +20,7 @@ APP_FORBIDDEN = "không được sửa app erp_ai hoặc kho git của nó"
 NAME_FORBIDDEN = "tên file thuộc loại bí mật hoặc được bảo vệ"
 EXT_FORBIDDEN = "đuôi file không được phép"
 GIT_DIR = "không được chạm thư mục .git"
+PATH_GIT_PATTERN = 'tên file có ký tự * ? [ ] hoặc bắt đầu bằng ":" hay "-", git không commit an toàn được'
 CMD_SHELL = "đối số chứa ký tự điều khiển shell"
 CMD_FORCE = "cờ --force bị cấm"
 CMD_OTHER_SITE = "chỉ chạy cho site đang chạy"
@@ -44,6 +46,8 @@ class GuardResult:
 	rel_path: str | None
 	app: str | None
 	reason: str | None
+	is_core_app: bool = False
+	git: source.GitState | None = None
 
 
 def _refused(reason: str) -> GuardResult:
@@ -125,11 +129,21 @@ def _is_erp_ai(target: str, root: str, app: str) -> bool:
 	return bool(repos & _erp_ai_common_dirs(root))
 
 
-def check_write_path(rel_path: str, allowed_apps: tuple[str, ...], *, new_file: bool) -> GuardResult:
+def _is_git_pattern(rel_in_repo: str) -> bool:
+	"""Same condition as `process_runner._check_git_write_call` (design-addendum-2 QĐ-A2): a bare path
+	git would read as a glob, a magic pathspec or an option cannot be committed safely."""
+	return rel_in_repo.startswith((":", "-")) or bool(source.GIT_GLOB_CHARS.search(rel_in_repo))
+
+
+def check_write_path(
+	rel_path: str, allowed_apps: tuple[str, ...], *, new_file: bool, read_git: bool = True
+) -> GuardResult:
 	"""Check a write target relative to `apps/`; refusals follow the order of design table 3.1.
 
 	`source.resolve_safe_path` is the only path resolver; when it refuses, the same real path is only
-	classified to pick the reason, and an unclassified refusal stays `PATH_INVALID`.
+	classified to pick the reason, and an unclassified refusal stays `PATH_INVALID`. With `read_git`
+	(proposal time), a target passing every path check then needs `source.read_git_state` to pass and
+	its state is returned in `git`; the apply/undo job passes `read_git=False` and reads git itself.
 	"""
 	if not isinstance(rel_path, str) or not rel_path.strip() or "\0" in rel_path or os.path.isabs(rel_path):
 		return _refused(PATH_INVALID)
@@ -150,9 +164,23 @@ def check_write_path(rel_path: str, allowed_apps: tuple[str, ...], *, new_file: 
 		return _refused(EXT_FORBIDDEN)
 	if GIT_DIR_NAME in parts:
 		return _refused(GIT_DIR)
+	if _is_git_pattern(os.sep.join(parts[1:])):
+		return _refused(PATH_GIT_PATTERN)
 	if full is None:
 		return _refused(PATH_INVALID)
-	return GuardResult(full_path=full, rel_path=rel, app=parts[0], reason=None)
+	state = None
+	if read_git:
+		state = source.read_git_state(full, new_file=new_file)
+		if state.refusal is not None:
+			return _refused(state.refusal)
+	return GuardResult(
+		full_path=full,
+		rel_path=rel,
+		app=parts[0],
+		reason=None,
+		is_core_app=parts[0] in CORE_APPS,
+		git=state,
+	)
 
 
 def _app_names(allowed_apps) -> tuple[str, ...]:

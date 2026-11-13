@@ -5,6 +5,7 @@ import frappe
 from frappe.tests.utils import FrappeTestCase
 
 from erp_ai import hooks, tasks
+from erp_ai.agent import run_log
 from erp_ai.constants import (
 	AGENT_USER,
 	CREDENTIAL_DOCTYPE,
@@ -17,10 +18,11 @@ from erp_ai.constants import (
 	SETTING_DOCTYPE,
 	TITLE_ALARM,
 	TITLE_RUN_FAILED,
+	TRIGGER_CHANGE_ACTION,
 	TRIGGER_TICKET_INSERT,
 )
 from erp_ai.gateway import client
-from erp_ai.test_utils import add_credential, set_agent_settings
+from erp_ai.test_utils import add_credential, make_change_proposal, set_agent_settings
 
 # Far-future months cannot hold real ERP AI Log rows, so sums only see rows the test inserts.
 NOW = datetime(2031, 11, 15, 8, 0, 0)
@@ -113,6 +115,27 @@ class TestRecomputeMonthlySpend(FrappeTestCase):
 
 		self.assertAlmostEqual(self._spent_total(), 0.5, places=6)
 		self.assertEqual(self._spent_key(self.row_a), 0)
+		self.assertEqual(self._spent_key(self.row_b), 0)
+
+	def test_recompute_spend_unchanged_by_change_rows(self):
+		_add_log(0.5, self.label_a, THIS_MONTH)
+		proposal = make_change_proposal()
+		for step in ("propose", "approve", "apply"):
+			name = run_log.write_entry(
+				ticket=proposal.ticket,
+				run_id=proposal.run_id,
+				entry_type="change",
+				trigger=TRIGGER_CHANGE_ACTION,
+				change_step=step,
+				actor="Administrator",
+				change_proposal=proposal.name,
+			)
+			frappe.db.set_value(LOG_DOCTYPE, name, "creation", THIS_MONTH, update_modified=False)
+
+		tasks.recompute_monthly_spend(now=NOW)
+
+		self.assertAlmostEqual(self._spent_total(), 0.5, places=6)
+		self.assertAlmostEqual(self._spent_key(self.row_a), 0.5, places=6)
 		self.assertEqual(self._spent_key(self.row_b), 0)
 
 	def test_default_now_is_current_time(self):

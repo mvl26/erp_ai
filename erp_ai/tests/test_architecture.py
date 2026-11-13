@@ -1481,7 +1481,7 @@ TODO_DOCTYPE = "ToDo"
 DOC_CREATE_CALLS = ("get_doc", "new_doc")
 SHARE_BYPASS_NAMES = ("ignore_share_permission", "add_docshare")
 SHARE_BYPASS_SUFFIXES = ("assign_to._add", "frappe.share.add")
-ENTRY_TYPES_EXPECTED = ("classify", "reason", "skip")
+ENTRY_TYPES_EXPECTED = ("classify", "reason", "skip", "change")
 
 # `_assign` is the denormalised JSON column of HD Ticket. Routing must read ToDo through site_facts instead.
 # authority.py (FEAT-002, "who may instruct the bot") predates routing and is the one reader allowed.
@@ -1721,7 +1721,7 @@ def check_no_default_people_in_agent_python(sources: dict) -> list:
 
 
 def check_entry_types_unchanged(sources: dict) -> list:
-	"""ADR-019 QĐ 7: the log keeps its three entry types, in the code and in the DocType options."""
+	"""ADR-019 QĐ 7 + ADR-012 QĐ 6: the log keeps its four entry types, in the code and in the DocType options."""
 	run_log, doctype = sources.get(RUN_LOG_FILE), sources.get(LOG_DOCTYPE_FILE)
 	if run_log is None:
 		return _missing(RUN_LOG_FILE)
@@ -3171,16 +3171,24 @@ class TestScannersCatchViolations(unittest.TestCase):
 		)
 
 	def test_entry_types_scanner_catches_new_type_in_code_or_doctype(self):
-		run_log = 'ENTRY_TYPES = ("classify", "reason", "skip")\n'
-		doctype = json.dumps({"fields": [{"fieldname": "entry_type", "options": "classify\nreason\nskip"}]})
+		run_log = 'ENTRY_TYPES = ("classify", "reason", "skip", "change")\n'
+		doctype = json.dumps(
+			{"fields": [{"fieldname": "entry_type", "options": "classify\nreason\nskip\nchange"}]}
+		)
 		good = {RUN_LOG_FILE: run_log, LOG_DOCTYPE_FILE: doctype}
 		self.assertEqual(check_entry_types_unchanged(good), [])
-		extra = {**good, RUN_LOG_FILE: 'ENTRY_TYPES = ("classify", "reason", "skip", "route")\n'}
+		extra = {**good, RUN_LOG_FILE: 'ENTRY_TYPES = ("classify", "reason", "skip", "change", "route")\n'}
 		self.assertCaught(check_entry_types_unchanged(extra), "ENTRY_TYPES")
+		without_change = {**good, RUN_LOG_FILE: 'ENTRY_TYPES = ("classify", "reason", "skip")\n'}
+		self.assertCaught(check_entry_types_unchanged(without_change), "ENTRY_TYPES")
 		options = json.dumps(
-			{"fields": [{"fieldname": "entry_type", "options": "classify\nreason\nskip\nroute"}]}
+			{"fields": [{"fieldname": "entry_type", "options": "classify\nreason\nskip\nchange\nroute"}]}
 		)
 		self.assertCaught(check_entry_types_unchanged({**good, LOG_DOCTYPE_FILE: options}), "options")
+		old_options = json.dumps(
+			{"fields": [{"fieldname": "entry_type", "options": "classify\nreason\nskip"}]}
+		)
+		self.assertCaught(check_entry_types_unchanged({**good, LOG_DOCTYPE_FILE: old_options}), "options")
 		computed = {**good, RUN_LOG_FILE: "ENTRY_TYPES = tuple(x)\n"}
 		self.assertCaught(check_entry_types_unchanged(computed), "ENTRY_TYPES")
 		self.assertCaught(check_entry_types_unchanged({RUN_LOG_FILE: run_log}), LOG_DOCTYPE_FILE)

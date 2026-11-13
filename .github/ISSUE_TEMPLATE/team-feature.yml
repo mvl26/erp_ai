@@ -1,0 +1,34 @@
+name: Request for the team crew
+description: Hand a raw request to the team. Add the team:intake label so the team picks it up.
+labels: ["team:intake"]
+body:
+  - type: textarea
+    id: request
+    attributes:
+      label: Raw request
+      description: Write it as you would to a colleague. The team will ask back about big open points.
+    validations:
+      required: true
+  - type: dropdown
+    id: size
+    attributes:
+      label: Work size
+      options: ["auto", "S", "M", "L"]
+      default: 0
+  - type: dropdown
+    id: mode
+    attributes:
+      label: Mode
+      description: ask = ask about big open points; decide = decide and record the reason (add the team:ask label to be asked).
+      options: ["decide", "ask"]
+      default: 0
+  - type: textarea
+    id: constraints
+    attributes:
+      label: Constraints
+      description: Deadline, mandatory technology, parts that must not be touched.
+  - type: textarea
+    id: done
+    attributes:
+      label: What done looks like
+      description: What you will check before accepting.

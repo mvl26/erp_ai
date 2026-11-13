@@ -26,6 +26,8 @@ REL = "pkg/mod.py"
 PATH = f"{APP}/{REL}"
 BEFORE = "x = 1\r\n# Tiếng Việt\r\ny = 1\r\n"
 TOOL_NAMES = ["propose_file_change", "propose_new_file", "propose_bench_command"]
+# Command table of design 3.1, written by hand
+BENCH_COMMANDS_TABLE = ("migrate", "build", "clear-cache", "clear-website-cache", "list-apps", "version")
 NOT_GRANTED = {"ok": False, "reason": "tool không được cấp ở mức/thẩm quyền hiện tại"}
 
 
@@ -420,6 +422,126 @@ class TestProposeChange(FrappeTestCase):
 			"tham số không hợp lệ: command",
 		)
 		self.assertEqual(len(self.proposals()), 2)
+
+	def bench(self, command, app=None, **context):
+		arguments = {"command": command, "reason": "chạy lệnh bench"}
+		if app is not None:
+			arguments["app"] = app
+		return self.run_tool("propose_bench_command", arguments, **context)
+
+	def test_command_proposal_makes_zero_subprocess_calls(self):
+		git_before = self.git_snapshot()
+		with (
+			patch("subprocess.Popen") as popen,
+			patch("subprocess.run") as run,
+			patch("subprocess.call") as call,
+			patch("subprocess.check_call") as check_call,
+			patch("subprocess.check_output") as check_output,
+			patch("os.system") as system,
+			patch("os.popen") as os_popen,
+		):
+			results = [self.bench(command) for command in BENCH_COMMANDS_TABLE if command != "build"]
+			results.append(self.bench("build", APP))
+		spawns = {
+			"subprocess.Popen": popen,
+			"subprocess.run": run,
+			"subprocess.call": call,
+			"subprocess.check_call": check_call,
+			"subprocess.check_output": check_output,
+			"os.system": system,
+			"os.popen": os_popen,
+		}
+		self.assertEqual({name: spawn.call_count for name, spawn in spawns.items()}, dict.fromkeys(spawns, 0))
+		for result in results:
+			with self.subTest(result=result):
+				self.assertEqual(set(result), {"ok", "proposal", "status", "comment"}, result)
+				self.assertEqual((result["ok"], result["status"]), (True, "Chờ duyệt"))
+		self.assertEqual(self.git_snapshot(), git_before)
+		self.assertEqual(self.on_disk(), BEFORE)
+		self.assertEqual(len(self.proposals()), len(BENCH_COMMANDS_TABLE))
+
+	def test_bench_command_tool_refuses_enum_outside_and_app_misuse(self):
+		(spec,) = [spec for spec in propose_change.TOOLS if spec.name == "propose_bench_command"]
+		properties = spec.schema["input_schema"]["properties"]
+		self.assertEqual(set(properties["command"]["enum"]), set(BENCH_COMMANDS_TABLE))
+		self.assertEqual(len(properties["command"]["enum"]), len(BENCH_COMMANDS_TABLE))
+		self.assertNotIn("update", properties["command"]["enum"])
+		self.assertEqual((properties["app"]["minLength"], properties["app"]["maxLength"]), (1, 100))
+		self.assertEqual(spec.schema["input_schema"]["required"], ["command", "reason"])
+
+		allowed = (APP, "frappe", "erp_ai", "erp_ai-wt")
+		forbidden = "không được sửa app erp_ai hoặc kho git của nó"
+		cases = (
+			# outside the enum: the schema refuses before the handler
+			({"command": "update"}, "tham số không hợp lệ: command"),
+			({"command": "restart"}, "tham số không hợp lệ: command"),
+			({"command": "build", "app": ""}, "tham số không hợp lệ: app"),
+			({"command": "build", "app": "a" * 101}, "tham số không hợp lệ: app"),
+			# build needs an app that passes the app guard
+			({"command": "build"}, "lệnh build cần app"),
+			({"command": "build", "app": "helpdesk"}, "app không có trong danh sách được sửa"),
+			({"command": "build", "app": "erp_ai"}, forbidden),
+			({"command": "build", "app": "erp_ai-wt"}, forbidden),
+			# any other command takes no app: a site command and `version`
+			({"command": "migrate", "app": APP}, "lệnh này không nhận app"),
+			({"command": "version", "app": APP}, "lệnh này không nhận app"),
+		)
+		for arguments, reason in cases:
+			with self.subTest(arguments=arguments):
+				result = self.run_tool(
+					"propose_bench_command", {**arguments, "reason": "x"}, allowed_apps=allowed
+				)
+				self.assertEqual(result, {"ok": False, "reason": reason})
+		# the handler itself refuses a command outside the table, whatever reaches it
+		direct = propose_change.propose_bench_command(
+			{"command": "update", "reason": "x"}, self.context(allowed_apps=allowed)
+		)
+		self.assertEqual(direct, {"ok": False, "reason": "lệnh không có trong danh sách cho phép"})
+		# an app of 100 characters passes the schema and reaches the app guard
+		longest = self.bench("build", "a" * 100, allowed_apps=allowed)
+		self.assertEqual(longest, {"ok": False, "reason": "app không có trong danh sách được sửa"})
+		self.assertEqual(self.proposals(), [])
+		self.assertEqual(self.comments(), [])
+
+	def test_command_args_built_by_server_for_each_command(self):
+		site = frappe.local.site
+		expected = {
+			"migrate": ["--site", site, "migrate"],
+			"build": ["build", "--app", "frappe"],
+			"clear-cache": ["--site", site, "clear-cache"],
+			"clear-website-cache": ["--site", site, "clear-website-cache"],
+			"list-apps": ["--site", site, "list-apps"],
+			"version": ["version"],
+		}
+		self.assertEqual(set(expected), set(BENCH_COMMANDS_TABLE))
+		for command, command_args in expected.items():
+			with self.subTest(command=command):
+				app = "frappe" if command == "build" else None
+				result = self.bench(command, app, allowed_apps=(APP, "frappe"))
+				self.assertEqual(set(result), {"ok", "proposal", "status", "comment"}, result)
+				self.assertEqual((result["ok"], result["status"]), (True, "Chờ duyệt"))
+				frappe.set_user("Administrator")
+				doc = frappe.get_doc(PROPOSAL_DOCTYPE, result["proposal"])
+				frappe.set_user(AGENT)
+				self.assertEqual(json.loads(doc.command_args), command_args)
+				self.assertEqual(
+					(doc.change_kind, doc.change_status, doc.reversible, doc.is_new_file),
+					(CHANGE_KIND_COMMAND, CHANGE_STATUS_PENDING, 0, 0),
+				)
+				self.assertEqual((doc.app or "", doc.reason), (app or "", "chạy lệnh bench"))
+				# a command proposal carries no git field, even for a core app such as frappe
+				self.assertEqual(
+					(doc.target_branch, doc.upstream_ref, doc.ahead_count, doc.is_core_app), ("", "", 0, 0)
+				)
+				self.assertEqual(
+					(doc.file_path or "", doc.base_hash or "", doc.content_after or ""), ("", "", "")
+				)
+				(comment,) = [row for row in self.comments() if row.name == result["comment"]]
+				shown = " ".join(command_args)
+				self.assertIn(f"đang chờ duyệt: lệnh <code>bench {shown}</code>.</p>", comment.content)
+				self.assertIn("<p>Lệnh bench không hoàn tác được.</p>", comment.content)
+				self.assertNotIn("Commit sẽ vào nhánh", comment.content)
+				self.assertNotIn("Cảnh báo app lõi", comment.content)
 
 	def test_not_granted_without_switch_instructor_or_l3(self):
 		edit = (["x = 1"], ["x = 2"])

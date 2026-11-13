@@ -1,6 +1,8 @@
 """Architecture tests (ADR-001..005, NFR-1, NFR-5, D-23): static scans of the source tree.
 
 Nothing here imports product code or touches the database: files are read as text and parsed with `ast`.
+The one exception is `test_agent_modules_import_alone_in_fresh_process`, which imports a few modules in a
+child Python process (never in this one) to catch import cycles that test order would hide.
 
 Scanned files ("product code"): every `.py` file under `erp_ai/` except `test_*.py` (this also drops
 `test_utils.py`), anything under a `tests/` directory and `__pycache__`. `eval/` is product code (it is an
@@ -13,8 +15,10 @@ synthetic violating code (must be caught) and clean code (must not be flagged).
 
 import ast
 import json
+import os
 import re
 import shlex
+import subprocess
 import sys
 import unittest
 from pathlib import Path
@@ -26,6 +30,13 @@ PACKAGE_ROOT = Path(__file__).resolve().parent.parent
 REPO_ROOT = PACKAGE_ROOT.parent
 CI_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "ci.yml"
 PACKAGE = "erp_ai"
+FRESH_IMPORT_MODULES = (
+	"erp_ai.agent.policy",
+	"erp_ai.agent.tools.read",
+	"erp_ai.agent.tools.source",
+	"erp_ai.agent.tools.registry",
+	"erp_ai.erp_ai_agent.doctype.erp_ai_setting.erp_ai_setting",
+)
 
 CLIENT_FILE = "gateway/client.py"
 CREDENTIALS_FILE = "gateway/credentials.py"
@@ -96,6 +107,11 @@ LAYER_RULES = (
 		("erp_ai.gateway", "erp_ai.agent.runner", "erp_ai.agent.queue"),
 		"ADR-001/ADR-010: the panel is an entry layer, it never calls the model, runs the agent or enqueues",
 	),
+	(
+		"erp_ai.agent.policy",
+		("erp_ai.agent.tools",),
+		"STD-DESIGN-6: policy là tầng dưới của tools, không import ngược",
+	),
 )
 # NOT forbidden on purpose: erp_ai.eval -> erp_ai.agent.runner (entry layer -> agent core, ADR-001).
 
@@ -120,7 +136,14 @@ SQL_READ_ONLY = re.compile(r"^\s*(select|show|describe)\b", re.IGNORECASE)
 ALLOWED_TOP_LEVEL_MODULES = frozenset({PACKAGE, "frappe", "helpdesk", *sys.stdlib_module_names})
 ANTHROPIC_MODULE = "anthropic"
 
-POLICY_FIELDS = ("permission_level", "excluded_teams", "ai_opt_out", "auto_assign_enabled")
+POLICY_FIELDS = (
+	"permission_level",
+	"excluded_teams",
+	"ai_opt_out",
+	"auto_assign_enabled",
+	"code_change_enabled",
+	"code_change_apps",
+)
 
 SECRET_READERS = ("get_decrypted_password", "get_password")
 SECRET_NAMES = ("api_key", "apikey", "secret", "password", "token")
@@ -2052,6 +2075,21 @@ class TestArchitecture(unittest.TestCase):
 		self.assertIn("Việt Nam", self.sources["agent/prompts.py"])  # the coincidence the scan must tolerate
 		self.assertEqual(check_no_default_people_in_agent_python(self.sources), [])
 
+	def test_agent_modules_import_alone_in_fresh_process(self):
+		# STD-DESIGN-6: an import cycle stays hidden in-process when another test imported a module first.
+		env = dict(os.environ, PYTHONPATH=os.pathsep.join([str(REPO_ROOT), os.environ.get("PYTHONPATH", "")]))
+		for module in FRESH_IMPORT_MODULES:
+			with self.subTest(module=module):
+				done = subprocess.run(
+					[sys.executable, "-c", f"import {module}"],
+					capture_output=True,
+					text=True,
+					timeout=120,
+					env=env,
+					check=False,
+				)
+				self.assertEqual(done.returncode, 0, done.stderr)
+
 
 # ---------------------------------------------------------------------------------------------------
 # Tests of the scanners themselves (STD-TEST-8): violating code is caught, clean code is not flagged
@@ -2121,6 +2159,25 @@ class TestScannersCatchViolations(unittest.TestCase):
 			),
 		}
 		self.assertEqual(check_layer_imports(allowed), [])
+
+	def test_layer_imports_catches_policy_importing_tools(self):
+		cases = (
+			"from erp_ai.agent.tools import source\n",
+			"import erp_ai.agent.tools.source\n",
+			"from erp_ai.agent.tools.source import get_source_root\n",
+			"def f():\n\tfrom erp_ai.agent.tools import source\n",
+			"from .tools import source\n",
+		)
+		for source in cases:
+			with self.subTest(source=source):
+				self.assertCaught(
+					check_layer_imports({POLICY_FILE: source}),
+					"agent/policy.py:",
+					"erp_ai.agent.tools",
+					"STD-DESIGN-6: policy là tầng dưới của tools, không import ngược",
+				)
+		allowed = "from erp_ai.constants import LEVELS\nfrom erp_ai.agent import run_log\n"
+		self.assertEqual(check_layer_imports({POLICY_FILE: allowed}), [])
 
 	def test_layer_imports_catches_lazy_and_relative_imports(self):
 		lazy = "def f():\n\tfrom erp_ai.agent.runner import run_for_ticket\n"
@@ -2528,6 +2585,8 @@ class TestScannersCatchViolations(unittest.TestCase):
 			"import frappe\nfrappe.db.get_single_value('ERP AI Setting', 'excluded_teams')\n",
 			"def f(ticket):\n\treturn ticket.ai_opt_out\n",
 			"def f(ticket):\n\treturn ticket.get('ai_opt_out')\n",
+			"def f(settings):\n\treturn settings.code_change_enabled\n",
+			"import frappe\nfrappe.db.get_single_value('ERP AI Setting', 'code_change_apps')\n",
 		)
 		for source in cases:
 			with self.subTest(source=source):

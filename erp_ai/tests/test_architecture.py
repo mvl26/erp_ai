@@ -2356,6 +2356,29 @@ class TestScannersCatchViolations(unittest.TestCase):
 			"without start_new_session=True",
 		)
 
+	def test_subprocess_call_shape_accepts_git_writes_in_process_runner(self):
+		"""ADR-022 QĐ 2, 4: the git add/commit/rm call of process_runner.py passes the shape rule."""
+		head = (
+			"import subprocess\nsubprocess.run([source.TIMEOUT_EXECUTABLE, '-s', 'KILL', '5', 'git', "
+			"*source.git_global_options(read=False), 'add', '--', rel], timeout=10, cwd=repo_root"
+		)
+		good = f"{head}, env=source.git_env(identity=True), start_new_session=True)\n"
+		self.assertEqual(check_subprocess_call_shape({SOURCE_TOOL_FILE: "", PROCESS_RUNNER_FILE: good}), [])
+		self.assertEqual(check_subprocess_only_in_source_tool({PROCESS_RUNNER_FILE: good}), [])
+		cases = (
+			("without start_new_session=True", f"{head}, env=source.git_env(identity=True))\n"),
+			("without env=", f"{head}, start_new_session=True)\n"),
+			(
+				"env= uses os.environ",
+				f"import os\n{head}, env={{**os.environ, **source.git_env(identity=True)}}, start_new_session=True)\n",
+			),
+		)
+		for fragment, source in cases:
+			with self.subTest(fragment=fragment):
+				self.assertCaught(
+					check_subprocess_call_shape({SOURCE_TOOL_FILE: "", PROCESS_RUNNER_FILE: source}), fragment
+				)
+
 	# policy fields -----------------------------------------------------------------------------
 
 	def test_policy_fields_caught_outside_policy_and_allowed_inside(self):

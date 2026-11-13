@@ -32,6 +32,9 @@ CREDENTIALS_FILE = "gateway/credentials.py"
 QUEUE_FILE = "agent/queue.py"
 POLICY_FILE = "agent/policy.py"
 SOURCE_TOOL_FILE = "agent/tools/source.py"
+PROCESS_RUNNER_FILE = "agent/changes/process_runner.py"
+# ADR-013, ADR-022, D-12: the only files that start processes.
+SUBPROCESS_FILES = (SOURCE_TOOL_FILE, PROCESS_RUNNER_FILE)
 READ_TOOL_FILE = "agent/tools/read.py"
 HANDLERS_FILE = "handlers.py"
 TOOLS_PREFIX = "agent/tools/"
@@ -603,15 +606,16 @@ def check_tools_never_bypass_permissions(sources: dict) -> list:
 
 
 def check_subprocess_only_in_source_tool(sources: dict) -> list:
+	"""ADR-005, ADR-013, ADR-022: processes start only in SUBPROCESS_FILES."""
 	violations = []
 	for rel, source in only_python(sources).items():
-		if rel == SOURCE_TOOL_FILE:
+		if rel in SUBPROCESS_FILES:
 			continue
 		tree = parse(rel, source)
 		aliases = import_aliases(tree)
 		for lineno, target in imported_modules(tree, module_name(rel), False):
 			if module_in(target, "subprocess"):
-				violations.append(f"{rel}:{lineno}: imports {target} outside {SOURCE_TOOL_FILE}")
+				violations.append(f"{rel}:{lineno}: imports {target} outside {SUBPROCESS_FILES}")
 		for node in ast.walk(tree):
 			if isinstance(node, ast.Call):
 				name = resolved_name(node.func, aliases)
@@ -620,17 +624,25 @@ def check_subprocess_only_in_source_tool(sources: dict) -> list:
 					name.startswith("os.")
 					and (function in OS_SHELL_FUNCTIONS or function.startswith(OS_SHELL_PREFIXES))
 				):
-					violations.append(violation(rel, node, f"{name} outside {SOURCE_TOOL_FILE}"))
+					violations.append(violation(rel, node, f"{name} outside {SUBPROCESS_FILES}"))
 	return violations
 
 
 def check_subprocess_call_shape(sources: dict) -> list:
-	"""ADR-005: every subprocess call in the source tool has timeout=, a list command, no shell."""
-	source = sources.get(SOURCE_TOOL_FILE)
-	if source is None:
+	"""ADR-005/ADR-013: every subprocess call in SUBPROCESS_FILES has timeout=, a list command, no shell;
+	in process_runner.py every call also has the timeout-wrapped shape (ADR-013 QĐ 3, 7; D-3)."""
+	if SOURCE_TOOL_FILE not in sources:
 		return [f"{SOURCE_TOOL_FILE}: file missing"]
 	violations = []
-	tree = parse(SOURCE_TOOL_FILE, source)
+	for rel in SUBPROCESS_FILES:
+		if rel in sources:
+			violations.extend(subprocess_call_shape_problems(rel, sources[rel]))
+	return violations
+
+
+def subprocess_call_shape_problems(rel: str, source: str) -> list:
+	violations = []
+	tree = parse(rel, source)
 	aliases = import_aliases(tree)
 	for node in ast.walk(tree):
 		if not isinstance(node, ast.Call):
@@ -643,20 +655,18 @@ def check_subprocess_call_shape(sources: dict) -> list:
 			continue
 		keywords = {keyword.arg: keyword.value for keyword in node.keywords}
 		if name.split(".")[-1] not in SUBPROCESS_RUN_FUNCTIONS:
-			violations.append(
-				violation(SOURCE_TOOL_FILE, node, f"{name}: only run()-style calls with timeout")
-			)
+			violations.append(violation(rel, node, f"{name}: only run()-style calls with timeout"))
 		if "timeout" not in keywords:
-			violations.append(violation(SOURCE_TOOL_FILE, node, f"{name} without timeout="))
+			violations.append(violation(rel, node, f"{name} without timeout="))
 		shell = keywords.get("shell")
 		if shell is not None and not (isinstance(shell, ast.Constant) and shell.value is False):
-			violations.append(violation(SOURCE_TOOL_FILE, node, f"{name} with shell="))
+			violations.append(violation(rel, node, f"{name} with shell="))
 		command = node.args[0] if node.args else keywords.get("args")
 		if isinstance(command, ast.Constant | ast.JoinedStr):
-			violations.append(violation(SOURCE_TOOL_FILE, node, f"{name} with a string command, not a list"))
-		if is_timeout_wrapped(command):
+			violations.append(violation(rel, node, f"{name} with a string command, not a list"))
+		if rel == PROCESS_RUNNER_FILE or is_timeout_wrapped(command):
 			violations.extend(
-				violation(SOURCE_TOOL_FILE, node, f"{name} {problem}")
+				violation(rel, node, f"{name} {problem}")
 				for problem in timeout_wrapped_call_problems(keywords, aliases)
 			)
 	return violations
@@ -1772,6 +1782,7 @@ class TestArchitecture(unittest.TestCase):
 		scanned = only_python(self.sources)
 		self.assertGreater(len(scanned), 0)
 		self.assertIn("subprocess", self.sources[SOURCE_TOOL_FILE])
+		self.assertIn("subprocess", self.sources[PROCESS_RUNNER_FILE])
 		self.assertEqual(check_subprocess_only_in_source_tool(self.sources), [])
 		self.assertEqual(check_subprocess_call_shape(self.sources), [])
 		wrapped = [
@@ -2269,6 +2280,81 @@ class TestScannersCatchViolations(unittest.TestCase):
 			"import os\nimport subprocess\nsubprocess.run(['git', 'log'], timeout=3, env={**os.environ})\n"
 		)
 		self.assertEqual(check_subprocess_call_shape({SOURCE_TOOL_FILE: plain_git}), [])
+
+	def test_subprocess_allowed_in_process_runner_only_besides_source_tool(self):
+		self.assertEqual(SUBPROCESS_FILES, ("agent/tools/source.py", "agent/changes/process_runner.py"))
+		allowed = "import subprocess\nsubprocess.run(['bench'], timeout=3)\n"
+		self.assertEqual(check_subprocess_only_in_source_tool({PROCESS_RUNNER_FILE: allowed}), [])
+		for rel in ("agent/changes/apply_job.py", "agent/changes/file_writer.py", "agent/changes/runner.py"):
+			with self.subTest(rel=rel):
+				self.assertCaught(check_subprocess_only_in_source_tool({rel: allowed}), "outside")
+
+	def test_subprocess_call_shape_applies_to_process_runner(self):
+		head = (
+			"import os\nimport subprocess\n"
+			"subprocess.run([TIMEOUT_EXECUTABLE, '-s', 'KILL', '5', BENCH_EXECUTABLE], timeout=35"
+		)
+		good = f"{head}, cwd=get_bench_path(), env=_minimal_env(), start_new_session=True)\n"
+		self.assertEqual(check_subprocess_call_shape({SOURCE_TOOL_FILE: "", PROCESS_RUNNER_FILE: good}), [])
+		bench_first = (
+			"import subprocess\nsubprocess.run([source.TIMEOUT_EXECUTABLE, '-s', 'KILL', '5', 'bench'], "
+			"timeout=35, cwd=root, env=_minimal_env(), start_new_session=True)\n"
+		)
+		self.assertEqual(
+			check_subprocess_call_shape({SOURCE_TOOL_FILE: "", PROCESS_RUNNER_FILE: bench_first}), []
+		)
+		cases = (
+			(
+				"without timeout=",
+				"import subprocess\nsubprocess.run(['bench'], cwd=r, env={}, start_new_session=True)\n",
+			),
+			("with shell=", f"{head}, cwd=r, env={{}}, start_new_session=True, shell=True)\n"),
+			(
+				"string command",
+				"import subprocess\nsubprocess.run('bench migrate', timeout=3, cwd=r, env={}, start_new_session=True)\n",
+			),
+			(
+				"only run()",
+				"import subprocess\nsubprocess.Popen(['bench'], timeout=3, cwd=r, env={}, start_new_session=True)\n",
+			),
+			("without start_new_session=True", f"{head}, cwd=r, env=_minimal_env())\n"),
+			(
+				"without start_new_session=True",
+				f"{head}, cwd=r, env=_minimal_env(), start_new_session=False)\n",
+			),
+			("without cwd=", f"{head}, env=_minimal_env(), start_new_session=True)\n"),
+			("without env=", f"{head}, cwd=r, start_new_session=True)\n"),
+			("env= uses os.environ", f"{head}, cwd=r, env={{**os.environ}}, start_new_session=True)\n"),
+			("env= uses os.environ", f"{head}, cwd=r, env=dict(os.environ), start_new_session=True)\n"),
+			("env= uses os.environ", f"{head}, cwd=r, env=os.environ, start_new_session=True)\n"),
+			(
+				"without start_new_session=True",
+				"import subprocess\nsubprocess.run(['bench'], timeout=3, cwd=r, env={})\n",
+			),
+			(
+				"without cwd=",
+				"import subprocess\nsubprocess.run(['bench'], timeout=3, env={}, start_new_session=True)\n",
+			),
+			(
+				"env= uses os.environ",
+				"import os\nimport subprocess\nsubprocess.run(['bench'], timeout=3, cwd=r, env=os.environ, start_new_session=True)\n",
+			),
+		)
+		for fragment, source in cases:
+			with self.subTest(fragment=fragment, source=source):
+				violations = check_subprocess_call_shape({SOURCE_TOOL_FILE: "", PROCESS_RUNNER_FILE: source})
+				self.assertCaught(violations, fragment)
+				self.assertTrue(all(text.startswith(PROCESS_RUNNER_FILE) for text in violations), violations)
+		plain = (
+			"import os\nimport subprocess\nsubprocess.run(['git', 'log'], timeout=3, env={**os.environ})\n"
+		)
+		self.assertEqual(check_subprocess_call_shape({SOURCE_TOOL_FILE: plain}), [])
+		self.assertCaught(
+			check_subprocess_call_shape({SOURCE_TOOL_FILE: "", PROCESS_RUNNER_FILE: plain}),
+			"env= uses os.environ",
+			"without cwd=",
+			"without start_new_session=True",
+		)
 
 	# policy fields -----------------------------------------------------------------------------
 

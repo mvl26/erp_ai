@@ -1,10 +1,13 @@
 import hashlib
 import json
+from datetime import datetime
+from unittest.mock import patch
 
 import frappe
 from frappe.tests.utils import FrappeTestCase
 
 from erp_ai.agent.changes import transitions
+from erp_ai.agent.changes.process_runner import CommandResult
 from erp_ai.constants import (
 	BOT_GIT_EMAIL,
 	BOT_GIT_NAME,
@@ -324,3 +327,566 @@ class TestTransitionsBasics(FrappeTestCase):
 			with self.subTest(case=case), self.assertRaises(ValueError):
 				transitions.log_step(*args)
 		self.assertEqual(frappe.db.count(LOG_DOCTYPE), log_count)
+
+
+# Design 2.2 / 3.5: the edges `finish` may take, each with the one log step it writes (hand-written).
+FINISH_EDGES_EXPECTED = {
+	(CHANGE_STATUS_APPROVED, CHANGE_STATUS_FAILED): "fail",
+	(CHANGE_STATUS_APPLYING, CHANGE_STATUS_APPLIED): "apply",
+	(CHANGE_STATUS_APPLYING, CHANGE_STATUS_FAILED): "fail",
+	(CHANGE_STATUS_APPLYING, CHANGE_STATUS_STALE): "stale",
+	(CHANGE_STATUS_UNDOING, CHANGE_STATUS_UNDONE): "undo",
+	(CHANGE_STATUS_UNDOING, CHANGE_STATUS_FAILED): "fail",
+}
+ALL_STATUSES = (
+	"Chờ duyệt",
+	"Đã từ chối",
+	"Đã duyệt",
+	"Đang áp dụng",
+	"Đã áp dụng",
+	"Lỗi",
+	"Hết hiệu lực",
+	"Đang hoàn tác",
+	"Đã hoàn tác",
+)
+GIT_FIELDS_EXPECTED = ("applied_branch", "applied_ahead_count", "apply_commit_sha", "undo_commit_sha")
+NOW = datetime(2026, 11, 13, 9, 30, 15)
+ACTOR = "Administrator"
+LOG_FIELDS = ("change_step", "actor", "ticket", "run_id", "error", "value_before", "value_after", "creation")
+
+
+def _state(name) -> dict:
+	return frappe.db.get_value(PROPOSAL_DOCTYPE, name, list(STATE_FIELDS_EXPECTED), as_dict=True)
+
+
+def _modified(name):
+	return frappe.db.get_value(PROPOSAL_DOCTYPE, name, "modified")
+
+
+def _rows(name) -> list:
+	rows = frappe.get_all(
+		LOG_DOCTYPE,
+		filters={"change_proposal": name},
+		fields=list(LOG_FIELDS),
+		order_by="creation asc",
+	)
+	for row in rows:
+		for key in ("value_before", "value_after"):
+			row[key] = None if row[key] is None else json.loads(row[key])
+	return rows
+
+
+def _proposal_in(status, kind=CHANGE_KIND_CODE):
+	proposal = make_change_proposal(kind=kind)
+	frappe.db.set_value(PROPOSAL_DOCTYPE, proposal.name, "change_status", status, update_modified=False)
+	return proposal
+
+
+class TransitionTestCase(FrappeTestCase):
+	def setUp(self):
+		patcher = patch("erp_ai.agent.changes.transitions.now_datetime", return_value=NOW)
+		patcher.start()
+		self.addCleanup(patcher.stop)
+
+	def assertNothingChanged(self, name, state, modified):
+		self.assertEqual(_state(name), state)
+		self.assertEqual(_modified(name), modified)
+		self.assertEqual(_rows(name), [])
+
+	def assertRefused(self, call, message, name):
+		state, modified = _state(name), _modified(name)
+		with self.assertRaises(transitions.InvalidTransition) as caught:
+			call()
+		self.assertEqual(str(caught.exception), message)
+		self.assertNothingChanged(name, state, modified)
+
+
+class TestApproveReject(TransitionTestCase):
+	def test_approve_writes_decision_digest_and_one_row(self):
+		proposal = make_change_proposal()
+		before, modified = _state(proposal.name), _modified(proposal.name)
+		digest = _hand_digest(frappe.get_doc(PROPOSAL_DOCTYPE, proposal.name))
+		self.assertEqual(transitions.approve(proposal.name, ACTOR), "Đã duyệt")
+		self.assertEqual(
+			_state(proposal.name),
+			{
+				**before,
+				"change_status": "Đã duyệt",
+				"decided_by": ACTOR,
+				"decided_at": NOW,
+				"approved_digest": digest,
+			},
+		)
+		self.assertNotEqual(_modified(proposal.name), modified)
+		rows = _rows(proposal.name)
+		self.assertEqual(len(rows), 1)
+		self.assertEqual(
+			{key: rows[0][key] for key in LOG_FIELDS[:-1]},
+			{
+				"change_step": "approve",
+				"actor": ACTOR,
+				"ticket": proposal.ticket,
+				"run_id": proposal.run_id,
+				"error": None,
+				"value_before": None,
+				"value_after": None,
+			},
+		)
+
+	def test_reject_writes_decision_and_one_row_without_digest(self):
+		proposal = make_change_proposal()
+		before = _state(proposal.name)
+		self.assertEqual(transitions.reject(proposal.name, ACTOR), "Đã từ chối")
+		self.assertEqual(
+			_state(proposal.name),
+			{**before, "change_status": "Đã từ chối", "decided_by": ACTOR, "decided_at": NOW},
+		)
+		self.assertIsNone(_state(proposal.name).approved_digest)
+		self.assertEqual([(row.change_step, row.actor) for row in _rows(proposal.name)], [("reject", ACTOR)])
+
+	def test_approve_twice_second_raises_and_logs_nothing(self):
+		proposal = make_change_proposal()
+		transitions.approve(proposal.name, ACTOR)
+		state, modified, rows = _state(proposal.name), _modified(proposal.name), _rows(proposal.name)
+		with self.assertRaises(transitions.InvalidTransition) as caught:
+			transitions.approve(proposal.name, "Guest")
+		self.assertEqual(str(caught.exception), "Đề xuất đang ở trạng thái Đã duyệt, không duyệt được")
+		self.assertEqual(_state(proposal.name), state)
+		self.assertEqual(_modified(proposal.name), modified)
+		self.assertEqual(_rows(proposal.name), rows)
+
+	def test_reject_then_approve_raises(self):
+		proposal = make_change_proposal()
+		transitions.reject(proposal.name, ACTOR)
+		state, modified, rows = _state(proposal.name), _modified(proposal.name), _rows(proposal.name)
+		for call, verb in ((transitions.approve, "duyệt"), (transitions.reject, "từ chối")):
+			with self.subTest(verb=verb), self.assertRaises(transitions.InvalidTransition) as caught:
+				call(proposal.name, ACTOR)
+			self.assertEqual(
+				str(caught.exception), f"Đề xuất đang ở trạng thái Đã từ chối, không {verb} được"
+			)
+		self.assertEqual(_state(proposal.name), state)
+		self.assertEqual(_modified(proposal.name), modified)
+		self.assertEqual(_rows(proposal.name), rows)
+
+	def test_approve_and_reject_refused_from_every_other_state(self):
+		for status in ALL_STATUSES[1:]:
+			for call, verb in ((transitions.approve, "duyệt"), (transitions.reject, "từ chối")):
+				with self.subTest(status=status, verb=verb):
+					proposal = _proposal_in(status)
+					self.assertRefused(
+						lambda: call(proposal.name, ACTOR),
+						f"Đề xuất đang ở trạng thái {status}, không {verb} được",
+						proposal.name,
+					)
+
+
+class TestRequestUndo(TransitionTestCase):
+	def test_request_undo_writes_undo_by_and_at_without_row(self):
+		proposal = _proposal_in(CHANGE_STATUS_APPLIED)
+		before = _state(proposal.name)
+		self.assertEqual(transitions.request_undo(proposal.name, ACTOR), "Đang hoàn tác")
+		self.assertEqual(
+			_state(proposal.name),
+			{**before, "change_status": "Đang hoàn tác", "undo_by": ACTOR, "undo_at": NOW},
+		)
+		self.assertEqual(_rows(proposal.name), [])
+
+	def test_request_undo_refused_for_command(self):
+		for status in ALL_STATUSES:
+			with self.subTest(status=status):
+				proposal = _proposal_in(status, kind=CHANGE_KIND_COMMAND)
+				self.assertRefused(
+					lambda: transitions.request_undo(proposal.name, ACTOR),
+					"Lệnh bench không hoàn tác được",
+					proposal.name,
+				)
+
+	def test_request_undo_refused_for_code_outside_applied(self):
+		for status in (s for s in ALL_STATUSES if s != "Đã áp dụng"):
+			with self.subTest(status=status):
+				proposal = _proposal_in(status)
+				self.assertRefused(
+					lambda: transitions.request_undo(proposal.name, ACTOR),
+					f"Đề xuất đang ở trạng thái {status}, không hoàn tác được",
+					proposal.name,
+				)
+
+
+class TestBeginApply(TransitionTestCase):
+	def test_begin_apply_only_from_approved_and_second_call_false(self):
+		proposal = _proposal_in(CHANGE_STATUS_APPROVED)
+		before = _state(proposal.name)
+		self.assertIs(transitions.begin_apply(proposal.name), True)
+		self.assertEqual(_state(proposal.name), {**before, "change_status": "Đang áp dụng"})
+		self.assertEqual(_rows(proposal.name), [])
+		state, modified = _state(proposal.name), _modified(proposal.name)
+		self.assertIs(transitions.begin_apply(proposal.name), False)
+		self.assertNothingChanged(proposal.name, state, modified)
+
+	def test_begin_apply_false_from_every_other_state(self):
+		for status in (s for s in ALL_STATUSES if s != "Đã duyệt"):
+			with self.subTest(status=status):
+				proposal = _proposal_in(status)
+				state, modified = _state(proposal.name), _modified(proposal.name)
+				self.assertIs(transitions.begin_apply(proposal.name), False)
+				self.assertNothingChanged(proposal.name, state, modified)
+
+
+class TestFinish(TransitionTestCase):
+	def test_finish_edges_are_the_design_state_machine(self):
+		self.assertEqual(len(FINISH_EDGES_EXPECTED), 6)
+		for expected in ALL_STATUSES:
+			for new_status in ALL_STATUSES:
+				step = FINISH_EDGES_EXPECTED.get((expected, new_status))
+				with self.subTest(expected=expected, new_status=new_status):
+					proposal = _proposal_in(expected)
+					if step is None:
+						state, modified = _state(proposal.name), _modified(proposal.name)
+						for any_step in ("apply", "fail", "stale", "undo"):
+							with self.assertRaises(ValueError):
+								transitions.finish(
+									proposal.name, expected, new_status, step=any_step, actor=ACTOR
+								)
+						self.assertNothingChanged(proposal.name, state, modified)
+					else:
+						self.assertIs(
+							transitions.finish(proposal.name, expected, new_status, step=step, actor=ACTOR),
+							True,
+						)
+						self.assertEqual(_state(proposal.name).change_status, new_status)
+
+	def test_finish_refuses_a_step_that_does_not_match_the_edge(self):
+		for (expected, new_status), step in FINISH_EDGES_EXPECTED.items():
+			for wrong_step in (s for s in CHANGE_STEPS if s != step):
+				with self.subTest(expected=expected, new_status=new_status, step=wrong_step):
+					proposal = _proposal_in(expected)
+					state, modified = _state(proposal.name), _modified(proposal.name)
+					with self.assertRaises(ValueError):
+						transitions.finish(proposal.name, expected, new_status, step=wrong_step, actor=ACTOR)
+					self.assertNothingChanged(proposal.name, state, modified)
+
+	def test_finish_writes_status_time_reason_fields_and_one_row(self):
+		proposal = _proposal_in(CHANGE_STATUS_APPLYING)
+		before = _state(proposal.name)
+		fields = {
+			"apply_commit_sha": "c" * 40,
+			"applied_branch": "main",
+			"applied_ahead_count": 1,
+		}
+		value_before = {"sha256": "a" * 64, "head": "d" * 40}
+		value_after = {"sha256": "b" * 64, "commit": "c" * 40, "branch": "main"}
+		self.assertIs(
+			transitions.finish(
+				proposal.name,
+				CHANGE_STATUS_APPLYING,
+				CHANGE_STATUS_APPLIED,
+				step="apply",
+				actor=ACTOR,
+				fields=fields,
+				before=value_before,
+				after=value_after,
+			),
+			True,
+		)
+		self.assertEqual(
+			_state(proposal.name),
+			{
+				**before,
+				"change_status": "Đã áp dụng",
+				"finished_at": NOW,
+				"failure_reason": None,
+				"apply_commit_sha": "c" * 40,
+				"applied_branch": "main",
+				"applied_ahead_count": 1,
+			},
+		)
+		rows = _rows(proposal.name)
+		self.assertEqual(len(rows), 1)
+		self.assertEqual(
+			{key: rows[0][key] for key in LOG_FIELDS[:-1]},
+			{
+				"change_step": "apply",
+				"actor": ACTOR,
+				"ticket": proposal.ticket,
+				"run_id": proposal.run_id,
+				"error": None,
+				"value_before": value_before,
+				"value_after": value_after,
+			},
+		)
+
+	def test_finish_failure_stores_reason_and_logs_it_as_error(self):
+		proposal = _proposal_in(CHANGE_STATUS_UNDOING)
+		before = _state(proposal.name)
+		reason = "file đã đổi sau khi áp dụng, không hoàn tác"
+		self.assertIs(
+			transitions.finish(
+				proposal.name,
+				CHANGE_STATUS_UNDOING,
+				CHANGE_STATUS_FAILED,
+				step="fail",
+				actor=ACTOR,
+				reason=reason,
+				fields={"undo_commit_sha": "e" * 40},
+			),
+			True,
+		)
+		self.assertEqual(
+			_state(proposal.name),
+			{
+				**before,
+				"change_status": "Lỗi",
+				"finished_at": NOW,
+				"failure_reason": reason,
+				"undo_commit_sha": "e" * 40,
+			},
+		)
+		self.assertEqual(
+			[(row.change_step, row.error, row.value_before, row.value_after) for row in _rows(proposal.name)],
+			[("fail", reason, None, None)],
+		)
+
+	def test_finish_result_stores_command_output_on_proposal_and_row(self):
+		# (result, exit_code stored on the proposal): the Int column is NOT NULL, so no exit code is 0 there.
+		cases = {
+			"exit code": (
+				CommandResult(exit_code=1, output="lỗi\n", duration_ms=250, timed_out=False, not_found=False),
+				1,
+			),
+			"no budget": (
+				CommandResult(exit_code=None, output="", duration_ms=0, timed_out=True, not_found=False),
+				0,
+			),
+		}
+		for case, (result, stored_exit_code) in cases.items():
+			with self.subTest(case=case):
+				proposal = _proposal_in(CHANGE_STATUS_APPLYING, kind=CHANGE_KIND_COMMAND)
+				before = _state(proposal.name)
+				self.assertIs(
+					transitions.finish(
+						proposal.name,
+						CHANGE_STATUS_APPLYING,
+						CHANGE_STATUS_FAILED,
+						step="fail",
+						actor=ACTOR,
+						reason="quá thời gian",
+						result=result,
+					),
+					True,
+				)
+				self.assertEqual(
+					_state(proposal.name),
+					{
+						**before,
+						"change_status": "Lỗi",
+						"finished_at": NOW,
+						"failure_reason": "quá thời gian",
+						"exit_code": stored_exit_code,
+						"duration_ms": result.duration_ms,
+						"command_output": result.output,
+					},
+				)
+				self.assertEqual(
+					[(row.change_step, row.error, row.value_after) for row in _rows(proposal.name)],
+					[
+						(
+							"fail",
+							"quá thời gian",
+							{
+								"exit_code": result.exit_code,
+								"duration_ms": result.duration_ms,
+								"output": result.output,
+							},
+						)
+					],
+				)
+
+	def test_finish_refuses_bad_result(self):
+		ok = CommandResult(exit_code=0, output="", duration_ms=1, timed_out=False, not_found=False)
+		cases = {
+			"not a CommandResult": {"result": {"exit_code": 0, "duration_ms": 1, "output": ""}},
+			"result and after": {"result": ok, "after": {"sha256": "a" * 64}},
+		}
+		for case, kwargs in cases.items():
+			with self.subTest(case=case):
+				proposal = _proposal_in(CHANGE_STATUS_APPLYING, kind=CHANGE_KIND_COMMAND)
+				state, modified = _state(proposal.name), _modified(proposal.name)
+				with self.assertRaises(ValueError):
+					transitions.finish(
+						proposal.name,
+						CHANGE_STATUS_APPLYING,
+						CHANGE_STATUS_APPLIED,
+						step="apply",
+						actor=ACTOR,
+						**kwargs,
+					)
+				self.assertNothingChanged(proposal.name, state, modified)
+
+	def test_finish_with_wrong_expected_does_nothing(self):
+		for (expected, new_status), step in FINISH_EDGES_EXPECTED.items():
+			for current in (s for s in ALL_STATUSES if s != expected):
+				with self.subTest(expected=expected, new_status=new_status, current=current):
+					proposal = _proposal_in(current)
+					state, modified = _state(proposal.name), _modified(proposal.name)
+					self.assertIs(
+						transitions.finish(
+							proposal.name, expected, new_status, step=step, actor=ACTOR, reason="x"
+						),
+						False,
+					)
+					self.assertNothingChanged(proposal.name, state, modified)
+
+	def test_finish_fields_only_git_keys_else_valueerror(self):
+		self.assertEqual(transitions.STATE_FIELDS[-4:], GIT_FIELDS_EXPECTED)
+		values = {
+			"applied_branch": "develop",
+			"applied_ahead_count": 3,
+			"apply_commit_sha": "f" * 40,
+			"undo_commit_sha": "9" * 40,
+		}
+		for key in GIT_FIELDS_EXPECTED:
+			with self.subTest(key=key):
+				proposal = _proposal_in(CHANGE_STATUS_APPLYING)
+				transitions.finish(
+					proposal.name,
+					CHANGE_STATUS_APPLYING,
+					CHANGE_STATUS_FAILED,
+					step="fail",
+					actor=ACTOR,
+					fields={key: values[key]},
+				)
+				self.assertEqual(_state(proposal.name)[key], values[key])
+		bad_fields = (
+			{"change_status": CHANGE_STATUS_APPLIED},
+			{"failure_reason": "x"},
+			{"decided_by": "Guest"},
+			{"finished_at": NOW},
+			{"exit_code": 0},
+			{"content_after": "x"},
+			{"target_branch": "develop"},
+			{"apply_commit_sha": "f" * 40, "approved_digest": "0" * 64},
+			[("apply_commit_sha", "f" * 40)],
+		)
+		for fields in bad_fields:
+			with self.subTest(fields=fields):
+				proposal = _proposal_in(CHANGE_STATUS_APPLYING)
+				state, modified = _state(proposal.name), _modified(proposal.name)
+				with self.assertRaises(ValueError):
+					transitions.finish(
+						proposal.name,
+						CHANGE_STATUS_APPLYING,
+						CHANGE_STATUS_FAILED,
+						step="fail",
+						actor=ACTOR,
+						fields=fields,
+					)
+				self.assertNothingChanged(proposal.name, state, modified)
+
+
+class TestTransitionInput(TransitionTestCase):
+	def _calls(self, name, person=ACTOR):
+		return {
+			"approve": lambda: transitions.approve(name, person),
+			"reject": lambda: transitions.reject(name, person),
+			"request_undo": lambda: transitions.request_undo(name, person),
+			"begin_apply": lambda: transitions.begin_apply(name),
+			"finish": lambda: transitions.finish(
+				name, CHANGE_STATUS_APPLYING, CHANGE_STATUS_FAILED, step="fail", actor=person
+			),
+		}
+
+	def test_name_must_be_a_non_empty_string(self):
+		proposal = make_change_proposal()
+		for bad in ("", "  ", None, 7, proposal):
+			for function, call in self._calls(bad).items():
+				with self.subTest(name=bad, function=function), self.assertRaises(ValueError):
+					call()
+
+	def test_unknown_proposal_raises_does_not_exist(self):
+		for name, shown in (("AICHG-99999999", "AICHG-99999999"), ("<b>x</b>", "&lt;b&gt;x&lt;/b&gt;")):
+			for function, call in self._calls(name).items():
+				with self.subTest(name=name, function=function):
+					with self.assertRaises(frappe.DoesNotExistError) as caught:
+						call()
+					self.assertEqual(str(caught.exception), f"Không có đề xuất {shown}")
+
+	def test_user_and_actor_must_be_non_empty_strings(self):
+		for bad in ("", "  ", None, 7):
+			proposal = _proposal_in(CHANGE_STATUS_APPLYING)
+			state, modified = _state(proposal.name), _modified(proposal.name)
+			calls = self._calls(proposal.name, person=bad)
+			del calls["begin_apply"]
+			for function, call in calls.items():
+				with self.subTest(person=bad, function=function), self.assertRaises(ValueError):
+					call()
+			self.assertNothingChanged(proposal.name, state, modified)
+
+
+class TestEveryStepLogs(TransitionTestCase):
+	def test_each_step_writes_exactly_one_change_row(self):
+		errors = {
+			"fail": "đang có thay đổi khác chạy, không lấy được khóa",
+			"stale": "file đích đã đổi kể từ lúc đề xuất",
+		}
+		cases = (
+			("propose", CHANGE_STATUS_PENDING, lambda name: transitions.log_step(name, "propose", ACTOR)),
+			("approve", CHANGE_STATUS_PENDING, lambda name: transitions.approve(name, ACTOR)),
+			("reject", CHANGE_STATUS_PENDING, lambda name: transitions.reject(name, ACTOR)),
+			(
+				"apply",
+				CHANGE_STATUS_APPLYING,
+				lambda name: transitions.finish(
+					name, CHANGE_STATUS_APPLYING, CHANGE_STATUS_APPLIED, step="apply", actor=ACTOR
+				),
+			),
+			(
+				"fail",
+				CHANGE_STATUS_APPROVED,
+				lambda name: transitions.finish(
+					name,
+					CHANGE_STATUS_APPROVED,
+					CHANGE_STATUS_FAILED,
+					step="fail",
+					actor=ACTOR,
+					reason=errors["fail"],
+				),
+			),
+			(
+				"stale",
+				CHANGE_STATUS_APPLYING,
+				lambda name: transitions.finish(
+					name,
+					CHANGE_STATUS_APPLYING,
+					CHANGE_STATUS_STALE,
+					step="stale",
+					actor=ACTOR,
+					reason=errors["stale"],
+				),
+			),
+			(
+				"undo",
+				CHANGE_STATUS_UNDOING,
+				lambda name: transitions.finish(
+					name, CHANGE_STATUS_UNDOING, CHANGE_STATUS_UNDONE, step="undo", actor=ACTOR
+				),
+			),
+		)
+		self.assertEqual(tuple(step for step, _status, _call in cases), CHANGE_STEPS)
+		for step, status, call in cases:
+			with self.subTest(step=step):
+				proposal = _proposal_in(status)
+				call(proposal.name)
+				rows = _rows(proposal.name)
+				self.assertEqual(len(rows), 1)
+				self.assertIsNotNone(rows[0].creation)
+				self.assertEqual(
+					{key: rows[0][key] for key in ("change_step", "actor", "ticket", "run_id", "error")},
+					{
+						"change_step": step,
+						"actor": ACTOR,
+						"ticket": proposal.ticket,
+						"run_id": proposal.run_id,
+						"error": errors.get(step),
+					},
+				)

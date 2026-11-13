@@ -8,7 +8,6 @@ from frappe.utils import get_fullname
 from erp_ai import gateway
 from erp_ai.agent import authority, policy, site_facts
 from erp_ai.agent.answer_delay import AnswerDelay
-from erp_ai.agent.changes import transitions
 from erp_ai.agent.classification import load_mapping, parse_classification
 from erp_ai.agent.prompts import (
 	build_classify_request,
@@ -17,7 +16,7 @@ from erp_ai.agent.prompts import (
 	build_routing_table,
 )
 from erp_ai.agent.routing import decide_route, departments, load_routing_config, sla_lag
-from erp_ai.agent.run_log import write_entry
+from erp_ai.agent.run_log import ENTRY_TYPE_CHANGE, write_entry
 from erp_ai.agent.run_status import CLASSIFY_STEP, RunStatus
 from erp_ai.agent.tools.read import TOOL_RESULT_MAX_CHARS
 from erp_ai.agent.tools.registry import (
@@ -54,6 +53,7 @@ from erp_ai.constants import (
 	TITLE_RUN_FAILED,
 	TITLE_STATUS_FAILED,
 	TITLE_WRONG_USER,
+	TRIGGER_CHANGE_ACTION,
 	TRIGGER_COMMENT_MENTION,
 	TRIGGER_TICKET_INSERT,
 )
@@ -85,6 +85,7 @@ WRITE_TOOL_TARGETS = {
 }
 ACTION_DOCTYPE_MAX = 80
 PROPOSE_TOOLS = ("propose_file_change", "propose_new_file", "propose_bench_command")
+PROPOSE_STEP = "propose"
 UNPARSEABLE_ERROR = "UNPARSEABLE: không phân loại được"
 BAD_MAPPING_ERROR = "category_mapping không hợp lệ, không có giá trị dự đoán"
 BAD_ROUTING_ERROR = "routing_rules không hợp lệ, định tuyến dùng giá trị rỗng"
@@ -678,8 +679,17 @@ def _run_tool(block, context, actions, before, after, tool_errors, skipped):
 			"is_error": True,
 		}
 	if name in PROPOSE_TOOLS and outcome.get("ok"):
-		# the `propose` step of the proposal's own log trail, written by the agent account
-		transitions.log_step(outcome["proposal"], "propose", context.agent_user)
+		# the `propose` step of the proposal's own log trail, written by the agent account (design 4.1 step 4)
+		write_entry(
+			entry_type=ENTRY_TYPE_CHANGE,
+			trigger=TRIGGER_CHANGE_ACTION,
+			change_step=PROPOSE_STEP,
+			actor=AGENT_USER,
+			change_proposal=outcome["proposal"],
+			ticket=context.ticket_name,
+			run_id=context.run_id,
+			instructor=context.instructor,
+		)
 	if name in WRITE_TOOL_TARGETS:
 		actions.append(_action(name, context, outcome, bool(outcome.get("ok")), arguments))
 		if outcome.get("ok") and "after" in outcome:

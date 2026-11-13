@@ -102,7 +102,7 @@ def _decider(name) -> str:
 
 
 @frappe.whitelist(methods=["POST"])
-def approve(name) -> dict:
+def approve(name=None) -> dict:
 	"""`Chờ duyệt → Đã duyệt`, then queue the `apply` job (design 3.3, ADR-012 QĐ 4)."""
 	user = _decider(name)
 	status = transitions.approve(name, user)
@@ -111,14 +111,14 @@ def approve(name) -> dict:
 
 
 @frappe.whitelist(methods=["POST"])
-def reject(name) -> dict:
+def reject(name=None) -> dict:
 	"""`Chờ duyệt → Đã từ chối`; no job (design 3.3)."""
 	user = _decider(name)
 	return {"name": name, "status": transitions.reject(name, user)}
 
 
 @frappe.whitelist(methods=["POST"])
-def undo(name) -> dict:
+def undo(name=None) -> dict:
 	"""`Đã áp dụng → Đang hoàn tác` for a code change, then queue the `undo` job (design 3.3)."""
 	user = _decider(name)
 	status = transitions.request_undo(name, user)

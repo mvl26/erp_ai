@@ -1367,3 +1367,429 @@ class TestRunGitReadInSandbox(RealCoreReposUntouchedMixin, unittest.TestCase):
 		sandbox = GitSandbox(self, apps=("custom_app",), erp_ai_worktree=None)
 		result = source.run_git_read(sandbox.repo("custom_app"), "rev-parse", "--verify", "-q", "no-such-ref")
 		self.assertEqual(result, source.GitRun(exit_code=1, stdout=b"", timed_out=False))
+
+
+# Design table 3.2, typed here on purpose: the sentences are a contract (STD-TEST-2).
+EXPECTED_GIT_NOT_REPO = "thư mục app không phải gốc một kho git"
+EXPECTED_GIT_NO_COMMIT = "kho git của app chưa có commit nào"
+EXPECTED_GIT_DETACHED = "HEAD của kho git không nằm trên nhánh nào (detached)"
+EXPECTED_GIT_LOCKED = (
+	"kho git đang bị khóa (index.lock): có thao tác git khác đang chạy hoặc bị dừng giữa chừng"
+)
+EXPECTED_GIT_IN_PROGRESS = "kho git đang dở merge, rebase, cherry-pick hoặc revert"
+EXPECTED_GIT_IGNORED = "file đích bị git bỏ qua (.gitignore)"
+EXPECTED_GIT_DIRTY = "file đích có thay đổi chưa commit"
+EXPECTED_GIT_ERROR = "không đọc được trạng thái git"
+READ_GIT_PATH = "erp_ai.agent.tools.source.run_git_read"
+APP = "custom_app"
+TARGET = "custom_app/hooks.py"
+FAKE_HEAD = "0123456789abcdef0123456789abcdef01234567"
+
+
+def refused(reason):
+	return source.GitState(refusal=reason, repo_root=None, rel_in_repo=None, branch=None, head=None)
+
+
+class TestReadGitState(RealCoreReposUntouchedMixin, unittest.TestCase):
+	"""read_git_state against GitSandbox repos only (NFR-9)."""
+
+	def make_sandbox(self, **kwargs):
+		sandbox = GitSandbox(self, apps=(APP,), erp_ai_worktree=None, **kwargs)
+		sandbox.commit_file(APP, ".gitignore", "*.log\n")
+		sandbox.commit_file(APP, TARGET, "x = 1\n")
+		return sandbox
+
+	def full(self, sandbox, rel=TARGET, app=APP):
+		return os.path.join(sandbox.repo(app), rel)
+
+	def head(self, sandbox, app=APP):
+		return sandbox.git(app, "rev-parse", "HEAD").strip()
+
+	def read(self, full_path, *, new_file=False, root=None, limit_s=source.GIT_TIMEOUT_S):
+		if root is None:
+			return source.read_git_state(full_path, new_file=new_file, limit_s=limit_s)
+		with patch(ROOT_PATH, return_value=root):
+			return source.read_git_state(full_path, new_file=new_file, limit_s=limit_s)
+
+	def test_read_git_state_refusals(self):
+		def staged(sandbox):
+			sandbox.stage(APP, TARGET, "x = 2\n")
+			return self.full(sandbox), False, None
+
+		def unstaged(sandbox):
+			sandbox.write_unstaged(APP, TARGET, "x = 2\n")
+			return self.full(sandbox), False, None
+
+		def untracked_existing(sandbox):
+			sandbox.write_unstaged(APP, "custom_app/extra.py", "y = 1\n")
+			return self.full(sandbox, "custom_app/extra.py"), False, None
+
+		def ignored_new(sandbox):
+			return self.full(sandbox, "custom_app/debug.log"), True, None
+
+		def not_repo(sandbox):
+			os.makedirs(os.path.join(sandbox.root, "plain_app", "plain_app"))
+			return os.path.join(sandbox.root, "plain_app", "plain_app", "x.py"), True, None
+
+		def inside_other_repo(sandbox):
+			# The apps root itself is a repo (as when the bench is one); inner_app has no .git (D-20).
+			outer = sandbox.repo(APP)
+			os.makedirs(os.path.join(outer, "inner_app", "inner_app"))
+			return os.path.join(outer, "inner_app", "inner_app", "x.py"), True, outer
+
+		def no_commit(sandbox):
+			os.makedirs(sandbox.repo("fresh_app"))
+			sandbox.git("fresh_app", "init", "--quiet", "--initial-branch=main")
+			return self.full(sandbox, "fresh_app/x.py", "fresh_app"), True, None
+
+		def detached(sandbox):
+			sandbox.detach(APP)
+			return self.full(sandbox), False, None
+
+		def in_progress(kind):
+			def make(sandbox):
+				sandbox.mark_in_progress(APP, kind)
+				return self.full(sandbox), False, None
+
+			return make
+
+		def index_lock(sandbox):
+			sandbox.hold_index_lock(APP)
+			return self.full(sandbox), False, None
+
+		cases = (
+			("staged", staged, EXPECTED_GIT_DIRTY),
+			("unstaged", unstaged, EXPECTED_GIT_DIRTY),
+			("untracked existing file", untracked_existing, EXPECTED_GIT_DIRTY),
+			("new file ignored", ignored_new, EXPECTED_GIT_IGNORED),
+			("not a repo", not_repo, EXPECTED_GIT_NOT_REPO),
+			("app inside another repo", inside_other_repo, EXPECTED_GIT_NOT_REPO),
+			("no commit", no_commit, EXPECTED_GIT_NO_COMMIT),
+			("detached", detached, EXPECTED_GIT_DETACHED),
+			("MERGE_HEAD", in_progress("MERGE_HEAD"), EXPECTED_GIT_IN_PROGRESS),
+			("rebase-merge", in_progress("rebase-merge"), EXPECTED_GIT_IN_PROGRESS),
+			("CHERRY_PICK_HEAD", in_progress("CHERRY_PICK_HEAD"), EXPECTED_GIT_IN_PROGRESS),
+			("REVERT_HEAD", in_progress("REVERT_HEAD"), EXPECTED_GIT_IN_PROGRESS),
+			("index.lock", index_lock, EXPECTED_GIT_LOCKED),
+		)
+		self.assertEqual(len(cases), 13)
+		for name, make, expected in cases:
+			with self.subTest(name):
+				sandbox = self.make_sandbox()
+				full_path, new_file, root = make(sandbox)
+				self.assertEqual(self.read(full_path, new_file=new_file, root=root), refused(expected))
+
+	def test_read_git_state_rebase_apply_dir_is_in_progress(self):
+		# The fifth in-progress file (design step 4); the sandbox helper has no `rebase-apply` kind.
+		sandbox = self.make_sandbox()
+		rebase_apply = sandbox.git(APP, "rev-parse", "--git-path", "rebase-apply").strip()
+		os.makedirs(os.path.join(sandbox.repo(APP), rebase_apply))
+		self.assertEqual(self.read(self.full(sandbox)), refused(EXPECTED_GIT_IN_PROGRESS))
+
+	def test_read_git_state_other_dirty_file_does_not_block(self):
+		sandbox = self.make_sandbox()
+		sandbox.commit_file(APP, "custom_app/a.py", "a = 1\n")
+		sandbox.commit_file(APP, "custom_app/b.py", "b = 1\n")
+		sandbox.stage(APP, "custom_app/a.py", "a = 2\n")
+		sandbox.write_unstaged(APP, "custom_app/b.py", "b = 2\n")
+		sandbox.write_unstaged(APP, "custom_app/c.py", "c = 1\n")
+		sandbox.write_unstaged(APP, "custom_app/other.log", "ignored\n")
+		repo = sandbox.repo(APP)
+		head = self.head(sandbox)
+		for rel, new_file in ((TARGET, False), ("custom_app/new_module.py", True)):
+			with self.subTest(rel=rel):
+				self.assertEqual(
+					self.read(os.path.join(repo, rel), new_file=new_file),
+					source.GitState(
+						refusal=None,
+						repo_root=repo,
+						rel_in_repo=rel,
+						branch="main",
+						head=head,
+						upstream_ref="",
+						ahead_count=0,
+					),
+				)
+		self.assertIn("M  custom_app/a.py", sandbox.git(APP, "status", "--porcelain"))
+
+	def test_read_git_state_reports_current_branch(self):
+		sandbox = self.make_sandbox()
+		sandbox.switch_branch(APP, "feature/x")
+		state = self.read(self.full(sandbox))
+		self.assertEqual((state.refusal, state.branch, state.head), (None, "feature/x", self.head(sandbox)))
+
+	def test_read_git_state_on_worktree_uses_its_own_admin_dir(self):
+		sandbox = GitSandbox(self, apps=("erp_ai",))
+		worktree = sandbox.repo("erp_ai-wt")
+		state = self.read(os.path.join(worktree, "README.md"))
+		self.assertEqual(
+			state,
+			source.GitState(
+				refusal=None,
+				repo_root=worktree,
+				rel_in_repo="README.md",
+				branch="erp_ai-wt",
+				head=self.head(sandbox, "erp_ai-wt"),
+			),
+		)
+		sandbox.hold_index_lock("erp_ai-wt")
+		self.assertEqual(self.read(os.path.join(worktree, "README.md")), refused(EXPECTED_GIT_LOCKED))
+		self.assertEqual(self.read(os.path.join(sandbox.repo("erp_ai"), "README.md")).refusal, None)
+
+	def test_read_git_state_tracked_file_deleted_from_disk_is_dirty_for_new_file(self):
+		sandbox = self.make_sandbox()
+		os.remove(self.full(sandbox))
+		self.assertEqual(self.read(self.full(sandbox), new_file=True), refused(EXPECTED_GIT_DIRTY))
+
+	def test_read_git_state_pathspec_is_literal(self):
+		sandbox = self.make_sandbox()
+		sandbox.commit_file(APP, "custom_app/f*.py", "star = 1\n")
+		sandbox.commit_file(APP, "custom_app/fa.py", "fa = 1\n")
+		sandbox.write_unstaged(APP, "custom_app/fa.py", "fa = 2\n")
+		self.assertIsNone(self.read(self.full(sandbox, "custom_app/f*.py")).refusal)
+		sandbox.write_unstaged(APP, ":odd.py", "odd = 1\n")
+		self.assertEqual(self.read(self.full(sandbox, ":odd.py")), refused(EXPECTED_GIT_DIRTY))
+		self.assertEqual(
+			self.read(self.full(sandbox, ":odd.log"), new_file=True), refused(EXPECTED_GIT_IGNORED)
+		)
+		self.assertIsNone(self.read(self.full(sandbox, ":odd_new.py"), new_file=True).refusal)
+
+	def test_read_git_state_check_order_with_two_refusals(self):
+		def nested_and_untracked(sandbox):
+			outer = sandbox.repo(APP)
+			sandbox.write_unstaged(APP, "inner_app/inner_app/x.py", "x = 1\n")
+			return os.path.join(outer, "inner_app", "inner_app", "x.py"), False, outer
+
+		def no_commit_and_locked(sandbox):
+			os.makedirs(sandbox.repo("fresh_app"))
+			sandbox.git("fresh_app", "init", "--quiet", "--initial-branch=main")
+			sandbox.hold_index_lock("fresh_app")
+			return self.full(sandbox, "fresh_app/x.py", "fresh_app"), True, None
+
+		def detached_and_locked(sandbox):
+			sandbox.detach(APP)
+			sandbox.hold_index_lock(APP)
+			return self.full(sandbox), False, None
+
+		def detached_and_merging(sandbox):
+			sandbox.detach(APP)
+			sandbox.mark_in_progress(APP, "MERGE_HEAD")
+			return self.full(sandbox), False, None
+
+		def locked_and_merging(sandbox):
+			sandbox.mark_in_progress(APP, "MERGE_HEAD")
+			sandbox.hold_index_lock(APP)
+			return self.full(sandbox), False, None
+
+		def locked_and_staged(sandbox):
+			sandbox.stage(APP, TARGET, "x = 2\n")
+			sandbox.hold_index_lock(APP)
+			return self.full(sandbox), False, None
+
+		def rebasing_and_ignored(sandbox):
+			sandbox.mark_in_progress(APP, "rebase-merge")
+			return self.full(sandbox, "custom_app/debug.log"), True, None
+
+		def reverting_and_staged(sandbox):
+			sandbox.stage(APP, TARGET, "x = 2\n")
+			sandbox.mark_in_progress(APP, "REVERT_HEAD")
+			return self.full(sandbox), False, None
+
+		cases = (
+			("not repo before dirty", nested_and_untracked, EXPECTED_GIT_NOT_REPO),
+			("no commit before index.lock", no_commit_and_locked, EXPECTED_GIT_NO_COMMIT),
+			("detached before index.lock", detached_and_locked, EXPECTED_GIT_DETACHED),
+			("detached before in progress", detached_and_merging, EXPECTED_GIT_DETACHED),
+			("index.lock before in progress", locked_and_merging, EXPECTED_GIT_LOCKED),
+			("index.lock before dirty", locked_and_staged, EXPECTED_GIT_LOCKED),
+			("in progress before ignored", rebasing_and_ignored, EXPECTED_GIT_IN_PROGRESS),
+			("in progress before dirty", reverting_and_staged, EXPECTED_GIT_IN_PROGRESS),
+		)
+		for name, make, expected in cases:
+			with self.subTest(name):
+				sandbox = self.make_sandbox()
+				full_path, new_file, root = make(sandbox)
+				self.assertEqual(self.read(full_path, new_file=new_file, root=root), refused(expected))
+
+	def test_read_git_state_missing_app_dir_is_not_a_repo(self):
+		sandbox = self.make_sandbox()
+		with patch(READ_GIT_PATH) as run:
+			state = self.read(os.path.join(sandbox.root, "ghost_app", "x.py"), new_file=True)
+		self.assertEqual(state, refused(EXPECTED_GIT_NOT_REPO))
+		run.assert_not_called()
+
+	def test_read_git_state_runs_only_read_subcommands_in_order_with_limit(self):
+		sandbox = self.make_sandbox()
+		repo = sandbox.repo(APP)
+		with patch(READ_GIT_PATH, wraps=source.run_git_read) as run:
+			state = self.read(self.full(sandbox), limit_s=7)
+		self.assertIsNone(state.refusal)
+		self.assertEqual(
+			[(call.args, call.kwargs) for call in run.call_args_list],
+			[
+				((repo, "rev-parse", "--show-toplevel", "--git-common-dir"), {"limit_s": 7}),
+				((repo, "rev-parse", "--verify", "-q", "HEAD"), {"limit_s": 7}),
+				((repo, "rev-parse", "--abbrev-ref", "HEAD"), {"limit_s": 7}),
+				(
+					(
+						repo,
+						"rev-parse",
+						"--git-path",
+						"index.lock",
+						"--git-path",
+						"MERGE_HEAD",
+						"--git-path",
+						"CHERRY_PICK_HEAD",
+						"--git-path",
+						"REVERT_HEAD",
+						"--git-path",
+						"rebase-merge",
+						"--git-path",
+						"rebase-apply",
+					),
+					{"limit_s": 7},
+				),
+				((repo, "check-ignore", "-q", "--", f"./{TARGET}"), {"limit_s": 7}),
+				(
+					(
+						repo,
+						"status",
+						"--porcelain=v1",
+						"-z",
+						"--untracked-files=all",
+						"--",
+						f":(literal){TARGET}",
+					),
+					{"limit_s": 7},
+				),
+			],
+		)
+		for call in run.call_args_list:
+			self.assertIn(call.args[1], source.GIT_READ_SUBCOMMANDS)
+
+	def good_runs(self, repo):
+		git_paths = b"".join(
+			f".git/{name}\n".encode()
+			for name in (
+				"index.lock",
+				"MERGE_HEAD",
+				"CHERRY_PICK_HEAD",
+				"REVERT_HEAD",
+				"rebase-merge",
+				"rebase-apply",
+			)
+		)
+		return [
+			source.GitRun(exit_code=0, stdout=f"{repo}\n{repo}/.git\n".encode(), timed_out=False),
+			source.GitRun(exit_code=0, stdout=f"{FAKE_HEAD}\n".encode(), timed_out=False),
+			source.GitRun(exit_code=0, stdout=b"main\n", timed_out=False),
+			source.GitRun(exit_code=0, stdout=git_paths, timed_out=False),
+			source.GitRun(exit_code=1, stdout=b"", timed_out=False),
+			source.GitRun(exit_code=0, stdout=b"", timed_out=False),
+		]
+
+	def test_read_git_state_git_failures_unparsable_output_and_timeouts(self):
+		sandbox = self.make_sandbox()
+		repo = sandbox.repo(APP)
+		with patch(READ_GIT_PATH, side_effect=self.good_runs(repo)):
+			self.assertEqual(
+				self.read(self.full(sandbox)),
+				source.GitState(
+					refusal=None, repo_root=repo, rel_in_repo=TARGET, branch="main", head=FAKE_HEAD
+				),
+			)
+
+		def run(exit_code, stdout=b"", timed_out=False):
+			return source.GitRun(exit_code=exit_code, stdout=stdout, timed_out=timed_out)
+
+		top_other = f"{sandbox.root}\n{repo}/.git\n".encode()
+		cases = (
+			(0, run(None, timed_out=True), EXPECTED_GIT_ERROR),
+			(0, run(-9, timed_out=True), EXPECTED_GIT_ERROR),
+			(0, run(None), EXPECTED_GIT_ERROR),
+			(0, run(0, f"{repo}\n".encode()), EXPECTED_GIT_ERROR),
+			(0, run(0, b""), EXPECTED_GIT_ERROR),
+			(0, run(0, f"{repo}\n\n".encode()), EXPECTED_GIT_ERROR),
+			(0, run(128), EXPECTED_GIT_NOT_REPO),
+			(0, run(0, top_other), EXPECTED_GIT_NOT_REPO),
+			(1, run(None, timed_out=True), EXPECTED_GIT_ERROR),
+			(1, run(None), EXPECTED_GIT_ERROR),
+			(1, run(1), EXPECTED_GIT_NO_COMMIT),
+			(1, run(128), EXPECTED_GIT_ERROR),
+			(1, run(0, b"not-a-sha\n"), EXPECTED_GIT_ERROR),
+			(1, run(0, b""), EXPECTED_GIT_ERROR),
+			(2, run(None, timed_out=True), EXPECTED_GIT_ERROR),
+			(2, run(None), EXPECTED_GIT_ERROR),
+			(2, run(128), EXPECTED_GIT_ERROR),
+			(2, run(0, b"HEAD\n"), EXPECTED_GIT_DETACHED),
+			(2, run(0, b"\n"), EXPECTED_GIT_ERROR),
+			(3, run(None, timed_out=True), EXPECTED_GIT_ERROR),
+			(3, run(None), EXPECTED_GIT_ERROR),
+			(3, run(128), EXPECTED_GIT_ERROR),
+			(3, run(0, b".git/index.lock\n.git/MERGE_HEAD\n"), EXPECTED_GIT_ERROR),
+			(3, run(0, b"\n\n\n\n\n\n"), EXPECTED_GIT_ERROR),
+			(4, run(None, timed_out=True), EXPECTED_GIT_ERROR),
+			(4, run(None), EXPECTED_GIT_ERROR),
+			(4, run(128), EXPECTED_GIT_ERROR),
+			(4, run(0), EXPECTED_GIT_IGNORED),
+			(5, run(None, timed_out=True), EXPECTED_GIT_ERROR),
+			(5, run(None), EXPECTED_GIT_ERROR),
+			(5, run(128), EXPECTED_GIT_ERROR),
+			(5, run(0, b" M custom_app/hooks.py\0"), EXPECTED_GIT_DIRTY),
+		)
+		for step, bad, expected in cases:
+			with self.subTest(step=step, bad=bad):
+				runs = [*self.good_runs(repo)[:step], bad]
+				with patch(READ_GIT_PATH, side_effect=runs) as fake:
+					self.assertEqual(self.read(self.full(sandbox)), refused(expected))
+				self.assertEqual(fake.call_count, step + 1)
+
+	def test_read_git_state_ignored_wins_over_dirty(self):
+		sandbox = self.make_sandbox()
+		repo = sandbox.repo(APP)
+		runs = self.good_runs(repo)
+		runs[4] = source.GitRun(exit_code=0, stdout=b"", timed_out=False)
+		runs[5] = source.GitRun(exit_code=0, stdout=b"?? custom_app/hooks.py\0", timed_out=False)
+		with patch(READ_GIT_PATH, side_effect=runs) as fake:
+			self.assertEqual(self.read(self.full(sandbox)), refused(EXPECTED_GIT_IGNORED))
+		self.assertEqual(fake.call_count, 5)
+
+	def test_read_git_state_rejects_bad_input_before_git(self):
+		sandbox = self.make_sandbox()
+		repo = sandbox.repo(APP)
+		os.symlink(os.path.join(repo, "custom_app"), os.path.join(repo, "link"))
+		bad_paths = (
+			None,
+			3,
+			b"/x.py",
+			"",
+			"custom_app/custom_app/hooks.py",
+			f"{repo}/x\0.py",
+			os.path.join(sandbox.base, "outside.py"),
+			sandbox.root,
+			repo,
+			os.path.join(repo, "custom_app", "..", "custom_app", "hooks.py"),
+			os.path.join(repo, "link", "hooks.py"),
+		)
+		with patch(READ_GIT_PATH) as run:
+			for full_path in bad_paths:
+				with self.subTest(full_path=full_path):
+					with self.assertRaisesRegex(ValueError, "full_path"):
+						source.read_git_state(full_path, new_file=False)
+			for new_file in (None, 1, "yes"):
+				with self.subTest(new_file=new_file):
+					with self.assertRaisesRegex(ValueError, "new_file"):
+						source.read_git_state(self.full(sandbox), new_file=new_file)
+			for limit_s in (0, 31, True, 1.5, "5"):
+				with self.subTest(limit_s=limit_s):
+					with self.assertRaisesRegex(ValueError, "limit_s"):
+						source.read_git_state(self.full(sandbox), new_file=False, limit_s=limit_s)
+		run.assert_not_called()
+
+	def test_git_state_defaults_and_frozen(self):
+		state = source.GitState(
+			refusal=None, repo_root="/r", rel_in_repo="a.py", branch="main", head=FAKE_HEAD
+		)
+		self.assertEqual((state.upstream_ref, state.ahead_count), ("", 0))
+		with self.assertRaises(AttributeError):
+			state.branch = "other"

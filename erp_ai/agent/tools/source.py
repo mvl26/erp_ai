@@ -72,6 +72,25 @@ GIT_DEFAULT_PATH = "/usr/bin:/bin"
 KILLED_EXIT_CODES = (-9, 124, 137)
 # ADR-022 QĐ 2: the diff option that makes diff-tree/rev-list write a file; git accepts unambiguous abbreviations.
 GIT_WRITE_OPTION = "--output"
+# Design table 3.2: the git refusal sentences of read_git_state are a contract with the tests.
+GIT_NOT_REPO = "thư mục app không phải gốc một kho git"
+GIT_NO_COMMIT = "kho git của app chưa có commit nào"
+GIT_DETACHED = "HEAD của kho git không nằm trên nhánh nào (detached)"
+GIT_LOCKED = "kho git đang bị khóa (index.lock): có thao tác git khác đang chạy hoặc bị dừng giữa chừng"
+GIT_IN_PROGRESS = "kho git đang dở merge, rebase, cherry-pick hoặc revert"
+GIT_IGNORED = "file đích bị git bỏ qua (.gitignore)"
+GIT_DIRTY = "file đích có thay đổi chưa commit"
+GIT_ERROR = "không đọc được trạng thái git"
+# index.lock first (GIT_LOCKED), then the files git leaves while an operation is in progress (GIT_IN_PROGRESS).
+GIT_STATE_FILES = (
+	"index.lock",
+	"MERGE_HEAD",
+	"CHERRY_PICK_HEAD",
+	"REVERT_HEAD",
+	"rebase-merge",
+	"rebase-apply",
+)
+GIT_OBJECT_NAME = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
 
 
 def get_source_root():
@@ -392,6 +411,139 @@ def run_git_read(repo_root: str, subcommand: str, *args: str, limit_s: int = GIT
 		return GitRun(exit_code=None, stdout=b"", timed_out=False)
 	timed_out = done.returncode in KILLED_EXIT_CODES and time.monotonic() - started >= limit_s
 	return GitRun(exit_code=done.returncode, stdout=done.stdout or b"", timed_out=timed_out)
+
+
+@dataclass(frozen=True)
+class GitState:
+	refusal: str | None  # a sentence of design table 3.2; None = the target can be committed
+	repo_root: str | None  # real path of the repo root, which is the app directory (D-20)
+	rel_in_repo: str | None
+	branch: str | None
+	head: str | None
+	upstream_ref: str = ""
+	ahead_count: int = 0
+
+
+def _git_refused(reason: str) -> GitState:
+	return GitState(refusal=reason, repo_root=None, rel_in_repo=None, branch=None, head=None)
+
+
+def _git_finished(run: GitRun) -> GitRun | None:
+	"""The run when git exited on its own; None when it timed out or could not start (GIT_ERROR)."""
+	return None if run.timed_out or run.exit_code is None else run
+
+
+def _git_lines(run: GitRun) -> list[str]:
+	text = os.fsdecode(run.stdout)
+	return text[:-1].split("\n") if text.endswith("\n") else [text]
+
+
+def _check_git_state_call(full_path, new_file, limit_s) -> tuple[str, str]:
+	"""Return (app directory, path in the repo) of a canonical file path under the root, else ValueError."""
+	if not isinstance(new_file, bool):
+		raise ValueError(f"new_file must be a bool: {new_file!r}")
+	if not isinstance(limit_s, int) or isinstance(limit_s, bool) or not 1 <= limit_s <= GIT_TIMEOUT_S:
+		raise ValueError(f"limit_s must be an integer from 1 to {GIT_TIMEOUT_S}: {limit_s!r}")
+	root = os.path.realpath(get_source_root())
+	if (
+		not isinstance(full_path, str)
+		or "\0" in full_path
+		or not os.path.isabs(full_path)
+		or os.path.realpath(full_path) != full_path
+		or not _inside(root, full_path)
+	):
+		raise ValueError(f"full_path must be a real path under the source root: {full_path!r}")
+	app, _, rel_in_repo = os.path.relpath(full_path, root).partition(os.sep)
+	if not rel_in_repo:
+		raise ValueError(f"full_path must be a file inside an app directory: {full_path!r}")
+	return os.path.join(root, app), rel_in_repo
+
+
+def read_git_state(full_path: str, *, new_file: bool, limit_s: int = GIT_TIMEOUT_S) -> GitState:
+	"""Read whether the target file can get one `commit --only` in its app repo; stop at the first refusal.
+
+	Order (design 3.2): app dir is a repo root, a first commit, HEAD on a branch, no `index.lock`, no
+	merge/rebase/cherry-pick/revert in progress, target not ignored, target clean. Other dirty files do
+	not block. Every command is a read subcommand through `run_git_read`; a timeout, an unknown exit code
+	or unparsable output is GIT_ERROR. `new_file` is part of the contract: the same status check covers a
+	tracked file deleted from disk.
+	"""
+	repo_root, rel_in_repo = _check_git_state_call(full_path, new_file, limit_s)
+	if not os.path.isdir(repo_root):
+		return _git_refused(GIT_NOT_REPO)
+
+	top = _git_finished(
+		run_git_read(repo_root, "rev-parse", "--show-toplevel", "--git-common-dir", limit_s=limit_s)
+	)
+	if top is None:
+		return _git_refused(GIT_ERROR)
+	if top.exit_code != 0:
+		return _git_refused(GIT_NOT_REPO)
+	lines = _git_lines(top)
+	if len(lines) != 2 or not all(lines):
+		return _git_refused(GIT_ERROR)
+	if os.path.realpath(lines[0]) != repo_root:
+		return _git_refused(GIT_NOT_REPO)
+
+	verify = _git_finished(run_git_read(repo_root, "rev-parse", "--verify", "-q", "HEAD", limit_s=limit_s))
+	if verify is None or verify.exit_code not in (0, 1):
+		return _git_refused(GIT_ERROR)
+	if verify.exit_code == 1:
+		return _git_refused(GIT_NO_COMMIT)
+	head = _git_lines(verify)
+	if len(head) != 1 or not GIT_OBJECT_NAME.fullmatch(head[0]):
+		return _git_refused(GIT_ERROR)
+
+	abbrev = _git_finished(run_git_read(repo_root, "rev-parse", "--abbrev-ref", "HEAD", limit_s=limit_s))
+	if abbrev is None or abbrev.exit_code != 0:
+		return _git_refused(GIT_ERROR)
+	branch = _git_lines(abbrev)
+	if len(branch) != 1 or not branch[0]:
+		return _git_refused(GIT_ERROR)
+	if branch[0] == "HEAD":
+		return _git_refused(GIT_DETACHED)
+
+	git_path_args = [arg for name in GIT_STATE_FILES for arg in ("--git-path", name)]
+	paths = _git_finished(run_git_read(repo_root, "rev-parse", *git_path_args, limit_s=limit_s))
+	if paths is None or paths.exit_code != 0:
+		return _git_refused(GIT_ERROR)
+	state_files = _git_lines(paths)
+	if len(state_files) != len(GIT_STATE_FILES) or not all(state_files):
+		return _git_refused(GIT_ERROR)
+	existing = [os.path.exists(os.path.join(repo_root, path)) for path in state_files]
+	if existing[0]:
+		return _git_refused(GIT_LOCKED)
+	if any(existing[1:]):
+		return _git_refused(GIT_IN_PROGRESS)
+
+	# `./` keeps a leading `:` from being read as pathspec magic, which check-ignore refuses.
+	ignored = _git_finished(
+		run_git_read(repo_root, "check-ignore", "-q", "--", f"./{rel_in_repo}", limit_s=limit_s)
+	)
+	if ignored is None or ignored.exit_code not in (0, 1):
+		return _git_refused(GIT_ERROR)
+	if ignored.exit_code == 0:
+		return _git_refused(GIT_IGNORED)
+
+	status = _git_finished(
+		run_git_read(
+			repo_root,
+			"status",
+			"--porcelain=v1",
+			"-z",
+			"--untracked-files=all",
+			"--",
+			f":(literal){rel_in_repo}",
+			limit_s=limit_s,
+		)
+	)
+	if status is None or status.exit_code != 0:
+		return _git_refused(GIT_ERROR)
+	if status.stdout:
+		return _git_refused(GIT_DIRTY)
+	return GitState(
+		refusal=None, repo_root=repo_root, rel_in_repo=rel_in_repo, branch=branch[0], head=head[0]
+	)
 
 
 TOOLS: list[ToolSpec] = [

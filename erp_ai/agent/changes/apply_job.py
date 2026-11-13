@@ -1,26 +1,33 @@
 """The change job: applies an approved proposal (one file + one local commit, or one bench command) and
 undoes an applied code change. Runs in the `long` queue, one job at a time across the bench."""
 
+import hashlib
 import json
 import os
+import time
 
 import frappe
 from frappe.utils import get_fullname
+from frappe.utils.file_lock import LockTimeoutError
 from frappe.utils.synchronization import filelock
 
 from erp_ai.agent import change_text, policy
+from erp_ai.agent.authority import NEVER_AUTHORITY
 from erp_ai.agent.changes import file_writer, process_runner, transitions
 from erp_ai.agent.tools import change_guard, source
 from erp_ai.constants import (
 	CHANGE_KIND_CODE,
 	CHANGE_STATUS_APPLIED,
 	CHANGE_STATUS_APPLYING,
+	CHANGE_STATUS_APPROVED,
 	CHANGE_STATUS_FAILED,
 	CHANGE_STATUS_STALE,
 	CHANGE_STATUS_UNDOING,
 	CHANGE_STATUS_UNDONE,
 	COMMAND_TIMEOUT_S,
+	LOGGER_NAME,
 	PROPOSAL_DOCTYPE,
+	ROLE_INSTRUCTOR,
 	TITLE_CHANGE_FAILED,
 )
 
@@ -28,9 +35,15 @@ LOCK_NAME = "erp_ai_change"
 LOCK_TIMEOUT_S = 30
 ACTION_APPLY = "apply"
 ACTION_UNDO = "undo"
+OUTCOME_SKIPPED = "skipped"
 
-SWITCH_OFF = "công tắc sửa code đã tắt"
-DIGEST_CHANGED = "nội dung đề xuất đã đổi sau khi duyệt"
+# Design 4.3 steps 3 and 4.2 (exact wording of the design table).
+LOCK_BUSY = "đang có thay đổi khác chạy, không lấy được khóa"
+WRONG_RUNNER = "sai người chạy job"
+APPROVER_LOST_ROLE = "người duyệt không còn quyền"
+SWITCH_OFF = "công tắc đang tắt"
+DIGEST_CHANGED = "nội dung đề xuất đã bị sửa sau khi duyệt"
+STORED_HASH_MISMATCH = "nội dung lưu không khớp dấu"
 BRANCH_CHANGED = "nhánh đang checkout đã đổi từ lúc đề xuất"
 FILE_CHANGED = "file đã đổi từ lúc đề xuất"
 FILE_NOW_EXISTS = "file đã tồn tại từ lúc đề xuất"
@@ -42,7 +55,6 @@ COMMIT_UNEXPECTED = "commit vừa tạo không đúng một file của đề xu�
 COMMAND_FAILED = "lệnh thoát với mã {0}"
 COMMAND_TIMED_OUT = "lệnh chạy quá giờ và đã bị dừng"
 COMMAND_NOT_FOUND = "không tìm thấy lệnh bench"
-CRASHED = "job lỗi: {0}"
 # Git states that mean the repo moved since the proposal was made: the proposal is stale, not broken.
 GIT_MOVED_REASONS = (
 	source.GIT_NOT_REPO,
@@ -66,62 +78,148 @@ class _Stop(Exception):
 
 
 def run_change(proposal_name: str, action: str) -> None:
-	"""Job entry (queued by `queue.enqueue_change_job`): `action` is `apply` or `undo`."""
+	"""Job entry (queued by `queue.enqueue_change_job`): `action` is `apply` or `undo` (design 4.3, 4.4).
+
+	Ends with the proposal in a final state or untouched (a repeated job); writes one `erp_ai` log line.
+	"""
 	if action not in (ACTION_APPLY, ACTION_UNDO):
 		raise ValueError(f"Unknown action: {action!r}")
-	with filelock(LOCK_NAME, timeout=LOCK_TIMEOUT_S, is_global=True):
-		if action == ACTION_APPLY:
-			if not transitions.begin_apply(proposal_name):
-				return
-			expected = CHANGE_STATUS_APPLYING
-		else:
-			status = frappe.db.get_value(PROPOSAL_DOCTYPE, proposal_name, "change_status")
-			if status != CHANGE_STATUS_UNDOING:
-				return
-			expected = CHANGE_STATUS_UNDOING
-		# The running state is durable before any file or process is touched.
-		frappe.db.commit()
-		proposal = frappe.get_doc(PROPOSAL_DOCTYPE, proposal_name)
-		actor = proposal.decided_by if action == ACTION_APPLY else proposal.undo_by
-		try:
-			_run(proposal, action, actor)
-		except _Stop as stop:
-			transitions.finish(
-				proposal_name,
-				expected,
-				stop.status,
-				step="stale" if stop.status == CHANGE_STATUS_STALE else "fail",
-				actor=actor,
-				reason=stop.reason,
-				result=stop.result,
-			)
-		except Exception as exc:
-			frappe.db.rollback()
-			frappe.log_error(TITLE_CHANGE_FAILED, f"{proposal_name} {action}: {type(exc).__name__}")
-			transitions.finish(
-				proposal_name,
-				expected,
-				CHANGE_STATUS_FAILED,
-				step="fail",
-				actor=actor,
-				reason=CRASHED.format(type(exc).__name__),
-			)
-		frappe.db.commit()
+	started = time.monotonic()
+	deadline = started + COMMAND_TIMEOUT_S
+	outcome = _locked_run(proposal_name, action, deadline)
+	commit = "-"
+	if outcome != OUTCOME_SKIPPED:
+		commit_field = "apply_commit_sha" if action == ACTION_APPLY else "undo_commit_sha"
+		commit = frappe.db.get_value(PROPOSAL_DOCTYPE, proposal_name, commit_field) or "-"
+	frappe.logger(LOGGER_NAME).info(
+		"erp_ai change proposal=%s action=%s outcome=%s duration_ms=%d commit=%s",
+		proposal_name,
+		action,
+		outcome,
+		int((time.monotonic() - started) * 1000),
+		commit,
+	)
 
 
-def _run(proposal, action: str, actor: str) -> None:
+def _locked_run(proposal_name: str, action: str, deadline: float) -> str:
+	"""Steps 2 to 5 of design 4.3 (4.4 for undo); returns the final status, or `OUTCOME_SKIPPED`."""
+	waiting = CHANGE_STATUS_APPROVED if action == ACTION_APPLY else CHANGE_STATUS_UNDOING
+	row = frappe.db.get_value(
+		PROPOSAL_DOCTYPE, proposal_name, ["change_status", "decided_by", "undo_by"], as_dict=True
+	)
+	if row is None or row.change_status != waiting:
+		return OUTCOME_SKIPPED
+	actor = row.decided_by if action == ACTION_APPLY else row.undo_by
+	try:
+		with filelock(LOCK_NAME, timeout=LOCK_TIMEOUT_S, is_global=True):
+			return _run_in_lock(proposal_name, action, actor, deadline)
+	except LockTimeoutError:
+		if not transitions.finish(
+			proposal_name, waiting, CHANGE_STATUS_FAILED, step="fail", actor=actor, reason=LOCK_BUSY
+		):
+			return OUTCOME_SKIPPED
+		frappe.db.commit()
+		return CHANGE_STATUS_FAILED
+
+
+def _run_in_lock(proposal_name: str, action: str, actor: str, deadline: float) -> str:
+	if action == ACTION_APPLY:
+		if not transitions.begin_apply(proposal_name):
+			return OUTCOME_SKIPPED
+		expected = CHANGE_STATUS_APPLYING
+	else:
+		status = frappe.db.get_value(PROPOSAL_DOCTYPE, proposal_name, "change_status")
+		if status != CHANGE_STATUS_UNDOING:
+			return OUTCOME_SKIPPED
+		expected = CHANGE_STATUS_UNDOING
+	# The running state is durable before any check, file or process (ADR-013 decision 5).
+	frappe.db.commit()
+	proposal = frappe.get_doc(PROPOSAL_DOCTYPE, proposal_name)
+	outcome = CHANGE_STATUS_FAILED
+	try:
+		outcome = _run(proposal, action, actor, deadline)
+	except _Stop as stop:
+		transitions.finish(
+			proposal_name,
+			expected,
+			stop.status,
+			step="stale" if stop.status == CHANGE_STATUS_STALE else "fail",
+			actor=actor,
+			reason=stop.reason,
+			result=stop.result,
+		)
+		outcome = stop.status
+	except Exception as exc:
+		frappe.db.rollback()
+		frappe.log_error(
+			TITLE_CHANGE_FAILED, f"proposal={proposal_name} action={action} error={type(exc).__name__}"
+		)
+		transitions.finish(
+			proposal_name,
+			expected,
+			CHANGE_STATUS_FAILED,
+			step="fail",
+			actor=actor,
+			reason=type(exc).__name__,
+		)
+	frappe.db.commit()
+	return outcome
+
+
+def _run(proposal, action: str, actor: str, deadline: float) -> str:
 	if action == ACTION_UNDO:
 		_undo_code(proposal, actor)
-		return
+		return CHANGE_STATUS_UNDONE
+	settings = _recheck(proposal)
+	if proposal.change_kind == CHANGE_KIND_CODE:
+		_apply_code(proposal, actor, settings.allowed_apps)
+	else:
+		_apply_command(proposal, actor, deadline)
+	return CHANGE_STATUS_APPLIED
+
+
+def _has_authority(user) -> bool:
+	return bool(user) and user not in NEVER_AUTHORITY and ROLE_INSTRUCTOR in frappe.get_roles(user)
+
+
+def _recheck(proposal):
+	"""Design 4.3 step 4.2, in table order: the first failing row ends the job as `Lỗi` with its reason."""
+	if frappe.session.user != proposal.decided_by:
+		raise _Stop(CHANGE_STATUS_FAILED, WRONG_RUNNER)
+	if not _has_authority(proposal.decided_by):
+		raise _Stop(CHANGE_STATUS_FAILED, APPROVER_LOST_ROLE)
 	settings = policy.current_change_settings()
 	if not settings.enabled:
 		raise _Stop(CHANGE_STATUS_FAILED, SWITCH_OFF)
 	if transitions.content_digest(proposal) != proposal.approved_digest:
 		raise _Stop(CHANGE_STATUS_FAILED, DIGEST_CHANGED)
 	if proposal.change_kind == CHANGE_KIND_CODE:
-		_apply_code(proposal, actor, settings.allowed_apps)
+		guard = change_guard.check_write_path(
+			proposal.file_path, settings.allowed_apps, new_file=bool(proposal.is_new_file), read_git=False
+		)
+		refusal = guard.reason
 	else:
-		_apply_command(proposal, actor, settings.allowed_apps)
+		args = json.loads(proposal.command_args or "null")
+		refusal = change_guard.check_bench_args(args, settings.allowed_apps, frappe.local.site)
+	if refusal:
+		raise _Stop(CHANGE_STATUS_FAILED, refusal)
+	if proposal.change_kind == CHANGE_KIND_CODE:
+		content_after = (proposal.content_after or "").encode("utf-8")
+		if hashlib.sha256(content_after).hexdigest() != proposal.after_hash:
+			raise _Stop(CHANGE_STATUS_FAILED, STORED_HASH_MISMATCH)
+		# The real message with the approver put back as the placeholder is the stored preview (design 3.9);
+		# `apply_message` only places the approver in its own line, so building it with the placeholder is that.
+		preview = change_text.message_text(
+			*change_text.apply_message(
+				proposal.name,
+				str(proposal.ticket or ""),
+				proposal.file_path,
+				change_text.APPROVER_PLACEHOLDER,
+			)
+		)
+		if preview != proposal.commit_message:
+			raise _Stop(CHANGE_STATUS_FAILED, DIGEST_CHANGED)
+	return settings
 
 
 def _guard(proposal, allowed_apps, *, new_file: bool, stale_on_git: bool):
@@ -245,12 +343,9 @@ def _undo_code(proposal, actor: str) -> None:
 	)
 
 
-def _apply_command(proposal, actor: str, allowed_apps) -> None:
-	args = json.loads(proposal.command_args or "null")
-	refusal = change_guard.check_bench_args(args, allowed_apps, frappe.local.site)
-	if refusal:
-		raise _Stop(CHANGE_STATUS_FAILED, refusal)
-	result = process_runner.run_bench(args, COMMAND_TIMEOUT_S)
+def _apply_command(proposal, actor: str, deadline: float) -> None:
+	args = json.loads(proposal.command_args)
+	result = process_runner.run_bench(args, int(deadline - time.monotonic()))
 	if result.not_found:
 		raise _Stop(CHANGE_STATUS_FAILED, COMMAND_NOT_FOUND, result)
 	if result.timed_out:

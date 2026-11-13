@@ -5,7 +5,10 @@ from unittest.mock import patch
 
 import frappe
 from frappe.tests.utils import FrappeTestCase
+from frappe.utils.synchronization import filelock
+from helpdesk.test_utils import create_agent
 
+from erp_ai.agent import policy
 from erp_ai.agent.changes import apply_job, file_writer, process_runner, transitions
 from erp_ai.agent.changes.process_runner import CommandResult
 from erp_ai.constants import (
@@ -17,8 +20,10 @@ from erp_ai.constants import (
 	CHANGE_STATUS_FAILED,
 	CHANGE_STATUS_STALE,
 	CHANGE_STATUS_UNDONE,
+	COMMAND_TIMEOUT_S,
 	LOG_DOCTYPE,
 	PROPOSAL_DOCTYPE,
+	ROLE_INSTRUCTOR,
 )
 from erp_ai.test_utils import GitSandbox, make_change_proposal, set_agent_settings
 
@@ -28,7 +33,7 @@ FILE_PATH = f"{APP}/{REL}"
 NEW_REL = "pkg/new_mod.py"
 BEFORE = "x = 1\n# Tiếng Việt\n"
 AFTER = "x = 2\n# Tiếng Việt\n"
-ACTOR = "Administrator"
+ACTOR = "apply.instructor@example.com"
 
 
 def _sha(text: str) -> str:
@@ -45,6 +50,11 @@ class ApplyJobTestCase(FrappeTestCase):
 		log_error = patch.object(frappe, "log_error")
 		self.log_error = log_error.start()
 		self.addCleanup(log_error.stop)
+		# The job runs as the approver, who must still hold the instructor role (design 4.3 step 4.2).
+		self.addCleanup(frappe.set_user, "Administrator")
+		create_agent(ACTOR)
+		frappe.get_doc("User", ACTOR).add_roles(ROLE_INSTRUCTOR)
+		frappe.set_user(ACTOR)
 		self.sandbox = GitSandbox(self)
 		self.sandbox.commit_file(APP, REL, BEFORE)
 		set_agent_settings(code_change_enabled=1, code_change_apps=APP)
@@ -201,7 +211,7 @@ class TestApplyCode(ApplyJobTestCase):
 
 	def test_switch_off_or_app_removed_fails_without_writing(self):
 		for settings, reason in (
-			({"code_change_enabled": 0}, "công tắc sửa code đã tắt"),
+			({"code_change_enabled": 0}, "công tắc đang tắt"),
 			({"code_change_apps": "helpdesk"}, "app không có trong danh sách được sửa"),
 		):
 			set_agent_settings(code_change_enabled=1, code_change_apps=APP)
@@ -223,7 +233,7 @@ class TestApplyCode(ApplyJobTestCase):
 		state = self.state(name)
 		self.assertEqual(
 			(state.change_status, state.failure_reason),
-			(CHANGE_STATUS_FAILED, "nội dung đề xuất đã đổi sau khi duyệt"),
+			(CHANGE_STATUS_FAILED, "nội dung đề xuất đã bị sửa sau khi duyệt"),
 		)
 		self.assertEqual(self.read(), BEFORE)
 
@@ -253,15 +263,164 @@ class TestApplyCode(ApplyJobTestCase):
 		rollback.assert_called_once_with()
 
 		state = self.state(name)
-		self.assertEqual(
-			(state.change_status, state.failure_reason), (CHANGE_STATUS_FAILED, "job lỗi: RuntimeError")
-		)
+		self.assertEqual((state.change_status, state.failure_reason), (CHANGE_STATUS_FAILED, "RuntimeError"))
 		self.log_error.assert_called_once()
 		self.assertNotIn("bí mật", str(self.log_error.call_args))
 
 	def test_unknown_action_is_refused(self):
 		with self.assertRaises(ValueError):
 			apply_job.run_change("x", "delete")
+
+
+class TestRunChangeSkeleton(ApplyJobTestCase):
+	def assert_failed_without_writing(self, name, reason, count):
+		state = self.state(name)
+		self.assertEqual((state.change_status, state.failure_reason), (CHANGE_STATUS_FAILED, reason))
+		self.assertEqual(self.read(), BEFORE)
+		self.assertEqual(self.commit_count(), count)
+		self.assertEqual(self.worktree_changes(), "")
+		self.assertEqual(self.steps(name), ["approve", "fail"])
+
+	def test_rechecks_fail_without_writing(self):
+		def switch_off(name):
+			set_agent_settings(code_change_enabled=0)
+
+		def role_lost(name):
+			# A user cannot change their own roles: an administrator takes the role away.
+			frappe.set_user("Administrator")
+			frappe.get_doc("User", ACTOR).remove_roles(ROLE_INSTRUCTOR)
+			frappe.set_user(ACTOR)
+
+		def digest_edited(name):
+			frappe.db.set_value(PROPOSAL_DOCTYPE, name, "content_after", "import os\n", update_modified=False)
+
+		def app_removed(name):
+			set_agent_settings(code_change_apps="helpdesk")
+
+		def other_session_user(name):
+			frappe.set_user("Administrator")
+
+		# Design table 4.3 step 4.2, one case per row (the role row has two sides).
+		cases = (
+			("switch off", None, switch_off, "công tắc đang tắt"),
+			("role lost", None, role_lost, "người duyệt không còn quyền"),
+			("digest edited", None, digest_edited, "nội dung đề xuất đã bị sửa sau khi duyệt"),
+			("app removed", None, app_removed, "app không có trong danh sách được sửa"),
+			("wrong session user", None, other_session_user, "sai người chạy job"),
+			(
+				"commit_message edited",
+				{"commit_message": "erp_ai: thông điệp khác"},
+				None,
+				"nội dung đề xuất đã bị sửa sau khi duyệt",
+			),
+			("after_hash mismatch", {"after_hash": _sha("y = 3\n")}, None, "nội dung lưu không khớp dấu"),
+		)
+		start = self.head()
+		for label, edit_before_approval, change_after_approval, reason in cases:
+			with self.subTest(label):
+				# Each case starts from the same repo, whatever an earlier case did.
+				self.sandbox.git(APP, "reset", "--hard", "--quiet", start)
+				frappe.set_user("Administrator")
+				frappe.get_doc("User", ACTOR).add_roles(ROLE_INSTRUCTOR)
+				frappe.set_user(ACTOR)
+				set_agent_settings(code_change_enabled=1, code_change_apps=APP)
+				name = self.code_proposal()
+				if edit_before_approval:
+					# Edited before approval, so the approved digest covers it and only this row can catch it.
+					frappe.db.set_value(PROPOSAL_DOCTYPE, name, edit_before_approval, update_modified=False)
+				self.approved(name)
+				if change_after_approval:
+					change_after_approval(name)
+				count = self.commit_count()
+
+				apply_job.run_change(name, "apply")
+
+				self.assert_failed_without_writing(name, reason, count)
+
+	def test_approver_who_never_carries_authority_fails(self):
+		frappe.set_user("Administrator")
+		name = self.code_proposal()
+		transitions.approve(name, "Administrator")
+		count = self.commit_count()
+
+		apply_job.run_change(name, "apply")
+
+		self.assert_failed_without_writing(name, "người duyệt không còn quyền", count)
+
+	def test_lock_timeout_fails_without_writing(self):
+		name = self.approved(self.code_proposal())
+		count = self.commit_count()
+
+		with patch.object(apply_job, "LOCK_TIMEOUT_S", 0.2), filelock(apply_job.LOCK_NAME, is_global=True):
+			apply_job.run_change(name, "apply")
+
+		self.assert_failed_without_writing(name, "đang có thay đổi khác chạy, không lấy được khóa", count)
+
+	def test_repeat_job_does_nothing_when_not_approved(self):
+		pending = self.code_proposal()
+		applied = self.approved(self.code_proposal())
+		apply_job.run_change(applied, "apply")
+		count = self.commit_count()
+
+		for name, steps in ((pending, []), (applied, ["approve", "apply"])):
+			with self.subTest(steps=steps), patch.object(apply_job, "filelock") as lock:
+				status = self.state(name).change_status
+
+				apply_job.run_change(name, "apply")
+
+				lock.assert_not_called()
+				self.assertEqual(self.state(name).change_status, status)
+				self.assertEqual(self.steps(name), steps)
+				self.assertEqual(self.commit_count(), count)
+
+	def test_applying_state_committed_before_rechecks_run(self):
+		name = self.approved(self.code_proposal())
+		seen = []
+		real_settings = policy.current_change_settings
+
+		def settings():
+			seen.append(
+				(frappe.db.commit.call_count, frappe.db.get_value(PROPOSAL_DOCTYPE, name, "change_status"))
+			)
+			return real_settings()
+
+		with patch.object(policy, "current_change_settings", side_effect=settings):
+			apply_job.run_change(name, "apply")
+
+		self.assertEqual(seen, [(1, "Đang áp dụng")])
+		self.assertEqual(self.state(name).change_status, CHANGE_STATUS_APPLIED)
+
+	def info_lines(self, logger):
+		return [
+			call.args
+			for call in logger.return_value.info.call_args_list
+			if call.args and call.args[0].startswith("erp_ai change ")
+		]
+
+	def test_one_log_line_with_the_commit_and_no_content(self):
+		name = self.approved(self.code_proposal())
+		with patch.object(frappe, "logger") as logger:
+			apply_job.run_change(name, "apply")
+
+		lines = self.info_lines(logger)
+		self.assertEqual(len(lines), 1)
+		template, *values = lines[0]
+		self.assertEqual(template, "erp_ai change proposal=%s action=%s outcome=%s duration_ms=%d commit=%s")
+		self.assertEqual(values[:3], [name, "apply", CHANGE_STATUS_APPLIED])
+		self.assertIsInstance(values[3], int)
+		self.assertEqual(values[4], self.head())
+		logger.assert_any_call("erp_ai")
+		self.assertNotIn("x = 2", str(logger.mock_calls))
+
+	def test_log_line_without_commit_shows_a_dash(self):
+		name = self.approved(self.code_proposal())
+		set_agent_settings(code_change_enabled=0)
+		with patch.object(frappe, "logger") as logger:
+			apply_job.run_change(name, "apply")
+
+		lines = self.info_lines(logger)
+		self.assertEqual(len(lines), 1)
+		self.assertEqual((lines[0][3], lines[0][5]), (CHANGE_STATUS_FAILED, "-"))
 
 
 class TestNewFileAndUndo(ApplyJobTestCase):
@@ -411,6 +570,18 @@ class TestApplyCommand(ApplyJobTestCase):
 
 		run_bench.assert_not_called()
 		self.assertEqual(self.state(name).change_status, CHANGE_STATUS_FAILED)
+
+	def test_command_limit_comes_from_the_job_deadline(self):
+		name = self.command_proposal(["version"])
+		clock = iter([1000.0])
+		with (
+			patch("time.monotonic", side_effect=lambda: next(clock, 1100.0)),
+			patch.object(process_runner, "run_bench", return_value=self.result()) as run_bench,
+		):
+			apply_job.run_change(name, "apply")
+
+		(_, limit), _ = run_bench.call_args
+		self.assertEqual(limit, COMMAND_TIMEOUT_S - 100)
 
 	def test_state_is_committed_before_the_command_runs(self):
 		name = self.command_proposal(["version"])

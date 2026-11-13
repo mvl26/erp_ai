@@ -1,4 +1,6 @@
 import os
+import shutil
+import tempfile
 from datetime import datetime, timedelta
 from unittest.mock import patch
 
@@ -259,9 +261,9 @@ class TestPolicy(FrappeTestCase):
 		settings = frappe._dict(code_change_enabled=1, code_change_apps="erp_ai\n../x\n\nmyapp\nerp_ai\n../x")
 		self.assertEqual(policy.change_settings(settings).allowed_apps, ("erp_ai", "../x", "myapp"))
 
-	def _assert_refused(self, apps, message):
+	def _assert_refused(self, apps, message, root):
 		with self.assertRaises(frappe.ValidationError) as caught:
-			policy.validate_change_apps(frappe._dict(code_change_apps=apps))
+			policy.validate_change_apps(frappe._dict(code_change_apps=apps), root)
 		self.assertEqual(str(caught.exception), message)
 
 	def test_validate_change_apps_rejects_erp_ai_dotdot_missing_dir(self):
@@ -281,10 +283,10 @@ class TestPolicy(FrappeTestCase):
 		)
 		for apps, message in cases:
 			with self.subTest(apps=apps):
-				self._assert_refused(apps, message)
+				self._assert_refused(apps, message, apps_root.root)
 
 	def test_validate_change_apps_order_of_reasons(self):
-		TempAppsRoot(self, apps=("myapp", "erp_ai"))
+		apps_root = TempAppsRoot(self, apps=("myapp", "erp_ai"))
 		cases = (
 			# lines are checked in order for the name rules ...
 			("erp_ai\n../x", "Không được thêm erp_ai vào danh sách app được sửa"),
@@ -296,30 +298,45 @@ class TestPolicy(FrappeTestCase):
 		)
 		for apps, message in cases:
 			with self.subTest(apps=apps):
-				self._assert_refused(apps, message)
+				self._assert_refused(apps, message, apps_root.root)
 
 	def test_validate_change_apps_never_looks_up_a_bad_name(self):
-		TempAppsRoot(self, apps=("myapp",))
+		apps_root = TempAppsRoot(self, apps=("myapp",))
 		with patch("os.path.isdir", wraps=os.path.isdir) as isdir:
-			self._assert_refused("myapp\n../x", "Tên app '../x' không hợp lệ")
+			self._assert_refused("myapp\n../x", "Tên app '../x' không hợp lệ", apps_root.root)
 		isdir.assert_not_called()
 
 	def test_validate_change_apps_accepts_blank_and_listed_dirs(self):
-		TempAppsRoot(self, apps=("myapp",))
+		apps_root = TempAppsRoot(self, apps=("myapp",))
 		for apps in (None, "", "\n  \n", "myapp", "  myapp \n\nmyapp\n"):
 			with self.subTest(apps=apps):
-				self.assertIsNone(policy.validate_change_apps(frappe._dict(code_change_apps=apps)))
-		self.assertIsNone(policy.validate_change_apps(frappe._dict()))
+				self.assertIsNone(
+					policy.validate_change_apps(frappe._dict(code_change_apps=apps), apps_root.root)
+				)
+		self.assertIsNone(policy.validate_change_apps(frappe._dict(), apps_root.root))
 
 	def test_validate_change_apps_accepts_core_apps(self):
 		self.assertEqual(CORE_APPS, ("frappe", "erpnext", "helpdesk", "hrms"))
-		TempAppsRoot(self, apps=CORE_APPS)
+		apps_root = TempAppsRoot(self, apps=CORE_APPS)
 		settings = frappe._dict(code_change_apps="frappe\nerpnext\nhelpdesk\nhrms\nfrappe")
-		self.assertIsNone(policy.validate_change_apps(settings))
+		self.assertIsNone(policy.validate_change_apps(settings, apps_root.root))
 		self.assertEqual(
 			policy.change_settings(settings).allowed_apps, ("frappe", "erpnext", "helpdesk", "hrms")
 		)
 
 	def test_validate_change_apps_core_app_still_needs_its_dir(self):
-		TempAppsRoot(self, apps=("frappe", "erpnext", "helpdesk"))
-		self._assert_refused("frappe\nhrms", "Không có thư mục apps/hrms")
+		apps_root = TempAppsRoot(self, apps=("frappe", "erpnext", "helpdesk"))
+		self._assert_refused("frappe\nhrms", "Không có thư mục apps/hrms", apps_root.root)
+
+	def test_validate_change_apps_uses_given_root(self):
+		given = tempfile.mkdtemp()
+		self.addCleanup(shutil.rmtree, given, True)
+		other = tempfile.mkdtemp()
+		self.addCleanup(shutil.rmtree, other, True)
+		os.makedirs(os.path.join(given, "onlygiven"))
+		os.makedirs(os.path.join(other, "onlyother"))
+		settings = frappe._dict(code_change_apps="onlygiven")
+		self.assertIsNone(policy.validate_change_apps(settings, given))
+		self._assert_refused("onlygiven", "Không có thư mục apps/onlygiven", other)
+		self._assert_refused("onlyother", "Không có thư mục apps/onlyother", given)
+		self.assertIsNone(policy.validate_change_apps(frappe._dict(code_change_apps="onlyother"), other))

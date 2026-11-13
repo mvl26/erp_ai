@@ -6,7 +6,6 @@ import frappe
 from frappe import _
 from frappe.utils import get_datetime, now_datetime
 
-from erp_ai.agent.tools import source
 from erp_ai.constants import LEVELS, LOG_DOCTYPE, SETTING_DOCTYPE
 
 OPT_OUT_FIELD = "ai_opt_out"
@@ -131,14 +130,13 @@ def current_change_settings() -> ChangeSettings:
 	)
 
 
-def validate_change_apps(settings) -> None:
-	"""Raise frappe.ValidationError for a bad name or erp_ai (every line), then for a missing apps/<x> directory."""
+def validate_change_apps(settings, apps_root: str) -> None:
+	"""Raise frappe.ValidationError for a bad name or erp_ai (every line), then for a missing `apps_root`/<x> directory."""
 	apps = _change_app_lines(getattr(settings, CODE_CHANGE_APPS_FIELD, None))
 	for name in apps:
 		error = _app_name_error(name)
 		if error:
 			frappe.throw(error)
-	root = source.get_source_root()
 	for name in apps:
-		if not os.path.isdir(os.path.join(root, name)):
+		if not os.path.isdir(os.path.join(apps_root, name)):
 			frappe.throw(_("Không có thư mục apps/{0}").format(name))

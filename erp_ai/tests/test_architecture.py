@@ -120,7 +120,14 @@ SQL_READ_ONLY = re.compile(r"^\s*(select|show|describe)\b", re.IGNORECASE)
 ALLOWED_TOP_LEVEL_MODULES = frozenset({PACKAGE, "frappe", "helpdesk", *sys.stdlib_module_names})
 ANTHROPIC_MODULE = "anthropic"
 
-POLICY_FIELDS = ("permission_level", "excluded_teams", "ai_opt_out", "auto_assign_enabled")
+POLICY_FIELDS = (
+	"permission_level",
+	"excluded_teams",
+	"ai_opt_out",
+	"auto_assign_enabled",
+	"code_change_enabled",
+	"code_change_apps",
+)
 
 SECRET_READERS = ("get_decrypted_password", "get_password")
 SECRET_NAMES = ("api_key", "apikey", "secret", "password", "token")
@@ -2528,6 +2535,8 @@ class TestScannersCatchViolations(unittest.TestCase):
 			"import frappe\nfrappe.db.get_single_value('ERP AI Setting', 'excluded_teams')\n",
 			"def f(ticket):\n\treturn ticket.ai_opt_out\n",
 			"def f(ticket):\n\treturn ticket.get('ai_opt_out')\n",
+			"def f(settings):\n\treturn settings.code_change_enabled\n",
+			"import frappe\nfrappe.db.get_single_value('ERP AI Setting', 'code_change_apps')\n",
 		)
 		for source in cases:
 			with self.subTest(source=source):

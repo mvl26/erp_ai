@@ -1,3 +1,4 @@
+import os
 from datetime import datetime, timedelta
 from unittest.mock import patch
 
@@ -7,8 +8,8 @@ from frappe.utils import now_datetime
 from helpdesk.test_utils import make_ticket
 
 from erp_ai.agent import policy
-from erp_ai.constants import LOG_DOCTYPE, SETTING_DOCTYPE
-from erp_ai.test_utils import set_agent_settings
+from erp_ai.constants import CORE_APPS, LOG_DOCTYPE, SETTING_DOCTYPE
+from erp_ai.test_utils import TempAppsRoot, set_agent_settings
 
 TEAM = "Nhân sự & Hành chính"
 
@@ -201,3 +202,124 @@ class TestPolicy(FrappeTestCase):
 		self._log(ticket, "edge", "classify", created=midnight)
 		self._log(ticket, "before", "classify", created=midnight - timedelta(seconds=1))
 		self.assertEqual(policy.runs_today(ticket, now=midnight + timedelta(hours=12)), 1)
+
+	def test_runs_today_ignores_change_rows(self):
+		ticket = self._ticket()
+		self._log(ticket, "r1", "reason")
+		self._log(ticket, "c1", "change")
+		self._log(ticket, "c2", "change")
+		self.assertEqual(policy.runs_today(ticket), 1)
+		only_change = self._ticket()
+		self._log(only_change, "c3", "change")
+		self.assertEqual(policy.runs_today(only_change), 0)
+
+	# code change settings (FEAT-004) -----------------------------------------------------------
+
+	def test_change_settings_defaults_off_and_empty(self):
+		off = policy.ChangeSettings(enabled=False, allowed_apps=())
+		self.assertEqual(policy.change_settings(frappe._dict()), off)
+		self.assertEqual(policy.change_settings(object()), off)
+		for enabled, apps in ((0, None), (None, ""), (0, "\n  \n\t\n")):
+			with self.subTest(enabled=enabled, apps=apps):
+				settings = frappe._dict(code_change_enabled=enabled, code_change_apps=apps)
+				self.assertEqual(policy.change_settings(settings), off)
+		self.assertEqual(
+			policy.change_settings(frappe._dict(code_change_enabled=1, code_change_apps=None)),
+			policy.ChangeSettings(enabled=True, allowed_apps=()),
+		)
+		set_agent_settings(code_change_enabled=0, code_change_apps="")
+		self.assertEqual(policy.current_change_settings(), off)
+		self.assertEqual(policy.change_settings(frappe.get_doc(SETTING_DOCTYPE)), off)
+
+	def test_current_change_settings_reads_db_every_call(self):
+		set_agent_settings(code_change_enabled=0, code_change_apps="")
+		self.assertEqual(
+			policy.current_change_settings(), policy.ChangeSettings(enabled=False, allowed_apps=())
+		)
+		with patch.object(frappe.db, "get_single_value", wraps=frappe.db.get_single_value) as reads:
+			set_agent_settings(code_change_enabled=1, code_change_apps="myapp\nhrms")
+			self.assertEqual(
+				policy.current_change_settings(),
+				policy.ChangeSettings(enabled=True, allowed_apps=("myapp", "hrms")),
+			)
+		self.assertTrue(reads.call_args_list)
+		self.assertTrue(all(call.kwargs.get("cache") is False for call in reads.call_args_list))
+
+	def test_change_apps_parsing_and_dedup(self):
+		settings = frappe._dict(
+			code_change_enabled=1, code_change_apps="  myapp \n\nfrappe\r\nmyapp\n  \n\thrms\t\nfrappe"
+		)
+		self.assertEqual(
+			policy.change_settings(settings),
+			policy.ChangeSettings(enabled=True, allowed_apps=("myapp", "frappe", "hrms")),
+		)
+
+	def test_change_settings_drops_names_validate_would_refuse(self):
+		# A value written past validate (db.set_value) must never hand a path-like name to the tools.
+		settings = frappe._dict(code_change_enabled=1, code_change_apps="erp_ai\n../x\nmy app\na/b\nmyapp\n.")
+		self.assertEqual(policy.change_settings(settings).allowed_apps, ("myapp",))
+
+	def _assert_refused(self, apps, message):
+		with self.assertRaises(frappe.ValidationError) as caught:
+			policy.validate_change_apps(frappe._dict(code_change_apps=apps))
+		self.assertEqual(str(caught.exception), message)
+
+	def test_validate_change_apps_rejects_erp_ai_dotdot_missing_dir(self):
+		apps_root = TempAppsRoot(self, apps=("myapp", "erp_ai"))
+		apps_root.write("afile", "x = 1\n")
+		cases = (
+			("../x", "Tên app '../x' không hợp lệ"),
+			("a/b", "Tên app 'a/b' không hợp lệ"),
+			("x.y", "Tên app 'x.y' không hợp lệ"),
+			("my app", "Tên app 'my app' không hợp lệ"),
+			("..", "Tên app '..' không hợp lệ"),
+			("erp_ai", "Không được thêm erp_ai vào danh sách app được sửa"),
+			("  erp_ai  ", "Không được thêm erp_ai vào danh sách app được sửa"),
+			("nope", "Không có thư mục apps/nope"),
+			("afile", "Không có thư mục apps/afile"),
+			("frappe", "Không có thư mục apps/frappe"),
+		)
+		for apps, message in cases:
+			with self.subTest(apps=apps):
+				self._assert_refused(apps, message)
+
+	def test_validate_change_apps_order_of_reasons(self):
+		TempAppsRoot(self, apps=("myapp", "erp_ai"))
+		cases = (
+			# lines are checked in order for the name rules ...
+			("erp_ai\n../x", "Không được thêm erp_ai vào danh sách app được sửa"),
+			("../x\nerp_ai", "Tên app '../x' không hợp lệ"),
+			# ... and every name is checked before any directory is looked up
+			("nope\n../x", "Tên app '../x' không hợp lệ"),
+			("nope\nerp_ai", "Không được thêm erp_ai vào danh sách app được sửa"),
+			("myapp\nnope\nother", "Không có thư mục apps/nope"),
+		)
+		for apps, message in cases:
+			with self.subTest(apps=apps):
+				self._assert_refused(apps, message)
+
+	def test_validate_change_apps_never_looks_up_a_bad_name(self):
+		TempAppsRoot(self, apps=("myapp",))
+		with patch("os.path.isdir", wraps=os.path.isdir) as isdir:
+			self._assert_refused("myapp\n../x", "Tên app '../x' không hợp lệ")
+		isdir.assert_not_called()
+
+	def test_validate_change_apps_accepts_blank_and_listed_dirs(self):
+		TempAppsRoot(self, apps=("myapp",))
+		for apps in (None, "", "\n  \n", "myapp", "  myapp \n\nmyapp\n"):
+			with self.subTest(apps=apps):
+				self.assertIsNone(policy.validate_change_apps(frappe._dict(code_change_apps=apps)))
+		self.assertIsNone(policy.validate_change_apps(frappe._dict()))
+
+	def test_validate_change_apps_accepts_core_apps(self):
+		self.assertEqual(CORE_APPS, ("frappe", "erpnext", "helpdesk", "hrms"))
+		TempAppsRoot(self, apps=CORE_APPS)
+		settings = frappe._dict(code_change_apps="frappe\nerpnext\nhelpdesk\nhrms\nfrappe")
+		self.assertIsNone(policy.validate_change_apps(settings))
+		self.assertEqual(
+			policy.change_settings(settings).allowed_apps, ("frappe", "erpnext", "helpdesk", "hrms")
+		)
+
+	def test_validate_change_apps_core_app_still_needs_its_dir(self):
+		TempAppsRoot(self, apps=("frappe", "erpnext", "helpdesk"))
+		self._assert_refused("frappe\nhrms", "Không có thư mục apps/hrms")

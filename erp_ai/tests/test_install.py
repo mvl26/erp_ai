@@ -396,6 +396,28 @@ class TestInstall(FrappeTestCase):
 		self.assertNotIn("System Manager", _agent_roles())
 		self.assertFalse(frappe.db.get_value("User", AGENT_USER, "api_key"))
 
+	def _new_user(self, email, roles):
+		user = frappe.get_doc(
+			{"doctype": "User", "email": email, "first_name": "erp_ai T33", "send_welcome_email": 0}
+		)
+		for role in roles:
+			user.append("roles", {"role": role})
+		return user.insert(ignore_permissions=True)
+
+	def test_instructor_role_has_desk_access_and_makes_system_user(self):
+		# AC-5, D-11: the approver reaches Desk only through the role's desk_access (no extra code).
+		self.addCleanup(frappe.db.rollback)
+		install.ensure_setup()
+		self.assertEqual(frappe.db.get_value("Role", ROLE_INSTRUCTOR, "desk_access"), 1)
+		instructor = self._new_user("erp-ai-t33-instructor@example.com", [ROLE_INSTRUCTOR])
+		self.assertEqual([row.role for row in instructor.roles], [ROLE_INSTRUCTOR])
+		self.assertEqual(instructor.user_type, "System User")
+		no_desk_role = frappe.get_doc(
+			{"doctype": "Role", "role_name": "erp_ai T33 no desk", "desk_access": 0}
+		).insert(ignore_permissions=True)
+		outsider = self._new_user("erp-ai-t33-outsider@example.com", [no_desk_role.name])
+		self.assertEqual(outsider.user_type, "Website User")
+
 	def test_user_missing_agent_role_gets_it_back(self):
 		frappe.db.delete("Has Role", {"parent": AGENT_USER, "parenttype": "User", "role": ROLE_AGENT})
 		self.assertNotIn(ROLE_AGENT, _agent_roles())

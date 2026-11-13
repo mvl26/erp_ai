@@ -9,8 +9,11 @@ from helpdesk.test_utils import make_ticket
 from erp_ai.agent import answer_delay, authority, runner
 from erp_ai.agent.classification import DEFAULT_CATEGORY_MAPPING
 from erp_ai.agent.prompts import (
+	CHANGE_TOOLS_BLOCK,
+	SITE_ADMIN_TOOLS_BLOCK,
 	TASK_COMMENT,
 	TASK_NEW_TICKET,
+	UNRESTRICTED_TOOLS_BLOCK,
 	build_classify_request,
 	build_reason_system,
 	build_routing_table,
@@ -35,6 +38,7 @@ from erp_ai.test_utils import (
 	FakeGateway,
 	add_credential,
 	make_active_agent,
+	make_change_proposal,
 	make_model_result,
 	make_routing_rules,
 	record_status_signals,
@@ -1138,3 +1142,200 @@ class TestRunnerReasoning(RunnerTestBase):
 			[{"field": "agent_group", "reason": "giá trị không tồn tại trên hệ thống"}],
 		)
 		self.assertFalse(second.skipped_fields)
+
+
+SITE_ADMIN_TOOL_NAMES = ["api_list_records", "api_get_record", "api_create_record", "api_update_record"]
+
+
+class TestRunnerSiteAdminTools(RunnerTestBase):
+	"""The generic record tools reach the model only with the switch on, L3 and an instructor."""
+
+	def setUp(self):
+		super().setUp()
+		set_agent_settings(
+			permission_level="L3", code_change_enabled=1, unrestricted_enabled=0, monthly_budget_usd=1000
+		)
+
+	def _offered(self):
+		(call,) = self.gateway.calls
+		names = [tool["name"] for tool in call["tools"]]
+		return [name for name in names if name in SITE_ADMIN_TOOL_NAMES], call["system"][0]["text"]
+
+	def test_offered_with_switch_l3_and_instructor(self):
+		with patch.object(authority, "latest_instructor", return_value="Administrator"):
+			self._run("comment_mention")
+
+		names, system = self._offered()
+		self.assertEqual(names, SITE_ADMIN_TOOL_NAMES)
+		self.assertIn(SITE_ADMIN_TOOLS_BLOCK, system)
+
+	def test_not_offered_without_instructor(self):
+		with patch.object(authority, "latest_instructor", return_value=None):
+			self._run("comment_mention")
+
+		names, system = self._offered()
+		self.assertEqual(names, [])
+		self.assertNotIn(SITE_ADMIN_TOOLS_BLOCK, system)
+
+	def test_not_offered_with_switch_off_or_below_l3(self):
+		for settings in ({"code_change_enabled": 0}, {"permission_level": "L2"}):
+			set_agent_settings(permission_level="L3", code_change_enabled=1)
+			set_agent_settings(**settings)
+			self.gateway.calls.clear()
+			with patch.object(authority, "latest_instructor", return_value="Administrator"):
+				self._run("comment_mention")
+
+			names, system = self._offered()
+			self.assertEqual(names, [], settings)
+			self.assertNotIn(SITE_ADMIN_TOOLS_BLOCK, system)
+
+	def test_unrestricted_switch_offers_every_record_tool_once_with_its_own_block(self):
+		everything = [*SITE_ADMIN_TOOL_NAMES, "api_delete_record", "api_submit_record", "api_call_method"]
+		for settings in (
+			{"permission_level": "L1", "code_change_enabled": 0, "unrestricted_enabled": 1},
+			{"permission_level": "L3", "code_change_enabled": 1, "unrestricted_enabled": 1},
+		):
+			set_agent_settings(**settings)
+			self.gateway.calls.clear()
+			with patch.object(authority, "latest_instructor", return_value="Administrator"):
+				self._run("comment_mention")
+
+			(call,) = self.gateway.calls
+			names = [tool["name"] for tool in call["tools"]]
+			self.assertEqual(sorted(name for name in names if name.startswith("api_")), sorted(everything))
+			self.assertEqual(len(names), len(set(names)), settings)
+			system = call["system"][0]["text"]
+			self.assertIn(UNRESTRICTED_TOOLS_BLOCK, system)
+			self.assertNotIn(SITE_ADMIN_TOOLS_BLOCK, system)
+			self.assertEqual(call["tools"][-1]["cache_control"], {"type": "ephemeral"})
+
+	def test_unrestricted_switch_offers_nothing_without_instructor(self):
+		set_agent_settings(unrestricted_enabled=1)
+		with patch.object(authority, "latest_instructor", return_value=None):
+			self._run("comment_mention")
+
+		(call,) = self.gateway.calls
+		self.assertFalse([tool["name"] for tool in call["tools"] if tool["name"].startswith("api_")])
+		self.assertNotIn(UNRESTRICTED_TOOLS_BLOCK, call["system"][0]["text"])
+
+	def test_unrestricted_actions_are_logged(self):
+		set_agent_settings(unrestricted_enabled=1)
+		self.gateway.results = [
+			tool_turn(
+				tool_use("toolu_1", "api_delete_record", doctype="Note", name="n1"),
+				tool_use("toolu_2", "api_call_method", method="frappe.client.get_count", arguments={}),
+			),
+			make_model_result(),
+		]
+		results = {
+			"api_delete_record": {"ok": True, "doctype": "Note", "name": "n1"},
+			"api_call_method": {"ok": True, "method": "frappe.client.get_count", "result": 1},
+		}
+		with (
+			patch.object(authority, "latest_instructor", return_value="Administrator"),
+			patch.object(runner, "execute_tool", side_effect=lambda name, args, ctx: results[name]),
+		):
+			self._run("comment_mention")
+
+		(entry,) = [row for row in self._entries(entry_type="reason") if row.actions]
+		self.assertEqual(
+			json.loads(entry.actions),
+			[
+				{"tool": "api_delete_record", "doctype": "Note", "name": "n1", "ok": True},
+				{
+					"tool": "api_call_method",
+					"doctype": "Method",
+					"name": "frappe.client.get_count",
+					"ok": True,
+				},
+			],
+		)
+
+	def test_change_tools_are_offered_with_their_block_and_a_proposal_logs_propose(self):
+		proposal = make_change_proposal(ticket=self.ticket.name).name
+		self.gateway.results = [
+			tool_turn(
+				tool_use("toolu_1", "propose_new_file", path="custom_app/a.py", content="x", reason="r"),
+				tool_use("toolu_2", "propose_bench_command", command="migrate", reason="r"),
+			),
+			make_model_result(),
+		]
+		results = {
+			"propose_new_file": {"ok": True, "proposal": proposal, "status": "Chờ duyệt"},
+			"propose_bench_command": {"ok": False, "reason": "lệnh không có trong danh sách cho phép"},
+		}
+		with (
+			patch.object(authority, "latest_instructor", return_value="Administrator"),
+			patch.object(runner, "execute_tool", side_effect=lambda name, args, ctx: results[name]),
+		):
+			self._run("comment_mention")
+
+		call = self.gateway.calls[0]
+		names = [tool["name"] for tool in call["tools"]]
+		for name in ("propose_file_change", "propose_new_file", "propose_bench_command"):
+			self.assertIn(name, names)
+		self.assertIn(CHANGE_TOOLS_BLOCK, call["system"][0]["text"])
+		(entry,) = [row for row in self._entries(entry_type="reason") if row.actions]
+		self.assertEqual(
+			json.loads(entry.actions),
+			[
+				{
+					"tool": "propose_new_file",
+					"doctype": "ERP AI Change Proposal",
+					"name": proposal,
+					"ok": True,
+				},
+				{
+					"tool": "propose_bench_command",
+					"doctype": "ERP AI Change Proposal",
+					"name": None,
+					"ok": False,
+				},
+			],
+		)
+		steps = frappe.get_all(
+			LOG_DOCTYPE, filters={"change_proposal": proposal}, fields=["change_step", "actor"]
+		)
+		self.assertEqual([(row.change_step, row.actor) for row in steps], [("propose", AGENT_USER)])
+
+	def test_record_tool_runs_for_real_and_the_log_names_the_record(self):
+		title = f"{PREFIX}site api note"
+		self.gateway.results = [
+			tool_turn(
+				tool_use(
+					"toolu_1", "api_create_record", doctype="Note", values={"title": title, "public": 1}
+				),
+				tool_use("toolu_2", "api_create_record", doctype="ERP AI Setting", values={"enabled": 0}),
+			),
+			make_model_result(),
+		]
+		with patch.object(authority, "latest_instructor", return_value="Administrator"):
+			self._run("comment_mention")
+
+		note = frappe.db.get_value("Note", {"title": title}, "name")
+		self.assertTrue(note)
+		(entry,) = [row for row in self._entries(entry_type="reason") if row.actions]
+		self.assertEqual(
+			json.loads(entry.actions),
+			[
+				{"tool": "api_create_record", "doctype": "Note", "name": note, "ok": True},
+				{"tool": "api_create_record", "doctype": "ERP AI Setting", "name": None, "ok": False},
+			],
+		)
+
+	def test_crashed_record_tool_is_logged_with_the_requested_doctype(self):
+		self.gateway.results = [
+			tool_turn(tool_use("toolu_1", "api_update_record", doctype="Note", name="x", values={})),
+			make_model_result(),
+		]
+		with (
+			patch.object(authority, "latest_instructor", return_value="Administrator"),
+			patch.object(runner, "execute_tool", side_effect=RuntimeError("boom")),
+		):
+			self._run("comment_mention")
+
+		(entry,) = [row for row in self._entries(entry_type="reason") if row.actions]
+		self.assertEqual(
+			json.loads(entry.actions),
+			[{"tool": "api_update_record", "doctype": "Note", "name": None, "ok": False}],
+		)

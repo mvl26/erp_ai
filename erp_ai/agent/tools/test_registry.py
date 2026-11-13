@@ -282,10 +282,15 @@ class TestRegistry(FrappeTestCase):
 	def test_tool_context_appends_change_fields_after_routing_config(self):
 		fields = [(f.name, f.default) for f in dataclasses.fields(ToolContext)]
 		self.assertEqual(
-			fields[-3:],
-			[("routing_config", None), ("change_enabled", False), ("allowed_apps", ())],
+			fields[-4:],
+			[
+				("routing_config", None),
+				("change_enabled", False),
+				("allowed_apps", ()),
+				("unrestricted", False),
+			],
 		)
-		self.assertEqual(len(fields), 9)
+		self.assertEqual(len(fields), 10)
 
 	def test_grant_functions_take_change_enabled_without_default(self):
 		for function in (registry._granted_specs, get_tool_schemas, registry.grants_change_tools):
@@ -361,8 +366,12 @@ READ_TOOL_NAMES = ["get_ticket", "list_comments", "search_resolved_tickets", "ge
 SOURCE_TOOL_NAMES = ["search_source", "read_source", "git_source"]
 TICKET_WRITE_TOOL_NAMES = ["set_classification", "set_resolution_hint", "post_comment"]
 TASK_WRITE_TOOL_NAMES = ["create_task"]
+CREATED_NOTE = "<note made by api_create_record>"
+CHANGE_TOOL_NAMES = ["propose_file_change", "propose_new_file", "propose_bench_command"]
+APP_NOT_ALLOWED = "app không có trong danh sách được sửa"
+SITE_ADMIN_TOOL_NAMES = ["api_list_records", "api_get_record", "api_create_record", "api_update_record"]
 FORBIDDEN_WRITE_PARAMETER_WORDS = ("doctype", "field")
-SCHEMA_TYPES = {"string", "integer", "boolean", "array"}
+SCHEMA_TYPES = {"string", "integer", "boolean", "array", "object"}
 
 
 class TestRealToolSet(FrappeTestCase):
@@ -381,7 +390,20 @@ class TestRealToolSet(FrappeTestCase):
 		for level in ("L1", "L2", "L3"):
 			self.assertEqual(self.names(level, False), granted)
 			self.assertEqual(self.names(level, True), granted + TASK_WRITE_TOOL_NAMES)
-		self.assertEqual(len(registry._all_specs()), 11)
+		self.assertEqual(len(registry._all_specs()), 21)
+
+	def test_switch_on_adds_site_admin_tools_only_at_l3_with_instructor(self):
+		base = READ_TOOL_NAMES + SOURCE_TOOL_NAMES + TICKET_WRITE_TOOL_NAMES
+		with_task = base + TASK_WRITE_TOOL_NAMES
+		expected = {
+			("L1", True): with_task,
+			("L2", True): with_task,
+			("L3", False): base,
+			("L3", True): with_task + CHANGE_TOOL_NAMES + SITE_ADMIN_TOOL_NAMES,
+		}
+		for (level, has_instructor), names in expected.items():
+			schemas = get_tool_schemas(level, has_instructor, True)
+			self.assertEqual([s["name"] for s in schemas], names, (level, has_instructor))
 
 	def test_switch_off_tool_names_match_base_for_all_levels_and_authority(self):
 		# AC-1: switch off = the exact tool names of the FEAT-006 base, written out as literals.
@@ -487,25 +509,55 @@ class TestRealToolsRunWithoutCommit(FrappeTestCase):
 			"set_resolution_hint": {"text": "ERPAI-TEST-T27 gợi ý"},
 			"post_comment": {"content": "ERPAI-TEST-T27 bình luận"},
 			"create_task": {"subject": "ERPAI-TEST-T27 việc", "description": "ERPAI-TEST-T27 mô tả"},
+			"propose_file_change": {
+				"path": "erp_ai/README.md",
+				"edits": [{"old": "a", "new": "b"}],
+				"reason": "ERPAI-TEST-T27",
+			},
+			"propose_new_file": {"path": "erp_ai/t27.md", "content": "x", "reason": "ERPAI-TEST-T27"},
+			"propose_bench_command": {"command": "version", "reason": "ERPAI-TEST-T27"},
+			"api_list_records": {"doctype": "HD Ticket", "filters": [["name", "=", str(self.ticket)]]},
+			"api_get_record": {"doctype": "HD Ticket", "name": str(self.ticket)},
+			"api_create_record": {"doctype": "Note", "values": {"title": "ERPAI-TEST-T27 ghi chú"}},
+			"api_update_record": {
+				"doctype": "HD Ticket",
+				"name": str(self.ticket),
+				"values": {"subject": "ERPAI-TEST-T27 phiếu đã sửa"},
+			},
+			"api_delete_record": {"doctype": "Note", "name": CREATED_NOTE},
+			"api_submit_record": {"doctype": "Note", "name": CREATED_NOTE, "action": "submit"},
+			"api_call_method": {"method": "frappe.client.get_count", "arguments": {"doctype": "HD Ticket"}},
 		}
 
 	def test_every_real_handler_runs_without_committing(self):
 		context = ToolContext(
 			ticket_name=self.ticket,
-			effective_level="L1",
+			effective_level="L3",
 			instructor=AGENT_EMAIL,
 			run_id="run-t27",
 			category_mapping={"A": {"ticket_type": SEED_TYPE}},
 			agent_user=AGENT_EMAIL,
+			change_enabled=True,
+			unrestricted=True,
 		)
 		arguments = self.arguments()
 		specs = REAL_ALL_SPECS()
 		self.assertEqual(sorted(arguments), sorted(spec.name for spec in specs))
 		frappe.set_user(AGENT_EMAIL)
+		results = {}
 		for spec in specs:
-			result = execute_tool(spec.name, arguments[spec.name], context)
+			call_arguments = dict(arguments[spec.name])
+			if call_arguments.get("name") == CREATED_NOTE:
+				call_arguments["name"] = results["api_create_record"]["name"]
+			results[spec.name] = execute_tool(spec.name, call_arguments, context)
+		# The note is deleted before the submit call, so that handler ends at its own "missing record" refusal.
+		self.assertEqual(results.pop("api_submit_record")["reason"], "không tìm thấy bản ghi")
+		# No app is on the allowed list of this context: the two file tools end at the guard's refusal.
+		for name in ("propose_file_change", "propose_new_file"):
+			self.assertEqual(results.pop(name)["reason"], APP_NOT_ALLOWED)
+		for name, result in results.items():
 			# ok means the handler ran to its end: not a schema refusal, not "not granted", not a handler refusal.
-			self.assertTrue(result["ok"], f"{spec.name}: {result}")
+			self.assertTrue(result["ok"], f"{name}: {result}")
 		frappe.set_user("Administrator")
 		ticket = frappe.get_doc("HD Ticket", self.ticket)
 		self.assertEqual(ticket.ticket_type, SEED_TYPE)
@@ -515,3 +567,5 @@ class TestRealToolsRunWithoutCommit(FrappeTestCase):
 			)
 		)
 		self.assertTrue(frappe.db.exists("Task", {"subject": "ERPAI-TEST-T27 việc"}))
+		self.assertFalse(frappe.db.exists("Note", {"title": "ERPAI-TEST-T27 ghi chú"}))
+		self.assertEqual(ticket.subject, "ERPAI-TEST-T27 phiếu đã sửa")

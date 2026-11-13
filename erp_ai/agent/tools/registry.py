@@ -20,12 +20,13 @@ class ToolContext:
 	routing_config: dict | None = None
 	change_enabled: bool = False
 	allowed_apps: tuple[str, ...] = ()
+	unrestricted: bool = False
 
 
 @dataclass(frozen=True)
 class ToolSpec:
 	name: str
-	group: Literal["read", "ticket_write", "task_write", "change_propose"]
+	group: Literal["read", "ticket_write", "task_write", "change_propose", "site_admin", "site_unrestricted"]
 	schema: dict
 	handler: Callable[[dict, ToolContext], dict]
 
@@ -34,10 +35,15 @@ TOOL_MODULES = (
 	"erp_ai.agent.tools.read",
 	"erp_ai.agent.tools.source",
 	"erp_ai.agent.tools.write_ticket",
+	"erp_ai.agent.tools.propose_change",
+	"erp_ai.agent.tools.site_api",
 )
 SAVEPOINT = "erp_ai_tool"
 KEY_REASON_MAX = 100  # model-supplied argument names are cut so reason stays short
 CHANGE_GROUP = "change_propose"
+SITE_ADMIN_GROUP = "site_admin"
+# The unrestricted switch grants these groups on its own: any level above L0, with an instructor.
+UNRESTRICTED_GROUPS = (SITE_ADMIN_GROUP, "site_unrestricted")
 # ADR-011 QĐ 2, 6: the only grant table, one row per group, checked above L0:
 # group -> condition on (effective_level, has_instructor, change_enabled).
 GRANT_TABLE = (
@@ -46,6 +52,11 @@ GRANT_TABLE = (
 	("task_write", lambda level, has_instructor, change_enabled: has_instructor),
 	(
 		CHANGE_GROUP,
+		lambda level, has_instructor, change_enabled: change_enabled and level == "L3" and has_instructor,
+	),
+	# Generic record tools (site_api.py): the same switch, level and authority as the change tools.
+	(
+		SITE_ADMIN_GROUP,
 		lambda level, has_instructor, change_enabled: change_enabled and level == "L3" and has_instructor,
 	),
 )
@@ -70,6 +81,21 @@ def _granted_specs(effective_level: str, has_instructor: bool, change_enabled: b
 	return [spec for spec in _all_specs() if spec.group in groups]
 
 
+def _unrestricted_specs(effective_level: str, has_instructor: bool, unrestricted: bool) -> list[ToolSpec]:
+	if not (unrestricted and has_instructor):
+		return []
+	if effective_level not in LEVELS or effective_level == LEVELS[0]:
+		return []
+	return [spec for spec in _all_specs() if spec.group in UNRESTRICTED_GROUPS]
+
+
+def get_unrestricted_tool_schemas(
+	effective_level: str, has_instructor: bool, unrestricted: bool
+) -> list[dict]:
+	granted = _unrestricted_specs(effective_level, has_instructor, unrestricted)
+	return [copy.deepcopy(spec.schema) for spec in granted]
+
+
 def get_tool_schemas(effective_level: str, has_instructor: bool, change_enabled: bool) -> list[dict]:
 	granted = _granted_specs(effective_level, has_instructor, change_enabled)
 	return [copy.deepcopy(spec.schema) for spec in granted]
@@ -78,6 +104,11 @@ def get_tool_schemas(effective_level: str, has_instructor: bool, change_enabled:
 def grants_change_tools(effective_level: str, has_instructor: bool, change_enabled: bool) -> bool:
 	granted = _granted_specs(effective_level, has_instructor, change_enabled)
 	return any(spec.group == CHANGE_GROUP for spec in granted)
+
+
+def grants_site_admin_tools(effective_level: str, has_instructor: bool, change_enabled: bool) -> bool:
+	granted = _granted_specs(effective_level, has_instructor, change_enabled)
+	return any(spec.group == SITE_ADMIN_GROUP for spec in granted)
 
 
 def _invalid(key) -> dict:
@@ -93,6 +124,7 @@ JSON_TYPES = {
 	"integer": lambda v: isinstance(v, int) and not isinstance(v, bool),
 	"boolean": lambda v: isinstance(v, bool),
 	"array": lambda v: isinstance(v, list),
+	"object": lambda v: isinstance(v, dict),
 }
 
 
@@ -131,7 +163,10 @@ def _first_invalid_key(arguments, input_schema: dict) -> str | None:
 
 
 def execute_tool(name: str, arguments: dict, context: ToolContext) -> dict:
-	granted = _granted_specs(context.effective_level, bool(context.instructor), context.change_enabled)
+	granted = [
+		*_granted_specs(context.effective_level, bool(context.instructor), context.change_enabled),
+		*_unrestricted_specs(context.effective_level, bool(context.instructor), context.unrestricted),
+	]
 	spec = next((s for s in granted if s.name == name), None)
 	if spec is None:
 		return {"ok": False, "reason": "tool không được cấp ở mức/thẩm quyền hiện tại"}

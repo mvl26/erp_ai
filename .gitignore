@@ -13,6 +13,7 @@ __pycache__
 .team/session/
 .claude/settings.local.json
 .claude/worktrees/
+.ruff_cache/
 
 # secrets: never commit
 .env

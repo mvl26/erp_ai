@@ -29,6 +29,19 @@ TOOL_NAMES = ["propose_file_change", "propose_new_file", "propose_bench_command"
 # Command table of design 3.1, written by hand
 BENCH_COMMANDS_TABLE = ("migrate", "build", "clear-cache", "clear-website-cache", "list-apps", "version")
 NOT_GRANTED = {"ok": False, "reason": "tool không được cấp ở mức/thẩm quyền hiện tại"}
+# Sentences of design 3.9, written by hand
+NO_UPSTREAM_NOTE = "<p>Nhánh này không theo nhánh remote nào.</p>"
+CORE_WARNING_START = "<p>Cảnh báo app lõi: "
+CORE_WARNING = (
+	"<p>Cảnh báo app lõi: frappe dùng chung cho mọi site trên bench này, nên thay đổi ảnh hưởng tất cả các "
+	"site. bench update không giữ commit local: nó dừng nếu kho có thay đổi chưa commit; khi kho sạch, nó "
+	"kéo bằng git pull (merge) từ remote upstream hoặc remote đầu tiên, có thể tạo merge commit hoặc xung "
+	"đột; bench update --reset xóa vĩnh viễn commit chưa đẩy. Đẩy commit lên fork là việc của người, làm "
+	"trước khi chạy bench update.</p>"
+)
+RESTART_NOTE = "<p>Sau khi áp dụng cần người chạy bench restart.</p>"
+REMOTE_URL = "https://x-token-FAKE@host/r.git"
+GIT_FIELDS = ("target_branch", "upstream_ref", "ahead_count", "is_core_app")
 
 
 def _sha(text: str) -> str:
@@ -565,3 +578,167 @@ class TestProposeChange(FrappeTestCase):
 			no_comment = propose_change.propose_file_change(arguments, self.context())
 		self.assertEqual(no_comment, {"ok": False, "reason": "thiếu quyền tạo comment"})
 		self.assert_nothing_created()
+
+	def stored(self, proposal):
+		frappe.set_user("Administrator")
+		doc = frappe.get_doc(PROPOSAL_DOCTYPE, proposal)
+		frappe.set_user(AGENT)
+		return doc
+
+	def comment_of(self, result):
+		(content,) = [row.content for row in self.comments() if row.name == result["comment"]]
+		return content
+
+	def assert_in_order(self, text, parts):
+		positions = [text.index(part) for part in parts]
+		self.assertEqual(positions, sorted(positions), text)
+
+	def test_core_app_proposal_created_when_listed(self):
+		core_path = f"frappe/{REL}"
+		self.sandbox.commit_file("frappe", REL, BEFORE)
+		self.sandbox.switch_branch("frappe", "feature/core")
+		unlisted = self.change(["x = 1"], ["x = 2"], core_path)
+		self.assertEqual(unlisted, {"ok": False, "reason": "app không có trong danh sách được sửa"})
+		self.assertEqual(self.proposals(), [])
+
+		result = self.change(["x = 1"], ["x = 2"], core_path, allowed_apps=(APP, "frappe"))
+
+		self.assertEqual(set(result), {"ok", "proposal", "status", "comment", "branch"}, result)
+		self.assertEqual(
+			(result["ok"], result["status"], result["branch"]), (True, "Chờ duyệt", "feature/core")
+		)
+		doc = self.stored(result["proposal"])
+		self.assertEqual((doc.change_kind, doc.app, doc.file_path), (CHANGE_KIND_CODE, "frappe", core_path))
+		self.assertEqual(tuple(doc.get(field) for field in GIT_FIELDS), ("feature/core", "", 0, 1))
+		# core app without an upstream: branch, no-upstream sentence, core warning, restart note, in that order
+		content = self.comment_of(result)
+		branch = "<p>Commit sẽ vào nhánh feature/core của app frappe.</p>"
+		self.assert_in_order(content, [branch, NO_UPSTREAM_NOTE, CORE_WARNING, RESTART_NOTE])
+		self.assertNotIn("Nhánh này theo ", content)
+
+	def test_comment_shows_branch_upstream_ahead_and_core_warning(self):
+		core_path = f"frappe/{REL}"
+		self.sandbox.commit_file("frappe", REL, BEFORE)
+		self.sandbox.switch_branch("frappe", "feature/core")
+		self.sandbox.add_remote("frappe", url=REMOTE_URL, ahead=3)
+		# the store the leak check reads from holds the URL with its token
+		self.assertEqual(self.sandbox.git("frappe", "remote", "get-url", "origin").strip(), REMOTE_URL)
+
+		result = self.change(["x = 1"], ["x = 2"], core_path, allowed_apps=(APP, "frappe"))
+
+		self.assertTrue(result["ok"], result)
+		doc = self.stored(result["proposal"])
+		self.assertEqual(
+			tuple(doc.get(field) for field in GIT_FIELDS), ("feature/core", "origin/feature/core", 3, 1)
+		)
+		content = self.comment_of(result)
+		branch = "<p>Commit sẽ vào nhánh feature/core của app frappe.</p>"
+		upstream = (
+			"<p>Nhánh này theo origin/feature/core và đang đi trước 3 commit "
+			"(tính theo lần fetch cuối trên máy chủ).</p>"
+		)
+		self.assert_in_order(content, [branch, upstream, CORE_WARNING, RESTART_NOTE])
+		self.assertNotIn(NO_UPSTREAM_NOTE, content)
+		# NFR-8: the remote URL and its token appear 0 times in the comment, the proposal and the result
+		stored_fields = json.dumps(doc.as_dict(), default=str, ensure_ascii=False)
+		self.assertIn("origin/feature/core", stored_fields)
+		for store, text in (
+			("comment", content),
+			("proposal", stored_fields),
+			("result", json.dumps(result)),
+		):
+			for secret in (REMOTE_URL, "x-token-FAKE", "host/r.git"):
+				with self.subTest(store=store, secret=secret):
+					self.assertEqual(text.count(secret), 0)
+
+	def test_non_core_app_comment_has_no_core_warning(self):
+		# non-core app without an upstream
+		alone = self.change(["x = 1"], ["x = 2"])
+		self.assertTrue(alone["ok"], alone)
+		self.assertEqual(
+			tuple(self.stored(alone["proposal"]).get(field) for field in GIT_FIELDS), ("main", "", 0, 0)
+		)
+		content = self.comment_of(alone)
+		branch = f"<p>Commit sẽ vào nhánh main của app {APP}.</p>"
+		self.assert_in_order(content, [branch, NO_UPSTREAM_NOTE, RESTART_NOTE])
+		self.assertNotIn(CORE_WARNING_START, content)
+
+		# non-core app with an upstream
+		self.sandbox.add_remote(APP, url=REMOTE_URL, ahead=1)
+		tracked = self.change(["x = 1"], ["x = 2"])
+		self.assertTrue(tracked["ok"], tracked)
+		self.assertEqual(
+			tuple(self.stored(tracked["proposal"]).get(field) for field in GIT_FIELDS),
+			("main", "origin/main", 1, 0),
+		)
+		content = self.comment_of(tracked)
+		upstream = (
+			"<p>Nhánh này theo origin/main và đang đi trước 1 commit "
+			"(tính theo lần fetch cuối trên máy chủ).</p>"
+		)
+		self.assert_in_order(content, [branch, upstream, RESTART_NOTE])
+		self.assertNotIn(CORE_WARNING_START, content)
+		self.assertNotIn(NO_UPSTREAM_NOTE, content)
+
+	def test_tool_cannot_set_git_fields_or_commit_message(self):
+		self.sandbox.switch_branch(APP, "feature/real")
+		forged = {
+			"target_branch": "forged-branch",
+			"upstream_ref": REMOTE_URL,
+			"ahead_count": 99,
+			"is_core_app": 1,
+			"commit_message": "forged message",
+		}
+		calls = {
+			"propose_file_change": {"path": PATH, "find": ["x = 1"], "replace": ["x = 2"], "reason": "x"},
+			"propose_new_file": {"path": f"{APP}/pkg/new_mod.py", "content": "z = 1\n", "reason": "x"},
+			"propose_bench_command": {"command": "build", "app": "frappe", "reason": "x"},
+		}
+		allowed = (APP, "frappe")
+		# pinned: the schema refuses every extra key the model sends
+		for name, arguments in calls.items():
+			for key, value in forged.items():
+				with self.subTest(tool=name, key=key):
+					refused = self.run_tool(name, {**arguments, key: value}, allowed_apps=allowed)
+					self.assertEqual(refused, {"ok": False, "reason": f"tham số không hợp lệ: {key}"})
+		self.assertEqual(self.proposals(), [])
+
+		# whatever reaches the handler, the git fields come from the guard and the message from the controller
+		results = {
+			name: getattr(propose_change, name)({**arguments, **forged}, self.context(allowed_apps=allowed))
+			for name, arguments in calls.items()
+		}
+		for name in ("propose_file_change", "propose_new_file"):
+			with self.subTest(tool=name):
+				result = results[name]
+				self.assertEqual((result["ok"], result["branch"]), (True, "feature/real"), result)
+				doc = self.stored(result["proposal"])
+				self.assertEqual(tuple(doc.get(field) for field in GIT_FIELDS), ("feature/real", "", 0, 0))
+				self.assertEqual(
+					doc.commit_message,
+					f"erp_ai: áp dụng {doc.name} ({doc.file_path})\n\n"
+					f"Đề xuất: {doc.name}\nPhiếu: {self.ticket}\nNgười duyệt: <người duyệt>\n"
+					"Commit do ERP AI Agent tạo sau khi người duyệt bấm Duyệt.",
+				)
+		# design 2.1: a bench command, even a build of core app frappe, has its 5 git fields empty / 0
+		command = results["propose_bench_command"]
+		self.assertTrue(command["ok"], command)
+		self.assertNotIn("branch", command)
+		doc = self.stored(command["proposal"])
+		self.assertEqual(json.loads(doc.command_args), ["build", "--app", "frappe"])
+		self.assertEqual(
+			(*(doc.get(field) for field in GIT_FIELDS), doc.commit_message or ""), ("", "", 0, 0, "")
+		)
+		for result in results.values():
+			self.assertNotIn("forged", self.comment_of(result))
+			self.assertNotIn("x-token-FAKE", self.comment_of(result))
+
+	def test_bench_app_checked_by_check_bench_args_at_proposal_time(self):
+		# "a;b" passes the list and the folder checks; only check_bench_args refuses it
+		shell = self.bench("build", "a;b", allowed_apps=("a;b",))
+		self.assertEqual(shell, {"ok": False, "reason": "đối số chứa ký tự điều khiển shell"})
+		# an app of only spaces passes the schema (minLength 1) and counts as no app
+		spaces = self.bench("build", "   ", allowed_apps=(APP, "   "))
+		self.assertEqual(spaces, {"ok": False, "reason": "lệnh build cần app"})
+		self.assertEqual(self.proposals(), [])
+		self.assertEqual(self.comments(), [])

@@ -330,6 +330,13 @@ class TestRegistry(FrappeTestCase):
 					key,
 				)
 
+	def test_grants_change_tools_follows_granted_specs_not_conditions(self):
+		# Design 3.6, ADR-011 QĐ 3/6: with every condition met but no change_propose spec
+		# registered, nothing is granted, so the prompt flag must say False too.
+		schemas = get_tool_schemas("L3", True, True)
+		self.assertEqual([s["name"] for s in schemas], ["do_read", "do_ticket", "do_task"])
+		self.assertIs(registry.grants_change_tools("L3", True, True), False)
+
 	def test_execute_rejects_change_tool_when_not_granted(self):
 		denied = (
 			_context("L3", "boss@x.com", change_enabled=False),

@@ -25,6 +25,7 @@ PROPOSE_TOOL_NAMES = ("propose_file_change", "propose_new_file", "propose_bench_
 TICKET_DOCTYPE = "HD Ticket"
 REASON_MAX_CHARS = 1000
 PATH_MAX_CHARS = 300
+APP_MAX_CHARS = 100
 DIFF_CONTEXT_LINES = 3
 PROPOSAL_FILE_MAX_BYTES = source.SEARCH_FILE_MAX_BYTES
 COMMENT_DOCTYPE = "Comment"
@@ -209,6 +210,11 @@ def propose_bench_command(args: dict, ctx: ToolContext) -> dict:
 		"command_args": json.dumps(built, ensure_ascii=False),
 		"reversible": 0,
 		"reason": args["reason"],
+		# design 2.1: a bench command carries no git field
+		"target_branch": "",
+		"upstream_ref": "",
+		"ahead_count": 0,
+		"is_core_app": 0,
 	}
 	return _insert(ctx, values)
 
@@ -277,7 +283,7 @@ TOOLS: list[ToolSpec] = [
 				"type": "object",
 				"properties": {
 					"command": {"type": "string", "enum": list(change_guard.BENCH_COMMANDS)},
-					"app": {"type": "string", "minLength": 1, "maxLength": 80},
+					"app": {"type": "string", "minLength": 1, "maxLength": APP_MAX_CHARS},
 					"reason": _REASON,
 				},
 				"required": ["command", "reason"],

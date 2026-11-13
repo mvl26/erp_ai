@@ -1873,9 +1873,9 @@ CHANGE_GUARD_FILE = "agent/tools/change_guard.py"
 CHANGE_GUARD_FUNCTION = "check_write_path"
 SAFE_PATH_CALL = "erp_ai.agent.tools.source.resolve_safe_path"
 SAFE_PATH_NAME = "safe_path"  # any function so named outside source.py is a second resolver (ADR-011)
-REALPATH_CALL = "realpath"
 ROOT_CHECK_CALLS = ("commonpath", "is_relative_to")
-# Hand-written: (file, function) allowed to realpath + root-check outside source.py. check_write_path only
+MODULE_SCOPE = "<module>"
+# Hand-written: (file, function) allowed to root-check outside source.py. check_write_path only
 # classifies a path resolve_safe_path already refused, to pick the refusal reason (ADR-011, design table 3.1).
 ROOT_CHECK_ALLOWLIST = frozenset(
 	{
@@ -2055,19 +2055,20 @@ def _refuses_when_unresolved(function, aliases: dict) -> bool:
 	)
 
 
-def _root_check_functions(tree: ast.AST):
-	"""Functions that both resolve symlinks (`realpath`) and check a root (`commonpath`/`is_relative_to`)."""
-	for node in ast.walk(tree):
-		if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
-			called = {referenced_name(call.func) for call in ast.walk(node) if isinstance(call, ast.Call)}
-			if REALPATH_CALL in called and called & set(ROOT_CHECK_CALLS):
-				yield node
+def _root_check_calls(node: ast.AST, function: str = MODULE_SCOPE):
+	"""`(innermost enclosing function name, call)` for every `commonpath`/`is_relative_to` call, realpath nearby or
+	not: source.py itself splits the root check (`_inside`) from the realpath calls of its caller."""
+	for child in ast.iter_child_nodes(node):
+		scope = child.name if isinstance(child, ast.FunctionDef | ast.AsyncFunctionDef) else function
+		if isinstance(child, ast.Call) and referenced_name(child.func) in ROOT_CHECK_CALLS:
+			yield function, child
+		yield from _root_check_calls(child, scope)
 
 
 def check_change_guard_uses_resolve_safe_path(sources: dict) -> list:
 	"""ADR-011 Ràng buộc: `change_guard.check_write_path` calls `source.resolve_safe_path` and refuses when it
-	returns None; outside source.py no function is named like it or resolves symlinks and checks a root
-	(ROOT_CHECK_ALLOWLIST holds the guard's own classification of a refused path)."""
+	returns None; outside source.py no function is named like it and no code checks a root
+	(`commonpath`/`is_relative_to`, with or without realpath; ROOT_CHECK_ALLOWLIST holds the guard's own classification of a refused path)."""
 	guard = sources.get(CHANGE_GUARD_FILE)
 	if guard is None:
 		return _missing(CHANGE_GUARD_FILE)
@@ -2110,13 +2111,13 @@ def check_change_guard_uses_resolve_safe_path(sources: dict) -> list:
 		for node in ast.walk(tree):
 			if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef) and SAFE_PATH_NAME in node.name:
 				violations.append(violation(rel, node, f"{node.name}() is a second path resolver (ADR-011)"))
-		for node in _root_check_functions(tree):
-			if (rel, node.name) not in ROOT_CHECK_ALLOWLIST:
+		for function, call in _root_check_calls(tree):
+			if (rel, function) not in ROOT_CHECK_ALLOWLIST:
 				violations.append(
 					violation(
 						rel,
-						node,
-						f"{node.name}() resolves symlinks and checks a root: a second resolver (ADR-011)",
+						call,
+						f"{function}() calls {referenced_name(call.func)}: a second root check (ADR-011)",
 					)
 				)
 	return violations
@@ -2173,8 +2174,15 @@ def _writes_any_doctype(tree: ast.AST) -> bool:
 	"""The module loads a document of a non-constant DocType and saves/deletes it, or deletes one directly."""
 	generic = set()
 	for node in ast.walk(tree):
-		if isinstance(node, ast.Call) and referenced_name(node.func) in GENERIC_DOC_CALLS and node.args:
-			first = node.args[0]
+		if isinstance(node, ast.Call) and referenced_name(node.func) in GENERIC_DOC_CALLS:
+			# Positional, or keywords only: `get_doc(doctype=d, name=n)`.
+			first = (
+				node.args[0]
+				if node.args
+				else next((keyword.value for keyword in node.keywords if keyword.arg == "doctype"), None)
+			)
+			if first is None:
+				continue
 			constant = isinstance(first, ast.Constant | ast.Dict) or (referenced_name(first) or "").isupper()
 			if not constant and not _names_proposal(first):
 				generic.add(referenced_name(node.func))
@@ -4142,6 +4150,26 @@ class TestScannersCatchViolations(unittest.TestCase):
 				},
 				"_inside",
 			),
+			# source.py's own shape: the root check in a helper, the realpath calls in its caller.
+			"root check split from realpath": (
+				{
+					CHANGE_GUARD_FILE: good,
+					"agent/changes/file_writer.py": "import os\n\ndef _inside(root, full):\n"
+					"\treturn os.path.commonpath([root, full]) == root\n\ndef resolve(rel):\n"
+					"\troot, full = os.path.realpath(ROOT), os.path.realpath(rel)\n"
+					"\treturn full if _inside(root, full) else None\n",
+				},
+				"agent/changes/file_writer.py",
+				"_inside",
+			),
+			"root check at module level": (
+				{
+					CHANGE_GUARD_FILE: good,
+					"agent/changes/file_writer.py": "import pathlib\n\nOK = pathlib.Path(P).is_relative_to(R)\n",
+				},
+				"agent/changes/file_writer.py",
+				"is_relative_to",
+			),
 			"missing file": (
 				{SOURCE_TOOL_FILE: "def resolve_safe_path(rel):\n\treturn rel\n"},
 				CHANGE_GUARD_FILE,
@@ -4320,6 +4348,14 @@ class TestScannersCatchViolations(unittest.TestCase):
 			"delete_doc in another tool": (
 				"agent/tools/cleanup.py",
 				"DENIED_DOCTYPES = {LOG_DOCTYPE}\ndef drop(doctype, name):\n\tfrappe.delete_doc(doctype, name)\n",
+			),
+			"get_doc with keywords only": (
+				"agent/tools/cleanup.py",
+				"def save(d, n):\n\tdoc = frappe.get_doc(doctype=d, name=n)\n\tdoc.save()\n",
+			),
+			"delete_doc with keywords only": (
+				"agent/tools/cleanup.py",
+				"def drop(d, n):\n\tfrappe.delete_doc(doctype=d, name=n)\n",
 			),
 		}
 		for name, (rel, source) in generic.items():

@@ -23,3 +23,16 @@
 {"ts":"2026-11-13T15:07:24+07:00","event":"end","session_id":"017e3d08-1b22-4898-92d1-e43fb441da12","feature":"BUG-003","stage":"build","reason":"other","duration_s":1105,"compactions":0}
 {"ts":"2026-11-13T15:07:24+07:00","event":"end","session_id":"87fb48fb-e583-4c83-ae25-e55786d0fd01","feature":"BUG-003","stage":"build","reason":"other","duration_s":14612,"compactions":0}
 {"ts":"2026-11-13T15:07:26+07:00","event":"end","session_id":"6c38287b-bf21-45d8-bbe6-babd0767ec62","feature":"BUG-003","stage":"build","reason":"other","duration_s":14552,"compactions":0}
+{"ts":"2026-11-13T15:13:03+07:00","event":"end","session_id":"a87e42fa-0676-444a-a7df-f67f33e82d3d","feature":"BUG-003","stage":"build","reason":"other","duration_s":0,"compactions":0}
+{"ts":"2026-11-13T15:20:51+07:00","event":"end","session_id":"6746c478-ad1c-4798-adbb-8b7c4fcb4eb9","feature":"BUG-003","stage":"build","reason":"other","duration_s":466,"compactions":0}
+{"ts":"2026-11-13T17:01:52+07:00","event":"end","session_id":"6b16d9d9-6697-4d07-875f-9996d136c740","feature":"BUG-003","stage":"build","reason":"other","duration_s":0,"compactions":0}
+{"ts":"2026-11-13T17:01:52+07:00","event":"end","session_id":"d732c5d1-10aa-424a-a613-f0b4b6c62ef8","feature":"BUG-003","stage":"build","reason":"other","duration_s":0,"compactions":0}
+{"ts":"2026-11-13T17:01:52+07:00","event":"end","session_id":"c4ce48a9-f4e1-4c75-9b53-5d9d3d2573c7","feature":"BUG-003","stage":"build","reason":"other","duration_s":0,"compactions":0}
+{"ts":"2026-11-13T17:57:43+07:00","event":"end","session_id":"c777757b-bead-4e4a-90b5-f57080771ec6","feature":"BUG-003","stage":"build","reason":"other","duration_s":2047,"compactions":0}
+{"ts":"2026-11-13T18:10:02+07:00","event":"end","session_id":"df7d4794-2160-4752-bebd-f29d5585f025","feature":"CHG-001","stage":"analyze","reason":"other","duration_s":690,"compactions":0}
+{"ts":"2026-11-13T18:25:36+07:00","event":"end","session_id":"6746c478-ad1c-4798-adbb-8b7c4fcb4eb9","feature":"CHG-001","stage":"analyze","reason":"other","duration_s":11551,"compactions":0}
+{"ts":"2026-11-13T18:25:36+07:00","event":"end","session_id":"d6349641-136b-4c9c-9f47-7001008168d6","feature":"CHG-001","stage":"analyze","reason":"other","duration_s":11077,"compactions":0}
+{"ts":"2026-11-13T18:25:38+07:00","event":"end","session_id":"6c38287b-bf21-45d8-bbe6-babd0767ec62","feature":"CHG-001","stage":"analyze","reason":"other","duration_s":26444,"compactions":0}
+{"ts":"2026-11-14T00:27:34+07:00","event":"end","session_id":"5ac98490-8cc8-4e7f-842a-c99381452aec","feature":"CHG-001","stage":"analyze","reason":"other","duration_s":1,"compactions":0}
+{"ts":"2026-11-14T00:29:02+07:00","event":"end","session_id":"6746c478-ad1c-4798-adbb-8b7c4fcb4eb9","feature":"CHG-001","stage":"analyze","reason":"other","duration_s":33357,"compactions":0}
+{"ts":"2026-11-14T00:29:05+07:00","event":"end","session_id":"c636a144-dd7a-4180-ba4e-4720e0d5691c","feature":"CHG-001","stage":"analyze","reason":"other","duration_s":0,"compactions":0}

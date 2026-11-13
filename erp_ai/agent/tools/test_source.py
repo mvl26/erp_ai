@@ -688,6 +688,29 @@ class TestGitSandbox(RealCoreReposUntouchedMixin, FrappeTestCase):
 			self.assertEqual(handle.read(), "# frappe\n")
 		self.assertEqual(sandbox.git("custom_app", "status", "--porcelain"), "")
 
+	def test_git_sandbox_write_refuses_app_outside_root(self):
+		sandbox = GitSandbox(self, apps=("custom_app",), erp_ai_worktree=None)
+		outside = os.path.realpath(tempfile.mkdtemp())
+		self.addCleanup(shutil.rmtree, outside, True)
+		base_entries = sorted(os.listdir(sandbox.base))
+		cases = {
+			"commit_file": lambda app: sandbox.commit_file(app, "escape.py", "x = 1\n"),
+			"stage": lambda app: sandbox.stage(app, "escape.py", "x = 1\n"),
+			"write_unstaged": lambda app: sandbox.write_unstaged(app, "escape.py", "x = 1\n"),
+		}
+		for name, call in cases.items():
+			for app in (outside, "..", "", "custom_app/.."):
+				with self.subTest(helper=name, app=app):
+					with self.assertRaisesRegex(ValueError, "outside"):
+						call(app)
+			with self.subTest(helper=name, app="missing_app"):
+				with self.assertRaisesRegex(ValueError, "no repo missing_app"):
+					call("missing_app")
+		self.assertEqual(os.listdir(outside), [])
+		self.assertEqual(sorted(os.listdir(sandbox.base)), base_entries)
+		self.assertFalse(os.path.exists(os.path.join(sandbox.root, "escape.py")))
+		self.assertFalse(os.path.exists(sandbox.repo("missing_app")))
+
 	def test_sandbox_state_helpers_produce_expected_git_state(self):
 		sandbox = GitSandbox(self, apps=("custom_app",), erp_ai_worktree=None)
 		app = "custom_app"
@@ -789,6 +812,17 @@ class TestGitSandbox(RealCoreReposUntouchedMixin, FrappeTestCase):
 		with self.subTest(case="duplicate remote"):
 			with self.assertRaisesRegex(AssertionError, "already exists"):
 				sandbox.add_remote(app, name="mirror")
+		outside = os.path.realpath(tempfile.mkdtemp())
+		self.addCleanup(shutil.rmtree, outside, True)
+		remotes = os.path.join(sandbox.base, "remotes")
+		climb = os.path.relpath(os.path.join(outside, "r"), os.path.join(remotes, app))
+		for name in (os.path.join(outside, "r"), climb, "..", "a/b", ""):
+			with self.subTest(case="remote name escapes", name=name):
+				with self.assertRaisesRegex(ValueError, "remote name"):
+					sandbox.add_remote(app, name=name)
+		self.assertEqual(os.listdir(outside), [])
+		self.assertEqual(sorted(os.listdir(os.path.join(remotes, app))), ["mirror.git"])
+		self.assertEqual(sandbox.git(app, "remote"), "mirror\n")
 		with self.subTest(case="switch to missing branch"):
 			with self.assertRaisesRegex(AssertionError, "nope"):
 				sandbox.switch_branch(app, "nope", create=False)
@@ -807,6 +841,35 @@ class TestGitSandbox(RealCoreReposUntouchedMixin, FrappeTestCase):
 					getattr(sandbox, helper)("missing_app", *args)
 		with self.assertRaisesRegex(ValueError, "no repo missing_app"):
 			sandbox.install_marker_hooks("missing_app")
+
+	def test_mark_in_progress_rebase_merge_twice_keeps_state(self):
+		sandbox = GitSandbox(self, apps=("custom_app",), erp_ai_worktree=None)
+		sandbox.mark_in_progress("custom_app", "rebase-merge")
+		sandbox.mark_in_progress("custom_app", "rebase-merge")
+		self.assertIn("You are currently rebasing branch 'main'", sandbox.git("custom_app", "status"))
+
+	def test_install_marker_hooks_refuses_second_install_on_shared_hooks_dir(self):
+		sandbox = GitSandbox(self, apps=("erp_ai",))
+		markers = sandbox.install_marker_hooks("erp_ai")
+		for app in ("erp_ai", "erp_ai-wt"):
+			with self.subTest(app=app):
+				with self.assertRaisesRegex(ValueError, "marker hooks already installed"):
+					sandbox.install_marker_hooks(app)
+		self.assertFalse(os.path.exists(os.path.join(sandbox.base, "markers", "erp_ai-wt")))
+		with open(
+			os.path.join(sandbox.repo("erp_ai"), ".git", "hooks", "pre-commit"), encoding="utf-8"
+		) as handle:
+			self.assertIn(f'"{markers}/pre-commit"', handle.read())
+
+	def test_marker_hooks_see_commit_msg_once_pre_commit_passes(self):
+		sandbox = GitSandbox(self, apps=("custom_app",), erp_ai_worktree=None)
+		markers = sandbox.install_marker_hooks("custom_app")
+		os.remove(os.path.join(sandbox.repo("custom_app"), ".git", "hooks", "pre-commit"))
+		sandbox.commit_file("custom_app", "loud.py", "x = 1\n", run_hooks=True)
+		self.assertEqual(
+			sorted(os.listdir(markers)),
+			["commit-msg", "post-commit", "post-index-change", "prepare-commit-msg", "reference-transaction"],
+		)
 
 	def test_install_marker_hooks_records_hooks_only_when_asked(self):
 		sandbox = GitSandbox(self, apps=("custom_app",), erp_ai_worktree=None)
@@ -886,6 +949,7 @@ class TestRealCoreReposUntouchedMixin(unittest.TestCase):
 		self.assertEqual([args for args, _ in calls], expected)
 		for _, kwargs in calls:
 			self.assertEqual(kwargs["stdin"], subprocess.DEVNULL)
+			self.assertEqual(kwargs["timeout"], test_utils.GIT_SANDBOX_TIMEOUT_S)
 			self.assertNotIn("GIT_DIR", kwargs["env"])
 		self.assertEqual(snapshot["hrms"], ("abc", "abc\n"))
 

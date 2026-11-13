@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -338,6 +339,16 @@ class TempAppsRoot:
 GIT_SANDBOX_NAME = "ERP AI Test"
 GIT_SANDBOX_EMAIL = "erp-ai-test@sandbox.invalid"
 GIT_SANDBOX_TIMEOUT_S = 30
+GIT_SANDBOX_REMOTE_NAME = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]*")
+IN_PROGRESS_KINDS = ("MERGE_HEAD", "rebase-merge", "CHERRY_PICK_HEAD", "REVERT_HEAD")
+MARKER_HOOKS = (
+	"pre-commit",
+	"prepare-commit-msg",
+	"commit-msg",
+	"post-commit",
+	"post-index-change",
+	"reference-transaction",
+)
 
 
 class GitSandbox:
@@ -394,16 +405,21 @@ class GitSandbox:
 	def repo(self, app) -> str:
 		return os.path.join(self.root, app)
 
+	def _repo_dir(self, app) -> str:
+		"""Real path of `repo(app)`; refuse the root itself, anything outside it and a missing directory."""
+		path = os.path.realpath(self.repo(app))
+		if os.path.commonpath([self.root, path]) != self.root or path == self.root:
+			raise ValueError(f"GitSandbox refuses to work outside the repos under {self.root}: {path}")
+		if not os.path.isdir(path):
+			raise ValueError(f"GitSandbox has no repo {app}: {path}")
+		return path
+
 	def git(self, app, *args, run_hooks=False) -> str:
 		"""Run `git <args>` in `repo(app)` and return stdout; refuse any directory outside the sandbox repos.
 
 		Repo hooks run only with `run_hooks=True`; otherwise `core.hooksPath` is an empty temp dir.
 		"""
-		cwd = os.path.realpath(self.repo(app))
-		if os.path.commonpath([self.root, cwd]) != self.root or cwd == self.root:
-			raise ValueError(f"GitSandbox refuses to run git outside the repos under {self.root}: {cwd}")
-		if not os.path.isdir(cwd):
-			raise ValueError(f"GitSandbox has no repo {app}: {cwd}")
+		cwd = self._repo_dir(app)
 		hooks = () if run_hooks else ("-c", f"core.hooksPath={self.no_hooks}")
 		completed = subprocess.run(
 			["git", *hooks, *args],
@@ -419,8 +435,8 @@ class GitSandbox:
 		return completed.stdout
 
 	def _write(self, app, rel, content) -> None:
-		"""Write `content` to `rel` of `repo(app)`; refuse a `rel` that resolves outside that repo."""
-		repo = os.path.realpath(self.repo(app))
+		"""Write `content` to `rel` of `repo(app)`; refuse an `app` or a `rel` that resolves outside that repo."""
+		repo = self._repo_dir(app)
 		path = os.path.realpath(os.path.join(repo, rel))
 		if os.path.commonpath([repo, path]) != repo or path == repo:
 			raise ValueError(f"GitSandbox refuses to write outside {repo}: {rel!r}")
@@ -470,7 +486,12 @@ class GitSandbox:
 		return self.git(app, "rev-parse", "--path-format=absolute", "--git-path", name).strip()
 
 	def remote_dir(self, app, name="origin") -> str:
-		"""The temp bare repo behind remote `name` of `app`; it lives under `base`, outside `root`."""
+		"""The temp bare repo behind remote `name` of `app`; it lives under `base`, outside `root`.
+
+		`name` is one path component (`GIT_SANDBOX_REMOTE_NAME`), so the repo cannot leave `base`.
+		"""
+		if not GIT_SANDBOX_REMOTE_NAME.fullmatch(name):
+			raise ValueError(f"GitSandbox refuses remote name {name!r}")
 		return os.path.join(self.base, "remotes", app, f"{name}.git")
 
 	def add_remote(self, app, name="origin", url="https://x-token-FAKE@host/r.git", ahead=2) -> None:
@@ -480,8 +501,8 @@ class GitSandbox:
 		"""
 		if ahead < 0:
 			raise ValueError(f"ahead must be >= 0: {ahead}")
-		branch = self.git(app, "symbolic-ref", "--short", "HEAD").strip()
 		bare = self.remote_dir(app, name)
+		branch = self.git(app, "symbolic-ref", "--short", "HEAD").strip()
 		self.git(app, "init", "--quiet", "--bare", bare)
 		self.git(app, "push", "--quiet", bare, f"HEAD:refs/heads/{branch}")
 		self.git(app, "remote", "add", name, url)
@@ -505,7 +526,7 @@ class GitSandbox:
 		path = self._git_path(app, kind)
 		if kind == "rebase-merge":
 			branch = self.git(app, "symbolic-ref", "HEAD")
-			os.makedirs(path)
+			os.makedirs(path, exist_ok=True)
 			self._write_file(os.path.join(path, "head-name"), branch)
 			self._write_file(os.path.join(path, "onto"), head)
 		else:
@@ -519,10 +540,13 @@ class GitSandbox:
 		"""Install `MARKER_HOOKS` in the repo's hooks dir; return the marker dir (under `base`).
 
 		Each hook touches `<markers>/<hook>`; `pre-commit` then refuses the commit. Helper commands never
-		run them (`git(..., run_hooks=False)`); a test passes `run_hooks=True` to run them.
+		run them (`git(..., run_hooks=False)`); a test passes `run_hooks=True` to run them. A repo and its
+		worktrees share one hooks dir, so a second install on it is refused.
 		"""
 		common = self.git(app, "rev-parse", "--path-format=absolute", "--git-common-dir").strip()
 		hooks_dir = os.path.join(common, "hooks")
+		if any(os.path.exists(os.path.join(hooks_dir, hook)) for hook in MARKER_HOOKS):
+			raise ValueError(f"GitSandbox marker hooks already installed in {hooks_dir}")
 		markers = os.path.join(self.base, "markers", app)
 		os.makedirs(markers)
 		os.makedirs(hooks_dir, exist_ok=True)
@@ -534,17 +558,6 @@ class GitSandbox:
 			self._write_file(path, script)
 			os.chmod(path, 0o755)
 		return markers
-
-
-IN_PROGRESS_KINDS = ("MERGE_HEAD", "rebase-merge", "CHERRY_PICK_HEAD", "REVERT_HEAD")
-MARKER_HOOKS = (
-	"pre-commit",
-	"prepare-commit-msg",
-	"commit-msg",
-	"post-commit",
-	"post-index-change",
-	"reference-transaction",
-)
 
 
 def real_core_repos_snapshot() -> dict:

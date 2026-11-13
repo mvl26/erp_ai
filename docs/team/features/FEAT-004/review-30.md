@@ -8,7 +8,8 @@ Approved-by:
 # Review 30 — FEAT-004 T30
 
 - Diff: vòng 1 `git diff 25be823..6d90e79 -- erp_ai/agent/runner.py erp_ai/agent/test_agent_runner.py` (mã nhận từ ngoài quy trình); vòng 2 `git diff 34762ba..563d4c7` (1 commit, 2 file)
-- Vòng: 2 (max_rework=3)
+- Diff vòng 3: `git diff 1a82772..122fd4c` (nhánh `team/FEAT-004-task-30b`, 1 commit, 1 file, +10/-2)
+- Vòng: 3 (max_rework=3)
 - Verdict: approve (5 dòng `api_*` của `WRITE_TOOL_TARGETS`, `_action` đọc doctype và đường `get_unrestricted_tool_schemas` thuộc Amendment 2 / CHG-001, chấm ở `review-chg001.md`)
 
 ## Vòng 1 — request-changes (review E, mã nhận về)
@@ -26,6 +27,12 @@ minor | — | — | 1 điểm nhỏ: `PROPOSE_TOOLS` (runner.py:87) lặp tên t
 - Phát hiện 2: ADDRESSED (`runner.py:691` truyền `instructor=context.instructor`; `test_agent_runner.py:1525-1531` so với giá trị viết tay `PROPOSE_ROW_FIELDS`)
 - Phát hiện 3: ADDRESSED (`:1533` dùng `latest_instructor` thật, mọi điều kiện cấp khác đều bật nên chỉ việc thiếu người ra lệnh giữ tool lại; `:1555` patch `frappe.enqueue` và `subprocess.Popen`, đỏ khi có duyệt, job, argv ghi hay commit; `assertTrue(argvs)` chứng minh lệnh git đọc của bộ chặn có chạy). Hai test này xanh ngay lần đầu vì mã đã có; reviewer xét từ mã test là đỏ được
 - Phát hiện mới: không có blocker/major
+
+## Vòng 3 — approve (sửa sau khi `cmd.test` đỏ trên nhánh đã merge, `git diff 1a82772..122fd4c`)
+- Lỗi: trên `1a82772` (merge T25 và T30 cùng lượt), `ERROR: test_model_claims_approved_after_proposing_zero_applies` → `ValueError: not enough values to unpack (expected 1, got 0)` (tái hiện 2 lần: cả app và chạy riêng module trên site yên). Nguyên nhân do ghép hai task, không do riêng task nào: test của T30 viết trên nền tool còn nhận `edits[{old,new}]`; T25 đổi tool sang `find[]`/`replace[]` của design 3.1 nên lời gọi của test bị từ chối, không có đề xuất
+- ADDRESSED: `test_agent_runner.py:1497-1498`, `1506-1513` gửi `find`/`replace`. Test 1 dùng `execute_tool` thật, được đúng 1 đề xuất `Chờ duyệt`; test chèn lệnh nay bị từ chối bởi kiểm cấp (`registry.py:170-172`) chứ không bởi tham số sai, tức chặt hơn trước; test dòng nhật ký vẫn giả `execute_tool`, chấp nhận vì nó phủ dòng `change`/`reason` của runner (AC-12)
+- Phát hiện mới: không có blocker/major; 1 điểm nhỏ: test chèn lệnh chỉ kiểm `ok: False`, không kiểm lý do
+- Bằng chứng của dev: RED trên nền `ERROR: test_model_claims_approved_after_proposing_zero_applies … line 1578 … ValueError: not enough values to unpack (expected 1, got 0)`; GREEN `Ran 73 tests in 15.518s` / `FAILED (failures=3)` (3 ca nhiễu `auto_assign_enabled=1` đang lưu)
 
 ## Review checklist (10)
 Đã phủ 10/10.

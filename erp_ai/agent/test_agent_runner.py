@@ -1339,3 +1339,113 @@ class TestRunnerSiteAdminTools(RunnerTestBase):
 			json.loads(entry.actions),
 			[{"tool": "api_update_record", "doctype": "Note", "name": None, "ok": False}],
 		)
+
+
+# Hand-written: the tools a run with an instructor gets when no change group is granted (FEAT-001/006 set).
+BASE_TOOL_NAMES_WITH_INSTRUCTOR = [
+	"get_ticket",
+	"list_comments",
+	"search_resolved_tickets",
+	"get_record",
+	"search_source",
+	"read_source",
+	"git_source",
+	"set_classification",
+	"set_resolution_hint",
+	"post_comment",
+	"create_task",
+]
+CHANGE_TOOL_NAMES = ["propose_file_change", "propose_new_file", "propose_bench_command"]
+
+
+class TestRunnerChangeGrant(RunnerTestBase):
+	"""T29: the run's tools and prompt follow the grant result (AC-1, AC-2, AC-14; ADR-011 QĐ 2, 3)."""
+
+	def setUp(self):
+		super().setUp()
+		# every setting the grant depends on is set here, never read from the shared site
+		set_agent_settings(
+			permission_level="L3",
+			code_change_enabled=1,
+			code_change_apps="frappe\nhrms\nfrappe",
+			unrestricted_enabled=0,
+			monthly_budget_usd=1000,
+			spent_this_month_usd=0,
+			prompt_digest=f"{PREFIX}digest",
+			max_runs_per_ticket_per_day=10,  # several runs per test on one ticket
+		)
+		self.table = build_routing_table(DEFAULT_CATEGORY_MAPPING, json.loads(make_routing_rules()), {})
+
+	def _call(self, instructor="Administrator"):
+		self.gateway.calls.clear()
+		with patch.object(authority, "latest_instructor", return_value=instructor):
+			self._run("comment_mention")
+		(call,) = self.gateway.calls
+		return [tool["name"] for tool in call["tools"]], call["system"]
+
+	def _base_system(self):
+		return build_reason_system(f"{PREFIX}digest", self.table)
+
+	def test_switch_off_run_sends_base_tools_and_prompt(self):
+		set_agent_settings(code_change_enabled=0)
+		names, system = self._call()
+
+		self.assertEqual(names, BASE_TOOL_NAMES_WITH_INSTRUCTOR)
+		self.assertNotIn("propose_file_change", names)
+		self.assertEqual(system, self._base_system())
+		self.assertNotIn(CHANGE_TOOLS_BLOCK, system[0]["text"])
+
+	def test_over_budget_l3_drops_change_tools(self):
+		set_agent_settings(monthly_budget_usd=10, spent_this_month_usd=10.01)
+		contexts = []
+		with patch.object(runner, "ToolContext", wraps=runner.ToolContext) as make_context:
+			names, system = self._call()
+			contexts.extend(make_context.call_args_list)
+
+		(made,) = contexts
+		self.assertEqual(made.kwargs["effective_level"], "L1")
+		# the switch is on and an instructor exists: only the lowered level removes the change tools
+		self.assertIs(made.kwargs["change_enabled"], True)
+		self.assertEqual(names, BASE_TOOL_NAMES_WITH_INSTRUCTOR)
+		self.assertFalse(set(CHANGE_TOOL_NAMES) & set(names))
+		self.assertEqual(system, self._base_system())
+		self.assertNotIn(CHANGE_TOOLS_BLOCK, system[0]["text"])
+
+	def test_over_budget_edge_spent_equal_to_budget_keeps_change_tools(self):
+		set_agent_settings(monthly_budget_usd=10, spent_this_month_usd=10)
+		names, system = self._call()
+
+		self.assertEqual([name for name in names if name in CHANGE_TOOL_NAMES], CHANGE_TOOL_NAMES)
+		self.assertIn(CHANGE_TOOLS_BLOCK, system[0]["text"])
+
+	def test_prompt_variant_follows_grant_result(self):
+		with patch.object(runner, "ToolContext", wraps=runner.ToolContext) as make_context:
+			names, system = self._call()
+
+		# granted: the three change tools are offered and the prompt carries the change block
+		self.assertEqual(names[: len(BASE_TOOL_NAMES_WITH_INSTRUCTOR)], BASE_TOOL_NAMES_WITH_INSTRUCTOR)
+		self.assertEqual([name for name in names if name in CHANGE_TOOL_NAMES], CHANGE_TOOL_NAMES)
+		self.assertEqual(
+			system,
+			build_reason_system(f"{PREFIX}digest", self.table, change_tools=True, site_admin_tools=True),
+		)
+		self.assertIn(CHANGE_TOOLS_BLOCK, system[0]["text"])
+		made = make_context.call_args
+		self.assertIs(made.kwargs["change_enabled"], True)
+		# the app list reaches the context as stored, blank and repeated lines dropped
+		self.assertEqual(made.kwargs["allowed_apps"], ("frappe", "hrms"))
+
+		# refused, one case per missing condition: no instructor, level L2, switch off
+		for case, settings, instructor in (
+			("L3 without instructor", {}, None),
+			("L2 with the switch on", {"permission_level": "L2"}, "Administrator"),
+			("L3 with the switch off", {"code_change_enabled": 0}, "Administrator"),
+		):
+			with self.subTest(case):
+				set_agent_settings(permission_level="L3", code_change_enabled=1)
+				set_agent_settings(**settings)
+				names, system = self._call(instructor)
+
+				self.assertFalse(set(CHANGE_TOOL_NAMES) & set(names))
+				self.assertNotIn(CHANGE_TOOLS_BLOCK, system[0]["text"])
+				self.assertEqual(system, self._base_system())

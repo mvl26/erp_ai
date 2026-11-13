@@ -1979,7 +1979,8 @@ def _state_field_writes(tree: ast.AST):
 
 
 def check_change_state_fields_written_only_in_changes(sources: dict) -> list:
-	"""ADR-012 QĐ 2 / Ràng buộc: the proposal state group (STATE_FIELDS) is written only under agent/changes/."""
+	"""ADR-012 QĐ 2 / Ràng buộc ("Ghi vào"): the proposal state group (STATE_FIELDS) is written only under
+	agent/changes/; reads are allowed. Design 8.2 words this more broadly; ADR-012's write-only scope is kept."""
 	violations = []
 	for rel, source in only_python(sources).items():
 		if rel.startswith(CHANGES_PREFIX):

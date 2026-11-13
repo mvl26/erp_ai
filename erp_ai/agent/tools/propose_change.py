@@ -177,7 +177,8 @@ def propose_file_change(args: dict, ctx: ToolContext) -> dict:
 		return _fail(reason)
 	if after == before:
 		return _fail(NO_CHANGE)
-	return _insert(ctx, _code_values(guard, before=before, after=after, reason=args["reason"]))
+	result = _insert(ctx, _code_values(guard, before=before, after=after, reason=args["reason"]))
+	return {**result, "branch": guard.git.branch}
 
 
 def propose_new_file(args: dict, ctx: ToolContext) -> dict:

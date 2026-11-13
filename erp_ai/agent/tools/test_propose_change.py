@@ -123,11 +123,15 @@ class TestProposeChange(FrappeTestCase):
 		return rows
 
 	def test_file_change_creates_pending_proposal_and_comment_without_touching_disk(self):
+		# a branch other than the sandbox default, so a hard-coded branch cannot pass
+		self.sandbox.switch_branch(APP, "feature/propose")
 		file_hash, git_before = self.disk_hash(), self.git_snapshot()
 		result = self.change(["x = 1", "y = 1"], ["x = 2", "y = 3"])
 
-		self.assertEqual(set(result), {"ok", "proposal", "status", "comment"}, result)
-		self.assertEqual((result["ok"], result["status"]), (True, "Chờ duyệt"))
+		self.assertEqual(set(result), {"ok", "proposal", "status", "comment", "branch"}, result)
+		self.assertEqual(
+			(result["ok"], result["status"], result["branch"]), (True, "Chờ duyệt", "feature/propose")
+		)
 		after = "x = 2\r\n# Tiếng Việt\r\ny = 3\r\n"
 		frappe.set_user("Administrator")
 		doc = frappe.get_doc(PROPOSAL_DOCTYPE, result["proposal"])
@@ -138,7 +142,7 @@ class TestProposeChange(FrappeTestCase):
 		self.assertEqual((doc.content_before, doc.content_after), (BEFORE, after))
 		self.assertEqual((doc.base_hash, doc.after_hash), (_sha(BEFORE), _sha(after)))
 		self.assertEqual((doc.ticket, doc.run_id, doc.instructor), (self.ticket, "run-propose", BOSS))
-		self.assertEqual((doc.target_branch, doc.upstream_ref, doc.is_core_app), ("main", "", 0))
+		self.assertEqual((doc.target_branch, doc.upstream_ref, doc.is_core_app), ("feature/propose", "", 0))
 		self.assertEqual(doc.reason, "sửa theo yêu cầu")
 		self.assertIn("-x = 1", doc.diff)
 		self.assertIn("+x = 2", doc.diff)
@@ -345,6 +349,7 @@ class TestProposeChange(FrappeTestCase):
 		)
 
 		self.assertTrue(result["ok"], result)
+		self.assertNotIn("branch", result)
 		frappe.set_user("Administrator")
 		doc = frappe.get_doc(PROPOSAL_DOCTYPE, result["proposal"])
 		frappe.set_user(AGENT)

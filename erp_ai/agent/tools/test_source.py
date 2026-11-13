@@ -1479,6 +1479,13 @@ class TestReadGitState(RealCoreReposUntouchedMixin, unittest.TestCase):
 				full_path, new_file, root = make(sandbox)
 				self.assertEqual(self.read(full_path, new_file=new_file, root=root), refused(expected))
 
+	def test_read_git_state_rebase_apply_dir_is_in_progress(self):
+		# The fifth in-progress file (design step 4); the sandbox helper has no `rebase-apply` kind.
+		sandbox = self.make_sandbox()
+		rebase_apply = sandbox.git(APP, "rev-parse", "--git-path", "rebase-apply").strip()
+		os.makedirs(os.path.join(sandbox.repo(APP), rebase_apply))
+		self.assertEqual(self.read(self.full(sandbox)), refused(EXPECTED_GIT_IN_PROGRESS))
+
 	def test_read_git_state_other_dirty_file_does_not_block(self):
 		sandbox = self.make_sandbox()
 		sandbox.commit_file(APP, "custom_app/a.py", "a = 1\n")
@@ -1702,6 +1709,7 @@ class TestReadGitState(RealCoreReposUntouchedMixin, unittest.TestCase):
 			(0, run(None), EXPECTED_GIT_ERROR),
 			(0, run(0, f"{repo}\n".encode()), EXPECTED_GIT_ERROR),
 			(0, run(0, b""), EXPECTED_GIT_ERROR),
+			(0, run(0, f"{repo}\n\n".encode()), EXPECTED_GIT_ERROR),
 			(0, run(128), EXPECTED_GIT_NOT_REPO),
 			(0, run(0, top_other), EXPECTED_GIT_NOT_REPO),
 			(1, run(None, timed_out=True), EXPECTED_GIT_ERROR),

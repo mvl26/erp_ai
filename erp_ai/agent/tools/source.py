@@ -424,7 +424,7 @@ class GitState:
 	ahead_count: int = 0
 
 
-def _git_refused(reason) -> GitState:
+def _git_refused(reason: str) -> GitState:
 	return GitState(refusal=reason, repo_root=None, rel_in_repo=None, branch=None, head=None)
 
 

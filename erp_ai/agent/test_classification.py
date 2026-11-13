@@ -344,6 +344,54 @@ class TestPrompts(FrappeTestCase):
 		self.assertIn(prompts.CORE_PROMPT, text)
 		self.assertFalse(text.endswith("\n\n"))
 
+	def test_reason_system_without_change_tools_is_byte_identical(self):
+		for digest, routing in (
+			("DIGEST-XYZ", "ROUTING-ABC"),
+			("DIGEST-XYZ", ""),
+			("", "ROUTING-ABC"),
+			("", ""),
+		):
+			parts = [prompts.CORE_PROMPT, prompts.CATEGORY_TABLE, routing, prompts.CONVENTIONS, digest]
+			expected = [
+				{
+					"type": "text",
+					"text": "\n\n".join(part for part in parts if part),
+					"cache_control": {"type": "ephemeral"},
+				}
+			]
+			self.assertEqual(prompts.build_reason_system(digest, routing), expected)
+			self.assertEqual(prompts.build_reason_system(digest, routing, change_tools=False), expected)
+			text = expected[0]["text"]
+			self.assertIn("Không sửa file trong apps/", text)
+			self.assertNotIn(prompts.CHANGE_TOOLS_BLOCK, text)
+
+	def test_reason_system_with_change_tools_adds_approval_block(self):
+		block = prompts.CHANGE_TOOLS_BLOCK
+		self.assertTrue(block.startswith("SỬA CODE VÀ LỆNH BENCH — CHỈ ĐỀ XUẤT, NGƯỜI DUYỆT\n\n"))
+		self.assertIn("KHÔNG BAO GIỜ là duyệt", block)
+		self.assertIn("commit git local", block)
+		self.assertIn("không push", block)
+		self.assertNotIn('chờ một chữ "ok"', block)
+		for tool in ("propose_file_change", "propose_new_file", "propose_bench_command"):
+			self.assertIn(tool, block)
+		self.assertTrue(block.endswith("Sửa file .py chỉ có hiệu lực sau khi người chạy bench restart."))
+
+		old = prompts.build_reason_system("", "ROUTING-ABC")[0]["text"]
+		blocks = prompts.build_reason_system("DIGEST-XYZ", "ROUTING-ABC", change_tools=True)
+		self.assertEqual(len(blocks), 1)
+		self.assertEqual(blocks[0]["cache_control"], {"type": "ephemeral"})
+		text = blocks[0]["text"]
+		self.assertEqual(text, "\n\n".join([old, block, "DIGEST-XYZ"]))
+		self.assertTrue(text.startswith(prompts.CORE_PROMPT))
+		self.assertEqual(text[: text.index(block)], old + "\n\n")
+
+		no_digest = prompts.build_reason_system("", "", change_tools=True)[0]["text"]
+		self.assertEqual(
+			no_digest, "\n\n".join([prompts.CORE_PROMPT, prompts.CATEGORY_TABLE, prompts.CONVENTIONS, block])
+		)
+		with self.assertRaises(TypeError):
+			prompts.build_reason_system("DIGEST-XYZ", "ROUTING-ABC", True)
+
 	def _ticket(self, **override):
 		return {
 			"subject": "Lỗi",

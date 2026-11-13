@@ -99,3 +99,15 @@ Compiling translations for hrms
 
 - `bench build` liên kết lại `sites/assets/<app>` cho mọi app ở mỗi lần chạy. Với `PYTHONPATH=$W`, lần build `erp_ai` đầu tiên đã trỏ `sites/assets/erp_ai` vào `$W/erp_ai/public` (thấy trong dòng `Linking …`). Lần `bench build --app hrms` sau đó (không `PYTHONPATH`) trỏ lại về `/home/miyano/frappe-bench/apps/erp_ai/erp_ai/public`; đã kiểm bằng `readlink` sau cùng. Trong khoảng giữa, site dùng chung phục vụ asset `erp_ai` từ worktree này.
 - `bench migrate` chạy cả hook `after_migrate` của các app khác (AssetCore, …); phần lớn thời gian là của chúng, không phải của `erp_ai`.
+
+## T17 — Bước kiểm tay form Desk (chưa làm)
+
+ui false, người kiểm sau G4. Test tự động chỉ đọc chữ của `erp_ai_change_proposal.js` (`test_form_script_static_rules`); form chưa được mở trên trình duyệt. Người kiểm mở `/app/erp-ai-change-proposal/<tên>` và đánh dấu từng dòng:
+
+- [ ] Người có role `ERP AI Instructor`, đề xuất `Chờ duyệt`: thấy `Duyệt` và `Từ chối`, không thấy `Hoàn tác`.
+- [ ] `Đã áp dụng` + `Thay đổi code`: chỉ thấy `Hoàn tác`. `Đã áp dụng` + `Lệnh bench`, và các trạng thái khác: không có nút.
+- [ ] Người không có role đó (kể cả `Administrator` nếu không gán role): không có nút nào.
+- [ ] Bấm nút nào cũng hiện hộp xác nhận trước; bấm "Không" thì không có request. Bấm "Có" thì có 1 request POST, rồi form tải lại và đổi trạng thái.
+- [ ] Hộp xác nhận của `Duyệt` lặp lại câu "Commit sẽ vào nhánh …" và, với app lõi, câu đầu của cảnh báo app lõi.
+- [ ] Dòng giới thiệu đầu form hiện đủ câu của `change_notes`, mỗi câu một dòng; màu cam khi `is_core_app`, xanh khi không. Câu có ký tự `<`, `&` hiện đúng chữ, không thành thẻ HTML.
+- [ ] Server vẫn từ chối khi gọi thẳng method (đã có test tự động ở `TestChangeProposalMethods`; nút chỉ để tiện, AC-5).

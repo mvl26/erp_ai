@@ -29,6 +29,9 @@ Tiến độ: BASE ghi ở đây trước mỗi lần gọi dev.
 - round 6: review T10 approve, T40 approve, T36 approve, T23 request-changes (1 major STD-TEST-2), T8 request-changes (1 major STD-TEST-8) · merge lô 3: T10, T40, T36
 - `cmd.test` lô 3 trên `66ddf58`: `Ran 924 tests in 211.667s` / `OK` → tick T10, T40, T36 (review-10, 40, 36 approve, 1 vòng)
 - round 8: review T41 approve, T23 vòng 2 approve (ADDRESSED), T8 vòng 2 approve (ADDRESSED), T51 request-changes (1 major STD-ERR-2) · merge lô 4: T41, T23, T8
+- `cmd.test` lô 4 trên `2f41590`: `Ran 946 tests in 188.805s` / `OK` → tick T41, T23 (2 vòng), T8 (2 vòng)
+- round 10: review T51 vòng 2 approve (ADDRESSED), T9 request-changes (1 major STD-TEST-2) · merge lô 5: T51
+- round 9: BASE=2f41590 · dev T9 · rework T51 vòng 2 (FIX_BASE=d727371) · `cmd.test` lô 4 chạy nền trên `2f41590` (chuỗi T51 → T37/T12 chặn các task khác nên lượt này chỉ 2 dev)
 - round 7: BASE=66ddf58 · dev T41, T51 · rework T23 vòng 2 (FIX_BASE=992a489) · rework T8 vòng 2 (FIX_BASE=9b2a7fc) · `cmd.test` lô 3 chạy nền trên `66ddf58`
 - round 3: BASE=f0054f5 · dev T3 (có `cmd.migrate`) · rework T7 vòng 2 (FIX_BASE=5604ba9) · rework T35 (bỏ tên/email thật khỏi ghi chú, FIX_BASE=587e780) · review T1 (cb40420..team/FEAT-004-task-1)
 
@@ -162,7 +165,7 @@ FEAT-005 trích `F4-T<n>` (T2–T7, T12, T23, T24, T28–T33): các ID đó KHÔ
   - Returns: `CommitSummary(commit, parents, paths, branch, author_email)` (email tác giả của commit HEAD; [Sửa vòng 2]), `git_head(repo) -> str | None`, `git_commit_summary(repo)` (HEAD so với cha của chính nó bằng diff-tree, không nhận HEAD cũ; [Sửa vòng 2]), `git_blob(repo, rev, rel) -> bytes | None`, `git_is_ancestor(repo, a, b) -> bool | None` (None = lỗi git), `GitState.upstream_ref`/`ahead_count` điền theo ref remote có sẵn ở máy (không `fetch`, không đọc `.git/config`); `branch.<n>.remote` là URL → `upstream_ref = "(remote không tên)"`
   - Expect: `test_upstream_with_url_like_name_is_masked`, `test_ahead_count_and_upstream_ref`, `test_git_blob_none_for_deleted_path`, `test_git_is_ancestor_true_false_none`, `test_commit_summary_parents_paths_branch` (thêm kiểm `author_email` và `paths` tính theo cha của HEAD, kể cả khi trước đó có commit của người)
 
-- [ ] T8 — Bộ chặn: danh tính kho git của `erp_ai` và worktree — files: erp_ai/agent/tools/change_guard.py, erp_ai/agent/tools/test_change_guard.py — test: erp_ai/agent/tools/test_change_guard.py — depends: T7
+- [x] T8 — Bộ chặn: danh tính kho git của `erp_ai` và worktree — files: erp_ai/agent/tools/change_guard.py, erp_ai/agent/tools/test_change_guard.py — test: erp_ai/agent/tools/test_change_guard.py — depends: T7
   - Criterion: AC-4, AC-16 (đường dẫn khử symlink rơi vào repo `erp_ai`, kể cả worktree `apps/erp_ai-wt` hoặc tên khác; `erp_ai` có trong danh sách vẫn bị chặn)
   - Receives: `check_write_path` (T7); helper tạm (T7)
   - Returns: thêm `APP_FORBIDDEN` (`không được sửa app erp_ai hoặc kho git của nó`): đi từ thư mục đích lên `apps/` tìm `.git`; thư mục → `realpath(.git)`; file `gitdir: X` → đọc `X/commondir` nếu có; so với **hợp hai common dir** (repo chứa gói `erp_ai` đang chạy, đi lên từ `os.path.dirname(erp_ai.__file__)`; và `os.path.join(source.get_source_root(), "erp_ai")` của gốc tạm); chỉ đọc file, không `git`/`subprocess`
@@ -304,13 +307,13 @@ FEAT-005 trích `F4-T<n>` (T2–T7, T12, T23, T24, T28–T33): các ID đó KHÔ
   - Returns: `safe_person_name(name) -> str` (loại `@`, `://`, xuống dòng, ký tự điều khiển; ≤ giới hạn 3.9; rỗng/`None` → giá trị thay thế theo 3.9), `apply_message(name, ticket, file_path, approver) -> tuple[str, str]` (subject, body), `undo_message(name, ticket, file_path, apply_commit, undoer)`, `message_text(subject, body)`; bản xem trước chỉ khác ở dòng người duyệt
   - Expect: `test_apply_message_template_and_preview`, `test_safe_person_name` (`@`, `://`, xuống dòng, điều khiển, 200 ký tự, rỗng, `None`), `test_undo_message_has_apply_commit_and_undoer`
 
-- [ ] T41 — `change_text.py`: `proposal_notes` (nhánh, upstream, cảnh báo app lõi) — files: erp_ai/agent/change_text.py, erp_ai/agent/test_change_text.py — test: erp_ai/agent/test_change_text.py — depends: T40
+- [x] T41 — `change_text.py`: `proposal_notes` (nhánh, upstream, cảnh báo app lõi) — files: erp_ai/agent/change_text.py, erp_ai/agent/test_change_text.py — test: erp_ai/agent/test_change_text.py — depends: T40
   - Criterion: AC-21 (tên nhánh; `origin/<n>`, số commit đi trước; cảnh báo app lõi 3 ý; app khác không có; URL 0 lần), AC-22 (văn bản form), NFR-8
   - Receives: câu cảnh báo 3.9 (mọi site trên bench; `bench update` có thể xung đột hoặc, với `--reset`, xóa; đẩy lên fork là việc của người); chuỗi chỉ từ trường đề xuất, không từ git
   - Returns: `proposal_notes(proposal_fields) -> list[str]` (comment và `change_notes` dùng chung); có/không `upstream_ref`; `is_core_app` thêm cảnh báo; thêm câu "Commit áp dụng"/"Commit hoàn tác" theo trạng thái
   - Expect: `test_notes_branch_upstream_and_core_warning` (có/không upstream; app lõi đủ 3 ý; app khác không), `test_notes_never_contain_urls`
 
-- [ ] T23 — Registry: nhóm `change_propose`, 3 đối số cấp, `ToolContext` 2 trường — [F6] — files: erp_ai/agent/tools/registry.py, erp_ai/agent/tools/test_registry.py, erp_ai/agent/test_run_status.py, erp_ai/agent/runner.py, erp_ai/agent/test_agent_runner.py — test: erp_ai/agent/tools/test_registry.py — depends: T2
+- [x] T23 — Registry: nhóm `change_propose`, 3 đối số cấp, `ToolContext` 2 trường — [F6] — files: erp_ai/agent/tools/registry.py, erp_ai/agent/tools/test_registry.py, erp_ai/agent/test_run_status.py, erp_ai/agent/runner.py, erp_ai/agent/test_agent_runner.py — test: erp_ai/agent/tools/test_registry.py — depends: T2
   - Criterion: AC-1 (công tắc tắt: danh sách tên tool như nền FEAT-006, 4 mức × có/không người ra lệnh), AC-2, ADR-011 QĐ 1, 2, 6
   - Receives: `_granted_specs`, `get_tool_schemas`, `ToolContext` (có `routing_config` của FEAT-006 ở cuối), `ToolSpec.group`; bảng cấp design 3.6
   - Returns: `ToolSpec.group` thêm `change_propose`; `ToolContext` thêm `change_enabled: bool = False`, `allowed_apps: tuple[str, ...] = ()` ĐẶT SAU `routing_config`; `_granted_specs(effective_level, has_instructor, change_enabled)` (một dòng mỗi nhóm; `change_propose` = `change_enabled ∧ level == "L3" ∧ has_instructor`); `get_tool_schemas(level, has_instructor, change_enabled)` bắt buộc; `grants_change_tools(...)`; `execute_tool` kiểm lại; sửa mọi lời gọi cũ kể cả lời gọi FEAT-006 thêm: `runner.py` (chỉ dòng `get_tool_schemas`), `test_run_status.py`, `test_agent_runner.py`, `test_registry.py` (truyền `False`); `ToolContext` được dựng bằng đối số tên

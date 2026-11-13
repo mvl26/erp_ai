@@ -1779,7 +1779,12 @@ class TestArchitecture(unittest.TestCase):
 			for node in ast.walk(parse(SOURCE_TOOL_FILE, self.sources[SOURCE_TOOL_FILE]))
 			if isinstance(node, ast.Call) and node.args and is_timeout_wrapped(node.args[0])
 		]
-		self.assertEqual(len(wrapped), 1, "run_git_read must pass its argv inline so the shape rule sees it")
+		self.assertEqual(
+			len(wrapped),
+			1,
+			"run_git_read must pass its argv inline so the shape rule sees it; "
+			"a later task that adds another timeout-wrapped call in source.py updates this count",
+		)
 
 	def test_level_and_send_policy_fields_only_in_policy(self):
 		scanned = only_python(self.sources)

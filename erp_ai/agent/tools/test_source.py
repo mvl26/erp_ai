@@ -1270,6 +1270,44 @@ class TestGitReadOptions(unittest.TestCase):
 							source.GitRun(exit_code=code, stdout=b"", timed_out=False),
 						)
 
+	def test_run_git_read_normal_exit_after_limit_is_not_timed_out(self):
+		repo = os.path.realpath(tempfile.gettempdir())
+		for code in (0, 1, 128):
+			with self.subTest(code=code):
+				done = subprocess.CompletedProcess([], code, stdout=b"late")
+				with patch(RUN_PATH, return_value=done):
+					with patch("erp_ai.agent.tools.source.time.monotonic", side_effect=[100.0, 107.0]):
+						self.assertEqual(
+							source.run_git_read(repo, "status", limit_s=7),
+							source.GitRun(exit_code=code, stdout=b"late", timed_out=False),
+						)
+
+	def test_run_git_read_refuses_output_file_options(self):
+		# ADR-022 QĐ 2: no argument may make a read subcommand write; diff options take
+		# `--output=<file>`, `--output <file>` and unambiguous long-option abbreviations.
+		repo = os.path.realpath(tempfile.gettempdir())
+		with patch(RUN_PATH) as run:
+			for args in (
+				("-p", "--output=/tmp/x", "HEAD"),
+				("-p", "--output", "/tmp/x", "HEAD"),
+				("-p", "--outp=/tmp/x", "HEAD"),
+				("-p", "--ou", "/tmp/x", "HEAD"),
+			):
+				for subcommand in ("diff-tree", "rev-list"):
+					with self.subTest(subcommand=subcommand, args=args):
+						with self.assertRaisesRegex(ValueError, "argument"):
+							source.run_git_read(repo, subcommand, *args)
+		run.assert_not_called()
+
+	def test_run_git_read_keeps_other_options_and_end_of_options(self):
+		repo = os.path.realpath(tempfile.gettempdir())
+		done = subprocess.CompletedProcess([], 0, stdout=b"")
+		for args in (("--oneline", "HEAD"), ("--name-only", "-r", "HEAD", "--"), ("--objects", "HEAD")):
+			with self.subTest(args=args):
+				with patch(RUN_PATH, return_value=done) as run:
+					source.run_git_read(repo, "rev-list", *args)
+				self.assertEqual(run.call_args.args[0][-len(args) :], list(args))
+
 	def test_run_git_read_missing_executable_is_unknown_exit(self):
 		repo = os.path.realpath(tempfile.gettempdir())
 		with patch(RUN_PATH, side_effect=FileNotFoundError("timeout")):

@@ -70,6 +70,8 @@ GIT_HOOKS_DIR = os.path.realpath(
 GIT_BACKSTOP_EXTRA_S = 5
 GIT_DEFAULT_PATH = "/usr/bin:/bin"
 KILLED_EXIT_CODES = (-9, 124, 137)
+# ADR-022 QĐ 2: the diff option that makes diff-tree/rev-list write a file; git accepts unambiguous abbreviations.
+GIT_WRITE_OPTION = "--output"
 
 
 def get_source_root():
@@ -350,6 +352,10 @@ def _check_git_read_call(repo_root, subcommand, args, limit_s) -> None:
 		raise ValueError(f"repo_root must be an existing absolute directory: {repo_root!r}")
 	if not all(isinstance(arg, str) and "\0" not in arg for arg in args):
 		raise ValueError("every git argument must be a string without NUL")
+	for arg in args:
+		name = arg.split("=", 1)[0]
+		if name.startswith(GIT_WRITE_OPTION) or (len(name) > 2 and GIT_WRITE_OPTION.startswith(name)):
+			raise ValueError(f"git argument not allowed, it writes a file: {name!r}")
 	if not isinstance(limit_s, int) or isinstance(limit_s, bool) or not 1 <= limit_s <= GIT_TIMEOUT_S:
 		raise ValueError(f"limit_s must be an integer from 1 to {GIT_TIMEOUT_S}: {limit_s!r}")
 

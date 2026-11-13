@@ -9,6 +9,8 @@ GIT_DIR_NAME = ".git"
 ERP_AI_APP = "erp_ai"
 GITDIR_PREFIX = "gitdir:"
 COMMONDIR_FILE = "commondir"
+# Larger pointer files are not read: git itself rejects them (READ_GITFILE_ERR_TOO_LARGE).
+MAX_POINTER_BYTES = 4096
 
 # Refusal wording of design 3.1 (contract with the model and the tests).
 PATH_INVALID = "đường dẫn không hợp lệ hoặc nằm ngoài apps/"
@@ -31,36 +33,51 @@ def _refused(reason: str) -> GuardResult:
 	return GuardResult(full_path=None, rel_path=None, app=None, reason=reason)
 
 
+def _first_line(path: str) -> str | None:
+	"""First line of a regular file of at most `MAX_POINTER_BYTES`, stripped.
+
+	Anything git would not read as a pointer (not a regular file, e.g. a FIFO or a directory; too
+	large; unreadable; not UTF-8) yields `None`, which the caller treats as "no repo".
+	"""
+	if not os.path.isfile(path) or os.path.getsize(path) > MAX_POINTER_BYTES:
+		return None
+	try:
+		with open(path, encoding="utf-8") as handle:
+			return handle.readline(MAX_POINTER_BYTES).strip()
+	except (OSError, UnicodeDecodeError):
+		return None  # Unreadable pointer: git cannot follow it either, so it leads to no repo.
+
+
 def _git_common_dir(entry: str) -> str | None:
 	"""Return the real git common dir that a `.git` entry leads to, reading files only (no `git`).
 
 	A `.git` directory is its own common dir; a `gitdir: X` file (worktree, submodule) leads to
-	`X/<commondir>` when `X/commondir` exists, else to `X`. A file git itself could not read as a
-	`gitdir:` pointer leads to no repo, so it yields `None`.
+	`X/<commondir>` when `X/commondir` exists, else to `X`. A relative `X` is resolved, as git does,
+	from the folder holding the `.git` entry, not from where a symlinked `.git` points. A file git
+	itself could not read as a `gitdir:` pointer, or a `commondir` that exists but cannot be read,
+	leads to no repo, so it yields `None`.
 	"""
 	real = os.path.realpath(entry)
 	if os.path.isdir(real):
 		return real
-	try:
-		with open(real, encoding="utf-8") as handle:
-			line = handle.readline().strip()
-	except (OSError, UnicodeDecodeError):
+	line = _first_line(real)
+	if line is None or not line.startswith(GITDIR_PREFIX):
 		return None
-	if not line.startswith(GITDIR_PREFIX):
-		return None
-	gitdir = os.path.join(os.path.dirname(real), line[len(GITDIR_PREFIX) :].strip())
-	try:
-		with open(os.path.join(gitdir, COMMONDIR_FILE), encoding="utf-8") as handle:
-			commondir = handle.readline().strip()
-	except FileNotFoundError:
+	gitdir = os.path.join(os.path.dirname(entry), line[len(GITDIR_PREFIX) :].strip())
+	commondir_file = os.path.join(gitdir, COMMONDIR_FILE)
+	if not os.path.lexists(commondir_file):
 		return os.path.realpath(gitdir)
-	except (OSError, UnicodeDecodeError):
+	commondir = _first_line(commondir_file)
+	if commondir is None:
 		return None
 	return os.path.realpath(os.path.join(gitdir, commondir))
 
 
-def _common_dirs_upward(start: str, stop: str | None = None) -> set[str]:
-	"""Common dirs of every `.git` entry from `start` up to `stop` (inclusive), or to `/` without `stop`."""
+def _common_dirs_upward(start: str, stop: str | None = None, *, nearest_only: bool = False) -> set[str]:
+	"""Common dirs of every `.git` entry from `start` up to `stop` (inclusive), or to `/` without `stop`.
+
+	With `nearest_only`, the walk ends at the first `.git` entry found, the repo git itself would use.
+	"""
 	found = set()
 	current = start
 	while True:
@@ -69,6 +86,8 @@ def _common_dirs_upward(start: str, stop: str | None = None) -> set[str]:
 			common = _git_common_dir(entry)
 			if common:
 				found.add(common)
+			if nearest_only:
+				return found
 		parent = os.path.dirname(current)
 		if current == stop or parent == current:
 			return found
@@ -77,7 +96,7 @@ def _common_dirs_upward(start: str, stop: str | None = None) -> set[str]:
 
 def _erp_ai_common_dirs(root: str) -> set[str]:
 	"""Union of the two `erp_ai` identities: the repo holding the running package and `<root>/erp_ai`."""
-	running = _common_dirs_upward(os.path.dirname(os.path.realpath(erp_ai.__file__)))
+	running = _common_dirs_upward(os.path.dirname(os.path.realpath(erp_ai.__file__)), nearest_only=True)
 	temp_app = os.path.join(root, ERP_AI_APP)
 	return running | _common_dirs_upward(temp_app, temp_app)
 

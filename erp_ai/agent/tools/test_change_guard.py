@@ -1,4 +1,6 @@
 import os
+import threading
+from unittest.mock import patch
 
 from frappe.tests.utils import FrappeTestCase
 
@@ -7,6 +9,14 @@ from erp_ai.agent.tools import change_guard, source
 from erp_ai.test_utils import TempAppsRoot
 
 ALLOWED = ("myapp",)
+
+
+def release_fifo_reader(fifo):
+	"""Open the FIFO for writing and close it so a reader blocked on it gets EOF; no reader is fine."""
+	try:
+		os.close(os.open(fifo, os.O_WRONLY | os.O_NONBLOCK))
+	except OSError:
+		pass  # ENXIO: nobody is reading, nothing to release.
 
 
 class TestCheckWritePath(FrappeTestCase):
@@ -198,6 +208,59 @@ class TestCheckWritePath(FrappeTestCase):
 			with self.subTest(rel=rel):
 				self.assertEqual(self.reason(rel, allowed, new_file=new_file), change_guard.APP_FORBIDDEN)
 		self.assertIsNone(self.reason("unrelated/new.py", allowed, new_file=True))
+
+	def test_unreadable_git_pointer_leads_to_no_repo_without_raising(self):
+		self.fake_erp_ai_repo()
+		self.apps.write("junk/.git", "not a pointer\ngitdir: ../erp_ai/.git\n")
+		with open(self.apps.write("binary/.git", ""), "wb") as handle:
+			handle.write(b"gitdir: \xff\xfe../erp_ai/.git\n")
+		admin = os.path.join(self.root, "erp_ai", ".git", "worktrees", "dircommon")
+		os.makedirs(os.path.join(admin, "commondir"))
+		self.apps.write("dircommon/.git", f"gitdir: {admin}\n")
+		padding = " " * change_guard.MAX_POINTER_BYTES
+		self.fake_worktree("huge", "huge", gitdir=padding + os.path.join(self.root, "erp_ai", ".git"))
+		allowed = ("junk", "binary", "dircommon", "huge")
+		for app in allowed:
+			with self.subTest(app=app):
+				self.assertIsNone(change_guard._git_common_dir(os.path.join(self.root, app, ".git")))
+				self.assertIsNone(self.reason(f"{app}/new.py", allowed, new_file=True))
+
+	def test_git_pointer_that_is_not_a_regular_file_does_not_block(self):
+		fifo = os.path.join(self.root, "piped", ".git")
+		os.makedirs(os.path.dirname(fifo))
+		os.mkfifo(fifo)
+		self.addCleanup(release_fifo_reader, fifo)
+		results = []
+		worker = threading.Thread(
+			target=lambda: results.append(change_guard._git_common_dir(fifo)), daemon=True
+		)
+		worker.start()
+		worker.join(5)
+		self.assertFalse(worker.is_alive(), "reading a FIFO .git blocked")
+		self.assertEqual(results, [None])
+
+	def test_relative_gitdir_resolves_from_the_git_entry_not_its_symlink_target(self):
+		self.fake_erp_ai_repo()
+		admin = os.path.join(self.root, "erp_ai", ".git", "worktrees", "linked")
+		self.apps.write(os.path.join(admin, "commondir"), "../..\n")
+		pointer = self.apps.write("holder/sub/pointer", "gitdir: ../erp_ai/.git/worktrees/linked\n")
+		self.apps.write("linked/ok.py", "x = 1\n")
+		os.symlink(pointer, os.path.join(self.root, "linked", ".git"))
+		allowed = ("linked", "holder")
+		self.assertEqual(self.reason("linked/ok.py", allowed), change_guard.APP_FORBIDDEN)
+		self.assertEqual(self.reason("linked/new.py", allowed, new_file=True), change_guard.APP_FORBIDDEN)
+
+	def test_running_package_identity_is_the_nearest_repo_only(self):
+		outer = os.path.join(self.apps.base, "outer")
+		self.apps.write(".git/HEAD", "ref: refs/heads/main\n", root=outer)
+		self.apps.write("inner/.git/HEAD", "ref: refs/heads/main\n", root=outer)
+		package_file = self.apps.write("inner/erp_ai/__init__.py", "", root=outer)
+		os.symlink(os.path.join(outer, ".git"), os.path.join(self.root, "myapp", ".git"))
+		os.symlink(os.path.join(outer, "inner", ".git"), os.path.join(self.root, "otherapp", ".git"))
+		allowed = ("myapp", "otherapp")
+		with patch.object(erp_ai, "__file__", package_file):
+			self.assertEqual(self.reason("otherapp/ok.py", allowed), change_guard.APP_FORBIDDEN)
+			self.assertIsNone(self.reason("myapp/ok.py", allowed))
 
 	def test_refuses_symlink_into_erp_ai_repo(self):
 		self.fake_erp_ai_repo()

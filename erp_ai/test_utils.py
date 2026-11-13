@@ -1,4 +1,7 @@
 import json
+import os
+import shutil
+import tempfile
 from unittest.mock import patch
 
 import frappe
@@ -280,3 +283,44 @@ def make_team(testcase, *, with_rule: bool = False, rule_users: tuple[str, ...] 
 		frappe.db.set_value("HD Team", team.name, "assignment_rule", None, update_modified=False)
 		frappe.delete_doc("Assignment Rule", rule, force=True, ignore_permissions=True)
 	return team.name
+
+
+SOURCE_ROOT_PATH = "erp_ai.agent.tools.source.get_source_root"
+
+
+class TempAppsRoot:
+	"""A temporary `apps/` root that `source.get_source_root` returns for one test; the real `apps/` is never touched.
+
+	Layout under `base` (a fresh `tempfile.mkdtemp()`, removed by `addCleanup`):
+	`apps/<app>/ok.py`, `.env`, `x.pem`, `site_config.json` for every app in `apps`; in the first app
+	`link_out.py` (symlink to `outside/plain.py`) and `dir_out` (symlink to `outside/`); `outside/plain.py`
+	and `sites/site_config.json` sit next to `apps/`, outside the root.
+	"""
+
+	def __init__(self, testcase, apps=("myapp",)):
+		self.base = os.path.realpath(tempfile.mkdtemp())
+		testcase.addCleanup(shutil.rmtree, self.base, True)
+		self.root = os.path.join(self.base, "apps")
+		self.outside = os.path.join(self.base, "outside")
+		os.makedirs(self.root)
+		self.write("plain.py", "x = 1\n", root=self.outside)
+		self.write("site_config.json", "{}\n", root=os.path.join(self.base, "sites"))
+		for app in apps:
+			for name in ("ok.py", ".env", "x.pem", "site_config.json"):
+				self.write(os.path.join(app, name), "x = 1\n")
+		if apps:
+			os.symlink(
+				os.path.join(self.outside, "plain.py"), os.path.join(self.root, apps[0], "link_out.py")
+			)
+			os.symlink(self.outside, os.path.join(self.root, apps[0], "dir_out"))
+		patcher = patch(SOURCE_ROOT_PATH, return_value=self.root)
+		patcher.start()
+		testcase.addCleanup(patcher.stop)
+
+	def write(self, rel, text, root=None) -> str:
+		"""Write `text` to `rel` under `root` (default: the temp `apps/`), creating parents; return the full path."""
+		path = os.path.join(root or self.root, rel)
+		os.makedirs(os.path.dirname(path), exist_ok=True)
+		with open(path, "w", encoding="utf-8") as handle:
+			handle.write(text)
+		return path

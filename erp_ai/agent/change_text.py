@@ -6,7 +6,13 @@ the controller and the apply job.
 
 import unicodedata
 
-from erp_ai.constants import BOT_GIT_NAME
+from erp_ai.constants import (
+	BOT_GIT_NAME,
+	CHANGE_KIND_CODE,
+	CHANGE_KIND_COMMAND,
+	CHANGE_STATUS_APPLIED,
+	CHANGE_STATUS_UNDONE,
+)
 
 APPROVER_PLACEHOLDER = "<người duyệt>"
 ANONYMOUS_PERSON = "(không hiện tên)"
@@ -56,3 +62,55 @@ def undo_message(
 def message_text(subject: str, body: str) -> str:
 	"""Full message as stored in `commit_message`: subject, blank line, body."""
 	return f"{subject}\n\n{body}"
+
+
+def _shown(value) -> str:
+	"""Field value fit for a note: stripped text; "" when empty or carrying a URL (NFR-8)."""
+	text = str(value or "").strip()
+	return "" if "://" in text else text
+
+
+def proposal_notes(proposal_fields) -> list[str]:
+	"""Sentences for the bot comment and the review form (design 3.9).
+
+	`proposal_fields` is the proposal document or a dict of its fields; only those stored
+	fields are read, never git. A sentence whose value is missing or carries a URL is left out.
+	"""
+	notes = []
+	is_code = proposal_fields.get("change_kind") == CHANGE_KIND_CODE
+	app = _shown(proposal_fields.get("app"))
+	branch = _shown(proposal_fields.get("target_branch"))
+	upstream_raw = str(proposal_fields.get("upstream_ref") or "").strip()
+	upstream = _shown(upstream_raw)
+	status = proposal_fields.get("change_status")
+	if is_code and branch:
+		if app:
+			notes.append(f"Commit sẽ vào nhánh {branch} của app {app}.")
+		if upstream:
+			ahead = int(proposal_fields.get("ahead_count") or 0)
+			notes.append(
+				f"Nhánh này theo {upstream} và đang đi trước {ahead} commit"
+				" (tính theo lần fetch cuối trên máy chủ)."
+			)
+		elif not upstream_raw:
+			notes.append("Nhánh này không theo nhánh remote nào.")
+	if proposal_fields.get("is_core_app") and app:
+		notes.append(
+			f"Cảnh báo app lõi: {app} dùng chung cho mọi site trên bench này, nên thay đổi ảnh hưởng"
+			" tất cả các site. bench update không giữ commit local: nó dừng nếu kho có thay đổi chưa"
+			" commit; khi kho sạch, nó kéo bằng git pull (merge) từ remote upstream hoặc remote đầu"
+			" tiên, có thể tạo merge commit hoặc xung đột; bench update --reset xóa vĩnh viễn commit"
+			" chưa đẩy. Đẩy commit lên fork là việc của người, làm trước khi chạy bench update."
+		)
+	if is_code:
+		apply_commit = _shown(proposal_fields.get("apply_commit_sha"))
+		undo_commit = _shown(proposal_fields.get("undo_commit_sha"))
+		if status == CHANGE_STATUS_APPLIED and apply_commit:
+			notes.append(f"Commit áp dụng: {apply_commit}.")
+		elif status == CHANGE_STATUS_UNDONE and undo_commit:
+			notes.append(f"Commit hoàn tác: {undo_commit}.")
+		if str(proposal_fields.get("file_path") or "").endswith(".py"):
+			notes.append("Sau khi áp dụng cần người chạy bench restart.")
+	elif proposal_fields.get("change_kind") == CHANGE_KIND_COMMAND:
+		notes.append("Lệnh bench không hoàn tác được.")
+	return notes

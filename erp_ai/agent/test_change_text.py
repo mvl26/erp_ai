@@ -1,7 +1,13 @@
 from frappe.tests.utils import FrappeTestCase
 
 from erp_ai.agent import change_text
-from erp_ai.agent.change_text import apply_message, message_text, safe_person_name, undo_message
+from erp_ai.agent.change_text import (
+	apply_message,
+	message_text,
+	proposal_notes,
+	safe_person_name,
+	undo_message,
+)
 
 
 class TestChangeText(FrappeTestCase):
@@ -106,3 +112,200 @@ class TestChangeText(FrappeTestCase):
 		for raw, expected in cases:
 			with self.subTest(raw=raw):
 				self.assertEqual(safe_person_name(raw), expected)
+
+
+BRANCH_NOTE = "Commit sẽ vào nhánh develop của app helpdesk."
+UPSTREAM_NOTE = (
+	"Nhánh này theo origin/develop và đang đi trước 2 commit (tính theo lần fetch cuối trên máy chủ)."
+)
+NO_UPSTREAM_NOTE = "Nhánh này không theo nhánh remote nào."
+CORE_WARNING_FRAPPE = (
+	"Cảnh báo app lõi: frappe dùng chung cho mọi site trên bench này, nên thay đổi ảnh hưởng tất cả"
+	" các site. bench update không giữ commit local: nó dừng nếu kho có thay đổi chưa commit; khi kho"
+	" sạch, nó kéo bằng git pull (merge) từ remote upstream hoặc remote đầu tiên, có thể tạo merge"
+	" commit hoặc xung đột; bench update --reset xóa vĩnh viễn commit chưa đẩy. Đẩy commit lên fork là"
+	" việc của người, làm trước khi chạy bench update."
+)
+RESTART_NOTE = "Sau khi áp dụng cần người chạy bench restart."
+COMMAND_NOTE = "Lệnh bench không hoàn tác được."
+APPLY_SHA = "0123456789abcdef0123456789abcdef01234567"
+UNDO_SHA = "fedcba9876543210fedcba9876543210fedcba98"
+TOKEN_URL = "https://x-access-token:ghp_FAKE123@github.com/org/helpdesk.git"
+
+
+def code_fields(**overrides):
+	fields = {
+		"change_kind": "Thay đổi code",
+		"app": "helpdesk",
+		"file_path": "helpdesk/helpdesk/hooks.js",
+		"target_branch": "develop",
+		"upstream_ref": "origin/develop",
+		"ahead_count": 2,
+		"is_core_app": 0,
+		"change_status": "Chờ duyệt",
+		"apply_commit_sha": "",
+		"undo_commit_sha": "",
+	}
+	fields.update(overrides)
+	return fields
+
+
+class TestProposalNotes(FrappeTestCase):
+	def test_notes_branch_upstream_and_core_warning(self):
+		# non-core app tracking a remote: branch + upstream, no core warning
+		self.assertEqual(proposal_notes(code_fields()), [BRANCH_NOTE, UPSTREAM_NOTE])
+		# no upstream: the "no remote" sentence replaces the upstream one
+		self.assertEqual(proposal_notes(code_fields(upstream_ref="")), [BRANCH_NOTE, NO_UPSTREAM_NOTE])
+		self.assertEqual(
+			proposal_notes(code_fields(upstream_ref=None, ahead_count=None)),
+			[BRANCH_NOTE, NO_UPSTREAM_NOTE],
+		)
+		# ahead_count missing while an upstream is set -> 0
+		self.assertEqual(
+			proposal_notes(code_fields(ahead_count=None)),
+			[
+				BRANCH_NOTE,
+				"Nhánh này theo origin/develop và đang đi trước 0 commit"
+				" (tính theo lần fetch cuối trên máy chủ).",
+			],
+		)
+		# core app: the warning with its 3 points comes after the branch sentences
+		notes = proposal_notes(
+			code_fields(
+				app="frappe",
+				file_path="frappe/frappe/hooks.js",
+				target_branch="version-15",
+				upstream_ref="upstream/version-15",
+				ahead_count=1,
+				is_core_app=1,
+			)
+		)
+		self.assertEqual(
+			notes,
+			[
+				"Commit sẽ vào nhánh version-15 của app frappe.",
+				"Nhánh này theo upstream/version-15 và đang đi trước 1 commit"
+				" (tính theo lần fetch cuối trên máy chủ).",
+				CORE_WARNING_FRAPPE,
+			],
+		)
+		self.assertIn("dùng chung cho mọi site trên bench này", notes[2])
+		self.assertIn("bench update --reset xóa vĩnh viễn commit chưa đẩy", notes[2])
+		self.assertIn("Đẩy commit lên fork là việc của người", notes[2])
+		# core warning without an upstream
+		self.assertEqual(
+			proposal_notes(code_fields(app="frappe", upstream_ref="", is_core_app=1)),
+			["Commit sẽ vào nhánh develop của app frappe.", NO_UPSTREAM_NOTE, CORE_WARNING_FRAPPE],
+		)
+		# is_core_app is the only trigger: a core-named app without the flag gets no warning
+		self.assertEqual(
+			proposal_notes(code_fields(app="frappe", is_core_app=0)),
+			["Commit sẽ vào nhánh develop của app frappe.", UPSTREAM_NOTE],
+		)
+
+	def test_notes_skip_branch_sentences_when_branch_unknown(self):
+		self.assertEqual(proposal_notes(code_fields(target_branch="")), [])
+		self.assertEqual(proposal_notes(code_fields(target_branch=None, upstream_ref="")), [])
+
+	def test_notes_commit_sentence_by_status(self):
+		base = [BRANCH_NOTE, UPSTREAM_NOTE]
+		applied = code_fields(change_status="Đã áp dụng", apply_commit_sha=APPLY_SHA)
+		self.assertEqual(proposal_notes(applied), [*base, f"Commit áp dụng: {APPLY_SHA}."])
+		undone = code_fields(
+			change_status="Đã hoàn tác", apply_commit_sha=APPLY_SHA, undo_commit_sha=UNDO_SHA
+		)
+		self.assertEqual(proposal_notes(undone), [*base, f"Commit hoàn tác: {UNDO_SHA}."])
+		# other states add no commit sentence even when both sha are filled
+		for status in ("Chờ duyệt", "Đã duyệt", "Đang áp dụng", "Đang hoàn tác", "Lỗi", "Hết hiệu lực"):
+			with self.subTest(status=status):
+				fields = code_fields(
+					change_status=status, apply_commit_sha=APPLY_SHA, undo_commit_sha=UNDO_SHA
+				)
+				self.assertEqual(proposal_notes(fields), base)
+		# the right state with an empty sha adds nothing
+		self.assertEqual(proposal_notes(code_fields(change_status="Đã áp dụng")), base)
+		self.assertEqual(
+			proposal_notes(code_fields(change_status="Đã hoàn tác", apply_commit_sha=APPLY_SHA)), base
+		)
+
+	def test_notes_python_file_needs_restart(self):
+		self.assertEqual(
+			proposal_notes(code_fields(file_path="helpdesk/helpdesk/api.py")),
+			[BRANCH_NOTE, UPSTREAM_NOTE, RESTART_NOTE],
+		)
+		self.assertEqual(
+			proposal_notes(
+				code_fields(
+					file_path="helpdesk/helpdesk/api.py",
+					change_status="Đã áp dụng",
+					apply_commit_sha=APPLY_SHA,
+				)
+			),
+			[BRANCH_NOTE, UPSTREAM_NOTE, f"Commit áp dụng: {APPLY_SHA}.", RESTART_NOTE],
+		)
+		self.assertEqual(proposal_notes(code_fields(file_path=None)), [BRANCH_NOTE, UPSTREAM_NOTE])
+
+	def test_notes_bench_command_and_unknown_kind(self):
+		command = {
+			"change_kind": "Lệnh bench",
+			"app": "helpdesk",
+			"file_path": "",
+			"target_branch": "",
+			"upstream_ref": "",
+			"ahead_count": 0,
+			"is_core_app": 0,
+			"change_status": "Đã áp dụng",
+			"apply_commit_sha": "",
+			"undo_commit_sha": "",
+		}
+		self.assertEqual(proposal_notes(command), [COMMAND_NOTE])
+		# no git or restart sentence for a command even if those fields were filled
+		self.assertEqual(
+			proposal_notes(
+				{
+					**command,
+					"target_branch": "develop",
+					"file_path": "helpdesk/helpdesk/api.py",
+					"apply_commit_sha": APPLY_SHA,
+				}
+			),
+			[COMMAND_NOTE],
+		)
+		self.assertEqual(proposal_notes(code_fields(change_kind="khác")), [])
+		self.assertEqual(proposal_notes({}), [])
+
+	def test_notes_never_contain_urls(self):
+		# a URL in a shown field drops the sentence that would carry it
+		self.assertEqual(proposal_notes(code_fields(upstream_ref=TOKEN_URL)), [BRANCH_NOTE])
+		self.assertEqual(proposal_notes(code_fields(target_branch=TOKEN_URL)), [])
+		self.assertEqual(proposal_notes(code_fields(app=TOKEN_URL, is_core_app=1)), [UPSTREAM_NOTE])
+		self.assertEqual(
+			proposal_notes(code_fields(change_status="Đã áp dụng", apply_commit_sha=TOKEN_URL)),
+			[BRANCH_NOTE, UPSTREAM_NOTE],
+		)
+		self.assertEqual(
+			proposal_notes(
+				code_fields(
+					change_status="Đã hoàn tác", apply_commit_sha=APPLY_SHA, undo_commit_sha=TOKEN_URL
+				)
+			),
+			[BRANCH_NOTE, UPSTREAM_NOTE],
+		)
+		# every combination keeps "://" and the token out of every sentence
+		for status in ("Chờ duyệt", "Đã áp dụng", "Đã hoàn tác"):
+			for is_core in (0, 1):
+				for upstream in ("origin/develop", "", TOKEN_URL):
+					fields = code_fields(
+						change_status=status,
+						is_core_app=is_core,
+						upstream_ref=upstream,
+						apply_commit_sha=APPLY_SHA,
+						undo_commit_sha=UNDO_SHA,
+					)
+					with self.subTest(status=status, is_core=is_core, upstream=upstream):
+						notes = proposal_notes(fields)
+						self.assertTrue(notes)
+						text = "\n".join(notes)
+						self.assertNotIn("://", text)
+						self.assertNotIn("ghp_FAKE123", text)
+						self.assertNotIn("github.com", text)

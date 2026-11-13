@@ -11,7 +11,8 @@ from helpdesk.test_utils import create_agent, make_ticket
 from erp_ai.agent.tools import registry, route_ticket
 from erp_ai.agent.tools.registry import ToolContext, ToolSpec, execute_tool, get_tool_schemas
 from erp_ai.agent.tools.source import GIT_SUBCOMMANDS
-from erp_ai.constants import ROLE_AGENT
+from erp_ai.constants import PROPOSAL_DOCTYPE, ROLE_AGENT
+from erp_ai.test_utils import GitSandbox
 
 REAL_ALL_SPECS = registry._all_specs
 AGENT_EMAIL = "erpai-test-t27.agent@example.com"
@@ -197,6 +198,15 @@ class TestRegistry(FrappeTestCase):
 			result = execute_tool("do_read", arguments, _context())
 			self.assertEqual(result["reason"], f"tham số không hợp lệ: {key}", arguments)
 
+	def test_execute_rejects_non_object_for_object_rule(self):
+		specs = [_spec("do_read", "read", {"values": {"type": "object"}})]
+		with patch.object(registry, "_all_specs", lambda: specs):
+			for given in (["a"], "a", 1, None):
+				result = execute_tool("do_read", {"values": given}, _context())
+				self.assertEqual(result, {"ok": False, "reason": "tham số không hợp lệ: values"}, given)
+			accepted = execute_tool("do_read", {"values": {"a": 1}}, _context())
+		self.assertTrue(accepted["ok"])
+
 	def test_invalid_reason_cuts_model_supplied_key(self):
 		result = execute_tool("do_read", {"query": "abc", "x" * 5000: 1}, _context())
 		self.assertFalse(result["ok"])
@@ -368,10 +378,31 @@ TICKET_WRITE_TOOL_NAMES = ["set_classification", "set_resolution_hint", "post_co
 TASK_WRITE_TOOL_NAMES = ["create_task"]
 CREATED_NOTE = "<note made by api_create_record>"
 CHANGE_TOOL_NAMES = ["propose_file_change", "propose_new_file", "propose_bench_command"]
-APP_NOT_ALLOWED = "app không có trong danh sách được sửa"
+SANDBOX_APP = "custom_app"
 SITE_ADMIN_TOOL_NAMES = ["api_list_records", "api_get_record", "api_create_record", "api_update_record"]
 FORBIDDEN_WRITE_PARAMETER_WORDS = ("doctype", "field")
 SCHEMA_TYPES = {"string", "integer", "boolean", "array", "object"}
+# Written out by hand, not read from registry.TOOL_MODULES: module -> its tool names, in order.
+TOOLS_BY_MODULE = {
+	"erp_ai.agent.tools.read": ["get_ticket", "list_comments", "search_resolved_tickets", "get_record"],
+	"erp_ai.agent.tools.source": ["search_source", "read_source", "git_source"],
+	"erp_ai.agent.tools.write_ticket": [
+		"set_classification",
+		"set_resolution_hint",
+		"post_comment",
+		"create_task",
+	],
+	"erp_ai.agent.tools.propose_change": ["propose_file_change", "propose_new_file", "propose_bench_command"],
+	"erp_ai.agent.tools.site_api": [
+		"api_list_records",
+		"api_get_record",
+		"api_create_record",
+		"api_update_record",
+		"api_delete_record",
+		"api_submit_record",
+		"api_call_method",
+	],
+}
 
 
 class TestRealToolSet(FrappeTestCase):
@@ -391,6 +422,17 @@ class TestRealToolSet(FrappeTestCase):
 			self.assertEqual(self.names(level, False), granted)
 			self.assertEqual(self.names(level, True), granted + TASK_WRITE_TOOL_NAMES)
 		self.assertEqual(len(registry._all_specs()), 21)
+
+	def test_tool_modules_register_exactly_the_21_tools(self):
+		# Spec Amendment 2, N-3 items 18-19: 11 base + 3 propose + 4 record + 3 full-power tools.
+		self.assertEqual(registry.TOOL_MODULES, tuple(TOOLS_BY_MODULE))
+		self.assertNotIn("erp_ai.agent.tools.route_ticket", registry.TOOL_MODULES)
+		for module_name, names in TOOLS_BY_MODULE.items():
+			module = importlib.import_module(module_name)
+			self.assertEqual([spec.name for spec in module.TOOLS], names, module_name)
+		expected = [name for names in TOOLS_BY_MODULE.values() for name in names]
+		self.assertEqual(len(expected), 21)
+		self.assertEqual([spec.name for spec in registry._all_specs()], expected)
 
 	def test_switch_on_adds_site_admin_tools_only_at_l3_with_instructor(self):
 		base = READ_TOOL_NAMES + SOURCE_TOOL_NAMES + TICKET_WRITE_TOOL_NAMES
@@ -495,6 +537,9 @@ class TestRealToolsRunWithoutCommit(FrappeTestCase):
 		self.assertFalse(frappe.db.exists("HD Ticket Type", SEED_TYPE))
 		frappe.get_doc({"doctype": "HD Ticket Type", "name": SEED_TYPE}).insert()
 		self.ticket = make_ticket(subject="ERPAI-TEST-T27 phiếu", raised_by=AGENT_EMAIL).name
+		# Every source and file tool reads the temp repos only; the file tools may edit SANDBOX_APP.
+		sandbox = GitSandbox(self, apps=("erp_ai", SANDBOX_APP), erp_ai_worktree=None)
+		sandbox.commit_file("erp_ai", "erp_ai/agent/tools/registry.py", "class ToolSpec:\n\tpass\n")
 
 	def arguments(self):
 		return {
@@ -510,12 +555,12 @@ class TestRealToolsRunWithoutCommit(FrappeTestCase):
 			"post_comment": {"content": "ERPAI-TEST-T27 bình luận"},
 			"create_task": {"subject": "ERPAI-TEST-T27 việc", "description": "ERPAI-TEST-T27 mô tả"},
 			"propose_file_change": {
-				"path": "erp_ai/README.md",
-				"find": ["a"],
-				"replace": ["b"],
+				"path": f"{SANDBOX_APP}/README.md",
+				"find": ["# "],
+				"replace": ["## "],
 				"reason": "ERPAI-TEST-T27",
 			},
-			"propose_new_file": {"path": "erp_ai/t27.md", "content": "x", "reason": "ERPAI-TEST-T27"},
+			"propose_new_file": {"path": f"{SANDBOX_APP}/t27.md", "content": "x", "reason": "ERPAI-TEST-T27"},
 			"propose_bench_command": {"command": "version", "reason": "ERPAI-TEST-T27"},
 			"api_list_records": {"doctype": "HD Ticket", "filters": [["name", "=", str(self.ticket)]]},
 			"api_get_record": {"doctype": "HD Ticket", "name": str(self.ticket)},
@@ -539,6 +584,7 @@ class TestRealToolsRunWithoutCommit(FrappeTestCase):
 			category_mapping={"A": {"ticket_type": SEED_TYPE}},
 			agent_user=AGENT_EMAIL,
 			change_enabled=True,
+			allowed_apps=(SANDBOX_APP,),
 			unrestricted=True,
 		)
 		arguments = self.arguments()
@@ -553,9 +599,6 @@ class TestRealToolsRunWithoutCommit(FrappeTestCase):
 			results[spec.name] = execute_tool(spec.name, call_arguments, context)
 		# The note is deleted before the submit call, so that handler ends at its own "missing record" refusal.
 		self.assertEqual(results.pop("api_submit_record")["reason"], "không tìm thấy bản ghi")
-		# No app is on the allowed list of this context: the two file tools end at the guard's refusal.
-		for name in ("propose_file_change", "propose_new_file"):
-			self.assertEqual(results.pop(name)["reason"], APP_NOT_ALLOWED)
 		for name, result in results.items():
 			# ok means the handler ran to its end: not a schema refusal, not "not granted", not a handler refusal.
 			self.assertTrue(result["ok"], f"{name}: {result}")
@@ -570,3 +613,5 @@ class TestRealToolsRunWithoutCommit(FrappeTestCase):
 		self.assertTrue(frappe.db.exists("Task", {"subject": "ERPAI-TEST-T27 việc"}))
 		self.assertFalse(frappe.db.exists("Note", {"title": "ERPAI-TEST-T27 ghi chú"}))
 		self.assertEqual(ticket.subject, "ERPAI-TEST-T27 phiếu đã sửa")
+		for name in ("propose_file_change", "propose_new_file"):
+			self.assertTrue(frappe.db.exists(PROPOSAL_DOCTYPE, results[name]["proposal"]), name)

@@ -218,6 +218,15 @@ class TestTransitionsBasics(FrappeTestCase):
 				self.assertRegex(digest, r"^[0-9a-f]{64}$")
 				self.assertEqual(digest, _hand_digest(doc))
 
+	def test_content_digest_pins_the_order_of_the_three_int_fields(self):
+		# Distinct values in is_new_file, ahead_count and is_core_app: swapping any two names in
+		# DIGEST_FIELDS changes the digest, so a stored approved_digest cannot silently drift.
+		doc = frappe.get_doc(
+			PROPOSAL_DOCTYPE, make_change_proposal(is_new_file=1, ahead_count=2, is_core_app=0).name
+		)
+		self.assertEqual(len({doc.is_new_file, doc.ahead_count, doc.is_core_app}), 3)
+		self.assertEqual(transitions.content_digest(doc), _hand_digest(doc))
+
 	def test_content_digest_keeps_non_ascii_unescaped(self):
 		doc = frappe.get_doc(PROPOSAL_DOCTYPE, make_change_proposal(content_after="x = 'Đã duyệt'\n").name)
 		values = [doc.get(name) for name, _value in DIGEST_FIELD_NEW_VALUES]

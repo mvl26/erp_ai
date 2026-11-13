@@ -31,6 +31,9 @@ Tiến độ: BASE ghi ở đây trước mỗi lần gọi dev.
 - round 8: review T41 approve, T23 vòng 2 approve (ADDRESSED), T8 vòng 2 approve (ADDRESSED), T51 request-changes (1 major STD-ERR-2) · merge lô 4: T41, T23, T8
 - `cmd.test` lô 4 trên `2f41590`: `Ran 946 tests in 188.805s` / `OK` → tick T41, T23 (2 vòng), T8 (2 vòng)
 - round 10: review T51 vòng 2 approve (ADDRESSED), T9 request-changes (1 major STD-TEST-2) · merge lô 5: T51
+- `cmd.test` lô 5 trên `7f4f5c9`: `Ran 964 tests in 194.157s` / `OK` → tick T51 (2 vòng)
+- round 12: review T12 approve, T9 vòng 2 approve (ADDRESSED), T37 request-changes (1 major STD-TEST-8) · merge lô 6: T12, T9
+- round 11: BASE=7f4f5c9 · dev T37, T12 (có `cmd.migrate`, DocType mới) · rework T9 vòng 2 (FIX_BASE=039d14a) · `cmd.test` lô 5 chạy nền trên `7f4f5c9`
 - round 9: BASE=2f41590 · dev T9 · rework T51 vòng 2 (FIX_BASE=d727371) · `cmd.test` lô 4 chạy nền trên `2f41590` (chuỗi T51 → T37/T12 chặn các task khác nên lượt này chỉ 2 dev)
 - round 7: BASE=66ddf58 · dev T41, T51 · rework T23 vòng 2 (FIX_BASE=992a489) · rework T8 vòng 2 (FIX_BASE=9b2a7fc) · `cmd.test` lô 3 chạy nền trên `66ddf58`
 - round 3: BASE=f0054f5 · dev T3 (có `cmd.migrate`) · rework T7 vòng 2 (FIX_BASE=5604ba9) · rework T35 (bỏ tên/email thật khỏi ghi chú, FIX_BASE=587e780) · review T1 (cb40420..team/FEAT-004-task-1)
@@ -141,7 +144,7 @@ FEAT-005 trích `F4-T<n>` (T2–T7, T12, T23, T24, T28–T33): các ID đó KHÔ
   - Returns: `GitSandbox(testcase, apps=("frappe","erpnext","helpdesk","hrms","erp_ai","custom_app"), *, erp_ai_worktree="erp_ai-wt")` với `root`, `repo(app)`, `commit_file(app, rel, content) -> sha`, `stage`, `write_unstaged`, `refs(app)`, `log_meta(app, rev="HEAD")`; mỗi repo có commit đầu và nhánh `main`; lệnh git của helper dùng `GIT_CONFIG_GLOBAL=/dev/null`, `GIT_CONFIG_NOSYSTEM=1`, danh tính test cố định; thư mục tạm dưới `tempfile.mkdtemp()`, `addCleanup` xóa; `patch` `source.get_source_root` trong `setUp`; repo `erp_ai-wt` là worktree thật (`.git` là file + `commondir`). Các hàm còn lại của design 8.5 do T51
   - Expect: `test_source.py::test_git_sandbox_redirects_apps_root` (`get_source_root()` = `root` trong sandbox, ngoài sandbox là gốc thật), `test_git_sandbox_repos_are_isolated_from_global_config` (HOME giả có `.gitconfig` email thật: không lọt vào `log_meta`)
 
-- [ ] T51 — `GitSandbox` phần trạng thái: remote, nhánh, khóa, hook + mixin repo lõi thật — [F6: test_utils.py] — files: erp_ai/test_utils.py, erp_ai/agent/tools/test_source.py — test: erp_ai/agent/tools/test_source.py — depends: T36
+- [x] T51 — `GitSandbox` phần trạng thái: remote, nhánh, khóa, hook + mixin repo lõi thật — [F6: test_utils.py] — files: erp_ai/test_utils.py, erp_ai/agent/tools/test_source.py — test: erp_ai/agent/tools/test_source.py — depends: T36
   - Criterion: NFR-9, AC-18 (tạo từng điều kiện git), AC-19 (hook đánh dấu), AC-21 (remote URL token giả); ADR-022 QĐ 8
   - Receives: `GitSandbox` lõi (T36); design 8.5
   - Returns: `add_remote(app, name="origin", url="https://x-token-FAKE@host/r.git", ahead=2)` (remote là repo bare tạm; URL giả chỉ lưu trong `.git/config` tạm), `switch_branch(app, branch, *, create=True)`, `detach(app)`, `mark_in_progress(app, kind)` (`MERGE_HEAD`, `rebase-merge`, `CHERRY_PICK_HEAD`, `REVERT_HEAD`), `hold_index_lock(app)`, `install_marker_hooks(app) -> thư mục tệp đánh dấu` (hook `pre-commit` từ chối, `prepare-commit-msg`, `commit-msg`, `post-commit`, `post-index-change`, `reference-transaction` ghi tệp đánh dấu); `RealCoreReposUntouchedMixin` (`setUpClass` chụp `git -C <bench>/apps/<app> --no-optional-locks rev-parse HEAD` và `status --porcelain` của `frappe`, `erpnext`, `helpdesk`, `hrms`; `tearDownClass` so; chỉ đọc)

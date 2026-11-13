@@ -185,9 +185,10 @@ def _has_authority(user) -> bool:
 def _recheck(proposal, action: str) -> tuple[str, ...]:
 	"""Design 4.3 step 4.2, in table order: the first failing row ends the job as `Lỗi` with its reason.
 
-	Undo (design 4.4 step 2) checks the same rows against `undo_by` and skips the switch (G-1); its guard
-	allows the proposal's own app, so undo stays possible after the app left the list. Returns the apps
-	the guard allowed.
+	Undo (design 4.4 step 2) runs only the runner, role, digest and guard rows against `undo_by`: not the
+	switch (G-1), not the stored-hash and commit-message preview rows (apply-only). Its guard allows the
+	proposal's own app, so undo stays possible after the app left the list. Returns the apps the guard
+	allowed.
 	"""
 	runner = proposal.decided_by if action == ACTION_APPLY else proposal.undo_by
 	if frappe.session.user != runner:
@@ -215,7 +216,7 @@ def _recheck(proposal, action: str) -> tuple[str, ...]:
 		refusal = change_guard.check_bench_args(args, settings.allowed_apps, frappe.local.site)
 	if refusal:
 		raise _Stop(CHANGE_STATUS_FAILED, refusal)
-	if proposal.change_kind == CHANGE_KIND_CODE:
+	if action == ACTION_APPLY and proposal.change_kind == CHANGE_KIND_CODE:
 		content_after = (proposal.content_after or "").encode("utf-8")
 		if hashlib.sha256(content_after).hexdigest() != proposal.after_hash:
 			raise _Stop(CHANGE_STATUS_FAILED, STORED_HASH_MISMATCH)

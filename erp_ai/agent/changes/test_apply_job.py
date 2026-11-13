@@ -11,10 +11,10 @@ from frappe.tests.utils import FrappeTestCase
 from frappe.utils.synchronization import filelock
 from helpdesk.test_utils import create_agent
 
-from erp_ai.agent import policy
+from erp_ai.agent import change_text, policy
 from erp_ai.agent.changes import apply_job, file_writer, process_runner, transitions
 from erp_ai.agent.changes.process_runner import CommandResult
-from erp_ai.agent.tools import source
+from erp_ai.agent.tools import change_guard, source
 from erp_ai.constants import (
 	BOT_GIT_EMAIL,
 	CHANGE_KIND_CODE,
@@ -1601,7 +1601,10 @@ class TestUndoCode(ApplyJobTestCase):
 				count = self.commit_count()
 				patcher = change()
 
-				with patch.object(file_writer, "write_atomic", wraps=file_writer.write_atomic) as writes:
+				with (
+					patch.object(file_writer, "write_atomic", wraps=file_writer.write_atomic) as writes,
+					patch.object(apply_job, "_undo_code", wraps=apply_job._undo_code) as undo_steps,
+				):
 					apply_job.run_change(name, "undo")
 
 				if patcher:
@@ -1611,6 +1614,8 @@ class TestUndoCode(ApplyJobTestCase):
 				self.assertEqual(self.read(), AFTER)
 				self.assertEqual((self.head(), self.commit_count()), (apply_commit, count))
 				writes.assert_not_called()
+				# The step 2 recheck refuses, not the guard of steps 3 to 7 that repeats it.
+				undo_steps.assert_not_called()
 				self.assertEqual(self.steps(name), ["approve", "apply", "fail"])
 
 	def test_undo_checks_the_undoer_not_the_approver(self):
@@ -1624,6 +1629,49 @@ class TestUndoCode(ApplyJobTestCase):
 
 		state = self.state(name)
 		self.assertEqual((state.change_status, state.failure_reason), (CHANGE_STATUS_UNDONE, None))
+
+	def test_undo_does_not_rebuild_the_commit_message_preview(self):
+		# Design 4.4 step 2 has no preview row: the undo commit uses `undo_message`, so a later change of
+		# `apply_message` must not block it. The stored `commit_message` (a digest field) stays as approved.
+		name, _ = self.undo_requested()
+
+		with patch.object(change_text, "apply_message", return_value=("tiêu đề khác", "nội dung khác")):
+			apply_job.run_change(name, "undo")
+
+		state = self.state(name)
+		self.assertEqual((state.change_status, state.failure_reason), (CHANGE_STATUS_UNDONE, None))
+		self.assert_target_undone("changed file")
+
+	def test_undo_does_not_recheck_the_stored_content_after_hash(self):
+		# Design 4.4 step 2 has no `sha256(content_after) == after_hash` row; step 3 checks the file on disk.
+		# The digest is rebuilt so only that apply-only row would refuse.
+		name, _ = self.undo_requested()
+		doc = frappe.get_doc(PROPOSAL_DOCTYPE, name)
+		doc.content_after = "y = 0\n"
+		frappe.db.set_value(
+			PROPOSAL_DOCTYPE,
+			name,
+			{"content_after": doc.content_after, "approved_digest": transitions.content_digest(doc)},
+			update_modified=False,
+		)
+
+		apply_job.run_change(name, "undo")
+
+		state = self.state(name)
+		self.assertEqual((state.change_status, state.failure_reason), (CHANGE_STATUS_UNDONE, None))
+		self.assert_target_undone("changed file")
+
+	def test_undo_guard_allows_only_the_proposal_app(self):
+		name, _ = self.undo_requested()
+		set_agent_settings(code_change_enabled=0, code_change_apps="")
+
+		with patch.object(change_guard, "check_write_path", wraps=change_guard.check_write_path) as guard:
+			apply_job.run_change(name, "undo")
+
+		self.assertEqual(self.state(name).change_status, CHANGE_STATUS_UNDONE)
+		self.assertTrue(guard.call_args_list)
+		for call in guard.call_args_list:
+			self.assertEqual(call.args[1], (APP,))
 
 	def assert_undo_commit_kept_and_failed(self, name, kind, apply_commit, branch="main"):
 		state = self.state(name)

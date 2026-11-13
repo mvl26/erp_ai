@@ -36,6 +36,15 @@ Lớp 1: AC-18 và D-20 làm đúng thứ tự design 3.2 bước 1–6; bước
 
 minor | — | — | 3 điểm nhỏ: `_git_refused(reason)` ở source.py:428 thiếu type hint; không có ca cho đầu ra top-level `"{repo}\n\n"` (vế `not all(lines)`, source.py:481); regex nhận HEAD 64 hex trong khi design ghi 40 | tùy dev
 
+## Vòng 2 — approve (re-review theo phạm vi, `git diff 18b5cff..team/FEAT-004-task-38`, commit `2c5a3c8`, 2 file, +9/-1)
+- Verdict cuối: approve, 2 vòng (max_rework=3)
+- Phát hiện 1 (major STD-TEST-8 `rebase-apply`): ADDRESSED (`test_source.py:1482-1487` `test_read_git_state_rebase_apply_dir_is_in_progress`; đổi lát cắt thành `existing[1:5]` hoặc bỏ phần tử tuple đều làm test đỏ)
+- Design-defect clean filter: ADDRESSED bằng phán quyết của architect (`arch-ruling-clean-filter.md`: chấp nhận, T38 không đổi; luật 3 cờ thuộc T39); diff không đụng lời gọi `status`/`check-ignore`
+- Chữ pathspec của design 3.2 bước 5–6: NOT ADDRESSED trong design.md, đã có `design-addendum-2.md` QĐ-A1 ghi đúng hai dạng mã đang dùng
+- Minor vòng 1: thêm type hint `_git_refused(reason: str)`; thêm ca `"{repo}\n\n"`; regex HEAD 64 hex giữ nguyên
+- Phát hiện mới: không có blocker/major; minor: test mới không kiểm đường dẫn `rebase-apply` là tương đối
+- Bằng chứng dev vòng 2: RED (lát cắt `existing[1:5]`) `FAIL: test_read_git_state_rebase_apply_dir_is_in_progress ... AssertionError: GitState(refusal=None, ...) != GitState(refusal='kho git đang dở merge, rebase, cherry-pi[101 chars]nt=0)`; GREEN test_source `Ran 89 tests in 4.985s` / `OK`, test_architecture `Ran 98 tests in 1.432s` / `OK`
+
 ## Review checklist (10)
 Đã phủ 10/10; ngoài major trên và design-defect, phần còn lại đạt: 13 subTest đúng thứ tự design; 8 ca thứ tự kiểm có hai lý do cùng lúc; mọi nhánh mã thoát, quá giờ, đầu ra không đọc được có ca kèm số lần gọi; đầu vào được kiểm trước mọi lệnh git; không skip.
 

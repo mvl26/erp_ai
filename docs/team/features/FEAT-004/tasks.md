@@ -74,7 +74,10 @@ Tiến độ: BASE ghi ở đây trước mỗi lần gọi dev.
 - round 33: review T5 → design-defect (vòng import) + 1 major STD-DESIGN-5 · review T14 request-changes (1 major STD-TEST-2: khóa `for_update` không được ghim)
 - round 34: rework T14 vòng 2 (FIX_BASE=2a4ad58 → `bdd79e1`) · rework T5 vòng 2 (FIX_BASE=944b250 → `d62f6ec`; chỉ sửa STD-DESIGN-5, đo vòng import: `ImportError` có thật)
 - round 35: review T14 vòng 2 approve (ADDRESSED) · review T5 vòng 2: STD-DESIGN-5 ADDRESSED, design-defect còn mở → T5 ĐỖ · merge T14 `4ac0c57`
-- round 36: BASE=(commit ngay sau `4ac0c57`) · dev T16 · `cmd.test` chạy nền
+- round 36: BASE=0aaf3fb · dev T16 (`team/FEAT-004-task-16` @ `66a0bab`) · `cmd.test` chạy nền
+- `cmd.test` trên `0aaf3fb`: `Ran 1092 tests in 402.599s` / `OK` → tick T14 (review-14 approve, 2 vòng)
+- round 37: review T16 (0aaf3fb..`66a0bab`) approve, 1 vòng · merge T16 `aec5e5c`
+- round 38: BASE=(commit ngay sau `aec5e5c`) · dev T49 · `cmd.test` chạy nền
 
 ## Bảng đổi ID cũ → mới (plan lần 1, 34 task → lần này 51 task)
 FEAT-005 trích `F4-T<n>` (T2–T7, T12, T23, T24, T28–T33): các ID đó KHÔNG đổi nghĩa lớn; ID cũ T1–T34 giữ nguyên, task mới nhận T35–T51 và nằm xen đúng chỗ trong file.
@@ -257,7 +260,7 @@ FEAT-005 trích `F4-T<n>` (T2–T7, T12, T23, T24, T28–T33): các ID đó KHÔ
   - Returns: `InvalidTransition(frappe.ValidationError)`; `STATE_FIELDS` (11 tên của bảng trạng thái design 2.1, tức 9 dòng vì `decided_by/decided_at` và `undo_by/undo_at` chung dòng; tổng 15 tên; sửa đếm 2026-11-13 theo review-13; + **[Sửa vòng 1]** `applied_branch`, `applied_ahead_count`, `apply_commit_sha`, `undo_commit_sha`); `prepare_new(doc)` đặt `Chờ duyệt`, xóa mọi trường trạng thái; `content_digest(doc)` = sha256 JSON 14 trường theo design 2.3 (9 cũ + `target_branch`, `upstream_ref`, `ahead_count`, `is_core_app`, `commit_message`, `ensure_ascii=False`); `log_step(proposal, step, actor, *, error=None, before=None, after=None) -> str`; controller `before_insert` gọi `prepare_new`; `LAYER_RULES` thêm dòng cho `erp_ai.agent.changes` (cấm `gateway`, `agent.runner`, `agent.run_status`, `eval`, `handlers`, `tasks`, `install`, `erp_ai_agent`) và `erp_ai.agent.tools` cấm import `changes`; sửa luật hiện có nếu việc `changes` gọi `write_entry` làm nó đỏ, theo ADR-012
   - Expect: `test_prepare_new_forces_pending_and_clears_state_fields` (gồm 4 trường git), `test_content_digest_changes_with_any_field` (mỗi trong 14 trường), `test_log_step_writes_one_change_row`; `test_insert_with_non_pending_status_is_forced_pending`; `test_architecture::test_layer_imports` xanh
 
-- [ ] T14 — `transitions`: duyệt, từ chối, xin hoàn tác, bắt đầu áp dụng, `finish` — files: erp_ai/agent/changes/transitions.py, erp_ai/agent/changes/test_transitions.py — test: erp_ai/agent/changes/test_transitions.py — depends: T13
+- [x] T14 — `transitions`: duyệt, từ chối, xin hoàn tác, bắt đầu áp dụng, `finish` — files: erp_ai/agent/changes/transitions.py, erp_ai/agent/changes/test_transitions.py — test: erp_ai/agent/changes/test_transitions.py — depends: T13
   - Criterion: AC-5, AC-6 (duyệt hai lần/ job lặp không đổi gì), AC-12, NFR-2, NFR-6; ADR-012 QĐ 3, 7; D-2
   - Receives: `prepare_new`, `content_digest`, `log_step` (T13); máy trạng thái design 2.2
   - Returns: `approve(name, user) -> str`, `reject`, `request_undo(name, user)` (chỉ `Thay đổi code` ở `Đã áp dụng`; ghi `undo_by`, `undo_at`), `begin_apply(name) -> bool`, `finish(name, expected, new_status, *, step, actor, reason=None, result=None, fields=None) -> bool` (**[Sửa vòng 1]** `fields` là dict con của 4 trường git; khóa khác → `ValueError`); mỗi phép chuyển: `get_value(..., for_update=True)` rồi so trạng thái rồi `set_value`; sai trạng thái → `InvalidTransition` (method) hoặc `False` (job); câu lỗi từ 3.3; `approve` ghi `decided_by`, `decided_at`, `approved_digest`

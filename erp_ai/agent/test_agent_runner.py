@@ -875,7 +875,7 @@ class TestRunnerReasoning(RunnerTestBase):
 		self.assertNotIn("create_task", names)
 		self.assertEqual(call["tools"][-1]["cache_control"], {"type": "ephemeral"})
 		self.assertTrue(all("cache_control" not in tool for tool in call["tools"][:-1]))
-		self.assertTrue(all("cache_control" not in tool for tool in get_tool_schemas("L1", False)))
+		self.assertTrue(all("cache_control" not in tool for tool in get_tool_schemas("L1", False, False)))
 
 	def test_reason_system_shows_configured_people(self):
 		user, prefix_user, head = (make_active_agent(self) for _ in range(3))

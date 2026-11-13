@@ -42,7 +42,7 @@ class TestRunStatus(FrappeTestCase):
 		return status
 
 	def test_every_granted_tool_and_classify_step_has_label(self):
-		granted = {schema["name"] for schema in get_tool_schemas(LEVELS[-1], True)}
+		granted = {schema["name"] for schema in get_tool_schemas(LEVELS[-1], True, False)}
 
 		self.assertEqual(CLASSIFY_STEP, "classify")
 		self.assertEqual(set(WORK_LABELS), granted | {CLASSIFY_STEP})

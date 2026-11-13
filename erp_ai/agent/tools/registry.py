@@ -18,12 +18,14 @@ class ToolContext:
 	category_mapping: dict
 	agent_user: str
 	routing_config: dict | None = None
+	change_enabled: bool = False
+	allowed_apps: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
 class ToolSpec:
 	name: str
-	group: Literal["read", "ticket_write", "task_write"]
+	group: Literal["read", "ticket_write", "task_write", "change_propose"]
 	schema: dict
 	handler: Callable[[dict, ToolContext], dict]
 
@@ -35,7 +37,18 @@ TOOL_MODULES = (
 )
 SAVEPOINT = "erp_ai_tool"
 KEY_REASON_MAX = 100  # model-supplied argument names are cut so reason stays short
-GROUPS_BY_LEVEL = ("read", "ticket_write")
+CHANGE_GROUP = "change_propose"
+# ADR-011 QĐ 2, 6: the only grant table, one row per group, checked above L0:
+# group -> condition on (effective_level, has_instructor, change_enabled).
+GRANT_TABLE = (
+	("read", lambda level, has_instructor, change_enabled: True),
+	("ticket_write", lambda level, has_instructor, change_enabled: True),
+	("task_write", lambda level, has_instructor, change_enabled: has_instructor),
+	(
+		CHANGE_GROUP,
+		lambda level, has_instructor, change_enabled: change_enabled and level == "L3" and has_instructor,
+	),
+)
 
 
 def _all_specs() -> list[ToolSpec]:
@@ -46,15 +59,25 @@ def _all_specs() -> list[ToolSpec]:
 	return specs
 
 
-def _granted_specs(effective_level: str, has_instructor: bool) -> list[ToolSpec]:
+def _granted_specs(effective_level: str, has_instructor: bool, change_enabled: bool) -> list[ToolSpec]:
 	if effective_level not in LEVELS or effective_level == LEVELS[0]:
 		return []
-	groups = GROUPS_BY_LEVEL + (("task_write",) if has_instructor else ())
+	groups = {
+		group
+		for group, condition in GRANT_TABLE
+		if condition(effective_level, has_instructor, change_enabled)
+	}
 	return [spec for spec in _all_specs() if spec.group in groups]
 
 
-def get_tool_schemas(effective_level: str, has_instructor: bool) -> list[dict]:
-	return [copy.deepcopy(spec.schema) for spec in _granted_specs(effective_level, has_instructor)]
+def get_tool_schemas(effective_level: str, has_instructor: bool, change_enabled: bool) -> list[dict]:
+	granted = _granted_specs(effective_level, has_instructor, change_enabled)
+	return [copy.deepcopy(spec.schema) for spec in granted]
+
+
+def grants_change_tools(effective_level: str, has_instructor: bool, change_enabled: bool) -> bool:
+	granted = _granted_specs(effective_level, has_instructor, change_enabled)
+	return any(spec.group == CHANGE_GROUP for spec in granted)
 
 
 def _invalid(key) -> dict:
@@ -108,7 +131,7 @@ def _first_invalid_key(arguments, input_schema: dict) -> str | None:
 
 
 def execute_tool(name: str, arguments: dict, context: ToolContext) -> dict:
-	granted = _granted_specs(context.effective_level, bool(context.instructor))
+	granted = _granted_specs(context.effective_level, bool(context.instructor), context.change_enabled)
 	spec = next((s for s in granted if s.name == name), None)
 	if spec is None:
 		return {"ok": False, "reason": "tool không được cấp ở mức/thẩm quyền hiện tại"}

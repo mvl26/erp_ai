@@ -975,6 +975,40 @@ class TestCommitFailure(ApplyJobTestCase):
 				# NFR-8: the person's author e-mail never reaches the log rows or the proposal.
 				self.assert_no_human_email_stored(name)
 
+	def test_commit_failed_on_top_of_an_earlier_bot_commit_restores(self):
+		# D-17: HEAD unchanged gives the file back even when HEAD is the bot's own commit of an earlier apply.
+		for kind in ("changed file", "new file"):
+			with self.subTest(kind):
+				self.fresh_repo()
+				earlier = self.approved(
+					self.code_proposal(
+						file_path=f"{APP}/pkg/earlier_mod.py",
+						is_new_file=1,
+						content_before="",
+						base_hash="",
+						after_hash=_sha(AFTER),
+					)
+				)
+				apply_job.run_change(earlier, "apply")
+				start = self.head()
+				self.assertEqual(self.author_email(), BOT_GIT_EMAIL)
+				self.assertEqual(self.stored(earlier).apply_commit_sha, start)
+				name = self.proposal_for(kind)
+
+				with patch.object(process_runner, "git_commit_only", return_value=self.failed()):
+					apply_job.run_change(name, "apply")
+
+				state = self.stored(name)
+				self.assertEqual(
+					(state.change_status, state.failure_reason),
+					(CHANGE_STATUS_FAILED, "commit git lỗi, đã trả file về như trước: fatal: lỗi giả"),
+				)
+				self.assert_target_given_back(kind)
+				self.assertEqual(self.head(), start)
+				self.assertEqual(self.worktree_changes(), "")
+				self.assertFalse(state.apply_commit_sha)
+				self.assertEqual(self.steps(name), ["approve", "fail"])
+
 	def test_apply_accepted_when_bot_commit_lands_after_human_commit(self):
 		real_commit = process_runner.git_commit_only
 		for kind in ("changed file", "new file"):

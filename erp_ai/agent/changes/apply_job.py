@@ -16,6 +16,7 @@ from erp_ai.agent.authority import NEVER_AUTHORITY
 from erp_ai.agent.changes import file_writer, process_runner, transitions
 from erp_ai.agent.tools import change_guard, source
 from erp_ai.constants import (
+	BOT_GIT_EMAIL,
 	CHANGE_KIND_CODE,
 	CHANGE_STATUS_APPLIED,
 	CHANGE_STATUS_APPLYING,
@@ -47,11 +48,14 @@ STORED_HASH_MISMATCH = "nội dung lưu không khớp dấu"
 TARGET_CHANGED = "file đích đã đổi kể từ lúc đề xuất"
 FILE_CHANGED_AFTER_APPLY = "file đã đổi sau khi áp dụng, không hoàn tác tự động được"
 WRITE_MISMATCH = "đọc lại sau khi ghi không khớp"
-COMMIT_FAILED = "git commit lỗi, file đã được trả lại như cũ"
-COMMIT_TIMED_OUT = "git commit quá giờ, file đã được trả lại như cũ"
 COMMIT_UNEXPECTED = "commit vừa tạo không đúng một file của đề xuất"
 # Design table 3.2 (exact wording).
+GIT_COMMIT_FAILED = "commit git lỗi, đã trả file về như trước"
+GIT_COMMIT_TIMED_OUT_SUFFIX = " (quá thời gian)"
+GIT_RESTORE_FAILED = "commit git lỗi và không trả lại được trạng thái kho, cần người kiểm"
 GIT_COMMIT_MISMATCH = "commit không đúng nội dung đã duyệt, cần người kiểm"
+# Design 3.5: the short reason taken from the git output after `GIT_COMMIT_FAILED`.
+GIT_SHORT_REASON_MAX_CHARS = 120
 GIT_BRANCH_CHANGED = "nhánh đang checkout đã đổi kể từ lúc đề xuất"
 COMMAND_FAILED = "lệnh thoát với mã {0}"
 COMMAND_TIMED_OUT = "lệnh chạy quá giờ và đã bị dừng"
@@ -227,13 +231,23 @@ def _guard(proposal, allowed_apps, *, new_file: bool):
 	return guard
 
 
+def _failed(result) -> bool:
+	return result.timed_out or result.exit_code != 0
+
+
+def _commit_failed_reason(result) -> str:
+	"""`GIT_COMMIT_FAILED`, ` (quá thời gian)` on a timeout, then the last git output line cut short (design 3.5)."""
+	reason = GIT_COMMIT_FAILED + (GIT_COMMIT_TIMED_OUT_SUFFIX if result.timed_out else "")
+	lines = [line.strip() for line in (result.output or "").splitlines() if line.strip()]
+	return f"{reason}: {lines[-1][:GIT_SHORT_REASON_MAX_CHARS]}" if lines else reason
+
+
 def _git_commit(repo_root: str, rel_in_repo: str, subject: str, body: str, give_back, limit_s: int) -> None:
 	"""One `commit --only` of the target; on any failure `give_back()` restores the file, then the job fails."""
 	result = process_runner.git_commit_only(repo_root, rel_in_repo, subject, body, limit_s)
-	if result.timed_out or result.exit_code != 0:
+	if _failed(result):
 		give_back()
-		reason = COMMIT_TIMED_OUT if result.timed_out else COMMIT_FAILED
-		raise _Stop(CHANGE_STATUS_FAILED, reason, result)
+		raise _Stop(CHANGE_STATUS_FAILED, _commit_failed_reason(result), result)
 
 
 def _commit(guard, subject: str, body: str, give_back) -> str:
@@ -269,17 +283,18 @@ def _apply_record(proposal, full_path: str, old_head: str, commit: str | None, b
 	return {"fields": fields, "before": {"sha256": proposal.base_hash, "head": old_head}, "after": after}
 
 
-def _apply_postcheck(proposal, state, full_path: str):
+def _apply_postcheck(proposal, state, full_path: str, summary=None):
 	"""Design 4.3 step 3.5 (ADR-022 decision 1 step 5); returns the `CommitSummary` of the bot commit.
 
-	The bot commit exists (the commit command exited 0), so the file is never given back and history is
-	never rewritten (design-addendum-3 QĐ-B2 item 1): a check that fails or cannot be read ends the job as
-	`Lỗi` `GIT_COMMIT_MISMATCH`, keeping the commit sha when it is known.
+	The bot commit exists (the commit command exited 0, or HEAD moved to a bot commit whose `summary` is
+	given), so the file is never given back and history is never rewritten (design-addendum-3 QĐ-B2 item 1):
+	a check that fails or cannot be read ends the job as `Lỗi` `GIT_COMMIT_MISMATCH`, keeping the commit sha
+	when it is known.
 	"""
 	repo, rel, old_head = state.repo_root, state.rel_in_repo, state.head
-	summary = None
 	try:
-		summary = source.git_commit_summary(repo)
+		if summary is None:
+			summary = source.git_commit_summary(repo)
 		matches = (
 			len(summary.parents) == 1
 			and source.git_is_ancestor(repo, old_head, summary.parents[0]) is True
@@ -325,47 +340,149 @@ def _apply_code(proposal, actor: str, allowed_apps, deadline: float) -> None:
 		raise _Stop(CHANGE_STATUS_FAILED, state.refusal)
 	if state.branch != proposal.target_branch:
 		raise _Stop(CHANGE_STATUS_STALE, GIT_BRANCH_CHANGED)
-	repo, rel = state.repo_root, state.rel_in_repo
+	repo, rel, old_head = state.repo_root, state.rel_in_repo, state.head
+	added = committed = False
+	summary = None
 
-	def give_back():
-		if new_file:
-			process_runner.git_unstage_new(repo, rel, source.GIT_TIMEOUT_S)
-			file_writer.remove_created(full)
-		else:
-			file_writer.write_atomic(full, proposal.content_before, new_file=False)
+	def give_back(reason: str, expected_head: str):
+		"""Design 4.3 step 3.6, then `Lỗi` with `reason`, or `GIT_RESTORE_FAILED` when the repo is not as before."""
+		if not _give_back(
+			proposal, full, repo, rel, new_file=new_file, added=added, expected_head=expected_head
+		):
+			reason = GIT_RESTORE_FAILED
+		raise _Stop(CHANGE_STATUS_FAILED, reason)
 
 	written = file_writer.write_atomic(full, proposal.content_after, new_file=new_file)
-	if written != proposal.after_hash:
+	try:
+		if written != proposal.after_hash:
+			give_back(WRITE_MISMATCH, old_head)
+		if new_file:
+			result = process_runner.git_add_new(repo, rel, source.GIT_TIMEOUT_S)
+			if _failed(result):
+				give_back(_commit_failed_reason(result), old_head)
+			added = True
+		subject, body = change_text.apply_message(
+			proposal.name, str(proposal.ticket or ""), proposal.file_path, _person(actor)
+		)
+		result = process_runner.git_commit_only(repo, rel, subject, body, _git_limit(deadline))
+		if _failed(result):
+			summary = _commit_landed(
+				repo, old_head, lambda head: give_back(_commit_failed_reason(result), head)
+			)
+		committed = True
+		summary = _apply_postcheck(proposal, state, full, summary)
+		record = _apply_record(proposal, full, old_head, summary.commit, summary.branch)
+		transitions.finish(
+			proposal.name,
+			CHANGE_STATUS_APPLYING,
+			CHANGE_STATUS_APPLIED,
+			step="apply",
+			actor=actor,
+			fields={
+				**record["fields"],
+				"applied_branch": summary.branch,
+				"applied_ahead_count": state.ahead_count + 1 if state.upstream_ref else 0,
+			},
+			before=record["before"],
+			after=record["after"],
+		)
+	except _Stop:
+		raise
+	except Exception as exc:
+		# Design-addendum-3 QĐ-B2 item 4: an unexpected error gives the file back only while no bot commit is
+		# known, and only once HEAD is proven unchanged (D-17).
+		if committed:
+			_fail_after_commit(proposal, full, repo, old_head, summary, exc)
+		_give_back_after_crash(proposal, full, repo, rel, new_file=new_file, added=added, old_head=old_head)
+		raise
+
+
+def _give_back(
+	proposal, full: str, repo: str, rel: str, *, new_file: bool, added: bool, expected_head: str
+) -> bool:
+	"""Design 4.3 step 3.6; True when the file, the index entry of the target and HEAD are as before.
+
+	A changed file gets `content_before` back (read-back hash = `base_hash`); a new file is removed, then
+	unstaged when `git add` went through. HEAD must still be `expected_head` and git must accept the target.
+	"""
+	try:
 		if new_file:
 			file_writer.remove_created(full)
+			restored = True
+			if added:
+				restored = not _failed(process_runner.git_unstage_new(repo, rel, source.GIT_TIMEOUT_S))
 		else:
-			file_writer.write_atomic(full, proposal.content_before, new_file=False)
-		raise _Stop(CHANGE_STATUS_FAILED, WRITE_MISMATCH)
-	if new_file:
-		added = process_runner.git_add_new(repo, rel, source.GIT_TIMEOUT_S)
-		if added.timed_out or added.exit_code != 0:
-			file_writer.remove_created(full)
-			raise _Stop(CHANGE_STATUS_FAILED, COMMIT_FAILED, added)
-	subject, body = change_text.apply_message(
-		proposal.name, str(proposal.ticket or ""), proposal.file_path, _person(actor)
-	)
-	_git_commit(repo, rel, subject, body, give_back, _git_limit(deadline))
-	summary = _apply_postcheck(proposal, state, full)
-	record = _apply_record(proposal, full, state.head, summary.commit, summary.branch)
-	transitions.finish(
-		proposal.name,
-		CHANGE_STATUS_APPLYING,
-		CHANGE_STATUS_APPLIED,
-		step="apply",
-		actor=actor,
-		fields={
-			**record["fields"],
-			"applied_branch": summary.branch,
-			"applied_ahead_count": state.ahead_count + 1 if state.upstream_ref else 0,
-		},
-		before=record["before"],
-		after=record["after"],
-	)
+			restored = (
+				file_writer.write_atomic(full, proposal.content_before, new_file=False) == proposal.base_hash
+			)
+		return (
+			restored
+			and source.git_head(repo) == expected_head
+			and source.read_git_state(full, new_file=new_file).refusal is None
+		)
+	except Exception as exc:
+		# The give-back itself broke: the repo state is unknown, which is what `GIT_RESTORE_FAILED` says.
+		frappe.log_error(
+			TITLE_CHANGE_FAILED, f"proposal={proposal.name} action=give_back error={type(exc).__name__}"
+		)
+		return False
+
+
+def _commit_landed(repo: str, old_head: str, give_back):
+	"""Design 4.3 step 3.4 after a failed or timed-out commit; returns the `CommitSummary` of a bot commit.
+
+	HEAD unchanged → `give_back(old_head)`; HEAD moved to a person's commit → `give_back(head_now)`; HEAD
+	unreadable, or moved and its summary unreadable → `Lỗi` `GIT_ERROR` without giving back (QĐ-B2 item 2).
+	"""
+	head_now = source.git_head(repo)
+	if head_now is None:
+		raise _Stop(CHANGE_STATUS_FAILED, source.GIT_ERROR)
+	if head_now == old_head:
+		give_back(old_head)
+	try:
+		summary = source.git_commit_summary(repo)
+	except RuntimeError:
+		raise _Stop(CHANGE_STATUS_FAILED, source.GIT_ERROR) from None
+	if summary.author_email != BOT_GIT_EMAIL:
+		give_back(head_now)
+	return summary
+
+
+def _fail_after_commit(proposal, full: str, repo: str, old_head: str, summary, exc: Exception):
+	"""QĐ-B2 items 1 and 4: the bot commit exists, so the file stays; `Lỗi` with the class name, keeping the
+	commit sha when known (`summary`, else a HEAD that moved off `old_head`) with its QĐ-B5 log values."""
+	frappe.db.rollback()
+	frappe.log_error(TITLE_CHANGE_FAILED, f"proposal={proposal.name} action=apply error={type(exc).__name__}")
+	if summary is not None:
+		commit, branch = summary.commit, summary.branch
+	else:
+		head = source.git_head(repo)
+		commit, branch = (head if head not in (None, old_head) else None), None
+	raise _Stop(
+		CHANGE_STATUS_FAILED, type(exc).__name__, **_apply_record(proposal, full, old_head, commit, branch)
+	) from exc
+
+
+def _give_back_after_crash(
+	proposal, full: str, repo: str, rel: str, *, new_file: bool, added: bool, old_head
+):
+	"""QĐ-B2 item 4 with no bot commit known: give the file back only when HEAD is still `old_head` (D-17).
+
+	The caller re-raises the original error, which ends the job as `Lỗi` with its class name; a give-back
+	that was skipped or did not hold is recorded in the error log so a person checks the repo.
+	"""
+	try:
+		restored = source.git_head(repo) == old_head and _give_back(
+			proposal, full, repo, rel, new_file=new_file, added=added, expected_head=old_head
+		)
+	except Exception as exc:
+		# Never hide the first error behind one from giving back; record this one and go on.
+		frappe.log_error(
+			TITLE_CHANGE_FAILED, f"proposal={proposal.name} action=give_back error={type(exc).__name__}"
+		)
+		return
+	if not restored:
+		frappe.log_error(TITLE_CHANGE_FAILED, f"proposal={proposal.name} action=give_back restored=False")
 
 
 def _undo_code(proposal, actor: str) -> None:

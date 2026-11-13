@@ -3,10 +3,10 @@ from frappe import _
 from frappe.model.document import Document
 from frappe.utils import cint, cstr
 
-from erp_ai.agent import queue
+from erp_ai.agent import change_text, queue
 from erp_ai.agent.authority import NEVER_AUTHORITY
 from erp_ai.agent.changes import transitions
-from erp_ai.constants import PROPOSAL_DOCTYPE, ROLE_INSTRUCTOR
+from erp_ai.constants import CHANGE_KIND_CODE, PROPOSAL_DOCTYPE, ROLE_INSTRUCTOR
 
 # Design 2.1 content group (ADR-012 QĐ 1): written once at insert, never changed afterwards.
 CONTENT_FIELDS = (
@@ -45,8 +45,13 @@ class ERPAIChangeProposal(Document):
 	def before_insert(self):
 		transitions.prepare_new(self)
 
+	def onload(self):
+		"""Design 3.3 form data: the 3.9 sentences, built only from the stored fields (no git)."""
+		self.set_onload("change_notes", change_text.proposal_notes(self))
+
 	def validate(self):
 		if self.is_new():
+			self._set_commit_message()
 			return
 		before = frappe.db.get_value(self.doctype, self.name, CONTENT_FIELDS, as_dict=True)
 		changed = [
@@ -59,6 +64,19 @@ class ERPAIChangeProposal(Document):
 				_("Nội dung đề xuất không sửa được sau khi tạo: {0}").format(", ".join(changed)),
 				frappe.ValidationError,
 			)
+
+	def _set_commit_message(self):
+		"""D-14: the apply-commit preview (design 3.9), replacing whatever the caller passed.
+
+		Runs in `validate` at insert, once Frappe has named the proposal; a bench command has no commit.
+		"""
+		if self.change_kind != CHANGE_KIND_CODE:
+			self.commit_message = None
+			return
+		subject, body = change_text.apply_message(
+			self.name, cstr(self.ticket), cstr(self.file_path), change_text.APPROVER_PLACEHOLDER
+		)
+		self.commit_message = change_text.message_text(subject, body)
 
 
 def _decider(name) -> str:

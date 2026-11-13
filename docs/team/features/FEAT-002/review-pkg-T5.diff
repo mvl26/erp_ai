@@ -1,0 +1,393 @@
+diff --git a/erp_ai/agent/run_status.py b/erp_ai/agent/run_status.py
+index f855db5..ad2e3e5 100644
+--- a/erp_ai/agent/run_status.py
++++ b/erp_ai/agent/run_status.py
+@@ -11,7 +11,26 @@ from erp_ai.constants import AGENT_STATUS_EVENT, AGENT_USER, JOB_TIMEOUT_S
+ 
+ PAYLOAD_KEYS = ("ticket_id", "run_id", "agent_user", "agent_name", "state", "text", "expires_in_s")
+ STATE_THINKING = "thinking"
++STATE_WORKING = "working"
+ STATE_DONE = "done"
++CLASSIFY_STEP = "classify"
++WORKING_TEXT = "Đang làm: {label}…"
++FALLBACK_WORK_LABEL = "xử lý yêu cầu"
++# The only table of work labels (A-15): the text of a "working" signal comes from here, never from the model.
++WORK_LABELS = {
++	"get_ticket": "đọc phiếu",
++	"list_comments": "đọc comment",
++	"search_resolved_tickets": "tìm phiếu đã giải quyết",
++	"get_record": "tra bản ghi",
++	"search_source": "tra mã nguồn",
++	"read_source": "đọc mã nguồn",
++	"git_source": "xem lịch sử mã nguồn",
++	"set_classification": "ghi phân loại",
++	"set_resolution_hint": "ghi hướng giải quyết",
++	"post_comment": "viết trả lời",
++	"create_task": "tạo task",
++	CLASSIFY_STEP: "phân loại phiếu",
++}
+ 
+ 
+ class RunStatus:
+@@ -36,6 +55,16 @@ class RunStatus:
+ 		if self.started and not self.finished and self.last_state != STATE_THINKING:
+ 			self._emit(STATE_THINKING, self.text)
+ 
++	def working(self, step: str) -> None:
++		if self.started and not self.finished:
++			# an unknown name (invented by the model) never reaches the text (D-5)
++			label = WORK_LABELS.get(step, FALLBACK_WORK_LABEL)
++			self._emit(STATE_WORKING, WORKING_TEXT.format(label=label))
++
++	def take_errors(self) -> list[str]:
++		errors, self._errors = self._errors, []
++		return errors
++
+ 	def done(self) -> None:
+ 		if self.started and not self.finished:
+ 			self.finished = True
+diff --git a/erp_ai/agent/runner.py b/erp_ai/agent/runner.py
+index 86fee7d..1cfcbdf 100644
+--- a/erp_ai/agent/runner.py
++++ b/erp_ai/agent/runner.py
+@@ -11,7 +11,7 @@ from erp_ai.agent.answer_delay import AnswerDelay
+ from erp_ai.agent.classification import load_mapping, parse_classification, resolve_ticket_values
+ from erp_ai.agent.prompts import build_classify_request, build_initial_message, build_reason_system
+ from erp_ai.agent.run_log import write_entry
+-from erp_ai.agent.run_status import RunStatus
++from erp_ai.agent.run_status import CLASSIFY_STEP, RunStatus
+ from erp_ai.agent.tools.read import TOOL_RESULT_MAX_CHARS
+ from erp_ai.agent.tools.registry import ToolContext, execute_tool, get_tool_schemas
+ from erp_ai.constants import (
+@@ -124,7 +124,9 @@ def _run(ticket_name, trigger):
+ 			)
+ 		classification = None
+ 		if trigger == TRIGGER_TICKET_INSERT:
+-			proceed, classification = _classify(ticket_name, trigger, run_id, mapping, context, deadline)
++			proceed, classification = _classify(
++				ticket_name, trigger, run_id, mapping, context, deadline, status
++			)
+ 			if not proceed:
+ 				return
+ 		if level != LEVELS[0]:
+@@ -158,7 +160,7 @@ def _call_fields(result):
+ 	}
+ 
+ 
+-def _classify(ticket_name, trigger, run_id, mapping, context, deadline):
++def _classify(ticket_name, trigger, run_id, mapping, context, deadline, status):
+ 	"""Classification step (design 4.3 step 6). Writes one `classify` entry; with a context (L1+) also applies it.
+ 
+ 	Returns `(proceed, classification)`: `proceed` is False when the run must end here (gateway error);
+@@ -166,6 +168,7 @@ def _classify(ticket_name, trigger, run_id, mapping, context, deadline):
+ 	"""
+ 	subject, description = frappe.db.get_value("HD Ticket", ticket_name, ["subject", "description"])
+ 	base = {"ticket": ticket_name, "run_id": run_id, "entry_type": "classify", "trigger": trigger, "turn": 0}
++	status.working(CLASSIFY_STEP)
+ 	try:
+ 		result = _call_model(
+ 			"classify",
+@@ -176,7 +179,7 @@ def _classify(ticket_name, trigger, run_id, mapping, context, deadline):
+ 	except gateway.GatewayError as exc:
+ 		write_entry(
+ 			**base,
+-			error=f"{exc.kind} status={exc.status}",
++			error="; ".join([f"{exc.kind} status={exc.status}", *status.take_errors()]),
+ 			stop_reason="gateway_error",
+ 			credential_label=exc.credential_label,
+ 			keys_tried=exc.keys_tried,
+@@ -186,7 +189,8 @@ def _classify(ticket_name, trigger, run_id, mapping, context, deadline):
+ 	call_fields = _call_fields(result)
+ 	classification = parse_classification(result.text)
+ 	if classification is None:
+-		write_entry(**base, **call_fields, error=UNPARSEABLE_ERROR, stop_reason="unparseable")
++		error = "; ".join([UNPARSEABLE_ERROR, *status.take_errors()])
++		write_entry(**base, **call_fields, error=error, stop_reason="unparseable")
+ 		return True, None
+ 
+ 	values = resolve_ticket_values(classification, subject, mapping)
+@@ -195,7 +199,7 @@ def _classify(ticket_name, trigger, run_id, mapping, context, deadline):
+ 		**base,
+ 		**call_fields,
+ 		stop_reason=result.stop_reason,
+-		error=None if mapping else BAD_MAPPING_ERROR,
++		error="; ".join([*([] if mapping else [BAD_MAPPING_ERROR]), *status.take_errors()]) or None,
+ 		predicted_category=classification.category,
+ 		predicted_confidence=classification.confidence,
+ 		predicted_ticket_type=values["ticket_type"],
+@@ -204,6 +208,7 @@ def _classify(ticket_name, trigger, run_id, mapping, context, deadline):
+ 		applied=0,
+ 	)
+ 	if context is not None:
++		status.working("set_classification")
+ 		_apply_classification(log_name, classification, context)
+ 	summary = {"category": classification.category, "confidence": classification.confidence, **values}
+ 	return True, summary
+@@ -291,7 +296,7 @@ def _reason(ticket_name, trigger, run_id, settings, context, classification, dea
+ 			write_entry(
+ 				**base,
+ 				turn=turn,
+-				error=f"{exc.kind} status={exc.status}",
++				error="; ".join([f"{exc.kind} status={exc.status}", *status.take_errors()]),
+ 				stop_reason=STOP_TIME_BUDGET if exc.kind == DEADLINE_KIND else STOP_GATEWAY_ERROR,
+ 				credential_label=exc.credential_label,
+ 				keys_tried=exc.keys_tried,
+@@ -304,6 +309,7 @@ def _reason(ticket_name, trigger, run_id, settings, context, classification, dea
+ 		if delay is not None and any(block["name"] == ANSWER_TOOL for block in tool_blocks):
+ 			delay.wait_before_answer(deadline)
+ 		for block in tool_blocks:
++			status.working(block["name"])
+ 			tool_results.append(_run_tool(block, context, actions, before, after, tool_errors, skipped))
+ 		stop_reason = result.stop_reason
+ 		wants_tools = stop_reason == STOP_TOOL_USE
+@@ -315,7 +321,7 @@ def _reason(ticket_name, trigger, run_id, settings, context, classification, dea
+ 			turn=turn,
+ 			stop_reason=stop_reason,
+ 			tools_called=[block["name"] for block in tool_blocks] or None,
+-			error="; ".join(tool_errors) or None,
++			error="; ".join([*tool_errors, *status.take_errors()]) or None,
+ 			actions=actions or None,
+ 			value_before=before or None,
+ 			value_after=after or None,
+diff --git a/erp_ai/agent/test_run_status.py b/erp_ai/agent/test_run_status.py
+new file mode 100644
+index 0000000..e7a421e
+--- /dev/null
++++ b/erp_ai/agent/test_run_status.py
+@@ -0,0 +1,109 @@
++from unittest.mock import patch
++
++import frappe
++from frappe.tests.utils import FrappeTestCase
++
++from erp_ai.agent.run_status import (
++	CLASSIFY_STEP,
++	FALLBACK_WORK_LABEL,
++	PAYLOAD_KEYS,
++	WORK_LABELS,
++	WORKING_TEXT,
++	RunStatus,
++)
++from erp_ai.agent.tools.registry import get_tool_schemas
++from erp_ai.constants import LEVELS
++from erp_ai.test_utils import record_status_signals
++
++LABEL_TABLE = {
++	"get_ticket": "đọc phiếu",
++	"list_comments": "đọc comment",
++	"search_resolved_tickets": "tìm phiếu đã giải quyết",
++	"get_record": "tra bản ghi",
++	"search_source": "tra mã nguồn",
++	"read_source": "đọc mã nguồn",
++	"git_source": "xem lịch sử mã nguồn",
++	"set_classification": "ghi phân loại",
++	"set_resolution_hint": "ghi hướng giải quyết",
++	"post_comment": "viết trả lời",
++	"create_task": "tạo task",
++	"classify": "phân loại phiếu",
++}
++
++
++class TestRunStatus(FrappeTestCase):
++	def setUp(self):
++		self.signals = record_status_signals(self)
++
++	def _status(self):
++		status = RunStatus("HD-TICKET-1", "run1", "Đang suy nghĩ…")
++		status.start()
++		self.signals.clear()
++		return status
++
++	def test_every_granted_tool_and_classify_step_has_label(self):
++		granted = {schema["name"] for schema in get_tool_schemas(LEVELS[-1], True)}
++
++		self.assertEqual(CLASSIFY_STEP, "classify")
++		self.assertEqual(len(granted), 11)
++		self.assertEqual(set(WORK_LABELS), granted | {CLASSIFY_STEP})
++		self.assertEqual(WORK_LABELS, LABEL_TABLE)
++		for step in WORK_LABELS:
++			with self.subTest(step):
++				status = self._status()
++				status.working(step)
++				self.assertEqual(self.signals[-1]["message"]["state"], "working")
++				self.assertEqual(
++					self.signals[-1]["message"]["text"], WORKING_TEXT.format(label=LABEL_TABLE[step])
++				)
++
++	def test_unknown_tool_gets_fallback_label(self):
++		status = self._status()
++
++		status.working("drop_all_tables")
++
++		text = self.signals[-1]["message"]["text"]
++		self.assertEqual(text, f"Đang làm: {FALLBACK_WORK_LABEL}…")
++		self.assertNotIn("drop_all_tables", text)
++
++	def test_payload_has_exactly_seven_keys(self):
++		status = self._status()
++
++		status.working("get_ticket")
++		status.thinking()
++		status.done()
++
++		self.assertEqual([s["message"]["state"] for s in self.signals], ["working", "thinking", "done"])
++		for signal in self.signals:
++			self.assertEqual(list(signal["message"]), list(PAYLOAD_KEYS))
++			self.assertEqual(len(signal["message"]), 7)
++
++	def test_thinking_not_repeated_after_thinking(self):
++		status = self._status()
++
++		status.thinking()
++		status.working("get_ticket")
++		status.thinking()
++		status.thinking()
++
++		self.assertEqual([s["message"]["state"] for s in self.signals], ["working", "thinking"])
++
++	def test_working_silent_when_inactive_or_finished(self):
++		silent = RunStatus("HD-TICKET-1", "run1", "  ")
++		silent.start()
++		silent.working("get_ticket")
++		finished = self._status()
++		finished.done()
++		self.signals.clear()
++		finished.working("get_ticket")
++
++		self.assertEqual(self.signals, [])
++
++	def test_take_errors_returns_and_clears(self):
++		status = self._status()
++
++		with patch.object(frappe, "publish_realtime", side_effect=RuntimeError("secret")):
++			status.working("get_ticket")
++
++		self.assertEqual(status.take_errors(), ["status_working: RuntimeError"])
++		self.assertEqual(status.take_errors(), [])
+diff --git a/erp_ai/agent/test_runner_status.py b/erp_ai/agent/test_runner_status.py
+index 975d128..510047b 100644
+--- a/erp_ai/agent/test_runner_status.py
++++ b/erp_ai/agent/test_runner_status.py
+@@ -7,8 +7,8 @@ import frappe
+ from frappe.utils import get_fullname
+ 
+ from erp_ai.agent import answer_delay, policy, runner
+-from erp_ai.agent.run_status import PAYLOAD_KEYS
+-from erp_ai.agent.test_agent_runner import DAILY_LIMIT, RunnerTestBase, tool_turn, tool_use
++from erp_ai.agent.run_status import FALLBACK_WORK_LABEL, PAYLOAD_KEYS
++from erp_ai.agent.test_agent_runner import CLASSIFY_A, DAILY_LIMIT, RunnerTestBase, tool_turn, tool_use
+ from erp_ai.constants import AGENT_STATUS_EVENT, AGENT_USER, JOB_TIMEOUT_S, SETTING_DOCTYPE
+ from erp_ai.test_utils import FakeGateway, make_model_result, set_agent_settings
+ 
+@@ -117,6 +117,12 @@ class TestRunnerStatus(RunnerTestBase):
+ 
+ 		self.assertEqual(self.signals, [])
+ 
++	def _states(self):
++		return [signal["message"]["state"] for signal in self.signals]
++
++	def _texts(self):
++		return [signal["message"]["text"] for signal in self.signals]
++
+ 	def _answer_turns(self, cost_usd=0.0):
+ 		return (
+ 			tool_turn(tool_use("t1", "post_comment", content="Đã xử lý"), cost_usd=cost_usd),
+@@ -145,6 +151,9 @@ class TestRunnerStatus(RunnerTestBase):
+ 		self.assertEqual(self.sleeps, [2.5])
+ 		self.assertEqual(self.at_sleep, [(["thinking"], comments_before)])
+ 		self.assertEqual(self._comment_count(), comments_before + 1)
++		# the "working" signal of the answer comes only after the wait
++		self.assertEqual(self._states(), ["thinking", "working", "thinking", "done"])
++		self.assertEqual(self.signals[1]["message"]["text"], "Đang làm: viết trả lời…")
+ 
+ 	def test_whole_turn_waits_before_its_first_tool(self):
+ 		"""D-6: the wait sits before every tool of the answer turn, not just before the post_comment block."""
+@@ -180,6 +189,9 @@ class TestRunnerStatus(RunnerTestBase):
+ 		self.assertEqual(set(states), {"thinking"})
+ 		# no signal between the model call and the sleep
+ 		self.assertEqual(len(states), self.signals_on_model_call[0])
++		# the sleep ends, then the answer is announced as work
++		self.assertEqual(self._states()[:2], ["thinking", "working"])
++		self.assertEqual(self.signals[1]["message"]["text"], "Đang làm: viết trả lời…")
+ 
+ 	def test_skipped_runs_emit_nothing_and_never_wait(self):
+ 		self._set_delay(3, 5)
+@@ -264,3 +276,78 @@ class TestRunnerStatus(RunnerTestBase):
+ 		self.assertEqual(on[1], 2)
+ 		self.assertAlmostEqual(on[2], off[2])
+ 		self.assertAlmostEqual(on[2], 0.5)
++
++	def test_signal_sequence_read_tool_then_answer(self):
++		self._gateway(
++			tool_turn(tool_use("t1", "get_ticket")),
++			tool_turn(tool_use("t2", "post_comment", content="Đã xử lý")),
++			make_model_result(text="xong"),
++		)
++
++		self._run("comment_mention")
++
++		self.assertEqual(self._states(), ["thinking", "working", "thinking", "working", "thinking", "done"])
++		self.assertEqual(
++			self._texts(),
++			[
++				THINKING_TEXT,
++				"Đang làm: đọc phiếu…",
++				THINKING_TEXT,
++				"Đang làm: viết trả lời…",
++				THINKING_TEXT,
++				"",
++			],
++		)
++
++	def test_ticket_insert_l0_gets_start_signal(self):
++		set_agent_settings(permission_level="L0")
++		self._gateway(make_model_result(text=CLASSIFY_A))
++
++		self._run("ticket_insert")
++
++		self.assertEqual(self._states(), ["thinking", "working", "done"])
++		self.assertEqual(self._texts()[1], "Đang làm: phân loại phiếu…")
++
++	def test_ticket_insert_l1_signal_sequence(self):
++		self._gateway(make_model_result(text=CLASSIFY_A), make_model_result(text="xong"))
++
++		self._run("ticket_insert")
++
++		self.assertEqual(self._states(), ["thinking", "working", "working", "thinking", "done"])
++		self.assertEqual(self._texts()[1:3], ["Đang làm: phân loại phiếu…", "Đang làm: ghi phân loại…"])
++
++	def test_ticket_insert_never_waits(self):
++		self._set_delay(3, 5)
++		for level in ("L0", "L1"):
++			with self.subTest(level):
++				frappe.db.savepoint("erp_ai_insert_case")
++				try:
++					set_agent_settings(permission_level=level)
++					self._gateway(
++						make_model_result(text=CLASSIFY_A),
++						tool_turn(tool_use("t1", "post_comment", content="Đã xử lý")),
++						make_model_result(text="xong"),
++					)
++
++					self._run("ticket_insert")
++
++					self.assertEqual(self.sleeps, [])
++				finally:
++					frappe.db.rollback(save_point="erp_ai_insert_case")
++
++	def test_tool_arguments_and_ticket_text_never_in_payload(self):
++		marker = "MARKERXYZ"
++		frappe.db.set_value("HD Ticket", self.ticket.name, "subject", f"{marker} subject")
++		self._gateway(
++			tool_turn(
++				tool_use("t1", f"tool_{marker}", secret=marker),
++				tool_use("t2", "post_comment", content=f"{marker} answer"),
++			),
++			make_model_result(text="xong"),
++		)
++
++		self._run("comment_mention")
++
++		self.assertIn("working", self._states())
++		self.assertNotIn(marker, json.dumps(self.signals, ensure_ascii=False))
++		self.assertIn(f"Đang làm: {FALLBACK_WORK_LABEL}…", self._texts())

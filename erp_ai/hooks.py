@@ -8,7 +8,7 @@ app_license = "mit"
 # Apps
 # ------------------
 
-# required_apps = []
+required_apps = ["helpdesk"]
 
 # Each item in the list will be shown as an app in the apps page
 # add_to_apps_screen = [
@@ -83,12 +83,13 @@ app_license = "mit"
 # ------------
 
 # before_install = "erp_ai.install.before_install"
-# after_install = "erp_ai.install.after_install"
+after_install = "erp_ai.install.after_install"
+after_migrate = "erp_ai.install.after_migrate"
 
 # Uninstallation
 # ------------
 
-# before_uninstall = "erp_ai.uninstall.before_uninstall"
+before_uninstall = "erp_ai.install.before_uninstall"
 # after_uninstall = "erp_ai.uninstall.after_uninstall"
 
 # Integration Setup
@@ -137,34 +138,28 @@ app_license = "mit"
 # ---------------
 # Hook on document methods and events
 
-# doc_events = {
-# 	"*": {
-# 		"on_update": "method",
-# 		"on_cancel": "method",
-# 		"on_trash": "method"
-# 	}
-# }
+doc_events = {
+	"HD Ticket": {
+		"before_insert": "erp_ai.handlers.ticket_before_insert",
+		"after_insert": "erp_ai.handlers.ticket_after_insert",
+		"validate": "erp_ai.handlers.ticket_validate",
+		"on_update": "erp_ai.handlers.ticket_on_update",
+	},
+	"Comment": {
+		"after_insert": "erp_ai.handlers.comment_after_insert",
+	},
+}
+
+# Deleting a ticket must not be blocked by its audit-log rows (the log is kept)
+ignore_links_on_delete = ["ERP AI Log"]
 
 # Scheduled Tasks
 # ---------------
 
-# scheduler_events = {
-# 	"all": [
-# 		"erp_ai.tasks.all"
-# 	],
-# 	"daily": [
-# 		"erp_ai.tasks.daily"
-# 	],
-# 	"hourly": [
-# 		"erp_ai.tasks.hourly"
-# 	],
-# 	"weekly": [
-# 		"erp_ai.tasks.weekly"
-# 	],
-# 	"monthly": [
-# 		"erp_ai.tasks.monthly"
-# 	],
-# }
+scheduler_events = {
+	"hourly": ["erp_ai.tasks.reprobe_exhausted_keys"],
+	"daily": ["erp_ai.tasks.recompute_monthly_spend", "erp_ai.tasks.check_privilege_escalation"],
+}
 
 # Testing
 # -------
@@ -246,4 +241,3 @@ app_license = "mit"
 # ------------
 # List of apps whose translatable strings should be excluded from this app's translations.
 # ignore_translatable_strings_from = []
-

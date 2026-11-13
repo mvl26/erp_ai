@@ -1,0 +1,79 @@
+Feature: FEAT-002
+Stage: plan
+Author-agent: tech-lead
+Date: 2026-11-12
+Approved-by:
+<!-- Cổng: người duyệt điền dòng trên `Approved-by: <tên> <YYYY-MM-DD>`. Không có cổng thì để trống. -->
+
+# Tasks FEAT-002
+
+Mỗi task 2–5 phút. Hai task chung file thì phụ thuộc nhau. Đánh dấu `BLOCKED: <lý do>` cuối dòng khi bị chặn.
+Lệnh test: `cmd.test_one` với `{file}` = file ở `test:`. Mọi đường dẫn bắt đầu từ `erp_ai/`. Ràng buộc chung: xem `plan.md` mục "Shared constraints". Tên hàm/lớp/khóa lấy nguyên văn từ `design.md` mục 3.
+
+- [x] T1 — Walking skeleton: runner phát `thinking` rồi `done` qua `run_status` — files: erp_ai/constants.py, erp_ai/agent/run_status.py, erp_ai/agent/runner.py, erp_ai/test_utils.py, erp_ai/agent/test_runner_status.py — test: erp_ai/agent/test_runner_status.py — depends: —
+  - progress: BASE=bc4baf6 · dev call 1 · review round 1 request-changes (major STD-TEST-2) · dev call 2 · round 2 approve · merged 9db58cd
+  - Tiêu chí: AC-2 (tín hiệu bắt đầu trước lời gọi model đầu, đúng `room`, `agent_user`, `ticket_id`, `text`), AC-4 (nhánh có câu trả lời: `done` là tín hiệu cuối), NFR-4' (payload đúng 7 khóa).
+  - Receives: `constants.py` thêm `AGENT_STATUS_EVENT = "erp_ai:agent_status"`, `TITLE_STATUS_FAILED = "erp_ai: chỉ báo trạng thái lỗi"`, `ANSWER_DELAY_MAX_S = 30` (cả 3, để task sau khỏi sửa lại file này). `test_utils.py`: `FakeGateway(*results, on_call=None)`; `record_status_signals(testcase) -> list[dict]` (patch `frappe.realtime.emit_via_redis`).
+  - Returns: `run_status.py`: `PAYLOAD_KEYS`, `class RunStatus(ticket_name: str, run_id: str, thinking_text: str | None)` với `start()`, `thinking()`, `done()`, `_emit(state, text)` (bắt mọi `Exception`, không ném; mảnh lỗi `f"status_{state}: {type(exc).__name__}"` cất vào danh sách nội bộ). `working()`/`take_errors()`/`WORK_LABELS` để T5. `runner.py`: sau chốt `level_L0` tạo `RunStatus(...)`, `status.start()` trước `mapping`/`context`, `try: ... finally: status.done()`; `status.thinking()` trước `_call_model("reason", ...)`.
+  - Expect: `cmd.test_one` trên `test_runner_status.py` đỏ trước (không có `run_status`), xanh sau: `test_start_signal_before_first_model_call`, `test_done_last_when_answered`. Dán cả hai lần chạy.
+- [x] T2 — Ba trường cấu hình và kiểm khi lưu — files: erp_ai/erp_ai_agent/doctype/erp_ai_setting/erp_ai_setting.json, erp_ai/erp_ai_agent/doctype/erp_ai_setting/erp_ai_setting.py, erp_ai/erp_ai_agent/doctype/erp_ai_setting/test_erp_ai_setting.py, erp_ai/tests/test_install.py — test: erp_ai/erp_ai_agent/doctype/erp_ai_setting/test_erp_ai_setting.py — depends: T1
+  - progress: BASE=a4cb74f · dev call 1 · round 1 approve · merged dbb035f
+  - Tiêu chí: AC-1 (mặc định `Đang suy nghĩ…`/3/5; từ chối −1, 31, min > max, 5001 ký tự; lưu được 0/0, 30/30, 3/3, 0/30, câu chữ rỗng, 5000 ký tự), NFR-2 (cận 30). Thông báo so đúng chuỗi ở `design.md` 3.1.
+  - Receives: `ANSWER_DELAY_MAX_S` từ `constants.py` (T1).
+  - Returns: trường `thinking_text` (Small Text), `answer_delay_min_s`, `answer_delay_max_s` (Int) sau `trigger_keyword` trong `field_order`; `INT_LIMITS` thêm 2 dòng; `ERPAISetting.check_status_settings()` gọi sau `check_limits()` (chuẩn hóa `thinking_text or ""`, min ≤ max, độ dài ≤ 5000).
+  - Test: `test_status_fields_defaults`, `test_status_fields_rejections` (subTest, so chuỗi), `test_status_fields_valid_edges_save`; ở `test_install.py`: `test_status_defaults_filled_only_when_missing`, `test_emptied_thinking_text_survives_setup`.
+  - Expect: `cmd.test_one` trên `test_erp_ai_setting.py` và `test_install.py` xanh; đỏ-đúng-lý-do trước khi sửa `.json`/`.py`.
+- [x] T3 — Module khoảng trễ trả lời `answer_delay` — files: erp_ai/agent/answer_delay.py, erp_ai/agent/test_answer_delay.py — test: erp_ai/agent/test_answer_delay.py — depends: T1
+  - progress: BASE=a4cb74f · dev call 1 · round 1 request-changes (2 major) · dev call 2 · round 2 approve · merged 46bfae6
+  - Tiêu chí: AC-3 (a)–(d), NFR-1, NFR-2, A-5.
+  - Receives: `ANSWER_DELAY_MAX_S` (T1).
+  - Returns: `answer_delay.py`: `_now()`, `_sleep(seconds)`, `_pick(low, high)` (điểm thay thế cho test); `class AnswerDelay` với `AnswerDelay.start(low_s, high_s) -> AnswerDelay` (None→0, kẹp [0, 30], sắp lại low ≤ high, `delay_s = _pick`, `anchor = _now()`, `waited_s = 0.0`) và `wait_before_answer(deadline: float) -> float` (chỉ lần gọi đầu; `wait = min(anchor + delay_s - now, deadline - now)`; `wait > 0` mới `_sleep`; không bao giờ nới `deadline`).
+  - Test: `test_full_delay_when_model_instant`, `test_delay_always_within_min_max` (50 lần, 1–4), `test_fixed_delay_when_min_equals_max`, `test_no_wait_when_model_slower_than_delay`, `test_no_wait_when_zero_zero`, `test_wait_capped_by_run_deadline`, `test_waits_only_once`, `test_out_of_range_db_values_are_clamped` (−5/99, 9/2).
+  - Expect: `cmd.test_one` trên `test_answer_delay.py` xanh, đủ 8 test.
+- [x] T4 — Nối khoảng trễ vào runner; cô lập test cũ khỏi Redis và `time.sleep` — files: erp_ai/agent/runner.py, erp_ai/agent/test_agent_runner.py, erp_ai/tests/test_handlers.py, erp_ai/agent/test_runner_status.py — test: erp_ai/agent/test_runner_status.py — depends: T2, T3
+  - progress: BASE=e57751b · dev call 1 · round 1 request-changes (1 major) · dev call 2 · round 2 approve · merged e68f479
+  - Tiêu chí: AC-3 (mốc = ngay sau tín hiệu bắt đầu), AC-5 (nhánh bỏ qua không tín hiệu/không chờ; câu chữ rỗng và `"   "` → 0 tín hiệu nhưng vẫn chờ), AC-6 (c) `runs_today` = 1 và (e) `messages` giống hệt bật/tắt, AC-8 (số lời gọi gateway và tổng `cost_usd` bằng nhau bật/tắt), D-6, D-16.
+  - Receives: `AnswerDelay` (T3); 3 trường cấu hình (T2); `record_status_signals`, `FakeGateway(on_call)` (T1).
+  - Returns: `runner.py`: hằng `ANSWER_TOOL = "post_comment"`; `delay = AnswerDelay.start(settings.answer_delay_min_s, settings.answer_delay_max_s)` ngay sau `status.start()` chỉ khi trigger là `comment_mention`, ngược lại `None`; trong `_reason`, khi một lượt có khối `tool_use` tên `ANSWER_TOOL` thì `delay.wait_before_answer(deadline)` trước khi chạy tool nào của lượt. `test_agent_runner.py` `RunnerTestBase.setUp`: đặt `answer_delay_min_s = answer_delay_max_s = 0`, gắn `record_status_signals`, patch `answer_delay._sleep` thành bộ ghi. `test_handlers.py` `HandlerTestCase.setUp`: gắn `record_status_signals`.
+  - Test (trong `test_runner_status.py`): `test_answer_waits_from_start_signal`, `test_indicator_stays_thinking_while_waiting`, `test_skipped_runs_emit_nothing_and_never_wait` (4 subTest), `test_empty_text_no_signal_delay_still_applies`, `test_mention_run_counts_once_for_daily_limit`, `test_model_messages_same_with_feature_on_and_off`, `test_same_gateway_calls_and_cost_with_feature_on_and_off`.
+  - Expect: `cmd.test_one` trên `test_runner_status.py`, `test_agent_runner.py`, `test_handlers.py` xanh.
+- [x] T5 — Trạng thái "Đang làm": nhãn việc, `working()`, `ticket_insert` — files: erp_ai/agent/run_status.py, erp_ai/agent/runner.py, erp_ai/agent/test_run_status.py, erp_ai/agent/test_runner_status.py — test: erp_ai/agent/test_run_status.py — depends: T4
+  - progress: BASE=177f013 · dev call 1 · rework vòng 2, 3 · round 3 approve · merged 06132f0
+  - Tiêu chí: AC-9, AC-2 (`ticket_insert` ở `L0` có tín hiệu bắt đầu), AC-5 (`ticket_insert` không bao giờ chờ), NFR-4' (tên tool lạ → nhãn dự phòng, tham số tool/nội dung phiếu không vào payload), D-3, D-4, D-5.
+  - Receives: `RunStatus` (T1), runner đã nối `AnswerDelay` (T4).
+  - Returns: `run_status.py`: `CLASSIFY_STEP = "classify"`, `WORKING_TEXT = "Đang làm: {label}…"`, `FALLBACK_WORK_LABEL = "xử lý yêu cầu"`, `WORK_LABELS` (11 tool + `classify`, đúng bảng `design.md` 3.3), `RunStatus.working(step: str)`, `RunStatus.take_errors() -> list[str]`; `thinking()` không phát khi tín hiệu gần nhất đã là `thinking`. `runner.py`: `status.working(block["name"])` trước `_run_tool`; `status.working(CLASSIFY_STEP)` trước `_call_model("classify", ...)`; `status.working("set_classification")` trước `_apply_classification` ở `L1+`; `write_entry(..., error="; ".join([*tool_errors, *status.take_errors()]) or None)` ở cả nhánh `GatewayError` và các `write_entry` của `classify`.
+  - Test: `test_run_status.py`: `test_every_granted_tool_and_classify_step_has_label`, `test_unknown_tool_gets_fallback_label`, `test_payload_has_exactly_seven_keys`. `test_runner_status.py`: `test_signal_sequence_read_tool_then_answer` (thinking, working(đọc phiếu), thinking, working(viết trả lời), thinking, done), `test_ticket_insert_l0_gets_start_signal`, `test_ticket_insert_l1_signal_sequence`, `test_ticket_insert_never_waits` (L0 và L1), `test_tool_arguments_and_ticket_text_never_in_payload`.
+  - Expect: `cmd.test_one` trên `test_run_status.py` và `test_runner_status.py` xanh.
+- [x] T6 — `done` ở mọi nhánh kết thúc, kể cả rollback; `_end_status` — files: erp_ai/agent/runner.py, erp_ai/agent/run_status.py, erp_ai/agent/test_runner_status.py — test: erp_ai/agent/test_runner_status.py — depends: T5
+  - progress: BASE=e93d9b1 · dev call 1 · round 1 request-changes (2 major STD-TEST-2) · dev call 2 · round 2 approve · merged fc9f072
+  - Tiêu chí: AC-4 (mọi nhánh), R-2, NFR-5 (`done` sau `write_entry` cuối), NFR-6 (không thêm bản ghi `Comment`/`Task`/`modified`), `design.md` 4.4–4.5.
+  - Receives: `RunStatus.take_errors()` (T5), `TITLE_STATUS_FAILED` (T1).
+  - Returns: `runner.py`: `_end_status(status, delay, ticket_name, run_id, trigger)` chạy ở `finally` của `_run` (thay `status.done()` đơn giản của T1): `status.done()`; mỗi mảnh còn lại → `frappe.log_error(TITLE_STATUS_FAILED, f"ticket={ticket_name} run_id={run_id} {mảnh}")`; một dòng `frappe.logger(LOGGER_NAME).info("erp_ai run_status ticket=%s run_id=%s trigger=%s signals=%d errors=%d delay_s=%.1f waited_s=%.1f", ...)`; không commit, không rollback. `RunStatus.signal_count` thuộc tính.
+  - Test: `test_done_last_when_no_post_comment`, `test_done_last_on_gateway_error`, `test_done_last_on_deadline`, `test_done_last_on_max_turns`, `test_done_last_after_tool_exception`, `test_done_last_on_classify_gateway_error`, `test_done_last_on_unexpected_runner_exception` (patch `runner.build_initial_message` ném), `test_done_reaches_page_on_rollback_branch` (theo mẫu `test_failure_after_tool_rolls_ticket_back_and_keeps_entry`), `test_done_after_last_log_entry`, `test_feature_adds_no_comment_task_or_ticket_change`.
+  - Expect: `cmd.test_one` trên `test_runner_status.py` xanh; dán đầu ra nhánh rollback.
+- [x] T7 — Lỗi khi phát không chặn lần chạy; không lộ câu chữ vào nhật ký — files: erp_ai/agent/run_status.py, erp_ai/agent/runner.py, erp_ai/agent/test_run_status.py, erp_ai/agent/test_runner_status.py — test: erp_ai/agent/test_runner_status.py — depends: T6
+  - progress: BASE=8108969 · dev call 1 · round 1 request-changes (1 major STD-TEST-2) · dev call 2 · round 2 approve · merged 533f93f
+  - Tiêu chí: AC-7 (bắt đầu / "đang làm" / kết thúc, mỗi bước một test), NFR-4' (nhật ký, Error Log, dòng logger không chứa câu chữ cấu hình, nhãn hay nội dung phiếu), D-9.
+  - Receives: `_end_status` (T6); `RunStatus._emit` bắt lỗi (T1).
+  - Returns: chỉ sửa mã sản phẩm nếu test đỏ lộ lỗi (ví dụ `start()` chưa đặt `started` trước khi phát, hoặc mảnh lỗi chưa nối vào `error` của bản ghi kế tiếp); không thêm hành vi mới ngoài `design.md` 3.3, 4.6.
+  - Test: `test_run_status.py`: `test_emit_never_raises_and_records_class`, `test_done_sent_after_failed_start`. `test_runner_status.py`: `test_start_signal_failure_still_answers_and_logs_class` (`emit_via_redis` ném `RuntimeError` khi `state == thinking`; `error` lượt 1 chứa `status_thinking: RuntimeError`), `test_working_signal_failure_still_answers_and_logs_class`, `test_done_signal_failure_logged_to_error_log_class_only`, `test_status_text_never_in_logs` (chuỗi đánh dấu).
+  - Expect: `cmd.test_one` trên cả hai file xanh.
+- [x] T8 — Script chỉ báo trên trang phiếu `agent_status_indicator.js` — files: erp_ai/public/js/agent_status_indicator.js, erp_ai/tests/test_architecture.py — test: erp_ai/tests/test_architecture.py — depends: T1
+  - progress: BASE=e57751b · dev call 1 · round 1 request-changes (2 major) · dev call 2 · round 2 approve · merged 18c1a9e
+  - Tiêu chí: AC-10 (hỗ trợ bước tay (a)–(i)), AC-11 (hẹn giờ theo `expires_in_s`, không viết cứng 600), R-1, R-3, ADR-007 Quyết định 5.
+  - Receives: tên sự kiện `erp_ai:agent_status` (T1), payload 7 khóa (`design.md` 3.2).
+  - Returns: `function setupForm({ doc, router })` cấp cao nhất, trả `{ actions: [] }`, thân bọc `try/catch` có comment lý do; logic đúng `design.md` 3.7 (`socket.on(EVENT, onStatus)` một lần, `doc_subscribe`, lọc `ticket_id`, `runs`/`finished`, `render()` bằng `textContent`). Không `import`/`export`. `test_architecture.py`: `A::test_status_script_static_rules` (từ cấm mục 3.7; có `textContent`, `doc_subscribe`, `"connect"`, `setTimeout`, `try`; đọc `expires_in_s`; không có `600`), `A::test_status_event_name_matches_script`.
+  - Expect: `cmd.test_one` trên `test_architecture.py` xanh; `cmd.format` trên tệp `.js` sạch, dán đầu ra. Phần hiển thị chỉ kiểm bằng bước tay (A-21, J1).
+- [x] T9 — Cài đặt bản ghi HD Form Script và gỡ khi gỡ app — files: erp_ai/install.py, erp_ai/hooks.py, erp_ai/tests/test_install.py — test: erp_ai/tests/test_install.py — depends: T2, T8
+  - progress: BASE=177f013 · dev call 1 · round 1 request-changes (2 major) · dev call 2 · round 2 approve · merged 8d61533
+  - Tiêu chí: AC-12, A-22, ADR-007.
+  - Receives: tệp `erp_ai/public/js/agent_status_indicator.js` (T8); `test_install.py` đã có 2 test T2.
+  - Returns: `install.py`: hằng `FORM_SCRIPT_DOCTYPE = "HD Form Script"`, `AGENT_STATUS_SCRIPT = "ERP AI Agent Status"`, `AGENT_STATUS_SCRIPT_FILE = ("public", "js", "agent_status_indicator.js")`, `AGENT_STATUS_SCRIPT_FLAGS` (đúng 6 cờ `design.md` 3.6); `_ensure_agent_status_script()` làm bước thứ 7 của `ensure_setup()` (thiếu doctype → cảnh báo logger rồi bỏ qua; chưa có → insert; khác → update + save; giống hệt → không lưu); `before_uninstall()` xóa đúng bản ghi đó, đây là lệnh xóa duy nhất. `hooks.py`: `before_uninstall = "erp_ai.install.before_uninstall"`. Cập nhật docstring `ensure_setup`.
+  - Test: `setUp` xóa bản ghi `ERP AI Agent Status` trong giao dịch, `_counts()` đếm bản ghi; `test_status_script_installed_once_matching_repo_file`, `test_status_script_reset_when_changed_on_site` (subTest 3 trường), `test_status_script_served_to_agent_page_only` (`get_form_script("HD Ticket")` có script; `is_customer_portal=True` thì không), `test_unchanged_status_script_is_not_saved_again`, `test_uninstall_removes_only_status_script`, `test_uninstall_without_record_is_noop`.
+  - Expect: `cmd.test_one` trên `test_install.py` xanh.
+- [x] T10 — Luật kiến trúc máy kiểm của ADR-007 và ADR-008 — files: erp_ai/tests/test_architecture.py — test: erp_ai/tests/test_architecture.py — depends: T7, T9
+  - progress: BASE=064b57e · dev call 1 · round 1 request-changes (3 major STD-TEST-8) · round 2 request-changes (1 major) · round 3 approve · merged 8231347
+  - Tiêu chí: ADR-007, ADR-008, NFR-6 (`run_status.py` không ghi gì), R-1.
+  - Receives: `run_status.py` cuối cùng (T7), `install.py`/`hooks.py` (T9), hai test tĩnh của T8.
+  - Returns: `A::test_publish_realtime_only_in_run_status`, `A::test_run_status_imported_only_by_runner`, `A::test_run_status_writes_nothing`, `A::test_no_open_doc_or_all_room`, `A::test_form_script_only_in_install`, `A::test_hooks_have_no_page_injection`, `A::test_install_deletes_only_status_script_on_uninstall`, và `TestScannersCatchViolations::test_status_scanners_catch_violations` (mỗi bộ quét mới bắt được một nguồn vi phạm giả, cùng kiểu test bộ quét có sẵn).
+  - Expect: `cmd.test_one` trên `test_architecture.py` xanh; sửa `LAYER_RULES` nếu `agent/run_status.py`/`agent/answer_delay.py` chưa có mặt.

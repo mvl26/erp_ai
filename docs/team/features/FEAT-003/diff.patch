@@ -1,0 +1,3348 @@
+diff --git a/erp_ai/agent/policy.py b/erp_ai/agent/policy.py
+index 73bf321..67284ce 100644
+--- a/erp_ai/agent/policy.py
++++ b/erp_ai/agent/policy.py
+@@ -45,6 +45,10 @@ def contains_keyword(content) -> bool:
+ 	return keyword.casefold() in (content or "").casefold()
+ 
+ 
++def get_trigger_keyword() -> str:
++	return frappe.db.get_single_value(SETTING_DOCTYPE, "trigger_keyword") or ""
++
++
+ def effective_level(settings) -> str:
+ 	"""The only reader of permission_level; over budget caps at L1 but never raises L0."""
+ 	level = settings.permission_level
+diff --git a/erp_ai/agent/test_policy.py b/erp_ai/agent/test_policy.py
+index c882aa3..f2529e9 100644
+--- a/erp_ai/agent/test_policy.py
++++ b/erp_ai/agent/test_policy.py
+@@ -120,6 +120,17 @@ class TestPolicy(FrappeTestCase):
+ 		set_agent_settings(trigger_keyword="")
+ 		self.assertFalse(policy.contains_keyword("anything @ai"))
+ 
++	def test_get_trigger_keyword_matches_contains_keyword(self):
++		for configured in ("@AI", " @ai ", "", None):
++			with self.subTest(configured=configured):
++				set_agent_settings(trigger_keyword=configured)
++				keyword = policy.get_trigger_keyword()
++				self.assertEqual(keyword, configured or "")
++				if keyword:
++					self.assertTrue(policy.contains_keyword(f"hi {keyword.upper()} there"))
++				else:
++					self.assertFalse(policy.contains_keyword("anything @ai"))
++
+ 	def test_effective_level_over_budget_never_raises(self):
+ 		cases = [("L3", "L1"), ("L2", "L1"), ("L1", "L1"), ("L0", "L0")]
+ 		for level, expected in cases:
+diff --git a/erp_ai/constants.py b/erp_ai/constants.py
+index cc381e1..e847b30 100644
+--- a/erp_ai/constants.py
++++ b/erp_ai/constants.py
+@@ -37,3 +37,9 @@ TITLE_STATUS_FAILED = "erp_ai: chỉ báo trạng thái lỗi"
+ AGENT_STATUS_EVENT = "erp_ai:agent_status"
+ 
+ LOGGER_NAME = "erp_ai"
++
++PANEL_METHODS = (
++	"erp_ai.ticket_panel.get_panel_data",
++	"erp_ai.ticket_panel.send_message",
++)
++PANEL_MAX_MESSAGE_CHARS = 2000
+diff --git a/erp_ai/erp_ai_agent/doctype/erp_ai_credential/erp_ai_credential.json b/erp_ai/erp_ai_agent/doctype/erp_ai_credential/erp_ai_credential.json
+index 3571569..4aba8f8 100644
+--- a/erp_ai/erp_ai_agent/doctype/erp_ai_credential/erp_ai_credential.json
++++ b/erp_ai/erp_ai_agent/doctype/erp_ai_credential/erp_ai_credential.json
+@@ -5,16 +5,19 @@
+  "editable_grid": 1,
+  "engine": "InnoDB",
+  "field_order": [
++  "section_key",
+   "label",
+   "provider",
+   "api_key",
+   "model_classify",
+   "model_reason",
++  "section_usage",
+   "try_order",
+   "purpose",
+   "budget_month_usd",
+   "spent_month_usd",
+   "enabled",
++  "section_state",
+   "status",
+   "paused_until",
+   "tokens_remaining",
+@@ -22,10 +25,17 @@
+   "error_count",
+   "last_error",
+   "last_success_at",
++  "section_note",
+   "note"
+  ],
+  "fields": [
+   {
++   "fieldname": "section_key",
++   "fieldtype": "Section Break",
++   "label": "Khóa và model"
++  },
++  {
++   "description": "Tên gọi để nhận biết khóa này, ví dụ \"Khóa chính\". Không trùng với khóa khác, không phân biệt hoa thường. Người nhập; hiện trong Log để biết lần gọi dùng khóa nào.",
+    "fieldname": "label",
+    "fieldtype": "Data",
+    "in_list_view": 1,
+@@ -34,28 +44,38 @@
+   },
+   {
+    "default": "Anthropic",
++   "description": "Nhà cung cấp model của khóa này: Anthropic hoặc OpenAI. Hiện chỉ khóa Anthropic được dùng; dòng chọn OpenAI bị bỏ qua khi gọi model. Người nhập.",
+    "fieldname": "provider",
+    "fieldtype": "Select",
+    "label": "Nhà cung cấp",
+    "options": "Anthropic\nOpenAI"
+   },
+   {
++   "description": "Khóa bí mật do nhà cung cấp cấp, lưu mã hóa, sau khi lưu không hiện lại và không bao giờ ghi vào Log. Muốn đổi thì nhập khóa mới. Người nhập.",
+    "fieldname": "api_key",
+    "fieldtype": "Password",
+    "label": "Khóa API"
+   },
+   {
++   "description": "Tên model dùng cho bước phân loại bằng khóa này. Để trống thì dùng model phân loại mặc định ở ERP AI Setting. Người nhập.",
+    "fieldname": "model_classify",
+    "fieldtype": "Data",
+    "label": "Model phân loại"
+   },
+   {
++   "description": "Tên model dùng cho bước lập luận bằng khóa này. Để trống thì khóa này không dùng cho bước lập luận. Người nhập.",
+    "fieldname": "model_reason",
+    "fieldtype": "Data",
+    "label": "Model lập luận"
+   },
++  {
++   "fieldname": "section_usage",
++   "fieldtype": "Section Break",
++   "label": "Thứ tự thử và ngân sách"
++  },
+   {
+    "default": "10",
++   "description": "Số nhỏ được thử trước, ví dụ 10. Để trống hoặc 0 thì coi như 99; khóa có số lớn hơn 99 vẫn được thử sau. Người nhập.",
+    "fieldname": "try_order",
+    "fieldtype": "Int",
+    "in_list_view": 1,
+@@ -63,6 +83,7 @@
+   },
+   {
+    "default": "Chính",
++   "description": "Chỉ để ghi chú khóa dùng vào việc gì (Chính, Dự phòng, Theo khách hàng); hiện không ảnh hưởng việc chọn khóa, thứ tự thử mới quyết định. Người nhập.",
+    "fieldname": "purpose",
+    "fieldtype": "Select",
+    "label": "Mục đích",
+@@ -70,6 +91,7 @@
+   },
+   {
+    "default": "0",
++   "description": "Ngân sách mỗi tháng của riêng khóa này, tính bằng USD. Nhập 0 là không giới hạn; đạt ngân sách thì bỏ qua khóa này. Lưu ý: nghĩa này ngược với ngân sách ở ERP AI Setting. Người nhập.",
+    "fieldname": "budget_month_usd",
+    "fieldtype": "Float",
+    "label": "Ngân sách tháng (USD)",
+@@ -77,6 +99,7 @@
+   },
+   {
+    "default": "0",
++   "description": "Số tiền đã chi trong tháng cho khóa này, tính bằng USD. Hệ thống tự ghi mỗi ngày, tính từ Log; người không sửa được.",
+    "fieldname": "spent_month_usd",
+    "fieldtype": "Float",
+    "label": "Đã chi tháng (USD)",
+@@ -85,13 +108,20 @@
+   },
+   {
+    "default": "1",
++   "description": "Tắt thì khóa này không được thử khi gọi model, dù trạng thái là gì. Dùng để tạm ngưng một khóa mà không xóa khóa đó. Người đặt.",
+    "fieldname": "enabled",
+    "fieldtype": "Check",
+    "in_list_view": 1,
+    "label": "Bật"
+   },
++  {
++   "fieldname": "section_state",
++   "fieldtype": "Section Break",
++   "label": "Trạng thái khóa"
++  },
+   {
+    "default": "Hoạt động",
++   "description": "Hoạt động, Tạm nghỉ, Hết hạn mức hoặc Lỗi khóa. Hệ thống tự đặt ba trạng thái sau; người chỉ được đổi Lỗi khóa về Hoạt động sau khi đã thay khóa mới.",
+    "fieldname": "status",
+    "fieldtype": "Select",
+    "in_list_view": 1,
+@@ -100,18 +130,21 @@
+    "read_only_depends_on": "eval:doc.status!='Lỗi khóa'"
+   },
+   {
++   "description": "Thời điểm khóa hết tạm nghỉ và được thử lại. Hệ thống tự ghi khi khóa chuyển sang Tạm nghỉ, không sửa được.",
+    "fieldname": "paused_until",
+    "fieldtype": "Datetime",
+    "label": "Tạm nghỉ đến",
+    "read_only": 1
+   },
+   {
++   "description": "Số token còn lại theo hạn mức nhà cung cấp báo trong lần gọi gần nhất. Hệ thống tự ghi sau mỗi lần gọi, không sửa được.",
+    "fieldname": "tokens_remaining",
+    "fieldtype": "Int",
+    "label": "Token còn lại",
+    "read_only": 1
+   },
+   {
++   "description": "Thời điểm hạn mức của nhà cung cấp được đặt lại. Hệ thống tự ghi sau mỗi lần gọi, không sửa được.",
+    "fieldname": "limit_reset_at",
+    "fieldtype": "Datetime",
+    "label": "Hạn mức đặt lại lúc",
+@@ -119,24 +152,33 @@
+   },
+   {
+    "default": "0",
++   "description": "Số lỗi liên tiếp của khóa này, về 0 khi gọi thành công. Hệ thống tự ghi sau mỗi lần gọi, không sửa được.",
+    "fieldname": "error_count",
+    "fieldtype": "Int",
+    "label": "Số lỗi",
+    "read_only": 1
+   },
+   {
++   "description": "Nội dung lỗi của lần gọi thất bại gần nhất, không bao giờ chứa khóa. Hệ thống tự ghi sau mỗi lần gọi, không sửa được.",
+    "fieldname": "last_error",
+    "fieldtype": "Small Text",
+    "label": "Lỗi gần nhất",
+    "read_only": 1
+   },
+   {
++   "description": "Thời điểm lần gọi thành công gần nhất. Hệ thống tự ghi sau mỗi lần gọi, không sửa được.",
+    "fieldname": "last_success_at",
+    "fieldtype": "Datetime",
+    "label": "Thành công gần nhất",
+    "read_only": 1
+   },
+   {
++   "fieldname": "section_note",
++   "fieldtype": "Section Break",
++   "label": "Ghi chú"
++  },
++  {
++   "description": "Ghi chú tự do của người quản trị về khóa này, ví dụ khóa của ai hoặc hạn dùng. Chỉ để tham khảo, không ảnh hưởng việc chạy. Người nhập.",
+    "fieldname": "note",
+    "fieldtype": "Small Text",
+    "label": "Ghi chú"
+@@ -144,7 +186,7 @@
+  ],
+  "istable": 1,
+  "links": [],
+- "modified": "2026-11-11 10:00:00.000000",
++ "modified": "2026-11-12 10:00:00.000000",
+  "modified_by": "Administrator",
+  "module": "ERP AI agent",
+  "name": "ERP AI Credential",
+diff --git a/erp_ai/erp_ai_agent/doctype/erp_ai_log/erp_ai_log.json b/erp_ai/erp_ai_agent/doctype/erp_ai_log/erp_ai_log.json
+index 7b24ade..f31c34a 100644
+--- a/erp_ai/erp_ai_agent/doctype/erp_ai_log/erp_ai_log.json
++++ b/erp_ai/erp_ai_agent/doctype/erp_ai_log/erp_ai_log.json
+@@ -5,6 +5,7 @@
+  "doctype": "DocType",
+  "engine": "InnoDB",
+  "field_order": [
++  "section_run",
+   "ticket",
+   "run_id",
+   "entry_type",
+@@ -12,6 +13,7 @@
+   "trigger",
+   "instructor",
+   "model",
++  "section_usage",
+   "input_tokens",
+   "output_tokens",
+   "cache_creation_input_tokens",
+@@ -21,27 +23,37 @@
+   "keys_tried",
+   "latency_ms",
+   "stop_reason",
++  "section_changes",
+   "tools_called",
+   "actions",
+   "value_before",
+   "value_after",
+   "skipped_fields",
++  "section_prediction",
+   "predicted_category",
+   "predicted_confidence",
+   "predicted_ticket_type",
+   "predicted_agent_group",
+   "predicted_priority",
+   "applied",
++  "section_correction",
+   "human_corrected_to",
+   "human_corrected_by",
+   "human_corrected_at",
++  "section_error",
+   "error"
+  ],
+  "fields": [
++  {
++   "fieldname": "section_run",
++   "fieldtype": "Section Break",
++   "label": "Lần chạy"
++  },
+   {
+    "fieldname": "ticket",
+    "fieldtype": "Link",
+    "label": "Phiếu",
++   "description": "Phiếu HD Ticket mà lần chạy này xử lý, hiện bằng mã phiếu. Dùng để lọc các bản ghi theo phiếu. Hệ thống tự ghi khi agent chạy, không sửa được.",
+    "options": "HD Ticket",
+    "search_index": 1,
+    "read_only": 1
+@@ -50,6 +62,7 @@
+    "fieldname": "run_id",
+    "fieldtype": "Data",
+    "label": "Mã lần chạy",
++   "description": "Mã chung của một lần chạy agent. Các bản ghi cùng một lần chạy có cùng mã, dùng để gom chúng lại với nhau. Hệ thống tự ghi khi agent chạy, không sửa được.",
+    "search_index": 1,
+    "read_only": 1
+   },
+@@ -57,6 +70,7 @@
+    "fieldname": "entry_type",
+    "fieldtype": "Select",
+    "label": "Loại bản ghi",
++   "description": "Loại bản ghi: classify là phân loại phiếu, reason là một lượt lập luận, skip là phiếu bị bỏ qua nên không chạy. Hệ thống tự ghi khi agent chạy, không sửa được.",
+    "options": "classify\nreason\nskip",
+    "read_only": 1
+   },
+@@ -64,12 +78,14 @@
+    "fieldname": "turn",
+    "fieldtype": "Int",
+    "label": "Lượt",
++   "description": "Số thứ tự lượt. Lượt 0 là phân loại hoặc bỏ qua; lượt 1 đến N là các lượt lập luận của vòng lặp agent. Hệ thống tự ghi khi agent chạy, không sửa được.",
+    "read_only": 1
+   },
+   {
+    "fieldname": "trigger",
+    "fieldtype": "Select",
+    "label": "Nguồn kích hoạt",
++   "description": "Nguồn kích hoạt: ticket_insert khi phiếu mới được tạo, comment_mention khi có bình luận chứa từ khóa kích hoạt. Hệ thống tự ghi khi agent chạy, không sửa được.",
+    "options": "ticket_insert\ncomment_mention",
+    "read_only": 1
+   },
+@@ -77,6 +93,7 @@
+    "fieldname": "instructor",
+    "fieldtype": "Link",
+    "label": "Người ra lệnh",
++   "description": "Người chỉ đạo agent: người viết bình luận mới nhất có vai trò ERP AI Instructor hoặc được người khác giao việc; nếu không có thì là chủ phiếu khi chủ phiếu đủ điều kiện đó. Có thể có cả khi nguồn là ticket_insert, và có thể khác người viết từ khóa kích hoạt. Chỉ dòng reason mới ghi. Hệ thống tự ghi khi agent chạy, không sửa được.",
+    "options": "User",
+    "read_only": 1
+   },
+@@ -84,36 +101,47 @@
+    "fieldname": "model",
+    "fieldtype": "Data",
+    "label": "Model",
++   "description": "Tên model đã xử lý lần gọi này, lấy từ dòng khóa API đã trả lời (hoặc model mặc định của Setting khi phân loại). Hệ thống tự ghi khi agent chạy, không sửa được.",
+    "read_only": 1
+   },
++  {
++   "fieldname": "section_usage",
++   "fieldtype": "Section Break",
++   "label": "Token, chi phí và khóa"
++  },
+   {
+    "fieldname": "input_tokens",
+    "fieldtype": "Int",
+    "label": "Token input",
++   "description": "Số token gửi lên model trong lần gọi này, không tính phần đọc hoặc ghi cache. Dùng để tính chi phí. Hệ thống tự ghi khi agent chạy, không sửa được.",
+    "read_only": 1
+   },
+   {
+    "fieldname": "output_tokens",
+    "fieldtype": "Int",
+    "label": "Token output",
++   "description": "Số token model trả về trong lần gọi này. Dùng để tính chi phí. Hệ thống tự ghi khi agent chạy, không sửa được.",
+    "read_only": 1
+   },
+   {
+    "fieldname": "cache_creation_input_tokens",
+    "fieldtype": "Int",
+    "label": "Token ghi cache",
++   "description": "Số token được ghi vào cache của nhà cung cấp trong lần gọi này. Tính theo đơn giá ghi cache. Hệ thống tự ghi khi agent chạy, không sửa được.",
+    "read_only": 1
+   },
+   {
+    "fieldname": "cache_read_input_tokens",
+    "fieldtype": "Int",
+    "label": "Token đọc cache",
++   "description": "Số token được đọc từ cache của nhà cung cấp trong lần gọi này. Tính theo đơn giá đọc cache. Hệ thống tự ghi khi agent chạy, không sửa được.",
+    "read_only": 1
+   },
+   {
+    "fieldname": "cost_usd",
+    "fieldtype": "Float",
+    "label": "Chi phí (USD)",
++   "description": "Chi phí lần gọi, tính bằng USD từ số token và đơn giá trong Setting. Tổng chi phí các dòng trong tháng được cộng vào số đã chi trong tháng của Setting. Hệ thống tự ghi khi agent chạy, không sửa được.",
+    "precision": "6",
+    "read_only": 1
+   },
+@@ -121,42 +149,54 @@
+    "fieldname": "credential_label",
+    "fieldtype": "Data",
+    "label": "Khóa đã trả lời",
++   "description": "Nhãn của khóa API đã dùng cho lần gọi này. Ở dòng gateway_error đó là khóa thử cuối cùng, chưa trả lời được. Chỉ ghi nhãn, không bao giờ ghi nội dung khóa. Hệ thống tự ghi khi agent chạy, không sửa được.",
+    "read_only": 1
+   },
+   {
+    "fieldname": "keys_tried",
+    "fieldtype": "Small Text",
+    "label": "Các khóa đã thử",
++   "description": "Danh sách nhãn khóa đã thử trong lần gọi này, kèm kết quả của từng khóa (thành công hoặc lý do bị bỏ qua). Hệ thống tự ghi khi agent chạy, không sửa được.",
+    "read_only": 1
+   },
+   {
+    "fieldname": "latency_ms",
+    "fieldtype": "Int",
+    "label": "Độ trễ (ms)",
++   "description": "Thời gian chờ của lần gọi, tính bằng mili giây, từ lúc gửi đến lúc nhận trả lời. Lần gọi lỗi ghi 0, không có thời gian đo. Hệ thống tự ghi khi agent chạy, không sửa được.",
+    "read_only": 1
+   },
+   {
+    "fieldname": "stop_reason",
+    "fieldtype": "Data",
+    "label": "Lý do dừng",
++   "description": "Lý do dừng của dòng này, ví dụ: tool_use (model muốn gọi tool), end_turn (model trả lời xong), max_turns, time_budget, gateway_error, unparseable (không đọc được kết quả phân loại); dòng bỏ qua ghi not_sendable, daily_limit hoặc level_L0. Hệ thống tự ghi khi agent chạy, không sửa được.",
+    "read_only": 1
+   },
++  {
++   "fieldname": "section_changes",
++   "fieldtype": "Section Break",
++   "label": "Tool và thay đổi trên phiếu"
++  },
+   {
+    "fieldname": "tools_called",
+    "fieldtype": "Small Text",
+    "label": "Tool đã gọi",
++   "description": "Danh sách tool agent đã gọi trong lượt này, theo thứ tự gọi; mỗi dòng reason chỉ ghi tool của lượt đó. Để trống nếu không gọi tool nào. Hệ thống tự ghi khi agent chạy, không sửa được.",
+    "read_only": 1
+   },
+   {
+    "fieldname": "actions",
+    "fieldtype": "Small Text",
+    "label": "Hành động",
++   "description": "Các hành động agent đã thực hiện trên phiếu, ví dụ ghi phân loại hoặc đăng bình luận. Để trống nếu chỉ đọc. Hệ thống tự ghi khi agent chạy, không sửa được.",
+    "read_only": 1
+   },
+   {
+    "fieldname": "value_before",
+    "fieldtype": "Code",
+    "label": "Giá trị trước",
++   "description": "Giá trị các trường của phiếu trước khi agent sửa, ở dạng JSON. Dùng để đối chiếu và hoàn tác thủ công. Hệ thống tự ghi khi agent chạy, không sửa được.",
+    "options": "JSON",
+    "read_only": 1
+   },
+@@ -164,6 +204,7 @@
+    "fieldname": "value_after",
+    "fieldtype": "Code",
+    "label": "Giá trị sau",
++   "description": "Giá trị các trường của phiếu sau khi agent sửa, ở dạng JSON. So sánh với giá trị trước để thấy thay đổi. Hệ thống tự ghi khi agent chạy, không sửa được.",
+    "options": "JSON",
+    "read_only": 1
+   },
+@@ -171,54 +212,73 @@
+    "fieldname": "skipped_fields",
+    "fieldtype": "Small Text",
+    "label": "Trường bỏ qua khi phân loại",
++   "description": "Các trường bị bỏ qua khi phân loại vì giá trị không hợp lệ hoặc không có trong hệ thống. Để trống nếu không bỏ qua trường nào. Hệ thống tự ghi khi agent chạy, không sửa được.",
+    "read_only": 1
+   },
++  {
++   "fieldname": "section_prediction",
++   "fieldtype": "Section Break",
++   "label": "Dự đoán phân loại"
++  },
+   {
+    "fieldname": "predicted_category",
+    "fieldtype": "Data",
+    "label": "Đầu mục dự đoán",
++   "description": "Đầu mục A đến F mà agent dự đoán cho phiếu, theo bảng đầu mục trong Setting. Để trống nếu không phân loại được. Hệ thống tự ghi khi agent chạy, không sửa được.",
+    "read_only": 1
+   },
+   {
+    "fieldname": "predicted_confidence",
+    "fieldtype": "Data",
+    "label": "Độ tin cậy dự đoán",
++   "description": "Độ tin cậy của dự đoán: Cao, Trung bình hoặc Thấp. Khi dự đoán được áp dụng, giá trị này được ghi vào trường ai_confidence của phiếu. Hệ thống tự ghi khi agent chạy, không sửa được.",
+    "read_only": 1
+   },
+   {
+    "fieldname": "predicted_ticket_type",
+    "fieldtype": "Data",
+    "label": "Loại phiếu dự đoán",
++   "description": "Loại phiếu mà agent dự đoán, theo đầu mục đã chọn. Đối chiếu với loại phiếu người sửa để đo độ chính xác. Hệ thống tự ghi khi agent chạy, không sửa được.",
+    "read_only": 1
+   },
+   {
+    "fieldname": "predicted_agent_group",
+    "fieldtype": "Data",
+    "label": "Nhóm xử lý dự đoán",
++   "description": "Nhóm xử lý mà agent dự đoán, theo đầu mục đã chọn. Đối chiếu với nhóm người sửa để đo độ chính xác. Hệ thống tự ghi khi agent chạy, không sửa được.",
+    "read_only": 1
+   },
+   {
+    "fieldname": "predicted_priority",
+    "fieldtype": "Data",
+    "label": "Ưu tiên dự đoán",
++   "description": "Mức ưu tiên mà agent dự đoán. Tiêu đề phiếu có [GẤP] thì ưu tiên là Urgent. Dùng để đo độ chính xác của dự đoán. Hệ thống tự ghi khi agent chạy, không sửa được.",
+    "read_only": 1
+   },
+   {
+    "fieldname": "applied",
+    "fieldtype": "Check",
+    "label": "Đã áp dụng",
++   "description": "Được chọn khi dự đoán đã ghi vào phiếu; bỏ trống nghĩa là chỉ ghi nhận dự đoán, phiếu không bị sửa (ví dụ ở mức quyền L0). Hệ thống tự ghi khi agent chạy, không sửa được.",
+    "read_only": 1
+   },
++  {
++   "fieldname": "section_correction",
++   "fieldtype": "Section Break",
++   "label": "Người sửa sau dự đoán"
++  },
+   {
+    "fieldname": "human_corrected_to",
+    "fieldtype": "Small Text",
+    "label": "Người sửa thành",
++   "description": "Giá trị mới khi người đổi loại phiếu, nhóm xử lý hoặc ưu tiên sau khi AI đã dự đoán. Hệ thống tự ghi khi người đổi, không sửa được.",
+    "read_only": 1
+   },
+   {
+    "fieldname": "human_corrected_by",
+    "fieldtype": "Link",
+    "label": "Người sửa",
++   "description": "Người đổi loại phiếu, nhóm xử lý hoặc ưu tiên sau khi AI đã dự đoán. Hệ thống tự ghi khi người đổi, không sửa được.",
+    "options": "User",
+    "read_only": 1
+   },
+@@ -226,17 +286,24 @@
+    "fieldname": "human_corrected_at",
+    "fieldtype": "Datetime",
+    "label": "Thời điểm sửa đầu tiên",
++   "description": "Thời điểm của lần sửa đầu tiên sau khi AI đã dự đoán; chỉ ghi ở lần sửa đầu, các lần sau không đổi. Hệ thống tự ghi, không sửa được.",
+    "read_only": 1
+   },
++  {
++   "fieldname": "section_error",
++   "fieldtype": "Section Break",
++   "label": "Lỗi"
++  },
+   {
+    "fieldname": "error",
+    "fieldtype": "Small Text",
+    "label": "Lỗi",
++   "description": "Nội dung lỗi khi lần chạy thất bại. Không có khóa API hay nội dung bí mật trong trường này; để trống nếu lần chạy không lỗi. Hệ thống tự ghi khi agent chạy, không sửa được.",
+    "read_only": 1
+   }
+  ],
+  "links": [],
+- "modified": "2026-11-11 12:00:00.000000",
++ "modified": "2026-11-12 12:00:00.000000",
+  "modified_by": "Administrator",
+  "module": "ERP AI agent",
+  "name": "ERP AI Log",
+diff --git a/erp_ai/erp_ai_agent/doctype/erp_ai_setting/erp_ai_setting.json b/erp_ai/erp_ai_agent/doctype/erp_ai_setting/erp_ai_setting.json
+index f2c24b6..2527592 100644
+--- a/erp_ai/erp_ai_agent/doctype/erp_ai_setting/erp_ai_setting.json
++++ b/erp_ai/erp_ai_agent/doctype/erp_ai_setting/erp_ai_setting.json
+@@ -4,73 +4,101 @@
+  "doctype": "DocType",
+  "engine": "InnoDB",
+  "field_order": [
++  "section_activation",
+   "enabled",
+   "permission_level",
++  "section_limits",
+   "max_turns_per_run",
+   "max_runs_per_ticket_per_day",
+   "max_keys_per_call",
+   "request_timeout_s",
++  "section_budget",
+   "monthly_budget_usd",
+   "spent_this_month_usd",
+   "price_input_per_mtok",
+   "price_cache_write_per_mtok",
+   "price_cache_read_per_mtok",
+   "price_output_per_mtok",
++  "section_model",
+   "model_classify_default",
+   "trigger_keyword",
+   "thinking_text",
+   "answer_delay_min_s",
+   "answer_delay_max_s",
++  "section_routing",
+   "excluded_teams",
+   "category_mapping",
+   "prompt_digest",
++  "section_alerts",
+   "alert_recipients",
+   "credentials"
+  ],
+  "fields": [
++  {
++   "fieldname": "section_activation",
++   "fieldtype": "Section Break",
++   "label": "Bật và mức quyền"
++  },
+   {
+    "fieldname": "enabled",
+    "fieldtype": "Check",
+    "label": "Bật agent",
+-   "default": "0"
++   "default": "0",
++   "description": "Bật hoặc tắt agent. Tắt thì không xếp lần chạy mới cho phiếu hay bình luận. Muốn bật phải có đủ 4 đơn giá lớn hơn 0 và từ khóa kích hoạt không rỗng, nếu thiếu thì không lưu được."
+   },
+   {
+    "fieldname": "permission_level",
+    "fieldtype": "Select",
+    "label": "Mức quyền",
+    "options": "L0\nL1\nL2\nL3",
+-   "default": "L0"
++   "default": "L0",
++   "description": "L0: chỉ phân loại phiếu mới và ghi vào Log, không sửa phiếu, không trả lời bình luận. L1: đọc dữ liệu, ghi phân loại hoặc gợi ý lên phiếu, đăng bình luận. L2 và L3 hiện có đúng bộ công cụ như L1. Khi đã chi vượt ngân sách tháng thì tự hạ về L1 (L0 giữ nguyên)."
++  },
++  {
++   "fieldname": "section_limits",
++   "fieldtype": "Section Break",
++   "label": "Giới hạn mỗi lần chạy"
+   },
+   {
+    "fieldname": "max_turns_per_run",
+    "fieldtype": "Int",
+    "label": "Số lượt tối đa mỗi lần chạy",
+-   "default": "8"
++   "default": "8",
++   "description": "Số lượt lập luận tối đa của một lần chạy, từ 1 đến 20. Chạm giới hạn thì agent dừng vòng lặp và kết thúc lần chạy đó."
+   },
+   {
+    "fieldname": "max_runs_per_ticket_per_day",
+    "fieldtype": "Int",
+    "label": "Số lần chạy tối đa mỗi phiếu mỗi ngày",
+-   "default": "5"
++   "default": "5",
++   "description": "Số lần agent được chạy trên một phiếu trong một ngày, từ 1 đến 50. Chạm giới hạn thì bỏ qua phiếu đó đến hết ngày (ngày tính từ 00:00)."
+   },
+   {
+    "fieldname": "max_keys_per_call",
+    "fieldtype": "Int",
+    "label": "Số khóa tối đa mỗi lời gọi",
+-   "default": "3"
++   "default": "3",
++   "description": "Số khóa API tối đa được thử cho một lời gọi, từ 1 đến 10. Thử hết số khóa này mà vẫn không được thì báo lỗi và gửi cảnh báo."
+   },
+   {
+    "fieldname": "request_timeout_s",
+    "fieldtype": "Int",
+    "label": "Timeout mỗi lời gọi API (giây)",
+-   "default": "60"
++   "default": "60",
++   "description": "Thời gian chờ tối đa của mỗi lời gọi API, tính bằng giây, từ 5 đến 300. Quá thời gian thì khóa đó tạm nghỉ và chuyển sang khóa kế tiếp."
++  },
++  {
++   "fieldname": "section_budget",
++   "fieldtype": "Section Break",
++   "label": "Ngân sách và đơn giá"
+   },
+   {
+    "fieldname": "monthly_budget_usd",
+    "fieldtype": "Float",
+    "label": "Ngân sách tháng (USD)",
+    "default": "10",
+-   "precision": "6"
++   "precision": "6",
++   "description": "Ngân sách mỗi tháng dương lịch, tính bằng USD, không âm. Chi vượt thì quyền hạ về L1, không chặn chạy. Nhập 0 nghĩa là hạ về L1 ngay khi có chi phí, không phải là không giới hạn."
+   },
+   {
+    "fieldname": "spent_this_month_usd",
+@@ -78,97 +106,126 @@
+    "label": "Đã chi tháng này (USD)",
+    "default": "0",
+    "precision": "6",
+-   "read_only": 1
++   "read_only": 1,
++   "description": "Hệ thống tự ghi: mỗi ngày tự tính bằng tổng chi phí trong Log của tháng hiện tại, nên ngày 1 bắt đầu lại từ khoảng 0. Đơn vị USD, không sửa được; giá trị gõ vào bị bỏ khi lưu."
+   },
+   {
+    "fieldname": "price_input_per_mtok",
+    "fieldtype": "Float",
+    "label": "Đơn giá input (USD / 1 triệu token)",
+-   "default": "0"
++   "default": "0",
++   "description": "Đơn giá token đầu vào, tính bằng USD cho 1 triệu token. Dùng để tính chi phí ghi vào Log. Không được âm; bằng 0 thì không bật được agent."
+   },
+   {
+    "fieldname": "price_cache_write_per_mtok",
+    "fieldtype": "Float",
+    "label": "Đơn giá ghi cache (USD / 1 triệu token)",
+-   "default": "0"
++   "default": "0",
++   "description": "Đơn giá ghi cache, tính bằng USD cho 1 triệu token. Dùng để tính chi phí ghi vào Log. Không được âm; bằng 0 thì không bật được agent."
+   },
+   {
+    "fieldname": "price_cache_read_per_mtok",
+    "fieldtype": "Float",
+    "label": "Đơn giá đọc cache (USD / 1 triệu token)",
+-   "default": "0"
++   "default": "0",
++   "description": "Đơn giá đọc cache, tính bằng USD cho 1 triệu token. Dùng để tính chi phí ghi vào Log. Không được âm; bằng 0 thì không bật được agent."
+   },
+   {
+    "fieldname": "price_output_per_mtok",
+    "fieldtype": "Float",
+    "label": "Đơn giá output (USD / 1 triệu token)",
+-   "default": "0"
++   "default": "0",
++   "description": "Đơn giá token đầu ra, tính bằng USD cho 1 triệu token. Dùng để tính chi phí ghi vào Log. Không được âm; bằng 0 thì không bật được agent."
++  },
++  {
++   "fieldname": "section_model",
++   "fieldtype": "Section Break",
++   "label": "Model, từ khóa và chỉ báo trả lời"
+   },
+   {
+    "fieldname": "model_classify_default",
+    "fieldtype": "Data",
+    "label": "Model phân loại mặc định",
+-   "default": "claude-haiku-5-5"
++   "default": "claude-haiku-5-5",
++   "description": "Tên model dùng để phân loại phiếu khi dòng khóa API không ghi model phân loại riêng. Nhập đúng tên model của nhà cung cấp."
+   },
+   {
+    "fieldname": "trigger_keyword",
+    "fieldtype": "Data",
+    "label": "Từ khóa kích hoạt",
+-   "default": "@ai"
++   "default": "@ai",
++   "description": "Bình luận trên phiếu chứa cụm này (không phân biệt hoa thường) thì agent được gọi. Ví dụ: @ai. Không được để trống khi bật agent."
+   },
+   {
+    "fieldname": "thinking_text",
+    "fieldtype": "Small Text",
+    "label": "Chữ chỉ báo khi đang suy nghĩ",
+    "default": "Đang suy nghĩ…",
+-   "description": "Hiện trên chỉ báo trạng thái ở trang phiếu. Để trống để tắt chỉ báo; khoảng trễ vẫn áp dụng."
++   "description": "Hiện trên chỉ báo trạng thái ở trang phiếu. Để trống để tắt chỉ báo; khoảng trễ (tính bằng giây, đặt ở hai ô kế tiếp) vẫn áp dụng."
+   },
+   {
+    "fieldname": "answer_delay_min_s",
+    "fieldtype": "Int",
+    "label": "Trễ trả lời tối thiểu (giây)",
+-   "default": "3"
++   "default": "3",
++   "description": "Độ trễ tối thiểu trước khi trả lời, tính bằng giây, từ 0 đến 30, không lớn hơn mức tối đa. Chỉ áp dụng khi agent được gọi bằng bình luận."
+   },
+   {
+    "fieldname": "answer_delay_max_s",
+    "fieldtype": "Int",
+    "label": "Trễ trả lời tối đa (giây)",
+-   "default": "5"
++   "default": "5",
++   "description": "Độ trễ tối đa trước khi trả lời, tính bằng giây, từ 0 đến 30, không nhỏ hơn mức tối thiểu. Chỉ áp dụng khi agent được gọi bằng bình luận."
++  },
++  {
++   "fieldname": "section_routing",
++   "fieldtype": "Section Break",
++   "label": "Phân loại và nhóm loại trừ"
+   },
+   {
+    "fieldname": "excluded_teams",
+    "fieldtype": "Small Text",
+    "label": "Nhóm loại trừ",
+-   "default": "Nhân sự & Hành chính\nTài chính Kế toán"
++   "default": "Nhân sự & Hành chính\nTài chính Kế toán",
++   "description": "Mỗi dòng một tên nhóm, so với Nhóm xử lý của phiếu, không phân biệt hoa thường. Phiếu thuộc các nhóm này thì agent bỏ qua."
+   },
+   {
+    "fieldname": "category_mapping",
+    "fieldtype": "Code",
+    "label": "Ánh xạ đầu mục",
+    "options": "JSON",
+-   "default": "{\"A\": {\"ticket_type\": \"Sự cố & lỗi hệ thống\", \"agent_group\": \"IT\", \"priority\": \"High\"}, \"B\": {\"ticket_type\": \"Quản trị & cấu hình hệ thống\", \"agent_group\": \"IT\", \"priority\": \"Medium\"}, \"C\": {\"ticket_type\": \"Phát triển tính năng & tự động hóa\", \"agent_group\": \"IT\", \"priority\": \"Medium\"}, \"D\": {\"ticket_type\": \"Chuẩn hóa dữ liệu & quy trình trên ERP\", \"agent_group\": \"\", \"priority\": \"Medium\"}, \"E\": {\"ticket_type\": \"Công việc nghiệp vụ ngoài IT\", \"agent_group\": \"\", \"priority\": \"\"}, \"F\": {\"ticket_type\": \"Câu hỏi, phiếu nhiễu\", \"agent_group\": \"IT\", \"priority\": \"Low\"}}"
++   "default": "{\"A\": {\"ticket_type\": \"Sự cố & lỗi hệ thống\", \"agent_group\": \"IT\", \"priority\": \"High\"}, \"B\": {\"ticket_type\": \"Quản trị & cấu hình hệ thống\", \"agent_group\": \"IT\", \"priority\": \"Medium\"}, \"C\": {\"ticket_type\": \"Phát triển tính năng & tự động hóa\", \"agent_group\": \"IT\", \"priority\": \"Medium\"}, \"D\": {\"ticket_type\": \"Chuẩn hóa dữ liệu & quy trình trên ERP\", \"agent_group\": \"\", \"priority\": \"Medium\"}, \"E\": {\"ticket_type\": \"Công việc nghiệp vụ ngoài IT\", \"agent_group\": \"\", \"priority\": \"\"}, \"F\": {\"ticket_type\": \"Câu hỏi, phiếu nhiễu\", \"agent_group\": \"IT\", \"priority\": \"Low\"}}",
++   "description": "JSON gồm các đầu mục A đến F. Mỗi đầu mục có thể có loại phiếu, nhóm xử lý, ưu tiên. Sai cú pháp thì không lưu được. Tiêu đề phiếu có [GẤP] thì ưu tiên thành Urgent."
+   },
+   {
+    "fieldname": "prompt_digest",
+    "fieldtype": "Long Text",
+-   "label": "Trích yếu HDSD"
++   "label": "Trích yếu HDSD",
++   "description": "Người tự nhập, hệ thống không tự điền. Được nối vào cuối hướng dẫn của bước lập luận, không dùng ở bước phân loại."
++  },
++  {
++   "fieldname": "section_alerts",
++   "fieldtype": "Section Break",
++   "label": "Cảnh báo và khóa API"
+   },
+   {
+    "fieldname": "alert_recipients",
+    "fieldtype": "Small Text",
+    "label": "Người nhận cảnh báo",
+-   "default": "[email-redacted]"
++   "default": "[email-redacted]",
++   "description": "Mỗi dòng một email, không tách bằng dấu phẩy, ví dụ [email-redacted]. Nhận cảnh báo: khóa lỗi, khóa hết hạn mức, hết khóa dùng được, khóa hoạt động lại, cảnh báo leo quyền hằng ngày."
+   },
+   {
+    "fieldname": "credentials",
+    "fieldtype": "Table",
+    "label": "Khóa API",
+-   "options": "ERP AI Credential"
++   "options": "ERP AI Credential",
++   "description": "Danh sách khóa API. Nhãn bắt buộc và không trùng nhau (không phân biệt hoa thường). Có nút Kiểm tra khóa."
+   }
+  ],
+  "issingle": 1,
+  "links": [],
+- "modified": "2026-11-12 10:00:00.000000",
++ "modified": "2026-11-12 18:00:00.000000",
+  "modified_by": "Administrator",
+  "module": "ERP AI agent",
+  "name": "ERP AI Setting",
+diff --git a/erp_ai/public/js/agent_status_indicator.js b/erp_ai/public/js/agent_status_indicator.js
+index 551897d..1f940d9 100644
+--- a/erp_ai/public/js/agent_status_indicator.js
++++ b/erp_ai/public/js/agent_status_indicator.js
+@@ -1,6 +1,50 @@
+-function setupForm({ doc, router }) {
++function setupForm({ doc, call, router }) {
+ 	try {
+ 		const EVENT = "erp_ai:agent_status";
++		const ACTION_LABEL = "Trao đổi với bot";
++		const TEXT_PANEL_TITLE = "Hướng giải quyết & trao đổi với bot";
++		const TEXT_CLOSE = "Đóng";
++		const TEXT_AI_SECTION = "Hướng giải quyết của AI";
++		const TEXT_CHAT_SECTION = "Trao đổi với bot";
++		const TEXT_EMPTY_FIELD = "Chưa có";
++		const TEXT_EMPTY_THREAD = "Chưa có tin nào.";
++		const TEXT_BOT_LABEL = "Bot";
++		const TEXT_BOT_GUIDANCE =
++			"Bot có thể không trả lời khi đang tắt, đang ở chế độ chỉ ghi nhận, phiếu không dùng AI hoặc thuộc nhóm loại trừ, hoặc đã hết lượt hôm nay.";
++		const TEXT_LOAD_FAILED = "Không tải được dữ liệu của khu vực. Hãy đóng rồi mở lại.";
++		const TEXT_INPUT_PLACEHOLDER =
++			"Nhập câu hỏi cho bot. Enter để gửi, Shift+Enter để xuống dòng.";
++		const TEXT_SEND = "Gửi";
++		const TEXT_SENDING = "Đang gửi…";
++		const TEXT_EMPTY_MESSAGE = "Hãy nhập nội dung trước khi gửi.";
++		const TEXT_TOO_LONG = "Tin dài quá 2000 ký tự.";
++		const TEXT_SEND_FAILED = "Không gửi được tin. Chữ bạn gõ vẫn còn, hãy thử lại.";
++		const MAX_MESSAGE_CHARS = 2000;
++		const NARROW_SCREEN_PX = 640;
++		const INDICATOR_FLOATING_STYLE = {
++			position: "fixed",
++			right: "24px",
++			bottom: "88px",
++			zIndex: "40",
++		};
++		const INDICATOR_DOCKED_STYLE = {
++			position: "static",
++			right: "",
++			bottom: "",
++			zIndex: "",
++		};
++		const newPanelState = () => ({
++			el: null,
++			open: false,
++			slotEl: null,
++			aiListEl: null,
++			threadEl: null,
++			errorEl: null,
++			inputEl: null,
++			sendEl: null,
++			seq: 0,
++			sending: false,
++		});
+ 		const socket =
+ 			document.querySelector("#app")?.__vue_app__?.config?.globalProperties?.$socket;
+ 		if (!socket || typeof socket.on !== "function" || !doc?.name) {
+@@ -15,7 +59,13 @@ function setupForm({ doc, router }) {
+ 			nameEl: null,
+ 			textEl: null,
+ 			socket: null,
++			call: null,
++			panel: newPanelState(),
++			resizeBound: false,
+ 		});
++		state.call = call;
++		// A state object left by an older script version has no panel part.
++		state.panel = state.panel || newPanelState();
+ 
+ 		const ensureElement = () => {
+ 			if (state.el) {
+@@ -25,11 +75,7 @@ function setupForm({ doc, router }) {
+ 			el.setAttribute("role", "status");
+ 			el.setAttribute("aria-live", "polite");
+ 			el.hidden = true;
+-			Object.assign(el.style, {
+-				position: "fixed",
+-				right: "24px",
+-				bottom: "88px",
+-				zIndex: "40",
++			Object.assign(el.style, INDICATOR_FLOATING_STYLE, {
+ 				display: "flex",
+ 				alignItems: "center",
+ 				gap: "8px",
+@@ -98,6 +144,290 @@ function setupForm({ doc, router }) {
+ 			render();
+ 		};
+ 
++		const buildPanel = () => {
++			const panel = state.panel;
++			if (panel.el) {
++				return panel.el;
++			}
++			const el = document.createElement("div");
++			Object.assign(el.style, {
++				position: "fixed",
++				right: "24px",
++				top: "72px",
++				width: "380px",
++				maxHeight: "calc(100vh - 120px)",
++				overflowY: "auto",
++				zIndex: "40",
++				padding: "12px",
++				background: "#ffffff",
++				border: "1px solid #e5e7eb",
++				borderRadius: "8px",
++				boxShadow: "0 1px 4px rgba(0, 0, 0, 0.12)",
++				fontSize: "13px",
++			});
++			el.hidden = true;
++			const header = document.createElement("div");
++			Object.assign(header.style, {
++				display: "flex",
++				justifyContent: "space-between",
++				alignItems: "center",
++				marginBottom: "8px",
++			});
++			const title = document.createElement("strong");
++			title.textContent = TEXT_PANEL_TITLE;
++			const closeEl = document.createElement("button");
++			closeEl.type = "button";
++			closeEl.textContent = TEXT_CLOSE;
++			closeEl.addEventListener("click", () => {
++				try {
++					closePanel();
++				} catch (e) {
++					// A panel handler must never break the ticket page (ADR-009 decision 4).
++				}
++			});
++			header.append(title, closeEl);
++			const aiTitle = document.createElement("strong");
++			aiTitle.textContent = TEXT_AI_SECTION;
++			const aiListEl = document.createElement("div");
++			const chatTitle = document.createElement("strong");
++			chatTitle.textContent = TEXT_CHAT_SECTION;
++			const guidanceEl = document.createElement("div");
++			guidanceEl.style.color = "#6b7280";
++			guidanceEl.textContent = TEXT_BOT_GUIDANCE;
++			const threadEl = document.createElement("div");
++			const errorEl = document.createElement("div");
++			errorEl.style.color = "#b91c1c";
++			const formEl = document.createElement("div");
++			Object.assign(formEl.style, { display: "flex", gap: "8px", marginTop: "8px" });
++			const inputEl = document.createElement("textarea");
++			inputEl.rows = 2;
++			inputEl.style.flex = "1";
++			inputEl.placeholder = TEXT_INPUT_PLACEHOLDER;
++			inputEl.addEventListener("keydown", (event) => {
++				try {
++					if (event.key === "Enter" && !event.shiftKey && !event.isComposing) {
++						event.preventDefault();
++						submit();
++					}
++				} catch (e) {
++					// A panel handler must never break the ticket page (ADR-009 decision 4).
++				}
++			});
++			const sendEl = document.createElement("button");
++			sendEl.type = "button";
++			sendEl.textContent = TEXT_SEND;
++			sendEl.addEventListener("click", () => {
++				try {
++					submit();
++				} catch (e) {
++					// A panel handler must never break the ticket page (ADR-009 decision 4).
++				}
++			});
++			formEl.append(inputEl, sendEl);
++			const slotEl = document.createElement("div");
++			el.append(
++				header,
++				aiTitle,
++				aiListEl,
++				chatTitle,
++				guidanceEl,
++				threadEl,
++				errorEl,
++				formEl,
++				slotEl
++			);
++			document.body.appendChild(el);
++			panel.el = el;
++			panel.slotEl = slotEl;
++			panel.aiListEl = aiListEl;
++			panel.threadEl = threadEl;
++			panel.errorEl = errorEl;
++			panel.inputEl = inputEl;
++			panel.sendEl = sendEl;
++			return el;
++		};
++
++		const dockIndicator = (docked) => {
++			const el = ensureElement();
++			Object.assign(el.style, docked ? INDICATOR_DOCKED_STYLE : INDICATOR_FLOATING_STYLE);
++			(docked ? state.panel.slotEl : document.body).appendChild(el);
++		};
++
++		const closePanel = () => {
++			const panel = state.panel;
++			panel.open = false;
++			if (panel.el) {
++				panel.el.hidden = true;
++				dockIndicator(false);
++			}
++		};
++
++		const renderAiFields = (data) => {
++			const fields = data?.ai_fields;
++			if (!Array.isArray(fields)) {
++				throw new Error("ai_fields is not a list");
++			}
++			const nodes = fields.map((field) => {
++				const row = document.createElement("div");
++				row.style.marginTop = "8px";
++				const label = document.createElement("strong");
++				label.textContent = field?.label || "";
++				const body = document.createElement("div");
++				body.style.whiteSpace = "pre-wrap";
++				body.textContent = field?.text ?? TEXT_EMPTY_FIELD;
++				row.append(label, body);
++				return row;
++			});
++			state.panel.aiListEl.replaceChildren(...nodes);
++		};
++
++		const renderMessages = (data) => {
++			const messages = data?.messages;
++			if (!Array.isArray(messages)) {
++				throw new Error("messages is not a list");
++			}
++			if (messages.length === 0) {
++				const empty = document.createElement("div");
++				empty.style.marginTop = "8px";
++				empty.textContent = TEXT_EMPTY_THREAD;
++				state.panel.threadEl.replaceChildren(empty);
++				return;
++			}
++			const nodes = messages.map((message) => {
++				const row = document.createElement("div");
++				row.style.marginTop = "8px";
++				row.style.padding = "6px 8px";
++				row.style.borderRadius = "6px";
++				row.style.background = message?.is_bot ? "#eef2ff" : "#f9fafb";
++				const head = document.createElement("strong");
++				head.textContent = [
++					message?.is_bot ? TEXT_BOT_LABEL : "",
++					message?.author,
++					message?.created_at,
++				]
++					.filter(Boolean)
++					.join(" · ");
++				const body = document.createElement("div");
++				body.style.whiteSpace = "pre-wrap";
++				body.textContent = message?.text ?? "";
++				row.append(head, body);
++				return row;
++			});
++			state.panel.threadEl.replaceChildren(...nodes);
++		};
++
++		const reload = () => {
++			const panel = state.panel;
++			if (!panel.open || !state.ticket) {
++				return;
++			}
++			const seq = ++panel.seq;
++			const ticket = state.ticket;
++			const isStale = () => seq !== panel.seq || ticket !== state.ticket || !panel.open;
++			const showLoadFailed = () => {
++				if (!isStale()) {
++					panel.errorEl.textContent = TEXT_LOAD_FAILED;
++				}
++			};
++			try {
++				state
++					.call("erp_ai.ticket_panel.get_panel_data", { ticket })
++					.then((data) => {
++						try {
++							if (isStale()) {
++								return;
++							}
++							renderAiFields(data);
++							renderMessages(data);
++							panel.errorEl.textContent = "";
++						} catch (e) {
++							panel.aiListEl.replaceChildren();
++							panel.threadEl.replaceChildren();
++							panel.errorEl.textContent = TEXT_LOAD_FAILED;
++						}
++					})
++					.catch(showLoadFailed);
++			} catch (e) {
++				showLoadFailed();
++			}
++		};
++
++		const submit = () => {
++			const panel = state.panel;
++			if (panel.sending || !panel.open || !state.ticket) {
++				return;
++			}
++			const value = panel.inputEl.value.trim();
++			if (!value) {
++				panel.errorEl.textContent = TEXT_EMPTY_MESSAGE;
++				return;
++			}
++			if (value.length > MAX_MESSAGE_CHARS) {
++				panel.errorEl.textContent = TEXT_TOO_LONG;
++				return;
++			}
++			const ticket = state.ticket;
++			const isStale = () => ticket !== state.ticket;
++			const unlock = () => {
++				panel.sending = false;
++				panel.inputEl.disabled = false;
++				panel.sendEl.disabled = false;
++				panel.sendEl.textContent = TEXT_SEND;
++			};
++			const onSent = () => {
++				try {
++					unlock();
++					if (isStale()) {
++						return;
++					}
++					panel.inputEl.value = "";
++					panel.errorEl.textContent = "";
++					reload();
++				} catch (e) {
++					// A panel handler must never break the ticket page (ADR-009 decision 4).
++				}
++			};
++			const onSendFailed = () => {
++				try {
++					unlock();
++					if (!isStale()) {
++						panel.errorEl.textContent = TEXT_SEND_FAILED;
++					}
++				} catch (e) {
++					// A panel handler must never break the ticket page (ADR-009 decision 4).
++				}
++			};
++			panel.errorEl.textContent = "";
++			panel.sending = true;
++			panel.inputEl.disabled = true;
++			panel.sendEl.disabled = true;
++			panel.sendEl.textContent = TEXT_SENDING;
++			try {
++				state
++					.call("erp_ai.ticket_panel.send_message", { ticket, text: value })
++					.then(onSent, onSendFailed);
++			} catch (e) {
++				onSendFailed();
++			}
++		};
++
++		const togglePanel = () => {
++			try {
++				const panel = state.panel;
++				if (panel.open) {
++					closePanel();
++					return;
++				}
++				buildPanel();
++				panel.open = true;
++				panel.el.hidden = false;
++				dockIndicator(true);
++				reload();
++			} catch (e) {
++				// A panel handler must never break the ticket page (ADR-009 decision 4).
++			}
++		};
++
+ 		const reset = () => {
+ 			for (const run of state.runs.values()) {
+ 				clearTimeout(run.timer);
+@@ -107,6 +437,17 @@ function setupForm({ doc, router }) {
+ 			if (state.el) {
+ 				state.el.hidden = true;
+ 			}
++			const panel = state.panel;
++			panel.seq++;
++			closePanel();
++			panel.aiListEl?.replaceChildren();
++			panel.threadEl?.replaceChildren();
++			if (panel.inputEl) {
++				panel.inputEl.value = "";
++			}
++			if (panel.errorEl) {
++				panel.errorEl.textContent = "";
++			}
+ 		};
+ 
+ 		const onStatus = (msg) => {
+@@ -154,6 +495,40 @@ function setupForm({ doc, router }) {
+ 			}
+ 		};
+ 
++		const onDocinfo = (msg) => {
++			try {
++				if (
++					msg?.key === "comments" &&
++					msg.doc?.reference_doctype === "HD Ticket" &&
++					String(msg.doc.reference_name) === state.ticket
++				) {
++					reload();
++				}
++			} catch (e) {
++				// A socket callback must never throw to the console (AC-10 g).
++			}
++		};
++
++		const onDocUpdate = (msg) => {
++			try {
++				if (msg?.doctype === "HD Ticket" && String(msg.name) === state.ticket) {
++					reload();
++				}
++			} catch (e) {
++				// A socket callback must never throw to the console (AC-10 g).
++			}
++		};
++
++		const onResize = () => {
++			try {
++				if (window.innerWidth < NARROW_SCREEN_PX) {
++					closePanel();
++				}
++			} catch (e) {
++				// A resize callback must never throw to the console (AC-10 g).
++			}
++		};
++
+ 		if (String(doc.name) !== state.ticket) {
+ 			reset();
+ 			state.ticket = String(doc.name);
+@@ -163,12 +538,17 @@ function setupForm({ doc, router }) {
+ 		if (state.socket !== socket) {
+ 			state.socket = socket;
+ 			socket.on(EVENT, onStatus);
++			socket.on("docinfo_update", onDocinfo);
++			socket.on("doc_update", onDocUpdate);
+ 			socket.on("connect", () => {
+ 				try {
+ 					// Re-join the room after a reconnect; never subscribe with no ticket open.
+ 					if (state.ticket) {
+ 						socket.emit("doc_subscribe", "HD Ticket", state.ticket);
+ 					}
++					if (state.panel.open) {
++						reload();
++					}
+ 				} catch (e) {
+ 					// A socket callback must never throw to the console (AC-10 g).
+ 				}
+@@ -188,6 +568,14 @@ function setupForm({ doc, router }) {
+ 				}
+ 			});
+ 		}
++		if (!state.resizeBound) {
++			state.resizeBound = true;
++			window.addEventListener("resize", onResize);
++		}
++		if (window.innerWidth < NARROW_SCREEN_PX) {
++			return { actions: [] };
++		}
++		return { actions: [{ label: ACTION_LABEL, onClick: togglePanel }] };
+ 	} catch (e) {
+ 		// The indicator must never break the ticket page (ADR-007 decision 5).
+ 	}
+diff --git a/erp_ai/tests/test_architecture.py b/erp_ai/tests/test_architecture.py
+index c5c6d1b..33c36a1 100644
+--- a/erp_ai/tests/test_architecture.py
++++ b/erp_ai/tests/test_architecture.py
+@@ -17,6 +17,9 @@ import shlex
+ import sys
+ import unittest
+ from pathlib import Path
++from typing import ClassVar
++
++from erp_ai.constants import AGENT_STATUS_EVENT, PANEL_METHODS
+ 
+ PACKAGE_ROOT = Path(__file__).resolve().parent.parent
+ REPO_ROOT = PACKAGE_ROOT.parent
+@@ -40,16 +43,24 @@ LAYER_RULES = (
+ 			"erp_ai.agent",
+ 			"erp_ai.eval",
+ 			"erp_ai.handlers",
++			"erp_ai.ticket_panel",
+ 			"erp_ai.tasks",
+ 			"erp_ai.install",
+ 			"erp_ai.erp_ai_agent",
+ 		),
+-		"ADR-001: gateway must not import agent, eval, handlers, scheduler, install or doctype controllers",
++		"ADR-001: gateway must not import agent, eval, handlers, ticket_panel, scheduler, install or doctype controllers",
+ 	),
+ 	(
+ 		"erp_ai.agent",
+-		("erp_ai.eval", "erp_ai.handlers", "erp_ai.tasks", "erp_ai.install", "erp_ai.erp_ai_agent"),
+-		"ADR-001: agent core must not import eval, handlers, scheduler, install or doctype controllers",
++		(
++			"erp_ai.eval",
++			"erp_ai.handlers",
++			"erp_ai.ticket_panel",
++			"erp_ai.tasks",
++			"erp_ai.install",
++			"erp_ai.erp_ai_agent",
++		),
++		"ADR-001: agent core must not import eval, handlers, ticket_panel, scheduler, install or doctype controllers",
+ 	),
+ 	(
+ 		"erp_ai.agent.tools",
+@@ -61,6 +72,11 @@ LAYER_RULES = (
+ 		("erp_ai.gateway", "erp_ai.agent.runner"),
+ 		"ADR-001/ADR-003: handlers enqueue by path string, never import gateway or runner",
+ 	),
++	(
++		"erp_ai.ticket_panel",
++		("erp_ai.gateway", "erp_ai.agent.runner", "erp_ai.agent.queue"),
++		"ADR-001/ADR-010: the panel is an entry layer, it never calls the model, runs the agent or enqueues",
++	),
+ )
+ # NOT forbidden on purpose: erp_ai.eval -> erp_ai.agent.runner (entry layer -> agent core, ADR-001).
+ 
+@@ -111,10 +127,24 @@ STATUS_SCRIPT_FORBIDDEN = (
+ 	r"frappe\.call",
+ 	r"updateField",
+ 	r"open_doc:",
+-	r"\bcall\b",
+ 	r"600",
+ 	r"HD Form Script",
+ 	r"^\s*(import|export)\b",
++	# ADR-009: the panel script must not parse markup, poll, unbind listeners or create navigable elements.
++	r"DOMParser",
++	r"createContextualFragment",
++	r"setInterval",
++	r"MutationObserver",
++	r"\.off\(",
++	r"removeListener",
++	r"removeAllListeners",
++	r'createElement\("a"',
++	r'createElement\("img"',
++	r'createElement\("iframe"',
++	r'createElement\("script"',
++	r"\.src =",
++	r"\.href =",
++	r"innerText =",
+ )
+ # Regexes: the socket guard keeps setupForm (run many times) from registering listeners twice; the
+ # `state.ticket = null` leave-page step keeps a left ticket's signals from showing (ADR-008 decision 6).
+@@ -129,8 +159,102 @@ STATUS_SCRIPT_REQUIRED = (
+ 	r"if \(state\.socket !== socket\)",
+ 	r"state\.ticket = null",
+ 	r"if \(state\.ticket\)",
++	# T12: message thread, labels, B-8 guidance, close button, indicator moved into the panel and back.
++	r"threadEl",
++	r"renderMessages",
++	r'TEXT_EMPTY_THREAD = "Chưa có tin nào\."',
++	r'TEXT_BOT_LABEL = "Bot"',
++	r'TEXT_CLOSE = "Đóng"',
++	r"Bot có thể không trả lời khi đang tắt, đang ở chế độ chỉ ghi nhận, "
++	r"phiếu không dùng AI hoặc thuộc nhóm loại trừ, hoặc đã hết lượt hôm nay\.",
++	r'TEXT_LOAD_FAILED = "Không tải được dữ liệu của khu vực\. Hãy đóng rồi mở lại\."',
++	r"\(docked \? state\.panel\.slotEl : document\.body\)\.appendChild\(el\)",
++	# T12: stale-result guard (design F1 reload).
++	r"seq !== panel\.seq \|\| ticket !== state\.ticket \|\| !panel\.open",
++	# T12 use sites (the pins above match declarations; these match where each is used).
++	r"renderMessages\(data\)",
++	r"if \(isStale\(\)\) \{\s*return;",
++	r"dockIndicator\(true\)",
++	r"dockIndicator\(false\)",
++	r"textContent = TEXT_BOT_GUIDANCE",
++	r"textContent = TEXT_EMPTY_THREAD",
++	r"textContent = TEXT_CLOSE",
++	r"\? TEXT_BOT_LABEL :",
++	# A failed reload clears both lists (no new AI fields beside an old thread); reset tolerates an old panel state.
++	r"panel\.threadEl\.replaceChildren\(\);\s*panel\.errorEl\.textContent = TEXT_LOAD_FAILED",
++	r"panel\.threadEl\?\.replaceChildren\(\)",
++	# T13 send box: fixed texts, then the use sites (declaration-only pins were rejected in review).
++	r'TEXT_SEND_FAILED = "Không gửi được tin\. Chữ bạn gõ vẫn còn, hãy thử lại\."',
++	r'TEXT_EMPTY_MESSAGE = "Hãy nhập nội dung trước khi gửi\."',
++	r'TEXT_TOO_LONG = "Tin dài quá 2000 ký tự\."',
++	r'TEXT_SENDING = "Đang gửi…"',
++	r"MAX_MESSAGE_CHARS = 2000",
++	r'event\.key === "Enter" && !event\.shiftKey && !event\.isComposing',
++	r'sendEl\.addEventListener\("click"',
++	r"const value = panel\.inputEl\.value\.trim\(\)",
++	r"if \(!value\) \{\s*panel\.errorEl\.textContent = TEXT_EMPTY_MESSAGE;\s*return;",
++	r"value\.length > MAX_MESSAGE_CHARS\) \{\s*panel\.errorEl\.textContent = TEXT_TOO_LONG;\s*return;",
++	r"if \(panel\.sending \|\| !panel\.open",
++	r"panel\.sending = true",
++	r"panel\.sending = false",
++	r'state\s*\.call\("erp_ai\.ticket_panel\.send_message", \{ ticket, text: value \}\)',
++	r'panel\.inputEl\.value = "";\s*panel\.errorEl\.textContent = "";\s*reload\(\)',
++	# Failure only shows the fixed text: nothing else (such as clearing the box) happens in that branch.
++	r"if \(!isStale\(\)\) \{\s*panel\.errorEl\.textContent = TEXT_SEND_FAILED;\s*\}",
++	r"sendEl\.textContent = TEXT_SENDING",
++	r"sendEl\.textContent = TEXT_SEND\b",
++	r"inputEl\.placeholder = TEXT_INPUT_PLACEHOLDER",
++	# T13 r1: fixed values of the remaining texts, and the box is locked while a send is pending.
++	r'TEXT_SEND = "Gửi";',
++	r'TEXT_INPUT_PLACEHOLDER =\s*"Nhập câu hỏi cho bot\. Enter để gửi, Shift\+Enter để xuống dòng\."',
++	r"panel\.sendEl\.disabled = true;\s*panel\.sendEl\.textContent = TEXT_SENDING",
++	r"panel\.inputEl\.disabled = true",
++	# T13 r1: each wiring point pinned at its use site (a declaration or a copy elsewhere must not satisfy it).
++	r"const isStale = \(\) => ticket !== state\.ticket;",
++	r"unlock = \(\) => \{\s*panel\.sending = false;\s*panel\.inputEl\.disabled = false;\s*panel\.sendEl\.disabled = false;\s*panel\.sendEl\.textContent = TEXT_SEND;\s*\}",
++	r'unlock\(\);\s*if \(isStale\(\)\) \{\s*return;\s*\}\s*panel\.inputEl\.value = ""',
++	r"onSendFailed = \(\) => \{\s*try \{\s*unlock\(\);\s*if \(!isStale\(\)\)",
++	r"\.then\(onSent, onSendFailed\)",
++	r"catch \(e\) \{\s*onSendFailed\(\);",
++	r"isComposing\) \{\s*event\.preventDefault\(\);\s*submit\(\);",
++	r'addEventListener\("click", \(\) => \{\s*try \{\s*submit\(\);',
++	r"formEl,\s*slotEl",
++	# T14 live updates (design F3): both listeners are named handlers registered once per socket, in the guard block.
++	r'state\.socket = socket;\s*socket\.on\(EVENT, onStatus\);\s*socket\.on\("docinfo_update", onDocinfo\);\s*socket\.on\("doc_update", onDocUpdate\);',
++	r"docinfo_update",
++	r"doc_update",
++	# Payload keys: frappe comment.py:59-67 (key, doc.reference_doctype/name) and document.py:1370-1385 (doctype, name).
++	r'const onDocinfo = \(msg\) => \{\s*try \{\s*if \(\s*msg\?\.key === "comments" &&\s*msg\.doc\?\.reference_doctype === "HD Ticket" &&\s*String\(msg\.doc\.reference_name\) === state\.ticket\s*\) \{\s*reload\(\);',
++	r'const onDocUpdate = \(msg\) => \{\s*try \{\s*if \(msg\?\.doctype === "HD Ticket" && String\(msg\.name\) === state\.ticket\) \{\s*reload\(\);',
++	# Reconnect: re-join the room, then refill an open panel.
++	r'socket\.emit\("doc_subscribe", "HD Ticket", state\.ticket\);\s*\}\s*if \(state\.panel\.open\) \{\s*reload\(\);',
++	# Reset (ticket change or leaving the page): cancel pending loads, close the panel (returns the indicator), clear texts and the input.
++	r"const panel = state\.panel;\s*panel\.seq\+\+;\s*closePanel\(\);",
++	r'if \(panel\.inputEl\) \{\s*panel\.inputEl\.value = "";\s*\}',
++	r"String\(doc\.name\) !== state\.ticket\) \{\s*reset\(\);\s*state\.ticket = String\(doc\.name\)",
++	r"reset\(\);\s*state\.ticket = null",
++	# Narrow screen: one resize listener for the page lifetime, closing the panel under the width limit.
++	r"const onResize = \(\) => \{\s*try \{\s*if \(window\.innerWidth < NARROW_SCREEN_PX\) \{\s*closePanel\(\);",
++	r'if \(!state\.resizeBound\) \{\s*state\.resizeBound = true;\s*window\.addEventListener\("resize", onResize\);',
++	r"if \(window\.innerWidth < NARROW_SCREEN_PX\) \{\s*return \{ actions: \[\] \};",
+ )
+ 
++# ADR-009: every `call(` in the page script passes a string literal naming one of PANEL_METHODS.
++STATUS_SCRIPT_CALL = re.compile(r"\bcall\(\s*(\"([^\"]*)\")?")
++
++
++def check_status_script_calls(script: str, allowed_methods) -> list:
++	"""Violations: a `call(` whose first argument is not a literal in `allowed_methods`."""
++	violations = []
++	for match in STATUS_SCRIPT_CALL.finditer(script):
++		line = script.count("\n", 0, match.start()) + 1
++		if match.group(1) is None:
++			violations.append(f"line {line}: first argument of call( is not a string literal")
++		elif match.group(2) not in allowed_methods:
++			violations.append(f"line {line}: {match.group(2)} is not in PANEL_METHODS")
++	return violations
++
++
+ # ADR-008 (status signals) and ADR-007 (the one form script): who may publish, import, write or delete.
+ RUN_STATUS_FILE = "agent/run_status.py"
+ RUN_STATUS_MODULE = "erp_ai.agent.run_status"
+@@ -971,6 +1095,306 @@ def check_install_deletes_only_status_script(sources: dict) -> list:
+ 	return violations
+ 
+ 
++# ---------------------------------------------------------------------------------------------------
++# FEAT-003 (ADR-009, ADR-010 Amendment 1): the ticket-page panel script and the two whitelisted methods
++# ---------------------------------------------------------------------------------------------------
++
++PANEL_FILE = "ticket_panel.py"
++PANEL_MODULE = "erp_ai.ticket_panel"
++STATUS_SCRIPT_STATE_NAME = "__erpAiAgentStatus"
++STATUS_SCRIPT_ONCE_BLOCK = "if (state.socket !== socket) {"
++STATUS_SCRIPT_SOCKET_EVENTS = ("docinfo_update", "doc_update", "connect", "disconnect")
++STATUS_SCRIPT_QUERY_CALLS = re.compile(r"\b(querySelector(?:All)?|getElementById|getElementsBy\w+)\(")
++STATUS_SCRIPT_ALLOWED_QUERIES = {"querySelector": "#app", "getElementById": "app"}
++# ADR-010 Amendment 1 (read writes nothing, one comment call) and Decision 8 (no agent gates in the panel).
++PANEL_FORBIDDEN_NAMES = frozenset(
++	{
++		"ignore_permissions",
++		"set_user",
++		"get_all",
++		"get_values",
++		"sql",
++		"set_value",
++		"db_set",
++		"insert",
++		"save",
++		"commit",
++		"rollback",
++		"cache",
++		"publish_realtime",
++	}
++)
++PANEL_FORBIDDEN_PREFIXES = ("delete",)
++PANEL_SEND_FUNCTION = "send_message"
++PANEL_COMMENT_CALL = "new_comment"
++PANEL_GATE_NAMES = (
++	"is_enabled",
++	"can_send_ticket",
++	"effective_level",
++	"runs_today",
++	"enqueue",
++	"permission_level",
++	"excluded_teams",
++	"ai_opt_out",
++)
++
++
++def mask_js(script: str) -> str:
++	"""The script with comments and the inside of string literals blanked (same length, newlines kept), so
++	positions and braces can be found without matching text that sits in a string or a comment."""
++	out = []
++	i, n = 0, len(script)
++	while i < n:
++		ch = script[i]
++		pair = script[i : i + 2]
++		if pair == "//":
++			end = script.find("\n", i)
++			end = n if end == -1 else end
++			out.append(" " * (end - i))
++			i = end
++		elif pair == "/*":
++			end = script.find("*/", i + 2)
++			end = n if end == -1 else end + 2
++			out.append("".join(c if c == "\n" else " " for c in script[i:end]))
++			i = end
++		elif ch in "\"'`":
++			j = i + 1
++			while j < n and script[j] != ch:
++				j += 2 if script[j] == "\\" else 1
++			out.append(ch + "".join(c if c == "\n" else " " for c in script[i + 1 : j]) + script[j : j + 1])
++			i = j + 1
++		else:
++			out.append(ch)
++			i += 1
++	return "".join(out)
++
++
++def js_line(script: str, offset: int) -> int:
++	return script.count("\n", 0, offset) + 1
++
++
++def whitelisted_functions(sources: dict) -> list:
++	"""`[(rel, function node, decorator node)]` for every function decorated with `frappe.whitelist`."""
++	found = []
++	for rel, source in only_python(sources).items():
++		tree = parse(rel, source)
++		aliases = import_aliases(tree)
++		for node in ast.walk(tree):
++			if not isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
++				continue
++			for decorator in node.decorator_list:
++				target = decorator.func if isinstance(decorator, ast.Call) else decorator
++				if resolved_name(target, aliases) == "frappe.whitelist":
++					found.append((rel, node, decorator))
++	return found
++
++
++def whitelisted_paths(sources: dict) -> set:
++	return {f"{module_name(rel)}.{node.name}" for rel, node, _decorator in whitelisted_functions(sources)}
++
++
++def check_call_allow_list(script: str, allowed_methods, sources: dict) -> list:
++	"""ADR-009: the literals passed to `call(` are exactly the allowed methods, each a whitelisted function."""
++	violations = check_status_script_calls(script, allowed_methods)
++	literals = {m.group(2) for m in STATUS_SCRIPT_CALL.finditer(script) if m.group(1) is not None}
++	for missing in sorted(set(allowed_methods) - literals):
++		violations.append(f"{missing} is in PANEL_METHODS but the script never calls it")
++	paths = whitelisted_paths(sources)
++	for literal in sorted(literals):
++		if literal not in paths:
++			violations.append(f"{literal} does not point to a @frappe.whitelist function")
++	return violations
++
++
++def check_status_script_queries(script: str) -> list:
++	"""ADR-009: element lookups only for the Vue root (`#app`), never into Helpdesk's own DOM."""
++	violations = []
++	masked = mask_js(script)
++	for match in STATUS_SCRIPT_QUERY_CALLS.finditer(masked):
++		line = js_line(script, match.start())
++		argument = re.match(r"\s*([\"'])(.*?)\1\s*\)", script[match.end() :])
++		if argument is None or STATUS_SCRIPT_ALLOWED_QUERIES.get(match.group(1)) != argument.group(2):
++			violations.append(f"line {line}: {match.group(1)}( is only allowed with the Vue root (#app)")
++	return violations
++
++
++def check_status_script_window_state(script: str) -> list:
++	"""ADR-009: one `window.__erpAi…` state object and no other property written on `window`."""
++	violations = []
++	names = set(re.findall(r"__erpAi\w*", script))
++	if names != {STATUS_SCRIPT_STATE_NAME}:
++		violations.append(f"window state names are {sorted(names)}, expected only {STATUS_SCRIPT_STATE_NAME}")
++	masked = mask_js(script)
++	for match in re.finditer(r"\bwindow\.(\w+)\s*=(?!=)", masked):
++		if match.group(1) != STATUS_SCRIPT_STATE_NAME:
++			violations.append(f"line {js_line(script, match.start())}: window.{match.group(1)} is written")
++	for match in re.finditer(r"\bwindow\s*\[", masked):
++		violations.append(f"line {js_line(script, match.start())}: window[...] access hides a second state")
++	return violations
++
++
++def _matching_brace(masked: str, open_at: int) -> int:
++	depth = 0
++	for i in range(open_at, len(masked)):
++		if masked[i] == "{":
++			depth += 1
++		elif masked[i] == "}":
++			depth -= 1
++			if depth == 0:
++				return i
++	return -1
++
++
++def socket_on_registrations(script: str) -> list:
++	"""`[(line, inside the once-per-socket block, event name or None)]` for every `.on(` call."""
++	masked = mask_js(script)
++	start = masked.find(STATUS_SCRIPT_ONCE_BLOCK)
++	block = (-1, -1)
++	if start != -1:
++		open_at = start + len(STATUS_SCRIPT_ONCE_BLOCK) - 1
++		block = (open_at, _matching_brace(masked, open_at))
++	declared = re.search(r"const EVENT = \"([^\"]*)\"", script)
++	found = []
++	for match in re.finditer(r"\.on\(", masked):
++		argument = re.match(r"\s*(?:\"([^\"]*)\"|([A-Za-z_$][\w$]*))", script[match.end() :])
++		name = None
++		if argument is not None and argument.group(1) is not None:
++			name = argument.group(1)
++		elif argument is not None and argument.group(2) == "EVENT" and declared:
++			name = declared.group(1)
++		inside = block[0] < match.start() < block[1]
++		found.append((js_line(script, match.start()), inside, name))
++	return found
++
++
++def check_socket_on_only_in_once_block(script: str, status_event: str) -> list:
++	"""ADR-009: every `.on(` sits in the `if (state.socket !== socket)` block and names an allowed event."""
++	violations = []
++	if mask_js(script).find(STATUS_SCRIPT_ONCE_BLOCK) == -1:
++		violations.append(f"the once-per-socket block {STATUS_SCRIPT_ONCE_BLOCK} is missing")
++	allowed = {status_event, *STATUS_SCRIPT_SOCKET_EVENTS}
++	for line, inside, name in socket_on_registrations(script):
++		if not inside:
++			violations.append(f"line {line}: .on( is outside the once-per-socket block")
++		if name not in allowed:
++			violations.append(f"line {line}: event {name!r} is not one of {sorted(allowed)}")
++	return violations
++
++
++def check_whitelisted_methods_declare_http_methods(sources: dict) -> list:
++	"""ADR-010: every `@frappe.whitelist` in the app names its HTTP methods and never allows guests."""
++	violations = []
++	for rel, node, decorator in whitelisted_functions(sources):
++		if not isinstance(decorator, ast.Call):
++			violations.append(
++				violation(rel, decorator, f"{node.name}: bare @frappe.whitelist, methods= missing")
++			)
++			continue
++		keywords = {kw.arg: kw.value for kw in decorator.keywords}
++		if "allow_guest" in keywords:
++			violations.append(violation(rel, decorator, f"{node.name}: allow_guest is not allowed"))
++		methods = keywords.get("methods")
++		if not (
++			isinstance(methods, ast.List | ast.Tuple)
++			and methods.elts
++			and all(isinstance(e, ast.Constant) and isinstance(e.value, str) for e in methods.elts)
++		):
++			violations.append(violation(rel, decorator, f"{node.name}: methods= must list HTTP methods"))
++	return violations
++
++
++def check_ticket_panel_whitelist(sources: dict, expected=PANEL_METHODS) -> list:
++	"""ADR-010 Amendment 1: exactly the two panel methods, each `methods=["POST"]` and nothing else."""
++	if PANEL_FILE not in sources:
++		return [f"{PANEL_FILE} is missing"]
++	violations = []
++	own = whitelisted_functions({PANEL_FILE: sources[PANEL_FILE]})
++	paths = sorted(f"{PANEL_MODULE}.{node.name}" for _rel, node, _decorator in own)
++	if paths != sorted(expected):
++		violations.append(f"whitelisted functions are {paths}, expected {sorted(expected)}")
++	for rel, node, decorator in own:
++		methods = None
++		if isinstance(decorator, ast.Call):
++			methods = {kw.arg: kw.value for kw in decorator.keywords}.get("methods")
++		values = (
++			[e.value if isinstance(e, ast.Constant) else None for e in methods.elts]
++			if isinstance(methods, ast.List | ast.Tuple)
++			else None
++		)
++		if values != ["POST"]:
++			violations.append(violation(rel, decorator, f'{node.name}: methods must be exactly ["POST"]'))
++	return violations
++
++
++def _panel_identifiers(tree: ast.AST):
++	"""`(node, name)` for every identifier-like use: names, attributes, keyword names, imported names."""
++	for node in ast.walk(tree):
++		if isinstance(node, ast.Name):
++			yield node, node.id
++		elif isinstance(node, ast.Attribute):
++			yield node, node.attr
++		elif isinstance(node, ast.keyword) and node.arg:
++			yield node, node.arg
++		elif isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
++			yield node, node.name
++		elif isinstance(node, ast.Import | ast.ImportFrom):
++			for alias in node.names:
++				yield node, alias.name.rpartition(".")[2]
++
++
++def _comment_calls(root: ast.AST) -> list:
++	return [
++		n
++		for n in ast.walk(root)
++		if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) and n.func.attr == PANEL_COMMENT_CALL
++	]
++
++
++def check_ticket_panel_forbidden_calls(sources: dict) -> list:
++	"""ADR-010 Amendment 1: no permission bypass, user switch, raw query, write, commit, cache or realtime in
++	the panel module; exactly one `.new_comment(` and it sits in `send_message`."""
++	if PANEL_FILE not in sources:
++		return [f"{PANEL_FILE} is missing"]
++	tree = parse(PANEL_FILE, sources[PANEL_FILE])
++	violations = []
++	for node, name in _panel_identifiers(tree):
++		if name in PANEL_FORBIDDEN_NAMES or name.startswith(PANEL_FORBIDDEN_PREFIXES):
++			violations.append(violation(PANEL_FILE, node, f"{name} is not allowed in the panel module"))
++	for node in constant_strings(tree):
++		if node.value in PANEL_FORBIDDEN_NAMES:
++			violations.append(
++				violation(PANEL_FILE, node, f"string {node.value!r} is not allowed in the panel")
++			)
++	total = _comment_calls(tree)
++	if len(total) != 1:
++		violations.append(
++			f"{PANEL_FILE}: expected exactly one .{PANEL_COMMENT_CALL}( call, found {len(total)}"
++		)
++	send = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == PANEL_SEND_FUNCTION]
++	if len(send) != 1 or len(_comment_calls(send[0])) != 1:
++		violations.append(
++			f"{PANEL_FILE}: the one .{PANEL_COMMENT_CALL}( call must be inside {PANEL_SEND_FUNCTION}"
++		)
++	return violations
++
++
++def check_ticket_panel_does_not_evaluate_agent_gates(sources: dict) -> list:
++	"""ADR-010 Decision 8: the panel never evaluates the agent's gates (the comment handler and runner do)."""
++	if PANEL_FILE not in sources:
++		return [f"{PANEL_FILE} is missing"]
++	tree = parse(PANEL_FILE, sources[PANEL_FILE])
++	violations = []
++	for node, name in _panel_identifiers(tree):
++		for gate in PANEL_GATE_NAMES:
++			if gate in name:
++				violations.append(violation(PANEL_FILE, node, f"{name} evaluates an agent gate ({gate})"))
++	for node in constant_strings(tree):
++		for gate in PANEL_GATE_NAMES:
++			if re.search(rf"\b{gate}\b", node.value):
++				violations.append(violation(PANEL_FILE, node, f"string mentions agent gate {gate}"))
++	return violations
++
++
+ class TestArchitecture(unittest.TestCase):
+ 	@classmethod
+ 	def setUpClass(cls):
+@@ -1068,12 +1492,89 @@ class TestArchitecture(unittest.TestCase):
+ 	def test_status_script_static_rules(self):
+ 		script = load_product_sources(suffixes=(".js",)).get(STATUS_SCRIPT_FILE)
+ 		self.assertIsNotNone(script, f"{STATUS_SCRIPT_FILE} is missing")
+-		self.assertIn("function setupForm({ doc, router })", script)
++		self.assertIn("function setupForm({ doc, call, router })", script)
+ 		for pattern in STATUS_SCRIPT_FORBIDDEN:
+ 			self.assertIsNone(re.search(pattern, script, re.MULTILINE), f"forbidden in script: {pattern}")
+ 		for pattern in STATUS_SCRIPT_REQUIRED:
+ 			self.assertIsNotNone(re.search(pattern, script), f"missing in script: {pattern}")
+ 
++	def test_status_script_calls_use_literal_panel_methods(self):
++		script = load_product_sources(suffixes=(".js",)).get(STATUS_SCRIPT_FILE)
++		self.assertIsNotNone(script, f"{STATUS_SCRIPT_FILE} is missing")
++		self.assertGreater(len(STATUS_SCRIPT_CALL.findall(script)), 0, "no call( found in script")
++		self.assertEqual(check_status_script_calls(script, PANEL_METHODS), [])
++
++	def test_status_script_call_check_catches_variable_and_unknown_method(self):
++		allowed = ("erp_ai.ticket_panel.get_panel_data",)
++		self.assertEqual(
++			check_status_script_calls('state.call("erp_ai.ticket_panel.get_panel_data", {})', allowed), []
++		)
++		self.assertEqual(len(check_status_script_calls("state.call(METHOD, {})", allowed)), 1)
++		self.assertEqual(len(check_status_script_calls('state.call("other.method", {})', allowed)), 1)
++		self.assertEqual(len(check_status_script_calls("state\n.call(\n  METHOD)", allowed)), 1)
++
++	def status_script(self):
++		script = load_product_sources(suffixes=(".js",)).get(STATUS_SCRIPT_FILE)
++		self.assertIsNotNone(script, f"{STATUS_SCRIPT_FILE} is missing")
++		return script
++
++	def test_status_script_calls_only_panel_methods(self):
++		script = self.status_script()
++		literals = {m.group(2) for m in STATUS_SCRIPT_CALL.finditer(script) if m.group(1) is not None}
++		self.assertEqual(literals, set(PANEL_METHODS))
++		self.assertEqual(
++			whitelisted_paths(self.sources) & set(PANEL_METHODS),
++			set(PANEL_METHODS),
++		)
++		self.assertEqual(check_call_allow_list(script, PANEL_METHODS, self.sources), [])
++
++	def test_status_script_queries_only_app_root(self):
++		script = self.status_script()
++		self.assertIn('document.querySelector("#app")', script)
++		self.assertEqual(check_status_script_queries(script), [])
++
++	def test_status_script_has_one_window_state(self):
++		script = self.status_script()
++		self.assertIn(f"window.{STATUS_SCRIPT_STATE_NAME} = window.{STATUS_SCRIPT_STATE_NAME} ||", script)
++		self.assertEqual(check_status_script_window_state(script), [])
++
++	def test_status_script_socket_events_only_in_once_block(self):
++		script = self.status_script()
++		registered = socket_on_registrations(script)
++		self.assertEqual(
++			{name for _line, inside, name in registered if inside},
++			{AGENT_STATUS_EVENT, "docinfo_update", "doc_update", "connect"},
++		)
++		self.assertEqual(check_socket_on_only_in_once_block(script, AGENT_STATUS_EVENT), [])
++
++	def test_whitelisted_methods_declare_http_methods_without_guest(self):
++		found = {(rel, node.name) for rel, node, _decorator in whitelisted_functions(self.sources)}
++		self.assertTrue({(PANEL_FILE, "get_panel_data"), (PANEL_FILE, "send_message")} <= found, found)
++		self.assertEqual(check_whitelisted_methods_declare_http_methods(self.sources), [])
++
++	def test_ticket_panel_has_exactly_two_whitelisted_methods(self):
++		self.assertEqual(
++			sorted(PANEL_METHODS),
++			["erp_ai.ticket_panel.get_panel_data", "erp_ai.ticket_panel.send_message"],
++		)
++		self.assertEqual(check_ticket_panel_whitelist(self.sources), [])
++
++	def test_ticket_panel_forbidden_calls(self):
++		self.assertIn(".new_comment(", self.sources[PANEL_FILE])
++		self.assertEqual(check_ticket_panel_forbidden_calls(self.sources), [])
++
++	def test_ticket_panel_does_not_evaluate_agent_gates(self):
++		self.assertIn(PANEL_FILE, self.sources)
++		self.assertEqual(check_ticket_panel_does_not_evaluate_agent_gates(self.sources), [])
++
++	def test_layer_rules_forbid_ticket_panel_from_gateway_and_agent(self):
++		rules = {scope: forbidden for scope, forbidden, _reason in LAYER_RULES}
++		for scope in ("erp_ai.gateway", "erp_ai.agent"):
++			self.assertIn("erp_ai.ticket_panel", rules[scope])
++		self.assertEqual(
++			rules["erp_ai.ticket_panel"], ("erp_ai.gateway", "erp_ai.agent.runner", "erp_ai.agent.queue")
++		)
++
+ 	def test_status_event_name_matches_script(self):
+ 		match = re.search(r'^AGENT_STATUS_EVENT = "([^"]+)"', self.sources[CONSTANTS_FILE], re.MULTILINE)
+ 		self.assertIsNotNone(match, "AGENT_STATUS_EVENT not found in constants.py")
+@@ -1145,9 +1646,13 @@ class TestScannersCatchViolations(unittest.TestCase):
+ 			"handlers.py": "from erp_ai.gateway import call_model\n",
+ 			"gateway/breaker.py": "from erp_ai.erp_ai_agent.doctype.erp_ai_setting import erp_ai_setting\n",
+ 			"agent/authority.py": "from erp_ai.erp_ai_agent import doctype\n",
++			"ticket_panel.py": "from erp_ai.gateway import call_model\n",
++			"gateway/cache.py": "from erp_ai import ticket_panel\n",
++			"agent/context.py": "from erp_ai.ticket_panel import get_panel_data\n",
+ 		}
+ 		for rel, source in cases.items():
+ 			with self.subTest(rel=rel):
++				rel = rel.partition("#")[0]
+ 				self.assertCaught(check_layer_imports({rel: source}), rel)
+ 
+ 	def test_layer_imports_catches_lazy_and_relative_imports(self):
+@@ -1719,6 +2224,195 @@ class TestScannersCatchViolations(unittest.TestCase):
+ 			with self.subTest(fragment=fragment, source=source):
+ 				self.assertCaught(check_install_deletes_only_status_script({INSTALL_FILE: source}), fragment)
+ 
++	# ticket panel (ADR-009, ADR-010 Amendment 1) -------------------------------------------------
++
++	PANEL_SOURCES: ClassVar[dict] = {
++		"ticket_panel.py": (
++			"import frappe\n"
++			"@frappe.whitelist(methods=['POST'])\n"
++			"def get_panel_data(ticket):\n\treturn 1\n"
++			"@frappe.whitelist(methods=['POST'])\n"
++			"def send_message(ticket, text):\n\treturn frappe.get_doc('HD Ticket', ticket).new_comment(text)\n"
++		)
++	}
++
++	def test_call_allow_list_scanner_catches_unlisted_method(self):
++		allowed = tuple(PANEL_METHODS)
++		good = 'state.call("erp_ai.ticket_panel.get_panel_data", {});\nstate.call("erp_ai.ticket_panel.send_message", {});'
++		self.assertEqual(check_call_allow_list(good, allowed, self.PANEL_SOURCES), [])
++		self.assertCaught(
++			check_call_allow_list(
++				good + 'state.call("erp_ai.handlers.other", {});', allowed, self.PANEL_SOURCES
++			),
++			"erp_ai.handlers.other is not in PANEL_METHODS",
++			"does not point to a @frappe.whitelist function",
++		)
++		self.assertCaught(
++			check_call_allow_list(good.split("\n")[0], allowed, self.PANEL_SOURCES),
++			"erp_ai.ticket_panel.send_message is in PANEL_METHODS but the script never calls it",
++		)
++		self.assertCaught(
++			check_call_allow_list(good + "state.call(METHOD, {});", allowed, self.PANEL_SOURCES),
++			"not a string literal",
++		)
++		undecorated = {
++			"ticket_panel.py": self.PANEL_SOURCES["ticket_panel.py"].replace(
++				"@frappe.whitelist(methods=['POST'])\ndef send", "def send"
++			)
++		}
++		self.assertCaught(
++			check_call_allow_list(good, allowed, undecorated),
++			"erp_ai.ticket_panel.send_message does not point to a @frappe.whitelist function",
++		)
++
++	def test_socket_on_scanner_catches_outside_once_block(self):
++		block = 'if (state.socket !== socket) {\n\tsocket.on(EVENT, a);\n\tsocket.on("connect", () => { b(); });\n}\n'
++		head = 'const EVENT = "erp_ai:agent_status";\n'
++		self.assertEqual(check_socket_on_only_in_once_block(head + block, "erp_ai:agent_status"), [])
++		self.assertCaught(
++			check_socket_on_only_in_once_block(
++				head + block + 'socket.on("doc_update", c);\n', "erp_ai:agent_status"
++			),
++			"outside the once-per-socket block",
++		)
++		self.assertCaught(
++			check_socket_on_only_in_once_block(
++				head + block.replace("EVENT, a", '"typing", a'), "erp_ai:agent_status"
++			),
++			"event 'typing' is not one of",
++		)
++		self.assertCaught(
++			check_socket_on_only_in_once_block(head + "socket.on(EVENT, a);\n", "erp_ai:agent_status"),
++			"block if (state.socket !== socket) { is missing",
++		)
++		self.assertCaught(
++			check_socket_on_only_in_once_block(
++				head + block.replace("EVENT, a", "OTHER, a"), "erp_ai:agent_status"
++			),
++			"event None is not one of",
++		)
++		# an `.on(` in a comment or string is not a registration
++		self.assertEqual(
++			check_socket_on_only_in_once_block(
++				head + block + '// socket.on("x", y)\nconst s = "socket.on(";\n', "erp_ai:agent_status"
++			),
++			[],
++		)
++
++	def test_status_script_query_scanner_catches_other_selectors(self):
++		self.assertEqual(check_status_script_queries('document.querySelector("#app")'), [])
++		self.assertEqual(check_status_script_queries('document.getElementById("app")'), [])
++		for source in (
++			'document.querySelector(".ticket")',
++			'document.querySelector("#app .x")',
++			'document.querySelectorAll("#app")',
++			'document.getElementById("other")',
++			'document.getElementsByClassName("x")',
++			"document.querySelector(selector)",
++		):
++			with self.subTest(source=source):
++				self.assertCaught(check_status_script_queries(source), "only allowed with the Vue root")
++
++	def test_status_script_window_scanner_catches_second_state(self):
++		good = "window.__erpAiAgentStatus = window.__erpAiAgentStatus || {};\nwindow.addEventListener(1, 2);"
++		self.assertEqual(check_status_script_window_state(good), [])
++		self.assertCaught(
++			check_status_script_window_state(good + "window.__erpAiPanel = {};"), "window state names are"
++		)
++		self.assertCaught(
++			check_status_script_window_state(good + "window.other = 1;"), "window.other is written"
++		)
++		self.assertCaught(check_status_script_window_state(good + 'window["x"] = 1;'), "window[...]")
++		self.assertCaught(check_status_script_window_state("var a = 1;"), "window state names are")
++
++	def test_whitelist_scanner_catches_guest_bare_and_missing_methods(self):
++		for decorator, fragment in (
++			("@frappe.whitelist()", "methods= must list"),
++			("@frappe.whitelist", "bare @frappe.whitelist"),
++			("@frappe.whitelist(allow_guest=True, methods=['POST'])", "allow_guest"),
++			("@frappe.whitelist(allow_guest=False, methods=['POST'])", "allow_guest"),
++			("@frappe.whitelist(methods=[])", "methods= must list"),
++			("@whitelist(methods=METHODS)", "methods= must list"),
++		):
++			with self.subTest(decorator=decorator):
++				source = f"import frappe\nfrom frappe import whitelist\n{decorator}\ndef f():\n\tpass\n"
++				self.assertCaught(check_whitelisted_methods_declare_http_methods({"x.py": source}), fragment)
++		ok = "import frappe\n@frappe.whitelist(methods=['POST'])\ndef f():\n\tpass\n"
++		self.assertEqual(check_whitelisted_methods_declare_http_methods({"x.py": ok}), [])
++
++	def test_ticket_panel_whitelist_scanner_catches_third_method_and_get(self):
++		self.assertEqual(check_ticket_panel_whitelist(self.PANEL_SOURCES), [])
++		source = self.PANEL_SOURCES["ticket_panel.py"]
++		extra = source + "@frappe.whitelist(methods=['POST'])\ndef third():\n\tpass\n"
++		self.assertCaught(check_ticket_panel_whitelist({PANEL_FILE: extra}), "whitelisted functions are")
++		self.assertCaught(
++			check_ticket_panel_whitelist({PANEL_FILE: source.replace("'POST'", "'GET'", 1)}),
++			'exactly ["POST"]',
++		)
++		self.assertCaught(
++			check_ticket_panel_whitelist({PANEL_FILE: source.replace("['POST']", "['POST', 'GET']", 1)}),
++			'exactly ["POST"]',
++		)
++		self.assertCaught(
++			check_ticket_panel_whitelist({PANEL_FILE: source.replace("def get_panel_data", "def get_data")}),
++			"whitelisted functions are",
++		)
++
++	def test_ticket_panel_forbidden_scanner_catches_each_name(self):
++		for snippet in (
++			"frappe.get_doc('X', 1, ignore_permissions=True)",
++			"frappe.set_user('a')",
++			"frappe.get_all('X')",
++			"frappe.db.get_values('X')",
++			"frappe.db.sql('select 1')",
++			"frappe.db.set_value('X', 1, 'a', 2)",
++			"doc.db_set('a', 1)",
++			"doc.insert()",
++			"doc.save()",
++			"frappe.delete_doc('X', 1)",
++			"frappe.db.delete('X')",
++			"frappe.db.commit()",
++			"frappe.db.rollback()",
++			"frappe.cache.get('k')",
++			"frappe.publish_realtime('e')",
++		):
++			with self.subTest(snippet=snippet):
++				source = self.PANEL_SOURCES["ticket_panel.py"] + f"def extra():\n\t{snippet}\n"
++				self.assertCaught(
++					check_ticket_panel_forbidden_calls({PANEL_FILE: source}), "not allowed in the panel"
++				)
++		source = self.PANEL_SOURCES["ticket_panel.py"]
++		self.assertCaught(
++			check_ticket_panel_forbidden_calls({PANEL_FILE: source + "def x(d):\n\td.new_comment('a')\n"}),
++			"found 2",
++		)
++		self.assertCaught(
++			check_ticket_panel_forbidden_calls({PANEL_FILE: source.replace("new_comment", "other")}),
++			"found 0",
++		)
++		moved = source.replace("return frappe.get_doc('HD Ticket', ticket).new_comment(text)", "return 1")
++		moved += "def helper(d):\n\td.new_comment('a')\n"
++		self.assertCaught(
++			check_ticket_panel_forbidden_calls({PANEL_FILE: moved}), "must be inside send_message"
++		)
++		self.assertEqual(check_ticket_panel_forbidden_calls({PANEL_FILE: source}), [])
++
++	def test_ticket_panel_gate_scanner_catches_each_gate(self):
++		for gate in PANEL_GATE_NAMES:
++			for snippet in (f"policy.{gate}()", f"{gate} = 1", f"d.get('{gate}')"):
++				with self.subTest(snippet=snippet):
++					source = self.PANEL_SOURCES["ticket_panel.py"] + f"def extra(d, policy):\n\t{snippet}\n"
++					self.assertCaught(
++						check_ticket_panel_does_not_evaluate_agent_gates({PANEL_FILE: source}), gate
++					)
++		self.assertCaught(
++			check_ticket_panel_does_not_evaluate_agent_gates(
++				{PANEL_FILE: "from erp_ai.agent.queue import enqueue_agent_run\n"}
++			),
++			"enqueue",
++		)
++		self.assertEqual(check_ticket_panel_does_not_evaluate_agent_gates(self.PANEL_SOURCES), [])
++
+ 
+ if __name__ == "__main__":
+ 	unittest.main()
+diff --git a/erp_ai/tests/test_doctype_descriptions.py b/erp_ai/tests/test_doctype_descriptions.py
+new file mode 100644
+index 0000000..3de4ca5
+--- /dev/null
++++ b/erp_ai/tests/test_doctype_descriptions.py
+@@ -0,0 +1,338 @@
++import json
++import re
++from pathlib import Path
++
++import frappe
++from frappe.tests.utils import FrappeTestCase
++
++APP_DIR = Path(__file__).resolve().parent.parent
++DOCTYPE_DIR = APP_DIR / "erp_ai_agent" / "doctype"
++MAX_DESCRIPTION_CHARS = 400
++MIN_STORED_VALUE_CHARS = 4
++BREAK_TYPES = ("Section Break", "Column Break", "Tab Break")
++SAFE_EMAIL_DOMAINS = ("congty.vn", "example.com")
++EMAIL_PATTERN = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
++SYSTEM_WRITES = "Hệ thống tự ghi"
++NOT_EDITABLE = "không sửa được"
++VIETNAMESE_ACCENTS = re.compile(
++	"[àáạảãâầấậẩẫăằắặẳẵèéẹẻẽêềếệểễìíịỉĩòóọỏõôồốộổỗơờớợởỡùúụủũưừứựửữỳýỵỷỹđ]", re.IGNORECASE
++)
++
++# Keyed by DocType name: expected visible-field count, required phrases per field,
++# and the Section Breaks as (fieldname, label, first field of the group).
++DOCTYPE_CONFIG = {
++	"ERP AI Setting": {
++		"folder": "erp_ai_setting",
++		"field_count": 22,
++		"phrases": {
++			"enabled": ("Tắt", "4 đơn giá", "từ khóa kích hoạt"),
++			"permission_level": ("L0", "L1", "L2", "L3", "ngân sách"),
++			"max_turns_per_run": ("từ 1 đến 20", "dừng"),
++			"max_runs_per_ticket_per_day": ("từ 1 đến 50", "00:00"),
++			"max_keys_per_call": ("từ 1 đến 10", "báo lỗi"),
++			"request_timeout_s": ("từ 5 đến 300", "giây", "khóa kế tiếp"),
++			"monthly_budget_usd": ("USD", "L1", "Nhập 0", "không phải"),
++			"spent_this_month_usd": ("mỗi ngày", "tổng chi phí"),
++			"price_input_per_mtok": ("USD", "triệu token", "không được âm"),
++			"price_cache_write_per_mtok": ("USD", "triệu token", "không được âm"),
++			"price_cache_read_per_mtok": ("USD", "triệu token", "không được âm"),
++			"price_output_per_mtok": ("USD", "triệu token", "không được âm"),
++			"model_classify_default": ("phân loại", "model"),
++			"trigger_keyword": ("@ai", "không phân biệt hoa thường"),
++			"thinking_text": ("Để trống", "giây"),
++			"answer_delay_min_s": ("giây", "từ 0 đến 30", "bình luận"),
++			"answer_delay_max_s": ("giây", "từ 0 đến 30", "bình luận"),
++			"excluded_teams": ("mỗi dòng", "không phân biệt hoa thường"),
++			"category_mapping": ("JSON", "A đến F", "[GẤP]", "Urgent"),
++			"prompt_digest": ("lập luận", "phân loại"),
++			"alert_recipients": ("mỗi dòng", "[email-redacted]", "dấu phẩy"),
++			"credentials": ("không trùng", "Kiểm tra khóa"),
++		},
++		"section_count": 6,
++		"read_only_fields": ("spent_this_month_usd",),
++		"sections": (
++			("section_activation", "Bật và mức quyền", "enabled"),
++			("section_limits", "Giới hạn mỗi lần chạy", "max_turns_per_run"),
++			("section_budget", "Ngân sách và đơn giá", "monthly_budget_usd"),
++			("section_model", "Model, từ khóa và chỉ báo trả lời", "model_classify_default"),
++			("section_routing", "Phân loại và nhóm loại trừ", "excluded_teams"),
++			("section_alerts", "Cảnh báo và khóa API", "alert_recipients"),
++		),
++	},
++	"ERP AI Credential": {
++		"folder": "erp_ai_credential",
++		"field_count": 18,
++		"phrases": {
++			"label": ("không trùng", "không phân biệt hoa thường"),
++			"provider": ("nhà cung cấp", "Anthropic", "OpenAI", "bỏ qua"),
++			"api_key": ("khóa bí mật", "mã hóa", "không hiện lại", "Log"),
++			"model_classify": ("Setting", "phân loại"),
++			"model_reason": ("lập luận", "không dùng"),
++			"try_order": ("99", "nhỏ", "Để trống", "hoặc 0", "lớn hơn 99"),
++			"purpose": ("ghi chú", "không ảnh hưởng"),
++			"budget_month_usd": ("USD", "Nhập 0", "không giới hạn", "ngược"),
++			"spent_month_usd": ("mỗi ngày", "Log"),
++			"enabled": ("Tắt", "không được thử", "không xóa"),
++			"status": ("Tạm nghỉ", "Hết hạn mức", "Lỗi khóa", "Hoạt động"),
++			"paused_until": ("tạm nghỉ",),
++			"tokens_remaining": ("số token còn lại", "lần gọi gần nhất"),
++			"limit_reset_at": ("hạn mức", "nhà cung cấp", "đặt lại"),
++			"error_count": ("lỗi liên tiếp", "về 0"),
++			"last_error": ("không bao giờ chứa khóa",),
++			"last_success_at": ("thành công",),
++			"note": ("ghi chú",),
++		},
++		"section_count": 4,
++		"read_only_fields": (
++			"spent_month_usd",
++			"paused_until",
++			"tokens_remaining",
++			"limit_reset_at",
++			"error_count",
++			"last_error",
++			"last_success_at",
++		),
++		"sections": (
++			("section_key", "Khóa và model", "label"),
++			("section_usage", "Thứ tự thử và ngân sách", "try_order"),
++			("section_state", "Trạng thái khóa", "status"),
++			("section_note", "Ghi chú", "note"),
++		),
++	},
++	"ERP AI Log": {
++		"folder": "erp_ai_log",
++		"field_count": 31,
++		"phrases": {
++			"ticket": ("HD Ticket", "mã phiếu", "lọc"),
++			"run_id": ("cùng một lần chạy", "gom"),
++			"entry_type": ("classify", "reason", "skip", "phân loại", "lập luận"),
++			"turn": ("Lượt 0", "lượt 1", "lập luận"),
++			"trigger": ("ticket_insert", "comment_mention", "bình luận"),
++			"instructor": ("ERP AI Instructor", "giao việc", "chủ phiếu", "ticket_insert", "dòng reason"),
++			"model": ("model", "lần gọi"),
++			"input_tokens": ("token", "gửi lên"),
++			"output_tokens": ("token", "model trả về"),
++			"cache_creation_input_tokens": ("ghi vào cache", "token"),
++			"cache_read_input_tokens": ("đọc từ cache", "token"),
++			"cost_usd": ("USD", "đơn giá", "Setting", "đã chi trong tháng"),
++			"credential_label": ("nhãn", "khóa", "thử cuối cùng", "gateway_error"),
++			"keys_tried": ("danh sách", "nhãn khóa", "kết quả"),
++			"latency_ms": ("mili giây", "lần gọi", "ghi 0"),
++			"stop_reason": (
++				"ví dụ",
++				"tool_use",
++				"end_turn",
++				"max_turns",
++				"time_budget",
++				"gateway_error",
++				"unparseable",
++				"not_sendable",
++				"daily_limit",
++				"level_L0",
++			),
++			"tools_called": ("tool", "trong lượt này"),
++			"actions": ("hành động", "phiếu"),
++			"value_before": ("JSON", "trước khi"),
++			"value_after": ("JSON", "sau khi"),
++			"skipped_fields": ("bỏ qua", "phân loại"),
++			"predicted_category": ("đầu mục", "A đến F"),
++			"predicted_confidence": ("Cao", "Trung bình", "Thấp", "ai_confidence"),
++			"predicted_ticket_type": ("loại phiếu", "dự đoán"),
++			"predicted_agent_group": ("nhóm xử lý", "dự đoán"),
++			"predicted_priority": ("ưu tiên", "dự đoán"),
++			"applied": ("đã ghi", "phiếu"),
++			"human_corrected_to": ("loại phiếu", "nhóm xử lý", "ưu tiên", "AI đã dự đoán"),
++			"human_corrected_by": ("người đổi", "AI đã dự đoán"),
++			"human_corrected_at": ("lần sửa đầu", "AI đã dự đoán"),
++			"error": ("lỗi", "không có khóa"),
++		},
++		"section_count": 6,
++		"read_only_fields": (
++			"ticket",
++			"run_id",
++			"entry_type",
++			"turn",
++			"trigger",
++			"instructor",
++			"model",
++			"input_tokens",
++			"output_tokens",
++			"cache_creation_input_tokens",
++			"cache_read_input_tokens",
++			"cost_usd",
++			"credential_label",
++			"keys_tried",
++			"latency_ms",
++			"stop_reason",
++			"tools_called",
++			"actions",
++			"value_before",
++			"value_after",
++			"skipped_fields",
++			"predicted_category",
++			"predicted_confidence",
++			"predicted_ticket_type",
++			"predicted_agent_group",
++			"predicted_priority",
++			"applied",
++			"human_corrected_to",
++			"human_corrected_by",
++			"human_corrected_at",
++			"error",
++		),
++		"sections": (
++			("section_run", "Lần chạy", "ticket"),
++			("section_usage", "Token, chi phí và khóa", "input_tokens"),
++			("section_changes", "Tool và thay đổi trên phiếu", "tools_called"),
++			("section_prediction", "Dự đoán phân loại", "predicted_category"),
++			("section_correction", "Người sửa sau dự đoán", "human_corrected_to"),
++			("section_error", "Lỗi", "error"),
++		),
++	},
++}
++
++# Wordings that contradicted the code that writes the field (T5 review round 1).
++FORBIDDEN_PHRASES = {
++	"ERP AI Log": {
++		"instructor": ("người ra lệnh", "khi phiếu mới tạo"),
++		"tools_called": ("lần chạy này",),
++		"predicted_confidence": ("thường khiến", "không được áp dụng"),
++		"stop_reason": ("là lỗi khi gọi nhà cung cấp",),
++		"latency_ms": ("có thể để trống",),
++	},
++}
++
++
++def load_doctype(config):
++	path = DOCTYPE_DIR / config["folder"] / f"{config['folder']}.json"
++	return json.loads(path.read_text(encoding="utf-8"))
++
++
++def visible_fields(doctype_json):
++	return [
++		field
++		for field in doctype_json["fields"]
++		if field["fieldtype"] not in BREAK_TYPES and not field.get("hidden")
++	]
++
++
++def section_breaks(doctype_json):
++	return [field for field in doctype_json["fields"] if field["fieldtype"] == "Section Break"]
++
++
++class TestDoctypeDescriptions(FrappeTestCase):
++	def each_doctype(self):
++		return [(doctype, config, load_doctype(config)) for doctype, config in DOCTYPE_CONFIG.items()]
++
++	def test_every_visible_field_has_description(self):
++		for doctype, config, doctype_json in self.each_doctype():
++			with self.subTest(doctype=doctype):
++				fields = visible_fields(doctype_json)
++				self.assertEqual(len(fields), config["field_count"])
++				missing = [f["fieldname"] for f in fields if not (f.get("description") or "").strip()]
++				self.assertEqual(
++					missing, [], f"{doctype}: thiếu mô tả {len(missing)}/{len(fields)}: {missing}"
++				)
++
++	def test_descriptions_at_most_400_chars(self):
++		for doctype, _config, doctype_json in self.each_doctype():
++			with self.subTest(doctype=doctype):
++				too_long = {
++					f["fieldname"]: len(f["description"])
++					for f in visible_fields(doctype_json)
++					if len(f.get("description") or "") > MAX_DESCRIPTION_CHARS
++				}
++				self.assertEqual(too_long, {}, f"{doctype}: mô tả dài quá {MAX_DESCRIPTION_CHARS} ký tự")
++
++	def test_required_phrases_present(self):
++		for doctype, config, doctype_json in self.each_doctype():
++			with self.subTest(doctype=doctype):
++				by_name = {f["fieldname"]: f for f in visible_fields(doctype_json)}
++				self.assertEqual(set(config["phrases"]), set(by_name), f"{doctype}: cấu hình test lệch field")
++				missing = {}
++				for fieldname, phrases in config["phrases"].items():
++					description = by_name[fieldname].get("description") or ""
++					absent = [p for p in phrases if p.lower() not in description.lower()]
++					if absent:
++						missing[fieldname] = absent
++				self.assertEqual(missing, {}, f"{doctype}: thiếu cụm")
++
++	def test_forbidden_phrases_absent(self):
++		for doctype, forbidden in FORBIDDEN_PHRASES.items():
++			by_name = {f["fieldname"]: f for f in visible_fields(load_doctype(DOCTYPE_CONFIG[doctype]))}
++			present = {}
++			for fieldname, phrases in forbidden.items():
++				description = (by_name[fieldname].get("description") or "").lower()
++				found = [p for p in phrases if p.lower() in description]
++				if found:
++					present[fieldname] = found
++			self.assertEqual(present, {}, f"{doctype}: còn cụm sai")
++
++	def test_read_only_fields_say_system_writes(self):
++		for doctype, config, doctype_json in self.each_doctype():
++			with self.subTest(doctype=doctype):
++				by_name = {f["fieldname"]: f for f in visible_fields(doctype_json)}
++				read_only = {f for f, field in by_name.items() if field.get("read_only")}
++				self.assertEqual(read_only, set(config["read_only_fields"]))
++				for fieldname in read_only:
++					description = by_name[fieldname].get("description") or ""
++					self.assertIn(SYSTEM_WRITES, description, f"{doctype}.{fieldname}")
++					self.assertIn(NOT_EDITABLE, description, f"{doctype}.{fieldname}")
++
++	def test_section_breaks_labelled_in_vietnamese(self):
++		for doctype, config, doctype_json in self.each_doctype():
++			with self.subTest(doctype=doctype):
++				breaks = section_breaks(doctype_json)
++				self.assertGreaterEqual(len(breaks), 2)
++				self.assertEqual(len(breaks), config["section_count"])
++				expected = [(name, label) for name, label, _first in config["sections"]]
++				self.assertEqual([(b["fieldname"], b.get("label")) for b in breaks], expected)
++				for section in breaks:
++					self.assertTrue(VIETNAMESE_ACCENTS.search(section["label"]), section["fieldname"])
++					self.assertNotIn("(USD)", section["label"])
++				order = doctype_json["field_order"]
++				for name, _label, first in config["sections"]:
++					self.assertEqual(order.index(first), order.index(name) + 1, f"{doctype}: {name}")
++
++	def test_descriptions_have_no_sensitive_data(self):
++		for doctype, _config, doctype_json in self.each_doctype():
++			with self.subTest(doctype=doctype):
++				for field in visible_fields(doctype_json):
++					description = field.get("description") or ""
++					where = f"{doctype}.{field['fieldname']}"
++					self.assertNotIn("sk-", description, where)
++					self.assertNotIn("miyano", description.lower(), where)
++					for email in EMAIL_PATTERN.findall(description):
++						self.assertTrue(email.lower().endswith(SAFE_EMAIL_DOMAINS), f"{where}: {email}")
++
++	def test_descriptions_contain_no_stored_setting_values(self):
++		setting = frappe.get_single("ERP AI Setting")
++		doctype_json = load_doctype(DOCTYPE_CONFIG["ERP AI Setting"])
++		stored = {}
++		for field in visible_fields(doctype_json):
++			if field["fieldtype"] in ("Table", "Password"):
++				continue
++			value = setting.get(field["fieldname"])
++			if isinstance(value, str) and len(value.strip()) >= MIN_STORED_VALUE_CHARS:
++				stored[field["fieldname"]] = value.strip().lower()
++		for field in visible_fields(doctype_json):
++			description = (field.get("description") or "").lower()
++			for source, value in stored.items():
++				self.assertNotIn(
++					value, description, f"{field['fieldname']} chứa giá trị đang lưu của {source}"
++				)
++
++	def test_skipped_fields_still_follows_value_after(self):
++		doctype_json = load_doctype(DOCTYPE_CONFIG["ERP AI Log"])
++		order = doctype_json["field_order"]
++		self.assertEqual(order.index("skipped_fields"), order.index("value_after") + 1)
++		names = [f["fieldname"] for f in doctype_json["fields"]]
++		self.assertEqual(names, order)
++
++	def test_section_breaks_carry_only_label(self):
++		for doctype, _config, doctype_json in self.each_doctype():
++			with self.subTest(doctype=doctype):
++				for section in section_breaks(doctype_json):
++					self.assertEqual(
++						set(section), {"fieldname", "fieldtype", "label"}, f"{doctype}.{section['fieldname']}"
++					)
+diff --git a/erp_ai/tests/test_ticket_panel.py b/erp_ai/tests/test_ticket_panel.py
+new file mode 100644
+index 0000000..cd7830b
+--- /dev/null
++++ b/erp_ai/tests/test_ticket_panel.py
+@@ -0,0 +1,785 @@
++import json
++from unittest.mock import MagicMock, patch
++
++import frappe
++from frappe.tests.utils import FrappeTestCase
++from helpdesk.test_utils import create_agent, make_ticket, make_todo
++from helpdesk.utils import is_agent
++
++from erp_ai import ticket_panel
++from erp_ai.agent import answer_delay, runner
++from erp_ai.agent.policy import contains_keyword
++from erp_ai.agent.queue import PENDING_JOB_IDS_FLAG
++from erp_ai.agent.run_log import write_entry
++from erp_ai.constants import (
++	AGENT_USER,
++	LOG_DOCTYPE,
++	LOGGER_NAME,
++	PANEL_METHODS,
++	ROLE_INSTRUCTOR,
++	TITLE_RUN_FAILED,
++)
++from erp_ai.test_utils import FakeGateway, make_model_result, record_status_signals, set_agent_settings
++
++AI_FIELD_LABELS = (
++	("ai_resolution_hint", "Hướng giải quyết (AI)"),
++	("ai_confidence", "Độ tin cậy (AI)"),
++	("ai_classified_by", "Phân loại bởi"),
++	("ai_updated_at", "AI cập nhật lúc"),
++)
++AGENT_EMAIL = "[email-redacted]"
++NO_READ_EMAIL = "[email-redacted]"
++INACTIVE_EMAIL = "[email-redacted]"
++WEBSITE_EMAIL = "[email-redacted]"
++CUSTOMER_EMAIL = "[email-redacted]"
++KEYWORD = "@ai"
++THREAD_KEYS = {"name", "author", "is_bot", "created_at", "text"}
++
++
++def _make_user(email, user_type="Website User"):
++	if not frappe.db.exists("User", email):
++		frappe.get_doc(
++			{
++				"doctype": "User",
++				"email": email,
++				"first_name": email.split("@")[0],
++				"user_type": user_type,
++				"send_welcome_email": 0,
++			}
++		).insert(ignore_permissions=True)
++	return email
++
++
++def _add_comment(ticket, content, owner="Administrator", creation=None, comment_type="Comment"):
++	"""A Comment as the timeline stores it; owner and creation are set directly, like the DB would hold them."""
++	with patch.object(frappe, "enqueue"):
++		doc = frappe.get_doc(
++			{
++				"doctype": "Comment",
++				"comment_type": comment_type,
++				"reference_doctype": "HD Ticket",
++				"reference_name": ticket,
++				"content": "placeholder",
++			}
++		).insert(ignore_permissions=True)
++	values = {"content": content, "owner": owner}
++	if creation:
++		values["creation"] = creation
++	frappe.db.set_value("Comment", doc.name, values, update_modified=False)
++	return doc.name
++
++
++class TestTicketPanelRead(FrappeTestCase):
++	def setUp(self):
++		# FrappeTestCase rolls back only after the whole class: undo each test.
++		self.addCleanup(frappe.db.rollback)
++		self.addCleanup(frappe.set_user, "Administrator")
++		frappe.set_user("Administrator")
++		create_agent(AGENT_EMAIL)
++		self.ticket = make_ticket(subject="Panel read ticket")
++
++	def _read(self, user=AGENT_EMAIL, ticket=None):
++		frappe.set_user(user)
++		return ticket_panel.get_panel_data(ticket or self.ticket.name)
++
++	def test_methods_whitelisted_post_without_guest(self):
++		self.assertEqual(
++			PANEL_METHODS, ("erp_ai.ticket_panel.get_panel_data", "erp_ai.ticket_panel.send_message")
++		)
++		for method in PANEL_METHODS:
++			with self.subTest(method=method):
++				fn = frappe.get_attr(method)
++				self.assertIn(fn, frappe.whitelisted)
++				self.assertEqual(frappe.allowed_http_methods_for_whitelisted_func[fn], ["POST"])
++				self.assertNotIn(fn, frappe.guest_methods)
++
++	def test_read_returns_ai_fields_as_stored_text(self):
++		frappe.db.set_value(
++			"HD Ticket",
++			self.ticket.name,
++			{
++				"ai_resolution_hint": "<p>Dòng 1</p><p>Dòng 2</p>",
++				"ai_confidence": "Cao",
++				"ai_classified_by": "AI",
++				"ai_updated_at": "2026-11-12 10:05:00",
++			},
++		)
++		data = self._read()
++		self.assertEqual(data["ticket"], self.ticket.name)
++		self.assertEqual(data["messages"], [])
++		by_name = {item["fieldname"]: item["text"] for item in data["ai_fields"]}
++		self.assertEqual(by_name["ai_resolution_hint"].split(), ["Dòng", "1", "Dòng", "2"])
++		self.assertIn("\n", by_name["ai_resolution_hint"].strip())
++		self.assertEqual(by_name["ai_confidence"], "Cao")
++		self.assertEqual(by_name["ai_classified_by"], "AI")
++		self.assertEqual(by_name["ai_updated_at"], "12-11-2026 10:05:00")
++
++	def test_read_empty_ai_fields_are_null(self):
++		data = self._read()
++		self.assertEqual(len(data["ai_fields"]), 4)
++		for item in data["ai_fields"]:
++			with self.subTest(field=item["fieldname"]):
++				self.assertIsNone(item["text"])
++
++	def test_read_ai_fields_use_hd_ticket_labels(self):
++		data = self._read()
++		self.assertEqual(
++			[(item["fieldname"], item["label"]) for item in data["ai_fields"]], list(AI_FIELD_LABELS)
++		)
++
++	def test_read_denied_for_non_agents_and_guest(self):
++		_make_user(WEBSITE_EMAIL)
++		for user in (WEBSITE_EMAIL, "Guest"):
++			with self.subTest(user=user), self.assertRaises(frappe.PermissionError):
++				self._read(user)
++
++	def test_read_denied_for_customer_who_can_read_the_ticket(self):
++		# Only a non-agent that HD Ticket's permission hook lets in shows that the is_agent() gate is needed.
++		_make_user(CUSTOMER_EMAIL)
++		frappe.get_doc("User", CUSTOMER_EMAIL).add_roles("HD Customer")
++		ticket = make_ticket(subject="Customer own ticket", raised_by=CUSTOMER_EMAIL)
++		frappe.set_user(CUSTOMER_EMAIL)
++		self.assertFalse(is_agent())
++		self.assertTrue(frappe.has_permission("HD Ticket", "read", doc=ticket.name))
++		with self.assertRaises(frappe.PermissionError):
++			ticket_panel.get_panel_data(ticket.name)
++
++	def test_read_rejects_empty_or_wrong_type_ticket(self):
++		frappe.set_user(AGENT_EMAIL)
++		for value in ("", "   "):
++			with self.subTest(ticket=value), self.assertRaises(frappe.ValidationError):
++				ticket_panel.get_panel_data(value)
++
++	def test_read_hides_fields_above_the_callers_permlevel(self):
++		frappe.db.set_value("HD Ticket", self.ticket.name, "ai_updated_at", "2026-11-12 10:05:00")
++		self.assertEqual(self._read()["ai_fields"][3]["text"], "12-11-2026 10:05:00")
++		self.addCleanup(frappe.clear_cache, doctype="HD Ticket")
++		permlevel = frappe.get_meta("HD Ticket").get_field("ai_updated_at").permlevel
++		frappe.permissions.update_permission_property("HD Ticket", "Agent", permlevel, "read", 0)
++		frappe.clear_cache(doctype="HD Ticket")
++		self.assertIsNone(self._read()["ai_fields"][3]["text"])
++
++	def test_read_denied_for_agent_without_ticket_read(self):
++		frappe.set_user("Administrator")
++		create_agent(NO_READ_EMAIL)
++		frappe.get_doc("User", NO_READ_EMAIL).remove_roles("Agent", "Agent Manager")
++		frappe.set_user(NO_READ_EMAIL)
++		self.assertTrue(is_agent())
++		self.assertFalse(frappe.has_permission("HD Ticket", "read", doc=self.ticket.name))
++		with self.assertRaises(frappe.PermissionError):
++			ticket_panel.get_panel_data(self.ticket.name)
++
++	def test_inactive_hd_agent_denied(self):
++		create_agent(INACTIVE_EMAIL)
++		frappe.db.set_value("HD Agent", INACTIVE_EMAIL, "is_active", 0)
++		with self.assertRaises(frappe.PermissionError):
++			self._read(INACTIVE_EMAIL)
++
++	def test_read_denied_for_missing_ticket(self):
++		with self.assertRaises(frappe.PermissionError):
++			self._read(ticket="999999999")
++
++
++class TestTicketPanelThread(FrappeTestCase):
++	def setUp(self):
++		self.addCleanup(frappe.db.rollback)
++		self.addCleanup(frappe.set_user, "Administrator")
++		frappe.set_user("Administrator")
++		create_agent(AGENT_EMAIL)
++		set_agent_settings(trigger_keyword=KEYWORD)
++		self.ticket = make_ticket(subject="Panel thread ticket").name
++
++	def _messages(self):
++		frappe.set_user(AGENT_EMAIL)
++		return ticket_panel.get_panel_data(self.ticket)["messages"]
++
++	def test_thread_selects_b5_comments_in_creation_order(self):
++		# AC-8 data: 3 human keyword (1 other case), 2 human plain, 2 agent, 1 keyword on ANOTHER ticket.
++		# Inserted out of order on purpose: the result must follow `creation`, not insertion.
++		other_ticket = make_ticket(subject="Another ticket").name
++		late = _add_comment(self.ticket, f"{KEYWORD} late human", creation="2026-11-12 10:05:00")
++		_add_comment(self.ticket, "plain human chat", creation="2026-11-12 10:01:00")
++		bot_plain = _add_comment(self.ticket, "bot says hi", AGENT_USER, "2026-11-12 10:03:00")
++		early = _add_comment(self.ticket, f"early {KEYWORD.upper()} human", creation="2026-11-12 10:02:00")
++		_add_comment(self.ticket, "another plain human", creation="2026-11-12 10:04:00")
++		bot_kw = _add_comment(self.ticket, f"bot {KEYWORD}", AGENT_USER, "2026-11-12 10:06:00")
++		last = _add_comment(self.ticket, f"last {KEYWORD} human", creation="2026-11-12 10:07:00")
++		_add_comment(other_ticket, f"{KEYWORD} on another ticket", creation="2026-11-12 10:04:30")
++
++		messages = self._messages()
++
++		self.assertEqual([m["name"] for m in messages], [early, bot_plain, late, bot_kw, last])
++		for message in messages:
++			self.assertEqual(set(message), THREAD_KEYS)
++			self.assertNotIn("@", message["author"])
++		self.assertEqual(messages[0]["text"], f"early {KEYWORD.upper()} human")
++		self.assertEqual(messages[0]["created_at"], frappe.utils.format_datetime("2026-11-12 10:02:00"))
++		self.assertRegex(messages[0]["created_at"], r"^\d{2}-\d{2}-\d{4} 10:02:00$")
++		self.assertEqual(messages[0]["author"], frappe.utils.get_fullname("Administrator"))
++
++	def test_thread_selects_nothing_for_humans_when_keyword_is_empty(self):
++		set_agent_settings(trigger_keyword="")
++		_add_comment(self.ticket, f"{KEYWORD} human")
++		bot = _add_comment(self.ticket, "bot reply", AGENT_USER)
++		self.assertEqual([m["name"] for m in self._messages()], [bot])
++
++	def test_thread_ignores_non_comment_types(self):
++		for comment_type in ("Info", "Assignment Completed", "Like", "Label"):
++			_add_comment(self.ticket, f"{KEYWORD} {comment_type}", comment_type=comment_type)
++		_add_comment(self.ticket, "bot info", AGENT_USER, comment_type="Info")
++		kept = _add_comment(self.ticket, f"{KEYWORD} real comment")
++		self.assertEqual([m["name"] for m in self._messages()], [kept])
++
++	def test_thread_marks_bot_messages(self):
++		_add_comment(self.ticket, f"{KEYWORD} human", creation="2026-11-12 10:00:00")
++		_add_comment(self.ticket, "bot answer", AGENT_USER, "2026-11-12 10:01:00")
++		messages = self._messages()
++		self.assertEqual([m["is_bot"] for m in messages], [False, True])
++		self.assertEqual(messages[1]["author"], frappe.utils.get_fullname(AGENT_USER))
++
++	def test_read_strips_xss_payloads_to_text(self):
++		payload = (
++			f'<script>alert(1)</script><img src=x onerror="alert(2)">'
++			f'<a href="javascript:alert(3)">link</a> <b>{KEYWORD}</b> bold'
++		)
++		_add_comment(self.ticket, payload)
++		_add_comment(self.ticket, f"<p>one</p><p>two</p>{payload}", AGENT_USER)
++		xss, bot = self._messages()
++		# Markup that can run (img/a handlers, javascript: urls) is gone; whatever text is left (an escaped
++		# <script> literal) is inert because the page renders it with textContent only.
++		for message in (xss, bot):
++			with self.subTest(is_bot=message["is_bot"]):
++				for tag in ("<img", "<a ", "</a", "<b>"):
++					self.assertNotIn(tag, message["text"])
++				self.assertNotIn("onerror", message["text"])
++				self.assertNotIn("javascript:", message["text"])
++				self.assertIn("link", message["text"])
++				self.assertEqual(message["text"].split()[-3:], ["link", KEYWORD, "bold"])
++		self.assertEqual(bot["text"].split()[:2], ["one", "two"])
++
++
++class TestTicketPanelReadOnly(FrappeTestCase):
++	"""AC-14, NFR-4, STD-OPS-5: the read changes nothing, calls no model, and logs ids only."""
++
++	def setUp(self):
++		self.addCleanup(frappe.db.rollback)
++		self.addCleanup(frappe.set_user, "Administrator")
++		frappe.set_user("Administrator")
++		create_agent(AGENT_EMAIL)
++		set_agent_settings(trigger_keyword=KEYWORD)
++		self.ticket = make_ticket(subject="Panel read-only ticket").name
++
++	def _logger(self):
++		logger = MagicMock()
++		patcher = patch.object(ticket_panel.frappe, "logger", return_value=logger)
++		get_logger = patcher.start()
++		self.addCleanup(patcher.stop)
++		return logger, get_logger
++
++	def _counts(self):
++		return {
++			"comments": frappe.db.count("Comment"),
++			"logs": frappe.db.count("ERP AI Log"),
++			"todos": frappe.db.count("ToDo"),
++			"tasks": frappe.db.count("Task"),
++			"modified": frappe.db.get_value("HD Ticket", self.ticket, "modified"),
++		}
++
++	def test_read_writes_nothing_and_calls_no_gateway(self):
++		_add_comment(self.ticket, f"{KEYWORD} human")
++		_add_comment(self.ticket, "bot reply", AGENT_USER)
++		gateway = FakeGateway()
++		frappe.set_user(AGENT_EMAIL)
++		self.assertNotEqual(frappe.session.user, "Administrator")
++		before = self._counts()
++		with patch("erp_ai.gateway.call_model", gateway), patch("frappe.enqueue") as enqueue:
++			for _ in range(3):
++				writes = frappe.db.transaction_writes
++				ticket_panel.get_panel_data(self.ticket)
++				self.assertEqual(frappe.db.transaction_writes, writes)
++		self.assertEqual(self._counts(), before)
++		self.assertEqual(gateway.call_count, 0)
++		enqueue.assert_not_called()
++
++	def test_read_never_returns_keyword_or_settings(self):
++		set_agent_settings(
++			trigger_keyword="zq-unique-keyword",
++			alert_recipients="[email-redacted]",
++			thinking_text="zq-unique-thinking",
++		)
++		frappe.db.set_value("HD Ticket", self.ticket, "ai_confidence", "Cao")
++		_add_comment(self.ticket, "bot reply", AGENT_USER)
++		frappe.set_user(AGENT_EMAIL)
++		result = json.dumps(ticket_panel.get_panel_data(self.ticket), ensure_ascii=False)
++		for secret in ("zq-unique-keyword", "zq-unique-recipient", "zq-unique-thinking"):
++			with self.subTest(secret=secret):
++				self.assertNotIn(secret, result)
++		self.assertEqual(set(json.loads(result)), {"ticket", "ai_fields", "messages"})
++
++	def test_read_logs_ids_only_at_debug(self):
++		_add_comment(self.ticket, f"{KEYWORD} secret body text")
++		_add_comment(self.ticket, "bot secret reply", AGENT_USER)
++		_add_comment(self.ticket, "plain human note without the trigger")
++		logger, get_logger = self._logger()
++		frappe.set_user(AGENT_EMAIL)
++		ticket_panel.get_panel_data(self.ticket)
++		get_logger.assert_called_with(LOGGER_NAME)
++		logger.debug.assert_called_once_with(f"erp_ai panel read ticket={self.ticket} messages=2")
++		logger.info.assert_not_called()
++		logged = str(logger.mock_calls)
++		bot_name = frappe.utils.get_fullname(AGENT_USER)
++		for leak in ("secret", KEYWORD, bot_name, AGENT_EMAIL, AGENT_USER, "Administrator"):
++			self.assertNotIn(leak, logged)
++
++	def test_denied_read_logs_reason_without_content_or_email(self):
++		_make_user(WEBSITE_EMAIL)
++		_add_comment(self.ticket, f"{KEYWORD} secret body text")
++		logger, _ = self._logger()
++		frappe.set_user(WEBSITE_EMAIL)
++		with self.assertRaises(frappe.PermissionError):
++			ticket_panel.get_panel_data(self.ticket)
++		logger.info.assert_called_once_with(
++			f"erp_ai panel denied method=get ticket={self.ticket} reason=not_agent"
++		)
++		logger.debug.assert_not_called()
++
++		frappe.set_user("Administrator")
++		create_agent(NO_READ_EMAIL)
++		frappe.get_doc("User", NO_READ_EMAIL).remove_roles("Agent", "Agent Manager")
++		frappe.set_user(NO_READ_EMAIL)
++		logger.reset_mock()
++		with self.assertRaises(frappe.PermissionError):
++			ticket_panel.get_panel_data(self.ticket)
++		logger.info.assert_called_once_with(
++			f"erp_ai panel denied method=get ticket={self.ticket} reason=no_read"
++		)
++		logger.debug.assert_not_called()
++		logged = str(logger.mock_calls)
++		for leak in ("secret", KEYWORD, WEBSITE_EMAIL, NO_READ_EMAIL):
++			self.assertNotIn(leak, logged)
++
++
++class TestTicketPanelSend(FrappeTestCase):
++	"""AC-9, AC-13 (send): input checks, content building, one Comment owned by the sender."""
++
++	KEYWORD = "!hoibot"
++
++	def setUp(self):
++		self.addCleanup(frappe.db.rollback)
++		self.addCleanup(frappe.set_user, "Administrator")
++		frappe.set_user("Administrator")
++		create_agent(AGENT_EMAIL)
++		set_agent_settings(trigger_keyword=self.KEYWORD)
++		self.ticket = make_ticket(subject="Panel send ticket").name
++		# The Comment handler (FEAT-001) is not under test here: keep it from queueing a job.
++		enqueue = patch.object(frappe, "enqueue")
++		enqueue.start()
++		self.addCleanup(enqueue.stop)
++
++	def _send(self, text, user=AGENT_EMAIL, ticket=None):
++		frappe.set_user(user)
++		return ticket_panel.send_message(ticket or self.ticket, text)
++
++	def _content(self, result):
++		return frappe.db.get_value("Comment", result["comment"], "content")
++
++	def _comment_count(self):
++		return frappe.db.count("Comment", {"reference_doctype": "HD Ticket", "reference_name": self.ticket})
++
++	def test_send_empty_or_whitespace_is_rejected(self):
++		for text in ("", "   ", "\n\t \n"):
++			with self.subTest(text=text), self.assertRaises(frappe.ValidationError):
++				self._send(text)
++		# Frappe's own annotation check turns a wrong type away before the function body runs.
++		for text in (None, 5):
++			with self.subTest(text=text), self.assertRaises(frappe.FrappeTypeError):
++				self._send(text)
++		self.assertEqual(self._comment_count(), 0)
++
++	def test_send_length_boundary(self):
++		self.assertIn("comment", self._send("a" * 2000))
++		# The limit counts the text after strip().
++		self.assertIn("comment", self._send("  " + "a" * 2000 + "  "))
++		with self.assertRaises(frappe.ValidationError):
++			self._send("a" * 2001)
++		self.assertEqual(self._comment_count(), 2)
++
++	def test_send_appends_configured_keyword_when_missing(self):
++		self.assertEqual(self._content(self._send("Hello there")), f"<p>Hello there {self.KEYWORD}</p>")
++
++	def test_send_keeps_text_when_keyword_present_other_case(self):
++		self.assertEqual(
++			self._content(self._send(f"Hi {self.KEYWORD.upper()} please")),
++			f"<p>Hi {self.KEYWORD.upper()} please</p>",
++		)
++
++	def test_send_escapes_html(self):
++		# <b> is an allowed tag: only our own escaping keeps it from being stored as markup.
++		result = self._send("<b>x</b> & y")
++		self.assertEqual(self._content(result), f"<p>&lt;b&gt;x&lt;/b&gt; &amp; y {self.KEYWORD}</p>")
++		frappe.set_user(AGENT_EMAIL)
++		texts = [m["text"] for m in ticket_panel.get_panel_data(self.ticket)["messages"]]
++		self.assertEqual(texts, [f"<b>x</b> & y {self.KEYWORD}"])
++
++	def test_send_multiline_keeps_line_breaks(self):
++		content = self._content(self._send("one\ntwo\r\nthree"))
++		self.assertEqual(content, f"<p>one<br>two<br>three {self.KEYWORD}</p>")
++
++	def test_send_creates_one_comment_owned_by_sender(self):
++		result = self._send("Question")
++		self.assertEqual(list(result), ["comment"])
++		self.assertEqual(self._comment_count(), 1)
++		values = frappe.db.get_value(
++			"Comment", result["comment"], ["owner", "comment_type", "comment_email"], as_dict=True
++		)
++		self.assertEqual(values.owner, AGENT_EMAIL)
++		self.assertNotEqual(values.owner, AGENT_USER)
++		self.assertEqual(values.comment_type, "Comment")
++		self.assertEqual(values.comment_email, AGENT_EMAIL)
++
++	def test_send_with_empty_keyword_creates_comment_without_keyword(self):
++		set_agent_settings(trigger_keyword="")
++		self.assertEqual(self._content(self._send("No keyword")), "<p>No keyword</p>")
++		self.assertEqual(self._comment_count(), 1)
++
++	def test_send_calls_new_comment_once_with_built_content(self):
++		with patch("helpdesk.helpdesk.doctype.hd_ticket.hd_ticket.HDTicket.new_comment") as new_comment:
++			new_comment.return_value = "COMMENT-1"
++			self.assertEqual(self._send("Hi"), {"comment": "COMMENT-1"})
++		new_comment.assert_called_once_with(f"<p>Hi {self.KEYWORD}</p>")
++
++	def test_send_denied_for_same_accounts_creates_nothing(self):
++		_make_user(WEBSITE_EMAIL)
++		frappe.set_user("Administrator")
++		create_agent(NO_READ_EMAIL)
++		frappe.get_doc("User", NO_READ_EMAIL).remove_roles("Agent", "Agent Manager")
++		create_agent(INACTIVE_EMAIL)
++		frappe.db.set_value("HD Agent", INACTIVE_EMAIL, "is_active", 0)
++		_make_user(CUSTOMER_EMAIL)
++		frappe.get_doc("User", CUSTOMER_EMAIL).add_roles("HD Customer")
++		own = make_ticket(subject="Customer own ticket", raised_by=CUSTOMER_EMAIL).name
++		frappe.set_user(NO_READ_EMAIL)
++		self.assertTrue(is_agent())
++		self.assertFalse(frappe.has_permission("HD Ticket", "read", doc=self.ticket))
++		frappe.set_user(CUSTOMER_EMAIL)
++		self.assertFalse(is_agent())
++		self.assertTrue(frappe.has_permission("HD Ticket", "read", doc=own))
++		with self.assertRaises(frappe.PermissionError):
++			ticket_panel.send_message(own, "Hi")
++		for user in (WEBSITE_EMAIL, "Guest", NO_READ_EMAIL, INACTIVE_EMAIL):
++			with self.subTest(user=user), self.assertRaises(frappe.PermissionError):
++				self._send("Hi", user=user)
++		with self.assertRaises(frappe.PermissionError):
++			self._send("Hi", ticket="999999999")
++		self.assertEqual(self._comment_count(), 0)
++		self.assertEqual(frappe.db.count("Comment", {"reference_name": own}), 0)
++
++	def test_send_denied_for_agent_user(self):
++		frappe.set_user("Administrator")
++		create_agent(AGENT_USER)
++		with self.assertRaises(frappe.PermissionError):
++			self._send("Hi", user=AGENT_USER)
++		self.assertEqual(self._comment_count(), 0)
++
++	def _logger(self):
++		logger = MagicMock()
++		patcher = patch.object(ticket_panel.frappe, "logger", return_value=logger)
++		patcher.start()
++		self.addCleanup(patcher.stop)
++		return logger
++
++	def test_send_stored_content_passes_contains_keyword(self):
++		for text in ("Hello", "<b>x</b> & y", f"Hi {self.KEYWORD.upper()} there", "one\ntwo"):
++			with self.subTest(text=text):
++				stored = self._content(self._send(text))
++				self.assertTrue(contains_keyword(stored), stored)
++
++	def test_send_checks_keyword_on_sanitized_form(self):
++		# The check must run on what sanitize_html(always_sanitize=True) returns, not on our own escaping.
++		with (
++			patch.object(ticket_panel, "sanitize_html", return_value="<p>stripped</p>") as sanitize,
++			patch("helpdesk.helpdesk.doctype.hd_ticket.hd_ticket.HDTicket.new_comment") as new_comment,
++		):
++			with self.assertRaises(frappe.ValidationError):
++				self._send("Hello")
++		sanitize.assert_called_once_with(f"<p>Hello {self.KEYWORD}</p>", always_sanitize=True)
++		new_comment.assert_not_called()
++
++	def test_send_keyword_with_special_chars_rejected(self):
++		for keyword in ("a&b", "a<b"):
++			with self.subTest(keyword=keyword):
++				set_agent_settings(trigger_keyword=keyword)
++				with (
++					patch(
++						"helpdesk.helpdesk.doctype.hd_ticket.hd_ticket.HDTicket.new_comment"
++					) as new_comment,
++					self.assertRaises(frappe.ValidationError) as caught,
++				):
++					self._send("Hello")
++				new_comment.assert_not_called()
++				self.assertNotIn(keyword, str(caught.exception))
++				self.assertNotIn(keyword.casefold(), str(caught.exception).casefold())
++				self.assertEqual(self._comment_count(), 0)
++
++	def test_send_logs_without_content_or_email(self):
++		logger = self._logger()
++		added = self._send("Secret body")["comment"]
++		kept = self._send(f"Other {self.KEYWORD}")["comment"]
++		set_agent_settings(trigger_keyword="a&b")
++		with self.assertRaises(frappe.ValidationError):
++			self._send("Secret body")
++		set_agent_settings(trigger_keyword=self.KEYWORD)
++		with self.assertRaises(frappe.PermissionError):
++			self._send("Secret body", user="Guest")
++		frappe.set_user("Administrator")
++		create_agent(AGENT_USER)
++		with self.assertRaises(frappe.PermissionError):
++			self._send("Secret body", user=AGENT_USER)
++		# The FEAT-001 handler logs through the same logger name: keep only the panel's lines.
++		lines = [
++			call.args[0] for call in logger.info.call_args_list if call.args[0].startswith("erp_ai panel")
++		]
++		self.assertEqual(
++			lines,
++			[
++				f"erp_ai panel send ticket={self.ticket} comment={added} keyword_added=true",
++				f"erp_ai panel send ticket={self.ticket} comment={kept} keyword_added=false",
++				f"erp_ai panel send rejected ticket={self.ticket} reason=keyword_not_storable",
++				f"erp_ai panel denied method=send ticket={self.ticket} reason=not_agent",
++				f"erp_ai panel denied method=send ticket={self.ticket} reason=agent_user",
++			],
++		)
++		logged = str(logger.mock_calls)
++		for leak in ("Secret", "Other", "a&b", self.KEYWORD, AGENT_EMAIL, AGENT_USER):
++			self.assertNotIn(leak, logged)
++
++
++class TestTicketPanelGateParity(FrappeTestCase):
++	"""AC-10, NFR-4: the panel and the Comments box reach the same agent decision in every gate branch."""
++
++	KEYWORD = "xin-bot"
++	TEXT = "Please look at this"
++	EXCLUDED_TEAM = "ERPAI-TEST-Parity-Excluded"
++	INSTRUCTOR_EMAIL = "[email-redacted]"
++	SAVEPOINT = "erp_ai_gate_parity"
++	RUN_ROUTE = "erp_ai.agent.runner.run_for_ticket"
++
++	def setUp(self):
++		# Cleanups run LIFO: set_user, rollback, then the roles cache that the rollback leaves stale.
++		self.addCleanup(frappe.clear_cache, user=self.INSTRUCTOR_EMAIL)
++		self.addCleanup(frappe.db.rollback)
++		self.addCleanup(frappe.set_user, "Administrator")
++		frappe.set_user("Administrator")
++		commit_guard = patch.object(frappe.db, "commit", side_effect=AssertionError("test must not commit"))
++		commit_guard.start()
++		self.addCleanup(commit_guard.stop)
++		log_error = patch.object(frappe, "log_error")
++		self.log_error = log_error.start()
++		self.addCleanup(log_error.stop)
++		record_status_signals(self)
++		sleep_patch = patch.object(answer_delay, "_sleep")
++		sleep_patch.start()
++		self.addCleanup(sleep_patch.stop)
++		self.gateway = FakeGateway()
++		gateway_patch = patch("erp_ai.gateway.call_model", self.gateway)
++		gateway_patch.start()
++		self.addCleanup(gateway_patch.stop)
++		enqueue_patch = patch.object(frappe, "enqueue")
++		self.enqueue = enqueue_patch.start()
++		self.addCleanup(enqueue_patch.stop)
++
++		if not frappe.db.exists("Role", ROLE_INSTRUCTOR):
++			frappe.get_doc({"doctype": "Role", "role_name": ROLE_INSTRUCTOR}).insert(ignore_permissions=True)
++		create_agent(AGENT_EMAIL)
++		create_agent(self.INSTRUCTOR_EMAIL)
++		frappe.get_doc("User", self.INSTRUCTOR_EMAIL).add_roles(ROLE_INSTRUCTOR)
++
++	def _tool_turn(self):
++		block = {"type": "tool_use", "id": "toolu_1", "name": "get_ticket", "input": {}}
++		return make_model_result(content=[block], stop_reason="tool_use")
++
++	def _branches(self):
++		"""name -> (settings, ticket values, seeded runs, assigned agent, commenter, gateway results, expected jobs, expected gateway calls, expected instructor)."""
++		l1 = {
++			"permission_level": "L1",
++			"max_runs_per_ticket_per_day": 5,
++			"max_turns_per_run": 4,
++			"monthly_budget_usd": 0,
++			"spent_this_month_usd": 0,
++			"excluded_teams": "",
++		}
++		return {
++			"agent_off": (
++				{**l1, "enabled": 0},
++				{},
++				0,
++				False,
++				AGENT_EMAIL,
++				[],
++				0,
++				0,
++				None,
++			),
++			"level_L0": (
++				{**l1, "permission_level": "L0"},
++				{},
++				0,
++				False,
++				AGENT_EMAIL,
++				[],
++				1,
++				0,
++				None,
++			),
++			"excluded_group": (
++				{**l1, "excluded_teams": self.EXCLUDED_TEAM},
++				{"agent_group": self.EXCLUDED_TEAM},
++				0,
++				False,
++				AGENT_EMAIL,
++				[],
++				0,
++				0,
++				None,
++			),
++			"ai_opt_out": (l1, {"ai_opt_out": 1}, 0, False, AGENT_EMAIL, [], 0, 0, None),
++			"daily_limit": (
++				{**l1, "max_runs_per_ticket_per_day": 1},
++				{},
++				1,
++				False,
++				AGENT_EMAIL,
++				[],
++				1,
++				0,
++				None,
++			),
++			"turn_limit": (
++				{**l1, "max_turns_per_run": 1},
++				{},
++				0,
++				False,
++				AGENT_EMAIL,
++				[self._tool_turn()],
++				1,
++				1,
++				None,
++			),
++			"over_budget": (
++				{**l1, "permission_level": "L2", "monthly_budget_usd": 1, "spent_this_month_usd": 2},
++				{},
++				0,
++				False,
++				AGENT_EMAIL,
++				[],
++				1,
++				1,
++				None,
++			),
++			"instructor_role": (
++				{**l1, "permission_level": "L2"},
++				{},
++				0,
++				False,
++				self.INSTRUCTOR_EMAIL,
++				[],
++				1,
++				1,
++				self.INSTRUCTOR_EMAIL,
++			),
++			"assignee": ({**l1, "permission_level": "L2"}, {}, 0, True, AGENT_EMAIL, [], 1, 1, AGENT_EMAIL),
++			"other_person": (l1, {}, 0, False, AGENT_EMAIL, [], 1, 1, None),
++		}
++
++	def _decision(self, ticket, user, act, results):
++		"""Run `act` as `user`, then every agent job it queued; return what the decision looks like, then undo it all."""
++		frappe.db.savepoint(self.SAVEPOINT)
++		known = set(frappe.get_all(LOG_DOCTYPE, filters={"ticket": ticket}, pluck="name"))
++		self.enqueue.reset_mock()
++		self.gateway.calls.clear()
++		self.gateway.results = list(results)
++		frappe.flags.pop(PENDING_JOB_IDS_FLAG, None)
++		frappe.set_user(user)
++		decisions = []
++		logger = MagicMock()
++		logger.info.side_effect = lambda message, *args, **kwargs: decisions.append(str(message))
++		try:
++			with patch.object(frappe, "logger", return_value=logger):
++				content_of = act()
++			jobs = [
++				call.kwargs
++				for call in self.enqueue.call_args_list
++				if call.args and call.args[0] == self.RUN_ROUTE
++			]
++		finally:
++			frappe.set_user("Administrator")
++		for job in jobs:
++			runner.run_for_ticket(job["ticket_name"], job["trigger"])
++		frappe.set_user("Administrator")
++		entries = [
++			row
++			for row in frappe.get_all(
++				LOG_DOCTYPE,
++				filters={"ticket": ticket},
++				fields=["name", "entry_type", "trigger", "turn", "stop_reason", "instructor"],
++				order_by="creation asc, name asc",
++			)
++			if row.name not in known
++		]
++		outcome = {
++			"jobs": [(job["ticket_name"], job["trigger"], job["job_id"]) for job in jobs],
++			"gateway": [
++				(call["task"], [tool["name"] for tool in call.get("tools") or []])
++				for call in self.gateway.calls
++			],
++			"log": [(e.entry_type, e.trigger, e.turn, e.stop_reason, e.instructor) for e in entries],
++			"decisions": [line for line in decisions if line.startswith("erp_ai handler ")],
++			"comment": frappe.db.get_value("Comment", content_of, ["owner", "comment_type", "content"]),
++		}
++		frappe.flags.pop(PENDING_JOB_IDS_FLAG, None)
++		frappe.db.rollback(save_point=self.SAVEPOINT)
++		return outcome
++
++	def test_send_matches_comments_box_in_every_gate_branch(self):
++		for name, branch in self._branches().items():
++			settings, ticket_values, seeded, assigned, user, results, want_jobs, want_calls, want_who = branch
++			with self.subTest(branch=name):
++				set_agent_settings(enabled=1, trigger_keyword=self.KEYWORD)
++				ticket = make_ticket(subject=f"Parity {name}").name
++				if ticket_values:
++					frappe.db.set_value("HD Ticket", ticket, ticket_values)
++				if assigned:
++					todo = make_todo(ticket, AGENT_EMAIL)
++					frappe.db.set_value("ToDo", todo, "assigned_by", "Administrator")
++				for index in range(seeded):
++					write_entry(
++						ticket=ticket,
++						run_id=f"ERPAI-TEST-parity-{index}",
++						entry_type="classify",
++						trigger="ticket_insert",
++						turn=0,
++					)
++				set_agent_settings(**settings)
++
++				def comments_box():
++					return frappe.get_doc("HD Ticket", ticket).new_comment(
++						f"<p>{self.TEXT} {self.KEYWORD}</p>"
++					)
++
++				def panel():
++					return ticket_panel.send_message(ticket, self.TEXT)["comment"]
++
++				via_box = self._decision(ticket, user, comments_box, results)
++				via_panel = self._decision(ticket, user, panel, results)
++
++				self.assertEqual(via_panel, via_box)
++				self.assertEqual(len(via_panel["jobs"]), want_jobs)
++				self.assertEqual(len(via_panel["gateway"]), want_calls)
++				if want_jobs:
++					self.assertTrue(via_panel["log"])
++				self.assertEqual(
++					{entry[4] for entry in via_panel["log"] if entry[0] == "reason"} or {None},
++					{want_who},
++				)
++				if name in ("excluded_group", "ai_opt_out"):
++					self.assertEqual(self.gateway.call_count, 0)
+diff --git a/erp_ai/ticket_panel.py b/erp_ai/ticket_panel.py
+new file mode 100644
+index 0000000..6e83e11
+--- /dev/null
++++ b/erp_ai/ticket_panel.py
+@@ -0,0 +1,144 @@
++"""Ticket-page panel (ADR-009, ADR-010): the AI fields of a ticket, read under the caller's own permissions."""
++
++import html
++
++import frappe
++from frappe import _
++from frappe.core.utils import html_to_plain_text
++from frappe.desk.form.activity import get_activity_timeline
++from frappe.utils import cstr, format_datetime
++from frappe.utils.html_utils import sanitize_html
++from helpdesk.utils import is_agent
++
++from erp_ai.agent.policy import contains_keyword, get_trigger_keyword
++from erp_ai.constants import AGENT_USER, LOGGER_NAME, PANEL_MAX_MESSAGE_CHARS
++
++TICKET_DOCTYPE = "HD Ticket"
++AI_FIELDS = ("ai_resolution_hint", "ai_confidence", "ai_classified_by", "ai_updated_at")
++
++
++def _log_denied(method, ticket, reason):
++	"""Ids and reasons only, never ticket content."""
++	frappe.logger(LOGGER_NAME).info(f"erp_ai panel denied method={method} ticket={ticket} reason={reason}")
++
++
++def _require_panel_access(ticket: str, *, forbid_agent_user: bool = False) -> None:
++	"""Shared gate of both panel methods: an active agent who can read the ticket."""
++	method = "send" if forbid_agent_user else "get"
++	if not is_agent():
++		_log_denied(method, ticket, "not_agent")
++		frappe.throw(_("Bạn không có quyền xem khu vực này của phiếu."), frappe.PermissionError)
++	if not frappe.db.exists(TICKET_DOCTYPE, ticket) or not frappe.has_permission(
++		TICKET_DOCTYPE, "read", doc=ticket
++	):
++		_log_denied(method, ticket, "no_read")
++		frappe.throw(_("Bạn không có quyền xem khu vực này của phiếu."), frappe.PermissionError)
++	if forbid_agent_user and frappe.session.user == AGENT_USER:
++		_log_denied(method, ticket, "agent_user")
++		frappe.throw(_("Tài khoản agent không được gửi tin từ khu vực này."), frappe.PermissionError)
++
++
++def _field_text(meta, doc, fieldname):
++	value = doc.get(fieldname)
++	if not value:
++		return None
++	fieldtype = meta.get_field(fieldname).fieldtype
++	if fieldtype == "Text Editor":
++		return html_to_plain_text(value) or None
++	if fieldtype == "Datetime":
++		return format_datetime(value)
++	return cstr(value)
++
++
++def _ai_fields(ticket: str) -> list[dict]:
++	meta = frappe.get_meta(TICKET_DOCTYPE)
++	doc = frappe.get_doc(TICKET_DOCTYPE, ticket)
++	doc.apply_fieldlevel_read_permissions()
++	return [
++		{"fieldname": name, "label": meta.get_label(name), "text": _field_text(meta, doc, name)}
++		for name in AI_FIELDS
++	]
++
++
++def _thread(ticket: str) -> list[dict]:
++	"""B-5 (ADR-010): Comment items of the timeline written by the agent or containing the keyword, old to new."""
++	items = get_activity_timeline(TICKET_DOCTYPE, ticket, ["comment"])["activities"]
++	messages = []
++	for item in items:
++		if item["type"] != "comment":
++			continue
++		content = item["data"]["content"]
++		is_bot = item["author"]["email"] == AGENT_USER
++		if not is_bot and not contains_keyword(content):
++			continue
++		messages.append(
++			{
++				"name": item["data"]["name"],
++				"author": item["author"]["fullname"],
++				"is_bot": is_bot,
++				"created_at": format_datetime(item["timestamp"]),
++				"text": html_to_plain_text(content),
++			}
++		)
++	return messages
++
++
++@frappe.whitelist(methods=["POST"])
++def get_panel_data(ticket: str) -> dict:
++	if not isinstance(ticket, str) or not ticket.strip():
++		frappe.throw(_("Thiếu mã phiếu."), frappe.ValidationError)
++	ticket = ticket.strip()
++	_require_panel_access(ticket)
++	messages = _thread(ticket)
++	frappe.logger(LOGGER_NAME).debug(f"erp_ai panel read ticket={ticket} messages={len(messages)}")
++	return {"ticket": ticket, "ai_fields": _ai_fields(ticket), "messages": messages}
++
++
++def _message_content(text) -> tuple[str, bool]:
++	"""B-6: the typed text escaped, line breaks kept, the trigger keyword appended when missing.
++
++	Returns the content and whether the keyword was appended."""
++	if not isinstance(text, str) or not text.strip():
++		frappe.throw(_("Nội dung tin trống."), frappe.ValidationError)
++	text = text.strip()
++	if len(text) > PANEL_MAX_MESSAGE_CHARS:
++		frappe.throw(_("Tin dài quá {0} ký tự.").format(PANEL_MAX_MESSAGE_CHARS), frappe.ValidationError)
++	body = "<br>".join(html.escape(line, quote=False) for line in text.splitlines())
++	keyword = get_trigger_keyword()
++	keyword_added = bool(keyword) and not contains_keyword(body)
++	if keyword_added:
++		body = f"{body} {html.escape(keyword, quote=False)}"
++	return f"<p>{body}</p>", keyword_added
++
++
++@frappe.whitelist(methods=["POST"])
++def send_message(ticket: str, text: str) -> dict:
++	"""Post the typed text as a Comment on the ticket, owned by the caller (B-6).
++
++	Input: ticket name; text, 1-PANEL_MAX_MESSAGE_CHARS characters after strip().
++	Output: {"comment": <Comment name>}.
++	Errors: PermissionError (not an active agent, no read on the ticket, or the agent account);
++	ValidationError (missing ticket, empty or too long text, or a trigger keyword that does not survive
++	storage as a Comment); FrappeTypeError (text not a string).
++	"""
++	if not isinstance(ticket, str) or not ticket.strip():
++		frappe.throw(_("Thiếu mã phiếu."), frappe.ValidationError)
++	ticket = ticket.strip()
++	_require_panel_access(ticket, forbid_agent_user=True)
++	content, keyword_added = _message_content(text)
++	# Same call as Comment.validate: the stored form must still trigger the agent handler (ADR-010 Amendment 1).
++	if get_trigger_keyword() and not contains_keyword(sanitize_html(content, always_sanitize=True)):
++		frappe.logger(LOGGER_NAME).info(
++			f"erp_ai panel send rejected ticket={ticket} reason=keyword_not_storable"
++		)
++		frappe.throw(
++			_(
++				"Từ khóa kích hoạt trong ERP AI Setting có ký tự không dùng được. Quản trị viên cần đổi từ khóa này."
++			),
++			frappe.ValidationError,
++		)
++	comment = frappe.get_doc(TICKET_DOCTYPE, ticket).new_comment(content)
++	frappe.logger(LOGGER_NAME).info(
++		f"erp_ai panel send ticket={ticket} comment={comment} keyword_added={str(keyword_added).lower()}"
++	)
++	return {"comment": comment}

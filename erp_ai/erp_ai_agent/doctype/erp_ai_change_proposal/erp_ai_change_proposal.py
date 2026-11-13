@@ -1,0 +1,126 @@
+import frappe
+from frappe import _
+from frappe.model.document import Document
+from frappe.utils import cint, cstr
+
+from erp_ai.agent import change_text, queue
+from erp_ai.agent.authority import NEVER_AUTHORITY
+from erp_ai.agent.changes import transitions
+from erp_ai.constants import CHANGE_KIND_CODE, PROPOSAL_DOCTYPE, ROLE_INSTRUCTOR
+
+# Design 2.1 content group (ADR-012 QĐ 1): written once at insert, never changed afterwards.
+CONTENT_FIELDS = (
+	"ticket",
+	"run_id",
+	"instructor",
+	"change_kind",
+	"app",
+	"file_path",
+	"is_new_file",
+	"command_args",
+	"base_hash",
+	"content_before",
+	"content_after",
+	"after_hash",
+	"diff",
+	"reason",
+	"reversible",
+	"target_branch",
+	"upstream_ref",
+	"ahead_count",
+	"is_core_app",
+	"commit_message",
+)
+NUMERIC_CONTENT_FIELDS = ("is_new_file", "reversible", "ahead_count", "is_core_app")
+
+
+def _stored_form(fieldname: str, value):
+	"""Compare as the database stores the value: integers for Check/Int, text otherwise (None is "")."""
+	if fieldname in NUMERIC_CONTENT_FIELDS:
+		return cint(value)
+	return cstr(value)
+
+
+class ERPAIChangeProposal(Document):
+	def before_insert(self):
+		transitions.prepare_new(self)
+
+	def onload(self):
+		"""Design 3.3 form data: the 3.9 sentences, built only from the stored fields (no git)."""
+		self.set_onload("change_notes", change_text.proposal_notes(self))
+
+	def validate(self):
+		if self.is_new():
+			self._set_commit_message()
+			return
+		before = frappe.db.get_value(self.doctype, self.name, CONTENT_FIELDS, as_dict=True)
+		changed = [
+			fieldname
+			for fieldname in CONTENT_FIELDS
+			if _stored_form(fieldname, self.get(fieldname)) != _stored_form(fieldname, before.get(fieldname))
+		]
+		if changed:
+			frappe.throw(
+				_("Nội dung đề xuất không sửa được sau khi tạo: {0}").format(", ".join(changed)),
+				frappe.ValidationError,
+			)
+
+	def _set_commit_message(self):
+		"""D-14: the apply-commit preview (design 3.9), replacing whatever the caller passed.
+
+		Runs in `validate` at insert, once Frappe has named the proposal; a bench command has no commit.
+		"""
+		if self.change_kind != CHANGE_KIND_CODE:
+			self.commit_message = None
+			return
+		subject, body = change_text.apply_message(
+			self.name, cstr(self.ticket), cstr(self.file_path), change_text.APPROVER_PLACEHOLDER
+		)
+		self.commit_message = change_text.message_text(subject, body)
+
+
+def _decider(name) -> str:
+	"""Design 3.3/4.2 boundary: the session user holds `ERP AI Instructor`, then `name` is an existing proposal.
+
+	`name` has no type annotation on the three methods on purpose: Frappe would refuse a non-string with its
+	own type error before this check, and design 3.3 answers it with `DoesNotExistError` instead.
+	Returns the session user. The role is read with `frappe.get_roles`, never `is_instruction`: an assigned
+	user without the role is refused, and the accounts of `NEVER_AUTHORITY` are refused even with it.
+	"""
+	user = frappe.session.user
+	if user in NEVER_AUTHORITY or ROLE_INSTRUCTOR not in frappe.get_roles(user):
+		frappe.throw(
+			_("Chỉ người có vai trò ERP AI Instructor mới duyệt, từ chối hoặc hoàn tác được"),
+			frappe.PermissionError,
+		)
+	if not isinstance(name, str) or not name.strip() or not frappe.db.exists(PROPOSAL_DOCTYPE, name):
+		frappe.throw(
+			_("Không có đề xuất {0}").format(frappe.utils.escape_html(cstr(name))),
+			frappe.DoesNotExistError,
+		)
+	return user
+
+
+@frappe.whitelist(methods=["POST"])
+def approve(name=None) -> dict:
+	"""`Chờ duyệt → Đã duyệt`, then queue the `apply` job (design 3.3, ADR-012 QĐ 4)."""
+	user = _decider(name)
+	status = transitions.approve(name, user)
+	queue.enqueue_change_job(name, "apply")
+	return {"name": name, "status": status}
+
+
+@frappe.whitelist(methods=["POST"])
+def reject(name=None) -> dict:
+	"""`Chờ duyệt → Đã từ chối`; no job (design 3.3)."""
+	user = _decider(name)
+	return {"name": name, "status": transitions.reject(name, user)}
+
+
+@frappe.whitelist(methods=["POST"])
+def undo(name=None) -> dict:
+	"""`Đã áp dụng → Đang hoàn tác` for a code change, then queue the `undo` job (design 3.3)."""
+	user = _decider(name)
+	status = transitions.request_undo(name, user)
+	queue.enqueue_change_job(name, "undo")
+	return {"name": name, "status": status}

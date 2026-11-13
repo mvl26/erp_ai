@@ -1,0 +1,60 @@
+{
+  "stack": "frappe",
+  "language": ["python"],
+  "cmd": {
+    "install": "cd ../.. && bench setup requirements --dev && bench --site miyano install-app erp_ai",
+    "build": "cd ../.. && bench build --app erp_ai",
+    "test": "cd ../.. && bench --site miyano run-tests --app erp_ai",
+    "test_one": "cd ../.. && bench --site miyano run-tests --module \"$(echo {file} | sed 's#/#.#g; s#\\.py$##')\"",
+    "lint": "pre-commit run --all-files",
+    "typecheck": "",
+    "format": "pre-commit run --files {file}",
+    "run": "cd ../.. && bench start",
+    "migrate": "cd ../.. && bench --site miyano migrate"
+  },
+  "formatters_by_ext": {
+    ".py": "pre-commit run --files {file}",
+    ".js": "pre-commit run --files {file}"
+  },
+  "structure": {
+    "src": "erp_ai",
+    "tests": "colocated",
+    "docs": "docs",
+    "config": ["pyproject.toml", "erp_ai/hooks.py", ".pre-commit-config.yaml"],
+    "allowed_new_file_roots": ["erp_ai", "docs", ".github"]
+  },
+  "naming": {
+    "file": "snake_case",
+    "class": "PascalCase",
+    "function": "snake_case",
+    "constant": "UPPER_SNAKE_CASE",
+    "test_file": "test_{name}.py"
+  },
+  "test": {
+    "skip_markers": ["@unittest.skip", "@unittest.skipIf", "@unittest.expectedFailure", ".skipTest("]
+  },
+  "protected_paths": [".env", ".env.*", "**/*.pem", "**/*.key", "license.txt"],
+  "ci": {
+    "provider": "github",
+    "runner": "ubuntu-latest"
+  },
+  "deploy": {
+    "staging": "",
+    "smoke": "",
+    "prod_requires_reviewer": true
+  },
+  "ui": false,
+  "tracker": "github",
+  "plugins": {
+    "required": ["team@automation-ai"],
+    "recommended": []
+  },
+  "notes": {
+    "cmd.*": "Site dev = miyano (site duy nhất trong bench, default_site, allow_tests=true, đã cài erp_ai); chốt lúc onboard 2026-11-11.",
+    "cmd.test_one": "Chưa chạy thử: repo chưa có file test; phải kiểm với file test đầu tiên.",
+    "cmd.format": "Dùng pre-commit vì ruff không có trong env/ của bench.",
+    "language": "Thêm javascript khi có HD Form Script.",
+    "ui": "Chưa chốt (open-questions câu 9): UI là SPA của helpdesk, không thuộc app.",
+    "naming.branch": "Chưa chốt (open-questions câu 10)."
+  }
+}

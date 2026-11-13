@@ -1,0 +1,96 @@
+diff --git a/erp_ai/public/js/agent_status_indicator.js b/erp_ai/public/js/agent_status_indicator.js
+index 1fa307a..551897d 100644
+--- a/erp_ai/public/js/agent_status_indicator.js
++++ b/erp_ai/public/js/agent_status_indicator.js
+@@ -15,7 +15,6 @@ function setupForm({ doc, router }) {
+ 			nameEl: null,
+ 			textEl: null,
+ 			socket: null,
+-			bound: false,
+ 		});
+ 
+ 		const ensureElement = () => {
+@@ -133,7 +132,13 @@ function setupForm({ doc, router }) {
+ 						return;
+ 					}
+ 					run = {
+-						timer: setTimeout(() => finish(runId), ms),
++						timer: setTimeout(() => {
++							try {
++								finish(runId);
++							} catch (e) {
++								// A timer callback must never throw to the console (AC-10 g).
++							}
++						}, ms),
+ 						text: "",
+ 						name: "",
+ 						at: 0,
+@@ -158,10 +163,28 @@ function setupForm({ doc, router }) {
+ 		if (state.socket !== socket) {
+ 			state.socket = socket;
+ 			socket.on(EVENT, onStatus);
+-			socket.on("connect", () => socket.emit("doc_subscribe", "HD Ticket", state.ticket));
++			socket.on("connect", () => {
++				try {
++					// Re-join the room after a reconnect; never subscribe with no ticket open.
++					if (state.ticket) {
++						socket.emit("doc_subscribe", "HD Ticket", state.ticket);
++					}
++				} catch (e) {
++					// A socket callback must never throw to the console (AC-10 g).
++				}
++			});
+ 			router?.afterEach((to) => {
+-				if (to?.name !== "TicketAgent" || String(to?.params?.ticketId) !== state.ticket) {
+-					reset();
++				try {
++					if (
++						to?.name !== "TicketAgent" ||
++						String(to?.params?.ticketId) !== state.ticket
++					) {
++						// Left the viewed ticket: forget it so its signals are ignored (ADR-008 decision 6).
++						reset();
++						state.ticket = null;
++					}
++				} catch (e) {
++					// A router hook must never throw to the console (AC-10 g).
+ 				}
+ 			});
+ 		}
+diff --git a/erp_ai/tests/test_architecture.py b/erp_ai/tests/test_architecture.py
+index 39153b2..9d7da3a 100644
+--- a/erp_ai/tests/test_architecture.py
++++ b/erp_ai/tests/test_architecture.py
+@@ -116,7 +116,20 @@ STATUS_SCRIPT_FORBIDDEN = (
+ 	r"HD Form Script",
+ 	r"^\s*(import|export)\b",
+ )
+-STATUS_SCRIPT_REQUIRED = ("textContent", "doc_subscribe", '"connect"', "setTimeout", "try", "expires_in_s")
++# Regexes: the socket guard keeps setupForm (run many times) from registering listeners twice; the
++# `state.ticket = null` leave-page step keeps a left ticket's signals from showing (ADR-008 decision 6).
++STATUS_SCRIPT_REQUIRED = (
++	r"textContent",
++	r"doc_subscribe",
++	r'"connect"',
++	r"setTimeout",
++	r"try \{",
++	r"catch \(",
++	r"expires_in_s",
++	r"if \(state\.socket !== socket\)",
++	r"state\.ticket = null",
++	r"if \(state\.ticket\)",
++)
+ 
+ LEGACY_NAMES = ("HD Ticket Comment", "commented_by", "comment_email", "comment_by")
+ # Design 3.5 (amendment 1c) tells `get_record` to DROP comment_email/comment_by from a Comment; this one
+@@ -760,8 +773,8 @@ class TestArchitecture(unittest.TestCase):
+ 		self.assertIn("function setupForm({ doc, router })", script)
+ 		for pattern in STATUS_SCRIPT_FORBIDDEN:
+ 			self.assertIsNone(re.search(pattern, script, re.MULTILINE), f"forbidden in script: {pattern}")
+-		for token in STATUS_SCRIPT_REQUIRED:
+-			self.assertIn(token, script)
++		for pattern in STATUS_SCRIPT_REQUIRED:
++			self.assertIsNotNone(re.search(pattern, script), f"missing in script: {pattern}")
+ 
+ 	def test_status_event_name_matches_script(self):
+ 		match = re.search(r'^AGENT_STATUS_EVENT = "([^"]+)"', self.sources[CONSTANTS_FILE], re.MULTILINE)

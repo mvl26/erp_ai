@@ -1,0 +1,33 @@
+diff --git a/erp_ai/agent/test_run_status.py b/erp_ai/agent/test_run_status.py
+index 936ff18..a46d986 100644
+--- a/erp_ai/agent/test_run_status.py
++++ b/erp_ai/agent/test_run_status.py
+@@ -65,6 +65,16 @@ class TestRunStatus(FrappeTestCase):
+ 		self.assertEqual(text, f"Đang làm: {FALLBACK_WORK_LABEL}…")
+ 		self.assertNotIn("drop_all_tables", text)
+ 
++	def test_unhashable_step_never_throws(self):
++		for step in (["x"], {}):
++			with self.subTest(repr(step)):
++				status = self._status()
++
++				status.working(step)
++
++				self.assertEqual(len(self.signals), 1)
++				self.assertEqual(self.signals[0]["message"]["text"], f"Đang làm: {FALLBACK_WORK_LABEL}…")
++
+ 	def test_payload_has_exactly_seven_keys(self):
+ 		status = self._status()
+ 
+diff --git a/erp_ai/agent/test_runner_status.py b/erp_ai/agent/test_runner_status.py
+index 6ee18ad..3ebeb2a 100644
+--- a/erp_ai/agent/test_runner_status.py
++++ b/erp_ai/agent/test_runner_status.py
+@@ -342,6 +342,7 @@ class TestRunnerStatus(RunnerTestBase):
+ 		self._set_delay(3, 5)
+ 		for level in ("L0", "L1"):
+ 			with self.subTest(level):
++				self.signals.clear()
+ 				frappe.db.savepoint("erp_ai_insert_case")
+ 				try:
+ 					set_agent_settings(permission_level=level)

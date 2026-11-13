@@ -1,0 +1,16 @@
+---
+paths:
+  - "colocated/**"
+  - "**/*test*"
+---
+
+# When editing tests
+
+- Failing test first, paste the red output; mandatory for bug fixes (STD-TEST-1).
+- Run one test file: `cd ../.. && bench --site miyano run-tests --module "$(echo {file} | sed 's#/#.#g; s#\.py$##')"` (substitute `{file}`); before merging: `cd ../.. && bench --site miyano run-tests --app erp_ai` (STD-TEST-3).
+- NEVER add skip markers to get green: @unittest.skip, @unittest.skipIf, @unittest.expectedFailure, .skipTest( — a violation is a blocker (STD-TEST-4).
+- Do not change an assertion to match wrong behavior; change a test only when the spec changes (STD-TEST-5).
+- Tests are independent and repeatable: no dependence on order, wall-clock time or external network (STD-TEST-6).
+- Cover edge cases and error paths too (STD-TEST-8).
+- Test file name: `test_{name}.py` (STD-NAME-3).
+- Flaky test → record it in `docs/team/debt.md`, do not disable it (STD-TEST-7).

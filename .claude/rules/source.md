@@ -1,0 +1,19 @@
+---
+paths:
+  - "erp_ai/**"
+---
+
+# When editing source code
+
+- Edit only within the task's touchpoints; need to edit outside them → stop and report `DESIGN_CONFLICT` (STD-DESIGN-1).
+- Follow the file's existing style; no mass style changes (STD-STYLE-4).
+- No dead code, commented-out code or debug logging left behind (STD-STYLE-5).
+- The simplest solution that meets the spec; reuse existing logic (STD-DESIGN-4, STD-DESIGN-5).
+- Do not swallow errors; validate input at boundaries; external calls get a timeout and bounded retries (STD-ERR-1, -2, -5).
+- Environment-specific values come from configuration, never hard-coded (STD-DESIGN-7).
+- Names follow the profile's `naming.*` (STD-NAME-1, STD-NAME-2).
+
+## What to read with what
+- Finding where to edit across many files → the `Explore` agent; one known file → Read just the relevant part.
+- Library docs → WebFetch the official docs for the exact version; fallback: the installed library's source.
+- Formatting after an edit is done by the hook (formatters_by_ext); do not run a formatter by hand over the whole repo.

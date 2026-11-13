@@ -1,6 +1,21 @@
 ### ERP AI agent
 
-Hỗ trợ công việc trên erp (helpdesk ở giai đoạn 1)
+Agent AI hỗ trợ công việc trên ERP Miyano. Giai đoạn 1: Helpdesk. Agent đọc phiếu mới (và comment có từ khóa), phân loại vào 1 trong 6 đầu mục A–F, chấm độ phức tạp và độ quan trọng, và ở mức `L1` ghi hướng giải quyết, comment trên phiếu. App cài xong ở trạng thái **tắt**.
+
+Phạm vi hiện tại: mức `L0` và `L1`. Mức `L2`/`L3` chọn được trên form nhưng chỉ cấp đúng bộ tool của `L1`.
+
+| Mức | Agent làm gì |
+|---|---|
+| `L0` (shadow) | Chỉ chạy bước phân loại, ghi dự đoán (đầu mục, nhóm, ưu tiên, hai điểm, người dự kiến) vào `ERP AI Log`, không đổi phiếu. Comment có từ khóa được ghi nhật ký "bỏ qua do L0", không gọi API |
+| `L1` | Ghi loại phiếu, nhóm, ưu tiên (tính từ hai điểm, xem mục "Định tuyến theo điểm"), độ tin cậy, hai điểm và lý do chấm, hướng giải quyết, comment; tạo Task khi có người có role `ERP AI Instructor` ra lệnh. Khi công tắc `auto_assign_enabled` bật (tắt sẵn): gán người phụ trách và tạo Task cho đầu mục C/D. Không đổi `status`, không ghi đè phân loại do người đã đặt, không giành phiếu đã có người được gán |
+
+Khi vượt ngân sách tháng, mức hiệu lực lui về `L1` (không bao giờ nâng `L0` lên `L1`).
+
+### Yêu cầu
+
+- Frappe `>=15.126.1,<16.0.0`, Helpdesk 15.1.0 trở lên (comment phiếu là core `Comment`; bản Helpdesk cũ hơn sẽ không kích hoạt được bằng comment).
+- Thư viện `anthropic>=0.103.1,<1` (khai trong `pyproject.toml`).
+- Khóa API Anthropic loại workspace chuẩn (`sk-ant-api03-`), nhập trên form cấu hình.
 
 ### Installation
 
@@ -9,8 +24,113 @@ You can install this app using the [bench](https://github.com/frappe/bench) CLI:
 ```bash
 cd $PATH_TO_YOUR_BENCH
 bench get-app $URL_OF_THIS_REPO --branch develop
-bench install-app erp_ai
+bench --site <site> install-app erp_ai
+bench --site <site> migrate
 ```
+
+Cài và migrate (chạy lại được, không ghi đè cấu hình đã lưu) tạo: role `ERP AI Agent` và `ERP AI Instructor`; tài khoản `ai.agent@miyano.com.vn` chỉ có role `ERP AI Agent` và `Agent` (không có System Manager); các trường AI trên HD Ticket (permlevel 8, ẩn với khách), gồm ba trường điểm `ai_complexity`, `ai_importance`, `ai_score_reason`; trường `ai_ticket` trên Task và quyền `share` cho dòng quyền Task của app; `ERP AI Setting` ở trạng thái tắt, mức `L0`, công tắc `auto_assign_enabled` tắt; bản ghi HD Form Script `ERP AI Agent Status` (xem mục "Chỉ báo trạng thái trên trang phiếu").
+
+### Cấu hình và bật
+
+Mở `/app/erp-ai-setting` (chỉ System Manager). Mỗi field trên các form `ERP AI Setting`, `ERP AI Credential` và `ERP AI Log` có mô tả ngay dưới ô nhập (đơn vị, khoảng hợp lệ, ví dụ, field nào do hệ thống tự ghi), và form chia thành các nhóm có tiêu đề.
+
+1. Thêm khóa API ở bảng khóa; bấm "Kiểm tra khóa" để thử từng khóa.
+2. Đặt `monthly_budget_usd` (mặc định 10), bốn đơn giá token (mặc định 0; phải > 0 mới bật được) và model (không có giá trị nào viết cứng trong mã). Model phân loại nên là `claude-haiku-*`: chỉ với model này bước phân loại tắt thinking; model khác không được tắt thinking và có thể bị cắt ở trần token.
+3. Rà các giá trị mặc định: `excluded_teams` (mặc định "Nhân sự & Hành chính" và "Tài chính Kế toán", mỗi nhóm một dòng: phiếu các nhóm này và phiếu có cờ "không dùng AI" không bao giờ được gửi lên API), `trigger_keyword` (mặc định `@ai`), `category_mapping` (đầu mục A–F sang loại phiếu, nhóm và ưu tiên mặc định của đầu mục; ưu tiên cuối cùng của phiếu còn phụ thuộc hai điểm và bảng `importance_priority` trong `routing_rules`, không chỉ ánh xạ này), `routing_rules` (mục "Định tuyến theo điểm"), `alert_recipients` (mặc định `info@miyano.com.vn`).
+4. Giữ `L0` đủ lâu để đo độ chính xác (báo cáo `ERP AI Accuracy`), rồi mới tích `enabled` và chuyển `L1`.
+5. Công tắc `auto_assign_enabled` ("Tự gán người và tạo Task") để tắt cho tới khi xong các việc chuẩn bị trong `docs/HuongDan_QuanTri_DinhTuyen.md`.
+
+Cấp role `ERP AI Instructor` cho người được phép ra lệnh agent trên mọi phiếu; người được giao phiếu chỉ có thẩm quyền trên đúng phiếu đó.
+
+Chi tiết các việc phải làm trước khi bật: `docs/team/features/FEAT-001/asbuilt.md`, mục 6.
+
+### Định tuyến theo điểm
+
+Mỗi phiếu mới được chấm hai điểm 1–3 trong cùng lời gọi phân loại: độ phức tạp (1: dưới 1 giờ làm việc; 2: trong 1 ngày; 3: nhiều ngày, cần phân tích hoặc xây mới) và độ quan trọng (1: ảnh hưởng một người, không chặn việc; 2: chặn việc của một người hoặc bộ phận, hoặc có hạn trong 24 giờ; 3: chặn nghiệp vụ kế toán, kho, bán hàng hoặc nhiều bộ phận). Điểm có ở `ERP AI Log` (các cột `predicted_complexity`, `predicted_importance`, `predicted_score_reason`) ở mọi mức; từ `L1` có thêm trên phiếu ở ba trường chỉ đọc `ai_complexity`, `ai_importance`, `ai_score_reason`, HD Agent (role `Agent`) đọc được. Điểm 0 nghĩa là chưa chấm hoặc model trả điểm sai; ưu tiên khi đó theo `category_mapping`.
+
+**Mức ưu tiên** (từ `L1`), xét lần lượt, quy tắc nào khớp trước thì dừng:
+
+| Điều kiện | Ưu tiên |
+|---|---|
+| Tiêu đề có `[GẤP]` hoặc `[GẬP]` | `Urgent` |
+| Đầu mục F | `Low` |
+| Đầu mục E | Bot không ghi ưu tiên (COO đặt) |
+| Đầu mục A và độ quan trọng 3 | `Urgent` |
+| Còn lại | Mức cao hơn giữa ưu tiên của đầu mục trong `category_mapping` và mức theo độ quan trọng trong `importance_priority` (mặc định: 2 và 3 là `High`, 1 không nâng) |
+
+Độ phức tạp không đổi mức ưu tiên; nó dành cho `condition` của SLA. Sửa `importance_priority` là lần chạy sau dùng giá trị mới, không cần deploy. Đặt `{"1": "", "2": "", "3": ""}` để quay về ưu tiên theo ánh xạ đầu mục.
+
+**Nhóm.** A, B, C, F lấy nhóm trong `category_mapping`. D và E lấy nhóm của bộ phận model chọn, chỉ khi bộ phận có trong bảng `departments`, nhóm có tồn tại và không nằm trong `excluded_teams`; không thì bot không ghi nhóm và `ERP AI Log` ghi lý do.
+
+**Cấu hình `routing_rules`** (một trường JSON trên `ERP AI Setting`; sai dạng thì không lưu được, thông báo nêu chỗ sai):
+
+| Khóa | Nội dung |
+|---|---|
+| `assignees` | Đầu mục A, B, C, F: `default` (user ID người mặc định) và `prefixes` (tiền tố tiêu đề, ví dụ `[tracecore]`, sang user ID). Danh sách người để trống khi cài |
+| `departments` | Cho D/E: `"<bộ phận>": {"team": "<HD Team>", "head": "<user ID trưởng bộ phận>"}` |
+| `importance_priority` | Độ quan trọng "1", "2", "3" sang `Low`/`Medium`/`High`/`Urgent` hoặc rỗng (mức tối thiểu) |
+| `expected_sla` | Mỗi đầu mục `response_min` và `resolution_min` (phút, hoặc `null` thì không kiểm); mặc định theo bảng 16.2 (A 15/480, B 15/240, C 60/1440, D và E 60/null, F 5/60) |
+
+**Gán người và Task** (chỉ khi công tắc `auto_assign_enabled` bật, từ `L1`): bot gán đúng một người theo `assignees` (tiền tố tiêu đề được ưu tiên hơn `default`; D/E dùng trưởng bộ phận) bằng cơ chế gán của Helpdesk, người đó nhận một thông báo. Bot không gán khi: phiếu đã có người được gán (kể cả Assignment Rule của nhóm gán ngay lúc bot lưu nhóm; muốn dùng bảng người mặc định cho nhóm nào thì tắt rule của nhóm đó); người trong bảng không phải HD Agent đang hoạt động; người đó là tài khoản agent (không bao giờ); người đã phân loại phiếu. Không có người hợp lệ: một comment nhờ trưởng nhóm phân công. Đầu mục C/D, khi chính bot vừa gán được người: một Task có trường `ai_ticket` trỏ tới phiếu, giao cho người đó; chạy lại hoặc đã có Task liên kết thì không tạo thêm. Site tắt chia sẻ tài liệu mà người đó không đọc được Task: không Task, một comment nhờ trưởng nhóm giao Task. Mọi lần ghi và từ chối nằm ở cột `actions` của bản ghi `classify` trong `ERP AI Log`.
+
+**SLA.** Bot không tạo, sửa SLA và không tự gán `response_by`, `resolution_by`; Helpdesk chọn và tính SLA mỗi lần lưu phiếu. Bot báo: phiếu không có SLA nào áp vào thì một comment "Chưa có SLA áp vào phiếu, cần System Manager cấu hình." và một dòng cảnh báo; SLA đang áp xử lý chậm hơn `expected_sla` thì một dòng cảnh báo (`sla_check` trong `actions`). Muốn SLA khác nhau theo độ phức tạp, tạo SLA với `condition` đọc `doc.ai_complexity`; mẫu an toàn và cảnh báo ở `docs/HuongDan_QuanTri_DinhTuyen.md`, mục 3. Một `condition` lỗi chặn mọi lần lưu phiếu, của cả người lẫn bot.
+
+**Trước khi bật công tắc** làm các việc ở `docs/HuongDan_QuanTri_DinhTuyen.md`, mục 2 (gỡ role thừa của tài khoản agent, tắt SLA test, sửa team trỏ Assignment Rule đã mất, tạo HD Agent, điền người cho từng đầu mục kể cả F). Chi tiết thiết kế và các giới hạn đã biết: `docs/team/features/FEAT-006/asbuilt.md`.
+
+### Chỉ báo trạng thái trên trang phiếu
+
+Khi agent đang chạy (comment có từ khóa `@ai`, hoặc phiếu mới), trang phiếu của HD Agent hiện một chỉ báo nổi ở góc dưới phải, kèm tên tài khoản agent: `Đang suy nghĩ…`, đổi thành `Đang làm: <việc>…` khi agent chạy một tool, rồi tự mất khi lần chạy kết thúc (kể cả lỗi). Các nhãn việc: đọc phiếu, đọc comment, tìm phiếu đã giải quyết, tra bản ghi, tra mã nguồn, đọc mã nguồn, xem lịch sử mã nguồn, ghi phân loại, ghi hướng giải quyết, viết trả lời, tạo task, phân loại phiếu. Chỉ báo không tạo comment hay bản ghi nào và không hiện trên cổng khách. Cần tiến trình `socketio` của bench; thiếu nó thì chỉ báo không hiện, lần chạy vẫn bình thường.
+
+Ba trường trên `/app/erp-ai-setting`:
+
+| Trường | Mặc định | Ý nghĩa |
+|---|---|---|
+| `thinking_text` | `Đang suy nghĩ…` | Chữ hiện khi agent đang suy nghĩ (tối đa 5000 ký tự). Để trống để tắt chỉ báo |
+| `answer_delay_min_s` | `3` | Trễ tối thiểu (giây, 0 đến 30) trước khi đăng câu trả lời đầu tiên của `@ai` |
+| `answer_delay_max_s` | `5` | Trễ tối đa (giây, 0 đến 30, không nhỏ hơn mức tối thiểu) |
+
+Trễ được tính từ lúc chỉ báo bắt đầu (thời gian model chạy được trừ vào), và không áp dụng cho phiếu mới. Đặt `0` và `0` để không trễ.
+
+**Cảnh báo:** chỉ báo chạy bằng bản ghi HD Form Script `ERP AI Agent Status`, nội dung lấy từ `erp_ai/public/js/agent_status_indicator.js`. Mỗi lần `bench --site <site> migrate` (và `install-app`) đặt lại bản ghi này theo tệp trong repo, nên mọi sửa tay trên site bị ghi đè; gỡ app thì bản ghi bị xóa. Sửa tệp `.js` xong phải chạy `migrate`, restart là không đủ. Sau mỗi lần nâng cấp Helpdesk hoặc Frappe, kiểm lại chỉ báo bằng tay: các bước ở `docs/team/features/FEAT-002/acceptance.md`, mục "Bước tay cho người".
+
+### Khu vực trao đổi với bot trên trang phiếu
+
+Khu vực "Hướng giải quyết & trao đổi với bot" cho HD Agent đọc hướng giải quyết của AI, xem các lần hỏi–đáp với bot và hỏi bot ngay trên trang phiếu, không phải nhớ từ khóa. Chạy bằng cùng bản ghi HD Form Script `ERP AI Agent Status` ở mục trên (cùng cảnh báo: sửa `.js` xong phải `migrate`).
+
+**Mở khu vực.** Mở phiếu ở `/helpdesk/tickets/<id>` trên máy tính (cửa sổ rộng từ 640 px), bấm nút "Trao đổi với bot" ở đầu trang. Một ngăn hiện bên phải, bấm "Đóng" để đóng. Nút không có trên cửa sổ hẹp hoặc bản di động, và không có trên cổng khách (`/helpdesk/my-tickets/<id>`).
+
+**Trong khu vực có:**
+- 4 mục AI chỉ đọc: hướng giải quyết, độ tin cậy, phân loại bởi, AI cập nhật lúc. Mục chưa có giá trị hiện "Chưa có". Không sửa được ở đây.
+- Luồng tin: các comment có từ khóa kích hoạt và các comment của bot trên phiếu này, cũ ở trên, mới ở dưới; tin của bot có nhãn "Bot". Nội dung hiện dạng chữ thuần.
+- Chỉ báo "Đang suy nghĩ…" khi bot đang chạy (nằm trong ngăn khi ngăn mở).
+
+**Gửi câu hỏi.** Gõ câu hỏi vào ô nhập rồi nhấn Enter (hoặc bấm "Gửi"); Shift+Enter để xuống dòng. Không cần gõ từ khóa: hệ thống tự thêm từ khóa kích hoạt vào cuối tin nếu bạn chưa gõ. Tin dài tối đa 2000 ký tự, không gửi được tin rỗng. Tin gửi đi là một comment bình thường của chính bạn trên phiếu (hiện cả ở tab Comments), chữ như `<b>` được hiện nguyên chữ chứ không thành định dạng. Gửi thất bại (mất mạng, hết quyền) thì ngăn báo "Không gửi được tin" và giữ nguyên chữ bạn đã gõ. Khu vực tự cập nhật khi có comment mới hoặc khi bot đổi field AI, không cần tải lại trang.
+
+**Khi nào bot không trả lời.** Gửi tin chỉ tạo comment; việc bot có trả lời hay không do cùng các chốt như khi gõ từ khóa ở tab Comments, và khu vực không tự báo lý do. Bot có thể không trả lời khi: agent đang tắt; mức đang là `L0` (chỉ ghi nhận); phiếu có cờ "không dùng AI" hoặc thuộc nhóm loại trừ; hoặc đã hết lượt hôm nay (xem `ERP AI Log` để biết lý do bỏ qua). Ngăn cũng hiện dòng nhắc này. Nếu quản trị đặt `trigger_keyword` có ký tự `<`, `>` hoặc `&`, khu vực từ chối gửi và báo quản trị viên đổi từ khóa (ô Comments cũng không kích hoạt được bot với từ khóa đó).
+
+**Quyền.** Chỉ HD Agent đang hoạt động và có quyền đọc phiếu dùng được khu vực. Khu vực chỉ đọc và chỉ gửi qua hai method `erp_ai.ticket_panel.get_panel_data` và `erp_ai.ticket_panel.send_message` (POST, không cho Guest); không bao giờ hiện từ khóa hay cấu hình agent, không sửa hay xóa tin, không đính kèm, không nhắc tên.
+
+**Sau mỗi lần nâng cấp Helpdesk hoặc Frappe**, chạy lại bằng tay hai bước ở `docs/team/features/FEAT-003/acceptance.md`, mục "Bước tay J1 cho người": J1 AC-6 (nút, tiêu đề, gửi bằng Enter, các tab cũ vẫn chạy) và J1 AC-11 (cập nhật trực tiếp bằng hai phiên, chỉ báo chỉ một nơi). Khu vực dựa vào điểm mở rộng `actions` của HD Form Script và hai sự kiện `docinfo_update`, `doc_update` của Frappe; nâng cấp có thể làm chúng đổi.
+
+### Bộ đánh giá offline
+
+Đo độ chính xác phân loại trên phiếu đã gán nhãn người, trước khi bật agent. Phiếu nhóm loại trừ không được xuất.
+
+```bash
+bench --site <site> execute erp_ai.eval.export_tickets.export --args '["<đường dẫn .jsonl ngoài repo>"]'
+bench --site <site> execute erp_ai.eval.run_eval.run --args '["<đường dẫn .jsonl>"]'
+```
+
+`export` từ chối đường dẫn nằm trong repo. `run` gửi nội dung lên API bằng cùng prompt với agent thật và in: độ chính xác tổng, theo từng đầu mục, ma trận nhầm lẫn 6×6, độ chính xác trên phiếu không do người viết nhiều nhất tạo, tỷ lệ khớp ưu tiên và khớp nhóm so với giá trị người đã đặt, phân bố hai điểm, token đầu ra lớn nhất của bước phân loại, số lần bị cắt ở `max_tokens` (`Classify max_tokens hits`), và kết luận (≥ 85% / 70–85% / < 70%). Số lần bị cắt khác 0 nghĩa là trần token đang chạm: kiểm model phân loại (mục "Cấu hình và bật", bước 2).
+
+### Running tests
+
+```bash
+cd $PATH_TO_YOUR_BENCH
+bench --site <site> run-tests --app erp_ai
+```
+
+Site phải bật `allow_tests`. Test không gọi mạng thật (lời gọi model được thay bằng stub). Không đặt file test tên `test_runner.py`: Frappe bỏ qua tên này (test kiến trúc kiểm điều đó).
 
 ### Contributing
 

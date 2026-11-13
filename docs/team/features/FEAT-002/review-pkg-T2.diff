@@ -1,0 +1,212 @@
+diff --git a/erp_ai/erp_ai_agent/doctype/erp_ai_setting/erp_ai_setting.json b/erp_ai/erp_ai_agent/doctype/erp_ai_setting/erp_ai_setting.json
+index 420c35c..f2c24b6 100644
+--- a/erp_ai/erp_ai_agent/doctype/erp_ai_setting/erp_ai_setting.json
++++ b/erp_ai/erp_ai_agent/doctype/erp_ai_setting/erp_ai_setting.json
+@@ -18,6 +18,9 @@
+   "price_output_per_mtok",
+   "model_classify_default",
+   "trigger_keyword",
++  "thinking_text",
++  "answer_delay_min_s",
++  "answer_delay_max_s",
+   "excluded_teams",
+   "category_mapping",
+   "prompt_digest",
+@@ -113,6 +116,25 @@
+    "label": "Từ khóa kích hoạt",
+    "default": "@ai"
+   },
++  {
++   "fieldname": "thinking_text",
++   "fieldtype": "Small Text",
++   "label": "Chữ chỉ báo khi đang suy nghĩ",
++   "default": "Đang suy nghĩ…",
++   "description": "Hiện trên chỉ báo trạng thái ở trang phiếu. Để trống để tắt chỉ báo; khoảng trễ vẫn áp dụng."
++  },
++  {
++   "fieldname": "answer_delay_min_s",
++   "fieldtype": "Int",
++   "label": "Trễ trả lời tối thiểu (giây)",
++   "default": "3"
++  },
++  {
++   "fieldname": "answer_delay_max_s",
++   "fieldtype": "Int",
++   "label": "Trễ trả lời tối đa (giây)",
++   "default": "5"
++  },
+   {
+    "fieldname": "excluded_teams",
+    "fieldtype": "Small Text",
+@@ -146,7 +168,7 @@
+  ],
+  "issingle": 1,
+  "links": [],
+- "modified": "2026-11-11 11:00:00.000000",
++ "modified": "2026-11-12 10:00:00.000000",
+  "modified_by": "Administrator",
+  "module": "ERP AI agent",
+  "name": "ERP AI Setting",
+diff --git a/erp_ai/erp_ai_agent/doctype/erp_ai_setting/erp_ai_setting.py b/erp_ai/erp_ai_agent/doctype/erp_ai_setting/erp_ai_setting.py
+index dc398ac..e789eaf 100644
+--- a/erp_ai/erp_ai_agent/doctype/erp_ai_setting/erp_ai_setting.py
++++ b/erp_ai/erp_ai_agent/doctype/erp_ai_setting/erp_ai_setting.py
+@@ -3,7 +3,13 @@ from frappe.model.document import Document
+ 
+ from erp_ai import gateway
+ from erp_ai.agent.classification import validate_mapping
+-from erp_ai.constants import CREDENTIAL_DOCTYPE, KEY_STATUS_ACTIVE, KEY_STATUS_BAD_KEY, SETTING_DOCTYPE
++from erp_ai.constants import (
++	ANSWER_DELAY_MAX_S,
++	CREDENTIAL_DOCTYPE,
++	KEY_STATUS_ACTIVE,
++	KEY_STATUS_BAD_KEY,
++	SETTING_DOCTYPE,
++)
+ 
+ SELF_MANAGED_KEY_FIELDS = (
+ 	"status",
+@@ -33,7 +39,10 @@ INT_LIMITS = {
+ 	"max_keys_per_call": ("Số khóa tối đa mỗi lời gọi", 1, 10),
+ 	"request_timeout_s": ("Timeout mỗi lời gọi API", 5, 300),
+ 	"monthly_budget_usd": ("Ngân sách tháng", 0, None),
++	"answer_delay_min_s": ("Trễ trả lời tối thiểu", 0, ANSWER_DELAY_MAX_S),
++	"answer_delay_max_s": ("Trễ trả lời tối đa", 0, ANSWER_DELAY_MAX_S),
+ }
++THINKING_TEXT_MAX_CHARS = 5000
+ PRICE_FIELDS = (
+ 	"price_input_per_mtok",
+ 	"price_cache_write_per_mtok",
+@@ -49,6 +58,7 @@ class ERPAISetting(Document):
+ 		self.check_labels()
+ 		validate_mapping(self.category_mapping)
+ 		self.check_limits()
++		self.check_status_settings()
+ 		self.check_enabled_requirements()
+ 
+ 	def restore_self_managed_fields(self):
+@@ -95,6 +105,14 @@ class ERPAISetting(Document):
+ 			if (self.get(fieldname) or 0) < 0:
+ 				frappe.throw("Đơn giá không được âm")
+ 
++	def check_status_settings(self):
++		# Saved as "" (not NULL) so that _ensure_default_settings never re-enables a switched-off indicator.
++		self.thinking_text = self.thinking_text or ""
++		if (self.answer_delay_min_s or 0) > (self.answer_delay_max_s or 0):
++			frappe.throw("Trễ trả lời tối thiểu không được lớn hơn trễ trả lời tối đa")
++		if len(self.thinking_text) > THINKING_TEXT_MAX_CHARS:
++			frappe.throw(f"Chữ chỉ báo khi đang suy nghĩ không được dài quá {THINKING_TEXT_MAX_CHARS} ký tự")
++
+ 	def check_enabled_requirements(self):
+ 		if not self.enabled:
+ 			return
+diff --git a/erp_ai/erp_ai_agent/doctype/erp_ai_setting/test_erp_ai_setting.py b/erp_ai/erp_ai_agent/doctype/erp_ai_setting/test_erp_ai_setting.py
+index 9627821..b6eec3a 100644
+--- a/erp_ai/erp_ai_agent/doctype/erp_ai_setting/test_erp_ai_setting.py
++++ b/erp_ai/erp_ai_agent/doctype/erp_ai_setting/test_erp_ai_setting.py
+@@ -228,6 +228,68 @@ class TestERPAISetting(FrappeTestCase):
+ 			with self.subTest(fields=fields), self.assertRaisesRegex(frappe.ValidationError, message):
+ 				saved_with(**fields)
+ 
++	def test_status_fields_defaults(self):
++		meta = frappe.get_meta(SETTING_DOCTYPE)
++		self.assertEqual(meta.get_field("thinking_text").fieldtype, "Small Text")
++		self.assertEqual(meta.get_field("thinking_text").default, "Đang suy nghĩ…")
++		for fieldname, default in (("answer_delay_min_s", "3"), ("answer_delay_max_s", "5")):
++			with self.subTest(fieldname=fieldname):
++				self.assertEqual(meta.get_field(fieldname).fieldtype, "Int")
++				self.assertEqual(meta.get_field(fieldname).default, default)
++		order = [field.fieldname for field in meta.fields]
++		after = order.index("trigger_keyword")
++		self.assertEqual(
++			order[after + 1 : after + 4], ["thinking_text", "answer_delay_min_s", "answer_delay_max_s"]
++		)
++
++	def test_status_fields_rejections(self):
++		min_msg = "Trễ trả lời tối thiểu phải từ 0 đến 30"
++		max_msg = "Trễ trả lời tối đa phải từ 0 đến 30"
++		order_msg = "Trễ trả lời tối thiểu không được lớn hơn trễ trả lời tối đa"
++		text_msg = "Chữ chỉ báo khi đang suy nghĩ không được dài quá 5000 ký tự"
++		cases = [
++			({"answer_delay_min_s": -1, "answer_delay_max_s": 5}, min_msg),
++			({"answer_delay_min_s": 31, "answer_delay_max_s": 31}, min_msg),
++			({"answer_delay_min_s": 3, "answer_delay_max_s": -1}, max_msg),
++			({"answer_delay_min_s": 3, "answer_delay_max_s": 31}, max_msg),
++			({"answer_delay_min_s": 6, "answer_delay_max_s": 5}, order_msg),
++			({"thinking_text": "x" * 5001}, text_msg),
++		]
++		for fields, message in cases:
++			with self.subTest(fields=fields):
++				doc = frappe.get_doc(SETTING_DOCTYPE)
++				doc.update(fields)
++				with self.assertRaises(frappe.ValidationError) as caught:
++					doc.save()
++				self.assertEqual(frappe.utils.strip_html(str(caught.exception)), message)
++
++	def test_status_fields_valid_edges_save(self):
++		cases = [
++			{"answer_delay_min_s": 0, "answer_delay_max_s": 0},
++			{"answer_delay_min_s": 30, "answer_delay_max_s": 30},
++			{"answer_delay_min_s": 3, "answer_delay_max_s": 3},
++			{"answer_delay_min_s": 0, "answer_delay_max_s": 30},
++			{"thinking_text": ""},
++			{"thinking_text": "x" * 5000},
++		]
++		for fields in cases:
++			with self.subTest(fields=fields):
++				doc = frappe.get_doc(SETTING_DOCTYPE)
++				doc.update(fields)
++				doc.save()
++				saved = frappe.get_doc(SETTING_DOCTYPE)
++				for fieldname, value in fields.items():
++					self.assertEqual(
++						saved.get(fieldname) or ("" if fieldname == "thinking_text" else 0), value
++					)
++		doc = frappe.get_doc(SETTING_DOCTYPE)
++		doc.thinking_text = None
++		doc.save()
++		stored = frappe.db.sql(
++			"select value from `tabSingles` where doctype=%s and field='thinking_text'", SETTING_DOCTYPE
++		)
++		self.assertEqual(stored, (("",),))
++
+ 	def test_validation_rejects_empty_and_duplicate_key_labels(self):
+ 		doc = frappe.get_doc(SETTING_DOCTYPE)
+ 		doc.set("credentials", [])
+diff --git a/erp_ai/tests/test_install.py b/erp_ai/tests/test_install.py
+index c48fc66..38bfc01 100644
+--- a/erp_ai/tests/test_install.py
++++ b/erp_ai/tests/test_install.py
+@@ -254,6 +254,32 @@ class TestInstall(FrappeTestCase):
+ 		install.ensure_setup()
+ 		self.assertEqual(frappe.db.get_single_value(SETTING_DOCTYPE, "permission_level"), "L0")
+ 
++	def _stored(self, fieldname):
++		rows = frappe.db.sql(
++			"select value from `tabSingles` where doctype=%s and field=%s", (SETTING_DOCTYPE, fieldname)
++		)
++		return rows[0][0] if rows else "<missing>"
++
++	def test_status_defaults_filled_only_when_missing(self):
++		self.assertEqual(self._stored("thinking_text"), "Đang suy nghĩ…")
++		self.assertEqual(self._stored("answer_delay_min_s"), "3")
++		self.assertEqual(self._stored("answer_delay_max_s"), "5")
++		frappe.db.set_single_value(SETTING_DOCTYPE, "thinking_text", "Chờ chút")
++		frappe.db.set_single_value(SETTING_DOCTYPE, "answer_delay_min_s", 0)
++		frappe.db.set_single_value(SETTING_DOCTYPE, "answer_delay_max_s", 0)
++		frappe.db.delete("Singles", {"doctype": SETTING_DOCTYPE, "field": "trigger_keyword"})
++		install.ensure_setup()
++		self.assertEqual(self._stored("thinking_text"), "Chờ chút")
++		self.assertEqual(self._stored("answer_delay_min_s"), "0")
++		self.assertEqual(self._stored("answer_delay_max_s"), "0")
++		self.assertEqual(self._stored("trigger_keyword"), "@ai")
++
++	def test_emptied_thinking_text_survives_setup(self):
++		frappe.db.set_single_value(SETTING_DOCTYPE, "thinking_text", "")
++		install.ensure_setup()
++		install.after_migrate()
++		self.assertEqual(self._stored("thinking_text"), "")
++
+ 	def test_setup_never_writes_existing_tickets(self):
+ 		ticket = make_ticket(subject="erp_ai T11 existing")
+ 		frappe.get_doc(

@@ -1,0 +1,5 @@
+# Review 01 (T1), round 1 — findings verbatim
+
+major | STD-TEST-2 | erp_ai/agent/test_runner_status.py:220-235 | `test_done_last_when_answered` scripts `get_ticket` then a plain `end_turn` text. `_reason` never posts end_turn text (runner.py:288-302 just writes the entry and returns), so no answer is created. This is the "model does not call `post_comment`" branch (spec AC-4 and design 4.4 list it as a separate branch, and T6 owns it). The answered branch named in the T1 criteria has no test. | Make turn 1 `tool_use("t1", "post_comment", content=...)`. Use the real tool, or patch `runner.execute_tool` as in test_agent_runner.py:889-902. Assert the answer exists (`_comment_count()` +1, or a `post_comment` action with `ok: True`). Then keep the checks: `thinking` first, exactly one `done`, `done` last. | confirmed
+
+minor (dev's call, optional): (1) test_runner_status.py:201 builds the expected room with `get_doc_room(...)` instead of the literal `"doc:HD Ticket/<name>"` from design 8.1. (2) The 7-key check covers only the `thinking` payload, not `done`. (3) runner.py:111 `settings.get("thinking_text")` fine until T2.

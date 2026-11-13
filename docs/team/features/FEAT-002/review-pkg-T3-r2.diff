@@ -1,0 +1,75 @@
+diff --git a/erp_ai/agent/answer_delay.py b/erp_ai/agent/answer_delay.py
+index 8995dc4..e9649b4 100644
+--- a/erp_ai/agent/answer_delay.py
++++ b/erp_ai/agent/answer_delay.py
+@@ -19,6 +19,12 @@ def _pick(low: float, high: float) -> float:
+ 
+ 
+ class AnswerDelay:
++	"""Random delay before the answer is released.
++
++	Input: min/max seconds (clamped to 0..ANSWER_DELAY_MAX_S, reordered if min > max).
++	Output: `delay_s` picked once at start; `wait_before_answer(deadline)` returns seconds slept.
++	"""
++
+ 	def __init__(self, delay_s: float, anchor: float):
+ 		self.delay_s = delay_s
+ 		self.anchor = anchor
+@@ -26,7 +32,7 @@ class AnswerDelay:
+ 		self._done = False
+ 
+ 	@classmethod
+-	def start(cls, low_s, high_s) -> "AnswerDelay":
++	def start(cls, low_s: float | None, high_s: float | None) -> "AnswerDelay":
+ 		low, high = (min(max(v or 0, 0), ANSWER_DELAY_MAX_S) for v in (low_s, high_s))
+ 		if low > high:
+ 			low, high = high, low
+diff --git a/erp_ai/agent/test_answer_delay.py b/erp_ai/agent/test_answer_delay.py
+index 9a3417a..9ac9ea7 100644
+--- a/erp_ai/agent/test_answer_delay.py
++++ b/erp_ai/agent/test_answer_delay.py
+@@ -6,6 +6,8 @@ from erp_ai.agent import answer_delay
+ from erp_ai.agent.answer_delay import AnswerDelay
+ from erp_ai.constants import ANSWER_DELAY_MAX_S
+ 
++REAL_PICK = answer_delay._pick
++
+ 
+ class TestAnswerDelay(FrappeTestCase):
+ 	def setUp(self):
+@@ -38,7 +40,7 @@ class TestAnswerDelay(FrappeTestCase):
+ 
+ 		def record(low, high):
+ 			picks.append((low, high))
+-			return answer_delay.random.uniform(low, high)
++			return REAL_PICK(low, high)
+ 
+ 		with patch.object(answer_delay, "_pick", record):
+ 			for _ in range(50):
+@@ -48,8 +50,9 @@ class TestAnswerDelay(FrappeTestCase):
+ 		self.assertEqual(picks, [(1, 4)] * 50)
+ 
+ 	def test_fixed_delay_when_min_equals_max(self):
+-		for _ in range(10):
+-			self.assertEqual(AnswerDelay.start(3, 3).delay_s, 3)
++		with patch.object(answer_delay, "_pick", REAL_PICK):
++			for _ in range(10):
++				self.assertEqual(AnswerDelay.start(3, 3).delay_s, 3)
+ 
+ 	def test_no_wait_when_model_slower_than_delay(self):
+ 		delay = AnswerDelay.start(3, 3)
+@@ -79,8 +82,13 @@ class TestAnswerDelay(FrappeTestCase):
+ 		self.assertEqual(delay.waited_s, 4)
+ 
+ 	def test_out_of_range_db_values_are_clamped(self):
+-		delay = AnswerDelay.start(-5, 99)
++		bounds = []
++		with patch.object(answer_delay, "_pick", lambda low, high: bounds.append((low, high)) or high):
++			delay = AnswerDelay.start(-5, 99)
+ 		self.assertEqual(delay.delay_s, ANSWER_DELAY_MAX_S)
++		self.assertEqual(bounds, [(0, ANSWER_DELAY_MAX_S)])
++		with patch.object(answer_delay, "_pick", REAL_PICK):
++			self.assertEqual(AnswerDelay.start(-5, -1).delay_s, 0)
+ 		self.assertEqual(AnswerDelay.start(None, None).delay_s, 0)
+ 		# min > max is reordered: _pick receives (2, 9), never (9, 2)
+ 		calls = []

@@ -1,0 +1,323 @@
+diff --git a/erp_ai/agent/runner.py b/erp_ai/agent/runner.py
+index ed3f3f4..86fee7d 100644
+--- a/erp_ai/agent/runner.py
++++ b/erp_ai/agent/runner.py
+@@ -7,6 +7,7 @@ from frappe.utils import get_fullname
+ 
+ from erp_ai import gateway
+ from erp_ai.agent import authority, policy
++from erp_ai.agent.answer_delay import AnswerDelay
+ from erp_ai.agent.classification import load_mapping, parse_classification, resolve_ticket_values
+ from erp_ai.agent.prompts import build_classify_request, build_initial_message, build_reason_system
+ from erp_ai.agent.run_log import write_entry
+@@ -33,6 +34,8 @@ STOP_MAX_TURNS = "max_turns"
+ STOP_TIME_BUDGET = "time_budget"
+ STOP_GATEWAY_ERROR = "gateway_error"
+ DEADLINE_KIND = "deadline"
++# The tool whose call is the answer the delay holds back (D-6).
++ANSWER_TOOL = "post_comment"
+ # Write tools -> (doctype of the record they touch, key of the result that names it; None = the ticket).
+ WRITE_TOOL_TARGETS = {
+ 	"set_classification": ("HD Ticket", None),
+@@ -103,6 +106,10 @@ def _run(ticket_name, trigger):
+ 	status = RunStatus(ticket_name, run_id, settings.get("thinking_text"))
+ 	try:
+ 		status.start()
++		# anchor of the delay = right after the start signal (AC-3); ticket_insert never waits
++		delay = None
++		if trigger == TRIGGER_COMMENT_MENTION:
++			delay = AnswerDelay.start(settings.answer_delay_min_s, settings.answer_delay_max_s)
+ 		mapping = load_mapping(settings.category_mapping)
+ 		# One context for the whole run (classification and reasoning); never built at L0, which calls no tool.
+ 		context = None
+@@ -121,7 +128,7 @@ def _run(ticket_name, trigger):
+ 			if not proceed:
+ 				return
+ 		if level != LEVELS[0]:
+-			_reason(ticket_name, trigger, run_id, settings, context, classification, deadline, status)
++			_reason(ticket_name, trigger, run_id, settings, context, classification, deadline, status, delay)
+ 	finally:
+ 		status.done()
+ 
+@@ -242,7 +249,7 @@ def _apply_classification(log_name, classification, context):
+ 		frappe.db.commit()
+ 
+ 
+-def _reason(ticket_name, trigger, run_id, settings, context, classification, deadline, status):
++def _reason(ticket_name, trigger, run_id, settings, context, classification, deadline, status, delay):
+ 	"""Reasoning step (design 4.3 step 8): at most `max_turns_per_run` model turns, one `reason` entry each."""
+ 	comments = authority.fetch_ticket_comments(ticket_name)
+ 	# the role is decided on the owner; only then is the author replaced by the full name shown to the model
+@@ -293,6 +300,9 @@ def _reason(ticket_name, trigger, run_id, settings, context, classification, dea
+ 
+ 		tool_blocks = [block for block in result.content if block.get("type") == "tool_use"]
+ 		tool_results, actions, before, after, tool_errors, skipped = [], [], {}, {}, [], []
++		# the whole turn waits, before any of its tools runs (D-6)
++		if delay is not None and any(block["name"] == ANSWER_TOOL for block in tool_blocks):
++			delay.wait_before_answer(deadline)
+ 		for block in tool_blocks:
+ 			tool_results.append(_run_tool(block, context, actions, before, after, tool_errors, skipped))
+ 		stop_reason = result.stop_reason
+diff --git a/erp_ai/agent/test_agent_runner.py b/erp_ai/agent/test_agent_runner.py
+index e24e672..9223e56 100644
+--- a/erp_ai/agent/test_agent_runner.py
++++ b/erp_ai/agent/test_agent_runner.py
+@@ -6,7 +6,7 @@ import frappe
+ from frappe.tests.utils import FrappeTestCase
+ from helpdesk.test_utils import make_ticket
+ 
+-from erp_ai.agent import authority, runner
++from erp_ai.agent import answer_delay, authority, runner
+ from erp_ai.agent.classification import DEFAULT_CATEGORY_MAPPING
+ from erp_ai.agent.prompts import TASK_COMMENT, TASK_NEW_TICKET, build_classify_request, build_reason_system
+ from erp_ai.agent.run_log import write_entry
+@@ -25,7 +25,13 @@ from erp_ai.constants import (
+ 	TITLE_WRONG_USER,
+ )
+ from erp_ai.gateway import GatewayError
+-from erp_ai.test_utils import FakeGateway, add_credential, make_model_result, set_agent_settings
++from erp_ai.test_utils import (
++	FakeGateway,
++	add_credential,
++	make_model_result,
++	record_status_signals,
++	set_agent_settings,
++)
+ 
+ PREFIX = "ERPAI-TEST-"
+ CLASSIFY_A = json.dumps({"dau_muc": "A", "do_tin_cay": "Cao", "ly_do": "x"})
+@@ -66,7 +72,15 @@ class RunnerTestBase(FrappeTestCase):
+ 			permission_level="L0",
+ 			max_runs_per_ticket_per_day=DAILY_LIMIT,
+ 			category_mapping=json.dumps(DEFAULT_CATEGORY_MAPPING),
++			answer_delay_min_s=0,
++			answer_delay_max_s=0,
+ 		)
++		# No status signal reaches Redis and no run sleeps for real (the delay is 0 here; a test that sets one reads `sleeps`).
++		self.signals = record_status_signals(self)
++		self.sleeps = []
++		sleep_patch = patch.object(answer_delay, "_sleep", side_effect=self.sleeps.append)
++		sleep_patch.start()
++		self.addCleanup(sleep_patch.stop)
+ 		self.gateway = FakeGateway(make_model_result(text=CLASSIFY_A))
+ 		gateway_patch = patch("erp_ai.gateway.call_model", self.gateway)
+ 		gateway_patch.start()
+diff --git a/erp_ai/agent/test_runner_status.py b/erp_ai/agent/test_runner_status.py
+index 0f0b133..b34a7aa 100644
+--- a/erp_ai/agent/test_runner_status.py
++++ b/erp_ai/agent/test_runner_status.py
+@@ -1,12 +1,16 @@
++import copy
++import json
++import re
+ from unittest.mock import patch
+ 
+ import frappe
+ from frappe.utils import get_fullname
+ 
++from erp_ai.agent import answer_delay, policy
+ from erp_ai.agent.run_status import PAYLOAD_KEYS
+-from erp_ai.agent.test_agent_runner import RunnerTestBase, tool_turn, tool_use
++from erp_ai.agent.test_agent_runner import DAILY_LIMIT, RunnerTestBase, tool_turn, tool_use
+ from erp_ai.constants import AGENT_STATUS_EVENT, AGENT_USER, JOB_TIMEOUT_S, SETTING_DOCTYPE
+-from erp_ai.test_utils import FakeGateway, make_model_result, record_status_signals, set_agent_settings
++from erp_ai.test_utils import FakeGateway, make_model_result, set_agent_settings
+ 
+ THINKING_TEXT = "Đang suy nghĩ…"
+ 
+@@ -17,12 +21,30 @@ class TestRunnerStatus(RunnerTestBase):
+ 		# `thinking_text` is added to the DocType by a later task; the Single value is rolled back with the test.
+ 		frappe.db.set_single_value(SETTING_DOCTYPE, "thinking_text", THINKING_TEXT)
+ 		set_agent_settings(permission_level="L1")
+-		self.signals = record_status_signals(self)
+ 		self.signals_on_model_call = []
++		self.model_messages = []
++		self.model_seconds = 0
++		# Fake clock: only a model call moves it, so the delay maths is exact.
++		self.clock = [0.0]
++		clock_patch = patch.object(answer_delay, "_now", side_effect=lambda: self.clock[0])
++		clock_patch.start()
++		self.addCleanup(clock_patch.stop)
++		# What the page showed and what the ticket had when the run went to sleep.
++		self.at_sleep = []
++
++		def sleeper(seconds):
++			self.sleeps.append(seconds)
++			self.at_sleep.append(([s["message"]["state"] for s in self.signals], self._comment_count()))
++
++		sleep_patch = patch.object(answer_delay, "_sleep", side_effect=sleeper)
++		sleep_patch.start()
++		self.addCleanup(sleep_patch.stop)
+ 
+ 	def _gateway(self, *results):
+ 		def on_call(task, kwargs):
+ 			self.signals_on_model_call.append(len(self.signals))
++			self.model_messages.append(copy.deepcopy(kwargs["messages"]) if "messages" in kwargs else None)
++			self.clock[0] += self.model_seconds
+ 
+ 		self.gateway = FakeGateway(*results, on_call=on_call)
+ 		patcher = patch("erp_ai.gateway.call_model", self.gateway)
+@@ -85,3 +107,113 @@ class TestRunnerStatus(RunnerTestBase):
+ 		self._run("comment_mention")
+ 
+ 		self.assertEqual(self.signals, [])
++
++	def _answer_turns(self, cost_usd=0.0):
++		return (
++			tool_turn(tool_use("t1", "post_comment", content="Đã xử lý"), cost_usd=cost_usd),
++			make_model_result(text="xong", cost_usd=cost_usd),
++		)
++
++	def _set_delay(self, low, high):
++		set_agent_settings(answer_delay_min_s=low, answer_delay_max_s=high)
++
++	def test_answer_waits_from_start_signal(self):
++		self._set_delay(4, 4)
++		self.model_seconds = 1
++		self._gateway(*self._answer_turns())
++		comments_before = self._comment_count()
++
++		self._run("comment_mention")
++
++		# anchor = right after the start signal; the model took 1 s of the 4 s
++		self.assertEqual(self.sleeps, [3])
++		self.assertEqual(self.at_sleep, [(["thinking"], comments_before)])
++		self.assertEqual(self._comment_count(), comments_before + 1)
++
++	def test_indicator_stays_thinking_while_waiting(self):
++		self._set_delay(4, 4)
++		self._gateway(*self._answer_turns())
++
++		self._run("comment_mention")
++
++		states, _ = self.at_sleep[0]
++		self.assertEqual(set(states), {"thinking"})
++		# no signal between the model call and the sleep
++		self.assertEqual(len(states), self.signals_on_model_call[0])
++
++	def test_skipped_runs_emit_nothing_and_never_wait(self):
++		self._set_delay(3, 5)
++		cases = {
++			"disabled": lambda: set_agent_settings(enabled=0),
++			"not_sendable": lambda: frappe.db.set_value("HD Ticket", self.ticket.name, "ai_opt_out", 1),
++			"daily_limit": lambda: self._seed_runs(DAILY_LIMIT),
++			"level_L0": lambda: set_agent_settings(permission_level="L0"),
++		}
++		for name, arrange in cases.items():
++			with self.subTest(name):
++				frappe.db.savepoint("erp_ai_skip_case")
++				self._gateway(*self._answer_turns())
++				arrange()
++
++				self._run("comment_mention")
++
++				self.assertEqual(self.signals, [])
++				self.assertEqual(self.sleeps, [])
++				self.assertEqual(self.gateway.call_count, 0)
++				frappe.db.rollback(save_point="erp_ai_skip_case")
++
++	def test_empty_text_no_signal_delay_still_applies(self):
++		self._set_delay(3, 5)
++		for text in ("", "   "):
++			with self.subTest(repr(text)):
++				frappe.db.savepoint("erp_ai_empty_case")
++				self.sleeps.clear()
++				frappe.db.set_single_value(SETTING_DOCTYPE, "thinking_text", text)
++				self._gateway(*self._answer_turns())
++
++				self._run("comment_mention")
++
++				self.assertEqual(self.signals, [])
++				self.assertEqual(len(self.sleeps), 1)
++				self.assertTrue(3 <= self.sleeps[0] <= 5, self.sleeps)
++				frappe.db.rollback(save_point="erp_ai_empty_case")
++
++	def test_mention_run_counts_once_for_daily_limit(self):
++		self._set_delay(3, 5)
++		self._gateway(*self._answer_turns())
++
++		self._run("comment_mention")
++
++		self.assertEqual(len(self._entries(entry_type="reason")), 2)
++		self.assertEqual(policy.runs_today(self.ticket.name), 1)
++
++	def _run_with(self, low, high, text):
++		"""One mention run under the given feature settings; returns (model messages per call, call count, total cost)."""
++		frappe.db.savepoint("erp_ai_on_off")
++		self._set_delay(low, high)
++		frappe.db.set_single_value(SETTING_DOCTYPE, "thinking_text", text)
++		self.model_messages.clear()
++		self._gateway(*self._answer_turns(cost_usd=0.25))
++		self._run("comment_mention")
++		cost = sum(entry.cost_usd for entry in self._entries())
++		# the id of the comment a run creates is random; everything else must be identical
++		messages = re.sub(r'(comment\\": \\")\w+', r"\1<id>", json.dumps(self.model_messages, sort_keys=True))
++		outcome = (messages, self.gateway.call_count, cost)
++		frappe.db.rollback(save_point="erp_ai_on_off")
++		return outcome
++
++	def test_model_messages_same_with_feature_on_and_off(self):
++		on = self._run_with(3, 5, THINKING_TEXT)
++		off = self._run_with(0, 0, "")
++
++		self.assertIn("<id>", on[0])
++		self.assertEqual(on[0], off[0])
++
++	def test_same_gateway_calls_and_cost_with_feature_on_and_off(self):
++		on = self._run_with(3, 5, THINKING_TEXT)
++		off = self._run_with(0, 0, "")
++
++		self.assertEqual(on[1], off[1])
++		self.assertEqual(on[1], 2)
++		self.assertAlmostEqual(on[2], off[2])
++		self.assertAlmostEqual(on[2], 0.5)
+diff --git a/erp_ai/tests/test_handlers.py b/erp_ai/tests/test_handlers.py
+index af15d35..607ea47 100644
+--- a/erp_ai/tests/test_handlers.py
++++ b/erp_ai/tests/test_handlers.py
+@@ -6,9 +6,15 @@ from frappe.tests.utils import FrappeTestCase
+ from helpdesk.test_utils import make_ticket
+ 
+ from erp_ai import handlers
+-from erp_ai.agent import runner
++from erp_ai.agent import answer_delay, runner
+ from erp_ai.constants import AGENT_USER, LOG_DOCTYPE, LOGGER_NAME
+-from erp_ai.test_utils import FakeGateway, make_log_entry, make_model_result, set_agent_settings
++from erp_ai.test_utils import (
++	FakeGateway,
++	make_log_entry,
++	make_model_result,
++	record_status_signals,
++	set_agent_settings,
++)
+ 
+ PREFIX = "ERPAI-TEST-"
+ RUN_FOR_TICKET_PATH = "erp_ai.agent.runner.run_for_ticket"
+@@ -55,6 +61,12 @@ class HandlerTestCase(FrappeTestCase):
+ 		log_error.start()
+ 		self.addCleanup(log_error.stop)
+ 
++		# A run started by a handler test must neither publish to Redis nor sleep for real.
++		record_status_signals(self)
++		sleep_patch = patch.object(answer_delay, "_sleep")
++		sleep_patch.start()
++		self.addCleanup(sleep_patch.stop)
++
+ 		self.gateway = FakeGateway()
+ 		gateway_patch = patch("erp_ai.gateway.call_model", self.gateway)
+ 		gateway_patch.start()
+@@ -64,7 +76,13 @@ class HandlerTestCase(FrappeTestCase):
+ 		self.enqueue = enqueue_patch.start()
+ 		self.addCleanup(enqueue_patch.stop)
+ 
+-		set_agent_settings(enabled=1, trigger_keyword=KEYWORD, excluded_teams=EXCLUDED_TEAM)
++		set_agent_settings(
++			enabled=1,
++			trigger_keyword=KEYWORD,
++			excluded_teams=EXCLUDED_TEAM,
++			answer_delay_min_s=0,
++			answer_delay_max_s=0,
++		)
+ 		for team in (EXCLUDED_TEAM, OPEN_TEAM):
+ 			_ensure_team(team)
+ 		_ensure_ticket_type(TICKET_TYPE)

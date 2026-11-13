@@ -1,0 +1,8 @@
+{"ts":"2026-11-11T10:50:16+07:00","event":"end","session_id":"a007cb94-da64-4b33-828a-f4eaaaf7e22c","feature":"FEAT-001","stage":"intake","reason":"other","duration_s":null,"compactions":0}
+{"ts":"2026-11-11T13:40:02+07:00","event":"end","session_id":"c3221b5d-6799-489f-974e-70d74b1212c2","feature":"FEAT-001","stage":"build","reason":"other","duration_s":1,"compactions":0}
+{"ts":"2026-11-11T13:40:04+07:00","event":"end","session_id":"c07880a4-501f-453e-b0dd-a16814c0e01d","feature":"FEAT-001","stage":"build","reason":"other","duration_s":1,"compactions":0}
+{"ts":"2026-11-11T13:44:10+07:00","event":"end","session_id":"f6862095-61ce-400d-8b57-ce584684efe4","feature":"FEAT-001","stage":"build","reason":"other","duration_s":4,"compactions":0}
+{"ts":"2026-11-11T17:06:14+07:00","event":"end","session_id":"dd105a60-91e1-47df-b97a-ebf60070ce85","feature":"FEAT-001","stage":"build","reason":"other","duration_s":15,"compactions":0}
+{"ts":"2026-11-11T20:03:08+07:00","event":"compact","session_id":"cc03198d-c63c-4da7-8d33-b479609b0cf2","feature":"FEAT-001","stage":"idle","trigger":"auto"}
+{"ts":"2026-11-12T10:39:58+07:00","event":"end","session_id":"cc03198d-c63c-4da7-8d33-b479609b0cf2","feature":"BUG-001","stage":"idle","reason":"other","duration_s":144706,"compactions":1}
+{"ts":"2026-11-12T10:39:59+07:00","event":"end","session_id":"4400269b-e6cb-4d3a-8e7c-69d482fbaff2","feature":"BUG-001","stage":"idle","reason":"other","duration_s":1,"compactions":0}

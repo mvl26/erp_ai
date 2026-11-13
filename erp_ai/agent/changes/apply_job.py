@@ -45,13 +45,14 @@ SWITCH_OFF = "công tắc đang tắt"
 DIGEST_CHANGED = "nội dung đề xuất đã bị sửa sau khi duyệt"
 STORED_HASH_MISMATCH = "nội dung lưu không khớp dấu"
 BRANCH_CHANGED = "nhánh đang checkout đã đổi từ lúc đề xuất"
-FILE_CHANGED = "file đã đổi từ lúc đề xuất"
-FILE_NOW_EXISTS = "file đã tồn tại từ lúc đề xuất"
+TARGET_CHANGED = "file đích đã đổi kể từ lúc đề xuất"
 FILE_CHANGED_AFTER_APPLY = "file đã đổi sau khi áp dụng, không hoàn tác tự động được"
-WRITE_MISMATCH = "nội dung ghi xuống đĩa không khớp đề xuất"
+WRITE_MISMATCH = "đọc lại sau khi ghi không khớp"
 COMMIT_FAILED = "git commit lỗi, file đã được trả lại như cũ"
 COMMIT_TIMED_OUT = "git commit quá giờ, file đã được trả lại như cũ"
 COMMIT_UNEXPECTED = "commit vừa tạo không đúng một file của đề xuất"
+# Design table 3.2 (exact wording).
+GIT_COMMIT_MISMATCH = "commit không đúng nội dung đã duyệt, cần người kiểm"
 COMMAND_FAILED = "lệnh thoát với mã {0}"
 COMMAND_TIMED_OUT = "lệnh chạy quá giờ và đã bị dừng"
 COMMAND_NOT_FOUND = "không tìm thấy lệnh bench"
@@ -68,13 +69,16 @@ GIT_MOVED_REASONS = (
 
 
 class _Stop(Exception):
-	"""Ends a job with a final status and reason; nothing on disk is left half-done when it is raised."""
+	"""Ends a job with a final status and reason, and the git `fields` and log `before`/`after` to record."""
 
-	def __init__(self, status: str, reason: str, result=None):
+	def __init__(self, status: str, reason: str, result=None, *, fields=None, before=None, after=None):
 		super().__init__(reason)
 		self.status = status
 		self.reason = reason
 		self.result = result
+		self.fields = fields
+		self.before = before
+		self.after = after
 
 
 def run_change(proposal_name: str, action: str) -> None:
@@ -147,6 +151,9 @@ def _run_in_lock(proposal_name: str, action: str, actor: str, deadline: float) -
 			actor=actor,
 			reason=stop.reason,
 			result=stop.result,
+			fields=stop.fields,
+			before=stop.before,
+			after=stop.after,
 		)
 		outcome = stop.status
 	except Exception as exc:
@@ -172,7 +179,7 @@ def _run(proposal, action: str, actor: str, deadline: float) -> str:
 		return CHANGE_STATUS_UNDONE
 	settings = _recheck(proposal)
 	if proposal.change_kind == CHANGE_KIND_CODE:
-		_apply_code(proposal, actor, settings.allowed_apps)
+		_apply_code(proposal, actor, settings.allowed_apps, deadline)
 	else:
 		_apply_command(proposal, actor, deadline)
 	return CHANGE_STATUS_APPLIED
@@ -222,74 +229,137 @@ def _recheck(proposal):
 	return settings
 
 
-def _guard(proposal, allowed_apps, *, new_file: bool, stale_on_git: bool):
-	"""Path and git checks at run time; a git refusal is stale on apply (the repo moved) and a failure on undo."""
+def _guard(proposal, allowed_apps, *, new_file: bool):
+	"""Path and git checks of the undo job; any refusal ends it as `Lỗi`."""
 	guard = change_guard.check_write_path(proposal.file_path, allowed_apps, new_file=new_file)
 	if guard.reason:
-		git_refusal = guard.reason in GIT_MOVED_REASONS
-		status = CHANGE_STATUS_STALE if stale_on_git and git_refusal else CHANGE_STATUS_FAILED
-		raise _Stop(status, guard.reason)
+		raise _Stop(CHANGE_STATUS_FAILED, guard.reason)
 	return guard
 
 
-def _commit(guard, subject: str, body: str, give_back) -> str:
-	"""One `commit --only` of the target; on any failure `give_back()` restores the file, then the job fails.
-
-	Returns the new HEAD commit.
-	"""
-	git = guard.git
-	result = process_runner.git_commit_only(
-		git.repo_root, git.rel_in_repo, subject, body, source.GIT_TIMEOUT_S
-	)
+def _git_commit(repo_root: str, rel_in_repo: str, subject: str, body: str, give_back, limit_s: int) -> None:
+	"""One `commit --only` of the target; on any failure `give_back()` restores the file, then the job fails."""
+	result = process_runner.git_commit_only(repo_root, rel_in_repo, subject, body, limit_s)
 	if result.timed_out or result.exit_code != 0:
 		give_back()
 		reason = COMMIT_TIMED_OUT if result.timed_out else COMMIT_FAILED
 		raise _Stop(CHANGE_STATUS_FAILED, reason, result)
+
+
+def _commit(guard, subject: str, body: str, give_back) -> str:
+	"""The undo commit and its check; returns the new HEAD commit."""
+	git = guard.git
+	_git_commit(git.repo_root, git.rel_in_repo, subject, body, give_back, source.GIT_TIMEOUT_S)
 	summary = source.git_commit_summary(git.repo_root)
 	if summary.parents != (git.head,) or summary.paths != (git.rel_in_repo,):
 		raise _Stop(CHANGE_STATUS_FAILED, COMMIT_UNEXPECTED)
 	return summary.commit
 
 
+def _git_limit(deadline: float) -> int:
+	"""`limit_s` of a git write: at most `GIT_TIMEOUT_S`, cut by the job deadline, never below 1 (design 3.5)."""
+	return min(source.GIT_TIMEOUT_S, max(1, int(deadline - time.monotonic())))
+
+
 def _person(user: str) -> str:
 	return change_text.safe_person_name(get_fullname(user))
 
 
-def _apply_code(proposal, actor: str, allowed_apps) -> None:
+def _apply_record(proposal, full_path: str, old_head: str, commit: str | None, branch: str | None) -> dict:
+	"""`fields`, `before` and `after` of a `finish` after the commit ran (design-addendum-3 QĐ-B5).
+
+	Without a commit sha, neither `fields` nor `after` carries one.
+	"""
+	after = {"sha256": file_writer.sha256_of(full_path)}
+	fields = {}
+	if commit:
+		fields["apply_commit_sha"] = commit
+		after["commit"] = commit
+	after["branch"] = branch
+	return {"fields": fields, "before": {"sha256": proposal.base_hash, "head": old_head}, "after": after}
+
+
+def _apply_postcheck(proposal, state, full_path: str):
+	"""Design 4.3 step 3.5 (ADR-022 decision 1 step 5); returns the `CommitSummary` of the bot commit.
+
+	The bot commit exists (the commit command exited 0), so the file is never given back and history is
+	never rewritten (design-addendum-3 QĐ-B2 item 1): a check that fails or cannot be read ends the job as
+	`Lỗi` `GIT_COMMIT_MISMATCH`, keeping the commit sha when it is known.
+	"""
+	repo, rel, old_head = state.repo_root, state.rel_in_repo, state.head
+	summary = None
+	try:
+		summary = source.git_commit_summary(repo)
+		matches = (
+			len(summary.parents) == 1
+			and source.git_is_ancestor(repo, old_head, summary.parents[0]) is True
+			and summary.paths == (rel,)
+			and summary.branch == proposal.target_branch
+			and source.git_blob(repo, summary.commit, rel) == (proposal.content_after or "").encode("utf-8")
+		)
+	except RuntimeError:
+		# git could not be read: the check is not passed (QĐ-B2 item 1), the reason below says so.
+		matches = False
+	if matches:
+		return summary
+	if summary is not None:
+		commit, branch = summary.commit, summary.branch
+	else:
+		head = source.git_head(repo)
+		commit, branch = (head if head not in (None, old_head) else None), None
+	raise _Stop(
+		CHANGE_STATUS_FAILED,
+		GIT_COMMIT_MISMATCH,
+		**_apply_record(proposal, full_path, old_head, commit, branch),
+	)
+
+
+def _apply_code(proposal, actor: str, allowed_apps, deadline: float) -> None:
+	"""Design 4.3 step 4.3: file hash, git pre-read, write, commit, post-check, done."""
 	new_file = bool(proposal.is_new_file)
-	guard = _guard(proposal, allowed_apps, new_file=new_file, stale_on_git=True)
-	git = guard.git
-	if git.branch != proposal.target_branch:
-		raise _Stop(CHANGE_STATUS_STALE, BRANCH_CHANGED)
-	on_disk = file_writer.sha256_of(guard.full_path)
-	if new_file and (on_disk is not None or os.path.lexists(guard.full_path)):
-		raise _Stop(CHANGE_STATUS_STALE, FILE_NOW_EXISTS)
+	guard = change_guard.check_write_path(proposal.file_path, allowed_apps, new_file=new_file, read_git=False)
+	if guard.reason:
+		raise _Stop(CHANGE_STATUS_FAILED, guard.reason)
+	full = guard.full_path
+	# D-19: the file hash first, git after; a stale target never reaches git.
+	on_disk = file_writer.sha256_of(full)
+	if new_file and (on_disk is not None or os.path.lexists(full)):
+		raise _Stop(CHANGE_STATUS_STALE, TARGET_CHANGED)
 	if not new_file and on_disk != proposal.base_hash:
-		raise _Stop(CHANGE_STATUS_STALE, FILE_CHANGED)
+		raise _Stop(CHANGE_STATUS_STALE, TARGET_CHANGED)
+	state = source.read_git_state(full, new_file=new_file)
+	if state.refusal:
+		status = CHANGE_STATUS_STALE if state.refusal in GIT_MOVED_REASONS else CHANGE_STATUS_FAILED
+		raise _Stop(status, state.refusal)
+	if state.branch != proposal.target_branch:
+		raise _Stop(CHANGE_STATUS_STALE, BRANCH_CHANGED)
+	repo, rel = state.repo_root, state.rel_in_repo
 
 	def give_back():
 		if new_file:
-			process_runner.git_unstage_new(git.repo_root, git.rel_in_repo, source.GIT_TIMEOUT_S)
-			file_writer.remove_created(guard.full_path)
+			process_runner.git_unstage_new(repo, rel, source.GIT_TIMEOUT_S)
+			file_writer.remove_created(full)
 		else:
-			file_writer.write_atomic(guard.full_path, proposal.content_before, new_file=False)
+			file_writer.write_atomic(full, proposal.content_before, new_file=False)
 
-	written = file_writer.write_atomic(guard.full_path, proposal.content_after, new_file=new_file)
+	written = file_writer.write_atomic(full, proposal.content_after, new_file=new_file)
 	if written != proposal.after_hash:
 		if new_file:
-			file_writer.remove_created(guard.full_path)
+			file_writer.remove_created(full)
 		else:
-			file_writer.write_atomic(guard.full_path, proposal.content_before, new_file=False)
+			file_writer.write_atomic(full, proposal.content_before, new_file=False)
 		raise _Stop(CHANGE_STATUS_FAILED, WRITE_MISMATCH)
 	if new_file:
-		added = process_runner.git_add_new(git.repo_root, git.rel_in_repo, source.GIT_TIMEOUT_S)
+		added = process_runner.git_add_new(repo, rel, source.GIT_TIMEOUT_S)
 		if added.timed_out or added.exit_code != 0:
-			file_writer.remove_created(guard.full_path)
+			file_writer.remove_created(full)
 			raise _Stop(CHANGE_STATUS_FAILED, COMMIT_FAILED, added)
 	subject, body = change_text.apply_message(
 		proposal.name, str(proposal.ticket or ""), proposal.file_path, _person(actor)
 	)
-	commit = _commit(guard, subject, body, give_back)
+	_git_commit(repo, rel, subject, body, give_back, _git_limit(deadline))
+	summary = _apply_postcheck(proposal, state, full)
+	record = _apply_record(proposal, full, state.head, summary.commit, summary.branch)
 	transitions.finish(
 		proposal.name,
 		CHANGE_STATUS_APPLYING,
@@ -297,19 +367,19 @@ def _apply_code(proposal, actor: str, allowed_apps) -> None:
 		step="apply",
 		actor=actor,
 		fields={
-			"applied_branch": git.branch,
-			"applied_ahead_count": git.ahead_count + 1 if git.upstream_ref else 0,
-			"apply_commit_sha": commit,
+			**record["fields"],
+			"applied_branch": summary.branch,
+			"applied_ahead_count": state.ahead_count + 1 if state.upstream_ref else 0,
 		},
-		before={"hash": proposal.base_hash},
-		after={"hash": proposal.after_hash, "commit": commit},
+		before=record["before"],
+		after=record["after"],
 	)
 
 
 def _undo_code(proposal, actor: str) -> None:
 	new_file = bool(proposal.is_new_file)
 	# Undo stays possible after the app left the allowed list; the guard still refuses erp_ai and bad paths.
-	guard = _guard(proposal, (proposal.app,), new_file=False, stale_on_git=False)
+	guard = _guard(proposal, (proposal.app,), new_file=False)
 	if file_writer.sha256_of(guard.full_path) != proposal.after_hash:
 		raise _Stop(CHANGE_STATUS_FAILED, FILE_CHANGED_AFTER_APPLY)
 

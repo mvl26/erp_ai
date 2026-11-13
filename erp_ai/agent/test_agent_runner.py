@@ -1494,7 +1494,8 @@ class TestRunnerProposeLogAndInjection(RunnerTestBase):
 			block_id,
 			"propose_file_change",
 			path=f"{SANDBOX_APP}/{SANDBOX_REL}",
-			edits=[{"old": "x = 1", "new": "x = 2"}],
+			find=["x = 1"],
+			replace=["x = 2"],
 			reason="r",
 		)
 
@@ -1502,7 +1503,14 @@ class TestRunnerProposeLogAndInjection(RunnerTestBase):
 		proposal = make_change_proposal(ticket=self.ticket.name).name
 		self.gateway.results = [
 			tool_turn(
-				tool_use("toolu_1", "propose_file_change", path="custom_app/a.py", edits=[], reason="r"),
+				tool_use(
+					"toolu_1",
+					"propose_file_change",
+					path="custom_app/a.py",
+					find=["x = 1"],
+					replace=["x = 2"],
+					reason="r",
+				),
 				tool_use("toolu_2", "propose_new_file", path="custom_app/b.py", content="x", reason="r"),
 			),
 			make_model_result(),

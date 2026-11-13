@@ -253,6 +253,27 @@ class TestApplyCode(ApplyJobTestCase):
 		self.assertEqual(self.worktree_changes(), "")
 		self.assertEqual(self.steps(name), ["approve", "fail"])
 
+	def test_read_back_hash_mismatch_fails_without_a_commit(self):
+		name = self.approved(self.code_proposal())
+		count = self.commit_count()
+		real_write = file_writer.write_atomic
+
+		def write_reads_back_other_bytes(path, content, new_file):
+			written = real_write(path, content, new_file=new_file)
+			return _sha("khác\n") if content == AFTER else written
+
+		with patch.object(file_writer, "write_atomic", side_effect=write_reads_back_other_bytes):
+			apply_job.run_change(name, "apply")
+
+		state = self.state(name)
+		# Design 4.3 step 4.3 gives the reason word for word.
+		self.assertEqual(
+			(state.change_status, state.failure_reason),
+			(CHANGE_STATUS_FAILED, "đọc lại sau khi ghi không khớp"),
+		)
+		self.assertEqual(self.commit_count(), count)
+		self.assertEqual(self.steps(name), ["approve", "fail"])
+
 	def test_crash_ends_as_failed_with_the_exception_class_only(self):
 		name = self.approved(self.code_proposal())
 		# The job rolls back before it records the failure; here its own commits are mocked, so a real

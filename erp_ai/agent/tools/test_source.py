@@ -1299,6 +1299,38 @@ class TestGitReadOptions(unittest.TestCase):
 							source.run_git_read(repo, subcommand, *args)
 		run.assert_not_called()
 
+	def test_run_git_read_rejects_filter_textconv_ext_diff_flags(self):
+		# arch-ruling-clean-filter.md (b): these flags run a program declared in the repo config.
+		repo = os.path.realpath(tempfile.gettempdir())
+		cases = (
+			("--filters", "cat-file", ("--filters", f"{FAKE_HEAD}:a.py")),
+			("--textconv", "cat-file", ("--textconv", f"{FAKE_HEAD}:a.py")),
+			("--ext-diff", "diff-tree", ("-r", "--ext-diff", FAKE_HEAD)),
+		)
+		with patch(RUN_PATH) as run:
+			for flag, subcommand, args in cases:
+				with self.subTest(flag=flag):
+					with self.assertRaisesRegex(ValueError, f"argument.*{flag}"):
+						source.run_git_read(repo, subcommand, *args)
+		run.assert_not_called()
+
+	def test_run_git_read_rejects_abbreviated_and_valued_program_flags(self):
+		repo = os.path.realpath(tempfile.gettempdir())
+		with patch(RUN_PATH) as run:
+			for arg in ("--filt", "--filters=x", "--textc", "--textconv=x", "--ext", "--ext-diff=x"):
+				with self.subTest(arg=arg):
+					with self.assertRaisesRegex(ValueError, "argument"):
+						source.run_git_read(repo, "cat-file", arg, f"{FAKE_HEAD}:a.py")
+		run.assert_not_called()
+
+	def test_run_git_read_keeps_negated_program_flags(self):
+		repo = os.path.realpath(tempfile.gettempdir())
+		done = subprocess.CompletedProcess([], 0, stdout=b"")
+		args = ("-r", "--no-ext-diff", "--no-textconv", "--name-only", FAKE_HEAD)
+		with patch(RUN_PATH, return_value=done) as run:
+			source.run_git_read(repo, "diff-tree", *args)
+		self.assertEqual(run.call_args.args[0][-len(args) :], list(args))
+
 	def test_run_git_read_keeps_other_options_and_end_of_options(self):
 		repo = os.path.realpath(tempfile.gettempdir())
 		done = subprocess.CompletedProcess([], 0, stdout=b"")
@@ -1662,12 +1694,17 @@ class TestReadGitState(RealCoreReposUntouchedMixin, unittest.TestCase):
 					),
 					{"limit_s": 7},
 				),
+				(
+					(repo, "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"),
+					{"limit_s": 7},
+				),
 			],
 		)
 		for call in run.call_args_list:
 			self.assertIn(call.args[1], source.GIT_READ_SUBCOMMANDS)
 
-	def good_runs(self, repo):
+	@staticmethod
+	def good_runs(repo):
 		git_paths = b"".join(
 			f".git/{name}\n".encode()
 			for name in (
@@ -1686,6 +1723,8 @@ class TestReadGitState(RealCoreReposUntouchedMixin, unittest.TestCase):
 			source.GitRun(exit_code=0, stdout=git_paths, timed_out=False),
 			source.GitRun(exit_code=1, stdout=b"", timed_out=False),
 			source.GitRun(exit_code=0, stdout=b"", timed_out=False),
+			# design 3.2 step 7: no upstream configured (git exits 128) → "" / 0
+			source.GitRun(exit_code=128, stdout=b"", timed_out=False),
 		]
 
 	def test_read_git_state_git_failures_unparsable_output_and_timeouts(self):
@@ -1793,3 +1832,487 @@ class TestReadGitState(RealCoreReposUntouchedMixin, unittest.TestCase):
 		self.assertEqual((state.upstream_ref, state.ahead_count), ("", 0))
 		with self.assertRaises(AttributeError):
 			state.branch = "other"
+
+
+# Design 3.2 step 7, typed here on purpose (STD-TEST-2).
+EXPECTED_MASKED_UPSTREAM = "(remote không tên)"
+FAKE_URL = "https://x-token-FAKE@host/r.git"
+UPSTREAM_ARGS = ("rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}")
+AHEAD_ARGS = ("rev-list", "--count", "@{upstream}..HEAD")
+
+
+class TestReadGitStateUpstream(RealCoreReposUntouchedMixin, unittest.TestCase):
+	"""AC-21, NFR-8: upstream_ref and ahead_count from local remote refs only, never a URL."""
+
+	def make_sandbox(self):
+		sandbox = GitSandbox(self, apps=(APP,), erp_ai_worktree=None)
+		sandbox.commit_file(APP, TARGET, "x = 1\n")
+		return sandbox
+
+	def read(self, sandbox, limit_s=source.GIT_TIMEOUT_S):
+		return source.read_git_state(os.path.join(sandbox.repo(APP), TARGET), new_file=False, limit_s=limit_s)
+
+	def test_ahead_count_and_upstream_ref(self):
+		for ahead in (0, 2):
+			with self.subTest(ahead=ahead):
+				sandbox = self.make_sandbox()
+				sandbox.add_remote(APP, ahead=ahead)
+				repo = sandbox.repo(APP)
+				state = self.read(sandbox)
+				self.assertEqual(
+					state,
+					source.GitState(
+						refusal=None,
+						repo_root=repo,
+						rel_in_repo=TARGET,
+						branch="main",
+						head=sandbox.git(APP, "rev-parse", "HEAD").strip(),
+						upstream_ref="origin/main",
+						ahead_count=ahead,
+					),
+				)
+				self.assertNotIn("x-token-FAKE", repr(state))
+
+	def test_upstream_of_other_branch_and_no_fetch(self):
+		sandbox = self.make_sandbox()
+		sandbox.add_remote(APP, ahead=1)
+		refs_before = sandbox.refs(APP)
+		sandbox.switch_branch(APP, "feature/x")
+		sandbox.git(APP, "branch", "--quiet", "--set-upstream-to=origin/main")
+		sandbox.commit_file(APP, "custom_app/f.py", "f = 1\n")
+		state = self.read(sandbox)
+		self.assertEqual(
+			(state.branch, state.upstream_ref, state.ahead_count), ("feature/x", "origin/main", 2)
+		)
+		refs_after = sandbox.refs(APP)
+		self.assertEqual(refs_after["refs/remotes/origin/main"], refs_before["refs/remotes/origin/main"])
+
+	def test_upstream_with_url_like_name_is_masked(self):
+		sandbox = self.make_sandbox()
+		sandbox.add_remote(APP, ahead=2)
+		sandbox.git(APP, "remote", "rename", "origin", "x-token-FAKE@host")
+		self.assertEqual(
+			sandbox.git(APP, "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"),
+			"x-token-FAKE@host/main\n",
+		)
+		state = self.read(sandbox)
+		self.assertEqual(
+			(state.refusal, state.upstream_ref, state.ahead_count), (None, EXPECTED_MASKED_UPSTREAM, 2)
+		)
+		self.assertNotIn("x-token-FAKE", repr(state))
+
+	def test_branch_remote_set_to_url_never_leaks_it(self):
+		# git 2.43 refuses `@{upstream}` when branch.<n>.remote is a URL ("not stored as a
+		# remote-tracking branch", exit 128), so the state reads as "not tracking"; the URL never shows.
+		sandbox = self.make_sandbox()
+		sandbox.git(APP, "config", "branch.main.remote", FAKE_URL)
+		sandbox.git(APP, "config", "branch.main.merge", "refs/heads/main")
+		state = self.read(sandbox)
+		self.assertEqual((state.refusal, state.upstream_ref, state.ahead_count), (None, "", 0))
+		self.assertNotIn("x-token-FAKE", repr(state))
+
+	def test_upstream_mask_each_side_of_condition(self):
+		sandbox = self.make_sandbox()
+		repo = sandbox.repo(APP)
+		cases = (
+			(b"https://host/r/main\n", EXPECTED_MASKED_UPSTREAM),
+			(b"me@host/main\n", EXPECTED_MASKED_UPSTREAM),
+			(b"https://me@host/main\n", EXPECTED_MASKED_UPSTREAM),
+			(b"origin/main\n", "origin/main"),
+			(b"origin:x/main\n", "origin:x/main"),
+		)
+		for stdout, expected in cases:
+			with self.subTest(stdout=stdout):
+				runs = [
+					*TestReadGitState.good_runs(repo)[:6],
+					source.GitRun(exit_code=0, stdout=stdout, timed_out=False),
+					source.GitRun(exit_code=0, stdout=b"3\n", timed_out=False),
+				]
+				with patch(READ_GIT_PATH, side_effect=runs):
+					state = self.read(sandbox)
+				self.assertEqual((state.refusal, state.upstream_ref, state.ahead_count), (None, expected, 3))
+
+	def test_upstream_and_ahead_calls_in_order_with_limit(self):
+		sandbox = self.make_sandbox()
+		sandbox.add_remote(APP, ahead=1)
+		repo = sandbox.repo(APP)
+		with patch(READ_GIT_PATH, wraps=source.run_git_read) as run:
+			state = self.read(sandbox, limit_s=7)
+		self.assertEqual(state.ahead_count, 1)
+		self.assertEqual(
+			[(call.args, call.kwargs) for call in run.call_args_list[-2:]],
+			[((repo, *UPSTREAM_ARGS), {"limit_s": 7}), ((repo, *AHEAD_ARGS), {"limit_s": 7})],
+		)
+		self.assertEqual(run.call_count, 8)
+
+	def test_upstream_and_ahead_failures(self):
+		sandbox = self.make_sandbox()
+		repo = sandbox.repo(APP)
+
+		def run(exit_code, stdout=b"", timed_out=False):
+			return source.GitRun(exit_code=exit_code, stdout=stdout, timed_out=timed_out)
+
+		upstream_ok = run(0, b"origin/main\n")
+		cases = (
+			("upstream timed out", [run(None, timed_out=True)], refused(EXPECTED_GIT_ERROR)),
+			("upstream killed", [run(-9, timed_out=True)], refused(EXPECTED_GIT_ERROR)),
+			("upstream did not start", [run(None)], refused(EXPECTED_GIT_ERROR)),
+			("upstream empty output", [run(0, b"")], refused(EXPECTED_GIT_ERROR)),
+			("upstream empty line", [run(0, b"\n")], refused(EXPECTED_GIT_ERROR)),
+			("upstream two lines", [run(0, b"origin/main\nx\n")], refused(EXPECTED_GIT_ERROR)),
+			("ahead timed out", [upstream_ok, run(None, timed_out=True)], refused(EXPECTED_GIT_ERROR)),
+			("ahead did not start", [upstream_ok, run(None)], refused(EXPECTED_GIT_ERROR)),
+			("ahead exit 128", [upstream_ok, run(128)], refused(EXPECTED_GIT_ERROR)),
+			("ahead not a number", [upstream_ok, run(0, b"two\n")], refused(EXPECTED_GIT_ERROR)),
+			("ahead negative", [upstream_ok, run(0, b"-1\n")], refused(EXPECTED_GIT_ERROR)),
+			("ahead empty", [upstream_ok, run(0, b"")], refused(EXPECTED_GIT_ERROR)),
+			("ahead two lines", [upstream_ok, run(0, b"1\n2\n")], refused(EXPECTED_GIT_ERROR)),
+		)
+		for name, tail, expected in cases:
+			with self.subTest(name):
+				runs = [*TestReadGitState.good_runs(repo)[:6], *tail]
+				with patch(READ_GIT_PATH, side_effect=runs) as fake:
+					self.assertEqual(self.read(sandbox), expected)
+				self.assertEqual(fake.call_count, 6 + len(tail))
+
+		for code in (1, 128):
+			with self.subTest(no_upstream_exit=code):
+				runs = [*TestReadGitState.good_runs(repo)[:6], run(code)]
+				with patch(READ_GIT_PATH, side_effect=runs) as fake:
+					state = self.read(sandbox)
+				self.assertEqual((state.refusal, state.upstream_ref, state.ahead_count), (None, "", 0))
+				self.assertEqual(fake.call_count, 7)
+
+
+EXPECTED_BOT_EMAIL = "erp-ai-agent@bot.invalid"
+SANDBOX_EMAIL = "erp-ai-test@sandbox.invalid"
+MISSING_SHA = "0" * 40
+BAD_REVS = (
+	"",
+	"main",
+	"HEAD~1",
+	"head",
+	"-x",
+	"A" * 40,
+	"0" * 39,
+	"0" * 41,
+	f"{'0' * 40}\n",
+	None,
+	3,
+	b"HEAD",
+)
+
+
+class TestGitCommitReaders(RealCoreReposUntouchedMixin, unittest.TestCase):
+	"""AC-17 (post-check), AC-20 (ancestor), NFR-8: git_head, git_commit_summary, git_blob, git_is_ancestor."""
+
+	def make_sandbox(self):
+		return GitSandbox(self, apps=(APP,), erp_ai_worktree=None)
+
+	def head(self, sandbox):
+		return sandbox.git(APP, "rev-parse", "HEAD").strip()
+
+	def bot_commit(self, sandbox, rel, content):
+		sandbox._write(APP, rel, content)
+		sandbox.git(APP, "add", "--", rel)
+		sandbox.git(
+			APP,
+			"commit",
+			"--quiet",
+			"--no-gpg-sign",
+			f"--author=ERP AI Agent <{EXPECTED_BOT_EMAIL}>",
+			"-m",
+			f"bot {rel}",
+			"--",
+			rel,
+		)
+		return self.head(sandbox)
+
+	@staticmethod
+	def result(exit_code, stdout=b"", timed_out=False):
+		return source.GitRun(exit_code=exit_code, stdout=stdout, timed_out=timed_out)
+
+	def test_git_head_sha_or_none(self):
+		sandbox = self.make_sandbox()
+		repo = sandbox.repo(APP)
+		self.assertEqual(source.git_head(repo), self.head(sandbox))
+		os.makedirs(sandbox.repo("fresh_app"))
+		sandbox.git("fresh_app", "init", "--quiet", "--initial-branch=main")
+		self.assertIsNone(source.git_head(sandbox.repo("fresh_app")))
+		with patch(READ_GIT_PATH, wraps=source.run_git_read) as run:
+			source.git_head(repo)
+		run.assert_called_once_with(repo, "rev-parse", "--verify", "-q", "HEAD")
+		for bad in (
+			self.result(None, timed_out=True),
+			self.result(None),
+			self.result(128),
+			self.result(0, b"not-a-sha\n"),
+			self.result(0, b""),
+			self.result(0, f"{FAKE_HEAD}\n{FAKE_HEAD}\n".encode()),
+		):
+			with self.subTest(bad=bad):
+				with patch(READ_GIT_PATH, return_value=bad):
+					self.assertIsNone(source.git_head(repo))
+		with patch(RUN_PATH) as run:
+			with self.assertRaisesRegex(ValueError, "repo_root"):
+				source.git_head("relative/repo")
+		run.assert_not_called()
+
+	def test_commit_summary_parents_paths_branch(self):
+		sandbox = self.make_sandbox()
+		repo = sandbox.repo(APP)
+		sandbox.commit_file(APP, TARGET, "x = 1\n")
+		old_head = self.head(sandbox)
+		human = sandbox.commit_file(APP, "custom_app/human.py", "h = 1\n")
+		bot = self.bot_commit(sandbox, TARGET, "x = 2\n")
+		self.assertEqual(
+			source.git_commit_summary(repo),
+			source.CommitSummary(
+				commit=bot,
+				parents=(human,),
+				paths=(TARGET,),
+				branch="main",
+				author_email=EXPECTED_BOT_EMAIL,
+			),
+		)
+		self.assertNotEqual(human, old_head)
+
+		human_last = sandbox.commit_file(APP, "custom_app/human2.py", "h = 2\n")
+		summary = source.git_commit_summary(repo)
+		self.assertEqual(
+			(summary.commit, summary.parents, summary.paths, summary.author_email),
+			(human_last, (bot,), ("custom_app/human2.py",), SANDBOX_EMAIL),
+		)
+
+	def test_commit_summary_paths_of_rename_delete_and_several_files(self):
+		sandbox = self.make_sandbox()
+		repo = sandbox.repo(APP)
+		sandbox.commit_file(APP, "a.py", "a = 1\n")
+		sandbox.commit_file(APP, "b.py", "b = 1\n")
+		sandbox.git(APP, "mv", "a.py", "z.py")
+		sandbox.git(APP, "rm", "--quiet", "b.py")
+		sandbox._write(APP, "c d.py", "c = 1\n")
+		sandbox.git(APP, "add", "--", "c d.py")
+		sandbox.git(APP, "commit", "--quiet", "--no-gpg-sign", "-m", "several")
+		self.assertEqual(source.git_commit_summary(repo).paths, ("a.py", "b.py", "c d.py", "z.py"))
+
+	def test_commit_summary_root_merge_and_detached(self):
+		sandbox = self.make_sandbox()
+		repo = sandbox.repo(APP)
+		root = self.head(sandbox)
+		self.assertEqual(
+			source.git_commit_summary(repo),
+			source.CommitSummary(
+				commit=root, parents=(), paths=("README.md",), branch="main", author_email=SANDBOX_EMAIL
+			),
+		)
+		sandbox.switch_branch(APP, "side")
+		side = sandbox.commit_file(APP, "s.py", "s = 1\n")
+		sandbox.switch_branch(APP, "main", create=False)
+		main = sandbox.commit_file(APP, "m.py", "m = 1\n")
+		sandbox.git(APP, "merge", "--quiet", "--no-ff", "--no-edit", "side")
+		merge = source.git_commit_summary(repo)
+		self.assertEqual(
+			(merge.commit, merge.parents, merge.paths, merge.branch),
+			(self.head(sandbox), (main, side), (), "main"),
+		)
+		sandbox.detach(APP)
+		self.assertIsNone(source.git_commit_summary(repo).branch)
+
+	def test_commit_summary_runs_read_subcommands_without_paths(self):
+		sandbox = self.make_sandbox()
+		repo = sandbox.repo(APP)
+		head = self.head(sandbox)
+		with patch(READ_GIT_PATH, wraps=source.run_git_read) as run:
+			source.git_commit_summary(repo)
+		self.assertEqual(
+			[call.args for call in run.call_args_list],
+			[
+				(repo, "rev-list", "-1", "--no-commit-header", "--format=%H%x00%P%x00%ae", "HEAD"),
+				(
+					repo,
+					"diff-tree",
+					"-r",
+					"-z",
+					"--root",
+					"--no-commit-id",
+					"--no-renames",
+					"--name-only",
+					head,
+				),
+				(repo, "rev-parse", "--abbrev-ref", "HEAD"),
+			],
+		)
+		for call in run.call_args_list:
+			self.assertNotIn("--", call.args)
+
+	def test_commit_summary_git_failures_raise(self):
+		sandbox = self.make_sandbox()
+		repo = sandbox.repo(APP)
+		meta = self.result(0, f"{FAKE_HEAD}\0{FAKE_HEAD}\0{EXPECTED_BOT_EMAIL}\n".encode())
+		paths = self.result(0, b"custom_app/hooks.py\0")
+		branch = self.result(0, b"main\n")
+		with patch(READ_GIT_PATH, side_effect=[meta, paths, branch]):
+			self.assertEqual(
+				source.git_commit_summary(repo),
+				source.CommitSummary(
+					commit=FAKE_HEAD,
+					parents=(FAKE_HEAD,),
+					paths=("custom_app/hooks.py",),
+					branch="main",
+					author_email=EXPECTED_BOT_EMAIL,
+				),
+			)
+		cases = (
+			("meta timed out", [self.result(None, timed_out=True)]),
+			("meta did not start", [self.result(None)]),
+			("meta exit 128", [self.result(128)]),
+			("meta empty", [self.result(0, b"")]),
+			("meta two fields", [self.result(0, f"{FAKE_HEAD}\0{EXPECTED_BOT_EMAIL}\n".encode())]),
+			("meta bad commit", [self.result(0, f"xyz\0{FAKE_HEAD}\0a@b\n".encode())]),
+			("meta bad parent", [self.result(0, f"{FAKE_HEAD}\0xyz\0a@b\n".encode())]),
+			("meta two lines", [self.result(0, f"{FAKE_HEAD}\0\0a@b\n{FAKE_HEAD}\0\0a@b\n".encode())]),
+			("paths timed out", [meta, self.result(None, timed_out=True)]),
+			("paths exit 128", [meta, self.result(128)]),
+			("paths not NUL terminated", [meta, self.result(0, b"a.py")]),
+			("paths empty name", [meta, self.result(0, b"\0")]),
+			("branch timed out", [meta, paths, self.result(None, timed_out=True)]),
+			("branch exit 128", [meta, paths, self.result(128)]),
+			("branch empty", [meta, paths, self.result(0, b"\n")]),
+		)
+		for name, runs in cases:
+			with self.subTest(name):
+				with patch(READ_GIT_PATH, side_effect=runs) as fake:
+					with self.assertRaisesRegex(RuntimeError, EXPECTED_GIT_ERROR):
+						source.git_commit_summary(repo)
+				self.assertEqual(fake.call_count, len(runs))
+
+	def test_commit_summary_empty_paths_and_frozen(self):
+		sandbox = self.make_sandbox()
+		repo = sandbox.repo(APP)
+		meta = self.result(0, f"{FAKE_HEAD}\0{FAKE_HEAD}\0{EXPECTED_BOT_EMAIL}\n".encode())
+		with patch(READ_GIT_PATH, side_effect=[meta, self.result(0, b""), self.result(0, b"main\n")]):
+			summary = source.git_commit_summary(repo)
+		self.assertEqual(summary.paths, ())
+		with self.assertRaises(AttributeError):
+			summary.commit = "x"
+
+	def test_git_blob_none_for_deleted_path(self):
+		sandbox = self.make_sandbox()
+		repo = sandbox.repo(APP)
+		content = "a = 'Việt'\r\nb = 2".encode() + b"\xff"
+		first = sandbox.commit_file(APP, "custom_app/a.py", content)
+		sandbox.git(APP, "rm", "--quiet", "custom_app/a.py")
+		sandbox.git(APP, "commit", "--quiet", "--no-gpg-sign", "-m", "delete")
+		deleted = self.head(sandbox)
+		self.assertEqual(source.git_blob(repo, first, "custom_app/a.py"), content)
+		self.assertIsNone(source.git_blob(repo, deleted, "custom_app/a.py"))
+		self.assertIsNone(source.git_blob(repo, deleted, "custom_app/never.py"))
+		self.assertIsNone(source.git_blob(repo, "HEAD", "custom_app/a.py"))
+		self.assertEqual(source.git_blob(repo, "HEAD", "README.md"), f"# {APP}\n".encode())
+		with self.assertRaisesRegex(RuntimeError, EXPECTED_GIT_ERROR):
+			source.git_blob(repo, first, "custom_app")
+		with self.assertRaisesRegex(RuntimeError, EXPECTED_GIT_ERROR):
+			source.git_blob(repo, MISSING_SHA, "README.md")
+
+	def test_git_blob_calls_and_failures(self):
+		sandbox = self.make_sandbox()
+		repo = sandbox.repo(APP)
+		head = self.head(sandbox)
+		with patch(READ_GIT_PATH, wraps=source.run_git_read) as run:
+			source.git_blob(repo, head, "README.md")
+		self.assertEqual(
+			[call.args for call in run.call_args_list],
+			[
+				(repo, "cat-file", "-t", head),
+				(repo, "cat-file", "-t", f"{head}:README.md"),
+				(repo, "cat-file", "blob", f"{head}:README.md"),
+			],
+		)
+		commit = self.result(0, b"commit\n")
+		blob = self.result(0, b"blob\n")
+		raising = (
+			("commit timed out", [self.result(None, timed_out=True)]),
+			("commit did not start", [self.result(None)]),
+			("commit exit 128", [self.result(128)]),
+			("commit is a tree", [self.result(0, b"tree\n")]),
+			("path timed out", [commit, self.result(None, timed_out=True)]),
+			("path did not start", [commit, self.result(None)]),
+			("path exit 1", [commit, self.result(1)]),
+			("path is a tree", [commit, self.result(0, b"tree\n")]),
+			("path is a submodule", [commit, self.result(0, b"commit\n")]),
+			("read timed out", [commit, blob, self.result(None, timed_out=True)]),
+			("read exit 128", [commit, blob, self.result(128)]),
+		)
+		for name, runs in raising:
+			with self.subTest(name):
+				with patch(READ_GIT_PATH, side_effect=runs) as fake:
+					with self.assertRaisesRegex(RuntimeError, EXPECTED_GIT_ERROR):
+						source.git_blob(repo, head, "README.md")
+				self.assertEqual(fake.call_count, len(runs))
+		with patch(READ_GIT_PATH, side_effect=[commit, self.result(128)]) as fake:
+			self.assertIsNone(source.git_blob(repo, head, "README.md"))
+		self.assertEqual(fake.call_count, 2)
+		with patch(READ_GIT_PATH, side_effect=[commit, blob, self.result(0, b"")]):
+			self.assertEqual(source.git_blob(repo, head, "README.md"), b"")
+
+	def test_git_blob_rejects_bad_input_before_git(self):
+		repo = os.path.realpath(tempfile.gettempdir())
+		bad_rels = (
+			"",
+			"/abs.py",
+			"../x.py",
+			"a/../b.py",
+			"./a.py",
+			"a//b.py",
+			"a/",
+			".",
+			"a\0b",
+			None,
+			b"a.py",
+		)
+		with patch(RUN_PATH) as run:
+			for rev in BAD_REVS:
+				with self.subTest(rev=rev):
+					with self.assertRaisesRegex(ValueError, "rev"):
+						source.git_blob(repo, rev, "a.py")
+			for rel in bad_rels:
+				with self.subTest(rel=rel):
+					with self.assertRaisesRegex(ValueError, "rel_in_repo"):
+						source.git_blob(repo, FAKE_HEAD, rel)
+			with self.assertRaisesRegex(ValueError, "repo_root"):
+				source.git_blob("relative", FAKE_HEAD, "a.py")
+		run.assert_not_called()
+
+	def test_git_is_ancestor_true_false_none(self):
+		sandbox = self.make_sandbox()
+		repo = sandbox.repo(APP)
+		older = self.head(sandbox)
+		newer = sandbox.commit_file(APP, "b.py", "b = 1\n")
+		self.assertIs(source.git_is_ancestor(repo, older, newer), True)
+		self.assertIs(source.git_is_ancestor(repo, older, older), True)
+		self.assertIs(source.git_is_ancestor(repo, newer, older), False)
+		self.assertIs(source.git_is_ancestor(repo, older, "HEAD"), True)
+		self.assertIsNone(source.git_is_ancestor(repo, MISSING_SHA, newer))
+		self.assertIsNone(source.git_is_ancestor(repo, newer, MISSING_SHA))
+		with patch(READ_GIT_PATH, wraps=source.run_git_read) as run:
+			source.git_is_ancestor(repo, older, newer)
+		run.assert_called_once_with(repo, "merge-base", "--is-ancestor", older, newer)
+		for bad in (
+			self.result(None, timed_out=True),
+			self.result(-9, timed_out=True),
+			self.result(None),
+			self.result(2),
+		):
+			with self.subTest(bad=bad):
+				with patch(READ_GIT_PATH, return_value=bad):
+					self.assertIsNone(source.git_is_ancestor(repo, older, newer))
+		with patch(RUN_PATH) as run:
+			for rev in BAD_REVS:
+				with self.subTest(older=rev):
+					with self.assertRaisesRegex(ValueError, "rev"):
+						source.git_is_ancestor(repo, rev, newer)
+				with self.subTest(newer=rev):
+					with self.assertRaisesRegex(ValueError, "rev"):
+						source.git_is_ancestor(repo, older, rev)
+		run.assert_not_called()

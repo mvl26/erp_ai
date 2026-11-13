@@ -72,6 +72,8 @@ GIT_DEFAULT_PATH = "/usr/bin:/bin"
 KILLED_EXIT_CODES = (-9, 124, 137)
 # ADR-022 QĐ 2: the diff option that makes diff-tree/rev-list write a file; git accepts unambiguous abbreviations.
 GIT_WRITE_OPTION = "--output"
+# arch-ruling-clean-filter.md (b): options that run a program declared in the repo config; never a read argument.
+GIT_PROGRAM_OPTIONS = ("--filters", "--textconv", "--ext-diff")
 # Design table 3.2: the git refusal sentences of read_git_state are a contract with the tests.
 GIT_NOT_REPO = "thư mục app không phải gốc một kho git"
 GIT_NO_COMMIT = "kho git của app chưa có commit nào"
@@ -81,6 +83,8 @@ GIT_IN_PROGRESS = "kho git đang dở merge, rebase, cherry-pick hoặc revert"
 GIT_IGNORED = "file đích bị git bỏ qua (.gitignore)"
 GIT_DIRTY = "file đích có thay đổi chưa commit"
 GIT_ERROR = "không đọc được trạng thái git"
+# Design 3.2 step 7: shown instead of an upstream name that looks like a URL (NFR-8).
+GIT_MASKED_UPSTREAM = "(remote không tên)"
 # index.lock first (GIT_LOCKED), then the files git leaves while an operation is in progress (GIT_IN_PROGRESS).
 GIT_STATE_FILES = (
 	"index.lock",
@@ -359,6 +363,11 @@ def git_env(*, identity: bool) -> dict[str, str]:
 	return env
 
 
+def _is_option(name: str, option: str) -> bool:
+	"""True when `name` is `option` or an abbreviation of it that git accepts (longer than `--`)."""
+	return name.startswith(option) or (len(name) > 2 and option.startswith(name))
+
+
 def _check_git_read_call(repo_root, subcommand, args, limit_s) -> None:
 	if not isinstance(subcommand, str) or subcommand not in GIT_READ_SUBCOMMANDS:
 		raise ValueError(f"git read subcommand not allowed: {subcommand!r}")
@@ -373,8 +382,10 @@ def _check_git_read_call(repo_root, subcommand, args, limit_s) -> None:
 		raise ValueError("every git argument must be a string without NUL")
 	for arg in args:
 		name = arg.split("=", 1)[0]
-		if name.startswith(GIT_WRITE_OPTION) or (len(name) > 2 and GIT_WRITE_OPTION.startswith(name)):
+		if _is_option(name, GIT_WRITE_OPTION):
 			raise ValueError(f"git argument not allowed, it writes a file: {name!r}")
+		if any(_is_option(name, option) for option in GIT_PROGRAM_OPTIONS):
+			raise ValueError(f"git argument not allowed, it runs a configured program: {name!r}")
 	if not isinstance(limit_s, int) or isinstance(limit_s, bool) or not 1 <= limit_s <= GIT_TIMEOUT_S:
 		raise ValueError(f"limit_s must be an integer from 1 to {GIT_TIMEOUT_S}: {limit_s!r}")
 
@@ -541,9 +552,168 @@ def read_git_state(full_path: str, *, new_file: bool, limit_s: int = GIT_TIMEOUT
 		return _git_refused(GIT_ERROR)
 	if status.stdout:
 		return _git_refused(GIT_DIRTY)
-	return GitState(
-		refusal=None, repo_root=repo_root, rel_in_repo=rel_in_repo, branch=branch[0], head=head[0]
+
+	# Step 7: the upstream from local remote refs only (no fetch); a URL-like name is masked (NFR-8).
+	upstream = _git_finished(
+		run_git_read(
+			repo_root, "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}", limit_s=limit_s
+		)
 	)
+	if upstream is None:
+		return _git_refused(GIT_ERROR)
+	upstream_ref, ahead_count = "", 0
+	if upstream.exit_code == 0:
+		ref = _git_lines(upstream)
+		if len(ref) != 1 or not ref[0]:
+			return _git_refused(GIT_ERROR)
+		upstream_ref = GIT_MASKED_UPSTREAM if "://" in ref[0] or "@" in ref[0] else ref[0]
+		ahead = _git_finished(
+			run_git_read(repo_root, "rev-list", "--count", "@{upstream}..HEAD", limit_s=limit_s)
+		)
+		if ahead is None or ahead.exit_code != 0:
+			return _git_refused(GIT_ERROR)
+		count = _git_lines(ahead)
+		if len(count) != 1 or not count[0].isascii() or not count[0].isdigit():
+			return _git_refused(GIT_ERROR)
+		ahead_count = int(count[0])
+	return GitState(
+		refusal=None,
+		repo_root=repo_root,
+		rel_in_repo=rel_in_repo,
+		branch=branch[0],
+		head=head[0],
+		upstream_ref=upstream_ref,
+		ahead_count=ahead_count,
+	)
+
+
+@dataclass(frozen=True)
+class CommitSummary:
+	commit: str
+	parents: tuple[str, ...]
+	paths: tuple[str, ...]  # paths HEAD changed against its own parent (diff-tree), sorted by git
+	branch: str | None  # None when HEAD is detached
+	author_email: str  # author email of the HEAD commit
+
+
+def _check_rev(rev) -> None:
+	if not isinstance(rev, str) or not (rev == "HEAD" or GIT_OBJECT_NAME.fullmatch(rev)):
+		raise ValueError(f"rev must be HEAD or a full object name: {rev!r}")
+
+
+def _check_rel_in_repo(rel_in_repo) -> None:
+	if (
+		not isinstance(rel_in_repo, str)
+		or not rel_in_repo
+		or "\0" in rel_in_repo
+		or any(part in ("", ".", "..") for part in rel_in_repo.split("/"))
+	):
+		raise ValueError(f"rel_in_repo must be a normalized relative path: {rel_in_repo!r}")
+
+
+def _git_failed(what: str) -> RuntimeError:
+	logger.warning("git %s could not be read", what)
+	return RuntimeError(f"{GIT_ERROR}: {what}")
+
+
+def git_head(repo_root: str) -> str | None:
+	"""The HEAD commit of repo_root; None when there is none or git could not tell (timeout, error)."""
+	run = _git_finished(run_git_read(repo_root, "rev-parse", "--verify", "-q", "HEAD"))
+	if run is None or run.exit_code != 0:
+		return None
+	head = _git_lines(run)
+	return head[0] if len(head) == 1 and GIT_OBJECT_NAME.fullmatch(head[0]) else None
+
+
+def git_commit_summary(repo_root: str) -> CommitSummary:
+	"""HEAD compared with its own parent (design 3.2, [Sửa vòng 2]); RuntimeError when git cannot be read.
+
+	Commit, parents and author email come from `rev-list` (diff-tree prints nothing for a merge); the
+	paths come from `diff-tree` of that commit, which lists none for a merge (two parents).
+	"""
+	meta = _git_finished(
+		run_git_read(repo_root, "rev-list", "-1", "--no-commit-header", "--format=%H%x00%P%x00%ae", "HEAD")
+	)
+	if meta is None or meta.exit_code != 0:
+		raise _git_failed("HEAD commit")
+	lines = _git_lines(meta)
+	fields = lines[0].split("\0") if len(lines) == 1 else []
+	if len(fields) != 3:
+		raise _git_failed("HEAD commit")
+	commit, parent_text, author_email = fields
+	parents = tuple(parent_text.split(" ")) if parent_text else ()
+	if not all(GIT_OBJECT_NAME.fullmatch(name) for name in (commit, *parents)):
+		raise _git_failed("HEAD commit")
+
+	changed = _git_finished(
+		run_git_read(
+			repo_root,
+			"diff-tree",
+			"-r",
+			"-z",
+			"--root",
+			"--no-commit-id",
+			"--no-renames",
+			"--name-only",
+			commit,
+		)
+	)
+	if changed is None or changed.exit_code != 0:
+		raise _git_failed("HEAD paths")
+	text = os.fsdecode(changed.stdout)
+	paths = tuple(text[:-1].split("\0")) if text else ()
+	if text and (not text.endswith("\0") or not all(paths)):
+		raise _git_failed("HEAD paths")
+
+	abbrev = _git_finished(run_git_read(repo_root, "rev-parse", "--abbrev-ref", "HEAD"))
+	if abbrev is None or abbrev.exit_code != 0:
+		raise _git_failed("HEAD branch")
+	branch = _git_lines(abbrev)
+	if len(branch) != 1 or not branch[0]:
+		raise _git_failed("HEAD branch")
+	return CommitSummary(
+		commit=commit,
+		parents=parents,
+		paths=paths,
+		branch=None if branch[0] == "HEAD" else branch[0],
+		author_email=author_email,
+	)
+
+
+def git_blob(repo_root: str, commit: str, rel_in_repo: str) -> bytes | None:
+	"""The bytes of rel_in_repo in the tree of commit; None when the path is not in that tree.
+
+	`<commit>:<rel>` is a tree path, not a pathspec (design-addendum-2 QĐ-A1). The commit is checked
+	first because git exits 128 both for a missing commit and for a missing path. A path that is not a
+	file (directory, submodule), a timeout or any other git error is a RuntimeError, never None.
+	"""
+	_check_rev(commit)
+	_check_rel_in_repo(rel_in_repo)
+	kind = _git_finished(run_git_read(repo_root, "cat-file", "-t", commit))
+	if kind is None or kind.exit_code != 0 or _git_lines(kind) != ["commit"]:
+		raise _git_failed("commit of blob")
+	spec = f"{commit}:{rel_in_repo}"
+	kind = _git_finished(run_git_read(repo_root, "cat-file", "-t", spec))
+	if kind is None or kind.exit_code not in (0, 128):
+		raise _git_failed("blob type")
+	if kind.exit_code == 128:
+		return None
+	if _git_lines(kind) != ["blob"]:
+		raise _git_failed("blob type")
+	blob = _git_finished(run_git_read(repo_root, "cat-file", "blob", spec))
+	if blob is None or blob.exit_code != 0:
+		raise _git_failed("blob")
+	return blob.stdout
+
+
+def git_is_ancestor(repo_root: str, older: str, newer: str) -> bool | None:
+	"""True when older is an ancestor of (or equal to) newer, False when not, None on any git error."""
+	_check_rev(older)
+	_check_rev(newer)
+	run = _git_finished(run_git_read(repo_root, "merge-base", "--is-ancestor", older, newer))
+	if run is None or run.exit_code not in (0, 1):
+		return None
+	return run.exit_code == 0
 
 
 TOOLS: list[ToolSpec] = [

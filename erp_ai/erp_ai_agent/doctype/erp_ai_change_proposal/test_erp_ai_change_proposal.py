@@ -1,4 +1,5 @@
 import json
+import re
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -9,7 +10,7 @@ import frappe.handler
 from frappe.tests.utils import FrappeTestCase
 from helpdesk.test_utils import create_agent, make_ticket, make_todo
 
-from erp_ai.agent import authority
+from erp_ai.agent import authority, change_text
 from erp_ai.agent.changes import transitions
 from erp_ai.constants import (
 	AGENT_USER,
@@ -813,3 +814,234 @@ class TestChangeProposalMethods(FrappeTestCase):
 			form = self._form_as(METHOD_INSTRUCTOR, command.name)
 			self.assertFalse(form.commit_message)
 			self.assertEqual(form.get("__onload").change_notes, ["Lệnh bench không hoàn tác được."])
+
+
+FORM_SCRIPT_PATH = Path(__file__).resolve().parent / "erp_ai_change_proposal.js"
+# The three whitelisted methods (design 3.3), written out by hand.
+APPROVE_PATH = "erp_ai.erp_ai_agent.doctype.erp_ai_change_proposal.erp_ai_change_proposal.approve"
+REJECT_PATH = "erp_ai.erp_ai_agent.doctype.erp_ai_change_proposal.erp_ai_change_proposal.reject"
+UNDO_PATH = "erp_ai.erp_ai_agent.doctype.erp_ai_change_proposal.erp_ai_change_proposal.undo"
+ROLE_CHECK = 'frappe.user.has_role("ERP AI Instructor")'
+
+
+def _without_comments(source: str) -> str:
+	"""The script text with `//` and `/* */` comments removed; string literals are kept as they are."""
+	return re.sub(
+		r'("(?:\\.|[^"\\\n])*")|/\*.*?\*/|//[^\n]*',
+		lambda match: match.group(1) or "",
+		source,
+		flags=re.DOTALL,
+	)
+
+
+def _statement(code: str) -> str:
+	"""Regex for `code` written in full, allowing any line breaks and indent the formatter adds."""
+	parts = []
+	for token in re.split(r"(\s+|[\(\)\[\]])", code):
+		if not token:
+			continue
+		if token.isspace():
+			parts.append(r"\s+")
+		elif token in "([":
+			parts.append(re.escape(token) + r"\s*")
+		elif token in ")]":
+			parts.append(r"\s*,?\s*" + re.escape(token))
+		else:
+			parts.append(re.escape(token))
+	return "".join(parts)
+
+
+def _button_pattern(label: str, method_path: str) -> str:
+	"""One `add_action_button(frm, __("<label>"), <confirm>, "<method>")` call site."""
+	return (
+		r'add_action_button\(\s*frm,\s*__\("'
+		+ re.escape(label)
+		+ r'"\),[^;]*?"'
+		+ re.escape(method_path)
+		+ r'"\s*\)'
+	)
+
+
+def _block_after(source: str, condition_pattern: str) -> str:
+	"""Body of the first `if (<condition>) { ... }` block, up to its closing brace at the same indent."""
+	match = re.search(r"\n(\t+)if \(\s*" + condition_pattern + r"\s*\) \{\n(.*?)\n\1\}", source, re.DOTALL)
+	return match.group(2) if match else ""
+
+
+class TestChangeProposalFormScript(FrappeTestCase):
+	"""Design 3.3 "Form Desk", AC-5, AC-22, ADR-022 QĐ 9: static rules on the form script text.
+
+	The buttons are only a convenience (AC-5): the server checks role and state again.
+	The real rendering is checked by hand after G4 (profile `ui: false`, dev-notes.md).
+	"""
+
+	def setUp(self):
+		if not FORM_SCRIPT_PATH.exists():
+			self.fail(f"form script missing: {FORM_SCRIPT_PATH.name}")
+		# Every static check reads code only: a call written inside a comment does not count.
+		self.source = _without_comments(FORM_SCRIPT_PATH.read_text(encoding="utf-8"))
+
+	def test_form_script_static_rules(self):
+		source = self.source
+		self.assertIn('frappe.ui.form.on("ERP AI Change Proposal", {', source)
+		self.assertIn("refresh(frm) {", source)
+
+		with self.subTest(rule="each method path once, wired to its own button"):
+			for label, method_path in (
+				("Duyệt", APPROVE_PATH),
+				("Từ chối", REJECT_PATH),
+				("Hoàn tác", UNDO_PATH),
+			):
+				self.assertEqual(source.count(f'"{method_path}"'), 1, method_path)
+				self.assertRegex(source, _button_pattern(label, method_path))
+
+		with self.subTest(rule="role check returns before any button"):
+			self.assertRegex(source, r"if \(!" + re.escape(ROLE_CHECK) + r"\) \{\s*return;\s*\}")
+			self.assertLess(source.index(ROLE_CHECK), source.index("add_action_button(frm,"))
+
+		with self.subTest(rule="Duyệt and Từ chối only when Chờ duyệt"):
+			pending = _block_after(source, r'frm\.doc\.change_status === "Chờ duyệt"')
+			self.assertRegex(pending, _button_pattern("Duyệt", APPROVE_PATH))
+			self.assertRegex(pending, _button_pattern("Từ chối", REJECT_PATH))
+			self.assertNotIn(UNDO_PATH, pending)
+
+		with self.subTest(rule="Hoàn tác only when Đã áp dụng and Thay đổi code"):
+			applied = _block_after(
+				source,
+				r'frm\.doc\.change_status === "Đã áp dụng" &&\s*frm\.doc\.change_kind === "Thay đổi code"',
+			)
+			self.assertRegex(applied, _button_pattern("Hoàn tác", UNDO_PATH))
+			self.assertNotIn(APPROVE_PATH, applied)
+			self.assertNotIn(REJECT_PATH, applied)
+
+		with self.subTest(rule="confirm, then POST call with name, then reload_doc"):
+			helper = re.search(
+				r"function add_action_button\(frm, label, message, method\) \{\n(.*?)\n\}", source, re.DOTALL
+			)
+			self.assertIsNotNone(helper, "add_action_button helper missing")
+			body = helper.group(1)
+			self.assertIn("frm.add_custom_button(label,", body)
+			for step in ("frappe.confirm(message,", "frappe.call({", "frm.reload_doc()"):
+				self.assertIn(step, body)
+			confirm_at = body.index("frappe.confirm(message,")
+			call_at = body.index("frappe.call({")
+			reload_at = body.index("frm.reload_doc()")
+			self.assertLess(confirm_at, call_at)
+			self.assertLess(call_at, reload_at)
+			call = body[call_at:reload_at]
+			self.assertIn("method,", call)
+			self.assertIn("args: { name: frm.doc.name },", call)
+			self.assertIn('type: "POST",', call)
+			self.assertRegex(body[call_at:], _statement("callback: () => frm.reload_doc(),"))
+			self.assertEqual(source.count("frm.reload_doc()"), 1)
+			self.assertEqual(source.count("frappe.call("), 1)
+			self.assertEqual(source.count('type: "POST"'), 1)
+			self.assertEqual(source.count("frappe.confirm("), 1)
+			self.assertEqual(source.count("frm.add_custom_button("), 1)
+
+		with self.subTest(rule="intro from __onload.change_notes, each line escaped"):
+			self.assertIn("frm.doc.__onload", source)
+			self.assertIn(".change_notes", source)
+			self.assertRegex(
+				source,
+				r'frm\.set_intro\(\s*notes\.map\(frappe\.utils\.escape_html\)\.join\("<br>"\),\s*'
+				r'frm\.doc\.is_core_app \? "orange" : "blue"\s*\)',
+			)
+			self.assertEqual(source.count("frm.set_intro("), 1)
+
+		with self.subTest(rule="approve confirmation repeats branch line and core warning, escaped"):
+			builder = re.search(
+				r"function approve_confirm_message\(frm, notes\) \{\n(.*?)\n\}", source, re.DOTALL
+			)
+			self.assertIsNotNone(builder, "approve_confirm_message missing")
+			body = builder.group(1)
+			self.assertIn("frm.doc.is_core_app", body)
+			self.assertIn(".map(frappe.utils.escape_html)", body)
+			self.assertRegex(
+				source,
+				r'__\("Duyệt"\),\s*approve_confirm_message\(frm, notes\),\s*"'
+				+ re.escape(APPROVE_PATH)
+				+ '"',
+			)
+			notes = change_text.proposal_notes(
+				{
+					"change_kind": CHANGE_KIND_CODE,
+					"app": "myapp",
+					"target_branch": "main",
+					"is_core_app": 1,
+					"file_path": "myapp/x.js",
+				}
+			)
+			for prefix_name, note_name in (
+				("BRANCH_NOTE_PREFIX", "Commit sẽ vào nhánh "),
+				("CORE_WARNING_PREFIX", "Cảnh báo app lõi: "),
+			):
+				literal = re.search(r"const " + prefix_name + r' = "([^"]+)";', source)
+				self.assertIsNotNone(literal, prefix_name)
+				self.assertEqual(literal.group(1), note_name)
+				self.assertTrue(any(note.startswith(literal.group(1)) for note in notes), literal.group(1))
+			self.assertRegex(
+				body,
+				_statement(
+					"const branch_note = notes.find((note) => note.startsWith(BRANCH_NOTE_PREFIX));"
+					" if (branch_note) { lines.push(branch_note); }"
+				),
+			)
+			self.assertRegex(
+				body,
+				_statement(
+					"const core_warning = notes.find((note) => note.startsWith(CORE_WARNING_PREFIX));"
+					' if (frm.doc.is_core_app && core_warning) { lines.push(core_warning.split(". ")[0] + "."); }'
+				),
+			)
+			self.assertRegex(body, _statement('return lines.map(frappe.utils.escape_html).join("<br>");'))
+			self.assertEqual(body.count("lines.push("), 2)
+
+		with self.subTest(rule="approve confirmation sentence follows change_kind"):
+			builder = re.search(
+				r"function approve_confirm_message\(frm, notes\) \{\n(.*?)\n\}", source, re.DOTALL
+			)
+			self.assertIsNotNone(builder, "approve_confirm_message missing")
+			body = builder.group(1)
+			command_note = "Lệnh bench không hoàn tác được."
+			self.assertIn(command_note, change_text.proposal_notes({"change_kind": CHANGE_KIND_COMMAND}))
+			# A bench command runs and cannot be undone; only a code change writes a file and commits.
+			self.assertRegex(
+				body,
+				_statement(
+					"const lines = frm.doc.change_kind === "
+					+ json.dumps(CHANGE_KIND_COMMAND, ensure_ascii=False)
+					+ ' ? [__("Duyệt đề xuất này? Lệnh bench sẽ chạy."), __('
+					+ json.dumps(command_note, ensure_ascii=False)
+					+ ')] : [__("Duyệt đề xuất này? File sẽ được ghi và có một commit.")];'
+				),
+			)
+			self.assertEqual(source.count("File sẽ được ghi"), 1)
+
+		with self.subTest(rule="Từ chối and Hoàn tác confirmations state what is written"):
+			pending = _block_after(source, r'frm\.doc\.change_status === "Chờ duyệt"')
+			self.assertNotIn("Không có gì được ghi", source)
+			self.assertIn("Không có file nào được ghi, không có lệnh nào chạy.", pending)
+			applied = _block_after(
+				source,
+				r'frm\.doc\.change_status === "Đã áp dụng" &&\s*frm\.doc\.change_kind === "Thay đổi code"',
+			)
+			self.assertNotIn("File được ghi lại như cũ", source)
+			self.assertIn("file mới thì bị xóa", applied)
+
+		with self.subTest(rule="no HTML built by concatenation"):
+			self.assertNotIn("`", source)
+			self.assertEqual(source.count('"<br>"'), source.count('.join("<br>")'))
+			# The only markup literal is the "<br>" separator between escaped lines.
+			self.assertNotRegex(source, r'"<(?!br>")')
+
+		for forbidden in (
+			"innerHTML",
+			"eval(",
+			"document.write",
+			".html(",
+			"outerHTML",
+			"insertAdjacentHTML",
+		):
+			with self.subTest(forbidden=forbidden):
+				self.assertNotIn(forbidden, source)

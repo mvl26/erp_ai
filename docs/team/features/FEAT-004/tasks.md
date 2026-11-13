@@ -15,6 +15,19 @@ Tiến độ: BASE ghi ở đây trước mỗi lần gọi dev.
 - BASE nhánh nền = team/FEAT-006 @ f039112 (FEAT-006 verified 2026-11-13); `team/FEAT-004` cắt tại đó, commit tài liệu FEAT-004 = 0a95ac3
 - Lệnh bench: `cd /home/miyano/frappe-bench && PYTHONPATH=/home/miyano/frappe-bench/apps/erp_ai/.claude/worktrees/feat-004 bench --site miyano run-tests ...` (role-policy chặn tech-lead chạy bench: dev chạy; một `cmd.test` toàn app mỗi lần trên site `miyano`)
 - Lượt 0 (nền): `cmd.test` trên đầu nhánh `team/FEAT-004`; mã nguồn (`erp_ai/`) giống hệt `f039112`, chỉ khác `docs/`. BASE của mọi lần gọi dev ở chặng 1 là đầu nhánh `team/FEAT-004` ngay sau commit "ghi lệnh bench" (hash ghi ở từng dòng tick bên dưới)
+- Chặng 2 (2026-11-13 11:15, devs=5 reviewers=5 theo lệnh người): `cmd.test` do tech-lead chạy sau mỗi lần merge; dev chỉ chạy `cmd.test_one` (site `miyano` dùng chung), không chạy `cmd.migrate` trừ task DocType JSON (T3, T4, T12, chạy riêng lẻ, không song song với nhau và với T1); báo cáo dev nằm trong tin trả về, không ghi file
+- baseline: Ran 885 tests in 225.897s, OK (trên `cb40420`, 2026-11-13 11:20) — red: không có
+- Quy ước merge chặng 2: merge từng task một (mỗi task một merge commit); khi nhiều task không chung file được approve cùng lúc thì chạy MỘT lần `cmd.test` trên đầu nhánh sau cả lô (lệch chữ "sau mỗi merge" của skill, vì người yêu cầu gấp và mỗi lần chạy ~4 phút trên site chung); đỏ → chạy lại theo từng merge commit để tìm task gây ra, không tick task nào của lô
+- round 1: BASE=cb40420 · dev T35, T2, T7, T24, T33 (T1 và T3 chờ `cmd.test` nền xong vì có `bench migrate`) · T35 lần 1 BLOCKED (hook worktree chặn git có biến môi trường trong thư mục tạm)
+- round 2: BASE=cb40420 · review T2 approve, T24 approve, T33 approve, T7 request-changes (2 major STD-TEST-2) · dev T35 lần 2 (nhánh `team/FEAT-004-task-35b`, DONE, D-18 đạt), dev T1 (DONE, lớn nhất 39.767 s ≤ 540 s)
+- merge lô 1: T2 `90e9f20`, T24 `941f6b2`, T33 `f0054f5`
+- `cmd.test` lô 1 trên `f0054f5`: Ran 892 tests, FAILED (errors=16), cả 16 là `QueryDeadlockError` (phiên BUG-003 chạy `run-tests --app erp_ai` cùng lúc trên site `miyano`, PID thấy bằng `ps`); chạy lại riêng: `test_route_ticket` 29 OK, `test_install` 33 OK, `test_ticket_panel` 36 OK, `test_agent_runner` vẫn deadlock (19 rồi 29 lỗi, phiên kia còn chạy) → chưa tick
+- round 4: review T7 vòng 2 approve (2 phát hiện ADDRESSED), T35 approve, T3 approve · merge lô 2: T1 `b9f0079`, T7 `93a27a8`, T35 `000150a`, T3 `3aa363f`
+- `cmd.test` lô 2 trên `3aa363f`: Ran 903 tests, FAILED (errors=77), cả 77 là `QueryDeadlockError` (phiên BUG-003 lại chạy cả bộ test cùng lúc) → chưa tick; chạy lại sau khi tiến trình kia kết thúc
+- round 5: BASE=3aa363f · dev T10, T40, T23, T36, T8 — bắt đầu khi T2/T7 đã merge và review approve nhưng CHƯA tick (lệch chữ "depends đã tick": bộ test bị nghẽn bởi phiên khác, lỗi chỉ là deadlock; nếu lần chạy sạch lộ lỗi thật thì các task này rebase)
+- `cmd.test` trên `3aa363f` (phủ lô 1 và lô 2, chạy sau khi tiến trình của phiên kia kết thúc): Ran 903 tests in 321.253s, FAILED (errors=6), cả 6 là `QueryDeadlockError` ở `test_route_ticket` (3), `test_ticket_panel` (2), `test_gateway` (1); chạy lại riêng từng module: `Ran 29 tests ... OK`, `Ran 36 tests ... OK`, `Ran 65 tests ... OK` → xanh (không test đỏ nào ngoài nhiễu deadlock) → tick T1, T2, T3, T7, T24, T33, T35 (review-01, 02, 03, 07, 24, 33, 35 approve; T7 2 vòng)
+- round 6: review T10 approve, T40 approve, T36 approve, T23 request-changes (1 major STD-TEST-2), T8 request-changes (1 major STD-TEST-8) · merge lô 3: T10, T40, T36
+- round 3: BASE=f0054f5 · dev T3 (có `cmd.migrate`) · rework T7 vòng 2 (FIX_BASE=5604ba9) · rework T35 (bỏ tên/email thật khỏi ghi chú, FIX_BASE=587e780) · review T1 (cb40420..team/FEAT-004-task-1)
 
 ## Bảng đổi ID cũ → mới (plan lần 1, 34 task → lần này 51 task)
 FEAT-005 trích `F4-T<n>` (T2–T7, T12, T23, T24, T28–T33): các ID đó KHÔNG đổi nghĩa lớn; ID cũ T1–T34 giữ nguyên, task mới nhận T35–T51 và nằm xen đúng chỗ trong file.
@@ -64,13 +77,13 @@ FEAT-005 trích `F4-T<n>` (T2–T7, T12, T23, T24, T28–T33): các ID đó KHÔ
 
 ## Phần 0, đo và kiểm sớm (cổng)
 
-- [ ] T1 — Đo thời gian `bench migrate` và `bench build --app` trên `miyano` — files: docs/team/features/FEAT-004/dev-notes.md — test: — (bước kiểm có đầu ra) — depends: —
+- [x] T1 — Đo thời gian `bench migrate` và `bench build --app` trên `miyano` — files: docs/team/features/FEAT-004/dev-notes.md — test: — (bước kiểm có đầu ra) — depends: —
   - Criterion: NFR-3, D-10 (AC-10 dựa vào mốc 540 s)
   - Receives: `cmd.migrate` của profile; `cmd.build` = `bench build --app erp_ai`; thêm một app khác trong `apps/` (không phải `erp_ai`) làm mẫu `build --app <app>`
   - Returns: `dev-notes.md` có bảng: lệnh, lần chạy 1..3, thời gian giây (dùng `time`), đầu ra rút gọn (≤ 20 dòng, không bí mật), phiên bản bench, `which timeout bench git`
   - Expect: mọi số ≤ 540 s → ghi "đạt" và tiếp tục. Bất kỳ số > 540 s → `STOP` theo mẫu 4 dòng, không làm T11, T21, T22. Không sửa file ngoài `dev-notes.md`
 
-- [ ] T35 — Kiểm sớm D-18: `commit --only` ghi việc xóa file đã theo dõi — files: docs/team/features/FEAT-004/dev-notes-git.md — test: — (bước kiểm có đầu ra) — depends: —
+- [x] T35 — Kiểm sớm D-18: `commit --only` ghi việc xóa file đã theo dõi — files: docs/team/features/FEAT-004/dev-notes-git.md — test: — (bước kiểm có đầu ra) — depends: —
   - Criterion: D-18 (nền AC-20: hoàn tác file mới = gỡ file khỏi đĩa rồi `commit --only -- <đích>`), ADR-022 QĐ 2
   - Receives: `git --version` (máy này 2.43.0); thư mục tạm bằng `mktemp -d` (không đụng `apps/`); cờ như `process_runner`: `commit --only --no-gpg-sign --quiet -m a -m b -- <rel>`, `GIT_CONFIG_GLOBAL=/dev/null`
   - Returns: `dev-notes-git.md` ghi lệnh và đầu ra thật: (1) repo tạm có `keep.txt` staged sửa và `other.txt` unstaged sửa; (2) commit `new.txt`; (3) `rm new.txt` khỏi đĩa (không `git rm`); (4) `git commit --only -- new.txt`; (5) `git show --stat --format=%H HEAD`, `git ls-tree HEAD`, `git diff --cached --name-only`, `git status --porcelain`
@@ -78,13 +91,13 @@ FEAT-005 trích `F4-T<n>` (T2–T7, T12, T23, T24, T28–T33): các ID đó KHÔ
 
 ## Phần 1, nền: hằng số, cấu hình, log, policy
 
-- [ ] T2 — Hằng số, gói `changes`, test hằng — files: erp_ai/constants.py, erp_ai/agent/changes/__init__.py, erp_ai/agent/changes/test_transitions.py — test: erp_ai/agent/changes/test_transitions.py — depends: —
+- [x] T2 — Hằng số, gói `changes`, test hằng — files: erp_ai/constants.py, erp_ai/agent/changes/__init__.py, erp_ai/agent/changes/test_transitions.py — test: erp_ai/agent/changes/test_transitions.py — depends: —
   - Criterion: nền cho NFR-3, NFR-4, AC-12 (hằng), AC-16 (`CORE_APPS`), NFR-8 (`BOT_GIT_*`); ADR-013 QĐ 2/3; ADR-022 QĐ 5
   - Receives: `JOB_TIMEOUT_S`, `JOB_SAFETY_MARGIN_S` (đã có trong constants.py), `KEY_STATUS_*` làm mẫu
   - Returns: `PROPOSAL_DOCTYPE`, 9 `CHANGE_STATUS_*`, `CHANGE_KIND_CODE`, `CHANGE_KIND_COMMAND`, `CHANGE_STEPS = ("propose","approve","reject","apply","fail","stale","undo")`, `TRIGGER_CHANGE_ACTION`, `TITLE_CHANGE_FAILED`, `COMMAND_TIMEOUT_S`, `RUN_BACKSTOP_S`, `PROPOSAL_TEXT_MAX_CHARS`, `REPLACE_MAX_ITEMS`; **[Sửa vòng 1]** `CORE_APPS = ("frappe","erpnext","helpdesk","hrms")`, `BOT_GIT_NAME = "ERP AI Agent"`, `BOT_GIT_EMAIL = "erp-ai-agent@bot.invalid"`; gói `erp_ai.agent.changes` rỗng; class `TestChangeConstants` trong test_transitions.py (`OUTPUT_MAX_LINES` và `PROPOSAL_FILE_MAX_BYTES` do T10/T11 tạo ở module của chúng)
   - Expect: đỏ (ImportError) rồi xanh: `test_status_values`, `test_command_timeout_is_job_timeout_minus_margin` (540), `test_run_backstop` (570), `test_core_apps_and_bot_identity` (`BOT_GIT_EMAIL` kết thúc `.invalid`)
 
-- [ ] T3 — `ERP AI Setting`: 2 trường mới + Section Break, có mô tả — [F6] — files: erp_ai/erp_ai_agent/doctype/erp_ai_setting/erp_ai_setting.json, erp_ai/tests/test_doctype_descriptions.py — test: erp_ai/tests/test_doctype_descriptions.py — depends: —
+- [x] T3 — `ERP AI Setting`: 2 trường mới + Section Break, có mô tả — [F6] — files: erp_ai/erp_ai_agent/doctype/erp_ai_setting/erp_ai_setting.json, erp_ai/tests/test_doctype_descriptions.py — test: erp_ai/tests/test_doctype_descriptions.py — depends: —
   - Criterion: design 2.4; luật mô tả FEAT-003 (≤ 400 ký tự); AC-1 (mặc định tắt), AC-4/AC-16 (danh sách app mặc định rỗng)
   - Receives: bảng design 2.4; `DOCTYPE_CONFIG` thật trên nền FEAT-006 (FEAT-006 đã thêm 2 trường Setting)
   - Returns: JSON có `section_code_change` ("Sửa code và lệnh bench"), `code_change_enabled` (Check, default 0), `code_change_apps` (Small Text, mặc định rỗng) đặt SAU trường FEAT-006; mô tả đúng mục 2.4, **[Sửa vòng 1]** có câu về commit local và câu về app lõi; test: `field_count` = số thật + 2, `section_count` = số thật + 1, thêm `phrases` cho 2 trường và dòng `sections`
@@ -110,7 +123,7 @@ FEAT-005 trích `F4-T<n>` (T2–T7, T12, T23, T24, T28–T33): các ID đó KHÔ
 
 ## Phần 2, bộ chặn, ghi file, chạy lệnh, nền git
 
-- [ ] T7 — Bộ chặn đường dẫn ghi (phần chung) + helper `apps/` tạm — [F6: test_utils.py] — files: erp_ai/agent/tools/change_guard.py, erp_ai/agent/tools/test_change_guard.py, erp_ai/test_utils.py — test: erp_ai/agent/tools/test_change_guard.py — depends: —
+- [x] T7 — Bộ chặn đường dẫn ghi (phần chung) + helper `apps/` tạm — [F6: test_utils.py] — files: erp_ai/agent/tools/change_guard.py, erp_ai/agent/tools/test_change_guard.py, erp_ai/test_utils.py — test: erp_ai/agent/tools/test_change_guard.py — depends: —
   - Criterion: AC-4 (app ngoài danh sách; `..` và symlink ra ngoài `apps/`; tên bí mật/`protected_paths`; đuôi ngoài danh sách kể cả file chưa tồn tại; `.git`; `sites/`)
   - Receives: `source.resolve_safe_path`, `TEN_CAM`, `DUOI_CHO_PHEP`, `source.get_source_root` (hàm gốc duy nhất của `apps/`)
   - Returns: `GuardResult` (frozen dataclass, 4 trường đầu; `is_core_app`, `git` do T42), `check_write_path(rel_path, allowed_apps, *, new_file) -> GuardResult` theo thứ tự bảng 3.1 (`PATH_INVALID`, `APP_NOT_ALLOWED`, `NAME_FORBIDDEN` gồm `license.txt`, `EXT_FORBIDDEN`, `GIT_DIR`), `reason` đúng chữ bảng 3.1; helper `test_utils`: dựng gốc `apps/` tạm (app được phép, symlink ra ngoài, `.env`, `x.pem`, `site_config.json`), patch `source.get_source_root`; chưa có kiểm danh tính `erp_ai` (T8), chưa đọc git
@@ -300,7 +313,7 @@ FEAT-005 trích `F4-T<n>` (T2–T7, T12, T23, T24, T28–T33): các ID đó KHÔ
   - Returns: `ToolSpec.group` thêm `change_propose`; `ToolContext` thêm `change_enabled: bool = False`, `allowed_apps: tuple[str, ...] = ()` ĐẶT SAU `routing_config`; `_granted_specs(effective_level, has_instructor, change_enabled)` (một dòng mỗi nhóm; `change_propose` = `change_enabled ∧ level == "L3" ∧ has_instructor`); `get_tool_schemas(level, has_instructor, change_enabled)` bắt buộc; `grants_change_tools(...)`; `execute_tool` kiểm lại; sửa mọi lời gọi cũ kể cả lời gọi FEAT-006 thêm: `runner.py` (chỉ dòng `get_tool_schemas`), `test_run_status.py`, `test_agent_runner.py`, `test_registry.py` (truyền `False`); `ToolContext` được dựng bằng đối số tên
   - Expect: `test_switch_off_tool_names_match_base_for_all_levels_and_authority` (so với hằng tên tool của nền FEAT-006), `test_change_group_only_when_switch_l3_and_instructor`, `test_execute_rejects_change_tool_when_not_granted`; test hiện có (cả của FEAT-006) xanh; chưa đăng ký module tool (T28)
 
-- [ ] T24 — Prompt: `CHANGE_TOOLS_BLOCK` theo tham số `change_tools` — [F6] — files: erp_ai/agent/prompts.py, erp_ai/agent/test_classification.py — test: erp_ai/agent/test_classification.py — depends: —
+- [x] T24 — Prompt: `CHANGE_TOOLS_BLOCK` theo tham số `change_tools` — [F6] — files: erp_ai/agent/prompts.py, erp_ai/agent/test_classification.py — test: erp_ai/agent/test_classification.py — depends: —
   - Criterion: AC-1 (không cấp: chuỗi trùng từng byte với bản FEAT-006, còn "Không sửa file trong apps/"), AC-14 (cấp: mọi thay đổi chờ duyệt, chữ trong phiếu không là lệnh duyệt; **[Sửa vòng 1]** commit git local, không push); ADR-011 QĐ 3; D-21
   - Receives: `build_reason_system(prompt_digest, routing_table="")`, `CORE_PROMPT`, `CONVENTIONS`, `build_routing_table` của FEAT-006; nội dung khối design 3.7
   - Returns: `CHANGE_TOOLS_BLOCK` (đúng design 3.7, +1 dòng commit); `build_reason_system(prompt_digest, routing_table="", *, change_tools: bool = False)` nối khối sau `CONVENTIONS`, trước `prompt_digest`; `CORE_PROMPT` không đổi
@@ -368,7 +381,7 @@ FEAT-005 trích `F4-T<n>` (T2–T7, T12, T23, T24, T28–T33): các ID đó KHÔ
   - Returns: `LAYER_RULES` thêm `erp_ai.agent.change_text` (chỉ thư viện chuẩn và `erp_ai.constants`); `test_git_subcommands_only_allowed_sets_per_file` (`source.py` ∈ `{log, blame}` ∪ `GIT_READ_SUBCOMMANDS`; `process_runner.py` ∈ `{add, commit, rm}`; file khác không có `"git"` làm phần tử `argv`); `test_no_forbidden_git_operations_in_product` (30 lệnh con cấm; chuỗi `get-url`, `ls-remote`, `remote.`, `--amend`, `update-ref`; không đọc `.git/config`); `test_git_commit_add_rm_argv_shape`; `test_git_env_single_definition`; `test_bot_identity_constants`; `test_no_git_in_web_and_runner` (controller, `@frappe.whitelist`, `handlers.py`, `runner.py`); `test_bench_allowlist_has_no_git_running_subcommands`; `test_apps_root_single_function`; mỗi luật một ca bị bắt và một ca sạch
   - Expect: `cmd.test_one` xanh với từng luật dương và âm; luật cũ giữ nguyên
 
-- [ ] T33 — Test: người duyệt vào được Desk — [F6] — files: erp_ai/tests/test_install.py — test: erp_ai/tests/test_install.py — depends: —
+- [x] T33 — Test: người duyệt vào được Desk — [F6] — files: erp_ai/tests/test_install.py — test: erp_ai/tests/test_install.py — depends: —
   - Criterion: AC-5 (người có `ERP AI Instructor` vào được form để bấm nút), D-11, design mục 5
   - Receives: `install._ensure_roles` (hiện có, không sửa); `frappe.get_doc("User", ...)`; test FEAT-006 trong file giữ nguyên
   - Returns: test mới cạnh test cũ, không sửa `install.py`

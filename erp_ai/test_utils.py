@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -7,10 +8,18 @@ from unittest.mock import patch
 
 import frappe
 from frappe.permissions import AUTOMATIC_ROLES
+from frappe.utils import get_bench_path
 from helpdesk.test_utils import create_agent
 
 from erp_ai.agent.run_log import write_entry
-from erp_ai.constants import AGENT_STATUS_EVENT, AGENT_USER, HELPDESK_AGENT_ROLE, ROLE_AGENT, SETTING_DOCTYPE
+from erp_ai.constants import (
+	AGENT_STATUS_EVENT,
+	AGENT_USER,
+	CORE_APPS,
+	HELPDESK_AGENT_ROLE,
+	ROLE_AGENT,
+	SETTING_DOCTYPE,
+)
 from erp_ai.gateway import GatewayError, ModelResult
 
 
@@ -330,6 +339,16 @@ class TempAppsRoot:
 GIT_SANDBOX_NAME = "ERP AI Test"
 GIT_SANDBOX_EMAIL = "erp-ai-test@sandbox.invalid"
 GIT_SANDBOX_TIMEOUT_S = 30
+GIT_SANDBOX_REMOTE_NAME = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]*")
+IN_PROGRESS_KINDS = ("MERGE_HEAD", "rebase-merge", "CHERRY_PICK_HEAD", "REVERT_HEAD")
+MARKER_HOOKS = (
+	"pre-commit",
+	"prepare-commit-msg",
+	"commit-msg",
+	"post-commit",
+	"post-index-change",
+	"reference-transaction",
+)
 
 
 class GitSandbox:
@@ -351,7 +370,9 @@ class GitSandbox:
 		self.base = os.path.realpath(tempfile.mkdtemp())
 		testcase.addCleanup(shutil.rmtree, self.base, True)
 		self.root = os.path.join(self.base, "apps")
+		self.no_hooks = os.path.join(self.base, "no-hooks")
 		os.makedirs(self.root)
+		os.makedirs(self.no_hooks)
 		for app in apps:
 			os.makedirs(self.repo(app))
 			self.git(app, "init", "--quiet", "--initial-branch=main")
@@ -371,6 +392,7 @@ class GitSandbox:
 			{
 				"GIT_CONFIG_GLOBAL": "/dev/null",
 				"GIT_CONFIG_NOSYSTEM": "1",
+				"GIT_CEILING_DIRECTORIES": self.root,
 				"GIT_AUTHOR_NAME": GIT_SANDBOX_NAME,
 				"GIT_AUTHOR_EMAIL": GIT_SANDBOX_EMAIL,
 				"GIT_COMMITTER_NAME": GIT_SANDBOX_NAME,
@@ -383,13 +405,24 @@ class GitSandbox:
 	def repo(self, app) -> str:
 		return os.path.join(self.root, app)
 
-	def git(self, app, *args) -> str:
-		"""Run `git <args>` in `repo(app)` and return stdout; refuse any directory outside the sandbox."""
-		cwd = os.path.realpath(self.repo(app))
-		if os.path.commonpath([self.base, cwd]) != self.base or cwd == self.base:
-			raise ValueError(f"GitSandbox refuses to run git outside {self.base}: {cwd}")
+	def _repo_dir(self, app) -> str:
+		"""Real path of `repo(app)`; refuse the root itself, anything outside it and a missing directory."""
+		path = os.path.realpath(self.repo(app))
+		if os.path.commonpath([self.root, path]) != self.root or path == self.root:
+			raise ValueError(f"GitSandbox refuses to work outside the repos under {self.root}: {path}")
+		if not os.path.isdir(path):
+			raise ValueError(f"GitSandbox has no repo {app}: {path}")
+		return path
+
+	def git(self, app, *args, run_hooks=False) -> str:
+		"""Run `git <args>` in `repo(app)` and return stdout; refuse any directory outside the sandbox repos.
+
+		Repo hooks run only with `run_hooks=True`; otherwise `core.hooksPath` is an empty temp dir.
+		"""
+		cwd = self._repo_dir(app)
+		hooks = () if run_hooks else ("-c", f"core.hooksPath={self.no_hooks}")
 		completed = subprocess.run(
-			["git", *args],
+			["git", *hooks, *args],
 			cwd=cwd,
 			env=self.env(),
 			stdin=subprocess.DEVNULL,
@@ -402,15 +435,34 @@ class GitSandbox:
 		return completed.stdout
 
 	def _write(self, app, rel, content) -> None:
-		path = os.path.join(self.repo(app), rel)
+		"""Write `content` to `rel` of `repo(app)`; refuse an `app` or a `rel` that resolves outside that repo."""
+		repo = self._repo_dir(app)
+		path = os.path.realpath(os.path.join(repo, rel))
+		if os.path.commonpath([repo, path]) != repo or path == repo:
+			raise ValueError(f"GitSandbox refuses to write outside {repo}: {rel!r}")
+		self._write_file(path, content)
+
+	@staticmethod
+	def _write_file(path, content) -> None:
 		os.makedirs(os.path.dirname(path), exist_ok=True)
 		with open(path, "wb") as handle:
 			handle.write(content if isinstance(content, bytes) else content.encode("utf-8"))
 
-	def commit_file(self, app, rel, content, *, message=None) -> str:
-		"""Write, add and commit one file; return the new commit sha."""
-		self.stage(app, rel, content)
-		self.git(app, "commit", "--quiet", "--no-gpg-sign", "-m", message or f"add {rel}", "--", rel)
+	def commit_file(self, app, rel, content, *, message=None, run_hooks=False) -> str:
+		"""Write, add and commit one file; return the new commit sha. Repo hooks run only with `run_hooks`."""
+		self._write(app, rel, content)
+		self.git(app, "add", "--", rel, run_hooks=run_hooks)
+		self.git(
+			app,
+			"commit",
+			"--quiet",
+			"--no-gpg-sign",
+			"-m",
+			message or f"add {rel}",
+			"--",
+			rel,
+			run_hooks=run_hooks,
+		)
 		return self.git(app, "rev-parse", "HEAD").strip()
 
 	def stage(self, app, rel, content) -> None:
@@ -428,3 +480,127 @@ class GitSandbox:
 	def log_meta(self, app, rev="HEAD") -> str:
 		"""Author name, author email, committer name, committer email and message of `rev`, one per line."""
 		return self.git(app, "log", "-1", "--format=format:%an%n%ae%n%cn%n%ce%n%B", rev)
+
+	def _git_path(self, app, name) -> str:
+		"""Absolute `git rev-parse --git-path <name>` of `app` (a worktree gets its own admin dir)."""
+		return self.git(app, "rev-parse", "--path-format=absolute", "--git-path", name).strip()
+
+	def remote_dir(self, app, name="origin") -> str:
+		"""The temp bare repo behind remote `name` of `app`; it lives under `base`, outside `root`.
+
+		`name` is one path component (`GIT_SANDBOX_REMOTE_NAME`), so the repo cannot leave `base`.
+		"""
+		if not GIT_SANDBOX_REMOTE_NAME.fullmatch(name):
+			raise ValueError(f"GitSandbox refuses remote name {name!r}")
+		return os.path.join(self.base, "remotes", app, f"{name}.git")
+
+	def add_remote(self, app, name="origin", url="https://x-token-FAKE@host/r.git", ahead=2) -> None:
+		"""Make `name/<branch>` the upstream of the checked-out branch, `ahead` local commits behind HEAD.
+
+		The remote is a temp bare repo filled by path; only the fake `url` is written to `.git/config`.
+		"""
+		if ahead < 0:
+			raise ValueError(f"ahead must be >= 0: {ahead}")
+		bare = self.remote_dir(app, name)
+		branch = self.git(app, "symbolic-ref", "--short", "HEAD").strip()
+		self.git(app, "init", "--quiet", "--bare", bare)
+		self.git(app, "push", "--quiet", bare, f"HEAD:refs/heads/{branch}")
+		self.git(app, "remote", "add", name, url)
+		self.git(app, "fetch", "--quiet", bare, f"+refs/heads/*:refs/remotes/{name}/*")
+		self.git(app, "branch", "--quiet", f"--set-upstream-to={name}/{branch}")
+		for number in range(1, ahead + 1):
+			self.commit_file(app, f"ahead_{number}.txt", f"{number}\n", message=f"ahead commit {number}")
+
+	def switch_branch(self, app, branch, *, create=True) -> None:
+		self.git(app, "switch", "--quiet", *(("-c",) if create else ()), branch)
+
+	def detach(self, app) -> None:
+		self.git(app, "switch", "--quiet", "--detach")
+
+	def mark_in_progress(self, app, kind) -> None:
+		"""Leave the state file git writes mid-operation: `MERGE_HEAD`, `CHERRY_PICK_HEAD`, `REVERT_HEAD`
+		(the HEAD sha) or the `rebase-merge` directory (`head-name`, `onto`)."""
+		if kind not in IN_PROGRESS_KINDS:
+			raise ValueError(f"unknown in-progress kind: {kind!r}")
+		head = self.git(app, "rev-parse", "HEAD")
+		path = self._git_path(app, kind)
+		if kind == "rebase-merge":
+			branch = self.git(app, "symbolic-ref", "HEAD")
+			os.makedirs(path, exist_ok=True)
+			self._write_file(os.path.join(path, "head-name"), branch)
+			self._write_file(os.path.join(path, "onto"), head)
+		else:
+			self._write_file(path, head)
+
+	def hold_index_lock(self, app) -> None:
+		"""Create `index.lock` as a concurrent git process would; later index writes fail."""
+		self._write_file(self._git_path(app, "index.lock"), "")
+
+	def install_marker_hooks(self, app) -> str:
+		"""Install `MARKER_HOOKS` in the repo's hooks dir; return the marker dir (under `base`).
+
+		Each hook touches `<markers>/<hook>`; `pre-commit` then refuses the commit. Helper commands never
+		run them (`git(..., run_hooks=False)`); a test passes `run_hooks=True` to run them. A repo and its
+		worktrees share one hooks dir, so a second install on it is refused.
+		"""
+		common = self.git(app, "rev-parse", "--path-format=absolute", "--git-common-dir").strip()
+		hooks_dir = os.path.join(common, "hooks")
+		if any(os.path.exists(os.path.join(hooks_dir, hook)) for hook in MARKER_HOOKS):
+			raise ValueError(f"GitSandbox marker hooks already installed in {hooks_dir}")
+		markers = os.path.join(self.base, "markers", app)
+		os.makedirs(markers)
+		os.makedirs(hooks_dir, exist_ok=True)
+		for hook in MARKER_HOOKS:
+			script = f'#!/bin/sh\ncat > /dev/null\ntouch "{markers}/{hook}"\n'
+			if hook == "pre-commit":
+				script += "exit 1\n"
+			path = os.path.join(hooks_dir, hook)
+			self._write_file(path, script)
+			os.chmod(path, 0o755)
+		return markers
+
+
+def real_core_repos_snapshot() -> dict:
+	"""`{app: (HEAD sha, status --porcelain)}` of the real core repos; read-only git, no optional locks."""
+	apps_dir = os.path.join(get_bench_path(), "apps")
+	env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
+	env["LC_ALL"] = "C"
+	snapshot = {}
+	for app in CORE_APPS:
+		outputs = []
+		for args in (("rev-parse", "HEAD"), ("status", "--porcelain")):
+			command = ["git", "-C", os.path.join(apps_dir, app), "--no-optional-locks", *args]
+			completed = subprocess.run(
+				command,
+				env=env,
+				stdin=subprocess.DEVNULL,
+				capture_output=True,
+				text=True,
+				timeout=GIT_SANDBOX_TIMEOUT_S,
+			)
+			if completed.returncode != 0:
+				raise AssertionError(f"{' '.join(command)} failed: {completed.stderr}")
+			outputs.append(completed.stdout)
+		snapshot[app] = (outputs[0].strip(), outputs[1])
+	return snapshot
+
+
+class RealCoreReposUntouchedMixin:
+	"""Fail the test class when HEAD or `status --porcelain` of a real core repo changed while it ran (NFR-9)."""
+
+	@classmethod
+	def setUpClass(cls):
+		cls._real_core_repos_before = real_core_repos_snapshot()
+		super().setUpClass()
+
+	@classmethod
+	def tearDownClass(cls):
+		super().tearDownClass()
+		after = real_core_repos_snapshot()
+		changed = [
+			f"{app}: {cls._real_core_repos_before[app]!r} -> {after.get(app)!r}"
+			for app in cls._real_core_repos_before
+			if after.get(app) != cls._real_core_repos_before[app]
+		]
+		if changed:
+			raise AssertionError("real core repos changed: " + "; ".join(changed))

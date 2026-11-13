@@ -3,37 +3,45 @@ disk and no command runs here. A person approves on the proposal form, then the 
 
 import difflib
 import hashlib
+import itertools
 import json
 import os
 
 import frappe
 
 from erp_ai.agent import change_link, change_text
-from erp_ai.agent.tools import change_guard
+from erp_ai.agent.tools import change_guard, source
 from erp_ai.agent.tools.registry import ToolContext, ToolSpec
 from erp_ai.constants import (
 	CHANGE_KIND_CODE,
 	CHANGE_KIND_COMMAND,
-	CHANGE_STATUS_PENDING,
 	PROPOSAL_DOCTYPE,
 	PROPOSAL_TEXT_MAX_CHARS,
 	REPLACE_MAX_ITEMS,
 )
 
 GROUP = "change_propose"
+PROPOSE_TOOL_NAMES = ("propose_file_change", "propose_new_file", "propose_bench_command")
 TICKET_DOCTYPE = "HD Ticket"
 REASON_MAX_CHARS = 1000
 PATH_MAX_CHARS = 300
 DIFF_CONTEXT_LINES = 3
+PROPOSAL_FILE_MAX_BYTES = source.SEARCH_FILE_MAX_BYTES
+COMMENT_DOCTYPE = "Comment"
 NO_INSTRUCTOR = "không có người ra lệnh"
-NO_CREATE_PERMISSION = "thiếu quyền tạo đề xuất"
-FILE_MISSING = "file không tồn tại; dùng propose_new_file để tạo file mới"
+# Design table 3.1: these sentences are the contract with the model and the tests.
+NO_PERMISSION = "thiếu quyền tạo đề xuất"
+NO_COMMENT_PERMISSION = "thiếu quyền tạo comment"
+NOT_FOUND = "file không tồn tại"
+TOO_LARGE = "file lớn hơn 1 MiB"
+NOT_UTF8 = "file không phải UTF-8"
+EDIT_SHAPE = f"find và replace phải cùng số phần tử, từ 1 đến {REPLACE_MAX_ITEMS}"
+EDIT_NOT_FOUND = "đoạn find[{index}] không có trong file"
+EDIT_AMBIGUOUS = "đoạn find[{index}] xuất hiện nhiều hơn một lần"
+EDIT_OVERLAP = "các đoạn find chồng nhau"
+NO_CHANGE = "nội dung sau trùng nội dung trước"
 FILE_EXISTS = "file đã tồn tại; dùng propose_file_change để sửa"
 FOLDER_MISSING = "thư mục chứa file chưa tồn tại"
-NOT_TEXT = "file không phải văn bản UTF-8"
-TOO_LONG = f"nội dung file vượt {PROPOSAL_TEXT_MAX_CHARS} ký tự"
-NO_CHANGE = "nội dung sau khi sửa giống hệt nội dung hiện tại"
-BAD_EDIT = "mỗi phần tử của edits phải là object có old và new là chuỗi, old không rỗng"
 
 
 def _fail(reason: str) -> dict:
@@ -48,26 +56,34 @@ def _entry_refusal(ctx: ToolContext) -> dict | None:
 	if not ctx.instructor:
 		return _fail(NO_INSTRUCTOR)
 	if not frappe.has_permission(PROPOSAL_DOCTYPE, "create"):
-		return _fail(NO_CREATE_PERMISSION)
+		return _fail(NO_PERMISSION)
+	if not frappe.has_permission(COMMENT_DOCTYPE, "create"):
+		return _fail(NO_COMMENT_PERMISSION)
 	return None
 
 
-def _apply_edits(text: str, edits: list) -> tuple[str | None, str | None]:
-	"""Apply each {old, new} once, in order; (new text, None) or (None, refusal reason)."""
-	for index, edit in enumerate(edits, start=1):
-		if (
-			not isinstance(edit, dict)
-			or set(edit) != {"old", "new"}
-			or not isinstance(edit["old"], str)
-			or not isinstance(edit["new"], str)
-			or not edit["old"]
-		):
-			return None, BAD_EDIT
-		count = text.count(edit["old"])
-		if count != 1:
-			return None, f"edits[{index}].old xuất hiện {count} lần trong file, cần đúng 1 lần"
-		text = text.replace(edit["old"], edit["new"])
-	return text, None
+def _apply_edits(text: str, find: list, replace: list) -> tuple[str | None, str | None]:
+	"""Replace each find[i] (exactly once in `text`, spans not overlapping) by replace[i], by position
+	on the original text (design 3.1); (new text, None) or (None, refusal reason)."""
+	if len(find) != len(replace) or not 1 <= len(find) <= REPLACE_MAX_ITEMS:
+		return None, EDIT_SHAPE
+	spans = []
+	for index, needle in enumerate(find):
+		start = text.find(needle)
+		if start < 0:
+			return None, EDIT_NOT_FOUND.format(index=index)
+		if text.find(needle, start + 1) >= 0:
+			return None, EDIT_AMBIGUOUS.format(index=index)
+		spans.append((start, start + len(needle), replace[index]))
+	spans.sort()
+	if any(end > next_start for (_, end, _), (next_start, _, _) in itertools.pairwise(spans)):
+		return None, EDIT_OVERLAP
+	pieces, cursor = [], 0
+	for start, end, new in spans:
+		pieces += [text[cursor:start], new]
+		cursor = end
+	pieces.append(text[cursor:])
+	return "".join(pieces), None
 
 
 def _diff(rel_path: str, before: str, after: str) -> str:
@@ -81,24 +97,27 @@ def _diff(rel_path: str, before: str, after: str) -> str:
 	return "".join(line if line.endswith("\n") else line + "\n" for line in lines)
 
 
-def _comment(ctx: ToolContext, proposal) -> None:
-	"""One ticket comment with the notes the reviewer needs (design 3.9) and the Duyệt / Từ chối links."""
+def _comment(ctx: ToolContext, proposal) -> str:
+	"""One ticket comment (design 3.8): the escaped first sentence, the notes of design 3.9 and the
+	Duyệt / Từ chối links; returns the Comment name."""
 	escape = frappe.utils.escape_html
-	target = proposal.file_path or " ".join(json.loads(proposal.command_args or "[]"))
-	lines = [
-		f"Đã tạo đề xuất {proposal.name} ({proposal.change_kind}: {target}), đang {CHANGE_STATUS_PENDING}.",
-		*change_text.proposal_notes(proposal),
-	]
+	if proposal.change_kind == CHANGE_KIND_CODE:
+		verb = "tạo" if proposal.is_new_file else "sửa"
+		target = f"{verb} <code>{escape(proposal.file_path)}</code>"
+	else:
+		args = " ".join(json.loads(proposal.command_args or "[]"))
+		target = f"lệnh <code>bench {escape(args)}</code>"
+	form = f"/app/erp-ai-change-proposal/{proposal.name}"
+	html = f'<p>Đề xuất <a href="{escape(form)}">{escape(proposal.name)}</a> đang chờ duyệt: {target}.</p>'
+	html += "".join(f"<p>{escape(line)}</p>" for line in change_text.proposal_notes(proposal))
 	approve = change_link.decision_path(proposal.name, change_link.ACTION_APPROVE)
 	reject = change_link.decision_path(proposal.name, change_link.ACTION_REJECT)
-	form = f"/app/erp-ai-change-proposal/{proposal.name}"
-	html = "".join(f"<p>{escape(line)}</p>" for line in lines)
 	html += (
 		f'<p><a href="{escape(approve)}"><strong>Duyệt</strong></a> · '
 		f'<a href="{escape(reject)}"><strong>Từ chối</strong></a> · '
 		f'<a href="{escape(form)}">Xem nội dung thay đổi</a></p>'
 	)
-	frappe.get_doc(TICKET_DOCTYPE, ctx.ticket_name).new_comment(html)
+	return frappe.get_doc(TICKET_DOCTYPE, ctx.ticket_name).new_comment(html)
 
 
 def _insert(ctx: ToolContext, values: dict) -> dict:
@@ -112,8 +131,8 @@ def _insert(ctx: ToolContext, values: dict) -> dict:
 		}
 	)
 	proposal.insert()
-	_comment(ctx, proposal)
-	return {"ok": True, "proposal": proposal.name, "status": proposal.change_status}
+	comment = _comment(ctx, proposal)
+	return {"ok": True, "proposal": proposal.name, "status": proposal.change_status, "comment": comment}
 
 
 def _code_values(guard, *, before: str | None, after: str, reason: str) -> dict:
@@ -144,23 +163,22 @@ def propose_file_change(args: dict, ctx: ToolContext) -> dict:
 	if guard.reason:
 		return _fail(guard.reason)
 	if not os.path.isfile(guard.full_path):
-		return _fail(FILE_MISSING)
+		return _fail(NOT_FOUND)
 	with open(guard.full_path, "rb") as handle:
-		data = handle.read(PROPOSAL_TEXT_MAX_CHARS * 4 + 1)
+		data = handle.read(PROPOSAL_FILE_MAX_BYTES + 1)
+	if len(data) > PROPOSAL_FILE_MAX_BYTES:
+		return _fail(TOO_LARGE)
 	try:
 		before = data.decode("utf-8")
 	except UnicodeDecodeError:
-		return _fail(NOT_TEXT)
-	if len(before) > PROPOSAL_TEXT_MAX_CHARS:
-		return _fail(TOO_LONG)
-	after, reason = _apply_edits(before, args["edits"])
+		return _fail(NOT_UTF8)
+	after, reason = _apply_edits(before, args["find"], args["replace"])
 	if reason:
 		return _fail(reason)
 	if after == before:
 		return _fail(NO_CHANGE)
-	if len(after) > PROPOSAL_TEXT_MAX_CHARS:
-		return _fail(TOO_LONG)
-	return _insert(ctx, _code_values(guard, before=before, after=after, reason=args["reason"]))
+	result = _insert(ctx, _code_values(guard, before=before, after=after, reason=args["reason"]))
+	return {**result, "branch": guard.git.branch}
 
 
 def propose_new_file(args: dict, ctx: ToolContext) -> dict:
@@ -196,6 +214,8 @@ def propose_bench_command(args: dict, ctx: ToolContext) -> dict:
 
 _PATH = {"type": "string", "minLength": 3, "maxLength": PATH_MAX_CHARS}
 _REASON = {"type": "string", "minLength": 1, "maxLength": REASON_MAX_CHARS}
+_FIND_ITEM = {"type": "string", "minLength": 1, "maxLength": PROPOSAL_TEXT_MAX_CHARS}
+_REPLACE_ITEM = {"type": "string", "maxLength": PROPOSAL_TEXT_MAX_CHARS}
 
 TOOLS: list[ToolSpec] = [
 	ToolSpec(
@@ -205,17 +225,19 @@ TOOLS: list[ToolSpec] = [
 			"name": "propose_file_change",
 			"description": (
 				"Tạo đề xuất sửa một file đã có trong apps/ (đường dẫn tính từ apps/, ví dụ "
-				"helpdesk/helpdesk/api/ticket.py). edits là danh sách {old, new}: mỗi old phải xuất hiện "
-				"đúng 1 lần trong file. Chỉ tạo đề xuất Chờ duyệt, chưa ghi gì xuống đĩa."
+				"helpdesk/helpdesk/api/ticket.py). find và replace là hai mảng cùng số phần tử: mỗi find[i] "
+				"phải xuất hiện đúng 1 lần trong file, các đoạn find không chồng nhau, và được thay bằng "
+				"replace[i]. Chỉ tạo đề xuất Chờ duyệt, chưa ghi gì xuống đĩa."
 			),
 			"input_schema": {
 				"type": "object",
 				"properties": {
 					"path": _PATH,
-					"edits": {"type": "array", "maxItems": REPLACE_MAX_ITEMS, "items": {"type": "object"}},
+					"find": {"type": "array", "maxItems": REPLACE_MAX_ITEMS, "items": _FIND_ITEM},
+					"replace": {"type": "array", "maxItems": REPLACE_MAX_ITEMS, "items": _REPLACE_ITEM},
 					"reason": _REASON,
 				},
-				"required": ["path", "edits", "reason"],
+				"required": ["path", "find", "replace", "reason"],
 			},
 		},
 		handler=propose_file_change,

@@ -727,6 +727,35 @@ class TestChangeProposalMethods(FrappeTestCase):
 						METHOD_INSTRUCTOR, method, name, frappe.DoesNotExistError, message, proposal=witness
 					)
 
+	def test_methods_missing_name_is_not_found(self):
+		"""Design 3.3 error table after addendum 3 QĐ-B6: `name` missing, not a string or unknown → 404.
+
+		Called the way Frappe's handler does (`frappe.call` with the form dict) on the whitelisted function,
+		so the wrapper's type validation runs (`in_test`) and a missing `name` reaches the method.
+		"""
+		cases = (
+			({}, "Không có đề xuất "),
+			({"name": None}, "Không có đề xuất "),
+			({"name": 123}, "Không có đề xuất 123"),
+			({"name": ["<x>"]}, "Không có đề xuất [&apos;&lt;x&gt;&apos;]"),
+		)
+		witness = _proposal_in(CHANGE_STATUS_PENDING)
+		self.assertTrue(frappe.flags.in_test)
+		for method in METHOD_NAMES:
+			for form_dict, message in cases:
+				with self.subTest(method=method, form_dict=form_dict):
+					before = self._snapshot(witness)
+					frappe.set_user(METHOD_INSTRUCTOR)
+					try:
+						with self.assertRaises(frappe.DoesNotExistError) as caught:
+							frappe.call(f"{METHOD_MODULE}.{method}", **form_dict)
+					finally:
+						frappe.set_user("Administrator")
+					self.assertIs(type(caught.exception), frappe.DoesNotExistError)
+					self.assertEqual(str(caught.exception), message)
+					self.assertEqual(self._snapshot(witness), before)
+					self.assertEqual(self._change_jobs(), [])
+
 	def _form_as(self, user, name):
 		"""The document Desk receives from `getdoc` for `user` (design 3.3 form data)."""
 		frappe.set_user(user)

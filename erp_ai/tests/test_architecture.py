@@ -111,6 +111,10 @@ LOG_SINK_METHODS = ("debug", "info", "warning", "error", "exception", "critical"
 STATUS_SCRIPT_FILE = "public/js/agent_status_indicator.js"
 STATUS_INDICATOR_VISIBILITY = "setIndicatorVisible"
 STATUS_INDICATOR_FUNCTIONS = ("ensureElement", "render", "reset", "dockIndicator")
+# `el.style.display = …` or `Object.assign(el.style, …, { display: … })` on the indicator itself.
+STATUS_INDICATOR_DISPLAY_WRITE = re.compile(
+	r"\b(?:state\.)?el\.style\.display\s*=(?!=)|Object\.assign\((?:state\.)?el\.style\b[^;]*?\bdisplay\s*:"
+)
 CONSTANTS_FILE = "constants.py"
 # Design 3.7: Helpdesk loads the page script through `new Function`, so none of these may appear in it.
 STATUS_SCRIPT_FORBIDDEN = (
@@ -1318,6 +1322,18 @@ def check_status_indicator_hides(script: str) -> list:
 				f"line {js_line(script, start + match.start())}: {name} sets hidden without display,"
 				" an inline display keeps the indicator on screen"
 			)
+		for match in STATUS_INDICATOR_DISPLAY_WRITE.finditer(masked[start:end]):
+			violations.append(
+				f"line {js_line(script, start + match.start())}: {name} writes display outside {helper}"
+			)
+	if spans.get("render"):
+		body = masked[spans["render"][0] : spans["render"][1]]
+		if not re.search(
+			rf"if \(state\.runs\.size === 0\) \{{\s*{helper}\(el, false\);\s*return;\s*\}}", body
+		):
+			violations.append("render does not hide the indicator when no run is active")
+		if not body.rstrip().endswith(f"{helper}(el, true);"):
+			violations.append(f"render does not end with {helper}(el, true)")
 	if spans.get("ensureElement"):
 		body = masked[spans["ensureElement"][0] : spans["ensureElement"][1]]
 		hide_at = body.rfind(f"{helper}(el, false)")
@@ -2395,7 +2411,10 @@ class TestScannersCatchViolations(unittest.TestCase):
 			"\tsetIndicatorVisible(el, false);\n"
 			"};\n"
 			"const render = () => {\n"
-			"\tif (x) { setIndicatorVisible(el, false); return; }\n"
+			"\tif (state.runs.size === 0) {\n"
+			"\t\tsetIndicatorVisible(el, false);\n"
+			"\t\treturn;\n"
+			"\t}\n"
 			"\tsetIndicatorVisible(el, true);\n"
 			"};\n"
 			"const dockIndicator = (docked) => {\n"
@@ -2426,6 +2445,36 @@ class TestScannersCatchViolations(unittest.TestCase):
 			),
 			('\tel.style.display = visible ? "flex" : "none";\n', "", "setIndicatorVisible does not write"),
 			("const dockIndicator = (docked)", "const dock = (docked)", "function dockIndicator is missing"),
+			(
+				"\t\tsetIndicatorVisible(el, false);\n\t\treturn;\n\t}\n\tsetIndicatorVisible(el, true);\n",
+				"\t\tsetIndicatorVisible(el, true);\n\t\treturn;\n\t}\n\tsetIndicatorVisible(el, false);\n",
+				"render does not hide the indicator when no run is active",
+			),
+			(
+				"\t\tsetIndicatorVisible(el, false);\n\t\treturn;\n\t}\n\tsetIndicatorVisible(el, true);\n",
+				"\t\tsetIndicatorVisible(el, true);\n\t\treturn;\n\t}\n\tsetIndicatorVisible(el, false);\n",
+				"render does not end with setIndicatorVisible(el, true)",
+			),
+			(
+				"\tsetIndicatorVisible(el, true);\n};",
+				"\tsetIndicatorVisible(el, true);\n\tel.title = name;\n};",
+				"render does not end with setIndicatorVisible(el, true)",
+			),
+			(
+				"if (state.el) { setIndicatorVisible(state.el, false); }",
+				"if (state.el) { state.el.remove(); }",
+				"reset does not call setIndicatorVisible(state.el, false)",
+			),
+			(
+				"\tsetIndicatorVisible(el, true);\n};",
+				'\tsetIndicatorVisible(el, true);\n\tel.style.display = "flex";\n};',
+				"render writes display outside setIndicatorVisible",
+			),
+			(
+				"Object.assign(el.style, INDICATOR_DOCKED_STYLE);",
+				'Object.assign(el.style, INDICATOR_DOCKED_STYLE, { display: "flex" });',
+				"dockIndicator writes display outside setIndicatorVisible",
+			),
 		):
 			with self.subTest(fragment=fragment):
 				self.assertIn(old, good)

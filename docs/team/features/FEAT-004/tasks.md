@@ -13,6 +13,8 @@ Mỗi task 2–5 phút. Hai task chung file thì phụ thuộc nhau. Đánh dấ
 Nhánh nền: **`team/FEAT-006 (hash at build time)`**. Build chỉ bắt đầu sau khi FEAT-006 qua verify; tech-lead tạo `team/FEAT-004` từ đầu nhánh đó, ghi mã commit thật vào dòng dưới và chạy `cmd.test` trước T1.
 Tiến độ: BASE ghi ở đây trước mỗi lần gọi dev.
 - BASE nhánh nền = team/FEAT-006 @ f039112 (FEAT-006 verified 2026-11-13); `team/FEAT-004` cắt tại đó, commit tài liệu FEAT-004 = 0a95ac3
+- Lệnh bench: `cd /home/miyano/frappe-bench && PYTHONPATH=/home/miyano/frappe-bench/apps/erp_ai/.claude/worktrees/feat-004 bench --site miyano run-tests ...` (role-policy chặn tech-lead chạy bench: dev chạy; một `cmd.test` toàn app mỗi lần trên site `miyano`)
+- Lượt 0 (nền): `cmd.test` trên đầu nhánh `team/FEAT-004`; mã nguồn (`erp_ai/`) giống hệt `f039112`, chỉ khác `docs/`. BASE của mọi lần gọi dev ở chặng 1 là đầu nhánh `team/FEAT-004` ngay sau commit "ghi lệnh bench" (hash ghi ở từng dòng tick bên dưới)
 
 ## Bảng đổi ID cũ → mới (plan lần 1, 34 task → lần này 51 task)
 FEAT-005 trích `F4-T<n>` (T2–T7, T12, T23, T24, T28–T33): các ID đó KHÔNG đổi nghĩa lớn; ID cũ T1–T34 giữ nguyên, task mới nhận T35–T51 và nằm xen đúng chỗ trong file.

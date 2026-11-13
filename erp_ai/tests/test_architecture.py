@@ -33,6 +33,7 @@ QUEUE_FILE = "agent/queue.py"
 POLICY_FILE = "agent/policy.py"
 SOURCE_TOOL_FILE = "agent/tools/source.py"
 PROCESS_RUNNER_FILE = "agent/changes/process_runner.py"
+PROCESS_RUNNER_WRAPPER = "_run_wrapped"  # its callers pass cwd=/env= through to subprocess.run
 # ADR-013, ADR-022, D-12: the only files that start processes.
 SUBPROCESS_FILES = (SOURCE_TOOL_FILE, PROCESS_RUNNER_FILE)
 READ_TOOL_FILE = "agent/tools/read.py"
@@ -648,6 +649,12 @@ def subprocess_call_shape_problems(rel: str, source: str) -> list:
 		if not isinstance(node, ast.Call):
 			continue
 		name = resolved_name(node.func, aliases)
+		if rel == PROCESS_RUNNER_FILE and name == PROCESS_RUNNER_WRAPPER:
+			keywords = {keyword.arg: keyword.value for keyword in node.keywords}
+			violations.extend(
+				violation(rel, node, f"{name} {problem}") for problem in cwd_env_problems(keywords, aliases)
+			)
+			continue
 		if not name.startswith("subprocess.") or name.split(".")[-1] not in (
 			*SUBPROCESS_RUN_FUNCTIONS,
 			"Popen",
@@ -686,6 +693,12 @@ def timeout_wrapped_call_problems(keywords: dict, aliases: dict) -> list:
 	group = keywords.get("start_new_session")
 	if not (isinstance(group, ast.Constant) and group.value is True):
 		problems.append("without start_new_session=True")
+	return problems + cwd_env_problems(keywords, aliases)
+
+
+def cwd_env_problems(keywords: dict, aliases: dict) -> list:
+	"""An explicit cwd= and an env= that never copies os.environ (ADR-022 QĐ 4; design 8.2)."""
+	problems = []
 	if "cwd" not in keywords:
 		problems.append("without cwd=")
 	env = keywords.get("env")
@@ -2355,6 +2368,62 @@ class TestScannersCatchViolations(unittest.TestCase):
 			"without cwd=",
 			"without start_new_session=True",
 		)
+
+	def test_subprocess_call_shape_accepts_git_writes_in_process_runner(self):
+		"""ADR-022 QĐ 2, 4: the git add/commit/rm call of process_runner.py passes the shape rule."""
+		head = (
+			"import subprocess\nsubprocess.run([source.TIMEOUT_EXECUTABLE, '-s', 'KILL', '5', 'git', "
+			"*source.git_global_options(read=False), 'add', '--', rel], timeout=10, cwd=repo_root"
+		)
+		good = f"{head}, env=source.git_env(identity=True), start_new_session=True)\n"
+		self.assertEqual(check_subprocess_call_shape({SOURCE_TOOL_FILE: "", PROCESS_RUNNER_FILE: good}), [])
+		self.assertEqual(check_subprocess_only_in_source_tool({PROCESS_RUNNER_FILE: good}), [])
+		cases = (
+			("without start_new_session=True", f"{head}, env=source.git_env(identity=True))\n"),
+			("without env=", f"{head}, start_new_session=True)\n"),
+			(
+				"env= uses os.environ",
+				f"import os\n{head}, env={{**os.environ, **source.git_env(identity=True)}}, start_new_session=True)\n",
+			),
+		)
+		for fragment, source in cases:
+			with self.subTest(fragment=fragment):
+				self.assertCaught(
+					check_subprocess_call_shape({SOURCE_TOOL_FILE: "", PROCESS_RUNNER_FILE: source}), fragment
+				)
+
+	def test_subprocess_call_shape_checks_run_wrapped_callers_in_process_runner(self):
+		"""Design 8.2 "env= không chứa os.environ": process_runner.py builds cwd=/env= in its
+		`_run_wrapped(...)` callers, so each caller gets the same cwd=/env= checks as subprocess.run."""
+		head = "import os\nimport subprocess\n_run_wrapped(['git', 'add', '--', rel], limit_s=5"
+		for env in ("source.git_env(identity=True)", "_minimal_env()"):
+			good = f"{head}, cwd=repo_root, env={env}, backstop_s=5, max_lines=20)\n"
+			with self.subTest(good=good):
+				self.assertEqual(
+					check_subprocess_call_shape({SOURCE_TOOL_FILE: "", PROCESS_RUNNER_FILE: good}), []
+				)
+		cases = (
+			("_run_wrapped without cwd=", f"{head}, env=_minimal_env())\n"),
+			("_run_wrapped without env=", f"{head}, cwd=repo_root)\n"),
+			("_run_wrapped without env=", f"{head}, **options)\n"),
+			("_run_wrapped env= uses os.environ", f"{head}, cwd=repo_root, env=os.environ)\n"),
+			("_run_wrapped env= uses os.environ", f"{head}, cwd=repo_root, env=dict(os.environ))\n"),
+			(
+				"_run_wrapped env= uses os.environ",
+				f"{head}, cwd=repo_root, env={{**os.environ, **source.git_env(identity=True)}})\n",
+			),
+			(
+				"_run_wrapped env= uses os.environ",
+				"from os import environ\n_run_wrapped(['bench'], cwd=r, env=dict(environ), limit_s=5)\n",
+			),
+		)
+		for fragment, source in cases:
+			with self.subTest(fragment=fragment, source=source):
+				violations = check_subprocess_call_shape({SOURCE_TOOL_FILE: "", PROCESS_RUNNER_FILE: source})
+				self.assertCaught(violations, fragment)
+				self.assertTrue(all(text.startswith(PROCESS_RUNNER_FILE) for text in violations), violations)
+		elsewhere = f"{head}, cwd=repo_root, env=os.environ)\n"
+		self.assertEqual(check_subprocess_call_shape({SOURCE_TOOL_FILE: elsewhere}), [])
 
 	# policy fields -----------------------------------------------------------------------------
 

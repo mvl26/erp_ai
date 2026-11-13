@@ -27,6 +27,9 @@ Tiến độ: BASE ghi ở đây trước mỗi lần gọi dev.
 - round 5: BASE=3aa363f · dev T10, T40, T23, T36, T8 — bắt đầu khi T2/T7 đã merge và review approve nhưng CHƯA tick (lệch chữ "depends đã tick": bộ test bị nghẽn bởi phiên khác, lỗi chỉ là deadlock; nếu lần chạy sạch lộ lỗi thật thì các task này rebase)
 - `cmd.test` trên `3aa363f` (phủ lô 1 và lô 2, chạy sau khi tiến trình của phiên kia kết thúc): Ran 903 tests in 321.253s, FAILED (errors=6), cả 6 là `QueryDeadlockError` ở `test_route_ticket` (3), `test_ticket_panel` (2), `test_gateway` (1); chạy lại riêng từng module: `Ran 29 tests ... OK`, `Ran 36 tests ... OK`, `Ran 65 tests ... OK` → xanh (không test đỏ nào ngoài nhiễu deadlock) → tick T1, T2, T3, T7, T24, T33, T35 (review-01, 02, 03, 07, 24, 33, 35 approve; T7 2 vòng)
 - round 6: review T10 approve, T40 approve, T36 approve, T23 request-changes (1 major STD-TEST-2), T8 request-changes (1 major STD-TEST-8) · merge lô 3: T10, T40, T36
+- `cmd.test` lô 3 trên `66ddf58`: `Ran 924 tests in 211.667s` / `OK` → tick T10, T40, T36 (review-10, 40, 36 approve, 1 vòng)
+- round 8: review T41 approve, T23 vòng 2 approve (ADDRESSED), T8 vòng 2 approve (ADDRESSED), T51 request-changes (1 major STD-ERR-2) · merge lô 4: T41, T23, T8
+- round 7: BASE=66ddf58 · dev T41, T51 · rework T23 vòng 2 (FIX_BASE=992a489) · rework T8 vòng 2 (FIX_BASE=9b2a7fc) · `cmd.test` lô 3 chạy nền trên `66ddf58`
 - round 3: BASE=f0054f5 · dev T3 (có `cmd.migrate`) · rework T7 vòng 2 (FIX_BASE=5604ba9) · rework T35 (bỏ tên/email thật khỏi ghi chú, FIX_BASE=587e780) · review T1 (cb40420..team/FEAT-004-task-1)
 
 ## Bảng đổi ID cũ → mới (plan lần 1, 34 task → lần này 51 task)
@@ -129,7 +132,7 @@ FEAT-005 trích `F4-T<n>` (T2–T7, T12, T23, T24, T28–T33): các ID đó KHÔ
   - Returns: `GuardResult` (frozen dataclass, 4 trường đầu; `is_core_app`, `git` do T42), `check_write_path(rel_path, allowed_apps, *, new_file) -> GuardResult` theo thứ tự bảng 3.1 (`PATH_INVALID`, `APP_NOT_ALLOWED`, `NAME_FORBIDDEN` gồm `license.txt`, `EXT_FORBIDDEN`, `GIT_DIR`), `reason` đúng chữ bảng 3.1; helper `test_utils`: dựng gốc `apps/` tạm (app được phép, symlink ra ngoài, `.env`, `x.pem`, `site_config.json`), patch `source.get_source_root`; chưa có kiểm danh tính `erp_ai` (T8), chưa đọc git
   - Expect: đỏ rồi xanh: `test_refuses_app_not_in_allowed_list`, `test_refuses_escape_with_dotdot_and_symlink`, `test_refuses_secret_and_protected_names`, `test_refuses_extension_outside_read_list_even_for_new_file`, `test_refuses_git_dir_component`, `test_allows_file_in_allowed_app`; không đụng `apps/` thật
 
-- [ ] T36 — `GitSandbox` phần lõi: repo git tạm, thay gốc `apps/` — [F6: test_utils.py] — files: erp_ai/test_utils.py, erp_ai/agent/tools/test_source.py — test: erp_ai/agent/tools/test_source.py — depends: T7
+- [x] T36 — `GitSandbox` phần lõi: repo git tạm, thay gốc `apps/` — [F6: test_utils.py] — files: erp_ai/test_utils.py, erp_ai/agent/tools/test_source.py — test: erp_ai/agent/tools/test_source.py — depends: T7
   - Criterion: NFR-9, ADR-022 QĐ 8; nền cho mọi test git (AC-16..AC-23)
   - Receives: design 8.5; `source.get_source_root` (patch); helper `apps/` tạm của T7 (không đổi hành vi); không phải file sản phẩm nên được gọi `subprocess` để dựng repo
   - Returns: `GitSandbox(testcase, apps=("frappe","erpnext","helpdesk","hrms","erp_ai","custom_app"), *, erp_ai_worktree="erp_ai-wt")` với `root`, `repo(app)`, `commit_file(app, rel, content) -> sha`, `stage`, `write_unstaged`, `refs(app)`, `log_meta(app, rev="HEAD")`; mỗi repo có commit đầu và nhánh `main`; lệnh git của helper dùng `GIT_CONFIG_GLOBAL=/dev/null`, `GIT_CONFIG_NOSYSTEM=1`, danh tính test cố định; thư mục tạm dưới `tempfile.mkdtemp()`, `addCleanup` xóa; `patch` `source.get_source_root` trong `setUp`; repo `erp_ai-wt` là worktree thật (`.git` là file + `commondir`). Các hàm còn lại của design 8.5 do T51
@@ -171,7 +174,7 @@ FEAT-005 trích `F4-T<n>` (T2–T7, T12, T23, T24, T28–T33): các ID đó KHÔ
   - Returns: `build_bench_args(command, app, allowed_apps, site) -> list[str] | str` (str = reason: `lệnh build cần app` / `lệnh này không nhận app` / lý do app); `check_bench_args(args, allowed_apps, site) -> str | None` 4 bước theo thứ tự (`đối số chứa ký tự điều khiển shell`, `cờ --force bị cấm`, `chỉ chạy cho site đang chạy`, `lệnh không có trong danh sách cho phép`, so khớp ĐÚNG một dạng); danh sách cấm 23 tên (thêm `switch-to-branch`, `new-app`, `init`)
   - Expect: `test_bench_args_refuse_every_a6_denied_command` (đủ 23 tên), `test_bench_args_refuse_shell_metacharacters`, `test_bench_args_refuse_other_site_and_force`, `test_bench_args_refuse_unlisted_and_build_of_disallowed_app`, `test_build_args_for_each_allowed_command`
 
-- [ ] T10 — `file_writer`: ghi nguyên tử, gỡ file đã tạo — files: erp_ai/agent/changes/file_writer.py, erp_ai/agent/changes/test_file_writer.py — test: erp_ai/agent/changes/test_file_writer.py — depends: T2
+- [x] T10 — `file_writer`: ghi nguyên tử, gỡ file đã tạo — files: erp_ai/agent/changes/file_writer.py, erp_ai/agent/changes/test_file_writer.py — test: erp_ai/agent/changes/test_file_writer.py — depends: T2
   - Criterion: AC-6, AC-7 (từng byte; hoàn tác file mới = gỡ), NFR-2; ADR-013 QĐ 6
   - Receives: gói `changes` (T2); thư mục tạm của test
   - Returns: `sha256_of(full_path) -> str | None`; `write_atomic(full_path, content, *, new_file) -> str` (mkstemp cùng thư mục prefix `.erp_ai_`, UTF-8, flush, fsync, chmod theo file cũ hoặc 0o644, `os.replace`, đọc lại, sha256; lỗi giữa chừng gỡ tệp tạm rồi raise); `remove_created(full_path)`; không ghi trực tiếp tệp trong `.git`
@@ -295,7 +298,7 @@ FEAT-005 trích `F4-T<n>` (T2–T7, T12, T23, T24, T28–T33): các ID đó KHÔ
   - Returns: lớp test dùng `RealCoreReposUntouchedMixin`; chỉ file test
   - Expect: `test_repo_hooks_never_run` (6 hook; áp dụng và hoàn tác thành công; 0 tệp đánh dấu), `test_remote_refs_and_other_branches_unchanged_after_apply_and_undo` (kể cả ref trên remote bare tạm), `test_commit_metadata_has_no_email_url_or_token` (HOME giả có `.gitconfig` email thật; URL `x-token-FAKE`; họ tên người duyệt chứa `@` → tác giả = `ERP AI Agent <erp-ai-agent@bot.invalid>`; 0 lần trong `git log`, comment, `__onload`, trường đề xuất)
 
-- [ ] T40 — `change_text.py`: thông điệp commit và `safe_person_name` — files: erp_ai/agent/change_text.py, erp_ai/agent/test_change_text.py — test: erp_ai/agent/test_change_text.py — depends: T2
+- [x] T40 — `change_text.py`: thông điệp commit và `safe_person_name` — files: erp_ai/agent/change_text.py, erp_ai/agent/test_change_text.py — test: erp_ai/agent/test_change_text.py — depends: T2
   - Criterion: AC-17 (mẫu thông điệp: mã đề xuất, số phiếu, họ tên người duyệt), AC-20 (thông điệp hoàn tác có mã commit áp dụng), NFR-8; ADR-022 QĐ 5; design 3.9
   - Receives: `BOT_GIT_*` (T2); mẫu 3.9; chỉ import thư viện chuẩn và `erp_ai.constants`
   - Returns: `safe_person_name(name) -> str` (loại `@`, `://`, xuống dòng, ký tự điều khiển; ≤ giới hạn 3.9; rỗng/`None` → giá trị thay thế theo 3.9), `apply_message(name, ticket, file_path, approver) -> tuple[str, str]` (subject, body), `undo_message(name, ticket, file_path, apply_commit, undoer)`, `message_text(subject, body)`; bản xem trước chỉ khác ở dòng người duyệt

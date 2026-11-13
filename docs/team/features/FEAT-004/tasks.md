@@ -91,6 +91,68 @@ Tiến độ: BASE ghi ở đây trước mỗi lần gọi dev.
 - round 46: review T42 (0b802ec..`8983584`) approve, 1 vòng (`is_core_app` với `read_git=False`: chấp nhận, ghi deferred cho designer) · BASE=e1182d0 · dev T6 (`team/FEAT-004-task-6` @ `ad893d7`; RED `Ran 27 tests / FAILED (failures=6)`, `AssertionError: ValidationError not raised`; GREEN `Ran 27 tests in 1.140s OK`, test_architecture `Ran 110 tests … OK`) · T42 CHƯA merge vì `cmd.test` đang chạy trên cây làm việc của nhánh feature (không đổi mã giữa lúc chạy)
 - round 47: review T6 (e1182d0..`ad893d7`) · dev T18, dev T25 (mỗi dev tự `git merge team/FEAT-004-task-42` vào nhánh task trước khi làm, BASE của review = commit merge đó; lệch chữ "depends đã tick": T42 đã approve, chờ lượt merge)
 - DỪNG chặng 5 (2026-11-13 15:06, người dừng build lần 4 và yêu cầu commit; 27/52 đã tick): T39, T5, T52 ĐÃ merge vào `team/FEAT-004` @ `e1182d0` nhưng CHƯA tick và CHƯA kiểm — chưa đọc được kết quả `cmd.test` trên `e1182d0`, phải chạy lại `cmd.test` rồi mới tick. Nhánh task có commit chưa merge: T42 (`8983584`, đã approve), T6 (`ad893d7`, review round 47 chưa có kết quả), T18 (`e4cf022`) và T25 (`f96fd91`) — hai nhánh này mới chỉ có commit merge T42, chưa có mã của task. Cây làm việc của mọi worktree task sạch lúc dừng. Tiếp tục: `/team:build FEAT-004`
+- Chặng 6, bước nhận code (2026-11-14, chưa gọi dev/reviewer): người chọn "Nhận code đó làm nền". Commit phần chưa commit trên `develop` thành `2ab30f9`, `7e90e5e`, `25be823`, `6d90e79` (mã, chưa review) cùng `be92ea0`, `196ae67`, `357a3d1`, `7cc37bb` (tài liệu, số liệu); merge `develop` → `team/FEAT-004` = `0fdc37d` (không xung đột; cây mã giống hệt `develop`). `cmd.migrate` chạy xong (có đổi `erp_ai_setting.json`). Bảng đối chiếu 25 task: mục "Đối chiếu 25 task còn mở" bên dưới
+- `cmd.test` trên `0fdc37d` (2026-11-14, hai lần chạy cho cùng kết quả): `Ran 1241 tests in 255.692s` / `FAILED (failures=27, errors=80)` (bench vẫn thoát 0). Cả 107 ca đỏ nằm ở `test_agent_runner`, `test_runner_routing`, `test_runner_status`, `test_handlers.TestHumanCorrection`, `test_write_ticket`; 78 ca là `ValueError: too many values to unpack` ở chỗ test lấy đúng một dòng log của phiếu. Nguyên nhân đo được (truy vấn chỉ đọc): 63 dòng `ERP AI Log` mồ côi của các phiếu 43065, 43067, 43069–43072 (tạo 2026-11-13 15:25–18:07, phiếu đã bị xóa; số phiếu lớn nhất còn lại là 43068) nên phiếu test nhận lại đúng các số đó. Cùng loại với lần dọn 2026-11-13. Cài đặt đang lưu cũng lệch (`auto_assign_enabled=1`, `code_change_apps` có 4 app) nhưng không tách được khi dữ liệu mồ côi còn. Không module test nào của phần code vừa nhận đỏ (`test_apply_job`, `test_propose_change`, `test_site_api`, `test_change_decision`, `test_change_link`, `test_registry`, `test_classification`, `test_architecture`, `test_change_guard`, `test_erp_ai_setting`, `test_doctype_descriptions`). CHƯA có nền xanh → không tick task nào, không merge task nào cho tới khi người cho dọn dữ liệu và `cmd.test` chạy lại xanh. Tech-lead không xóa dữ liệu và không đổi cài đặt ở lượt này
+
+## Đối chiếu 25 task còn mở với code nhận từ ngoài quy trình (2026-11-14)
+
+Nguồn: người chọn "Nhận code đó làm nền" (journal 2026-11-14). Code do một phiên khác viết thẳng trên `develop`, không qua dev/reviewer của đội, mới chỉ được kiểm bằng test của chính nó. Đã commit trên `develop` và merge vào `team/FEAT-004` (`0fdc37d`):
+
+| Commit | Nội dung | Khoảng diff để review |
+|---|---|---|
+| `2ab30f9` | `erp_ai_setting.py` + test (giống từng byte `ad893d7` của nhánh task 6) | `154d752..2ab30f9` |
+| `7e90e5e` | `change_guard.py` + test (giống từng byte `8983584` của nhánh task 42) | `2ab30f9..7e90e5e` |
+| `25be823` | `changes/apply_job.py`, `agent/change_link.py`, `erp_ai/change_decision.py` + 3 file test | `7e90e5e..25be823` |
+| `6d90e79` | `tools/propose_change.py`, `tools/site_api.py`, `registry.py`, `runner.py`, `prompts.py`, `policy.py`, `erp_ai_setting.json` + test, `test_architecture.py`, `test_doctype_descriptions.py` | `25be823..6d90e79` |
+
+Quy ước cột "Kết quả": **đủ** = mã có và khớp Returns của task, còn thiếu review; **một phần** = mã có nhưng lệch hoặc thiếu so với Returns/Expect; **thiếu** = chưa có gì; **bỏ** = không còn cần. Không dòng nào dưới đây được tick: chưa task nào có `review-NN.md` approve cho mã đang nằm trên nhánh. Định nghĩa từng task (files, Criterion, Returns, Expect) ở các phần dưới vẫn là chuẩn để review và làm tiếp.
+
+| Task | Kết quả | Mã đang có (file:hàm) | Còn thiếu hoặc lệch | Việc tiếp |
+|---|---|---|---|---|
+| T5 | đủ (mã của đội) | `policy.py:change_settings`, `current_change_settings`, `validate_change_apps`; merge `e1182d0` | `review-05.md` còn ghi Verdict design-defect; lượt approve vòng 3 chỉ có ở dòng progress round 45 | reviewer ghi vòng 3 vào `review-05.md` (`d62f6ec..f6260e7`), `cmd.test` xanh rồi tick |
+| T39 | đủ (mã của đội) | `tools/source.py:git_head`, `git_commit_summary`, `git_blob`, `git_is_ancestor`; merge `0b802ec` | `review-39.md` còn ghi Verdict design-defect; lượt approve chỉ có ở round 44 | reviewer ghi vòng 2 vào `review-39.md` (`99f17b6..8ff4278`), rồi tick |
+| T52 | đủ (mã của đội) | controller `approve/reject/undo(name=None)`; `test_methods_missing_name_is_not_found`; merge trong `e1182d0` | chưa có file `review-52.md` (approve chỉ có ở round 45) | reviewer viết `review-52.md` (`c8af79f..04e1dbc`), rồi tick |
+| T6 | đủ | `erp_ai_setting.py:ERPAISetting.validate` gọi `policy.validate_change_apps(self, source.get_source_root())` (`2ab30f9`) | review round 47 chưa từng có kết quả | review `154d752..2ab30f9` |
+| T42 | đủ | `change_guard.py:check_write_path(read_git=)`, `GuardResult.git`, `is_core_app`, `PATH_GIT_PATTERN` (`7e90e5e`) | approve round 46 không có file `review-42.md` | reviewer viết `review-42.md` (`2ab30f9..7e90e5e`) |
+| T18 | một phần | `apply_job.py:run_change`, `_run` (khóa `filelock`, commit trạng thái trước, kiểm công tắc và digest) | thiếu 5/7 điều kiện kiểm lại: người chạy job, người duyệt còn role (ADR-012 QĐ 7), `sha256(content_after) == after_hash`, `commit_message`, bộ chặn `read_git=False`; hết hạn khóa ném ra ngoài thay vì `Lỗi`; không có `deadline`; không có dòng `logger.info`; test `test_lock_timeout_fails_without_writing` chưa có | review rồi dev bổ sung |
+| T19 | một phần | `apply_job.py:_apply_code`, `_commit` | gọi git trước dấu file (ngược D-19); kiểm sau dùng `parents != (head,)` chặt, không `git_blob`, không cờ `committed`, không bắt `RuntimeError` (phụ lục 3 QĐ-B2); `before/after` dùng khóa `hash` thay `sha256`, `head`, `branch` (QĐ-B5); `limit_s` không theo `deadline` | review rồi dev sửa |
+| T46 | một phần | `apply_job.py:_guard`, `BRANCH_CHANGED` | từ chối git lúc áp dụng (`index.lock`, detached, đang merge, bị ignore, không phải repo) thành `Hết hiệu lực`, design 4.3 và Expect đòi `Lỗi`; chưa có `test_index_lock_fails_fast` và test 5 subTest | người hoặc designer chốt `Lỗi` hay `Hết hiệu lực`, rồi dev |
+| T45 | một phần | `apply_job.py:_commit(give_back)`, `_apply_code.give_back` | không đọc `git_head` trước khi trả lại; không phân biệt commit của người (`author_email`); không có `GIT_RESTORE_FAILED`, `GIT_ERROR`; `COMMIT_UNEXPECTED` không lưu `apply_commit_sha`; thiếu 9 test của Expect và phụ lục 3 | dev bổ sung |
+| T20 | một phần | `apply_job.py:_undo_code` | không kiểm `undo_by`, role, digest; không kiểm sau `git_blob`; khóa `before/after` lệch QĐ-B5 | review rồi dev sửa |
+| T47 | một phần | `apply_job.py:_undo_code.give_back` (trả lại khi commit hoàn tác lỗi) | không gọi `git_is_ancestor` (`GIT_NOT_ANCESTOR`, `GIT_ERROR`); từ chối git lúc hoàn tác chưa có test; thiếu quy tắc `committed` và commit của người | dev bổ sung |
+| T21 | một phần | `apply_job.py:_apply_command` | luôn dùng `COMMAND_TIMEOUT_S`, không tính ngân sách còn lại (`limit < 1` → "quá thời gian", phụ lục 2 QĐ-A3); câu lỗi khác chữ design; chưa có `depends_on` của `exit_code` trong JSON và `exit_code = 0` khi không có mã thoát (QĐ-B4) | dev bổ sung (có `cmd.migrate`) |
+| T22 | một phần | `apply_job.py:_apply_command` nhánh `timed_out` | câu lỗi khác chữ ("lệnh chạy quá giờ và đã bị dừng" so với "quá thời gian"); chưa có test khóa giả (AC-13) và `test_limit_passed_is_remaining_budget` | dev bổ sung test, sửa chữ |
+| T48 | thiếu | — | cả ba test chéo (hook, ref remote, metadata commit) | dev viết test |
+| T25 | một phần | `propose_change.py:propose_file_change`, `_apply_edits`, `_comment`, `_insert` | schema là `edits[{old,new}]`, design 3.1 ghi `find[]`/`replace[]`; câu lỗi không theo bảng 3.1; không có `PROPOSE_TOOL_NAMES`; kết quả không có khóa `comment`; comment mang đường dẫn Duyệt / Từ chối ký sẵn (ngoài spec); chưa có luật "tool không ghi" trong `test_architecture.py` | chốt schema (giữ `edits` cần sửa design), review, dev |
+| T26 | một phần | `propose_change.py:propose_new_file` | `base_hash` và `content_before` là `None`, Returns ghi chuỗi rỗng; chưa có `test_no_delete_or_rename_operation_exists` | review rồi dev |
+| T27 | một phần | `propose_change.py:propose_bench_command` | chưa có test 0 lời gọi tiến trình con và test dựng `command_args` cho từng lệnh | dev bổ sung test |
+| T50 | một phần | `propose_change.py:_code_values` (4 trường git lấy từ `GuardResult`), `_comment` dùng `change_text.proposal_notes` | thiếu 4 test của Expect (app lõi, URL và token 0 lần, không cảnh báo với app thường, tool không đặt được trường git) | dev bổ sung test |
+| T28 | đủ, có lệch | `registry.py:TOOL_MODULES` thêm `propose_change` | cùng lúc thêm `site_api` và 2 nhóm ngoài spec nên số tool là 21, Expect ghi 14; test cũ `len == 11`, `len(fields) == 9` đã bị sửa theo | review `25be823..6d90e79` |
+| T29 | đủ, cần review | `runner.py:_run` (truyền `change_enabled`, `allowed_apps`), `_reason` (cấp tool, `grants_change_tools`) | chưa có test vượt ngân sách L3 → L1 mất tool; `_reason` thêm đường cấp thứ hai `get_unrestricted_tool_schemas` (ngoài spec) | review rồi dev bổ sung test |
+| T30 | một phần | `runner.py:_run_tool` (`transitions.log_step(..., "propose", ...)`), `WRITE_TOOL_TARGETS`, `PROPOSE_TOOLS` | thiếu 2 test AC-11 (chèn lệnh không thẩm quyền; model nói "đã được duyệt" → 0 lần áp dụng); `WRITE_TOOL_TARGETS` có thêm 5 tool `api_*` ngoài spec | dev bổ sung test |
+| T31 | thiếu | — | 5 luật kiến trúc nhóm 1 | dev |
+| T32 | thiếu | — | 2 luật nhóm 2 và test âm của luật enqueue, subprocess | dev (sau T31) |
+| T44 | thiếu | — | luật git của ADR-022 | dev (sau T32) |
+| T34 | thiếu | — | checkpoint cuối của tech-lead | làm sau cùng |
+
+Tổng: đủ 7 (T5, T39, T52, T6, T42, T28, T29), một phần 13, thiếu 5, bỏ 0.
+
+### Nhánh task còn lại
+- `team/FEAT-004-task-6` (`ad893d7`) và `team/FEAT-004-task-42` (`8983584`): nội dung đã nằm trên nhánh feature qua `2ab30f9` và `7e90e5e` (giống từng byte). Giữ tới khi review của T6 và T42 approve, rồi gỡ worktree; `git branch -d` sẽ từ chối vì commit của nhánh chưa được merge theo lịch sử, nên phải merge nhánh vào `team/FEAT-004` trước (merge không đổi file) hoặc người cho phép xóa cưỡng bức.
+- `team/FEAT-004-task-18` (`e4cf022`) và `team/FEAT-004-task-25` (`f96fd91`): chỉ có commit merge T42, không có mã của task. Không dùng lại: dev của T18 và T25 làm trên nhánh mới cắt từ đầu `team/FEAT-004`. Gỡ worktree và xóa nhánh cùng lúc với nhánh task 42.
+
+### Phần vượt spec FEAT-004 (thuộc CHG-001, chưa có spec, design hay ADR)
+| Phần | File | Trái với |
+|---|---|---|
+| Duyệt một lần bấm bằng đường dẫn GET có chữ ký trong comment | `agent/change_link.py`, `erp_ai/change_decision.py:decide`, `propose_change.py:_comment` | ADR-012 QĐ 4 (duyệt chỉ qua method `POST` trong controller, trên form Desk); design 3.3; T17 (hộp xác nhận) |
+| Tool bản ghi chung, làm trực tiếp không qua duyệt | `tools/site_api.py` (`api_create_record`, `api_update_record`, …) | ADR-005 QĐ 3 và Ràng buộc "không tool ghi nào nhận tên DocType hay tên trường"; FEAT-006 AC-9 theo ghi chú bàn giao của phiên kia |
+| Ô "Toàn quyền (khẩn cấp)": xóa, submit, gọi hàm whitelist từ L1 | `erp_ai_setting.json:unrestricted_enabled`, `policy.py:unrestricted_enabled`, `registry.py:_unrestricted_specs`, `runner.py:_reason` | ADR-011 QĐ 2 và QĐ 6 (một hàm cấp, một bảng cấp, nhóm ghi chỉ ở L3); ADR-005 QĐ 3 |
+| Nhóm `site_admin` cấp theo công tắc sửa code | `registry.py:GRANT_TABLE` | ADR-011 QĐ 5 theo nghĩa của công tắc (bật sửa code nay bật luôn quyền tạo, sửa bản ghi); mô tả trường `code_change_enabled` đã bị đổi |
+| Prompt "làm luôn, không hỏi lại" thay quy tắc 6 | `prompts.py:ACT_NOW_BLOCK`, `SITE_ADMIN_TOOLS_BLOCK`, `UNRESTRICTED_TOOLS_BLOCK`; `CHANGE_TOOLS_BLOCK` đã bị sửa chữ | T24 (đã review theo chữ cũ); spec AC-5 phần "không có cách duyệt nào khác" |
+| Kiểm lại lúc áp dụng thiếu "người duyệt còn role" | `apply_job.py:_run` | ADR-012 QĐ 7 |
+| Test cũ bị sửa theo hành vi mới | `test_registry.py`, `test_doctype_descriptions.py`, `test_architecture.py:POLICY_FIELDS`, `test_classification.py` | STD-TEST-5 nếu không có amendment của spec đi trước |
+
+Các phần này cần Amendment của spec (CHG-001), phán quyết của architect cho ADR-005, ADR-011, ADR-012 và review bảo mật riêng trước khi coi là xong; team-leader điều phối, tech-lead không tự xử.
 
 ## Bảng đổi ID cũ → mới (plan lần 1, 34 task → lần này 51 task)
 FEAT-005 trích `F4-T<n>` (T2–T7, T12, T23, T24, T28–T33): các ID đó KHÔNG đổi nghĩa lớn; ID cũ T1–T34 giữ nguyên, task mới nhận T35–T51 và nằm xen đúng chỗ trong file.

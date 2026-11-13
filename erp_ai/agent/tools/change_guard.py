@@ -19,6 +19,23 @@ APP_FORBIDDEN = "không được sửa app erp_ai hoặc kho git của nó"
 NAME_FORBIDDEN = "tên file thuộc loại bí mật hoặc được bảo vệ"
 EXT_FORBIDDEN = "đuôi file không được phép"
 GIT_DIR = "không được chạm thư mục .git"
+CMD_SHELL = "đối số chứa ký tự điều khiển shell"
+CMD_FORCE = "cờ --force bị cấm"
+CMD_OTHER_SITE = "chỉ chạy cho site đang chạy"
+CMD_NOT_LISTED = "lệnh không có trong danh sách cho phép"
+CMD_NEEDS_APP = "lệnh build cần app"
+CMD_TAKES_NO_APP = "lệnh này không nhận app"
+
+# Command table of design 3.1: the only bench argument shapes an agent may propose (ADR-011 QĐ 4).
+# No subcommand here runs git in an app repo (ADR-022 QĐ 2).
+SITE_COMMANDS = ("migrate", "clear-cache", "clear-website-cache", "list-apps")
+BUILD_COMMAND = "build"
+VERSION_COMMAND = "version"
+BENCH_COMMANDS = (SITE_COMMANDS[0], BUILD_COMMAND, *SITE_COMMANDS[1:], VERSION_COMMAND)
+SITE_FLAG = "--site"
+APP_FLAG = "--app"
+FORCE_FLAG = "--force"
+SHELL_METACHARACTERS = (";", "|", "&", "`", "$(", ">", "<", "\n")
 
 
 @dataclass(frozen=True)
@@ -136,3 +153,103 @@ def check_write_path(rel_path: str, allowed_apps: tuple[str, ...], *, new_file: 
 	if full is None:
 		return _refused(PATH_INVALID)
 	return GuardResult(full_path=full, rel_path=rel, app=parts[0], reason=None)
+
+
+def _app_names(allowed_apps) -> tuple[str, ...]:
+	"""`allowed_apps` as a tuple of names; anything but a collection of strings allows no app.
+
+	A plain string is refused on purpose: `in` on it would match any substring of the name.
+	"""
+	if not isinstance(allowed_apps, tuple | list | set | frozenset):
+		return ()
+	if not all(isinstance(name, str) for name in allowed_apps):
+		return ()
+	return tuple(allowed_apps)
+
+
+def _is_site(site) -> bool:
+	return isinstance(site, str) and bool(site.strip())
+
+
+def _build_app_reason(app, allowed_apps: tuple[str, ...]) -> str | None:
+	"""Reason of design table 3.1 why `app` cannot be built, or `None` when it passes the app guard.
+
+	The name must be one plain folder directly under `apps/`, listed, resolving (symlinks followed) to
+	itself, and not `erp_ai` or a repo sharing its git common dir.
+	"""
+	if not isinstance(app, str) or app not in allowed_apps or "\0" in app:
+		return APP_NOT_ALLOWED
+	root = os.path.realpath(source.get_source_root())
+	target = os.path.realpath(os.path.join(root, app))
+	if os.path.dirname(target) != root or os.path.basename(target) != app:
+		return APP_NOT_ALLOWED
+	if _is_erp_ai(target, root, app):
+		return APP_FORBIDDEN
+	return None
+
+
+def _bench_shape(command, app, allowed_apps: tuple[str, ...], site) -> list[str] | str:
+	"""The argument list of design table 3.1 for one command, or the refusal reason."""
+	if not isinstance(command, str) or command not in BENCH_COMMANDS:
+		return CMD_NOT_LISTED
+	if command == BUILD_COMMAND:
+		if app is None or (isinstance(app, str) and not app.strip()):
+			return CMD_NEEDS_APP
+		return _build_app_reason(app, allowed_apps) or [BUILD_COMMAND, APP_FLAG, app]
+	if app is not None:
+		return CMD_TAKES_NO_APP
+	if command == VERSION_COMMAND:
+		return [VERSION_COMMAND]
+	if not _is_site(site):
+		return CMD_OTHER_SITE
+	return [SITE_FLAG, site, command]
+
+
+def build_bench_args(
+	command: str, app: str | None, allowed_apps: tuple[str, ...], site: str
+) -> list[str] | str:
+	"""Build the stored `command_args` of design table 3.1; a `str` result is the refusal reason.
+
+	The built list then goes through `check_bench_args`, so a name or site carrying a shell
+	metacharacter is refused with the same sentence as at apply time.
+	"""
+	args = _bench_shape(command, app, _app_names(allowed_apps), site)
+	if isinstance(args, str):
+		return args
+	return check_bench_args(args, allowed_apps, site) or args
+
+
+def _site_values(args: list[str]) -> list[str | None]:
+	"""Every value given to `--site` (`--site X` or `--site=X`); a trailing `--site` gives `None`."""
+	values = []
+	for index, arg in enumerate(args):
+		if arg == SITE_FLAG:
+			values.append(args[index + 1] if index + 1 < len(args) else None)
+		elif arg.startswith(SITE_FLAG + "="):
+			values.append(arg[len(SITE_FLAG) + 1 :])
+	return values
+
+
+def check_bench_args(args: list[str], allowed_apps: tuple[str, ...], site: str) -> str | None:
+	"""Check stored bench arguments in the order of design 3.2; `None` lets them run.
+
+	1. shell metacharacter, 2. `--force`, 3. `--site` other than the running site, 4. not exactly
+	one shape of table 3.1 for the current `allowed_apps`. Anything but a non-empty list of strings
+	matches no shape.
+	"""
+	if not isinstance(args, list) or not args or not all(isinstance(arg, str) for arg in args):
+		return CMD_NOT_LISTED
+	if any(char in arg for arg in args for char in SHELL_METACHARACTERS):
+		return CMD_SHELL
+	if any(arg == FORCE_FLAG or arg.startswith(FORCE_FLAG + "=") for arg in args):
+		return CMD_FORCE
+	if any(not _is_site(site) or value != site for value in _site_values(args)):
+		return CMD_OTHER_SITE
+	apps = _app_names(allowed_apps)
+	if len(args) == 3 and args[:2] == [BUILD_COMMAND, APP_FLAG]:
+		expected = _bench_shape(BUILD_COMMAND, args[2], apps, site)
+	elif len(args) == 3 and args[0] == SITE_FLAG:
+		expected = _bench_shape(args[2], None, apps, site)
+	else:
+		expected = _bench_shape(args[0], None, apps, site)
+	return None if expected == args else CMD_NOT_LISTED

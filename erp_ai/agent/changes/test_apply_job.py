@@ -1,3 +1,4 @@
+import dataclasses
 import hashlib
 import json
 import os
@@ -11,6 +12,7 @@ from helpdesk.test_utils import create_agent
 from erp_ai.agent import policy
 from erp_ai.agent.changes import apply_job, file_writer, process_runner, transitions
 from erp_ai.agent.changes.process_runner import CommandResult
+from erp_ai.agent.tools import source
 from erp_ai.constants import (
 	BOT_GIT_EMAIL,
 	CHANGE_KIND_CODE,
@@ -181,7 +183,8 @@ class TestApplyCode(ApplyJobTestCase):
 
 		state = self.state(name)
 		self.assertEqual(state.change_status, CHANGE_STATUS_STALE)
-		self.assertEqual(state.failure_reason, "file đã đổi từ lúc đề xuất")
+		# Design 4.3 step 3.1 gives the reason word for word.
+		self.assertEqual(state.failure_reason, "file đích đã đổi kể từ lúc đề xuất")
 		self.assertEqual(self.read(), "x = 99\n")
 		self.assertEqual(self.commit_count(), count)
 		self.assertEqual(self.steps(name), ["approve", "stale"])
@@ -270,6 +273,229 @@ class TestApplyCode(ApplyJobTestCase):
 	def test_unknown_action_is_refused(self):
 		with self.assertRaises(ValueError):
 			apply_job.run_change("x", "delete")
+
+
+class TestApplyCodeSteps(ApplyJobTestCase):
+	"""Design 4.3 step 4.3 items 1 to 5 and 7 (ADR-022 decision 1, D-19, design-addendum-3 QĐ-B2 and QĐ-B5)."""
+
+	def log_row(self, name, step):
+		row = frappe.get_all(
+			LOG_DOCTYPE,
+			filters={"change_proposal": name, "change_step": step},
+			fields=["value_before", "value_after"],
+		)[0]
+		return json.loads(row.value_before or "null"), json.loads(row.value_after or "null")
+
+	def author_email(self):
+		return self.sandbox.git(APP, "log", "-1", "--format=%ae").strip()
+
+	def test_apply_writes_exact_approved_bytes(self):
+		content = "a = '<script>alert(1)</script>'\r\n# Tiếng Việt có dấu\r\nb = 2"
+		name = self.approved(self.code_proposal(content_after=content, after_hash=_sha(content)))
+
+		apply_job.run_change(name, "apply")
+
+		self.assertEqual(self.state(name).change_status, CHANGE_STATUS_APPLIED)
+		with open(self.path(), "rb") as handle:
+			self.assertEqual(handle.read(), content.encode("utf-8"))
+
+	def test_apply_creates_one_commit_with_only_target_path(self):
+		self.sandbox.commit_file(APP, "pkg/staged.py", "s = 1\n")
+		self.sandbox.commit_file(APP, "pkg/unstaged.py", "u = 1\n")
+		self.sandbox.stage(APP, "pkg/staged.py", "s = 2\n")
+		self.sandbox.write_unstaged(APP, "pkg/unstaged.py", "u = 2\n")
+		name = self.approved(self.code_proposal())
+		count = self.commit_count()
+
+		apply_job.run_change(name, "apply")
+
+		self.assertEqual(self.state(name).change_status, CHANGE_STATUS_APPLIED)
+		self.assertEqual(self.commit_count(), count + 1)
+		changed = self.sandbox.git(APP, "diff-tree", "-r", "--no-commit-id", "--name-only", "HEAD").split()
+		self.assertEqual(changed, [REL])
+		self.assertRegex(name, r"^AICHG-\d{5}$")
+		self.assertIn(name, self.sandbox.git(APP, "log", "-1", "--format=%B"))
+		self.assertEqual(self.sandbox.git(APP, "diff", "--cached", "--name-only").split(), ["pkg/staged.py"])
+		self.assertEqual(self.sandbox.git(APP, "diff", "--name-only").split(), ["pkg/unstaged.py"])
+		self.assertEqual(self.read("pkg/staged.py"), "s = 2\n")
+		self.assertEqual(self.read("pkg/unstaged.py"), "u = 2\n")
+
+	def test_target_changed_after_proposal_becomes_stale(self):
+		def committed_by_a_person():
+			self.sandbox.commit_file(APP, REL, "x = 99\n")
+
+		def left_uncommitted():
+			self.sandbox.write_unstaged(APP, REL, "x = 99\n")
+
+		start = self.head()
+		for label, change in (("committed", committed_by_a_person), ("uncommitted", left_uncommitted)):
+			with self.subTest(label):
+				self.sandbox.git(APP, "reset", "--hard", "--quiet", start)
+				name = self.approved(self.code_proposal())
+				change()
+				count = self.commit_count()
+
+				# D-19: the file hash is checked first, so git is not even read for a stale target.
+				with patch.object(source, "read_git_state", wraps=source.read_git_state) as read_git:
+					apply_job.run_change(name, "apply")
+
+				read_git.assert_not_called()
+				state = self.state(name)
+				self.assertEqual(
+					(state.change_status, state.failure_reason),
+					(CHANGE_STATUS_STALE, "file đích đã đổi kể từ lúc đề xuất"),
+				)
+				self.assertEqual(self.read(), "x = 99\n")
+				self.assertEqual(self.commit_count(), count)
+				self.assertEqual(self.steps(name), ["approve", "stale"])
+
+	def test_new_file_appeared_meanwhile_becomes_stale(self):
+		def committed_by_a_person():
+			self.sandbox.commit_file(APP, NEW_REL, "taken = 1\n")
+
+		def left_untracked():
+			self.sandbox.write_unstaged(APP, NEW_REL, "taken = 1\n")
+
+		start = self.head()
+		for label, create in (("committed", committed_by_a_person), ("untracked", left_untracked)):
+			with self.subTest(label):
+				self.sandbox.git(APP, "reset", "--hard", "--quiet", start)
+				if os.path.lexists(self.path(NEW_REL)):
+					os.remove(self.path(NEW_REL))
+				name = self.approved(self.new_file_proposal())
+				create()
+				count = self.commit_count()
+
+				with patch.object(source, "read_git_state", wraps=source.read_git_state) as read_git:
+					apply_job.run_change(name, "apply")
+
+				read_git.assert_not_called()
+				state = self.state(name)
+				self.assertEqual(
+					(state.change_status, state.failure_reason),
+					(CHANGE_STATUS_STALE, "file đích đã đổi kể từ lúc đề xuất"),
+				)
+				self.assertEqual(self.read(NEW_REL), "taken = 1\n")
+				self.assertEqual(self.commit_count(), count)
+				self.assertEqual(self.steps(name), ["approve", "stale"])
+
+	def test_two_proposals_same_file_second_is_stale(self):
+		first = self.approved(self.code_proposal())
+		second = self.approved(self.code_proposal(content_after="x = 3\n", after_hash=_sha("x = 3\n")))
+		count = self.commit_count()
+
+		apply_job.run_change(first, "apply")
+		apply_job.run_change(second, "apply")
+
+		self.assertEqual(self.state(first).change_status, CHANGE_STATUS_APPLIED)
+		self.assertEqual(self.state(second).change_status, CHANGE_STATUS_STALE)
+		self.assertEqual(self.read(), AFTER)
+		self.assertEqual(self.commit_count(), count + 1)
+		self.assertEqual(self.state(first).apply_commit_sha, self.head())
+
+	def test_apply_and_undo_rows_carry_commit_sha(self):
+		name = self.approved(self.code_proposal())
+		old_head = self.head()
+
+		apply_job.run_change(name, "apply")
+
+		state = self.state(name)
+		self.assertEqual(state.apply_commit_sha, self.head())
+		before, after = self.log_row(name, "apply")
+		self.assertEqual(before, {"sha256": _sha(BEFORE), "head": old_head})
+		self.assertEqual(after, {"sha256": _sha(AFTER), "commit": state.apply_commit_sha, "branch": "main"})
+
+	def test_git_commit_limit_comes_from_the_job_deadline(self):
+		start = self.head()
+		# Seconds gone from the job budget when the commit starts → the commit's `limit_s` (design 3.5).
+		for spent, limit in (
+			(100, source.GIT_TIMEOUT_S),
+			(COMMAND_TIMEOUT_S - 5, 5),
+			(COMMAND_TIMEOUT_S + 50, 1),
+		):
+			with self.subTest(spent=spent):
+				self.sandbox.git(APP, "reset", "--hard", "--quiet", start)
+				name = self.approved(self.code_proposal())
+				clock = iter([1000.0])
+				with (
+					patch("time.monotonic", side_effect=lambda spent=spent: next(clock, 1000.0 + spent)),
+					patch.object(
+						process_runner, "git_commit_only", wraps=process_runner.git_commit_only
+					) as commit,
+				):
+					apply_job.run_change(name, "apply")
+
+				self.assertEqual(commit.call_args.args[4], limit)
+				self.assertEqual(self.state(name).change_status, CHANGE_STATUS_APPLIED)
+
+	def assert_commit_kept_and_failed(self, name, start, writes):
+		state = self.state(name)
+		self.assertEqual(
+			(state.change_status, state.failure_reason),
+			(CHANGE_STATUS_FAILED, "commit không đúng nội dung đã duyệt, cần người kiểm"),
+		)
+		self.assertEqual(self.read(), AFTER)
+		self.assertNotEqual(self.head(), start)
+		self.assertEqual(self.sandbox.git(APP, "rev-parse", "HEAD~1").strip(), start)
+		self.assertEqual(self.author_email(), BOT_GIT_EMAIL)
+		self.assertEqual(state.apply_commit_sha, self.head())
+		# The only write is the apply itself: the file is never given back once the commit exists.
+		self.assertEqual(writes.call_count, 1)
+		self.assertEqual(self.steps(name), ["approve", "fail"])
+		before, after = self.log_row(name, "fail")
+		self.assertEqual(before, {"sha256": _sha(BEFORE), "head": start})
+		self.assertEqual(after["commit"], state.apply_commit_sha)
+		self.assertEqual(after["sha256"], _sha(AFTER))
+
+	def test_postcheck_unreadable_keeps_commit_and_fails(self):
+		start = self.head()
+		unreadable = RuntimeError("không đọc được trạng thái git: HEAD commit")
+		cases = (
+			("git_commit_summary raises", "git_commit_summary", {"side_effect": unreadable}),
+			("git_blob raises", "git_blob", {"side_effect": unreadable}),
+			("git_is_ancestor None", "git_is_ancestor", {"return_value": None}),
+		)
+		for label, function, behavior in cases:
+			with self.subTest(label):
+				self.sandbox.git(APP, "reset", "--hard", "--quiet", start)
+				name = self.approved(self.code_proposal())
+				with (
+					patch.object(source, function, **behavior),
+					patch.object(file_writer, "write_atomic", wraps=file_writer.write_atomic) as writes,
+				):
+					apply_job.run_change(name, "apply")
+
+				self.log_error.assert_not_called()
+				self.assert_commit_kept_and_failed(name, start, writes)
+
+	def test_postcheck_wrong_commit_keeps_commit_and_fails(self):
+		start = self.head()
+		real_summary = source.git_commit_summary
+
+		def summary_with(**changes):
+			return lambda repo: dataclasses.replace(real_summary(repo), **changes)
+
+		# ADR-022 decision 1 step 5, one case per condition of design 4.3 step 3.5.
+		cases = (
+			("two parents", "git_commit_summary", {"side_effect": summary_with(parents=(start, start))}),
+			("old head not an ancestor", "git_is_ancestor", {"return_value": False}),
+			("other paths", "git_commit_summary", {"side_effect": summary_with(paths=(REL, "pkg/x.py"))}),
+			("other branch", "git_commit_summary", {"side_effect": summary_with(branch="other")}),
+			("other blob", "git_blob", {"return_value": b"x = 7\n"}),
+		)
+		for label, function, behavior in cases:
+			with self.subTest(label):
+				self.sandbox.git(APP, "reset", "--hard", "--quiet", start)
+				name = self.approved(self.code_proposal())
+				with (
+					patch.object(source, function, **behavior),
+					patch.object(file_writer, "write_atomic", wraps=file_writer.write_atomic) as writes,
+				):
+					apply_job.run_change(name, "apply")
+
+				self.assert_commit_kept_and_failed(name, start, writes)
+				branch = "other" if label == "other branch" else "main"
+				self.assertEqual(self.log_row(name, "fail")[1]["branch"], branch)
 
 
 class TestRunChangeSkeleton(ApplyJobTestCase):

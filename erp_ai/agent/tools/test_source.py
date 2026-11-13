@@ -3,11 +3,14 @@ import re
 import shutil
 import subprocess
 import tempfile
+import unittest
 from unittest.mock import patch
 
+import frappe
 from frappe.tests.utils import FrappeTestCase
 
 from erp_ai.agent.tools import source
+from erp_ai.test_utils import GitSandbox
 
 ROOT_PATH = "erp_ai.agent.tools.source.get_source_root"
 
@@ -501,3 +504,148 @@ class TestGitSource(FrappeTestCase):
 			result = self.git("log")
 		self.assertTrue(result["ok"])
 		self.assertEqual(len(result["output"]), 8000)
+
+
+SANDBOX_APPS = ("frappe", "erpnext", "helpdesk", "hrms", "erp_ai", "custom_app")
+SANDBOX_EMAIL = "erp-ai-test@sandbox.invalid"
+SANDBOX_IDENTITY = f"ERP AI Test\n{SANDBOX_EMAIL}\nERP AI Test\n{SANDBOX_EMAIL}\n"
+LEAKED_EMAIL = "real.person@example.com"
+
+
+class TestGitSandbox(FrappeTestCase):
+	def make_fake_home(self) -> str:
+		"""A HOME whose `.gitconfig` sets a real-looking identity and a global commit-msg hook that adds it."""
+		home = os.path.realpath(tempfile.mkdtemp())
+		self.addCleanup(shutil.rmtree, home, True)
+		hooks = os.path.join(home, "hooks")
+		os.makedirs(hooks)
+		hook = os.path.join(hooks, "commit-msg")
+		with open(hook, "w", encoding="utf-8") as handle:
+			handle.write(f'#!/bin/sh\necho "Signed-off-by: Real Person <{LEAKED_EMAIL}>" >> "$1"\n')
+		os.chmod(hook, 0o755)
+		with open(os.path.join(home, ".gitconfig"), "w", encoding="utf-8") as handle:
+			handle.write(
+				f"[user]\n\tname = Real Person\n\temail = {LEAKED_EMAIL}\n[core]\n\thooksPath = {hooks}\n"
+			)
+		return home
+
+	def test_git_sandbox_redirects_apps_root(self):
+		real_root = os.path.realpath(os.path.join(frappe.get_app_path("frappe"), "..", ".."))
+		self.assertEqual(source.get_source_root(), real_root)
+
+		host = unittest.TestCase()
+		sandbox = GitSandbox(host)
+		self.assertEqual(source.get_source_root(), sandbox.root)
+		self.assertNotEqual(sandbox.root, real_root)
+		self.assertEqual(os.path.basename(sandbox.root), "apps")
+		temp_dir = os.path.realpath(tempfile.gettempdir())
+		self.assertEqual(os.path.commonpath([temp_dir, sandbox.root]), temp_dir)
+		self.assertEqual(
+			sorted(os.listdir(sandbox.root)),
+			["custom_app", "erp_ai", "erp_ai-wt", "erpnext", "frappe", "helpdesk", "hrms"],
+		)
+		self.assertEqual(sandbox.repo("erp_ai"), os.path.join(sandbox.root, "erp_ai"))
+		self.assertEqual(
+			source.resolve_safe_path("erp_ai/README.md"), os.path.join(sandbox.root, "erp_ai", "README.md")
+		)
+
+		host.doCleanups()
+		self.assertEqual(source.get_source_root(), real_root)
+		self.assertFalse(os.path.exists(sandbox.root))
+
+	def test_git_sandbox_repos_are_isolated_from_global_config(self):
+		fake_home = self.make_fake_home()
+		with patch.dict(os.environ, {"HOME": fake_home, "XDG_CONFIG_HOME": fake_home}):
+			sandbox = GitSandbox(self, apps=("custom_app",), erp_ai_worktree=None)
+			sandbox.commit_file("custom_app", "app.py", "x = 1\n")
+			meta = sandbox.log_meta("custom_app")
+			first = sandbox.log_meta("custom_app", rev="HEAD~1")
+			env = sandbox.env()
+
+		self.assertEqual(meta, SANDBOX_IDENTITY + "add app.py\n")
+		self.assertEqual(first, SANDBOX_IDENTITY + "initial commit\n")
+		self.assertNotIn(LEAKED_EMAIL, meta + first)
+		self.assertEqual(env["GIT_CONFIG_GLOBAL"], "/dev/null")
+		self.assertEqual(env["GIT_CONFIG_NOSYSTEM"], "1")
+		self.assertEqual(env["GIT_AUTHOR_EMAIL"], SANDBOX_EMAIL)
+		self.assertEqual(env["GIT_COMMITTER_EMAIL"], SANDBOX_EMAIL)
+
+	def test_git_sandbox_ignores_inherited_git_dir(self):
+		stray = os.path.realpath(tempfile.mkdtemp())
+		self.addCleanup(shutil.rmtree, stray, True)
+		stray_git_dir = os.path.join(stray, ".git")
+		with patch.dict(os.environ, {"GIT_DIR": stray_git_dir, "GIT_WORK_TREE": stray}):
+			sandbox = GitSandbox(self, apps=("custom_app",), erp_ai_worktree=None)
+			env = sandbox.env()
+			count = sandbox.git("custom_app", "rev-list", "--count", "HEAD")
+		self.assertEqual(count, "1\n")
+		self.assertFalse(os.path.exists(stray_git_dir))
+		self.assertNotIn("GIT_DIR", env)
+		self.assertNotIn("GIT_WORK_TREE", env)
+
+	def test_git_sandbox_each_repo_has_first_commit_on_main(self):
+		sandbox = GitSandbox(self)
+		for app in SANDBOX_APPS:
+			with self.subTest(app=app):
+				repo = sandbox.repo(app)
+				self.assertTrue(os.path.isdir(os.path.join(repo, ".git")))
+				self.assertEqual(sandbox.git(app, "rev-parse", "--show-toplevel"), repo + "\n")
+				self.assertEqual(sandbox.git(app, "symbolic-ref", "HEAD"), "refs/heads/main\n")
+				self.assertEqual(sandbox.git(app, "rev-list", "--count", "HEAD"), "1\n")
+				self.assertEqual(sandbox.git(app, "ls-tree", "--name-only", "HEAD"), "README.md\n")
+				self.assertEqual(sandbox.git(app, "status", "--porcelain"), "")
+
+	def test_git_sandbox_erp_ai_worktree_is_real_worktree(self):
+		sandbox = GitSandbox(self)
+		main_repo = sandbox.repo("erp_ai")
+		worktree = sandbox.repo("erp_ai-wt")
+		self.assertEqual(worktree, os.path.join(sandbox.root, "erp_ai-wt"))
+		dot_git = os.path.join(worktree, ".git")
+		self.assertTrue(os.path.isfile(dot_git))
+		admin = os.path.join(main_repo, ".git", "worktrees", "erp_ai-wt")
+		with open(dot_git, encoding="utf-8") as handle:
+			self.assertEqual(handle.read(), f"gitdir: {admin}\n")
+		with open(os.path.join(admin, "commondir"), encoding="utf-8") as handle:
+			self.assertEqual(handle.read(), "../..\n")
+		self.assertEqual(
+			sandbox.git("erp_ai-wt", "rev-parse", "--path-format=absolute", "--git-common-dir"),
+			os.path.join(main_repo, ".git") + "\n",
+		)
+		self.assertEqual(sandbox.git("erp_ai-wt", "symbolic-ref", "HEAD"), "refs/heads/erp_ai-wt\n")
+		self.assertEqual(
+			sandbox.git("erp_ai-wt", "rev-parse", "HEAD"), sandbox.git("erp_ai", "rev-parse", "main")
+		)
+
+	def test_git_sandbox_custom_apps_without_worktree(self):
+		sandbox = GitSandbox(self, apps=("frappe", "erp_ai"), erp_ai_worktree=None)
+		self.assertEqual(sorted(os.listdir(sandbox.root)), ["erp_ai", "frappe"])
+
+	def test_git_sandbox_commit_stage_unstaged_and_refs(self):
+		sandbox = GitSandbox(self, apps=("custom_app",), erp_ai_worktree=None)
+		first = sandbox.git("custom_app", "rev-parse", "HEAD").strip()
+		sha = sandbox.commit_file("custom_app", "pkg/mod.py", "x = 2\n")
+		self.assertRegex(sha, r"^[0-9a-f]{40}$")
+		self.assertNotEqual(sha, first)
+		self.assertEqual(sandbox.git("custom_app", "rev-parse", "HEAD"), sha + "\n")
+		self.assertEqual(sandbox.git("custom_app", "rev-parse", "HEAD~1"), first + "\n")
+		self.assertEqual(sandbox.git("custom_app", "show", "HEAD:pkg/mod.py"), "x = 2\n")
+		self.assertEqual(
+			sandbox.git("custom_app", "diff-tree", "--no-commit-id", "--name-only", "-r", "HEAD"),
+			"pkg/mod.py\n",
+		)
+		self.assertEqual(sandbox.refs("custom_app"), {"refs/heads/main": sha})
+
+		sandbox.stage("custom_app", "staged.py", "s = 1\n")
+		sandbox.write_unstaged("custom_app", "pkg/mod.py", "x = 3\n")
+		self.assertEqual(sandbox.git("custom_app", "status", "--porcelain"), " M pkg/mod.py\nA  staged.py\n")
+		self.assertEqual(sandbox.git("custom_app", "show", ":staged.py"), "s = 1\n")
+		with open(os.path.join(sandbox.repo("custom_app"), "pkg", "mod.py"), encoding="utf-8") as handle:
+			self.assertEqual(handle.read(), "x = 3\n")
+		self.assertEqual(sandbox.refs("custom_app"), {"refs/heads/main": sha})
+
+	def test_git_sandbox_refuses_git_outside_its_temp_dir(self):
+		sandbox = GitSandbox(self, apps=("custom_app",), erp_ai_worktree=None)
+		for app in ("..", "../..", "/tmp", "custom_app/../../.."):
+			with self.subTest(app=app):
+				with self.assertRaises(ValueError):
+					sandbox.git(app, "status")

@@ -1,6 +1,7 @@
 import json
 import os
 import shutil
+import subprocess
 import tempfile
 from unittest.mock import patch
 
@@ -324,3 +325,106 @@ class TempAppsRoot:
 		with open(path, "w", encoding="utf-8") as handle:
 			handle.write(text)
 		return path
+
+
+GIT_SANDBOX_NAME = "ERP AI Test"
+GIT_SANDBOX_EMAIL = "erp-ai-test@sandbox.invalid"
+GIT_SANDBOX_TIMEOUT_S = 30
+
+
+class GitSandbox:
+	"""A temporary `apps/` root of throw-away git repos that `source.get_source_root` returns for one test (NFR-9).
+
+	Every app in `apps` is a repo on branch `main` with one first commit (`README.md`). When `erp_ai` is in
+	`apps` and `erp_ai_worktree` is set, `<root>/<erp_ai_worktree>` is a real `git worktree` of it on a branch
+	of the same name. The helper runs git only inside its own `tempfile.mkdtemp()` directory (removed by
+	`addCleanup`), with inherited `GIT_*` variables dropped, no global/system config and a fixed test identity.
+	"""
+
+	def __init__(
+		self,
+		testcase,
+		apps=("frappe", "erpnext", "helpdesk", "hrms", "erp_ai", "custom_app"),
+		*,
+		erp_ai_worktree="erp_ai-wt",
+	):
+		self.base = os.path.realpath(tempfile.mkdtemp())
+		testcase.addCleanup(shutil.rmtree, self.base, True)
+		self.root = os.path.join(self.base, "apps")
+		os.makedirs(self.root)
+		for app in apps:
+			os.makedirs(self.repo(app))
+			self.git(app, "init", "--quiet", "--initial-branch=main")
+			self.commit_file(app, "README.md", f"# {app}\n", message="initial commit")
+		if erp_ai_worktree and "erp_ai" in apps:
+			self.git(
+				"erp_ai", "worktree", "add", "--quiet", "-b", erp_ai_worktree, self.repo(erp_ai_worktree)
+			)
+		patcher = patch(SOURCE_ROOT_PATH, return_value=self.root)
+		patcher.start()
+		testcase.addCleanup(patcher.stop)
+
+	def env(self) -> dict:
+		"""Environment of every helper git command: the process env minus `GIT_*`, plus isolation and identity."""
+		env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
+		env.update(
+			{
+				"GIT_CONFIG_GLOBAL": "/dev/null",
+				"GIT_CONFIG_NOSYSTEM": "1",
+				"GIT_AUTHOR_NAME": GIT_SANDBOX_NAME,
+				"GIT_AUTHOR_EMAIL": GIT_SANDBOX_EMAIL,
+				"GIT_COMMITTER_NAME": GIT_SANDBOX_NAME,
+				"GIT_COMMITTER_EMAIL": GIT_SANDBOX_EMAIL,
+				"LC_ALL": "C",
+			}
+		)
+		return env
+
+	def repo(self, app) -> str:
+		return os.path.join(self.root, app)
+
+	def git(self, app, *args) -> str:
+		"""Run `git <args>` in `repo(app)` and return stdout; refuse any directory outside the sandbox."""
+		cwd = os.path.realpath(self.repo(app))
+		if os.path.commonpath([self.base, cwd]) != self.base or cwd == self.base:
+			raise ValueError(f"GitSandbox refuses to run git outside {self.base}: {cwd}")
+		completed = subprocess.run(
+			["git", *args],
+			cwd=cwd,
+			env=self.env(),
+			stdin=subprocess.DEVNULL,
+			capture_output=True,
+			text=True,
+			timeout=GIT_SANDBOX_TIMEOUT_S,
+		)
+		if completed.returncode != 0:
+			raise AssertionError(f"git {' '.join(args)} failed in {cwd}: {completed.stderr}")
+		return completed.stdout
+
+	def _write(self, app, rel, content) -> None:
+		path = os.path.join(self.repo(app), rel)
+		os.makedirs(os.path.dirname(path), exist_ok=True)
+		with open(path, "wb") as handle:
+			handle.write(content if isinstance(content, bytes) else content.encode("utf-8"))
+
+	def commit_file(self, app, rel, content, *, message=None) -> str:
+		"""Write, add and commit one file; return the new commit sha."""
+		self.stage(app, rel, content)
+		self.git(app, "commit", "--quiet", "--no-gpg-sign", "-m", message or f"add {rel}", "--", rel)
+		return self.git(app, "rev-parse", "HEAD").strip()
+
+	def stage(self, app, rel, content) -> None:
+		self._write(app, rel, content)
+		self.git(app, "add", "--", rel)
+
+	def write_unstaged(self, app, rel, content) -> None:
+		self._write(app, rel, content)
+
+	def refs(self, app) -> dict:
+		"""`{refname: sha}` of every ref (`for-each-ref`)."""
+		output = self.git(app, "for-each-ref", "--format=%(refname) %(objectname)")
+		return dict(line.split(" ", 1) for line in output.splitlines())
+
+	def log_meta(self, app, rev="HEAD") -> str:
+		"""Author name, author email, committer name, committer email and message of `rev`, one per line."""
+		return self.git(app, "log", "-1", "--format=format:%an%n%ae%n%cn%n%ce%n%B", rev)

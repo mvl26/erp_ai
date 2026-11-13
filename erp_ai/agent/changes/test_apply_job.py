@@ -2,6 +2,8 @@ import dataclasses
 import hashlib
 import json
 import os
+import shutil
+import time
 from unittest.mock import patch
 
 import frappe
@@ -36,6 +38,12 @@ NEW_REL = "pkg/new_mod.py"
 BEFORE = "x = 1\n# Tiếng Việt\n"
 AFTER = "x = 2\n# Tiếng Việt\n"
 ACTOR = "apply.instructor@example.com"
+# Design table 3.2, written out by hand so a changed constant cannot hide a changed text.
+GIT_LOCKED_TEXT = "kho git đang bị khóa (index.lock): có thao tác git khác đang chạy hoặc bị dừng giữa chừng"
+GIT_DETACHED_TEXT = "HEAD của kho git không nằm trên nhánh nào (detached)"
+GIT_IN_PROGRESS_TEXT = "kho git đang dở merge, rebase, cherry-pick hoặc revert"
+GIT_IGNORED_TEXT = "file đích bị git bỏ qua (.gitignore)"
+GIT_NOT_REPO_TEXT = "thư mục app không phải gốc một kho git"
 
 
 def _sha(text: str) -> str:
@@ -146,7 +154,7 @@ class TestApplyCode(ApplyJobTestCase):
 		self.assertEqual(self.worktree_changes(), "")
 		self.assertEqual(self.steps(name), ["approve", "apply"])
 
-	def test_apply_leaves_other_dirty_files_out_of_the_commit(self):
+	def test_other_dirty_files_do_not_block_apply(self):
 		self.sandbox.commit_file(APP, "pkg/other.py", "a = 1\n")
 		with open(self.path("pkg/other.py"), "w", encoding="utf-8") as handle:
 			handle.write("a = 2\n")
@@ -199,18 +207,24 @@ class TestApplyCode(ApplyJobTestCase):
 		self.assertEqual(self.state(name).change_status, CHANGE_STATUS_STALE)
 		self.assertEqual(self.read(), "x = 5\n")
 
-	def test_branch_changed_since_proposal_is_stale(self):
+	def test_branch_changed_after_approval_becomes_stale(self):
 		name = self.approved(self.code_proposal())
-		self.sandbox.git(APP, "checkout", "--quiet", "-b", "other")
+		main_head = self.head()
+		self.sandbox.switch_branch(APP, "other")
 
 		apply_job.run_change(name, "apply")
 
 		state = self.state(name)
+		# Design table 3.2 `GIT_BRANCH_CHANGED`, word for word (spec D-1, ADR-022 decision 6).
 		self.assertEqual(
 			(state.change_status, state.failure_reason),
-			(CHANGE_STATUS_STALE, "nhánh đang checkout đã đổi từ lúc đề xuất"),
+			(CHANGE_STATUS_STALE, "nhánh đang checkout đã đổi kể từ lúc đề xuất"),
 		)
 		self.assertEqual(self.read(), BEFORE)
+		self.assertEqual(self.sandbox.git(APP, "rev-parse", "main").strip(), main_head)
+		self.assertEqual(self.sandbox.git(APP, "rev-parse", "other").strip(), main_head)
+		self.assertEqual(self.worktree_changes(), "")
+		self.assertEqual(self.steps(name), ["approve", "stale"])
 
 	def test_switch_off_or_app_removed_fails_without_writing(self):
 		for settings, reason in (
@@ -294,6 +308,100 @@ class TestApplyCode(ApplyJobTestCase):
 	def test_unknown_action_is_refused(self):
 		with self.assertRaises(ValueError):
 			apply_job.run_change("x", "delete")
+
+
+class TestGitPrecheck(ApplyJobTestCase):
+	"""Design 4.3 step 4.3 item 2 (AC-18 at apply time, NFR-3, ADR-022 decisions 3, 6 and 7)."""
+
+	def remove_git_dir(self):
+		shutil.rmtree(os.path.join(self.sandbox.repo(APP), ".git"))
+
+	def ignore_new_target(self):
+		self.sandbox.commit_file(APP, ".gitignore", f"{NEW_REL}\n")
+
+	def test_git_precheck_fails_at_apply_without_write_or_commit(self):
+		# Each git refusal of design table 3.2 ends the job as `Lỗi` with its text, word for word.
+		cases = (
+			("index.lock", lambda: self.sandbox.hold_index_lock(APP), False, GIT_LOCKED_TEXT),
+			("detached", lambda: self.sandbox.detach(APP), False, GIT_DETACHED_TEXT),
+			(
+				"MERGE_HEAD",
+				lambda: self.sandbox.mark_in_progress(APP, "MERGE_HEAD"),
+				False,
+				GIT_IN_PROGRESS_TEXT,
+			),
+			("ignored after", self.ignore_new_target, True, GIT_IGNORED_TEXT),
+			(".git removed", self.remove_git_dir, False, GIT_NOT_REPO_TEXT),
+		)
+		for label, break_git, new_file, reason in cases:
+			with self.subTest(label):
+				self.sandbox = GitSandbox(self)
+				self.sandbox.commit_file(APP, REL, BEFORE)
+				name = self.approved(self.new_file_proposal() if new_file else self.code_proposal())
+				break_git()
+				count = None if label == ".git removed" else self.commit_count()
+
+				with (
+					patch.object(file_writer, "write_atomic", wraps=file_writer.write_atomic) as write,
+					patch.object(process_runner, "git_add_new", wraps=process_runner.git_add_new) as add,
+					patch.object(
+						process_runner, "git_commit_only", wraps=process_runner.git_commit_only
+					) as commit,
+				):
+					apply_job.run_change(name, "apply")
+
+				state = self.state(name)
+				self.assertEqual((state.change_status, state.failure_reason), (CHANGE_STATUS_FAILED, reason))
+				write.assert_not_called()
+				add.assert_not_called()
+				commit.assert_not_called()
+				if new_file:
+					self.assertFalse(os.path.lexists(self.path(NEW_REL)))
+				else:
+					self.assertEqual(self.read(), BEFORE)
+				if count is not None:
+					self.assertEqual(self.commit_count(), count)
+				self.assertEqual(self.steps(name), ["approve", "fail"])
+
+	def test_index_lock_fails_fast(self):
+		name = self.approved(self.code_proposal())
+		self.sandbox.hold_index_lock(APP)
+		lock = os.path.join(self.sandbox.repo(APP), ".git", "index.lock")
+		count = self.commit_count()
+
+		started = time.monotonic()
+		apply_job.run_change(name, "apply")
+		elapsed = time.monotonic() - started
+
+		state = self.state(name)
+		self.assertEqual((state.change_status, state.failure_reason), (CHANGE_STATUS_FAILED, GIT_LOCKED_TEXT))
+		self.assertLess(elapsed, source.GIT_TIMEOUT_S)
+		# The job never removes a lock it did not take (design 4.3 error table).
+		self.assertTrue(os.path.exists(lock))
+		self.assertEqual(self.read(), BEFORE)
+		self.assertEqual(self.commit_count(), count)
+		self.assertEqual(self.steps(name), ["approve", "fail"])
+
+	def test_git_precheck_limit_comes_from_the_job_deadline(self):
+		start = self.head()
+		# Seconds gone from the job budget when git is read → the `limit_s` of `read_git_state` (NFR-3).
+		for spent, limit in (
+			(100, source.GIT_TIMEOUT_S),
+			(COMMAND_TIMEOUT_S - 5, 5),
+			(COMMAND_TIMEOUT_S + 50, 1),
+		):
+			with self.subTest(spent=spent):
+				self.sandbox.git(APP, "reset", "--hard", "--quiet", start)
+				name = self.approved(self.code_proposal())
+				clock = iter([1000.0])
+				with (
+					patch("time.monotonic", side_effect=lambda spent=spent: next(clock, 1000.0 + spent)),
+					patch.object(source, "read_git_state", wraps=source.read_git_state) as read_git,
+				):
+					apply_job.run_change(name, "apply")
+
+				self.assertEqual(read_git.call_args.kwargs.get("limit_s"), limit)
+				self.assertEqual(self.state(name).change_status, CHANGE_STATUS_APPLIED)
 
 
 class TestApplyCodeSteps(ApplyJobTestCase):

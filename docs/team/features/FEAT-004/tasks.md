@@ -77,7 +77,9 @@ Tiến độ: BASE ghi ở đây trước mỗi lần gọi dev.
 - round 36: BASE=0aaf3fb · dev T16 (`team/FEAT-004-task-16` @ `66a0bab`) · `cmd.test` chạy nền
 - `cmd.test` trên `0aaf3fb`: `Ran 1092 tests in 402.599s` / `OK` → tick T14 (review-14 approve, 2 vòng)
 - round 37: review T16 (0aaf3fb..`66a0bab`) approve, 1 vòng · merge T16 `aec5e5c`
-- round 38: BASE=(commit ngay sau `aec5e5c`) · dev T49 · `cmd.test` chạy nền
+- round 38: BASE=7b58389 · dev T49 (`team/FEAT-004-task-49` @ `f46c279`) · `cmd.test` chạy nền
+- `cmd.test` trên `7b58389` (chạy cùng lúc dev T49 chạy `cmd.test_one` trên site chung): `Ran 1102 tests in 318.138s` / `FAILED (errors=1)`, lỗi ở `test_route_ticket.TestCreateRoutedTask.test_description_escaped_and_has_scores` → CHƯA tick T16; chạy lại cả bộ khi không còn ai dùng site
+- round 39: review T49 (7b58389..`f46c279`) approve, 1 vòng · merge T49 `3c69fdd` (lệch: merge trước khi đọc kết quả đỏ ở trên; chưa tick T16, T49 cho tới khi cả bộ xanh trên `3c69fdd`)
 
 ## Bảng đổi ID cũ → mới (plan lần 1, 34 task → lần này 51 task)
 FEAT-005 trích `F4-T<n>` (T2–T7, T12, T23, T24, T28–T33): các ID đó KHÔNG đổi nghĩa lớn; ID cũ T1–T34 giữ nguyên, task mới nhận T35–T51 và nằm xen đúng chỗ trong file.

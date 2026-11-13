@@ -5,8 +5,10 @@ from unittest.mock import patch
 from frappe.tests.utils import FrappeTestCase
 
 import erp_ai
+from erp_ai.agent.changes import process_runner
 from erp_ai.agent.tools import change_guard, source
-from erp_ai.test_utils import TempAppsRoot
+from erp_ai.constants import CORE_APPS
+from erp_ai.test_utils import GitSandbox, TempAppsRoot
 
 ALLOWED = ("myapp",)
 SITE = "site1.test"
@@ -20,6 +22,19 @@ NEEDS_APP_REFUSAL = "lệnh build cần app"
 TAKES_NO_APP_REFUSAL = "lệnh này không nhận app"
 APP_NOT_ALLOWED_REFUSAL = "app không có trong danh sách được sửa"
 APP_FORBIDDEN_REFUSAL = "không được sửa app erp_ai hoặc kho git của nó"
+GIT_PATTERN_REFUSAL = 'tên file có ký tự * ? [ ] hoặc bắt đầu bằng ":" hay "-", git không commit an toàn được'
+
+HAND_WRITTEN_CORE_APPS = ("frappe", "erpnext", "helpdesk", "hrms")
+# design-addendum-2 QĐ-A2: refused and allowed names, under one app.
+GIT_PATTERN_REFUSED = (
+	"custom_app/[id].vue",
+	"custom_app/src/a*.py",
+	"custom_app/a?.py",
+	"custom_app/a].py",
+	"custom_app/:x.py",
+	"custom_app/-x.py",
+)
+GIT_PATTERN_ALLOWED = ("custom_app/sub/-x.py", "custom_app/a:b.py")
 
 # Denied list of spec A-6 plus ADR-022 QĐ 2 (design 8.1): 23 names.
 A6_DENIED_COMMANDS = (
@@ -63,7 +78,8 @@ class TestCheckWritePath(FrappeTestCase):
 		self.root = self.apps.root
 
 	def reason(self, rel, allowed=ALLOWED, *, new_file=False):
-		return change_guard.check_write_path(rel, allowed, new_file=new_file).reason
+		# The temp root holds no git repos: these T7-T9 checks run without the git read (T42).
+		return change_guard.check_write_path(rel, allowed, new_file=new_file, read_git=False).reason
 
 	def fake_erp_ai_repo(self):
 		"""Build, with plain file writes, a temp `erp_ai` repo (`.git` dir) and its worktree `erp_ai-wt`.
@@ -95,6 +111,7 @@ class TestCheckWritePath(FrappeTestCase):
 				change_guard.NAME_FORBIDDEN,
 				change_guard.EXT_FORBIDDEN,
 				change_guard.GIT_DIR,
+				change_guard.PATH_GIT_PATTERN,
 			),
 			(
 				"đường dẫn không hợp lệ hoặc nằm ngoài apps/",
@@ -103,6 +120,7 @@ class TestCheckWritePath(FrappeTestCase):
 				"tên file thuộc loại bí mật hoặc được bảo vệ",
 				"đuôi file không được phép",
 				"không được chạm thư mục .git",
+				'tên file có ký tự * ? [ ] hoặc bắt đầu bằng ":" hay "-", git không commit an toàn được',
 			),
 		)
 
@@ -209,14 +227,18 @@ class TestCheckWritePath(FrappeTestCase):
 	def test_allows_file_in_allowed_app(self):
 		full = os.path.join(self.root, "myapp", "ok.py")
 		self.assertEqual(
-			change_guard.check_write_path("myapp/ok.py", ALLOWED, new_file=False),
+			change_guard.check_write_path("myapp/ok.py", ALLOWED, new_file=False, read_git=False),
 			change_guard.GuardResult(full_path=full, rel_path="myapp/ok.py", app="myapp", reason=None),
 		)
-		new = change_guard.check_write_path("myapp/pkg/new_module.py", ("myapp", "otherapp"), new_file=True)
+		new = change_guard.check_write_path(
+			"myapp/pkg/new_module.py", ("myapp", "otherapp"), new_file=True, read_git=False
+		)
 		self.assertIsNone(new.reason)
 		self.assertEqual(new.full_path, os.path.join(self.root, "myapp", "pkg", "new_module.py"))
 		self.assertEqual((new.rel_path, new.app), ("myapp/pkg/new_module.py", "myapp"))
-		normalized = change_guard.check_write_path("myapp/sub/../ok.py", ALLOWED, new_file=False)
+		normalized = change_guard.check_write_path(
+			"myapp/sub/../ok.py", ALLOWED, new_file=False, read_git=False
+		)
 		self.assertEqual((normalized.rel_path, normalized.reason), ("myapp/ok.py", None))
 
 	def test_refuses_erp_ai_app(self):
@@ -351,6 +373,173 @@ class TestCheckWritePath(FrappeTestCase):
 			with self.subTest(rel=rel):
 				self.assertEqual(self.reason(rel, allowed, new_file=new_file), change_guard.APP_FORBIDDEN)
 		self.assertIsNone(self.reason("myapp/ok.py", allowed))
+
+
+class TestCheckWritePathGit(FrappeTestCase):
+	"""T42: core apps, the git state read at proposal time and git pattern names, on `GitSandbox` repos only."""
+
+	def setUp(self):
+		self.sandbox = GitSandbox(self)
+		self.root = self.sandbox.root
+
+	def head(self, app):
+		return self.sandbox.git(app, "rev-parse", "HEAD").strip()
+
+	def make_dirty(self, app, rel="README.md"):
+		with open(os.path.join(self.sandbox.repo(app), rel), "a", encoding="utf-8") as handle:
+			handle.write("changed\n")
+
+	def git_reads(self):
+		reads = patch.object(source, "run_git_read", wraps=source.run_git_read)
+		mock = reads.start()
+		self.addCleanup(reads.stop)
+		return mock
+
+	def test_core_apps_allowed_only_when_listed(self):
+		self.assertEqual(CORE_APPS, ("frappe", "erpnext", "helpdesk", "hrms"))
+		listed = (*HAND_WRITTEN_CORE_APPS, "custom_app")
+		for app in HAND_WRITTEN_CORE_APPS:
+			with self.subTest(app=app, listed=True):
+				result = change_guard.check_write_path(f"{app}/README.md", listed, new_file=False)
+				self.assertIsNone(result.reason)
+				self.assertTrue(result.is_core_app)
+				self.assertEqual(
+					(result.app, result.git.branch, result.git.head), (app, "main", self.head(app))
+				)
+				no_git = change_guard.check_write_path(
+					f"{app}/README.md", listed, new_file=False, read_git=False
+				)
+				self.assertEqual((no_git.reason, no_git.is_core_app, no_git.git), (None, True, None))
+			with self.subTest(app=app, listed=False):
+				result = change_guard.check_write_path(f"{app}/README.md", ("custom_app",), new_file=False)
+				self.assertEqual(result.reason, APP_NOT_ALLOWED_REFUSAL)
+				self.assertFalse(result.is_core_app)
+				self.assertIsNone(result.git)
+		# `erp_ai` is not a core app and stays refused even when listed (AC-16).
+		for rel in ("erp_ai/README.md", "erp_ai-wt/README.md"):
+			with self.subTest(rel=rel):
+				result = change_guard.check_write_path(rel, (*listed, "erp_ai", "erp_ai-wt"), new_file=False)
+				self.assertEqual(result.reason, APP_FORBIDDEN_REFUSAL)
+				self.assertFalse(result.is_core_app)
+				self.assertIsNone(result.git)
+
+	def test_non_core_app_has_no_core_flag(self):
+		self.assertNotIn("custom_app", HAND_WRITTEN_CORE_APPS)
+		for read_git in (True, False):
+			with self.subTest(read_git=read_git):
+				result = change_guard.check_write_path(
+					"custom_app/README.md", ("custom_app",), new_file=False, read_git=read_git
+				)
+				self.assertIsNone(result.reason)
+				self.assertFalse(result.is_core_app)
+
+	def test_guard_returns_git_state_when_allowed(self):
+		repo = self.sandbox.repo("custom_app")
+		for rel, new_file, rel_in_repo in (
+			("custom_app/README.md", False, "README.md"),
+			("custom_app/pkg/new_module.py", True, "pkg/new_module.py"),
+		):
+			with self.subTest(rel=rel):
+				result = change_guard.check_write_path(rel, ("custom_app",), new_file=new_file)
+				self.assertIsNone(result.reason)
+				self.assertEqual(result.full_path, os.path.join(repo, rel_in_repo))
+				self.assertEqual(
+					result.git,
+					source.GitState(
+						refusal=None,
+						repo_root=repo,
+						rel_in_repo=rel_in_repo,
+						branch="main",
+						head=self.head("custom_app"),
+						upstream_ref="",
+						ahead_count=0,
+					),
+				)
+
+	def test_guard_refuses_with_git_reason_and_read_git_false_skips_git(self):
+		self.make_dirty("custom_app")
+		reads = self.git_reads()
+		refused = change_guard.check_write_path("custom_app/README.md", ("custom_app",), new_file=False)
+		self.assertEqual(refused.reason, "file đích có thay đổi chưa commit")
+		self.assertEqual((refused.full_path, refused.git, refused.is_core_app), (None, None, False))
+		self.assertGreater(reads.call_count, 0)
+		reads.reset_mock()
+		skipped = change_guard.check_write_path(
+			"custom_app/README.md", ("custom_app",), new_file=False, read_git=False
+		)
+		self.assertEqual((skipped.reason, skipped.git), (None, None))
+		self.assertEqual(skipped.full_path, os.path.join(self.sandbox.repo("custom_app"), "README.md"))
+		self.assertEqual(reads.call_count, 0)
+		# An ignored new file is refused with the git sentence too, and only when git is read.
+		self.sandbox.commit_file("custom_app", ".gitignore", "build/\n")
+		self.assertEqual(
+			change_guard.check_write_path("custom_app/build/out.js", ("custom_app",), new_file=True).reason,
+			"file đích bị git bỏ qua (.gitignore)",
+		)
+		self.assertIsNone(
+			change_guard.check_write_path(
+				"custom_app/build/out.js", ("custom_app",), new_file=True, read_git=False
+			).reason
+		)
+
+	def test_refuses_git_pattern_names(self):
+		for rel in GIT_PATTERN_REFUSED:
+			with self.subTest(rel=rel):
+				result = change_guard.check_write_path(rel, ("custom_app",), new_file=True)
+				self.assertEqual(result.reason, GIT_PATTERN_REFUSAL)
+				self.assertEqual((result.full_path, result.git), (None, None))
+		for rel in GIT_PATTERN_ALLOWED:
+			with self.subTest(rel=rel):
+				result = change_guard.check_write_path(rel, ("custom_app",), new_file=True)
+				self.assertIsNone(result.reason)
+				self.assertEqual(result.git.rel_in_repo, rel.partition("/")[2])
+		# Order of table 3.1: earlier refusals win over the git pattern one; it comes before the git read.
+		for rel, expected in (
+			("other/a*.py", APP_NOT_ALLOWED_REFUSAL),
+			("custom_app/-secret.py", "tên file thuộc loại bí mật hoặc được bảo vệ"),
+			("custom_app/a*.sh", "đuôi file không được phép"),
+			("custom_app/.git/a*.py", "không được chạm thư mục .git"),
+			("custom_app/:x/.git/a.py", "không được chạm thư mục .git"),
+		):
+			with self.subTest(rel=rel):
+				self.assertEqual(
+					change_guard.check_write_path(rel, ("custom_app",), new_file=True).reason, expected
+				)
+		# A tracked, dirty pattern name: git would say GIT_DIRTY, the pattern refusal comes first.
+		self.sandbox.commit_file("custom_app", "a*.py", "x = 1\n")
+		self.make_dirty("custom_app", "a*.py")
+		self.assertEqual(
+			change_guard.check_write_path("custom_app/a*.py", ("custom_app",), new_file=False).reason,
+			GIT_PATTERN_REFUSAL,
+		)
+
+	def test_git_pattern_refusal_also_with_read_git_false(self):
+		reads = self.git_reads()
+		for rel in GIT_PATTERN_REFUSED:
+			with self.subTest(rel=rel):
+				for read_git in (True, False):
+					result = change_guard.check_write_path(
+						rel, ("custom_app",), new_file=True, read_git=read_git
+					)
+					self.assertEqual(result.reason, GIT_PATTERN_REFUSAL)
+		self.assertEqual(reads.call_count, 0)
+
+	def test_guard_and_process_runner_agree_on_git_pattern_names(self):
+		repo = self.sandbox.repo("custom_app")
+		for rel in GIT_PATTERN_REFUSED:
+			with self.subTest(rel=rel, refused=True):
+				self.assertEqual(
+					change_guard.check_write_path(rel, ("custom_app",), new_file=True, read_git=False).reason,
+					GIT_PATTERN_REFUSAL,
+				)
+				with self.assertRaises(ValueError):
+					process_runner._check_git_write_call(repo, rel.partition("/")[2], 1)
+		for rel in GIT_PATTERN_ALLOWED:
+			with self.subTest(rel=rel, refused=False):
+				self.assertIsNone(
+					change_guard.check_write_path(rel, ("custom_app",), new_file=True, read_git=False).reason
+				)
+				self.assertIsNone(process_runner._check_git_write_call(repo, rel.partition("/")[2], 1))
 
 
 class TestBenchArgs(FrappeTestCase):

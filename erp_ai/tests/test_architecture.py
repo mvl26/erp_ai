@@ -32,6 +32,10 @@ CREDENTIALS_FILE = "gateway/credentials.py"
 QUEUE_FILE = "agent/queue.py"
 POLICY_FILE = "agent/policy.py"
 SOURCE_TOOL_FILE = "agent/tools/source.py"
+PROCESS_RUNNER_FILE = "agent/changes/process_runner.py"
+PROCESS_RUNNER_WRAPPER = "_run_wrapped"  # its callers pass cwd=/env= through to subprocess.run
+# ADR-013, ADR-022, D-12: the only files that start processes.
+SUBPROCESS_FILES = (SOURCE_TOOL_FILE, PROCESS_RUNNER_FILE)
 READ_TOOL_FILE = "agent/tools/read.py"
 HANDLERS_FILE = "handlers.py"
 TOOLS_PREFIX = "agent/tools/"
@@ -83,7 +87,7 @@ LAYER_RULES = (
 
 ENQUEUE_NAMES = ("enqueue", "enqueue_doc")
 ENQUEUE_REQUIRED_KEYWORDS = ("queue", "timeout", "enqueue_after_commit", "job_id", "deduplicate")
-ENQUEUE_TARGET = "erp_ai.agent.runner.run_for_ticket"
+ENQUEUE_TARGETS = ("erp_ai.agent.runner.run_for_ticket", "erp_ai.agent.changes.apply_job.run_change")
 
 CONFIG_DOCTYPES = ("ERP AI Setting", "ERP AI Credential")
 CONFIG_DOCTYPE_CONSTANTS = ("SETTING_DOCTYPE", "CREDENTIAL_DOCTYPE")
@@ -494,7 +498,7 @@ def check_single_enqueue_site(sources: dict) -> list:
 
 
 def check_enqueue_call_shape(sources: dict) -> list:
-	"""ADR-003: the one call has the runner path and all five parameters."""
+	"""ADR-003/ADR-013 QĐ 2: exactly two calls, one per target (runner, change job), each with all five parameters."""
 	source = sources.get(QUEUE_FILE)
 	if source is None:
 		return [f"{QUEUE_FILE}: file missing"]
@@ -503,19 +507,26 @@ def check_enqueue_call_shape(sources: dict) -> list:
 		for node in ast.walk(parse(QUEUE_FILE, source))
 		if isinstance(node, ast.Call) and referenced_name(node.func) in ENQUEUE_NAMES
 	]
-	if len(calls) != 1:
-		return [f"{QUEUE_FILE}: expected exactly one enqueue call, found {len(calls)}"]
-	call = calls[0]
+	if len(calls) != len(ENQUEUE_TARGETS):
+		return [f"{QUEUE_FILE}: expected exactly two enqueue calls, found {len(calls)}"]
 	violations = []
-	first = call.args[0] if call.args else None
-	if not (isinstance(first, ast.Constant) and first.value == ENQUEUE_TARGET):
+	targets = []
+	for call in calls:
+		first = call.args[0] if call.args else None
+		if isinstance(first, ast.Constant) and first.value in ENQUEUE_TARGETS:
+			targets.append(first.value)
+		else:
+			violations.append(
+				violation(QUEUE_FILE, call, f"first argument must be one of the strings {ENQUEUE_TARGETS!r}")
+			)
+		given = {keyword.arg for keyword in call.keywords}
+		for name in ENQUEUE_REQUIRED_KEYWORDS:
+			if name not in given:
+				violations.append(violation(QUEUE_FILE, call, f"missing keyword {name}="))
+	if not violations and sorted(targets) != sorted(ENQUEUE_TARGETS):
 		violations.append(
-			violation(QUEUE_FILE, call, f"first argument must be the string {ENQUEUE_TARGET!r}")
+			f"{QUEUE_FILE}: expected one call to each of {ENQUEUE_TARGETS!r}, found {targets!r}"
 		)
-	given = {keyword.arg for keyword in call.keywords}
-	for name in ENQUEUE_REQUIRED_KEYWORDS:
-		if name not in given:
-			violations.append(violation(QUEUE_FILE, call, f"missing keyword {name}="))
 	return violations
 
 
@@ -603,15 +614,16 @@ def check_tools_never_bypass_permissions(sources: dict) -> list:
 
 
 def check_subprocess_only_in_source_tool(sources: dict) -> list:
+	"""ADR-005, ADR-013, ADR-022: processes start only in SUBPROCESS_FILES."""
 	violations = []
 	for rel, source in only_python(sources).items():
-		if rel == SOURCE_TOOL_FILE:
+		if rel in SUBPROCESS_FILES:
 			continue
 		tree = parse(rel, source)
 		aliases = import_aliases(tree)
 		for lineno, target in imported_modules(tree, module_name(rel), False):
 			if module_in(target, "subprocess"):
-				violations.append(f"{rel}:{lineno}: imports {target} outside {SOURCE_TOOL_FILE}")
+				violations.append(f"{rel}:{lineno}: imports {target} outside {SUBPROCESS_FILES}")
 		for node in ast.walk(tree):
 			if isinstance(node, ast.Call):
 				name = resolved_name(node.func, aliases)
@@ -620,22 +632,36 @@ def check_subprocess_only_in_source_tool(sources: dict) -> list:
 					name.startswith("os.")
 					and (function in OS_SHELL_FUNCTIONS or function.startswith(OS_SHELL_PREFIXES))
 				):
-					violations.append(violation(rel, node, f"{name} outside {SOURCE_TOOL_FILE}"))
+					violations.append(violation(rel, node, f"{name} outside {SUBPROCESS_FILES}"))
 	return violations
 
 
 def check_subprocess_call_shape(sources: dict) -> list:
-	"""ADR-005: every subprocess call in the source tool has timeout=, a list command, no shell."""
-	source = sources.get(SOURCE_TOOL_FILE)
-	if source is None:
+	"""ADR-005/ADR-013: every subprocess call in SUBPROCESS_FILES has timeout=, a list command, no shell;
+	in process_runner.py every call also has the timeout-wrapped shape (ADR-013 QĐ 3, 7; D-3)."""
+	if SOURCE_TOOL_FILE not in sources:
 		return [f"{SOURCE_TOOL_FILE}: file missing"]
 	violations = []
-	tree = parse(SOURCE_TOOL_FILE, source)
+	for rel in SUBPROCESS_FILES:
+		if rel in sources:
+			violations.extend(subprocess_call_shape_problems(rel, sources[rel]))
+	return violations
+
+
+def subprocess_call_shape_problems(rel: str, source: str) -> list:
+	violations = []
+	tree = parse(rel, source)
 	aliases = import_aliases(tree)
 	for node in ast.walk(tree):
 		if not isinstance(node, ast.Call):
 			continue
 		name = resolved_name(node.func, aliases)
+		if rel == PROCESS_RUNNER_FILE and name == PROCESS_RUNNER_WRAPPER:
+			keywords = {keyword.arg: keyword.value for keyword in node.keywords}
+			violations.extend(
+				violation(rel, node, f"{name} {problem}") for problem in cwd_env_problems(keywords, aliases)
+			)
+			continue
 		if not name.startswith("subprocess.") or name.split(".")[-1] not in (
 			*SUBPROCESS_RUN_FUNCTIONS,
 			"Popen",
@@ -643,18 +669,51 @@ def check_subprocess_call_shape(sources: dict) -> list:
 			continue
 		keywords = {keyword.arg: keyword.value for keyword in node.keywords}
 		if name.split(".")[-1] not in SUBPROCESS_RUN_FUNCTIONS:
-			violations.append(
-				violation(SOURCE_TOOL_FILE, node, f"{name}: only run()-style calls with timeout")
-			)
+			violations.append(violation(rel, node, f"{name}: only run()-style calls with timeout"))
 		if "timeout" not in keywords:
-			violations.append(violation(SOURCE_TOOL_FILE, node, f"{name} without timeout="))
+			violations.append(violation(rel, node, f"{name} without timeout="))
 		shell = keywords.get("shell")
 		if shell is not None and not (isinstance(shell, ast.Constant) and shell.value is False):
-			violations.append(violation(SOURCE_TOOL_FILE, node, f"{name} with shell="))
+			violations.append(violation(rel, node, f"{name} with shell="))
 		command = node.args[0] if node.args else keywords.get("args")
 		if isinstance(command, ast.Constant | ast.JoinedStr):
-			violations.append(violation(SOURCE_TOOL_FILE, node, f"{name} with a string command, not a list"))
+			violations.append(violation(rel, node, f"{name} with a string command, not a list"))
+		if rel == PROCESS_RUNNER_FILE or is_timeout_wrapped(command):
+			violations.extend(
+				violation(rel, node, f"{name} {problem}")
+				for problem in timeout_wrapped_call_problems(keywords, aliases)
+			)
 	return violations
+
+
+def is_timeout_wrapped(command) -> bool:
+	"""ADR-022 QĐ 4: a `[TIMEOUT_EXECUTABLE, ...]` / `["timeout", ...]` command is a new FEAT-004 git call."""
+	first = command.elts[0] if isinstance(command, ast.List) and command.elts else None
+	return (isinstance(first, ast.Name) and first.id == "TIMEOUT_EXECUTABLE") or (
+		isinstance(first, ast.Constant) and first.value == "timeout"
+	)
+
+
+def timeout_wrapped_call_problems(keywords: dict, aliases: dict) -> list:
+	"""Own process group, explicit cwd= and an env= that never copies os.environ (ADR-022 QĐ 4, Ràng buộc)."""
+	problems = []
+	group = keywords.get("start_new_session")
+	if not (isinstance(group, ast.Constant) and group.value is True):
+		problems.append("without start_new_session=True")
+	return problems + cwd_env_problems(keywords, aliases)
+
+
+def cwd_env_problems(keywords: dict, aliases: dict) -> list:
+	"""An explicit cwd= and an env= that never copies os.environ (ADR-022 QĐ 4; design 8.2)."""
+	problems = []
+	if "cwd" not in keywords:
+		problems.append("without cwd=")
+	env = keywords.get("env")
+	if env is None:
+		problems.append("without env=")
+	elif any(resolved_name(part, aliases) == "os.environ" for part in ast.walk(env)):
+		problems.append("env= uses os.environ")
+	return problems
 
 
 def check_policy_fields_only_in_policy(sources: dict) -> list:
@@ -1743,8 +1802,20 @@ class TestArchitecture(unittest.TestCase):
 		scanned = only_python(self.sources)
 		self.assertGreater(len(scanned), 0)
 		self.assertIn("subprocess", self.sources[SOURCE_TOOL_FILE])
+		self.assertIn("subprocess", self.sources[PROCESS_RUNNER_FILE])
 		self.assertEqual(check_subprocess_only_in_source_tool(self.sources), [])
 		self.assertEqual(check_subprocess_call_shape(self.sources), [])
+		wrapped = [
+			node
+			for node in ast.walk(parse(SOURCE_TOOL_FILE, self.sources[SOURCE_TOOL_FILE]))
+			if isinstance(node, ast.Call) and node.args and is_timeout_wrapped(node.args[0])
+		]
+		self.assertEqual(
+			len(wrapped),
+			1,
+			"run_git_read must pass its argv inline so the shape rule sees it; "
+			"a later task that adds another timeout-wrapped call in source.py updates this count",
+		)
 
 	def test_level_and_send_policy_fields_only_in_policy(self):
 		scanned = only_python(self.sources)
@@ -1972,6 +2043,8 @@ class TestArchitecture(unittest.TestCase):
 # Tests of the scanners themselves (STD-TEST-8): violating code is caught, clean code is not flagged
 # ---------------------------------------------------------------------------------------------------
 
+ENQUEUE_GOOD_KEYWORDS = "queue='long', timeout=1, enqueue_after_commit=True, job_id='j', deduplicate=True"
+
 
 class TestScannersCatchViolations(unittest.TestCase):
 	def assertCaught(self, violations, *fragments):
@@ -2071,19 +2144,57 @@ class TestScannersCatchViolations(unittest.TestCase):
 		}
 		self.assertEqual(check_single_enqueue_site(sources), [])
 
-	def test_enqueue_call_shape_requires_five_parameters(self):
-		good = (
-			"import frappe\n"
-			f"frappe.enqueue({ENQUEUE_TARGET!r}, queue='long', timeout=1, enqueue_after_commit=True,"
-			" job_id='j', deduplicate=True)\n"
+	def test_enqueue_targets_pinned(self):
+		self.assertEqual(
+			ENQUEUE_TARGETS,
+			("erp_ai.agent.runner.run_for_ticket", "erp_ai.agent.changes.apply_job.run_change"),
 		)
+
+	@staticmethod
+	def enqueue_call(target: str, keywords: str = ENQUEUE_GOOD_KEYWORDS) -> str:
+		return f"frappe.enqueue({target!r}, {keywords})\n"
+
+	def test_enqueue_call_shape_accepts_runner_and_change_job(self):
+		good = "import frappe\n" + "".join(self.enqueue_call(target) for target in ENQUEUE_TARGETS)
 		self.assertEqual(check_enqueue_call_shape({QUEUE_FILE: good}), [])
-		missing = good.replace(", deduplicate=True", "")
-		self.assertCaught(check_enqueue_call_shape({QUEUE_FILE: missing}), "deduplicate")
-		wrong_target = good.replace(ENQUEUE_TARGET, "erp_ai.other.fn")
-		self.assertCaught(check_enqueue_call_shape({QUEUE_FILE: wrong_target}), "first argument")
-		twice = good + good
-		self.assertCaught(check_enqueue_call_shape({QUEUE_FILE: twice}), "exactly one")
+
+	def test_enqueue_call_shape_requires_exactly_two_calls(self):
+		runner, change = (self.enqueue_call(target) for target in ENQUEUE_TARGETS)
+		for label, body in (("one", runner), ("three", runner + change + change)):
+			with self.subTest(calls=label):
+				self.assertCaught(
+					check_enqueue_call_shape({QUEUE_FILE: "import frappe\n" + body}), "exactly two"
+				)
+
+	def test_enqueue_call_shape_requires_each_target_once(self):
+		for target in ENQUEUE_TARGETS:
+			with self.subTest(target=target):
+				body = "import frappe\n" + self.enqueue_call(target) * 2
+				violations = check_enqueue_call_shape({QUEUE_FILE: body})
+				self.assertCaught(violations, "each of")
+				self.assertFalse(any("first argument" in text for text in violations), violations)
+
+	def test_enqueue_call_shape_rejects_target_outside_set(self):
+		runner = self.enqueue_call(ENQUEUE_TARGETS[0])
+		for bad in ("erp_ai.other.fn", "erp_ai.agent.changes.apply_job", "erp_ai.agent.runner.run"):
+			with self.subTest(target=bad):
+				body = "import frappe\n" + runner + self.enqueue_call(bad)
+				self.assertCaught(check_enqueue_call_shape({QUEUE_FILE: body}), "first argument")
+		not_literal = "import frappe\n" + runner + f"frappe.enqueue(TARGET, {ENQUEUE_GOOD_KEYWORDS})\n"
+		self.assertCaught(check_enqueue_call_shape({QUEUE_FILE: not_literal}), "first argument")
+
+	def test_enqueue_call_shape_requires_five_parameters_on_each_call(self):
+		for index, target in enumerate(ENQUEUE_TARGETS):
+			for name in ENQUEUE_REQUIRED_KEYWORDS:
+				with self.subTest(target=target, missing=name):
+					keywords = ", ".join(
+						part for part in ENQUEUE_GOOD_KEYWORDS.split(", ") if not part.startswith(f"{name}=")
+					)
+					calls = [self.enqueue_call(other) for other in ENQUEUE_TARGETS]
+					calls[index] = self.enqueue_call(target, keywords)
+					violations = check_enqueue_call_shape({QUEUE_FILE: "import frappe\n" + "".join(calls)})
+					self.assertCaught(violations, f"missing keyword {name}=")
+					self.assertEqual(len(violations), 1, violations)
 
 	# no save on configuration ------------------------------------------------------------------
 
@@ -2202,6 +2313,164 @@ class TestScannersCatchViolations(unittest.TestCase):
 		for fragment, source in cases.items():
 			with self.subTest(fragment=fragment):
 				self.assertCaught(check_subprocess_call_shape({SOURCE_TOOL_FILE: source}), fragment)
+
+	def test_subprocess_call_shape_timeout_wrapped_git_needs_group_cwd_and_own_env(self):
+		head = "import os\nimport subprocess\nsubprocess.run([TIMEOUT_EXECUTABLE, '-s', 'KILL', '5', 'git'], timeout=10"
+		good = f"{head}, cwd=repo, env=git_env(identity=False), start_new_session=True)\n"
+		self.assertEqual(check_subprocess_call_shape({SOURCE_TOOL_FILE: good}), [])
+		literal = good.replace("TIMEOUT_EXECUTABLE", "'timeout'")
+		self.assertEqual(check_subprocess_call_shape({SOURCE_TOOL_FILE: literal}), [])
+		cases = (
+			("without start_new_session=True", f"{head}, cwd=repo, env=git_env(identity=False))\n"),
+			(
+				"without start_new_session=True",
+				f"{head}, cwd=repo, env=git_env(identity=False), start_new_session=False)\n",
+			),
+			("without cwd=", f"{head}, env=git_env(identity=False), start_new_session=True)\n"),
+			("without env=", f"{head}, cwd=repo, start_new_session=True)\n"),
+			("env= uses os.environ", f"{head}, cwd=repo, env={{**os.environ}}, start_new_session=True)\n"),
+			("env= uses os.environ", f"{head}, cwd=repo, env=dict(os.environ), start_new_session=True)\n"),
+			("env= uses os.environ", f"{head}, cwd=repo, env=os.environ, start_new_session=True)\n"),
+		)
+		for fragment, source in cases:
+			for variant in (source, source.replace("TIMEOUT_EXECUTABLE", "'timeout'")):
+				with self.subTest(variant=variant):
+					self.assertCaught(check_subprocess_call_shape({SOURCE_TOOL_FILE: variant}), fragment)
+		plain_git = (
+			"import os\nimport subprocess\nsubprocess.run(['git', 'log'], timeout=3, env={**os.environ})\n"
+		)
+		self.assertEqual(check_subprocess_call_shape({SOURCE_TOOL_FILE: plain_git}), [])
+
+	def test_subprocess_allowed_in_process_runner_only_besides_source_tool(self):
+		self.assertEqual(SUBPROCESS_FILES, ("agent/tools/source.py", "agent/changes/process_runner.py"))
+		allowed = "import subprocess\nsubprocess.run(['bench'], timeout=3)\n"
+		self.assertEqual(check_subprocess_only_in_source_tool({PROCESS_RUNNER_FILE: allowed}), [])
+		for rel in ("agent/changes/apply_job.py", "agent/changes/file_writer.py", "agent/changes/runner.py"):
+			with self.subTest(rel=rel):
+				self.assertCaught(check_subprocess_only_in_source_tool({rel: allowed}), "outside")
+
+	def test_subprocess_call_shape_applies_to_process_runner(self):
+		head = (
+			"import os\nimport subprocess\n"
+			"subprocess.run([TIMEOUT_EXECUTABLE, '-s', 'KILL', '5', BENCH_EXECUTABLE], timeout=35"
+		)
+		good = f"{head}, cwd=get_bench_path(), env=_minimal_env(), start_new_session=True)\n"
+		self.assertEqual(check_subprocess_call_shape({SOURCE_TOOL_FILE: "", PROCESS_RUNNER_FILE: good}), [])
+		bench_first = (
+			"import subprocess\nsubprocess.run([source.TIMEOUT_EXECUTABLE, '-s', 'KILL', '5', 'bench'], "
+			"timeout=35, cwd=root, env=_minimal_env(), start_new_session=True)\n"
+		)
+		self.assertEqual(
+			check_subprocess_call_shape({SOURCE_TOOL_FILE: "", PROCESS_RUNNER_FILE: bench_first}), []
+		)
+		cases = (
+			(
+				"without timeout=",
+				"import subprocess\nsubprocess.run(['bench'], cwd=r, env={}, start_new_session=True)\n",
+			),
+			("with shell=", f"{head}, cwd=r, env={{}}, start_new_session=True, shell=True)\n"),
+			(
+				"string command",
+				"import subprocess\nsubprocess.run('bench migrate', timeout=3, cwd=r, env={}, start_new_session=True)\n",
+			),
+			(
+				"only run()",
+				"import subprocess\nsubprocess.Popen(['bench'], timeout=3, cwd=r, env={}, start_new_session=True)\n",
+			),
+			("without start_new_session=True", f"{head}, cwd=r, env=_minimal_env())\n"),
+			(
+				"without start_new_session=True",
+				f"{head}, cwd=r, env=_minimal_env(), start_new_session=False)\n",
+			),
+			("without cwd=", f"{head}, env=_minimal_env(), start_new_session=True)\n"),
+			("without env=", f"{head}, cwd=r, start_new_session=True)\n"),
+			("env= uses os.environ", f"{head}, cwd=r, env={{**os.environ}}, start_new_session=True)\n"),
+			("env= uses os.environ", f"{head}, cwd=r, env=dict(os.environ), start_new_session=True)\n"),
+			("env= uses os.environ", f"{head}, cwd=r, env=os.environ, start_new_session=True)\n"),
+			(
+				"without start_new_session=True",
+				"import subprocess\nsubprocess.run(['bench'], timeout=3, cwd=r, env={})\n",
+			),
+			(
+				"without cwd=",
+				"import subprocess\nsubprocess.run(['bench'], timeout=3, env={}, start_new_session=True)\n",
+			),
+			(
+				"env= uses os.environ",
+				"import os\nimport subprocess\nsubprocess.run(['bench'], timeout=3, cwd=r, env=os.environ, start_new_session=True)\n",
+			),
+		)
+		for fragment, source in cases:
+			with self.subTest(fragment=fragment, source=source):
+				violations = check_subprocess_call_shape({SOURCE_TOOL_FILE: "", PROCESS_RUNNER_FILE: source})
+				self.assertCaught(violations, fragment)
+				self.assertTrue(all(text.startswith(PROCESS_RUNNER_FILE) for text in violations), violations)
+		plain = (
+			"import os\nimport subprocess\nsubprocess.run(['git', 'log'], timeout=3, env={**os.environ})\n"
+		)
+		self.assertEqual(check_subprocess_call_shape({SOURCE_TOOL_FILE: plain}), [])
+		self.assertCaught(
+			check_subprocess_call_shape({SOURCE_TOOL_FILE: "", PROCESS_RUNNER_FILE: plain}),
+			"env= uses os.environ",
+			"without cwd=",
+			"without start_new_session=True",
+		)
+
+	def test_subprocess_call_shape_accepts_git_writes_in_process_runner(self):
+		"""ADR-022 QĐ 2, 4: the git add/commit/rm call of process_runner.py passes the shape rule."""
+		head = (
+			"import subprocess\nsubprocess.run([source.TIMEOUT_EXECUTABLE, '-s', 'KILL', '5', 'git', "
+			"*source.git_global_options(read=False), 'add', '--', rel], timeout=10, cwd=repo_root"
+		)
+		good = f"{head}, env=source.git_env(identity=True), start_new_session=True)\n"
+		self.assertEqual(check_subprocess_call_shape({SOURCE_TOOL_FILE: "", PROCESS_RUNNER_FILE: good}), [])
+		self.assertEqual(check_subprocess_only_in_source_tool({PROCESS_RUNNER_FILE: good}), [])
+		cases = (
+			("without start_new_session=True", f"{head}, env=source.git_env(identity=True))\n"),
+			("without env=", f"{head}, start_new_session=True)\n"),
+			(
+				"env= uses os.environ",
+				f"import os\n{head}, env={{**os.environ, **source.git_env(identity=True)}}, start_new_session=True)\n",
+			),
+		)
+		for fragment, source in cases:
+			with self.subTest(fragment=fragment):
+				self.assertCaught(
+					check_subprocess_call_shape({SOURCE_TOOL_FILE: "", PROCESS_RUNNER_FILE: source}), fragment
+				)
+
+	def test_subprocess_call_shape_checks_run_wrapped_callers_in_process_runner(self):
+		"""Design 8.2 "env= không chứa os.environ": process_runner.py builds cwd=/env= in its
+		`_run_wrapped(...)` callers, so each caller gets the same cwd=/env= checks as subprocess.run."""
+		head = "import os\nimport subprocess\n_run_wrapped(['git', 'add', '--', rel], limit_s=5"
+		for env in ("source.git_env(identity=True)", "_minimal_env()"):
+			good = f"{head}, cwd=repo_root, env={env}, backstop_s=5, max_lines=20)\n"
+			with self.subTest(good=good):
+				self.assertEqual(
+					check_subprocess_call_shape({SOURCE_TOOL_FILE: "", PROCESS_RUNNER_FILE: good}), []
+				)
+		cases = (
+			("_run_wrapped without cwd=", f"{head}, env=_minimal_env())\n"),
+			("_run_wrapped without env=", f"{head}, cwd=repo_root)\n"),
+			("_run_wrapped without env=", f"{head}, **options)\n"),
+			("_run_wrapped env= uses os.environ", f"{head}, cwd=repo_root, env=os.environ)\n"),
+			("_run_wrapped env= uses os.environ", f"{head}, cwd=repo_root, env=dict(os.environ))\n"),
+			(
+				"_run_wrapped env= uses os.environ",
+				f"{head}, cwd=repo_root, env={{**os.environ, **source.git_env(identity=True)}})\n",
+			),
+			(
+				"_run_wrapped env= uses os.environ",
+				"from os import environ\n_run_wrapped(['bench'], cwd=r, env=dict(environ), limit_s=5)\n",
+			),
+		)
+		for fragment, source in cases:
+			with self.subTest(fragment=fragment, source=source):
+				violations = check_subprocess_call_shape({SOURCE_TOOL_FILE: "", PROCESS_RUNNER_FILE: source})
+				self.assertCaught(violations, fragment)
+				self.assertTrue(all(text.startswith(PROCESS_RUNNER_FILE) for text in violations), violations)
+		elsewhere = f"{head}, cwd=repo_root, env=os.environ)\n"
+		self.assertEqual(check_subprocess_call_shape({SOURCE_TOOL_FILE: elsewhere}), [])
 
 	# policy fields -----------------------------------------------------------------------------
 

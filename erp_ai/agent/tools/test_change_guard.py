@@ -422,6 +422,21 @@ class TestBenchArgs(FrappeTestCase):
 				self.assertEqual(self.check([name, "--app", "myapp"]), NOT_LISTED_REFUSAL)
 				self.assertEqual(self.check(["--site", "site1.test", name, "myapp"]), NOT_LISTED_REFUSAL)
 
+	def test_bench_allow_list_is_exactly_the_six_design_commands(self):
+		# Design 3.2 / spec A-6: the allow-list is the mechanism; every other command is refused.
+		self.assertEqual(
+			set(change_guard.BENCH_COMMANDS),
+			{"migrate", "build", "clear-cache", "clear-website-cache", "list-apps", "version"},
+		)
+		self.assertEqual(len(change_guard.BENCH_COMMANDS), 6)
+		for name in ("trim-database", "doctor", "show-config", "destroy-all-sessions"):
+			with self.subTest(command=name):
+				self.assertNotIn(name, A6_DENIED_COMMANDS)
+				self.assertEqual(self.build(name), NOT_LISTED_REFUSAL)
+				self.assertEqual(self.build(name, "myapp"), NOT_LISTED_REFUSAL)
+				self.assertEqual(self.check(["--site", "site1.test", name]), NOT_LISTED_REFUSAL)
+				self.assertEqual(self.check([name]), NOT_LISTED_REFUSAL)
+
 	def test_bench_args_refuse_shell_metacharacters(self):
 		for char in (";", "|", "&", "`", "$(", ">", "<", "\n"):
 			with self.subTest(char=char):
@@ -470,6 +485,10 @@ class TestBenchArgs(FrappeTestCase):
 				)
 				self.assertEqual(self.build("migrate", None, ALLOWED, site), OTHER_SITE_REFUSAL)
 				self.assertEqual(self.build("list-apps", None, ALLOWED, site), OTHER_SITE_REFUSAL)
+		# Step 3 refuses a blank running site even when `--site` repeats it exactly.
+		for site in ("", "  "):
+			with self.subTest(site=site):
+				self.assertEqual(self.check(["--site", site, "migrate"], ALLOWED, site), OTHER_SITE_REFUSAL)
 
 	def test_bench_args_refuse_unlisted_and_build_of_disallowed_app(self):
 		self.fake_erp_ai_repo()

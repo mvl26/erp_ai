@@ -22,8 +22,8 @@ can't be verified"). Vì vậy cấu hình global của máy vẫn được đ�
 
 ```
 $ git -C /tmp/tmp.enCoH8QF4g config --show-origin --get-regexp '^(core\.hookspath|commit\.gpgsign|user\.)'
-file:/home/miyano/.gitconfig	user.name hivx
-file:/home/miyano/.gitconfig	user.email chuvanhieu357@gmail.com
+file:/home/miyano/.gitconfig	user.name <đã che>
+file:/home/miyano/.gitconfig	user.email <đã che>
 file:.git/config	user.name T35 Test
 file:.git/config	user.email t35@test.invalid
 ```

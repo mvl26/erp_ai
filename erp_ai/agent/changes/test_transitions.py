@@ -1,7 +1,7 @@
 import hashlib
 import json
 from datetime import datetime
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import frappe
 from frappe.tests.utils import FrappeTestCase
@@ -811,6 +811,14 @@ class TestTransitionInput(TransitionTestCase):
 						call()
 					self.assertEqual(str(caught.exception), f"Không có đề xuất {shown}")
 
+	def test_unknown_proposal_goes_through_frappe_throw(self):
+		# Design 3.3: `frappe.throw(msg, DoesNotExistError)` so the sentence reaches the HTTP client.
+		for function, call in self._calls("AICHG-99999999").items():
+			with self.subTest(function=function), patch.object(frappe, "throw", wraps=frappe.throw) as throw:
+				with self.assertRaises(frappe.DoesNotExistError):
+					call()
+				throw.assert_called_once_with("Không có đề xuất AICHG-99999999", frappe.DoesNotExistError)
+
 	def test_user_and_actor_must_be_non_empty_strings(self):
 		for bad in ("", "  ", None, 7):
 			proposal = _proposal_in(CHANGE_STATUS_APPLYING)
@@ -821,6 +829,51 @@ class TestTransitionInput(TransitionTestCase):
 				with self.subTest(person=bad, function=function), self.assertRaises(ValueError):
 					call()
 			self.assertNothingChanged(proposal.name, state, modified)
+
+
+class TestLockBeforeWrite(TransitionTestCase):
+	"""D-2: each transition reads the row with `for_update=True` before its `set_value(update_modified=True)`."""
+
+	def test_each_transition_locks_the_row_before_writing(self):
+		cases = (
+			("approve", CHANGE_STATUS_PENDING, lambda name: transitions.approve(name, ACTOR)),
+			("reject", CHANGE_STATUS_PENDING, lambda name: transitions.reject(name, ACTOR)),
+			("request_undo", CHANGE_STATUS_APPLIED, lambda name: transitions.request_undo(name, ACTOR)),
+			("begin_apply", CHANGE_STATUS_APPROVED, transitions.begin_apply),
+			(
+				"finish",
+				CHANGE_STATUS_APPLYING,
+				lambda name: transitions.finish(
+					name, CHANGE_STATUS_APPLYING, CHANGE_STATUS_APPLIED, step="apply", actor=ACTOR
+				),
+			),
+		)
+		for function, status, call in cases:
+			with self.subTest(function=function):
+				proposal = _proposal_in(status)
+				db = Mock()
+				with (
+					patch.object(frappe.db, "get_value", wraps=frappe.db.get_value) as get_value,
+					patch.object(frappe.db, "set_value", wraps=frappe.db.set_value) as set_value,
+				):
+					db.attach_mock(get_value, "get_value")
+					db.attach_mock(set_value, "set_value")
+					call(proposal.name)
+				names = [entry[0] for entry in db.mock_calls]
+				self.assertIn("set_value", names)
+				first_write = names.index("set_value")
+				locks = [
+					entry
+					for entry in db.mock_calls[:first_write]
+					if entry[0] == "get_value"
+					and entry.args[:2] == (PROPOSAL_DOCTYPE, proposal.name)
+					and entry.kwargs.get("for_update") is True
+				]
+				self.assertEqual(len(locks), 1, db.mock_calls[:first_write])
+				writes = [entry for entry in db.mock_calls if entry[0] == "set_value"]
+				self.assertEqual(len(writes), 1)
+				self.assertEqual(writes[0].args[:2], (PROPOSAL_DOCTYPE, proposal.name))
+				self.assertIs(writes[0].kwargs.get("update_modified"), True)
 
 
 class TestEveryStepLogs(TransitionTestCase):

@@ -149,7 +149,7 @@ def _lock(name) -> frappe._dict:
 		PROPOSAL_DOCTYPE, name, ["change_status", "change_kind"], as_dict=True, for_update=True
 	)
 	if row is None:
-		raise frappe.DoesNotExistError(f"Không có đề xuất {frappe.utils.escape_html(name)}")
+		frappe.throw(f"Không có đề xuất {frappe.utils.escape_html(name)}", frappe.DoesNotExistError)
 	return row
 
 

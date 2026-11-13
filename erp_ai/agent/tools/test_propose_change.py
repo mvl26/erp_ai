@@ -318,30 +318,74 @@ class TestProposeChange(FrappeTestCase):
 		self.assertIn(f"sửa <code>{APP}/pkg/notes.md</code>.</p>", markdown_comment)
 		self.assertNotIn("bench restart", markdown_comment)
 
-	def test_new_file_proposal_and_its_refusals(self):
-		arguments = {"path": f"{APP}/pkg/new_mod.py", "content": "z = 1\n", "reason": "thêm module"}
-		result = self.run_tool("propose_new_file", arguments)
+	def new_file(self, path=f"{APP}/pkg/new_mod.py", content="z = 1\n"):
+		return self.run_tool("propose_new_file", {"path": path, "content": content, "reason": "thêm module"})
 
-		self.assertTrue(result["ok"], result)
+	def test_new_file_proposal_does_not_create_file(self):
+		# a branch other than the sandbox default, so a hard-coded branch cannot pass
+		self.sandbox.switch_branch(APP, "feature/new")
+		git_before = self.git_snapshot()
+		result = self.new_file()
+
+		self.assertEqual(set(result), {"ok", "proposal", "status", "comment", "branch"}, result)
+		self.assertEqual(
+			(result["ok"], result["status"], result["branch"]), (True, "Chờ duyệt", "feature/new")
+		)
 		frappe.set_user("Administrator")
 		doc = frappe.get_doc(PROPOSAL_DOCTYPE, result["proposal"])
 		frappe.set_user(AGENT)
+		new_path = f"{APP}/pkg/new_mod.py"
 		self.assertEqual(
-			(doc.is_new_file, doc.content_after, doc.after_hash), (1, "z = 1\n", _sha("z = 1\n"))
+			(doc.change_kind, doc.app, doc.file_path, doc.is_new_file, doc.reversible),
+			(CHANGE_KIND_CODE, APP, new_path, 1, 1),
 		)
-		self.assertFalse(doc.content_before)
+		self.assertEqual((doc.content_after, doc.after_hash), ("z = 1\n", _sha("z = 1\n")))
+		self.assertEqual((doc.content_before, doc.base_hash), ("", ""))
+		self.assertEqual(doc.target_branch, "feature/new")
 		self.assertIn("+z = 1", doc.diff)
 		self.assertFalse(os.path.lexists(os.path.join(self.sandbox.repo(APP), "pkg/new_mod.py")))
-		for path, phrase in (
-			(PATH, "đã tồn tại"),
-			(f"{APP}/khong_co/new.py", "thư mục chứa file chưa tồn tại"),
-			(f"{APP}/pkg/tool.exe", "đuôi file"),
-			(f"{APP}/pkg/secret_key.py", "bí mật"),
-		):
-			refused = self.run_tool("propose_new_file", {**arguments, "path": path})
-			self.assertFalse(refused["ok"], path)
-			self.assertIn(phrase, refused["reason"], path)
-		self.assertEqual(len(self.proposals()), 1)
+		self.assertEqual(self.on_disk(), BEFORE)
+		self.assertEqual(self.git_snapshot(), git_before)
+		self.assertEqual(self.proposals(), [doc.name])
+		(comment,) = self.comments()
+		self.assertEqual(result["comment"], comment.name)
+		self.assertIn(f"đang chờ duyệt: tạo <code>{new_path}</code>.</p>", comment.content)
+
+	def test_new_file_errors_exists_and_no_parent(self):
+		self.sandbox.commit_file(APP, ".gitignore", "pkg/ignored_new.py\n")
+		cases = (
+			(PATH, "file đã tồn tại"),
+			(f"{APP}/khong_co/new.py", "thư mục cha chưa có"),
+			(f"{APP}/pkg/tool.exe", "đuôi file không được phép"),
+			(f"{APP}/pkg/secret_key.py", "tên file thuộc loại bí mật hoặc được bảo vệ"),
+			(f"{APP}/pkg/ignored_new.py", "file đích bị git bỏ qua (.gitignore)"),
+			# path minLength is 1 (design 3.1): a one-character path reaches the guard, not the schema
+			("a", "app không có trong danh sách được sửa"),
+			("", "tham số không hợp lệ: path"),
+		)
+		for path, reason in cases:
+			with self.subTest(path=path):
+				self.assertEqual(self.new_file(path), {"ok": False, "reason": reason})
+		self.assert_nothing_created()
+
+	def test_no_delete_or_rename_operation_exists(self):
+		operation_words = ("delete", "remove", "rename", "move", "unlink", "xoa", "xóa", "doi_ten", "đổi tên")
+		for spec in get_tool_schemas("L3", True, True):
+			words = [spec["name"], *spec["input_schema"].get("properties", {})]
+			for word in words:
+				with self.subTest(tool=spec["name"], word=word):
+					self.assertFalse([w for w in operation_words if w in word.lower()])
+		(new_file,) = [spec for spec in propose_change.TOOLS if spec.name == "propose_new_file"]
+		content = new_file.schema["input_schema"]["properties"]["content"]
+		self.assertEqual((content["minLength"], content["maxLength"]), (1, 20000))
+		self.assertEqual(new_file.schema["input_schema"]["properties"]["path"]["minLength"], 1)
+		# an empty file is the closest a new-file proposal gets to a delete: the schema refuses it
+		for text in ("", "x" * 20001):
+			with self.subTest(length=len(text)):
+				self.assertEqual(
+					self.new_file(content=text), {"ok": False, "reason": "tham số không hợp lệ: content"}
+				)
+		self.assert_nothing_created()
 
 	def test_bench_command_proposal_and_its_refusals(self):
 		result = self.run_tool(

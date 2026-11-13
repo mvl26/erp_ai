@@ -40,8 +40,8 @@ EDIT_NOT_FOUND = "đoạn find[{index}] không có trong file"
 EDIT_AMBIGUOUS = "đoạn find[{index}] xuất hiện nhiều hơn một lần"
 EDIT_OVERLAP = "các đoạn find chồng nhau"
 NO_CHANGE = "nội dung sau trùng nội dung trước"
-FILE_EXISTS = "file đã tồn tại; dùng propose_file_change để sửa"
-FOLDER_MISSING = "thư mục chứa file chưa tồn tại"
+EXISTS = "file đã tồn tại"
+NO_PARENT = "thư mục cha chưa có"
 
 
 def _fail(reason: str) -> dict:
@@ -143,8 +143,8 @@ def _code_values(guard, *, before: str | None, after: str, reason: str) -> dict:
 		"file_path": guard.rel_path,
 		"is_new_file": int(new_file),
 		"reversible": 1,
-		"base_hash": None if new_file else _sha256(before.encode("utf-8")),
-		"content_before": before,
+		"base_hash": "" if new_file else _sha256(before.encode("utf-8")),
+		"content_before": "" if new_file else before,
 		"content_after": after,
 		"after_hash": _sha256(after.encode("utf-8")),
 		"diff": _diff(guard.rel_path, before or "", after),
@@ -188,10 +188,11 @@ def propose_new_file(args: dict, ctx: ToolContext) -> dict:
 	if guard.reason:
 		return _fail(guard.reason)
 	if os.path.lexists(guard.full_path):
-		return _fail(FILE_EXISTS)
+		return _fail(EXISTS)
 	if not os.path.isdir(os.path.dirname(guard.full_path)):
-		return _fail(FOLDER_MISSING)
-	return _insert(ctx, _code_values(guard, before=None, after=args["content"], reason=args["reason"]))
+		return _fail(NO_PARENT)
+	result = _insert(ctx, _code_values(guard, before=None, after=args["content"], reason=args["reason"]))
+	return {**result, "branch": guard.git.branch}
 
 
 def propose_bench_command(args: dict, ctx: ToolContext) -> dict:
@@ -212,7 +213,7 @@ def propose_bench_command(args: dict, ctx: ToolContext) -> dict:
 	return _insert(ctx, values)
 
 
-_PATH = {"type": "string", "minLength": 3, "maxLength": PATH_MAX_CHARS}
+_PATH = {"type": "string", "minLength": 1, "maxLength": PATH_MAX_CHARS}
 _REASON = {"type": "string", "minLength": 1, "maxLength": REASON_MAX_CHARS}
 _FIND_ITEM = {"type": "string", "minLength": 1, "maxLength": PROPOSAL_TEXT_MAX_CHARS}
 _REPLACE_ITEM = {"type": "string", "maxLength": PROPOSAL_TEXT_MAX_CHARS}

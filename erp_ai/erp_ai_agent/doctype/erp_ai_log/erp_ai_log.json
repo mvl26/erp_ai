@@ -77,7 +77,7 @@
    "fieldname": "entry_type",
    "fieldtype": "Select",
    "label": "Loại bản ghi",
-   "description": "Loại bản ghi: classify là phân loại phiếu, reason là một lượt lập luận, skip là phiếu bị bỏ qua nên không chạy. Hệ thống tự ghi khi agent chạy, không sửa được.",
+   "description": "Loại bản ghi: classify là phân loại phiếu, reason là một lượt lập luận, skip là phiếu bị bỏ qua nên không chạy, change là một bước của đề xuất thay đổi. Hệ thống tự ghi khi agent chạy hoặc ở mỗi bước của đề xuất (thường do người duyệt thực hiện), không sửa được.",
    "options": "classify\nreason\nskip\nchange",
    "read_only": 1
   },
@@ -92,7 +92,7 @@
    "fieldname": "trigger",
    "fieldtype": "Select",
    "label": "Nguồn kích hoạt",
-   "description": "Nguồn kích hoạt: ticket_insert khi phiếu mới được tạo, comment_mention khi có bình luận chứa từ khóa kích hoạt. Hệ thống tự ghi khi agent chạy, không sửa được.",
+   "description": "Nguồn kích hoạt: ticket_insert khi phiếu mới được tạo, comment_mention khi có bình luận chứa từ khóa kích hoạt, change_action khi ghi một bước của đề xuất thay đổi. Hệ thống tự ghi khi agent chạy hoặc ở mỗi bước của đề xuất (thường do người duyệt thực hiện), không sửa được.",
    "options": "ticket_insert\ncomment_mention\nchange_action",
    "read_only": 1
   },

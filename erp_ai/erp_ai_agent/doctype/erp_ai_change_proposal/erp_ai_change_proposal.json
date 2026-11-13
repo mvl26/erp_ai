@@ -1,0 +1,369 @@
+{
+ "actions": [],
+ "autoname": "AICHG-.#####",
+ "creation": "2026-11-13 12:00:00.000000",
+ "doctype": "DocType",
+ "engine": "InnoDB",
+ "field_order": [
+  "section_proposal",
+  "change_status",
+  "change_kind",
+  "app",
+  "file_path",
+  "is_new_file",
+  "reversible",
+  "column_proposal",
+  "ticket",
+  "run_id",
+  "instructor",
+  "reason",
+  "section_git",
+  "target_branch",
+  "upstream_ref",
+  "ahead_count",
+  "is_core_app",
+  "column_git",
+  "commit_message",
+  "section_git_result",
+  "apply_commit_sha",
+  "applied_branch",
+  "applied_ahead_count",
+  "column_git_result",
+  "undo_commit_sha",
+  "section_diff",
+  "diff",
+  "section_content",
+  "content_before",
+  "content_after",
+  "base_hash",
+  "after_hash",
+  "section_command",
+  "command_args",
+  "exit_code",
+  "duration_ms",
+  "command_output",
+  "section_decision",
+  "decided_by",
+  "decided_at",
+  "undo_by",
+  "undo_at",
+  "finished_at",
+  "failure_reason",
+  "approved_digest"
+ ],
+ "fields": [
+  {
+   "fieldname": "section_proposal",
+   "fieldtype": "Section Break",
+   "label": "Đề xuất"
+  },
+  {
+   "default": "Chờ duyệt",
+   "fieldname": "change_status",
+   "fieldtype": "Select",
+   "in_list_view": 1,
+   "label": "Trạng thái",
+   "options": "Chờ duyệt\nĐã từ chối\nĐã duyệt\nĐang áp dụng\nĐã áp dụng\nLỗi\nHết hiệu lực\nĐang hoàn tác\nĐã hoàn tác",
+   "read_only": 1,
+   "search_index": 1
+  },
+  {
+   "fieldname": "change_kind",
+   "fieldtype": "Select",
+   "in_list_view": 1,
+   "label": "Loại thay đổi",
+   "options": "Thay đổi code\nLệnh bench",
+   "read_only": 1
+  },
+  {
+   "fieldname": "app",
+   "fieldtype": "Data",
+   "in_list_view": 1,
+   "label": "App",
+   "read_only": 1
+  },
+  {
+   "fieldname": "file_path",
+   "fieldtype": "Data",
+   "in_list_view": 1,
+   "label": "Đường dẫn file",
+   "read_only": 1
+  },
+  {
+   "default": "0",
+   "fieldname": "is_new_file",
+   "fieldtype": "Check",
+   "label": "File mới",
+   "read_only": 1
+  },
+  {
+   "default": "0",
+   "fieldname": "reversible",
+   "fieldtype": "Check",
+   "label": "Hoàn tác được",
+   "read_only": 1
+  },
+  {
+   "fieldname": "column_proposal",
+   "fieldtype": "Column Break"
+  },
+  {
+   "fieldname": "ticket",
+   "fieldtype": "Link",
+   "label": "Phiếu",
+   "options": "HD Ticket",
+   "read_only": 1,
+   "reqd": 1,
+   "search_index": 1
+  },
+  {
+   "fieldname": "run_id",
+   "fieldtype": "Data",
+   "label": "Mã lần chạy",
+   "read_only": 1,
+   "reqd": 1
+  },
+  {
+   "fieldname": "instructor",
+   "fieldtype": "Link",
+   "label": "Người ra lệnh",
+   "options": "User",
+   "read_only": 1
+  },
+  {
+   "fieldname": "reason",
+   "fieldtype": "Small Text",
+   "label": "Lý do",
+   "read_only": 1
+  },
+  {
+   "depends_on": "eval:doc.change_kind=='Thay đổi code'",
+   "fieldname": "section_git",
+   "fieldtype": "Section Break",
+   "label": "Commit git sẽ tạo"
+  },
+  {
+   "fieldname": "target_branch",
+   "fieldtype": "Data",
+   "label": "Nhánh nhận commit",
+   "read_only": 1
+  },
+  {
+   "depends_on": "eval:doc.upstream_ref",
+   "fieldname": "upstream_ref",
+   "fieldtype": "Data",
+   "label": "Nhánh remote đang theo",
+   "read_only": 1
+  },
+  {
+   "default": "0",
+   "depends_on": "eval:doc.upstream_ref",
+   "fieldname": "ahead_count",
+   "fieldtype": "Int",
+   "label": "Số commit đi trước lúc đề xuất",
+   "read_only": 1
+  },
+  {
+   "default": "0",
+   "fieldname": "is_core_app",
+   "fieldtype": "Check",
+   "label": "App lõi",
+   "read_only": 1
+  },
+  {
+   "fieldname": "column_git",
+   "fieldtype": "Column Break"
+  },
+  {
+   "fieldname": "commit_message",
+   "fieldtype": "Code",
+   "label": "Thông điệp commit dự kiến",
+   "read_only": 1
+  },
+  {
+   "depends_on": "eval:doc.apply_commit_sha",
+   "fieldname": "section_git_result",
+   "fieldtype": "Section Break",
+   "label": "Commit đã tạo"
+  },
+  {
+   "fieldname": "apply_commit_sha",
+   "fieldtype": "Data",
+   "label": "Mã commit áp dụng",
+   "read_only": 1
+  },
+  {
+   "fieldname": "applied_branch",
+   "fieldtype": "Data",
+   "label": "Nhánh đã nhận commit",
+   "read_only": 1
+  },
+  {
+   "default": "0",
+   "fieldname": "applied_ahead_count",
+   "fieldtype": "Int",
+   "label": "Số commit đi trước sau khi áp dụng",
+   "read_only": 1
+  },
+  {
+   "fieldname": "column_git_result",
+   "fieldtype": "Column Break"
+  },
+  {
+   "depends_on": "eval:doc.undo_commit_sha",
+   "fieldname": "undo_commit_sha",
+   "fieldtype": "Data",
+   "label": "Mã commit hoàn tác",
+   "read_only": 1
+  },
+  {
+   "depends_on": "eval:doc.change_kind=='Thay đổi code'",
+   "fieldname": "section_diff",
+   "fieldtype": "Section Break",
+   "label": "Diff"
+  },
+  {
+   "fieldname": "diff",
+   "fieldtype": "Code",
+   "label": "Diff",
+   "read_only": 1
+  },
+  {
+   "collapsible": 1,
+   "depends_on": "eval:doc.change_kind=='Thay đổi code'",
+   "fieldname": "section_content",
+   "fieldtype": "Section Break",
+   "label": "Nội dung đầy đủ"
+  },
+  {
+   "fieldname": "content_before",
+   "fieldtype": "Code",
+   "label": "Nội dung trước",
+   "read_only": 1
+  },
+  {
+   "fieldname": "content_after",
+   "fieldtype": "Code",
+   "label": "Nội dung sau",
+   "read_only": 1
+  },
+  {
+   "fieldname": "base_hash",
+   "fieldtype": "Data",
+   "label": "SHA-256 lúc đề xuất",
+   "read_only": 1
+  },
+  {
+   "fieldname": "after_hash",
+   "fieldtype": "Data",
+   "label": "SHA-256 nội dung sau",
+   "read_only": 1
+  },
+  {
+   "depends_on": "eval:doc.change_kind=='Lệnh bench'",
+   "fieldname": "section_command",
+   "fieldtype": "Section Break",
+   "label": "Lệnh bench"
+  },
+  {
+   "fieldname": "command_args",
+   "fieldtype": "Code",
+   "label": "Đối số lệnh bench",
+   "options": "JSON",
+   "read_only": 1
+  },
+  {
+   "fieldname": "exit_code",
+   "fieldtype": "Int",
+   "label": "Mã thoát",
+   "read_only": 1
+  },
+  {
+   "fieldname": "duration_ms",
+   "fieldtype": "Int",
+   "label": "Thời gian chạy (ms)",
+   "read_only": 1
+  },
+  {
+   "fieldname": "command_output",
+   "fieldtype": "Code",
+   "label": "Đầu ra lệnh",
+   "read_only": 1
+  },
+  {
+   "fieldname": "section_decision",
+   "fieldtype": "Section Break",
+   "label": "Duyệt và kết quả"
+  },
+  {
+   "fieldname": "decided_by",
+   "fieldtype": "Link",
+   "label": "Người duyệt hoặc từ chối",
+   "options": "User",
+   "read_only": 1
+  },
+  {
+   "fieldname": "decided_at",
+   "fieldtype": "Datetime",
+   "label": "Lúc duyệt hoặc từ chối",
+   "read_only": 1
+  },
+  {
+   "fieldname": "undo_by",
+   "fieldtype": "Link",
+   "label": "Người hoàn tác",
+   "options": "User",
+   "read_only": 1
+  },
+  {
+   "fieldname": "undo_at",
+   "fieldtype": "Datetime",
+   "label": "Lúc bấm hoàn tác",
+   "read_only": 1
+  },
+  {
+   "fieldname": "finished_at",
+   "fieldtype": "Datetime",
+   "label": "Lúc kết thúc gần nhất",
+   "read_only": 1
+  },
+  {
+   "fieldname": "failure_reason",
+   "fieldtype": "Small Text",
+   "label": "Lý do lỗi",
+   "read_only": 1
+  },
+  {
+   "fieldname": "approved_digest",
+   "fieldtype": "Data",
+   "label": "Dấu nội dung lúc duyệt",
+   "read_only": 1
+  }
+ ],
+ "links": [],
+ "modified": "2026-11-13 12:00:00.000000",
+ "modified_by": "Administrator",
+ "module": "ERP AI agent",
+ "name": "ERP AI Change Proposal",
+ "naming_rule": "Expression (old style)",
+ "owner": "Administrator",
+ "permissions": [
+  {
+   "create": 1,
+   "read": 1,
+   "role": "ERP AI Agent"
+  },
+  {
+   "read": 1,
+   "role": "ERP AI Instructor"
+  },
+  {
+   "read": 1,
+   "role": "System Manager"
+  }
+ ],
+ "sort_field": "modified",
+ "sort_order": "DESC",
+ "states": [],
+ "track_changes": 0
+}

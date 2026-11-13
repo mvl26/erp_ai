@@ -1,3 +1,5 @@
+import difflib
+import hashlib
 import json
 import os
 import re
@@ -9,14 +11,18 @@ from unittest.mock import patch
 import frappe
 from frappe.permissions import AUTOMATIC_ROLES
 from frappe.utils import get_bench_path
-from helpdesk.test_utils import create_agent
+from helpdesk.test_utils import create_agent, make_ticket
 
 from erp_ai.agent.run_log import write_entry
 from erp_ai.constants import (
 	AGENT_STATUS_EVENT,
 	AGENT_USER,
+	CHANGE_KIND_CODE,
+	CHANGE_KIND_COMMAND,
+	CHANGE_STATUS_PENDING,
 	CORE_APPS,
 	HELPDESK_AGENT_ROLE,
+	PROPOSAL_DOCTYPE,
 	ROLE_AGENT,
 	SETTING_DOCTYPE,
 )
@@ -604,3 +610,86 @@ class RealCoreReposUntouchedMixin:
 		]
 		if changed:
 			raise AssertionError("real core repos changed: " + "; ".join(changed))
+
+
+SAMPLE_PROPOSAL_APP = "myapp"
+SAMPLE_PROPOSAL_FILE = "myapp/myapp/ok.py"
+SAMPLE_CONTENT_BEFORE = "x = 1\n"
+SAMPLE_CONTENT_AFTER = "x = 2\n"
+
+
+def _sha256_text(text: str) -> str:
+	return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _sample_code_fields() -> dict:
+	diff = "".join(
+		difflib.unified_diff(
+			SAMPLE_CONTENT_BEFORE.splitlines(keepends=True),
+			SAMPLE_CONTENT_AFTER.splitlines(keepends=True),
+			fromfile=f"a/{SAMPLE_PROPOSAL_FILE}",
+			tofile=f"b/{SAMPLE_PROPOSAL_FILE}",
+		)
+	)
+	return {
+		"change_kind": CHANGE_KIND_CODE,
+		"app": SAMPLE_PROPOSAL_APP,
+		"file_path": SAMPLE_PROPOSAL_FILE,
+		"is_new_file": 0,
+		"command_args": "",
+		"base_hash": _sha256_text(SAMPLE_CONTENT_BEFORE),
+		"content_before": SAMPLE_CONTENT_BEFORE,
+		"content_after": SAMPLE_CONTENT_AFTER,
+		"after_hash": _sha256_text(SAMPLE_CONTENT_AFTER),
+		"diff": diff,
+		"reversible": 1,
+		"target_branch": "main",
+		"upstream_ref": "origin/main",
+		"ahead_count": 0,
+		"is_core_app": 0,
+		"commit_message": f"erp_ai: áp dụng đề xuất mẫu ({SAMPLE_PROPOSAL_FILE})\n\nNgười duyệt: <người duyệt>",
+	}
+
+
+def _sample_command_fields() -> dict:
+	return {
+		"change_kind": CHANGE_KIND_COMMAND,
+		"app": SAMPLE_PROPOSAL_APP,
+		"file_path": "",
+		"is_new_file": 0,
+		"command_args": json.dumps(["build", "--app", SAMPLE_PROPOSAL_APP]),
+		"reversible": 0,
+		"target_branch": "",
+		"upstream_ref": "",
+		"ahead_count": 0,
+		"is_core_app": 0,
+		"commit_message": "",
+	}
+
+
+def make_change_proposal(kind: str = CHANGE_KIND_CODE, ticket: str | None = None, **fields):
+	"""Insert a `Chờ duyệt` ERP AI Change Proposal (file change with git fields, or bench command) and return it.
+
+	`ticket` defaults to a new HD Ticket; `fields` override any sample value. Inserted with
+	`ignore_permissions=True` and never committed: the caller's test rolls it back.
+	"""
+	if kind == CHANGE_KIND_CODE:
+		values = _sample_code_fields()
+	elif kind == CHANGE_KIND_COMMAND:
+		values = _sample_command_fields()
+	else:
+		raise ValueError(f"unknown change kind: {kind!r}")
+	if ticket is None:
+		ticket = make_ticket(subject=_unique("change proposal")).name
+	values.update(
+		{
+			"doctype": PROPOSAL_DOCTYPE,
+			"ticket": ticket,
+			"run_id": f"{PREFIX}run",
+			"instructor": "Administrator",
+			"reason": "Đề xuất mẫu cho test",
+			"change_status": CHANGE_STATUS_PENDING,
+		}
+	)
+	values.update(fields)
+	return frappe.get_doc(values).insert(ignore_permissions=True)

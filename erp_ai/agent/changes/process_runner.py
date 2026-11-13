@@ -64,12 +64,7 @@ def run_bench(args: list[str], limit_s: int) -> CommandResult:
 
 
 def _check_git_write_call(repo_root, rel, limit_s) -> None:
-	if (
-		not isinstance(repo_root, str)
-		or "\0" in repo_root
-		or not os.path.isabs(repo_root)
-		or not os.path.isdir(repo_root)
-	):
+	if not isinstance(repo_root, str) or not os.path.isabs(repo_root) or not os.path.isdir(repo_root):
 		raise ValueError(f"repo_root must be an existing absolute directory: {repo_root!r}")
 	if (
 		not isinstance(rel, str)
@@ -88,7 +83,7 @@ def _check_git_write_call(repo_root, rel, limit_s) -> None:
 
 
 def _check_commit_message(subject, body) -> None:
-	if not isinstance(subject, str) or not subject.strip() or "\0" in subject or "\n" in subject:
+	if not isinstance(subject, str) or not subject.strip() or any(char in subject for char in "\0\r\n"):
 		raise ValueError("subject must be one non-empty line without NUL")
 	if not isinstance(body, str) or not body.strip() or "\0" in body:
 		raise ValueError("body must be non-empty text without NUL")

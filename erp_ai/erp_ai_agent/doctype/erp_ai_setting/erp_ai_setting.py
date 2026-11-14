@@ -1,3 +1,5 @@
+import json
+import math
 import os
 
 import frappe
@@ -19,6 +21,7 @@ from erp_ai.constants import (
 	CREDENTIAL_DOCTYPE,
 	KEY_STATUS_ACTIVE,
 	KEY_STATUS_BAD_KEY,
+	KPI_IDS,
 	SETTING_DOCTYPE,
 )
 
@@ -91,6 +94,8 @@ DUE_FIELD_SETTING = "field_due_date"
 DUE_FIELD_TYPES = ("Date", "Datetime")
 # AC-49, E-6: the report types the bot may run.
 ALLOWED_REPORT_TYPES = ("Script Report", "Query Report")
+# AC-55, E-9: the stages every KPI target names.
+KPI_STAGES = ("gd2", "gd4")
 
 
 def permission_switch_fields(meta) -> list:
@@ -120,6 +125,7 @@ class ERPAISetting(Document):
 		self.check_allowed_reports()
 		self.check_manuals_dir()
 		self.check_operation_people()
+		self.check_kpi_targets()
 
 	def on_update(self):
 		self.notify_permission_switches()
@@ -289,10 +295,59 @@ class ERPAISetting(Document):
 		if watcher and (watcher == AGENT_USER or not frappe.db.get_value("User", watcher, "enabled")):
 			frappe.throw("Người theo dõi phiếu D phải là tài khoản người đang bật")
 
+	def check_kpi_targets(self):
+		"""AC-55, E-9: exactly the KPI_IDS, each with exactly gd2 and gd4 as numbers >= 0.
+
+		Blank is refused too: the message carries the field's default JSON so the admin can paste it back in.
+		"""
+		if not (self.kpi_targets or "").strip():
+			default = self.meta.get_field("kpi_targets").default
+			frappe.throw(
+				f"Mục tiêu KPI: không được để trống. Muốn khôi phục, hãy dán JSON mặc định sau:\n{default}"
+			)
+		error = kpi_targets_error(self.kpi_targets)
+		if error:
+			frappe.throw(f"Mục tiêu KPI: {error}")
+
 
 def _filled_lines(value) -> list:
 	"""The non-blank lines of a one-entry-per-line field, trimmed."""
 	return [line.strip() for line in (value or "").splitlines() if line.strip()]
+
+
+def kpi_targets_error(raw) -> str | None:
+	"""The first E-9 fault of these targets as "{key path} {reason}", or None; unknown top keys come first."""
+	try:
+		targets = json.loads(raw)
+	except ValueError:
+		targets = None
+	if not isinstance(targets, dict):
+		return "không phải JSON object hợp lệ"
+	for key in targets:
+		if key not in KPI_IDS:
+			return f"{frappe.utils.escape_html(key)} không phải KPI hợp lệ, chỉ nhận {', '.join(KPI_IDS)}"
+	for kpi in KPI_IDS:
+		if kpi not in targets:
+			return f"{kpi} bị thiếu"
+		stages = targets[kpi]
+		if not isinstance(stages, dict):
+			return f"{kpi} phải là object có đúng {' và '.join(KPI_STAGES)}"
+		for key in stages:
+			if key not in KPI_STAGES:
+				return f"{kpi}.{frappe.utils.escape_html(key)} không hợp lệ, chỉ nhận {', '.join(KPI_STAGES)}"
+		for stage in KPI_STAGES:
+			if stage not in stages:
+				return f"{kpi}.{stage} bị thiếu"
+			if not _is_target_number(stages[stage]):
+				return f"{kpi}.{stage} phải là số không âm"
+	return None
+
+
+def _is_target_number(value) -> bool:
+	"""A finite JSON number >= 0; true/false are refused although Python counts them as int."""
+	if isinstance(value, bool) or not isinstance(value, int | float):
+		return False
+	return math.isfinite(value) and value >= 0
 
 
 def allowed_report_error(name) -> str | None:

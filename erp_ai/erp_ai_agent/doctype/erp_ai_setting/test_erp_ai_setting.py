@@ -1896,3 +1896,155 @@ class TestOperationPeople(FrappeTestCase):
 			with self.subTest(typed=typed):
 				self.assertIsNone(self._save(d_ticket_watcher=typed, monthly_reviewers=""))
 				self.assertEqual(self._stored("d_ticket_watcher"), "")
+
+
+KPI_ERROR_PREFIX = "Mục tiêu KPI: "
+KPI_ALLOWED = (
+	"first_response_minutes, complete_fields_pct, closed_without_human_pct, b_resolution_hours, "
+	"c_task_in_3_days_pct, stale_over_5_days"
+)
+
+
+def _kpi_targets(**changes):
+	"""The default targets with these KPI entries replaced (a value of ... drops the KPI)."""
+	targets = {kpi: dict(stages) for kpi, stages in DEFAULT_KPI_TARGETS.items()}
+	for kpi, value in changes.items():
+		if value is ...:
+			targets.pop(kpi)
+		else:
+			targets[kpi] = value
+	return targets
+
+
+class TestKpiTargets(FrappeTestCase):
+	def setUp(self):
+		self.addCleanup(frappe.db.rollback)
+		keep_agent_settings(self)
+		self.default_raw = frappe.get_meta(SETTING_DOCTYPE).get_field("kpi_targets").default
+		self.assertEqual(json.loads(self.default_raw), DEFAULT_KPI_TARGETS)
+		self.assertIsNone(self._save(kpi_targets=self.default_raw, coo_report_recipients=""))
+
+	def _save(self, **fields):
+		"""Save the setting with these fields; return the error text, or None when it saved."""
+		doc = frappe.get_doc(SETTING_DOCTYPE)
+		doc.update(fields)
+		try:
+			doc.save()
+		except frappe.ValidationError as error:
+			return str(error)
+		return None
+
+	def _stored(self):
+		return frappe.db.get_single_value(SETTING_DOCTYPE, "kpi_targets", cache=False)
+
+	def test_default_targets_valid(self):
+		# AC-55, E-9: the shipped default saves as is; zero, decimals, another key order and outer blanks pass.
+		self.assertEqual(json.loads(self._stored()), DEFAULT_KPI_TARGETS)
+		reordered = dict(reversed(list(_kpi_targets(b_resolution_hours={"gd4": 0.5, "gd2": 0}).items())))
+		for value in (
+			json.dumps(reordered),
+			"\n  " + json.dumps(_kpi_targets(stale_over_5_days={"gd2": 21, "gd4": 1e3})) + "\n",
+		):
+			with self.subTest(value=value):
+				self.assertIsNone(self._save(kpi_targets=value))
+				self.assertEqual(self._stored(), value)
+
+	def test_bad_targets_blocked(self):
+		# AC-55, E-9: each refusal names the key path; the stored value holds; the first fault in KPI_IDS order
+		# (unknown top keys before) wins; the operations people (step 9) are checked before the targets (step 10).
+		good = json.dumps(_kpi_targets(first_response_minutes={"gd2": 20, "gd4": 7}))
+		self.assertIsNone(self._save(kpi_targets=good))
+		number = "phải là số không âm"
+		stages = "phải là object có đúng gd2 và gd4"
+		cases = (
+			(json.dumps(_kpi_targets(b_resolution_hours=...)), "b_resolution_hours bị thiếu"),
+			(json.dumps(_kpi_targets(stale_over_5_days=...)), "stale_over_5_days bị thiếu"),
+			(
+				json.dumps(_kpi_targets(complete_fields_pct=..., stale_over_5_days=...)),
+				"complete_fields_pct bị thiếu",
+			),
+			(
+				json.dumps({**DEFAULT_KPI_TARGETS, "other_kpi": {"gd2": 1, "gd4": 1}}),
+				f"other_kpi không phải KPI hợp lệ, chỉ nhận {KPI_ALLOWED}",
+			),
+			(
+				json.dumps({"<b>x</b>": {}, **_kpi_targets(first_response_minutes=...)}),
+				f"&lt;b&gt;x&lt;/b&gt; không phải KPI hợp lệ, chỉ nhận {KPI_ALLOWED}",
+			),
+			(json.dumps(_kpi_targets(complete_fields_pct=[100, 100])), f"complete_fields_pct {stages}"),
+			(json.dumps(_kpi_targets(b_resolution_hours=4)), f"b_resolution_hours {stages}"),
+			(
+				json.dumps(_kpi_targets(c_task_in_3_days_pct={"gd4": 100})),
+				"c_task_in_3_days_pct.gd2 bị thiếu",
+			),
+			(
+				json.dumps(_kpi_targets(closed_without_human_pct={"gd2": 10})),
+				"closed_without_human_pct.gd4 bị thiếu",
+			),
+			(
+				json.dumps(_kpi_targets(stale_over_5_days={"gd2": 10, "gd4": 4, "gd3": 6})),
+				"stale_over_5_days.gd3 không hợp lệ, chỉ nhận gd2, gd4",
+			),
+			(
+				json.dumps(_kpi_targets(stale_over_5_days={"gd2": 10, "gd4": 4, "<i>": 6})),
+				"stale_over_5_days.&lt;i&gt; không hợp lệ, chỉ nhận gd2, gd4",
+			),
+			(
+				json.dumps(_kpi_targets(b_resolution_hours={"gd2": -1, "gd4": 1})),
+				f"b_resolution_hours.gd2 {number}",
+			),
+			(
+				json.dumps(_kpi_targets(stale_over_5_days={"gd2": 10, "gd4": -0.5})),
+				f"stale_over_5_days.gd4 {number}",
+			),
+			(
+				json.dumps(_kpi_targets(complete_fields_pct={"gd2": "100", "gd4": 100})),
+				f"complete_fields_pct.gd2 {number}",
+			),
+			(
+				json.dumps(_kpi_targets(complete_fields_pct={"gd2": 100, "gd4": None})),
+				f"complete_fields_pct.gd4 {number}",
+			),
+			(
+				json.dumps(_kpi_targets(closed_without_human_pct={"gd2": True, "gd4": 30})),
+				f"closed_without_human_pct.gd2 {number}",
+			),
+			(
+				json.dumps(_kpi_targets(first_response_minutes={"gd2": 15, "gd4": False})),
+				f"first_response_minutes.gd4 {number}",
+			),
+			(
+				json.dumps(_kpi_targets(c_task_in_3_days_pct={"gd2": 80, "gd4": float("inf")})),
+				f"c_task_in_3_days_pct.gd4 {number}",
+			),
+			(
+				json.dumps(_kpi_targets(b_resolution_hours={"gd2": float("nan"), "gd4": 1})),
+				f"b_resolution_hours.gd2 {number}",
+			),
+			(
+				json.dumps(
+					_kpi_targets(
+						complete_fields_pct={"gd2": -1, "gd4": 100},
+						b_resolution_hours=...,
+						stale_over_5_days={"gd2": 10},
+					)
+				),
+				f"complete_fields_pct.gd2 {number}",
+			),
+			('{"first_response_minutes": {"gd2": 15, "gd4": 5},', "không phải JSON object hợp lệ"),
+			("{'first_response_minutes': {}}", "không phải JSON object hợp lệ"),
+			(json.dumps([DEFAULT_KPI_TARGETS]), "không phải JSON object hợp lệ"),
+			('"xxx"', "không phải JSON object hợp lệ"),
+			("12", "không phải JSON object hợp lệ"),
+		)
+		for value, reason in cases:
+			with self.subTest(value=value):
+				self.assertEqual(self._save(kpi_targets=value), KPI_ERROR_PREFIX + reason)
+				self.assertEqual(self._stored(), good)
+		empty = f"{KPI_ERROR_PREFIX}không được để trống. Muốn khôi phục, hãy dán JSON mặc định sau:\n{self.default_raw}"
+		for value in ("", "  \n\t ", None):
+			with self.subTest(value=value):
+				self.assertEqual(self._save(kpi_targets=value), empty)
+				self.assertEqual(self._stored(), good)
+		self.assertEqual(self._save(kpi_targets="", coo_report_recipients="sai"), _email_error("sai"))
+		self.assertEqual(self._stored(), good)

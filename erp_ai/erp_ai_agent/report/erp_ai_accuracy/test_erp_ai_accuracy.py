@@ -221,12 +221,12 @@ class TestAccuracyFiltersAndColumns(AccuracyTestCase):
 		with self.assertRaises(frappe.PermissionError):
 			execute(self._filters())
 
-	def test_report_record_is_system_manager_only_script_report(self):
+	def test_report_record_is_script_report_for_system_manager_and_instructor(self):
 		report = frappe.get_doc("Report", REPORT)
 		self.assertEqual(report.report_type, "Script Report")
 		self.assertEqual(report.ref_doctype, LOG_DOCTYPE)
 		self.assertEqual(report.module, "ERP AI agent")
-		self.assertEqual([row.role for row in report.roles], ["System Manager"])
+		self.assertEqual([row.role for row in report.roles], ["System Manager", ROLE_INSTRUCTOR])
 		self.assertEqual(report.is_standard, "Yes")
 		self.assertTrue(frappe.has_permission("Report", doc=report, user="Administrator"))
 

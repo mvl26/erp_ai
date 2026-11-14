@@ -4,7 +4,9 @@ undoes an applied code change. Runs in the `long` queue, one job at a time acros
 import hashlib
 import json
 import os
+import re
 import time
+import unicodedata
 
 import frappe
 from frappe.utils import get_fullname
@@ -55,6 +57,9 @@ GIT_RESTORE_FAILED = "commit git lỗi và không trả lại được trạng t
 GIT_COMMIT_MISMATCH = "commit không đúng nội dung đã duyệt, cần người kiểm"
 # Design 3.5: the short reason taken from the git output after `GIT_COMMIT_FAILED`.
 GIT_SHORT_REASON_MAX_CHARS = 120
+# Design addendum 4 QĐ-D1, QĐ-D2: a word of the short reason that may hold a path, URL, email or key is masked.
+GIT_MASKED_WORD = "…"
+GIT_KEY_LIKE = re.compile(r"[A-Za-z0-9_+\-]{20,}")
 GIT_BRANCH_CHANGED = "nhánh đang checkout đã đổi kể từ lúc đề xuất"
 GIT_NOT_ANCESTOR = "commit áp dụng không còn nằm trong lịch sử nhánh đang checkout"
 # Design 4.3 step 4 (exact wording); "quá thời gian" is AC-10's reason (design addendum 2 QĐ-A3).
@@ -241,11 +246,29 @@ def _failed(result) -> bool:
 	return result.timed_out or result.exit_code != 0
 
 
+def _git_short_line(output: str) -> str:
+	"""The last non-empty line of `output`, cleaned then cut to `GIT_SHORT_REASON_MAX_CHARS` (addendum 4 QĐ-D1).
+
+	Control characters become spaces and whitespace collapses; a word holding `/` `\\` `@` `=` `~` or a
+	key-like run becomes `GIT_MASKED_WORD`; the cut comes after the masking. Nothing left → "".
+	"""
+	# Lines end at `\n` only: a `\r` (git progress) is a control character, made a space below.
+	lines = [line for line in (output or "").split("\n") if line.strip()]
+	if not lines:
+		return ""
+	text = "".join(" " if unicodedata.category(char) == "Cc" else char for char in lines[-1])
+	words = [
+		GIT_MASKED_WORD if any(char in word for char in "/\\@=~") or GIT_KEY_LIKE.search(word) else word
+		for word in text.split()
+	]
+	return " ".join(words)[:GIT_SHORT_REASON_MAX_CHARS]
+
+
 def _commit_failed_reason(result) -> str:
-	"""`GIT_COMMIT_FAILED`, ` (quá thời gian)` on a timeout, then the last git output line cut short (design 3.5)."""
+	"""`GIT_COMMIT_FAILED`, ` (quá thời gian)` on a timeout, then the cleaned last git output line (design 3.5)."""
 	reason = GIT_COMMIT_FAILED + (GIT_COMMIT_TIMED_OUT_SUFFIX if result.timed_out else "")
-	lines = [line.strip() for line in (result.output or "").splitlines() if line.strip()]
-	return f"{reason}: {lines[-1][:GIT_SHORT_REASON_MAX_CHARS]}" if lines else reason
+	short = _git_short_line(result.output)
+	return f"{reason}: {short}" if short else reason
 
 
 def _git_limit(deadline: float) -> int:

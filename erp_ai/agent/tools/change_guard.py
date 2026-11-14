@@ -27,6 +27,11 @@ CMD_OTHER_SITE = "chỉ chạy cho site đang chạy"
 CMD_NOT_LISTED = "lệnh không có trong danh sách cho phép"
 CMD_NEEDS_APP = "lệnh build cần app"
 CMD_TAKES_NO_APP = "lệnh này không nhận app"
+# CHG-002 design table 3.1.
+BLOCK_SHAPE = "đưa changes hoặc path, không cả hai và không thiếu cả hai"
+BLOCK_EMPTY = "khối không có mục file hay lệnh nào"
+OP_UNKNOWN = "loại mục phải là edit, create, delete hoặc rename"
+OP_FIELDS = "mục {action} thiếu hoặc thừa trường"
 
 # Command table of design 3.1: the only bench argument shapes an agent may propose (ADR-011 QĐ 4).
 # No subcommand here runs git in an app repo (ADR-022 QĐ 2).
@@ -48,6 +53,23 @@ class GuardResult:
 	reason: str | None
 	is_core_app: bool = False
 	git: source.GitState | None = None
+
+
+@dataclass(frozen=True)
+class FileOp:
+	"""One file item of a block proposal (CHG-002 design 3.2); `kind` is a value of `CHANGE_OPS`.
+
+	`path` is relative to `apps/` (the source of a rename); `new_path` is the rename target, else `None`.
+	`before` is `None` for a created file, `after` is `None` for a deleted one.
+	"""
+
+	kind: str
+	path: str
+	new_path: str | None
+	before: str | None
+	after: str | None
+	base_hash: str | None
+	after_hash: str | None
 
 
 def _refused(reason: str) -> GuardResult:

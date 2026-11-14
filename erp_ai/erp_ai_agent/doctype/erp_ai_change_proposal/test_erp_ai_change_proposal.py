@@ -26,7 +26,12 @@ from erp_ai.constants import (
 	CHANGE_STATUS_UNDOING,
 	CHANGE_STATUS_UNDONE,
 	LOG_DOCTYPE,
+	OPERATION_DOCTYPE,
 	PROPOSAL_DOCTYPE,
+	RESTART_STATUS_CONFIRMED,
+	RESTART_STATUS_LAUNCH_FAILED,
+	RESTART_STATUS_SENT,
+	RESTART_STATUS_UNCONFIRMED,
 	ROLE_INSTRUCTOR,
 )
 from erp_ai.erp_ai_agent.doctype.erp_ai_change_proposal import erp_ai_change_proposal as controller
@@ -63,6 +68,7 @@ FIELD_ORDER = [
 	"undo_commit_sha",
 	"section_diff",
 	"diff",
+	"operations",
 	"section_content",
 	"content_before",
 	"content_after",
@@ -70,9 +76,11 @@ FIELD_ORDER = [
 	"after_hash",
 	"section_command",
 	"command_args",
+	"command_list",
 	"exit_code",
 	"duration_ms",
 	"command_output",
+	"command_results",
 	"section_decision",
 	"decided_by",
 	"decided_at",
@@ -81,6 +89,9 @@ FIELD_ORDER = [
 	"finished_at",
 	"failure_reason",
 	"approved_digest",
+	"created_dirs",
+	"restart_status",
+	"restart_sent_at",
 ]
 GIT_FIELDS = (
 	"target_branch",
@@ -101,6 +112,8 @@ CODE_FIELDS = {
 	"commit_message",
 	"command_output",
 }
+# Design 2.2 block fields stored as JSON text.
+BLOCK_CODE_FIELDS = {"command_list", "command_results", "created_dirs"}
 # Design 2.1 content group, each with a valid replacement value so only the immutability rule can refuse it.
 CONTENT_FIELD_NEW_VALUES = {
 	"run_id": "ERPAI-TEST-other-run",
@@ -233,18 +246,38 @@ class TestERPAIChangeProposal(FrappeTestCase):
 		)
 		self.assertEqual([CHANGE_KIND_CODE, CHANGE_KIND_COMMAND], kind_options)
 		select_fields = {name for name, field in fields.items() if field["fieldtype"] == "Select"}
-		self.assertEqual(select_fields, {"change_status", "change_kind"})
+		self.assertEqual(select_fields, {"change_status", "change_kind", "restart_status"})
+		restart_options = ["", "Đã gửi", "Đã xác nhận", "Chưa xác nhận", "Lỗi khởi chạy"]
+		self.assertEqual(fields["restart_status"]["options"].split("\n"), restart_options)
+		self.assertEqual(
+			[
+				"",
+				RESTART_STATUS_SENT,
+				RESTART_STATUS_CONFIRMED,
+				RESTART_STATUS_UNCONFIRMED,
+				RESTART_STATUS_LAUNCH_FAILED,
+			],
+			restart_options,
+		)
+		# Empty restart status means "no restart needed" (ADR-040 decision 7).
+		self.assertFalse(fields["restart_status"].get("default"))
 
 	def test_content_fields_are_code_and_read_only(self):
 		fields = _fields_by_name()
 		code_fields = {name for name, field in fields.items() if field["fieldtype"] == "Code"}
-		self.assertEqual(code_fields, CODE_FIELDS)
+		self.assertEqual(code_fields, CODE_FIELDS | BLOCK_CODE_FIELDS)
+		for name in BLOCK_CODE_FIELDS:
+			with self.subTest(fieldname=name):
+				self.assertEqual(fields[name]["options"], "JSON")
+		self.assertEqual(fields["operations"]["fieldtype"], "Table")
+		self.assertEqual(fields["operations"]["options"], OPERATION_DOCTYPE)
+		self.assertEqual(fields["restart_sent_at"]["fieldtype"], "Datetime")
 		data_fields = [
 			name
 			for name, field in fields.items()
 			if field["fieldtype"] not in ("Section Break", "Column Break", "Tab Break")
 		]
-		self.assertEqual(len(data_fields), 35)
+		self.assertEqual(len(data_fields), 41)
 		for name in data_fields:
 			with self.subTest(fieldname=name):
 				self.assertEqual(fields[name].get("read_only"), 1)

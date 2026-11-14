@@ -6,7 +6,7 @@ from frappe.utils import cint, cstr
 from erp_ai.agent import change_text, queue
 from erp_ai.agent.agent_write_guard import refuse_agent_write
 from erp_ai.agent.authority import NEVER_AUTHORITY
-from erp_ai.agent.changes import transitions
+from erp_ai.agent.changes import block, transitions
 from erp_ai.constants import CHANGE_KIND_CODE, PROPOSAL_DOCTYPE, ROLE_INSTRUCTOR
 
 # Design 2.1 content group (ADR-012 QĐ 1): written once at insert, never changed afterwards.
@@ -84,8 +84,12 @@ class ERPAIChangeProposal(Document):
 		if self.change_kind != CHANGE_KIND_CODE:
 			self.commit_message = None
 			return
+		label = cstr(self.file_path)
+		if block.is_block(self):
+			# CHG-002 T1: a block of one item is labelled with that item's path (T19 adds the label of many).
+			label = block.operations_of(self)[0].path
 		subject, body = change_text.apply_message(
-			self.name, cstr(self.ticket), cstr(self.file_path), change_text.APPROVER_PLACEHOLDER
+			self.name, cstr(self.ticket), label, change_text.APPROVER_PLACEHOLDER
 		)
 		self.commit_message = change_text.message_text(subject, body)
 

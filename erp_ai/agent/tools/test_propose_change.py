@@ -275,6 +275,13 @@ class TestProposeChange(FrappeTestCase):
 		old_shape = {"path": PATH, "edits": [{"old": "x = 1", "new": "x = 2"}], "reason": "x"}
 		self.assertEqual(
 			self.run_tool("propose_file_change", old_shape),
+			{"ok": False, "reason": "tham số không hợp lệ: edits"},
+		)
+		self.assert_nothing_created()
+		# old shape without a stray key reaches the handler and keeps the old refusal
+		legacy_missing_find = {"path": PATH, "replace": ["x = 2"], "reason": "x"}
+		self.assertEqual(
+			self.run_tool("propose_file_change", legacy_missing_find),
 			{"ok": False, "reason": "tham số không hợp lệ: find"},
 		)
 		self.assert_nothing_created()

@@ -115,7 +115,7 @@
    "label": "Mức quyền",
    "options": "L0\nL1\nL2\nL3",
    "default": "L0",
-   "description": "L0: chỉ phân loại phiếu mới vào Log, không sửa phiếu, không bình luận. L1: đọc dữ liệu, ghi phân loại hoặc gợi ý lên phiếu, bình luận. L2 trở lên: ghi ERP ngoài phiếu qua đề xuất hoặc dòng Tự làm. L3: thêm công cụ bản ghi chung, sửa code. Mỗi phiếu trên đường danh mục trắng không vượt Mức tối đa của đầu mục; năm quyền mở rộng tính theo ô này. Chi vượt ngân sách tháng thì hạ về L1 (L0 giữ nguyên)."
+   "description": "L0: chỉ phân loại phiếu mới vào Log, không sửa phiếu hay bình luận. L1: ghi phân loại, gợi ý lên phiếu, bình luận. L2 trở lên: ghi ERP ngoài phiếu qua đề xuất hoặc dòng Tự làm. L3: mức của công cụ bản ghi chung, sửa code. Mức thực tế của từng phiếu trên đường danh mục trắng không vượt Mức tối đa của đầu mục; năm quyền mở rộng tính theo ô này. Vượt ngân sách tháng thì tự hạ về L1 (L0 giữ nguyên)."
   },
   {
    "fieldname": "agent_enabled_at",

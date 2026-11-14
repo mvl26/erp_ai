@@ -27,7 +27,20 @@ DOCTYPE_CONFIG = {
 		"phrases": {
 			"enabled": ("Tắt", "4 đơn giá", "từ khóa kích hoạt"),
 			# FEAT-007 spec-addendum-3.md:88 (T64): from L2 up, ERP writes go through a proposal or a `Tự làm` row.
-			"permission_level": ("L0", "L1", "L2", "L3", "ngân sách", "đề xuất", "Tự làm"),
+			# T64 review round 1: keep the L3 gate (AC-3(2)), the automatic budget fallback and the
+			# design.md:184 sentence word for word.
+			"permission_level": (
+				"L0",
+				"L1",
+				"L2",
+				"L3",
+				"ngân sách",
+				"đề xuất",
+				"Tự làm",
+				"L3: mức của công cụ bản ghi chung",
+				"tự hạ về L1",
+				"Mức thực tế của từng phiếu",
+			),
 			# FEAT-007 design.md:182: the AC-16 watermark of section_activation.
 			"agent_enabled_at": ("Hệ thống tự ghi", "không sửa được"),
 			"unrestricted_enabled": (
@@ -75,6 +88,7 @@ DOCTYPE_CONFIG = {
 				"bị chặn khi lưu",
 				"chờ Duyệt",
 				"Đổi trường",
+				"bị từ chối",
 				"bảng con",
 			),
 			"user_templates": ("tạo tài khoản theo mẫu", "System Manager", "Guest"),

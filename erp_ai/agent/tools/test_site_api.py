@@ -20,6 +20,9 @@ NOT_GRANTED = {"ok": False, "reason": "tool không được cấp ở mức/th�
 APP_NAME = "erp_ai"
 STUB_APP_DOCTYPE = "Note"
 OTHER_PROFILE = "SITEAPI hồ sơ thường"
+WEBHOOK_NAME = "SITEAPI-TEST webhook"
+RENAMED_NOTE = "SITEAPI-TEST tên mới"
+DUPLICATE_TAG = "SITEAPI-TEST nhãn trùng"
 _real_get_all = frappe.get_all
 
 
@@ -411,6 +414,71 @@ class TestSiteApi(FrappeTestCase):
 		enabled = self.update("Server Script", result["name"], {"disabled": 0})
 		self.assertTrue(enabled["ok"], enabled)
 		self.assertEqual(frappe.db.get_value("Server Script", result["name"], "disabled"), 1)
+
+	def test_webhook_always_saved_disabled_in_normal_mode(self):
+		before = frappe.db.count("Webhook")
+		result = self.create(
+			"Webhook",
+			{
+				"name": WEBHOOK_NAME,
+				"webhook_doctype": "Note",
+				"webhook_docevent": "after_insert",
+				"request_url": "https://example.com/siteapi",
+				"request_method": "POST",
+				"enabled": 1,
+			},
+		)
+		self.assertEqual(result, {"ok": True, "doctype": "Webhook", "name": WEBHOOK_NAME})
+		self.assertEqual(frappe.db.count("Webhook"), before + 1)
+		self.assertEqual(frappe.db.get_value("Webhook", WEBHOOK_NAME, "enabled"), 0)
+		enabled = self.update("Webhook", WEBHOOK_NAME, {"enabled": 1})
+		self.assertEqual(enabled, {"ok": True, "doctype": "Webhook", "name": WEBHOOK_NAME})
+		self.assertEqual(frappe.db.get_value("Webhook", WEBHOOK_NAME, "enabled"), 0)
+
+	def test_rename_is_refused(self):
+		created = self.create("Note", {"title": NOTE_TITLE, "public": 1})
+		self.assertTrue(created["ok"], created)
+		before = frappe.db.count("Note")
+		content = frappe.db.get_value("Note", created["name"], "content")
+		result = self.update("Note", created["name"], {"name": RENAMED_NOTE, "content": "mới"})
+		self.assertEqual(
+			result, {"ok": False, "reason": "không đổi tên bản ghi qua công cụ: name", "doctype": "Note"}
+		)
+		self.assertEqual(frappe.db.count("Note"), before)
+		self.assertFalse(frappe.db.exists("Note", RENAMED_NOTE))
+		self.assertEqual(frappe.db.get_value("Note", created["name"], "content"), content)
+
+	def test_duplicate_name_rolls_back_to_savepoint(self):
+		created = self.create("Tag", {"name": DUPLICATE_TAG})
+		self.assertEqual(created, {"ok": True, "doctype": "Tag", "name": DUPLICATE_TAG})
+		before = frappe.db.count("Tag")
+		with (
+			patch.object(frappe.db, "rollback", wraps=frappe.db.rollback) as rollback,
+			patch.object(frappe, "log_error") as log_error,
+		):
+			result = self.create("Tag", {"name": DUPLICATE_TAG})
+		self.assertEqual(result, {"ok": False, "reason": "đã có bản ghi cùng tên", "doctype": "Tag"})
+		rollback.assert_any_call(save_point=site_api.SAVEPOINT)
+		log_error.assert_called_once()
+		self.assertEqual(frappe.db.count("Tag"), before)
+
+	def test_hook_error_leaves_no_partial_write(self):
+		from frappe.desk.doctype.note.note import Note
+
+		before = frappe.db.count("Note")
+		with (
+			patch.object(Note, "on_update", side_effect=TypeError("hook boom"), create=True) as hook,
+			patch.object(frappe, "log_error") as log_error,
+		):
+			result = self.create("Note", {"title": NOTE_TITLE, "public": 1})
+		hook.assert_called_once()
+		self.assertEqual(
+			result, {"ok": False, "reason": "lỗi hệ thống khi lưu, không có gì thay đổi", "doctype": "Note"}
+		)
+		self.assertNotIn("hook boom", result["reason"])
+		log_error.assert_called_once()
+		self.assertEqual(frappe.db.count("Note"), before)
+		self.assertFalse(frappe.db.exists("Note", {"title": NOTE_TITLE}))
 
 	def test_update_changes_only_the_given_fields(self):
 		created = self.create("Note", {"title": NOTE_TITLE, "public": 1, "content": "cũ"})

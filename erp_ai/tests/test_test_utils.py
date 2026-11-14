@@ -1,9 +1,11 @@
+import hashlib
 import json
 import unittest
 from unittest.mock import patch
 
 import frappe
 from frappe.tests.utils import FrappeTestCase
+from frappe.utils.password import remove_encrypted_password, set_encrypted_password
 
 from erp_ai.constants import AGENT_USER, CREDENTIAL_DOCTYPE, HELPDESK_AGENT_ROLE, ROLE_AGENT, SETTING_DOCTYPE
 from erp_ai.test_utils import (
@@ -230,6 +232,25 @@ def _credential_rows() -> list[dict]:
 	)
 
 
+def _credential_auth_rows() -> list[tuple]:
+	"""`__Auth` rows of ERP AI Credential; the stored (encrypted) value appears only as its sha256, never printed."""
+	rows = frappe.db.sql(
+		"select doctype, name, fieldname, password, encrypted from `__Auth` where doctype=%s",
+		CREDENTIAL_DOCTYPE,
+		as_dict=True,
+	)
+	return sorted(
+		(
+			row.doctype,
+			row.name,
+			row.fieldname,
+			hashlib.sha256(row.password.encode("utf-8")).hexdigest(),
+			row.encrypted,
+		)
+		for row in rows
+	)
+
+
 class TestKeepAgentSettings(FrappeTestCase):
 	def setUp(self):
 		frappe.db.rollback()
@@ -266,3 +287,24 @@ class TestKeepAgentSettings(FrappeTestCase):
 		self.assertEqual(_credential_rows(), rows_before)
 		self.assertEqual(frappe.db.get_single_value(SETTING_DOCTYPE, "trigger_keyword"), f"{PREFIX}keyword")
 		self.assertEqual(frappe.get_cached_doc(SETTING_DOCTYPE).thinking_text, f"{PREFIX}thinking")
+
+	def test_restores_auth_rows_of_credentials(self):
+		# Own rows, so the test never depends on the site's credentials.
+		changed = add_credential(f"{PREFIX}auth-changed")
+		deleted = add_credential(f"{PREFIX}auth-deleted")
+		auth_before = _credential_auth_rows()
+		inner = unittest.TestCase()
+
+		keep_agent_settings(inner)
+		set_encrypted_password(CREDENTIAL_DOCTYPE, changed, f"sk-{PREFIX}FAKE-changed", "api_key")
+		remove_encrypted_password(CREDENTIAL_DOCTYPE, deleted, "api_key")
+		added = add_credential(f"{PREFIX}auth-added")
+		auth_changed = _credential_auth_rows()
+		self.assertNotEqual(auth_changed, auth_before)
+		self.assertEqual(len(auth_changed), len(auth_before))
+		self.assertIn(added, {row[1] for row in auth_changed})
+
+		inner.doCleanups()
+
+		self.assertEqual(_credential_auth_rows(), auth_before)
+		self.assertEqual(len(_credential_auth_rows()), len(auth_before))

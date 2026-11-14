@@ -1227,22 +1227,27 @@ def _child_rows():
 	]
 
 
+def _stub_child_meta(test):
+	"""Make `frappe.get_meta` return STUB_CHILD_META for STUB_CHILD for the duration of `test`."""
+	real_get_meta = frappe.get_meta
+
+	def get_meta(doctype, *args, **kwargs):
+		return STUB_CHILD_META if doctype == STUB_CHILD else real_get_meta(doctype, *args, **kwargs)
+
+	patcher = patch.object(frappe, "get_meta", get_meta)
+	patcher.start()
+	test.addCleanup(patcher.stop)
+
+
 class TestSiteApiChildSecrets(FrappeTestCase):
 	"""F-2: secret-named keys and child Password fields are scrubbed in child rows at every depth."""
 
 	def setUp(self):
-		real_get_meta = frappe.get_meta
-
-		def get_meta(doctype, *args, **kwargs):
-			return STUB_CHILD_META if doctype == STUB_CHILD else real_get_meta(doctype, *args, **kwargs)
-
+		_stub_child_meta(self)
 		# The cut is lifted so only the secret filter, not the 200-character cut, keeps the fake values out.
-		for patcher in (
-			patch.object(frappe, "get_meta", get_meta),
-			patch.object(site_api, "VALUE_MAX", 10000),
-		):
-			patcher.start()
-			self.addCleanup(patcher.stop)
+		patcher = patch.object(site_api, "VALUE_MAX", 10000)
+		patcher.start()
+		self.addCleanup(patcher.stop)
 
 	def assert_scrubbed(self, values, fakes=CHILD_FAKES, shown=(CHILD_SHOWN, DEEP_SHOWN)):
 		text = json.dumps(values, ensure_ascii=False, default=str)
@@ -1276,3 +1281,22 @@ class TestSiteApiChildSecrets(FrappeTestCase):
 	def test_child_rows_without_secrets_are_shown_as_before(self):
 		doc = _StubDoc({"rows": [{"label": "a"}]})
 		self.assertEqual(site_api._shown(doc, ["rows"]), {"rows": '[{"label": "a"}]'})
+
+	def test_compact_json_text_without_secrets_is_shown_unchanged(self):
+		doc = _StubDoc({"rows": '[{"label":"a"}]'})
+		self.assertEqual(site_api._shown(doc, ["rows"]), {"rows": '[{"label":"a"}]'})
+
+
+class TestSiteApiChildSecretsAtRealCut(FrappeTestCase):
+	"""F-2 at the real VALUE_MAX (200, not patched): secrets are scrubbed first, the text is cut after."""
+
+	def setUp(self):
+		_stub_child_meta(self)
+
+	def test_secret_within_the_first_200_characters_is_scrubbed_before_the_cut(self):
+		# Unscrubbed, the fake key sits at characters 28-45, inside the cut; scrubbed, the text is 48 + 300 + 3 long.
+		doc = _StubDoc({"rows": [{"name": "r1", "api_key": FAKE_CHILD_KEY, "label": "x" * 300}]})
+		shown = site_api._shown(doc, ["rows"])["rows"]
+		self.assertEqual(shown, '[{"name": "r1", "api_key": "[đã ẩn]", "label": "' + "x" * 152)
+		self.assertEqual(len(shown), 200)
+		self.assertEqual(shown.count(FAKE_CHILD_KEY), 0)

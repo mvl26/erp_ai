@@ -1650,6 +1650,8 @@ class TestRunnerRecordToolValues(RunnerTestBase):
 		)
 		# ~12.5 KB each: four keep their values whole within 60000 bytes, a fifth would not fit
 		self.assertEqual([action["value_before"] for action in actions], [large_values()] * 4 + [CUT] * 2)
+		# a delete has no "after": a stripped entry must not show the marker in its place
+		self.assertEqual([action["value_after"] for action in actions], [None] * 6)
 
 
 # Hand-written (F-1): the bound of the `actions` column in bytes and the marker of a cut.

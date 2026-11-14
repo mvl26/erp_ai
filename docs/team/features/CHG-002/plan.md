@@ -52,15 +52,19 @@ Chép nguyên văn từ design; mọi task thừa hưởng. Số dòng `file:lin
 - `CHANGE_OP_EDIT = "Sửa"`, `CHANGE_OP_CREATE = "Tạo"`, `CHANGE_OP_DELETE = "Xóa"`, `CHANGE_OP_RENAME = "Đổi tên"`, `CHANGE_OPS = (CHANGE_OP_EDIT, CHANGE_OP_CREATE, CHANGE_OP_DELETE, CHANGE_OP_RENAME)`
 - `RESTART_STATUS_SENT = "Đã gửi"`, `RESTART_STATUS_CONFIRMED = "Đã xác nhận"`, `RESTART_STATUS_UNCONFIRMED = "Chưa xác nhận"`, `RESTART_STATUS_LAUNCH_FAILED = "Lỗi khởi chạy"`
 - `CHANGE_MAX_FILE_OPS = 50`, `CHANGE_MAX_TOTAL_BYTES = 8 * 1024 * 1024`, `CHANGE_MAX_COMMANDS = 6`
+- `CHANGE_FILE_MAX_BYTES = 2 * 1024 * 1024` (design-addendum-1 A-1.2, ADR-040 Phán quyết C-1; T1 tạo cùng khối)
 - `RESTART_WEB_STOP_S = 40`, `RESTART_TIMEOUT_S = JOB_TIMEOUT_S + RESTART_WEB_STOP_S + JOB_SAFETY_MARGIN_S` (= 700), `RESTART_LAUNCH_TIMEOUT_S = 10`
 - Xóa `PROPOSAL_TEXT_MAX_CHARS`, `REPLACE_MAX_ITEMS` (T29).
-- Giới hạn mỗi file: chỉ một tên, `source.TEXT_MAX_BYTES` (= `SEARCH_FILE_MAX_BYTES` cho tới T50).
+- Giới hạn mỗi file: `source.TEXT_MAX_BYTES` là tên nhập lại của `CHANGE_FILE_MAX_BYTES` (T3); chỉ `source.text_refusal` so kích thước với nó. `SEARCH_FILE_MAX_BYTES` bị xóa ở T49, hai `PROPOSAL_FILE_MAX_BYTES` ở T6 và T26.
+- `source.SETSID_EXECUTABLE = "setsid"` (A-5; T3 tạo, T8 dùng).
+
+**Phụ lục thiết kế:** `design-addendum-1.md` thắng `design.md` ở chỗ hai bên khác nhau (A-1 giới hạn và `diff_text`, A-2 `_decider`, A-3 `_refuse_unsafe_path`, A-5 `setsid`, A-6 epoch UTC). Các task đã chép chữ mới ghi `A-n` ở dòng Returns.
 
 **Chữ ký** (§3.2–§3.6):
 - `source.text_refusal(rel_path: str, data: bytes | None = None) -> str | None`
 - `change_guard.check_write_path(rel_path, allowed_apps, *, new_file, read_git=True) -> GuardResult` (giữ chữ ký)
 - `change_guard.FileOp` (dataclass frozen): `kind`, `path`, `new_path`, `before: str | None`, `after: str | None`, `base_hash`, `after_hash`; `kind` là một giá trị của `CHANGE_OPS`
-- `change_guard.check_block(ops, commands, allowed_apps, site, *, at_apply: bool, legacy: bool = False) -> BlockCheck`; `BlockCheck(reason, app, targets)`; `OpTarget(op, full_path, full_new_path, new_dirs, guard)`
+- `change_guard.check_block(ops, commands, allowed_apps, site, *, at_apply: bool, diff_text: str, legacy: bool = False) -> BlockCheck` (`diff_text` bắt buộc, A-1.4); `BlockCheck(reason, app, targets)`; `OpTarget(op, full_path, full_new_path, new_dirs, guard)`
 - `change_guard.RESTART_COMMAND = "restart"`; hình dạng duy nhất `["restart"]`
 - `block.is_block(doc) -> bool`, `block.operations_of(doc) -> tuple[FileOp, ...]`, `block.commands_of(doc) -> list[list[str]]`
 - `process_runner.git_commit_only(repo_root, rels: tuple[str, ...], subject, body, limit_s)`; `process_runner.launch_restart() -> tuple[bool, str | None]`; `process_runner.RESTART_ARGV`
@@ -218,7 +222,7 @@ Tại mỗi điểm: `cmd.test` xanh trên `team/CHG-002` (không test đỏ nà
 |---|---|---|
 | `commit --only` không ghi nhận file đã xóa trên git 2.43 | T0 đỏ | Dừng, báo team-leader, cần ADR mới (ADR-040 Ràng buộc Git) |
 | C-1 chưa có phán quyết khi build tới T50 | ADR-040 QĐ 5 vẫn ghi 1 MiB | T50 không bắt đầu; mọi task khác dùng `source.TEXT_MAX_BYTES` nên không bị chặn; báo team-leader |
-| `arch-review-design.md` (architect, 2026-11-15) trả `REVIEW: fix`, 0 blocker, 3 major; `design.md` chưa sửa lúc lập plan | F-1 (tổng 8 MiB phải đếm cả `diff`; hằng trần mỗi file ở `constants.py`) chạm T1, T3, T13, T29, T49, T50; F-2 (`confirm_restart` chỉ nhận `ERP AI Instructor` qua `_decider`) chạm T24, T42; F-3 (`remove_file`, `remove_empty_dirs` kiểm `.git*` và symlink) chạm T5, T6 | Plan không tự sửa hợp đồng của design. Sau khi designer sửa `design.md`, tech-lead sửa đúng các dòng Returns/Expect của những task trên (`/team:plan --insert`) trước khi giao chúng; T0, T2 và mọi task khác không chờ |
+| `arch-review-design.md` (architect, 2026-11-15) trả `REVIEW: fix`, 0 blocker, 3 major; `design.md` chưa sửa lúc lập plan | F-1 (tổng 8 MiB phải đếm cả `diff`; hằng trần mỗi file ở `constants.py`) chạm T1, T3, T13, T29, T49, T50; F-2 (`confirm_restart` chỉ nhận `ERP AI Instructor` qua `_decider`) chạm T24, T42; F-3 (`remove_file`, `remove_empty_dirs` kiểm `.git*` và symlink) chạm T5, T6 | ĐÃ XỬ LÝ 2026-11-15 (build lượt 1): designer viết `design-addendum-1.md`; tech-lead đã chép chữ mới vào T3, T4, T5, T6, T8, T12, T13, T23, T24, T25, T26, T33, T35, T39, T41, T47, T49, T50 và khối hằng ở trên. T50 chỉ còn test nghiệm thu; `SETSID_EXECUTABLE` thêm ở T3 nên T8 phụ thuộc thêm T3 |
 | Chiều "xuống" của migrate xóa DocType mồ côi (journal FEAT-004, T34) trái chữ design §6 | T51 thấy `tabERP AI Change Operation` biến mất sau chiều xuống | Xem lưu ý ở T51; chỉ DocType con mới, 0 dòng; khác thế thì dừng và báo |
 | T1 chạm 12 file | review T1 dài | Ngoại lệ cỡ của walking skeleton (như FEAT-006 T1); mọi lõi giả, chỉ 1 loại mục |
 | Đổi chữ ký `git_commit_only` làm đỏ `test_apply_job.py` (71 chỗ dùng) | T7 đỏ ở test cũ | T7 chỉ đổi cách gọi và stub, không đổi assertion hành vi |

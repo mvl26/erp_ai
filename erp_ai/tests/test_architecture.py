@@ -3674,6 +3674,10 @@ REMOVED_GRANT_NAMES = ("_unrestricted_specs", "get_unrestricted_tool_schemas")
 GRANT_TABLE_NAME = "GRANT_TABLE"
 SCHEMA_FUNCTION = "get_tool_schemas"
 SCHEMA_CALL_MARK = "schema"
+SPEC_SOURCE = "_all_specs"
+IDENTIFIER = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+TOOL_MODULES_NAME = "TOOL_MODULES"
+SPEC_CONSUMERS = (SCHEMA_FUNCTION, "_grants_group", "execute_tool")
 AGENT_WRITE_OPENER = "allow_agent_write"
 AGENT_WRITE_OPENER_FILES = (RUN_LOG_FILE, PROPOSE_TOOL_FILE)
 AGENT_WRITE_FLAG_NAME = "AGENT_WRITE_FLAG"
@@ -3811,7 +3815,8 @@ def check_change_link_builds_no_api_method_path(sources: dict) -> list:
 
 
 def _node_texts(node, aliases: dict, docstrings: set) -> list:
-	"""The names a node carries: a reference (alias resolved), an imported name, a keyword name, a string."""
+	"""The names a node carries: a reference (alias resolved), an imported name, a keyword name, a string
+	and each identifier inside it (a dotted path names its last segment, as a grep would match it)."""
 	if isinstance(node, ast.Name):
 		return [resolved_name(node, aliases).rpartition(".")[2]]
 	if isinstance(node, ast.Attribute):
@@ -3821,8 +3826,58 @@ def _node_texts(node, aliases: dict, docstrings: set) -> list:
 	if isinstance(node, ast.keyword):
 		return [node.arg] if node.arg else []
 	if isinstance(node, ast.Constant) and isinstance(node.value, str) and id(node) not in docstrings:
-		return [node.value]
+		return list(dict.fromkeys([node.value, *IDENTIFIER.findall(node.value)]))
 	return []
+
+
+def _top_level_reads(tree: ast.Module, name: str) -> list:
+	"""`[(owner, node)]` for each read of `name`; owner = the enclosing top-level function's name, else None."""
+	return [
+		(statement.name if isinstance(statement, ast.FunctionDef | ast.AsyncFunctionDef) else None, node)
+		for statement in tree.body
+		for node in ast.walk(statement)
+		if isinstance(node, ast.Name) and node.id == name and isinstance(node.ctx, ast.Load)
+	]
+
+
+def _grant_path_violations(tree: ast.Module, reader: str) -> list:
+	"""Specs are listed only by SPEC_SOURCE (from TOOL_MODULES), called only by the grant function `reader`;
+	each SPEC_CONSUMERS function exists and calls `reader`."""
+	violations = []
+	spec_reads = _top_level_reads(tree, SPEC_SOURCE)
+	for owner, node in spec_reads:
+		if owner != reader:
+			violations.append(
+				violation(
+					REGISTRY_FILE,
+					node,
+					f"{owner}: {SPEC_SOURCE}() outside {reader} lists ungranted specs (ADR-023)",
+				)
+			)
+	if reader not in {owner for owner, _node in spec_reads}:
+		violations.append(f"{REGISTRY_FILE}: {reader} does not list specs from {SPEC_SOURCE}() (ADR-023)")
+	for owner, node in _top_level_reads(tree, TOOL_MODULES_NAME):
+		if owner not in (None, SPEC_SOURCE):
+			violations.append(
+				violation(
+					REGISTRY_FILE, node, f"{owner}: reads {TOOL_MODULES_NAME} outside {SPEC_SOURCE} (ADR-023)"
+				)
+			)
+	functions = {
+		statement.name: statement
+		for statement in tree.body
+		if isinstance(statement, ast.FunctionDef | ast.AsyncFunctionDef)
+	}
+	for consumer in SPEC_CONSUMERS:
+		if consumer not in functions:
+			violations.append(
+				f"{REGISTRY_FILE}: {consumer} missing; it must reach specs through {reader} (ADR-023)"
+			)
+		elif not any(owner == consumer for owner, _node in _top_level_reads(tree, reader)):
+			violations.append(
+				violation(REGISTRY_FILE, functions[consumer], f"{consumer} does not call {reader} (ADR-023)")
+			)
+	return violations
 
 
 def check_registry_has_one_grant_function(sources: dict) -> list:
@@ -3838,6 +3893,10 @@ def check_registry_has_one_grant_function(sources: dict) -> list:
 			for text in texts + _node_texts(node, aliases, docstrings):
 				if text in REMOVED_GRANT_NAMES:
 					violations.append(violation(rel, node, f"{text} is a second grant path (ADR-023)"))
+				elif text == SPEC_SOURCE and rel != REGISTRY_FILE:
+					violations.append(
+						violation(rel, node, f"{text} reached past the grant function (ADR-023)")
+					)
 	for rel in (REGISTRY_FILE, RUNNER_FILE):
 		if rel not in sources:
 			violations.extend(_missing(rel))
@@ -3866,6 +3925,8 @@ def check_registry_has_one_grant_function(sources: dict) -> list:
 				f"{REGISTRY_FILE}: {len(tables)} {GRANT_TABLE_NAME} assignments read by {readers}; "
 				"one grant table and one grant function (ADR-023)"
 			)
+		else:
+			violations.extend(_grant_path_violations(tree, readers[0]))
 	if RUNNER_FILE in sources:
 		tree = parse(RUNNER_FILE, sources[RUNNER_FILE])
 		aliases = import_aliases(tree)
@@ -7072,6 +7133,12 @@ class TestScannersCatchViolations(unittest.TestCase):
 		)
 		aliased[RUNNER_FILE] = aliased[RUNNER_FILE].replace("return get_tool_schemas(", "return schemas(")
 		self.assertEqual(check_registry_has_one_grant_function(aliased), [])
+		documented = self.changed(
+			GRANT_CLEAN,
+			QUEUE_FILE,
+			f'\n\ndef f():\n\t"""Replaces _unrestricted_specs; never call {SPEC_SOURCE} here."""\n',
+		)
+		self.assertEqual(check_registry_has_one_grant_function(documented), [])
 
 	def test_registry_one_grant_function_caught(self):
 		cases = {
@@ -7110,6 +7177,50 @@ class TestScannersCatchViolations(unittest.TestCase):
 				("return get_tool_schemas(*grant)", "return registry.schemas_for(*grant)"),
 			),
 			"no schema call": (RUNNER_FILE, "", ("return get_tool_schemas(*grant)", "return []")),
+			"removed name as dotted path": (
+				QUEUE_FILE,
+				"\nX = frappe.get_attr('erp_ai.agent.tools.registry.get_unrestricted_tool_schemas')\n",
+				None,
+			),
+			"6d90e79 _unrestricted_specs body under a new name": (
+				REGISTRY_FILE,
+				"\n\ndef _full_specs(effective_level, has_instructor, unrestricted):\n"
+				"\tif not (unrestricted and has_instructor):\n\t\treturn []\n"
+				"\tif effective_level not in LEVELS or effective_level == LEVELS[0]:\n\t\treturn []\n"
+				f"\treturn [spec for spec in {SPEC_SOURCE}() if spec.group in UNRESTRICTED_GROUPS]\n",
+				None,
+			),
+			"spec source listed outside the grant function": (
+				REGISTRY_FILE,
+				"",
+				("return _granted_specs(level)\n", f"return {SPEC_SOURCE}()\n"),
+			),
+			"tool modules read outside the spec source": (
+				REGISTRY_FILE,
+				f"\n\ndef _extra():\n\treturn [importlib.import_module(n).TOOLS for n in {TOOL_MODULES_NAME}]\n",
+				None,
+			),
+			"execute_tool skips the grant function": (
+				REGISTRY_FILE,
+				"",
+				("granted = _granted_specs(context.effective_level)", "granted = context.specs"),
+			),
+			"_grants_group skips the grant function": (
+				REGISTRY_FILE,
+				"",
+				("for spec in _granted_specs(level))", "for spec in ())"),
+			),
+			"execute_tool missing": (REGISTRY_FILE, "", ("def execute_tool(", "def run_tool(")),
+			"spec source reached from the runner": (
+				RUNNER_FILE,
+				f"\n\ndef tools():\n\treturn registry.{SPEC_SOURCE}()\n",
+				None,
+			),
+			"spec source imported elsewhere": (
+				QUEUE_FILE,
+				f"\nfrom erp_ai.agent.tools.registry import {SPEC_SOURCE}\n",
+				None,
+			),
 		}
 		for case, (rel, extra, replace) in cases.items():
 			with self.subTest(case=case):
@@ -7122,6 +7233,12 @@ class TestScannersCatchViolations(unittest.TestCase):
 
 	def test_agent_write_flag_clean(self):
 		self.assertEqual(check_agent_write_flag_only_in_run_log_and_propose_tool(AGENT_WRITE_CLEAN), [])
+		documented = self.changed(
+			AGENT_WRITE_CLEAN,
+			"erp_ai_agent/doctype/erp_ai_log/erp_ai_log.py",
+			f'\n\ndef g():\n\t"""Never opens erp_ai.agent.agent_write_guard.{AGENT_WRITE_OPENER}."""\n',
+		)
+		self.assertEqual(check_agent_write_flag_only_in_run_log_and_propose_tool(documented), [])
 		self.assertEqual(
 			sorted({(rel, kind) for rel, _node, kind in agent_write_references(AGENT_WRITE_CLEAN)}),
 			sorted(
@@ -7171,6 +7288,14 @@ class TestScannersCatchViolations(unittest.TestCase):
 			"flag value as key": (PROPOSE_TOOL_FILE, '\nfrappe.flags["erp_ai_agent_write_allowed"] = True\n'),
 			"flag value as attribute": (elsewhere, "\nfrappe.flags.erp_ai_agent_write_allowed = True\n"),
 			"flag value as keyword": (elsewhere, "\nfrappe.flags.update(erp_ai_agent_write_allowed=True)\n"),
+			"opener as dotted path": (
+				elsewhere,
+				f"\nX = frappe.get_attr('erp_ai.agent.agent_write_guard.{AGENT_WRITE_OPENER}')\n",
+			),
+			"opener as hooks.py entry": (
+				"hooks.py",
+				f'\ndoc_events = {{"*": {{"validate": "erp_ai.agent.agent_write_guard.{AGENT_WRITE_OPENER}"}}}}\n',
+			),
 		}
 		for case, (rel, extra) in cases.items():
 			with self.subTest(case=case):
@@ -7278,15 +7403,32 @@ def decision_path(name, query):
 }
 
 GRANT_CLEAN = {
-	REGISTRY_FILE: f"""{GRANT_TABLE_NAME} = (("read", lambda level: True),)
+	REGISTRY_FILE: f"""import importlib
+
+{TOOL_MODULES_NAME} = ("erp_ai.agent.tools.read",)
+{GRANT_TABLE_NAME} = (("read", lambda level: True),)
+
+
+def {SPEC_SOURCE}():
+	return [spec for name in {TOOL_MODULES_NAME} for spec in importlib.import_module(name).TOOLS]
 
 
 def _granted_specs(level):
-	return [g for g, c in {GRANT_TABLE_NAME} if c(level)]
+	groups = [g for g, c in {GRANT_TABLE_NAME} if c(level)]
+	return [spec for spec in {SPEC_SOURCE}() if spec.group in groups]
 
 
 def {SCHEMA_FUNCTION}(level):
 	return _granted_specs(level)
+
+
+def _grants_group(group, level):
+	return any(spec.group == group for spec in _granted_specs(level))
+
+
+def execute_tool(name, arguments, context):
+	granted = _granted_specs(context.effective_level)
+	return next(spec for spec in granted if spec.name == name)
 """,
 	RUNNER_FILE: f"""from erp_ai.agent.tools.registry import {SCHEMA_FUNCTION}
 

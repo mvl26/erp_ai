@@ -10,6 +10,10 @@ from erp_ai.constants import (
 	BOT_GIT_NAME,
 	CHANGE_KIND_CODE,
 	CHANGE_KIND_COMMAND,
+	CHANGE_OP_CREATE,
+	CHANGE_OP_DELETE,
+	CHANGE_OP_EDIT,
+	CHANGE_OP_RENAME,
 	CHANGE_STATUS_APPLIED,
 	CHANGE_STATUS_UNDONE,
 )
@@ -32,12 +36,43 @@ def safe_person_name(full_name: str | None) -> str:
 	return text[:PERSON_NAME_MAX_CHARS].rstrip()
 
 
-def apply_message(proposal: str, ticket: str, file_path: str, approver: str) -> tuple[str, str]:
-	"""(subject, body) of the apply commit; `approver` = APPROVER_PLACEHOLDER gives the preview."""
-	subject = f"erp_ai: áp dụng {proposal} ({file_path})"
+# Verb of each item line of a block commit body (CHG-002 design 3.7).
+_ITEM_VERBS = {
+	CHANGE_OP_EDIT: "sửa",
+	CHANGE_OP_CREATE: "tạo",
+	CHANGE_OP_DELETE: "xóa",
+	CHANGE_OP_RENAME: "đổi tên",
+}
+
+
+def block_label(operations) -> str:
+	"""Label of a block commit: the item's path for one item, `{n} file` for more (CHG-002 3.7)."""
+	if len(operations) == 1:
+		return operations[0].path
+	return f"{len(operations)} file"
+
+
+def _item_lines(operations) -> str:
+	"""One line per block item (`sửa …`, `tạo …`, `xóa …`, `đổi tên … → …`); "" for `None`."""
+	lines = []
+	for operation in operations or ():
+		line = f"{_ITEM_VERBS[operation.kind]} {operation.path}"
+		if operation.kind == CHANGE_OP_RENAME:
+			line += f" → {operation.new_path}"
+		lines.append(f"{line}\n")
+	return "".join(lines)
+
+
+def apply_message(proposal: str, ticket: str, label: str, approver: str, operations=None) -> tuple[str, str]:
+	"""(subject, body) of the apply commit; `approver` = APPROVER_PLACEHOLDER gives the preview.
+
+	`operations` (block items) adds one line per item after the "Phiếu" line; `None` keeps the old text.
+	"""
+	subject = f"erp_ai: áp dụng {proposal} ({label})"
 	body = (
 		f"Đề xuất: {proposal}\n"
 		f"Phiếu: {ticket}\n"
+		f"{_item_lines(operations)}"
 		f"Người duyệt: {approver}\n"
 		f"Commit do {BOT_GIT_NAME} tạo sau khi người duyệt bấm Duyệt."
 	)
@@ -45,13 +80,17 @@ def apply_message(proposal: str, ticket: str, file_path: str, approver: str) -> 
 
 
 def undo_message(
-	proposal: str, ticket: str, file_path: str, apply_commit: str, actor: str
+	proposal: str, ticket: str, label: str, apply_commit: str, actor: str, operations=None
 ) -> tuple[str, str]:
-	"""(subject, body) of the undo commit; names the apply commit and the person who undid it."""
-	subject = f"erp_ai: hoàn tác {proposal} ({file_path})"
+	"""(subject, body) of the undo commit; names the apply commit and the person who undid it.
+
+	`operations` (block items) adds one line per item after the "Phiếu" line; `None` keeps the old text.
+	"""
+	subject = f"erp_ai: hoàn tác {proposal} ({label})"
 	body = (
 		f"Đề xuất: {proposal}\n"
 		f"Phiếu: {ticket}\n"
+		f"{_item_lines(operations)}"
 		f"Commit áp dụng: {apply_commit}\n"
 		f"Người hoàn tác: {actor}\n"
 		f"Commit do {BOT_GIT_NAME} tạo sau khi người hoàn tác bấm Hoàn tác."

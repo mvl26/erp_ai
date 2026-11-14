@@ -12,6 +12,7 @@ from erp_ai.test_utils import keep_agent_settings
 REASON_DENIED = "DocType bị cấm với bot (dữ liệu của app, tài khoản hoặc dữ liệu nhạy cảm)"
 REASON_PERMISSION = "DocType phân quyền"
 REASON_SUBMITTABLE = "chứng từ submit"
+REASON_CHILD_TABLE = "bảng con của DocType khác"
 ALLOWED_IMPORTS = frozenset({"frappe", "erp_ai.agent.tools.read", "erp_ai.agent.tools.site_api"})
 HARD_BANS_MODULE = "erp_ai.agent.hard_bans"
 
@@ -77,6 +78,33 @@ class TestHardBanReason(FrappeTestCase):
 			self.assertEqual(hard_bans.hard_ban_reason("Custom Role"), REASON_DENIED)
 		with patch.object(site_api, "PERMISSION_DOCTYPES", frozenset({submittable})):
 			self.assertEqual(hard_bans.hard_ban_reason(submittable), REASON_PERMISSION)
+
+	def _child_table_outside_ban_sets(self) -> str:
+		banned = read.denied_doctypes() | set(site_api.PERMISSION_DOCTYPES) | {"DocPerm", "Has Role"}
+		names = frappe.get_all("DocType", {"istable": 1}, pluck="name", order_by="name")
+		free = [name for name in names if name not in banned]
+		self.assertTrue(free, "the site has no child table outside the ban sets")
+		return free[0]
+
+	def test_child_tables_banned(self):
+		# AR3-3, AC-29: every istable DocType is a hard ban, read from its meta; no name list.
+		for doctype in ("DocPerm", "Has Role", self._child_table_outside_ban_sets()):
+			with self.subTest(doctype=doctype):
+				self.assertTrue(frappe.get_meta(doctype).istable)
+				self.assertNotIn(doctype, read.denied_doctypes() | set(site_api.PERMISSION_DOCTYPES))
+				reason = hard_bans.hard_ban_reason(doctype)
+				self.assertEqual(reason, REASON_CHILD_TABLE)
+				self.assertNotIn("danh mục", reason)
+		# Edge: a parent DocType with no other ban is not banned for this reason.
+		self.assertFalse(frappe.get_meta("ToDo").istable)
+		self.assertIsNone(hard_bans.hard_ban_reason("ToDo"))
+		# Order: an app child table keeps the first reason (denied to the bot).
+		app_child = frappe.get_all("DocType", {"module": read.AI_MODULE, "istable": 1}, pluck="name", limit=1)
+		self.assertTrue(app_child, "the app has no child table")
+		self.assertEqual(hard_bans.hard_ban_reason(app_child[0]), REASON_DENIED)
+		# Error case: an unknown DocType still raises, as before.
+		with self.assertRaises(frappe.DoesNotExistError):
+			hard_bans.hard_ban_reason("ERPAI-TEST-no-such-child-table")
 
 	def test_follows_denied_doctypes_source_live(self):
 		fake = "ERPAI-TEST-not-a-doctype"

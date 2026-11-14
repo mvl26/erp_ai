@@ -160,7 +160,7 @@ DOCTYPE_CONFIG = {
 	},
 	"ERP AI Log": {
 		"folder": "erp_ai_log",
-		"field_count": 38,
+		"field_count": 43,
 		"phrases": {
 			"ticket": ("HD Ticket", "mã phiếu", "lọc"),
 			"run_id": ("cùng một lần chạy", "gom"),
@@ -189,6 +189,7 @@ DOCTYPE_CONFIG = {
 				"mỗi bước một dòng",
 			),
 			"actor": ("người thực hiện", "người duyệt", "agent", "không suy từ"),
+			"site_environment": ("production", "test", "Setting", "giữ nguyên"),
 			"input_tokens": ("token", "gửi lên"),
 			"output_tokens": ("token", "model trả về"),
 			"cache_creation_input_tokens": ("ghi vào cache", "token"),
@@ -216,6 +217,7 @@ DOCTYPE_CONFIG = {
 			"skipped_fields": ("bỏ qua", "phân loại"),
 			"predicted_category": ("đầu mục", "A đến F"),
 			"predicted_confidence": ("Cao", "Trung bình", "Thấp", "ai_confidence"),
+			"predicted_confidence_pct": ("số nguyên", "0 đến 100", "ngưỡng độ tin cậy", "không được quy đổi"),
 			"predicted_ticket_type": ("loại phiếu", "dự đoán"),
 			"predicted_agent_group": ("nhóm xử lý", "dự đoán"),
 			"predicted_priority": ("ưu tiên", "dự đoán"),
@@ -224,6 +226,17 @@ DOCTYPE_CONFIG = {
 			"predicted_score_reason": ("lý do", "không có điểm"),
 			"predicted_assignee": ("người phụ trách", "dự đoán"),
 			"applied": ("đã ghi", "phiếu"),
+			"created_labels": (
+				"lúc tạo phiếu",
+				"trước khi",
+				"JSON",
+				"ticket_type",
+				"agent_group",
+				"priority",
+				"dòng classify",
+			),
+			"split_requested": ("2 yêu cầu", "xác nhận", "không đăng lần hai", "không tạo, sửa, đóng"),
+			"split_requests": ("JSON", "phiếu gộp", "Để trống"),
 			"human_corrected_to": ("loại phiếu", "nhóm xử lý", "ưu tiên", "AI đã dự đoán"),
 			"human_corrected_by": ("người đổi", "AI đã dự đoán"),
 			"human_corrected_at": ("lần sửa đầu", "AI đã dự đoán"),
@@ -241,6 +254,7 @@ DOCTYPE_CONFIG = {
 			"change_proposal",
 			"change_step",
 			"actor",
+			"site_environment",
 			"input_tokens",
 			"output_tokens",
 			"cache_creation_input_tokens",
@@ -257,6 +271,7 @@ DOCTYPE_CONFIG = {
 			"skipped_fields",
 			"predicted_category",
 			"predicted_confidence",
+			"predicted_confidence_pct",
 			"predicted_ticket_type",
 			"predicted_agent_group",
 			"predicted_priority",
@@ -265,6 +280,9 @@ DOCTYPE_CONFIG = {
 			"predicted_score_reason",
 			"predicted_assignee",
 			"applied",
+			"created_labels",
+			"split_requested",
+			"split_requests",
 			"human_corrected_to",
 			"human_corrected_by",
 			"human_corrected_at",
@@ -301,6 +319,15 @@ CODE_CHANGE_FIELDS = {
 		"sửa app lõi ảnh hưởng mọi site trên bench. Không bao giờ được thêm erp_ai. "
 		"Bỏ trống thì không file nào được sửa.",
 	},
+}
+
+
+FEAT007_LOG_COLUMNS = {
+	"created_labels": "Small Text",
+	"predicted_confidence_pct": "Int",
+	"split_requested": "Check",
+	"split_requests": "Small Text",
+	"site_environment": "Data",
 }
 
 
@@ -447,6 +474,12 @@ class TestDoctypeDescriptions(FrappeTestCase):
 		self.assertEqual(order.index("skipped_fields"), order.index("value_after") + 1)
 		names = [f["fieldname"] for f in doctype_json["fields"]]
 		self.assertEqual(names, order)
+
+	def test_feat007_log_columns_have_design_types(self):
+		# FEAT-007 design.md 2.3, design-w0-fixes.md F-5: the five added columns and their types.
+		by_name = {f["fieldname"]: f for f in load_doctype(DOCTYPE_CONFIG["ERP AI Log"])["fields"]}
+		actual = {name: by_name.get(name, {}).get("fieldtype") for name in FEAT007_LOG_COLUMNS}
+		self.assertEqual(actual, FEAT007_LOG_COLUMNS)
 
 	def test_section_breaks_carry_only_label(self):
 		for doctype, _config, doctype_json in self.each_doctype():

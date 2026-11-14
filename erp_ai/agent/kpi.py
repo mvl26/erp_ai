@@ -10,6 +10,8 @@ from statistics import median
 
 import frappe
 
+from erp_ai.agent.classification import load_mapping
+from erp_ai.agent.ops_data import category_by_ticket_type, ticket_category
 from erp_ai.constants import AGENT_USER, LOG_DOCTYPE
 
 TICKET = "HD Ticket"
@@ -17,18 +19,24 @@ CLOSED_STATUSES = ("Resolved", "Closed")
 COMPLETE_FIELDS = ("ticket_type", "agent_group", "priority")
 FAST_RESPONSE_MINUTES = 15
 FASTEST_RESPONSE_MINUTES = 5
+TASK_DUE = timedelta(hours=72)
+STALE_DAYS = (5, 7)
 
 
 def compute_week(week_start: date, settings) -> dict:
-	"""KPI 1-3 of the week starting Monday `week_start`; keys are fields of `ERP AI KPI Week`."""
+	"""KPI 1-6 of the week starting Monday `week_start`; keys are fields of `ERP AI KPI Week`."""
 	ws = datetime.combine(week_start, datetime.min.time())
 	we = ws + timedelta(days=7)
+	reverse_map = category_by_ticket_type(load_mapping(settings.category_mapping))
 	return {
 		"week_start": week_start,
 		"week_end": week_start + timedelta(days=6),
 		**_first_response(ws, we),
 		**_complete_fields(we),
 		**_closed_without_human(ws, we),
+		**_b_resolution(ws, we, reverse_map),
+		**_c_task_in_3_days(ws, we, reverse_map),
+		**_stale(we),
 	}
 
 
@@ -57,16 +65,75 @@ def _first_response(ws: datetime, we: datetime) -> dict:
 	}
 
 
-def _complete_fields(we: datetime) -> dict:
-	"""KPI 2: tickets open at `we` (A-D2: created before it, not resolved before it) with all three fields."""
-	tickets = frappe.get_all(
+def _open_at(we: datetime, fields: list[str]) -> list:
+	"""Tickets open at `we` (A-D2): created before it, not resolved before it."""
+	return frappe.get_all(
 		TICKET,
 		filters=[["creation", "<", we]],
 		or_filters=[["resolution_date", "is", "not set"], ["resolution_date", ">=", we]],
-		fields=list(COMPLETE_FIELDS),
+		fields=fields,
 	)
+
+
+def _complete_fields(we: datetime) -> dict:
+	"""KPI 2: tickets open at `we` with all three fields."""
+	tickets = _open_at(we, list(COMPLETE_FIELDS))
 	complete = sum(all(row.get(field) for field in COMPLETE_FIELDS) for row in tickets)
 	return {"complete_fields_pct": _pct(complete, len(tickets)), "complete_fields_sample": len(tickets)}
+
+
+def _b_resolution(ws: datetime, we: datetime, reverse_map: dict[str, str]) -> dict:
+	"""KPI 4: mean calendar hours from creation to resolution of category B tickets resolved in [ws, we)."""
+	tickets = frappe.get_all(
+		TICKET,
+		filters=[["resolution_date", ">=", ws], ["resolution_date", "<", we]],
+		fields=["ticket_type", "creation", "resolution_date"],
+	)
+	hours = [
+		(row.resolution_date - row.creation).total_seconds() / 3600
+		for row in tickets
+		if ticket_category(row, reverse_map) == "B"
+	]
+	return {
+		"b_resolution_avg_hours": sum(hours) / len(hours) if hours else None,
+		"b_resolution_sample": len(hours),
+	}
+
+
+def _c_task_in_3_days(ws: datetime, we: datetime, reverse_map: dict[str, str]) -> dict:
+	"""KPI 5 (A-D4): category C tickets created in [ws - 3 days, we - 3 days) with a linked Task created
+	at most 72 h after the ticket (exactly 72 h counts)."""
+	tickets = [
+		row
+		for row in frappe.get_all(
+			TICKET,
+			filters=[["creation", ">=", ws - TASK_DUE], ["creation", "<", we - TASK_DUE]],
+			fields=["name", "ticket_type", "creation"],
+		)
+		if ticket_category(row, reverse_map) == "C"
+	]
+	created = {row.name: row.creation for row in tickets}
+	in_time = (
+		{
+			task.ai_ticket
+			for task in frappe.get_all(
+				"Task", filters={"ai_ticket": ["in", list(created)]}, fields=["ai_ticket", "creation"]
+			)
+			if task.creation <= created[task.ai_ticket] + TASK_DUE
+		}
+		if created
+		else set()
+	)
+	return {"c_task_in_3_days_pct": _pct(len(in_time), len(tickets)), "c_task_sample": len(tickets)}
+
+
+def _stale(we: datetime) -> dict:
+	"""KPI 6: tickets open at `we` older than 5 and than 7 days (exactly 5 days is not counted)."""
+	tickets = _open_at(we, ["creation"])
+	return {
+		f"stale_over_{days}_days": sum(we - row.creation > timedelta(days=days) for row in tickets)
+		for days in STALE_DAYS
+	}
 
 
 def _closed_without_human(ws: datetime, we: datetime) -> dict:

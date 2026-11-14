@@ -7,7 +7,7 @@ from helpdesk.test_utils import make_ticket
 
 from erp_ai.agent import kpi
 from erp_ai.constants import AGENT_USER, LOG_DOCTYPE
-from erp_ai.test_utils import keep_agent_settings
+from erp_ai.test_utils import keep_agent_settings, set_agent_settings
 
 # Weeks long before any real ticket on the shared site, one per test, so "open at the week end" (A-D2)
 # sees only the tickets a test makes.
@@ -16,7 +16,10 @@ WEEK_KPI2 = date(2001, 2, 5)
 WEEK_KPI3 = date(2001, 3, 5)
 WEEK_EMPTY = date(2001, 4, 2)
 WEEK_NO_RESPONSE = date(2001, 5, 7)
-KPI_1_TO_3_KEYS = {
+WEEK_KPI4 = date(2001, 6, 4)
+WEEK_KPI5 = date(2001, 7, 2)
+WEEK_KPI6 = date(2001, 8, 6)
+KPI_KEYS = {
 	"week_start",
 	"week_end",
 	"first_response_median_min",
@@ -27,9 +30,26 @@ KPI_1_TO_3_KEYS = {
 	"complete_fields_sample",
 	"closed_without_human_pct",
 	"closed_sample",
+	"b_resolution_avg_hours",
+	"b_resolution_sample",
+	"c_task_in_3_days_pct",
+	"c_task_sample",
+	"stale_over_5_days",
+	"stale_over_7_days",
 }
 CUSTOMER = "erpai-test-kpi-customer@example.com"
 HUMAN_AGENT = "erpai-test-kpi-human@example.com"
+TYPE_A = "ERPAI-TEST kpi A"
+TYPE_B = "ERPAI-TEST kpi B"
+TYPE_C = "ERPAI-TEST kpi C"
+TYPE_UNMAPPED = "ERPAI-TEST kpi unmapped"
+# D shares B's ticket type and comes first in the JSON: B still wins (earlier in CATEGORIES).
+CATEGORY_MAPPING = {
+	"D": {"ticket_type": TYPE_B},
+	"A": {"ticket_type": TYPE_A},
+	"B": {"ticket_type": TYPE_B},
+	"C": {"ticket_type": TYPE_C},
+}
 FULL_FIELDS = {"ticket_type": "ERPAI-TEST type", "agent_group": "ERPAI-TEST team", "priority": "Medium"}
 
 
@@ -100,6 +120,12 @@ def _todo(ticket: str, assigned_by: str) -> None:
 	_insert_as(doc, assigned_by)
 
 
+def _task(ticket: str, creation: datetime) -> None:
+	doc = frappe.get_doc({"doctype": "Task", "subject": "ERPAI-TEST kpi", "ai_ticket": ticket})
+	doc.db_insert()
+	frappe.db.set_value("Task", doc.name, "creation", creation, update_modified=False)
+
+
 def _log(ticket: str, actions: list[dict]) -> None:
 	frappe.get_doc(
 		{
@@ -139,7 +165,8 @@ class TestKpi(FrappeTestCase):
 	def setUp(self):
 		keep_agent_settings(self)
 		self.addCleanup(frappe.db.rollback)
-		self.settings = frappe.get_cached_doc("ERP AI Setting")
+		set_agent_settings(category_mapping=json.dumps(CATEGORY_MAPPING))
+		self.settings = frappe.get_single("ERP AI Setting")
 
 	def test_kpi1_median_and_rates(self):
 		ws = _start(WEEK_KPI1)
@@ -159,7 +186,7 @@ class TestKpi(FrappeTestCase):
 
 		result = kpi.compute_week(WEEK_KPI1, self.settings)
 
-		self.assertEqual(set(result), KPI_1_TO_3_KEYS)
+		self.assertEqual(set(result), KPI_KEYS)
 		self.assertEqual(result["week_start"], WEEK_KPI1)
 		self.assertEqual(result["week_end"], WEEK_KPI1 + timedelta(days=6))
 		self.assertEqual(result["first_response_median_min"], 10.0)
@@ -252,16 +279,26 @@ class TestKpi(FrappeTestCase):
 	def test_zero_sample_none(self):
 		result = kpi.compute_week(WEEK_EMPTY, self.settings)
 
-		self.assertEqual(set(result), KPI_1_TO_3_KEYS)
+		self.assertEqual(set(result), KPI_KEYS)
 		for field in (
 			"first_response_median_min",
 			"first_response_within_15_pct",
 			"first_response_within_5_pct",
 			"complete_fields_pct",
 			"closed_without_human_pct",
+			"b_resolution_avg_hours",
+			"c_task_in_3_days_pct",
 		):
 			self.assertIsNone(result[field], field)
-		for field in ("first_response_sample", "complete_fields_sample", "closed_sample"):
+		for field in (
+			"first_response_sample",
+			"complete_fields_sample",
+			"closed_sample",
+			"b_resolution_sample",
+			"c_task_sample",
+			"stale_over_5_days",
+			"stale_over_7_days",
+		):
 			self.assertEqual(result[field], 0, field)
 
 		# one ticket in the week, never answered: no median, rates are 0 (not answered = missed)
@@ -271,3 +308,82 @@ class TestKpi(FrappeTestCase):
 		self.assertEqual(result["first_response_within_15_pct"], 0.0)
 		self.assertEqual(result["first_response_within_5_pct"], 0.0)
 		self.assertEqual(result["first_response_sample"], 1)
+
+	def test_kpi4_b_resolution_hours(self):
+		ws = _start(WEEK_KPI4)
+		we = ws + timedelta(days=7)
+		# category B resolved in [ws, we): 2 h, 30 h, 10 h -> mean 14 h
+		for resolved, hours in ((ws, 2), (ws + timedelta(days=3), 30), (we - timedelta(seconds=1), 10)):
+			_ticket(resolved - timedelta(hours=hours), resolution_date=resolved, ticket_type=TYPE_B)
+		# decoys: B resolved at `we` and just before `ws`; B never resolved
+		for resolved in (we, ws - timedelta(seconds=1)):
+			_ticket(resolved - timedelta(hours=100), resolution_date=resolved, ticket_type=TYPE_B)
+		_ticket(ws + timedelta(days=1), ticket_type=TYPE_B)
+		# decoys: resolved in the week but category A, C, an unmapped type, no type
+		for ticket_type in (TYPE_A, TYPE_C, TYPE_UNMAPPED, None):
+			_ticket(
+				ws - timedelta(hours=100), resolution_date=ws + timedelta(days=1), ticket_type=ticket_type
+			)
+
+		result = kpi.compute_week(WEEK_KPI4, self.settings)
+
+		self.assertEqual(result["b_resolution_sample"], 3)
+		self.assertEqual(result["b_resolution_avg_hours"], 14.0)
+
+	def test_kpi5_task_within_72h_edge(self):
+		ws = _start(WEEK_KPI5)
+		we = ws + timedelta(days=7)
+		window_start, window_end = ws - timedelta(days=3), we - timedelta(days=3)
+		hours_72 = timedelta(hours=72)
+		# counts: first moment of the window, its Task at exactly 72 h
+		_task(_ticket(window_start, ticket_type=TYPE_C), window_start + hours_72)
+		# counts: created the day before the week, inside the shifted window (A-D4), a fast Task
+		created = ws - timedelta(days=1)
+		_task(_ticket(created, ticket_type=TYPE_C), created + timedelta(hours=1))
+		# counts: one late Task, one early Task
+		created = ws + timedelta(days=1)
+		both = _ticket(created, ticket_type=TYPE_C)
+		_task(both, created + timedelta(hours=80))
+		_task(both, created + timedelta(hours=1))
+		# does not count: its only Task at 72 h + 1 s
+		_task(_ticket(ws, ticket_type=TYPE_C), ws + hours_72 + timedelta(seconds=1))
+		# does not count: no Task of its own (a fast Task is linked to another ticket, outside the sample)
+		created = ws + timedelta(days=2)
+		_ticket(created, ticket_type=TYPE_C)
+		_task(_ticket(created, ticket_type=TYPE_A), created + timedelta(hours=1))
+		# decoy: C just before the window, a fast Task
+		created = window_start - timedelta(seconds=1)
+		_task(_ticket(created, ticket_type=TYPE_C), created + timedelta(hours=1))
+		# decoy: C at the window end, only a late Task (a shorter shift pulls it in as a miss)
+		_task(_ticket(window_end, ticket_type=TYPE_C), window_end + timedelta(hours=80))
+		# decoys: in the window with a fast Task but category B, an unmapped type, no type
+		created = ws + timedelta(days=1)
+		for ticket_type in (TYPE_B, TYPE_UNMAPPED, None):
+			_task(_ticket(created, ticket_type=ticket_type), created + timedelta(hours=1))
+
+		result = kpi.compute_week(WEEK_KPI5, self.settings)
+
+		self.assertEqual(result["c_task_sample"], 5)
+		self.assertEqual(result["c_task_in_3_days_pct"], 60.0)
+
+	def test_kpi6_stale_edges(self):
+		we = _start(WEEK_KPI6) + timedelta(days=7)
+		five, seven = timedelta(days=5), timedelta(days=7)
+		# age exactly 5 days: not counted
+		_ticket(we - five)
+		# over 5 days only
+		_ticket(we - five - timedelta(seconds=1))
+		# age exactly 7 days: over 5, not over 7
+		_ticket(we - seven, ticket_type=TYPE_B)
+		# over 7 days, any category
+		_ticket(we - seven - timedelta(seconds=1), ticket_type=None)
+		# still open at `we` (resolved exactly at `we`), over 7 days
+		_ticket(we - timedelta(days=10), resolution_date=we)
+		# decoys: resolved just before `we`; created at `we`
+		_ticket(we - timedelta(days=10), resolution_date=we - timedelta(seconds=1))
+		_ticket(we)
+
+		result = kpi.compute_week(WEEK_KPI6, self.settings)
+
+		self.assertEqual(result["stale_over_5_days"], 4)
+		self.assertEqual(result["stale_over_7_days"], 2)

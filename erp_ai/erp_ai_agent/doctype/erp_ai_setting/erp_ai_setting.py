@@ -127,6 +127,19 @@ PROMPT_OVERRIDE_FIELDS = {
 	"reasoning": ("prompt_override_reasoning", "chỉ dẫn lập luận"),
 	"category_guide": ("prompt_override_category_guide", "bảng hướng dẫn đầu mục"),
 }
+# AC-38, D-3: the override history, written only by record_prompt_revisions.
+PROMPT_REVISION_DOCTYPE = "ERP AI Prompt Revision"
+PROMPT_REVISIONS_FIELD = "prompt_revisions"
+PROMPT_REVISION_FIELDS = (
+	"name",
+	"owner",
+	"creation",
+	"part",
+	"changed_by",
+	"changed_at",
+	"old_value",
+	"new_length",
+)
 
 
 def permission_switch_fields(meta) -> list:
@@ -158,6 +171,7 @@ class ERPAISetting(Document):
 		self.check_operation_people()
 		self.check_kpi_targets()
 		self.check_prompt_overrides()
+		self.record_prompt_revisions()
 		self.stamp_agent_enabled_at()
 
 	def on_update(self):
@@ -187,6 +201,20 @@ class ERPAISetting(Document):
 		singles = frappe.db.get_singles_dict(SETTING_DOCTYPE)
 		for fieldname in SELF_MANAGED_WATERMARKS:
 			self.set(fieldname, singles.get(fieldname))
+		# D-3: the history is the rows in the DB, in their order; rows added, edited or deleted on the doc are void.
+		self.set(
+			PROMPT_REVISIONS_FIELD,
+			frappe.get_all(
+				PROMPT_REVISION_DOCTYPE,
+				filters={
+					"parent": SETTING_DOCTYPE,
+					"parenttype": SETTING_DOCTYPE,
+					"parentfield": PROMPT_REVISIONS_FIELD,
+				},
+				fields=list(PROMPT_REVISION_FIELDS),
+				order_by="idx",
+			),
+		)
 		stored = {
 			row.name: row
 			for row in frappe.get_all(
@@ -205,6 +233,25 @@ class ERPAISetting(Document):
 				row.set(fieldname, saved[fieldname])
 			if human_reactivated:
 				row.update({"status": KEY_STATUS_ACTIVE, "error_count": 0, "last_error": ""})
+
+	def record_prompt_revisions(self):
+		"""AC-38 (design.md:318): one history row per part whose value differs from the DB; blank equals unset."""
+		singles = frappe.db.get_singles_dict(SETTING_DOCTYPE)
+		for part, (fieldname, _label) in PROMPT_OVERRIDE_FIELDS.items():
+			old_value = singles.get(fieldname) or ""
+			new_value = self.get(fieldname) or ""
+			if new_value == old_value:
+				continue
+			self.append(
+				PROMPT_REVISIONS_FIELD,
+				{
+					"part": part,
+					"changed_by": frappe.session.user,
+					"changed_at": frappe.utils.now_datetime(),
+					"old_value": old_value,
+					"new_length": len(new_value),
+				},
+			)
 
 	def stamp_agent_enabled_at(self):
 		"""AC-16: `enabled` going 0 -> 1 against the DB stamps the clock; otherwise the restored value stays."""

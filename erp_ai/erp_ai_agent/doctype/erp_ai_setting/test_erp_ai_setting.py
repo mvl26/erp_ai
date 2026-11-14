@@ -2216,6 +2216,12 @@ PROMPT_PARTS = {
 	),
 }
 PROMPT_MAX_CHARS = 20000
+REVISION_FILTERS = {"parent": SETTING_DOCTYPE, "parentfield": "prompt_revisions"}
+SETTING_JS = Path(erp_ai_setting.__file__).with_suffix(".js")
+# AC-38: an override that passes the classify check and carries HTML-like text, saved as the first value.
+CLASSIFY_A = prompts.CLASSIFY_PROMPT + "\n<img src=x onerror=alert(1)> & a"
+CLASSIFY_B = prompts.CLASSIFY_PROMPT + "\nb  \n"
+REVISION_MOMENTS = (datetime.datetime(2030, 3, 4, 5, 6, 7), datetime.datetime(2030, 3, 5, 6, 7, 8))
 
 
 def _too_long_error(label):
@@ -2242,9 +2248,32 @@ class TestPromptOverrides(FrappeTestCase):
 	def setUp(self):
 		self.addCleanup(frappe.db.rollback)
 		keep_agent_settings(self)
+		# design-w0-fixes-7 1b: blank overrides and no history in the DB, written past the controller, so no test
+		# depends on what the site holds.
 		blank = {fieldname: "" for fieldname, *_rest in PROMPT_PARTS.values()}
+		for fieldname in blank:
+			frappe.db.set_single_value(SETTING_DOCTYPE, fieldname, "")
+		frappe.db.delete(PROMPT_REVISION_DOCTYPE, REVISION_FILTERS)
 		kpi_default = frappe.get_meta(SETTING_DOCTYPE).get_field("kpi_targets").default
 		self.assertIsNone(self._save(kpi_targets=kpi_default, coo_report_recipients="", **blank))
+		self.assertEqual(self._revisions(), [])
+
+	def _revisions(self):
+		"""Every stored history row, in `idx` order, as (idx, part, changed_by, changed_at, old_value, new_length)."""
+		rows = frappe.get_all(
+			PROMPT_REVISION_DOCTYPE,
+			filters=REVISION_FILTERS,
+			fields=["idx", "part", "changed_by", "changed_at", "old_value", "new_length"],
+			order_by="idx",
+		)
+		return [
+			(row.idx, row.part, row.changed_by, row.changed_at, row.old_value, row.new_length) for row in rows
+		]
+
+	def _save_at(self, moment, **fields):
+		"""`_save` while the clock reads `moment`."""
+		with patch("frappe.utils.now_datetime", return_value=moment):
+			return self._save(**fields)
 
 	def _save(self, **fields):
 		"""Save the setting with these fields; return the error text, or None when it saved."""
@@ -2296,7 +2325,7 @@ class TestPromptOverrides(FrappeTestCase):
 				("part", "Select", "classify\nreasoning\ncategory_guide", 1),
 				("changed_by", "Link", "User", 1),
 				("changed_at", "Datetime", None, 1),
-				("old_value", "Long Text", None, 1),
+				("old_value", "Code", None, 1),
 				("new_length", "Int", None, 1),
 			],
 		)
@@ -2307,21 +2336,108 @@ class TestPromptOverrides(FrappeTestCase):
 
 	def test_prompt_revision_keeps_old_value_verbatim(self):
 		# AC-38: the history holds the real old override; "<...>" and "&" must not be escaped or stripped on save.
+		# Built through the system path (design-w0-fixes-7 1b): the old value in the DB, then a form save.
 		old_value = prompts.CLASSIFY_PROMPT
 		self.assertIn("<", old_value)
 		self.assertIn("&", old_value)
-		doc = frappe.get_doc(SETTING_DOCTYPE)
-		doc.append(
-			"prompt_revisions",
-			{"part": "classify", "changed_by": "Administrator", "old_value": old_value, "new_length": 0},
+		frappe.db.set_single_value(SETTING_DOCTYPE, "prompt_override_classify", old_value)
+		self.assertIsNone(
+			self._save(prompt_override_classify=old_value + "\n<img src=x onerror=alert(1)> & x")
 		)
-		doc.save()
 		stored = frappe.get_all(
 			PROMPT_REVISION_DOCTYPE,
 			filters={"parent": SETTING_DOCTYPE, "parentfield": "prompt_revisions"},
 			pluck="old_value",
 		)
 		self.assertEqual(stored, [old_value])
+
+	def test_prompt_revision_old_value_rendered_escaped(self):
+		# design-w0-fixes-7 1a: a Code field is shown by Desk through formatters.Code (formatters.js:346-348),
+		# which escapes every HTML character, in the row form and in a grid column alike; the DB keeps it raw.
+		field = frappe.get_meta(PROMPT_REVISION_DOCTYPE).get_field("old_value")
+		self.assertEqual((field.fieldtype, field.read_only, field.ignore_xss_filter), ("Code", 1, 1))
+
+	def test_revision_row_on_change(self):
+		# AC-38, design.md:318: each save changing a part adds one row: who, when, the old DB value verbatim
+		# ("" when it was blank) and the length of the new value as stored (blanks counted).
+		user = frappe.session.user
+		first, second = REVISION_MOMENTS
+		self.assertIsNone(self._save_at(first, prompt_override_classify=CLASSIFY_A))
+		self.assertIsNone(self._save_at(second, prompt_override_classify=CLASSIFY_B))
+		self.assertEqual(
+			self._revisions(),
+			[
+				(1, "classify", user, first, "", len(CLASSIFY_A)),
+				(2, "classify", user, second, CLASSIFY_A, len(CLASSIFY_B)),
+			],
+		)
+
+	def test_revision_row_when_override_cleared(self):
+		# Back to the built-in part: the row keeps the old override and a new length of 0.
+		self.assertIsNone(self._save_at(REVISION_MOMENTS[0], prompt_override_classify=CLASSIFY_A))
+		self.assertIsNone(self._save_at(REVISION_MOMENTS[1], prompt_override_classify=""))
+		user = frappe.session.user
+		self.assertEqual(
+			self._revisions(),
+			[
+				(1, "classify", user, REVISION_MOMENTS[0], "", len(CLASSIFY_A)),
+				(2, "classify", user, REVISION_MOMENTS[1], CLASSIFY_A, 0),
+			],
+		)
+
+	def test_one_revision_row_per_changed_part_in_form_order(self):
+		# One save changing every part: one row each, in form order; parts left unchanged add none.
+		moment = REVISION_MOMENTS[0]
+		new_values = {part: builtin for part, (_field, _label, builtin, _markers) in PROMPT_PARTS.items()}
+		self.assertIsNone(
+			self._save_at(moment, **{PROMPT_PARTS[part][0]: value for part, value in new_values.items()})
+		)
+		user = frappe.session.user
+		first_rows = [
+			(idx, part, user, moment, "", len(value))
+			for idx, (part, value) in enumerate(new_values.items(), start=1)
+		]
+		self.assertEqual(self._revisions(), first_rows)
+		self.assertIsNone(self._save_at(REVISION_MOMENTS[1], prompt_override_reasoning=""))
+		self.assertEqual(
+			self._revisions(),
+			[*first_rows, (4, "reasoning", user, REVISION_MOMENTS[1], prompts.CORE_PROMPT, 0)],
+		)
+
+	def test_no_revision_without_change(self):
+		# AC-38: saving the same value again, or changing only a field that is not a prompt, adds no row.
+		self.assertIsNone(self._save(prompt_override_classify=CLASSIFY_A))
+		before = self._revisions()
+		self.assertEqual(len(before), 1)
+		self.assertIsNone(self._save(prompt_override_classify=CLASSIFY_A))
+		self.assertEqual(self._revisions(), before)
+		self.assertIsNone(self._save(trigger_keyword="@ai-t20"))
+		self.assertEqual(self._stored("trigger_keyword"), "@ai-t20")
+		self.assertEqual(self._revisions(), before)
+
+	def test_revisions_restored_on_save(self):
+		# D-3, design.md:291: a row added, edited or deleted on the doc has no effect; the DB rows win, in order.
+		self.assertIsNone(self._save_at(REVISION_MOMENTS[0], prompt_override_classify=CLASSIFY_A))
+		self.assertIsNone(self._save_at(REVISION_MOMENTS[1], prompt_override_classify=CLASSIFY_B))
+		before = self._revisions()
+		self.assertEqual(len(before), 2)
+		doc = frappe.get_doc(SETTING_DOCTYPE)
+		doc.prompt_revisions[1].update({"old_value": "tampered", "changed_by": "Guest", "new_length": 1})
+		doc.remove(doc.prompt_revisions[0])
+		doc.append(
+			"prompt_revisions",
+			{"part": "reasoning", "changed_by": "Guest", "old_value": "fake", "new_length": 4},
+		)
+		doc.save()
+		self.assertEqual(self._revisions(), before)
+
+	def test_history_table_locked_on_form(self):
+		# design.md:329: the form offers no add or delete on the self-managed table (the real boundary is the
+		# server restore above).
+		script = SETTING_JS.read_text(encoding="utf-8")
+		for flag in ("cannot_add_rows", "cannot_delete_rows"):
+			with self.subTest(flag=flag):
+				self.assertIn(f'frm.set_df_property("prompt_revisions", "{flag}", 1);', script)
 
 	def test_required_markers_match_design(self):
 		# design.md:314-316 and the plan.md risk row: classify holds exactly the 11 keys ("do_tin_cay_pct" is U1's).

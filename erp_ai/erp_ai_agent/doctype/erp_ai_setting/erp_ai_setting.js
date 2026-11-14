@@ -1,5 +1,8 @@
 frappe.ui.form.on("ERP AI Setting", {
 	refresh(frm) {
+		// D-3: the history is written by the server only; the real boundary is the restore in validate.
+		frm.set_df_property("prompt_revisions", "cannot_add_rows", 1);
+		frm.set_df_property("prompt_revisions", "cannot_delete_rows", 1);
 		frm.add_custom_button(__("Kiểm tra khóa"), () => {
 			frappe.call({
 				method: "erp_ai.erp_ai_agent.doctype.erp_ai_setting.erp_ai_setting.check_keys",

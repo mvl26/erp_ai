@@ -517,7 +517,7 @@ SPLIT_QUESTION = "Anh/chị xác nhận có muốn tách thành các phiếu ri�
 
 
 class TestSplitComment(FrappeTestCase):
-	"""AC-28, pure part (design.md:409): the comment asking whether to split a merged ticket."""
+	"""AC-28, pure part (design-w0-fixes-2.md 5b): the comment asking whether to split a merged ticket."""
 
 	def setUp(self):
 		keep_agent_settings(self)
@@ -569,9 +569,48 @@ class TestSplitComment(FrappeTestCase):
 		eleven = [f"Việc {i}" for i in range(1, 12)]
 		self.assertEqual(
 			self._comment(True, eleven),
+			"Phiếu này có vẻ gồm 11 yêu cầu:\n"
+			"1. Việc 1\n2. Việc 2\n3. Việc 3\n4. Việc 4\n5. Việc 5\n"
+			"6. Việc 6\n7. Việc 7\n8. Việc 8\n9. Việc 9\n10. Việc 10\n"
+			"… và 1 yêu cầu khác không liệt kê.\n" + SPLIT_QUESTION,
+		)
+
+	def test_cap_applies_after_dropping_empty(self):
+		ten = [f"Việc {i}" for i in range(1, 11)]
+		self.assertEqual(
+			self._comment(True, ["", "   ", " \n\t ", *ten]),
 			"Phiếu này có vẻ gồm 10 yêu cầu:\n"
 			"1. Việc 1\n2. Việc 2\n3. Việc 3\n4. Việc 4\n5. Việc 5\n"
 			"6. Việc 6\n7. Việc 7\n8. Việc 8\n9. Việc 9\n10. Việc 10\n" + SPLIT_QUESTION,
+		)
+
+	def test_overflow_line_counts_after_dropping_empty(self):
+		twelve = [f"Việc {i}" for i in range(1, 13)]
+		requests = [*twelve[:3], "", *twelve[3:7], "  \n ", *twelve[7:]]
+		self.assertEqual(
+			self._comment(True, requests),
+			"Phiếu này có vẻ gồm 12 yêu cầu:\n"
+			"1. Việc 1\n2. Việc 2\n3. Việc 3\n4. Việc 4\n5. Việc 5\n"
+			"6. Việc 6\n7. Việc 7\n8. Việc 8\n9. Việc 9\n10. Việc 10\n"
+			"… và 2 yêu cầu khác không liệt kê.\n" + SPLIT_QUESTION,
+		)
+
+	def test_newline_inside_request_collapsed(self):
+		self.assertEqual(
+			self._comment(True, ["x\n2. y", "a \t\n  b"]),
+			"Phiếu này có vẻ gồm 2 yêu cầu:\n1. x 2. y\n2. a b\n" + SPLIT_QUESTION,
+		)
+
+	def test_cut_applies_after_collapsing(self):
+		comment = self._comment(True, ["d" * 100 + " \n\n " + "e" * 150, "Hai"])
+		self.assertEqual(
+			comment,
+			"Phiếu này có vẻ gồm 2 yêu cầu:\n1. "
+			+ "d" * 100
+			+ " "
+			+ "e" * 99
+			+ "\n2. Hai\n"
+			+ SPLIT_QUESTION,
 		)
 
 	def test_exactly_ten_all_listed(self):

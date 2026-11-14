@@ -4,6 +4,7 @@ from frappe.model.document import Document
 from frappe.utils import cint, cstr
 
 from erp_ai.agent import change_text, queue
+from erp_ai.agent.agent_write_guard import refuse_agent_write
 from erp_ai.agent.authority import NEVER_AUTHORITY
 from erp_ai.agent.changes import transitions
 from erp_ai.constants import CHANGE_KIND_CODE, PROPOSAL_DOCTYPE, ROLE_INSTRUCTOR
@@ -42,14 +43,24 @@ def _stored_form(fieldname: str, value):
 
 
 class ERPAIChangeProposal(Document):
+	"""M5 (ADR-023 QĐ 5): the agent account writes a proposal only inside `propose_change._insert`."""
+
 	def before_insert(self):
+		refuse_agent_write(self)
 		transitions.prepare_new(self)
 
 	def onload(self):
 		"""Design 3.3 form data: the 3.9 sentences, built only from the stored fields (no git)."""
 		self.set_onload("change_notes", change_text.proposal_notes(self))
 
+	def on_trash(self):
+		refuse_agent_write(self)
+
+	def before_rename(self, old, new, merge=False):
+		refuse_agent_write(self)
+
 	def validate(self):
+		refuse_agent_write(self)
 		if self.is_new():
 			self._set_commit_message()
 			return

@@ -23,6 +23,8 @@
   "level_cap_f",
   "confidence_threshold",
   "auto_approve_streak",
+  "section_catalog",
+  "catalog_rules",
   "section_limits",
   "max_turns_per_run",
   "max_runs_per_ticket_per_day",
@@ -188,6 +190,18 @@
    "label": "Số lần duyệt liên tiếp để Tự làm",
    "default": "20",
    "description": "Số đề xuất liên tiếp được duyệt không sửa của một loại hành động để dòng Tự làm chạy không cần duyệt, từ 1 đến 100. Từ chối, duyệt có sửa, hoàn tác đếm lại từ 0."
+  },
+  {
+   "fieldname": "section_catalog",
+   "fieldtype": "Section Break",
+   "label": "Danh mục trắng"
+  },
+  {
+   "fieldname": "catalog_rules",
+   "fieldtype": "Table",
+   "label": "Danh mục trắng",
+   "options": "ERP AI Catalog Rule",
+   "description": "Danh mục trắng của đường chính. Không có dòng nào = bot không ghi ERP ngoài phiếu. Mỗi dòng: hành động, DocType, trường, đầu mục, chế độ Cấm / Cần duyệt / Tự làm. Dòng trỏ vào dữ liệu của app, phân quyền, tài khoản hay chứng từ submit bị chặn khi lưu."
   },
   {
    "fieldname": "section_limits",
@@ -385,7 +399,7 @@
  ],
  "issingle": 1,
  "links": [],
- "modified": "2026-11-14 17:00:00.000000",
+ "modified": "2026-11-14 19:10:00.000000",
  "modified_by": "Administrator",
  "module": "ERP AI agent",
  "name": "ERP AI Setting",

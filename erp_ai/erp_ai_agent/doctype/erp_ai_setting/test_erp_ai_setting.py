@@ -11,6 +11,7 @@ from frappe.utils import get_datetime
 from erp_ai import constants, install
 from erp_ai.agent.classification import DEFAULT_CATEGORY_MAPPING
 from erp_ai.agent.routing import DEFAULT_ROUTING_RULES
+from erp_ai.agent.tools import read
 from erp_ai.constants import (
 	CREDENTIAL_DOCTYPE,
 	KEY_STATUS_ACTIVE,
@@ -650,6 +651,13 @@ class TestFeat007Defaults(FrappeTestCase):
 			with self.subTest(fieldname=fieldname):
 				self.assertEqual(self._value_after_install(fieldname), expected)
 
+	def test_catalog_starts_empty_after_install(self):
+		# AC-29: a Table keeps its rows in the child table, not in Singles; install seeds no catalog row.
+		row_filters = {"parent": SETTING_DOCTYPE, "parentfield": "catalog_rules"}
+		frappe.db.delete(CATALOG_RULE_DOCTYPE, row_filters)
+		install._ensure_default_settings()
+		self.assertEqual(frappe.get_all(CATALOG_RULE_DOCTYPE, filters=row_filters), [])
+
 	def test_level_caps_default(self):
 		meta = frappe.get_meta(SETTING_DOCTYPE)
 		order = [field.fieldname for field in meta.fields]
@@ -887,3 +895,76 @@ class TestCatalogRules(FrappeTestCase):
 		self.assertEqual(type(doc).__bases__, (Document,))
 		own_members = [name for name in vars(type(doc)) if not name.startswith("__")]
 		self.assertEqual(own_members, [])
+
+	def _save_rule(self, action, target_doctype, ignore_links=False):
+		"""Save the setting with exactly one catalog row; return the error text, or None when it saved."""
+		doc = frappe.get_doc(SETTING_DOCTYPE)
+		doc.set("catalog_rules", [])
+		doc.append(
+			"catalog_rules",
+			{
+				"action": action,
+				"target_doctype": target_doctype,
+				"fields": "title",
+				"categories": "A",
+				"mode": "Cần duyệt",
+			},
+		)
+		doc.flags.ignore_links = ignore_links
+		try:
+			doc.save()
+		except frappe.ValidationError as error:
+			return frappe.utils.strip_html(str(error))
+		return None
+
+	def test_four_hard_bans_blocked(self):
+		# AC-29: a row on app data, a permission DocType, a submittable document or an unknown action is refused.
+		cases = (
+			(
+				"Đổi trường",
+				"ERP AI Log",
+				"Danh mục dòng 1: DocType ERP AI Log bị cấm cứng: "
+				"DocType bị cấm với bot (dữ liệu của app, tài khoản hoặc dữ liệu nhạy cảm)",
+			),
+			(
+				"Đổi trường",
+				"Custom Role",
+				"Danh mục dòng 1: DocType Custom Role bị cấm cứng: DocType phân quyền",
+			),
+			(
+				"Đổi trường",
+				"Sales Invoice",
+				"Danh mục dòng 1: DocType Sales Invoice bị cấm cứng: chứng từ submit",
+			),
+			("Xóa bản ghi", "Note", "Danh mục dòng 1: hành động không hợp lệ"),
+		)
+		stored_before = [row.as_dict() for row in frappe.get_doc(SETTING_DOCTYPE).catalog_rules]
+		for action, target_doctype, message in cases:
+			with self.subTest(target_doctype=target_doctype):
+				self.assertEqual(self._save_rule(action, target_doctype), message)
+		self.assertEqual(
+			[row.as_dict() for row in frappe.get_doc(SETTING_DOCTYPE).catalog_rules], stored_before
+		)
+
+	def test_unknown_doctype_blocked(self):
+		# E-4: a DocType name that does not exist (data sent through the API without link checks).
+		self.assertEqual(
+			self._save_rule("Đổi trường", "Không Có DocType Này", ignore_links=True),
+			"Danh mục dòng 1: không có DocType Không Có DocType Này",
+		)
+
+	def test_hard_ban_follows_denied_doctypes_source(self):
+		# AC-29, ADR-031: the save-time check reads the live ban sets, no copy of its own.
+		self.assertIsNone(self._save_rule("Đổi trường", "Note"))
+		original = read.denied_doctypes
+		with patch.object(read, "denied_doctypes", lambda: original() | {"Note"}):
+			self.assertEqual(
+				self._save_rule("Đổi trường", "Note"),
+				"Danh mục dòng 1: DocType Note bị cấm cứng: "
+				"DocType bị cấm với bot (dữ liệu của app, tài khoản hoặc dữ liệu nhạy cảm)",
+			)
+		# (b) Custom Role is only in the site_api permission set.
+		self.assertEqual(
+			self._save_rule("Đổi trường", "Custom Role"),
+			"Danh mục dòng 1: DocType Custom Role bị cấm cứng: DocType phân quyền",
+		)

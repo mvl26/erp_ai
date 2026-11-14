@@ -87,6 +87,23 @@ class TestCategoryLookup(FrappeTestCase):
 		}
 		self.assertEqual(ops_data.category_by_ticket_type(mapping), {TYPE_A: "A", TYPE_D: "D"})
 
+	def test_shared_ticket_type_earliest_category_wins(self):
+		# the category met first in CATEGORIES order wins, whatever the JSON key order
+		mapping = {"C": {"ticket_type": "X"}, "A": {"ticket_type": "X"}, "B": {"ticket_type": "Y"}}
+		reversed_mapping = dict(reversed(list(mapping.items())))
+		self.assertEqual(list(reversed_mapping), ["B", "A", "C"])
+		for case in (mapping, reversed_mapping):
+			with self.subTest(keys=list(case)):
+				self.assertEqual(ops_data.category_by_ticket_type(case), {"X": "A", "Y": "B"})
+
+	def test_keys_outside_categories_are_left_out(self):
+		mapping = {
+			"G": {"ticket_type": "Type G"},
+			"a": {"ticket_type": "Type a"},
+			"B": {"ticket_type": "Type B"},
+		}
+		self.assertEqual(ops_data.category_by_ticket_type(mapping), {"Type B": "B"})
+
 	def test_empty_mapping_gives_empty_reverse_map(self):
 		self.assertEqual(ops_data.category_by_ticket_type({}), {})
 
@@ -100,6 +117,13 @@ class TestCategoryLookup(FrappeTestCase):
 		self.assertIsNone(ops_data.ticket_category({"ticket_type": None}, reverse_map))
 		self.assertIsNone(ops_data.ticket_category({}, reverse_map))
 		self.assertIsNone(ops_data.ticket_category({"ticket_type": TYPE_A}, {}))
+
+	def test_ticket_category_empty_type_is_none_even_if_mapped(self):
+		# an empty or missing type has no category, even with a hand-built map that holds such a key
+		reverse_map = {"": "A", None: "B"}
+		self.assertIsNone(ops_data.ticket_category({"ticket_type": ""}, reverse_map))
+		self.assertIsNone(ops_data.ticket_category({"ticket_type": None}, reverse_map))
+		self.assertIsNone(ops_data.ticket_category({}, reverse_map))
 
 	def test_ba_note_marker(self):
 		self.assertEqual(ops_data.BA_NOTE_MARKER, "**BA note**")

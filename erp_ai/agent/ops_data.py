@@ -6,6 +6,8 @@ so a run at 02:00 still belongs to the previous cycle.
 
 from datetime import date, datetime, time, timedelta
 
+from erp_ai.constants import CATEGORIES
+
 BA_NOTE_MARKER = "**BA note**"
 CYCLE_START = time(8, 0)
 
@@ -33,10 +35,26 @@ def monthly_cycle(now: datetime) -> str:
 
 
 def category_by_ticket_type(mapping: dict) -> dict[str, str]:
-	"""Invert a loaded `category_mapping`: ticket type -> category; entries without a ticket type are left out."""
-	return {entry["ticket_type"]: category for category, entry in mapping.items() if entry.get("ticket_type")}
+	"""Invert a loaded `category_mapping`: ticket type -> category.
+
+	Categories are read in `CATEGORIES` order (A -> F), not in the JSON key order; a key outside
+	`CATEGORIES` and a category with an empty `ticket_type` are left out. When several categories share
+	one ticket type, the one met first in `CATEGORIES` order wins, the same rule as
+	`run_eval._expected_category`. Consequence: the tickets of a losing category are counted under the
+	winning category in the accuracy report, the KPI (U5a) and the 08:00 report (`c_missing_ba_note`
+	included).
+	"""
+	reverse_map: dict[str, str] = {}
+	for category in CATEGORIES:
+		ticket_type = (mapping.get(category) or {}).get("ticket_type")
+		if ticket_type:
+			reverse_map.setdefault(ticket_type, category)
+	return reverse_map
 
 
-def ticket_category(ticket_row, reverse_map: dict[str, str]) -> str | None:
-	"""The category of a ticket row from its `ticket_type`; None when the type is empty or not mapped."""
-	return reverse_map.get(ticket_row.get("ticket_type"))
+def ticket_category(ticket_row: dict, reverse_map: dict[str, str]) -> str | None:
+	"""The category of a ticket row from its `ticket_type`; None when the type is empty, missing or not mapped."""
+	ticket_type = ticket_row.get("ticket_type")
+	if not ticket_type:
+		return None
+	return reverse_map.get(ticket_type)

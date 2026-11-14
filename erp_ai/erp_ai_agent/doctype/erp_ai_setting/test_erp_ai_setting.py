@@ -614,6 +614,15 @@ FEAT007_NEW_FIELD_DEFAULTS = {
 	"field_project": "",
 	"field_item_code": "",
 	"field_serial_no": "",
+	"reply_enabled": 0,
+	"resolve_on_tasks_done_enabled": 0,
+	"close_silent_f_enabled": 0,
+	"close_silent_f_days": 3,
+	"kb_draft_enabled": 0,
+	"knowledge_search_limit": 5,
+	"manuals_dir": "",
+	"allowed_reports": "",
+	"report_row_limit": 20,
 }
 # FEAT-007 AC-31: the highest level per category A-F, in form order.
 LEVEL_CAP_DEFAULTS = (
@@ -695,10 +704,13 @@ class TestFeat007Defaults(FrappeTestCase):
 				self.assertEqual(self._value_after_install(fieldname), default)
 
 
-# FEAT-007 AC-22, AC-36: fieldname -> (exact error text, low, high).
+# FEAT-007 AC-22, AC-36, AC-44, AC-46, AC-49: fieldname -> (exact error text, low, high).
 FEAT007_INT_LIMITS = {
 	"confidence_threshold": ("Ngưỡng độ tin cậy phải từ 0 đến 100", 0, 100),
 	"auto_approve_streak": ("Số lần duyệt liên tiếp để Tự làm phải từ 1 đến 100", 1, 100),
+	"close_silent_f_days": ("Số ngày chờ trước khi đóng phiếu F phải từ 1 đến 30", 1, 30),
+	"knowledge_search_limit": ("Số kết quả tìm tri thức tối đa phải từ 1 đến 20", 1, 20),
+	"report_row_limit": ("Số dòng báo cáo tối đa phải từ 1 đến 100", 1, 100),
 }
 
 
@@ -1467,3 +1479,96 @@ class TestTicketFieldNames(FrappeTestCase):
 		self.assertEqual(self._stored(), VALID_TICKET_FIELDS | {"origin_board_value": BOARD_VALUE})
 		self.assertIsNone(self._save(dict.fromkeys(TICKET_FIELD_LABELS, "  ") | {"origin_board_value": ""}))
 		self.assertEqual(self._stored(), dict.fromkeys(TICKET_FIELD_SECTION[1:], ""))
+
+
+# FEAT-007 design.md:107: section_knowledge and its nine fields, in form order, with their field types.
+KNOWLEDGE_SECTION = {
+	"reply_enabled": "Check",
+	"resolve_on_tasks_done_enabled": "Check",
+	"close_silent_f_enabled": "Check",
+	"close_silent_f_days": "Int",
+	"kb_draft_enabled": "Check",
+	"knowledge_search_limit": "Int",
+	"manuals_dir": "Data",
+	"allowed_reports": "Small Text",
+	"report_row_limit": "Int",
+}
+
+
+def _manuals_dir_error(typed):
+	return f"Kho HDSD '{typed}' phải là thư mục có sẵn dưới apps/"
+
+
+class TestManualsDir(FrappeTestCase):
+	def setUp(self):
+		self.addCleanup(frappe.db.rollback)
+		keep_agent_settings(self)
+		self.sandbox = TempAppsRoot(self, apps=("myapp",))
+		self.sandbox.write("myapp/docs/hdsd.md", "# HDSD\n")
+		self.assertIsNone(self._save(""))
+
+	def _save(self, value):
+		"""Save the setting with this manuals_dir (no app list, so the temp root holds); return the error or None."""
+		doc = frappe.get_doc(SETTING_DOCTYPE)
+		doc.update({"manuals_dir": value, "code_change_apps": ""})
+		try:
+			doc.save()
+		except frappe.ValidationError as error:
+			return str(error)
+		return None
+
+	def _stored(self):
+		return frappe.db.get_single_value(SETTING_DOCTYPE, "manuals_dir", cache=False) or ""
+
+	def test_section_and_field_shape(self):
+		# design.md:107: section 11 follows the code-change block; design.md:131-137: the field types.
+		meta = frappe.get_meta(SETTING_DOCTYPE)
+		order = [field.fieldname for field in meta.fields]
+		self.assertIn("section_knowledge", order, "ERP AI Setting has no section_knowledge")
+		start = order.index("section_knowledge")
+		self.assertEqual(order[start - 1], "code_change_apps")
+		self.assertEqual(order[start + 1 : start + 10], list(KNOWLEDGE_SECTION))
+		self.assertEqual(
+			{fieldname: meta.get_field(fieldname).fieldtype for fieldname in KNOWLEDGE_SECTION},
+			KNOWLEDGE_SECTION,
+		)
+
+	def test_missing_or_outside_dir_blocked(self):
+		# AC-47, E-7: a missing directory, a file, a path leaving apps/ (traversal, absolute, symlink) and
+		# apps/ itself are refused; the stored value does not change.
+		self.assertIsNone(self._save("myapp/docs"))
+		refused = (
+			"myapp/khong_co",
+			"myapp/docs/hdsd.md",
+			"myapp/ok.py",
+			"../outside",
+			"myapp/../../outside",
+			self.sandbox.outside,
+			"myapp/dir_out",
+			".",
+			"myapp/..",
+			self.sandbox.root,
+		)
+		for typed in refused:
+			with self.subTest(typed=typed):
+				self.assertEqual(self._save(f" {typed} "), _manuals_dir_error(typed))
+				self.assertEqual(self._stored(), "myapp/docs")
+
+	def test_manuals_dir_escaped_in_error(self):
+		# STD-SEC-3: the typed path is HTML-escaped in the message, as the ticket field name is.
+		self.assertEqual(self._save("<b>x</b>"), _manuals_dir_error("&lt;b&gt;x&lt;/b&gt;"))
+
+	def test_existing_dir_saves(self):
+		# AC-47: an existing directory under apps/ saves trimmed; a blank value saves as empty.
+		for typed, stored in (
+			("myapp/docs", "myapp/docs"),
+			("\tmyapp ", "myapp"),
+			("myapp/docs/", "myapp/docs/"),
+		):
+			with self.subTest(typed=typed):
+				self.assertIsNone(self._save(typed))
+				self.assertEqual(self._stored(), stored)
+		for typed in ("", "   ", None):
+			with self.subTest(typed=typed):
+				self.assertIsNone(self._save(typed))
+				self.assertEqual(self._stored(), "")

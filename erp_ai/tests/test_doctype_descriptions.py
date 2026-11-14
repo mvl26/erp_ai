@@ -23,7 +23,7 @@ VIETNAMESE_ACCENTS = re.compile(
 DOCTYPE_CONFIG = {
 	"ERP AI Setting": {
 		"folder": "erp_ai_setting",
-		"field_count": 50,
+		"field_count": 59,
 		"phrases": {
 			"enabled": ("Tắt", "4 đơn giá", "từ khóa kích hoạt"),
 			"permission_level": ("L0", "L1", "L2", "L3", "ngân sách"),
@@ -126,8 +126,24 @@ DOCTYPE_CONFIG = {
 				"erp_ai",
 				"Bỏ trống",
 			),
+			# FEAT-007 design.md:172-175: the four switches; the three that change a status or write an article
+			# say they wait for the origin field.
+			"reply_enabled": ("mặc định tắt",),
+			**{
+				fieldname: ("mặc định tắt", "chỉ bật sau khi đã đặt trường Nguồn phát sinh")
+				for fieldname in (
+					"resolve_on_tasks_done_enabled",
+					"close_silent_f_enabled",
+					"kb_draft_enabled",
+				)
+			},
+			"close_silent_f_days": ("ngày", "từ 1 đến 30"),
+			"knowledge_search_limit": ("kết quả", "từ 1 đến 20"),
+			"report_row_limit": ("dòng", "từ 1 đến 100"),
+			"manuals_dir": ("apps/", "Để trống", "chưa có kho HDSD", "mã nguồn"),
+			"allowed_reports": ("Mỗi dòng", "Để trống", "bị chặn khi lưu"),
 		},
-		"section_count": 11,
+		"section_count": 12,
 		"read_only_fields": ("spent_this_month_usd",),
 		"sections": (
 			("section_activation", "Bật và mức quyền", "enabled"),
@@ -140,6 +156,7 @@ DOCTYPE_CONFIG = {
 			("section_routing", "Phân loại và nhóm loại trừ", "excluded_teams"),
 			("section_ticket_fields", "Trường sẵn có của phiếu", "field_ticket_nature"),
 			("section_code_change", "Sửa code và lệnh bench", "code_change_apps"),
+			("section_knowledge", "Trả lời, đóng phiếu và tri thức", "reply_enabled"),
 			("section_alerts", "Cảnh báo và khóa API", "alert_recipients"),
 		),
 	},
@@ -555,8 +572,10 @@ class TestDoctypeDescriptions(FrappeTestCase):
 		start = order.index("prompt_digest")
 		# FEAT-007 design.md:98, 106 (NFR-8): the switch moved to section_permissions; the block keeps the app list.
 		# design.md:104-106: section_ticket_fields (AC-24) sits between section_routing and section_code_change.
+		# design.md:107 (row 11 after row 10): section_knowledge follows the code-change block; rows 12-13 are
+		# not built yet, so section_alerts (row 14) comes right after it.
 		self.assertEqual(
-			order[start : start + 13],
+			order[start : start + 23],
 			[
 				"prompt_digest",
 				"section_ticket_fields",
@@ -570,6 +589,16 @@ class TestDoctypeDescriptions(FrappeTestCase):
 				"field_serial_no",
 				"section_code_change",
 				"code_change_apps",
+				"section_knowledge",
+				"reply_enabled",
+				"resolve_on_tasks_done_enabled",
+				"close_silent_f_enabled",
+				"close_silent_f_days",
+				"kb_draft_enabled",
+				"knowledge_search_limit",
+				"manuals_dir",
+				"allowed_reports",
+				"report_row_limit",
 				"section_alerts",
 			],
 		)

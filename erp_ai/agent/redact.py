@@ -21,9 +21,15 @@ SECRET_PATTERNS = (
 	re.compile(r"\beyJ[\w-]+\.[\w-]+\.[\w-]+"),
 )
 
-# Key-name candidate (K-1..K-3): up to three possessive `[\w-]+` runs one space apart, starting where no
-# run continues, then an optional quote, `:` or `=` and surrounding whitespace. Linear in the text (K-8).
-_KEY_CANDIDATE = re.compile(r"(?<![\w-])(?P<name>[\w-]++(?: [\w-]++){0,2})[\"']?\s*+[:=]\s*+")
+# Key-name candidate (K-1..K-3): up to three `[\w-]+` runs one space apart, starting where no run
+# continues, then an optional quote, `:` or `=` and surrounding whitespace. Each run and each `\s*` is
+# taken whole and never given back (`(?=(?P<x>...))(?P=x)`, the Python 3.10 form of a possessive
+# quantifier), so the scan stays linear in the text (K-8).
+_KEY_CANDIDATE = re.compile(
+	r"(?<![\w-])(?P<name>(?=(?P<run1>[\w-]+))(?P=run1)"
+	r"(?: (?=(?P<run2>[\w-]+))(?P=run2)(?: (?=(?P<run3>[\w-]+))(?P=run3))?)?)"
+	r"[\"']?(?=(?P<space1>\s*))(?P=space1)[:=](?=(?P<space2>\s*))(?P=space2)"
+)
 # Key value (K-4): double-quoted, single-quoted or bare.
 _KEY_VALUE = re.compile(r"\"(?P<double>[^\"]*)\"|'(?P<single>[^']*)'|(?P<bare>[^\s,;&\"'}\]]+)")
 

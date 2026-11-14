@@ -1,3 +1,4 @@
+import re
 import time
 import unicodedata
 
@@ -11,6 +12,58 @@ MASK = "[đã che]"
 FAKE_FRAPPE_KEY = "fakekey0000000a"
 FAKE_FRAPPE_SECRET = "fakesecret00000"
 FAKE_JWT = "eyJmYWtlIjoxfQ.eyJmYWtlIjoyfQ.ZmFrZXNpZ25hdHVyZQ"
+_COUNTED_REPEAT = re.compile(r"\{(?:\d+|\d*,\d*)\}")
+
+
+def _python_311_constructs(source: str) -> list[str]:
+	"""Possessive quantifiers and atomic groups in a regex source: Python 3.10 `re` rejects both."""
+	found = []
+	index = 0
+	after_quantifier = False
+	while index < len(source):
+		char = source[index]
+		group_start = index > 0 and source[index - 1] == "(" and (index < 2 or source[index - 2] != "\\")
+		if char == "\\":
+			index += 2
+			after_quantifier = False
+			continue
+		if char == "[":
+			index += 1
+			if source.startswith("^", index):
+				index += 1
+			if source.startswith("]", index):
+				index += 1
+			while index < len(source) and source[index] != "]":
+				index += 2 if source[index] == "\\" else 1
+			index += 1
+			after_quantifier = False
+			continue
+		if source.startswith("(?>", index):
+			found.append(f"(?> at {index}")
+		if after_quantifier and char == "+":
+			found.append(f"possessive at {index}")
+			after_quantifier = False
+		elif after_quantifier and char == "?":
+			after_quantifier = False
+		elif char in "*+?" and not group_start:
+			after_quantifier = True
+		elif counted := _COUNTED_REPEAT.match(source, index):
+			index = counted.end()
+			after_quantifier = True
+			continue
+		else:
+			after_quantifier = False
+		index += 1
+	return found
+
+
+def _module_patterns() -> list[re.Pattern]:
+	patterns = []
+	for value in vars(redact).values():
+		for item in value if isinstance(value, tuple | list) else (value,):
+			if isinstance(item, re.Pattern):
+				patterns.append(item)
+	return patterns
 
 
 class TestRedact(FrappeTestCase):
@@ -215,3 +268,30 @@ class TestRedact(FrappeTestCase):
 			with self.subTest(word=word):
 				self.assertTrue(redact.is_secret_key(word))
 				self.assertEqual(redact.redact_secrets(f"{word}=fake-value"), f"{word}={MASK}")
+
+	def test_python_311_construct_check_catches_each_construct(self):
+		for source in (r"a++", r"[\w-]*+b", r"\s?+", r"a{2}+", r"a{0,2}+", r"(?:ab){1,}+", r"(?>a|b)c"):
+			with self.subTest(source=source):
+				self.assertTrue(_python_311_constructs(source))
+		for source in (
+			r"a+b*c?",
+			r"a+?b*?c??d{1,2}?",
+			r"[+*?{}]+\++\*+\?+",
+			r"(?:a)+(?P<x>b)*(?=c)?(?<!d)",
+			r"\(?a\{2}+",
+			r"[\]+]+x",
+		):
+			with self.subTest(source=source):
+				self.assertEqual(_python_311_constructs(source), [])
+
+	def test_every_pattern_is_python_310_syntax(self):
+		# CI and `requires-python` start at 3.10, whose `re` has no possessive quantifier or atomic group.
+		patterns = _module_patterns()
+		self.assertIn(redact._KEY_CANDIDATE, patterns)
+		self.assertIn(redact._KEY_VALUE, patterns)
+		self.assertIn(redact._SEGMENT_SEPARATOR, patterns)
+		for pattern in redact.SECRET_PATTERNS:
+			self.assertIn(pattern, patterns)
+		for pattern in patterns:
+			with self.subTest(pattern=pattern.pattern):
+				self.assertEqual(_python_311_constructs(pattern.pattern), [])

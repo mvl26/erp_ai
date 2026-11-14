@@ -9,8 +9,9 @@ Approved-by:
 
 - Diff: `team/FEAT-004-task-61` (head 5130c88), base 7b55147 (head T60, review riêng)
 - Diff vòng 2: `5130c88..team/FEAT-004-task-61` (head 1b36a51)
-- Vòng: 2
-- Verdict: request-changes (vòng 1: request-changes; vòng 2: request-changes)
+- Diff vòng 3: `1b36a51..team/FEAT-004-task-61` (head 8b1a54e)
+- Vòng: 3 (hết `max_rework=3`; tech-lead đã phán và dừng, xem cuối file)
+- Verdict: request-changes (vòng 1: request-changes; vòng 2: request-changes; vòng 3: request-changes)
 
 Lệnh đã chạy (chỉ đọc):
 ```
@@ -115,3 +116,27 @@ minor | — | — | 1 điểm nhỏ: chặn theo từ `token`/`secret`/`password
 
 ### Deferred (vòng 2)
 - Mục minor ở vòng 1 (`RecursionError` ở `_parsed`/`_scrub`, `SECRET_METHODS` che nhau với luật đoạn tên cuối, chưa test phạm vi "chỉ đoạn tên cuối") không thuộc diff sửa; giữ nguyên, không chặn vòng này.
+
+## Vòng 3 (2026-11-14) — request-changes
+
+Tech-lead chép từ tin trả về của reviewer. Tiêu chí vòng này theo quyết định (decide) của team-leader: phương án (a), từ chối bộ chọn cột `*`, `tabX.*`, "chặn ở mức cố gắng với các dạng đã liệt kê".
+
+- Diff sửa: `git diff 1b36a51..team/FEAT-004-task-61` (head 8b1a54e, 1 commit, 2 file, +63/−2). Reviewer đọc thêm `frappe/model/db_query.py:621-633`, `frappe/client.py:126-166` (version-15). Không chạy test.
+- Bằng chứng của dev: RED `FAILED (failures=7)`, `{'ok': True, 'method': ...} != {'ok': False, 'reason': 'tham số chọn mọi cột bằ...'}`; GREEN test_site_api `Ran 54 tests ... OK`, test_architecture `Ran 133 tests ... OK`.
+- Phát hiện vòng 2 (major STD-SEC-4, `*`): **ADDRESSED với các dạng nó nêu** (`site_api.py:334-335`, helper `:304-320`; test `test_site_api.py:835-848`).
+- Mô tả tool (`site_api.py:546-549`) chỉ nói điều mã làm, giữ chữ "mức cố gắng".
+
+| severity | STD | file:line | description | fix |
+|---|---|---|---|---|
+| major | STD-SEC-4 | erp_ai/agent/tools/site_api.py:316-318 (gốc ở :282) | `fields`/`fieldname` là chuỗi JSON của một chuỗi không bị bắt: `{"doctype": "User", "fields": "\"*\"", "as_dict": 0}`. `_parsed` chỉ mở JSON ra object/array nên trả `'"*"'` nguyên, không khớp `COLUMN_SELECTOR_PATTERN`; Frappe thì `json.loads` ra `*` (`db_query.py:628-633`; `get_value` qua `frappe.parse_json`, `client.py:150`). Trả mọi cột dạng hàng không khóa, đúng điều tiêu chí bảo phải từ chối ("kể cả chuỗi JSON lồng") | Trong `_is_column_selector`, khi giá trị là `str` thì thử `json.loads` và xét lại nếu kết quả là `str`; thêm dòng test `{"fields": "\"*\""}` và `{"fieldname": "\"*\""}` |
+
+minor | — | — | 1 điểm nhỏ: STD-TEST-8 nhánh đệ quy vào dict/list lồng (`site_api.py:308`, `:311-312`) chưa có dòng test nào chỉ nó bắt | dev's call
+
+### Không kiểm được từ diff (vòng 3)
+- Đường vòng `fields: "\"*\""` chưa chạy thử (site bận); xác nhận bằng `cmd.test_one erp_ai/agent/tools/test_site_api.py` sau khi thêm dòng test.
+- Dạng khác ngoài danh sách (`` `db`.`tabUser`.* ``, `distinct *`, hàm tự chọn cột phía server) thuộc "mức cố gắng" (ADR-023 QĐ 6 b): ghi vào rủi ro còn lại của As-Built.
+
+## Phán của tech-lead khi hết `max_rework=3` (2026-11-14)
+- Phát hiện vòng 3 (major STD-SEC-4, chuỗi JSON của chuỗi): **thật, chặn theo chữ tiêu chí vòng 3**; chưa chạy, kết luận từ đọc mã Frappe. Sửa nhỏ, nhưng tech-lead không mở vòng 4.
+- Chuyển team-leader chọn: (a) cho vòng 4 đúng phạm vi đó (một bước giải mã + 2 dòng test + ca đệ quy của minor); (b) nhận là rủi ro còn lại của "chặn ở mức cố gắng" và merge `8b1a54e` nguyên trạng, ghi vào As-Built.
+- Nhánh `team/FEAT-004-task-61` @ `8b1a54e` chưa merge; T62 (`337ccd8`), T64 (`59ab285`) đã approve, xếp chồng trên T61 nên cũng chưa merge.

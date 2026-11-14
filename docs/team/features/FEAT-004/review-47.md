@@ -78,3 +78,36 @@ Lớp 1: đúng phần sửa đã yêu cầu (AC-20, ADR-022 QĐ 6), không th�
 
 ### deferred (vòng 2)
 - Không có điểm mới. Minor vòng 1 (subTest "commit times out" có `output=""`) giữ nguyên, tùy dev.
+
+## Phần phụ lục 4 (T47b, 2026-11-14) — `_git_short_line`
+
+Tech-lead chép từ tin trả về của reviewer. Việc này do `design-addendum-4.md` giao cho T47 sau khi T47 gốc đã merge; làm trên `team/FEAT-004-task-47b` → `-47b-r2` → `-47b-r3`.
+
+- Diff vòng 1: `git diff 73f346d..46ec724` (2 commit `8b06f46`, `46ec724`; 2 file, +124/−6)
+- Diff vòng 2: `git diff 46ec724..2d96466` (1 commit; `test_apply_job.py` +21)
+- Vòng: 2 · Verdict: approve (vòng 1: request-changes)
+
+### Vòng 1 — request-changes
+- Layer 1: QĐ-D1, QĐ-D2 làm đúng chữ (dòng cuối không rỗng, `Cc` → khoảng trắng, che rồi mới cắt 120, rỗng → chỉ câu không có `: `; cả 3 chỗ gọi `_commit_failed_reason` ở `apply_job.py:399,407,580`); 3 test có tên như phụ lục; đổi đầu vào `test_long_git_output…` theo phụ lục; đổi một phép kiểm T48 (`test_apply_job.py:2737`) theo phán round 75.
+
+| severity | STD | file:line | description | fix |
+|---|---|---|---|---|
+| major | STD-TEST-2 | erp_ai/agent/changes/test_apply_job.py:774-801 (luật ở apply_job.py:259-262) | Hai phần của luật che không được ghim: `~` (đầu vào duy nhất `~/x`, `~/y` đã bị `/` che) và ngưỡng "≥ 20" cùng các ký tự `_+-` của `GIT_KEY_LIKE` (chỉ có chuỗi 40 ký tự chữ-số); đổi `{20,}` thành `{7,}`..`{40,}` vẫn xanh | Thêm subTest: từ có `~` không có `/`; từ 20 ký tự bị che và 19 ký tự giữ nguyên; từ chỉ đạt 20 qua `_` hoặc `-` |
+
+minor | — | — | 2 điểm nhỏ: `assertNotIn(HOOK_OUTPUT, …)` ở vòng lặp T48 không còn đỏ được sau khi email bị che; `GitSandbox` thứ hai dựng thừa ở subTest "apply" | dev's call
+
+- Bằng chứng của dev: RED `FAILED (failures=10)`, `'/tmp/…/apps/custom_app' unexpectedly found in 'commit git lỗi, đã trả file về như trước: fatal: https://x-token-FAKE@host/r.git real.person@example.com /tmp/…/index.lock'`; commit 2 RED `'hook-output-T48 real.person@example.com pre-commit' not found in '… hook-output-T48 … pre-commit'`; GREEN `Ran 112 tests` FAILED (errors=2, `QueryDeadlockError`), 2 ca chạy lại theo tên `Ran 2 tests` OK.
+
+### Vòng 2 — approve (chỉ diff sửa)
+- major STD-TEST-2: **ADDRESSED** — `test_git_short_line_masks_each_rule_member_alone` (`test_apply_job.py:804-822`): `HEAD~1`, `~miyano`, từ 20 ký tự (che), 19 ký tự (giữ), `ab_…`, `ab-…`, `ab+…`, `C:\x`, `token=abc`; kỳ vọng viết `"…"` trực tiếp.
+- Bằng chứng của dev (đột biến, khôi phục sau mỗi lần; `apply_job.py` trùng byte với `46ec724`): bỏ `~` → `'lỗi HEAD~1 cuối' != 'lỗi … cuối'`; `{21,}` → `'lỗi Ab3dEf6hIj9lMn2pQr5t cuối' != 'lỗi … cuối'`; `{19,}` → `'lỗi … cuối' != 'lỗi Ab3dEf6hIj9lMn2pQr5 cuối'`; GREEN cả module `Ran 113 tests … FAILED (errors=42)` (cả 42 là `QueryDeadlockError`, phiên khác chạy cả app cùng lúc), 42 tên chạy lại `Ran 43 tests … OK`.
+- Phát hiện mới (blocker/major): không có.
+
+### Không kiểm được từ diff → tech-lead
+- Phán round 75 có trong `tasks.md` (commit `a3848b0`, sau BASE của review).
+- Dòng `:2746` xanh: xem kết quả `cmd.test` cả app sau merge `fad39a3` trong `tasks.md`.
+
+### Deferred (cho designer)
+- Chữ "dòng chỉ gồm từ bị che + rỗng → `""`" của phụ lục 4 lệch với QĐ-D1 bước 2–3 (cho `… … …`); dev theo QĐ-D1.
+- Chỉ che `Cc`; ký tự định dạng (`Cf`, ví dụ U+200B) có thể cắt một token thành các đoạn < 20.
+- Trong test hook của T48, commit hỏng ở khóa ref nên dòng cuối có thể là lỗi của git dù hook có chạy hay không; các phép `NotIn` ở vòng lặp đó có thể yếu (có từ trước phần này).

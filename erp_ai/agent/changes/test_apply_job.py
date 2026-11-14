@@ -2734,7 +2734,7 @@ class TestCommitCrossChecks(RealCoreReposUntouchedMixin, ApplyJobTestCase):
 			apply_job.run_change(name, "apply")
 		state = self.state(name)
 		self.assertEqual(state.change_status, CHANGE_STATUS_FAILED)
-		self.assertIn(f"{HOOK_OUTPUT} pre-commit", state.failure_reason)
+		self.assertIn(f"hook-output-T48 {apply_job.GIT_MASKED_WORD} pre-commit", state.failure_reason)
 		self.assertIn("pre-commit", os.listdir(markers))
 
 	def test_remote_refs_and_other_branches_unchanged_after_apply_and_undo(self):

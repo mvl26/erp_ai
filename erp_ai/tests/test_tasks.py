@@ -1053,6 +1053,65 @@ class TestCheckPrivilegeEscalation(FrappeTestCase):
 					self._changes(at - timedelta(seconds=1), at), [f"ERP AI Log {name}{NO_BEFORE_AFTER}"]
 				)
 
+	def test_unusable_after_snapshot_shapes_listed_without_before_after(self):
+		# The `after` side is unusable while `before` is fine (mirror of the test above).
+		usable = {"api_update_record#1": {"name": "u", "roles": [{"role": "A"}]}}
+		shapes = {
+			"broken JSON": '{"api_update_record#1": {"name": "u", "roles": [',
+			"column not a dict": '["api_update_record#1"]',
+			"snapshot not a dict": {"api_update_record#1": "u"},
+			"roles not a list": {"api_update_record#1": {"name": "u", "roles": "System Manager"}},
+			"roles an empty object": {"api_update_record#1": {"name": "u", "roles": {}}},
+			"role row not a dict": {"api_update_record#1": {"name": "u", "roles": ["System Manager"]}},
+			"roles missing": {"api_update_record#1": {"name": "u"}},
+		}
+		cases = [(shape, usable, bad) for shape, bad in shapes.items()]
+		# A role row that is a dict without a `role` name, on each side.
+		no_role_name = {"api_update_record#1": {"name": "u", "roles": [{"idx": 1}]}}
+		cases += [("role row without role, before", no_role_name, usable)]
+		cases += [("role row without role, after", usable, no_role_name)]
+		at = SEEDED_AT
+		for shape, before, after in cases:
+			at += timedelta(minutes=1)
+			with self.subTest(shape=shape):
+				self._log_row([_hand_action("api_update_record", "User", "u")], before, after, at=at)
+
+				self.assertEqual(
+					self._changes(at - timedelta(seconds=1), at),
+					[
+						f"sửa User u (người ra lệnh erpai-tasks-boss@example.invalid, {at:%Y-%m-%d %H:%M}){NO_BEFORE_AFTER}"
+					],
+				)
+
+	def test_unusable_permission_snapshot_listed_without_before_after(self):
+		usable = {
+			"Custom DocPerm": {"name": "perm-1", "role": "Desk User", "read": 1},
+			"DocType": {"name": "Note", "permissions": [{"role": "Desk User", "read": 1}]},
+		}
+		at = SEEDED_AT
+		for doctype, name in (("Custom DocPerm", "perm-1"), ("DocType", "Note")):
+			for shape, before, after in (
+				("before a str", name, usable[doctype]),
+				("after a str", usable[doctype], name),
+				("both sides None", None, None),
+			):
+				at += timedelta(minutes=1)
+				with self.subTest(doctype=doctype, shape=shape):
+					self._log_row(
+						[_hand_action("api_update_record", doctype, name)],
+						{"api_update_record#1": before},
+						{"api_update_record#1": after},
+						at=at,
+					)
+
+					self.assertEqual(
+						self._changes(at - timedelta(seconds=1), at),
+						[
+							f"sửa {doctype} {name} (người ra lệnh erpai-tasks-boss@example.invalid, "
+							f"{at:%Y-%m-%d %H:%M}){NO_BEFORE_AFTER}"
+						],
+					)
+
 	def test_broken_snapshot_json_listed_without_before_after(self):
 		role = self._test_role("thường")
 		self._log_row(
@@ -1064,6 +1123,13 @@ class TestCheckPrivilegeEscalation(FrappeTestCase):
 		broken_actions = self._log_row(
 			'[{"tool": "api_update_record", "doctype": "User", "name": "cut@example.invalid", "ok": tr',
 			at=datetime(2031, 11, 15, 8, 20, 0),
+		)
+		# A broken `value_after` column next to a usable `value_before` one.
+		self._log_row(
+			[_hand_action("api_update_record", "User", "broken-after@example.invalid")],
+			{"api_update_record#1": {"name": "broken-after@example.invalid", "roles": []}},
+			'{"api_update_record#1": {"name": "broken-after@example.invalid", "roles": [{"role": "Sys',
+			at=datetime(2031, 11, 15, 8, 25, 0),
 		)
 		# A neighbouring row with usable snapshots still gives its normal entry.
 		self._log_row(
@@ -1083,6 +1149,8 @@ class TestCheckPrivilegeEscalation(FrappeTestCase):
 			"Agent đã sửa bản ghi phân quyền: "
 			f"sửa User broken@example.invalid {BY}{NO_BEFORE_AFTER}, "
 			f"ERP AI Log {broken_actions}{NO_BEFORE_AFTER}, "
+			"sửa User broken-after@example.invalid "
+			f"(người ra lệnh erpai-tasks-boss@example.invalid, 2031-11-15 08:25){NO_BEFORE_AFTER}, "
 			f"thêm role {role} cho fine@example.invalid "
 			"(người ra lệnh erpai-tasks-boss@example.invalid, 2031-11-15 08:30)",
 		)

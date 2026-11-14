@@ -131,13 +131,15 @@ def _is_privilege_target(doctype) -> bool:
 
 def _has_role_rows(snapshot: dict) -> bool:
 	roles = snapshot.get("roles")
-	return isinstance(roles, list) and all(isinstance(row, dict) for row in roles)
+	return isinstance(roles, list) and all(
+		isinstance(row, dict) and isinstance(row.get("role"), str) and row["role"] for row in roles
+	)
 
 
 def _usable_snapshots(doctype, key: str, before: dict, after: dict) -> tuple | None:
 	"""The (before, after) snapshots of one call, or None when they cannot be compared: a key is missing (an old
 	row), a side is neither a dict nor None (None = a create's before or a delete's after), both sides are None,
-	or a User side has no list of role rows."""
+	or a User side has no list of role rows that each name a role."""
 	if key not in before or key not in after:
 		return None
 	pair = (before[key], after[key])

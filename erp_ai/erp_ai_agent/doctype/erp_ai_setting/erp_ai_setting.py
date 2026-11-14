@@ -8,8 +8,11 @@ from erp_ai.agent.hard_bans import hard_ban_reason
 from erp_ai.agent.routing import validate_routing_config
 from erp_ai.agent.tools import source
 from erp_ai.constants import (
+	ACTION_CREATE_CUSTOM_FIELD,
+	ACTION_UPDATE_FIELDS,
 	ANSWER_DELAY_MAX_S,
 	CATALOG_ACTIONS,
+	CATEGORIES,
 	CREDENTIAL_DOCTYPE,
 	KEY_STATUS_ACTIVE,
 	KEY_STATUS_BAD_KEY,
@@ -60,6 +63,8 @@ PROBE_RESULT_FIELDS = ("label", "ok", "error_kind", "status")
 # D-7: the switches are the Check fields of this section, read from the meta; no switch name is written here.
 PERMISSION_SECTION = "section_permissions"
 PERMISSION_NOTICE_TITLE = "Đã bật quyền mở rộng"
+# design.md:214-221: the only catalog actions whose row names a DocType; the others act on a fixed one.
+DOCTYPE_ACTIONS = (ACTION_CREATE_CUSTOM_FIELD, ACTION_UPDATE_FIELDS)
 
 
 def permission_switch_fields(meta) -> list:
@@ -166,25 +171,54 @@ class ERPAISetting(Document):
 			frappe.throw("Không thể bật agent khi từ khóa kích hoạt rỗng")
 
 	def check_catalog_rules(self):
-		"""AC-29, ADR-031 decision 1: a row with an unknown action or on a hard-banned DocType is refused (E-4)."""
+		"""AC-29, ADR-031 decision 1: refuse the first catalog row breaking an E-4 rule; normalise categories."""
+		seen = {}
 		for row in self.catalog_rules:
 			reason = catalog_rule_error(row)
+			if not reason:
+				key = (row.action, row.target_doctype or "")
+				if key in seen:
+					reason = f"trùng với dòng {seen[key]}"
+				seen[key] = row.idx
 			if reason:
 				frappe.throw(f"Danh mục dòng {row.idx}: {reason}")
 
 
 def catalog_rule_error(row) -> str | None:
-	"""The first E-4 reason this catalog row breaks, or None."""
+	"""The first E-4 reason of this row alone (not the duplicate check), or None.
+
+	On success the row's DocType is set to its stored name and its categories to the form "A,B".
+	"""
 	if row.action not in CATALOG_ACTIONS:
 		return "hành động không hợp lệ"
-	doctype = row.target_doctype
-	if not doctype:
-		return None
-	if not frappe.db.exists("DocType", doctype):
-		return f"không có DocType {doctype}"
-	ban = hard_ban_reason(doctype)
-	if ban:
-		return f"DocType {doctype} bị cấm cứng: {ban}"
+	takes_doctype = row.action in DOCTYPE_ACTIONS
+	if row.target_doctype and not takes_doctype:
+		return "hành động này không nhận DocType"
+	if takes_doctype and not row.target_doctype:
+		return "hành động này cần DocType"
+	if row.target_doctype:
+		doctype = frappe.db.get_value("DocType", row.target_doctype)
+		if not doctype:
+			return f"không có DocType {row.target_doctype}"
+		ban = hard_ban_reason(doctype)
+		if ban:
+			return f"DocType {doctype} bị cấm cứng: {ban}"
+		row.target_doctype = doctype
+	fields = [line.strip() for line in (row.fields or "").splitlines() if line.strip()]
+	if fields and row.action != ACTION_UPDATE_FIELDS:
+		return "hành động này không nhận danh sách trường"
+	if row.action == ACTION_UPDATE_FIELDS:
+		if not fields:
+			return "cần ít nhất một trường"
+		meta = frappe.get_meta(row.target_doctype)
+		for fieldname in fields:
+			if not meta.has_field(fieldname):
+				return f"trường {fieldname} không có trên {row.target_doctype}"
+	letters = [part.strip() for part in (row.categories or "").split(",")]
+	if not all(letter in CATEGORIES for letter in letters):
+		# The escape is the en dash of the design text (E-4); ruff RUF001 refuses the literal character.
+		return "đầu mục phải là các chữ A\u2013F cách nhau bằng dấu phẩy"
+	row.categories = ",".join(sorted(set(letters)))
 	return None
 
 

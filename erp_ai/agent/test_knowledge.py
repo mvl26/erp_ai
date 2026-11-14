@@ -234,6 +234,62 @@ class TestSearchKb(KnowledgeCase):
 		self.assertIn("cuối", row["excerpt"])
 		self.assertNotIn("<", row["excerpt"])
 
+	def test_secret_split_by_inline_tag_fully_masked(self):
+		word = _word()
+		self._article(
+			f"<p>{word} password: <b>fake-ab</b>cdkb</p><p>khoá sk-<i>fakekbabcdef</i>0123456789 hết</p>"
+		)
+
+		[row] = knowledge.search_kb_articles(word, 5)
+
+		self.assertIn(word, row["excerpt"])
+		for part in ("fake-ab", "cdkb", "fakekbabcdef", "0123456789"):
+			self.assertNotIn(part, row["excerpt"])
+
+	def _raw_excerpt(self, content, query):
+		"""Excerpt of one row whose content is this raw HTML (the editor's sanitizer would rewrite the tags)."""
+		row = frappe._dict(name="raw", title="", content=content, modified="2025-01-01 00:00:00")
+		with patch("frappe.get_list", return_value=[row]):
+			[found] = knowledge.search_kb_articles(query, 5)
+		return found["excerpt"]
+
+	def test_inline_tag_does_not_split_word(self):
+		anchor, head, tail = _word("an"), _word("in"), _word("in")
+		tags = (
+			"b",
+			"I",
+			"EM",
+			"strong",
+			"span class='x'",
+			"a href='#'",
+			"code",
+			"u",
+			"s",
+			"mark",
+			"sub",
+			"sup",
+		)
+		cut = _word("tg")
+		cut_by_tags = (
+			"".join(f"<{tag}>{cut[index]}</{tag.split()[0]}>" for index, tag in enumerate(tags))
+			+ cut[len(tags) :]
+		)
+
+		excerpt = self._raw_excerpt(f"<p>{anchor} {head}<B>{tail}</B> {cut_by_tags}</p>", anchor)
+
+		self.assertIn(f"{anchor} {head}{tail} {cut}", excerpt)
+
+	def test_block_tag_separates_words_any_case_closing_or_self_closing(self):
+		words = [_word("bl") for _index in range(8)]
+		content = (
+			f"<P>{words[0]}</P><DIV>{words[1]}</DIV>{words[2]}</LI>{words[3]}"
+			f"<br/>{words[4]}<BR />{words[5]}<H2>{words[6]}</h2><td>{words[7]}</td>"
+		)
+
+		excerpt = self._raw_excerpt(content, words[0])
+
+		self.assertEqual(knowledge._words(excerpt), words)
+
 	def test_short_article_excerpt_whole_text(self):
 		word = _word()
 		name = self._article(f"<p>Cách xử lý {word}</p>")

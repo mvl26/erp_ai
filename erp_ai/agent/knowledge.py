@@ -20,6 +20,13 @@ WORD_MIN_CHARS = 2
 EMPTY_QUERY = "Câu tìm cần ít nhất một từ dài 2 ký tự"
 
 _WORD = re.compile(r"\w+")
+# Tags that end a line or a block of text: a space goes before each of them (opening, closing or self-closing,
+# any case) so words of adjacent blocks stay apart. Any other tag is inline and must not split a word.
+BLOCK_TAGS = (
+	"address|article|aside|blockquote|br|dd|div|dl|dt|figcaption|figure|footer|h[1-6]|header|hr|li|"
+	"main|nav|ol|p|pre|section|table|tbody|td|tfoot|th|thead|tr|ul"
+)
+_BLOCK_TAG = re.compile(rf"<(?=/?(?:{BLOCK_TAGS})\b)", re.IGNORECASE)
 
 
 def tokenize(text) -> list[str]:
@@ -50,9 +57,9 @@ def search_kb_articles(query: str, limit: int) -> list[dict]:
 	)
 	ranked = []
 	for row in rows:
-		# One space keeps the last title word and the first content word apart; a space before each tag
+		# One space keeps the last title word and the first content word apart; a space before each block tag
 		# keeps the last word of one HTML block and the first word of the next apart.
-		text = f"{row.title or ''} {strip_html((row.content or '').replace('<', ' <'))}"
+		text = f"{row.title or ''} {strip_html(_BLOCK_TAG.sub(' <', row.content or ''))}"
 		matched = set(words) & set(_words(text))
 		if matched:
 			in_title = len(matched & set(_words(row.title)))

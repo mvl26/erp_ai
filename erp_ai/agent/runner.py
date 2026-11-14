@@ -672,7 +672,7 @@ def _reason(ticket_name, trigger, run_id, settings, context, classification, dea
 			)
 		except Exception:
 			# no change of the turn may be committed without its `reason` entry (NFR-3); `run_for_ticket` logs it
-			_undo_turn()
+			_undo_turn(run_id)
 			raise
 		_write_propose_rows(actions, context)
 		if not wants_tools or not tool_results:
@@ -681,17 +681,32 @@ def _reason(ticket_name, trigger, run_id, settings, context, classification, dea
 		messages.append({"role": "user", "content": tool_results})
 
 
-def _undo_turn() -> None:
+def _undo_turn(run_id) -> None:
 	"""Undo the uncommitted writes of the failing reason turn, back to right after its model call.
 
 	As `frappe.db.rollback()` does, stopping at the savepoint (design-amd2 D-8): the commit callbacks queued
 	since are dropped (only the turn's: the commit before the savepoint ran the earlier ones) and the rollback
-	callbacks run.
+	callbacks run. Raises nothing: the caller re-raises the turn's own error, which must reach the Error Log.
 	"""
-	frappe.db.rollback(save_point=REASON_TURN_SAVEPOINT)
+	try:
+		frappe.db.rollback(save_point=REASON_TURN_SAVEPOINT)
+	except Exception as exc:
+		# the savepoint is gone: a commit inside a tool (DDL, a controller's own commit) kept the turn's earlier
+		# writes (ADR-024 QĐ 5, accepted). Not set again and the callback queues left alone: the remaining
+		# writes will be committed, so their callbacks must run (D-8)
+		frappe.logger(LOGGER_NAME).warning(
+			"reason turn undo failed run_id=%s error=%s", run_id, type(exc).__name__
+		)
+		return
 	frappe.db.before_commit.reset()
 	frappe.db.after_commit.reset()
-	frappe.db.after_rollback.run()
+	try:
+		frappe.db.after_rollback.run()
+	except Exception as exc:
+		# the turn's writes are already undone; a rollback hook's failure must not replace the turn's error
+		frappe.logger(LOGGER_NAME).warning(
+			"reason turn undo callback failed run_id=%s error=%s", run_id, type(exc).__name__
+		)
 
 
 def _write_propose_rows(actions, context) -> None:

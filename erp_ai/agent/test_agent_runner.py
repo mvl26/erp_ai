@@ -6,7 +6,7 @@ import os
 import subprocess
 import time
 from collections import Counter
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import frappe
 from frappe.tests.utils import FrappeTestCase
@@ -40,6 +40,7 @@ from erp_ai.constants import (
 	JOB_TIMEOUT_S,
 	KEY_STATUS_BAD_KEY,
 	LOG_DOCTYPE,
+	LOGGER_NAME,
 	PROPOSAL_DOCTYPE,
 	ROLE_INSTRUCTOR,
 	TITLE_RUN_FAILED,
@@ -2149,6 +2150,10 @@ class TurnFaultForTest(Exception):
 	"""The fault a test injects into a turn; its class name must reach the Error Log unchanged."""
 
 
+class RollbackCallbackFaultForTest(Exception):
+	"""Raised by an `after_rollback` callback a tool's hook queued; it must not replace the turn's fault."""
+
+
 class TestRunnerTurnUndo(RunnerTestBase):
 	"""NFR-3, ADR-024 QĐ 2: a turn failing after its tools ran is undone to the point right after its model call."""
 
@@ -2361,14 +2366,20 @@ class TestRunnerTurnUndo(RunnerTestBase):
 		self.roles_at_fault.append(self._roles())
 		self.proposals_at_fault.append(len(self._proposal_names()))
 
-	def _register_callbacks(self):
+	def _register_callbacks(self, failing_rollback_callback=False):
 		"""What a tool's hooks may do: queue work for after the commit or after a rollback."""
 		frappe.db.before_commit.add(lambda: self.callbacks.append("before_commit"))
 		frappe.db.after_commit.add(lambda: self.callbacks.append("after_commit"))
 		frappe.db.after_rollback.add(lambda: self.callbacks.append("after_rollback"))
 		frappe.enqueue(TURN_JOB_METHOD, enqueue_after_commit=True, timeout=60)
+		if failing_rollback_callback:
 
-	def _tools(self, register_callbacks=False):
+			def failing():
+				raise RollbackCallbackFaultForTest("after_rollback")
+
+			frappe.db.after_rollback.add(failing)
+
+	def _tools(self, register_callbacks=False, failing_rollback_callback=False):
 		"""Real tools, except a proposal tool inserts a real `Chờ duyệt` proposal of the ticket and succeeds."""
 		execute_tool = runner.execute_tool
 
@@ -2380,15 +2391,17 @@ class TestRunnerTurnUndo(RunnerTestBase):
 				return {"ok": True, "proposal": proposal, "status": CHANGE_STATUS_PENDING}
 			outcome = execute_tool(name, arguments, context)
 			if register_callbacks and self._reason_calls() == 2:
-				self._register_callbacks()
+				self._register_callbacks(failing_rollback_callback)
 			return outcome
 
 		return patch.object(runner, "execute_tool", side_effect=execute)
 
-	def _write_entry(self, fail_on=None):
+	def _write_entry(self, fail_on=None, lose_savepoint=False):
 		"""`runner.write_entry` that records (entry_type, turn) of each call; `fail_on(fields)` true → the fault.
 
-		A `reason` row is faulted after its real insert, a `change` row before it."""
+		A `reason` row is faulted after its real insert, a `change` row before it. `lose_savepoint`: before the
+		fault the turn savepoint is gone, as after a commit inside the turn (DDL, a controller's own commit);
+		released rather than committed so the test transaction can still be undone."""
 
 		def fake(**fields):
 			self.written.append((fields.get("entry_type"), fields.get("turn")))
@@ -2398,6 +2411,8 @@ class TestRunnerTurnUndo(RunnerTestBase):
 			name = write_entry(**fields)
 			if faulty:
 				self._note_fault()
+				if lose_savepoint:
+					frappe.db.sql(f"release savepoint {TURN_SAVEPOINT}")
 				raise TurnFaultForTest("write_entry")
 			return name
 
@@ -2530,6 +2545,92 @@ class TestRunnerTurnUndo(RunnerTestBase):
 
 		self._assert_second_turn_undone()
 		self.assertEqual(self.callbacks, ["after_rollback"])
+
+	def _run_with_logger(self, *patches):
+		"""`_run_turns` with `frappe.logger` replaced; the warnings `_undo_turn` writes are in `self.logger`."""
+		self.logger = MagicMock()
+		self.get_logger = MagicMock(return_value=self.logger)
+		self._run_turns(None, patch.object(frappe, "logger", self.get_logger), *patches)
+
+	def _undo_warnings(self):
+		return [
+			call.args
+			for call in self.logger.warning.call_args_list
+			if call.args and str(call.args[0]).startswith("reason turn undo")
+		]
+
+	def _run_id(self):
+		(first,) = self._entries(entry_type="reason", turn=1)
+		return first.run_id
+
+	def _assert_lost_savepoint_kept_original_error(self):
+		# the turn's writes stay: the savepoint was gone, nothing could be undone (ADR-024 QĐ 5, accepted)
+		self.assertEqual(self.roles_at_fault, [sorted([TURN_KEPT_ROLE, TURN_ADDED_ROLE])])
+		self.assertEqual(self._roles(), sorted([TURN_KEPT_ROLE, TURN_ADDED_ROLE]))
+		self.assertEqual(
+			self._run_failed_errors(),
+			[f"ticket={self.ticket.name} trigger=comment_mention error=TurnFaultForTest"],
+		)
+		self.assertIn(LOGGER_NAME, [call.args[0] for call in self.get_logger.call_args_list if call.args])
+		self.assertEqual(
+			self._undo_warnings(),
+			[("reason turn undo failed run_id=%s error=%s", self._run_id(), "OperationalError")],
+		)
+		# one rollback attempt; the savepoint is not set again
+		self.assertEqual(
+			self._turn_events(),
+			[
+				("model",),
+				("savepoint", TURN_SAVEPOINT),
+				("model",),
+				("savepoint", TURN_SAVEPOINT),
+				("rollback", TURN_SAVEPOINT),
+			],
+		)
+
+	def test_lost_turn_savepoint_keeps_original_error(self):
+		self._track()
+		self._run_with_logger(self._tools(), self._write_entry(self._second_reason_row, lose_savepoint=True))
+
+		self._assert_lost_savepoint_kept_original_error()
+
+	def test_lost_turn_savepoint_keeps_commit_callbacks(self):
+		self._track()
+		self._run_with_logger(
+			self._tools(register_callbacks=True),
+			self._write_entry(self._second_reason_row, lose_savepoint=True),
+		)
+
+		self._assert_lost_savepoint_kept_original_error()
+		# the queues are left as they are: no rollback callback ran, the turn's commit callbacks still wait
+		self.assertEqual(self.callbacks, [])
+		self._run_commit_callbacks()
+		self.assertEqual(self.callbacks, ["before_commit", "after_commit"])
+		self.assertEqual(self.jobs.methods.count(TURN_JOB_METHOD), 1)
+
+	def test_failing_rollback_callback_keeps_original_error(self):
+		self._track()
+		self._run_with_logger(
+			self._tools(register_callbacks=True, failing_rollback_callback=True),
+			self._write_entry(self._second_reason_row),
+		)
+
+		self._assert_second_turn_undone()
+		# the rollback callback queued before the failing one ran; the commit callbacks were still dropped
+		self.assertEqual(self.callbacks, ["after_rollback"])
+		self.assertEqual(
+			self._undo_warnings(),
+			[
+				(
+					"reason turn undo callback failed run_id=%s error=%s",
+					self._run_id(),
+					"RollbackCallbackFaultForTest",
+				)
+			],
+		)
+		self._run_commit_callbacks()
+		self.assertEqual(self.callbacks, ["after_rollback"])
+		self.assertNotIn(TURN_JOB_METHOD, self.jobs.methods)
 
 
 # Hand-written: the tools a run with an instructor gets when no change group is granted (FEAT-001/006 set).

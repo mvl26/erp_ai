@@ -8,7 +8,14 @@ from frappe.tests.utils import FrappeTestCase
 from frappe.utils import add_days, getdate, now_datetime
 
 from erp_ai.constants import CATEGORIES, LOG_DOCTYPE
-from erp_ai.erp_ai_agent.report.erp_ai_accuracy.erp_ai_accuracy import execute
+from erp_ai.erp_ai_agent.report.erp_ai_accuracy.erp_ai_accuracy import (
+	GATE_MIN_ACCURACY,
+	GATE_MIN_SAMPLE,
+	GATE_WINDOW_DAYS,
+	GateResult,
+	execute,
+	l0_l1_gate,
+)
 from erp_ai.test_utils import keep_agent_settings, make_log_entry
 
 PREFIX = "ERPAI-TEST-"
@@ -358,3 +365,138 @@ class TestLabels(AccuracyTestCase):
 		self.assertEqual([row["category"] for row in data], [*CATEGORIES, "Tổng"])
 		self.assertEqual(self._numbers(data[-1]), (0, 0, 0, 1))
 		self.assertEqual([row["failed_runs"] for row in data[:-1]], [None] * len(CATEGORIES))
+
+	def test_failed_run_at_the_first_second_of_the_range_counts(self):
+		# the filter starts at 00:00:00 of the day 60 days back; one second earlier is outside
+		start = datetime.combine(getdate(self._filters()["from_date"]), datetime.min.time())
+		for ticket, created in (("at-start", start), ("before-start", start - timedelta(seconds=1))):
+			name = self._classify(ticket, None)
+			frappe.db.set_value(LOG_DOCTYPE, name, "creation", created, update_modified=False)
+		self.assertEqual(self._numbers(self._rows()["Tổng"]), (0, 0, 0, 1))
+
+
+class TestGate(AccuracyTestCase):
+	"""AC-18, design 3.5.3: verdict of the L0 → L1 gate over the 14 days before `now`."""
+
+	def setUp(self):
+		super().setUp()
+		keep_agent_settings(self)
+		self.now = datetime(2026, 11, 10, 12, 0, 0)
+
+	def _classify(self, created, correct=True, labeled=True):
+		"""A new ticket with one `classify` row created at `created`; its label equals the prediction when
+		`correct`, else differs in the priority; `labeled=False` leaves it without a label."""
+		ticket = f"{PREFIX}gate-{next(TICKET_NUMBERS)}"
+		self._row(ticket, created, "A", correct if labeled else None)
+		return ticket
+
+	def _row(self, ticket, created, category, correct):
+		name = make_log_entry(
+			run_id=ticket,
+			entry_type="classify",
+			predicted_category=category,
+			**(
+				{}
+				if category is None
+				else {f"predicted_{field}": value for field, value in PREDICTED.items()}
+			),
+		)
+		values = {"creation": created, "ticket": ticket}
+		if correct is not None:
+			values["created_labels"] = json.dumps(PREDICTED if correct else {**PREDICTED, "priority": "High"})
+		frappe.db.set_value(LOG_DOCTYPE, name, values, update_modified=False)
+
+	def _sample(self, labeled, correct, days_ago=3):
+		for index in range(labeled):
+			self._classify(self.now - timedelta(days=days_ago), correct=index < correct)
+
+	def _gate(self):
+		result = l0_l1_gate(self.now)
+		return result.verdict, result.labeled, result.correct
+
+	def test_constants_are_the_documented_numbers(self):
+		self.assertEqual((GATE_WINDOW_DAYS, GATE_MIN_SAMPLE, GATE_MIN_ACCURACY), (14, 30, 0.85))
+
+	def test_not_enough_sample_29(self):
+		self._sample(29, 29)
+		# unlabeled tickets are not in the sample of 30
+		for _ in range(5):
+			self._classify(self.now - DAY, labeled=False)
+		self.assertEqual(self._gate(), ("Chưa đủ mẫu", 29, 29))
+
+	def test_no_sample_at_all(self):
+		self.assertEqual(self._gate(), ("Chưa đủ mẫu", 0, 0))
+
+	def test_pass_exactly_85(self):
+		self._sample(40, 34)
+		self.assertEqual(self._gate(), ("Đạt", 40, 34))
+
+	def test_fail_82_5(self):
+		self._sample(40, 33)
+		self.assertEqual(self._gate(), ("Chưa đạt", 40, 33))
+
+	def test_pass_30_26(self):
+		self._sample(30, 26)
+		self.assertEqual(self._gate(), ("Đạt", 30, 26))
+
+	def test_fail_30_25(self):
+		self._sample(30, 25)
+		self.assertEqual(self._gate(), ("Chưa đạt", 30, 25))
+
+	def test_outside_window_ignored(self):
+		start = self.now - timedelta(days=14)
+		second = timedelta(seconds=1)
+		self._sample(30, 30)
+		# in the window (now - 14 days, now]: one second after its start, and `now` itself (both wrong)
+		self._classify(start + second, correct=False)
+		self._classify(self.now, correct=False)
+		# outside: exactly at its start, one second after `now`, well before it
+		self._classify(start, correct=False)
+		self._classify(self.now + second, correct=False)
+		self._classify(self.now - timedelta(days=20), correct=False)
+		self.assertEqual(self._gate(), ("Đạt", 32, 30))
+
+	def test_window_uses_the_first_successful_row_of_each_ticket(self):
+		self._sample(30, 30)
+		# first success before the window, a later (wrong) success inside it: the ticket is not counted
+		old = self._classify(self.now - timedelta(days=15))
+		self._row(old, self.now - DAY, "B", correct=False)
+		# a failed run before the window, then the first success inside it (wrong): the ticket counts
+		late = f"{PREFIX}gate-late"
+		self._row(late, self.now - timedelta(days=20), None, None)
+		self._row(late, self.now - DAY, "A", correct=False)
+		# first success inside the window is wrong, a later one is right: the first one decides
+		rerun = self._classify(self.now - 2 * DAY, correct=False)
+		self._row(rerun, self.now - DAY, "A", correct=True)
+		self.assertEqual(self._gate(), ("Đạt", 32, 30))
+
+	def test_rows_of_other_entry_types_are_ignored(self):
+		self._sample(29, 29)
+		# a full, correct prediction: only the `entry_type` keeps it out of the sample (else 30 of 30, "Đạt")
+		name = make_log_entry(
+			run_id=f"{PREFIX}gate-reason",
+			entry_type="reason",
+			predicted_category="A",
+			**{f"predicted_{field}": value for field, value in PREDICTED.items()},
+		)
+		frappe.db.set_value(
+			LOG_DOCTYPE,
+			name,
+			{
+				"creation": self.now - DAY,
+				"ticket": f"{PREFIX}gate-reason",
+				"created_labels": json.dumps(PREDICTED),
+			},
+			update_modified=False,
+		)
+		self.assertEqual(self._gate(), ("Chưa đủ mẫu", 29, 29))
+
+	def test_default_now_is_the_current_time(self):
+		# far from the real clock, so the sample counts only when `now` comes from `now_datetime()`
+		self.now = datetime(2020, 1, 1, 12, 0, 0)
+		self._sample(30, 30, days_ago=0)
+		with patch(
+			"erp_ai.erp_ai_agent.report.erp_ai_accuracy.erp_ai_accuracy.now_datetime", return_value=self.now
+		):
+			result = l0_l1_gate()
+		self.assertEqual(result, GateResult("Đạt", 30, 30))

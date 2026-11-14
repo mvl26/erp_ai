@@ -433,6 +433,14 @@ class TestERPAIChangeProposal(FrappeTestCase):
 			},
 		)
 
+	def test_exit_code_hidden_when_unknown(self):
+		# Design addendum 3 QĐ-B4: the Int column stores 0 when there is no exit code (out of budget,
+		# `TimeoutExpired`, never ran); the form shows it only once applied or when the code is not 0.
+		self.assertEqual(
+			_fields_by_name()["exit_code"].get("depends_on"),
+			'eval:doc.change_status=="Đã áp dụng" || doc.exit_code',
+		)
+
 
 METHOD_MODULE = "erp_ai.erp_ai_agent.doctype.erp_ai_change_proposal.erp_ai_change_proposal"
 METHOD_NAMES = ("approve", "reject", "undo")

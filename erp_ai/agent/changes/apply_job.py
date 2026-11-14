@@ -56,9 +56,11 @@ GIT_COMMIT_MISMATCH = "commit không đúng nội dung đã duyệt, cần ngư�
 # Design 3.5: the short reason taken from the git output after `GIT_COMMIT_FAILED`.
 GIT_SHORT_REASON_MAX_CHARS = 120
 GIT_BRANCH_CHANGED = "nhánh đang checkout đã đổi kể từ lúc đề xuất"
-COMMAND_FAILED = "lệnh thoát với mã {0}"
-COMMAND_TIMED_OUT = "lệnh chạy quá giờ và đã bị dừng"
-COMMAND_NOT_FOUND = "không tìm thấy lệnh bench"
+GIT_NOT_ANCESTOR = "commit áp dụng không còn nằm trong lịch sử nhánh đang checkout"
+# Design 4.3 step 4 (exact wording); "quá thời gian" is AC-10's reason (design addendum 2 QĐ-A3).
+COMMAND_FAILED = "lệnh trả mã {0}"
+COMMAND_OUT_OF_TIME = "quá thời gian"
+COMMAND_NOT_FOUND = "không tìm thấy bench trên máy chủ"
 
 
 class _Stop(Exception):
@@ -246,14 +248,6 @@ def _commit_failed_reason(result) -> str:
 	return f"{reason}: {lines[-1][:GIT_SHORT_REASON_MAX_CHARS]}" if lines else reason
 
 
-def _git_commit(repo_root: str, rel_in_repo: str, subject: str, body: str, give_back, limit_s: int) -> None:
-	"""One `commit --only` of the target; on any failure `give_back()` restores the file, then the job fails."""
-	result = process_runner.git_commit_only(repo_root, rel_in_repo, subject, body, limit_s)
-	if _failed(result):
-		give_back()
-		raise _Stop(CHANGE_STATUS_FAILED, _commit_failed_reason(result), result)
-
-
 def _git_limit(deadline: float) -> int:
 	"""`limit_s` of a git write: at most `GIT_TIMEOUT_S`, cut by the job deadline, never below 1 (design 3.5)."""
 	return min(source.GIT_TIMEOUT_S, max(1, int(deadline - time.monotonic())))
@@ -358,11 +352,17 @@ def _apply_code(proposal, actor: str, allowed_apps, deadline: float) -> None:
 	added = committed = False
 	summary = None
 
+	def restore() -> bool:
+		"""Design 4.3 step 3.6: `content_before` back (read-back hash = `base_hash`), or the new file removed
+		and unstaged when `git add` went through."""
+		if new_file:
+			file_writer.remove_created(full)
+			return not added or not _failed(process_runner.git_unstage_new(repo, rel, source.GIT_TIMEOUT_S))
+		return file_writer.write_atomic(full, proposal.content_before, new_file=False) == proposal.base_hash
+
 	def give_back(reason: str, expected_head: str):
 		"""Design 4.3 step 3.6, then `Lỗi` with `reason`, or `GIT_RESTORE_FAILED` when the repo is not as before."""
-		if not _give_back(
-			proposal, full, repo, rel, new_file=new_file, added=added, expected_head=expected_head
-		):
+		if not _give_back(proposal, full, repo, restore, new_file=new_file, expected_head=expected_head):
 			reason = GIT_RESTORE_FAILED
 		raise _Stop(CHANGE_STATUS_FAILED, reason)
 
@@ -406,31 +406,34 @@ def _apply_code(proposal, actor: str, allowed_apps, deadline: float) -> None:
 		# Design-addendum-3 QĐ-B2 item 4: an unexpected error gives the file back only while no bot commit is
 		# known, and only once HEAD is proven unchanged (D-17).
 		if committed:
-			_fail_after_commit(proposal, full, repo, old_head, summary, exc)
-		_give_back_after_crash(proposal, full, repo, rel, new_file=new_file, added=added, old_head=old_head)
+			_fail_after_commit(
+				proposal,
+				ACTION_APPLY,
+				repo,
+				old_head,
+				summary,
+				exc,
+				lambda commit, branch: _apply_record(proposal, full, old_head, commit, branch),
+			)
+		_give_back_after_crash(
+			proposal,
+			repo,
+			old_head,
+			lambda: _give_back(proposal, full, repo, restore, new_file=new_file, expected_head=old_head),
+		)
 		raise
 
 
-def _give_back(
-	proposal, full: str, repo: str, rel: str, *, new_file: bool, added: bool, expected_head: str
-) -> bool:
-	"""Design 4.3 step 3.6; True when the file, the index entry of the target and HEAD are as before.
+def _give_back(proposal, full: str, repo: str, restore, *, new_file: bool, expected_head: str) -> bool:
+	"""Design 4.3 step 3.6 (4.4 step 6 for undo); True when the file, the index entry of the target and HEAD
+	are as before.
 
-	A changed file gets `content_before` back (read-back hash = `base_hash`); a new file is removed, then
-	unstaged when `git add` went through. HEAD must still be `expected_head` and git must accept the target.
+	`restore()` puts the file back and is True when its read-back hash (or the removal) holds; HEAD must
+	still be `expected_head` and git must accept the target (`new_file`: as git sees the target then).
 	"""
 	try:
-		if new_file:
-			file_writer.remove_created(full)
-			restored = True
-			if added:
-				restored = not _failed(process_runner.git_unstage_new(repo, rel, source.GIT_TIMEOUT_S))
-		else:
-			restored = (
-				file_writer.write_atomic(full, proposal.content_before, new_file=False) == proposal.base_hash
-			)
 		return (
-			restored
+			restore()
 			and source.git_head(repo) == expected_head
 			and source.read_git_state(full, new_file=new_file).refusal is None
 		)
@@ -462,33 +465,30 @@ def _commit_landed(repo: str, old_head: str, give_back):
 	return summary
 
 
-def _fail_after_commit(proposal, full: str, repo: str, old_head: str, summary, exc: Exception):
+def _fail_after_commit(proposal, action: str, repo: str, old_head: str, summary, exc: Exception, record):
 	"""QĐ-B2 items 1 and 4: the bot commit exists, so the file stays; `Lỗi` with the class name, keeping the
-	commit sha when known (`summary`, else a HEAD that moved off `old_head`) with its QĐ-B5 log values."""
+	commit sha when known (`summary`, else a HEAD that moved off `old_head`) with its QĐ-B5 log values from
+	`record(commit, branch)`."""
 	frappe.db.rollback()
-	frappe.log_error(TITLE_CHANGE_FAILED, f"proposal={proposal.name} action=apply error={type(exc).__name__}")
+	frappe.log_error(
+		TITLE_CHANGE_FAILED, f"proposal={proposal.name} action={action} error={type(exc).__name__}"
+	)
 	if summary is not None:
 		commit, branch = summary.commit, summary.branch
 	else:
 		head = source.git_head(repo)
 		commit, branch = (head if head not in (None, old_head) else None), None
-	raise _Stop(
-		CHANGE_STATUS_FAILED, type(exc).__name__, **_apply_record(proposal, full, old_head, commit, branch)
-	) from exc
+	raise _Stop(CHANGE_STATUS_FAILED, type(exc).__name__, **record(commit, branch)) from exc
 
 
-def _give_back_after_crash(
-	proposal, full: str, repo: str, rel: str, *, new_file: bool, added: bool, old_head
-):
-	"""QĐ-B2 item 4 with no bot commit known: give the file back only when HEAD is still `old_head` (D-17).
+def _give_back_after_crash(proposal, repo: str, old_head: str, give_back):
+	"""QĐ-B2 item 4 with no bot commit known: `give_back()` only when HEAD is still `old_head` (D-17).
 
 	The caller re-raises the original error, which ends the job as `Lỗi` with its class name; a give-back
 	that was skipped or did not hold is recorded in the error log so a person checks the repo.
 	"""
 	try:
-		restored = source.git_head(repo) == old_head and _give_back(
-			proposal, full, repo, rel, new_file=new_file, added=added, expected_head=old_head
-		)
+		restored = source.git_head(repo) == old_head and give_back()
 	except Exception as exc:
 		# Never hide the first error behind one from giving back; record this one and go on.
 		frappe.log_error(
@@ -508,58 +508,114 @@ def _undo_code(proposal, actor: str, allowed_apps, deadline: float) -> None:
 	full = guard.full_path
 	if file_writer.sha256_of(full) != proposal.after_hash:
 		raise _Stop(CHANGE_STATUS_FAILED, FILE_CHANGED_AFTER_APPLY)
+	# Git pre-check (design 4.4 step 4): a git refusal is `Lỗi`. No "same branch" check: the undo commits on
+	# the branch checked out now, only when the apply commit is in its history (ADR-022 decision 6).
 	state = source.read_git_state(full, new_file=False, limit_s=_git_limit(deadline))
 	if state.refusal:
 		raise _Stop(CHANGE_STATUS_FAILED, state.refusal)
 	repo, rel, old_head = state.repo_root, state.rel_in_repo, state.head
+	in_history = source.git_is_ancestor(repo, str(proposal.apply_commit_sha or ""), old_head)
+	if in_history is None:
+		raise _Stop(CHANGE_STATUS_FAILED, source.GIT_ERROR)
+	if not in_history:
+		raise _Stop(CHANGE_STATUS_FAILED, GIT_NOT_ANCESTOR)
+	committed = False
+	summary = None
 
-	def give_back():
-		file_writer.write_atomic(full, proposal.content_after, new_file=new_file)
+	def restore() -> bool:
+		"""Design 4.4 step 6: the applied bytes back (a new file is created again), read-back hash = `after_hash`."""
+		return (
+			file_writer.write_atomic(full, proposal.content_after, new_file=new_file) == proposal.after_hash
+		)
+
+	def give_back(reason: str, expected_head: str):
+		"""Design 4.4 step 6, then `Lỗi` with `reason`, or `GIT_RESTORE_FAILED` when the repo is not as before.
+
+		The target is back in the tree of HEAD (the apply commit), so git checks it as a changed file."""
+		if not _give_back(proposal, full, repo, restore, new_file=False, expected_head=expected_head):
+			reason = GIT_RESTORE_FAILED
+		raise _Stop(CHANGE_STATUS_FAILED, reason)
 
 	if new_file:
 		file_writer.remove_created(full)
 		if os.path.lexists(full):
 			raise _Stop(CHANGE_STATUS_FAILED, WRITE_MISMATCH)
 	elif file_writer.write_atomic(full, proposal.content_before, new_file=False) != proposal.base_hash:
-		give_back()
-		raise _Stop(CHANGE_STATUS_FAILED, WRITE_MISMATCH)
-	subject, body = change_text.undo_message(
-		proposal.name,
-		str(proposal.ticket or ""),
-		proposal.file_path,
-		str(proposal.apply_commit_sha or ""),
-		_person(actor),
-	)
-	_git_commit(repo, rel, subject, body, give_back, _git_limit(deadline))
-	# D-18: the undo commit of a new file has the path deleted from the tree.
-	restored = None if new_file else (proposal.content_before or "").encode("utf-8")
-	summary = _postcheck(
-		state,
-		state.branch,
-		restored,
-		None,
-		lambda commit, branch: _undo_record(proposal, full, old_head, commit, branch),
-	)
-	record = _undo_record(proposal, full, old_head, summary.commit, summary.branch)
-	transitions.finish(
-		proposal.name,
-		CHANGE_STATUS_UNDOING,
-		CHANGE_STATUS_UNDONE,
-		step="undo",
-		actor=actor,
-		fields=record["fields"],
-		before=record["before"],
-		after=record["after"],
-	)
+		give_back(WRITE_MISMATCH, old_head)
+	try:
+		subject, body = change_text.undo_message(
+			proposal.name,
+			str(proposal.ticket or ""),
+			proposal.file_path,
+			str(proposal.apply_commit_sha or ""),
+			_person(actor),
+		)
+		result = process_runner.git_commit_only(repo, rel, subject, body, _git_limit(deadline))
+		if _failed(result):
+			# Design 4.4 step 6 follows 4.3 step 3.4 (D-17, design-addendum-3 QĐ-B2 items 2 and 3).
+			summary = _commit_landed(
+				repo, old_head, lambda head: give_back(_commit_failed_reason(result), head)
+			)
+		committed = True
+		# D-18: the undo commit of a new file has the path deleted from the tree.
+		restored = None if new_file else (proposal.content_before or "").encode("utf-8")
+		summary = _postcheck(
+			state,
+			state.branch,
+			restored,
+			summary,
+			lambda commit, branch: _undo_record(proposal, full, old_head, commit, branch),
+		)
+		record = _undo_record(proposal, full, old_head, summary.commit, summary.branch)
+		transitions.finish(
+			proposal.name,
+			CHANGE_STATUS_UNDOING,
+			CHANGE_STATUS_UNDONE,
+			step="undo",
+			actor=actor,
+			fields=record["fields"],
+			before=record["before"],
+			after=record["after"],
+		)
+	except _Stop:
+		raise
+	except Exception as exc:
+		# Design-addendum-3 QĐ-B2 item 4 on the undo side, as in `_apply_code`.
+		if committed:
+			_fail_after_commit(
+				proposal,
+				ACTION_UNDO,
+				repo,
+				old_head,
+				summary,
+				exc,
+				lambda commit, branch: _undo_record(proposal, full, old_head, commit, branch),
+			)
+		_give_back_after_crash(
+			proposal,
+			repo,
+			old_head,
+			lambda: _give_back(proposal, full, repo, restore, new_file=False, expected_head=old_head),
+		)
+		raise
 
 
 def _apply_command(proposal, actor: str, deadline: float) -> None:
+	"""Design 4.3 step 4: one bench run with the job's remaining budget; no git call (ADR-022 QĐ 1)."""
 	args = json.loads(proposal.command_args)
-	result = process_runner.run_bench(args, int(deadline - time.monotonic()))
+	limit = int(deadline - time.monotonic())
+	if limit < 1:
+		# Design addendum 2 QĐ-A3: no process when under 1 s is left; no exit code (addendum 3 QĐ-B4).
+		no_run = process_runner.CommandResult(
+			exit_code=None, output="", duration_ms=0, timed_out=True, not_found=False
+		)
+		raise _Stop(CHANGE_STATUS_FAILED, COMMAND_OUT_OF_TIME, no_run)
+	result = process_runner.run_bench(args, limit)
+	# Design 4.3 step 4, in its order: timed out, bench not found, non-zero exit, done.
+	if result.timed_out:
+		raise _Stop(CHANGE_STATUS_FAILED, COMMAND_OUT_OF_TIME, result)
 	if result.not_found:
 		raise _Stop(CHANGE_STATUS_FAILED, COMMAND_NOT_FOUND, result)
-	if result.timed_out:
-		raise _Stop(CHANGE_STATUS_FAILED, COMMAND_TIMED_OUT, result)
 	if result.exit_code != 0:
 		raise _Stop(CHANGE_STATUS_FAILED, COMMAND_FAILED.format(result.exit_code), result)
 	transitions.finish(

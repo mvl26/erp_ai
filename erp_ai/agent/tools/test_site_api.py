@@ -26,6 +26,8 @@ WEBHOOK_NAME = "SITEAPI-TEST webhook"
 RENAMED_NOTE = "SITEAPI-TEST tên mới"
 DUPLICATE_TAG = "SITEAPI-TEST nhãn trùng"
 FAKE_SECRET = "SITEAPI-FAKE-SECRET-7f3a"
+FAKE_PASSWORD = "SITEAPI-FAKE-PASSWORD-91c2"
+FAKE_API_SECRET = "SITEAPI-FAKE-API-SECRET-4d8e"
 HIDDEN = "[đã ẩn]"
 SECRET_METHOD_REFUSED = "hàm này trả khóa API hoặc mật khẩu, không gọi qua công cụ"
 _real_get_all = frappe.get_all
@@ -158,7 +160,11 @@ class TestSiteApi(FrappeTestCase):
 
 	def test_creates_user_with_an_allowed_role(self):
 		result = self.create("User", self.user_values(roles=[{"role": ALLOWED_ROLE}]))
-		self.assertEqual(result, {"ok": True, "doctype": "User", "name": NEW_USER})
+		self.assertEqual(
+			{key: result[key] for key in ("ok", "doctype", "name", "value_before")},
+			{"ok": True, "doctype": "User", "name": NEW_USER, "value_before": None},
+		)
+		self.assertEqual(set(result["value_after"]), {"email", "first_name", "send_welcome_email", "roles"})
 		self.assertEqual(frappe.db.get_value("User", NEW_USER, "enabled"), 1)
 		self.assertEqual(self.roles_of(NEW_USER), {ALLOWED_ROLE})
 
@@ -416,9 +422,24 @@ class TestSiteApi(FrappeTestCase):
 		)
 		self.assertTrue(result["ok"], result)
 		self.assertEqual(frappe.db.get_value("Server Script", result["name"], "disabled"), 1)
+		# The forced value shows as saved, not as the model sent it.
+		self.assertEqual(result["value_before"], None)
+		self.assertEqual(
+			result["value_after"],
+			{
+				"name": "SITEAPI-TEST script",
+				"script_type": "API",
+				"api_method": "siteapi_test_method",
+				"script": "frappe.response['message'] = 1",
+				"disabled": 1,
+			},
+		)
 		enabled = self.update("Server Script", result["name"], {"disabled": 0})
 		self.assertTrue(enabled["ok"], enabled)
 		self.assertEqual(frappe.db.get_value("Server Script", result["name"], "disabled"), 1)
+		self.assertEqual(
+			(enabled["value_before"], enabled["value_after"]), ({"disabled": 1}, {"disabled": 1})
+		)
 
 	def test_webhook_always_saved_disabled_in_normal_mode(self):
 		before = frappe.db.count("Webhook")
@@ -433,11 +454,36 @@ class TestSiteApi(FrappeTestCase):
 				"enabled": 1,
 			},
 		)
-		self.assertEqual(result, {"ok": True, "doctype": "Webhook", "name": WEBHOOK_NAME})
+		self.assertEqual(
+			result,
+			{
+				"ok": True,
+				"doctype": "Webhook",
+				"name": WEBHOOK_NAME,
+				"value_before": None,
+				"value_after": {
+					"name": WEBHOOK_NAME,
+					"webhook_doctype": "Note",
+					"webhook_docevent": "after_insert",
+					"request_url": "https://example.com/siteapi",
+					"request_method": "POST",
+					"enabled": 0,
+				},
+			},
+		)
 		self.assertEqual(frappe.db.count("Webhook"), before + 1)
 		self.assertEqual(frappe.db.get_value("Webhook", WEBHOOK_NAME, "enabled"), 0)
 		enabled = self.update("Webhook", WEBHOOK_NAME, {"enabled": 1})
-		self.assertEqual(enabled, {"ok": True, "doctype": "Webhook", "name": WEBHOOK_NAME})
+		self.assertEqual(
+			enabled,
+			{
+				"ok": True,
+				"doctype": "Webhook",
+				"name": WEBHOOK_NAME,
+				"value_before": {"enabled": 0},
+				"value_after": {"enabled": 0},
+			},
+		)
 		self.assertEqual(frappe.db.get_value("Webhook", WEBHOOK_NAME, "enabled"), 0)
 
 	def test_rename_is_refused(self):
@@ -455,7 +501,16 @@ class TestSiteApi(FrappeTestCase):
 
 	def test_duplicate_name_rolls_back_to_savepoint(self):
 		created = self.create("Tag", {"name": DUPLICATE_TAG})
-		self.assertEqual(created, {"ok": True, "doctype": "Tag", "name": DUPLICATE_TAG})
+		self.assertEqual(
+			created,
+			{
+				"ok": True,
+				"doctype": "Tag",
+				"name": DUPLICATE_TAG,
+				"value_before": None,
+				"value_after": {"name": DUPLICATE_TAG},
+			},
+		)
 		before = frappe.db.count("Tag")
 		with (
 			patch.object(frappe.db, "rollback", wraps=frappe.db.rollback) as rollback,
@@ -489,9 +544,62 @@ class TestSiteApi(FrappeTestCase):
 		created = self.create("Note", {"title": NOTE_TITLE, "public": 1, "content": "cũ"})
 		self.assertTrue(created["ok"], created)
 		result = self.update("Note", created["name"], {"content": "mới"})
-		self.assertEqual(result, {"ok": True, "doctype": "Note", "name": created["name"]})
+		self.assertEqual(
+			result,
+			{
+				"ok": True,
+				"doctype": "Note",
+				"name": created["name"],
+				"value_before": {"content": "cũ"},
+				"value_after": {"content": "mới"},
+			},
+		)
 		note = frappe.get_doc("Note", created["name"])
 		self.assertEqual((note.title, note.public, note.content), (NOTE_TITLE, 1, "mới"))
+
+	def test_create_returns_the_saved_values_and_no_before(self):
+		long_content = "n" * 300
+		result = self.create("Note", {"title": NOTE_TITLE, "public": 1, "content": long_content})
+		self.assertEqual(
+			result,
+			{
+				"ok": True,
+				"doctype": "Note",
+				"name": result["name"],
+				"value_before": None,
+				"value_after": {"title": NOTE_TITLE, "public": 1, "content": "n" * 200},
+			},
+		)
+		row = frappe.db.get_value("Note", result["name"], ["title", "public", "content"], as_dict=True)
+		self.assertEqual(row, {"title": NOTE_TITLE, "public": 1, "content": long_content})
+
+	def test_update_reads_the_saved_value_back_from_the_document(self):
+		from frappe.desk.doctype.note.note import Note
+
+		created = self.create("Note", {"title": NOTE_TITLE, "public": 1})
+
+		def rewrite(note):
+			note.title = "SITEAPI-TEST đã chuẩn hóa"
+
+		with patch.object(Note, "validate", side_effect=rewrite, autospec=True, create=True):
+			result = self.update("Note", created["name"], {"title": "SITEAPI-TEST model gửi"})
+		self.assertEqual(
+			(result["value_before"], result["value_after"]),
+			({"title": NOTE_TITLE}, {"title": "SITEAPI-TEST đã chuẩn hóa"}),
+		)
+		self.assertEqual(frappe.db.get_value("Note", created["name"], "title"), "SITEAPI-TEST đã chuẩn hóa")
+
+	def test_refused_and_failed_calls_carry_no_before_after(self):
+		created = self.create("Tag", {"name": DUPLICATE_TAG})
+		self.assertIn("value_after", created)
+		with patch.object(frappe, "log_error"):
+			failed = self.create("Tag", {"name": DUPLICATE_TAG})
+		refused = self.create("User", self.user_values(roles=[{"role": "System Manager"}]))
+		missing = self.update("Note", "SITEAPI-không-có", {"content": "x"})
+		for result in (failed, refused, missing):
+			self.assertFalse(result["ok"], result)
+			self.assertNotIn("value_before", result)
+			self.assertNotIn("value_after", result)
 
 	def test_update_refuses_missing_record(self):
 		result = self.update("Note", "SITEAPI-không-có", {"content": "x"})
@@ -629,13 +737,19 @@ class TestSiteApiUnrestricted(FrappeTestCase):
 				},
 			},
 		)
-		self.assertEqual(created, {"ok": True, "doctype": "User", "name": NEW_USER})
+		self.assertEqual(
+			{key: created[key] for key in ("ok", "doctype", "name", "value_before")},
+			{"ok": True, "doctype": "User", "name": NEW_USER, "value_before": None},
+		)
 		self.assertEqual(self.roles_of(NEW_USER), {"System Manager", ROLE_INSTRUCTOR})
 		own = self.run_tool(
 			"api_update_record", {"doctype": "User", "name": AGENT, "values": {"first_name": "Đổi"}}
 		)
 		self.assertTrue(own["ok"], own)
 		self.assertEqual(frappe.db.get_value("User", AGENT, "first_name"), "Đổi")
+		self.assertEqual(
+			(own["value_before"], own["value_after"]), ({"first_name": "SITEAPI"}, {"first_name": "Đổi"})
+		)
 
 	def test_permission_doctypes_are_open(self):
 		for doctype in ("Custom DocPerm", "Custom Role"):
@@ -683,14 +797,90 @@ class TestSiteApiUnrestricted(FrappeTestCase):
 
 	def test_delete_removes_the_record_through_permissions(self):
 		created = self.run_tool(
-			"api_create_record", {"doctype": "Note", "values": {"title": NOTE_TITLE, "public": 1}}
+			"api_create_record",
+			{"doctype": "Note", "values": {"title": NOTE_TITLE, "public": 1, "content": "nội dung"}},
+		)
+		row = frappe.db.get_value(
+			"Note", created["name"], ["name", "title", "public", "notify_on_login", "content"], as_dict=True
 		)
 		result = self.run_tool("api_delete_record", {"doctype": "Note", "name": created["name"]})
-		self.assertEqual(result, {"ok": True, "doctype": "Note", "name": created["name"]})
+		self.assertEqual(
+			result,
+			{
+				"ok": True,
+				"doctype": "Note",
+				"name": created["name"],
+				"value_before": {
+					"name": created["name"],
+					"title": NOTE_TITLE,
+					"public": 1,
+					"notify_on_login": 0,
+					"notify_on_every_login": 0,
+					"content": "nội dung",
+				},
+				"value_after": None,
+			},
+		)
+		self.assertLessEqual(row.items(), result["value_before"].items())
 		self.assertFalse(frappe.db.exists("Note", created["name"]))
 		missing = self.run_tool("api_delete_record", {"doctype": "Note", "name": created["name"]})
 		self.assertFalse(missing["ok"])
 		self.assertIn("không tìm thấy bản ghi", missing["reason"])
+
+	def create_new_user(self):
+		created = self.run_tool(
+			"api_create_record",
+			{
+				"doctype": "User",
+				"values": {"email": NEW_USER, "first_name": "Bí mật", "send_welcome_email": 0},
+			},
+		)
+		self.assertTrue(created["ok"], created)
+
+	def test_delete_before_holds_at_most_twenty_fields(self):
+		self.create_new_user()
+		result = self.run_tool("api_delete_record", {"doctype": "User", "name": NEW_USER})
+		self.assertTrue(result["ok"], result)
+		self.assertEqual(len(result["value_before"]), 20)
+		self.assertEqual(
+			{key: result["value_before"][key] for key in ("name", "email", "first_name")},
+			{"name": NEW_USER, "email": NEW_USER, "first_name": "Bí mật"},
+		)
+		self.assertIsNone(result["value_after"])
+		self.assertFalse(frappe.db.exists("User", NEW_USER))
+
+	def test_before_after_never_carry_secret_fields(self):
+		self.create_new_user()
+		real_get_doc = frappe.get_doc
+		planted = []
+
+		def get_doc_with_planted_secrets(*args, **kwargs):
+			doc = real_get_doc(*args, **kwargs)
+			if getattr(doc, "doctype", None) == "User" and doc.name == NEW_USER:
+				doc.new_password, doc.api_secret = FAKE_PASSWORD, FAKE_API_SECRET
+				planted.append(doc)
+			return doc
+
+		# The cap is lifted so only the secret filter, not the 20-field limit, keeps the planted values out.
+		with (
+			patch.object(frappe, "get_doc", side_effect=get_doc_with_planted_secrets),
+			patch.object(site_api, "DELETED_FIELDS_MAX", 1000),
+		):
+			result = self.run_tool("api_delete_record", {"doctype": "User", "name": NEW_USER})
+		self.assertTrue(planted)
+		self.assertEqual(
+			(planted[0].as_dict()["new_password"], planted[0].as_dict()["api_secret"]),
+			(FAKE_PASSWORD, FAKE_API_SECRET),
+		)
+		self.assertTrue(result["ok"], result)
+		self.assertIn("value_before", result)
+		self.assertIn("value_after", result)
+		self.assertGreater(len(result["value_before"]), 20)
+		self.assertEqual(result["value_before"]["first_name"], "Bí mật")
+		text = json.dumps(result, ensure_ascii=False, default=str)
+		self.assertEqual((text.count(FAKE_PASSWORD), text.count(FAKE_API_SECRET)), (0, 0))
+		for key in ("new_password", "api_secret", "api_key", "reset_password_key"):
+			self.assertNotIn(key, result["value_before"])
 
 	def test_delete_without_permission_is_refused(self):
 		frappe.set_user(PLAIN_AGENT)
@@ -709,15 +899,32 @@ class TestSiteApiUnrestricted(FrappeTestCase):
 		)
 		self.assertFalse(refused["ok"])
 		self.assertIn("không submit được", refused["reason"])
-		for action in ("submit", "cancel"):
+		for action, before, after in (("submit", 0, 1), ("cancel", 1, 2)):
+			# The stub moves docstatus in the database the way the real action would.
 			with (
 				patch.object(site_api, "_is_submittable", return_value=True),
-				patch.object(frappe.model.document.Document, action, autospec=True) as called,
+				patch.object(
+					frappe.model.document.Document,
+					action,
+					autospec=True,
+					side_effect=lambda doc, status=after: doc.db_set("docstatus", status),
+				) as called,
 			):
 				result = self.run_tool(
 					"api_submit_record", {"doctype": "Note", "name": created["name"], "action": action}
 				)
-			self.assertEqual(result, {"ok": True, "doctype": "Note", "name": created["name"]}, action)
+			self.assertEqual(
+				result,
+				{
+					"ok": True,
+					"doctype": "Note",
+					"name": created["name"],
+					"value_before": {"docstatus": before},
+					"value_after": {"docstatus": after},
+				},
+				action,
+			)
+			self.assertEqual(frappe.db.get_value("Note", created["name"], "docstatus"), after, action)
 			called.assert_called_once()
 
 	def test_call_method_runs_whitelisted_methods_only(self):
@@ -728,7 +935,19 @@ class TestSiteApiUnrestricted(FrappeTestCase):
 				"arguments": {"doctype": "User", "filters": BOSS, "fieldname": "email"},
 			},
 		)
-		self.assertEqual(result, {"ok": True, "method": "frappe.client.get_value", "result": {"email": BOSS}})
+		self.assertEqual(
+			result,
+			{
+				"ok": True,
+				"method": "frappe.client.get_value",
+				"result": {"email": BOSS},
+				"value_before": None,
+				"value_after": {
+					"method": "frappe.client.get_value",
+					"argument_keys": ["doctype", "fieldname", "filters"],
+				},
+			},
+		)
 		for method in ("frappe.get_doc", "frappe.db.sql", "os.system", "frappe.khong.co", "khongco"):
 			refused = self.run_tool("api_call_method", {"method": method, "arguments": {}})
 			self.assertFalse(refused["ok"], method)

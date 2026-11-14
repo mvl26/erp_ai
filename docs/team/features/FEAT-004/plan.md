@@ -185,3 +185,74 @@ S1 = T12 → T13 → T14 → T16 → T18 → T19 → T46 → T45 (cộng T15 que
 5. Sau T22 và T48: lệnh, hoàn tác, test chéo xong; `cmd.test` xanh.
 6. Sau T30, T32, T44: `cmd.test`, `cmd.lint` sạch; `ls docs/team/adr/` có ADR-011/012/013/022 tham chiếu ADR-005 (AC-15); `cmd.migrate` lên/xuống/lên đối soát số dòng `ERP AI Log`, `runs_today`, `spent_this_month_usd`, trường cũ của `ERP AI Setting`.
 7. Hết build (T34): `diff.patch`; xóa `.team/active-build`; báo roles đã gọi; qa dán HEAD/`status` 4 repo lõi trước/sau `cmd.test` (NFR-9) và ảnh/mô tả form 3 trạng thái (AC-22) vào `acceptance.md`.
+
+## Chèn CHG-001 (Amendment 2), 2026-11-14 (`/team:plan --insert`)
+
+Căn cứ: `spec.md` mục Amendment 2 (AC-24..AC-35, S-1..S-8), ADR-023, `docs/team/features/CHG-001/arch-impact.md` (M1–M5), `review-chg001.md` (3 blocker, 9 major), quyết định của người 2026-11-14 (journal). Không có design riêng cho phần này: `arch-impact.md` ghi các điểm "để designer quyết" không đạt ngưỡng xung đột, nên các lựa chọn dưới đây do plan chốt và mọi task dùng chung.
+
+### Bản đồ file → task
+| File | Trách nhiệm sau khi chèn | Task (theo thứ tự) |
+|---|---|---|
+| `erp_ai/agent/change_link.py` + test | dựng đường dẫn form Desk có chữ ký | T53 |
+| `erp_ai/agent/tools/propose_change.py` + test | comment 3 liên kết; đường hợp lệ M5 khi tạo đề xuất | T53 → T67 |
+| `erp_ai/change_decision.py` + test | một cửa POST `decide` | T54 → T58 (chỉ test) |
+| `erp_ai/erp_ai_agent/doctype/erp_ai_change_proposal/erp_ai_change_proposal.js` | form tự POST một lần, không hộp hỏi | T54 |
+| `erp_ai/agent/changes/apply_job.py` + test | job áp dụng, hoàn tác | T47 → T21 → T22 → T55 → T57 → T48 |
+| `erp_ai/agent/changes/result_comment.py` + test (mới) | comment kết quả về phiếu | T56 |
+| `erp_ai/agent/tools/site_api.py` + test | công cụ bản ghi | T59 → T60 → T61 → T62 |
+| `erp_ai/agent/tools/registry.py` + test | một bảng cấp | T63 |
+| `erp_ai/agent/runner.py` + `test_agent_runner.py` | một lời gọi lấy schema; mục hành động có trước/sau | T63 → T64 |
+| `erp_ai/agent/agent_write_guard.py` + test (mới) | kiểm danh tính tài khoản agent | T65 |
+| controller `erp_ai_setting.py`, `erp_ai_credential.py` | đóng với tài khoản agent | T65 |
+| controller `erp_ai_log.py`, `erp_ai/agent/run_log.py` + test | đường hợp lệ 1 | T66 |
+| controller `erp_ai_change_proposal.py` | đường hợp lệ 2 | T67 |
+| `erp_ai/tests/test_architecture.py` | luật tĩnh của ADR-023 | T32 → T44 → T68 |
+
+### Ràng buộc chung của phần chèn (chép nguyên)
+- Đường dẫn quyết định: `/app/erp-ai-change-proposal/<name>?name=<name>&action=<approve|reject>&_signature=<chữ ký>`; chữ ký là HMAC của Frappe trên `name` + `action` (`change_link._signed_query`, không đổi); không hạn (A-9).
+- Method duy nhất: `erp_ai.change_decision.decide(name, action, _signature)`, `methods=["POST"]`, không `allow_guest`; role kiểm ở `_decider` của controller. Không method `GET` nào trong `erp_ai/**` đổi trạng thái (ADR-010, ADR-023 QĐ 1).
+- Job: người thực hiện không thuộc `NEVER_AUTHORITY`, còn `ERP AI Instructor`, trùng `frappe.session.user`; khóa hết `LOCK_TIMEOUT_S` → `Lỗi` với `LOCK_BUSY`, 1 dòng nhật ký (ADR-023 QĐ 2).
+- Tập cấm `site_api`: "đóng ở mọi chế độ" = mọi DocType thuộc module của app (tính động); chế độ thường thêm `DocType`, `Role`, `Custom DocPerm`, `Custom Role`; mọi phép so tên dùng tên đang lưu (ADR-023 QĐ 3).
+- Bảng cấp: `site_admin` = (công tắc sửa code ∧ `L3` ∧ người ra lệnh) ∨ (toàn quyền ∧ mức > L0 ∧ người ra lệnh); `site_unrestricted` = toàn quyền ∧ mức > L0 ∧ người ra lệnh; một hàm cấp (ADR-023 QĐ 4).
+- M5: `erp_ai/agent/agent_write_guard.py` với `AGENT_WRITE_FLAG = "erp_ai_agent_write_allowed"`, `allow_agent_write()`, `refuse_agent_write(doc)`; cờ ở `frappe.flags`, chỉ `run_log.py` và `tools/propose_change.py` gọi `allow_agent_write` (ADR-023 QĐ 5).
+- `api_call_method` giữ gọi tự do (người chọn); không bao giờ trả khóa API hay mật khẩu: `SECRET_METHODS` + `_scrub` (T61). Cam kết "bot không tự đổi công tắc" qua đường ghi DB thẳng là cố gắng, không bảo đảm (ADR-023 QĐ 6 b).
+- Nhật ký trước/sau: khóa `value_before`, `value_after` trong kết quả tool và trong mục hành động; không trường mật.
+
+### Thứ tự và song song
+Sáu chuỗi theo file chạy cạnh nhau, tối đa 5 dev: (1) `apply_job.py`: T47 → T21 (`cmd.migrate`, một mình trên site) → T22 → T55 → T57 → T48; (2) `site_api.py`: T59 → T60 → T61 → T62; (3) T53 → T67; (4) T63 → T64 (sau T62); (5) T54 → T58 (sau T55); (6) T65 → T66, T67; T56 đứng riêng; `test_architecture.py`: T32 (sau T22) → T44 → T68 (sau cùng). Đường găng: chuỗi (1) rồi T32 → T44 → T68 → T34.
+
+### AC / biện pháp → task
+| Mã | Task |
+|---|---|
+| M1 (AC-24, AC-25, AC-26, NFR-10) | T53, T54, T68 |
+| M2 (ADR-012 QĐ 7, NFR-6) | T55 |
+| AC-27, AC-12 qua liên kết | T58 |
+| AC-28 | T56, T57, T48 |
+| M3 (AC-31, AC-33) | T59, T68 |
+| AC-30 | T60 |
+| AC-33 phần gọi hàm, NFR-5 | T61 |
+| AC-35, NFR-11 | T62, T64 |
+| M4 (AC-1, AC-2, AC-32) | T63, T68 |
+| M5 (AC-33, AC-5) | T65, T66, T67, T68 |
+| AC-29, AC-14, AC-34 | đã có trong mã nhận về, review-chg001 nhóm H không còn blocker/major ngoài M4; 4 điểm nhỏ để deferred |
+
+### Checkpoint thêm
+8. Sau T54 và T53: `cmd.test_one` của `test_change_decision.py`, `test_change_link.py`, `test_propose_change.py` xanh; không còn `/api/method/` trong comment.
+9. Sau T67 (M5 đủ ba task): `cmd.test` cả app xanh — đây là chỗ lộ ra nếu bộ chặn chặn nhầm chính runner.
+10. Sau T68: `cmd.test`, `cmd.lint`; rồi T34.
+
+### Rủi ro thêm
+| Rủi ro | Dấu hiệu | Cách xử lý |
+|---|---|---|
+| M5 chặn nhầm runner (runner lưu Setting hoặc Log ngoài `write_entry` dưới tài khoản agent) | `cmd.test` đỏ ở `test_agent_runner`, `test_runner_*` sau T65/T66 | dev trả `NEEDS_CONTEXT`; không mở đường hợp lệ thứ ba khi chưa có architect |
+| Comment kết quả (AC-28) do job ghi dưới phiên người duyệt làm agent chạy lại | job agent mới sau `post_result` | T56 có test đếm 0 job; ghi comment theo cách comment của bot |
+| `api_call_method`: không biết bản ghi bị chạm nên `value_before` rỗng | AC-35 chỉ đạt phần tên hàm | ghi cho qa và người; không chặn build |
+| Người duyệt không vào được Desk | qa/người kiểm trên `miyano` | ngoài build (ADR-023 QĐ 6); T33 đã ghim role có `desk_access` |
+| Liên kết GET cũ trong comment của đề xuất đang chờ | người bấm nhận lỗi | duyệt bằng nút trên form; ghi vào As-Built |
+
+### Trọng tâm review của phần chèn
+1. Dict do client gửi có khóa `flags` không bật được đường hợp lệ của M5 (T65).
+2. `decide` qua GET thật sự bị từ chối ở tầng Frappe, không chỉ ở test gọi hàm trực tiếp (T54).
+3. Job áp dụng còn lại sau bước kết thúc request (T54), không đếm trên `frappe.enqueue` đã patch.
+4. Tên chữ thường của DocType, role, user (T59); chuỗi JSON lồng trong tham số `call_method` (T61).
+5. Comment kết quả không mang dòng cuối đầu ra git có URL (T56, review-45 deferred).

@@ -1857,6 +1857,425 @@ def check_entry_types_unchanged(sources: dict) -> list:
 	return violations
 
 
+# ---------------------------------------------------------------------------------------------------
+# FEAT-004 rules, group 1 (ADR-011, ADR-012 "Ràng buộc"; design 8.2)
+# ---------------------------------------------------------------------------------------------------
+
+CHANGES_PREFIX = "agent/changes/"
+TRANSITIONS_FILE = "agent/changes/transitions.py"
+TRANSITIONS_MODULE = "erp_ai.agent.changes.transitions"
+PROPOSAL_CONTROLLER_FILE = "erp_ai_agent/doctype/erp_ai_change_proposal/erp_ai_change_proposal.py"
+PROPOSAL_DOCTYPE_FILE = "erp_ai_agent/doctype/erp_ai_change_proposal/erp_ai_change_proposal.json"
+PROPOSAL_DOCTYPE_NAME = "ERP AI Change Proposal"
+PROPOSAL_DOCTYPE_CONSTANT = "PROPOSAL_DOCTYPE"
+PROPOSE_TOOL_FILE = "agent/tools/propose_change.py"
+CHANGE_GUARD_FILE = "agent/tools/change_guard.py"
+CHANGE_GUARD_FUNCTION = "check_write_path"
+SAFE_PATH_CALL = "erp_ai.agent.tools.source.resolve_safe_path"
+SAFE_PATH_NAME = "safe_path"  # any function so named outside source.py is a second resolver (ADR-011)
+ROOT_CHECK_CALLS = ("commonpath", "is_relative_to")
+MODULE_SCOPE = "<module>"
+# Hand-written: (file, function) allowed to root-check outside source.py. check_write_path only
+# classifies a path resolve_safe_path already refused, to pick the refusal reason (ADR-011, design table 3.1).
+ROOT_CHECK_ALLOWLIST = frozenset(
+	{
+		(CHANGE_GUARD_FILE, CHANGE_GUARD_FUNCTION),
+		# Guards the output path of the offline eval export; predates FEAT-004 and is on no path the agent's
+		# tools or the apply job write through.
+		("eval/export_tickets.py", "_inside_repo"),
+	}
+)
+
+# Design 2.1 state group (11 names) + the 4 git result fields of amendment 1, in transitions.STATE_FIELDS order.
+STATE_FIELDS = (
+	"change_status",
+	"decided_by",
+	"decided_at",
+	"approved_digest",
+	"undo_by",
+	"undo_at",
+	"finished_at",
+	"exit_code",
+	"duration_ms",
+	"command_output",
+	"failure_reason",
+	"applied_branch",
+	"applied_ahead_count",
+	"apply_commit_sha",
+	"undo_commit_sha",
+)
+STATE_WRITE_CALLS = ("set", "db_set", "set_value", "update", "setattr")
+STATE_KEYWORD_CALLS = (*STATE_WRITE_CALLS, "get_doc", "new_doc", "dict")
+
+# ADR-012 Ràng buộc, design 2.1: every role on the proposal DocType and the only permissions it holds.
+PROPOSAL_PERMISSIONS = {
+	"ERP AI Agent": frozenset({"create", "read"}),
+	"ERP AI Instructor": frozenset({"read"}),
+	"System Manager": frozenset({"read"}),
+}
+PROPOSAL_FORBIDDEN_PERMISSIONS = ("write", "delete", "submit", "cancel", "amend")
+# The check fields of a Frappe DocPerm row.
+DOCPERM_FLAGS = (
+	"select",
+	"read",
+	"write",
+	"create",
+	"delete",
+	"submit",
+	"cancel",
+	"amend",
+	"report",
+	"export",
+	"import",
+	"share",
+	"print",
+	"email",
+)
+PROPOSAL_SAVE_CALLS = ("save", "db_set", "set_value")
+# A tool that loads/deletes a document of a non-constant DocType and saves/deletes it writes any DocType
+# (site_api.update_record / delete_record); only its deny sets keep the proposal out (ADR-011).
+GENERIC_DOC_CALLS = ("get_doc", "delete_doc")
+GENERIC_WRITE_CALLS = ("save", "delete")
+DENY_SET_SUFFIX = "DENIED_DOCTYPES"
+SITE_API_FILE = "agent/tools/site_api.py"
+SITE_API_DENY_SETS = ("DENIED_DOCTYPES", "ALWAYS_DENIED_DOCTYPES")
+
+
+def check_transitions_imported_only_by_controller_and_changes(sources: dict) -> list:
+	"""ADR-012 Ràng buộc: only the proposal controller and agent/changes/** reach the state machine
+	(an import, `changes.transitions` through an imported package, or the dotted path as a string)."""
+	reason = "ADR-012: only the proposal controller and agent/changes/ use the state machine"
+	violations = []
+	for rel, source in only_python(sources).items():
+		if rel == PROPOSAL_CONTROLLER_FILE or rel.startswith(CHANGES_PREFIX):
+			continue
+		tree = parse(rel, source)
+		aliases = import_aliases(tree)
+		for lineno, target in imported_modules(tree, module_name(rel), rel.endswith("__init__.py")):
+			if module_in(target, TRANSITIONS_MODULE):
+				violations.append(f"{rel}:{lineno}: imports {target} ({reason})")
+		for node in ast.walk(tree):
+			if isinstance(node, ast.Attribute) and resolved_name(node, aliases) == TRANSITIONS_MODULE:
+				violations.append(violation(rel, node, f"reaches {TRANSITIONS_MODULE} ({reason})"))
+			elif (
+				isinstance(node, ast.Constant)
+				and isinstance(node.value, str)
+				and module_in(node.value, TRANSITIONS_MODULE)
+			):
+				violations.append(violation(rel, node, f"names {node.value} ({reason})"))
+	return violations
+
+
+def _state_field_writes(tree: ast.AST):
+	"""`(node, how)` for every write of a STATE_FIELDS name: assignment target, dict key, `set`-like call
+	with the name as a positional string or attribute (`qb.set(T.change_status, v)`), or the name as a
+	keyword of a document write/create call or of `dict(...)`."""
+	for node in ast.walk(tree):
+		targets = []
+		if isinstance(node, ast.Assign):
+			targets = node.targets
+		elif isinstance(node, ast.AugAssign | ast.AnnAssign):
+			targets = [node.target]
+		for target in targets:
+			for part in ast.walk(target):
+				if isinstance(part, ast.Attribute) and part.attr in STATE_FIELDS:
+					yield part, f"assigns .{part.attr}"
+				elif isinstance(part, ast.Constant) and part.value in STATE_FIELDS:
+					yield part, f"assigns [{part.value!r}]"
+		if isinstance(node, ast.Dict):
+			for key in node.keys:
+				if isinstance(key, ast.Constant) and key.value in STATE_FIELDS:
+					yield key, f"sets {key.value!r}"
+		elif isinstance(node, ast.Call):
+			function = (dotted_name(node.func) or "").split(".")[-1]
+			if function in STATE_WRITE_CALLS:
+				for arg in node.args:
+					if isinstance(arg, ast.Constant) and arg.value in STATE_FIELDS:
+						yield arg, f"{function}({arg.value!r})"
+					elif isinstance(arg, ast.Attribute) and arg.attr in STATE_FIELDS:
+						yield arg, f"{function}(.{arg.attr})"
+			if function in STATE_KEYWORD_CALLS:
+				for keyword in node.keywords:
+					if keyword.arg in STATE_FIELDS:
+						yield keyword.value, f"{function}({keyword.arg}=)"
+
+
+def check_change_state_fields_written_only_in_changes(sources: dict) -> list:
+	"""ADR-012 QĐ 2 / Ràng buộc ("Ghi vào"): the proposal state group (STATE_FIELDS) is written only under
+	agent/changes/; reads are allowed. Design 8.2 words this more broadly; ADR-012's write-only scope is kept."""
+	violations = []
+	for rel, source in only_python(sources).items():
+		if rel.startswith(CHANGES_PREFIX):
+			continue
+		for node, how in _state_field_writes(parse(rel, source)):
+			violations.append(
+				violation(rel, node, f"{how}: a proposal state field outside {CHANGES_PREFIX} (ADR-012)")
+			)
+	return violations
+
+
+def _resolver_results(function, aliases: dict) -> set:
+	"""Local names bound to a `resolve_safe_path(...)` result (`full = ...` or `(full := ...)`)."""
+	names = set()
+	for node in ast.walk(function):
+		if isinstance(node, ast.Assign | ast.NamedExpr) and isinstance(node.value, ast.Call):
+			if resolved_name(node.value.func, aliases) == SAFE_PATH_CALL:
+				targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+				names.update(target.id for target in targets if isinstance(target, ast.Name))
+	return names
+
+
+def _tests_none(test, names: set) -> bool:
+	"""`x is None`, `(x := ...) is None` or `not x` for x in `names`."""
+	if isinstance(test, ast.UnaryOp) and isinstance(test.op, ast.Not):
+		return isinstance(test.operand, ast.Name) and test.operand.id in names
+	if not (isinstance(test, ast.Compare) and len(test.ops) == 1 and isinstance(test.ops[0], ast.Is)):
+		return False
+	left = test.left.target if isinstance(test.left, ast.NamedExpr) else test.left
+	right = test.comparators[0]
+	return (
+		isinstance(left, ast.Name)
+		and left.id in names
+		and isinstance(right, ast.Constant)
+		and right.value is None
+	)
+
+
+def _refuses_when_unresolved(function, aliases: dict) -> bool:
+	"""An `if <resolve_safe_path result> is None:` whose body returns a call (the refusal) or raises."""
+	names = _resolver_results(function, aliases)
+	return any(
+		isinstance(node, ast.If)
+		and _tests_none(node.test, names)
+		and any(
+			isinstance(stmt, ast.Raise) or (isinstance(stmt, ast.Return) and isinstance(stmt.value, ast.Call))
+			for stmt in node.body
+		)
+		for node in ast.walk(function)
+	)
+
+
+def _root_check_calls(node: ast.AST, function: str = MODULE_SCOPE):
+	"""`(innermost enclosing function name, call)` for every `commonpath`/`is_relative_to` call, realpath nearby or
+	not: source.py itself splits the root check (`_inside`) from the realpath calls of its caller."""
+	for child in ast.iter_child_nodes(node):
+		scope = child.name if isinstance(child, ast.FunctionDef | ast.AsyncFunctionDef) else function
+		if isinstance(child, ast.Call) and referenced_name(child.func) in ROOT_CHECK_CALLS:
+			yield function, child
+		yield from _root_check_calls(child, scope)
+
+
+def check_change_guard_uses_resolve_safe_path(sources: dict) -> list:
+	"""ADR-011 Ràng buộc: `change_guard.check_write_path` calls `source.resolve_safe_path` and refuses when it
+	returns None; outside source.py no function is named like it and no code checks a root
+	(`commonpath`/`is_relative_to`, with or without realpath; ROOT_CHECK_ALLOWLIST holds the guard's own classification of a refused path)."""
+	guard = sources.get(CHANGE_GUARD_FILE)
+	if guard is None:
+		return _missing(CHANGE_GUARD_FILE)
+	violations = []
+	tree = parse(CHANGE_GUARD_FILE, guard)
+	aliases = import_aliases(tree)
+	function = next(
+		(
+			node
+			for node in tree.body
+			if isinstance(node, ast.FunctionDef) and node.name == CHANGE_GUARD_FUNCTION
+		),
+		None,
+	)
+	if function is None:
+		violations.append(f"{CHANGE_GUARD_FILE}: no top-level {CHANGE_GUARD_FUNCTION}() (ADR-011)")
+	elif not any(
+		isinstance(node, ast.Call) and resolved_name(node.func, aliases) == SAFE_PATH_CALL
+		for node in ast.walk(function)
+	):
+		violations.append(
+			violation(
+				CHANGE_GUARD_FILE,
+				function,
+				f"{CHANGE_GUARD_FUNCTION} does not call {SAFE_PATH_CALL} (ADR-011)",
+			)
+		)
+	elif not _refuses_when_unresolved(function, aliases):
+		violations.append(
+			violation(
+				CHANGE_GUARD_FILE,
+				function,
+				f"{CHANGE_GUARD_FUNCTION} does not refuse when {SAFE_PATH_CALL} returns None (ADR-011)",
+			)
+		)
+	for rel, source in only_python(sources).items():
+		if rel == SOURCE_TOOL_FILE:
+			continue
+		tree = parse(rel, source)
+		for node in ast.walk(tree):
+			if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef) and SAFE_PATH_NAME in node.name:
+				violations.append(violation(rel, node, f"{node.name}() is a second path resolver (ADR-011)"))
+		for function, call in _root_check_calls(tree):
+			if (rel, function) not in ROOT_CHECK_ALLOWLIST:
+				violations.append(
+					violation(
+						rel,
+						call,
+						f"{function}() calls {referenced_name(call.func)}: a second root check (ADR-011)",
+					)
+				)
+	return violations
+
+
+def check_proposal_doctype_permissions(sources: dict) -> list:
+	"""ADR-012 Ràng buộc: no role has write/delete/submit/cancel/amend on the proposal; each role holds exactly
+	the permissions of PROPOSAL_PERMISSIONS (rows of one role are merged)."""
+	text = sources.get(PROPOSAL_DOCTYPE_FILE)
+	if text is None:
+		return _missing(PROPOSAL_DOCTYPE_FILE)
+	violations = []
+	granted = {}
+	for row in json.loads(text).get("permissions") or []:
+		role = row.get("role")
+		flags = {flag for flag in DOCPERM_FLAGS if row.get(flag)}
+		violations.extend(
+			f"{PROPOSAL_DOCTYPE_FILE}: role {role!r} has {flag} (ADR-012)"
+			for flag in PROPOSAL_FORBIDDEN_PERMISSIONS
+			if flag in flags
+		)
+		granted.setdefault(role, set()).update(flags - set(PROPOSAL_FORBIDDEN_PERMISSIONS))
+	for role in sorted(set(granted) | set(PROPOSAL_PERMISSIONS), key=str):
+		expected = PROPOSAL_PERMISSIONS.get(role, frozenset())
+		if granted.get(role, set()) != expected:
+			violations.append(
+				f"{PROPOSAL_DOCTYPE_FILE}: role {role!r} has {sorted(granted.get(role, ()))}, "
+				f"expected {sorted(expected)} (ADR-012)"
+			)
+	return violations
+
+
+def _names_proposal(node) -> bool:
+	return (isinstance(node, ast.Constant) and node.value == PROPOSAL_DOCTYPE_NAME) or (
+		referenced_name(node) == PROPOSAL_DOCTYPE_CONSTANT
+	)
+
+
+def _builds_proposal(tree: ast.AST) -> bool:
+	"""The module loads or creates a proposal: `get_doc`/`new_doc`(proposal, ...) or `{"doctype": proposal}`."""
+	for node in ast.walk(tree):
+		if isinstance(node, ast.Call) and referenced_name(node.func) in DOC_GETTERS and node.args:
+			if _names_proposal(node.args[0]):
+				return True
+		elif isinstance(node, ast.Dict) and any(
+			isinstance(key, ast.Constant) and key.value == "doctype" and _names_proposal(value)
+			for key, value in zip(node.keys, node.values, strict=True)
+		):
+			return True
+	return False
+
+
+def _writes_any_doctype(tree: ast.AST) -> bool:
+	"""The module loads a document of a non-constant DocType and saves/deletes it, or deletes one directly."""
+	generic = set()
+	for node in ast.walk(tree):
+		if isinstance(node, ast.Call) and referenced_name(node.func) in GENERIC_DOC_CALLS:
+			# Positional, or keywords only: `get_doc(doctype=d, name=n)`.
+			first = (
+				node.args[0]
+				if node.args
+				else next((keyword.value for keyword in node.keywords if keyword.arg == "doctype"), None)
+			)
+			if first is None:
+				continue
+			constant = isinstance(first, ast.Constant | ast.Dict) or (referenced_name(first) or "").isupper()
+			if not constant and not _names_proposal(first):
+				generic.add(referenced_name(node.func))
+	if "delete_doc" in generic:
+		return True
+	return "get_doc" in generic and any(
+		isinstance(node, ast.Call) and referenced_name(node.func) in GENERIC_WRITE_CALLS
+		for node in ast.walk(tree)
+	)
+
+
+def _contains_proposal(node) -> bool:
+	"""The set expression keeps the proposal DocType: named in a literal or set call, or on either side of `|`;
+	on the right of `-` it is taken out, so only the left side counts."""
+	if _names_proposal(node):
+		return True
+	if isinstance(node, ast.Set | ast.List | ast.Tuple):
+		return any(_contains_proposal(element) for element in node.elts)
+	if isinstance(node, ast.Call):
+		return any(_contains_proposal(arg) for arg in node.args)
+	if isinstance(node, ast.BinOp) and isinstance(node.op, ast.BitOr):
+		return _contains_proposal(node.left) or _contains_proposal(node.right)
+	if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Sub):
+		return _contains_proposal(node.left)
+	return False
+
+
+def _deny_sets(tree: ast.AST) -> dict:
+	"""`{name: (node, value)}` of module-level assignments to a `*DENIED_DOCTYPES` name."""
+	found = {}
+	for node in tree.body:
+		if isinstance(node, ast.Assign):
+			for target in node.targets:
+				if isinstance(target, ast.Name) and target.id.endswith(DENY_SET_SUFFIX):
+					found[target.id] = (node, node.value)
+	return found
+
+
+def _proposal_deny_violations(rel: str, tree: ast.AST) -> list:
+	"""ADR-011: a tool writing any DocType keeps the proposal out through its deny sets (both sets for site_api)."""
+	if not _writes_any_doctype(tree):
+		return []
+	sets = _deny_sets(tree)
+	required = SITE_API_DENY_SETS if rel == SITE_API_FILE else ()
+	violations = [
+		f"{rel}: saves/deletes any DocType but has no {name} deny set (ADR-011)"
+		for name in required
+		if name not in sets
+	]
+	if not sets and not required:
+		violations.append(
+			f"{rel}: saves/deletes any DocType but has no *{DENY_SET_SUFFIX} deny set (ADR-011)"
+		)
+	for name, (node, value) in sets.items():
+		if not _contains_proposal(value):
+			violations.append(
+				violation(
+					rel,
+					node,
+					f"deny set {name} lacks {PROPOSAL_DOCTYPE_CONSTANT} in a tool that saves any DocType (ADR-011)",
+				)
+			)
+	return violations
+
+
+def check_tool_never_saves_proposal(sources: dict) -> list:
+	"""ADR-011 Ràng buộc: a tool only `.insert()`s a proposal. In agent/tools/**, a module that loads or creates a
+	proposal has no `.save(`/`db_set`/`set_value` at all; any other module never passes the proposal to one; a
+	module that saves/deletes a non-constant DocType has the proposal in every `*DENIED_DOCTYPES` set."""
+	violations = []
+	for rel, source in only_python(scoped(sources, TOOLS_PREFIX)).items():
+		tree = parse(rel, source)
+		violations.extend(_proposal_deny_violations(rel, tree))
+		builds = _builds_proposal(tree)
+		for node in ast.walk(tree):
+			if not isinstance(node, ast.Call) or referenced_name(node.func) not in PROPOSAL_SAVE_CALLS:
+				continue
+			function = referenced_name(node.func)
+			if builds:
+				violations.append(
+					violation(
+						rel,
+						node,
+						f"{function} in a tool that builds an {PROPOSAL_DOCTYPE_NAME} (ADR-011: insert only)",
+					)
+				)
+			elif any(_names_proposal(arg) for arg in node.args):
+				violations.append(
+					violation(rel, node, f"{function} on an {PROPOSAL_DOCTYPE_NAME} in a tool (ADR-011)")
+				)
+	return violations
+
+
 class TestArchitecture(unittest.TestCase):
 	@classmethod
 	def setUpClass(cls):
@@ -2148,6 +2567,42 @@ class TestArchitecture(unittest.TestCase):
 	def test_no_default_people_in_agent_python(self):
 		self.assertIn("Việt Nam", self.sources["agent/prompts.py"])  # the coincidence the scan must tolerate
 		self.assertEqual(check_no_default_people_in_agent_python(self.sources), [])
+
+	# FEAT-004: change proposals (ADR-011, ADR-012) -----------------------------------------------
+
+	def test_transitions_imported_only_by_controller_and_changes(self):
+		controller = parse(PROPOSAL_CONTROLLER_FILE, self.sources[PROPOSAL_CONTROLLER_FILE])
+		imports = [
+			target
+			for _lineno, target in imported_modules(controller, module_name(PROPOSAL_CONTROLLER_FILE), False)
+		]
+		self.assertIn(TRANSITIONS_MODULE, imports)
+		self.assertEqual(check_transitions_imported_only_by_controller_and_changes(self.sources), [])
+
+	def test_change_state_fields_written_only_in_changes(self):
+		self.assertEqual(len(STATE_FIELDS), 15)
+		declared = [
+			ast.literal_eval(node.value)
+			for node in parse(TRANSITIONS_FILE, self.sources[TRANSITIONS_FILE]).body
+			if isinstance(node, ast.Assign)
+			and any(getattr(t, "id", None) == "STATE_FIELDS" for t in node.targets)
+		]
+		self.assertEqual(declared, [STATE_FIELDS])
+		self.assertEqual(check_change_state_fields_written_only_in_changes(self.sources), [])
+
+	def test_change_guard_uses_resolve_safe_path(self):
+		self.assertIn("def resolve_safe_path(", self.sources[SOURCE_TOOL_FILE])
+		self.assertIn(CHANGE_GUARD_FILE, self.sources)
+		self.assertEqual(check_change_guard_uses_resolve_safe_path(self.sources), [])
+
+	def test_proposal_doctype_permissions(self):
+		scanned = load_product_sources(suffixes=(".py", ".json"))
+		self.assertIn(PROPOSAL_DOCTYPE_FILE, scanned)
+		self.assertEqual(check_proposal_doctype_permissions(scanned), [])
+
+	def test_tool_never_saves_proposal(self):
+		self.assertIn("proposal.insert()", self.sources[PROPOSE_TOOL_FILE])
+		self.assertEqual(check_tool_never_saves_proposal(self.sources), [])
 
 	def test_agent_modules_import_alone_in_fresh_process(self):
 		# STD-DESIGN-6: an import cycle stays hidden in-process when another test imported a module first.
@@ -3579,6 +4034,353 @@ class TestScannersCatchViolations(unittest.TestCase):
 		self.assertEqual(check_no_default_people_in_agent_python({"agent/prompts.py": clean}), [])
 		outside = "DEFAULT = 'Hiếu'\n"
 		self.assertEqual(check_no_default_people_in_agent_python({"constants.py": outside}), [])
+
+	# FEAT-004 group 1 (ADR-011, ADR-012) -------------------------------------------------------
+
+	def test_transitions_import_caught_outside_controller_and_changes(self):
+		cases = {
+			"agent/runner.py": "from erp_ai.agent.changes import transitions\n",
+			"handlers.py": "import erp_ai.agent.changes.transitions\n",
+			"agent/tools/propose_change.py": "from erp_ai.agent.changes.transitions import approve\n",
+			"tasks.py": "from erp_ai.agent.changes import transitions as t\n",
+			"gateway/client.py": "from erp_ai.agent import changes\nX = changes.transitions.approve\n",
+			"change_decision.py": "M = 'erp_ai.agent.changes.transitions.approve'\n",
+			"agent/changes_old.py": "from erp_ai.agent.changes import transitions\n",
+			"erp_ai_agent/doctype/erp_ai_log/erp_ai_log.py": "from erp_ai.agent.changes import transitions\n",
+		}
+		for rel, source in cases.items():
+			with self.subTest(rel=rel):
+				self.assertCaught(
+					check_transitions_imported_only_by_controller_and_changes({rel: source}), rel, "ADR-012"
+				)
+
+	def test_transitions_import_clean_in_controller_and_changes(self):
+		allowed = "from erp_ai.agent.changes import transitions\n"
+		clean = {
+			PROPOSAL_CONTROLLER_FILE: allowed,
+			"agent/changes/apply_job.py": allowed,
+			"agent/changes/transitions.py": "from erp_ai.agent.run_log import write_entry\n",
+			"agent/runner.py": "from erp_ai.agent.changes import apply_job\nM = 'erp_ai.agent.changes.apply_job.run_change'\n",
+			"agent/queue.py": "from erp_ai.agent.changes import transitions_note\n",
+		}
+		self.assertEqual(check_transitions_imported_only_by_controller_and_changes(clean), [])
+
+	def test_state_field_writes_caught_outside_changes(self):
+		for field in STATE_FIELDS:
+			with self.subTest(field=field):
+				self.assertCaught(
+					check_change_state_fields_written_only_in_changes(
+						{"agent/tools/propose_change.py": f"doc.{field} = 1\n"}
+					),
+					field,
+				)
+		shapes = {
+			"attribute": "proposal.change_status = 'Đã duyệt'\n",
+			"augmented": "proposal.exit_code += 1\n",
+			"annotated": "proposal.decided_by: str = user\n",
+			"subscript": "proposal['decided_at'] = now\n",
+			"dict key": "frappe.get_doc({'doctype': D, 'approved_digest': x}).insert()\n",
+			"doc.set": "doc.set('undo_by', user)\n",
+			"db_set": "doc.db_set('undo_at', now)\n",
+			"set_value": "frappe.db.set_value(D, name, 'finished_at', now)\n",
+			"setattr": "setattr(doc, 'failure_reason', text)\n",
+			"keyword": "frappe.new_doc(D, applied_branch='main')\n",
+			"qb set attribute": "frappe.qb.update(T).set(T.change_status, v).run()\n",
+			"dict() keyword": "doc.update(dict(change_status=v))\n",
+		}
+		for shape, source in shapes.items():
+			with self.subTest(shape=shape):
+				self.assertCaught(
+					check_change_state_fields_written_only_in_changes({"change_decision.py": source}),
+					"change_decision.py",
+					"ADR-012",
+				)
+
+	def test_state_field_reads_and_changes_writes_are_clean(self):
+		clean = {
+			# Writes inside agent/changes/ are the state machine's own job.
+			"agent/changes/transitions.py": "doc.set('change_status', S)\nfrappe.db.set_value(D, n, {'decided_by': u})\n",
+			"agent/changes/apply_job.py": "proposal.apply_commit_sha = sha\n",
+			# Reads elsewhere, and a content field (not in STATE_FIELDS) written elsewhere.
+			"agent/change_text.py": "s = fields.get('change_status')\nc = proposal.undo_commit_sha\n",
+			"agent/tools/propose_change.py": (
+				"x = {'ok': True, 'status': proposal.change_status}\n"
+				"frappe.get_doc({'doctype': D, 'change_kind': k}).insert()\n"
+			),
+			"agent/tools/source.py": "run = GitRun(exit_code=None, stdout=b'')\n",
+			"change_decision.py": "s = frappe.db.get_value(D, name, 'change_status')\n",
+		}
+		self.assertEqual(check_change_state_fields_written_only_in_changes(clean), [])
+
+	def test_change_guard_without_resolve_safe_path_caught(self):
+		good = (
+			"from erp_ai.agent.tools import source\n\ndef check_write_path(rel):\n"
+			"\tfull = source.resolve_safe_path(rel)\n\tif full is None:\n\t\treturn _refused(PATH_INVALID)\n"
+			"\treturn full\n"
+		)
+		cases = {
+			"refusal of the resolver not kept": (
+				{
+					CHANGE_GUARD_FILE: "import os\nfrom erp_ai.agent.tools import source\n\n"
+					"def check_write_path(rel):\n\tfull = source.resolve_safe_path(rel)\n"
+					"\ttarget = full or os.path.realpath(rel)\n\treturn _refused(None) if not target else target\n"
+				},
+				"None",
+			),
+			"None check without a refusal": (
+				{
+					CHANGE_GUARD_FILE: "from erp_ai.agent.tools import source\n\ndef check_write_path(rel):\n"
+					"\tfull = source.resolve_safe_path(rel)\n\tif full is None:\n\t\tpass\n\treturn full\n"
+				},
+				"None",
+			),
+			"realpath root check in a helper": (
+				{
+					CHANGE_GUARD_FILE: good,
+					"agent/changes/file_writer.py": "import os\n\ndef _real(p):\n\tr = os.path.realpath(p)\n"
+					"\treturn os.path.commonpath([ROOT, r]) == ROOT\n",
+				},
+				"agent/changes/file_writer.py",
+				"_real",
+			),
+			"root check in another guard function": (
+				{
+					CHANGE_GUARD_FILE: good
+					+ "\ndef _inside(p):\n\treturn os.path.commonpath([R, os.path.realpath(p)]) == R\n",
+				},
+				"_inside",
+			),
+			# source.py's own shape: the root check in a helper, the realpath calls in its caller.
+			"root check split from realpath": (
+				{
+					CHANGE_GUARD_FILE: good,
+					"agent/changes/file_writer.py": "import os\n\ndef _inside(root, full):\n"
+					"\treturn os.path.commonpath([root, full]) == root\n\ndef resolve(rel):\n"
+					"\troot, full = os.path.realpath(ROOT), os.path.realpath(rel)\n"
+					"\treturn full if _inside(root, full) else None\n",
+				},
+				"agent/changes/file_writer.py",
+				"_inside",
+			),
+			"root check at module level": (
+				{
+					CHANGE_GUARD_FILE: good,
+					"agent/changes/file_writer.py": "import pathlib\n\nOK = pathlib.Path(P).is_relative_to(R)\n",
+				},
+				"agent/changes/file_writer.py",
+				"is_relative_to",
+			),
+			"missing file": (
+				{SOURCE_TOOL_FILE: "def resolve_safe_path(rel):\n\treturn rel\n"},
+				CHANGE_GUARD_FILE,
+			),
+			"no guard function": (
+				{CHANGE_GUARD_FILE: "def other(rel):\n\treturn rel\n"},
+				CHANGE_GUARD_FUNCTION,
+			),
+			"guard resolves itself": (
+				{
+					CHANGE_GUARD_FILE: "import os\n\ndef check_write_path(rel):\n\treturn os.path.realpath(rel)\n"
+				},
+				"ADR-011",
+			),
+			"call in another function": (
+				{
+					CHANGE_GUARD_FILE: "from erp_ai.agent.tools import source\n\ndef check_write_path(rel):\n\treturn rel\n"
+					"\ndef helper(rel):\n\treturn source.resolve_safe_path(rel)\n"
+				},
+				"ADR-011",
+			),
+			"second resolver": (
+				{
+					CHANGE_GUARD_FILE: good,
+					"agent/changes/file_writer.py": "def _resolve_safe_path(p):\n\treturn p\n",
+				},
+				"agent/changes/file_writer.py",
+			),
+		}
+		for name, (sources, *fragments) in cases.items():
+			with self.subTest(case=name):
+				self.assertCaught(check_change_guard_uses_resolve_safe_path(sources), *fragments)
+
+	def test_change_guard_with_resolve_safe_path_clean(self):
+		clean = {
+			SOURCE_TOOL_FILE: "def resolve_safe_path(rel):\n\treturn rel\n",
+			# The guard's own realpath/commonpath only classifies a refused path (allowlisted, ADR-011).
+			CHANGE_GUARD_FILE: "import os\nfrom erp_ai.agent.tools import source\n\ndef check_write_path(rel):\n"
+			"\tif not rel:\n\t\treturn _refused(PATH_INVALID)\n\tfull = source.resolve_safe_path(rel)\n"
+			"\ttarget = full or os.path.realpath(rel)\n\tif os.path.commonpath([R, target]) != R:\n"
+			"\t\treturn _refused(PATH_INVALID)\n\tif full is None:\n\t\treturn _refused(PATH_INVALID)\n"
+			"\treturn full\n",
+			# realpath alone (no root check) is not a resolver.
+			"agent/changes/apply_job.py": "import os\n\ndef _top(p):\n\treturn os.path.realpath(p)\n",
+		}
+		self.assertEqual(check_change_guard_uses_resolve_safe_path(clean), [])
+		direct = {
+			CHANGE_GUARD_FILE: "from erp_ai.agent.tools.source import resolve_safe_path\n\n"
+			"def check_write_path(rel):\n\tif (full := resolve_safe_path(rel)) is None:\n"
+			"\t\traise ValueError(rel)\n\treturn full\n"
+		}
+		self.assertEqual(check_change_guard_uses_resolve_safe_path(direct), [])
+
+	def test_root_check_allowlist_is_closed(self):
+		# Hand-written and closed: exactly these (file, function) pairs; anything else is a second resolver.
+		self.assertEqual(
+			ROOT_CHECK_ALLOWLIST,
+			frozenset(
+				{(CHANGE_GUARD_FILE, CHANGE_GUARD_FUNCTION), ("eval/export_tickets.py", "_inside_repo")}
+			),
+		)
+		good = (
+			"from erp_ai.agent.tools import source\n\ndef check_write_path(rel):\n"
+			"\tfull = source.resolve_safe_path(rel)\n\tif full is None:\n\t\treturn _refused(PATH_INVALID)\n"
+			"\treturn full\n"
+		)
+		root_check = (
+			"import os\n\ndef {name}(p):\n\treturn os.path.commonpath([R, os.path.realpath(p)]) == R\n"
+		)
+		allowed = {CHANGE_GUARD_FILE: good, "eval/export_tickets.py": root_check.format(name="_inside_repo")}
+		self.assertEqual(check_change_guard_uses_resolve_safe_path(allowed), [])
+		outside = {
+			"same function, another file": ("eval/compute_metrics.py", "_inside_repo"),
+			"same file, another function": ("eval/export_tickets.py", "_inside_app"),
+		}
+		for name, (rel, function) in outside.items():
+			with self.subTest(case=name):
+				sources = {CHANGE_GUARD_FILE: good, rel: root_check.format(name=function)}
+				self.assertCaught(check_change_guard_uses_resolve_safe_path(sources), rel, function)
+
+	def _proposal_json(self, permissions):
+		return {
+			PROPOSAL_DOCTYPE_FILE: json.dumps({"name": PROPOSAL_DOCTYPE_NAME, "permissions": permissions})
+		}
+
+	def _proposal_rows(self):
+		return [
+			{"role": "ERP AI Agent", "create": 1, "read": 1},
+			{"role": "ERP AI Instructor", "read": 1},
+			{"role": "System Manager", "read": 1},
+		]
+
+	def test_proposal_permissions_caught(self):
+		self.assertCaught(check_proposal_doctype_permissions({}), PROPOSAL_DOCTYPE_FILE)
+		for role in PROPOSAL_PERMISSIONS:
+			for flag in PROPOSAL_FORBIDDEN_PERMISSIONS:
+				with self.subTest(role=role, flag=flag):
+					rows = self._proposal_rows()
+					next(row for row in rows if row["role"] == role)[flag] = 1
+					self.assertCaught(
+						check_proposal_doctype_permissions(self._proposal_json(rows)), role, flag
+					)
+		cases = {
+			"agent without create": [{"role": "ERP AI Agent", "read": 1}, *self._proposal_rows()[1:]],
+			"agent without read": [{"role": "ERP AI Agent", "create": 1}, *self._proposal_rows()[1:]],
+			"instructor may create": [
+				*self._proposal_rows()[:1],
+				{"role": "ERP AI Instructor", "read": 1, "create": 1},
+				*self._proposal_rows()[2:],
+			],
+			"outside flag share": [
+				{"role": "ERP AI Agent", "create": 1, "read": 1, "share": 1},
+				*self._proposal_rows()[1:],
+			],
+			"outside role": [*self._proposal_rows(), {"role": "Guest", "read": 1}],
+			"missing role": self._proposal_rows()[:2],
+			"split rows add write": [*self._proposal_rows(), {"role": "ERP AI Agent", "write": 1}],
+		}
+		for name, rows in cases.items():
+			with self.subTest(case=name):
+				self.assertCaught(check_proposal_doctype_permissions(self._proposal_json(rows)), "ADR-012")
+
+	def test_proposal_permissions_clean(self):
+		self.assertEqual(check_proposal_doctype_permissions(self._proposal_json(self._proposal_rows())), [])
+		zeros = [
+			{**row, **{flag: 0 for flag in PROPOSAL_FORBIDDEN_PERMISSIONS}, "permlevel": 0, "if_owner": 0}
+			for row in self._proposal_rows()
+		]
+		self.assertEqual(check_proposal_doctype_permissions(self._proposal_json(zeros)), [])
+
+	def test_tool_saving_a_proposal_caught(self):
+		builds = "from erp_ai.constants import PROPOSAL_DOCTYPE\nd = frappe.get_doc({'doctype': PROPOSAL_DOCTYPE})\n"
+		for call in ("d.save()", "d.db_set('reason', 'x')", "frappe.db.set_value('ToDo', n, 'x', 1)"):
+			with self.subTest(call=call):
+				self.assertCaught(
+					check_tool_never_saves_proposal({PROPOSE_TOOL_FILE: builds + call + "\n"}),
+					PROPOSE_TOOL_FILE,
+					"ADR-011",
+				)
+		elsewhere = {
+			"get_doc constant": "frappe.get_doc(PROPOSAL_DOCTYPE, name).save()\n",
+			"get_doc literal": "frappe.get_doc('ERP AI Change Proposal', name).save()\n",
+			"new_doc": "d = frappe.new_doc(PROPOSAL_DOCTYPE)\nd.save()\n",
+			"set_value": "frappe.db.set_value(PROPOSAL_DOCTYPE, name, 'reason', 'x')\n",
+			"set_value literal": "frappe.db.set_value('ERP AI Change Proposal', name, 'reason', 'x')\n",
+			"db_set": "frappe.get_doc(PROPOSAL_DOCTYPE, name).db_set('reason', 'x')\n",
+		}
+		for name, source in elsewhere.items():
+			with self.subTest(case=name):
+				self.assertCaught(
+					check_tool_never_saves_proposal({"agent/tools/site_api.py": source}),
+					"agent/tools/site_api.py",
+				)
+		saves = "def save(doctype, name):\n\tdoc = frappe.get_doc(doctype, name)\n\tdoc.save()\n"
+		generic = {
+			"no deny set": ("agent/tools/site_api.py", saves),
+			"denied set lacks it": (
+				"agent/tools/site_api.py",
+				"DENIED_DOCTYPES = {'User'}\nALWAYS_DENIED_DOCTYPES = frozenset({PROPOSAL_DOCTYPE})\n"
+				+ saves,
+			),
+			"always-denied set lacks it": (
+				"agent/tools/site_api.py",
+				"DENIED_DOCTYPES = {PROPOSAL_DOCTYPE}\nALWAYS_DENIED_DOCTYPES = frozenset({LOG_DOCTYPE})\n"
+				+ saves,
+			),
+			"always-denied set missing": (
+				"agent/tools/site_api.py",
+				"DENIED_DOCTYPES = {PROPOSAL_DOCTYPE}\n" + saves,
+			),
+			"subtracted from the set": (
+				"agent/tools/site_api.py",
+				"DENIED_DOCTYPES = (read.DENIED_DOCTYPES | {'X'}) - {PROPOSAL_DOCTYPE}\n"
+				"ALWAYS_DENIED_DOCTYPES = frozenset({PROPOSAL_DOCTYPE})\n" + saves,
+			),
+			"delete_doc in another tool": (
+				"agent/tools/cleanup.py",
+				"DENIED_DOCTYPES = {LOG_DOCTYPE}\ndef drop(doctype, name):\n\tfrappe.delete_doc(doctype, name)\n",
+			),
+			"get_doc with keywords only": (
+				"agent/tools/cleanup.py",
+				"def save(d, n):\n\tdoc = frappe.get_doc(doctype=d, name=n)\n\tdoc.save()\n",
+			),
+			"delete_doc with keywords only": (
+				"agent/tools/cleanup.py",
+				"def drop(d, n):\n\tfrappe.delete_doc(doctype=d, name=n)\n",
+			),
+		}
+		for name, (rel, source) in generic.items():
+			with self.subTest(case=name):
+				self.assertCaught(check_tool_never_saves_proposal({rel: source}), rel, "deny")
+
+	def test_tool_inserting_a_proposal_clean(self):
+		clean = {
+			PROPOSE_TOOL_FILE: "d = frappe.get_doc({'doctype': PROPOSAL_DOCTYPE, 'reason': r})\nd.insert()\n",
+			# Other DocTypes in tools keep their own rules.
+			"agent/tools/write_ticket.py": "doc = frappe.get_doc('HD Ticket', n)\ndoc.save()\n",
+			"agent/tools/route_ticket.py": "doc = frappe.get_doc(TICKET_DOCTYPE, ctx.ticket_name)\ndoc.save()\n",
+			# A tool saving or deleting any DocType keeps the proposal in every deny set (ADR-011).
+			"agent/tools/site_api.py": (
+				"DENIED_DOCTYPES = (read.DENIED_DOCTYPES - {'User'}) | {PROPOSAL_DOCTYPE, 'Custom Role'}\n"
+				"ALWAYS_DENIED_DOCTYPES = frozenset({SETTING_DOCTYPE, PROPOSAL_DOCTYPE})\n"
+				"doc = frappe.get_doc(doctype, name)\ndoc.save()\nfrappe.delete_doc(doctype, name)\n"
+			),
+			# A generic loader that never saves or deletes needs no deny set.
+			"agent/tools/read.py": "doc = frappe.get_doc(doctype, name)\nreturn doc.as_dict()\n",
+			"agent/tools/cleanup.py": "DENIED_DOCTYPES = {'ERP AI Change Proposal'}\nfrappe.delete_doc(doctype, name)\n",
+			# Outside agent/tools/ the state machine writes the proposal (ADR-012).
+			"agent/changes/transitions.py": "frappe.db.set_value(PROPOSAL_DOCTYPE, name, values)\n",
+		}
+		self.assertEqual(check_tool_never_saves_proposal(clean), [])
 
 
 if __name__ == "__main__":

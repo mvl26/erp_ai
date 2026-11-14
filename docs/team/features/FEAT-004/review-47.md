@@ -9,8 +9,9 @@ Approved-by:
 
 - Diff: `git diff 7c2a3af..485f09c` (nhánh `team/FEAT-004-task-47`; 1 commit; 2 file, +562/-76)
 - Lệnh đã dùng: `git log --oneline 7c2a3af..team/FEAT-004-task-47`, `git diff --stat 7c2a3af..team/FEAT-004-task-47`, `git diff 7c2a3af..team/FEAT-004-task-47 -- <file>`, `git show 485f09c:<file>`, `git grep -n ... 485f09c`, `git log -1 --format=... 485f09c`
-- Vòng: 1
-- Verdict: request-changes
+- Diff vòng 2: `git diff 485f09c..4359e7d` (1 commit; 1 file, +19/-1)
+- Vòng: 2
+- Verdict: approve (vòng 1: request-changes)
 
 ## Vòng 1 — request-changes
 Lớp 1: khớp design 4.4 bước 4, 6 và `design-addendum-3.md` QĐ-B2 mục 1–4, QĐ-B5 phía hoàn tác. `apply_job.py:510-520`: `read_git_state.refusal` → `Lỗi`, rồi `git_is_ancestor` (`None` → `GIT_ERROR`, `False` → `GIT_NOT_ANCESTOR`) trước mọi lần ghi; không kiểm "nhánh trùng" (ADR-022 QĐ 6). Commit hoàn tác lỗi dùng lại `_commit_landed` (HEAD không đổi → trả lại so với `old_head`; commit của người → so với `head_now`; HEAD không đọc được hoặc tóm tắt không đọc được → `GIT_ERROR`, không trả lại); cờ `committed`; kiểm sau với `state.branch`; `_fail_after_commit`/`_give_back_after_crash` dùng chung qua tham số `action`, `record`, `give_back`. `result` không còn được truyền vào `_Stop` nên đầu ra git không vào `command_output` (design 3.5). Các test Expect đều có (`test_undo_postcheck_unreadable_keeps_commit_and_fails` đã có sẵn từ T20, `test_apply_job.py:1785`). Mọi điểm "Ghi cho dev T47" đã xử lý. Không ngoài touchpoint.
@@ -47,3 +48,33 @@ minor | — | — | 1 điểm nhỏ: subTest "commit times out" của `test_undo
 ## deferred
 - `_recheck` (`apply_job.py:215`): đề xuất lệnh ở nhánh hoàn tác vẫn đọc `settings` chưa gán; hiện được chặn bởi `request_undo` (test mới `test_request_undo_refuses_a_command_proposal`). Ngoài phạm vi T47.
 - Nhánh hoàn tác file mới khi `os.path.lexists(full)` vẫn đúng sau `remove_created` → `WRITE_MISMATCH` không gọi trả lại/kiểm HEAD (mã cũ, không đổi trong diff).
+
+## Vòng 2 — approve
+- Lệnh đã dùng: `git log --oneline 485f09c..team/FEAT-004-task-47`, `git diff --stat 485f09c..team/FEAT-004-task-47`, `git diff 485f09c..team/FEAT-004-task-47`, `git log -1 --format='%an <%ae>%n%B' 4359e7d`, `git rev-parse team/FEAT-004-task-47` (= `4359e7d`).
+- Chỉ xét diff sửa: 1 commit `test(changes): lock the argument order of the undo ancestor check with a human commit after apply (FEAT-004)`, chỉ đụng `erp_ai/agent/changes/test_apply_job.py`; không đổi mã sản phẩm.
+
+| Phát hiện vòng 1 | Trạng thái | Bằng chứng |
+|---|---|---|
+| major STD-TEST-8 — thứ tự đối số `git_is_ancestor(repo, apply_commit_sha, old_head)` không được ghim | ADDRESSED | `test_apply_job.py:1901-1915` test mới `test_undo_accepted_after_a_human_commit_on_the_same_branch` (cả 2 KINDS): commit tay trên cùng nhánh sau áp dụng → `Đã hoàn tác`, `HEAD~1` = commit tay, `HEAD~2` = commit áp dụng. Commit áp dụng là tổ tiên của HEAD nhưng không ngược lại, nên đảo đối số → `False` → `GIT_NOT_ANCESTOR` → đỏ. `test_apply_job.py:1920,1933`: test `None` dựng HEAD ≠ commit áp dụng và khẳng định `args[1:] == (apply_commit, human_head)` — hai giá trị khác nhau, đúng thứ tự. RED của dev khớp: đảo đối số → `FAILED (failures=3)` (2 subTest + "Tuples differ" ở test mock). |
+
+Lớp 1: đúng phần sửa đã yêu cầu (AC-20, ADR-022 QĐ 6), không thừa, trong touchpoint.
+
+### Review checklist (10) — vòng 2
+1. Đúng và đủ phần sửa, không thừa — đạt (STD-DESIGN-5, STD-TEST-2).
+2. Chỉ sửa file test đã có trong touchpoint; không file mới — đạt (STD-DESIGN-1, STD-STRUCT-1).
+3. RED có (đảo đối số có chủ đích → 3 failures); phủ đường "người commit sau áp dụng"; không skip/xfail — đạt (STD-TEST-1, STD-TEST-8, STD-TEST-4).
+4. Assertion `(apply_commit, apply_commit)` đổi thành `(apply_commit, human_head)` vì dựng thêm commit tay, không phải để khớp hành vi sai; test mới dùng sandbox mỗi subTest — đạt (STD-TEST-5, STD-TEST-6).
+5. Không đổi mã xử lý lỗi — không áp dụng/đạt (STD-ERR-1).
+6. Không bí mật; email trong commit tay là của sandbox — đạt (STD-SEC-1, STD-SEC-6).
+7. Không đổi hợp đồng — đạt (STD-DESIGN-3).
+8. Tên test nêu rõ hành vi; chú thích đúng nội dung; style theo file — đạt (STD-NAME-2, STD-STYLE-4, STD-STYLE-5).
+9. Không phụ thuộc mới — đạt (STD-DEP-1).
+10. Commit `test(changes): ... (FEAT-004)`, nhánh `team/FEAT-004-task-47`, không trailer AI — đạt (STD-NAME-4, STD-NAME-5, STD-GIT-8).
+
+### Bằng chứng của dev (vòng 2)
+- RED: đảo hai đối số có chủ đích → `FAILED (failures=3)`; `('Lỗi', 'commit áp dụng không còn nằm trong lịch sử nhánh đang checkout') != ('Đã hoàn tác', None)` cho cả 2 KINDS; test mock "Tuples differ" với hai sha sai thứ tự.
+- GREEN: cả module `Ran 96 tests`, 14 errors đều `QueryDeadlockError` (site dùng chung); chạy lại 14 test theo tên `Ran 14 tests ... OK`.
+- Reviewer không chạy test. Tech-lead nên chạy `cmd.test` toàn app sau merge để xác nhận 14 deadlock là do site dùng chung, không do test.
+
+### deferred (vòng 2)
+- Không có điểm mới. Minor vòng 1 (subTest "commit times out" có `output=""`) giữ nguyên, tùy dev.

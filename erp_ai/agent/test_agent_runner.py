@@ -1,3 +1,6 @@
+import ast
+import copy
+import inspect
 import json
 import os
 import subprocess
@@ -1602,6 +1605,207 @@ class TestRunnerRecordToolValues(RunnerTestBase):
 		self.assertIn("value_after", action)
 		self.assertEqual(action["value_before"]["first_name"], "Bí mật")
 		self.assertEqual((entry.actions.count(FAKE_PASSWORD), entry.actions.count(FAKE_API_SECRET)), (0, 0))
+
+
+SNAPSHOT_USER = "runner.snapshot@example.com"
+SNAPSHOT_ROLES = ["Blogger", "Knowledge Base Editor"]
+SNAPSHOT_MARK = "RUNNER-SNAPSHOT-MARK-7e2d"
+SNAPSHOT_KEY = "_snapshot"
+
+
+class TestRunnerRecordSnapshots(RunnerTestBase):
+	"""AC-13 (c), (d): each successful generic record call keeps its full before/after under `<tool>#<n>`."""
+
+	def setUp(self):
+		super().setUp()
+		set_agent_settings(
+			permission_level="L3", code_change_enabled=1, unrestricted_enabled=0, monthly_budget_usd=1000
+		)
+		make_instructor(self)
+
+	def _note(self, title):
+		return frappe.get_doc({"doctype": "Note", "title": title, "public": 1}).insert().name
+
+	def _run_turn(self, *blocks, execute=None):
+		"""One model turn calling `blocks`, then a final answer; returns the reason entry that holds the actions."""
+		frappe.db.delete(LOG_DOCTYPE, {"ticket": self.ticket.name})
+		self.gateway.calls.clear()
+		self.gateway.results = [tool_turn(*blocks), make_model_result()]
+		with (
+			patch.object(authority, "latest_instructor", return_value=INSTRUCTOR),
+			patch.object(runner, "execute_tool", side_effect=execute or runner.execute_tool),
+		):
+			self._run("comment_mention")
+		(entry,) = [row for row in self._entries(entry_type="reason") if row.actions]
+		return entry
+
+	def test_generic_write_tools_derived_from_write_tool_targets(self):
+		self.assertEqual(
+			sorted(runner.GENERIC_WRITE_TOOLS),
+			["api_create_record", "api_delete_record", "api_submit_record", "api_update_record"],
+		)
+		(assignment,) = [
+			node
+			for node in ast.walk(ast.parse(inspect.getsource(runner)))
+			if isinstance(node, ast.Assign)
+			and any(getattr(target, "id", None) == "GENERIC_WRITE_TOOLS" for target in node.targets)
+		]
+		names = {node.id for node in ast.walk(assignment.value) if isinstance(node, ast.Name)}
+		literals = [
+			node.value
+			for node in ast.walk(assignment.value)
+			if isinstance(node, ast.Constant) and isinstance(node.value, str)
+		]
+		self.assertIn("WRITE_TOOL_TARGETS", names)
+		self.assertEqual(literals, [], "GENERIC_WRITE_TOOLS must not name a tool by hand")
+
+	def test_record_snapshot_keys_by_position_and_always_drops_snapshot(self):
+		snapshot = {"before": {"name": "n1", "title": SNAPSHOT_MARK}, "after": {"name": "n1", "title": "sau"}}
+		before, after = {}, {}
+		outcome = {"ok": True, SNAPSHOT_KEY: copy.deepcopy(snapshot)}
+		runner._record_snapshot("api_delete_record", outcome, 3, before, after)
+		self.assertEqual(outcome, {"ok": True})
+		self.assertEqual(before, {"api_delete_record#3": snapshot["before"]})
+		self.assertEqual(after, {"api_delete_record#3": snapshot["after"]})
+
+		for name, ok in (("api_call_method", True), ("post_comment", True), ("set_classification", False)):
+			with self.subTest(name):
+				outcome = {"ok": ok, SNAPSHOT_KEY: copy.deepcopy(snapshot)}
+				runner._record_snapshot(name, outcome, 4, before, after)
+				self.assertEqual(outcome, {"ok": ok})
+				self.assertEqual(list(before), ["api_delete_record#3"])
+				self.assertEqual(list(after), ["api_delete_record#3"])
+
+		runner._record_snapshot("api_update_record", {"ok": False, "reason": "r"}, 5, before, after)
+		self.assertEqual(list(before), ["api_delete_record#3"])
+
+	def test_create_user_snapshot_lists_both_roles(self):
+		entry = self._run_turn(
+			tool_use(
+				"toolu_1",
+				"api_create_record",
+				doctype="User",
+				values={
+					"email": SNAPSHOT_USER,
+					"first_name": "Ảnh chụp",
+					"send_welcome_email": 0,
+					"roles": [{"role": role} for role in SNAPSHOT_ROLES],
+				},
+			)
+		)
+
+		(action,) = json.loads(entry.actions)
+		self.assertTrue(action["ok"], action)
+		self.assertEqual(action["name"], SNAPSHOT_USER)
+		self.assertEqual(json.loads(entry.value_before), {"api_create_record#1": None})
+		value_after = json.loads(entry.value_after)
+		self.assertEqual(list(value_after), ["api_create_record#1"])
+		snapshot = value_after["api_create_record#1"]
+		self.assertEqual(sorted(snapshot), ["name", "roles"])
+		self.assertEqual(snapshot["name"], SNAPSHOT_USER)
+		self.assertEqual([row["role"] for row in snapshot["roles"]], SNAPSHOT_ROLES)
+
+	def test_two_calls_same_tool_one_turn_two_snapshots(self):
+		old_first, old_second = f"{PREFIX}snapshot one", f"{PREFIX}snapshot two"
+		new_first, new_second = f"{PREFIX}snapshot one new", f"{PREFIX}snapshot two new"
+		first, second = self._note(old_first), self._note(old_second)
+		entry = self._run_turn(
+			tool_use("toolu_1", "api_update_record", doctype="Note", name=first, values={"title": new_first}),
+			tool_use(
+				"toolu_2", "api_update_record", doctype="Note", name=second, values={"title": new_second}
+			),
+		)
+
+		self.assertEqual([action["ok"] for action in json.loads(entry.actions)], [True, True])
+		self.assertEqual(
+			json.loads(entry.value_before),
+			{
+				"api_update_record#1": {"name": first, "title": old_first},
+				"api_update_record#2": {"name": second, "title": old_second},
+			},
+		)
+		self.assertEqual(
+			json.loads(entry.value_after),
+			{
+				"api_update_record#1": {"name": first, "title": new_first},
+				"api_update_record#2": {"name": second, "title": new_second},
+			},
+		)
+
+		# A refused first call still takes position 1; only the second call's pair is kept, under #2.
+		newest = f"{PREFIX}snapshot two newest"
+		entry = self._run_turn(
+			tool_use(
+				"toolu_1", "api_update_record", doctype="Note", name=f"{PREFIX}missing", values={"title": "x"}
+			),
+			tool_use("toolu_2", "api_update_record", doctype="Note", name=second, values={"title": newest}),
+		)
+		self.assertEqual([action["ok"] for action in json.loads(entry.actions)], [False, True])
+		self.assertEqual(
+			json.loads(entry.value_before), {"api_update_record#2": {"name": second, "title": new_second}}
+		)
+		self.assertEqual(
+			json.loads(entry.value_after), {"api_update_record#2": {"name": second, "title": newest}}
+		)
+
+	def test_position_counts_every_action_not_only_the_same_tool(self):
+		old_title, new_title = f"{PREFIX}snapshot after comment", f"{PREFIX}snapshot after comment new"
+		note = self._note(old_title)
+		execute_tool = runner.execute_tool
+
+		def execute(name, arguments, context):
+			if name == "post_comment":
+				return {"ok": True, "comment": "c1"}
+			return execute_tool(name, arguments, context)
+
+		entry = self._run_turn(
+			tool_use("toolu_1", "post_comment", content="xin chào"),
+			tool_use("toolu_2", "api_update_record", doctype="Note", name=note, values={"title": new_title}),
+			execute=execute,
+		)
+
+		self.assertEqual(
+			[(action["tool"], action["ok"]) for action in json.loads(entry.actions)],
+			[("post_comment", True), ("api_update_record", True)],
+		)
+		self.assertEqual(
+			json.loads(entry.value_before), {"api_update_record#2": {"name": note, "title": old_title}}
+		)
+		self.assertEqual(
+			json.loads(entry.value_after), {"api_update_record#2": {"name": note, "title": new_title}}
+		)
+
+	def test_snapshot_never_reaches_model(self):
+		planted = {"before": {"name": "n1", "title": SNAPSHOT_MARK}, "after": None}
+		results = {
+			"api_update_record": {
+				"ok": True,
+				"doctype": "Note",
+				"name": "n1",
+				"value_before": None,
+				"value_after": None,
+				SNAPSHOT_KEY: planted,
+			},
+			"api_create_record": {"ok": False, "reason": "bị từ chối", SNAPSHOT_KEY: planted},
+			"api_call_method": {"ok": True, "method": "frappe.ping", "result": 1, SNAPSHOT_KEY: planted},
+			"post_comment": {"ok": True, "comment": "c1", SNAPSHOT_KEY: planted},
+		}
+		entry = self._run_turn(
+			tool_use("toolu_1", "api_update_record", doctype="Note", name="n1", values={"title": "x"}),
+			tool_use("toolu_2", "api_create_record", doctype="Note", values={"title": "x"}),
+			tool_use("toolu_3", "api_call_method", method="frappe.ping", arguments={}),
+			tool_use("toolu_4", "post_comment", content="xin chào"),
+			execute=lambda name, args, ctx: copy.deepcopy(results[name]),
+		)
+
+		tool_results = self.gateway.calls[1]["messages"][-1]["content"]
+		self.assertEqual(
+			[block["tool_use_id"] for block in tool_results], ["toolu_1", "toolu_2", "toolu_3", "toolu_4"]
+		)
+		for block in tool_results:
+			self.assertEqual(block["content"].count(SNAPSHOT_KEY), 0, block)
+			self.assertEqual(block["content"].count(SNAPSHOT_MARK), 0, block)
+		self.assertEqual(json.loads(entry.value_before)["api_update_record#1"], planted["before"])
 
 
 # Hand-written: the tools a run with an instructor gets when no change group is granted (FEAT-001/006 set).

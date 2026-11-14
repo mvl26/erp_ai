@@ -23,7 +23,7 @@ VIETNAMESE_ACCENTS = re.compile(
 DOCTYPE_CONFIG = {
 	"ERP AI Setting": {
 		"folder": "erp_ai_setting",
-		"field_count": 72,
+		"field_count": 76,
 		"phrases": {
 			"enabled": ("Tắt", "4 đơn giá", "từ khóa kích hoạt"),
 			"permission_level": ("L0", "L1", "L2", "L3", "ngân sách"),
@@ -157,13 +157,24 @@ DOCTYPE_CONFIG = {
 			"kpi_targets": ("JSON", "gd2", "gd4", "không lưu được"),
 			"daily_report_sent_on": ("Hệ thống tự ghi", "không sửa được"),
 			"budget_alert_sent_month": ("Hệ thống tự ghi", "không sửa được"),
+			# FEAT-007 design.md:182-183: section_prompts (AC-38).
+			**{
+				fieldname: ("Để trống", "bắt buộc", "20000", "không bị ghi đè")
+				for fieldname in (
+					"prompt_override_classify",
+					"prompt_override_reasoning",
+					"prompt_override_category_guide",
+				)
+			},
+			"prompt_revisions": ("Hệ thống tự ghi", "Không sửa được"),
 		},
-		"section_count": 13,
+		"section_count": 14,
 		"read_only_fields": (
 			"spent_this_month_usd",
 			"agent_enabled_at",
 			"daily_report_sent_on",
 			"budget_alert_sent_month",
+			"prompt_revisions",
 		),
 		"sections": (
 			("section_activation", "Bật và mức quyền", "enabled"),
@@ -178,6 +189,7 @@ DOCTYPE_CONFIG = {
 			("section_code_change", "Sửa code và lệnh bench", "code_change_apps"),
 			("section_knowledge", "Trả lời, đóng phiếu và tri thức", "reply_enabled"),
 			("section_operations", "Báo cáo và vận hành", "coo_report_recipients"),
+			("section_prompts", "Ghi đè prompt", "prompt_override_classify"),
 			("section_alerts", "Cảnh báo và khóa API", "alert_recipients"),
 		),
 	},
@@ -253,6 +265,24 @@ DOCTYPE_CONFIG = {
 		"sections": (
 			("section_template", "Mẫu và vai trò", "template_name"),
 			("section_note", "Ghi chú", "note"),
+		),
+	},
+	# FEAT-007 design.md:227, D-3: one prompt override change (child of ERP AI Setting, AC-38), system-written.
+	"ERP AI Prompt Revision": {
+		"folder": "erp_ai_prompt_revision",
+		"field_count": 5,
+		"phrases": {
+			"part": ("Hệ thống tự ghi", "classify", "reasoning", "category_guide"),
+			"changed_by": ("Hệ thống tự ghi", "người"),
+			"changed_at": ("Hệ thống tự ghi", "thời điểm"),
+			"old_value": ("Hệ thống tự ghi", "giá trị cũ", "bản dựng sẵn"),
+			"new_length": ("Hệ thống tự ghi", "ký tự"),
+		},
+		"section_count": 2,
+		"read_only_fields": ("part", "changed_by", "changed_at", "old_value", "new_length"),
+		"sections": (
+			("section_change", "Lần sửa", "part"),
+			("section_value", "Giá trị cũ", "old_value"),
 		),
 	},
 	"ERP AI Log": {
@@ -594,10 +624,10 @@ class TestDoctypeDescriptions(FrappeTestCase):
 		# FEAT-007 design.md:98, 106 (NFR-8): the switch moved to section_permissions; the block keeps the app list.
 		# design.md:104-106: section_ticket_fields (AC-24) sits between section_routing and section_code_change.
 		# design.md:107 (row 11 after row 10): section_knowledge follows the code-change block.
-		# design.md:108 (row 12 after row 11): section_operations follows section_knowledge; row 13 is not built
-		# yet, so section_alerts (row 14) comes right after it.
+		# design.md:108 (row 12 after row 11): section_operations follows section_knowledge; design.md:109-110:
+		# section_prompts (row 13) follows it, then section_alerts (row 14).
 		self.assertEqual(
-			order[start : start + 36],
+			order[start : start + 41],
 			[
 				"prompt_digest",
 				"section_ticket_fields",
@@ -634,6 +664,11 @@ class TestDoctypeDescriptions(FrappeTestCase):
 				"kpi_targets",
 				"daily_report_sent_on",
 				"budget_alert_sent_month",
+				"section_prompts",
+				"prompt_override_classify",
+				"prompt_override_reasoning",
+				"prompt_override_category_guide",
+				"prompt_revisions",
 				"section_alerts",
 			],
 		)

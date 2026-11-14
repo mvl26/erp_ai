@@ -117,6 +117,38 @@ class TestKbSearch(KnowledgeCase):
 		# NFC + casefold: a decomposed, upper-case query finds the same article
 		self.assertEqual(self._names(unicodedata.normalize("NFD", f"MÃ{suffix.upper()}")), [accented])
 
+	def test_html_blocks_do_not_glue_words(self):
+		suffix = frappe.generate_hash(length=10).lower()
+		end, start = f"in{suffix}", f"mã{suffix}"
+		li_end, li_start = _word("li"), _word("li")
+		br_end, br_start = _word("br"), _word("br")
+		blocks = self._article(f"<p>Lỗi {end}</p><p>{start.upper()} hàng</p>")
+		items = self._article(f"<ul><li>{li_end}</li><li>{li_start}</li></ul>")
+		line_break = self._article(f"<p>{br_end}<br>{br_start}</p>")
+
+		# word at the end of one block, word at the start of the next
+		self.assertEqual(self._names(end), [blocks])
+		self.assertEqual(self._names(start), [blocks])
+		self.assertEqual(self._names(f"{li_end} {li_start}"), [items])
+		self.assertEqual(self._names(f"{br_start} {br_end}"), [line_break])
+		[row] = knowledge.search_kb_articles(start, 5)
+		self.assertNotIn(f"{end}{start.upper()}", row["excerpt"])
+		self.assertIn(end, row["excerpt"])
+		self.assertIn(start.upper(), row["excerpt"])
+
+	def test_less_than_as_text_or_entity_keeps_words(self):
+		typed_before, typed_after = _word("lt"), _word("lt")
+		entity_before, entity_after = _word("lt"), _word("lt")
+		typed = self._article(f"<p>{typed_before} < 5 {typed_after}</p>")
+		entity = self._article(f"<p>{entity_before}&lt;{entity_after}&gt;</p>")
+
+		self.assertEqual(self._names(typed_before), [typed])
+		self.assertEqual(self._names(typed_after), [typed])
+		self.assertEqual(self._names(f"{entity_before} {entity_after}"), [entity])
+		# the editor stores a typed `<` as `&lt;`: the words on both sides stay apart in the excerpt
+		[row] = knowledge.search_kb_articles(typed_after, 5)
+		self.assertIn(f"{typed_before} &lt; 5 {typed_after}", row["excerpt"])
+
 	def test_whole_word_only(self):
 		word = _word()
 		self._article(f"<p>{word}xyz</p>")

@@ -50,8 +50,9 @@ def search_kb_articles(query: str, limit: int) -> list[dict]:
 	)
 	ranked = []
 	for row in rows:
-		# One space keeps the last title word and the first content word apart.
-		text = f"{row.title or ''} {strip_html(row.content or '')}"
+		# One space keeps the last title word and the first content word apart; a space before each tag
+		# keeps the last word of one HTML block and the first word of the next apart.
+		text = f"{row.title or ''} {strip_html((row.content or '').replace('<', ' <'))}"
 		matched = set(words) & set(_words(text))
 		if matched:
 			in_title = len(matched & set(_words(row.title)))

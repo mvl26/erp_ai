@@ -2305,6 +2305,24 @@ class TestPromptOverrides(FrappeTestCase):
 		self.assertEqual(type(doc).__bases__, (Document,))
 		self.assertEqual([name for name in vars(type(doc)) if not name.startswith("__")], [])
 
+	def test_prompt_revision_keeps_old_value_verbatim(self):
+		# AC-38: the history holds the real old override; "<...>" and "&" must not be escaped or stripped on save.
+		old_value = prompts.CLASSIFY_PROMPT
+		self.assertIn("<", old_value)
+		self.assertIn("&", old_value)
+		doc = frappe.get_doc(SETTING_DOCTYPE)
+		doc.append(
+			"prompt_revisions",
+			{"part": "classify", "changed_by": "Administrator", "old_value": old_value, "new_length": 0},
+		)
+		doc.save()
+		stored = frappe.get_all(
+			PROMPT_REVISION_DOCTYPE,
+			filters={"parent": SETTING_DOCTYPE, "parentfield": "prompt_revisions"},
+			pluck="old_value",
+		)
+		self.assertEqual(stored, [old_value])
+
 	def test_required_markers_match_design(self):
 		# design.md:314-316 and the plan.md risk row: classify holds exactly the 11 keys ("do_tin_cay_pct" is U1's).
 		self.assertEqual(getattr(erp_ai_setting, "PROMPT_OVERRIDE_MAX_CHARS", None), PROMPT_MAX_CHARS)

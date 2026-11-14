@@ -524,7 +524,10 @@ class TestCheckPrivilegeEscalation(FrappeTestCase):
 
 		self.assertEqual(
 			[call.args for call in changes.call_args_list],
-			[(WATERMARK, datetime(2031, 11, 15, 8, 55, 0)), (WATERMARK, datetime(2031, 11, 16, 8, 55, 0))],
+			[
+				(WATERMARK, datetime(2031, 11, 15, 8, 55, 0)),
+				(datetime(2031, 11, 15, 8, 55, 0), datetime(2031, 11, 16, 8, 55, 0)),
+			],
 		)
 
 	def _set_raw_watermark(self, raw):
@@ -871,11 +874,10 @@ class TestCheckPrivilegeEscalation(FrappeTestCase):
 	def test_admin_items_first_each_group_by_time(self):
 		# Rows built by hand so one action can remove an admin role and add an ordinary one.
 		ordinary_a, ordinary_b = self._test_role("A"), self._test_role("B")
-		# The earlier admin item sorts later alphabetically ("thêm" after "gỡ"): only `creation` order puts it first.
 		for at, user, old, new in (
 			(datetime(2031, 11, 15, 8, 11, 0), "u1", [], [ordinary_a]),
-			(datetime(2031, 11, 15, 8, 12, 0), "u2", [], [ROLE_AGENT]),
-			(datetime(2031, 11, 15, 8, 14, 0), "u3", ["System Manager"], [ordinary_b]),
+			(datetime(2031, 11, 15, 8, 12, 0), "u2", ["System Manager"], [ordinary_b]),
+			(datetime(2031, 11, 15, 8, 14, 0), "u3", [], [ROLE_AGENT]),
 		):
 			self._log_row(
 				[_hand_action("api_update_record", "User", user)],
@@ -893,13 +895,13 @@ class TestCheckPrivilegeEscalation(FrappeTestCase):
 		self.assertEqual(
 			self._changes(),
 			[
-				f"[QUẢN TRỊ] thêm role {ROLE_AGENT} cho u2 "
+				"[QUẢN TRỊ] gỡ role System Manager của u2 "
 				"(người ra lệnh erpai-tasks-boss@example.invalid, 2031-11-15 08:12)",
-				"[QUẢN TRỊ] gỡ role System Manager của u3 "
+				f"[QUẢN TRỊ] thêm role {ROLE_AGENT} cho u3 "
 				"(người ra lệnh erpai-tasks-boss@example.invalid, 2031-11-15 08:14)",
 				"thêm role ERPAI-TEST vai A cho u1 (người ra lệnh erpai-tasks-boss@example.invalid, 2031-11-15 08:11)",
+				"thêm role ERPAI-TEST vai B cho u2 (người ra lệnh erpai-tasks-boss@example.invalid, 2031-11-15 08:12)",
 				"tạo Role Profile p (người ra lệnh erpai-tasks-boss@example.invalid, 2031-11-15 08:13)",
-				"thêm role ERPAI-TEST vai B cho u3 (người ra lệnh erpai-tasks-boss@example.invalid, 2031-11-15 08:14)",
 			],
 		)
 

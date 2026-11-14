@@ -16,10 +16,18 @@ def check_article_write(doc, method):
 	"""`validate`: under the agent account, only a `Draft` the bot itself created may be saved."""
 	if frappe.session.user != AGENT_USER:
 		return
-	if not doc.is_new() and doc.owner != AGENT_USER:
+	if not doc.is_new() and _stored_owner(doc) != AGENT_USER:
 		frappe.throw(NOT_OWN, frappe.PermissionError)
 	if doc.status != "Draft":
 		frappe.throw(DRAFT_ONLY, frappe.PermissionError)
+
+
+def _stored_owner(doc):
+	"""The owner saved in the database, never the in-memory value the caller sent."""
+	before = doc.get_doc_before_save()
+	if before:
+		return before.owner
+	return frappe.db.get_value(doc.doctype, doc.name, "owner")
 
 
 def check_article_delete(doc, method):

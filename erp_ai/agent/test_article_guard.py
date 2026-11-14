@@ -100,6 +100,28 @@ class TestArticleGuard(FrappeTestCase):
 		self.assertRefused(NOT_OWN, doc.save)
 		self.assertEqual(self._stored(human_published.name), "Published")
 
+	def test_agent_spoofed_owner_refused(self):
+		human_draft = self._article(self.human)
+		human_published = self._article(self.human, "Published")
+		frappe.set_user(AGENT_USER)
+
+		# the owner the caller sends is not trusted: the stored owner decides
+		doc = frappe.get_doc("HD Article", human_draft.name)
+		doc.owner = AGENT_USER
+		doc.title = f"{doc.title} bot sửa"
+		self.assertRefused(NOT_OWN, doc.save)
+		self.assertEqual(self._stored(human_draft.name, "owner"), self.human)
+		self.assertEqual(self._stored(human_draft.name, "title"), human_draft.title)
+
+		# nor can a spoofed owner pull a human's published article back to draft
+		doc = frappe.get_doc("HD Article", human_published.name)
+		doc.owner = AGENT_USER
+		doc.status = "Draft"
+		doc.flags.ignore_permissions = True
+		self.assertRefused(NOT_OWN, doc.save)
+		self.assertEqual(self._stored(human_published.name, "owner"), self.human)
+		self.assertEqual(self._stored(human_published.name), "Published")
+
 	def test_agent_delete_refused(self):
 		own = self._article(AGENT_USER)
 		human_draft = self._article(self.human)

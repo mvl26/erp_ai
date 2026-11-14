@@ -53,9 +53,12 @@ def auto_assign_enabled(settings) -> bool:
 	return bool(getattr(settings, "auto_assign_enabled", 0))
 
 
+UNRESTRICTED_FIELD = "unrestricted_enabled"
+
+
 def unrestricted_enabled(settings) -> bool:
 	"""The only reader of the unrestricted switch; missing or 0 means off."""
-	return bool(getattr(settings, "unrestricted_enabled", 0))
+	return bool(getattr(settings, UNRESTRICTED_FIELD, 0))
 
 
 def contains_keyword(content) -> bool:
@@ -132,6 +135,39 @@ def current_change_settings() -> ChangeSettings:
 		frappe._dict(
 			{field: frappe.db.get_single_value(SETTING_DOCTYPE, field, cache=False) for field in fields}
 		)
+	)
+
+
+RECORD_TOOLS_FIELD = "record_tools_enabled"
+ACT_NOW_FIELD = "act_now_enabled"
+ONE_CLICK_APPROVAL_FIELD = "one_click_approval_enabled"
+# The five permission switches in the spec's order (1)..(5).
+PERMISSION_SWITCH_FIELDS = (
+	UNRESTRICTED_FIELD,
+	RECORD_TOOLS_FIELD,
+	ACT_NOW_FIELD,
+	CODE_CHANGE_ENABLED_FIELD,
+	ONE_CLICK_APPROVAL_FIELD,
+)
+
+
+@dataclass(frozen=True)
+class PermissionSwitches:
+	unrestricted: bool = False  # (1)
+	record_tools: bool = False  # (2)
+	act_now: bool = False  # (3)
+	code_change: bool = False  # (4)
+	one_click_approval: bool = False  # (5)
+
+
+def permission_switches(settings) -> PermissionSwitches:
+	"""The only reader of the five permission switches; a missing field (before migrate) means off."""
+	return PermissionSwitches(
+		unrestricted=unrestricted_enabled(settings),
+		record_tools=bool(getattr(settings, RECORD_TOOLS_FIELD, 0)),
+		act_now=bool(getattr(settings, ACT_NOW_FIELD, 0)),
+		code_change=change_settings(settings).enabled,
+		one_click_approval=bool(getattr(settings, ONE_CLICK_APPROVAL_FIELD, 0)),
 	)
 
 

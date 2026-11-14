@@ -40,6 +40,10 @@ DOCTYPE_CONFIG = {
 				"L3: mức của công cụ bản ghi chung",
 				"tự hạ về L1",
 				"Mức thực tế của từng phiếu",
+				"đọc dữ liệu",
+				"không ghi gì lên phiếu",
+				"Từ L2: ghi ERP ngoài phiếu",
+				"(L0 giữ nguyên)",
 			),
 			# FEAT-007 design.md:182: the AC-16 watermark of section_activation.
 			"agent_enabled_at": ("Hệ thống tự ghi", "không sửa được"),

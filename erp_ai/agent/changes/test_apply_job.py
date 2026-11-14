@@ -762,12 +762,70 @@ class TestCommitFailure(ApplyJobTestCase):
 	def test_long_git_output_gives_a_short_reason(self):
 		self.fresh_repo()
 		name = self.proposal_for("changed file")
-		output = "dòng đầu\n" + "e" * 300 + "\n"
+		# Ordinary words: a 300-letter run would be masked as key-like (design addendum 4 QĐ-D1).
+		output = "dòng đầu\n" + "lỗi " * 80 + "\n"
 
 		with patch.object(process_runner, "git_commit_only", return_value=self.failed(output=output)):
 			apply_job.run_change(name, "apply")
 
-		self.assertEqual(self.stored(name).failure_reason, f"{GIT_COMMIT_FAILED_TEXT}: {'e' * 120}")
+		expected = " ".join(["lỗi"] * 80)[:120]
+		self.assertEqual(self.stored(name).failure_reason, f"{GIT_COMMIT_FAILED_TEXT}: {expected}")
+
+	def test_git_short_line_masks_paths_urls_emails_and_key_like_words(self):
+		# NFR-8, AC-13, design addendum 4 QĐ-D1: no path, URL, email, key=value, `~` path or key reaches the store.
+		key = "Ab3dEf6hIj9lMn2pQr5tUv8xYz1bCd4fGh7jKl0n"
+		self.assertEqual(len(key), 40)
+		cases = (
+			(
+				"fatal: Unable to create '/home/u/bench/apps/x/.git/index.lock': File exists.",
+				("/home/u/bench/apps/x/.git/index.lock", "/home", "index.lock"),
+				("fatal:", "File exists."),
+			),
+			(
+				"https://x-token-FAKE@host/r.git",
+				("https://x-token-FAKE@host/r.git", "x-token-FAKE", "host"),
+				(),
+			),
+			("real.person@example.com", ("real.person@example.com", "example.com"), ()),
+			("token=abc", ("token=abc", "abc"), ()),
+			("~/x", ("~/x",), ()),
+			("C:\\x", ("C:\\x",), ()),
+			(key, (key,), ()),
+		)
+		for line, secrets, kept in cases:
+			with self.subTest(line):
+				short = apply_job._git_short_line(line)
+				for secret in secrets:
+					self.assertNotIn(secret, short)
+				self.assertIn("…", short)
+				for word in kept:
+					self.assertIn(word, short)
+
+	def test_git_short_line_masks_before_cut_and_drops_control_chars(self):
+		# Design addendum 4 QĐ-D1 steps (1) and (4): mask first, cut to 120 after.
+		prefix = ("lỗi " * 30)[:109] + " "
+		self.assertEqual(len(prefix), 110)
+		token = "Z9" * 20
+		short = apply_job._git_short_line(prefix + token + " lỗi" * 10)
+		self.assertNotIn("Z", short)
+		self.assertNotIn("9", short)
+		self.assertIn("…", short)
+		self.assertLessEqual(len(short), 120)
+		self.assertLessEqual(len(apply_job._git_short_line("lỗi " * 80)), 120)
+
+		self.assertEqual(apply_job._git_short_line("fatal:\x1b[31mlỗi\rđỏ\t\tcuối"), "fatal: [31mlỗi đỏ cuối")
+		self.assertEqual(apply_job._git_short_line("/a/b token=x ~/y"), "… … …")
+		for empty in ("", " \t ", "\x1b\x07\r"):
+			with self.subTest(repr(empty)):
+				self.assertEqual(apply_job._git_short_line(empty), "")
+
+		# An output whose last line is empty after cleaning gives only the sentence, without `: `.
+		name = self.proposal_for("changed file")
+		with patch.object(
+			process_runner, "git_commit_only", return_value=self.failed(output="fatal\n\x1b\x07\n")
+		):
+			apply_job.run_change(name, "apply")
+		self.assertEqual(self.stored(name).failure_reason, GIT_COMMIT_FAILED_TEXT)
 
 	def test_new_file_add_failure_removes_the_file(self):
 		start = self.fresh_repo()
@@ -2024,6 +2082,43 @@ class TestUndoCode(ApplyJobTestCase):
 					self.assertFalse(state.command_output)
 					self.assertEqual(self.steps(name), ["approve", "apply", "fail"])
 					self.assertNotIn("commit", self.log_row(name, "fail")[1] or {})
+
+	def test_commit_failed_reason_stores_no_path_or_secret(self):
+		# NFR-8, AC-13, design addendum 4 QĐ-D1 and QĐ-D2: the apply and the undo commit both store a clean line.
+		for action in ("apply", "undo"):
+			with self.subTest(action):
+				if action == "apply":
+					self.sandbox = GitSandbox(self)
+					self.sandbox.commit_file(APP, REL, BEFORE)
+					frappe.set_user(ACTOR)
+					name = self.approved(self.code_proposal())
+				else:
+					name, _ = self.fresh_undo()
+				repo = self.sandbox.repo(APP)
+				url = "https://x-token-FAKE@host/r.git"
+				email = "real.person@example.com"
+				line = f"fatal: {url} {email} {repo}/.git/index.lock"
+				output = f"dòng đầu\n{line}\n"
+				secrets = (repo, url, "x-token-FAKE", email)
+				# The leak check reads a store that would hold them: the stub output carries every one,
+				# inside the 120 characters an uncleaned reason keeps.
+				self.assertLessEqual(len(line), 120)
+				for secret in secrets:
+					self.assertIn(secret, output)
+
+				with patch.object(process_runner, "git_commit_only", return_value=self.failed(output=output)):
+					apply_job.run_change(name, action)
+
+				state = self.stored(name)
+				self.assertEqual(state.change_status, CHANGE_STATUS_FAILED)
+				self.assertTrue(state.failure_reason.startswith(f"{GIT_COMMIT_FAILED_TEXT}: fatal: "))
+				self.assertFalse(state.command_output)
+				errors = frappe.get_all(LOG_DOCTYPE, filters={"change_proposal": name}, pluck="error")
+				self.assertIn(state.failure_reason, errors)
+				for secret in secrets:
+					self.assertNotIn(secret, state.failure_reason)
+					for error in errors:
+						self.assertNotIn(secret, error or "")
 
 	def test_undo_restore_check_failing_reports_restore_failed(self):
 		real_head, real_state = source.git_head, source.read_git_state

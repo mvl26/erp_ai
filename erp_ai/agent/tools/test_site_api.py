@@ -841,6 +841,12 @@ class TestSiteApiUnrestricted(FrappeTestCase):
 			("frappe.client.get_list", {"doctype": "User", "fields": '["name", "*"]'}),
 			("frappe.client.get_list", {"doctype": "User", "fields": "name, *"}),
 			("frappe.client.get_value", {"doctype": "User", "filters": BOSS, "fieldname": "*", "as_dict": 0}),
+			("frappe.client.get_list", {"doctype": "User", "fields": '"*"', "as_dict": 0}),
+			(
+				"frappe.client.get_value",
+				{"doctype": "User", "filters": BOSS, "fieldname": '"*"', "as_dict": 0},
+			),
+			("frappe.client.get_list", {"doctype": "User", "args": [{"fields": ["*"]}]}),
 		):
 			with self.subTest(method=method, arguments=arguments), patch.object(frappe, "call") as called:
 				result = self.run_tool("api_call_method", {"method": method, "arguments": arguments})

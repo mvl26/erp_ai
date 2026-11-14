@@ -315,7 +315,13 @@ def _selects_every_column(value) -> bool:
 
 def _is_column_selector(value) -> bool:
 	if isinstance(value, str):
-		return any(COLUMN_SELECTOR_PATTERN.fullmatch(part) for part in value.split(","))
+		if any(COLUMN_SELECTOR_PATTERN.fullmatch(part) for part in value.split(",")):
+			return True
+		try:
+			loaded = json.loads(value)
+		except ValueError:
+			return False
+		return isinstance(loaded, str) and _is_column_selector(loaded)
 	if isinstance(value, list):
 		return any(_is_column_selector(item) for item in value)
 	return False

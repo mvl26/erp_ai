@@ -64,6 +64,10 @@ Tiến độ: BASE ghi ở đây trước mỗi lần gọi dev.
 - round 15: review lại T9 (`5e0f804..a743e35`) · review T6 (`c4338f8..d43ef0b`)
 - round 15 kết quả: review T9 vòng 2 approve (major ADDRESSED) · merge T9 `4cdb4f5` → test_tasks `Ran 46 tests in 5.093s` / `OK` (một lần giữ khóa, migrate exit 0, 0 lệnh ngoài khóa) · tick T9 (review-09, 2 vòng) · review T6 vòng 1 request-changes: 1 major STD-TEST-2 `test_agent_runner.py:2552,2575` (tên logger `LOGGER_NAME` của hai cảnh báo không thật sự được kiểm: một mock chung cho mọi tên, `_end_status` cũng gọi `frappe.logger(LOGGER_NAME)`)
 - round 16: BASE=4cdb4f5 · dev T10 (`tasks.py`/`test_tasks.py`) · sửa T6 vòng 2 (`runner.py`/`test_agent_runner.py`); không chung file
+- round 16 kết quả: dev T10 `DONE` (`team/FEAT-005-task-10` @ `e1c5ca0`, `tasks.py` +14/−3, `test_tasks.py` +96/−2; RED `Ran 49 tests in 6.586s` / `FAILED (failures=8)`; GREEN `Ran 49 tests in 5.649s` / `OK`; 5 đột biến đỏ) · sửa T6 `DONE_WITH_CONCERNS` (`a65af8d`, +13/−7; hai đột biến tên logger đỏ `Ran 14 tests` / `FAILED (failures=3)`; GREEN `--case TestRunnerTurnUndo` `Ran 14 tests in 6.311s` / `OK`; cả module hai lượt đỏ vì `QueryDeadlockError` ở `set_agent_settings`: `errors=4`, `errors=12`)
+- round 17: review T10 (`8ef96d5..e1c5ca0`) · review lại T6 (`d43ef0b..a65af8d`)
+- round 17 kết quả: review T6 vòng 2 approve · review T10 approve, 1 vòng (2 minor) · một lần giữ khóa 21:28:07–21:29:14 (0 lệnh ngoài khóa, migrate exit 0): merge T6 `ccda05c` → test_agent_runner `Ran 108 tests in 27.033s` / `OK` (hai cài đặt để trống rồi trả lại đúng) → merge T10 `46516b4` → test_tasks `Ran 49 tests in 4.974s` / `OK` · tick T6 (review-06, 2 vòng), T10 (review-10, 1 vòng); 9/16
+- round 18: BASE=đầu nhánh sau commit tài liệu của round 17 (mã = `46516b4`) · dev T11 (`tasks.py`/`test_tasks.py`); T12, T13 nối tiếp cùng file; T14 chờ T13; T15 chờ T13
 
 ## Phần 1, ảnh chụp trước/sau ở tool ghi (AC-13, NFR-3)
 
@@ -101,7 +105,7 @@ Tiến độ: BASE ghi ở đây trước mỗi lần gọi dev.
   - Returns: `REASON_TURN_SAVEPOINT = "erp_ai_reason_turn"`; mỗi lượt đặt `frappe.db.savepoint(REASON_TURN_SAVEPOINT)` ngay sau khi `_call_model` trả về; từ chạy tool tới hết `write_entry` của lượt nằm trong `try`; `except Exception`: `_undo_turn()` rồi `raise` (giữ ngoại lệ gốc); `_undo_turn()` = `frappe.db.rollback(save_point=REASON_TURN_SAVEPOINT)`; lượt thành công không `release`. Nhánh `GatewayError` và quy tắc "không rollback" của `run_for_ticket` không đổi
   - Expect: `test_write_entry_failure_undoes_turn_role_change` (`api_update_record` thêm role ok, `write_entry` của lượt ném → User không có role, 0 dòng `reason` của lượt, có Error Log `TITLE_RUN_FAILED`), `test_snapshot_handling_failure_undoes_turn` (`_record_snapshot` ném, cùng kết quả) xanh; lỗi giả bằng `unittest.mock.patch`
 
-- [ ] T6 — `_undo_turn` khi savepoint đã mất: giữ ngoại lệ gốc — files: erp_ai/agent/runner.py, erp_ai/agent/test_agent_runner.py — test: erp_ai/agent/test_agent_runner.py — depends: T5
+- [x] T6 — `_undo_turn` khi savepoint đã mất: giữ ngoại lệ gốc — files: erp_ai/agent/runner.py, erp_ai/agent/test_agent_runner.py — test: erp_ai/agent/test_agent_runner.py — depends: T5
   - Sửa vòng 3 (design-amd2 vòng 3 §4.1 `_undo_turn` bước 1–2, D-8): savepoint mất → warning, return, KHÔNG đụng hàng callback, không đặt lại savepoint; callback `after_rollback` ném → bắt, warning `"reason turn undo callback failed run_id=%s error=%s"`, không ném lỗi mới; test thêm `test_lost_turn_savepoint_keeps_commit_callbacks`, `test_failing_rollback_callback_keeps_original_error`
   - Criterion: ADR-024 QĐ 2, QĐ 5 (đường DDL, chấp nhận); design-amd2 §4.1 `_undo_turn`
   - Receives: `_undo_turn()`, `REASON_TURN_SAVEPOINT` (T5); `LOGGER_NAME`
@@ -133,7 +137,7 @@ Tiến độ: BASE ghi ở đây trước mỗi lần gọi dev.
   - Returns: DocType `User`: so `roles` của before/after theo tên role (`Counter`), mỗi role thêm ra `thêm role <role> cho <user> (người ra lệnh <instructor>, <YYYY-MM-DD HH:MM>)`, mỗi role gỡ ra `gỡ role <role> của <user> (…)`; không khác → 0 mục
   - Expect: `test_bot_created_user_role_alarm_names_user_role_instructor`, `test_bot_removed_role_listed_as_removed`, `test_bot_resave_user_without_role_change_no_line` (bot lưu lại User có role do người cấp → 0 dòng cho user đó) xanh; test so đúng chữ
 
-- [ ] T10 — Dấu `[QUẢN TRỊ]` và thứ tự mục — files: erp_ai/tasks.py, erp_ai/tests/test_tasks.py — test: erp_ai/tests/test_tasks.py — depends: T9
+- [x] T10 — Dấu `[QUẢN TRỊ]` và thứ tự mục — files: erp_ai/tasks.py, erp_ai/tests/test_tasks.py — test: erp_ai/tests/test_tasks.py — depends: T9
   - Criterion: AC-14 ca (3); A-19; ADR-024 Ràng buộc "Test (Quyết định 4)"; design-amd2 §3.3
   - Receives: mục role của T9; `site_api.FORBIDDEN_ROLES`
   - Returns: tiền tố `[QUẢN TRỊ] ` khi role ∈ `site_api.FORBIDDEN_ROLES`; thứ tự: `[QUẢN TRỊ]` trước, rồi thời điểm tăng; qua `_list_names` (5 mục)

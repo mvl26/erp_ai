@@ -1134,6 +1134,15 @@ SPEC_FORBIDDEN_ROLES = (
 	"Guest",
 	"All",
 )
+# Each forbidden role with one vowel accented: tabRole's utf8mb4_unicode_ci collation still finds the real role.
+ACCENTED_FORBIDDEN_ROLES = {
+	"System Manager": "Sýstem Manager",
+	"Administrator": "Ádministrator",
+	"ERP AI Instructor": "ERP AI Ínstructor",
+	"ERP AI Agent": "ERP AI Ágent",
+	"Guest": "Gúest",
+	"All": "Áll",
+}
 # Own test data: two business roles created in setUp, rolled back afterwards.
 STOCK_ROLE = "ERP AI Test Thủ kho"
 OFFICE_ROLE = "ERP AI Test Văn phòng"
@@ -1187,13 +1196,15 @@ class TestUserTemplates(FrappeTestCase):
 		self.assertEqual([name for name in vars(type(doc)) if not name.startswith("__")], [])
 
 	def test_forbidden_role_blocked(self):
-		# AC-30 (1): each of the six roles alone makes the template unsavable, also typed in another case;
+		# AC-30 (1): each of the six roles alone makes the template unsavable, also typed in another case
+		# or with an accent the database ignores (the check runs on the real role name, STD-ERR-2);
 		# a valid template stands first (decoy) so the bad row is row 2 and {idx} is pinned.
 		self.assertEqual(site_api.FORBIDDEN_ROLES, frozenset(SPEC_FORBIDDEN_ROLES))
+		self.assertEqual(set(ACCENTED_FORBIDDEN_ROLES), set(SPEC_FORBIDDEN_ROLES))
 		decoy = {"template_name": "Thủ kho", "roles": STOCK_ROLE}
 		stored_before = self._stored_templates()
 		for role in SPEC_FORBIDDEN_ROLES:
-			for typed in (role, role.upper()):
+			for typed in (role, role.upper(), ACCENTED_FORBIDDEN_ROLES[role]):
 				with self.subTest(role=typed):
 					self.assertEqual(
 						self._save_templates(
@@ -1223,6 +1234,16 @@ class TestUserTemplates(FrappeTestCase):
 		for label, row, reason in cases:
 			with self.subTest(label):
 				self.assertEqual(self._save_templates(decoy, row), f"Mẫu tài khoản dòng 2: {reason}")
+		# Bad row at position 3 of 4, duplicating row 2: pins {idx} and {j} beyond the first two rows.
+		self.assertEqual(
+			self._save_templates(
+				decoy,
+				{"template_name": "Văn phòng", "roles": OFFICE_ROLE},
+				{"template_name": "VĂN PHÒNG", "roles": STOCK_ROLE},
+				{"template_name": "Kế toán", "roles": OFFICE_ROLE},
+			),
+			"Mẫu tài khoản dòng 3: trùng tên với dòng 2",
+		)
 		self.assertEqual(self._stored_templates(), stored_before)
 
 	def test_valid_template_saves(self):

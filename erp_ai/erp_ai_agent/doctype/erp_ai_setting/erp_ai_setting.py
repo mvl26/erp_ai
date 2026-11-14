@@ -200,7 +200,10 @@ class ERPAISetting(Document):
 
 
 def user_template_error(row) -> str | None:
-	"""The first E-5 role reason of this row, or None; on success the roles are stored one per line by real name."""
+	"""The first E-5 role reason of this row, or None; on success the roles are stored one per line by real name.
+
+	The ban is checked on the real name too: tabRole's collation ignores case and accents, so "Gúest" finds Guest.
+	"""
 	forbidden = {role.casefold(): role for role in site_api.FORBIDDEN_ROLES}
 	roles = [line.strip() for line in (row.roles or "").splitlines() if line.strip()]
 	if not roles:
@@ -212,6 +215,8 @@ def user_template_error(row) -> str | None:
 		real = frappe.db.get_value("Role", role)
 		if not real:
 			return f"không có vai trò {role}"
+		if real in site_api.FORBIDDEN_ROLES:
+			return f"vai trò {real} bị cấm cho bot"
 		stored.append(real)
 	row.roles = "\n".join(stored)
 	return None

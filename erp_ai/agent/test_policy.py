@@ -388,3 +388,76 @@ class TestTicketContentDoctype(FrappeTestCase):
 		for doctype, fieldnames in cases:
 			with self.subTest(doctype=doctype):
 				self.assertEqual(policy.ticket_link_fieldnames(doctype), fieldnames)
+
+
+class TestPermissionSwitches(FrappeTestCase):
+	# U1 3.1: the five permission switches, read in one place, in the spec's order (1)..(5).
+	FIELD_FLAGS = (
+		("unrestricted_enabled", "unrestricted"),
+		("record_tools_enabled", "record_tools"),
+		("act_now_enabled", "act_now"),
+		("code_change_enabled", "code_change"),
+		("one_click_approval_enabled", "one_click_approval"),
+	)
+
+	def setUp(self):
+		self.addCleanup(frappe.db.rollback)
+		keep_agent_settings(self)
+		for name in ("permission_switches", "PermissionSwitches", "PERMISSION_SWITCH_FIELDS"):
+			self.assertTrue(hasattr(policy, name), f"policy has no {name}")
+
+	def _flags(self, switches):
+		return {flag: getattr(switches, flag) for _field, flag in self.FIELD_FLAGS}
+
+	def test_missing_fields_read_off(self):
+		off = {flag: False for _field, flag in self.FIELD_FLAGS}
+		self.assertEqual(policy.PermissionSwitches(), policy.PermissionSwitches(*off.values()))
+		# A settings object without the fields (before migrate) reads every switch off and never raises.
+		for settings in (frappe._dict(), object()):
+			with self.subTest(settings=settings):
+				self.assertEqual(self._flags(policy.permission_switches(settings)), off)
+		for value in (0, None, ""):
+			with self.subTest(value=value):
+				settings = frappe._dict({field: value for field, _flag in self.FIELD_FLAGS})
+				self.assertEqual(self._flags(policy.permission_switches(settings)), off)
+		set_agent_settings(**{field: 0 for field, _flag in self.FIELD_FLAGS})
+		self.assertEqual(self._flags(policy.permission_switches(frappe.get_doc(SETTING_DOCTYPE))), off)
+		with self.assertRaises(AttributeError):
+			policy.permission_switches(frappe._dict()).act_now = True
+
+	def test_each_field_maps_to_its_flag(self):
+		self.assertEqual(
+			(
+				policy.UNRESTRICTED_FIELD,
+				policy.RECORD_TOOLS_FIELD,
+				policy.ACT_NOW_FIELD,
+				policy.ONE_CLICK_APPROVAL_FIELD,
+			),
+			("unrestricted_enabled", "record_tools_enabled", "act_now_enabled", "one_click_approval_enabled"),
+		)
+		self.assertEqual(policy.PERMISSION_SWITCH_FIELDS, tuple(field for field, _flag in self.FIELD_FLAGS))
+		for field, flag in self.FIELD_FLAGS:
+			with self.subTest(field=field):
+				switches = policy.permission_switches(frappe._dict({field: 1}))
+				self.assertEqual(
+					self._flags(switches), {other: other == flag for _f, other in self.FIELD_FLAGS}
+				)
+		self.assertTrue(
+			all(
+				self._flags(
+					policy.permission_switches(frappe._dict.fromkeys(policy.PERMISSION_SWITCH_FIELDS, 1))
+				).values()
+			)
+		)
+		# Read from the stored setting: (2) and (5) on, the rest off.
+		set_agent_settings(
+			unrestricted_enabled=0,
+			record_tools_enabled=1,
+			act_now_enabled=0,
+			code_change_enabled=0,
+			one_click_approval_enabled=1,
+		)
+		self.assertEqual(
+			policy.permission_switches(frappe.get_doc(SETTING_DOCTYPE)),
+			policy.PermissionSwitches(record_tools=True, one_click_approval=True),
+		)

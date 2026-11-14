@@ -4,6 +4,7 @@ import json
 import os
 import shutil
 import subprocess
+import tempfile
 import time
 from unittest.mock import patch
 
@@ -38,6 +39,7 @@ from erp_ai.constants import (
 from erp_ai.test_utils import (
 	GIT_SANDBOX_EMAIL,
 	GitSandbox,
+	RealCoreReposUntouchedMixin,
 	add_credential,
 	make_change_proposal,
 	pin_agent_roles,
@@ -165,6 +167,26 @@ class ApplyJobTestCase(FrappeTestCase):
 
 	def author_email(self):
 		return self.sandbox.git(APP, "log", "-1", "--format=%ae").strip()
+
+	def add_proposer(self):
+		"""Create `PROPOSER`, an agent who may call the propose tools; the session goes back to `ACTOR`."""
+		frappe.set_user("Administrator")
+		create_agent(PROPOSER)
+		frappe.get_doc("User", PROPOSER).add_roles(ROLE_AGENT)
+		frappe.set_user(ACTOR)
+
+	def tool_context(self, ticket, run_id):
+		"""The context the runner hands the propose tools for `PROPOSER` on `ticket`, with `ACTOR` instructing."""
+		return ToolContext(
+			ticket_name=ticket,
+			effective_level="L3",
+			instructor=ACTOR,
+			run_id=run_id,
+			category_mapping={},
+			agent_user=PROPOSER,
+			change_enabled=True,
+			allowed_apps=(APP,),
+		)
 
 
 class TestApplyCode(ApplyJobTestCase):
@@ -2514,6 +2536,243 @@ class TestApplyCommand(ApplyJobTestCase):
 		self.assertNotEqual(self.state(name).change_status, CHANGE_STATUS_APPROVED)
 
 
+# Design 8.1 (AC-19 c): the six repo hooks the sandbox installs; each one would leave a marker file.
+HOOKS_THAT_MUST_NOT_RUN = (
+	"pre-commit",
+	"prepare-commit-msg",
+	"commit-msg",
+	"post-commit",
+	"post-index-change",
+	"reference-transaction",
+)
+# Design 8.3 (NFR-8): the bot identity as written in the design, not read from the constants.
+BOT_AUTHOR = "ERP AI Agent <erp-ai-agent@bot.invalid>"
+HOME_EMAIL = "real.person@example.com"
+HOME_NAME = "Real Person From Home"
+REMOTE_URL = "https://x-token-FAKE@host/r.git"
+APPROVER_NAME_EMAIL = "duyet.that@corp.example"
+# Review-45: what each planted repo hook prints when it runs.
+HOOK_OUTPUT = f"hook-output-T48 {HOME_EMAIL}"
+
+
+class TestCommitCrossChecks(RealCoreReposUntouchedMixin, ApplyJobTestCase):
+	"""Cross checks of the bot commit for apply and undo: hooks, refs, metadata (AC-19 c, AC-23, NFR-7..9, AC-13)."""
+
+	def apply_then_undo(self, name, actor=ACTOR):
+		# The job runs as the deciding instructor (ADR-023 decision 2); the session goes back to `ACTOR`.
+		frappe.set_user(actor)
+		transitions.approve(name, actor)
+		apply_job.run_change(name, "apply")
+		self.assertEqual(self.state(name).change_status, CHANGE_STATUS_APPLIED)
+		transitions.request_undo(name, actor)
+		apply_job.run_change(name, "undo")
+		self.assertEqual(self.state(name).change_status, CHANGE_STATUS_UNDONE)
+		frappe.set_user(ACTOR)
+		return name
+
+	def hook_dir(self):
+		return os.path.join(self.sandbox.repo(APP), ".git", "hooks")
+
+	def test_repo_hooks_never_run(self):
+		markers = self.sandbox.install_marker_hooks(APP)
+		for hook in HOOKS_THAT_MUST_NOT_RUN:
+			self.assertTrue(os.access(os.path.join(self.hook_dir(), hook), os.X_OK), hook)
+
+		for label, proposal in (("file sửa", self.code_proposal), ("file mới", self.new_file_proposal)):
+			with self.subTest(label):
+				name = self.apply_then_undo(proposal())
+				self.assertEqual(self.steps(name), ["approve", "apply", "undo"])
+				self.assertEqual(self.worktree_changes(), "")
+				self.assertEqual(sorted(os.listdir(markers)), [])
+
+		# Control: the same hooks do run for a plain git commit in this repo, so an empty marker dir
+		# above means the job switched them off, not that they were broken.
+		with self.assertRaises(AssertionError):
+			self.sandbox.commit_file(APP, "pkg/control.py", "c = 1\n", run_hooks=True)
+		fired = set(os.listdir(markers))
+		self.assertIn("pre-commit", fired)
+		self.assertLessEqual(fired, set(HOOKS_THAT_MUST_NOT_RUN))
+
+	def test_failure_reason_has_no_hook_output(self):
+		# Review-45: a failed commit stores the last line of the git output; a repo hook that ran would print it.
+		markers = self.sandbox.install_marker_hooks(APP)
+		for hook in HOOKS_THAT_MUST_NOT_RUN:
+			path = os.path.join(self.hook_dir(), hook)
+			with open(path, encoding="utf-8") as handle:
+				script = handle.read()
+			with open(path, "w", encoding="utf-8") as handle:
+				handle.write(script.replace("#!/bin/sh\n", f'#!/bin/sh\necho "{HOOK_OUTPUT} {hook}"\n', 1))
+		# A held branch lock makes git fail the commit at the ref update, after the point where hooks run.
+		ref_lock = self.sandbox.git(
+			APP, "rev-parse", "--path-format=absolute", "--git-path", "refs/heads/main.lock"
+		).strip()
+
+		for action in ("apply", "undo"):
+			with self.subTest(action):
+				name = self.approved(self.code_proposal())
+				if action == "undo":
+					apply_job.run_change(name, "apply")
+					self.assertEqual(self.state(name).change_status, CHANGE_STATUS_APPLIED)
+					transitions.request_undo(name, ACTOR)
+				content, head = self.read(), self.head()
+				with open(ref_lock, "w", encoding="utf-8"):
+					pass
+				try:
+					apply_job.run_change(name, action)
+				finally:
+					os.remove(ref_lock)
+
+				state = self.state(name)
+				self.assertEqual(state.change_status, CHANGE_STATUS_FAILED)
+				self.assertTrue(
+					state.failure_reason.startswith(f"{GIT_COMMIT_FAILED_TEXT}: "), state.failure_reason
+				)
+				self.assertNotIn(HOOK_OUTPUT, state.failure_reason)
+				self.assertNotIn(HOME_EMAIL, state.failure_reason)
+				self.assertEqual((self.read(), self.head(), self.worktree_changes()), (content, head, ""))
+				self.assertEqual(sorted(os.listdir(markers)), [])
+
+		# Control: the job made to run the repo hooks puts their output in `failure_reason` (a new file:
+		# the failed undo above left `REL` applied).
+		name = self.approved(self.new_file_proposal())
+		with patch.object(source, "GIT_HOOKS_DIR", self.hook_dir()):
+			apply_job.run_change(name, "apply")
+		state = self.state(name)
+		self.assertEqual(state.change_status, CHANGE_STATUS_FAILED)
+		self.assertIn(f"{HOOK_OUTPUT} pre-commit", state.failure_reason)
+		self.assertIn("pre-commit", os.listdir(markers))
+
+	def test_remote_refs_and_other_branches_unchanged_after_apply_and_undo(self):
+		self.sandbox.add_remote(APP, url=REMOTE_URL)
+		# A push to `origin` would land in the temp bare repo; fetch keeps the fake URL of the leak checks.
+		bare = self.sandbox.remote_dir(APP)
+		self.sandbox.git(APP, "remote", "set-url", "--push", "origin", bare)
+		self.assertEqual(self.sandbox.git(APP, "remote", "get-url", "--push", "origin").strip(), bare)
+		self.assertEqual(self.sandbox.git(APP, "remote", "get-url", "origin").strip(), REMOTE_URL)
+		self.sandbox.switch_branch(APP, "other")
+		self.sandbox.commit_file(APP, "pkg/other_branch.py", "o = 1\n")
+		self.sandbox.switch_branch(APP, "main", create=False)
+		self.sandbox.git(APP, "tag", "v1")
+
+		def other_refs():
+			refs = self.sandbox.refs(APP)
+			main = refs.pop("refs/heads/main")
+			return main, refs
+
+		def remote_refs():
+			return self.sandbox.git(APP, "ls-remote", bare)
+
+		main_before, refs_before = other_refs()
+		remote_before = remote_refs()
+		self.assertEqual(set(refs_before), {"refs/heads/other", "refs/remotes/origin/main", "refs/tags/v1"})
+		self.assertIn("refs/heads/main", remote_before)
+		name = self.approved(self.code_proposal(upstream_ref="origin/main"))
+
+		apply_job.run_change(name, "apply")
+
+		self.assertEqual(self.state(name).change_status, CHANGE_STATUS_APPLIED)
+		main_applied, refs_applied = other_refs()
+		self.assertEqual(self.sandbox.git(APP, "rev-parse", "main~1").strip(), main_before)
+		self.assertEqual(refs_applied, refs_before)
+		self.assertEqual(remote_refs(), remote_before)
+
+		transitions.request_undo(name, ACTOR)
+		apply_job.run_change(name, "undo")
+
+		self.assertEqual(self.state(name).change_status, CHANGE_STATUS_UNDONE)
+		_, refs_undone = other_refs()
+		self.assertEqual(self.sandbox.git(APP, "rev-parse", "main~1").strip(), main_applied)
+		self.assertEqual(refs_undone, refs_before)
+		self.assertEqual(remote_refs(), remote_before)
+
+	def test_commit_metadata_has_no_email_url_or_token(self):
+		home = os.path.realpath(tempfile.mkdtemp())
+		self.addCleanup(shutil.rmtree, home, True)
+		with open(os.path.join(home, ".gitconfig"), "w", encoding="utf-8") as handle:
+			handle.write(f"[user]\n\temail = {HOME_EMAIL}\n\tname = {HOME_NAME}\n")
+		environ = patch.dict(os.environ, {"HOME": home, "XDG_CONFIG_HOME": home, "EMAIL": HOME_EMAIL})
+		environ.start()
+		self.addCleanup(environ.stop)
+		self.sandbox.add_remote(APP, url=REMOTE_URL)
+		self.add_proposer()
+		frappe.set_user("Administrator")
+		approver = f"erp-ai-t48-{frappe.generate_hash(length=8)}@example.com"
+		frappe.get_doc(
+			{
+				"doctype": "User",
+				"email": approver,
+				"first_name": f"Duyệt {APPROVER_NAME_EMAIL}",
+				"send_welcome_email": 0,
+			}
+		).insert(ignore_permissions=True).add_roles(ROLE_INSTRUCTOR)
+		ticket = str(make_ticket(subject="ERPAI-TEST T48 metadata", raised_by=PROPOSER).name)
+		# The proposal comes from the propose tool, which writes its own ticket comment (design 3.8, 3.9).
+		frappe.set_user(PROPOSER)
+		result = execute_tool(
+			"propose_file_change",
+			{"path": FILE_PATH, "find": ["x = 1"], "replace": ["x = 2"], "reason": "sửa theo yêu cầu"},
+			self.tool_context(ticket, "run-t48"),
+		)
+		frappe.set_user(ACTOR)
+		self.assertTrue(result["ok"], result)
+		name = result["proposal"]
+		self.assertEqual(frappe.db.get_value(PROPOSAL_DOCTYPE, name, "upstream_ref"), "origin/main")
+
+		self.apply_then_undo(name, actor=approver)
+
+		state = self.state(name)
+		commits = {"apply": state.apply_commit_sha, "undo": state.undo_commit_sha}
+		self.assertEqual(self.sandbox.git(APP, "rev-parse", "HEAD~1").strip(), commits["apply"])
+		self.assertEqual(self.head(), commits["undo"])
+		people = {"apply": "Người duyệt: (không hiện tên)", "undo": "Người hoàn tác: (không hiện tên)"}
+		for action, commit in commits.items():
+			with self.subTest(action):
+				meta = self.sandbox.log_meta(APP, commit)
+				author_name, author_email, committer_name, committer_email, message = meta.split("\n", 4)
+				self.assertEqual(f"{author_name} <{author_email}>", BOT_AUTHOR)
+				self.assertEqual(f"{committer_name} <{committer_email}>", BOT_AUTHOR)
+				self.assertIn(people[action], message)
+				for leak in ("@", "://", "x-token-FAKE", "host/r.git", HOME_NAME):
+					self.assertNotIn(leak, message)
+				for leak in (HOME_EMAIL, HOME_NAME, approver, APPROVER_NAME_EMAIL, "x-token-FAKE"):
+					self.assertNotIn(leak, meta)
+
+		doc = frappe.get_doc(PROPOSAL_DOCTYPE, name)
+		doc.run_method("onload")
+		notes = json.dumps(doc.get("__onload"), ensure_ascii=False, default=str)
+		self.assertIn("origin/main", notes)
+		fields = json.dumps(doc.as_dict(), ensure_ascii=False, default=str)
+		self.assertIn(commits["apply"], fields)
+		# The store is not empty: the proposal comment with its notes is read below.
+		ticket_comments = frappe.get_all(
+			"Comment", filters=authority.ticket_comment_filters(ticket), pluck="content"
+		)
+		self.assertEqual(len(ticket_comments), 1, ticket_comments)
+		self.assertIn(name, ticket_comments[0])
+		self.assertIn("Nhánh này theo origin/main", ticket_comments[0])
+		comments = json.dumps(
+			frappe.get_all(
+				"Comment",
+				filters={"reference_name": ("in", [name, doc.ticket])},
+				fields=["content", "subject"],
+			)
+			+ frappe.get_all(
+				"HD Ticket Comment", filters={"reference_ticket": doc.ticket}, fields=["content"]
+			)
+			+ frappe.get_all(
+				LOG_DOCTYPE,
+				filters={"change_proposal": name},
+				fields=["value_before", "value_after", "error"],
+			),
+			ensure_ascii=False,
+			default=str,
+		)
+		for where, text in (("__onload", notes), ("trường đề xuất", fields), ("comment và log", comments)):
+			for leak in (HOME_EMAIL, HOME_NAME, APPROVER_NAME_EMAIL, "x-token-FAKE", "host/r.git", "://"):
+				with self.subTest(where=where, leak=leak):
+					self.assertNotIn(leak, text)
+
+
 class TestNoKeyLeak(ApplyJobTestCase):
 	"""AC-13, NFR-5: a fake key in `os.environ` and in the stored credential never reaches a store of the flow."""
 
@@ -2522,9 +2781,8 @@ class TestNoKeyLeak(ApplyJobTestCase):
 		environ = patch.dict(os.environ, {"ANTHROPIC_API_KEY": FAKE_KEY, "ERP_AI_FAKE_SECRET": FAKE_KEY})
 		environ.start()
 		self.addCleanup(environ.stop)
+		self.add_proposer()
 		frappe.set_user("Administrator")
-		create_agent(PROPOSER)
-		frappe.get_doc("User", PROPOSER).add_roles(ROLE_AGENT)
 		add_credential("t22-leak", api_key=FAKE_KEY)
 		frappe.set_user(ACTOR)
 
@@ -2537,16 +2795,7 @@ class TestNoKeyLeak(ApplyJobTestCase):
 		"""
 		frappe.set_user("Administrator")
 		ticket = str(make_ticket(subject="ERPAI-TEST T22 leak", raised_by=PROPOSER).name)
-		context = ToolContext(
-			ticket_name=ticket,
-			effective_level="L3",
-			instructor=ACTOR,
-			run_id="run-t22",
-			category_mapping={},
-			agent_user=PROPOSER,
-			change_enabled=True,
-			allowed_apps=(APP,),
-		)
+		context = self.tool_context(ticket, "run-t22")
 		base = self.head()
 		calls = []
 		real_run = subprocess.run

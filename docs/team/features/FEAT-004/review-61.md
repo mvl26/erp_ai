@@ -8,8 +8,9 @@ Approved-by:
 # Review 61 — FEAT-004 T61
 
 - Diff: `team/FEAT-004-task-61` (head 5130c88), base 7b55147 (head T60, review riêng)
-- Vòng: 1
-- Verdict: request-changes
+- Diff vòng 2: `5130c88..team/FEAT-004-task-61` (head 1b36a51)
+- Vòng: 2
+- Verdict: request-changes (vòng 1: request-changes; vòng 2: request-changes)
 
 Lệnh đã chạy (chỉ đọc):
 ```
@@ -66,3 +67,51 @@ minor | STD-ERR-1, STD-TEST-8 | site_api.py:266-275,280-292 | 3 điểm nhỏ: `
 
 ## Deferred
 - Không có (vòng 1).
+
+## Vòng 2 (2026-11-14)
+- Diff sửa: `5130c88..team/FEAT-004-task-61` (head 1b36a51), 1 commit `fix(site_api): refuse call_method arguments that name a key or password field (FEAT-004)`, 2 file (`site_api.py` +12/−2, `test_site_api.py` +33). Chỉ xét diff sửa.
+- Verdict: **request-changes**
+
+Lệnh đã chạy (chỉ đọc):
+```
+git log --oneline 5130c88..team/FEAT-004-task-61
+git diff --stat 5130c88..team/FEAT-004-task-61
+git diff 5130c88..team/FEAT-004-task-61
+git show team/FEAT-004:docs/team/features/FEAT-004/tasks.md | grep -n -A6 '^- \[ \] T61'
+git show team/FEAT-004-task-61:erp_ai/agent/tools/site_api.py   # dòng 30-60, vị trí hàm
+git -C apps/frappe show HEAD:frappe/model/db_query.py           # dòng 1000-1060 (version-15)
+git -C apps/frappe show HEAD:frappe/client.py                   # get_list
+```
+Rủi ro ngoài diff đã đọc một chỗ: cách Frappe mở rộng `fields=["*"]` (`frappe/model/db_query.py:1047-1050`: `*` được thay bằng toàn bộ trường đọc được, gồm trường permlevel 1 khi tài khoản đọc được) và `frappe.client.get_list` (`as_dict=0` → `as_list`). Không chạy test (theo lệnh tech-lead).
+
+### Đối chiếu phát hiện vòng 1
+- major | STD-SEC-4 | site_api.py:280-292,325 — **NOT ADDRESSED (một phần)**.
+  - Đã đóng: tên trường bí mật trong tham số bị từ chối trước khi gọi ở `site_api.py:311-312` (`IDENTIFIER_PATTERN` tách `\w+` trên văn bản đã `_parsed` + casefold, nên `api_key as k`, `` `tabUser`.`API_KEY` `` trong chuỗi JSON lồng, `tabUser.reset_password_key`, `["Access_Token"]` đều ra tên trần). Test `test_site_api.py:802-823` phủ 6 ca (`get_value` `as_dict=0`, bí danh, backtick, chuỗi JSON lồng, tiền tố bảng, chữ hoa), so nguyên dict lý do và `frappe.call` 0 lần; RED của dev 6 failures đúng 6 ca. Test đối chứng `test_site_api.py:825-832` chặn việc chặn quá tay với trường thường. Mô tả tool `site_api.py:519-520` và docstring `site_api.py:300-303` nay nói đúng "chặn ở mức cố gắng", không còn nói quá.
+  - Còn hở: chọn cột bằng `*` không nhắc tên trường nào. `frappe.client.get_list` với `{"doctype": "User", "fields": ["*"], "as_dict": 0}` → Frappe thay `*` bằng mọi trường đọc được (`db_query.py:1047-1050`), trả hàng dạng list không khóa: `api_key`, `reset_password_key` của mọi người dùng đi thẳng tới model, `_scrub` không có khóa để ẩn. Tương tự `{"doctype": "OAuth Bearer Token", "fields": ["*"], "as_dict": 0}` trả `access_token`, `refresh_token` (permlevel 0), và `frappe.desk.reportview.get` (kết quả `keys`/`values` dạng vị trí) với `fields: ["*"]`. Đây đúng đường "get_list với `as_dict=0` (hàng là tuple)" phát hiện vòng 1 đã nêu, nên chưa đóng. Trái quyết định của người 2026-11-14 "không bao giờ trả khóa API hay mật khẩu" và AC-33.
+
+### Phát hiện (chỉ blocker/major)
+| severity | STD | file:line | description | fix |
+|---|---|---|---|---|
+| major | STD-SEC-4 | erp_ai/agent/tools/site_api.py:311-312 | Chặn theo tên trường bỏ sót chọn cột `*`: `frappe.client.get_list` `{"doctype": "User", "fields": ["*"], "as_dict": 0}` (và OAuth Bearer Token, `frappe.desk.reportview.get` với `fields: ["*"]`) trả giá trị `api_key`/`access_token` trần, không khóa, `_scrub` không ẩn được. Còn lại của phát hiện vòng 1. | Trong `_method_refusal`, từ chối thêm khi một chuỗi lá của tham số đã `_parsed` là bộ chọn cột `*` (`*`, `tabX.*`, `` `tabX`.* ``, có thể kèm khoảng trắng; `count(*)` có thể cho qua). Thêm ca vào test (hoặc test riêng): `get_list` User `fields ["*"]` `as_dict 0`, `fields "*"` dạng chuỗi, `` ["`tabOAuth Bearer Token`.*"] ``, `frappe.desk.reportview.get` `fields ["*"]` → `ok=False`, `frappe.call` 0 lần. confirmed (đọc mã Frappe version-15, chưa chạy; quyền đọc permlevel 1 của tài khoản agent giả định như vòng 1) |
+
+### Review checklist (10) — diff sửa
+1. Đúng và đủ spec/criteria — trượt một phần: dòng "Sửa theo review-61 vòng 1" của T61 làm đủ (tên, casefold, JSON lồng, bí danh, test `as_dict=0`, mô tả tool); "không bao giờ trả khóa" vẫn hở qua `*` (major trên). Không thêm phạm vi.
+2. Touchpoints — đạt (đúng hai file của task).
+3. Test đỏ trước, phủ biên — đạt một phần: RED 6 failures trước mã; biên bí danh/backtick/chuỗi lồng/chữ hoa và ca đối chứng có; biên `*` chưa phủ. Không skip/xfail.
+4. Không sửa test cho khớp hành vi sai; test độc lập — đạt: chỉ thêm test, `frappe.call` patch trong từng `subTest`, lý do viết cứng `SECRET_ARGUMENT_REFUSED`.
+5. Lỗi, kiểm đầu vào — đạt: không thêm nhánh lỗi mới; regex trên văn bản đã có sẵn.
+6. Bí mật, tiêm, phân quyền, lộ dữ liệu — trượt (STD-SEC-4, major trên).
+7. Hợp đồng — đạt: thêm một lý do từ chối mới cho `api_call_method`; bên gọi duy nhất là model.
+8. Tên, cấu trúc, không mã chết — đạt (`IDENTIFIER_PATTERN`, `SECRET_ARGUMENT_REASON` theo `naming.constant`, chú thích đúng việc mã làm).
+9. Phụ thuộc mới — không có (`re` thư viện chuẩn).
+10. Commit, nhánh, tài liệu — đạt: một commit `fix(site_api): ... (FEAT-004)` trên `team/FEAT-004-task-61`; mô tả tool và docstring sửa cùng diff, khớp mã.
+
+minor | — | — | 1 điểm nhỏ: chặn theo từ `token`/`secret`/`password` ở mọi chỗ trong tham số (cả giá trị, ví dụ nội dung ticket "khách quên password" gửi qua `frappe.client.insert`) sẽ từ chối cả lời gọi vô hại; chấp nhận được với quyết định "chặn ở mức cố gắng", nên ghi trong mô tả tool để model biết lý do | tùy dev
+
+### Không kiểm được từ diff
+- Vai trò thật của tài khoản agent ở chế độ Toàn quyền (có đọc permlevel 1 của User không) quyết định `api_key` có nằm trong `*` hay không; `access_token` của OAuth Bearer Token là permlevel 0 nên lọt bất kể → tech-lead kiểm.
+- Lint (`pre-commit run --all-files`) cho dòng mô tả dài `site_api.py:519-520` — chưa chạy.
+- Test chưa chạy lại (theo lệnh): đề nghị `cmd.test_one erp_ai/agent/tools/test_site_api.py`.
+
+### Deferred (vòng 2)
+- Mục minor ở vòng 1 (`RecursionError` ở `_parsed`/`_scrub`, `SECRET_METHODS` che nhau với luật đoạn tên cuối, chưa test phạm vi "chỉ đoạn tên cuối") không thuộc diff sửa; giữ nguyên, không chặn vòng này.

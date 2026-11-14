@@ -1,3 +1,4 @@
+import hashlib
 import re
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -15,16 +16,22 @@ from werkzeug.wrappers import Request
 
 from erp_ai import change_decision
 from erp_ai.agent import authority, change_link
+from erp_ai.agent.changes import process_runner
 from erp_ai.constants import (
 	AGENT_USER,
+	CHANGE_KIND_CODE,
+	CHANGE_STATUS_APPLIED,
 	CHANGE_STATUS_APPROVED,
+	CHANGE_STATUS_FAILED,
 	CHANGE_STATUS_PENDING,
 	CHANGE_STATUS_REJECTED,
+	CHANGE_STATUS_STALE,
 	LOG_DOCTYPE,
 	PROPOSAL_DOCTYPE,
 	ROLE_INSTRUCTOR,
+	SETTING_DOCTYPE,
 )
-from erp_ai.test_utils import make_change_proposal
+from erp_ai.test_utils import GitSandbox, make_change_proposal, set_agent_settings
 
 INSTRUCTOR = "decision.instructor@example.com"
 PLAIN = "decision.plain@example.com"
@@ -40,6 +47,16 @@ FORM_SCRIPT_PATH = (
 	/ "erp_ai_change_proposal"
 	/ "erp_ai_change_proposal.js"
 )
+# AC-27: a code proposal on a throw-away `GitSandbox` repo (never the real `apps/`).
+SANDBOX_APP = "custom_app"
+SANDBOX_REL = "pkg/mod.py"
+CODE_BEFORE = "x = 1\n"
+CODE_AFTER = "x = 2\n"
+CODE_EDITED = "import os\n"
+
+
+def _sha(text: str) -> str:
+	return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
 def _signature(name, action) -> str:
@@ -291,3 +308,177 @@ class TestChangeDecision(FrappeTestCase):
 		)
 		self.assertLess(body.index("history.replaceState("), body.index("frappe.call("))
 		self.assertLess(body.index("frappe.call("), body.index("frm.reload_doc()"))
+
+	def sandbox_proposal(self) -> str:
+		"""A `Chờ duyệt` code proposal on `SANDBOX_APP` of the sandbox that the job would apply as it stands."""
+		return make_change_proposal(
+			CHANGE_KIND_CODE,
+			ticket=self.proposal.ticket,
+			app=SANDBOX_APP,
+			file_path=f"{SANDBOX_APP}/{SANDBOX_REL}",
+			content_before=CODE_BEFORE,
+			content_after=CODE_AFTER,
+			base_hash=_sha(CODE_BEFORE),
+			after_hash=_sha(CODE_AFTER),
+			target_branch="main",
+			upstream_ref="",
+		).name
+
+	def run_queued_job(self, name) -> dict:
+		"""Run the one `apply` job `decide` queued for `name` as the worker does: under the job's `user`.
+
+		The job's own `frappe.db.commit` is held back; returns the spies on every git write and bench run.
+		"""
+		(job,) = (call for call in self.jobs() if call.kwargs["kwargs"]["kwargs"]["proposal_name"] == name)
+		job_kwargs = job.kwargs["kwargs"]
+		self.assertEqual((job_kwargs["user"], job_kwargs["kwargs"]["action"]), (INSTRUCTOR, "apply"))
+		patchers = {
+			target: patch.object(process_runner, target, wraps=getattr(process_runner, target))
+			for target in ("git_add_new", "git_commit_only", "run_bench")
+		}
+		frappe.set_user(job_kwargs["user"])
+		try:
+			with patch.object(frappe.db, "commit"):
+				spies = {target: patcher.start() for target, patcher in patchers.items()}
+				try:
+					frappe.get_attr(job_kwargs["method"])(**job_kwargs["kwargs"])
+				finally:
+					for patcher in patchers.values():
+						patcher.stop()
+		finally:
+			frappe.set_user("Administrator")
+		return spies
+
+	def sandbox_git(self, *args) -> str:
+		return self.sandbox.git(SANDBOX_APP, *args).strip()
+
+	def target_bytes(self) -> bytes:
+		return (Path(self.sandbox.repo(SANDBOX_APP)) / SANDBOX_REL).read_bytes()
+
+	def status_and_reason(self, name):
+		return frappe.db.get_value(PROPOSAL_DOCTYPE, name, ["change_status", "failure_reason"])
+
+	def change_rows(self, name):
+		return frappe.get_all(
+			LOG_DOCTYPE,
+			filters={"change_proposal": name},
+			fields=["change_step", "actor", "error", "ticket", "creation"],
+			order_by="creation asc",
+		)
+
+	def clear_settings_cache_after_rollback(self):
+		frappe.db.rollback()
+		frappe.clear_document_cache(SETTING_DOCTYPE, SETTING_DOCTYPE)
+
+	def test_link_approval_still_rechecked_at_apply(self):
+		"""AC-27: each apply-time check still refuses after `decide`; 0 bytes, 0 commits, 0 runs, one log row."""
+		# Runs before the class's rollback, so the switch and app list of this test leave no cached value.
+		self.addCleanup(self.clear_settings_cache_after_rollback)
+		self.sandbox = GitSandbox(self, apps=(SANDBOX_APP,), erp_ai_worktree=None)
+		start = self.sandbox.commit_file(SANDBOX_APP, SANDBOX_REL, CODE_BEFORE)
+
+		def reset():
+			self.sandbox_git("checkout", "--quiet", "--force", "-B", "main", start)
+			set_agent_settings(code_change_enabled=1, code_change_apps=SANDBOX_APP)
+
+		def switch_off(name):
+			set_agent_settings(code_change_enabled=0)
+
+		def target_changed(name):
+			self.sandbox.commit_file(SANDBOX_APP, SANDBOX_REL, "x = 99\n")
+
+		def content_edited(name):
+			# `after_hash` follows the edit, so only the digest taken at approval can tell.
+			frappe.db.set_value(
+				PROPOSAL_DOCTYPE,
+				name,
+				{"content_after": CODE_EDITED, "after_hash": _sha(CODE_EDITED)},
+				update_modified=False,
+			)
+
+		def branch_changed(name):
+			self.sandbox.switch_branch(SANDBOX_APP, "other")
+
+		def app_removed(name):
+			set_agent_settings(code_change_apps="other_app")
+
+		# Control: with nothing changed after the link approval, the same fixture is applied.
+		reset()
+		name = self.sandbox_proposal()
+		self.assertEqual(self.post(INSTRUCTOR, "approve", name=name)["status"], CHANGE_STATUS_APPROVED)
+		self.run_queued_job(name)
+		self.assertEqual(self.status_and_reason(name), (CHANGE_STATUS_APPLIED, None))
+		self.assertEqual(self.target_bytes(), CODE_AFTER.encode("utf-8"))
+		self.assertEqual(self.sandbox_git("rev-list", "--count", "HEAD"), "3")
+
+		# Statuses and reasons of design 4.3 steps 4.2 and 4.3, written out by hand.
+		cases = {
+			"code switch off": (switch_off, CHANGE_STATUS_FAILED, "fail", "công tắc đang tắt"),
+			"target file changed": (
+				target_changed,
+				CHANGE_STATUS_STALE,
+				"stale",
+				"file đích đã đổi kể từ lúc đề xuất",
+			),
+			"content no longer matches the approved digest": (
+				content_edited,
+				CHANGE_STATUS_FAILED,
+				"fail",
+				"nội dung đề xuất đã bị sửa sau khi duyệt",
+			),
+			"checked-out branch changed": (
+				branch_changed,
+				CHANGE_STATUS_STALE,
+				"stale",
+				"nhánh đang checkout đã đổi kể từ lúc đề xuất",
+			),
+			"app removed from the allowed list": (
+				app_removed,
+				CHANGE_STATUS_FAILED,
+				"fail",
+				"app không có trong danh sách được sửa",
+			),
+		}
+		for case, (change, status, step, reason) in cases.items():
+			with self.subTest(case=case):
+				reset()
+				name = self.sandbox_proposal()
+				self.assertEqual(
+					self.post(INSTRUCTOR, "approve", name=name)["status"], CHANGE_STATUS_APPROVED
+				)
+				change(name)
+				before = (self.target_bytes(), self.sandbox_git("rev-parse", "HEAD"))
+				count = self.sandbox_git("rev-list", "--count", "HEAD")
+				worktree = self.sandbox_git("status", "--porcelain")
+
+				spies = self.run_queued_job(name)
+
+				self.assertEqual(self.status_and_reason(name), (status, reason))
+				self.assertEqual((self.target_bytes(), self.sandbox_git("rev-parse", "HEAD")), before)
+				self.assertEqual(self.sandbox_git("rev-list", "--count", "HEAD"), count)
+				self.assertEqual(self.sandbox_git("status", "--porcelain"), worktree)
+				self.assertEqual(
+					{target: spy.call_count for target, spy in spies.items()}, dict.fromkeys(spies, 0)
+				)
+				self.assertEqual(
+					[(row.change_step, row.actor, row.error) for row in self.change_rows(name)],
+					[("approve", INSTRUCTOR, None), (step, INSTRUCTOR, reason)],
+				)
+
+	def test_decide_logs_exactly_one_row_with_the_caller_as_actor(self):
+		"""AC-12: one `decide` call, one log row, naming the user who called it."""
+		for action, status in (("approve", CHANGE_STATUS_APPROVED), ("reject", CHANGE_STATUS_REJECTED)):
+			with self.subTest(action=action):
+				# Proposed for someone else than the caller: the row names the caller only by being right.
+				name = make_change_proposal(ticket=self.proposal.ticket, instructor=TICKET_CREATOR).name
+				self.assertEqual(self.change_rows(name), [])
+
+				self.assertEqual(self.post(INSTRUCTOR, action, name=name)["status"], status)
+
+				(row,) = self.change_rows(name)
+				self.assertEqual(
+					(row.change_step, row.actor, row.error, row.ticket),
+					(action, INSTRUCTOR, None, self.proposal.ticket),
+				)
+				self.assertIsNotNone(row.creation)
+				self.assertEqual(frappe.db.get_value(PROPOSAL_DOCTYPE, name, "decided_by"), INSTRUCTOR)

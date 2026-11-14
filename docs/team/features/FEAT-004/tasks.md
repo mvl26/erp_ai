@@ -784,11 +784,12 @@ Chữ, tên hàm, tên cờ dùng chung: `plan.md` mục "Chèn CHG-001". Quyế
 
 ## Phần 8, sửa sau nghiệm thu lần 2 (chèn 2026-11-14, `/team:plan --insert --decide`; căn cứ `acceptance-r4.md` @ `789d524` F-R4-2; F-R4-1 do analyst sửa bằng Amendment 3 của spec, xem `plan.md` mục "Chèn sau nghiệm thu lần 2")
 
-- [ ] T70 — F-R4-2: ca liên kết sai ghim câu báo lỗi viết tay — files: erp_ai/test_change_decision.py — test: erp_ai/test_change_decision.py — depends: —
+- [x] T70 — F-R4-2: ca liên kết sai ghim câu báo lỗi viết tay — files: erp_ai/test_change_decision.py — test: erp_ai/test_change_decision.py — depends: —
   - Criterion: `acceptance-r4.md` F-R4-2 (minor STD-TEST-2); AC-26 ("trang báo "không hợp lệ" hoặc lý do từ chối, khi: chữ ký thiếu hoặc sai; chữ ký của đề xuất khác; hành động khác duyệt/từ chối"); không sửa mã sản phẩm; không nới phép so nào (STD-TEST-5)
   - Receives: `test_post_bad_signature_changed_action_or_name_writes_nothing` (6 ca: wrong, empty, action changed, name changed, signed for the other name, unknown action) đang truyền `change_decision.BAD_LINK` cho `assertRefused(user, http_method, action, message, signature=None, name=None)`; `assertRefused` so `str(exc) == message`; mẫu hằng viết tay `ROLE_REFUSAL` ở `test_change_decision.py:42`
   - Returns: 6 ca trên so thông điệp với một chuỗi viết tay trong file test (hằng mức module, cùng kiểu `ROLE_REFUSAL`), chuỗi có cụm `không hợp lệ` của AC-26; trong test này không còn tham chiếu `change_decision.BAD_LINK`; `assertRefused` và mọi phép so khác (trạng thái, số dòng nhật ký, 0 job, đề xuất kia vẫn "Chờ duyệt") giữ nguyên; `git diff --name-only` chỉ có `erp_ai/test_change_decision.py`. Câu trong mã khác AC-26 (không có cụm `không hợp lệ`) → dừng, báo `DONE_WITH_CONCERNS`, không sửa mã và không sửa chuỗi kỳ vọng cho khớp
   - Expect: đây là task chỉ sửa test, mã đang đúng nên test mới xanh ngay; bằng chứng đỏ là một lần đột biến KHÔNG commit: tạm đổi `BAD_LINK` trong `erp_ai/change_decision.py` thành câu khác → `cmd.test_one` đỏ ở `test_post_bad_signature_changed_action_or_name_writes_nothing` với `AssertionError` so chuỗi (bản cũ so với hằng thì vẫn xanh dưới cùng đột biến), `git checkout -- erp_ai/change_decision.py` → `cmd.test_one` `OK`; dán cả hai dòng kết quả
+  - progress: BASE=b2da34e · round 90: dev T70 (lần 1, nhánh `team/FEAT-004-task-70`) → `DONE` `e949542` (hằng viết tay `BAD_LINK_REFUSAL`; câu trong mã có cụm "không hợp lệ" của AC-26, không sửa mã) · round 91: review vòng 1 (`b2da34e..e949542`) approve · merge `32132a6` · sau merge dưới khóa: test_change_decision chạy riêng `Ran 10 tests in 25.731s` / `OK` · review-70
 
 ## Checkpoint cuối (tech-lead, không giao dev)
 

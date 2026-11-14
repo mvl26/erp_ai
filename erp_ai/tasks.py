@@ -1,4 +1,5 @@
-from datetime import datetime
+import json
+from datetime import datetime, timedelta
 
 import frappe
 from frappe.permissions import AUTOMATIC_ROLES
@@ -6,6 +7,7 @@ from frappe.query_builder.functions import Sum
 from frappe.utils import add_months, get_datetime, now_datetime
 
 from erp_ai import alerts, gateway
+from erp_ai.agent.runner import GENERIC_WRITE_TOOLS
 from erp_ai.constants import (
 	AGENT_USER,
 	CREDENTIAL_DOCTYPE,
@@ -17,7 +19,18 @@ from erp_ai.constants import (
 )
 
 PERMISSION_DOCTYPES = ("Custom DocPerm", "DocPerm", "Role", "Has Role", "User Permission", "Role Profile")
+HAS_ROLE_DOCTYPE = "Has Role"
+DOCTYPE_DOCTYPE = "DocType"
 MAX_LISTED_NAMES = 5
+# Rows newer than now minus this are left for the next run: covers write_entry's insert-to-commit gap and clock skew.
+PRIVILEGE_ALERT_SETTLE_S = 300
+# Frappe 15 reads an empty Datetime single back as this value instead of None.
+EMPTY_DATETIME = datetime(1, 1, 1)
+UNKNOWN_INSTRUCTOR = "không rõ"
+# Verb of each generic write tool, keyed by the action word of its name (`api_<word>_record`), so the tool names
+# come only from runner.GENERIC_WRITE_TOOLS; a new generic tool with another word fails at import, never mislabelled.
+CHANGE_VERBS = {"create": "tạo", "update": "sửa", "delete": "xóa", "submit": "submit/hủy"}
+PRIVILEGE_CHANGE_VERBS = {tool: CHANGE_VERBS[tool.split("_")[1]] for tool in GENERIC_WRITE_TOOLS}
 
 
 def recompute_monthly_spend(now: datetime | None = None) -> None:
@@ -81,13 +94,43 @@ def _agent_role_drift() -> list[str]:
 	return [f"thừa role {role}" for role in extra] + [f"thiếu role {role}" for role in missing]
 
 
-def _permission_records_by_agent() -> list[str]:
-	names = []
-	for doctype in PERMISSION_DOCTYPES:
-		if frappe.db.exists("DocType", doctype):
-			rows = frappe.get_all(doctype, filters={"modified_by": AGENT_USER}, pluck="name")
-			names.extend(f"{doctype} {name}" for name in rows)
-	return names
+def _load_snapshots(raw) -> dict:
+	"""The `"<tool>#<n>"` snapshots of a `reason` row's `value_before`/`value_after` column (design-amd2 §2)."""
+	return json.loads(raw) if raw else {}
+
+
+def _is_permission_change(doctype, key: str, before: dict, after: dict) -> bool:
+	if doctype == DOCTYPE_DOCTYPE:
+		return (before.get(key) or {}).get("permissions") != (after.get(key) or {}).get("permissions")
+	return doctype in PERMISSION_DOCTYPES and doctype != HAS_ROLE_DOCTYPE
+
+
+def _privilege_changes_by_agent(lower: datetime | None, upper: datetime) -> list[str]:
+	"""One entry per successful generic write on a permission record logged in (lower, upper] (ADR-024 QĐ 1, 3.3).
+
+	Reads `reason` rows of ERP AI Log by `creation`, oldest first; no lower bound when `lower` is empty.
+	A DocType write counts only when its `permissions` snapshot changed. `Has Role` rows are User changes.
+	"""
+	log = frappe.qb.DocType(LOG_DOCTYPE)
+	query = (
+		frappe.qb.from_(log)
+		.select(log.creation, log.instructor, log.actions, log.value_before, log.value_after)
+		.where((log.entry_type == "reason") & (log.creation <= upper) & log.actions.like("%api_%"))
+		.orderby(log.creation)
+	)
+	if lower:
+		query = query.where(log.creation > lower)
+	changes = []
+	for row in query.run(as_dict=True):
+		before, after = _load_snapshots(row.value_before), _load_snapshots(row.value_after)
+		by = f"người ra lệnh {row.instructor or UNKNOWN_INSTRUCTOR}, {row.creation:%Y-%m-%d %H:%M}"
+		for position, action in enumerate(json.loads(row.actions), start=1):
+			tool, doctype = action.get("tool"), action.get("doctype")
+			if tool not in GENERIC_WRITE_TOOLS or not action.get("ok"):
+				continue
+			if _is_permission_change(doctype, f"{tool}#{position}", before, after):
+				changes.append(f"{PRIVILEGE_CHANGE_VERBS[tool]} {doctype} {action.get('name')} ({by})")
+	return changes
 
 
 def _enabled_scripts_by_agent() -> list[str]:
@@ -119,23 +162,28 @@ def _raise_alarm(subject: str, names: list[str]) -> None:
 		frappe.log_error(TITLE_RUN_FAILED, f"check_privilege_escalation email error={type(exc).__name__}")
 
 
-def check_privilege_escalation() -> None:
+def check_privilege_escalation(now: datetime | None = None) -> None:
 	"""Daily job (AC-18): one alarm per escalation condition that holds.
 
 	Conditions: the agent account's roles (minus automatic ones) differ from {ERP AI Agent, Agent}
-	(extra or missing, or the account is gone); permission records
-	modified by the agent; enabled Server Script/Webhook owned by the agent; an enabled key with an
-	empty `api_key`. Messages list at most 5 names and never any key text. A failing alarm email is
-	logged under TITLE_RUN_FAILED and the alarm Error Log is kept; the remaining conditions still run.
-	On any error it rolls back, logs a constant title with an explicit message and returns (D-20).
+	(extra or missing, or the account is gone); permission records the agent wrote, read from the ERP AI Log
+	rows created in (watermark, now - PRIVILEGE_ALERT_SETTLE_S]; enabled Server Script/Webhook owned by the
+	agent; an enabled key with an empty `api_key`. Messages list at most 5 names and never any key text.
+	A failing alarm email is logged under TITLE_RUN_FAILED and the alarm Error Log is kept; the remaining
+	conditions still run. On any error it rolls back, logs a constant title with an explicit message and
+	returns (D-20).
 	"""
-	checks = (
-		("Tài khoản agent có role ngoài danh sách cho phép", _agent_role_drift),
-		("Agent đã sửa bản ghi phân quyền", _permission_records_by_agent),
-		("Server Script/Webhook do agent tạo đang bật", _enabled_scripts_by_agent),
-		("Khóa đang bật nhưng không có giá trị", _enabled_keys_without_value),
-	)
+	upper = (get_datetime(now) if now else now_datetime()) - timedelta(seconds=PRIVILEGE_ALERT_SETTLE_S)
 	try:
+		lower = frappe.db.get_single_value(SETTING_DOCTYPE, "privilege_alert_checked_until", cache=False)
+		if lower == EMPTY_DATETIME:
+			lower = None
+		checks = (
+			("Tài khoản agent có role ngoài danh sách cho phép", _agent_role_drift),
+			("Agent đã sửa bản ghi phân quyền", lambda: _privilege_changes_by_agent(lower, upper)),
+			("Server Script/Webhook do agent tạo đang bật", _enabled_scripts_by_agent),
+			("Khóa đang bật nhưng không có giá trị", _enabled_keys_without_value),
+		)
 		for subject, find in checks:
 			names = find()
 			if names:

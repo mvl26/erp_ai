@@ -3,6 +3,7 @@ from frappe.model.document import Document
 
 from erp_ai import gateway
 from erp_ai.agent import policy
+from erp_ai.agent.agent_write_guard import refuse_agent_write
 from erp_ai.agent.classification import validate_mapping
 from erp_ai.agent.routing import validate_routing_config
 from erp_ai.agent.tools import source
@@ -56,7 +57,12 @@ PROBE_RESULT_FIELDS = ("label", "ok", "error_kind", "status")
 
 
 class ERPAISetting(Document):
+	# No valid write path for the agent account (ADR-023 QĐ 5).
+	def before_insert(self):
+		refuse_agent_write(self)
+
 	def validate(self):
+		refuse_agent_write(self)
 		self.restore_self_managed_fields()
 		self.check_labels()
 		validate_mapping(self.category_mapping)
@@ -65,6 +71,18 @@ class ERPAISetting(Document):
 		self.check_limits()
 		self.check_status_settings()
 		self.check_enabled_requirements()
+
+	def on_trash(self):
+		refuse_agent_write(self)
+
+	def before_rename(self, old, new, merge=False):
+		refuse_agent_write(self)
+
+	def before_submit(self):
+		refuse_agent_write(self)
+
+	def before_cancel(self):
+		refuse_agent_write(self)
 
 	def restore_self_managed_fields(self):
 		# (b) the monthly spend is written only by the scheduler

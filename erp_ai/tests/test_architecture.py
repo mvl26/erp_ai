@@ -14,6 +14,7 @@ synthetic violating code (must be caught) and clean code (must not be flagged).
 """
 
 import ast
+import itertools
 import json
 import os
 import re
@@ -22,7 +23,7 @@ import subprocess
 import sys
 import unittest
 from pathlib import Path
-from typing import ClassVar
+from typing import ClassVar, NamedTuple
 
 from erp_ai.constants import AGENT_STATUS_EVENT, PANEL_METHODS
 
@@ -50,6 +51,22 @@ SUBPROCESS_FILES = (SOURCE_TOOL_FILE, PROCESS_RUNNER_FILE)
 READ_TOOL_FILE = "agent/tools/read.py"
 HANDLERS_FILE = "handlers.py"
 TOOLS_PREFIX = "agent/tools/"
+CHANGE_TEXT_FILE = "agent/change_text.py"
+CHANGE_TEXT_MODULE = "erp_ai.agent.change_text"
+# Design 8.2 [Sửa vòng 1]: change_text imports only the standard library and erp_ai.constants. Every other
+# erp_ai module is read from the tree (so a new one is covered); third-party code is check_import_boundaries'.
+CHANGE_TEXT_FORBIDDEN = (
+	"frappe",
+	"helpdesk",
+	*sorted(
+		f"{PACKAGE}.{path.stem}"
+		for path in PACKAGE_ROOT.iterdir()
+		if path.stem.isidentifier()
+		and not path.stem.startswith("__")
+		and path.stem != "constants"
+		and (path.is_dir() or path.suffix == ".py")
+	),
+)
 
 # ADR-001 (layers), ADR-003 (handlers), ADR-005 (tools): (scope module, forbidden modules, reason).
 LAYER_RULES = (
@@ -111,6 +128,11 @@ LAYER_RULES = (
 		"erp_ai.agent.policy",
 		("erp_ai.agent.tools",),
 		"STD-DESIGN-6: policy là tầng dưới của tools, không import ngược",
+	),
+	(
+		CHANGE_TEXT_MODULE,
+		CHANGE_TEXT_FORBIDDEN,
+		"design 8.2/ADR-022: change_text imports only the standard library and erp_ai.constants",
 	),
 )
 # NOT forbidden on purpose: erp_ai.eval -> erp_ai.agent.runner (entry layer -> agent core, ADR-001).
@@ -1857,6 +1879,2120 @@ def check_entry_types_unchanged(sources: dict) -> list:
 	return violations
 
 
+# ---------------------------------------------------------------------------------------------------
+# FEAT-004 rules, group 1 (ADR-011, ADR-012 "Ràng buộc"; design 8.2)
+# ---------------------------------------------------------------------------------------------------
+
+CHANGES_PREFIX = "agent/changes/"
+TRANSITIONS_FILE = "agent/changes/transitions.py"
+TRANSITIONS_MODULE = "erp_ai.agent.changes.transitions"
+PROPOSAL_CONTROLLER_FILE = "erp_ai_agent/doctype/erp_ai_change_proposal/erp_ai_change_proposal.py"
+PROPOSAL_DOCTYPE_FILE = "erp_ai_agent/doctype/erp_ai_change_proposal/erp_ai_change_proposal.json"
+PROPOSAL_DOCTYPE_NAME = "ERP AI Change Proposal"
+PROPOSAL_DOCTYPE_CONSTANT = "PROPOSAL_DOCTYPE"
+PROPOSE_TOOL_FILE = "agent/tools/propose_change.py"
+CHANGE_GUARD_FILE = "agent/tools/change_guard.py"
+CHANGE_GUARD_FUNCTION = "check_write_path"
+SAFE_PATH_CALL = "erp_ai.agent.tools.source.resolve_safe_path"
+SAFE_PATH_NAME = "safe_path"  # any function so named outside source.py is a second resolver (ADR-011)
+ROOT_CHECK_CALLS = ("commonpath", "is_relative_to")
+MODULE_SCOPE = "<module>"
+# Hand-written: (file, function) allowed to root-check outside source.py. check_write_path only
+# classifies a path resolve_safe_path already refused, to pick the refusal reason (ADR-011, design table 3.1).
+ROOT_CHECK_ALLOWLIST = frozenset(
+	{
+		(CHANGE_GUARD_FILE, CHANGE_GUARD_FUNCTION),
+		# Guards the output path of the offline eval export; predates FEAT-004 and is on no path the agent's
+		# tools or the apply job write through.
+		("eval/export_tickets.py", "_inside_repo"),
+	}
+)
+
+# Design 2.1 state group (11 names) + the 4 git result fields of amendment 1, in transitions.STATE_FIELDS order.
+STATE_FIELDS = (
+	"change_status",
+	"decided_by",
+	"decided_at",
+	"approved_digest",
+	"undo_by",
+	"undo_at",
+	"finished_at",
+	"exit_code",
+	"duration_ms",
+	"command_output",
+	"failure_reason",
+	"applied_branch",
+	"applied_ahead_count",
+	"apply_commit_sha",
+	"undo_commit_sha",
+)
+STATE_WRITE_CALLS = ("set", "db_set", "set_value", "update", "setattr")
+STATE_KEYWORD_CALLS = (*STATE_WRITE_CALLS, "get_doc", "new_doc", "dict")
+
+# ADR-012 Ràng buộc, design 2.1: every role on the proposal DocType and the only permissions it holds.
+PROPOSAL_PERMISSIONS = {
+	"ERP AI Agent": frozenset({"create", "read"}),
+	"ERP AI Instructor": frozenset({"read"}),
+	"System Manager": frozenset({"read"}),
+}
+PROPOSAL_FORBIDDEN_PERMISSIONS = ("write", "delete", "submit", "cancel", "amend")
+# The check fields of a Frappe DocPerm row.
+DOCPERM_FLAGS = (
+	"select",
+	"read",
+	"write",
+	"create",
+	"delete",
+	"submit",
+	"cancel",
+	"amend",
+	"report",
+	"export",
+	"import",
+	"share",
+	"print",
+	"email",
+)
+PROPOSAL_SAVE_CALLS = ("save", "db_set", "set_value")
+# A tool that loads/deletes a document of a non-constant DocType and saves/deletes it writes any DocType
+# (site_api.update_record / delete_record); only its deny sets keep the proposal out (ADR-011).
+GENERIC_DOC_CALLS = ("get_doc", "delete_doc")
+GENERIC_WRITE_CALLS = ("save", "delete")
+DENY_SET_SUFFIX = "DENIED_DOCTYPES"
+SITE_API_FILE = "agent/tools/site_api.py"
+# ADR-023 Quyết định 3: site_api derives its deny sets; it never writes the app's DocType names by hand.
+APP_DOCTYPE_CONSTANTS = ("SETTING_DOCTYPE", "CREDENTIAL_DOCTYPE", "LOG_DOCTYPE", PROPOSAL_DOCTYPE_CONSTANT)
+APP_DOCTYPE_NAMES = ("ERP AI Setting", "ERP AI Credential", "ERP AI Log", PROPOSAL_DOCTYPE_NAME)
+SET_LITERAL_CALLS = ("set", "frozenset", "tuple", "list")
+SITE_API_ALWAYS_DENIED = "always_denied_doctypes"
+# The calls that yield a derived deny set: site_api's own function and read.denied_doctypes().
+SITE_API_DENY_SOURCES = (SITE_API_ALWAYS_DENIED, "denied_doctypes")
+# Where the derived set comes from: the app's module, or read.denied_doctypes() (ADR-023 Ràng buộc).
+SITE_API_DERIVED_FROM = ("AI_MODULE", "denied_doctypes")
+SITE_API_TOOL_PREFIX = "api_"
+SITE_API_WRITE_CALLS = (
+	"save",
+	"insert",
+	"delete",
+	"delete_doc",
+	"submit",
+	"cancel",
+	"call",
+	*PROPOSAL_SAVE_CALLS,
+)
+
+
+def check_transitions_imported_only_by_controller_and_changes(sources: dict) -> list:
+	"""ADR-012 Ràng buộc: only the proposal controller and agent/changes/** reach the state machine
+	(an import, `changes.transitions` through an imported package, or the dotted path as a string)."""
+	reason = "ADR-012: only the proposal controller and agent/changes/ use the state machine"
+	violations = []
+	for rel, source in only_python(sources).items():
+		if rel == PROPOSAL_CONTROLLER_FILE or rel.startswith(CHANGES_PREFIX):
+			continue
+		tree = parse(rel, source)
+		aliases = import_aliases(tree)
+		for lineno, target in imported_modules(tree, module_name(rel), rel.endswith("__init__.py")):
+			if module_in(target, TRANSITIONS_MODULE):
+				violations.append(f"{rel}:{lineno}: imports {target} ({reason})")
+		for node in ast.walk(tree):
+			if isinstance(node, ast.Attribute) and resolved_name(node, aliases) == TRANSITIONS_MODULE:
+				violations.append(violation(rel, node, f"reaches {TRANSITIONS_MODULE} ({reason})"))
+			elif (
+				isinstance(node, ast.Constant)
+				and isinstance(node.value, str)
+				and module_in(node.value, TRANSITIONS_MODULE)
+			):
+				violations.append(violation(rel, node, f"names {node.value} ({reason})"))
+	return violations
+
+
+def _state_field_writes(tree: ast.AST):
+	"""`(node, how)` for every write of a STATE_FIELDS name: assignment target, dict key, `set`-like call
+	with the name as a positional string or attribute (`qb.set(T.change_status, v)`), or the name as a
+	keyword of a document write/create call or of `dict(...)`."""
+	for node in ast.walk(tree):
+		targets = []
+		if isinstance(node, ast.Assign):
+			targets = node.targets
+		elif isinstance(node, ast.AugAssign | ast.AnnAssign):
+			targets = [node.target]
+		for target in targets:
+			for part in ast.walk(target):
+				if isinstance(part, ast.Attribute) and part.attr in STATE_FIELDS:
+					yield part, f"assigns .{part.attr}"
+				elif isinstance(part, ast.Constant) and part.value in STATE_FIELDS:
+					yield part, f"assigns [{part.value!r}]"
+		if isinstance(node, ast.Dict):
+			for key in node.keys:
+				if isinstance(key, ast.Constant) and key.value in STATE_FIELDS:
+					yield key, f"sets {key.value!r}"
+		elif isinstance(node, ast.Call):
+			function = (dotted_name(node.func) or "").split(".")[-1]
+			if function in STATE_WRITE_CALLS:
+				for arg in node.args:
+					if isinstance(arg, ast.Constant) and arg.value in STATE_FIELDS:
+						yield arg, f"{function}({arg.value!r})"
+					elif isinstance(arg, ast.Attribute) and arg.attr in STATE_FIELDS:
+						yield arg, f"{function}(.{arg.attr})"
+			if function in STATE_KEYWORD_CALLS:
+				for keyword in node.keywords:
+					if keyword.arg in STATE_FIELDS:
+						yield keyword.value, f"{function}({keyword.arg}=)"
+
+
+def check_change_state_fields_written_only_in_changes(sources: dict) -> list:
+	"""ADR-012 QĐ 2 / Ràng buộc ("Ghi vào"): the proposal state group (STATE_FIELDS) is written only under
+	agent/changes/; reads are allowed. Design 8.2 words this more broadly; ADR-012's write-only scope is kept."""
+	violations = []
+	for rel, source in only_python(sources).items():
+		if rel.startswith(CHANGES_PREFIX):
+			continue
+		for node, how in _state_field_writes(parse(rel, source)):
+			violations.append(
+				violation(rel, node, f"{how}: a proposal state field outside {CHANGES_PREFIX} (ADR-012)")
+			)
+	return violations
+
+
+def _resolver_results(function, aliases: dict) -> set:
+	"""Local names bound to a `resolve_safe_path(...)` result (`full = ...` or `(full := ...)`)."""
+	names = set()
+	for node in ast.walk(function):
+		if isinstance(node, ast.Assign | ast.NamedExpr) and isinstance(node.value, ast.Call):
+			if resolved_name(node.value.func, aliases) == SAFE_PATH_CALL:
+				targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+				names.update(target.id for target in targets if isinstance(target, ast.Name))
+	return names
+
+
+def _tests_none(test, names: set) -> bool:
+	"""`x is None`, `(x := ...) is None` or `not x` for x in `names`."""
+	if isinstance(test, ast.UnaryOp) and isinstance(test.op, ast.Not):
+		return isinstance(test.operand, ast.Name) and test.operand.id in names
+	if not (isinstance(test, ast.Compare) and len(test.ops) == 1 and isinstance(test.ops[0], ast.Is)):
+		return False
+	left = test.left.target if isinstance(test.left, ast.NamedExpr) else test.left
+	right = test.comparators[0]
+	return (
+		isinstance(left, ast.Name)
+		and left.id in names
+		and isinstance(right, ast.Constant)
+		and right.value is None
+	)
+
+
+def _refuses_when_unresolved(function, aliases: dict) -> bool:
+	"""An `if <resolve_safe_path result> is None:` whose body returns a call (the refusal) or raises."""
+	names = _resolver_results(function, aliases)
+	return any(
+		isinstance(node, ast.If)
+		and _tests_none(node.test, names)
+		and any(
+			isinstance(stmt, ast.Raise) or (isinstance(stmt, ast.Return) and isinstance(stmt.value, ast.Call))
+			for stmt in node.body
+		)
+		for node in ast.walk(function)
+	)
+
+
+def _root_check_calls(node: ast.AST, function: str = MODULE_SCOPE):
+	"""`(innermost enclosing function name, call)` for every `commonpath`/`is_relative_to` call, realpath nearby or
+	not: source.py itself splits the root check (`_inside`) from the realpath calls of its caller."""
+	for child in ast.iter_child_nodes(node):
+		scope = child.name if isinstance(child, ast.FunctionDef | ast.AsyncFunctionDef) else function
+		if isinstance(child, ast.Call) and referenced_name(child.func) in ROOT_CHECK_CALLS:
+			yield function, child
+		yield from _root_check_calls(child, scope)
+
+
+def check_change_guard_uses_resolve_safe_path(sources: dict) -> list:
+	"""ADR-011 Ràng buộc: `change_guard.check_write_path` calls `source.resolve_safe_path` and refuses when it
+	returns None; outside source.py no function is named like it and no code checks a root
+	(`commonpath`/`is_relative_to`, with or without realpath; ROOT_CHECK_ALLOWLIST holds the guard's own classification of a refused path)."""
+	guard = sources.get(CHANGE_GUARD_FILE)
+	if guard is None:
+		return _missing(CHANGE_GUARD_FILE)
+	violations = []
+	tree = parse(CHANGE_GUARD_FILE, guard)
+	aliases = import_aliases(tree)
+	function = next(
+		(
+			node
+			for node in tree.body
+			if isinstance(node, ast.FunctionDef) and node.name == CHANGE_GUARD_FUNCTION
+		),
+		None,
+	)
+	if function is None:
+		violations.append(f"{CHANGE_GUARD_FILE}: no top-level {CHANGE_GUARD_FUNCTION}() (ADR-011)")
+	elif not any(
+		isinstance(node, ast.Call) and resolved_name(node.func, aliases) == SAFE_PATH_CALL
+		for node in ast.walk(function)
+	):
+		violations.append(
+			violation(
+				CHANGE_GUARD_FILE,
+				function,
+				f"{CHANGE_GUARD_FUNCTION} does not call {SAFE_PATH_CALL} (ADR-011)",
+			)
+		)
+	elif not _refuses_when_unresolved(function, aliases):
+		violations.append(
+			violation(
+				CHANGE_GUARD_FILE,
+				function,
+				f"{CHANGE_GUARD_FUNCTION} does not refuse when {SAFE_PATH_CALL} returns None (ADR-011)",
+			)
+		)
+	for rel, source in only_python(sources).items():
+		if rel == SOURCE_TOOL_FILE:
+			continue
+		tree = parse(rel, source)
+		for node in ast.walk(tree):
+			if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef) and SAFE_PATH_NAME in node.name:
+				violations.append(violation(rel, node, f"{node.name}() is a second path resolver (ADR-011)"))
+		for function, call in _root_check_calls(tree):
+			if (rel, function) not in ROOT_CHECK_ALLOWLIST:
+				violations.append(
+					violation(
+						rel,
+						call,
+						f"{function}() calls {referenced_name(call.func)}: a second root check (ADR-011)",
+					)
+				)
+	return violations
+
+
+def check_proposal_doctype_permissions(sources: dict) -> list:
+	"""ADR-012 Ràng buộc: no role has write/delete/submit/cancel/amend on the proposal; each role holds exactly
+	the permissions of PROPOSAL_PERMISSIONS (rows of one role are merged)."""
+	text = sources.get(PROPOSAL_DOCTYPE_FILE)
+	if text is None:
+		return _missing(PROPOSAL_DOCTYPE_FILE)
+	violations = []
+	granted = {}
+	for row in json.loads(text).get("permissions") or []:
+		role = row.get("role")
+		flags = {flag for flag in DOCPERM_FLAGS if row.get(flag)}
+		violations.extend(
+			f"{PROPOSAL_DOCTYPE_FILE}: role {role!r} has {flag} (ADR-012)"
+			for flag in PROPOSAL_FORBIDDEN_PERMISSIONS
+			if flag in flags
+		)
+		granted.setdefault(role, set()).update(flags - set(PROPOSAL_FORBIDDEN_PERMISSIONS))
+	for role in sorted(set(granted) | set(PROPOSAL_PERMISSIONS), key=str):
+		expected = PROPOSAL_PERMISSIONS.get(role, frozenset())
+		if granted.get(role, set()) != expected:
+			violations.append(
+				f"{PROPOSAL_DOCTYPE_FILE}: role {role!r} has {sorted(granted.get(role, ()))}, "
+				f"expected {sorted(expected)} (ADR-012)"
+			)
+	return violations
+
+
+def _names_proposal(node) -> bool:
+	return (isinstance(node, ast.Constant) and node.value == PROPOSAL_DOCTYPE_NAME) or (
+		referenced_name(node) == PROPOSAL_DOCTYPE_CONSTANT
+	)
+
+
+def _builds_proposal(tree: ast.AST) -> bool:
+	"""The module loads or creates a proposal: `get_doc`/`new_doc`(proposal, ...) or `{"doctype": proposal}`."""
+	for node in ast.walk(tree):
+		if isinstance(node, ast.Call) and referenced_name(node.func) in DOC_GETTERS and node.args:
+			if _names_proposal(node.args[0]):
+				return True
+		elif isinstance(node, ast.Dict) and any(
+			isinstance(key, ast.Constant) and key.value == "doctype" and _names_proposal(value)
+			for key, value in zip(node.keys, node.values, strict=True)
+		):
+			return True
+	return False
+
+
+def _writes_any_doctype(tree: ast.AST) -> bool:
+	"""The module loads a document of a non-constant DocType and saves/deletes it, or deletes one directly."""
+	generic = set()
+	for node in ast.walk(tree):
+		if isinstance(node, ast.Call) and referenced_name(node.func) in GENERIC_DOC_CALLS:
+			# Positional, or keywords only: `get_doc(doctype=d, name=n)`.
+			first = (
+				node.args[0]
+				if node.args
+				else next((keyword.value for keyword in node.keywords if keyword.arg == "doctype"), None)
+			)
+			if first is None:
+				continue
+			constant = isinstance(first, ast.Constant | ast.Dict) or (referenced_name(first) or "").isupper()
+			if not constant and not _names_proposal(first):
+				generic.add(referenced_name(node.func))
+	if "delete_doc" in generic:
+		return True
+	return "get_doc" in generic and any(
+		isinstance(node, ast.Call) and referenced_name(node.func) in GENERIC_WRITE_CALLS
+		for node in ast.walk(tree)
+	)
+
+
+def _contains_proposal(node) -> bool:
+	"""The set expression keeps the proposal DocType: named in a literal or set call, or on either side of `|`;
+	on the right of `-` it is taken out, so only the left side counts."""
+	if _names_proposal(node):
+		return True
+	if isinstance(node, ast.Set | ast.List | ast.Tuple):
+		return any(_contains_proposal(element) for element in node.elts)
+	if isinstance(node, ast.Call):
+		return any(_contains_proposal(arg) for arg in node.args)
+	if isinstance(node, ast.BinOp) and isinstance(node.op, ast.BitOr):
+		return _contains_proposal(node.left) or _contains_proposal(node.right)
+	if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Sub):
+		return _contains_proposal(node.left)
+	return False
+
+
+def _deny_sets(tree: ast.AST) -> dict:
+	"""`{name: (node, value)}` of module-level assignments to a `*DENIED_DOCTYPES` name."""
+	found = {}
+	for node in tree.body:
+		if isinstance(node, ast.Assign):
+			for target in node.targets:
+				if isinstance(target, ast.Name) and target.id.endswith(DENY_SET_SUFFIX):
+					found[target.id] = (node, node.value)
+	return found
+
+
+def _names_app_doctype(node) -> bool:
+	return (isinstance(node, ast.Constant) and node.value in APP_DOCTYPE_NAMES) or (
+		isinstance(node, ast.Name | ast.Attribute) and referenced_name(node) in APP_DOCTYPE_CONSTANTS
+	)
+
+
+def _literal_names_app_doctype(node) -> bool:
+	"""`node` holds a set/tuple/list literal (bare or inside set()/frozenset()/...) naming an app DocType."""
+	for inner in ast.walk(node):
+		if isinstance(inner, ast.Set | ast.Tuple | ast.List) and any(
+			_names_app_doctype(e) for e in inner.elts
+		):
+			return True
+		if (
+			isinstance(inner, ast.Call)
+			and referenced_name(inner.func) in SET_LITERAL_CALLS
+			and any(_names_app_doctype(arg) for arg in inner.args)
+		):
+			return True
+	return False
+
+
+def _removes_app_doctype(node) -> bool:
+	"""`node` takes an app DocType out of a set: `x - {PROPOSAL_DOCTYPE}` or `x.difference(...)`."""
+	for inner in ast.walk(node):
+		if isinstance(inner, ast.BinOp) and isinstance(inner.op, ast.Sub):
+			if any(_names_app_doctype(part) for part in ast.walk(inner.right)):
+				return True
+		elif isinstance(inner, ast.Call) and referenced_name(inner.func) == "difference":
+			if any(_names_app_doctype(part) for arg in inner.args for part in ast.walk(arg)):
+				return True
+	return False
+
+
+def _module_functions(tree: ast.AST) -> dict:
+	return {node.name: node for node in tree.body if isinstance(node, ast.FunctionDef)}
+
+
+def _called_names(node) -> set:
+	return {referenced_name(call.func) for call in ast.walk(node) if isinstance(call, ast.Call)} - {None}
+
+
+def _reaches(node, targets: tuple, functions: dict, seen=frozenset()) -> bool:
+	"""`node` calls one of `targets`, directly or through the module's own functions."""
+	for name in _called_names(node):
+		if name in targets:
+			return True
+		if (
+			name in functions
+			and name not in seen
+			and _reaches(functions[name], targets, functions, seen | {name})
+		):
+			return True
+	return False
+
+
+def _returns_deny_set(name: str, functions: dict, seen=frozenset()) -> bool:
+	"""A deny source, or a module function whose every `return` value is built from a deny source."""
+	if name in SITE_API_DENY_SOURCES:
+		return True
+	function = functions.get(name)
+	if function is None or name in seen:
+		return False
+	returns = [node for node in ast.walk(function) if isinstance(node, ast.Return)]
+	return bool(returns) and all(
+		node.value is not None
+		and not _removes_app_doctype(node.value)
+		and any(_returns_deny_set(called, functions, seen | {name}) for called in _called_names(node.value))
+		for node in returns
+	)
+
+
+def _is_deny_gate(statement, functions: dict, seen=frozenset()) -> bool:
+	"""`if <test>: ... return` where the test calls a deny set, or a module function that has such a gate itself."""
+	if not isinstance(statement, ast.If) or not any(isinstance(node, ast.Return) for node in statement.body):
+		return False
+	if _removes_app_doctype(statement.test):
+		return False
+	return any(
+		_returns_deny_set(name, functions) or _has_deny_gate(name, functions, seen)
+		for name in _called_names(statement.test)
+	)
+
+
+def _has_deny_gate(name: str, functions: dict, seen=frozenset()) -> bool:
+	function = functions.get(name)
+	if function is None or name in seen:
+		return False
+	return any(_is_deny_gate(node, functions, seen | {name}) for node in ast.walk(function))
+
+
+def _site_api_handlers(tree: ast.AST) -> dict:
+	"""`{tool name: handler name}` of every `ToolSpec(name="api_...", handler=...)`."""
+	handlers = {}
+	for node in ast.walk(tree):
+		if not (isinstance(node, ast.Call) and referenced_name(node.func) == "ToolSpec"):
+			continue
+		keywords = {keyword.arg: keyword.value for keyword in node.keywords}
+		tool, handler = keywords.get("name"), keywords.get("handler")
+		if (
+			isinstance(tool, ast.Constant)
+			and isinstance(tool.value, str)
+			and tool.value.startswith(SITE_API_TOOL_PREFIX)
+		):
+			# Only a bare name is a function of this module; `other.handler` cannot be proven here.
+			handlers[tool.value] = handler.id if isinstance(handler, ast.Name) else None
+	return handlers
+
+
+def _site_api_deny_violations(rel: str, tree: ast.AST) -> list:
+	"""ADR-023 Quyết định 3 / ADR-011: site_api has no hand-written set of the app's DocTypes; the always-denied
+	set is derived from the app's module; every `api_*` handler is refused by that derived set before any write."""
+	violations = [
+		violation(
+			rel, node, "hand-written set of the app's DocTypes in site_api, derive the deny set (ADR-023)"
+		)
+		for node in tree.body
+		if isinstance(node, ast.Assign | ast.AnnAssign)
+		and node.value is not None
+		and _literal_names_app_doctype(node.value)
+	]
+	functions = _module_functions(tree)
+	always = functions.get(SITE_API_ALWAYS_DENIED)
+	if always is None:
+		violations.append(
+			f"{rel}: no {SITE_API_ALWAYS_DENIED}() deny set derived from the app's module (ADR-023)"
+		)
+	elif _literal_names_app_doctype(always) or not any(
+		referenced_name(node) in SITE_API_DERIVED_FROM for node in ast.walk(always)
+	):
+		violations.append(
+			violation(
+				rel, always, f"{SITE_API_ALWAYS_DENIED}() is not derived from the app's module (ADR-023)"
+			)
+		)
+	handlers = _site_api_handlers(tree)
+	if not handlers:
+		violations.append(
+			f"{rel}: saves/deletes any DocType but no {SITE_API_TOOL_PREFIX}* handler to check the deny gate"
+		)
+	for tool, name in handlers.items():
+		handler = functions.get(name)
+		if handler is None:
+			violations.append(f"{rel}: handler of {tool} is not a function of the module, deny gate unproven")
+			continue
+		gated = False
+		for statement in handler.body:
+			if _is_deny_gate(statement, functions):
+				gated = True
+				break
+			if isinstance(statement, ast.Return) or _reaches(statement, SITE_API_WRITE_CALLS, functions):
+				break
+		if not gated:
+			violations.append(
+				violation(
+					rel,
+					handler,
+					f"{tool} handler {name} writes or returns before the derived deny gate (ADR-011)",
+				)
+			)
+	return violations
+
+
+def _proposal_deny_violations(rel: str, tree: ast.AST) -> list:
+	"""ADR-011: a tool writing any DocType keeps the proposal out through its deny sets; site_api through the
+	derived deny gate of ADR-023."""
+	if not _writes_any_doctype(tree):
+		return []
+	if rel == SITE_API_FILE:
+		return _site_api_deny_violations(rel, tree)
+	sets = _deny_sets(tree)
+	violations = []
+	if not sets:
+		violations.append(
+			f"{rel}: saves/deletes any DocType but has no *{DENY_SET_SUFFIX} deny set (ADR-011)"
+		)
+	for name, (node, value) in sets.items():
+		if not _contains_proposal(value):
+			violations.append(
+				violation(
+					rel,
+					node,
+					f"deny set {name} lacks {PROPOSAL_DOCTYPE_CONSTANT} in a tool that saves any DocType (ADR-011)",
+				)
+			)
+	return violations
+
+
+def check_tool_never_saves_proposal(sources: dict) -> list:
+	"""ADR-011 Ràng buộc: a tool only `.insert()`s a proposal. In agent/tools/**, a module that loads or creates a
+	proposal has no `.save(`/`db_set`/`set_value` at all; any other module never passes the proposal to one; a
+	module that saves/deletes a non-constant DocType has the proposal in every `*DENIED_DOCTYPES` set; site_api
+	instead refuses every `api_*` call through its derived deny set before any write (ADR-023)."""
+	violations = []
+	for rel, source in only_python(scoped(sources, TOOLS_PREFIX)).items():
+		tree = parse(rel, source)
+		violations.extend(_proposal_deny_violations(rel, tree))
+		builds = _builds_proposal(tree)
+		for node in ast.walk(tree):
+			if not isinstance(node, ast.Call) or referenced_name(node.func) not in PROPOSAL_SAVE_CALLS:
+				continue
+			function = referenced_name(node.func)
+			if builds:
+				violations.append(
+					violation(
+						rel,
+						node,
+						f"{function} in a tool that builds an {PROPOSAL_DOCTYPE_NAME} (ADR-011: insert only)",
+					)
+				)
+			elif any(_names_proposal(arg) for arg in node.args):
+				violations.append(
+					violation(rel, node, f"{function} on an {PROPOSAL_DOCTYPE_NAME} in a tool (ADR-011)")
+				)
+	return violations
+
+
+# FEAT-004 T32: file-system writes and session/publish in the change path (ADR-013 Ràng buộc) ----------
+FILE_WRITER_FILE = "agent/changes/file_writer.py"
+# mode is the second positional argument of these; a method `.open(` (Path.open) takes it first
+OPEN_FUNCTIONS = ("open", "builtins.open", "io.open", "codecs.open", "os.fdopen")
+OPEN_WRITE_MODE_CHARS = frozenset("wax+")
+OS_OPEN_READ_FLAGS = frozenset(
+	{"O_RDONLY", "O_CLOEXEC", "O_NOFOLLOW", "O_DIRECTORY", "O_NONBLOCK", "O_NOCTTY"}
+)
+FS_WRITE_FUNCTIONS = frozenset(
+	{
+		"os.replace",
+		"os.rename",
+		"os.renames",
+		"os.remove",
+		"os.unlink",
+		"os.rmdir",
+		"os.removedirs",
+		"os.mkdir",
+		"os.makedirs",
+		"os.truncate",
+		"os.ftruncate",
+		"os.write",
+		"os.symlink",
+		"os.link",
+		"os.chmod",
+		"os.chown",
+	}
+)
+FS_WRITE_MODULES = ("shutil", "tempfile")  # every function of these copies, moves, creates or removes files
+PATH_WRITE_METHODS = (
+	"write_text",
+	"write_bytes",
+	"touch",
+	"unlink",
+	"mkdir",
+	"rmdir",
+	"symlink_to",
+	"hardlink_to",
+)
+# Exactly what ADR-013 Ràng buộc names for agent/changes/**: `frappe.set_user`, `publish_realtime`.
+CHANGES_FORBIDDEN_NAMES = ("set_user", "publish_realtime")
+
+
+def _is_fs_write_name(name: str) -> bool:
+	return name in FS_WRITE_FUNCTIONS or name.split(".")[0] in FS_WRITE_MODULES
+
+
+def _leaf_names(node) -> set:
+	"""Names in an expression, an attribute chain counted by its last part (`os.O_RDONLY` -> "O_RDONLY")."""
+	inner = {id(part.value) for part in ast.walk(node) if isinstance(part, ast.Attribute)}
+	return {
+		referenced_name(part)
+		for part in ast.walk(node)
+		if isinstance(part, ast.Name | ast.Attribute) and id(part) not in inner
+	}
+
+
+def _open_write_reason(call: ast.Call, name: str):
+	"""Why `call` opens a file for writing, else None. A mode the scan cannot read counts as a write."""
+	keywords = _call_keywords(call)
+	hidden = "**kwargs" if any(keyword.arg is None for keyword in call.keywords) else None
+	if name == "os.open":
+		flags = keywords.get("flags", call.args[1] if len(call.args) > 1 else None)
+		if flags is None:
+			return f"os.open with flags through {hidden}" if hidden else None
+		constants = [part for part in ast.walk(flags) if isinstance(part, ast.Constant) and part.value != 0]
+		if constants or _leaf_names(flags) - OS_OPEN_READ_FLAGS:
+			return "os.open with write flags"
+		return None
+	method = isinstance(call.func, ast.Attribute) and call.func.attr == "open" and name not in OPEN_FUNCTIONS
+	if name not in OPEN_FUNCTIONS and not method:
+		return None
+	mode = keywords.get("mode")
+	if mode is None:
+		position = 0 if method else 1
+		mode = call.args[position] if len(call.args) > position else None
+	if mode is None:
+		return f"{name or 'open'} with a mode through {hidden}" if hidden else None
+	if isinstance(mode, ast.Constant) and isinstance(mode.value, str):
+		return (
+			f"{name or 'open'} with mode {mode.value!r}" if OPEN_WRITE_MODE_CHARS & set(mode.value) else None
+		)
+	return f"{name or 'open'} with a mode that is not a string literal"
+
+
+def _fs_writes(rel: str, tree: ast.AST):
+	"""`(lineno or node, message)` for every file-system write or rename/remove in a module: write-mode opens
+	(positional or `mode=`, builtins/io/codecs/os.fdopen/Path.open, os.open flags), the os/shutil/tempfile
+	functions however imported or referenced (`from os import replace`, `import shutil as s`, `f = os.remove`)
+	and the Path write methods."""
+	aliases = import_aliases(tree)
+	for lineno, target in imported_modules(tree, module_name(rel), rel.endswith("__init__.py")):
+		if _is_fs_write_name(target):
+			yield lineno, f"imports {target}"
+	inner = {id(node.value) for node in ast.walk(tree) if isinstance(node, ast.Attribute)}
+	for node in ast.walk(tree):
+		if isinstance(node, ast.Name | ast.Attribute) and id(node) not in inner:
+			name = resolved_name(node, aliases)
+			if _is_fs_write_name(name):
+				yield node, f"uses {name}"
+		if not isinstance(node, ast.Call):
+			continue
+		name = resolved_name(node.func, aliases)
+		reason = _open_write_reason(node, name)
+		if reason:
+			yield node, reason
+		elif (
+			isinstance(node.func, ast.Attribute)
+			and node.func.attr in PATH_WRITE_METHODS
+			and not _is_fs_write_name(name)
+		):
+			yield node, f"calls .{node.func.attr}()"
+
+
+def check_fs_writes_only_in_file_writer(sources: dict) -> list:
+	"""ADR-013 Ràng buộc 2 / design 8.2: in agent/** and the proposal controller, writing, renaming or removing
+	files happens only in agent/changes/file_writer.py (erp_ai/eval/ is outside this rule)."""
+	violations = []
+	for rel, source in only_python(sources).items():
+		if rel == FILE_WRITER_FILE or not (rel.startswith(AGENT_PREFIX) or rel == PROPOSAL_CONTROLLER_FILE):
+			continue
+		for node, message in _fs_writes(rel, parse(rel, source)):
+			text = f"{message}: a file-system write outside {FILE_WRITER_FILE} (ADR-013)"
+			violations.append(
+				f"{rel}:{node}: {text}" if isinstance(node, int) else violation(rel, node, text)
+			)
+	return violations
+
+
+def _names_forbidden(name: str) -> bool:
+	return any(name == forbidden or name.endswith("." + forbidden) for forbidden in CHANGES_FORBIDDEN_NAMES)
+
+
+def check_changes_never_set_user_or_publish(sources: dict) -> list:
+	"""ADR-013 Ràng buộc ("Trong `erp_ai/agent/changes/**` không có `frappe.set_user`, `publish_realtime`"):
+	exactly those two names. Any reference counts (call, alias import, `f = frappe.set_user`, the name as a
+	string); reads of `frappe.session.user` are allowed."""
+	reason = f"in {CHANGES_PREFIX} (ADR-013)"
+	violations = []
+	for rel, source in only_python(scoped(sources, CHANGES_PREFIX)).items():
+		tree = parse(rel, source)
+		aliases = import_aliases(tree)
+		for lineno, target in imported_modules(tree, module_name(rel), rel.endswith("__init__.py")):
+			if _names_forbidden(target):
+				violations.append(f"{rel}:{lineno}: imports {target} {reason}")
+		inner = {id(node.value) for node in ast.walk(tree) if isinstance(node, ast.Attribute)}
+		for node in ast.walk(tree):
+			if isinstance(node, ast.Name | ast.Attribute) and id(node) not in inner:
+				name = resolved_name(node, aliases)
+				if _names_forbidden(name):
+					violations.append(violation(rel, node, f"uses {name} {reason}"))
+			elif (
+				isinstance(node, ast.Constant)
+				and isinstance(node.value, str)
+				and _names_forbidden(node.value)
+			):
+				violations.append(violation(rel, node, f"names {node.value!r} in a string {reason}"))
+	return violations
+
+
+# ---------------------------------------------------------------------------------------------------
+# ADR-022 (FEAT-004 T44): git rules. Sets below are hand-written from ADR-022 QĐ 2 on purpose: a product
+# constant that widens itself must not widen the rule (the real-code test pins the product constants).
+# ---------------------------------------------------------------------------------------------------
+
+SOURCE_MODULE = module_name(SOURCE_TOOL_FILE)
+PROCESS_RUNNER_MODULE = module_name(PROCESS_RUNNER_FILE)
+CONSTANTS_MODULE = module_name(CONSTANTS_FILE)
+GIT_PROGRAM = "git"
+GIT_LEGACY_SUBCOMMANDS = frozenset({"log", "blame"})  # the read tool of ADR-013 QĐ 8, kept as it is
+GIT_READ_SET = frozenset(
+	{"rev-parse", "rev-list", "status", "check-ignore", "ls-files", "merge-base", "diff-tree", "cat-file"}
+)
+GIT_WRITE_SET = frozenset({"add", "commit", "rm"})
+GIT_ALLOWED_SUBCOMMANDS = {
+	SOURCE_TOOL_FILE: GIT_LEGACY_SUBCOMMANDS | GIT_READ_SET,
+	PROCESS_RUNNER_FILE: GIT_WRITE_SET,
+}
+GIT_FORBIDDEN_SUBCOMMANDS = (
+	"push",
+	"fetch",
+	"pull",
+	"clone",
+	"checkout",
+	"switch",
+	"restore",
+	"branch",
+	"reset",
+	"rebase",
+	"merge",
+	"cherry-pick",
+	"revert",
+	"am",
+	"apply",
+	"stash",
+	"clean",
+	"tag",
+	"remote",
+	"config",
+	"update-ref",
+	"symbolic-ref",
+	"reflog",
+	"gc",
+	"maintenance",
+	"worktree",
+	"notes",
+	"replace",
+	"filter-branch",
+	"prune",
+)
+GIT_FORBIDDEN_FRAGMENTS = ("get-url", "ls-remote", "remote.", "--amend", "update-ref")
+GIT_CONFIG_PATH = re.compile(r"\.git[/\\]+config\b")
+GIT_COMMAND_TEXT = re.compile(r"(?<![\w.-])git\s+([\w-]+)")  # "git push ..." handed to shlex.split
+# Global git options that take the next element as their value (so it is not the subcommand).
+GIT_OPTIONS_WITH_VALUE = (
+	"-C",
+	"-c",
+	"--git-dir",
+	"--work-tree",
+	"--namespace",
+	"--config-env",
+	"--super-prefix",
+)
+GIT_OPTIONS_FUNCTION = "git_global_options"
+GIT_ENV_FUNCTION = "git_env"
+GIT_ENV_MARKERS = (
+	"GIT_CONFIG_GLOBAL",
+	"GIT_CONFIG_NOSYSTEM",
+	"GIT_TERMINAL_PROMPT",
+	"GIT_AUTHOR_",
+	"GIT_COMMITTER_",
+	"core.hooksPath",
+	"core.fsmonitor",
+)
+GIT_MARKER_OWNERS = {"core.hooksPath": GIT_OPTIONS_FUNCTION, "core.fsmonitor": GIT_OPTIONS_FUNCTION}
+PATHSPEC_SEPARATOR = "--"
+PATHSPEC_MAGIC = ":"
+COMMIT_REQUIRED_FLAGS = ("--only", "--no-gpg-sign")
+COMMIT_FORBIDDEN_FLAGS = (
+	"-a",
+	"--all",
+	"--amend",
+	"--allow-empty",
+	"--fixup",
+	"--squash",
+	"-C",
+	"-c",
+	"--reset-author",
+)
+COMMIT_FORBIDDEN_SHORT = frozenset(flag[1] for flag in COMMIT_FORBIDDEN_FLAGS if not flag.startswith("--"))
+COMMIT_MESSAGE_FLAGS = ("-m", "--message")  # the next element is the message, not an option
+RM_REQUIRED_FLAG = "--cached"
+BOT_NAME_CONSTANT = "BOT_GIT_NAME"
+BOT_EMAIL_CONSTANT = "BOT_GIT_EMAIL"
+BOT_GIT_NAME_VALUE = "ERP AI Agent"
+BOT_EMAIL_SUFFIX = ".invalid"
+BOT_IDENTITY_ENV = {
+	"GIT_AUTHOR_NAME": BOT_NAME_CONSTANT,
+	"GIT_COMMITTER_NAME": BOT_NAME_CONSTANT,
+	"GIT_AUTHOR_EMAIL": BOT_EMAIL_CONSTANT,
+	"GIT_COMMITTER_EMAIL": BOT_EMAIL_CONSTANT,
+}
+USER_IDENTITY_FRAGMENTS = ("user.name", "user.email")
+AGENT_USER_NAME = "AGENT_USER"
+GIT_FUNCTION_NAMES = ("read_git_state", "run_git_read", "_run_git_write")
+GIT_FUNCTION_PREFIX = "git_"
+GIT_MODULES = (SOURCE_MODULE, PROCESS_RUNNER_MODULE)
+NO_GIT_FILES = (PROPOSAL_CONTROLLER_FILE, HANDLERS_FILE, RUNNER_FILE)
+BENCH_COMMANDS_NAME = "BENCH_COMMANDS"
+GIT_RUNNING_BENCH_SUBCOMMANDS = (
+	"update",
+	"switch-to-branch",
+	"get-app",
+	"remove-app",
+	"new-app",
+	"setup",
+	"init",
+)
+APPS_ROOT_FUNCTION = "get_source_root"
+APPS_ROOT_SEGMENT = re.compile(r"(?:^|[/\\])apps(?:[/\\]|$)")
+APP_PATH_CALLS = ("get_app_path",)
+RESOLVE_DEPTH = 20
+
+
+class GitArgv(NamedTuple):
+	"""One git command line: `elements` are `(file, node, spread)`; `slot` indexes the subcommand;
+	`subcommands` is None when the scan cannot prove it is a constant string."""
+
+	rel: str
+	node: ast.AST
+	elements: list
+	git: int | None
+	slot: int | None
+	subcommands: frozenset | None
+	root_rel: str
+	root: ast.AST
+
+
+def _docstring_ids(tree: ast.AST) -> set:
+	ids = set()
+	for node in ast.walk(tree):
+		if isinstance(node, ast.Module | ast.ClassDef | ast.FunctionDef | ast.AsyncFunctionDef) and node.body:
+			first = node.body[0]
+			if isinstance(first, ast.Expr) and isinstance(first.value, ast.Constant):
+				ids.add(id(first.value))
+	return ids
+
+
+def _parameters(function) -> list:
+	arguments = function.args
+	names = [arg.arg for arg in (*arguments.posonlyargs, *arguments.args, *arguments.kwonlyargs)]
+	return names + ([arguments.vararg.arg] if arguments.vararg else [])
+
+
+class GitScan:
+	"""Every git command line of the product (ADR-022 Ràng buộc).
+
+	A command line is a list/tuple display or a `+` concatenation with a "git" element (also `/usr/bin/git`,
+	a module constant, an f-string or a `*`-spread constant list of any product module, imported under any
+	alias). The subcommand is the first element after "git" that is not a global option. When that element
+	is a parameter of the enclosing function (`run_git_read(repo, subcommand, *args)`,
+	`_run_git_write(..., subcommand_args)`), the command line is expanded at every call site of that
+	function; when it is a local name, it must be gated by `if name not in <constant set>: return/raise`.
+	Anything else is "not a constant" (`subcommands=None`).
+	"""
+
+	def __init__(self, sources: dict):
+		self.trees = {rel: parse(rel, source) for rel, source in only_python(sources).items()}
+		self.aliases = {rel: import_aliases(tree) for rel, tree in self.trees.items()}
+		self.files = {module_name(rel): rel for rel in self.trees}
+		self.assignments = {rel: self._module_assignments(tree) for rel, tree in self.trees.items()}
+		self.parents = {
+			rel: {id(child): node for node in ast.walk(tree) for child in ast.iter_child_nodes(node)}
+			for rel, tree in self.trees.items()
+		}
+		self.problems = []
+		self.templates = []  # (rel, root, elements, git index) of every command line as written
+		self.argvs = []
+		for rel, tree in self.trees.items():
+			for root in self._roots(rel, tree):
+				elements = self.flatten(rel, root)
+				git = self.git_index(elements)
+				if git is not None:
+					self._add(rel, root, elements, git)
+
+	@staticmethod
+	def _module_assignments(tree: ast.AST) -> dict:
+		names = {}
+		for node in tree.body:
+			if (
+				isinstance(node, ast.Assign)
+				and len(node.targets) == 1
+				and isinstance(node.targets[0], ast.Name)
+			):
+				names[node.targets[0].id] = node.value
+			elif (
+				isinstance(node, ast.AnnAssign)
+				and isinstance(node.target, ast.Name)
+				and node.value is not None
+			):
+				names[node.target.id] = node.value
+		return names
+
+	# value resolution ------------------------------------------------------------------------------
+
+	def lookup(self, rel: str, node):
+		"""`(file, value node)` of the module constant a Name/Attribute refers to, in any product module."""
+		if isinstance(node, ast.Name) and node.id in self.assignments.get(rel, {}):
+			return rel, self.assignments[rel][node.id]
+		if not isinstance(node, ast.Name | ast.Attribute):
+			return None
+		module, _dot, name = resolved_name(node, self.aliases.get(rel, {})).rpartition(".")
+		target = self.files.get(module)
+		if target is not None and name in self.assignments[target]:
+			return target, self.assignments[target][name]
+		return None
+
+	def text(self, rel: str, node, depth: int = 0):
+		"""The string a node always evaluates to, else None."""
+		if depth > RESOLVE_DEPTH:
+			return None
+		if isinstance(node, ast.Constant):
+			return node.value if isinstance(node.value, str) else None
+		if isinstance(node, ast.JoinedStr):
+			parts = [self.text(rel, value, depth + 1) for value in node.values]
+			return None if None in parts else "".join(parts)
+		if isinstance(node, ast.FormattedValue):
+			plain = node.conversion == -1 and node.format_spec is None
+			return self.text(rel, node.value, depth + 1) if plain else None
+		if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+			left, right = self.text(rel, node.left, depth + 1), self.text(rel, node.right, depth + 1)
+			return None if left is None or right is None else left + right
+		found = self.lookup(rel, node)
+		return self.text(*found, depth + 1) if found else None
+
+	def prefix(self, rel: str, node) -> str:
+		"""The constant text a string expression starts with (`f":(literal){rel}"` -> ":(literal)")."""
+		if isinstance(node, ast.JoinedStr) and node.values:
+			return self.text(rel, node.values[0]) or ""
+		if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+			return self.prefix(rel, node.left)
+		return self.text(rel, node) or ""
+
+	def strings(self, rel: str, node, depth: int = 0):
+		"""The frozenset of strings a constant set/tuple/list (or `frozenset(...)` of one) holds, else None."""
+		if depth > RESOLVE_DEPTH:
+			return None
+		if (
+			isinstance(node, ast.Call)
+			and referenced_name(node.func) in SET_LITERAL_CALLS
+			and len(node.args) == 1
+			and not node.keywords
+		):
+			return self.strings(rel, node.args[0], depth + 1)
+		if isinstance(node, ast.Set | ast.List | ast.Tuple):
+			found = set()
+			for element in node.elts:
+				if isinstance(element, ast.Starred):
+					inner = self.strings(rel, element.value, depth + 1)
+					if inner is None:
+						return None
+					found |= inner
+				else:
+					value = self.text(rel, element, depth + 1)
+					if value is None:
+						return None
+					found.add(value)
+			return frozenset(found)
+		if isinstance(node, ast.BinOp) and isinstance(node.op, ast.BitOr | ast.Add):
+			left, right = self.strings(rel, node.left, depth + 1), self.strings(rel, node.right, depth + 1)
+			return None if left is None or right is None else left | right
+		found = self.lookup(rel, node)
+		return self.strings(*found, depth + 1) if found else None
+
+	def code_texts(self, rel: str):
+		"""`(node, text)` for every string of the code (docstrings excluded, f-string pieces and resolved
+		concatenations included) and every keyword-argument name (`dict(GIT_CONFIG_GLOBAL=...)`)."""
+		docstrings = _docstring_ids(self.trees[rel])
+		for node in ast.walk(self.trees[rel]):
+			if isinstance(node, ast.Constant) and isinstance(node.value, str) and id(node) not in docstrings:
+				yield node, node.value
+			elif isinstance(node, ast.JoinedStr | ast.BinOp):
+				value = self.text(rel, node)
+				if value is not None:
+					yield node, value
+			elif isinstance(node, ast.keyword) and node.arg:
+				yield node, node.arg
+
+	# command lines ---------------------------------------------------------------------------------
+
+	def is_construct(self, node) -> bool:
+		if isinstance(node, ast.List | ast.Tuple):
+			return True
+		return (
+			isinstance(node, ast.BinOp)
+			and isinstance(node.op, ast.Add)
+			and (self.is_construct(node.left) or self.is_construct(node.right))
+		)
+
+	def _roots(self, rel: str, tree: ast.AST):
+		parents = self.parents[rel]
+		for node in ast.walk(tree):
+			if not self.is_construct(node):
+				continue
+			parent = parents.get(id(node))
+			if isinstance(parent, ast.BinOp) and self.is_construct(parent):
+				continue
+			if isinstance(parent, ast.Starred) and isinstance(parents.get(id(parent)), ast.List | ast.Tuple):
+				continue
+			yield node
+
+	def flatten(self, rel: str, node, depth: int = 0) -> list:
+		if depth > RESOLVE_DEPTH:
+			return [(rel, node, True)]
+		if isinstance(node, ast.List | ast.Tuple):
+			elements = []
+			for element in node.elts:
+				if isinstance(element, ast.Starred):
+					elements += self.spread(rel, element.value, depth + 1)
+				else:
+					elements.append((rel, element, False))
+			return elements
+		if isinstance(node, ast.BinOp) and self.is_construct(node):
+			return self.spread(rel, node.left, depth + 1) + self.spread(rel, node.right, depth + 1)
+		return [(rel, node, True)]
+
+	def spread(self, rel: str, node, depth: int = 0) -> list:
+		"""The elements `*node` (or a `+` operand) adds; an unknown value stays one spread element."""
+		if self.is_construct(node):
+			return self.flatten(rel, node, depth)
+		found = self.lookup(rel, node)
+		if found and self.is_construct(found[1]):
+			return self.flatten(*found, depth)
+		return [(rel, node, True)]
+
+	def git_index(self, elements: list):
+		for index, (rel, node, spread) in enumerate(elements):
+			value = None if spread else self.text(rel, node)
+			if value is not None and os.path.basename(value) == GIT_PROGRAM:
+				return index
+		return None
+
+	def is_options_call(self, rel: str, node) -> bool:
+		return self._is_source_call(rel, node, GIT_OPTIONS_FUNCTION)
+
+	def is_env_call(self, rel: str, node) -> bool:
+		return self._is_source_call(rel, node, GIT_ENV_FUNCTION)
+
+	def _is_source_call(self, rel: str, node, function: str) -> bool:
+		if not isinstance(node, ast.Call):
+			return False
+		name = resolved_name(node.func, self.aliases.get(rel, {}))
+		return name == f"{SOURCE_MODULE}.{function}" or (rel == SOURCE_TOOL_FILE and name == function)
+
+	def slot(self, elements: list, start: int):
+		index = start
+		while index < len(elements):
+			rel, node, spread = elements[index]
+			if spread and self.is_options_call(rel, node):
+				index += 1
+				continue
+			value = None if spread else self.text(rel, node)
+			if value is None or not value.startswith("-"):
+				return index
+			index += 2 if value in GIT_OPTIONS_WITH_VALUE else 1
+		return None
+
+	def function_of(self, rel: str, node):
+		parents = self.parents[rel]
+		while (node := parents.get(id(node))) is not None:
+			if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda):
+				return node
+		return None
+
+	def _add(self, rel: str, root, elements: list, git: int) -> None:
+		self.templates.append((rel, root, elements, git))
+		self._check_not_mutated(rel, root)
+		slot = self.slot(elements, git + 1)
+		if slot is None:
+			self.argvs.append(GitArgv(rel, root, elements, git, None, None, rel, root))
+			return
+		element_rel, node, spread = elements[slot]
+		value = None if spread else self.text(element_rel, node)
+		function = self.function_of(rel, root)
+		subcommands = None if value is None else frozenset({value})
+		if subcommands is None and isinstance(node, ast.Name) and function is not None and element_rel == rel:
+			if node.id in _parameters(function) and not isinstance(function, ast.Lambda):
+				self._expand(rel, root, elements, function)
+				return
+			if not spread:
+				subcommands = self.guard(rel, function, node.id, root.lineno)
+		self.argvs.append(GitArgv(rel, root, elements, git, slot, subcommands, rel, root))
+
+	def _check_not_mutated(self, rel: str, root) -> None:
+		parent = self.parents[rel].get(id(root))
+		if not (
+			isinstance(parent, ast.Assign)
+			and len(parent.targets) == 1
+			and isinstance(parent.targets[0], ast.Name)
+		):
+			return
+		name = parent.targets[0].id
+		scope = self.function_of(rel, parent) or self.trees[rel]
+		for node in ast.walk(scope):
+			changed = (
+				isinstance(node, ast.AugAssign)
+				and isinstance(node.target, ast.Name)
+				and node.target.id == name
+			) or (
+				isinstance(node, ast.Call)
+				and isinstance(node.func, ast.Attribute)
+				and isinstance(node.func.value, ast.Name)
+				and node.func.value.id == name
+				and node.func.attr in ("append", "extend", "insert", "__iadd__")
+			)
+			if changed:
+				self.problems.append(
+					violation(rel, node, f"git command line {name!r} is changed after it is built")
+				)
+
+	def guard(self, rel: str, function, name: str, before: int):
+		"""The constant set of `if ... name not in SET ...: return/raise` ahead of `before`, else None."""
+		for node in ast.walk(function):
+			if not (
+				isinstance(node, ast.If)
+				and node.lineno < before
+				and isinstance(node.body[-1], ast.Return | ast.Raise)
+				and self._unconditional(rel, function, node)
+			):
+				continue
+			tests = (
+				node.test.values
+				if isinstance(node.test, ast.BoolOp) and isinstance(node.test.op, ast.Or)
+				else [node.test]
+			)
+			for test in tests:
+				if (
+					isinstance(test, ast.Compare)
+					and isinstance(test.left, ast.Name)
+					and test.left.id == name
+					and len(test.ops) == 1
+					and isinstance(test.ops[0], ast.NotIn)
+					and not self._rebound(function, name, node.lineno, before)
+				):
+					allowed = self.strings(rel, test.comparators[0])
+					if allowed is not None:
+						return allowed
+		return None
+
+	def _unconditional(self, rel: str, function, node) -> bool:
+		"""`node` sits in the function body itself or only inside `try:` bodies of it."""
+		parents = self.parents[rel]
+		child, parent = node, parents.get(id(node))
+		while parent is not function:
+			if not (isinstance(parent, ast.Try) and child in parent.body):
+				return False
+			child, parent = parent, parents.get(id(parent))
+		return True
+
+	@staticmethod
+	def _rebound(function, name: str, after: int, before: int) -> bool:
+		return any(
+			isinstance(node, ast.Name)
+			and node.id == name
+			and isinstance(node.ctx, ast.Store)
+			and after < node.lineno < before
+			for node in ast.walk(function)
+		)
+
+	def _expand(self, rel: str, root, elements: list, function) -> None:
+		for call_rel, call in self.calls_of(rel, function):
+			expanded = self.substitute(rel, elements, function, call_rel, call)
+			git = self.git_index(expanded)
+			slot = None if git is None else self.slot(expanded, git + 1)
+			subcommands = None
+			if slot is not None:
+				element_rel, node, spread = expanded[slot]
+				value = None if spread else self.text(element_rel, node)
+				subcommands = None if value is None else frozenset({value})
+			self.argvs.append(GitArgv(call_rel, call, expanded, git, slot, subcommands, rel, root))
+
+	def calls_of(self, rel: str, function) -> list:
+		"""Every direct call of `function` in the product; any other use of it is a problem."""
+		target = f"{module_name(rel)}.{function.name}"
+		calls = []
+		for other, tree in self.trees.items():
+			aliases = self.aliases[other]
+			callees = {id(node.func) for node in ast.walk(tree) if isinstance(node, ast.Call)}
+			inner = {id(node.value) for node in ast.walk(tree) if isinstance(node, ast.Attribute)}
+			for node in ast.walk(tree):
+				if not isinstance(node, ast.Name | ast.Attribute) or id(node) in inner:
+					continue
+				same_file = other == rel and isinstance(node, ast.Name) and node.id == function.name
+				if not same_file and resolved_name(node, aliases) != target:
+					continue
+				if id(node) in callees:
+					calls.append((other, self.parents[other][id(node)]))
+				else:
+					self.problems.append(
+						violation(
+							other,
+							node,
+							f"{function.name} puts its parameter in the git subcommand slot and is used other than by a direct call",
+						)
+					)
+		return calls
+
+	def substitute(self, rel: str, elements: list, function, call_rel: str, call: ast.Call) -> list:
+		"""The template command line with each parameter replaced by what this call passes."""
+		arguments = function.args
+		positional = [arg.arg for arg in (*arguments.posonlyargs, *arguments.args)]
+		named = positional + [arg.arg for arg in arguments.kwonlyargs]
+		vararg = arguments.vararg.arg if arguments.vararg else None
+		splat = next((i for i, arg in enumerate(call.args) if isinstance(arg, ast.Starred)), len(call.args))
+		keywords = {keyword.arg: keyword.value for keyword in call.keywords if keyword.arg}
+
+		def argument(name):
+			index = positional.index(name) if name in positional else len(call.args)
+			if index < len(call.args):
+				return call.args[index] if index < splat else None
+			return keywords.get(name)
+
+		expanded = []
+		for element_rel, node, spread in elements:
+			if element_rel != rel or not isinstance(node, ast.Name):
+				expanded.append((element_rel, node, spread))
+			elif node.id == vararg and spread:
+				if splat < len(positional):
+					expanded.append((call_rel, call, True))
+					continue
+				for arg in call.args[len(positional) :]:
+					if isinstance(arg, ast.Starred):
+						expanded += self.spread(call_rel, arg.value)
+					else:
+						expanded.append((call_rel, arg, False))
+			elif node.id in named:
+				arg = argument(node.id)
+				if arg is None:
+					expanded.append((call_rel, call, True))
+				else:
+					expanded += self.spread(call_rel, arg) if spread else [(call_rel, arg, False)]
+			else:
+				expanded.append((element_rel, node, spread))
+		return expanded
+
+	def consumer(self, rel: str, root):
+		"""The call that runs a command line: the call it is an argument of, or that gets the name it is bound to."""
+		parents = self.parents[rel]
+		node = root
+		while (parent := parents.get(id(node))) is not None:
+			if isinstance(parent, ast.Call) and node is not parent.func:
+				return parent
+			if (
+				isinstance(parent, ast.Assign)
+				and len(parent.targets) == 1
+				and isinstance(parent.targets[0], ast.Name)
+			):
+				name = parent.targets[0].id
+				scope = self.function_of(rel, parent) or self.trees[rel]
+				for call in ast.walk(scope):
+					if isinstance(call, ast.Call) and any(
+						isinstance(arg, ast.Name) and arg.id == name
+						for arg in (*call.args, *(keyword.value for keyword in call.keywords))
+					):
+						return call
+				return None
+			if isinstance(parent, ast.stmt):
+				return None
+			node = parent
+		return None
+
+	def is_legacy(self, rel: str, root) -> bool:
+		"""The log/blame command of the read tool (ADR-022 QĐ 4: kept as it is, not a new git command)."""
+		found = [argv for argv in self.argvs if argv.root is root and argv.root_rel == rel]
+		return (
+			rel == SOURCE_TOOL_FILE
+			and bool(found)
+			and all(
+				argv.node is root
+				and argv.subcommands is not None
+				and argv.subcommands <= GIT_LEGACY_SUBCOMMANDS
+				for argv in found
+			)
+		)
+
+	def outermost_names(self, rel: str, root):
+		"""Name/Attribute nodes under `root` that are not the base of a longer attribute chain."""
+		inner = {id(node.value) for node in ast.walk(root) if isinstance(node, ast.Attribute)}
+		for node in ast.walk(root):
+			if isinstance(node, ast.Name | ast.Attribute) and id(node) not in inner:
+				yield node, resolved_name(node, self.aliases[rel])
+
+
+def check_git_subcommands_only_allowed_sets_per_file(sources: dict) -> list:
+	"""ADR-022 QĐ 2, Ràng buộc: git runs only from source.py (log/blame + the read set) and process_runner.py
+	(add/commit/rm); every subcommand is a constant string; no other product file has "git" in a command line."""
+	scan = GitScan(sources)
+	violations = list(scan.problems)
+	for rel, root, _elements, _git in scan.templates:
+		if rel not in GIT_ALLOWED_SUBCOMMANDS:
+			violations.append(
+				violation(
+					rel,
+					root,
+					f'"git" in a command line outside {tuple(GIT_ALLOWED_SUBCOMMANDS)} (ADR-022 QĐ 2)',
+				)
+			)
+	for argv in scan.argvs:
+		allowed = GIT_ALLOWED_SUBCOMMANDS.get(argv.root_rel)
+		if allowed is None:
+			continue  # reported above
+		if argv.subcommands is None:
+			violations.append(
+				violation(argv.rel, argv.node, "git subcommand is not a constant string (ADR-022 Ràng buộc)")
+			)
+		elif argv.subcommands - allowed:
+			violations.append(
+				violation(
+					argv.rel,
+					argv.node,
+					f"git subcommand {sorted(argv.subcommands - allowed)} not allowed for {argv.root_rel} (ADR-022 QĐ 2)",
+				)
+			)
+	return violations
+
+
+def _path_parts(scan: GitScan, rel: str):
+	"""`(node, [text or None])` for the arguments of every call and every `a / b / c` or `a + b + c` chain."""
+	parents = scan.parents[rel]
+	for node in ast.walk(scan.trees[rel]):
+		if isinstance(node, ast.Call):
+			yield node, [scan.text(rel, arg) for arg in node.args]
+		elif isinstance(node, ast.BinOp) and isinstance(node.op, ast.Div | ast.Add):
+			parent = parents.get(id(node))
+			if isinstance(parent, ast.BinOp) and type(parent.op) is type(node.op):
+				continue
+			operands, chain = [], node
+			while isinstance(chain, ast.BinOp) and type(chain.op) is type(node.op):
+				operands.insert(0, chain.right)
+				chain = chain.left
+			yield node, [scan.text(rel, part) for part in (chain, *operands)]
+
+
+def check_no_forbidden_git_operations_in_product(sources: dict) -> list:
+	"""ADR-022 QĐ 2, Ràng buộc: none of the 30 forbidden subcommands in a git command line; no string of the
+	product names get-url, ls-remote, remote., --amend or update-ref; nothing reads .git/config."""
+	scan = GitScan(sources)
+	violations = []
+	command_lines = [(rel, root, elements, git) for rel, root, elements, git in scan.templates]
+	command_lines += [
+		(argv.rel, argv.node, argv.elements, argv.git) for argv in scan.argvs if argv.git is not None
+	]
+	for rel, node, elements, git in command_lines:
+		for element_rel, element, spread in elements[git + 1 :]:
+			value = None if spread else scan.text(element_rel, element)
+			if value in GIT_FORBIDDEN_SUBCOMMANDS:
+				violations.append(violation(rel, node, f"git command line holds {value!r} (ADR-022 QĐ 2)"))
+	for rel in scan.trees:
+		for node, value in scan.code_texts(rel):
+			violations.extend(
+				violation(rel, node, f"string names {fragment} (ADR-022 Ràng buộc)")
+				for fragment in GIT_FORBIDDEN_FRAGMENTS
+				if fragment in value
+			)
+			if GIT_CONFIG_PATH.search(value):
+				violations.append(violation(rel, node, "string names .git/config (ADR-022 Ràng buộc)"))
+			if rel in SUBPROCESS_FILES:
+				violations.extend(
+					violation(rel, node, f"string runs git {token!r} (ADR-022 QĐ 2)")
+					for token in GIT_COMMAND_TEXT.findall(value)
+					if token in GIT_FORBIDDEN_SUBCOMMANDS
+				)
+				if value == "config" or value.endswith(("/config", "\\config")):
+					violations.append(
+						violation(rel, node, "string names a git config file (ADR-022 Ràng buộc)")
+					)
+		for node, parts in _path_parts(scan, rel):
+			for first, second in itertools.pairwise(parts):
+				if (
+					first is not None
+					and second is not None
+					and os.path.basename(first.rstrip("/\\")) == ".git"
+					and second.lstrip("/\\").startswith("config")
+				):
+					violations.append(
+						violation(rel, node, "path .git + config: reads the git config (ADR-022 Ràng buộc)")
+					)
+	return violations
+
+
+def _commit_flag_forbidden(flag: str) -> bool:
+	name = flag.split("=", 1)[0]
+	if name in COMMIT_FORBIDDEN_FLAGS:
+		return True
+	if name.startswith("--"):  # git accepts an unambiguous abbreviation of a long option
+		return len(name) > 2 and any(forbidden.startswith(name) for forbidden in COMMIT_FORBIDDEN_FLAGS)
+	return name.startswith("-") and bool(set(name[1:]) & COMMIT_FORBIDDEN_SHORT)
+
+
+def _write_argv_problems(scan: GitScan, subcommand: str, tail: list) -> list:
+	"""What is wrong with the elements after `add`/`commit`/`rm` (ADR-022 Ràng buộc; addendum 2 QĐ-A1)."""
+	if any(spread for _rel, _node, spread in tail):
+		return ["has an argument the scan cannot read (a spread or a list that is not constant)"]
+	texts = [scan.text(rel, node) for rel, node, _spread in tail]
+	if [index for index, value in enumerate(texts) if value == PATHSPEC_SEPARATOR] != [len(tail) - 2]:
+		return [f'must end with "{PATHSPEC_SEPARATOR}" and exactly one path']
+	problems = []
+	path_rel, path, _spread = tail[-1]
+	if scan.prefix(path_rel, path).startswith(PATHSPEC_MAGIC):
+		problems.append(f'path after "{PATHSPEC_SEPARATOR}" starts with "{PATHSPEC_MAGIC}" (pathspec magic)')
+	options, message_next = [], False
+	for value in texts[:-2]:
+		if message_next:
+			message_next = False
+		elif value is None:
+			problems.append(f'has an argument before "{PATHSPEC_SEPARATOR}" that is not a constant string')
+		elif value in COMMIT_MESSAGE_FLAGS and subcommand == "commit":
+			message_next = True
+		else:
+			options.append(value)
+	if subcommand == "commit":
+		problems += [f"without {flag}" for flag in COMMIT_REQUIRED_FLAGS if flag not in options]
+		problems += [f"with forbidden {flag}" for flag in options if _commit_flag_forbidden(flag)]
+	elif subcommand == "rm" and RM_REQUIRED_FLAG not in options:
+		problems.append(f"without {RM_REQUIRED_FLAG}")
+	return problems
+
+
+def check_git_commit_add_rm_argv_shape(sources: dict) -> list:
+	"""ADR-022 Ràng buộc, design-addendum-2 QĐ-A1: commit has --only and --no-gpg-sign, add/rm/commit end with
+	"--" and exactly one path that does not start with ":", rm has --cached, commit has no forbidden flag."""
+	scan = GitScan(sources)
+	violations = []
+	for argv in scan.argvs:
+		if argv.slot is None or not argv.subcommands:
+			continue
+		tail = argv.elements[argv.slot + 1 :]
+		for subcommand in sorted(argv.subcommands & GIT_WRITE_SET):
+			violations.extend(
+				violation(argv.rel, argv.node, f"git {subcommand} {problem} (ADR-022 Ràng buộc)")
+				for problem in _write_argv_problems(scan, subcommand, tail)
+			)
+	return violations
+
+
+def check_git_env_single_definition(sources: dict) -> list:
+	"""ADR-022 QĐ 4, Ràng buộc: the git options and environment are defined once, in source.py; every new git
+	command line starts with *git_global_options(...) and runs with env=git_env(...), never os.environ."""
+	scan = GitScan(sources)
+	violations = []
+	for rel in scan.trees:
+		for node, value in scan.code_texts(rel):
+			for marker in GIT_ENV_MARKERS:
+				if marker not in value:
+					continue
+				owner = GIT_MARKER_OWNERS.get(marker, GIT_ENV_FUNCTION)
+				function = scan.function_of(rel, node)
+				if rel != SOURCE_TOOL_FILE or function is None or getattr(function, "name", None) != owner:
+					violations.append(
+						violation(rel, node, f"{marker} outside {SOURCE_TOOL_FILE} {owner}() (ADR-022 QĐ 4)")
+					)
+	for function_name in (GIT_OPTIONS_FUNCTION, GIT_ENV_FUNCTION):
+		definitions = [
+			violation(rel, node, f"defines {function_name}()")
+			for rel, tree in scan.trees.items()
+			for node in ast.walk(tree)
+			if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef) and node.name == function_name
+		]
+		if len(definitions) != 1 or not definitions[0].startswith(f"{SOURCE_TOOL_FILE}:"):
+			violations.append(
+				f"{function_name}() must be defined once, in {SOURCE_TOOL_FILE}: {definitions} (ADR-022 QĐ 4)"
+			)
+	for rel, root, elements, git in scan.templates:
+		if scan.is_legacy(rel, root):
+			continue
+		following = elements[git + 1] if git + 1 < len(elements) else None
+		if following is None or not (following[2] and scan.is_options_call(following[0], following[1])):
+			violations.append(
+				violation(
+					rel,
+					root,
+					f'git command line without *{GIT_OPTIONS_FUNCTION}(...) right after "git" (ADR-022 QĐ 4)',
+				)
+			)
+		consumer = scan.consumer(rel, root)
+		env = None if consumer is None else _call_keywords(consumer).get("env")
+		if env is None or not scan.is_env_call(rel, env):
+			violations.append(
+				violation(
+					rel,
+					root,
+					f"git command line not run with env={GIT_ENV_FUNCTION}(...) of {SOURCE_TOOL_FILE} (ADR-022 QĐ 4)",
+				)
+			)
+		elif any(resolved_name(part, scan.aliases[rel]) == "os.environ" for part in ast.walk(env)):
+			violations.append(violation(rel, root, "git env= uses os.environ (ADR-022 Ràng buộc)"))
+	if PROCESS_RUNNER_FILE in scan.trees:
+		for function_name in (GIT_OPTIONS_FUNCTION, GIT_ENV_FUNCTION):
+			calls = [
+				node
+				for node in ast.walk(scan.trees[PROCESS_RUNNER_FILE])
+				if scan._is_source_call(PROCESS_RUNNER_FILE, node, function_name)
+			]
+			if not calls:
+				violations.append(
+					f"{PROCESS_RUNNER_FILE}: never calls source.{function_name}() (ADR-022 QĐ 4: reuse, no second git setup)"
+				)
+	return violations
+
+
+def _env_entries(scan: GitScan, rel: str):
+	"""`(node, key, value node)` for dict entries, keyword arguments and `x["KEY"] = value` assignments."""
+	for node in ast.walk(scan.trees[rel]):
+		if isinstance(node, ast.Dict):
+			for key, value in zip(node.keys, node.values, strict=True):
+				if key is not None and scan.text(rel, key) is not None:
+					yield key, scan.text(rel, key), value
+		elif isinstance(node, ast.keyword) and node.arg:
+			yield node, node.arg, node.value
+		elif isinstance(node, ast.Assign):
+			for target in node.targets:
+				if isinstance(target, ast.Subscript) and scan.text(rel, target.slice) is not None:
+					yield target, scan.text(rel, target.slice), node.value
+
+
+def check_bot_identity_constants(sources: dict) -> list:
+	"""ADR-022 QĐ 5: the bot identity is erp_ai.constants (name "ERP AI Agent", address ending .invalid), the four
+	GIT_AUTHOR_*/GIT_COMMITTER_* variables take it, and git code never uses user.name/user.email/AGENT_USER."""
+	scan = GitScan(sources)
+	constants = scan.assignments.get(CONSTANTS_FILE)
+	if constants is None:
+		return [f"{CONSTANTS_FILE}: file missing (ADR-022 QĐ 5)"]
+	violations = []
+	name = scan.text(CONSTANTS_FILE, constants[BOT_NAME_CONSTANT]) if BOT_NAME_CONSTANT in constants else None
+	if name != BOT_GIT_NAME_VALUE:
+		violations.append(
+			f"{CONSTANTS_FILE}: {BOT_NAME_CONSTANT} = {name!r}, not {BOT_GIT_NAME_VALUE!r} (ADR-022 QĐ 5)"
+		)
+	email = (
+		scan.text(CONSTANTS_FILE, constants[BOT_EMAIL_CONSTANT]) if BOT_EMAIL_CONSTANT in constants else None
+	)
+	local, at, domain = (email or "").partition("@")
+	if not (
+		local
+		and at
+		and "@" not in domain
+		and domain.endswith(BOT_EMAIL_SUFFIX)
+		and len(domain) > len(BOT_EMAIL_SUFFIX)
+	):
+		violations.append(
+			f"{CONSTANTS_FILE}: {BOT_EMAIL_CONSTANT} = {email!r} is not an address ending {BOT_EMAIL_SUFFIX} (ADR-022 QĐ 5)"
+		)
+	set_in_source = set()
+	for rel in scan.trees:
+		for node, key, value in _env_entries(scan, rel):
+			if key not in BOT_IDENTITY_ENV:
+				continue
+			expected = f"{CONSTANTS_MODULE}.{BOT_IDENTITY_ENV[key]}"
+			if resolved_name(value, scan.aliases[rel]) != expected:
+				violations.append(violation(rel, node, f"{key} is not set from {expected} (ADR-022 QĐ 5)"))
+			elif rel == SOURCE_TOOL_FILE:
+				set_in_source.add(key)
+	violations.extend(
+		f"{SOURCE_TOOL_FILE}: {key} is never set from the bot constant (ADR-022 QĐ 5)"
+		for key in BOT_IDENTITY_ENV
+		if key not in set_in_source
+	)
+	for rel in SUBPROCESS_FILES:
+		if rel not in scan.trees:
+			continue
+		for node, value in scan.code_texts(rel):
+			if value == AGENT_USER_NAME or any(fragment in value for fragment in USER_IDENTITY_FRAGMENTS):
+				violations.append(violation(rel, node, f"git code names {value!r} (ADR-022 QĐ 5)"))
+		for lineno, target in imported_modules(scan.trees[rel], module_name(rel), False):
+			if target.split(".")[-1] == AGENT_USER_NAME:
+				violations.append(f"{rel}:{lineno}: imports {target} (ADR-022 QĐ 5)")
+		for node, name in scan.outermost_names(rel, scan.trees[rel]):
+			if name.split(".")[-1] == AGENT_USER_NAME:
+				violations.append(violation(rel, node, f"git code uses {name} (ADR-022 QĐ 5)"))
+	return violations
+
+
+def _git_function_names(scan: GitScan) -> set:
+	names = set(GIT_FUNCTION_NAMES)
+	for module in GIT_MODULES:
+		rel = scan.files.get(module)
+		if rel is not None:
+			names |= {
+				node.name
+				for node in scan.trees[rel].body
+				if isinstance(node, ast.FunctionDef) and node.name.startswith(GIT_FUNCTION_PREFIX)
+			}
+	return names
+
+
+def _is_git_function(dotted: str) -> bool:
+	module, _dot, name = dotted.rpartition(".")
+	return module in GIT_MODULES and (name in GIT_FUNCTION_NAMES or name.startswith(GIT_FUNCTION_PREFIX))
+
+
+def _git_uses(scan: GitScan, rel: str, root, git_names: set):
+	"""`(node, what)` for subprocess and git-function uses inside `root` (a module or a function)."""
+	for lineno, target in imported_modules(root, module_name(rel), rel.endswith("__init__.py")):
+		if (
+			module_in(target, "subprocess")
+			or module_in(target, PROCESS_RUNNER_MODULE)
+			or _is_git_function(target)
+		):
+			yield lineno, f"imports {target}"
+	for node, name in scan.outermost_names(rel, root):
+		if module_in(name, "subprocess") or _is_git_function(name):
+			yield node, f"uses {name}"
+	docstrings = _docstring_ids(scan.trees[rel])
+	for node in ast.walk(root):
+		if (
+			isinstance(node, ast.Constant)
+			and id(node) not in docstrings
+			and (node.value in git_names or node.value in GIT_MODULES)
+		):
+			yield node, f"names {node.value!r}"
+	root_ids = {id(node) for node in ast.walk(root)}
+	for template_rel, template, _elements, _git in scan.templates:
+		if template_rel == rel and id(template) in root_ids:
+			yield template, 'builds a "git" command line'
+
+
+def check_no_git_in_web_and_runner(sources: dict) -> list:
+	"""ADR-022 QĐ 3, Ràng buộc: the proposal controller, every @frappe.whitelist function (and the module
+	functions it calls), handlers.py and agent/runner.py never import subprocess or touch a git function."""
+	scan = GitScan(sources)
+	git_names = _git_function_names(scan)
+	scopes = [(rel, scan.trees[rel], "") for rel in NO_GIT_FILES if rel in scan.trees]
+	for rel, function, _decorator in whitelisted_functions(sources):
+		functions = _module_functions(scan.trees[rel])
+		reached, pending = {function.name: function}, [function]
+		while pending:
+			for name in _called_names(pending.pop()):
+				if name in functions and name not in reached:
+					reached[name] = functions[name]
+					pending.append(functions[name])
+		scopes += [
+			(rel, node, f" (reached from @frappe.whitelist {function.name})") for node in reached.values()
+		]
+	violations = []
+	for rel, root, where in scopes:
+		for node, what in _git_uses(scan, rel, root, git_names):
+			text = f"{what}{where}: no git in web requests, handlers or the runner (ADR-022 QĐ 3)"
+			violations.append(
+				f"{rel}:{node}: {text}" if isinstance(node, int) else violation(rel, node, text)
+			)
+	return sorted(set(violations))
+
+
+def check_bench_allowlist_has_no_git_running_subcommands(sources: dict) -> list:
+	"""ADR-022 QĐ 2: change_guard's bench command table never holds a subcommand that runs git in an app repo."""
+	scan = GitScan(sources)
+	if CHANGE_GUARD_FILE not in scan.trees:
+		return [f"{CHANGE_GUARD_FILE}: file missing"]
+	violations = []
+	table = scan.assignments[CHANGE_GUARD_FILE].get(BENCH_COMMANDS_NAME)
+	commands = None if table is None else scan.strings(CHANGE_GUARD_FILE, table)
+	if commands is None:
+		violations.append(
+			f"{CHANGE_GUARD_FILE}: {BENCH_COMMANDS_NAME} is not a table of constant strings (ADR-022 QĐ 2)"
+		)
+	else:
+		violations.extend(
+			f"{CHANGE_GUARD_FILE}: {BENCH_COMMANDS_NAME} holds {command!r}, which runs git in an app repo (ADR-022 QĐ 2)"
+			for command in sorted(commands & set(GIT_RUNNING_BENCH_SUBCOMMANDS))
+		)
+	for node, value in scan.code_texts(CHANGE_GUARD_FILE):
+		if value in GIT_RUNNING_BENCH_SUBCOMMANDS:
+			violations.append(
+				violation(
+					CHANGE_GUARD_FILE,
+					node,
+					f"bench subcommand {value!r} runs git in an app repo (ADR-022 QĐ 2)",
+				)
+			)
+	return violations
+
+
+def check_apps_root_single_function(sources: dict) -> list:
+	"""ADR-022 QĐ 8: in agent/**, only source.get_source_root works out the apps/ root."""
+	scan = GitScan(sources)
+	violations = []
+	definitions = [
+		(rel, node)
+		for rel, tree in scan.trees.items()
+		if rel.startswith(AGENT_PREFIX)
+		for node in ast.walk(tree)
+		if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef) and node.name == APPS_ROOT_FUNCTION
+	]
+	if [rel for rel, _node in definitions] != [SOURCE_TOOL_FILE] or definitions[0][1] not in scan.trees[
+		SOURCE_TOOL_FILE
+	].body:
+		violations.append(
+			f"{APPS_ROOT_FUNCTION}() must be defined once, at module level of {SOURCE_TOOL_FILE}: "
+			f"{[violation(rel, node, 'def') for rel, node in definitions]} (ADR-022 QĐ 8)"
+		)
+	for rel, tree in scan.trees.items():
+		if not rel.startswith(AGENT_PREFIX):
+			continue
+
+		def in_root_function(node, rel=rel):
+			function = scan.function_of(rel, node)
+			return rel == SOURCE_TOOL_FILE and getattr(function, "name", None) == APPS_ROOT_FUNCTION
+
+		for node, value in scan.code_texts(rel):
+			if APPS_ROOT_SEGMENT.search(value) and not in_root_function(node):
+				violations.append(
+					violation(rel, node, f"path {value!r} outside {APPS_ROOT_FUNCTION}() (ADR-022 QĐ 8)")
+				)
+		for node in ast.walk(tree):
+			if isinstance(node, ast.Call) and not in_root_function(node):
+				name = resolved_name(node.func, scan.aliases[rel])
+				if name.split(".")[-1] in APP_PATH_CALLS:
+					violations.append(
+						violation(rel, node, f"{name} outside {APPS_ROOT_FUNCTION}() (ADR-022 QĐ 8)")
+					)
+	return violations
+
+
+# FEAT-004 T68: ADR-023 Ràng buộc. The site_api rule (no hand-written set of the app's DocTypes) is
+# already part of check_tool_never_saves_proposal (_site_api_deny_violations, T59) and is not repeated.
+CHANGE_LINK_FILE = "agent/change_link.py"
+AGENT_WRITE_GUARD_FILE = "agent/agent_write_guard.py"
+CHANGE_STATE_NAMES = ("approve", "reject", "undo")
+GET_METHOD = "GET"
+API_METHOD_PATH = "api/method/"
+UNKNOWN_PIECE = "\0"  # stands for a piece of a string whose value is not known statically
+REMOVED_GRANT_NAMES = ("_unrestricted_specs", "get_unrestricted_tool_schemas")
+GRANT_TABLE_NAME = "GRANT_TABLE"
+SCHEMA_FUNCTION = "get_tool_schemas"
+SCHEMA_CALL_MARK = "schema"
+SPEC_SOURCE = "_all_specs"
+IDENTIFIER = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+TOOL_MODULES_NAME = "TOOL_MODULES"
+SPEC_CONSUMERS = (SCHEMA_FUNCTION, "_grants_group", "execute_tool")
+AGENT_WRITE_OPENER = "allow_agent_write"
+AGENT_WRITE_OPENER_FILES = (RUN_LOG_FILE, PROPOSE_TOOL_FILE)
+AGENT_WRITE_FLAG_NAME = "AGENT_WRITE_FLAG"
+
+
+def _absolute_aliases(tree: ast.AST, rel: str) -> dict:
+	"""import_aliases plus relative `from .x import y [as z]`, resolved against the module of `rel`."""
+	aliases = import_aliases(tree)
+	package = module_name(rel).split(".")
+	if not rel.endswith("__init__.py"):
+		package = package[:-1]
+	for node in ast.walk(tree):
+		if isinstance(node, ast.ImportFrom) and node.level:
+			base = package[: len(package) - (node.level - 1)]
+			base = ".".join([*base, node.module] if node.module else base)
+			for alias in node.names:
+				aliases[alias.asname or alias.name] = f"{base}.{alias.name}"
+	return aliases
+
+
+def _module_definitions(tree: ast.AST) -> dict:
+	"""`{name: node}` of the module's own functions and assigned values."""
+	found = {}
+	for node in tree.body:
+		if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
+			found[node.name] = node
+		elif isinstance(node, ast.Assign):
+			found.update({target.id: node.value for target in node.targets if isinstance(target, ast.Name)})
+		elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name) and node.value is not None:
+			found[node.target.id] = node.value
+	return found
+
+
+def _reaches_change_state(rel: str, node, aliases: dict, definitions: dict, seen=frozenset()) -> bool:
+	"""`node` names approve/reject/undo or erp_ai.agent.changes.transitions (reference, import or dotted
+	text), directly or through the module's own functions and values."""
+	if any(
+		module_in(target, TRANSITIONS_MODULE)
+		for _line, target in imported_modules(node, module_name(rel), rel.endswith("__init__.py"))
+	):
+		return True
+	for inner in ast.walk(node):
+		if isinstance(inner, ast.Constant) and isinstance(inner.value, str):
+			if module_in(inner.value, TRANSITIONS_MODULE):
+				return True
+			continue
+		if not isinstance(inner, ast.Name | ast.Attribute):
+			continue
+		name = resolved_name(inner, aliases)
+		leaf = name.rpartition(".")[2] if isinstance(inner, ast.Name) else inner.attr
+		if leaf in CHANGE_STATE_NAMES or module_in(name, TRANSITIONS_MODULE):
+			return True
+		if (
+			isinstance(inner, ast.Name)
+			and inner.id in definitions
+			and inner.id not in seen
+			and _reaches_change_state(rel, definitions[inner.id], aliases, definitions, seen | {inner.id})
+		):
+			return True
+	return False
+
+
+def change_state_whitelists(sources: dict) -> list:
+	"""`[(rel, function, methods)]` of every whitelisted function that reaches the change state machine."""
+	found = []
+	trees = {}
+	for rel, node, decorator in whitelisted_functions(sources):
+		if rel not in trees:
+			tree = parse(rel, sources[rel])
+			trees[rel] = (_absolute_aliases(tree, rel), _module_definitions(tree))
+		aliases, definitions = trees[rel]
+		if _reaches_change_state(rel, node, aliases, definitions, frozenset({node.name})):
+			keywords = {kw.arg: kw.value for kw in getattr(decorator, "keywords", ())}
+			methods = keywords.get("methods")
+			listed = methods.elts if isinstance(methods, ast.List | ast.Tuple | ast.Set) else ()
+			found.append((rel, node, {e.value for e in listed if isinstance(e, ast.Constant)}))
+	return found
+
+
+def check_no_get_whitelist_reaches_change_state(sources: dict) -> list:
+	"""ADR-023 Ràng buộc: no `@frappe.whitelist(methods=[..."GET"...])` reaches approve/reject/undo or the
+	state machine (ADR-010: a state change is never a GET)."""
+	return [
+		violation(rel, node, f"{node.name}: GET whitelist reaches the change state (ADR-023)")
+		for rel, node, methods in change_state_whitelists(sources)
+		if GET_METHOD in methods
+	]
+
+
+def _string_shape(scan: GitScan, rel: str, node, depth: int = 0) -> str:
+	"""The text of a string expression, each piece not known statically written as UNKNOWN_PIECE."""
+	if depth > RESOLVE_DEPTH:
+		return UNKNOWN_PIECE
+	if isinstance(node, ast.JoinedStr):
+		return "".join(_string_shape(scan, rel, value, depth + 1) for value in node.values)
+	if isinstance(node, ast.FormattedValue):
+		return _string_shape(scan, rel, node.value, depth + 1)
+	if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+		return _string_shape(scan, rel, node.left, depth + 1) + _string_shape(
+			scan, rel, node.right, depth + 1
+		)
+	if isinstance(node, ast.Constant):
+		return node.value if isinstance(node.value, str) else UNKNOWN_PIECE
+	found = scan.lookup(rel, node)
+	return _string_shape(scan, *found, depth + 1) if found else UNKNOWN_PIECE
+
+
+def _change_link_shapes(sources: dict) -> list:
+	"""`[(node, shape)]` of every string expression of change_link.py (docstrings excluded)."""
+	scan = GitScan(sources)
+	tree = scan.trees[CHANGE_LINK_FILE]
+	docstrings = _docstring_ids(tree)
+	return [
+		(node, _string_shape(scan, CHANGE_LINK_FILE, node))
+		for node in ast.walk(tree)
+		if (isinstance(node, ast.Constant) and isinstance(node.value, str) and id(node) not in docstrings)
+		or isinstance(node, ast.JoinedStr)
+		or (isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add))
+	]
+
+
+def change_link_string_shapes(sources: dict) -> list:
+	return [shape for _node, shape in _change_link_shapes(sources)] if CHANGE_LINK_FILE in sources else []
+
+
+def check_change_link_builds_no_api_method_path(sources: dict) -> list:
+	"""ADR-023 Ràng buộc: change_link builds no `/api/method/` path (a link opens the form, the form POSTs)."""
+	if CHANGE_LINK_FILE not in sources:
+		return _missing(CHANGE_LINK_FILE)
+	return [
+		violation(CHANGE_LINK_FILE, node, f"builds {shape!r}, an /api/method/ path (ADR-023)")
+		for node, shape in _change_link_shapes(sources)
+		if API_METHOD_PATH in shape
+	]
+
+
+def _node_texts(node, aliases: dict, docstrings: set) -> list:
+	"""The names a node carries: a reference (alias resolved), an imported name, a keyword name, a string
+	and each identifier inside it (a dotted path names its last segment, as a grep would match it)."""
+	if isinstance(node, ast.Name):
+		return [resolved_name(node, aliases).rpartition(".")[2]]
+	if isinstance(node, ast.Attribute):
+		return [node.attr]
+	if isinstance(node, ast.Import | ast.ImportFrom):
+		return [alias.name.rpartition(".")[2] for alias in node.names]
+	if isinstance(node, ast.keyword):
+		return [node.arg] if node.arg else []
+	if isinstance(node, ast.Constant) and isinstance(node.value, str) and id(node) not in docstrings:
+		return list(dict.fromkeys([node.value, *IDENTIFIER.findall(node.value)]))
+	return []
+
+
+def _top_level_reads(tree: ast.Module, name: str) -> list:
+	"""`[(owner, node)]` for each read of `name`; owner = the enclosing top-level function's name, else None."""
+	return [
+		(statement.name if isinstance(statement, ast.FunctionDef | ast.AsyncFunctionDef) else None, node)
+		for statement in tree.body
+		for node in ast.walk(statement)
+		if isinstance(node, ast.Name) and node.id == name and isinstance(node.ctx, ast.Load)
+	]
+
+
+def _grant_path_violations(tree: ast.Module, reader: str) -> list:
+	"""Specs are listed only by SPEC_SOURCE (from TOOL_MODULES), called only by the grant function `reader`;
+	each SPEC_CONSUMERS function exists and calls `reader`."""
+	violations = []
+	spec_reads = _top_level_reads(tree, SPEC_SOURCE)
+	for owner, node in spec_reads:
+		if owner != reader:
+			violations.append(
+				violation(
+					REGISTRY_FILE,
+					node,
+					f"{owner}: {SPEC_SOURCE}() outside {reader} lists ungranted specs (ADR-023)",
+				)
+			)
+	if reader not in {owner for owner, _node in spec_reads}:
+		violations.append(f"{REGISTRY_FILE}: {reader} does not list specs from {SPEC_SOURCE}() (ADR-023)")
+	for owner, node in _top_level_reads(tree, TOOL_MODULES_NAME):
+		if owner not in (None, SPEC_SOURCE):
+			violations.append(
+				violation(
+					REGISTRY_FILE, node, f"{owner}: reads {TOOL_MODULES_NAME} outside {SPEC_SOURCE} (ADR-023)"
+				)
+			)
+	functions = {
+		statement.name: statement
+		for statement in tree.body
+		if isinstance(statement, ast.FunctionDef | ast.AsyncFunctionDef)
+	}
+	for consumer in SPEC_CONSUMERS:
+		if consumer not in functions:
+			violations.append(
+				f"{REGISTRY_FILE}: {consumer} missing; it must reach specs through {reader} (ADR-023)"
+			)
+		elif not any(owner == consumer for owner, _node in _top_level_reads(tree, reader)):
+			violations.append(
+				violation(REGISTRY_FILE, functions[consumer], f"{consumer} does not call {reader} (ADR-023)")
+			)
+	return violations
+
+
+def check_registry_has_one_grant_function(sources: dict) -> list:
+	"""ADR-023 Ràng buộc (ADR-011 QĐ 6): one grant table read by one grant function in registry.py; the
+	removed names `_unrestricted_specs`, `get_unrestricted_tool_schemas` exist nowhere; runner.py calls one
+	schema function, `get_tool_schemas`, once."""
+	violations = []
+	for rel, source in only_python(sources).items():
+		tree = parse(rel, source)
+		aliases, docstrings = import_aliases(tree), _docstring_ids(tree)
+		for node in ast.walk(tree):
+			texts = [node.name] if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef) else []
+			for text in texts + _node_texts(node, aliases, docstrings):
+				if text in REMOVED_GRANT_NAMES:
+					violations.append(violation(rel, node, f"{text} is a second grant path (ADR-023)"))
+				elif text == SPEC_SOURCE and rel != REGISTRY_FILE:
+					violations.append(
+						violation(rel, node, f"{text} reached past the grant function (ADR-023)")
+					)
+	for rel in (REGISTRY_FILE, RUNNER_FILE):
+		if rel not in sources:
+			violations.extend(_missing(rel))
+	if REGISTRY_FILE in sources:
+		tree = parse(REGISTRY_FILE, sources[REGISTRY_FILE])
+		tables = [
+			node
+			for node in tree.body
+			if isinstance(node, ast.Assign | ast.AnnAssign)
+			and any(
+				isinstance(target, ast.Name) and target.id == GRANT_TABLE_NAME
+				for target in (node.targets if isinstance(node, ast.Assign) else [node.target])
+			)
+		]
+		readers = [
+			function.name
+			for function in ast.walk(tree)
+			if isinstance(function, ast.FunctionDef | ast.AsyncFunctionDef)
+			and any(
+				isinstance(node, ast.Name) and node.id == GRANT_TABLE_NAME and isinstance(node.ctx, ast.Load)
+				for node in ast.walk(function)
+			)
+		]
+		if len(tables) != 1 or len(readers) != 1:
+			violations.append(
+				f"{REGISTRY_FILE}: {len(tables)} {GRANT_TABLE_NAME} assignments read by {readers}; "
+				"one grant table and one grant function (ADR-023)"
+			)
+		else:
+			violations.extend(_grant_path_violations(tree, readers[0]))
+	if RUNNER_FILE in sources:
+		tree = parse(RUNNER_FILE, sources[RUNNER_FILE])
+		aliases = import_aliases(tree)
+		calls = [
+			(node, resolved_name(node.func, aliases).rpartition(".")[2])
+			for node in ast.walk(tree)
+			if isinstance(node, ast.Call)
+		]
+		schema_calls = [(node, name) for node, name in calls if SCHEMA_CALL_MARK in name.lower()]
+		if [name for _node, name in schema_calls] != [SCHEMA_FUNCTION]:
+			violations.append(
+				f"{RUNNER_FILE}: schema calls {[violation(RUNNER_FILE, n, name) for n, name in schema_calls]}; "
+				f"exactly one {SCHEMA_FUNCTION}() call (ADR-023)"
+			)
+	return violations
+
+
+def _agent_write_flag_value(sources: dict):
+	"""The literal value of AGENT_WRITE_FLAG in agent_write_guard.py, else None."""
+	value = GitScan._module_assignments(parse(AGENT_WRITE_GUARD_FILE, sources[AGENT_WRITE_GUARD_FILE])).get(
+		AGENT_WRITE_FLAG_NAME
+	)
+	return value.value if isinstance(value, ast.Constant) and isinstance(value.value, str) else None
+
+
+def agent_write_references(sources: dict) -> list:
+	"""`[(rel, node, kind)]`: every reference, import, keyword or string naming `allow_agent_write`
+	(kind AGENT_WRITE_OPENER) or the flag, by constant name or by value (kind AGENT_WRITE_FLAG_NAME)."""
+	kinds = {AGENT_WRITE_OPENER: AGENT_WRITE_OPENER, AGENT_WRITE_FLAG_NAME: AGENT_WRITE_FLAG_NAME}
+	if AGENT_WRITE_GUARD_FILE in sources and (value := _agent_write_flag_value(sources)):
+		kinds[value] = AGENT_WRITE_FLAG_NAME
+	found = []
+	for rel, source in only_python(sources).items():
+		tree = parse(rel, source)
+		aliases, docstrings = import_aliases(tree), _docstring_ids(tree)
+		for node in ast.walk(tree):
+			found.extend(
+				(rel, node, kinds[text]) for text in _node_texts(node, aliases, docstrings) if text in kinds
+			)
+	return found
+
+
+def check_agent_write_flag_only_in_run_log_and_propose_tool(sources: dict) -> list:
+	"""ADR-023 Ràng buộc (M5): the write guard's opening is used only by run_log.py and the propose tool;
+	the flag is named only in agent_write_guard.py, which checks it."""
+	if AGENT_WRITE_GUARD_FILE not in sources:
+		return _missing(AGENT_WRITE_GUARD_FILE)
+	violations = []
+	if _agent_write_flag_value(sources) is None:
+		violations.append(
+			f"{AGENT_WRITE_GUARD_FILE}: {AGENT_WRITE_FLAG_NAME} is not a string literal, its value cannot be "
+			"scanned for (ADR-023)"
+		)
+	for rel, node, kind in agent_write_references(sources):
+		if kind == AGENT_WRITE_FLAG_NAME and rel != AGENT_WRITE_GUARD_FILE:
+			violations.append(violation(rel, node, "names the agent write flag outside the guard (ADR-023)"))
+		elif kind == AGENT_WRITE_OPENER and rel not in AGENT_WRITE_OPENER_FILES:
+			if rel != AGENT_WRITE_GUARD_FILE or isinstance(node, ast.Name | ast.Attribute):
+				violations.append(
+					violation(
+						rel, node, f"uses {AGENT_WRITE_OPENER} outside run_log and the propose tool (ADR-023)"
+					)
+				)
+	return violations
+
+
 class TestArchitecture(unittest.TestCase):
 	@classmethod
 	def setUpClass(cls):
@@ -2149,6 +4285,177 @@ class TestArchitecture(unittest.TestCase):
 		self.assertIn("Việt Nam", self.sources["agent/prompts.py"])  # the coincidence the scan must tolerate
 		self.assertEqual(check_no_default_people_in_agent_python(self.sources), [])
 
+	# FEAT-004: change proposals (ADR-011, ADR-012) -----------------------------------------------
+
+	def test_transitions_imported_only_by_controller_and_changes(self):
+		controller = parse(PROPOSAL_CONTROLLER_FILE, self.sources[PROPOSAL_CONTROLLER_FILE])
+		imports = [
+			target
+			for _lineno, target in imported_modules(controller, module_name(PROPOSAL_CONTROLLER_FILE), False)
+		]
+		self.assertIn(TRANSITIONS_MODULE, imports)
+		self.assertEqual(check_transitions_imported_only_by_controller_and_changes(self.sources), [])
+
+	def test_change_state_fields_written_only_in_changes(self):
+		self.assertEqual(len(STATE_FIELDS), 15)
+		declared = [
+			ast.literal_eval(node.value)
+			for node in parse(TRANSITIONS_FILE, self.sources[TRANSITIONS_FILE]).body
+			if isinstance(node, ast.Assign)
+			and any(getattr(t, "id", None) == "STATE_FIELDS" for t in node.targets)
+		]
+		self.assertEqual(declared, [STATE_FIELDS])
+		self.assertEqual(check_change_state_fields_written_only_in_changes(self.sources), [])
+
+	def test_change_guard_uses_resolve_safe_path(self):
+		self.assertIn("def resolve_safe_path(", self.sources[SOURCE_TOOL_FILE])
+		self.assertIn(CHANGE_GUARD_FILE, self.sources)
+		self.assertEqual(check_change_guard_uses_resolve_safe_path(self.sources), [])
+
+	def test_proposal_doctype_permissions(self):
+		scanned = load_product_sources(suffixes=(".py", ".json"))
+		self.assertIn(PROPOSAL_DOCTYPE_FILE, scanned)
+		self.assertEqual(check_proposal_doctype_permissions(scanned), [])
+
+	def test_tool_never_saves_proposal(self):
+		self.assertIn("proposal.insert()", self.sources[PROPOSE_TOOL_FILE])
+		self.assertEqual(check_tool_never_saves_proposal(self.sources), [])
+
+	def test_fs_writes_only_in_file_writer(self):
+		for rel in (FILE_WRITER_FILE, PROPOSAL_CONTROLLER_FILE, PROPOSE_TOOL_FILE, CHANGE_GUARD_FILE):
+			self.assertIn(rel, self.sources)
+		# The scan sees the real writer's writes, so a clean result elsewhere is not a blind scan.
+		writer = parse(FILE_WRITER_FILE, self.sources[FILE_WRITER_FILE])
+		found = " ".join(message for _node, message in _fs_writes(FILE_WRITER_FILE, writer))
+		for expected in ("os.replace", "os.remove", "tempfile.mkstemp", "os.fdopen with mode 'wb'"):
+			self.assertIn(expected, found)
+		self.assertEqual(check_fs_writes_only_in_file_writer(self.sources), [])
+
+	def test_changes_never_set_user_or_publish(self):
+		self.assertIn("frappe.session.user", self.sources["agent/changes/apply_job.py"])  # a read is allowed
+		self.assertGreater(len(only_python(scoped(self.sources, CHANGES_PREFIX))), 3)
+		self.assertEqual(check_changes_never_set_user_or_publish(self.sources), [])
+
+	# ADR-022 git rules (FEAT-004 T44) ------------------------------------------------------------------
+
+	def _git_scan(self) -> GitScan:
+		for rel in (SOURCE_TOOL_FILE, PROCESS_RUNNER_FILE, CONSTANTS_FILE, CHANGE_GUARD_FILE, *NO_GIT_FILES):
+			self.assertIn(rel, self.sources)
+		return GitScan(self.sources)
+
+	def _found_subcommands(self, scan: GitScan, rel: str) -> set:
+		return {sub for argv in scan.argvs if argv.root_rel == rel for sub in argv.subcommands or ()}
+
+	def test_change_text_layer_rule_covers_every_other_module(self):
+		rule = next((rule for rule in LAYER_RULES if rule[0] == CHANGE_TEXT_MODULE), None)
+		self.assertIsNotNone(rule)
+		self.assertIn(module_name(CHANGE_TEXT_FILE), {module_name(rel) for rel in self.sources})
+		for rel in only_python(self.sources):
+			top = ".".join(module_name(rel).split(".")[:2])
+			if top not in (PACKAGE, CONSTANTS_MODULE):
+				self.assertTrue(any(module_in(top, forbidden) for forbidden in rule[1]), top)
+
+	def test_git_subcommands_only_allowed_sets_per_file(self):
+		scan = self._git_scan()
+		source_constants = scan.assignments[SOURCE_TOOL_FILE]
+		# The product's own sets equal ADR-022 QĐ 2, so the hand-written sets here are the same contract.
+		self.assertEqual(
+			scan.strings(SOURCE_TOOL_FILE, source_constants["GIT_READ_SUBCOMMANDS"]), GIT_READ_SET
+		)
+		self.assertEqual(
+			scan.strings(SOURCE_TOOL_FILE, source_constants["GIT_SUBCOMMANDS"]), GIT_LEGACY_SUBCOMMANDS
+		)
+		# Not a blind scan: the expanded call sites of both wrappers and the log/blame tool are seen.
+		self.assertEqual(self._found_subcommands(scan, PROCESS_RUNNER_FILE), set(GIT_WRITE_SET))
+		self.assertLessEqual(
+			{
+				"log",
+				"blame",
+				"rev-parse",
+				"rev-list",
+				"status",
+				"check-ignore",
+				"merge-base",
+				"diff-tree",
+				"cat-file",
+			},
+			self._found_subcommands(scan, SOURCE_TOOL_FILE),
+		)
+		self.assertEqual(check_git_subcommands_only_allowed_sets_per_file(self.sources), [])
+
+	def test_no_forbidden_git_operations_in_product(self):
+		scan = self._git_scan()
+		self.assertGreater(len([argv for argv in scan.argvs if argv.git is not None]), 10)
+		self.assertEqual(check_no_forbidden_git_operations_in_product(self.sources), [])
+
+	def test_git_commit_add_rm_argv_shape(self):
+		scan = self._git_scan()
+		writes = [argv for argv in scan.argvs if argv.subcommands and argv.subcommands & GIT_WRITE_SET]
+		self.assertEqual(sorted(sub for argv in writes for sub in argv.subcommands), ["add", "commit", "rm"])
+		self.assertTrue(all(argv.rel == PROCESS_RUNNER_FILE for argv in writes))
+		self.assertEqual(check_git_commit_add_rm_argv_shape(self.sources), [])
+
+	def test_git_env_single_definition(self):
+		scan = self._git_scan()
+		new_commands = [
+			(rel, root) for rel, root, _elements, _git in scan.templates if not scan.is_legacy(rel, root)
+		]
+		self.assertEqual(sorted(rel for rel, _root in new_commands), [PROCESS_RUNNER_FILE, SOURCE_TOOL_FILE])
+		self.assertEqual(check_git_env_single_definition(self.sources), [])
+
+	def test_bot_identity_constants(self):
+		self._git_scan()
+		self.assertEqual(check_bot_identity_constants(self.sources), [])
+
+	def test_no_git_in_web_and_runner(self):
+		self._git_scan()
+		self.assertIn(
+			PROPOSAL_CONTROLLER_FILE, {rel for rel, _node, _decorator in whitelisted_functions(self.sources)}
+		)
+		self.assertEqual(check_no_git_in_web_and_runner(self.sources), [])
+
+	def test_bench_allowlist_has_no_git_running_subcommands(self):
+		scan = self._git_scan()
+		commands = scan.strings(CHANGE_GUARD_FILE, scan.assignments[CHANGE_GUARD_FILE][BENCH_COMMANDS_NAME])
+		self.assertIn("migrate", commands)
+		self.assertEqual(check_bench_allowlist_has_no_git_running_subcommands(self.sources), [])
+
+	def test_apps_root_single_function(self):
+		self._git_scan()
+		self.assertEqual(check_apps_root_single_function(self.sources), [])
+
+	# ADR-023 Ràng buộc (FEAT-004 T68) ------------------------------------------------------------------
+
+	def test_no_get_whitelist_reaches_change_state(self):
+		# Not a blind scan: the real decision methods are seen as reaching the state machine (all POST).
+		reaching = {(rel, node.name) for rel, node, _methods in change_state_whitelists(self.sources)}
+		for name in CHANGE_STATE_NAMES:
+			self.assertIn((PROPOSAL_CONTROLLER_FILE, name), reaching)
+		self.assertIn(("change_decision.py", "decide"), reaching)
+		self.assertEqual(check_no_get_whitelist_reaches_change_state(self.sources), [])
+
+	def test_change_link_builds_no_api_method_path(self):
+		self.assertIn(CHANGE_LINK_FILE, self.sources)
+		self.assertIn("/app/erp-ai-change-proposal", change_link_string_shapes(self.sources))
+		self.assertEqual(check_change_link_builds_no_api_method_path(self.sources), [])
+
+	def test_registry_has_one_grant_function(self):
+		self.assertIn(f"{GRANT_TABLE_NAME} = (", self.sources[REGISTRY_FILE])
+		self.assertIn(f"{SCHEMA_FUNCTION}(", self.sources[RUNNER_FILE])
+		self.assertEqual(check_registry_has_one_grant_function(self.sources), [])
+
+	def test_agent_write_flag_only_in_run_log_and_propose_tool(self):
+		references = agent_write_references(self.sources)
+		self.assertEqual(
+			{rel for rel, _node, kind in references if kind == AGENT_WRITE_OPENER},
+			set(AGENT_WRITE_OPENER_FILES),
+		)
+		self.assertEqual(
+			{rel for rel, _node, kind in references if kind == AGENT_WRITE_FLAG_NAME},
+			{AGENT_WRITE_GUARD_FILE},
+		)
+		self.assertEqual(check_agent_write_flag_only_in_run_log_and_propose_tool(self.sources), [])
+
 	def test_agent_modules_import_alone_in_fresh_process(self):
 		# STD-DESIGN-6: an import cycle stays hidden in-process when another test imported a module first.
 		env = dict(os.environ, PYTHONPATH=os.pathsep.join([str(REPO_ROOT), os.environ.get("PYTHONPATH", "")]))
@@ -2170,6 +4477,176 @@ class TestArchitecture(unittest.TestCase):
 # ---------------------------------------------------------------------------------------------------
 
 ENQUEUE_GOOD_KEYWORDS = "queue='long', timeout=1, enqueue_after_commit=True, job_id='j', deduplicate=True"
+
+# ADR-022 (T44): a small product that keeps every git rule; each caught case changes one file of it.
+GIT_CLEAN = {
+	SOURCE_TOOL_FILE: '''"""Read tools; git_commit_only never uses --amend (a docstring is not code)."""
+import os
+import subprocess
+
+import frappe
+
+from erp_ai.constants import BOT_GIT_EMAIL, BOT_GIT_NAME
+
+GIT_SUBCOMMANDS = {"log", "blame"}
+GIT_READ_SUBCOMMANDS = frozenset({"rev-parse", "status", "cat-file"})
+
+
+def get_source_root():
+	return os.path.realpath(os.path.dirname(os.path.dirname(frappe.get_app_path("frappe"))))
+
+
+def git_source(args, ctx):
+	try:
+		sub = args.get("subcommand")
+		if not isinstance(sub, str) or sub not in GIT_SUBCOMMANDS:
+			return None
+		command = ["git", "--no-pager", "-C", ctx.repo, sub, *args.get("args")]
+		return subprocess.run(command, timeout=30, env={**os.environ, "GIT_PAGER": "cat"})
+	except OSError:
+		return None
+
+
+def git_global_options(*, read):
+	options = ["--no-pager", "-c", f"core.hooksPath={HOOKS}", "-c", "core.fsmonitor=false"]
+	return [*options, "--no-optional-locks"] if read else options
+
+
+def git_env(*, identity):
+	env = {"PATH": "/usr/bin", "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_NOSYSTEM": "1", "GIT_TERMINAL_PROMPT": "0"}
+	if identity:
+		env.update(
+			{
+				"GIT_AUTHOR_NAME": BOT_GIT_NAME,
+				"GIT_COMMITTER_NAME": BOT_GIT_NAME,
+				"GIT_AUTHOR_EMAIL": BOT_GIT_EMAIL,
+				"GIT_COMMITTER_EMAIL": BOT_GIT_EMAIL,
+			}
+		)
+	return env
+
+
+def run_git_read(repo_root, subcommand, *args, limit_s=30):
+	return subprocess.run(
+		[TIMEOUT_EXECUTABLE, "-s", "KILL", str(limit_s), "git", *git_global_options(read=True), subcommand, *args],
+		cwd=repo_root,
+		env=git_env(identity=False),
+		timeout=limit_s + 5,
+		start_new_session=True,
+	)
+
+
+def read_git_state(repo_root, rel, names):
+	run_git_read(repo_root, "rev-parse", "--verify", "-q", "HEAD")
+	run_git_read(repo_root, "rev-parse", *names)
+	return run_git_read(repo_root, "status", "--porcelain=v1", "--", f":(literal){rel}")
+
+
+def git_blob(repo_root, commit, rel):
+	return run_git_read(repo_root, "cat-file", "blob", f"{commit}:{rel}")
+''',
+	PROCESS_RUNNER_FILE: '''"""bench and git add/commit/rm; never `-a`/`--amend`, never `git push`."""
+import subprocess
+
+import frappe
+
+from erp_ai.agent.tools import source
+
+
+def _run_git_write(repo_root, rel, limit_s, subcommand_args):
+	return _run_wrapped(
+		["git", *source.git_global_options(read=False), *subcommand_args, "--", rel],
+		cwd=repo_root,
+		env=source.git_env(identity=True),
+		limit_s=limit_s,
+	)
+
+
+def git_add_new(repo_root, rel, limit_s):
+	return _run_git_write(repo_root, rel, limit_s, ["add"])
+
+
+def git_commit_only(repo_root, rel, subject, body, limit_s):
+	return _run_git_write(
+		repo_root, rel, limit_s, ["commit", "--only", "--no-gpg-sign", "--quiet", "-m", subject, "-m", body]
+	)
+
+
+def git_unstage_new(repo_root, rel, limit_s):
+	return _run_git_write(repo_root, rel, limit_s, ["rm", "--cached", "-q"])
+
+
+def run_bench(args, limit_s):
+	return _run_wrapped([BENCH, *args], cwd=frappe.utils.get_bench_path(), env=_minimal_env(), limit_s=limit_s)
+
+
+def _run_wrapped(command, *, cwd, env, limit_s):
+	return subprocess.run([TIMEOUT, str(limit_s), *command], cwd=cwd, env=env, timeout=limit_s + 5, start_new_session=True)
+''',
+	CONSTANTS_FILE: 'AGENT_USER = "ai.agent@example.com"\nBOT_GIT_NAME = "ERP AI Agent"\nBOT_GIT_EMAIL = "erp-ai-agent@bot.invalid"\n',
+	CHANGE_GUARD_FILE: """from erp_ai.agent.tools import source
+
+PATH_INVALID = "đường dẫn nằm ngoài apps/"
+SITE_COMMANDS = ("migrate", "clear-cache")
+BUILD_COMMAND = "build"
+BENCH_COMMANDS = (*SITE_COMMANDS, BUILD_COMMAND, "version")
+
+
+def check_write_path(rel):
+	return source.read_git_state(source.get_source_root(), rel, [])
+
+
+def _bench_shape(command, site):
+	return [BUILD_COMMAND, "--app", site] if command == BUILD_COMMAND else ["--site", site, command]
+""",
+	"agent/changes/apply_job.py": """import os
+
+from erp_ai.agent.changes import process_runner
+from erp_ai.agent.tools import source
+
+
+def run_change(name, repo, rel, subject, body):
+	if source.git_head(repo) is None:
+		return None
+	return process_runner.git_commit_only(repo, rel, subject, body, source.GIT_TIMEOUT_S)
+
+
+def _full(root, rel):
+	return os.path.join(source.get_source_root(), rel)
+""",
+	PROPOSAL_CONTROLLER_FILE: """import frappe
+
+from erp_ai.agent import change_text, queue
+
+
+@frappe.whitelist(methods=["POST"])
+def approve(name):
+	return queue.enqueue_change(name)
+
+
+def form_data(doc):
+	return change_text.render(doc.applied_branch)
+""",
+	HANDLERS_FILE: "import frappe\n\nfrom erp_ai.agent import policy\n\n\ndef on_update(doc, method=None):\n\treturn policy.agent_enabled()\n",
+	RUNNER_FILE: "import frappe\n\nfrom erp_ai.agent.tools import registry\n\n\ndef run_for_ticket(name):\n\treturn registry.dispatch(name)\n",
+	"ticket_panel.py": """import frappe
+
+from erp_ai.agent.tools import source
+
+
+@frappe.whitelist(methods=["GET"])
+def get_panel_data(name):
+	return _panel(name)
+
+
+def _panel(name):
+	return {"name": name}
+
+
+def _not_web(repo):
+	return source.git_head(repo)
+""",
+}
 
 
 class TestScannersCatchViolations(unittest.TestCase):
@@ -3579,6 +6056,1426 @@ class TestScannersCatchViolations(unittest.TestCase):
 		self.assertEqual(check_no_default_people_in_agent_python({"agent/prompts.py": clean}), [])
 		outside = "DEFAULT = 'Hiếu'\n"
 		self.assertEqual(check_no_default_people_in_agent_python({"constants.py": outside}), [])
+
+	# FEAT-004 group 1 (ADR-011, ADR-012) -------------------------------------------------------
+
+	def test_transitions_import_caught_outside_controller_and_changes(self):
+		cases = {
+			"agent/runner.py": "from erp_ai.agent.changes import transitions\n",
+			"handlers.py": "import erp_ai.agent.changes.transitions\n",
+			"agent/tools/propose_change.py": "from erp_ai.agent.changes.transitions import approve\n",
+			"tasks.py": "from erp_ai.agent.changes import transitions as t\n",
+			"gateway/client.py": "from erp_ai.agent import changes\nX = changes.transitions.approve\n",
+			"change_decision.py": "M = 'erp_ai.agent.changes.transitions.approve'\n",
+			"agent/changes_old.py": "from erp_ai.agent.changes import transitions\n",
+			"erp_ai_agent/doctype/erp_ai_log/erp_ai_log.py": "from erp_ai.agent.changes import transitions\n",
+		}
+		for rel, source in cases.items():
+			with self.subTest(rel=rel):
+				self.assertCaught(
+					check_transitions_imported_only_by_controller_and_changes({rel: source}), rel, "ADR-012"
+				)
+
+	def test_transitions_import_clean_in_controller_and_changes(self):
+		allowed = "from erp_ai.agent.changes import transitions\n"
+		clean = {
+			PROPOSAL_CONTROLLER_FILE: allowed,
+			"agent/changes/apply_job.py": allowed,
+			"agent/changes/transitions.py": "from erp_ai.agent.run_log import write_entry\n",
+			"agent/runner.py": "from erp_ai.agent.changes import apply_job\nM = 'erp_ai.agent.changes.apply_job.run_change'\n",
+			"agent/queue.py": "from erp_ai.agent.changes import transitions_note\n",
+		}
+		self.assertEqual(check_transitions_imported_only_by_controller_and_changes(clean), [])
+
+	def test_state_field_writes_caught_outside_changes(self):
+		for field in STATE_FIELDS:
+			with self.subTest(field=field):
+				self.assertCaught(
+					check_change_state_fields_written_only_in_changes(
+						{"agent/tools/propose_change.py": f"doc.{field} = 1\n"}
+					),
+					field,
+				)
+		shapes = {
+			"attribute": "proposal.change_status = 'Đã duyệt'\n",
+			"augmented": "proposal.exit_code += 1\n",
+			"annotated": "proposal.decided_by: str = user\n",
+			"subscript": "proposal['decided_at'] = now\n",
+			"dict key": "frappe.get_doc({'doctype': D, 'approved_digest': x}).insert()\n",
+			"doc.set": "doc.set('undo_by', user)\n",
+			"db_set": "doc.db_set('undo_at', now)\n",
+			"set_value": "frappe.db.set_value(D, name, 'finished_at', now)\n",
+			"setattr": "setattr(doc, 'failure_reason', text)\n",
+			"keyword": "frappe.new_doc(D, applied_branch='main')\n",
+			"qb set attribute": "frappe.qb.update(T).set(T.change_status, v).run()\n",
+			"dict() keyword": "doc.update(dict(change_status=v))\n",
+		}
+		for shape, source in shapes.items():
+			with self.subTest(shape=shape):
+				self.assertCaught(
+					check_change_state_fields_written_only_in_changes({"change_decision.py": source}),
+					"change_decision.py",
+					"ADR-012",
+				)
+
+	def test_state_field_reads_and_changes_writes_are_clean(self):
+		clean = {
+			# Writes inside agent/changes/ are the state machine's own job.
+			"agent/changes/transitions.py": "doc.set('change_status', S)\nfrappe.db.set_value(D, n, {'decided_by': u})\n",
+			"agent/changes/apply_job.py": "proposal.apply_commit_sha = sha\n",
+			# Reads elsewhere, and a content field (not in STATE_FIELDS) written elsewhere.
+			"agent/change_text.py": "s = fields.get('change_status')\nc = proposal.undo_commit_sha\n",
+			"agent/tools/propose_change.py": (
+				"x = {'ok': True, 'status': proposal.change_status}\n"
+				"frappe.get_doc({'doctype': D, 'change_kind': k}).insert()\n"
+			),
+			"agent/tools/source.py": "run = GitRun(exit_code=None, stdout=b'')\n",
+			"change_decision.py": "s = frappe.db.get_value(D, name, 'change_status')\n",
+		}
+		self.assertEqual(check_change_state_fields_written_only_in_changes(clean), [])
+
+	def test_change_guard_without_resolve_safe_path_caught(self):
+		good = (
+			"from erp_ai.agent.tools import source\n\ndef check_write_path(rel):\n"
+			"\tfull = source.resolve_safe_path(rel)\n\tif full is None:\n\t\treturn _refused(PATH_INVALID)\n"
+			"\treturn full\n"
+		)
+		cases = {
+			"refusal of the resolver not kept": (
+				{
+					CHANGE_GUARD_FILE: "import os\nfrom erp_ai.agent.tools import source\n\n"
+					"def check_write_path(rel):\n\tfull = source.resolve_safe_path(rel)\n"
+					"\ttarget = full or os.path.realpath(rel)\n\treturn _refused(None) if not target else target\n"
+				},
+				"None",
+			),
+			"None check without a refusal": (
+				{
+					CHANGE_GUARD_FILE: "from erp_ai.agent.tools import source\n\ndef check_write_path(rel):\n"
+					"\tfull = source.resolve_safe_path(rel)\n\tif full is None:\n\t\tpass\n\treturn full\n"
+				},
+				"None",
+			),
+			"realpath root check in a helper": (
+				{
+					CHANGE_GUARD_FILE: good,
+					"agent/changes/file_writer.py": "import os\n\ndef _real(p):\n\tr = os.path.realpath(p)\n"
+					"\treturn os.path.commonpath([ROOT, r]) == ROOT\n",
+				},
+				"agent/changes/file_writer.py",
+				"_real",
+			),
+			"root check in another guard function": (
+				{
+					CHANGE_GUARD_FILE: good
+					+ "\ndef _inside(p):\n\treturn os.path.commonpath([R, os.path.realpath(p)]) == R\n",
+				},
+				"_inside",
+			),
+			# source.py's own shape: the root check in a helper, the realpath calls in its caller.
+			"root check split from realpath": (
+				{
+					CHANGE_GUARD_FILE: good,
+					"agent/changes/file_writer.py": "import os\n\ndef _inside(root, full):\n"
+					"\treturn os.path.commonpath([root, full]) == root\n\ndef resolve(rel):\n"
+					"\troot, full = os.path.realpath(ROOT), os.path.realpath(rel)\n"
+					"\treturn full if _inside(root, full) else None\n",
+				},
+				"agent/changes/file_writer.py",
+				"_inside",
+			),
+			"root check at module level": (
+				{
+					CHANGE_GUARD_FILE: good,
+					"agent/changes/file_writer.py": "import pathlib\n\nOK = pathlib.Path(P).is_relative_to(R)\n",
+				},
+				"agent/changes/file_writer.py",
+				"is_relative_to",
+			),
+			"missing file": (
+				{SOURCE_TOOL_FILE: "def resolve_safe_path(rel):\n\treturn rel\n"},
+				CHANGE_GUARD_FILE,
+			),
+			"no guard function": (
+				{CHANGE_GUARD_FILE: "def other(rel):\n\treturn rel\n"},
+				CHANGE_GUARD_FUNCTION,
+			),
+			"guard resolves itself": (
+				{
+					CHANGE_GUARD_FILE: "import os\n\ndef check_write_path(rel):\n\treturn os.path.realpath(rel)\n"
+				},
+				"ADR-011",
+			),
+			"call in another function": (
+				{
+					CHANGE_GUARD_FILE: "from erp_ai.agent.tools import source\n\ndef check_write_path(rel):\n\treturn rel\n"
+					"\ndef helper(rel):\n\treturn source.resolve_safe_path(rel)\n"
+				},
+				"ADR-011",
+			),
+			"second resolver": (
+				{
+					CHANGE_GUARD_FILE: good,
+					"agent/changes/file_writer.py": "def _resolve_safe_path(p):\n\treturn p\n",
+				},
+				"agent/changes/file_writer.py",
+			),
+		}
+		for name, (sources, *fragments) in cases.items():
+			with self.subTest(case=name):
+				self.assertCaught(check_change_guard_uses_resolve_safe_path(sources), *fragments)
+
+	def test_change_guard_with_resolve_safe_path_clean(self):
+		clean = {
+			SOURCE_TOOL_FILE: "def resolve_safe_path(rel):\n\treturn rel\n",
+			# The guard's own realpath/commonpath only classifies a refused path (allowlisted, ADR-011).
+			CHANGE_GUARD_FILE: "import os\nfrom erp_ai.agent.tools import source\n\ndef check_write_path(rel):\n"
+			"\tif not rel:\n\t\treturn _refused(PATH_INVALID)\n\tfull = source.resolve_safe_path(rel)\n"
+			"\ttarget = full or os.path.realpath(rel)\n\tif os.path.commonpath([R, target]) != R:\n"
+			"\t\treturn _refused(PATH_INVALID)\n\tif full is None:\n\t\treturn _refused(PATH_INVALID)\n"
+			"\treturn full\n",
+			# realpath alone (no root check) is not a resolver.
+			"agent/changes/apply_job.py": "import os\n\ndef _top(p):\n\treturn os.path.realpath(p)\n",
+		}
+		self.assertEqual(check_change_guard_uses_resolve_safe_path(clean), [])
+		direct = {
+			CHANGE_GUARD_FILE: "from erp_ai.agent.tools.source import resolve_safe_path\n\n"
+			"def check_write_path(rel):\n\tif (full := resolve_safe_path(rel)) is None:\n"
+			"\t\traise ValueError(rel)\n\treturn full\n"
+		}
+		self.assertEqual(check_change_guard_uses_resolve_safe_path(direct), [])
+
+	def test_root_check_allowlist_is_closed(self):
+		# Hand-written and closed: exactly these (file, function) pairs; anything else is a second resolver.
+		self.assertEqual(
+			ROOT_CHECK_ALLOWLIST,
+			frozenset(
+				{(CHANGE_GUARD_FILE, CHANGE_GUARD_FUNCTION), ("eval/export_tickets.py", "_inside_repo")}
+			),
+		)
+		good = (
+			"from erp_ai.agent.tools import source\n\ndef check_write_path(rel):\n"
+			"\tfull = source.resolve_safe_path(rel)\n\tif full is None:\n\t\treturn _refused(PATH_INVALID)\n"
+			"\treturn full\n"
+		)
+		root_check = (
+			"import os\n\ndef {name}(p):\n\treturn os.path.commonpath([R, os.path.realpath(p)]) == R\n"
+		)
+		allowed = {CHANGE_GUARD_FILE: good, "eval/export_tickets.py": root_check.format(name="_inside_repo")}
+		self.assertEqual(check_change_guard_uses_resolve_safe_path(allowed), [])
+		outside = {
+			"same function, another file": ("eval/compute_metrics.py", "_inside_repo"),
+			"same file, another function": ("eval/export_tickets.py", "_inside_app"),
+		}
+		for name, (rel, function) in outside.items():
+			with self.subTest(case=name):
+				sources = {CHANGE_GUARD_FILE: good, rel: root_check.format(name=function)}
+				self.assertCaught(check_change_guard_uses_resolve_safe_path(sources), rel, function)
+
+	def _proposal_json(self, permissions):
+		return {
+			PROPOSAL_DOCTYPE_FILE: json.dumps({"name": PROPOSAL_DOCTYPE_NAME, "permissions": permissions})
+		}
+
+	def _proposal_rows(self):
+		return [
+			{"role": "ERP AI Agent", "create": 1, "read": 1},
+			{"role": "ERP AI Instructor", "read": 1},
+			{"role": "System Manager", "read": 1},
+		]
+
+	def test_proposal_permissions_caught(self):
+		self.assertCaught(check_proposal_doctype_permissions({}), PROPOSAL_DOCTYPE_FILE)
+		for role in PROPOSAL_PERMISSIONS:
+			for flag in PROPOSAL_FORBIDDEN_PERMISSIONS:
+				with self.subTest(role=role, flag=flag):
+					rows = self._proposal_rows()
+					next(row for row in rows if row["role"] == role)[flag] = 1
+					self.assertCaught(
+						check_proposal_doctype_permissions(self._proposal_json(rows)), role, flag
+					)
+		cases = {
+			"agent without create": [{"role": "ERP AI Agent", "read": 1}, *self._proposal_rows()[1:]],
+			"agent without read": [{"role": "ERP AI Agent", "create": 1}, *self._proposal_rows()[1:]],
+			"instructor may create": [
+				*self._proposal_rows()[:1],
+				{"role": "ERP AI Instructor", "read": 1, "create": 1},
+				*self._proposal_rows()[2:],
+			],
+			"outside flag share": [
+				{"role": "ERP AI Agent", "create": 1, "read": 1, "share": 1},
+				*self._proposal_rows()[1:],
+			],
+			"outside role": [*self._proposal_rows(), {"role": "Guest", "read": 1}],
+			"missing role": self._proposal_rows()[:2],
+			"split rows add write": [*self._proposal_rows(), {"role": "ERP AI Agent", "write": 1}],
+		}
+		for name, rows in cases.items():
+			with self.subTest(case=name):
+				self.assertCaught(check_proposal_doctype_permissions(self._proposal_json(rows)), "ADR-012")
+
+	def test_proposal_permissions_clean(self):
+		self.assertEqual(check_proposal_doctype_permissions(self._proposal_json(self._proposal_rows())), [])
+		zeros = [
+			{**row, **{flag: 0 for flag in PROPOSAL_FORBIDDEN_PERMISSIONS}, "permlevel": 0, "if_owner": 0}
+			for row in self._proposal_rows()
+		]
+		self.assertEqual(check_proposal_doctype_permissions(self._proposal_json(zeros)), [])
+
+	def test_tool_saving_a_proposal_caught(self):
+		builds = "from erp_ai.constants import PROPOSAL_DOCTYPE\nd = frappe.get_doc({'doctype': PROPOSAL_DOCTYPE})\n"
+		for call in ("d.save()", "d.db_set('reason', 'x')", "frappe.db.set_value('ToDo', n, 'x', 1)"):
+			with self.subTest(call=call):
+				self.assertCaught(
+					check_tool_never_saves_proposal({PROPOSE_TOOL_FILE: builds + call + "\n"}),
+					PROPOSE_TOOL_FILE,
+					"ADR-011",
+				)
+		elsewhere = {
+			"get_doc constant": "frappe.get_doc(PROPOSAL_DOCTYPE, name).save()\n",
+			"get_doc literal": "frappe.get_doc('ERP AI Change Proposal', name).save()\n",
+			"new_doc": "d = frappe.new_doc(PROPOSAL_DOCTYPE)\nd.save()\n",
+			"set_value": "frappe.db.set_value(PROPOSAL_DOCTYPE, name, 'reason', 'x')\n",
+			"set_value literal": "frappe.db.set_value('ERP AI Change Proposal', name, 'reason', 'x')\n",
+			"db_set": "frappe.get_doc(PROPOSAL_DOCTYPE, name).db_set('reason', 'x')\n",
+		}
+		for name, source in elsewhere.items():
+			with self.subTest(case=name):
+				self.assertCaught(
+					check_tool_never_saves_proposal({"agent/tools/site_api.py": source}),
+					"agent/tools/site_api.py",
+				)
+		saves = "def save(doctype, name):\n\tdoc = frappe.get_doc(doctype, name)\n\tdoc.save()\n"
+		generic = {
+			"no deny set": ("agent/tools/site_api.py", saves),
+			"denied set lacks it": ("agent/tools/cleanup.py", "DENIED_DOCTYPES = {'User'}\n" + saves),
+			"subtracted from the set": (
+				"agent/tools/cleanup.py",
+				"DENIED_DOCTYPES = (read.DENIED_DOCTYPES | {'X'}) - {PROPOSAL_DOCTYPE}\n" + saves,
+			),
+			"delete_doc in another tool": (
+				"agent/tools/cleanup.py",
+				"DENIED_DOCTYPES = {LOG_DOCTYPE}\ndef drop(doctype, name):\n\tfrappe.delete_doc(doctype, name)\n",
+			),
+			"get_doc with keywords only": (
+				"agent/tools/cleanup.py",
+				"def save(d, n):\n\tdoc = frappe.get_doc(doctype=d, name=n)\n\tdoc.save()\n",
+			),
+			"delete_doc with keywords only": (
+				"agent/tools/cleanup.py",
+				"def drop(d, n):\n\tfrappe.delete_doc(doctype=d, name=n)\n",
+			),
+		}
+		for name, (rel, source) in generic.items():
+			with self.subTest(case=name):
+				self.assertCaught(check_tool_never_saves_proposal({rel: source}), rel, "deny")
+
+	def test_tool_inserting_a_proposal_clean(self):
+		clean = {
+			PROPOSE_TOOL_FILE: "d = frappe.get_doc({'doctype': PROPOSAL_DOCTYPE, 'reason': r})\nd.insert()\n",
+			# Other DocTypes in tools keep their own rules.
+			"agent/tools/write_ticket.py": "doc = frappe.get_doc('HD Ticket', n)\ndoc.save()\n",
+			"agent/tools/route_ticket.py": "doc = frappe.get_doc(TICKET_DOCTYPE, ctx.ticket_name)\ndoc.save()\n",
+			# A tool saving or deleting any DocType keeps the proposal in every deny set (ADR-011).
+			"agent/tools/write_any.py": (
+				"DENIED_DOCTYPES = (read.DENIED_DOCTYPES - {'User'}) | {PROPOSAL_DOCTYPE, 'Custom Role'}\n"
+				"doc = frappe.get_doc(doctype, name)\ndoc.save()\nfrappe.delete_doc(doctype, name)\n"
+			),
+			# site_api refuses through the derived deny gate (ADR-023).
+			SITE_API_FILE: SITE_API_GATED,
+			# A generic loader that never saves or deletes needs no deny set.
+			"agent/tools/read.py": "doc = frappe.get_doc(doctype, name)\nreturn doc.as_dict()\n",
+			"agent/tools/cleanup.py": "DENIED_DOCTYPES = {'ERP AI Change Proposal'}\nfrappe.delete_doc(doctype, name)\n",
+			# Outside agent/tools/ the state machine writes the proposal (ADR-012).
+			"agent/changes/transitions.py": "frappe.db.set_value(PROPOSAL_DOCTYPE, name, values)\n",
+		}
+		self.assertEqual(check_tool_never_saves_proposal(clean), [])
+
+	def test_site_api_hand_written_app_doctype_set_caught(self):
+		cases = {
+			"frozenset of a constant": "ALWAYS_DENIED_DOCTYPES = frozenset({PROPOSAL_DOCTYPE})\n",
+			"set literal of a string": "DENIED = {'ERP AI Change Proposal', 'User'}\n",
+			"tuple of constants": "APP_DOCTYPES = (SETTING_DOCTYPE, constants.CREDENTIAL_DOCTYPE)\n",
+			"annotated list": "APP: list = ['ERP AI Log']\n",
+			"union with a derived set": "DENIED = read.DENIED_DOCTYPES | {LOG_DOCTYPE}\n",
+		}
+		for name, line in cases.items():
+			with self.subTest(case=name):
+				self.assertCaught(
+					check_tool_never_saves_proposal({SITE_API_FILE: line + SITE_API_GATED}),
+					f"{SITE_API_FILE}:1:",
+					"ADR-023",
+				)
+
+	def test_site_api_hand_written_app_doctype_set_clean(self):
+		# Sets of other DocTypes and a single constant stay allowed; only a set naming the app's DocTypes is caught.
+		source = (
+			"PERMISSION_DOCTYPES = frozenset({'Custom Role', DOCTYPE_DOCTYPE, ROLE_DOCTYPE})\n"
+			"FORCED_VALUES = {'Server Script': {'disabled': 1}}\n"
+			"OWN = PROPOSAL_DOCTYPE\n" + SITE_API_GATED
+		)
+		self.assertEqual(check_tool_never_saves_proposal({SITE_API_FILE: source}), [])
+
+	def test_site_api_always_denied_not_derived_caught(self):
+		derived = 'return frozenset(frappe.get_all("DocType", {"module": read.AI_MODULE}, pluck="name"))'
+		cases = {
+			"missing": (
+				SITE_API_GATED.replace("def always_denied_doctypes", "def other_doctypes"),
+				"no always_",
+			),
+			"hand-written inside": (
+				SITE_API_GATED.replace(derived, "return frozenset({SETTING_DOCTYPE, PROPOSAL_DOCTYPE})"),
+				"not derived",
+			),
+			"not from the app module": (
+				SITE_API_GATED.replace("read.AI_MODULE", "'Core'"),
+				"not derived",
+			),
+		}
+		for name, (source, fragment) in cases.items():
+			with self.subTest(case=name):
+				self.assertNotEqual(source, SITE_API_GATED)
+				self.assertCaught(
+					check_tool_never_saves_proposal({SITE_API_FILE: source}), fragment, "ADR-023"
+				)
+
+	def test_site_api_handler_without_deny_gate_caught(self):
+		gate = "\tif refusal := _refusal(doctype, ctx):\n\t\treturn refusal\n"
+		read_tool = (
+			"def get_record(args, ctx):\n\treturn frappe.get_doc(args['doctype'], args['name']).as_dict()\n"
+			"TOOLS.append(ToolSpec(name='api_get_record', handler=get_record))\n"
+		)
+		cases = {
+			"save before the gate": SITE_API_GATED.replace(
+				gate, "\tfrappe.get_doc(doctype, 'x').save()\n" + gate
+			),
+			"no gate": SITE_API_GATED.replace(gate, ""),
+			# review-31: calling the deny set without refusing on it proves nothing.
+			"deny set called, not gated": SITE_API_GATED.replace(gate, "\t_refusal(doctype, ctx)\n"),
+			"refusal never returns": SITE_API_GATED.replace(
+				"\t\treturn {'ok': False, 'reason': 'không được phép'}\n\treturn None\n",
+				"\t\tlogger.info(doctype)\n\treturn None\n",
+			),
+			"proposal taken out of the set": SITE_API_GATED.replace(
+				"read.denied_doctypes() - {'User'}", "read.denied_doctypes() - {PROPOSAL_DOCTYPE}"
+			),
+			"read handler returns before the gate": SITE_API_GATED + read_tool,
+		}
+		for name, source in cases.items():
+			with self.subTest(case=name):
+				self.assertNotEqual(source, SITE_API_GATED)
+				self.assertCaught(
+					check_tool_never_saves_proposal({SITE_API_FILE: source}), "before the derived deny gate"
+				)
+		no_tools = SITE_API_GATED.split("TOOLS = ")[0]
+		self.assertCaught(check_tool_never_saves_proposal({SITE_API_FILE: no_tools}), "deny gate")
+		elsewhere = SITE_API_GATED.replace("handler=call_method", "handler=other.call_method")
+		self.assertCaught(check_tool_never_saves_proposal({SITE_API_FILE: elsewhere}), "deny gate unproven")
+
+	def test_site_api_handlers_behind_deny_gate_clean(self):
+		# The real module is held to the same rule by TestArchitecture.test_tool_never_saves_proposal.
+		self.assertEqual(check_tool_never_saves_proposal({SITE_API_FILE: SITE_API_GATED}), [])
+
+	# FEAT-004 T32: file-system writes, session and publish in the change path (ADR-013) --------------
+
+	def test_fs_writes_caught_outside_file_writer(self):
+		cases = {
+			"open positional w": "open(p, 'w')\n",
+			"open positional a": "with open(p, 'ab') as f:\n\tf.write(b)\n",
+			"open positional x": "open(p, 'x')\n",
+			"open r+": "open(p, 'r+')\n",
+			"open mode= w": "open(p, mode='w', encoding='utf-8')\n",
+			"open mode= a": "open(file=p, mode='a')\n",
+			"open non-literal mode": "MODE = 'w'\nopen(p, MODE)\n",
+			"open mode through a helper": "def _mode():\n\treturn 'w'\n\ndef save(p):\n\treturn open(p, _mode())\n",
+			"open mode through **kwargs": "open(p, **options)\n",
+			"io.open": "import io\nio.open(p, 'w')\n",
+			"io aliased": "import io as i\ni.open(p, mode='wb')\n",
+			"codecs.open": "import codecs\ncodecs.open(p, 'w', 'utf-8')\n",
+			"os.fdopen": "import os\nos.fdopen(fd, 'wb')\n",
+			"Path.open": "from pathlib import Path\nPath(p).open('w')\n",
+			"Path.open mode=": "from pathlib import Path\nPath(p).open(mode='a')\n",
+			"os.open write flags": "import os\nos.open(p, os.O_WRONLY | os.O_CREAT)\n",
+			"os.open int flags": "import os\nos.open(p, 577)\n",
+			"os.replace": "import os\nos.replace(a, b)\n",
+			"os.rename": "import os\nos.rename(a, b)\n",
+			"os.remove": "import os\nos.remove(p)\n",
+			"os.unlink": "import os\nos.unlink(p)\n",
+			"from os import replace": "from os import replace\nreplace(a, b)\n",
+			"from os import remove as rm": "from os import remove as rm\nrm(p)\n",
+			"import os as o": "import os as o\no.unlink(p)\n",
+			"os function as a value": "import os\ncleanup = os.remove\ncleanup(p)\n",
+			"os.makedirs": "import os\nos.makedirs(d, exist_ok=True)\n",
+			"shutil": "import shutil\nshutil.copyfile(a, b)\n",
+			"shutil aliased": "import shutil as s\ns.move(a, b)\n",
+			"from shutil import": "from shutil import rmtree\nrmtree(d)\n",
+			"tempfile": "import tempfile\ntempfile.NamedTemporaryFile(dir=d)\n",
+			"from tempfile import mkstemp as m": "from tempfile import mkstemp as m\nm(dir=d)\n",
+			"Path.write_text": "from pathlib import Path\nPath(p).write_text(s)\n",
+			"Path.write_bytes chain": "self.root.joinpath(rel).write_bytes(b)\n",
+			"Path.unlink": "target.unlink(missing_ok=True)\n",
+			"Path.touch": "target.touch()\n",
+		}
+		for rel in (
+			"agent/changes/apply_job.py",
+			"agent/changes/process_runner.py",
+			PROPOSE_TOOL_FILE,
+			CHANGE_GUARD_FILE,
+			PROPOSAL_CONTROLLER_FILE,
+			"agent/run_log.py",
+		):
+			for case, source in cases.items():
+				with self.subTest(rel=rel, case=case):
+					self.assertCaught(check_fs_writes_only_in_file_writer({rel: source}), rel)
+
+	def test_fs_reads_and_file_writer_writes_are_clean(self):
+		writer = (
+			"import os\nimport tempfile\n"
+			"fd, temp = tempfile.mkstemp(dir=d)\n"
+			"with os.fdopen(fd, 'wb') as handle:\n\thandle.write(b)\n"
+			"os.replace(temp, full)\nos.remove(full)\n"
+		)
+		clean = {
+			FILE_WRITER_FILE: writer,
+			PROPOSE_TOOL_FILE: "with open(full, 'rb') as handle:\n\tdata = handle.read()\n",
+			CHANGE_GUARD_FILE: "import os\nwith open(p, encoding='utf-8') as h:\n\tos.path.join(a, b)\n",
+			"agent/tools/source.py": "open(full, 'r', encoding='utf-8', errors='replace')\nopen(p, mode='rt')\n",
+			"agent/changes/apply_job.py": (
+				"import os\nfrom pathlib import Path\n"
+				"text = Path(p).read_text()\nPath(p).open()\nos.open(p, os.O_RDONLY | os.O_CLOEXEC)\n"
+				"name = name.replace('a', 'b')\nos.path.exists(p)\nfile_writer.remove_created(full)\n"
+			),
+			PROPOSAL_CONTROLLER_FILE: "doc.rename(new)\n",
+			# Outside agent/** and the controller the rule does not apply (ADR-013: eval/ untouched).
+			"eval/run_eval.py": "import shutil\nopen(p, 'w')\nshutil.rmtree(d)\n",
+			"install.py": "import os\nos.remove(p)\n",
+		}
+		self.assertEqual(check_fs_writes_only_in_file_writer(clean), [])
+
+	def test_changes_set_user_or_publish_caught(self):
+		cases = {
+			"set_user": "import frappe\nfrappe.set_user('Administrator')\n",
+			"set_user aliased import": "from frappe import set_user as su\nsu(owner)\n",
+			"set_user aliased module": "import frappe as f\nf.set_user(owner)\n",
+			"set_user as a value": "import frappe\nbecome = frappe.set_user\nbecome(owner)\n",
+			"set_user by string": "import frappe\ngetattr(frappe, 'set_user')(owner)\n",
+			"publish_realtime": "import frappe\nfrappe.publish_realtime('e', {}, user=u)\n",
+			"publish_realtime from realtime": "from frappe.realtime import publish_realtime as p\np('e')\n",
+			"publish by dotted string": "import frappe\nfrappe.get_attr('frappe.publish_realtime')('e')\n",
+		}
+		for rel in (
+			"agent/changes/apply_job.py",
+			"agent/changes/transitions.py",
+			"agent/changes/new_step.py",
+		):
+			for case, source in cases.items():
+				with self.subTest(rel=rel, case=case):
+					self.assertCaught(check_changes_never_set_user_or_publish({rel: source}), rel, "ADR-013")
+
+	def test_changes_session_reads_and_other_modules_are_clean(self):
+		clean = {
+			"agent/changes/apply_job.py": (
+				"import frappe\nif frappe.session.user != runner:\n\tpass\n"
+				"user = frappe.session.user\nnote = 'never calls set_user or publish_realtime'\n"
+				"doc.user = frappe.session.user\nrow['user'] = user\n"
+			),
+			"agent/changes/transitions.py": "import frappe\nfrappe.db.set_value(D, n, {'decided_by': frappe.session.user})\n",
+			# Outside agent/changes/ this rule does not apply (run_status.py publishes, by ADR-008).
+			RUN_STATUS_FILE: "import frappe\nfrappe.publish_realtime('e', {}, room=r, after_commit=False)\n",
+			"agent/runner.py": "import frappe\nfrappe.set_user(u)\n",
+		}
+		self.assertEqual(check_changes_never_set_user_or_publish(clean), [])
+
+	# FEAT-004 T32: the enqueue and subprocess rules also catch the change path ------------------------
+
+	def test_single_enqueue_catches_change_path_files(self):
+		for rel in ("agent/changes/apply_job.py", PROPOSE_TOOL_FILE, PROPOSAL_CONTROLLER_FILE):
+			for source in (
+				"import frappe as f\nf.enqueue('erp_ai.agent.changes.apply_job.run_change')\n",
+				"from frappe.utils.background_jobs import enqueue as later\nlater('x')\n",
+				"import frappe\nfrappe.enqueue_doc(D, n, 'run')\n",
+			):
+				with self.subTest(rel=rel, source=source):
+					self.assertCaught(check_single_enqueue_site({rel: source}), rel, QUEUE_FILE)
+
+	def test_subprocess_caught_in_change_path_files(self):
+		for rel in (
+			"agent/changes/apply_job.py",
+			FILE_WRITER_FILE,
+			PROPOSE_TOOL_FILE,
+			CHANGE_GUARD_FILE,
+			PROPOSAL_CONTROLLER_FILE,
+		):
+			for source in (
+				"import subprocess as sp\nsp.run(['bench', 'migrate'], timeout=3)\n",
+				"from subprocess import check_output as co\nco(['git', 'status'], timeout=3)\n",
+				"from os import system\nsystem('bench migrate')\n",
+				"import os as o\no.execvp('bench', ['bench'])\n",
+			):
+				with self.subTest(rel=rel, source=source):
+					self.assertCaught(check_subprocess_only_in_source_tool({rel: source}), rel, "outside")
+
+	# FEAT-004 T44: ADR-022 git rules ---------------------------------------------------------------
+
+	def git_product(self, rel: str, extra: str = "", replace: tuple = ()) -> dict:
+		"""GIT_CLEAN with `extra` appended to `rel` (a new file when absent) and `replace=(old, new)` applied."""
+		text = GIT_CLEAN.get(rel, "")
+		if replace:
+			self.assertIn(replace[0], text)
+			text = text.replace(*replace)
+		return {**GIT_CLEAN, rel: text + extra}
+
+	def test_git_rules_pass_on_the_clean_product(self):
+		for check in (
+			check_git_subcommands_only_allowed_sets_per_file,
+			check_no_forbidden_git_operations_in_product,
+			check_git_commit_add_rm_argv_shape,
+			check_git_env_single_definition,
+			check_bot_identity_constants,
+			check_no_git_in_web_and_runner,
+			check_bench_allowlist_has_no_git_running_subcommands,
+			check_apps_root_single_function,
+		):
+			with self.subTest(check=check.__name__):
+				self.assertEqual(check(GIT_CLEAN), [])
+		self.assertEqual(check_layer_imports(GIT_CLEAN), [])
+		scan = GitScan(GIT_CLEAN)
+		self.assertEqual(
+			{sub for argv in scan.argvs if argv.root_rel == SOURCE_TOOL_FILE for sub in argv.subcommands},
+			{"log", "blame", "rev-parse", "status", "cat-file"},
+		)
+
+	def test_change_text_layer_rule_catches_non_stdlib_imports(self):
+		for source in (
+			"import frappe\n",
+			"from frappe.utils import cstr\n",
+			"import helpdesk\n",
+			"from erp_ai.agent.tools import source\n",
+			"from erp_ai.agent import policy\n",
+			"from . import queue\n",
+			"from erp_ai import gateway\n",
+			"import erp_ai.erp_ai_agent\n",
+		):
+			with self.subTest(source=source):
+				self.assertCaught(
+					check_layer_imports({CHANGE_TEXT_FILE: source}), CHANGE_TEXT_FILE, "change_text"
+				)
+
+	def test_change_text_layer_rule_allows_stdlib_and_constants(self):
+		clean = "import re\nimport unicodedata\nfrom erp_ai.constants import BOT_GIT_NAME\nfrom erp_ai import constants\n"
+		self.assertEqual(check_layer_imports({CHANGE_TEXT_FILE: clean}), [])
+
+	def test_git_subcommands_rule_catches_each_way_of_reaching_git(self):
+		run_read = "\n\ndef extra(r):\n\treturn run_git_read(r, {sub})\n"
+		cases = {
+			# outside the read set, as a literal, a module constant and an f-string
+			"source push": self.git_product(SOURCE_TOOL_FILE, run_read.format(sub='"push"')),
+			"source add": self.git_product(SOURCE_TOOL_FILE, run_read.format(sub='"add"')),
+			"source constant": self.git_product(
+				SOURCE_TOOL_FILE, "\nPUSH = 'pu' + 'sh'" + run_read.format(sub="PUSH")
+			),
+			"source f-string": self.git_product(SOURCE_TOOL_FILE, run_read.format(sub="f\"{'fetch'}\"")),
+			# a log/blame gate whose set is wider than log/blame
+			"source gate": self.git_product(
+				SOURCE_TOOL_FILE,
+				replace=('GIT_SUBCOMMANDS = {"log", "blame"}', 'GIT_SUBCOMMANDS = {"log", "push"}'),
+			),
+			# a read subcommand, and log, in the write file (both outside {add, commit, rm})
+			"runner status": self.git_product(
+				PROCESS_RUNNER_FILE, "\nX = _run_git_write(r, rel, 1, ['status'])\n"
+			),
+			"runner literal log": self.git_product(
+				PROCESS_RUNNER_FILE,
+				"\nX = _run_wrapped(['git', *source.git_global_options(read=False), 'log'], cwd=r, env=e, limit_s=1)\n",
+			),
+			# the subcommand passed through a variable / a parameter of another function
+			"variable": self.git_product(
+				PROCESS_RUNNER_FILE, "\n\ndef f(r, sub):\n\treturn _run_git_write(r, 'x', 1, [sub])\n"
+			),
+			"forwarded": self.git_product(
+				SOURCE_TOOL_FILE, "\n\ndef f(r, sub):\n\treturn run_git_read(r, sub)\n"
+			),
+			"local": self.git_product(
+				SOURCE_TOOL_FILE, "\n\ndef f(r):\n\tsub = pick()\n\treturn run_git_read(r, sub)\n"
+			),
+			# aliased import of the wrapper, the wrapper used as a value
+			"alias": self.git_product(
+				"agent/changes/apply_job.py",
+				"\nfrom erp_ai.agent.tools.source import run_git_read as rg\nrg(r, 'fetch')\n",
+			),
+			"as value": self.git_product("agent/changes/apply_job.py", "\nreader = source.run_git_read\n"),
+			# git in another file: literal, path, constant list + concatenation, f-string, tuple
+			"other literal": self.git_product("agent/changes/apply_job.py", "\nC = ['git', 'status']\n"),
+			"other path": self.git_product("agent/tools/read.py", "C = ('/usr/bin/git', 'log')\n"),
+			"other concat": self.git_product(
+				"agent/changes/apply_job.py", "\nGIT = ['git']\nC = GIT + ['status']\n"
+			),
+			"other spread": self.git_product(
+				"agent/changes/apply_job.py", "\nC = [*source.GIT_PREFIX, 'rev-parse']\n"
+			)
+			| {SOURCE_TOOL_FILE: GIT_CLEAN[SOURCE_TOOL_FILE] + "\nGIT_PREFIX = ('git', '--no-pager')\n"},
+			"other f-string": self.git_product("handlers.py", "\nC = [f\"{'git'}\", 'log']\n"),
+			# no constant subcommand: built and then changed
+			"mutated": self.git_product(
+				PROCESS_RUNNER_FILE, "\n\ndef f(r):\n\tcmd = ['git']\n\tcmd += ['push']\n\treturn cmd\n"
+			),
+		}
+		for case, sources in cases.items():
+			with self.subTest(case=case):
+				self.assertCaught(check_git_subcommands_only_allowed_sets_per_file(sources), "git")
+
+	def test_git_subcommands_rule_names_the_file_and_the_reason(self):
+		found = check_git_subcommands_only_allowed_sets_per_file(
+			self.git_product(PROCESS_RUNNER_FILE, "\nX = _run_git_write(r, rel, 1, ['status'])\n")
+		)
+		self.assertCaught(found, PROCESS_RUNNER_FILE, "status", "ADR-022")
+		found = check_git_subcommands_only_allowed_sets_per_file(
+			self.git_product("agent/tools/read.py", "C = ['git', 'log']\n")
+		)
+		self.assertCaught(found, "agent/tools/read.py", "outside")
+
+	def test_forbidden_git_operations_caught(self):
+		for sub in GIT_FORBIDDEN_SUBCOMMANDS:
+			for case, sources in (
+				(
+					"read arg",
+					self.git_product(
+						SOURCE_TOOL_FILE, f"\n\ndef f(r):\n\treturn run_git_read(r, 'rev-parse', '{sub}')\n"
+					),
+				),
+				(
+					"write list",
+					self.git_product(PROCESS_RUNNER_FILE, f"\nX = _run_git_write(r, rel, 1, ['{sub}'])\n"),
+				),
+				(
+					"constant",
+					self.git_product(
+						PROCESS_RUNNER_FILE,
+						f"\nSUB = '{sub}'\nX = _run_git_write(r, rel, 1, ['commit', SUB])\n",
+					),
+				),
+				("shlex", self.git_product(PROCESS_RUNNER_FILE, f"\nX = shlex.split('git {sub} origin')\n")),
+			):
+				with self.subTest(sub=sub, case=case):
+					self.assertCaught(check_no_forbidden_git_operations_in_product(sources), repr(sub))
+		for fragment in GIT_FORBIDDEN_FRAGMENTS:
+			for rel in ("agent/changes/apply_job.py", "eval/run_eval.py", SOURCE_TOOL_FILE):
+				with self.subTest(fragment=fragment, rel=rel):
+					sources = self.git_product(rel, f"\nX = f'-c {{key}}{fragment}x'\n")
+					self.assertCaught(check_no_forbidden_git_operations_in_product(sources), rel, fragment)
+		for config_read in (
+			"open(os.path.join(repo, '.git', 'config'))",
+			"(Path(repo) / '.git' / 'config').read_text()",
+			"open(f'{repo}/.git/config')",
+			"open(repo + '/.git' + '/config')",
+		):
+			with self.subTest(config_read=config_read):
+				sources = self.git_product(CHANGE_GUARD_FILE, f"\nX = {config_read}\n")
+				self.assertCaught(
+					check_no_forbidden_git_operations_in_product(sources), CHANGE_GUARD_FILE, "config"
+				)
+		# a git dir found at runtime, no literal .git: only the subprocess-file config branch sees it
+		for rel in SUBPROCESS_FILES:
+			for config_read in (
+				"open(f'{git_dir}/config')",
+				"open(os.path.join(git_dir, 'config'))",
+			):
+				with self.subTest(rel=rel, config_read=config_read):
+					sources = self.git_product(
+						rel, f"\n\ndef f(r):\n\tgit_dir = locate(r)\n\treturn {config_read}\n"
+					)
+					self.assertCaught(
+						check_no_forbidden_git_operations_in_product(sources), rel, "git config file"
+					)
+
+	def test_forbidden_git_operations_clean_cases(self):
+		clean = self.git_product(
+			"agent/changes/apply_job.py",
+			"\nMESSAGE = 'remote không tên; nhánh theo dõi upstream'\nGIT_DIR = '.git'\nSETTINGS = os.path.join(root, 'config')\n",
+		)
+		self.assertEqual(check_no_forbidden_git_operations_in_product(clean), [])
+		for rel in SUBPROCESS_FILES:
+			with self.subTest(rel=rel):
+				clean = self.git_product(rel, "\nSTEP = 'configure'\nPATH = 'etc/configure'\n")
+				self.assertEqual(check_no_forbidden_git_operations_in_product(clean), [])
+
+	def test_git_write_argv_shape_caught(self):
+		write = "\nX = _run_git_write(r, rel, 1, {args})\n"
+		cases = {
+			"commit without --only": write.format(args="['commit', '--no-gpg-sign', '-m', s]"),
+			"commit without --no-gpg-sign": write.format(args="['commit', '--only', '-m', s]"),
+			"rm without --cached": write.format(args="['rm', '-q']"),
+			"commit spread": write.format(args="['commit', '--only', '--no-gpg-sign', *extra]"),
+			"commit from a constant": "\nAMEND = ['commit', '--only', '--no-gpg-sign', '--amend']"
+			+ write.format(args="AMEND"),
+			"commit non-constant option": write.format(args="['commit', '--only', '--no-gpg-sign', flag]"),
+			"add without --": "\nX = _run_wrapped(['git', *source.git_global_options(read=False), 'add', rel], cwd=r, env=e)\n",
+			"add two paths": "\nX = _run_wrapped(['git', *source.git_global_options(read=False), 'add', '--', a, b], cwd=r, env=e)\n",
+			"add magic path": "\nX = _run_wrapped(['git', *source.git_global_options(read=False), 'add', '--', f':(literal){rel}'], cwd=r, env=e)\n",
+			"add magic constant": "\nX = _run_wrapped(['git', *source.git_global_options(read=False), 'add', '--', ':' + rel], cwd=r, env=e)\n",
+			"rm two separators": "\nX = _run_wrapped(['git', *source.git_global_options(read=False), 'rm', '--cached', '--', '--', rel], cwd=r, env=e)\n",
+		}
+		for flag in (*COMMIT_FORBIDDEN_FLAGS, "--amen", "-am", "--fixup=HEAD", "--squash=HEAD"):
+			cases[f"commit {flag}"] = write.format(
+				args=f"['commit', '--only', '--no-gpg-sign', '{flag}', '-m', s]"
+			)
+		for case, extra in cases.items():
+			with self.subTest(case=case):
+				found = check_git_commit_add_rm_argv_shape(self.git_product(PROCESS_RUNNER_FILE, extra))
+				self.assertCaught(found, PROCESS_RUNNER_FILE, "ADR-022")
+
+	def test_git_write_argv_shape_allows_a_message_that_looks_like_a_flag(self):
+		extra = "\nX = _run_git_write(r, rel, 1, ['commit', '--only', '--no-gpg-sign', '-m', '-a', '-m', '--amend'])\n"
+		self.assertEqual(check_git_commit_add_rm_argv_shape(self.git_product(PROCESS_RUNNER_FILE, extra)), [])
+
+	def test_git_env_single_definition_caught(self):
+		new_add = "\nX = _run_wrapped(['git', *source.git_global_options(read=False), 'add', '--', rel], cwd=r, env={env})\n"
+		cases = {
+			"marker in runner": self.git_product(
+				PROCESS_RUNNER_FILE, "\nENV = {'GIT_CONFIG_GLOBAL': '/dev/null'}\n"
+			),
+			"marker keyword": self.git_product(
+				"agent/changes/apply_job.py", "\nENV = dict(GIT_CONFIG_NOSYSTEM='1')\n"
+			),
+			"hooks f-string": self.git_product(
+				PROCESS_RUNNER_FILE, "\nOPTS = ['-c', f'core.hooksPath={d}']\n"
+			),
+			"marker elsewhere in source": self.git_product(
+				SOURCE_TOOL_FILE, "\n\ndef other_env():\n\treturn {'GIT_TERMINAL_PROMPT': '0'}\n"
+			),
+			"identity elsewhere": self.git_product(
+				PROCESS_RUNNER_FILE, "\nENV = {'GIT_AUTHOR_' + 'NAME': n}\n"
+			),
+			"second git_env": self.git_product(
+				PROCESS_RUNNER_FILE, "\n\ndef git_env(*, identity):\n\treturn {}\n"
+			),
+			"second options": self.git_product(
+				"agent/changes/apply_job.py", "\n\ndef git_global_options(*, read):\n\treturn []\n"
+			),
+			"os.environ env": self.git_product(PROCESS_RUNNER_FILE, new_add.format(env="{**os.environ}")),
+			"env mixed": self.git_product(
+				PROCESS_RUNNER_FILE, new_add.format(env="source.git_env(identity=True) | dict(os.environ)")
+			),
+			"own env": self.git_product(PROCESS_RUNNER_FILE, new_add.format(env="_minimal_env()")),
+			"no env": self.git_product(
+				PROCESS_RUNNER_FILE,
+				"\nX = _run_wrapped(['git', *source.git_global_options(read=False), 'add', '--', rel], cwd=r)\n",
+			),
+			"no options": self.git_product(
+				PROCESS_RUNNER_FILE,
+				"\nX = _run_wrapped(['git', 'add', '--', rel], cwd=r, env=source.git_env(identity=True))\n",
+			),
+			"read without options": self.git_product(
+				SOURCE_TOOL_FILE, replace=("*git_global_options(read=True), subcommand", "subcommand")
+			),
+			"runner own env": self.git_product(
+				PROCESS_RUNNER_FILE, replace=("env=source.git_env(identity=True)", "env={'PATH': '/usr/bin'}")
+			),
+		}
+		for case, sources in cases.items():
+			with self.subTest(case=case):
+				self.assertCaught(check_git_env_single_definition(sources), "ADR-022")
+
+	def test_git_env_single_definition_sees_aliases(self):
+		aliased = self.git_product(
+			PROCESS_RUNNER_FILE,
+			replace=(
+				"from erp_ai.agent.tools import source\n",
+				"from erp_ai.agent.tools import source\nfrom erp_ai.agent.tools.source import git_env as ge\n",
+			),
+		)
+		aliased[PROCESS_RUNNER_FILE] = aliased[PROCESS_RUNNER_FILE].replace("env=source.git_env(", "env=ge(")
+		self.assertEqual(check_git_env_single_definition(aliased), [])
+
+	def test_bot_identity_caught(self):
+		cases = {
+			"real address": self.git_product(
+				CONSTANTS_FILE, replace=('"erp-ai-agent@bot.invalid"', '"erp-ai-agent@miyano.com.vn"')
+			),
+			"no domain": self.git_product(
+				CONSTANTS_FILE, replace=('"erp-ai-agent@bot.invalid"', '"bot.invalid"')
+			),
+			"other name": self.git_product(CONSTANTS_FILE, replace=('"ERP AI Agent"', '"Bot"')),
+			"literal email": self.git_product(
+				SOURCE_TOOL_FILE,
+				replace=('"GIT_AUTHOR_EMAIL": BOT_GIT_EMAIL', '"GIT_AUTHOR_EMAIL": "a@b.invalid"'),
+			),
+			"agent user": self.git_product(
+				SOURCE_TOOL_FILE,
+				replace=(
+					'"GIT_COMMITTER_EMAIL": BOT_GIT_EMAIL',
+					'"GIT_COMMITTER_EMAIL": constants.AGENT_USER',
+				),
+			),
+			"missing variable": self.git_product(
+				SOURCE_TOOL_FILE, replace=('"GIT_COMMITTER_NAME": BOT_GIT_NAME,', "")
+			),
+			"user.email option": self.git_product(
+				PROCESS_RUNNER_FILE, "\nOPTS = ['-c', 'user.email=x@y.z']\n"
+			),
+			"user.name option": self.git_product(SOURCE_TOOL_FILE, "\nOPTS = ['-c', f'user.name={n}']\n"),
+			"agent user alias": self.git_product(
+				PROCESS_RUNNER_FILE, "\nfrom erp_ai.constants import AGENT_USER as who\nX = who\n"
+			),
+		}
+		for case, sources in cases.items():
+			with self.subTest(case=case):
+				self.assertCaught(check_bot_identity_constants(sources), "ADR-022")
+
+	def test_no_git_in_web_and_runner_caught(self):
+		cases = {
+			"controller subprocess": (PROPOSAL_CONTROLLER_FILE, "\nimport subprocess as sp\n"),
+			"controller alias": (
+				PROPOSAL_CONTROLLER_FILE,
+				"\nfrom erp_ai.agent.tools.source import read_git_state as rgs\nX = rgs(p, new_file=False)\n",
+			),
+			"controller module": (
+				PROPOSAL_CONTROLLER_FILE,
+				"\nfrom erp_ai.agent.tools import source\nX = source.git_head(r)\n",
+			),
+			"handlers runner module": (HANDLERS_FILE, "\nfrom erp_ai.agent.changes import process_runner\n"),
+			"runner getattr": (RUNNER_FILE, "\nX = getattr(source, 'read_git_state')\n"),
+			"runner git argv": (RUNNER_FILE, "\nX = ['git', 'status']\n"),
+			"whitelist through helper": (
+				"ticket_panel.py",
+				"",
+			),
+			"whitelist local import": (
+				"change_decision.py",
+				"import frappe\n\n\n@frappe.whitelist()\ndef decide(name):\n\timport subprocess\n\treturn subprocess.run(['ls'], timeout=1)\n",
+			),
+		}
+		for case, (rel, extra) in cases.items():
+			with self.subTest(case=case):
+				sources = self.git_product(rel, extra)
+				if case == "whitelist through helper":
+					sources = self.git_product(
+						rel, replace=('return {"name": name}', "return source.run_git_read(name, 'status')")
+					)
+				self.assertCaught(check_no_git_in_web_and_runner(sources), rel, "ADR-022")
+
+	def test_bench_allowlist_caught(self):
+		for command in GIT_RUNNING_BENCH_SUBCOMMANDS:
+			for case, replace in (
+				(
+					"site list",
+					(
+						'SITE_COMMANDS = ("migrate", "clear-cache")',
+						f'SITE_COMMANDS = ("migrate", "{command}")',
+					),
+				),
+				(
+					"table",
+					(
+						'BENCH_COMMANDS = (*SITE_COMMANDS, BUILD_COMMAND, "version")',
+						f'BENCH_COMMANDS = (*SITE_COMMANDS, "{command}")',
+					),
+				),
+				("shape", ('["--site", site, command]', f'["--site", site, "{command}"]')),
+			):
+				with self.subTest(command=command, case=case):
+					found = check_bench_allowlist_has_no_git_running_subcommands(
+						self.git_product(CHANGE_GUARD_FILE, replace=replace)
+					)
+					self.assertCaught(found, CHANGE_GUARD_FILE, command)
+		unreadable = self.git_product(
+			CHANGE_GUARD_FILE,
+			replace=(
+				'BENCH_COMMANDS = (*SITE_COMMANDS, BUILD_COMMAND, "version")',
+				"BENCH_COMMANDS = tuple(load())",
+			),
+		)
+		self.assertCaught(
+			check_bench_allowlist_has_no_git_running_subcommands(unreadable), BENCH_COMMANDS_NAME
+		)
+
+	def test_apps_root_caught(self):
+		cases = {
+			"join": (
+				"agent/changes/apply_job.py",
+				"\nROOT = os.path.join(frappe.utils.get_bench_path(), 'apps')\n",
+			),
+			"f-string": (
+				"agent/changes/apply_job.py",
+				"\n\ndef root(bench, app):\n\treturn f'{bench}/apps/{app}'\n",
+			),
+			"path": (CHANGE_GUARD_FILE, "\nROOT = Path(get_bench_path()) / 'apps'\n"),
+			"app path": (
+				CHANGE_GUARD_FILE,
+				"\nROOT = os.path.dirname(os.path.dirname(frappe.get_app_path('frappe')))\n",
+			),
+			"second root": (CHANGE_GUARD_FILE, "\n\ndef get_source_root():\n\treturn '/srv'\n"),
+		}
+		for case, (rel, extra) in cases.items():
+			with self.subTest(case=case):
+				self.assertCaught(
+					check_apps_root_single_function(self.git_product(rel, extra)), rel, "ADR-022"
+				)
+		no_root = self.git_product(SOURCE_TOOL_FILE, replace=("def get_source_root():", "def find_root():"))
+		self.assertCaught(check_apps_root_single_function(no_root), APPS_ROOT_FUNCTION)
+
+	# ADR-023 Ràng buộc (FEAT-004 T68) ------------------------------------------------------------------
+
+	@staticmethod
+	def changed(clean: dict, rel: str, extra: str = "", replace=None) -> dict:
+		"""A copy of `clean` with `extra` appended to `rel` (a new file when absent) and `replace` applied."""
+		sources = dict(clean)
+		source = sources.get(rel, "")
+		if replace is not None:
+			assert replace[0] in source, replace[0]
+			source = source.replace(*replace)
+		sources[rel] = source + extra
+		return sources
+
+	def test_get_whitelist_reaching_change_state_clean(self):
+		self.assertEqual(check_no_get_whitelist_reaches_change_state(WHITELIST_CLEAN), [])
+		# The clean product is not clean because nothing is seen: the POST methods do reach the state machine.
+		self.assertEqual(
+			sorted((rel, node.name) for rel, node, _methods in change_state_whitelists(WHITELIST_CLEAN)),
+			[("change_decision.py", "decide"), (PROPOSAL_CONTROLLER_FILE, "approve")],
+		)
+
+	def test_get_whitelist_reaching_change_state_caught(self):
+		get_api = (
+			'import frappe\n{imports}\n\n@frappe.whitelist(methods=("GET",))\ndef go(name=None):\n{body}\n'
+		)
+		cases = {
+			"transitions call": (
+				PROPOSAL_CONTROLLER_FILE,
+				"",
+				('methods=["POST"])\ndef approve', 'methods=["GET", "POST"])\ndef approve'),
+			),
+			"through a module dict": (
+				"change_decision.py",
+				"",
+				('methods=["POST"])\ndef decide', 'methods=["POST", "GET"])\ndef decide'),
+			),
+			"through a module function": (
+				"change_decision.py",
+				'\n\n@frappe.whitelist(methods=["GET"])\ndef go(name=None):\n\treturn helper(name)\n',
+				None,
+			),
+			"aliased import": (
+				"api.py",
+				get_api.format(
+					imports=f"from erp_ai.{PROPOSAL_CONTROLLER_FILE[:-3].replace('/', '.')} import undo as back",
+					body="\treturn back(name)",
+				),
+				None,
+			),
+			"transitions module alias": (
+				"api.py",
+				get_api.format(
+					imports="import erp_ai.agent.changes.transitions as t",
+					body="\treturn t.request_undo(name, 'u')",
+				),
+				None,
+			),
+			"relative transitions import": (
+				"api.py",
+				get_api.format(
+					imports="from .agent.changes import transitions",
+					body="\treturn transitions.request_undo(name, 'u')",
+				),
+				None,
+			),
+			"transitions imported in the body": (
+				"api.py",
+				get_api.format(
+					imports="",
+					body="\timport erp_ai.agent.changes.transitions\n\treturn frappe.get_attr(name)(name)",
+				),
+				None,
+			),
+			"transitions path as text": (
+				"api.py",
+				get_api.format(
+					imports="",
+					body="\treturn frappe.get_attr('erp_ai.agent.changes.transitions.request_undo')(name)",
+				),
+				None,
+			),
+		}
+		for case, (rel, extra, replace) in cases.items():
+			with self.subTest(case=case):
+				sources = self.changed(WHITELIST_CLEAN, rel, extra, replace)
+				self.assertCaught(check_no_get_whitelist_reaches_change_state(sources), rel, "ADR-023")
+
+	def test_change_link_api_method_path_clean(self):
+		self.assertEqual(check_change_link_builds_no_api_method_path(CHANGE_LINK_CLEAN), [])
+		self.assertIn("/app/erp-ai-change-proposal/\0?\0", change_link_string_shapes(CHANGE_LINK_CLEAN))
+
+	def test_change_link_api_method_path_caught(self):
+		cases = {
+			"literal": '\nURL = "/api/method/erp_ai.change_decision.decide"\n',
+			"f-string": '\n\ndef path(method, query):\n\treturn f"/api/method/{method}?{query}"\n',
+			"concatenation": '\nURL = "/api/" + "method/" + DECIDE_METHOD\n',
+			"constant prefix": '\nAPI = "/api/method"\n\n\ndef path(method):\n\treturn f"{API}/{method}"\n',
+			"imported prefix": "\nfrom erp_ai.constants import API_ROOT\n\n\ndef path(m):\n\treturn API_ROOT + m\n",
+			"full url": '\n\ndef url(host, method):\n\treturn host + "/api/method/" + method\n',
+		}
+		with_constant = self.changed(CHANGE_LINK_CLEAN, CONSTANTS_FILE, 'API_ROOT = "/api/method/"\n')
+		for case, extra in cases.items():
+			with self.subTest(case=case):
+				sources = self.changed(with_constant, CHANGE_LINK_FILE, extra)
+				self.assertCaught(
+					check_change_link_builds_no_api_method_path(sources), CHANGE_LINK_FILE, "ADR-023"
+				)
+		missing = {rel: src for rel, src in CHANGE_LINK_CLEAN.items() if rel != CHANGE_LINK_FILE}
+		self.assertCaught(check_change_link_builds_no_api_method_path(missing), CHANGE_LINK_FILE, "missing")
+
+	def test_registry_one_grant_function_clean(self):
+		self.assertEqual(check_registry_has_one_grant_function(GRANT_CLEAN), [])
+		aliased = self.changed(
+			GRANT_CLEAN,
+			RUNNER_FILE,
+			replace=("import get_tool_schemas\n", "import get_tool_schemas as schemas\n"),
+		)
+		aliased[RUNNER_FILE] = aliased[RUNNER_FILE].replace("return get_tool_schemas(", "return schemas(")
+		self.assertEqual(check_registry_has_one_grant_function(aliased), [])
+		documented = self.changed(
+			GRANT_CLEAN,
+			QUEUE_FILE,
+			f'\n\ndef f():\n\t"""Replaces _unrestricted_specs; never call {SPEC_SOURCE} here."""\n',
+		)
+		self.assertEqual(check_registry_has_one_grant_function(documented), [])
+
+	def test_registry_one_grant_function_caught(self):
+		cases = {
+			"removed function back": (REGISTRY_FILE, "\n\ndef _unrestricted_specs():\n\treturn []\n", None),
+			"removed name read": (QUEUE_FILE, "\nX = _unrestricted_specs\n", None),
+			"removed name as attribute": (
+				QUEUE_FILE,
+				"\nX = registry.get_unrestricted_tool_schemas('L3')\n",
+				None,
+			),
+			"removed name imported": (
+				QUEUE_FILE,
+				"\nfrom erp_ai.agent.tools.registry import get_unrestricted_tool_schemas as g\n",
+				None,
+			),
+			"removed name as text": (QUEUE_FILE, "\nX = getattr(registry, '_unrestricted_specs')\n", None),
+			"second grant function": (
+				REGISTRY_FILE,
+				f"\n\ndef _other(level):\n\treturn [g for g, c in {GRANT_TABLE_NAME}]\n",
+				None,
+			),
+			"no grant function": (
+				REGISTRY_FILE,
+				"",
+				(f"for g, c in {GRANT_TABLE_NAME} if", "for g, c in () if"),
+			),
+			"second table": (REGISTRY_FILE, f"\n{GRANT_TABLE_NAME} = ()\n", None),
+			"second schema call": (
+				RUNNER_FILE,
+				"\n\ndef again(grant):\n\treturn get_tool_schemas(*grant)\n",
+				None,
+			),
+			"other schema function": (
+				RUNNER_FILE,
+				"",
+				("return get_tool_schemas(*grant)", "return registry.schemas_for(*grant)"),
+			),
+			"no schema call": (RUNNER_FILE, "", ("return get_tool_schemas(*grant)", "return []")),
+			"removed name as dotted path": (
+				QUEUE_FILE,
+				"\nX = frappe.get_attr('erp_ai.agent.tools.registry.get_unrestricted_tool_schemas')\n",
+				None,
+			),
+			"6d90e79 _unrestricted_specs body under a new name": (
+				REGISTRY_FILE,
+				"\n\ndef _full_specs(effective_level, has_instructor, unrestricted):\n"
+				"\tif not (unrestricted and has_instructor):\n\t\treturn []\n"
+				"\tif effective_level not in LEVELS or effective_level == LEVELS[0]:\n\t\treturn []\n"
+				f"\treturn [spec for spec in {SPEC_SOURCE}() if spec.group in UNRESTRICTED_GROUPS]\n",
+				None,
+			),
+			"spec source listed outside the grant function": (
+				REGISTRY_FILE,
+				"",
+				("return _granted_specs(level)\n", f"return {SPEC_SOURCE}()\n"),
+			),
+			"tool modules read outside the spec source": (
+				REGISTRY_FILE,
+				f"\n\ndef _extra():\n\treturn [importlib.import_module(n).TOOLS for n in {TOOL_MODULES_NAME}]\n",
+				None,
+			),
+			"execute_tool skips the grant function": (
+				REGISTRY_FILE,
+				"",
+				("granted = _granted_specs(context.effective_level)", "granted = context.specs"),
+			),
+			"_grants_group skips the grant function": (
+				REGISTRY_FILE,
+				"",
+				("for spec in _granted_specs(level))", "for spec in ())"),
+			),
+			"execute_tool missing": (REGISTRY_FILE, "", ("def execute_tool(", "def run_tool(")),
+			"spec source reached from the runner": (
+				RUNNER_FILE,
+				f"\n\ndef tools():\n\treturn registry.{SPEC_SOURCE}()\n",
+				None,
+			),
+			"spec source imported elsewhere": (
+				QUEUE_FILE,
+				f"\nfrom erp_ai.agent.tools.registry import {SPEC_SOURCE}\n",
+				None,
+			),
+		}
+		for case, (rel, extra, replace) in cases.items():
+			with self.subTest(case=case):
+				sources = self.changed(GRANT_CLEAN, rel, extra, replace)
+				self.assertCaught(check_registry_has_one_grant_function(sources), rel, "ADR-023")
+		for rel in (REGISTRY_FILE, RUNNER_FILE):
+			with self.subTest(missing=rel):
+				missing = {other: src for other, src in GRANT_CLEAN.items() if other != rel}
+				self.assertCaught(check_registry_has_one_grant_function(missing), rel, "missing")
+
+	def test_agent_write_flag_clean(self):
+		self.assertEqual(check_agent_write_flag_only_in_run_log_and_propose_tool(AGENT_WRITE_CLEAN), [])
+		documented = self.changed(
+			AGENT_WRITE_CLEAN,
+			"erp_ai_agent/doctype/erp_ai_log/erp_ai_log.py",
+			f'\n\ndef g():\n\t"""Never opens erp_ai.agent.agent_write_guard.{AGENT_WRITE_OPENER}."""\n',
+		)
+		self.assertEqual(check_agent_write_flag_only_in_run_log_and_propose_tool(documented), [])
+		self.assertEqual(
+			sorted({(rel, kind) for rel, _node, kind in agent_write_references(AGENT_WRITE_CLEAN)}),
+			sorted(
+				[
+					(AGENT_WRITE_GUARD_FILE, AGENT_WRITE_FLAG_NAME),
+					(AGENT_WRITE_GUARD_FILE, AGENT_WRITE_OPENER),  # its __all__ string: exempt in the guard
+					(PROPOSE_TOOL_FILE, AGENT_WRITE_OPENER),
+					(RUN_LOG_FILE, AGENT_WRITE_OPENER),
+				]
+			),
+		)
+
+	def test_agent_write_flag_caught(self):
+		elsewhere = "erp_ai_agent/doctype/erp_ai_log/erp_ai_log.py"
+		with_block = "\n\ndef f():\n\twith {opener}():\n\t\tpass\n"
+		cases = {
+			"opener called elsewhere": (
+				elsewhere,
+				f"\nfrom erp_ai.agent.agent_write_guard import {AGENT_WRITE_OPENER}\n"
+				+ with_block.format(opener=AGENT_WRITE_OPENER),
+			),
+			"opener aliased": (
+				elsewhere,
+				f"\nfrom erp_ai.agent.agent_write_guard import {AGENT_WRITE_OPENER} as opened\n"
+				+ with_block.format(opener="opened"),
+			),
+			"opener as attribute": (
+				elsewhere,
+				with_block.format(opener=f"guard.{AGENT_WRITE_OPENER}"),
+			),
+			"opener as text": (elsewhere, f"\nX = getattr(guard, '{AGENT_WRITE_OPENER}')\n"),
+			"opener called in the guard": (
+				AGENT_WRITE_GUARD_FILE,
+				with_block.format(opener=AGENT_WRITE_OPENER),
+			),
+			"opener aliased in the guard": (
+				AGENT_WRITE_GUARD_FILE,
+				f"\nfrom erp_ai.agent.agent_write_guard import {AGENT_WRITE_OPENER} as again\n"
+				+ with_block.format(opener="again"),
+			),
+			"other run_log.py": ("eval/run_log.py", with_block.format(opener=f"guard.{AGENT_WRITE_OPENER}")),
+			"flag constant imported": (
+				elsewhere,
+				f"\nfrom erp_ai.agent.agent_write_guard import {AGENT_WRITE_FLAG_NAME}\n",
+			),
+			"flag constant as attribute": (RUN_LOG_FILE, f"\nX = guard.{AGENT_WRITE_FLAG_NAME}\n"),
+			"flag value as key": (PROPOSE_TOOL_FILE, '\nfrappe.flags["erp_ai_agent_write_allowed"] = True\n'),
+			"flag value as attribute": (elsewhere, "\nfrappe.flags.erp_ai_agent_write_allowed = True\n"),
+			"flag value as keyword": (elsewhere, "\nfrappe.flags.update(erp_ai_agent_write_allowed=True)\n"),
+			"opener as dotted path": (
+				elsewhere,
+				f"\nX = frappe.get_attr('erp_ai.agent.agent_write_guard.{AGENT_WRITE_OPENER}')\n",
+			),
+			"opener as hooks.py entry": (
+				"hooks.py",
+				f'\ndoc_events = {{"*": {{"validate": "erp_ai.agent.agent_write_guard.{AGENT_WRITE_OPENER}"}}}}\n',
+			),
+		}
+		for case, (rel, extra) in cases.items():
+			with self.subTest(case=case):
+				sources = self.changed(AGENT_WRITE_CLEAN, rel, extra)
+				self.assertCaught(
+					check_agent_write_flag_only_in_run_log_and_propose_tool(sources), rel, "ADR-023"
+				)
+		missing = {rel: src for rel, src in AGENT_WRITE_CLEAN.items() if rel != AGENT_WRITE_GUARD_FILE}
+		self.assertCaught(
+			check_agent_write_flag_only_in_run_log_and_propose_tool(missing),
+			AGENT_WRITE_GUARD_FILE,
+			"missing",
+		)
+		unknown = self.changed(
+			AGENT_WRITE_CLEAN,
+			AGENT_WRITE_GUARD_FILE,
+			replace=('= "erp_ai_agent_write_allowed"', '= "erp_ai_" + SUFFIX'),
+		)
+		self.assertCaught(
+			check_agent_write_flag_only_in_run_log_and_propose_tool(unknown),
+			AGENT_WRITE_GUARD_FILE,
+			"ADR-023",
+		)
+
+
+# A minimal site_api: derived always-denied set, a refusal gating on it, two handlers gated before writing.
+SITE_API_GATED = """def always_denied_doctypes():
+	return frozenset(frappe.get_all("DocType", {"module": read.AI_MODULE}, pluck="name"))
+
+def _denied(ctx):
+	if ctx.unrestricted:
+		return always_denied_doctypes()
+	return frozenset(read.denied_doctypes() - {'User'}) | PERMISSION_DOCTYPES
+
+def _refusal(doctype, ctx):
+	if doctype in _denied(ctx):
+		return {'ok': False, 'reason': 'không được phép'}
+	return None
+
+def update_record(args, ctx):
+	doctype = args['doctype']
+	if refusal := _refusal(doctype, ctx):
+		return refusal
+	doc = frappe.get_doc(doctype, args['name'])
+	doc.save()
+
+def call_method(args, ctx):
+	if any(name in str(args) for name in always_denied_doctypes()):
+		return {'ok': False}
+	return frappe.call(args['method'])
+
+TOOLS = [
+	ToolSpec(name='api_update_record', handler=update_record),
+	ToolSpec(name='api_call_method', handler=call_method),
+]
+"""
+
+# ADR-023 Ràng buộc (T68): small products that keep each rule; each caught case changes one file.
+WHITELIST_CLEAN = {
+	PROPOSAL_CONTROLLER_FILE: """import frappe
+from erp_ai.agent.changes import transitions
+
+LIMIT = 5
+
+
+@frappe.whitelist(methods=["POST"])
+def approve(name=None):
+	return transitions.approve(name, frappe.session.user)
+
+
+@frappe.whitelist(methods=["GET", "POST"])
+def form_data(name=None):
+	return frappe.get_doc("ERP AI Change Proposal", name).as_dict(), LIMIT, _again(name)
+
+
+def _again(name):
+	return _again(name) if name else None
+""",
+	"change_decision.py": """import frappe
+from erp_ai.erp_ai_agent.doctype.erp_ai_change_proposal import erp_ai_change_proposal as proposal_form
+
+DECIDERS = {"approve": proposal_form.approve}
+
+
+@frappe.whitelist(methods=["POST"])
+def decide(name=None, action=None):
+	return DECIDERS[action](name)
+
+
+def helper(name):
+	return proposal_form.reject(name)
+""",
+}
+
+CHANGE_LINK_CLEAN = {
+	CHANGE_LINK_FILE: '''"""Links open the form; the old /api/method/ link is gone."""
+
+FORM_ROUTE = "/app/erp-ai-change-proposal"
+
+
+def decision_path(name, query):
+	return f"{FORM_ROUTE}/{name}?{query}"
+''',
+	"ticket_panel.py": 'PANEL_URL = "/api/method/erp_ai.ticket_panel.get_panel_data"\n',
+}
+
+GRANT_CLEAN = {
+	REGISTRY_FILE: f"""import importlib
+
+{TOOL_MODULES_NAME} = ("erp_ai.agent.tools.read",)
+{GRANT_TABLE_NAME} = (("read", lambda level: True),)
+
+
+def {SPEC_SOURCE}():
+	return [spec for name in {TOOL_MODULES_NAME} for spec in importlib.import_module(name).TOOLS]
+
+
+def _granted_specs(level):
+	groups = [g for g, c in {GRANT_TABLE_NAME} if c(level)]
+	return [spec for spec in {SPEC_SOURCE}() if spec.group in groups]
+
+
+def {SCHEMA_FUNCTION}(level):
+	return _granted_specs(level)
+
+
+def _grants_group(group, level):
+	return any(spec.group == group for spec in _granted_specs(level))
+
+
+def execute_tool(name, arguments, context):
+	granted = _granted_specs(context.effective_level)
+	return next(spec for spec in granted if spec.name == name)
+""",
+	RUNNER_FILE: f"""from erp_ai.agent.tools.registry import {SCHEMA_FUNCTION}
+
+
+def run(grant):
+	return {SCHEMA_FUNCTION}(*grant)
+""",
+	QUEUE_FILE: "from erp_ai.agent.tools import registry\n",
+}
+
+AGENT_WRITE_CLEAN = {
+	AGENT_WRITE_GUARD_FILE: f'''"""`{AGENT_WRITE_FLAG_NAME}` is set by `{AGENT_WRITE_OPENER}()` only."""
+
+import frappe
+
+__all__ = ["{AGENT_WRITE_OPENER}", "refuse_agent_write"]
+{AGENT_WRITE_FLAG_NAME} = "erp_ai_agent_write_allowed"
+
+
+def {AGENT_WRITE_OPENER}():
+	frappe.flags[{AGENT_WRITE_FLAG_NAME}] = True
+
+
+def refuse_agent_write(doc):
+	return frappe.flags.get({AGENT_WRITE_FLAG_NAME})
+''',
+	RUN_LOG_FILE: f"""from erp_ai.agent.agent_write_guard import {AGENT_WRITE_OPENER}
+
+
+def write_entry():
+	with {AGENT_WRITE_OPENER}():
+		pass
+""",
+	PROPOSE_TOOL_FILE: f"""from erp_ai.agent import agent_write_guard as guard
+
+
+def propose():
+	with guard.{AGENT_WRITE_OPENER}():
+		pass
+""",
+	"erp_ai_agent/doctype/erp_ai_log/erp_ai_log.py": """from erp_ai.agent.agent_write_guard import refuse_agent_write
+
+
+def validate(doc):
+	refuse_agent_write(doc)
+""",
+}
 
 
 if __name__ == "__main__":

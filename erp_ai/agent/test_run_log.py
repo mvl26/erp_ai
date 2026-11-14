@@ -2,10 +2,13 @@ import json
 from unittest.mock import patch
 
 import frappe
+import frappe.client
 from frappe.tests.utils import FrappeTestCase
 
 from erp_ai.agent import run_log
-from erp_ai.constants import HELPDESK_AGENT_ROLE, LOG_DOCTYPE, ROLE_AGENT
+from erp_ai.agent.agent_write_guard import AGENT_WRITE_FLAG
+from erp_ai.constants import AGENT_USER, HELPDESK_AGENT_ROLE, LOG_DOCTYPE, ROLE_AGENT
+from erp_ai.erp_ai_agent.doctype.erp_ai_log.erp_ai_log import ERPAILog
 from erp_ai.test_utils import make_change_proposal, make_log_entry
 
 AI_USER = "erpai-test-run-log-agent@example.com"
@@ -21,6 +24,14 @@ CHANGE_STEP_VALUES = ("propose", "approve", "reject", "apply", "fail", "stale", 
 CHANGE_TRIGGER = "change_action"
 OLD_ENTRY_TYPES = ("classify", "reason", "skip")
 MISSING = object()
+# ADR-023 QĐ 5 (M5): the ERP AI Log hooks that refuse the agent account outside `run_log.write_entry`.
+GUARDED_HOOKS = ("before_insert", "validate", "on_trash", "before_rename")
+# As frappe.model.rename_doc passes them: old name, new name, merge.
+HOOK_ARGUMENTS = {"before_rename": ("old-name", "new-name", False)}
+REFUSAL = "Tài khoản agent không được ghi"
+SAVEPOINT = "erp_ai_run_log_guard_path"
+# The DocType name spelled with a JSON escape, as a model could send it through call_method.
+LOG_ESCAPED = "ERP AI \\u004cog"
 
 
 def _make_user(email, role):
@@ -249,3 +260,128 @@ class TestRunLog(FrappeTestCase):
 		self.assertEqual(frappe.db.get_value(LOG_DOCTYPE, name, "trigger"), "ticket_insert")
 		self.assertEqual(frappe.db.get_value(LOG_DOCTYPE, name, "model"), "fake-model")
 		self.assertTrue(frappe.db.get_value(LOG_DOCTYPE, name, "run_id"))
+
+
+class TestRunLogAgentWriteGuard(FrappeTestCase):
+	"""M5 of ADR-023 QĐ 5: the agent account writes ERP AI Log only through `run_log.write_entry`."""
+
+	def setUp(self):
+		commit_guard = patch.object(frappe.db, "commit", side_effect=AssertionError("test must not commit"))
+		commit_guard.start()
+		self.addCleanup(commit_guard.stop)
+		self.addCleanup(frappe.db.rollback)
+		self.addCleanup(frappe.set_user, "Administrator")
+		self.addCleanup(frappe.flags.pop, AGENT_WRITE_FLAG, None)
+		frappe.set_user("Administrator")
+		frappe.flags.pop(AGENT_WRITE_FLAG, None)
+		if not frappe.db.exists("User", AGENT_USER):
+			raise AssertionError(f"{AGENT_USER} does not exist on this site")
+		self.log_name = make_log_entry(model="ERPAI-TEST-guard")
+
+	def _snapshot(self) -> tuple:
+		row = frappe.db.sql(f"select * from `tab{LOG_DOCTYPE}` where name=%s", self.log_name, as_dict=True)
+		return frappe.db.count(LOG_DOCTYPE), tuple(sorted(row[0].items()))
+
+	def _assert_refused(self, write):
+		"""Run `write` as the agent: refused by the guard, the log table unchanged; undone for the next path."""
+		before = self._snapshot()
+		frappe.db.savepoint(SAVEPOINT)
+		frappe.set_user(AGENT_USER)
+		try:
+			with self.assertRaisesRegex(frappe.PermissionError, REFUSAL):
+				write()
+			frappe.set_user("Administrator")
+			self.assertEqual(self._snapshot(), before)
+		finally:
+			frappe.set_user("Administrator")
+			frappe.db.rollback(save_point=SAVEPOINT)
+
+	def test_every_guarded_hook_refuses_the_agent(self):
+		doc = frappe.get_doc(LOG_DOCTYPE, self.log_name)
+		frappe.set_user(AGENT_USER)
+		for hook in GUARDED_HOOKS:
+			with self.subTest(hook=hook), self.assertRaisesRegex(frappe.PermissionError, REFUSAL):
+				doc.run_method(hook, *HOOK_ARGUMENTS.get(hook, ()))
+
+	def test_agent_cannot_write_log_outside_write_entry(self):
+		def save_log():
+			doc = frappe.get_doc(LOG_DOCTYPE, self.log_name)
+			doc.error = "forged"
+			doc.save(ignore_permissions=True)
+
+		new_log = {"run_id": "ERPAI-TEST-forged", "entry_type": "skip", "trigger": "ticket_insert", "turn": 0}
+		paths = {
+			"insert": lambda: frappe.get_doc({"doctype": LOG_DOCTYPE, **new_log}).insert(
+				ignore_permissions=True
+			),
+			"save": save_log,
+			"delete": lambda: frappe.delete_doc(LOG_DOCTYPE, self.log_name, ignore_permissions=True),
+			"client.insert JSON string": lambda: frappe.client.insert(
+				json.dumps(new_log)[:-1] + f', "doctype": "{LOG_ESCAPED}"}}'
+			),
+			"forged flag in doc": lambda: frappe.client.insert(
+				{"doctype": LOG_DOCTYPE, "flags": {AGENT_WRITE_FLAG: True}, AGENT_WRITE_FLAG: 1, **new_log}
+			),
+		}
+		for path, write in paths.items():
+			with self.subTest(path=path):
+				self._assert_refused(write)
+
+	def test_write_entry_still_works_under_agent_account(self):
+		proposal = make_change_proposal()
+		before = frappe.db.count(LOG_DOCTYPE)
+		frappe.set_user(AGENT_USER)
+		names = [
+			run_log.write_entry(
+				run_id="ERPAI-TEST-guard", entry_type="reason", trigger="comment_mention", turn=1
+			),
+			run_log.write_entry(
+				ticket=proposal.ticket,
+				run_id=proposal.run_id,
+				entry_type="change",
+				trigger=CHANGE_TRIGGER,
+				change_step="propose",
+				actor=AGENT_USER,
+				change_proposal=proposal.name,
+			),
+		]
+
+		frappe.set_user("Administrator")
+		self.assertEqual(frappe.db.count(LOG_DOCTYPE), before + 2)
+		for name in names:
+			self.assertEqual(frappe.db.get_value(LOG_DOCTYPE, name, "owner"), AGENT_USER)
+
+	def test_flag_is_off_after_write_entry(self):
+		seen = []
+
+		def spy(doc):
+			seen.append(frappe.flags.get(AGENT_WRITE_FLAG))
+
+		frappe.set_user(AGENT_USER)
+		with patch.object(ERPAILog, "before_insert", spy, create=True):
+			run_log.write_entry(run_id="ERPAI-TEST-guard", entry_type="skip", trigger="ticket_insert", turn=0)
+		self.assertEqual(seen, [True])
+		self.assertIsNone(frappe.flags.get(AGENT_WRITE_FLAG))
+
+		before = frappe.db.count(LOG_DOCTYPE)
+		with self.assertRaises(frappe.LinkValidationError):
+			run_log.write_entry(
+				ticket="ERPAI-TEST-missing-ticket",
+				run_id="ERPAI-TEST-guard",
+				entry_type="skip",
+				trigger="ticket_insert",
+				turn=0,
+			)
+		self.assertIsNone(frappe.flags.get(AGENT_WRITE_FLAG))
+		self.assertEqual(frappe.db.count(LOG_DOCTYPE), before)
+		frappe.set_user("Administrator")
+		self._assert_refused(
+			lambda: frappe.get_doc(
+				{
+					"doctype": LOG_DOCTYPE,
+					"run_id": "ERPAI-TEST-guard",
+					"entry_type": "skip",
+					"trigger": "ticket_insert",
+				}
+			).insert(ignore_permissions=True)
+		)

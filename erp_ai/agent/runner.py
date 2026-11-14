@@ -8,7 +8,6 @@ from frappe.utils import get_fullname
 from erp_ai import gateway
 from erp_ai.agent import authority, policy, site_facts
 from erp_ai.agent.answer_delay import AnswerDelay
-from erp_ai.agent.changes import transitions
 from erp_ai.agent.classification import load_mapping, parse_classification
 from erp_ai.agent.prompts import (
 	build_classify_request,
@@ -17,16 +16,16 @@ from erp_ai.agent.prompts import (
 	build_routing_table,
 )
 from erp_ai.agent.routing import decide_route, departments, load_routing_config, sla_lag
-from erp_ai.agent.run_log import write_entry
+from erp_ai.agent.run_log import ENTRY_TYPE_CHANGE, write_entry
 from erp_ai.agent.run_status import CLASSIFY_STEP, RunStatus
 from erp_ai.agent.tools.read import TOOL_RESULT_MAX_CHARS
 from erp_ai.agent.tools.registry import (
 	ToolContext,
 	execute_tool,
 	get_tool_schemas,
-	get_unrestricted_tool_schemas,
 	grants_change_tools,
 	grants_site_admin_tools,
+	grants_unrestricted_tools,
 )
 from erp_ai.agent.tools.route_ticket import (
 	ASSIGN_REQUEST,
@@ -54,6 +53,7 @@ from erp_ai.constants import (
 	TITLE_RUN_FAILED,
 	TITLE_STATUS_FAILED,
 	TITLE_WRONG_USER,
+	TRIGGER_CHANGE_ACTION,
 	TRIGGER_COMMENT_MENTION,
 	TRIGGER_TICKET_INSERT,
 )
@@ -83,8 +83,19 @@ WRITE_TOOL_TARGETS = {
 	"api_submit_record": (None, "name"),
 	"api_call_method": ("Method", "method"),
 }
+# Record tools: their action entry also carries the before/after values and the instructor (AC-35).
+RECORD_TOOLS = frozenset(
+	("api_create_record", "api_update_record", "api_delete_record", "api_submit_record", "api_call_method")
+)
 ACTION_DOCTYPE_MAX = 80
+# `ERP AI Log.actions` is a Small Text column: MariaDB `text`, 65535 bytes. The JSON the runner stores there
+# stays within ACTIONS_MAX_BYTES (utf-8); each string in it within ACTION_VALUE_MAX_BYTES. A cut is marked.
+ACTIONS_MAX_BYTES = 60000
+ACTION_VALUE_MAX_BYTES = 1024
+ACTION_CUT_MARKER = "[đã cắt]"
+ACTION_VALUE_KEYS = ("value_before", "value_after")
 PROPOSE_TOOLS = ("propose_file_change", "propose_new_file", "propose_bench_command")
+PROPOSE_STEP = "propose"
 UNPARSEABLE_ERROR = "UNPARSEABLE: không phân loại được"
 BAD_MAPPING_ERROR = "category_mapping không hợp lệ, không có giá trị dự đoán"
 BAD_ROUTING_ERROR = "routing_rules không hợp lệ, định tuyến dùng giá trị rỗng"
@@ -513,7 +524,10 @@ def _check_sla(category, context, actions, lines):
 
 def _record_route(log_name, result, decision, assigned, task, actions, errors):
 	"""Update the `classify` entry once (design 3.5)."""
-	updates = {"applied": 1 if result else 0, "actions": json.dumps(actions, ensure_ascii=False)}
+	updates = {
+		"applied": 1 if result else 0,
+		"actions": json.dumps(_bounded_actions(actions), ensure_ascii=False),
+	}
 	if result:
 		before = {"ticket": result["before"]} if result.get("before") else {}
 		after = {"ticket": result["after"]} if result.get("after") else {}
@@ -581,13 +595,8 @@ def _reason(ticket_name, trigger, run_id, settings, context, classification, dea
 		["subject", "description", "status", "priority", "ticket_type", "agent_group", "creation"],
 		as_dict=True,
 	)
-	grant = (context.effective_level, bool(context.instructor), context.change_enabled)
+	grant = (context.effective_level, bool(context.instructor), context.change_enabled, context.unrestricted)
 	tools = get_tool_schemas(*grant)
-	offered = {tool["name"] for tool in tools}
-	unrestricted_tools = get_unrestricted_tool_schemas(
-		context.effective_level, bool(context.instructor), context.unrestricted
-	)
-	tools.extend(tool for tool in unrestricted_tools if tool["name"] not in offered)
 	if tools:
 		tools[-1]["cache_control"] = {"type": "ephemeral"}
 	system = build_reason_system(
@@ -595,7 +604,7 @@ def _reason(ticket_name, trigger, run_id, settings, context, classification, dea
 		_routing_table(context),
 		change_tools=grants_change_tools(*grant),
 		site_admin_tools=grants_site_admin_tools(*grant),
-		unrestricted_tools=bool(unrestricted_tools),
+		unrestricted_tools=grants_unrestricted_tools(*grant),
 	)
 	messages = [{"role": "user", "content": build_initial_message(ticket, labelled, trigger, classification)}]
 	base = {
@@ -647,7 +656,7 @@ def _reason(ticket_name, trigger, run_id, settings, context, classification, dea
 			stop_reason=stop_reason,
 			tools_called=[block["name"] for block in tool_blocks] or None,
 			error="; ".join([*tool_errors, *status.take_errors()]) or None,
-			actions=actions or None,
+			actions=_bounded_actions(actions) if actions else None,
 			value_before=before or None,
 			value_after=after or None,
 			skipped_fields=skipped or None,
@@ -678,8 +687,17 @@ def _run_tool(block, context, actions, before, after, tool_errors, skipped):
 			"is_error": True,
 		}
 	if name in PROPOSE_TOOLS and outcome.get("ok"):
-		# the `propose` step of the proposal's own log trail, written by the agent account
-		transitions.log_step(outcome["proposal"], "propose", context.agent_user)
+		# the `propose` step of the proposal's own log trail, written by the agent account (design 4.1 step 4)
+		write_entry(
+			entry_type=ENTRY_TYPE_CHANGE,
+			trigger=TRIGGER_CHANGE_ACTION,
+			change_step=PROPOSE_STEP,
+			actor=AGENT_USER,
+			change_proposal=outcome["proposal"],
+			ticket=context.ticket_name,
+			run_id=context.run_id,
+			instructor=context.instructor,
+		)
 	if name in WRITE_TOOL_TARGETS:
 		actions.append(_action(name, context, outcome, bool(outcome.get("ok")), arguments))
 		if outcome.get("ok") and "after" in outcome:
@@ -697,4 +715,75 @@ def _action(name, context, outcome, ok, arguments):
 		requested = arguments.get("doctype") if isinstance(arguments, dict) else None
 		doctype = str((outcome or {}).get("doctype") or requested or "")[:ACTION_DOCTYPE_MAX] or None
 	record = context.ticket_name if key is None else (outcome or {}).get(key)
-	return {"tool": name, "doctype": doctype, "name": record, "ok": ok}
+	action = {"tool": name, "doctype": doctype, "name": record, "ok": ok}
+	if name in RECORD_TOOLS:
+		# copied as the tool returned them (already free of secrets and cut); a refused or crashed call has none
+		written = outcome if ok else {}
+		action["value_before"] = written.get("value_before")
+		action["value_after"] = written.get("value_after")
+		action["instructor"] = context.instructor
+	return action
+
+
+def _stored_bytes(value) -> int:
+	"""Size of `value` as `write_entry` stores it (utf-8 JSON)."""
+	return len(json.dumps(value, ensure_ascii=False).encode("utf-8"))
+
+
+def _cut_strings(value):
+	"""`value` with every string longer than ACTION_VALUE_MAX_BYTES cut on a character boundary and marked."""
+	if isinstance(value, str):
+		data = value.encode("utf-8")
+		if len(data) <= ACTION_VALUE_MAX_BYTES:
+			return value
+		room = ACTION_VALUE_MAX_BYTES - len(ACTION_CUT_MARKER.encode("utf-8"))
+		return data[:room].decode("utf-8", errors="ignore") + ACTION_CUT_MARKER
+	if isinstance(value, dict):
+		return {key: _cut_strings(item) for key, item in value.items()}
+	if isinstance(value, list | tuple):
+		return [_cut_strings(item) for item in value]
+	return value
+
+
+def _without_values(entry):
+	"""`entry` with its before/after values replaced by the marker; who, what and the outcome stay."""
+	if not isinstance(entry, dict):
+		return entry
+	return {
+		key: ACTION_CUT_MARKER if key in ACTION_VALUE_KEYS and value is not None else value
+		for key, value in entry.items()
+	}
+
+
+def _bounded_actions(actions) -> list:
+	"""The turn's `actions` cut to fit the `actions` column: at most ACTIONS_MAX_BYTES as stored (F-1).
+
+	Each string is first cut to ACTION_VALUE_MAX_BYTES. When the list is still too large, entries lose their
+	before/after values to the marker, the costliest values first, so as many entries as fit keep theirs.
+	Every entry stays (one per tool call) unless even the entries without values do not fit: then the last
+	ones are dropped and one closing `{"cut": marker, "dropped": count}` entry says how many.
+	"""
+	entries = [_cut_strings(entry) for entry in actions]
+	if _stored_bytes(entries) <= ACTIONS_MAX_BYTES:
+		return entries
+	bare = [_without_values(entry) for entry in entries]
+	# replacing one list item changes the stored size by exactly the difference of the two items
+	costs = [
+		_stored_bytes(entry) - _stored_bytes(stripped) for entry, stripped in zip(entries, bare, strict=True)
+	]
+	room = ACTIONS_MAX_BYTES - _stored_bytes(bare)
+	if room >= 0:
+		kept = list(bare)
+		for index in sorted(range(len(entries)), key=costs.__getitem__):
+			if costs[index] > room:
+				break
+			kept[index] = entries[index]
+			room -= costs[index]
+		return kept
+	while bare and _stored_bytes([*bare, _dropped_entry(len(entries) - len(bare))]) > ACTIONS_MAX_BYTES:
+		bare.pop()
+	return [*bare, _dropped_entry(len(entries) - len(bare))]
+
+
+def _dropped_entry(count: int) -> dict:
+	return {"cut": ACTION_CUT_MARKER, "dropped": count}

@@ -42,22 +42,39 @@ SAVEPOINT = "erp_ai_tool"
 KEY_REASON_MAX = 100  # model-supplied argument names are cut so reason stays short
 CHANGE_GROUP = "change_propose"
 SITE_ADMIN_GROUP = "site_admin"
-# The unrestricted switch grants these groups on its own: any level above L0, with an instructor.
-UNRESTRICTED_GROUPS = (SITE_ADMIN_GROUP, "site_unrestricted")
-# ADR-011 QĐ 2, 6: the only grant table, one row per group, checked above L0:
-# group -> condition on (effective_level, has_instructor, change_enabled).
+UNRESTRICTED_GROUP = "site_unrestricted"
+
+
+def _unrestricted_grant(level: str, has_instructor: bool, unrestricted: bool) -> bool:
+	# The full-power switch: any level above L0 (so also L1 after a budget cut), with an instructor.
+	return unrestricted and level != LEVELS[0] and has_instructor
+
+
+# ADR-011 QĐ 2, 6 and ADR-023 QĐ 4: the only grant table, one row per group, checked above L0:
+# group -> condition on (effective_level, has_instructor, change_enabled, unrestricted).
 GRANT_TABLE = (
-	("read", lambda level, has_instructor, change_enabled: True),
-	("ticket_write", lambda level, has_instructor, change_enabled: True),
-	("task_write", lambda level, has_instructor, change_enabled: has_instructor),
+	("read", lambda level, has_instructor, change_enabled, unrestricted: True),
+	("ticket_write", lambda level, has_instructor, change_enabled, unrestricted: True),
+	("task_write", lambda level, has_instructor, change_enabled, unrestricted: has_instructor),
 	(
 		CHANGE_GROUP,
-		lambda level, has_instructor, change_enabled: change_enabled and level == "L3" and has_instructor,
+		lambda level, has_instructor, change_enabled, unrestricted: (
+			change_enabled and level == "L3" and has_instructor
+		),
 	),
-	# Generic record tools (site_api.py): the same switch, level and authority as the change tools.
+	# Generic record tools (site_api.py): the change tools' switch, level and authority, or full power.
 	(
 		SITE_ADMIN_GROUP,
-		lambda level, has_instructor, change_enabled: change_enabled and level == "L3" and has_instructor,
+		lambda level, has_instructor, change_enabled, unrestricted: (
+			(change_enabled and level == "L3" and has_instructor)
+			or _unrestricted_grant(level, has_instructor, unrestricted)
+		),
+	),
+	(
+		UNRESTRICTED_GROUP,
+		lambda level, has_instructor, change_enabled, unrestricted: _unrestricted_grant(
+			level, has_instructor, unrestricted
+		),
 	),
 )
 
@@ -70,45 +87,49 @@ def _all_specs() -> list[ToolSpec]:
 	return specs
 
 
-def _granted_specs(effective_level: str, has_instructor: bool, change_enabled: bool) -> list[ToolSpec]:
+def _granted_specs(
+	effective_level: str, has_instructor: bool, change_enabled: bool, unrestricted: bool = False
+) -> list[ToolSpec]:
 	if effective_level not in LEVELS or effective_level == LEVELS[0]:
 		return []
 	groups = {
 		group
 		for group, condition in GRANT_TABLE
-		if condition(effective_level, has_instructor, change_enabled)
+		if condition(effective_level, has_instructor, change_enabled, unrestricted)
 	}
 	return [spec for spec in _all_specs() if spec.group in groups]
 
 
-def _unrestricted_specs(effective_level: str, has_instructor: bool, unrestricted: bool) -> list[ToolSpec]:
-	if not (unrestricted and has_instructor):
-		return []
-	if effective_level not in LEVELS or effective_level == LEVELS[0]:
-		return []
-	return [spec for spec in _all_specs() if spec.group in UNRESTRICTED_GROUPS]
-
-
-def get_unrestricted_tool_schemas(
-	effective_level: str, has_instructor: bool, unrestricted: bool
+def get_tool_schemas(
+	effective_level: str, has_instructor: bool, change_enabled: bool, unrestricted: bool = False
 ) -> list[dict]:
-	granted = _unrestricted_specs(effective_level, has_instructor, unrestricted)
+	granted = _granted_specs(effective_level, has_instructor, change_enabled, unrestricted)
 	return [copy.deepcopy(spec.schema) for spec in granted]
 
 
-def get_tool_schemas(effective_level: str, has_instructor: bool, change_enabled: bool) -> list[dict]:
-	granted = _granted_specs(effective_level, has_instructor, change_enabled)
-	return [copy.deepcopy(spec.schema) for spec in granted]
+def _grants_group(
+	group: str, effective_level: str, has_instructor: bool, change_enabled: bool, unrestricted: bool
+) -> bool:
+	granted = _granted_specs(effective_level, has_instructor, change_enabled, unrestricted)
+	return any(spec.group == group for spec in granted)
 
 
-def grants_change_tools(effective_level: str, has_instructor: bool, change_enabled: bool) -> bool:
-	granted = _granted_specs(effective_level, has_instructor, change_enabled)
-	return any(spec.group == CHANGE_GROUP for spec in granted)
+def grants_change_tools(
+	effective_level: str, has_instructor: bool, change_enabled: bool, unrestricted: bool = False
+) -> bool:
+	return _grants_group(CHANGE_GROUP, effective_level, has_instructor, change_enabled, unrestricted)
 
 
-def grants_site_admin_tools(effective_level: str, has_instructor: bool, change_enabled: bool) -> bool:
-	granted = _granted_specs(effective_level, has_instructor, change_enabled)
-	return any(spec.group == SITE_ADMIN_GROUP for spec in granted)
+def grants_site_admin_tools(
+	effective_level: str, has_instructor: bool, change_enabled: bool, unrestricted: bool = False
+) -> bool:
+	return _grants_group(SITE_ADMIN_GROUP, effective_level, has_instructor, change_enabled, unrestricted)
+
+
+def grants_unrestricted_tools(
+	effective_level: str, has_instructor: bool, change_enabled: bool, unrestricted: bool = False
+) -> bool:
+	return _grants_group(UNRESTRICTED_GROUP, effective_level, has_instructor, change_enabled, unrestricted)
 
 
 def _invalid(key) -> dict:
@@ -163,10 +184,9 @@ def _first_invalid_key(arguments, input_schema: dict) -> str | None:
 
 
 def execute_tool(name: str, arguments: dict, context: ToolContext) -> dict:
-	granted = [
-		*_granted_specs(context.effective_level, bool(context.instructor), context.change_enabled),
-		*_unrestricted_specs(context.effective_level, bool(context.instructor), context.unrestricted),
-	]
+	granted = _granted_specs(
+		context.effective_level, bool(context.instructor), context.change_enabled, context.unrestricted
+	)
 	spec = next((s for s in granted if s.name == name), None)
 	if spec is None:
 		return {"ok": False, "reason": "tool không được cấp ở mức/thẩm quyền hiện tại"}

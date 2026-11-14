@@ -2,6 +2,7 @@ import json
 
 import frappe
 
+from erp_ai.agent.agent_write_guard import allow_agent_write
 from erp_ai.constants import CHANGE_STEPS, LOG_DOCTYPE, TRIGGER_CHANGE_ACTION
 
 ENTRY_TYPE_CHANGE = "change"
@@ -31,7 +32,8 @@ def write_entry(**fields) -> str:
 	user's permissions. `change` rows (one per proposal step) take `trigger="change_action"` plus
 	`change_step` in `CHANGE_STEPS`, `actor` and `change_proposal`, and are inserted with
 	`ignore_permissions=True` so an approver who may not create ERP AI Log still leaves the audit row.
-	Unknown fields are dropped by Frappe; a `doctype` argument is ignored.
+	Unknown fields are dropped by Frappe; a `doctype` argument is ignored. The insert alone runs inside
+	`allow_agent_write()`: the one path by which the agent account may write ERP AI Log (ADR-023 QĐ 5).
 
 	Raises:
 		ValueError: `entry_type` or `trigger` is missing or not allowed for the entry type, or a `change`
@@ -51,7 +53,9 @@ def write_entry(**fields) -> str:
 		key: json.dumps(value, ensure_ascii=False) if isinstance(value, list | dict) else value
 		for key, value in fields.items()
 	}
-	doc = frappe.get_doc({**values, "doctype": LOG_DOCTYPE}).insert(ignore_permissions=is_change)
+	doc = frappe.get_doc({**values, "doctype": LOG_DOCTYPE})
+	with allow_agent_write():
+		doc.insert(ignore_permissions=is_change)
 	if not frappe.flags.in_test:
 		frappe.db.commit()
 	return doc.name

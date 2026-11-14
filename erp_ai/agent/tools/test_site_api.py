@@ -17,6 +17,44 @@ NOTE_TITLE = "SITEAPI-TEST ghi chú"
 TOOL_NAMES = ["api_list_records", "api_get_record", "api_create_record", "api_update_record"]
 UNRESTRICTED_TOOL_NAMES = ["api_delete_record", "api_submit_record", "api_call_method"]
 NOT_GRANTED = {"ok": False, "reason": "tool không được cấp ở mức/thẩm quyền hiện tại"}
+APP_NAME = "erp_ai"
+STUB_APP_DOCTYPE = "Note"
+OTHER_PROFILE = "SITEAPI hồ sơ thường"
+_real_get_all = frappe.get_all
+
+
+def _app_doctypes():
+	"""Every DocType of the app's modules, read independently of site_api."""
+	modules = frappe.get_all("Module Def", {"app_name": APP_NAME}, pluck="name")
+	return sorted(frappe.get_all("DocType", {"module": ["in", modules]}, pluck="name"))
+
+
+def _get_all_with_stub_app_doctype(doctype, *args, **kwargs):
+	"""`frappe.get_all` as if the stub DocType belonged to the app's module."""
+	rows = _real_get_all(doctype, *args, **kwargs)
+	filters = args[0] if args else kwargs.get("filters")
+	if doctype == "DocType" and isinstance(filters, dict) and "module" in filters:
+		rows = [*rows, STUB_APP_DOCTYPE]
+	return rows
+
+
+def _snapshot(doctype):
+	if frappe.get_meta(doctype).issingle:
+		return frappe.db.get_singles_dict(doctype)
+	return frappe.db.count(doctype)
+
+
+def _calls_naming(doctype):
+	"""One call of every site_api tool on the DocType, keyed by tool name."""
+	return {
+		"api_list_records": {"doctype": doctype},
+		"api_get_record": {"doctype": doctype, "name": doctype},
+		"api_create_record": {"doctype": doctype, "values": {}},
+		"api_update_record": {"doctype": doctype, "name": doctype, "values": {}},
+		"api_delete_record": {"doctype": doctype, "name": doctype},
+		"api_submit_record": {"doctype": doctype, "name": doctype, "action": "submit"},
+		"api_call_method": {"method": "frappe.client.get_list", "arguments": {"doctype": doctype}},
+	}
 
 
 def _make_user(email, *roles):
@@ -161,9 +199,151 @@ class TestSiteApi(FrappeTestCase):
 				result = self.run_tool(name, arguments)
 				self.assertFalse(result["ok"], (name, doctype))
 				self.assertIn("không được phép", result["reason"])
-		for doctype in ("Custom DocPerm", "Role Permission", "Salary Slip", "Custom Role"):
+		for doctype in ("Custom DocPerm", "Custom Role", "Salary Slip", "Employee", "GL Entry"):
+			self.assertTrue(frappe.db.exists("DocType", doctype), doctype)
 			result = self.create(doctype, {"role": ALLOWED_ROLE})
 			self.assertFalse(result["ok"], doctype)
+			self.assertIn("không được phép", result["reason"], doctype)
+
+	def test_every_app_doctype_denied_for_every_tool_in_both_modes(self):
+		doctypes = _app_doctypes()
+		self.assertIn("ERP AI Change Proposal", doctypes)
+		before = {doctype: _snapshot(doctype) for doctype in doctypes}
+		for context in (_context(), _context(level="L1", change_enabled=False, unrestricted=True)):
+			for doctype in doctypes:
+				self.assert_closed_on_every_tool(doctype, context)
+		self.assertEqual({doctype: _snapshot(doctype) for doctype in doctypes}, before)
+
+	def test_doctype_added_to_the_app_module_is_denied(self):
+		# A fifth DocType of the app is closed without editing site_api: Note stands in for it through a stub.
+		before = _snapshot(STUB_APP_DOCTYPE)
+		with patch.object(frappe, "get_all", side_effect=_get_all_with_stub_app_doctype):
+			for context in (_context(), _context(level="L1", change_enabled=False, unrestricted=True)):
+				self.assert_closed_on_every_tool(STUB_APP_DOCTYPE, context)
+		self.assertEqual(_snapshot(STUB_APP_DOCTYPE), before)
+
+	def assert_closed_on_every_tool(self, doctype, context):
+		calls = _calls_naming(doctype)
+		self.assertEqual(sorted(calls), sorted(spec.name for spec in site_api.TOOLS))
+		for spec in site_api.TOOLS:
+			with self.subTest(doctype=doctype, tool=spec.name, unrestricted=context.unrestricted):
+				result = spec.handler(calls[spec.name], context)
+				self.assertFalse(result["ok"])
+				self.assertIn("không được phép", result["reason"])
+
+	def test_normal_mode_denies_doctype_and_role_records(self):
+		# developer_mode is on: a DocType save would export JSON into the frappe app, so the write is stubbed.
+		for doctype, name, values in (
+			("DocType", "Note", {"permissions": [{"role": ALLOWED_ROLE, "read": 1, "write": 1}]}),
+			("Role", ALLOWED_ROLE, {"desk_access": 0}),
+			("Custom DocPerm", "x", {"read": 1}),
+			("Custom Role", "x", {"report": "x"}),
+		):
+			with self.subTest(doctype), patch.object(site_api, "_write") as write:
+				result = self.update(doctype, name, values)
+				self.assertFalse(result["ok"])
+				self.assertIn("không được phép", result["reason"])
+				write.assert_not_called()
+
+	def test_lowercase_names_are_refused(self):
+		frappe.set_user("Administrator")
+		frappe.get_doc(
+			{"doctype": "Role Profile", "role_profile": PROFILE, "roles": [{"role": "System Manager"}]}
+		).insert()
+		frappe.set_user(AGENT)
+		unrestricted = _context(level="L1", change_enabled=False, unrestricted=True)
+		cases = (
+			(
+				"role",
+				"api_create_record",
+				{"doctype": "User", "values": self.user_values(roles=[{"role": "system manager"}])},
+				"vai trò không được gán",
+				None,
+			),
+			(
+				"user doctype",
+				"api_create_record",
+				{"doctype": "user", "values": self.user_values(roles=[{"role": "System Manager"}])},
+				"vai trò không được gán",
+				None,
+			),
+			(
+				"role profile of a user",
+				"api_create_record",
+				{"doctype": "User", "values": self.user_values(role_profile_name=PROFILE.lower())},
+				"vai trò không được gán",
+				None,
+			),
+			(
+				"role in a role profile",
+				"api_create_record",
+				{
+					"doctype": "role profile",
+					"values": {"role_profile": OTHER_PROFILE, "roles": [{"role": "system manager"}]},
+				},
+				"vai trò không được gán",
+				None,
+			),
+			(
+				"administrator",
+				"api_update_record",
+				{"doctype": "User", "name": "administrator", "values": {"first_name": "Đổi"}},
+				"không được sửa",
+				None,
+			),
+			(
+				"agent account",
+				"api_update_record",
+				{"doctype": "user", "name": AGENT.upper(), "values": {"first_name": "Đổi"}},
+				"không được sửa",
+				None,
+			),
+			(
+				"app doctype",
+				"api_get_record",
+				{"doctype": "erp ai setting", "name": "erp ai setting"},
+				"không được phép",
+				None,
+			),
+			(
+				"app doctype",
+				"api_update_record",
+				{"doctype": "erp ai setting", "name": "erp ai setting", "values": {"enabled": 0}},
+				"không được phép",
+				None,
+			),
+			(
+				"app doctype unrestricted",
+				"api_get_record",
+				{"doctype": "erp ai setting", "name": "erp ai setting"},
+				"không được phép",
+				unrestricted,
+			),
+			(
+				"app doctype unrestricted",
+				"api_list_records",
+				{"doctype": "erp ai change proposal"},
+				"không được phép",
+				unrestricted,
+			),
+			(
+				"permission doctype",
+				"api_list_records",
+				{"doctype": "custom docperm"},
+				"không được phép",
+				None,
+			),
+		)
+		for label, tool, arguments, reason, context in cases:
+			with self.subTest(label, tool=tool):
+				result = self.run_tool(tool, arguments, context)
+				self.assertFalse(result["ok"])
+				self.assertIn(reason, result["reason"])
+		frappe.set_user("Administrator")
+		self.assertFalse(frappe.db.exists("User", NEW_USER))
+		self.assertFalse(frappe.db.exists("Role Profile", OTHER_PROFILE))
+		self.assertNotEqual(frappe.db.get_value("User", "Administrator", "first_name"), "Đổi")
+		self.assertNotEqual(frappe.db.get_value("User", AGENT, "first_name"), "Đổi")
 
 	def test_refuses_child_table_doctype(self):
 		result = self.create(

@@ -12,15 +12,7 @@ from frappe.utils import strip_html
 
 from erp_ai.agent.tools import read
 from erp_ai.agent.tools.registry import ToolContext, ToolSpec
-from erp_ai.constants import (
-	AGENT_USER,
-	CREDENTIAL_DOCTYPE,
-	LOG_DOCTYPE,
-	PROPOSAL_DOCTYPE,
-	ROLE_AGENT,
-	ROLE_INSTRUCTOR,
-	SETTING_DOCTYPE,
-)
+from erp_ai.constants import AGENT_USER, ROLE_AGENT, ROLE_INSTRUCTOR
 
 GROUP = "site_admin"
 UNRESTRICTED_GROUP = "site_unrestricted"
@@ -28,10 +20,10 @@ OWN_APP_PREFIX = "erp_ai."
 SAVEPOINT = "erp_ai_site_api"
 USER_DOCTYPE = "User"
 ROLE_PROFILE_DOCTYPE = "Role Profile"
-# The read tool hides User from the model; these tools manage users, so only User is taken off that list.
-DENIED_DOCTYPES = (read.DENIED_DOCTYPES - {USER_DOCTYPE}) | {PROPOSAL_DOCTYPE, "Custom Role"}
-# Closed in every mode: the bot never changes its own switches, keys, audit log or change proposals.
-ALWAYS_DENIED_DOCTYPES = frozenset({SETTING_DOCTYPE, CREDENTIAL_DOCTYPE, LOG_DOCTYPE, PROPOSAL_DOCTYPE})
+ROLE_DOCTYPE = "Role"
+DOCTYPE_DOCTYPE = "DocType"
+# Changing these grants permissions the way a forbidden role would: denied unless the unrestricted switch is on.
+PERMISSION_DOCTYPES = frozenset({"Custom Role", "Custom DocPerm", DOCTYPE_DOCTYPE, ROLE_DOCTYPE})
 # Roles that would let an account command the bot or administer the site; never assignable here.
 FORBIDDEN_ROLES = frozenset({"System Manager", "Administrator", ROLE_INSTRUCTOR, ROLE_AGENT, "Guest", "All"})
 PROTECTED_USERS = frozenset({"Administrator", "Guest", AGENT_USER})
@@ -58,8 +50,33 @@ def _fail(reason: str, doctype=None) -> dict:
 	return result
 
 
+def always_denied_doctypes() -> frozenset:
+	"""Closed in every mode: every DocType of the app's module, read at call time, so a new one is closed too.
+	The bot never changes its own switches, keys, audit log or change proposals."""
+	return frozenset(frappe.get_all(DOCTYPE_DOCTYPE, {"module": read.AI_MODULE}, pluck="name"))
+
+
+def _denied_doctypes(ctx: ToolContext) -> frozenset:
+	if ctx.unrestricted:
+		return always_denied_doctypes()
+	# The read tool hides User from the model; these tools manage users, so only User is taken off that list.
+	return frozenset(read.denied_doctypes() - {USER_DOCTYPE}) | PERMISSION_DOCTYPES
+
+
+def _stored_name(doctype: str, name):
+	"""The name as stored when the record exists (MariaDB matches names case-insensitively), else the name given."""
+	if not isinstance(name, str) or not name:
+		return name
+	return frappe.db.get_value(doctype, name, "name") or name
+
+
+def _named_in(name, names) -> bool:
+	"""Case-insensitive membership: `name` should already be the stored name where one exists."""
+	return isinstance(name, str) and name.casefold() in {item.casefold() for item in names}
+
+
 def _doctype_refusal(doctype: str, ctx: ToolContext) -> dict | None:
-	if doctype in (ALWAYS_DENIED_DOCTYPES if ctx.unrestricted else DENIED_DOCTYPES):
+	if _named_in(doctype, _denied_doctypes(ctx)):
 		return _fail("DocType này không được phép dùng qua công cụ", doctype)
 	if not frappe.db.exists("DocType", doctype):
 		return _fail("không tìm thấy DocType", doctype)
@@ -82,9 +99,10 @@ def _is_draft(doc) -> bool:
 
 
 def _profile_roles(profile) -> list[str]:
-	if not isinstance(profile, str) or not frappe.db.exists(ROLE_PROFILE_DOCTYPE, profile):
+	stored = isinstance(profile, str) and frappe.db.exists(ROLE_PROFILE_DOCTYPE, profile)
+	if not stored:
 		return []
-	return [row.role for row in frappe.get_doc(ROLE_PROFILE_DOCTYPE, profile).roles]
+	return [row.role for row in frappe.get_doc(ROLE_PROFILE_DOCTYPE, stored).roles]
 
 
 def _wanted_roles(doctype: str, values: dict) -> list | None:
@@ -115,7 +133,8 @@ def _values_refusal(doctype: str, values: dict, ctx: ToolContext) -> dict | None
 	roles = _wanted_roles(doctype, values)
 	if roles is None:
 		return _fail("mỗi dòng của roles / role_profiles phải là một object", doctype)
-	forbidden = sorted({role for role in roles if role in FORBIDDEN_ROLES})
+	stored_roles = {_stored_name(ROLE_DOCTYPE, role) for role in roles}
+	forbidden = sorted(role for role in stored_roles if _named_in(role, FORBIDDEN_ROLES))
 	if forbidden:
 		return _fail(f"vai trò không được gán qua công cụ: {', '.join(forbidden)}", doctype)
 	return None
@@ -138,7 +157,7 @@ def _write(doctype: str, save) -> dict:
 
 
 def create_record(args: dict, ctx: ToolContext) -> dict:
-	doctype, values = args["doctype"], args["values"]
+	doctype, values = _stored_name(DOCTYPE_DOCTYPE, args["doctype"]), args["values"]
 	if refusal := _doctype_refusal(doctype, ctx) or _values_refusal(doctype, values, ctx):
 		return refusal
 
@@ -150,13 +169,13 @@ def create_record(args: dict, ctx: ToolContext) -> dict:
 
 
 def update_record(args: dict, ctx: ToolContext) -> dict:
-	doctype, name, values = args["doctype"], args["name"], args["values"]
+	doctype, name, values = _stored_name(DOCTYPE_DOCTYPE, args["doctype"]), args["name"], args["values"]
 	if refusal := _doctype_refusal(doctype, ctx) or _values_refusal(doctype, values, ctx):
 		return refusal
 	if "name" in values:
 		return _fail("không đổi tên bản ghi qua công cụ: name", doctype)
 	protected = () if ctx.unrestricted else PROTECTED_USERS | {ctx.agent_user}
-	if doctype == USER_DOCTYPE and name in protected:
+	if doctype == USER_DOCTYPE and _named_in(_stored_name(USER_DOCTYPE, name), protected):
 		return _fail("tài khoản này không được sửa qua công cụ", doctype)
 	if not frappe.get_meta(doctype).issingle and not frappe.db.exists(doctype, name):
 		return _fail("không tìm thấy bản ghi", doctype)
@@ -180,7 +199,7 @@ def _existing_refusal(doctype: str, name: str, ctx: ToolContext) -> dict | None:
 
 
 def delete_record(args: dict, ctx: ToolContext) -> dict:
-	doctype, name = args["doctype"], args["name"]
+	doctype, name = _stored_name(DOCTYPE_DOCTYPE, args["doctype"]), args["name"]
 	if refusal := _existing_refusal(doctype, name, ctx):
 		return refusal
 
@@ -196,7 +215,7 @@ def _is_submittable(doctype: str) -> bool:
 
 
 def submit_record(args: dict, ctx: ToolContext) -> dict:
-	doctype, name, action = args["doctype"], args["name"], args["action"]
+	doctype, name, action = _stored_name(DOCTYPE_DOCTYPE, args["doctype"]), args["name"], args["action"]
 	if refusal := _existing_refusal(doctype, name, ctx):
 		return refusal
 	if not _is_submittable(doctype):
@@ -214,7 +233,7 @@ def _method_refusal(method: str, arguments: dict) -> dict | None:
 	if method.startswith(OWN_APP_PREFIX):
 		return _fail("không gọi hàm của erp_ai qua công cụ")
 	text = json.dumps(arguments, ensure_ascii=False, default=str)
-	if any(doctype in text for doctype in ALWAYS_DENIED_DOCTYPES):
+	if any(doctype in text for doctype in always_denied_doctypes()):
 		return _fail("tham số nhắc tới DocType không được phép dùng qua công cụ")
 	return None
 
@@ -241,7 +260,7 @@ def call_method(args: dict, ctx: ToolContext) -> dict:
 
 
 def get_record(args: dict, ctx: ToolContext) -> dict:
-	doctype, name = args["doctype"], args["name"]
+	doctype, name = _stored_name(DOCTYPE_DOCTYPE, args["doctype"]), args["name"]
 	if refusal := _doctype_refusal(doctype, ctx):
 		return refusal
 	meta = frappe.get_meta(doctype)
@@ -271,7 +290,7 @@ def _filter_ok(row, columns: set) -> bool:
 
 
 def list_records(args: dict, ctx: ToolContext) -> dict:
-	doctype = args["doctype"]
+	doctype = _stored_name(DOCTYPE_DOCTYPE, args["doctype"])
 	if refusal := _doctype_refusal(doctype, ctx):
 		return refusal
 	meta = frappe.get_meta(doctype)

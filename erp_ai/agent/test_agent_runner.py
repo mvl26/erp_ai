@@ -36,6 +36,7 @@ from erp_ai.constants import (
 	KEY_STATUS_BAD_KEY,
 	LOG_DOCTYPE,
 	PROPOSAL_DOCTYPE,
+	ROLE_INSTRUCTOR,
 	TITLE_RUN_FAILED,
 	TITLE_WRONG_USER,
 )
@@ -1152,6 +1153,23 @@ class TestRunnerReasoning(RunnerTestBase):
 
 
 SITE_ADMIN_TOOL_NAMES = ["api_list_records", "api_get_record", "api_create_record", "api_update_record"]
+# Not Administrator: the session user in these tests is Administrator, so the action entry must name this user.
+INSTRUCTOR = "runner.instructor@example.com"
+
+
+def make_instructor(testcase):
+	"""Insert the instructor user with the instructor role; rolled back, then its role cache cleared."""
+
+	def drop():
+		frappe.db.rollback()
+		frappe.clear_cache(user=INSTRUCTOR)
+
+	testcase.addCleanup(drop)
+	user = frappe.get_doc(
+		{"doctype": "User", "email": INSTRUCTOR, "first_name": "Người chỉ thị", "send_welcome_email": 0}
+	)
+	user.append("roles", {"role": ROLE_INSTRUCTOR})
+	user.insert()
 
 
 class TestRunnerSiteAdminTools(RunnerTestBase):
@@ -1226,6 +1244,7 @@ class TestRunnerSiteAdminTools(RunnerTestBase):
 		self.assertNotIn(UNRESTRICTED_TOOLS_BLOCK, call["system"][0]["text"])
 
 	def test_unrestricted_actions_are_logged(self):
+		make_instructor(self)
 		set_agent_settings(unrestricted_enabled=1)
 		self.gateway.results = [
 			tool_turn(
@@ -1239,7 +1258,7 @@ class TestRunnerSiteAdminTools(RunnerTestBase):
 			"api_call_method": {"ok": True, "method": "frappe.client.get_count", "result": 1},
 		}
 		with (
-			patch.object(authority, "latest_instructor", return_value="Administrator"),
+			patch.object(authority, "latest_instructor", return_value=INSTRUCTOR),
 			patch.object(runner, "execute_tool", side_effect=lambda name, args, ctx: results[name]),
 		):
 			self._run("comment_mention")
@@ -1255,7 +1274,7 @@ class TestRunnerSiteAdminTools(RunnerTestBase):
 					"ok": True,
 					"value_before": None,
 					"value_after": None,
-					"instructor": "Administrator",
+					"instructor": INSTRUCTOR,
 				},
 				{
 					"tool": "api_call_method",
@@ -1264,7 +1283,7 @@ class TestRunnerSiteAdminTools(RunnerTestBase):
 					"ok": True,
 					"value_before": None,
 					"value_after": None,
-					"instructor": "Administrator",
+					"instructor": INSTRUCTOR,
 				},
 			],
 		)
@@ -1317,6 +1336,7 @@ class TestRunnerSiteAdminTools(RunnerTestBase):
 		self.assertEqual([(row.change_step, row.actor) for row in steps], [("propose", AGENT_USER)])
 
 	def test_record_tool_runs_for_real_and_the_log_names_the_record(self):
+		make_instructor(self)
 		title = f"{PREFIX}site api note"
 		self.gateway.results = [
 			tool_turn(
@@ -1327,7 +1347,7 @@ class TestRunnerSiteAdminTools(RunnerTestBase):
 			),
 			make_model_result(),
 		]
-		with patch.object(authority, "latest_instructor", return_value="Administrator"):
+		with patch.object(authority, "latest_instructor", return_value=INSTRUCTOR):
 			self._run("comment_mention")
 
 		note = frappe.db.get_value("Note", {"title": title}, "name")
@@ -1343,7 +1363,7 @@ class TestRunnerSiteAdminTools(RunnerTestBase):
 					"ok": True,
 					"value_before": None,
 					"value_after": {"title": title, "public": 1},
-					"instructor": "Administrator",
+					"instructor": INSTRUCTOR,
 				},
 				{
 					"tool": "api_create_record",
@@ -1352,18 +1372,19 @@ class TestRunnerSiteAdminTools(RunnerTestBase):
 					"ok": False,
 					"value_before": None,
 					"value_after": None,
-					"instructor": "Administrator",
+					"instructor": INSTRUCTOR,
 				},
 			],
 		)
 
 	def test_crashed_record_tool_is_logged_with_the_requested_doctype(self):
+		make_instructor(self)
 		self.gateway.results = [
 			tool_turn(tool_use("toolu_1", "api_update_record", doctype="Note", name="x", values={})),
 			make_model_result(),
 		]
 		with (
-			patch.object(authority, "latest_instructor", return_value="Administrator"),
+			patch.object(authority, "latest_instructor", return_value=INSTRUCTOR),
 			patch.object(runner, "execute_tool", side_effect=RuntimeError("boom")),
 		):
 			self._run("comment_mention")
@@ -1379,13 +1400,12 @@ class TestRunnerSiteAdminTools(RunnerTestBase):
 					"ok": False,
 					"value_before": None,
 					"value_after": None,
-					"instructor": "Administrator",
+					"instructor": INSTRUCTOR,
 				}
 			],
 		)
 
 
-INSTRUCTOR = "Administrator"
 FAKE_PASSWORD = "RUNNER-FAKE-PASSWORD-5b71"
 FAKE_API_SECRET = "RUNNER-FAKE-API-SECRET-c09e"
 SECRET_USER = "runner.secret@example.com"
@@ -1399,6 +1419,7 @@ class TestRunnerRecordToolValues(RunnerTestBase):
 		set_agent_settings(
 			permission_level="L3", code_change_enabled=1, unrestricted_enabled=1, monthly_budget_usd=1000
 		)
+		make_instructor(self)
 
 	def _note(self, title):
 		return frappe.get_doc({"doctype": "Note", "title": title, "public": 1}).insert().name

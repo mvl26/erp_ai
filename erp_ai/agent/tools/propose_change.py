@@ -13,7 +13,7 @@ from erp_ai.agent import change_link, change_text
 from erp_ai.agent.agent_write_guard import allow_agent_write
 from erp_ai.agent.tools import change_guard, source
 from erp_ai.agent.tools.registry import ToolContext, ToolSpec
-from erp_ai.agent.tools.registry import _invalid as registry_invalid
+from erp_ai.agent.tools.registry import _invalid as registry_invalid  # design-addendum-2 A2-2
 from erp_ai.constants import (
 	CHANGE_KIND_CODE,
 	CHANGE_KIND_COMMAND,

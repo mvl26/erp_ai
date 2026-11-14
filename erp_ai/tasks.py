@@ -187,6 +187,11 @@ def _raise_alarm(subject: str, names: list[str]) -> None:
 		frappe.log_error(TITLE_RUN_FAILED, f"check_privilege_escalation email error={type(exc).__name__}")
 
 
+def _advance_privilege_watermark(upper: datetime) -> None:
+	"""The only writer of the watermark: a direct Single write in the job's transaction, never a Setting save."""
+	frappe.db.set_single_value(SETTING_DOCTYPE, "privilege_alert_checked_until", upper)
+
+
 def check_privilege_escalation(now: datetime | None = None) -> None:
 	"""Daily job (AC-18): one alarm per escalation condition that holds.
 
@@ -195,8 +200,9 @@ def check_privilege_escalation(now: datetime | None = None) -> None:
 	rows created in (watermark, now - PRIVILEGE_ALERT_SETTLE_S]; enabled Server Script/Webhook owned by the
 	agent; an enabled key with an empty `api_key`. Messages list at most 5 names and never any key text.
 	A failing alarm email is logged under TITLE_RUN_FAILED and the alarm Error Log is kept; the remaining
-	conditions still run. On any error it rolls back, logs a constant title with an explicit message and
-	returns (D-20).
+	conditions still run. After every condition it advances the watermark to the upper bound (never back)
+	in the same transaction as the alarms, before the job's commit (ADR-024 QĐ 3.3, 3.5). On any error it
+	rolls back, logs a constant title with an explicit message and returns (D-20).
 	"""
 	upper = (get_datetime(now) if now else now_datetime()) - timedelta(seconds=PRIVILEGE_ALERT_SETTLE_S)
 	try:
@@ -211,6 +217,9 @@ def check_privilege_escalation(now: datetime | None = None) -> None:
 			names = find()
 			if names:
 				_raise_alarm(subject, names)
+		# Never moves back: an upper bound not after the watermark read nothing new (ADR-024 QĐ 3.3).
+		if lower is None or upper > lower:
+			_advance_privilege_watermark(upper)
 		if not frappe.flags.in_test:
 			frappe.db.commit()
 	except Exception as exc:

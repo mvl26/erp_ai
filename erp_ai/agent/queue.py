@@ -5,6 +5,7 @@ from erp_ai.constants import JOB_TIMEOUT_S, TRIGGER_COMMENT_MENTION, TRIGGER_TIC
 PENDING_JOB_IDS_FLAG = "erp_ai_pending_job_ids"
 VALID_TRIGGERS = (TRIGGER_TICKET_INSERT, TRIGGER_COMMENT_MENTION)
 VALID_CHANGE_ACTIONS = ("apply", "undo")
+SCHEDULED_JOB_TIMEOUT_S = 1200
 
 
 def _clear_pending_job_ids():
@@ -55,4 +56,37 @@ def enqueue_change_job(proposal_name: str, action: str) -> None:
 		deduplicate=True,
 		proposal_name=proposal_name,
 		action=action,
+	)
+
+
+def enqueue_daily_report_job() -> None:
+	frappe.enqueue(
+		"erp_ai.agent.daily_report.run_daily_report",
+		queue="long",
+		timeout=SCHEDULED_JOB_TIMEOUT_S,
+		enqueue_after_commit=True,
+		job_id="erp_ai::daily_report",
+		deduplicate=True,
+	)
+
+
+def enqueue_weekly_kpi_job() -> None:
+	frappe.enqueue(
+		"erp_ai.agent.kpi.run_weekly_kpi",
+		queue="long",
+		timeout=SCHEDULED_JOB_TIMEOUT_S,
+		enqueue_after_commit=True,
+		job_id="erp_ai::weekly_kpi",
+		deduplicate=True,
+	)
+
+
+def enqueue_monthly_review_job() -> None:
+	frappe.enqueue(
+		"erp_ai.agent.monthly_review.run_monthly_review",
+		queue="long",
+		timeout=SCHEDULED_JOB_TIMEOUT_S,
+		enqueue_after_commit=True,
+		job_id="erp_ai::monthly_review",
+		deduplicate=True,
 	)

@@ -117,7 +117,13 @@ LAYER_RULES = (
 
 ENQUEUE_NAMES = ("enqueue", "enqueue_doc")
 ENQUEUE_REQUIRED_KEYWORDS = ("queue", "timeout", "enqueue_after_commit", "job_id", "deduplicate")
-ENQUEUE_TARGETS = ("erp_ai.agent.runner.run_for_ticket", "erp_ai.agent.changes.apply_job.run_change")
+ENQUEUE_TARGETS = (
+	"erp_ai.agent.runner.run_for_ticket",
+	"erp_ai.agent.changes.apply_job.run_change",
+	"erp_ai.agent.daily_report.run_daily_report",
+	"erp_ai.agent.kpi.run_weekly_kpi",
+	"erp_ai.agent.monthly_review.run_monthly_review",
+)
 
 CONFIG_DOCTYPES = ("ERP AI Setting", "ERP AI Credential")
 CONFIG_DOCTYPE_CONSTANTS = ("SETTING_DOCTYPE", "CREDENTIAL_DOCTYPE")
@@ -542,7 +548,7 @@ def check_single_enqueue_site(sources: dict) -> list:
 
 
 def check_enqueue_call_shape(sources: dict) -> list:
-	"""ADR-003/ADR-013 QĐ 2: exactly two calls, one per target (runner, change job), each with all five parameters."""
+	"""ADR-003/ADR-013 QĐ 2, ADR-033 QĐ 6: exactly one call per target, each with all five parameters."""
 	source = sources.get(QUEUE_FILE)
 	if source is None:
 		return [f"{QUEUE_FILE}: file missing"]
@@ -552,7 +558,10 @@ def check_enqueue_call_shape(sources: dict) -> list:
 		if isinstance(node, ast.Call) and referenced_name(node.func) in ENQUEUE_NAMES
 	]
 	if len(calls) != len(ENQUEUE_TARGETS):
-		return [f"{QUEUE_FILE}: expected exactly two enqueue calls, found {len(calls)}"]
+		return [
+			f"{QUEUE_FILE}: expected exactly {len(ENQUEUE_TARGETS)} enqueue calls, one per target, "
+			f"found {len(calls)}"
+		]
 	violations = []
 	targets = []
 	for call in calls:
@@ -2325,7 +2334,13 @@ class TestScannersCatchViolations(unittest.TestCase):
 	def test_enqueue_targets_pinned(self):
 		self.assertEqual(
 			ENQUEUE_TARGETS,
-			("erp_ai.agent.runner.run_for_ticket", "erp_ai.agent.changes.apply_job.run_change"),
+			(
+				"erp_ai.agent.runner.run_for_ticket",
+				"erp_ai.agent.changes.apply_job.run_change",
+				"erp_ai.agent.daily_report.run_daily_report",
+				"erp_ai.agent.kpi.run_weekly_kpi",
+				"erp_ai.agent.monthly_review.run_monthly_review",
+			),
 		)
 
 	@staticmethod
@@ -2336,29 +2351,32 @@ class TestScannersCatchViolations(unittest.TestCase):
 		good = "import frappe\n" + "".join(self.enqueue_call(target) for target in ENQUEUE_TARGETS)
 		self.assertEqual(check_enqueue_call_shape({QUEUE_FILE: good}), [])
 
-	def test_enqueue_call_shape_requires_exactly_two_calls(self):
-		runner, change = (self.enqueue_call(target) for target in ENQUEUE_TARGETS)
-		for label, body in (("one", runner), ("three", runner + change + change)):
+	def test_enqueue_call_shape_requires_one_call_per_target(self):
+		calls = [self.enqueue_call(target) for target in ENQUEUE_TARGETS]
+		for label, body in (("missing one", calls[1:]), ("one extra", calls + calls[-1:])):
 			with self.subTest(calls=label):
 				self.assertCaught(
-					check_enqueue_call_shape({QUEUE_FILE: "import frappe\n" + body}), "exactly two"
+					check_enqueue_call_shape({QUEUE_FILE: "import frappe\n" + "".join(body)}),
+					"one per target",
 				)
 
 	def test_enqueue_call_shape_requires_each_target_once(self):
-		for target in ENQUEUE_TARGETS:
+		for index, target in enumerate(ENQUEUE_TARGETS):
 			with self.subTest(target=target):
-				body = "import frappe\n" + self.enqueue_call(target) * 2
+				calls = [self.enqueue_call(other) for other in ENQUEUE_TARGETS]
+				calls[index - 1] = self.enqueue_call(target)
+				body = "import frappe\n" + "".join(calls)
 				violations = check_enqueue_call_shape({QUEUE_FILE: body})
 				self.assertCaught(violations, "each of")
 				self.assertFalse(any("first argument" in text for text in violations), violations)
 
 	def test_enqueue_call_shape_rejects_target_outside_set(self):
-		runner = self.enqueue_call(ENQUEUE_TARGETS[0])
+		others = "".join(self.enqueue_call(target) for target in ENQUEUE_TARGETS[:-1])
 		for bad in ("erp_ai.other.fn", "erp_ai.agent.changes.apply_job", "erp_ai.agent.runner.run"):
 			with self.subTest(target=bad):
-				body = "import frappe\n" + runner + self.enqueue_call(bad)
+				body = "import frappe\n" + others + self.enqueue_call(bad)
 				self.assertCaught(check_enqueue_call_shape({QUEUE_FILE: body}), "first argument")
-		not_literal = "import frappe\n" + runner + f"frappe.enqueue(TARGET, {ENQUEUE_GOOD_KEYWORDS})\n"
+		not_literal = "import frappe\n" + others + f"frappe.enqueue(TARGET, {ENQUEUE_GOOD_KEYWORDS})\n"
 		self.assertCaught(check_enqueue_call_shape({QUEUE_FILE: not_literal}), "first argument")
 
 	def test_enqueue_call_shape_requires_five_parameters_on_each_call(self):

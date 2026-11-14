@@ -112,3 +112,35 @@ class TestEnqueueChangeJob(FrappeTestCase):
 				with self.assertRaisesRegex(ValueError, "proposal_name"):
 					queue.enqueue_change_job(proposal_name, "apply")
 				enqueue.assert_not_called()
+
+
+class TestEnqueueScheduledJobs(FrappeTestCase):
+	def test_each_job_shape(self):
+		cases = (
+			(
+				"enqueue_daily_report_job",
+				"erp_ai.agent.daily_report.run_daily_report",
+				"erp_ai::daily_report",
+			),
+			("enqueue_weekly_kpi_job", "erp_ai.agent.kpi.run_weekly_kpi", "erp_ai::weekly_kpi"),
+			(
+				"enqueue_monthly_review_job",
+				"erp_ai.agent.monthly_review.run_monthly_review",
+				"erp_ai::monthly_review",
+			),
+		)
+		self.assertEqual(getattr(queue, "SCHEDULED_JOB_TIMEOUT_S", None), 1200)
+		for function_name, target, job_id in cases:
+			with self.subTest(function=function_name), patch("frappe.enqueue") as enqueue:
+				enqueue_job = getattr(queue, function_name, None)
+				self.assertTrue(callable(enqueue_job), f"queue.{function_name} is missing")
+				self.assertIsNone(enqueue_job())
+
+				enqueue.assert_called_once_with(
+					target,
+					queue="long",
+					timeout=1200,
+					enqueue_after_commit=True,
+					job_id=job_id,
+					deduplicate=True,
+				)

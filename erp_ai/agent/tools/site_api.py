@@ -53,7 +53,7 @@ def _fail(reason: str, doctype=None) -> dict:
 def always_denied_doctypes() -> frozenset:
 	"""Closed in every mode: every DocType of the app's module, read at call time, so a new one is closed too.
 	The bot never changes its own switches, keys, audit log or change proposals."""
-	return frozenset(frappe.get_all(DOCTYPE_DOCTYPE, {"module": read.AI_MODULE}, pluck="name"))
+	return frozenset(frappe.get_all("DocType", {"module": read.AI_MODULE}, pluck="name"))
 
 
 def _denied_doctypes(ctx: ToolContext) -> frozenset:

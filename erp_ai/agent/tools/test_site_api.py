@@ -1446,3 +1446,128 @@ class TestSnapshot(FrappeTestCase):
 			self.assertEqual([row["role"] for row in snapshot["roles"]], [ALLOWED_ROLE, "Accounts User"])
 			self.assertNotIn(FAKE_SECRET, json.dumps(snapshot))
 			self.assertNotIn(FAKE_PASSWORD, json.dumps(snapshot))
+
+
+# F-2: planted fake values in child rows; none may reach `value_before`/`value_after`.
+FAKE_CHILD_KEY = "SITEAPI-FAKEKEY123"
+FAKE_CHILD_SECRET = "SITEAPI-FAKESECRET456"
+FAKE_CHILD_PIN = "SITEAPI-FAKEPIN789"
+FAKE_DEEP_KEY = "SITEAPI-FAKEDEEP000"
+FAKE_JSON_TOKEN = "SITEAPI-FAKETOKEN321"
+FAKE_CREDENTIAL_KEY = "SITEAPI-FAKECREDKEY654"
+CHILD_FAKES = (FAKE_CHILD_KEY, FAKE_CHILD_SECRET, FAKE_CHILD_PIN, FAKE_DEEP_KEY, FAKE_JSON_TOKEN)
+CHILD_SHOWN = "SITEAPI nhãn dòng con"
+DEEP_SHOWN = "SITEAPI ghi chú sâu"
+STUB_CHILD = "SITEAPI Stub Child"
+# `pin_code` is not secret-named: only the child meta's Password type hides it.
+STUB_CHILD_META = frappe._dict(
+	fields=[
+		frappe._dict(fieldname="pin_code", fieldtype="Password"),
+		frappe._dict(fieldname="label", fieldtype="Data"),
+	]
+)
+
+
+class _StubMeta:
+	"""A parent meta whose `rows` field is a table of STUB_CHILD."""
+
+	def get_field(self, fieldname):
+		return frappe._dict(fieldtype="Table", options=STUB_CHILD) if fieldname == "rows" else None
+
+
+class _StubDoc:
+	def __init__(self, record, meta=None):
+		self.record, self.meta = record, meta or _StubMeta()
+
+	def as_dict(self):
+		return self.record
+
+
+def _child_rows():
+	return [
+		{
+			"name": "r1",
+			"api_key": FAKE_CHILD_KEY,
+			"api_secret": FAKE_CHILD_SECRET,
+			"pin_code": FAKE_CHILD_PIN,
+			"label": CHILD_SHOWN,
+			"inner": [{"api_key": FAKE_DEEP_KEY, "note": DEEP_SHOWN}],
+		},
+		# a row that arrives as JSON text, compared after decoding the way Frappe decodes it
+		json.dumps({"token": FAKE_JSON_TOKEN, "label": CHILD_SHOWN}),
+	]
+
+
+def _stub_child_meta(test):
+	"""Make `frappe.get_meta` return STUB_CHILD_META for STUB_CHILD for the duration of `test`."""
+	real_get_meta = frappe.get_meta
+
+	def get_meta(doctype, *args, **kwargs):
+		return STUB_CHILD_META if doctype == STUB_CHILD else real_get_meta(doctype, *args, **kwargs)
+
+	patcher = patch.object(frappe, "get_meta", get_meta)
+	patcher.start()
+	test.addCleanup(patcher.stop)
+
+
+class TestSiteApiChildSecrets(FrappeTestCase):
+	"""F-2: secret-named keys and child Password fields are scrubbed in child rows at every depth."""
+
+	def setUp(self):
+		_stub_child_meta(self)
+		# The cut is lifted so only the secret filter, not the 200-character cut, keeps the fake values out.
+		patcher = patch.object(site_api, "VALUE_MAX", 10000)
+		patcher.start()
+		self.addCleanup(patcher.stop)
+
+	def assert_scrubbed(self, values, fakes=CHILD_FAKES, shown=(CHILD_SHOWN, DEEP_SHOWN)):
+		text = json.dumps(values, ensure_ascii=False, default=str)
+		self.assertEqual([text.count(fake) for fake in fakes], [0] * len(fakes), text)
+		for value in shown:
+			self.assertGreaterEqual(text.count(value), 1, text)
+
+	def test_deleted_values_scrub_child_rows(self):
+		doc = _StubDoc({"name": "p1", "title": "tiêu đề", "rows": _child_rows()})
+		values = site_api._deleted_values(doc)
+		self.assertEqual(values["title"], "tiêu đề")
+		self.assert_scrubbed(values)
+
+	def test_created_or_updated_values_scrub_child_rows(self):
+		doc = _StubDoc({"name": "p1", "title": "tiêu đề", "rows": _child_rows()})
+		self.assert_scrubbed(site_api._shown(doc, ["title", "rows"]))
+
+	def test_table_held_as_json_text_is_scrubbed(self):
+		doc = _StubDoc({"rows": json.dumps(_child_rows())})
+		self.assert_scrubbed(site_api._shown(doc, ["rows"]))
+
+	def test_child_row_held_as_document_is_scrubbed(self):
+		credential = frappe.get_doc(
+			{"doctype": "ERP AI Credential", "label": CHILD_SHOWN, "api_key": FAKE_CREDENTIAL_KEY}
+		)
+		doc = _StubDoc({"credentials": [credential]}, frappe.get_meta("ERP AI Setting"))
+		self.assert_scrubbed(
+			site_api._shown(doc, ["credentials"]), fakes=(FAKE_CREDENTIAL_KEY,), shown=(CHILD_SHOWN,)
+		)
+
+	def test_child_rows_without_secrets_are_shown_as_before(self):
+		doc = _StubDoc({"rows": [{"label": "a"}]})
+		self.assertEqual(site_api._shown(doc, ["rows"]), {"rows": '[{"label": "a"}]'})
+
+	def test_compact_json_text_without_secrets_is_shown_unchanged(self):
+		doc = _StubDoc({"rows": '[{"label":"a"}]'})
+		self.assertEqual(site_api._shown(doc, ["rows"]), {"rows": '[{"label":"a"}]'})
+
+
+class TestSiteApiChildSecretsAtRealCut(FrappeTestCase):
+	"""F-2 at the real VALUE_MAX (200, not patched): secrets are scrubbed first, the text is cut after."""
+
+	def setUp(self):
+		_stub_child_meta(self)
+
+	def test_secret_within_the_first_200_characters_is_scrubbed_before_the_cut(self):
+		# Unscrubbed, the fake key sits at characters 28-45, inside the cut; scrubbed, the text is 48 + 300 + 3 long.
+		doc = _StubDoc({"rows": [{"name": "r1", "api_key": FAKE_CHILD_KEY, "label": "x" * 300}]})
+		shown = site_api._shown(doc, ["rows"])["rows"]
+		self.assertEqual(shown, '[{"name": "r1", "api_key": "[đã ẩn]", "label": "' + "x" * 152)
+		self.assertEqual(len(shown), 200)
+		self.assertEqual(shown.count(FAKE_CHILD_KEY), 0)

@@ -79,3 +79,36 @@ minor | — | — | 1 điểm nhỏ: comment ở :1156 nói lý do là "session 
 ### Sau merge (tech-lead, 2026-11-14 chặng 10)
 - Merge `353018a` (sau T61 `c2762a1`, T62 `8a2a5ef`, sửa ghép `c9abee1`). test_agent_runner với cài đặt site đang lưu: `Ran 78 tests in 34.637s` / `FAILED (failures=3)`, ba ca `TestRunnerL1Classification` (nhiễu `auto_assign_enabled=1`, không ca nào của T64); với hai cài đặt tạm để trống: `Ran 78 tests in 22.463s` / `OK`.
 - Phán mục cỡ cột `ERP AI Log.actions` (suspected, chưa tái hiện): sửa đòi đổi kiểu cột hoặc chặn kích thước ở runner, ngoài touchpoint T64 và là quyết định thiết kế → không chặn tick; chuyển team-leader/designer như lo ngại mở, qa thử ở verify (AC-34).
+
+## Sửa lại sau nghiệm thu (2026-11-14, chặng 11) — F-1 của `acceptance-part-3.md`
+
+Tech-lead chép từ tin trả về của reviewer (reviewer chỉ đọc, không ghi file).
+
+- Diff: `git diff abd2fa2..0ea548c` (commit `fix(runner): bound the actions column of ERP AI Log in bytes (FEAT-004)`, `runner.py` +75/−2, `test_agent_runner.py` +142); bổ sung 2 dòng test ở `7894f04` (`git diff f0fefb4..7894f04 -- erp_ai/agent/test_agent_runner.py`)
+- Vòng: 1
+- Verdict: approve
+
+### Lớp 1 — khớp tiêu chí
+- `_bounded_actions` dùng ở cả hai đường ghi (`runner.py:529` `_record_route`, `runner.py:659` vòng reason), đo đúng cách `write_entry` lưu (`json.dumps(ensure_ascii=False)`, `run_log.py:53`). Tổng luôn ≤ `ACTIONS_MAX_BYTES = 60000` byte với mọi danh sách; `sanitize_html` của Frappe bỏ qua chuỗi JSON nên lúc lưu không phình.
+- Mỗi chuỗi cắt ở `ACTION_VALUE_MAX_BYTES = 1024` byte, đúng ranh giới ký tự; dấu cắt `ACTION_CUT_MARKER = "[đã cắt]"`. Vượt tổng: `value_before`/`value_after` của mục tốn nhất được thay bằng dấu cắt trước; công cụ, DocType, tên bản ghi, đúng/sai, người ra lệnh còn nguyên.
+- Kết quả lưu là JSON hợp lệ dạng list; không sửa assertion cũ; một mục 20 × 200 "ế" (12310 byte) giữ nguyên.
+- Test: probe của qa (6 `api_delete_record` × 20 trường × 200 ký tự → 1 dòng nhật ký, 6 mục, định danh từng mục, 4 mục giữ giá trị / 2 mục cắt); ca đúng 60000 byte (giữ nguyên) và 60001 byte (cắt), số tính tay; mỗi giới hạn có ca riêng chỉ nó làm đỏ (reviewer kiểm tay: 59999/60001, 1024, cắt theo ký tự thay vì byte, đảo thứ tự "tốn nhất trước").
+
+### Phát hiện (chỉ blocker/major)
+- Không có.
+
+minor | — | — | 3 điểm nhỏ: (1) nhánh `value is not None` chưa có ca giữ → đã thêm ở `7894f04` (`value_after == [None] * 6`, đột biến ra `[None, None, None, None, '[đã cắt]', '[đã cắt]']`), reviewer xác nhận ở vòng 2 của review-62; (2) chú thích `runner.py:91-92` ghi "each string" nhưng khóa dict không bị cắt (tổng vẫn bị chặn); (3) chữ commit "one entry per call stays" không đúng ở nhánh bỏ mục | tùy dev
+
+### Review checklist (10)
+1–10: đạt (touchpoint đúng, RED/GREEN có, 0 dấu skip, không `except` mới, cột giữ `Small Text`, không migration, không phụ thuộc mới, commit `fix(runner): … (FEAT-004)` không trailer AI).
+
+### Không kiểm được từ diff — tech-lead phán
+- "Mọi danh sách ≤ giới hạn" và "đúng 1 mục mỗi lời gọi" (AC-34) không thể cùng đúng với cột 64 KB và số mục không giới hạn. Dev ưu tiên lần ghi không lỗi: khi các mục đã bỏ giá trị vẫn không vừa, các mục cuối bị bỏ và có một mục đóng `{"cut": "[đã cắt]", "dropped": n}`. Một mục đã bỏ giá trị nặng khoảng 70–700 byte → cần khoảng 85–850 lời gọi ghi trong MỘT lượt; `actions` đặt lại mỗi lượt và `REASON_MAX_TOKENS = 4096`. Phán: thật nhưng không chặn; là giới hạn còn lại, báo team-leader và ghi vào As-Built. Muốn bỏ hẳn giới hạn này phải đổi kiểu cột (migration, quyết định thiết kế).
+- AC-35 ở ca vượt tổng: mục bị cắt còn công cụ, DocType, bản ghi, người ra lệnh và dấu cắt, không còn giá trị trước/sau. Giá trị trong `actions` vốn đã là bản cắt (T62: ≤ 20 trường, 200 ký tự). Phán: không chặn; giới hạn còn lại, báo team-leader.
+- RED của ca route là `DataError 1366` (MariaDB cắt giữa ký tự nhiều byte), cùng gốc "vượt cột" với 1406 của F-1 → không chặn.
+
+### Sau merge (tech-lead)
+- Merge `0558640` (`team/FEAT-004-task-64` @ `7894f04`). `cmd.test_one` test_agent_runner trên `0558640`, `PYTHONPATH` = worktree feat-004, cài đặt site đang lưu: `Ran 85 tests in 24.701s` / `FAILED (failures=3)`: đúng ba ca `TestRunnerL1Classification` (`test_l1_all_fields_skipped_reasons_logged_saves_ai_fields_applied_one`, `test_l1_applies_mapping_confidence_and_hint`, `test_l1_empty_route_still_saves_ai_fields_applied_one`), đỏ sẵn trên `abd2fa2` (bảng module của `acceptance-part-3.md`) vì site lưu `auto_assign_enabled=1`; không ca nào của T64. Không để trống cài đặt lần này vì site đang dùng chung với qa phần 1–2, FEAT-005, FEAT-007.
+
+### Deferred
+- Không có.

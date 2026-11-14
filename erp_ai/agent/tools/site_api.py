@@ -9,6 +9,8 @@ import json
 import re
 
 import frappe
+from frappe.model import table_fields
+from frappe.model.base_document import BaseDocument
 from frappe.utils import strip_html
 
 from erp_ai.agent.tools import read
@@ -186,11 +188,39 @@ def _shown_value(value):
 	return text[:VALUE_MAX]
 
 
+def _child_password_fields(meta, fieldname: str) -> frozenset:
+	"""The Password fields of the child DocType behind table field `fieldname`; empty for any other field."""
+	field = meta.get_field(fieldname)
+	if not field or field.fieldtype not in table_fields:
+		return frozenset()
+	return frozenset(
+		child.fieldname for child in frappe.get_meta(field.options).fields if child.fieldtype == "Password"
+	)
+
+
+def _plain(value):
+	"""`value` with every Document (a child row) turned into its dict, in nested lists and tuples."""
+	if isinstance(value, BaseDocument):
+		return value.as_dict()
+	if isinstance(value, list | tuple):
+		return [_plain(item) for item in value]
+	return value
+
+
+def _without_secrets(value, meta, fieldname: str):
+	"""`value` with the secrets of its child rows scrubbed at every depth (F-2), compared after decoding the way
+	Frappe hands rows over (Document, dict or JSON text); `value` itself when it holds none, so it shows as before."""
+	decoded = _parsed(_plain(value))
+	scrubbed = _scrub(decoded, _child_password_fields(meta, fieldname))
+	return value if scrubbed == decoded else scrubbed
+
+
 def _shown(doc, keys) -> dict:
-	"""The value of each key as held by `doc`, secret and system fields left out, each cut to VALUE_MAX."""
+	"""The value of each key as held by `doc`, secret and system fields left out, secrets of child rows scrubbed,
+	each cut to VALUE_MAX."""
 	record = doc.as_dict()
 	return {
-		key: _shown_value(record.get(key))
+		key: _shown_value(_without_secrets(record.get(key), doc.meta, key))
 		for key in keys
 		if key not in SYSTEM_FIELDS and not _is_secret(doc.meta, key)
 	}
@@ -379,17 +409,18 @@ def _parsed(value):
 	return value
 
 
-def _scrub(value):
-	"""`value` with the value of every key in SECRET_RESULT_KEYS replaced, in nested dicts, lists and tuples."""
+def _scrub(value, extra_keys=frozenset()):
+	"""`value` with the value of every key in SECRET_RESULT_KEYS (or `extra_keys`) replaced, in nested dicts, lists
+	and tuples."""
 	if isinstance(value, dict):
 		return {
 			key: SCRUBBED_VALUE
-			if isinstance(key, str) and key.casefold() in SECRET_RESULT_KEYS
-			else _scrub(item)
+			if isinstance(key, str) and (key.casefold() in SECRET_RESULT_KEYS or key in extra_keys)
+			else _scrub(item, extra_keys)
 			for key, item in value.items()
 		}
 	if isinstance(value, list | tuple):
-		return [_scrub(item) for item in value]
+		return [_scrub(item, extra_keys) for item in value]
 	return value
 
 

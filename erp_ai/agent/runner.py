@@ -90,6 +90,12 @@ RECORD_TOOLS = frozenset(
 	("api_create_record", "api_update_record", "api_delete_record", "api_submit_record", "api_call_method")
 )
 ACTION_DOCTYPE_MAX = 80
+# `ERP AI Log.actions` is a Small Text column: MariaDB `text`, 65535 bytes. The JSON the runner stores there
+# stays within ACTIONS_MAX_BYTES (utf-8); each string in it within ACTION_VALUE_MAX_BYTES. A cut is marked.
+ACTIONS_MAX_BYTES = 60000
+ACTION_VALUE_MAX_BYTES = 1024
+ACTION_CUT_MARKER = "[đã cắt]"
+ACTION_VALUE_KEYS = ("value_before", "value_after")
 PROPOSE_TOOLS = ("propose_file_change", "propose_new_file", "propose_bench_command")
 PROPOSE_STEP = "propose"
 UNPARSEABLE_ERROR = "UNPARSEABLE: không phân loại được"
@@ -522,7 +528,10 @@ def _check_sla(category, context, actions, lines):
 
 def _record_route(log_name, result, decision, assigned, task, actions, errors):
 	"""Update the `classify` entry once (design 3.5)."""
-	updates = {"applied": 1 if result else 0, "actions": json.dumps(actions, ensure_ascii=False)}
+	updates = {
+		"applied": 1 if result else 0,
+		"actions": json.dumps(_bounded_actions(actions), ensure_ascii=False),
+	}
 	if result:
 		before = {"ticket": result["before"]} if result.get("before") else {}
 		after = {"ticket": result["after"]} if result.get("after") else {}
@@ -655,7 +664,7 @@ def _reason(ticket_name, trigger, run_id, settings, context, classification, dea
 				stop_reason=stop_reason,
 				tools_called=[block["name"] for block in tool_blocks] or None,
 				error="; ".join([*tool_errors, *status.take_errors()]) or None,
-				actions=actions or None,
+				actions=_bounded_actions(actions) if actions else None,
 				value_before=before or None,
 				value_after=after or None,
 				skipped_fields=skipped or None,
@@ -741,3 +750,67 @@ def _action(name, context, outcome, ok, arguments):
 		action["value_after"] = written.get("value_after")
 		action["instructor"] = context.instructor
 	return action
+
+
+def _stored_bytes(value) -> int:
+	"""Size of `value` as `write_entry` stores it (utf-8 JSON)."""
+	return len(json.dumps(value, ensure_ascii=False).encode("utf-8"))
+
+
+def _cut_strings(value):
+	"""`value` with every string longer than ACTION_VALUE_MAX_BYTES cut on a character boundary and marked."""
+	if isinstance(value, str):
+		data = value.encode("utf-8")
+		if len(data) <= ACTION_VALUE_MAX_BYTES:
+			return value
+		room = ACTION_VALUE_MAX_BYTES - len(ACTION_CUT_MARKER.encode("utf-8"))
+		return data[:room].decode("utf-8", errors="ignore") + ACTION_CUT_MARKER
+	if isinstance(value, dict):
+		return {key: _cut_strings(item) for key, item in value.items()}
+	if isinstance(value, list | tuple):
+		return [_cut_strings(item) for item in value]
+	return value
+
+
+def _without_values(entry):
+	"""`entry` with its before/after values replaced by the marker; who, what and the outcome stay."""
+	if not isinstance(entry, dict):
+		return entry
+	return {
+		key: ACTION_CUT_MARKER if key in ACTION_VALUE_KEYS and value is not None else value
+		for key, value in entry.items()
+	}
+
+
+def _bounded_actions(actions) -> list:
+	"""The turn's `actions` cut to fit the `actions` column: at most ACTIONS_MAX_BYTES as stored (F-1).
+
+	Each string is first cut to ACTION_VALUE_MAX_BYTES. When the list is still too large, entries lose their
+	before/after values to the marker, the costliest values first, so as many entries as fit keep theirs.
+	Every entry stays (one per tool call) unless even the entries without values do not fit: then the last
+	ones are dropped and one closing `{"cut": marker, "dropped": count}` entry says how many.
+	"""
+	entries = [_cut_strings(entry) for entry in actions]
+	if _stored_bytes(entries) <= ACTIONS_MAX_BYTES:
+		return entries
+	bare = [_without_values(entry) for entry in entries]
+	# replacing one list item changes the stored size by exactly the difference of the two items
+	costs = [
+		_stored_bytes(entry) - _stored_bytes(stripped) for entry, stripped in zip(entries, bare, strict=True)
+	]
+	room = ACTIONS_MAX_BYTES - _stored_bytes(bare)
+	if room >= 0:
+		kept = list(bare)
+		for index in sorted(range(len(entries)), key=costs.__getitem__):
+			if costs[index] > room:
+				break
+			kept[index] = entries[index]
+			room -= costs[index]
+		return kept
+	while bare and _stored_bytes([*bare, _dropped_entry(len(entries) - len(bare))]) > ACTIONS_MAX_BYTES:
+		bare.pop()
+	return [*bare, _dropped_entry(len(entries) - len(bare))]
+
+
+def _dropped_entry(count: int) -> dict:
+	return {"cut": ACTION_CUT_MARKER, "dropped": count}

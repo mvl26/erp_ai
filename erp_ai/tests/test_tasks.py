@@ -1,11 +1,13 @@
-from datetime import datetime
+from contextlib import contextmanager
+from datetime import datetime, timedelta
 from unittest.mock import patch
 
 import frappe
 from frappe.tests.utils import FrappeTestCase
 
 from erp_ai import hooks, tasks
-from erp_ai.agent import run_log
+from erp_ai.agent import run_log, runner
+from erp_ai.agent.tools.registry import ToolContext, execute_tool
 from erp_ai.constants import (
 	AGENT_USER,
 	CREDENTIAL_DOCTYPE,
@@ -21,6 +23,7 @@ from erp_ai.constants import (
 	TRIGGER_CHANGE_ACTION,
 	TRIGGER_TICKET_INSERT,
 )
+from erp_ai.erp_ai_agent.doctype.erp_ai_setting import erp_ai_setting
 from erp_ai.gateway import client
 from erp_ai.test_utils import add_credential, make_change_proposal, set_agent_settings
 
@@ -30,6 +33,14 @@ THIS_MONTH = datetime(2031, 11, 3, 9, 0, 0)
 LAST_MONTH = datetime(2031, 10, 31, 23, 59, 59)
 FIRST_OF_MONTH = datetime(2031, 11, 1, 0, 0, 0)
 NEXT_MONTH = datetime(2031, 12, 1, 0, 0, 0)
+# The privilege alarm reads ERP AI Log in (watermark, upper]: real rows are older than the far-future watermark.
+WATERMARK = datetime(2031, 11, 15, 8, 0, 0)
+SEEDED_AT = datetime(2031, 11, 15, 8, 10, 0)
+RUN_AT = datetime(2031, 11, 15, 9, 0, 0)
+UPPER = RUN_AT - timedelta(seconds=300)
+PERMISSION_SUBJECT = "Agent đã sửa bản ghi phân quyền"
+INSTRUCTOR = "erpai-tasks-boss@example.invalid"
+PROFILE_PREFIX = "ERPAI-TEST hồ sơ"
 
 
 def _add_log(cost_usd, label, creation):
@@ -47,6 +58,11 @@ def _add_log(cost_usd, label, creation):
 	).insert(ignore_permissions=True)
 	frappe.db.set_value(LOG_DOCTYPE, doc.name, "creation", creation, update_modified=False)
 	return doc.name
+
+
+def _hand_action(tool, doctype, name, ok=True):
+	"""An action entry of a `reason` row as the runner writes it, for cases the tools cannot seed."""
+	return {"tool": tool, "doctype": doctype, "name": name, "ok": ok, "instructor": INSTRUCTOR}
 
 
 class TestRecomputeMonthlySpend(FrappeTestCase):
@@ -212,6 +228,81 @@ class TestCheckPrivilegeEscalation(FrappeTestCase):
 		for role in (ROLE_AGENT, HELPDESK_AGENT_ROLE):
 			self._add_role(role)
 		self._neutralize_agent_rows()
+		# Real ERP AI Log rows of the site are older than this watermark, so only seeded rows are read.
+		frappe.db.set_single_value(SETTING_DOCTYPE, "privilege_alert_checked_until", WATERMARK)
+		if not frappe.db.exists("User", INSTRUCTOR):
+			frappe.get_doc(
+				{"doctype": "User", "email": INSTRUCTOR, "first_name": "ERPAI-TEST", "send_welcome_email": 0}
+			).insert(ignore_permissions=True)
+		self.addCleanup(frappe.clear_cache, user=AGENT_USER)
+
+	@contextmanager
+	def _as_agent(self):
+		# Only System Manager may write Role Profile / User Permission: granted to the agent for the seeding only.
+		self._add_role("System Manager")
+		frappe.clear_cache(user=AGENT_USER)
+		frappe.set_user(AGENT_USER)
+		try:
+			yield
+		finally:
+			frappe.set_user("Administrator")
+			frappe.db.delete(
+				"Has Role", {"parent": AGENT_USER, "parenttype": "User", "role": "System Manager"}
+			)
+			frappe.clear_cache(user=AGENT_USER)
+
+	def _log_row(
+		self, actions, before=None, after=None, instructor=INSTRUCTOR, at=SEEDED_AT, entry_type="reason"
+	):
+		"""Write one ERP AI Log row in the runner's shape (design-amd2 §2) and back-date its `creation`."""
+		name = run_log.write_entry(
+			run_id="ERPAI-TEST-run",
+			entry_type=entry_type,
+			trigger=TRIGGER_TICKET_INSERT,
+			turn=1,
+			instructor=instructor,
+			actions=actions,
+			value_before=before or None,
+			value_after=after or None,
+		)
+		frappe.db.set_value(LOG_DOCTYPE, name, "creation", at, update_modified=False)
+		return name
+
+	def _agent_calls(self, *calls, at=SEEDED_AT, instructor=INSTRUCTOR):
+		"""Run generic write tools as the agent account and log them as one `reason` row, as the runner does.
+		Returns the name of each written record."""
+		context = ToolContext(
+			ticket_name="",
+			effective_level="L3",
+			instructor=instructor,
+			run_id="ERPAI-TEST-run",
+			category_mapping={},
+			agent_user=AGENT_USER,
+			change_enabled=True,
+		)
+		actions, before, after = [], {}, {}
+		with self._as_agent():
+			for tool, arguments in calls:
+				outcome = execute_tool(tool, arguments, context)
+				self.assertTrue(outcome.get("ok"), outcome)
+				actions.append(runner._action(tool, context, outcome, True, arguments))
+				runner._record_snapshot(tool, outcome, len(actions), before, after)
+			self._log_row(actions, before, after, instructor, at)
+		return [action["name"] for action in actions]
+
+	def _create_profile(self, label, at=SEEDED_AT):
+		values = {"role_profile": f"{PROFILE_PREFIX} {label}", "roles": [{"role": "Desk User"}]}
+		return self._agent_calls(("api_create_record", {"doctype": "Role Profile", "values": values}), at=at)[
+			0
+		]
+
+	def _changes(self, lower=WATERMARK, upper=UPPER):
+		return tasks._privilege_changes_by_agent(lower, upper)
+
+	def _permission_alarm(self):
+		messages = [m for m in self._alarm_messages() if m.startswith(f"{PERMISSION_SUBJECT}:")]
+		self.assertEqual(len(messages), 1, self._alarm_messages())
+		return messages[0]
 
 	def _neutralize_agent_rows(self):
 		# Live rows attributed to the agent must not influence the permission-record and
@@ -229,7 +320,7 @@ class TestCheckPrivilegeEscalation(FrappeTestCase):
 		frappe.db.set_value("Webhook", {"owner": AGENT_USER}, "enabled", 0)
 
 	def _run(self):
-		tasks.check_privilege_escalation()
+		tasks.check_privilege_escalation(now=RUN_AT)
 		self.log_error.assert_not_called()
 
 	def _add_role(self, role):
@@ -345,19 +436,187 @@ class TestCheckPrivilegeEscalation(FrappeTestCase):
 		self.assertIn(ROLE_AGENT, self._alarm_messages()[0])
 
 	def test_alarm_on_permission_records_modified_by_agent(self):
-		name = self._add_perm(AGENT_USER)
+		profile, permission = self._agent_calls(
+			(
+				"api_create_record",
+				{
+					"doctype": "Role Profile",
+					"values": {"role_profile": f"{PROFILE_PREFIX} 1", "roles": [{"role": "Desk User"}]},
+				},
+			),
+			(
+				"api_create_record",
+				{
+					"doctype": "User Permission",
+					"values": {"user": INSTRUCTOR, "allow": "Role", "for_value": "Desk User"},
+				},
+			),
+		)
+		self._agent_calls(
+			(
+				"api_update_record",
+				{"doctype": "Role Profile", "name": profile, "values": {"roles": [{"role": "Desk User"}]}},
+			),
+			at=datetime(2031, 11, 15, 8, 20, 0),
+		)
+		# DocType rows are built by hand: saving a real DocType runs DDL, which commits implicitly.
+		old_perms = [{"role": "Desk User", "read": 1}]
+		new_perms = [{"role": "Desk User", "read": 1, "write": 1}]
+		for name, after_perms, at in (
+			("Note", new_perms, datetime(2031, 11, 15, 8, 30, 0)),
+			("ToDo", old_perms, datetime(2031, 11, 15, 8, 40, 0)),
+		):
+			self._log_row(
+				[_hand_action("api_update_record", "DocType", name)],
+				{"api_update_record#1": {"name": name, "permissions": old_perms}},
+				{"api_update_record#1": {"name": name, "permissions": after_perms}},
+				at=at,
+			)
 
 		self._run()
 
 		self.assertEqual(self.send_alarm.call_count, 1)
-		self.assertIn(name, self._alarm_messages()[0])
+		self.assertEqual(
+			self._alarm_messages()[0],
+			"Agent đã sửa bản ghi phân quyền: "
+			"tạo Role Profile ERPAI-TEST hồ sơ 1 (người ra lệnh erpai-tasks-boss@example.invalid, 2031-11-15 08:10), "
+			f"tạo User Permission {permission} (người ra lệnh erpai-tasks-boss@example.invalid, 2031-11-15 08:10), "
+			"sửa Role Profile ERPAI-TEST hồ sơ 1 (người ra lệnh erpai-tasks-boss@example.invalid, 2031-11-15 08:20), "
+			"sửa DocType Note (người ra lệnh erpai-tasks-boss@example.invalid, 2031-11-15 08:30)",
+		)
 
 	def test_permission_record_modified_by_someone_else_does_not_alarm(self):
+		frappe.get_doc("User", INSTRUCTOR).add_roles("Desk User")
 		self._add_perm("Administrator")
+		# Stamped as the agent but with no log row: `modified_by` is not read any more (ADR-024 QĐ 1).
+		self._add_perm(AGENT_USER)
 
 		self._run()
 
 		self.send_alarm.assert_not_called()
+
+	def test_window_excludes_watermark_includes_upper_in_creation_order(self):
+		for name, at in (
+			("at-watermark", WATERMARK),
+			("at-upper", UPPER),
+			("after-upper", UPPER + timedelta(seconds=1)),
+			("inside", WATERMARK + timedelta(seconds=1)),
+		):
+			self._log_row([_hand_action("api_update_record", "Custom DocPerm", name)], at=at)
+
+		self.assertEqual(
+			self._changes(),
+			[
+				"sửa Custom DocPerm inside (người ra lệnh erpai-tasks-boss@example.invalid, 2031-11-15 08:00)",
+				"sửa Custom DocPerm at-upper (người ra lệnh erpai-tasks-boss@example.invalid, 2031-11-15 08:55)",
+			],
+		)
+
+	def test_job_reads_watermark_and_settled_upper_bound(self):
+		with (
+			patch.object(tasks, "_privilege_changes_by_agent", return_value=[]) as changes,
+			patch.object(tasks, "now_datetime", return_value=RUN_AT),
+		):
+			tasks.check_privilege_escalation()
+			tasks.check_privilege_escalation(now="2031-11-16 09:00:00")
+
+		self.assertEqual(
+			[call.args for call in changes.call_args_list],
+			[(WATERMARK, datetime(2031, 11, 15, 8, 55, 0)), (WATERMARK, datetime(2031, 11, 16, 8, 55, 0))],
+		)
+
+	def _set_raw_watermark(self, raw):
+		"""Leave this raw text in tabSingles (None = no row at all), as a fresh site or an old save may."""
+		frappe.db.delete("Singles", {"doctype": SETTING_DOCTYPE, "field": "privilege_alert_checked_until"})
+		if raw is not None:
+			frappe.db.sql(
+				"insert into `tabSingles` (doctype, field, value) values (%s, %s, %s)",
+				(SETTING_DOCTYPE, "privilege_alert_checked_until", raw),
+			)
+
+	def test_empty_watermark_reads_from_the_start(self):
+		self._log_row(
+			[_hand_action("api_update_record", "Custom DocPerm", "a-year-ago")],
+			at=datetime(2030, 11, 15, 9, 0, 0),
+		)
+
+		# Frappe 15 casts these raw forms to datetime(1, 1, 1) or None: all mean "never alarmed" (design-amd2 §2).
+		for raw in (None, "", "0001-01-01 00:00:00"):
+			with self.subTest(raw=raw):
+				self._set_raw_watermark(raw)
+
+				self.assertIsNone(erp_ai_setting.read_privilege_watermark())
+				with patch.object(tasks, "_privilege_changes_by_agent", return_value=[]) as changes:
+					self._run()
+				changes.assert_called_once_with(None, UPPER)
+				self.assertIn(
+					"sửa Custom DocPerm a-year-ago (người ra lệnh erpai-tasks-boss@example.invalid, 2030-11-15 09:00)",
+					self._changes(lower=None),
+				)
+
+	def test_doctype_write_without_permissions_change_not_listed(self):
+		perms = [{"role": "Desk User", "read": 1}]
+		self._log_row(
+			[
+				_hand_action("api_update_record", "DocType", "Note"),
+				_hand_action("api_update_record", "DocType", "ToDo"),
+			],
+			{
+				"api_update_record#1": {"name": "Note", "description": "old", "permissions": perms},
+				"api_update_record#2": {"name": "ToDo", "description": "old"},
+			},
+			{
+				"api_update_record#1": {"name": "Note", "description": "new", "permissions": perms},
+				"api_update_record#2": {"name": "ToDo", "description": "new"},
+			},
+		)
+
+		self.assertEqual(self._changes(), [])
+
+	def test_only_ok_generic_writes_on_permission_doctypes_are_listed(self):
+		perms = [{"role": "Desk User", "read": 1}]
+		self._log_row(
+			[
+				_hand_action("api_update_record", "Custom DocPerm", "refused", ok=False),
+				_hand_action("api_update_record", "Has Role", "has-role-row"),
+				_hand_action("api_call_method", "Custom DocPerm", "called"),
+				_hand_action("api_update_record", "Note", "a-note"),
+				_hand_action("api_update_record", "DocType", "ToDo"),
+				_hand_action("api_delete_record", "User Permission", "up-1"),
+				_hand_action("api_submit_record", "Custom DocPerm", "perm-1"),
+				_hand_action("api_create_record", "Role", "ERPAI-TEST role"),
+				_hand_action("api_update_record", "DocType", "Note"),
+			],
+			{
+				"api_update_record#5": {"name": "ToDo", "permissions": perms},
+				"api_update_record#9": {"name": "Note", "permissions": perms},
+			},
+			{
+				"api_update_record#5": {"name": "ToDo", "permissions": perms},
+				"api_update_record#9": {"name": "Note", "permissions": []},
+			},
+		)
+
+		self.assertEqual(
+			self._changes(),
+			[
+				"xóa User Permission up-1 (người ra lệnh erpai-tasks-boss@example.invalid, 2031-11-15 08:10)",
+				"submit/hủy Custom DocPerm perm-1 (người ra lệnh erpai-tasks-boss@example.invalid, 2031-11-15 08:10)",
+				"tạo Role ERPAI-TEST role (người ra lệnh erpai-tasks-boss@example.invalid, 2031-11-15 08:10)",
+				"sửa DocType Note (người ra lệnh erpai-tasks-boss@example.invalid, 2031-11-15 08:10)",
+			],
+		)
+
+	def test_empty_instructor_is_named_unknown(self):
+		self._log_row([_hand_action("api_update_record", "Custom DocPerm", "x")], instructor=None)
+
+		self.assertEqual(self._changes(), ["sửa Custom DocPerm x (người ra lệnh không rõ, 2031-11-15 08:10)"])
+
+	def test_only_reason_rows_are_read(self):
+		for entry_type in ("classify", "skip"):
+			self._log_row([_hand_action("api_update_record", "Custom DocPerm", "x")], entry_type=entry_type)
+
+		self.assertEqual(self._changes(), [])
 
 	def test_setup_neutralizes_live_rows_attributed_to_agent(self):
 		self._add_perm(AGENT_USER)
@@ -427,8 +686,8 @@ class TestCheckPrivilegeEscalation(FrappeTestCase):
 		self.assertEqual(self.send_alarm.call_count, 1)
 
 	def test_one_alarm_per_condition(self):
+		self._create_profile(1)
 		self._add_role("System Manager")
-		self._add_perm(AGENT_USER)
 		self._add_server_script(AGENT_USER, disabled=0)
 		self._add_empty_key()
 
@@ -437,21 +696,38 @@ class TestCheckPrivilegeEscalation(FrappeTestCase):
 		self.assertEqual(self.send_alarm.call_count, 4)
 
 	def test_lists_at_most_five_names(self):
-		names = [self._add_perm(AGENT_USER) for _ in range(7)]
+		# Seeded newest first: the alarm still lists by `creation` ascending.
+		for minute in range(17, 10, -1):
+			self._create_profile(minute, at=datetime(2031, 11, 15, 8, minute, 0))
 
 		self._run()
 
-		message = self._alarm_messages()[0]
-		self.assertEqual(sum(name in message for name in names), 5)
-		self.assertIn("…và 2 mục khác", message)
+		self.assertEqual(
+			self._permission_alarm(),
+			"Agent đã sửa bản ghi phân quyền: "
+			"tạo Role Profile ERPAI-TEST hồ sơ 11 (người ra lệnh erpai-tasks-boss@example.invalid, 2031-11-15 08:11), "
+			"tạo Role Profile ERPAI-TEST hồ sơ 12 (người ra lệnh erpai-tasks-boss@example.invalid, 2031-11-15 08:12), "
+			"tạo Role Profile ERPAI-TEST hồ sơ 13 (người ra lệnh erpai-tasks-boss@example.invalid, 2031-11-15 08:13), "
+			"tạo Role Profile ERPAI-TEST hồ sơ 14 (người ra lệnh erpai-tasks-boss@example.invalid, 2031-11-15 08:14), "
+			"tạo Role Profile ERPAI-TEST hồ sơ 15 (người ra lệnh erpai-tasks-boss@example.invalid, 2031-11-15 08:15)"
+			" …và 2 mục khác",
+		)
 
 	def test_five_names_have_no_overflow_text(self):
-		for _ in range(5):
-			self._add_perm(AGENT_USER)
+		for minute in range(11, 16):
+			self._create_profile(minute, at=datetime(2031, 11, 15, 8, minute, 0))
 
 		self._run()
 
-		self.assertNotIn("mục khác", self._alarm_messages()[0])
+		self.assertEqual(
+			self._permission_alarm(),
+			"Agent đã sửa bản ghi phân quyền: "
+			"tạo Role Profile ERPAI-TEST hồ sơ 11 (người ra lệnh erpai-tasks-boss@example.invalid, 2031-11-15 08:11), "
+			"tạo Role Profile ERPAI-TEST hồ sơ 12 (người ra lệnh erpai-tasks-boss@example.invalid, 2031-11-15 08:12), "
+			"tạo Role Profile ERPAI-TEST hồ sơ 13 (người ra lệnh erpai-tasks-boss@example.invalid, 2031-11-15 08:13), "
+			"tạo Role Profile ERPAI-TEST hồ sơ 14 (người ra lệnh erpai-tasks-boss@example.invalid, 2031-11-15 08:14), "
+			"tạo Role Profile ERPAI-TEST hồ sơ 15 (người ra lệnh erpai-tasks-boss@example.invalid, 2031-11-15 08:15)",
+		)
 
 	def test_error_is_logged_and_rolled_back_not_raised(self):
 		frappe.db.savepoint("t34_before_job")
@@ -475,15 +751,15 @@ class TestCheckPrivilegeEscalation(FrappeTestCase):
 	def test_email_failure_keeps_alarm_logs_failure_and_continues(self):
 		self.send_alarm_patch.stop()
 		set_agent_settings(alert_recipients="erpai-test@example.invalid")
+		self._create_profile(1)
 		self._add_role("System Manager")
-		self._add_perm(AGENT_USER)
 		self._add_empty_key()
 
 		with (
 			patch("frappe.sendmail", side_effect=frappe.OutgoingEmailError("no account")) as sendmail,
 			patch.object(frappe.db, "rollback") as rollback,
 		):
-			tasks.check_privilege_escalation()
+			tasks.check_privilege_escalation(now=RUN_AT)
 
 		rollback.assert_not_called()
 		self.assertEqual(sendmail.call_count, 3)

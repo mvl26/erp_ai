@@ -196,10 +196,13 @@ def _shown(doc, keys) -> dict:
 	}
 
 
+def _filled_fields(record: dict) -> list:
+	return [key for key, value in record.items() if value not in EMPTY_VALUES]
+
+
 def _deleted_values(doc) -> dict:
 	"""The non-empty fields of a record about to be deleted, at most DELETED_FIELDS_MAX."""
-	filled = [key for key, value in doc.as_dict().items() if value not in EMPTY_VALUES]
-	return dict(list(_shown(doc, filled).items())[:DELETED_FIELDS_MAX])
+	return dict(list(_shown(doc, _filled_fields(doc.as_dict())).items())[:DELETED_FIELDS_MAX])
 
 
 def _snapshot_value(value):
@@ -327,10 +330,7 @@ def delete_record(args: dict, ctx: ToolContext) -> dict:
 	def delete():
 		doc = frappe.get_doc(doctype, name)
 		value_before = _deleted_values(doc)
-		filled = [
-			key for key, value in doc.as_dict(no_private_properties=True).items() if value not in EMPTY_VALUES
-		]
-		before = _snapshot(doc, filled)
+		before = _snapshot(doc, _filled_fields(doc.as_dict(no_private_properties=True)))
 		frappe.delete_doc(doctype, name)
 		return name, value_before, None, {"before": before, "after": None}
 

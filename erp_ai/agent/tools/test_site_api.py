@@ -72,7 +72,7 @@ def _calls_naming(doctype):
 
 
 def _without_snapshot(result):
-	"""The tool result as the model sees it: the runner takes `_snapshot` out (AC-13, asserted on its own)."""
+	"""The tool result less `_snapshot`, which is asserted on its own (AC-13)."""
 	return {key: value for key, value in result.items() if key != "_snapshot"}
 
 
@@ -527,6 +527,57 @@ class TestSiteApi(FrappeTestCase):
 			},
 		)
 		self.assertEqual(frappe.db.get_value("Webhook", WEBHOOK_NAME, "enabled"), 0)
+
+	def test_snapshot_keys_are_the_given_values_not_the_forced_ones(self):
+		values = {
+			"name": WEBHOOK_NAME,
+			"webhook_doctype": "Note",
+			"webhook_docevent": "after_insert",
+			"request_url": "https://example.com/siteapi",
+			"request_method": "POST",
+		}
+		created = self.create("Webhook", values)
+		self.assertTrue(created["ok"], created)
+		self.assertEqual(frappe.db.get_value("Webhook", WEBHOOK_NAME, "enabled"), 0)
+		self.assertIsNone(created["_snapshot"]["before"])
+		self.assertEqual(set(created["_snapshot"]["after"]), {"name", *values})
+		updated = self.update("Webhook", WEBHOOK_NAME, {"request_method": "PUT"})
+		self.assertTrue(updated["ok"], updated)
+		self.assertEqual(
+			updated["_snapshot"],
+			{
+				"before": {"name": WEBHOOK_NAME, "request_method": "POST"},
+				"after": {"name": WEBHOOK_NAME, "request_method": "PUT"},
+			},
+		)
+
+	def test_update_snapshot_holds_the_doctype_tables_and_the_saved_values(self):
+		from frappe.desk.doctype.note.note import Note
+
+		created = self.create("Note", {"title": NOTE_TITLE, "public": 1, "seen_by": [{"user": BOSS}]})
+		self.assertTrue(created["ok"], created)
+		content = frappe.db.get_value("Note", created["name"], "content")
+
+		def rewrite(note):
+			note.content = "SITEAPI-TEST đã chuẩn hóa"
+
+		with (
+			patch.dict(site_api.SNAPSHOT_TABLES, {"Note": ("seen_by",)}),
+			patch.object(Note, "validate", side_effect=rewrite, autospec=True, create=True),
+		):
+			result = self.update("Note", created["name"], {"content": "SITEAPI-TEST model gửi"})
+		seen_by = [{"docstatus": 0, "user": BOSS}]
+		self.assertEqual(
+			result["_snapshot"],
+			{
+				"before": {"name": created["name"], "content": content, "seen_by": seen_by},
+				"after": {
+					"name": created["name"],
+					"content": "SITEAPI-TEST đã chuẩn hóa",
+					"seen_by": seen_by,
+				},
+			},
+		)
 
 	def test_rename_is_refused(self):
 		created = self.create("Note", {"title": NOTE_TITLE, "public": 1})

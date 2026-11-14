@@ -6,7 +6,7 @@ import frappe
 from frappe import _
 from frappe.utils import get_datetime, now_datetime
 
-from erp_ai.constants import LEVELS, LOG_DOCTYPE, SETTING_DOCTYPE
+from erp_ai.constants import LEVELS, LOG_DOCTYPE, SETTING_DOCTYPE, TICKET_CONTENT_DOCTYPES
 
 OPT_OUT_FIELD = "ai_opt_out"
 EXCLUDED_TEAMS_FIELD = "excluded_teams"
@@ -145,3 +145,30 @@ def validate_change_apps(settings, apps_root: str) -> None:
 	for name in apps:
 		if not os.path.isdir(os.path.join(apps_root, name)):
 			frappe.throw(_("Không có thư mục apps/{0}").format(name))
+
+
+TICKET_DOCTYPE = "HD Ticket"
+
+
+def _stored_doctype_name(doctype) -> str | None:
+	"""The DocType's stored name (the collation matches "comment" to Comment), or None when there is none."""
+	return frappe.db.get_value("DocType", doctype, "name")
+
+
+def ticket_link_fieldnames(doctype: str) -> tuple[str, ...]:
+	"""Fields of this DocType (Custom Fields included, meta order) that Link to HD Ticket; () for HD Ticket itself
+	and for a missing DocType."""
+	name = _stored_doctype_name(doctype)
+	if not name or name == TICKET_DOCTYPE:
+		return ()
+	return tuple(
+		field.fieldname
+		for field in frappe.get_meta(name).fields
+		if field.fieldtype == "Link" and field.options == TICKET_DOCTYPE
+	)
+
+
+def is_ticket_content_doctype(doctype: str) -> bool:
+	"""ADR-034: a DocType of TICKET_CONTENT_DOCTYPES or one with a Link to HD Ticket carries ticket content."""
+	name = _stored_doctype_name(doctype)
+	return bool(name) and (name in TICKET_CONTENT_DOCTYPES or bool(ticket_link_fieldnames(name)))

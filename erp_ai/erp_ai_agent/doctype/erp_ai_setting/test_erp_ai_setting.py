@@ -1572,3 +1572,115 @@ class TestManualsDir(FrappeTestCase):
 			with self.subTest(typed=typed):
 				self.assertIsNone(self._save(typed))
 				self.assertEqual(self._stored(), "")
+
+
+def _report_error(typed, reason):
+	return f"Báo cáo '{typed}' {reason}"
+
+
+def _ticket_based_reason(doctype):
+	return f"dựa trên {doctype}, mang nội dung phiếu hoặc dữ liệu của app: bot không được chạy"
+
+
+class TestAllowedReports(FrappeTestCase):
+	def setUp(self):
+		self.addCleanup(frappe.db.rollback)
+		keep_agent_settings(self)
+		self.assertTrue(
+			frappe.get_meta(SETTING_DOCTYPE).has_field("allowed_reports"),
+			"ERP AI Setting has no allowed_reports",
+		)
+		self.assertIsNone(self._save(""))
+
+	def _report(self, name, ref_doctype="Note", report_type="Query Report", disabled=0):
+		"""A Report row of this test (raw insert: Report.validate needs Script Manager and may export files)."""
+		frappe.get_doc(
+			{
+				"doctype": "Report",
+				"name": name,
+				"report_name": name,
+				"ref_doctype": ref_doctype,
+				"report_type": report_type,
+				"is_standard": "No",
+				"disabled": disabled,
+			}
+		).db_insert()
+		return name
+
+	def _save(self, value, **fields):
+		"""Save the setting with this allowed_reports (and fields); return the error text, or None when it saved."""
+		doc = frappe.get_doc(SETTING_DOCTYPE)
+		doc.update({"allowed_reports": value, **fields})
+		try:
+			doc.save()
+		except frappe.ValidationError as error:
+			return str(error)
+		return None
+
+	def _stored(self):
+		return frappe.db.get_single_value(SETTING_DOCTYPE, "allowed_reports", cache=False) or ""
+
+	def test_unknown_type_disabled_ticket_based_blocked(self):
+		# AC-49, E-6: an unknown name (escaped), a type other than Script/Query Report, a disabled report and a
+		# report on a DocType of TICKET_CONTENT_DOCTYPES are refused on any line; the stored value holds.
+		safe = self._report("ERP AI Test BC an toàn")
+		self.assertIsNone(self._save(safe))
+		cases = [
+			("ERP AI Test BC không có", _report_error("ERP AI Test BC không có", "không có")),
+			("<b>x</b>", _report_error("&lt;b&gt;x&lt;/b&gt;", "không có")),
+		]
+		for report_type in ("Report Builder", "Custom Report"):
+			name = self._report(f"ERP AI Test BC {report_type}", report_type=report_type)
+			cases.append((name, _report_error(name, "phải là Script Report hoặc Query Report")))
+		for report_type in ("Query Report", "Script Report"):
+			name = self._report(f"ERP AI Test BC tắt {report_type}", report_type=report_type, disabled=1)
+			cases.append((name, _report_error(name, "đang tắt")))
+		for doctype in ("HD Ticket", "Comment", "Communication", "File"):
+			name = self._report(f"ERP AI Test BC trên {doctype}", ref_doctype=doctype)
+			cases.append((name, _report_error(name, _ticket_based_reason(doctype))))
+		for typed, error in cases:
+			with self.subTest(typed=typed):
+				self.assertEqual(self._save(f"{safe}\n\n  {typed} \n{safe}"), error)
+				self.assertEqual(self._stored(), safe)
+		# design.md step 7 before step 8: a bad report is reported before a bad manuals directory.
+		self.assertEqual(
+			self._save("ERP AI Test BC không có", manuals_dir="khong_co_thu_muc_nay"),
+			_report_error("ERP AI Test BC không có", "không có"),
+		)
+
+	def test_log_based_report_blocked(self):
+		# AC-49, ADR-034 QĐ 3: a report on a DocType the read tools deny (app data) is refused, read live from
+		# read.denied_doctypes().
+		for doctype in ("ERP AI Log", "ERP AI Setting", "User"):
+			name = self._report(f"ERP AI Test BC trên {doctype}", ref_doctype=doctype)
+			with self.subTest(doctype=doctype):
+				self.assertEqual(self._save(name), _report_error(name, _ticket_based_reason(doctype)))
+				self.assertEqual(self._stored(), "")
+		name = self._report("ERP AI Test BC trên Note")
+		self.assertIsNone(self._save(name))
+		original = read.denied_doctypes
+		with patch.object(read, "denied_doctypes", lambda: original() | {"Note"}):
+			self.assertEqual(self._save(name), _report_error(name, _ticket_based_reason("Note")))
+		self.assertEqual(self._stored(), name)
+
+	def test_report_on_ticket_linked_doctype_blocked(self):
+		# design-w0-fixes-3.md ruling 2, C-T15-5: a DocType with a Link to HD Ticket (the legacy ticket comment
+		# by its standard field, Task by erp_ai's Custom Field) carries ticket content.
+		for doctype in ("HD Ticket Comment", "Task"):
+			name = self._report(f"ERP AI Test BC trên {doctype}", ref_doctype=doctype)
+			with self.subTest(doctype=doctype):
+				self.assertEqual(self._save(name), _report_error(name, _ticket_based_reason(doctype)))
+				self.assertEqual(self._stored(), "")
+
+	def test_safe_report_saves(self):
+		# AC-49: enabled Script and Query Reports on a DocType without ticket content save as typed; blank lines
+		# are ignored; a blank value saves.
+		query = self._report("ERP AI Test BC Query")
+		script = self._report("ERP AI Test BC Script", ref_doctype="ToDo", report_type="Script Report")
+		value = f"  {query}\n\n{script}\t\n"
+		self.assertIsNone(self._save(value))
+		self.assertEqual(self._stored(), value)
+		for typed in ("", "\n  \n", None):
+			with self.subTest(typed=typed):
+				self.assertIsNone(self._save(typed))
+				self.assertEqual(self._stored(), typed or "")

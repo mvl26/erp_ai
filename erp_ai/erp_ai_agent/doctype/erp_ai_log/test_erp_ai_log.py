@@ -1,7 +1,11 @@
+import json
+
 import frappe
 from frappe.tests.utils import FrappeTestCase
 
+from erp_ai.agent import run_log
 from erp_ai.constants import HELPDESK_AGENT_ROLE, LOG_DOCTYPE, ROLE_AGENT
+from erp_ai.test_utils import keep_agent_settings
 
 AI_USER = "erp-ai-log-agent@example.com"
 HD_AGENT_USER = "erp-ai-log-hd-agent@example.com"
@@ -39,6 +43,9 @@ LOG_FIELDS = (
 	"human_corrected_at",
 	"error",
 )
+
+
+SMALL_TEXT_MAX_BYTES = 65535
 
 
 def _make_user(email, role):
@@ -136,3 +143,42 @@ class TestERPAILog(FrappeTestCase):
 			self.assertFalse(frappe.has_permission(LOG_DOCTYPE, ptype, doc=doc), ptype)
 		with self.assertRaises(frappe.PermissionError):
 			frappe.delete_doc(LOG_DOCTYPE, doc.name)
+
+
+def _actions_just_over_small_text(byte_size):
+	"""One `actions` entry whose JSON is exactly `byte_size` UTF-8 bytes, mostly 3-byte Vietnamese letters."""
+	entry = {"action": "post_comment", "note": ""}
+	base = len(json.dumps([entry], ensure_ascii=False).encode("utf-8"))
+	letters, ascii_tail = divmod(byte_size - base, len("ệ".encode()))
+	entry["note"] = "ệ" * letters + "a" * ascii_tail
+	return [entry]
+
+
+class TestActionsLongText(FrappeTestCase):
+	"""FEAT-007 D-6 / F-6: `actions` is Long Text, so a JSON list over the old 64 KB Small Text limit fits."""
+
+	def setUp(self):
+		self.addCleanup(frappe.db.rollback)
+		self.addCleanup(frappe.set_user, "Administrator")
+		frappe.set_user("Administrator")
+		keep_agent_settings(self)
+
+	def test_write_entry_actions_over_65535_bytes_round_trips(self):
+		actions = _actions_just_over_small_text(SMALL_TEXT_MAX_BYTES + 1)
+		written = json.dumps(actions, ensure_ascii=False)
+		# Over the limit in bytes only: the character count stays far below it.
+		self.assertEqual(len(written.encode("utf-8")), SMALL_TEXT_MAX_BYTES + 1)
+		self.assertLess(len(written), SMALL_TEXT_MAX_BYTES)
+		name = run_log.write_entry(entry_type="reason", trigger="ticket_insert", actions=actions)
+		self.assertEqual(frappe.db.get_value(LOG_DOCTYPE, name, "actions"), written)
+
+	def test_actions_fieldtype_long_text(self):
+		self.assertEqual(frappe.get_meta(LOG_DOCTYPE).get_field("actions").fieldtype, "Long Text")
+
+	def test_actions_column_is_longtext(self):
+		data_type = frappe.db.sql(
+			"""select DATA_TYPE from information_schema.columns
+			where table_schema = database() and table_name = %s and column_name = %s""",
+			(f"tab{LOG_DOCTYPE}", "actions"),
+		)
+		self.assertEqual(data_type[0][0].lower(), "longtext")

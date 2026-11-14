@@ -2372,6 +2372,20 @@ class TestPromptOverrides(FrappeTestCase):
 			],
 		)
 
+	def test_revision_row_names_the_saving_user(self):
+		# AC-38 "who": the session user, not the Single's owner (Administrator in the test runner).
+		editor = "erp-ai-prompt-editor@example.com"
+		user = frappe.new_doc("User")
+		user.update({"email": editor, "first_name": "Prompt Editor", "send_welcome_email": 0})
+		user.append("roles", {"role": "System Manager"})
+		user.insert(ignore_permissions=True)
+		self.addCleanup(frappe.set_user, "Administrator")
+		frappe.set_user(editor)
+		self.assertIsNone(self._save_at(REVISION_MOMENTS[0], prompt_override_classify=CLASSIFY_A))
+		self.assertEqual(
+			self._revisions(), [(1, "classify", editor, REVISION_MOMENTS[0], "", len(CLASSIFY_A))]
+		)
+
 	def test_revision_row_when_override_cleared(self):
 		# Back to the built-in part: the row keeps the old override and a new length of 0.
 		self.assertIsNone(self._save_at(REVISION_MOMENTS[0], prompt_override_classify=CLASSIFY_A))

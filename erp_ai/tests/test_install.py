@@ -15,6 +15,7 @@ from erp_ai.constants import (
 	ROLE_INSTRUCTOR,
 	SETTING_DOCTYPE,
 )
+from erp_ai.test_utils import keep_agent_settings
 
 AI_FIELDS = (
 	"ai_section",
@@ -30,6 +31,17 @@ AI_FIELDS = (
 TEMPLATE = "Default"
 
 AUTOMATIC_ROLES = {"Guest", "All", "Administrator", "Desk User"}
+
+# FEAT-007 AC-1: switches (1) and (4) existed before FEAT-007; (2), (3), (5) are new.
+OLD_SWITCHES = ("unrestricted_enabled", "code_change_enabled")
+NEW_SWITCHES = ("record_tools_enabled", "act_now_enabled", "one_click_approval_enabled")
+FIVE_SWITCHES = (
+	"unrestricted_enabled",
+	"record_tools_enabled",
+	"act_now_enabled",
+	"code_change_enabled",
+	"one_click_approval_enabled",
+)
 
 
 def _agent_roles():
@@ -625,3 +637,46 @@ class TestInstall(FrappeTestCase):
 		install.before_uninstall()
 		install.before_uninstall()
 		self.assertEqual(_counts()["status_scripts"], 0)
+
+
+def _stored_settings():
+	return dict(frappe.db.sql("select field, value from `tabSingles` where doctype=%s", SETTING_DOCTYPE))
+
+
+class TestFeat007Migrate(FrappeTestCase):
+	def setUp(self):
+		frappe.db.rollback()
+		self.addCleanup(frappe.db.rollback)
+		keep_agent_settings(self)
+		# Custom fields already exist (migrate); never let a create path run DDL (implicit commit).
+		patcher = patch.object(frappe.db, "updatedb")
+		patcher.start()
+		self.addCleanup(patcher.stop)
+
+	def test_fresh_install_five_switches_off(self):
+		frappe.db.delete("Singles", {"doctype": SETTING_DOCTYPE})
+		install.ensure_setup()
+		stored = _stored_settings()
+		self.assertEqual(
+			{name: stored.get(name, "<missing>") for name in FIVE_SWITCHES}, dict.fromkeys(FIVE_SWITCHES, "0")
+		)
+
+	def test_migrate_keeps_old_switches_new_switches_off(self):
+		frappe.db.delete("Singles", {"doctype": SETTING_DOCTYPE, "field": ("in", FIVE_SWITCHES)})
+		for name in OLD_SWITCHES:
+			frappe.db.set_single_value(SETTING_DOCTYPE, name, 1)
+		install.after_migrate()
+		stored = _stored_settings()
+		self.assertEqual(
+			{name: stored.get(name, "<missing>") for name in FIVE_SWITCHES},
+			{**dict.fromkeys(OLD_SWITCHES, "1"), **dict.fromkeys(NEW_SWITCHES, "0")},
+		)
+
+	def test_second_migrate_changes_nothing(self):
+		frappe.db.delete("Singles", {"doctype": SETTING_DOCTYPE, "field": ("in", FIVE_SWITCHES)})
+		frappe.db.set_single_value(SETTING_DOCTYPE, "code_change_enabled", 1)
+		install.after_migrate()
+		first = _stored_settings()
+		self.assertLessEqual(set(FIVE_SWITCHES), set(first))
+		install.after_migrate()
+		self.assertEqual(_stored_settings(), first)

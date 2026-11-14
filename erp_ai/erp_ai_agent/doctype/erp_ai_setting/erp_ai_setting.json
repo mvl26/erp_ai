@@ -7,8 +7,12 @@
   "section_activation",
   "enabled",
   "permission_level",
-  "unrestricted_enabled",
   "section_permissions",
+  "unrestricted_enabled",
+  "record_tools_enabled",
+  "act_now_enabled",
+  "code_change_enabled",
+  "one_click_approval_enabled",
   "site_environment",
   "section_limits",
   "max_turns_per_run",
@@ -35,7 +39,6 @@
   "routing_rules",
   "prompt_digest",
   "section_code_change",
-  "code_change_enabled",
   "code_change_apps",
   "section_alerts",
   "alert_recipients",
@@ -60,19 +63,47 @@
    "label": "Mức quyền",
    "options": "L0\nL1\nL2\nL3",
    "default": "L0",
-   "description": "L0: chỉ phân loại phiếu mới và ghi vào Log, không sửa phiếu, không trả lời bình luận. L1: đọc dữ liệu, ghi phân loại hoặc gợi ý lên phiếu, đăng bình luận. L2 có đúng bộ công cụ như L1. L3 thêm công cụ tạo, sửa bản ghi và đề xuất sửa code khi bật ô Cho phép sửa code và lệnh bench. Khi đã chi vượt ngân sách tháng thì tự hạ về L1 (L0 giữ nguyên)."
+   "description": "L0: chỉ phân loại phiếu mới, ghi vào Log, không sửa phiếu, không trả lời bình luận. L1: đọc dữ liệu, ghi phân loại hoặc gợi ý lên phiếu, đăng bình luận. L2 có công cụ như L1. L3: mức của công cụ bản ghi chung, sửa code. Mức thực tế của từng phiếu trên đường danh mục trắng không vượt Mức tối đa của đầu mục; năm quyền mở rộng tính theo ô này. Chi vượt ngân sách tháng thì tự hạ về L1 (L0 giữ nguyên)."
+  },
+  {
+   "fieldname": "section_permissions",
+   "fieldtype": "Section Break",
+   "label": "Năm quyền mở rộng (mặc định tắt)"
   },
   {
    "fieldname": "unrestricted_enabled",
    "fieldtype": "Check",
    "label": "Toàn quyền (khẩn cấp)",
    "default": "0",
-   "description": "Bật thì ở mọi mức từ L1 và khi có người ra lệnh, bot được tạo, sửa, xóa, submit, hủy bản ghi và gọi hàm whitelist theo quyền của tài khoản agent, không qua duyệt: gán được mọi vai trò kể cả System Manager, sửa được phân quyền và mọi tài khoản. Vẫn đóng: cấu hình, khóa API, Log và đề xuất của ERP AI; mật khẩu người dùng. Việc bot làm vẫn ghi vào Log. Chỉ bật khi cần gấp, xong thì tắt."
+   "description": "Toàn quyền. Bật thì từ L1, khi có người ra lệnh và chưa vượt ngân sách tháng, bot được tạo, sửa, xóa, submit, hủy bản ghi, gán mọi vai trò kể cả System Manager và gọi hàm whitelist, không qua duyệt. Gọi hàm là tự do: bot không tự đổi công tắc và không đọc phiếu nhóm loại trừ qua gọi hàm chỉ là cố gắng. Vẫn đóng: cấu hình, khóa API, Log, đề xuất; mật khẩu. Chỉ bật khi cần gấp."
   },
   {
-   "fieldname": "section_permissions",
-   "fieldtype": "Section Break",
-   "label": "Năm quyền mở rộng (mặc định tắt)"
+   "fieldname": "record_tools_enabled",
+   "fieldtype": "Check",
+   "label": "Công cụ bản ghi chung",
+   "default": "0",
+   "description": "Công cụ bản ghi chung. Bật thì ở L3 và khi có người ra lệnh, bot liệt kê, đọc, tạo, sửa bản ghi của DocType không bị cấm, ghi thẳng không qua duyệt (không xóa, không submit, không gán 6 vai trò quản trị). Không theo danh mục trắng. Mọi lần ghi có trong Log. Sau cập nhật ô này tắt, kể cả khi ô sửa code đang bật."
+  },
+  {
+   "fieldname": "act_now_enabled",
+   "fieldtype": "Check",
+   "label": "Làm luôn, không hỏi lại",
+   "default": "0",
+   "description": "Làm luôn. Bật thì khi có người ra lệnh và có ít nhất một quyền mở rộng được cấp, bot làm ngay trong lượt, không hỏi lại, không bị ngưỡng độ tin cậy chặn. Không thêm công cụ nào. Tắt thì dưới ngưỡng bot chỉ hỏi."
+  },
+  {
+   "fieldname": "code_change_enabled",
+   "fieldtype": "Check",
+   "label": "Cho phép sửa code và lệnh bench",
+   "default": "0",
+   "description": "Sửa code và lệnh bench. Bật thì ở L3 và khi có người ra lệnh, bot đề xuất sửa file, tạo file, lệnh bench; mọi thay đổi phải được duyệt bởi ERP AI Instructor trên form đề xuất. Mỗi thay đổi đã áp dụng là một commit git local; bot không push. Ô này không còn mở công cụ bản ghi. Tắt thì bot không có ba công cụ đó."
+  },
+  {
+   "fieldname": "one_click_approval_enabled",
+   "fieldtype": "Check",
+   "label": "Duyệt một lần bấm",
+   "default": "0",
+   "description": "Duyệt một lần bấm. Bật thì comment đề xuất có liên kết Duyệt và Từ chối: một lần bấm là chạy, không hộp xác nhận; người có quyền duyệt bấm liên kết được chuyển tiếp cũng duyệt. Tắt thì máy chủ từ chối liên kết, kể cả liên kết cũ; duyệt trên form hoặc ngăn của bot, có bước xác nhận."
   },
   {
    "fieldname": "site_environment",
@@ -251,13 +282,6 @@
    "label": "Sửa code và lệnh bench"
   },
   {
-   "fieldname": "code_change_enabled",
-   "fieldtype": "Check",
-   "label": "Cho phép sửa code và lệnh bench",
-   "default": "0",
-   "description": "Bật thì ở mức L3 và khi có người ra lệnh, bot được: (1) tạo và sửa bản ghi trực tiếp theo quyền của tài khoản agent, không qua duyệt (không xóa, không submit, không gán vai trò quản trị); (2) đề xuất sửa code và lệnh bench, mọi thay đổi code phải được duyệt trên form đề xuất. Mỗi thay đổi code đã áp dụng thành một commit git local; bot không push. Tắt thì bot trở lại như cũ."
-  },
-  {
    "fieldname": "code_change_apps",
    "fieldtype": "Small Text",
    "label": "App được phép sửa",
@@ -285,7 +309,7 @@
  ],
  "issingle": 1,
  "links": [],
- "modified": "2026-11-14 09:00:00.000000",
+ "modified": "2026-11-14 16:00:00.000000",
  "modified_by": "Administrator",
  "module": "ERP AI agent",
  "name": "ERP AI Setting",

@@ -573,6 +573,129 @@ class TestCheckPrivilegeEscalation(FrappeTestCase):
 
 		self.assertEqual(self._changes(), [])
 
+	def _test_role(self, label):
+		name = f"ERPAI-TEST vai {label}"
+		if not frappe.db.exists("Role", name):
+			frappe.get_doc({"doctype": "Role", "role_name": name, "desk_access": 1}).insert(
+				ignore_permissions=True
+			)
+		return name
+
+	def _user_values(self, *roles):
+		return {
+			"email": f"erpai-tasks-{frappe.generate_hash(length=8)}@example.invalid",
+			"first_name": "ERPAI-TEST",
+			"send_welcome_email": 0,
+			"roles": [{"role": role} for role in roles],
+		}
+
+	def _human_user(self, *roles):
+		"""A User given its roles by a person: no ERP AI Log row."""
+		return (
+			frappe.get_doc({"doctype": "User", **self._user_values(*roles)})
+			.insert(ignore_permissions=True)
+			.name
+		)
+
+	def test_bot_created_user_role_alarm_names_user_role_instructor(self):
+		role_a, role_b = self._test_role("A"), self._test_role("B")
+		user = self._agent_calls(
+			("api_create_record", {"doctype": "User", "values": self._user_values(role_a, role_b)})
+		)[0]
+
+		self._run()
+
+		self.assertEqual(
+			self._permission_alarm(),
+			"Agent đã sửa bản ghi phân quyền: "
+			f"thêm role ERPAI-TEST vai A cho {user} "
+			"(người ra lệnh erpai-tasks-boss@example.invalid, 2031-11-15 08:10), "
+			f"thêm role ERPAI-TEST vai B cho {user} "
+			"(người ra lệnh erpai-tasks-boss@example.invalid, 2031-11-15 08:10)",
+		)
+
+	def test_bot_removed_role_listed_as_removed(self):
+		kept, removed, added = self._test_role("giữ"), self._test_role("gỡ"), self._test_role("thêm")
+		user = self._human_user(kept, removed)
+		self._agent_calls(
+			(
+				"api_update_record",
+				{"doctype": "User", "name": user, "values": {"roles": [{"role": kept}, {"role": added}]}},
+			)
+		)
+
+		self.assertEqual(
+			self._changes(),
+			[
+				f"thêm role ERPAI-TEST vai thêm cho {user} "
+				"(người ra lệnh erpai-tasks-boss@example.invalid, 2031-11-15 08:10)",
+				f"gỡ role ERPAI-TEST vai gỡ của {user} "
+				"(người ra lệnh erpai-tasks-boss@example.invalid, 2031-11-15 08:10)",
+			],
+		)
+
+	def test_user_roles_compared_by_name_count_deleted_user_loses_all(self):
+		# Rows built by hand: Frappe drops duplicate role rows on save, and deleting a User is out of the seeding.
+		self._log_row(
+			[
+				_hand_action("api_update_record", "User", "dup@example.invalid"),
+				_hand_action("api_delete_record", "User", "gone@example.invalid"),
+			],
+			{
+				"api_update_record#1": {
+					"name": "dup@example.invalid",
+					"roles": [{"role": "A"}, {"role": "A"}, {"role": "A"}, {"role": "B"}],
+				},
+				"api_delete_record#2": {"name": "gone@example.invalid", "roles": [{"role": "C"}]},
+			},
+			{
+				"api_update_record#1": {
+					"name": "dup@example.invalid",
+					"roles": [{"role": "B"}, {"role": "A"}, {"role": "B"}, {"role": "B"}],
+				},
+				# The runner writes the key with None for a delete (runner._record_snapshot).
+				"api_delete_record#2": None,
+			},
+		)
+
+		self.assertEqual(
+			self._changes(),
+			[
+				"thêm role B cho dup@example.invalid "
+				"(người ra lệnh erpai-tasks-boss@example.invalid, 2031-11-15 08:10)",
+				"thêm role B cho dup@example.invalid "
+				"(người ra lệnh erpai-tasks-boss@example.invalid, 2031-11-15 08:10)",
+				"gỡ role A của dup@example.invalid "
+				"(người ra lệnh erpai-tasks-boss@example.invalid, 2031-11-15 08:10)",
+				"gỡ role A của dup@example.invalid "
+				"(người ra lệnh erpai-tasks-boss@example.invalid, 2031-11-15 08:10)",
+				"gỡ role C của gone@example.invalid "
+				"(người ra lệnh erpai-tasks-boss@example.invalid, 2031-11-15 08:10)",
+			],
+		)
+
+	def test_bot_resave_user_without_role_change_no_line(self):
+		role_a, role_b = self._test_role("A"), self._test_role("B")
+		user = self._human_user(role_a, role_b)
+		self._agent_calls(
+			(
+				"api_update_record",
+				{
+					"doctype": "User",
+					"name": user,
+					"values": {
+						"first_name": "ERPAI-TEST lưu lại",
+						"roles": [{"role": role_a}, {"role": role_b}],
+					},
+				},
+			),
+			("api_update_record", {"doctype": "User", "name": user, "values": {"last_name": "lần hai"}}),
+		)
+
+		self.assertEqual(self._changes(), [])
+		self._run()
+		self.send_alarm.assert_not_called()
+
 	def test_only_ok_generic_writes_on_permission_doctypes_are_listed(self):
 		perms = [{"role": "Desk User", "read": 1}]
 		self._log_row(

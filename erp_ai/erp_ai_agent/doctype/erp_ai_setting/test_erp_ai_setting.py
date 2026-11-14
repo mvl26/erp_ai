@@ -1,11 +1,14 @@
+import ast
 import json
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import frappe
+from frappe.model.document import Document
 from frappe.tests.utils import FrappeTestCase
 from frappe.utils import get_datetime
 
-from erp_ai import install
+from erp_ai import constants, install
 from erp_ai.agent.classification import DEFAULT_CATEGORY_MAPPING
 from erp_ai.agent.routing import DEFAULT_ROUTING_RULES
 from erp_ai.constants import (
@@ -795,3 +798,92 @@ class TestPermissionSwitchNotice(FrappeTestCase):
 		self.assertIn("gọi hàm whitelist", message)
 		self.assertIn("Gọi hàm là tự do", message)
 		self.assertIn("chỉ là cố gắng", message)
+
+
+CATALOG_RULE_DOCTYPE = "ERP AI Catalog Rule"
+CATALOG_RULE_JSON = (
+	Path(erp_ai_setting.__file__).resolve().parent.parent / "erp_ai_catalog_rule" / "erp_ai_catalog_rule.json"
+)
+# FEAT-007 design.md:214-221 and design-w0-fixes.md F-1: the stored Select values, written out once.
+CATALOG_ACTION_CONSTANTS = {
+	"ACTION_CREATE_USER": "Tạo tài khoản theo mẫu",
+	"ACTION_ADD_TEAM_MEMBER": "Thêm người vào nhóm Helpdesk",
+	"ACTION_ADD_HOLIDAY": "Thêm ngày nghỉ",
+	"ACTION_SET_ITEM_GROUP": "Đổi nhóm hàng",
+	"ACTION_CREATE_CUSTOM_FIELD": "Tạo Custom Field",
+	"ACTION_UPDATE_FIELDS": "Đổi trường",
+}
+CATALOG_MODE_CONSTANTS = {
+	"MODE_DENY": "Cấm",
+	"MODE_NEEDS_APPROVAL": "Cần duyệt",
+	"MODE_AUTO": "Tự làm",
+}
+# F-1: the FEAT-007 block closes constants.py, names in this order.
+FEAT007_CONSTANT_BLOCK = (
+	*CATALOG_ACTION_CONSTANTS,
+	"CATALOG_ACTIONS",
+	*CATALOG_MODE_CONSTANTS,
+	"CATALOG_MODES",
+	"KPI_IDS",
+	"TICKET_CONTENT_DOCTYPES",
+)
+
+
+class TestCatalogRules(FrappeTestCase):
+	def setUp(self):
+		self.addCleanup(frappe.db.rollback)
+		keep_agent_settings(self)
+		self.assertTrue(
+			frappe.db.exists("DocType", CATALOG_RULE_DOCTYPE), "DocType ERP AI Catalog Rule is missing"
+		)
+
+	def test_select_options_match_constants(self):
+		# AC-29: the JSON options come from the constants, one source.
+		fields = {
+			f["fieldname"]: f for f in json.loads(CATALOG_RULE_JSON.read_text(encoding="utf-8"))["fields"]
+		}
+		self.assertEqual(fields["action"]["options"], "\n".join(constants.CATALOG_ACTIONS))
+		self.assertEqual(fields["mode"]["options"], "\n".join(constants.CATALOG_MODES))
+		self.assertEqual(fields["mode"]["default"], constants.MODE_NEEDS_APPROVAL)
+		self.assertEqual(
+			{name: getattr(constants, name) for name in CATALOG_ACTION_CONSTANTS}, CATALOG_ACTION_CONSTANTS
+		)
+		self.assertEqual(constants.CATALOG_ACTIONS, tuple(CATALOG_ACTION_CONSTANTS.values()))
+		self.assertEqual(
+			{name: getattr(constants, name) for name in CATALOG_MODE_CONSTANTS}, CATALOG_MODE_CONSTANTS
+		)
+		self.assertEqual(constants.CATALOG_MODES, ("Cấm", "Cần duyệt", "Tự làm"))
+		self.assertEqual(frappe.new_doc(CATALOG_RULE_DOCTYPE).mode, "Cần duyệt")
+
+	def test_kpi_ids_in_order(self):
+		self.assertEqual(
+			constants.KPI_IDS,
+			(
+				"first_response_minutes",
+				"complete_fields_pct",
+				"closed_without_human_pct",
+				"b_resolution_hours",
+				"c_task_in_3_days_pct",
+				"stale_over_5_days",
+			),
+		)
+
+	def test_ticket_content_doctypes_is_adr_034_list(self):
+		# design-w0-fixes-3.md ruling 2: exactly the four DocTypes of ADR-034 decision 1, in this order.
+		self.assertEqual(constants.TICKET_CONTENT_DOCTYPES, ("HD Ticket", "Comment", "Communication", "File"))
+
+	def test_constants_stay_leaf_with_block_at_end(self):
+		# A-D6: constants.py imports nothing; F-1: the FEAT-007 names are the last assignments, in order.
+		source = Path(constants.__file__).read_text(encoding="utf-8")
+		self.assertEqual([line for line in source.splitlines() if line.startswith(("import", "from"))], [])
+		tree = ast.parse(source)
+		self.assertFalse([node for node in ast.walk(tree) if isinstance(node, ast.Import | ast.ImportFrom)])
+		names = [node.targets[0].id for node in tree.body if isinstance(node, ast.Assign)]
+		self.assertEqual(tuple(names[-len(FEAT007_CONSTANT_BLOCK) :]), FEAT007_CONSTANT_BLOCK)
+
+	def test_controller_is_empty_document(self):
+		doc = frappe.new_doc(CATALOG_RULE_DOCTYPE)
+		self.assertEqual(type(doc).__name__, "ERPAICatalogRule")
+		self.assertEqual(type(doc).__bases__, (Document,))
+		own_members = [name for name in vars(type(doc)) if not name.startswith("__")]
+		self.assertEqual(own_members, [])

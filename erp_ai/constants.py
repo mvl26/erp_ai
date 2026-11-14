@@ -69,3 +69,32 @@ PANEL_METHODS = (
 	"erp_ai.ticket_panel.send_message",
 )
 PANEL_MAX_MESSAGE_CHARS = 2000
+
+# FEAT-007 (F-1): catalog actions and modes, KPI ids, ticket-content DocTypes; one block, keep it last.
+ACTION_CREATE_USER = "Tạo tài khoản theo mẫu"
+ACTION_ADD_TEAM_MEMBER = "Thêm người vào nhóm Helpdesk"
+ACTION_ADD_HOLIDAY = "Thêm ngày nghỉ"
+ACTION_SET_ITEM_GROUP = "Đổi nhóm hàng"
+ACTION_CREATE_CUSTOM_FIELD = "Tạo Custom Field"
+ACTION_UPDATE_FIELDS = "Đổi trường"
+CATALOG_ACTIONS = (
+	ACTION_CREATE_USER,
+	ACTION_ADD_TEAM_MEMBER,
+	ACTION_ADD_HOLIDAY,
+	ACTION_SET_ITEM_GROUP,
+	ACTION_CREATE_CUSTOM_FIELD,
+	ACTION_UPDATE_FIELDS,
+)
+MODE_DENY = "Cấm"
+MODE_NEEDS_APPROVAL = "Cần duyệt"
+MODE_AUTO = "Tự làm"
+CATALOG_MODES = (MODE_DENY, MODE_NEEDS_APPROVAL, MODE_AUTO)
+KPI_IDS = (
+	"first_response_minutes",
+	"complete_fields_pct",
+	"closed_without_human_pct",
+	"b_resolution_hours",
+	"c_task_in_3_days_pct",
+	"stale_over_5_days",
+)
+TICKET_CONTENT_DOCTYPES = ("HD Ticket", "Comment", "Communication", "File")

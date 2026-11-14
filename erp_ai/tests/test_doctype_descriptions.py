@@ -165,6 +165,24 @@ DOCTYPE_CONFIG = {
 			("section_note", "Ghi chú", "note"),
 		),
 	},
+	# FEAT-007 design.md:204-210: one row of the whitelist catalog (child of ERP AI Setting).
+	"ERP AI Catalog Rule": {
+		"folder": "erp_ai_catalog_rule",
+		"field_count": 5,
+		"phrases": {
+			"action": ("Tạo tài khoản theo mẫu", "Tạo Custom Field", "Đổi trường"),
+			"target_doctype": ("Đổi trường", "Tạo Custom Field", "phải trống", "bị chặn khi lưu"),
+			"fields": ("Mỗi dòng", "fieldname", "Đổi trường", "ít nhất một dòng"),
+			"categories": ("A đến F", "dấu phẩy", "bỏ trùng"),
+			"mode": ("Cấm", "Cần duyệt", "Tự làm", "Mặc định Cần duyệt"),
+		},
+		"section_count": 2,
+		"read_only_fields": (),
+		"sections": (
+			("section_action", "Hành động và DocType đích", "action"),
+			("section_scope", "Đầu mục và chế độ", "categories"),
+		),
+	},
 	"ERP AI Log": {
 		"folder": "erp_ai_log",
 		"field_count": 43,

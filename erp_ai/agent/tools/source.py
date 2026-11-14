@@ -137,10 +137,11 @@ def resolve_manual_path(rel):
 def resolve_safe_path(rel):
 	"""Return the real path of an allowed source path under the root, else None.
 
-	A file inside the manuals directory is not source (ADR-034 QĐ 5); the directory itself still resolves (E-7).
+	Anything strictly inside the manuals directory that is not an existing directory is not source: an existing
+	file or a path not on disk yet (ADR-034 QĐ 5); the directory itself and its subdirectories still resolve (E-7).
 	"""
 	full = _base_resolve(rel)
-	if full and os.path.isfile(full):
+	if full and not os.path.isdir(full):
 		root = manuals_root()
 		if root and _inside(root, full):
 			return None

@@ -35,6 +35,8 @@ SYSTEM_FIELDS = frozenset(
 FORCED_VALUES = {"Server Script": {"disabled": 1}, "Webhook": {"enabled": 0}}
 FILTER_OPERATORS = frozenset({"=", "!=", "like", "not like", "in", "not in", ">", "<", ">=", "<=", "is"})
 REASON_MAX = 300
+TITLE_WRITE_FAILED = "erp_ai: công cụ bản ghi lưu lỗi"
+UNEXPECTED_ERROR_REASON = "lỗi hệ thống khi lưu, không có gì thay đổi"
 DOCTYPE_ECHO_MAX = 80
 DEFAULT_LIMIT = 20
 MAX_LIMIT = 50
@@ -152,6 +154,13 @@ def _write(doctype: str, save) -> dict:
 		frappe.db.rollback(save_point=SAVEPOINT)
 		detail = strip_html(str(exc)).strip() or type(exc).__name__
 		return _fail(f"hệ thống từ chối: {detail}", doctype)
+	except Exception as exc:
+		# DuplicateEntryError, TypeError, hook errors: undo the partial write; only the error type reaches Error Log.
+		frappe.db.rollback(save_point=SAVEPOINT)
+		frappe.log_error(TITLE_WRITE_FAILED, f"site_api doctype={doctype} error={type(exc).__name__}")
+		if isinstance(exc, frappe.DuplicateEntryError):
+			return _fail("đã có bản ghi cùng tên", doctype)
+		return _fail(UNEXPECTED_ERROR_REASON, doctype)
 	frappe.db.release_savepoint(SAVEPOINT)
 	return {"ok": True, "doctype": doctype, "name": doc.name}
 

@@ -10,8 +10,9 @@ Approved-by:
 - Diff: `team/FEAT-004-task-61` (head 5130c88), base 7b55147 (head T60, review riêng)
 - Diff vòng 2: `5130c88..team/FEAT-004-task-61` (head 1b36a51)
 - Diff vòng 3: `1b36a51..team/FEAT-004-task-61` (head 8b1a54e)
-- Vòng: 3 (hết `max_rework=3`; tech-lead đã phán và dừng, xem cuối file)
-- Verdict: request-changes (vòng 1: request-changes; vòng 2: request-changes; vòng 3: request-changes)
+- Diff vòng 4: `8b1a54e..e0acf3f` (nhánh task đã merge `c2762a1` và xóa)
+- Vòng: 4 (hết `max_rework=3` ở vòng 3; vòng 4 do người cho thêm đúng một lần, xem cuối file)
+- Verdict: approve (vòng 1: request-changes; vòng 2: request-changes; vòng 3: request-changes; vòng 4: approve)
 
 Lệnh đã chạy (chỉ đọc):
 ```
@@ -140,3 +141,23 @@ minor | — | — | 1 điểm nhỏ: STD-TEST-8 nhánh đệ quy vào dict/list 
 - Phát hiện vòng 3 (major STD-SEC-4, chuỗi JSON của chuỗi): **thật, chặn theo chữ tiêu chí vòng 3**; chưa chạy, kết luận từ đọc mã Frappe. Sửa nhỏ, nhưng tech-lead không mở vòng 4.
 - Chuyển team-leader chọn: (a) cho vòng 4 đúng phạm vi đó (một bước giải mã + 2 dòng test + ca đệ quy của minor); (b) nhận là rủi ro còn lại của "chặn ở mức cố gắng" và merge `8b1a54e` nguyên trạng, ghi vào As-Built.
 - Nhánh `team/FEAT-004-task-61` @ `8b1a54e` chưa merge; T62 (`337ccd8`), T64 (`59ab285`) đã approve, xếp chồng trên T61 nên cũng chưa merge.
+
+## Vòng 4 (2026-11-14) — approve
+
+Vòng ngoài hạn mức, theo quyết định của người 2026-11-14 ("cho sửa thêm 1 vòng cuối"; còn dạng khác thì không sửa nữa, ghi rủi ro còn lại rồi merge). Tech-lead chép từ tin trả về của reviewer.
+
+- Diff sửa: `git diff 8b1a54e..e0acf3f` (1 commit `fix(site_api): refuse a JSON-encoded string * column selector (FEAT-004)`, 2 file, +13/−1). Reviewer đọc thêm Frappe v15 `db_query.py:345-366,620-633`, `client.py:25-40,126-166`, `desk/reportview.py:92-150`. Không chạy test.
+- Bằng chứng của dev: RED `{'ok': True, 'method': 'frappe.client.get_list',…} != {'ok': False, 'reason': 'tham số chọn mọi cột bằ…'}`, `FAILED (failures=2)`; GREEN test_site_api `Ran 54 tests in 41.356s` / `OK`, test_architecture `Ran 133 tests in 6.036s` / `OK`.
+- major STD-SEC-4 vòng 3 (chuỗi JSON của chuỗi `"\"*\""`): **ADDRESSED** (`site_api.py:320-324`; test `test_site_api.py:844`, `:845-848`). Frappe giải mã một lần, mã giải mã lặp, tệ nhất là từ chối thừa; chuỗi thường như `'"name"'` vẫn đi qua.
+- minor STD-TEST-8 vòng 3 (nhánh đệ quy): **ADDRESSED** (`test_site_api.py:849`, `{"args": [{"fields": ["*"]}]}` ghim `site_api.py:308`, `:311-312`).
+- Phát hiện mới: không có. Checklist 10/10 đạt. Đột biến (đọc mã, chưa chạy): bỏ `:320-324` → dòng 844, 847 đỏ; bỏ `or _selects_every_column(item)` hoặc nhánh list → dòng 849 đỏ.
+
+### Không kiểm được từ diff (vòng 4)
+- GREEN của dev: tech-lead chạy lại sau merge `c2762a1`: `Ran 55 tests in 38.302s` / `OK`.
+- Hai dạng NGHI, chưa chạy, ngoài danh sách của T61: `fields` là `'"*x"'` / `'"**"'` (Frappe tách chuỗi đã giải mã thành từng ký tự, `db_query.py:631`); Frappe đổi chỗ `fields`/`filters` (`db_query.py:355-361`) qua hàm whitelist không gọi `validate_args`.
+
+### Deferred (vòng 4) — rủi ro còn lại cho As-Built
+- Hai dạng nghi trên, cùng `` `db`.`tabUser`.* ``, `distinct *`, hàm tự chọn cột phía server (vòng 3): đã chép vào `tasks.md` dòng "Rủi ro còn lại của T61". Designer quyết có cần task sau hay không.
+
+### Sau merge
+- Merge T62 (`8a2a5ef`) làm đỏ 4 ca đối chứng của T61 vòng 2, 3 (so nguyên dict, thiếu `value_before`/`value_after` của T62): lỗi do ghép, sửa ở nhánh `team/FEAT-004-task-62-fix` (`81b7186`), xem review-62.

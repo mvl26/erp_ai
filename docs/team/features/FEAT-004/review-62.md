@@ -8,8 +8,18 @@ Approved-by:
 # Review 62 — FEAT-004 T62
 
 - Diff: `team/FEAT-004-task-62` (head 337ccd8), so với 5130c88 (head của T61), 1 commit, 2 file
-- Vòng: 1
+- Diff sửa ghép: `git diff ab802fe..81b7186` (nhánh `team/FEAT-004-task-62-fix`, 1 commit, chỉ `test_site_api.py` +32/−6; merge `c9abee1`)
+- Vòng: 1 (+ 1 lần sửa sau merge, review riêng: approve)
 - Verdict: approve
+
+## Sửa sau merge (2026-11-14) — approve
+
+Tech-lead chép từ tin trả về của reviewer. Merge T62 (`8a2a5ef`) lên nền đã có T61 vòng 2–4 làm đỏ `test_site_api`: `Ran 60 tests in 46.013s` / `FAILED (failures=4)` (`test_get_value_on_an_ordinary_field_still_goes_through`, 3 subTest của `test_star_outside_a_column_selector_still_goes_through`; hai test đối chứng của T61 so nguyên dict, thiếu `value_before`/`value_after`). Lỗi do ghép: T62 cắt từ T61 vòng 1.
+
+- Sửa: giá trị kỳ vọng thêm `value_before=None`, `value_after={"method", "argument_keys"}` viết tay, `argument_keys` theo thứ tự `sorted(arguments)` (`site_api.py:404`); vẫn so bằng nguyên dict, giữ `assert_called_once`. Đổi vì hợp đồng đổi theo T62 (STD-TEST-5), không nới test.
+- Bằng chứng của dev: RED `Ran 60 tests in 47.094s` / `FAILED (failures=4)`; GREEN `Ran 60 tests in 46.641s` / `OK`. Tech-lead chạy lại sau merge `c9abee1`: `Ran 60 tests in 46.005s` / `OK`.
+- Phát hiện: không có. minor | — | — | 1 điểm nhỏ: chú thích "T62 contract" lặp hai chỗ (`test_site_api.py:1088,1141`) | tùy dev
+- Phán của tech-lead về mục "bảng con" bên dưới (suspected): không tái hiện, không DocType lõi nào được nêu; không chặn tick. Ghi vào rủi ro còn lại cho As-Built và cho designer: `value_before` khi xóa có thể mang trường kiểu Data tên `api_key`/`api_secret` nằm trong bảng con.
 
 Lệnh đã dùng (chỉ đọc):
 ```

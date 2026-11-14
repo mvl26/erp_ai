@@ -8,22 +8,22 @@ Approved-by:
 # Plan FEAT-007 — đợt 0 (U0, U4a, U5a, U6a)
 
 - Nhánh feature: `team/FEAT-007` từ `develop` @ `1918db2` (`config.base_branch` = `main` không có trong repo; `design.md` và luật dự án lấy `develop`). Build trong worktree riêng, không checkout ở cây chính, không ghi `.team/current.json` (DoD của spec).
-- Số task: 58 (T1–T55 làm ngay; T56–T58 chờ `team/FEAT-004` vào `develop`); song song tối đa: 2 (`limits.max_parallel_dev`).
+- Số task: 60 (T1–T55, T59, T60 làm ngay; T56–T58 chờ `team/FEAT-004` vào `develop`); song song tối đa: 2 (`limits.max_parallel_dev`). T59, T60 do lần chèn 1 thêm (mục "Chèn 1" cuối file).
 - Phạm vi: chỉ đợt 0 của `arch-impact.md`. Đợt 1, 2 (U1–U3, U4b, U5b, U6b, U7, U8) lập kế hoạch sau bằng `/team:plan FEAT-007 --insert` khi có `design-addendum-N.md`.
 - Đầu vào: `spec.md` + `spec-addendum-1.md`; `design.md`; `design-w0-fixes.md` (thắng `design.md`); `arch-review-design-w0-r2.md` (approve kèm C-1 → T42, C-2 → T9).
 - Cổng: `team.py status` chỉ áp G5; G3 không áp dụng.
 
 ## Thứ tự
 1. **T1 (bộ khung)** một mình; chưa task nào khác bắt đầu trước khi review T1 `approve`.
-2. **Chuỗi U0** T2 → T3 → T4 → T5 và T6 → T7 → T8 → T10 → … → T20 (cùng `erp_ai_setting.json/.py`, `test_erp_ai_setting.py`, `test_doctype_descriptions.py` nên bắt buộc nối tiếp), rồi T21 → T22 → T23. Phần Log (T3–T5) đặt sớm vì T4 đóng cửa sổ tràn 64 KB (F-6) và T28, T31, T55 cần nó.
+2. **Chuỗi U0** T2 → T3 → T4 → T5 và T6 → T7 → T8 → T10 → … → T20 (cùng `erp_ai_setting.json/.py`, `test_erp_ai_setting.py`, `test_doctype_descriptions.py` nên bắt buộc nối tiếp), rồi T21 → T22 → T60 → T23. **T59** vào vòng build đầu tiên sau T1 (không chung file với task sẵn sàng nào), để các task sau đọc `cmd.test` trên nền xanh. Phần Log (T3–T5) đặt sớm vì T4 đóng cửa sổ tràn 64 KB (F-6) và T28, T31, T55 cần nó.
 3. **Việc thuần, không cần trường cấu hình** chạy song song với chuỗi U0 ngay sau T1: T9, T24 → T25 → T26, T27, T35 → T36, T37, T40, T41, T42 → T44. Đây là lệch có lý do so với câu "U0 trước mọi đơn vị" của `design.md:87`: các task này không đọc trường nào của U0 (phụ thuộc lấy từ luồng dữ liệu), và rủi ro lớn nhất của đợt (ghim `test_architecture.py`, T42) được thử sớm.
 4. **Việc cần trường của U0**: T28 → T31 (sau T3, T5); T32 (sau T20, T29); T33 → T34 (sau T18); T38 → T39 (sau T14); T43 → T45 … T50 (sau T19); T51 → T54 (sau T16, T26); T55 (sau T5).
 5. **Hòa nhập** T56 → T57, T58 sau khi `team/FEAT-004` vào `develop`. `team/FEAT-007` không vào `develop` trước khi T57, T58 tick (`design-w0-fixes.md:214`).
 
 ## Nhóm song song
 Hai làn, mỗi làn một dev; bộ điều phối của build chọn task sẵn sàng không chung file với task đang chạy.
-- Làn A (chuỗi U0): T1 → T2 → T3 → T4 → T5 → T7 → T8 → T10 → T11 → T12 → T13 → T14 → T15 → T16 → T17 → T18 → T19 → T20 → T32 (T6 chen sau T2; T21 → T22 → T23 chen sau T18).
-- Làn B: T9, T24–T27, T35–T37, T40–T42, T44 trước; rồi T28–T31, T33, T34, T38, T39, T43, T45–T55 khi phụ thuộc đã tick.
+- Làn A (chuỗi U0): T1 → T2 → T3 → T4 → T5 → T7 → T8 → T10 → T11 → T12 → T13 → T14 → T15 → T16 → T17 → T18 → T19 → T20 → T32 (T6 chen sau T2; T21 → T22 → T60 → T23 chen sau T18).
+- Làn B: T59 trước tiên; T9, T24–T27, T35–T37, T40–T42, T44 trước; rồi T28–T31, T33, T34, T38, T39, T43, T45–T55 khi phụ thuộc đã tick.
 - Không bao giờ song song: hai task `[migrate]` (22 task: T1–T5, T7, T8, T10, T12–T14, T16, T18, T19, T31, T34, T40, T43, T44, T48, T49, T55; T56 cũng chạy `cmd.migrate` nên tính như một task `[migrate]`); hai task chung file (bảng dưới).
 
 ## Ràng buộc chung
@@ -89,12 +89,14 @@ Mọi file của `design-w0-fixes.md` mục 5.1, 5.2 và `design.md:560-570, 585
 | U0 | `D/erp_ai_prompt_revision/*` | mới | T19 |
 | U0 | `erp_ai/constants.py` | sửa | T8 |
 | U0 | `erp_ai/agent/hard_bans.py` | mới | T9, T57 |
-| U0 | `erp_ai/install.py` | sửa | T21, T22 |
+| U0 | `erp_ai/install.py` | sửa | T21, T22, T60 |
+| nền test (A-18) | `erp_ai/agent/test_agent_runner.py` | sửa | T59, T56 |
+| nền test (A-18) | `erp_ai/agent/test_runner_routing.py` | sửa (dự kiến 0 dòng) | T59 |
 | U0 | `D/erp_ai_log/erp_ai_log.json` | sửa | T3, T4, T5 |
 | U0 | `S/test_erp_ai_setting.py` | sửa | T1, T2, T6, T7, T8, T10–T20, T32, T57 |
 | U0 | `erp_ai/agent/test_hard_bans.py` | mới | T9, T57 |
 | U0 | `D/erp_ai_log/test_erp_ai_log.py` | sửa | T4, T5 |
-| U0 | `erp_ai/tests/test_install.py` | sửa | T2, T5, T21, T22, T23 |
+| U0 | `erp_ai/tests/test_install.py` | sửa | T2, T5, T21, T22, T60, T23 |
 | U0, U5a | `erp_ai/tests/test_doctype_descriptions.py` | sửa | T1, T2, T3, T7, T8, T10, T12, T13, T14, T16, T18, T19, T43, T49, T56 |
 | U0 | `erp_ai/test_utils.py` | sửa | T1 |
 | U4a | `erp_ai/agent/missed_scan.py`, `test_missed_scan.py` | mới | T33, T34 |
@@ -132,8 +134,9 @@ Chỉ liệt kê file có từ hai task trở lên; file còn lại có đúng m
 | `S/erp_ai_setting.py` | T6 | T7, T10–T20, T32, T56 | theo số |
 | `S/test_erp_ai_setting.py` | T1 | T2, T6, T7, T8, T10–T20, T32, T57 | theo số |
 | `erp_ai/tests/test_doctype_descriptions.py` | T1 | T2, T3, T7, T8, T10, T12, T13, T14, T16, T18, T19, T43, T49, T56 | theo số |
-| `erp_ai/tests/test_install.py` | T2 | T5, T21, T22, T23 | T2 → T5 → T21 → T22 → T23 |
-| `erp_ai/install.py` | T21 | T22 | T21 → T22 |
+| `erp_ai/tests/test_install.py` | T2 | T5, T21, T22, T60, T23 | T2 → T5 → T21 → T22 → T60 → T23 |
+| `erp_ai/install.py` | T21 | T22, T60 | T21 → T22 → T60 |
+| `erp_ai/agent/test_agent_runner.py` | T59 | T56 | T59 → T56 |
 | `D/erp_ai_log/erp_ai_log.json` | T3 | T4, T5 | T3 → T4 → T5 |
 | `D/erp_ai_log/test_erp_ai_log.py` | T4 | T5 | T4 → T5 |
 | `erp_ai/agent/hard_bans.py`, `test_hard_bans.py` | T9 | T57 | T9 → T57 |
@@ -175,6 +178,9 @@ Danh sách AC đợt 0 theo `design-w0-fixes.md` mục 6.4. Phần còn lại c�
 | AC-38 | T19, T20 |
 | AC-44 | T14 |
 | AC-45 (chặn) | T22, T40 |
+| AC-45 câu cuối (quyền đọc của Instructor; phán quyết (1b)) | T60 |
+| A-U4b-1 (trường `ai_created_labels`; phán quyết (1)) | T60, T23 |
+| A-18 (5 test đỏ sẵn có) | T59 |
 | AC-46 | T14, T37 |
 | AC-47 | T14, T38, T39 |
 | AC-49 | T15 |
@@ -205,9 +211,10 @@ Sau mỗi lần merge một task: `cmd.test` trên `team/FEAT-007` (luật của
 | Mốc | Sau task | Kiểm |
 |---|---|---|
 | M0 | trước T1 | `cmd.test` trên đầu nhánh, ghi dòng `baseline:` của `tasks.md` |
+| M0b | T59 | `cmd.test` trên `team/FEAT-007`: không còn 5 test của dòng `baseline:`; viết lại dòng đó thành "red: không có" kèm đầu ra |
 | M1 | T5 | `cmd.test`, `cmd.lint`; luồng chính: lưu form ERP AI Setting dưới System Manager không lỗi; tài khoản chỉ có ERP AI Instructor mở được Report View của ERP AI Log |
 | M2 | T12 | `cmd.test`, `cmd.lint`; lưu một dòng danh mục hợp lệ và một dòng trỏ `Custom Role` (bị chặn) |
-| M3 | T23 và T32 | U0 xong: `cmd.test`, `cmd.lint`; `cmd.migrate` lần hai không đổi `tabSingles` |
+| M3 | T23 và T32 | U0 xong (gồm T60): `cmd.test`, `cmd.lint`; `cmd.migrate` lần hai không đổi `tabSingles`, không đổi Custom DocPerm của HD Article |
 | M4 | T34, T39 | U4a, U6a xong: `cmd.test`, `cmd.lint`; `frappe.get_hooks("scheduler_events")["cron"]` có dòng `*/15` |
 | M5 | T55 | đợt 0 trước hòa nhập: `cmd.test`, `cmd.lint`; gọi tay `run_daily_report`, `run_weekly_kpi`, `run_monthly_review` hai lần, lần hai không tạo thêm email/dòng |
 | M6 | T58 | cửa merge: `cmd.test`, `cmd.lint` xanh trên nhánh đã gộp `develop`; rồi `/team:verify FEAT-007` (đối soát migrate (a)–(d) của `design.md:530`, ảnh màn hình AC-56) |
@@ -239,3 +246,27 @@ T1 đi một đường mỏng qua mọi tầng mà đợt 0 dựa vào, với ph
 | 3 | Mục "việc bot làm" và chi phí hôm qua của báo cáo 08:00 không có trong `test_twelve_tickets_sections` | `test_daily_report.py::TestBuild::test_bot_actions_and_cost_yesterday` | T52 |
 | 4 | Hai lần chạy job 08:00 chồng nhau (khóa file bận) | `test_daily_report.py::TestRun::test_lock_busy_returns_without_email` | T54 |
 | 5 | Từ khóa Error Log chứa `%`, `_`, hoặc dài 1 / 101 ký tự (STD-SEC-3) | `test_system_read.py::TestErrorLogs::test_keyword_wildcards_escaped_and_length_bounds` | T36 |
+
+## Chèn 1 (2026-11-14, `/team:plan FEAT-007 --insert`)
+Hai task thêm vào đợt 0; không task nào đổi số. Các bảng phía trên đã cập nhật.
+
+| Task | Nguồn | Vị trí | Task đổi theo |
+|---|---|---|---|
+| T59 — năm test đỏ sẵn có tự đặt `auto_assign_enabled` | A-18 (`spec.md:266`, `spec-addendum-1.md:118`); quyết định ở `journal-part5.md:23` | sau T1, làn B, vòng build kế tiếp | T56 `[affected]`: thêm `test_agent_runner.py` vào `files:`, thêm T59 vào `depends:` |
+| T60 — task mà thiết kế gọi là "T22a": trường `ai_created_labels`, quyền đọc HD Article cho Instructor | `arch-review-design-w1b.md` mục 4 điểm (1), (1b); `arch-review-design-w1b-r2.md:88` (ii) | sau T22, làn A | T23 `[affected]`: `depends:` T20, T60; thêm test thứ ba cho trường mới |
+
+- **Mã task.** `team.py` nhận dòng task bằng `(T\d+)\b`, nên "T1a", "T22a" không được đếm. Điều kiện bắt đầu của U4b (`design-addendum-1-U4b-U8-fixes.md:126`) và U6b (`design-addendum-1-U6b-fixes.md:341`) ghi "T22a": đọc là T60.
+- **Ràng buộc chung thêm.** Trường HD Ticket `ai_created_labels`: Small Text, `hidden`, `read_only`, `no_copy`, permlevel 8, trong `_ai_field_specs`. Quyền HD Article: `setup_custom_perms("HD Article")` trước, rồi một dòng `ERP AI Instructor`, permlevel 0, `read=1`, `report=1`; không sửa dòng nào khác. Hai tài liệu thiết kế không định vị trí của trường trong `_ai_field_specs`; kế hoạch đặt nó ở cuối danh sách để `insert_after` của trường sẵn có không đổi.
+- **Phạm vi T59.** Chỉ ghim `auto_assign_enabled=0` ở `RunnerTestBase.setUp`. `keep_agent_settings` không thêm vào lớp này: `addCleanup(frappe.db.rollback)` của lớp đã trả lại cấu hình và lớp cấm commit, nên thêm vào là mã không test nào làm đỏ được (STD-DESIGN-5). Đây là lệch so với chữ "bằng `keep_agent_settings`" của `journal-part5.md:23`.
+
+| Rủi ro của lần chèn | Dấu hiệu | Cách xử lý |
+|---|---|---|
+| `team/FEAT-004` cũng sửa `test_agent_runner.py` (+299 dòng ở khối import và cuối file); phiên đó đang tránh 5 test đỏ bằng cách tạm đặt `auto_assign_enabled=0` trên site, không sửa test | xung đột ở T56; hoặc phiên kia sửa cùng test theo A-18 `[changed]` | T59 chỉ chạm `setUp` và thêm lớp ngay sau `RunnerTestBase`; T56 nhận file này. Team-leader báo phiên FEAT-004 rằng FEAT-007 đã nhận phần sửa test (A-18 `[changed]`: "FEAT-004 bỏ phần việc đó") |
+| Trường `hidden` vẫn có dòng mẫu phiếu `visible_to` "Agents" (`_ensure_template_rows` thêm cho mọi dòng của `_ai_field_specs`); chưa kiểm giao diện agent của Helpdesk có hiện chuỗi JSON của trường này không | agent thấy ô "ai_created_labels" trên phiếu | Kiểm bằng mắt ở `/team:verify` sau U4b (khi trường có giá trị). Có hiện → hỏi architect: loại trường `hidden` khỏi `_ensure_template_rows` (đổi phán quyết (1), không tự sửa trong build) |
+| Sau `cmd.migrate` từ cây FEAT-007 có T60, quyền HD Article của site `miyano` thành Custom DocPerm và ở lại cả khi phiên khác migrate từ cây không có T60 | quyền HD Article trên site không theo file chuẩn của Helpdesk nữa | Hệ quả (1b) đã được nhận (`journal-part4.md:16` (ii)); ghi As-Built. Cách gỡ: `arch-review-design-w1b-r2.md:88` |
+
+| # | Đầu vào / kiểu lỗi thêm vào trọng tâm review | Test | Task |
+|---|---|---|---|
+| 6 | Site đã có Custom DocPerm của HD Article do người sửa trước khi cài | `test_install.py::TestFeat007Migrate::test_existing_article_custom_perm_kept` | T60 |
+| 7 | Site chưa cài DocType HD Article | `::test_article_perm_skipped_when_doctype_missing` | T60 |
+| 8 | Giá trị `auto_assign_enabled` đang lưu trên site đổi giữa hai lần chạy (phiên FEAT-004 bật tắt ô này) | `test_agent_runner.py::TestRunnerBaseSettings::test_setup_overrides_stored_auto_assign` | T59 |

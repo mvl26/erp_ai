@@ -6,6 +6,8 @@ import frappe
 from frappe.permissions import AUTOMATIC_ROLES
 from frappe.query_builder.functions import Sum
 from frappe.utils import add_months, get_datetime, now_datetime
+from frappe.utils.file_lock import LockTimeoutError
+from frappe.utils.synchronization import filelock
 
 from erp_ai import alerts, gateway
 from erp_ai.agent.runner import GENERIC_WRITE_TOOLS
@@ -15,6 +17,7 @@ from erp_ai.constants import (
 	CREDENTIAL_DOCTYPE,
 	HELPDESK_AGENT_ROLE,
 	LOG_DOCTYPE,
+	LOGGER_NAME,
 	ROLE_AGENT,
 	SETTING_DOCTYPE,
 	TITLE_RUN_FAILED,
@@ -28,6 +31,10 @@ USER_DOCTYPE = "User"
 MAX_LISTED_NAMES = 5
 # Rows newer than now minus this are left for the next run: covers write_entry's insert-to-commit gap and clock skew.
 PRIVILEGE_ALERT_SETTLE_S = 300
+# Per-site file lock around the whole alarm job, commit included, so two runs never overlap (ADR-024 QĐ 3.7).
+PRIVILEGE_ALERT_LOCK = "erp_ai_privilege_alert"
+PRIVILEGE_ALERT_LOCK_TIMEOUT_S = 60
+PRIVILEGE_CHANGES_SUBJECT = "Agent đã sửa bản ghi phân quyền"
 UNKNOWN_INSTRUCTOR = "không rõ"
 # Marks a role entry whose role the tools refuse without the unrestricted switch; such entries are listed first.
 ADMIN_ROLE_MARK = "[QUẢN TRỊ] "
@@ -260,18 +267,30 @@ def check_privilege_escalation(now: datetime | None = None) -> None:
 	conditions still run. After every condition it advances the watermark to the upper bound (never back)
 	in the same transaction as the alarms, before the job's commit (ADR-024 QĐ 3.3, 3.5). On any error it
 	rolls back, logs a constant title with an explicit message and returns (D-20).
+	The whole run, commit included, holds the per-site PRIVILEGE_ALERT_LOCK; when another run holds it past
+	PRIVILEGE_ALERT_LOCK_TIMEOUT_S the job logs "lock busy" and returns without running any condition
+	(ADR-024 QĐ 3.7). A finished run logs its window and permission-change count, never a user or role name.
 	"""
+	try:
+		with filelock(PRIVILEGE_ALERT_LOCK, timeout=PRIVILEGE_ALERT_LOCK_TIMEOUT_S):
+			_check_privilege_escalation_locked(now)
+	except LockTimeoutError:
+		frappe.log_error(TITLE_RUN_FAILED, "check_privilege_escalation lock busy")
+
+
+def _check_privilege_escalation_locked(now: datetime | None) -> None:
 	upper = (get_datetime(now) if now else now_datetime()) - timedelta(seconds=PRIVILEGE_ALERT_SETTLE_S)
 	try:
 		lower = read_privilege_watermark()
 		checks = (
 			("Tài khoản agent có role ngoài danh sách cho phép", _agent_role_drift),
-			("Agent đã sửa bản ghi phân quyền", lambda: _privilege_changes_by_agent(lower, upper)),
+			(PRIVILEGE_CHANGES_SUBJECT, lambda: _privilege_changes_by_agent(lower, upper)),
 			("Server Script/Webhook do agent tạo đang bật", _enabled_scripts_by_agent),
 			("Khóa đang bật nhưng không có giá trị", _enabled_keys_without_value),
 		)
+		found = {}
 		for subject, find in checks:
-			names = find()
+			found[subject] = names = find()
 			if names:
 				_raise_alarm(subject, names)
 		# Never moves back: an upper bound not after the watermark read nothing new (ADR-024 QĐ 3.3).
@@ -282,6 +301,13 @@ def check_privilege_escalation(now: datetime | None = None) -> None:
 	except Exception as exc:
 		frappe.db.rollback()
 		frappe.log_error(TITLE_RUN_FAILED, f"check_privilege_escalation error={type(exc).__name__}")
+		return
+	frappe.logger(LOGGER_NAME).info(
+		"check_privilege_escalation window=%s..%s changes=%d",
+		lower,
+		upper,
+		len(found[PRIVILEGE_CHANGES_SUBJECT]),
+	)
 
 
 def reprobe_exhausted_keys() -> None:

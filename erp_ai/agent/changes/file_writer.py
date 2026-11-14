@@ -58,7 +58,10 @@ def make_parents(full_path, app_dir) -> list[str]:
 				raise ValueError("file_writer does not create directories through a symlink")
 	except BaseException:
 		for made in reversed(created):
-			os.rmdir(made)
+			if os.path.islink(made):
+				os.unlink(made)
+			else:
+				os.rmdir(made)
 		raise
 	return created
 

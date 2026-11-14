@@ -204,6 +204,32 @@ class TestMakeParents(FrappeTestCase):
 			file_writer.make_parents(full, self.app_dir)
 		self.assertEqual(os.listdir(self.apps.outside), ["plain.py"])
 
+	def test_file_outside_app_dir_raises(self):
+		for parts in (("other", "x"), ("loose",)):
+			with self.subTest(parts=parts):
+				full = os.path.join(self.apps.root, *parts, "new.py")
+				with self.assertRaises(ValueError):
+					file_writer.make_parents(full, self.app_dir)
+				self.assertEqual(os.listdir(self.apps.root), ["myapp"])
+				self.assertEqual(sorted(os.listdir(self.app_dir)), APP_DIR_BEFORE)
+
+	def test_level_turned_symlink_after_mkdir_rolls_back(self):
+		full = os.path.join(self.app_dir, "a", "b", "new.py")
+		second = os.path.join(self.app_dir, "a", "b")
+		real_mkdir = os.mkdir
+
+		def swap(path, mode=0o777):
+			if path == second:
+				return os.symlink(self.apps.outside, path)
+			return real_mkdir(path, mode)
+
+		with patch.object(file_writer.os, "mkdir", side_effect=swap):
+			with self.assertRaises(ValueError):
+				file_writer.make_parents(full, self.app_dir)
+		self.assertFalse(os.path.lexists(os.path.join(self.app_dir, "a")))
+		self.assertEqual(sorted(os.listdir(self.app_dir)), APP_DIR_BEFORE)
+		self.assertEqual(os.listdir(self.apps.outside), ["plain.py"])
+
 
 class TestRemoveEmptyDirs(FrappeTestCase):
 	def setUp(self):

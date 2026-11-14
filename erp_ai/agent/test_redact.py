@@ -51,14 +51,16 @@ class TestRedact(FrappeTestCase):
 		)
 
 	def test_long_run_without_secret_untouched(self):
-		# Generous bound: the anchored scan takes milliseconds here; the unanchored regex took
-		# about a minute for 50,000 characters, so 10 seconds only fails on quadratic scanning.
+		# K-8: generous bound; a linear scan takes milliseconds here, a quadratic one about a minute
+		# for 50,000 characters, so 10 seconds only fails on quadratic scanning.
 		for text in (
 			"a" * 100_000,
 			"Q2hhb_-9" * 12_500,
 			f"dữ liệu {'f0' * 50_000} hết",
 			"pwd" * 33_334,
 			"Token" * 20_000,
+			"a " * 50_000 + ": x",
+			"Mật khẩu " * 20_000,
 		):
 			with self.subTest(length=len(text)):
 				started = time.monotonic()
@@ -93,37 +95,45 @@ class TestRedact(FrappeTestCase):
 		self.assertEqual(redact.redact_secrets("ở cuối password=fake-end"), f"ở cuối password={MASK}")
 
 	def test_is_secret_key_names(self):
-		for name in (
-			"api_key",
-			"x_api_key",
-			"apiKey",
-			"api_secret",
-			"access_token",
-			"accessToken",
-			"clientSecret",
-			"new_password",
-			"reset_password_key",
-			"Mật khẩu",
-			unicodedata.normalize("NFD", "Mật khẩu"),
-			"smtp_pwd",
-			"API_SECRET",
-			"auth_token",
-			*site_api.SECRET_FIELDS,
-		):
-			with self.subTest(name=name):
-				self.assertTrue(redact.is_secret_key(name))
-		for name in (
-			"input_tokens",
-			"output_tokens",
-			"max_tokens",
-			"tokenizer",
-			"primary_key",
-			"subject",
-			"description",
-			"customer",
-		):
-			with self.subTest(name=name):
-				self.assertFalse(redact.is_secret_key(name))
+		# One row per line of table 3c (design-w0-fixes-3.md), labelled with the deciding criterion.
+		rows = (
+			(
+				"N-6",
+				True,
+				(
+					"api_key",
+					"x_api_key",
+					"api_secret",
+					"access_token",
+					"new_password",
+					"reset_password_key",
+					"smtp_pwd",
+					"API_SECRET",
+					"auth_token",
+					*site_api.SECRET_FIELDS,
+				),
+			),
+			("N-2a", True, ("apiKey", "accessToken", "clientSecret")),
+			("N-2a digit", True, ("oauth2Token",)),
+			("N-2b", True, ("DBPassword", "APIKey", "JWTToken")),
+			("N-4", True, ("api-key", "smtp.password", "Secret Key")),
+			("N-1 N-3", True, ("Mật khẩu", unicodedata.normalize("NFD", "Mật khẩu"), "MẬT KHẨU")),
+			(
+				"N-6 N-7",
+				False,
+				("input_tokens", "output_tokens", "max_tokens", "MAX_TOKENS", "tokenizer", "passwords"),
+			),
+			("N-6 adjacent", False, ("api_primary_key",)),
+			(
+				"N-4 N-6 N-7",
+				False,
+				("apikey", "primary_key", "subject", "description", "customer", "mat khau"),
+			),
+		)
+		for criterion, expected, names in rows:
+			for name in names:
+				with self.subTest(criterion=criterion, name=name):
+					self.assertIs(redact.is_secret_key(name), expected)
 
 	def test_usage_counters_not_masked(self):
 		self.assertEqual(
@@ -143,10 +153,56 @@ class TestRedact(FrappeTestCase):
 			f"subject: hello, Đặt Mật khẩu: {MASK}",
 		)
 
-	def test_secret_word_before_another_run_is_not_the_key(self):
-		# In "token abc: …" the key is "abc"; the scan then restarts at that second run.
-		self.assertEqual(redact.redact_secrets("token abc: fake-c"), "token abc: fake-c")
-		self.assertEqual(redact.redact_secrets("pwd password=fake-d"), f"pwd password={MASK}")
+	def test_key_value_rules(self):
+		# K-2 (up to three runs), K-5 (no pair dropping), K-6. The two unchanged texts are the accepted
+		# K-2 limit: the secret word is not among the last three runs before the separator.
+		cases = (
+			("token abc: fake-c", f"token abc: {MASK}"),
+			("Secret Key: fake-x", f"Secret Key: {MASK}"),
+			("password mới: fake-y", f"password mới: {MASK}"),
+			("Mật khẩu mới: fake-m", f"Mật khẩu mới: {MASK}"),
+			("Mật khẩu đăng nhập mới: fake-n", "Mật khẩu đăng nhập mới: fake-n"),
+			("password cũ của anh: fake-z", "password cũ của anh: fake-z"),
+			("pwd password=fake-d", f"pwd password={MASK}"),
+			("ghi chú: token=fake-a", f"ghi chú: token={MASK}"),
+		)
+		for text, expected in cases:
+			with self.subTest(text=text):
+				self.assertEqual(redact.redact_secrets(text), expected)
+
+	def test_value_patterns_run_before_key_scan(self):
+		# R-3 before R-4; K-7 keeps a value already masked by R-3.
+		cases = (
+			("Authorization: token FAKEKEY:FAKESECRET", f"Authorization: token {MASK}"),
+			("password=sk-ant-FAKE0000", f"password={MASK}"),
+			('api_key: "sk-FAKE0000000000000000"', f'api_key: "{MASK}"'),
+		)
+		for text, expected in cases:
+			with self.subTest(text=text):
+				self.assertEqual(redact.redact_secrets(text), expected)
+
+	def test_secret_patterns_are_the_five_value_patterns(self):
+		samples = (
+			"khóa sk-ant-abc hết hạn",
+			"khóa sk-FAKE000000000000000000 hết hạn",
+			"Authorization: Bearer FAKEtoken00000000",
+			f"Authorization: token {FAKE_FRAPPE_KEY}:{FAKE_FRAPPE_SECRET}",
+			f"jwt {FAKE_JWT} cuối",
+		)
+		self.assertEqual(len(redact.SECRET_PATTERNS), 5)
+		for index, sample in enumerate(samples):
+			with self.subTest(sample=sample):
+				matching = [i for i, pattern in enumerate(redact.SECRET_PATTERNS) if pattern.search(sample)]
+				self.assertEqual(matching, [index])
+		for pattern in redact.SECRET_PATTERNS:
+			with self.subTest(pattern=pattern.pattern):
+				self.assertIsNone(pattern.search("api_key=abc"))
+
+	def test_output_is_nfc(self):
+		text = unicodedata.normalize("NFD", "Mật khẩu đã đổi xong")
+		result = redact.redact_secrets(text)
+		self.assertEqual(result, unicodedata.normalize("NFC", text))
+		self.assertTrue(unicodedata.is_normalized("NFC", result))
 
 	def test_secret_key_without_value_untouched(self):
 		self.assertEqual(redact.redact_secrets("api_key= , pwd=fake-e"), f"api_key= , pwd={MASK}")

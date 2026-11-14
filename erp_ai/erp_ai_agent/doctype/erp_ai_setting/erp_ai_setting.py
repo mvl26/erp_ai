@@ -1,3 +1,5 @@
+import os
+
 import frappe
 from frappe.model.document import Document
 
@@ -51,6 +53,9 @@ INT_LIMITS = {
 	"answer_delay_max_s": ("Trễ trả lời tối đa", 0, ANSWER_DELAY_MAX_S),
 	"confidence_threshold": ("Ngưỡng độ tin cậy", 0, 100),
 	"auto_approve_streak": ("Số lần duyệt liên tiếp để Tự làm", 1, 100),
+	"close_silent_f_days": ("Số ngày chờ trước khi đóng phiếu F", 1, 30),
+	"knowledge_search_limit": ("Số kết quả tìm tri thức tối đa", 1, 20),
+	"report_row_limit": ("Số dòng báo cáo tối đa", 1, 100),
 }
 THINKING_TEXT_MAX_CHARS = 5000
 PRICE_FIELDS = (
@@ -104,6 +109,7 @@ class ERPAISetting(Document):
 		self.check_ticket_field_names()
 		self.check_catalog_rules()
 		self.check_user_templates()
+		self.check_manuals_dir()
 
 	def on_update(self):
 		self.notify_permission_switches()
@@ -229,6 +235,20 @@ class ERPAISetting(Document):
 				seen[key] = row.idx
 			if reason:
 				frappe.throw(f"Mẫu tài khoản dòng {row.idx}: {reason}")
+
+	def check_manuals_dir(self):
+		"""AC-47, E-7: a set manuals path, trimmed, must be an existing directory under apps/, not apps/ itself.
+
+		`resolve_safe_path` refuses a path leaving the source root and the root itself, so only the directory
+		test is added here.
+		"""
+		self.manuals_dir = (self.manuals_dir or "").strip()
+		if not self.manuals_dir:
+			return
+		path = source.resolve_safe_path(self.manuals_dir)
+		if not (path and os.path.isdir(path)):
+			typed = frappe.utils.escape_html(self.manuals_dir)
+			frappe.throw(f"Kho HDSD '{typed}' phải là thư mục có sẵn dưới apps/")
 
 
 def user_template_error(row) -> str | None:

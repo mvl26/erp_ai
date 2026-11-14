@@ -62,6 +62,16 @@
   "field_serial_no",
   "section_code_change",
   "code_change_apps",
+  "section_knowledge",
+  "reply_enabled",
+  "resolve_on_tasks_done_enabled",
+  "close_silent_f_enabled",
+  "close_silent_f_days",
+  "kb_draft_enabled",
+  "knowledge_search_limit",
+  "manuals_dir",
+  "allowed_reports",
+  "report_row_limit",
   "section_alerts",
   "alert_recipients",
   "credentials"
@@ -456,6 +466,72 @@
    "description": "Mỗi dòng một tên thư mục app trong apps/. Có thể thêm app lõi frappe, erpnext, helpdesk, hrms; sửa app lõi ảnh hưởng mọi site trên bench. Không bao giờ được thêm erp_ai. Bỏ trống thì không file nào được sửa."
   },
   {
+   "fieldname": "section_knowledge",
+   "fieldtype": "Section Break",
+   "label": "Trả lời, đóng phiếu và tri thức"
+  },
+  {
+   "fieldname": "reply_enabled",
+   "fieldtype": "Check",
+   "label": "Trả lời người tạo phiếu",
+   "default": "0",
+   "description": "Trả lời người tạo phiếu. Bật thì bot được gửi email trả lời hoặc câu hỏi cho người tạo phiếu ngay trên phiếu. Tắt thì bot không có công cụ trả lời, chỉ đăng comment nội bộ. Ô này mặc định tắt."
+  },
+  {
+   "fieldname": "resolve_on_tasks_done_enabled",
+   "fieldtype": "Check",
+   "label": "Giải quyết phiếu khi xong Task",
+   "default": "0",
+   "description": "Giải quyết phiếu khi mọi Task của phiếu đã xong. Bật thì bot chuyển phiếu sang trạng thái đã giải quyết và báo người tạo; phiếu Chỉ đạo BGĐ không bị đổi trạng thái. Ô này mặc định tắt; chỉ bật sau khi đã đặt trường Nguồn phát sinh."
+  },
+  {
+   "fieldname": "close_silent_f_enabled",
+   "fieldtype": "Check",
+   "label": "Đóng phiếu F khi người tạo im lặng",
+   "default": "0",
+   "description": "Đóng phiếu đầu mục F khi người tạo không phản hồi sau số ngày chờ bên dưới, tính từ lần bot trả lời hoặc hỏi. Bot báo người tạo trước khi đóng; phiếu Chỉ đạo BGĐ không bị đóng. Ô này mặc định tắt; chỉ bật sau khi đã đặt trường Nguồn phát sinh."
+  },
+  {
+   "fieldname": "close_silent_f_days",
+   "fieldtype": "Int",
+   "label": "Số ngày chờ trước khi đóng phiếu F",
+   "default": "3",
+   "description": "Số ngày chờ người tạo phiếu F phản hồi trước khi bot đóng phiếu, từ 1 đến 30 ngày. Người tạo trả lời trước hạn thì đếm lại từ đầu."
+  },
+  {
+   "fieldname": "kb_draft_enabled",
+   "fieldtype": "Check",
+   "label": "Soạn bài cơ sở tri thức",
+   "default": "0",
+   "description": "Soạn bài cơ sở tri thức. Bật thì khi phiếu được giải quyết, bot soạn một bài nháp từ cách xử lý của phiếu; người duyệt mới xuất bản. Ô này mặc định tắt; chỉ bật sau khi đã đặt trường Nguồn phát sinh."
+  },
+  {
+   "fieldname": "knowledge_search_limit",
+   "fieldtype": "Int",
+   "label": "Số kết quả tìm tri thức tối đa",
+   "default": "5",
+   "description": "Số kết quả tối đa mỗi lần bot tìm trong cơ sở tri thức, bộ HDSD hoặc phiếu cũ, từ 1 đến 20."
+  },
+  {
+   "fieldname": "manuals_dir",
+   "fieldtype": "Data",
+   "label": "Kho HDSD",
+   "description": "Thư mục chứa file .md của bộ HDSD, tính từ thư mục apps/, ví dụ erpnext/docs. Để trống thì bot trả lời chưa có kho HDSD. File trong thư mục này không đọc được qua công cụ đọc mã nguồn."
+  },
+  {
+   "fieldname": "allowed_reports",
+   "fieldtype": "Small Text",
+   "label": "Báo cáo bot được chạy",
+   "description": "Mỗi dòng một tên báo cáo bot được chạy (Script Report hoặc Query Report), theo quyền của tài khoản agent, chỉ đọc. Để trống thì bot không chạy báo cáo nào. Báo cáo dựa trên phiếu, comment, email bị chặn khi lưu."
+  },
+  {
+   "fieldname": "report_row_limit",
+   "fieldtype": "Int",
+   "label": "Số dòng báo cáo tối đa",
+   "default": "20",
+   "description": "Số dòng tối đa của kết quả báo cáo bot nhận mỗi lần chạy, từ 1 đến 100; các dòng sau bị cắt."
+  },
+  {
    "fieldname": "section_alerts",
    "fieldtype": "Section Break",
    "label": "Cảnh báo và khóa API"
@@ -477,7 +553,7 @@
  ],
  "issingle": 1,
  "links": [],
- "modified": "2026-11-14 23:30:00.000000",
+ "modified": "2026-11-14 23:45:00.000000",
  "modified_by": "Administrator",
  "module": "ERP AI agent",
  "name": "ERP AI Setting",

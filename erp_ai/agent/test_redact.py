@@ -1,4 +1,5 @@
 import time
+import unicodedata
 
 from frappe.tests.utils import FrappeTestCase
 
@@ -52,7 +53,13 @@ class TestRedact(FrappeTestCase):
 	def test_long_run_without_secret_untouched(self):
 		# Generous bound: the anchored scan takes milliseconds here; the unanchored regex took
 		# about a minute for 50,000 characters, so 10 seconds only fails on quadratic scanning.
-		for text in ("a" * 100_000, "Q2hhb_-9" * 12_500, f"dữ liệu {'f0' * 50_000} hết"):
+		for text in (
+			"a" * 100_000,
+			"Q2hhb_-9" * 12_500,
+			f"dữ liệu {'f0' * 50_000} hết",
+			"pwd" * 33_334,
+			"Token" * 20_000,
+		):
 			with self.subTest(length=len(text)):
 				started = time.monotonic()
 				self.assertEqual(redact.redact_secrets(text), text)
@@ -88,17 +95,64 @@ class TestRedact(FrappeTestCase):
 	def test_is_secret_key_names(self):
 		for name in (
 			"api_key",
+			"x_api_key",
+			"apiKey",
+			"api_secret",
+			"access_token",
+			"accessToken",
+			"clientSecret",
 			"new_password",
+			"reset_password_key",
 			"Mật khẩu",
+			unicodedata.normalize("NFD", "Mật khẩu"),
+			"smtp_pwd",
 			"API_SECRET",
 			"auth_token",
 			*site_api.SECRET_FIELDS,
 		):
 			with self.subTest(name=name):
 				self.assertTrue(redact.is_secret_key(name))
-		for name in ("subject", "description", "customer"):
+		for name in (
+			"input_tokens",
+			"output_tokens",
+			"max_tokens",
+			"tokenizer",
+			"primary_key",
+			"subject",
+			"description",
+			"customer",
+		):
 			with self.subTest(name=name):
 				self.assertFalse(redact.is_secret_key(name))
+
+	def test_usage_counters_not_masked(self):
+		self.assertEqual(
+			redact.redact_secrets("input_tokens: 1200, output_tokens: 512, api_key=abc"),
+			f"input_tokens: 1200, output_tokens: 512, api_key={MASK}",
+		)
+
+	def test_nfd_vietnamese_key_masked(self):
+		text = unicodedata.normalize("NFD", "Mật khẩu: fake-value-nfd")
+		self.assertEqual(redact.redact_secrets(text), f"Mật khẩu: {MASK}")
+
+	def test_key_after_plain_key_value_masked(self):
+		# A plain key's value can itself be "secret_key=value"; the scan must not swallow it.
+		self.assertEqual(redact.redact_secrets("ghi chú: token=fake-a"), f"ghi chú: token={MASK}")
+		self.assertEqual(
+			redact.redact_secrets("subject: hello, Đặt Mật khẩu: fake-b"),
+			f"subject: hello, Đặt Mật khẩu: {MASK}",
+		)
+
+	def test_secret_word_before_another_run_is_not_the_key(self):
+		# In "token abc: …" the key is "abc"; the scan then restarts at that second run.
+		self.assertEqual(redact.redact_secrets("token abc: fake-c"), "token abc: fake-c")
+		self.assertEqual(redact.redact_secrets("pwd password=fake-d"), f"pwd password={MASK}")
+
+	def test_secret_key_without_value_untouched(self):
+		self.assertEqual(redact.redact_secrets("api_key= , pwd=fake-e"), f"api_key= , pwd={MASK}")
+
+	def test_single_quoted_value_masked(self):
+		self.assertEqual(redact.redact_secrets("password='fake value 11'"), f"password='{MASK}'")
 
 	def test_one_word_list_for_both_functions(self):
 		for word in redact.SECRET_WORDS:

@@ -8,7 +8,7 @@ import frappe
 
 from erp_ai.agent.tools.read import _schema
 from erp_ai.agent.tools.registry import ToolSpec
-from erp_ai.constants import BOT_GIT_EMAIL, BOT_GIT_NAME
+from erp_ai.constants import BOT_GIT_EMAIL, BOT_GIT_NAME, SETTING_DOCTYPE
 
 logger = frappe.logger("erp_ai.source")
 
@@ -105,8 +105,8 @@ def _inside(root, full):
 	return os.path.commonpath([root, full]) == root and full != root
 
 
-def resolve_safe_path(rel):
-	"""Return the real path of an allowed source file under the root, else None."""
+def _base_resolve(rel):
+	"""Return the real path of an allowed path under the root (no secret name, allowed extension), else None."""
 	if not isinstance(rel, str) or not rel.strip() or "\0" in rel:
 		return None
 	root = os.path.realpath(get_source_root())
@@ -117,6 +117,33 @@ def resolve_safe_path(rel):
 		return None
 	if os.path.isfile(full) and os.path.splitext(full)[1].lower() not in DUOI_CHO_PHEP:
 		return None
+	return full
+
+
+def manuals_root():
+	"""Real path of the manuals directory set in `manuals_dir`; None when blank or not a safe directory (AC-47)."""
+	value = (frappe.db.get_single_value(SETTING_DOCTYPE, "manuals_dir") or "").strip()
+	full = _base_resolve(value)
+	return full if full and os.path.isdir(full) else None
+
+
+def resolve_manual_path(rel):
+	"""Return the real path of an allowed path strictly inside the manuals directory, else None."""
+	full = _base_resolve(rel)
+	root = manuals_root() if full else None
+	return full if root and _inside(root, full) else None
+
+
+def resolve_safe_path(rel):
+	"""Return the real path of an allowed source path under the root, else None.
+
+	A file inside the manuals directory is not source (ADR-034 QĐ 5); the directory itself still resolves (E-7).
+	"""
+	full = _base_resolve(rel)
+	if full and os.path.isfile(full):
+		root = manuals_root()
+		if root and _inside(root, full):
+			return None
 	return full
 
 

@@ -23,7 +23,7 @@ VIETNAMESE_ACCENTS = re.compile(
 DOCTYPE_CONFIG = {
 	"ERP AI Setting": {
 		"folder": "erp_ai_setting",
-		"field_count": 31,
+		"field_count": 39,
 		"phrases": {
 			"enabled": ("Tắt", "4 đơn giá", "từ khóa kích hoạt"),
 			"permission_level": ("L0", "L1", "L2", "L3", "ngân sách"),
@@ -56,6 +56,12 @@ DOCTYPE_CONFIG = {
 				"liên kết cũ",
 			),
 			"site_environment": ("production", "site test", "không bị chặn"),
+			**{
+				f"level_cap_{category}": ("Mức quyền", "năm quyền mở rộng", "chưa biết")
+				for category in "abcdef"
+			},
+			"confidence_threshold": ("từ 0 đến 100", "chỉ đăng một comment hỏi", "Làm luôn"),
+			"auto_approve_streak": ("từ 1 đến 100", "Tự làm", "đếm lại từ 0"),
 			"max_turns_per_run": ("từ 1 đến 20", "dừng"),
 			"max_runs_per_ticket_per_day": ("từ 1 đến 50", "00:00"),
 			"max_keys_per_call": ("từ 1 đến 10", "báo lỗi"),
@@ -105,11 +111,12 @@ DOCTYPE_CONFIG = {
 				"Bỏ trống",
 			),
 		},
-		"section_count": 8,
+		"section_count": 9,
 		"read_only_fields": ("spent_this_month_usd",),
 		"sections": (
 			("section_activation", "Bật và mức quyền", "enabled"),
 			("section_permissions", "Năm quyền mở rộng (mặc định tắt)", "unrestricted_enabled"),
+			("section_autonomy", "Mức tự chủ theo đầu mục và độ tin cậy", "level_cap_a"),
 			("section_limits", "Giới hạn mỗi lần chạy", "max_turns_per_run"),
 			("section_budget", "Ngân sách và đơn giá", "monthly_budget_usd"),
 			("section_model", "Model, từ khóa và chỉ báo trả lời", "model_classify_default"),

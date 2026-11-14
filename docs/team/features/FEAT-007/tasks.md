@@ -1,0 +1,331 @@
+Feature: FEAT-007
+Stage: plan
+Author-agent: tech-lead
+Date: 2026-11-14
+Approved-by:
+<!-- Cổng: người duyệt điền dòng trên `Approved-by: <tên> <YYYY-MM-DD>`. Không có cổng thì để trống. -->
+
+# Tasks FEAT-007 — đợt 0 (U0, U4a, U5a, U6a)
+
+Mỗi task 2–5 phút. Hai task chung file thì phụ thuộc nhau. Đánh dấu `BLOCKED: <lý do>` cuối dòng khi bị chặn (chỉ ghi khi task thật sự bị chặn lúc build; `team.py` coi feature là bị chặn khi một dòng task chưa tick có chữ đó).
+
+Quy ước cho mọi task:
+- `cmd.test_one` = lệnh của profile với `{file}` là file ở `test:` (và file test khác nêu ở `Expect:`). Viết test đỏ trước (STD-TEST-1), chỉ sửa trong `files:` (STD-DESIGN-1), không skip/xfail (STD-TEST-4).
+- Nguồn chữ chính xác (tên, chuỗi lỗi, mô tả trường, công thức): `design-w0-fixes.md` thắng `design.md`; C-1, C-2 của `arch-review-design-w0-r2.md` là bắt buộc. Số dòng `design.md:<n>` dưới đây là của file thiết kế. Tên dùng chung giữa các task: `plan.md` mục "Ràng buộc chung".
+- Nhãn `[migrate]` = task sửa JSON của DocType/Report hoặc `hooks.py`: chạy `cmd.migrate` trước `cmd.test_one`. Hai task `[migrate]` không bao giờ chạy song song (site `miyano` dùng chung, `plan.md` mục Rủi ro).
+- Task sửa `erp_ai_setting.json`: `DOCTYPE_CONFIG["ERP AI Setting"]` (`field_count`, `section_count`, `phrases`, `read_only_fields`) tăng đúng theo số trường/section task đó thêm, tính từ số thật của nhánh nền (27 trường, 7 section trên `develop` @ `1918db2`); mô tả ≤ 400 ký tự, cụm bắt buộc theo bảng `design.md:157-184`; dòng mới của `TestFeat007Defaults::test_every_new_field_default` cho mọi trường task đó thêm (mặc định theo bảng `design.md:114-151`).
+- Mọi lớp test mới gọi `keep_agent_settings(self)` (T1), tự tạo dữ liệu, truyền `now` thay đồng hồ thật (STD-TEST-6).
+- Task thêm/sửa file `.py` không phải test: `cmd.test_one` với `erp_ai/tests/test_architecture.py` cũng phải xanh; luật quét nào không qua được trong `files:` → trả `DESIGN_CONFLICT`, không sửa luật.
+- Controller U0 không viết tên công tắc quyền nào trong `.py` (D-7, luật `POLICY_FIELDS`); không module nào dưới `erp_ai/agent/**` import `erp_ai.erp_ai_agent.*` (F-1).
+
+Nhánh nền: **`develop` @ `1918db2`** (`config.base_branch` = `main` không có trong repo; `design.md` lấy `develop`). Nhánh `team/FEAT-007` đã tạo từ đó; build trong worktree riêng, không checkout ở cây chính, không ghi `.team/current.json` (DoD của spec).
+Tiến độ: BASE ghi ở đây trước mỗi lần gọi dev.
+- Lệnh bench: `cd /home/miyano/frappe-bench && PYTHONPATH=<gốc worktree đang dùng> bench --site miyano run-tests ...` (worktree của nhánh feature: `/home/miyano/frappe-bench/apps/erp_ai/.claude/worktrees/feat-007`; chi tiết và luật dùng chung site: `plan.md` mục "Chạy test từ worktree trên site dùng chung")
+- baseline: <ghi kết quả `cmd.test` trên đầu nhánh `team/FEAT-007` lúc bắt đầu build, kèm test đỏ sẵn có nếu có>
+
+## U0 — Nền cấu hình
+
+- [ ] T1 — Bộ khung: trường `site_environment` có mặc định từ cài đặt [migrate] — files: erp_ai/erp_ai_agent/doctype/erp_ai_setting/erp_ai_setting.json, erp_ai/erp_ai_agent/doctype/erp_ai_setting/test_erp_ai_setting.py, erp_ai/tests/test_doctype_descriptions.py, erp_ai/test_utils.py, erp_ai/tests/test_test_utils.py — test: erp_ai/erp_ai_agent/doctype/erp_ai_setting/test_erp_ai_setting.py — depends: —
+  - Tiêu chí: AC-12 (Select `production\ntest`, mặc định `production`); NFR-7 (test trả lại cấu hình); NFR-4.
+  - Receives: `install._ensure_default_settings` (hiện có, điền trường có `default` khi dòng `tabSingles` thiếu); `set_agent_settings` (`test_utils.py`).
+  - Returns: `keep_agent_settings(testcase) -> None` trong `erp_ai/test_utils.py` (chụp `tabSingles` của ERP AI Setting và dòng các bảng con trong `setUp`, trả lại bằng `addCleanup`); section `section_permissions` nhãn "Năm quyền mở rộng (mặc định tắt)" đứng sau `section_activation`, chứa `site_environment`; lớp `TestFeat007Defaults`.
+  - Expect: `cmd.migrate` rồi `cmd.test_one` → `TestFeat007Defaults::test_site_environment_default_production_and_options` xanh; `erp_ai/tests/test_test_utils.py::TestKeepAgentSettings::test_restores_singles_and_child_rows` xanh; `erp_ai/tests/test_doctype_descriptions.py` xanh với `field_count` nền + 1.
+- [ ] T2 — Ba công tắc quyền mới mặc định tắt [migrate] — files: erp_ai/erp_ai_agent/doctype/erp_ai_setting/erp_ai_setting.json, erp_ai/erp_ai_agent/doctype/erp_ai_setting/test_erp_ai_setting.py, erp_ai/tests/test_doctype_descriptions.py, erp_ai/tests/test_install.py — test: erp_ai/tests/test_install.py — depends: T1
+  - Tiêu chí: AC-1 (cài mới 5 ô tắt; migrate giữ (1), (4), ô (2), (3), (5) = 0; migrate lần hai không đổi); mô tả 5 ô, `site_environment`, `permission_level` theo `design.md:159-164, 184`.
+  - Receives: `section_permissions`, `keep_agent_settings` (T1); `install.ensure_setup`.
+  - Returns: trường Check `record_tools_enabled`, `act_now_enabled`, `one_click_approval_enabled` (mặc định 0); `unrestricted_enabled`, `code_change_enabled` chuyển vào `section_permissions` theo thứ tự `design.md:98`; `section_code_change` chỉ còn `code_change_apps`; lớp `TestFeat007Migrate` trong `test_install.py`.
+  - Expect: `TestFeat007Migrate::test_fresh_install_five_switches_off`, `::test_migrate_keeps_old_switches_new_switches_off`, `::test_second_migrate_changes_nothing` xanh; `test_code_change_block_follows_feat006_fields` sửa theo vị trí mới, lý do NFR-8 ghi trong commit.
+- [ ] T3 — Năm cột mới của ERP AI Log [migrate] — files: erp_ai/erp_ai_agent/doctype/erp_ai_log/erp_ai_log.json, erp_ai/tests/test_doctype_descriptions.py — test: erp_ai/tests/test_doctype_descriptions.py — depends: T2
+  - Tiêu chí: D-5 / F-5 (chỉ thêm; không đổi option `entry_type`, `trigger`).
+  - Receives: `DOCTYPE_CONFIG["ERP AI Log"]` (`field_count` 38 trên nền).
+  - Returns: cột `created_labels` (Small Text), `predicted_confidence_pct` (Int), `split_requested` (Check), `split_requests` (Small Text), `site_environment` (Data); `field_count` nền + 5, cụm từ cho 5 trường.
+  - Expect: `cmd.test_one` xanh; `erp_ai/tests/test_architecture.py::TestArchitecture::test_entry_types_unchanged` xanh, không bị sửa.
+- [ ] T4 — Trường `actions` của ERP AI Log thành Long Text [migrate] — files: erp_ai/erp_ai_agent/doctype/erp_ai_log/erp_ai_log.json, erp_ai/erp_ai_agent/doctype/erp_ai_log/test_erp_ai_log.py — test: erp_ai/erp_ai_agent/doctype/erp_ai_log/test_erp_ai_log.py — depends: T3
+  - Tiêu chí: D-6 / F-6 (chỉ đổi `fieldtype`; không đổi tên, vị trí, `read_only`).
+  - Receives: `run_log.write_entry(entry_type="reason", trigger="ticket_insert", actions=[...])` (hiện có).
+  - Returns: lớp `TestActionsLongText`; commit độc lập (team-leader có thể đưa sớm vào `develop`, F-6).
+  - Expect: `::test_write_entry_actions_over_65535_bytes_round_trips`, `::test_actions_fieldtype_long_text`, `::test_actions_column_is_longtext` xanh.
+- [ ] T5 — ERP AI Instructor đọc được ERP AI Log qua báo cáo [migrate] — files: erp_ai/erp_ai_agent/doctype/erp_ai_log/erp_ai_log.json, erp_ai/erp_ai_agent/doctype/erp_ai_log/test_erp_ai_log.py, erp_ai/tests/test_install.py — test: erp_ai/erp_ai_agent/doctype/erp_ai_log/test_erp_ai_log.py — depends: T4
+  - Tiêu chí: AC-20, D-5 (DocPerm `ERP AI Instructor` đúng `read=1`, `report=1`, mọi quyền khác 0; append-only giữ nguyên).
+  - Receives: `TestFeat007Migrate` (T2); test hiện có `TestERPAILog::test_no_role_can_write_or_delete`.
+  - Returns: DocPerm thứ ba trên ERP AI Log (T31, T55 dựa vào).
+  - Expect: `TestERPAILog::test_no_role_can_write_or_delete` (sửa: tập role = System Manager, ERP AI Agent, ERP AI Instructor; lý do NFR-8 trong commit) xanh; `erp_ai/tests/test_install.py::TestFeat007Migrate::test_instructor_can_report_on_log` xanh.
+- [ ] T6 — Thông báo khi bật quyền mở rộng — files: erp_ai/erp_ai_agent/doctype/erp_ai_setting/erp_ai_setting.py, erp_ai/erp_ai_agent/doctype/erp_ai_setting/test_erp_ai_setting.py — test: erp_ai/erp_ai_agent/doctype/erp_ai_setting/test_erp_ai_setting.py — depends: T2
+  - Tiêu chí: AC-4 phần form (`design.md:322`): một `frappe.msgprint` tiêu đề "Đã bật quyền mở rộng", mỗi ô 0 → 1 một dòng nhãn + mô tả, dòng cuối môi trường site.
+  - Receives: 5 trường Check của `section_permissions`, `site_environment` (T1, T2).
+  - Returns: `notify_permission_switches()` gọi trong `on_update`, đọc danh sách ô từ meta (D-7).
+  - Expect: `TestPermissionSwitchNotice::test_each_switch_on_shows_name_consequence_environment` (5 ca), `::test_save_without_switch_change_no_notice`, `::test_switch_off_no_notice`, `::test_unrestricted_notice_has_call_method_caveat` xanh.
+- [ ] T7 — Trường mức tự chủ theo đầu mục [migrate] — files: erp_ai/erp_ai_agent/doctype/erp_ai_setting/erp_ai_setting.json, erp_ai/erp_ai_agent/doctype/erp_ai_setting/erp_ai_setting.py, erp_ai/erp_ai_agent/doctype/erp_ai_setting/test_erp_ai_setting.py, erp_ai/tests/test_doctype_descriptions.py — test: erp_ai/erp_ai_agent/doctype/erp_ai_setting/test_erp_ai_setting.py — depends: T3, T6
+  - Tiêu chí: AC-31 (cap mặc định A L2, B L3, C L1, D L2, E L1, F L3); AC-22 (`confidence_threshold` 70, 0..100); AC-36 (`auto_approve_streak` 20, 1..100).
+  - Receives: `INT_LIMITS` (hiện có, chữ lỗi "<nhãn> phải từ a đến b").
+  - Returns: section `section_autonomy` với `level_cap_a`..`level_cap_f`, `confidence_threshold`, `auto_approve_streak`; lớp `TestFeat007Limits`.
+  - Expect: `TestFeat007Defaults::test_level_caps_default`, `TestFeat007Limits::test_int_limits_edges` (2 trường: low−1 chặn, low, high, high+1 chặn) xanh.
+- [ ] T8 — Bảng con ERP AI Catalog Rule lấy option từ hằng [migrate] — files: erp_ai/constants.py, erp_ai/erp_ai_agent/doctype/erp_ai_catalog_rule/{__init__.py,erp_ai_catalog_rule.json,erp_ai_catalog_rule.py}, erp_ai/erp_ai_agent/doctype/erp_ai_setting/test_erp_ai_setting.py, erp_ai/tests/test_doctype_descriptions.py — test: erp_ai/erp_ai_agent/doctype/erp_ai_setting/test_erp_ai_setting.py — depends: T7
+  - Tiêu chí: AC-29 (một nguồn option), F-1 (hằng ở `erp_ai/constants.py`, một khối liền cuối file), ràng buộc A-D6 (file giữ là module lá).
+  - Receives: `erp_ai/constants.py` hiện có (0 dòng import).
+  - Returns: khối hằng FEAT-007 đúng `plan.md` "Ràng buộc chung" (`ACTION_*` ×6, `CATALOG_ACTIONS`, `MODE_*` ×3, `CATALOG_MODES`, `KPI_IDS`, `TICKET_CONTENT_DOCTYPES`); DocType con `ERP AI Catalog Rule` (`action`, `target_doctype`, `fields`, `categories`, `mode` mặc định `Cần duyệt`, `design.md:204-210`), controller là lớp `Document` rỗng; `DOCTYPE_CONFIG` cho bảng con; lớp `TestCatalogRules`.
+  - Expect: `TestCatalogRules::test_select_options_match_constants` (option `action`, `mode` của JSON = `"\n".join` của `CATALOG_ACTIONS`, `CATALOG_MODES`) xanh; `erp_ai/constants.py` sau task có 0 dòng bắt đầu bằng `import` hoặc `from` (dán đầu ra lệnh đếm trong báo cáo).
+- [ ] T9 — Hàm `hard_ban_reason` ở Lõi — files: erp_ai/agent/hard_bans.py, erp_ai/agent/test_hard_bans.py — test: erp_ai/agent/test_hard_bans.py — depends: T1
+  - Tiêu chí: ADR-031 Ràng buộc, F-3 (thứ tự 3 lý do), C-2 (tập module được import).
+  - Receives: `read.denied_doctypes()`, `site_api.DENIED_DOCTYPES` (tên trên nền `develop`; đổi sang `site_api.PERMISSION_DOCTYPES` ở T57).
+  - Returns: `hard_ban_reason(doctype: str) -> str | None`; lý do theo thứ tự: "DocType bị cấm với bot (dữ liệu của app, tài khoản hoặc dữ liệu nhạy cảm)", "DocType phân quyền", "chứng từ submit".
+  - Expect: `TestHardBanReason::test_reasons_in_order`, `::test_no_doctype_literal_in_module` (không hằng chuỗi nào trùng tên DocType; module chỉ import `frappe`, `erp_ai.agent.tools.read`, `erp_ai.agent.tools.site_api`) xanh; `test_architecture.py::TestArchitecture::test_layer_imports` xanh; `erp_ai/agent/policy.py` không import `erp_ai.agent.hard_bans`.
+- [ ] T10 — Dòng danh mục trỏ DocType cấm bị chặn khi lưu [migrate] — files: erp_ai/erp_ai_agent/doctype/erp_ai_setting/erp_ai_setting.json, erp_ai/erp_ai_agent/doctype/erp_ai_setting/erp_ai_setting.py, erp_ai/erp_ai_agent/doctype/erp_ai_setting/test_erp_ai_setting.py, erp_ai/tests/test_doctype_descriptions.py — test: erp_ai/erp_ai_agent/doctype/erp_ai_setting/test_erp_ai_setting.py — depends: T8, T9
+  - Tiêu chí: AC-29 (4 dòng cấm: DocType của app, phân quyền, chứng từ submit, hành động không có), ADR-031 QĐ 1.
+  - Receives: `CATALOG_ACTIONS` (T8); `hard_ban_reason` (T9); DocType `ERP AI Catalog Rule` (T8).
+  - Returns: section `section_catalog` + trường `catalog_rules`; `check_catalog_rules()` với lỗi "Danh mục dòng {idx}: {lý do}", lý do "hành động không hợp lệ", "không có DocType {dt}", "DocType {dt} bị cấm cứng: {lý do của hard_ban_reason}".
+  - Expect: `TestCatalogRules::test_four_hard_bans_blocked`, `::test_hard_ban_follows_denied_doctypes_source` (ca a, b) xanh.
+- [ ] T11 — Hình dạng dòng danh mục được kiểm khi lưu — files: erp_ai/erp_ai_agent/doctype/erp_ai_setting/erp_ai_setting.py, erp_ai/erp_ai_agent/doctype/erp_ai_setting/test_erp_ai_setting.py — test: erp_ai/erp_ai_agent/doctype/erp_ai_setting/test_erp_ai_setting.py — depends: T10
+  - Tiêu chí: AC-29 (DocType/trường theo hành động theo bảng `design.md:214-221`, đầu mục A–F, dòng trùng; dòng hợp lệ lưu được).
+  - Receives: `check_catalog_rules()` (T10); `ACTION_*` (T8).
+  - Returns: các lý do còn lại của E-4 (`design.md:300, 303-305`); `categories` chuẩn hóa về dạng `A,B` (bỏ trùng, sắp xếp).
+  - Expect: `TestCatalogRules::test_row_shape_rules`, `::test_valid_rule_saves_and_categories_normalized` xanh.
+- [ ] T12 — Mẫu tài khoản không chứa vai trò cấm [migrate] — files: erp_ai/erp_ai_agent/doctype/erp_ai_user_template/{__init__.py,erp_ai_user_template.json,erp_ai_user_template.py}, erp_ai/erp_ai_agent/doctype/erp_ai_setting/erp_ai_setting.json, erp_ai/erp_ai_agent/doctype/erp_ai_setting/erp_ai_setting.py, erp_ai/erp_ai_agent/doctype/erp_ai_setting/test_erp_ai_setting.py, erp_ai/tests/test_doctype_descriptions.py — test: erp_ai/erp_ai_agent/doctype/erp_ai_setting/test_erp_ai_setting.py — depends: T11
+  - Tiêu chí: AC-30 (1) (6 vai trò cấm, vai trò không có, tên trùng không phân biệt hoa thường).
+  - Receives: `site_api.FORBIDDEN_ROLES` (hiện có); `section_catalog` (T10).
+  - Returns: DocType con `ERP AI User Template` (`template_name`, `roles`, `note`); trường `user_templates`; `check_user_templates()` với lỗi "Mẫu tài khoản dòng {idx}: {lý do}" (E-5, `design.md:306`); `DOCTYPE_CONFIG` cho bảng con.
+  - Expect: `TestUserTemplates::test_forbidden_role_blocked`, `::test_unknown_role_and_duplicate_name_blocked`, `::test_valid_template_saves` xanh.
+- [ ] T13 — Tên trường sẵn có của phiếu được kiểm khi lưu [migrate] — files: erp_ai/erp_ai_agent/doctype/erp_ai_setting/erp_ai_setting.json, erp_ai/erp_ai_agent/doctype/erp_ai_setting/erp_ai_setting.py, erp_ai/erp_ai_agent/doctype/erp_ai_setting/test_erp_ai_setting.py, erp_ai/tests/test_doctype_descriptions.py — test: erp_ai/erp_ai_agent/doctype/erp_ai_setting/test_erp_ai_setting.py — depends: T12
+  - Tiêu chí: AC-24 (E-1, E-2, E-3 của `design.md:294-297`); D-19 (`excluded_title_prefixes` mặc định `[HR]\n[Kế toán]`, chỉ là trường, hành vi ở U2).
+  - Receives: `frappe.get_meta("HD Ticket")`.
+  - Returns: section `section_ticket_fields` với `field_ticket_nature`, `field_erp_module`, `field_origin`, `origin_board_value`, `field_due_date`, `field_project`, `field_item_code`, `field_serial_no`; `excluded_title_prefixes` trong `section_routing` sau `excluded_teams`; `check_ticket_field_names()`.
+  - Expect: `TestTicketFieldNames::test_unknown_field_blocked`, `::test_due_field_must_be_date`, `::test_board_value_needs_origin_field`, `::test_existing_custom_field_saves` xanh.
+- [ ] T14 — Mục tri thức: trường mới, kho HDSD được kiểm khi lưu [migrate] — files: erp_ai/erp_ai_agent/doctype/erp_ai_setting/erp_ai_setting.json, erp_ai/erp_ai_agent/doctype/erp_ai_setting/erp_ai_setting.py, erp_ai/erp_ai_agent/doctype/erp_ai_setting/test_erp_ai_setting.py, erp_ai/tests/test_doctype_descriptions.py — test: erp_ai/erp_ai_agent/doctype/erp_ai_setting/test_erp_ai_setting.py — depends: T13
+  - Tiêu chí: AC-47 (E-7: kho phải là thư mục có sẵn dưới `apps/`, khác chính `apps/`); AC-44 (`close_silent_f_days` 3, 1..30); AC-46 (`knowledge_search_limit` 5, 1..20); `report_row_limit` 20, 1..100; 4 ô Check mặc định 0.
+  - Receives: `source.resolve_safe_path(rel)` (hiện có); `TempAppsRoot` (`test_utils.py`); `TestFeat007Limits` (T7).
+  - Returns: section `section_knowledge` với 9 trường theo `design.md:107`; `check_manuals_dir()`; 3 dòng `INT_LIMITS`. `allowed_reports` chỉ là trường (kiểm ở T15).
+  - Expect: `TestManualsDir::test_missing_or_outside_dir_blocked`, `::test_existing_dir_saves`; `TestFeat007Limits::test_int_limits_edges` (thêm 3 trường) xanh.
+- [ ] T15 — Báo cáo mang nội dung phiếu không vào danh sách bot được chạy — files: erp_ai/erp_ai_agent/doctype/erp_ai_setting/erp_ai_setting.py, erp_ai/erp_ai_agent/doctype/erp_ai_setting/test_erp_ai_setting.py — test: erp_ai/erp_ai_agent/doctype/erp_ai_setting/test_erp_ai_setting.py — depends: T14
+  - Tiêu chí: AC-49, ADR-034 QĐ 3 (E-6, chữ ở `design-w0-fixes.md` F-1 "Thay `design.md:307`").
+  - Receives: `TICKET_CONTENT_DOCTYPES` (T8); `read.denied_doctypes()`; trường `allowed_reports` (T14).
+  - Returns: `check_allowed_reports()`.
+  - Expect: `TestAllowedReports::test_unknown_type_disabled_ticket_based_blocked`, `::test_log_based_report_blocked`, `::test_safe_report_saves` xanh.
+- [ ] T16 — Mục vận hành: trường mới, người nhận được kiểm khi lưu [migrate] — files: erp_ai/erp_ai_agent/doctype/erp_ai_setting/erp_ai_setting.json, erp_ai/erp_ai_agent/doctype/erp_ai_setting/erp_ai_setting.py, erp_ai/erp_ai_agent/doctype/erp_ai_setting/test_erp_ai_setting.py, erp_ai/tests/test_doctype_descriptions.py — test: erp_ai/erp_ai_agent/doctype/erp_ai_setting/test_erp_ai_setting.py — depends: T15
+  - Tiêu chí: AC-51, AC-59, AC-27 (E-8, `design.md:309`); AC-63 (`max_tasks_per_run` 10, 1..20); AC-26 (mốc phản hồi mặc định dùng lại `routing_rules`, D-2); khoảng số: `review_sample_size` 1..50, `due_reminder_hours` 1..168, `ba_note_due_hours` 1..168, `task_due_days` 1..30.
+  - Receives: `DEFAULT_ROUTING_RULES.expected_sla` (`routing.py`, hiện có); `AGENT_USER`.
+  - Returns: section `section_operations` với 12 trường theo `design.md:108` (`kpi_targets` mặc định là JSON của `design.md:189-197`; `daily_report_sent_on`, `budget_alert_sent_month` read-only); `check_operation_people()`; 5 dòng `INT_LIMITS`.
+  - Expect: `TestOperationPeople::test_bad_email_blocked`, `::test_disabled_reviewer_blocked`, `::test_watcher_must_be_enabled_human`; `TestFeat007Defaults::test_response_targets_reuse_routing_rules` (15, 15, 60, 60, 60, 5; có thể xanh ngay vì ghim hành vi sẵn có, ghi rõ trong báo cáo); `test_int_limits_edges` (thêm 5 trường) xanh.
+- [ ] T17 — Mục tiêu KPI sai bị chặn khi lưu — files: erp_ai/erp_ai_agent/doctype/erp_ai_setting/erp_ai_setting.py, erp_ai/erp_ai_agent/doctype/erp_ai_setting/test_erp_ai_setting.py — test: erp_ai/erp_ai_agent/doctype/erp_ai_setting/test_erp_ai_setting.py — depends: T16
+  - Tiêu chí: AC-55 (E-9, `design.md:310`: đúng 6 khóa `KPI_IDS`, mỗi khóa đúng `gd2`, `gd4` là số ≥ 0; rỗng → lỗi kèm JSON mặc định).
+  - Receives: `KPI_IDS` (T8); trường `kpi_targets` (T16).
+  - Returns: `check_kpi_targets()` với lỗi "Mục tiêu KPI: {đường dẫn khóa} {lỗi}".
+  - Expect: `TestKpiTargets::test_bad_targets_blocked` (thiếu khóa, giá trị âm, JSON hỏng, rỗng), `::test_default_targets_valid` xanh.
+- [ ] T18 — Mốc tự quản không bị người dời khi lưu [migrate] — files: erp_ai/erp_ai_agent/doctype/erp_ai_setting/erp_ai_setting.json, erp_ai/erp_ai_agent/doctype/erp_ai_setting/erp_ai_setting.py, erp_ai/erp_ai_agent/doctype/erp_ai_setting/test_erp_ai_setting.py, erp_ai/tests/test_doctype_descriptions.py — test: erp_ai/erp_ai_agent/doctype/erp_ai_setting/test_erp_ai_setting.py — depends: T17
+  - Tiêu chí: ADR-033 QĐ 6 (`design.md:291, 319`); AC-16 (mốc `agent_enabled_at`).
+  - Receives: `restore_self_managed_fields()` (hiện có); `daily_report_sent_on`, `budget_alert_sent_month` (T16).
+  - Returns: trường `agent_enabled_at` (Datetime, read-only) trong `section_activation`; `restore_self_managed_fields()` lấy lại 3 mốc từ DB (`cache=False`); `stamp_agent_enabled_at()` đặt `now_datetime()` chỉ khi `enabled` đổi 0 → 1.
+  - Expect: `TestSelfManagedFeat007::test_watermarks_restored_on_human_save`, `::test_agent_enabled_at_stamped_on_enable_only` xanh.
+- [ ] T19 — Ghi đè prompt thiếu mục bắt buộc bị chặn [migrate] — files: erp_ai/erp_ai_agent/doctype/erp_ai_prompt_revision/{__init__.py,erp_ai_prompt_revision.json,erp_ai_prompt_revision.py}, erp_ai/erp_ai_agent/doctype/erp_ai_setting/erp_ai_setting.json, erp_ai/erp_ai_agent/doctype/erp_ai_setting/erp_ai_setting.py, erp_ai/erp_ai_agent/doctype/erp_ai_setting/test_erp_ai_setting.py, erp_ai/tests/test_doctype_descriptions.py — test: erp_ai/erp_ai_agent/doctype/erp_ai_setting/test_erp_ai_setting.py — depends: T18
+  - Tiêu chí: AC-38 (E-10, `design.md:311-317`: quá 20000 ký tự, thiếu mục bắt buộc của từng phần; bản dựng sẵn tự qua kiểm).
+  - Receives: `CLASSIFY_PROMPT`, `CORE_PROMPT`, `CATEGORY_TABLE` (`prompts.py`, hiện có).
+  - Returns: DocType con `ERP AI Prompt Revision` (`part`, `changed_by`, `changed_at`, `old_value`, `new_length`, mọi trường read-only); section `section_prompts` với `prompt_override_classify`, `prompt_override_reasoning`, `prompt_override_category_guide`, `prompt_revisions`; `PROMPT_OVERRIDE_MAX_CHARS = 20000`, `PROMPT_REQUIRED_MARKERS`, `check_prompt_overrides()` (ở controller, Lõi không import); `DOCTYPE_CONFIG` cho bảng con. Mục `classify` của `PROMPT_REQUIRED_MARKERS` ở đợt 0 gồm đúng 11 khóa của `design.md:314`; khóa thứ 12 `"do_tin_cay_pct"` (`design-addendum-1-U1.md:63`) không thêm ở task này vì `CLASSIFY_PROMPT` chưa có khóa đó trước U1 và `test_builtin_prompts_pass_required_markers` sẽ đỏ (`plan.md` mục Rủi ro).
+  - Expect: `TestPromptOverrides::test_missing_marker_blocked_each_part`, `::test_too_long_blocked`, `::test_builtin_prompts_pass_required_markers` xanh; `DOCTYPE_CONFIG["ERP AI Setting"]`: `field_count` = nền + 49, `section_count` = nền + 7; `test_every_new_field_default` phủ đủ 49 trường.
+- [ ] T20 — Lịch sử ghi đè prompt do hệ thống ghi — files: erp_ai/erp_ai_agent/doctype/erp_ai_setting/erp_ai_setting.py, erp_ai/erp_ai_agent/doctype/erp_ai_setting/erp_ai_setting.js, erp_ai/erp_ai_agent/doctype/erp_ai_setting/test_erp_ai_setting.py — test: erp_ai/erp_ai_agent/doctype/erp_ai_setting/test_erp_ai_setting.py — depends: T19
+  - Tiêu chí: AC-38 (người sửa, thời điểm, giá trị cũ; không đổi → không dòng; người không sửa được lịch sử), D-3.
+  - Receives: `prompt_revisions`, `restore_self_managed_fields()` (T18, T19).
+  - Returns: `record_prompt_revisions()` (`design.md:318`); bước khôi phục `prompt_revisions` từ DB trong `restore_self_managed_fields()`; `erp_ai_setting.js` đặt `cannot_add_rows`, `cannot_delete_rows` cho `prompt_revisions`.
+  - Expect: `TestPromptOverrides::test_revision_row_on_change`, `::test_no_revision_without_change`, `::test_revisions_restored_on_save` xanh.
+- [ ] T21 — Cài đặt điền `agent_enabled_at` khi agent đang bật — files: erp_ai/install.py, erp_ai/tests/test_install.py — test: erp_ai/tests/test_install.py — depends: T5, T18
+  - Tiêu chí: AC-16 (mốc bật cho site đã bật trước khi nâng cấp), ADR-006 (chỉ điền trường thiếu); `design.md:329`.
+  - Receives: trường `agent_enabled_at` (T18); `_ensure_default_settings` (hiện có); `TestFeat007Migrate` (T2).
+  - Returns: một dòng trong `_ensure_default_settings`: `enabled` = 1 và `agent_enabled_at` thiếu → `now_datetime()`.
+  - Expect: `TestFeat007Migrate::test_agent_enabled_at_filled_once_when_enabled` (bật + thiếu → có giá trị; chạy `ensure_setup` lần hai không đổi; tắt → vẫn rỗng) xanh; `::test_second_migrate_changes_nothing` vẫn xanh.
+- [ ] T22 — Trường tùy biến `ai_confidence_pct`, `ai_source_ticket` do cài đặt tạo — files: erp_ai/install.py, erp_ai/tests/test_install.py — test: erp_ai/tests/test_install.py — depends: T21
+  - Tiêu chí: AC-22 / D-14 (HD Ticket `ai_confidence_pct` Int, read-only, permlevel 8, sau `ai_confidence`); AC-45 / D-15 (HD Article `ai_source_ticket` Link HD Ticket, read-only, `search_index` 1); `design.md:249-250, 330-331`.
+  - Receives: `_ai_field_specs`, `_ensure_task_ticket_field`, `ensure_setup` (hiện có).
+  - Returns: dòng `ai_confidence_pct` trong `_ai_field_specs`; `_ensure_article_source_field()` gọi trong `ensure_setup` sau `_ensure_task_ticket_field` (`create_custom_fields(update=False)`; DocType HD Article chưa có → cảnh báo logger, bỏ qua).
+  - Expect: `TestFeat007Migrate::test_confidence_pct_field_installed`, `::test_article_source_field_installed_idempotent`, `::test_article_field_skipped_when_doctype_missing` xanh.
+- [ ] T23 — Dòng thừa sau khi lùi phiên bản không làm hỏng form — files: erp_ai/tests/test_install.py — test: erp_ai/tests/test_install.py — depends: T20, T22
+  - Tiêu chí: STD-OPS-2 (chiều xuống: dòng `tabSingles` thừa, dòng bảng con mồ côi vô hại; `design.md:529`).
+  - Receives: 49 trường và 3 bảng con của U0 (T1–T19).
+  - Returns: 2 test ghim hành vi chiều xuống (không sửa mã sản phẩm; nếu xanh ngay, ghi rõ trong báo cáo kèm cách đã làm test đỏ thử).
+  - Expect: `TestFeat007Migrate::test_leftover_single_rows_dropped_on_next_human_save`, `::test_orphan_child_rows_do_not_break_get_single` xanh.
+
+## U4a — Phân loại, phần ngoài lõi
+
+- [ ] T24 — Ngoại lệ ưu tiên theo hạn hoàn thành — files: erp_ai/agent/routing.py, erp_ai/agent/test_routing.py — test: erp_ai/agent/test_routing.py — depends: T1
+  - Tiêu chí: AC-25 (`design.md:382-388`; không hạ mức đã cao; [GẤP], F, E giữ).
+  - Receives: `decide_route(...)`, `_priority`, `_rank` (hiện có).
+  - Returns: tham số mới có mặc định của `decide_route`: `due_at: datetime | None = None`, `due_field_configured: bool = False`, `d_watcher: str | None = None`, `now: datetime | None = None`; ghi chú "chưa cấu hình trường Hạn hoàn thành, bỏ qua ngoại lệ theo hạn".
+  - Expect: `TestPriorityExceptions::test_truth_table` (≥ 14 ca subTest), `::test_missing_due_field_note`, `::test_existing_rules_kept` xanh; test routing cũ không đổi.
+- [ ] T25 — Người theo dõi phiếu đầu mục D — files: erp_ai/agent/routing.py, erp_ai/agent/test_routing.py — test: erp_ai/agent/test_routing.py — depends: T24
+  - Tiêu chí: AC-27 phần quyết định (`design.md:389`).
+  - Receives: tham số `d_watcher`, `is_active_agent` của `decide_route` (T24).
+  - Returns: `RouteDecision.watcher: str | None = None`; ghi chú "chưa cấu hình người theo dõi phiếu D".
+  - Expect: `TestDWatcher::test_d_configured`, `::test_other_category_none`, `::test_d_unconfigured_note`, `::test_inactive_watcher_none` xanh.
+- [ ] T26 — Vị từ quá mốc phản hồi — files: erp_ai/agent/routing.py, erp_ai/agent/test_routing.py — test: erp_ai/agent/test_routing.py — depends: T25
+  - Tiêu chí: AC-26 (đúng bằng mốc → chưa quá; không biết đầu mục → `False`), D-18.
+  - Receives: `config["expected_sla"][category]["response_min"]` (hiện có).
+  - Returns: `response_overdue(created: datetime, first_responded_on: datetime | None, category: str | None, config: dict, now: datetime) -> bool`; `processing_deadline(category: str | None, resolution_by: datetime | None, due_at: datetime | None) -> datetime | None`.
+  - Expect: `TestResponseOverdue::test_over_exact_answered`, `::test_processing_deadline_d_with_and_without_due` xanh.
+- [ ] T27 — Chữ comment hỏi tách phiếu gộp — files: erp_ai/agent/classification.py, erp_ai/agent/test_classification.py — test: erp_ai/agent/test_classification.py — depends: T1
+  - Tiêu chí: AC-28 phần thuần (`design.md:409`: mỗi yêu cầu cắt 200 ký tự, tối đa 10).
+  - Receives: `needs_split`, `requests` của kết quả `parse_classification` (hiện có).
+  - Returns: `split_request_comment(classification) -> str | None`.
+  - Expect: `TestSplitComment::test_four_requests`, `::test_single_request_none`, `::test_caps_at_ten` xanh.
+- [ ] T28 — ERP AI Accuracy tính đúng theo nhãn của người — files: erp_ai/erp_ai_agent/report/erp_ai_accuracy/erp_ai_accuracy.py, erp_ai/erp_ai_agent/report/erp_ai_accuracy/test_erp_ai_accuracy.py — test: erp_ai/erp_ai_agent/report/erp_ai_accuracy/test_erp_ai_accuracy.py — depends: T3
+  - Tiêu chí: AC-19, D-9 (`design.md:397-400`); NFR-8 (test cũ ghim "im lặng = đúng" sửa theo AC-19, lý do trong commit).
+  - Receives: cột `created_labels` (T3); `human_corrected_to` (hiện có); `make_log_entry` (`test_utils.py`).
+  - Returns: cột `category`, `predictions`, `labeled`, `correct`, `accuracy_pct`, `failed_runs`; hàm nội bộ trả (labeled, correct) theo phiếu cho T29, T30.
+  - Expect: `TestLabels::test_six_label_cases` xanh.
+- [ ] T29 — Kết luận cửa L0 → L1 — files: erp_ai/erp_ai_agent/report/erp_ai_accuracy/erp_ai_accuracy.py, erp_ai/erp_ai_agent/report/erp_ai_accuracy/test_erp_ai_accuracy.py — test: erp_ai/erp_ai_agent/report/erp_ai_accuracy/test_erp_ai_accuracy.py — depends: T28
+  - Tiêu chí: AC-18 (`design.md:404`).
+  - Receives: luật nhãn (T28).
+  - Returns: `GATE_WINDOW_DAYS = 14`, `GATE_MIN_SAMPLE = 30`, `GATE_MIN_ACCURACY = 0.85`; dataclass `GateResult(verdict, labeled, correct)`; `l0_l1_gate(now: datetime | None = None) -> GateResult`, `verdict` ∈ "Chưa đủ mẫu", "Đạt", "Chưa đạt".
+  - Expect: `TestGate::test_not_enough_sample_29`, `::test_pass_exactly_85`, `::test_fail_82_5`, `::test_pass_30_26`, `::test_outside_window_ignored` xanh.
+- [ ] T30 — Ba số độ trễ phân loại trong tóm tắt báo cáo — files: erp_ai/erp_ai_agent/report/erp_ai_accuracy/erp_ai_accuracy.py, erp_ai/erp_ai_agent/report/erp_ai_accuracy/test_erp_ai_accuracy.py — test: erp_ai/erp_ai_agent/report/erp_ai_accuracy/test_erp_ai_accuracy.py — depends: T29
+  - Tiêu chí: AC-17, D-8 (`design.md:401-403`: đúng 5:00 tính "≤ 5"; phiếu bỏ qua có chủ ý không đếm).
+  - Receives: `l0_l1_gate()` (T29); `policy.can_send_ticket`, `CLASSIFICATION_FIELDS` (hiện có).
+  - Returns: `execute(filters)` trả `columns, data, None, None, report_summary` với "Phân loại ≤ 5 phút", "Phân loại > 5 phút", "Chưa phân loại", "Cửa L0 → L1".
+  - Expect: `TestLatencySummary::test_six_tickets_three_numbers` xanh.
+- [ ] T31 — ERP AI Instructor chạy được ERP AI Accuracy [migrate] — files: erp_ai/erp_ai_agent/report/erp_ai_accuracy/erp_ai_accuracy.json, erp_ai/erp_ai_agent/report/erp_ai_accuracy/test_erp_ai_accuracy.py — test: erp_ai/erp_ai_agent/report/erp_ai_accuracy/test_erp_ai_accuracy.py — depends: T5, T30
+  - Tiêu chí: AC-20 (Instructor được; chỉ ERP AI Agent bị từ chối; System Manager được).
+  - Receives: DocPerm `report` của Instructor trên ERP AI Log (T5).
+  - Returns: `roles` của Report thêm `ERP AI Instructor`.
+  - Expect: `TestAccess::test_three_accounts` (gọi `frappe.desk.query_report.run` dưới từng tài khoản) xanh.
+- [ ] T32 — Cảnh báo khi nâng mức mà chưa đạt cửa L0 → L1 — files: erp_ai/erp_ai_agent/doctype/erp_ai_setting/erp_ai_setting.py, erp_ai/erp_ai_agent/doctype/erp_ai_setting/test_erp_ai_setting.py — test: erp_ai/erp_ai_agent/doctype/erp_ai_setting/test_erp_ai_setting.py — depends: T20, T29
+  - Tiêu chí: AC-18 phần form (`design.md:323`; không chặn lưu, A-8).
+  - Receives: `l0_l1_gate() -> GateResult` (T29, import từ module báo cáo; controller được phép, Lõi thì không).
+  - Returns: `warn_level_raise_without_gate()` trong `on_update`: mức trước `L0`, mức mới ≥ `L1`, `verdict != "Đạt"` → `frappe.msgprint(..., title="Chưa đạt cửa L0 → L1", indicator="orange")`.
+  - Expect: `TestLevelRaiseWarning::test_raise_from_l0_not_passed_warns_and_saves`, `::test_raise_from_l0_passed_no_warning`, `::test_change_l1_to_l2_no_gate_warning` xanh.
+- [ ] T33 — Tìm phiếu bị lỡ phân loại — files: erp_ai/agent/missed_scan.py, erp_ai/agent/test_missed_scan.py — test: erp_ai/agent/test_missed_scan.py — depends: T18
+  - Tiêu chí: AC-16 (8 điều kiện của `design.md:368-376`), D-16, A-D3.
+  - Receives: trường `agent_enabled_at` (T18); `policy.can_send_ticket`, `policy.runs_today`, `CLASSIFICATION_FIELDS`, `AGENT_USER` (hiện có).
+  - Returns: `SCAN_BATCH = 50`, `SCAN_GRACE_MIN = 5`; `find_missed_tickets(now: datetime) -> list[str]` (không import gateway, runner).
+  - Expect: `TestMissedScan::test_seven_ticket_kinds`, `::test_failed_run_requeued`, `::test_grace_edge_exactly_five_minutes`, `::test_no_enabled_at_noop` xanh.
+- [ ] T34 — Việc quét 15 phút xếp lại phiếu bị lỡ [migrate] — files: erp_ai/agent/missed_scan.py, erp_ai/agent/test_missed_scan.py, erp_ai/hooks.py — test: erp_ai/agent/test_missed_scan.py — depends: T33, T44
+  - Tiêu chí: AC-16 (lịch 15 phút; quét hai lần → một job mỗi phiếu, NFR-3); ADR-033 QĐ 2; D-17 (1 dòng logger mỗi lần chạy).
+  - Receives: `find_missed_tickets` (T33); `queue.enqueue_agent_run(ticket, trigger)`, `TRIGGER_TICKET_INSERT`, `policy.is_enabled()` (hiện có); khóa `cron` của `scheduler_events` (T44).
+  - Returns: `scan_missed_tickets(now: datetime | None = None) -> None`; dòng `"*/15 * * * *": ["erp_ai.agent.missed_scan.scan_missed_tickets"]` trong `hooks.py`.
+  - Expect: `TestMissedScan::test_two_scans_one_job_per_ticket`, `::test_agent_disabled_noop`, `::test_cron_declared_every_15_minutes` xanh.
+
+## U6a — Tri thức, hàm đọc
+
+- [ ] T35 — Hàm che bí mật dùng chung — files: erp_ai/agent/redact.py, erp_ai/agent/test_redact.py — test: erp_ai/agent/test_redact.py — depends: T1
+  - Tiêu chí: NFR-6, ADR-034 QĐ 2 (`design.md:486`: từng mẫu, giữ tên khóa, không che chữ thường).
+  - Receives: —
+  - Returns: `SECRET_PATTERNS`; `redact_secrets(text: str | None) -> str` (thay bằng "[đã che]").
+  - Expect: `TestRedact::test_each_pattern`, `::test_plain_text_untouched` xanh.
+- [ ] T36 — Đọc Error Log có giới hạn — files: erp_ai/agent/system_read.py, erp_ai/agent/test_system_read.py — test: erp_ai/agent/test_system_read.py — depends: T35
+  - Tiêu chí: AC-50 (`design.md:487`: mặc định 24 giờ, tối đa 7 ngày, `limit` 1..50, `keyword` 2..100 ký tự, LIKE có escape, `error` giữ 2000 ký tự cuối); NFR-6; STD-SEC-3.
+  - Receives: `redact_secrets` (T35); `pin_agent_roles` (`test_utils.py`).
+  - Returns: `read_error_logs(since=None, until=None, keyword=None, limit=20) -> list[dict]` với khóa `name`, `creation`, `method`, `error`; lỗi "Khoảng thời gian tối đa 7 ngày".
+  - Expect: `TestErrorLogs::test_time_and_keyword_filter`, `::test_limit_bounds`, `::test_window_over_seven_days_refused`, `::test_seeded_secrets_masked`, `::test_agent_roles_unchanged`, `::test_keyword_wildcards_escaped_and_length_bounds` (từ khóa `%`, `_` không khớp mọi dòng; 1 ký tự và 101 ký tự bị từ chối) xanh.
+- [ ] T37 — Tìm bài CSKT đã xuất bản theo số từ khớp — files: erp_ai/agent/knowledge.py, erp_ai/agent/test_knowledge.py — test: erp_ai/agent/test_knowledge.py — depends: T35
+  - Tiêu chí: AC-46, D-12, ADR-034 QĐ 4 (`design.md:489-490`: chỉ Published, theo quyền phiên đang chạy, giữ dấu, `KB_SCAN_MAX = 200`, trích 300 ký tự).
+  - Receives: `redact_secrets` (T35).
+  - Returns: `tokenize(text) -> list[str]`; `search_kb_articles(query: str, limit: int) -> list[dict]` với khóa `name`, `title`, `excerpt`; lỗi "Câu tìm cần ít nhất một từ dài 2 ký tự".
+  - Expect: `TestKbSearch::test_only_published`, `::test_rank_by_matched_words`, `::test_reversed_two_words`, `::test_limit`, `::test_vietnamese_accents_distinguish`, `::test_empty_query_refused`, `::test_no_helpdesk_search_import` xanh.
+- [ ] T38 — File trong kho HDSD không đọc được qua công cụ mã nguồn — files: erp_ai/agent/tools/source.py, erp_ai/agent/tools/test_source.py — test: erp_ai/agent/tools/test_source.py — depends: T14
+  - Tiêu chí: AC-47, ADR-034 QĐ 5 (`design.md:492`; thư mục kho vẫn lưu được ở T14).
+  - Receives: trường `manuals_dir` (T14); `resolve_safe_path(rel)` (hiện có); `TempAppsRoot`.
+  - Returns: `_base_resolve(rel)`; `manuals_root()`; `resolve_manual_path(rel)`; `resolve_safe_path(rel)` trả `None` khi đích là file trong `manuals_root()`; chữ ký `read_source`, `search_source`, `git_source` không đổi.
+  - Expect: `TestManualsExcluded::test_read_source_refuses_manual_file`, `::test_search_source_skips_manuals`, `::test_resolve_manual_path_only_inside` xanh; `erp_ai/erp_ai_agent/doctype/erp_ai_setting/test_erp_ai_setting.py::TestManualsDir::test_existing_dir_saves` vẫn xanh.
+- [ ] T39 — Tìm trong kho HDSD theo mục — files: erp_ai/agent/knowledge.py, erp_ai/agent/test_knowledge.py — test: erp_ai/agent/test_knowledge.py — depends: T37, T38
+  - Tiêu chí: AC-47 (`design.md:491`: `MANUALS_MAX_FILES = 500`, mỗi file ≤ 1 MiB, ngân sách 10 s, cắt mục theo dòng bắt đầu bằng `#`).
+  - Receives: `tokenize` (T37); `source.resolve_manual_path` (T38).
+  - Returns: `search_manuals(query: str, limit: int, manuals_dir: str | None) -> list[dict] | None` với khóa `document`, `heading`, `line`, `excerpt`; `manuals_dir` rỗng → `None`.
+  - Expect: `TestManuals::test_match_returns_document_heading_line`, `::test_no_match_empty`, `::test_unconfigured_none` xanh.
+- [ ] T40 — Tài khoản agent chỉ lưu được bài CSKT nháp của chính nó [migrate] — files: erp_ai/agent/article_guard.py, erp_ai/agent/test_article_guard.py, erp_ai/hooks.py — test: erp_ai/agent/test_article_guard.py — depends: T1
+  - Tiêu chí: AC-45 phần chặn, ADR-034 QĐ 6 và Ràng buộc (`design.md:493`).
+  - Receives: `AGENT_USER` (hiện có).
+  - Returns: `check_article_write(doc, method)`, `check_article_delete(doc, method)` (ném `frappe.PermissionError`); `doc_events["HD Article"]` với `validate`, `on_trash` theo `design.md:346-349`.
+  - Expect: `TestArticleGuard::test_agent_insert_draft_ok`, `::test_agent_publish_refused`, `::test_agent_edit_human_article_refused`, `::test_agent_delete_refused`, `::test_human_publishes_bot_draft`, `::test_hooks_registered` xanh.
+
+## U5a — Vận hành, phần ngoài lõi
+
+- [ ] T41 — Khóa chu kỳ tính từ lịch — files: erp_ai/agent/ops_data.py, erp_ai/agent/test_ops_data.py — test: erp_ai/agent/test_ops_data.py — depends: T1
+  - Tiêu chí: AC-52 / ADR-033 QĐ 6 (`design.md:419-425`: chạy 02:00 → chu kỳ hôm qua).
+  - Receives: —
+  - Returns: `daily_cycle(now) -> date`; `weekly_cycle(now) -> date`; `monthly_cycle(now) -> str` (`YYYY-MM`); `category_by_ticket_type(mapping) -> dict[str, str]`; `ticket_category(ticket_row, reverse_map) -> str | None`; `BA_NOTE_MARKER = "**BA note**"`.
+  - Expect: `TestCycles::test_daily_weekly_monthly_cycles` xanh.
+- [ ] T42 — Ba hàm xếp hàng cho job theo lịch — files: erp_ai/agent/queue.py, erp_ai/agent/test_queue.py, erp_ai/tests/test_architecture.py — test: erp_ai/agent/test_queue.py — depends: T1
+  - Tiêu chí: ADR-003/ADR-013 QĐ 2, ADR-033 QĐ 6; F-2 (`design-w0-fixes.md:72-86`); C-1 (`arch-review-design-w0-r2.md:51`).
+  - Receives: `enqueue_agent_run`, `enqueue_change_job` (hiện có, không đổi); `ENQUEUE_TARGETS`, `check_enqueue_call_shape` (`test_architecture.py`).
+  - Returns: `SCHEDULED_JOB_TIMEOUT_S = 1200`; `enqueue_daily_report_job() -> None`, `enqueue_weekly_kpi_job() -> None`, `enqueue_monthly_review_job() -> None` (đích và `job_id` theo `plan.md` "Ràng buộc chung"); `ENQUEUE_TARGETS` 5 chuỗi; chữ lỗi `f"expected exactly {len(ENQUEUE_TARGETS)} enqueue calls, one per target"`.
+  - Expect: `TestEnqueueScheduledJobs::test_each_job_shape` (subTest ×3) xanh, `TestEnqueueAgentRun`, `TestEnqueueChangeJob` không đổi; `cmd.test_one` với `erp_ai/tests/test_architecture.py`: `test_enqueue_targets_pinned` (5 chuỗi), `test_enqueue_call_shape_requires_one_call_per_target` (đổi tên), `test_enqueue_call_shape_requires_each_target_once` và `test_enqueue_call_shape_rejects_target_outside_set` (thân có đúng `len(ENQUEUE_TARGETS)` lời gọi, khẳng định "each of" và "first argument" giữ nguyên) xanh; lớp `TestScannersCatchViolations` không mất ca nào; lý do sửa ghim (ADR-033 QĐ 6) trong commit.
+- [ ] T43 — Bảng ERP AI KPI Week mỗi tuần một dòng [migrate] — files: erp_ai/erp_ai_agent/doctype/erp_ai_kpi_week/{__init__.py,erp_ai_kpi_week.json,erp_ai_kpi_week.py}, erp_ai/erp_ai_agent/doctype/erp_ai_kpi_week/test_erp_ai_kpi_week.py, erp_ai/tests/test_doctype_descriptions.py — test: erp_ai/erp_ai_agent/doctype/erp_ai_kpi_week/test_erp_ai_kpi_week.py — depends: T19
+  - Tiêu chí: AC-55 (khóa chu kỳ `week_start` unique), ADR-033 QĐ 6, 7 (`design.md:254-270`: quyền System Manager, ERP AI Instructor `read`, `report`; không role nào `create/write/delete`).
+  - Receives: `DOCTYPE_CONFIG` (dạng sau T19).
+  - Returns: DocType `ERP AI KPI Week`, tên `KPI-<week_start ISO>` đặt trong `autoname` của controller; `DOCTYPE_CONFIG` cho DocType này. Lời gọi `refuse_agent_write` thêm ở T58.
+  - Expect: `TestKpiWeekAgentGuard::test_scheduler_session_inserts`; `TestKpiWeek::test_duplicate_week_raises_duplicate_entry` xanh.
+- [ ] T44 — Cửa vào lịch 08:00, thứ Hai, ngày 1 [migrate] — files: erp_ai/schedules.py, erp_ai/tests/test_schedules.py, erp_ai/hooks.py — test: erp_ai/tests/test_schedules.py — depends: T40, T42
+  - Tiêu chí: AC-51 (khai báo lịch), F-2 (`schedules.py` chỉ gọi `queue.*_job`, không `enqueue`).
+  - Receives: 3 hàm `*_job` (T42); `hooks.py` sau T40.
+  - Returns: `enqueue_daily_report()`, `enqueue_weekly_kpi()`, `enqueue_monthly_review()` trong `erp_ai/schedules.py`; khóa `cron` trong `scheduler_events` với 3 dòng theo `design.md:356-358`.
+  - Expect: `TestCron::test_cron_strings`, `::test_each_cron_calls_its_queue_function` xanh; `test_architecture.py::TestArchitecture::test_single_enqueue_call_site` xanh.
+- [ ] T45 — KPI 1 đến 3 của một tuần — files: erp_ai/agent/kpi.py, erp_ai/agent/test_kpi.py — test: erp_ai/agent/test_kpi.py — depends: T8, T41
+  - Tiêu chí: AC-53, D-11, A-D2 (`design.md:463-465`; mẫu 0 → rỗng).
+  - Receives: `KPI_IDS` (T8); `category_by_ticket_type`, `ticket_category` (T41); `AGENT_USER`.
+  - Returns: `compute_week(week_start: date, settings) -> dict` với các khóa trùng tên trường của `ERP AI KPI Week` (`design.md:261-265`) cho KPI 1–3.
+  - Expect: `TestKpi::test_kpi1_median_and_rates`, `::test_kpi2_open_at_week_end`, `::test_kpi3_bot_only_closures`, `::test_zero_sample_none` xanh.
+- [ ] T46 — KPI 4 đến 6 của một tuần — files: erp_ai/agent/kpi.py, erp_ai/agent/test_kpi.py — test: erp_ai/agent/test_kpi.py — depends: T45
+  - Tiêu chí: AC-54, A-D4 (`design.md:466-468`: đúng 72 giờ tính đạt; đúng 5 ngày không tính).
+  - Receives: `compute_week` (T45); trường Task `ai_ticket` (hiện có).
+  - Returns: khóa KPI 4–6 của `compute_week` (`b_resolution_avg_hours`, `b_resolution_sample`, `c_task_in_3_days_pct`, `c_task_sample`, `stale_over_5_days`, `stale_over_7_days`).
+  - Expect: `TestKpi::test_kpi4_b_resolution_hours`, `::test_kpi5_task_within_72h_edge`, `::test_kpi6_stale_edges` xanh.
+- [ ] T47 — Job KPI tuần ghi đúng một dòng mỗi tuần — files: erp_ai/agent/kpi.py, erp_ai/agent/test_kpi.py — test: erp_ai/agent/test_kpi.py — depends: T43, T46
+  - Tiêu chí: AC-55, D-10 (bù tối đa 8 tuần), NFR-3, ADR-033 Ràng buộc (lỗi giữa chừng không để lại dòng), D-17.
+  - Receives: `compute_week` (T46); `weekly_cycle` (T41); DocType `ERP AI KPI Week` (T43).
+  - Returns: `TITLE_KPI_FAILED`; `run_weekly_kpi(now=None) -> None` (`filelock("erp_ai_weekly_kpi")`, `frappe.DuplicateEntryError` → bỏ qua tuần đó; `design.md:470`).
+  - Expect: `TestRunWeekly::test_same_week_twice_one_row`, `::test_next_week_compares`, `::test_backfill_capped_at_eight`, `::test_error_midway_no_row_then_once` xanh.
+- [ ] T48 — Báo cáo ERP AI KPI Weekly sáu dòng [migrate] — files: erp_ai/erp_ai_agent/report/erp_ai_kpi_weekly/{__init__.py,erp_ai_kpi_weekly.json,erp_ai_kpi_weekly.py}, erp_ai/erp_ai_agent/report/erp_ai_kpi_weekly/test_erp_ai_kpi_weekly.py — test: erp_ai/erp_ai_agent/report/erp_ai_kpi_weekly/test_erp_ai_kpi_weekly.py — depends: T17, T43
+  - Tiêu chí: AC-56, AC-20 (`design.md:481`: cột `kpi`, `this_week`, `last_week`, `target_gd2`, `target_gd4`, `unit`; "chưa có dữ liệu").
+  - Receives: `KPI_IDS` (T8); `kpi_targets` hợp lệ (T16, T17); DocType `ERP AI KPI Week` (T43).
+  - Returns: Script Report `ERP AI KPI Weekly`, `ref_doctype` ERP AI KPI Week, `roles` System Manager, ERP AI Instructor.
+  - Expect: `TestReport::test_six_rows_columns`, `::test_access_three_accounts` xanh.
+- [ ] T49 — Kỳ rà soát tháng khóa danh sách phiếu [migrate] — files: erp_ai/erp_ai_agent/doctype/erp_ai_review_month/{__init__.py,erp_ai_review_month.json,erp_ai_review_month.py}, erp_ai/erp_ai_agent/doctype/erp_ai_review_item/{__init__.py,erp_ai_review_item.json,erp_ai_review_item.py}, erp_ai/erp_ai_agent/doctype/erp_ai_review_month/test_erp_ai_review_month.py, erp_ai/tests/test_doctype_descriptions.py — test: erp_ai/erp_ai_agent/doctype/erp_ai_review_month/test_erp_ai_review_month.py — depends: T43
+  - Tiêu chí: AC-59 (kết luận, người rà; không đổi được danh sách), ADR-033 QĐ 7 (`design.md:272-274, 477`).
+  - Receives: `DOCTYPE_CONFIG` (dạng sau T43).
+  - Returns: DocType `ERP AI Review Month` (tên `REV-<YYYY-MM>`, `month` unique; quyền System Manager, ERP AI Instructor `read`, `write`; không `create`, `delete`), bảng con `ERP AI Review Item`; `validate` với lỗi "Không được đổi danh sách phiếu của kỳ rà soát" và đặt `reviewed_by`, `reviewed_at`. Lời gọi `refuse_agent_write` thêm ở T58.
+  - Expect: `TestReviewMonth::test_verdict_sets_reviewer`, `::test_ticket_list_locked`; `TestReviewMonthAgentGuard::test_scheduler_session_creates`, `::test_reviewer_session_writes_verdict` xanh.
+- [ ] T50 — Job rà soát tháng chọn mẫu cố định theo tháng — files: erp_ai/agent/monthly_review.py, erp_ai/agent/test_monthly_review.py — test: erp_ai/agent/test_monthly_review.py — depends: T16, T41, T49
+  - Tiêu chí: AC-59, D-10 (chỉ tháng trước), ADR-033 Ràng buộc (`design.md:474-476`).
+  - Receives: `monthly_cycle` (T41); `monthly_reviewers`, `review_sample_size` (T16); DocType `ERP AI Review Month` (T49); `policy.can_send_ticket`.
+  - Returns: `TITLE_REVIEW_FAILED`; `review_candidates(month: str) -> list[str]`; `pick_sample(candidates, month, size) -> list[str]`; `run_monthly_review(now=None) -> None`.
+  - Expect: `TestReview::test_25_gives_10_unique`, `::test_6_gives_6`, `::test_rerun_same_set`, `::test_excluded_absent`, `::test_no_reviewers_list_still_created`, `::test_error_midway_no_row_then_once` xanh.
+- [ ] T51 — Số liệu phiếu của báo cáo 08:00 — files: erp_ai/agent/daily_report.py, erp_ai/agent/test_daily_report.py — test: erp_ai/agent/test_daily_report.py — depends: T16, T26, T41
+  - Tiêu chí: AC-51, AC-26 (đếm quá mốc phản hồi), D-18, A-D5 (`design.md:439-449`: cửa sổ `[anchor − 24 h, anchor)`).
+  - Receives: `response_overdue`, `processing_deadline` (T26); `category_by_ticket_type`, `ticket_category`, `BA_NOTE_MARKER` (T41); `field_due_date` (T13); `due_reminder_hours`, `ba_note_due_hours`, `task_due_days` (T16); `policy.can_send_ticket`.
+  - Returns: `build_daily_report(anchor) -> dict` với khóa `new_by_category_priority`, `new_list`, `due_soon`, `overdue`, `response_overdue`, `c_missing_ba_note`, `cd_missing_task`, `de_progress`.
+  - Expect: `TestBuild::test_twelve_tickets_sections` xanh.
+- [ ] T52 — Việc bot làm hôm qua trong báo cáo 08:00 — files: erp_ai/agent/daily_report.py, erp_ai/agent/test_daily_report.py — test: erp_ai/agent/test_daily_report.py — depends: T51
+  - Tiêu chí: AC-51 (mục việc bot và chi phí; `design.md:450-453`).
+  - Receives: `build_daily_report` (T51); ERP AI Log (`actions`, `change_step`, `cost_usd`, `error`).
+  - Returns: `ACTION_KIND_BY_TOOL` (`create_task` → Task, `post_comment` → comment, còn lại "khác"); khóa `bot_actions`, `cost_yesterday` (6 chữ số) của `build_daily_report`.
+  - Expect: `TestBuild::test_bot_actions_and_cost_yesterday` xanh.
+- [ ] T53 — Email báo cáo 08:00 gửi đúng một lần mỗi ngày — files: erp_ai/agent/daily_report.py, erp_ai/agent/test_daily_report.py — test: erp_ai/agent/test_daily_report.py — depends: T35, T52
+  - Tiêu chí: AC-52 (hai lần cùng ngày → 1 email; ngày trống vẫn gửi số 0; phiếu loại trừ chỉ có mã phiếu), NFR-6, F-7, ADR-033 QĐ 6 (`design.md:429-435, 455`).
+  - Receives: `build_daily_report` (T52); `redact_secrets` (T35); `daily_cycle` (T41); `coo_report_recipients`, `daily_report_sent_on` (T16).
+  - Returns: `render_daily_report(data) -> str`; `run_daily_report(now=None) -> None` (bước 1–6, 8; chỗ ghi duy nhất của `daily_report_sent_on` bằng `frappe.db.set_single_value`, cùng giao dịch với `frappe.sendmail(..., delayed=True)`).
+  - Expect: `TestRun::test_twice_same_day_one_email`, `::test_empty_day_sends_zeros`, `::test_excluded_ticket_number_only_no_subject`, `::test_secret_in_subject_redacted` xanh.
+- [ ] T54 — Báo cáo 08:00 bỏ qua hoặc lỗi không ném ra khỏi job — files: erp_ai/agent/daily_report.py, erp_ai/agent/test_daily_report.py — test: erp_ai/agent/test_daily_report.py — depends: T53
+  - Tiêu chí: AC-52 (người nhận rỗng; lỗi gửi → log, không ném, mốc không ghi; cuối tuần tắt), D-17 (`design.md:430, 432-433, 436`).
+  - Receives: `run_daily_report` (T53); `daily_report_weekends` (T16).
+  - Returns: `TITLE_DAILY_REPORT_FAILED = "erp_ai: báo cáo hằng ngày lỗi"`; nhánh khóa bận (`filelock("erp_ai_daily_report", timeout=5)`), người nhận rỗng, cuối tuần, lỗi gửi (`frappe.db.rollback()` + `frappe.log_error`).
+  - Expect: `TestRun::test_no_recipients_logs_only`, `::test_send_error_logged_not_raised_watermark_kept`, `::test_weekend_skipped_when_off`, `::test_lock_busy_returns_without_email` xanh.
+- [ ] T55 — Báo cáo ERP AI Cost theo phiếu, theo lần chạy [migrate] — files: erp_ai/erp_ai_agent/report/erp_ai_cost/{__init__.py,erp_ai_cost.json,erp_ai_cost.py}, erp_ai/erp_ai_agent/report/erp_ai_cost/test_erp_ai_cost.py — test: erp_ai/erp_ai_agent/report/erp_ai_cost/test_erp_ai_cost.py — depends: T5
+  - Tiêu chí: AC-60 (sai số 0 ở 6 chữ số; tổng tháng = `spent_this_month_usd` sau `recompute_monthly_spend`), AC-20 (`design.md:482`).
+  - Receives: DocPerm `report` của Instructor trên ERP AI Log (T5); `tasks.recompute_monthly_spend` (hiện có).
+  - Returns: Script Report `ERP AI Cost`, `ref_doctype` ERP AI Log, `roles` System Manager, ERP AI Instructor; bộ lọc `from_date`, `to_date`, `group_by` ∈ `Phiếu`, `Lần chạy`.
+  - Expect: `TestCost::test_per_ticket_and_run_totals`, `::test_month_total_matches_spent`, `::test_access_three_accounts` xanh.
+
+## Hòa nhập sau FEAT-004 (cửa merge `team/FEAT-007` → `develop`)
+
+Ba task dưới đây chỉ bắt đầu khi `team/FEAT-004` (gồm T59, T65) đã vào `develop`. Trước lúc đó build đợt 0 dừng ở T55; tech-lead ghi chữ chặn vào cuối dòng T56 khi T1–T55 đã tick mà điều kiện chưa có.
+
+- [ ] T56 — Gộp `develop` đã có FEAT-004 vào nhánh feature — files: erp_ai/tests/test_architecture.py, erp_ai/erp_ai_agent/doctype/erp_ai_setting/erp_ai_setting.py, erp_ai/erp_ai_agent/doctype/erp_ai_setting/erp_ai_setting.json, erp_ai/tests/test_doctype_descriptions.py — test: erp_ai/tests/test_architecture.py — depends: T23, T27, T31, T32, T34, T36, T39, T47, T48, T50, T54, T55
+  - Tiêu chí: `design-w0-fixes.md` mục 4 (nhắc gộp tay, dòng 212) và F-2 (dòng 95), F-5 (dòng 164).
+  - Receives: `develop` đã chứa `team/FEAT-004` (và phần ADR-024 của FEAT-005 nếu đã vào).
+  - Returns: merge commit trên nhánh task; `refuse_agent_write` của T65 là dòng đầu của `validate`, trước bước 1 của `design.md:290`; `test_architecture.py` giữ phần của hai nhánh kia và các chỗ sửa của T42; `field_count` của ERP AI Setting = số thật trên nền mới + 49. Xung đột ở file ngoài `files:` → dừng, trả `NEEDS_CONTEXT` kèm danh sách file.
+  - Expect: `cmd.migrate` rồi `cmd.test` xanh (không test đỏ ngoài dòng `baseline:`); `cmd.lint` sạch.
+- [ ] T57 — INT-1: điều cấm cứng trỏ tập DocType phân quyền của FEAT-004 — files: erp_ai/agent/hard_bans.py, erp_ai/agent/test_hard_bans.py, erp_ai/erp_ai_agent/doctype/erp_ai_setting/test_erp_ai_setting.py — test: erp_ai/agent/test_hard_bans.py — depends: T56
+  - Tiêu chí: F-3, INT-1 (`design-w0-fixes.md:209`), ADR-031 Ràng buộc, ADR-023 QĐ 3.
+  - Receives: `site_api.PERMISSION_DOCTYPES` (FEAT-004 T59). Không còn tên công khai nào cho tập phân quyền → dừng, trả `DESIGN_CONFLICT`, không giữ `DENIED_DOCTYPES`.
+  - Returns: `PERMISSION_SET` = `site_api.PERMISSION_DOCTYPES` trong `hard_ban_reason`.
+  - Expect: `TestHardBanReason::test_permission_doctypes_banned` xanh; `erp_ai/erp_ai_agent/doctype/erp_ai_setting/test_erp_ai_setting.py::TestCatalogRules::test_hard_ban_follows_denied_doctypes_source` có ca `Role` xanh; số lần chữ `DENIED_DOCTYPES` trong `erp_ai/agent/hard_bans.py` = 0.
+- [ ] T58 — INT-2: tài khoản agent không ghi được KPI Week, Review Month — files: erp_ai/erp_ai_agent/doctype/erp_ai_kpi_week/erp_ai_kpi_week.py, erp_ai/erp_ai_agent/doctype/erp_ai_kpi_week/test_erp_ai_kpi_week.py, erp_ai/erp_ai_agent/doctype/erp_ai_review_month/erp_ai_review_month.py, erp_ai/erp_ai_agent/doctype/erp_ai_review_month/test_erp_ai_review_month.py — test: erp_ai/erp_ai_agent/doctype/erp_ai_kpi_week/test_erp_ai_kpi_week.py — depends: T56
+  - Tiêu chí: F-4, INT-2 (`design-w0-fixes.md:210`), ADR-033 QĐ 8, ADR-023 QĐ 5 (M5); không thêm `allow_agent_write()` mới.
+  - Receives: `refuse_agent_write(doc)` của `erp_ai/agent/agent_write_guard.py` (FEAT-004 T65); mẫu `erp_ai_log.py` của FEAT-004.
+  - Returns: `refuse_agent_write(self)` là dòng đầu của `before_insert`, `validate`, `on_trash`, `before_rename(self, old, new, merge=False)` ở hai controller (ở Review Month: trước kiểm khóa danh sách).
+  - Expect: `TestKpiWeekAgentGuard::test_every_guarded_hook_refuses_agent`, `::test_agent_insert_save_delete_refused`, `::test_scheduler_session_inserts`; `erp_ai/erp_ai_agent/doctype/erp_ai_review_month/test_erp_ai_review_month.py::TestReviewMonthAgentGuard::test_every_guarded_hook_refuses_agent`, `::test_agent_insert_save_delete_refused`, `::test_scheduler_session_creates`, `::test_reviewer_session_writes_verdict` xanh; số lần `refuse_agent_write(self)` = 4 ở mỗi controller.

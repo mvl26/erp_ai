@@ -76,6 +76,9 @@ NAME_MAX = 140
 # DELETED_FIELDS_MAX of its non-empty fields.
 VALUE_MAX = 200
 DELETED_FIELDS_MAX = 20
+# Full before/after of a write, for the audit log only: a User snapshot always holds just its name and roles.
+SNAPSHOT_TABLES = {USER_DOCTYPE: ("roles",)}
+SNAPSHOT_ROW_DROPPED = (SYSTEM_FIELDS - {"docstatus"}) | {"name", "parentfield"}
 
 
 def _fail(reason: str, doctype=None) -> dict:
@@ -196,6 +199,37 @@ def _deleted_values(doc) -> dict:
 	"""The non-empty fields of a record about to be deleted, at most DELETED_FIELDS_MAX."""
 	filled = [key for key, value in doc.as_dict().items() if value not in (None, "", [])]
 	return dict(list(_shown(doc, filled).items())[:DELETED_FIELDS_MAX])
+
+
+def _snapshot_value(value):
+	return json.loads(frappe.as_json(value))
+
+
+def _snapshot_row(row) -> dict:
+	record = row.as_dict(no_private_properties=True)
+	return {
+		key: _snapshot_value(value)
+		for key, value in record.items()
+		if key not in SNAPSHOT_ROW_DROPPED and not _is_secret(row.meta, key)
+	}
+
+
+def _snapshot(doc, fields) -> dict:
+	"""The record's name and each of `fields` as held by `doc`, child tables as rows in `idx` order; secret fields
+	are left out on the record and on every row, nothing is cut."""
+	if doc.doctype == USER_DOCTYPE:
+		fields = SNAPSHOT_TABLES[USER_DOCTYPE]
+	tables = {field.fieldname for field in doc.meta.get_table_fields()}
+	snapshot = {"name": doc.name}
+	for field in fields:
+		if _is_secret(doc.meta, field):
+			continue
+		if field in tables:
+			rows = sorted(doc.get(field) or [], key=lambda row: row.idx or 0)
+			snapshot[field] = [_snapshot_row(row) for row in rows]
+		else:
+			snapshot[field] = _snapshot_value(doc.get(field))
+	return snapshot
 
 
 def _write(doctype: str, save) -> dict:

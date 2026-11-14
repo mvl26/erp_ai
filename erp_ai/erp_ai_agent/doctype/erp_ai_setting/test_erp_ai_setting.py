@@ -1176,6 +1176,28 @@ class TestCatalogRules(FrappeTestCase):
 			"Danh mục dòng 1: DocType Role bị cấm cứng: DocType phân quyền",
 		)
 
+	def test_row_pointing_at_child_table_blocked_on_save(self):
+		# AR3-3, AC-29 [changed]: a row on any child table (istable, found from the DocType records) is refused.
+		banned = read.denied_doctypes() | set(site_api.PERMISSION_DOCTYPES) | {"DocPerm", "Has Role"}
+		found = [
+			name
+			for name in frappe.get_all("DocType", {"istable": 1}, pluck="name", order_by="name")
+			if name not in banned
+		]
+		self.assertTrue(found, "the site has no child table outside the ban sets")
+		stored_before = [row.as_dict() for row in frappe.get_doc(SETTING_DOCTYPE).catalog_rules]
+		for target_doctype in ("DocPerm", "Has Role", found[0]):
+			with self.subTest(target_doctype=target_doctype):
+				self.assertEqual(
+					self._save_rule("Đổi trường", target_doctype),
+					f"Danh mục dòng 1: DocType {target_doctype} bị cấm cứng: bảng con của DocType khác",
+				)
+		self.assertEqual(
+			[row.as_dict() for row in frappe.get_doc(SETTING_DOCTYPE).catalog_rules], stored_before
+		)
+		# Edge: a parent DocType with no ban still saves.
+		self.assertIsNone(self._save_rule("Đổi trường", "Note"))
+
 	def _save_rows(self, *rows, ignore_links=False):
 		"""Save the setting with exactly these catalog rows; return the error text, or None when it saved."""
 		doc = frappe.get_doc(SETTING_DOCTYPE)

@@ -1,6 +1,7 @@
 import hashlib
 import json
 import os
+import re
 from unittest.mock import patch
 
 import frappe
@@ -178,6 +179,33 @@ class TestProposeChange(FrappeTestCase):
 		self.assertIn(f'<a href="{reject}"><strong>Từ chối</strong></a>', comment.content)
 		self.assertLess(comment.content.index(approve), comment.content.index(reject))
 		self.assertIn("<p>Sau khi áp dụng cần người chạy bench restart.</p>", comment.content)
+
+	def test_comment_of_each_tool_has_three_links_and_decisions_open_the_form(self):
+		results = (
+			self.change(["x = 1"], ["x = 2"]),
+			self.new_file(),
+			self.run_tool("propose_bench_command", {"command": "migrate", "reason": "sau khi sửa DocType"}),
+		)
+		frappe.set_user("Administrator")
+		contents = {row.name: row.content for row in self.comments()}
+		for tool, result in zip(TOOL_NAMES, results, strict=True):
+			with self.subTest(tool=tool):
+				self.assertTrue(result["ok"], result)
+				name = result["proposal"]
+				form = f"/app/erp-ai-change-proposal/{name}"
+				labelled = re.findall(
+					r'<a href="([^"]*)">(?:<strong>)?([^<]*)(?:</strong>)?</a>', contents[result["comment"]]
+				)
+				labelled = [(frappe.utils.html_utils.unescape_html(href), text) for href, text in labelled]
+				links = {text: href for href, text in labelled if text != name}
+				self.assertEqual(set(links), {"Duyệt", "Từ chối", "Xem nội dung thay đổi"}, labelled)
+				self.assertEqual(len({href for href, _ in labelled}), 3, labelled)
+				self.assertEqual(links["Xem nội dung thay đổi"], form)
+				for label, action in (("Duyệt", "approve"), ("Từ chối", "reject")):
+					href = links[label]
+					self.assertTrue(href.startswith(f"{form}?"), href)
+					self.assertNotIn("/api/method/", href)
+					self.assertEqual(href, change_link.decision_path(name, action))
 
 	def test_finds_replace_by_position_on_the_original_content(self):
 		# out of order, swapping each other's text, and touching without overlapping

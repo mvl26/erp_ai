@@ -87,6 +87,7 @@ class RunnerTestBase(FrappeTestCase):
 			answer_delay_min_s=0,
 			answer_delay_max_s=0,
 			routing_rules=make_routing_rules(),
+			auto_assign_enabled=0,
 		)
 		# No status signal reaches Redis and no run sleeps for real (the delay is 0 here; a test that sets one reads `sleeps`).
 		self.signals = record_status_signals(self)
@@ -122,6 +123,16 @@ class RunnerTestBase(FrappeTestCase):
 				trigger="ticket_insert",
 				turn=0,
 			)
+
+
+class TestRunnerBaseSettings(RunnerTestBase):
+	def setUp(self):
+		# The stored value is whatever the shared site holds; force 1 so the base setUp must override it.
+		set_agent_settings(auto_assign_enabled=1)
+		super().setUp()
+
+	def test_setup_overrides_stored_auto_assign(self):
+		self.assertEqual(frappe.db.get_single_value("ERP AI Setting", "auto_assign_enabled"), 0)
 
 
 class TestRunner(RunnerTestBase):

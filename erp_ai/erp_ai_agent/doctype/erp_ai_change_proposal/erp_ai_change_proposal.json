@@ -273,6 +273,7 @@
    "read_only": 1
   },
   {
+   "depends_on": "eval:doc.change_status==\"Đã áp dụng\" || doc.exit_code",
    "fieldname": "exit_code",
    "fieldtype": "Int",
    "label": "Mã thoát",
@@ -341,7 +342,7 @@
   }
  ],
  "links": [],
- "modified": "2026-11-13 12:00:00.000000",
+ "modified": "2026-11-14 12:00:00.000000",
  "modified_by": "Administrator",
  "module": "ERP AI agent",
  "name": "ERP AI Change Proposal",

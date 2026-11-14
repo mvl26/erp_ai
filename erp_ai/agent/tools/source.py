@@ -1,3 +1,4 @@
+import logging
 import os
 import re
 import subprocess
@@ -10,7 +11,18 @@ from erp_ai.agent.tools.read import _schema
 from erp_ai.agent.tools.registry import ToolSpec
 from erp_ai.constants import BOT_GIT_EMAIL, BOT_GIT_NAME, SETTING_DOCTYPE
 
-logger = frappe.logger("erp_ai.source")
+LOGGER_NAME = "erp_ai.source"
+
+
+def _logger() -> logging.Logger:
+	"""The "erp_ai.source" logger, got at each use: importing this module makes no logger (F-3)."""
+	try:
+		return frappe.logger(LOGGER_NAME)
+	except Exception:
+		# Kept on purpose (STD-ERR-1): the callers log from inside their own error handling, so a log file
+		# that cannot be opened must not replace their error; the stdlib logger of the same name takes it.
+		return logging.getLogger(LOGGER_NAME)
+
 
 DUOI_CHO_PHEP = {".py", ".js", ".vue", ".json", ".md", ".html", ".css", ".txt"}
 TEN_CAM = re.compile(
@@ -178,7 +190,7 @@ def read_source(args, ctx):
 			"content": "\n".join(chunk),
 		}
 	except Exception:
-		logger.exception("read_source failed")
+		_logger().exception("read_source failed")
 		return _refuse("Không đọc được file")
 
 
@@ -238,7 +250,7 @@ def search_source(args, ctx):
 				_scan_file(full, os.path.relpath(full, root), needle, hits)
 		return {"ok": True, "hits": hits}
 	except Exception:
-		logger.exception("search_source failed")
+		_logger().exception("search_source failed")
 		return _refuse("Không tìm được trong mã nguồn")
 
 
@@ -334,16 +346,16 @@ def git_source(args, ctx):
 			env={**os.environ, "GIT_PAGER": "cat"},
 		)
 		if done.returncode != 0:
-			logger.warning("git_source %s exit %s", sub, done.returncode)
+			_logger().warning("git_source %s exit %s", sub, done.returncode)
 			return _refuse(f"git báo lỗi (mã {done.returncode})")
 		return {"ok": True, "output": (done.stdout or "")[:GIT_OUTPUT_MAX_CHARS]}
 	except FileNotFoundError:
 		return _refuse("chưa cài git trên máy chủ")
 	except subprocess.TimeoutExpired:
-		logger.warning("git_source timed out")
+		_logger().warning("git_source timed out")
 		return _refuse("git chạy quá thời gian cho phép")
 	except Exception:
-		logger.exception("git_source failed")
+		_logger().exception("git_source failed")
 		return _refuse("Không chạy được git")
 
 
@@ -443,10 +455,10 @@ def run_git_read(repo_root: str, subcommand: str, *args: str, limit_s: int = GIT
 			start_new_session=True,
 		)
 	except subprocess.TimeoutExpired:
-		logger.warning("git %s timed out after the backstop", subcommand)
+		_logger().warning("git %s timed out after the backstop", subcommand)
 		return GitRun(exit_code=None, stdout=b"", timed_out=True)
 	except OSError as error:
-		logger.warning("git %s could not start: %s", subcommand, type(error).__name__)
+		_logger().warning("git %s could not start: %s", subcommand, type(error).__name__)
 		return GitRun(exit_code=None, stdout=b"", timed_out=False)
 	timed_out = done.returncode in KILLED_EXIT_CODES and time.monotonic() - started >= limit_s
 	return GitRun(exit_code=done.returncode, stdout=done.stdout or b"", timed_out=timed_out)
@@ -640,7 +652,7 @@ def _check_rel_in_repo(rel_in_repo) -> None:
 
 
 def _git_failed(what: str) -> RuntimeError:
-	logger.warning("git %s could not be read", what)
+	_logger().warning("git %s could not be read", what)
 	return RuntimeError(f"{GIT_ERROR}: {what}")
 
 

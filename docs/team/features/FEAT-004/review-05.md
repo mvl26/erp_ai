@@ -8,8 +8,19 @@ Approved-by:
 # Review 05 — FEAT-004 T5
 
 - Diff: `git diff dee2daa..team/FEAT-004-task-5` (2 commit `944b250`, `d62f6ec`; 3 file)
-- Vòng: 2 (max_rework=3)
-- Verdict: design-defect (T5 ĐỖ, chưa merge; chặn T6, T18, T29)
+- Diff vòng 3: `git diff d62f6ec..f6260e7` (cả task: `git diff dee2daa..f6260e7`; merge vào `team/FEAT-004` trong `e1182d0`)
+- Vòng: 3 (max_rework=3)
+- Verdict: approve (vòng 3, 2026-11-14; vòng 1–2 là design-defect, gỡ bằng `design-addendum-3.md` QĐ-B3)
+
+## Vòng 3 — approve (re-review theo phạm vi, `git diff d62f6ec..f6260e7`, 3 file, +84/-19; reviewer chấm lại 2026-11-14 vì lượt approve ở round 45 chưa được ghi vào file)
+- Phát hiện 1 (STD-DESIGN-6, vòng import): ADDRESSED theo QĐ-B3. `policy.py:9` bỏ import `tools.source`; `policy.py:133-142` nhận `validate_change_apps(settings, apps_root)`, giữ 3 câu và thứ tự; `test_architecture.py:110-114` có dòng `LAYER_RULES` đúng chữ; `test_architecture.py:2078-2091` test tiến trình mới phủ 5 module; `test_architecture.py:2163-2180` test bộ quét phủ import tuyệt đối, trong thân hàm, tương đối và một ca sạch
+- Phát hiện 2 (STD-DESIGN-5): ADDRESSED từ vòng 2, không đổi
+- Test: `test_policy.py:331-342` `test_validate_change_apps_uses_given_root` dùng 2 gốc tạm kiểm chéo, không patch `get_source_root`; test cũ chỉ thêm đối số gốc, không đổi assertion (STD-TEST-5 đạt)
+- Review checklist (10): phủ 10/10, không blocker/major
+- Bằng chứng của dev: RED `ImportError: cannot import name '_schema' from partially initialized module 'erp_ai.agent.tools.read'`; GREEN test_policy `Ran 36 tests … OK`, test_architecture `Ran 110 tests … OK`
+- `cmd.test` trên `6cf568e` (chứa merge `e1182d0`): `Ran 1241 tests in 304.203s` / `OK`
+
+minor | — | — | 1 điểm nhỏ: khi `PYTHONPATH` rỗng, `test_architecture.py:2080` thêm một mục rỗng làm thư mục hiện tại vào `sys.path` của tiến trình con | tùy dev
 
 ## Vòng 1 — design-defect + 1 major (`git diff dee2daa..944b250`)
 Lớp 1: Returns đạt. 3 câu từ chối trùng từng chữ design 3.6; bỏ dòng trùng/rỗng; app lõi qua khi có thư mục; `POLICY_FIELDS` 6 tên, giữ `auto_assign_enabled`; hàm FEAT-006 không đổi.
@@ -40,4 +51,4 @@ minor | — | — | 1 điểm nhỏ: hằng `APP_NAME` chứa regex → `APP_NAM
 - Ai import `tools.read` trước trong worker/`frappe.get_attr` ở prod: thuộc quyết định design ở trên.
 
 ## deferred
-- Không có.
+- Cho designer: `design.md` mục 3.6 và 8.2 chưa gộp chữ của QĐ-B3 (phụ lục 3 đang là căn cứ; không chặn).

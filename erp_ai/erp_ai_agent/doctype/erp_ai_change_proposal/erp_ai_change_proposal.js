@@ -4,6 +4,7 @@ const CORE_WARNING_PREFIX = "Cảnh báo app lõi: ";
 
 frappe.ui.form.on("ERP AI Change Proposal", {
 	refresh(frm) {
+		decide_from_link(frm);
 		const notes = (frm.doc.__onload && frm.doc.__onload.change_notes) || [];
 		frm.set_intro(
 			notes.map(frappe.utils.escape_html).join("<br>"),
@@ -42,6 +43,27 @@ frappe.ui.form.on("ERP AI Change Proposal", {
 		}
 	},
 });
+
+// The signed Duyệt / Từ chối link of the ticket comment opens this form (ADR-023 QĐ 1): one click
+// decides, so no confirmation here. The address is cleaned first, so a refresh or reload never sends it again.
+function decide_from_link(frm) {
+	const params = new URLSearchParams(window.location.search);
+	const action = params.get("action");
+	const signature = params.get("_signature");
+	if (!action || !signature) {
+		return;
+	}
+	window.history.replaceState(null, "", window.location.pathname);
+	if (frm.doc.change_status === "Chờ duyệt") {
+		frappe.call({
+			method: "erp_ai.change_decision.decide",
+			args: { name: frm.doc.name, action, _signature: signature },
+			type: "POST",
+			freeze: true,
+			callback: () => frm.reload_doc(),
+		});
+	}
+}
 
 function approve_confirm_message(frm, notes) {
 	// A bench command runs and cannot be undone; only a code change writes a file and commits.

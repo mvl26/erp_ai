@@ -8,7 +8,6 @@ from frappe.utils import get_fullname
 from erp_ai import gateway
 from erp_ai.agent import authority, policy, site_facts
 from erp_ai.agent.answer_delay import AnswerDelay
-from erp_ai.agent.changes import transitions
 from erp_ai.agent.classification import load_mapping, parse_classification
 from erp_ai.agent.prompts import (
 	build_classify_request,
@@ -17,16 +16,16 @@ from erp_ai.agent.prompts import (
 	build_routing_table,
 )
 from erp_ai.agent.routing import decide_route, departments, load_routing_config, sla_lag
-from erp_ai.agent.run_log import write_entry
+from erp_ai.agent.run_log import ENTRY_TYPE_CHANGE, write_entry
 from erp_ai.agent.run_status import CLASSIFY_STEP, RunStatus
 from erp_ai.agent.tools.read import TOOL_RESULT_MAX_CHARS
 from erp_ai.agent.tools.registry import (
 	ToolContext,
 	execute_tool,
 	get_tool_schemas,
-	get_unrestricted_tool_schemas,
 	grants_change_tools,
 	grants_site_admin_tools,
+	grants_unrestricted_tools,
 )
 from erp_ai.agent.tools.route_ticket import (
 	ASSIGN_REQUEST,
@@ -54,6 +53,7 @@ from erp_ai.constants import (
 	TITLE_RUN_FAILED,
 	TITLE_STATUS_FAILED,
 	TITLE_WRONG_USER,
+	TRIGGER_CHANGE_ACTION,
 	TRIGGER_COMMENT_MENTION,
 	TRIGGER_TICKET_INSERT,
 )
@@ -83,8 +83,21 @@ WRITE_TOOL_TARGETS = {
 	"api_submit_record": (None, "name"),
 	"api_call_method": ("Method", "method"),
 }
+# Generic write tools: the model names the DocType; each successful call keeps its full snapshot (AC-13).
+GENERIC_WRITE_TOOLS = tuple(name for name, (doctype, _) in WRITE_TOOL_TARGETS.items() if doctype is None)
+# Record tools: their action entry also carries the before/after values and the instructor (AC-35).
+RECORD_TOOLS = frozenset(
+	("api_create_record", "api_update_record", "api_delete_record", "api_submit_record", "api_call_method")
+)
 ACTION_DOCTYPE_MAX = 80
+# `ERP AI Log.actions` is a Small Text column: MariaDB `text`, 65535 bytes. The JSON the runner stores there
+# stays within ACTIONS_MAX_BYTES (utf-8); each string in it within ACTION_VALUE_MAX_BYTES. A cut is marked.
+ACTIONS_MAX_BYTES = 60000
+ACTION_VALUE_MAX_BYTES = 1024
+ACTION_CUT_MARKER = "[đã cắt]"
+ACTION_VALUE_KEYS = ("value_before", "value_after")
 PROPOSE_TOOLS = ("propose_file_change", "propose_new_file", "propose_bench_command")
+PROPOSE_STEP = "propose"
 UNPARSEABLE_ERROR = "UNPARSEABLE: không phân loại được"
 BAD_MAPPING_ERROR = "category_mapping không hợp lệ, không có giá trị dự đoán"
 BAD_ROUTING_ERROR = "routing_rules không hợp lệ, định tuyến dùng giá trị rỗng"
@@ -94,6 +107,8 @@ REASON_TASK_EXISTS = "phiếu đã có Task liên kết"
 ROUTE_SAVEPOINT = "erp_ai_route"
 # One write unit after (u1) (assign, comment) nests inside the savepoint above.
 ROUTE_UNIT_SAVEPOINT = "erp_ai_route_unit"
+# Set right after each reason turn's model call: a failing turn is undone to here (ADR-024 QĐ 2).
+REASON_TURN_SAVEPOINT = "erp_ai_reason_turn"
 USAGE_COLUMNS = ("input_tokens", "output_tokens", "cache_creation_input_tokens", "cache_read_input_tokens")
 
 
@@ -513,7 +528,10 @@ def _check_sla(category, context, actions, lines):
 
 def _record_route(log_name, result, decision, assigned, task, actions, errors):
 	"""Update the `classify` entry once (design 3.5)."""
-	updates = {"applied": 1 if result else 0, "actions": json.dumps(actions, ensure_ascii=False)}
+	updates = {
+		"applied": 1 if result else 0,
+		"actions": json.dumps(_bounded_actions(actions), ensure_ascii=False),
+	}
 	if result:
 		before = {"ticket": result["before"]} if result.get("before") else {}
 		after = {"ticket": result["after"]} if result.get("after") else {}
@@ -581,13 +599,8 @@ def _reason(ticket_name, trigger, run_id, settings, context, classification, dea
 		["subject", "description", "status", "priority", "ticket_type", "agent_group", "creation"],
 		as_dict=True,
 	)
-	grant = (context.effective_level, bool(context.instructor), context.change_enabled)
+	grant = (context.effective_level, bool(context.instructor), context.change_enabled, context.unrestricted)
 	tools = get_tool_schemas(*grant)
-	offered = {tool["name"] for tool in tools}
-	unrestricted_tools = get_unrestricted_tool_schemas(
-		context.effective_level, bool(context.instructor), context.unrestricted
-	)
-	tools.extend(tool for tool in unrestricted_tools if tool["name"] not in offered)
 	if tools:
 		tools[-1]["cache_control"] = {"type": "ephemeral"}
 	system = build_reason_system(
@@ -595,7 +608,7 @@ def _reason(ticket_name, trigger, run_id, settings, context, classification, dea
 		_routing_table(context),
 		change_tools=grants_change_tools(*grant),
 		site_admin_tools=grants_site_admin_tools(*grant),
-		unrestricted_tools=bool(unrestricted_tools),
+		unrestricted_tools=grants_unrestricted_tools(*grant),
 	)
 	messages = [{"role": "user", "content": build_initial_message(ticket, labelled, trigger, classification)}]
 	base = {
@@ -628,34 +641,94 @@ def _reason(ticket_name, trigger, run_id, settings, context, classification, dea
 			)
 			return
 
-		tool_blocks = [block for block in result.content if block.get("type") == "tool_use"]
-		tool_results, actions, before, after, tool_errors, skipped = [], [], {}, {}, [], []
-		# the whole turn waits, before any of its tools runs (D-6)
-		if delay is not None and any(block["name"] == ANSWER_TOOL for block in tool_blocks):
-			delay.wait_before_answer(deadline)
-		for block in tool_blocks:
-			status.working(block["name"])
-			tool_results.append(_run_tool(block, context, actions, before, after, tool_errors, skipped))
-		stop_reason = result.stop_reason
-		wants_tools = stop_reason == STOP_TOOL_USE
-		if wants_tools and turn == max_turns:
-			stop_reason = STOP_MAX_TURNS
-		write_entry(
-			**base,
-			**_call_fields(result),
-			turn=turn,
-			stop_reason=stop_reason,
-			tools_called=[block["name"] for block in tool_blocks] or None,
-			error="; ".join([*tool_errors, *status.take_errors()]) or None,
-			actions=actions or None,
-			value_before=before or None,
-			value_after=after or None,
-			skipped_fields=skipped or None,
-		)
+		# after the call, so the gateway key state it wrote survives an undo; not released: the commit of the
+		# `reason` row's `write_entry` ends it (within the turn the runner commits nothing else), and the next
+		# turn's savepoint of the same name replaces it
+		frappe.db.savepoint(REASON_TURN_SAVEPOINT)
+		try:
+			tool_blocks = [block for block in result.content if block.get("type") == "tool_use"]
+			tool_results, actions, before, after, tool_errors, skipped = [], [], {}, {}, [], []
+			# the whole turn waits, before any of its tools runs (D-6)
+			if delay is not None and any(block["name"] == ANSWER_TOOL for block in tool_blocks):
+				delay.wait_before_answer(deadline)
+			for block in tool_blocks:
+				status.working(block["name"])
+				tool_results.append(_run_tool(block, context, actions, before, after, tool_errors, skipped))
+			stop_reason = result.stop_reason
+			wants_tools = stop_reason == STOP_TOOL_USE
+			if wants_tools and turn == max_turns:
+				stop_reason = STOP_MAX_TURNS
+			write_entry(
+				**base,
+				**_call_fields(result),
+				turn=turn,
+				stop_reason=stop_reason,
+				tools_called=[block["name"] for block in tool_blocks] or None,
+				error="; ".join([*tool_errors, *status.take_errors()]) or None,
+				actions=_bounded_actions(actions) if actions else None,
+				value_before=before or None,
+				value_after=after or None,
+				skipped_fields=skipped or None,
+			)
+		except Exception:
+			# no change of the turn may be committed without its `reason` entry (NFR-3); `run_for_ticket` logs it
+			_undo_turn(run_id)
+			raise
+		_write_propose_rows(actions, context)
 		if not wants_tools or not tool_results:
 			return
 		messages.append({"role": "assistant", "content": result.content})
 		messages.append({"role": "user", "content": tool_results})
+
+
+def _undo_turn(run_id) -> None:
+	"""Undo the uncommitted writes of the failing reason turn, back to right after its model call.
+
+	As `frappe.db.rollback()` does, stopping at the savepoint (design-amd2 D-8): the commit callbacks queued
+	since are dropped (only the turn's: the commit before the savepoint ran the earlier ones) and the rollback
+	callbacks run. When the savepoint is already gone, nothing is undone and neither happens: both callback
+	queues are left as they are. Raises nothing: the caller re-raises the turn's own error, which must reach
+	the Error Log.
+	"""
+	try:
+		frappe.db.rollback(save_point=REASON_TURN_SAVEPOINT)
+	except Exception as exc:
+		# the savepoint is gone: a commit inside a tool (DDL, a controller's own commit) kept the turn's earlier
+		# writes (ADR-024 QĐ 5, accepted). Not set again and the callback queues left alone: the remaining
+		# writes will be committed, so their callbacks must run (D-8)
+		frappe.logger(LOGGER_NAME).warning(
+			"reason turn undo failed run_id=%s error=%s", run_id, type(exc).__name__
+		)
+		return
+	frappe.db.before_commit.reset()
+	frappe.db.after_commit.reset()
+	try:
+		frappe.db.after_rollback.run()
+	except Exception as exc:
+		# the turn's writes are already undone; a rollback hook's failure must not replace the turn's error
+		frappe.logger(LOGGER_NAME).warning(
+			"reason turn undo callback failed run_id=%s error=%s", run_id, type(exc).__name__
+		)
+
+
+def _write_propose_rows(actions, context) -> None:
+	"""The `propose` step of each proposal the turn made, written by the agent account (design 4.1 step 4).
+
+	Only after the turn's `reason` row (design-amd2 D-7): `write_entry` commits, and a commit inside the turn
+	would keep its writes without that row. Read from the turn's own `actions`, not their bounded copy.
+	"""
+	for action in actions:
+		if action["tool"] in PROPOSE_TOOLS and action["ok"]:
+			write_entry(
+				entry_type=ENTRY_TYPE_CHANGE,
+				trigger=TRIGGER_CHANGE_ACTION,
+				change_step=PROPOSE_STEP,
+				actor=AGENT_USER,
+				change_proposal=action["name"],
+				ticket=context.ticket_name,
+				run_id=context.run_id,
+				instructor=context.instructor,
+			)
 
 
 def _run_tool(block, context, actions, before, after, tool_errors, skipped):
@@ -677,11 +750,9 @@ def _run_tool(block, context, actions, before, after, tool_errors, skipped):
 			"content": f"Lỗi: {type(exc).__name__}",
 			"is_error": True,
 		}
-	if name in PROPOSE_TOOLS and outcome.get("ok"):
-		# the `propose` step of the proposal's own log trail, written by the agent account
-		transitions.log_step(outcome["proposal"], "propose", context.agent_user)
 	if name in WRITE_TOOL_TARGETS:
 		actions.append(_action(name, context, outcome, bool(outcome.get("ok")), arguments))
+		_record_snapshot(name, outcome, len(actions), before, after)
 		if outcome.get("ok") and "after" in outcome:
 			before[name] = outcome.get("before")
 			after[name] = outcome["after"]
@@ -691,10 +762,90 @@ def _run_tool(block, context, actions, before, after, tool_errors, skipped):
 	return {"type": "tool_result", "tool_use_id": block["id"], "content": content}
 
 
+def _record_snapshot(name, outcome, n, before, after) -> None:
+	"""Keep a generic write call's full before/after under `<tool>#<n>`, n = its position in the turn's actions;
+	the snapshot is always taken out of the outcome, so it never reaches the model (design-amd2 §4.1)."""
+	snapshot = outcome.pop("_snapshot", None)
+	if name in GENERIC_WRITE_TOOLS and snapshot is not None:
+		before[f"{name}#{n}"] = snapshot["before"]
+		after[f"{name}#{n}"] = snapshot["after"]
+
+
 def _action(name, context, outcome, ok, arguments):
 	doctype, key = WRITE_TOOL_TARGETS[name]
 	if doctype is None:
 		requested = arguments.get("doctype") if isinstance(arguments, dict) else None
 		doctype = str((outcome or {}).get("doctype") or requested or "")[:ACTION_DOCTYPE_MAX] or None
 	record = context.ticket_name if key is None else (outcome or {}).get(key)
-	return {"tool": name, "doctype": doctype, "name": record, "ok": ok}
+	action = {"tool": name, "doctype": doctype, "name": record, "ok": ok}
+	if name in RECORD_TOOLS:
+		# copied as the tool returned them (already free of secrets and cut); a refused or crashed call has none
+		written = outcome if ok else {}
+		action["value_before"] = written.get("value_before")
+		action["value_after"] = written.get("value_after")
+		action["instructor"] = context.instructor
+	return action
+
+
+def _stored_bytes(value) -> int:
+	"""Size of `value` as `write_entry` stores it (utf-8 JSON)."""
+	return len(json.dumps(value, ensure_ascii=False).encode("utf-8"))
+
+
+def _cut_strings(value):
+	"""`value` with every string longer than ACTION_VALUE_MAX_BYTES cut on a character boundary and marked."""
+	if isinstance(value, str):
+		data = value.encode("utf-8")
+		if len(data) <= ACTION_VALUE_MAX_BYTES:
+			return value
+		room = ACTION_VALUE_MAX_BYTES - len(ACTION_CUT_MARKER.encode("utf-8"))
+		return data[:room].decode("utf-8", errors="ignore") + ACTION_CUT_MARKER
+	if isinstance(value, dict):
+		return {key: _cut_strings(item) for key, item in value.items()}
+	if isinstance(value, list | tuple):
+		return [_cut_strings(item) for item in value]
+	return value
+
+
+def _without_values(entry):
+	"""`entry` with its before/after values replaced by the marker; who, what and the outcome stay."""
+	if not isinstance(entry, dict):
+		return entry
+	return {
+		key: ACTION_CUT_MARKER if key in ACTION_VALUE_KEYS and value is not None else value
+		for key, value in entry.items()
+	}
+
+
+def _bounded_actions(actions) -> list:
+	"""The turn's `actions` cut to fit the `actions` column: at most ACTIONS_MAX_BYTES as stored (F-1).
+
+	Each string is first cut to ACTION_VALUE_MAX_BYTES. When the list is still too large, entries lose their
+	before/after values to the marker, the costliest values first, so as many entries as fit keep theirs.
+	Every entry stays (one per tool call) unless even the entries without values do not fit: then the last
+	ones are dropped and one closing `{"cut": marker, "dropped": count}` entry says how many.
+	"""
+	entries = [_cut_strings(entry) for entry in actions]
+	if _stored_bytes(entries) <= ACTIONS_MAX_BYTES:
+		return entries
+	bare = [_without_values(entry) for entry in entries]
+	# replacing one list item changes the stored size by exactly the difference of the two items
+	costs = [
+		_stored_bytes(entry) - _stored_bytes(stripped) for entry, stripped in zip(entries, bare, strict=True)
+	]
+	room = ACTIONS_MAX_BYTES - _stored_bytes(bare)
+	if room >= 0:
+		kept = list(bare)
+		for index in sorted(range(len(entries)), key=costs.__getitem__):
+			if costs[index] > room:
+				break
+			kept[index] = entries[index]
+			room -= costs[index]
+		return kept
+	while bare and _stored_bytes([*bare, _dropped_entry(len(entries) - len(bare))]) > ACTIONS_MAX_BYTES:
+		bare.pop()
+	return [*bare, _dropped_entry(len(entries) - len(bare))]
+
+
+def _dropped_entry(count: int) -> dict:
+	return {"cut": ACTION_CUT_MARKER, "dropped": count}

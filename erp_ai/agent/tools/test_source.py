@@ -1,7 +1,9 @@
+import importlib.util
 import os
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -113,10 +115,10 @@ class TestSourceTools(FrappeTestCase):
 	def test_unexpected_error_is_refused_and_logged(self):
 		self.write("myapp/a.py", "a\n")
 		with patch("erp_ai.agent.tools.source.open", side_effect=RuntimeError("boom"), create=True):
-			with patch("erp_ai.agent.tools.source.logger") as logger:
+			with patch("frappe.logger") as get_logger:
 				result = source.read_source({"path": "myapp/a.py"}, None)
 		self.assertFalse(result["ok"])
-		logger.exception.assert_called_once()
+		get_logger.return_value.exception.assert_called_once()
 
 	def test_directory_and_missing_file_refused(self):
 		self.assertFalse(source.read_source({"path": "myapp"}, None)["ok"])
@@ -1349,7 +1351,8 @@ class TestGitReadOptions(unittest.TestCase):
 	def test_run_git_read_missing_executable_is_unknown_exit(self):
 		repo = os.path.realpath(tempfile.gettempdir())
 		with patch(RUN_PATH, side_effect=FileNotFoundError("timeout")):
-			with patch.object(source.logger, "warning") as warning:
+			with patch("frappe.logger") as get_logger:
+				warning = get_logger.return_value.warning
 				self.assertEqual(
 					source.run_git_read(repo, "status"),
 					source.GitRun(exit_code=None, stdout=b"", timed_out=False),
@@ -2490,3 +2493,49 @@ class TestManualsExcluded(FrappeTestCase):
 		):
 			with self.subTest(rel=rel):
 				self.assertIsNone(source.resolve_manual_path(rel))
+
+
+EXPECTED_LOGGER_NAME = "erp_ai.source"
+IMPORT_PROBE_NAME = "erp_ai_source_import_probe"
+
+
+class TestSourceLogger(FrappeTestCase):
+	"""F-3: no logger is made at import; each log site gets the "erp_ai.source" logger when it logs."""
+
+	def setUp(self):
+		self.root = os.path.realpath(tempfile.mkdtemp())
+		self.addCleanup(shutil.rmtree, self.root, True)
+		os.makedirs(os.path.join(self.root, "myapp"))
+		with open(os.path.join(self.root, "myapp", "a.py"), "w", encoding="utf-8") as handle:
+			handle.write("a\n")
+		patcher = patch(ROOT_PATH, return_value=self.root)
+		patcher.start()
+		self.addCleanup(patcher.stop)
+
+	def test_import_creates_no_logger(self):
+		# A fresh copy under another name: the loaded `source` module and its classes stay untouched.
+		spec = importlib.util.spec_from_file_location(IMPORT_PROBE_NAME, source.__file__)
+		probe = importlib.util.module_from_spec(spec)
+		sys.modules[IMPORT_PROBE_NAME] = probe
+		self.addCleanup(sys.modules.pop, IMPORT_PROBE_NAME, None)
+		with patch("frappe.logger") as get_logger:
+			spec.loader.exec_module(probe)
+		self.assertEqual(get_logger.call_count, 0)
+		self.assertFalse(hasattr(probe, "logger"))
+
+	def test_log_sites_use_the_source_logger_name(self):
+		with patch("erp_ai.agent.tools.source.open", side_effect=RuntimeError("boom"), create=True):
+			with patch("frappe.logger") as get_logger:
+				result = source.read_source({"path": "myapp/a.py"}, None)
+		self.assertEqual(result, {"ok": False, "reason": "Không đọc được file"})
+		get_logger.assert_called_once_with("erp_ai.source")
+		get_logger.return_value.exception.assert_called_once_with("read_source failed")
+
+	def test_logger_failure_keeps_the_original_error_handling(self):
+		with patch("erp_ai.agent.tools.source.open", side_effect=RuntimeError("boom"), create=True):
+			with patch("frappe.logger", side_effect=OSError("log directory not writable")):
+				with self.assertLogs(EXPECTED_LOGGER_NAME, level="ERROR") as captured:
+					result = source.read_source({"path": "myapp/a.py"}, None)
+		self.assertEqual(result, {"ok": False, "reason": "Không đọc được file"})
+		self.assertEqual([record.getMessage() for record in captured.records], ["read_source failed"])
+		self.assertEqual(captured.records[0].exc_info[0], RuntimeError)

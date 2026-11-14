@@ -603,8 +603,6 @@ FEAT007_NEW_FIELD_DEFAULTS = {
 	"level_cap_f": "L3",
 	"confidence_threshold": 70,
 	"auto_approve_streak": 20,
-	# A Table keeps no Singles row: no stored value means the catalog starts empty.
-	"catalog_rules": None,
 }
 # FEAT-007 AC-31: the highest level per category A-F, in form order.
 LEVEL_CAP_DEFAULTS = (
@@ -652,6 +650,13 @@ class TestFeat007Defaults(FrappeTestCase):
 		for fieldname, expected in FEAT007_NEW_FIELD_DEFAULTS.items():
 			with self.subTest(fieldname=fieldname):
 				self.assertEqual(self._value_after_install(fieldname), expected)
+
+	def test_catalog_starts_empty_after_install(self):
+		# AC-29: a Table keeps its rows in the child table, not in Singles; install seeds no catalog row.
+		row_filters = {"parent": SETTING_DOCTYPE, "parentfield": "catalog_rules"}
+		frappe.db.delete(CATALOG_RULE_DOCTYPE, row_filters)
+		install._ensure_default_settings()
+		self.assertEqual(frappe.get_all(CATALOG_RULE_DOCTYPE, filters=row_filters), [])
 
 	def test_level_caps_default(self):
 		meta = frappe.get_meta(SETTING_DOCTYPE)

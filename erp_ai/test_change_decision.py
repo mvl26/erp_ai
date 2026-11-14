@@ -61,7 +61,20 @@ def _not_whitelisted_for_guest() -> str:
 class TestChangeDecision(FrappeTestCase):
 	"""ADR-023 QĐ 1 / M1: the signed link opens the form, the form POSTs `decide` once (AC-5, AC-25, AC-26)."""
 
+	@classmethod
+	def tearDownClass(cls):
+		super().tearDownClass()
+		# STD-TEST-6: the role edits of this class leave no cached role the site itself does not grant.
+		for user in (AGENT_USER, INSTRUCTOR):
+			cached = frappe.cache.hget("roles", user)
+			granted = bool(frappe.db.exists("Has Role", {"parent": user, "role": ROLE_INSTRUCTOR}))
+			if cached is not None and (ROLE_INSTRUCTOR in cached) != granted:
+				raise AssertionError(f"stale roles cache for {user}: {cached}, site grants role: {granted}")
+
 	def setUp(self):
+		# `add_roles` re-caches the Redis `roles` hash; cleanups run in reverse, so these clear it after the rollback.
+		for user in (AGENT_USER, INSTRUCTOR):
+			self.addCleanup(frappe.clear_cache, user=user)
 		self.addCleanup(frappe.db.rollback)
 		self.addCleanup(frappe.set_user, "Administrator")
 		frappe.set_user("Administrator")

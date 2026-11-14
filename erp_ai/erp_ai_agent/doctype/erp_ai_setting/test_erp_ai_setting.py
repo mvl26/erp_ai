@@ -143,6 +143,40 @@ class TestERPAISetting(FrappeTestCase):
 				self.assertEqual(actual, expected)
 		self.assertEqual(float(frappe.db.get_single_value(SETTING_DOCTYPE, "spent_this_month_usd")), 3.5)
 
+	def test_privilege_alert_watermark_restored_on_human_save(self):
+		meta = frappe.get_meta(SETTING_DOCTYPE)
+		field = meta.get_field("privilege_alert_checked_until")
+		self.assertIsNotNone(field, "field privilege_alert_checked_until is missing")
+		self.assertEqual(field.fieldtype, "Datetime")
+		self.assertTrue(field.read_only)
+		order = [df.fieldname for df in meta.fields]
+		self.assertEqual(order[order.index("alert_recipients") + 1], "privilege_alert_checked_until")
+		section = next(
+			df.fieldname
+			for df in reversed(meta.fields[: order.index("privilege_alert_checked_until")])
+			if df.fieldtype == "Section Break"
+		)
+		self.assertEqual(section, "section_alerts")
+
+		for in_db, from_form in (
+			("2030-05-01 10:00:00", "2031-01-01 00:00:00"),
+			("2030-05-01 10:00:00", None),
+			(None, "2031-01-01 00:00:00"),
+		):
+			with self.subTest(in_db=in_db, from_form=from_form):
+				frappe.db.set_single_value(SETTING_DOCTYPE, "privilege_alert_checked_until", in_db)
+				doc = frappe.get_doc(SETTING_DOCTYPE)
+				doc.privilege_alert_checked_until = from_form
+				doc.save()
+				stored = frappe.db.get_single_value(
+					SETTING_DOCTYPE, "privilege_alert_checked_until", cache=False
+				)
+				if in_db is None:
+					self.assertIsNone(stored)
+				else:
+					self.assertEqual(get_datetime(stored), get_datetime(in_db))
+					self.assertEqual(get_datetime(doc.privilege_alert_checked_until), get_datetime(in_db))
+
 	def test_new_key_row_gets_default_self_managed_fields(self):
 		doc = frappe.get_doc(SETTING_DOCTYPE)
 		doc.set("credentials", [])

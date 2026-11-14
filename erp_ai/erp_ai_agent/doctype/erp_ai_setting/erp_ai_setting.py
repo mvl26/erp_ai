@@ -89,6 +89,10 @@ class ERPAISetting(Document):
 		self.spent_this_month_usd = frappe.db.get_single_value(
 			SETTING_DOCTYPE, "spent_this_month_usd", cache=False
 		)
+		# the privilege-alert watermark is written only by the alert job (ADR-024 QĐ 3.2)
+		self.privilege_alert_checked_until = frappe.db.get_single_value(
+			SETTING_DOCTYPE, "privilege_alert_checked_until", cache=False
+		)
 		stored = {
 			row.name: row
 			for row in frappe.get_all(

@@ -23,7 +23,7 @@ VIETNAMESE_ACCENTS = re.compile(
 DOCTYPE_CONFIG = {
 	"ERP AI Setting": {
 		"folder": "erp_ai_setting",
-		"field_count": 27,
+		"field_count": 28,
 		"phrases": {
 			"enabled": ("Tắt", "4 đơn giá", "từ khóa kích hoạt"),
 			"permission_level": ("L0", "L1", "L2", "L3", "ngân sách"),
@@ -67,6 +67,7 @@ DOCTYPE_CONFIG = {
 			"routing_rules": ("đầu mục", "SLA", "phút", "bị chặn khi lưu"),
 			"prompt_digest": ("lập luận", "phân loại"),
 			"alert_recipients": ("mỗi dòng", "canhbao@congty.vn", "dấu phẩy"),
+			"privilege_alert_checked_until": ("Hệ thống tự ghi", "không sửa được", "chưa cảnh báo lần nào"),
 			"credentials": ("không trùng", "Kiểm tra khóa"),
 			"code_change_enabled": (
 				"L3",
@@ -86,7 +87,7 @@ DOCTYPE_CONFIG = {
 			),
 		},
 		"section_count": 7,
-		"read_only_fields": ("spent_this_month_usd",),
+		"read_only_fields": ("spent_this_month_usd", "privilege_alert_checked_until"),
 		"sections": (
 			("section_activation", "Bật và mức quyền", "enabled"),
 			("section_limits", "Giới hạn mỗi lần chạy", "max_turns_per_run"),

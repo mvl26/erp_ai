@@ -185,12 +185,57 @@ Không ca nào lỗi lược đồ lạ (foreign schema) trong lần này. `git 
 5. Không skip marker, không assert bị nới: đạt (R-4 đóng phần assert; F-R4-1 là chữ spec).
 6. DoD build + không đụng protected_paths: đạt; migration up/down/up (STD-OPS-2, R-3): CHƯA LÀM. As-Built/CHANGELOG: owner writer, sau G4.
 
-## Phán quyết
+## Phán quyết riêng của qa (lượt `da00518`, ghi @ `789d524`, giữ nguyên)
 
-`rework`: checklist mục 3, 4, 6 chưa đạt.
+qa kết luận `rework`; kết luận này không đổi và không bị sửa ở lượt đóng bên dưới. Checklist mục 3, 4, 6 chưa đạt.
 - F-R4-2 — tái hiện: đọc `erp_ai/test_change_decision.py:213` (kỳ vọng = `change_decision.BAD_LINK`); task mới T70 (dev).
 - F-R4-1 — sửa chữ AC-25/AC-26 theo ADR-023 QĐ1 (`/team:analyze FEAT-004 --amend`), chốt ADR-023; owner analyst/architect.
 - F-3 và `cmd.test` — tái hiện: `flock -w 1800 .team/miyano-site.lock env PYTHONPATH=<worktree> bench --site miyano run-tests --module erp_ai.gateway.test_gateway --test test_api_key_never_leaks` và `cmd.test` cả app; hiện BLOCKED vì phiên khác chạy `run-tests` ngoài khóa. Owner: team-leader (giữ site độc quyền), rồi qa chạy lại.
 - R-3 — `r3_updown.sh` trong một lần giữ khóa; owner qa, khi site rảnh.
 
-Verdict: rework
+## Đã đóng sau lượt `da00518` (tới đầu nhánh `b8d3e74`)
+
+Lượt đóng này qa KHÔNG chạy test, KHÔNG chạy lệnh bench (lệnh team-leader). Mọi số dưới đây là bằng chứng của vai khác, có nguồn; qa chỉ đọc file (`git log`, `grep`) trên worktree `feat-004` @ `b8d3e74`.
+
+| mục | đóng bởi | bằng chứng | ai chạy |
+|---|---|---|---|
+| F-3 | T69 (`source.py` không tạo logger lúc import), review-69 approve 1 vòng, merge `9adcdd6` | `test_gateway` chạy riêng `Ran 65 tests in 8.204s` / `OK` (review-69; dòng progress T69 trong `tasks.md`); trong lần cả app của qa trên `da00518`, `test_api_key_never_leaks` xanh | tech-lead. Lần chạy riêng của chính qa (20:35:47) dừng ở `QueryDeadlockError 1213` trong `setUp`, không tới assert — qa chưa có lần chạy riêng xanh của riêng mình |
+| F-4 | đóng ở lượt `da00518` (xem trên) | sau `cmd.migrate` từ worktree feat-004, `test_erp_ai_log` suite 7/0/0 trong lần cả app | qa |
+| F-R4-2 | T70, review-70 approve 1 vòng, merge `32132a6`, 70/70 task | `erp_ai/test_change_decision.py:43` `BAD_LINK_REFUSAL = "Đường dẫn duyệt không hợp lệ hoặc đã bị sửa."` (câu viết tay), dùng ở `:214`; `test_change_decision` `Ran 10 tests in 25.731s` / `OK` sau merge | dev/reviewer/tech-lead; qa chỉ đọc file |
+| F-R4-1 | spec Amendment 3 @ `cf88a52` (+ 4 dòng sửa chưa commit trong worktree) | `spec.md:484-485` AC-25/AC-26 `[changed: Amd-3]`: form Desk + lời gọi quyết định, khớp ADR-023 QĐ1 | analyst; qa đọc chữ |
+
+Mã giữa `da00518` và `b8d3e74`: chỉ T70 (file test) và tài liệu; qa không chạy lại gì trên `b8d3e74`.
+
+## Quyết định của người (2026-11-14)
+
+Người chọn (AskUserQuestion, qua team-leader): **"Chấp nhận với bằng chứng hiện có"** — bỏ điều kiện một lần `cmd.test` cả app sạch cho FEAT-004.
+
+- Lần cả app tốt nhất vẫn là của qa trên `da00518`: `Ran 1499 tests in 802.131s` / `FAILED (failures=2, errors=12)`. Không có lần cả app nào ra `OK` trên nhánh này.
+- Đây là chấp nhận theo quyết định của người, KHÔNG phải nghiệm thu sạch của qa: phán quyết riêng của qa vẫn là `rework` (mục trên). DoD "`cmd.test` xanh" và checklist mục 4, 6 được người miễn, không được qa đánh dấu đạt.
+- STD-OPS-2 (migration up/down/up do qa kiểm) chưa đạt; người nhận rủi ro này cùng quyết định (O-9).
+
+## Còn mở sau quyết định (cũng ghi ở `docs/team/debt.md`)
+
+**Test (8 test vẫn deadlock khi chạy lại theo tên, lượt `da00518`):**
+- O-1 `test_runner_routing::test_existing_linked_task_no_new_task` — 1213
+- O-2 `test_runner_routing::test_other_category_or_no_person_no_task` — 1213
+- O-3 `test_runner_routing::test_preassigned_by_human_no_task_no_comment` — 1213
+- O-4 `test_runner_routing::test_broken_sla_condition_stops_route_cleanly` — 1213
+- O-5 `test_runner_status::test_done_last_on_unexpected_runner_exception` — 1213
+- O-6 `test_runner_status::test_end_status_never_raises_when_logging_fails` — 1213
+- O-7 `test_runner_status::test_indicator_stays_thinking_while_waiting` — 1213
+- O-8 `test_runner_status::test_done_last_when_answered` — **chưa phân loại**: lần cả app là failure thật `0 != 1` (`test_runner_status.py:138`), lần chạy lại dừng ở 1213 trước assert; không có bằng chứng nó là môi trường hay lỗi mã.
+
+**Migration:**
+- O-9 R-3: up → down → up chỉ có bằng chứng của tech-lead/dev ở T34 (`cmd.migrate` lên / xuống bước 1 `code_change_enabled=0` / lên; chiều xuống gỡ mã không chạy vì `remove_orphan_doctypes` sẽ xóa DocType `ERP AI Change Proposal`, cần người duyệt). qa chưa tự chạy.
+
+**Chỉ người quan sát được sau merge** (mục trên): O-10 AC-22 form duyệt thật; O-11 AC-25 liên kết Duyệt/Từ chối bằng trình duyệt thật; O-12 AC-28 dòng `Info` trên trang phiếu thật; O-13 AC-29 đo với model thật (sau G4).
+
+**Rủi ro còn lại:** O-14 R-1 (mục vượt 60000 byte chỉ còn `[đã cắt]`; chờ FEAT-005 AC-13); O-15 R-2 (chặn đọc khóa qua `frappe.client.get_list` dựa vào Frappe @ `2e9ecdc`); O-16 R-5 (AC-11 thiếu kịch bản câu chèn khi ô Toàn quyền bật); O-17 R-6 (không có lần cả app `OK`; miễn theo quyết định, rủi ro vẫn còn). Kèm theo, không đánh số riêng: 21 Comment mồ côi trên HD Ticket đã mất vẫn còn trên site (`DELETE` bị 1175); F-5 hai test còn trong "Test chập chờn" của `debt.md` cho tới lần xanh thứ hai.
+
+**7 điểm "Còn lệch" (spec P-5, Amendment 3):** O-18 ADR-023 còn *proposed* (architect); O-19 AC-34 ca cực đoan bỏ mục cuối (team-leader, As-Built); O-20 AC-35/A-27 cần người xác nhận bản tóm tắt đủ dùng hoặc chờ FEAT-005 AC-13 (người); O-21 chữ "agent không có System Manager" (ADR-006, A-2, A-2') trái quyết định giữ `System Manager` (architect); O-22 chưa có bằng chứng agent trên `miyano` đã gỡ `ERP AI Instructor` (người); O-23 AC-25 "người duyệt mở được Desk" chưa kiểm cho Hiếu, Việt, Tiến (người); O-24 cột "Mã nhận về" của N-7 là ảnh chụp lịch sử (tech-lead).
+
+Tổng: 24 mục mở (O-1..O-24). As-Built/CHANGELOG: owner writer, sau G4.
+
+Dòng dưới là dạng máy đọc (`team.py`) của QUYẾT ĐỊNH CỦA NGƯỜI 2026-11-14 ("Chấp nhận với bằng chứng hiện có"), không phải nghiệm thu sạch của qa; qa giữ `rework`, 24 mục mở ở trên.
+Verdict: accepted

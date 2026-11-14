@@ -230,7 +230,7 @@
   },
   {
    "fieldname": "actions",
-   "fieldtype": "Small Text",
+   "fieldtype": "Long Text",
    "label": "Hành động",
    "description": "Các hành động agent đã thực hiện trên phiếu, ví dụ ghi phân loại hoặc đăng bình luận. Để trống nếu chỉ đọc. Hệ thống tự ghi khi agent chạy, không sửa được.",
    "read_only": 1

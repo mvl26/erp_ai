@@ -72,6 +72,10 @@ MAX_LIMIT = 50
 MAX_FIELDS = 20
 MAX_FILTERS = 10
 NAME_MAX = 140
+# Before/after values of a write: each value cut to VALUE_MAX characters; a deleted record shows at most
+# DELETED_FIELDS_MAX of its non-empty fields.
+VALUE_MAX = 200
+DELETED_FIELDS_MAX = 20
 
 
 def _fail(reason: str, doctype=None) -> dict:
@@ -171,11 +175,35 @@ def _values_refusal(doctype: str, values: dict, ctx: ToolContext) -> dict | None
 	return None
 
 
+def _shown_value(value):
+	if value is None or isinstance(value, bool | int | float):
+		return value
+	text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, default=str)
+	return text[:VALUE_MAX]
+
+
+def _shown(doc, keys) -> dict:
+	"""The value of each key as held by `doc`, secret and system fields left out, each cut to VALUE_MAX."""
+	record = doc.as_dict()
+	return {
+		key: _shown_value(record.get(key))
+		for key in keys
+		if key not in SYSTEM_FIELDS and not _is_secret(doc.meta, key)
+	}
+
+
+def _deleted_values(doc) -> dict:
+	"""The non-empty fields of a record about to be deleted, at most DELETED_FIELDS_MAX."""
+	filled = [key for key, value in doc.as_dict().items() if value not in (None, "", [])]
+	return dict(list(_shown(doc, filled).items())[:DELETED_FIELDS_MAX])
+
+
 def _write(doctype: str, save) -> dict:
-	"""Run `save` (returns the saved document) in its own savepoint; a refused write leaves nothing behind."""
+	"""Run `save` (returns the name, the value before and the value after) in its own savepoint; a refused write
+	leaves nothing behind."""
 	frappe.db.savepoint(SAVEPOINT)
 	try:
-		doc = save()
+		name, value_before, value_after = save()
 	except frappe.PermissionError:
 		frappe.db.rollback(save_point=SAVEPOINT)
 		return _fail("thiếu quyền trên DocType hoặc bản ghi này", doctype)
@@ -191,7 +219,13 @@ def _write(doctype: str, save) -> dict:
 			return _fail("đã có bản ghi cùng tên", doctype)
 		return _fail(UNEXPECTED_ERROR_REASON, doctype)
 	frappe.db.release_savepoint(SAVEPOINT)
-	return {"ok": True, "doctype": doctype, "name": doc.name}
+	return {
+		"ok": True,
+		"doctype": doctype,
+		"name": name,
+		"value_before": value_before,
+		"value_after": value_after,
+	}
 
 
 def create_record(args: dict, ctx: ToolContext) -> dict:
@@ -200,8 +234,9 @@ def create_record(args: dict, ctx: ToolContext) -> dict:
 		return refusal
 
 	def save():
-		doc = frappe.get_doc({**values, **_forced_values(doctype, ctx), "doctype": doctype})
-		return doc.insert()
+		written = {**values, **_forced_values(doctype, ctx)}
+		doc = frappe.get_doc({**written, "doctype": doctype}).insert()
+		return doc.name, None, _shown(doc, written)
 
 	return _write(doctype, save)
 
@@ -222,8 +257,11 @@ def update_record(args: dict, ctx: ToolContext) -> dict:
 		doc = frappe.get_doc(doctype, name)
 		if not _is_draft(doc):
 			frappe.throw("chứng từ đã submit hoặc đã hủy, không sửa qua công cụ")
-		doc.update({**values, **_forced_values(doctype, ctx)})
-		return doc.save()
+		written = {**values, **_forced_values(doctype, ctx)}
+		value_before = _shown(doc, written)
+		doc.update(written)
+		doc.save()
+		return doc.name, value_before, _shown(doc, written)
 
 	return _write(doctype, save)
 
@@ -242,8 +280,9 @@ def delete_record(args: dict, ctx: ToolContext) -> dict:
 		return refusal
 
 	def delete():
+		value_before = _deleted_values(frappe.get_doc(doctype, name))
 		frappe.delete_doc(doctype, name)
-		return frappe._dict(name=name)
+		return name, value_before, None
 
 	return _write(doctype, delete)
 
@@ -261,8 +300,9 @@ def submit_record(args: dict, ctx: ToolContext) -> dict:
 
 	def run():
 		doc = frappe.get_doc(doctype, name)
+		value_before = {"docstatus": doc.docstatus}
 		getattr(doc, action)()
-		return doc
+		return doc.name, value_before, {"docstatus": doc.docstatus}
 
 	return _write(doctype, run)
 
@@ -360,12 +400,19 @@ def call_method(args: dict, ctx: ToolContext) -> dict:
 
 	def run():
 		outcome["result"] = frappe.call(function, **arguments)
-		return frappe._dict(name=method)
+		# The record the method touched is unknown: only the call itself is shown.
+		return method, None, {"method": method, "argument_keys": sorted(arguments)}
 
 	written = _write(None, run)
 	if not written["ok"]:
 		return written
-	return {"ok": True, "method": method, "result": _scrub(outcome["result"])}
+	return {
+		"ok": True,
+		"method": method,
+		"result": _scrub(outcome["result"]),
+		"value_before": written["value_before"],
+		"value_after": written["value_after"],
+	}
 
 
 def get_record(args: dict, ctx: ToolContext) -> dict:

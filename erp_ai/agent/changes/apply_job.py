@@ -57,9 +57,11 @@ GIT_COMMIT_MISMATCH = "commit không đúng nội dung đã duyệt, cần ngư�
 GIT_SHORT_REASON_MAX_CHARS = 120
 GIT_BRANCH_CHANGED = "nhánh đang checkout đã đổi kể từ lúc đề xuất"
 GIT_NOT_ANCESTOR = "commit áp dụng không còn nằm trong lịch sử nhánh đang checkout"
-COMMAND_FAILED = "lệnh thoát với mã {0}"
+# Design 4.3 step 4 (exact wording); "quá thời gian" is AC-10's reason (design addendum 2 QĐ-A3).
+COMMAND_FAILED = "lệnh trả mã {0}"
 COMMAND_TIMED_OUT = "lệnh chạy quá giờ và đã bị dừng"
-COMMAND_NOT_FOUND = "không tìm thấy lệnh bench"
+COMMAND_OUT_OF_TIME = "quá thời gian"
+COMMAND_NOT_FOUND = "không tìm thấy bench trên máy chủ"
 
 
 class _Stop(Exception):
@@ -600,8 +602,16 @@ def _undo_code(proposal, actor: str, allowed_apps, deadline: float) -> None:
 
 
 def _apply_command(proposal, actor: str, deadline: float) -> None:
+	"""Design 4.3 step 4: one bench run with the job's remaining budget; no git call (ADR-022 QĐ 1)."""
 	args = json.loads(proposal.command_args)
-	result = process_runner.run_bench(args, int(deadline - time.monotonic()))
+	limit = int(deadline - time.monotonic())
+	if limit < 1:
+		# Design addendum 2 QĐ-A3: no process when under 1 s is left; no exit code (addendum 3 QĐ-B4).
+		no_run = process_runner.CommandResult(
+			exit_code=None, output="", duration_ms=0, timed_out=True, not_found=False
+		)
+		raise _Stop(CHANGE_STATUS_FAILED, COMMAND_OUT_OF_TIME, no_run)
+	result = process_runner.run_bench(args, limit)
 	if result.not_found:
 		raise _Stop(CHANGE_STATUS_FAILED, COMMAND_NOT_FOUND, result)
 	if result.timed_out:

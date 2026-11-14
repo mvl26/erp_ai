@@ -12,6 +12,9 @@ SCORE_VALUES = (1, 2, 3)
 SCORE_REASON_MAX_WORDS = 25
 # The guide spells the tag "[GẬP]"; "[GẤP]" is the standard spelling. Accept both.
 URGENT_TAGS = ("[GẤP]", "[GẬP]")
+# AC-28 (design.md:409): the split question lists at most 10 requests, each cut to 200 characters.
+SPLIT_MAX_REQUESTS = 10
+SPLIT_REQUEST_MAX_CHARS = 200
 
 # D-8: ticket_type = category name; agent_group and priority per guide 16.1-16.2.
 DEFAULT_CATEGORY_MAPPING = {
@@ -99,6 +102,23 @@ def parse_classification(text: str) -> Classification | None:
 		score_reason=score_reason,
 		department=department if isinstance(department, str) else None,
 	)
+
+
+def split_request_comment(classification) -> str | None:
+	"""AC-28: the comment asking the creator whether to split a merged ticket; None when there is nothing to ask.
+
+	Blank requests are dropped and do not count towards the two needed.
+	"""
+	if classification is None or not classification.needs_split:
+		return None
+	requests = [r.strip() for r in classification.requests if r.strip()]
+	if len(requests) < 2:
+		return None
+	listed = [r[:SPLIT_REQUEST_MAX_CHARS] for r in requests[:SPLIT_MAX_REQUESTS]]
+	lines = [f"Phiếu này có vẻ gồm {len(listed)} yêu cầu:"]
+	lines += [f"{number}. {request}" for number, request in enumerate(listed, start=1)]
+	lines.append("Anh/chị xác nhận có muốn tách thành các phiếu riêng không? Bot không tự tách phiếu.")
+	return "\n".join(lines)
 
 
 def _mapping_error(raw):

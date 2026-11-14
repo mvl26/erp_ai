@@ -20,6 +20,8 @@ AI_SECTION_FIELD = "ai_section"
 AI_PERMLEVEL = 8
 TASK_DOCTYPE = "Task"
 TASK_TICKET_FIELD = "ai_ticket"
+ARTICLE_DOCTYPE = "HD Article"
+ARTICLE_SOURCE_FIELD = "ai_source_ticket"
 FORM_SCRIPT_DOCTYPE = "HD Form Script"
 AGENT_STATUS_SCRIPT = "ERP AI Agent Status"
 AGENT_STATUS_SCRIPT_FILE = ("public", "js", "agent_status_indicator.js")
@@ -49,6 +51,7 @@ def ensure_setup() -> None:
 	_ensure_ticket_custom_fields()
 	_ensure_template_rows()
 	_ensure_task_ticket_field()
+	_ensure_article_source_field()
 	_ensure_task_permission()
 	_ensure_agent_status_script()
 
@@ -150,6 +153,12 @@ def _ai_field_specs() -> list[dict]:
 			"read_only": 1,
 		},
 		{
+			"fieldname": "ai_confidence_pct",
+			"label": "Độ tin cậy % (AI)",
+			"fieldtype": "Int",
+			"read_only": 1,
+		},
+		{
 			"fieldname": "ai_complexity",
 			"label": "Độ phức tạp (AI)",
 			"fieldtype": "Int",
@@ -234,6 +243,30 @@ def _ensure_task_ticket_field() -> None:
 					"search_index": 1,
 					"module": AI_MODULE,
 					"insert_after": "description",
+				}
+			]
+		},
+		update=False,
+	)
+
+
+def _ensure_article_source_field() -> None:
+	if not frappe.db.exists("DocType", ARTICLE_DOCTYPE):
+		frappe.logger(LOGGER_NAME).warning("DocType HD Article not found; source ticket field not added")
+		return
+	# update=False: a field that exists is left as the human set it.
+	create_custom_fields(
+		{
+			ARTICLE_DOCTYPE: [
+				{
+					"fieldname": ARTICLE_SOURCE_FIELD,
+					"label": "Phiếu nguồn (AI)",
+					"fieldtype": "Link",
+					"options": TICKET_DOCTYPE,
+					"read_only": 1,
+					"search_index": 1,
+					"module": AI_MODULE,
+					"insert_after": "category",
 				}
 			]
 		},

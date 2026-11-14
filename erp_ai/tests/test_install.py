@@ -110,7 +110,7 @@ class TestInstall(FrappeTestCase):
 		self.assertEqual(_counts(), before)
 		self.assertEqual(before["roles"], 2)
 		self.assertEqual(before["users"], 1)
-		self.assertEqual(before["ai_fields"], 9)
+		self.assertEqual(before["ai_fields"], 10)
 
 	def test_ai_fields_permlevel_8_and_template_rows_agents_only(self):
 		for name in AI_FIELDS:
@@ -161,7 +161,7 @@ class TestInstall(FrappeTestCase):
 			fields=["name", "idx", "fieldname", "required", "visible_to", "editable_after_creation"],
 			order_by="idx",
 		)
-		self.assertEqual(len(rows), 9)
+		self.assertEqual(len(rows), 10)
 		first = rows[0]
 		self.assertEqual(
 			(
@@ -174,12 +174,13 @@ class TestInstall(FrappeTestCase):
 			),
 			("erp-ai-t12-keep", 1, "priority", 1, "Everyone", 1),
 		)
-		self.assertEqual([r.idx for r in rows], [1, 2, 3, 4, 5, 6, 7, 8, 9])
+		self.assertEqual([r.idx for r in rows], [1, 2, 3, 4, 5, 6, 7, 8, 9, 10])
 		self.assertEqual(
 			[r.fieldname for r in rows[1:]],
 			[
 				"ai_resolution_hint",
 				"ai_confidence",
+				"ai_confidence_pct",
 				"ai_complexity",
 				"ai_importance",
 				"ai_score_reason",
@@ -735,6 +736,98 @@ class TestFeat007Migrate(FrappeTestCase):
 		)
 		self._setup_at(ENABLED_AT)
 		self.assertIsNone(self._enabled_at())
+
+	def _custom_field(self, doctype, fieldname):
+		return frappe.db.get_value(
+			"Custom Field",
+			{"dt": doctype, "fieldname": fieldname},
+			[
+				"name",
+				"fieldtype",
+				"options",
+				"read_only",
+				"permlevel",
+				"search_index",
+				"module",
+				"insert_after",
+				"label",
+			],
+			as_dict=True,
+		)
+
+	def test_confidence_pct_field_installed(self):
+		"""AC-22, D-14: HD Ticket `ai_confidence_pct` Int, read-only, permlevel 8, after `ai_confidence`."""
+		frappe.db.delete("Custom Field", {"dt": "HD Ticket", "fieldname": "ai_confidence_pct"})
+		frappe.db.delete("HD Ticket Template Field", {"parent": TEMPLATE, "fieldname": "ai_confidence_pct"})
+		frappe.clear_cache(doctype="HD Ticket")
+		install.ensure_setup()
+		field = self._custom_field("HD Ticket", "ai_confidence_pct")
+		self.assertIsNotNone(field)
+		self.assertEqual(
+			(field.fieldtype, field.read_only, field.permlevel, field.module, field.insert_after),
+			("Int", 1, 8, "ERP AI agent", "ai_confidence"),
+		)
+		self.assertEqual(
+			frappe.db.get_value(
+				"Custom Field", {"dt": "HD Ticket", "fieldname": "ai_complexity"}, "insert_after"
+			),
+			"ai_confidence_pct",
+		)
+		rows = frappe.get_all(
+			"HD Ticket Template Field",
+			filters={"parent": TEMPLATE, "fieldname": "ai_confidence_pct"},
+			fields=["visible_to", "required", "editable_after_creation"],
+		)
+		self.assertEqual(
+			[(r.visible_to, r.required, r.editable_after_creation) for r in rows], [("Agents", 0, 0)]
+		)
+		install.after_migrate()
+		self.assertEqual(
+			frappe.db.count("Custom Field", {"dt": "HD Ticket", "fieldname": "ai_confidence_pct"}), 1
+		)
+		self.assertEqual(
+			frappe.db.count(
+				"HD Ticket Template Field", {"parent": TEMPLATE, "fieldname": "ai_confidence_pct"}
+			),
+			1,
+		)
+
+	def test_article_source_field_installed_idempotent(self):
+		"""AC-45, D-15: HD Article `ai_source_ticket` Link HD Ticket, read-only, indexed; a human edit is kept."""
+		frappe.db.delete("Custom Field", {"dt": "HD Article", "fieldname": "ai_source_ticket"})
+		frappe.clear_cache(doctype="HD Article")
+		install.ensure_setup()
+		field = self._custom_field("HD Article", "ai_source_ticket")
+		self.assertIsNotNone(field)
+		self.assertEqual(
+			(field.fieldtype, field.options, field.read_only, field.search_index),
+			("Link", "HD Ticket", 1, 1),
+		)
+		self.assertEqual((field.module, field.insert_after), ("ERP AI agent", "category"))
+		frappe.db.set_value("Custom Field", field.name, {"label": "Do người sửa", "search_index": 0})
+		install.after_migrate()
+		field = self._custom_field("HD Article", "ai_source_ticket")
+		self.assertEqual((field.label, field.search_index), ("Do người sửa", 0))
+		self.assertEqual(
+			frappe.db.count("Custom Field", {"dt": "HD Article", "fieldname": "ai_source_ticket"}), 1
+		)
+
+	def test_article_field_skipped_when_doctype_missing(self):
+		frappe.db.delete("Custom Field", {"dt": "HD Article", "fieldname": "ai_source_ticket"})
+		real = frappe.db.exists
+		with (
+			patch.object(
+				install.frappe.db,
+				"exists",
+				side_effect=lambda *a, **k: None if a[:2] == ("DocType", "HD Article") else real(*a, **k),
+			),
+			patch.object(install.frappe, "logger") as logger,
+		):
+			install.ensure_setup()
+		warnings = [c.args for c in logger.return_value.warning.call_args_list if "HD Article" in c.args[0]]
+		self.assertEqual(len(warnings), 1)
+		self.assertIn("not found", warnings[0][0])
+		self.assertIsNone(self._custom_field("HD Article", "ai_source_ticket"))
 
 	def test_instructor_can_report_on_log(self):
 		"""AC-20, D-5: ERP AI Instructor reads ERP AI Log through reports, nothing else (append-only kept)."""

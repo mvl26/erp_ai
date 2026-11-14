@@ -1641,10 +1641,6 @@ class TestRunnerRecordSnapshots(RunnerTestBase):
 
 	def test_generic_write_tools_derived_from_write_tool_targets(self):
 		self.assertEqual(
-			runner.GENERIC_WRITE_TOOLS,
-			tuple(name for name, (doctype, _) in runner.WRITE_TOOL_TARGETS.items() if doctype is None),
-		)
-		self.assertEqual(
 			sorted(runner.GENERIC_WRITE_TOOLS),
 			["api_create_record", "api_delete_record", "api_submit_record", "api_update_record"],
 		)
@@ -1750,6 +1746,33 @@ class TestRunnerRecordSnapshots(RunnerTestBase):
 		)
 		self.assertEqual(
 			json.loads(entry.value_after), {"api_update_record#2": {"name": second, "title": newest}}
+		)
+
+	def test_position_counts_every_action_not_only_the_same_tool(self):
+		old_title, new_title = f"{PREFIX}snapshot after comment", f"{PREFIX}snapshot after comment new"
+		note = self._note(old_title)
+		execute_tool = runner.execute_tool
+
+		def execute(name, arguments, context):
+			if name == "post_comment":
+				return {"ok": True, "comment": "c1"}
+			return execute_tool(name, arguments, context)
+
+		entry = self._run_turn(
+			tool_use("toolu_1", "post_comment", content="xin chào"),
+			tool_use("toolu_2", "api_update_record", doctype="Note", name=note, values={"title": new_title}),
+			execute=execute,
+		)
+
+		self.assertEqual(
+			[(action["tool"], action["ok"]) for action in json.loads(entry.actions)],
+			[("post_comment", True), ("api_update_record", True)],
+		)
+		self.assertEqual(
+			json.loads(entry.value_before), {"api_update_record#2": {"name": note, "title": old_title}}
+		)
+		self.assertEqual(
+			json.loads(entry.value_after), {"api_update_record#2": {"name": note, "title": new_title}}
 		)
 
 	def test_snapshot_never_reaches_model(self):

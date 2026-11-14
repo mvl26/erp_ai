@@ -1,6 +1,7 @@
 """Secret masking shared by logs, tool results, Error Log reads and emails (NFR-6, ADR-034 QĐ 2).
 
-Rules N-1..N-7, K-1..K-8, R-1..R-5 of `design-w0-fixes-3.md` section 3. One word list (`SECRET_WORDS`)
+Rules N-1..N-7, K-1..K-8, R-1..R-5 of `design-w0-fixes-3.md` section 3, with K-4, K-4a and K-8 as
+amended by `design-w0-fixes-4.md` point 3. One word list (`SECRET_WORDS`)
 drives both `is_secret_key` and the key-value scan of `redact_secrets`. Output is always NFC (3a).
 """
 

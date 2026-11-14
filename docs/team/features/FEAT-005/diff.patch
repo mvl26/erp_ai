@@ -1157,10 +1157,10 @@ index 0000000..61ce0c5
 +
 +- Không có.
 diff --git a/docs/team/features/FEAT-005/tasks.md b/docs/team/features/FEAT-005/tasks.md
-index d224965..126af56 100644
+index d224965..9bdb5ea 100644
 --- a/docs/team/features/FEAT-005/tasks.md
 +++ b/docs/team/features/FEAT-005/tasks.md
-@@ -15,18 +15,102 @@ Ký hiệu `F4-T<n>` = task `T<n>` trong `docs/team/features/FEAT-004/tasks.md`.
+@@ -15,18 +15,106 @@ Ký hiệu `F4-T<n>` = task `T<n>` trong `docs/team/features/FEAT-004/tasks.md`.
  
  Nhánh nền: `team/FEAT-004` sau khi build xong (F4-T34 đã tick). Khi đó tech-lead tạo `team/FEAT-005` từ đầu nhánh đó, ghi mã commit thật vào dòng BASE dưới, chạy `cmd.test` (phải xanh) trước T1.
  Tiến độ: BASE ghi ở đây trước mỗi lần gọi dev.
@@ -1252,6 +1252,10 @@ index d224965..126af56 100644
 +- T16 cả app, MỘT lần giữ khóa `miyano-site.lock` 23:08:35–23:17:19 trên mã `8898f3c` (0 lệnh `run-tests`/`migrate` ngoài khóa lúc bắt đầu; số dòng ERP AI Log trước migrate 42, sau migrate 42; migrate từ worktree feat-005 exit 0; ghi lại `auto_assign_enabled=1`, `code_change_apps` = `frappe\nerpnext\nhelpdesk\nhrms` → để trống, đọc lại `0` và rỗng): test_architecture `Ran 179 tests in 13.524s` / `OK` → tick T14 (review-14, 3 vòng) → `bench --site miyano run-tests --app erp_ai`: `Ran 1564 tests in 477.844s` / `FAILED (failures=1)`, 0 `QueryDeadlockError` → trả lại hai cài đặt, đọc lại khớp từng ký tự (`RESTORE MATCH`)
 +- T16 ca đỏ duy nhất: `erp_ai.erp_ai_agent.report.erp_ai_accuracy.test_erp_ai_accuracy.TestAccuracyFiltersAndColumns.test_report_record_is_system_manager_only_script_report`, `AssertionError: Lists differ: ['System Manager', 'ERP AI Instructor'] != ['System Manager']`. Chạy lại theo tên một lần (giữ khóa 23:18:26–23:18:53, migrate trước): `Ran 1 test in 0.027s` / `FAILED (failures=1)`, cùng lỗi. Phân loại: SCHEMA CỦA PHIÊN KHÁC, không phải deadlock, không phải lỗi thật của FEAT-005. Bằng chứng: bản ghi Report `ERP AI Accuracy` trên site mang role do JSON của nhánh FEAT-007 đồng bộ (`worktrees/feat-007/…/erp_ai_accuracy.json`: `"modified": "2026-11-14 12:00:02"`, hai role `System Manager` + `ERP AI Instructor`); JSON trên nhánh này `"modified": "2026-11-11 12:00:00"`, một role, cũ hơn nên migrate từ worktree này không ghi đè; `git diff develop...team/FEAT-005 -- erp_ai/erp_ai_agent/report` rỗng (FEAT-005 không chạm report này)
 +- DỪNG lượt build 4 ở T16 (theo lệnh team-leader: cả app không `OK` thì không lặp, liệt kê ca đỏ theo loại rồi dừng): 16/17 tick (T1–T15, T17); T16 CHƯA tick vì còn 1 ca đỏ ngoài dòng `baseline:` (loại: schema của phiên khác). `cmd.lint` sạch; `diff.patch` = `git diff develop...team/FEAT-005` (nền `eda2c9d`; `base_branch` `main` không có nhánh local nên dùng `develop`, nơi `team/*` được gộp vào). Còn mở cho team-leader: (1) quyết định (decide) T13 và `design-defect` vế Error Log (debt.md, review-13); (2) ca đỏ schema của FEAT-007: chạy lại ca này khi site chỉ mang schema của nhánh này, hoặc nhận như nhiễu môi trường; (3) T14 đã dùng hết 3 vòng (approve ở vòng 3). Tiếp: `/team:build FEAT-005 --task T16` hoặc `/team:verify FEAT-005` nếu team-leader nhận ca đỏ là nhiễu môi trường
++- lượt build 5 (`/team:build FEAT-005 --task T16 --decide`, chỉ T16, không gọi dev hay reviewer, không đổi mã; BASE `c6c06ee`): MỘT lần giữ khóa `miyano-site.lock` 23:28:13–23:37:56 trên mã `c6c06ee` (0 lệnh `run-tests`/`migrate` ngoài khóa lúc bắt đầu). Ghi lại trước khi làm: Report `ERP AI Accuracy` roles `System Manager` + `ERP AI Instructor`, `modified` `2026-11-14 12:00:02`; `auto_assign_enabled=1`; `code_change_apps` = `frappe\nerpnext\nhelpdesk\nhrms`; số dòng ERP AI Log 42; `has_field("privilege_alert_checked_until")` = False (phiên khác vừa migrate)
++- T16 `cmd.migrate` lên/xuống/lên trong lần giữ khóa đó: lên (worktree feat-005) exit 0 → `has_field` True, 42 dòng · xuống (checkout chính ở `develop` `4469287`, JSON không có trường mốc) exit 0 → `has_field` False, 42 dòng · lên (worktree feat-005) exit 0 → `has_field` True, 42 dòng. Số dòng ERP AI Log trước 42 = sau 42; `tabSingles` không có dòng mốc ở cả bốn lần đọc; ba lần migrate không đổi bản ghi Report và hai cài đặt
++- T16 cả app trong lần giữ khóa đó: Report đưa về JSON của nhánh bằng `import_file_by_path(<worktree feat-005>/…/erp_ai_accuracy.json, force=True)` → đọc lại roles `System Manager`, `modified` `2026-11-11 12:00:00`; hai cài đặt để trống (đọc lại `0` và rỗng) → `bench --site miyano run-tests --app erp_ai`: `Ran 1564 tests in 503.462s` / `OK`, 0 `QueryDeadlockError` → trả lại: hai cài đặt bằng `set_single_value`, Report bằng `import_file_by_path(<worktree feat-007>/…/erp_ai_accuracy.json, force=True)` → đọc lại cả ba khớp bản đã ghi (`RESTORE MATCH`: roles `System Manager` + `ERP AI Instructor`, `modified` `2026-11-14 12:00:02`; `1`; `frappe\nerpnext\nhelpdesk\nhrms`); `git status -- erp_ai` của ba worktree (feat-005, feat-007, chính): 0 file đổi. Lần thử đầu 23:27:55 dừng ngay ở bước đọc (lỗi của script đọc của tech-lead), chưa đổi gì trên site
++- tick T16: `cmd.test` `OK`, `cmd.lint` sạch và các bước kiểm tĩnh ở dòng "T16 kiểm tĩnh" phía trên (mã không đổi từ `8898f3c`: `git diff 8898f3c c6c06ee -- erp_ai` rỗng), migrate lên/xuống/lên đạt, `diff.patch` làm lại. 17/17. Ghi cho qa: site kết thúc ở chiều "lên" của worktree feat-005 nhưng phiên khác migrate sẽ lại gỡ trường mốc, verify phải migrate từ worktree này trong lần giữ khóa của mình; ca `test_report_record_is_system_manager_only_script_report` chỉ xanh khi bản ghi Report trên site đúng JSON của nhánh (cách tạm đổi rồi trả như trên); bước kiểm múi giờ không DST (design-amd2 §6); đối chiếu mốc bằng giá trị thô của `tabSingles` và `read_privilege_watermark() is None`. Tiếp: `/team:verify FEAT-005`
  
  ## Phần 1, ảnh chụp trước/sau ở tool ghi (AC-13, NFR-3)
  
@@ -1267,7 +1271,7 @@ index d224965..126af56 100644
    - Criterion: AC-13 (a), NFR-3; design-amd2 §3.1, §4.1
    - Receives: `_snapshot`, `SNAPSHOT_TABLES` (T1); `create_record`, `update_record`, `delete_record`, `submit_record`, `_write`
    - Returns: kết quả `ok=true` có thêm `_snapshot: {"before": dict|None, "after": dict|None}`. Tập trường: tạo/sửa = khóa của `values` ∪ `SNAPSHOT_TABLES.get(doctype, ())`; xóa = mọi trường có giá trị kể cả bảng con; submit/hủy = `docstatus`. Sửa: `before` chụp từ doc vừa nạp, trước `doc.update`, `after` sau `save()`. Tạo: `before=None`. Xóa: `after=None`. `ok=false` hoặc tool sập: không có khóa `_snapshot`. `call_method` không trả `_snapshot`. Khóa `value_before`/`value_after` của F4-T62 không đổi
-@@ -34,25 +118,28 @@ Tiến độ: BASE ghi ở đây trước mỗi lần gọi dev.
+@@ -34,25 +122,28 @@ Tiến độ: BASE ghi ở đây trước mỗi lần gọi dev.
  
  ## Phần 2, runner ghi ảnh chụp và hoàn tác lượt (AC-13, NFR-3, ADR-024 QĐ 2)
  
@@ -1300,7 +1304,7 @@ index d224965..126af56 100644
    - Criterion: ADR-024 QĐ 2, QĐ 5 (đường DDL, chấp nhận); design-amd2 §4.1 `_undo_turn`
    - Receives: `_undo_turn()`, `REASON_TURN_SAVEPOINT` (T5); `LOGGER_NAME`
    - Returns: rollback savepoint ném lỗi → bắt (chú thích lý do, STD-ERR-1), `frappe.logger(LOGGER_NAME).warning("reason turn undo failed run_id=%s error=%s", …)` chỉ với tên lớp lỗi, không ném lỗi mới; ngoại lệ gốc đi tiếp
-@@ -60,7 +147,7 @@ Tiến độ: BASE ghi ở đây trước mỗi lần gọi dev.
+@@ -60,7 +151,7 @@ Tiến độ: BASE ghi ở đây trước mỗi lần gọi dev.
  
  ## Phần 3, mốc "đã báo tới đâu" (ADR-024 QĐ 3.1, 3.2)
  
@@ -1309,7 +1313,7 @@ index d224965..126af56 100644
    - Criterion: design-amd2 §2 (mốc), §5, §6; ADR-024 QĐ 3.1, 3.2
    - Receives: `restore_self_managed_fields` (đang khôi phục `spent_this_month_usd`); `DOCTYPE_CONFIG["ERP AI Setting"]` trong `test_doctype_descriptions.py` (`field_count`, `read_only_fields`, `phrases`)
    - Returns: trường `privilege_alert_checked_until`: Datetime, `read_only`, ở `section_alerts` ngay sau `alert_recipients`, mô tả tiếng Việt ≤ 400 ký tự nói hệ thống tự ghi; `restore_self_managed_fields` đặt lại trường từ `frappe.db.get_single_value(SETTING_DOCTYPE, "privilege_alert_checked_until", cache=False)`; `DOCTYPE_CONFIG`: `field_count` +1 so với số thật trên nhánh nền (dự kiến 27 → 28), thêm tên trường vào `read_only_fields` và một dòng `phrases`; `section_count` không đổi
-@@ -69,37 +156,48 @@ Tiến độ: BASE ghi ở đây trước mỗi lần gọi dev.
+@@ -69,37 +160,48 @@ Tiến độ: BASE ghi ở đây trước mỗi lần gọi dev.
  
  ## Phần 4, cảnh báo đọc từ nhật ký (AC-14, AC-19, NFR-8)
  
@@ -1364,7 +1368,7 @@ index d224965..126af56 100644
    - Criterion: AC-19, NFR-8; ADR-024 QĐ 3.5, 3.7; design-amd2 §4.2 bước 1, 5, 6
    - Receives: thân job sau T12; `filelock` của `frappe.utils.synchronization`; `TITLE_RUN_FAILED`, `LOGGER_NAME`
    - Returns: `PRIVILEGE_ALERT_LOCK = "erp_ai_privilege_alert"`, `PRIVILEGE_ALERT_LOCK_TIMEOUT_S = 60`; `with filelock(PRIVILEGE_ALERT_LOCK, timeout=PRIVILEGE_ALERT_LOCK_TIMEOUT_S)` (không `is_global`) bao cả thân job kể cả commit; `LockTimeoutError` → `log_error(TITLE_RUN_FAILED, "check_privilege_escalation lock busy")`, return, không chạy điều kiện nào; lỗi giữa job → rollback cả Error Log cảnh báo, Email Queue và mốc; `frappe.logger(LOGGER_NAME).info("check_privilege_escalation window=%s..%s changes=%d", …)` không có tên user hay role
-@@ -107,13 +205,15 @@ Tiến độ: BASE ghi ở đây trước mỗi lần gọi dev.
+@@ -107,13 +209,15 @@ Tiến độ: BASE ghi ở đây trước mỗi lần gọi dev.
  
  ## Phần 5, luật kiến trúc và đầu-cuối
  
@@ -1382,12 +1386,12 @@ index d224965..126af56 100644
    - Criterion: AC-14, AC-19, NFR-8 (đầu-cuối runner → nhật ký → job cảnh báo)
    - Receives: runner với Cổng model giả (T3–T6); `tasks.check_privilege_escalation(now=)` (T13)
    - Returns: một test, không sửa mã sản phẩm
-@@ -121,9 +221,9 @@ Tiến độ: BASE ghi ở đây trước mỗi lần gọi dev.
+@@ -121,9 +225,9 @@ Tiến độ: BASE ghi ở đây trước mỗi lần gọi dev.
  
  ## Checkpoint cuối (tech-lead, không giao dev)
  
 -- [ ] T16 — Chạy `cmd.test`, `cmd.lint`, `cmd.migrate` lên/xuống/lên, kiểm DoD, `diff.patch` — files: docs/team/features/FEAT-005/diff.patch, docs/team/features/FEAT-005/tasks.md — test: `cmd.test` (cả app) — depends: T1..T15
-+- [ ] T16 — Chạy `cmd.test`, `cmd.lint`, `cmd.migrate` lên/xuống/lên, kiểm DoD, `diff.patch` — files: docs/team/features/FEAT-005/diff.patch, docs/team/features/FEAT-005/tasks.md — test: `cmd.test` (cả app) — depends: T1..T15, T17
++- [x] T16 — Chạy `cmd.test`, `cmd.lint`, `cmd.migrate` lên/xuống/lên, kiểm DoD, `diff.patch` — files: docs/team/features/FEAT-005/diff.patch, docs/team/features/FEAT-005/tasks.md — test: `cmd.test` (cả app) — depends: T1..T15, T17
    - Criterion: DoD phần build của spec Amendment 2; design-amd2 §6
 -  - Expect: `cmd.test` xanh (không test đỏ ngoài dòng `baseline:`), `cmd.lint` sạch; `cmd.migrate` lên/xuống/lên: số dòng ERP AI Log trước = sau, `has_field("privilege_alert_checked_until")` đúng; diff không có dấu skip của `test.skip_markers`, không chạm `protected_paths`; `grep -n 'Trạng thái' docs/team/adr/ADR-01[4-8].md` dán vào journal; ghi cho qa: bước kiểm múi giờ không DST (design-amd2 §6)
 +  - Expect: `cmd.test` xanh (không test đỏ ngoài dòng `baseline:`), `cmd.lint` sạch; `cmd.migrate` lên/xuống/lên: số dòng ERP AI Log trước = sau, `has_field("privilege_alert_checked_until")` đúng; diff không có dấu skip của `test.skip_markers`, không chạm `protected_paths`; `grep -n 'Trạng thái' docs/team/adr/ADR-01[4-8].md` dán vào journal; ghi cho qa: bước kiểm múi giờ không DST (design-amd2 §6); theo design-amd2 vòng 2: đối chiếu mốc bằng giá trị thô của `tabSingles` (`None` hoặc `""`) và `read_privilege_watermark() is None`, không khẳng định `get_single_value(...) is None`; chạy lại lệnh `git grep` "Rà nơi gọi ngoài §7" của §7 trên đầu nhánh
@@ -1395,10 +1399,10 @@ index d224965..126af56 100644
  ## Rút theo Amendment 2
  
 diff --git a/docs/team/journal/FEAT-005.md b/docs/team/journal/FEAT-005.md
-index 69ac775..2e233a4 100644
+index 69ac775..cb3a10d 100644
 --- a/docs/team/journal/FEAT-005.md
 +++ b/docs/team/journal/FEAT-005.md
-@@ -43,3 +43,34 @@ Approved-by:
+@@ -43,3 +43,39 @@ Approved-by:
  - 2026-11-14 design → designer | design-amd2.md thay design.md cho build (163 dòng, 10 touchpoint, 36 test), cần trường mới `privilege_alert_checked_until` | DESIGNED sau sửa vòng 1 theo ADR-024 (architect: chấp nhận có điều chỉnh, thay ADR-016 QĐ 5; thêm hoàn tác theo lượt trong runner) | cỡ M
  - 2026-11-14 lý do gọi tech-lead (/team:plan, cùng vai): spec và design rút gọn đã khớp ADR-024, cần plan.md/tasks.md mới thay 52 task cũ
  - 2026-11-14 plan → tech-lead | chọn `/team:plan` (skill) + handbook; `plan.md`, `tasks.md` viết lại: 16 task (T1–T15 dev, T16 tech-lead), 11 lượt, tối đa 2 dev cùng lúc vì chuỗi file `site_api.py`/`runner.py`/`tasks.py`; 52 task cũ chuyển thành bảng "Rút theo Amendment 2"; chờ F4-T62, F4-T64 (đã kiểm ID), F4-T63, F4-T65, F4-T68; dòng trạng thái ADR-016 (một phần, ADR-024), ADR-005/011/012 (trỏ ADR-023) | PLANNED, DONE_WITH_CONCERNS | 1 lượt | wrong nhỏ ở design: design-amd2 §7 thiếu touchpoint `erp_ai/tests/test_doctype_descriptions.py` (`field_count` 27 và `read_only_fields` sẽ đỏ khi thêm trường mốc), plan đưa vào T7, cần designer/team-leader xác nhận | không tạo nhánh, không ghi current.json, không commit (theo lệnh); `team.py status` còn hiện cỡ L; trạng thái ADR-014/015/017/018 của DoD chưa ai sửa
@@ -1433,6 +1437,11 @@ index 69ac775..2e233a4 100644
 +- 2026-11-14 quyết định (decide) T13 | dev trả `DESIGN_CONFLICT` ở một vế: `tabError Log` là MyISAM (`frappe/core/doctype/error_log/error_log.json:6`) nên rollback không xóa được dòng Error Log cảnh báo, trái chữ ADR-024 QĐ 3.5 và design-amd2 §4.2 bước 5 ("rollback cả ba") | chọn: không dừng build; nhận phần làm được (Email Queue và mốc rollback, thư lần sau gửi đúng một lần, khóa, dòng log), đưa qua reviewer kèm sự thật này, ghi `design-defect` vào debt.md và báo team-leader | vì: không touchpoint nào sửa được engine của Frappe core; hành vi có từ trước FEAT-005; hướng sai là báo lặp một dòng Error Log, không sót (ADR-024 QĐ 3.8) | phương án khác: dừng chờ designer (mất thêm một lượt build, T14–T16 đứng) | sai thì: designer sửa chữ ADR/design hoặc thêm task bù (xóa dòng Error Log của lần chạy lỗi); qa trả rework
 +- 2026-11-14 build T13, T14, T15 → dev, reviewer | T13 1 vòng `approve (code) + design-defect (clause)`, merge `79ad5d0`, test_tasks `Ran 66 tests in 7.832s` / `OK`; T15 1 vòng approve, merge `7d85356`, test_agent_runner `Ran 109 tests in 29.261s` / `OK`; T14 3 vòng (major STD-DESIGN-5 luật đồng hồ rộng hơn ADR; major STD-TEST-2 quét hẹp sót hằng cấp module), merge `8898f3c`, test_architecture `Ran 179 tests in 13.524s` / `OK` | 16/17 | ~95 phút | wrong (tech-lead): lại quên gỡ worktree dev trước vòng sửa T14 (một lần gọi `BLOCKED`); handoff chấm lại T14 vòng 2 thiếu chữ các minor cũ; good: lệnh chờ hết lệnh ngoài khóa ngay trong lần giữ khóa, cả ngày không deadlock nào
 +- 2026-11-14 build lần 4 → tech-lead | T16 cả app trong một lần giữ khóa trên `8898f3c`: `Ran 1564 tests in 477.844s` / `FAILED (failures=1)`, 0 deadlock; ca đỏ `test_erp_ai_accuracy…test_report_record_is_system_manager_only_script_report` (`['System Manager', 'ERP AI Instructor'] != ['System Manager']`), chạy lại theo tên một lần vẫn đỏ, loại: schema của phiên khác (Report trên site do JSON của FEAT-007 đồng bộ, `modified` mới hơn); hai cài đặt trả lại khớp; `cmd.lint` sạch; `diff.patch` đã ghi | STOPPED (T16 chưa tick: cả app không `OK`, không lặp theo lệnh) | ~135 phút | vai đã gọi: dev, reviewer (2 vai, trần M: 6); `cmd.migrate` lên/xuống/lên chưa chạy riêng, để qa
++- 2026-11-14 quyết định (decide) T13 / `design-defect` | chọn: nhận quyết định T13 của tech-lead: giữ mã đã merge (sau một lần chạy lỗi, dòng Error Log cảnh báo có thể lặp một lần; thư và mốc vẫn đúng một lần), không thêm task bù; designer sửa chữ design-amd2 §4.2 bước 5 và chữ ký `_undo_turn(run_id)` ở §4.1, architect sửa chữ ADR-024 QĐ 3.5 | vì: `tabError Log` là MyISAM của Frappe core, không touchpoint nào sửa được; hướng sai là lặp, không sót (ADR-024 QĐ 3.8); kênh người nhận là thư | phương án khác: ghi dòng Error Log sau commit (mất dòng nếu tiến trình chết giữa chừng); hỏi người | sai thì: thêm một task ghi dòng Error Log sau commit; lệch NFR-8 ở kênh Error Log ghi vào rủi ro còn lại của As-Built và báo người
++- 2026-11-14 quyết định (decide) ca đỏ của T16 | chọn: chạy lại cả app trong MỘT lần giữ khóa sau khi tạm đưa bản ghi Report `ERP AI Accuracy` trên site về đúng JSON của nhánh này (import ép của Frappe, không SQL, không sửa JSON hay test), xong thì trả lại bản của FEAT-007 và đọc lại | vì: ca đỏ so bản ghi trên site với JSON của nhánh, mà site đang mang bản của nhánh khác (`modified` mới hơn nên migrate không ghi đè); cùng kiểu "ghi lại, tạm đổi, chạy, trả lại" người đã duyệt cho hai cài đặt (2026-11-13) | phương án khác: nhận ca đỏ là nhiễu môi trường rồi tick T16; hỏi người | sai thì: bản ghi được trả lại ngay trong lần giữ khóa đó; migrate của FEAT-007 cũng tự đồng bộ lại
++- 2026-11-14 lý do gọi tech-lead (`/team:build FEAT-005 --task T16`, cùng vai): chỉ còn T16; cần một lần cả app `OK` và bước migrate lên/xuống/lên thì mới tick được
++- 2026-11-14 lý do gọi designer và architect (chỉ sửa chữ, song song với T16, cùng một message): review-13 trả `design-defect` cho vế "rollback cả Error Log" của design-amd2 §4.2 bước 5 và ADR-024 QĐ 3.5; qa và As-Built đối chiếu mã với hai tài liệu này nên chữ phải đúng với mã đã được duyệt
++- 2026-11-14 build lần 5 → tech-lead | chỉ T16, một lần giữ khóa 23:28:13–23:37:56 trên `c6c06ee`: `cmd.migrate` lên/xuống/lên exit 0 cả ba, `has_field("privilege_alert_checked_until")` True/False/True, ERP AI Log 42 = 42; Report `ERP AI Accuracy` tạm về JSON của nhánh (import ép), hai cài đặt để trống → `Ran 1564 tests in 503.462s` / `OK`, 0 deadlock → trả lại cả ba, đọc lại khớp (`RESTORE MATCH`); tick T16, 17/17, `diff.patch` làm lại | DONE | ~15 phút | vai đã gọi: không (0 dev, 0 reviewer; không đổi mã) | wrong (tech-lead): script đọc trạng thái lỗi ở lần thử đầu (đọc `tabSingles` qua `get_value` cần cột `modified`), dừng trước khi đổi gì, sửa rồi chạy lại; script phụ viết ở scratchpad (ngoài `docs/team/**`, hook nhắc)
 diff --git a/erp_ai/agent/runner.py b/erp_ai/agent/runner.py
 index 3311790..736d8b0 100644
 --- a/erp_ai/agent/runner.py

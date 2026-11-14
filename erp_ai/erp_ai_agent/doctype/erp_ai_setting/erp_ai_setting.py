@@ -1,3 +1,5 @@
+from datetime import datetime
+
 import frappe
 from frappe.model.document import Document
 
@@ -54,6 +56,7 @@ PRICE_FIELDS = (
 	"price_output_per_mtok",
 )
 PROBE_RESULT_FIELDS = ("label", "ok", "error_kind", "status")
+EMPTY_DATETIME = datetime(1, 1, 1)  # what frappe.utils.cast returns for an empty Datetime
 
 
 class ERPAISetting(Document):
@@ -89,6 +92,10 @@ class ERPAISetting(Document):
 		self.spent_this_month_usd = frappe.db.get_single_value(
 			SETTING_DOCTYPE, "spent_this_month_usd", cache=False
 		)
+		# the privilege-alert watermark is written only by the alert job (ADR-024 QĐ 3.2);
+		# get_single_value casts an empty Datetime to year 1, which must stay empty
+		watermark = frappe.db.get_single_value(SETTING_DOCTYPE, "privilege_alert_checked_until", cache=False)
+		self.privilege_alert_checked_until = None if watermark == EMPTY_DATETIME else watermark
 		stored = {
 			row.name: row
 			for row in frappe.get_all(

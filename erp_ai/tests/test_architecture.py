@@ -1,8 +1,10 @@
 """Architecture tests (ADR-001..005, NFR-1, NFR-5, D-23): static scans of the source tree.
 
-Nothing here imports product code or touches the database: files are read as text and parsed with `ast`.
-The one exception is `test_agent_modules_import_alone_in_fresh_process`, which imports a few modules in a
-child Python process (never in this one) to catch import cycles that test order would hide.
+Nothing here touches the database, and product code is read as text and parsed with `ast`. Exceptions:
+the module imports constants from `erp_ai.constants` (no frappe call);
+`test_agent_modules_import_alone_in_fresh_process` imports a few modules in a child Python process (never
+in this one) to catch import cycles that test order would hide; and
+`test_privilege_alert_reads_shared_generic_write_tools` imports the runner's tool tables (ADR-024).
 
 Scanned files ("product code"): every `.py` file under `erp_ai/` except `test_*.py` (this also drops
 `test_utils.py`), anything under a `tests/` directory and `__pycache__`. `eval/` is product code (it is an
@@ -3785,18 +3787,26 @@ def _string_shape(scan: GitScan, rel: str, node, depth: int = 0) -> str:
 	return _string_shape(scan, *found, depth + 1) if found else UNKNOWN_PIECE
 
 
-def _change_link_shapes(sources: dict) -> list:
-	"""`[(node, shape)]` of every string expression of change_link.py (docstrings excluded)."""
-	scan = GitScan(sources)
-	tree = scan.trees[CHANGE_LINK_FILE]
-	docstrings = _docstring_ids(tree)
+NO_CONSTANTS_SCAN = GitScan({})  # resolves no name: every Name/Attribute piece stays an UNKNOWN_PIECE
+
+
+def _string_texts(root, docstrings: set, scan: GitScan = NO_CONSTANTS_SCAN, rel: str = "") -> list:
+	"""`[(node, shape)]` of every string expression under `root` (docstrings excluded); the module constants
+	of `scan` are resolved from file `rel`."""
 	return [
-		(node, _string_shape(scan, CHANGE_LINK_FILE, node))
-		for node in ast.walk(tree)
+		(node, _string_shape(scan, rel, node))
+		for node in ast.walk(root)
 		if (isinstance(node, ast.Constant) and isinstance(node.value, str) and id(node) not in docstrings)
 		or isinstance(node, ast.JoinedStr)
 		or (isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add))
 	]
+
+
+def _change_link_shapes(sources: dict) -> list:
+	"""`[(node, shape)]` of every string expression of change_link.py (docstrings excluded)."""
+	scan = GitScan(sources)
+	tree = scan.trees[CHANGE_LINK_FILE]
+	return _string_texts(tree, _docstring_ids(tree), scan, CHANGE_LINK_FILE)
 
 
 def change_link_string_shapes(sources: dict) -> list:
@@ -3991,6 +4001,348 @@ def check_agent_write_flag_only_in_run_log_and_propose_tool(sources: dict) -> li
 					)
 				)
 	return violations
+
+
+# ---------------------------------------------------------------------------------------------------
+# ADR-024 Ràng buộc: the privilege alert reads ERP AI Log through the runner's tool set and one watermark
+# ---------------------------------------------------------------------------------------------------
+
+TASKS_FILE = "tasks.py"
+SETTING_CONTROLLER_FILE = CONFIG_CONTROLLER_FILES[0]
+SETTING_DOCTYPE_FILE = "erp_ai_agent/doctype/erp_ai_setting/erp_ai_setting.json"
+RUNNER_MODULE = module_name(RUNNER_FILE)
+GENERIC_WRITE_TOOLS_NAME = "GENERIC_WRITE_TOOLS"
+WATERMARK_FIELD = "privilege_alert_checked_until"
+WATERMARK_WRITER = "_advance_privilege_watermark"
+WATERMARK_FILES = (SETTING_DOCTYPE_FILE, SETTING_CONTROLLER_FILE)  # tests are never scanned, so allowed too
+SETTING_WRITE_METHODS = ("save", "insert")
+# The clocks ADR-024 Ràng buộc 4 bans in the alert job: datetime.now/utcnow (any alias, resolved) and SQL
+# NOW(), as the query builder's Now() or written in a string.
+PRIVILEGE_JOB_FUNCTION = "check_privilege_escalation"
+FOREIGN_CLOCK_CALLS = ("datetime.datetime.now", "datetime.datetime.utcnow")
+QUERY_BUILDER_NOW = "Now"
+SQL_NOW = re.compile(r"\bnow\s*\(", re.IGNORECASE)
+VERSION_DOCTYPE = "Version"
+VERSION_TABLE = re.compile(r"\btabVersion\b")
+VERSION_JS = re.compile(r"""(["'`])Version\1|\btabVersion\b""")
+PRIVILEGE_CONDITION_FUNCTION = "_privilege_changes_by_agent"
+OWNER_FIELDS = ("modified_by", "owner")
+WRITE_ENTRY_FUNCTION = "write_entry"
+COMMIT_CALL = "frappe.db.commit"
+
+
+def _pattern_lines(source: str, pattern: re.Pattern) -> set:
+	return {source.count("\n", 0, match.start()) + 1 for match in pattern.finditer(source)}
+
+
+def _text_lines(source: str, text: str) -> set:
+	return _pattern_lines(source, re.compile(re.escape(text)))
+
+
+def _reached_functions(functions: dict, start: str, references) -> list:
+	"""`start` and every function of `functions` it reaches through `references(function)`, sorted."""
+	reached, pending = set(), [start]
+	while pending:
+		name = pending.pop()
+		if name not in reached:
+			reached.add(name)
+			pending.extend(other for other in references(functions[name]) if other in functions)
+	return sorted(reached)
+
+
+def _called_or_passed_names(node) -> set:
+	"""Names `node` calls or reads as a value (a function handed over, e.g. in a tuple of checks)."""
+	return _called_names(node) | {name.id for name in ast.walk(node) if isinstance(name, ast.Name)}
+
+
+def _naming_lines(rel: str, source: str, text: str) -> set:
+	"""Lines naming `text`: written anywhere in the file (comments too), or built by a Python string
+	expression."""
+	lines = _text_lines(source, text)
+	if rel.endswith(".py"):
+		tree = parse(rel, source)
+		lines |= {node.lineno for node, folded in _string_texts(tree, set()) if text in folded}
+	return lines
+
+
+def _own_nodes(function):
+	"""The nodes of `function`'s body, without those of functions, lambdas or classes defined inside it."""
+	pending = list(function.body)
+	while pending:
+		node = pending.pop()
+		yield node
+		if not isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda | ast.ClassDef):
+			pending.extend(ast.iter_child_nodes(node))
+
+
+def check_generic_write_tools_shared(targets: dict, generic, sources: dict) -> list:
+	"""ADR-024 Ràng buộc 2: every write tool whose DocType the model names (target DocType None) is in
+	GENERIC_WRITE_TOOLS, and tasks.py reads that one runner tuple, never a set of its own."""
+	if TASKS_FILE not in sources:
+		return _missing(TASKS_FILE)
+	violations = [
+		f"{RUNNER_FILE}: {name} has a model-chosen DocType but is not in {GENERIC_WRITE_TOOLS_NAME} (ADR-024)"
+		for name, (doctype, _key) in targets.items()
+		if doctype is None and name not in generic
+	]
+	tree = parse(TASKS_FILE, sources[TASKS_FILE])
+	aliases = import_aliases(tree)
+	shared = f"{RUNNER_MODULE}.{GENERIC_WRITE_TOOLS_NAME}"
+	reads = [
+		node
+		for node in ast.walk(tree)
+		if isinstance(node, ast.Name | ast.Attribute)
+		and isinstance(node.ctx, ast.Load)
+		and resolved_name(node, aliases) == shared
+	]
+	if not reads:
+		violations.append(f"{TASKS_FILE}: never reads {shared} (ADR-024)")
+	violations.extend(
+		violation(TASKS_FILE, node, f"defines its own {GENERIC_WRITE_TOOLS_NAME} (ADR-024)")
+		for node in ast.walk(tree)
+		if isinstance(node, ast.Name)
+		and isinstance(node.ctx, ast.Store)
+		and node.id == GENERIC_WRITE_TOOLS_NAME
+	)
+	return violations
+
+
+def check_tasks_names_no_write_tool(sources: dict, tool_names) -> list:
+	"""ADR-024 Ràng buộc 2: tasks.py writes no tool name of the runner's WRITE_TOOL_TARGETS by hand (as text, or
+	built by `+`/f-string). The bare substring `api_` stays allowed: `api_key` and the `like "%api_%"` filter."""
+	if TASKS_FILE not in sources:
+		return _missing(TASKS_FILE)
+	source = sources[TASKS_FILE]
+	return [
+		f"{TASKS_FILE}:{line}: writes the tool name {name!r} by hand; read {GENERIC_WRITE_TOOLS_NAME} (ADR-024)"
+		for name in tool_names
+		for line in sorted(_naming_lines(TASKS_FILE, source, name))
+	]
+
+
+def check_watermark_field_only_in_allowed_places(sources: dict) -> list:
+	"""ADR-024 Ràng buộc 3, design-amd2 D-6: the watermark field is named only in the ERP AI Setting JSON and
+	controller (reader `read_privilege_watermark`) and, in tasks.py, only inside WATERMARK_WRITER."""
+	if TASKS_FILE not in sources:
+		return _missing(TASKS_FILE)
+	violations = []
+	for rel, source in sources.items():
+		if rel in WATERMARK_FILES:
+			continue
+		lines = _naming_lines(rel, source, WATERMARK_FIELD)
+		span = range(0)
+		if rel == TASKS_FILE:
+			writer = _module_functions(parse(rel, source)).get(WATERMARK_WRITER)
+			if writer is None:
+				violations.append(
+					f"{TASKS_FILE}: no function {WATERMARK_WRITER} writes the watermark (ADR-024)"
+				)
+			else:
+				span = range(writer.lineno, writer.end_lineno + 1)
+				if not any(line in span for line in lines):
+					violations.append(
+						f"{TASKS_FILE}: {WATERMARK_WRITER} does not write {WATERMARK_FIELD} (ADR-024)"
+					)
+		violations.extend(
+			f"{rel}:{line}: names {WATERMARK_FIELD} outside the Setting and {WATERMARK_WRITER} (ADR-024)"
+			for line in sorted(lines)
+			if line not in span
+		)
+	return violations
+
+
+def check_tasks_never_saves_or_inserts_setting(sources: dict) -> list:
+	"""ADR-024 Ràng buộc 3: tasks.py never calls `save()`/`insert()` on an ERP AI Setting document (a save would
+	run `restore_self_managed_fields` and the watermark would never move)."""
+	if TASKS_FILE not in sources:
+		return _missing(TASKS_FILE)
+	tree = parse(TASKS_FILE, sources[TASKS_FILE])
+	config_vars = set(CONFIG_VARIABLE_NAMES)
+	for node in ast.walk(tree):
+		if isinstance(node, ast.Assign) and _is_config_doc_expr(node.value, set()):
+			config_vars.update(target.id for target in node.targets if isinstance(target, ast.Name))
+	return [
+		violation(TASKS_FILE, node, f"`.{node.func.attr}()` on the ERP AI Setting document (ADR-024)")
+		for node in ast.walk(tree)
+		if isinstance(node, ast.Call)
+		and isinstance(node.func, ast.Attribute)
+		and node.func.attr in SETTING_WRITE_METHODS
+		and _is_config_doc_expr(node.func.value, config_vars)
+	]
+
+
+def check_privilege_job_reads_no_other_clock(sources: dict) -> list:
+	"""ADR-024 Ràng buộc 4: the alert job PRIVILEGE_JOB_FUNCTION, and every tasks.py function it reaches
+	(called or passed as a value), calls no `datetime.now`/`datetime.utcnow` (any alias) or query builder
+	`Now()` and writes or reads (a module constant, alone or in a string expression) no SQL `NOW()`; its clock
+	is `frappe.utils.now_datetime` or the `now` argument. The other jobs of tasks.py and `frappe.utils.now`
+	(the same clock as `now_datetime`) are outside the constraint."""
+	if TASKS_FILE not in sources:
+		return _missing(TASKS_FILE)
+	scan = GitScan(sources)
+	tree = scan.trees[TASKS_FILE]
+	functions, aliases, docstrings = _module_functions(tree), import_aliases(tree), _docstring_ids(tree)
+	if PRIVILEGE_JOB_FUNCTION not in functions:
+		return [f"{TASKS_FILE}: no function {PRIVILEGE_JOB_FUNCTION} (ADR-024)"]
+	violations = []
+	for name in _reached_functions(functions, PRIVILEGE_JOB_FUNCTION, _called_or_passed_names):
+		function = functions[name]
+		calls = [
+			(node, resolved_name(node.func, aliases))
+			for node in ast.walk(function)
+			if isinstance(node, ast.Call)
+		]
+		violations.extend(
+			violation(TASKS_FILE, node, f"{name} reads the clock with {called}() (ADR-024)")
+			for node, called in calls
+			if called in FOREIGN_CLOCK_CALLS or called.rpartition(".")[2] == QUERY_BUILDER_NOW
+		)
+		texts = _string_texts(function, docstrings, scan, TASKS_FILE)
+		in_texts = {id(inner) for node, _text in texts for inner in ast.walk(node)}
+		texts += [
+			(node, _string_shape(scan, TASKS_FILE, node))
+			for node in ast.walk(function)
+			if isinstance(node, ast.Name | ast.Attribute)
+			and id(node) not in in_texts
+			and scan.lookup(TASKS_FILE, node)
+		]
+		violations.extend(
+			violation(TASKS_FILE, node, f"{name}: SQL clock in {text!r} (ADR-024)")
+			for node, text in texts
+			if SQL_NOW.search(text)
+		)
+	return violations
+
+
+def check_no_version_reads(sources: dict) -> list:
+	"""ADR-024 Ràng buộc 1: product code (Python and JS) never names the `Version` DocType or its table."""
+	violations = []
+	for rel, source in sources.items():
+		if rel.endswith(".py"):
+			tree = parse(rel, source)
+			violations.extend(
+				violation(rel, node, f"reads Version through {text!r} (ADR-024)")
+				for node, text in _string_texts(tree, _docstring_ids(tree))
+				if text.strip() == VERSION_DOCTYPE or VERSION_TABLE.search(text)
+			)
+		elif rel.endswith(".js"):
+			violations.extend(
+				f"{rel}:{line}: reads Version (ADR-024)"
+				for line in sorted(_pattern_lines(source, VERSION_JS))
+			)
+	return violations
+
+
+def check_privilege_condition_ignores_owner(sources: dict) -> list:
+	"""ADR-024 Ràng buộc 1: PRIVILEGE_CONDITION_FUNCTION, and every tasks.py function it reaches, never names
+	`modified_by`/`owner` (attribute, keyword, string or SQL text)."""
+	if TASKS_FILE not in sources:
+		return _missing(TASKS_FILE)
+	tree = parse(TASKS_FILE, sources[TASKS_FILE])
+	functions, docstrings = _module_functions(tree), _docstring_ids(tree)
+	if PRIVILEGE_CONDITION_FUNCTION not in functions:
+		return [f"{TASKS_FILE}: no function {PRIVILEGE_CONDITION_FUNCTION} (ADR-024)"]
+	violations = []
+	for name in _reached_functions(functions, PRIVILEGE_CONDITION_FUNCTION, _called_names):
+		function = functions[name]
+		texts = _string_texts(function, docstrings)
+		texts += [(node, node.attr) for node in ast.walk(function) if isinstance(node, ast.Attribute)]
+		texts += [(node, node.arg) for node in ast.walk(function) if isinstance(node, ast.keyword)]
+		violations.extend(
+			violation(TASKS_FILE, node, f"{name} filters on {field} (ADR-024)")
+			for node, text in texts
+			for field in OWNER_FIELDS
+			if text and field in IDENTIFIER.findall(text)
+		)
+	return violations
+
+
+def check_write_entry_inserts_and_commits(sources: dict) -> list:
+	"""ADR-024 Ràng buộc 5: `run_log.write_entry` itself calls `.insert(...)` and then `frappe.db.commit()`
+	(not in a helper, a nested function or a deferred callback)."""
+	if RUN_LOG_FILE not in sources:
+		return _missing(RUN_LOG_FILE)
+	tree = parse(RUN_LOG_FILE, sources[RUN_LOG_FILE])
+	function = _module_functions(tree).get(WRITE_ENTRY_FUNCTION)
+	if function is None:
+		return [f"{RUN_LOG_FILE}: no function {WRITE_ENTRY_FUNCTION} (ADR-024)"]
+	aliases = import_aliases(tree)
+	calls = [node for node in _own_nodes(function) if isinstance(node, ast.Call)]
+	inserts = [node.lineno for node in calls if referenced_name(node.func) == "insert"]
+	commits = [node.lineno for node in calls if resolved_name(node.func, aliases) == COMMIT_CALL]
+	if not inserts or not commits or max(commits) < min(inserts):
+		return [
+			violation(
+				RUN_LOG_FILE,
+				function,
+				f"{WRITE_ENTRY_FUNCTION} must insert then {COMMIT_CALL}() in its own body (ADR-024)",
+			)
+		]
+	return []
+
+
+# Compliant samples of the ADR-024 rules; each violating sample is one change of these (see the two tests).
+PRIVILEGE_TASKS_SAMPLE = f"""from datetime import timedelta
+
+import frappe
+from frappe.utils import get_datetime, now_datetime
+
+from erp_ai.agent.runner import GENERIC_WRITE_TOOLS
+from erp_ai.constants import CREDENTIAL_DOCTYPE, LOG_DOCTYPE, SETTING_DOCTYPE
+from erp_ai.erp_ai_agent.doctype.erp_ai_setting.erp_ai_setting import read_privilege_watermark
+
+
+def _usable(action):
+	return action.get("tool") in GENERIC_WRITE_TOOLS and action.get("ok")
+
+
+def {PRIVILEGE_CONDITION_FUNCTION}(lower, upper):
+	log = frappe.qb.DocType(LOG_DOCTYPE)
+	query = frappe.qb.from_(log).select(log.name, log.actions).where(log.actions.like("%api_%"))
+	return [row.name for row in query.run(as_dict=True) if _usable(row)]
+
+
+def _scripts_by_agent():
+	return frappe.get_all("Server Script", filters={{"owner": "bot"}}, pluck="name")
+
+
+def _keys_without_value():
+	return frappe.get_all(CREDENTIAL_DOCTYPE, fields=["label", "api_key"])
+
+
+def {WATERMARK_WRITER}(upper):
+	frappe.db.set_single_value(SETTING_DOCTYPE, "{WATERMARK_FIELD}", upper)
+
+
+def check_privilege_escalation(now=None):
+	upper = (get_datetime(now) if now else now_datetime()) - timedelta(seconds=300)
+	lower = read_privilege_watermark()
+	{PRIVILEGE_CONDITION_FUNCTION}(lower, upper)
+	_scripts_by_agent()
+	_keys_without_value()
+	frappe.get_doc({{"doctype": "ToDo"}}).insert()
+	{WATERMARK_WRITER}(upper)
+"""
+PRIVILEGE_SOURCES_SAMPLE = {
+	TASKS_FILE: PRIVILEGE_TASKS_SAMPLE,
+	SETTING_CONTROLLER_FILE: (
+		"import frappe\n\n\ndef read_privilege_watermark():\n"
+		f'\treturn frappe.db.get_single_value("ERP AI Setting", "{WATERMARK_FIELD}", cache=False)\n'
+	),
+	SETTING_DOCTYPE_FILE: f'{{"fields": [{{"fieldname": "{WATERMARK_FIELD}"}}]}}\n',
+	"agent/tools/read.py": 'import frappe\n\nNOTE = "Version 15"\nROWS = frappe.get_all("ERP AI Log")\n',
+	"public/js/agent_status_indicator.js": "const label = 'App Version 1';\n",
+}
+RUN_LOG_SAMPLE = """import frappe
+
+
+def write_entry(**fields):
+	doc = frappe.get_doc({**fields, "doctype": "ERP AI Log"})
+	doc.insert()
+	if not frappe.flags.in_test:
+		frappe.db.commit()
+	return doc.name
+"""
 
 
 class TestArchitecture(unittest.TestCase):
@@ -4455,6 +4807,396 @@ class TestArchitecture(unittest.TestCase):
 			{AGENT_WRITE_GUARD_FILE},
 		)
 		self.assertEqual(check_agent_write_flag_only_in_run_log_and_propose_tool(self.sources), [])
+
+	def assertRuleSamples(self, check, compliant: dict, violating: dict):
+		"""`check` lets the compliant sources through and catches each violating case: `{case: (sources, fragment)}`."""
+		self.assertEqual(check(compliant), [], "the compliant sample is flagged")
+		self.assertGreater(len(violating), 0)
+		for case, (sources, fragment) in violating.items():
+			with self.subTest(case=case):
+				TestScannersCatchViolations.assertCaught(self, check(sources), fragment)
+
+	def test_privilege_alert_reads_shared_generic_write_tools(self):
+		# The one in-process product import of this class: the runner's tool tables are values, not text.
+		from erp_ai.agent.runner import GENERIC_WRITE_TOOLS, WRITE_TOOL_TARGETS
+
+		changed = TestScannersCatchViolations.changed
+		self.assertIn("api_update_record", GENERIC_WRITE_TOOLS)
+		self.assertIn("api_", self.sources[TASKS_FILE])  # `api_key` and `like "%api_%"` stay allowed
+		self.assertEqual(
+			check_generic_write_tools_shared(WRITE_TOOL_TARGETS, GENERIC_WRITE_TOOLS, self.sources), []
+		)
+		self.assertEqual(check_tasks_names_no_write_tool(self.sources, WRITE_TOOL_TARGETS), [])
+
+		# Rule 1: every tool with a model-chosen DocType is in the tuple tasks.py reads from the runner.
+		targets = {"post_comment": ("Comment", "comment"), "api_update_record": (None, "name")}
+		generic = ("api_update_record",)
+		shared_import = "from erp_ai.agent.runner import GENERIC_WRITE_TOOLS\n"
+		by_module = changed(
+			changed(
+				PRIVILEGE_SOURCES_SAMPLE,
+				TASKS_FILE,
+				replace=(shared_import, "from erp_ai.agent import runner\n"),
+			),
+			TASKS_FILE,
+			replace=("in GENERIC_WRITE_TOOLS", "in runner.GENERIC_WRITE_TOOLS"),
+		)
+		self.assertEqual(check_generic_write_tools_shared(targets, generic, by_module), [])
+		self.assertRuleSamples(
+			lambda sources: check_generic_write_tools_shared(targets, generic, sources),
+			PRIVILEGE_SOURCES_SAMPLE,
+			{
+				"own tuple in tasks.py": (
+					changed(
+						PRIVILEGE_SOURCES_SAMPLE,
+						TASKS_FILE,
+						replace=(shared_import, "GENERIC_WRITE_TOOLS = ('api_update_record',)\n"),
+					),
+					"defines its own GENERIC_WRITE_TOOLS",
+				),
+				"another runner tuple under the shared name": (
+					changed(
+						PRIVILEGE_SOURCES_SAMPLE,
+						TASKS_FILE,
+						replace=(
+							shared_import,
+							"from erp_ai.agent.runner import RECORD_TOOLS as GENERIC_WRITE_TOOLS\n",
+						),
+					),
+					"never reads erp_ai.agent.runner.GENERIC_WRITE_TOOLS",
+				),
+			},
+		)
+		self.assertRuleSamples(
+			lambda targets: check_generic_write_tools_shared(targets, generic, PRIVILEGE_SOURCES_SAMPLE),
+			targets,
+			{
+				"new generic tool left out": (
+					{**targets, "api_rename_record": (None, "name")},
+					"api_rename_record",
+				)
+			},
+		)
+
+		# Rule 2: no tool name of WRITE_TOOL_TARGETS written in tasks.py (the bare `api_` is not a tool name).
+		self.assertRuleSamples(
+			lambda sources: check_tasks_names_no_write_tool(sources, WRITE_TOOL_TARGETS),
+			PRIVILEGE_SOURCES_SAMPLE,
+			{
+				case: (changed(PRIVILEGE_SOURCES_SAMPLE, TASKS_FILE, extra), name)
+				for case, extra, name in (
+					("double quotes", '\nHAND = ("api_update_record",)\n', "api_update_record"),
+					("single quotes", "\nHAND = ('api_delete_record',)\n", "api_delete_record"),
+					("concatenation", "\nHAND = \"api_create\" + '_record'\n", "api_create_record"),
+					("implicit concatenation", '\nHAND = "api_submit" "_record"\n', "api_submit_record"),
+					("comment", "\n# also reads api_call_method\n", "api_call_method"),
+					("non-api write tool", '\nANSWER = "post_comment"\n', "post_comment"),
+				)
+			},
+		)
+
+	def test_privilege_alert_watermark_and_clock_rules(self):
+		changed = TestScannersCatchViolations.changed
+		sample = PRIVILEGE_SOURCES_SAMPLE
+		scanned = load_product_sources(suffixes=(".py", ".json", ".js", ".html"))
+		for rel in (TASKS_FILE, SETTING_CONTROLLER_FILE, SETTING_DOCTYPE_FILE, RUN_LOG_FILE):
+			self.assertIn(rel, scanned)
+		self.assertIn(f"def {WATERMARK_WRITER}(", scanned[TASKS_FILE])
+		self.assertIn("def read_privilege_watermark(", scanned[SETTING_CONTROLLER_FILE])
+		self.assertEqual(check_watermark_field_only_in_allowed_places(scanned), [])
+		self.assertEqual(check_tasks_never_saves_or_inserts_setting(scanned), [])
+		self.assertEqual(check_privilege_job_reads_no_other_clock(scanned), [])
+		self.assertEqual(check_no_version_reads(scanned), [])
+		self.assertEqual(check_privilege_condition_ignores_owner(scanned), [])
+		self.assertEqual(check_write_entry_inserts_and_commits(scanned), [])
+
+		def in_function(body: str) -> str:
+			return f"\n\ndef _sample():\n\t{body}\n"
+
+		# Rule 3: the field name only in the Setting JSON/controller and in WATERMARK_WRITER of tasks.py.
+		outside = "outside the Setting"
+		self.assertRuleSamples(
+			check_watermark_field_only_in_allowed_places,
+			sample,
+			{
+				"reader in the job, single quotes": (
+					changed(
+						sample,
+						TASKS_FILE,
+						replace=(
+							"lower = read_privilege_watermark()",
+							f"lower = frappe.db.get_single_value(SETTING_DOCTYPE, '{WATERMARK_FIELD}')",
+						),
+					),
+					outside,
+				),
+				"module constant by concatenation": (
+					changed(sample, TASKS_FILE, '\nFIELD = "privilege_alert_" + "checked_until"\n'),
+					outside,
+				),
+				"implicit concatenation": (
+					changed(sample, TASKS_FILE, '\nFIELD = "privilege_alert_" "checked_until"\n'),
+					outside,
+				),
+				"another product module": (
+					changed(sample, "alerts.py", f'FIELD = "{WATERMARK_FIELD}"\n'),
+					"alerts.py:1",
+				),
+				"client script": (
+					changed(sample, "public/js/x.js", f'frm.set_value("{WATERMARK_FIELD}", null);\n'),
+					"public/js/x.js:1",
+				),
+				"writer renamed": (
+					changed(sample, TASKS_FILE, replace=(f"def {WATERMARK_WRITER}(", "def _move_watermark(")),
+					f"no function {WATERMARK_WRITER}",
+				),
+				"writer without the field": (
+					changed(sample, TASKS_FILE, replace=(f'"{WATERMARK_FIELD}", upper', "FIELD, upper")),
+					"does not write",
+				),
+			},
+		)
+
+		# Rule 4: tasks.py never save()s or insert()s an ERP AI Setting document.
+		self.assertRuleSamples(
+			check_tasks_never_saves_or_inserts_setting,
+			sample,
+			{
+				case: (changed(sample, TASKS_FILE, in_function(body)), "on the ERP AI Setting document")
+				for case, body in (
+					("get_doc literal save", 'frappe.get_doc("ERP AI Setting").save()'),
+					("get_single constant save", "frappe.get_single(SETTING_DOCTYPE).save()"),
+					("tracked variable insert", "doc = frappe.new_doc(SETTING_DOCTYPE)\n\tdoc.insert()"),
+					(
+						"dict insert",
+						"frappe.get_doc({'doctype': 'ERP AI Setting'}).insert(ignore_permissions=True)",
+					),
+				)
+			},
+		)
+
+		# Rule 5: the alert job (and every tasks.py function it reaches) reads no clock but now_datetime / its
+		# `now` argument; other jobs of tasks.py are out of scope.
+		job_upper = "upper = (get_datetime(now) if now else now_datetime())"
+
+		def in_job(line: str) -> dict:
+			return changed(sample, TASKS_FILE, replace=(job_upper, f"{line}\n\t{job_upper}"))
+
+		def in_helper(helper: str, line: str) -> dict:
+			return changed(sample, TASKS_FILE, replace=(f"def {helper}():\n", f"def {helper}():\n\t{line}\n"))
+
+		passed_as_value = changed(
+			in_job("for find in (_stamp,):\n\t\tfind()"),
+			TASKS_FILE,
+			"\n\ndef _stamp():\n\treturn frappe.qb.from_('X').select(Now())\n",
+			replace=("import frappe\n", "import frappe\nfrom frappe.query_builder.functions import Now\n"),
+		)
+		self.assertRuleSamples(
+			check_privilege_job_reads_no_other_clock,
+			sample,
+			{
+				"datetime.now in the job": (
+					changed(
+						in_job("started = datetime.now()"),
+						TASKS_FILE,
+						replace=(
+							"from datetime import timedelta",
+							"from datetime import datetime, timedelta",
+						),
+					),
+					"check_privilege_escalation reads the clock with datetime.datetime.now()",
+				),
+				"aliased utcnow in a helper it calls": (
+					changed(
+						in_helper("_scripts_by_agent", "started = dt.datetime.utcnow()"),
+						TASKS_FILE,
+						replace=("import frappe\n", "import datetime as dt\n\nimport frappe\n"),
+					),
+					"_scripts_by_agent reads the clock with datetime.datetime.utcnow()",
+				),
+				"query builder Now in a helper passed as a value": (
+					passed_as_value,
+					"_stamp reads the clock with frappe.query_builder.functions.Now()",
+				),
+				"SQL NOW() split by concatenation in a helper": (
+					in_helper(
+						"_keys_without_value", 'frappe.db.sql("select 1 where creation <= NO" + "W()")'
+					),
+					"_keys_without_value: SQL clock",
+				),
+				"lower-case now ( in an f-string in the job": (
+					in_job('frappe.db.sql(f"select 1 where creation <= now ( ) - {1}")'),
+					"check_privilege_escalation: SQL clock",
+				),
+				"module constant with NOW() read by the job": (
+					changed(
+						in_job("frappe.db.sql(CUTOFF_SQL)"),
+						TASKS_FILE,
+						'\nCUTOFF_SQL = "select 1 where creation <= NOW()"\n',
+					),
+					"check_privilege_escalation: SQL clock in 'select 1 where creation <= NOW()'",
+				),
+				"module constant with NOW() in an f-string of a helper": (
+					changed(
+						in_helper("_keys_without_value", 'frappe.db.sql(f"select 1 where {CUTOFF}")'),
+						TASKS_FILE,
+						'\nCUTOFF = "creation <= NOW()"\n',
+					),
+					"_keys_without_value: SQL clock in 'select 1 where creation <= NOW()'",
+				),
+				"job renamed": (
+					changed(
+						sample, TASKS_FILE, replace=("def check_privilege_escalation(", "def _run_alert(")
+					),
+					"no function check_privilege_escalation",
+				),
+			},
+		)
+		other_job = (
+			"from datetime import datetime\n\nfrom frappe.query_builder.functions import Now\n"
+			"\n\ndef recompute_monthly_spend():\n\treturn datetime.now(), datetime.utcnow(), Now()"
+			'\n\n\ndef reprobe_exhausted_keys():\n\treturn frappe.db.sql("select 1 where creation <= NOW()")\n'
+		)
+		for case, sources in (
+			("another job of tasks.py reads datetime.now and NOW()", changed(sample, TASKS_FILE, other_job)),
+			("frappe.utils.now() in the job", in_job("stamp = frappe.utils.now()")),
+			("the plain string 'now' in a helper", in_helper("_scripts_by_agent", 'label = "now"')),
+			(
+				"a module constant with NOW() read only by another job",
+				changed(
+					sample,
+					TASKS_FILE,
+					'\nSTALE_SQL = "select 1 where creation <= NOW()"\n'
+					"\n\ndef reprobe_exhausted_keys():\n\treturn frappe.db.sql(STALE_SQL)\n",
+				),
+			),
+		):
+			with self.subTest(case=case):
+				self.assertEqual(check_privilege_job_reads_no_other_clock(sources), [])
+
+		# Rule 6: product code never reads the Version DocType.
+		self.assertRuleSamples(
+			check_no_version_reads,
+			sample,
+			{
+				case: (changed(sample, rel, extra), f"{rel}:")
+				for case, rel, extra in (
+					(
+						"get_all double quotes",
+						"agent/a.py",
+						'import frappe\nfrappe.get_all("Version", pluck="name")\n',
+					),
+					(
+						"db.get_all single quotes",
+						"agent/b.py",
+						"import frappe\nfrappe.db.get_all('Version')\n",
+					),
+					(
+						"built by concatenation",
+						"agent/c.py",
+						'import frappe\nfrappe.qb.DocType("Ver" + "sion")\n',
+					),
+					(
+						"raw SQL table",
+						"agent/d.py",
+						'import frappe\nfrappe.db.sql("select data from `tabVersion`")\n',
+					),
+					("client script", "public/js/e.js", "frappe.db.get_list('Version');\n"),
+				)
+			},
+		)
+
+		# Rule 7: the permission condition (and the tasks.py functions it calls) never filters on modified_by/owner.
+		rows = "\treturn [row.name for row"
+		self.assertRuleSamples(
+			check_privilege_condition_ignores_owner,
+			sample,
+			{
+				"modified_by column": (
+					changed(
+						sample,
+						TASKS_FILE,
+						replace=('like("%api_%")', 'like("%api_%") & (log.modified_by == "x")'),
+					),
+					f"{PRIVILEGE_CONDITION_FUNCTION} filters on modified_by",
+				),
+				"owner in a called helper": (
+					changed(sample, TASKS_FILE, replace=('action.get("ok")', 'action.get("owner") == "x"')),
+					"_usable filters on owner",
+				),
+				"keyword filter": (
+					changed(
+						sample,
+						TASKS_FILE,
+						replace=(
+							rows,
+							"\tfrappe.get_all(LOG_DOCTYPE, filters=dict(modified_by=upper))\n" + rows,
+						),
+					),
+					"filters on modified_by",
+				),
+				"SQL text": (
+					changed(
+						sample,
+						TASKS_FILE,
+						replace=(
+							rows,
+							'\tfrappe.db.sql("select name from `tabHas Role` where `owner` = %s", upper)\n'
+							+ rows,
+						),
+					),
+					"filters on owner",
+				),
+				"condition function renamed": (
+					changed(
+						sample, TASKS_FILE, replace=(f"def {PRIVILEGE_CONDITION_FUNCTION}(", "def _records(")
+					),
+					f"no function {PRIVILEGE_CONDITION_FUNCTION}",
+				),
+			},
+		)
+
+		# Rule 8: write_entry inserts and commits in its own body, insert first.
+		run_log = {RUN_LOG_FILE: RUN_LOG_SAMPLE}
+		commit_block = "\tif not frappe.flags.in_test:\n\t\tfrappe.db.commit()\n"
+		self.assertEqual(
+			check_write_entry_inserts_and_commits(
+				changed(
+					changed(run_log, RUN_LOG_FILE, replace=("frappe.db.commit()", "db.commit()")),
+					RUN_LOG_FILE,
+					"from frappe import db\n",
+				)
+			),
+			[],
+		)
+		self.assertRuleSamples(
+			check_write_entry_inserts_and_commits,
+			run_log,
+			{
+				case: (changed(run_log, RUN_LOG_FILE, extra, replace), WRITE_ENTRY_FUNCTION)
+				for case, extra, replace in (
+					(
+						"commit moved to a helper",
+						"\n\ndef _commit():\n\tfrappe.db.commit()\n",
+						("\t\tfrappe.db.commit()", "\t\t_commit()"),
+					),
+					(
+						"commit deferred to a nested job",
+						"",
+						(
+							commit_block,
+							"\tdef _later():\n\t\tfrappe.db.commit()\n\n\tfrappe.enqueue(_later, enqueue_after_commit=True)\n",
+						),
+					),
+					(
+						"commit before insert",
+						"",
+						("\tdoc.insert()\n" + commit_block, "\tfrappe.db.commit()\n\tdoc.insert()\n"),
+					),
+					("insert replaced", "", ("doc.insert()", "doc.db_insert()")),
+				)
+			},
+		)
 
 	def test_agent_modules_import_alone_in_fresh_process(self):
 		# STD-DESIGN-6: an import cycle stays hidden in-process when another test imported a module first.

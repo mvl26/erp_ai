@@ -71,6 +71,11 @@ def _calls_naming(doctype):
 	}
 
 
+def _without_snapshot(result):
+	"""The tool result less `_snapshot`, which is asserted on its own (AC-13)."""
+	return {key: value for key, value in result.items() if key != "_snapshot"}
+
+
 def _make_user(email, *roles):
 	if not frappe.db.exists("User", email):
 		frappe.get_doc(
@@ -492,7 +497,7 @@ class TestSiteApi(FrappeTestCase):
 			},
 		)
 		self.assertEqual(
-			result,
+			_without_snapshot(result),
 			{
 				"ok": True,
 				"doctype": "Webhook",
@@ -512,7 +517,7 @@ class TestSiteApi(FrappeTestCase):
 		self.assertEqual(frappe.db.get_value("Webhook", WEBHOOK_NAME, "enabled"), 0)
 		enabled = self.update("Webhook", WEBHOOK_NAME, {"enabled": 1})
 		self.assertEqual(
-			enabled,
+			_without_snapshot(enabled),
 			{
 				"ok": True,
 				"doctype": "Webhook",
@@ -522,6 +527,57 @@ class TestSiteApi(FrappeTestCase):
 			},
 		)
 		self.assertEqual(frappe.db.get_value("Webhook", WEBHOOK_NAME, "enabled"), 0)
+
+	def test_snapshot_keys_are_the_given_values_not_the_forced_ones(self):
+		values = {
+			"name": WEBHOOK_NAME,
+			"webhook_doctype": "Note",
+			"webhook_docevent": "after_insert",
+			"request_url": "https://example.com/siteapi",
+			"request_method": "POST",
+		}
+		created = self.create("Webhook", values)
+		self.assertTrue(created["ok"], created)
+		self.assertEqual(frappe.db.get_value("Webhook", WEBHOOK_NAME, "enabled"), 0)
+		self.assertIsNone(created["_snapshot"]["before"])
+		self.assertEqual(set(created["_snapshot"]["after"]), {"name", *values})
+		updated = self.update("Webhook", WEBHOOK_NAME, {"request_method": "PUT"})
+		self.assertTrue(updated["ok"], updated)
+		self.assertEqual(
+			updated["_snapshot"],
+			{
+				"before": {"name": WEBHOOK_NAME, "request_method": "POST"},
+				"after": {"name": WEBHOOK_NAME, "request_method": "PUT"},
+			},
+		)
+
+	def test_update_snapshot_holds_the_doctype_tables_and_the_saved_values(self):
+		from frappe.desk.doctype.note.note import Note
+
+		created = self.create("Note", {"title": NOTE_TITLE, "public": 1, "seen_by": [{"user": BOSS}]})
+		self.assertTrue(created["ok"], created)
+		content = frappe.db.get_value("Note", created["name"], "content")
+
+		def rewrite(note):
+			note.content = "SITEAPI-TEST đã chuẩn hóa"
+
+		with (
+			patch.dict(site_api.SNAPSHOT_TABLES, {"Note": ("seen_by",)}),
+			patch.object(Note, "validate", side_effect=rewrite, autospec=True, create=True),
+		):
+			result = self.update("Note", created["name"], {"content": "SITEAPI-TEST model gửi"})
+		seen_by = [{"docstatus": 0, "user": BOSS}]
+		self.assertEqual(
+			result["_snapshot"],
+			{
+				"before": {"name": created["name"], "content": content, "seen_by": seen_by},
+				"after": {
+					"name": created["name"],
+					"content": "SITEAPI-TEST đã chuẩn hóa",
+					"seen_by": seen_by,
+				},
+			},
+		)
 
 	def test_rename_is_refused(self):
 		created = self.create("Note", {"title": NOTE_TITLE, "public": 1})
@@ -539,7 +595,7 @@ class TestSiteApi(FrappeTestCase):
 	def test_duplicate_name_rolls_back_to_savepoint(self):
 		created = self.create("Tag", {"name": DUPLICATE_TAG})
 		self.assertEqual(
-			created,
+			_without_snapshot(created),
 			{
 				"ok": True,
 				"doctype": "Tag",
@@ -582,7 +638,7 @@ class TestSiteApi(FrappeTestCase):
 		self.assertTrue(created["ok"], created)
 		result = self.update("Note", created["name"], {"content": "mới"})
 		self.assertEqual(
-			result,
+			_without_snapshot(result),
 			{
 				"ok": True,
 				"doctype": "Note",
@@ -598,7 +654,7 @@ class TestSiteApi(FrappeTestCase):
 		long_content = "n" * 300
 		result = self.create("Note", {"title": NOTE_TITLE, "public": 1, "content": long_content})
 		self.assertEqual(
-			result,
+			_without_snapshot(result),
 			{
 				"ok": True,
 				"doctype": "Note",
@@ -845,7 +901,7 @@ class TestSiteApiUnrestricted(FrappeTestCase):
 		)
 		result = self.run_tool("api_delete_record", {"doctype": "Note", "name": created["name"]})
 		self.assertEqual(
-			result,
+			_without_snapshot(result),
 			{
 				"ok": True,
 				"doctype": "Note",
@@ -954,7 +1010,7 @@ class TestSiteApiUnrestricted(FrappeTestCase):
 					"api_submit_record", {"doctype": "Note", "name": created["name"], "action": action}
 				)
 			self.assertEqual(
-				result,
+				_without_snapshot(result),
 				{
 					"ok": True,
 					"doctype": "Note",
@@ -966,6 +1022,134 @@ class TestSiteApiUnrestricted(FrappeTestCase):
 			)
 			self.assertEqual(frappe.db.get_value("Note", created["name"], "docstatus"), after, action)
 			called.assert_called_once()
+
+	def test_delete_and_submit_snapshot_shapes(self):
+		long_content = "c" * 300
+		created = self.run_tool(
+			"api_create_record",
+			{"doctype": "Note", "values": {"title": NOTE_TITLE, "public": 1, "content": long_content}},
+		)
+		name = created["name"]
+		self.assertEqual(
+			created["_snapshot"],
+			{
+				"before": None,
+				"after": {"name": name, "title": NOTE_TITLE, "public": 1, "content": long_content},
+			},
+		)
+
+		updated = self.run_tool(
+			"api_update_record",
+			{
+				"doctype": "Note",
+				"name": name,
+				"values": {"expire_notification_on": "2026-12-01", "seen_by": [{"user": BOSS}]},
+			},
+		)
+		self.assertEqual(
+			updated["_snapshot"],
+			{
+				"before": {"name": name, "expire_notification_on": None, "seen_by": []},
+				"after": {
+					"name": name,
+					"expire_notification_on": "2026-12-01",
+					"seen_by": [{"docstatus": 0, "user": BOSS}],
+				},
+			},
+		)
+
+		for action, before, after in (("submit", 0, 1), ("cancel", 1, 2)):
+			with (
+				patch.object(site_api, "_is_submittable", return_value=True),
+				patch.object(
+					frappe.model.document.Document,
+					action,
+					autospec=True,
+					side_effect=lambda doc, status=after: doc.db_set("docstatus", status),
+				),
+			):
+				result = self.run_tool(
+					"api_submit_record", {"doctype": "Note", "name": name, "action": action}
+				)
+			self.assertEqual(
+				result["_snapshot"],
+				{"before": {"name": name, "docstatus": before}, "after": {"name": name, "docstatus": after}},
+				action,
+			)
+		frappe.db.set_value("Note", name, "docstatus", 0, update_modified=False)
+
+		creation = frappe.db.get_value("Note", name, "creation")
+		self.assertIsInstance(creation, datetime.datetime)
+		deleted = self.run_tool("api_delete_record", {"doctype": "Note", "name": name})
+		self.assertTrue(deleted["ok"], deleted)
+		before = deleted["_snapshot"]["before"]
+		self.assertIsNone(deleted["_snapshot"]["after"])
+		self.assertEqual(set(deleted["_snapshot"]), {"before", "after"})
+		self.assertEqual(
+			{
+				key: before[key]
+				for key in ("name", "title", "public", "content", "expire_notification_on", "seen_by")
+			},
+			{
+				"name": name,
+				"title": NOTE_TITLE,
+				"public": 1,
+				"content": long_content,
+				"expire_notification_on": "2026-12-01",
+				"seen_by": [{"docstatus": 0, "user": BOSS}],
+			},
+		)
+		self.assertEqual(before["creation"], str(creation))
+		self.assertEqual([key for key, value in before.items() if value in (None, "", [])], [])
+		self.assertEqual(deleted["value_before"]["content"], "c" * 200)
+		json.dumps(deleted["_snapshot"])
+
+	def test_refused_or_failed_write_has_no_snapshot(self):
+		from frappe.desk.doctype.note.note import Note
+
+		control = self.run_tool("api_create_record", {"doctype": "Note", "values": {"title": NOTE_TITLE}})
+		self.assertTrue(control["ok"], control)
+		self.assertIn("_snapshot", control)
+		name = control["name"]
+
+		def refuse(note):
+			frappe.throw("SITEAPI từ chối")
+
+		with patch.object(Note, "validate", side_effect=refuse, autospec=True, create=True):
+			failed_update = self.run_tool(
+				"api_update_record", {"doctype": "Note", "name": name, "values": {"content": "x"}}
+			)
+		with (
+			patch.object(frappe, "log_error"),
+			patch.object(frappe, "delete_doc", side_effect=TypeError("boom")),
+		):
+			crashed_delete = self.run_tool("api_delete_record", {"doctype": "Note", "name": name})
+		results = {
+			"create": self.run_tool("api_create_record", {"doctype": "ERP AI Log", "values": {"enabled": 0}}),
+			"update": self.run_tool(
+				"api_update_record",
+				{"doctype": "Note", "name": "SITEAPI-không-có", "values": {"content": "x"}},
+			),
+			"delete": self.run_tool("api_delete_record", {"doctype": "Note", "name": "SITEAPI-không-có"}),
+			"submit": self.run_tool(
+				"api_submit_record", {"doctype": "Note", "name": name, "action": "submit"}
+			),
+			"failed update": failed_update,
+			"crashed delete": crashed_delete,
+		}
+		for case, result in results.items():
+			self.assertFalse(result["ok"], (case, result))
+			self.assertNotIn("_snapshot", result, case)
+
+		method = self.run_tool(
+			"api_call_method",
+			{
+				"method": "frappe.client.get_value",
+				"arguments": {"doctype": "User", "filters": BOSS, "fieldname": "email"},
+			},
+		)
+		self.assertTrue(method["ok"], method)
+		self.assertNotIn("_snapshot", method)
 
 	def test_call_method_runs_whitelisted_methods_only(self):
 		result = self.run_tool(

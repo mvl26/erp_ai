@@ -76,6 +76,7 @@ NAME_MAX = 140
 # DELETED_FIELDS_MAX of its non-empty fields.
 VALUE_MAX = 200
 DELETED_FIELDS_MAX = 20
+EMPTY_VALUES = (None, "", [])
 # Full before/after of a write, for the audit log only: a User snapshot always holds just its name and roles.
 SNAPSHOT_TABLES = {USER_DOCTYPE: ("roles",)}
 SNAPSHOT_ROW_DROPPED = (SYSTEM_FIELDS - {"docstatus"}) | {"name", "parentfield"}
@@ -195,10 +196,13 @@ def _shown(doc, keys) -> dict:
 	}
 
 
+def _filled_fields(record: dict) -> list:
+	return [key for key, value in record.items() if value not in EMPTY_VALUES]
+
+
 def _deleted_values(doc) -> dict:
 	"""The non-empty fields of a record about to be deleted, at most DELETED_FIELDS_MAX."""
-	filled = [key for key, value in doc.as_dict().items() if value not in (None, "", [])]
-	return dict(list(_shown(doc, filled).items())[:DELETED_FIELDS_MAX])
+	return dict(list(_shown(doc, _filled_fields(doc.as_dict())).items())[:DELETED_FIELDS_MAX])
 
 
 def _snapshot_value(value):
@@ -233,11 +237,11 @@ def _snapshot(doc, fields) -> dict:
 
 
 def _write(doctype: str, save) -> dict:
-	"""Run `save` (returns the name, the value before and the value after) in its own savepoint; a refused write
-	leaves nothing behind."""
+	"""Run `save` (returns the name, the value before, the value after and the full snapshot or None) in its own
+	savepoint; a refused write leaves nothing behind and carries no snapshot."""
 	frappe.db.savepoint(SAVEPOINT)
 	try:
-		name, value_before, value_after = save()
+		name, value_before, value_after, snapshot = save()
 	except frappe.PermissionError:
 		frappe.db.rollback(save_point=SAVEPOINT)
 		return _fail("thiếu quyền trên DocType hoặc bản ghi này", doctype)
@@ -253,13 +257,20 @@ def _write(doctype: str, save) -> dict:
 			return _fail("đã có bản ghi cùng tên", doctype)
 		return _fail(UNEXPECTED_ERROR_REASON, doctype)
 	frappe.db.release_savepoint(SAVEPOINT)
-	return {
+	result = {
 		"ok": True,
 		"doctype": doctype,
 		"name": name,
 		"value_before": value_before,
 		"value_after": value_after,
 	}
+	if snapshot is not None:
+		result["_snapshot"] = snapshot
+	return result
+
+
+def _snapshot_fields(doctype: str, values: dict) -> tuple:
+	return (*values, *SNAPSHOT_TABLES.get(doctype, ()))
 
 
 def create_record(args: dict, ctx: ToolContext) -> dict:
@@ -270,7 +281,8 @@ def create_record(args: dict, ctx: ToolContext) -> dict:
 	def save():
 		written = {**values, **_forced_values(doctype, ctx)}
 		doc = frappe.get_doc({**written, "doctype": doctype}).insert()
-		return doc.name, None, _shown(doc, written)
+		after = _snapshot(doc, _snapshot_fields(doctype, values))
+		return doc.name, None, _shown(doc, written), {"before": None, "after": after}
 
 	return _write(doctype, save)
 
@@ -293,9 +305,11 @@ def update_record(args: dict, ctx: ToolContext) -> dict:
 			frappe.throw("chứng từ đã submit hoặc đã hủy, không sửa qua công cụ")
 		written = {**values, **_forced_values(doctype, ctx)}
 		value_before = _shown(doc, written)
+		before = _snapshot(doc, _snapshot_fields(doctype, values))
 		doc.update(written)
 		doc.save()
-		return doc.name, value_before, _shown(doc, written)
+		after = _snapshot(doc, _snapshot_fields(doctype, values))
+		return doc.name, value_before, _shown(doc, written), {"before": before, "after": after}
 
 	return _write(doctype, save)
 
@@ -314,9 +328,11 @@ def delete_record(args: dict, ctx: ToolContext) -> dict:
 		return refusal
 
 	def delete():
-		value_before = _deleted_values(frappe.get_doc(doctype, name))
+		doc = frappe.get_doc(doctype, name)
+		value_before = _deleted_values(doc)
+		before = _snapshot(doc, _filled_fields(doc.as_dict(no_private_properties=True)))
 		frappe.delete_doc(doctype, name)
-		return name, value_before, None
+		return name, value_before, None, {"before": before, "after": None}
 
 	return _write(doctype, delete)
 
@@ -335,8 +351,10 @@ def submit_record(args: dict, ctx: ToolContext) -> dict:
 	def run():
 		doc = frappe.get_doc(doctype, name)
 		value_before = {"docstatus": doc.docstatus}
+		before = _snapshot(doc, ("docstatus",))
 		getattr(doc, action)()
-		return doc.name, value_before, {"docstatus": doc.docstatus}
+		after = _snapshot(doc, ("docstatus",))
+		return doc.name, value_before, {"docstatus": doc.docstatus}, {"before": before, "after": after}
 
 	return _write(doctype, run)
 
@@ -435,7 +453,7 @@ def call_method(args: dict, ctx: ToolContext) -> dict:
 	def run():
 		outcome["result"] = frappe.call(function, **arguments)
 		# The record the method touched is unknown: only the call itself is shown.
-		return method, None, {"method": method, "argument_keys": sorted(arguments)}
+		return method, None, {"method": method, "argument_keys": sorted(arguments)}, None
 
 	written = _write(None, run)
 	if not written["ok"]:

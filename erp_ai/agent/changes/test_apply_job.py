@@ -1,3 +1,4 @@
+import contextlib
 import dataclasses
 import hashlib
 import json
@@ -10,12 +11,13 @@ from unittest.mock import patch
 
 import frappe
 from frappe.tests.utils import FrappeTestCase
+from frappe.utils.error import log_error as real_log_error
 from frappe.utils.file_lock import LockTimeoutError
 from frappe.utils.synchronization import filelock
 from helpdesk.test_utils import create_agent, make_ticket
 
 from erp_ai.agent import authority, change_text, policy
-from erp_ai.agent.changes import apply_job, file_writer, process_runner, transitions
+from erp_ai.agent.changes import apply_job, file_writer, process_runner, result_comment, transitions
 from erp_ai.agent.changes.process_runner import CommandResult
 from erp_ai.agent.tools import change_guard, source
 from erp_ai.agent.tools.registry import ToolContext, execute_tool
@@ -1426,7 +1428,11 @@ class TestRunChangeSkeleton(ApplyJobTestCase):
 		lines = self.info_lines(logger)
 		self.assertEqual(len(lines), 1)
 		template, *values = lines[0]
-		self.assertEqual(template, "erp_ai change proposal=%s action=%s outcome=%s duration_ms=%d commit=%s")
+		# CHG-001 design 4 step 4: the line gains `comment=`.
+		self.assertEqual(
+			template,
+			"erp_ai change proposal=%s action=%s outcome=%s duration_ms=%d commit=%s comment=%s",
+		)
 		self.assertEqual(values[:3], [name, "apply", CHANGE_STATUS_APPLIED])
 		self.assertIsInstance(values[3], int)
 		self.assertEqual(values[4], self.head())
@@ -3122,3 +3128,219 @@ class TestActorRecheckAndLock(ApplyJobTestCase):
 				self.assertEqual(self.steps(name), steps)
 				self.assertEqual(self.read_bytes(), content)
 				self.assertEqual(self.head(), head)
+
+
+class TestResultComment(ApplyJobTestCase):
+	"""AC-28, CHG-001 design 4 and 8: after every outcome the job writes one `Info` result line on the ticket."""
+
+	def info_rows(self, name):
+		ticket = frappe.db.get_value(PROPOSAL_DOCTYPE, name, "ticket")
+		return frappe.get_all(
+			"Comment",
+			filters={"reference_doctype": "HD Ticket", "reference_name": ticket, "comment_type": "Info"},
+			fields=["name", "content", "owner"],
+			order_by="creation asc",
+		)
+
+	def fresh_repo(self):
+		self.sandbox = GitSandbox(self)
+		self.sandbox.commit_file(APP, REL, BEFORE)
+
+	def run_job(self, name, action, post_result=None):
+		"""Run the job with its log line, rollback and `post_result` watched; returns what the checks read.
+
+		`post_result` replaces the real writer when given; `commits_at_post` is the commit count when it is called.
+		"""
+		real_post_result = result_comment.post_result
+		seen = {"commits_at_post": None}
+
+		def post(proposal_name):
+			seen["commits_at_post"] = frappe.db.commit.call_count
+			return (post_result or real_post_result)(proposal_name)
+
+		with (
+			patch.object(frappe, "logger") as logger,
+			patch.object(frappe.db, "rollback") as rollback,
+			patch.object(result_comment, "post_result", side_effect=post) as posted,
+		):
+			apply_job.run_change(name, action)
+
+		lines = [
+			call.args
+			for call in logger.return_value.info.call_args_list
+			if call.args and call.args[0].startswith("erp_ai change ")
+		]
+		self.assertEqual(len(lines), 1, lines)
+		self.assertTrue(lines[0][0].endswith(" comment=%s"), lines[0][0])
+		return {
+			"comment": lines[0][-1],
+			"posted": posted,
+			"rollback": rollback,
+			"commits_at_post": seen["commits_at_post"],
+			"commits_after": frappe.db.commit.call_count,
+		}
+
+	def test_one_result_comment_per_outcome(self):
+		def apply_code():
+			return self.approved(self.code_proposal()), "apply", contextlib.nullcontext()
+
+		def command_exit_2():
+			name = make_change_proposal(
+				CHANGE_KIND_COMMAND, app=APP, command_args=json.dumps(["build", "--app", APP])
+			).name
+			failed = CommandResult(exit_code=2, output="lỗi", duration_ms=5, timed_out=False, not_found=False)
+			return (
+				self.approved(name),
+				"apply",
+				patch.object(process_runner, "run_bench", return_value=failed),
+			)
+
+		def branch_changed():
+			name = self.approved(self.code_proposal())
+			self.sandbox.switch_branch(APP, "other")
+			return name, "apply", contextlib.nullcontext()
+
+		def undo():
+			name = self.approved(self.code_proposal())
+			apply_job.run_change(name, "apply")
+			transitions.request_undo(name, ACTOR)
+			return name, "undo", contextlib.nullcontext()
+
+		def lock_timeout():
+			busy = patch.object(apply_job, "filelock", side_effect=LockTimeoutError(apply_job.LOCK_NAME))
+			return self.approved(self.code_proposal()), "apply", busy
+
+		def wrong_runner():
+			name = self.approved(self.code_proposal())
+			frappe.set_user("Administrator")
+			return name, "apply", contextlib.nullcontext()
+
+		# Final status and reason of each outcome, written out as in design 4.3 (not read from the constants).
+		cases = (
+			("apply code", apply_code, CHANGE_STATUS_APPLIED, None),
+			("command exit 2", command_exit_2, CHANGE_STATUS_FAILED, "lệnh trả mã 2"),
+			(
+				"branch changed",
+				branch_changed,
+				CHANGE_STATUS_STALE,
+				"nhánh đang checkout đã đổi kể từ lúc đề xuất",
+			),
+			("undo", undo, CHANGE_STATUS_UNDONE, None),
+			(
+				"lock timeout",
+				lock_timeout,
+				CHANGE_STATUS_FAILED,
+				"đang có thay đổi khác chạy, không lấy được khóa",
+			),
+			("wrong runner", wrong_runner, CHANGE_STATUS_FAILED, "sai người chạy job"),
+		)
+		for label, prepare, status, reason in cases:
+			with self.subTest(label):
+				# Each case starts from a fresh repo on `main` and the approver's session.
+				self.fresh_repo()
+				frappe.set_user(ACTOR)
+				name, action, context = prepare()
+				runner = frappe.session.user
+				before = {row.name for row in self.info_rows(name)}
+
+				with context:
+					run = self.run_job(name, action)
+				frappe.set_user(ACTOR)
+
+				state = self.state(name)
+				self.assertEqual((state.change_status, state.failure_reason), (status, reason))
+				new_rows = [row for row in self.info_rows(name) if row.name not in before]
+				self.assertEqual(len(new_rows), 1, new_rows)
+				row = new_rows[0]
+				self.assertEqual(row.owner, runner)
+				self.assertIn(f"kết quả đề xuất {name} ", row.content)
+				self.assertIn(f": {status}", row.content)
+				run["posted"].assert_called_once_with(name)
+				self.assertEqual(run["comment"], row.name)
+				# The line is committed on its own, after the final status (design 4 step 2), never rolled back.
+				self.assertEqual(run["commits_after"], run["commits_at_post"] + 1)
+				run["rollback"].assert_not_called()
+
+	def test_skipped_job_posts_nothing(self):
+		applied = self.approved(self.code_proposal())
+		apply_job.run_change(applied, "apply")
+		self.assertEqual(self.state(applied).change_status, CHANGE_STATUS_APPLIED)
+		pending = self.code_proposal()
+		for label, name, action in (
+			("repeated apply", applied, "apply"),
+			("never approved", pending, "apply"),
+			("undo never requested", applied, "undo"),
+		):
+			with self.subTest(label):
+				status, before = self.state(name).change_status, self.info_rows(name)
+
+				run = self.run_job(name, action)
+
+				self.assertEqual(self.state(name).change_status, status)
+				self.assertEqual(self.info_rows(name), before)
+				run["posted"].assert_not_called()
+				self.assertEqual(run["comment"], "-")
+
+		# The other `comment=-` branch: the writer found nothing to write on and returned None.
+		with self.subTest("nothing written"):
+			self.fresh_repo()
+			name = self.approved(self.code_proposal())
+
+			run = self.run_job(name, "apply", post_result=lambda proposal_name: None)
+
+			self.assertEqual(self.state(name).change_status, CHANGE_STATUS_APPLIED)
+			run["posted"].assert_called_once_with(name)
+			self.assertEqual(run["comment"], "-")
+
+	def test_comment_failure_keeps_final_status_and_logs(self):
+		def failing_post(proposal_name):
+			raise RuntimeError("bí mật https://x-token-FAKE@host/r.git")
+
+		title = result_comment.TITLE_RESULT_COMMENT_FAILED
+		for action, status in (("apply", CHANGE_STATUS_APPLIED), ("undo", CHANGE_STATUS_UNDONE)):
+			with self.subTest(action):
+				self.fresh_repo()
+				name = self.approved(self.code_proposal())
+				if action == "undo":
+					apply_job.run_change(name, "apply")
+					transitions.request_undo(name, ACTOR)
+				before = {row.name for row in self.info_rows(name)}
+				logged_before = frappe.get_all("Error Log", filters={"method": title}, pluck="name")
+
+				# The real `Error Log` is written here; the job's rollback is mocked, as its commits are.
+				with patch.object(frappe, "log_error", side_effect=real_log_error):
+					run = self.run_job(name, action, post_result=failing_post)
+
+				self.assertEqual(self.state(name).change_status, status)
+				self.assertEqual(run["comment"], "error")
+				run["rollback"].assert_called_once_with()
+				self.assertEqual(run["commits_after"], run["commits_at_post"])
+				logged = frappe.get_all(
+					"Error Log",
+					filters={"method": title, "name": ("not in", logged_before or [""])},
+					pluck="error",
+				)
+				self.assertEqual(logged, [f"proposal={name} action={action} error=RuntimeError"])
+				self.assertEqual([row for row in self.info_rows(name) if row.name not in before], [])
+
+	def test_result_comment_has_no_remote_url_or_fake_token(self):
+		self.sandbox.add_remote(APP, url=REMOTE_URL)
+		name = self.approved(self.code_proposal(upstream_ref="origin/main"))
+		apply_job.run_change(name, "apply")
+		transitions.request_undo(name, ACTOR)
+		apply_job.run_change(name, "undo")
+		self.assertEqual(self.state(name).change_status, CHANGE_STATUS_UNDONE)
+		# A failure reason that carries the remote URL with its fake token reaches the proposal as is.
+		busy = self.approved(self.code_proposal(upstream_ref="origin/main"))
+		with (
+			patch.object(apply_job, "LOCK_BUSY", f"không fetch được {REMOTE_URL}"),
+			patch.object(apply_job, "filelock", side_effect=LockTimeoutError(apply_job.LOCK_NAME)),
+		):
+			apply_job.run_change(busy, "apply")
+		self.assertIn(REMOTE_URL, self.state(busy).failure_reason)
+
+		stored = [row.content for proposal in (name, busy) for row in self.info_rows(proposal)]
+		self.assertEqual(len(stored), 3, stored)
+		for leak in ("://", "x-token-FAKE", "host/r.git", "@"):
+			with self.subTest(leak=leak):
+				self.assertNotIn(leak, " ".join(stored))

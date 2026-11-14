@@ -1175,3 +1175,82 @@ class TestSiteApiUnrestricted(FrappeTestCase):
 		self.assertFalse(result["ok"])
 		self.assertIn("erp_ai", result["reason"])
 		self.assertEqual(called.call_count, 0)
+
+
+class TestSnapshot(FrappeTestCase):
+	"""`site_api._snapshot` on records held in memory: nothing is saved."""
+
+	def test_snapshot_drops_secret_and_system_fields(self):
+		long_note = "x" * 30000
+		setting = frappe.get_doc(
+			{
+				"doctype": "ERP AI Setting",
+				"name": "ERP AI Setting",
+				"credentials": [
+					{"label": "SITEAPI thứ hai", "api_key": FAKE_SECRET, "idx": 2, "note": long_note},
+					{
+						"label": "SITEAPI thứ nhất",
+						"api_key": FAKE_SECRET,
+						"idx": 1,
+						"paused_until": "2026-11-14 08:30:00",
+					},
+				],
+			}
+		)
+		snapshot = site_api._snapshot(setting, ("credentials",))
+		self.assertEqual(set(snapshot), {"name", "credentials"})
+		self.assertEqual(snapshot["name"], "ERP AI Setting")
+		rows = snapshot["credentials"]
+		self.assertEqual([row["label"] for row in rows], ["SITEAPI thứ nhất", "SITEAPI thứ hai"])
+		dropped = {
+			"name",
+			"idx",
+			"parent",
+			"parentfield",
+			"parenttype",
+			"owner",
+			"creation",
+			"modified",
+			"modified_by",
+			"doctype",
+		}
+		for row in rows:
+			self.assertEqual(set(row) & (dropped | {"api_key"}), set(), row)
+		self.assertEqual(rows[1]["note"], long_note)
+		self.assertEqual(rows[0]["paused_until"], "2026-11-14 08:30:00")
+
+		account = frappe.get_doc(
+			{
+				"doctype": "Email Account",
+				"name": "SITEAPI hộp thư",
+				"email_id": BOSS,
+				"password": FAKE_PASSWORD,
+			}
+		)
+		snapshot = site_api._snapshot(account, ("email_id", "password", "docstatus"))
+		self.assertEqual(snapshot, {"name": "SITEAPI hộp thư", "email_id": BOSS, "docstatus": 0})
+
+		text = json.dumps([site_api._snapshot(setting, ("credentials",)), snapshot], ensure_ascii=False)
+		self.assertEqual(text.count(FAKE_SECRET), 0)
+		self.assertEqual(text.count(FAKE_PASSWORD), 0)
+
+	def test_user_snapshot_only_name_and_roles(self):
+		user = frappe.get_doc(
+			{
+				"doctype": "User",
+				"name": NEW_USER,
+				"email": NEW_USER,
+				"first_name": "Người mới",
+				"api_key": FAKE_SECRET,
+				"new_password": FAKE_PASSWORD,
+				"roles": [{"role": "Accounts User", "idx": 2}, {"role": ALLOWED_ROLE, "idx": 1}],
+			}
+		)
+		self.assertEqual(site_api.SNAPSHOT_TABLES, {"User": ("roles",)})
+		for fields in ((), ("first_name", "email", "api_key", "new_password"), ("roles",)):
+			snapshot = site_api._snapshot(user, fields)
+			self.assertEqual(set(snapshot), {"name", "roles"}, fields)
+			self.assertEqual(snapshot["name"], NEW_USER)
+			self.assertEqual([row["role"] for row in snapshot["roles"]], [ALLOWED_ROLE, "Accounts User"])
+			self.assertNotIn(FAKE_SECRET, json.dumps(snapshot))
+			self.assertNotIn(FAKE_PASSWORD, json.dumps(snapshot))

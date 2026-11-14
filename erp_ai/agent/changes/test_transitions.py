@@ -32,6 +32,10 @@ from erp_ai.constants import (
 	PROPOSAL_DOCTYPE,
 	PROPOSAL_TEXT_MAX_CHARS,
 	REPLACE_MAX_ITEMS,
+	RESTART_STATUS_CONFIRMED,
+	RESTART_STATUS_LAUNCH_FAILED,
+	RESTART_STATUS_SENT,
+	RESTART_STATUS_UNCONFIRMED,
 	RUN_BACKSTOP_S,
 	TITLE_CHANGE_FAILED,
 	TRIGGER_CHANGE_ACTION,
@@ -1060,6 +1064,138 @@ class TestRecordCommit(TransitionTestCase):
 			transitions.record_commit("x", CHANGE_STATUS_APPLYING, {"apply_commit_sha": "c" * 40})
 
 
+# CHG-002 design 3.6: the only states a restart is launched from, and the two launch outcomes.
+RESTART_EXPECTED_STATES = (CHANGE_STATUS_APPLIED, CHANGE_STATUS_UNDONE)
+RESTART_LAUNCH_VALUES = (RESTART_STATUS_SENT, RESTART_STATUS_LAUNCH_FAILED)
+RESTART_CONCLUSIONS = (RESTART_STATUS_CONFIRMED, RESTART_STATUS_UNCONFIRMED)
+# Different from NOW, so a stored `restart_sent_at` cannot come from `now_datetime()`.
+SENT_AT = datetime(2026, 11, 13, 9, 29, 1)
+
+
+def _with_restart(status, restart_status, sent_at=None):
+	proposal = _proposal_in(status)
+	frappe.db.set_value(
+		PROPOSAL_DOCTYPE,
+		proposal.name,
+		{"restart_status": restart_status, "restart_sent_at": sent_at},
+		update_modified=False,
+	)
+	return proposal
+
+
+class TestRecordRestart(TransitionTestCase):
+	def test_sent_and_launch_failed_stored_status_unchanged(self):
+		for expected in RESTART_EXPECTED_STATES:
+			for value in RESTART_LAUNCH_VALUES:
+				with self.subTest(expected=expected, value=value):
+					proposal = _proposal_in(expected)
+					before = _state(proposal.name)
+					self.assertIs(transitions.record_restart(proposal.name, expected, value, SENT_AT), True)
+					self.assertEqual(
+						_state(proposal.name),
+						{**before, "restart_status": value, "restart_sent_at": SENT_AT},
+					)
+					self.assertEqual(_state(proposal.name).change_status, expected)
+					self.assertEqual(_rows(proposal.name), [])
+
+	def test_wrong_expected_or_value_refused(self):
+		cases = [
+			(status, RESTART_STATUS_SENT) for status in ALL_STATUSES if status not in RESTART_EXPECTED_STATES
+		]
+		cases += [
+			(CHANGE_STATUS_APPLIED, value)
+			for value in (*RESTART_CONCLUSIONS, "", None, "Lạ", CHANGE_STATUS_APPLIED)
+		]
+		for expected, value in cases:
+			with self.subTest(expected=expected, value=value):
+				# The proposal is in `expected`, so only the argument check can refuse.
+				proposal = _proposal_in(expected)
+				state, modified = _state(proposal.name), _modified(proposal.name)
+				with self.assertRaises(ValueError):
+					transitions.record_restart(proposal.name, expected, value, SENT_AT)
+				self.assertNothingChanged(proposal.name, state, modified)
+
+	def test_sent_at_must_be_a_datetime(self):
+		for bad in (None, "2026-11-13 09:29:01", 1763026141):
+			with self.subTest(sent_at=bad):
+				proposal = _proposal_in(CHANGE_STATUS_APPLIED)
+				state, modified = _state(proposal.name), _modified(proposal.name)
+				with self.assertRaises(ValueError):
+					transitions.record_restart(proposal.name, CHANGE_STATUS_APPLIED, RESTART_STATUS_SENT, bad)
+				self.assertNothingChanged(proposal.name, state, modified)
+
+	def test_current_status_differs_returns_false(self):
+		for expected in RESTART_EXPECTED_STATES:
+			for current in (s for s in ALL_STATUSES if s != expected):
+				with self.subTest(expected=expected, current=current):
+					proposal = _proposal_in(current)
+					state, modified = _state(proposal.name), _modified(proposal.name)
+					self.assertIs(
+						transitions.record_restart(proposal.name, expected, RESTART_STATUS_SENT, SENT_AT),
+						False,
+					)
+					self.assertNothingChanged(proposal.name, state, modified)
+
+	def test_unknown_proposal_raises_does_not_exist(self):
+		with self.assertRaises(frappe.DoesNotExistError):
+			transitions.record_restart("AICHG-99999999", CHANGE_STATUS_APPLIED, RESTART_STATUS_SENT, SENT_AT)
+
+
+class TestConfirmRestart(TransitionTestCase):
+	def test_only_from_sent(self):
+		for status in RESTART_EXPECTED_STATES:
+			for value in RESTART_CONCLUSIONS:
+				with self.subTest(status=status, value=value):
+					proposal = _with_restart(status, RESTART_STATUS_SENT, SENT_AT)
+					before = _state(proposal.name)
+					self.assertIs(transitions.confirm_restart(proposal.name, value), True)
+					self.assertEqual(_state(proposal.name), {**before, "restart_status": value})
+					self.assertEqual(_rows(proposal.name), [])
+		for current in (None, *RESTART_CONCLUSIONS, RESTART_STATUS_LAUNCH_FAILED):
+			for value in RESTART_CONCLUSIONS:
+				with self.subTest(current=current, value=value):
+					proposal = _with_restart(CHANGE_STATUS_APPLIED, current, SENT_AT)
+					state, modified = _state(proposal.name), _modified(proposal.name)
+					self.assertIs(transitions.confirm_restart(proposal.name, value), False)
+					self.assertNothingChanged(proposal.name, state, modified)
+
+	def test_invalid_value_refused(self):
+		for value in (RESTART_STATUS_SENT, RESTART_STATUS_LAUNCH_FAILED, "", None, "Lạ"):
+			with self.subTest(value=value):
+				proposal = _with_restart(CHANGE_STATUS_APPLIED, RESTART_STATUS_SENT, SENT_AT)
+				state, modified = _state(proposal.name), _modified(proposal.name)
+				with self.assertRaises(ValueError):
+					transitions.confirm_restart(proposal.name, value)
+				self.assertNothingChanged(proposal.name, state, modified)
+
+	def test_unknown_proposal_raises_does_not_exist(self):
+		with self.assertRaises(frappe.DoesNotExistError):
+			transitions.confirm_restart("AICHG-99999999", RESTART_STATUS_CONFIRMED)
+
+	def test_reads_restart_status_under_one_lock_before_writing(self):
+		proposal = _with_restart(CHANGE_STATUS_APPLIED, RESTART_STATUS_SENT, SENT_AT)
+		db = Mock()
+		with (
+			patch.object(frappe.db, "get_value", wraps=frappe.db.get_value) as get_value,
+			patch.object(frappe.db, "set_value", wraps=frappe.db.set_value) as set_value,
+		):
+			db.attach_mock(get_value, "get_value")
+			db.attach_mock(set_value, "set_value")
+			transitions.confirm_restart(proposal.name, RESTART_STATUS_CONFIRMED)
+		names = [entry[0] for entry in db.mock_calls]
+		self.assertEqual(names.count("set_value"), 1)
+		first_write = names.index("set_value")
+		locks = [
+			entry
+			for entry in db.mock_calls[:first_write]
+			if entry[0] == "get_value" and entry.kwargs.get("for_update") is True
+		]
+		self.assertEqual(len(locks), 1, db.mock_calls[:first_write])
+		self.assertEqual(locks[0].args[:2], (PROPOSAL_DOCTYPE, proposal.name))
+		self.assertIn("restart_status", locks[0].args[2])
+		self.assertIs(db.mock_calls[first_write].kwargs.get("update_modified"), True)
+
+
 class TestTransitionInput(TransitionTestCase):
 	def _calls(self, name, person=ACTOR):
 		return {
@@ -1128,6 +1264,13 @@ class TestLockBeforeWrite(TransitionTestCase):
 				CHANGE_STATUS_UNDOING,
 				lambda name: transitions.record_commit(
 					name, CHANGE_STATUS_UNDOING, fields={"undo_commit_sha": "e" * 40}
+				),
+			),
+			(
+				"record_restart",
+				CHANGE_STATUS_UNDONE,
+				lambda name: transitions.record_restart(
+					name, CHANGE_STATUS_UNDONE, RESTART_STATUS_SENT, SENT_AT
 				),
 			),
 		)

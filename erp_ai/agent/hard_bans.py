@@ -19,7 +19,7 @@ def hard_ban_reason(doctype: str) -> str | None:
 	"""
 	if doctype in read.denied_doctypes():
 		return REASON_DENIED
-	if doctype in site_api.DENIED_DOCTYPES:
+	if doctype in site_api.PERMISSION_DOCTYPES:
 		return REASON_PERMISSION
 	if frappe.get_meta(doctype).is_submittable:
 		return REASON_SUBMITTABLE

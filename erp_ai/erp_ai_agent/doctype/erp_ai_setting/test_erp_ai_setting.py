@@ -1170,6 +1170,11 @@ class TestCatalogRules(FrappeTestCase):
 			self._save_rule("Đổi trường", "Custom Role"),
 			"Danh mục dòng 1: DocType Custom Role bị cấm cứng: DocType phân quyền",
 		)
+		# (c) INT-1: Role is only in FEAT-004's site_api.PERMISSION_DOCTYPES.
+		self.assertEqual(
+			self._save_rule("Đổi trường", "Role"),
+			"Danh mục dòng 1: DocType Role bị cấm cứng: DocType phân quyền",
+		)
 
 	def _save_rows(self, *rows, ignore_links=False):
 		"""Save the setting with exactly these catalog rows; return the error text, or None when it saved."""

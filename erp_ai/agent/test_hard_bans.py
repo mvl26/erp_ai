@@ -38,7 +38,7 @@ class TestHardBanReason(FrappeTestCase):
 		keep_agent_settings(self)
 
 	def _submittable_outside_ban_sets(self) -> str:
-		banned = read.denied_doctypes() | set(site_api.DENIED_DOCTYPES)
+		banned = read.denied_doctypes() | set(site_api.PERMISSION_DOCTYPES)
 		names = frappe.get_all("DocType", {"is_submittable": 1, "istable": 0}, pluck="name", order_by="name")
 		free = [name for name in names if name not in banned]
 		self.assertTrue(free, "the site has no submittable DocType outside the ban sets")
@@ -52,17 +52,30 @@ class TestHardBanReason(FrappeTestCase):
 		self.assertIsNone(hard_bans.hard_ban_reason("ToDo"))
 
 	def test_permission_set_gives_permission_reason(self):
-		only_in_site_api = set(site_api.DENIED_DOCTYPES) - read.denied_doctypes()
+		only_in_site_api = set(site_api.PERMISSION_DOCTYPES) - read.denied_doctypes()
 		self.assertTrue(only_in_site_api)
 		for doctype in only_in_site_api:
 			self.assertEqual(hard_bans.hard_ban_reason(doctype), REASON_PERMISSION, doctype)
+
+	def test_permission_doctypes_banned(self):
+		# INT-1 (F-3): every name of FEAT-004's permission set is banned; Role is only there, not in read's set.
+		for doctype in site_api.PERMISSION_DOCTYPES:
+			with self.subTest(doctype=doctype):
+				self.assertIn(hard_bans.hard_ban_reason(doctype), (REASON_PERMISSION, REASON_DENIED))
+		self.assertNotIn("Role", read.denied_doctypes())
+		self.assertEqual(hard_bans.hard_ban_reason("Role"), REASON_PERMISSION)
+		# The set is read live: a DocType with no other ban gets the permission reason only while it is in the set.
+		self.assertIsNone(hard_bans.hard_ban_reason("ToDo"))
+		with patch.object(site_api, "PERMISSION_DOCTYPES", frozenset({"ToDo"})):
+			self.assertEqual(hard_bans.hard_ban_reason("ToDo"), REASON_PERMISSION)
+			self.assertIsNone(hard_bans.hard_ban_reason("Role"))
 
 	def test_first_matching_reason_wins(self):
 		submittable = self._submittable_outside_ban_sets()
 		with patch.object(read, "denied_doctypes", return_value={submittable, "Custom Role"}):
 			self.assertEqual(hard_bans.hard_ban_reason(submittable), REASON_DENIED)
 			self.assertEqual(hard_bans.hard_ban_reason("Custom Role"), REASON_DENIED)
-		with patch.object(site_api, "DENIED_DOCTYPES", frozenset({submittable})):
+		with patch.object(site_api, "PERMISSION_DOCTYPES", frozenset({submittable})):
 			self.assertEqual(hard_bans.hard_ban_reason(submittable), REASON_PERMISSION)
 
 	def test_follows_denied_doctypes_source_live(self):

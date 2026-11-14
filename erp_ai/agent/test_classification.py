@@ -569,9 +569,37 @@ class TestSplitComment(FrappeTestCase):
 		eleven = [f"Việc {i}" for i in range(1, 12)]
 		self.assertEqual(
 			self._comment(True, eleven),
+			"Phiếu này có vẻ gồm 11 yêu cầu:\n"
+			"1. Việc 1\n2. Việc 2\n3. Việc 3\n4. Việc 4\n5. Việc 5\n"
+			"6. Việc 6\n7. Việc 7\n8. Việc 8\n9. Việc 9\n10. Việc 10\n"
+			"… và 1 yêu cầu khác không liệt kê.\n" + SPLIT_QUESTION,
+		)
+
+	def test_cap_applies_after_dropping_empty(self):
+		ten = [f"Việc {i}" for i in range(1, 11)]
+		self.assertEqual(
+			self._comment(True, ["", "   ", " \n\t ", *ten]),
 			"Phiếu này có vẻ gồm 10 yêu cầu:\n"
 			"1. Việc 1\n2. Việc 2\n3. Việc 3\n4. Việc 4\n5. Việc 5\n"
 			"6. Việc 6\n7. Việc 7\n8. Việc 8\n9. Việc 9\n10. Việc 10\n" + SPLIT_QUESTION,
+		)
+
+	def test_newline_inside_request_collapsed(self):
+		self.assertEqual(
+			self._comment(True, ["x\n2. y", "a \t\n  b"]),
+			"Phiếu này có vẻ gồm 2 yêu cầu:\n1. x 2. y\n2. a b\n" + SPLIT_QUESTION,
+		)
+
+	def test_cut_applies_after_collapsing(self):
+		comment = self._comment(True, ["d" * 100 + " \n\n " + "e" * 150, "Hai"])
+		self.assertEqual(
+			comment,
+			"Phiếu này có vẻ gồm 2 yêu cầu:\n1. "
+			+ "d" * 100
+			+ " "
+			+ "e" * 99
+			+ "\n2. Hai\n"
+			+ SPLIT_QUESTION,
 		)
 
 	def test_exactly_ten_all_listed(self):

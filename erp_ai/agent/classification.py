@@ -107,16 +107,20 @@ def parse_classification(text: str) -> Classification | None:
 def split_request_comment(classification) -> str | None:
 	"""AC-28: the comment asking the creator whether to split a merged ticket; None when there is nothing to ask.
 
-	Blank requests are dropped and do not count towards the two needed.
+	Whitespace runs collapse to one space, blank requests are dropped; n counts what is left
+	(design-w0-fixes-2.md 5b). At most 10 are listed, the rest are counted on one line.
 	"""
 	if classification is None or not classification.needs_split:
 		return None
-	requests = [r.strip() for r in classification.requests if r.strip()]
+	requests = [" ".join(r.split()) for r in classification.requests]
+	requests = [r for r in requests if r]
 	if len(requests) < 2:
 		return None
 	listed = [r[:SPLIT_REQUEST_MAX_CHARS] for r in requests[:SPLIT_MAX_REQUESTS]]
-	lines = [f"Phiếu này có vẻ gồm {len(listed)} yêu cầu:"]
+	lines = [f"Phiếu này có vẻ gồm {len(requests)} yêu cầu:"]
 	lines += [f"{number}. {request}" for number, request in enumerate(listed, start=1)]
+	if len(requests) > SPLIT_MAX_REQUESTS:
+		lines.append(f"… và {len(requests) - SPLIT_MAX_REQUESTS} yêu cầu khác không liệt kê.")
 	lines.append("Anh/chị xác nhận có muốn tách thành các phiếu riêng không? Bot không tự tách phiếu.")
 	return "\n".join(lines)
 

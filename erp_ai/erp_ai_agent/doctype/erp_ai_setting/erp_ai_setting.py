@@ -65,6 +65,19 @@ PERMISSION_SECTION = "section_permissions"
 PERMISSION_NOTICE_TITLE = "Đã bật quyền mở rộng"
 # design.md:214-221: the only catalog actions whose row names a DocType; the others act on a fixed one.
 DOCTYPE_ACTIONS = (ACTION_CREATE_CUSTOM_FIELD, ACTION_UPDATE_FIELDS)
+# AC-24: the settings naming an HD Ticket field, in form order; the due field must hold a date (E-2).
+TICKET_DOCTYPE = "HD Ticket"
+TICKET_FIELD_SETTINGS = (
+	"field_ticket_nature",
+	"field_erp_module",
+	"field_origin",
+	"field_due_date",
+	"field_project",
+	"field_item_code",
+	"field_serial_no",
+)
+DUE_FIELD_SETTING = "field_due_date"
+DUE_FIELD_TYPES = ("Date", "Datetime")
 
 
 def permission_switch_fields(meta) -> list:
@@ -88,6 +101,7 @@ class ERPAISetting(Document):
 		self.check_limits()
 		self.check_status_settings()
 		self.check_enabled_requirements()
+		self.check_ticket_field_names()
 		self.check_catalog_rules()
 		self.check_user_templates()
 
@@ -170,6 +184,24 @@ class ERPAISetting(Document):
 			frappe.throw("Không thể bật agent khi chưa nhập đủ 4 đơn giá lớn hơn 0")
 		if not (self.trigger_keyword or "").strip():
 			frappe.throw("Không thể bật agent khi từ khóa kích hoạt rỗng")
+
+	def check_ticket_field_names(self):
+		"""AC-24: each set field name, trimmed, must be a field of HD Ticket by its exact name (E-1, E-2, E-3)."""
+		ticket_meta = frappe.get_meta(TICKET_DOCTYPE)
+		for fieldname in TICKET_FIELD_SETTINGS:
+			name = (self.get(fieldname) or "").strip()
+			self.set(fieldname, name)
+			if not name:
+				continue
+			field = ticket_meta.get_field(name)
+			if not field:
+				label = self.meta.get_label(fieldname)
+				frappe.throw(f"Trường '{frappe.utils.escape_html(name)}' không có trên HD Ticket ({label})")
+			if fieldname == DUE_FIELD_SETTING and field.fieldtype not in DUE_FIELD_TYPES:
+				frappe.throw("Trường Hạn hoàn thành phải có kiểu Date hoặc Datetime")
+		self.origin_board_value = (self.origin_board_value or "").strip()
+		if self.origin_board_value and not self.field_origin:
+			frappe.throw("Đặt giá trị Chỉ đạo BGĐ thì phải đặt tên trường Nguồn phát sinh")
 
 	def check_catalog_rules(self):
 		"""AC-29, ADR-031 decision 1: refuse the first catalog row breaking an E-4 rule; normalise categories."""

@@ -23,7 +23,7 @@ VIETNAMESE_ACCENTS = re.compile(
 DOCTYPE_CONFIG = {
 	"ERP AI Setting": {
 		"folder": "erp_ai_setting",
-		"field_count": 41,
+		"field_count": 50,
 		"phrases": {
 			"enabled": ("Tắt", "4 đơn giá", "từ khóa kích hoạt"),
 			"permission_level": ("L0", "L1", "L2", "L3", "ngân sách"),
@@ -80,6 +80,7 @@ DOCTYPE_CONFIG = {
 			"answer_delay_min_s": ("giây", "từ 0 đến 30", "bình luận"),
 			"answer_delay_max_s": ("giây", "từ 0 đến 30", "bình luận"),
 			"excluded_teams": ("mỗi dòng", "không phân biệt hoa thường"),
+			"excluded_title_prefixes": ("Mỗi dòng", "[HR]", "không gửi cho model"),
 			"category_mapping": ("JSON", "A đến F", "[GẤP]", "Urgent"),
 			"auto_assign_enabled": (
 				"Bật",
@@ -93,6 +94,19 @@ DOCTYPE_CONFIG = {
 			),
 			"routing_rules": ("đầu mục", "SLA", "phút", "bị chặn khi lưu"),
 			"prompt_digest": ("lập luận", "phân loại"),
+			**{
+				fieldname: ("fieldname", "Để trống", "không lưu được")
+				for fieldname in (
+					"field_ticket_nature",
+					"field_erp_module",
+					"field_origin",
+					"field_project",
+					"field_item_code",
+					"field_serial_no",
+				)
+			},
+			"field_due_date": ("fieldname", "Để trống", "không lưu được", "kiểu Date hoặc Datetime"),
+			"origin_board_value": ("Chỉ đạo BGĐ", "đổi trạng thái", "Nguồn phát sinh"),
 			"alert_recipients": ("mỗi dòng", "canhbao@congty.vn", "dấu phẩy"),
 			"credentials": ("không trùng", "Kiểm tra khóa"),
 			"code_change_enabled": (
@@ -113,7 +127,7 @@ DOCTYPE_CONFIG = {
 				"Bỏ trống",
 			),
 		},
-		"section_count": 10,
+		"section_count": 11,
 		"read_only_fields": ("spent_this_month_usd",),
 		"sections": (
 			("section_activation", "Bật và mức quyền", "enabled"),
@@ -124,6 +138,7 @@ DOCTYPE_CONFIG = {
 			("section_budget", "Ngân sách và đơn giá", "monthly_budget_usd"),
 			("section_model", "Model, từ khóa và chỉ báo trả lời", "model_classify_default"),
 			("section_routing", "Phân loại và nhóm loại trừ", "excluded_teams"),
+			("section_ticket_fields", "Trường sẵn có của phiếu", "field_ticket_nature"),
 			("section_code_change", "Sửa code và lệnh bench", "code_change_apps"),
 			("section_alerts", "Cảnh báo và khóa API", "alert_recipients"),
 		),
@@ -539,9 +554,24 @@ class TestDoctypeDescriptions(FrappeTestCase):
 		order = doctype_json["field_order"]
 		start = order.index("prompt_digest")
 		# FEAT-007 design.md:98, 106 (NFR-8): the switch moved to section_permissions; the block keeps the app list.
+		# design.md:104-106: section_ticket_fields (AC-24) sits between section_routing and section_code_change.
 		self.assertEqual(
-			order[start : start + 4],
-			["prompt_digest", "section_code_change", "code_change_apps", "section_alerts"],
+			order[start : start + 13],
+			[
+				"prompt_digest",
+				"section_ticket_fields",
+				"field_ticket_nature",
+				"field_erp_module",
+				"field_origin",
+				"origin_board_value",
+				"field_due_date",
+				"field_project",
+				"field_item_code",
+				"field_serial_no",
+				"section_code_change",
+				"code_change_apps",
+				"section_alerts",
+			],
 		)
 		start = order.index("section_permissions")
 		self.assertEqual(

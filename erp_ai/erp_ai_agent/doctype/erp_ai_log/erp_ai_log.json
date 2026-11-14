@@ -281,7 +281,8 @@
    "fieldname": "predicted_confidence_pct",
    "fieldtype": "Int",
    "label": "Độ tin cậy dự đoán (%)",
-   "description": "Độ tin cậy của phân loại, là số nguyên từ 0 đến 100, dùng để so với ngưỡng độ tin cậy. Dòng ghi trước khi có trường này chỉ có nhãn Cao, Trung bình hoặc Thấp ở trường Độ tin cậy dự đoán; nhãn cũ không được quy đổi sang số. Hệ thống tự ghi khi agent chạy, không sửa được.",
+   "default": "-1",
+   "description": "Độ tin cậy 0–100 của bước phân loại. -1 = không biết (dòng tạo trước khi có cột, hoặc model không trả số). Hệ thống tự ghi khi agent chạy, không sửa được.",
    "read_only": 1
   },
   {

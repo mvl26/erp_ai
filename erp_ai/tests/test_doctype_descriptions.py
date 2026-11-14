@@ -217,7 +217,8 @@ DOCTYPE_CONFIG = {
 			"skipped_fields": ("bỏ qua", "phân loại"),
 			"predicted_category": ("đầu mục", "A đến F"),
 			"predicted_confidence": ("Cao", "Trung bình", "Thấp", "ai_confidence"),
-			"predicted_confidence_pct": ("số nguyên", "0 đến 100", "ngưỡng độ tin cậy", "không được quy đổi"),
+			# FEAT-007 design-w0-fixes-2.md section 1: -1 = unknown (wins over design.md:234).
+			"predicted_confidence_pct": ("-1", "không biết"),
 			"predicted_ticket_type": ("loại phiếu", "dự đoán"),
 			"predicted_agent_group": ("nhóm xử lý", "dự đoán"),
 			"predicted_priority": ("ưu tiên", "dự đoán"),

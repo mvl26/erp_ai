@@ -158,6 +158,14 @@ class TestERPAISetting(FrappeTestCase):
 		)
 		self.assertEqual(section, "section_alerts")
 
+		def raw_watermark():
+			return frappe.db.get_value(
+				"Singles",
+				{"doctype": SETTING_DOCTYPE, "field": "privilege_alert_checked_until"},
+				"value",
+				order_by=None,
+			)
+
 		for in_db, from_form in (
 			("2030-05-01 10:00:00", "2031-01-01 00:00:00"),
 			("2030-05-01 10:00:00", None),
@@ -165,15 +173,19 @@ class TestERPAISetting(FrappeTestCase):
 		):
 			with self.subTest(in_db=in_db, from_form=from_form):
 				frappe.db.set_single_value(SETTING_DOCTYPE, "privilege_alert_checked_until", in_db)
+				before = raw_watermark()
 				doc = frappe.get_doc(SETTING_DOCTYPE)
 				doc.privilege_alert_checked_until = from_form
 				doc.save()
-				stored = frappe.db.get_single_value(
-					SETTING_DOCTYPE, "privilege_alert_checked_until", cache=False
-				)
 				if in_db is None:
-					self.assertIsNone(stored)
+					# empty stays empty: no year-1 text in tabSingles, nothing on the form
+					self.assertIsNone(before)
+					self.assertIsNone(raw_watermark())
+					self.assertIsNone(doc.privilege_alert_checked_until)
 				else:
+					stored = frappe.db.get_single_value(
+						SETTING_DOCTYPE, "privilege_alert_checked_until", cache=False
+					)
 					self.assertEqual(get_datetime(stored), get_datetime(in_db))
 					self.assertEqual(get_datetime(doc.privilege_alert_checked_until), get_datetime(in_db))
 

@@ -4,11 +4,13 @@ from datetime import datetime, timedelta
 from unittest.mock import patch
 
 import frappe
+from frappe.desk.query_report import run
+from frappe.permissions import AUTOMATIC_ROLES
 from frappe.tests.utils import FrappeTestCase
 from frappe.utils import add_days, get_datetime, getdate, now_datetime
 from helpdesk.test_utils import make_ticket
 
-from erp_ai.constants import AGENT_USER, CATEGORIES, LOG_DOCTYPE
+from erp_ai.constants import AGENT_USER, CATEGORIES, LOG_DOCTYPE, ROLE_AGENT, ROLE_INSTRUCTOR
 from erp_ai.erp_ai_agent.report.erp_ai_accuracy import erp_ai_accuracy
 from erp_ai.erp_ai_agent.report.erp_ai_accuracy.erp_ai_accuracy import (
 	GATE_MIN_ACCURACY,
@@ -219,12 +221,12 @@ class TestAccuracyFiltersAndColumns(AccuracyTestCase):
 		with self.assertRaises(frappe.PermissionError):
 			execute(self._filters())
 
-	def test_report_record_is_system_manager_only_script_report(self):
+	def test_report_record_is_script_report_for_system_manager_and_instructor(self):
 		report = frappe.get_doc("Report", REPORT)
 		self.assertEqual(report.report_type, "Script Report")
 		self.assertEqual(report.ref_doctype, LOG_DOCTYPE)
 		self.assertEqual(report.module, "ERP AI agent")
-		self.assertEqual([row.role for row in report.roles], ["System Manager"])
+		self.assertEqual([row.role for row in report.roles], ["System Manager", ROLE_INSTRUCTOR])
 		self.assertEqual(report.is_standard, "Yes")
 		self.assertTrue(frappe.has_permission("Report", doc=report, user="Administrator"))
 
@@ -675,3 +677,43 @@ class TestLatencySummary(AccuracyTestCase):
 		) as fetch:
 			self._summary()
 		self.assertEqual(fetch.call_count, 1)
+
+
+class TestAccess(AccuracyTestCase):
+	"""AC-20: the Instructor runs the report, only ERP AI Agent is refused, System Manager runs it."""
+
+	def setUp(self):
+		super().setUp()
+		keep_agent_settings(self)
+		self._log("A", 1)
+
+	def _user_with_only(self, role):
+		"""A new user whose only non-automatic role is `role`, so no other role can grant or refuse access."""
+		email = f"erp-ai-accuracy-{frappe.scrub(role).replace('_', '-')}@example.com"
+		user = frappe.get_doc(
+			{"doctype": "User", "email": email, "first_name": "access", "send_welcome_email": 0}
+		)
+		user.append("roles", {"role": role})
+		user.insert(ignore_permissions=True)
+		self.assertEqual(set(frappe.get_roles(email)) - set(AUTOMATIC_ROLES), {role})
+		return email
+
+	def _run_as(self, role):
+		frappe.set_user(self._user_with_only(role))
+		filters = json.dumps({key: str(value) for key, value in self._filters().items()})
+		return run(REPORT, filters=filters)
+
+	def _predictions_of_a(self, result):
+		return next(row["predictions"] for row in result["result"] if row["category"] == "A")
+
+	def test_three_accounts(self):
+		with self.subTest(account=ROLE_INSTRUCTOR):
+			self.assertEqual(self._predictions_of_a(self._run_as(ROLE_INSTRUCTOR)), 1)
+
+		with self.subTest(account=ROLE_AGENT):
+			with self.assertRaises(frappe.PermissionError):
+				self._run_as(ROLE_AGENT)
+			self.assertFalse(frappe.get_doc("Report", REPORT).is_permitted())
+
+		with self.subTest(account="System Manager"):
+			self.assertEqual(self._predictions_of_a(self._run_as("System Manager")), 1)

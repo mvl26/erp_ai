@@ -234,6 +234,37 @@ class TestRedact(FrappeTestCase):
 			with self.subTest(text=text):
 				self.assertEqual(redact.redact_secrets(text), expected)
 
+	def test_pattern_masked_value_tail_masked(self):
+		# K-7 as amended: after a secret key, the tail K-4 still counts as bare value goes with the MASK.
+		cases = (
+			("password=sk-ant-FAKE&tailFAKE", f"password={MASK}"),
+			("password=sk-ant-FAKE&amp;tailFAKE", f"password={MASK}"),
+			("password=sk-ant-FAKE.tailFAKE", f"password={MASK}"),
+			("pwd=sk-FAKE0000000000000000+tailFAKE", f"pwd={MASK}"),
+			("token=eyJa.eyJb.c2ln&tailFAKE", f"token={MASK}"),
+			("password=sk-ant-FAKE,tailFAKE", f"password={MASK}"),
+			("password=sk-ant-FAKE&tailFAKE;pwd=fake-z", f"password={MASK};pwd={MASK}"),
+		)
+		for text, expected in cases:
+			with self.subTest(text=text):
+				result = redact.redact_secrets(text)
+				self.assertEqual(result, expected)
+				self.assertNotIn("tailFAKE", result)
+
+	def test_pattern_masked_value_tail_stops_like_bare_value(self):
+		# The tail stops where a bare value stops (K-4 (a)-(c), `}`); a non-secret key keeps it (K-7).
+		cases = (
+			("password=sk-ant-FAKE&page=2", f"password={MASK}&page=2"),
+			("password=sk-ant-FAKE, tiếp", f"password={MASK}, tiếp"),
+			("password=sk-ant-FAKE;", f"password={MASK};"),
+			("{password=sk-ant-FAKE}", f"{{password={MASK}}}"),
+			("note=sk-ant-FAKE&tailFAKE", f"note={MASK}&tailFAKE"),
+			("api_key=sk-ant-FAKE&pwd=fake-z", f"api_key={MASK}&pwd={MASK}"),
+		)
+		for text, expected in cases:
+			with self.subTest(text=text):
+				self.assertEqual(redact.redact_secrets(text), expected)
+
 	def test_secret_patterns_are_the_five_value_patterns(self):
 		samples = (
 			"khóa sk-ant-abc hết hạn",

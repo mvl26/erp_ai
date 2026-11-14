@@ -13,6 +13,7 @@ from erp_ai.agent.changes.file_writer import (
 	sha256_of,
 	write_atomic,
 )
+from erp_ai.test_utils import TempAppsRoot
 
 OLD_BYTES = b"old\n"
 OLD_SHA256 = "01d09d19c2139a46aebfb577780d123d7396e97201bc7ead210a2ebff8239dee"
@@ -24,6 +25,7 @@ VIETNAMESE_CRLF_BYTES = (
 	b"d\xc3\xb2ng m\xe1\xbb\x99t\r\nTi\xe1\xba\xbfng Vi\xe1\xbb\x87t c\xc3\xb3 d\xe1\xba\xa5u\r\n"
 	b"kh\xc3\xb4ng newline cu\xe1\xbb\x91i"
 )
+APP_DIR_BEFORE = sorted([".env", "dir_out", "link_out.py", "ok.py", "site_config.json", "x.pem"])
 VIETNAMESE_CRLF_SHA256 = "9b6d99b985f50f7227a1325a9f46c400a8b8a6e94830254b973a2fe640f6039a"
 
 
@@ -145,3 +147,115 @@ class TestFileWriter(FrappeTestCase):
 
 	def test_proposal_file_max_bytes_is_one_mib(self):
 		self.assertEqual(PROPOSAL_FILE_MAX_BYTES, 1048576)
+
+
+class TestMakeParents(FrappeTestCase):
+	def setUp(self):
+		self.apps = TempAppsRoot(self)
+		self.app_dir = os.path.join(self.apps.root, "myapp")
+
+	def test_three_levels_created_top_down(self):
+		full = os.path.join(self.app_dir, "a", "b", "c", "new.py")
+		made = []
+		real_mkdir = os.mkdir
+
+		def spy(path, mode=0o777):
+			made.append((path, mode))
+			return real_mkdir(path, mode)
+
+		with patch.object(file_writer.os, "mkdir", side_effect=spy):
+			created = file_writer.make_parents(full, self.app_dir)
+		expected = [
+			os.path.join(self.app_dir, "a"),
+			os.path.join(self.app_dir, "a", "b"),
+			os.path.join(self.app_dir, "a", "b", "c"),
+		]
+		self.assertEqual(created, expected)
+		self.assertEqual(made, [(d, 0o755) for d in expected])
+		for d in expected:
+			self.assertTrue(os.path.isdir(d))
+		self.assertFalse(os.path.exists(full))
+		self.assertEqual(file_writer.make_parents(full, self.app_dir), [])
+
+		existing = os.path.join(self.app_dir, "a", "x", "y.py")
+		self.assertEqual(
+			file_writer.make_parents(existing, self.app_dir), [os.path.join(self.app_dir, "a", "x")]
+		)
+
+	def test_app_dir_missing_raises(self):
+		missing_app = os.path.join(self.apps.root, "noapp")
+		full = os.path.join(missing_app, "pkg", "new.py")
+		with self.assertRaises(ValueError):
+			file_writer.make_parents(full, missing_app)
+		self.assertFalse(os.path.exists(missing_app))
+
+	def test_git_component_rolls_back(self):
+		for parts in (("pkg", ".github", "workflows"), ("pkg", ".git", "hooks")):
+			with self.subTest(parts=parts):
+				full = os.path.join(self.app_dir, *parts, "x.yml")
+				with self.assertRaises(ValueError):
+					file_writer.make_parents(full, self.app_dir)
+				self.assertFalse(os.path.exists(os.path.join(self.app_dir, "pkg")))
+				self.assertEqual(sorted(os.listdir(self.app_dir)), APP_DIR_BEFORE)
+
+	def test_symlinked_parent_rolls_back(self):
+		full = os.path.join(self.app_dir, "dir_out", "pkg", "new.py")
+		with self.assertRaises(ValueError):
+			file_writer.make_parents(full, self.app_dir)
+		self.assertEqual(os.listdir(self.apps.outside), ["plain.py"])
+
+
+class TestRemoveEmptyDirs(FrappeTestCase):
+	def setUp(self):
+		self.apps = TempAppsRoot(self)
+		self.app_dir = os.path.join(self.apps.root, "myapp")
+
+	def _dir(self, *parts):
+		path = os.path.join(self.app_dir, *parts)
+		os.makedirs(path, exist_ok=True)
+		return path
+
+	def test_keeps_nonempty_and_preexisting(self):
+		preexisting = self._dir("pre")
+		empty = self._dir("pre", "empty")
+		full = self._dir("pre", "full")
+		self.apps.write(os.path.join("myapp", "pre", "full", "keep.py"), "x = 1\n")
+		removed = file_writer.remove_empty_dirs([empty, full])
+		self.assertEqual(removed, [empty])
+		self.assertFalse(os.path.exists(empty))
+		self.assertTrue(os.path.isdir(full))
+		self.assertTrue(os.path.isdir(preexisting))
+
+	def test_symlink_dir_skipped_target_untouched(self):
+		target = os.path.join(self.apps.base, "outside_empty")
+		os.mkdir(target)
+		link = os.path.join(self.app_dir, "link_empty")
+		os.symlink(target, link)
+		self.assertEqual(file_writer.remove_empty_dirs([link]), [])
+		self.assertTrue(os.path.islink(link))
+		self.assertTrue(os.path.isdir(target))
+
+	def test_git_component_dir_skipped(self):
+		empty = self._dir(".github", "empty")
+		git_empty = self._dir(".git", "refs")
+		self.assertEqual(file_writer.remove_empty_dirs([empty, git_empty]), [])
+		self.assertTrue(os.path.isdir(empty))
+		self.assertTrue(os.path.isdir(git_empty))
+
+	def test_deepest_first_nonempty_kept(self):
+		top = self._dir("a")
+		middle = self._dir("a", "b")
+		deepest = self._dir("a", "b", "c")
+		cached = self._dir("a", "cached")
+		self.apps.write(os.path.join("myapp", "a", "cached", "__pycache__", "m.pyc"), "")
+		removed = file_writer.remove_empty_dirs([top, cached, middle, deepest])
+		self.assertEqual(removed, [deepest, middle])
+		self.assertTrue(os.path.isdir(top))
+		self.assertTrue(os.path.isdir(os.path.join(cached, "__pycache__")))
+
+	def test_dir_under_symlinked_parent_or_outside_root_skipped(self):
+		outside_empty = os.path.join(self.apps.outside, "empty")
+		os.mkdir(outside_empty)
+		through_link = os.path.join(self.app_dir, "dir_out", "empty")
+		self.assertEqual(file_writer.remove_empty_dirs([through_link, outside_empty]), [])
+		self.assertTrue(os.path.isdir(outside_empty))

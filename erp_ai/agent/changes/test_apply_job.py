@@ -801,6 +801,26 @@ class TestCommitFailure(ApplyJobTestCase):
 				for word in kept:
 					self.assertIn(word, short)
 
+	def test_git_short_line_masks_each_rule_member_alone(self):
+		# Review round 1 (design addendum 4 QĐ-D1): each word holds exactly one rule member, so dropping
+		# that member, or moving the key-like threshold off 20, changes the result.
+		alnum_20 = "Ab3dEf6hIj9lMn2pQr5t"
+		self.assertEqual(len(alnum_20), 20)
+		cases = (
+			("HEAD~1", "…"),
+			("~miyano", "…"),
+			(alnum_20, "…"),
+			(alnum_20[:19], alnum_20[:19]),
+			(("ab_" * 7)[:20], "…"),
+			(("ab-" * 7)[:20], "…"),
+			(("ab+" * 7)[:20], "…"),
+			("C:\\x", "…"),
+			("token=abc", "…"),
+		)
+		for word, expected in cases:
+			with self.subTest(word):
+				self.assertEqual(apply_job._git_short_line(f"lỗi {word} cuối"), f"lỗi {expected} cuối")
+
 	def test_git_short_line_masks_before_cut_and_drops_control_chars(self):
 		# Design addendum 4 QĐ-D1 steps (1) and (4): mask first, cut to 120 after.
 		prefix = ("lỗi " * 30)[:109] + " "
@@ -2723,6 +2743,7 @@ class TestCommitCrossChecks(RealCoreReposUntouchedMixin, ApplyJobTestCase):
 					state.failure_reason.startswith(f"{GIT_COMMIT_FAILED_TEXT}: "), state.failure_reason
 				)
 				self.assertNotIn(HOOK_OUTPUT, state.failure_reason)
+				self.assertNotIn("hook-output-T48", state.failure_reason)
 				self.assertNotIn(HOME_EMAIL, state.failure_reason)
 				self.assertEqual((self.read(), self.head(), self.worktree_changes()), (content, head, ""))
 				self.assertEqual(sorted(os.listdir(markers)), [])

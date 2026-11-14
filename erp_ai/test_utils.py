@@ -14,14 +14,19 @@ from frappe.utils import get_bench_path
 from helpdesk.test_utils import create_agent, make_ticket
 
 from erp_ai.agent.run_log import write_entry
+from erp_ai.agent.tools.change_guard import FileOp
 from erp_ai.constants import (
 	AGENT_STATUS_EVENT,
 	AGENT_USER,
 	CHANGE_KIND_CODE,
 	CHANGE_KIND_COMMAND,
+	CHANGE_OP_CREATE,
+	CHANGE_OP_DELETE,
+	CHANGE_OP_RENAME,
 	CHANGE_STATUS_PENDING,
 	CORE_APPS,
 	HELPDESK_AGENT_ROLE,
+	OPERATION_DOCTYPE,
 	PROPOSAL_DOCTYPE,
 	ROLE_AGENT,
 	SETTING_DOCTYPE,
@@ -566,13 +571,19 @@ class GitSandbox:
 		return markers
 
 
+ERP_AI_REPO = "erp_ai"
+
+
 def real_core_repos_snapshot() -> dict:
-	"""`{app: (HEAD sha, status --porcelain)}` of the real core repos; read-only git, no optional locks."""
+	"""`{app: (HEAD sha, status --porcelain)}` of the real core repos and the real `erp_ai` repo (NFR-14).
+
+	Read-only git, no optional locks.
+	"""
 	apps_dir = os.path.join(get_bench_path(), "apps")
 	env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
 	env["LC_ALL"] = "C"
 	snapshot = {}
-	for app in CORE_APPS:
+	for app in (*CORE_APPS, ERP_AI_REPO):
 		outputs = []
 		for args in (("rev-parse", "HEAD"), ("status", "--porcelain")):
 			command = ["git", "-C", os.path.join(apps_dir, app), "--no-optional-locks", *args]
@@ -691,5 +702,104 @@ def make_change_proposal(kind: str = CHANGE_KIND_CODE, ticket: str | None = None
 			"change_status": CHANGE_STATUS_PENDING,
 		}
 	)
+	values.update(fields)
+	return frappe.get_doc(values).insert(ignore_permissions=True)
+
+
+def _block_operation(operation) -> FileOp:
+	"""A `FileOp` from a `FileOp` or a dict of its field names; a missing hash is computed from the text."""
+	if isinstance(operation, dict):
+		operation = FileOp(
+			**{
+				"new_path": None,
+				"before": None,
+				"after": None,
+				"base_hash": None,
+				"after_hash": None,
+				**operation,
+			}
+		)
+	base_hash = operation.base_hash
+	if base_hash is None and operation.before is not None:
+		base_hash = _sha256_text(operation.before)
+	after_hash = operation.after_hash
+	if after_hash is None and operation.after is not None:
+		after_hash = _sha256_text(operation.after)
+	return FileOp(
+		operation.kind,
+		operation.path,
+		operation.new_path,
+		operation.before,
+		operation.after,
+		base_hash,
+		after_hash,
+	)
+
+
+def _block_diff(operation: FileOp) -> str:
+	"""Design 2.2 `diff` of one item: deletion against `/dev/null`, rename as `rename from` / `rename to`."""
+	if operation.kind == CHANGE_OP_RENAME:
+		return f"rename from {operation.path}\nrename to {operation.new_path}\n"
+	before = "" if operation.before is None else operation.before
+	after = "" if operation.after is None else operation.after
+	return "".join(
+		difflib.unified_diff(
+			before.splitlines(keepends=True),
+			after.splitlines(keepends=True),
+			fromfile="/dev/null" if operation.kind == CHANGE_OP_CREATE else f"a/{operation.path}",
+			tofile="/dev/null" if operation.kind == CHANGE_OP_DELETE else f"b/{operation.path}",
+		)
+	)
+
+
+def _command_app(commands: list) -> str:
+	"""Design 2.2: the app of a block with only commands is the one of its `build --app`, if any."""
+	for args in commands:
+		if args[:2] == ["build", "--app"] and len(args) > 2:
+			return args[2]
+	return ""
+
+
+def make_block_proposal(operations, commands, ticket: str | None = None, **fields):
+	"""Insert a `Chờ duyệt` ERP AI Change Proposal of the block shape (CHG-002 design 2.1, 2.2) and return it.
+
+	`operations` is a list of `change_guard.FileOp` or dicts of its field names, stored as child rows in that
+	order; a hash left `None` is computed from the text. `commands` is the argv list stored as `command_list`
+	JSON. `ticket` defaults to a new HD Ticket; `fields` override any parent value. Inserted with
+	`ignore_permissions=True` and never committed: the caller's test rolls it back.
+	"""
+	operations = [_block_operation(operation) for operation in operations]
+	if ticket is None:
+		ticket = make_ticket(subject=_unique("block proposal")).name
+	values = {
+		"doctype": PROPOSAL_DOCTYPE,
+		"ticket": ticket,
+		"run_id": f"{PREFIX}run",
+		"instructor": "Administrator",
+		"reason": "Đề xuất khối mẫu cho test",
+		"change_status": CHANGE_STATUS_PENDING,
+		"change_kind": CHANGE_KIND_CODE if operations else CHANGE_KIND_COMMAND,
+		"app": operations[0].path.split("/", 1)[0] if operations else _command_app(commands),
+		"reversible": 1 if operations else 0,
+		"command_list": json.dumps(commands),
+		"diff": "".join(_block_diff(operation) for operation in operations),
+		"target_branch": "main" if operations else "",
+		"upstream_ref": "origin/main" if operations else "",
+		"ahead_count": 0,
+		"is_core_app": 0,
+		"operations": [
+			{
+				"doctype": OPERATION_DOCTYPE,
+				"operation": operation.kind,
+				"file_path": operation.path,
+				"new_path": operation.new_path,
+				"content_before": operation.before,
+				"content_after": operation.after,
+				"base_hash": operation.base_hash,
+				"after_hash": operation.after_hash,
+			}
+			for operation in operations
+		],
+	}
 	values.update(fields)
 	return frappe.get_doc(values).insert(ignore_permissions=True)

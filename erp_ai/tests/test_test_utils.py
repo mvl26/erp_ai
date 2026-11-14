@@ -1,18 +1,39 @@
+import hashlib
 import json
+import os
+import subprocess
 import unittest
 from unittest.mock import patch
 
 import frappe
 from frappe.tests.utils import FrappeTestCase
+from frappe.utils import get_bench_path
 
-from erp_ai.constants import AGENT_USER, HELPDESK_AGENT_ROLE, ROLE_AGENT
+from erp_ai.agent.changes import block
+from erp_ai.agent.tools.change_guard import FileOp
+from erp_ai.constants import (
+	AGENT_USER,
+	CHANGE_KIND_CODE,
+	CHANGE_KIND_COMMAND,
+	CHANGE_OP_CREATE,
+	CHANGE_OP_DELETE,
+	CHANGE_OP_EDIT,
+	CHANGE_OP_RENAME,
+	CHANGE_STATUS_PENDING,
+	CORE_APPS,
+	HELPDESK_AGENT_ROLE,
+	PROPOSAL_DOCTYPE,
+	ROLE_AGENT,
+)
 from erp_ai.test_utils import (
 	PREFIX,
 	make_active_agent,
+	make_block_proposal,
 	make_routing_rules,
 	make_sla,
 	make_team,
 	pin_agent_roles,
+	real_core_repos_snapshot,
 )
 
 AUTOMATIC_ROLES = {"Guest", "All", "Administrator", "Desk User"}
@@ -207,3 +228,124 @@ class TestMakeHelpers(FrappeTestCase):
 		)
 		priorities = frappe.get_all("HD Service Level Priority", filters={"parent": plain}, pluck="priority")
 		self.assertEqual(set(priorities), {"Low", "Medium", "High", "Urgent"})
+
+
+def _sha256(text: str) -> str:
+	return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+class TestMakeBlockProposal(FrappeTestCase):
+	def setUp(self):
+		frappe.db.rollback()
+		# Registered first so it is undone last: the rollback cleanup runs while commits are still guarded.
+		commit_guard = patch.object(frappe.db, "commit", side_effect=AssertionError("test must not commit"))
+		commit_guard.start()
+		self.addCleanup(commit_guard.stop)
+		self.addCleanup(frappe.db.rollback)
+
+	def test_rows_hashes_and_command_list_stored(self):
+		operations = [
+			FileOp(CHANGE_OP_EDIT, "myapp/myapp/a.py", None, "a = 1\n", "a = 2\n", None, None),
+			{"kind": CHANGE_OP_CREATE, "path": "myapp/myapp/new/b.py", "after": "b = 1\n"},
+			FileOp(CHANGE_OP_DELETE, "myapp/myapp/c.py", None, "c = 1\n", None, None, None),
+			{
+				"kind": CHANGE_OP_RENAME,
+				"path": "myapp/myapp/d.py",
+				"new_path": "myapp/myapp/e.py",
+				"before": "d = 1\n",
+				"after": "d = 1\n",
+			},
+		]
+		commands = [["build", "--app", "myapp"], ["restart"]]
+
+		doc = make_block_proposal(operations, commands, reason="khối mẫu")
+
+		stored = frappe.get_doc(PROPOSAL_DOCTYPE, doc.name)
+		self.assertEqual(stored.change_status, CHANGE_STATUS_PENDING)
+		self.assertEqual(stored.change_kind, CHANGE_KIND_CODE)
+		self.assertEqual(stored.reason, "khối mẫu")
+		self.assertEqual(stored.app, "myapp")
+		self.assertEqual(stored.reversible, 1)
+		self.assertTrue(stored.ticket)
+		for fieldname in (
+			"file_path",
+			"content_before",
+			"content_after",
+			"base_hash",
+			"after_hash",
+			"command_args",
+		):
+			self.assertFalse(stored.get(fieldname), fieldname)
+		self.assertEqual(json.loads(stored.command_list), commands)
+		rows = [
+			(
+				row.idx,
+				row.operation,
+				row.file_path,
+				row.new_path or None,
+				row.base_hash or None,
+				row.after_hash or None,
+			)
+			for row in sorted(stored.operations, key=lambda row: row.idx)
+		]
+		self.assertEqual(
+			rows,
+			[
+				(1, CHANGE_OP_EDIT, "myapp/myapp/a.py", None, _sha256("a = 1\n"), _sha256("a = 2\n")),
+				(2, CHANGE_OP_CREATE, "myapp/myapp/new/b.py", None, None, _sha256("b = 1\n")),
+				(3, CHANGE_OP_DELETE, "myapp/myapp/c.py", None, _sha256("c = 1\n"), None),
+				(
+					4,
+					CHANGE_OP_RENAME,
+					"myapp/myapp/d.py",
+					"myapp/myapp/e.py",
+					_sha256("d = 1\n"),
+					_sha256("d = 1\n"),
+				),
+			],
+		)
+		self.assertTrue(block.is_block(stored))
+		self.assertEqual(block.commands_of(stored), commands)
+		read_back = block.operations_of(stored)
+		self.assertEqual([op.before for op in read_back], ["a = 1\n", None, "c = 1\n", "d = 1\n"])
+		self.assertEqual([op.after for op in read_back], ["a = 2\n", "b = 1\n", None, "d = 1\n"])
+		self.assertIn("myapp/myapp/a.py", stored.diff)
+		self.assertIn("rename from myapp/myapp/d.py", stored.diff)
+
+	def test_explicit_hash_kept_and_commands_only_block_is_bench_command(self):
+		wrong = "0" * 64
+		doc = make_block_proposal(
+			[FileOp(CHANGE_OP_EDIT, "myapp/myapp/a.py", None, "a = 1\n", "a = 2\n", wrong, None)], []
+		)
+		self.assertEqual(doc.operations[0].base_hash, wrong)
+		self.assertEqual(doc.operations[0].after_hash, _sha256("a = 2\n"))
+		self.assertEqual(json.loads(doc.command_list), [])
+
+		commands_only = make_block_proposal([], [["build", "--app", "hrms"]], ticket=doc.ticket)
+		self.assertEqual(commands_only.change_kind, CHANGE_KIND_COMMAND)
+		self.assertEqual(commands_only.app, "hrms")
+		self.assertEqual(commands_only.reversible, 0)
+		self.assertEqual(commands_only.ticket, doc.ticket)
+		self.assertFalse(commands_only.operations)
+		self.assertTrue(block.is_block(commands_only))
+
+
+def _git_output(repo: str, *args: str) -> str:
+	return subprocess.run(
+		["git", "-C", repo, "--no-optional-locks", *args],
+		capture_output=True,
+		text=True,
+		check=True,
+		timeout=30,
+	).stdout
+
+
+class TestRealCoreRepos(FrappeTestCase):
+	def test_snapshot_includes_erp_ai(self):
+		snapshot = real_core_repos_snapshot()
+
+		self.assertEqual(set(snapshot), {*CORE_APPS, "erp_ai"})
+		repo = os.path.join(get_bench_path(), "apps", "erp_ai")
+		head, status = snapshot["erp_ai"]
+		self.assertEqual(head, _git_output(repo, "rev-parse", "HEAD").strip())
+		self.assertIsInstance(status, str)

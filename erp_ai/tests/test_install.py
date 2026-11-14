@@ -1,6 +1,7 @@
 from unittest.mock import patch
 
 import frappe
+from frappe.permissions import rights, setup_custom_perms
 from frappe.tests.utils import FrappeTestCase
 from helpdesk.helpdesk.doctype.hd_form_script.hd_form_script import get_form_script
 from helpdesk.test_utils import make_ticket
@@ -47,6 +48,12 @@ FIVE_SWITCHES = (
 )
 
 # FEAT-007 AC-16: patched clocks for the enable mark filled by install.
+# FEAT-007 T60 (design "T22a"): hidden HD Ticket field and the Instructor read right on HD Article.
+CREATED_LABELS_FIELD = "ai_created_labels"
+ARTICLE = "HD Article"
+ARTICLE_STANDARD_ROLES = ("System Manager", "Agent", "HD Customer", "HD Customer Manager")
+PERM_FLAGS = (*rights, "if_owner")
+
 EARLIER = "2025-12-31 08:00:00"
 ENABLED_AT = "2026-01-02 03:04:05"
 LATER = "2026-02-03 04:05:06"
@@ -110,7 +117,7 @@ class TestInstall(FrappeTestCase):
 		self.assertEqual(_counts(), before)
 		self.assertEqual(before["roles"], 2)
 		self.assertEqual(before["users"], 1)
-		self.assertEqual(before["ai_fields"], 10)
+		self.assertEqual(before["ai_fields"], 11)
 
 	def test_ai_fields_permlevel_8_and_template_rows_agents_only(self):
 		for name in AI_FIELDS:
@@ -652,6 +659,40 @@ def _stored_settings():
 	return dict(frappe.db.sql("select field, value from `tabSingles` where doctype=%s", SETTING_DOCTYPE))
 
 
+def _perm_key(row):
+	"""Role, permlevel and every permission flag of one DocPerm / Custom DocPerm row."""
+	return (row.role, row.permlevel, tuple((flag, row.get(flag) or 0) for flag in PERM_FLAGS))
+
+
+def _article_custom_perms(**filters):
+	return frappe.get_all(
+		"Custom DocPerm", filters={"parent": ARTICLE, **filters}, fields=["*"], order_by="name"
+	)
+
+
+def _article_custom_perm_snapshot():
+	return [(row.name, _perm_key(row), str(row.modified)) for row in _article_custom_perms()]
+
+
+def _labels_field():
+	return frappe.db.get_value(
+		"Custom Field",
+		{"dt": "HD Ticket", "fieldname": CREATED_LABELS_FIELD},
+		[
+			"name",
+			"fieldtype",
+			"permlevel",
+			"hidden",
+			"read_only",
+			"no_copy",
+			"module",
+			"insert_after",
+			"modified",
+		],
+		as_dict=True,
+	)
+
+
 class TestFeat007Migrate(FrappeTestCase):
 	def setUp(self):
 		frappe.db.rollback()
@@ -824,7 +865,11 @@ class TestFeat007Migrate(FrappeTestCase):
 			patch.object(install.frappe, "logger") as logger,
 		):
 			install.ensure_setup()
-		warnings = [c.args for c in logger.return_value.warning.call_args_list if "HD Article" in c.args[0]]
+		warnings = [
+			c.args
+			for c in logger.return_value.warning.call_args_list
+			if "HD Article" in c.args[0] and "permission" not in c.args[0]
+		]
 		self.assertEqual(len(warnings), 1)
 		self.assertIn("not found", warnings[0][0])
 		self.assertIsNone(self._custom_field("HD Article", "ai_source_ticket"))
@@ -851,3 +896,181 @@ class TestFeat007Migrate(FrappeTestCase):
 			{right: effective[right] for right in checked},
 			expected,
 		)
+
+	def _clear_article_meta_after_test(self):
+		# get_meta and the install path cache in-transaction permissions in redis; rollback does not clear it.
+		self.addCleanup(frappe.clear_cache, doctype=ARTICLE)
+
+	def _instructor_article_perms(self):
+		return _article_custom_perms(role=ROLE_INSTRUCTOR)
+
+	def _assert_instructor_read_report_only(self):
+		rows = self._instructor_article_perms()
+		self.assertEqual(len(rows), 1)
+		self.assertEqual(
+			_perm_key(rows[0]),
+			(
+				ROLE_INSTRUCTOR,
+				0,
+				tuple((flag, int(flag in INSTRUCTOR_LOG_RIGHTS)) for flag in PERM_FLAGS),
+			),
+		)
+
+	def test_created_labels_field_installed(self):
+		"""Ruling (1), ADR-006: hidden HD Ticket `ai_created_labels`, permlevel 8, last of the AI fields."""
+		frappe.db.delete("Custom Field", {"dt": "HD Ticket", "fieldname": CREATED_LABELS_FIELD})
+		frappe.clear_cache(doctype="HD Ticket")
+		opt_out_after = frappe.db.get_value(
+			"Custom Field", {"dt": "HD Ticket", "fieldname": "ai_opt_out"}, "insert_after"
+		)
+		install.ensure_setup()
+		field = _labels_field()
+		self.assertIsNotNone(field)
+		self.assertEqual(
+			(field.fieldtype, field.permlevel, field.hidden, field.read_only, field.no_copy, field.module),
+			("Small Text", 8, 1, 1, 1, "ERP AI agent"),
+		)
+		self.assertEqual(field.insert_after, "ai_opt_out")
+		self.assertEqual(
+			frappe.db.get_value(
+				"Custom Field", {"dt": "HD Ticket", "fieldname": "ai_opt_out"}, "insert_after"
+			),
+			opt_out_after,
+		)
+
+	def test_hidden_labels_field_has_no_template_row(self):
+		"""design-w0-fixes-2 (4): a hidden AI field gets no HD Ticket Template row."""
+		frappe.db.delete("Custom Field", {"dt": "HD Ticket", "fieldname": CREATED_LABELS_FIELD})
+		frappe.db.delete("HD Ticket Template Field", {"parent": TEMPLATE, "fieldname": CREATED_LABELS_FIELD})
+		frappe.clear_cache(doctype="HD Ticket")
+		install.ensure_setup()
+		install.ensure_setup()
+		field = _labels_field()
+		self.assertIsNotNone(field)
+		self.assertEqual(field.hidden, 1)
+		self.assertEqual(
+			frappe.db.count(
+				"HD Ticket Template Field", {"parent": TEMPLATE, "fieldname": CREATED_LABELS_FIELD}
+			),
+			0,
+		)
+
+	def test_existing_template_row_of_hidden_field_kept(self):
+		"""design-w0-fixes-2 (4): a template row a human added for the hidden field is not deleted."""
+		frappe.db.delete("HD Ticket Template Field", {"parent": TEMPLATE, "fieldname": CREATED_LABELS_FIELD})
+		template = frappe.get_doc("HD Ticket Template", TEMPLATE)
+		template.append("fields", {"fieldname": CREATED_LABELS_FIELD, "required": 0, "visible_to": "Agents"})
+		template.flags.ignore_permissions = True
+		template.save()
+		install.ensure_setup()
+		self.assertEqual(
+			frappe.db.count(
+				"HD Ticket Template Field", {"parent": TEMPLATE, "fieldname": CREATED_LABELS_FIELD}
+			),
+			1,
+		)
+
+	def test_instructor_article_perm_read_report_only(self):
+		"""Ruling (1b), ADR-015, AC-45: ERP AI Instructor reads HD Article (read, report), nothing else."""
+		self._clear_article_meta_after_test()
+		# Own starting state: no Custom DocPerm on HD Article, whatever an earlier run left on the site.
+		frappe.db.delete("Custom DocPerm", {"parent": ARTICLE})
+		install.ensure_setup()
+		self._assert_instructor_read_report_only()
+		meta_rows = [p for p in frappe.get_meta(ARTICLE).permissions if p.role == ROLE_INSTRUCTOR]
+		self.assertEqual([(p.permlevel, p.read, p.report, p.write) for p in meta_rows], [(0, 1, 1, 0)])
+
+	def test_article_perms_of_other_roles_unchanged(self):
+		"""Ruling (1b): the standard DocPerm is copied first, so the four standard roles keep their rights."""
+		self._clear_article_meta_after_test()
+		frappe.db.delete("Custom DocPerm", {"parent": ARTICLE})
+		standard = sorted(
+			_perm_key(row) for row in frappe.get_all("DocPerm", filters={"parent": ARTICLE}, fields=["*"])
+		)
+		self.assertEqual({key[0] for key in standard}, set(ARTICLE_STANDARD_ROLES))
+		install.ensure_setup()
+		custom = _article_custom_perms()
+		self.assertEqual(
+			sorted(_perm_key(row) for row in custom if row.role in ARTICLE_STANDARD_ROLES), standard
+		)
+		self.assertEqual(len(custom), len(standard) + 1)
+		self._assert_instructor_read_report_only()
+
+	def test_existing_article_custom_perm_kept(self):
+		"""Ruling (1b): a Custom DocPerm a human edited or added stays as is; only the Instructor row is added."""
+		self._clear_article_meta_after_test()
+		frappe.db.delete("Custom DocPerm", {"parent": ARTICLE})
+		setup_custom_perms(ARTICLE)
+		agent = frappe.db.get_value("Custom DocPerm", {"parent": ARTICLE, "role": "Agent"})
+		frappe.db.set_value(
+			"Custom DocPerm",
+			agent,
+			{"write": 0, "delete": 0, "modified": "2020-01-01 00:00:00"},
+			update_modified=False,
+		)
+		frappe.get_doc(
+			{
+				"doctype": "Custom DocPerm",
+				"parent": ARTICLE,
+				"parenttype": "DocType",
+				"parentfield": "permissions",
+				"role": "Blogger",
+				"permlevel": 0,
+				"read": 1,
+			}
+		).insert(ignore_permissions=True)
+		before = _article_custom_perm_snapshot()
+		install.ensure_setup()
+		after = [row for row in _article_custom_perm_snapshot() if row[1][0] != ROLE_INSTRUCTOR]
+		self.assertEqual(after, before)
+		self.assertEqual(len(_article_custom_perms()), len(before) + 1)
+		self._assert_instructor_read_report_only()
+
+	def test_second_setup_keeps_labels_field_and_article_perms(self):
+		"""Ruling (ii): a second setup changes nothing, also an Instructor row a human edited (no second row)."""
+		self._clear_article_meta_after_test()
+		frappe.db.delete("Custom DocPerm", {"parent": ARTICLE})
+		install.ensure_setup()
+		self._assert_instructor_read_report_only()
+		frappe.db.set_value(
+			"Custom DocPerm",
+			self._instructor_article_perms()[0].name,
+			{"export": 1, "modified": "2020-01-01 00:00:00"},
+			update_modified=False,
+		)
+		perms = _article_custom_perm_snapshot()
+		field = _labels_field()
+		self.assertIsNotNone(field)
+		install.ensure_setup()
+		install.after_migrate()
+		self.assertEqual(_article_custom_perm_snapshot(), perms)
+		self.assertEqual(_labels_field(), field)
+		self.assertEqual(
+			frappe.db.count("Custom Field", {"dt": "HD Ticket", "fieldname": CREATED_LABELS_FIELD}), 1
+		)
+		self.assertEqual(len(self._instructor_article_perms()), 1)
+
+	def test_article_perm_skipped_when_doctype_missing(self):
+		"""No HD Article DocType: one permission warning, no Custom DocPerm copied or added."""
+		self._clear_article_meta_after_test()
+		frappe.db.delete("Custom DocPerm", {"parent": ARTICLE})
+		real = frappe.db.exists
+		with (
+			patch.object(
+				install.frappe.db,
+				"exists",
+				side_effect=lambda *a, **k: None if a[:2] == ("DocType", ARTICLE) else real(*a, **k),
+			),
+			patch.object(install.frappe, "logger") as logger,
+		):
+			install.ensure_setup()
+		# The source field logs its own warning (T22); this one speaks for the permission only.
+		warnings = [
+			c.args
+			for c in logger.return_value.warning.call_args_list
+			if ARTICLE in c.args[0] and "permission" in c.args[0]
+		]
+		self.assertEqual(len(warnings), 1)
+		self.assertIn("not found", warnings[0][0])
+		self.assertNotIn("source ticket field", warnings[0][0])
+		self.assertEqual(_article_custom_perms(), [])

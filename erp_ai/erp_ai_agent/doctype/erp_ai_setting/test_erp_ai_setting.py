@@ -647,6 +647,8 @@ FEAT007_NEW_FIELD_DEFAULTS = {
 	# No Singles row: get_single_value casts the absent Date to date(1, 1, 1) (see test_watermarks_start_unset).
 	"daily_report_sent_on": datetime.date(1, 1, 1),
 	"budget_alert_sent_month": "",
+	# No default either: the absent Datetime casts to datetime(1, 1, 1).
+	"agent_enabled_at": datetime.datetime(1, 1, 1),
 }
 # FEAT-007 AC-26, D-2: the expected first-response minutes of categories A-F (routing_rules.expected_sla).
 RESPONSE_TARGET_MINUTES = {"A": 15, "B": 15, "C": 60, "D": 60, "E": 60, "F": 5}
@@ -2048,3 +2050,101 @@ class TestKpiTargets(FrappeTestCase):
 				self.assertEqual(self._stored(), good)
 		self.assertEqual(self._save(kpi_targets="", coo_report_recipients="sai"), _email_error("sai"))
 		self.assertEqual(self._stored(), good)
+
+
+# FEAT-007 ADR-033 QĐ 6, AC-16: the watermarks only the system writes -> (value in DB, value typed on the form).
+WATERMARKS = {
+	"agent_enabled_at": ("2030-03-04 05:06:07", "2031-01-01 00:00:00"),
+	"daily_report_sent_on": ("2030-03-04", "2031-01-01"),
+	"budget_alert_sent_month": ("2030-02", "2031-01"),
+}
+WATERMARK_TYPES = {
+	"agent_enabled_at": "Datetime",
+	"daily_report_sent_on": "Date",
+	"budget_alert_sent_month": "Data",
+}
+ENABLED_STAMP = "2030-05-06 07:08:09"
+
+
+class TestSelfManagedFeat007(FrappeTestCase):
+	def setUp(self):
+		self.addCleanup(frappe.db.rollback)
+		keep_agent_settings(self)
+		set_agent_settings(enabled=0, trigger_keyword="@ai", **PRICES)
+
+	def _stored(self, fieldname):
+		"""The `tabSingles` value of `fieldname` as text, or None when it has no row or is NULL."""
+		raw = frappe.db.get_singles_dict(SETTING_DOCTYPE).get(fieldname)
+		return None if raw is None else str(frappe.utils.cast(WATERMARK_TYPES[fieldname], raw))
+
+	def _save_at(self, moment, **fields):
+		"""Save the setting with these fields while the clock reads `moment`."""
+		doc = frappe.get_doc(SETTING_DOCTYPE)
+		doc.update(fields)
+		with patch("frappe.utils.now_datetime", return_value=moment):
+			doc.save()
+
+	def test_agent_enabled_at_field_shape(self):
+		# design.md:97, 114: a read-only Datetime right after permission_level, with no default.
+		meta = frappe.get_meta(SETTING_DOCTYPE)
+		field = meta.get_field("agent_enabled_at")
+		self.assertIsNotNone(field, "ERP AI Setting has no agent_enabled_at field")
+		self.assertEqual((field.fieldtype, field.read_only, field.default), ("Datetime", 1, None))
+		order = [field.fieldname for field in meta.fields]
+		self.assertEqual(
+			order[order.index("section_activation") : order.index("section_permissions")],
+			["section_activation", "enabled", "permission_level", "agent_enabled_at"],
+		)
+
+	def test_watermarks_restored_on_human_save(self):
+		# Each watermark alone: a value typed on the form never replaces the one in the DB.
+		for fieldname, (in_db, typed) in WATERMARKS.items():
+			with self.subTest(fieldname=fieldname):
+				set_agent_settings(**{name: seeded for name, (seeded, _typed) in WATERMARKS.items()})
+				doc = frappe.get_doc(SETTING_DOCTYPE)
+				doc.set(fieldname, typed)
+				doc.save()
+				self.assertEqual(self._stored(fieldname), in_db)
+
+	def test_watermarks_restored_from_db_not_stale_cache(self):
+		# The value cache of get_single_value may hold an older value: the DB one must win (cache=False).
+		for fieldname, (in_db, stale) in WATERMARKS.items():
+			with self.subTest(fieldname=fieldname):
+				set_agent_settings(**{fieldname: in_db})
+				cache = frappe.db.value_cache.setdefault(SETTING_DOCTYPE, {})
+				cache[fieldname] = frappe.utils.cast(WATERMARK_TYPES[fieldname], stale)
+				frappe.get_doc(SETTING_DOCTYPE).save()
+				self.assertEqual(self._stored(fieldname), in_db)
+
+	def test_unset_watermarks_stay_unset_on_human_save(self):
+		# No value yet (the job never ran): a human save keeps neither the typed value nor a placeholder.
+		frappe.db.delete("Singles", {"doctype": SETTING_DOCTYPE, "field": ("in", list(WATERMARKS))})
+		doc = frappe.get_doc(SETTING_DOCTYPE)
+		doc.update({fieldname: typed for fieldname, (_in_db, typed) in WATERMARKS.items()})
+		doc.save()
+		for fieldname in WATERMARKS:
+			with self.subTest(fieldname=fieldname):
+				self.assertIsNone(self._stored(fieldname))
+
+	def test_agent_enabled_at_stamped_on_enable_only(self):
+		# AC-16: the stamp moves only when `enabled` goes 0 -> 1; a value typed on the same save never wins.
+		old, typed = WATERMARKS["agent_enabled_at"]
+		set_agent_settings(agent_enabled_at=old)
+		steps = (
+			("0 -> 0 keeps the old stamp", datetime.datetime(2030, 4, 1, 8), 0, old),
+			("0 -> 1 stamps the clock", datetime.datetime(2030, 5, 6, 7, 8, 9), 1, ENABLED_STAMP),
+			("1 -> 1 later keeps the stamp", datetime.datetime(2030, 6, 1, 9), 1, ENABLED_STAMP),
+			("1 -> 0 keeps the stamp", datetime.datetime(2030, 7, 1, 9), 0, ENABLED_STAMP),
+			("0 -> 1 again stamps anew", datetime.datetime(2030, 8, 1, 10), 1, "2030-08-01 10:00:00"),
+		)
+		for step, moment, enabled, expected in steps:
+			with self.subTest(step=step):
+				self._save_at(moment, enabled=enabled, agent_enabled_at=typed)
+				self.assertEqual(self._stored("agent_enabled_at"), expected)
+
+	def test_enable_compared_with_db_not_stale_cache(self):
+		# The value cache still says the agent is on, the DB says off: the save is a 0 -> 1 and stamps.
+		set_agent_settings(agent_enabled_at=WATERMARKS["agent_enabled_at"][0])
+		frappe.db.value_cache.setdefault(SETTING_DOCTYPE, {})["enabled"] = 1
+		self._save_at(datetime.datetime(2030, 5, 6, 7, 8, 9), enabled=1)
+		self.assertEqual(self._stored("agent_enabled_at"), ENABLED_STAMP)

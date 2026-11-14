@@ -35,6 +35,8 @@ SELF_MANAGED_KEY_FIELDS = (
 	"last_success_at",
 	"spent_month_usd",
 )
+# ADR-033 decision 6: the watermarks each written only by its job (frappe.db.set_single_value), never by a human.
+SELF_MANAGED_WATERMARKS = ("agent_enabled_at", "daily_report_sent_on", "budget_alert_sent_month")
 NEW_KEY_DEFAULTS = {
 	"status": KEY_STATUS_ACTIVE,
 	"paused_until": None,
@@ -126,6 +128,7 @@ class ERPAISetting(Document):
 		self.check_manuals_dir()
 		self.check_operation_people()
 		self.check_kpi_targets()
+		self.stamp_agent_enabled_at()
 
 	def on_update(self):
 		self.notify_permission_switches()
@@ -149,6 +152,11 @@ class ERPAISetting(Document):
 		self.spent_this_month_usd = frappe.db.get_single_value(
 			SETTING_DOCTYPE, "spent_this_month_usd", cache=False
 		)
+		# The raw stored values, uncached like cache=False: get_single_value would turn an unset Date/Datetime
+		# into year 1 and a save would then store that placeholder as if the job had run.
+		singles = frappe.db.get_singles_dict(SETTING_DOCTYPE)
+		for fieldname in SELF_MANAGED_WATERMARKS:
+			self.set(fieldname, singles.get(fieldname))
 		stored = {
 			row.name: row
 			for row in frappe.get_all(
@@ -167,6 +175,11 @@ class ERPAISetting(Document):
 				row.set(fieldname, saved[fieldname])
 			if human_reactivated:
 				row.update({"status": KEY_STATUS_ACTIVE, "error_count": 0, "last_error": ""})
+
+	def stamp_agent_enabled_at(self):
+		"""AC-16: `enabled` going 0 -> 1 against the DB stamps the clock; otherwise the restored value stays."""
+		if self.enabled and not frappe.db.get_single_value(SETTING_DOCTYPE, "enabled", cache=False):
+			self.agent_enabled_at = frappe.utils.now_datetime()
 
 	def check_labels(self):
 		seen = set()

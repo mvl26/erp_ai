@@ -7,6 +7,7 @@
   "section_activation",
   "enabled",
   "permission_level",
+  "agent_enabled_at",
   "section_permissions",
   "unrestricted_enabled",
   "record_tools_enabled",
@@ -109,6 +110,13 @@
    "options": "L0\nL1\nL2\nL3",
    "default": "L0",
    "description": "L0: chỉ phân loại phiếu mới, ghi vào Log, không sửa phiếu, không trả lời bình luận. L1: đọc dữ liệu, ghi phân loại hoặc gợi ý lên phiếu, đăng bình luận. L2 có công cụ như L1. L3: mức của công cụ bản ghi chung, sửa code. Mức thực tế của từng phiếu trên đường danh mục trắng không vượt Mức tối đa của đầu mục; năm quyền mở rộng tính theo ô này. Chi vượt ngân sách tháng thì tự hạ về L1 (L0 giữ nguyên)."
+  },
+  {
+   "fieldname": "agent_enabled_at",
+   "fieldtype": "Datetime",
+   "label": "Thời điểm bật agent",
+   "read_only": 1,
+   "description": "Hệ thống tự ghi thời điểm gần nhất ô Bật agent đổi từ tắt sang bật; việc quét phiếu bị lỡ chỉ xét phiếu tạo sau mốc này. Lưu khi agent đã bật thì mốc giữ nguyên; không sửa được."
   },
   {
    "fieldname": "section_permissions",
@@ -654,7 +662,7 @@
  ],
  "issingle": 1,
  "links": [],
- "modified": "2026-11-15 10:00:00.000000",
+ "modified": "2026-11-15 12:00:00.000000",
  "modified_by": "Administrator",
  "module": "ERP AI agent",
  "name": "ERP AI Setting",

@@ -6,12 +6,14 @@ import os
 import subprocess
 import time
 from collections import Counter
+from datetime import datetime, timedelta
 from unittest.mock import MagicMock, patch
 
 import frappe
 from frappe.tests.utils import FrappeTestCase
 from helpdesk.test_utils import make_ticket
 
+from erp_ai import tasks
 from erp_ai.agent import answer_delay, authority, runner
 from erp_ai.agent.agent_write_guard import allow_agent_write
 from erp_ai.agent.classification import DEFAULT_CATEGORY_MAPPING
@@ -43,6 +45,7 @@ from erp_ai.constants import (
 	LOGGER_NAME,
 	PROPOSAL_DOCTYPE,
 	ROLE_INSTRUCTOR,
+	SETTING_DOCTYPE,
 	TITLE_RUN_FAILED,
 	TITLE_WRONG_USER,
 )
@@ -2635,6 +2638,84 @@ class TestRunnerTurnUndo(RunnerTestBase):
 		self._run_commit_callbacks()
 		self.assertEqual(self.callbacks, ["after_rollback"])
 		self.assertNotIn(TURN_JOB_METHOD, self.jobs.methods)
+
+
+ALARM_USER = "runner.alarm.once@example.com"
+# The human-granted role stays in the tool's list; only the second role is the agent's change.
+ALARM_KEPT_ROLE, ALARM_ADDED_ROLE = "Blogger", "Knowledge Base Contributor"
+ALARM_SUBJECT = "Agent đã sửa bản ghi phân quyền"
+# Fixed future times, so every real ERP AI Log row of the site is older than the watermark.
+ALARM_WATERMARK = datetime(2031, 11, 15, 8, 0, 0)
+ALARM_LOGGED_AT = datetime(2031, 11, 15, 8, 10, 0)
+
+
+class TestRunnerPrivilegeAlarmEndToEnd(RunnerTestBase):
+	"""AC-14, AC-19, NFR-8: a role the runner adds through a record tool is alarmed by the daily job exactly once."""
+
+	def setUp(self):
+		super().setUp()
+		set_agent_settings(
+			permission_level="L3", code_change_enabled=1, unrestricted_enabled=0, monthly_budget_usd=1000
+		)
+		make_instructor(self)
+		self.addCleanup(frappe.clear_cache, user=ALARM_USER)
+		frappe.get_doc(
+			{
+				"doctype": "User",
+				"email": ALARM_USER,
+				"first_name": "Cảnh báo một lần",
+				"send_welcome_email": 0,
+				"roles": [{"role": ALARM_KEPT_ROLE}],
+			}
+		).insert()
+		# Rolled back with the test transaction, like every row the run and the job write here.
+		frappe.db.set_single_value(SETTING_DOCTYPE, "privilege_alert_checked_until", ALARM_WATERMARK)
+		self.send_alarm = self.enterContext(patch("erp_ai.alerts.send_alarm"))
+		self.log_error = self.enterContext(patch("frappe.log_error"))
+
+	def _roles(self):
+		return sorted(frappe.get_all("Has Role", {"parent": ALARM_USER, "parenttype": "User"}, pluck="role"))
+
+	def _permission_alarms(self, now):
+		"""Run the daily job at `now`; return the messages it sent for the permission-change condition."""
+		self.send_alarm.reset_mock()
+		tasks.check_privilege_escalation(now=now)
+		self.log_error.assert_not_called()
+		return [call.args[1] for call in self.send_alarm.call_args_list if call.args[0] == ALARM_SUBJECT]
+
+	def test_role_change_via_record_tool_alarmed_once(self):
+		self.gateway.results = [
+			tool_turn(
+				tool_use(
+					"toolu_1",
+					"api_update_record",
+					doctype="User",
+					name=ALARM_USER,
+					values={"roles": [{"role": ALARM_KEPT_ROLE}, {"role": ALARM_ADDED_ROLE}]},
+				)
+			),
+			make_model_result(),
+		]
+		with patch.object(authority, "latest_instructor", return_value=INSTRUCTOR):
+			self._run("comment_mention")
+
+		self.assertEqual(self._roles(), sorted([ALARM_KEPT_ROLE, ALARM_ADDED_ROLE]))
+		# The row the runner wrote in this run, only moved in time.
+		(entry,) = [row for row in self._entries(entry_type="reason") if row.actions]
+		self.assertEqual(
+			[(action["tool"], action["doctype"], action["ok"]) for action in json.loads(entry.actions)],
+			[("api_update_record", "User", True)],
+		)
+		frappe.db.set_value(LOG_DOCTYPE, entry.name, "creation", ALARM_LOGGED_AT, update_modified=False)
+
+		self.assertEqual(
+			self._permission_alarms(ALARM_LOGGED_AT + timedelta(hours=1)),
+			[
+				f"{ALARM_SUBJECT}: thêm role {ALARM_ADDED_ROLE} cho {ALARM_USER} "
+				f"(người ra lệnh {INSTRUCTOR}, 2031-11-15 08:10)"
+			],
+		)
+		self.assertEqual(self._permission_alarms(ALARM_LOGGED_AT + timedelta(hours=25)), [])
 
 
 # Hand-written: the tools a run with an instructor gets when no change group is granted (FEAT-001/006 set).

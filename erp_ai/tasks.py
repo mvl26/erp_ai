@@ -1,4 +1,5 @@
 import json
+from collections import Counter
 from datetime import datetime, timedelta
 
 import frappe
@@ -22,6 +23,7 @@ from erp_ai.erp_ai_agent.doctype.erp_ai_setting.erp_ai_setting import read_privi
 PERMISSION_DOCTYPES = ("Custom DocPerm", "DocPerm", "Role", "Has Role", "User Permission", "Role Profile")
 HAS_ROLE_DOCTYPE = "Has Role"
 DOCTYPE_DOCTYPE = "DocType"
+USER_DOCTYPE = "User"
 MAX_LISTED_NAMES = 5
 # Rows newer than now minus this are left for the next run: covers write_entry's insert-to-commit gap and clock skew.
 PRIVILEGE_ALERT_SETTLE_S = 300
@@ -104,11 +106,24 @@ def _is_permission_change(doctype, key: str, before: dict, after: dict) -> bool:
 	return doctype in PERMISSION_DOCTYPES and doctype != HAS_ROLE_DOCTYPE
 
 
+def _role_counts(snapshot) -> Counter:
+	return Counter(row.get("role") for row in (snapshot or {}).get("roles") or [])
+
+
+def _role_changes(user: str, key: str, before: dict, after: dict, by: str) -> list[str]:
+	"""One entry per role added to or removed from a User, by role name (D-4: kept roles get new rows on save)."""
+	old, new = _role_counts(before.get(key)), _role_counts(after.get(key))
+	added = [f"thêm role {role} cho {user} ({by})" for role in (new - old).elements()]
+	removed = [f"gỡ role {role} của {user} ({by})" for role in (old - new).elements()]
+	return added + removed
+
+
 def _privilege_changes_by_agent(lower: datetime | None, upper: datetime) -> list[str]:
 	"""One entry per successful generic write on a permission record logged in (lower, upper] (ADR-024 QĐ 1, 3.3).
 
 	Reads `reason` rows of ERP AI Log by `creation`, oldest first; no lower bound when `lower` is None.
-	A DocType write counts only when its `permissions` snapshot changed. `Has Role` rows are User changes.
+	A DocType write counts only when its `permissions` snapshot changed. `Has Role` rows are User changes: a User
+	write gives one entry per role added or removed.
 	"""
 	log = frappe.qb.DocType(LOG_DOCTYPE)
 	query = (
@@ -127,7 +142,9 @@ def _privilege_changes_by_agent(lower: datetime | None, upper: datetime) -> list
 			tool, doctype = action.get("tool"), action.get("doctype")
 			if tool not in GENERIC_WRITE_TOOLS or not action.get("ok"):
 				continue
-			if _is_permission_change(doctype, f"{tool}#{position}", before, after):
+			if doctype == USER_DOCTYPE:
+				changes.extend(_role_changes(action.get("name"), f"{tool}#{position}", before, after, by))
+			elif _is_permission_change(doctype, f"{tool}#{position}", before, after):
 				changes.append(f"{PRIVILEGE_CHANGE_VERBS[tool]} {doctype} {action.get('name')} ({by})")
 	return changes
 

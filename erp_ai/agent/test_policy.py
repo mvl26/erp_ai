@@ -11,7 +11,7 @@ from helpdesk.test_utils import make_ticket
 
 from erp_ai.agent import policy
 from erp_ai.constants import CORE_APPS, LOG_DOCTYPE, SETTING_DOCTYPE
-from erp_ai.test_utils import TempAppsRoot, set_agent_settings
+from erp_ai.test_utils import TempAppsRoot, keep_agent_settings, set_agent_settings
 
 TEAM = "Nhân sự & Hành chính"
 
@@ -346,3 +346,45 @@ class TestPolicy(FrappeTestCase):
 		self._assert_refused("onlygiven", "Không có thư mục apps/onlygiven", other)
 		self._assert_refused("onlyother", "Không có thư mục apps/onlyother", given)
 		self.assertIsNone(policy.validate_change_apps(frappe._dict(code_change_apps="onlyother"), other))
+
+
+class TestTicketContentDoctype(FrappeTestCase):
+	# ADR-034 QĐ 1: the four names of TICKET_CONTENT_DOCTYPES (T8 pins the constant itself).
+	CONSTANT_NAMES = ("HD Ticket", "Comment", "Communication", "File")
+
+	def setUp(self):
+		self.addCleanup(frappe.db.rollback)
+		keep_agent_settings(self)
+		for function in ("ticket_link_fieldnames", "is_ticket_content_doctype"):
+			self.assertTrue(callable(getattr(policy, function, None)), f"policy has no {function}()")
+		# The Custom Field erp_ai installs (test_install pins it); no test creates one (ALTER TABLE commits).
+		self.assertTrue(
+			frappe.db.exists(
+				"Custom Field", {"dt": "Task", "fieldname": "ai_ticket", "options": "HD Ticket"}
+			),
+			"Custom Field Task.ai_ticket of erp_ai is missing",
+		)
+
+	def test_constant_and_ticket_links(self):
+		# design-w0-fixes-3.md ruling 2, C-T15-2: the constant by name, any other DocType by its Link fields to
+		# HD Ticket (standard or Custom Field), always on the stored DocType name.
+		for doctype in (*self.CONSTANT_NAMES, "comment", "HD Ticket Comment", "Task", "task"):
+			with self.subTest(doctype=doctype):
+				self.assertTrue(policy.is_ticket_content_doctype(doctype))
+		for doctype in ("User", "Note", "Không có DocType này"):
+			with self.subTest(doctype=doctype):
+				self.assertFalse(policy.is_ticket_content_doctype(doctype))
+		cases = (
+			("HD Ticket Comment", ("reference_ticket",)),
+			("Task", ("ai_ticket",)),
+			("task", ("ai_ticket",)),
+			# HD Ticket links to itself (split from, merged with) but is the ticket, not a linked record.
+			("HD Ticket", ()),
+			("hd ticket", ()),
+			("Comment", ()),
+			("User", ()),
+			("Không có DocType này", ()),
+		)
+		for doctype, fieldnames in cases:
+			with self.subTest(doctype=doctype):
+				self.assertEqual(policy.ticket_link_fieldnames(doctype), fieldnames)

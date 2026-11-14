@@ -8,7 +8,7 @@ from erp_ai.agent import policy
 from erp_ai.agent.classification import validate_mapping
 from erp_ai.agent.hard_bans import hard_ban_reason
 from erp_ai.agent.routing import validate_routing_config
-from erp_ai.agent.tools import site_api, source
+from erp_ai.agent.tools import read, site_api, source
 from erp_ai.constants import (
 	ACTION_CREATE_CUSTOM_FIELD,
 	ACTION_UPDATE_FIELDS,
@@ -83,6 +83,8 @@ TICKET_FIELD_SETTINGS = (
 )
 DUE_FIELD_SETTING = "field_due_date"
 DUE_FIELD_TYPES = ("Date", "Datetime")
+# AC-49, E-6: the report types the bot may run.
+ALLOWED_REPORT_TYPES = ("Script Report", "Query Report")
 
 
 def permission_switch_fields(meta) -> list:
@@ -109,6 +111,7 @@ class ERPAISetting(Document):
 		self.check_ticket_field_names()
 		self.check_catalog_rules()
 		self.check_user_templates()
+		self.check_allowed_reports()
 		self.check_manuals_dir()
 
 	def on_update(self):
@@ -236,6 +239,16 @@ class ERPAISetting(Document):
 			if reason:
 				frappe.throw(f"Mẫu tài khoản dòng {row.idx}: {reason}")
 
+	def check_allowed_reports(self):
+		"""AC-49, ADR-034 QĐ 3: refuse the first listed report breaking an E-6 rule; blank lines are ignored."""
+		for line in (self.allowed_reports or "").splitlines():
+			typed = line.strip()
+			if not typed:
+				continue
+			reason = allowed_report_error(typed)
+			if reason:
+				frappe.throw(f"Báo cáo '{frappe.utils.escape_html(typed)}' {reason}")
+
 	def check_manuals_dir(self):
 		"""AC-47, E-7: a set manuals path, trimmed, must be an existing directory under apps/, not apps/ itself.
 
@@ -249,6 +262,21 @@ class ERPAISetting(Document):
 		if not (path and os.path.isdir(path)):
 			typed = frappe.utils.escape_html(self.manuals_dir)
 			frappe.throw(f"Kho HDSD '{typed}' phải là thư mục có sẵn dưới apps/")
+
+
+def allowed_report_error(name) -> str | None:
+	"""The E-6 reason this report may not be run by the bot, or None."""
+	report = frappe.db.get_value("Report", name, ["report_type", "disabled", "ref_doctype"], as_dict=True)
+	if not report:
+		return "không có"
+	if report.report_type not in ALLOWED_REPORT_TYPES:
+		return "phải là Script Report hoặc Query Report"
+	if report.disabled:
+		return "đang tắt"
+	ref_doctype = report.ref_doctype
+	if policy.is_ticket_content_doctype(ref_doctype) or ref_doctype in read.denied_doctypes():
+		return f"dựa trên {ref_doctype}, mang nội dung phiếu hoặc dữ liệu của app: bot không được chạy"
+	return None
 
 
 def user_template_error(row) -> str | None:

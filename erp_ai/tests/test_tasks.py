@@ -662,10 +662,22 @@ class TestCheckPrivilegeEscalation(FrappeTestCase):
 			seen_by_last_condition.append(self._watermark())
 			return []
 
+		# Take the job's commit branch without committing: the patched commit only records how many
+		# watermark writes the transaction holds at that point; the test transaction is rolled back.
+		writes_at_commit = []
+		self.addCleanup(setattr, frappe.flags, "in_test", frappe.flags.in_test)
+		frappe.flags.in_test = False
+		self.enterContext(
+			patch.object(
+				frappe.db, "commit", side_effect=lambda: writes_at_commit.append(len(watermark_writes()))
+			)
+		)
+
 		with patch.object(tasks, "_enabled_keys_without_value", side_effect=last_condition):
 			self._run()
 
 		self.assertEqual(seen_by_last_condition, [WATERMARK])
+		self.assertEqual(writes_at_commit, [1])
 		self.assertEqual(len(watermark_writes()), 1)
 		self.assertEqual(self._watermark(), UPPER)
 

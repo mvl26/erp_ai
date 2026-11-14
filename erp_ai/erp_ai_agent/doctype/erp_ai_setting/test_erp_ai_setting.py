@@ -11,7 +11,7 @@ from frappe.utils import get_datetime
 from erp_ai import constants, install
 from erp_ai.agent.classification import DEFAULT_CATEGORY_MAPPING
 from erp_ai.agent.routing import DEFAULT_ROUTING_RULES
-from erp_ai.agent.tools import read
+from erp_ai.agent.tools import read, site_api
 from erp_ai.constants import (
 	CREDENTIAL_DOCTYPE,
 	KEY_STATUS_ACTIVE,
@@ -589,7 +589,9 @@ class TestCheckKeys(FrappeTestCase):
 		self.assertNotIn("AuthenticationError", json.dumps(result))
 
 
+USER_TEMPLATE_DOCTYPE = "ERP AI User Template"
 # FEAT-007 design 2.1: default of every new ERP AI Setting field (NFR-4); one row per field as tasks add them.
+# Table fields have no Singles value: see test_catalog_starts_empty_after_install and its siblings.
 FEAT007_NEW_FIELD_DEFAULTS = {
 	"site_environment": "production",
 	"record_tools_enabled": 0,
@@ -657,6 +659,13 @@ class TestFeat007Defaults(FrappeTestCase):
 		frappe.db.delete(CATALOG_RULE_DOCTYPE, row_filters)
 		install._ensure_default_settings()
 		self.assertEqual(frappe.get_all(CATALOG_RULE_DOCTYPE, filters=row_filters), [])
+
+	def test_user_templates_start_empty_after_install(self):
+		# AC-30 (1): like catalog_rules, the templates live in the child table; install seeds no template row.
+		row_filters = {"parent": SETTING_DOCTYPE, "parentfield": "user_templates"}
+		frappe.db.delete(USER_TEMPLATE_DOCTYPE, row_filters)
+		install._ensure_default_settings()
+		self.assertEqual(frappe.get_all(USER_TEMPLATE_DOCTYPE, filters=row_filters), [])
 
 	def test_level_caps_default(self):
 		meta = frappe.get_meta(SETTING_DOCTYPE)
@@ -1107,5 +1116,152 @@ class TestCatalogRules(FrappeTestCase):
 				(constants.ACTION_UPDATE_FIELDS, "Note", "title\ncontent", "A"),
 				(constants.ACTION_CREATE_CUSTOM_FIELD, "ToDo", None, "A"),
 				(constants.ACTION_UPDATE_FIELDS, "ToDo", "description", "A"),
+			],
+		)
+
+
+USER_TEMPLATE_JSON = (
+	Path(erp_ai_setting.__file__).resolve().parent.parent
+	/ "erp_ai_user_template"
+	/ "erp_ai_user_template.json"
+)
+# AC-30 (1), spec.md:196: the six roles a template may never hold, written out once.
+SPEC_FORBIDDEN_ROLES = (
+	"System Manager",
+	"Administrator",
+	"ERP AI Instructor",
+	"ERP AI Agent",
+	"Guest",
+	"All",
+)
+# Each forbidden role with one vowel accented: tabRole's utf8mb4_unicode_ci collation still finds the real role.
+ACCENTED_FORBIDDEN_ROLES = {
+	"System Manager": "Sýstem Manager",
+	"Administrator": "Ádministrator",
+	"ERP AI Instructor": "ERP AI Ínstructor",
+	"ERP AI Agent": "ERP AI Ágent",
+	"Guest": "Gúest",
+	"All": "Áll",
+}
+# Own test data: two business roles created in setUp, rolled back afterwards.
+STOCK_ROLE = "ERP AI Test Thủ kho"
+OFFICE_ROLE = "ERP AI Test Văn phòng"
+
+
+class TestUserTemplates(FrappeTestCase):
+	def setUp(self):
+		self.addCleanup(frappe.db.rollback)
+		keep_agent_settings(self)
+		self.assertTrue(
+			frappe.db.exists("DocType", USER_TEMPLATE_DOCTYPE), "DocType ERP AI User Template is missing"
+		)
+		for role in (STOCK_ROLE, OFFICE_ROLE):
+			if not frappe.db.exists("Role", role):
+				frappe.get_doc({"doctype": "Role", "role_name": role}).insert(ignore_permissions=True)
+
+	def _save_templates(self, *rows):
+		"""Save the setting with exactly these template rows; return the error text, or None when it saved."""
+		doc = frappe.get_doc(SETTING_DOCTYPE)
+		doc.set("user_templates", [])
+		for row in rows:
+			doc.append("user_templates", row)
+		try:
+			doc.save()
+		except frappe.ValidationError as error:
+			return frappe.utils.strip_html(str(error))
+		return None
+
+	def _stored_templates(self):
+		return [
+			(row.template_name, row.roles, row.note) for row in frappe.get_doc(SETTING_DOCTYPE).user_templates
+		]
+
+	def test_child_doctype_and_field_shape(self):
+		# design.md:225 and :100: three fields; the Table sits right after catalog_rules in section_catalog.
+		doctype_json = json.loads(USER_TEMPLATE_JSON.read_text(encoding="utf-8"))
+		self.assertEqual(doctype_json["istable"], 1)
+		fields = {f["fieldname"]: f for f in doctype_json["fields"] if f["fieldtype"] != "Section Break"}
+		self.assertEqual(
+			{name: (f["fieldtype"], f.get("reqd", 0)) for name, f in fields.items()},
+			{"template_name": ("Data", 1), "roles": ("Small Text", 0), "note": ("Small Text", 0)},
+		)
+		meta = frappe.get_meta(SETTING_DOCTYPE)
+		field = meta.get_field("user_templates")
+		self.assertEqual((field.fieldtype, field.options), ("Table", USER_TEMPLATE_DOCTYPE))
+		order = [f.fieldname for f in meta.fields]
+		self.assertEqual(order[order.index("section_catalog") + 1 :][:2], ["catalog_rules", "user_templates"])
+		doc = frappe.new_doc(USER_TEMPLATE_DOCTYPE)
+		self.assertEqual(type(doc).__name__, "ERPAIUserTemplate")
+		self.assertEqual(type(doc).__bases__, (Document,))
+		self.assertEqual([name for name in vars(type(doc)) if not name.startswith("__")], [])
+
+	def test_forbidden_role_blocked(self):
+		# AC-30 (1): each of the six roles alone makes the template unsavable, also typed in another case
+		# or with an accent the database ignores (the check runs on the real role name, STD-ERR-2);
+		# a valid template stands first (decoy) so the bad row is row 2 and {idx} is pinned.
+		self.assertEqual(site_api.FORBIDDEN_ROLES, frozenset(SPEC_FORBIDDEN_ROLES))
+		self.assertEqual(set(ACCENTED_FORBIDDEN_ROLES), set(SPEC_FORBIDDEN_ROLES))
+		decoy = {"template_name": "Thủ kho", "roles": STOCK_ROLE}
+		stored_before = self._stored_templates()
+		for role in SPEC_FORBIDDEN_ROLES:
+			for typed in (role, role.upper(), ACCENTED_FORBIDDEN_ROLES[role]):
+				with self.subTest(role=typed):
+					self.assertEqual(
+						self._save_templates(
+							decoy, {"template_name": "Quản trị", "roles": f"{OFFICE_ROLE}\n{typed}"}
+						),
+						f"Mẫu tài khoản dòng 2: vai trò {role} bị cấm cho bot",
+					)
+		self.assertEqual(self._stored_templates(), stored_before)
+
+	def test_unknown_role_and_duplicate_name_blocked(self):
+		# AC-30 (1), E-5: unknown role; name duplicated regardless of case and spaces; blank name; no role.
+		decoy = {"template_name": "Thủ kho", "roles": STOCK_ROLE}
+		cases = (
+			(
+				"unknown role",
+				{"template_name": "Văn phòng", "roles": f"{OFFICE_ROLE}\nKhông Có Vai Trò Này"},
+				"không có vai trò Không Có Vai Trò Này",
+			),
+			("same name", {"template_name": "Thủ kho", "roles": OFFICE_ROLE}, "trùng tên với dòng 1"),
+			("other case", {"template_name": "THỦ KHO", "roles": OFFICE_ROLE}, "trùng tên với dòng 1"),
+			("spaces", {"template_name": "  thủ kho ", "roles": OFFICE_ROLE}, "trùng tên với dòng 1"),
+			("blank name", {"template_name": "   ", "roles": OFFICE_ROLE}, "tên mẫu không được để trống"),
+			("no role", {"template_name": "Văn phòng", "roles": None}, "cần ít nhất một vai trò"),
+			("blank lines", {"template_name": "Văn phòng", "roles": "\n  \n"}, "cần ít nhất một vai trò"),
+		)
+		stored_before = self._stored_templates()
+		for label, row, reason in cases:
+			with self.subTest(label):
+				self.assertEqual(self._save_templates(decoy, row), f"Mẫu tài khoản dòng 2: {reason}")
+		# Bad row at position 3 of 4, duplicating row 2: pins {idx} and {j} beyond the first two rows.
+		self.assertEqual(
+			self._save_templates(
+				decoy,
+				{"template_name": "Văn phòng", "roles": OFFICE_ROLE},
+				{"template_name": "VĂN PHÒNG", "roles": STOCK_ROLE},
+				{"template_name": "Kế toán", "roles": OFFICE_ROLE},
+			),
+			"Mẫu tài khoản dòng 3: trùng tên với dòng 2",
+		)
+		self.assertEqual(self._stored_templates(), stored_before)
+
+	def test_valid_template_saves(self):
+		# AC-30 (1): templates with known, allowed roles save; names differing by one letter are not duplicates;
+		# roles are stored one per line under their real name, blank lines dropped.
+		rows = (
+			{
+				"template_name": "Thủ kho",
+				"roles": f" {STOCK_ROLE} \n\n{OFFICE_ROLE.upper()}",
+				"note": "Kho chính",
+			},
+			{"template_name": "Thủ kho 2", "roles": STOCK_ROLE},
+		)
+		self.assertIsNone(self._save_templates(*rows))
+		self.assertEqual(
+			self._stored_templates(),
+			[
+				("Thủ kho", f"{STOCK_ROLE}\n{OFFICE_ROLE}", "Kho chính"),
+				("Thủ kho 2", STOCK_ROLE, None),
 			],
 		)

@@ -6,7 +6,7 @@ from erp_ai.agent import policy
 from erp_ai.agent.classification import validate_mapping
 from erp_ai.agent.hard_bans import hard_ban_reason
 from erp_ai.agent.routing import validate_routing_config
-from erp_ai.agent.tools import source
+from erp_ai.agent.tools import site_api, source
 from erp_ai.constants import (
 	ACTION_CREATE_CUSTOM_FIELD,
 	ACTION_UPDATE_FIELDS,
@@ -89,6 +89,7 @@ class ERPAISetting(Document):
 		self.check_status_settings()
 		self.check_enabled_requirements()
 		self.check_catalog_rules()
+		self.check_user_templates()
 
 	def on_update(self):
 		self.notify_permission_switches()
@@ -182,6 +183,43 @@ class ERPAISetting(Document):
 				seen[key] = row.idx
 			if reason:
 				frappe.throw(f"Danh mục dòng {row.idx}: {reason}")
+
+	def check_user_templates(self):
+		"""AC-30 (1): refuse the first account template breaking an E-5 rule."""
+		seen = {}
+		for row in self.user_templates:
+			name = (row.template_name or "").strip()
+			reason = user_template_error(row) if name else "tên mẫu không được để trống"
+			if not reason:
+				key = name.casefold()
+				if key in seen:
+					reason = f"trùng tên với dòng {seen[key]}"
+				seen[key] = row.idx
+			if reason:
+				frappe.throw(f"Mẫu tài khoản dòng {row.idx}: {reason}")
+
+
+def user_template_error(row) -> str | None:
+	"""The first E-5 role reason of this row, or None; on success the roles are stored one per line by real name.
+
+	The ban is checked on the real name too: tabRole's collation ignores case and accents, so "Gúest" finds Guest.
+	"""
+	forbidden = {role.casefold(): role for role in site_api.FORBIDDEN_ROLES}
+	roles = [line.strip() for line in (row.roles or "").splitlines() if line.strip()]
+	if not roles:
+		return "cần ít nhất một vai trò"
+	stored = []
+	for role in roles:
+		if role.casefold() in forbidden:
+			return f"vai trò {forbidden[role.casefold()]} bị cấm cho bot"
+		real = frappe.db.get_value("Role", role)
+		if not real:
+			return f"không có vai trò {role}"
+		if real in site_api.FORBIDDEN_ROLES:
+			return f"vai trò {real} bị cấm cho bot"
+		stored.append(real)
+	row.roles = "\n".join(stored)
+	return None
 
 
 def catalog_rule_error(row) -> str | None:

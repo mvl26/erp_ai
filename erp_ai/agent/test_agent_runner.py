@@ -1603,6 +1603,150 @@ class TestRunnerRecordToolValues(RunnerTestBase):
 		self.assertEqual(action["value_before"]["first_name"], "Bí mật")
 		self.assertEqual((entry.actions.count(FAKE_PASSWORD), entry.actions.count(FAKE_API_SECRET)), (0, 0))
 
+	def test_six_large_deletes_keep_one_bounded_log_row(self):
+		"""F-1 (qa's probe): one turn, six deletes whose before holds 20 fields x 200 "ế" (~12.5 KB per entry)."""
+
+		def delete_with_large_values(name, args, ctx):
+			return {
+				"ok": True,
+				"doctype": "Note",
+				"name": args["name"],
+				"value_before": large_values(),
+				"value_after": None,
+			}
+
+		names = [f"{PREFIX}large-{index}" for index in range(1, 7)]
+		self.gateway.results = [
+			tool_turn(
+				*(
+					tool_use(f"toolu_{index}", "api_delete_record", doctype="Note", name=name)
+					for index, name in enumerate(names, 1)
+				)
+			),
+			make_model_result(),
+		]
+		with (
+			patch.object(authority, "latest_instructor", return_value=INSTRUCTOR),
+			patch.object(runner, "execute_tool", side_effect=delete_with_large_values),
+		):
+			self._run("comment_mention")
+
+		rows = self._entries(entry_type="reason", turn=1)
+		self.assertEqual(len(rows), 1, [row.error for row in self._entries()])
+		self.assertLessEqual(len(rows[0].actions.encode("utf-8")), ACTIONS_BOUND)
+		actions = json.loads(rows[0].actions)
+		self.assertEqual(
+			[{key: action[key] for key in IDENTITY_KEYS} for action in actions],
+			[
+				{
+					"tool": "api_delete_record",
+					"doctype": "Note",
+					"name": name,
+					"ok": True,
+					"instructor": INSTRUCTOR,
+				}
+				for name in names
+			],
+		)
+		# ~12.5 KB each: four keep their values whole within 60000 bytes, a fifth would not fit
+		self.assertEqual([action["value_before"] for action in actions], [large_values()] * 4 + [CUT] * 2)
+		# a delete has no "after": a stripped entry must not show the marker in its place
+		self.assertEqual([action["value_after"] for action in actions], [None] * 6)
+
+
+# Hand-written (F-1): the bound of the `actions` column in bytes and the marker of a cut.
+ACTIONS_BOUND = 60000
+CUT = "[đã cắt]"
+IDENTITY_KEYS = ("tool", "doctype", "name", "ok", "instructor")
+
+
+def large_values():
+	"""20 fields x 200 "ế" (3 bytes each): the largest before/after a record tool returns, 12310 bytes as JSON."""
+	return {f"field_{index}": "ế" * 200 for index in range(20)}
+
+
+def stored_bytes(actions):
+	"""Size of `actions` as `write_entry` stores it."""
+	return len(json.dumps(actions, ensure_ascii=False).encode("utf-8"))
+
+
+class TestRunnerActionsBound(RunnerTestBase):
+	"""F-1: whatever the runner hands to `ERP AI Log.actions` fits the column; every cut is marked."""
+
+	def test_list_exactly_at_the_bound_is_stored_unchanged(self):
+		# `{"value_before": "` is 18 bytes, `"}` 2: one entry is 978 + 20 = 998, 60 entries + 59 ", " + "[]" = 60000
+		actions = [{"value_before": "a" * 978} for _ in range(60)]
+		self.assertEqual(stored_bytes(actions), 60000)
+		self.assertEqual(runner._bounded_actions(actions), actions)
+
+	def test_one_byte_over_the_bound_replaces_the_largest_values_by_the_marker(self):
+		actions = [{"value_before": "a" * 979}] + [{"value_before": "a" * 978} for _ in range(59)]
+		self.assertEqual(stored_bytes(actions), 60001)
+		bounded = runner._bounded_actions(actions)
+		self.assertEqual(bounded, [{"value_before": CUT}, *actions[1:]])
+		self.assertLessEqual(stored_bytes(bounded), ACTIONS_BOUND)
+
+	def test_value_over_its_byte_bound_is_cut_on_a_character_boundary(self):
+		# 1024 bytes per value, the marker takes 12: 1012 bytes of room hold 337 whole "ế" (1011 bytes), the
+		# 1012th byte falls inside the 338th character. 1024 ASCII bytes fit; 1025 keep 1012 + the marker.
+		action = {
+			"tool": "api_update_record",
+			"value_after": {"description": "ế" * 400, "title": "a" * 1024, "subject": "a" * 1025},
+		}
+		(bounded,) = runner._bounded_actions([action])
+		self.assertEqual(
+			bounded,
+			{
+				"tool": "api_update_record",
+				"value_after": {
+					"description": "ế" * 337 + CUT,
+					"title": "a" * 1024,
+					"subject": "a" * 1012 + CUT,
+				},
+			},
+		)
+		self.assertEqual(len(bounded["value_after"]["description"].encode("utf-8")), 1023)
+
+	def test_normal_size_entry_is_stored_uncut(self):
+		action = {
+			"tool": "api_delete_record",
+			"doctype": "Note",
+			"name": "n",
+			"ok": True,
+			"value_before": large_values(),
+			"value_after": None,
+			"instructor": INSTRUCTOR,
+		}
+		self.assertEqual(runner._bounded_actions([action]), [action])
+
+	def test_entries_that_do_not_fit_without_values_give_way_to_one_marked_entry(self):
+		# `{"name": "` is 10 bytes, `"}` 2: one entry is 100 bytes, 102 with its ", "; the closing entry
+		# `{"cut": "[đã cắt]", "dropped": 113}` is 39: 587 x 102 + 39 + "[]" = 59915, 588 entries would be 60017.
+		actions = [{"name": "n" * 88} for _ in range(700)]
+		bounded = runner._bounded_actions(actions)
+		self.assertEqual(bounded, [*actions[:587], {"cut": CUT, "dropped": 113}])
+		self.assertLessEqual(stored_bytes(bounded), ACTIONS_BOUND)
+
+	def test_route_record_bounds_the_actions_it_stores(self):
+		log_name = write_entry(
+			ticket=self.ticket.name,
+			run_id=f"{PREFIX}route",
+			entry_type="classify",
+			trigger="ticket_insert",
+			turn=0,
+		)
+		actions = [
+			{"tool": "api_delete_record", "name": f"n{index}", "value_before": large_values()}
+			for index in range(6)
+		]
+		runner._record_route(log_name, None, None, None, None, actions, [])
+		stored = frappe.db.get_value(LOG_DOCTYPE, log_name, "actions")
+		self.assertLessEqual(len(stored.encode("utf-8")), ACTIONS_BOUND)
+		self.assertEqual(
+			json.loads(stored),
+			[*actions[:4], *({**action, "value_before": CUT} for action in actions[4:])],
+		)
+
 
 # Hand-written: the tools a run with an instructor gets when no change group is granted (FEAT-001/006 set).
 BASE_TOOL_NAMES_WITH_INSTRUCTOR = [

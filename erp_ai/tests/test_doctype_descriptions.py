@@ -23,7 +23,7 @@ VIETNAMESE_ACCENTS = re.compile(
 DOCTYPE_CONFIG = {
 	"ERP AI Setting": {
 		"folder": "erp_ai_setting",
-		"field_count": 28,
+		"field_count": 31,
 		"phrases": {
 			"enabled": ("Tắt", "4 đơn giá", "từ khóa kích hoạt"),
 			"permission_level": ("L0", "L1", "L2", "L3", "ngân sách"),
@@ -36,6 +36,24 @@ DOCTYPE_CONFIG = {
 				"mật khẩu",
 				"Log",
 				"cần gấp",
+				"vượt ngân sách",
+				"gọi hàm",
+				"cố gắng",
+			),
+			"record_tools_enabled": (
+				"L3",
+				"người ra lệnh",
+				"không qua duyệt",
+				"danh mục trắng",
+				"Log",
+				"Sau cập nhật",
+			),
+			"act_now_enabled": ("người ra lệnh", "không hỏi lại", "ngưỡng độ tin cậy", "Không thêm công cụ"),
+			"one_click_approval_enabled": (
+				"một lần bấm",
+				"không hộp xác nhận",
+				"chuyển tiếp",
+				"liên kết cũ",
 			),
 			"site_environment": ("production", "site test", "không bị chặn"),
 			"max_turns_per_run": ("từ 1 đến 20", "dừng"),
@@ -76,6 +94,7 @@ DOCTYPE_CONFIG = {
 				"commit git local",
 				"không push",
 				"Tắt",
+				"không còn mở công cụ bản ghi",
 			),
 			"code_change_apps": (
 				"Mỗi dòng",
@@ -90,12 +109,12 @@ DOCTYPE_CONFIG = {
 		"read_only_fields": ("spent_this_month_usd",),
 		"sections": (
 			("section_activation", "Bật và mức quyền", "enabled"),
-			("section_permissions", "Năm quyền mở rộng (mặc định tắt)", "site_environment"),
+			("section_permissions", "Năm quyền mở rộng (mặc định tắt)", "unrestricted_enabled"),
 			("section_limits", "Giới hạn mỗi lần chạy", "max_turns_per_run"),
 			("section_budget", "Ngân sách và đơn giá", "monthly_budget_usd"),
 			("section_model", "Model, từ khóa và chỉ báo trả lời", "model_classify_default"),
 			("section_routing", "Phân loại và nhóm loại trừ", "excluded_teams"),
-			("section_code_change", "Sửa code và lệnh bench", "code_change_enabled"),
+			("section_code_change", "Sửa code và lệnh bench", "code_change_apps"),
 			("section_alerts", "Cảnh báo và khóa API", "alert_recipients"),
 		),
 	},
@@ -268,10 +287,11 @@ CODE_CHANGE_FIELDS = {
 		"fieldtype": "Check",
 		"label": "Cho phép sửa code và lệnh bench",
 		"default": "0",
-		"description": "Bật thì ở mức L3 và khi có người ra lệnh, bot được: (1) tạo và sửa bản ghi trực tiếp theo "
-		"quyền của tài khoản agent, không qua duyệt (không xóa, không submit, không gán vai trò quản trị); "
-		"(2) đề xuất sửa code và lệnh bench, mọi thay đổi code phải được duyệt trên form đề xuất. "
-		"Mỗi thay đổi code đã áp dụng thành một commit git local; bot không push. Tắt thì bot trở lại như cũ.",
+		# FEAT-007 design.md:162: the switch no longer opens the record tools (record_tools_enabled does).
+		"description": "Sửa code và lệnh bench. Bật thì ở L3 và khi có người ra lệnh, bot đề xuất sửa file, "
+		"tạo file, lệnh bench; mọi thay đổi phải được duyệt bởi ERP AI Instructor trên form đề xuất. "
+		"Mỗi thay đổi đã áp dụng là một commit git local; bot không push. "
+		"Ô này không còn mở công cụ bản ghi. Tắt thì bot không có ba công cụ đó.",
 	},
 	"code_change_apps": {
 		"fieldtype": "Small Text",
@@ -286,6 +306,11 @@ CODE_CHANGE_FIELDS = {
 
 # Wordings that contradicted the code that writes the field (T5 review round 1).
 FORBIDDEN_PHRASES = {
+	# FEAT-007 design.md:162, 184: record tools moved from the code-change switch to their own switch.
+	"ERP AI Setting": {
+		"permission_level": ("ô Cho phép sửa code",),
+		"code_change_enabled": ("tạo và sửa bản ghi trực tiếp",),
+	},
 	"ERP AI Log": {
 		"instructor": ("người ra lệnh", "khi phiếu mới tạo"),
 		"tools_called": ("lần chạy này",),
@@ -435,14 +460,22 @@ class TestDoctypeDescriptions(FrappeTestCase):
 		doctype_json = load_doctype(DOCTYPE_CONFIG["ERP AI Setting"])
 		order = doctype_json["field_order"]
 		start = order.index("prompt_digest")
+		# FEAT-007 design.md:98, 106 (NFR-8): the switch moved to section_permissions; the block keeps the app list.
 		self.assertEqual(
-			order[start : start + 5],
+			order[start : start + 4],
+			["prompt_digest", "section_code_change", "code_change_apps", "section_alerts"],
+		)
+		start = order.index("section_permissions")
+		self.assertEqual(
+			order[start : start + 7],
 			[
-				"prompt_digest",
-				"section_code_change",
+				"section_permissions",
+				"unrestricted_enabled",
+				"record_tools_enabled",
+				"act_now_enabled",
 				"code_change_enabled",
-				"code_change_apps",
-				"section_alerts",
+				"one_click_approval_enabled",
+				"site_environment",
 			],
 		)
 		self.assertLess(order.index("routing_rules"), order.index("section_code_change"))

@@ -588,6 +588,9 @@ class TestCheckKeys(FrappeTestCase):
 # FEAT-007 design 2.1: default of every new ERP AI Setting field (NFR-4); one row per field as tasks add them.
 FEAT007_NEW_FIELD_DEFAULTS = {
 	"site_environment": "production",
+	"record_tools_enabled": 0,
+	"act_now_enabled": 0,
+	"one_click_approval_enabled": 0,
 }
 
 

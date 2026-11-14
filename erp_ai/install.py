@@ -102,6 +102,14 @@ def _ensure_default_settings() -> None:
 		)
 		if not stored or stored[0][0] is None:
 			frappe.db.set_single_value(SETTING_DOCTYPE, fieldname, default)
+	# A site enabled before the upgrade gets its enable mark once (AC-16, ADR-006); absent, NULL or "" is missing.
+	enabled_at = frappe.db.sql(
+		"select value from `tabSingles` where doctype=%s and field='agent_enabled_at'", SETTING_DOCTYPE
+	)
+	if frappe.db.get_single_value(SETTING_DOCTYPE, "enabled", cache=False) and not (
+		enabled_at and enabled_at[0][0]
+	):
+		frappe.db.set_single_value(SETTING_DOCTYPE, "agent_enabled_at", frappe.utils.now_datetime())
 
 
 def _ensure_ticket_custom_fields() -> None:

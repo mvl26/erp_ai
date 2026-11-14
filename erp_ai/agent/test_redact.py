@@ -260,6 +260,32 @@ class TestRedact(FrappeTestCase):
 	def test_secret_key_without_value_untouched(self):
 		self.assertEqual(redact.redact_secrets("api_key= , pwd=fake-e"), f"api_key= , pwd={MASK}")
 
+	def test_list_separator_inside_bare_value_masked(self):
+		# K-4: `,` `;` `&` not followed by end of text, whitespace or a key candidate belong to the value.
+		cases = (
+			("password=ab&cd", f"password={MASK}"),
+			("password=ab&amp;cd", f"password={MASK}"),
+			("pwd=ab;cd", f"pwd={MASK}"),
+			("pwd=ab,cd", f"pwd={MASK}"),
+			("password=ab&cd tiếp", f"password={MASK} tiếp"),
+		)
+		for text, expected in cases:
+			with self.subTest(text=text):
+				self.assertEqual(redact.redact_secrets(text), expected)
+
+	def test_list_separator_before_next_key_ends_value(self):
+		# K-4 (a)-(c): the separator ends the value before end of text, whitespace or the next key.
+		cases = (
+			("token=abc&page=2", f"token={MASK}&page=2"),
+			("api_key=x;pwd=y", f"api_key={MASK};pwd={MASK}"),
+			("password=abc;", f"password={MASK};"),
+			("password=abc, tiếp", f"password={MASK}, tiếp"),
+			("api_key= , pwd=x", f"api_key= , pwd={MASK}"),
+		)
+		for text, expected in cases:
+			with self.subTest(text=text):
+				self.assertEqual(redact.redact_secrets(text), expected)
+
 	def test_single_quoted_value_masked(self):
 		self.assertEqual(redact.redact_secrets("password='fake value 11'"), f"password='{MASK}'")
 

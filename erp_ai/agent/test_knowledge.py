@@ -247,6 +247,18 @@ class TestSearchKb(KnowledgeCase):
 		for part in ("fake-ab", "cdkb", "fakekbabcdef", "0123456789"):
 			self.assertNotIn(part, row["excerpt"])
 
+	def test_excerpt_password_with_ampersand_masked(self):
+		word = _word()
+		# The editor stores `&` as `&amp;`; the excerpt is masked without decoding the entity (K-4).
+		self._article(f"<p>{word} mật khẩu: fakepw&amp;tailFAKE</p>")
+
+		[row] = knowledge.search_kb_articles(word, 5)
+
+		self.assertIn(word, row["excerpt"])
+		self.assertIn("[đã che]", row["excerpt"])
+		self.assertNotIn("fakepw", row["excerpt"])
+		self.assertNotIn("tailFAKE", row["excerpt"])
+
 	def _raw_excerpt(self, content, query):
 		"""Excerpt of one row whose content is this raw HTML (the editor's sanitizer would rewrite the tags)."""
 		row = frappe._dict(name="raw", title="", content=content, modified="2025-01-01 00:00:00")

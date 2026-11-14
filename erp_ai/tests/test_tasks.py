@@ -556,6 +556,116 @@ class TestCheckPrivilegeEscalation(FrappeTestCase):
 					self._changes(lower=None),
 				)
 
+	def _watermark(self):
+		return erp_ai_setting.read_privilege_watermark()
+
+	def _spy_changes(self):
+		"""Record the entries the permission condition finds on each job run (the real function still runs)."""
+		found = []
+		real = tasks._privilege_changes_by_agent
+
+		def spy(lower, upper):
+			found.append(real(lower, upper))
+			return found[-1]
+
+		self.enterContext(patch.object(tasks, "_privilege_changes_by_agent", side_effect=spy))
+		return found
+
+	def _watermark_writes(self):
+		"""Every `set_single_value` call on the watermark field, whoever makes it."""
+		real = frappe.db.set_single_value
+		writes = self.enterContext(patch.object(frappe.db, "set_single_value", wraps=real))
+		return lambda: [c for c in writes.call_args_list if c.args[1:2] == ("privilege_alert_checked_until",)]
+
+	def _listed(self, entries, profile):
+		return [entry for entry in entries if entry.startswith(f"tạo Role Profile {profile} ")]
+
+	def test_change_alarmed_on_next_run_only(self):
+		found = self._spy_changes()
+		profile = self._create_profile("T11 sau 1 giờ")
+		first, second = SEEDED_AT + timedelta(hours=1), SEEDED_AT + timedelta(hours=25)
+
+		tasks.check_privilege_escalation(now=first)
+		self.assertEqual(self._watermark(), first - timedelta(seconds=300))
+		self.assertIn(profile, self._permission_alarm())
+		self.send_alarm.reset_mock()
+		tasks.check_privilege_escalation(now=second)
+
+		self.log_error.assert_not_called()
+		self.assertEqual([len(self._listed(entries, profile)) for entries in found], [1, 0])
+		self.assertEqual(self._watermark(), second - timedelta(seconds=300))
+		self.send_alarm.assert_not_called()
+
+	def test_change_after_two_missed_runs_alarmed_once(self):
+		found = self._spy_changes()
+		profile = self._create_profile("T11 lỡ hai lần")
+		late, next_run = SEEDED_AT + timedelta(hours=49), SEEDED_AT + timedelta(hours=73)
+
+		tasks.check_privilege_escalation(now=late)
+		tasks.check_privilege_escalation(now=next_run)
+
+		self.log_error.assert_not_called()
+		self.assertEqual([len(self._listed(entries, profile)) for entries in found], [1, 0])
+		self.assertEqual(self._watermark(), next_run - timedelta(seconds=300))
+
+	def test_change_before_rollout_alarmed_on_first_run_only(self):
+		profile = self._create_profile("T11 trước triển khai", at=datetime(2030, 11, 15, 9, 0, 0))
+		self._set_raw_watermark(None)
+		found = self._spy_changes()
+
+		self._run()
+		self.assertEqual(self._watermark(), UPPER)
+		tasks.check_privilege_escalation(now=RUN_AT + timedelta(days=1))
+
+		self.log_error.assert_not_called()
+		self.assertEqual([len(self._listed(entries, profile)) for entries in found], [1, 0])
+		self.assertEqual(self._watermark(), UPPER + timedelta(days=1))
+
+	def test_change_inside_settle_margin_waits_for_next_run(self):
+		found = self._spy_changes()
+		at_lower = self._create_profile("T11 bằng mốc", at=WATERMARK)
+		at_upper = self._create_profile("T11 bằng cận trên", at=UPPER)
+		settling = self._create_profile("T11 đang lắng", at=UPPER + timedelta(seconds=1))
+		next_run = RUN_AT + timedelta(days=1)
+
+		self._run()
+		tasks.check_privilege_escalation(now=next_run)
+
+		self.log_error.assert_not_called()
+		self.assertEqual(
+			[[len(self._listed(entries, p)) for p in (at_lower, at_upper, settling)] for entries in found],
+			[[0, 1, 0], [0, 0, 1]],
+		)
+		self.assertEqual(self._watermark(), next_run - timedelta(seconds=300))
+
+	def test_upper_not_after_watermark_keeps_it(self):
+		self._create_profile("T11 trước mốc", at=WATERMARK - timedelta(minutes=1))
+		watermark_writes = self._watermark_writes()
+
+		for now in (WATERMARK + timedelta(seconds=300), WATERMARK):
+			with self.subTest(now=now):
+				tasks.check_privilege_escalation(now=now)
+
+				self.log_error.assert_not_called()
+				self.send_alarm.assert_not_called()
+				self.assertEqual(watermark_writes(), [])
+				self.assertEqual(self._watermark(), WATERMARK)
+
+	def test_watermark_written_once_after_all_conditions(self):
+		watermark_writes = self._watermark_writes()
+		seen_by_last_condition = []
+
+		def last_condition():
+			seen_by_last_condition.append(self._watermark())
+			return []
+
+		with patch.object(tasks, "_enabled_keys_without_value", side_effect=last_condition):
+			self._run()
+
+		self.assertEqual(seen_by_last_condition, [WATERMARK])
+		self.assertEqual(len(watermark_writes()), 1)
+		self.assertEqual(self._watermark(), UPPER)
+
 	def test_doctype_write_without_permissions_change_not_listed(self):
 		perms = [{"role": "Desk User", "read": 1}]
 		self._log_row(
@@ -761,10 +871,11 @@ class TestCheckPrivilegeEscalation(FrappeTestCase):
 	def test_admin_items_first_each_group_by_time(self):
 		# Rows built by hand so one action can remove an admin role and add an ordinary one.
 		ordinary_a, ordinary_b = self._test_role("A"), self._test_role("B")
+		# The earlier admin item sorts later alphabetically ("thêm" after "gỡ"): only `creation` order puts it first.
 		for at, user, old, new in (
 			(datetime(2031, 11, 15, 8, 11, 0), "u1", [], [ordinary_a]),
-			(datetime(2031, 11, 15, 8, 12, 0), "u2", ["System Manager"], [ordinary_b]),
-			(datetime(2031, 11, 15, 8, 14, 0), "u3", [], [ROLE_AGENT]),
+			(datetime(2031, 11, 15, 8, 12, 0), "u2", [], [ROLE_AGENT]),
+			(datetime(2031, 11, 15, 8, 14, 0), "u3", ["System Manager"], [ordinary_b]),
 		):
 			self._log_row(
 				[_hand_action("api_update_record", "User", user)],
@@ -782,13 +893,13 @@ class TestCheckPrivilegeEscalation(FrappeTestCase):
 		self.assertEqual(
 			self._changes(),
 			[
-				"[QUẢN TRỊ] gỡ role System Manager của u2 "
+				f"[QUẢN TRỊ] thêm role {ROLE_AGENT} cho u2 "
 				"(người ra lệnh erpai-tasks-boss@example.invalid, 2031-11-15 08:12)",
-				f"[QUẢN TRỊ] thêm role {ROLE_AGENT} cho u3 "
+				"[QUẢN TRỊ] gỡ role System Manager của u3 "
 				"(người ra lệnh erpai-tasks-boss@example.invalid, 2031-11-15 08:14)",
 				"thêm role ERPAI-TEST vai A cho u1 (người ra lệnh erpai-tasks-boss@example.invalid, 2031-11-15 08:11)",
-				"thêm role ERPAI-TEST vai B cho u2 (người ra lệnh erpai-tasks-boss@example.invalid, 2031-11-15 08:12)",
 				"tạo Role Profile p (người ra lệnh erpai-tasks-boss@example.invalid, 2031-11-15 08:13)",
+				"thêm role ERPAI-TEST vai B cho u3 (người ra lệnh erpai-tasks-boss@example.invalid, 2031-11-15 08:14)",
 			],
 		)
 

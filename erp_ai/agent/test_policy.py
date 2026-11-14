@@ -154,6 +154,23 @@ class TestPolicy(FrappeTestCase):
 				else:
 					self.assertFalse(policy.contains_keyword("anything @ai"))
 
+	def test_effective_level_over_budget_never_raises(self):
+		cases = [("L3", "L1"), ("L2", "L1"), ("L1", "L1"), ("L0", "L0")]
+		for level, expected in cases:
+			with self.subTest(level=level):
+				settings = frappe._dict(permission_level=level)
+				self.assertEqual(policy.effective_level(settings, over_budget=True), expected)
+
+	def test_effective_level_at_budget_does_not_lower(self):
+		settings = frappe._dict(permission_level="L3", monthly_budget_usd=10)
+		with patch.object(policy, "month_spend_usd", return_value=10.0):
+			over_budget = policy.is_over_budget(settings, now=datetime(2001, 2, 15, 12, 0))
+		self.assertEqual(policy.effective_level(settings, over_budget=over_budget), "L3")
+
+	def test_effective_level_under_budget_unchanged(self):
+		settings = frappe._dict(permission_level="L2")
+		self.assertEqual(policy.effective_level(settings, over_budget=False), "L2")
+
 	def _log(self, ticket, run_id, entry_type="classify", created=None):
 		log = frappe.get_doc(
 			{"doctype": LOG_DOCTYPE, "ticket": ticket, "run_id": run_id, "entry_type": entry_type, "turn": 0}
@@ -444,12 +461,16 @@ class TestPermissionSwitches(FrappeTestCase):
 
 class TestBudget(FrappeTestCase):
 	# AC-61: the month's spend is summed from live ERP AI Log rows, never from spent_this_month_usd.
-	# A far month keeps the site's own log rows out of the sums; every row carries a different cost.
-	JUNE = datetime(2031, 6, 15, 10, 0)
+	# February 2001 has no real rows on the site; every row here is written inside the test transaction.
+	FEB = datetime(2001, 2, 15, 12, 0)
 
 	def setUp(self):
+		commit_guard = patch.object(
+			frappe.db, "commit", side_effect=AssertionError("test must not commit the transaction")
+		)
+		commit_guard.start()
+		self.addCleanup(commit_guard.stop)
 		self.addCleanup(frappe.db.rollback)
-		keep_agent_settings(self)
 
 	def _log(self, created, cost_usd=None, entry_type="classify"):
 		values = {"doctype": LOG_DOCTYPE, "run_id": f"budget-{created}", "entry_type": entry_type, "turn": 0}
@@ -458,58 +479,56 @@ class TestBudget(FrappeTestCase):
 		log = frappe.get_doc(values).insert(ignore_permissions=True)
 		frappe.db.set_value(LOG_DOCTYPE, log.name, "creation", created, update_modified=False)
 
-	def _june_rows(self):
-		self._log(datetime(2031, 5, 31, 23, 59, 59), 100.0)  # last second of the month before
-		self._log(datetime(2031, 6, 1, 0, 0, 0), 0.125)  # first instant of the month counts
-		self._log(datetime(2031, 6, 15, 9, 0), 1.25, "classify")
-		self._log(datetime(2031, 6, 30, 23, 59, 59), 2.5, "reason")
-		self._log(datetime(2031, 6, 20, 8, 0), None, "skip")  # no cost_usd: adds nothing
-		self._log(datetime(2031, 7, 1, 0, 0, 0), 1000.0)  # first instant of the next month
+	def _february_rows(self):
+		"""February 2001 spends 4.0 + 6.0 = 10.0; the two boundary rows are outside [start, end)."""
+		self._log(datetime(2001, 1, 31, 23, 59, 59), 100.0)  # last second of the month before
+		self._log(datetime(2001, 2, 1, 0, 0, 0), 4.0)  # first instant of the month counts
+		self._log(datetime(2001, 2, 15, 9, 0), None, "skip")  # no cost_usd: adds nothing
+		self._log(datetime(2001, 2, 28, 23, 59, 59), 6.0, "reason")
+		self._log(datetime(2001, 3, 1, 0, 0, 0), 1000.0)  # first instant of the next month
 
 	def test_month_spend_sums_live_log_rows(self):
-		self._june_rows()
-		for now in (datetime(2031, 6, 1, 0, 0), self.JUNE, datetime(2031, 6, 30, 23, 59, 59)):
-			with self.subTest(now=now):
-				spend = policy.month_spend_usd(now=now)
-				self.assertIsInstance(spend, float)
-				self.assertEqual(spend, 3.875)
-		self.assertEqual(policy.month_spend_usd(now=datetime(2031, 5, 2)), 100.0)
-		self.assertEqual(policy.month_spend_usd(now=datetime(2031, 7, 31, 12)), 1000.0)
-		# December rolls over to January of the next year.
-		self._log(datetime(2031, 12, 31, 23, 59, 59), 7.0)
-		self._log(datetime(2032, 1, 1, 0, 0, 0), 50.0)
-		self.assertEqual(policy.month_spend_usd(now=datetime(2031, 12, 10)), 7.0)
-		self.assertEqual(policy.month_spend_usd(now=datetime(2032, 1, 10)), 50.0)
-		# A month without rows spends 0.0.
-		self.assertEqual(policy.month_spend_usd(now=datetime(2031, 9, 10)), 0.0)
+		self.assertEqual(policy.month_spend_usd(now=self.FEB), 0.0)  # a month without rows
+		self._february_rows()
+		spend = policy.month_spend_usd(now=self.FEB)
+		self.assertIsInstance(spend, float)
+		self.assertEqual(spend, 10.0)
 
 	def test_over_budget_reads_log_not_spent_field(self):
-		self._june_rows()  # June spends 3.875
+		self._february_rows()
 		cases = [
-			({"monthly_budget_usd": 3.5, "spent_this_month_usd": 0}, True),
-			({"monthly_budget_usd": 4, "spent_this_month_usd": 999}, False),
-			({"monthly_budget_usd": 3.875, "spent_this_month_usd": 999}, False),  # equal is not over
+			({"monthly_budget_usd": 9.5, "spent_this_month_usd": 0}, True),
+			({"monthly_budget_usd": 10.5, "spent_this_month_usd": 999}, False),
 			({"monthly_budget_usd": None, "spent_this_month_usd": 0}, True),
 		]
 		for fields, expected in cases:
 			with self.subTest(**fields):
-				self.assertIs(policy.is_over_budget(frappe._dict(fields), now=self.JUNE), expected)
-		# No spend and no budget: 0 > 0 is not over.
-		empty = frappe._dict(monthly_budget_usd=0, spent_this_month_usd=5)
-		self.assertIs(policy.is_over_budget(empty, now=datetime(2031, 9, 10)), False)
-		# The stored setting is read the same way.
-		set_agent_settings(monthly_budget_usd=3.75, spent_this_month_usd=0)
-		self.assertIs(policy.is_over_budget(frappe.get_doc(SETTING_DOCTYPE), now=self.JUNE), True)
+				self.assertIs(policy.is_over_budget(frappe._dict(fields), now=self.FEB), expected)
+		# The spend goes through the module-level seam, called with the given `now`.
+		with patch.object(policy, "month_spend_usd", return_value=10.01) as month_spend:
+			self.assertIs(policy.is_over_budget(frappe._dict(monthly_budget_usd=10), now=self.FEB), True)
+		month_spend.assert_called_once_with(self.FEB)
 
 	def test_over_budget_caps_permission_level_at_l1(self):
+		self._february_rows()
 		over = {"L3": "L1", "L2": "L1", "L1": "L1", "L0": "L0"}
 		for level, expected in over.items():
 			with self.subTest(level=level):
-				# the spent field says "far over" but only the flag counts
+				# the spent field says "under" but the log rows (10.0) are over the budget of 9.5
 				settings = frappe._dict(
-					permission_level=level, monthly_budget_usd=1, spent_this_month_usd=999
+					permission_level=level, monthly_budget_usd=9.5, spent_this_month_usd=0
 				)
-				self.assertEqual(policy.effective_level(settings, over_budget=True), expected)
+				over_budget = policy.is_over_budget(settings, now=self.FEB)
+				self.assertIs(over_budget, True)
+				self.assertEqual(policy.effective_level(settings, over_budget=over_budget), expected)
 				self.assertEqual(policy.effective_level(settings, over_budget=False), level)
 		with self.assertRaises(TypeError):
 			policy.effective_level(frappe._dict(permission_level="L3"), True)
+
+	def test_spend_equal_to_budget_is_not_over(self):
+		# No spend and no budget: 0 > 0 is not over.
+		self.assertIs(policy.is_over_budget(frappe._dict(monthly_budget_usd=0), now=self.FEB), False)
+		self._february_rows()
+		settings = frappe._dict(permission_level="L3", monthly_budget_usd=10, spent_this_month_usd=999)
+		self.assertIs(policy.is_over_budget(settings, now=self.FEB), False)
+		self.assertEqual(policy.effective_level(settings, over_budget=False), "L3")

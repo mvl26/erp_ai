@@ -1,5 +1,6 @@
 import ast
 import inspect
+import os
 import unicodedata
 from unittest.mock import patch
 
@@ -7,7 +8,7 @@ import frappe
 from frappe.tests.utils import FrappeTestCase
 
 from erp_ai.agent import knowledge
-from erp_ai.test_utils import keep_agent_settings, make_active_agent
+from erp_ai.test_utils import TempAppsRoot, keep_agent_settings, make_active_agent, set_agent_settings
 
 EMPTY_QUERY = "Câu tìm cần ít nhất một từ dài 2 ký tự"
 
@@ -300,3 +301,175 @@ class TestSearchKb(KnowledgeCase):
 
 		self.assertIn(frappe.db.get_value("HD Article", name, "title"), row["excerpt"])
 		self.assertIn(f"Cách xử lý {word}", row["excerpt"])
+
+
+class TestManuals(FrappeTestCase):
+	"""AC-47 (`design.md:491`): sections of the `.md` files in the manuals directory, ranked like the KB search."""
+
+	def setUp(self):
+		self.addCleanup(frappe.db.rollback)
+		keep_agent_settings(self)
+		self.sandbox = TempAppsRoot(self, apps=("myapp",))
+		set_agent_settings(manuals_dir="myapp/docs")
+
+	def _manual(self, rel, text):
+		return self.sandbox.write(os.path.join("myapp", "docs", rel), text)
+
+	def _search(self, query, limit=10, manuals_dir="myapp/docs", **kwargs):
+		return knowledge.search_manuals(query, limit, manuals_dir, **kwargs)
+
+	def _found(self, query, **kwargs):
+		return [(row["document"], row["line"]) for row in self._search(query, **kwargs)]
+
+	def test_match_returns_document_heading_line(self):
+		word = _word("mn")
+		self._manual("sub/hdsd.md", f"Lời mở đầu\n# Đăng nhập\nnội dung\n## Lỗi in\ndòng {word}\n")
+
+		self.assertEqual(
+			self._search(word),
+			[
+				{
+					"document": "sub/hdsd.md",
+					"heading": "Lỗi in",
+					"line": 4,
+					"excerpt": f"## Lỗi in\ndòng {word}",
+				}
+			],
+		)
+
+	def test_no_match_empty(self):
+		self._manual("hdsd.md", "# Đăng nhập\nnội dung\n")
+
+		self.assertEqual(self._search(_word("mn")), [])
+
+	def test_unconfigured_none(self):
+		self._manual("hdsd.md", "# Đăng nhập\nnội dung\n")
+		for value in ("", "   ", None):
+			with self.subTest(manuals_dir=value):
+				self.assertIsNone(self._search("đăng nhập", manuals_dir=value))
+
+	def test_empty_query_refused(self):
+		for query in ("", "a b", None):
+			with self.subTest(query=query):
+				with self.assertRaises(frappe.ValidationError) as caught:
+					self._search(query)
+				self.assertIn(EMPTY_QUERY, str(caught.exception))
+
+	def test_sections_cut_at_hash_lines(self):
+		one, two = _word("mn"), _word("mn")
+		self._manual(
+			"hdsd.md",
+			f"# Phần một\n{one}\n# Phần hai\n{two}\n#Không cách\n{one} {two}\n  # thụt lề không phải mục\n",
+		)
+
+		rows = self._search(f"{one} {two}")
+
+		self.assertEqual(
+			[(row["heading"], row["line"]) for row in rows],
+			[
+				("Không cách", 5),
+				("Phần một", 1),
+				("Phần hai", 3),
+			],
+		)
+		self.assertEqual(rows[1]["excerpt"], f"# Phần một\n{one}")
+		self.assertNotIn(two, rows[1]["excerpt"])
+		self.assertIn("thụt lề", rows[0]["excerpt"])
+
+	def test_text_before_first_heading(self):
+		word = _word("mn")
+		self._manual("hdsd.md", f"Giới thiệu {word}\n# Mục\nkhác\n")
+
+		self.assertEqual(
+			self._search(word),
+			[{"document": "hdsd.md", "heading": "", "line": 1, "excerpt": f"Giới thiệu {word}"}],
+		)
+
+	def test_rank_by_matched_words_then_heading_matches(self):
+		one, two = _word("mn"), _word("mn")
+		self._manual("a.md", f"# Mục\n{one}\n")
+		self._manual("b.md", f"# Mục\n{one} {two}\n")
+		self._manual("c.md", f"# {one}\n{two}\n")
+
+		self.assertEqual(self._found(f"{one} {two}"), [("c.md", 1), ("b.md", 1), ("a.md", 1)])
+
+	def test_limit(self):
+		word = _word("mn")
+		for name in ("a.md", "b.md", "c.md"):
+			self._manual(name, f"# Mục\n{word}\n")
+
+		self.assertEqual(self._found(word, limit=2), [("a.md", 1), ("b.md", 1)])
+		self.assertEqual(len(self._search(word, limit=3)), 3)
+
+	def test_only_md_files_inside_the_manuals_dir(self):
+		word = _word("mn")
+		self._manual("hdsd.md", f"# Mục\n{word}\n")
+		self._manual("ghi-chu.txt", f"# Mục\n{word}\n")
+		self.sandbox.write("myapp/khac.md", f"# Mục\n{word}\n")
+		self.sandbox.write("plain.md", f"# Mục\n{word}\n", root=self.sandbox.outside)
+		os.symlink(
+			os.path.join(self.sandbox.outside, "plain.md"),
+			os.path.join(self.sandbox.root, "myapp", "docs", "link.md"),
+		)
+		os.symlink(self.sandbox.outside, os.path.join(self.sandbox.root, "myapp", "docs", "dir_out"))
+
+		self.assertEqual(self._found(word), [("hdsd.md", 1)])
+
+	def test_dir_other_than_configured_or_outside_root_finds_nothing(self):
+		word = _word("mn")
+		self._manual("hdsd.md", f"# Mục\n{word}\n")
+		self.sandbox.write("plain.md", f"# Mục\n{word}\n", root=self.sandbox.outside)
+
+		for value in ("myapp", "../outside", self.sandbox.outside, "myapp/docs/../../myapp"):
+			with self.subTest(manuals_dir=value):
+				self.assertEqual(self._search(word, manuals_dir=value), [])
+		self.assertEqual(self._found(word, manuals_dir=" myapp/docs/ "), [("hdsd.md", 1)])
+
+	def test_at_most_max_files_scanned(self):
+		self.assertEqual(knowledge.MANUALS_MAX_FILES, 500)
+		word = _word("mn")
+		for name in ("a.md", "b.md", "c.md"):
+			self._manual(name, f"# Mục\n{word}\n")
+
+		with patch.object(knowledge, "MANUALS_MAX_FILES", 2):
+			self.assertEqual(self._found(word), [("a.md", 1), ("b.md", 1)])
+
+	def test_file_over_one_mib_skipped(self):
+		self.assertEqual(knowledge.MANUALS_FILE_MAX_BYTES, 1024 * 1024)
+		word = _word("mn")
+		head = f"# Mục\n{word}\n"
+		self._manual("a_vua.md", head + "x" * (1024 * 1024 - len(head.encode())))
+		self._manual("b_qua.md", head + "x" * (1024 * 1024 - len(head.encode()) + 1))
+
+		self.assertEqual(self._found(word), [("a_vua.md", 1)])
+
+	def test_time_budget(self):
+		self.assertEqual(knowledge.MANUALS_BUDGET_S, 10)
+		word = _word("mn")
+		for name in ("a.md", "b.md", "c.md"):
+			self._manual(name, f"# Mục\n{word}\n")
+		# start, then one reading before each file: 9.99 s still scans b.md, 10 s stops before c.md
+		ticks = iter([100.0, 100.0, 109.99, 110.0])
+
+		self.assertEqual(self._found(word, clock=lambda: next(ticks)), [("a.md", 1), ("b.md", 1)])
+
+	def test_excerpt_masked_before_cut(self):
+		word = _word("mn")
+		filler = "z" * 141
+		self._manual("hdsd.md", f"# Mục\npassword: fake-mn {filler} {word} {'w ' * 200}\n")
+
+		[row] = self._search(word)
+
+		self.assertNotIn("fake-mn", row["excerpt"])
+		self.assertIn(word, row["excerpt"])
+		self.assertEqual(len(row["excerpt"]), knowledge.EXCERPT_MAX_CHARS)
+
+	def test_decomposed_text_found_and_excerpt_nfc(self):
+		suffix = frappe.generate_hash(length=10).lower()
+		self._manual("hdsd.md", unicodedata.normalize("NFD", f"# Lỗi in\nSai mã{suffix}\n"))
+
+		[row] = self._search(f"mã{suffix}")
+
+		self.assertEqual(row["heading"], "Lỗi in")
+		self.assertTrue(unicodedata.is_normalized("NFC", row["excerpt"]))
+		self.assertEqual(self._search(f"ma{suffix}"), [])

@@ -45,7 +45,8 @@ Approved-by:
 ## Test chập chờn
 | Test | Lần gặp | Ghi chú |
 |---|---|---|
-| — | — | Chưa có test nào |
+| `erp_ai.agent.test_runner_routing` (`TestRoutingTask.test_other_exception_generic_reason_not_sharing`, `TestRoutingNoOverride.test_rule_assignment_in_route_save_kept`) | 2026-11-14, FEAT-007 mốc M1 trên `team/FEAT-007` @ `631fa36`: mỗi test đỏ `FAIL` đúng một lần (lần chạy cả bộ; rồi một lần chạy riêng module), không lặp lại ở ba lần chạy riêng sau đó (hai lần chỉ `QueryDeadlockError`, lần thứ tư `Ran 62 tests in 99.742s OK`) | Chưa có thông báo khẳng định (đầu ra lúc đó chỉ giữ dòng `FAIL:`). Bối cảnh: site `miyano` dùng chung, `bench start` đang chạy scheduler + 2 worker nạp mã cây chính, phiên khác chạy `migrate` và test cùng lúc. Việc cần làm: chạy riêng hai test khi site rảnh, giữ nguyên traceback; nếu phụ thuộc dữ liệu dùng chung (Assignment Rule, job do worker xử lý) thì cho test tự cô lập (STD-TEST-6). |
+| `erp_ai.erp_ai_agent.report.erp_ai_accuracy.test_erp_ai_accuracy` (`AccuracyTestCase.setUp`) | 2026-11-14, FEAT-007 T28/T29: `QueryDeadlockError` ở nhiều lần chạy của dev | `setUp` viết lại mọi dòng `classify` của `tabERP AI Log` bằng một câu `UPDATE` trong giao dịch của từng test, khóa cả bảng trên site dùng chung (`review-29.md` câu 7). Cần designer chọn cách cô lập (cửa `l0_l1_gate` không nhận bộ lọc nên không lọc theo tiền tố được). |
 
 ## Đã quét / Chưa quét / Độ tin cậy
 | Tầng | Đã quét | Chưa quét | Độ tin cậy |

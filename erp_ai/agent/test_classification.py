@@ -11,7 +11,7 @@ from erp_ai.constants import (
 	TRIGGER_COMMENT_MENTION,
 	TRIGGER_TICKET_INSERT,
 )
-from erp_ai.test_utils import make_routing_rules
+from erp_ai.test_utils import keep_agent_settings, make_routing_rules
 
 VALID = {
 	"dau_muc": "A",
@@ -511,3 +511,87 @@ class TestPrompts(FrappeTestCase):
 		self.assertEqual(len(payload["comments"][0]["content"]), 2000)
 		self.assertEqual(payload["comments"][0]["role"], "dữ liệu")
 		self.assertTrue(payload["comments"][0]["content"].startswith("cyyy"))
+
+
+SPLIT_QUESTION = "Anh/chị xác nhận có muốn tách thành các phiếu riêng không? Bot không tự tách phiếu."
+
+
+class TestSplitComment(FrappeTestCase):
+	"""AC-28, pure part (design.md:409): the comment asking whether to split a merged ticket."""
+
+	def setUp(self):
+		keep_agent_settings(self)
+
+	def _comment(self, needs_split, requests):
+		parsed = classification.parse_classification(_text(can_tach=needs_split, cac_yeu_cau=requests))
+		self.assertIsNotNone(parsed)
+		return classification.split_request_comment(parsed)
+
+	def test_four_requests(self):
+		comment = self._comment(True, ["Sửa đơn bán", "Thêm kho mới", "Đổi giá", "Tạo tài khoản"])
+		self.assertEqual(
+			comment,
+			"Phiếu này có vẻ gồm 4 yêu cầu:\n"
+			"1. Sửa đơn bán\n"
+			"2. Thêm kho mới\n"
+			"3. Đổi giá\n"
+			"4. Tạo tài khoản\n"
+			"Anh/chị xác nhận có muốn tách thành các phiếu riêng không? Bot không tự tách phiếu.",
+		)
+
+	def test_two_requests_is_enough(self):
+		self.assertEqual(
+			self._comment(True, ["Một", "Hai"]),
+			"Phiếu này có vẻ gồm 2 yêu cầu:\n1. Một\n2. Hai\n" + SPLIT_QUESTION,
+		)
+
+	def test_single_request_none(self):
+		self.assertIsNone(self._comment(True, ["Chỉ một việc"]))
+		self.assertIsNone(self._comment(True, []))
+
+	def test_needs_split_false_with_several_requests_none(self):
+		self.assertIsNone(self._comment(False, ["Một", "Hai", "Ba"]))
+
+	def test_no_classification_none(self):
+		self.assertIsNone(classification.split_request_comment(None))
+
+	def test_request_of_200_chars_kept_201_cut(self):
+		exactly_200 = "a" * 200
+		over_by_one = "b" * 200 + "Z"
+		comment = self._comment(True, [exactly_200, over_by_one])
+		self.assertEqual(
+			comment,
+			"Phiếu này có vẻ gồm 2 yêu cầu:\n1. " + "a" * 200 + "\n2. " + "b" * 200 + "\n" + SPLIT_QUESTION,
+		)
+		self.assertNotIn("Z", comment)
+
+	def test_caps_at_ten(self):
+		eleven = [f"Việc {i}" for i in range(1, 12)]
+		self.assertEqual(
+			self._comment(True, eleven),
+			"Phiếu này có vẻ gồm 10 yêu cầu:\n"
+			"1. Việc 1\n2. Việc 2\n3. Việc 3\n4. Việc 4\n5. Việc 5\n"
+			"6. Việc 6\n7. Việc 7\n8. Việc 8\n9. Việc 9\n10. Việc 10\n" + SPLIT_QUESTION,
+		)
+
+	def test_exactly_ten_all_listed(self):
+		ten = [f"Việc {i}" for i in range(1, 11)]
+		self.assertEqual(
+			self._comment(True, ten),
+			"Phiếu này có vẻ gồm 10 yêu cầu:\n"
+			"1. Việc 1\n2. Việc 2\n3. Việc 3\n4. Việc 4\n5. Việc 5\n"
+			"6. Việc 6\n7. Việc 7\n8. Việc 8\n9. Việc 9\n10. Việc 10\n" + SPLIT_QUESTION,
+		)
+
+	def test_blank_requests_dropped_and_not_counted(self):
+		self.assertEqual(
+			self._comment(True, ["  Một  ", "", "   ", "Hai"]),
+			"Phiếu này có vẻ gồm 2 yêu cầu:\n1. Một\n2. Hai\n" + SPLIT_QUESTION,
+		)
+		self.assertIsNone(self._comment(True, ["Một", "", " \n\t "]))
+
+	def test_cut_counts_after_trimming_spaces(self):
+		comment = self._comment(True, ["   " + "c" * 200 + "   ", "Hai"])
+		self.assertEqual(
+			comment, "Phiếu này có vẻ gồm 2 yêu cầu:\n1. " + "c" * 200 + "\n2. Hai\n" + SPLIT_QUESTION
+		)

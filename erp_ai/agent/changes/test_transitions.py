@@ -517,6 +517,104 @@ class TestRequestUndo(TransitionTestCase):
 					proposal.name,
 				)
 
+	# CHG-002 design 3.3 `undo`, 4.3 "Cạnh mới": `Lỗi → Đang hoàn tác` for a code change whose apply
+	# commit exists and was not undone yet; each condition failing on its own keeps the old refusal.
+	def _failed_with(self, kind=CHANGE_KIND_CODE, **fields):
+		proposal = _proposal_in(CHANGE_STATUS_FAILED, kind=kind)
+		if fields:
+			frappe.db.set_value(PROPOSAL_DOCTYPE, proposal.name, fields, update_modified=False)
+		return proposal
+
+	def test_from_failed_needs_apply_sha_and_no_undo_sha(self):
+		proposal = self._failed_with(apply_commit_sha="a" * 40)
+		before = _state(proposal.name)
+		self.assertEqual(transitions.request_undo(proposal.name, ACTOR), "Đang hoàn tác")
+		self.assertEqual(
+			_state(proposal.name),
+			{**before, "change_status": "Đang hoàn tác", "undo_by": ACTOR, "undo_at": NOW},
+		)
+		self.assertEqual(_state(proposal.name).apply_commit_sha, "a" * 40)
+		self.assertEqual(_rows(proposal.name), [])
+
+	def test_from_failed_without_sha_refused(self):
+		for apply_sha in (None, ""):
+			with self.subTest(apply_commit_sha=apply_sha):
+				proposal = self._failed_with(apply_commit_sha=apply_sha)
+				self.assertRefused(
+					lambda: transitions.request_undo(proposal.name, ACTOR),
+					"Đề xuất đang ở trạng thái Lỗi, không hoàn tác được",
+					proposal.name,
+				)
+				self.assertEqual(_state(proposal.name).change_status, "Lỗi")
+
+	def test_from_failed_with_undo_sha_refused(self):
+		proposal = self._failed_with(apply_commit_sha="a" * 40, undo_commit_sha="b" * 40)
+		self.assertRefused(
+			lambda: transitions.request_undo(proposal.name, ACTOR),
+			"Đề xuất đang ở trạng thái Lỗi, không hoàn tác được",
+			proposal.name,
+		)
+		self.assertEqual(_state(proposal.name).change_status, "Lỗi")
+
+	def test_from_failed_other_kind_refused(self):
+		proposal = self._failed_with(apply_commit_sha="a" * 40)
+		frappe.db.set_value(PROPOSAL_DOCTYPE, proposal.name, "change_kind", "Loại lạ", update_modified=False)
+		self.assertRefused(
+			lambda: transitions.request_undo(proposal.name, ACTOR),
+			"Đề xuất đang ở trạng thái Lỗi, không hoàn tác được",
+			proposal.name,
+		)
+		self.assertEqual(_state(proposal.name).change_status, "Lỗi")
+
+	def test_command_only_block_not_undoable(self):
+		proposal = self._failed_with(
+			kind=CHANGE_KIND_COMMAND, command_list=json.dumps([["migrate"]]), apply_commit_sha="a" * 40
+		)
+		self.assertRefused(
+			lambda: transitions.request_undo(proposal.name, ACTOR),
+			"Lệnh bench không hoàn tác được",
+			proposal.name,
+		)
+		self.assertEqual(_state(proposal.name).change_status, "Lỗi")
+
+	def test_other_statuses_refused_even_with_apply_sha(self):
+		for status in (s for s in ALL_STATUSES if s not in ("Đã áp dụng", "Lỗi")):
+			with self.subTest(status=status):
+				proposal = _proposal_in(status)
+				frappe.db.set_value(
+					PROPOSAL_DOCTYPE, proposal.name, "apply_commit_sha", "a" * 40, update_modified=False
+				)
+				self.assertRefused(
+					lambda: transitions.request_undo(proposal.name, ACTOR),
+					f"Đề xuất đang ở trạng thái {status}, không hoàn tác được",
+					proposal.name,
+				)
+
+	def test_two_callers_one_wins(self):
+		proposal = self._failed_with(apply_commit_sha="a" * 40)
+		self.assertEqual(transitions.request_undo(proposal.name, ACTOR), "Đang hoàn tác")
+		self.assertRefused(
+			lambda: transitions.request_undo(proposal.name, "Guest"),
+			"Đề xuất đang ở trạng thái Đang hoàn tác, không hoàn tác được",
+			proposal.name,
+		)
+		self.assertEqual(_state(proposal.name).undo_by, ACTOR)
+
+	def test_lock_reads_status_kind_and_both_commit_shas(self):
+		proposal = self._failed_with(apply_commit_sha="a" * 40)
+		with patch.object(frappe.db, "get_value", wraps=frappe.db.get_value) as get_value:
+			transitions.request_undo(proposal.name, ACTOR)
+		locks = [entry for entry in get_value.call_args_list if entry.kwargs.get("for_update") is True]
+		self.assertEqual(len(locks), 1)
+		self.assertEqual(
+			locks[0].args,
+			(
+				PROPOSAL_DOCTYPE,
+				proposal.name,
+				["change_status", "change_kind", "apply_commit_sha", "undo_commit_sha"],
+			),
+		)
+
 
 class TestBeginApply(TransitionTestCase):
 	def test_begin_apply_only_from_approved_and_second_call_false(self):

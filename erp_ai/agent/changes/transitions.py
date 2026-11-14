@@ -10,6 +10,7 @@ from erp_ai.agent.changes import block
 from erp_ai.agent.changes.process_runner import CommandResult
 from erp_ai.agent.run_log import ENTRY_TYPE_CHANGE, write_entry
 from erp_ai.constants import (
+	CHANGE_KIND_CODE,
 	CHANGE_KIND_COMMAND,
 	CHANGE_STATUS_APPLIED,
 	CHANGE_STATUS_APPLYING,
@@ -169,7 +170,7 @@ def _require_text(value, label) -> None:
 
 
 def _lock(name) -> frappe._dict:
-	"""Lock the proposal row (D-2) and return its `change_status` and `change_kind`.
+	"""Lock the proposal row (D-2); return its `change_status`, `change_kind` and both commit SHAs.
 
 	Raises:
 		ValueError: `name` is not a non-empty string.
@@ -177,7 +178,11 @@ def _lock(name) -> frappe._dict:
 	"""
 	_require_text(name, "name")
 	row = frappe.db.get_value(
-		PROPOSAL_DOCTYPE, name, ["change_status", "change_kind"], as_dict=True, for_update=True
+		PROPOSAL_DOCTYPE,
+		name,
+		["change_status", "change_kind", "apply_commit_sha", "undo_commit_sha"],
+		as_dict=True,
+		for_update=True,
 	)
 	if row is None:
 		frappe.throw(f"Không có đề xuất {frappe.utils.escape_html(name)}", frappe.DoesNotExistError)
@@ -219,15 +224,24 @@ def reject(name, user) -> str:
 def request_undo(name, user) -> str:
 	"""`Đã áp dụng → Đang hoàn tác` for a code change: write `undo_by`, `undo_at`; the job logs `undo`.
 
+	CHG-002 design 3.3, 4.3: also from `Lỗi` when the change is `Thay đổi code`, its `apply_commit_sha`
+	is set and its `undo_commit_sha` is empty.
+
 	Raises:
-		InvalidTransition: a bench command (any state), or a code change not `Đã áp dụng`; nothing is written.
+		InvalidTransition: a bench command (any state), or a change that has neither edge; nothing is written.
 		ValueError, frappe.DoesNotExistError: see `_lock`; `user` is not a non-empty string.
 	"""
 	_require_text(user, "user")
 	row = _lock(name)
 	if row.change_kind == CHANGE_KIND_COMMAND:
 		frappe.throw("Lệnh bench không hoàn tác được", InvalidTransition)
-	if row.change_status != CHANGE_STATUS_APPLIED:
+	undoable_failure = (
+		row.change_status == CHANGE_STATUS_FAILED
+		and row.change_kind == CHANGE_KIND_CODE
+		and bool(row.apply_commit_sha)
+		and not row.undo_commit_sha
+	)
+	if row.change_status != CHANGE_STATUS_APPLIED and not undoable_failure:
 		_refuse(row.change_status, "hoàn tác")
 	frappe.db.set_value(
 		PROPOSAL_DOCTYPE,

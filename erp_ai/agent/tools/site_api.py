@@ -78,20 +78,7 @@ VALUE_MAX = 200
 DELETED_FIELDS_MAX = 20
 # Full before/after of a write, for the audit log only: a User snapshot always holds just its name and roles.
 SNAPSHOT_TABLES = {USER_DOCTYPE: ("roles",)}
-SNAPSHOT_ROW_DROPPED = frozenset(
-	{
-		"name",
-		"idx",
-		"parent",
-		"parentfield",
-		"parenttype",
-		"owner",
-		"creation",
-		"modified",
-		"modified_by",
-		"doctype",
-	}
-)
+SNAPSHOT_ROW_DROPPED = (SYSTEM_FIELDS - {"docstatus"}) | {"name", "parentfield"}
 
 
 def _fail(reason: str, doctype=None) -> dict:
@@ -235,7 +222,7 @@ def _snapshot(doc, fields) -> dict:
 	tables = {field.fieldname for field in doc.meta.get_table_fields()}
 	snapshot = {"name": doc.name}
 	for field in fields:
-		if field == "name" or _is_secret(doc.meta, field):
+		if _is_secret(doc.meta, field):
 			continue
 		if field in tables:
 			rows = sorted(doc.get(field) or [], key=lambda row: row.idx or 0)

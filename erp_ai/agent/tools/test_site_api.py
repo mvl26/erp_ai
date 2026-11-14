@@ -1,4 +1,6 @@
+import datetime
 import json
+from decimal import Decimal
 from unittest.mock import patch
 
 import frappe
@@ -1186,20 +1188,24 @@ class TestSnapshot(FrappeTestCase):
 			{
 				"doctype": "ERP AI Setting",
 				"name": "ERP AI Setting",
+				"monthly_budget_usd": Decimal("12.50"),
 				"credentials": [
 					{"label": "SITEAPI thứ hai", "api_key": FAKE_SECRET, "idx": 2, "note": long_note},
 					{
 						"label": "SITEAPI thứ nhất",
 						"api_key": FAKE_SECRET,
 						"idx": 1,
-						"paused_until": "2026-11-14 08:30:00",
+						"paused_until": datetime.datetime(2026, 11, 14, 8, 30),
 					},
 				],
 			}
 		)
-		snapshot = site_api._snapshot(setting, ("credentials",))
-		self.assertEqual(set(snapshot), {"name", "credentials"})
+		# A private property is never part of the snapshot.
+		setattr(setting.credentials[0], "__unsaved", 1)
+		snapshot = site_api._snapshot(setting, ("name", "credentials", "monthly_budget_usd"))
+		self.assertEqual(set(snapshot), {"name", "credentials", "monthly_budget_usd"})
 		self.assertEqual(snapshot["name"], "ERP AI Setting")
+		self.assertEqual(snapshot["monthly_budget_usd"], 12.5)
 		rows = snapshot["credentials"]
 		self.assertEqual([row["label"] for row in rows], ["SITEAPI thứ nhất", "SITEAPI thứ hai"])
 		dropped = {
@@ -1216,8 +1222,10 @@ class TestSnapshot(FrappeTestCase):
 		}
 		for row in rows:
 			self.assertEqual(set(row) & (dropped | {"api_key"}), set(), row)
+			self.assertEqual([key for key in row if key.startswith("_")], [], row)
 		self.assertEqual(rows[1]["note"], long_note)
 		self.assertEqual(rows[0]["paused_until"], "2026-11-14 08:30:00")
+		json.dumps(snapshot)
 
 		account = frappe.get_doc(
 			{

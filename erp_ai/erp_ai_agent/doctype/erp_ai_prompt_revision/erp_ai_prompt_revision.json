@@ -1,0 +1,80 @@
+{
+ "actions": [],
+ "creation": "2026-11-15 14:00:00.000000",
+ "doctype": "DocType",
+ "editable_grid": 1,
+ "engine": "InnoDB",
+ "field_order": [
+  "section_change",
+  "part",
+  "changed_by",
+  "changed_at",
+  "section_value",
+  "old_value",
+  "new_length"
+ ],
+ "fields": [
+  {
+   "fieldname": "section_change",
+   "fieldtype": "Section Break",
+   "label": "Lần sửa"
+  },
+  {
+   "description": "Hệ thống tự ghi phần prompt vừa được sửa: classify (phân loại), reasoning (chỉ dẫn lập luận) hoặc category_guide (bảng hướng dẫn đầu mục); không sửa được.",
+   "fieldname": "part",
+   "fieldtype": "Select",
+   "in_list_view": 1,
+   "label": "Phần",
+   "options": "classify\nreasoning\ncategory_guide",
+   "read_only": 1
+  },
+  {
+   "description": "Hệ thống tự ghi tài khoản của người đã lưu thay đổi; không sửa được.",
+   "fieldname": "changed_by",
+   "fieldtype": "Link",
+   "in_list_view": 1,
+   "label": "Người sửa",
+   "options": "User",
+   "read_only": 1
+  },
+  {
+   "description": "Hệ thống tự ghi thời điểm lưu thay đổi; không sửa được.",
+   "fieldname": "changed_at",
+   "fieldtype": "Datetime",
+   "in_list_view": 1,
+   "label": "Thời điểm sửa",
+   "read_only": 1
+  },
+  {
+   "fieldname": "section_value",
+   "fieldtype": "Section Break",
+   "label": "Giá trị cũ"
+  },
+  {
+   "description": "Hệ thống tự ghi giá trị cũ của ô ghi đè trước lần sửa này; trống nghĩa là trước đó dùng bản dựng sẵn; không sửa được.",
+   "fieldname": "old_value",
+   "fieldtype": "Long Text",
+   "label": "Giá trị cũ",
+   "read_only": 1
+  },
+  {
+   "description": "Hệ thống tự ghi số ký tự của giá trị mới sau lần sửa; 0 nghĩa là ô được để trống để quay về bản dựng sẵn; không sửa được.",
+   "fieldname": "new_length",
+   "fieldtype": "Int",
+   "in_list_view": 1,
+   "label": "Độ dài mới",
+   "read_only": 1
+  }
+ ],
+ "istable": 1,
+ "links": [],
+ "modified": "2026-11-15 14:00:00.000000",
+ "modified_by": "Administrator",
+ "module": "ERP AI agent",
+ "name": "ERP AI Prompt Revision",
+ "owner": "Administrator",
+ "permissions": [],
+ "sort_field": "modified",
+ "sort_order": "DESC",
+ "states": []
+}

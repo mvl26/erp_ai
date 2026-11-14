@@ -10,6 +10,7 @@ from frappe.tests.utils import FrappeTestCase
 from frappe.utils import get_datetime
 
 from erp_ai import constants, install
+from erp_ai.agent import prompts
 from erp_ai.agent.classification import DEFAULT_CATEGORY_MAPPING
 from erp_ai.agent.routing import DEFAULT_ROUTING_RULES
 from erp_ai.agent.tools import read, site_api
@@ -592,6 +593,7 @@ class TestCheckKeys(FrappeTestCase):
 
 
 USER_TEMPLATE_DOCTYPE = "ERP AI User Template"
+PROMPT_REVISION_DOCTYPE = "ERP AI Prompt Revision"
 # FEAT-007 design 2.1: default of every new ERP AI Setting field (NFR-4); one row per field as tasks add them.
 # Table fields have no Singles value: see test_catalog_starts_empty_after_install and its siblings.
 FEAT007_NEW_FIELD_DEFAULTS = {
@@ -649,7 +651,15 @@ FEAT007_NEW_FIELD_DEFAULTS = {
 	"budget_alert_sent_month": "",
 	# No default either: the absent Datetime casts to datetime(1, 1, 1); checked with the agent off (enabled = 0).
 	"agent_enabled_at": datetime.datetime(1, 1, 1),
+	# design.md:150: blank override = the built-in prompt part.
+	"prompt_override_classify": "",
+	"prompt_override_reasoning": "",
+	"prompt_override_category_guide": "",
 }
+# The new Table fields: no Singles value, each has its own "starts empty" test below.
+FEAT007_NEW_TABLE_FIELDS = ("catalog_rules", "user_templates", "prompt_revisions")
+# design.md:153: FEAT-007 wave 0 adds 49 data fields to ERP AI Setting.
+FEAT007_NEW_FIELD_COUNT = 49
 # FEAT-007 AC-26, D-2: the expected first-response minutes of categories A-F (routing_rules.expected_sla).
 RESPONSE_TARGET_MINUTES = {"A": 15, "B": 15, "C": 60, "D": 60, "E": 60, "F": 5}
 # FEAT-007 design.md:108: section_operations and its twelve fields, in form order, with their field types.
@@ -722,9 +732,23 @@ class TestFeat007Defaults(FrappeTestCase):
 		# The agent_enabled_at row means "agent off + value missing -> stays unset"; pin `enabled` so the row
 		# holds whatever the site stores (keep_agent_settings restores it).
 		set_agent_settings(enabled=0)
+		covered = set(FEAT007_NEW_FIELD_DEFAULTS) | set(FEAT007_NEW_TABLE_FIELDS)
+		self.assertEqual(len(covered), FEAT007_NEW_FIELD_COUNT)
+		meta = frappe.get_meta(SETTING_DOCTYPE)
+		self.assertEqual(sorted(name for name in covered if not meta.get_field(name)), [])
 		for fieldname, expected in FEAT007_NEW_FIELD_DEFAULTS.items():
 			with self.subTest(fieldname=fieldname):
 				self.assertEqual(self._value_after_install(fieldname), expected)
+
+	def test_prompt_revisions_start_empty_after_install(self):
+		# AC-38, D-3: the revision history lives in the child table; install seeds no row.
+		row_filters = {"parent": SETTING_DOCTYPE, "parentfield": "prompt_revisions"}
+		self.assertTrue(
+			frappe.db.exists("DocType", PROMPT_REVISION_DOCTYPE), "DocType ERP AI Prompt Revision is missing"
+		)
+		frappe.db.delete(PROMPT_REVISION_DOCTYPE, row_filters)
+		install._ensure_default_settings()
+		self.assertEqual(frappe.get_all(PROMPT_REVISION_DOCTYPE, filters=row_filters), [])
 
 	def test_catalog_starts_empty_after_install(self):
 		# AC-29: a Table keeps its rows in the child table, not in Singles; install seeds no catalog row.
@@ -2151,3 +2175,229 @@ class TestSelfManagedFeat007(FrappeTestCase):
 		frappe.db.value_cache.setdefault(SETTING_DOCTYPE, {})["enabled"] = 1
 		self._save_at(datetime.datetime(2030, 5, 6, 7, 8, 9), enabled=1)
 		self.assertEqual(self._stored("agent_enabled_at"), ENABLED_STAMP)
+
+
+PROMPT_REVISION_JSON = (
+	Path(erp_ai_setting.__file__).resolve().parent.parent
+	/ "erp_ai_prompt_revision"
+	/ "erp_ai_prompt_revision.json"
+)
+# AC-38, E-10 (design.md:311-316): part -> (override field, label in the error, built-in text, required markers).
+PROMPT_PARTS = {
+	"classify": (
+		"prompt_override_classify",
+		"phân loại",
+		prompts.CLASSIFY_PROMPT,
+		(
+			'"dau_muc"',
+			'"do_tin_cay"',
+			'"ly_do"',
+			'"nhom"',
+			'"uu_tien"',
+			'"can_tach"',
+			'"cac_yeu_cau"',
+			'"do_phuc_tap"',
+			'"do_quan_trong"',
+			'"ly_do_diem"',
+			'"bo_phan"',
+		),
+	),
+	"reasoning": (
+		"prompt_override_reasoning",
+		"chỉ dẫn lập luận",
+		prompts.CORE_PROMPT,
+		("**Nhận định:**", "**Căn cứ:**", "**Hướng xử lý:**", "**Cần ai quyết:**"),
+	),
+	"category_guide": (
+		"prompt_override_category_guide",
+		"bảng hướng dẫn đầu mục",
+		prompts.CATEGORY_TABLE,
+		("| A |", "| B |", "| C |", "| D |", "| E |", "| F |"),
+	),
+}
+PROMPT_MAX_CHARS = 20000
+
+
+def _too_long_error(label):
+	return f"Ghi đè prompt {label} dài quá 20000 ký tự"
+
+
+def _missing_error(label, *markers):
+	return f"Ghi đè prompt {label} thiếu mục bắt buộc: {', '.join(markers)}"
+
+
+def _without_marker(part, text, marker):
+	"""`text` with every occurrence of `marker` gone; for the category guide, the table row of that letter."""
+	if part != "category_guide":
+		return text.replace(marker, "")
+	return "\n".join(line for line in text.splitlines() if not line.startswith(marker))
+
+
+def _padded(text, length):
+	"""`text` followed by a newline and filler up to exactly `length` characters."""
+	return text + "\n" + "x" * (length - len(text) - 1)
+
+
+class TestPromptOverrides(FrappeTestCase):
+	def setUp(self):
+		self.addCleanup(frappe.db.rollback)
+		keep_agent_settings(self)
+		blank = {fieldname: "" for fieldname, *_rest in PROMPT_PARTS.values()}
+		kpi_default = frappe.get_meta(SETTING_DOCTYPE).get_field("kpi_targets").default
+		self.assertIsNone(self._save(kpi_targets=kpi_default, coo_report_recipients="", **blank))
+
+	def _save(self, **fields):
+		"""Save the setting with these fields; return the error text, or None when it saved."""
+		doc = frappe.get_doc(SETTING_DOCTYPE)
+		doc.update(fields)
+		try:
+			doc.save()
+		except frappe.ValidationError as error:
+			return str(error)
+		return None
+
+	def _stored(self, fieldname):
+		return frappe.db.get_single_value(SETTING_DOCTYPE, fieldname, cache=False)
+
+	def test_prompt_section_and_child_doctype_shape(self):
+		# design.md:109, 150-151, 227: section 13 between the operations block and section_alerts; three Long
+		# Text overrides and the read-only history table; every column of the child DocType is read-only.
+		meta = frappe.get_meta(SETTING_DOCTYPE)
+		order = [field.fieldname for field in meta.fields]
+		self.assertIn("section_prompts", order, "ERP AI Setting has no section_prompts")
+		start = order.index("section_prompts")
+		self.assertEqual(order[start - 1], "budget_alert_sent_month")
+		self.assertEqual(
+			order[start + 1 : start + 6],
+			[
+				*(fieldname for fieldname, *_rest in PROMPT_PARTS.values()),
+				"prompt_revisions",
+				"section_alerts",
+			],
+		)
+		for fieldname, *_rest in PROMPT_PARTS.values():
+			with self.subTest(fieldname=fieldname):
+				field = meta.get_field(fieldname)
+				# A prompt is model input, not HTML: the XSS filter would store "<...>" placeholders and "&" escaped.
+				self.assertEqual(
+					(field.fieldtype, field.read_only, field.default, field.ignore_xss_filter),
+					("Long Text", 0, None, 1),
+				)
+		field = meta.get_field("prompt_revisions")
+		self.assertEqual(
+			(field.fieldtype, field.options, field.read_only), ("Table", PROMPT_REVISION_DOCTYPE, 1)
+		)
+		doctype_json = json.loads(PROMPT_REVISION_JSON.read_text(encoding="utf-8"))
+		self.assertEqual(doctype_json["istable"], 1)
+		fields = [f for f in doctype_json["fields"] if f["fieldtype"] != "Section Break"]
+		self.assertEqual(
+			[(f["fieldname"], f["fieldtype"], f.get("options"), f.get("read_only")) for f in fields],
+			[
+				("part", "Select", "classify\nreasoning\ncategory_guide", 1),
+				("changed_by", "Link", "User", 1),
+				("changed_at", "Datetime", None, 1),
+				("old_value", "Long Text", None, 1),
+				("new_length", "Int", None, 1),
+			],
+		)
+		doc = frappe.new_doc(PROMPT_REVISION_DOCTYPE)
+		self.assertEqual(type(doc).__name__, "ERPAIPromptRevision")
+		self.assertEqual(type(doc).__bases__, (Document,))
+		self.assertEqual([name for name in vars(type(doc)) if not name.startswith("__")], [])
+
+	def test_required_markers_match_design(self):
+		# design.md:314-316 and the plan.md risk row: classify holds exactly the 11 keys ("do_tin_cay_pct" is U1's).
+		self.assertEqual(getattr(erp_ai_setting, "PROMPT_OVERRIDE_MAX_CHARS", None), PROMPT_MAX_CHARS)
+		self.assertEqual(
+			getattr(erp_ai_setting, "PROMPT_REQUIRED_MARKERS", None),
+			{part: markers for part, (*_rest, markers) in PROMPT_PARTS.items()},
+		)
+		# Each override names its own markers, so the form text and the check cannot drift apart.
+		meta = frappe.get_meta(SETTING_DOCTYPE)
+		for part in ("classify", "reasoning"):
+			fieldname, _label, _builtin, markers = PROMPT_PARTS[part]
+			with self.subTest(part=part):
+				description = meta.get_field(fieldname).description
+				self.assertEqual([m for m in markers if m not in description], [])
+
+	def test_builtin_prompts_pass_required_markers(self):
+		# AC-38: each built-in part passes the check of its own part, so the list never drifts from the code.
+		for part, (fieldname, _label, builtin, _markers) in PROMPT_PARTS.items():
+			with self.subTest(part=part):
+				self.assertIsNone(self._save(**{fieldname: builtin}))
+				self.assertEqual(self._stored(fieldname), builtin)
+				self.assertIsNone(self._save(**{fieldname: ""}))
+
+	def test_missing_marker_blocked_each_part(self):
+		# E-10: each marker of each part removed alone refuses the save with exactly that marker named; the
+		# stored value holds.
+		for part, (fieldname, label, builtin, markers) in PROMPT_PARTS.items():
+			for marker in markers:
+				with self.subTest(part=part, marker=marker):
+					text = _without_marker(part, builtin, marker)
+					self.assertNotEqual(text, builtin)
+					self.assertEqual(self._save(**{fieldname: text}), _missing_error(label, marker))
+					self.assertEqual(self._stored(fieldname), "")
+
+	def test_missing_markers_listed_in_constant_order(self):
+		# Two markers missing, removed last first: the message lists them in PROMPT_REQUIRED_MARKERS order.
+		for part, (fieldname, label, builtin, markers) in PROMPT_PARTS.items():
+			with self.subTest(part=part):
+				first, last = markers[0], markers[-1]
+				text = _without_marker(part, _without_marker(part, builtin, last), first)
+				self.assertEqual(self._save(**{fieldname: text}), _missing_error(label, first, last))
+
+	def test_markers_need_their_exact_form(self):
+		# classify: a key without its JSON quotes does not count; category_guide: the row must start the line
+		# (blanks inside the cell are allowed), the letter in a later cell does not count.
+		_field, classify_label, classify_text, _markers = PROMPT_PARTS["classify"]
+		unquoted = classify_text.replace('"bo_phan"', "bo_phan")
+		self.assertEqual(
+			self._save(prompt_override_classify=unquoted), _missing_error(classify_label, '"bo_phan"')
+		)
+
+		_field, guide_label, guide_text, _markers = PROMPT_PARTS["category_guide"]
+		spaced = guide_text.replace("| C |", "|   C\t|")
+		self.assertIsNone(self._save(prompt_override_category_guide=spaced))
+		self.assertEqual(self._stored("prompt_override_category_guide"), spaced)
+		indented = guide_text.replace("\n| D |", "\n x | D |")
+		self.assertEqual(
+			self._save(prompt_override_category_guide=indented), _missing_error(guide_label, "| D |")
+		)
+
+	def test_too_long_blocked(self):
+		# E-10: per part, 20000 characters save and 20001 are refused; blanks around the text do not count;
+		# the length is checked before the markers.
+		for part, (fieldname, label, builtin, markers) in PROMPT_PARTS.items():
+			with self.subTest(part=part):
+				at_limit = _padded(builtin, PROMPT_MAX_CHARS)
+				self.assertIsNone(self._save(**{fieldname: at_limit}))
+				self.assertEqual(self._stored(fieldname), at_limit)
+				with_blanks = f"  \n{at_limit}\n  "
+				self.assertIsNone(self._save(**{fieldname: with_blanks}))
+				over = _padded(builtin, PROMPT_MAX_CHARS + 1)
+				self.assertEqual(self._save(**{fieldname: over}), _too_long_error(label))
+				self.assertEqual(self._stored(fieldname), with_blanks)
+				over_and_missing = _padded(_without_marker(part, builtin, markers[0]), PROMPT_MAX_CHARS + 1)
+				self.assertEqual(self._save(**{fieldname: over_and_missing}), _too_long_error(label))
+
+	def test_blank_override_not_checked(self):
+		# Blank or only whitespace = the built-in part: no marker check, the save passes.
+		for fieldname, *_rest in PROMPT_PARTS.values():
+			for value in ("", " \n\t "):
+				with self.subTest(fieldname=fieldname, value=value):
+					self.assertIsNone(self._save(**{fieldname: value}))
+
+	def test_first_bad_part_in_form_order(self):
+		# The category guide and the reasoning part are both bad: the reasoning part (earlier on the form) wins;
+		# with the reasoning part blank, the category guide is named.
+		_field, reasoning_label, _text, reasoning_markers = PROMPT_PARTS["reasoning"]
+		_field, guide_label, _text, guide_markers = PROMPT_PARTS["category_guide"]
+		self.assertEqual(
+			self._save(prompt_override_category_guide="no table", prompt_override_reasoning="no headings"),
+			_missing_error(reasoning_label, *reasoning_markers),
+		)
+		self.assertEqual(
+			self._save(prompt_override_category_guide="no table", prompt_override_reasoning=""),
+			_missing_error(guide_label, *guide_markers),
+		)

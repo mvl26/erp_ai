@@ -86,6 +86,11 @@
   "kpi_targets",
   "daily_report_sent_on",
   "budget_alert_sent_month",
+  "section_prompts",
+  "prompt_override_classify",
+  "prompt_override_reasoning",
+  "prompt_override_category_guide",
+  "prompt_revisions",
   "section_alerts",
   "alert_recipients",
   "credentials"
@@ -641,6 +646,40 @@
    "description": "Hệ thống tự ghi tháng (dạng YYYY-MM) đã gửi email vượt ngân sách tháng, để mỗi tháng chỉ gửi một lần; không sửa được."
   },
   {
+   "fieldname": "section_prompts",
+   "fieldtype": "Section Break",
+   "label": "Ghi đè prompt"
+  },
+  {
+   "fieldname": "prompt_override_classify",
+   "fieldtype": "Long Text",
+   "label": "Ghi đè prompt phân loại",
+   "ignore_xss_filter": 1,
+   "description": "Để trống = dùng bản dựng sẵn. Nội dung thay bước phân loại; phải có các mục bắt buộc là 11 khóa JSON \"dau_muc\", \"do_tin_cay\", \"ly_do\", \"nhom\", \"uu_tien\", \"can_tach\", \"cac_yeu_cau\", \"do_phuc_tap\", \"do_quan_trong\", \"ly_do_diem\", \"bo_phan\" và ≤ 20000 ký tự. Các câu cấm và khối năm quyền không bị ghi đè. Mỗi lần sửa được lưu vào Lịch sử ghi đè prompt."
+  },
+  {
+   "fieldname": "prompt_override_reasoning",
+   "fieldtype": "Long Text",
+   "label": "Ghi đè prompt chỉ dẫn lập luận",
+   "ignore_xss_filter": 1,
+   "description": "Để trống = dùng bản dựng sẵn. Nội dung thay phần chỉ dẫn lập luận; phải có các mục bắt buộc **Nhận định:**, **Căn cứ:**, **Hướng xử lý:**, **Cần ai quyết:** và ≤ 20000 ký tự. Các câu cấm và khối năm quyền không bị ghi đè. Mỗi lần sửa được lưu vào Lịch sử ghi đè prompt."
+  },
+  {
+   "fieldname": "prompt_override_category_guide",
+   "fieldtype": "Long Text",
+   "label": "Ghi đè prompt bảng hướng dẫn đầu mục",
+   "ignore_xss_filter": 1,
+   "description": "Để trống = dùng bản dựng sẵn. Nội dung thay bảng hướng dẫn đầu mục; phải có các mục bắt buộc là một dòng bảng cho mỗi đầu mục A đến F, đầu dòng dạng | A | và ≤ 20000 ký tự. Các câu cấm và khối năm quyền không bị ghi đè. Mỗi lần sửa được lưu vào Lịch sử ghi đè prompt."
+  },
+  {
+   "fieldname": "prompt_revisions",
+   "fieldtype": "Table",
+   "label": "Lịch sử ghi đè prompt",
+   "options": "ERP AI Prompt Revision",
+   "read_only": 1,
+   "description": "Hệ thống tự ghi mỗi lần sửa ghi đè prompt: phần, người sửa, thời điểm, giá trị cũ; không sửa được."
+  },
+  {
    "fieldname": "section_alerts",
    "fieldtype": "Section Break",
    "label": "Cảnh báo và khóa API"
@@ -662,7 +701,7 @@
  ],
  "issingle": 1,
  "links": [],
- "modified": "2026-11-15 12:00:00.000000",
+ "modified": "2026-11-15 14:00:00.000000",
  "modified_by": "Administrator",
  "module": "ERP AI agent",
  "name": "ERP AI Setting",

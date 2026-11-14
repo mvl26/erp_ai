@@ -1,6 +1,7 @@
 import json
 import math
 import os
+import re
 
 import frappe
 from frappe.model.document import Document
@@ -98,6 +99,34 @@ DUE_FIELD_TYPES = ("Date", "Datetime")
 ALLOWED_REPORT_TYPES = ("Script Report", "Query Report")
 # AC-55, E-9: the stages every KPI target names.
 KPI_STAGES = ("gd2", "gd4")
+# AC-38, E-10 (design.md:311-316): an override longer than this is refused; blanks around it do not count.
+PROMPT_OVERRIDE_MAX_CHARS = 20000
+# Per prompt part, what an override must keep: classify the JSON keys parse_classification reads, reasoning the
+# comment headings, category_guide one table row per category (a line starting "| X |", blanks inside allowed).
+PROMPT_REQUIRED_MARKERS = {
+	"classify": (
+		'"dau_muc"',
+		'"do_tin_cay"',
+		'"ly_do"',
+		'"nhom"',
+		'"uu_tien"',
+		'"can_tach"',
+		'"cac_yeu_cau"',
+		'"do_phuc_tap"',
+		'"do_quan_trong"',
+		'"ly_do_diem"',
+		'"bo_phan"',
+	),
+	"reasoning": ("**Nhận định:**", "**Căn cứ:**", "**Hướng xử lý:**", "**Cần ai quyết:**"),
+	"category_guide": tuple(f"| {category} |" for category in CATEGORIES),
+}
+TABLE_ROW_PART = "category_guide"
+# part -> (override field, label in the error), in form order.
+PROMPT_OVERRIDE_FIELDS = {
+	"classify": ("prompt_override_classify", "phân loại"),
+	"reasoning": ("prompt_override_reasoning", "chỉ dẫn lập luận"),
+	"category_guide": ("prompt_override_category_guide", "bảng hướng dẫn đầu mục"),
+}
 
 
 def permission_switch_fields(meta) -> list:
@@ -128,6 +157,7 @@ class ERPAISetting(Document):
 		self.check_manuals_dir()
 		self.check_operation_people()
 		self.check_kpi_targets()
+		self.check_prompt_overrides()
 		self.stamp_agent_enabled_at()
 
 	def on_update(self):
@@ -321,6 +351,30 @@ class ERPAISetting(Document):
 		error = kpi_targets_error(self.kpi_targets)
 		if error:
 			frappe.throw(f"Mục tiêu KPI: {error}")
+
+	def check_prompt_overrides(self):
+		"""AC-38, E-10: each set override, in form order, within the length limit, then keeping its markers."""
+		for part, (fieldname, label) in PROMPT_OVERRIDE_FIELDS.items():
+			text = (self.get(fieldname) or "").strip()
+			if not text:
+				continue
+			if len(text) > PROMPT_OVERRIDE_MAX_CHARS:
+				frappe.throw(f"Ghi đè prompt {label} dài quá {PROMPT_OVERRIDE_MAX_CHARS} ký tự")
+			missing = missing_prompt_markers(part, text)
+			if missing:
+				frappe.throw(f"Ghi đè prompt {label} thiếu mục bắt buộc: {', '.join(missing)}")
+
+
+def missing_prompt_markers(part, text) -> list:
+	"""The markers of `part` that `text` lacks, in PROMPT_REQUIRED_MARKERS order."""
+	return [marker for marker in PROMPT_REQUIRED_MARKERS[part] if not _has_marker(part, marker, text)]
+
+
+def _has_marker(part, marker, text) -> bool:
+	if part != TABLE_ROW_PART:
+		return marker in text
+	category = re.escape(marker.strip("| "))
+	return re.search(rf"^\|\s*{category}\s*\|", text, re.MULTILINE) is not None
 
 
 def _filled_lines(value) -> list:

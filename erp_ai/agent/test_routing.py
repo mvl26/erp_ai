@@ -1,5 +1,5 @@
 import json
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 
 import frappe
 from frappe.tests.utils import FrappeTestCase
@@ -665,6 +665,7 @@ URGENT_MAPPING = {
 	"B": {**DEFAULT_CATEGORY_MAPPING["B"], "priority": "Urgent"},
 	"D": {**DEFAULT_CATEGORY_MAPPING["D"], "priority": "Urgent"},
 }
+A_MEDIUM_MAPPING = {**DEFAULT_CATEGORY_MAPPING, "A": {**DEFAULT_CATEGORY_MAPPING["A"], "priority": "Medium"}}
 
 
 def _decide_due(category, due_at=None, configured=True, importance=1, subject="Thông thường", mapping=None):
@@ -692,7 +693,16 @@ class TestPriorityExceptions(FrappeTestCase):
 		cases = (
 			# (name, category, importance, due_at, configured, subject, mapping, expected)
 			("A importance 3", "A", 3, None, True, "x", None, "Urgent"),
-			("A importance 1, due soon ignored", "A", 1, NOW + timedelta(hours=1), True, "x", None, "High"),
+			(
+				"A importance 1, due soon ignored",
+				"A",
+				1,
+				NOW + timedelta(hours=1),
+				True,
+				"x",
+				A_MEDIUM_MAPPING,
+				"Medium",
+			),
 			("B due exactly 24 h", "B", 1, NOW + day, True, "x", None, "High"),
 			("B due 24 h + 1 s", "B", 1, NOW + day + timedelta(seconds=1), True, "x", None, "Medium"),
 			("B due in 1 h", "B", 1, NOW + timedelta(hours=1), True, "x", None, "High"),
@@ -742,9 +752,59 @@ class TestPriorityExceptions(FrappeTestCase):
 					notes = _decide_due(category, due_at, configured=False).notes
 					self.assertEqual([note for note in notes if note["field"] == "due_at"], [DUE_NOTE])
 					self.assertNotIn(DUE_NOTE, _decide_due(category, due_at, configured=True).notes)
+			with self.subTest(category=category, configured=None):
+				decision = _decide_due(category, soon, configured=None)
+				self.assertNotIn("due_at", [note["field"] for note in decision.notes])
+				self.assertEqual(decision.priority, "High")
 		for category in "ACEF":
 			with self.subTest(category=category):
 				self.assertNotIn(DUE_NOTE, _decide_due(category, soon, configured=False).notes)
+
+	def test_old_call_shape_no_due_note(self):
+		expected = {"A": "High", "B": "Medium", "C": "Medium", "D": "Medium", "E": None, "F": "Low"}
+		self.assertEqual(sorted(expected), sorted(DEFAULT_CATEGORY_MAPPING))
+		for category, priority in expected.items():
+			with self.subTest(category=category):
+				decision = _decide(category, 1)
+				self.assertNotIn("due_at", [note["field"] for note in decision.notes])
+				self.assertEqual(decision.priority, priority)
+
+	def test_date_due_is_end_of_day(self):
+		due = date(2026, 11, 15)
+		cases = (
+			("B exactly 24 h before end of day", "B", datetime(2026, 11, 14, 23, 59, 59), "High"),
+			("B 24 h + 1 s before end of day", "B", datetime(2026, 11, 14, 23, 59, 58), "Medium"),
+			("D with a date", "D", datetime(2026, 11, 1, 9, 0, 0), "High"),
+		)
+		for name, category, now, expected in cases:
+			with self.subTest(case=name):
+				decision = routing.decide_route(
+					Classification(category=category, confidence="Cao", importance=1),
+					"Thông thường",
+					DEFAULT_CATEGORY_MAPPING,
+					CONFIG,
+					team_exists=lambda team: True,
+					is_excluded_team=lambda team: False,
+					is_active_agent=lambda user: True,
+					due_at=due,
+					due_field_configured=True,
+					now=now,
+				)
+				self.assertEqual(decision.priority, expected)
+
+	def test_as_deadline(self):
+		moment = datetime(2026, 11, 15, 8, 30, 0)
+		cases = (
+			("None", None, None),
+			("empty", "", None),
+			("datetime kept", moment, moment),
+			("date is end of day", date(2026, 11, 15), datetime(2026, 11, 15, 23, 59, 59)),
+		)
+		for name, value, expected in cases:
+			with self.subTest(case=name):
+				result = routing.as_deadline(value)
+				self.assertEqual(result, expected)
+				self.assertIs(type(result), type(expected))
 
 	def test_existing_rules_kept(self):
 		for category, expected in EXPECTED.items():

@@ -9,6 +9,7 @@ from unittest.mock import patch
 
 import frappe
 from frappe.tests.utils import FrappeTestCase
+from frappe.utils.file_lock import LockTimeoutError
 from frappe.utils.synchronization import filelock
 from helpdesk.test_utils import create_agent, make_ticket
 
@@ -18,6 +19,7 @@ from erp_ai.agent.changes.process_runner import CommandResult
 from erp_ai.agent.tools import change_guard, source
 from erp_ai.agent.tools.registry import ToolContext, execute_tool
 from erp_ai.constants import (
+	AGENT_USER,
 	BOT_GIT_EMAIL,
 	CHANGE_KIND_CODE,
 	CHANGE_KIND_COMMAND,
@@ -25,6 +27,7 @@ from erp_ai.constants import (
 	CHANGE_STATUS_APPROVED,
 	CHANGE_STATUS_FAILED,
 	CHANGE_STATUS_STALE,
+	CHANGE_STATUS_UNDOING,
 	CHANGE_STATUS_UNDONE,
 	COMMAND_TIMEOUT_S,
 	LOG_DOCTYPE,
@@ -37,6 +40,7 @@ from erp_ai.test_utils import (
 	GitSandbox,
 	add_credential,
 	make_change_proposal,
+	pin_agent_roles,
 	set_agent_settings,
 )
 
@@ -2634,3 +2638,104 @@ class TestNoKeyLeak(ApplyJobTestCase):
 			self.sandbox.switch_branch(APP, f"leak/{FAKE_KEY}")
 			leaked = self.leaks(self.run_flow())
 			self.assertTrue({"tool_result", "proposal", "log"} <= leaked, leaked)
+
+
+class TestActorRecheckAndLock(ApplyJobTestCase):
+	"""ADR-023 decision 2 (M2), ADR-012 decision 7, NFR-6: the job itself refuses the actor and a busy lock.
+
+	The role-lost and other-session-user rows are pinned by `test_rechecks_fail_without_writing` (apply) and
+	`test_undo_rechecks_fail_without_writing` (undo).
+	"""
+
+	ACTOR_REFUSED_TEXT = "người duyệt không còn quyền"
+	LOCK_BUSY_TEXT = "đang có thay đổi khác chạy, không lấy được khóa"
+
+	def read_bytes(self, rel=REL):
+		with open(self.path(rel), "rb") as handle:
+			return handle.read()
+
+	def agent_holds_instructor_role(self):
+		"""Give the agent account `ERP AI Instructor` for this test only, as it holds it on the site today."""
+		frappe.set_user("Administrator")
+		pin_agent_roles(self)
+		frappe.get_doc(
+			{
+				"doctype": "Has Role",
+				"parent": AGENT_USER,
+				"parenttype": "User",
+				"parentfield": "roles",
+				"role": ROLE_INSTRUCTOR,
+			}
+		).db_insert()
+		frappe.clear_cache(user=AGENT_USER)
+		self.assertIn(ROLE_INSTRUCTOR, frappe.get_roles(AGENT_USER))
+
+	def test_apply_refused_when_decider_is_agent_account_even_with_role(self):
+		# The agent account holds the role and is the job's session user: only `NEVER_AUTHORITY` can refuse.
+		self.agent_holds_instructor_role()
+		for action in ("apply", "undo"):
+			with self.subTest(action):
+				self.sandbox = GitSandbox(self)
+				self.sandbox.commit_file(APP, REL, BEFORE)
+				frappe.set_user(ACTOR)
+				name = self.code_proposal()
+				if action == "apply":
+					transitions.approve(name, AGENT_USER)
+					steps = ["approve", "fail"]
+				else:
+					apply_job.run_change(self.approved(name), "apply")
+					self.assertEqual(self.state(name).change_status, CHANGE_STATUS_APPLIED)
+					transitions.request_undo(name, AGENT_USER)
+					steps = ["approve", "apply", "fail"]
+				content, head = self.read_bytes(), self.head()
+				frappe.set_user(AGENT_USER)
+
+				apply_job.run_change(name, action)
+
+				state = self.state(name)
+				self.assertEqual(
+					(state.change_status, state.failure_reason),
+					(CHANGE_STATUS_FAILED, self.ACTOR_REFUSED_TEXT),
+				)
+				self.assertEqual(self.read_bytes(), content)
+				self.assertEqual(self.head(), head)
+				self.assertEqual(self.worktree_changes(), "")
+				self.assertEqual(self.steps(name), steps)
+
+	def test_lock_timeout_fails_with_reason_one_log_row_zero_subprocess(self):
+		# A file change and a bench command waiting in `Đã duyệt`, then a file change waiting in `Đang hoàn tác`.
+		for label in ("code apply", "command apply", "undo"):
+			with self.subTest(label):
+				frappe.set_user(ACTOR)
+				if label == "command apply":
+					command = make_change_proposal(
+						CHANGE_KIND_COMMAND, app=APP, command_args=json.dumps(["build", "--app", APP])
+					)
+					name = self.approved(command.name)
+				else:
+					name = self.approved(self.code_proposal())
+				action, waiting, steps = "apply", CHANGE_STATUS_APPROVED, ["approve", "fail"]
+				if label == "undo":
+					apply_job.run_change(name, "apply")
+					transitions.request_undo(name, ACTOR)
+					action, waiting, steps = "undo", CHANGE_STATUS_UNDOING, ["approve", "apply", "fail"]
+				self.assertEqual(self.state(name).change_status, waiting)
+				content, head = self.read_bytes(), self.head()
+
+				with (
+					patch.object(
+						apply_job, "filelock", side_effect=LockTimeoutError(apply_job.LOCK_NAME)
+					) as lock,
+					patch("subprocess.Popen", wraps=subprocess.Popen) as popen,
+				):
+					apply_job.run_change(name, action)
+
+				lock.assert_called_once()
+				popen.assert_not_called()
+				state = self.state(name)
+				self.assertEqual(
+					(state.change_status, state.failure_reason), (CHANGE_STATUS_FAILED, self.LOCK_BUSY_TEXT)
+				)
+				self.assertEqual(self.steps(name), steps)
+				self.assertEqual(self.read_bytes(), content)
+				self.assertEqual(self.head(), head)

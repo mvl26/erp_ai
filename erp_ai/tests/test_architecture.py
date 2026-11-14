@@ -6466,6 +6466,19 @@ class TestScannersCatchViolations(unittest.TestCase):
 				self.assertCaught(
 					check_no_forbidden_git_operations_in_product(sources), CHANGE_GUARD_FILE, "config"
 				)
+		# a git dir found at runtime, no literal .git: only the subprocess-file config branch sees it
+		for rel in SUBPROCESS_FILES:
+			for config_read in (
+				"open(f'{git_dir}/config')",
+				"open(os.path.join(git_dir, 'config'))",
+			):
+				with self.subTest(rel=rel, config_read=config_read):
+					sources = self.git_product(
+						rel, f"\n\ndef f(r):\n\tgit_dir = locate(r)\n\treturn {config_read}\n"
+					)
+					self.assertCaught(
+						check_no_forbidden_git_operations_in_product(sources), rel, "git config file"
+					)
 
 	def test_forbidden_git_operations_clean_cases(self):
 		clean = self.git_product(
@@ -6473,6 +6486,10 @@ class TestScannersCatchViolations(unittest.TestCase):
 			"\nMESSAGE = 'remote không tên; nhánh theo dõi upstream'\nGIT_DIR = '.git'\nSETTINGS = os.path.join(root, 'config')\n",
 		)
 		self.assertEqual(check_no_forbidden_git_operations_in_product(clean), [])
+		for rel in SUBPROCESS_FILES:
+			with self.subTest(rel=rel):
+				clean = self.git_product(rel, "\nSTEP = 'configure'\nPATH = 'etc/configure'\n")
+				self.assertEqual(check_no_forbidden_git_operations_in_product(clean), [])
 
 	def test_git_write_argv_shape_caught(self):
 		write = "\nX = _run_git_write(r, rel, 1, {args})\n"

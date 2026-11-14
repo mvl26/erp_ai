@@ -5,7 +5,7 @@ from unittest.mock import patch
 
 from frappe.tests.utils import FrappeTestCase
 
-from erp_ai.agent.changes import process_runner
+from erp_ai.agent.changes import file_writer, process_runner
 from erp_ai.agent.changes.process_runner import (
 	ENV_ALLOWLIST,
 	OUTPUT_MAX_LINES,
@@ -13,6 +13,7 @@ from erp_ai.agent.changes.process_runner import (
 	run_bench,
 )
 from erp_ai.agent.tools import source
+from erp_ai.test_utils import GitSandbox
 
 RUN_PATH = "erp_ai.agent.changes.process_runner.subprocess.run"
 CLOCK_PATH = "erp_ai.agent.changes.process_runner.time.monotonic"
@@ -490,3 +491,38 @@ class TestGitWrites(FrappeTestCase):
 						self._call(function, rel=rel)
 					self.assertEqual(run.call_args.args[0][-1], rel)
 					self.assertEqual(run.call_args.args[0][-2], "--")
+
+
+SANDBOX_APP = "custom_app"
+DELETED_REL = "myapp/a.py"
+OTHER_STAGED_REL = "myapp/staged.py"
+
+
+class TestCommitOnlyRecordsDeletion(FrappeTestCase):
+	"""T-0 (design 8.0, AC-38, AC-52): a real `git commit --only -- <deleted path>` on a `GitSandbox` repo."""
+
+	def setUp(self):
+		self.sandbox = GitSandbox(self, apps=(SANDBOX_APP,), erp_ai_worktree=None)
+		self.sandbox.commit_file(SANDBOX_APP, DELETED_REL, "a = 1\n")
+		self.repo_root = self.sandbox.repo(SANDBOX_APP)
+
+	def _git(self, *args) -> str:
+		return self.sandbox.git(SANDBOX_APP, *args)
+
+	def test_single_deleted_path_recorded(self):
+		print(f"T-0 {self._git('--version').strip()}")
+		self.sandbox.stage(SANDBOX_APP, OTHER_STAGED_REL, "s = 1\n")
+		before_head = self._git("rev-parse", "HEAD").strip()
+
+		file_writer.remove_created(os.path.join(self.repo_root, DELETED_REL))
+		outcome = process_runner.git_commit_only(self.repo_root, DELETED_REL, SUBJECT, BODY, 20)
+
+		self.assertEqual(outcome.exit_code, 0, outcome.output)
+		self.assertEqual(self._git("rev-parse", "HEAD~1").strip(), before_head)
+		self.assertEqual(
+			self._git("diff-tree", "--no-commit-id", "--name-status", "-r", "HEAD"), f"D\t{DELETED_REL}\n"
+		)
+		self.assertEqual(self._git("ls-files", "--", DELETED_REL), "")
+		self.assertEqual(self._git("status", "--porcelain", "--", DELETED_REL), "")
+		self.assertEqual(self._git("status", "--porcelain"), f"A  {OTHER_STAGED_REL}\n")
+		self.assertEqual(self._git("diff", "--cached", "--name-only"), f"{OTHER_STAGED_REL}\n")

@@ -36,3 +36,9 @@
 {"ts":"2026-11-14T00:27:34+07:00","event":"end","session_id":"5ac98490-8cc8-4e7f-842a-c99381452aec","feature":"CHG-001","stage":"analyze","reason":"other","duration_s":1,"compactions":0}
 {"ts":"2026-11-14T00:29:02+07:00","event":"end","session_id":"6746c478-ad1c-4798-adbb-8b7c4fcb4eb9","feature":"CHG-001","stage":"analyze","reason":"other","duration_s":33357,"compactions":0}
 {"ts":"2026-11-14T00:29:05+07:00","event":"end","session_id":"c636a144-dd7a-4180-ba4e-4720e0d5691c","feature":"CHG-001","stage":"analyze","reason":"other","duration_s":0,"compactions":0}
+{"ts":"2026-11-14T14:51:44+07:00","event":"end","session_id":"5942e923-2824-448e-9ab0-c0fc5740c25a","feature":"FEAT-004","stage":"build","reason":"other","duration_s":1,"compactions":0}
+{"ts":"2026-11-14T14:55:53+07:00","event":"end","session_id":"0b4f4da3-efe3-4030-b9ba-9566a630d3d0","feature":"FEAT-004","stage":"build","reason":"other","duration_s":1,"compactions":0}
+{"ts":"2026-11-14T14:55:53+07:00","event":"end","session_id":"0d5c477f-e78f-4f24-a0ea-296d795134aa","feature":"FEAT-004","stage":"build","reason":"other","duration_s":1,"compactions":0}
+{"ts":"2026-11-14T14:55:53+07:00","event":"end","session_id":"bdd25f95-74ed-4969-a022-7373a3fc87a1","feature":"FEAT-004","stage":"build","reason":"other","duration_s":1,"compactions":0}
+{"ts":"2026-11-14T14:58:20+07:00","event":"end","session_id":"62a1ed1f-8217-4ad4-9377-b1851a22ae2f","feature":"FEAT-004","stage":"build","reason":"other","duration_s":0,"compactions":0}
+{"ts":"2026-11-14T20:55:58+07:00","event":"compact","session_id":"2d940539-6061-4dd2-bb77-4dac1d52f6e2","feature":"FEAT-004","stage":"wave","trigger":"auto"}

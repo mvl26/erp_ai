@@ -272,7 +272,7 @@ Căn cứ: `acceptance.md` @ `8351761` (Verdict: rework; F-3, F-4, F-5), lệnh 
 Không sửa `erp_ai/gateway/test_gateway.py`: phép so `used_sinks()` ở `:937` giữ nguyên độ chặt (STD-TEST-5).
 
 ### Ràng buộc chung của phần chèn
-- Tên logger giữ nguyên `"erp_ai.source"`; chữ và mức của 9 chỗ ghi log (`source.py:153, 213, 309, 315, 318, 418, 421, 615` và chỗ tương ứng) không đổi.
+- Tên logger giữ nguyên `"erp_ai.source"`; chữ và mức của 8 chỗ ghi log (`source.py:153, 213, 309, 315, 318, 418, 421, 615`) không đổi.
 - Chỉ `source.py:13` gọi `frappe.logger` ở mức module trong `erp_ai/**` ngoài test (grep 2026-11-14: 17 chỗ gọi, 16 chỗ nằm trong thân hàm).
 - Mọi `bench --site miyano run-tests` bọc `flock -w 1800 /home/miyano/frappe-bench/apps/erp_ai/.team/miyano-site.lock`, mỗi lúc một lệnh; `QueryDeadlockError` thì chạy lại theo tên một lần. Không chạy `cmd.test` cả app ở lượt này (team-leader xếp khung giờ riêng cho qa).
 

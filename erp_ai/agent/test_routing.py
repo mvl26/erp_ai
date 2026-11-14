@@ -904,3 +904,95 @@ class TestDWatcher(FrappeTestCase):
 		self.assertEqual(old_shape, _decide_watcher("D", _AgentCheck(active=True), d_watcher=None))
 		self.assertIsNone(old_shape.watcher)
 		self.assertEqual(_watcher_notes(old_shape), [])
+
+
+RESPONSE_CONFIG = {
+	"expected_sla": {
+		"B": {"response_min": 30, "resolution_min": 240},
+		"C": {"response_min": 60, "resolution_min": 1440},
+		"E": {"response_min": None, "resolution_min": None},
+	}
+}
+
+
+class TestResponseOverdue(FrappeTestCase):
+	def setUp(self):
+		keep_agent_settings(self)
+
+	def test_over_exact_answered(self):
+		created = datetime(2026, 11, 14, 8, 0, 0)
+		mark = created + timedelta(minutes=30)
+		second = timedelta(seconds=1)
+		cases = (
+			# (name, first_responded_on, category, config, now, expected)
+			("B over the mark by 1 s", None, "B", RESPONSE_CONFIG, mark + second, True),
+			("B exactly at the mark", None, "B", RESPONSE_CONFIG, mark, False),
+			("B before the mark", None, "B", RESPONSE_CONFIG, mark - second, False),
+			("C uses its own 60 min mark", None, "C", RESPONSE_CONFIG, mark + second, False),
+			(
+				"C over its own mark",
+				None,
+				"C",
+				RESPONSE_CONFIG,
+				created + timedelta(minutes=60) + second,
+				True,
+			),
+			(
+				"answered before the mark",
+				created + timedelta(minutes=5),
+				"B",
+				RESPONSE_CONFIG,
+				mark + second,
+				False,
+			),
+			(
+				"answered after the mark",
+				mark + timedelta(minutes=5),
+				"B",
+				RESPONSE_CONFIG,
+				mark + timedelta(hours=1),
+				False,
+			),
+			("unknown category", None, "Z", RESPONSE_CONFIG, mark + timedelta(hours=1), False),
+			("None category", None, None, RESPONSE_CONFIG, mark + timedelta(hours=1), False),
+			(
+				"category missing from expected_sla",
+				None,
+				"A",
+				RESPONSE_CONFIG,
+				mark + timedelta(hours=1),
+				False,
+			),
+			("response_min null", None, "E", RESPONSE_CONFIG, mark + timedelta(hours=1), False),
+			("expected_sla missing", None, "B", {}, mark + timedelta(hours=1), False),
+			("config None", None, "B", None, mark + timedelta(hours=1), False),
+		)
+		for name, responded, category, config, now, expected in cases:
+			with self.subTest(case=name):
+				self.assertIs(routing.response_overdue(created, responded, category, config, now), expected)
+
+	def test_processing_deadline_d_with_and_without_due(self):
+		resolution_by = datetime(2026, 11, 14, 17, 0, 0)
+		due_at = datetime(2026, 11, 20, 10, 30, 0)
+		end_of_day = datetime(2026, 11, 20, 23, 59, 59)
+		cases = (
+			# (name, category, resolution_by, due_at, expected)
+			("D with due_at", "D", resolution_by, due_at, due_at),
+			("D without due_at", "D", resolution_by, None, resolution_by),
+			("D with a date", "D", resolution_by, date(2026, 11, 20), end_of_day),
+			("D without due_at nor resolution_by", "D", None, None, None),
+			("E with due_at", "E", resolution_by, due_at, due_at),
+			("E with a date", "E", None, date(2026, 11, 20), end_of_day),
+			("E without due_at", "E", resolution_by, None, resolution_by),
+			("A due_at ignored", "A", resolution_by, due_at, resolution_by),
+			("B due_at ignored", "B", resolution_by, due_at, resolution_by),
+			("C due_at ignored", "C", resolution_by, due_at, resolution_by),
+			("F due_at ignored", "F", resolution_by, due_at, resolution_by),
+			("None category", None, resolution_by, due_at, resolution_by),
+			("B without resolution_by", "B", None, due_at, None),
+		)
+		for name, category, resolution, due, expected in cases:
+			with self.subTest(case=name):
+				result = routing.processing_deadline(category, resolution, due)
+				self.assertEqual(result, expected)
+				self.assertIs(type(result), type(expected))

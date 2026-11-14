@@ -71,7 +71,7 @@ Giới hạn của bằng chứng: lần cả app (`A:21`, `A:148`) chưa lần 
 - R-6 / O-17: không có lần cả app `OK`; O-1..O-8 (8 test `test_runner_routing`/`test_runner_status` còn 1213; O-8 chưa phân loại) không thuộc AC-24..35 nhưng nằm trong cùng lần cả app.
 - O-24: cột "Mã nhận về" của N-7 là ảnh chụp lịch sử.
 
-## Phán quyết
+## Phán quyết riêng của qa (ghi 2026-11-14 @ `7a134ae`, giữ nguyên)
 
 Ý kiến riêng của qa, đọc từ bằng chứng trên: cả 12 tiêu chí đều có bằng chứng tự động xanh của qa FEAT-004 trên mã trùng với `develop` @ `7a134ae`; không tiêu chí nào thiếu bằng chứng, không tiêu chí nào đỏ vì mã. Nhưng theo luật nghiệm thu, qa không ghi `accepted` khi còn: (1) phần NOT VERIFIABLE của AC-25 (trình duyệt thật) và AC-28 (dòng `Info` trên trang phiếu thật); (2) checklist mục 2 (`cmd.test` chưa lần nào `OK`) và mục 4 (migration up/down/up chưa do qa chạy). Cùng bằng chứng này, qa FEAT-004 cũng giữ `rework` (`A:188-194`).
 
@@ -83,4 +83,32 @@ Không có task dev nào phải làm lại. Việc cần làm và chủ:
 
 Phán quyết này dựa hoàn toàn vào nghiệm thu FEAT-004 và quyết định của người ngày 2026-11-14; không có gì được chạy lại. Quyết định đó ("Chấp nhận với bằng chứng hiện có") đã miễn mục 2 và mục 4 cho FEAT-004, gồm cả AC-24..AC-35; nếu người mở rộng quyết định đó cho CHG-001 thì đó là chấp nhận của người, không phải nghiệm thu sạch của qa.
 
-Verdict: rework
+qa kết luận `rework` (dòng máy đọc lúc 2026-11-14 là "Verdict" = `rework`; viết lại ở dạng chữ để `team.py` chỉ đọc dòng cuối). Kết luận và các lý do ở trên không đổi.
+
+## Bằng chứng mới, chỉ đọc (2026-11-15, `develop` @ `bf1d766`)
+
+qa không chạy test, không chạy lệnh site nào; chỉ `git` chỉ-đọc và đọc file.
+
+- Lần cả app `OK` đầu tiên trên mã chứa toàn bộ FEAT-004: `docs/team/features/FEAT-005/acceptance.md:27` — `cmd.test` = `PYTHONPATH=$W bench --site miyano run-tests --app erp_ai` (trong khóa, 23:44:29–23:52:39), exit 0, `Ran 1564 tests in 488.122s` / `OK`; `deadlock lines: 0`. Commit: `03373f18af49bd77fd44eae0feea3d502367d41d` (`FEAT-005/acceptance.md:3`). Người chạy: qa FEAT-005.
+- `git merge-base --is-ancestor <c> 03373f1`: `ba89ab3` → yes, `b8d3e74` → yes (T69, T70 có trong commit đó). `git merge-base --is-ancestor 03373f1 bf1d766` → yes.
+- `git diff --stat 03373f1 bf1d766 -- erp_ai` → rỗng: mã trên `develop` @ `bf1d766` trùng commit đã chạy `OK`.
+- `git diff --stat 7a134ae 03373f1 -- erp_ai` → 12 file của FEAT-005 (`runner.py`, `site_api.py`, `tasks.py`, `erp_ai_setting`, các file test), `3574 insertions(+), 111 deletions(-)`. Nghĩa là: mã của AC-30..AC-35 (`site_api`, `runner`) trên `develop` đã khác `7a134ae`; lần `OK` trên chạy trên mã mới này và chạy cả các test phủ AC-24..AC-35 nêu trong bảng.
+
+Bằng chứng này đóng phần "`cmd.test` chưa lần nào `OK`" của checklist mục 2 (cho mã trên `develop` hiện tại). Nó KHÔNG đóng: phần NOT VERIFIABLE của AC-25, AC-28; migration up/down/up của ô `unrestricted_enabled` (mục 4, R-3/O-9; lần up/down/up ở FEAT-005 là của ô FEAT-005, không phải ô này).
+
+## Quyết định của người (2026-11-15)
+
+Người chọn (AskUserQuestion, qua team-leader, `docs/team/journal/CHG-001.pending.md:2`): **"Chấp nhận như FEAT-004"** — áp quyết định "Chấp nhận với bằng chứng hiện có" (`FEAT-004/acceptance.md`, mục "Quyết định của người (2026-11-14)") cho CHG-001.
+
+- Đây là chấp nhận theo quyết định của người, KHÔNG phải nghiệm thu sạch của qa: phán quyết riêng của qa vẫn là `rework` (mục trên).
+- Checklist mục 4 (migration up/down/up do qa chạy, STD-OPS-2) được người miễn, không được qa đánh dấu đạt; người nhận rủi ro này (O-9).
+
+## Còn mở sau quyết định
+
+- **AC-25 — chưa kiểm trên trình duyệt thật.** Mở liên kết Duyệt/Từ chối trên `miyano` bằng trình duyệt thật, dán mô tả/ảnh (`S:484`; O-11); ba người duyệt mở được Desk (O-23). Chủ: **người**.
+- **AC-28 — chưa kiểm trên trình duyệt thật.** Xem dòng `Info` trên trang phiếu Helpdesk thật (O-12). Chủ: **người**.
+- Migration up → down → up của ô `unrestricted_enabled` (R-3/O-9): qa chưa chạy; người nhận rủi ro.
+- Các rủi ro còn lại ở mục "Rủi ro còn lại" trên giữ nguyên (O-13..O-22, O-24, `R4:102` O-1); R-6/O-17 nay có lần cả app `OK` trên `03373f1` (mục "Bằng chứng mới").
+
+Dòng dưới là dạng máy đọc (`team.py`) của QUYẾT ĐỊNH CỦA NGƯỜI 2026-11-15 ("Chấp nhận như FEAT-004"), không phải nghiệm thu sạch của qa; qa giữ `rework`, AC-25 và AC-28 chưa kiểm trên trình duyệt thật (chủ: người).
+Verdict: accepted

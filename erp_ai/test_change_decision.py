@@ -40,6 +40,7 @@ TICKET_CREATOR = "decision.creator@example.com"
 DECIDE = "erp_ai.change_decision.decide"
 RUN_CHANGE = "erp_ai.agent.changes.apply_job.run_change"
 ROLE_REFUSAL = "Chỉ người có vai trò ERP AI Instructor mới duyệt, từ chối hoặc hoàn tác được"
+BAD_LINK_REFUSAL = "Đường dẫn duyệt không hợp lệ hoặc đã bị sửa."
 FORM_SCRIPT_PATH = (
 	Path(__file__).resolve().parent
 	/ "erp_ai_agent"
@@ -210,7 +211,7 @@ class TestChangeDecision(FrappeTestCase):
 		for case, (action, signature, name) in cases.items():
 			with self.subTest(case=case):
 				self.assertRefused(
-					INSTRUCTOR, "POST", action, change_decision.BAD_LINK, signature=signature, name=name
+					INSTRUCTOR, "POST", action, BAD_LINK_REFUSAL, signature=signature, name=name
 				)
 				self.assertEqual(
 					frappe.db.get_value(PROPOSAL_DOCTYPE, other.name, "change_status"), CHANGE_STATUS_PENDING

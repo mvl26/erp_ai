@@ -115,7 +115,7 @@
    "label": "Mức quyền",
    "options": "L0\nL1\nL2\nL3",
    "default": "L0",
-   "description": "L0: chỉ phân loại phiếu mới, ghi vào Log, không sửa phiếu, không trả lời bình luận. L1: đọc dữ liệu, ghi phân loại hoặc gợi ý lên phiếu, đăng bình luận. L2 có công cụ như L1. L3: mức của công cụ bản ghi chung, sửa code. Mức thực tế của từng phiếu trên đường danh mục trắng không vượt Mức tối đa của đầu mục; năm quyền mở rộng tính theo ô này. Chi vượt ngân sách tháng thì tự hạ về L1 (L0 giữ nguyên)."
+   "description": "L0: chỉ phân loại phiếu mới vào Log, không sửa phiếu, không bình luận. L1: đọc dữ liệu, ghi phân loại hoặc gợi ý lên phiếu, bình luận. L2 trở lên: ghi ERP ngoài phiếu qua đề xuất hoặc dòng Tự làm. L3: thêm công cụ bản ghi chung, sửa code. Mỗi phiếu trên đường danh mục trắng không vượt Mức tối đa của đầu mục; năm quyền mở rộng tính theo ô này. Chi vượt ngân sách tháng thì hạ về L1 (L0 giữ nguyên)."
   },
   {
    "fieldname": "agent_enabled_at",
@@ -249,7 +249,7 @@
    "fieldtype": "Table",
    "label": "Danh mục trắng",
    "options": "ERP AI Catalog Rule",
-   "description": "Danh mục trắng của đường chính. Không có dòng nào = bot không ghi ERP ngoài phiếu. Mỗi dòng: hành động, DocType, trường, đầu mục, chế độ Cấm / Cần duyệt / Tự làm. Dòng trỏ vào dữ liệu của app, phân quyền, tài khoản hay chứng từ submit bị chặn khi lưu."
+   "description": "Danh mục trắng của đường chính. Không có dòng nào: 6 hành động có tên thành đề xuất chờ Duyệt; riêng \"Đổi trường\" và thêm người vào nhóm loại trừ cần một dòng, không có thì bị từ chối. Mỗi dòng: hành động, DocType, trường, đầu mục, chế độ Cấm / Cần duyệt / Tự làm. Bảng con không bao giờ là đích. Dòng trỏ vào dữ liệu của app, phân quyền, tài khoản hay chứng từ submit bị chặn khi lưu."
   },
   {
    "fieldname": "user_templates",

@@ -4,7 +4,7 @@ import frappe
 from frappe.tests.utils import FrappeTestCase
 
 from erp_ai.agent import run_log
-from erp_ai.constants import HELPDESK_AGENT_ROLE, LOG_DOCTYPE, ROLE_AGENT
+from erp_ai.constants import HELPDESK_AGENT_ROLE, LOG_DOCTYPE, ROLE_AGENT, ROLE_INSTRUCTOR
 from erp_ai.test_utils import keep_agent_settings
 
 AI_USER = "erp-ai-log-agent@example.com"
@@ -126,7 +126,7 @@ class TestERPAILog(FrappeTestCase):
 	def test_no_role_can_write_or_delete(self):
 		meta = frappe.get_meta(LOG_DOCTYPE)
 		roles = {p.role: p for p in meta.permissions}
-		self.assertEqual(set(roles), {"System Manager", ROLE_AGENT})
+		self.assertEqual(set(roles), {"System Manager", ROLE_AGENT, ROLE_INSTRUCTOR})
 		for role, perm in roles.items():
 			for ptype in ("write", "delete", "submit", "cancel", "amend"):
 				with self.subTest(role=role, ptype=ptype):

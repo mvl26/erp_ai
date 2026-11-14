@@ -2354,7 +2354,7 @@ class TestManualsExcluded(FrappeTestCase):
 		self.assertEqual(source.manuals_root(), self.docs)
 
 	def test_manuals_subdirectory_resolves_but_its_files_do_not(self):
-		# Only files are refused (design.md:492): a subdirectory of the manuals directory still resolves (E-7).
+		# Files are refused (design-w0-fixes-4 điểm 5): an existing subdirectory of the manuals directory still resolves (E-7).
 		sub = os.path.join(self.docs, "vi")
 		self.sandbox.write("myapp/docs/vi/x.md", "# HDSD vi\n")
 		self.assertEqual(source.resolve_safe_path("myapp/docs/vi"), sub)
@@ -2364,6 +2364,49 @@ class TestManualsExcluded(FrappeTestCase):
 		with patch(RUN_PATH, return_value=completed("ok")):
 			self.assertTrue(self.git("log", ["--", "docs/vi"])["ok"])
 			self.assertFalse(self.git("log", ["--", "docs/vi/x.md"])["ok"])
+
+	def test_new_path_inside_manuals_refused(self):
+		# design-w0-fixes-4 điểm 5: a path not yet on disk inside the store is refused like an existing file.
+		self.sandbox.write("myapp/docs/vi/x.md", "# HDSD vi\n")
+		for rel in (
+			"myapp/docs/new.md",
+			"myapp/docs/vi/new.md",
+			"myapp/docs/new_dir/deeper/new.md",
+			"myapp/docs/new_dir/",
+			"myapp/docs/./new.md",
+			"myapp/docs/vi/../new.md",
+			os.path.join(self.docs, "new.md"),
+		):
+			with self.subTest(rel=rel):
+				self.assertFalse(os.path.lexists(os.path.join(self.root, rel)))
+				self.assertIsNone(source.resolve_safe_path(rel))
+		self.assertFalse(source.read_source({"path": "myapp/docs/new.md"}, None)["ok"])
+		# The store itself, its existing subdirectory and new paths just outside it still resolve.
+		for rel, expected in (
+			("myapp/docs", self.docs),
+			("myapp/docs/", self.docs),
+			("myapp/docs/vi", os.path.join(self.docs, "vi")),
+			("myapp/docs-other/new.md", os.path.join(self.root, "myapp", "docs-other", "new.md")),
+			("myapp/docsnew.md", os.path.join(self.root, "myapp", "docsnew.md")),
+			("myapp/new.md", os.path.join(self.root, "myapp", "new.md")),
+			("myapp/docs/../new.md", os.path.join(self.root, "myapp", "new.md")),
+		):
+			with self.subTest(rel=rel):
+				self.assertEqual(source.resolve_safe_path(rel), expected)
+
+	def test_new_path_via_symlink_into_manuals_refused(self):
+		# The comparison uses the real path: a symlink leading into the store is refused for new paths too.
+		os.symlink(self.docs, os.path.join(self.root, "myapp", "docs_link"))
+		os.symlink(os.path.join(self.docs, "ghost.md"), os.path.join(self.root, "myapp", "ghost_link.md"))
+		for rel in ("myapp/docs_link/new.md", "myapp/docs_link/new_dir/new.md", "myapp/ghost_link.md"):
+			with self.subTest(rel=rel):
+				self.assertIsNone(source.resolve_safe_path(rel))
+		self.assertEqual(source.resolve_safe_path("myapp/docs_link"), self.docs)
+		# A symlink inside the store leading out of it: the new path's real location is outside, so it resolves.
+		pkg = os.path.join(self.root, "myapp", "pkg")
+		os.makedirs(pkg)
+		os.symlink(pkg, os.path.join(self.docs, "pkg_link"))
+		self.assertEqual(source.resolve_safe_path("myapp/docs/pkg_link/new.py"), os.path.join(pkg, "new.py"))
 
 	def test_search_source_skips_manuals(self):
 		result = source.search_source({"pattern": "needle"}, None)

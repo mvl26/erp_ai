@@ -2,13 +2,14 @@ import os
 import threading
 from unittest.mock import patch
 
+import frappe
 from frappe.tests.utils import FrappeTestCase
 
 import erp_ai
 from erp_ai.agent.changes import process_runner
 from erp_ai.agent.tools import change_guard, source
 from erp_ai.constants import CORE_APPS
-from erp_ai.test_utils import GitSandbox, TempAppsRoot
+from erp_ai.test_utils import GitSandbox, TempAppsRoot, keep_agent_settings, set_agent_settings
 
 ALLOWED = ("myapp",)
 SITE = "site1.test"
@@ -20,6 +21,7 @@ OTHER_SITE_REFUSAL = "chỉ chạy cho site đang chạy"
 NOT_LISTED_REFUSAL = "lệnh không có trong danh sách cho phép"
 NEEDS_APP_REFUSAL = "lệnh build cần app"
 TAKES_NO_APP_REFUSAL = "lệnh này không nhận app"
+PATH_INVALID_REFUSAL = "đường dẫn không hợp lệ hoặc nằm ngoài apps/"
 APP_NOT_ALLOWED_REFUSAL = "app không có trong danh sách được sửa"
 APP_FORBIDDEN_REFUSAL = "không được sửa app erp_ai hoặc kho git của nó"
 GIT_PATTERN_REFUSAL = 'tên file có ký tự * ? [ ] hoặc bắt đầu bằng ":" hay "-", git không commit an toàn được'
@@ -240,6 +242,24 @@ class TestCheckWritePath(FrappeTestCase):
 			"myapp/sub/../ok.py", ALLOWED, new_file=False, read_git=False
 		)
 		self.assertEqual((normalized.rel_path, normalized.reason), ("myapp/ok.py", None))
+
+	def test_new_file_in_manuals_refused(self):
+		# design-w0-fixes-4 điểm 5: the bot may not write into the manuals store, neither a new nor an existing file.
+		self.addCleanup(frappe.db.rollback)
+		keep_agent_settings(self)
+		self.apps.write("myapp/docs/hdsd.md", "# HDSD\n")
+		set_agent_settings(manuals_dir="myapp/docs")
+		for rel, new_file in (
+			("myapp/docs/new.md", True),
+			("myapp/docs/new_dir/new.md", True),
+			("myapp/docs/hdsd.md", False),
+		):
+			with self.subTest(rel=rel):
+				self.assertEqual(self.reason(rel, new_file=new_file), PATH_INVALID_REFUSAL)
+		# A new file of the same app outside the store is not refused because of its path.
+		for rel in ("myapp/new.md", "myapp/docs-other/new.md", "myapp/pkg/new_module.py"):
+			with self.subTest(rel=rel):
+				self.assertIsNone(self.reason(rel, new_file=True))
 
 	def test_refuses_erp_ai_app(self):
 		self.apps.write("erp_ai/ok.py", "x = 1\n")

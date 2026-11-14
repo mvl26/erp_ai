@@ -2457,6 +2457,210 @@ def check_tool_never_saves_proposal(sources: dict) -> list:
 	return violations
 
 
+# FEAT-004 T32: file-system writes and session/publish in the change path (ADR-013 Ràng buộc) ----------
+FILE_WRITER_FILE = "agent/changes/file_writer.py"
+# mode is the second positional argument of these; a method `.open(` (Path.open) takes it first
+OPEN_FUNCTIONS = ("open", "builtins.open", "io.open", "codecs.open", "os.fdopen")
+OPEN_WRITE_MODE_CHARS = frozenset("wax+")
+OS_OPEN_READ_FLAGS = frozenset(
+	{"O_RDONLY", "O_CLOEXEC", "O_NOFOLLOW", "O_DIRECTORY", "O_NONBLOCK", "O_NOCTTY"}
+)
+FS_WRITE_FUNCTIONS = frozenset(
+	{
+		"os.replace",
+		"os.rename",
+		"os.renames",
+		"os.remove",
+		"os.unlink",
+		"os.rmdir",
+		"os.removedirs",
+		"os.mkdir",
+		"os.makedirs",
+		"os.truncate",
+		"os.ftruncate",
+		"os.write",
+		"os.symlink",
+		"os.link",
+		"os.chmod",
+		"os.chown",
+	}
+)
+FS_WRITE_MODULES = ("shutil", "tempfile")  # every function of these copies, moves, creates or removes files
+PATH_WRITE_METHODS = (
+	"write_text",
+	"write_bytes",
+	"touch",
+	"unlink",
+	"mkdir",
+	"rmdir",
+	"symlink_to",
+	"hardlink_to",
+)
+CHANGES_FORBIDDEN_NAMES = ("set_user", "sendmail", *REALTIME_NAMES)
+SESSION_NAMES = ("frappe.session", "frappe.local.session")
+
+
+def _is_fs_write_name(name: str) -> bool:
+	return name in FS_WRITE_FUNCTIONS or name.split(".")[0] in FS_WRITE_MODULES
+
+
+def _leaf_names(node) -> set:
+	"""Names in an expression, an attribute chain counted by its last part (`os.O_RDONLY` -> "O_RDONLY")."""
+	inner = {id(part.value) for part in ast.walk(node) if isinstance(part, ast.Attribute)}
+	return {
+		referenced_name(part)
+		for part in ast.walk(node)
+		if isinstance(part, ast.Name | ast.Attribute) and id(part) not in inner
+	}
+
+
+def _open_write_reason(call: ast.Call, name: str):
+	"""Why `call` opens a file for writing, else None. A mode the scan cannot read counts as a write."""
+	keywords = _call_keywords(call)
+	hidden = "**kwargs" if any(keyword.arg is None for keyword in call.keywords) else None
+	if name == "os.open":
+		flags = keywords.get("flags", call.args[1] if len(call.args) > 1 else None)
+		if flags is None:
+			return f"os.open with flags through {hidden}" if hidden else None
+		constants = [part for part in ast.walk(flags) if isinstance(part, ast.Constant) and part.value != 0]
+		if constants or _leaf_names(flags) - OS_OPEN_READ_FLAGS:
+			return "os.open with write flags"
+		return None
+	method = isinstance(call.func, ast.Attribute) and call.func.attr == "open" and name not in OPEN_FUNCTIONS
+	if name not in OPEN_FUNCTIONS and not method:
+		return None
+	mode = keywords.get("mode")
+	if mode is None:
+		position = 0 if method else 1
+		mode = call.args[position] if len(call.args) > position else None
+	if mode is None:
+		return f"{name or 'open'} with a mode through {hidden}" if hidden else None
+	if isinstance(mode, ast.Constant) and isinstance(mode.value, str):
+		return (
+			f"{name or 'open'} with mode {mode.value!r}" if OPEN_WRITE_MODE_CHARS & set(mode.value) else None
+		)
+	return f"{name or 'open'} with a mode that is not a string literal"
+
+
+def _fs_writes(rel: str, tree: ast.AST):
+	"""`(lineno or node, message)` for every file-system write or rename/remove in a module: write-mode opens
+	(positional or `mode=`, builtins/io/codecs/os.fdopen/Path.open, os.open flags), the os/shutil/tempfile
+	functions however imported or referenced (`from os import replace`, `import shutil as s`, `f = os.remove`)
+	and the Path write methods."""
+	aliases = import_aliases(tree)
+	for lineno, target in imported_modules(tree, module_name(rel), rel.endswith("__init__.py")):
+		if _is_fs_write_name(target):
+			yield lineno, f"imports {target}"
+	inner = {id(node.value) for node in ast.walk(tree) if isinstance(node, ast.Attribute)}
+	for node in ast.walk(tree):
+		if isinstance(node, ast.Name | ast.Attribute) and id(node) not in inner:
+			name = resolved_name(node, aliases)
+			if _is_fs_write_name(name):
+				yield node, f"uses {name}"
+		if not isinstance(node, ast.Call):
+			continue
+		name = resolved_name(node.func, aliases)
+		reason = _open_write_reason(node, name)
+		if reason:
+			yield node, reason
+		elif (
+			isinstance(node.func, ast.Attribute)
+			and node.func.attr in PATH_WRITE_METHODS
+			and not _is_fs_write_name(name)
+		):
+			yield node, f"calls .{node.func.attr}()"
+
+
+def check_fs_writes_only_in_file_writer(sources: dict) -> list:
+	"""ADR-013 Ràng buộc 2 / design 8.2: in agent/** and the proposal controller, writing, renaming or removing
+	files happens only in agent/changes/file_writer.py (erp_ai/eval/ is outside this rule)."""
+	violations = []
+	for rel, source in only_python(sources).items():
+		if rel == FILE_WRITER_FILE or not (rel.startswith(AGENT_PREFIX) or rel == PROPOSAL_CONTROLLER_FILE):
+			continue
+		for node, message in _fs_writes(rel, parse(rel, source)):
+			text = f"{message}: a file-system write outside {FILE_WRITER_FILE} (ADR-013)"
+			violations.append(
+				f"{rel}:{node}: {text}" if isinstance(node, int) else violation(rel, node, text)
+			)
+	return violations
+
+
+def _names_forbidden(name: str) -> bool:
+	return any(name == forbidden or name.endswith("." + forbidden) for forbidden in CHANGES_FORBIDDEN_NAMES)
+
+
+def _is_session(node, aliases: dict) -> bool:
+	return resolved_name(node, aliases) in SESSION_NAMES
+
+
+def _session_user_writes(tree: ast.AST, aliases: dict):
+	"""`(node, how)` for `frappe.session.user = x`, `frappe.session["user"] = x`, `frappe.local.session = ...`,
+	`setattr(frappe.session, "user", x)` and `frappe.session.update(...)`, however frappe/session was imported."""
+	for node in ast.walk(tree):
+		targets = []
+		if isinstance(node, ast.Assign):
+			targets = node.targets
+		elif isinstance(node, ast.AugAssign | ast.AnnAssign):
+			targets = [node.target]
+		for target in targets:
+			if isinstance(target, ast.Attribute) and (
+				_is_session(target, aliases) or (target.attr == "user" and _is_session(target.value, aliases))
+			):
+				yield target, f"assigns {resolved_name(target, aliases)}"
+			elif (
+				isinstance(target, ast.Subscript)
+				and _is_session(target.value, aliases)
+				and _is_constant(target.slice, "user")
+			):
+				yield target, "assigns the session ['user']"
+		if not isinstance(node, ast.Call):
+			continue
+		if (
+			referenced_name(node.func) == "setattr"
+			and len(node.args) > 1
+			and _is_session(node.args[0], aliases)
+			and _is_constant(node.args[1], "user")
+		):
+			yield node, "setattr on the session user"
+		elif (
+			isinstance(node.func, ast.Attribute)
+			and node.func.attr == "update"
+			and _is_session(node.func.value, aliases)
+		):
+			yield node, "updates the session"
+
+
+def check_changes_never_set_user_or_publish(sources: dict) -> list:
+	"""ADR-013 Ràng buộc ("không có `frappe.set_user`, `publish_realtime`"), widened by task T32 to sendmail and
+	to assigning the session user: agent/changes/** runs as the user who enqueued the job and tells nobody.
+	Any reference counts (call, alias import, `f = frappe.set_user`, the name as a string); reads of
+	`frappe.session.user` are allowed."""
+	reason = f"in {CHANGES_PREFIX} (ADR-013)"
+	violations = []
+	for rel, source in only_python(scoped(sources, CHANGES_PREFIX)).items():
+		tree = parse(rel, source)
+		aliases = import_aliases(tree)
+		for lineno, target in imported_modules(tree, module_name(rel), rel.endswith("__init__.py")):
+			if module_in(target, REALTIME_MODULE) or _names_forbidden(target):
+				violations.append(f"{rel}:{lineno}: imports {target} {reason}")
+		inner = {id(node.value) for node in ast.walk(tree) if isinstance(node, ast.Attribute)}
+		for node in ast.walk(tree):
+			if isinstance(node, ast.Name | ast.Attribute) and id(node) not in inner:
+				name = resolved_name(node, aliases)
+				if _names_forbidden(name):
+					violations.append(violation(rel, node, f"uses {name} {reason}"))
+			elif (
+				isinstance(node, ast.Constant)
+				and isinstance(node.value, str)
+				and _names_forbidden(node.value)
+			):
+				violations.append(violation(rel, node, f"names {node.value!r} in a string {reason}"))
+		for node, how in _session_user_writes(tree, aliases):
+			violations.append(violation(rel, node, f"{how} {reason}"))
+	return violations
+
+
 class TestArchitecture(unittest.TestCase):
 	@classmethod
 	def setUpClass(cls):
@@ -2784,6 +2988,21 @@ class TestArchitecture(unittest.TestCase):
 	def test_tool_never_saves_proposal(self):
 		self.assertIn("proposal.insert()", self.sources[PROPOSE_TOOL_FILE])
 		self.assertEqual(check_tool_never_saves_proposal(self.sources), [])
+
+	def test_fs_writes_only_in_file_writer(self):
+		for rel in (FILE_WRITER_FILE, PROPOSAL_CONTROLLER_FILE, PROPOSE_TOOL_FILE, CHANGE_GUARD_FILE):
+			self.assertIn(rel, self.sources)
+		# The scan sees the real writer's writes, so a clean result elsewhere is not a blind scan.
+		writer = parse(FILE_WRITER_FILE, self.sources[FILE_WRITER_FILE])
+		found = " ".join(message for _node, message in _fs_writes(FILE_WRITER_FILE, writer))
+		for expected in ("os.replace", "os.remove", "tempfile.mkstemp", "os.fdopen with mode 'wb'"):
+			self.assertIn(expected, found)
+		self.assertEqual(check_fs_writes_only_in_file_writer(self.sources), [])
+
+	def test_changes_never_set_user_or_publish(self):
+		self.assertIn("frappe.session.user", self.sources["agent/changes/apply_job.py"])  # a read is allowed
+		self.assertGreater(len(only_python(scoped(self.sources, CHANGES_PREFIX))), 3)
+		self.assertEqual(check_changes_never_set_user_or_publish(self.sources), [])
 
 	def test_agent_modules_import_alone_in_fresh_process(self):
 		# STD-DESIGN-6: an import cycle stays hidden in-process when another test imported a module first.
@@ -4634,6 +4853,156 @@ class TestScannersCatchViolations(unittest.TestCase):
 	def test_site_api_handlers_behind_deny_gate_clean(self):
 		# The real module is held to the same rule by TestArchitecture.test_tool_never_saves_proposal.
 		self.assertEqual(check_tool_never_saves_proposal({SITE_API_FILE: SITE_API_GATED}), [])
+
+	# FEAT-004 T32: file-system writes, session and publish in the change path (ADR-013) --------------
+
+	def test_fs_writes_caught_outside_file_writer(self):
+		cases = {
+			"open positional w": "open(p, 'w')\n",
+			"open positional a": "with open(p, 'ab') as f:\n\tf.write(b)\n",
+			"open positional x": "open(p, 'x')\n",
+			"open r+": "open(p, 'r+')\n",
+			"open mode= w": "open(p, mode='w', encoding='utf-8')\n",
+			"open mode= a": "open(file=p, mode='a')\n",
+			"open non-literal mode": "MODE = 'w'\nopen(p, MODE)\n",
+			"open mode through a helper": "def _mode():\n\treturn 'w'\n\ndef save(p):\n\treturn open(p, _mode())\n",
+			"open mode through **kwargs": "open(p, **options)\n",
+			"io.open": "import io\nio.open(p, 'w')\n",
+			"io aliased": "import io as i\ni.open(p, mode='wb')\n",
+			"codecs.open": "import codecs\ncodecs.open(p, 'w', 'utf-8')\n",
+			"os.fdopen": "import os\nos.fdopen(fd, 'wb')\n",
+			"Path.open": "from pathlib import Path\nPath(p).open('w')\n",
+			"Path.open mode=": "from pathlib import Path\nPath(p).open(mode='a')\n",
+			"os.open write flags": "import os\nos.open(p, os.O_WRONLY | os.O_CREAT)\n",
+			"os.open int flags": "import os\nos.open(p, 577)\n",
+			"os.replace": "import os\nos.replace(a, b)\n",
+			"os.rename": "import os\nos.rename(a, b)\n",
+			"os.remove": "import os\nos.remove(p)\n",
+			"os.unlink": "import os\nos.unlink(p)\n",
+			"from os import replace": "from os import replace\nreplace(a, b)\n",
+			"from os import remove as rm": "from os import remove as rm\nrm(p)\n",
+			"import os as o": "import os as o\no.unlink(p)\n",
+			"os function as a value": "import os\ncleanup = os.remove\ncleanup(p)\n",
+			"os.makedirs": "import os\nos.makedirs(d, exist_ok=True)\n",
+			"shutil": "import shutil\nshutil.copyfile(a, b)\n",
+			"shutil aliased": "import shutil as s\ns.move(a, b)\n",
+			"from shutil import": "from shutil import rmtree\nrmtree(d)\n",
+			"tempfile": "import tempfile\ntempfile.NamedTemporaryFile(dir=d)\n",
+			"from tempfile import mkstemp as m": "from tempfile import mkstemp as m\nm(dir=d)\n",
+			"Path.write_text": "from pathlib import Path\nPath(p).write_text(s)\n",
+			"Path.write_bytes chain": "self.root.joinpath(rel).write_bytes(b)\n",
+			"Path.unlink": "target.unlink(missing_ok=True)\n",
+			"Path.touch": "target.touch()\n",
+		}
+		for rel in (
+			"agent/changes/apply_job.py",
+			"agent/changes/process_runner.py",
+			PROPOSE_TOOL_FILE,
+			CHANGE_GUARD_FILE,
+			PROPOSAL_CONTROLLER_FILE,
+			"agent/run_log.py",
+		):
+			for case, source in cases.items():
+				with self.subTest(rel=rel, case=case):
+					self.assertCaught(check_fs_writes_only_in_file_writer({rel: source}), rel)
+
+	def test_fs_reads_and_file_writer_writes_are_clean(self):
+		writer = (
+			"import os\nimport tempfile\n"
+			"fd, temp = tempfile.mkstemp(dir=d)\n"
+			"with os.fdopen(fd, 'wb') as handle:\n\thandle.write(b)\n"
+			"os.replace(temp, full)\nos.remove(full)\n"
+		)
+		clean = {
+			FILE_WRITER_FILE: writer,
+			PROPOSE_TOOL_FILE: "with open(full, 'rb') as handle:\n\tdata = handle.read()\n",
+			CHANGE_GUARD_FILE: "import os\nwith open(p, encoding='utf-8') as h:\n\tos.path.join(a, b)\n",
+			"agent/tools/source.py": "open(full, 'r', encoding='utf-8', errors='replace')\nopen(p, mode='rt')\n",
+			"agent/changes/apply_job.py": (
+				"import os\nfrom pathlib import Path\n"
+				"text = Path(p).read_text()\nPath(p).open()\nos.open(p, os.O_RDONLY | os.O_CLOEXEC)\n"
+				"name = name.replace('a', 'b')\nos.path.exists(p)\nfile_writer.remove_created(full)\n"
+			),
+			PROPOSAL_CONTROLLER_FILE: "doc.rename(new)\n",
+			# Outside agent/** and the controller the rule does not apply (ADR-013: eval/ untouched).
+			"eval/run_eval.py": "import shutil\nopen(p, 'w')\nshutil.rmtree(d)\n",
+			"install.py": "import os\nos.remove(p)\n",
+		}
+		self.assertEqual(check_fs_writes_only_in_file_writer(clean), [])
+
+	def test_changes_set_user_or_publish_caught(self):
+		cases = {
+			"set_user": "import frappe\nfrappe.set_user('Administrator')\n",
+			"set_user aliased import": "from frappe import set_user as su\nsu(owner)\n",
+			"set_user aliased module": "import frappe as f\nf.set_user(owner)\n",
+			"set_user as a value": "import frappe\nbecome = frappe.set_user\nbecome(owner)\n",
+			"set_user by string": "import frappe\ngetattr(frappe, 'set_user')(owner)\n",
+			"session.user assigned": "import frappe\nfrappe.session.user = owner\n",
+			"local.session.user assigned": "import frappe\nfrappe.local.session.user = owner\n",
+			"session imported then assigned": "from frappe import session\nsession.user = owner\n",
+			"session subscript": "import frappe\nfrappe.session['user'] = owner\n",
+			"session setattr": "import frappe\nsetattr(frappe.session, 'user', owner)\n",
+			"session update": "import frappe\nfrappe.session.update(user=owner)\n",
+			"session replaced": "import frappe\nfrappe.local.session = frappe._dict(user=owner)\n",
+			"publish_realtime": "import frappe\nfrappe.publish_realtime('e', {}, user=u)\n",
+			"publish_realtime from realtime": "from frappe.realtime import publish_realtime as p\np('e')\n",
+			"realtime module": "import frappe.realtime\n",
+			"publish_progress": "import frappe\nfrappe.publish_progress(50)\n",
+			"publish by dotted string": "import frappe\nfrappe.get_attr('frappe.publish_realtime')('e')\n",
+			"sendmail": "import frappe\nfrappe.sendmail(recipients=[u], subject='s')\n",
+			"sendmail aliased": "from frappe import sendmail as mail\nmail(recipients=[u])\n",
+		}
+		for rel in (
+			"agent/changes/apply_job.py",
+			"agent/changes/transitions.py",
+			"agent/changes/new_step.py",
+		):
+			for case, source in cases.items():
+				with self.subTest(rel=rel, case=case):
+					self.assertCaught(check_changes_never_set_user_or_publish({rel: source}), rel, "ADR-013")
+
+	def test_changes_session_reads_and_other_modules_are_clean(self):
+		clean = {
+			"agent/changes/apply_job.py": (
+				"import frappe\nif frappe.session.user != runner:\n\tpass\n"
+				"user = frappe.session.user\nnote = 'never calls set_user or publish_realtime'\n"
+				"doc.user = frappe.session.user\nrow['user'] = user\n"
+			),
+			"agent/changes/transitions.py": "import frappe\nfrappe.db.set_value(D, n, {'decided_by': frappe.session.user})\n",
+			# Outside agent/changes/ this rule does not apply (run_status.py publishes, by ADR-008).
+			RUN_STATUS_FILE: "import frappe\nfrappe.publish_realtime('e', {}, room=r, after_commit=False)\n",
+			"agent/runner.py": "import frappe\nfrappe.set_user(u)\n",
+		}
+		self.assertEqual(check_changes_never_set_user_or_publish(clean), [])
+
+	# FEAT-004 T32: the enqueue and subprocess rules also catch the change path ------------------------
+
+	def test_single_enqueue_catches_change_path_files(self):
+		for rel in ("agent/changes/apply_job.py", PROPOSE_TOOL_FILE, PROPOSAL_CONTROLLER_FILE):
+			for source in (
+				"import frappe as f\nf.enqueue('erp_ai.agent.changes.apply_job.run_change')\n",
+				"from frappe.utils.background_jobs import enqueue as later\nlater('x')\n",
+				"import frappe\nfrappe.enqueue_doc(D, n, 'run')\n",
+			):
+				with self.subTest(rel=rel, source=source):
+					self.assertCaught(check_single_enqueue_site({rel: source}), rel, QUEUE_FILE)
+
+	def test_subprocess_caught_in_change_path_files(self):
+		for rel in (
+			"agent/changes/apply_job.py",
+			FILE_WRITER_FILE,
+			PROPOSE_TOOL_FILE,
+			CHANGE_GUARD_FILE,
+			PROPOSAL_CONTROLLER_FILE,
+		):
+			for source in (
+				"import subprocess as sp\nsp.run(['bench', 'migrate'], timeout=3)\n",
+				"from subprocess import check_output as co\nco(['git', 'status'], timeout=3)\n",
+				"from os import system\nsystem('bench migrate')\n",
+				"import os as o\no.execvp('bench', ['bench'])\n",
+			):
+				with self.subTest(rel=rel, source=source):
+					self.assertCaught(check_subprocess_only_in_source_tool({rel: source}), rel, "outside")
 
 
 # A minimal site_api: derived always-denied set, a refusal gating on it, two handlers gated before writing.

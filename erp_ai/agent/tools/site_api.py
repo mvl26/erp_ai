@@ -6,6 +6,7 @@ submit, cancel and call whitelisted methods. The app's own DocTypes and secret f
 """
 
 import json
+import re
 
 import frappe
 from frappe.utils import strip_html
@@ -28,6 +29,34 @@ PERMISSION_DOCTYPES = frozenset({"Custom Role", "Custom DocPerm", DOCTYPE_DOCTYP
 FORBIDDEN_ROLES = frozenset({"System Manager", "Administrator", ROLE_INSTRUCTOR, ROLE_AGENT, "Guest", "All"})
 PROTECTED_USERS = frozenset({"Administrator", "Guest", AGENT_USER})
 SECRET_FIELDS = frozenset({"new_password", "api_key", "api_secret", "reset_password_key"})
+# Whitelisted methods that hand back keys or passwords; `call_method` refuses them before the call.
+SECRET_METHODS = frozenset(
+	{
+		"frappe.core.doctype.user.user.generate_keys",
+		"frappe.client.get_password",
+		"frappe.utils.password.get_decrypted_password",
+		"frappe.utils.backups.get_backup_encryption_key",
+		"frappe.integrations.oauth2.get_token",
+	}
+)
+# A method whose last dotted segment holds one of these is refused too.
+SECRET_METHOD_WORDS = ("password", "generate_keys", "secret")
+SECRET_METHOD_REASON = "hàm này trả khóa API hoặc mật khẩu, không gọi qua công cụ"
+# Keys whose value never reaches the model in a `call_method` result, compared casefolded.
+SECRET_RESULT_KEYS = frozenset(
+	key.casefold()
+	for key in SECRET_FIELDS
+	| {"password", "secret", "token", "access_token", "refresh_token", "client_secret", "encryption_key"}
+)
+SECRET_ARGUMENT_REASON = "tham số nhắc tới trường khóa API hoặc mật khẩu, không gọi qua công cụ"
+# Splits argument text into bare names, so `api_key as k` and `tabUser`.`api_key` both yield `api_key`.
+IDENTIFIER_PATTERN = re.compile(r"\w+")
+# `fields`/`fieldname` entries that select every column (`*`, `tabX.*`, `` `tabX`.* ``) return keyless rows
+# that `_scrub` cannot hide; `count(*)` and a `*` in a filter value are not column selectors.
+COLUMN_KEYS = frozenset({"fields", "fieldname"})
+COLUMN_SELECTOR_PATTERN = re.compile(r"\s*(?:(?:`[^`]+`|\w+)\s*\.\s*)?\*\s*")
+COLUMN_SELECTOR_REASON = "tham số chọn mọi cột bằng *, hãy liệt kê tên trường cần lấy"
+SCRUBBED_VALUE = "[đã ẩn]"
 SYSTEM_FIELDS = frozenset(
 	{"doctype", "docstatus", "owner", "creation", "modified", "modified_by", "idx", "parent", "parenttype"}
 )
@@ -238,12 +267,83 @@ def submit_record(args: dict, ctx: ToolContext) -> dict:
 	return _write(doctype, run)
 
 
+def _is_secret_method(method: str) -> bool:
+	last_segment = method.rsplit(".", 1)[-1].casefold()
+	return method in SECRET_METHODS or any(word in last_segment for word in SECRET_METHOD_WORDS)
+
+
+def _parsed(value):
+	"""`value` with every string that parses as a JSON object or array replaced by its parsed form, recursively."""
+	if isinstance(value, str):
+		try:
+			loaded = json.loads(value)
+		except ValueError:
+			return value
+		return _parsed(loaded) if isinstance(loaded, dict | list) else value
+	if isinstance(value, dict):
+		return {str(key): _parsed(item) for key, item in value.items()}
+	if isinstance(value, list | tuple):
+		return [_parsed(item) for item in value]
+	return value
+
+
+def _scrub(value):
+	"""`value` with the value of every key in SECRET_RESULT_KEYS replaced, in nested dicts, lists and tuples."""
+	if isinstance(value, dict):
+		return {
+			key: SCRUBBED_VALUE
+			if isinstance(key, str) and key.casefold() in SECRET_RESULT_KEYS
+			else _scrub(item)
+			for key, item in value.items()
+		}
+	if isinstance(value, list | tuple):
+		return [_scrub(item) for item in value]
+	return value
+
+
+def _selects_every_column(value) -> bool:
+	"""True when a `fields`/`fieldname` value anywhere in the parsed `value` holds a `*` column selector."""
+	if isinstance(value, dict):
+		return any(
+			(key.casefold() in COLUMN_KEYS and _is_column_selector(item)) or _selects_every_column(item)
+			for key, item in value.items()
+		)
+	if isinstance(value, list):
+		return any(_selects_every_column(item) for item in value)
+	return False
+
+
+def _is_column_selector(value) -> bool:
+	if isinstance(value, str):
+		if any(COLUMN_SELECTOR_PATTERN.fullmatch(part) for part in value.split(",")):
+			return True
+		try:
+			loaded = json.loads(value)
+		except ValueError:
+			return False
+		return isinstance(loaded, str) and _is_column_selector(loaded)
+	if isinstance(value, list):
+		return any(_is_column_selector(item) for item in value)
+	return False
+
+
 def _method_refusal(method: str, arguments: dict) -> dict | None:
+	"""Early refusal only: the app's DocTypes are closed for the agent account by their controllers.
+
+	A secret field named in the arguments is refused here because a bare value (`get_value` with
+	`as_dict=0`) carries no key for `_scrub` to hide; this is best effort, not a guarantee."""
 	if method.startswith(OWN_APP_PREFIX):
 		return _fail("không gọi hàm của erp_ai qua công cụ")
-	text = json.dumps(arguments, ensure_ascii=False, default=str)
-	if any(doctype in text for doctype in always_denied_doctypes()):
+	if _is_secret_method(method):
+		return _fail(SECRET_METHOD_REASON)
+	parsed = _parsed(arguments)
+	if _selects_every_column(parsed):
+		return _fail(COLUMN_SELECTOR_REASON)
+	text = json.dumps(parsed, ensure_ascii=False, default=str).casefold()
+	if any(doctype.casefold() in text for doctype in always_denied_doctypes()):
 		return _fail("tham số nhắc tới DocType không được phép dùng qua công cụ")
+	if not SECRET_RESULT_KEYS.isdisjoint(IDENTIFIER_PATTERN.findall(text)):
+		return _fail(SECRET_ARGUMENT_REASON)
 	return None
 
 
@@ -265,7 +365,7 @@ def call_method(args: dict, ctx: ToolContext) -> dict:
 	written = _write(None, run)
 	if not written["ok"]:
 		return written
-	return {"ok": True, "method": method, "result": outcome["result"]}
+	return {"ok": True, "method": method, "result": _scrub(outcome["result"])}
 
 
 def get_record(args: dict, ctx: ToolContext) -> dict:
@@ -449,7 +549,10 @@ TOOLS: list[ToolSpec] = [
 			"name": "api_call_method",
 			"description": (
 				"Gọi một hàm whitelist của Frappe hoặc app khác bằng đường dẫn Python đầy đủ "
-				"(ví dụ frappe.client.get_value), arguments là object tham số. Không gọi được hàm của erp_ai."
+				"(ví dụ frappe.client.get_value), arguments là object tham số. Không gọi được hàm của erp_ai hay hàm trả khóa API, mật khẩu; "
+				"tham số nhắc tới trường khóa hoặc mật khẩu, hoặc chọn mọi cột bằng * (`*`, `tabX.*` trong fields/fieldname), "
+				"bị từ chối và giá trị dưới khóa bí mật trong kết quả được ẩn, "
+				"nhưng đây chỉ là chặn ở mức cố gắng, không bảo đảm mọi bí mật đều bị chặn."
 			),
 			"input_schema": {
 				"type": "object",

@@ -1,8 +1,10 @@
+import json
 from unittest.mock import patch
 
 import frappe
 from frappe.tests.utils import FrappeTestCase
 
+from erp_ai.agent import change_link
 from erp_ai.agent.tools import registry, site_api
 from erp_ai.agent.tools.registry import ToolContext, execute_tool, get_tool_schemas
 from erp_ai.constants import ROLE_AGENT, ROLE_INSTRUCTOR
@@ -23,6 +25,11 @@ OTHER_PROFILE = "SITEAPI hồ sơ thường"
 WEBHOOK_NAME = "SITEAPI-TEST webhook"
 RENAMED_NOTE = "SITEAPI-TEST tên mới"
 DUPLICATE_TAG = "SITEAPI-TEST nhãn trùng"
+FAKE_SECRET = "SITEAPI-FAKE-SECRET-7f3a"
+HIDDEN = "[đã ẩn]"
+SECRET_METHOD_REFUSED = "hàm này trả khóa API hoặc mật khẩu, không gọi qua công cụ"
+SECRET_ARGUMENT_REFUSED = "tham số nhắc tới trường khóa API hoặc mật khẩu, không gọi qua công cụ"
+COLUMN_SELECTOR_REFUSED = "tham số chọn mọi cột bằng *, hãy liệt kê tên trường cần lấy"
 _real_get_all = frappe.get_all
 
 
@@ -792,3 +799,134 @@ class TestSiteApiUnrestricted(FrappeTestCase):
 		self.assertFalse(result["ok"])
 		frappe.set_user("Administrator")
 		self.assertTrue(frappe.db.exists("User", BOSS))
+
+	def test_secret_returning_methods_are_refused_before_call(self):
+		for method in (
+			"frappe.core.doctype.user.user.generate_keys",
+			"frappe.client.get_password",
+			"frappe.utils.password.get_decrypted_password",
+			"frappe.utils.backups.get_backup_encryption_key",
+			"frappe.integrations.oauth2.get_token",
+			"frappe.core.doctype.user.user.update_password",
+			"frappe.twofactor.reset_otp_secret",
+			"other_app.api.Generate_Keys_For",
+		):
+			with patch.object(frappe, "call") as called:
+				result = self.run_tool("api_call_method", {"method": method, "arguments": {"user": BOSS}})
+			self.assertEqual(result, {"ok": False, "reason": SECRET_METHOD_REFUSED}, method)
+			self.assertEqual(called.call_count, 0, method)
+
+	def test_result_secrets_are_scrubbed(self):
+		returned = {
+			"api_secret": FAKE_SECRET,
+			"API_KEY": FAKE_SECRET,
+			"title": "giữ nguyên",
+			"rows": [{"name": "r1", "password": FAKE_SECRET}, ("t1", {"Access_Token": FAKE_SECRET})],
+		}
+		with patch.object(frappe, "call", return_value=returned) as called:
+			result = self.run_tool(
+				"api_call_method", {"method": "frappe.client.get_value", "arguments": {"doctype": "Note"}}
+			)
+		called.assert_called_once()
+		self.assertTrue(result["ok"], result)
+		scrubbed = result["result"]
+		self.assertEqual(scrubbed["title"], "giữ nguyên")
+		self.assertEqual(scrubbed["rows"][0], {"name": "r1", "password": HIDDEN})
+		self.assertEqual(scrubbed["rows"][1], ["t1", {"Access_Token": HIDDEN}])
+		self.assertEqual((scrubbed["api_secret"], scrubbed["API_KEY"]), (HIDDEN, HIDDEN))
+		self.assertEqual(json.dumps(result, ensure_ascii=False).count(FAKE_SECRET), 0)
+
+	def test_arguments_naming_a_secret_field_are_refused_before_call(self):
+		for method, arguments in (
+			(
+				"frappe.client.get_value",
+				{"doctype": "User", "filters": BOSS, "fieldname": "api_key", "as_dict": 0},
+			),
+			(
+				"frappe.client.get_value",
+				{"doctype": "OAuth Bearer Token", "filters": {}, "fieldname": ["Access_Token"], "as_dict": 0},
+			),
+			("frappe.client.get_list", {"doctype": "User", "fields": ["name", "api_key as k"], "as_dict": 0}),
+			("frappe.client.get_list", {"doctype": "User", "fields": '["`tabUser`.`API_KEY`"]'}),
+			("frappe.client.get_list", {"doctype": "User", "fields": ["tabUser.reset_password_key"]}),
+			(
+				"frappe.client.get_value",
+				{"doctype": "User", "filters": {"name": BOSS}, "fieldname": "password"},
+			),
+		):
+			with self.subTest(arguments=arguments), patch.object(frappe, "call") as called:
+				result = self.run_tool("api_call_method", {"method": method, "arguments": arguments})
+				self.assertEqual(result, {"ok": False, "reason": SECRET_ARGUMENT_REFUSED})
+				self.assertEqual(called.call_count, 0)
+
+	def test_get_value_on_an_ordinary_field_still_goes_through(self):
+		arguments = {"doctype": "User", "filters": BOSS, "fieldname": "full_name", "as_dict": 0}
+		with patch.object(frappe, "call", return_value="Sếp") as called:
+			result = self.run_tool(
+				"api_call_method", {"method": "frappe.client.get_value", "arguments": arguments}
+			)
+		called.assert_called_once()
+		self.assertEqual(result, {"ok": True, "method": "frappe.client.get_value", "result": "Sếp"})
+
+	def test_column_selector_star_is_refused_before_call(self):
+		for method, arguments in (
+			("frappe.client.get_list", {"doctype": "User", "fields": ["*"], "as_dict": 0}),
+			("frappe.desk.reportview.get", {"doctype": "User", "fields": ["*"]}),
+			("frappe.client.get_list", {"doctype": "User", "fields": ["name", "tabUser.*"]}),
+			("frappe.client.get_list", {"doctype": "User", "fields": ["`tabUser` . *"]}),
+			("frappe.client.get_list", {"doctype": "User", "fields": '["name", "*"]'}),
+			("frappe.client.get_list", {"doctype": "User", "fields": "name, *"}),
+			("frappe.client.get_value", {"doctype": "User", "filters": BOSS, "fieldname": "*", "as_dict": 0}),
+			("frappe.client.get_list", {"doctype": "User", "fields": '"*"', "as_dict": 0}),
+			(
+				"frappe.client.get_value",
+				{"doctype": "User", "filters": BOSS, "fieldname": '"*"', "as_dict": 0},
+			),
+			("frappe.client.get_list", {"doctype": "User", "args": [{"fields": ["*"]}]}),
+		):
+			with self.subTest(method=method, arguments=arguments), patch.object(frappe, "call") as called:
+				result = self.run_tool("api_call_method", {"method": method, "arguments": arguments})
+				self.assertEqual(result, {"ok": False, "reason": COLUMN_SELECTOR_REFUSED})
+				self.assertEqual(called.call_count, 0)
+
+	def test_star_outside_a_column_selector_still_goes_through(self):
+		for arguments in (
+			{"doctype": "User", "fields": ["name"], "as_dict": 0},
+			{"doctype": "User", "fields": ["count(*) as total"]},
+			{"doctype": "User", "fields": ["name"], "filters": {"full_name": "*"}},
+		):
+			with (
+				self.subTest(arguments=arguments),
+				patch.object(frappe, "call", return_value=[["r1"]]) as called,
+			):
+				result = self.run_tool(
+					"api_call_method", {"method": "frappe.client.get_list", "arguments": arguments}
+				)
+				called.assert_called_once()
+				self.assertEqual(result, {"ok": True, "method": "frappe.client.get_list", "result": [["r1"]]})
+
+	def test_nested_json_doc_naming_app_doctype_is_refused(self):
+		for method, arguments in (
+			# `S` is "S": the name only appears once the `doc` string is parsed as JSON.
+			("frappe.client.insert", {"doc": '{"doctype": "erp ai \\u0053etting", "enabled": 1}'}),
+			("frappe.client.save", {"doc": json.dumps({"doc": '{"doctype": "erp ai credential"}'})}),
+			("frappe.client.get_list", {"doctype": "erp ai log"}),
+		):
+			with patch.object(frappe, "call") as called:
+				result = self.run_tool("api_call_method", {"method": method, "arguments": arguments})
+			self.assertFalse(result["ok"], arguments)
+			self.assertIn("không được phép", result["reason"], arguments)
+			self.assertEqual(called.call_count, 0, arguments)
+
+	def test_decision_method_refused_even_with_valid_signed_link(self):
+		name, action = "AICHG-00001", change_link.ACTION_APPROVE
+		signature = change_link.decision_path(name, action).rsplit(change_link.SIGNATURE_MARK, 1)[1]
+		self.assertTrue(change_link.signature_ok(name, action, signature))
+		arguments = {"name": name, "action": action, "_signature": signature}
+		with patch.object(frappe, "call") as called:
+			result = self.run_tool(
+				"api_call_method", {"method": change_link.DECIDE_METHOD, "arguments": arguments}
+			)
+		self.assertFalse(result["ok"])
+		self.assertIn("erp_ai", result["reason"])
+		self.assertEqual(called.call_count, 0)

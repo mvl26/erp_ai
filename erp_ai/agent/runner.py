@@ -23,9 +23,9 @@ from erp_ai.agent.tools.registry import (
 	ToolContext,
 	execute_tool,
 	get_tool_schemas,
-	get_unrestricted_tool_schemas,
 	grants_change_tools,
 	grants_site_admin_tools,
+	grants_unrestricted_tools,
 )
 from erp_ai.agent.tools.route_ticket import (
 	ASSIGN_REQUEST,
@@ -582,13 +582,8 @@ def _reason(ticket_name, trigger, run_id, settings, context, classification, dea
 		["subject", "description", "status", "priority", "ticket_type", "agent_group", "creation"],
 		as_dict=True,
 	)
-	grant = (context.effective_level, bool(context.instructor), context.change_enabled)
+	grant = (context.effective_level, bool(context.instructor), context.change_enabled, context.unrestricted)
 	tools = get_tool_schemas(*grant)
-	offered = {tool["name"] for tool in tools}
-	unrestricted_tools = get_unrestricted_tool_schemas(
-		context.effective_level, bool(context.instructor), context.unrestricted
-	)
-	tools.extend(tool for tool in unrestricted_tools if tool["name"] not in offered)
 	if tools:
 		tools[-1]["cache_control"] = {"type": "ephemeral"}
 	system = build_reason_system(
@@ -596,7 +591,7 @@ def _reason(ticket_name, trigger, run_id, settings, context, classification, dea
 		_routing_table(context),
 		change_tools=grants_change_tools(*grant),
 		site_admin_tools=grants_site_admin_tools(*grant),
-		unrestricted_tools=bool(unrestricted_tools),
+		unrestricted_tools=grants_unrestricted_tools(*grant),
 	)
 	messages = [{"role": "user", "content": build_initial_message(ticket, labelled, trigger, classification)}]
 	base = {

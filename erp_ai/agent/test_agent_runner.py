@@ -1417,6 +1417,40 @@ class TestRunnerChangeGrant(RunnerTestBase):
 		self.assertEqual(system, self._base_system())
 		self.assertNotIn(CHANGE_TOOLS_BLOCK, system[0]["text"])
 
+	def test_over_budget_l3_keeps_unrestricted_tools(self):
+		# AC-2 (c): the budget lowers L3 to L1, the full-power switch still grants every record tool.
+		set_agent_settings(monthly_budget_usd=10, spent_this_month_usd=10.01, unrestricted_enabled=1)
+		names, system = self._call()
+
+		self.assertEqual(
+			names,
+			[
+				*BASE_TOOL_NAMES_WITH_INSTRUCTOR,
+				*SITE_ADMIN_TOOL_NAMES,
+				"api_delete_record",
+				"api_submit_record",
+				"api_call_method",
+			],
+		)
+		self.assertEqual(
+			system,
+			build_reason_system(
+				f"{PREFIX}digest", self.table, site_admin_tools=True, unrestricted_tools=True
+			),
+		)
+		self.assertIn(UNRESTRICTED_TOOLS_BLOCK, system[0]["text"])
+		self.assertNotIn(CHANGE_TOOLS_BLOCK, system[0]["text"])
+
+	def test_runner_asks_registry_once(self):
+		# ADR-023 QĐ 4: one schema call per `_reason`, carrying all four grant inputs.
+		set_agent_settings(unrestricted_enabled=1)
+		with patch.object(runner, "get_tool_schemas", wraps=runner.get_tool_schemas) as schemas:
+			names, _system = self._call()
+
+		schemas.assert_called_once_with("L3", True, True, True)
+		self.assertFalse(hasattr(runner, "get_unrestricted_tool_schemas"))
+		self.assertEqual(len(names), len(set(names)))
+
 	def test_over_budget_edge_spent_equal_to_budget_keeps_change_tools(self):
 		set_agent_settings(monthly_budget_usd=10, spent_this_month_usd=10)
 		names, system = self._call()

@@ -3149,21 +3149,34 @@ class TestResultComment(ApplyJobTestCase):
 	def run_job(self, name, action, post_result=None):
 		"""Run the job with its log line, rollback and `post_result` watched; returns what the checks read.
 
-		`post_result` replaces the real writer when given; `commits_at_post` is the commit count when it is called.
+		`post_result` replaces the real writer when given; `commits_at_post` is the commit count when it is called,
+		`last_commit_at_post` the `(count, change_status)` the job's last commit saw before that call (None: no commit).
 		"""
 		real_post_result = result_comment.post_result
-		seen = {"commits_at_post": None}
+		commits = []
+		seen = {"commits_at_post": None, "last_commit_at_post": None}
+
+		def commit():
+			# The commit is mocked, so what it would make durable is the status the job holds when it is called.
+			commits.append(
+				(frappe.db.commit.call_count, frappe.db.get_value(PROPOSAL_DOCTYPE, name, "change_status"))
+			)
 
 		def post(proposal_name):
 			seen["commits_at_post"] = frappe.db.commit.call_count
+			seen["last_commit_at_post"] = commits[-1] if commits else None
 			return (post_result or real_post_result)(proposal_name)
 
-		with (
-			patch.object(frappe, "logger") as logger,
-			patch.object(frappe.db, "rollback") as rollback,
-			patch.object(result_comment, "post_result", side_effect=post) as posted,
-		):
-			apply_job.run_change(name, action)
+		frappe.db.commit.side_effect = commit
+		try:
+			with (
+				patch.object(frappe, "logger") as logger,
+				patch.object(frappe.db, "rollback") as rollback,
+				patch.object(result_comment, "post_result", side_effect=post) as posted,
+			):
+				apply_job.run_change(name, action)
+		finally:
+			frappe.db.commit.side_effect = None
 
 		lines = [
 			call.args
@@ -3177,6 +3190,7 @@ class TestResultComment(ApplyJobTestCase):
 			"posted": posted,
 			"rollback": rollback,
 			"commits_at_post": seen["commits_at_post"],
+			"last_commit_at_post": seen["last_commit_at_post"],
 			"commits_after": frappe.db.commit.call_count,
 		}
 
@@ -3215,7 +3229,8 @@ class TestResultComment(ApplyJobTestCase):
 			frappe.set_user("Administrator")
 			return name, "apply", contextlib.nullcontext()
 
-		# Final status and reason of each outcome, written out as in design 4.3 (not read from the constants).
+		# Final status and reason of each outcome; the reasons are written out as in design 4.3 (not read from the
+		# constants), the statuses are the `CHANGE_STATUS_*` values.
 		cases = (
 			("apply code", apply_code, CHANGE_STATUS_APPLIED, None),
 			("command exit 2", command_exit_2, CHANGE_STATUS_FAILED, "lệnh trả mã 2"),
@@ -3257,6 +3272,9 @@ class TestResultComment(ApplyJobTestCase):
 				self.assertIn(f": {status}", row.content)
 				run["posted"].assert_called_once_with(name)
 				self.assertEqual(run["comment"], row.name)
+				# The final status is committed before the line is written (design 4 step 3): the job's last commit
+				# before `post_result` saw it.
+				self.assertEqual(run["last_commit_at_post"], (run["commits_at_post"], status))
 				# The line is committed on its own, after the final status (design 4 step 2), never rolled back.
 				self.assertEqual(run["commits_after"], run["commits_at_post"] + 1)
 				run["rollback"].assert_not_called()
@@ -3297,23 +3315,34 @@ class TestResultComment(ApplyJobTestCase):
 			raise RuntimeError("bí mật https://x-token-FAKE@host/r.git")
 
 		title = result_comment.TITLE_RESULT_COMMENT_FAILED
-		for action, status in (("apply", CHANGE_STATUS_APPLIED), ("undo", CHANGE_STATUS_UNDONE)):
-			with self.subTest(action):
+		for label, action, status in (
+			("apply", "apply", CHANGE_STATUS_APPLIED),
+			("undo", "undo", CHANGE_STATUS_UNDONE),
+			("lock timeout", "apply", CHANGE_STATUS_FAILED),
+		):
+			with self.subTest(label):
 				self.fresh_repo()
 				name = self.approved(self.code_proposal())
-				if action == "undo":
+				if label == "undo":
 					apply_job.run_change(name, "apply")
 					transitions.request_undo(name, ACTOR)
+				busy = contextlib.nullcontext()
+				if label == "lock timeout":
+					busy = patch.object(
+						apply_job, "filelock", side_effect=LockTimeoutError(apply_job.LOCK_NAME)
+					)
 				before = {row.name for row in self.info_rows(name)}
 				logged_before = frappe.get_all("Error Log", filters={"method": title}, pluck="name")
 
 				# The real `Error Log` is written here; the job's rollback is mocked, as its commits are.
-				with patch.object(frappe, "log_error", side_effect=real_log_error):
+				with busy, patch.object(frappe, "log_error", side_effect=real_log_error):
 					run = self.run_job(name, action, post_result=failing_post)
 
 				self.assertEqual(self.state(name).change_status, status)
 				self.assertEqual(run["comment"], "error")
 				run["rollback"].assert_called_once_with()
+				# The rollback only loses the line: the final status was committed before `post_result` ran.
+				self.assertEqual(run["last_commit_at_post"], (run["commits_at_post"], status))
 				self.assertEqual(run["commits_after"], run["commits_at_post"])
 				logged = frappe.get_all(
 					"Error Log",

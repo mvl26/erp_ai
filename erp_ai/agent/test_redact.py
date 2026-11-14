@@ -260,6 +260,50 @@ class TestRedact(FrappeTestCase):
 	def test_secret_key_without_value_untouched(self):
 		self.assertEqual(redact.redact_secrets("api_key= , pwd=fake-e"), f"api_key= , pwd={MASK}")
 
+	def test_list_separator_inside_bare_value_masked(self):
+		# K-4: `,` `;` `&` not followed by end of text, whitespace or a key candidate belong to the value.
+		cases = (
+			("password=ab&cd", f"password={MASK}"),
+			("password=ab&amp;cd", f"password={MASK}"),
+			("pwd=ab;cd", f"pwd={MASK}"),
+			("pwd=ab,cd", f"pwd={MASK}"),
+			("password=ab&cd tiếp", f"password={MASK} tiếp"),
+		)
+		for text, expected in cases:
+			with self.subTest(text=text):
+				self.assertEqual(redact.redact_secrets(text), expected)
+
+	def test_list_separator_before_next_key_ends_value(self):
+		# K-4 (a)-(c): the separator ends the value before end of text, whitespace or the next key.
+		cases = (
+			("token=abc&page=2", f"token={MASK}&page=2"),
+			("api_key=x;pwd=y", f"api_key={MASK};pwd={MASK}"),
+			("password=abc;", f"password={MASK};"),
+			("password=abc, tiếp", f"password={MASK}, tiếp"),
+			("api_key= , pwd=x", f"api_key= , pwd={MASK}"),
+			# (c) covers keys of two and three runs, `:` as well as `=`, and the quote and space before it.
+			("pwd=ab;api key: fake-z", f"pwd={MASK};api key: {MASK}"),
+			("pwd=ab;user:bob", f"pwd={MASK};user:bob"),
+			("pwd=ab;user :x", f"pwd={MASK};user :x"),
+			('token=abc&page"=2', f'token={MASK}&page"=2'),
+			("pwd=ab;my api key: fake-q", f"pwd={MASK};my api key: {MASK}"),
+			("pwd=ab&page no 2=x", f"pwd={MASK}&page no 2=x"),
+		)
+		for text, expected in cases:
+			with self.subTest(text=text):
+				self.assertEqual(redact.redact_secrets(text), expected)
+
+	def test_list_separator_before_closing_mark_stays_in_value(self):
+		# K-4: a separator followed by `"` `}` `]` is none of (a)-(c), so it belongs to the value.
+		cases = (
+			("{pwd=ab;}", f"{{pwd={MASK}}}"),
+			("[pwd=ab,]", f"[pwd={MASK}]"),
+			('x="pwd=ab&"', f'x="pwd={MASK}"'),
+		)
+		for text, expected in cases:
+			with self.subTest(text=text):
+				self.assertEqual(redact.redact_secrets(text), expected)
+
 	def test_single_quoted_value_masked(self):
 		self.assertEqual(redact.redact_secrets("password='fake value 11'"), f"password='{MASK}'")
 

@@ -1,6 +1,7 @@
 """Secret masking shared by logs, tool results, Error Log reads and emails (NFR-6, ADR-034 QĐ 2).
 
-Rules N-1..N-7, K-1..K-8, R-1..R-5 of `design-w0-fixes-3.md` section 3. One word list (`SECRET_WORDS`)
+Rules N-1..N-7, K-1..K-8, R-1..R-5 of `design-w0-fixes-3.md` section 3, with K-4, K-4a and K-8 as
+amended by `design-w0-fixes-4.md` point 3. One word list (`SECRET_WORDS`)
 drives both `is_secret_key` and the key-value scan of `redact_secrets`. Output is always NFC (3a).
 """
 
@@ -25,13 +26,22 @@ SECRET_PATTERNS = (
 # continues, then an optional quote, `:` or `=` and surrounding whitespace. Each run and each `\s*` is
 # taken whole and never given back (`(?=(?P<x>...))(?P=x)`, the Python 3.10 form of a possessive
 # quantifier), so the scan stays linear in the text (K-8).
-_KEY_CANDIDATE = re.compile(
-	r"(?<![\w-])(?P<name>(?=(?P<run1>[\w-]+))(?P=run1)"
-	r"(?: (?=(?P<run2>[\w-]+))(?P=run2)(?: (?=(?P<run3>[\w-]+))(?P=run3))?)?)"
-	r"[\"']?(?=(?P<space1>\s*))(?P=space1)[:=](?=(?P<space2>\s*))(?P=space2)"
+_KEY_NAME_RUNS = (
+	r"(?=(?P<run1>[\w-]+))(?P=run1)(?: (?=(?P<run2>[\w-]+))(?P=run2)(?: (?=(?P<run3>[\w-]+))(?P=run3))?)?"
 )
-# Key value (K-4): double-quoted, single-quoted or bare.
-_KEY_VALUE = re.compile(r"\"(?P<double>[^\"]*)\"|'(?P<single>[^']*)'|(?P<bare>[^\s,;&\"'}\]]+)")
+_KEY_NAME_END = r"[\"']?(?=(?P<space1>\s*))(?P=space1)[:=]"
+_KEY_CANDIDATE = re.compile(
+	rf"(?<![\w-])(?P<name>{_KEY_NAME_RUNS}){_KEY_NAME_END}(?=(?P<space2>\s*))(?P=space2)"
+)
+# Key value (K-4): double-quoted, single-quoted or bare. A bare value runs over `,` `;` `&` too, unless
+# the separator is followed by the end of the text, whitespace or the start of a key candidate (K-1..K-3);
+# the look-ahead reads that candidate with the same taken-whole runs (K-8).
+_KEY_VALUE = re.compile(
+	r"\"(?P<double>[^\"]*)\"|'(?P<single>[^']*)'"
+	r"|(?P<bare>[^\s,;&\"'}\]]"
+	r"(?:(?=(?P<chunk>[^\s,;&\"'}\]]+))(?P=chunk)"
+	rf"|[,;&](?!\Z|\s|{_KEY_NAME_RUNS}{_KEY_NAME_END}))*)"
+)
 
 
 def _name_segments(name: str) -> tuple[str, ...]:

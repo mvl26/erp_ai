@@ -62,6 +62,25 @@ Hai công tắc trên `/app/erp-ai-setting`, chỉ System Manager đặt đượ
 
 **Tắt.** Đặt `code_change_enabled` và `unrestricted_enabled` về 0: bot trở lại như cũ. Commit bot đã tạo ở lại trong lịch sử git; muốn bỏ thì bấm Hoàn tác trên từng đề xuất trước khi tắt, hoặc `git revert` thủ công. Revert mã của tính năng làm mất DocType `ERP AI Change Proposal` và các bản ghi đề xuất, tức mất dữ liệu kiểm toán.
 
+### Nhật ký trước/sau và cảnh báo phân quyền hằng ngày
+
+Khi bot ghi bản ghi trực tiếp (mục trên), bạn dựng lại được bot đã đổi gì từ nhật ký, và mỗi ngày nhận một thư nếu bot đã đổi role hay phân quyền.
+
+**Đọc trước/sau.** Mở `ERP AI Log`, dòng `reason` của lượt chạy. Cột `actions` liệt kê từng lời gọi (công cụ, DocType, tên bản ghi, đúng hay sai) theo thứ tự; lời gọi thứ `n` có giá trị trước và sau ở hai cột `value_before` và `value_after`, khóa `"<công cụ>#<n>"` (ví dụ `api_update_record#2`), nên hai lời gọi cùng công cụ trong một lượt không đè nhau. Giá trị gồm cả dòng của bảng con: role của User, ngày của Holiday List, trạng thái và hành động của Workflow. Khi bot sửa bằng cách đưa cả danh sách, so trước với sau cho thấy dòng nào bị bỏ và dòng nào được thêm. Giá trị lưu đầy đủ, không cắt. Tạo mới có trước là rỗng; xóa có sau là rỗng. Với User chỉ có mã user và danh sách role; mật khẩu, khóa, token không bao giờ có trong đó. Chỉ System Manager đọc được `ERP AI Log`.
+
+**Hoàn tác bằng tay.** Bot không có công cụ hoàn tác. Đọc giá trị trước, mở bản ghi trong Desk và đặt lại: thêm lại role bị gỡ, bỏ role bị thêm, trả giá trị cũ. Bản ghi bị xóa hay đã submit bằng "Toàn quyền" thì không hoàn tác được.
+
+**Cảnh báo hằng ngày.** Job `check_privilege_escalation` chạy mỗi ngày và gửi một thư tới `alert_recipients` (cùng dòng ở Error Log) với tiêu đề "Agent đã sửa bản ghi phân quyền" khi bot đã thêm hoặc gỡ role của một user, hoặc tạo, sửa, xóa một bản ghi phân quyền (Custom DocPerm, DocPerm, Role, User Permission, Role Profile, hoặc phần `permissions` của một DocType). Mỗi mục nêu việc, user, role, người ra lệnh và thời điểm, ví dụ `thêm role <role> cho <user> (người ra lệnh <người>, <YYYY-MM-DD HH:MM>)` hoặc `gỡ role <role> của <user> (…)`.
+- Dòng có role quản trị (`System Manager`, `Administrator`, `ERP AI Instructor`, `ERP AI Agent`, `Guest`, `All`) có dấu `[QUẢN TRỊ]` ở đầu và đứng trước các dòng khác.
+- Thư chỉ liệt kê tối đa 5 mục rồi "…và N mục khác", để thư ngắn; vì dòng quản trị đứng trước nên không bị cắt trước dòng thường. Danh sách đầy đủ tra ở `ERP AI Log`.
+- Mục ghi `, không có trước/sau` là thay đổi mà nhật ký không đọc được trước/sau (nhật ký cũ trước khi có tính năng này, hoặc dữ liệu hỏng). Nó vẫn được báo, không bị bỏ qua. Mục `sửa User …, không có trước/sau` không có dấu `[QUẢN TRỊ]` vì không biết role, và có thể nằm trong "…và N mục khác": tra `ERP AI Log`.
+- Không cảnh báo: role hay phân quyền do người đổi, và bot lưu lại một User mà không đổi role.
+- Ba cảnh báo khác trong cùng job không đổi: role của tài khoản agent lệch tập, Server Script hoặc Webhook do agent tạo đang bật, khóa đang bật nhưng không có giá trị.
+
+**Báo đúng một lần.** Ô chỉ đọc `privilege_alert_checked_until` (nhóm cảnh báo trên `ERP AI Setting`) là mốc "đã báo tới đâu"; chỉ job ghi, form lưu không đổi được. Mỗi lần chạy xét từ mốc tới 5 phút trước giờ chạy, rồi dời mốc: một thay đổi vào đúng một thư; lịch lỡ vài ngày thì lần sau gộp đủ. Lần chạy đầu sau khi cập nhật báo một lần mọi thay đổi cũ của bot (mục `không có trước/sau`), không phải lỗi. Lần chạy lỗi giữa chừng không dời mốc và không gửi thư; lần sau gửi đúng một thư. Dòng Error Log của lần lỗi vẫn ở lại (bảng Error Log của Frappe không hoàn tác được) nên lần sau có thể có thêm một dòng giống: lặp ở Error Log, không sót. Hai lần chạy cùng lúc thì lần sau chờ tối đa 60 giây rồi bỏ lượt.
+
+**Giới hạn đã biết.** Khi "Toàn quyền (khẩn cấp)" đang bật, đổi role bằng cách gọi hàm whitelist (`api_call_method`) không có trong cảnh báo hằng ngày. Lượt chạy của bot lỗi trước khi dòng `reason` được lưu thì mọi thay đổi trong lượt đó bị hoàn tác, nhưng commit do mã ngoài `erp_ai` chạy bên trong một công cụ vẫn cố định các thay đổi trước nó. Chưa có địa chỉ trong `alert_recipients` thì cảnh báo chỉ có ở Error Log. Chi tiết: `docs/team/features/FEAT-005/asbuilt.md`.
+
 ### Định tuyến theo điểm
 
 Mỗi phiếu mới được chấm hai điểm 1–3 trong cùng lời gọi phân loại: độ phức tạp (1: dưới 1 giờ làm việc; 2: trong 1 ngày; 3: nhiều ngày, cần phân tích hoặc xây mới) và độ quan trọng (1: ảnh hưởng một người, không chặn việc; 2: chặn việc của một người hoặc bộ phận, hoặc có hạn trong 24 giờ; 3: chặn nghiệp vụ kế toán, kho, bán hàng hoặc nhiều bộ phận). Điểm có ở `ERP AI Log` (các cột `predicted_complexity`, `predicted_importance`, `predicted_score_reason`) ở mọi mức; từ `L1` có thêm trên phiếu ở ba trường chỉ đọc `ai_complexity`, `ai_importance`, `ai_score_reason`, HD Agent (role `Agent`) đọc được. Điểm 0 nghĩa là chưa chấm hoặc model trả điểm sai; ưu tiên khi đó theo `category_mapping`.

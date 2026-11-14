@@ -1,3 +1,5 @@
+from datetime import datetime
+
 import frappe
 from frappe.model.document import Document
 
@@ -54,6 +56,17 @@ PRICE_FIELDS = (
 	"price_output_per_mtok",
 )
 PROBE_RESULT_FIELDS = ("label", "ok", "error_kind", "status")
+EMPTY_DATETIME = datetime(1, 1, 1)  # what frappe.utils.cast returns for an empty Datetime
+
+
+def read_privilege_watermark() -> datetime | None:
+	"""Where the privilege alert has read ERP AI Log up to; None = never alarmed (design-amd2 §2, D-6).
+
+	Frappe 15 casts an empty raw value (no row, NULL, "") to datetime(1, 1, 1) and "0001-01-01 …" to None:
+	both come back as None, a real value unchanged.
+	"""
+	watermark = frappe.db.get_single_value(SETTING_DOCTYPE, "privilege_alert_checked_until", cache=False)
+	return None if watermark == EMPTY_DATETIME else watermark
 
 
 class ERPAISetting(Document):
@@ -89,6 +102,8 @@ class ERPAISetting(Document):
 		self.spent_this_month_usd = frappe.db.get_single_value(
 			SETTING_DOCTYPE, "spent_this_month_usd", cache=False
 		)
+		# the privilege-alert watermark is written only by the alert job (ADR-024 QĐ 3.2); empty stays empty
+		self.privilege_alert_checked_until = read_privilege_watermark()
 		stored = {
 			row.name: row
 			for row in frappe.get_all(

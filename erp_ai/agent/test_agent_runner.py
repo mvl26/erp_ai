@@ -1,14 +1,21 @@
+import ast
+import copy
+import inspect
 import json
 import os
 import subprocess
 import time
-from unittest.mock import patch
+from collections import Counter
+from datetime import datetime, timedelta
+from unittest.mock import MagicMock, patch
 
 import frappe
 from frappe.tests.utils import FrappeTestCase
 from helpdesk.test_utils import make_ticket
 
+from erp_ai import tasks
 from erp_ai.agent import answer_delay, authority, runner
+from erp_ai.agent.agent_write_guard import allow_agent_write
 from erp_ai.agent.classification import DEFAULT_CATEGORY_MAPPING
 from erp_ai.agent.prompts import (
 	CHANGE_TOOLS_BLOCK,
@@ -35,8 +42,10 @@ from erp_ai.constants import (
 	JOB_TIMEOUT_S,
 	KEY_STATUS_BAD_KEY,
 	LOG_DOCTYPE,
+	LOGGER_NAME,
 	PROPOSAL_DOCTYPE,
 	ROLE_INSTRUCTOR,
+	SETTING_DOCTYPE,
 	TITLE_RUN_FAILED,
 	TITLE_WRONG_USER,
 )
@@ -1746,6 +1755,967 @@ class TestRunnerActionsBound(RunnerTestBase):
 			json.loads(stored),
 			[*actions[:4], *({**action, "value_before": CUT} for action in actions[4:])],
 		)
+
+
+SNAPSHOT_USER = "runner.snapshot@example.com"
+SNAPSHOT_ROLES = ["Blogger", "Knowledge Base Editor"]
+SNAPSHOT_MARK = "RUNNER-SNAPSHOT-MARK-7e2d"
+SNAPSHOT_KEY = "_snapshot"
+DIFF_USER = "runner.snapshot.diff@example.com"
+# The user starts with the first two roles; the tool's full list drops the first, keeps the second, adds the third.
+DIFF_ROLES = ("Blogger", "Knowledge Base Editor", "Knowledge Base Contributor")
+HOLIDAY_LIST_NAME = f"{PREFIX}snapshot holidays"
+# Fixed dates, not today's: the tool's list misses the second old date and adds the fourth.
+HOLIDAY_DATES = ("2031-03-02", "2031-04-30", "2031-05-01", "2031-09-02")
+LONG_FIELD_CHARS = 30000
+
+
+def long_text(seed):
+	"""LONG_FIELD_CHARS characters, ASCII and Vietnamese mixed, numbered so a cut or a shifted part shows."""
+	return "".join(f"{seed}{index:05d} ạ-ữ " for index in range(LONG_FIELD_CHARS))[:LONG_FIELD_CHARS]
+
+
+def row_diff(before_rows, after_rows, column):
+	"""(removed, added) values of `column`, found only by comparing the rows before with the rows after."""
+	before_values = Counter(row[column] for row in before_rows)
+	after_values = Counter(row[column] for row in after_rows)
+	return sorted((before_values - after_values).elements()), sorted(
+		(after_values - before_values).elements()
+	)
+
+
+class TestRunnerRecordSnapshots(RunnerTestBase):
+	"""AC-13 (c), (d): each successful generic record call keeps its full before/after under `<tool>#<n>`."""
+
+	def setUp(self):
+		super().setUp()
+		set_agent_settings(
+			permission_level="L3", code_change_enabled=1, unrestricted_enabled=0, monthly_budget_usd=1000
+		)
+		make_instructor(self)
+
+	def _note(self, title):
+		return frappe.get_doc({"doctype": "Note", "title": title, "public": 1}).insert().name
+
+	def _run_turn(self, *blocks, execute=None):
+		"""One model turn calling `blocks`, then a final answer; returns the reason entry that holds the actions."""
+		frappe.db.delete(LOG_DOCTYPE, {"ticket": self.ticket.name})
+		self.gateway.calls.clear()
+		self.gateway.results = [tool_turn(*blocks), make_model_result()]
+		with (
+			patch.object(authority, "latest_instructor", return_value=INSTRUCTOR),
+			patch.object(runner, "execute_tool", side_effect=execute or runner.execute_tool),
+		):
+			self._run("comment_mention")
+		(entry,) = [row for row in self._entries(entry_type="reason") if row.actions]
+		return entry
+
+	def test_generic_write_tools_derived_from_write_tool_targets(self):
+		self.assertEqual(
+			sorted(runner.GENERIC_WRITE_TOOLS),
+			["api_create_record", "api_delete_record", "api_submit_record", "api_update_record"],
+		)
+		(assignment,) = [
+			node
+			for node in ast.walk(ast.parse(inspect.getsource(runner)))
+			if isinstance(node, ast.Assign)
+			and any(getattr(target, "id", None) == "GENERIC_WRITE_TOOLS" for target in node.targets)
+		]
+		names = {node.id for node in ast.walk(assignment.value) if isinstance(node, ast.Name)}
+		literals = [
+			node.value
+			for node in ast.walk(assignment.value)
+			if isinstance(node, ast.Constant) and isinstance(node.value, str)
+		]
+		self.assertIn("WRITE_TOOL_TARGETS", names)
+		self.assertEqual(literals, [], "GENERIC_WRITE_TOOLS must not name a tool by hand")
+
+	def test_record_snapshot_keys_by_position_and_always_drops_snapshot(self):
+		snapshot = {"before": {"name": "n1", "title": SNAPSHOT_MARK}, "after": {"name": "n1", "title": "sau"}}
+		before, after = {}, {}
+		outcome = {"ok": True, SNAPSHOT_KEY: copy.deepcopy(snapshot)}
+		runner._record_snapshot("api_delete_record", outcome, 3, before, after)
+		self.assertEqual(outcome, {"ok": True})
+		self.assertEqual(before, {"api_delete_record#3": snapshot["before"]})
+		self.assertEqual(after, {"api_delete_record#3": snapshot["after"]})
+
+		for name, ok in (("api_call_method", True), ("post_comment", True), ("set_classification", False)):
+			with self.subTest(name):
+				outcome = {"ok": ok, SNAPSHOT_KEY: copy.deepcopy(snapshot)}
+				runner._record_snapshot(name, outcome, 4, before, after)
+				self.assertEqual(outcome, {"ok": ok})
+				self.assertEqual(list(before), ["api_delete_record#3"])
+				self.assertEqual(list(after), ["api_delete_record#3"])
+
+		runner._record_snapshot("api_update_record", {"ok": False, "reason": "r"}, 5, before, after)
+		self.assertEqual(list(before), ["api_delete_record#3"])
+
+	def test_create_user_snapshot_lists_both_roles(self):
+		entry = self._run_turn(
+			tool_use(
+				"toolu_1",
+				"api_create_record",
+				doctype="User",
+				values={
+					"email": SNAPSHOT_USER,
+					"first_name": "Ảnh chụp",
+					"send_welcome_email": 0,
+					"roles": [{"role": role} for role in SNAPSHOT_ROLES],
+				},
+			)
+		)
+
+		(action,) = json.loads(entry.actions)
+		self.assertTrue(action["ok"], action)
+		self.assertEqual(action["name"], SNAPSHOT_USER)
+		self.assertEqual(json.loads(entry.value_before), {"api_create_record#1": None})
+		value_after = json.loads(entry.value_after)
+		self.assertEqual(list(value_after), ["api_create_record#1"])
+		snapshot = value_after["api_create_record#1"]
+		self.assertEqual(sorted(snapshot), ["name", "roles"])
+		self.assertEqual(snapshot["name"], SNAPSHOT_USER)
+		self.assertEqual([row["role"] for row in snapshot["roles"]], SNAPSHOT_ROLES)
+
+	def test_two_calls_same_tool_one_turn_two_snapshots(self):
+		old_first, old_second = f"{PREFIX}snapshot one", f"{PREFIX}snapshot two"
+		new_first, new_second = f"{PREFIX}snapshot one new", f"{PREFIX}snapshot two new"
+		first, second = self._note(old_first), self._note(old_second)
+		entry = self._run_turn(
+			tool_use("toolu_1", "api_update_record", doctype="Note", name=first, values={"title": new_first}),
+			tool_use(
+				"toolu_2", "api_update_record", doctype="Note", name=second, values={"title": new_second}
+			),
+		)
+
+		self.assertEqual([action["ok"] for action in json.loads(entry.actions)], [True, True])
+		self.assertEqual(
+			json.loads(entry.value_before),
+			{
+				"api_update_record#1": {"name": first, "title": old_first},
+				"api_update_record#2": {"name": second, "title": old_second},
+			},
+		)
+		self.assertEqual(
+			json.loads(entry.value_after),
+			{
+				"api_update_record#1": {"name": first, "title": new_first},
+				"api_update_record#2": {"name": second, "title": new_second},
+			},
+		)
+
+		# A refused first call still takes position 1; only the second call's pair is kept, under #2.
+		newest = f"{PREFIX}snapshot two newest"
+		entry = self._run_turn(
+			tool_use(
+				"toolu_1", "api_update_record", doctype="Note", name=f"{PREFIX}missing", values={"title": "x"}
+			),
+			tool_use("toolu_2", "api_update_record", doctype="Note", name=second, values={"title": newest}),
+		)
+		self.assertEqual([action["ok"] for action in json.loads(entry.actions)], [False, True])
+		self.assertEqual(
+			json.loads(entry.value_before), {"api_update_record#2": {"name": second, "title": new_second}}
+		)
+		self.assertEqual(
+			json.loads(entry.value_after), {"api_update_record#2": {"name": second, "title": newest}}
+		)
+
+	def test_position_counts_every_action_not_only_the_same_tool(self):
+		old_title, new_title = f"{PREFIX}snapshot after comment", f"{PREFIX}snapshot after comment new"
+		note = self._note(old_title)
+		execute_tool = runner.execute_tool
+
+		def execute(name, arguments, context):
+			if name == "post_comment":
+				return {"ok": True, "comment": "c1"}
+			return execute_tool(name, arguments, context)
+
+		entry = self._run_turn(
+			tool_use("toolu_1", "post_comment", content="xin chào"),
+			tool_use("toolu_2", "api_update_record", doctype="Note", name=note, values={"title": new_title}),
+			execute=execute,
+		)
+
+		self.assertEqual(
+			[(action["tool"], action["ok"]) for action in json.loads(entry.actions)],
+			[("post_comment", True), ("api_update_record", True)],
+		)
+		self.assertEqual(
+			json.loads(entry.value_before), {"api_update_record#2": {"name": note, "title": old_title}}
+		)
+		self.assertEqual(
+			json.loads(entry.value_after), {"api_update_record#2": {"name": note, "title": new_title}}
+		)
+
+	def test_snapshot_never_reaches_model(self):
+		planted = {"before": {"name": "n1", "title": SNAPSHOT_MARK}, "after": None}
+		results = {
+			"api_update_record": {
+				"ok": True,
+				"doctype": "Note",
+				"name": "n1",
+				"value_before": None,
+				"value_after": None,
+				SNAPSHOT_KEY: planted,
+			},
+			"api_create_record": {"ok": False, "reason": "bị từ chối", SNAPSHOT_KEY: planted},
+			"api_call_method": {"ok": True, "method": "frappe.ping", "result": 1, SNAPSHOT_KEY: planted},
+			"post_comment": {"ok": True, "comment": "c1", SNAPSHOT_KEY: planted},
+		}
+		entry = self._run_turn(
+			tool_use("toolu_1", "api_update_record", doctype="Note", name="n1", values={"title": "x"}),
+			tool_use("toolu_2", "api_create_record", doctype="Note", values={"title": "x"}),
+			tool_use("toolu_3", "api_call_method", method="frappe.ping", arguments={}),
+			tool_use("toolu_4", "post_comment", content="xin chào"),
+			execute=lambda name, args, ctx: copy.deepcopy(results[name]),
+		)
+
+		tool_results = self.gateway.calls[1]["messages"][-1]["content"]
+		self.assertEqual(
+			[block["tool_use_id"] for block in tool_results], ["toolu_1", "toolu_2", "toolu_3", "toolu_4"]
+		)
+		for block in tool_results:
+			self.assertEqual(block["content"].count(SNAPSHOT_KEY), 0, block)
+			self.assertEqual(block["content"].count(SNAPSHOT_MARK), 0, block)
+		self.assertEqual(json.loads(entry.value_before)["api_update_record#1"], planted["before"])
+
+	def test_update_user_role_list_diff_shows_removed_and_added(self):
+		removed, kept, added = DIFF_ROLES
+		frappe.get_doc(
+			{
+				"doctype": "User",
+				"email": DIFF_USER,
+				"first_name": "Hiệu role",
+				"send_welcome_email": 0,
+				"roles": [{"role": removed}, {"role": kept}],
+			}
+		).insert()
+
+		entry = self._run_turn(
+			tool_use(
+				"toolu_1",
+				"api_update_record",
+				doctype="User",
+				name=DIFF_USER,
+				values={"roles": [{"role": kept}, {"role": added}]},
+			)
+		)
+
+		(action,) = json.loads(entry.actions)
+		self.assertTrue(action["ok"], action)
+		self.assertEqual(
+			sorted(frappe.get_all("Has Role", {"parent": DIFF_USER, "parenttype": "User"}, pluck="role")),
+			sorted([kept, added]),
+		)
+		before = json.loads(entry.value_before)
+		after = json.loads(entry.value_after)
+		self.assertEqual(
+			before,
+			{
+				"api_update_record#1": {
+					"name": DIFF_USER,
+					"roles": [{"role": removed, "docstatus": 0}, {"role": kept, "docstatus": 0}],
+				}
+			},
+		)
+		self.assertEqual(
+			after,
+			{
+				"api_update_record#1": {
+					"name": DIFF_USER,
+					"roles": [{"role": kept, "docstatus": 0}, {"role": added, "docstatus": 0}],
+				}
+			},
+		)
+		# The role kept on the user is in neither side of the difference.
+		self.assertEqual(
+			row_diff(before["api_update_record#1"]["roles"], after["api_update_record#1"]["roles"], "role"),
+			([removed], [added]),
+		)
+
+	def test_holiday_list_missing_old_date_seen_in_diff(self):
+		first, missing, kept, new = HOLIDAY_DATES
+
+		def holiday(day):
+			return {"holiday_date": day, "description": f"Nghỉ {day}", "weekly_off": 0}
+
+		holiday_list = (
+			frappe.get_doc(
+				{
+					"doctype": "Holiday List",
+					"holiday_list_name": HOLIDAY_LIST_NAME,
+					"from_date": "2031-01-01",
+					"to_date": "2031-12-31",
+					"holidays": [holiday(first), holiday(missing), holiday(kept)],
+				}
+			)
+			.insert()
+			.name
+		)
+
+		entry = self._run_turn(
+			tool_use(
+				"toolu_1",
+				"api_update_record",
+				doctype="Holiday List",
+				name=holiday_list,
+				values={"holidays": [holiday(first), holiday(kept), holiday(new)]},
+			)
+		)
+
+		(action,) = json.loads(entry.actions)
+		self.assertTrue(action["ok"], action)
+
+		def stored(*days):
+			return [{**holiday(day), "docstatus": 0} for day in days]
+
+		before = json.loads(entry.value_before)
+		after = json.loads(entry.value_after)
+		self.assertEqual(
+			before, {"api_update_record#1": {"name": holiday_list, "holidays": stored(first, missing, kept)}}
+		)
+		self.assertEqual(
+			after, {"api_update_record#1": {"name": holiday_list, "holidays": stored(first, kept, new)}}
+		)
+		self.assertEqual(
+			row_diff(
+				before["api_update_record#1"]["holidays"],
+				after["api_update_record#1"]["holidays"],
+				"holiday_date",
+			),
+			([missing], [new]),
+		)
+
+	def test_30000_char_field_stored_byte_identical(self):
+		old_content, new_content = long_text("T"), long_text("S")
+		self.assertEqual((len(old_content), len(new_content)), (LONG_FIELD_CHARS, LONG_FIELD_CHARS))
+		self.assertGreater(LONG_FIELD_CHARS, TOOL_RESULT_MAX_CHARS)
+		note = frappe.get_doc(
+			{"doctype": "Note", "title": f"{PREFIX}snapshot long", "public": 1, "content": old_content}
+		).insert()
+
+		entry = self._run_turn(
+			tool_use(
+				"toolu_1",
+				"api_update_record",
+				doctype="Note",
+				name=note.name,
+				values={"content": new_content},
+			)
+		)
+
+		(action,) = json.loads(entry.actions)
+		self.assertTrue(action["ok"], action)
+		self.assertEqual(frappe.db.get_value("Note", note.name, "content"), new_content)
+		before = json.loads(entry.value_before)["api_update_record#1"]
+		after = json.loads(entry.value_after)["api_update_record#1"]
+		self.assertEqual(before["content"].encode("utf-8"), old_content.encode("utf-8"))
+		self.assertEqual(after["content"].encode("utf-8"), new_content.encode("utf-8"))
+		self.assertEqual(
+			(before, after),
+			({"name": note.name, "content": old_content}, {"name": note.name, "content": new_content}),
+		)
+
+
+TURN_USER = "runner.turn.undo@example.com"
+TURN_KEPT_ROLE, TURN_ADDED_ROLE = "Blogger", "Knowledge Base Contributor"
+# Written out, not read from runner, so a test of the order still runs when the constant is missing.
+TURN_SAVEPOINT = "erp_ai_reason_turn"
+TURN_NOTE_OLD, TURN_NOTE_NEW = f"{PREFIX}turn undo note", f"{PREFIX}turn undo note renamed"
+
+
+TURN_ROLE_CALL = tool_use(
+	"toolu_role",
+	"api_update_record",
+	doctype="User",
+	name=TURN_USER,
+	values={"roles": [{"role": TURN_KEPT_ROLE}, {"role": TURN_ADDED_ROLE}]},
+)
+TURN_PROPOSE_CALLS = (
+	tool_use(
+		"toolu_file", "propose_file_change", path="custom_app/a.py", find=["x"], replace=["y"], reason="r"
+	),
+	tool_use("toolu_new", "propose_new_file", path="custom_app/b.py", content="x", reason="r"),
+)
+TURN_JOB_METHOD = "frappe.ping"
+
+
+class FakeJobQueue:
+	"""Stands in for the RQ queue: records the method of every job put in it, runs none."""
+
+	def __init__(self):
+		self.methods = []
+
+	def enqueue_call(self, *args, **kwargs):
+		self.methods.append(kwargs["kwargs"]["method"])
+
+
+class TurnFaultForTest(Exception):
+	"""The fault a test injects into a turn; its class name must reach the Error Log unchanged."""
+
+
+class RollbackCallbackFaultForTest(Exception):
+	"""Raised by an `after_rollback` callback a tool's hook queued; it must not replace the turn's fault."""
+
+
+class TestRunnerTurnUndo(RunnerTestBase):
+	"""NFR-3, ADR-024 QĐ 2: a turn failing after its tools ran is undone to the point right after its model call."""
+
+	def setUp(self):
+		super().setUp()
+		set_agent_settings(
+			permission_level="L3",
+			code_change_enabled=1,
+			unrestricted_enabled=0,
+			monthly_budget_usd=1000,
+			max_turns_per_run=8,
+		)
+		make_instructor(self)
+		frappe.get_doc(
+			{
+				"doctype": "User",
+				"email": TURN_USER,
+				"first_name": "Hoàn tác lượt",
+				"send_welcome_email": 0,
+				"roles": [{"role": TURN_KEPT_ROLE}],
+			}
+		).insert()
+		self.note = frappe.get_doc({"doctype": "Note", "title": TURN_NOTE_OLD, "public": 1}).insert().name
+		self.key_row = add_credential(f"{PREFIX}turn key")
+		self.events = []
+		self.roles_at_fault = []
+		self.gateway.on_call = self._on_model_call
+		self.old_errors = frappe.get_all(
+			"Error Log",
+			filters={"method": TITLE_RUN_FAILED, "error": ["like", f"ticket={self.ticket.name} %"]},
+			pluck="name",
+		)
+
+	def _reason_calls(self):
+		return sum(1 for call in self.gateway.calls if call["task"] == "reason")
+
+	def _on_model_call(self, task, kwargs):
+		"""The second reason call writes gateway key state, as `apply_failure` does, before the turn's tools run."""
+		self.events.append(("model",))
+		if task == "reason" and self._reason_calls() == 2:
+			frappe.db.set_value(
+				CREDENTIAL_DOCTYPE, self.key_row, {"status": KEY_STATUS_BAD_KEY}, update_modified=False
+			)
+
+	def _roles(self):
+		return sorted(frappe.get_all("Has Role", {"parent": TURN_USER, "parenttype": "User"}, pluck="role"))
+
+	def _run_turns(self, second_turn_result=None, *patches):
+		"""Turn 1 renames the note; turn 2 adds a role to the user (or gets `second_turn_result`); then a final answer."""
+		self.gateway.calls.clear()
+		self.gateway.results = [
+			tool_turn(
+				tool_use(
+					"toolu_1",
+					"api_update_record",
+					doctype="Note",
+					name=self.note,
+					values={"title": TURN_NOTE_NEW},
+				)
+			),
+			second_turn_result
+			or tool_turn(
+				tool_use(
+					"toolu_2",
+					"api_update_record",
+					doctype="User",
+					name=TURN_USER,
+					values={"roles": [{"role": TURN_KEPT_ROLE}, {"role": TURN_ADDED_ROLE}]},
+				)
+			),
+			make_model_result(),
+		]
+		real_savepoint, real_rollback, real_release = (
+			frappe.db.savepoint,
+			frappe.db.rollback,
+			frappe.db.release_savepoint,
+		)
+
+		def savepoint(save_point):
+			self.events.append(("savepoint", save_point))
+			return real_savepoint(save_point)
+
+		def rollback(*args, **kwargs):
+			self.events.append(("rollback", kwargs.get("save_point")))
+			return real_rollback(*args, **kwargs)
+
+		def release_savepoint(save_point):
+			self.events.append(("release", save_point))
+			return real_release(save_point)
+
+		with (
+			patch.object(authority, "latest_instructor", return_value=INSTRUCTOR),
+			patch.object(frappe.db, "savepoint", side_effect=savepoint),
+			patch.object(frappe.db, "rollback", side_effect=rollback),
+			patch.object(frappe.db, "release_savepoint", side_effect=release_savepoint),
+		):
+			for item in patches:
+				item.start()
+			try:
+				self._run("comment_mention")
+			finally:
+				for item in reversed(patches):
+					item.stop()
+
+	def _turn_events(self):
+		"""Model calls and every savepoint, rollback or release that names the turn savepoint, in order."""
+		return [event for event in self.events if event == ("model",) or event[1:] == (TURN_SAVEPOINT,)]
+
+	def _run_failed_errors(self):
+		"""Messages of the `TITLE_RUN_FAILED` Error Logs of this ticket written since `setUp` (ticket names are reused)."""
+		filters = {"method": TITLE_RUN_FAILED, "error": ["like", f"ticket={self.ticket.name} %"]}
+		if self.old_errors:
+			filters["name"] = ["not in", self.old_errors]
+		return frappe.get_all("Error Log", filters=filters, pluck="error")
+
+	def _assert_second_turn_undone(self):
+		# the role really was added before the fault, then undone
+		self.assertEqual(self.roles_at_fault, [sorted([TURN_KEPT_ROLE, TURN_ADDED_ROLE])])
+		self.assertEqual(self._roles(), [TURN_KEPT_ROLE])
+		self.assertEqual(self._entries(entry_type="reason", turn=2), [])
+		self.assertEqual(
+			self._run_failed_errors(),
+			[f"ticket={self.ticket.name} trigger=comment_mention error=TurnFaultForTest"],
+		)
+		# the earlier successful turn keeps its change and its row
+		self.assertEqual(frappe.db.get_value("Note", self.note, "title"), TURN_NOTE_NEW)
+		(first,) = self._entries(entry_type="reason", turn=1)
+		self.assertEqual(
+			[(action["tool"], action["doctype"], action["ok"]) for action in json.loads(first.actions)],
+			[("api_update_record", "Note", True)],
+		)
+		# the gateway state written by the failing turn's own model call survives the undo
+		self.assertEqual(frappe.db.get_value(CREDENTIAL_DOCTYPE, self.key_row, "status"), KEY_STATUS_BAD_KEY)
+		self.assertEqual(
+			self._turn_events(),
+			[
+				("model",),
+				("savepoint", TURN_SAVEPOINT),
+				("model",),
+				("savepoint", TURN_SAVEPOINT),
+				("rollback", TURN_SAVEPOINT),
+			],
+		)
+
+	def test_write_entry_failure_undoes_turn_role_change(self):
+		def failing_write_entry(**fields):
+			name = write_entry(**fields)
+			if fields.get("entry_type") == "reason" and fields.get("turn") == 2:
+				self.roles_at_fault.append(self._roles())
+				raise TurnFaultForTest("write_entry")
+			return name
+
+		self._run_turns(None, patch.object(runner, "write_entry", side_effect=failing_write_entry))
+
+		self._assert_second_turn_undone()
+
+	def test_snapshot_handling_failure_undoes_turn(self):
+		record_snapshot = runner._record_snapshot
+
+		def failing_record_snapshot(name, outcome, n, before, after):
+			record_snapshot(name, outcome, n, before, after)
+			if self._reason_calls() == 2:
+				self.roles_at_fault.append(self._roles())
+				raise TurnFaultForTest("snapshot")
+
+		self._run_turns(None, patch.object(runner, "_record_snapshot", side_effect=failing_record_snapshot))
+
+		self._assert_second_turn_undone()
+
+	def test_successful_turns_set_savepoint_after_each_model_call_never_release(self):
+		self._run_turns()
+
+		self.assertEqual(self._roles(), sorted([TURN_KEPT_ROLE, TURN_ADDED_ROLE]))
+		self.assertEqual(frappe.db.get_value("Note", self.note, "title"), TURN_NOTE_NEW)
+		self.assertEqual([entry.turn for entry in self._entries(entry_type="reason")], [1, 2, 3])
+		self.assertEqual(self._run_failed_errors(), [])
+		self.assertEqual(self._turn_events(), [("model",), ("savepoint", TURN_SAVEPOINT)] * 3)
+		self.assertEqual(runner.REASON_TURN_SAVEPOINT, TURN_SAVEPOINT)
+
+	def test_gateway_error_turn_writes_its_entry_and_undoes_nothing(self):
+		self._run_turns(GatewayError("all_keys_failed", status=529, credential_label=f"{PREFIX}turn key"))
+
+		self.assertEqual(frappe.db.get_value("Note", self.note, "title"), TURN_NOTE_NEW)
+		self.assertEqual(frappe.db.get_value(CREDENTIAL_DOCTYPE, self.key_row, "status"), KEY_STATUS_BAD_KEY)
+		self.assertEqual(
+			[(entry.turn, entry.stop_reason, entry.error) for entry in self._entries(entry_type="reason")],
+			[(1, "tool_use", None), (2, "gateway_error", "all_keys_failed status=529")],
+		)
+		self.assertEqual(self._run_failed_errors(), [])
+		self.assertEqual(self._turn_events(), [("model",), ("savepoint", TURN_SAVEPOINT), ("model",)])
+
+	def _track(self):
+		"""Record `runner.write_entry` calls and callbacks; jobs go to a fake queue."""
+		self.written = []
+		self.callbacks = []
+		self.proposals_at_fault = []
+		self.jobs = FakeJobQueue()
+		for target, value in (("get_queue", lambda *args, **kwargs: self.jobs), ("_check_queue_size", None)):
+			queue_patch = patch(f"frappe.utils.background_jobs.{target}", side_effect=value)
+			queue_patch.start()
+			self.addCleanup(queue_patch.stop)
+		# callbacks left by the fixtures are not the turn's: only those a turn adds are counted
+		for queue in (frappe.db.before_commit, frappe.db.after_commit, frappe.db.after_rollback):
+			queue.reset()
+
+	def _proposal_names(self):
+		return frappe.get_all(PROPOSAL_DOCTYPE, filters={"ticket": self.ticket.name}, pluck="name")
+
+	def _note_fault(self):
+		self.roles_at_fault.append(self._roles())
+		self.proposals_at_fault.append(len(self._proposal_names()))
+
+	def _register_callbacks(self, failing_rollback_callback=False):
+		"""What a tool's hooks may do: queue work for after the commit or after a rollback."""
+		frappe.db.before_commit.add(lambda: self.callbacks.append("before_commit"))
+		frappe.db.after_commit.add(lambda: self.callbacks.append("after_commit"))
+		frappe.db.after_rollback.add(lambda: self.callbacks.append("after_rollback"))
+		frappe.enqueue(TURN_JOB_METHOD, enqueue_after_commit=True, timeout=60)
+		if failing_rollback_callback:
+
+			def failing():
+				raise RollbackCallbackFaultForTest("after_rollback")
+
+			frappe.db.after_rollback.add(failing)
+
+	def _tools(self, register_callbacks=False, failing_rollback_callback=False):
+		"""Real tools, except a proposal tool inserts a real `Chờ duyệt` proposal of the ticket and succeeds."""
+		execute_tool = runner.execute_tool
+
+		def execute(name, arguments, context):
+			if name in CHANGE_TOOL_NAMES:
+				# as `propose_change._insert`: the run's agent account inserts it through the write guard
+				with allow_agent_write():
+					proposal = make_change_proposal(ticket=self.ticket.name).name
+				return {"ok": True, "proposal": proposal, "status": CHANGE_STATUS_PENDING}
+			outcome = execute_tool(name, arguments, context)
+			if register_callbacks and self._reason_calls() == 2:
+				self._register_callbacks(failing_rollback_callback)
+			return outcome
+
+		return patch.object(runner, "execute_tool", side_effect=execute)
+
+	def _write_entry(self, fail_on=None, lose_savepoint=False):
+		"""`runner.write_entry` that records (entry_type, turn) of each call; `fail_on(fields)` true → the fault.
+
+		A `reason` row is faulted after its real insert, a `change` row before it. `lose_savepoint`: before the
+		fault the turn savepoint is gone, as after a commit inside the turn (DDL, a controller's own commit);
+		released rather than committed so the test transaction can still be undone."""
+
+		def fake(**fields):
+			self.written.append((fields.get("entry_type"), fields.get("turn")))
+			faulty = fail_on is not None and fail_on(fields)
+			if faulty and fields.get("entry_type") != "reason":
+				raise TurnFaultForTest("write_entry")
+			name = write_entry(**fields)
+			if faulty:
+				self._note_fault()
+				if lose_savepoint:
+					frappe.db.sql(f"release savepoint {TURN_SAVEPOINT}")
+				raise TurnFaultForTest("write_entry")
+			return name
+
+		return patch.object(runner, "write_entry", side_effect=fake)
+
+	def _from_second_turn(self):
+		return self.written[self.written.index(("reason", 2)) :]
+
+	@staticmethod
+	def _second_reason_row(fields):
+		return fields.get("entry_type") == "reason" and fields.get("turn") == 2
+
+	def _assert_turn_and_proposals_undone(self):
+		# the proposal really was made before the fault, then undone
+		self.assertEqual(self.proposals_at_fault, [1])
+		self._assert_second_turn_undone()
+		self.assertEqual(self._proposal_names(), [])
+		self.assertEqual(self._entries(entry_type="change"), [])
+		# no `change` row was even attempted: outside tests it would have committed the turn's writes
+		self.assertNotIn("change", [entry_type for entry_type, _turn in self.written])
+
+	def test_turn_writes_propose_rows_only_after_its_reason_row(self):
+		self._track()
+		self._run_turns(tool_turn(TURN_ROLE_CALL, *TURN_PROPOSE_CALLS), self._tools(), self._write_entry())
+
+		self.assertEqual(
+			self._from_second_turn(), [("reason", 2), ("change", None), ("change", None), ("reason", 3)]
+		)
+		(second,) = self._entries(entry_type="reason", turn=2)
+		proposals = [
+			action["name"] for action in json.loads(second.actions) if action["tool"] in CHANGE_TOOL_NAMES
+		]
+		self.assertEqual(len(proposals), 2)
+		self.assertEqual(sorted(proposals), sorted(self._proposal_names()))
+		rows = self._entries(entry_type="change")
+		self.assertEqual(
+			[[row[field] for field in PROPOSE_ROW_FIELDS] for row in rows],
+			[
+				["change", "change_action", "propose", AGENT_USER, proposal, self.ticket.name, second.run_id]
+				for proposal in proposals
+			],
+		)
+		self.assertEqual([row.instructor for row in rows], [INSTRUCTOR, INSTRUCTOR])
+		self.assertEqual(self._roles(), sorted([TURN_KEPT_ROLE, TURN_ADDED_ROLE]))
+		self.assertEqual(self._run_failed_errors(), [])
+
+	def test_propose_then_role_change_then_failure_undoes_both(self):
+		self._track()
+		self._run_turns(
+			tool_turn(TURN_PROPOSE_CALLS[0], TURN_ROLE_CALL),
+			self._tools(),
+			self._write_entry(fail_on=self._second_reason_row),
+		)
+
+		self._assert_turn_and_proposals_undone()
+
+	def test_role_change_then_propose_then_failure_undoes_both(self):
+		self._track()
+		bounded_actions = runner._bounded_actions
+
+		def failing_bounded_actions(actions):
+			if self._reason_calls() == 2:
+				self._note_fault()
+				raise TurnFaultForTest("bounded actions")
+			return bounded_actions(actions)
+
+		self._run_turns(
+			tool_turn(TURN_ROLE_CALL, TURN_PROPOSE_CALLS[0]),
+			self._tools(),
+			self._write_entry(),
+			patch.object(runner, "_bounded_actions", side_effect=failing_bounded_actions),
+		)
+
+		self._assert_turn_and_proposals_undone()
+
+	def test_propose_row_failure_after_reason_row_keeps_turn(self):
+		self._track()
+		with patch.object(runner, "_undo_turn", wraps=runner._undo_turn) as undo_turn:
+			self._run_turns(
+				tool_turn(TURN_ROLE_CALL, TURN_PROPOSE_CALLS[0]),
+				self._tools(),
+				self._write_entry(fail_on=lambda fields: fields.get("entry_type") == "change"),
+			)
+
+		undo_turn.assert_not_called()
+		self.assertEqual(self._from_second_turn(), [("reason", 2), ("change", None)])
+		self.assertEqual(self._roles(), sorted([TURN_KEPT_ROLE, TURN_ADDED_ROLE]))
+		(second,) = self._entries(entry_type="reason", turn=2)
+		(proposal,) = self._proposal_names()
+		self.assertEqual(
+			[(action["tool"], action["name"], action["ok"]) for action in json.loads(second.actions)],
+			[("api_update_record", TURN_USER, True), ("propose_file_change", proposal, True)],
+		)
+		self.assertEqual(self._entries(entry_type="change"), [])
+		self.assertEqual(
+			self._run_failed_errors(),
+			[f"ticket={self.ticket.name} trigger=comment_mention error=TurnFaultForTest"],
+		)
+
+	def _run_commit_callbacks(self):
+		frappe.db.before_commit.run()
+		frappe.db.after_commit.run()
+
+	def test_undone_turn_drops_its_commit_callbacks(self):
+		self._track()
+		self._run_turns(
+			None, self._tools(register_callbacks=True), self._write_entry(self._second_reason_row)
+		)
+
+		self._assert_second_turn_undone()
+		self._run_commit_callbacks()
+		self.assertEqual([name for name in self.callbacks if name != "after_rollback"], [])
+		self.assertNotIn(TURN_JOB_METHOD, self.jobs.methods)
+
+	def test_successful_turn_keeps_its_commit_callbacks(self):
+		self._track()
+		self._run_turns(None, self._tools(register_callbacks=True), self._write_entry())
+
+		self.assertEqual(self._roles(), sorted([TURN_KEPT_ROLE, TURN_ADDED_ROLE]))
+		self.assertEqual(self.callbacks, [])
+		self._run_commit_callbacks()
+		self.assertEqual(self.callbacks, ["before_commit", "after_commit"])
+		self.assertEqual(self.jobs.methods.count(TURN_JOB_METHOD), 1)
+
+	def test_undone_turn_runs_its_after_rollback_callbacks(self):
+		self._track()
+		self._run_turns(
+			None, self._tools(register_callbacks=True), self._write_entry(self._second_reason_row)
+		)
+
+		self._assert_second_turn_undone()
+		self.assertEqual(self.callbacks, ["after_rollback"])
+
+	def _run_with_logger(self, *patches):
+		"""`_run_turns` with `frappe.logger` replaced: one mock per logger name, kept in `self.loggers`."""
+		self.loggers = {}
+
+		def get_logger(module=None, *args, **kwargs):
+			return self.loggers.setdefault(module, MagicMock())
+
+		self._run_turns(None, patch.object(frappe, "logger", side_effect=get_logger), *patches)
+
+	def _undo_warnings(self):
+		"""The undo warnings written through the agent's own logger (`LOGGER_NAME`), not any other."""
+		logger = self.loggers.get(LOGGER_NAME)
+		return [
+			call.args
+			for call in (logger.warning.call_args_list if logger else [])
+			if call.args and str(call.args[0]).startswith("reason turn undo")
+		]
+
+	def _run_id(self):
+		(first,) = self._entries(entry_type="reason", turn=1)
+		return first.run_id
+
+	def _assert_lost_savepoint_kept_original_error(self):
+		# the turn's writes stay: the savepoint was gone, nothing could be undone (ADR-024 QĐ 5, accepted)
+		self.assertEqual(self.roles_at_fault, [sorted([TURN_KEPT_ROLE, TURN_ADDED_ROLE])])
+		self.assertEqual(self._roles(), sorted([TURN_KEPT_ROLE, TURN_ADDED_ROLE]))
+		self.assertEqual(
+			self._run_failed_errors(),
+			[f"ticket={self.ticket.name} trigger=comment_mention error=TurnFaultForTest"],
+		)
+		self.assertEqual(
+			self._undo_warnings(),
+			[("reason turn undo failed run_id=%s error=%s", self._run_id(), "OperationalError")],
+		)
+		# one rollback attempt; the savepoint is not set again
+		self.assertEqual(
+			self._turn_events(),
+			[
+				("model",),
+				("savepoint", TURN_SAVEPOINT),
+				("model",),
+				("savepoint", TURN_SAVEPOINT),
+				("rollback", TURN_SAVEPOINT),
+			],
+		)
+
+	def test_lost_turn_savepoint_keeps_original_error(self):
+		self._track()
+		self._run_with_logger(self._tools(), self._write_entry(self._second_reason_row, lose_savepoint=True))
+
+		self._assert_lost_savepoint_kept_original_error()
+
+	def test_lost_turn_savepoint_keeps_commit_callbacks(self):
+		self._track()
+		self._run_with_logger(
+			self._tools(register_callbacks=True),
+			self._write_entry(self._second_reason_row, lose_savepoint=True),
+		)
+
+		self._assert_lost_savepoint_kept_original_error()
+		# the queues are left as they are: no rollback callback ran, the turn's commit callbacks still wait
+		self.assertEqual(self.callbacks, [])
+		self._run_commit_callbacks()
+		self.assertEqual(self.callbacks, ["before_commit", "after_commit"])
+		self.assertEqual(self.jobs.methods.count(TURN_JOB_METHOD), 1)
+
+	def test_failing_rollback_callback_keeps_original_error(self):
+		self._track()
+		self._run_with_logger(
+			self._tools(register_callbacks=True, failing_rollback_callback=True),
+			self._write_entry(self._second_reason_row),
+		)
+
+		self._assert_second_turn_undone()
+		# the rollback callback queued before the failing one ran; the commit callbacks were still dropped
+		self.assertEqual(self.callbacks, ["after_rollback"])
+		self.assertEqual(
+			self._undo_warnings(),
+			[
+				(
+					"reason turn undo callback failed run_id=%s error=%s",
+					self._run_id(),
+					"RollbackCallbackFaultForTest",
+				)
+			],
+		)
+		self._run_commit_callbacks()
+		self.assertEqual(self.callbacks, ["after_rollback"])
+		self.assertNotIn(TURN_JOB_METHOD, self.jobs.methods)
+
+
+ALARM_USER = "runner.alarm.once@example.com"
+# The human-granted role stays in the tool's list; only the second role is the agent's change.
+ALARM_KEPT_ROLE, ALARM_ADDED_ROLE = "Blogger", "Knowledge Base Contributor"
+ALARM_SUBJECT = "Agent đã sửa bản ghi phân quyền"
+# Fixed future times, so every real ERP AI Log row of the site is older than the watermark.
+ALARM_WATERMARK = datetime(2031, 11, 15, 8, 0, 0)
+ALARM_LOGGED_AT = datetime(2031, 11, 15, 8, 10, 0)
+
+
+class TestRunnerPrivilegeAlarmEndToEnd(RunnerTestBase):
+	"""AC-14, AC-19, NFR-8: a role the runner adds through a record tool is alarmed by the daily job exactly once."""
+
+	def setUp(self):
+		super().setUp()
+		set_agent_settings(
+			permission_level="L3", code_change_enabled=1, unrestricted_enabled=0, monthly_budget_usd=1000
+		)
+		make_instructor(self)
+		self.addCleanup(frappe.clear_cache, user=ALARM_USER)
+		frappe.get_doc(
+			{
+				"doctype": "User",
+				"email": ALARM_USER,
+				"first_name": "Cảnh báo một lần",
+				"send_welcome_email": 0,
+				"roles": [{"role": ALARM_KEPT_ROLE}],
+			}
+		).insert()
+		# Rolled back with the test transaction, like every row the run and the job write here.
+		frappe.db.set_single_value(SETTING_DOCTYPE, "privilege_alert_checked_until", ALARM_WATERMARK)
+		self.send_alarm = self.enterContext(patch("erp_ai.alerts.send_alarm"))
+		self.log_error = self.enterContext(patch("frappe.log_error"))
+
+	def _roles(self):
+		return sorted(frappe.get_all("Has Role", {"parent": ALARM_USER, "parenttype": "User"}, pluck="role"))
+
+	def _permission_alarms(self, now):
+		"""Run the daily job at `now`; return the messages it sent for the permission-change condition."""
+		self.send_alarm.reset_mock()
+		tasks.check_privilege_escalation(now=now)
+		self.log_error.assert_not_called()
+		return [call.args[1] for call in self.send_alarm.call_args_list if call.args[0] == ALARM_SUBJECT]
+
+	def test_role_change_via_record_tool_alarmed_once(self):
+		self.gateway.results = [
+			tool_turn(
+				tool_use(
+					"toolu_1",
+					"api_update_record",
+					doctype="User",
+					name=ALARM_USER,
+					values={"roles": [{"role": ALARM_KEPT_ROLE}, {"role": ALARM_ADDED_ROLE}]},
+				)
+			),
+			make_model_result(),
+		]
+		with patch.object(authority, "latest_instructor", return_value=INSTRUCTOR):
+			self._run("comment_mention")
+
+		self.assertEqual(self._roles(), sorted([ALARM_KEPT_ROLE, ALARM_ADDED_ROLE]))
+		# The row the runner wrote in this run, only moved in time.
+		(entry,) = [row for row in self._entries(entry_type="reason") if row.actions]
+		self.assertEqual(
+			[(action["tool"], action["doctype"], action["ok"]) for action in json.loads(entry.actions)],
+			[("api_update_record", "User", True)],
+		)
+		frappe.db.set_value(LOG_DOCTYPE, entry.name, "creation", ALARM_LOGGED_AT, update_modified=False)
+
+		self.assertEqual(
+			self._permission_alarms(ALARM_LOGGED_AT + timedelta(hours=1)),
+			[
+				f"{ALARM_SUBJECT}: thêm role {ALARM_ADDED_ROLE} cho {ALARM_USER} "
+				f"(người ra lệnh {INSTRUCTOR}, 2031-11-15 08:10)"
+			],
+		)
+		self.assertEqual(self._permission_alarms(ALARM_LOGGED_AT + timedelta(hours=25)), [])
 
 
 # Hand-written: the tools a run with an instructor gets when no change group is granted (FEAT-001/006 set).

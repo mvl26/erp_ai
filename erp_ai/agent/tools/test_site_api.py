@@ -1,4 +1,6 @@
+import datetime
 import json
+from decimal import Decimal
 from unittest.mock import patch
 
 import frappe
@@ -67,6 +69,11 @@ def _calls_naming(doctype):
 		"api_submit_record": {"doctype": doctype, "name": doctype, "action": "submit"},
 		"api_call_method": {"method": "frappe.client.get_list", "arguments": {"doctype": doctype}},
 	}
+
+
+def _without_snapshot(result):
+	"""The tool result less `_snapshot`, which is asserted on its own (AC-13)."""
+	return {key: value for key, value in result.items() if key != "_snapshot"}
 
 
 def _make_user(email, *roles):
@@ -176,6 +183,13 @@ class TestSiteApi(FrappeTestCase):
 			self.assertFalse(result["ok"], role)
 			self.assertIn(role, result["reason"])
 			self.assertFalse(frappe.db.exists("User", NEW_USER), role)
+
+	def test_forbidden_roles_are_exactly_the_six_admin_roles_of_ac14(self):
+		# Written out by hand so a role dropped from or added to the constant fails here.
+		self.assertEqual(
+			site_api.FORBIDDEN_ROLES,
+			{"System Manager", "Administrator", "ERP AI Instructor", "ERP AI Agent", "Guest", "All"},
+		)
 
 	def test_refuses_adding_a_forbidden_role_to_an_existing_user(self):
 		self.create("User", self.user_values())
@@ -490,7 +504,7 @@ class TestSiteApi(FrappeTestCase):
 			},
 		)
 		self.assertEqual(
-			result,
+			_without_snapshot(result),
 			{
 				"ok": True,
 				"doctype": "Webhook",
@@ -510,7 +524,7 @@ class TestSiteApi(FrappeTestCase):
 		self.assertEqual(frappe.db.get_value("Webhook", WEBHOOK_NAME, "enabled"), 0)
 		enabled = self.update("Webhook", WEBHOOK_NAME, {"enabled": 1})
 		self.assertEqual(
-			enabled,
+			_without_snapshot(enabled),
 			{
 				"ok": True,
 				"doctype": "Webhook",
@@ -520,6 +534,57 @@ class TestSiteApi(FrappeTestCase):
 			},
 		)
 		self.assertEqual(frappe.db.get_value("Webhook", WEBHOOK_NAME, "enabled"), 0)
+
+	def test_snapshot_keys_are_the_given_values_not_the_forced_ones(self):
+		values = {
+			"name": WEBHOOK_NAME,
+			"webhook_doctype": "Note",
+			"webhook_docevent": "after_insert",
+			"request_url": "https://example.com/siteapi",
+			"request_method": "POST",
+		}
+		created = self.create("Webhook", values)
+		self.assertTrue(created["ok"], created)
+		self.assertEqual(frappe.db.get_value("Webhook", WEBHOOK_NAME, "enabled"), 0)
+		self.assertIsNone(created["_snapshot"]["before"])
+		self.assertEqual(set(created["_snapshot"]["after"]), {"name", *values})
+		updated = self.update("Webhook", WEBHOOK_NAME, {"request_method": "PUT"})
+		self.assertTrue(updated["ok"], updated)
+		self.assertEqual(
+			updated["_snapshot"],
+			{
+				"before": {"name": WEBHOOK_NAME, "request_method": "POST"},
+				"after": {"name": WEBHOOK_NAME, "request_method": "PUT"},
+			},
+		)
+
+	def test_update_snapshot_holds_the_doctype_tables_and_the_saved_values(self):
+		from frappe.desk.doctype.note.note import Note
+
+		created = self.create("Note", {"title": NOTE_TITLE, "public": 1, "seen_by": [{"user": BOSS}]})
+		self.assertTrue(created["ok"], created)
+		content = frappe.db.get_value("Note", created["name"], "content")
+
+		def rewrite(note):
+			note.content = "SITEAPI-TEST đã chuẩn hóa"
+
+		with (
+			patch.dict(site_api.SNAPSHOT_TABLES, {"Note": ("seen_by",)}),
+			patch.object(Note, "validate", side_effect=rewrite, autospec=True, create=True),
+		):
+			result = self.update("Note", created["name"], {"content": "SITEAPI-TEST model gửi"})
+		seen_by = [{"docstatus": 0, "user": BOSS}]
+		self.assertEqual(
+			result["_snapshot"],
+			{
+				"before": {"name": created["name"], "content": content, "seen_by": seen_by},
+				"after": {
+					"name": created["name"],
+					"content": "SITEAPI-TEST đã chuẩn hóa",
+					"seen_by": seen_by,
+				},
+			},
+		)
 
 	def test_rename_is_refused(self):
 		created = self.create("Note", {"title": NOTE_TITLE, "public": 1})
@@ -537,7 +602,7 @@ class TestSiteApi(FrappeTestCase):
 	def test_duplicate_name_rolls_back_to_savepoint(self):
 		created = self.create("Tag", {"name": DUPLICATE_TAG})
 		self.assertEqual(
-			created,
+			_without_snapshot(created),
 			{
 				"ok": True,
 				"doctype": "Tag",
@@ -580,7 +645,7 @@ class TestSiteApi(FrappeTestCase):
 		self.assertTrue(created["ok"], created)
 		result = self.update("Note", created["name"], {"content": "mới"})
 		self.assertEqual(
-			result,
+			_without_snapshot(result),
 			{
 				"ok": True,
 				"doctype": "Note",
@@ -596,7 +661,7 @@ class TestSiteApi(FrappeTestCase):
 		long_content = "n" * 300
 		result = self.create("Note", {"title": NOTE_TITLE, "public": 1, "content": long_content})
 		self.assertEqual(
-			result,
+			_without_snapshot(result),
 			{
 				"ok": True,
 				"doctype": "Note",
@@ -843,7 +908,7 @@ class TestSiteApiUnrestricted(FrappeTestCase):
 		)
 		result = self.run_tool("api_delete_record", {"doctype": "Note", "name": created["name"]})
 		self.assertEqual(
-			result,
+			_without_snapshot(result),
 			{
 				"ok": True,
 				"doctype": "Note",
@@ -952,7 +1017,7 @@ class TestSiteApiUnrestricted(FrappeTestCase):
 					"api_submit_record", {"doctype": "Note", "name": created["name"], "action": action}
 				)
 			self.assertEqual(
-				result,
+				_without_snapshot(result),
 				{
 					"ok": True,
 					"doctype": "Note",
@@ -964,6 +1029,134 @@ class TestSiteApiUnrestricted(FrappeTestCase):
 			)
 			self.assertEqual(frappe.db.get_value("Note", created["name"], "docstatus"), after, action)
 			called.assert_called_once()
+
+	def test_delete_and_submit_snapshot_shapes(self):
+		long_content = "c" * 300
+		created = self.run_tool(
+			"api_create_record",
+			{"doctype": "Note", "values": {"title": NOTE_TITLE, "public": 1, "content": long_content}},
+		)
+		name = created["name"]
+		self.assertEqual(
+			created["_snapshot"],
+			{
+				"before": None,
+				"after": {"name": name, "title": NOTE_TITLE, "public": 1, "content": long_content},
+			},
+		)
+
+		updated = self.run_tool(
+			"api_update_record",
+			{
+				"doctype": "Note",
+				"name": name,
+				"values": {"expire_notification_on": "2026-12-01", "seen_by": [{"user": BOSS}]},
+			},
+		)
+		self.assertEqual(
+			updated["_snapshot"],
+			{
+				"before": {"name": name, "expire_notification_on": None, "seen_by": []},
+				"after": {
+					"name": name,
+					"expire_notification_on": "2026-12-01",
+					"seen_by": [{"docstatus": 0, "user": BOSS}],
+				},
+			},
+		)
+
+		for action, before, after in (("submit", 0, 1), ("cancel", 1, 2)):
+			with (
+				patch.object(site_api, "_is_submittable", return_value=True),
+				patch.object(
+					frappe.model.document.Document,
+					action,
+					autospec=True,
+					side_effect=lambda doc, status=after: doc.db_set("docstatus", status),
+				),
+			):
+				result = self.run_tool(
+					"api_submit_record", {"doctype": "Note", "name": name, "action": action}
+				)
+			self.assertEqual(
+				result["_snapshot"],
+				{"before": {"name": name, "docstatus": before}, "after": {"name": name, "docstatus": after}},
+				action,
+			)
+		frappe.db.set_value("Note", name, "docstatus", 0, update_modified=False)
+
+		creation = frappe.db.get_value("Note", name, "creation")
+		self.assertIsInstance(creation, datetime.datetime)
+		deleted = self.run_tool("api_delete_record", {"doctype": "Note", "name": name})
+		self.assertTrue(deleted["ok"], deleted)
+		before = deleted["_snapshot"]["before"]
+		self.assertIsNone(deleted["_snapshot"]["after"])
+		self.assertEqual(set(deleted["_snapshot"]), {"before", "after"})
+		self.assertEqual(
+			{
+				key: before[key]
+				for key in ("name", "title", "public", "content", "expire_notification_on", "seen_by")
+			},
+			{
+				"name": name,
+				"title": NOTE_TITLE,
+				"public": 1,
+				"content": long_content,
+				"expire_notification_on": "2026-12-01",
+				"seen_by": [{"docstatus": 0, "user": BOSS}],
+			},
+		)
+		self.assertEqual(before["creation"], str(creation))
+		self.assertEqual([key for key, value in before.items() if value in (None, "", [])], [])
+		self.assertEqual(deleted["value_before"]["content"], "c" * 200)
+		json.dumps(deleted["_snapshot"])
+
+	def test_refused_or_failed_write_has_no_snapshot(self):
+		from frappe.desk.doctype.note.note import Note
+
+		control = self.run_tool("api_create_record", {"doctype": "Note", "values": {"title": NOTE_TITLE}})
+		self.assertTrue(control["ok"], control)
+		self.assertIn("_snapshot", control)
+		name = control["name"]
+
+		def refuse(note):
+			frappe.throw("SITEAPI từ chối")
+
+		with patch.object(Note, "validate", side_effect=refuse, autospec=True, create=True):
+			failed_update = self.run_tool(
+				"api_update_record", {"doctype": "Note", "name": name, "values": {"content": "x"}}
+			)
+		with (
+			patch.object(frappe, "log_error"),
+			patch.object(frappe, "delete_doc", side_effect=TypeError("boom")),
+		):
+			crashed_delete = self.run_tool("api_delete_record", {"doctype": "Note", "name": name})
+		results = {
+			"create": self.run_tool("api_create_record", {"doctype": "ERP AI Log", "values": {"enabled": 0}}),
+			"update": self.run_tool(
+				"api_update_record",
+				{"doctype": "Note", "name": "SITEAPI-không-có", "values": {"content": "x"}},
+			),
+			"delete": self.run_tool("api_delete_record", {"doctype": "Note", "name": "SITEAPI-không-có"}),
+			"submit": self.run_tool(
+				"api_submit_record", {"doctype": "Note", "name": name, "action": "submit"}
+			),
+			"failed update": failed_update,
+			"crashed delete": crashed_delete,
+		}
+		for case, result in results.items():
+			self.assertFalse(result["ok"], (case, result))
+			self.assertNotIn("_snapshot", result, case)
+
+		method = self.run_tool(
+			"api_call_method",
+			{
+				"method": "frappe.client.get_value",
+				"arguments": {"doctype": "User", "filters": BOSS, "fieldname": "email"},
+			},
+		)
+		self.assertTrue(method["ok"], method)
+		self.assertNotIn("_snapshot", method)
 
 	def test_call_method_runs_whitelisted_methods_only(self):
 		result = self.run_tool(
@@ -1175,6 +1368,91 @@ class TestSiteApiUnrestricted(FrappeTestCase):
 		self.assertFalse(result["ok"])
 		self.assertIn("erp_ai", result["reason"])
 		self.assertEqual(called.call_count, 0)
+
+
+class TestSnapshot(FrappeTestCase):
+	"""`site_api._snapshot` on records held in memory: nothing is saved."""
+
+	def test_snapshot_drops_secret_and_system_fields(self):
+		long_note = "x" * 30000
+		setting = frappe.get_doc(
+			{
+				"doctype": "ERP AI Setting",
+				"name": "ERP AI Setting",
+				"monthly_budget_usd": Decimal("12.50"),
+				"credentials": [
+					{"label": "SITEAPI thứ hai", "api_key": FAKE_SECRET, "idx": 2, "note": long_note},
+					{
+						"label": "SITEAPI thứ nhất",
+						"api_key": FAKE_SECRET,
+						"idx": 1,
+						"paused_until": datetime.datetime(2026, 11, 14, 8, 30),
+					},
+				],
+			}
+		)
+		# A private property is never part of the snapshot.
+		setattr(setting.credentials[0], "__unsaved", 1)
+		snapshot = site_api._snapshot(setting, ("name", "credentials", "monthly_budget_usd"))
+		self.assertEqual(set(snapshot), {"name", "credentials", "monthly_budget_usd"})
+		self.assertEqual(snapshot["name"], "ERP AI Setting")
+		self.assertEqual(snapshot["monthly_budget_usd"], 12.5)
+		rows = snapshot["credentials"]
+		self.assertEqual([row["label"] for row in rows], ["SITEAPI thứ nhất", "SITEAPI thứ hai"])
+		dropped = {
+			"name",
+			"idx",
+			"parent",
+			"parentfield",
+			"parenttype",
+			"owner",
+			"creation",
+			"modified",
+			"modified_by",
+			"doctype",
+		}
+		for row in rows:
+			self.assertEqual(set(row) & (dropped | {"api_key"}), set(), row)
+			self.assertEqual([key for key in row if key.startswith("_")], [], row)
+		self.assertEqual(rows[1]["note"], long_note)
+		self.assertEqual(rows[0]["paused_until"], "2026-11-14 08:30:00")
+		json.dumps(snapshot)
+
+		account = frappe.get_doc(
+			{
+				"doctype": "Email Account",
+				"name": "SITEAPI hộp thư",
+				"email_id": BOSS,
+				"password": FAKE_PASSWORD,
+			}
+		)
+		snapshot = site_api._snapshot(account, ("email_id", "password", "docstatus"))
+		self.assertEqual(snapshot, {"name": "SITEAPI hộp thư", "email_id": BOSS, "docstatus": 0})
+
+		text = json.dumps([site_api._snapshot(setting, ("credentials",)), snapshot], ensure_ascii=False)
+		self.assertEqual(text.count(FAKE_SECRET), 0)
+		self.assertEqual(text.count(FAKE_PASSWORD), 0)
+
+	def test_user_snapshot_only_name_and_roles(self):
+		user = frappe.get_doc(
+			{
+				"doctype": "User",
+				"name": NEW_USER,
+				"email": NEW_USER,
+				"first_name": "Người mới",
+				"api_key": FAKE_SECRET,
+				"new_password": FAKE_PASSWORD,
+				"roles": [{"role": "Accounts User", "idx": 2}, {"role": ALLOWED_ROLE, "idx": 1}],
+			}
+		)
+		self.assertEqual(site_api.SNAPSHOT_TABLES, {"User": ("roles",)})
+		for fields in ((), ("first_name", "email", "api_key", "new_password"), ("roles",)):
+			snapshot = site_api._snapshot(user, fields)
+			self.assertEqual(set(snapshot), {"name", "roles"}, fields)
+			self.assertEqual(snapshot["name"], NEW_USER)
+			self.assertEqual([row["role"] for row in snapshot["roles"]], [ALLOWED_ROLE, "Accounts User"])
+			self.assertNotIn(FAKE_SECRET, json.dumps(snapshot))
+			self.assertNotIn(FAKE_PASSWORD, json.dumps(snapshot))
 
 
 # F-2: planted fake values in child rows; none may reach `value_before`/`value_after`.

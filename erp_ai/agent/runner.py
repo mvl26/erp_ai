@@ -83,6 +83,8 @@ WRITE_TOOL_TARGETS = {
 	"api_submit_record": (None, "name"),
 	"api_call_method": ("Method", "method"),
 }
+# Generic write tools: the model names the DocType; each successful call keeps its full snapshot (AC-13).
+GENERIC_WRITE_TOOLS = tuple(name for name, (doctype, _) in WRITE_TOOL_TARGETS.items() if doctype is None)
 # Record tools: their action entry also carries the before/after values and the instructor (AC-35).
 RECORD_TOOLS = frozenset(
 	("api_create_record", "api_update_record", "api_delete_record", "api_submit_record", "api_call_method")
@@ -105,6 +107,8 @@ REASON_TASK_EXISTS = "phiếu đã có Task liên kết"
 ROUTE_SAVEPOINT = "erp_ai_route"
 # One write unit after (u1) (assign, comment) nests inside the savepoint above.
 ROUTE_UNIT_SAVEPOINT = "erp_ai_route_unit"
+# Set right after each reason turn's model call: a failing turn is undone to here (ADR-024 QĐ 2).
+REASON_TURN_SAVEPOINT = "erp_ai_reason_turn"
 USAGE_COLUMNS = ("input_tokens", "output_tokens", "cache_creation_input_tokens", "cache_read_input_tokens")
 
 
@@ -637,34 +641,94 @@ def _reason(ticket_name, trigger, run_id, settings, context, classification, dea
 			)
 			return
 
-		tool_blocks = [block for block in result.content if block.get("type") == "tool_use"]
-		tool_results, actions, before, after, tool_errors, skipped = [], [], {}, {}, [], []
-		# the whole turn waits, before any of its tools runs (D-6)
-		if delay is not None and any(block["name"] == ANSWER_TOOL for block in tool_blocks):
-			delay.wait_before_answer(deadline)
-		for block in tool_blocks:
-			status.working(block["name"])
-			tool_results.append(_run_tool(block, context, actions, before, after, tool_errors, skipped))
-		stop_reason = result.stop_reason
-		wants_tools = stop_reason == STOP_TOOL_USE
-		if wants_tools and turn == max_turns:
-			stop_reason = STOP_MAX_TURNS
-		write_entry(
-			**base,
-			**_call_fields(result),
-			turn=turn,
-			stop_reason=stop_reason,
-			tools_called=[block["name"] for block in tool_blocks] or None,
-			error="; ".join([*tool_errors, *status.take_errors()]) or None,
-			actions=_bounded_actions(actions) if actions else None,
-			value_before=before or None,
-			value_after=after or None,
-			skipped_fields=skipped or None,
-		)
+		# after the call, so the gateway key state it wrote survives an undo; not released: the commit of the
+		# `reason` row's `write_entry` ends it (within the turn the runner commits nothing else), and the next
+		# turn's savepoint of the same name replaces it
+		frappe.db.savepoint(REASON_TURN_SAVEPOINT)
+		try:
+			tool_blocks = [block for block in result.content if block.get("type") == "tool_use"]
+			tool_results, actions, before, after, tool_errors, skipped = [], [], {}, {}, [], []
+			# the whole turn waits, before any of its tools runs (D-6)
+			if delay is not None and any(block["name"] == ANSWER_TOOL for block in tool_blocks):
+				delay.wait_before_answer(deadline)
+			for block in tool_blocks:
+				status.working(block["name"])
+				tool_results.append(_run_tool(block, context, actions, before, after, tool_errors, skipped))
+			stop_reason = result.stop_reason
+			wants_tools = stop_reason == STOP_TOOL_USE
+			if wants_tools and turn == max_turns:
+				stop_reason = STOP_MAX_TURNS
+			write_entry(
+				**base,
+				**_call_fields(result),
+				turn=turn,
+				stop_reason=stop_reason,
+				tools_called=[block["name"] for block in tool_blocks] or None,
+				error="; ".join([*tool_errors, *status.take_errors()]) or None,
+				actions=_bounded_actions(actions) if actions else None,
+				value_before=before or None,
+				value_after=after or None,
+				skipped_fields=skipped or None,
+			)
+		except Exception:
+			# no change of the turn may be committed without its `reason` entry (NFR-3); `run_for_ticket` logs it
+			_undo_turn(run_id)
+			raise
+		_write_propose_rows(actions, context)
 		if not wants_tools or not tool_results:
 			return
 		messages.append({"role": "assistant", "content": result.content})
 		messages.append({"role": "user", "content": tool_results})
+
+
+def _undo_turn(run_id) -> None:
+	"""Undo the uncommitted writes of the failing reason turn, back to right after its model call.
+
+	As `frappe.db.rollback()` does, stopping at the savepoint (design-amd2 D-8): the commit callbacks queued
+	since are dropped (only the turn's: the commit before the savepoint ran the earlier ones) and the rollback
+	callbacks run. When the savepoint is already gone, nothing is undone and neither happens: both callback
+	queues are left as they are. Raises nothing: the caller re-raises the turn's own error, which must reach
+	the Error Log.
+	"""
+	try:
+		frappe.db.rollback(save_point=REASON_TURN_SAVEPOINT)
+	except Exception as exc:
+		# the savepoint is gone: a commit inside a tool (DDL, a controller's own commit) kept the turn's earlier
+		# writes (ADR-024 QĐ 5, accepted). Not set again and the callback queues left alone: the remaining
+		# writes will be committed, so their callbacks must run (D-8)
+		frappe.logger(LOGGER_NAME).warning(
+			"reason turn undo failed run_id=%s error=%s", run_id, type(exc).__name__
+		)
+		return
+	frappe.db.before_commit.reset()
+	frappe.db.after_commit.reset()
+	try:
+		frappe.db.after_rollback.run()
+	except Exception as exc:
+		# the turn's writes are already undone; a rollback hook's failure must not replace the turn's error
+		frappe.logger(LOGGER_NAME).warning(
+			"reason turn undo callback failed run_id=%s error=%s", run_id, type(exc).__name__
+		)
+
+
+def _write_propose_rows(actions, context) -> None:
+	"""The `propose` step of each proposal the turn made, written by the agent account (design 4.1 step 4).
+
+	Only after the turn's `reason` row (design-amd2 D-7): `write_entry` commits, and a commit inside the turn
+	would keep its writes without that row. Read from the turn's own `actions`, not their bounded copy.
+	"""
+	for action in actions:
+		if action["tool"] in PROPOSE_TOOLS and action["ok"]:
+			write_entry(
+				entry_type=ENTRY_TYPE_CHANGE,
+				trigger=TRIGGER_CHANGE_ACTION,
+				change_step=PROPOSE_STEP,
+				actor=AGENT_USER,
+				change_proposal=action["name"],
+				ticket=context.ticket_name,
+				run_id=context.run_id,
+				instructor=context.instructor,
+			)
 
 
 def _run_tool(block, context, actions, before, after, tool_errors, skipped):
@@ -686,20 +750,9 @@ def _run_tool(block, context, actions, before, after, tool_errors, skipped):
 			"content": f"Lỗi: {type(exc).__name__}",
 			"is_error": True,
 		}
-	if name in PROPOSE_TOOLS and outcome.get("ok"):
-		# the `propose` step of the proposal's own log trail, written by the agent account (design 4.1 step 4)
-		write_entry(
-			entry_type=ENTRY_TYPE_CHANGE,
-			trigger=TRIGGER_CHANGE_ACTION,
-			change_step=PROPOSE_STEP,
-			actor=AGENT_USER,
-			change_proposal=outcome["proposal"],
-			ticket=context.ticket_name,
-			run_id=context.run_id,
-			instructor=context.instructor,
-		)
 	if name in WRITE_TOOL_TARGETS:
 		actions.append(_action(name, context, outcome, bool(outcome.get("ok")), arguments))
+		_record_snapshot(name, outcome, len(actions), before, after)
 		if outcome.get("ok") and "after" in outcome:
 			before[name] = outcome.get("before")
 			after[name] = outcome["after"]
@@ -707,6 +760,15 @@ def _run_tool(block, context, actions, before, after, tool_errors, skipped):
 			skipped.extend(outcome.get("skipped") or [])
 	content = json.dumps(outcome, ensure_ascii=False, default=str)[:TOOL_RESULT_MAX_CHARS]
 	return {"type": "tool_result", "tool_use_id": block["id"], "content": content}
+
+
+def _record_snapshot(name, outcome, n, before, after) -> None:
+	"""Keep a generic write call's full before/after under `<tool>#<n>`, n = its position in the turn's actions;
+	the snapshot is always taken out of the outcome, so it never reaches the model (design-amd2 §4.1)."""
+	snapshot = outcome.pop("_snapshot", None)
+	if name in GENERIC_WRITE_TOOLS and snapshot is not None:
+		before[f"{name}#{n}"] = snapshot["before"]
+		after[f"{name}#{n}"] = snapshot["after"]
 
 
 def _action(name, context, outcome, ok, arguments):

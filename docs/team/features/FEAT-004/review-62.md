@@ -64,3 +64,38 @@ minor | — | — | 4 điểm nhỏ: (1) STD-TEST-2 site_api.py update_record `s
 
 ## Deferred
 - Không có.
+
+## Sửa lại sau nghiệm thu (2026-11-14, chặng 11) — F-2 của `acceptance-part-3.md`
+
+Tech-lead chép từ tin trả về của reviewer (reviewer chỉ đọc, không ghi file).
+
+### Vòng 1 — request-changes
+- Diff: `git diff 0ea548c..f0fefb4` (commit `fix(site_api): scrub secrets in child rows of before/after values (FEAT-004)`, `site_api.py` +38/−7, `test_site_api.py` +101; gói review: `abd2fa2..f0fefb4`)
+- Lớp 1: đường tạo, sửa, xóa đều qua `_shown` nên đều được lọc (`site_api.py:269,291,294,313`); khóa tên mật bị che ở mọi độ sâu, kể cả dòng con là JSON text; trường `Password` của DocType con bị che (ca `pin_code` chỉ vướng nhánh này, `api_key` chỉ vướng `SECRET_RESULT_KEYS`); khóa không mật vẫn hiện; không sửa assertion cũ; đúng touchpoint.
+
+| severity | STD | file:line | description | fix |
+|---|---|---|---|---|
+| major | STD-TEST-8 | erp_ai/agent/tools/test_site_api.py:1242 | setUp nâng VALUE_MAX lên 10000 cho CẢ 5 ca, nên thứ tự "lọc trước, cắt 200 sau" (site_api.py:219) không có ca nào giữ. Đảo thành cắt trước rồi lọc thì 5 ca vẫn xanh. Nhưng với VALUE_MAX=200 thật, JSON đã bị cắt không parse được, `_scrub` chỉ thấy một chuỗi, và `api_key` nằm trong 200 ký tự đầu bị lộ. Tiêu chí "cắt 200 ký tự vẫn chạy" không có ca nào ở giới hạn thật. confirmed | thêm một ca KHÔNG patch VALUE_MAX: dòng con có `api_key` giả trong 200 ký tự đầu, kỳ vọng viết tay bằng assertEqual nguyên chuỗi đã cắt (giá trị giả 0 lần, độ dài 200) |
+
+minor | — | — | 2 điểm nhỏ: (1) `site_api.py:197` `_plain` không chạy tới trên tài liệu thật vì `Document.as_dict` đã đổi dòng con thành dict, chỉ stub đi qua; docstring `_without_secrets` ghi "Document" là quá lời; (2) nhánh "trả lại `value` khi không có gì để che" chỉ thử với list | tùy dev
+
+### Vòng 2 — approve
+- Diff sửa: `git diff f0fefb4..7894f04` (commit `test(site_api): pin scrub-before-cut at the real 200-character limit (FEAT-004)`, chỉ test: `test_site_api.py` +35/−11, `test_agent_runner.py` +2)
+
+| Phát hiện | Trạng thái | Bằng chứng |
+|---|---|---|
+| major STD-TEST-8 — `VALUE_MAX` bị nâng cho cả 5 ca | ADDRESSED | `TestSiteApiChildSecretsAtRealCut` (`test_site_api.py:1290-1302`): `setUp` chỉ gọi `_stub_child_meta`, `VALUE_MAX` thật = 200; dòng con có `api_key` giả ở ký tự 28–45 và `label = "x" * 300`; `assertEqual` nguyên chuỗi viết tay `'[{"name": "r1", "api_key": "[đã ẩn]", "label": "' + "x" * 152` (48 + 152 = 200), `len == 200`, giá trị giả 0 lần. RED bằng đột biến (cắt trước, lọc sau): `AssertionError: '[{"n[19 chars]y": "SITEAPI-FAKEKEY123", "label": "xxxxxxxxxx[127 chars]xxxx' != '[{"n[19 chars]y": "[đã ẩn]", ...`, `Ran 67 tests in 22.199s` / `FAILED (failures=2)` |
+
+- Phát hiện mới: không có. `test_compact_json_text_without_secrets_is_shown_unchanged` (minor 2 vòng 1) đỏ được; `_stub_child_meta` là tách helper giữ nguyên hành vi, gỡ bằng `addCleanup`.
+
+minor | — | — | 1 điểm nhỏ: STD-GIT-1, commit `7894f04` gộp test của T62 và 2 dòng test của T64 (tech-lead giao cả hai trong một gói) | tùy dev
+
+### Không kiểm được từ diff — tech-lead phán
+- `failures=2` ở dòng RED: ca thứ hai là `test_child_row_held_as_document_is_scrubbed` (dev nêu trong báo cáo: đột biến đảo thứ tự cũng làm ca này đỏ) → không còn mở.
+- Minor (1) vòng 1 (`_plain`, docstring) dev không nhận: không chặn, để lại cho lần dọn sau.
+
+### Sau merge (tech-lead)
+- Merge `0558640` (`team/FEAT-004-task-64` @ `7894f04`). `cmd.test_one` test_site_api trên `0558640`, `PYTHONPATH` = worktree feat-004: `Ran 67 tests in 20.950s` / `OK` (60 test trên `abd2fa2`, +7).
+
+### Deferred
+- Không có.

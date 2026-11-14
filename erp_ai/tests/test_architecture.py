@@ -3662,6 +3662,276 @@ def check_apps_root_single_function(sources: dict) -> list:
 	return violations
 
 
+# FEAT-004 T68: ADR-023 Ràng buộc. The site_api rule (no hand-written set of the app's DocTypes) is
+# already part of check_tool_never_saves_proposal (_site_api_deny_violations, T59) and is not repeated.
+CHANGE_LINK_FILE = "agent/change_link.py"
+AGENT_WRITE_GUARD_FILE = "agent/agent_write_guard.py"
+CHANGE_STATE_NAMES = ("approve", "reject", "undo")
+GET_METHOD = "GET"
+API_METHOD_PATH = "api/method/"
+UNKNOWN_PIECE = "\0"  # stands for a piece of a string whose value is not known statically
+REMOVED_GRANT_NAMES = ("_unrestricted_specs", "get_unrestricted_tool_schemas")
+GRANT_TABLE_NAME = "GRANT_TABLE"
+SCHEMA_FUNCTION = "get_tool_schemas"
+SCHEMA_CALL_MARK = "schema"
+AGENT_WRITE_OPENER = "allow_agent_write"
+AGENT_WRITE_OPENER_FILES = (RUN_LOG_FILE, PROPOSE_TOOL_FILE)
+AGENT_WRITE_FLAG_NAME = "AGENT_WRITE_FLAG"
+
+
+def _absolute_aliases(tree: ast.AST, rel: str) -> dict:
+	"""import_aliases plus relative `from .x import y [as z]`, resolved against the module of `rel`."""
+	aliases = import_aliases(tree)
+	package = module_name(rel).split(".")
+	if not rel.endswith("__init__.py"):
+		package = package[:-1]
+	for node in ast.walk(tree):
+		if isinstance(node, ast.ImportFrom) and node.level:
+			base = package[: len(package) - (node.level - 1)]
+			base = ".".join([*base, node.module] if node.module else base)
+			for alias in node.names:
+				aliases[alias.asname or alias.name] = f"{base}.{alias.name}"
+	return aliases
+
+
+def _module_definitions(tree: ast.AST) -> dict:
+	"""`{name: node}` of the module's own functions and assigned values."""
+	found = {}
+	for node in tree.body:
+		if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
+			found[node.name] = node
+		elif isinstance(node, ast.Assign):
+			found.update({target.id: node.value for target in node.targets if isinstance(target, ast.Name)})
+		elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name) and node.value is not None:
+			found[node.target.id] = node.value
+	return found
+
+
+def _reaches_change_state(rel: str, node, aliases: dict, definitions: dict, seen=frozenset()) -> bool:
+	"""`node` names approve/reject/undo or erp_ai.agent.changes.transitions (reference, import or dotted
+	text), directly or through the module's own functions and values."""
+	if any(
+		module_in(target, TRANSITIONS_MODULE)
+		for _line, target in imported_modules(node, module_name(rel), rel.endswith("__init__.py"))
+	):
+		return True
+	for inner in ast.walk(node):
+		if isinstance(inner, ast.Constant) and isinstance(inner.value, str):
+			if module_in(inner.value, TRANSITIONS_MODULE):
+				return True
+			continue
+		if not isinstance(inner, ast.Name | ast.Attribute):
+			continue
+		name = resolved_name(inner, aliases)
+		leaf = name.rpartition(".")[2] if isinstance(inner, ast.Name) else inner.attr
+		if leaf in CHANGE_STATE_NAMES or module_in(name, TRANSITIONS_MODULE):
+			return True
+		if (
+			isinstance(inner, ast.Name)
+			and inner.id in definitions
+			and inner.id not in seen
+			and _reaches_change_state(rel, definitions[inner.id], aliases, definitions, seen | {inner.id})
+		):
+			return True
+	return False
+
+
+def change_state_whitelists(sources: dict) -> list:
+	"""`[(rel, function, methods)]` of every whitelisted function that reaches the change state machine."""
+	found = []
+	trees = {}
+	for rel, node, decorator in whitelisted_functions(sources):
+		if rel not in trees:
+			tree = parse(rel, sources[rel])
+			trees[rel] = (_absolute_aliases(tree, rel), _module_definitions(tree))
+		aliases, definitions = trees[rel]
+		if _reaches_change_state(rel, node, aliases, definitions, frozenset({node.name})):
+			keywords = {kw.arg: kw.value for kw in getattr(decorator, "keywords", ())}
+			methods = keywords.get("methods")
+			listed = methods.elts if isinstance(methods, ast.List | ast.Tuple | ast.Set) else ()
+			found.append((rel, node, {e.value for e in listed if isinstance(e, ast.Constant)}))
+	return found
+
+
+def check_no_get_whitelist_reaches_change_state(sources: dict) -> list:
+	"""ADR-023 Ràng buộc: no `@frappe.whitelist(methods=[..."GET"...])` reaches approve/reject/undo or the
+	state machine (ADR-010: a state change is never a GET)."""
+	return [
+		violation(rel, node, f"{node.name}: GET whitelist reaches the change state (ADR-023)")
+		for rel, node, methods in change_state_whitelists(sources)
+		if GET_METHOD in methods
+	]
+
+
+def _string_shape(scan: GitScan, rel: str, node, depth: int = 0) -> str:
+	"""The text of a string expression, each piece not known statically written as UNKNOWN_PIECE."""
+	if depth > RESOLVE_DEPTH:
+		return UNKNOWN_PIECE
+	if isinstance(node, ast.JoinedStr):
+		return "".join(_string_shape(scan, rel, value, depth + 1) for value in node.values)
+	if isinstance(node, ast.FormattedValue):
+		return _string_shape(scan, rel, node.value, depth + 1)
+	if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+		return _string_shape(scan, rel, node.left, depth + 1) + _string_shape(
+			scan, rel, node.right, depth + 1
+		)
+	if isinstance(node, ast.Constant):
+		return node.value if isinstance(node.value, str) else UNKNOWN_PIECE
+	found = scan.lookup(rel, node)
+	return _string_shape(scan, *found, depth + 1) if found else UNKNOWN_PIECE
+
+
+def _change_link_shapes(sources: dict) -> list:
+	"""`[(node, shape)]` of every string expression of change_link.py (docstrings excluded)."""
+	scan = GitScan(sources)
+	tree = scan.trees[CHANGE_LINK_FILE]
+	docstrings = _docstring_ids(tree)
+	return [
+		(node, _string_shape(scan, CHANGE_LINK_FILE, node))
+		for node in ast.walk(tree)
+		if (isinstance(node, ast.Constant) and isinstance(node.value, str) and id(node) not in docstrings)
+		or isinstance(node, ast.JoinedStr)
+		or (isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add))
+	]
+
+
+def change_link_string_shapes(sources: dict) -> list:
+	return [shape for _node, shape in _change_link_shapes(sources)] if CHANGE_LINK_FILE in sources else []
+
+
+def check_change_link_builds_no_api_method_path(sources: dict) -> list:
+	"""ADR-023 Ràng buộc: change_link builds no `/api/method/` path (a link opens the form, the form POSTs)."""
+	if CHANGE_LINK_FILE not in sources:
+		return _missing(CHANGE_LINK_FILE)
+	return [
+		violation(CHANGE_LINK_FILE, node, f"builds {shape!r}, an /api/method/ path (ADR-023)")
+		for node, shape in _change_link_shapes(sources)
+		if API_METHOD_PATH in shape
+	]
+
+
+def _node_texts(node, aliases: dict, docstrings: set) -> list:
+	"""The names a node carries: a reference (alias resolved), an imported name, a keyword name, a string."""
+	if isinstance(node, ast.Name):
+		return [resolved_name(node, aliases).rpartition(".")[2]]
+	if isinstance(node, ast.Attribute):
+		return [node.attr]
+	if isinstance(node, ast.Import | ast.ImportFrom):
+		return [alias.name.rpartition(".")[2] for alias in node.names]
+	if isinstance(node, ast.keyword):
+		return [node.arg] if node.arg else []
+	if isinstance(node, ast.Constant) and isinstance(node.value, str) and id(node) not in docstrings:
+		return [node.value]
+	return []
+
+
+def check_registry_has_one_grant_function(sources: dict) -> list:
+	"""ADR-023 Ràng buộc (ADR-011 QĐ 6): one grant table read by one grant function in registry.py; the
+	removed names `_unrestricted_specs`, `get_unrestricted_tool_schemas` exist nowhere; runner.py calls one
+	schema function, `get_tool_schemas`, once."""
+	violations = []
+	for rel, source in only_python(sources).items():
+		tree = parse(rel, source)
+		aliases, docstrings = import_aliases(tree), _docstring_ids(tree)
+		for node in ast.walk(tree):
+			texts = [node.name] if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef) else []
+			for text in texts + _node_texts(node, aliases, docstrings):
+				if text in REMOVED_GRANT_NAMES:
+					violations.append(violation(rel, node, f"{text} is a second grant path (ADR-023)"))
+	for rel in (REGISTRY_FILE, RUNNER_FILE):
+		if rel not in sources:
+			violations.extend(_missing(rel))
+	if REGISTRY_FILE in sources:
+		tree = parse(REGISTRY_FILE, sources[REGISTRY_FILE])
+		tables = [
+			node
+			for node in tree.body
+			if isinstance(node, ast.Assign | ast.AnnAssign)
+			and any(
+				isinstance(target, ast.Name) and target.id == GRANT_TABLE_NAME
+				for target in (node.targets if isinstance(node, ast.Assign) else [node.target])
+			)
+		]
+		readers = [
+			function.name
+			for function in ast.walk(tree)
+			if isinstance(function, ast.FunctionDef | ast.AsyncFunctionDef)
+			and any(
+				isinstance(node, ast.Name) and node.id == GRANT_TABLE_NAME and isinstance(node.ctx, ast.Load)
+				for node in ast.walk(function)
+			)
+		]
+		if len(tables) != 1 or len(readers) != 1:
+			violations.append(
+				f"{REGISTRY_FILE}: {len(tables)} {GRANT_TABLE_NAME} assignments read by {readers}; "
+				"one grant table and one grant function (ADR-023)"
+			)
+	if RUNNER_FILE in sources:
+		tree = parse(RUNNER_FILE, sources[RUNNER_FILE])
+		aliases = import_aliases(tree)
+		calls = [
+			(node, resolved_name(node.func, aliases).rpartition(".")[2])
+			for node in ast.walk(tree)
+			if isinstance(node, ast.Call)
+		]
+		schema_calls = [(node, name) for node, name in calls if SCHEMA_CALL_MARK in name.lower()]
+		if [name for _node, name in schema_calls] != [SCHEMA_FUNCTION]:
+			violations.append(
+				f"{RUNNER_FILE}: schema calls {[violation(RUNNER_FILE, n, name) for n, name in schema_calls]}; "
+				f"exactly one {SCHEMA_FUNCTION}() call (ADR-023)"
+			)
+	return violations
+
+
+def _agent_write_flag_value(sources: dict):
+	"""The literal value of AGENT_WRITE_FLAG in agent_write_guard.py, else None."""
+	value = GitScan._module_assignments(parse(AGENT_WRITE_GUARD_FILE, sources[AGENT_WRITE_GUARD_FILE])).get(
+		AGENT_WRITE_FLAG_NAME
+	)
+	return value.value if isinstance(value, ast.Constant) and isinstance(value.value, str) else None
+
+
+def agent_write_references(sources: dict) -> list:
+	"""`[(rel, node, kind)]`: every reference, import, keyword or string naming `allow_agent_write`
+	(kind AGENT_WRITE_OPENER) or the flag, by constant name or by value (kind AGENT_WRITE_FLAG_NAME)."""
+	kinds = {AGENT_WRITE_OPENER: AGENT_WRITE_OPENER, AGENT_WRITE_FLAG_NAME: AGENT_WRITE_FLAG_NAME}
+	if AGENT_WRITE_GUARD_FILE in sources and (value := _agent_write_flag_value(sources)):
+		kinds[value] = AGENT_WRITE_FLAG_NAME
+	found = []
+	for rel, source in only_python(sources).items():
+		tree = parse(rel, source)
+		aliases, docstrings = import_aliases(tree), _docstring_ids(tree)
+		for node in ast.walk(tree):
+			found.extend(
+				(rel, node, kinds[text]) for text in _node_texts(node, aliases, docstrings) if text in kinds
+			)
+	return found
+
+
+def check_agent_write_flag_only_in_run_log_and_propose_tool(sources: dict) -> list:
+	"""ADR-023 Ràng buộc (M5): the write guard's opening is used only by run_log.py and the propose tool;
+	the flag is named only in agent_write_guard.py, which checks it."""
+	if AGENT_WRITE_GUARD_FILE not in sources:
+		return _missing(AGENT_WRITE_GUARD_FILE)
+	violations = []
+	if _agent_write_flag_value(sources) is None:
+		violations.append(
+			f"{AGENT_WRITE_GUARD_FILE}: {AGENT_WRITE_FLAG_NAME} is not a string literal, its value cannot be "
+			"scanned for (ADR-023)"
+		)
+	for rel, node, kind in agent_write_references(sources):
+		if kind == AGENT_WRITE_FLAG_NAME and rel != AGENT_WRITE_GUARD_FILE:
+			violations.append(violation(rel, node, "names the agent write flag outside the guard (ADR-023)"))
+		elif kind == AGENT_WRITE_OPENER and rel not in AGENT_WRITE_OPENER_FILES:
+			if rel != AGENT_WRITE_GUARD_FILE or isinstance(node, ast.Name | ast.Attribute):
+				violations.append(
+					violation(
+						rel, node, f"uses {AGENT_WRITE_OPENER} outside run_log and the propose tool (ADR-023)"
+					)
+				)
+	return violations
+
+
 class TestArchitecture(unittest.TestCase):
 	@classmethod
 	def setUpClass(cls):
@@ -4092,6 +4362,38 @@ class TestArchitecture(unittest.TestCase):
 	def test_apps_root_single_function(self):
 		self._git_scan()
 		self.assertEqual(check_apps_root_single_function(self.sources), [])
+
+	# ADR-023 Ràng buộc (FEAT-004 T68) ------------------------------------------------------------------
+
+	def test_no_get_whitelist_reaches_change_state(self):
+		# Not a blind scan: the real decision methods are seen as reaching the state machine (all POST).
+		reaching = {(rel, node.name) for rel, node, _methods in change_state_whitelists(self.sources)}
+		for name in CHANGE_STATE_NAMES:
+			self.assertIn((PROPOSAL_CONTROLLER_FILE, name), reaching)
+		self.assertIn(("change_decision.py", "decide"), reaching)
+		self.assertEqual(check_no_get_whitelist_reaches_change_state(self.sources), [])
+
+	def test_change_link_builds_no_api_method_path(self):
+		self.assertIn(CHANGE_LINK_FILE, self.sources)
+		self.assertIn("/app/erp-ai-change-proposal", change_link_string_shapes(self.sources))
+		self.assertEqual(check_change_link_builds_no_api_method_path(self.sources), [])
+
+	def test_registry_has_one_grant_function(self):
+		self.assertIn(f"{GRANT_TABLE_NAME} = (", self.sources[REGISTRY_FILE])
+		self.assertIn(f"{SCHEMA_FUNCTION}(", self.sources[RUNNER_FILE])
+		self.assertEqual(check_registry_has_one_grant_function(self.sources), [])
+
+	def test_agent_write_flag_only_in_run_log_and_propose_tool(self):
+		references = agent_write_references(self.sources)
+		self.assertEqual(
+			{rel for rel, _node, kind in references if kind == AGENT_WRITE_OPENER},
+			set(AGENT_WRITE_OPENER_FILES),
+		)
+		self.assertEqual(
+			{rel for rel, _node, kind in references if kind == AGENT_WRITE_FLAG_NAME},
+			{AGENT_WRITE_GUARD_FILE},
+		)
+		self.assertEqual(check_agent_write_flag_only_in_run_log_and_propose_tool(self.sources), [])
 
 	def test_agent_modules_import_alone_in_fresh_process(self):
 		# STD-DESIGN-6: an import cycle stays hidden in-process when another test imported a module first.
@@ -6651,6 +6953,248 @@ class TestScannersCatchViolations(unittest.TestCase):
 		no_root = self.git_product(SOURCE_TOOL_FILE, replace=("def get_source_root():", "def find_root():"))
 		self.assertCaught(check_apps_root_single_function(no_root), APPS_ROOT_FUNCTION)
 
+	# ADR-023 Ràng buộc (FEAT-004 T68) ------------------------------------------------------------------
+
+	@staticmethod
+	def changed(clean: dict, rel: str, extra: str = "", replace=None) -> dict:
+		"""A copy of `clean` with `extra` appended to `rel` (a new file when absent) and `replace` applied."""
+		sources = dict(clean)
+		source = sources.get(rel, "")
+		if replace is not None:
+			assert replace[0] in source, replace[0]
+			source = source.replace(*replace)
+		sources[rel] = source + extra
+		return sources
+
+	def test_get_whitelist_reaching_change_state_clean(self):
+		self.assertEqual(check_no_get_whitelist_reaches_change_state(WHITELIST_CLEAN), [])
+		# The clean product is not clean because nothing is seen: the POST methods do reach the state machine.
+		self.assertEqual(
+			sorted((rel, node.name) for rel, node, _methods in change_state_whitelists(WHITELIST_CLEAN)),
+			[("change_decision.py", "decide"), (PROPOSAL_CONTROLLER_FILE, "approve")],
+		)
+
+	def test_get_whitelist_reaching_change_state_caught(self):
+		get_api = (
+			'import frappe\n{imports}\n\n@frappe.whitelist(methods=("GET",))\ndef go(name=None):\n{body}\n'
+		)
+		cases = {
+			"transitions call": (
+				PROPOSAL_CONTROLLER_FILE,
+				"",
+				('methods=["POST"])\ndef approve', 'methods=["GET", "POST"])\ndef approve'),
+			),
+			"through a module dict": (
+				"change_decision.py",
+				"",
+				('methods=["POST"])\ndef decide', 'methods=["POST", "GET"])\ndef decide'),
+			),
+			"through a module function": (
+				"change_decision.py",
+				'\n\n@frappe.whitelist(methods=["GET"])\ndef go(name=None):\n\treturn helper(name)\n',
+				None,
+			),
+			"aliased import": (
+				"api.py",
+				get_api.format(
+					imports=f"from erp_ai.{PROPOSAL_CONTROLLER_FILE[:-3].replace('/', '.')} import undo as back",
+					body="\treturn back(name)",
+				),
+				None,
+			),
+			"transitions module alias": (
+				"api.py",
+				get_api.format(
+					imports="import erp_ai.agent.changes.transitions as t",
+					body="\treturn t.request_undo(name, 'u')",
+				),
+				None,
+			),
+			"relative transitions import": (
+				"api.py",
+				get_api.format(
+					imports="from .agent.changes import transitions",
+					body="\treturn transitions.request_undo(name, 'u')",
+				),
+				None,
+			),
+			"transitions imported in the body": (
+				"api.py",
+				get_api.format(
+					imports="",
+					body="\timport erp_ai.agent.changes.transitions\n\treturn frappe.get_attr(name)(name)",
+				),
+				None,
+			),
+			"transitions path as text": (
+				"api.py",
+				get_api.format(
+					imports="",
+					body="\treturn frappe.get_attr('erp_ai.agent.changes.transitions.request_undo')(name)",
+				),
+				None,
+			),
+		}
+		for case, (rel, extra, replace) in cases.items():
+			with self.subTest(case=case):
+				sources = self.changed(WHITELIST_CLEAN, rel, extra, replace)
+				self.assertCaught(check_no_get_whitelist_reaches_change_state(sources), rel, "ADR-023")
+
+	def test_change_link_api_method_path_clean(self):
+		self.assertEqual(check_change_link_builds_no_api_method_path(CHANGE_LINK_CLEAN), [])
+		self.assertIn("/app/erp-ai-change-proposal/\0?\0", change_link_string_shapes(CHANGE_LINK_CLEAN))
+
+	def test_change_link_api_method_path_caught(self):
+		cases = {
+			"literal": '\nURL = "/api/method/erp_ai.change_decision.decide"\n',
+			"f-string": '\n\ndef path(method, query):\n\treturn f"/api/method/{method}?{query}"\n',
+			"concatenation": '\nURL = "/api/" + "method/" + DECIDE_METHOD\n',
+			"constant prefix": '\nAPI = "/api/method"\n\n\ndef path(method):\n\treturn f"{API}/{method}"\n',
+			"imported prefix": "\nfrom erp_ai.constants import API_ROOT\n\n\ndef path(m):\n\treturn API_ROOT + m\n",
+			"full url": '\n\ndef url(host, method):\n\treturn host + "/api/method/" + method\n',
+		}
+		with_constant = self.changed(CHANGE_LINK_CLEAN, CONSTANTS_FILE, 'API_ROOT = "/api/method/"\n')
+		for case, extra in cases.items():
+			with self.subTest(case=case):
+				sources = self.changed(with_constant, CHANGE_LINK_FILE, extra)
+				self.assertCaught(
+					check_change_link_builds_no_api_method_path(sources), CHANGE_LINK_FILE, "ADR-023"
+				)
+		missing = {rel: src for rel, src in CHANGE_LINK_CLEAN.items() if rel != CHANGE_LINK_FILE}
+		self.assertCaught(check_change_link_builds_no_api_method_path(missing), CHANGE_LINK_FILE, "missing")
+
+	def test_registry_one_grant_function_clean(self):
+		self.assertEqual(check_registry_has_one_grant_function(GRANT_CLEAN), [])
+		aliased = self.changed(
+			GRANT_CLEAN,
+			RUNNER_FILE,
+			replace=("import get_tool_schemas\n", "import get_tool_schemas as schemas\n"),
+		)
+		aliased[RUNNER_FILE] = aliased[RUNNER_FILE].replace("return get_tool_schemas(", "return schemas(")
+		self.assertEqual(check_registry_has_one_grant_function(aliased), [])
+
+	def test_registry_one_grant_function_caught(self):
+		cases = {
+			"removed function back": (REGISTRY_FILE, "\n\ndef _unrestricted_specs():\n\treturn []\n", None),
+			"removed name read": (QUEUE_FILE, "\nX = _unrestricted_specs\n", None),
+			"removed name as attribute": (
+				QUEUE_FILE,
+				"\nX = registry.get_unrestricted_tool_schemas('L3')\n",
+				None,
+			),
+			"removed name imported": (
+				QUEUE_FILE,
+				"\nfrom erp_ai.agent.tools.registry import get_unrestricted_tool_schemas as g\n",
+				None,
+			),
+			"removed name as text": (QUEUE_FILE, "\nX = getattr(registry, '_unrestricted_specs')\n", None),
+			"second grant function": (
+				REGISTRY_FILE,
+				f"\n\ndef _other(level):\n\treturn [g for g, c in {GRANT_TABLE_NAME}]\n",
+				None,
+			),
+			"no grant function": (
+				REGISTRY_FILE,
+				"",
+				(f"for g, c in {GRANT_TABLE_NAME} if", "for g, c in () if"),
+			),
+			"second table": (REGISTRY_FILE, f"\n{GRANT_TABLE_NAME} = ()\n", None),
+			"second schema call": (
+				RUNNER_FILE,
+				"\n\ndef again(grant):\n\treturn get_tool_schemas(*grant)\n",
+				None,
+			),
+			"other schema function": (
+				RUNNER_FILE,
+				"",
+				("return get_tool_schemas(*grant)", "return registry.schemas_for(*grant)"),
+			),
+			"no schema call": (RUNNER_FILE, "", ("return get_tool_schemas(*grant)", "return []")),
+		}
+		for case, (rel, extra, replace) in cases.items():
+			with self.subTest(case=case):
+				sources = self.changed(GRANT_CLEAN, rel, extra, replace)
+				self.assertCaught(check_registry_has_one_grant_function(sources), rel, "ADR-023")
+		for rel in (REGISTRY_FILE, RUNNER_FILE):
+			with self.subTest(missing=rel):
+				missing = {other: src for other, src in GRANT_CLEAN.items() if other != rel}
+				self.assertCaught(check_registry_has_one_grant_function(missing), rel, "missing")
+
+	def test_agent_write_flag_clean(self):
+		self.assertEqual(check_agent_write_flag_only_in_run_log_and_propose_tool(AGENT_WRITE_CLEAN), [])
+		self.assertEqual(
+			sorted({(rel, kind) for rel, _node, kind in agent_write_references(AGENT_WRITE_CLEAN)}),
+			sorted(
+				[
+					(AGENT_WRITE_GUARD_FILE, AGENT_WRITE_FLAG_NAME),
+					(AGENT_WRITE_GUARD_FILE, AGENT_WRITE_OPENER),  # its __all__ string: exempt in the guard
+					(PROPOSE_TOOL_FILE, AGENT_WRITE_OPENER),
+					(RUN_LOG_FILE, AGENT_WRITE_OPENER),
+				]
+			),
+		)
+
+	def test_agent_write_flag_caught(self):
+		elsewhere = "erp_ai_agent/doctype/erp_ai_log/erp_ai_log.py"
+		with_block = "\n\ndef f():\n\twith {opener}():\n\t\tpass\n"
+		cases = {
+			"opener called elsewhere": (
+				elsewhere,
+				f"\nfrom erp_ai.agent.agent_write_guard import {AGENT_WRITE_OPENER}\n"
+				+ with_block.format(opener=AGENT_WRITE_OPENER),
+			),
+			"opener aliased": (
+				elsewhere,
+				f"\nfrom erp_ai.agent.agent_write_guard import {AGENT_WRITE_OPENER} as opened\n"
+				+ with_block.format(opener="opened"),
+			),
+			"opener as attribute": (
+				elsewhere,
+				with_block.format(opener=f"guard.{AGENT_WRITE_OPENER}"),
+			),
+			"opener as text": (elsewhere, f"\nX = getattr(guard, '{AGENT_WRITE_OPENER}')\n"),
+			"opener called in the guard": (
+				AGENT_WRITE_GUARD_FILE,
+				with_block.format(opener=AGENT_WRITE_OPENER),
+			),
+			"opener aliased in the guard": (
+				AGENT_WRITE_GUARD_FILE,
+				f"\nfrom erp_ai.agent.agent_write_guard import {AGENT_WRITE_OPENER} as again\n"
+				+ with_block.format(opener="again"),
+			),
+			"other run_log.py": ("eval/run_log.py", with_block.format(opener=f"guard.{AGENT_WRITE_OPENER}")),
+			"flag constant imported": (
+				elsewhere,
+				f"\nfrom erp_ai.agent.agent_write_guard import {AGENT_WRITE_FLAG_NAME}\n",
+			),
+			"flag constant as attribute": (RUN_LOG_FILE, f"\nX = guard.{AGENT_WRITE_FLAG_NAME}\n"),
+			"flag value as key": (PROPOSE_TOOL_FILE, '\nfrappe.flags["erp_ai_agent_write_allowed"] = True\n'),
+			"flag value as attribute": (elsewhere, "\nfrappe.flags.erp_ai_agent_write_allowed = True\n"),
+			"flag value as keyword": (elsewhere, "\nfrappe.flags.update(erp_ai_agent_write_allowed=True)\n"),
+		}
+		for case, (rel, extra) in cases.items():
+			with self.subTest(case=case):
+				sources = self.changed(AGENT_WRITE_CLEAN, rel, extra)
+				self.assertCaught(
+					check_agent_write_flag_only_in_run_log_and_propose_tool(sources), rel, "ADR-023"
+				)
+		missing = {rel: src for rel, src in AGENT_WRITE_CLEAN.items() if rel != AGENT_WRITE_GUARD_FILE}
+		self.assertCaught(
+			check_agent_write_flag_only_in_run_log_and_propose_tool(missing),
+			AGENT_WRITE_GUARD_FILE,
+			"missing",
+		)
+		unknown = self.changed(
+			AGENT_WRITE_CLEAN,
+			AGENT_WRITE_GUARD_FILE,
+			replace=('= "erp_ai_agent_write_allowed"', '= "erp_ai_" + SUFFIX'),
+		)
+		self.assertCaught(
+			check_agent_write_flag_only_in_run_log_and_propose_tool(unknown),
+			AGENT_WRITE_GUARD_FILE,
+			"ADR-023",
+		)
+
 
 # A minimal site_api: derived always-denied set, a refusal gating on it, two handlers gated before writing.
 SITE_API_GATED = """def always_denied_doctypes():
@@ -6683,6 +7227,113 @@ TOOLS = [
 	ToolSpec(name='api_call_method', handler=call_method),
 ]
 """
+
+# ADR-023 Ràng buộc (T68): small products that keep each rule; each caught case changes one file.
+WHITELIST_CLEAN = {
+	PROPOSAL_CONTROLLER_FILE: """import frappe
+from erp_ai.agent.changes import transitions
+
+LIMIT = 5
+
+
+@frappe.whitelist(methods=["POST"])
+def approve(name=None):
+	return transitions.approve(name, frappe.session.user)
+
+
+@frappe.whitelist(methods=["GET", "POST"])
+def form_data(name=None):
+	return frappe.get_doc("ERP AI Change Proposal", name).as_dict(), LIMIT, _again(name)
+
+
+def _again(name):
+	return _again(name) if name else None
+""",
+	"change_decision.py": """import frappe
+from erp_ai.erp_ai_agent.doctype.erp_ai_change_proposal import erp_ai_change_proposal as proposal_form
+
+DECIDERS = {"approve": proposal_form.approve}
+
+
+@frappe.whitelist(methods=["POST"])
+def decide(name=None, action=None):
+	return DECIDERS[action](name)
+
+
+def helper(name):
+	return proposal_form.reject(name)
+""",
+}
+
+CHANGE_LINK_CLEAN = {
+	CHANGE_LINK_FILE: '''"""Links open the form; the old /api/method/ link is gone."""
+
+FORM_ROUTE = "/app/erp-ai-change-proposal"
+
+
+def decision_path(name, query):
+	return f"{FORM_ROUTE}/{name}?{query}"
+''',
+	"ticket_panel.py": 'PANEL_URL = "/api/method/erp_ai.ticket_panel.get_panel_data"\n',
+}
+
+GRANT_CLEAN = {
+	REGISTRY_FILE: f"""{GRANT_TABLE_NAME} = (("read", lambda level: True),)
+
+
+def _granted_specs(level):
+	return [g for g, c in {GRANT_TABLE_NAME} if c(level)]
+
+
+def {SCHEMA_FUNCTION}(level):
+	return _granted_specs(level)
+""",
+	RUNNER_FILE: f"""from erp_ai.agent.tools.registry import {SCHEMA_FUNCTION}
+
+
+def run(grant):
+	return {SCHEMA_FUNCTION}(*grant)
+""",
+	QUEUE_FILE: "from erp_ai.agent.tools import registry\n",
+}
+
+AGENT_WRITE_CLEAN = {
+	AGENT_WRITE_GUARD_FILE: f'''"""`{AGENT_WRITE_FLAG_NAME}` is set by `{AGENT_WRITE_OPENER}()` only."""
+
+import frappe
+
+__all__ = ["{AGENT_WRITE_OPENER}", "refuse_agent_write"]
+{AGENT_WRITE_FLAG_NAME} = "erp_ai_agent_write_allowed"
+
+
+def {AGENT_WRITE_OPENER}():
+	frappe.flags[{AGENT_WRITE_FLAG_NAME}] = True
+
+
+def refuse_agent_write(doc):
+	return frappe.flags.get({AGENT_WRITE_FLAG_NAME})
+''',
+	RUN_LOG_FILE: f"""from erp_ai.agent.agent_write_guard import {AGENT_WRITE_OPENER}
+
+
+def write_entry():
+	with {AGENT_WRITE_OPENER}():
+		pass
+""",
+	PROPOSE_TOOL_FILE: f"""from erp_ai.agent import agent_write_guard as guard
+
+
+def propose():
+	with guard.{AGENT_WRITE_OPENER}():
+		pass
+""",
+	"erp_ai_agent/doctype/erp_ai_log/erp_ai_log.py": """from erp_ai.agent.agent_write_guard import refuse_agent_write
+
+
+def validate(doc):
+	refuse_agent_write(doc)
+""",
+}
 
 
 if __name__ == "__main__":

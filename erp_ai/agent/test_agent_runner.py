@@ -5,6 +5,7 @@ import json
 import os
 import subprocess
 import time
+from collections import Counter
 from unittest.mock import patch
 
 import frappe
@@ -1611,6 +1612,27 @@ SNAPSHOT_USER = "runner.snapshot@example.com"
 SNAPSHOT_ROLES = ["Blogger", "Knowledge Base Editor"]
 SNAPSHOT_MARK = "RUNNER-SNAPSHOT-MARK-7e2d"
 SNAPSHOT_KEY = "_snapshot"
+DIFF_USER = "runner.snapshot.diff@example.com"
+# The user starts with the first two roles; the tool's full list drops the first, keeps the second, adds the third.
+DIFF_ROLES = ("Blogger", "Knowledge Base Editor", "Knowledge Base Contributor")
+HOLIDAY_LIST_NAME = f"{PREFIX}snapshot holidays"
+# Fixed dates, not today's: the tool's list misses the second old date and adds the fourth.
+HOLIDAY_DATES = ("2031-03-02", "2031-04-30", "2031-05-01", "2031-09-02")
+LONG_FIELD_CHARS = 30000
+
+
+def long_text(seed):
+	"""LONG_FIELD_CHARS characters, ASCII and Vietnamese mixed, numbered so a cut or a shifted part shows."""
+	return "".join(f"{seed}{index:05d} ạ-ữ " for index in range(LONG_FIELD_CHARS))[:LONG_FIELD_CHARS]
+
+
+def row_diff(before_rows, after_rows, column):
+	"""(removed, added) values of `column`, found only by comparing the rows before with the rows after."""
+	before_values = Counter(row[column] for row in before_rows)
+	after_values = Counter(row[column] for row in after_rows)
+	return sorted((before_values - after_values).elements()), sorted(
+		(after_values - before_values).elements()
+	)
 
 
 class TestRunnerRecordSnapshots(RunnerTestBase):
@@ -1806,6 +1828,143 @@ class TestRunnerRecordSnapshots(RunnerTestBase):
 			self.assertEqual(block["content"].count(SNAPSHOT_KEY), 0, block)
 			self.assertEqual(block["content"].count(SNAPSHOT_MARK), 0, block)
 		self.assertEqual(json.loads(entry.value_before)["api_update_record#1"], planted["before"])
+
+	def test_update_user_role_list_diff_shows_removed_and_added(self):
+		removed, kept, added = DIFF_ROLES
+		frappe.get_doc(
+			{
+				"doctype": "User",
+				"email": DIFF_USER,
+				"first_name": "Hiệu role",
+				"send_welcome_email": 0,
+				"roles": [{"role": removed}, {"role": kept}],
+			}
+		).insert()
+
+		entry = self._run_turn(
+			tool_use(
+				"toolu_1",
+				"api_update_record",
+				doctype="User",
+				name=DIFF_USER,
+				values={"roles": [{"role": kept}, {"role": added}]},
+			)
+		)
+
+		(action,) = json.loads(entry.actions)
+		self.assertTrue(action["ok"], action)
+		self.assertEqual(
+			sorted(frappe.get_all("Has Role", {"parent": DIFF_USER, "parenttype": "User"}, pluck="role")),
+			sorted([kept, added]),
+		)
+		before = json.loads(entry.value_before)
+		after = json.loads(entry.value_after)
+		self.assertEqual(
+			before,
+			{
+				"api_update_record#1": {
+					"name": DIFF_USER,
+					"roles": [{"role": removed, "docstatus": 0}, {"role": kept, "docstatus": 0}],
+				}
+			},
+		)
+		self.assertEqual(
+			after,
+			{
+				"api_update_record#1": {
+					"name": DIFF_USER,
+					"roles": [{"role": kept, "docstatus": 0}, {"role": added, "docstatus": 0}],
+				}
+			},
+		)
+		# The role kept on the user is in neither side of the difference.
+		self.assertEqual(
+			row_diff(before["api_update_record#1"]["roles"], after["api_update_record#1"]["roles"], "role"),
+			([removed], [added]),
+		)
+
+	def test_holiday_list_missing_old_date_seen_in_diff(self):
+		first, missing, kept, new = HOLIDAY_DATES
+
+		def holiday(day):
+			return {"holiday_date": day, "description": f"Nghỉ {day}", "weekly_off": 0}
+
+		holiday_list = (
+			frappe.get_doc(
+				{
+					"doctype": "Holiday List",
+					"holiday_list_name": HOLIDAY_LIST_NAME,
+					"from_date": "2031-01-01",
+					"to_date": "2031-12-31",
+					"holidays": [holiday(first), holiday(missing), holiday(kept)],
+				}
+			)
+			.insert()
+			.name
+		)
+
+		entry = self._run_turn(
+			tool_use(
+				"toolu_1",
+				"api_update_record",
+				doctype="Holiday List",
+				name=holiday_list,
+				values={"holidays": [holiday(first), holiday(kept), holiday(new)]},
+			)
+		)
+
+		(action,) = json.loads(entry.actions)
+		self.assertTrue(action["ok"], action)
+
+		def stored(*days):
+			return [{**holiday(day), "docstatus": 0} for day in days]
+
+		before = json.loads(entry.value_before)
+		after = json.loads(entry.value_after)
+		self.assertEqual(
+			before, {"api_update_record#1": {"name": holiday_list, "holidays": stored(first, missing, kept)}}
+		)
+		self.assertEqual(
+			after, {"api_update_record#1": {"name": holiday_list, "holidays": stored(first, kept, new)}}
+		)
+		self.assertEqual(
+			row_diff(
+				before["api_update_record#1"]["holidays"],
+				after["api_update_record#1"]["holidays"],
+				"holiday_date",
+			),
+			([missing], [new]),
+		)
+
+	def test_30000_char_field_stored_byte_identical(self):
+		old_content, new_content = long_text("T"), long_text("S")
+		self.assertEqual((len(old_content), len(new_content)), (LONG_FIELD_CHARS, LONG_FIELD_CHARS))
+		self.assertGreater(LONG_FIELD_CHARS, TOOL_RESULT_MAX_CHARS)
+		note = frappe.get_doc(
+			{"doctype": "Note", "title": f"{PREFIX}snapshot long", "public": 1, "content": old_content}
+		).insert()
+
+		entry = self._run_turn(
+			tool_use(
+				"toolu_1",
+				"api_update_record",
+				doctype="Note",
+				name=note.name,
+				values={"content": new_content},
+			)
+		)
+
+		(action,) = json.loads(entry.actions)
+		self.assertTrue(action["ok"], action)
+		self.assertEqual(frappe.db.get_value("Note", note.name, "content"), new_content)
+		before = json.loads(entry.value_before)["api_update_record#1"]
+		after = json.loads(entry.value_after)["api_update_record#1"]
+		self.assertEqual(before["content"].encode("utf-8"), old_content.encode("utf-8"))
+		self.assertEqual(after["content"].encode("utf-8"), new_content.encode("utf-8"))
+		self.assertEqual(
+			(before, after),
+			({"name": note.name, "content": old_content}, {"name": note.name, "content": new_content}),
+		)
 
 
 # Hand-written: the tools a run with an instructor gets when no change group is granted (FEAT-001/006 set).

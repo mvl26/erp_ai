@@ -8,7 +8,7 @@ from frappe.utils import synchronization
 from frappe.utils.file_lock import LockTimeoutError
 
 from erp_ai import hooks, tasks
-from erp_ai.agent import run_log, runner
+from erp_ai.agent import policy, run_log, runner
 from erp_ai.agent.tools import site_api
 from erp_ai.agent.tools.registry import ToolContext, execute_tool
 from erp_ai.constants import (
@@ -29,7 +29,7 @@ from erp_ai.constants import (
 )
 from erp_ai.erp_ai_agent.doctype.erp_ai_setting import erp_ai_setting
 from erp_ai.gateway import client
-from erp_ai.test_utils import add_credential, make_change_proposal, set_agent_settings
+from erp_ai.test_utils import add_credential, keep_agent_settings, make_change_proposal, set_agent_settings
 
 # Far-future months cannot hold real ERP AI Log rows, so sums only see rows the test inserts.
 NOW = datetime(2031, 11, 15, 8, 0, 0)
@@ -43,6 +43,7 @@ SEEDED_AT = datetime(2031, 11, 15, 8, 10, 0)
 RUN_AT = datetime(2031, 11, 15, 9, 0, 0)
 UPPER = RUN_AT - timedelta(seconds=300)
 PERMISSION_SUBJECT = "Agent đã sửa bản ghi phân quyền"
+SWITCH_SUBJECT = "Quyền mở rộng đang bật"
 INSTRUCTOR = "erpai-tasks-boss@example.invalid"
 PROFILE_PREFIX = "ERPAI-TEST hồ sơ"
 BY = "(người ra lệnh erpai-tasks-boss@example.invalid, 2031-11-15 08:10)"
@@ -227,6 +228,9 @@ class TestCheckPrivilegeEscalation(FrappeTestCase):
 		self.send_alarm_patch = patch("erp_ai.alerts.send_alarm")
 		self.send_alarm = self.send_alarm_patch.start()
 		self.addCleanup(self.send_alarm_patch.stop)
+		# Switches already on at the site must not influence the switch condition.
+		keep_agent_settings(self)
+		set_agent_settings(**dict.fromkeys(policy.PERMISSION_SWITCH_FIELDS, 0))
 		# Keys already on the site must not influence the key condition.
 		frappe.db.set_value(CREDENTIAL_DOCTYPE, {"parent": SETTING_DOCTYPE}, "enabled", 0)
 		# The agent's real roles on the site must not influence the role condition: start from
@@ -1591,6 +1595,142 @@ class TestCheckPrivilegeEscalation(FrappeTestCase):
 			self._run()
 
 		self.assertEqual(info.call_args_list, [call(line_format, None, UPPER, 3)])
+
+
+class TestPermissionSwitchAlarm(FrappeTestCase):
+	"""ADR-030 QĐ 7: the daily job's fifth condition lists the permission switches that are on."""
+
+	OTHER_CONDITIONS = (
+		"_agent_role_drift",
+		"_privilege_changes_by_agent",
+		"_enabled_scripts_by_agent",
+		"_enabled_keys_without_value",
+	)
+
+	def setUp(self):
+		self.addCleanup(frappe.db.rollback)
+		keep_agent_settings(self)
+		commit_guard = patch.object(frappe.db, "commit", side_effect=AssertionError("commit in test"))
+		commit_guard.start()
+		self.addCleanup(commit_guard.stop)
+		self.log_error = self.enterContext(patch("frappe.log_error"))
+		self.send_alarm_patch = patch("erp_ai.alerts.send_alarm")
+		self.send_alarm = self.send_alarm_patch.start()
+		self.addCleanup(self.send_alarm_patch.stop)
+		# The four older conditions read live site data; they find nothing here so only the switches count.
+		for name in self.OTHER_CONDITIONS:
+			self.enterContext(patch.object(tasks, name, return_value=[]))
+		set_agent_settings(**dict.fromkeys(policy.PERMISSION_SWITCH_FIELDS, 0))
+		frappe.db.set_single_value(SETTING_DOCTYPE, "privilege_alert_checked_until", WATERMARK)
+
+	def _switch_alarms(self):
+		return [c.args for c in self.send_alarm.call_args_list if c.args[0] == SWITCH_SUBJECT]
+
+	def test_two_switches_on_listed_in_one_alarm(self):
+		# (4) then (2), not adjacent and set out of order: the alarm lists labels in the order (1)..(5).
+		set_agent_settings(**{policy.CODE_CHANGE_ENABLED_FIELD: 1, policy.RECORD_TOOLS_FIELD: 1})
+
+		tasks.check_privilege_escalation(now=RUN_AT)
+
+		self.log_error.assert_not_called()
+		self.assertEqual(
+			self._switch_alarms(),
+			[(SWITCH_SUBJECT, f"{SWITCH_SUBJECT}: Công cụ bản ghi chung, Cho phép sửa code và lệnh bench")],
+		)
+		self.assertEqual(tasks.PERMISSION_SWITCHES_ON_SUBJECT, SWITCH_SUBJECT)
+
+	def test_switch_condition_is_the_fifth(self):
+		set_agent_settings(**{policy.ONE_CLICK_APPROVAL_FIELD: 1})
+		for name in self.OTHER_CONDITIONS:
+			getattr(tasks, name).return_value = [f"ERPAI-TEST {name}"]
+
+		tasks.check_privilege_escalation(now=RUN_AT)
+
+		self.assertEqual(
+			[c.args[0] for c in self.send_alarm.call_args_list],
+			[
+				"Tài khoản agent có role ngoài danh sách cho phép",
+				PERMISSION_SUBJECT,
+				"Server Script/Webhook do agent tạo đang bật",
+				"Khóa đang bật nhưng không có giá trị",
+				SWITCH_SUBJECT,
+			],
+		)
+		self.assertEqual(self.send_alarm.call_args.args[1], f"{SWITCH_SUBJECT}: Duyệt một lần bấm")
+
+	def test_all_off_no_alarm_entry(self):
+		tasks.check_privilege_escalation(now=RUN_AT)
+
+		self.log_error.assert_not_called()
+		self.send_alarm.assert_not_called()
+
+		# Control: the first switch alone, the edge of the order, alarms with its label only.
+		set_agent_settings(**{policy.UNRESTRICTED_FIELD: 1})
+		tasks.check_privilege_escalation(now=RUN_AT)
+
+		self.assertEqual(
+			self._switch_alarms(), [(SWITCH_SUBJECT, f"{SWITCH_SUBJECT}: Toàn quyền (khẩn cấp)")]
+		)
+		set_agent_settings(**{policy.UNRESTRICTED_FIELD: 0})
+		self.assertEqual(tasks._enabled_permission_switches(), [])
+
+	def test_condition_writes_no_log_row_and_keeps_watermark(self):
+		set_agent_settings(**{policy.UNRESTRICTED_FIELD: 1, policy.ACT_NOW_FIELD: 1})
+		logs_before = frappe.db.count(LOG_DOCTYPE)
+		reads = self.enterContext(
+			patch.object(tasks, "read_privilege_watermark", wraps=tasks.read_privilege_watermark)
+		)
+		writes = self.enterContext(
+			patch.object(tasks, "_advance_privilege_watermark", wraps=tasks._advance_privilege_watermark)
+		)
+
+		tasks.check_privilege_escalation(now=RUN_AT)
+		# The same window again: a watermark-bound condition would stay silent, this daily one alarms again.
+		tasks.check_privilege_escalation(now=RUN_AT)
+
+		self.log_error.assert_not_called()
+		expected = (SWITCH_SUBJECT, f"{SWITCH_SUBJECT}: Toàn quyền (khẩn cấp), Làm luôn, không hỏi lại")
+		self.assertEqual(self._switch_alarms(), [expected, expected])
+		self.assertEqual(frappe.db.count(LOG_DOCTYPE), logs_before)
+		# Only the job's own read and write per run: the switch condition adds none.
+		self.assertEqual(reads.call_count, 2)
+		self.assertEqual(writes.call_args_list, [call(UPPER)])
+		self.assertEqual(erp_ai_setting.read_privilege_watermark(), UPPER)
+
+	def test_error_later_rolls_back_switch_alarm(self):
+		self.send_alarm_patch.stop()
+		recipient = f"erpai-t94-{frappe.generate_hash(length=8)}@example.invalid"
+		set_agent_settings(alert_recipients=recipient, **{policy.RECORD_TOOLS_FIELD: 1})
+		frappe.db.savepoint("t94_before_job")
+		real_rollback = frappe.db.rollback
+		rollback = self.enterContext(
+			patch.object(
+				frappe.db,
+				"rollback",
+				side_effect=lambda *args, **kwargs: real_rollback(save_point="t94_before_job"),
+			)
+		)
+
+		# The watermark write comes after every condition: failing there undoes the switch alarm's mail.
+		with patch.object(
+			tasks, "_advance_privilege_watermark", side_effect=frappe.QueryTimeoutError("boom")
+		):
+			tasks.check_privilege_escalation(now=RUN_AT)
+
+		rollback.assert_called_once()
+		self.assertEqual(
+			[c.args for c in self.log_error.call_args_list if c.args[0] == TITLE_RUN_FAILED],
+			[(TITLE_RUN_FAILED, "check_privilege_escalation error=QueryTimeoutError")],
+		)
+		self.assertEqual(frappe.db.count("Email Queue Recipient", {"recipient": recipient}), 0)
+		self.assertEqual(erp_ai_setting.read_privilege_watermark(), WATERMARK)
+
+		# Control: the same run without the failure queues the switch alarm's mail.
+		tasks.check_privilege_escalation(now=RUN_AT)
+
+		self.assertEqual(frappe.db.count("Email Queue Recipient", {"recipient": recipient}), 1)
+		self.assertEqual(erp_ai_setting.read_privilege_watermark(), UPPER)
+		rollback.assert_called_once()
 
 
 class TestReprobeExhaustedKeys(FrappeTestCase):

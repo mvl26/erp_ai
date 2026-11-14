@@ -7,6 +7,7 @@ from frappe.tests.utils import FrappeTestCase
 
 from erp_ai import hooks, tasks
 from erp_ai.agent import run_log, runner
+from erp_ai.agent.tools import site_api
 from erp_ai.agent.tools.registry import ToolContext, execute_tool
 from erp_ai.constants import (
 	AGENT_USER,
@@ -268,7 +269,7 @@ class TestCheckPrivilegeEscalation(FrappeTestCase):
 		frappe.db.set_value(LOG_DOCTYPE, name, "creation", at, update_modified=False)
 		return name
 
-	def _agent_calls(self, *calls, at=SEEDED_AT, instructor=INSTRUCTOR):
+	def _agent_calls(self, *calls, at=SEEDED_AT, instructor=INSTRUCTOR, unrestricted=False):
 		"""Run generic write tools as the agent account and log them as one `reason` row, as the runner does.
 		Returns the name of each written record."""
 		context = ToolContext(
@@ -279,6 +280,7 @@ class TestCheckPrivilegeEscalation(FrappeTestCase):
 			category_mapping={},
 			agent_user=AGENT_USER,
 			change_enabled=True,
+			unrestricted=unrestricted,
 		)
 		actions, before, after = [], {}, {}
 		with self._as_agent():
@@ -695,6 +697,100 @@ class TestCheckPrivilegeEscalation(FrappeTestCase):
 		self.assertEqual(self._changes(), [])
 		self._run()
 		self.send_alarm.assert_not_called()
+
+	def test_admin_role_marked_and_listed_first(self):
+		# Five ordinary items older than the admin one: by time alone the admin item would be cut by the 5-item limit.
+		for minute in range(11, 16):
+			self._create_profile(minute, at=datetime(2031, 11, 15, 8, minute, 0))
+		user = self._human_user()
+		set_agent_settings(unrestricted_enabled=1)
+		self._agent_calls(
+			(
+				"api_update_record",
+				{"doctype": "User", "name": user, "values": {"roles": [{"role": "System Manager"}]}},
+			),
+			at=datetime(2031, 11, 15, 8, 20, 0),
+			unrestricted=True,
+		)
+
+		self._run()
+
+		self.assertEqual(
+			self._permission_alarm(),
+			"Agent đã sửa bản ghi phân quyền: "
+			f"[QUẢN TRỊ] thêm role System Manager cho {user} "
+			"(người ra lệnh erpai-tasks-boss@example.invalid, 2031-11-15 08:20), "
+			"tạo Role Profile ERPAI-TEST hồ sơ 11 (người ra lệnh erpai-tasks-boss@example.invalid, 2031-11-15 08:11), "
+			"tạo Role Profile ERPAI-TEST hồ sơ 12 (người ra lệnh erpai-tasks-boss@example.invalid, 2031-11-15 08:12), "
+			"tạo Role Profile ERPAI-TEST hồ sơ 13 (người ra lệnh erpai-tasks-boss@example.invalid, 2031-11-15 08:13), "
+			"tạo Role Profile ERPAI-TEST hồ sơ 14 (người ra lệnh erpai-tasks-boss@example.invalid, 2031-11-15 08:14)"
+			" …và 1 mục khác",
+		)
+
+	def test_every_forbidden_role_is_marked_when_added_or_removed(self):
+		# Rows built by hand: the tools refuse most of these roles, and deleting a User is out of the seeding.
+		roles = sorted(site_api.FORBIDDEN_ROLES)
+		actions, before, after = [], {}, {}
+		for role in roles:
+			actions.append(_hand_action("api_update_record", "User", f"add {role}"))
+			before[f"api_update_record#{len(actions)}"] = {"name": f"add {role}", "roles": []}
+			after[f"api_update_record#{len(actions)}"] = {"name": f"add {role}", "roles": [{"role": role}]}
+			actions.append(_hand_action("api_delete_record", "User", f"remove {role}"))
+			before[f"api_delete_record#{len(actions)}"] = {
+				"name": f"remove {role}",
+				"roles": [{"role": role}],
+			}
+			# The runner writes the key with None for a delete (runner._record_snapshot).
+			after[f"api_delete_record#{len(actions)}"] = None
+		ordinary = self._test_role("thường")
+		actions.append(_hand_action("api_update_record", "User", "ordinary"))
+		before[f"api_update_record#{len(actions)}"] = {"name": "ordinary", "roles": []}
+		after[f"api_update_record#{len(actions)}"] = {"name": "ordinary", "roles": [{"role": ordinary}]}
+		self._log_row(actions, before, after)
+
+		changes = self._changes()
+
+		by = "(người ra lệnh erpai-tasks-boss@example.invalid, 2031-11-15 08:10)"
+		for role in roles:
+			with self.subTest(role=role):
+				self.assertIn(f"[QUẢN TRỊ] thêm role {role} cho add {role} {by}", changes)
+				self.assertIn(f"[QUẢN TRỊ] gỡ role {role} của remove {role} {by}", changes)
+		self.assertEqual(changes[-1], f"thêm role {ordinary} cho ordinary {by}")
+		self.assertEqual(len(changes), 2 * len(roles) + 1)
+
+	def test_admin_items_first_each_group_by_time(self):
+		# Rows built by hand so one action can remove an admin role and add an ordinary one.
+		ordinary_a, ordinary_b = self._test_role("A"), self._test_role("B")
+		for at, user, old, new in (
+			(datetime(2031, 11, 15, 8, 11, 0), "u1", [], [ordinary_a]),
+			(datetime(2031, 11, 15, 8, 12, 0), "u2", ["System Manager"], [ordinary_b]),
+			(datetime(2031, 11, 15, 8, 14, 0), "u3", [], [ROLE_AGENT]),
+		):
+			self._log_row(
+				[_hand_action("api_update_record", "User", user)],
+				{"api_update_record#1": {"name": user, "roles": [{"role": role} for role in old]}},
+				{"api_update_record#1": {"name": user, "roles": [{"role": role} for role in new]}},
+				at=at,
+			)
+		self._log_row(
+			[_hand_action("api_create_record", "Role Profile", "p")],
+			{"api_create_record#1": None},
+			{"api_create_record#1": {"name": "p", "roles": []}},
+			at=datetime(2031, 11, 15, 8, 13, 0),
+		)
+
+		self.assertEqual(
+			self._changes(),
+			[
+				"[QUẢN TRỊ] gỡ role System Manager của u2 "
+				"(người ra lệnh erpai-tasks-boss@example.invalid, 2031-11-15 08:12)",
+				f"[QUẢN TRỊ] thêm role {ROLE_AGENT} cho u3 "
+				"(người ra lệnh erpai-tasks-boss@example.invalid, 2031-11-15 08:14)",
+				"thêm role ERPAI-TEST vai A cho u1 (người ra lệnh erpai-tasks-boss@example.invalid, 2031-11-15 08:11)",
+				"thêm role ERPAI-TEST vai B cho u2 (người ra lệnh erpai-tasks-boss@example.invalid, 2031-11-15 08:12)",
+				"tạo Role Profile p (người ra lệnh erpai-tasks-boss@example.invalid, 2031-11-15 08:13)",
+			],
+		)
 
 	def test_only_ok_generic_writes_on_permission_doctypes_are_listed(self):
 		perms = [{"role": "Desk User", "read": 1}]

@@ -9,6 +9,7 @@ from frappe.utils import add_months, get_datetime, now_datetime
 
 from erp_ai import alerts, gateway
 from erp_ai.agent.runner import GENERIC_WRITE_TOOLS
+from erp_ai.agent.tools.site_api import FORBIDDEN_ROLES
 from erp_ai.constants import (
 	AGENT_USER,
 	CREDENTIAL_DOCTYPE,
@@ -28,6 +29,8 @@ MAX_LISTED_NAMES = 5
 # Rows newer than now minus this are left for the next run: covers write_entry's insert-to-commit gap and clock skew.
 PRIVILEGE_ALERT_SETTLE_S = 300
 UNKNOWN_INSTRUCTOR = "không rõ"
+# Marks a role entry whose role the tools refuse without the unrestricted switch; such entries are listed first.
+ADMIN_ROLE_MARK = "[QUẢN TRỊ] "
 # Verb of each generic write tool, keyed by the action word of its name (`api_<word>_record`), so the tool names
 # come only from runner.GENERIC_WRITE_TOOLS; a new generic tool with another word fails at import, never mislabelled.
 CHANGE_VERBS = {"create": "tạo", "update": "sửa", "delete": "xóa", "submit": "submit/hủy"}
@@ -113,9 +116,13 @@ def _role_counts(snapshot) -> Counter:
 def _role_changes(user: str, key: str, before: dict, after: dict, by: str) -> list[str]:
 	"""One entry per role added to or removed from a User, by role name (D-4: kept roles get new rows on save)."""
 	old, new = _role_counts(before.get(key)), _role_counts(after.get(key))
-	added = [f"thêm role {role} cho {user} ({by})" for role in (new - old).elements()]
-	removed = [f"gỡ role {role} của {user} ({by})" for role in (old - new).elements()]
+	added = [f"{_admin_mark(role)}thêm role {role} cho {user} ({by})" for role in (new - old).elements()]
+	removed = [f"{_admin_mark(role)}gỡ role {role} của {user} ({by})" for role in (old - new).elements()]
 	return added + removed
+
+
+def _admin_mark(role) -> str:
+	return ADMIN_ROLE_MARK if role in FORBIDDEN_ROLES else ""
 
 
 def _privilege_changes_by_agent(lower: datetime | None, upper: datetime) -> list[str]:
@@ -123,7 +130,8 @@ def _privilege_changes_by_agent(lower: datetime | None, upper: datetime) -> list
 
 	Reads `reason` rows of ERP AI Log by `creation`, oldest first; no lower bound when `lower` is None.
 	A DocType write gives one entry when its `permissions` snapshot changed. `Has Role` rows are User changes: a
-	User write gives one entry per role added or removed (0..n).
+	User write gives one entry per role added or removed (0..n). Entries marked `[QUẢN TRỊ]` come first, so the
+	5-entry limit of the mail never cuts them before an ordinary one; each group keeps `creation` order.
 	"""
 	log = frappe.qb.DocType(LOG_DOCTYPE)
 	query = (
@@ -146,7 +154,8 @@ def _privilege_changes_by_agent(lower: datetime | None, upper: datetime) -> list
 				changes.extend(_role_changes(action.get("name"), f"{tool}#{position}", before, after, by))
 			elif _is_permission_change(doctype, f"{tool}#{position}", before, after):
 				changes.append(f"{PRIVILEGE_CHANGE_VERBS[tool]} {doctype} {action.get('name')} ({by})")
-	return changes
+	# Stable sort: each group keeps the `creation` order of the rows, then the order of actions and roles.
+	return sorted(changes, key=lambda change: not change.startswith(ADMIN_ROLE_MARK))
 
 
 def _enabled_scripts_by_agent() -> list[str]:

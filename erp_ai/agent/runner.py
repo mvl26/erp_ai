@@ -686,7 +686,9 @@ def _undo_turn(run_id) -> None:
 
 	As `frappe.db.rollback()` does, stopping at the savepoint (design-amd2 D-8): the commit callbacks queued
 	since are dropped (only the turn's: the commit before the savepoint ran the earlier ones) and the rollback
-	callbacks run. Raises nothing: the caller re-raises the turn's own error, which must reach the Error Log.
+	callbacks run. When the savepoint is already gone, nothing is undone and neither happens: both callback
+	queues are left as they are. Raises nothing: the caller re-raises the turn's own error, which must reach
+	the Error Log.
 	"""
 	try:
 		frappe.db.rollback(save_point=REASON_TURN_SAVEPOINT)

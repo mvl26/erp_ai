@@ -2547,15 +2547,20 @@ class TestRunnerTurnUndo(RunnerTestBase):
 		self.assertEqual(self.callbacks, ["after_rollback"])
 
 	def _run_with_logger(self, *patches):
-		"""`_run_turns` with `frappe.logger` replaced; the warnings `_undo_turn` writes are in `self.logger`."""
-		self.logger = MagicMock()
-		self.get_logger = MagicMock(return_value=self.logger)
-		self._run_turns(None, patch.object(frappe, "logger", self.get_logger), *patches)
+		"""`_run_turns` with `frappe.logger` replaced: one mock per logger name, kept in `self.loggers`."""
+		self.loggers = {}
+
+		def get_logger(module=None, *args, **kwargs):
+			return self.loggers.setdefault(module, MagicMock())
+
+		self._run_turns(None, patch.object(frappe, "logger", side_effect=get_logger), *patches)
 
 	def _undo_warnings(self):
+		"""The undo warnings written through the agent's own logger (`LOGGER_NAME`), not any other."""
+		logger = self.loggers.get(LOGGER_NAME)
 		return [
 			call.args
-			for call in self.logger.warning.call_args_list
+			for call in (logger.warning.call_args_list if logger else [])
 			if call.args and str(call.args[0]).startswith("reason turn undo")
 		]
 
@@ -2571,7 +2576,6 @@ class TestRunnerTurnUndo(RunnerTestBase):
 			self._run_failed_errors(),
 			[f"ticket={self.ticket.name} trigger=comment_mention error=TurnFaultForTest"],
 		)
-		self.assertIn(LOGGER_NAME, [call.args[0] for call in self.get_logger.call_args_list if call.args])
 		self.assertEqual(
 			self._undo_warnings(),
 			[("reason turn undo failed run_id=%s error=%s", self._run_id(), "OperationalError")],

@@ -1,23 +1,25 @@
 import json
-from datetime import datetime, timedelta
+from datetime import datetime
 
 import frappe
 from frappe import _
-from frappe.utils import add_days, get_datetime, getdate, now_datetime
+from frappe.utils import add_days, get_datetime, getdate
 
 from erp_ai.constants import CATEGORIES, CLASSIFICATION_FIELDS, LOG_DOCTYPE
 
 TOTAL_LABEL = "Tổng"
-CORRECTION_WINDOW = timedelta(days=7)
+COUNT_KEYS = ("predictions", "labeled", "correct")
 
 
 def execute(filters=None):
-	"""Script Report: accuracy of the AI classification, per category A-F and in total (AC-12, A-12, D-17).
+	"""Script Report: accuracy of the AI classification against the human's labels, per category A-F and in
+	total (AC-12, AC-19, D-9, NFR-8).
 
 	Filters: `from_date`, `to_date` (both required, inclusive, by the log row's `creation`).
-	A prediction is `corrected` when a person changed ticket type, agent group or priority to a value
-	different from the prediction within 7 days; `pending` while it is younger than 7 days and not corrected.
-	Returns no data when the range holds no prediction.
+	Each ticket counts once, by its first `classify` row with a predicted category (`_first_predictions`);
+	`labeled`/`correct` follow `label_outcome`. `failed_runs` (total row only) counts the tickets with a
+	`classify` row without a predicted category in the range and no successful `classify` row up to its end.
+	Returns no data when the range holds neither a prediction nor a failed run.
 
 	Raises:
 		frappe.PermissionError: the user may not run reports on ERP AI Log.
@@ -25,28 +27,29 @@ def execute(filters=None):
 	"""
 	frappe.has_permission(LOG_DOCTYPE, "report", throw=True)
 	from_date, to_date = _validate_dates(filters or {})
-	predictions = _fetch_predictions(from_date, to_date)
-	if not predictions:
+	start = datetime.combine(from_date, datetime.min.time())
+	# The end is the start of the day after `to_date`, so the whole last day counts.
+	end = datetime.combine(getdate(add_days(to_date, 1)), datetime.min.time())
+	rows = _fetch_classify_rows(end)
+	predictions = _first_predictions(rows, start)
+	failed_runs = _failed_runs(rows, start)
+	if not predictions and not failed_runs:
 		return _columns(), []
 
-	now = now_datetime()
-	counts = {category: {"predictions": 0, "corrected": 0, "pending": 0} for category in CATEGORIES}
+	counts = {category: dict.fromkeys(COUNT_KEYS, 0) for category in CATEGORIES}
 	for row in predictions:
+		labeled, correct = label_outcome(row)
 		bucket = counts[row.predicted_category]
 		bucket["predictions"] += 1
-		if _is_corrected(row):
-			bucket["corrected"] += 1
-		elif get_datetime(row.creation) > now - CORRECTION_WINDOW:
-			bucket["pending"] += 1
+		bucket["labeled"] += labeled
+		bucket["correct"] += correct
 
-	data = [{"category": category, **counts[category]} for category in CATEGORIES]
+	data = [{"category": category, **counts[category], "failed_runs": None} for category in CATEGORIES]
 	data.append(
 		{
 			"category": TOTAL_LABEL,
-			**{
-				key: sum(bucket[key] for bucket in counts.values())
-				for key in ("predictions", "corrected", "pending")
-			},
+			**{key: sum(bucket[key] for bucket in counts.values()) for key in COUNT_KEYS},
+			"failed_runs": failed_runs,
 		}
 	)
 	for row in data:
@@ -54,13 +57,33 @@ def execute(filters=None):
 	return _columns(), data
 
 
+def label_outcome(prediction) -> tuple[bool, bool]:
+	"""(labeled, correct) of one ticket's first successful `classify` row (AC-19, D-9).
+
+	The label of each field in `CLASSIFICATION_FIELDS` is `created_labels[field]` when set, else
+	`human_corrected_to[field]` when set, else there is none. Only fields with a label and a non-empty
+	`predicted_<field>` are compared (a D/E ticket whose group the bot left empty is not wrong for it).
+	No field to compare → not labeled; otherwise correct when every compared field is equal.
+	"""
+	created = _parse_labels(prediction.created_labels)
+	corrected = _parse_labels(prediction.human_corrected_to)
+	compared = []
+	for field in CLASSIFICATION_FIELDS:
+		predicted = prediction.get(f"predicted_{field}")
+		label = created.get(field) or corrected.get(field)
+		if predicted and label:
+			compared.append(predicted == label)
+	return bool(compared), bool(compared) and all(compared)
+
+
 def _columns() -> list[dict]:
 	return [
 		{"fieldname": "category", "label": _("Category"), "fieldtype": "Data", "width": 120},
 		{"fieldname": "predictions", "label": _("Predictions"), "fieldtype": "Int", "width": 110},
-		{"fieldname": "corrected", "label": _("Corrected"), "fieldtype": "Int", "width": 110},
-		{"fieldname": "pending", "label": _("Pending"), "fieldtype": "Int", "width": 110},
+		{"fieldname": "labeled", "label": _("Labeled"), "fieldtype": "Int", "width": 110},
+		{"fieldname": "correct", "label": _("Correct"), "fieldtype": "Int", "width": 110},
 		{"fieldname": "accuracy_pct", "label": _("Accuracy (%)"), "fieldtype": "Percent", "width": 120},
+		{"fieldname": "failed_runs", "label": _("Failed Runs"), "fieldtype": "Int", "width": 110},
 	]
 
 
@@ -73,41 +96,54 @@ def _validate_dates(filters: dict):
 	return from_date, to_date
 
 
-def _fetch_predictions(from_date, to_date) -> list:
+def _fetch_classify_rows(end: datetime) -> list:
+	"""Every `classify` row with a ticket created before `end`, oldest first."""
 	log = frappe.qb.DocType(LOG_DOCTYPE)
-	# Upper bound is the start of the day after `to_date`, so the whole last day counts.
 	return (
 		frappe.qb.from_(log)
 		.select(
+			log.ticket,
 			log.predicted_category,
 			log.creation,
-			log.human_corrected_at,
+			log.created_labels,
 			log.human_corrected_to,
 			log.predicted_ticket_type,
 			log.predicted_agent_group,
 			log.predicted_priority,
 		)
 		.where(log.entry_type == "classify")
-		.where(log.predicted_category.isin(CATEGORIES))
-		.where(log.creation >= datetime.combine(from_date, datetime.min.time()))
-		.where(log.creation < datetime.combine(getdate(add_days(to_date, 1)), datetime.min.time()))
+		# NULL != "" is not true, so this also drops rows whose ticket is NULL.
+		.where(log.ticket != "")
+		.where(log.creation < end)
+		.orderby(log.creation)
+		.orderby(log.name)
 		.run(as_dict=True)
 	)
 
 
-def _is_corrected(row) -> bool:
-	if not row.human_corrected_at:
-		return False
-	if get_datetime(row.human_corrected_at) > get_datetime(row.creation) + CORRECTION_WINDOW:
-		return False
-	corrected_to = _parse_corrected_to(row.human_corrected_to)
-	return any(
-		(corrected_to.get(field) or "") != (row.get(f"predicted_{field}") or "")
-		for field in CLASSIFICATION_FIELDS
+def _first_predictions(rows: list, start: datetime) -> list:
+	"""The first row with a predicted category of each ticket, when it was created at or after `start`."""
+	first = {}
+	for row in rows:
+		if row.predicted_category in CATEGORIES:
+			first.setdefault(row.ticket, row)
+	return [row for row in first.values() if get_datetime(row.creation) >= start]
+
+
+def _failed_runs(rows: list, start: datetime) -> int:
+	succeeded = {row.ticket for row in rows if row.predicted_category}
+	return len(
+		{
+			row.ticket
+			for row in rows
+			if not row.predicted_category
+			and get_datetime(row.creation) >= start
+			and row.ticket not in succeeded
+		}
 	)
 
 
-def _parse_corrected_to(raw) -> dict:
+def _parse_labels(raw) -> dict:
 	try:
 		parsed = json.loads(raw or "")
 	except ValueError:
@@ -116,7 +152,6 @@ def _parse_corrected_to(raw) -> dict:
 
 
 def _accuracy_pct(row: dict) -> float | None:
-	sample = row["predictions"] - row["pending"]
-	if sample <= 0:
+	if not row["labeled"]:
 		return None
-	return round((sample - row["corrected"]) / sample * 100, 2)
+	return round(row["correct"] / row["labeled"] * 100, 2)

@@ -100,9 +100,11 @@ def set_agent_settings(**fields) -> None:
 
 
 def keep_agent_settings(testcase) -> None:
-	"""Snapshot ERP AI Setting (its `tabSingles` rows and the rows of its child tables); `addCleanup` puts them back.
+	"""Snapshot ERP AI Setting (its `tabSingles` rows, the rows of its child tables and their `__Auth` rows);
+	`addCleanup` puts them back.
 
-	The restore writes in the current transaction and never commits (NFR-7).
+	`__Auth` values are copied as stored (encrypted), never decrypted. The restore writes in the current
+	transaction and never commits (NFR-7).
 	"""
 	singles = frappe.db.sql(
 		"select field, value from `tabSingles` where doctype=%s", SETTING_DOCTYPE, as_dict=True
@@ -117,6 +119,12 @@ def keep_agent_settings(testcase) -> None:
 		)
 		for child in child_doctypes
 	}
+	auth_doctypes = [SETTING_DOCTYPE, *child_doctypes]
+	auth_rows = frappe.db.sql(
+		"select doctype, name, fieldname, password, encrypted from `__Auth` where doctype in %(doctypes)s",
+		{"doctypes": tuple(auth_doctypes)},
+		as_dict=True,
+	)
 
 	def restore():
 		frappe.db.delete("Singles", {"doctype": SETTING_DOCTYPE})
@@ -129,6 +137,12 @@ def keep_agent_settings(testcase) -> None:
 			frappe.db.delete(child, {"parent": SETTING_DOCTYPE, "parenttype": SETTING_DOCTYPE})
 			for row in rows:
 				frappe.get_doc({**row, "doctype": child}).db_insert()
+		frappe.db.delete("__Auth", {"doctype": ("in", auth_doctypes)})
+		for row in auth_rows:
+			frappe.db.sql(
+				"insert into `__Auth` (doctype, name, fieldname, password, encrypted) values (%s, %s, %s, %s, %s)",
+				(row.doctype, row.name, row.fieldname, row.password, row.encrypted),
+			)
 
 	# Registered before `restore` so it runs after it, and still runs when `restore` fails.
 	testcase.addCleanup(frappe.db.value_cache.pop, SETTING_DOCTYPE, None)

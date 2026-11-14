@@ -44,6 +44,8 @@ INT_LIMITS = {
 	"monthly_budget_usd": ("Ngân sách tháng", 0, None),
 	"answer_delay_min_s": ("Trễ trả lời tối thiểu", 0, ANSWER_DELAY_MAX_S),
 	"answer_delay_max_s": ("Trễ trả lời tối đa", 0, ANSWER_DELAY_MAX_S),
+	"confidence_threshold": ("Ngưỡng độ tin cậy", 0, 100),
+	"auto_approve_streak": ("Số lần duyệt liên tiếp để Tự làm", 1, 100),
 }
 THINKING_TEXT_MAX_CHARS = 5000
 PRICE_FIELDS = (

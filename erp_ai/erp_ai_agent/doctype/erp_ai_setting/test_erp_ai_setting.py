@@ -591,7 +591,24 @@ FEAT007_NEW_FIELD_DEFAULTS = {
 	"record_tools_enabled": 0,
 	"act_now_enabled": 0,
 	"one_click_approval_enabled": 0,
+	"level_cap_a": "L2",
+	"level_cap_b": "L3",
+	"level_cap_c": "L1",
+	"level_cap_d": "L2",
+	"level_cap_e": "L1",
+	"level_cap_f": "L3",
+	"confidence_threshold": 70,
+	"auto_approve_streak": 20,
 }
+# FEAT-007 AC-31: the highest level per category A-F, in form order.
+LEVEL_CAP_DEFAULTS = (
+	("level_cap_a", "L2"),
+	("level_cap_b", "L3"),
+	("level_cap_c", "L1"),
+	("level_cap_d", "L2"),
+	("level_cap_e", "L1"),
+	("level_cap_f", "L3"),
+)
 
 
 class TestFeat007Defaults(FrappeTestCase):
@@ -629,6 +646,60 @@ class TestFeat007Defaults(FrappeTestCase):
 		for fieldname, expected in FEAT007_NEW_FIELD_DEFAULTS.items():
 			with self.subTest(fieldname=fieldname):
 				self.assertEqual(self._value_after_install(fieldname), expected)
+
+	def test_level_caps_default(self):
+		meta = frappe.get_meta(SETTING_DOCTYPE)
+		order = [field.fieldname for field in meta.fields]
+		self.assertIn("section_autonomy", order, "ERP AI Setting has no section_autonomy")
+		start = order.index("section_autonomy") + 1
+		self.assertEqual(
+			order[start : start + 8],
+			[fieldname for fieldname, _default in LEVEL_CAP_DEFAULTS]
+			+ ["confidence_threshold", "auto_approve_streak"],
+		)
+		for fieldname, default in LEVEL_CAP_DEFAULTS:
+			with self.subTest(fieldname=fieldname):
+				field = meta.get_field(fieldname)
+				self.assertEqual(
+					(field.fieldtype, field.options, field.default), ("Select", "L0\nL1\nL2\nL3", default)
+				)
+				self.assertEqual(self._value_after_install(fieldname), default)
+
+
+# FEAT-007 AC-22, AC-36: fieldname -> (exact error text, low, high).
+FEAT007_INT_LIMITS = {
+	"confidence_threshold": ("Ngưỡng độ tin cậy phải từ 0 đến 100", 0, 100),
+	"auto_approve_streak": ("Số lần duyệt liên tiếp để Tự làm phải từ 1 đến 100", 1, 100),
+}
+
+
+class TestFeat007Limits(FrappeTestCase):
+	def setUp(self):
+		self.addCleanup(frappe.db.rollback)
+		keep_agent_settings(self)
+
+	def _save(self, fieldname, value):
+		doc = frappe.get_doc(SETTING_DOCTYPE)
+		doc.set(fieldname, value)
+		doc.save()
+
+	def test_int_limits_edges(self):
+		meta = frappe.get_meta(SETTING_DOCTYPE)
+		for fieldname, (message, low, high) in FEAT007_INT_LIMITS.items():
+			field = meta.get_field(fieldname)
+			self.assertIsNotNone(field, f"ERP AI Setting has no {fieldname} field")
+			self.assertEqual(field.fieldtype, "Int", fieldname)
+			for value in (low - 1, high + 1):
+				with self.subTest(fieldname=fieldname, value=value):
+					with self.assertRaises(frappe.ValidationError) as caught:
+						self._save(fieldname, value)
+					self.assertEqual(frappe.utils.strip_html(str(caught.exception)), message)
+			for value in (low, high):
+				with self.subTest(fieldname=fieldname, value=value):
+					self._save(fieldname, value)
+					self.assertEqual(
+						frappe.db.get_single_value(SETTING_DOCTYPE, fieldname, cache=False), value
+					)
 
 
 # FEAT-007 design 2.1: the five Check fields of section_permissions (AC-4 notice, D-7).

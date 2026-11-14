@@ -14,6 +14,15 @@
   "code_change_enabled",
   "one_click_approval_enabled",
   "site_environment",
+  "section_autonomy",
+  "level_cap_a",
+  "level_cap_b",
+  "level_cap_c",
+  "level_cap_d",
+  "level_cap_e",
+  "level_cap_f",
+  "confidence_threshold",
+  "auto_approve_streak",
   "section_limits",
   "max_turns_per_run",
   "max_runs_per_ticket_per_day",
@@ -112,6 +121,73 @@
    "options": "production\ntest",
    "default": "production",
    "description": "test hoặc production. Ở production bot từ chối Custom Field, Server Script, Client Script, Property Setter, Workflow, Data Import trên đường danh mục trắng và đề nghị làm trên site test. Năm quyền mở rộng không bị chặn theo môi trường; giá trị ghi vào cảnh báo và Log."
+  },
+  {
+   "fieldname": "section_autonomy",
+   "fieldtype": "Section Break",
+   "label": "Mức tự chủ theo đầu mục và độ tin cậy"
+  },
+  {
+   "fieldname": "level_cap_a",
+   "fieldtype": "Select",
+   "label": "Mức tối đa đầu mục A",
+   "options": "L0\nL1\nL2\nL3",
+   "default": "L2",
+   "description": "Mức cao nhất của bot cho phiếu đầu mục A trên đường danh mục trắng, Task, đề xuất. Mức thực tế là mức nhỏ hơn giữa ô này và Mức quyền. Không áp cho năm quyền mở rộng. Đầu mục chưa biết tính L1."
+  },
+  {
+   "fieldname": "level_cap_b",
+   "fieldtype": "Select",
+   "label": "Mức tối đa đầu mục B",
+   "options": "L0\nL1\nL2\nL3",
+   "default": "L3",
+   "description": "Mức cao nhất của bot cho phiếu đầu mục B trên đường danh mục trắng, Task, đề xuất. Mức thực tế là mức nhỏ hơn giữa ô này và Mức quyền. Không áp cho năm quyền mở rộng. Đầu mục chưa biết tính L1."
+  },
+  {
+   "fieldname": "level_cap_c",
+   "fieldtype": "Select",
+   "label": "Mức tối đa đầu mục C",
+   "options": "L0\nL1\nL2\nL3",
+   "default": "L1",
+   "description": "Mức cao nhất của bot cho phiếu đầu mục C trên đường danh mục trắng, Task, đề xuất. Mức thực tế là mức nhỏ hơn giữa ô này và Mức quyền. Không áp cho năm quyền mở rộng. Đầu mục chưa biết tính L1."
+  },
+  {
+   "fieldname": "level_cap_d",
+   "fieldtype": "Select",
+   "label": "Mức tối đa đầu mục D",
+   "options": "L0\nL1\nL2\nL3",
+   "default": "L2",
+   "description": "Mức cao nhất của bot cho phiếu đầu mục D trên đường danh mục trắng, Task, đề xuất. Mức thực tế là mức nhỏ hơn giữa ô này và Mức quyền. Không áp cho năm quyền mở rộng. Đầu mục chưa biết tính L1."
+  },
+  {
+   "fieldname": "level_cap_e",
+   "fieldtype": "Select",
+   "label": "Mức tối đa đầu mục E",
+   "options": "L0\nL1\nL2\nL3",
+   "default": "L1",
+   "description": "Mức cao nhất của bot cho phiếu đầu mục E trên đường danh mục trắng, Task, đề xuất. Mức thực tế là mức nhỏ hơn giữa ô này và Mức quyền. Không áp cho năm quyền mở rộng. Đầu mục chưa biết tính L1."
+  },
+  {
+   "fieldname": "level_cap_f",
+   "fieldtype": "Select",
+   "label": "Mức tối đa đầu mục F",
+   "options": "L0\nL1\nL2\nL3",
+   "default": "L3",
+   "description": "Mức cao nhất của bot cho phiếu đầu mục F trên đường danh mục trắng, Task, đề xuất. Mức thực tế là mức nhỏ hơn giữa ô này và Mức quyền. Không áp cho năm quyền mở rộng. Đầu mục chưa biết tính L1."
+  },
+  {
+   "fieldname": "confidence_threshold",
+   "fieldtype": "Int",
+   "label": "Ngưỡng độ tin cậy (%)",
+   "default": "70",
+   "description": "Độ tin cậy tối thiểu, từ 0 đến 100 (phần trăm). Dưới ngưỡng bot không ghi gì, chỉ đăng một comment hỏi; trừ khi có người ra lệnh và ô Làm luôn bật."
+  },
+  {
+   "fieldname": "auto_approve_streak",
+   "fieldtype": "Int",
+   "label": "Số lần duyệt liên tiếp để Tự làm",
+   "default": "20",
+   "description": "Số đề xuất liên tiếp được duyệt không sửa của một loại hành động để dòng Tự làm chạy không cần duyệt, từ 1 đến 100. Từ chối, duyệt có sửa, hoàn tác đếm lại từ 0."
   },
   {
    "fieldname": "section_limits",
@@ -309,7 +385,7 @@
  ],
  "issingle": 1,
  "links": [],
- "modified": "2026-11-14 16:00:00.000000",
+ "modified": "2026-11-14 17:00:00.000000",
  "modified_by": "Administrator",
  "module": "ERP AI agent",
  "name": "ERP AI Setting",

@@ -15,16 +15,23 @@ Mọi task: test đỏ trước rồi mới sửa mã (STD-TEST-1), trừ các t
 `design-addendum-1.md` (2026-11-15) **thắng `design.md`** ở chỗ hai bên khác nhau; `A-n` trong task là mục của addendum. Đã chép vào task (build lượt 1): T3, T4, T5, T6, T8, T12, T13, T23, T24, T25, T26, T33, T35, T39, T41, T47, T49, T50.
 Cách chạy test của nhánh task (site `miyano` nạp mã ở cây chính, nên phải trỏ `PYTHONPATH` về worktree): từ thư mục bench `/home/miyano/frappe-bench`, `flock -w 1800 apps/erp_ai/.team/miyano-site.lock env PYTHONPATH=<worktree của dev> bench --site miyano run-tests --module <module>`. `bench run-tests` thoát mã 0 cả khi đỏ: đọc dòng `Ran N tests` và `OK`/`FAILED`.
 
-baseline: chưa đo; tech-lead chạy `cmd.test` trên `team/CHG-002` trước T0 và ghi kết quả vào dòng này.
-Nhánh `team/CHG-002` chưa tồn tại: `/team:build` tạo nó từ `develop` ở bước đầu. Tối đa 4 dev cùng lúc theo bảng làn ở `plan.md` mục "Nhóm song song".
+baseline: `Ran 1564 tests` / `FAILED (failures=6)` trên `team/CHG-002` @ `a689b8d`, 2026-11-15 03:27, một lần giữ khóa gồm `cmd.migrate` rồi `cmd.test` — red: `test_agent_runner.TestRunnerL1Classification.test_l1_all_fields_skipped_reasons_logged_saves_ai_fields_applied_one`, `…TestRunnerL1Classification.test_l1_applies_mapping_confidence_and_hint`, `…TestRunnerL1Classification.test_l1_empty_route_still_saves_ai_fields_applied_one`, `test_runner_routing.TestRoutingEndToEnd.test_l1_scores_written_to_ticket`, `test_runner_routing.TestRoutingUnit.test_broken_routing_rules_skip_sla_check_and_log_skipped`, `erp_ai_accuracy.test_erp_ai_accuracy.TestAccuracyFiltersAndColumns.test_report_record_is_system_manager_only_script_report`
+  - Nguyên nhân của 6 test đỏ là trạng thái site, không phải mã: 5 test thừa mục `assign_owner` vì site đang lưu `auto_assign_enabled=1`; 1 test vì bản ghi Report `ERP AI Accuracy` trên site có thêm vai trò `ERP AI Instructor`. Không sửa trong task nào.
+  - Lần đo đầu (03:15, không `migrate`) cho `failures=38, errors=178`: site đang ở schema của `team/FEAT-007` (172 lỗi `No module named …erp_ai_catalog_rule`, thiếu trường `privilege_alert_checked_until`). Vì vậy mọi lần chạy test của CHG-002 đi theo một lần giữ khóa gồm `migrate` rồi `run-tests`. `migrate` từ nhánh này xóa 3 DocType mồ côi của FEAT-007 (`ERP AI Prompt Revision`, `ERP AI User Template`, `ERP AI Catalog Rule`); phiên FEAT-007 migrate lại ở lần giữ khóa của họ.
+Nhánh `team/CHG-002` cắt từ `develop` @ `a689b8d` (2026-11-15, build lượt 1), worktree `.claude/worktrees/chg-002`. Tối đa 4 dev cùng lúc theo bảng làn ở `plan.md` mục "Nhóm song song" (`devs=4`, `reviewers=4`).
+preflight (build lượt 1): cặp task chung file = bảng "Một file một chủ" của `plan.md`, mọi cặp đã có `depends:`; thêm sau khi chép addendum: T8 cần T3 (`SETSID_EXECUTABLE`), T49 xóa `SEARCH_FILE_MAX_BYTES` sau T6 và T26 (hai nơi còn dùng nó ở cấp module); 0 task tự mâu thuẫn.
+round 1: dev T0
+round 2: review T0
+round 3: dev T1 (T0 đã tick; chưa task nào khác đủ `depends:`)
 
 ## Phần 0 — Cổng và walking skeleton
 
-- [ ] T0 — Test đặc tả: `git commit --only` ghi nhận file đã xóa (T-0 của design) — files: erp_ai/agent/changes/test_process_runner.py — test: erp_ai/agent/changes/test_process_runner.py — depends: —
+- [x] T0 — Test đặc tả: `git commit --only` ghi nhận file đã xóa (T-0 của design) — files: erp_ai/agent/changes/test_process_runner.py — test: erp_ai/agent/changes/test_process_runner.py — depends: —
   - Criterion: AC-38, AC-52 (R-9; §8.0). Test đặc tả hành vi git, không sửa mã sản phẩm.
   - Receives: `GitSandbox` (`erp_ai/test_utils.py`), `file_writer.remove_created(full)`, `process_runner.git_commit_only(repo_root, rel_in_repo, subject, body, limit_s)` chữ ký hiện có.
   - Returns: lớp `TestCommitOnlyRecordsDeletion` với `test_single_deleted_path_recorded`: mã thoát 0; `diff-tree --no-commit-id --name-status -r HEAD` = `D\tmyapp/a.py`; `ls-files myapp/a.py` rỗng; `status --porcelain` rỗng; file staged khác của sandbox vẫn staged; in phiên bản git.
   - Expect: `test_one` → `test_single_deleted_path_recorded` xanh. Đỏ thì dừng cả kế hoạch và báo team-leader (cần ADR mới).
+  - progress: BASE=a689b8d · dev call 1 DONE (`203c7f0`, `Ran 18 tests` / `OK`, git 2.43.0) · review round 1 approve (`review-00.md`) · merge `dd444ad` · `cmd.test` sau merge: `Ran 1565 tests` / `FAILED (failures=6)`, đúng 6 test của dòng `baseline:` · worktree và nhánh task đã xóa
 
 - [ ] T1 — Walking skeleton: khối 1 mục sửa đi từ tool tới commit — files: erp_ai/constants.py, erp_ai/erp_ai_agent/doctype/erp_ai_change_operation/__init__.py, erp_ai/erp_ai_agent/doctype/erp_ai_change_operation/erp_ai_change_operation.json, erp_ai/erp_ai_agent/doctype/erp_ai_change_operation/erp_ai_change_operation.py, erp_ai/erp_ai_agent/doctype/erp_ai_change_proposal/erp_ai_change_proposal.json, erp_ai/erp_ai_agent/doctype/erp_ai_change_proposal/erp_ai_change_proposal.py, erp_ai/agent/tools/change_guard.py, erp_ai/agent/tools/propose_change.py, erp_ai/agent/changes/block.py, erp_ai/agent/changes/transitions.py, erp_ai/agent/changes/apply_job.py, erp_ai/agent/changes/test_apply_block.py — test: erp_ai/agent/changes/test_apply_block.py — depends: T0
   - Ngoại lệ cỡ: 12 file vì đây là lát cắt đầu-cuối cỡ L (plan.md "Walking skeleton"); mọi lõi giả, chỉ một mục `edit`, không lệnh. Được sửa `erp_ai/agent/tools/test_registry.py` **chỉ** ở assertion ghim `required` của `propose_file_change`, nếu có.
@@ -42,6 +49,7 @@ Nhánh `team/CHG-002` chưa tồn tại: `/team:build` tạo nó từ `develop` 
     - `apply_job._run`: `block.is_block(proposal)` thì đi `_apply_block` bản giả (kiểm người chạy, vai trò, công tắc, dấu; ghi; 1 commit); dạng cũ đi đường cũ.
   - Expect: `test_one` → `TestWalkingSkeleton::test_one_edit_block_proposed_approved_applied_one_commit` xanh (1 đề xuất `Chờ duyệt` có 1 dòng con, 1 comment, sau duyệt và job: file đúng byte, 1 commit chứa đúng 1 đường dẫn, `Đã áp dụng`); `cmd.test` xanh sau `cmd.migrate`.
   - Gộp: reviewer `approve` trước khi T2..T50 bắt đầu.
+  - progress: BASE=dd444ad · dev call 1 DESIGN_CONFLICT (nhánh `team/CHG-002-task-1` @ `f8b4e62`, 12 file đúng touchpoint, worktree dev đã gỡ, nhánh giữ lại, CHƯA review, CHƯA merge) · RED `AssertionError: False is not true : {'ok': False, 'reason': 'tham số không hợp lệ: path'}` · GREEN `test_apply_block` `Ran 1 tests` / `OK`; `test_apply_job` 117 OK, `test_registry` 41 OK, `test_transitions` 42 OK, `test_change_decision` 10 OK · cả app `Ran 1566 tests` / `FAILED (failures=10)` = 6 test baseline + 4 test cũ ngoài touchpoint: `test_propose_change::test_edit_errors_create_nothing` (câu từ chối thành `…: edits` thay vì `…: find` vì `required=["reason"]`), `test_erp_ai_change_proposal::test_content_fields_are_code_and_read_only`, `::test_form_layout_git_sections`, `::test_select_options_match_constants` (ghim danh sách trường cũ; §2.2 thêm 6 trường) · DỪNG 2026-11-15 04:10, chờ team-leader phán (xem journal)
 
 ## Phần 1 — Nền
 

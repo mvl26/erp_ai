@@ -2365,3 +2365,60 @@ class TestSourceLogger(FrappeTestCase):
 		self.assertEqual(result, {"ok": False, "reason": "Không đọc được file"})
 		self.assertEqual([record.getMessage() for record in captured.records], ["read_source failed"])
 		self.assertEqual(captured.records[0].exc_info[0], RuntimeError)
+
+
+class TestTextRefusal(unittest.TestCase):
+	"""AC-44 (design §3.2, addendum A-1.2 to A-1.4, A-5): the one definition of "allowed text"."""
+
+	def test_order_and_reasons(self):
+		from erp_ai.constants import CHANGE_FILE_MAX_BYTES
+
+		self.assertIs(source.TEXT_MAX_BYTES, CHANGE_FILE_MAX_BYTES)
+		self.assertEqual(source.TEXT_SECRET_NAME, "tên file thuộc loại bí mật hoặc được bảo vệ")
+		self.assertEqual(source.GIT_DIR, "không được chạm .git hoặc tên bắt đầu bằng .git")
+		self.assertEqual(source.TEXT_NOT_UTF8, "file không phải văn bản UTF-8")
+		self.assertEqual(source.TEXT_HAS_NUL, "file có byte NUL, không phải văn bản")
+		self.assertEqual(source.SETSID_EXECUTABLE, "setsid")
+		too_large = b"x" * (source.TEXT_MAX_BYTES + 1)
+		cases = (
+			# Each row keeps every later fault too, so only the order of the checks decides the reason.
+			("myapp/.git/secret.py", too_large + b"\0\xff", source.TEXT_SECRET_NAME),
+			("myapp/.git/config.py", too_large + b"\0\xff", source.GIT_DIR),
+			("myapp/big.py", too_large + b"\0\xff", source.TEXT_TOO_LARGE),
+			("myapp/nul.py", b"a\0b\xff", source.TEXT_HAS_NUL),
+			("myapp/latin.py", "café".encode("latin-1"), source.TEXT_NOT_UTF8),
+			("myapp/ok.py", "café = 1\n".encode(), None),
+			("myapp/data.yaml", b"key: value\n", None),
+			("myapp/Makefile", b"all:\n", None),
+			("myapp/empty.txt", b"", None),
+			("myapp/.git/config.py", None, source.GIT_DIR),
+			("myapp/site_config.json", None, source.TEXT_SECRET_NAME),
+			("myapp/any.bin", None, None),
+		)
+		for rel, data, expected in cases:
+			with self.subTest(rel=rel):
+				self.assertEqual(source.text_refusal(rel, data), expected)
+		self.assertIsNone(source.text_refusal("myapp/ok.py"))
+
+	def test_github_component_refused(self):
+		for rel in (
+			"myapp/.github/workflows/ci.yml",
+			"myapp/.gitignore",
+			"myapp/.gitattributes",
+			".git/HEAD",
+			"myapp/sub/.gitmodules",
+		):
+			with self.subTest(rel=rel):
+				self.assertEqual(source.text_refusal(rel), source.GIT_DIR)
+				self.assertEqual(source.text_refusal(rel, b"x\n"), source.GIT_DIR)
+		for rel in ("myapp/digit.py", "myapp/my.git.py", "myapp/x.gitignore"):
+			with self.subTest(rel=rel):
+				self.assertIsNone(source.text_refusal(rel, b"x\n"))
+
+	def test_two_mib_ok_plus_one_refused_names_2_mib(self):
+		self.assertEqual(source.TEXT_MAX_BYTES, 2 * 1024 * 1024)
+		self.assertEqual(source.TEXT_TOO_LARGE, "file lớn hơn 2 MiB")
+		self.assertIsNone(source.text_refusal("myapp/big.txt", b"a" * source.TEXT_MAX_BYTES))
+		self.assertEqual(
+			source.text_refusal("myapp/big.txt", b"a" * (source.TEXT_MAX_BYTES + 1)), source.TEXT_TOO_LARGE
+		)

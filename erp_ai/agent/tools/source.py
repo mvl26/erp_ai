@@ -9,7 +9,7 @@ import frappe
 
 from erp_ai.agent.tools.read import _schema
 from erp_ai.agent.tools.registry import ToolSpec
-from erp_ai.constants import BOT_GIT_EMAIL, BOT_GIT_NAME
+from erp_ai.constants import BOT_GIT_EMAIL, BOT_GIT_NAME, CHANGE_FILE_MAX_BYTES
 
 LOGGER_NAME = "erp_ai.source"
 
@@ -29,6 +29,15 @@ TEN_CAM = re.compile(
 	r"(site_config\.json|common_site_config\.json|\.env|\.pem|\.key|" r"id_rsa|credential|secret|password)",
 	re.I,
 )
+
+# ADR-040 QĐ 5, design §3.1, §3.2 and addendum A-1.2 to A-1.4: the one definition of "allowed text".
+TEXT_MAX_BYTES = CHANGE_FILE_MAX_BYTES
+TEXT_SECRET_NAME = "tên file thuộc loại bí mật hoặc được bảo vệ"
+GIT_DIR = "không được chạm .git hoặc tên bắt đầu bằng .git"
+TEXT_TOO_LARGE = f"file lớn hơn {TEXT_MAX_BYTES // (1024 * 1024)} MiB"
+TEXT_HAS_NUL = "file có byte NUL, không phải văn bản"
+TEXT_NOT_UTF8 = "file không phải văn bản UTF-8"
+GIT_NAME_PREFIX = ".git"
 
 READ_MAX_LINES = 400
 READ_DEFAULT_LINES = 200
@@ -76,6 +85,7 @@ GIT_READ_SUBCOMMANDS = frozenset(
 )
 TIMEOUT_EXECUTABLE = "timeout"
 BENCH_EXECUTABLE = "bench"
+SETSID_EXECUTABLE = "setsid"
 GIT_HOOKS_DIR = os.path.realpath(
 	os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "git_no_hooks")
 )
@@ -130,6 +140,28 @@ def resolve_safe_path(rel):
 	if os.path.isfile(full) and os.path.splitext(full)[1].lower() not in DUOI_CHO_PHEP:
 		return None
 	return full
+
+
+def text_refusal(rel_path: str, data: bytes | None = None) -> str | None:
+	"""The refusal reason when rel_path (and data, when given) is not allowed text, else None.
+
+	Checked in this order (design §3.2): secret name, a component starting with ".git", size, NUL, strict UTF-8.
+	"""
+	if TEN_CAM.search(rel_path):
+		return TEXT_SECRET_NAME
+	if any(part.startswith(GIT_NAME_PREFIX) for part in rel_path.split(os.sep)):
+		return GIT_DIR
+	if data is None:
+		return None
+	if len(data) > TEXT_MAX_BYTES:
+		return TEXT_TOO_LARGE
+	if b"\0" in data:
+		return TEXT_HAS_NUL
+	try:
+		data.decode("utf-8", errors="strict")
+	except UnicodeDecodeError:
+		return TEXT_NOT_UTF8
+	return None
 
 
 def _refuse(reason):

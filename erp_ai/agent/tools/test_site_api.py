@@ -1085,7 +1085,20 @@ class TestSiteApiUnrestricted(FrappeTestCase):
 				"api_call_method", {"method": "frappe.client.get_value", "arguments": arguments}
 			)
 		called.assert_called_once()
-		self.assertEqual(result, {"ok": True, "method": "frappe.client.get_value", "result": "Sếp"})
+		# T62 contract: every ok api_call_method result also carries value_before/value_after.
+		self.assertEqual(
+			result,
+			{
+				"ok": True,
+				"method": "frappe.client.get_value",
+				"result": "Sếp",
+				"value_before": None,
+				"value_after": {
+					"method": "frappe.client.get_value",
+					"argument_keys": ["as_dict", "doctype", "fieldname", "filters"],
+				},
+			},
+		)
 
 	def test_column_selector_star_is_refused_before_call(self):
 		for method, arguments in (
@@ -1109,10 +1122,13 @@ class TestSiteApiUnrestricted(FrappeTestCase):
 				self.assertEqual(called.call_count, 0)
 
 	def test_star_outside_a_column_selector_still_goes_through(self):
-		for arguments in (
-			{"doctype": "User", "fields": ["name"], "as_dict": 0},
-			{"doctype": "User", "fields": ["count(*) as total"]},
-			{"doctype": "User", "fields": ["name"], "filters": {"full_name": "*"}},
+		for arguments, argument_keys in (
+			({"doctype": "User", "fields": ["name"], "as_dict": 0}, ["as_dict", "doctype", "fields"]),
+			({"doctype": "User", "fields": ["count(*) as total"]}, ["doctype", "fields"]),
+			(
+				{"doctype": "User", "fields": ["name"], "filters": {"full_name": "*"}},
+				["doctype", "fields", "filters"],
+			),
 		):
 			with (
 				self.subTest(arguments=arguments),
@@ -1122,7 +1138,17 @@ class TestSiteApiUnrestricted(FrappeTestCase):
 					"api_call_method", {"method": "frappe.client.get_list", "arguments": arguments}
 				)
 				called.assert_called_once()
-				self.assertEqual(result, {"ok": True, "method": "frappe.client.get_list", "result": [["r1"]]})
+				# T62 contract: every ok api_call_method result also carries value_before/value_after.
+				self.assertEqual(
+					result,
+					{
+						"ok": True,
+						"method": "frappe.client.get_list",
+						"result": [["r1"]],
+						"value_before": None,
+						"value_after": {"method": "frappe.client.get_list", "argument_keys": argument_keys},
+					},
+				)
 
 	def test_nested_json_doc_naming_app_doctype_is_refused(self):
 		for method, arguments in (

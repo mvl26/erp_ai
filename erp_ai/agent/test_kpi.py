@@ -178,14 +178,16 @@ class TestKpi(FrappeTestCase):
 		_ticket(ws + timedelta(days=2), resolution_date=we, agent_group=None)
 		# open at `we`, no priority
 		_ticket(ws + timedelta(days=5), priority=None)
+		# open at `we`, no ticket type
+		_ticket(ws + timedelta(days=6), ticket_type=None)
 		# decoys: resolved before `we`; created at `we`
 		_ticket(ws, resolution_date=we - timedelta(seconds=1), ticket_type=None)
 		_ticket(we, ticket_type=None)
 
 		result = kpi.compute_week(WEEK_KPI2, self.settings)
 
-		self.assertEqual(result["complete_fields_sample"], 4)
-		self.assertEqual(result["complete_fields_pct"], 50.0)
+		self.assertEqual(result["complete_fields_sample"], 5)
+		self.assertEqual(result["complete_fields_pct"], 40.0)
 
 	def test_kpi3_bot_only_closures(self):
 		ws = _start(WEEK_KPI3)
@@ -229,6 +231,14 @@ class TestKpi(FrappeTestCase):
 		other_status = closed()
 		_bot_only_trail(other_status)
 		_log(other_status, [_close_action(other_status, status="Replied")])
+		# does not count: the bot's ok close action is on another doctype
+		other_doctype = closed()
+		_bot_only_trail(other_doctype)
+		_log(other_doctype, [{**_close_action(other_doctype, status="Closed"), "doctype": "ToDo"}])
+		# does not count: the bot's ok close action is on another ticket
+		other_ticket = closed()
+		_bot_only_trail(other_ticket)
+		_log(other_ticket, [_close_action(bot_closed)])
 		# decoys outside [ws, we): bot-only closures resolved at `we` and just before `ws`
 		for resolution in (we, ws - timedelta(seconds=1)):
 			decoy = _ticket(ws - timedelta(days=1), resolution_date=resolution, raised_by=CUSTOMER)
@@ -236,8 +246,8 @@ class TestKpi(FrappeTestCase):
 
 		result = kpi.compute_week(WEEK_KPI3, self.settings)
 
-		self.assertEqual(result["closed_sample"], 8)
-		self.assertEqual(result["closed_without_human_pct"], 25.0)
+		self.assertEqual(result["closed_sample"], 10)
+		self.assertEqual(result["closed_without_human_pct"], 20.0)
 
 	def test_zero_sample_none(self):
 		result = kpi.compute_week(WEEK_EMPTY, self.settings)

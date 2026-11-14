@@ -5,20 +5,32 @@ import re
 from unittest.mock import patch
 
 import frappe
+import frappe.client
+from frappe.desk.form.save import savedocs
+from frappe.model.rename_doc import rename_doc
 from frappe.tests.utils import FrappeTestCase
 from helpdesk.test_utils import create_agent, make_ticket
 
 from erp_ai.agent import authority, change_link
+from erp_ai.agent.agent_write_guard import AGENT_WRITE_FLAG
+from erp_ai.agent.changes import transitions
 from erp_ai.agent.tools import propose_change
 from erp_ai.agent.tools.registry import ToolContext, execute_tool, get_tool_schemas
 from erp_ai.constants import (
+	AGENT_USER,
 	CHANGE_KIND_CODE,
 	CHANGE_KIND_COMMAND,
+	CHANGE_STATUS_APPLIED,
+	CHANGE_STATUS_APPROVED,
 	CHANGE_STATUS_PENDING,
+	CHANGE_STATUS_REJECTED,
+	CHANGE_STATUS_UNDOING,
 	PROPOSAL_DOCTYPE,
 	ROLE_AGENT,
+	ROLE_INSTRUCTOR,
 )
-from erp_ai.test_utils import GitSandbox
+from erp_ai.erp_ai_agent.doctype.erp_ai_change_proposal import erp_ai_change_proposal as controller
+from erp_ai.test_utils import GitSandbox, pin_agent_roles
 
 AGENT = "propose.agent@example.com"
 BOSS = "propose.boss@example.com"
@@ -43,6 +55,15 @@ CORE_WARNING = (
 RESTART_NOTE = "<p>Sau khi áp dụng cần người chạy bench restart.</p>"
 REMOTE_URL = "https://x-token-FAKE@host/r.git"
 GIT_FIELDS = ("target_branch", "upstream_ref", "ahead_count", "is_core_app")
+REFUSAL = "Tài khoản agent không được ghi"
+GUARDED_HOOKS = ("before_insert", "validate", "on_trash", "before_rename")
+# As frappe.model.rename_doc passes them: old name, new name, merge.
+HOOK_ARGUMENTS = {"before_rename": ("old-name", "new-name", False)}
+GUARD_SAVEPOINT = "erp_ai_proposal_guard_path"
+GUARD_INSTRUCTOR = "propose.guard.instructor@example.com"
+# The DocType name spelled with a JSON escape, as a model could send it through call_method.
+PROPOSAL_ESCAPED = "ERP AI \\u0043hange Proposal"
+BENCH_ARGUMENTS = {"command": "migrate", "reason": "sau khi sửa DocType"}
 
 
 def _sha(text: str) -> str:
@@ -770,3 +791,183 @@ class TestProposeChange(FrappeTestCase):
 		self.assertEqual(spaces, {"ok": False, "reason": "lệnh build cần app"})
 		self.assertEqual(self.proposals(), [])
 		self.assertEqual(self.comments(), [])
+
+
+class TestProposalAgentWriteGuard(FrappeTestCase):
+	"""M5 (ADR-023 QĐ 5, valid path 2): the agent account creates proposals only through the propose tools."""
+
+	def setUp(self):
+		commit_guard = patch.object(frappe.db, "commit", side_effect=AssertionError("commit in test"))
+		commit_guard.start()
+		self.addCleanup(commit_guard.stop)
+		self.addCleanup(frappe.db.rollback)
+		self.addCleanup(frappe.set_user, "Administrator")
+		self.addCleanup(frappe.flags.pop, AGENT_WRITE_FLAG, None)
+		frappe.set_user("Administrator")
+		frappe.flags.pop(AGENT_WRITE_FLAG, None)
+		if not frappe.db.exists("User", AGENT_USER):
+			raise AssertionError(f"{AGENT_USER} does not exist on this site")
+		# The agent account as the runner uses it: ERP AI Agent (create on proposals) and helpdesk Agent.
+		pin_agent_roles(self)
+		create_agent(BOSS)
+		create_agent(GUARD_INSTRUCTOR)
+		frappe.get_doc("User", GUARD_INSTRUCTOR).add_roles(ROLE_INSTRUCTOR)
+		enqueue = patch("frappe.enqueue")
+		self.enqueue = enqueue.start()
+		self.addCleanup(enqueue.stop)
+		self.sandbox = GitSandbox(self)
+		self.sandbox.commit_file(APP, REL, BEFORE)
+		self.ticket = str(make_ticket(subject="ERPAI-TEST propose guard").name)
+		frappe.set_user(AGENT_USER)
+		created = self.run_tool("propose_bench_command", BENCH_ARGUMENTS)
+		self.assertTrue(created["ok"], created)
+		self.existing = created["proposal"]
+
+	def context(self):
+		return ToolContext(
+			ticket_name=self.ticket,
+			effective_level="L3",
+			instructor=BOSS,
+			run_id="run-propose-guard",
+			category_mapping={},
+			agent_user=AGENT_USER,
+			change_enabled=True,
+			allowed_apps=(APP,),
+		)
+
+	def run_tool(self, name, arguments):
+		return execute_tool(name, arguments, self.context())
+
+	def values(self) -> dict:
+		return {
+			"doctype": PROPOSAL_DOCTYPE,
+			"ticket": self.ticket,
+			"run_id": "run-propose-guard",
+			"instructor": BOSS,
+			"change_kind": CHANGE_KIND_COMMAND,
+			"command_args": json.dumps(["migrate"]),
+			"reversible": 0,
+			"reason": "forged",
+		}
+
+	def snapshot(self) -> tuple:
+		"""Every proposal row, as stored."""
+		rows = frappe.db.sql("select * from `tabERP AI Change Proposal` order by name", as_dict=True)
+		return tuple(tuple(sorted(row.items())) for row in rows)
+
+	def assert_refused(self, write):
+		"""Run `write` as the agent: refused by the guard, proposal rows unchanged; undone for the next path."""
+		before = self.snapshot()
+		frappe.db.savepoint(GUARD_SAVEPOINT)
+		frappe.set_user(AGENT_USER)
+		try:
+			with self.assertRaisesRegex(frappe.PermissionError, REFUSAL):
+				write()
+			self.assertEqual(self.snapshot(), before)
+		finally:
+			frappe.set_user(AGENT_USER)
+			frappe.db.rollback(save_point=GUARD_SAVEPOINT)
+
+	def test_every_guarded_hook_refuses_the_agent(self):
+		doc = frappe.get_doc(PROPOSAL_DOCTYPE, self.existing)
+		for hook in GUARDED_HOOKS:
+			with self.subTest(hook=hook):
+				with self.assertRaisesRegex(frappe.PermissionError, REFUSAL):
+					doc.run_method(hook, *HOOK_ARGUMENTS.get(hook, ()))
+
+	def test_before_insert_refuses_before_prepare_new(self):
+		with patch.object(transitions, "prepare_new") as prepare_new:
+			self.assert_refused(lambda: frappe.get_doc(self.values()).run_method("before_insert"))
+		prepare_new.assert_not_called()
+
+	def test_agent_cannot_insert_or_edit_proposal_outside_tool(self):
+		def save_existing():
+			doc = frappe.get_doc(PROPOSAL_DOCTYPE, self.existing)
+			doc.change_status = CHANGE_STATUS_APPROVED
+			doc.save(ignore_permissions=True)
+
+		def savedocs_insert():
+			doc = {**self.values(), "name": "new-erp-ai-change-proposal-1", "__islocal": 1}
+			savedocs(frappe.as_json(doc), "Save")
+
+		paths = {
+			"direct insert": lambda: frappe.get_doc(self.values()).insert(ignore_permissions=True),
+			"direct save": save_existing,
+			"direct delete": lambda: frappe.delete_doc(
+				PROPOSAL_DOCTYPE, self.existing, ignore_permissions=True
+			),
+			"rename": lambda: rename_doc(
+				PROPOSAL_DOCTYPE, self.existing, f"{self.existing}-x", force=True, ignore_permissions=True
+			),
+			"client.insert JSON string": lambda: frappe.client.insert(
+				json.dumps(self.values()).replace(json.dumps(PROPOSAL_DOCTYPE), f'"{PROPOSAL_ESCAPED}"')
+			),
+			"savedocs insert": savedocs_insert,
+		}
+		for path, write in paths.items():
+			with self.subTest(path=path):
+				self.assert_refused(write)
+
+	def test_three_propose_tools_still_create_proposals_under_agent(self):
+		results = {
+			"propose_file_change": self.run_tool(
+				"propose_file_change", {"path": PATH, "find": ["x = 1"], "replace": ["x = 2"], "reason": "r"}
+			),
+			"propose_new_file": self.run_tool(
+				"propose_new_file", {"path": f"{APP}/pkg/new.py", "content": "z = 1\n", "reason": "r"}
+			),
+			"propose_bench_command": self.run_tool("propose_bench_command", BENCH_ARGUMENTS),
+		}
+		for tool, result in results.items():
+			with self.subTest(tool=tool):
+				self.assertTrue(result["ok"], result)
+				stored = frappe.db.get_value(
+					PROPOSAL_DOCTYPE, result["proposal"], ["owner", "change_status"], as_dict=True
+				)
+				self.assertEqual((stored.owner, stored.change_status), (AGENT_USER, CHANGE_STATUS_PENDING))
+
+	def test_instructor_can_still_approve_and_reject(self):
+		to_reject = self.run_tool("propose_bench_command", BENCH_ARGUMENTS)["proposal"]
+		to_undo = self.run_tool(
+			"propose_file_change", {"path": PATH, "find": ["x = 1"], "replace": ["x = 2"], "reason": "r"}
+		)["proposal"]
+		frappe.db.set_value(PROPOSAL_DOCTYPE, to_undo, "change_status", CHANGE_STATUS_APPLIED)
+		frappe.set_user(GUARD_INSTRUCTOR)
+		self.assertEqual(controller.approve(self.existing)["status"], CHANGE_STATUS_APPROVED)
+		self.assertEqual(controller.reject(to_reject)["status"], CHANGE_STATUS_REJECTED)
+		self.assertEqual(controller.undo(to_undo)["status"], CHANGE_STATUS_UNDOING)
+		frappe.set_user("Administrator")
+		self.assertEqual(
+			frappe.db.get_value(PROPOSAL_DOCTYPE, self.existing, ["change_status", "decided_by"]),
+			(CHANGE_STATUS_APPROVED, GUARD_INSTRUCTOR),
+		)
+
+	def test_flag_is_off_after_tool_returns(self):
+		flag_during_insert, flag_during_comment = [], []
+		prepare_new = transitions.prepare_new
+		comment = propose_change._comment
+
+		def record_insert(doc):
+			flag_during_insert.append(frappe.flags.get(AGENT_WRITE_FLAG))
+			return prepare_new(doc)
+
+		def record_comment(ctx, proposal):
+			flag_during_comment.append(frappe.flags.get(AGENT_WRITE_FLAG))
+			return comment(ctx, proposal)
+
+		with (
+			patch.object(transitions, "prepare_new", side_effect=record_insert),
+			patch.object(propose_change, "_comment", side_effect=record_comment),
+		):
+			self.assertTrue(self.run_tool("propose_bench_command", BENCH_ARGUMENTS)["ok"])
+		# The opening covers exactly the tool's own insert, not the comment written after it.
+		self.assertEqual((flag_during_insert, flag_during_comment), ([True], [None]))
+		self.assertIsNone(frappe.flags.get(AGENT_WRITE_FLAG))
+		self.assert_refused(lambda: frappe.get_doc(self.values()).insert(ignore_permissions=True))
+
+	def test_flag_is_off_after_tool_raises(self):
+		with patch.object(transitions, "prepare_new", side_effect=RuntimeError("boom")):
+			with self.assertRaisesRegex(RuntimeError, "boom"):
+				propose_change.propose_bench_command(BENCH_ARGUMENTS, self.context())
+		self.assertIsNone(frappe.flags.get(AGENT_WRITE_FLAG))
+		self.assert_refused(lambda: frappe.get_doc(self.values()).insert(ignore_permissions=True))

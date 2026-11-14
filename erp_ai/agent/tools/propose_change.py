@@ -10,6 +10,7 @@ import os
 import frappe
 
 from erp_ai.agent import change_link, change_text
+from erp_ai.agent.agent_write_guard import allow_agent_write
 from erp_ai.agent.tools import change_guard, source
 from erp_ai.agent.tools.registry import ToolContext, ToolSpec
 from erp_ai.constants import (
@@ -131,7 +132,9 @@ def _insert(ctx: ToolContext, values: dict) -> dict:
 			**values,
 		}
 	)
-	proposal.insert()
+	# ADR-023 QĐ 5 valid path 2: the only opening of the proposal guard for the agent account.
+	with allow_agent_write():
+		proposal.insert()
 	comment = _comment(ctx, proposal)
 	return {"ok": True, "proposal": proposal.name, "status": proposal.change_status, "comment": comment}
 

@@ -1,7 +1,9 @@
 import json
 from dataclasses import dataclass
+from datetime import date, datetime, time, timedelta
 
 import frappe
+from frappe.utils import now_datetime
 
 from erp_ai.agent.classification import PRIORITY_URGENT, URGENT_TAGS, Classification
 from erp_ai.constants import AGENT_USER, CATEGORIES
@@ -34,6 +36,8 @@ DEFAULT_ROUTING_RULES = json.dumps(
 ROOT_KEYS = ("assignees", "departments", "importance_priority", "expected_sla")
 ASSIGNEE_CATEGORIES = ("A", "B", "C", "F")
 SLA_KEYS = ("response_min", "resolution_min")
+DUE_SOON = timedelta(hours=24)
+DUE_FIELD_MISSING_NOTE = "chưa cấu hình trường Hạn hoàn thành, bỏ qua ngoại lệ theo hạn"
 
 
 @dataclass(frozen=True)
@@ -55,8 +59,17 @@ def decide_route(
 	team_exists,
 	is_excluded_team,
 	is_active_agent,
+	due_at: date | datetime | None = None,
+	due_field_configured: bool | None = None,
+	d_watcher: str | None = None,
+	now: datetime | None = None,
 ) -> RouteDecision:
-	"""Priority per R1-R5; team per mapping or department; assignee by category/prefix; needs_task for C/D."""
+	"""Priority per R1-R5 and the due-date exceptions (AC-25); team per mapping or department;
+	assignee by category/prefix; needs_task for C/D. d_watcher is accepted for AC-27 (not used yet).
+
+	due_field_configured: None = the caller does not say (no note; due_at used when given),
+	False = no due field (B/D get a note and due_at is ignored), True = due_at used.
+	"""
 	entry = mapping.get(classification.category) or {}
 	notes = []
 	if classification.category in ("D", "E"):
@@ -64,10 +77,13 @@ def decide_route(
 	else:
 		agent_group = entry.get("agent_group") or None
 	assignee = _assignee(classification, subject, config, is_active_agent, notes)
+	if classification.category in ("B", "D") and due_field_configured is False:
+		notes.append({"field": "due_at", "reason": DUE_FIELD_MISSING_NOTE})
+		due_at = None
 	return RouteDecision(
 		ticket_type=entry.get("ticket_type"),
 		agent_group=agent_group,
-		priority=_priority(classification, subject, mapping, config),
+		priority=_priority(classification, subject, mapping, config, due_at, now),
 		assignee=assignee,
 		needs_task=classification.category in ("C", "D") and assignee is not None,
 		notes=tuple(notes),
@@ -132,7 +148,9 @@ def _category_assignee(category, subject, config) -> str:
 	return entry.get("default") or ""
 
 
-def _priority(classification: Classification, subject, mapping: dict, config: dict) -> str | None:
+def _priority(
+	classification: Classification, subject, mapping: dict, config: dict, due_at=None, now=None
+) -> str | None:
 	category = classification.category
 	if isinstance(subject, str) and any(tag in subject.upper() for tag in URGENT_TAGS):
 		return PRIORITY_URGENT
@@ -146,8 +164,20 @@ def _priority(classification: Classification, subject, mapping: dict, config: di
 	candidates = [(mapping.get(category) or {}).get("priority")]
 	if importance:
 		candidates.append(((config or {}).get("importance_priority") or {}).get(str(importance)))
+	deadline = as_deadline(due_at)
+	if deadline and (category == "D" or (category == "B" and deadline - (now or now_datetime()) <= DUE_SOON)):
+		candidates.append("High")
 	candidates = [value for value in candidates if value]
 	return max(candidates, key=_rank) if candidates else None
+
+
+def as_deadline(value: date | datetime | None) -> datetime | None:
+	"""Due value as a moment: None/empty -> None; a datetime is kept; a plain date means the end of that day."""
+	if not value:
+		return None
+	if isinstance(value, datetime):
+		return value
+	return datetime.combine(value, time(23, 59, 59))
 
 
 def _rank(priority: str) -> int:

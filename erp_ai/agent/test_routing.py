@@ -1,4 +1,5 @@
 import json
+from datetime import date, datetime, timedelta
 
 import frappe
 from frappe.tests.utils import FrappeTestCase
@@ -6,6 +7,7 @@ from frappe.tests.utils import FrappeTestCase
 from erp_ai.agent import routing
 from erp_ai.agent.classification import DEFAULT_CATEGORY_MAPPING, Classification
 from erp_ai.constants import AGENT_USER
+from erp_ai.test_utils import keep_agent_settings
 
 CONFIG = {"importance_priority": {"1": "", "2": "High", "3": "High"}}
 
@@ -654,3 +656,163 @@ class TestDepartments(FrappeTestCase):
 	def test_empty_or_missing_section(self):
 		for config in ({}, None, {"departments": {}}, {"expected_sla": {}}):
 			self.assertEqual(routing.departments(config), (), repr(config))
+
+
+NOW = datetime(2026, 11, 14, 9, 0, 0)
+DUE_NOTE = {"field": "due_at", "reason": "chưa cấu hình trường Hạn hoàn thành, bỏ qua ngoại lệ theo hạn"}
+URGENT_MAPPING = {
+	**DEFAULT_CATEGORY_MAPPING,
+	"B": {**DEFAULT_CATEGORY_MAPPING["B"], "priority": "Urgent"},
+	"D": {**DEFAULT_CATEGORY_MAPPING["D"], "priority": "Urgent"},
+}
+A_MEDIUM_MAPPING = {**DEFAULT_CATEGORY_MAPPING, "A": {**DEFAULT_CATEGORY_MAPPING["A"], "priority": "Medium"}}
+
+
+def _decide_due(category, due_at=None, configured=True, importance=1, subject="Thông thường", mapping=None):
+	return routing.decide_route(
+		Classification(category=category, confidence="Cao", importance=importance),
+		subject,
+		DEFAULT_CATEGORY_MAPPING if mapping is None else mapping,
+		CONFIG,
+		team_exists=lambda team: True,
+		is_excluded_team=lambda team: False,
+		is_active_agent=lambda user: True,
+		due_at=due_at,
+		due_field_configured=configured,
+		d_watcher="watcher@x.com",
+		now=NOW,
+	)
+
+
+class TestPriorityExceptions(FrappeTestCase):
+	def setUp(self):
+		keep_agent_settings(self)
+
+	def test_truth_table(self):
+		day = timedelta(hours=24)
+		cases = (
+			# (name, category, importance, due_at, configured, subject, mapping, expected)
+			("A importance 3", "A", 3, None, True, "x", None, "Urgent"),
+			(
+				"A importance 1, due soon ignored",
+				"A",
+				1,
+				NOW + timedelta(hours=1),
+				True,
+				"x",
+				A_MEDIUM_MAPPING,
+				"Medium",
+			),
+			("B due exactly 24 h", "B", 1, NOW + day, True, "x", None, "High"),
+			("B due 24 h + 1 s", "B", 1, NOW + day + timedelta(seconds=1), True, "x", None, "Medium"),
+			("B due in 1 h", "B", 1, NOW + timedelta(hours=1), True, "x", None, "High"),
+			("B overdue", "B", 1, NOW - timedelta(hours=3), True, "x", None, "High"),
+			("B no due date", "B", 1, None, True, "x", None, "Medium"),
+			(
+				"B already Urgent not lowered",
+				"B",
+				1,
+				NOW + timedelta(hours=1),
+				True,
+				"x",
+				URGENT_MAPPING,
+				"Urgent",
+			),
+			("B field not configured", "B", 1, NOW + timedelta(hours=1), False, "x", None, "Medium"),
+			("C due soon ignored", "C", 1, NOW + timedelta(hours=1), True, "x", None, "Medium"),
+			("D due far away", "D", 1, NOW + timedelta(days=30), True, "x", None, "High"),
+			("D no due date", "D", 1, None, True, "x", None, "Medium"),
+			(
+				"D already Urgent not lowered",
+				"D",
+				1,
+				NOW + timedelta(days=30),
+				True,
+				"x",
+				URGENT_MAPPING,
+				"Urgent",
+			),
+			("D field not configured", "D", 1, NOW + timedelta(days=30), False, "x", None, "Medium"),
+			("E due soon stays empty", "E", 1, NOW + timedelta(hours=1), True, "x", None, None),
+			("F due soon stays Low", "F", 1, NOW + timedelta(hours=1), True, "x", None, "Low"),
+			("B tag with far due", "B", 1, NOW + timedelta(days=30), True, "[GẤP] x", None, "Urgent"),
+			("D tag with due", "D", 1, NOW + timedelta(days=30), True, "[GẤP] x", None, "Urgent"),
+		)
+		self.assertGreaterEqual(len(cases), 14)
+		for name, category, importance, due_at, configured, subject, mapping, expected in cases:
+			with self.subTest(case=name):
+				decision = _decide_due(category, due_at, configured, importance, subject, mapping)
+				self.assertEqual(decision.priority, expected)
+
+	def test_missing_due_field_note(self):
+		soon = NOW + timedelta(hours=1)
+		for category in "BD":
+			for due_at in (soon, None):
+				with self.subTest(category=category, due_at=due_at):
+					notes = _decide_due(category, due_at, configured=False).notes
+					self.assertEqual([note for note in notes if note["field"] == "due_at"], [DUE_NOTE])
+					self.assertNotIn(DUE_NOTE, _decide_due(category, due_at, configured=True).notes)
+			with self.subTest(category=category, configured=None):
+				decision = _decide_due(category, soon, configured=None)
+				self.assertNotIn("due_at", [note["field"] for note in decision.notes])
+				self.assertEqual(decision.priority, "High")
+		for category in "ACEF":
+			with self.subTest(category=category):
+				self.assertNotIn(DUE_NOTE, _decide_due(category, soon, configured=False).notes)
+
+	def test_old_call_shape_no_due_note(self):
+		expected = {"A": "High", "B": "Medium", "C": "Medium", "D": "Medium", "E": None, "F": "Low"}
+		self.assertEqual(sorted(expected), sorted(DEFAULT_CATEGORY_MAPPING))
+		for category, priority in expected.items():
+			with self.subTest(category=category):
+				decision = _decide(category, 1)
+				self.assertNotIn("due_at", [note["field"] for note in decision.notes])
+				self.assertEqual(decision.priority, priority)
+
+	def test_date_due_is_end_of_day(self):
+		due = date(2026, 11, 15)
+		cases = (
+			("B exactly 24 h before end of day", "B", datetime(2026, 11, 14, 23, 59, 59), "High"),
+			("B 24 h + 1 s before end of day", "B", datetime(2026, 11, 14, 23, 59, 58), "Medium"),
+			("D with a date", "D", datetime(2026, 11, 1, 9, 0, 0), "High"),
+		)
+		for name, category, now, expected in cases:
+			with self.subTest(case=name):
+				decision = routing.decide_route(
+					Classification(category=category, confidence="Cao", importance=1),
+					"Thông thường",
+					DEFAULT_CATEGORY_MAPPING,
+					CONFIG,
+					team_exists=lambda team: True,
+					is_excluded_team=lambda team: False,
+					is_active_agent=lambda user: True,
+					due_at=due,
+					due_field_configured=True,
+					now=now,
+				)
+				self.assertEqual(decision.priority, expected)
+
+	def test_as_deadline(self):
+		moment = datetime(2026, 11, 15, 8, 30, 0)
+		cases = (
+			("None", None, None),
+			("empty", "", None),
+			("datetime kept", moment, moment),
+			("date is end of day", date(2026, 11, 15), datetime(2026, 11, 15, 23, 59, 59)),
+		)
+		for name, value, expected in cases:
+			with self.subTest(case=name):
+				result = routing.as_deadline(value)
+				self.assertEqual(result, expected)
+				self.assertIs(type(result), type(expected))
+
+	def test_existing_rules_kept(self):
+		for category, expected in EXPECTED.items():
+			for importance in (1, 2, 3):
+				with self.subTest(category=category, importance=importance):
+					decision = _decide_due(category, None, True, importance)
+					self.assertEqual(decision.priority, expected[importance - 1])
+					self.assertEqual(decision.priority, _decide(category, importance).priority)
+					self.assertEqual(
+						_decide_due(category, None, True, importance, "[GẤP] x").priority, "Urgent"
+					)

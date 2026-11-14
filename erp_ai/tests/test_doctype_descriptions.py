@@ -23,7 +23,7 @@ VIETNAMESE_ACCENTS = re.compile(
 DOCTYPE_CONFIG = {
 	"ERP AI Setting": {
 		"folder": "erp_ai_setting",
-		"field_count": 59,
+		"field_count": 71,
 		"phrases": {
 			"enabled": ("Tắt", "4 đơn giá", "từ khóa kích hoạt"),
 			"permission_level": ("L0", "L1", "L2", "L3", "ngân sách"),
@@ -142,9 +142,22 @@ DOCTYPE_CONFIG = {
 			"report_row_limit": ("dòng", "từ 1 đến 100"),
 			"manuals_dir": ("apps/", "Để trống", "chưa có kho HDSD", "mã nguồn"),
 			"allowed_reports": ("Mỗi dòng", "Để trống", "bị chặn khi lưu"),
+			# FEAT-007 design.md:174, 177-181: section_operations.
+			"coo_report_recipients": ("08:00", "Để trống"),
+			"daily_report_weekends": ("08:00", "thứ Bảy", "Chủ nhật"),
+			"monthly_reviewers": ("Mỗi dòng", "vẫn được tạo"),
+			"review_sample_size": ("phiếu", "từ 1 đến 50"),
+			"d_ticket_watcher": ("đầu mục D", "Để trống"),
+			"due_reminder_hours": ("giờ", "từ 1 đến 168"),
+			"ba_note_due_hours": ("giờ", "từ 1 đến 168"),
+			"task_due_days": ("ngày", "từ 1 đến 30"),
+			"max_tasks_per_run": ("Task", "từ 1 đến 20"),
+			"kpi_targets": ("JSON", "gd2", "gd4", "không lưu được"),
+			"daily_report_sent_on": ("Hệ thống tự ghi", "không sửa được"),
+			"budget_alert_sent_month": ("Hệ thống tự ghi", "không sửa được"),
 		},
-		"section_count": 12,
-		"read_only_fields": ("spent_this_month_usd",),
+		"section_count": 13,
+		"read_only_fields": ("spent_this_month_usd", "daily_report_sent_on", "budget_alert_sent_month"),
 		"sections": (
 			("section_activation", "Bật và mức quyền", "enabled"),
 			("section_permissions", "Năm quyền mở rộng (mặc định tắt)", "unrestricted_enabled"),
@@ -157,6 +170,7 @@ DOCTYPE_CONFIG = {
 			("section_ticket_fields", "Trường sẵn có của phiếu", "field_ticket_nature"),
 			("section_code_change", "Sửa code và lệnh bench", "code_change_apps"),
 			("section_knowledge", "Trả lời, đóng phiếu và tri thức", "reply_enabled"),
+			("section_operations", "Báo cáo và vận hành", "coo_report_recipients"),
 			("section_alerts", "Cảnh báo và khóa API", "alert_recipients"),
 		),
 	},
@@ -572,10 +586,11 @@ class TestDoctypeDescriptions(FrappeTestCase):
 		start = order.index("prompt_digest")
 		# FEAT-007 design.md:98, 106 (NFR-8): the switch moved to section_permissions; the block keeps the app list.
 		# design.md:104-106: section_ticket_fields (AC-24) sits between section_routing and section_code_change.
-		# design.md:107 (row 11 after row 10): section_knowledge follows the code-change block; rows 12-13 are
-		# not built yet, so section_alerts (row 14) comes right after it.
+		# design.md:107 (row 11 after row 10): section_knowledge follows the code-change block.
+		# design.md:108 (row 12 after row 11): section_operations follows section_knowledge; row 13 is not built
+		# yet, so section_alerts (row 14) comes right after it.
 		self.assertEqual(
-			order[start : start + 23],
+			order[start : start + 36],
 			[
 				"prompt_digest",
 				"section_ticket_fields",
@@ -599,6 +614,19 @@ class TestDoctypeDescriptions(FrappeTestCase):
 				"manuals_dir",
 				"allowed_reports",
 				"report_row_limit",
+				"section_operations",
+				"coo_report_recipients",
+				"daily_report_weekends",
+				"monthly_reviewers",
+				"review_sample_size",
+				"d_ticket_watcher",
+				"due_reminder_hours",
+				"ba_note_due_hours",
+				"task_due_days",
+				"max_tasks_per_run",
+				"kpi_targets",
+				"daily_report_sent_on",
+				"budget_alert_sent_month",
 				"section_alerts",
 			],
 		)

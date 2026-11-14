@@ -1,4 +1,5 @@
 import ast
+import datetime
 import json
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -13,6 +14,7 @@ from erp_ai.agent.classification import DEFAULT_CATEGORY_MAPPING
 from erp_ai.agent.routing import DEFAULT_ROUTING_RULES
 from erp_ai.agent.tools import read, site_api
 from erp_ai.constants import (
+	AGENT_USER,
 	CREDENTIAL_DOCTYPE,
 	KEY_STATUS_ACTIVE,
 	KEY_STATUS_BAD_KEY,
@@ -623,6 +625,54 @@ FEAT007_NEW_FIELD_DEFAULTS = {
 	"manuals_dir": "",
 	"allowed_reports": "",
 	"report_row_limit": 20,
+	"coo_report_recipients": "",
+	"daily_report_weekends": 1,
+	"monthly_reviewers": "",
+	"review_sample_size": 10,
+	"d_ticket_watcher": "",
+	"due_reminder_hours": 24,
+	"ba_note_due_hours": 24,
+	"task_due_days": 3,
+	"max_tasks_per_run": 10,
+	"kpi_targets": (
+		"{\n"
+		'  "first_response_minutes": {"gd2": 15, "gd4": 5},\n'
+		'  "complete_fields_pct": {"gd2": 100, "gd4": 100},\n'
+		'  "closed_without_human_pct": {"gd2": 10, "gd4": 30},\n'
+		'  "b_resolution_hours": {"gd2": 4, "gd4": 1},\n'
+		'  "c_task_in_3_days_pct": {"gd2": 80, "gd4": 100},\n'
+		'  "stale_over_5_days": {"gd2": 10, "gd4": 4}\n'
+		"}"
+	),
+	# No Singles row: get_single_value casts the absent Date to date(1, 1, 1) (see test_watermarks_start_unset).
+	"daily_report_sent_on": datetime.date(1, 1, 1),
+	"budget_alert_sent_month": "",
+}
+# FEAT-007 AC-26, D-2: the expected first-response minutes of categories A-F (routing_rules.expected_sla).
+RESPONSE_TARGET_MINUTES = {"A": 15, "B": 15, "C": 60, "D": 60, "E": 60, "F": 5}
+# FEAT-007 design.md:108: section_operations and its twelve fields, in form order, with their field types.
+OPERATIONS_SECTION = {
+	"coo_report_recipients": "Small Text",
+	"daily_report_weekends": "Check",
+	"monthly_reviewers": "Small Text",
+	"review_sample_size": "Int",
+	"d_ticket_watcher": "Link",
+	"due_reminder_hours": "Int",
+	"ba_note_due_hours": "Int",
+	"task_due_days": "Int",
+	"max_tasks_per_run": "Int",
+	"kpi_targets": "Code",
+	"daily_report_sent_on": "Date",
+	"budget_alert_sent_month": "Data",
+}
+# FEAT-007 design.md:189-197 (section 2.1.1): the default KPI targets per stage.
+DEFAULT_KPI_TARGETS = {
+	"first_response_minutes": {"gd2": 15, "gd4": 5},
+	"complete_fields_pct": {"gd2": 100, "gd4": 100},
+	"closed_without_human_pct": {"gd2": 10, "gd4": 30},
+	"b_resolution_hours": {"gd2": 4, "gd4": 1},
+	"c_task_in_3_days_pct": {"gd2": 80, "gd4": 100},
+	"stale_over_5_days": {"gd2": 10, "gd4": 4},
 }
 # FEAT-007 AC-31: the highest level per category A-F, in form order.
 LEVEL_CAP_DEFAULTS = (
@@ -703,14 +753,61 @@ class TestFeat007Defaults(FrappeTestCase):
 				)
 				self.assertEqual(self._value_after_install(fieldname), default)
 
+	def test_response_targets_reuse_routing_rules(self):
+		# AC-26, D-2: the response targets are routing_rules.expected_sla.<X>.response_min, no field of their own;
+		# a fresh install stores 15, 15, 60, 60, 60, 5 for A-F.
+		stored = json.loads(self._value_after_install("routing_rules"))
+		self.assertEqual(
+			{category: sla["response_min"] for category, sla in stored["expected_sla"].items()},
+			RESPONSE_TARGET_MINUTES,
+		)
+		fieldnames = [field.fieldname for field in frappe.get_meta(SETTING_DOCTYPE).fields]
+		self.assertEqual([name for name in fieldnames if "response" in name], [])
 
-# FEAT-007 AC-22, AC-36, AC-44, AC-46, AC-49: fieldname -> (exact error text, low, high).
+	def test_operations_section_shape(self):
+		# design.md:108: section 12 follows the knowledge section; design.md:138-149: the field types; the two
+		# watermarks are read-only; design.md:189-197: the KPI targets default.
+		meta = frappe.get_meta(SETTING_DOCTYPE)
+		order = [field.fieldname for field in meta.fields]
+		self.assertIn("section_operations", order, "ERP AI Setting has no section_operations")
+		start = order.index("section_operations")
+		self.assertEqual(order[start - 1], "report_row_limit")
+		self.assertEqual(order[start + 1 : start + 13], list(OPERATIONS_SECTION))
+		self.assertEqual(
+			{fieldname: meta.get_field(fieldname).fieldtype for fieldname in OPERATIONS_SECTION},
+			OPERATIONS_SECTION,
+		)
+		self.assertEqual(meta.get_field("d_ticket_watcher").options, "User")
+		self.assertEqual(meta.get_field("kpi_targets").options, "JSON")
+		read_only = {name for name in OPERATIONS_SECTION if meta.get_field(name).read_only}
+		self.assertEqual(read_only, {"daily_report_sent_on", "budget_alert_sent_month"})
+		self.assertEqual(json.loads(meta.get_field("kpi_targets").default), DEFAULT_KPI_TARGETS)
+
+	def test_watermarks_start_unset(self):
+		# design.md:148-149: the two watermarks have no default; install stores no value for them.
+		for fieldname in ("daily_report_sent_on", "budget_alert_sent_month"):
+			with self.subTest(fieldname=fieldname):
+				self.assertIsNone(frappe.get_meta(SETTING_DOCTYPE).get_field(fieldname).default)
+				self._value_after_install(fieldname)
+				stored = frappe.db.sql(
+					"select value from `tabSingles` where doctype=%s and field=%s",
+					(SETTING_DOCTYPE, fieldname),
+				)
+				self.assertEqual(stored, ())
+
+
+# FEAT-007 AC-22, AC-36, AC-44, AC-46, AC-49, AC-51, AC-59, AC-63: fieldname -> (exact error text, low, high).
 FEAT007_INT_LIMITS = {
 	"confidence_threshold": ("Ngưỡng độ tin cậy phải từ 0 đến 100", 0, 100),
 	"auto_approve_streak": ("Số lần duyệt liên tiếp để Tự làm phải từ 1 đến 100", 1, 100),
 	"close_silent_f_days": ("Số ngày chờ trước khi đóng phiếu F phải từ 1 đến 30", 1, 30),
 	"knowledge_search_limit": ("Số kết quả tìm tri thức tối đa phải từ 1 đến 20", 1, 20),
 	"report_row_limit": ("Số dòng báo cáo tối đa phải từ 1 đến 100", 1, 100),
+	"review_sample_size": ("Số phiếu rà soát mỗi tháng phải từ 1 đến 50", 1, 50),
+	"due_reminder_hours": ("Số giờ báo trước hạn phải từ 1 đến 168", 1, 168),
+	"ba_note_due_hours": ("Số giờ chờ BA note phải từ 1 đến 168", 1, 168),
+	"task_due_days": ("Số ngày chờ Task phải từ 1 đến 30", 1, 30),
+	"max_tasks_per_run": ("Số Task tối đa mỗi lần chạy phải từ 1 đến 20", 1, 20),
 }
 
 
@@ -1684,3 +1781,118 @@ class TestAllowedReports(FrappeTestCase):
 			with self.subTest(typed=typed):
 				self.assertIsNone(self._save(typed))
 				self.assertEqual(self._stored(), typed or "")
+
+
+OPS_REVIEWER = "erpai-test-ops-reviewer@example.com"
+OPS_REVIEWER_OFF = "erpai-test-ops-reviewer-off@example.com"
+OPS_WATCHER = "erpai-test-ops-watcher@example.com"
+WATCHER_ERROR = "Người theo dõi phiếu D phải là tài khoản người đang bật"
+
+
+def _email_error(typed):
+	return f"Người nhận báo cáo COO: '{typed}' không phải email hợp lệ"
+
+
+def _reviewer_error(typed):
+	return f"Người rà soát: không có tài khoản '{typed}' đang bật"
+
+
+class TestOperationPeople(FrappeTestCase):
+	def setUp(self):
+		self.addCleanup(frappe.db.rollback)
+		keep_agent_settings(self)
+		self.assertTrue(
+			frappe.get_meta(SETTING_DOCTYPE).has_field("coo_report_recipients"),
+			"ERP AI Setting has no coo_report_recipients",
+		)
+		for email, enabled in ((OPS_REVIEWER, 1), (OPS_REVIEWER_OFF, 0), (OPS_WATCHER, 1)):
+			user = frappe.new_doc("User")
+			user.update(
+				{"email": email, "first_name": "ERP AI Test", "enabled": enabled, "send_welcome_email": 0}
+			)
+			user.insert(ignore_permissions=True)
+		self.assertIsNone(self._save(coo_report_recipients="", monthly_reviewers="", d_ticket_watcher=""))
+
+	def _save(self, **fields):
+		"""Save the setting with these fields; return the error text, or None when it saved."""
+		doc = frappe.get_doc(SETTING_DOCTYPE)
+		doc.update(fields)
+		try:
+			doc.save()
+		except frappe.ValidationError as error:
+			return str(error)
+		return None
+
+	def _stored(self, fieldname):
+		return frappe.db.get_single_value(SETTING_DOCTYPE, fieldname, cache=False) or ""
+
+	def test_bad_email_blocked(self):
+		# AC-51, E-8: a line that is not exactly one email is refused on any line (blank lines skipped); the typed
+		# text is escaped; the stored value holds. design.md step 8 before step 9: a bad manuals dir comes first.
+		good = "coo@example.com\n\n  ke.toan@congty.vn  \n"
+		self.assertIsNone(self._save(coo_report_recipients=good))
+		self.assertEqual(self._stored("coo_report_recipients"), good)
+		for typed, shown in (
+			("khong-phai-email", "khong-phai-email"),
+			("coo@", "coo@"),
+			("a@example.com, b@example.com", "a@example.com, b@example.com"),
+			("a@example.com, sai", "a@example.com, sai"),
+			("Giám đốc <coo@example.com>", "Giám đốc &lt;coo@example.com&gt;"),
+			("<b>x</b>", "&lt;b&gt;x&lt;/b&gt;"),
+		):
+			with self.subTest(typed=typed):
+				value = f"coo@example.com\n\n  {typed} \nke.toan@congty.vn"
+				self.assertEqual(self._save(coo_report_recipients=value), _email_error(shown))
+				self.assertEqual(self._stored("coo_report_recipients"), good)
+		self.assertEqual(
+			self._save(coo_report_recipients="sai", manuals_dir="khong_co_thu_muc_nay"),
+			"Kho HDSD 'khong_co_thu_muc_nay' phải là thư mục có sẵn dưới apps/",
+		)
+		for typed in ("", "\n  \n", None):
+			with self.subTest(typed=typed):
+				self.assertIsNone(self._save(coo_report_recipients=typed, manuals_dir=""))
+				self.assertEqual(self._stored("coo_report_recipients"), typed or "")
+
+	def test_disabled_reviewer_blocked(self):
+		# AC-59, E-8: each reviewer line must be an enabled User; a disabled or unknown account is refused on any
+		# line (escaped); blank lines are skipped; the stored value holds; the COO list is checked first.
+		good = f"{OPS_REVIEWER}\n\n  {OPS_WATCHER} \n"
+		self.assertIsNone(self._save(monthly_reviewers=good))
+		self.assertEqual(self._stored("monthly_reviewers"), good)
+		for typed, shown in (
+			(OPS_REVIEWER_OFF, OPS_REVIEWER_OFF),
+			("erpai-test-khong-co@example.com", "erpai-test-khong-co@example.com"),
+			("<b>x</b>", "&lt;b&gt;x&lt;/b&gt;"),
+		):
+			with self.subTest(typed=typed):
+				value = f"{OPS_REVIEWER}\n\n {typed}\t\n{OPS_WATCHER}"
+				self.assertEqual(self._save(monthly_reviewers=value), _reviewer_error(shown))
+				self.assertEqual(self._stored("monthly_reviewers"), good)
+		self.assertEqual(
+			self._save(monthly_reviewers=OPS_REVIEWER_OFF, coo_report_recipients="sai"), _email_error("sai")
+		)
+		for typed in ("", "\n  \n", None):
+			with self.subTest(typed=typed):
+				self.assertIsNone(self._save(monthly_reviewers=typed, coo_report_recipients=""))
+				self.assertEqual(self._stored("monthly_reviewers"), typed or "")
+
+	def test_watcher_must_be_enabled_human(self):
+		# AC-27, E-8: the D watcher, when set, must be enabled and not the agent account (each half alone); an
+		# unknown account is refused too; empty is allowed; the reviewers are checked first.
+		self.assertEqual(frappe.db.get_value("User", AGENT_USER, "enabled"), 1)
+		self.assertIsNone(self._save(d_ticket_watcher=OPS_WATCHER))
+		self.assertEqual(self._stored("d_ticket_watcher"), OPS_WATCHER)
+		for typed in (OPS_REVIEWER_OFF, AGENT_USER, AGENT_USER.upper()):
+			with self.subTest(typed=typed):
+				self.assertEqual(self._save(d_ticket_watcher=typed), WATCHER_ERROR)
+				self.assertEqual(self._stored("d_ticket_watcher"), OPS_WATCHER)
+		self.assertIsNotNone(self._save(d_ticket_watcher="erpai-test-khong-co@example.com"))
+		self.assertEqual(self._stored("d_ticket_watcher"), OPS_WATCHER)
+		self.assertEqual(
+			self._save(d_ticket_watcher=AGENT_USER, monthly_reviewers=OPS_REVIEWER_OFF),
+			_reviewer_error(OPS_REVIEWER_OFF),
+		)
+		for typed in ("", None):
+			with self.subTest(typed=typed):
+				self.assertIsNone(self._save(d_ticket_watcher=typed, monthly_reviewers=""))
+				self.assertEqual(self._stored("d_ticket_watcher"), "")

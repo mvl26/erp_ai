@@ -72,6 +72,19 @@
   "manuals_dir",
   "allowed_reports",
   "report_row_limit",
+  "section_operations",
+  "coo_report_recipients",
+  "daily_report_weekends",
+  "monthly_reviewers",
+  "review_sample_size",
+  "d_ticket_watcher",
+  "due_reminder_hours",
+  "ba_note_due_hours",
+  "task_due_days",
+  "max_tasks_per_run",
+  "kpi_targets",
+  "daily_report_sent_on",
+  "budget_alert_sent_month",
   "section_alerts",
   "alert_recipients",
   "credentials"
@@ -532,6 +545,94 @@
    "description": "Số dòng tối đa của kết quả báo cáo bot nhận mỗi lần chạy, từ 1 đến 100; các dòng sau bị cắt."
   },
   {
+   "fieldname": "section_operations",
+   "fieldtype": "Section Break",
+   "label": "Báo cáo và vận hành"
+  },
+  {
+   "fieldname": "coo_report_recipients",
+   "fieldtype": "Small Text",
+   "label": "Người nhận báo cáo COO",
+   "description": "Mỗi dòng một email nhận báo cáo 08:00 hằng ngày, ví dụ coo@congty.vn; không tách bằng dấu phẩy. Để trống thì không gửi. Dòng không phải một email hợp lệ thì không lưu được."
+  },
+  {
+   "fieldname": "daily_report_weekends",
+   "fieldtype": "Check",
+   "label": "Gửi báo cáo cả cuối tuần",
+   "default": "1",
+   "description": "Bật thì báo cáo 08:00 gửi cả thứ Bảy và Chủ nhật; tắt thì chỉ gửi từ thứ Hai đến thứ Sáu. Ô này mặc định bật."
+  },
+  {
+   "fieldname": "monthly_reviewers",
+   "fieldtype": "Small Text",
+   "label": "Người rà soát tháng",
+   "description": "Mỗi dòng một tài khoản (email đăng nhập) nhận thông báo danh sách rà soát tháng. Để trống thì danh sách vẫn được tạo nhưng không thông báo. Tài khoản không có hoặc đang tắt thì không lưu được."
+  },
+  {
+   "fieldname": "review_sample_size",
+   "fieldtype": "Int",
+   "label": "Số phiếu rà soát mỗi tháng",
+   "default": "10",
+   "description": "Số phiếu chọn ngẫu nhiên mỗi tháng trong các phiếu bot đã ghi để người rà soát chấm đúng hoặc sai, từ 1 đến 50 phiếu. Ít phiếu hơn thì lấy hết."
+  },
+  {
+   "fieldname": "d_ticket_watcher",
+   "fieldtype": "Link",
+   "label": "Người theo dõi phiếu D",
+   "options": "User",
+   "description": "Người (thường là IT) được thêm làm người theo dõi phiếu đầu mục D, một lần mỗi phiếu. Để trống thì không thêm. Phải là tài khoản người đang bật, không phải tài khoản agent."
+  },
+  {
+   "fieldname": "due_reminder_hours",
+   "fieldtype": "Int",
+   "label": "Số giờ báo trước hạn",
+   "default": "24",
+   "description": "Số giờ còn lại tới mốc xử lý hoặc Hạn hoàn thành để phiếu được tính là sắp quá hạn trong báo cáo 08:00 và được nhắc, từ 1 đến 168 giờ."
+  },
+  {
+   "fieldname": "ba_note_due_hours",
+   "fieldtype": "Int",
+   "label": "Số giờ chờ BA note",
+   "default": "24",
+   "description": "Số giờ từ lúc tạo phiếu đầu mục C mà chưa có BA note thì phiếu được nêu trong báo cáo 08:00 và được nhắc, từ 1 đến 168 giờ."
+  },
+  {
+   "fieldname": "task_due_days",
+   "fieldtype": "Int",
+   "label": "Số ngày chờ Task",
+   "default": "3",
+   "description": "Số ngày từ lúc tạo phiếu đầu mục C hoặc D mà chưa có Task liên kết thì phiếu được nêu trong báo cáo 08:00 và được nhắc, từ 1 đến 30 ngày."
+  },
+  {
+   "fieldname": "max_tasks_per_run",
+   "fieldtype": "Int",
+   "label": "Số Task tối đa mỗi lần chạy",
+   "default": "10",
+   "description": "Số Task tối đa bot tạo cho một phiếu trong một lần chạy, từ 1 đến 20; Task vượt số này không được tạo."
+  },
+  {
+   "fieldname": "kpi_targets",
+   "fieldtype": "Code",
+   "label": "Mục tiêu KPI",
+   "options": "JSON",
+   "default": "{\n  \"first_response_minutes\": {\"gd2\": 15, \"gd4\": 5},\n  \"complete_fields_pct\": {\"gd2\": 100, \"gd4\": 100},\n  \"closed_without_human_pct\": {\"gd2\": 10, \"gd4\": 30},\n  \"b_resolution_hours\": {\"gd2\": 4, \"gd4\": 1},\n  \"c_task_in_3_days_pct\": {\"gd2\": 80, \"gd4\": 100},\n  \"stale_over_5_days\": {\"gd2\": 10, \"gd4\": 4}\n}",
+   "description": "JSON mục tiêu 6 KPI theo giai đoạn: mỗi KPI có gd2 và gd4 là số không âm. Sai cú pháp hoặc thiếu KPI thì không lưu được."
+  },
+  {
+   "fieldname": "daily_report_sent_on",
+   "fieldtype": "Date",
+   "label": "Ngày đã gửi báo cáo 08:00",
+   "read_only": 1,
+   "description": "Hệ thống tự ghi ngày gần nhất đã gửi báo cáo 08:00, để mỗi ngày chỉ gửi một lần; không sửa được."
+  },
+  {
+   "fieldname": "budget_alert_sent_month",
+   "fieldtype": "Data",
+   "label": "Tháng đã gửi cảnh báo ngân sách",
+   "read_only": 1,
+   "description": "Hệ thống tự ghi tháng (dạng YYYY-MM) đã gửi email vượt ngân sách tháng, để mỗi tháng chỉ gửi một lần; không sửa được."
+  },
+  {
    "fieldname": "section_alerts",
    "fieldtype": "Section Break",
    "label": "Cảnh báo và khóa API"
@@ -553,7 +654,7 @@
  ],
  "issingle": 1,
  "links": [],
- "modified": "2026-11-14 23:45:00.000000",
+ "modified": "2026-11-15 10:00:00.000000",
  "modified_by": "Administrator",
  "module": "ERP AI agent",
  "name": "ERP AI Setting",

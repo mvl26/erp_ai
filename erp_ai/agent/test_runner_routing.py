@@ -1481,6 +1481,25 @@ class TestRoutingPermissions(AssignTestBase):
 
 	def setUp(self):
 		super().setUp()
+		# Pin the privilege-alert watermark just before the run: both no-argument job calls then have
+		# upper = now - 300 s below it, so the permission condition reads no log row (FEAT-005 AC-19).
+		self.since = frappe.utils.add_to_date(frappe.utils.now_datetime(), seconds=-1)
+		raw = frappe.db.get_value(
+			"Singles",
+			{"doctype": tasks.SETTING_DOCTYPE, "field": "privilege_alert_checked_until"},
+			"value",
+			order_by=None,
+		)
+		frappe.db.set_single_value(
+			tasks.SETTING_DOCTYPE, "privilege_alert_checked_until", self.since, update_modified=False
+		)
+		self.addCleanup(
+			frappe.db.set_single_value,
+			tasks.SETTING_DOCTYPE,
+			"privilege_alert_checked_until",
+			raw,
+			update_modified=False,
+		)
 		self.seen = []
 		for name in ROUTE_UNITS:
 			spy = patch.object(runner, name, side_effect=self._spy(name))
@@ -1541,7 +1560,14 @@ class TestRoutingPermissions(AssignTestBase):
 			tasks.check_privilege_escalation()
 		return {
 			"role_drift": tasks._agent_role_drift(),
-			"permission_records": tasks._permission_records_by_agent(),
+			# no settle margin: every reason row of the run falls inside (since, now]
+			"privilege_changes": tasks._privilege_changes_by_agent(self.since, frappe.utils.now_datetime()),
+			# observed directly: the run writes no permission record, not even outside the generic write tools
+			"permission_rows_by_agent": {
+				doctype: frappe.get_all(doctype, filters={"modified_by": AGENT_USER}, pluck="name")
+				for doctype in tasks.PERMISSION_DOCTYPES
+				if frappe.db.exists("DocType", doctype)
+			},
 			"scripts": tasks._enabled_scripts_by_agent(),
 			"alarms": sorted(call.args[0] for call in alarm.call_args_list),
 		}
@@ -1552,4 +1578,6 @@ class TestRoutingPermissions(AssignTestBase):
 		self._run_success_cases()
 		self.assertTrue(self.seen)
 
-		self.assertEqual(self._findings(), before)
+		after = self._findings()
+		self.assertEqual(after["privilege_changes"], [])
+		self.assertEqual(after, before)

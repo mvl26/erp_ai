@@ -23,6 +23,7 @@ from erp_ai.constants import (
 	TRIGGER_CHANGE_ACTION,
 	TRIGGER_TICKET_INSERT,
 )
+from erp_ai.erp_ai_agent.doctype.erp_ai_setting import erp_ai_setting
 from erp_ai.gateway import client
 from erp_ai.test_utils import add_credential, make_change_proposal, set_agent_settings
 
@@ -524,21 +525,53 @@ class TestCheckPrivilegeEscalation(FrappeTestCase):
 			[(WATERMARK, datetime(2031, 11, 15, 8, 55, 0)), (WATERMARK, datetime(2031, 11, 16, 8, 55, 0))],
 		)
 
+	def _set_raw_watermark(self, raw):
+		"""Leave this raw text in tabSingles (None = no row at all), as a fresh site or an old save may."""
+		frappe.db.delete("Singles", {"doctype": SETTING_DOCTYPE, "field": "privilege_alert_checked_until"})
+		if raw is not None:
+			frappe.db.sql(
+				"insert into `tabSingles` (doctype, field, value) values (%s, %s, %s)",
+				(SETTING_DOCTYPE, "privilege_alert_checked_until", raw),
+			)
+
 	def test_empty_watermark_reads_from_the_start(self):
-		frappe.db.set_single_value(SETTING_DOCTYPE, "privilege_alert_checked_until", None)
 		self._log_row(
-			[_hand_action("api_update_record", "Custom DocPerm", "before-watermark")],
-			at=datetime(2031, 11, 14, 7, 0, 0),
+			[_hand_action("api_update_record", "Custom DocPerm", "a-year-ago")],
+			at=datetime(2030, 11, 15, 9, 0, 0),
 		)
 
-		with patch.object(tasks, "_privilege_changes_by_agent", return_value=[]) as changes:
-			self._run()
+		# Frappe 15 casts these raw forms to datetime(1, 1, 1) or None: all mean "never alarmed" (design-amd2 §2).
+		for raw in (None, "", "0001-01-01 00:00:00"):
+			with self.subTest(raw=raw):
+				self._set_raw_watermark(raw)
 
-		changes.assert_called_once_with(None, UPPER)
-		self.assertIn(
-			"sửa Custom DocPerm before-watermark (người ra lệnh erpai-tasks-boss@example.invalid, 2031-11-14 07:00)",
-			self._changes(lower=None),
+				self.assertIsNone(erp_ai_setting.read_privilege_watermark())
+				with patch.object(tasks, "_privilege_changes_by_agent", return_value=[]) as changes:
+					self._run()
+				changes.assert_called_once_with(None, UPPER)
+				self.assertIn(
+					"sửa Custom DocPerm a-year-ago (người ra lệnh erpai-tasks-boss@example.invalid, 2030-11-15 09:00)",
+					self._changes(lower=None),
+				)
+
+	def test_doctype_write_without_permissions_change_not_listed(self):
+		perms = [{"role": "Desk User", "read": 1}]
+		self._log_row(
+			[
+				_hand_action("api_update_record", "DocType", "Note"),
+				_hand_action("api_update_record", "DocType", "ToDo"),
+			],
+			{
+				"api_update_record#1": {"name": "Note", "description": "old", "permissions": perms},
+				"api_update_record#2": {"name": "ToDo", "description": "old"},
+			},
+			{
+				"api_update_record#1": {"name": "Note", "description": "new", "permissions": perms},
+				"api_update_record#2": {"name": "ToDo", "description": "new"},
+			},
 		)
+
+		self.assertEqual(self._changes(), [])
 
 	def test_only_ok_generic_writes_on_permission_doctypes_are_listed(self):
 		perms = [{"role": "Desk User", "read": 1}]

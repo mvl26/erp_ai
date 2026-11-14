@@ -17,6 +17,7 @@ from erp_ai.constants import (
 	SETTING_DOCTYPE,
 	TITLE_RUN_FAILED,
 )
+from erp_ai.erp_ai_agent.doctype.erp_ai_setting.erp_ai_setting import read_privilege_watermark
 
 PERMISSION_DOCTYPES = ("Custom DocPerm", "DocPerm", "Role", "Has Role", "User Permission", "Role Profile")
 HAS_ROLE_DOCTYPE = "Has Role"
@@ -24,8 +25,6 @@ DOCTYPE_DOCTYPE = "DocType"
 MAX_LISTED_NAMES = 5
 # Rows newer than now minus this are left for the next run: covers write_entry's insert-to-commit gap and clock skew.
 PRIVILEGE_ALERT_SETTLE_S = 300
-# Frappe 15 reads an empty Datetime single back as this value instead of None.
-EMPTY_DATETIME = datetime(1, 1, 1)
 UNKNOWN_INSTRUCTOR = "không rõ"
 # Verb of each generic write tool, keyed by the action word of its name (`api_<word>_record`), so the tool names
 # come only from runner.GENERIC_WRITE_TOOLS; a new generic tool with another word fails at import, never mislabelled.
@@ -108,7 +107,7 @@ def _is_permission_change(doctype, key: str, before: dict, after: dict) -> bool:
 def _privilege_changes_by_agent(lower: datetime | None, upper: datetime) -> list[str]:
 	"""One entry per successful generic write on a permission record logged in (lower, upper] (ADR-024 QĐ 1, 3.3).
 
-	Reads `reason` rows of ERP AI Log by `creation`, oldest first; no lower bound when `lower` is empty.
+	Reads `reason` rows of ERP AI Log by `creation`, oldest first; no lower bound when `lower` is None.
 	A DocType write counts only when its `permissions` snapshot changed. `Has Role` rows are User changes.
 	"""
 	log = frappe.qb.DocType(LOG_DOCTYPE)
@@ -118,7 +117,7 @@ def _privilege_changes_by_agent(lower: datetime | None, upper: datetime) -> list
 		.where((log.entry_type == "reason") & (log.creation <= upper) & log.actions.like("%api_%"))
 		.orderby(log.creation)
 	)
-	if lower:
+	if lower is not None:
 		query = query.where(log.creation > lower)
 	changes = []
 	for row in query.run(as_dict=True):
@@ -175,9 +174,7 @@ def check_privilege_escalation(now: datetime | None = None) -> None:
 	"""
 	upper = (get_datetime(now) if now else now_datetime()) - timedelta(seconds=PRIVILEGE_ALERT_SETTLE_S)
 	try:
-		lower = frappe.db.get_single_value(SETTING_DOCTYPE, "privilege_alert_checked_until", cache=False)
-		if lower == EMPTY_DATETIME:
-			lower = None
+		lower = read_privilege_watermark()
 		checks = (
 			("Tài khoản agent có role ngoài danh sách cho phép", _agent_role_drift),
 			("Agent đã sửa bản ghi phân quyền", lambda: _privilege_changes_by_agent(lower, upper)),

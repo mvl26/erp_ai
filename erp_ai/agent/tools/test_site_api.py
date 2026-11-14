@@ -184,6 +184,13 @@ class TestSiteApi(FrappeTestCase):
 			self.assertIn(role, result["reason"])
 			self.assertFalse(frappe.db.exists("User", NEW_USER), role)
 
+	def test_forbidden_roles_are_exactly_the_six_admin_roles_of_ac14(self):
+		# Written out by hand so a role dropped from or added to the constant fails here.
+		self.assertEqual(
+			site_api.FORBIDDEN_ROLES,
+			{"System Manager", "Administrator", "ERP AI Instructor", "ERP AI Agent", "Guest", "All"},
+		)
+
 	def test_refuses_adding_a_forbidden_role_to_an_existing_user(self):
 		self.create("User", self.user_values())
 		result = self.update("User", NEW_USER, {"roles": [{"role": "System Manager"}]})

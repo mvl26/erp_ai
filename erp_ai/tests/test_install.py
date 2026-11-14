@@ -10,12 +10,15 @@ from erp_ai.agent.routing import DEFAULT_ROUTING_RULES
 from erp_ai.constants import (
 	AGENT_USER,
 	HELPDESK_AGENT_ROLE,
+	LOG_DOCTYPE,
 	LOGGER_NAME,
 	ROLE_AGENT,
 	ROLE_INSTRUCTOR,
 	SETTING_DOCTYPE,
 )
 from erp_ai.test_utils import keep_agent_settings
+
+INSTRUCTOR_LOG_RIGHTS = ("read", "report")
 
 AI_FIELDS = (
 	"ai_section",
@@ -680,3 +683,26 @@ class TestFeat007Migrate(FrappeTestCase):
 		self.assertLessEqual(set(FIVE_SWITCHES), set(first))
 		install.after_migrate()
 		self.assertEqual(_stored_settings(), first)
+
+	def test_instructor_can_report_on_log(self):
+		"""AC-20, D-5: ERP AI Instructor reads ERP AI Log through reports, nothing else (append-only kept)."""
+		rows = [p for p in frappe.get_meta(LOG_DOCTYPE).permissions if p.role == ROLE_INSTRUCTOR]
+		self.assertEqual(len(rows), 1)
+		row = rows[0]
+		self.assertEqual((row.permlevel, row.if_owner), (0, 0))
+		checked = [right for right in frappe.permissions.rights if right != "select"]
+		expected = {right: int(right in INSTRUCTOR_LOG_RIGHTS) for right in checked}
+		self.assertEqual(
+			{right: row.get(right) or 0 for right in checked},
+			expected,
+		)
+
+		instructor = "feat007-instructor@example.com"
+		frappe.local.role_permissions.clear()
+		self.addCleanup(frappe.local.role_permissions.clear)
+		with patch.object(frappe, "get_roles", return_value=[ROLE_INSTRUCTOR, "All", "Guest"]):
+			effective = frappe.permissions.get_role_permissions(LOG_DOCTYPE, user=instructor)
+		self.assertEqual(
+			{right: effective[right] for right in checked},
+			expected,
+		)

@@ -1898,8 +1898,26 @@ class TestUndoCode(ApplyJobTestCase):
 				)
 				self.assertEqual(self.head(), other_head)
 
+	def test_undo_accepted_after_a_human_commit_on_the_same_branch(self):
+		# AC-20, ADR-022 decision 6: the apply commit is an ancestor of HEAD, not HEAD itself.
+		for kind in self.KINDS:
+			with self.subTest(kind):
+				name, apply_commit = self.fresh_undo(kind)
+				human_head = self.sandbox.commit_file(APP, "pkg/manual.py", "y = 1\n", message="việc tay")
+
+				apply_job.run_change(name, "undo")
+
+				state = self.state(name)
+				self.assertEqual((state.change_status, state.failure_reason), (CHANGE_STATUS_UNDONE, None))
+				self.assert_target_undone(kind)
+				self.assertEqual(state.undo_commit_sha, self.head())
+				self.assertEqual(self.sandbox.git(APP, "rev-parse", "HEAD~1").strip(), human_head)
+				self.assertEqual(self.sandbox.git(APP, "rev-parse", "HEAD~2").strip(), apply_commit)
+
 	def test_undo_ancestor_unreadable_fails_with_git_error(self):
 		name, apply_commit = self.fresh_undo()
+		# HEAD differs from the apply commit, so the order of the two arguments is visible.
+		human_head = self.sandbox.commit_file(APP, "pkg/manual.py", "y = 1\n", message="việc tay")
 		count = self.commit_count()
 
 		write, remove, commit = self.file_calls()
@@ -1912,7 +1930,7 @@ class TestUndoCode(ApplyJobTestCase):
 			apply_job.run_change(name, "undo")
 
 		ancestor.assert_called_once()
-		self.assertEqual(ancestor.call_args.args[1:], (apply_commit, apply_commit))
+		self.assertEqual(ancestor.call_args.args[1:], (apply_commit, human_head))
 		self.assert_refused_before_writing(
 			name, "changed file", GIT_ERROR_TEXT, count, (writes, removes, commits)
 		)

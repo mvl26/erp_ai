@@ -54,6 +54,18 @@ ARTICLE = "HD Article"
 ARTICLE_STANDARD_ROLES = ("System Manager", "Agent", "HD Customer", "HD Customer Manager")
 PERM_FLAGS = (*rights, "if_owner")
 
+# FEAT-007 T23, STD-OPS-2 down (design.md:529): what a rollback of U0 leaves behind. A field removed from the meta
+# keeps its `tabSingles` row; a child table whose field is removed keeps its rows. Names absent from the meta
+# stand in for the rolled-back ones, since Frappe filters both by the meta alone.
+LEFTOVER_SINGLES = {
+	"erp_ai_rolled_back_switch": "1",
+	"erp_ai_rolled_back_note": "còn lại sau khi lùi phiên bản",
+	"erp_ai_rolled_back_blank": None,
+}
+ORPHAN_PARENTFIELD = "erp_ai_rolled_back_rows"
+U0_CHILD_TABLES = ("catalog_rules", "user_templates", "prompt_revisions")
+LEFTOVER_LABELS = '["Lỗi phần mềm"]'
+
 EARLIER = "2025-12-31 08:00:00"
 ENABLED_AT = "2026-01-02 03:04:05"
 LATER = "2026-02-03 04:05:06"
@@ -1074,3 +1086,133 @@ class TestFeat007Migrate(FrappeTestCase):
 		self.assertIn("not found", warnings[0][0])
 		self.assertNotIn("source ticket field", warnings[0][0])
 		self.assertEqual(_article_custom_perms(), [])
+
+	def _fresh_settings(self):
+		"""Own starting state: default settings and no child rows, whatever the site holds (keep_agent_settings)."""
+		frappe.db.delete("Singles", {"doctype": SETTING_DOCTYPE})
+		for child in {field.options for field in frappe.get_meta(SETTING_DOCTYPE).get_table_fields()}:
+			frappe.db.delete(child, {"parent": SETTING_DOCTYPE, "parenttype": SETTING_DOCTYPE})
+		install.ensure_setup()
+		install.after_migrate()
+		frappe.db.value_cache.pop(SETTING_DOCTYPE, None)
+
+	def _setting_values(self):
+		"""Every value field of the loaded form, as a human opening it would see them.
+
+		A save stores a never-set text field as "" where it had no row; both read as blank, so both count as None.
+		"""
+		doc = frappe.get_single(SETTING_DOCTYPE)
+		return {
+			field.fieldname: None if doc.get(field.fieldname) == "" else doc.get(field.fieldname)
+			for field in frappe.get_meta(SETTING_DOCTYPE).fields
+			if field.fieldtype not in frappe.model.no_value_fields
+			and field.fieldtype not in frappe.model.table_fields
+		}
+
+	def test_leftover_single_rows_dropped_on_next_human_save(self):
+		"""STD-OPS-2 down: `tabSingles` rows of removed fields are harmless; the next human save drops them."""
+		self._fresh_settings()
+		meta = frappe.get_meta(SETTING_DOCTYPE)
+		self.assertEqual([name for name in LEFTOVER_SINGLES if meta.has_field(name)], [])
+		kept = self._setting_values()
+		for field, value in LEFTOVER_SINGLES.items():
+			frappe.db.sql(
+				"insert into `tabSingles` (doctype, field, value) values (%s, %s, %s)",
+				(SETTING_DOCTYPE, field, value),
+			)
+		# Harmless: the form loads with the same values, and a migrate neither fails nor drops the rows.
+		self.assertEqual(self._setting_values(), kept)
+		install.after_migrate()
+		self.assertLessEqual(set(LEFTOVER_SINGLES), set(_stored_settings()))
+		frappe.get_single(SETTING_DOCTYPE).save()
+		self.assertEqual(set(LEFTOVER_SINGLES) & set(_stored_settings()), set())
+		self.assertEqual(self._setting_values(), kept)
+
+	def test_orphan_child_rows_do_not_break_get_single(self):
+		"""STD-OPS-2 down: rows of a removed table field are never loaded, and a save neither fails nor deletes them."""
+		self._fresh_settings()
+		meta = frappe.get_meta(SETTING_DOCTYPE)
+		self.assertFalse(meta.has_field(ORPHAN_PARENTFIELD))
+		orphans = {}
+		for fieldname in U0_CHILD_TABLES:
+			row = frappe.get_doc(
+				{
+					"doctype": meta.get_field(fieldname).options,
+					"parent": SETTING_DOCTYPE,
+					"parenttype": SETTING_DOCTYPE,
+					"parentfield": ORPHAN_PARENTFIELD,
+					"idx": 1,
+				}
+			)
+			row.db_insert()
+			orphans[row.doctype] = row.name
+		# One live row next to the orphan of the same table: only the orphan is left out.
+		live = frappe.get_doc(
+			{
+				"doctype": meta.get_field("prompt_revisions").options,
+				"parent": SETTING_DOCTYPE,
+				"parenttype": SETTING_DOCTYPE,
+				"parentfield": "prompt_revisions",
+				"idx": 1,
+				"part": "classify",
+				"changed_by": "Administrator",
+				"changed_at": EARLIER,
+				"new_length": 0,
+			}
+		)
+		live.db_insert()
+		expected = {"catalog_rules": [], "user_templates": [], "prompt_revisions": [live.name]}
+		doc = frappe.get_single(SETTING_DOCTYPE)
+		self.assertEqual({name: [row.name for row in doc.get(name)] for name in U0_CHILD_TABLES}, expected)
+		doc.save()
+		doc = frappe.get_single(SETTING_DOCTYPE)
+		self.assertEqual({name: [row.name for row in doc.get(name)] for name in U0_CHILD_TABLES}, expected)
+		self.assertEqual(
+			{child: frappe.db.exists(child, name) for child, name in orphans.items()},
+			{child: name for child, name in orphans.items()},
+		)
+
+	def _stored_labels(self, ticket):
+		rows = frappe.db.sql(
+			f"select `{CREATED_LABELS_FIELD}` from `tabHD Ticket` where name=%s", ticket, pluck=True
+		)
+		return rows[0] if rows else "<missing>"
+
+	def test_leftover_created_labels_column_does_not_break_ticket(self):
+		"""STD-OPS-2 down, ruling (1): the Custom Field record is gone, the column stays; tickets still load and save."""
+		frappe.db.set_single_value(SETTING_DOCTYPE, "enabled", 0)
+		field = _labels_field()
+		self.assertIsNotNone(field)
+		record = frappe.get_doc("Custom Field", field.name).as_dict()
+
+		def put_record_back():
+			if not frappe.db.exists("Custom Field", record.name):
+				frappe.get_doc(record).db_insert()
+			frappe.clear_cache(doctype="HD Ticket")
+
+		self.addCleanup(put_record_back)
+		before = make_ticket(subject="erp_ai T23 before rollback")
+		frappe.db.sql(
+			f"update `tabHD Ticket` set `{CREATED_LABELS_FIELD}`=%s where name=%s",
+			(LEFTOVER_LABELS, before.name),
+		)
+		# The rollback: DML on the record only, no DDL, so the column and its values stay.
+		frappe.db.delete("Custom Field", {"name": field.name})
+		frappe.clear_cache(doctype="HD Ticket")
+		self.assertFalse(frappe.get_meta("HD Ticket").has_field(CREATED_LABELS_FIELD))
+		self.assertTrue(frappe.db.has_column("HD Ticket", CREATED_LABELS_FIELD))
+
+		ticket = frappe.get_doc("HD Ticket", before.name)
+		ticket.subject = "erp_ai T23 saved after rollback"
+		ticket.save(ignore_permissions=True)
+		self.assertEqual(
+			frappe.db.get_value("HD Ticket", before.name, "subject"), "erp_ai T23 saved after rollback"
+		)
+		self.assertEqual(self._stored_labels(before.name), LEFTOVER_LABELS)
+		after = make_ticket(subject="erp_ai T23 after rollback")
+		self.assertTrue(frappe.db.exists("HD Ticket", after.name))
+		self.assertIsNone(self._stored_labels(after.name))
+
+		put_record_back()
+		self.assertTrue(frappe.get_meta("HD Ticket").has_field(CREATED_LABELS_FIELD))
+		self.assertEqual(_labels_field(), field)

@@ -28,6 +28,26 @@ PERMISSION_DOCTYPES = frozenset({"Custom Role", "Custom DocPerm", DOCTYPE_DOCTYP
 FORBIDDEN_ROLES = frozenset({"System Manager", "Administrator", ROLE_INSTRUCTOR, ROLE_AGENT, "Guest", "All"})
 PROTECTED_USERS = frozenset({"Administrator", "Guest", AGENT_USER})
 SECRET_FIELDS = frozenset({"new_password", "api_key", "api_secret", "reset_password_key"})
+# Whitelisted methods that hand back keys or passwords; `call_method` refuses them before the call.
+SECRET_METHODS = frozenset(
+	{
+		"frappe.core.doctype.user.user.generate_keys",
+		"frappe.client.get_password",
+		"frappe.utils.password.get_decrypted_password",
+		"frappe.utils.backups.get_backup_encryption_key",
+		"frappe.integrations.oauth2.get_token",
+	}
+)
+# A method whose last dotted segment holds one of these is refused too.
+SECRET_METHOD_WORDS = ("password", "generate_keys", "secret")
+SECRET_METHOD_REASON = "hàm này trả khóa API hoặc mật khẩu, không gọi qua công cụ"
+# Keys whose value never reaches the model in a `call_method` result, compared casefolded.
+SECRET_RESULT_KEYS = frozenset(
+	key.casefold()
+	for key in SECRET_FIELDS
+	| {"password", "secret", "token", "access_token", "refresh_token", "client_secret", "encryption_key"}
+)
+SCRUBBED_VALUE = "[đã ẩn]"
 SYSTEM_FIELDS = frozenset(
 	{"doctype", "docstatus", "owner", "creation", "modified", "modified_by", "idx", "parent", "parenttype"}
 )
@@ -238,11 +258,48 @@ def submit_record(args: dict, ctx: ToolContext) -> dict:
 	return _write(doctype, run)
 
 
+def _is_secret_method(method: str) -> bool:
+	last_segment = method.rsplit(".", 1)[-1].casefold()
+	return method in SECRET_METHODS or any(word in last_segment for word in SECRET_METHOD_WORDS)
+
+
+def _parsed(value):
+	"""`value` with every string that parses as a JSON object or array replaced by its parsed form, recursively."""
+	if isinstance(value, str):
+		try:
+			loaded = json.loads(value)
+		except ValueError:
+			return value
+		return _parsed(loaded) if isinstance(loaded, dict | list) else value
+	if isinstance(value, dict):
+		return {str(key): _parsed(item) for key, item in value.items()}
+	if isinstance(value, list | tuple):
+		return [_parsed(item) for item in value]
+	return value
+
+
+def _scrub(value):
+	"""`value` with the value of every key in SECRET_RESULT_KEYS replaced, in nested dicts, lists and tuples."""
+	if isinstance(value, dict):
+		return {
+			key: SCRUBBED_VALUE
+			if isinstance(key, str) and key.casefold() in SECRET_RESULT_KEYS
+			else _scrub(item)
+			for key, item in value.items()
+		}
+	if isinstance(value, list | tuple):
+		return [_scrub(item) for item in value]
+	return value
+
+
 def _method_refusal(method: str, arguments: dict) -> dict | None:
+	"""Early refusal only: the app's DocTypes are closed for the agent account by their controllers."""
 	if method.startswith(OWN_APP_PREFIX):
 		return _fail("không gọi hàm của erp_ai qua công cụ")
-	text = json.dumps(arguments, ensure_ascii=False, default=str)
-	if any(doctype in text for doctype in always_denied_doctypes()):
+	if _is_secret_method(method):
+		return _fail(SECRET_METHOD_REASON)
+	text = json.dumps(_parsed(arguments), ensure_ascii=False, default=str).casefold()
+	if any(doctype.casefold() in text for doctype in always_denied_doctypes()):
 		return _fail("tham số nhắc tới DocType không được phép dùng qua công cụ")
 	return None
 
@@ -265,7 +322,7 @@ def call_method(args: dict, ctx: ToolContext) -> dict:
 	written = _write(None, run)
 	if not written["ok"]:
 		return written
-	return {"ok": True, "method": method, "result": outcome["result"]}
+	return {"ok": True, "method": method, "result": _scrub(outcome["result"])}
 
 
 def get_record(args: dict, ctx: ToolContext) -> dict:
@@ -449,7 +506,8 @@ TOOLS: list[ToolSpec] = [
 			"name": "api_call_method",
 			"description": (
 				"Gọi một hàm whitelist của Frappe hoặc app khác bằng đường dẫn Python đầy đủ "
-				"(ví dụ frappe.client.get_value), arguments là object tham số. Không gọi được hàm của erp_ai."
+				"(ví dụ frappe.client.get_value), arguments là object tham số. Không gọi được hàm của erp_ai hay hàm trả khóa API, mật khẩu; "
+				"giá trị khóa và mật khẩu trong kết quả được ẩn."
 			),
 			"input_schema": {
 				"type": "object",

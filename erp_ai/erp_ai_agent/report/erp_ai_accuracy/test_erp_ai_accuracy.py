@@ -5,9 +5,11 @@ from unittest.mock import patch
 
 import frappe
 from frappe.tests.utils import FrappeTestCase
-from frappe.utils import add_days, getdate, now_datetime
+from frappe.utils import add_days, get_datetime, getdate, now_datetime
+from helpdesk.test_utils import make_ticket
 
-from erp_ai.constants import CATEGORIES, LOG_DOCTYPE
+from erp_ai.constants import AGENT_USER, CATEGORIES, LOG_DOCTYPE
+from erp_ai.erp_ai_agent.report.erp_ai_accuracy import erp_ai_accuracy
 from erp_ai.erp_ai_agent.report.erp_ai_accuracy.erp_ai_accuracy import (
 	GATE_MIN_ACCURACY,
 	GATE_MIN_SAMPLE,
@@ -16,7 +18,7 @@ from erp_ai.erp_ai_agent.report.erp_ai_accuracy.erp_ai_accuracy import (
 	execute,
 	l0_l1_gate,
 )
-from erp_ai.test_utils import keep_agent_settings, make_log_entry
+from erp_ai.test_utils import keep_agent_settings, make_log_entry, set_agent_settings
 
 PREFIX = "ERPAI-TEST-"
 REPORT = "ERP AI Accuracy"
@@ -68,7 +70,7 @@ class AccuracyTestCase(FrappeTestCase):
 		return {"from_date": add_days(getdate(self.now), -60), "to_date": getdate(self.now)}
 
 	def _rows(self, filters=None):
-		_, data = execute(filters or self._filters())
+		_, data, *_ = execute(filters or self._filters())
 		return {row["category"]: row for row in data}
 
 
@@ -151,7 +153,7 @@ class TestAccuracyTenLogSample(AccuracyTestCase):
 				frappe.db.set_value(LOG_DOCTYPE, name, "entry_type", "reason")
 
 	def test_no_prediction_in_range_gives_empty_data(self):
-		columns, data = execute(self._filters())
+		columns, data, *_ = execute(self._filters())
 		self.assertEqual(data, [])
 		self.assertEqual([column["fieldname"] for column in columns], COLUMN_FIELDS)
 
@@ -185,7 +187,7 @@ class TestAccuracyFiltersAndColumns(AccuracyTestCase):
 		self.assertEqual(rows["Tổng"]["predictions"], 2)
 
 	def test_columns_have_the_documented_fieldnames(self):
-		columns, _ = execute(self._filters())
+		columns, *_ = execute(self._filters())
 		self.assertEqual([column["fieldname"] for column in columns], COLUMN_FIELDS)
 		fieldtypes = {column["fieldname"]: column["fieldtype"] for column in columns}
 		self.assertEqual(fieldtypes["accuracy_pct"], "Percent")
@@ -361,7 +363,7 @@ class TestLabels(AccuracyTestCase):
 		self._classify("reason-row", None, entry_type="reason")
 		self._classify(None, None)
 		self._classify(None, "A")
-		_, data = execute(self._filters())
+		_, data, *_ = execute(self._filters())
 		self.assertEqual([row["category"] for row in data], [*CATEGORIES, "Tổng"])
 		self.assertEqual(self._numbers(data[-1]), (0, 0, 0, 1))
 		self.assertEqual([row["failed_runs"] for row in data[:-1]], [None] * len(CATEGORIES))
@@ -500,3 +502,176 @@ class TestGate(AccuracyTestCase):
 		):
 			result = l0_l1_gate()
 		self.assertEqual(result, GateResult("Đạt", 30, 30))
+
+
+SUMMARY_LABELS = ["Phân loại ≤ 5 phút", "Phân loại > 5 phút", "Chưa phân loại", "Cửa L0 → L1"]
+EXCLUDED_TEAM = f"{PREFIX}excluded-team"
+MINUTE = timedelta(minutes=1)
+
+
+class TestLatencySummary(AccuracyTestCase):
+	"""AC-17, D-8: classification latency of the tickets created in the range, in the report summary."""
+
+	def setUp(self):
+		super().setUp()
+		keep_agent_settings(self)
+		# off: inserting a ticket must not queue a run; the excluded team makes `can_send_ticket` false
+		set_agent_settings(enabled=0, excluded_teams=EXCLUDED_TEAM)
+		# far from real use of the site, so the tickets made here are the only ones in the range
+		self.now = datetime(2001, 1, 10, 12, 0, 0)
+		self.created = datetime(2001, 1, 10, 9, 0, 0)
+
+	def _ticket(self, created=None, **values):
+		"""A new ticket created at `created` (default 09:00 of the filter day); the group is left empty, so
+		the ticket is not full unless `values` set it."""
+		ticket = make_ticket(subject=f"{PREFIX}latency").name
+		frappe.db.set_value(
+			"HD Ticket",
+			ticket,
+			{"creation": created or self.created, "agent_group": "", **values},
+			update_modified=False,
+		)
+		return ticket
+
+	def _full_ticket(self, **values):
+		"""A ticket whose three classification fields are all set."""
+		return self._ticket(**{**PREDICTED, **values})
+
+	def _classify(self, ticket, after, category="A", created_labels=None):
+		"""A `classify` row of `ticket` created `after` its creation; `category=None` is a failed run."""
+		name = make_log_entry(
+			run_id=f"{PREFIX}{ticket}",
+			entry_type="classify",
+			predicted_category=category,
+			**(
+				{}
+				if category is None
+				else {f"predicted_{field}": value for field, value in PREDICTED.items()}
+			),
+		)
+		ticket_created = get_datetime(frappe.db.get_value("HD Ticket", ticket, "creation"))
+		values = {"creation": ticket_created + after, "ticket": ticket}
+		if created_labels is not None:
+			values["created_labels"] = json.dumps(created_labels)
+		frappe.db.set_value(LOG_DOCTYPE, name, values, update_modified=False)
+
+	def _day_filters(self, day=None):
+		day = day or getdate(self.created)
+		return {"from_date": day, "to_date": day}
+
+	def _summary(self, filters=None):
+		"""The report summary as {label: value}, with `now` fixed at `self.now`."""
+		with patch.object(erp_ai_accuracy, "now_datetime", return_value=self.now):
+			result = execute(filters or self._day_filters())
+		self.assertEqual(len(result), 5)
+		summary = result[4]
+		self.assertEqual([item["label"] for item in summary], SUMMARY_LABELS)
+		return {item["label"]: item["value"] for item in summary}
+
+	def _numbers(self, filters=None):
+		summary = self._summary(filters)
+		return tuple(summary[label] for label in SUMMARY_LABELS[:3])
+
+	def test_six_tickets_three_numbers(self):
+		# 1 min and exactly 5:00 are "≤ 5"; 6 min is "> 5"
+		self._classify(self._ticket(), MINUTE)
+		self._classify(self._ticket(), 5 * MINUTE)
+		self._classify(self._ticket(), 6 * MINUTE)
+		# a failed run and a ticket the bot never ran on: not classified
+		self._classify(self._ticket(), MINUTE, category=None)
+		self._ticket()
+		# skipped on purpose (the requester opted out): not counted, else "Chưa phân loại" would be 3
+		self._ticket(ai_opt_out=1)
+		self.assertEqual(
+			self._summary(),
+			dict(zip(SUMMARY_LABELS, [2, 1, 2, "Chưa đủ mẫu (0/0)"], strict=True)),
+		)
+
+	def test_five_minutes_and_one_second_is_over_five(self):
+		self._classify(self._ticket(), 5 * MINUTE + timedelta(seconds=1))
+		self.assertEqual(self._numbers(), (0, 1, 0))
+
+	def test_latency_is_measured_to_the_first_successful_row(self):
+		# a failed run at 1 min does not count as a result: the first success at 7 min does
+		failed_first = self._ticket()
+		self._classify(failed_first, MINUTE, category=None)
+		self._classify(failed_first, 7 * MINUTE)
+		# a later rerun at 10 min does not move the first success at 3 min
+		rerun = self._ticket()
+		self._classify(rerun, 3 * MINUTE)
+		self._classify(rerun, 10 * MINUTE)
+		self.assertEqual(self._numbers(), (1, 1, 0))
+
+	def test_tickets_skipped_on_purpose_are_not_counted(self):
+		# each one would change a number if it were counted
+		self._ticket(owner=AGENT_USER)
+		self._classify(self._ticket(ai_opt_out=1), MINUTE)
+		self._classify(self._ticket(agent_group=EXCLUDED_TEAM), 6 * MINUTE)
+		# full at creation: the three fields are set and the bot never ran ...
+		self._full_ticket()
+		# ... or the first successful row holds a label for each of the three fields (at 6 min, so that
+		# counting it and dropping the bot-filled ticket below cannot cancel out)
+		self._classify(self._ticket(), 6 * MINUTE, created_labels=PREDICTED)
+		# counted: two labels at creation only; fields the bot filled (no label at creation); never ran
+		self._classify(self._ticket(), MINUTE, created_labels={"ticket_type": "T1", "priority": "Low"})
+		self._classify(self._full_ticket(), 2 * MINUTE)
+		self._ticket()
+		self.assertEqual(self._numbers(), (2, 0, 1))
+
+	def test_success_after_the_range_end_still_gives_the_latency(self):
+		# created two minutes before the range ends, classified one minute after it: 3 minutes, "≤ 5"
+		end = datetime.combine(getdate(self.created) + DAY, datetime.min.time())
+		self.now = end + DAY
+		self._classify(self._ticket(created=end - 2 * MINUTE), 3 * MINUTE)
+		self.assertEqual(self._numbers(), (1, 0, 0))
+
+	def test_only_tickets_created_in_the_range_count(self):
+		start = datetime.combine(getdate(self.created), datetime.min.time())
+		second = timedelta(seconds=1)
+		# counted: the first second of the range and the last second of its last day
+		self._ticket(created=start)
+		self._ticket(created=start + DAY - second)
+		# not counted: one second before the range, the first second after it
+		self._ticket(created=start - second)
+		self._ticket(created=start + DAY)
+		self.assertEqual(self._numbers(), (0, 0, 2))
+
+	def _gate_row(self, created, correct):
+		"""A `classify` row of a new log-only ticket, created at `created`, labeled right or wrong."""
+		ticket = f"{PREFIX}gate-{next(TICKET_NUMBERS)}"
+		name = make_log_entry(
+			run_id=ticket,
+			entry_type="classify",
+			predicted_category="A",
+			**{f"predicted_{field}": value for field, value in PREDICTED.items()},
+		)
+		labels = PREDICTED if correct else {**PREDICTED, "priority": "High"}
+		frappe.db.set_value(
+			LOG_DOCTYPE,
+			name,
+			{"creation": created, "ticket": ticket, "created_labels": json.dumps(labels)},
+			update_modified=False,
+		)
+
+	def test_gate_item_does_not_follow_the_range(self):
+		# the range is a day long before the gate window: the gate still counts its own 14 days
+		for _ in range(GATE_MIN_SAMPLE):
+			self._gate_row(self.now - DAY, correct=True)
+		summary = self._summary(self._day_filters(getdate(self.now - 30 * DAY)))
+		self.assertEqual(summary["Cửa L0 → L1"], "Đạt (30/30)")
+
+	def test_gate_item_stops_at_now_inside_the_range(self):
+		# the range is today: rows up to `now` (included) count, a row one second later does not
+		for _ in range(GATE_MIN_SAMPLE - 1):
+			self._gate_row(self.now - DAY, correct=True)
+		self._gate_row(self.now, correct=True)
+		self._gate_row(self.now + timedelta(seconds=1), correct=False)
+		self.assertEqual(self._summary(self._day_filters(getdate(self.now)))["Cửa L0 → L1"], "Đạt (30/30)")
+
+	def test_classify_rows_are_read_once(self):
+		self._classify(self._ticket(), MINUTE)
+		with patch.object(
+			erp_ai_accuracy, "_fetch_classify_rows", wraps=erp_ai_accuracy._fetch_classify_rows
+		) as fetch:
+			self._summary()
+		self.assertEqual(fetch.call_count, 1)

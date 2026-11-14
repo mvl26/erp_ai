@@ -7,9 +7,13 @@ import frappe
 from frappe import _
 from frappe.utils import add_days, get_datetime, getdate, now_datetime
 
-from erp_ai.constants import CATEGORIES, CLASSIFICATION_FIELDS, LOG_DOCTYPE
+from erp_ai.agent import policy
+from erp_ai.constants import AGENT_USER, CATEGORIES, CLASSIFICATION_FIELDS, LOG_DOCTYPE
 
 TOTAL_LABEL = "Tổng"
+LATENCY_LABELS = ("Phân loại ≤ 5 phút", "Phân loại > 5 phút", "Chưa phân loại")
+GATE_LABEL = "Cửa L0 → L1"
+LATENCY_LIMIT = timedelta(minutes=5)
 COUNT_KEYS = ("predictions", "labeled", "correct")
 GATE_WINDOW_DAYS = 14
 GATE_MIN_SAMPLE = 30
@@ -32,9 +36,18 @@ def l0_l1_gate(now: datetime | None = None) -> GateResult:
 	"Đạt"; otherwise "Chưa đạt".
 	"""
 	now = now or now_datetime()
+	return _gate_result(_fetch_classify_rows(_through(now)), now)
+
+
+def _through(moment: datetime) -> datetime:
+	"""The end for `_fetch_classify_rows` that keeps rows created at `moment` itself (it keeps rows before
+	its end)."""
+	return moment + timedelta(microseconds=1)
+
+
+def _gate_result(rows: list, now: datetime) -> GateResult:
+	"""`l0_l1_gate` over `rows`: the `classify` rows created up to `now`, oldest first."""
 	start = now - timedelta(days=GATE_WINDOW_DAYS)
-	# `_fetch_classify_rows` keeps rows before its end: one microsecond past `now` keeps `now` itself.
-	rows = _fetch_classify_rows(now + timedelta(microseconds=1))
 	labeled = correct = 0
 	for row in _first_successes(rows):
 		if get_datetime(row.creation) > start:
@@ -60,6 +73,9 @@ def execute(filters=None):
 	`classify` row without a predicted category in the range and no successful `classify` row up to its end.
 	Returns no data when the range holds neither a prediction nor a failed run.
 
+	The summary (AC-17, AC-18, D-8) always has the latency numbers of `_latency_counts` and the
+	`l0_l1_gate` verdict at the current time with `correct/labeled`.
+
 	Raises:
 		frappe.PermissionError: the user may not run reports on ERP AI Log.
 		frappe.ValidationError: a date is missing or `from_date` is after `to_date`.
@@ -69,11 +85,17 @@ def execute(filters=None):
 	start = datetime.combine(from_date, datetime.min.time())
 	# The end is the start of the day after `to_date`, so the whole last day counts.
 	end = datetime.combine(getdate(add_days(to_date, 1)), datetime.min.time())
-	rows = _fetch_classify_rows(end)
+	now = now_datetime()
+	# One read serves the gate (rows up to `now`), the range (rows before `end`) and the latency of the
+	# tickets created in the range (every row read, so a result after the range end still counts).
+	all_rows = _fetch_classify_rows(max(end, _through(now)))
+	gate = _gate_result([row for row in all_rows if get_datetime(row.creation) <= now], now)
+	rows = [row for row in all_rows if get_datetime(row.creation) < end]
+	summary = _summary(_latency_counts(all_rows, start, end), gate)
 	predictions = _first_predictions(rows, start)
 	failed_runs = _failed_runs(rows, start)
 	if not predictions and not failed_runs:
-		return _columns(), []
+		return _columns(), [], None, None, summary
 
 	counts = {category: dict.fromkeys(COUNT_KEYS, 0) for category in CATEGORIES}
 	for row in predictions:
@@ -93,7 +115,54 @@ def execute(filters=None):
 	)
 	for row in data:
 		row["accuracy_pct"] = _accuracy_pct(row)
-	return _columns(), data
+	return _columns(), data, None, None, summary
+
+
+def _latency_counts(rows: list, start: datetime, end: datetime) -> list[int]:
+	"""[≤ 5 min, > 5 min, not classified] over the tickets created in `[start, end)` (AC-17, D-8).
+
+	The latency is the `creation` of the ticket's first successful `classify` row in `rows` minus the
+	ticket's `creation`; exactly `LATENCY_LIMIT` is "≤ 5". Tickets skipped on purpose are not counted
+	(`_skipped_on_purpose`); the rest without a successful row are not classified.
+	"""
+	successes = {row.ticket: row for row in _first_successes(rows)}
+	counts = [0, 0, 0]
+	tickets = frappe.get_all(
+		"HD Ticket",
+		filters=[["creation", ">=", start], ["creation", "<", end]],
+		fields=["name", "creation", "owner", *policy.SEND_POLICY_FIELDS, *CLASSIFICATION_FIELDS],
+	)
+	for ticket in tickets:
+		success = successes.get(ticket.name)
+		if _skipped_on_purpose(ticket, success):
+			continue
+		if not success:
+			counts[2] += 1
+		elif get_datetime(success.creation) - get_datetime(ticket.creation) <= LATENCY_LIMIT:
+			counts[0] += 1
+		else:
+			counts[1] += 1
+	return counts
+
+
+def _skipped_on_purpose(ticket, success) -> bool:
+	"""Created by the agent, not sendable, or full at creation: every classification field has a label at
+	creation on the first successful row or, with no successful row, a value on the ticket."""
+	if ticket.owner == AGENT_USER or not policy.can_send_ticket(ticket):
+		return True
+	values = _parse_labels(success.created_labels) if success else ticket
+	return all(values.get(field) for field in CLASSIFICATION_FIELDS)
+
+
+def _summary(latency_counts: list[int], gate: GateResult) -> list[dict]:
+	items = [
+		{"label": label, "value": count, "datatype": "Int"}
+		for label, count in zip(LATENCY_LABELS, latency_counts, strict=True)
+	]
+	items.append(
+		{"label": GATE_LABEL, "value": f"{gate.verdict} ({gate.correct}/{gate.labeled})", "datatype": "Data"}
+	)
+	return items
 
 
 def label_outcome(prediction) -> tuple[bool, bool]:

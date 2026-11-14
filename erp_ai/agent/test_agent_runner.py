@@ -116,6 +116,10 @@ class RunnerTestBase(FrappeTestCase):
 		gateway_patch = patch("erp_ai.gateway.call_model", self.gateway)
 		gateway_patch.start()
 		self.addCleanup(gateway_patch.stop)
+		# The month's spend never comes from the shared site's live ERP AI Log rows (STD-TEST-6).
+		month_spend_patch = patch("erp_ai.agent.policy.month_spend_usd", return_value=0.0)
+		self.month_spend = month_spend_patch.start()
+		self.addCleanup(month_spend_patch.stop)
 
 	def _entries(self, **filters):
 		return frappe.get_all(
@@ -2784,13 +2788,15 @@ class TestRunnerChangeGrant(RunnerTestBase):
 		self.assertNotIn(CHANGE_TOOLS_BLOCK, system[0]["text"])
 
 	def test_over_budget_l3_drops_change_tools(self):
-		set_agent_settings(monthly_budget_usd=10, spent_this_month_usd=10.01)
+		set_agent_settings(monthly_budget_usd=10)
+		self.month_spend.return_value = 10.01
 		contexts = []
 		with patch.object(runner, "ToolContext", wraps=runner.ToolContext) as make_context:
 			names, system = self._call()
 			contexts.extend(make_context.call_args_list)
 
 		(made,) = contexts
+		self.month_spend.assert_called()
 		self.assertEqual(made.kwargs["effective_level"], "L1")
 		# the switch is on and an instructor exists: only the lowered level removes the change tools
 		self.assertIs(made.kwargs["change_enabled"], True)
@@ -2801,7 +2807,8 @@ class TestRunnerChangeGrant(RunnerTestBase):
 
 	def test_over_budget_l3_keeps_unrestricted_tools(self):
 		# AC-2 (c): the budget lowers L3 to L1, the full-power switch still grants every record tool.
-		set_agent_settings(monthly_budget_usd=10, spent_this_month_usd=10.01, unrestricted_enabled=1)
+		set_agent_settings(monthly_budget_usd=10, unrestricted_enabled=1)
+		self.month_spend.return_value = 10.01
 		names, system = self._call()
 
 		self.assertEqual(
@@ -2834,7 +2841,8 @@ class TestRunnerChangeGrant(RunnerTestBase):
 		self.assertEqual(len(names), len(set(names)))
 
 	def test_over_budget_edge_spent_equal_to_budget_keeps_change_tools(self):
-		set_agent_settings(monthly_budget_usd=10, spent_this_month_usd=10)
+		set_agent_settings(monthly_budget_usd=10)
+		self.month_spend.return_value = 10.0
 		names, system = self._call()
 
 		self.assertEqual([name for name in names if name in CHANGE_TOOL_NAMES], CHANGE_TOOL_NAMES)

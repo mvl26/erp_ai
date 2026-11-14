@@ -1938,7 +1938,26 @@ GENERIC_DOC_CALLS = ("get_doc", "delete_doc")
 GENERIC_WRITE_CALLS = ("save", "delete")
 DENY_SET_SUFFIX = "DENIED_DOCTYPES"
 SITE_API_FILE = "agent/tools/site_api.py"
-SITE_API_DENY_SETS = ("DENIED_DOCTYPES", "ALWAYS_DENIED_DOCTYPES")
+# ADR-023 Quyết định 3: site_api derives its deny sets; it never writes the app's DocType names by hand.
+APP_DOCTYPE_CONSTANTS = ("SETTING_DOCTYPE", "CREDENTIAL_DOCTYPE", "LOG_DOCTYPE", PROPOSAL_DOCTYPE_CONSTANT)
+APP_DOCTYPE_NAMES = ("ERP AI Setting", "ERP AI Credential", "ERP AI Log", PROPOSAL_DOCTYPE_NAME)
+SET_LITERAL_CALLS = ("set", "frozenset", "tuple", "list")
+SITE_API_ALWAYS_DENIED = "always_denied_doctypes"
+# The calls that yield a derived deny set: site_api's own function and read.denied_doctypes().
+SITE_API_DENY_SOURCES = (SITE_API_ALWAYS_DENIED, "denied_doctypes")
+# Where the derived set comes from: the app's module, or read.denied_doctypes() (ADR-023 Ràng buộc).
+SITE_API_DERIVED_FROM = ("AI_MODULE", "denied_doctypes")
+SITE_API_TOOL_PREFIX = "api_"
+SITE_API_WRITE_CALLS = (
+	"save",
+	"insert",
+	"delete",
+	"delete_doc",
+	"submit",
+	"cancel",
+	"call",
+	*PROPOSAL_SAVE_CALLS,
+)
 
 
 def check_transitions_imported_only_by_controller_and_changes(sources: dict) -> list:
@@ -2221,18 +2240,179 @@ def _deny_sets(tree: ast.AST) -> dict:
 	return found
 
 
+def _names_app_doctype(node) -> bool:
+	return (isinstance(node, ast.Constant) and node.value in APP_DOCTYPE_NAMES) or (
+		isinstance(node, ast.Name | ast.Attribute) and referenced_name(node) in APP_DOCTYPE_CONSTANTS
+	)
+
+
+def _literal_names_app_doctype(node) -> bool:
+	"""`node` holds a set/tuple/list literal (bare or inside set()/frozenset()/...) naming an app DocType."""
+	for inner in ast.walk(node):
+		if isinstance(inner, ast.Set | ast.Tuple | ast.List) and any(
+			_names_app_doctype(e) for e in inner.elts
+		):
+			return True
+		if (
+			isinstance(inner, ast.Call)
+			and referenced_name(inner.func) in SET_LITERAL_CALLS
+			and any(_names_app_doctype(arg) for arg in inner.args)
+		):
+			return True
+	return False
+
+
+def _removes_app_doctype(node) -> bool:
+	"""`node` takes an app DocType out of a set: `x - {PROPOSAL_DOCTYPE}` or `x.difference(...)`."""
+	for inner in ast.walk(node):
+		if isinstance(inner, ast.BinOp) and isinstance(inner.op, ast.Sub):
+			if any(_names_app_doctype(part) for part in ast.walk(inner.right)):
+				return True
+		elif isinstance(inner, ast.Call) and referenced_name(inner.func) == "difference":
+			if any(_names_app_doctype(part) for arg in inner.args for part in ast.walk(arg)):
+				return True
+	return False
+
+
+def _module_functions(tree: ast.AST) -> dict:
+	return {node.name: node for node in tree.body if isinstance(node, ast.FunctionDef)}
+
+
+def _called_names(node) -> set:
+	return {referenced_name(call.func) for call in ast.walk(node) if isinstance(call, ast.Call)} - {None}
+
+
+def _reaches(node, targets: tuple, functions: dict, seen=frozenset()) -> bool:
+	"""`node` calls one of `targets`, directly or through the module's own functions."""
+	for name in _called_names(node):
+		if name in targets:
+			return True
+		if (
+			name in functions
+			and name not in seen
+			and _reaches(functions[name], targets, functions, seen | {name})
+		):
+			return True
+	return False
+
+
+def _returns_deny_set(name: str, functions: dict, seen=frozenset()) -> bool:
+	"""A deny source, or a module function whose every `return` value is built from a deny source."""
+	if name in SITE_API_DENY_SOURCES:
+		return True
+	function = functions.get(name)
+	if function is None or name in seen:
+		return False
+	returns = [node for node in ast.walk(function) if isinstance(node, ast.Return)]
+	return bool(returns) and all(
+		node.value is not None
+		and not _removes_app_doctype(node.value)
+		and any(_returns_deny_set(called, functions, seen | {name}) for called in _called_names(node.value))
+		for node in returns
+	)
+
+
+def _is_deny_gate(statement, functions: dict, seen=frozenset()) -> bool:
+	"""`if <test>: ... return` where the test calls a deny set, or a module function that has such a gate itself."""
+	if not isinstance(statement, ast.If) or not any(isinstance(node, ast.Return) for node in statement.body):
+		return False
+	if _removes_app_doctype(statement.test):
+		return False
+	return any(
+		_returns_deny_set(name, functions) or _has_deny_gate(name, functions, seen)
+		for name in _called_names(statement.test)
+	)
+
+
+def _has_deny_gate(name: str, functions: dict, seen=frozenset()) -> bool:
+	function = functions.get(name)
+	if function is None or name in seen:
+		return False
+	return any(_is_deny_gate(node, functions, seen | {name}) for node in ast.walk(function))
+
+
+def _site_api_handlers(tree: ast.AST) -> dict:
+	"""`{tool name: handler name}` of every `ToolSpec(name="api_...", handler=...)`."""
+	handlers = {}
+	for node in ast.walk(tree):
+		if not (isinstance(node, ast.Call) and referenced_name(node.func) == "ToolSpec"):
+			continue
+		keywords = {keyword.arg: keyword.value for keyword in node.keywords}
+		tool, handler = keywords.get("name"), keywords.get("handler")
+		if (
+			isinstance(tool, ast.Constant)
+			and isinstance(tool.value, str)
+			and tool.value.startswith(SITE_API_TOOL_PREFIX)
+		):
+			# Only a bare name is a function of this module; `other.handler` cannot be proven here.
+			handlers[tool.value] = handler.id if isinstance(handler, ast.Name) else None
+	return handlers
+
+
+def _site_api_deny_violations(rel: str, tree: ast.AST) -> list:
+	"""ADR-023 Quyết định 3 / ADR-011: site_api has no hand-written set of the app's DocTypes; the always-denied
+	set is derived from the app's module; every `api_*` handler is refused by that derived set before any write."""
+	violations = [
+		violation(
+			rel, node, "hand-written set of the app's DocTypes in site_api, derive the deny set (ADR-023)"
+		)
+		for node in tree.body
+		if isinstance(node, ast.Assign | ast.AnnAssign)
+		and node.value is not None
+		and _literal_names_app_doctype(node.value)
+	]
+	functions = _module_functions(tree)
+	always = functions.get(SITE_API_ALWAYS_DENIED)
+	if always is None:
+		violations.append(
+			f"{rel}: no {SITE_API_ALWAYS_DENIED}() deny set derived from the app's module (ADR-023)"
+		)
+	elif _literal_names_app_doctype(always) or not any(
+		referenced_name(node) in SITE_API_DERIVED_FROM for node in ast.walk(always)
+	):
+		violations.append(
+			violation(
+				rel, always, f"{SITE_API_ALWAYS_DENIED}() is not derived from the app's module (ADR-023)"
+			)
+		)
+	handlers = _site_api_handlers(tree)
+	if not handlers:
+		violations.append(
+			f"{rel}: saves/deletes any DocType but no {SITE_API_TOOL_PREFIX}* handler to check the deny gate"
+		)
+	for tool, name in handlers.items():
+		handler = functions.get(name)
+		if handler is None:
+			violations.append(f"{rel}: handler of {tool} is not a function of the module, deny gate unproven")
+			continue
+		gated = False
+		for statement in handler.body:
+			if _is_deny_gate(statement, functions):
+				gated = True
+				break
+			if isinstance(statement, ast.Return) or _reaches(statement, SITE_API_WRITE_CALLS, functions):
+				break
+		if not gated:
+			violations.append(
+				violation(
+					rel,
+					handler,
+					f"{tool} handler {name} writes or returns before the derived deny gate (ADR-011)",
+				)
+			)
+	return violations
+
+
 def _proposal_deny_violations(rel: str, tree: ast.AST) -> list:
-	"""ADR-011: a tool writing any DocType keeps the proposal out through its deny sets (both sets for site_api)."""
+	"""ADR-011: a tool writing any DocType keeps the proposal out through its deny sets; site_api through the
+	derived deny gate of ADR-023."""
 	if not _writes_any_doctype(tree):
 		return []
+	if rel == SITE_API_FILE:
+		return _site_api_deny_violations(rel, tree)
 	sets = _deny_sets(tree)
-	required = SITE_API_DENY_SETS if rel == SITE_API_FILE else ()
-	violations = [
-		f"{rel}: saves/deletes any DocType but has no {name} deny set (ADR-011)"
-		for name in required
-		if name not in sets
-	]
-	if not sets and not required:
+	violations = []
+	if not sets:
 		violations.append(
 			f"{rel}: saves/deletes any DocType but has no *{DENY_SET_SUFFIX} deny set (ADR-011)"
 		)
@@ -2251,7 +2431,8 @@ def _proposal_deny_violations(rel: str, tree: ast.AST) -> list:
 def check_tool_never_saves_proposal(sources: dict) -> list:
 	"""ADR-011 Ràng buộc: a tool only `.insert()`s a proposal. In agent/tools/**, a module that loads or creates a
 	proposal has no `.save(`/`db_set`/`set_value` at all; any other module never passes the proposal to one; a
-	module that saves/deletes a non-constant DocType has the proposal in every `*DENIED_DOCTYPES` set."""
+	module that saves/deletes a non-constant DocType has the proposal in every `*DENIED_DOCTYPES` set; site_api
+	instead refuses every `api_*` call through its derived deny set before any write (ADR-023)."""
 	violations = []
 	for rel, source in only_python(scoped(sources, TOOLS_PREFIX)).items():
 		tree = parse(rel, source)
@@ -4326,24 +4507,10 @@ class TestScannersCatchViolations(unittest.TestCase):
 		saves = "def save(doctype, name):\n\tdoc = frappe.get_doc(doctype, name)\n\tdoc.save()\n"
 		generic = {
 			"no deny set": ("agent/tools/site_api.py", saves),
-			"denied set lacks it": (
-				"agent/tools/site_api.py",
-				"DENIED_DOCTYPES = {'User'}\nALWAYS_DENIED_DOCTYPES = frozenset({PROPOSAL_DOCTYPE})\n"
-				+ saves,
-			),
-			"always-denied set lacks it": (
-				"agent/tools/site_api.py",
-				"DENIED_DOCTYPES = {PROPOSAL_DOCTYPE}\nALWAYS_DENIED_DOCTYPES = frozenset({LOG_DOCTYPE})\n"
-				+ saves,
-			),
-			"always-denied set missing": (
-				"agent/tools/site_api.py",
-				"DENIED_DOCTYPES = {PROPOSAL_DOCTYPE}\n" + saves,
-			),
+			"denied set lacks it": ("agent/tools/cleanup.py", "DENIED_DOCTYPES = {'User'}\n" + saves),
 			"subtracted from the set": (
-				"agent/tools/site_api.py",
-				"DENIED_DOCTYPES = (read.DENIED_DOCTYPES | {'X'}) - {PROPOSAL_DOCTYPE}\n"
-				"ALWAYS_DENIED_DOCTYPES = frozenset({PROPOSAL_DOCTYPE})\n" + saves,
+				"agent/tools/cleanup.py",
+				"DENIED_DOCTYPES = (read.DENIED_DOCTYPES | {'X'}) - {PROPOSAL_DOCTYPE}\n" + saves,
 			),
 			"delete_doc in another tool": (
 				"agent/tools/cleanup.py",
@@ -4369,11 +4536,12 @@ class TestScannersCatchViolations(unittest.TestCase):
 			"agent/tools/write_ticket.py": "doc = frappe.get_doc('HD Ticket', n)\ndoc.save()\n",
 			"agent/tools/route_ticket.py": "doc = frappe.get_doc(TICKET_DOCTYPE, ctx.ticket_name)\ndoc.save()\n",
 			# A tool saving or deleting any DocType keeps the proposal in every deny set (ADR-011).
-			"agent/tools/site_api.py": (
+			"agent/tools/write_any.py": (
 				"DENIED_DOCTYPES = (read.DENIED_DOCTYPES - {'User'}) | {PROPOSAL_DOCTYPE, 'Custom Role'}\n"
-				"ALWAYS_DENIED_DOCTYPES = frozenset({SETTING_DOCTYPE, PROPOSAL_DOCTYPE})\n"
 				"doc = frappe.get_doc(doctype, name)\ndoc.save()\nfrappe.delete_doc(doctype, name)\n"
 			),
+			# site_api refuses through the derived deny gate (ADR-023).
+			SITE_API_FILE: SITE_API_GATED,
 			# A generic loader that never saves or deletes needs no deny set.
 			"agent/tools/read.py": "doc = frappe.get_doc(doctype, name)\nreturn doc.as_dict()\n",
 			"agent/tools/cleanup.py": "DENIED_DOCTYPES = {'ERP AI Change Proposal'}\nfrappe.delete_doc(doctype, name)\n",
@@ -4381,6 +4549,124 @@ class TestScannersCatchViolations(unittest.TestCase):
 			"agent/changes/transitions.py": "frappe.db.set_value(PROPOSAL_DOCTYPE, name, values)\n",
 		}
 		self.assertEqual(check_tool_never_saves_proposal(clean), [])
+
+	def test_site_api_hand_written_app_doctype_set_caught(self):
+		cases = {
+			"frozenset of a constant": "ALWAYS_DENIED_DOCTYPES = frozenset({PROPOSAL_DOCTYPE})\n",
+			"set literal of a string": "DENIED = {'ERP AI Change Proposal', 'User'}\n",
+			"tuple of constants": "APP_DOCTYPES = (SETTING_DOCTYPE, constants.CREDENTIAL_DOCTYPE)\n",
+			"annotated list": "APP: list = ['ERP AI Log']\n",
+			"union with a derived set": "DENIED = read.DENIED_DOCTYPES | {LOG_DOCTYPE}\n",
+		}
+		for name, line in cases.items():
+			with self.subTest(case=name):
+				self.assertCaught(
+					check_tool_never_saves_proposal({SITE_API_FILE: line + SITE_API_GATED}),
+					f"{SITE_API_FILE}:1:",
+					"ADR-023",
+				)
+
+	def test_site_api_hand_written_app_doctype_set_clean(self):
+		# Sets of other DocTypes and a single constant stay allowed; only a set naming the app's DocTypes is caught.
+		source = (
+			"PERMISSION_DOCTYPES = frozenset({'Custom Role', DOCTYPE_DOCTYPE, ROLE_DOCTYPE})\n"
+			"FORCED_VALUES = {'Server Script': {'disabled': 1}}\n"
+			"OWN = PROPOSAL_DOCTYPE\n" + SITE_API_GATED
+		)
+		self.assertEqual(check_tool_never_saves_proposal({SITE_API_FILE: source}), [])
+
+	def test_site_api_always_denied_not_derived_caught(self):
+		derived = 'return frozenset(frappe.get_all("DocType", {"module": read.AI_MODULE}, pluck="name"))'
+		cases = {
+			"missing": (
+				SITE_API_GATED.replace("def always_denied_doctypes", "def other_doctypes"),
+				"no always_",
+			),
+			"hand-written inside": (
+				SITE_API_GATED.replace(derived, "return frozenset({SETTING_DOCTYPE, PROPOSAL_DOCTYPE})"),
+				"not derived",
+			),
+			"not from the app module": (
+				SITE_API_GATED.replace("read.AI_MODULE", "'Core'"),
+				"not derived",
+			),
+		}
+		for name, (source, fragment) in cases.items():
+			with self.subTest(case=name):
+				self.assertNotEqual(source, SITE_API_GATED)
+				self.assertCaught(
+					check_tool_never_saves_proposal({SITE_API_FILE: source}), fragment, "ADR-023"
+				)
+
+	def test_site_api_handler_without_deny_gate_caught(self):
+		gate = "\tif refusal := _refusal(doctype, ctx):\n\t\treturn refusal\n"
+		read_tool = (
+			"def get_record(args, ctx):\n\treturn frappe.get_doc(args['doctype'], args['name']).as_dict()\n"
+			"TOOLS.append(ToolSpec(name='api_get_record', handler=get_record))\n"
+		)
+		cases = {
+			"save before the gate": SITE_API_GATED.replace(
+				gate, "\tfrappe.get_doc(doctype, 'x').save()\n" + gate
+			),
+			"no gate": SITE_API_GATED.replace(gate, ""),
+			# review-31: calling the deny set without refusing on it proves nothing.
+			"deny set called, not gated": SITE_API_GATED.replace(gate, "\t_refusal(doctype, ctx)\n"),
+			"refusal never returns": SITE_API_GATED.replace(
+				"\t\treturn {'ok': False, 'reason': 'không được phép'}\n\treturn None\n",
+				"\t\tlogger.info(doctype)\n\treturn None\n",
+			),
+			"proposal taken out of the set": SITE_API_GATED.replace(
+				"read.denied_doctypes() - {'User'}", "read.denied_doctypes() - {PROPOSAL_DOCTYPE}"
+			),
+			"read handler returns before the gate": SITE_API_GATED + read_tool,
+		}
+		for name, source in cases.items():
+			with self.subTest(case=name):
+				self.assertNotEqual(source, SITE_API_GATED)
+				self.assertCaught(
+					check_tool_never_saves_proposal({SITE_API_FILE: source}), "before the derived deny gate"
+				)
+		no_tools = SITE_API_GATED.split("TOOLS = ")[0]
+		self.assertCaught(check_tool_never_saves_proposal({SITE_API_FILE: no_tools}), "deny gate")
+		elsewhere = SITE_API_GATED.replace("handler=call_method", "handler=other.call_method")
+		self.assertCaught(check_tool_never_saves_proposal({SITE_API_FILE: elsewhere}), "deny gate unproven")
+
+	def test_site_api_handlers_behind_deny_gate_clean(self):
+		# The real module is held to the same rule by TestArchitecture.test_tool_never_saves_proposal.
+		self.assertEqual(check_tool_never_saves_proposal({SITE_API_FILE: SITE_API_GATED}), [])
+
+
+# A minimal site_api: derived always-denied set, a refusal gating on it, two handlers gated before writing.
+SITE_API_GATED = """def always_denied_doctypes():
+	return frozenset(frappe.get_all("DocType", {"module": read.AI_MODULE}, pluck="name"))
+
+def _denied(ctx):
+	if ctx.unrestricted:
+		return always_denied_doctypes()
+	return frozenset(read.denied_doctypes() - {'User'}) | PERMISSION_DOCTYPES
+
+def _refusal(doctype, ctx):
+	if doctype in _denied(ctx):
+		return {'ok': False, 'reason': 'không được phép'}
+	return None
+
+def update_record(args, ctx):
+	doctype = args['doctype']
+	if refusal := _refusal(doctype, ctx):
+		return refusal
+	doc = frappe.get_doc(doctype, args['name'])
+	doc.save()
+
+def call_method(args, ctx):
+	if any(name in str(args) for name in always_denied_doctypes()):
+		return {'ok': False}
+	return frappe.call(args['method'])
+
+TOOLS = [
+	ToolSpec(name='api_update_record', handler=update_record),
+	ToolSpec(name='api_call_method', handler=call_method),
+]
+"""
 
 
 if __name__ == "__main__":

@@ -199,6 +199,27 @@ def as_deadline(value: date | datetime | None) -> datetime | None:
 	return datetime.combine(value, time(23, 59, 59))
 
 
+def response_overdue(
+	created: datetime, first_responded_on: datetime | None, category: str | None, config: dict, now: datetime
+) -> bool:
+	"""True when nobody has responded yet and now is strictly past created + the category's response_min."""
+	if first_responded_on:
+		return False
+	response_min = (((config or {}).get("expected_sla") or {}).get(category) or {}).get("response_min")
+	if response_min is None:
+		return False
+	return now > created + timedelta(minutes=response_min)
+
+
+def processing_deadline(
+	category: str | None, resolution_by: datetime | None, due_at: date | datetime | None
+) -> datetime | None:
+	"""D/E with a due value -> that due as a moment; otherwise the Helpdesk resolution_by (D-18)."""
+	if category in ("D", "E") and as_deadline(due_at):
+		return as_deadline(due_at)
+	return resolution_by
+
+
 def _rank(priority: str) -> int:
 	return PRIORITIES.index(priority) if priority in PRIORITIES else -1
 

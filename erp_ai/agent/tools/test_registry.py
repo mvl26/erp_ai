@@ -11,7 +11,8 @@ from helpdesk.test_utils import create_agent, make_ticket
 from erp_ai.agent.tools import registry, route_ticket
 from erp_ai.agent.tools.registry import ToolContext, ToolSpec, execute_tool, get_tool_schemas
 from erp_ai.agent.tools.source import GIT_SUBCOMMANDS
-from erp_ai.constants import ROLE_AGENT
+from erp_ai.constants import PROPOSAL_DOCTYPE, ROLE_AGENT
+from erp_ai.test_utils import GitSandbox
 
 REAL_ALL_SPECS = registry._all_specs
 AGENT_EMAIL = "erpai-test-t27.agent@example.com"
@@ -85,7 +86,7 @@ def _specs_with_change():
 	return [*_specs(), _spec("do_change", "change_propose")]
 
 
-def _context(level="L1", instructor=None, change_enabled=False):
+def _context(level="L1", instructor=None, change_enabled=False, unrestricted=False):
 	return ToolContext(
 		ticket_name="TKT-1",
 		effective_level=level,
@@ -94,6 +95,7 @@ def _context(level="L1", instructor=None, change_enabled=False):
 		category_mapping={},
 		agent_user="ai.agent@miyano.com.vn",
 		change_enabled=change_enabled,
+		unrestricted=unrestricted,
 	)
 
 
@@ -197,6 +199,15 @@ class TestRegistry(FrappeTestCase):
 			result = execute_tool("do_read", arguments, _context())
 			self.assertEqual(result["reason"], f"tham số không hợp lệ: {key}", arguments)
 
+	def test_execute_rejects_non_object_for_object_rule(self):
+		specs = [_spec("do_read", "read", {"values": {"type": "object"}})]
+		with patch.object(registry, "_all_specs", lambda: specs):
+			for given in (["a"], "a", 1, None):
+				result = execute_tool("do_read", {"values": given}, _context())
+				self.assertEqual(result, {"ok": False, "reason": "tham số không hợp lệ: values"}, given)
+			accepted = execute_tool("do_read", {"values": {"a": 1}}, _context())
+		self.assertTrue(accepted["ok"])
+
 	def test_invalid_reason_cuts_model_supplied_key(self):
 		result = execute_tool("do_read", {"query": "abc", "x" * 5000: 1}, _context())
 		self.assertFalse(result["ok"])
@@ -296,7 +307,9 @@ class TestRegistry(FrappeTestCase):
 		for function in (registry._granted_specs, get_tool_schemas, registry.grants_change_tools):
 			parameters = inspect.signature(function).parameters
 			self.assertEqual(
-				list(parameters), ["effective_level", "has_instructor", "change_enabled"], function.__name__
+				list(parameters),
+				["effective_level", "has_instructor", "change_enabled", "unrestricted"],
+				function.__name__,
 			)
 			self.assertIs(parameters["change_enabled"].default, inspect.Parameter.empty, function.__name__)
 
@@ -368,10 +381,31 @@ TICKET_WRITE_TOOL_NAMES = ["set_classification", "set_resolution_hint", "post_co
 TASK_WRITE_TOOL_NAMES = ["create_task"]
 CREATED_NOTE = "<note made by api_create_record>"
 CHANGE_TOOL_NAMES = ["propose_file_change", "propose_new_file", "propose_bench_command"]
-APP_NOT_ALLOWED = "app không có trong danh sách được sửa"
+SANDBOX_APP = "custom_app"
 SITE_ADMIN_TOOL_NAMES = ["api_list_records", "api_get_record", "api_create_record", "api_update_record"]
 FORBIDDEN_WRITE_PARAMETER_WORDS = ("doctype", "field")
 SCHEMA_TYPES = {"string", "integer", "boolean", "array", "object"}
+# Written out by hand, not read from registry.TOOL_MODULES: module -> its tool names, in order.
+TOOLS_BY_MODULE = {
+	"erp_ai.agent.tools.read": ["get_ticket", "list_comments", "search_resolved_tickets", "get_record"],
+	"erp_ai.agent.tools.source": ["search_source", "read_source", "git_source"],
+	"erp_ai.agent.tools.write_ticket": [
+		"set_classification",
+		"set_resolution_hint",
+		"post_comment",
+		"create_task",
+	],
+	"erp_ai.agent.tools.propose_change": ["propose_file_change", "propose_new_file", "propose_bench_command"],
+	"erp_ai.agent.tools.site_api": [
+		"api_list_records",
+		"api_get_record",
+		"api_create_record",
+		"api_update_record",
+		"api_delete_record",
+		"api_submit_record",
+		"api_call_method",
+	],
+}
 
 
 class TestRealToolSet(FrappeTestCase):
@@ -391,6 +425,17 @@ class TestRealToolSet(FrappeTestCase):
 			self.assertEqual(self.names(level, False), granted)
 			self.assertEqual(self.names(level, True), granted + TASK_WRITE_TOOL_NAMES)
 		self.assertEqual(len(registry._all_specs()), 21)
+
+	def test_tool_modules_register_exactly_the_21_tools(self):
+		# Spec Amendment 2, N-3 items 18-19: 11 base + 3 propose + 4 record + 3 full-power tools.
+		self.assertEqual(registry.TOOL_MODULES, tuple(TOOLS_BY_MODULE))
+		self.assertNotIn("erp_ai.agent.tools.route_ticket", registry.TOOL_MODULES)
+		for module_name, names in TOOLS_BY_MODULE.items():
+			module = importlib.import_module(module_name)
+			self.assertEqual([spec.name for spec in module.TOOLS], names, module_name)
+		expected = [name for names in TOOLS_BY_MODULE.values() for name in names]
+		self.assertEqual(len(expected), 21)
+		self.assertEqual([spec.name for spec in registry._all_specs()], expected)
 
 	def test_switch_on_adds_site_admin_tools_only_at_l3_with_instructor(self):
 		base = READ_TOOL_NAMES + SOURCE_TOOL_NAMES + TICKET_WRITE_TOOL_NAMES
@@ -495,6 +540,9 @@ class TestRealToolsRunWithoutCommit(FrappeTestCase):
 		self.assertFalse(frappe.db.exists("HD Ticket Type", SEED_TYPE))
 		frappe.get_doc({"doctype": "HD Ticket Type", "name": SEED_TYPE}).insert()
 		self.ticket = make_ticket(subject="ERPAI-TEST-T27 phiếu", raised_by=AGENT_EMAIL).name
+		# Every source and file tool reads the temp repos only; the file tools may edit SANDBOX_APP.
+		sandbox = GitSandbox(self, apps=("erp_ai", SANDBOX_APP), erp_ai_worktree=None)
+		sandbox.commit_file("erp_ai", "erp_ai/agent/tools/registry.py", "class ToolSpec:\n\tpass\n")
 
 	def arguments(self):
 		return {
@@ -510,11 +558,12 @@ class TestRealToolsRunWithoutCommit(FrappeTestCase):
 			"post_comment": {"content": "ERPAI-TEST-T27 bình luận"},
 			"create_task": {"subject": "ERPAI-TEST-T27 việc", "description": "ERPAI-TEST-T27 mô tả"},
 			"propose_file_change": {
-				"path": "erp_ai/README.md",
-				"edits": [{"old": "a", "new": "b"}],
+				"path": f"{SANDBOX_APP}/README.md",
+				"find": ["# "],
+				"replace": ["## "],
 				"reason": "ERPAI-TEST-T27",
 			},
-			"propose_new_file": {"path": "erp_ai/t27.md", "content": "x", "reason": "ERPAI-TEST-T27"},
+			"propose_new_file": {"path": f"{SANDBOX_APP}/t27.md", "content": "x", "reason": "ERPAI-TEST-T27"},
 			"propose_bench_command": {"command": "version", "reason": "ERPAI-TEST-T27"},
 			"api_list_records": {"doctype": "HD Ticket", "filters": [["name", "=", str(self.ticket)]]},
 			"api_get_record": {"doctype": "HD Ticket", "name": str(self.ticket)},
@@ -538,6 +587,7 @@ class TestRealToolsRunWithoutCommit(FrappeTestCase):
 			category_mapping={"A": {"ticket_type": SEED_TYPE}},
 			agent_user=AGENT_EMAIL,
 			change_enabled=True,
+			allowed_apps=(SANDBOX_APP,),
 			unrestricted=True,
 		)
 		arguments = self.arguments()
@@ -552,9 +602,6 @@ class TestRealToolsRunWithoutCommit(FrappeTestCase):
 			results[spec.name] = execute_tool(spec.name, call_arguments, context)
 		# The note is deleted before the submit call, so that handler ends at its own "missing record" refusal.
 		self.assertEqual(results.pop("api_submit_record")["reason"], "không tìm thấy bản ghi")
-		# No app is on the allowed list of this context: the two file tools end at the guard's refusal.
-		for name in ("propose_file_change", "propose_new_file"):
-			self.assertEqual(results.pop(name)["reason"], APP_NOT_ALLOWED)
 		for name, result in results.items():
 			# ok means the handler ran to its end: not a schema refusal, not "not granted", not a handler refusal.
 			self.assertTrue(result["ok"], f"{name}: {result}")
@@ -569,3 +616,135 @@ class TestRealToolsRunWithoutCommit(FrappeTestCase):
 		self.assertTrue(frappe.db.exists("Task", {"subject": "ERPAI-TEST-T27 việc"}))
 		self.assertFalse(frappe.db.exists("Note", {"title": "ERPAI-TEST-T27 ghi chú"}))
 		self.assertEqual(ticket.subject, "ERPAI-TEST-T27 phiếu đã sửa")
+		for name in ("propose_file_change", "propose_new_file"):
+			self.assertTrue(frappe.db.exists(PROPOSAL_DOCTYPE, results[name]["proposal"]), name)
+
+
+# Snapshot of the grant at 6d90e79, written by hand from the old two-function code
+# (get_tool_schemas + get_unrestricted_tool_schemas, as the runner merged them) before M4.
+SNAPSHOT_BASE = [
+	"get_ticket",
+	"list_comments",
+	"search_resolved_tickets",
+	"get_record",
+	"search_source",
+	"read_source",
+	"git_source",
+	"set_classification",
+	"set_resolution_hint",
+	"post_comment",
+]
+SNAPSHOT_WITH_TASK = [*SNAPSHOT_BASE, "create_task"]
+SNAPSHOT_RECORD = ["api_list_records", "api_get_record", "api_create_record", "api_update_record"]
+SNAPSHOT_FULL_POWER = ["api_delete_record", "api_submit_record", "api_call_method"]
+SNAPSHOT_PROPOSE = ["propose_file_change", "propose_new_file", "propose_bench_command"]
+# (change_enabled, unrestricted, level, has_instructor) -> granted tool names, in order.
+GRANT_SNAPSHOT = {
+	(False, False, "L0", False): [],
+	(False, False, "L0", True): [],
+	(False, False, "L1", False): SNAPSHOT_BASE,
+	(False, False, "L1", True): SNAPSHOT_WITH_TASK,
+	(False, False, "L2", False): SNAPSHOT_BASE,
+	(False, False, "L2", True): SNAPSHOT_WITH_TASK,
+	(False, False, "L3", False): SNAPSHOT_BASE,
+	(False, False, "L3", True): SNAPSHOT_WITH_TASK,
+	(False, True, "L0", False): [],
+	(False, True, "L0", True): [],
+	(False, True, "L1", False): SNAPSHOT_BASE,
+	(False, True, "L1", True): [*SNAPSHOT_WITH_TASK, *SNAPSHOT_RECORD, *SNAPSHOT_FULL_POWER],
+	(False, True, "L2", False): SNAPSHOT_BASE,
+	(False, True, "L2", True): [*SNAPSHOT_WITH_TASK, *SNAPSHOT_RECORD, *SNAPSHOT_FULL_POWER],
+	(False, True, "L3", False): SNAPSHOT_BASE,
+	(False, True, "L3", True): [*SNAPSHOT_WITH_TASK, *SNAPSHOT_RECORD, *SNAPSHOT_FULL_POWER],
+	(True, False, "L0", False): [],
+	(True, False, "L0", True): [],
+	(True, False, "L1", False): SNAPSHOT_BASE,
+	(True, False, "L1", True): SNAPSHOT_WITH_TASK,
+	(True, False, "L2", False): SNAPSHOT_BASE,
+	(True, False, "L2", True): SNAPSHOT_WITH_TASK,
+	(True, False, "L3", False): SNAPSHOT_BASE,
+	(True, False, "L3", True): [*SNAPSHOT_WITH_TASK, *SNAPSHOT_PROPOSE, *SNAPSHOT_RECORD],
+	(True, True, "L0", False): [],
+	(True, True, "L0", True): [],
+	(True, True, "L1", False): SNAPSHOT_BASE,
+	(True, True, "L1", True): [*SNAPSHOT_WITH_TASK, *SNAPSHOT_RECORD, *SNAPSHOT_FULL_POWER],
+	(True, True, "L2", False): SNAPSHOT_BASE,
+	(True, True, "L2", True): [*SNAPSHOT_WITH_TASK, *SNAPSHOT_RECORD, *SNAPSHOT_FULL_POWER],
+	(True, True, "L3", False): SNAPSHOT_BASE,
+	(True, True, "L3", True): [
+		*SNAPSHOT_WITH_TASK,
+		*SNAPSHOT_PROPOSE,
+		*SNAPSHOT_RECORD,
+		*SNAPSHOT_FULL_POWER,
+	],
+}
+NOT_GRANTED = {"ok": False, "reason": "tool không được cấp ở mức/thẩm quyền hiện tại"}
+
+
+class TestGrantTable(FrappeTestCase):
+	"""M4 (ADR-023 QĐ 4): one grant function, one GRANT_TABLE, `unrestricted` is its fourth input."""
+
+	def setUp(self):
+		self.addCleanup(frappe.db.rollback)
+
+	def test_grant_matrix_matches_snapshot(self):
+		# AC-1, AC-2 (a/b/c): 2 switches x 2 x 4 levels x instructor = 32 rows, all written out above.
+		self.assertEqual(len(GRANT_SNAPSHOT), 32)
+		for key, names in GRANT_SNAPSHOT.items():
+			change_enabled, unrestricted, level, has_instructor = key
+			grant = (level, has_instructor, change_enabled, unrestricted)
+			with self.subTest(key):
+				self.assertEqual([s["name"] for s in get_tool_schemas(*grant)], names)
+				self.assertEqual([s.name for s in registry._granted_specs(*grant)], names)
+				self.assertIs(registry.grants_change_tools(*grant), "propose_file_change" in names)
+				self.assertIs(registry.grants_site_admin_tools(*grant), "api_list_records" in names)
+				self.assertIs(registry.grants_unrestricted_tools(*grant), "api_delete_record" in names)
+
+	def test_unknown_level_grants_like_l0(self):
+		for change_enabled in (False, True):
+			for unrestricted in (False, True):
+				for has_instructor in (False, True):
+					grant = ("LX", has_instructor, change_enabled, unrestricted)
+					with self.subTest(grant):
+						self.assertEqual(get_tool_schemas(*grant), [])
+						self.assertIs(registry.grants_site_admin_tools(*grant), False)
+						self.assertIs(registry.grants_unrestricted_tools(*grant), False)
+
+	def test_registry_has_one_grant_function_and_one_table(self):
+		for name in ("_unrestricted_specs", "get_unrestricted_tool_schemas", "UNRESTRICTED_GROUPS"):
+			self.assertFalse(hasattr(registry, name), name)
+		self.assertEqual(
+			[group for group, _condition in registry.GRANT_TABLE],
+			["read", "ticket_write", "task_write", "change_propose", "site_admin", "site_unrestricted"],
+		)
+
+	def test_execute_asks_the_one_grant_function(self):
+		context = _context("L2", "boss@x.com", change_enabled=True, unrestricted=True)
+		with patch.object(registry, "_granted_specs", wraps=registry._granted_specs) as granted:
+			execute_tool("get_ticket", {"name": "x"}, context)
+		granted.assert_called_once_with("L2", True, True, True)
+
+	def test_execute_rejects_delete_record_when_not_granted(self):
+		arguments = {"doctype": "Note", "name": "ERPAI-TEST-T63 không có"}
+		denied = {
+			"switch on, L3, instructor, no full power": _context("L3", "boss@x.com", change_enabled=True),
+			"full power without instructor": _context("L3", None, unrestricted=True),
+			"full power at L0": _context("L0", "boss@x.com", unrestricted=True),
+			"full power at an unknown level": _context("LX", "boss@x.com", unrestricted=True),
+			"everything off": _context("L1", "boss@x.com"),
+		}
+		for case, context in denied.items():
+			with self.subTest(case):
+				self.assertEqual(execute_tool("api_delete_record", arguments, context), NOT_GRANTED)
+		granted = execute_tool(
+			"api_delete_record", arguments, _context("L1", "boss@x.com", unrestricted=True)
+		)
+		self.assertNotEqual(granted, NOT_GRANTED)
+
+	def test_unrestricted_enabled_defaults_to_zero_and_only_system_manager_can_set(self):
+		# AC-32: the switch is a Check that starts off; only System Manager may write the Setting.
+		meta = frappe.get_meta("ERP AI Setting")
+		field = meta.get_field("unrestricted_enabled")
+		self.assertEqual((field.fieldtype, field.default, field.permlevel), ("Check", "0", 0))
+		writers = {perm.role for perm in meta.permissions if perm.write}
+		self.assertEqual(writers, {"System Manager"})

@@ -2,7 +2,7 @@
 
 Agent AI hỗ trợ công việc trên ERP Miyano. Giai đoạn 1: Helpdesk. Agent đọc phiếu mới (và comment có từ khóa), phân loại vào 1 trong 6 đầu mục A–F, chấm độ phức tạp và độ quan trọng, và ở mức `L1` ghi hướng giải quyết, comment trên phiếu. App cài xong ở trạng thái **tắt**.
 
-Phạm vi hiện tại: mức `L0` và `L1`. Mức `L2`/`L3` chọn được trên form nhưng chỉ cấp đúng bộ tool của `L1`.
+Phạm vi mặc định: mức `L0` và `L1`. Mức `L2`/`L3` chọn được trên form; khi hai công tắc "Sửa code và lệnh bench" và "Toàn quyền (khẩn cấp)" đều tắt (mặc định) chúng chỉ cấp đúng bộ tool của `L1`. Hai công tắc đó mở thêm tool, xem mục "Sửa code, lệnh bench và ghi bản ghi trực tiếp".
 
 | Mức | Agent làm gì |
 |---|---|
@@ -28,7 +28,7 @@ bench --site <site> install-app erp_ai
 bench --site <site> migrate
 ```
 
-Cài và migrate (chạy lại được, không ghi đè cấu hình đã lưu) tạo: role `ERP AI Agent` và `ERP AI Instructor`; tài khoản `ai.agent@miyano.com.vn` chỉ có role `ERP AI Agent` và `Agent` (không có System Manager); các trường AI trên HD Ticket (permlevel 8, ẩn với khách), gồm ba trường điểm `ai_complexity`, `ai_importance`, `ai_score_reason`; trường `ai_ticket` trên Task và quyền `share` cho dòng quyền Task của app; `ERP AI Setting` ở trạng thái tắt, mức `L0`, công tắc `auto_assign_enabled` tắt; bản ghi HD Form Script `ERP AI Agent Status` (xem mục "Chỉ báo trạng thái trên trang phiếu").
+Cài và migrate (chạy lại được, không ghi đè cấu hình đã lưu) tạo: role `ERP AI Agent` và `ERP AI Instructor`; tài khoản `ai.agent@miyano.com.vn` chỉ có role `ERP AI Agent` và `Agent` (không có System Manager); các trường AI trên HD Ticket (permlevel 8, ẩn với khách), gồm ba trường điểm `ai_complexity`, `ai_importance`, `ai_score_reason`; trường `ai_ticket` trên Task và quyền `share` cho dòng quyền Task của app; `ERP AI Setting` ở trạng thái tắt, mức `L0`, công tắc `auto_assign_enabled` tắt, hai công tắc `code_change_enabled` và `unrestricted_enabled` tắt; DocType `ERP AI Change Proposal`; bản ghi HD Form Script `ERP AI Agent Status` (xem mục "Chỉ báo trạng thái trên trang phiếu").
 
 ### Cấu hình và bật
 
@@ -39,10 +39,47 @@ Mở `/app/erp-ai-setting` (chỉ System Manager). Mỗi field trên các form `
 3. Rà các giá trị mặc định: `excluded_teams` (mặc định "Nhân sự & Hành chính" và "Tài chính Kế toán", mỗi nhóm một dòng: phiếu các nhóm này và phiếu có cờ "không dùng AI" không bao giờ được gửi lên API), `trigger_keyword` (mặc định `@ai`), `category_mapping` (đầu mục A–F sang loại phiếu, nhóm và ưu tiên mặc định của đầu mục; ưu tiên cuối cùng của phiếu còn phụ thuộc hai điểm và bảng `importance_priority` trong `routing_rules`, không chỉ ánh xạ này), `routing_rules` (mục "Định tuyến theo điểm"), `alert_recipients` (mặc định `info@miyano.com.vn`).
 4. Giữ `L0` đủ lâu để đo độ chính xác (báo cáo `ERP AI Accuracy`), rồi mới tích `enabled` và chuyển `L1`.
 5. Công tắc `auto_assign_enabled` ("Tự gán người và tạo Task") để tắt cho tới khi xong các việc chuẩn bị trong `docs/HuongDan_QuanTri_DinhTuyen.md`.
+6. Hai công tắc `code_change_enabled` và `unrestricted_enabled` để tắt, trừ khi đã đọc mục "Sửa code, lệnh bench và ghi bản ghi trực tiếp".
 
-Cấp role `ERP AI Instructor` cho người được phép ra lệnh agent trên mọi phiếu; người được giao phiếu chỉ có thẩm quyền trên đúng phiếu đó.
+Cấp role `ERP AI Instructor` cho người được phép ra lệnh agent trên mọi phiếu; người được giao phiếu chỉ có thẩm quyền trên đúng phiếu đó. Không cấp role này cho tài khoản agent.
 
 Chi tiết các việc phải làm trước khi bật: `docs/team/features/FEAT-001/asbuilt.md`, mục 6.
+
+### Sửa code, lệnh bench và ghi bản ghi trực tiếp
+
+Hai công tắc trên `/app/erp-ai-setting`, chỉ System Manager đặt được, mặc định tắt. Cả hai tắt thì danh sách tool và prompt giống bản trước. Bot không đọc, không ghi được hai ô này, `ERP AI Credential`, `ERP AI Log` và `ERP AI Change Proposal` ở mọi chế độ.
+
+| Công tắc | Điều kiện | Bot làm được |
+|---|---|---|
+| `code_change_enabled` ("Cho phép sửa code và lệnh bench") | mức `L3`, có người có role `ERP AI Instructor` ra lệnh | (1) Ghi bản ghi trực tiếp, không qua duyệt, theo quyền của tài khoản agent: `api_list_records`, `api_get_record`, `api_create_record`, `api_update_record` (tạo User, gán vai trò nghiệp vụ, sửa cấu hình, bản ghi nháp). Vẫn bị từ chối: gán `System Manager`, `Administrator`, `ERP AI Instructor`, `ERP AI Agent`, `Guest`, `All`; sửa `Administrator`, `Guest`, tài khoản agent; ghi Role Permission, Custom DocPerm; xóa, submit, hủy. (2) Đề xuất sửa file trong app của `code_change_apps` hoặc chạy một lệnh `bench` trong danh sách `migrate`, `clear-cache`, `clear-website-cache`, `list-apps`, `build`, `version`; mọi thay đổi code và lệnh phải được người duyệt |
+| `unrestricted_enabled` ("Toàn quyền (khẩn cấp)") | từ `L1`, có người ra lệnh, không cần công tắc code | Thêm `api_delete_record`, `api_submit_record`, `api_call_method` (hàm whitelist) và bỏ giới hạn vai trò, tài khoản, DocType ở trên: gán được cả `System Manager`, sửa được phân quyền và mọi tài khoản. Không có hẹn giờ tự tắt và không có cảnh báo khi đang bật: xong việc thì tắt tay. Xóa và submit không hoàn tác được |
+
+`code_change_apps`: mỗi dòng một tên thư mục app trong `apps/`; thêm được `frappe`, `erpnext`, `helpdesk`, `hrms` (sửa app lõi ảnh hưởng mọi site trên bench); không bao giờ `erp_ai`; để trống thì không file nào được sửa. Giới hạn đã biết: bot chỉ chặn ở mức cố gắng việc đọc mật khẩu và khóa API của người dùng qua `api_call_method`; chi tiết ở `docs/team/features/FEAT-004/asbuilt.md`.
+
+**Duyệt.** Khi bot đề xuất, nó đăng một comment trên phiếu: mã đề xuất, loại, đích (file hoặc lệnh), nhánh nhận commit, cảnh báo app lõi, ghi chú cần `bench restart` (file `.py`) hoặc "lệnh bench không hoàn tác được", rồi ba liên kết "Duyệt", "Từ chối", "Xem nội dung thay đổi". Chỉ người có role `ERP AI Instructor` và vào được Desk duyệt được; tài khoản agent, `Administrator`, `Guest` bị từ chối. Mở liên kết "Duyệt" mở form Desk của đề xuất; form gửi đúng một lời gọi POST, không hộp xác nhận, rồi người bấm ở lại form và thấy diff và trạng thái mới. Chữ "ok" hay "duyệt" trong phiếu không phải là duyệt. Trên form `ERP AI Change Proposal` vẫn có ba nút Duyệt, Từ chối, Hoàn tác (có hộp xác nhận).
+
+**Áp dụng và hoàn tác.** Một thay đổi file được áp dụng thành đúng một commit git local trên nhánh đang checkout; bot không push, không đổi nhánh, không chạy hook của repo. Hoàn tác (nút trên form) là một commit hoàn tác và bị từ chối nếu file đã đổi sau đó. Sau mỗi kết cục có một dòng hoạt động `Info` trên phiếu nêu trạng thái cuối, mã commit hoặc mã thoát hoặc lý do. Mỗi bước có một dòng `ERP AI Log` (`entry_type=change`).
+
+**Tắt.** Đặt `code_change_enabled` và `unrestricted_enabled` về 0: bot trở lại như cũ. Commit bot đã tạo ở lại trong lịch sử git; muốn bỏ thì bấm Hoàn tác trên từng đề xuất trước khi tắt, hoặc `git revert` thủ công. Revert mã của tính năng làm mất DocType `ERP AI Change Proposal` và các bản ghi đề xuất, tức mất dữ liệu kiểm toán.
+
+### Nhật ký trước/sau và cảnh báo phân quyền hằng ngày
+
+Khi bot ghi bản ghi trực tiếp (mục trên), bạn dựng lại được bot đã đổi gì từ nhật ký, và mỗi ngày nhận một thư nếu bot đã đổi role hay phân quyền.
+
+**Đọc trước/sau.** Mở `ERP AI Log`, dòng `reason` của lượt chạy. Cột `actions` liệt kê từng lời gọi (công cụ, DocType, tên bản ghi, đúng hay sai) theo thứ tự; lời gọi thứ `n` có giá trị trước và sau ở hai cột `value_before` và `value_after`, khóa `"<công cụ>#<n>"` (ví dụ `api_update_record#2`), nên hai lời gọi cùng công cụ trong một lượt không đè nhau. Giá trị gồm cả dòng của bảng con: role của User, ngày của Holiday List, trạng thái và hành động của Workflow. Khi bot sửa bằng cách đưa cả danh sách, so trước với sau cho thấy dòng nào bị bỏ và dòng nào được thêm. Giá trị lưu đầy đủ, không cắt. Tạo mới có trước là rỗng; xóa có sau là rỗng. Với User chỉ có mã user và danh sách role; mật khẩu, khóa, token không bao giờ có trong đó. Chỉ System Manager đọc được `ERP AI Log`.
+
+**Hoàn tác bằng tay.** Bot không có công cụ hoàn tác. Đọc giá trị trước, mở bản ghi trong Desk và đặt lại: thêm lại role bị gỡ, bỏ role bị thêm, trả giá trị cũ. Bản ghi bị xóa hay đã submit bằng "Toàn quyền" thì không hoàn tác được.
+
+**Cảnh báo hằng ngày.** Job `check_privilege_escalation` chạy mỗi ngày và gửi một thư tới `alert_recipients` (cùng dòng ở Error Log) với tiêu đề "Agent đã sửa bản ghi phân quyền" khi bot đã thêm hoặc gỡ role của một user, hoặc tạo, sửa, xóa một bản ghi phân quyền (Custom DocPerm, DocPerm, Role, User Permission, Role Profile, hoặc phần `permissions` của một DocType). Mỗi mục nêu việc, user, role, người ra lệnh và thời điểm, ví dụ `thêm role <role> cho <user> (người ra lệnh <người>, <YYYY-MM-DD HH:MM>)` hoặc `gỡ role <role> của <user> (…)`.
+- Dòng có role quản trị (`System Manager`, `Administrator`, `ERP AI Instructor`, `ERP AI Agent`, `Guest`, `All`) có dấu `[QUẢN TRỊ]` ở đầu và đứng trước các dòng khác.
+- Thư chỉ liệt kê tối đa 5 mục rồi "…và N mục khác", để thư ngắn; vì dòng quản trị đứng trước nên không bị cắt trước dòng thường. Danh sách đầy đủ tra ở `ERP AI Log`.
+- Mục ghi `, không có trước/sau` là thay đổi mà nhật ký không đọc được trước/sau (nhật ký cũ trước khi có tính năng này, hoặc dữ liệu hỏng). Nó vẫn được báo, không bị bỏ qua. Mục `sửa User …, không có trước/sau` không có dấu `[QUẢN TRỊ]` vì không biết role, và có thể nằm trong "…và N mục khác": tra `ERP AI Log`.
+- Không cảnh báo: role hay phân quyền do người đổi, và bot lưu lại một User mà không đổi role.
+- Ba cảnh báo khác trong cùng job không đổi: role của tài khoản agent lệch tập, Server Script hoặc Webhook do agent tạo đang bật, khóa đang bật nhưng không có giá trị.
+
+**Báo đúng một lần.** Ô chỉ đọc `privilege_alert_checked_until` (nhóm cảnh báo trên `ERP AI Setting`) là mốc "đã báo tới đâu"; chỉ job ghi, form lưu không đổi được. Mỗi lần chạy xét từ mốc tới 5 phút trước giờ chạy, rồi dời mốc: một thay đổi vào đúng một thư; lịch lỡ vài ngày thì lần sau gộp đủ. Lần chạy đầu sau khi cập nhật báo một lần mọi thay đổi cũ của bot (mục `không có trước/sau`), không phải lỗi. Lần chạy lỗi giữa chừng không dời mốc và không gửi thư; lần sau gửi đúng một thư. Dòng Error Log của lần lỗi vẫn ở lại (bảng Error Log của Frappe không hoàn tác được) nên lần sau có thể có thêm một dòng giống: lặp ở Error Log, không sót. Hai lần chạy cùng lúc thì lần sau chờ tối đa 60 giây rồi bỏ lượt.
+
+**Giới hạn đã biết.** Khi "Toàn quyền (khẩn cấp)" đang bật, đổi role bằng cách gọi hàm whitelist (`api_call_method`) không có trong cảnh báo hằng ngày. Lượt chạy của bot lỗi trước khi dòng `reason` được lưu thì mọi thay đổi trong lượt đó bị hoàn tác, nhưng commit do mã ngoài `erp_ai` chạy bên trong một công cụ vẫn cố định các thay đổi trước nó. Chưa có địa chỉ trong `alert_recipients` thì cảnh báo chỉ có ở Error Log. Chi tiết: `docs/team/features/FEAT-005/asbuilt.md`.
 
 ### Định tuyến theo điểm
 

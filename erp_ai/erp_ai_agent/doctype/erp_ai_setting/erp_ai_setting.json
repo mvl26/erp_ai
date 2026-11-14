@@ -93,6 +93,7 @@
   "prompt_revisions",
   "section_alerts",
   "alert_recipients",
+  "privilege_alert_checked_until",
   "credentials"
  ],
  "fields": [
@@ -692,6 +693,13 @@
    "description": "Mỗi dòng một email, không tách bằng dấu phẩy, ví dụ canhbao@congty.vn. Nhận cảnh báo: khóa lỗi, khóa hết hạn mức, hết khóa dùng được, khóa hoạt động lại, cảnh báo leo quyền hằng ngày."
   },
   {
+   "fieldname": "privilege_alert_checked_until",
+   "fieldtype": "Datetime",
+   "label": "Đã cảnh báo leo quyền đến",
+   "read_only": 1,
+   "description": "Hệ thống tự ghi: mốc thời gian mà cảnh báo leo quyền đã xét hết thay đổi của bot trong nhật ký; lần sau chỉ xét thay đổi sau mốc này, không sửa được; giá trị gõ vào bị bỏ khi lưu. Để trống nghĩa là chưa cảnh báo lần nào."
+  },
+  {
    "fieldname": "credentials",
    "fieldtype": "Table",
    "label": "Khóa API",
@@ -701,7 +709,7 @@
  ],
  "issingle": 1,
  "links": [],
- "modified": "2026-11-15 14:00:00.000000",
+ "modified": "2026-11-15 15:00:00.000000",
  "modified_by": "Administrator",
  "module": "ERP AI agent",
  "name": "ERP AI Setting",

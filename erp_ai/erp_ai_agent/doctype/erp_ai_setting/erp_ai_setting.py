@@ -2,12 +2,14 @@ import json
 import math
 import os
 import re
+from datetime import datetime
 
 import frappe
 from frappe.model.document import Document
 
 from erp_ai import gateway
 from erp_ai.agent import policy
+from erp_ai.agent.agent_write_guard import refuse_agent_write
 from erp_ai.agent.classification import validate_mapping
 from erp_ai.agent.hard_bans import hard_ban_reason
 from erp_ai.agent.routing import validate_routing_config
@@ -153,8 +155,26 @@ def permission_switch_fields(meta) -> list:
 	return switches
 
 
+EMPTY_DATETIME = datetime(1, 1, 1)  # what frappe.utils.cast returns for an empty Datetime
+
+
+def read_privilege_watermark() -> datetime | None:
+	"""Where the privilege alert has read ERP AI Log up to; None = never alarmed (design-amd2 §2, D-6).
+
+	Frappe 15 casts an empty raw value (no row, NULL, "") to datetime(1, 1, 1) and "0001-01-01 …" to None:
+	both come back as None, a real value unchanged.
+	"""
+	watermark = frappe.db.get_single_value(SETTING_DOCTYPE, "privilege_alert_checked_until", cache=False)
+	return None if watermark == EMPTY_DATETIME else watermark
+
+
 class ERPAISetting(Document):
+	# No valid write path for the agent account (ADR-023 QĐ 5).
+	def before_insert(self):
+		refuse_agent_write(self)
+
 	def validate(self):
+		refuse_agent_write(self)
 		self.restore_self_managed_fields()
 		self.check_labels()
 		validate_mapping(self.category_mapping)
@@ -191,11 +211,25 @@ class ERPAISetting(Document):
 		lines.append(f"Môi trường site: {escape(self.site_environment or '')}")
 		frappe.msgprint("<br>".join(lines), title=PERMISSION_NOTICE_TITLE, indicator="orange")
 
+	def on_trash(self):
+		refuse_agent_write(self)
+
+	def before_rename(self, old, new, merge=False):
+		refuse_agent_write(self)
+
+	def before_submit(self):
+		refuse_agent_write(self)
+
+	def before_cancel(self):
+		refuse_agent_write(self)
+
 	def restore_self_managed_fields(self):
 		# (b) the monthly spend is written only by the scheduler
 		self.spent_this_month_usd = frappe.db.get_single_value(
 			SETTING_DOCTYPE, "spent_this_month_usd", cache=False
 		)
+		# the privilege-alert watermark is written only by the alert job (ADR-024 QĐ 3.2); empty stays empty
+		self.privilege_alert_checked_until = read_privilege_watermark()
 		# The raw stored values, uncached like cache=False: get_single_value would turn an unset Date/Datetime
 		# into year 1 and a save would then store that placeholder as if the job had run.
 		singles = frappe.db.get_singles_dict(SETTING_DOCTYPE)

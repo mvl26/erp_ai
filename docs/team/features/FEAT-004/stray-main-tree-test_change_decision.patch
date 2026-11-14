@@ -1,0 +1,19 @@
+diff --git a/erp_ai/test_change_decision.py b/erp_ai/test_change_decision.py
+index e819d9e..1db1e1e 100644
+--- a/erp_ai/test_change_decision.py
++++ b/erp_ai/test_change_decision.py
+@@ -70,12 +70,8 @@ class TestChangeDecision(FrappeTestCase):
+ 
+ 		self.assertEqual(self.status(), CHANGE_STATUS_APPROVED)
+ 		(job,) = self.jobs()
+-		self.assertEqual(
+-			(job.kwargs["proposal_name"], job.kwargs["action"]), (self.proposal.name, "apply")
+-		)
+-		self.assertEqual(
+-			frappe.db.get_value(PROPOSAL_DOCTYPE, self.proposal.name, "decided_by"), INSTRUCTOR
+-		)
++		self.assertEqual((job.kwargs["proposal_name"], job.kwargs["action"]), (self.proposal.name, "apply"))
++		self.assertEqual(frappe.db.get_value(PROPOSAL_DOCTYPE, self.proposal.name, "decided_by"), INSTRUCTOR)
+ 		self.assertEqual(frappe.local.response["type"], "redirect")
+ 		self.assertEqual(frappe.local.response["location"], f"/helpdesk/tickets/{self.proposal.ticket}")
+ 		self.page.assert_not_called()

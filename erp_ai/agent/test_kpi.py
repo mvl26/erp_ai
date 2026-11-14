@@ -351,9 +351,11 @@ class TestKpi(FrappeTestCase):
 		created = ws + timedelta(days=2)
 		_ticket(created, ticket_type=TYPE_C)
 		_task(_ticket(created, ticket_type=TYPE_A), created + timedelta(hours=1))
-		# decoys: C just before the window and at its end, a fast Task each
-		for created in (window_start - timedelta(seconds=1), window_end):
-			_task(_ticket(created, ticket_type=TYPE_C), created + timedelta(hours=1))
+		# decoy: C just before the window, a fast Task
+		created = window_start - timedelta(seconds=1)
+		_task(_ticket(created, ticket_type=TYPE_C), created + timedelta(hours=1))
+		# decoy: C at the window end, only a late Task (a shorter shift pulls it in as a miss)
+		_task(_ticket(window_end, ticket_type=TYPE_C), window_end + timedelta(hours=80))
 		# decoys: in the window with a fast Task but category B, an unmapped type, no type
 		created = ws + timedelta(days=1)
 		for ticket_type in (TYPE_B, TYPE_UNMAPPED, None):

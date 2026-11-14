@@ -5,6 +5,7 @@ import frappe
 from frappe.tests.utils import FrappeTestCase
 from frappe.utils import get_datetime
 
+from erp_ai import install
 from erp_ai.agent.classification import DEFAULT_CATEGORY_MAPPING
 from erp_ai.agent.routing import DEFAULT_ROUTING_RULES
 from erp_ai.constants import (
@@ -15,7 +16,7 @@ from erp_ai.constants import (
 	SETTING_DOCTYPE,
 )
 from erp_ai.erp_ai_agent.doctype.erp_ai_setting import erp_ai_setting
-from erp_ai.test_utils import TempAppsRoot, set_agent_settings
+from erp_ai.test_utils import TempAppsRoot, keep_agent_settings, set_agent_settings
 
 PRICES = {
 	"price_input_per_mtok": 1,
@@ -582,3 +583,46 @@ class TestCheckKeys(FrappeTestCase):
 			self.assertEqual(set(item), {"label", "ok", "error_kind", "status"})
 		self.assertNotIn(FAKE_SECRET, json.dumps(result))
 		self.assertNotIn("AuthenticationError", json.dumps(result))
+
+
+# FEAT-007 design 2.1: default of every new ERP AI Setting field (NFR-4); one row per field as tasks add them.
+FEAT007_NEW_FIELD_DEFAULTS = {
+	"site_environment": "production",
+}
+
+
+class TestFeat007Defaults(FrappeTestCase):
+	def setUp(self):
+		self.addCleanup(frappe.db.rollback)
+		keep_agent_settings(self)
+
+	def _value_after_install(self, fieldname):
+		"""Drop the stored value of `fieldname`, run the install default step and return the value it wrote."""
+		frappe.db.delete("Singles", {"doctype": SETTING_DOCTYPE, "field": fieldname})
+		install._ensure_default_settings()
+		return frappe.db.get_single_value(SETTING_DOCTYPE, fieldname, cache=False)
+
+	def test_site_environment_default_production_and_options(self):
+		field = frappe.get_meta(SETTING_DOCTYPE).get_field("site_environment")
+		self.assertIsNotNone(field, "ERP AI Setting has no site_environment field")
+		self.assertEqual(
+			(field.fieldtype, field.options, field.default), ("Select", "production\ntest", "production")
+		)
+		self.assertEqual(self._value_after_install("site_environment"), "production")
+
+		doc = frappe.get_single(SETTING_DOCTYPE)
+		doc.site_environment = "test"
+		doc.flags.ignore_validate = True
+		doc.save(ignore_permissions=True)
+		self.assertEqual(frappe.db.get_single_value(SETTING_DOCTYPE, "site_environment", cache=False), "test")
+
+		doc = frappe.get_single(SETTING_DOCTYPE)
+		doc.site_environment = "staging"
+		doc.flags.ignore_validate = True
+		with self.assertRaises(frappe.ValidationError):
+			doc.save(ignore_permissions=True)
+
+	def test_every_new_field_default(self):
+		for fieldname, expected in FEAT007_NEW_FIELD_DEFAULTS.items():
+			with self.subTest(fieldname=fieldname):
+				self.assertEqual(self._value_after_install(fieldname), expected)

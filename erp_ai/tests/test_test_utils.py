@@ -5,14 +5,17 @@ from unittest.mock import patch
 import frappe
 from frappe.tests.utils import FrappeTestCase
 
-from erp_ai.constants import AGENT_USER, HELPDESK_AGENT_ROLE, ROLE_AGENT
+from erp_ai.constants import AGENT_USER, CREDENTIAL_DOCTYPE, HELPDESK_AGENT_ROLE, ROLE_AGENT, SETTING_DOCTYPE
 from erp_ai.test_utils import (
 	PREFIX,
+	add_credential,
+	keep_agent_settings,
 	make_active_agent,
 	make_routing_rules,
 	make_sla,
 	make_team,
 	pin_agent_roles,
+	set_agent_settings,
 )
 
 AUTOMATIC_ROLES = {"Guest", "All", "Administrator", "Desk User"}
@@ -207,3 +210,59 @@ class TestMakeHelpers(FrappeTestCase):
 		)
 		priorities = frappe.get_all("HD Service Level Priority", filters={"parent": plain}, pluck="priority")
 		self.assertEqual(set(priorities), {"Low", "Medium", "High", "Urgent"})
+
+
+def _setting_singles() -> list[tuple]:
+	return [
+		tuple(row)
+		for row in frappe.db.sql(
+			"select field, value from `tabSingles` where doctype=%s order by field", SETTING_DOCTYPE
+		)
+	]
+
+
+def _credential_rows() -> list[dict]:
+	return frappe.get_all(
+		CREDENTIAL_DOCTYPE,
+		filters={"parent": SETTING_DOCTYPE, "parenttype": SETTING_DOCTYPE},
+		fields=["*"],
+		order_by="name",
+	)
+
+
+class TestKeepAgentSettings(FrappeTestCase):
+	def setUp(self):
+		frappe.db.rollback()
+		# Registered first so it is undone last: the rollback cleanup runs while commits are still guarded.
+		commit_guard = patch.object(frappe.db, "commit", side_effect=AssertionError("test must not commit"))
+		commit_guard.start()
+		self.addCleanup(commit_guard.stop)
+		# The rollback empties `value_cache` but not the document cache the test fills.
+		self.addCleanup(frappe.clear_document_cache, SETTING_DOCTYPE, SETTING_DOCTYPE)
+		self.addCleanup(frappe.db.rollback)
+
+	def test_restores_singles_and_child_rows(self):
+		set_agent_settings(trigger_keyword=f"{PREFIX}keyword", thinking_text=f"{PREFIX}thinking")
+		add_credential(f"{PREFIX}keep-A")
+		add_credential(f"{PREFIX}keep-B")
+		singles_before = _setting_singles()
+		rows_before = _credential_rows()
+		inner = unittest.TestCase()
+
+		keep_agent_settings(inner)
+		set_agent_settings(trigger_keyword=f"{PREFIX}changed")
+		frappe.db.delete("Singles", {"doctype": SETTING_DOCTYPE, "field": "thinking_text"})
+		frappe.db.delete(CREDENTIAL_DOCTYPE, {"parent": SETTING_DOCTYPE, "label": f"{PREFIX}keep-A"})
+		add_credential(f"{PREFIX}keep-new")
+		self.assertNotEqual(_setting_singles(), singles_before)
+		self.assertNotEqual(_credential_rows(), rows_before)
+		# Fill both caches with the changed values; the raw-SQL restore does not touch them.
+		self.assertEqual(frappe.db.get_single_value(SETTING_DOCTYPE, "trigger_keyword"), f"{PREFIX}changed")
+		self.assertIsNone(frappe.get_cached_doc(SETTING_DOCTYPE).thinking_text)
+
+		inner.doCleanups()
+
+		self.assertEqual(_setting_singles(), singles_before)
+		self.assertEqual(_credential_rows(), rows_before)
+		self.assertEqual(frappe.db.get_single_value(SETTING_DOCTYPE, "trigger_keyword"), f"{PREFIX}keyword")
+		self.assertEqual(frappe.get_cached_doc(SETTING_DOCTYPE).thinking_text, f"{PREFIX}thinking")

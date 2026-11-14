@@ -23,7 +23,7 @@ VIETNAMESE_ACCENTS = re.compile(
 DOCTYPE_CONFIG = {
 	"ERP AI Setting": {
 		"folder": "erp_ai_setting",
-		"field_count": 27,
+		"field_count": 28,
 		"phrases": {
 			"enabled": ("Tắt", "4 đơn giá", "từ khóa kích hoạt"),
 			"permission_level": ("L0", "L1", "L2", "L3", "ngân sách"),
@@ -37,6 +37,7 @@ DOCTYPE_CONFIG = {
 				"Log",
 				"cần gấp",
 			),
+			"site_environment": ("production", "site test", "không bị chặn"),
 			"max_turns_per_run": ("từ 1 đến 20", "dừng"),
 			"max_runs_per_ticket_per_day": ("từ 1 đến 50", "00:00"),
 			"max_keys_per_call": ("từ 1 đến 10", "báo lỗi"),
@@ -85,10 +86,11 @@ DOCTYPE_CONFIG = {
 				"Bỏ trống",
 			),
 		},
-		"section_count": 7,
+		"section_count": 8,
 		"read_only_fields": ("spent_this_month_usd",),
 		"sections": (
 			("section_activation", "Bật và mức quyền", "enabled"),
+			("section_permissions", "Năm quyền mở rộng (mặc định tắt)", "site_environment"),
 			("section_limits", "Giới hạn mỗi lần chạy", "max_turns_per_run"),
 			("section_budget", "Ngân sách và đơn giá", "monthly_budget_usd"),
 			("section_model", "Model, từ khóa và chỉ báo trả lời", "model_classify_default"),
@@ -401,7 +403,8 @@ class TestDoctypeDescriptions(FrappeTestCase):
 		doctype_json = load_doctype(DOCTYPE_CONFIG["ERP AI Setting"])
 		stored = {}
 		for field in visible_fields(doctype_json):
-			if field["fieldtype"] in ("Table", "Password"):
+			# A Select value is one of the fixed options a description may name (site_environment), not site data.
+			if field["fieldtype"] in ("Table", "Password", "Select"):
 				continue
 			value = setting.get(field["fieldname"])
 			if isinstance(value, str) and len(value.strip()) >= MIN_STORED_VALUE_CHARS:

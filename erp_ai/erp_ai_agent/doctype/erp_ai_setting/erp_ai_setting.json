@@ -46,10 +46,20 @@
   "answer_delay_max_s",
   "section_routing",
   "excluded_teams",
+  "excluded_title_prefixes",
   "category_mapping",
   "auto_assign_enabled",
   "routing_rules",
   "prompt_digest",
+  "section_ticket_fields",
+  "field_ticket_nature",
+  "field_erp_module",
+  "field_origin",
+  "origin_board_value",
+  "field_due_date",
+  "field_project",
+  "field_item_code",
+  "field_serial_no",
   "section_code_change",
   "code_change_apps",
   "section_alerts",
@@ -347,6 +357,13 @@
    "description": "Mỗi dòng một tên nhóm, so với Nhóm xử lý của phiếu, không phân biệt hoa thường. Phiếu thuộc các nhóm này thì agent bỏ qua."
   },
   {
+   "fieldname": "excluded_title_prefixes",
+   "fieldtype": "Small Text",
+   "label": "Tiền tố tiêu đề loại trừ",
+   "default": "[HR]\n[Kế toán]",
+   "description": "Mỗi dòng một tiền tố tiêu đề của bộ phận loại trừ, ví dụ [HR]. Phiếu có tiền tố này bị bỏ qua như phiếu nhóm loại trừ, không gửi cho model."
+  },
+  {
    "fieldname": "category_mapping",
    "fieldtype": "Code",
    "label": "Ánh xạ đầu mục",
@@ -373,6 +390,59 @@
    "fieldtype": "Long Text",
    "label": "Trích yếu HDSD",
    "description": "Người tự nhập, hệ thống không tự điền. Được nối vào cuối hướng dẫn của bước lập luận, không dùng ở bước phân loại."
+  },
+  {
+   "fieldname": "section_ticket_fields",
+   "fieldtype": "Section Break",
+   "label": "Trường sẵn có của phiếu"
+  },
+  {
+   "fieldname": "field_ticket_nature",
+   "fieldtype": "Data",
+   "label": "Tính chất phiếu",
+   "description": "Tên trường (fieldname) trên HD Ticket chứa Tính chất phiếu. Để trống nếu site chưa có; phần phụ thuộc không chạy và ghi log. Tên không có trên phiếu thì không lưu được."
+  },
+  {
+   "fieldname": "field_erp_module",
+   "fieldtype": "Data",
+   "label": "Phân hệ ERP",
+   "description": "Tên trường (fieldname) trên HD Ticket chứa Phân hệ ERP. Để trống nếu site chưa có; phần phụ thuộc không chạy và ghi log. Tên không có trên phiếu thì không lưu được."
+  },
+  {
+   "fieldname": "field_origin",
+   "fieldtype": "Data",
+   "label": "Nguồn phát sinh",
+   "description": "Tên trường (fieldname) trên HD Ticket chứa Nguồn phát sinh. Để trống nếu site chưa có; phần phụ thuộc không chạy và ghi log. Tên không có trên phiếu thì không lưu được."
+  },
+  {
+   "fieldname": "origin_board_value",
+   "fieldtype": "Data",
+   "label": "Giá trị Chỉ đạo BGĐ",
+   "description": "Giá trị của trường Nguồn phát sinh nghĩa là Chỉ đạo BGĐ. Phiếu có giá trị này không bao giờ bị bot đổi trạng thái theo hai đường tự động. Cần đặt trường Nguồn phát sinh trước."
+  },
+  {
+   "fieldname": "field_due_date",
+   "fieldtype": "Data",
+   "label": "Hạn hoàn thành",
+   "description": "Tên trường (fieldname) trên HD Ticket chứa Hạn hoàn thành, kiểu Date hoặc Datetime. Để trống nếu site chưa có; phần phụ thuộc không chạy và ghi log. Tên không có trên phiếu thì không lưu được."
+  },
+  {
+   "fieldname": "field_project",
+   "fieldtype": "Data",
+   "label": "Dự án",
+   "description": "Tên trường (fieldname) trên HD Ticket chứa Dự án. Để trống nếu site chưa có; phần phụ thuộc không chạy và ghi log. Tên không có trên phiếu thì không lưu được."
+  },
+  {
+   "fieldname": "field_item_code",
+   "fieldtype": "Data",
+   "label": "Mã hàng",
+   "description": "Tên trường (fieldname) trên HD Ticket chứa Mã hàng. Để trống nếu site chưa có; phần phụ thuộc không chạy và ghi log. Tên không có trên phiếu thì không lưu được."
+  },
+  {
+   "fieldname": "field_serial_no",
+   "fieldtype": "Data",
+   "label": "Số sê-ri",
+   "description": "Tên trường (fieldname) trên HD Ticket chứa Số sê-ri. Để trống nếu site chưa có; phần phụ thuộc không chạy và ghi log. Tên không có trên phiếu thì không lưu được."
   },
   {
    "fieldname": "section_code_change",
@@ -407,7 +477,7 @@
  ],
  "issingle": 1,
  "links": [],
- "modified": "2026-11-14 22:30:00.000000",
+ "modified": "2026-11-14 23:30:00.000000",
  "modified_by": "Administrator",
  "module": "ERP AI agent",
  "name": "ERP AI Setting",

@@ -605,6 +605,15 @@ FEAT007_NEW_FIELD_DEFAULTS = {
 	"level_cap_f": "L3",
 	"confidence_threshold": 70,
 	"auto_approve_streak": 20,
+	"excluded_title_prefixes": "[HR]\n[Kế toán]",
+	"field_ticket_nature": "",
+	"field_erp_module": "",
+	"field_origin": "",
+	"origin_board_value": "",
+	"field_due_date": "",
+	"field_project": "",
+	"field_item_code": "",
+	"field_serial_no": "",
 }
 # FEAT-007 AC-31: the highest level per category A-F, in form order.
 LEVEL_CAP_DEFAULTS = (
@@ -1265,3 +1274,165 @@ class TestUserTemplates(FrappeTestCase):
 				("Thủ kho 2", STOCK_ROLE, None),
 			],
 		)
+
+
+# FEAT-007 design.md:107, 120-121 (AC-24): the ticket field names, in form order, with their form label (E-1).
+TICKET_FIELD_LABELS = {
+	"field_ticket_nature": "Tính chất phiếu",
+	"field_erp_module": "Phân hệ ERP",
+	"field_origin": "Nguồn phát sinh",
+	"field_due_date": "Hạn hoàn thành",
+	"field_project": "Dự án",
+	"field_item_code": "Mã hàng",
+	"field_serial_no": "Số sê-ri",
+}
+TICKET_FIELD_SECTION = (
+	"section_ticket_fields",
+	"field_ticket_nature",
+	"field_erp_module",
+	"field_origin",
+	"origin_board_value",
+	"field_due_date",
+	"field_project",
+	"field_item_code",
+	"field_serial_no",
+)
+DUE_FIELD_ERROR = "Trường Hạn hoàn thành phải có kiểu Date hoặc Datetime"
+BOARD_VALUE_ERROR = "Đặt giá trị Chỉ đạo BGĐ thì phải đặt tên trường Nguồn phát sinh"
+BOARD_VALUE = "Chỉ đạo BGĐ"
+# Real HD Ticket fields, one per setting: Helpdesk's own fields and the Custom Fields erp_ai installs
+# (test_install pins them), so no test creates a Custom Field (its ALTER TABLE would commit).
+VALID_TICKET_FIELDS = {
+	"field_ticket_nature": "ticket_type",
+	"field_erp_module": "ai_score_reason",
+	"field_origin": "ai_confidence",
+	"field_due_date": "ai_updated_at",
+	"field_project": "subject",
+	"field_item_code": "ai_classified_by",
+	"field_serial_no": "raised_by",
+}
+CUSTOM_TICKET_FIELDS = ("ai_score_reason", "ai_confidence", "ai_updated_at", "ai_classified_by")
+
+
+def _accented(name):
+	"""`name` with its first plain vowel accented: the database collation would still match it."""
+	vowel = next(letter for letter in name if letter in "aeiou")
+	return name.replace(vowel, "áéíóú"["aeiou".index(vowel)], 1)
+
+
+def _unknown_ticket_field_error(fieldname, typed):
+	return f"Trường '{typed}' không có trên HD Ticket ({TICKET_FIELD_LABELS[fieldname]})"
+
+
+class TestTicketFieldNames(FrappeTestCase):
+	def setUp(self):
+		self.addCleanup(frappe.db.rollback)
+		keep_agent_settings(self)
+		meta = frappe.get_meta(SETTING_DOCTYPE)
+		for fieldname in TICKET_FIELD_SECTION:
+			self.assertTrue(meta.has_field(fieldname), f"ERP AI Setting has no {fieldname} field")
+		for fieldname in CUSTOM_TICKET_FIELDS:
+			self.assertTrue(
+				frappe.db.exists("Custom Field", {"dt": "HD Ticket", "fieldname": fieldname}),
+				f"Custom Field HD Ticket.{fieldname} of erp_ai is missing",
+			)
+		self.assertIsNone(self._save(dict.fromkeys(TICKET_FIELD_SECTION[1:], "")))
+
+	def _save(self, values):
+		"""Save the setting with these values; return the error text, or None when it saved."""
+		doc = frappe.get_doc(SETTING_DOCTYPE)
+		doc.update(values)
+		try:
+			doc.save()
+		except frappe.ValidationError as error:
+			return frappe.utils.strip_html(str(error))
+		return None
+
+	def _stored(self):
+		return {
+			fieldname: frappe.db.get_single_value(SETTING_DOCTYPE, fieldname, cache=False) or ""
+			for fieldname in TICKET_FIELD_SECTION[1:]
+		}
+
+	def test_section_and_field_shape(self):
+		# design.md:103, 107, 120-121: one Data field per name and the board value, in this order, after routing;
+		# D-19: the excluded title prefixes sit right after excluded_teams.
+		meta = frappe.get_meta(SETTING_DOCTYPE)
+		order = [field.fieldname for field in meta.fields]
+		self.assertIn("section_ticket_fields", order, "ERP AI Setting has no section_ticket_fields")
+		start = order.index("section_ticket_fields")
+		self.assertEqual(order[start : start + 10], [*TICKET_FIELD_SECTION, "section_code_change"])
+		self.assertLess(order.index("prompt_digest"), start)
+		for fieldname in TICKET_FIELD_SECTION[1:]:
+			with self.subTest(fieldname=fieldname):
+				self.assertEqual(meta.get_field(fieldname).fieldtype, "Data")
+		for fieldname, label in TICKET_FIELD_LABELS.items():
+			self.assertEqual(meta.get_field(fieldname).label, label)
+		self.assertEqual(order[order.index("excluded_teams") + 1], "excluded_title_prefixes")
+		field = meta.get_field("excluded_title_prefixes")
+		self.assertEqual((field.fieldtype, field.default), ("Small Text", "[HR]\n[Kế toán]"))
+
+	def test_unknown_field_blocked(self):
+		# AC-24, E-1: each of the seven names alone, as an unknown name, in another letter case and with an
+		# accent (meta names are exact, STD-ERR-2); the other six hold real fields (decoy).
+		self.assertIsNone(self._save(VALID_TICKET_FIELDS))
+		stored_before = self._stored()
+		for fieldname in TICKET_FIELD_LABELS:
+			real = VALID_TICKET_FIELDS[fieldname]
+			for typed in ("khong_co_truong_nay", real.upper(), _accented(real), real.title()):
+				with self.subTest(fieldname=fieldname, typed=typed):
+					self.assertNotEqual(typed, real)
+					self.assertEqual(
+						self._save(VALID_TICKET_FIELDS | {fieldname: f" {typed} "}),
+						_unknown_ticket_field_error(fieldname, typed),
+					)
+		# Two wrong names: the first in form order is reported.
+		self.assertEqual(
+			self._save(VALID_TICKET_FIELDS | {"field_erp_module": "sai_mot", "field_serial_no": "sai_hai"}),
+			_unknown_ticket_field_error("field_erp_module", "sai_mot"),
+		)
+		self.assertEqual(self._stored(), stored_before)
+
+	def test_due_field_must_be_date(self):
+		# AC-24, E-2: Data, Link, Time, Small Text and Select fields are refused; an unknown name stays E-1.
+		self.assertIsNone(self._save(VALID_TICKET_FIELDS))
+		stored_before = self._stored()
+		for typed in ("subject", "priority", "opening_time", "ai_score_reason", "ai_confidence"):
+			with self.subTest(typed=typed):
+				self.assertEqual(self._save(VALID_TICKET_FIELDS | {"field_due_date": typed}), DUE_FIELD_ERROR)
+		self.assertEqual(
+			self._save(VALID_TICKET_FIELDS | {"field_due_date": "han_khong_co"}),
+			_unknown_ticket_field_error("field_due_date", "han_khong_co"),
+		)
+		self.assertEqual(self._stored(), stored_before)
+		# A Date and a Datetime field (Helpdesk's own) save.
+		for typed in ("opening_date", "resolution_by"):
+			with self.subTest(typed=typed):
+				self.assertIsNone(self._save({"field_due_date": typed}))
+				self.assertEqual(self._stored()["field_due_date"], typed)
+
+	def test_board_value_needs_origin_field(self):
+		# AC-24, E-3: the board value without the origin field is refused (empty or blank origin);
+		# the origin field without a board value saves, and so does a blank board value.
+		stored_before = self._stored()
+		for origin in ("", "   ", None):
+			with self.subTest(origin=origin):
+				self.assertEqual(
+					self._save({"origin_board_value": BOARD_VALUE, "field_origin": origin}), BOARD_VALUE_ERROR
+				)
+		self.assertEqual(self._stored(), stored_before)
+		self.assertIsNone(self._save({"origin_board_value": "  ", "field_origin": ""}))
+		self.assertEqual(self._stored()["origin_board_value"], "")
+		self.assertIsNone(self._save({"origin_board_value": "", "field_origin": "ai_confidence"}))
+		self.assertEqual(
+			(self._stored()["field_origin"], self._stored()["origin_board_value"]), ("ai_confidence", "")
+		)
+
+	def test_existing_custom_field_saves(self):
+		# AC-24: names of real fields (erp_ai's Custom Fields and Helpdesk's own) save, trimmed; blank names
+		# stay unset.
+		values = {fieldname: f"  {name}\t" for fieldname, name in VALID_TICKET_FIELDS.items()}
+		self.assertIsNone(self._save(values | {"origin_board_value": f" {BOARD_VALUE} "}))
+		self.assertEqual(self._stored(), VALID_TICKET_FIELDS | {"origin_board_value": BOARD_VALUE})
+		self.assertIsNone(self._save(dict.fromkeys(TICKET_FIELD_LABELS, "  ") | {"origin_board_value": ""}))
+		self.assertEqual(self._stored(), dict.fromkeys(TICKET_FIELD_SECTION[1:], ""))

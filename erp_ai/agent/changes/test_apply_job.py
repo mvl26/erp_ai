@@ -3,6 +3,7 @@ import hashlib
 import json
 import os
 import shutil
+import subprocess
 import time
 from unittest.mock import patch
 
@@ -2284,18 +2285,137 @@ class TestApplyCommand(ApplyJobTestCase):
 		self.assertEqual(frappe.db.get_value(PROPOSAL_DOCTYPE, name, "command_output"), "xong")
 		self.assertEqual(self.steps(name), ["approve", "apply"])
 
-	def test_failed_timed_out_and_missing_command_end_as_failed(self):
-		for fields, reason in (
-			({"exit_code": 2}, "lệnh thoát với mã 2"),
-			({"exit_code": None, "timed_out": True}, "lệnh chạy quá giờ và đã bị dừng"),
-			({"exit_code": 127, "not_found": True}, "không tìm thấy lệnh bench"),
-		):
-			name = self.command_proposal(["--site", frappe.local.site, "migrate"])
-			with patch.object(process_runner, "run_bench", return_value=self.result(**fields)):
-				apply_job.run_change(name, "apply")
+	def test_approved_command_runs_once_with_exact_args(self):
+		# AC-8, NFR-2: one process for the whole job, the approved arguments after `timeout -s KILL <n> bench`,
+		# no shell, in the bench directory, with a timeout; a bench command makes no git call (ADR-022 QĐ 1).
+		args = ["--site", frappe.local.site, "migrate"]
+		name = self.command_proposal(args)
+		done = subprocess.CompletedProcess(args=[], returncode=0, stdout="xong\n")
+		with patch("subprocess.run", return_value=done) as run:
+			apply_job.run_change(name, "apply")
 
-			state = self.state(name)
-			self.assertEqual((state.change_status, state.failure_reason), (CHANGE_STATUS_FAILED, reason))
+		self.assertEqual(run.call_count, 1)
+		(argv,), kwargs = run.call_args
+		self.assertEqual(argv[:3], ["timeout", "-s", "KILL"])
+		self.assertTrue(argv[3].isdigit() and 1 <= int(argv[3]) <= COMMAND_TIMEOUT_S, argv[3])
+		self.assertEqual(argv[4:], ["bench", *args])
+		self.assertFalse(kwargs.get("shell", False))
+		self.assertEqual(kwargs["cwd"], frappe.utils.get_bench_path())
+		self.assertGreater(kwargs["timeout"], int(argv[3]))
+		self.assertIs(kwargs["start_new_session"], True)
+		self.assertEqual([call for call in run.call_args_list if "git" in call.args[0]], [])
+		state = self.state(name)
+		self.assertEqual((state.change_status, state.exit_code), (CHANGE_STATUS_APPLIED, 0))
+		self.assertFalse(state.apply_commit_sha)
+		self.assertEqual(self.steps(name), ["approve", "apply"])
+
+	def test_nonzero_exit_and_missing_bench_fail(self):
+		# Design 4.3 step 4, word for word; every branch stores the exit code, duration and output on the
+		# proposal and in the `fail` row's `value_after`.
+		for fields, reason, stored_exit_code in (
+			({"exit_code": 2, "output": "lỗi"}, "lệnh trả mã 2", 2),
+			({"exit_code": 127, "not_found": True, "output": ""}, "không tìm thấy bench trên máy chủ", 127),
+			({"exit_code": None, "not_found": True, "output": ""}, "không tìm thấy bench trên máy chủ", 0),
+		):
+			with self.subTest(reason=reason, exit_code=fields["exit_code"]):
+				name = self.command_proposal(["--site", frappe.local.site, "migrate"])
+				result = self.result(duration_ms=34, **fields)
+				with patch.object(process_runner, "run_bench", return_value=result) as run_bench:
+					apply_job.run_change(name, "apply")
+
+				run_bench.assert_called_once()
+				state = self.state(name)
+				self.assertEqual((state.change_status, state.failure_reason), (CHANGE_STATUS_FAILED, reason))
+				stored = frappe.db.get_value(
+					PROPOSAL_DOCTYPE, name, ["exit_code", "duration_ms", "command_output"], as_dict=True
+				)
+				self.assertEqual(
+					(stored.exit_code, stored.duration_ms, stored.command_output),
+					(stored_exit_code, 34, fields["output"]),
+				)
+				self.assertEqual(self.steps(name), ["approve", "fail"])
+				self.assertEqual(
+					self.log_row(name, "fail")[1],
+					{"exit_code": fields["exit_code"], "duration_ms": 34, "output": fields["output"]},
+				)
+
+	def test_approved_command_tampered_to_denied_is_blocked_at_apply(self):
+		# AC-9: an approved command edited into a denied one never runs. Editing only the arguments trips the
+		# digest row; editing the digest too still meets the guard (design 4.3 step 4.2).
+		denied = ["--site", frappe.local.site, "execute", "frappe.db.truncate"]
+		for refresh_digest, reason in (
+			(False, "nội dung đề xuất đã bị sửa sau khi duyệt"),
+			(True, "lệnh không có trong danh sách cho phép"),
+		):
+			with self.subTest(refresh_digest=refresh_digest):
+				name = self.command_proposal(["--site", frappe.local.site, "migrate"])
+				frappe.db.set_value(PROPOSAL_DOCTYPE, name, "command_args", json.dumps(denied))
+				if refresh_digest:
+					digest = transitions.content_digest(frappe.get_doc(PROPOSAL_DOCTYPE, name))
+					frappe.db.set_value(PROPOSAL_DOCTYPE, name, "approved_digest", digest)
+				with patch("subprocess.run") as run:
+					apply_job.run_change(name, "apply")
+
+				run.assert_not_called()
+				state = self.state(name)
+				self.assertEqual((state.change_status, state.failure_reason), (CHANGE_STATUS_FAILED, reason))
+				self.assertEqual(self.steps(name), ["approve", "fail"])
+
+	def test_command_without_budget_fails_as_timeout_without_subprocess(self):
+		# Design addendum 2 QĐ-A3 and addendum 3 QĐ-B4: under 1 s left → `Lỗi` "quá thời gian", no process,
+		# exit code 0 on the proposal (no code) and null in the one `fail` row.
+		for left_s in (0.999, -5.0):
+			with self.subTest(left_s=left_s):
+				name = self.command_proposal(["version"])
+				clock = iter([1000.0])
+				with (
+					patch(
+						"time.monotonic", side_effect=lambda: next(clock, 1000.0 + COMMAND_TIMEOUT_S - left_s)
+					),
+					patch("subprocess.run") as run,
+				):
+					apply_job.run_change(name, "apply")
+
+				run.assert_not_called()
+				state = self.state(name)
+				self.assertEqual(
+					(state.change_status, state.failure_reason), (CHANGE_STATUS_FAILED, "quá thời gian")
+				)
+				stored = frappe.db.get_value(
+					PROPOSAL_DOCTYPE, name, ["exit_code", "duration_ms", "command_output"], as_dict=True
+				)
+				self.assertEqual(
+					(stored.exit_code, stored.duration_ms, stored.command_output or ""), (0, 0, "")
+				)
+				self.assertEqual(self.steps(name), ["approve", "fail"])
+				after = self.log_row(name, "fail")[1]
+				self.assertIsNone(after["exit_code"])
+				self.assertEqual((after["duration_ms"], after["output"]), (0, ""))
+				self.log_error.assert_not_called()
+
+	def test_command_budget_of_one_second_runs_with_limit_1(self):
+		name = self.command_proposal(["version"])
+		clock = iter([1000.0])
+		with (
+			patch("time.monotonic", side_effect=lambda: next(clock, 1000.0 + COMMAND_TIMEOUT_S - 1.0)),
+			patch.object(process_runner, "run_bench", return_value=self.result()) as run_bench,
+		):
+			apply_job.run_change(name, "apply")
+
+		run_bench.assert_called_once_with(["version"], 1)
+		self.assertEqual(self.state(name).change_status, CHANGE_STATUS_APPLIED)
+
+	def test_timed_out_command_ends_as_failed(self):
+		name = self.command_proposal(["--site", frappe.local.site, "migrate"])
+		timed_out = self.result(exit_code=None, timed_out=True)
+		with patch.object(process_runner, "run_bench", return_value=timed_out):
+			apply_job.run_change(name, "apply")
+
+		state = self.state(name)
+		self.assertEqual(
+			(state.change_status, state.failure_reason),
+			(CHANGE_STATUS_FAILED, "lệnh chạy quá giờ và đã bị dừng"),
+		)
 
 	def test_arguments_no_longer_allowed_never_run(self):
 		name = self.command_proposal(["build", "--app", APP])
@@ -2318,7 +2438,7 @@ class TestApplyCommand(ApplyJobTestCase):
 		(_, limit), _ = run_bench.call_args
 		self.assertEqual(limit, COMMAND_TIMEOUT_S - 100)
 
-	def test_state_is_committed_before_the_command_runs(self):
+	def test_applying_state_committed_before_subprocess(self):
 		name = self.command_proposal(["version"])
 		seen = []
 

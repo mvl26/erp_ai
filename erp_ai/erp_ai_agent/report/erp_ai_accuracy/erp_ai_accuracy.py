@@ -1,14 +1,53 @@
 import json
-from datetime import datetime
+from dataclasses import dataclass
+from datetime import datetime, timedelta
+from fractions import Fraction
 
 import frappe
 from frappe import _
-from frappe.utils import add_days, get_datetime, getdate
+from frappe.utils import add_days, get_datetime, getdate, now_datetime
 
 from erp_ai.constants import CATEGORIES, CLASSIFICATION_FIELDS, LOG_DOCTYPE
 
 TOTAL_LABEL = "Tổng"
 COUNT_KEYS = ("predictions", "labeled", "correct")
+GATE_WINDOW_DAYS = 14
+GATE_MIN_SAMPLE = 30
+GATE_MIN_ACCURACY = 0.85
+
+
+@dataclass(frozen=True)
+class GateResult:
+	verdict: str
+	labeled: int
+	correct: int
+
+
+def l0_l1_gate(now: datetime | None = None) -> GateResult:
+	"""Verdict of the L0 → L1 gate (AC-18), independent of the report's filters.
+
+	The sample is every ticket whose first successful `classify` row was created in
+	`(now - GATE_WINDOW_DAYS, now]`, labeled/correct by `label_outcome`. Fewer than `GATE_MIN_SAMPLE`
+	labeled → "Chưa đủ mẫu"; `correct / labeled >= GATE_MIN_ACCURACY` (exact, no float rounding) →
+	"Đạt"; otherwise "Chưa đạt".
+	"""
+	now = now or now_datetime()
+	start = now - timedelta(days=GATE_WINDOW_DAYS)
+	# `_fetch_classify_rows` keeps rows before its end: one microsecond past `now` keeps `now` itself.
+	rows = _fetch_classify_rows(now + timedelta(microseconds=1))
+	labeled = correct = 0
+	for row in _first_successes(rows):
+		if get_datetime(row.creation) > start:
+			row_labeled, row_correct = label_outcome(row)
+			labeled += row_labeled
+			correct += row_correct
+	if labeled < GATE_MIN_SAMPLE:
+		verdict = "Chưa đủ mẫu"
+	elif Fraction(correct, labeled) >= Fraction(str(GATE_MIN_ACCURACY)):
+		verdict = "Đạt"
+	else:
+		verdict = "Chưa đạt"
+	return GateResult(verdict, labeled, correct)
 
 
 def execute(filters=None):
@@ -123,11 +162,16 @@ def _fetch_classify_rows(end: datetime) -> list:
 
 def _first_predictions(rows: list, start: datetime) -> list:
 	"""The first row with a predicted category of each ticket, when it was created at or after `start`."""
+	return [row for row in _first_successes(rows) if get_datetime(row.creation) >= start]
+
+
+def _first_successes(rows: list) -> list:
+	"""The first row with a predicted category A-F of each ticket (`rows` oldest first)."""
 	first = {}
 	for row in rows:
 		if row.predicted_category in CATEGORIES:
 			first.setdefault(row.ticket, row)
-	return [row for row in first.values() if get_datetime(row.creation) >= start]
+	return list(first.values())
 
 
 def _failed_runs(rows: list, start: datetime) -> int:

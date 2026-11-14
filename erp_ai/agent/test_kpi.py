@@ -337,6 +337,9 @@ class TestKpi(FrappeTestCase):
 		hours_72 = timedelta(hours=72)
 		# counts: first moment of the window, its Task at exactly 72 h
 		_task(_ticket(window_start, ticket_type=TYPE_C), window_start + hours_72)
+		# counts: created the day before the week, inside the shifted window (A-D4), a fast Task
+		created = ws - timedelta(days=1)
+		_task(_ticket(created, ticket_type=TYPE_C), created + timedelta(hours=1))
 		# counts: one late Task, one early Task
 		created = ws + timedelta(days=1)
 		both = _ticket(created, ticket_type=TYPE_C)
@@ -358,8 +361,8 @@ class TestKpi(FrappeTestCase):
 
 		result = kpi.compute_week(WEEK_KPI5, self.settings)
 
-		self.assertEqual(result["c_task_sample"], 4)
-		self.assertEqual(result["c_task_in_3_days_pct"], 50.0)
+		self.assertEqual(result["c_task_sample"], 5)
+		self.assertEqual(result["c_task_in_3_days_pct"], 60.0)
 
 	def test_kpi6_stale_edges(self):
 		we = _start(WEEK_KPI6) + timedelta(days=7)

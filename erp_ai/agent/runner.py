@@ -83,6 +83,8 @@ WRITE_TOOL_TARGETS = {
 	"api_submit_record": (None, "name"),
 	"api_call_method": ("Method", "method"),
 }
+# Generic write tools: the model names the DocType; each successful call keeps its full snapshot (AC-13).
+GENERIC_WRITE_TOOLS = tuple(name for name, (doctype, _) in WRITE_TOOL_TARGETS.items() if doctype is None)
 # Record tools: their action entry also carries the before/after values and the instructor (AC-35).
 RECORD_TOOLS = frozenset(
 	("api_create_record", "api_update_record", "api_delete_record", "api_submit_record", "api_call_method")
@@ -691,6 +693,7 @@ def _run_tool(block, context, actions, before, after, tool_errors, skipped):
 		)
 	if name in WRITE_TOOL_TARGETS:
 		actions.append(_action(name, context, outcome, bool(outcome.get("ok")), arguments))
+		_record_snapshot(name, outcome, len(actions), before, after)
 		if outcome.get("ok") and "after" in outcome:
 			before[name] = outcome.get("before")
 			after[name] = outcome["after"]
@@ -698,6 +701,15 @@ def _run_tool(block, context, actions, before, after, tool_errors, skipped):
 			skipped.extend(outcome.get("skipped") or [])
 	content = json.dumps(outcome, ensure_ascii=False, default=str)[:TOOL_RESULT_MAX_CHARS]
 	return {"type": "tool_result", "tool_use_id": block["id"], "content": content}
+
+
+def _record_snapshot(name, outcome, n, before, after) -> None:
+	"""Keep a generic write call's full before/after under `<tool>#<n>`, n = its position in the turn's actions;
+	the snapshot is always taken out of the outcome, so it never reaches the model (design-amd2 §4.1)."""
+	snapshot = outcome.pop("_snapshot", None)
+	if name in GENERIC_WRITE_TOOLS and snapshot is not None:
+		before[f"{name}#{n}"] = snapshot["before"]
+		after[f"{name}#{n}"] = snapshot["after"]
 
 
 def _action(name, context, outcome, ok, arguments):

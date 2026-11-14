@@ -26,7 +26,25 @@ DOCTYPE_CONFIG = {
 		"field_count": 77,
 		"phrases": {
 			"enabled": ("Tắt", "4 đơn giá", "từ khóa kích hoạt"),
-			"permission_level": ("L0", "L1", "L2", "L3", "ngân sách"),
+			# FEAT-007 spec-addendum-3.md:88 (T64): from L2 up, ERP writes go through a proposal or a `Tự làm` row.
+			# T64 review round 1: keep the L3 gate (AC-3(2)), the automatic budget fallback and the
+			# design.md:184 sentence word for word.
+			"permission_level": (
+				"L0",
+				"L1",
+				"L2",
+				"L3",
+				"ngân sách",
+				"đề xuất",
+				"Tự làm",
+				"L3: mức của công cụ bản ghi chung",
+				"tự hạ về L1",
+				"Mức thực tế của từng phiếu",
+				"đọc dữ liệu",
+				"không ghi gì lên phiếu",
+				"Từ L2: ghi ERP ngoài phiếu",
+				"(L0 giữ nguyên)",
+			),
 			# FEAT-007 design.md:182: the AC-16 watermark of section_activation.
 			"agent_enabled_at": ("Hệ thống tự ghi", "không sửa được"),
 			"unrestricted_enabled": (
@@ -64,7 +82,19 @@ DOCTYPE_CONFIG = {
 			},
 			"confidence_threshold": ("từ 0 đến 100", "chỉ đăng một comment hỏi", "Làm luôn"),
 			"auto_approve_streak": ("từ 1 đến 100", "Tự làm", "đếm lại từ 0"),
-			"catalog_rules": ("Không có dòng nào", "Cấm", "Cần duyệt", "Tự làm", "bị chặn khi lưu"),
+			# FEAT-007 spec-addendum-4.md AC-29 (T64): no row = proposal awaiting approval; "Đổi trường" and
+			# the excluded-team group need a row; a child table is never a target.
+			"catalog_rules": (
+				"Không có dòng nào",
+				"Cấm",
+				"Cần duyệt",
+				"Tự làm",
+				"bị chặn khi lưu",
+				"chờ Duyệt",
+				"Đổi trường",
+				"bị từ chối",
+				"bảng con",
+			),
 			"user_templates": ("tạo tài khoản theo mẫu", "System Manager", "Guest"),
 			"max_turns_per_run": ("từ 1 đến 20", "dừng"),
 			"max_runs_per_ticket_per_day": ("từ 1 đến 50", "00:00"),
@@ -465,7 +495,10 @@ FEAT007_LOG_COLUMNS = {
 FORBIDDEN_PHRASES = {
 	# FEAT-007 design.md:162, 184: record tools moved from the code-change switch to their own switch.
 	"ERP AI Setting": {
-		"permission_level": ("ô Cho phép sửa code",),
+		# FEAT-007 spec-addendum-3.md:88 (T64): L2 no longer "has the same tools as L1".
+		"permission_level": ("ô Cho phép sửa code", "L2 có công cụ như L1"),
+		# FEAT-007 spec-addendum-4.md AC-29 (T64): an empty catalog no longer means "no ERP writes".
+		"catalog_rules": ("bot không ghi ERP ngoài phiếu",),
 		"code_change_enabled": ("tạo và sửa bản ghi trực tiếp",),
 	},
 	"ERP AI Log": {

@@ -1,9 +1,11 @@
 from contextlib import contextmanager
 from datetime import datetime, timedelta
-from unittest.mock import patch
+from unittest.mock import MagicMock, call, patch
 
 import frappe
 from frappe.tests.utils import FrappeTestCase
+from frappe.utils import synchronization
+from frappe.utils.file_lock import LockTimeoutError
 
 from erp_ai import hooks, tasks
 from erp_ai.agent import run_log, runner
@@ -17,6 +19,7 @@ from erp_ai.constants import (
 	KEY_STATUS_BAD_KEY,
 	KEY_STATUS_QUOTA_EXHAUSTED,
 	LOG_DOCTYPE,
+	LOGGER_NAME,
 	ROLE_AGENT,
 	SETTING_DOCTYPE,
 	TITLE_ALARM,
@@ -218,9 +221,9 @@ class TestCheckPrivilegeEscalation(FrappeTestCase):
 		commit_guard = patch.object(frappe.db, "commit", side_effect=AssertionError("commit in test"))
 		commit_guard.start()
 		self.addCleanup(commit_guard.stop)
-		log_error = patch("frappe.log_error")
-		self.log_error = log_error.start()
-		self.addCleanup(log_error.stop)
+		self.log_error_patch = patch("frappe.log_error")
+		self.log_error = self.log_error_patch.start()
+		self.addCleanup(self.log_error_patch.stop)
 		self.send_alarm_patch = patch("erp_ai.alerts.send_alarm")
 		self.send_alarm = self.send_alarm_patch.start()
 		self.addCleanup(self.send_alarm_patch.stop)
@@ -1358,6 +1361,236 @@ class TestCheckPrivilegeEscalation(FrappeTestCase):
 		self.log_error.assert_any_call(
 			TITLE_RUN_FAILED, "check_privilege_escalation email error=OutgoingEmailError"
 		)
+
+	def _real_alarms(self):
+		"""Let alarms write their real Error Log and Email Queue rows (rolled back with the test).
+		Returns the recipient whose queued mails are this test's."""
+		self.send_alarm_patch.stop()
+		self.log_error_patch.stop()
+		self.log_error = self.enterContext(patch("frappe.log_error", wraps=frappe.log_error))
+		recipient = f"erpai-t13-{frappe.generate_hash(length=8)}@example.invalid"
+		set_agent_settings(alert_recipients=recipient)
+		return recipient
+
+	def _alarm_rows(self, marker, recipient):
+		"""(alarm Error Log rows naming `marker`, Email Queue rows to `recipient`) in the current transaction."""
+		return (
+			frappe.db.count("Error Log", {"method": TITLE_ALARM, "error": ["like", f"%{marker}%"]}),
+			frappe.db.count("Email Queue Recipient", {"recipient": recipient}),
+		)
+
+	def _commit_branch(self, side_effect=None):
+		"""Take the job's commit branch without committing; returns the patched commit."""
+		self.addCleanup(setattr, frappe.flags, "in_test", frappe.flags.in_test)
+		frappe.flags.in_test = False
+		return self.enterContext(patch.object(frappe.db, "commit", side_effect=side_effect))
+
+	def _run_failures(self):
+		return [c.args for c in self.log_error.call_args_list if c.args[0] == TITLE_RUN_FAILED]
+
+	def test_whole_job_runs_under_site_lock_including_commit(self):
+		self.assertIs(getattr(tasks, "filelock", None), synchronization.filelock)
+		events = []
+
+		@contextmanager
+		def lock(*args, **kwargs):
+			events.append(("lock", args, kwargs))
+			yield
+			events.append("unlock")
+
+		def step(name):
+			def record(*args):
+				events.append(name)
+				return []
+
+			return record
+
+		self._commit_branch(side_effect=step("commit"))
+		self.enterContext(patch.object(tasks, "filelock", lock))
+		self.enterContext(patch.object(tasks, "_agent_role_drift", side_effect=step("first condition")))
+		self.enterContext(
+			patch.object(tasks, "_enabled_keys_without_value", side_effect=step("last condition"))
+		)
+		self.enterContext(patch.object(tasks, "_advance_privilege_watermark", side_effect=step("watermark")))
+
+		self._run()
+
+		# Per site (no `is_global`), 60 s; the conditions, the watermark and the commit all hold the lock.
+		self.assertEqual(
+			events,
+			[
+				("lock", ("erp_ai_privilege_alert",), {"timeout": 60}),
+				"first condition",
+				"last condition",
+				"watermark",
+				"commit",
+				"unlock",
+			],
+		)
+		self.assertEqual(
+			(tasks.PRIVILEGE_ALERT_LOCK, tasks.PRIVILEGE_ALERT_LOCK_TIMEOUT_S), ("erp_ai_privilege_alert", 60)
+		)
+
+	def test_busy_lock_skips_run_without_moving_watermark(self):
+		recipient = self._real_alarms()
+		self._create_profile(f"T13 khóa bận {frappe.generate_hash(length=6)}")
+		self._add_role("System Manager")
+		self._add_server_script(AGENT_USER, disabled=0)
+		self._add_empty_key()
+		conditions = [
+			self.enterContext(patch.object(tasks, name, wraps=getattr(tasks, name)))
+			for name in (
+				"_agent_role_drift",
+				"_privilege_changes_by_agent",
+				"_enabled_scripts_by_agent",
+				"_enabled_keys_without_value",
+			)
+		]
+		watermark_writes = self._watermark_writes()
+		busy = MagicMock()
+		busy.return_value.__enter__.side_effect = LockTimeoutError("held by another process")
+
+		with patch.object(tasks, "filelock", busy):
+			tasks.check_privilege_escalation(now=RUN_AT)
+
+		self.assertEqual(
+			self.log_error.call_args_list, [call(TITLE_RUN_FAILED, "check_privilege_escalation lock busy")]
+		)
+		self.assertEqual([condition.call_count for condition in conditions], [0, 0, 0, 0])
+		self.assertEqual(watermark_writes(), [])
+		self.assertEqual(self._watermark(), WATERMARK)
+		self.assertEqual(frappe.db.count("Email Queue Recipient", {"recipient": recipient}), 0)
+
+		# Control: with the lock free, the same seed alarms on all four conditions and moves the watermark.
+		tasks.check_privilege_escalation(now=RUN_AT)
+
+		self.assertEqual([condition.call_count for condition in conditions], [1, 1, 1, 1])
+		self.assertEqual(frappe.db.count("Email Queue Recipient", {"recipient": recipient}), 4)
+		self.assertEqual(self._watermark(), UPPER)
+
+	def test_alarm_error_log_and_mail_written_before_commit_with_watermark(self):
+		recipient = self._real_alarms()
+		profile = self._create_profile(f"T13 trước commit {frappe.generate_hash(length=6)}")
+		at_commit = []
+
+		self._commit_branch(
+			side_effect=lambda: at_commit.append((*self._alarm_rows(profile, recipient), self._watermark()))
+		)
+		tasks.check_privilege_escalation(now=RUN_AT)
+
+		self.assertEqual(self._run_failures(), [])
+		# One commit, and the alarm Error Log, its mail and the watermark are all written before it.
+		self.assertEqual(at_commit, [(1, 1, UPPER)])
+
+	def test_failed_run_keeps_watermark_and_realarms_once(self):
+		recipient = self._real_alarms()
+		profile = self._create_profile(f"T13 lỗi {frappe.generate_hash(length=6)}")
+		frappe.db.savepoint("t13_before_job")
+		real_rollback = frappe.db.rollback
+		rollback = self.enterContext(
+			patch.object(
+				frappe.db,
+				"rollback",
+				side_effect=lambda *args, **kwargs: real_rollback(save_point="t13_before_job"),
+			)
+		)
+		commit = self._commit_branch()
+
+		@contextmanager
+		def failing_commit():
+			commit.side_effect = frappe.QueryTimeoutError("boom")
+			try:
+				yield
+			finally:
+				commit.side_effect = None
+
+		failures = {
+			# After the permission alarm, before the watermark.
+			"last condition": patch.object(
+				tasks, "_enabled_keys_without_value", side_effect=frappe.QueryTimeoutError("boom")
+			),
+			# After the alarm, its mail and the watermark were all written.
+			"commit": failing_commit(),
+		}
+
+		# `tabError Log` is MyISAM on MariaDB, so the alarm Error Log row itself survives a rollback: only the
+		# mail and the watermark (InnoDB) are asserted here.
+		for where, failure in failures.items():
+			with self.subTest(fails_at=where), failure:
+				tasks.check_privilege_escalation(now=RUN_AT)
+
+				self.assertEqual(self._alarm_rows(profile, recipient)[1], 0)
+				self.assertEqual(self._watermark(), WATERMARK)
+
+		self.assertEqual(rollback.call_count, 2)
+		self.assertEqual(
+			self._run_failures(),
+			[(TITLE_RUN_FAILED, "check_privilege_escalation error=QueryTimeoutError")] * 2,
+		)
+
+		tasks.check_privilege_escalation(now=RUN_AT)
+		self.assertEqual(self._alarm_rows(profile, recipient)[1], 1)
+		self.assertEqual(self._watermark(), UPPER)
+		tasks.check_privilege_escalation(now=RUN_AT + timedelta(days=1))
+
+		self.assertEqual(self._alarm_rows(profile, recipient)[1], 1)
+		self.assertEqual(self._watermark(), UPPER + timedelta(days=1))
+		self.assertEqual(rollback.call_count, 2)
+		self.assertEqual(len(self._run_failures()), 2)
+
+	def test_run_logs_window_and_change_count_without_names(self):
+		role = self._test_role("T13 nhật ký")
+		user = "erpai-t13-log@example.invalid"
+		self._log_row(
+			[
+				_hand_action("api_update_record", "User", user),
+				_hand_action("api_update_record", "Custom DocPerm", "perm-t13"),
+			],
+			{"api_update_record#1": {"name": user, "roles": []}},
+			{"api_update_record#1": {"name": user, "roles": [{"role": role}]}},
+		)
+		self._add_role("System Manager")
+		self._add_server_script(AGENT_USER, disabled=0)
+		# One mock per logger name, so a line sent to another logger is not counted as the job's.
+		loggers = {}
+		self.enterContext(
+			patch(
+				"frappe.logger",
+				side_effect=lambda module=None, *args, **kwargs: loggers.setdefault(module, MagicMock()),
+			)
+		)
+		line_format = "check_privilege_escalation window=%s..%s changes=%d"
+
+		self._run()
+
+		# 2 permission entries, while 3 conditions alarm with 4 names in all: only permission entries are counted.
+		self.assertEqual(self.send_alarm.call_count, 3)
+		info = loggers.get(LOGGER_NAME, MagicMock()).info
+		self.assertEqual(info.call_args_list, [call(line_format, WATERMARK, UPPER, 2)])
+		line = line_format % info.call_args.args[1:]
+		self.assertEqual(
+			line, "check_privilege_escalation window=2031-11-15 08:00:00..2031-11-15 08:55:00 changes=2"
+		)
+		for name in (user, role, "System Manager", INSTRUCTOR, AGENT_USER):
+			self.assertNotIn(name, line)
+		self.assertEqual(
+			[
+				logged
+				for module, logger in loggers.items()
+				if module != LOGGER_NAME
+				for logged in logger.info.call_args_list
+				if "check_privilege_escalation" in str(logged)
+			],
+			[],
+		)
+
+		# Never alarmed yet: the lower end is printed as None.
+		self._set_raw_watermark(None)
+		info.reset_mock()
+		with patch.object(tasks, "_privilege_changes_by_agent", return_value=["a", "b", "c"]):
+			self._run()
+
+		self.assertEqual(info.call_args_list, [call(line_format, None, UPPER, 3)])
 
 
 class TestReprobeExhaustedKeys(FrappeTestCase):

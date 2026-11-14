@@ -472,7 +472,13 @@ class TestGate(AccuracyTestCase):
 
 	def test_rows_of_other_entry_types_are_ignored(self):
 		self._sample(29, 29)
-		name = make_log_entry(run_id=f"{PREFIX}gate-reason", entry_type="reason", predicted_category="A")
+		# a full, correct prediction: only the `entry_type` keeps it out of the sample (else 30 of 30, "Đạt")
+		name = make_log_entry(
+			run_id=f"{PREFIX}gate-reason",
+			entry_type="reason",
+			predicted_category="A",
+			**{f"predicted_{field}": value for field, value in PREDICTED.items()},
+		)
 		frappe.db.set_value(
 			LOG_DOCTYPE,
 			name,

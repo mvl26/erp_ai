@@ -1967,6 +1967,209 @@ class TestRunnerRecordSnapshots(RunnerTestBase):
 		)
 
 
+TURN_USER = "runner.turn.undo@example.com"
+TURN_KEPT_ROLE, TURN_ADDED_ROLE = "Blogger", "Knowledge Base Contributor"
+# Written out, not read from runner, so a test of the order still runs when the constant is missing.
+TURN_SAVEPOINT = "erp_ai_reason_turn"
+TURN_NOTE_OLD, TURN_NOTE_NEW = f"{PREFIX}turn undo note", f"{PREFIX}turn undo note renamed"
+
+
+class TurnFaultForTest(Exception):
+	"""The fault a test injects into a turn; its class name must reach the Error Log unchanged."""
+
+
+class TestRunnerTurnUndo(RunnerTestBase):
+	"""NFR-3, ADR-024 QĐ 2: a turn failing after its tools ran is undone to the point right after its model call."""
+
+	def setUp(self):
+		super().setUp()
+		set_agent_settings(
+			permission_level="L3",
+			code_change_enabled=1,
+			unrestricted_enabled=0,
+			monthly_budget_usd=1000,
+			max_turns_per_run=8,
+		)
+		make_instructor(self)
+		frappe.get_doc(
+			{
+				"doctype": "User",
+				"email": TURN_USER,
+				"first_name": "Hoàn tác lượt",
+				"send_welcome_email": 0,
+				"roles": [{"role": TURN_KEPT_ROLE}],
+			}
+		).insert()
+		self.note = frappe.get_doc({"doctype": "Note", "title": TURN_NOTE_OLD, "public": 1}).insert().name
+		self.key_row = add_credential(f"{PREFIX}turn key")
+		self.events = []
+		self.roles_at_fault = []
+		self.gateway.on_call = self._on_model_call
+		self.old_errors = frappe.get_all(
+			"Error Log",
+			filters={"method": TITLE_RUN_FAILED, "error": ["like", f"ticket={self.ticket.name} %"]},
+			pluck="name",
+		)
+
+	def _reason_calls(self):
+		return sum(1 for call in self.gateway.calls if call["task"] == "reason")
+
+	def _on_model_call(self, task, kwargs):
+		"""The second reason call writes gateway key state, as `apply_failure` does, before the turn's tools run."""
+		self.events.append(("model",))
+		if task == "reason" and self._reason_calls() == 2:
+			frappe.db.set_value(
+				CREDENTIAL_DOCTYPE, self.key_row, {"status": KEY_STATUS_BAD_KEY}, update_modified=False
+			)
+
+	def _roles(self):
+		return sorted(frappe.get_all("Has Role", {"parent": TURN_USER, "parenttype": "User"}, pluck="role"))
+
+	def _run_turns(self, second_turn_result=None, *patches):
+		"""Turn 1 renames the note; turn 2 adds a role to the user (or gets `second_turn_result`); then a final answer."""
+		self.gateway.calls.clear()
+		self.gateway.results = [
+			tool_turn(
+				tool_use(
+					"toolu_1",
+					"api_update_record",
+					doctype="Note",
+					name=self.note,
+					values={"title": TURN_NOTE_NEW},
+				)
+			),
+			second_turn_result
+			or tool_turn(
+				tool_use(
+					"toolu_2",
+					"api_update_record",
+					doctype="User",
+					name=TURN_USER,
+					values={"roles": [{"role": TURN_KEPT_ROLE}, {"role": TURN_ADDED_ROLE}]},
+				)
+			),
+			make_model_result(),
+		]
+		real_savepoint, real_rollback, real_release = (
+			frappe.db.savepoint,
+			frappe.db.rollback,
+			frappe.db.release_savepoint,
+		)
+
+		def savepoint(save_point):
+			self.events.append(("savepoint", save_point))
+			return real_savepoint(save_point)
+
+		def rollback(*args, **kwargs):
+			self.events.append(("rollback", kwargs.get("save_point")))
+			return real_rollback(*args, **kwargs)
+
+		def release_savepoint(save_point):
+			self.events.append(("release", save_point))
+			return real_release(save_point)
+
+		with (
+			patch.object(authority, "latest_instructor", return_value=INSTRUCTOR),
+			patch.object(frappe.db, "savepoint", side_effect=savepoint),
+			patch.object(frappe.db, "rollback", side_effect=rollback),
+			patch.object(frappe.db, "release_savepoint", side_effect=release_savepoint),
+		):
+			for item in patches:
+				item.start()
+			try:
+				self._run("comment_mention")
+			finally:
+				for item in reversed(patches):
+					item.stop()
+
+	def _turn_events(self):
+		"""Model calls and every savepoint, rollback or release that names the turn savepoint, in order."""
+		return [event for event in self.events if event == ("model",) or event[1:] == (TURN_SAVEPOINT,)]
+
+	def _run_failed_errors(self):
+		"""Messages of the `TITLE_RUN_FAILED` Error Logs of this ticket written since `setUp` (ticket names are reused)."""
+		filters = {"method": TITLE_RUN_FAILED, "error": ["like", f"ticket={self.ticket.name} %"]}
+		if self.old_errors:
+			filters["name"] = ["not in", self.old_errors]
+		return frappe.get_all("Error Log", filters=filters, pluck="error")
+
+	def _assert_second_turn_undone(self):
+		# the role really was added before the fault, then undone
+		self.assertEqual(self.roles_at_fault, [sorted([TURN_KEPT_ROLE, TURN_ADDED_ROLE])])
+		self.assertEqual(self._roles(), [TURN_KEPT_ROLE])
+		self.assertEqual(self._entries(entry_type="reason", turn=2), [])
+		self.assertEqual(
+			self._run_failed_errors(),
+			[f"ticket={self.ticket.name} trigger=comment_mention error=TurnFaultForTest"],
+		)
+		# the earlier successful turn keeps its change and its row
+		self.assertEqual(frappe.db.get_value("Note", self.note, "title"), TURN_NOTE_NEW)
+		(first,) = self._entries(entry_type="reason", turn=1)
+		self.assertEqual(
+			[(action["tool"], action["doctype"], action["ok"]) for action in json.loads(first.actions)],
+			[("api_update_record", "Note", True)],
+		)
+		# the gateway state written by the failing turn's own model call survives the undo
+		self.assertEqual(frappe.db.get_value(CREDENTIAL_DOCTYPE, self.key_row, "status"), KEY_STATUS_BAD_KEY)
+		self.assertEqual(
+			self._turn_events(),
+			[
+				("model",),
+				("savepoint", TURN_SAVEPOINT),
+				("model",),
+				("savepoint", TURN_SAVEPOINT),
+				("rollback", TURN_SAVEPOINT),
+			],
+		)
+
+	def test_write_entry_failure_undoes_turn_role_change(self):
+		def failing_write_entry(**fields):
+			name = write_entry(**fields)
+			if fields.get("entry_type") == "reason" and fields.get("turn") == 2:
+				self.roles_at_fault.append(self._roles())
+				raise TurnFaultForTest("write_entry")
+			return name
+
+		self._run_turns(None, patch.object(runner, "write_entry", side_effect=failing_write_entry))
+
+		self._assert_second_turn_undone()
+
+	def test_snapshot_handling_failure_undoes_turn(self):
+		record_snapshot = runner._record_snapshot
+
+		def failing_record_snapshot(name, outcome, n, before, after):
+			record_snapshot(name, outcome, n, before, after)
+			if self._reason_calls() == 2:
+				self.roles_at_fault.append(self._roles())
+				raise TurnFaultForTest("snapshot")
+
+		self._run_turns(None, patch.object(runner, "_record_snapshot", side_effect=failing_record_snapshot))
+
+		self._assert_second_turn_undone()
+
+	def test_successful_turns_set_savepoint_after_each_model_call_never_release(self):
+		self._run_turns()
+
+		self.assertEqual(self._roles(), sorted([TURN_KEPT_ROLE, TURN_ADDED_ROLE]))
+		self.assertEqual(frappe.db.get_value("Note", self.note, "title"), TURN_NOTE_NEW)
+		self.assertEqual([entry.turn for entry in self._entries(entry_type="reason")], [1, 2, 3])
+		self.assertEqual(self._run_failed_errors(), [])
+		self.assertEqual(self._turn_events(), [("model",), ("savepoint", TURN_SAVEPOINT)] * 3)
+		self.assertEqual(runner.REASON_TURN_SAVEPOINT, TURN_SAVEPOINT)
+
+	def test_gateway_error_turn_writes_its_entry_and_undoes_nothing(self):
+		self._run_turns(GatewayError("all_keys_failed", status=529, credential_label=f"{PREFIX}turn key"))
+
+		self.assertEqual(frappe.db.get_value("Note", self.note, "title"), TURN_NOTE_NEW)
+		self.assertEqual(frappe.db.get_value(CREDENTIAL_DOCTYPE, self.key_row, "status"), KEY_STATUS_BAD_KEY)
+		self.assertEqual(
+			[(entry.turn, entry.stop_reason, entry.error) for entry in self._entries(entry_type="reason")],
+			[(1, "tool_use", None), (2, "gateway_error", "all_keys_failed status=529")],
+		)
+		self.assertEqual(self._run_failed_errors(), [])
+		self.assertEqual(self._turn_events(), [("model",), ("savepoint", TURN_SAVEPOINT), ("model",)])
+
+
 # Hand-written: the tools a run with an instructor gets when no change group is granted (FEAT-001/006 set).
 BASE_TOOL_NAMES_WITH_INSTRUCTOR = [
 	"get_ticket",

@@ -101,6 +101,8 @@ REASON_TASK_EXISTS = "phiếu đã có Task liên kết"
 ROUTE_SAVEPOINT = "erp_ai_route"
 # One write unit after (u1) (assign, comment) nests inside the savepoint above.
 ROUTE_UNIT_SAVEPOINT = "erp_ai_route_unit"
+# Set right after each reason turn's model call: a failing turn is undone to here (ADR-024 QĐ 2).
+REASON_TURN_SAVEPOINT = "erp_ai_reason_turn"
 USAGE_COLUMNS = ("input_tokens", "output_tokens", "cache_creation_input_tokens", "cache_read_input_tokens")
 
 
@@ -630,34 +632,47 @@ def _reason(ticket_name, trigger, run_id, settings, context, classification, dea
 			)
 			return
 
-		tool_blocks = [block for block in result.content if block.get("type") == "tool_use"]
-		tool_results, actions, before, after, tool_errors, skipped = [], [], {}, {}, [], []
-		# the whole turn waits, before any of its tools runs (D-6)
-		if delay is not None and any(block["name"] == ANSWER_TOOL for block in tool_blocks):
-			delay.wait_before_answer(deadline)
-		for block in tool_blocks:
-			status.working(block["name"])
-			tool_results.append(_run_tool(block, context, actions, before, after, tool_errors, skipped))
-		stop_reason = result.stop_reason
-		wants_tools = stop_reason == STOP_TOOL_USE
-		if wants_tools and turn == max_turns:
-			stop_reason = STOP_MAX_TURNS
-		write_entry(
-			**base,
-			**_call_fields(result),
-			turn=turn,
-			stop_reason=stop_reason,
-			tools_called=[block["name"] for block in tool_blocks] or None,
-			error="; ".join([*tool_errors, *status.take_errors()]) or None,
-			actions=actions or None,
-			value_before=before or None,
-			value_after=after or None,
-			skipped_fields=skipped or None,
-		)
+		# after the call, so the gateway key state it wrote survives an undo; not released: the commit of
+		# `write_entry` ends it, and the next turn's savepoint of the same name replaces it
+		frappe.db.savepoint(REASON_TURN_SAVEPOINT)
+		try:
+			tool_blocks = [block for block in result.content if block.get("type") == "tool_use"]
+			tool_results, actions, before, after, tool_errors, skipped = [], [], {}, {}, [], []
+			# the whole turn waits, before any of its tools runs (D-6)
+			if delay is not None and any(block["name"] == ANSWER_TOOL for block in tool_blocks):
+				delay.wait_before_answer(deadline)
+			for block in tool_blocks:
+				status.working(block["name"])
+				tool_results.append(_run_tool(block, context, actions, before, after, tool_errors, skipped))
+			stop_reason = result.stop_reason
+			wants_tools = stop_reason == STOP_TOOL_USE
+			if wants_tools and turn == max_turns:
+				stop_reason = STOP_MAX_TURNS
+			write_entry(
+				**base,
+				**_call_fields(result),
+				turn=turn,
+				stop_reason=stop_reason,
+				tools_called=[block["name"] for block in tool_blocks] or None,
+				error="; ".join([*tool_errors, *status.take_errors()]) or None,
+				actions=actions or None,
+				value_before=before or None,
+				value_after=after or None,
+				skipped_fields=skipped or None,
+			)
+		except Exception:
+			# no change of the turn may be committed without its `reason` entry (NFR-3); `run_for_ticket` logs it
+			_undo_turn()
+			raise
 		if not wants_tools or not tool_results:
 			return
 		messages.append({"role": "assistant", "content": result.content})
 		messages.append({"role": "user", "content": tool_results})
+
+
+def _undo_turn() -> None:
+	"""Undo the uncommitted writes of the failing reason turn, back to right after its model call."""
+	frappe.db.rollback(save_point=REASON_TURN_SAVEPOINT)
 
 
 def _run_tool(block, context, actions, before, after, tool_errors, skipped):

@@ -9,6 +9,7 @@ Approved-by:
 
 Mỗi task 2–5 phút. Hai task chung file thì phụ thuộc nhau. Đánh dấu `BLOCKED: <lý do>` cuối dòng khi bị chặn. Nhãn `[F6]` = task sửa ít nhất một trong các file FEAT-006 cũng sửa (danh sách ở `plan.md`); dev phải đọc mã FEAT-006 thật trước và không đổi hành vi hay assertion của nó (STD-TEST-5).
 `cmd.test_one` = lệnh của profile với `{file}` là file ở `test:`. Mọi task: viết test đỏ trước (STD-TEST-1), chỉ sửa trong `files:`, không skip/xfail. Tên hàm, hằng, chuỗi chính xác: `plan.md` mục Ràng buộc chung và `design.md` mục 2–4 (số dòng `file:line` trong design là của `team/FEAT-003`; dò lại trên nền thật). Task sửa `*.json` của DocType: chạy `cmd.migrate` rồi mới `cmd.test_one`. Mọi test có git dùng `GitSandbox` (T36, T51), không chạy git trong `apps/` thật (NFR-9).
+Con trỏ CHG-002 (2026-11-15): các task của Amendment 4 (AC-36..AC-57) KHÔNG nằm trong file này; xem `docs/team/features/CHG-002/tasks.md` và `plan.md` (T0..T51, nhánh `team/CHG-002`).
 
 Nhánh nền: **`team/FEAT-006 (hash at build time)`**. Build chỉ bắt đầu sau khi FEAT-006 qua verify; tech-lead tạo `team/FEAT-004` từ đầu nhánh đó, ghi mã commit thật vào dòng dưới và chạy `cmd.test` trước T1.
 Tiến độ: BASE ghi ở đây trước mỗi lần gọi dev.

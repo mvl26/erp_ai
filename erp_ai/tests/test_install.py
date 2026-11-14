@@ -117,7 +117,7 @@ class TestInstall(FrappeTestCase):
 		self.assertEqual(_counts(), before)
 		self.assertEqual(before["roles"], 2)
 		self.assertEqual(before["users"], 1)
-		self.assertEqual(before["ai_fields"], 10)
+		self.assertEqual(before["ai_fields"], 11)
 
 	def test_ai_fields_permlevel_8_and_template_rows_agents_only(self):
 		for name in AI_FIELDS:
@@ -865,7 +865,11 @@ class TestFeat007Migrate(FrappeTestCase):
 			patch.object(install.frappe, "logger") as logger,
 		):
 			install.ensure_setup()
-		warnings = [c.args for c in logger.return_value.warning.call_args_list if "HD Article" in c.args[0]]
+		warnings = [
+			c.args
+			for c in logger.return_value.warning.call_args_list
+			if "HD Article" in c.args[0] and "permission" not in c.args[0]
+		]
 		self.assertEqual(len(warnings), 1)
 		self.assertIn("not found", warnings[0][0])
 		self.assertIsNone(self._custom_field("HD Article", "ai_source_ticket"))
@@ -969,7 +973,8 @@ class TestFeat007Migrate(FrappeTestCase):
 	def test_instructor_article_perm_read_report_only(self):
 		"""Ruling (1b), ADR-015, AC-45: ERP AI Instructor reads HD Article (read, report), nothing else."""
 		self._clear_article_meta_after_test()
-		frappe.db.delete("Custom DocPerm", {"parent": ARTICLE, "role": ROLE_INSTRUCTOR})
+		# Own starting state: no Custom DocPerm on HD Article, whatever an earlier run left on the site.
+		frappe.db.delete("Custom DocPerm", {"parent": ARTICLE})
 		install.ensure_setup()
 		self._assert_instructor_read_report_only()
 		meta_rows = [p for p in frappe.get_meta(ARTICLE).permissions if p.role == ROLE_INSTRUCTOR]
@@ -1046,7 +1051,7 @@ class TestFeat007Migrate(FrappeTestCase):
 		self.assertEqual(len(self._instructor_article_perms()), 1)
 
 	def test_article_perm_skipped_when_doctype_missing(self):
-		"""No HD Article DocType: one warning, no Custom DocPerm copied or added."""
+		"""No HD Article DocType: one permission warning, no Custom DocPerm copied or added."""
 		self._clear_article_meta_after_test()
 		frappe.db.delete("Custom DocPerm", {"parent": ARTICLE})
 		real = frappe.db.exists
@@ -1059,7 +1064,13 @@ class TestFeat007Migrate(FrappeTestCase):
 			patch.object(install.frappe, "logger") as logger,
 		):
 			install.ensure_setup()
-		warnings = [c.args for c in logger.return_value.warning.call_args_list if ARTICLE in c.args[0]]
+		# The source field logs its own warning (T22); this one speaks for the permission only.
+		warnings = [
+			c.args
+			for c in logger.return_value.warning.call_args_list
+			if ARTICLE in c.args[0] and "permission" in c.args[0]
+		]
 		self.assertEqual(len(warnings), 1)
 		self.assertIn("not found", warnings[0][0])
+		self.assertNotIn("source ticket field", warnings[0][0])
 		self.assertEqual(_article_custom_perms(), [])

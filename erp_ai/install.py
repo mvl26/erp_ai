@@ -267,7 +267,8 @@ def _ensure_task_ticket_field() -> None:
 
 def _ensure_article_source_field() -> None:
 	if not frappe.db.exists("DocType", ARTICLE_DOCTYPE):
-		return  # _ensure_article_instructor_permission logs the missing DocType once
+		frappe.logger(LOGGER_NAME).warning("DocType HD Article not found; source ticket field not added")
+		return
 	# update=False: a field that exists is left as the human set it.
 	create_custom_fields(
 		{
@@ -320,9 +321,7 @@ def _ensure_task_permission() -> None:
 
 def _ensure_article_instructor_permission() -> None:
 	if not frappe.db.exists("DocType", ARTICLE_DOCTYPE):
-		frappe.logger(LOGGER_NAME).warning(
-			"DocType HD Article not found; source ticket field and instructor permission not added"
-		)
+		frappe.logger(LOGGER_NAME).warning("DocType HD Article not found; instructor permission not added")
 		return
 	# Copy the standard DocPerm first: once a Custom DocPerm exists, the standard rows are ignored (ADR-015).
 	setup_custom_perms(ARTICLE_DOCTYPE)

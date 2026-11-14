@@ -237,6 +237,8 @@ class TestKeepAgentSettings(FrappeTestCase):
 		commit_guard = patch.object(frappe.db, "commit", side_effect=AssertionError("test must not commit"))
 		commit_guard.start()
 		self.addCleanup(commit_guard.stop)
+		# The rollback empties `value_cache` but not the document cache the test fills.
+		self.addCleanup(frappe.clear_document_cache, SETTING_DOCTYPE, SETTING_DOCTYPE)
 		self.addCleanup(frappe.db.rollback)
 
 	def test_restores_singles_and_child_rows(self):
@@ -254,10 +256,13 @@ class TestKeepAgentSettings(FrappeTestCase):
 		add_credential(f"{PREFIX}keep-new")
 		self.assertNotEqual(_setting_singles(), singles_before)
 		self.assertNotEqual(_credential_rows(), rows_before)
+		# Fill both caches with the changed values; the raw-SQL restore does not touch them.
+		self.assertEqual(frappe.db.get_single_value(SETTING_DOCTYPE, "trigger_keyword"), f"{PREFIX}changed")
+		self.assertIsNone(frappe.get_cached_doc(SETTING_DOCTYPE).thinking_text)
 
 		inner.doCleanups()
 
 		self.assertEqual(_setting_singles(), singles_before)
 		self.assertEqual(_credential_rows(), rows_before)
 		self.assertEqual(frappe.db.get_single_value(SETTING_DOCTYPE, "trigger_keyword"), f"{PREFIX}keyword")
-		self.assertEqual(frappe.get_single(SETTING_DOCTYPE).thinking_text, f"{PREFIX}thinking")
+		self.assertEqual(frappe.get_cached_doc(SETTING_DOCTYPE).thinking_text, f"{PREFIX}thinking")

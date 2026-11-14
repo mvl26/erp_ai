@@ -15,11 +15,12 @@ from frappe.utils.synchronization import filelock
 
 from erp_ai.agent import change_text, policy
 from erp_ai.agent.authority import NEVER_AUTHORITY
-from erp_ai.agent.changes import file_writer, process_runner, result_comment, transitions
+from erp_ai.agent.changes import block, file_writer, process_runner, result_comment, transitions
 from erp_ai.agent.tools import change_guard, source
 from erp_ai.constants import (
 	BOT_GIT_EMAIL,
 	CHANGE_KIND_CODE,
+	CHANGE_OP_EDIT,
 	CHANGE_STATUS_APPLIED,
 	CHANGE_STATUS_APPLYING,
 	CHANGE_STATUS_APPROVED,
@@ -201,7 +202,9 @@ def _run(proposal, action: str, actor: str, deadline: float) -> str:
 		_undo_code(proposal, actor, _recheck(proposal, action), deadline)
 		return CHANGE_STATUS_UNDONE
 	allowed_apps = _recheck(proposal, action)
-	if proposal.change_kind == CHANGE_KIND_CODE:
+	if block.is_block(proposal):
+		_apply_block(proposal, actor, allowed_apps, deadline)
+	elif proposal.change_kind == CHANGE_KIND_CODE:
 		_apply_code(proposal, actor, allowed_apps, deadline)
 	else:
 		_apply_command(proposal, actor, deadline)
@@ -234,6 +237,9 @@ def _recheck(proposal, action: str) -> tuple[str, ...]:
 		allowed_apps = (proposal.app,)
 	if transitions.content_digest(proposal) != proposal.approved_digest:
 		raise _Stop(CHANGE_STATUS_FAILED, DIGEST_CHANGED)
+	if block.is_block(proposal):
+		# CHG-002 T1 walking skeleton: runner, role, switch and digest only; `_apply_block` guards its item.
+		return allowed_apps
 	if proposal.change_kind == CHANGE_KIND_CODE:
 		# The applied file exists at undo time, so the guard sees it as a changed file then.
 		new_file = action == ACTION_APPLY and bool(proposal.is_new_file)
@@ -468,6 +474,32 @@ def _apply_code(proposal, actor: str, allowed_apps, deadline: float) -> None:
 			lambda: _give_back(proposal, full, repo, restore, new_file=new_file, expected_head=old_head),
 		)
 		raise
+
+
+def _apply_block(proposal, actor: str, allowed_apps, deadline: float) -> None:
+	"""CHG-002 T1 walking skeleton: a block of exactly one `Sửa` item takes the one-file apply path.
+
+	The item is seen through the fields `_apply_code` reads, so the guard, stale check, write, one commit
+	of that one path, post-check and `Đã áp dụng` are those of the old shape. Later tasks replace this.
+	"""
+	operations = block.operations_of(proposal)
+	if len(operations) != 1 or operations[0].kind != CHANGE_OP_EDIT or block.commands_of(proposal):
+		raise _Stop(CHANGE_STATUS_FAILED, change_guard.OP_UNKNOWN)
+	(operation,) = operations
+	if hashlib.sha256(operation.after.encode("utf-8")).hexdigest() != operation.after_hash:
+		raise _Stop(CHANGE_STATUS_FAILED, STORED_HASH_MISMATCH)
+	item = frappe._dict(
+		name=proposal.name,
+		ticket=proposal.ticket,
+		target_branch=proposal.target_branch,
+		file_path=operation.path,
+		is_new_file=0,
+		content_before=operation.before,
+		content_after=operation.after,
+		base_hash=operation.base_hash,
+		after_hash=operation.after_hash,
+	)
+	_apply_code(item, actor, allowed_apps, deadline)
 
 
 def _give_back(proposal, full: str, repo: str, restore, *, new_file: bool, expected_head: str) -> bool:

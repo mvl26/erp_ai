@@ -6,6 +6,7 @@ import json
 import frappe
 from frappe.utils import now_datetime
 
+from erp_ai.agent.changes import block
 from erp_ai.agent.changes.process_runner import CommandResult
 from erp_ai.agent.run_log import ENTRY_TYPE_CHANGE, write_entry
 from erp_ai.constants import (
@@ -58,6 +59,16 @@ DIGEST_FIELDS = (
 	"is_core_app",
 	"commit_message",
 )
+# CHG-002 design 2.4: each child row of a block, in this exact order.
+OPERATION_DIGEST_FIELDS = (
+	"operation",
+	"file_path",
+	"new_path",
+	"base_hash",
+	"content_before",
+	"content_after",
+	"after_hash",
+)
 # The state fields a job may pass to `finish(fields=)` (design 3.5, round 1).
 GIT_RESULT_FIELDS = ("applied_branch", "applied_ahead_count", "apply_commit_sha", "undo_commit_sha")
 # Design 2.2: the edges a job ends with, each with the one log step it writes.
@@ -95,11 +106,18 @@ def prepare_new(doc) -> None:
 def content_digest(doc) -> str:
 	"""sha256 hex of the JSON list of the 14 design 2.3 fields (`ensure_ascii=False`), as stored on `doc`.
 
+	A block proposal (CHG-002 design 2.4) appends the list of its child rows in `idx` order, each as
+	`OPERATION_DIGEST_FIELDS`, then its `command_list`; the old shape keeps its digest byte for byte.
+
 	Raises:
 		ValueError: `doc` is not an ERP AI Change Proposal.
 	"""
 	_require_proposal(doc)
 	values = [doc.get(fieldname) for fieldname in DIGEST_FIELDS]
+	if block.is_block(doc):
+		rows = sorted(doc.get("operations") or [], key=lambda row: row.idx)
+		values.append([[row.get(fieldname) for fieldname in OPERATION_DIGEST_FIELDS] for row in rows])
+		values.append(doc.get("command_list"))
 	return hashlib.sha256(json.dumps(values, ensure_ascii=False).encode("utf-8")).hexdigest()
 
 

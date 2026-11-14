@@ -32,6 +32,7 @@
   "undo_commit_sha",
   "section_diff",
   "diff",
+  "operations",
   "section_content",
   "content_before",
   "content_after",
@@ -39,9 +40,11 @@
   "after_hash",
   "section_command",
   "command_args",
+  "command_list",
   "exit_code",
   "duration_ms",
   "command_output",
+  "command_results",
   "section_decision",
   "decided_by",
   "decided_at",
@@ -49,7 +52,10 @@
   "undo_at",
   "finished_at",
   "failure_reason",
-  "approved_digest"
+  "approved_digest",
+  "created_dirs",
+  "restart_status",
+  "restart_sent_at"
  ],
  "fields": [
   {
@@ -229,6 +235,13 @@
    "read_only": 1
   },
   {
+   "fieldname": "operations",
+   "fieldtype": "Table",
+   "label": "Các mục file",
+   "options": "ERP AI Change Operation",
+   "read_only": 1
+  },
+  {
    "collapsible": 1,
    "depends_on": "eval:doc.change_kind=='Thay đổi code'",
    "fieldname": "section_content",
@@ -273,6 +286,13 @@
    "read_only": 1
   },
   {
+   "fieldname": "command_list",
+   "fieldtype": "Code",
+   "label": "Danh sách lệnh bench",
+   "options": "JSON",
+   "read_only": 1
+  },
+  {
    "depends_on": "eval:doc.change_status==\"Đã áp dụng\" || doc.exit_code",
    "fieldname": "exit_code",
    "fieldtype": "Int",
@@ -289,6 +309,13 @@
    "fieldname": "command_output",
    "fieldtype": "Code",
    "label": "Đầu ra lệnh",
+   "read_only": 1
+  },
+  {
+   "fieldname": "command_results",
+   "fieldtype": "Code",
+   "label": "Kết quả từng lệnh",
+   "options": "JSON",
    "read_only": 1
   },
   {
@@ -339,10 +366,30 @@
    "fieldtype": "Data",
    "label": "Dấu nội dung lúc duyệt",
    "read_only": 1
+  },
+  {
+   "fieldname": "created_dirs",
+   "fieldtype": "Code",
+   "label": "Thư mục đã tạo",
+   "options": "JSON",
+   "read_only": 1
+  },
+  {
+   "fieldname": "restart_status",
+   "fieldtype": "Select",
+   "label": "Trạng thái restart",
+   "options": "\nĐã gửi\nĐã xác nhận\nChưa xác nhận\nLỗi khởi chạy",
+   "read_only": 1
+  },
+  {
+   "fieldname": "restart_sent_at",
+   "fieldtype": "Datetime",
+   "label": "Lúc gửi restart",
+   "read_only": 1
   }
  ],
  "links": [],
- "modified": "2026-11-14 12:00:00.000000",
+ "modified": "2026-11-15 12:00:00.000000",
  "modified_by": "Administrator",
  "module": "ERP AI agent",
  "name": "ERP AI Change Proposal",

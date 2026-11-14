@@ -415,6 +415,14 @@ class TestManuals(FrappeTestCase):
 
 		self.assertEqual(self._found(word), [("hdsd.md", 1)])
 
+	def test_dangling_symlink_inside_the_manuals_dir_skipped(self):
+		word = _word("mn")
+		self._manual("hdsd.md", f"# Mục\n{word}\n")
+		docs = os.path.join(self.sandbox.root, "myapp", "docs")
+		os.symlink(os.path.join(docs, "khong-con.md"), os.path.join(docs, "cu.md"))
+
+		self.assertEqual(self._found(word), [("hdsd.md", 1)])
+
 	def test_dir_other_than_configured_or_outside_root_finds_nothing(self):
 		word = _word("mn")
 		self._manual("hdsd.md", f"# Mục\n{word}\n")

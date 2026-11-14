@@ -4,10 +4,12 @@ from frappe.model.document import Document
 from erp_ai import gateway
 from erp_ai.agent import policy
 from erp_ai.agent.classification import validate_mapping
+from erp_ai.agent.hard_bans import hard_ban_reason
 from erp_ai.agent.routing import validate_routing_config
 from erp_ai.agent.tools import source
 from erp_ai.constants import (
 	ANSWER_DELAY_MAX_S,
+	CATALOG_ACTIONS,
 	CREDENTIAL_DOCTYPE,
 	KEY_STATUS_ACTIVE,
 	KEY_STATUS_BAD_KEY,
@@ -81,6 +83,7 @@ class ERPAISetting(Document):
 		self.check_limits()
 		self.check_status_settings()
 		self.check_enabled_requirements()
+		self.check_catalog_rules()
 
 	def on_update(self):
 		self.notify_permission_switches()
@@ -161,6 +164,28 @@ class ERPAISetting(Document):
 			frappe.throw("Không thể bật agent khi chưa nhập đủ 4 đơn giá lớn hơn 0")
 		if not (self.trigger_keyword or "").strip():
 			frappe.throw("Không thể bật agent khi từ khóa kích hoạt rỗng")
+
+	def check_catalog_rules(self):
+		"""AC-29, ADR-031 decision 1: a row with an unknown action or on a hard-banned DocType is refused (E-4)."""
+		for row in self.catalog_rules:
+			reason = catalog_rule_error(row)
+			if reason:
+				frappe.throw(f"Danh mục dòng {row.idx}: {reason}")
+
+
+def catalog_rule_error(row) -> str | None:
+	"""The first E-4 reason this catalog row breaks, or None."""
+	if row.action not in CATALOG_ACTIONS:
+		return "hành động không hợp lệ"
+	doctype = row.target_doctype
+	if not doctype:
+		return None
+	if not frappe.db.exists("DocType", doctype):
+		return f"không có DocType {doctype}"
+	ban = hard_ban_reason(doctype)
+	if ban:
+		return f"DocType {doctype} bị cấm cứng: {ban}"
+	return None
 
 
 @frappe.whitelist(methods=["POST"])

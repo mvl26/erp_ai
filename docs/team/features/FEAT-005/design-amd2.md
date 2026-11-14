@@ -9,6 +9,7 @@ Spec: Amendment 2 (AC-13, AC-14, AC-19; NFR-3, NFR-8; A-12, A-14..A-20). Mode de
 **Sửa vòng 4 (review-13 `design-defect` trên T13; review-06 minor (1) trên T6), chỉ sửa chữ cho khớp mã đã merge và đã review; quyết định (decide) của team-leader: giữ mã, không thêm task bù.** Chỉ các mục sau đổi; mục khác giữ như vòng 3:
 - §4.1: chữ ký `_undo_turn(run_id)` (hai chỗ; `run_id` chỉ dùng cho dòng warning).
 - §4.2 bước 5: `tabError Log` là MyISAM nên dòng Error Log cảnh báo không rollback; chỉ Email Queue và mốc rollback; thư gửi đúng một lần, dòng Error Log có thể lặp; khoảng hở NFR-8 ở kênh Error Log ghi vào As-Built là rủi ro còn lại.
+- §4.2 đoạn "Vì sao báo đúng một lần" (sửa sau As-Built R-1): thêm câu "đúng một lần" là của thư; dòng Error Log cảnh báo nằm ngoài giao dịch của mốc (`tabError Log` là MyISAM) nên có thể lặp sau một lần chạy lỗi, như bước 5 và ADR-024 QĐ 3.5.
 - §8: dòng `test_failed_run_keeps_watermark_and_realarms_once`.
 
 **Sửa vòng 3 (review-05 `design-defect`, major STD-ERR-7 trên T5: `write_entry` của dòng `propose` commit giữa lượt)** — chỉ các mục sau đổi; mục khác giữ như vòng 2:
@@ -89,7 +90,7 @@ Sửa vòng 1 (ADR-024) đã gộp vào thân: §1 (ADR-024 thay ADR-016 QĐ 5),
 4. Có ≥ 1 mục → `_raise_alarm(subject, lines)` (không sửa). Ba điều kiện kia chạy như cũ.
 5. Sau mọi điều kiện, nếu không rơi vào ca "không lùi": `_advance_privilege_watermark(upper)` — hàm **duy nhất** của `tasks.py` chứa tên trường mốc, chỉ bằng `frappe.db.set_single_value`, không `save()`/`insert()` ERP AI Setting. Rồi commit (ngoài test). Email Queue (`delayed=True`) và mốc cùng **một** giao dịch: lỗi ở đâu → rollback cả hai, lần sau thư gửi đúng một lần. Dòng Error Log cảnh báo (`send_alarm` → `frappe.log_error`, `alerts.py:18`) **không** nằm trong giao dịch đó: `tabError Log` là MyISAM (`frappe/core/doctype/error_log/error_log.json:6`), nên sau một lần chạy lỗi dòng đó ở lại và lần chạy sau có thể ghi thêm một dòng (báo lặp, không sót, ADR-024 QĐ 3.8). Khoảng hở NFR-8 "0 báo hai lần" ở kênh Error Log: As-Built ghi là rủi ro còn lại (vòng 4).
 6. `frappe.logger(LOGGER_NAME).info("check_privilege_escalation window=%s..%s changes=%d", …)` (`lower` rỗng in `None`), không tên user/role (STD-OPS-5, STD-SEC-6).
-- **Vì sao báo đúng một lần:** cửa sổ `(mốc, cận trên]` nối tiếp, không chồng; mốc chỉ tiến cùng giao dịch có cảnh báo; lịch lỡ N ngày thì cửa sổ dài ra (A-16). Khoảng lắng 300 s che khe insert→commit của `write_entry` và lệch đồng hồ. Đua không loại trừ được → báo **lặp**, không bao giờ **sót** (ADR-024 QĐ 3.8).
+- **Vì sao báo đúng một lần:** cửa sổ `(mốc, cận trên]` nối tiếp, không chồng; mốc chỉ tiến cùng giao dịch có cảnh báo; lịch lỡ N ngày thì cửa sổ dài ra (A-16). Khoảng lắng 300 s che khe insert→commit của `write_entry` và lệch đồng hồ. Đua không loại trừ được → báo **lặp**, không bao giờ **sót** (ADR-024 QĐ 3.8). "Đúng một lần" ở đây là của thư (Email Queue): dòng Error Log cảnh báo nằm **ngoài** giao dịch đó (`tabError Log` là MyISAM), nên sau một lần chạy lỗi nó ở lại và lần chạy sau có thể ghi thêm một dòng cho cùng thay đổi — lặp, không sót (bước 5, ADR-024 QĐ 3.5).
 - **Gọi ra ngoài:** chỉ email qua Email Queue như hiện nay; không lời gọi mạng mới.
 
 ## 5. Quyền

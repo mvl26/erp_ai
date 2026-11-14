@@ -13,6 +13,7 @@ from frappe.tests.utils import FrappeTestCase
 from helpdesk.test_utils import make_ticket
 
 from erp_ai.agent import answer_delay, authority, runner
+from erp_ai.agent.agent_write_guard import allow_agent_write
 from erp_ai.agent.classification import DEFAULT_CATEGORY_MAPPING
 from erp_ai.agent.prompts import (
 	CHANGE_TOOLS_BLOCK,
@@ -2118,6 +2119,32 @@ TURN_SAVEPOINT = "erp_ai_reason_turn"
 TURN_NOTE_OLD, TURN_NOTE_NEW = f"{PREFIX}turn undo note", f"{PREFIX}turn undo note renamed"
 
 
+TURN_ROLE_CALL = tool_use(
+	"toolu_role",
+	"api_update_record",
+	doctype="User",
+	name=TURN_USER,
+	values={"roles": [{"role": TURN_KEPT_ROLE}, {"role": TURN_ADDED_ROLE}]},
+)
+TURN_PROPOSE_CALLS = (
+	tool_use(
+		"toolu_file", "propose_file_change", path="custom_app/a.py", find=["x"], replace=["y"], reason="r"
+	),
+	tool_use("toolu_new", "propose_new_file", path="custom_app/b.py", content="x", reason="r"),
+)
+TURN_JOB_METHOD = "frappe.ping"
+
+
+class FakeJobQueue:
+	"""Stands in for the RQ queue: records the method of every job put in it, runs none."""
+
+	def __init__(self):
+		self.methods = []
+
+	def enqueue_call(self, *args, **kwargs):
+		self.methods.append(kwargs["kwargs"]["method"])
+
+
 class TurnFaultForTest(Exception):
 	"""The fault a test injects into a turn; its class name must reach the Error Log unchanged."""
 
@@ -2312,6 +2339,197 @@ class TestRunnerTurnUndo(RunnerTestBase):
 		)
 		self.assertEqual(self._run_failed_errors(), [])
 		self.assertEqual(self._turn_events(), [("model",), ("savepoint", TURN_SAVEPOINT), ("model",)])
+
+	def _track(self):
+		"""Record `runner.write_entry` calls and callbacks; jobs go to a fake queue."""
+		self.written = []
+		self.callbacks = []
+		self.proposals_at_fault = []
+		self.jobs = FakeJobQueue()
+		for target, value in (("get_queue", lambda *args, **kwargs: self.jobs), ("_check_queue_size", None)):
+			queue_patch = patch(f"frappe.utils.background_jobs.{target}", side_effect=value)
+			queue_patch.start()
+			self.addCleanup(queue_patch.stop)
+		# callbacks left by the fixtures are not the turn's: only those a turn adds are counted
+		for queue in (frappe.db.before_commit, frappe.db.after_commit, frappe.db.after_rollback):
+			queue.reset()
+
+	def _proposal_names(self):
+		return frappe.get_all(PROPOSAL_DOCTYPE, filters={"ticket": self.ticket.name}, pluck="name")
+
+	def _note_fault(self):
+		self.roles_at_fault.append(self._roles())
+		self.proposals_at_fault.append(len(self._proposal_names()))
+
+	def _register_callbacks(self):
+		"""What a tool's hooks may do: queue work for after the commit or after a rollback."""
+		frappe.db.before_commit.add(lambda: self.callbacks.append("before_commit"))
+		frappe.db.after_commit.add(lambda: self.callbacks.append("after_commit"))
+		frappe.db.after_rollback.add(lambda: self.callbacks.append("after_rollback"))
+		frappe.enqueue(TURN_JOB_METHOD, enqueue_after_commit=True, timeout=60)
+
+	def _tools(self, register_callbacks=False):
+		"""Real tools, except a proposal tool inserts a real `Chờ duyệt` proposal of the ticket and succeeds."""
+		execute_tool = runner.execute_tool
+
+		def execute(name, arguments, context):
+			if name in CHANGE_TOOL_NAMES:
+				# as `propose_change._insert`: the run's agent account inserts it through the write guard
+				with allow_agent_write():
+					proposal = make_change_proposal(ticket=self.ticket.name).name
+				return {"ok": True, "proposal": proposal, "status": CHANGE_STATUS_PENDING}
+			outcome = execute_tool(name, arguments, context)
+			if register_callbacks and self._reason_calls() == 2:
+				self._register_callbacks()
+			return outcome
+
+		return patch.object(runner, "execute_tool", side_effect=execute)
+
+	def _write_entry(self, fail_on=None):
+		"""`runner.write_entry` that records (entry_type, turn) of each call; `fail_on(fields)` true → the fault.
+
+		A `reason` row is faulted after its real insert, a `change` row before it."""
+
+		def fake(**fields):
+			self.written.append((fields.get("entry_type"), fields.get("turn")))
+			faulty = fail_on is not None and fail_on(fields)
+			if faulty and fields.get("entry_type") != "reason":
+				raise TurnFaultForTest("write_entry")
+			name = write_entry(**fields)
+			if faulty:
+				self._note_fault()
+				raise TurnFaultForTest("write_entry")
+			return name
+
+		return patch.object(runner, "write_entry", side_effect=fake)
+
+	def _from_second_turn(self):
+		return self.written[self.written.index(("reason", 2)) :]
+
+	@staticmethod
+	def _second_reason_row(fields):
+		return fields.get("entry_type") == "reason" and fields.get("turn") == 2
+
+	def _assert_turn_and_proposals_undone(self):
+		# the proposal really was made before the fault, then undone
+		self.assertEqual(self.proposals_at_fault, [1])
+		self._assert_second_turn_undone()
+		self.assertEqual(self._proposal_names(), [])
+		self.assertEqual(self._entries(entry_type="change"), [])
+		# no `change` row was even attempted: outside tests it would have committed the turn's writes
+		self.assertNotIn("change", [entry_type for entry_type, _turn in self.written])
+
+	def test_turn_writes_propose_rows_only_after_its_reason_row(self):
+		self._track()
+		self._run_turns(tool_turn(TURN_ROLE_CALL, *TURN_PROPOSE_CALLS), self._tools(), self._write_entry())
+
+		self.assertEqual(
+			self._from_second_turn(), [("reason", 2), ("change", None), ("change", None), ("reason", 3)]
+		)
+		(second,) = self._entries(entry_type="reason", turn=2)
+		proposals = [
+			action["name"] for action in json.loads(second.actions) if action["tool"] in CHANGE_TOOL_NAMES
+		]
+		self.assertEqual(len(proposals), 2)
+		self.assertEqual(sorted(proposals), sorted(self._proposal_names()))
+		rows = self._entries(entry_type="change")
+		self.assertEqual(
+			[[row[field] for field in PROPOSE_ROW_FIELDS] for row in rows],
+			[
+				["change", "change_action", "propose", AGENT_USER, proposal, self.ticket.name, second.run_id]
+				for proposal in proposals
+			],
+		)
+		self.assertEqual([row.instructor for row in rows], [INSTRUCTOR, INSTRUCTOR])
+		self.assertEqual(self._roles(), sorted([TURN_KEPT_ROLE, TURN_ADDED_ROLE]))
+		self.assertEqual(self._run_failed_errors(), [])
+
+	def test_propose_then_role_change_then_failure_undoes_both(self):
+		self._track()
+		self._run_turns(
+			tool_turn(TURN_PROPOSE_CALLS[0], TURN_ROLE_CALL),
+			self._tools(),
+			self._write_entry(fail_on=self._second_reason_row),
+		)
+
+		self._assert_turn_and_proposals_undone()
+
+	def test_role_change_then_propose_then_failure_undoes_both(self):
+		self._track()
+		bounded_actions = runner._bounded_actions
+
+		def failing_bounded_actions(actions):
+			if self._reason_calls() == 2:
+				self._note_fault()
+				raise TurnFaultForTest("bounded actions")
+			return bounded_actions(actions)
+
+		self._run_turns(
+			tool_turn(TURN_ROLE_CALL, TURN_PROPOSE_CALLS[0]),
+			self._tools(),
+			self._write_entry(),
+			patch.object(runner, "_bounded_actions", side_effect=failing_bounded_actions),
+		)
+
+		self._assert_turn_and_proposals_undone()
+
+	def test_propose_row_failure_after_reason_row_keeps_turn(self):
+		self._track()
+		with patch.object(runner, "_undo_turn", wraps=runner._undo_turn) as undo_turn:
+			self._run_turns(
+				tool_turn(TURN_ROLE_CALL, TURN_PROPOSE_CALLS[0]),
+				self._tools(),
+				self._write_entry(fail_on=lambda fields: fields.get("entry_type") == "change"),
+			)
+
+		undo_turn.assert_not_called()
+		self.assertEqual(self._from_second_turn(), [("reason", 2), ("change", None)])
+		self.assertEqual(self._roles(), sorted([TURN_KEPT_ROLE, TURN_ADDED_ROLE]))
+		(second,) = self._entries(entry_type="reason", turn=2)
+		(proposal,) = self._proposal_names()
+		self.assertEqual(
+			[(action["tool"], action["name"], action["ok"]) for action in json.loads(second.actions)],
+			[("api_update_record", TURN_USER, True), ("propose_file_change", proposal, True)],
+		)
+		self.assertEqual(self._entries(entry_type="change"), [])
+		self.assertEqual(
+			self._run_failed_errors(),
+			[f"ticket={self.ticket.name} trigger=comment_mention error=TurnFaultForTest"],
+		)
+
+	def _run_commit_callbacks(self):
+		frappe.db.before_commit.run()
+		frappe.db.after_commit.run()
+
+	def test_undone_turn_drops_its_commit_callbacks(self):
+		self._track()
+		self._run_turns(
+			None, self._tools(register_callbacks=True), self._write_entry(self._second_reason_row)
+		)
+
+		self._assert_second_turn_undone()
+		self._run_commit_callbacks()
+		self.assertEqual([name for name in self.callbacks if name != "after_rollback"], [])
+		self.assertNotIn(TURN_JOB_METHOD, self.jobs.methods)
+
+	def test_successful_turn_keeps_its_commit_callbacks(self):
+		self._track()
+		self._run_turns(None, self._tools(register_callbacks=True), self._write_entry())
+
+		self.assertEqual(self._roles(), sorted([TURN_KEPT_ROLE, TURN_ADDED_ROLE]))
+		self.assertEqual(self.callbacks, [])
+		self._run_commit_callbacks()
+		self.assertEqual(self.callbacks, ["before_commit", "after_commit"])
+		self.assertEqual(self.jobs.methods.count(TURN_JOB_METHOD), 1)
+
+	def test_undone_turn_runs_its_after_rollback_callbacks(self):
+		self._track()
+		self._run_turns(
+			None, self._tools(register_callbacks=True), self._write_entry(self._second_reason_row)
+		)
+
+		self._assert_second_turn_undone()
+		self.assertEqual(self.callbacks, ["after_rollback"])
 
 
 # Hand-written: the tools a run with an instructor gets when no change group is granted (FEAT-001/006 set).

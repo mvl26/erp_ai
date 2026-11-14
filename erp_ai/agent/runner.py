@@ -641,8 +641,9 @@ def _reason(ticket_name, trigger, run_id, settings, context, classification, dea
 			)
 			return
 
-		# after the call, so the gateway key state it wrote survives an undo; not released: the commit of
-		# `write_entry` ends it, and the next turn's savepoint of the same name replaces it
+		# after the call, so the gateway key state it wrote survives an undo; not released: the commit of the
+		# `reason` row's `write_entry` ends it (within the turn the runner commits nothing else), and the next
+		# turn's savepoint of the same name replaces it
 		frappe.db.savepoint(REASON_TURN_SAVEPOINT)
 		try:
 			tool_blocks = [block for block in result.content if block.get("type") == "tool_use"]
@@ -673,6 +674,7 @@ def _reason(ticket_name, trigger, run_id, settings, context, classification, dea
 			# no change of the turn may be committed without its `reason` entry (NFR-3); `run_for_ticket` logs it
 			_undo_turn()
 			raise
+		_write_propose_rows(actions, context)
 		if not wants_tools or not tool_results:
 			return
 		messages.append({"role": "assistant", "content": result.content})
@@ -680,8 +682,36 @@ def _reason(ticket_name, trigger, run_id, settings, context, classification, dea
 
 
 def _undo_turn() -> None:
-	"""Undo the uncommitted writes of the failing reason turn, back to right after its model call."""
+	"""Undo the uncommitted writes of the failing reason turn, back to right after its model call.
+
+	As `frappe.db.rollback()` does, stopping at the savepoint (design-amd2 D-8): the commit callbacks queued
+	since are dropped (only the turn's: the commit before the savepoint ran the earlier ones) and the rollback
+	callbacks run.
+	"""
 	frappe.db.rollback(save_point=REASON_TURN_SAVEPOINT)
+	frappe.db.before_commit.reset()
+	frappe.db.after_commit.reset()
+	frappe.db.after_rollback.run()
+
+
+def _write_propose_rows(actions, context) -> None:
+	"""The `propose` step of each proposal the turn made, written by the agent account (design 4.1 step 4).
+
+	Only after the turn's `reason` row (design-amd2 D-7): `write_entry` commits, and a commit inside the turn
+	would keep its writes without that row. Read from the turn's own `actions`, not their bounded copy.
+	"""
+	for action in actions:
+		if action["tool"] in PROPOSE_TOOLS and action["ok"]:
+			write_entry(
+				entry_type=ENTRY_TYPE_CHANGE,
+				trigger=TRIGGER_CHANGE_ACTION,
+				change_step=PROPOSE_STEP,
+				actor=AGENT_USER,
+				change_proposal=action["name"],
+				ticket=context.ticket_name,
+				run_id=context.run_id,
+				instructor=context.instructor,
+			)
 
 
 def _run_tool(block, context, actions, before, after, tool_errors, skipped):
@@ -703,18 +733,6 @@ def _run_tool(block, context, actions, before, after, tool_errors, skipped):
 			"content": f"Lỗi: {type(exc).__name__}",
 			"is_error": True,
 		}
-	if name in PROPOSE_TOOLS and outcome.get("ok"):
-		# the `propose` step of the proposal's own log trail, written by the agent account (design 4.1 step 4)
-		write_entry(
-			entry_type=ENTRY_TYPE_CHANGE,
-			trigger=TRIGGER_CHANGE_ACTION,
-			change_step=PROPOSE_STEP,
-			actor=AGENT_USER,
-			change_proposal=outcome["proposal"],
-			ticket=context.ticket_name,
-			run_id=context.run_id,
-			instructor=context.instructor,
-		)
 	if name in WRITE_TOOL_TARGETS:
 		actions.append(_action(name, context, outcome, bool(outcome.get("ok")), arguments))
 		_record_snapshot(name, outcome, len(actions), before, after)

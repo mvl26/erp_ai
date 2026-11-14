@@ -18,8 +18,11 @@ from erp_ai.test_utils import GitSandbox, RealCoreReposUntouchedMixin
 ROOT_PATH = "erp_ai.agent.tools.source.get_source_root"
 
 
-class TestSourceTools(FrappeTestCase):
+class SourceRootMixin:
+	"""A temporary `apps/` root with an app `myapp`, patched in as the source root, and a sibling `outside`."""
+
 	def setUp(self):
+		super().setUp()
 		base = os.path.realpath(tempfile.mkdtemp())
 		self.addCleanup(shutil.rmtree, base, True)
 		self.root = os.path.join(base, "apps")
@@ -31,12 +34,17 @@ class TestSourceTools(FrappeTestCase):
 		self.addCleanup(patcher.stop)
 
 	def write(self, rel, text, root=None):
+		return self.write_bytes(rel, text.encode("utf-8"), root=root)
+
+	def write_bytes(self, rel, data, root=None):
 		path = os.path.join(root or self.root, rel)
 		os.makedirs(os.path.dirname(path), exist_ok=True)
-		with open(path, "w", encoding="utf-8") as handle:
-			handle.write(text)
+		with open(path, "wb") as handle:
+			handle.write(data)
 		return path
 
+
+class TestSourceTools(SourceRootMixin, FrappeTestCase):
 	def test_path_escape_refused(self):
 		self.write("plain.py", "x = 1\n", root=self.outside)
 		self.write("myapp/ok.py", "x = 1\n")
@@ -62,8 +70,8 @@ class TestSourceTools(FrappeTestCase):
 			"myapp/my_credential.py",
 			"myapp/Password.py",
 			"myapp/secrets.txt",
-			"myapp/tool.exe",
-			"myapp/noext",
+			"myapp/.github/tool.yml",
+			"myapp/.gitignore",
 		):
 			self.write(rel, "data\n")
 			self.assertIsNone(source.resolve_safe_path(rel), rel)
@@ -166,13 +174,13 @@ class TestSourceTools(FrappeTestCase):
 		self.write("myapp/site_config.json", "foo(\n")
 		with open(os.path.join(self.root, "myapp", "bad.py"), "wb") as handle:
 			handle.write(b"foo(\xff\xfe\n")
-		self.write("myapp/huge.py", "foo(\n" + "z" * (1024 * 1024 + 1))
+		self.write("myapp/huge.py", "foo(\n" + "z" * (source.TEXT_MAX_BYTES + 1))
 		os.symlink(self.outside, os.path.join(self.root, "myapp", "outlink"))
 		self.write("leak.py", "foo(\n", root=self.outside)
 
 		result = source.search_source({"pattern": "foo("}, None)
 		paths = sorted({hit["path"] for hit in result["hits"]})
-		self.assertEqual(paths, ["myapp/a.py", "myapp/b.js", "myapp/bad.py"])
+		self.assertEqual(paths, ["myapp/a.py", "myapp/b.js", "myapp/skip.png"])
 		self.assertTrue(all(len(hit["text"]) <= 300 for hit in result["hits"]))
 
 		only_js = source.search_source({"pattern": "FOO(", "extension": ".js"}, None)
@@ -189,7 +197,7 @@ class TestSourceTools(FrappeTestCase):
 			{"pattern": "x" * 201},
 			{"pattern": "foo", "app": "../outside"},
 			{"pattern": "foo", "app": "/etc"},
-			{"pattern": "foo", "extension": ".exe"},
+			{"pattern": "foo", "extension": "exe"},
 		):
 			result = source.search_source(args, None)
 			self.assertFalse(result["ok"], args)
@@ -2421,4 +2429,179 @@ class TestTextRefusal(unittest.TestCase):
 		self.assertIsNone(source.text_refusal("myapp/big.txt", b"a" * source.TEXT_MAX_BYTES))
 		self.assertEqual(
 			source.text_refusal("myapp/big.txt", b"a" * (source.TEXT_MAX_BYTES + 1)), source.TEXT_TOO_LARGE
+		)
+
+
+ONE_MIB = 1024 * 1024
+SEARCH_TOOL = next(spec for spec in source.TOOLS if spec.name == "search_source")
+PATH_REFUSED = "Đường dẫn không hợp lệ hoặc không được phép đọc"
+EXTENSION_REFUSED = "Đuôi file không được phép tìm"
+
+
+class TestTextRule(SourceRootMixin, unittest.TestCase):
+	"""AC-44 (design §3.2 "Nơi dùng hàm", addendum A-1.4): the read tools follow `text_refusal`, not a suffix list."""
+
+	def test_read_yaml_toml_noext_ok(self):
+		files = {
+			"myapp/conf.yaml": "key: value\n",
+			"myapp/pyproject.toml": "[project]\nname = 'x'\n",
+			"myapp/Makefile": "all:\n\techo hi\n",
+			"myapp/conf/settings": "a = 1\n",
+			"myapp/run.sh": "echo hi\n",
+			"myapp/empty.cfg": "",
+		}
+		for rel, text in files.items():
+			self.write(rel, text)
+			with self.subTest(rel=rel):
+				self.assertEqual(source.resolve_safe_path(rel), os.path.join(self.root, rel))
+				self.assertEqual(
+					source.read_source({"path": rel}, None),
+					{
+						"ok": True,
+						"path": rel,
+						"from_line": 1,
+						"total_lines": len(text.splitlines()),
+						"content": "\n".join(text.splitlines()),
+					},
+				)
+		self.assertEqual(
+			source.search_source({"pattern": "echo hi"}, None)["hits"],
+			[
+				{"path": "myapp/Makefile", "line": 2, "text": "echo hi"},
+				{"path": "myapp/run.sh", "line": 1, "text": "echo hi"},
+			],
+		)
+
+	def test_read_binary_refused(self):
+		self.write_bytes("myapp/image.png", b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR")
+		self.write_bytes("myapp/latin.py", "café = 1\n".encode("latin-1"))
+		self.write_bytes("myapp/nul.txt", b"text\0more\n")
+		for rel, reason in (
+			("myapp/image.png", source.TEXT_HAS_NUL),
+			("myapp/latin.py", source.TEXT_NOT_UTF8),
+			("myapp/nul.txt", source.TEXT_HAS_NUL),
+		):
+			with self.subTest(rel=rel):
+				self.assertIsNotNone(source.resolve_safe_path(rel))
+				self.assertEqual(source.read_source({"path": rel}, None), {"ok": False, "reason": reason})
+
+	def test_names_refused_by_text_rule_not_resolved(self):
+		for rel in ("myapp/.github/workflows/ci.yml", "myapp/.gitignore", "myapp/client_secret.yaml"):
+			self.write(rel, "x: 1\n")
+			with self.subTest(rel=rel):
+				self.assertIsNone(source.resolve_safe_path(rel))
+				self.assertEqual(
+					source.read_source({"path": rel}, None), {"ok": False, "reason": PATH_REFUSED}
+				)
+
+	def test_search_skips_binary(self):
+		self.write("myapp/a.yaml", "needle: 1\n")
+		self.write_bytes("myapp/b.bin", b"needle\0\n")
+		self.write_bytes("myapp/c.py", b"needle = '\xff'\n")
+		self.write_bytes("myapp/d.txt", b"needle\r\nsecond needle\n")
+		self.write("myapp/.gitignore", "needle\n")
+		self.assertEqual(
+			source.search_source({"pattern": "needle"}, None),
+			{
+				"ok": True,
+				"hits": [
+					{"path": "myapp/a.yaml", "line": 1, "text": "needle: 1"},
+					{"path": "myapp/d.txt", "line": 1, "text": "needle"},
+					{"path": "myapp/d.txt", "line": 2, "text": "second needle"},
+				],
+			},
+		)
+
+	def test_search_unreadable_file_skipped(self):
+		self.write("myapp/a.py", "needle\n")
+		self.write("myapp/b.py", "needle\n")
+		real_open = open
+
+		def failing_open(path, *args, **kwargs):
+			if path.endswith("a.py"):
+				raise PermissionError(path)
+			return real_open(path, *args, **kwargs)
+
+		with patch("erp_ai.agent.tools.source.open", side_effect=failing_open, create=True):
+			result = source.search_source({"pattern": "needle"}, None)
+		self.assertEqual(result, {"ok": True, "hits": [{"path": "myapp/b.py", "line": 1, "text": "needle"}]})
+
+	def test_extension_pattern(self):
+		self.assertEqual(
+			SEARCH_TOOL.schema["input_schema"]["properties"]["extension"],
+			{"type": "string", "pattern": "^\\.[A-Za-z0-9]{1,10}$"},
+		)
+		self.write("myapp/a.yaml", "needle\n")
+		self.write("myapp/b.toml", "needle\n")
+		self.write("myapp/c.abcdefghij", "needle\n")
+		for extension, paths in (
+			(".yaml", ["myapp/a.yaml"]),
+			(".YAML", ["myapp/a.yaml"]),
+			(".toml", ["myapp/b.toml"]),
+			(".abcdefghij", ["myapp/c.abcdefghij"]),
+			(".exe", []),
+		):
+			with self.subTest(extension=extension):
+				self.assertEqual(
+					source.search_source({"pattern": "needle", "extension": extension}, None),
+					{"ok": True, "hits": [{"path": path, "line": 1, "text": "needle"} for path in paths]},
+				)
+		for extension in ("yaml", ".", ".abcdefghijk", ".py\n", ".a-b", ".py/x", 5):
+			with self.subTest(extension=extension):
+				self.assertEqual(
+					source.search_source({"pattern": "needle", "extension": extension}, None),
+					{"ok": False, "reason": EXTENSION_REFUSED},
+				)
+
+
+class TestReadSource(SourceRootMixin, unittest.TestCase):
+	"""AC-44, ADR-040 C-1: read_source reads up to `TEXT_MAX_BYTES` and refuses larger files with `TEXT_TOO_LARGE`."""
+
+	def test_file_between_one_and_two_mib_readable(self):
+		for size in (ONE_MIB + 1, source.TEXT_MAX_BYTES):
+			with self.subTest(size=size):
+				self.write("myapp/big.txt", "first\n" + "z" * (size - len("first\n")))
+				self.assertEqual(
+					source.read_source({"path": "myapp/big.txt", "limit": 1}, None),
+					{
+						"ok": True,
+						"path": "myapp/big.txt",
+						"from_line": 1,
+						"total_lines": 2,
+						"content": "first",
+					},
+				)
+
+	def test_file_over_two_mib_refused_same_reason(self):
+		self.assertEqual(source.TEXT_TOO_LARGE, "file lớn hơn 2 MiB")
+		for size in (source.TEXT_MAX_BYTES + 1, 3 * ONE_MIB):
+			with self.subTest(size=size):
+				data = b"z" * size
+				self.write_bytes("myapp/huge.txt", data)
+				self.assertEqual(
+					source.read_source({"path": "myapp/huge.txt"}, None),
+					{"ok": False, "reason": source.TEXT_TOO_LARGE},
+				)
+				self.assertEqual(source.text_refusal("myapp/huge.txt", data), source.TEXT_TOO_LARGE)
+
+
+class TestSearchSource(SourceRootMixin, unittest.TestCase):
+	"""AC-44, ADR-040 C-1: search_source scans files up to `TEXT_MAX_BYTES` and skips larger ones."""
+
+	def test_file_between_one_and_two_mib_searched_over_two_skipped(self):
+		for rel, size in (
+			("myapp/a_one_mib_plus_one.txt", ONE_MIB + 1),
+			("myapp/b_two_mib.txt", source.TEXT_MAX_BYTES),
+			("myapp/c_two_mib_plus_one.txt", source.TEXT_MAX_BYTES + 1),
+		):
+			self.write(rel, "needle\n" + "z" * (size - len("needle\n")))
+		self.assertEqual(
+			source.search_source({"pattern": "needle"}, None),
+			{
+				"ok": True,
+				"hits": [
+					{"path": "myapp/a_one_mib_plus_one.txt", "line": 1, "text": "needle"},
+					{"path": "myapp/b_two_mib.txt", "line": 1, "text": "needle"},
+				],
+			},
 		)

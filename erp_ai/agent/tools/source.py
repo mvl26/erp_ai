@@ -47,6 +47,8 @@ SEARCH_FILE_MAX_BYTES = 1024 * 1024
 SEARCH_TEXT_MAX_CHARS = 300
 PATTERN_MIN_CHARS = 2
 PATTERN_MAX_CHARS = 200
+# Design §3.2 "Nơi dùng hàm": the shape of the `extension` argument; which files are text is `text_refusal`'s call.
+SEARCH_EXTENSION = re.compile(r"^\.[A-Za-z0-9]{1,10}$")
 SKIPPED_DIRS = {"node_modules"}
 
 GIT_SUBCOMMANDS = {"log", "blame"}
@@ -135,9 +137,7 @@ def resolve_safe_path(rel):
 	full = os.path.realpath(os.path.join(root, rel))
 	if not _inside(root, full):
 		return None
-	if TEN_CAM.search(os.path.relpath(full, root)):
-		return None
-	if os.path.isfile(full) and os.path.splitext(full)[1].lower() not in DUOI_CHO_PHEP:
+	if text_refusal(os.path.relpath(full, root)) is not None:
 		return None
 	return full
 
@@ -183,8 +183,12 @@ def read_source(args, ctx):
 			return _refuse("Đường dẫn không hợp lệ hoặc không được phép đọc")
 		offset = max(_to_int(args.get("offset"), 1), 1)
 		limit = min(max(_to_int(args.get("limit"), READ_DEFAULT_LINES), 1), READ_MAX_LINES)
-		with open(full, encoding="utf-8", errors="replace") as handle:
-			lines = handle.read().splitlines()
+		with open(full, "rb") as handle:
+			data = handle.read(TEXT_MAX_BYTES + 1)
+		reason = text_refusal(os.path.relpath(full, os.path.realpath(get_source_root())), data)
+		if reason is not None:
+			return _refuse(reason)
+		lines = data.decode("utf-8", errors="strict").splitlines()
 		chunk = lines[offset - 1 : offset - 1 + limit]
 		return {
 			"ok": True,
@@ -209,17 +213,24 @@ def _search_base(root, app):
 	return None
 
 
-def _scan_file(full, rel, needle, hits):
+def _scan_text(text, rel, needle, hits):
+	for number, line in enumerate(text.splitlines(), 1):
+		if needle in line.lower():
+			hits.append({"path": rel, "line": number, "text": line.strip()[:SEARCH_TEXT_MAX_CHARS]})
+			if len(hits) >= SEARCH_MAX_HITS:
+				return
+
+
+def _read_text(full, rel):
+	"""The decoded text of a file allowed by `text_refusal`, else None (unreadable files included)."""
 	try:
-		with open(full, encoding="utf-8", errors="replace") as handle:
-			for number, line in enumerate(handle, 1):
-				if needle in line.lower():
-					text = line.strip()[:SEARCH_TEXT_MAX_CHARS]
-					hits.append({"path": rel, "line": number, "text": text})
-					if len(hits) >= SEARCH_MAX_HITS:
-						return
+		with open(full, "rb") as handle:
+			data = handle.read(TEXT_MAX_BYTES + 1)
 	except OSError:
-		return
+		return None
+	if text_refusal(rel, data) is not None:
+		return None
+	return data.decode("utf-8", errors="strict")
 
 
 def search_source(args, ctx):
@@ -229,7 +240,9 @@ def search_source(args, ctx):
 		if not isinstance(pattern, str) or not PATTERN_MIN_CHARS <= len(pattern) <= PATTERN_MAX_CHARS:
 			return _refuse("Mẫu tìm phải dài từ 2 đến 200 ký tự")
 		extension = args.get("extension")
-		if extension is not None and extension not in DUOI_CHO_PHEP:
+		if extension is not None and not (
+			isinstance(extension, str) and SEARCH_EXTENSION.fullmatch(extension)
+		):
 			return _refuse("Đuôi file không được phép tìm")
 		root = os.path.realpath(get_source_root())
 		base = _search_base(root, args.get("app"))
@@ -244,14 +257,15 @@ def search_source(args, ctx):
 			for name in sorted(filenames):
 				if time.monotonic() - started > SEARCH_TIME_BUDGET_S or len(hits) >= SEARCH_MAX_HITS:
 					return {"ok": True, "hits": hits}
-				if extension and os.path.splitext(name)[1].lower() != extension:
+				if extension and os.path.splitext(name)[1].lower() != extension.lower():
 					continue
 				full = resolve_safe_path(os.path.relpath(os.path.join(folder, name), root))
 				if full is None or not os.path.isfile(full):
 					continue
-				if os.path.getsize(full) > SEARCH_FILE_MAX_BYTES:
-					continue
-				_scan_file(full, os.path.relpath(full, root), needle, hits)
+				rel = os.path.relpath(full, root)
+				text = _read_text(full, rel)
+				if text is not None:
+					_scan_text(text, rel, needle, hits)
 		return {"ok": True, "hits": hits}
 	except Exception:
 		_logger().exception("search_source failed")
@@ -770,7 +784,7 @@ TOOLS: list[ToolSpec] = [
 			{
 				"pattern": {"type": "string", "minLength": PATTERN_MIN_CHARS, "maxLength": PATTERN_MAX_CHARS},
 				"app": {"type": "string", "minLength": 1},
-				"extension": {"type": "string", "enum": sorted(DUOI_CHO_PHEP)},
+				"extension": {"type": "string", "pattern": SEARCH_EXTENSION.pattern},
 			},
 			["pattern"],
 		),

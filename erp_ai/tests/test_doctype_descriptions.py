@@ -23,7 +23,7 @@ VIETNAMESE_ACCENTS = re.compile(
 DOCTYPE_CONFIG = {
 	"ERP AI Setting": {
 		"folder": "erp_ai_setting",
-		"field_count": 40,
+		"field_count": 41,
 		"phrases": {
 			"enabled": ("Tắt", "4 đơn giá", "từ khóa kích hoạt"),
 			"permission_level": ("L0", "L1", "L2", "L3", "ngân sách"),
@@ -63,6 +63,7 @@ DOCTYPE_CONFIG = {
 			"confidence_threshold": ("từ 0 đến 100", "chỉ đăng một comment hỏi", "Làm luôn"),
 			"auto_approve_streak": ("từ 1 đến 100", "Tự làm", "đếm lại từ 0"),
 			"catalog_rules": ("Không có dòng nào", "Cấm", "Cần duyệt", "Tự làm", "bị chặn khi lưu"),
+			"user_templates": ("tạo tài khoản theo mẫu", "System Manager", "Guest"),
 			"max_turns_per_run": ("từ 1 đến 20", "dừng"),
 			"max_runs_per_ticket_per_day": ("từ 1 đến 50", "00:00"),
 			"max_keys_per_call": ("từ 1 đến 10", "báo lỗi"),
@@ -183,6 +184,22 @@ DOCTYPE_CONFIG = {
 		"sections": (
 			("section_action", "Hành động và DocType đích", "action"),
 			("section_scope", "Đầu mục và chế độ", "categories"),
+		),
+	},
+	# FEAT-007 design.md:225: one account template (child of ERP AI Setting, AC-30 (1)).
+	"ERP AI User Template": {
+		"folder": "erp_ai_user_template",
+		"field_count": 3,
+		"phrases": {
+			"template_name": ("không trùng", "không phân biệt hoa thường", "tạo tài khoản theo mẫu"),
+			"roles": ("Mỗi dòng", "ít nhất một", "System Manager", "Guest", "bị chặn khi lưu"),
+			"note": ("ghi chú", "không ảnh hưởng"),
+		},
+		"section_count": 2,
+		"read_only_fields": (),
+		"sections": (
+			("section_template", "Mẫu và vai trò", "template_name"),
+			("section_note", "Ghi chú", "note"),
 		),
 	},
 	"ERP AI Log": {

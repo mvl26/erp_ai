@@ -25,6 +25,7 @@
   "auto_approve_streak",
   "section_catalog",
   "catalog_rules",
+  "user_templates",
   "section_limits",
   "max_turns_per_run",
   "max_runs_per_ticket_per_day",
@@ -202,6 +203,13 @@
    "label": "Danh mục trắng",
    "options": "ERP AI Catalog Rule",
    "description": "Danh mục trắng của đường chính. Không có dòng nào = bot không ghi ERP ngoài phiếu. Mỗi dòng: hành động, DocType, trường, đầu mục, chế độ Cấm / Cần duyệt / Tự làm. Dòng trỏ vào dữ liệu của app, phân quyền, tài khoản hay chứng từ submit bị chặn khi lưu."
+  },
+  {
+   "fieldname": "user_templates",
+   "fieldtype": "Table",
+   "label": "Mẫu tài khoản",
+   "options": "ERP AI User Template",
+   "description": "Mẫu cho hành động tạo tài khoản theo mẫu: tên mẫu và vai trò (mỗi dòng một vai trò). Không được chứa System Manager, Administrator, ERP AI Instructor, ERP AI Agent, Guest, All."
   },
   {
    "fieldname": "section_limits",
@@ -399,7 +407,7 @@
  ],
  "issingle": 1,
  "links": [],
- "modified": "2026-11-14 19:10:00.000000",
+ "modified": "2026-11-14 22:30:00.000000",
  "modified_by": "Administrator",
  "module": "ERP AI agent",
  "name": "ERP AI Setting",

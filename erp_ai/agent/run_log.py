@@ -61,9 +61,10 @@ def action_entry(
 	"""Build one entry of a log row's `actions`; the only place that does (ADR-033 Ràng buộc, U3 3.1).
 
 	The entry has every key of `ACTION_KEYS` in order, then `reason` when `ok` is False (blank gives
-	`NO_REASON`; otherwise `reason` passed through `redact.redact_secrets`) and `rule` when it is not blank. `doctype` is cut to `ACTION_DOCTYPE_MAX`. The values
-	before/after are copied with secret keys, `SECRET_FIELDS` and the DocType's `Password` fields set to
-	`SECRET_MASK`, and every string in them passed through `redact.redact_secrets`.
+	`NO_REASON`; otherwise `reason` passed through `redact.redact_secrets`) and `rule` when it is not
+	blank. `doctype` is cut to `ACTION_DOCTYPE_MAX`. The values before/after are copied with secret keys,
+	`SECRET_FIELDS` and the DocType's `Password` fields set to `SECRET_MASK`, and every string in them
+	passed through `redact.redact_secrets`.
 
 	Raises:
 		ValueError: `tool` is not a non-empty string, `ok` is not a bool, or a value set is not a dict or None.

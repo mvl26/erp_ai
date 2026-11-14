@@ -4,6 +4,7 @@ Pure module: standard library and erp_ai.constants only, no I/O. Shared by the t
 the controller and the apply job.
 """
 
+import json
 import unicodedata
 
 from erp_ai.constants import (
@@ -109,13 +110,58 @@ def _shown(value) -> str:
 	return "" if "://" in text else text
 
 
+# Verb of each item line of a block's notes; delete and rename in capitals (CHG-002 design 3.7).
+_NOTE_VERBS = {
+	CHANGE_OP_EDIT: "sửa",
+	CHANGE_OP_CREATE: "tạo",
+	CHANGE_OP_DELETE: "XÓA",
+	CHANGE_OP_RENAME: "ĐỔI TÊN",
+}
+_RESTART_ARGV = ["restart"]
+
+
+def _stored_commands(command_list) -> list[list[str]]:
+	"""The argv list stored in `command_list`; `[]` when empty, not JSON or not a list."""
+	try:
+		commands = json.loads(command_list or "[]")
+	except ValueError:
+		return []
+	return commands if isinstance(commands, list) else []
+
+
+def _block_notes(rows, commands) -> list[str]:
+	"""Lines 1-5 of a block's notes (CHG-002 design 3.7): counts, items, commands, restart, undo."""
+	rows = sorted(rows or (), key=lambda row: row.get("idx") or 0)
+	kinds = [row.get("operation") for row in rows]
+	notes = [
+		f"Gồm {kinds.count(CHANGE_OP_EDIT)} sửa, {kinds.count(CHANGE_OP_CREATE)} tạo,"
+		f" {kinds.count(CHANGE_OP_DELETE)} xóa, {kinds.count(CHANGE_OP_RENAME)} đổi tên;"
+		f" {len(commands)} lệnh."
+	]
+	for row in rows:
+		line = f"{_NOTE_VERBS[row.get('operation')]} {row.get('file_path')}"
+		if row.get("operation") == CHANGE_OP_RENAME:
+			line += f" → {row.get('new_path')}"
+		notes.append(line)
+	notes.extend(f"lệnh: bench {' '.join(argv)}" for argv in commands)
+	if _RESTART_ARGV in commands:
+		notes.append("Sau khi áp dụng, hệ thống sẽ restart bench (lệnh cuối).")
+	if commands:
+		notes.append("Lệnh trong khối không hoàn tác được; hoàn tác chỉ trả lại phần file.")
+	return notes
+
+
 def proposal_notes(proposal_fields) -> list[str]:
-	"""Sentences for the bot comment and the review form (design 3.9).
+	"""Sentences for the bot comment and the review form (design 3.9; block shape CHG-002 3.7).
 
 	`proposal_fields` is the proposal document or a dict of its fields; only those stored
 	fields are read, never git. A sentence whose value is missing or carries a URL is left out.
+	A block (child rows or a `command_list`) starts with its counts, items and commands.
 	"""
-	notes = []
+	rows = proposal_fields.get("operations")
+	command_list = proposal_fields.get("command_list")
+	is_block = bool(rows) or bool(command_list)
+	notes = _block_notes(rows, _stored_commands(command_list)) if is_block else []
 	is_code = proposal_fields.get("change_kind") == CHANGE_KIND_CODE
 	app = _shown(proposal_fields.get("app"))
 	branch = _shown(proposal_fields.get("target_branch"))
@@ -148,8 +194,8 @@ def proposal_notes(proposal_fields) -> list[str]:
 			notes.append(f"Commit áp dụng: {apply_commit}.")
 		elif status == CHANGE_STATUS_UNDONE and undo_commit:
 			notes.append(f"Commit hoàn tác: {undo_commit}.")
-		if str(proposal_fields.get("file_path") or "").endswith(".py"):
+		if not is_block and str(proposal_fields.get("file_path") or "").endswith(".py"):
 			notes.append("Sau khi áp dụng cần người chạy bench restart.")
-	elif proposal_fields.get("change_kind") == CHANGE_KIND_COMMAND:
+	elif not is_block and proposal_fields.get("change_kind") == CHANGE_KIND_COMMAND:
 		notes.append("Lệnh bench không hoàn tác được.")
 	return notes

@@ -962,11 +962,24 @@ class TestChangeProposalFormScript(FrappeTestCase):
 			self.assertIn("args: { name: frm.doc.name },", call)
 			self.assertIn('type: "POST",', call)
 			self.assertRegex(body[call_at:], _statement("callback: () => frm.reload_doc(),"))
-			self.assertEqual(source.count("frm.reload_doc()"), 1)
-			self.assertEqual(source.count("frappe.call("), 1)
-			self.assertEqual(source.count('type: "POST"'), 1)
+			# The three buttons share this one confirmed POST call (design 3.3/T17).
+			self.assertEqual(body.count("frm.reload_doc()"), 1)
+			self.assertEqual(body.count("frappe.call("), 1)
+			self.assertEqual(body.count('type: "POST"'), 1)
 			self.assertEqual(source.count("frappe.confirm("), 1)
 			self.assertEqual(source.count("frm.add_custom_button("), 1)
+
+		with self.subTest(rule="signed link: one extra POST call to decide, no confirm (ADR-023 QĐ 1)"):
+			outside = source.replace(helper.group(0), "")
+			self.assertEqual(outside.count("frappe.call("), 1)
+			call_at = outside.index("frappe.call(")
+			function_at = outside.rindex("\nfunction ", 0, call_at)
+			function_end = outside.index("\n}", call_at)
+			auto_block = outside[function_at:function_end]
+			call = auto_block[auto_block.index("frappe.call(") :]
+			self.assertIn('method: "erp_ai.change_decision.decide",', call)
+			self.assertIn('type: "POST",', call)
+			self.assertNotIn("frappe.confirm", auto_block)
 
 		with self.subTest(rule="intro from __onload.change_notes, each line escaped"):
 			self.assertIn("frm.doc.__onload", source)

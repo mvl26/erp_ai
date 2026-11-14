@@ -111,22 +111,20 @@ def _shown(value) -> str:
 
 
 # Verb of each item line of a block's notes; delete and rename in capitals (CHG-002 design 3.7).
-_NOTE_VERBS = {
-	CHANGE_OP_EDIT: "sửa",
-	CHANGE_OP_CREATE: "tạo",
-	CHANGE_OP_DELETE: "XÓA",
-	CHANGE_OP_RENAME: "ĐỔI TÊN",
-}
+_NOTE_VERBS = {**_ITEM_VERBS, CHANGE_OP_DELETE: "XÓA", CHANGE_OP_RENAME: "ĐỔI TÊN"}
 _RESTART_ARGV = ["restart"]
 
 
 def _stored_commands(command_list) -> list[list[str]]:
-	"""The argv list stored in `command_list`; `[]` when empty, not JSON or not a list."""
-	try:
-		commands = json.loads(command_list or "[]")
-	except ValueError:
-		return []
-	return commands if isinstance(commands, list) else []
+	"""The argv list stored in `command_list`, read strictly like `block.commands_of` (design 2.3).
+
+	Raises ValueError when the stored value is not a JSON list of argv lists, so the notes never
+	show the approver fewer commands than the apply job would read.
+	"""
+	commands = json.loads(command_list or "[]")
+	if not isinstance(commands, list) or not all(isinstance(argv, list) for argv in commands):
+		raise ValueError(f"command_list is not a list of argv lists: {command_list!r}")
+	return commands
 
 
 def _block_notes(rows, commands) -> list[str]:
@@ -160,6 +158,7 @@ def proposal_notes(proposal_fields) -> list[str]:
 	"""
 	rows = proposal_fields.get("operations")
 	command_list = proposal_fields.get("command_list")
+	# same test as `block.is_block` (design 2.3), on a dict or a document
 	is_block = bool(rows) or bool(command_list)
 	notes = _block_notes(rows, _stored_commands(command_list)) if is_block else []
 	is_code = proposal_fields.get("change_kind") == CHANGE_KIND_CODE

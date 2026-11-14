@@ -425,17 +425,19 @@ class TestBlockNotes(FrappeTestCase):
 			op_row(5, CHANGE_OP_EDIT, "helpdesk/helpdesk/api.py"),
 			op_row(2, CHANGE_OP_CREATE, "helpdesk/helpdesk/api/new.py"),
 			op_row(4, CHANGE_OP_RENAME, "helpdesk/helpdesk/a.py", "helpdesk/helpdesk/b.py"),
+			op_row(6, CHANGE_OP_CREATE, "helpdesk/helpdesk/api/other.py"),
 		]
 		commands = [MIGRATE_COMMAND, ["build", "--app", "helpdesk"], ["restart"]]
 		self.assertEqual(
 			proposal_notes(block_fields(rows, commands)),
 			[
-				"Gồm 2 sửa, 1 tạo, 1 xóa, 1 đổi tên; 3 lệnh.",
+				"Gồm 2 sửa, 2 tạo, 1 xóa, 1 đổi tên; 3 lệnh.",
 				"sửa helpdesk/helpdesk/hooks.py",
 				"tạo helpdesk/helpdesk/api/new.py",
 				"XÓA helpdesk/helpdesk/old.py",
 				"ĐỔI TÊN helpdesk/helpdesk/a.py → helpdesk/helpdesk/b.py",
 				"sửa helpdesk/helpdesk/api.py",
+				"tạo helpdesk/helpdesk/api/other.py",
 				"lệnh: bench --site miyano migrate",
 				"lệnh: bench build --app helpdesk",
 				"lệnh: bench restart",
@@ -519,10 +521,16 @@ class TestBlockNotes(FrappeTestCase):
 			BRANCH_NOTE,
 			UPSTREAM_NOTE,
 		]
-		# empty, missing, empty-list or malformed command_list: no command, no not-undoable line
-		for command_list in ("[]", "", None, "not json", '{"args": ["restart"]}'):
+		# empty, missing or empty-list command_list: no command, no not-undoable line
+		for command_list in ("[]", "", None):
 			with self.subTest(command_list=command_list):
 				self.assertEqual(proposal_notes(block_fields(ONE_EDIT, command_list)), no_command)
+		# a stored command_list that is not a JSON list of argv lists is read strictly, like
+		# block.commands_of (design 2.3): it raises, never shows the approver "0 lệnh"
+		for command_list in ("not json", '{"args": ["restart"]}', '["restart"]'):
+			with self.subTest(command_list=command_list):
+				with self.assertRaises(ValueError):
+					proposal_notes(block_fields(ONE_EDIT, command_list))
 		# a commands-only block gets the block line, not the old "Lệnh bench không hoàn tác được."
 		self.assertEqual(
 			proposal_notes(

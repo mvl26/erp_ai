@@ -680,6 +680,30 @@ class TestPermissionSwitchNotice(FrappeTestCase):
 				self.assertEqual(len(lines), 2)
 				self.assertEqual(lines[-1], f"Môi trường site: {environment}")
 
+	def test_several_switches_on_one_notice_in_form_order_without_outside_check(self):
+		# Review round 1: two switches in one save -> one notice, one line each in form order,
+		# environment last; auto_assign_enabled (section_routing) is a Check outside the section.
+		self._save({"auto_assign_enabled": 0})
+		meta = frappe.get_meta(SETTING_DOCTYPE)
+		msgprint = self._save(
+			{
+				"one_click_approval_enabled": 1,
+				"act_now_enabled": 1,
+				"auto_assign_enabled": 1,
+				"site_environment": "test",
+			}
+		)
+		calls = self._notice_calls(msgprint)
+		self.assertEqual(len(calls), 1, "several switches on in one save must give exactly one notice")
+		message = calls[0].args[0] if calls[0].args else calls[0].kwargs.get("msg")
+		lines = message.split("<br>")
+		expected_switch_lines = [
+			f"<b>{frappe.utils.escape_html(field.label)}</b>: {frappe.utils.escape_html(field.description)}"
+			for field in (meta.get_field("act_now_enabled"), meta.get_field("one_click_approval_enabled"))
+		]
+		self.assertEqual(lines, [*expected_switch_lines, "Môi trường site: test"])
+		self.assertNotIn(meta.get_field("auto_assign_enabled").label, message)
+
 	def test_save_without_switch_change_no_notice(self):
 		self._save({"record_tools_enabled": 1})
 		msgprint = self._save({"site_environment": "test"})

@@ -10,12 +10,13 @@ from unittest.mock import patch
 import frappe
 from frappe.tests.utils import FrappeTestCase
 from frappe.utils.synchronization import filelock
-from helpdesk.test_utils import create_agent
+from helpdesk.test_utils import create_agent, make_ticket
 
-from erp_ai.agent import change_text, policy
+from erp_ai.agent import authority, change_text, policy
 from erp_ai.agent.changes import apply_job, file_writer, process_runner, transitions
 from erp_ai.agent.changes.process_runner import CommandResult
 from erp_ai.agent.tools import change_guard, source
+from erp_ai.agent.tools.registry import ToolContext, execute_tool
 from erp_ai.constants import (
 	BOT_GIT_EMAIL,
 	CHANGE_KIND_CODE,
@@ -28,9 +29,16 @@ from erp_ai.constants import (
 	COMMAND_TIMEOUT_S,
 	LOG_DOCTYPE,
 	PROPOSAL_DOCTYPE,
+	ROLE_AGENT,
 	ROLE_INSTRUCTOR,
 )
-from erp_ai.test_utils import GIT_SANDBOX_EMAIL, GitSandbox, make_change_proposal, set_agent_settings
+from erp_ai.test_utils import (
+	GIT_SANDBOX_EMAIL,
+	GitSandbox,
+	add_credential,
+	make_change_proposal,
+	set_agent_settings,
+)
 
 APP = "custom_app"
 REL = "pkg/mod.py"
@@ -51,6 +59,9 @@ GIT_COMMIT_FAILED_TEXT = "commit git lỗi, đã trả file về như trước"
 GIT_RESTORE_FAILED_TEXT = "commit git lỗi và không trả lại được trạng thái kho, cần người kiểm"
 GIT_COMMIT_MISMATCH_TEXT = "commit không đúng nội dung đã duyệt, cần người kiểm"
 GIT_NOT_ANCESTOR_TEXT = "commit áp dụng không còn nằm trong lịch sử nhánh đang checkout"
+# AC-13, NFR-5: a fake key planted in the process environment and in the stored credential.
+FAKE_KEY = "sk-ant-ERPAI-T22-LEAK-5d0c71"
+PROPOSER = "propose.t22@example.com"
 
 
 def _sha(text: str) -> str:
@@ -2387,17 +2398,61 @@ class TestApplyCommand(ApplyJobTestCase):
 		run_bench.assert_called_once_with(["version"], 1)
 		self.assertEqual(self.state(name).change_status, CHANGE_STATUS_APPLIED)
 
-	def test_timed_out_command_ends_as_failed(self):
-		name = self.command_proposal(["--site", frappe.local.site, "migrate"])
-		timed_out = self.result(exit_code=None, timed_out=True)
-		with patch.object(process_runner, "run_bench", return_value=timed_out):
-			apply_job.run_change(name, "apply")
+	def test_command_timeout_fails_with_reason(self):
+		# AC-10, design 4.3 step 4 (design.md:627): `timed_out` → `Lỗi` "quá thời gian", checked first, so a
+		# result that is also `not_found` or carries a kill exit code still says "quá thời gian". Every branch
+		# stores the exit code, duration and output (design.md:632).
+		for fields, stored_exit_code in (
+			({"exit_code": None}, 0),
+			({"exit_code": 137, "output": "đang chạy\n"}, 137),
+			({"exit_code": None, "not_found": True}, 0),
+		):
+			with self.subTest(**fields):
+				name = self.command_proposal(["--site", frappe.local.site, "migrate"])
+				result = self.result(timed_out=True, duration_ms=540000, **fields)
+				with patch.object(process_runner, "run_bench", return_value=result) as run_bench:
+					apply_job.run_change(name, "apply")
 
-		state = self.state(name)
-		self.assertEqual(
-			(state.change_status, state.failure_reason),
-			(CHANGE_STATUS_FAILED, "lệnh chạy quá giờ và đã bị dừng"),
-		)
+				run_bench.assert_called_once()
+				state = self.state(name)
+				self.assertEqual(
+					(state.change_status, state.failure_reason), (CHANGE_STATUS_FAILED, "quá thời gian")
+				)
+				stored = frappe.db.get_value(
+					PROPOSAL_DOCTYPE, name, ["exit_code", "duration_ms", "command_output"], as_dict=True
+				)
+				self.assertEqual(
+					(stored.exit_code, stored.duration_ms, stored.command_output),
+					(stored_exit_code, 540000, result.output),
+				)
+				self.assertEqual(self.steps(name), ["approve", "fail"])
+				self.assertEqual(
+					self.log_row(name, "fail")[1],
+					{"exit_code": result.exit_code, "duration_ms": 540000, "output": result.output},
+				)
+
+	def test_limit_passed_is_remaining_budget(self):
+		# NFR-3, design 4.3 step 4: `limit = int(deadline - now)`, `deadline` taken when the job starts; the
+		# limit reaches `timeout -s KILL <limit> bench` unchanged.
+		for elapsed_s, limit in (
+			(0.0, COMMAND_TIMEOUT_S),
+			(0.5, COMMAND_TIMEOUT_S - 1),
+			(123.4, 416),
+			(539.0, 1),
+		):
+			with self.subTest(elapsed_s=elapsed_s):
+				name = self.command_proposal(["version"])
+				clock = iter([1000.0])
+				done = subprocess.CompletedProcess(args=[], returncode=0, stdout="xong\n")
+				with (
+					patch("time.monotonic", side_effect=lambda: next(clock, 1000.0 + elapsed_s)),
+					patch("subprocess.run", return_value=done) as run,
+				):
+					apply_job.run_change(name, "apply")
+
+				(argv,), _ = run.call_args
+				self.assertEqual(argv[1:5], ["-s", "KILL", str(limit), "bench"])
+				self.assertEqual(self.state(name).change_status, CHANGE_STATUS_APPLIED)
 
 	def test_arguments_no_longer_allowed_never_run(self):
 		name = self.command_proposal(["build", "--app", APP])
@@ -2435,3 +2490,147 @@ class TestApplyCommand(ApplyJobTestCase):
 
 		self.assertEqual(seen, [(1, "Đang áp dụng")])
 		self.assertNotEqual(self.state(name).change_status, CHANGE_STATUS_APPROVED)
+
+
+class TestNoKeyLeak(ApplyJobTestCase):
+	"""AC-13, NFR-5: a fake key in `os.environ` and in the stored credential never reaches a store of the flow."""
+
+	def setUp(self):
+		super().setUp()
+		environ = patch.dict(os.environ, {"ANTHROPIC_API_KEY": FAKE_KEY, "ERP_AI_FAKE_SECRET": FAKE_KEY})
+		environ.start()
+		self.addCleanup(environ.stop)
+		frappe.set_user("Administrator")
+		create_agent(PROPOSER)
+		frappe.get_doc("User", PROPOSER).add_roles(ROLE_AGENT)
+		add_credential("t22-leak", api_key=FAKE_KEY)
+		frappe.set_user(ACTOR)
+
+	def run_flow(self) -> dict:
+		"""Propose a file change and a bench command with the tools, approve and apply both, undo the file
+		change; returns each store as text, after proving that each one holds what the flow wrote.
+
+		`subprocess.run` is spied on: git runs for real in the sandbox, bench is a stub that prints the `env`
+		it was given as its output, so a key in that `env` lands in the proposal and its log rows.
+		"""
+		frappe.set_user("Administrator")
+		ticket = str(make_ticket(subject="ERPAI-TEST T22 leak", raised_by=PROPOSER).name)
+		context = ToolContext(
+			ticket_name=ticket,
+			effective_level="L3",
+			instructor=ACTOR,
+			run_id="run-t22",
+			category_mapping={},
+			agent_user=PROPOSER,
+			change_enabled=True,
+			allowed_apps=(APP,),
+		)
+		base = self.head()
+		calls = []
+		real_run = subprocess.run
+
+		def spy(argv, *args, **kwargs):
+			env = kwargs.get("env") or {}
+			calls.append(("bench" if "bench" in argv else "git", list(argv), env))
+			if "bench" in argv:
+				printed = "".join(f"{key}={value}\n" for key, value in sorted(env.items()))
+				return subprocess.CompletedProcess(args=argv, returncode=0, stdout=printed)
+			return real_run(argv, *args, **kwargs)
+
+		with patch("subprocess.run", side_effect=spy):
+			frappe.set_user(PROPOSER)
+			results = [
+				execute_tool(
+					"propose_file_change",
+					{
+						"path": FILE_PATH,
+						"find": ["x = 1"],
+						"replace": ["x = 2"],
+						"reason": "sửa theo yêu cầu",
+					},
+					context,
+				),
+				execute_tool(
+					"propose_bench_command", {"command": "version", "reason": "xem phiên bản"}, context
+				),
+			]
+			frappe.set_user(ACTOR)
+			self.assertEqual([result["ok"] for result in results], [True, True], results)
+			code, command = (result["proposal"] for result in results)
+			for name in (code, command):
+				transitions.approve(name, ACTOR)
+				apply_job.run_change(name, "apply")
+			transitions.request_undo(code, ACTOR)
+			apply_job.run_change(code, "undo")
+
+		names = [code, command]
+		self.assertEqual(
+			[self.state(name).change_status for name in names], [CHANGE_STATUS_UNDONE, CHANGE_STATUS_APPLIED]
+		)
+		proposals = [frappe.get_doc(PROPOSAL_DOCTYPE, name).as_dict() for name in names]
+		logs = frappe.get_all(LOG_DOCTYPE, filters={"change_proposal": ["in", names]}, fields=["*"])
+		comments = frappe.get_all(
+			"Comment", filters=authority.ticket_comment_filters(ticket), pluck="content"
+		)
+		commits = self.sandbox.git(APP, "log", "--format=%an%ae%cn%ce%B", f"{base}..HEAD")
+		bench_envs = [env for kind, _argv, env in calls if kind == "bench"]
+		git_envs = [env for kind, _argv, env in calls if kind == "git"]
+		git_writes = [argv for kind, argv, _env in calls if kind == "git" and "commit" in argv]
+		# Each store is not empty: a "0 occurrences" below reads real content.
+		self.assertIn("PATH=", proposals[1]["command_output"])
+		self.assertEqual(len(logs), 5, logs)
+		self.assertEqual(len(comments), 2, comments)
+		self.assertEqual(int(self.sandbox.git(APP, "rev-list", "--count", f"{base}..HEAD")), 2)
+		self.assertEqual(commits.count(BOT_GIT_EMAIL), 4, commits)
+		self.assertEqual(len(bench_envs), 1)
+		self.assertEqual(len(git_writes), 2, git_writes)
+		self.assertTrue(all(env.get("GIT_CONFIG_GLOBAL") == "/dev/null" for env in git_envs), git_envs)
+
+		def text(value):
+			return json.dumps(value, ensure_ascii=False, default=str)
+
+		return {
+			"tool_result": text(results),
+			"proposal": text(proposals),
+			"log": text(logs),
+			"comment": text(comments),
+			"commit": commits,
+			"bench_env": text(bench_envs),
+			"git_env": text(git_envs),
+		}
+
+	def leaks(self, stores) -> set:
+		return {store for store, content in stores.items() if FAKE_KEY in content}
+
+	def test_fake_key_never_in_proposal_result_log_comment(self):
+		self.assertEqual(self.leaks(self.run_flow()), set())
+
+		# The same check goes red when the key is leaked on purpose into each store.
+		real_git_env = source.git_env
+
+		def git_env_with_key(**kwargs):
+			identity = {"GIT_COMMITTER_NAME": FAKE_KEY} if kwargs["identity"] else {}
+			return {**real_git_env(**kwargs), "ERP_AI_FAKE_SECRET": FAKE_KEY, **identity}
+
+		planted = (
+			(
+				"bench env",
+				patch.object(process_runner, "_minimal_env", return_value=dict(os.environ)),
+				{"bench_env", "proposal", "log"},
+			),
+			("git env", patch.object(source, "git_env", side_effect=git_env_with_key), {"git_env", "commit"}),
+			(
+				"comment",
+				patch.object(change_text, "proposal_notes", return_value=[f"ghi chú {FAKE_KEY}"]),
+				{"comment"},
+			),
+		)
+		for label, leak, stores in planted:
+			with self.subTest(leak=label), leak:
+				leaked = self.leaks(self.run_flow())
+				self.assertTrue(stores <= leaked, (stores, leaked))
+		# Last: the branch name stays checked out and ends in the tool result, the proposal and the log.
+		with self.subTest(leak="branch"):
+			self.sandbox.switch_branch(APP, f"leak/{FAKE_KEY}")
+			leaked = self.leaks(self.run_flow())
+			self.assertTrue({"tool_result", "proposal", "log"} <= leaked, leaked)

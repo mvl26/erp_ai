@@ -59,7 +59,6 @@ GIT_BRANCH_CHANGED = "nhánh đang checkout đã đổi kể từ lúc đề xu�
 GIT_NOT_ANCESTOR = "commit áp dụng không còn nằm trong lịch sử nhánh đang checkout"
 # Design 4.3 step 4 (exact wording); "quá thời gian" is AC-10's reason (design addendum 2 QĐ-A3).
 COMMAND_FAILED = "lệnh trả mã {0}"
-COMMAND_TIMED_OUT = "lệnh chạy quá giờ và đã bị dừng"
 COMMAND_OUT_OF_TIME = "quá thời gian"
 COMMAND_NOT_FOUND = "không tìm thấy bench trên máy chủ"
 
@@ -612,10 +611,11 @@ def _apply_command(proposal, actor: str, deadline: float) -> None:
 		)
 		raise _Stop(CHANGE_STATUS_FAILED, COMMAND_OUT_OF_TIME, no_run)
 	result = process_runner.run_bench(args, limit)
+	# Design 4.3 step 4, in its order: timed out, bench not found, non-zero exit, done.
+	if result.timed_out:
+		raise _Stop(CHANGE_STATUS_FAILED, COMMAND_OUT_OF_TIME, result)
 	if result.not_found:
 		raise _Stop(CHANGE_STATUS_FAILED, COMMAND_NOT_FOUND, result)
-	if result.timed_out:
-		raise _Stop(CHANGE_STATUS_FAILED, COMMAND_TIMED_OUT, result)
 	if result.exit_code != 0:
 		raise _Stop(CHANGE_STATUS_FAILED, COMMAND_FAILED.format(result.exit_code), result)
 	transitions.finish(

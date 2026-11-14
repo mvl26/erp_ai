@@ -586,9 +586,12 @@ class TestSiteApi(FrappeTestCase):
 
 class TestUnrestrictedGrant(FrappeTestCase):
 	def names(self, level, has_instructor, unrestricted):
+		# Only the site_admin + site_unrestricted tools (site_api.TOOLS), change switch off.
+		record_tools = {spec.name for spec in site_api.TOOLS}
 		return [
 			spec["name"]
-			for spec in registry.get_unrestricted_tool_schemas(level, has_instructor, unrestricted)
+			for spec in get_tool_schemas(level, has_instructor, False, unrestricted)
+			if spec["name"] in record_tools
 		]
 
 	def test_switch_grants_every_record_tool_at_any_level_above_l0_with_instructor(self):

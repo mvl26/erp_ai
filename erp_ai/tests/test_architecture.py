@@ -1,8 +1,9 @@
 """Architecture tests (ADR-001..005, NFR-1, NFR-5, D-23): static scans of the source tree.
 
-Nothing here touches the database, and product code is read as text and parsed with `ast`. Two exceptions:
-`test_agent_modules_import_alone_in_fresh_process` imports a few modules in a child Python process (never in
-this one) to catch import cycles that test order would hide, and
+Nothing here touches the database, and product code is read as text and parsed with `ast`. Exceptions:
+the module imports constants from `erp_ai.constants` (no frappe call);
+`test_agent_modules_import_alone_in_fresh_process` imports a few modules in a child Python process (never
+in this one) to catch import cycles that test order would hide; and
 `test_privilege_alert_reads_shared_generic_write_tools` imports the runner's tool tables (ADR-024).
 
 Scanned files ("product code"): every `.py` file under `erp_ai/` except `test_*.py` (this also drops
@@ -3786,18 +3787,26 @@ def _string_shape(scan: GitScan, rel: str, node, depth: int = 0) -> str:
 	return _string_shape(scan, *found, depth + 1) if found else UNKNOWN_PIECE
 
 
-def _change_link_shapes(sources: dict) -> list:
-	"""`[(node, shape)]` of every string expression of change_link.py (docstrings excluded)."""
-	scan = GitScan(sources)
-	tree = scan.trees[CHANGE_LINK_FILE]
-	docstrings = _docstring_ids(tree)
+NO_CONSTANTS_SCAN = GitScan({})  # resolves no name: every Name/Attribute piece stays an UNKNOWN_PIECE
+
+
+def _string_texts(root, docstrings: set, scan: GitScan = NO_CONSTANTS_SCAN, rel: str = "") -> list:
+	"""`[(node, shape)]` of every string expression under `root` (docstrings excluded); the module constants
+	of `scan` are resolved from file `rel`."""
 	return [
-		(node, _string_shape(scan, CHANGE_LINK_FILE, node))
-		for node in ast.walk(tree)
+		(node, _string_shape(scan, rel, node))
+		for node in ast.walk(root)
 		if (isinstance(node, ast.Constant) and isinstance(node.value, str) and id(node) not in docstrings)
 		or isinstance(node, ast.JoinedStr)
 		or (isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add))
 	]
+
+
+def _change_link_shapes(sources: dict) -> list:
+	"""`[(node, shape)]` of every string expression of change_link.py (docstrings excluded)."""
+	scan = GitScan(sources)
+	tree = scan.trees[CHANGE_LINK_FILE]
+	return _string_texts(tree, _docstring_ids(tree), scan, CHANGE_LINK_FILE)
 
 
 def change_link_string_shapes(sources: dict) -> list:
@@ -4007,10 +4016,12 @@ WATERMARK_FIELD = "privilege_alert_checked_until"
 WATERMARK_WRITER = "_advance_privilege_watermark"
 WATERMARK_FILES = (SETTING_DOCTYPE_FILE, SETTING_CONTROLLER_FILE)  # tests are never scanned, so allowed too
 SETTING_WRITE_METHODS = ("save", "insert")
-# Clock reads other than frappe.utils.now_datetime, by last name: datetime.now/utcnow under any alias,
-# frappe.utils.now, and the query builder's Now(); SQL NOW() written in a string is matched below.
-FOREIGN_CLOCK_CALLS = ("now", "utcnow")
-SQL_NOW = re.compile(r"\bnow\s*\(|^\s*now\s*$", re.IGNORECASE)
+# The clocks ADR-024 Ràng buộc 4 bans in the alert job: datetime.now/utcnow (any alias, resolved) and SQL
+# NOW(), as the query builder's Now() or written in a string.
+PRIVILEGE_JOB_FUNCTION = "check_privilege_escalation"
+FOREIGN_CLOCK_CALLS = ("datetime.datetime.now", "datetime.datetime.utcnow")
+QUERY_BUILDER_NOW = "Now"
+SQL_NOW = re.compile(r"\bnow\s*\(", re.IGNORECASE)
 VERSION_DOCTYPE = "Version"
 VERSION_TABLE = re.compile(r"\btabVersion\b")
 VERSION_JS = re.compile(r"""(["'`])Version\1|\btabVersion\b""")
@@ -4020,36 +4031,33 @@ WRITE_ENTRY_FUNCTION = "write_entry"
 COMMIT_CALL = "frappe.db.commit"
 
 
-def _folded_string(node) -> str:
-	"""The text of a string expression (`+` and f-string pieces joined), each unknown piece as UNKNOWN_PIECE."""
-	if isinstance(node, ast.Constant):
-		return node.value if isinstance(node.value, str) else UNKNOWN_PIECE
-	if isinstance(node, ast.JoinedStr):
-		return "".join(_folded_string(value) for value in node.values)
-	if isinstance(node, ast.FormattedValue):
-		return _folded_string(node.value)
-	if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
-		return _folded_string(node.left) + _folded_string(node.right)
-	return UNKNOWN_PIECE
-
-
-def _string_texts(root, docstrings: set) -> list:
-	"""`[(node, text)]` for every string expression under `root` (docstrings excluded)."""
-	return [
-		(node, _folded_string(node))
-		for node in ast.walk(root)
-		if (isinstance(node, ast.Constant) and isinstance(node.value, str) and id(node) not in docstrings)
-		or isinstance(node, ast.JoinedStr)
-		or (isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add))
-	]
+def _pattern_lines(source: str, pattern: re.Pattern) -> set:
+	return {source.count("\n", 0, match.start()) + 1 for match in pattern.finditer(source)}
 
 
 def _text_lines(source: str, text: str) -> set:
-	return {source.count("\n", 0, match.start()) + 1 for match in re.finditer(re.escape(text), source)}
+	return _pattern_lines(source, re.compile(re.escape(text)))
+
+
+def _reached_functions(functions: dict, start: str, references) -> list:
+	"""`start` and every function of `functions` it reaches through `references(function)`, sorted."""
+	reached, pending = set(), [start]
+	while pending:
+		name = pending.pop()
+		if name not in reached:
+			reached.add(name)
+			pending.extend(other for other in references(functions[name]) if other in functions)
+	return sorted(reached)
+
+
+def _called_or_passed_names(node) -> set:
+	"""Names `node` calls or reads as a value (a function handed over, e.g. in a tuple of checks)."""
+	return _called_names(node) | {name.id for name in ast.walk(node) if isinstance(name, ast.Name)}
 
 
 def _naming_lines(rel: str, source: str, text: str) -> set:
-	"""Lines naming `text`: written anywhere in the file (comments too), or built by a Python string expression."""
+	"""Lines naming `text`: written anywhere in the file (comments too), or built by a Python string
+	expression."""
 	lines = _text_lines(source, text)
 	if rel.endswith(".py"):
 		tree = parse(rel, source)
@@ -4164,23 +4172,34 @@ def check_tasks_never_saves_or_inserts_setting(sources: dict) -> list:
 
 
 def check_privilege_job_reads_no_other_clock(sources: dict) -> list:
-	"""ADR-024 Ràng buộc 4: tasks.py calls no `datetime.now`/`utcnow` (any alias), `frappe.utils.now`, query
-	builder `Now()` and writes no SQL `NOW()`; its clock is `frappe.utils.now_datetime` or the `now` argument."""
+	"""ADR-024 Ràng buộc 4: the alert job PRIVILEGE_JOB_FUNCTION, and every tasks.py function it reaches
+	(called or passed as a value), calls no `datetime.now`/`datetime.utcnow` (any alias) or query builder `Now()` and
+	writes no SQL `NOW()`; its clock is `frappe.utils.now_datetime` or the `now` argument. The other jobs of
+	tasks.py and `frappe.utils.now` (the same clock as `now_datetime`) are outside the constraint."""
 	if TASKS_FILE not in sources:
 		return _missing(TASKS_FILE)
 	tree = parse(TASKS_FILE, sources[TASKS_FILE])
-	aliases = import_aliases(tree)
-	violations = [
-		violation(TASKS_FILE, node, f"reads the clock with {resolved_name(node.func, aliases)}() (ADR-024)")
-		for node in ast.walk(tree)
-		if isinstance(node, ast.Call)
-		and resolved_name(node.func, aliases).rpartition(".")[2].lower() in FOREIGN_CLOCK_CALLS
-	]
-	violations.extend(
-		violation(TASKS_FILE, node, f"SQL clock in {text!r} (ADR-024)")
-		for node, text in _string_texts(tree, _docstring_ids(tree))
-		if SQL_NOW.search(text)
-	)
+	functions, aliases, docstrings = _module_functions(tree), import_aliases(tree), _docstring_ids(tree)
+	if PRIVILEGE_JOB_FUNCTION not in functions:
+		return [f"{TASKS_FILE}: no function {PRIVILEGE_JOB_FUNCTION} (ADR-024)"]
+	violations = []
+	for name in _reached_functions(functions, PRIVILEGE_JOB_FUNCTION, _called_or_passed_names):
+		function = functions[name]
+		calls = [
+			(node, resolved_name(node.func, aliases))
+			for node in ast.walk(function)
+			if isinstance(node, ast.Call)
+		]
+		violations.extend(
+			violation(TASKS_FILE, node, f"{name} reads the clock with {called}() (ADR-024)")
+			for node, called in calls
+			if called in FOREIGN_CLOCK_CALLS or called.rpartition(".")[2] == QUERY_BUILDER_NOW
+		)
+		violations.extend(
+			violation(TASKS_FILE, node, f"{name}: SQL clock in {text!r} (ADR-024)")
+			for node, text in _string_texts(function, docstrings)
+			if SQL_NOW.search(text)
+		)
 	return violations
 
 
@@ -4198,9 +4217,7 @@ def check_no_version_reads(sources: dict) -> list:
 		elif rel.endswith(".js"):
 			violations.extend(
 				f"{rel}:{line}: reads Version (ADR-024)"
-				for line in sorted(
-					{source.count("\n", 0, match.start()) + 1 for match in VERSION_JS.finditer(source)}
-				)
+				for line in sorted(_pattern_lines(source, VERSION_JS))
 			)
 	return violations
 
@@ -4214,15 +4231,8 @@ def check_privilege_condition_ignores_owner(sources: dict) -> list:
 	functions, docstrings = _module_functions(tree), _docstring_ids(tree)
 	if PRIVILEGE_CONDITION_FUNCTION not in functions:
 		return [f"{TASKS_FILE}: no function {PRIVILEGE_CONDITION_FUNCTION} (ADR-024)"]
-	reached, pending = set(), [PRIVILEGE_CONDITION_FUNCTION]
-	while pending:
-		name = pending.pop()
-		if name in reached:
-			continue
-		reached.add(name)
-		pending.extend(called for called in _called_names(functions[name]) if called in functions)
 	violations = []
-	for name in sorted(reached):
+	for name in _reached_functions(functions, PRIVILEGE_CONDITION_FUNCTION, _called_names):
 		function = functions[name]
 		texts = _string_texts(function, docstrings)
 		texts += [(node, node.attr) for node in ast.walk(function) if isinstance(node, ast.Attribute)]
@@ -4793,8 +4803,7 @@ class TestArchitecture(unittest.TestCase):
 		self.assertGreater(len(violating), 0)
 		for case, (sources, fragment) in violating.items():
 			with self.subTest(case=case):
-				found = check(sources)
-				self.assertTrue(any(fragment in text for text in found), f"{fragment!r} not in {found}")
+				TestScannersCatchViolations.assertCaught(self, check(sources), fragment)
 
 	def test_privilege_alert_reads_shared_generic_write_tools(self):
 		# The one in-process product import of this class: the runner's tool tables are values, not text.
@@ -4955,44 +4964,79 @@ class TestArchitecture(unittest.TestCase):
 			},
 		)
 
-		# Rule 5: the job reads no clock but now_datetime / its `now` argument.
+		# Rule 5: the alert job (and every tasks.py function it reaches) reads no clock but now_datetime / its
+		# `now` argument; other jobs of tasks.py are out of scope.
+		job_upper = "upper = (get_datetime(now) if now else now_datetime())"
+
+		def in_job(line: str) -> dict:
+			return changed(sample, TASKS_FILE, replace=(job_upper, f"{line}\n\t{job_upper}"))
+
+		def in_helper(helper: str, line: str) -> dict:
+			return changed(sample, TASKS_FILE, replace=(f"def {helper}():\n", f"def {helper}():\n\t{line}\n"))
+
+		passed_as_value = changed(
+			in_job("for find in (_stamp,):\n\t\tfind()"),
+			TASKS_FILE,
+			"\n\ndef _stamp():\n\treturn frappe.qb.from_('X').select(Now())\n",
+			replace=("import frappe\n", "import frappe\nfrom frappe.query_builder.functions import Now\n"),
+		)
 		self.assertRuleSamples(
 			check_privilege_job_reads_no_other_clock,
 			sample,
 			{
-				case: (changed(sample, TASKS_FILE, extra), fragment)
-				for case, extra, fragment in (
-					(
-						"datetime.now",
-						"from datetime import datetime\n" + in_function("return datetime.now()"),
-						"datetime.datetime.now()",
-					),
-					(
-						"aliased utcnow",
-						"import datetime as dt\n" + in_function("return dt.datetime.utcnow()"),
-						"datetime.datetime.utcnow()",
-					),
-					("frappe.utils.now", in_function("return frappe.utils.now()"), "frappe.utils.now()"),
-					(
-						"query builder Now",
-						"from frappe.query_builder.functions import Now\n" + in_function("return Now()"),
-						"frappe.query_builder.functions.Now()",
-					),
-					(
-						"SQL NOW() by concatenation",
-						in_function(
-							'return frappe.db.sql("select name from `tabERP AI Log` where creation <= " + "NOW()")'
+				"datetime.now in the job": (
+					changed(
+						in_job("started = datetime.now()"),
+						TASKS_FILE,
+						replace=(
+							"from datetime import timedelta",
+							"from datetime import datetime, timedelta",
 						),
-						"SQL clock",
 					),
-					(
-						"lower-case now ( in an f-string",
-						in_function('return f"creation <= now ( ) - {1}"'),
-						"SQL clock",
+					"check_privilege_escalation reads the clock with datetime.datetime.now()",
+				),
+				"aliased utcnow in a helper it calls": (
+					changed(
+						in_helper("_scripts_by_agent", "started = dt.datetime.utcnow()"),
+						TASKS_FILE,
+						replace=("import frappe\n", "import datetime as dt\n\nimport frappe\n"),
 					),
-				)
+					"_scripts_by_agent reads the clock with datetime.datetime.utcnow()",
+				),
+				"query builder Now in a helper passed as a value": (
+					passed_as_value,
+					"_stamp reads the clock with frappe.query_builder.functions.Now()",
+				),
+				"SQL NOW() split by concatenation in a helper": (
+					in_helper(
+						"_keys_without_value", 'frappe.db.sql("select 1 where creation <= NO" + "W()")'
+					),
+					"_keys_without_value: SQL clock",
+				),
+				"lower-case now ( in an f-string in the job": (
+					in_job('frappe.db.sql(f"select 1 where creation <= now ( ) - {1}")'),
+					"check_privilege_escalation: SQL clock",
+				),
+				"job renamed": (
+					changed(
+						sample, TASKS_FILE, replace=("def check_privilege_escalation(", "def _run_alert(")
+					),
+					"no function check_privilege_escalation",
+				),
 			},
 		)
+		other_job = (
+			"from datetime import datetime\n\nfrom frappe.query_builder.functions import Now\n"
+			"\n\ndef recompute_monthly_spend():\n\treturn datetime.now(), datetime.utcnow(), Now()"
+			'\n\n\ndef reprobe_exhausted_keys():\n\treturn frappe.db.sql("select 1 where creation <= NOW()")\n'
+		)
+		for case, sources in (
+			("another job of tasks.py reads datetime.now and NOW()", changed(sample, TASKS_FILE, other_job)),
+			("frappe.utils.now() in the job", in_job("stamp = frappe.utils.now()")),
+			("the plain string 'now' in a helper", in_helper("_scripts_by_agent", 'label = "now"')),
+		):
+			with self.subTest(case=case):
+				self.assertEqual(check_privilege_job_reads_no_other_clock(sources), [])
 
 		# Rule 6: product code never reads the Version DocType.
 		self.assertRuleSamples(

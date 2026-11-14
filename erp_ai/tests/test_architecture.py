@@ -4173,12 +4173,14 @@ def check_tasks_never_saves_or_inserts_setting(sources: dict) -> list:
 
 def check_privilege_job_reads_no_other_clock(sources: dict) -> list:
 	"""ADR-024 Ràng buộc 4: the alert job PRIVILEGE_JOB_FUNCTION, and every tasks.py function it reaches
-	(called or passed as a value), calls no `datetime.now`/`datetime.utcnow` (any alias) or query builder `Now()` and
-	writes no SQL `NOW()`; its clock is `frappe.utils.now_datetime` or the `now` argument. The other jobs of
-	tasks.py and `frappe.utils.now` (the same clock as `now_datetime`) are outside the constraint."""
+	(called or passed as a value), calls no `datetime.now`/`datetime.utcnow` (any alias) or query builder
+	`Now()` and writes or reads (a module constant, alone or in a string expression) no SQL `NOW()`; its clock
+	is `frappe.utils.now_datetime` or the `now` argument. The other jobs of tasks.py and `frappe.utils.now`
+	(the same clock as `now_datetime`) are outside the constraint."""
 	if TASKS_FILE not in sources:
 		return _missing(TASKS_FILE)
-	tree = parse(TASKS_FILE, sources[TASKS_FILE])
+	scan = GitScan(sources)
+	tree = scan.trees[TASKS_FILE]
 	functions, aliases, docstrings = _module_functions(tree), import_aliases(tree), _docstring_ids(tree)
 	if PRIVILEGE_JOB_FUNCTION not in functions:
 		return [f"{TASKS_FILE}: no function {PRIVILEGE_JOB_FUNCTION} (ADR-024)"]
@@ -4195,9 +4197,18 @@ def check_privilege_job_reads_no_other_clock(sources: dict) -> list:
 			for node, called in calls
 			if called in FOREIGN_CLOCK_CALLS or called.rpartition(".")[2] == QUERY_BUILDER_NOW
 		)
+		texts = _string_texts(function, docstrings, scan, TASKS_FILE)
+		in_texts = {id(inner) for node, _text in texts for inner in ast.walk(node)}
+		texts += [
+			(node, _string_shape(scan, TASKS_FILE, node))
+			for node in ast.walk(function)
+			if isinstance(node, ast.Name | ast.Attribute)
+			and id(node) not in in_texts
+			and scan.lookup(TASKS_FILE, node)
+		]
 		violations.extend(
 			violation(TASKS_FILE, node, f"{name}: SQL clock in {text!r} (ADR-024)")
-			for node, text in _string_texts(function, docstrings)
+			for node, text in texts
 			if SQL_NOW.search(text)
 		)
 	return violations
@@ -5017,6 +5028,22 @@ class TestArchitecture(unittest.TestCase):
 					in_job('frappe.db.sql(f"select 1 where creation <= now ( ) - {1}")'),
 					"check_privilege_escalation: SQL clock",
 				),
+				"module constant with NOW() read by the job": (
+					changed(
+						in_job("frappe.db.sql(CUTOFF_SQL)"),
+						TASKS_FILE,
+						'\nCUTOFF_SQL = "select 1 where creation <= NOW()"\n',
+					),
+					"check_privilege_escalation: SQL clock in 'select 1 where creation <= NOW()'",
+				),
+				"module constant with NOW() in an f-string of a helper": (
+					changed(
+						in_helper("_keys_without_value", 'frappe.db.sql(f"select 1 where {CUTOFF}")'),
+						TASKS_FILE,
+						'\nCUTOFF = "creation <= NOW()"\n',
+					),
+					"_keys_without_value: SQL clock in 'select 1 where creation <= NOW()'",
+				),
 				"job renamed": (
 					changed(
 						sample, TASKS_FILE, replace=("def check_privilege_escalation(", "def _run_alert(")
@@ -5034,6 +5061,15 @@ class TestArchitecture(unittest.TestCase):
 			("another job of tasks.py reads datetime.now and NOW()", changed(sample, TASKS_FILE, other_job)),
 			("frappe.utils.now() in the job", in_job("stamp = frappe.utils.now()")),
 			("the plain string 'now' in a helper", in_helper("_scripts_by_agent", 'label = "now"')),
+			(
+				"a module constant with NOW() read only by another job",
+				changed(
+					sample,
+					TASKS_FILE,
+					'\nSTALE_SQL = "select 1 where creation <= NOW()"\n'
+					"\n\ndef reprobe_exhausted_keys():\n\treturn frappe.db.sql(STALE_SQL)\n",
+				),
+			),
 		):
 			with self.subTest(case=case):
 				self.assertEqual(check_privilege_job_reads_no_other_clock(sources), [])

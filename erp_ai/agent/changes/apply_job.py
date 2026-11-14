@@ -15,7 +15,7 @@ from frappe.utils.synchronization import filelock
 
 from erp_ai.agent import change_text, policy
 from erp_ai.agent.authority import NEVER_AUTHORITY
-from erp_ai.agent.changes import file_writer, process_runner, transitions
+from erp_ai.agent.changes import file_writer, process_runner, result_comment, transitions
 from erp_ai.agent.tools import change_guard, source
 from erp_ai.constants import (
 	BOT_GIT_EMAIL,
@@ -92,17 +92,40 @@ def run_change(proposal_name: str, action: str) -> None:
 	deadline = started + COMMAND_TIMEOUT_S
 	outcome = _locked_run(proposal_name, action, deadline)
 	commit = "-"
+	comment = "-"
 	if outcome != OUTCOME_SKIPPED:
 		commit_field = "apply_commit_sha" if action == ACTION_APPLY else "undo_commit_sha"
 		commit = frappe.db.get_value(PROPOSAL_DOCTYPE, proposal_name, commit_field) or "-"
+		comment = _post_result(proposal_name, action)
 	frappe.logger(LOGGER_NAME).info(
-		"erp_ai change proposal=%s action=%s outcome=%s duration_ms=%d commit=%s",
+		"erp_ai change proposal=%s action=%s outcome=%s duration_ms=%d commit=%s comment=%s",
 		proposal_name,
 		action,
 		outcome,
 		int((time.monotonic() - started) * 1000),
 		commit,
+		comment,
 	)
+
+
+def _post_result(proposal_name: str, action: str) -> str:
+	"""Write the result line on the ticket after the final status was committed (AC-28, CHG-001 design 4).
+
+	Returns the Comment name, `-` when nothing was written, or `error`.
+	"""
+	try:
+		name = result_comment.post_result(proposal_name)
+		frappe.db.commit()
+	except Exception as exc:
+		# STD-ERR-1: the final status is already committed and is the job's real result; a failed result line
+		# only loses that line (rolled back), so it is logged and the job ends normally instead of re-raising.
+		frappe.db.rollback()
+		frappe.log_error(
+			result_comment.TITLE_RESULT_COMMENT_FAILED,
+			f"proposal={proposal_name} action={action} error={type(exc).__name__}",
+		)
+		return "error"
+	return name or "-"
 
 
 def _locked_run(proposal_name: str, action: str, deadline: float) -> str:

@@ -53,6 +53,20 @@ PRICE_FIELDS = (
 	"price_output_per_mtok",
 )
 PROBE_RESULT_FIELDS = ("label", "ok", "error_kind", "status")
+# D-7: the switches are the Check fields of this section, read from the meta; no switch name is written here.
+PERMISSION_SECTION = "section_permissions"
+PERMISSION_NOTICE_TITLE = "Đã bật quyền mở rộng"
+
+
+def permission_switch_fields(meta) -> list:
+	"""The Check fields between `PERMISSION_SECTION` and the next Section Break, in form order."""
+	switches, inside = [], False
+	for field in meta.fields:
+		if field.fieldtype == "Section Break":
+			inside = field.fieldname == PERMISSION_SECTION
+		elif inside and field.fieldtype == "Check":
+			switches.append(field)
+	return switches
 
 
 class ERPAISetting(Document):
@@ -65,6 +79,23 @@ class ERPAISetting(Document):
 		self.check_limits()
 		self.check_status_settings()
 		self.check_enabled_requirements()
+
+	def on_update(self):
+		self.notify_permission_switches()
+
+	def notify_permission_switches(self):
+		"""AC-4: one notice listing every switch turned 0 -> 1 by this save, then the site environment."""
+		before = self.get_doc_before_save()
+		escape = frappe.utils.escape_html
+		lines = [
+			f"<b>{escape(field.label)}</b>: {escape(field.description or '')}"
+			for field in permission_switch_fields(self.meta)
+			if self.get(field.fieldname) and not (before and before.get(field.fieldname))
+		]
+		if not lines:
+			return
+		lines.append(f"Môi trường site: {escape(self.site_environment or '')}")
+		frappe.msgprint("<br>".join(lines), title=PERMISSION_NOTICE_TITLE, indicator="orange")
 
 	def restore_self_managed_fields(self):
 		# (b) the monthly spend is written only by the scheduler

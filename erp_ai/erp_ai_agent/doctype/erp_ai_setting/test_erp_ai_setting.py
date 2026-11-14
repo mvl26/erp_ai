@@ -629,3 +629,98 @@ class TestFeat007Defaults(FrappeTestCase):
 		for fieldname, expected in FEAT007_NEW_FIELD_DEFAULTS.items():
 			with self.subTest(fieldname=fieldname):
 				self.assertEqual(self._value_after_install(fieldname), expected)
+
+
+# FEAT-007 design 2.1: the five Check fields of section_permissions (AC-4 notice, D-7).
+PERMISSION_SWITCHES = (
+	"unrestricted_enabled",
+	"record_tools_enabled",
+	"act_now_enabled",
+	"code_change_enabled",
+	"one_click_approval_enabled",
+)
+NOTICE_TITLE = "Đã bật quyền mở rộng"
+
+
+class TestPermissionSwitchNotice(FrappeTestCase):
+	def setUp(self):
+		self.addCleanup(frappe.db.rollback)
+		keep_agent_settings(self)
+		self._save({fieldname: 0 for fieldname in PERMISSION_SWITCHES} | {"site_environment": "production"})
+
+	def _save(self, values):
+		"""Save the setting with `values`; return the mock that stood in for frappe.msgprint."""
+		doc = frappe.get_single(SETTING_DOCTYPE)
+		doc.update(values)
+		doc.flags.ignore_validate = True
+		with patch.object(frappe, "msgprint") as msgprint:
+			doc.save(ignore_permissions=True)
+		return msgprint
+
+	def _notice_calls(self, msgprint):
+		return [c for c in msgprint.call_args_list if c.kwargs.get("title") == NOTICE_TITLE]
+
+	def test_each_switch_on_shows_name_consequence_environment(self):
+		meta = frappe.get_meta(SETTING_DOCTYPE)
+		for environment, fieldname in zip(("test", "production") * 3, PERMISSION_SWITCHES, strict=False):
+			with self.subTest(fieldname=fieldname):
+				self._save({name: 0 for name in PERMISSION_SWITCHES})
+				msgprint = self._save({fieldname: 1, "site_environment": environment})
+				calls = self._notice_calls(msgprint)
+				self.assertEqual(len(calls), 1, f"no single notice when {fieldname} goes 0 -> 1")
+				call = calls[0]
+				self.assertEqual(call.kwargs.get("indicator"), "orange")
+				message = call.args[0] if call.args else call.kwargs.get("msg")
+				field = meta.get_field(fieldname)
+				self.assertIn(
+					f"<b>{frappe.utils.escape_html(field.label)}</b>: {frappe.utils.escape_html(field.description)}",
+					message,
+				)
+				lines = message.split("<br>")
+				self.assertEqual(len(lines), 2)
+				self.assertEqual(lines[-1], f"Môi trường site: {environment}")
+
+	def test_several_switches_on_one_notice_in_form_order_without_outside_check(self):
+		# Review round 1: two switches in one save -> one notice, one line each in form order,
+		# environment last; auto_assign_enabled (section_routing) is a Check outside the section.
+		self._save({"auto_assign_enabled": 0})
+		meta = frappe.get_meta(SETTING_DOCTYPE)
+		msgprint = self._save(
+			{
+				"one_click_approval_enabled": 1,
+				"act_now_enabled": 1,
+				"auto_assign_enabled": 1,
+				"site_environment": "test",
+			}
+		)
+		calls = self._notice_calls(msgprint)
+		self.assertEqual(len(calls), 1, "several switches on in one save must give exactly one notice")
+		message = calls[0].args[0] if calls[0].args else calls[0].kwargs.get("msg")
+		lines = message.split("<br>")
+		expected_switch_lines = [
+			f"<b>{frappe.utils.escape_html(field.label)}</b>: {frappe.utils.escape_html(field.description)}"
+			for field in (meta.get_field("act_now_enabled"), meta.get_field("one_click_approval_enabled"))
+		]
+		self.assertEqual(lines, [*expected_switch_lines, "Môi trường site: test"])
+		self.assertNotIn(meta.get_field("auto_assign_enabled").label, message)
+
+	def test_save_without_switch_change_no_notice(self):
+		self._save({"record_tools_enabled": 1})
+		msgprint = self._save({"site_environment": "test"})
+		self.assertEqual(self._notice_calls(msgprint), [])
+		msgprint = self._save({})
+		self.assertEqual(self._notice_calls(msgprint), [])
+
+	def test_switch_off_no_notice(self):
+		self._save({"act_now_enabled": 1, "one_click_approval_enabled": 1})
+		msgprint = self._save({"act_now_enabled": 0, "one_click_approval_enabled": 0})
+		self.assertEqual(self._notice_calls(msgprint), [])
+
+	def test_unrestricted_notice_has_call_method_caveat(self):
+		msgprint = self._save({"unrestricted_enabled": 1})
+		calls = self._notice_calls(msgprint)
+		self.assertEqual(len(calls), 1)
+		message = calls[0].args[0]
+		self.assertIn("gọi hàm whitelist", message)
+		self.assertIn("Gọi hàm là tự do", message)
+		self.assertIn("chỉ là cố gắng", message)

@@ -14,6 +14,7 @@ synthetic violating code (must be caught) and clean code (must not be flagged).
 """
 
 import ast
+import itertools
 import json
 import os
 import re
@@ -22,7 +23,7 @@ import subprocess
 import sys
 import unittest
 from pathlib import Path
-from typing import ClassVar
+from typing import ClassVar, NamedTuple
 
 from erp_ai.constants import AGENT_STATUS_EVENT, PANEL_METHODS
 
@@ -50,6 +51,22 @@ SUBPROCESS_FILES = (SOURCE_TOOL_FILE, PROCESS_RUNNER_FILE)
 READ_TOOL_FILE = "agent/tools/read.py"
 HANDLERS_FILE = "handlers.py"
 TOOLS_PREFIX = "agent/tools/"
+CHANGE_TEXT_FILE = "agent/change_text.py"
+CHANGE_TEXT_MODULE = "erp_ai.agent.change_text"
+# Design 8.2 [Sửa vòng 1]: change_text imports only the standard library and erp_ai.constants. Every other
+# erp_ai module is read from the tree (so a new one is covered); third-party code is check_import_boundaries'.
+CHANGE_TEXT_FORBIDDEN = (
+	"frappe",
+	"helpdesk",
+	*sorted(
+		f"{PACKAGE}.{path.stem}"
+		for path in PACKAGE_ROOT.iterdir()
+		if path.stem.isidentifier()
+		and not path.stem.startswith("__")
+		and path.stem != "constants"
+		and (path.is_dir() or path.suffix == ".py")
+	),
+)
 
 # ADR-001 (layers), ADR-003 (handlers), ADR-005 (tools): (scope module, forbidden modules, reason).
 LAYER_RULES = (
@@ -111,6 +128,11 @@ LAYER_RULES = (
 		"erp_ai.agent.policy",
 		("erp_ai.agent.tools",),
 		"STD-DESIGN-6: policy là tầng dưới của tools, không import ngược",
+	),
+	(
+		CHANGE_TEXT_MODULE,
+		CHANGE_TEXT_FORBIDDEN,
+		"design 8.2/ADR-022: change_text imports only the standard library and erp_ai.constants",
 	),
 )
 # NOT forbidden on purpose: erp_ai.eval -> erp_ai.agent.runner (entry layer -> agent core, ADR-001).
@@ -2661,6 +2683,1029 @@ def check_changes_never_set_user_or_publish(sources: dict) -> list:
 	return violations
 
 
+# ---------------------------------------------------------------------------------------------------
+# ADR-022 (FEAT-004 T44): git rules. Sets below are hand-written from ADR-022 QĐ 2 on purpose: a product
+# constant that widens itself must not widen the rule (the real-code test pins the product constants).
+# ---------------------------------------------------------------------------------------------------
+
+SOURCE_MODULE = module_name(SOURCE_TOOL_FILE)
+PROCESS_RUNNER_MODULE = module_name(PROCESS_RUNNER_FILE)
+CONSTANTS_MODULE = module_name(CONSTANTS_FILE)
+GIT_PROGRAM = "git"
+GIT_LEGACY_SUBCOMMANDS = frozenset({"log", "blame"})  # the read tool of ADR-013 QĐ 8, kept as it is
+GIT_READ_SET = frozenset(
+	{"rev-parse", "rev-list", "status", "check-ignore", "ls-files", "merge-base", "diff-tree", "cat-file"}
+)
+GIT_WRITE_SET = frozenset({"add", "commit", "rm"})
+GIT_ALLOWED_SUBCOMMANDS = {
+	SOURCE_TOOL_FILE: GIT_LEGACY_SUBCOMMANDS | GIT_READ_SET,
+	PROCESS_RUNNER_FILE: GIT_WRITE_SET,
+}
+GIT_FORBIDDEN_SUBCOMMANDS = (
+	"push",
+	"fetch",
+	"pull",
+	"clone",
+	"checkout",
+	"switch",
+	"restore",
+	"branch",
+	"reset",
+	"rebase",
+	"merge",
+	"cherry-pick",
+	"revert",
+	"am",
+	"apply",
+	"stash",
+	"clean",
+	"tag",
+	"remote",
+	"config",
+	"update-ref",
+	"symbolic-ref",
+	"reflog",
+	"gc",
+	"maintenance",
+	"worktree",
+	"notes",
+	"replace",
+	"filter-branch",
+	"prune",
+)
+GIT_FORBIDDEN_FRAGMENTS = ("get-url", "ls-remote", "remote.", "--amend", "update-ref")
+GIT_CONFIG_PATH = re.compile(r"\.git[/\\]+config\b")
+GIT_COMMAND_TEXT = re.compile(r"(?<![\w.-])git\s+([\w-]+)")  # "git push ..." handed to shlex.split
+# Global git options that take the next element as their value (so it is not the subcommand).
+GIT_OPTIONS_WITH_VALUE = (
+	"-C",
+	"-c",
+	"--git-dir",
+	"--work-tree",
+	"--namespace",
+	"--config-env",
+	"--super-prefix",
+)
+GIT_OPTIONS_FUNCTION = "git_global_options"
+GIT_ENV_FUNCTION = "git_env"
+GIT_ENV_MARKERS = (
+	"GIT_CONFIG_GLOBAL",
+	"GIT_CONFIG_NOSYSTEM",
+	"GIT_TERMINAL_PROMPT",
+	"GIT_AUTHOR_",
+	"GIT_COMMITTER_",
+	"core.hooksPath",
+	"core.fsmonitor",
+)
+GIT_MARKER_OWNERS = {"core.hooksPath": GIT_OPTIONS_FUNCTION, "core.fsmonitor": GIT_OPTIONS_FUNCTION}
+PATHSPEC_SEPARATOR = "--"
+PATHSPEC_MAGIC = ":"
+COMMIT_REQUIRED_FLAGS = ("--only", "--no-gpg-sign")
+COMMIT_FORBIDDEN_FLAGS = (
+	"-a",
+	"--all",
+	"--amend",
+	"--allow-empty",
+	"--fixup",
+	"--squash",
+	"-C",
+	"-c",
+	"--reset-author",
+)
+COMMIT_FORBIDDEN_SHORT = frozenset(flag[1] for flag in COMMIT_FORBIDDEN_FLAGS if not flag.startswith("--"))
+COMMIT_MESSAGE_FLAGS = ("-m", "--message")  # the next element is the message, not an option
+RM_REQUIRED_FLAG = "--cached"
+BOT_NAME_CONSTANT = "BOT_GIT_NAME"
+BOT_EMAIL_CONSTANT = "BOT_GIT_EMAIL"
+BOT_GIT_NAME_VALUE = "ERP AI Agent"
+BOT_EMAIL_SUFFIX = ".invalid"
+BOT_IDENTITY_ENV = {
+	"GIT_AUTHOR_NAME": BOT_NAME_CONSTANT,
+	"GIT_COMMITTER_NAME": BOT_NAME_CONSTANT,
+	"GIT_AUTHOR_EMAIL": BOT_EMAIL_CONSTANT,
+	"GIT_COMMITTER_EMAIL": BOT_EMAIL_CONSTANT,
+}
+USER_IDENTITY_FRAGMENTS = ("user.name", "user.email")
+AGENT_USER_NAME = "AGENT_USER"
+GIT_FUNCTION_NAMES = ("read_git_state", "run_git_read", "_run_git_write")
+GIT_FUNCTION_PREFIX = "git_"
+GIT_MODULES = (SOURCE_MODULE, PROCESS_RUNNER_MODULE)
+NO_GIT_FILES = (PROPOSAL_CONTROLLER_FILE, HANDLERS_FILE, RUNNER_FILE)
+BENCH_COMMANDS_NAME = "BENCH_COMMANDS"
+GIT_RUNNING_BENCH_SUBCOMMANDS = (
+	"update",
+	"switch-to-branch",
+	"get-app",
+	"remove-app",
+	"new-app",
+	"setup",
+	"init",
+)
+APPS_ROOT_FUNCTION = "get_source_root"
+APPS_ROOT_SEGMENT = re.compile(r"(?:^|[/\\])apps(?:[/\\]|$)")
+APP_PATH_CALLS = ("get_app_path",)
+RESOLVE_DEPTH = 20
+
+
+class GitArgv(NamedTuple):
+	"""One git command line: `elements` are `(file, node, spread)`; `slot` indexes the subcommand;
+	`subcommands` is None when the scan cannot prove it is a constant string."""
+
+	rel: str
+	node: ast.AST
+	elements: list
+	git: int | None
+	slot: int | None
+	subcommands: frozenset | None
+	root_rel: str
+	root: ast.AST
+
+
+def _docstring_ids(tree: ast.AST) -> set:
+	ids = set()
+	for node in ast.walk(tree):
+		if isinstance(node, ast.Module | ast.ClassDef | ast.FunctionDef | ast.AsyncFunctionDef) and node.body:
+			first = node.body[0]
+			if isinstance(first, ast.Expr) and isinstance(first.value, ast.Constant):
+				ids.add(id(first.value))
+	return ids
+
+
+def _parameters(function) -> list:
+	arguments = function.args
+	names = [arg.arg for arg in (*arguments.posonlyargs, *arguments.args, *arguments.kwonlyargs)]
+	return names + ([arguments.vararg.arg] if arguments.vararg else [])
+
+
+class GitScan:
+	"""Every git command line of the product (ADR-022 Ràng buộc).
+
+	A command line is a list/tuple display or a `+` concatenation with a "git" element (also `/usr/bin/git`,
+	a module constant, an f-string or a `*`-spread constant list of any product module, imported under any
+	alias). The subcommand is the first element after "git" that is not a global option. When that element
+	is a parameter of the enclosing function (`run_git_read(repo, subcommand, *args)`,
+	`_run_git_write(..., subcommand_args)`), the command line is expanded at every call site of that
+	function; when it is a local name, it must be gated by `if name not in <constant set>: return/raise`.
+	Anything else is "not a constant" (`subcommands=None`).
+	"""
+
+	def __init__(self, sources: dict):
+		self.trees = {rel: parse(rel, source) for rel, source in only_python(sources).items()}
+		self.aliases = {rel: import_aliases(tree) for rel, tree in self.trees.items()}
+		self.files = {module_name(rel): rel for rel in self.trees}
+		self.assignments = {rel: self._module_assignments(tree) for rel, tree in self.trees.items()}
+		self.parents = {
+			rel: {id(child): node for node in ast.walk(tree) for child in ast.iter_child_nodes(node)}
+			for rel, tree in self.trees.items()
+		}
+		self.problems = []
+		self.templates = []  # (rel, root, elements, git index) of every command line as written
+		self.argvs = []
+		for rel, tree in self.trees.items():
+			for root in self._roots(rel, tree):
+				elements = self.flatten(rel, root)
+				git = self.git_index(elements)
+				if git is not None:
+					self._add(rel, root, elements, git)
+
+	@staticmethod
+	def _module_assignments(tree: ast.AST) -> dict:
+		names = {}
+		for node in tree.body:
+			if (
+				isinstance(node, ast.Assign)
+				and len(node.targets) == 1
+				and isinstance(node.targets[0], ast.Name)
+			):
+				names[node.targets[0].id] = node.value
+			elif (
+				isinstance(node, ast.AnnAssign)
+				and isinstance(node.target, ast.Name)
+				and node.value is not None
+			):
+				names[node.target.id] = node.value
+		return names
+
+	# value resolution ------------------------------------------------------------------------------
+
+	def lookup(self, rel: str, node):
+		"""`(file, value node)` of the module constant a Name/Attribute refers to, in any product module."""
+		if isinstance(node, ast.Name) and node.id in self.assignments.get(rel, {}):
+			return rel, self.assignments[rel][node.id]
+		if not isinstance(node, ast.Name | ast.Attribute):
+			return None
+		module, _dot, name = resolved_name(node, self.aliases.get(rel, {})).rpartition(".")
+		target = self.files.get(module)
+		if target is not None and name in self.assignments[target]:
+			return target, self.assignments[target][name]
+		return None
+
+	def text(self, rel: str, node, depth: int = 0):
+		"""The string a node always evaluates to, else None."""
+		if depth > RESOLVE_DEPTH:
+			return None
+		if isinstance(node, ast.Constant):
+			return node.value if isinstance(node.value, str) else None
+		if isinstance(node, ast.JoinedStr):
+			parts = [self.text(rel, value, depth + 1) for value in node.values]
+			return None if None in parts else "".join(parts)
+		if isinstance(node, ast.FormattedValue):
+			plain = node.conversion == -1 and node.format_spec is None
+			return self.text(rel, node.value, depth + 1) if plain else None
+		if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+			left, right = self.text(rel, node.left, depth + 1), self.text(rel, node.right, depth + 1)
+			return None if left is None or right is None else left + right
+		found = self.lookup(rel, node)
+		return self.text(*found, depth + 1) if found else None
+
+	def prefix(self, rel: str, node) -> str:
+		"""The constant text a string expression starts with (`f":(literal){rel}"` -> ":(literal)")."""
+		if isinstance(node, ast.JoinedStr) and node.values:
+			return self.text(rel, node.values[0]) or ""
+		if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+			return self.prefix(rel, node.left)
+		return self.text(rel, node) or ""
+
+	def strings(self, rel: str, node, depth: int = 0):
+		"""The frozenset of strings a constant set/tuple/list (or `frozenset(...)` of one) holds, else None."""
+		if depth > RESOLVE_DEPTH:
+			return None
+		if (
+			isinstance(node, ast.Call)
+			and referenced_name(node.func) in SET_LITERAL_CALLS
+			and len(node.args) == 1
+			and not node.keywords
+		):
+			return self.strings(rel, node.args[0], depth + 1)
+		if isinstance(node, ast.Set | ast.List | ast.Tuple):
+			found = set()
+			for element in node.elts:
+				if isinstance(element, ast.Starred):
+					inner = self.strings(rel, element.value, depth + 1)
+					if inner is None:
+						return None
+					found |= inner
+				else:
+					value = self.text(rel, element, depth + 1)
+					if value is None:
+						return None
+					found.add(value)
+			return frozenset(found)
+		if isinstance(node, ast.BinOp) and isinstance(node.op, ast.BitOr | ast.Add):
+			left, right = self.strings(rel, node.left, depth + 1), self.strings(rel, node.right, depth + 1)
+			return None if left is None or right is None else left | right
+		found = self.lookup(rel, node)
+		return self.strings(*found, depth + 1) if found else None
+
+	def code_texts(self, rel: str):
+		"""`(node, text)` for every string of the code (docstrings excluded, f-string pieces and resolved
+		concatenations included) and every keyword-argument name (`dict(GIT_CONFIG_GLOBAL=...)`)."""
+		docstrings = _docstring_ids(self.trees[rel])
+		for node in ast.walk(self.trees[rel]):
+			if isinstance(node, ast.Constant) and isinstance(node.value, str) and id(node) not in docstrings:
+				yield node, node.value
+			elif isinstance(node, ast.JoinedStr | ast.BinOp):
+				value = self.text(rel, node)
+				if value is not None:
+					yield node, value
+			elif isinstance(node, ast.keyword) and node.arg:
+				yield node, node.arg
+
+	# command lines ---------------------------------------------------------------------------------
+
+	def is_construct(self, node) -> bool:
+		if isinstance(node, ast.List | ast.Tuple):
+			return True
+		return (
+			isinstance(node, ast.BinOp)
+			and isinstance(node.op, ast.Add)
+			and (self.is_construct(node.left) or self.is_construct(node.right))
+		)
+
+	def _roots(self, rel: str, tree: ast.AST):
+		parents = self.parents[rel]
+		for node in ast.walk(tree):
+			if not self.is_construct(node):
+				continue
+			parent = parents.get(id(node))
+			if isinstance(parent, ast.BinOp) and self.is_construct(parent):
+				continue
+			if isinstance(parent, ast.Starred) and isinstance(parents.get(id(parent)), ast.List | ast.Tuple):
+				continue
+			yield node
+
+	def flatten(self, rel: str, node, depth: int = 0) -> list:
+		if depth > RESOLVE_DEPTH:
+			return [(rel, node, True)]
+		if isinstance(node, ast.List | ast.Tuple):
+			elements = []
+			for element in node.elts:
+				if isinstance(element, ast.Starred):
+					elements += self.spread(rel, element.value, depth + 1)
+				else:
+					elements.append((rel, element, False))
+			return elements
+		if isinstance(node, ast.BinOp) and self.is_construct(node):
+			return self.spread(rel, node.left, depth + 1) + self.spread(rel, node.right, depth + 1)
+		return [(rel, node, True)]
+
+	def spread(self, rel: str, node, depth: int = 0) -> list:
+		"""The elements `*node` (or a `+` operand) adds; an unknown value stays one spread element."""
+		if self.is_construct(node):
+			return self.flatten(rel, node, depth)
+		found = self.lookup(rel, node)
+		if found and self.is_construct(found[1]):
+			return self.flatten(*found, depth)
+		return [(rel, node, True)]
+
+	def git_index(self, elements: list):
+		for index, (rel, node, spread) in enumerate(elements):
+			value = None if spread else self.text(rel, node)
+			if value is not None and os.path.basename(value) == GIT_PROGRAM:
+				return index
+		return None
+
+	def is_options_call(self, rel: str, node) -> bool:
+		return self._is_source_call(rel, node, GIT_OPTIONS_FUNCTION)
+
+	def is_env_call(self, rel: str, node) -> bool:
+		return self._is_source_call(rel, node, GIT_ENV_FUNCTION)
+
+	def _is_source_call(self, rel: str, node, function: str) -> bool:
+		if not isinstance(node, ast.Call):
+			return False
+		name = resolved_name(node.func, self.aliases.get(rel, {}))
+		return name == f"{SOURCE_MODULE}.{function}" or (rel == SOURCE_TOOL_FILE and name == function)
+
+	def slot(self, elements: list, start: int):
+		index = start
+		while index < len(elements):
+			rel, node, spread = elements[index]
+			if spread and self.is_options_call(rel, node):
+				index += 1
+				continue
+			value = None if spread else self.text(rel, node)
+			if value is None or not value.startswith("-"):
+				return index
+			index += 2 if value in GIT_OPTIONS_WITH_VALUE else 1
+		return None
+
+	def function_of(self, rel: str, node):
+		parents = self.parents[rel]
+		while (node := parents.get(id(node))) is not None:
+			if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda):
+				return node
+		return None
+
+	def _add(self, rel: str, root, elements: list, git: int) -> None:
+		self.templates.append((rel, root, elements, git))
+		self._check_not_mutated(rel, root)
+		slot = self.slot(elements, git + 1)
+		if slot is None:
+			self.argvs.append(GitArgv(rel, root, elements, git, None, None, rel, root))
+			return
+		element_rel, node, spread = elements[slot]
+		value = None if spread else self.text(element_rel, node)
+		function = self.function_of(rel, root)
+		subcommands = None if value is None else frozenset({value})
+		if subcommands is None and isinstance(node, ast.Name) and function is not None and element_rel == rel:
+			if node.id in _parameters(function) and not isinstance(function, ast.Lambda):
+				self._expand(rel, root, elements, function)
+				return
+			if not spread:
+				subcommands = self.guard(rel, function, node.id, root.lineno)
+		self.argvs.append(GitArgv(rel, root, elements, git, slot, subcommands, rel, root))
+
+	def _check_not_mutated(self, rel: str, root) -> None:
+		parent = self.parents[rel].get(id(root))
+		if not (
+			isinstance(parent, ast.Assign)
+			and len(parent.targets) == 1
+			and isinstance(parent.targets[0], ast.Name)
+		):
+			return
+		name = parent.targets[0].id
+		scope = self.function_of(rel, parent) or self.trees[rel]
+		for node in ast.walk(scope):
+			changed = (
+				isinstance(node, ast.AugAssign)
+				and isinstance(node.target, ast.Name)
+				and node.target.id == name
+			) or (
+				isinstance(node, ast.Call)
+				and isinstance(node.func, ast.Attribute)
+				and isinstance(node.func.value, ast.Name)
+				and node.func.value.id == name
+				and node.func.attr in ("append", "extend", "insert", "__iadd__")
+			)
+			if changed:
+				self.problems.append(
+					violation(rel, node, f"git command line {name!r} is changed after it is built")
+				)
+
+	def guard(self, rel: str, function, name: str, before: int):
+		"""The constant set of `if ... name not in SET ...: return/raise` ahead of `before`, else None."""
+		for node in ast.walk(function):
+			if not (
+				isinstance(node, ast.If)
+				and node.lineno < before
+				and isinstance(node.body[-1], ast.Return | ast.Raise)
+				and self._unconditional(rel, function, node)
+			):
+				continue
+			tests = (
+				node.test.values
+				if isinstance(node.test, ast.BoolOp) and isinstance(node.test.op, ast.Or)
+				else [node.test]
+			)
+			for test in tests:
+				if (
+					isinstance(test, ast.Compare)
+					and isinstance(test.left, ast.Name)
+					and test.left.id == name
+					and len(test.ops) == 1
+					and isinstance(test.ops[0], ast.NotIn)
+					and not self._rebound(function, name, node.lineno, before)
+				):
+					allowed = self.strings(rel, test.comparators[0])
+					if allowed is not None:
+						return allowed
+		return None
+
+	def _unconditional(self, rel: str, function, node) -> bool:
+		"""`node` sits in the function body itself or only inside `try:` bodies of it."""
+		parents = self.parents[rel]
+		child, parent = node, parents.get(id(node))
+		while parent is not function:
+			if not (isinstance(parent, ast.Try) and child in parent.body):
+				return False
+			child, parent = parent, parents.get(id(parent))
+		return True
+
+	@staticmethod
+	def _rebound(function, name: str, after: int, before: int) -> bool:
+		return any(
+			isinstance(node, ast.Name)
+			and node.id == name
+			and isinstance(node.ctx, ast.Store)
+			and after < node.lineno < before
+			for node in ast.walk(function)
+		)
+
+	def _expand(self, rel: str, root, elements: list, function) -> None:
+		for call_rel, call in self.calls_of(rel, function):
+			expanded = self.substitute(rel, elements, function, call_rel, call)
+			git = self.git_index(expanded)
+			slot = None if git is None else self.slot(expanded, git + 1)
+			subcommands = None
+			if slot is not None:
+				element_rel, node, spread = expanded[slot]
+				value = None if spread else self.text(element_rel, node)
+				subcommands = None if value is None else frozenset({value})
+			self.argvs.append(GitArgv(call_rel, call, expanded, git, slot, subcommands, rel, root))
+
+	def calls_of(self, rel: str, function) -> list:
+		"""Every direct call of `function` in the product; any other use of it is a problem."""
+		target = f"{module_name(rel)}.{function.name}"
+		calls = []
+		for other, tree in self.trees.items():
+			aliases = self.aliases[other]
+			callees = {id(node.func) for node in ast.walk(tree) if isinstance(node, ast.Call)}
+			inner = {id(node.value) for node in ast.walk(tree) if isinstance(node, ast.Attribute)}
+			for node in ast.walk(tree):
+				if not isinstance(node, ast.Name | ast.Attribute) or id(node) in inner:
+					continue
+				same_file = other == rel and isinstance(node, ast.Name) and node.id == function.name
+				if not same_file and resolved_name(node, aliases) != target:
+					continue
+				if id(node) in callees:
+					calls.append((other, self.parents[other][id(node)]))
+				else:
+					self.problems.append(
+						violation(
+							other,
+							node,
+							f"{function.name} puts its parameter in the git subcommand slot and is used other than by a direct call",
+						)
+					)
+		return calls
+
+	def substitute(self, rel: str, elements: list, function, call_rel: str, call: ast.Call) -> list:
+		"""The template command line with each parameter replaced by what this call passes."""
+		arguments = function.args
+		positional = [arg.arg for arg in (*arguments.posonlyargs, *arguments.args)]
+		named = positional + [arg.arg for arg in arguments.kwonlyargs]
+		vararg = arguments.vararg.arg if arguments.vararg else None
+		splat = next((i for i, arg in enumerate(call.args) if isinstance(arg, ast.Starred)), len(call.args))
+		keywords = {keyword.arg: keyword.value for keyword in call.keywords if keyword.arg}
+
+		def argument(name):
+			index = positional.index(name) if name in positional else len(call.args)
+			if index < len(call.args):
+				return call.args[index] if index < splat else None
+			return keywords.get(name)
+
+		expanded = []
+		for element_rel, node, spread in elements:
+			if element_rel != rel or not isinstance(node, ast.Name):
+				expanded.append((element_rel, node, spread))
+			elif node.id == vararg and spread:
+				if splat < len(positional):
+					expanded.append((call_rel, call, True))
+					continue
+				for arg in call.args[len(positional) :]:
+					if isinstance(arg, ast.Starred):
+						expanded += self.spread(call_rel, arg.value)
+					else:
+						expanded.append((call_rel, arg, False))
+			elif node.id in named:
+				arg = argument(node.id)
+				if arg is None:
+					expanded.append((call_rel, call, True))
+				else:
+					expanded += self.spread(call_rel, arg) if spread else [(call_rel, arg, False)]
+			else:
+				expanded.append((element_rel, node, spread))
+		return expanded
+
+	def consumer(self, rel: str, root):
+		"""The call that runs a command line: the call it is an argument of, or that gets the name it is bound to."""
+		parents = self.parents[rel]
+		node = root
+		while (parent := parents.get(id(node))) is not None:
+			if isinstance(parent, ast.Call) and node is not parent.func:
+				return parent
+			if (
+				isinstance(parent, ast.Assign)
+				and len(parent.targets) == 1
+				and isinstance(parent.targets[0], ast.Name)
+			):
+				name = parent.targets[0].id
+				scope = self.function_of(rel, parent) or self.trees[rel]
+				for call in ast.walk(scope):
+					if isinstance(call, ast.Call) and any(
+						isinstance(arg, ast.Name) and arg.id == name
+						for arg in (*call.args, *(keyword.value for keyword in call.keywords))
+					):
+						return call
+				return None
+			if isinstance(parent, ast.stmt):
+				return None
+			node = parent
+		return None
+
+	def is_legacy(self, rel: str, root) -> bool:
+		"""The log/blame command of the read tool (ADR-022 QĐ 4: kept as it is, not a new git command)."""
+		found = [argv for argv in self.argvs if argv.root is root and argv.root_rel == rel]
+		return (
+			rel == SOURCE_TOOL_FILE
+			and bool(found)
+			and all(
+				argv.node is root
+				and argv.subcommands is not None
+				and argv.subcommands <= GIT_LEGACY_SUBCOMMANDS
+				for argv in found
+			)
+		)
+
+	def outermost_names(self, rel: str, root):
+		"""Name/Attribute nodes under `root` that are not the base of a longer attribute chain."""
+		inner = {id(node.value) for node in ast.walk(root) if isinstance(node, ast.Attribute)}
+		for node in ast.walk(root):
+			if isinstance(node, ast.Name | ast.Attribute) and id(node) not in inner:
+				yield node, resolved_name(node, self.aliases[rel])
+
+
+def check_git_subcommands_only_allowed_sets_per_file(sources: dict) -> list:
+	"""ADR-022 QĐ 2, Ràng buộc: git runs only from source.py (log/blame + the read set) and process_runner.py
+	(add/commit/rm); every subcommand is a constant string; no other product file has "git" in a command line."""
+	scan = GitScan(sources)
+	violations = list(scan.problems)
+	for rel, root, _elements, _git in scan.templates:
+		if rel not in GIT_ALLOWED_SUBCOMMANDS:
+			violations.append(
+				violation(
+					rel,
+					root,
+					f'"git" in a command line outside {tuple(GIT_ALLOWED_SUBCOMMANDS)} (ADR-022 QĐ 2)',
+				)
+			)
+	for argv in scan.argvs:
+		allowed = GIT_ALLOWED_SUBCOMMANDS.get(argv.root_rel)
+		if allowed is None:
+			continue  # reported above
+		if argv.subcommands is None:
+			violations.append(
+				violation(argv.rel, argv.node, "git subcommand is not a constant string (ADR-022 Ràng buộc)")
+			)
+		elif argv.subcommands - allowed:
+			violations.append(
+				violation(
+					argv.rel,
+					argv.node,
+					f"git subcommand {sorted(argv.subcommands - allowed)} not allowed for {argv.root_rel} (ADR-022 QĐ 2)",
+				)
+			)
+	return violations
+
+
+def _path_parts(scan: GitScan, rel: str):
+	"""`(node, [text or None])` for the arguments of every call and every `a / b / c` or `a + b + c` chain."""
+	parents = scan.parents[rel]
+	for node in ast.walk(scan.trees[rel]):
+		if isinstance(node, ast.Call):
+			yield node, [scan.text(rel, arg) for arg in node.args]
+		elif isinstance(node, ast.BinOp) and isinstance(node.op, ast.Div | ast.Add):
+			parent = parents.get(id(node))
+			if isinstance(parent, ast.BinOp) and type(parent.op) is type(node.op):
+				continue
+			operands, chain = [], node
+			while isinstance(chain, ast.BinOp) and type(chain.op) is type(node.op):
+				operands.insert(0, chain.right)
+				chain = chain.left
+			yield node, [scan.text(rel, part) for part in (chain, *operands)]
+
+
+def check_no_forbidden_git_operations_in_product(sources: dict) -> list:
+	"""ADR-022 QĐ 2, Ràng buộc: none of the 30 forbidden subcommands in a git command line; no string of the
+	product names get-url, ls-remote, remote., --amend or update-ref; nothing reads .git/config."""
+	scan = GitScan(sources)
+	violations = []
+	command_lines = [(rel, root, elements, git) for rel, root, elements, git in scan.templates]
+	command_lines += [
+		(argv.rel, argv.node, argv.elements, argv.git) for argv in scan.argvs if argv.git is not None
+	]
+	for rel, node, elements, git in command_lines:
+		for element_rel, element, spread in elements[git + 1 :]:
+			value = None if spread else scan.text(element_rel, element)
+			if value in GIT_FORBIDDEN_SUBCOMMANDS:
+				violations.append(violation(rel, node, f"git command line holds {value!r} (ADR-022 QĐ 2)"))
+	for rel in scan.trees:
+		for node, value in scan.code_texts(rel):
+			violations.extend(
+				violation(rel, node, f"string names {fragment} (ADR-022 Ràng buộc)")
+				for fragment in GIT_FORBIDDEN_FRAGMENTS
+				if fragment in value
+			)
+			if GIT_CONFIG_PATH.search(value):
+				violations.append(violation(rel, node, "string names .git/config (ADR-022 Ràng buộc)"))
+			if rel in SUBPROCESS_FILES:
+				violations.extend(
+					violation(rel, node, f"string runs git {token!r} (ADR-022 QĐ 2)")
+					for token in GIT_COMMAND_TEXT.findall(value)
+					if token in GIT_FORBIDDEN_SUBCOMMANDS
+				)
+				if value == "config" or value.endswith(("/config", "\\config")):
+					violations.append(
+						violation(rel, node, "string names a git config file (ADR-022 Ràng buộc)")
+					)
+		for node, parts in _path_parts(scan, rel):
+			for first, second in itertools.pairwise(parts):
+				if (
+					first is not None
+					and second is not None
+					and os.path.basename(first.rstrip("/\\")) == ".git"
+					and second.lstrip("/\\").startswith("config")
+				):
+					violations.append(
+						violation(rel, node, "path .git + config: reads the git config (ADR-022 Ràng buộc)")
+					)
+	return violations
+
+
+def _commit_flag_forbidden(flag: str) -> bool:
+	name = flag.split("=", 1)[0]
+	if name in COMMIT_FORBIDDEN_FLAGS:
+		return True
+	if name.startswith("--"):  # git accepts an unambiguous abbreviation of a long option
+		return len(name) > 2 and any(forbidden.startswith(name) for forbidden in COMMIT_FORBIDDEN_FLAGS)
+	return name.startswith("-") and bool(set(name[1:]) & COMMIT_FORBIDDEN_SHORT)
+
+
+def _write_argv_problems(scan: GitScan, subcommand: str, tail: list) -> list:
+	"""What is wrong with the elements after `add`/`commit`/`rm` (ADR-022 Ràng buộc; addendum 2 QĐ-A1)."""
+	if any(spread for _rel, _node, spread in tail):
+		return ["has an argument the scan cannot read (a spread or a list that is not constant)"]
+	texts = [scan.text(rel, node) for rel, node, _spread in tail]
+	if [index for index, value in enumerate(texts) if value == PATHSPEC_SEPARATOR] != [len(tail) - 2]:
+		return [f'must end with "{PATHSPEC_SEPARATOR}" and exactly one path']
+	problems = []
+	path_rel, path, _spread = tail[-1]
+	if scan.prefix(path_rel, path).startswith(PATHSPEC_MAGIC):
+		problems.append(f'path after "{PATHSPEC_SEPARATOR}" starts with "{PATHSPEC_MAGIC}" (pathspec magic)')
+	options, message_next = [], False
+	for value in texts[:-2]:
+		if message_next:
+			message_next = False
+		elif value is None:
+			problems.append(f'has an argument before "{PATHSPEC_SEPARATOR}" that is not a constant string')
+		elif value in COMMIT_MESSAGE_FLAGS and subcommand == "commit":
+			message_next = True
+		else:
+			options.append(value)
+	if subcommand == "commit":
+		problems += [f"without {flag}" for flag in COMMIT_REQUIRED_FLAGS if flag not in options]
+		problems += [f"with forbidden {flag}" for flag in options if _commit_flag_forbidden(flag)]
+	elif subcommand == "rm" and RM_REQUIRED_FLAG not in options:
+		problems.append(f"without {RM_REQUIRED_FLAG}")
+	return problems
+
+
+def check_git_commit_add_rm_argv_shape(sources: dict) -> list:
+	"""ADR-022 Ràng buộc, design-addendum-2 QĐ-A1: commit has --only and --no-gpg-sign, add/rm/commit end with
+	"--" and exactly one path that does not start with ":", rm has --cached, commit has no forbidden flag."""
+	scan = GitScan(sources)
+	violations = []
+	for argv in scan.argvs:
+		if argv.slot is None or not argv.subcommands:
+			continue
+		tail = argv.elements[argv.slot + 1 :]
+		for subcommand in sorted(argv.subcommands & GIT_WRITE_SET):
+			violations.extend(
+				violation(argv.rel, argv.node, f"git {subcommand} {problem} (ADR-022 Ràng buộc)")
+				for problem in _write_argv_problems(scan, subcommand, tail)
+			)
+	return violations
+
+
+def check_git_env_single_definition(sources: dict) -> list:
+	"""ADR-022 QĐ 4, Ràng buộc: the git options and environment are defined once, in source.py; every new git
+	command line starts with *git_global_options(...) and runs with env=git_env(...), never os.environ."""
+	scan = GitScan(sources)
+	violations = []
+	for rel in scan.trees:
+		for node, value in scan.code_texts(rel):
+			for marker in GIT_ENV_MARKERS:
+				if marker not in value:
+					continue
+				owner = GIT_MARKER_OWNERS.get(marker, GIT_ENV_FUNCTION)
+				function = scan.function_of(rel, node)
+				if rel != SOURCE_TOOL_FILE or function is None or getattr(function, "name", None) != owner:
+					violations.append(
+						violation(rel, node, f"{marker} outside {SOURCE_TOOL_FILE} {owner}() (ADR-022 QĐ 4)")
+					)
+	for function_name in (GIT_OPTIONS_FUNCTION, GIT_ENV_FUNCTION):
+		definitions = [
+			violation(rel, node, f"defines {function_name}()")
+			for rel, tree in scan.trees.items()
+			for node in ast.walk(tree)
+			if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef) and node.name == function_name
+		]
+		if len(definitions) != 1 or not definitions[0].startswith(f"{SOURCE_TOOL_FILE}:"):
+			violations.append(
+				f"{function_name}() must be defined once, in {SOURCE_TOOL_FILE}: {definitions} (ADR-022 QĐ 4)"
+			)
+	for rel, root, elements, git in scan.templates:
+		if scan.is_legacy(rel, root):
+			continue
+		following = elements[git + 1] if git + 1 < len(elements) else None
+		if following is None or not (following[2] and scan.is_options_call(following[0], following[1])):
+			violations.append(
+				violation(
+					rel,
+					root,
+					f'git command line without *{GIT_OPTIONS_FUNCTION}(...) right after "git" (ADR-022 QĐ 4)',
+				)
+			)
+		consumer = scan.consumer(rel, root)
+		env = None if consumer is None else _call_keywords(consumer).get("env")
+		if env is None or not scan.is_env_call(rel, env):
+			violations.append(
+				violation(
+					rel,
+					root,
+					f"git command line not run with env={GIT_ENV_FUNCTION}(...) of {SOURCE_TOOL_FILE} (ADR-022 QĐ 4)",
+				)
+			)
+		elif any(resolved_name(part, scan.aliases[rel]) == "os.environ" for part in ast.walk(env)):
+			violations.append(violation(rel, root, "git env= uses os.environ (ADR-022 Ràng buộc)"))
+	if PROCESS_RUNNER_FILE in scan.trees:
+		for function_name in (GIT_OPTIONS_FUNCTION, GIT_ENV_FUNCTION):
+			calls = [
+				node
+				for node in ast.walk(scan.trees[PROCESS_RUNNER_FILE])
+				if scan._is_source_call(PROCESS_RUNNER_FILE, node, function_name)
+			]
+			if not calls:
+				violations.append(
+					f"{PROCESS_RUNNER_FILE}: never calls source.{function_name}() (ADR-022 QĐ 4: reuse, no second git setup)"
+				)
+	return violations
+
+
+def _env_entries(scan: GitScan, rel: str):
+	"""`(node, key, value node)` for dict entries, keyword arguments and `x["KEY"] = value` assignments."""
+	for node in ast.walk(scan.trees[rel]):
+		if isinstance(node, ast.Dict):
+			for key, value in zip(node.keys, node.values, strict=True):
+				if key is not None and scan.text(rel, key) is not None:
+					yield key, scan.text(rel, key), value
+		elif isinstance(node, ast.keyword) and node.arg:
+			yield node, node.arg, node.value
+		elif isinstance(node, ast.Assign):
+			for target in node.targets:
+				if isinstance(target, ast.Subscript) and scan.text(rel, target.slice) is not None:
+					yield target, scan.text(rel, target.slice), node.value
+
+
+def check_bot_identity_constants(sources: dict) -> list:
+	"""ADR-022 QĐ 5: the bot identity is erp_ai.constants (name "ERP AI Agent", address ending .invalid), the four
+	GIT_AUTHOR_*/GIT_COMMITTER_* variables take it, and git code never uses user.name/user.email/AGENT_USER."""
+	scan = GitScan(sources)
+	constants = scan.assignments.get(CONSTANTS_FILE)
+	if constants is None:
+		return [f"{CONSTANTS_FILE}: file missing (ADR-022 QĐ 5)"]
+	violations = []
+	name = scan.text(CONSTANTS_FILE, constants[BOT_NAME_CONSTANT]) if BOT_NAME_CONSTANT in constants else None
+	if name != BOT_GIT_NAME_VALUE:
+		violations.append(
+			f"{CONSTANTS_FILE}: {BOT_NAME_CONSTANT} = {name!r}, not {BOT_GIT_NAME_VALUE!r} (ADR-022 QĐ 5)"
+		)
+	email = (
+		scan.text(CONSTANTS_FILE, constants[BOT_EMAIL_CONSTANT]) if BOT_EMAIL_CONSTANT in constants else None
+	)
+	local, at, domain = (email or "").partition("@")
+	if not (
+		local
+		and at
+		and "@" not in domain
+		and domain.endswith(BOT_EMAIL_SUFFIX)
+		and len(domain) > len(BOT_EMAIL_SUFFIX)
+	):
+		violations.append(
+			f"{CONSTANTS_FILE}: {BOT_EMAIL_CONSTANT} = {email!r} is not an address ending {BOT_EMAIL_SUFFIX} (ADR-022 QĐ 5)"
+		)
+	set_in_source = set()
+	for rel in scan.trees:
+		for node, key, value in _env_entries(scan, rel):
+			if key not in BOT_IDENTITY_ENV:
+				continue
+			expected = f"{CONSTANTS_MODULE}.{BOT_IDENTITY_ENV[key]}"
+			if resolved_name(value, scan.aliases[rel]) != expected:
+				violations.append(violation(rel, node, f"{key} is not set from {expected} (ADR-022 QĐ 5)"))
+			elif rel == SOURCE_TOOL_FILE:
+				set_in_source.add(key)
+	violations.extend(
+		f"{SOURCE_TOOL_FILE}: {key} is never set from the bot constant (ADR-022 QĐ 5)"
+		for key in BOT_IDENTITY_ENV
+		if key not in set_in_source
+	)
+	for rel in SUBPROCESS_FILES:
+		if rel not in scan.trees:
+			continue
+		for node, value in scan.code_texts(rel):
+			if value == AGENT_USER_NAME or any(fragment in value for fragment in USER_IDENTITY_FRAGMENTS):
+				violations.append(violation(rel, node, f"git code names {value!r} (ADR-022 QĐ 5)"))
+		for lineno, target in imported_modules(scan.trees[rel], module_name(rel), False):
+			if target.split(".")[-1] == AGENT_USER_NAME:
+				violations.append(f"{rel}:{lineno}: imports {target} (ADR-022 QĐ 5)")
+		for node, name in scan.outermost_names(rel, scan.trees[rel]):
+			if name.split(".")[-1] == AGENT_USER_NAME:
+				violations.append(violation(rel, node, f"git code uses {name} (ADR-022 QĐ 5)"))
+	return violations
+
+
+def _git_function_names(scan: GitScan) -> set:
+	names = set(GIT_FUNCTION_NAMES)
+	for module in GIT_MODULES:
+		rel = scan.files.get(module)
+		if rel is not None:
+			names |= {
+				node.name
+				for node in scan.trees[rel].body
+				if isinstance(node, ast.FunctionDef) and node.name.startswith(GIT_FUNCTION_PREFIX)
+			}
+	return names
+
+
+def _is_git_function(dotted: str) -> bool:
+	module, _dot, name = dotted.rpartition(".")
+	return module in GIT_MODULES and (name in GIT_FUNCTION_NAMES or name.startswith(GIT_FUNCTION_PREFIX))
+
+
+def _git_uses(scan: GitScan, rel: str, root, git_names: set):
+	"""`(node, what)` for subprocess and git-function uses inside `root` (a module or a function)."""
+	for lineno, target in imported_modules(root, module_name(rel), rel.endswith("__init__.py")):
+		if (
+			module_in(target, "subprocess")
+			or module_in(target, PROCESS_RUNNER_MODULE)
+			or _is_git_function(target)
+		):
+			yield lineno, f"imports {target}"
+	for node, name in scan.outermost_names(rel, root):
+		if module_in(name, "subprocess") or _is_git_function(name):
+			yield node, f"uses {name}"
+	docstrings = _docstring_ids(scan.trees[rel])
+	for node in ast.walk(root):
+		if (
+			isinstance(node, ast.Constant)
+			and id(node) not in docstrings
+			and (node.value in git_names or node.value in GIT_MODULES)
+		):
+			yield node, f"names {node.value!r}"
+	root_ids = {id(node) for node in ast.walk(root)}
+	for template_rel, template, _elements, _git in scan.templates:
+		if template_rel == rel and id(template) in root_ids:
+			yield template, 'builds a "git" command line'
+
+
+def check_no_git_in_web_and_runner(sources: dict) -> list:
+	"""ADR-022 QĐ 3, Ràng buộc: the proposal controller, every @frappe.whitelist function (and the module
+	functions it calls), handlers.py and agent/runner.py never import subprocess or touch a git function."""
+	scan = GitScan(sources)
+	git_names = _git_function_names(scan)
+	scopes = [(rel, scan.trees[rel], "") for rel in NO_GIT_FILES if rel in scan.trees]
+	for rel, function, _decorator in whitelisted_functions(sources):
+		functions = _module_functions(scan.trees[rel])
+		reached, pending = {function.name: function}, [function]
+		while pending:
+			for name in _called_names(pending.pop()):
+				if name in functions and name not in reached:
+					reached[name] = functions[name]
+					pending.append(functions[name])
+		scopes += [
+			(rel, node, f" (reached from @frappe.whitelist {function.name})") for node in reached.values()
+		]
+	violations = []
+	for rel, root, where in scopes:
+		for node, what in _git_uses(scan, rel, root, git_names):
+			text = f"{what}{where}: no git in web requests, handlers or the runner (ADR-022 QĐ 3)"
+			violations.append(
+				f"{rel}:{node}: {text}" if isinstance(node, int) else violation(rel, node, text)
+			)
+	return sorted(set(violations))
+
+
+def check_bench_allowlist_has_no_git_running_subcommands(sources: dict) -> list:
+	"""ADR-022 QĐ 2: change_guard's bench command table never holds a subcommand that runs git in an app repo."""
+	scan = GitScan(sources)
+	if CHANGE_GUARD_FILE not in scan.trees:
+		return [f"{CHANGE_GUARD_FILE}: file missing"]
+	violations = []
+	table = scan.assignments[CHANGE_GUARD_FILE].get(BENCH_COMMANDS_NAME)
+	commands = None if table is None else scan.strings(CHANGE_GUARD_FILE, table)
+	if commands is None:
+		violations.append(
+			f"{CHANGE_GUARD_FILE}: {BENCH_COMMANDS_NAME} is not a table of constant strings (ADR-022 QĐ 2)"
+		)
+	else:
+		violations.extend(
+			f"{CHANGE_GUARD_FILE}: {BENCH_COMMANDS_NAME} holds {command!r}, which runs git in an app repo (ADR-022 QĐ 2)"
+			for command in sorted(commands & set(GIT_RUNNING_BENCH_SUBCOMMANDS))
+		)
+	for node, value in scan.code_texts(CHANGE_GUARD_FILE):
+		if value in GIT_RUNNING_BENCH_SUBCOMMANDS:
+			violations.append(
+				violation(
+					CHANGE_GUARD_FILE,
+					node,
+					f"bench subcommand {value!r} runs git in an app repo (ADR-022 QĐ 2)",
+				)
+			)
+	return violations
+
+
+def check_apps_root_single_function(sources: dict) -> list:
+	"""ADR-022 QĐ 8: in agent/**, only source.get_source_root works out the apps/ root."""
+	scan = GitScan(sources)
+	violations = []
+	definitions = [
+		(rel, node)
+		for rel, tree in scan.trees.items()
+		if rel.startswith(AGENT_PREFIX)
+		for node in ast.walk(tree)
+		if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef) and node.name == APPS_ROOT_FUNCTION
+	]
+	if [rel for rel, _node in definitions] != [SOURCE_TOOL_FILE] or definitions[0][1] not in scan.trees[
+		SOURCE_TOOL_FILE
+	].body:
+		violations.append(
+			f"{APPS_ROOT_FUNCTION}() must be defined once, at module level of {SOURCE_TOOL_FILE}: "
+			f"{[violation(rel, node, 'def') for rel, node in definitions]} (ADR-022 QĐ 8)"
+		)
+	for rel, tree in scan.trees.items():
+		if not rel.startswith(AGENT_PREFIX):
+			continue
+
+		def in_root_function(node, rel=rel):
+			function = scan.function_of(rel, node)
+			return rel == SOURCE_TOOL_FILE and getattr(function, "name", None) == APPS_ROOT_FUNCTION
+
+		for node, value in scan.code_texts(rel):
+			if APPS_ROOT_SEGMENT.search(value) and not in_root_function(node):
+				violations.append(
+					violation(rel, node, f"path {value!r} outside {APPS_ROOT_FUNCTION}() (ADR-022 QĐ 8)")
+				)
+		for node in ast.walk(tree):
+			if isinstance(node, ast.Call) and not in_root_function(node):
+				name = resolved_name(node.func, scan.aliases[rel])
+				if name.split(".")[-1] in APP_PATH_CALLS:
+					violations.append(
+						violation(rel, node, f"{name} outside {APPS_ROOT_FUNCTION}() (ADR-022 QĐ 8)")
+					)
+	return violations
+
+
 class TestArchitecture(unittest.TestCase):
 	@classmethod
 	def setUpClass(cls):
@@ -3004,6 +4049,94 @@ class TestArchitecture(unittest.TestCase):
 		self.assertGreater(len(only_python(scoped(self.sources, CHANGES_PREFIX))), 3)
 		self.assertEqual(check_changes_never_set_user_or_publish(self.sources), [])
 
+	# ADR-022 git rules (FEAT-004 T44) ------------------------------------------------------------------
+
+	def _git_scan(self) -> GitScan:
+		for rel in (SOURCE_TOOL_FILE, PROCESS_RUNNER_FILE, CONSTANTS_FILE, CHANGE_GUARD_FILE, *NO_GIT_FILES):
+			self.assertIn(rel, self.sources)
+		return GitScan(self.sources)
+
+	def _found_subcommands(self, scan: GitScan, rel: str) -> set:
+		return {sub for argv in scan.argvs if argv.root_rel == rel for sub in argv.subcommands or ()}
+
+	def test_change_text_layer_rule_covers_every_other_module(self):
+		rule = next((rule for rule in LAYER_RULES if rule[0] == CHANGE_TEXT_MODULE), None)
+		self.assertIsNotNone(rule)
+		self.assertIn(module_name(CHANGE_TEXT_FILE), {module_name(rel) for rel in self.sources})
+		for rel in only_python(self.sources):
+			top = ".".join(module_name(rel).split(".")[:2])
+			if top not in (PACKAGE, CONSTANTS_MODULE):
+				self.assertTrue(any(module_in(top, forbidden) for forbidden in rule[1]), top)
+
+	def test_git_subcommands_only_allowed_sets_per_file(self):
+		scan = self._git_scan()
+		source_constants = scan.assignments[SOURCE_TOOL_FILE]
+		# The product's own sets equal ADR-022 QĐ 2, so the hand-written sets here are the same contract.
+		self.assertEqual(
+			scan.strings(SOURCE_TOOL_FILE, source_constants["GIT_READ_SUBCOMMANDS"]), GIT_READ_SET
+		)
+		self.assertEqual(
+			scan.strings(SOURCE_TOOL_FILE, source_constants["GIT_SUBCOMMANDS"]), GIT_LEGACY_SUBCOMMANDS
+		)
+		# Not a blind scan: the expanded call sites of both wrappers and the log/blame tool are seen.
+		self.assertEqual(self._found_subcommands(scan, PROCESS_RUNNER_FILE), set(GIT_WRITE_SET))
+		self.assertLessEqual(
+			{
+				"log",
+				"blame",
+				"rev-parse",
+				"rev-list",
+				"status",
+				"check-ignore",
+				"merge-base",
+				"diff-tree",
+				"cat-file",
+			},
+			self._found_subcommands(scan, SOURCE_TOOL_FILE),
+		)
+		self.assertEqual(check_git_subcommands_only_allowed_sets_per_file(self.sources), [])
+
+	def test_no_forbidden_git_operations_in_product(self):
+		scan = self._git_scan()
+		self.assertGreater(len([argv for argv in scan.argvs if argv.git is not None]), 10)
+		self.assertEqual(check_no_forbidden_git_operations_in_product(self.sources), [])
+
+	def test_git_commit_add_rm_argv_shape(self):
+		scan = self._git_scan()
+		writes = [argv for argv in scan.argvs if argv.subcommands and argv.subcommands & GIT_WRITE_SET]
+		self.assertEqual(sorted(sub for argv in writes for sub in argv.subcommands), ["add", "commit", "rm"])
+		self.assertTrue(all(argv.rel == PROCESS_RUNNER_FILE for argv in writes))
+		self.assertEqual(check_git_commit_add_rm_argv_shape(self.sources), [])
+
+	def test_git_env_single_definition(self):
+		scan = self._git_scan()
+		new_commands = [
+			(rel, root) for rel, root, _elements, _git in scan.templates if not scan.is_legacy(rel, root)
+		]
+		self.assertEqual(sorted(rel for rel, _root in new_commands), [PROCESS_RUNNER_FILE, SOURCE_TOOL_FILE])
+		self.assertEqual(check_git_env_single_definition(self.sources), [])
+
+	def test_bot_identity_constants(self):
+		self._git_scan()
+		self.assertEqual(check_bot_identity_constants(self.sources), [])
+
+	def test_no_git_in_web_and_runner(self):
+		self._git_scan()
+		self.assertIn(
+			PROPOSAL_CONTROLLER_FILE, {rel for rel, _node, _decorator in whitelisted_functions(self.sources)}
+		)
+		self.assertEqual(check_no_git_in_web_and_runner(self.sources), [])
+
+	def test_bench_allowlist_has_no_git_running_subcommands(self):
+		scan = self._git_scan()
+		commands = scan.strings(CHANGE_GUARD_FILE, scan.assignments[CHANGE_GUARD_FILE][BENCH_COMMANDS_NAME])
+		self.assertIn("migrate", commands)
+		self.assertEqual(check_bench_allowlist_has_no_git_running_subcommands(self.sources), [])
+
+	def test_apps_root_single_function(self):
+		self._git_scan()
+		self.assertEqual(check_apps_root_single_function(self.sources), [])
+
 	def test_agent_modules_import_alone_in_fresh_process(self):
 		# STD-DESIGN-6: an import cycle stays hidden in-process when another test imported a module first.
 		env = dict(os.environ, PYTHONPATH=os.pathsep.join([str(REPO_ROOT), os.environ.get("PYTHONPATH", "")]))
@@ -3025,6 +4158,176 @@ class TestArchitecture(unittest.TestCase):
 # ---------------------------------------------------------------------------------------------------
 
 ENQUEUE_GOOD_KEYWORDS = "queue='long', timeout=1, enqueue_after_commit=True, job_id='j', deduplicate=True"
+
+# ADR-022 (T44): a small product that keeps every git rule; each caught case changes one file of it.
+GIT_CLEAN = {
+	SOURCE_TOOL_FILE: '''"""Read tools; git_commit_only never uses --amend (a docstring is not code)."""
+import os
+import subprocess
+
+import frappe
+
+from erp_ai.constants import BOT_GIT_EMAIL, BOT_GIT_NAME
+
+GIT_SUBCOMMANDS = {"log", "blame"}
+GIT_READ_SUBCOMMANDS = frozenset({"rev-parse", "status", "cat-file"})
+
+
+def get_source_root():
+	return os.path.realpath(os.path.dirname(os.path.dirname(frappe.get_app_path("frappe"))))
+
+
+def git_source(args, ctx):
+	try:
+		sub = args.get("subcommand")
+		if not isinstance(sub, str) or sub not in GIT_SUBCOMMANDS:
+			return None
+		command = ["git", "--no-pager", "-C", ctx.repo, sub, *args.get("args")]
+		return subprocess.run(command, timeout=30, env={**os.environ, "GIT_PAGER": "cat"})
+	except OSError:
+		return None
+
+
+def git_global_options(*, read):
+	options = ["--no-pager", "-c", f"core.hooksPath={HOOKS}", "-c", "core.fsmonitor=false"]
+	return [*options, "--no-optional-locks"] if read else options
+
+
+def git_env(*, identity):
+	env = {"PATH": "/usr/bin", "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_NOSYSTEM": "1", "GIT_TERMINAL_PROMPT": "0"}
+	if identity:
+		env.update(
+			{
+				"GIT_AUTHOR_NAME": BOT_GIT_NAME,
+				"GIT_COMMITTER_NAME": BOT_GIT_NAME,
+				"GIT_AUTHOR_EMAIL": BOT_GIT_EMAIL,
+				"GIT_COMMITTER_EMAIL": BOT_GIT_EMAIL,
+			}
+		)
+	return env
+
+
+def run_git_read(repo_root, subcommand, *args, limit_s=30):
+	return subprocess.run(
+		[TIMEOUT_EXECUTABLE, "-s", "KILL", str(limit_s), "git", *git_global_options(read=True), subcommand, *args],
+		cwd=repo_root,
+		env=git_env(identity=False),
+		timeout=limit_s + 5,
+		start_new_session=True,
+	)
+
+
+def read_git_state(repo_root, rel, names):
+	run_git_read(repo_root, "rev-parse", "--verify", "-q", "HEAD")
+	run_git_read(repo_root, "rev-parse", *names)
+	return run_git_read(repo_root, "status", "--porcelain=v1", "--", f":(literal){rel}")
+
+
+def git_blob(repo_root, commit, rel):
+	return run_git_read(repo_root, "cat-file", "blob", f"{commit}:{rel}")
+''',
+	PROCESS_RUNNER_FILE: '''"""bench and git add/commit/rm; never `-a`/`--amend`, never `git push`."""
+import subprocess
+
+import frappe
+
+from erp_ai.agent.tools import source
+
+
+def _run_git_write(repo_root, rel, limit_s, subcommand_args):
+	return _run_wrapped(
+		["git", *source.git_global_options(read=False), *subcommand_args, "--", rel],
+		cwd=repo_root,
+		env=source.git_env(identity=True),
+		limit_s=limit_s,
+	)
+
+
+def git_add_new(repo_root, rel, limit_s):
+	return _run_git_write(repo_root, rel, limit_s, ["add"])
+
+
+def git_commit_only(repo_root, rel, subject, body, limit_s):
+	return _run_git_write(
+		repo_root, rel, limit_s, ["commit", "--only", "--no-gpg-sign", "--quiet", "-m", subject, "-m", body]
+	)
+
+
+def git_unstage_new(repo_root, rel, limit_s):
+	return _run_git_write(repo_root, rel, limit_s, ["rm", "--cached", "-q"])
+
+
+def run_bench(args, limit_s):
+	return _run_wrapped([BENCH, *args], cwd=frappe.utils.get_bench_path(), env=_minimal_env(), limit_s=limit_s)
+
+
+def _run_wrapped(command, *, cwd, env, limit_s):
+	return subprocess.run([TIMEOUT, str(limit_s), *command], cwd=cwd, env=env, timeout=limit_s + 5, start_new_session=True)
+''',
+	CONSTANTS_FILE: 'AGENT_USER = "ai.agent@example.com"\nBOT_GIT_NAME = "ERP AI Agent"\nBOT_GIT_EMAIL = "erp-ai-agent@bot.invalid"\n',
+	CHANGE_GUARD_FILE: """from erp_ai.agent.tools import source
+
+PATH_INVALID = "đường dẫn nằm ngoài apps/"
+SITE_COMMANDS = ("migrate", "clear-cache")
+BUILD_COMMAND = "build"
+BENCH_COMMANDS = (*SITE_COMMANDS, BUILD_COMMAND, "version")
+
+
+def check_write_path(rel):
+	return source.read_git_state(source.get_source_root(), rel, [])
+
+
+def _bench_shape(command, site):
+	return [BUILD_COMMAND, "--app", site] if command == BUILD_COMMAND else ["--site", site, command]
+""",
+	"agent/changes/apply_job.py": """import os
+
+from erp_ai.agent.changes import process_runner
+from erp_ai.agent.tools import source
+
+
+def run_change(name, repo, rel, subject, body):
+	if source.git_head(repo) is None:
+		return None
+	return process_runner.git_commit_only(repo, rel, subject, body, source.GIT_TIMEOUT_S)
+
+
+def _full(root, rel):
+	return os.path.join(source.get_source_root(), rel)
+""",
+	PROPOSAL_CONTROLLER_FILE: """import frappe
+
+from erp_ai.agent import change_text, queue
+
+
+@frappe.whitelist(methods=["POST"])
+def approve(name):
+	return queue.enqueue_change(name)
+
+
+def form_data(doc):
+	return change_text.render(doc.applied_branch)
+""",
+	HANDLERS_FILE: "import frappe\n\nfrom erp_ai.agent import policy\n\n\ndef on_update(doc, method=None):\n\treturn policy.agent_enabled()\n",
+	RUNNER_FILE: "import frappe\n\nfrom erp_ai.agent.tools import registry\n\n\ndef run_for_ticket(name):\n\treturn registry.dispatch(name)\n",
+	"ticket_panel.py": """import frappe
+
+from erp_ai.agent.tools import source
+
+
+@frappe.whitelist(methods=["GET"])
+def get_panel_data(name):
+	return _panel(name)
+
+
+def _panel(name):
+	return {"name": name}
+
+
+def _not_web(repo):
+	return source.git_head(repo)
+""",
+}
 
 
 class TestScannersCatchViolations(unittest.TestCase):
@@ -5003,6 +6306,388 @@ class TestScannersCatchViolations(unittest.TestCase):
 			):
 				with self.subTest(rel=rel, source=source):
 					self.assertCaught(check_subprocess_only_in_source_tool({rel: source}), rel, "outside")
+
+	# FEAT-004 T44: ADR-022 git rules ---------------------------------------------------------------
+
+	def git_product(self, rel: str, extra: str = "", replace: tuple = ()) -> dict:
+		"""GIT_CLEAN with `extra` appended to `rel` (a new file when absent) and `replace=(old, new)` applied."""
+		text = GIT_CLEAN.get(rel, "")
+		if replace:
+			self.assertIn(replace[0], text)
+			text = text.replace(*replace)
+		return {**GIT_CLEAN, rel: text + extra}
+
+	def test_git_rules_pass_on_the_clean_product(self):
+		for check in (
+			check_git_subcommands_only_allowed_sets_per_file,
+			check_no_forbidden_git_operations_in_product,
+			check_git_commit_add_rm_argv_shape,
+			check_git_env_single_definition,
+			check_bot_identity_constants,
+			check_no_git_in_web_and_runner,
+			check_bench_allowlist_has_no_git_running_subcommands,
+			check_apps_root_single_function,
+		):
+			with self.subTest(check=check.__name__):
+				self.assertEqual(check(GIT_CLEAN), [])
+		self.assertEqual(check_layer_imports(GIT_CLEAN), [])
+		scan = GitScan(GIT_CLEAN)
+		self.assertEqual(
+			{sub for argv in scan.argvs if argv.root_rel == SOURCE_TOOL_FILE for sub in argv.subcommands},
+			{"log", "blame", "rev-parse", "status", "cat-file"},
+		)
+
+	def test_change_text_layer_rule_catches_non_stdlib_imports(self):
+		for source in (
+			"import frappe\n",
+			"from frappe.utils import cstr\n",
+			"import helpdesk\n",
+			"from erp_ai.agent.tools import source\n",
+			"from erp_ai.agent import policy\n",
+			"from . import queue\n",
+			"from erp_ai import gateway\n",
+			"import erp_ai.erp_ai_agent\n",
+		):
+			with self.subTest(source=source):
+				self.assertCaught(
+					check_layer_imports({CHANGE_TEXT_FILE: source}), CHANGE_TEXT_FILE, "change_text"
+				)
+
+	def test_change_text_layer_rule_allows_stdlib_and_constants(self):
+		clean = "import re\nimport unicodedata\nfrom erp_ai.constants import BOT_GIT_NAME\nfrom erp_ai import constants\n"
+		self.assertEqual(check_layer_imports({CHANGE_TEXT_FILE: clean}), [])
+
+	def test_git_subcommands_rule_catches_each_way_of_reaching_git(self):
+		run_read = "\n\ndef extra(r):\n\treturn run_git_read(r, {sub})\n"
+		cases = {
+			# outside the read set, as a literal, a module constant and an f-string
+			"source push": self.git_product(SOURCE_TOOL_FILE, run_read.format(sub='"push"')),
+			"source add": self.git_product(SOURCE_TOOL_FILE, run_read.format(sub='"add"')),
+			"source constant": self.git_product(
+				SOURCE_TOOL_FILE, "\nPUSH = 'pu' + 'sh'" + run_read.format(sub="PUSH")
+			),
+			"source f-string": self.git_product(SOURCE_TOOL_FILE, run_read.format(sub="f\"{'fetch'}\"")),
+			# a log/blame gate whose set is wider than log/blame
+			"source gate": self.git_product(
+				SOURCE_TOOL_FILE,
+				replace=('GIT_SUBCOMMANDS = {"log", "blame"}', 'GIT_SUBCOMMANDS = {"log", "push"}'),
+			),
+			# a read subcommand, and log, in the write file (both outside {add, commit, rm})
+			"runner status": self.git_product(
+				PROCESS_RUNNER_FILE, "\nX = _run_git_write(r, rel, 1, ['status'])\n"
+			),
+			"runner literal log": self.git_product(
+				PROCESS_RUNNER_FILE,
+				"\nX = _run_wrapped(['git', *source.git_global_options(read=False), 'log'], cwd=r, env=e, limit_s=1)\n",
+			),
+			# the subcommand passed through a variable / a parameter of another function
+			"variable": self.git_product(
+				PROCESS_RUNNER_FILE, "\n\ndef f(r, sub):\n\treturn _run_git_write(r, 'x', 1, [sub])\n"
+			),
+			"forwarded": self.git_product(
+				SOURCE_TOOL_FILE, "\n\ndef f(r, sub):\n\treturn run_git_read(r, sub)\n"
+			),
+			"local": self.git_product(
+				SOURCE_TOOL_FILE, "\n\ndef f(r):\n\tsub = pick()\n\treturn run_git_read(r, sub)\n"
+			),
+			# aliased import of the wrapper, the wrapper used as a value
+			"alias": self.git_product(
+				"agent/changes/apply_job.py",
+				"\nfrom erp_ai.agent.tools.source import run_git_read as rg\nrg(r, 'fetch')\n",
+			),
+			"as value": self.git_product("agent/changes/apply_job.py", "\nreader = source.run_git_read\n"),
+			# git in another file: literal, path, constant list + concatenation, f-string, tuple
+			"other literal": self.git_product("agent/changes/apply_job.py", "\nC = ['git', 'status']\n"),
+			"other path": self.git_product("agent/tools/read.py", "C = ('/usr/bin/git', 'log')\n"),
+			"other concat": self.git_product(
+				"agent/changes/apply_job.py", "\nGIT = ['git']\nC = GIT + ['status']\n"
+			),
+			"other spread": self.git_product(
+				"agent/changes/apply_job.py", "\nC = [*source.GIT_PREFIX, 'rev-parse']\n"
+			)
+			| {SOURCE_TOOL_FILE: GIT_CLEAN[SOURCE_TOOL_FILE] + "\nGIT_PREFIX = ('git', '--no-pager')\n"},
+			"other f-string": self.git_product("handlers.py", "\nC = [f\"{'git'}\", 'log']\n"),
+			# no constant subcommand: built and then changed
+			"mutated": self.git_product(
+				PROCESS_RUNNER_FILE, "\n\ndef f(r):\n\tcmd = ['git']\n\tcmd += ['push']\n\treturn cmd\n"
+			),
+		}
+		for case, sources in cases.items():
+			with self.subTest(case=case):
+				self.assertCaught(check_git_subcommands_only_allowed_sets_per_file(sources), "git")
+
+	def test_git_subcommands_rule_names_the_file_and_the_reason(self):
+		found = check_git_subcommands_only_allowed_sets_per_file(
+			self.git_product(PROCESS_RUNNER_FILE, "\nX = _run_git_write(r, rel, 1, ['status'])\n")
+		)
+		self.assertCaught(found, PROCESS_RUNNER_FILE, "status", "ADR-022")
+		found = check_git_subcommands_only_allowed_sets_per_file(
+			self.git_product("agent/tools/read.py", "C = ['git', 'log']\n")
+		)
+		self.assertCaught(found, "agent/tools/read.py", "outside")
+
+	def test_forbidden_git_operations_caught(self):
+		for sub in GIT_FORBIDDEN_SUBCOMMANDS:
+			for case, sources in (
+				(
+					"read arg",
+					self.git_product(
+						SOURCE_TOOL_FILE, f"\n\ndef f(r):\n\treturn run_git_read(r, 'rev-parse', '{sub}')\n"
+					),
+				),
+				(
+					"write list",
+					self.git_product(PROCESS_RUNNER_FILE, f"\nX = _run_git_write(r, rel, 1, ['{sub}'])\n"),
+				),
+				(
+					"constant",
+					self.git_product(
+						PROCESS_RUNNER_FILE,
+						f"\nSUB = '{sub}'\nX = _run_git_write(r, rel, 1, ['commit', SUB])\n",
+					),
+				),
+				("shlex", self.git_product(PROCESS_RUNNER_FILE, f"\nX = shlex.split('git {sub} origin')\n")),
+			):
+				with self.subTest(sub=sub, case=case):
+					self.assertCaught(check_no_forbidden_git_operations_in_product(sources), repr(sub))
+		for fragment in GIT_FORBIDDEN_FRAGMENTS:
+			for rel in ("agent/changes/apply_job.py", "eval/run_eval.py", SOURCE_TOOL_FILE):
+				with self.subTest(fragment=fragment, rel=rel):
+					sources = self.git_product(rel, f"\nX = f'-c {{key}}{fragment}x'\n")
+					self.assertCaught(check_no_forbidden_git_operations_in_product(sources), rel, fragment)
+		for config_read in (
+			"open(os.path.join(repo, '.git', 'config'))",
+			"(Path(repo) / '.git' / 'config').read_text()",
+			"open(f'{repo}/.git/config')",
+			"open(repo + '/.git' + '/config')",
+		):
+			with self.subTest(config_read=config_read):
+				sources = self.git_product(CHANGE_GUARD_FILE, f"\nX = {config_read}\n")
+				self.assertCaught(
+					check_no_forbidden_git_operations_in_product(sources), CHANGE_GUARD_FILE, "config"
+				)
+
+	def test_forbidden_git_operations_clean_cases(self):
+		clean = self.git_product(
+			"agent/changes/apply_job.py",
+			"\nMESSAGE = 'remote không tên; nhánh theo dõi upstream'\nGIT_DIR = '.git'\nSETTINGS = os.path.join(root, 'config')\n",
+		)
+		self.assertEqual(check_no_forbidden_git_operations_in_product(clean), [])
+
+	def test_git_write_argv_shape_caught(self):
+		write = "\nX = _run_git_write(r, rel, 1, {args})\n"
+		cases = {
+			"commit without --only": write.format(args="['commit', '--no-gpg-sign', '-m', s]"),
+			"commit without --no-gpg-sign": write.format(args="['commit', '--only', '-m', s]"),
+			"rm without --cached": write.format(args="['rm', '-q']"),
+			"commit spread": write.format(args="['commit', '--only', '--no-gpg-sign', *extra]"),
+			"commit from a constant": "\nAMEND = ['commit', '--only', '--no-gpg-sign', '--amend']"
+			+ write.format(args="AMEND"),
+			"commit non-constant option": write.format(args="['commit', '--only', '--no-gpg-sign', flag]"),
+			"add without --": "\nX = _run_wrapped(['git', *source.git_global_options(read=False), 'add', rel], cwd=r, env=e)\n",
+			"add two paths": "\nX = _run_wrapped(['git', *source.git_global_options(read=False), 'add', '--', a, b], cwd=r, env=e)\n",
+			"add magic path": "\nX = _run_wrapped(['git', *source.git_global_options(read=False), 'add', '--', f':(literal){rel}'], cwd=r, env=e)\n",
+			"add magic constant": "\nX = _run_wrapped(['git', *source.git_global_options(read=False), 'add', '--', ':' + rel], cwd=r, env=e)\n",
+			"rm two separators": "\nX = _run_wrapped(['git', *source.git_global_options(read=False), 'rm', '--cached', '--', '--', rel], cwd=r, env=e)\n",
+		}
+		for flag in (*COMMIT_FORBIDDEN_FLAGS, "--amen", "-am", "--fixup=HEAD", "--squash=HEAD"):
+			cases[f"commit {flag}"] = write.format(
+				args=f"['commit', '--only', '--no-gpg-sign', '{flag}', '-m', s]"
+			)
+		for case, extra in cases.items():
+			with self.subTest(case=case):
+				found = check_git_commit_add_rm_argv_shape(self.git_product(PROCESS_RUNNER_FILE, extra))
+				self.assertCaught(found, PROCESS_RUNNER_FILE, "ADR-022")
+
+	def test_git_write_argv_shape_allows_a_message_that_looks_like_a_flag(self):
+		extra = "\nX = _run_git_write(r, rel, 1, ['commit', '--only', '--no-gpg-sign', '-m', '-a', '-m', '--amend'])\n"
+		self.assertEqual(check_git_commit_add_rm_argv_shape(self.git_product(PROCESS_RUNNER_FILE, extra)), [])
+
+	def test_git_env_single_definition_caught(self):
+		new_add = "\nX = _run_wrapped(['git', *source.git_global_options(read=False), 'add', '--', rel], cwd=r, env={env})\n"
+		cases = {
+			"marker in runner": self.git_product(
+				PROCESS_RUNNER_FILE, "\nENV = {'GIT_CONFIG_GLOBAL': '/dev/null'}\n"
+			),
+			"marker keyword": self.git_product(
+				"agent/changes/apply_job.py", "\nENV = dict(GIT_CONFIG_NOSYSTEM='1')\n"
+			),
+			"hooks f-string": self.git_product(
+				PROCESS_RUNNER_FILE, "\nOPTS = ['-c', f'core.hooksPath={d}']\n"
+			),
+			"marker elsewhere in source": self.git_product(
+				SOURCE_TOOL_FILE, "\n\ndef other_env():\n\treturn {'GIT_TERMINAL_PROMPT': '0'}\n"
+			),
+			"identity elsewhere": self.git_product(
+				PROCESS_RUNNER_FILE, "\nENV = {'GIT_AUTHOR_' + 'NAME': n}\n"
+			),
+			"second git_env": self.git_product(
+				PROCESS_RUNNER_FILE, "\n\ndef git_env(*, identity):\n\treturn {}\n"
+			),
+			"second options": self.git_product(
+				"agent/changes/apply_job.py", "\n\ndef git_global_options(*, read):\n\treturn []\n"
+			),
+			"os.environ env": self.git_product(PROCESS_RUNNER_FILE, new_add.format(env="{**os.environ}")),
+			"env mixed": self.git_product(
+				PROCESS_RUNNER_FILE, new_add.format(env="source.git_env(identity=True) | dict(os.environ)")
+			),
+			"own env": self.git_product(PROCESS_RUNNER_FILE, new_add.format(env="_minimal_env()")),
+			"no env": self.git_product(
+				PROCESS_RUNNER_FILE,
+				"\nX = _run_wrapped(['git', *source.git_global_options(read=False), 'add', '--', rel], cwd=r)\n",
+			),
+			"no options": self.git_product(
+				PROCESS_RUNNER_FILE,
+				"\nX = _run_wrapped(['git', 'add', '--', rel], cwd=r, env=source.git_env(identity=True))\n",
+			),
+			"read without options": self.git_product(
+				SOURCE_TOOL_FILE, replace=("*git_global_options(read=True), subcommand", "subcommand")
+			),
+			"runner own env": self.git_product(
+				PROCESS_RUNNER_FILE, replace=("env=source.git_env(identity=True)", "env={'PATH': '/usr/bin'}")
+			),
+		}
+		for case, sources in cases.items():
+			with self.subTest(case=case):
+				self.assertCaught(check_git_env_single_definition(sources), "ADR-022")
+
+	def test_git_env_single_definition_sees_aliases(self):
+		aliased = self.git_product(
+			PROCESS_RUNNER_FILE,
+			replace=(
+				"from erp_ai.agent.tools import source\n",
+				"from erp_ai.agent.tools import source\nfrom erp_ai.agent.tools.source import git_env as ge\n",
+			),
+		)
+		aliased[PROCESS_RUNNER_FILE] = aliased[PROCESS_RUNNER_FILE].replace("env=source.git_env(", "env=ge(")
+		self.assertEqual(check_git_env_single_definition(aliased), [])
+
+	def test_bot_identity_caught(self):
+		cases = {
+			"real address": self.git_product(
+				CONSTANTS_FILE, replace=('"erp-ai-agent@bot.invalid"', '"erp-ai-agent@miyano.com.vn"')
+			),
+			"no domain": self.git_product(
+				CONSTANTS_FILE, replace=('"erp-ai-agent@bot.invalid"', '"bot.invalid"')
+			),
+			"other name": self.git_product(CONSTANTS_FILE, replace=('"ERP AI Agent"', '"Bot"')),
+			"literal email": self.git_product(
+				SOURCE_TOOL_FILE,
+				replace=('"GIT_AUTHOR_EMAIL": BOT_GIT_EMAIL', '"GIT_AUTHOR_EMAIL": "a@b.invalid"'),
+			),
+			"agent user": self.git_product(
+				SOURCE_TOOL_FILE,
+				replace=(
+					'"GIT_COMMITTER_EMAIL": BOT_GIT_EMAIL',
+					'"GIT_COMMITTER_EMAIL": constants.AGENT_USER',
+				),
+			),
+			"missing variable": self.git_product(
+				SOURCE_TOOL_FILE, replace=('"GIT_COMMITTER_NAME": BOT_GIT_NAME,', "")
+			),
+			"user.email option": self.git_product(
+				PROCESS_RUNNER_FILE, "\nOPTS = ['-c', 'user.email=x@y.z']\n"
+			),
+			"user.name option": self.git_product(SOURCE_TOOL_FILE, "\nOPTS = ['-c', f'user.name={n}']\n"),
+			"agent user alias": self.git_product(
+				PROCESS_RUNNER_FILE, "\nfrom erp_ai.constants import AGENT_USER as who\nX = who\n"
+			),
+		}
+		for case, sources in cases.items():
+			with self.subTest(case=case):
+				self.assertCaught(check_bot_identity_constants(sources), "ADR-022")
+
+	def test_no_git_in_web_and_runner_caught(self):
+		cases = {
+			"controller subprocess": (PROPOSAL_CONTROLLER_FILE, "\nimport subprocess as sp\n"),
+			"controller alias": (
+				PROPOSAL_CONTROLLER_FILE,
+				"\nfrom erp_ai.agent.tools.source import read_git_state as rgs\nX = rgs(p, new_file=False)\n",
+			),
+			"controller module": (
+				PROPOSAL_CONTROLLER_FILE,
+				"\nfrom erp_ai.agent.tools import source\nX = source.git_head(r)\n",
+			),
+			"handlers runner module": (HANDLERS_FILE, "\nfrom erp_ai.agent.changes import process_runner\n"),
+			"runner getattr": (RUNNER_FILE, "\nX = getattr(source, 'read_git_state')\n"),
+			"runner git argv": (RUNNER_FILE, "\nX = ['git', 'status']\n"),
+			"whitelist through helper": (
+				"ticket_panel.py",
+				"",
+			),
+			"whitelist local import": (
+				"change_decision.py",
+				"import frappe\n\n\n@frappe.whitelist()\ndef decide(name):\n\timport subprocess\n\treturn subprocess.run(['ls'], timeout=1)\n",
+			),
+		}
+		for case, (rel, extra) in cases.items():
+			with self.subTest(case=case):
+				sources = self.git_product(rel, extra)
+				if case == "whitelist through helper":
+					sources = self.git_product(
+						rel, replace=('return {"name": name}', "return source.run_git_read(name, 'status')")
+					)
+				self.assertCaught(check_no_git_in_web_and_runner(sources), rel, "ADR-022")
+
+	def test_bench_allowlist_caught(self):
+		for command in GIT_RUNNING_BENCH_SUBCOMMANDS:
+			for case, replace in (
+				(
+					"site list",
+					(
+						'SITE_COMMANDS = ("migrate", "clear-cache")',
+						f'SITE_COMMANDS = ("migrate", "{command}")',
+					),
+				),
+				(
+					"table",
+					(
+						'BENCH_COMMANDS = (*SITE_COMMANDS, BUILD_COMMAND, "version")',
+						f'BENCH_COMMANDS = (*SITE_COMMANDS, "{command}")',
+					),
+				),
+				("shape", ('["--site", site, command]', f'["--site", site, "{command}"]')),
+			):
+				with self.subTest(command=command, case=case):
+					found = check_bench_allowlist_has_no_git_running_subcommands(
+						self.git_product(CHANGE_GUARD_FILE, replace=replace)
+					)
+					self.assertCaught(found, CHANGE_GUARD_FILE, command)
+		unreadable = self.git_product(
+			CHANGE_GUARD_FILE,
+			replace=(
+				'BENCH_COMMANDS = (*SITE_COMMANDS, BUILD_COMMAND, "version")',
+				"BENCH_COMMANDS = tuple(load())",
+			),
+		)
+		self.assertCaught(
+			check_bench_allowlist_has_no_git_running_subcommands(unreadable), BENCH_COMMANDS_NAME
+		)
+
+	def test_apps_root_caught(self):
+		cases = {
+			"join": (
+				"agent/changes/apply_job.py",
+				"\nROOT = os.path.join(frappe.utils.get_bench_path(), 'apps')\n",
+			),
+			"f-string": (
+				"agent/changes/apply_job.py",
+				"\n\ndef root(bench, app):\n\treturn f'{bench}/apps/{app}'\n",
+			),
+			"path": (CHANGE_GUARD_FILE, "\nROOT = Path(get_bench_path()) / 'apps'\n"),
+			"app path": (
+				CHANGE_GUARD_FILE,
+				"\nROOT = os.path.dirname(os.path.dirname(frappe.get_app_path('frappe')))\n",
+			),
+			"second root": (CHANGE_GUARD_FILE, "\n\ndef get_source_root():\n\treturn '/srv'\n"),
+		}
+		for case, (rel, extra) in cases.items():
+			with self.subTest(case=case):
+				self.assertCaught(
+					check_apps_root_single_function(self.git_product(rel, extra)), rel, "ADR-022"
+				)
+		no_root = self.git_product(SOURCE_TOOL_FILE, replace=("def get_source_root():", "def find_root():"))
+		self.assertCaught(check_apps_root_single_function(no_root), APPS_ROOT_FUNCTION)
 
 
 # A minimal site_api: derived always-denied set, a refusal gating on it, two handlers gated before writing.

@@ -302,3 +302,39 @@ Một task dev (T69), không phụ thuộc. Việc tài liệu của tech-lead c
 2. Test ghim mới đỏ vì hành vi thiếu (logger tạo lúc import), không vì lỗi import.
 3. Hai test cũ vá `source.logger` (`test_source.py:110`, `:1346`) chỉ đổi cách vá, giữ nguyên điều chúng khẳng định.
 4. Lỗi khi lấy logger không nuốt lỗi gốc ở các nhánh `except` của `source.py` (STD-ERR-1).
+
+## Chèn sau nghiệm thu lần 2 (F-R4-2), 2026-11-14 (`/team:plan --insert --decide`)
+
+Căn cứ: `acceptance-r4.md` @ `789d524` (R-4 open with 2 findings), lệnh của team-leader (journal 2026-11-14). F-4 đã đóng ở lần nghiệm thu 2 nên mã T70 (từng để dành cho F-4 ở mục trên) được dùng cho F-R4-2. Không đổi hành vi sản phẩm.
+
+### Bản đồ file → task
+| File | Trách nhiệm sau khi chèn | Task |
+|---|---|---|
+| `erp_ai/test_change_decision.py` | 6 ca liên kết sai so thông điệp với chuỗi viết tay có cụm `không hợp lệ` (AC-26), không so với `change_decision.BAD_LINK` | T70 |
+| `docs/team/features/FEAT-004/spec.md` | Amendment 3 (F-R4-1, chữ AC-25/26 và AC-33/34/35) | analyst viết; tech-lead commit khi có `## Amendment 3` |
+| `docs/team/features/FEAT-004/diff.patch` | làm mới sau merge T70 | tech-lead |
+
+Không sửa `erp_ai/change_decision.py`. Một file, một chủ: chỉ T70 chạm `test_change_decision.py`.
+
+### Ràng buộc chung của phần chèn
+- Câu trong mã lúc lập task: `change_decision.py:13` `BAD_LINK = "Đường dẫn duyệt không hợp lệ hoặc đã bị sửa."`; AC-26 đòi trang báo "không hợp lệ". Design và ADR-023 không ghi câu đầy đủ, chỉ ghi `PermissionError(BAD_LINK)` (`tasks.md` T54).
+- `assertRefused` giữ phép so `str(exc) == message` (so cả câu, không đổi sang `assertIn`).
+- Câu trong mã không có cụm của AC-26 là phát hiện để báo, không phải thứ để dev chỉnh cho khớp.
+- Mọi `bench --site miyano run-tests` bọc `flock -w 1800 /home/miyano/frappe-bench/apps/erp_ai/.team/miyano-site.lock sh -c '…'`, mỗi lúc một lệnh; `QueryDeadlockError` thì chạy lại theo tên một lần. Không chạy `cmd.test` cả app ở lượt này.
+
+### Thứ tự và song song
+Một task dev (T70), không phụ thuộc; 1 dev, 1 reviewer.
+
+### AC / phát hiện → task
+| Mã | Task |
+|---|---|
+| F-R4-2 (STD-TEST-2; AC-26) | T70 |
+| F-R4-1 (STD-TEST-5; chữ AC-25/26) | không task dev; Amendment 3 của spec (analyst) |
+
+### Checkpoint thêm
+12. Sau T70: `cmd.test_one` của `erp_ai/test_change_decision.py` chạy riêng dưới khóa `OK`.
+
+### Trọng tâm review của phần chèn
+1. Chuỗi kỳ vọng là chữ viết tay trong file test, không lấy từ `change_decision` qua bất kỳ đường nào (import, `getattr`, đọc file).
+2. Chuỗi có cụm `không hợp lệ` của AC-26 và đủ 6 ca cũ còn nguyên; không ca nào bị bỏ hay gộp.
+3. `git diff` không chạm `erp_ai/change_decision.py`; không phép so nào khác bị nới.

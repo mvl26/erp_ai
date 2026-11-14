@@ -38,6 +38,7 @@ ASSIGNEE_CATEGORIES = ("A", "B", "C", "F")
 SLA_KEYS = ("response_min", "resolution_min")
 DUE_SOON = timedelta(hours=24)
 DUE_FIELD_MISSING_NOTE = "chưa cấu hình trường Hạn hoàn thành, bỏ qua ngoại lệ theo hạn"
+D_WATCHER_MISSING_NOTE = "chưa cấu hình người theo dõi phiếu D"
 
 
 @dataclass(frozen=True)
@@ -48,6 +49,7 @@ class RouteDecision:
 	assignee: str | None
 	needs_task: bool
 	notes: tuple
+	watcher: str | None = None
 
 
 def decide_route(
@@ -65,10 +67,13 @@ def decide_route(
 	now: datetime | None = None,
 ) -> RouteDecision:
 	"""Priority per R1-R5 and the due-date exceptions (AC-25); team per mapping or department;
-	assignee by category/prefix; needs_task for C/D. d_watcher is accepted for AC-27 (not used yet).
+	assignee by category/prefix; needs_task for C/D; watcher for D (AC-27).
 
 	due_field_configured: None = the caller does not say (no note; due_at used when given),
 	False = no due field (B/D get a note and due_at is ignored), True = due_at used.
+
+	d_watcher: None = the caller does not say (no watcher, no note), blank = not configured
+	(D gets a note), a user = D watcher when an active HD Agent (else a note). Ignored outside D.
 	"""
 	entry = mapping.get(classification.category) or {}
 	notes = []
@@ -80,6 +85,7 @@ def decide_route(
 	if classification.category in ("B", "D") and due_field_configured is False:
 		notes.append({"field": "due_at", "reason": DUE_FIELD_MISSING_NOTE})
 		due_at = None
+	watcher = _watcher(classification.category, d_watcher, is_active_agent, notes)
 	return RouteDecision(
 		ticket_type=entry.get("ticket_type"),
 		agent_group=agent_group,
@@ -87,7 +93,20 @@ def decide_route(
 		assignee=assignee,
 		needs_task=classification.category in ("C", "D") and assignee is not None,
 		notes=tuple(notes),
+		watcher=watcher,
 	)
+
+
+def _watcher(category, d_watcher, is_active_agent, notes) -> str | None:
+	if category != "D" or d_watcher is None:
+		return None
+	if d_watcher.strip() == "":
+		notes.append({"field": "watcher", "reason": D_WATCHER_MISSING_NOTE})
+		return None
+	if not is_active_agent(d_watcher):
+		notes.append({"field": "watcher", "reason": f"{d_watcher} không phải HD Agent đang hoạt động"})
+		return None
+	return d_watcher
 
 
 # Same normalization as policy.py (kept local so routing does not import policy).

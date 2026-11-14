@@ -816,3 +816,91 @@ class TestPriorityExceptions(FrappeTestCase):
 					self.assertEqual(
 						_decide_due(category, None, True, importance, "[GẤP] x").priority, "Urgent"
 					)
+
+
+WATCHER = "it@x"
+WATCHER_MISSING_NOTE = {"field": "watcher", "reason": "chưa cấu hình người theo dõi phiếu D"}
+WATCHER_INACTIVE_NOTE = {"field": "watcher", "reason": "it@x không phải HD Agent đang hoạt động"}
+
+
+class _AgentCheck:
+	"""Fake is_active_agent: fixed answer, records every user it was asked about."""
+
+	def __init__(self, active):
+		self.active = active
+		self.calls = []
+
+	def __call__(self, user):
+		self.calls.append(user)
+		return self.active
+
+
+def _decide_watcher(category, is_active_agent, **watcher_kwargs):
+	return routing.decide_route(
+		Classification(category=category, confidence="Cao", importance=1),
+		"Thông thường",
+		DEFAULT_CATEGORY_MAPPING,
+		CONFIG,
+		team_exists=lambda team: True,
+		is_excluded_team=lambda team: False,
+		is_active_agent=is_active_agent,
+		now=NOW,
+		**watcher_kwargs,
+	)
+
+
+def _watcher_notes(decision):
+	return [note for note in decision.notes if note["field"] == "watcher"]
+
+
+class TestDWatcher(FrappeTestCase):
+	def setUp(self):
+		keep_agent_settings(self)
+
+	def test_constant(self):
+		self.assertEqual(routing.D_WATCHER_MISSING_NOTE, "chưa cấu hình người theo dõi phiếu D")
+
+	def test_d_configured(self):
+		check = _AgentCheck(active=True)
+		decision = _decide_watcher("D", check, d_watcher=WATCHER)
+		self.assertEqual(decision.watcher, WATCHER)
+		self.assertEqual(_watcher_notes(decision), [])
+		self.assertIn(WATCHER, check.calls)
+
+	def test_other_category_none(self):
+		for category in "ABCEF":
+			for d_watcher in (WATCHER, ""):
+				with self.subTest(category=category, d_watcher=d_watcher):
+					check = _AgentCheck(active=True)
+					decision = _decide_watcher(category, check, d_watcher=d_watcher)
+					self.assertIsNone(decision.watcher)
+					self.assertEqual(_watcher_notes(decision), [])
+					self.assertNotIn(WATCHER, check.calls)
+
+	def test_d_unconfigured_note(self):
+		for d_watcher in ("", "  "):
+			with self.subTest(d_watcher=d_watcher):
+				check = _AgentCheck(active=True)
+				decision = _decide_watcher("D", check, d_watcher=d_watcher)
+				self.assertIsNone(decision.watcher)
+				self.assertEqual(_watcher_notes(decision), [WATCHER_MISSING_NOTE])
+				self.assertNotIn(d_watcher, check.calls)
+
+	def test_inactive_watcher_none(self):
+		check = _AgentCheck(active=False)
+		decision = _decide_watcher("D", check, d_watcher=WATCHER)
+		self.assertIsNone(decision.watcher)
+		self.assertEqual(_watcher_notes(decision), [WATCHER_INACTIVE_NOTE])
+		self.assertIn(WATCHER, check.calls)
+
+	def test_old_call_shape_no_watcher_note(self):
+		self.assertEqual(sorted(DEFAULT_CATEGORY_MAPPING), list("ABCDEF"))
+		for category in "ABCDEF":
+			with self.subTest(category=category):
+				decision = _decide(category, 1)
+				self.assertIsNone(decision.watcher)
+				self.assertEqual(_watcher_notes(decision), [])
+		old_shape = _decide_watcher("D", _AgentCheck(active=True))
+		self.assertEqual(old_shape, _decide_watcher("D", _AgentCheck(active=True), d_watcher=None))
+		self.assertIsNone(old_shape.watcher)
+		self.assertEqual(_watcher_notes(old_shape), [])

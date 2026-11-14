@@ -10,8 +10,20 @@ Approved-by:
 Tech-lead chép từ tin trả về của reviewer (reviewer không ghi file).
 
 - Diff: `git diff 9add0dc..f8c6bbd` (nhánh `team/FEAT-005-task-5`, 1 commit, `erp_ai/agent/runner.py` + `erp_ai/agent/test_agent_runner.py` +242/−24; CHƯA merge)
-- Vòng: 1
-- Verdict: design-defect (vòng 1) — T5 dừng, chờ team-leader/designer
+- Diff vòng 2: `git diff f8c6bbd..a928625` (gộp `team/FEAT-005` @ `035689b` = `e7343be`, sửa `a928625`); phần riêng của task so với nhánh feature: `git diff 035689b..a928625 -- erp_ai/agent/runner.py erp_ai/agent/test_agent_runner.py`; merge vào `team/FEAT-005` = `3b306a2`
+- Vòng: 2
+- Verdict: approve (vòng 2); vòng 1 design-defect, gỡ bằng design-amd2 "Sửa vòng 3" (D-7, D-8)
+
+## Vòng 2 — approve (`f8c6bbd..a928625`, chấm lại có phạm vi + phạm vi mới của design-amd2 vòng 3)
+
+- Gộp `e7343be`: sạch. Xung đột `runner.py` gỡ bằng cách giữ `_bounded_actions(actions) if actions else None` trong `try` của lượt; so với `035689b` chỉ `runner.py` và `test_agent_runner.py` đổi; file test chỉ thêm dòng, test FEAT-004 còn nguyên (`test_six_large_deletes_keep_one_bounded_log_row` `:1611`, ba test dòng `propose` `:1296`, `:2721`, `:2782`).
+- major STD-ERR-7 `runner.py:697`: ADDRESSED. `_run_tool` không còn ghi dòng `propose` (`runner.py:733-735`); `_write_propose_rows` chạy sau `try` (`runner.py:677`, `:697-711`); ghim bởi `test_agent_runner.py:2422` và `assertNotIn("change", …)` trong `_assert_turn_and_proposals_undone` (`:2447`, `:2457`).
+- Mục "Không kiểm được từ diff" vòng 1 (callback commit sống qua hoàn tác): ADDRESSED. `_undo_turn` (`runner.py:684-694`) rollback savepoint, `reset` `before_commit`/`after_commit`, chạy `after_rollback`; ghim bởi `:2504`, `:2515` (đối chứng), `:2525`.
+- Lớp 1: NFR-3, ADR-024 QĐ 2, design vòng 3 §3.2, §4.1, D-7, D-8 đạt; đủ 7 test (v3), không test nào bị che; chữ ký `_run_tool` không đổi; 0 dấu skip; chỉ hai file touchpoint. Checklist (10): 10/10 đạt. Không blocker, không major.
+- minor | — | — | 2 điểm nhỏ: (1) chưa có gì ghim việc `_write_propose_rows` đọc `actions` trong bộ nhớ chứ không phải bản `_bounded_actions` (chỉ khác khi mục bị bỏ quá 60000 byte, STD-TEST-8); (2) `_write_entry` trong test `:2388` vẫn ném lỗi sau lần insert thật của dòng `reason` (minor vòng 1) | tùy dev
+- Bằng chứng của dev vòng 2: RED `--case TestRunnerTurnUndo` `Ran 11 tests` / `FAILED (failures=6)`, `[('reason', 2), ('reason', 3)] != [('reason', 2), ('change', None), ('change', None), ('reason', 3)]`, `['before_commit', 'after_commit'] != []`; GREEN cả module `Ran 105 tests in 53.731s` / `OK`; 5 đột biến đỏ.
+- Không kiểm được từ diff (vòng 2) và cách tech-lead xử lý: (a) lượt GREEN của dev chưa lặp lại → sau merge `3b306a2`, một lần giữ khóa (migrate exit 0, hai cài đặt để trống rồi trả lại, 0 lệnh site ngoài khóa trước và sau): test_agent_runner `Ran 105 tests in 52.962s` / `OK`, 0 deadlock (lượt ngay trước đó `FAILED (failures=1, errors=5)` không tính: migrate của tôi exit 1 vì phiên khác đang giữ `bench_migrate.lock` ngoài `flock`, 5 `QueryDeadlockError`); (b) `_undo_turn` `reset` cả hàng callback chỉ đúng vì `_call_model` commit ngay trước savepoint (`runner.py:129-135`), trong test không có commit nên đường này chỉ kiểm bằng đọc mã → chuyển qa (verify), không chặn tick.
+- deferred: 2 minor trên; cùng lỗ hổng callback ở `ROUTE_SAVEPOINT`/`ROUTE_UNIT_SAVEPOINT` (design D-8) → ghi nợ, team-leader; nhánh rollback savepoint ném và callback `after_rollback` ném thuộc T6; thông điệp commit gộp `e7343be` dạng `merge(runner):` (STD-NAME-5, không amend theo lệnh).
 
 ## Vòng 1 — design-defect (`9add0dc..f8c6bbd`)
 

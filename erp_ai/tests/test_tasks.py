@@ -42,6 +42,9 @@ UPPER = RUN_AT - timedelta(seconds=300)
 PERMISSION_SUBJECT = "Agent đã sửa bản ghi phân quyền"
 INSTRUCTOR = "erpai-tasks-boss@example.invalid"
 PROFILE_PREFIX = "ERPAI-TEST hồ sơ"
+BY = "(người ra lệnh erpai-tasks-boss@example.invalid, 2031-11-15 08:10)"
+NO_BEFORE_AFTER = ", không có trước/sau"
+FAKE_KEY = "sk-ERPAI-TEST-fake-0123456789abcdef"
 
 
 def _add_log(cost_usd, label, creation):
@@ -509,8 +512,10 @@ class TestCheckPrivilegeEscalation(FrappeTestCase):
 		self.assertEqual(
 			self._changes(),
 			[
-				"sửa Custom DocPerm inside (người ra lệnh erpai-tasks-boss@example.invalid, 2031-11-15 08:00)",
-				"sửa Custom DocPerm at-upper (người ra lệnh erpai-tasks-boss@example.invalid, 2031-11-15 08:55)",
+				"sửa Custom DocPerm inside (người ra lệnh erpai-tasks-boss@example.invalid, 2031-11-15 08:00)"
+				f"{NO_BEFORE_AFTER}",
+				"sửa Custom DocPerm at-upper (người ra lệnh erpai-tasks-boss@example.invalid, 2031-11-15 08:55)"
+				f"{NO_BEFORE_AFTER}",
 			],
 		)
 
@@ -555,7 +560,8 @@ class TestCheckPrivilegeEscalation(FrappeTestCase):
 					self._run()
 				changes.assert_called_once_with(None, UPPER)
 				self.assertIn(
-					"sửa Custom DocPerm a-year-ago (người ra lệnh erpai-tasks-boss@example.invalid, 2030-11-15 09:00)",
+					"sửa Custom DocPerm a-year-ago (người ra lệnh erpai-tasks-boss@example.invalid, 2030-11-15 09:00)"
+					f"{NO_BEFORE_AFTER}",
 					self._changes(lower=None),
 				)
 
@@ -884,12 +890,13 @@ class TestCheckPrivilegeEscalation(FrappeTestCase):
 		self.assertEqual(len(changes), 2 * len(roles) + 1)
 
 	def test_admin_items_first_each_group_by_time(self):
-		# Rows built by hand so one action can remove an admin role and add an ordinary one.
+		# Rows built by hand so one action can add an admin role and an ordinary one. The earlier admin entry
+		# ("thêm …") sorts after the later one ("gỡ …") by text, so only the time order passes.
 		ordinary_a, ordinary_b = self._test_role("A"), self._test_role("B")
 		for at, user, old, new in (
 			(datetime(2031, 11, 15, 8, 11, 0), "u1", [], [ordinary_a]),
-			(datetime(2031, 11, 15, 8, 12, 0), "u2", ["System Manager"], [ordinary_b]),
-			(datetime(2031, 11, 15, 8, 14, 0), "u3", [], [ROLE_AGENT]),
+			(datetime(2031, 11, 15, 8, 12, 0), "u2", [], ["System Manager", ordinary_b]),
+			(datetime(2031, 11, 15, 8, 14, 0), "u3", [ROLE_AGENT], []),
 		):
 			self._log_row(
 				[_hand_action("api_update_record", "User", user)],
@@ -907,9 +914,9 @@ class TestCheckPrivilegeEscalation(FrappeTestCase):
 		self.assertEqual(
 			self._changes(),
 			[
-				"[QUẢN TRỊ] gỡ role System Manager của u2 "
+				"[QUẢN TRỊ] thêm role System Manager cho u2 "
 				"(người ra lệnh erpai-tasks-boss@example.invalid, 2031-11-15 08:12)",
-				f"[QUẢN TRỊ] thêm role {ROLE_AGENT} cho u3 "
+				f"[QUẢN TRỊ] gỡ role {ROLE_AGENT} của u3 "
 				"(người ra lệnh erpai-tasks-boss@example.invalid, 2031-11-15 08:14)",
 				"thêm role ERPAI-TEST vai A cho u1 (người ra lệnh erpai-tasks-boss@example.invalid, 2031-11-15 08:11)",
 				"thêm role ERPAI-TEST vai B cho u2 (người ra lệnh erpai-tasks-boss@example.invalid, 2031-11-15 08:12)",
@@ -944,17 +951,187 @@ class TestCheckPrivilegeEscalation(FrappeTestCase):
 		self.assertEqual(
 			self._changes(),
 			[
-				"xóa User Permission up-1 (người ra lệnh erpai-tasks-boss@example.invalid, 2031-11-15 08:10)",
-				"submit/hủy Custom DocPerm perm-1 (người ra lệnh erpai-tasks-boss@example.invalid, 2031-11-15 08:10)",
-				"tạo Role ERPAI-TEST role (người ra lệnh erpai-tasks-boss@example.invalid, 2031-11-15 08:10)",
+				f"xóa User Permission up-1 {BY}{NO_BEFORE_AFTER}",
+				f"submit/hủy Custom DocPerm perm-1 {BY}{NO_BEFORE_AFTER}",
+				f"tạo Role ERPAI-TEST role {BY}{NO_BEFORE_AFTER}",
 				"sửa DocType Note (người ra lệnh erpai-tasks-boss@example.invalid, 2031-11-15 08:10)",
 			],
 		)
 
+	def test_record_action_without_snapshot_listed(self):
+		# An old row: no snapshot column at all (written before design-amd2 §2).
+		self._log_row(
+			[
+				_hand_action("api_update_record", "User", "old-user"),
+				_hand_action("api_delete_record", "User Permission", "up-old"),
+				_hand_action("api_update_record", "DocType", "Note"),
+				_hand_action("api_update_record", "Has Role", "has-role-row"),
+				_hand_action("api_update_record", "Note", "a-note"),
+			],
+			at=datetime(2031, 11, 15, 8, 10, 0),
+		)
+		# A newer row whose snapshots lack some keys, next to keys that are usable.
+		self._log_row(
+			[
+				_hand_action("api_update_record", "User", "after-missing"),
+				_hand_action("api_delete_record", "User", "deleted"),
+				_hand_action("api_update_record", "User", "unchanged"),
+				_hand_action("api_update_record", "Custom DocPerm", "before-missing"),
+				_hand_action("api_update_record", "User", "added"),
+			],
+			{
+				"api_update_record#1": {"name": "after-missing", "roles": [{"role": "A"}]},
+				"api_delete_record#2": {"name": "deleted", "roles": [{"role": "C"}]},
+				"api_update_record#3": {"name": "unchanged", "roles": [{"role": "A"}]},
+				"api_update_record#5": {"name": "added", "roles": []},
+			},
+			{
+				# The runner writes the key with None for a delete: that is a usable "after", not a missing one.
+				"api_delete_record#2": None,
+				"api_update_record#3": {"name": "unchanged", "roles": [{"role": "A"}]},
+				"api_update_record#4": {"name": "before-missing", "role": "Desk User"},
+				"api_update_record#5": {"name": "added", "roles": [{"role": "A"}]},
+			},
+			at=datetime(2031, 11, 15, 8, 20, 0),
+		)
+
+		by_later = "(người ra lệnh erpai-tasks-boss@example.invalid, 2031-11-15 08:20)"
+		self.assertEqual(
+			self._changes(),
+			[
+				f"sửa User old-user {BY}{NO_BEFORE_AFTER}",
+				f"xóa User Permission up-old {BY}{NO_BEFORE_AFTER}",
+				f"sửa DocType Note {BY}{NO_BEFORE_AFTER}",
+				f"sửa User after-missing {by_later}{NO_BEFORE_AFTER}",
+				f"gỡ role C của deleted {by_later}",
+				f"sửa Custom DocPerm before-missing {by_later}{NO_BEFORE_AFTER}",
+				f"thêm role A cho added {by_later}",
+			],
+		)
+
+	def test_unusable_snapshot_shapes_listed_without_before_after(self):
+		shapes = {
+			"broken JSON": ('{"api_update_record#1": {"name": "u", "roles": [', None),
+			"column not a dict": ('["api_update_record#1"]', None),
+			"snapshot not a dict": ({"api_update_record#1": "u"}, None),
+			"roles not a list": ({"api_update_record#1": {"name": "u", "roles": "System Manager"}}, None),
+			"roles an empty object": ({"api_update_record#1": {"name": "u", "roles": {}}}, None),
+			"role row not a dict": (
+				{"api_update_record#1": {"name": "u", "roles": ["System Manager"]}},
+				None,
+			),
+			"roles missing": ({"api_update_record#1": {"name": "u"}}, None),
+			"both sides None": ({"api_update_record#1": None}, {"api_update_record#1": None}),
+		}
+		usable_after = {"api_update_record#1": {"name": "u", "roles": [{"role": "A"}]}}
+		# One row per shape, each alone in its own one-minute window.
+		at = SEEDED_AT
+		for shape, (before, after) in shapes.items():
+			at += timedelta(minutes=1)
+			with self.subTest(shape=shape):
+				self._log_row(
+					[_hand_action("api_update_record", "User", "u")], before, after or usable_after, at=at
+				)
+
+				self.assertEqual(
+					self._changes(at - timedelta(seconds=1), at),
+					[
+						f"sửa User u (người ra lệnh erpai-tasks-boss@example.invalid, {at:%Y-%m-%d %H:%M}){NO_BEFORE_AFTER}"
+					],
+				)
+
+		for shape, actions in (
+			("broken JSON", '[{"tool": "api_update_record", "doctype": "User", "name": "cut'),
+			("not a list", '{"tool": "api_update_record", "doctype": "User", "name": "u", "ok": true}'),
+			("entry not a dict", '["api_update_record"]'),
+		):
+			at += timedelta(minutes=1)
+			with self.subTest(actions=shape):
+				name = self._log_row(actions, at=at)
+
+				self.assertEqual(
+					self._changes(at - timedelta(seconds=1), at), [f"ERP AI Log {name}{NO_BEFORE_AFTER}"]
+				)
+
+	def test_broken_snapshot_json_listed_without_before_after(self):
+		role = self._test_role("thường")
+		self._log_row(
+			[_hand_action("api_update_record", "User", "broken@example.invalid")],
+			'{"api_update_record#1": {"name": "broken@example.invalid", "roles": [{"role": "Sys',
+			{"api_update_record#1": {"name": "broken@example.invalid", "roles": []}},
+			at=datetime(2031, 11, 15, 8, 10, 0),
+		)
+		broken_actions = self._log_row(
+			'[{"tool": "api_update_record", "doctype": "User", "name": "cut@example.invalid", "ok": tr',
+			at=datetime(2031, 11, 15, 8, 20, 0),
+		)
+		# A neighbouring row with usable snapshots still gives its normal entry.
+		self._log_row(
+			[_hand_action("api_update_record", "User", "fine@example.invalid")],
+			{"api_update_record#1": {"name": "fine@example.invalid", "roles": []}},
+			{"api_update_record#1": {"name": "fine@example.invalid", "roles": [{"role": role}]}},
+			at=datetime(2031, 11, 15, 8, 30, 0),
+		)
+		self._add_role("System Manager")
+		script = self._add_server_script(AGENT_USER, disabled=0)
+		label = self._add_empty_key()
+
+		self._run()
+
+		self.assertEqual(
+			self._permission_alarm(),
+			"Agent đã sửa bản ghi phân quyền: "
+			f"sửa User broken@example.invalid {BY}{NO_BEFORE_AFTER}, "
+			f"ERP AI Log {broken_actions}{NO_BEFORE_AFTER}, "
+			f"thêm role {role} cho fine@example.invalid "
+			"(người ra lệnh erpai-tasks-boss@example.invalid, 2031-11-15 08:30)",
+		)
+		messages = self._alarm_messages()
+		self.assertEqual(len(messages), 4, messages)
+		self.assertTrue(
+			any(m.startswith("Tài khoản agent có role") and "System Manager" in m for m in messages)
+		)
+		self.assertTrue(any(m.startswith("Server Script/Webhook") and script in m for m in messages))
+		self.assertTrue(any(m.startswith("Khóa đang bật") and label in m for m in messages))
+		self.assertEqual(self._watermark(), UPPER)
+
+	def test_fake_key_never_in_privilege_alarm(self):
+		secret_user = {"name": "secret@example.invalid", "api_key": FAKE_KEY, "roles": []}
+		self._log_row(
+			[
+				_hand_action("api_update_record", "User", "secret@example.invalid"),
+				_hand_action("api_update_record", "User Permission", "up-secret"),
+				_hand_action("api_update_record", "DocType", "Note"),
+				_hand_action("api_update_record", "User", "broken@example.invalid"),
+			],
+			{
+				"api_update_record#1": secret_user,
+				"api_update_record#2": {"name": "up-secret", "for_value": FAKE_KEY},
+				"api_update_record#3": {"name": "Note", "permissions": [{"role": FAKE_KEY}]},
+				"api_update_record#4": {"name": "broken@example.invalid", "roles": FAKE_KEY},
+			},
+			{
+				"api_update_record#1": {**secret_user, "roles": [{"role": self._test_role("A")}]},
+				"api_update_record#2": {"name": "up-secret", "for_value": FAKE_KEY},
+				"api_update_record#3": {"name": "Note", "permissions": []},
+				"api_update_record#4": {"name": "broken@example.invalid", "roles": FAKE_KEY},
+			},
+		)
+
+		self._run()
+
+		message = self._permission_alarm()
+		self.assertIn("sửa User broken@example.invalid", message)
+		self.assertEqual(sum(m.count(FAKE_KEY) for m in self._alarm_messages()), 0)
+		self.assertEqual(sum(m.count("sk-") for m in self._alarm_messages()), 0)
+
 	def test_empty_instructor_is_named_unknown(self):
 		self._log_row([_hand_action("api_update_record", "Custom DocPerm", "x")], instructor=None)
 
-		self.assertEqual(self._changes(), ["sửa Custom DocPerm x (người ra lệnh không rõ, 2031-11-15 08:10)"])
+		self.assertEqual(
+			self._changes(),
+			["sửa Custom DocPerm x (người ra lệnh không rõ, 2031-11-15 08:10)" + NO_BEFORE_AFTER],
+		)
 
 	def test_only_reason_rows_are_read(self):
 		for entry_type in ("classify", "skip"):

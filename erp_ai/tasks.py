@@ -31,6 +31,8 @@ PRIVILEGE_ALERT_SETTLE_S = 300
 UNKNOWN_INSTRUCTOR = "không rõ"
 # Marks a role entry whose role the tools refuse without the unrestricted switch; such entries are listed first.
 ADMIN_ROLE_MARK = "[QUẢN TRỊ] "
+# Ends an entry whose snapshots cannot be used, so the change is listed without its before/after (ADR-024 QĐ 1).
+NO_BEFORE_AFTER = ", không có trước/sau"
 # Verb of each generic write tool, keyed by the action word of its name (`api_<word>_record`), so the tool names
 # come only from runner.GENERIC_WRITE_TOOLS; a new generic tool with another word fails at import, never mislabelled.
 CHANGE_VERBS = {"create": "tạo", "update": "sửa", "delete": "xóa", "submit": "submit/hủy"}
@@ -100,22 +102,65 @@ def _agent_role_drift() -> list[str]:
 
 def _load_snapshots(raw) -> dict:
 	"""The `"<tool>#<n>"` snapshots of a `reason` row's `value_before`/`value_after` column (design-amd2 §2)."""
-	return json.loads(raw) if raw else {}
+	try:
+		snapshots = json.loads(raw) if raw else {}
+	except (ValueError, TypeError):
+		# Fail-closed (ADR-024 QĐ 1): a broken column must not stop the job (it would roll back every day and
+		# silence all four conditions); its actions are listed "không có trước/sau" instead.
+		return {}
+	return snapshots if isinstance(snapshots, dict) else {}
 
 
-def _is_permission_change(doctype, key: str, before: dict, after: dict) -> bool:
+def _load_actions(raw) -> list[dict] | None:
+	"""The action entries of a `reason` row, or None when the column cannot be read (listed by row name)."""
+	try:
+		actions = json.loads(raw)
+	except (ValueError, TypeError):
+		# Fail-closed (ADR-024 QĐ 1): same reason as `_load_snapshots`.
+		return None
+	if isinstance(actions, list) and all(isinstance(action, dict) for action in actions):
+		return actions
+	return None
+
+
+def _is_privilege_target(doctype) -> bool:
+	return doctype in (USER_DOCTYPE, DOCTYPE_DOCTYPE) or (
+		doctype in PERMISSION_DOCTYPES and doctype != HAS_ROLE_DOCTYPE
+	)
+
+
+def _has_role_rows(snapshot: dict) -> bool:
+	roles = snapshot.get("roles")
+	return isinstance(roles, list) and all(isinstance(row, dict) for row in roles)
+
+
+def _usable_snapshots(doctype, key: str, before: dict, after: dict) -> tuple | None:
+	"""The (before, after) snapshots of one call, or None when they cannot be compared: a key is missing (an old
+	row), a side is neither a dict nor None (None = a create's before or a delete's after), both sides are None,
+	or a User side has no list of role rows."""
+	if key not in before or key not in after:
+		return None
+	pair = (before[key], after[key])
+	if pair == (None, None) or not all(side is None or isinstance(side, dict) for side in pair):
+		return None
+	if doctype == USER_DOCTYPE and not all(side is None or _has_role_rows(side) for side in pair):
+		return None
+	return pair
+
+
+def _is_permission_change(doctype, before: dict | None, after: dict | None) -> bool:
 	if doctype == DOCTYPE_DOCTYPE:
-		return (before.get(key) or {}).get("permissions") != (after.get(key) or {}).get("permissions")
-	return doctype in PERMISSION_DOCTYPES and doctype != HAS_ROLE_DOCTYPE
+		return (before or {}).get("permissions") != (after or {}).get("permissions")
+	return True
 
 
-def _role_counts(snapshot) -> Counter:
+def _role_counts(snapshot: dict | None) -> Counter:
 	return Counter(row.get("role") for row in (snapshot or {}).get("roles") or [])
 
 
-def _role_changes(user: str, key: str, before: dict, after: dict, by: str) -> list[str]:
+def _role_changes(user: str, before: dict | None, after: dict | None, by: str) -> list[str]:
 	"""One entry per role added to or removed from a User, by role name (D-4: kept roles get new rows on save)."""
-	old, new = _role_counts(before.get(key)), _role_counts(after.get(key))
+	old, new = _role_counts(before), _role_counts(after)
 	added = [f"{_admin_mark(role)}thêm role {role} cho {user} ({by})" for role in (new - old).elements()]
 	removed = [f"{_admin_mark(role)}gỡ role {role} của {user} ({by})" for role in (old - new).elements()]
 	return added + removed
@@ -132,11 +177,13 @@ def _privilege_changes_by_agent(lower: datetime | None, upper: datetime) -> list
 	A DocType write gives one entry when its `permissions` snapshot changed. `Has Role` rows are User changes: a
 	User write gives one entry per role added or removed (0..n). Entries marked `[QUẢN TRỊ]` come first, so the
 	5-entry limit of the mail never cuts them before an ordinary one; each group keeps `creation` order.
+	Fail-closed: a User or permission write whose snapshots cannot be used gives one entry ending
+	NO_BEFORE_AFTER, and a row whose `actions` cannot be read gives `ERP AI Log <row>` + NO_BEFORE_AFTER.
 	"""
 	log = frappe.qb.DocType(LOG_DOCTYPE)
 	query = (
 		frappe.qb.from_(log)
-		.select(log.creation, log.instructor, log.actions, log.value_before, log.value_after)
+		.select(log.name, log.creation, log.instructor, log.actions, log.value_before, log.value_after)
 		.where((log.entry_type == "reason") & (log.creation <= upper) & log.actions.like("%api_%"))
 		.orderby(log.creation)
 	)
@@ -144,16 +191,24 @@ def _privilege_changes_by_agent(lower: datetime | None, upper: datetime) -> list
 		query = query.where(log.creation > lower)
 	changes = []
 	for row in query.run(as_dict=True):
+		actions = _load_actions(row.actions)
+		if actions is None:
+			changes.append(f"{LOG_DOCTYPE} {row.name}{NO_BEFORE_AFTER}")
+			continue
 		before, after = _load_snapshots(row.value_before), _load_snapshots(row.value_after)
 		by = f"người ra lệnh {row.instructor or UNKNOWN_INSTRUCTOR}, {row.creation:%Y-%m-%d %H:%M}"
-		for position, action in enumerate(json.loads(row.actions), start=1):
+		for position, action in enumerate(actions, start=1):
 			tool, doctype = action.get("tool"), action.get("doctype")
-			if tool not in GENERIC_WRITE_TOOLS or not action.get("ok"):
+			if tool not in GENERIC_WRITE_TOOLS or not action.get("ok") or not _is_privilege_target(doctype):
 				continue
-			if doctype == USER_DOCTYPE:
-				changes.extend(_role_changes(action.get("name"), f"{tool}#{position}", before, after, by))
-			elif _is_permission_change(doctype, f"{tool}#{position}", before, after):
-				changes.append(f"{PRIVILEGE_CHANGE_VERBS[tool]} {doctype} {action.get('name')} ({by})")
+			record = f"{PRIVILEGE_CHANGE_VERBS[tool]} {doctype} {action.get('name')} ({by})"
+			snapshots = _usable_snapshots(doctype, f"{tool}#{position}", before, after)
+			if snapshots is None:
+				changes.append(f"{record}{NO_BEFORE_AFTER}")
+			elif doctype == USER_DOCTYPE:
+				changes.extend(_role_changes(action.get("name"), *snapshots, by))
+			elif _is_permission_change(doctype, *snapshots):
+				changes.append(record)
 	# Stable sort: each group keeps the `creation` order of the rows, then the order of actions and roles.
 	return sorted(changes, key=lambda change: not change.startswith(ADMIN_ROLE_MARK))
 

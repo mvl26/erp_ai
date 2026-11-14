@@ -17,9 +17,9 @@ MAX_POINTER_BYTES = 4096
 PATH_INVALID = "đường dẫn không hợp lệ hoặc nằm ngoài apps/"
 APP_NOT_ALLOWED = "app không có trong danh sách được sửa"
 APP_FORBIDDEN = "không được sửa app erp_ai hoặc kho git của nó"
-NAME_FORBIDDEN = "tên file thuộc loại bí mật hoặc được bảo vệ"
-EXT_FORBIDDEN = "đuôi file không được phép"
-GIT_DIR = "không được chạm thư mục .git"
+# CHG-002 design table 3.1: the name and ".git*" sentences are those of `source.text_refusal`.
+NAME_FORBIDDEN = source.TEXT_SECRET_NAME
+GIT_DIR = source.GIT_DIR
 PATH_GIT_PATTERN = 'tên file có ký tự * ? [ ] hoặc bắt đầu bằng ":" hay "-", git không commit an toàn được'
 CMD_SHELL = "đối số chứa ký tự điều khiển shell"
 CMD_FORCE = "cờ --force bị cấm"
@@ -160,7 +160,12 @@ def _is_git_pattern(rel_in_repo: str) -> bool:
 def check_write_path(
 	rel_path: str, allowed_apps: tuple[str, ...], *, new_file: bool, read_git: bool = True
 ) -> GuardResult:
-	"""Check a write target relative to `apps/`; refusals follow the order of design table 3.1.
+	"""Check a write target relative to `apps/`; refusals follow steps 1-5 of CHG-002 design 3.2.
+
+	1. invalid or outside `apps/` → `PATH_INVALID`; 2. app not listed → `APP_NOT_ALLOWED`; a listed app
+	with no folder → `PATH_INVALID`; 3. `erp_ai` by repo identity → `APP_FORBIDDEN`; 4. `license.txt`,
+	then `source.text_refusal` (secret name, then a ".git*" component) → `NAME_FORBIDDEN` / `GIT_DIR`;
+	5. git pattern → `PATH_GIT_PATTERN`. Any file extension passes.
 
 	`source.resolve_safe_path` is the only path resolver; when it refuses, the same real path is only
 	classified to pick the reason, and an unclassified refusal stays `PATH_INVALID`. With `read_git`
@@ -178,14 +183,15 @@ def check_write_path(
 	parts = rel.split(os.sep)
 	if parts[0] not in allowed_apps:
 		return _refused(APP_NOT_ALLOWED)
+	if not os.path.isdir(os.path.join(root, parts[0])):
+		return _refused(PATH_INVALID)
 	if _is_erp_ai(target, root, parts[0]):
 		return _refused(APP_FORBIDDEN)
-	if source.TEN_CAM.search(rel) or parts[-1].lower() == PROTECTED_FILE_NAME:
+	if parts[-1].lower() == PROTECTED_FILE_NAME:
 		return _refused(NAME_FORBIDDEN)
-	if os.path.splitext(target)[1].lower() not in source.DUOI_CHO_PHEP:
-		return _refused(EXT_FORBIDDEN)
-	if GIT_DIR_NAME in parts:
-		return _refused(GIT_DIR)
+	name_reason = source.text_refusal(rel)
+	if name_reason is not None:
+		return _refused(name_reason)
 	if _is_git_pattern(os.sep.join(parts[1:])):
 		return _refused(PATH_GIT_PATTERN)
 	if full is None:

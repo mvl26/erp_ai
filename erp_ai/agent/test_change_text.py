@@ -8,6 +8,8 @@ from erp_ai.agent.change_text import (
 	safe_person_name,
 	undo_message,
 )
+from erp_ai.agent.tools.change_guard import FileOp
+from erp_ai.constants import CHANGE_OP_CREATE, CHANGE_OP_DELETE, CHANGE_OP_EDIT, CHANGE_OP_RENAME
 
 
 class TestChangeText(FrappeTestCase):
@@ -309,3 +311,80 @@ class TestProposalNotes(FrappeTestCase):
 						self.assertNotIn("://", text)
 						self.assertNotIn("ghp_FAKE123", text)
 						self.assertNotIn("github.com", text)
+
+
+def file_op(kind, path, new_path=None):
+	return FileOp(kind, path, new_path, None, None, None, None)
+
+
+BLOCK_OPS = (
+	file_op(CHANGE_OP_EDIT, "helpdesk/helpdesk/hooks.py"),
+	file_op(CHANGE_OP_CREATE, "helpdesk/helpdesk/api/new.py"),
+	file_op(CHANGE_OP_DELETE, "helpdesk/helpdesk/old.py"),
+	file_op(CHANGE_OP_RENAME, "helpdesk/helpdesk/a.py", "helpdesk/helpdesk/b.py"),
+)
+
+
+class TestBlockMessage(FrappeTestCase):
+	def test_none_operations_is_byte_identical_to_old(self):
+		path = "erp_ai/agent/policy.py"
+		self.assertEqual(
+			apply_message("AICHG-00007", "HD-0042", path, "An", operations=None),
+			apply_message("AICHG-00007", "HD-0042", path, "An"),
+		)
+		self.assertEqual(
+			message_text(*apply_message("AICHG-00007", "HD-0042", path, "An", None)),
+			"erp_ai: áp dụng AICHG-00007 (erp_ai/agent/policy.py)\n"
+			"\n"
+			"Đề xuất: AICHG-00007\n"
+			"Phiếu: HD-0042\n"
+			"Người duyệt: An\n"
+			"Commit do ERP AI Agent tạo sau khi người duyệt bấm Duyệt.",
+		)
+		self.assertEqual(
+			message_text(*undo_message("AICHG-00007", "HD-0042", path, APPLY_SHA, "Bình", operations=None)),
+			"erp_ai: hoàn tác AICHG-00007 (erp_ai/agent/policy.py)\n"
+			"\n"
+			"Đề xuất: AICHG-00007\n"
+			"Phiếu: HD-0042\n"
+			f"Commit áp dụng: {APPLY_SHA}\n"
+			"Người hoàn tác: Bình\n"
+			"Commit do ERP AI Agent tạo sau khi người hoàn tác bấm Hoàn tác.",
+		)
+
+	def test_body_lists_each_item_after_ticket_line(self):
+		items = (
+			"sửa helpdesk/helpdesk/hooks.py\n"
+			"tạo helpdesk/helpdesk/api/new.py\n"
+			"xóa helpdesk/helpdesk/old.py\n"
+			"đổi tên helpdesk/helpdesk/a.py → helpdesk/helpdesk/b.py\n"
+		)
+		subject, body = apply_message("AICHG-00009", "HD-0050", "4 file", "An", operations=BLOCK_OPS)
+		self.assertEqual(subject, "erp_ai: áp dụng AICHG-00009 (4 file)")
+		self.assertEqual(
+			body,
+			"Đề xuất: AICHG-00009\n"
+			"Phiếu: HD-0050\n"
+			f"{items}"
+			"Người duyệt: An\n"
+			"Commit do ERP AI Agent tạo sau khi người duyệt bấm Duyệt.",
+		)
+		subject, body = undo_message(
+			"AICHG-00009", "HD-0050", "4 file", APPLY_SHA, "Bình", operations=BLOCK_OPS
+		)
+		self.assertEqual(subject, "erp_ai: hoàn tác AICHG-00009 (4 file)")
+		self.assertEqual(
+			body,
+			"Đề xuất: AICHG-00009\n"
+			"Phiếu: HD-0050\n"
+			f"{items}"
+			f"Commit áp dụng: {APPLY_SHA}\n"
+			"Người hoàn tác: Bình\n"
+			"Commit do ERP AI Agent tạo sau khi người hoàn tác bấm Hoàn tác.",
+		)
+
+	def test_label_path_or_n_files(self):
+		self.assertEqual(change_text.block_label(BLOCK_OPS[:1]), "helpdesk/helpdesk/hooks.py")
+		self.assertEqual(change_text.block_label([BLOCK_OPS[3]]), "helpdesk/helpdesk/a.py")
+		self.assertEqual(change_text.block_label(BLOCK_OPS[:2]), "2 file")
+		self.assertEqual(change_text.block_label(BLOCK_OPS), "4 file")

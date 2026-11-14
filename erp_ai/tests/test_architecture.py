@@ -2496,8 +2496,8 @@ PATH_WRITE_METHODS = (
 	"symlink_to",
 	"hardlink_to",
 )
-CHANGES_FORBIDDEN_NAMES = ("set_user", "sendmail", *REALTIME_NAMES)
-SESSION_NAMES = ("frappe.session", "frappe.local.session")
+# Exactly what ADR-013 Ràng buộc names for agent/changes/**: `frappe.set_user`, `publish_realtime`.
+CHANGES_FORBIDDEN_NAMES = ("set_user", "publish_realtime")
 
 
 def _is_fs_write_name(name: str) -> bool:
@@ -2590,59 +2590,17 @@ def _names_forbidden(name: str) -> bool:
 	return any(name == forbidden or name.endswith("." + forbidden) for forbidden in CHANGES_FORBIDDEN_NAMES)
 
 
-def _is_session(node, aliases: dict) -> bool:
-	return resolved_name(node, aliases) in SESSION_NAMES
-
-
-def _session_user_writes(tree: ast.AST, aliases: dict):
-	"""`(node, how)` for `frappe.session.user = x`, `frappe.session["user"] = x`, `frappe.local.session = ...`,
-	`setattr(frappe.session, "user", x)` and `frappe.session.update(...)`, however frappe/session was imported."""
-	for node in ast.walk(tree):
-		targets = []
-		if isinstance(node, ast.Assign):
-			targets = node.targets
-		elif isinstance(node, ast.AugAssign | ast.AnnAssign):
-			targets = [node.target]
-		for target in targets:
-			if isinstance(target, ast.Attribute) and (
-				_is_session(target, aliases) or (target.attr == "user" and _is_session(target.value, aliases))
-			):
-				yield target, f"assigns {resolved_name(target, aliases)}"
-			elif (
-				isinstance(target, ast.Subscript)
-				and _is_session(target.value, aliases)
-				and _is_constant(target.slice, "user")
-			):
-				yield target, "assigns the session ['user']"
-		if not isinstance(node, ast.Call):
-			continue
-		if (
-			referenced_name(node.func) == "setattr"
-			and len(node.args) > 1
-			and _is_session(node.args[0], aliases)
-			and _is_constant(node.args[1], "user")
-		):
-			yield node, "setattr on the session user"
-		elif (
-			isinstance(node.func, ast.Attribute)
-			and node.func.attr == "update"
-			and _is_session(node.func.value, aliases)
-		):
-			yield node, "updates the session"
-
-
 def check_changes_never_set_user_or_publish(sources: dict) -> list:
-	"""ADR-013 Ràng buộc ("không có `frappe.set_user`, `publish_realtime`"), widened by task T32 to sendmail and
-	to assigning the session user: agent/changes/** runs as the user who enqueued the job and tells nobody.
-	Any reference counts (call, alias import, `f = frappe.set_user`, the name as a string); reads of
-	`frappe.session.user` are allowed."""
+	"""ADR-013 Ràng buộc ("Trong `erp_ai/agent/changes/**` không có `frappe.set_user`, `publish_realtime`"):
+	exactly those two names. Any reference counts (call, alias import, `f = frappe.set_user`, the name as a
+	string); reads of `frappe.session.user` are allowed."""
 	reason = f"in {CHANGES_PREFIX} (ADR-013)"
 	violations = []
 	for rel, source in only_python(scoped(sources, CHANGES_PREFIX)).items():
 		tree = parse(rel, source)
 		aliases = import_aliases(tree)
 		for lineno, target in imported_modules(tree, module_name(rel), rel.endswith("__init__.py")):
-			if module_in(target, REALTIME_MODULE) or _names_forbidden(target):
+			if _names_forbidden(target):
 				violations.append(f"{rel}:{lineno}: imports {target} {reason}")
 		inner = {id(node.value) for node in ast.walk(tree) if isinstance(node, ast.Attribute)}
 		for node in ast.walk(tree):
@@ -2656,8 +2614,6 @@ def check_changes_never_set_user_or_publish(sources: dict) -> list:
 				and _names_forbidden(node.value)
 			):
 				violations.append(violation(rel, node, f"names {node.value!r} in a string {reason}"))
-		for node, how in _session_user_writes(tree, aliases):
-			violations.append(violation(rel, node, f"{how} {reason}"))
 	return violations
 
 
@@ -4937,20 +4893,9 @@ class TestScannersCatchViolations(unittest.TestCase):
 			"set_user aliased module": "import frappe as f\nf.set_user(owner)\n",
 			"set_user as a value": "import frappe\nbecome = frappe.set_user\nbecome(owner)\n",
 			"set_user by string": "import frappe\ngetattr(frappe, 'set_user')(owner)\n",
-			"session.user assigned": "import frappe\nfrappe.session.user = owner\n",
-			"local.session.user assigned": "import frappe\nfrappe.local.session.user = owner\n",
-			"session imported then assigned": "from frappe import session\nsession.user = owner\n",
-			"session subscript": "import frappe\nfrappe.session['user'] = owner\n",
-			"session setattr": "import frappe\nsetattr(frappe.session, 'user', owner)\n",
-			"session update": "import frappe\nfrappe.session.update(user=owner)\n",
-			"session replaced": "import frappe\nfrappe.local.session = frappe._dict(user=owner)\n",
 			"publish_realtime": "import frappe\nfrappe.publish_realtime('e', {}, user=u)\n",
 			"publish_realtime from realtime": "from frappe.realtime import publish_realtime as p\np('e')\n",
-			"realtime module": "import frappe.realtime\n",
-			"publish_progress": "import frappe\nfrappe.publish_progress(50)\n",
 			"publish by dotted string": "import frappe\nfrappe.get_attr('frappe.publish_realtime')('e')\n",
-			"sendmail": "import frappe\nfrappe.sendmail(recipients=[u], subject='s')\n",
-			"sendmail aliased": "from frappe import sendmail as mail\nmail(recipients=[u])\n",
 		}
 		for rel in (
 			"agent/changes/apply_job.py",

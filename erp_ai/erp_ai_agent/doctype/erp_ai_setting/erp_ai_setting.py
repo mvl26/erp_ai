@@ -12,6 +12,7 @@ from erp_ai.agent.tools import read, site_api, source
 from erp_ai.constants import (
 	ACTION_CREATE_CUSTOM_FIELD,
 	ACTION_UPDATE_FIELDS,
+	AGENT_USER,
 	ANSWER_DELAY_MAX_S,
 	CATALOG_ACTIONS,
 	CATEGORIES,
@@ -56,6 +57,11 @@ INT_LIMITS = {
 	"close_silent_f_days": ("Số ngày chờ trước khi đóng phiếu F", 1, 30),
 	"knowledge_search_limit": ("Số kết quả tìm tri thức tối đa", 1, 20),
 	"report_row_limit": ("Số dòng báo cáo tối đa", 1, 100),
+	"review_sample_size": ("Số phiếu rà soát mỗi tháng", 1, 50),
+	"due_reminder_hours": ("Số giờ báo trước hạn", 1, 168),
+	"ba_note_due_hours": ("Số giờ chờ BA note", 1, 168),
+	"task_due_days": ("Số ngày chờ Task", 1, 30),
+	"max_tasks_per_run": ("Số Task tối đa mỗi lần chạy", 1, 20),
 }
 THINKING_TEXT_MAX_CHARS = 5000
 PRICE_FIELDS = (
@@ -113,6 +119,7 @@ class ERPAISetting(Document):
 		self.check_user_templates()
 		self.check_allowed_reports()
 		self.check_manuals_dir()
+		self.check_operation_people()
 
 	def on_update(self):
 		self.notify_permission_switches()
@@ -262,6 +269,30 @@ class ERPAISetting(Document):
 		if not (path and os.path.isdir(path)):
 			typed = frappe.utils.escape_html(self.manuals_dir)
 			frappe.throw(f"Kho HDSD '{typed}' phải là thư mục có sẵn dưới apps/")
+
+	def check_operation_people(self):
+		"""AC-51, AC-59, AC-27, E-8: the report recipients, the monthly reviewers and the D watcher.
+
+		Blank lines are ignored. A recipient line must be exactly one email: `validate_email_address` would
+		accept a comma list or a "Name <email>" line by returning only the address part.
+		"""
+		for typed in _filled_lines(self.coo_report_recipients):
+			if "," in typed or frappe.utils.validate_email_address(typed, throw=False) != typed:
+				shown = frappe.utils.escape_html(typed)
+				frappe.throw(f"Người nhận báo cáo COO: '{shown}' không phải email hợp lệ")
+		for typed in _filled_lines(self.monthly_reviewers):
+			if not frappe.db.get_value("User", typed, "enabled"):
+				frappe.throw(
+					f"Người rà soát: không có tài khoản '{frappe.utils.escape_html(typed)}' đang bật"
+				)
+		watcher = self.d_ticket_watcher
+		if watcher and (watcher == AGENT_USER or not frappe.db.get_value("User", watcher, "enabled")):
+			frappe.throw("Người theo dõi phiếu D phải là tài khoản người đang bật")
+
+
+def _filled_lines(value) -> list:
+	"""The non-blank lines of a one-entry-per-line field, trimmed."""
+	return [line.strip() for line in (value or "").splitlines() if line.strip()]
 
 
 def allowed_report_error(name) -> str | None:

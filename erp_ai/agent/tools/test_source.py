@@ -2353,6 +2353,18 @@ class TestManualsExcluded(FrappeTestCase):
 		self.assertEqual(source.resolve_safe_path("myapp/docs/"), self.docs)
 		self.assertEqual(source.manuals_root(), self.docs)
 
+	def test_manuals_subdirectory_resolves_but_its_files_do_not(self):
+		# Only files are refused (design.md:492): a subdirectory of the manuals directory still resolves (E-7).
+		sub = os.path.join(self.docs, "vi")
+		self.sandbox.write("myapp/docs/vi/x.md", "# HDSD vi\n")
+		self.assertEqual(source.resolve_safe_path("myapp/docs/vi"), sub)
+		self.assertIsNone(source.resolve_safe_path("myapp/docs/vi/x.md"))
+		self.assertFalse(source.read_source({"path": "myapp/docs/vi/x.md"}, None)["ok"])
+		os.makedirs(os.path.join(self.root, "myapp", ".git"))
+		with patch(RUN_PATH, return_value=completed("ok")):
+			self.assertTrue(self.git("log", ["--", "docs/vi"])["ok"])
+			self.assertFalse(self.git("log", ["--", "docs/vi/x.md"])["ok"])
+
 	def test_search_source_skips_manuals(self):
 		result = source.search_source({"pattern": "needle"}, None)
 		self.assertTrue(result["ok"])

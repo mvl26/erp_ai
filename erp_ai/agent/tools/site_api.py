@@ -6,6 +6,7 @@ submit, cancel and call whitelisted methods. The app's own DocTypes and secret f
 """
 
 import json
+import re
 
 import frappe
 from frappe.utils import strip_html
@@ -47,6 +48,9 @@ SECRET_RESULT_KEYS = frozenset(
 	for key in SECRET_FIELDS
 	| {"password", "secret", "token", "access_token", "refresh_token", "client_secret", "encryption_key"}
 )
+SECRET_ARGUMENT_REASON = "tham số nhắc tới trường khóa API hoặc mật khẩu, không gọi qua công cụ"
+# Splits argument text into bare names, so `api_key as k` and `tabUser`.`api_key` both yield `api_key`.
+IDENTIFIER_PATTERN = re.compile(r"\w+")
 SCRUBBED_VALUE = "[đã ẩn]"
 SYSTEM_FIELDS = frozenset(
 	{"doctype", "docstatus", "owner", "creation", "modified", "modified_by", "idx", "parent", "parenttype"}
@@ -293,7 +297,10 @@ def _scrub(value):
 
 
 def _method_refusal(method: str, arguments: dict) -> dict | None:
-	"""Early refusal only: the app's DocTypes are closed for the agent account by their controllers."""
+	"""Early refusal only: the app's DocTypes are closed for the agent account by their controllers.
+
+	A secret field named in the arguments is refused here because a bare value (`get_value` with
+	`as_dict=0`) carries no key for `_scrub` to hide; this is best effort, not a guarantee."""
 	if method.startswith(OWN_APP_PREFIX):
 		return _fail("không gọi hàm của erp_ai qua công cụ")
 	if _is_secret_method(method):
@@ -301,6 +308,8 @@ def _method_refusal(method: str, arguments: dict) -> dict | None:
 	text = json.dumps(_parsed(arguments), ensure_ascii=False, default=str).casefold()
 	if any(doctype.casefold() in text for doctype in always_denied_doctypes()):
 		return _fail("tham số nhắc tới DocType không được phép dùng qua công cụ")
+	if not SECRET_RESULT_KEYS.isdisjoint(IDENTIFIER_PATTERN.findall(text)):
+		return _fail(SECRET_ARGUMENT_REASON)
 	return None
 
 
@@ -507,7 +516,8 @@ TOOLS: list[ToolSpec] = [
 			"description": (
 				"Gọi một hàm whitelist của Frappe hoặc app khác bằng đường dẫn Python đầy đủ "
 				"(ví dụ frappe.client.get_value), arguments là object tham số. Không gọi được hàm của erp_ai hay hàm trả khóa API, mật khẩu; "
-				"giá trị khóa và mật khẩu trong kết quả được ẩn."
+				"tham số nhắc tới trường khóa hoặc mật khẩu bị từ chối và giá trị dưới khóa bí mật trong kết quả được ẩn, "
+				"nhưng đây chỉ là chặn ở mức cố gắng, không bảo đảm mọi bí mật đều bị chặn."
 			),
 			"input_schema": {
 				"type": "object",

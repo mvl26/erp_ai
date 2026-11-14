@@ -75,3 +75,7 @@ minor | — | — | 1 điểm nhỏ: comment ở :1156 nói lý do là "session 
 ### Deferred
 - Không có ngoài mục "Không kiểm được từ diff" của vòng 1 (cỡ cột `ERP AI Log.actions`), vẫn chờ tech-lead.
 - Test không chạy lại (site dùng chung, đang có merge check). Gợi ý: `cd ../.. && bench --site miyano run-tests --module erp_ai.agent.test_agent_runner`.
+
+### Sau merge (tech-lead, 2026-11-14 chặng 10)
+- Merge `353018a` (sau T61 `c2762a1`, T62 `8a2a5ef`, sửa ghép `c9abee1`). test_agent_runner với cài đặt site đang lưu: `Ran 78 tests in 34.637s` / `FAILED (failures=3)`, ba ca `TestRunnerL1Classification` (nhiễu `auto_assign_enabled=1`, không ca nào của T64); với hai cài đặt tạm để trống: `Ran 78 tests in 22.463s` / `OK`.
+- Phán mục cỡ cột `ERP AI Log.actions` (suspected, chưa tái hiện): sửa đòi đổi kiểu cột hoặc chặn kích thước ở runner, ngoài touchpoint T64 và là quyết định thiết kế → không chặn tick; chuyển team-leader/designer như lo ngại mở, qa thử ở verify (AC-34).

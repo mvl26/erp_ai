@@ -46,6 +46,11 @@ FIVE_SWITCHES = (
 	"one_click_approval_enabled",
 )
 
+# FEAT-007 AC-16: patched clocks for the enable mark filled by install.
+EARLIER = "2025-12-31 08:00:00"
+ENABLED_AT = "2026-01-02 03:04:05"
+LATER = "2026-02-03 04:05:06"
+
 
 def _agent_roles():
 	return set(frappe.get_all("Has Role", filters={"parent": AGENT_USER, "parenttype": "User"}, pluck="role"))
@@ -683,6 +688,53 @@ class TestFeat007Migrate(FrappeTestCase):
 		self.assertLessEqual(set(FIVE_SWITCHES), set(first))
 		install.after_migrate()
 		self.assertEqual(_stored_settings(), first)
+
+	def _setup_at(self, now):
+		with patch("frappe.utils.now_datetime", return_value=frappe.utils.get_datetime(now)):
+			install.ensure_setup()
+
+	def _enabled_at(self):
+		stored = _stored_settings().get("agent_enabled_at", "<missing>")
+		return str(frappe.utils.get_datetime(stored)) if stored not in ("<missing>", None, "") else stored
+
+	def test_agent_enabled_at_filled_once_when_enabled(self):
+		"""AC-16, ADR-006: a site enabled before the upgrade gets its enable mark once, never moved."""
+		frappe.db.set_single_value(SETTING_DOCTYPE, "enabled", 1)
+		frappe.db.delete("Singles", {"doctype": SETTING_DOCTYPE, "field": "agent_enabled_at"})
+		self._setup_at(ENABLED_AT)
+		self.assertEqual(self._enabled_at(), ENABLED_AT)
+		self._setup_at(LATER)
+		self.assertEqual(self._enabled_at(), ENABLED_AT)
+
+	def test_agent_enabled_at_null_or_empty_counts_as_missing(self):
+		frappe.db.set_single_value(SETTING_DOCTYPE, "enabled", 1)
+		for stored in (None, ""):
+			with self.subTest(stored=stored):
+				frappe.db.delete("Singles", {"doctype": SETTING_DOCTYPE, "field": "agent_enabled_at"})
+				frappe.db.sql(
+					"insert into `tabSingles` (doctype, field, value) values (%s, 'agent_enabled_at', %s)",
+					(SETTING_DOCTYPE, stored),
+				)
+				self._setup_at(ENABLED_AT)
+				self.assertEqual(self._enabled_at(), ENABLED_AT)
+
+	def test_agent_enabled_at_already_set_is_kept(self):
+		frappe.db.set_single_value(SETTING_DOCTYPE, "enabled", 1)
+		frappe.db.set_single_value(SETTING_DOCTYPE, "agent_enabled_at", EARLIER)
+		self._setup_at(ENABLED_AT)
+		self.assertEqual(self._enabled_at(), EARLIER)
+
+	def test_agent_enabled_at_left_unset_when_disabled(self):
+		frappe.db.set_single_value(SETTING_DOCTYPE, "enabled", 0)
+		frappe.db.delete("Singles", {"doctype": SETTING_DOCTYPE, "field": "agent_enabled_at"})
+		self._setup_at(ENABLED_AT)
+		self.assertEqual(self._enabled_at(), "<missing>")
+		frappe.db.sql(
+			"insert into `tabSingles` (doctype, field, value) values (%s, 'agent_enabled_at', NULL)",
+			SETTING_DOCTYPE,
+		)
+		self._setup_at(ENABLED_AT)
+		self.assertIsNone(self._enabled_at())
 
 	def test_instructor_can_report_on_log(self):
 		"""AC-20, D-5: ERP AI Instructor reads ERP AI Log through reports, nothing else (append-only kept)."""

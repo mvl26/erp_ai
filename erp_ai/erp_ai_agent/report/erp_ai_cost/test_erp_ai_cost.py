@@ -7,7 +7,7 @@ from frappe.desk.query_report import run as run_report
 from frappe.tests.utils import FrappeTestCase
 
 from erp_ai.constants import LOG_DOCTYPE, ROLE_AGENT, ROLE_INSTRUCTOR, SETTING_DOCTYPE
-from erp_ai.erp_ai_agent.report.erp_ai_cost.erp_ai_cost import execute
+from erp_ai.erp_ai_agent.report.erp_ai_cost.erp_ai_cost import GROUP_BY_OPTIONS, execute
 from erp_ai.tasks import recompute_monthly_spend
 from erp_ai.test_utils import keep_agent_settings, make_log_entry, set_agent_settings
 
@@ -164,8 +164,10 @@ class TestCost(FrappeTestCase):
 			(_run(1, 0), datetime(2031, 3, 5, 0, 0, 0), Decimal("0.200009")),
 		)
 
-		summary = self._summary()
-		self.assertEqual(_six(summary["Tổng trong khoảng"]), Decimal("5.167445"))
+		# The summary values are strings with exactly 6 decimals, the same in both modes.
+		for group_by in (BY_TICKET, BY_RUN):
+			with self.subTest(group_by=group_by):
+				self.assertEqual(self._summary(self._filters(group_by))["Tổng trong khoảng"], "5.167445")
 		self.assertEqual(_six(sum(run["cost"] for run in expected_runs.values())), Decimal("5.167445"))
 
 	def test_month_total_matches_spent(self):
@@ -173,21 +175,22 @@ class TestCost(FrappeTestCase):
 		# Before the daily job the summary shows the stored spend as it is, not the log total.
 		set_agent_settings(spent_this_month_usd=1.234567)
 		stale = self._summary()
-		self.assertEqual(_six(stale["Đã chi tháng này (Setting)"]), Decimal("1.234567"))
-		self.assertEqual(_six(stale["Tổng tháng này (ERP AI Log)"]), Decimal("17.167450"))
+		self.assertEqual(stale["Đã chi tháng này (Setting)"], "1.234567")
+		self.assertEqual(stale["Tổng tháng này (ERP AI Log)"], "17.167450")
 
 		recompute_monthly_spend(now=NOW)
 		spent = frappe.db.get_single_value(SETTING_DOCTYPE, "spent_this_month_usd")
 
 		summary = self._summary()
 		# Range 5.167445 + decoys in March 5 + 7 + 0.000002 + 0.000003; February and April rows excluded.
-		self.assertEqual(_six(summary["Tổng tháng này (ERP AI Log)"]), Decimal("17.167450"))
+		self.assertEqual(summary["Tổng tháng này (ERP AI Log)"], "17.167450")
+		self.assertEqual(summary["Đã chi tháng này (Setting)"], "17.167450")
 		self.assertEqual(_six(summary["Đã chi tháng này (Setting)"]), _six(spent))
 		self.assertEqual(_six(summary["Tổng tháng này (ERP AI Log)"]), _six(spent))
 		# The month of `now`, not of the range: a range in another month keeps the same month total.
 		other_month = self._summary(self._filters(from_date=date(2031, 4, 1), to_date=date(2031, 4, 1)))
-		self.assertEqual(_six(other_month["Tổng tháng này (ERP AI Log)"]), Decimal("17.167450"))
-		self.assertEqual(_six(other_month["Tổng trong khoảng"]), Decimal("13.000000"))
+		self.assertEqual(other_month["Tổng tháng này (ERP AI Log)"], "17.167450")
+		self.assertEqual(other_month["Tổng trong khoảng"], "13.000000")
 
 	def test_single_day_range_and_empty_range(self):
 		self._make_sample()
@@ -224,6 +227,16 @@ class TestCost(FrappeTestCase):
 			("Script Report", LOG_DOCTYPE, "Yes", "ERP AI agent"),
 		)
 		self.assertEqual(sorted(row.role for row in report.roles), ["ERP AI Instructor", "System Manager"])
+		# The JSON filters are the only filter source on the desk (there is no .js).
+		self.assertEqual(
+			[(f.fieldname, f.fieldtype, f.mandatory, f.options, f.default) for f in report.filters],
+			[
+				("from_date", "Date", 1, None, None),
+				("to_date", "Date", 1, None, None),
+				("group_by", "Select", 1, "Phiếu\nLần chạy", "Phiếu"),
+			],
+		)
+		self.assertEqual(report.filters[2].options.split("\n"), list(GROUP_BY_OPTIONS))
 		filters = self._filters()
 
 		frappe.set_user(_make_user(INSTRUCTOR_USER, ROLE_INSTRUCTOR))

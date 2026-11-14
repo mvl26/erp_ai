@@ -634,10 +634,19 @@ def check_tools_never_bypass_permissions(sources: dict) -> list:
 
 	Exception (design 3.5, `denied_doctypes`): `get_all("DocType", ...)` lists the app's own DocType names,
 	which is metadata, not user data.
+	ADR-005 + ADR-034: the query builder checks no permission either, so every `frappe.qb` reference and
+	every `frappe.query_builder` import in a tool is a violation (design-w0-fixes-5 point 1).
 	"""
 	violations = []
 	for rel, source in only_python(scoped(sources, TOOLS_PREFIX)).items():
-		for node in ast.walk(parse(rel, source)):
+		tree = parse(rel, source)
+		aliases = import_aliases(tree)
+		for lineno, target in imported_modules(tree, module_name(rel), False):
+			if module_in(target, "frappe.query_builder") or target == "frappe.qb":
+				violations.append(f"{rel}:{lineno}: imports {target} in a tool (ADR-034)")
+		for node in ast.walk(tree):
+			if isinstance(node, ast.Attribute) and resolved_name(node, aliases) == "frappe.qb":
+				violations.append(violation(rel, node, "frappe.qb in a tool (ADR-034)"))
 			if referenced_name(node) == "ignore_permissions" or (
 				isinstance(node, ast.Constant) and node.value == "ignore_permissions"
 			):
@@ -2452,6 +2461,36 @@ class TestScannersCatchViolations(unittest.TestCase):
 	def test_tools_bypass_ignores_code_outside_tools(self):
 		source = "import frappe\nfrappe.db.set_value('X', 'y', 'z', 1)\nfrappe.get_all('X')\n"
 		self.assertEqual(check_tools_never_bypass_permissions({"agent/runner.py": source}), [])
+
+	QUERY_BUILDER_SOURCES = (
+		# (source, line of the reported violation); the first three are design-w0-fixes-5 point 1 (a)-(c).
+		('import frappe\nt = frappe.qb.DocType("Error Log")\n', 2),
+		('import frappe\nfrappe.qb.from_("HD Ticket").select("*").run()\n', 2),
+		("from frappe.query_builder import DocType\n", 1),
+		("import frappe\nfrappe.qb.get_query('HD Ticket')\n", 2),
+		("import frappe\nbuilder = frappe.qb\n", 2),
+		("import frappe as f\nf.qb.DocType('HD Ticket')\n", 2),
+		("from frappe import qb\n", 1),
+		("import frappe.query_builder\n", 1),
+		("import frappe.query_builder as builder\n", 1),
+		("from frappe.query_builder.functions import Count\n", 1),
+	)
+
+	def test_tools_never_bypass_permissions_flags_query_builder(self):
+		for source, line in self.QUERY_BUILDER_SOURCES:
+			with self.subTest(source=source):
+				self.assertCaught(
+					check_tools_never_bypass_permissions({"agent/tools/x.py": source}),
+					f"agent/tools/x.py:{line}: ",
+					"ADR-034",
+				)
+
+	def test_query_builder_outside_tools_allowed(self):
+		outside = ("agent/system_read.py", "agent/tools_x.py", "agent/toolset/x.py", "eval/agent/tools/x.py")
+		for rel in outside:
+			for source, _line in self.QUERY_BUILDER_SOURCES:
+				with self.subTest(rel=rel, source=source):
+					self.assertEqual(check_tools_never_bypass_permissions({rel: source}), [])
 
 	# subprocess --------------------------------------------------------------------------------
 

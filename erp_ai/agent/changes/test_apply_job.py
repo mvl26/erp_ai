@@ -49,6 +49,7 @@ GIT_ERROR_TEXT = "không đọc được trạng thái git"
 GIT_COMMIT_FAILED_TEXT = "commit git lỗi, đã trả file về như trước"
 GIT_RESTORE_FAILED_TEXT = "commit git lỗi và không trả lại được trạng thái kho, cần người kiểm"
 GIT_COMMIT_MISMATCH_TEXT = "commit không đúng nội dung đã duyệt, cần người kiểm"
+GIT_NOT_ANCESTOR_TEXT = "commit áp dụng không còn nằm trong lịch sử nhánh đang checkout"
 
 
 def _sha(text: str) -> str:
@@ -934,7 +935,7 @@ class TestCommitFailure(ApplyJobTestCase):
 	def human_commit(self):
 		return self.sandbox.commit_file(APP, "pkg/human.py", "h = 1\n", message="việc tay của người")
 
-	def assert_no_human_email_stored(self, name):
+	def assert_no_human_email_stored(self, name, row_count=2):
 		rows = frappe.get_all(
 			LOG_DOCTYPE,
 			filters={"change_proposal": name},
@@ -942,7 +943,7 @@ class TestCommitFailure(ApplyJobTestCase):
 		)
 		proposal = frappe.get_doc(PROPOSAL_DOCTYPE, name).as_dict()
 		# The stores are not empty: the check below reads real rows and a real proposal.
-		self.assertEqual(len(rows), 2)
+		self.assertEqual(len(rows), row_count)
 		self.assertTrue(proposal.failure_reason)
 		self.assertTrue(any(row.error for row in rows))
 		for store in (rows, proposal):
@@ -975,6 +976,36 @@ class TestCommitFailure(ApplyJobTestCase):
 				self.assertEqual(self.steps(name), ["approve", "fail"])
 				# NFR-8: the person's author e-mail never reaches the log rows or the proposal.
 				self.assert_no_human_email_stored(name)
+		# Undo side (design 4.4 step 6, same rule as 4.3 step 3.4): the applied bytes come back.
+		for kind in ("changed file", "new file"):
+			with self.subTest("undo", kind=kind):
+				self.fresh_repo()
+				name = self.proposal_for(kind)
+				apply_job.run_change(name, "apply")
+				self.assertEqual(self.stored(name).change_status, CHANGE_STATUS_APPLIED)
+				transitions.request_undo(name, ACTOR)
+				human = []
+
+				def human_commits_then_failure(*args):
+					human.append(self.human_commit())
+					return self.failed()
+
+				with patch.object(process_runner, "git_commit_only", side_effect=human_commits_then_failure):
+					apply_job.run_change(name, "undo")
+
+				state = self.state(name)
+				self.assertEqual(
+					(state.change_status, state.failure_reason),
+					(CHANGE_STATUS_FAILED, f"{GIT_COMMIT_FAILED_TEXT}: fatal: lỗi giả"),
+				)
+				self.assertEqual(self.read(self.target(kind)), AFTER)
+				self.assertEqual(self.head(), human[0])
+				self.assertEqual(self.author_email(), GIT_SANDBOX_EMAIL)
+				self.assertEqual(self.worktree_changes(), "")
+				self.assertFalse(state.undo_commit_sha)
+				self.assertFalse(self.stored(name).command_output)
+				self.assertEqual(self.steps(name), ["approve", "apply", "fail"])
+				self.assert_no_human_email_stored(name, row_count=3)
 
 	def test_commit_failed_on_top_of_an_earlier_bot_commit_restores(self):
 		# D-17: HEAD unchanged gives the file back even when HEAD is the bot's own commit of an earlier apply.
@@ -1802,6 +1833,415 @@ class TestUndoCode(ApplyJobTestCase):
 
 		self.assertEqual(commit.call_args.args[4], 5)
 		self.assertEqual(self.state(name).change_status, CHANGE_STATUS_UNDONE)
+
+	# Design 4.4 steps 4 and 6 (AC-19 for undo, AC-20 refusals, D-2, D-17, design-addendum-3 QĐ-B2, QĐ-B5).
+
+	def fresh_undo(self, kind="changed file"):
+		"""A new sandbox, a proposal of `kind` applied, its undo asked; returns (name, apply commit)."""
+		self.sandbox = GitSandbox(self)
+		self.sandbox.commit_file(APP, REL, BEFORE)
+		return self.undo_requested(kind)
+
+	def failed(self, *, timed_out=False, output="fatal: lỗi giả"):
+		return CommandResult(
+			exit_code=None if timed_out else 1,
+			output=output,
+			duration_ms=3,
+			timed_out=timed_out,
+			not_found=False,
+		)
+
+	def stored(self, name):
+		return frappe.db.get_value(
+			PROPOSAL_DOCTYPE,
+			name,
+			["change_status", "failure_reason", "undo_commit_sha", "command_output"],
+			as_dict=True,
+		)
+
+	def file_calls(self):
+		"""Spies on every file write and removal and on the undo commit."""
+		return (
+			patch.object(file_writer, "write_atomic", wraps=file_writer.write_atomic),
+			patch.object(file_writer, "remove_created", wraps=file_writer.remove_created),
+			patch.object(process_runner, "git_commit_only", wraps=process_runner.git_commit_only),
+		)
+
+	def assert_refused_before_writing(self, name, kind, reason, count, calls):
+		state = self.stored(name)
+		self.assertEqual((state.change_status, state.failure_reason), (CHANGE_STATUS_FAILED, reason))
+		self.assertEqual(self.read(self.target(kind)), AFTER)
+		self.assertEqual(self.commit_count(), count)
+		for call in calls:
+			call.assert_not_called()
+		self.assertFalse(state.undo_commit_sha)
+		self.assertEqual(self.steps(name), ["approve", "apply", "fail"])
+
+	def test_undo_refused_when_apply_commit_not_ancestor(self):
+		for kind in self.KINDS:
+			with self.subTest(kind):
+				self.sandbox = GitSandbox(self)
+				base = self.sandbox.commit_file(APP, REL, BEFORE)
+				name, _ = self.undo_requested(kind)
+				# Another branch without the apply commit, whose target has the same bytes (step 3 passes).
+				self.sandbox.switch_branch(APP, "other")
+				self.sandbox.git(APP, "reset", "--hard", "--quiet", base)
+				other_head = self.sandbox.commit_file(APP, self.target(kind), AFTER, message="việc tay")
+				count = self.commit_count()
+
+				write, remove, commit = self.file_calls()
+				with write as writes, remove as removes, commit as commits:
+					apply_job.run_change(name, "undo")
+
+				self.assert_refused_before_writing(
+					name, kind, GIT_NOT_ANCESTOR_TEXT, count, (writes, removes, commits)
+				)
+				self.assertEqual(self.head(), other_head)
+
+	def test_undo_ancestor_unreadable_fails_with_git_error(self):
+		name, apply_commit = self.fresh_undo()
+		count = self.commit_count()
+
+		write, remove, commit = self.file_calls()
+		with (
+			patch.object(source, "git_is_ancestor", return_value=None) as ancestor,
+			write as writes,
+			remove as removes,
+			commit as commits,
+		):
+			apply_job.run_change(name, "undo")
+
+		ancestor.assert_called_once()
+		self.assertEqual(ancestor.call_args.args[1:], (apply_commit, apply_commit))
+		self.assert_refused_before_writing(
+			name, "changed file", GIT_ERROR_TEXT, count, (writes, removes, commits)
+		)
+
+	def test_undo_refused_on_git_precheck(self):
+		cases = (
+			("index.lock", lambda: self.sandbox.hold_index_lock(APP), GIT_LOCKED_TEXT),
+			("detached", lambda: self.sandbox.detach(APP), GIT_DETACHED_TEXT),
+		)
+		for kind in self.KINDS:
+			for label, break_git, reason in cases:
+				with self.subTest(kind=kind, case=label):
+					name, apply_commit = self.fresh_undo(kind)
+					break_git()
+					count = self.commit_count()
+
+					write, remove, commit = self.file_calls()
+					with write as writes, remove as removes, commit as commits:
+						apply_job.run_change(name, "undo")
+
+					self.assert_refused_before_writing(name, kind, reason, count, (writes, removes, commits))
+					self.assertEqual(self.head(), apply_commit)
+
+	def test_undo_commit_failure_restores_applied_bytes(self):
+		cases = (
+			("commit fails", self.failed(), f"{GIT_COMMIT_FAILED_TEXT}: fatal: lỗi giả"),
+			(
+				"commit times out",
+				self.failed(timed_out=True, output=""),
+				f"{GIT_COMMIT_FAILED_TEXT} (quá thời gian)",
+			),
+		)
+		for kind in self.KINDS:
+			for label, result, reason in cases:
+				with self.subTest(kind=kind, case=label):
+					name, apply_commit = self.fresh_undo(kind)
+					# HEAD is the bot's apply commit: only "HEAD == old HEAD" may give the file back here.
+					self.assertEqual(self.author_email(), BOT_GIT_EMAIL)
+
+					with patch.object(process_runner, "git_commit_only", return_value=result):
+						apply_job.run_change(name, "undo")
+
+					state = self.stored(name)
+					self.assertEqual(
+						(state.change_status, state.failure_reason), (CHANGE_STATUS_FAILED, reason)
+					)
+					with open(self.path(self.target(kind)), "rb") as handle:
+						self.assertEqual(handle.read(), AFTER.encode("utf-8"))
+					self.assertEqual(self.head(), apply_commit)
+					self.assertEqual(self.worktree_changes(), "")
+					self.assertFalse(state.undo_commit_sha)
+					# The git output is never stored on the proposal (design 3.5).
+					self.assertFalse(state.command_output)
+					self.assertEqual(self.steps(name), ["approve", "apply", "fail"])
+					self.assertNotIn("commit", self.log_row(name, "fail")[1] or {})
+
+	def test_undo_restore_check_failing_reports_restore_failed(self):
+		real_head, real_state = source.git_head, source.read_git_state
+
+		def head_unreadable_after_restore():
+			calls = iter([real_head])
+			return lambda repo: next(calls, lambda repo: None)(repo)
+
+		def refusal_after_restore():
+			calls = iter([real_state])
+			refused = source.GitState(GIT_LOCKED_TEXT, None, None, None, None)
+			return lambda full, **kw: next(calls, lambda full, **kw: refused)(full, **kw)
+
+		cases = (
+			("HEAD unreadable", "git_head", head_unreadable_after_restore),
+			("git refuses", "read_git_state", refusal_after_restore),
+		)
+		for kind in self.KINDS:
+			for label, function, stub in cases:
+				with self.subTest(kind=kind, case=label):
+					name, _ = self.fresh_undo(kind)
+
+					with (
+						patch.object(process_runner, "git_commit_only", return_value=self.failed()),
+						patch.object(source, function, side_effect=stub()),
+					):
+						apply_job.run_change(name, "undo")
+
+					state = self.stored(name)
+					self.assertEqual(
+						(state.change_status, state.failure_reason),
+						(CHANGE_STATUS_FAILED, GIT_RESTORE_FAILED_TEXT),
+					)
+					self.assertEqual(self.read(self.target(kind)), AFTER)
+					self.assertFalse(state.undo_commit_sha)
+					self.assertEqual(self.steps(name), ["approve", "apply", "fail"])
+
+	def test_undo_commit_failed_and_head_unreadable_fails_without_restore(self):
+		for kind in self.KINDS:
+			with self.subTest(kind):
+				name, apply_commit = self.fresh_undo(kind)
+
+				write, remove, _ = self.file_calls()
+				with (
+					patch.object(process_runner, "git_commit_only", return_value=self.failed()),
+					patch.object(source, "git_head", return_value=None),
+					write as writes,
+					remove as removes,
+				):
+					apply_job.run_change(name, "undo")
+
+				state = self.stored(name)
+				self.assertEqual(
+					(state.change_status, state.failure_reason), (CHANGE_STATUS_FAILED, GIT_ERROR_TEXT)
+				)
+				# QĐ-B2 item 2: the undo commit may exist, so the undone side stays on disk.
+				self.assert_target_undone(kind)
+				self.assertEqual(writes.call_count, 0 if kind == "new file" else 1)
+				self.assertEqual(removes.call_count, 1 if kind == "new file" else 0)
+				self.assertEqual(self.head(), apply_commit)
+				self.assertFalse(state.undo_commit_sha)
+				self.assertNotIn("commit", self.log_row(name, "fail")[1] or {})
+				self.assertEqual(self.steps(name), ["approve", "apply", "fail"])
+
+	def test_undo_head_moved_and_summary_unreadable_fails_without_restore(self):
+		real_commit = process_runner.git_commit_only
+
+		def commit_then_report_failure(*args):
+			real_commit(*args)
+			return self.failed()
+
+		for kind in self.KINDS:
+			with self.subTest(kind):
+				name, apply_commit = self.fresh_undo(kind)
+
+				write, remove, _ = self.file_calls()
+				with (
+					patch.object(process_runner, "git_commit_only", side_effect=commit_then_report_failure),
+					patch.object(source, "git_commit_summary", side_effect=RuntimeError("không đọc được")),
+					write as writes,
+					remove as removes,
+				):
+					apply_job.run_change(name, "undo")
+
+				state = self.stored(name)
+				self.assertEqual(
+					(state.change_status, state.failure_reason), (CHANGE_STATUS_FAILED, GIT_ERROR_TEXT)
+				)
+				self.assert_target_undone(kind)
+				self.assertEqual(writes.call_count, 0 if kind == "new file" else 1)
+				self.assertEqual(removes.call_count, 1 if kind == "new file" else 0)
+				self.assertEqual(self.sandbox.git(APP, "rev-parse", "HEAD~1").strip(), apply_commit)
+				self.assertFalse(state.undo_commit_sha)
+				self.log_error.assert_not_called()
+				self.assertEqual(self.steps(name), ["approve", "apply", "fail"])
+
+	def test_undo_commit_reported_failed_but_head_moved_goes_to_postcheck(self):
+		real_commit = process_runner.git_commit_only
+
+		def commit_then_report_failure(*args):
+			real_commit(*args)
+			return self.failed()
+
+		for kind in self.KINDS:
+			with self.subTest(kind):
+				name, apply_commit = self.fresh_undo(kind)
+
+				write, remove, _ = self.file_calls()
+				with (
+					patch.object(process_runner, "git_commit_only", side_effect=commit_then_report_failure),
+					write as writes,
+					remove as removes,
+				):
+					apply_job.run_change(name, "undo")
+
+				state = self.stored(name)
+				self.assertEqual((state.change_status, state.failure_reason), (CHANGE_STATUS_UNDONE, None))
+				self.assert_target_undone(kind)
+				self.assertEqual(writes.call_count, 0 if kind == "new file" else 1)
+				self.assertEqual(removes.call_count, 1 if kind == "new file" else 0)
+				self.assertEqual(self.sandbox.git(APP, "rev-parse", "HEAD~1").strip(), apply_commit)
+				self.assertEqual(state.undo_commit_sha, self.head())
+				self.assertEqual(self.author_email(), BOT_GIT_EMAIL)
+				self.assertEqual(self.steps(name), ["approve", "apply", "undo"])
+
+	def test_undo_accepted_when_bot_commit_lands_after_human_commit(self):
+		real_commit = process_runner.git_commit_only
+		for kind in self.KINDS:
+			with self.subTest(kind):
+				name, apply_commit = self.fresh_undo(kind)
+				human = []
+
+				def human_commits_first(*args, human=human):
+					human.append(
+						self.sandbox.commit_file(APP, "pkg/human.py", "h = 1\n", message="việc tay của người")
+					)
+					return real_commit(*args)
+
+				with patch.object(process_runner, "git_commit_only", side_effect=human_commits_first):
+					apply_job.run_change(name, "undo")
+
+				state = self.stored(name)
+				self.assertEqual((state.change_status, state.failure_reason), (CHANGE_STATUS_UNDONE, None))
+				self.assertEqual(self.sandbox.git(APP, "rev-parse", "HEAD~1").strip(), human[0])
+				self.assertEqual(self.sandbox.git(APP, "rev-parse", "HEAD~2").strip(), apply_commit)
+				self.assertEqual(state.undo_commit_sha, self.head())
+				self.assert_target_undone(kind)
+
+	def test_fail_row_with_commit_sha_carries_value_after_commit(self):
+		cases = (
+			("mismatch", {"return_value": b"x = 7\n"}),
+			("RuntimeError at post-check", {"side_effect": RuntimeError("không đọc được")}),
+		)
+		for label, behavior in cases:
+			with self.subTest(label):
+				name, apply_commit = self.fresh_undo()
+
+				with patch.object(source, "git_blob", **behavior):
+					apply_job.run_change(name, "undo")
+
+				state = self.stored(name)
+				self.assertEqual(state.failure_reason, GIT_COMMIT_MISMATCH_TEXT)
+				self.assertTrue(state.undo_commit_sha)
+				before, after = self.log_row(name, "fail")
+				self.assertEqual(
+					after, {"sha256": _sha(BEFORE), "commit": state.undo_commit_sha, "branch": "main"}
+				)
+				self.assertEqual(before, {"sha256": _sha(AFTER), "head": apply_commit})
+
+	def test_undo_exception_after_commit_landed_does_not_restore(self):
+		for kind in self.KINDS:
+			with self.subTest(kind):
+				name, apply_commit = self.fresh_undo(kind)
+
+				write, remove, _ = self.file_calls()
+				with (
+					patch.object(source, "git_blob", side_effect=KeyError("k")),
+					write as writes,
+					remove as removes,
+					patch.object(frappe.db, "rollback"),
+				):
+					apply_job.run_change(name, "undo")
+
+				state = self.stored(name)
+				self.assertEqual(
+					(state.change_status, state.failure_reason), (CHANGE_STATUS_FAILED, "KeyError")
+				)
+				self.assert_target_undone(kind)
+				self.assertEqual(writes.call_count, 0 if kind == "new file" else 1)
+				self.assertEqual(removes.call_count, 1 if kind == "new file" else 0)
+				self.assertEqual(self.sandbox.git(APP, "rev-parse", "HEAD~1").strip(), apply_commit)
+				self.assertEqual(state.undo_commit_sha, self.head())
+				before, after = self.log_row(name, "fail")
+				self.assertEqual(before, {"sha256": _sha(AFTER), "head": apply_commit})
+				self.assertEqual(after["commit"], state.undo_commit_sha)
+
+	def test_undo_unexpected_exception_after_write_restores_file(self):
+		for kind in self.KINDS:
+			with self.subTest(kind):
+				name, apply_commit = self.fresh_undo(kind)
+				self.log_error.reset_mock()
+
+				with (
+					patch.object(apply_job, "_person", side_effect=KeyError("k")),
+					patch.object(frappe.db, "rollback"),
+				):
+					apply_job.run_change(name, "undo")
+
+				state = self.stored(name)
+				self.assertEqual(
+					(state.change_status, state.failure_reason), (CHANGE_STATUS_FAILED, "KeyError")
+				)
+				self.assertEqual(self.read(self.target(kind)), AFTER)
+				self.assertEqual(self.worktree_changes(), "")
+				self.assertEqual(self.head(), apply_commit)
+				self.assertFalse(state.undo_commit_sha)
+				self.log_error.assert_called_once()
+				self.assertEqual(self.steps(name), ["approve", "apply", "fail"])
+
+	def test_undo_read_back_mismatch_gives_the_applied_bytes_back(self):
+		name, apply_commit = self.fresh_undo()
+		count = self.commit_count()
+		real_write = file_writer.write_atomic
+
+		def write_reads_back_other_bytes(path, content, new_file):
+			written = real_write(path, content, new_file=new_file)
+			return _sha("khác\n") if content == BEFORE else written
+
+		with (
+			patch.object(file_writer, "write_atomic", side_effect=write_reads_back_other_bytes) as writes,
+			patch.object(process_runner, "git_commit_only") as commit,
+		):
+			apply_job.run_change(name, "undo")
+
+		state = self.stored(name)
+		self.assertEqual(
+			(state.change_status, state.failure_reason),
+			(CHANGE_STATUS_FAILED, "đọc lại sau khi ghi không khớp"),
+		)
+		commit.assert_not_called()
+		self.assertEqual([call.args[1] for call in writes.call_args_list], [BEFORE, AFTER])
+		self.assertEqual(self.read(), AFTER)
+		self.assertEqual((self.head(), self.commit_count()), (apply_commit, count))
+		self.assertEqual(self.worktree_changes(), "")
+
+	def test_undo_postcheck_branch_is_the_checked_out_branch(self):
+		# Design 4.4 steps 4 and 6: the undo commits on the branch checked out at undo time when the apply
+		# commit is in its history; the post-check compares with that branch, not `target_branch`.
+		name, apply_commit = self.fresh_undo()
+		self.sandbox.switch_branch(APP, "feature")
+
+		apply_job.run_change(name, "undo")
+
+		state = self.stored(name)
+		self.assertEqual((state.change_status, state.failure_reason), (CHANGE_STATUS_UNDONE, None))
+		self.assertEqual(self.sandbox.git(APP, "rev-parse", "feature").strip(), state.undo_commit_sha)
+		self.assertEqual(self.sandbox.git(APP, "rev-parse", "main").strip(), apply_commit)
+		self.assertEqual(self.log_row(name, "undo")[1]["branch"], "feature")
+
+	def test_request_undo_refuses_a_command_proposal(self):
+		# The undo job has no command branch (`_recheck` reads the guard of a code change only for undo):
+		# `request_undo` is what keeps a bench command out of it.
+		name = self.approved(
+			make_change_proposal(
+				CHANGE_KIND_COMMAND, app=APP, command_args=json.dumps(["build", "--app", APP])
+			).name
+		)
+
+		with self.assertRaises(transitions.InvalidTransition):
+			transitions.request_undo(name, UNDOER)
+
+		state = self.state(name)
+		self.assertEqual(state.change_status, CHANGE_STATUS_APPROVED)
+		self.assertFalse(frappe.db.get_value(PROPOSAL_DOCTYPE, name, "undo_by"))
 
 
 class TestApplyCommand(ApplyJobTestCase):

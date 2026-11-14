@@ -154,11 +154,12 @@ def _wanted_roles(doctype: str, values: dict) -> list | None:
 	profile_rows = values.get("role_profiles") or [] if doctype == USER_DOCTYPE else []
 	if not all(isinstance(row, dict) for row in [*rows, *profile_rows]):
 		return None
-	roles = [row.get("role") for row in rows]
+	# Names are stripped for the check only (" System Manager" is the stored name); non-text stays as given.
+	roles = [role.strip() if isinstance(role, str) else role for role in (row.get("role") for row in rows)]
 	if doctype == USER_DOCTYPE:
 		profiles = [values.get("role_profile_name"), *(row.get("role_profile") for row in profile_rows)]
 		for profile in profiles:
-			roles.extend(_profile_roles(profile))
+			roles.extend(_profile_roles(profile.strip() if isinstance(profile, str) else profile))
 	return roles
 
 

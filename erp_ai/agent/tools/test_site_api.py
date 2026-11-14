@@ -34,6 +34,9 @@ HIDDEN = "[đã ẩn]"
 SECRET_METHOD_REFUSED = "hàm này trả khóa API hoặc mật khẩu, không gọi qua công cụ"
 SECRET_ARGUMENT_REFUSED = "tham số nhắc tới trường khóa API hoặc mật khẩu, không gọi qua công cụ"
 COLUMN_SELECTOR_REFUSED = "tham số chọn mọi cột bằng *, hãy liệt kê tên trường cần lấy"
+SPELLING_USER = "siteapi.spelling@example.com"
+BANNED_PROFILE = "SITEAPI Ho so cam"
+FORBIDDEN_REFUSAL = "vai trò không được gán qua công cụ: System Manager"
 _real_get_all = frappe.get_all
 
 
@@ -762,6 +765,93 @@ class TestSiteApi(FrappeTestCase):
 		)
 		self.assertFalse(result["ok"])
 		self.assertIn("thiếu quyền", result["reason"])
+
+
+class TestForbiddenRoleSpelling(FrappeTestCase):
+	"""A forbidden role (or a Role Profile holding one) written as a variant spelling is refused by the tool's own
+	check with the stored name, not left to Frappe's link check (STD-SEC-4)."""
+
+	def setUp(self):
+		commit_guard = patch.object(frappe.db, "commit", side_effect=AssertionError("commit in test"))
+		commit_guard.start()
+		self.addCleanup(commit_guard.stop)
+		self.addCleanup(frappe.db.rollback)
+		self.addCleanup(frappe.set_user, "Administrator")
+		frappe.set_user("Administrator")
+		_make_user(AGENT, ROLE_AGENT, "System Manager")
+		_make_user(BOSS, ROLE_INSTRUCTOR)
+		_make_user(SPELLING_USER)
+		frappe.get_doc(
+			{"doctype": "Role Profile", "role_profile": BANNED_PROFILE, "roles": [{"role": "System Manager"}]}
+		).insert()
+		frappe.set_user(AGENT)
+
+	def stored(self, user):
+		frappe.set_user("Administrator")
+		doc = frappe.get_doc("User", user) if frappe.db.exists("User", user) else None
+		frappe.set_user(AGENT)
+		if not doc:
+			return None
+		return {"roles": {row.role for row in doc.roles}, "role_profile_name": doc.role_profile_name}
+
+	def assert_refused_on_both_tools(self, values, reason, **labels):
+		with self.subTest(tool="create_record", **labels):
+			new_values = {"email": NEW_USER, "first_name": "Người mới", "send_welcome_email": 0, **values}
+			result = execute_tool("api_create_record", {"doctype": "User", "values": new_values}, _context())
+			self.assertEqual(result, {"ok": False, "reason": reason, "doctype": "User"})
+			self.assertIsNone(self.stored(NEW_USER))
+		with self.subTest(tool="update_record", **labels):
+			before = self.stored(SPELLING_USER)
+			arguments = {"doctype": "User", "name": SPELLING_USER, "values": values}
+			result = execute_tool("api_update_record", arguments, _context())
+			self.assertEqual(result, {"ok": False, "reason": reason, "doctype": "User"})
+			self.assertEqual(self.stored(SPELLING_USER), before)
+
+	def test_variant_spellings_refused(self):
+		spellings = (
+			("accented", "Sýstem Manager", "SITEAPI Hó sơ cám"),
+			("case", "SYSTEM MANAGER", BANNED_PROFILE.upper()),
+			("leading whitespace", "  System Manager", f"  {BANNED_PROFILE}"),
+			("trailing whitespace", "System Manager  ", f"{BANNED_PROFILE}  "),
+		)
+		for spelling, role, profile in spellings:
+			self.assert_refused_on_both_tools(
+				{"roles": [{"role": role}]}, FORBIDDEN_REFUSAL, spelling=spelling, path="roles"
+			)
+			self.assert_refused_on_both_tools(
+				{"role_profile_name": profile}, FORBIDDEN_REFUSAL, spelling=spelling, path="role_profile_name"
+			)
+		# This Frappe version has no `role_profiles` on User: the unknown-field check refuses it first.
+		self.assert_refused_on_both_tools(
+			{"role_profiles": [{"role_profile": BANNED_PROFILE}]},
+			"DocType không có trường: role_profiles",
+			path="role_profiles",
+		)
+
+	def test_whitespace_around_an_allowed_role_still_rejected_by_frappe(self):
+		# The tool's check strips names only to look them up; the values written keep the spaces, as before.
+		before = self.stored(SPELLING_USER)
+		arguments = {
+			"doctype": "User",
+			"name": SPELLING_USER,
+			"values": {"roles": [{"role": f"  {ALLOWED_ROLE}  "}]},
+		}
+		result = execute_tool("api_update_record", arguments, _context())
+		self.assertFalse(result["ok"])
+		self.assertTrue(result["reason"].startswith("hệ thống từ chối: Could not find Row #1: Role:"), result)
+		self.assertNotIn("vai trò không được gán", result["reason"])
+		self.assertEqual(self.stored(SPELLING_USER), before)
+
+	def test_unrestricted_still_assigns_a_variant_spelling(self):
+		arguments = {
+			"doctype": "User",
+			"name": SPELLING_USER,
+			"values": {"roles": [{"role": "Sýstem Manager"}]},
+		}
+		unrestricted = _context(level="L1", change_enabled=False, unrestricted=True)
+		result = execute_tool("api_update_record", arguments, unrestricted)
+		self.assertTrue(result["ok"], result)
+		self.assertEqual(self.stored(SPELLING_USER)["roles"], {"System Manager"})
 
 
 class TestUnrestrictedGrant(FrappeTestCase):

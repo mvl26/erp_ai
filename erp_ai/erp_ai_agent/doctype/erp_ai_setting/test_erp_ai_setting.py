@@ -1276,7 +1276,7 @@ class TestUserTemplates(FrappeTestCase):
 		)
 
 
-# FEAT-007 design.md:107, 120-121 (AC-24): the ticket field names, in form order, with their form label (E-1).
+# FEAT-007 design.md:104-106, 127-128 (AC-24): the ticket field names, in form order, with their form label (E-1).
 TICKET_FIELD_LABELS = {
 	"field_ticket_nature": "Tính chất phiếu",
 	"field_erp_module": "Phân hệ ERP",
@@ -1355,7 +1355,7 @@ class TestTicketFieldNames(FrappeTestCase):
 		}
 
 	def test_section_and_field_shape(self):
-		# design.md:103, 107, 120-121: one Data field per name and the board value, in this order, after routing;
+		# design.md:104-106, 127-128: one Data field per name and the board value, in this order, after routing;
 		# D-19: the excluded title prefixes sit right after excluded_teams.
 		meta = frappe.get_meta(SETTING_DOCTYPE)
 		order = [field.fieldname for field in meta.fields]
@@ -1392,6 +1392,37 @@ class TestTicketFieldNames(FrappeTestCase):
 			_unknown_ticket_field_error("field_erp_module", "sai_mot"),
 		)
 		self.assertEqual(self._stored(), stored_before)
+
+	def test_unknown_field_name_escaped(self):
+		# AC-24, E-1, STD-SEC-3: the typed name is HTML-escaped in the message, as the key label is (:308).
+		# Turns red when check_ticket_field_names puts the name into frappe.throw unescaped.
+		doc = frappe.get_doc(SETTING_DOCTYPE)
+		doc.update(VALID_TICKET_FIELDS | {"field_ticket_nature": "<b>sai</b>"})
+		with self.assertRaises(frappe.ValidationError) as raised:
+			doc.save()
+		self.assertEqual(
+			str(raised.exception),
+			"Trường '&lt;b&gt;sai&lt;/b&gt;' không có trên HD Ticket (Tính chất phiếu)",
+		)
+
+	def test_ticket_fields_checked_before_catalog(self):
+		# design.md:294, steps 4 then 5: a save with both a wrong ticket field name and a bad catalog row
+		# reports E-1. Turns red when check_catalog_rules runs before check_ticket_field_names in validate.
+		doc = frappe.get_doc(SETTING_DOCTYPE)
+		doc.update(VALID_TICKET_FIELDS | {"field_erp_module": "sai_mot"})
+		doc.set("catalog_rules", [])
+		doc.append(
+			"catalog_rules",
+			{
+				"action": constants.ACTION_ADD_HOLIDAY,
+				"target_doctype": "Note",
+				"categories": "A",
+				"mode": constants.MODE_NEEDS_APPROVAL,
+			},
+		)
+		with self.assertRaises(frappe.ValidationError) as raised:
+			doc.save()
+		self.assertEqual(str(raised.exception), _unknown_ticket_field_error("field_erp_module", "sai_mot"))
 
 	def test_due_field_must_be_date(self):
 		# AC-24, E-2: Data, Link, Time, Small Text and Select fields are refused; an unknown name stays E-1.

@@ -554,7 +554,7 @@ class TestDoctypeDescriptions(FrappeTestCase):
 		order = doctype_json["field_order"]
 		start = order.index("prompt_digest")
 		# FEAT-007 design.md:98, 106 (NFR-8): the switch moved to section_permissions; the block keeps the app list.
-		# design.md:107: section_ticket_fields (AC-24) sits between section_routing and section_code_change.
+		# design.md:104-106: section_ticket_fields (AC-24) sits between section_routing and section_code_change.
 		self.assertEqual(
 			order[start : start + 13],
 			[

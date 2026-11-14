@@ -196,7 +196,7 @@ class ERPAISetting(Document):
 			field = ticket_meta.get_field(name)
 			if not field:
 				label = self.meta.get_label(fieldname)
-				frappe.throw(f"Trường '{name}' không có trên HD Ticket ({label})")
+				frappe.throw(f"Trường '{frappe.utils.escape_html(name)}' không có trên HD Ticket ({label})")
 			if fieldname == DUE_FIELD_SETTING and field.fieldtype not in DUE_FIELD_TYPES:
 				frappe.throw("Trường Hạn hoàn thành phải có kiểu Date hoặc Datetime")
 		self.origin_board_value = (self.origin_board_value or "").strip()

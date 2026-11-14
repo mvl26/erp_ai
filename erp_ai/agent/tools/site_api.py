@@ -51,6 +51,11 @@ SECRET_RESULT_KEYS = frozenset(
 SECRET_ARGUMENT_REASON = "tham số nhắc tới trường khóa API hoặc mật khẩu, không gọi qua công cụ"
 # Splits argument text into bare names, so `api_key as k` and `tabUser`.`api_key` both yield `api_key`.
 IDENTIFIER_PATTERN = re.compile(r"\w+")
+# `fields`/`fieldname` entries that select every column (`*`, `tabX.*`, `` `tabX`.* ``) return keyless rows
+# that `_scrub` cannot hide; `count(*)` and a `*` in a filter value are not column selectors.
+COLUMN_KEYS = frozenset({"fields", "fieldname"})
+COLUMN_SELECTOR_PATTERN = re.compile(r"\s*(?:(?:`[^`]+`|\w+)\s*\.\s*)?\*\s*")
+COLUMN_SELECTOR_REASON = "tham số chọn mọi cột bằng *, hãy liệt kê tên trường cần lấy"
 SCRUBBED_VALUE = "[đã ẩn]"
 SYSTEM_FIELDS = frozenset(
 	{"doctype", "docstatus", "owner", "creation", "modified", "modified_by", "idx", "parent", "parenttype"}
@@ -296,6 +301,26 @@ def _scrub(value):
 	return value
 
 
+def _selects_every_column(value) -> bool:
+	"""True when a `fields`/`fieldname` value anywhere in the parsed `value` holds a `*` column selector."""
+	if isinstance(value, dict):
+		return any(
+			(key.casefold() in COLUMN_KEYS and _is_column_selector(item)) or _selects_every_column(item)
+			for key, item in value.items()
+		)
+	if isinstance(value, list):
+		return any(_selects_every_column(item) for item in value)
+	return False
+
+
+def _is_column_selector(value) -> bool:
+	if isinstance(value, str):
+		return any(COLUMN_SELECTOR_PATTERN.fullmatch(part) for part in value.split(","))
+	if isinstance(value, list):
+		return any(_is_column_selector(item) for item in value)
+	return False
+
+
 def _method_refusal(method: str, arguments: dict) -> dict | None:
 	"""Early refusal only: the app's DocTypes are closed for the agent account by their controllers.
 
@@ -305,7 +330,10 @@ def _method_refusal(method: str, arguments: dict) -> dict | None:
 		return _fail("không gọi hàm của erp_ai qua công cụ")
 	if _is_secret_method(method):
 		return _fail(SECRET_METHOD_REASON)
-	text = json.dumps(_parsed(arguments), ensure_ascii=False, default=str).casefold()
+	parsed = _parsed(arguments)
+	if _selects_every_column(parsed):
+		return _fail(COLUMN_SELECTOR_REASON)
+	text = json.dumps(parsed, ensure_ascii=False, default=str).casefold()
 	if any(doctype.casefold() in text for doctype in always_denied_doctypes()):
 		return _fail("tham số nhắc tới DocType không được phép dùng qua công cụ")
 	if not SECRET_RESULT_KEYS.isdisjoint(IDENTIFIER_PATTERN.findall(text)):
@@ -516,7 +544,8 @@ TOOLS: list[ToolSpec] = [
 			"description": (
 				"Gọi một hàm whitelist của Frappe hoặc app khác bằng đường dẫn Python đầy đủ "
 				"(ví dụ frappe.client.get_value), arguments là object tham số. Không gọi được hàm của erp_ai hay hàm trả khóa API, mật khẩu; "
-				"tham số nhắc tới trường khóa hoặc mật khẩu bị từ chối và giá trị dưới khóa bí mật trong kết quả được ẩn, "
+				"tham số nhắc tới trường khóa hoặc mật khẩu, hoặc chọn mọi cột bằng * (`*`, `tabX.*` trong fields/fieldname), "
+				"bị từ chối và giá trị dưới khóa bí mật trong kết quả được ẩn, "
 				"nhưng đây chỉ là chặn ở mức cố gắng, không bảo đảm mọi bí mật đều bị chặn."
 			),
 			"input_schema": {

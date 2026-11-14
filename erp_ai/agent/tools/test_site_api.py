@@ -29,6 +29,7 @@ FAKE_SECRET = "SITEAPI-FAKE-SECRET-7f3a"
 HIDDEN = "[đã ẩn]"
 SECRET_METHOD_REFUSED = "hàm này trả khóa API hoặc mật khẩu, không gọi qua công cụ"
 SECRET_ARGUMENT_REFUSED = "tham số nhắc tới trường khóa API hoặc mật khẩu, không gọi qua công cụ"
+COLUMN_SELECTOR_REFUSED = "tham số chọn mọi cột bằng *, hãy liệt kê tên trường cần lấy"
 _real_get_all = frappe.get_all
 
 
@@ -830,6 +831,37 @@ class TestSiteApiUnrestricted(FrappeTestCase):
 			)
 		called.assert_called_once()
 		self.assertEqual(result, {"ok": True, "method": "frappe.client.get_value", "result": "Sếp"})
+
+	def test_column_selector_star_is_refused_before_call(self):
+		for method, arguments in (
+			("frappe.client.get_list", {"doctype": "User", "fields": ["*"], "as_dict": 0}),
+			("frappe.desk.reportview.get", {"doctype": "User", "fields": ["*"]}),
+			("frappe.client.get_list", {"doctype": "User", "fields": ["name", "tabUser.*"]}),
+			("frappe.client.get_list", {"doctype": "User", "fields": ["`tabUser` . *"]}),
+			("frappe.client.get_list", {"doctype": "User", "fields": '["name", "*"]'}),
+			("frappe.client.get_list", {"doctype": "User", "fields": "name, *"}),
+			("frappe.client.get_value", {"doctype": "User", "filters": BOSS, "fieldname": "*", "as_dict": 0}),
+		):
+			with self.subTest(method=method, arguments=arguments), patch.object(frappe, "call") as called:
+				result = self.run_tool("api_call_method", {"method": method, "arguments": arguments})
+				self.assertEqual(result, {"ok": False, "reason": COLUMN_SELECTOR_REFUSED})
+				self.assertEqual(called.call_count, 0)
+
+	def test_star_outside_a_column_selector_still_goes_through(self):
+		for arguments in (
+			{"doctype": "User", "fields": ["name"], "as_dict": 0},
+			{"doctype": "User", "fields": ["count(*) as total"]},
+			{"doctype": "User", "fields": ["name"], "filters": {"full_name": "*"}},
+		):
+			with (
+				self.subTest(arguments=arguments),
+				patch.object(frappe, "call", return_value=[["r1"]]) as called,
+			):
+				result = self.run_tool(
+					"api_call_method", {"method": "frappe.client.get_list", "arguments": arguments}
+				)
+				called.assert_called_once()
+				self.assertEqual(result, {"ok": True, "method": "frappe.client.get_list", "result": [["r1"]]})
 
 	def test_nested_json_doc_naming_app_doctype_is_refused(self):
 		for method, arguments in (

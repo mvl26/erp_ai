@@ -4,7 +4,7 @@ from dataclasses import dataclass
 
 import frappe
 from frappe import _
-from frappe.utils import get_datetime, now_datetime
+from frappe.utils import add_months, get_datetime, now_datetime
 
 from erp_ai.constants import LEVELS, LOG_DOCTYPE, SETTING_DOCTYPE, TICKET_CONTENT_DOCTYPES
 
@@ -72,10 +72,26 @@ def get_trigger_keyword() -> str:
 	return frappe.db.get_single_value(SETTING_DOCTYPE, "trigger_keyword") or ""
 
 
-def effective_level(settings) -> str:
+def month_spend_usd(now=None) -> float:
+	"""Sum of cost_usd over every ERP AI Log row created in the month containing `now` (AC-61)."""
+	start = get_datetime(now or now_datetime()).replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+	end = add_months(start, 1)
+	rows = frappe.db.sql(
+		f"SELECT COALESCE(SUM(cost_usd), 0) FROM `tab{LOG_DOCTYPE}` WHERE creation >= %s AND creation < %s",
+		(start, end),
+	)
+	return float(rows[0][0])
+
+
+def is_over_budget(settings, now=None) -> bool:
+	"""The month's live log spend is above monthly_budget_usd; spent_this_month_usd is not read."""
+	return month_spend_usd(now) > (settings.monthly_budget_usd or 0)
+
+
+def effective_level(settings, *, over_budget: bool) -> str:
 	"""The only reader of permission_level; over budget caps at L1 but never raises L0."""
 	level = settings.permission_level
-	if (settings.spent_this_month_usd or 0) > (settings.monthly_budget_usd or 0):
+	if over_budget:
 		return min(level, OVER_BUDGET_LEVEL, key=LEVELS.index)
 	return level
 

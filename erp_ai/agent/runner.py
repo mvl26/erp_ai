@@ -161,7 +161,7 @@ def _run(ticket_name, trigger):
 		_log_skip(ticket_name, trigger, run_id, "daily_limit")
 		return
 	# (e)
-	level = policy.effective_level(settings)
+	level = policy.effective_level(settings, over_budget=policy.is_over_budget(settings))
 	auto_assign = policy.auto_assign_enabled(settings)
 	deadline = time.monotonic() + JOB_TIMEOUT_S - JOB_SAFETY_MARGIN_S
 

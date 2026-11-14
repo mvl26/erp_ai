@@ -345,6 +345,39 @@ class TestSiteApi(FrappeTestCase):
 		self.assertNotEqual(frappe.db.get_value("User", "Administrator", "first_name"), "Đổi")
 		self.assertNotEqual(frappe.db.get_value("User", AGENT, "first_name"), "Đổi")
 
+	def test_names_only_the_database_matches_are_refused(self):
+		"""MariaDB ignores trailing spaces and accents where casefold does not: the stored name decides."""
+		role_values = lambda role: self.user_values(roles=[{"role": role}])  # noqa: E731
+		user_update = lambda user: {"doctype": "User", "name": user, "values": {"first_name": "Đổi"}}  # noqa: E731
+		cases = (
+			(
+				"Role",
+				"System Manager ",
+				"api_create_record",
+				{"doctype": "User", "values": role_values("System Manager ")},
+				"vai trò không được gán",
+			),
+			(
+				"Role",
+				"Systém Manager",
+				"api_create_record",
+				{"doctype": "User", "values": role_values("Systém Manager")},
+				"vai trò không được gán",
+			),
+			("User", "Administrator ", "api_update_record", user_update("Administrator "), "không được sửa"),
+			("User", "Ädministrator", "api_update_record", user_update("Ädministrator"), "không được sửa"),
+		)
+		for doctype, name, tool, arguments, reason in cases:
+			with self.subTest(doctype, name=name), patch.object(site_api, "_write") as write:
+				# Precondition: the database finds the record while casefold alone would not.
+				stored = frappe.db.get_value(doctype, name, "name")
+				self.assertTrue(stored)
+				self.assertNotEqual(stored.casefold(), name.casefold())
+				result = self.run_tool(tool, arguments)
+				self.assertFalse(result["ok"])
+				self.assertIn(reason, result["reason"])
+				write.assert_not_called()
+
 	def test_refuses_child_table_doctype(self):
 		result = self.create(
 			"Has Role",

@@ -647,7 +647,7 @@ FEAT007_NEW_FIELD_DEFAULTS = {
 	# No Singles row: get_single_value casts the absent Date to date(1, 1, 1) (see test_watermarks_start_unset).
 	"daily_report_sent_on": datetime.date(1, 1, 1),
 	"budget_alert_sent_month": "",
-	# No default either: the absent Datetime casts to datetime(1, 1, 1).
+	# No default either: the absent Datetime casts to datetime(1, 1, 1); checked with the agent off (enabled = 0).
 	"agent_enabled_at": datetime.datetime(1, 1, 1),
 }
 # FEAT-007 AC-26, D-2: the expected first-response minutes of categories A-F (routing_rules.expected_sla).
@@ -719,6 +719,9 @@ class TestFeat007Defaults(FrappeTestCase):
 			doc.save(ignore_permissions=True)
 
 	def test_every_new_field_default(self):
+		# The agent_enabled_at row means "agent off + value missing -> stays unset"; pin `enabled` so the row
+		# holds whatever the site stores (keep_agent_settings restores it).
+		set_agent_settings(enabled=0)
 		for fieldname, expected in FEAT007_NEW_FIELD_DEFAULTS.items():
 			with self.subTest(fieldname=fieldname):
 				self.assertEqual(self._value_after_install(fieldname), expected)

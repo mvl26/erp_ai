@@ -7,7 +7,8 @@ Approved-by:
 
 # Acceptance FEAT-004 (bản gộp, lượt chốt)
 
-Commit kiểm: `ba89ab305d06270d646a6560cd69b8b741cefc25` (team/FEAT-004, worktree `.claude/worktrees/feat-004`; cây mã sạch, chỉ docs chưa commit).
+Commit kiểm (lượt sau rework T69): `da00518818e5c581b7c6806377102f4f21bdac3e` (team/FEAT-004; mã từ `ba89ab3` chỉ đổi T69 `cef90a3`/merge `9adcdd6`). Kết quả lượt này: mục "Lượt sau rework (da00518)" ở cuối; bảng tiêu chí bên dưới giữ bằng chứng trên `ba89ab3`.
+Commit kiểm lượt trước: `ba89ab305d06270d646a6560cd69b8b741cefc25` (team/FEAT-004, worktree `.claude/worktrees/feat-004`; cây mã sạch, chỉ docs chưa commit).
 Ba phần (`acceptance-part-1.md`, `-2.md`, `-3.md`) kiểm trên `abd2fa2`. Từ `abd2fa2` tới `ba89ab3` mã đổi đúng các commit rework `0ea548c` (T64, runner), `f0fefb4`, `7894f04` (T62, site_api) và merge `0558640`.
 
 Cách chạy: `cmd.test_one` từ `/home/miyano/frappe-bench`, `env PYTHONPATH=<worktree>` (traceback trỏ vào file của worktree: `app.log` có 238 dòng `worktrees/feat-004`), bọc `flock -w 1800 .team/miyano-site.lock`. `bench run-tests` thoát 0 cả khi đỏ: bằng chứng là dòng `Ran`/`OK|FAILED` cộng số đếm junit (tests/failures/errors/skipped). Nguồn bằng chứng trên `ba89ab3` (scratchpad qa `v/`):
@@ -130,20 +131,66 @@ Theo tiền lệ FEAT-002/003, các bước này không chặn phán quyết; be
 - R-5: AC-11 thiếu kịch bản câu chèn khi ô Toàn quyền bật.
 - R-6: Cả app chưa có lần `OK` trên `ba89ab3`.
 
+## Lượt sau rework (da00518)
+
+Bằng chứng ở scratchpad qa `v2/` (phiên 6c38287b). Lệnh: `flock -w 1800 .team/miyano-site.lock`, `PYTHONPATH=<worktree feat-004>`, từ `/home/miyano/frappe-bench`.
+
+**Trước khi lấy khóa** (3 lần nhìn, cách 2 phút, 20:14–20:18): lần 1 có `run-tests --module erp_ai.tests.test_architecture` của phiên FEAT-007 chạy ngoài khóa; các lần còn lại chỉ thấy lệnh giữ khóa kiểu `flock -w 1800 9` (của phiên khác, trong khóa). Trong lúc chạy lại theo tên (20:35) có `run-tests --module erp_ai.erp_ai_agent.report.erp_ai_accuracy.test_erp_ai_accuracy` chạy lặp ngoài khóa (pid 975350, 975610, 976097).
+
+**Một lần giữ khóa (20:18:34–20:33:03), `app_run.sh`:**
+
+| bước | kết quả |
+|---|---|
+| cài đặt trước | `auto_assign_enabled=1`; `code_change_apps="frappe\nerpnext\nhelpdesk\nhrms"` |
+| `cmd.migrate` | exit 0 (20:18:36–20:19:27). DocPerm của `ERP AI Log` sau migrate: `ERP AI Agent 0 1 0`, `System Manager 0 1 0` — không còn `ERP AI Instructor` |
+| dòng mồ côi | backup `v2/orphan_erp_ai_log.tsv` 0 dòng, `v2/orphan_comment.tsv` 22 dòng (21 bản ghi + tiêu đề). `DELETE` bị MariaDB từ chối: `ERROR 1175 (HY000) … safe update mode` → **0 dòng bị xóa**; 21 Comment trên HD Ticket đã mất vẫn còn |
+| để trống 2 cài đặt | đọc lại: `auto_assign_enabled 0`, `code_change_apps` rỗng |
+| `cmd.test` cả app (20:19:33–20:32:59) | exit 0; `Ran 1499 tests in 802.131s` / `FAILED (failures=2, errors=12)`; junit 1499/2/12/0 |
+| 4 repo lõi trước = sau | `frappe 2e9ecdc… 1`, `erpnext 8cf5d66… 10`, `helpdesk a185896… 3`, `hrms e1f22e4… 0` (HEAD, số dòng `status --porcelain`); `diff` rỗng — NFR-9 |
+| trap trả cài đặt | đọc lại 20:33:01: `auto_assign_enabled 1`; `code_change_apps frappe\nerpnext\nhelpdesk\nhrms` (= trước) |
+
+**Ca đỏ của lần cả app và lần chạy lại theo tên** (một lần, trong một lần giữ khóa 20:35:11–20:35:53, `rerun.sh`):
+
+| test | cả app | chạy lại theo tên | phân loại |
+|---|---|---|---|
+| `test_runner_routing::test_sharing_disabled_no_task_one_comment` | failure `['TASK-2026-00003'] != []` | `ok` | môi trường (fixture cùng lớp `TestRoutingTask` bị 1213 ở 6 ca; xanh khi chạy lại) |
+| `test_runner_routing::test_rerun_keeps_one_task`, `::test_preassigned_by_rule_no_task_no_comment`, `::test_refused_task_without_exception_no_task_no_comment` | error 1213 | `ok` | deadlock |
+| `test_runner_routing::test_existing_linked_task_no_new_task`, `::test_other_category_or_no_person_no_task`, `::test_preassigned_by_human_no_task_no_comment`, `::test_broken_sla_condition_stops_route_cleanly` | error 1213 | error 1213 (`Ran 8 tests in 15.264s` / `FAILED (errors=4)`, cả 4 là `QueryDeadlockError 1213`) | deadlock |
+| `test_runner_status::test_done_last_when_answered` | failure `0 != 1` (`test_runner_status.py:138`) | error 1213 | chưa phân loại được: lần chạy lại không tới assert; không có bằng chứng là lỗi thật |
+| `test_runner_status::test_mention_run_counts_once_for_daily_limit`, `::test_model_messages_same_with_feature_on_and_off` | error 1213 | `ok` | deadlock |
+| `test_runner_status::test_done_last_on_unexpected_runner_exception`, `::test_end_status_never_raises_when_logging_fails`, `::test_indicator_stays_thinking_while_waiting` | error 1213 | error 1213 (`Ran 6 tests in 7.344s` / `FAILED (errors=4)`, 4 × 1213) | deadlock |
+
+Không ca nào lỗi lược đồ lạ (foreign schema) trong lần này. `git diff --stat develop...HEAD`: `runner.py` 104+/15-, hai file test không đổi.
+
+**F-3:** cả app `test_gateway::TestApiKeyLeak::test_api_key_never_leaks` xanh (suite 1/0/0). Chạy riêng `--module erp_ai.gateway.test_gateway --test test_api_key_never_leaks` (20:35:47): `Ran 1 test in 0.100s` / `FAILED (errors=1)` — `QueryDeadlockError 1213` trong `setUp` (`test_utils.py:99` `set_single_value`), không tới assert. Thông điệp F-3 (`'frappe.logger' : success`) không xuất hiện, nhưng qa chưa có lần chạy riêng xanh → **F-3 chưa đóng** (BLOCKED môi trường); bằng chứng dev/reviewer (`Ran 65` OK, journal) không thay được.
+
+**F-4:** **đóng.** Nguyên nhân là lược đồ của nhánh khác (DocPerm `ERP AI Instructor` do migrate FEAT-007, `debt.md`); sau `cmd.migrate` từ worktree feat-004, DocPerm chỉ còn 2 role và `test_erp_ai_log::test_no_role_can_write_or_delete` xanh trong lần cả app (suite 7/0/0).
+
+**F-5:** hai test `test_route_ticket::test_sla_chosen_by_complexity_condition` và `test_ticket_panel::test_thread_ignores_non_comment_types` xanh trong lần cả app (lần xanh đầu tiên); vẫn ở `debt.md` cho tới lần thứ hai.
+
+**R-3 (migrate lên/xuống/lên):** **không làm được trong lượt này.** Script `r3_updown.sh` (xuống = `code_change_enabled=0` rồi `cmd.migrate` với mã `f039112`, theo design §6) chờ khóa từ 20:35:53; qa dừng nó lúc ~20:39 khi chưa lấy được khóa, trước bước nào ghi site (`v2/r3/` rỗng). Đọc mã Frappe: `remove_orphan_doctypes` chỉ xóa dòng DocType, không xóa bảng; `delete_controllers` không chạy khi `in_migrate`.
+
+**R-4:** gộp từ `acceptance-r4.md` (qa khác, chỉ đọc, trên `da00518`): 52 dòng assert bị xóa không trở lại nguyên văn đều có chỗ thay và căn cứ; 0 marker mới; 0 assert bị nới không căn cứ. Còn 2 phát hiện:
+- F-R4-1 (minor, STD-TEST-5): spec AC-25/AC-26 vẫn viết "chuyển về trang phiếu" và "chỉ nhận GET", còn mã và test theo ADR-023 QĐ1 (form + POST, ADR còn *proposed*). Chữ tiêu chí trái mã → cần `analyze --amend` AC-25/AC-26 và chốt ADR-023 (owner: analyst, architect).
+- F-R4-2 (minor, STD-TEST-2): `erp_ai/test_change_decision.py:213` so thông điệp với hằng `change_decision.BAD_LINK` của chính mã. Owner: dev, task nhỏ (đề xuất T70): viết tay câu kỳ vọng.
+
+**Kiểm chung trên da00518:** `cmd.lint` `pre-commit run --all-files` exit 0, 12 `Passed`, 0 `Failed`, không file mã nào bị sửa. Skip marker: theo `acceptance-r4.md` lệnh grep trên `develop...da00518` → 0 dòng. `cmd.typecheck`/`cmd.build`: profile không có slot.
+
 ## Checklist nghiệm thu (6)
 
-1. Mọi tiêu chí có lệnh + exit + đầu ra trên commit đã ghi: đạt (46 dòng = 35 AC + 11 NFR).
-2. Ca biên/lỗi ngoài đường thuận: đạt (stale, tamper, timeout, index lock, byte bound +1, bảng con có khóa).
-3. Test phủ khẳng định giá trị viết tay: đạt cho các test chính (phần 1–3); F-3 là test phụ thuộc thứ tự.
-4. `cmd.test`/`cmd.lint` xanh: KHÔNG ĐẠT — lint xanh; `cmd.test` không có lần `OK`, còn F-3, F-4 (thuộc FEAT-004) và F-5 (ngoài diff).
-5. Không skip marker, không assert bị nới: đạt một phần — 0 marker; R-4 chưa đối chiếu xong.
-6. DoD build + không đụng protected_paths: đạt (0 file khớp); As-Built/CHANGELOG: owner writer, sau G4.
+1. Mọi tiêu chí có lệnh + exit + đầu ra: đạt trên `ba89ab3` (46 dòng); trên `da00518` mã chỉ đổi T69 và lần cả app chạy toàn bộ test phủ.
+2. Ca biên/lỗi ngoài đường thuận: đạt.
+3. Test phủ khẳng định giá trị viết tay: đạt một phần — F-R4-2.
+4. `cmd.test`/`cmd.lint` xanh: KHÔNG ĐẠT — lint xanh; `cmd.test` `Ran 1499` `FAILED (failures=2, errors=12)`, 8 ca vẫn đỏ 1213 khi chạy lại; F-3 chưa có lần chạy riêng xanh.
+5. Không skip marker, không assert bị nới: đạt (R-4 đóng phần assert; F-R4-1 là chữ spec).
+6. DoD build + không đụng protected_paths: đạt; migration up/down/up (STD-OPS-2, R-3): CHƯA LÀM. As-Built/CHANGELOG: owner writer, sau G4.
 
 ## Phán quyết
 
-`rework`: tiêu chí AC/NFR đạt trên `ba89ab3`, nhưng checklist mục 4 không đạt.
-- F-3 — tái hiện: `flock -w 1800 .team/miyano-site.lock env PYTHONPATH=<worktree> bench --site miyano run-tests --module erp_ai.gateway.test_gateway --test test_api_key_never_leaks` → `FAILED (failures=1)`; task mới T65 (dev).
-- F-4 — tái hiện: `cmd.test` cả app → `test_erp_ai_log::test_no_role_can_write_or_delete` failure; task mới T66 (dev).
-- Sau đó: một lần `cmd.test` độc quyền trên site rồi `/team:verify FEAT-004`.
+`rework`: checklist mục 3, 4, 6 chưa đạt.
+- F-R4-2 — tái hiện: đọc `erp_ai/test_change_decision.py:213` (kỳ vọng = `change_decision.BAD_LINK`); task mới T70 (dev).
+- F-R4-1 — sửa chữ AC-25/AC-26 theo ADR-023 QĐ1 (`/team:analyze FEAT-004 --amend`), chốt ADR-023; owner analyst/architect.
+- F-3 và `cmd.test` — tái hiện: `flock -w 1800 .team/miyano-site.lock env PYTHONPATH=<worktree> bench --site miyano run-tests --module erp_ai.gateway.test_gateway --test test_api_key_never_leaks` và `cmd.test` cả app; hiện BLOCKED vì phiên khác chạy `run-tests` ngoài khóa. Owner: team-leader (giữ site độc quyền), rồi qa chạy lại.
+- R-3 — `r3_updown.sh` trong một lần giữ khóa; owner qa, khi site rảnh.
 
 Verdict: rework

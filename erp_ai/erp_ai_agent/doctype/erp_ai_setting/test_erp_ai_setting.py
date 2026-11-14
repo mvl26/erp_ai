@@ -968,3 +968,144 @@ class TestCatalogRules(FrappeTestCase):
 			self._save_rule("Đổi trường", "Custom Role"),
 			"Danh mục dòng 1: DocType Custom Role bị cấm cứng: DocType phân quyền",
 		)
+
+	def _save_rows(self, *rows, ignore_links=False):
+		"""Save the setting with exactly these catalog rows; return the error text, or None when it saved."""
+		doc = frappe.get_doc(SETTING_DOCTYPE)
+		doc.set("catalog_rules", [])
+		for row in rows:
+			doc.append("catalog_rules", {"categories": "A", "mode": constants.MODE_NEEDS_APPROVAL, **row})
+		doc.flags.ignore_links = ignore_links
+		try:
+			doc.save()
+		except frappe.ValidationError as error:
+			return frappe.utils.strip_html(str(error))
+		return None
+
+	def _stored_rows(self):
+		return [
+			(row.action, row.target_doctype, row.fields, row.categories)
+			for row in frappe.get_doc(SETTING_DOCTYPE).catalog_rules
+		]
+
+	def test_row_shape_rules(self):
+		# AC-29, E-4 (design.md:214-221, 300-305): each case differs from a valid row in one rule only;
+		# a valid row stands first so the bad row is row 2 and {idx} is pinned.
+		first = {"action": constants.ACTION_ADD_HOLIDAY}
+		update_note = {"action": constants.ACTION_UPDATE_FIELDS, "target_doctype": "Note", "fields": "title"}
+		custom_field_note = {"action": constants.ACTION_CREATE_CUSTOM_FIELD, "target_doctype": "Note"}
+		fixed_actions = (
+			constants.ACTION_CREATE_USER,
+			constants.ACTION_ADD_TEAM_MEMBER,
+			constants.ACTION_ADD_HOLIDAY,
+			constants.ACTION_SET_ITEM_GROUP,
+		)
+		cases = []
+		for action in fixed_actions:
+			cases += [
+				(action, {"action": action, "target_doctype": "Note"}, "hành động này không nhận DocType"),
+				(action, {"action": action, "fields": "title"}, "hành động này không nhận danh sách trường"),
+			]
+		cases += [
+			(
+				"custom field, no DocType",
+				{**custom_field_note, "target_doctype": None},
+				"hành động này cần DocType",
+			),
+			(
+				"custom field, fields",
+				{**custom_field_note, "fields": "title"},
+				"hành động này không nhận danh sách trường",
+			),
+			("update, no DocType", {**update_note, "target_doctype": None}, "hành động này cần DocType"),
+			("update, no fields", {**update_note, "fields": None}, "cần ít nhất một trường"),
+			("update, blank lines", {**update_note, "fields": "\n  \n"}, "cần ít nhất một trường"),
+			(
+				"update, unknown field",
+				{**update_note, "fields": "title\nkhong_co_truong"},
+				"trường khong_co_truong không có trên Note",
+			),
+		]
+		category_error = "đầu mục phải là các chữ A\u2013F cách nhau bằng dấu phẩy"  # en dash, as in E-4
+		for categories in ("G", "A,G", "a", "AB", "A,,B", "A,", "A;B"):
+			cases.append(
+				(f"categories {categories!r}", {**update_note, "categories": categories}, category_error)
+			)
+		stored_before = self._stored_rows()
+		for label, row, reason in cases:
+			with self.subTest(label):
+				self.assertEqual(self._save_rows(first, row), f"Danh mục dòng 2: {reason}")
+		# Duplicate: same action + target_doctype; the later row names the earlier one.
+		self.assertEqual(
+			self._save_rows(first, update_note, {**update_note, "fields": "content", "categories": "B"}),
+			"Danh mục dòng 3: trùng với dòng 2",
+		)
+		self.assertEqual(
+			self._save_rows(first, {"action": constants.ACTION_ADD_HOLIDAY, "categories": "C"}),
+			"Danh mục dòng 2: trùng với dòng 1",
+		)
+		self.assertEqual(self._stored_rows(), stored_before)
+
+	def test_unknown_action_and_case_variant_doctype(self):
+		# T10 review: a row without a DocType still has its action checked; a DocType typed in another
+		# letter case is the same DocType for the ban sets and is stored under its real name.
+		self.assertEqual(
+			self._save_rows({"action": constants.ACTION_ADD_HOLIDAY}, {"action": "Xóa bản ghi"}),
+			"Danh mục dòng 2: hành động không hợp lệ",
+		)
+		self.assertEqual(
+			self._save_rows(
+				{"action": constants.ACTION_ADD_HOLIDAY},
+				{"action": constants.ACTION_UPDATE_FIELDS, "target_doctype": "erp ai log", "fields": "title"},
+				ignore_links=True,
+			),
+			"Danh mục dòng 2: DocType ERP AI Log bị cấm cứng: "
+			"DocType bị cấm với bot (dữ liệu của app, tài khoản hoặc dữ liệu nhạy cảm)",
+		)
+		self.assertIsNone(
+			self._save_rows(
+				{"action": constants.ACTION_UPDATE_FIELDS, "target_doctype": "note", "fields": "title"},
+				ignore_links=True,
+			)
+		)
+		self.assertEqual(self._stored_rows(), [(constants.ACTION_UPDATE_FIELDS, "Note", "title", "A")])
+		self.assertEqual(
+			self._save_rows(
+				{"action": constants.ACTION_UPDATE_FIELDS, "target_doctype": "Note", "fields": "title"},
+				{"action": constants.ACTION_UPDATE_FIELDS, "target_doctype": "NOTE", "fields": "content"},
+				ignore_links=True,
+			),
+			"Danh mục dòng 2: trùng với dòng 1",
+		)
+
+	def test_valid_rule_saves_and_categories_normalized(self):
+		# AC-29: one valid row per action saves; categories become "A,B" (no duplicates, sorted, no spaces).
+		rows = (
+			{"action": constants.ACTION_CREATE_USER, "categories": "C,A"},
+			{"action": constants.ACTION_ADD_TEAM_MEMBER, "categories": "B,B"},
+			{"action": constants.ACTION_ADD_HOLIDAY, "categories": "A, B"},
+			{"action": constants.ACTION_SET_ITEM_GROUP, "categories": " F ,E,F,D "},
+			{
+				"action": constants.ACTION_CREATE_CUSTOM_FIELD,
+				"target_doctype": "Note",
+				"categories": "A,B,C,D,E,F",
+			},
+			{"action": constants.ACTION_UPDATE_FIELDS, "target_doctype": "Note", "fields": "title\ncontent"},
+			# Same DocType, other action; same action, other DocType: not duplicates.
+			{"action": constants.ACTION_CREATE_CUSTOM_FIELD, "target_doctype": "ToDo"},
+			{"action": constants.ACTION_UPDATE_FIELDS, "target_doctype": "ToDo", "fields": "description"},
+		)
+		self.assertIsNone(self._save_rows(*rows))
+		self.assertEqual(
+			self._stored_rows(),
+			[
+				(constants.ACTION_CREATE_USER, None, None, "A,C"),
+				(constants.ACTION_ADD_TEAM_MEMBER, None, None, "B"),
+				(constants.ACTION_ADD_HOLIDAY, None, None, "A,B"),
+				(constants.ACTION_SET_ITEM_GROUP, None, None, "D,E,F"),
+				(constants.ACTION_CREATE_CUSTOM_FIELD, "Note", None, "A,B,C,D,E,F"),
+				(constants.ACTION_UPDATE_FIELDS, "Note", "title\ncontent", "A"),
+				(constants.ACTION_CREATE_CUSTOM_FIELD, "ToDo", None, "A"),
+				(constants.ACTION_UPDATE_FIELDS, "ToDo", "description", "A"),
+			],
+		)

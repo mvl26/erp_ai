@@ -36,7 +36,11 @@ STATE_FIELDS = (
 	"exit_code",
 	"duration_ms",
 	"command_output",
+	"command_results",
 	"failure_reason",
+	"created_dirs",
+	"restart_status",
+	"restart_sent_at",
 	"applied_branch",
 	"applied_ahead_count",
 	"apply_commit_sha",
@@ -69,8 +73,17 @@ OPERATION_DIGEST_FIELDS = (
 	"content_after",
 	"after_hash",
 )
-# The state fields a job may pass to `finish(fields=)` (design 3.5, round 1).
-GIT_RESULT_FIELDS = ("applied_branch", "applied_ahead_count", "apply_commit_sha", "undo_commit_sha")
+# The state fields a job may pass to `finish(fields=)` and `record_commit(fields=)` (design 3.5, round 1;
+# CHG-002 design 3.6). `created_dirs` is given as a list and stored as JSON.
+GIT_RESULT_FIELDS = (
+	"applied_branch",
+	"applied_ahead_count",
+	"apply_commit_sha",
+	"undo_commit_sha",
+	"created_dirs",
+)
+# CHG-002 design 3.6: the states `record_commit` writes in (a job between its commit and its end).
+RECORD_COMMIT_STATES = (CHANGE_STATUS_APPLYING, CHANGE_STATUS_UNDOING)
 # Design 2.2: the edges a job ends with, each with the one log step it writes.
 FINISH_EDGES = {
 	(CHANGE_STATUS_APPROVED, CHANGE_STATUS_FAILED): "fail",
@@ -239,6 +252,42 @@ def begin_apply(name) -> bool:
 	return True
 
 
+def _git_values(fields) -> dict:
+	"""The column values of the git `fields`; `created_dirs` (a list) becomes JSON.
+
+	Raises:
+		ValueError: `fields` is not a dict of `GIT_RESULT_FIELDS` keys, or `created_dirs` is not a list.
+	"""
+	fields = {} if fields is None else fields
+	if not isinstance(fields, dict) or not set(fields) <= set(GIT_RESULT_FIELDS):
+		raise ValueError(f"fields must be a dict of {GIT_RESULT_FIELDS}, got {fields!r}")
+	values = dict(fields)
+	if "created_dirs" in values:
+		if not isinstance(values["created_dirs"], list):
+			raise ValueError(f"created_dirs must be a list, got {values['created_dirs']!r}")
+		values["created_dirs"] = json.dumps(values["created_dirs"], ensure_ascii=False)
+	return values
+
+
+def record_commit(name, expected, *, fields) -> bool:
+	"""Write the git `fields` of a job's commit while it is still `expected`; status and log stay as they are.
+
+	`expected` is `Đang áp dụng` or `Đang hoàn tác` (CHG-002 design 3.6). Returns `False` and writes
+	nothing when the proposal is no longer `expected`.
+
+	Raises:
+		ValueError: `expected` is not a running state; `fields` as `_git_values`; see `_lock`.
+		frappe.DoesNotExistError: see `_lock`.
+	"""
+	if expected not in RECORD_COMMIT_STATES:
+		raise ValueError(f"record_commit runs in {RECORD_COMMIT_STATES}, got {expected!r}")
+	values = _git_values(fields)
+	if _lock(name).change_status != expected:
+		return False
+	frappe.db.set_value(PROPOSAL_DOCTYPE, name, values, update_modified=True)
+	return True
+
+
 def finish(
 	name,
 	expected,
@@ -251,17 +300,18 @@ def finish(
 	fields=None,
 	before=None,
 	after=None,
+	command_results=None,
 ) -> bool:
 	"""End a job: `expected → new_status` (an edge of `FINISH_EDGES` with its `step`) and one log row.
 
-	Writes `finished_at`, `failure_reason = reason`, the git `fields` and, with a `CommandResult`
-	`result`, `exit_code`/`duration_ms`/`command_output` (also the row's `value_after`). `before` and
-	`after` go to the row's `value_before`/`value_after` (design 4.3 step 3.7, 4.4 step 7).
-	Returns `False` and writes nothing when the proposal is no longer `expected`.
+	Writes `finished_at`, `failure_reason = reason`, the git `fields`, `command_results` (a list, stored
+	as JSON) and, with a `CommandResult` `result`, `exit_code`/`duration_ms`/`command_output` (also the
+	row's `value_after`). `before` and `after` go to the row's `value_before`/`value_after` (design 4.3
+	step 3.7, 4.4 step 7). Returns `False` and writes nothing when the proposal is no longer `expected`.
 
 	Raises:
-		ValueError: not an edge of `FINISH_EDGES` or `step` not its step; `fields` not a dict of
-			`GIT_RESULT_FIELDS` keys; `result` not a `CommandResult`, or given with `after`; `actor`
+		ValueError: not an edge of `FINISH_EDGES` or `step` not its step; `fields` as `_git_values`;
+			`command_results` not a list; `result` not a `CommandResult`, or given with `after`; `actor`
 			not a non-empty string; see `_lock`.
 		frappe.DoesNotExistError: see `_lock`.
 	"""
@@ -270,9 +320,11 @@ def finish(
 		raise ValueError(f"{expected!r} → {new_status!r} is not a job edge")
 	if step != edge_step:
 		raise ValueError(f"{expected!r} → {new_status!r} logs step {edge_step!r}, got {step!r}")
-	fields = {} if fields is None else fields
-	if not isinstance(fields, dict) or not set(fields) <= set(GIT_RESULT_FIELDS):
-		raise ValueError(f"fields must be a dict of {GIT_RESULT_FIELDS}, got {fields!r}")
+	fields = _git_values(fields)
+	if command_results is not None:
+		if not isinstance(command_results, list):
+			raise ValueError(f"command_results must be a list, got {command_results!r}")
+		fields["command_results"] = json.dumps(command_results, ensure_ascii=False)
 	if result is not None:
 		if not isinstance(result, CommandResult):
 			raise ValueError(f"result must be a CommandResult, got {result!r}")

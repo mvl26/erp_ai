@@ -1,4 +1,5 @@
 import hashlib
+import inspect
 import json
 from datetime import datetime
 from unittest.mock import Mock, patch
@@ -37,7 +38,7 @@ from erp_ai.constants import (
 )
 from erp_ai.test_utils import make_change_proposal
 
-# Design 2.1 state group, written out by hand (11 fields + 4 git fields of round 1).
+# Design 2.1 state group, written out by hand (11 fields + 4 CHG-002 fields + 4 git fields of round 1).
 STATE_FIELDS_EXPECTED = (
 	"change_status",
 	"decided_by",
@@ -49,7 +50,11 @@ STATE_FIELDS_EXPECTED = (
 	"exit_code",
 	"duration_ms",
 	"command_output",
+	"command_results",
 	"failure_reason",
+	"created_dirs",
+	"restart_status",
+	"restart_sent_at",
 	"applied_branch",
 	"applied_ahead_count",
 	"apply_commit_sha",
@@ -783,6 +788,179 @@ class TestFinish(TransitionTestCase):
 					)
 				self.assertNothingChanged(proposal.name, state, modified)
 
+	def test_command_results_stored(self):
+		results = [
+			{
+				"args": ["migrate"],
+				"exit_code": 0,
+				"duration_ms": 1200,
+				"timed_out": False,
+				"output": "xong\n",
+			},
+			{"args": ["clear-cache"], "exit_code": None, "duration_ms": 0, "timed_out": True, "output": ""},
+		]
+		proposal = _proposal_in(CHANGE_STATUS_APPLYING)
+		before = _state(proposal.name)
+		self.assertIs(
+			transitions.finish(
+				proposal.name,
+				CHANGE_STATUS_APPLYING,
+				CHANGE_STATUS_APPLIED,
+				step="apply",
+				actor=ACTOR,
+				command_results=results,
+			),
+			True,
+		)
+		state = _state(proposal.name)
+		self.assertEqual(json.loads(state.command_results), results)
+		self.assertEqual(
+			state,
+			{
+				**before,
+				"change_status": "Đã áp dụng",
+				"finished_at": NOW,
+				"command_results": state.command_results,
+			},
+		)
+		self.assertEqual([row.change_step for row in _rows(proposal.name)], ["apply"])
+		# Without `command_results` the field stays empty.
+		other = _proposal_in(CHANGE_STATUS_APPLYING)
+		transitions.finish(
+			other.name, CHANGE_STATUS_APPLYING, CHANGE_STATUS_APPLIED, step="apply", actor=ACTOR
+		)
+		self.assertIsNone(_state(other.name).command_results)
+
+	def test_command_results_refused_when_not_a_list(self):
+		proposal = _proposal_in(CHANGE_STATUS_APPLYING)
+		state, modified = _state(proposal.name), _modified(proposal.name)
+		with self.assertRaises(ValueError):
+			transitions.finish(
+				proposal.name,
+				CHANGE_STATUS_APPLYING,
+				CHANGE_STATUS_APPLIED,
+				step="apply",
+				actor=ACTOR,
+				command_results='[{"args": ["migrate"]}]',
+			)
+		self.assertNothingChanged(proposal.name, state, modified)
+
+	def test_command_results_is_keyword_only(self):
+		parameters = inspect.signature(transitions.finish).parameters
+		self.assertEqual(
+			[name for name, p in parameters.items() if p.kind is inspect.Parameter.POSITIONAL_OR_KEYWORD],
+			["name", "expected", "new_status"],
+		)
+		self.assertIs(parameters["command_results"].kind, inspect.Parameter.KEYWORD_ONLY)
+		self.assertIsNone(parameters["command_results"].default)
+		results = [{"args": ["migrate"], "exit_code": 0, "duration_ms": 5, "timed_out": False, "output": ""}]
+		proposal = _proposal_in(CHANGE_STATUS_APPLYING)
+		state, modified = _state(proposal.name), _modified(proposal.name)
+		with self.assertRaises(TypeError):
+			transitions.finish(
+				proposal.name,
+				CHANGE_STATUS_APPLYING,
+				CHANGE_STATUS_APPLIED,
+				results,
+				step="apply",
+				actor=ACTOR,
+			)
+		self.assertNothingChanged(proposal.name, state, modified)
+		transitions.finish(
+			proposal.name,
+			CHANGE_STATUS_APPLYING,
+			CHANGE_STATUS_APPLIED,
+			step="apply",
+			actor=ACTOR,
+			command_results=results,
+		)
+		self.assertEqual(json.loads(_state(proposal.name).command_results), results)
+
+
+class TestPrepareNew(FrappeTestCase):
+	def test_new_state_fields_cleared(self):
+		new_values = {
+			"command_results": '[{"args": ["migrate"], "exit_code": 0}]',
+			"created_dirs": '["erp_ai/erp_ai/moi"]',
+			"restart_status": "Đã gửi",
+			"restart_sent_at": "2026-11-13 12:00:00",
+		}
+		for fieldname in new_values:
+			self.assertIn(fieldname, transitions.STATE_FIELDS)
+		doc = frappe.get_doc({"doctype": PROPOSAL_DOCTYPE, **STATE_VALUES, **new_values})
+		transitions.prepare_new(doc)
+		self.assertEqual(doc.change_status, "Chờ duyệt")
+		for fieldname in new_values:
+			with self.subTest(fieldname=fieldname):
+				self.assertIsNone(doc.get(fieldname))
+
+
+class TestRecordCommit(TransitionTestCase):
+	def test_git_result_fields_add_created_dirs(self):
+		self.assertEqual(transitions.GIT_RESULT_FIELDS, (*GIT_FIELDS_EXPECTED, "created_dirs"))
+
+	def test_writes_git_fields_keeps_status_no_log_row(self):
+		cases = {
+			CHANGE_STATUS_APPLYING: {
+				"apply_commit_sha": "c" * 40,
+				"applied_branch": "main",
+				"applied_ahead_count": 1,
+				"created_dirs": ["erp_ai/erp_ai/moi", "erp_ai/erp_ai/moi/con"],
+			},
+			CHANGE_STATUS_UNDOING: {"undo_commit_sha": "e" * 40},
+		}
+		for status, fields in cases.items():
+			with self.subTest(status=status):
+				proposal = _proposal_in(status)
+				before = _state(proposal.name)
+				self.assertIs(transitions.record_commit(proposal.name, status, fields=fields), True)
+				state = _state(proposal.name)
+				stored = {**fields}
+				if "created_dirs" in fields:
+					self.assertEqual(json.loads(state.created_dirs), fields["created_dirs"])
+					stored["created_dirs"] = state.created_dirs
+				self.assertEqual(state, {**before, **stored})
+				self.assertEqual(state.change_status, status)
+				self.assertEqual(_rows(proposal.name), [])
+
+	def test_wrong_status_returns_false(self):
+		for expected in (CHANGE_STATUS_APPLYING, CHANGE_STATUS_UNDOING):
+			for current in (s for s in ALL_STATUSES if s != expected):
+				with self.subTest(expected=expected, current=current):
+					proposal = _proposal_in(current)
+					state, modified = _state(proposal.name), _modified(proposal.name)
+					self.assertIs(
+						transitions.record_commit(
+							proposal.name, expected, fields={"apply_commit_sha": "c" * 40}
+						),
+						False,
+					)
+					self.assertNothingChanged(proposal.name, state, modified)
+
+	def test_refuses_expected_outside_running_states_and_bad_fields(self):
+		cases = [
+			(status, {"apply_commit_sha": "c" * 40})
+			for status in ALL_STATUSES
+			if status not in (CHANGE_STATUS_APPLYING, CHANGE_STATUS_UNDOING)
+		]
+		cases += [
+			(CHANGE_STATUS_APPLYING, {"change_status": CHANGE_STATUS_APPLIED}),
+			(CHANGE_STATUS_APPLYING, {"command_results": "[]"}),
+			(CHANGE_STATUS_APPLYING, {"created_dirs": "erp_ai/erp_ai/moi"}),
+			(CHANGE_STATUS_APPLYING, [("apply_commit_sha", "c" * 40)]),
+		]
+		for expected, fields in cases:
+			with self.subTest(expected=expected, fields=fields):
+				proposal = _proposal_in(expected)
+				state, modified = _state(proposal.name), _modified(proposal.name)
+				with self.assertRaises(ValueError):
+					transitions.record_commit(proposal.name, expected, fields=fields)
+				self.assertNothingChanged(proposal.name, state, modified)
+
+	def test_fields_is_keyword_only(self):
+		with self.assertRaises(TypeError):
+			transitions.record_commit("x", CHANGE_STATUS_APPLYING, {"apply_commit_sha": "c" * 40})
+
 
 class TestTransitionInput(TransitionTestCase):
 	def _calls(self, name, person=ACTOR):
@@ -845,6 +1023,13 @@ class TestLockBeforeWrite(TransitionTestCase):
 				CHANGE_STATUS_APPLYING,
 				lambda name: transitions.finish(
 					name, CHANGE_STATUS_APPLYING, CHANGE_STATUS_APPLIED, step="apply", actor=ACTOR
+				),
+			),
+			(
+				"record_commit",
+				CHANGE_STATUS_UNDOING,
+				lambda name: transitions.record_commit(
+					name, CHANGE_STATUS_UNDOING, fields={"undo_commit_sha": "e" * 40}
 				),
 			),
 		)

@@ -9,7 +9,7 @@ MASK = "[đã che]"
 SECRET_WORDS = ("api_key", "api_secret", "token", "secret", "password", "passwd", "pwd", "mật khẩu")
 
 _KEY_VALUE = re.compile(
-	r"(?P<key>[\w-]*(?:" + "|".join(re.escape(word) for word in SECRET_WORDS) + r")[\w-]*"
+	r"(?P<key>(?<![\w-])[\w-]*(?:" + "|".join(re.escape(word) for word in SECRET_WORDS) + r")[\w-]*"
 	r"[\"']?\s*[:=]\s*)"
 	r"(?:\"(?P<double>[^\"]*)\"|'(?P<single>[^']*)'|(?P<bare>[^\s,;&\"'}\]]+))",
 	re.IGNORECASE,
@@ -41,9 +41,8 @@ def redact_secrets(text: str | None) -> str:
 	"""Replace each secret value matched by `SECRET_PATTERNS` with "[đã che]", keeping key names and prefixes."""
 	if not text:
 		return ""
-	text = _KEY_VALUE.sub(_mask_key_value, text)
-	for pattern in SECRET_PATTERNS[1:]:
-		text = pattern.sub(_mask_keep_prefix, text)
+	for pattern in SECRET_PATTERNS:
+		text = pattern.sub(_mask_key_value if pattern is _KEY_VALUE else _mask_keep_prefix, text)
 	return text
 
 

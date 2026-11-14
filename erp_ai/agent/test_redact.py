@@ -1,3 +1,5 @@
+import time
+
 from frappe.tests.utils import FrappeTestCase
 
 from erp_ai.agent import redact
@@ -17,7 +19,9 @@ class TestRedact(FrappeTestCase):
 	def test_each_pattern(self):
 		cases = (
 			("khóa sk-ant-FAKE0000000000000000 hết hạn", "khóa [đã che] hết hạn"),
+			("khóa sk-ant-abc hết hạn", "khóa [đã che] hết hạn"),
 			("khóa sk-FAKE000000000000000000 hết hạn", "khóa [đã che] hết hạn"),
+			("khóa sk-FAKE000000000000 hết hạn", "khóa [đã che] hết hạn"),
 			("Authorization: Bearer FAKEtoken00000000", "Authorization: Bearer [đã che]"),
 			(
 				f"Authorization: token {FAKE_FRAPPE_KEY}:{FAKE_FRAPPE_SECRET}",
@@ -41,6 +45,18 @@ class TestRedact(FrappeTestCase):
 
 	def test_short_sk_prefix_untouched(self):
 		self.assertEqual(redact.redact_secrets("mã sk-12345 của kho"), "mã sk-12345 của kho")
+		self.assertEqual(
+			redact.redact_secrets("mã sk-FAKE00000000000 của kho"), "mã sk-FAKE00000000000 của kho"
+		)
+
+	def test_long_run_without_secret_untouched(self):
+		# Generous bound: the anchored scan takes milliseconds here; the unanchored regex took
+		# about a minute for 50,000 characters, so 10 seconds only fails on quadratic scanning.
+		for text in ("a" * 100_000, "Q2hhb_-9" * 12_500, f"dữ liệu {'f0' * 50_000} hết"):
+			with self.subTest(length=len(text)):
+				started = time.monotonic()
+				self.assertEqual(redact.redact_secrets(text), text)
+				self.assertLess(time.monotonic() - started, 10)
 
 	def test_plain_text_untouched(self):
 		for text in (
@@ -89,4 +105,3 @@ class TestRedact(FrappeTestCase):
 			with self.subTest(word=word):
 				self.assertTrue(redact.is_secret_key(word))
 				self.assertEqual(redact.redact_secrets(f"{word}=fake-value"), f"{word}={MASK}")
-		self.assertTrue(redact.SECRET_PATTERNS)

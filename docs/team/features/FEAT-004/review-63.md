@@ -8,8 +8,9 @@ Approved-by:
 # Review 63 — FEAT-004 T63
 
 - Diff: `git diff 7c2a3af..team/FEAT-004-task-63` (head `0009fde`, 1 commit; 4 file, +228/-46). Lệnh đã chạy: `git log --oneline 7c2a3af..team/FEAT-004-task-63`, `git diff --stat 7c2a3af..team/FEAT-004-task-63`, `git diff 7c2a3af..team/FEAT-004-task-63`, `git show 7c2a3af:erp_ai/agent/tools/{registry,read,source,write_ticket,propose_change,site_api}.py`, `git grep` tên cũ/hàm cấp trên `team/FEAT-004-task-63`, `git show team/FEAT-004-task-63:erp_ai/agent/{prompts.py,test_agent_runner.py,tools/test_site_api.py}`, `git show team/FEAT-004:docs/team/...` (tasks.md, ADR-023, ADR-011, plan.md, spec.md, review-chg001.md)
-- Vòng: 1 (max_rework=3)
-- Verdict: request-changes
+- Diff vòng 2: `git diff 0009fde..team/FEAT-004-task-63` (head `04df39c`, 1 commit; 1 file, +4/-1).
+- Vòng: 2 (max_rework=3)
+- Verdict: approve (vòng 1: request-changes)
 
 ## Vòng 1 — request-changes
 Lớp 1: khớp T63 Returns, ADR-023 QĐ 4 + Ràng buộc, ADR-011 QĐ 2, 3, 6. `registry.py` còn đúng một hàm cấp `_granted_specs(level, has_instructor, change_enabled, unrestricted)` và một `GRANT_TABLE` 6 dòng; `site_admin` = (code ∧ L3 ∧ người ra lệnh) ∨ `_unrestricted_grant`, `site_unrestricted` = `_unrestricted_grant` (toàn quyền ∧ mức ≠ L0 ∧ người ra lệnh); `_unrestricted_specs`, `get_unrestricted_tool_schemas`, `UNRESTRICTED_GROUPS` đã bỏ; `execute_tool` gọi một lần `_granted_specs` (`registry.py:187-189`); runner gọi `get_tool_schemas(*grant)` đúng một chỗ, ba cờ khối prompt lấy từ `grants_*` (`runner.py:585-594`). Không phần thừa, chỉ chạm 4 file touchpoints.
@@ -49,3 +50,22 @@ minor | — | — | 3 điểm nhỏ: (1) STD-DESIGN-5 `registry.py:90-133` thêm
 
 ## deferred
 - (không có)
+
+## Vòng 2 — approve
+Lệnh đã chạy: `git log --oneline 0009fde..team/FEAT-004-task-63`, `git diff --stat 0009fde..team/FEAT-004-task-63`, `git diff 0009fde..team/FEAT-004-task-63`, `git show team/FEAT-004-task-63:erp_ai/agent/tools/{test_site_api,site_api}.py`, `git grep -nE "get_unrestricted_tool_schemas|_unrestricted_specs|UNRESTRICTED_GROUPS" team/FEAT-004-task-63 -- '*.py'`.
+
+Diff: 1 commit `04df39c test(registry): read the record tools through get_tool_schemas in TestUnrestrictedGrant (FEAT-004)`, chỉ `erp_ai/agent/tools/test_site_api.py` (+4/-1) — đúng file tech-lead mở làm touchpoint của T63, chỉ trong helper `names`.
+
+Phát hiện vòng 1:
+- major | STD-GIT-2 | `erp_ai/agent/tools/test_site_api.py:308-311` — **ADDRESSED** (`test_site_api.py:307-314`). `names` nay gọi `get_tool_schemas(level, has_instructor, False, unrestricted)` (đã import ở `:7`) rồi lọc theo tên trong `site_api.TOOLS` (`:309`, 4 tool `GROUP` + 3 tool `UNRESTRICTED_GROUP`, `site_api.py:311-419`). `change_enabled=False` tắt nhánh code ∧ L3 nên mọi tool bản ghi còn lại chỉ đến từ `_unrestricted_grant` — đúng phạm vi hàm cũ đã bỏ. Kỳ vọng giữ nguyên, viết cứng (`TOOL_NAMES + UNRESTRICTED_TOOL_NAMES` ở L1–L3; `[]` ở `("L3", True, False)`, `("L3", False, True)`, L0, LX), và vẫn ghim thứ tự. Test vẫn đỏ khi bỏ vế `has_instructor` hoặc vế mức ≠ L0 của `_unrestricted_grant`, hoặc bỏ `or _unrestricted_grant` ở `site_admin` (mất 4 tool đầu). `git grep` ba tên đã bỏ trên đầu nhánh: chỉ còn `test_agent_runner.py:1451` (`assertFalse(hasattr…)`), `test_registry.py:624` (chú thích), `:714` (vòng lặp kiểm vắng mặt) — khớp lời dev.
+
+Review checklist (10) — chỉ trên diff sửa: 1 đạt (đúng việc vòng 1 yêu cầu, không thừa); 2 đạt (file touchpoint được mở, không file mới); 3 đạt — RED của dev là `AttributeError … get_unrestricted_tool_schemas` (`Ran 38 tests`, `FAILED (errors=1)`), GREEN `test_site_api` `Ran 38 tests … OK`, `test_registry` `Ran 41 tests … OK`; không skip/xfail; 4 đạt (kỳ vọng không đổi, chỉ đổi nguồn đọc); 5 không áp dụng (chỉ test); 6 đạt (không bí mật, không `protected_paths`); 7 đạt — không còn lời gọi đến API đã bỏ; 8 đạt (chú thích `:308` nói đúng việc lọc, không mã chết); 9 đạt (không phụ thuộc mới); 10 đạt (`test(registry): … (FEAT-004)`, nhánh `team/FEAT-004-task-63`, không dòng ghi công AI).
+
+Không phát hiện blocker/major mới.
+
+Không kiểm được từ diff (tech-lead xử lý):
+- Commit `0009fde` riêng lẻ vẫn làm đỏ `test_site_api` (STD-GIT-2 theo từng commit): khi gộp T63 vào `team/FEAT-004`, gộp hai commit cùng lúc (squash thành một commit task, STD-GIT-1) để không có commit đỏ trên nhánh feature.
+- Reviewer không chạy test (site chung, đang có merge check); gợi ý: `cmd.test_one` cho `erp_ai/agent/tools/test_site_api.py` sau khi gộp.
+- Vẫn còn mục `test_agent_runner` chưa xanh trọn một lần từ vòng 1.
+
+deferred vòng 2: (không có)

@@ -8,8 +8,8 @@ Approved-by:
 # Review 54 — FEAT-004 T54
 
 - Diff: `team/FEAT-004-task-54` (head 95493ec), dải `7c2a3af..team/FEAT-004-task-54`, 2 commit, 4 file
-- Vòng: 1
-- Verdict: request-changes
+- Vòng: 2
+- Verdict: approve (vòng 2; vòng 1: request-changes)
 
 Lệnh đã dùng (chỉ đọc):
 ```
@@ -64,3 +64,41 @@ minor | — | — | 3 điểm nhỏ: docstring `decide` (`change_decision.py:21-
 - Không có (vòng 1).
 
 Test không chạy (site dùng chung). Gợi ý: `cd ../.. && bench --site miyano run-tests --module erp_ai.test_change_decision`, rồi `--module erp_ai.erp_ai_agent.doctype.erp_ai_change_proposal.test_erp_ai_change_proposal`.
+
+## Vòng 2
+
+- Dải sửa: `95493ec..team/FEAT-004-task-54` (head 50b3432), 1 commit, 1 file (+13)
+- Verdict: approve
+
+Lệnh đã dùng (chỉ đọc):
+```
+git log --oneline 95493ec..team/FEAT-004-task-54
+git diff --stat 95493ec..team/FEAT-004-task-54
+git diff 95493ec..team/FEAT-004-task-54
+git log --format='%an%n%B' 95493ec..team/FEAT-004-task-54
+git show team/FEAT-004-task-54:erp_ai/test_change_decision.py | grep -nE 'add_roles|get_roles|addCleanup|…'  (rồi đọc dòng 80-92, 244-275)
+```
+Nguồn Frappe 15 đã đọc: `frappe/__init__.py:989-1002` (`clear_cache(user=…)` → `clear_user_cache`), `frappe/cache_manager.py:49-52` (`user_cache_keys` có `roles`).
+
+### Phát hiện cũ
+| Phát hiện | Trạng thái | Bằng chứng |
+|---|---|---|
+| major STD-TEST-6 `test_change_decision.py:237` (cache `roles` của tài khoản agent rò sau rollback) | ADDRESSED | `erp_ai/test_change_decision.py:75-78`: `addCleanup(frappe.clear_cache, user=…)` cho `AGENT_USER` và `INSTRUCTOR` đăng ký trước `frappe.db.rollback`, nên theo LIFO chạy sau rollback; `clear_cache(user=)` → `clear_user_cache` → `hdel("roles", user)`. Mọi `add_roles` của lớp (`:85` INSTRUCTOR, `:250` AGENT_USER) đều thuộc hai tài khoản này. `:64-72` `tearDownClass` chốt: cache còn lại phải khớp `Has Role` trên site. RED trong gói (`stale roles cache for decision.instructor@example.com … site grants role: False`, `FAILED (errors=1)`) cho thấy chốt đỏ khi bỏ cleanup; GREEN `Ran 8 tests … OK` |
+
+### Phát hiện mới (chỉ trong diff sửa)
+Không có blocker/major.
+
+### Review checklist (10), chỉ trên diff sửa
+1. Đúng việc, không thừa (STD-DESIGN-5, STD-TEST-2): đạt; chỉ cleanup + chốt.
+2. Touchpoint (STD-DESIGN-1, STD-STRUCT-1/2): đạt; chỉ `erp_ai/test_change_decision.py`, không file mới.
+3. Test đỏ trước, không skip (STD-TEST-1/8/4): đạt; RED rồi GREEN có trong gói, không dấu skip.
+4. Độc lập, lặp lại được (STD-TEST-5/6): đạt; cache role được xóa sau rollback. Chốt với AGENT_USER không đỏ được trên site này (site tự cấp role cho agent), nhưng cùng một vòng cleanup và vế INSTRUCTOR đã đỏ trong RED.
+5. Lỗi (STD-ERR-1/2/5): đạt; chốt ném `AssertionError` có ngữ cảnh, không nuốt lỗi.
+6. Bảo mật (STD-SEC-1/3/4/6): đạt; không bí mật, không đụng `protected_paths`.
+7. Hợp đồng (STD-DESIGN-3, STD-OPS-2): không đổi.
+8. Tên, style, mã chết (STD-NAME-1/2, STD-STYLE-4/5): đạt.
+9. Phụ thuộc mới (STD-DEP-1/3/5): không có.
+10. Commit, nhánh (STD-NAME-4/5, STD-GIT-1, STD-GIT-8): đạt; `test(change-decision): … (FEAT-004)`, không trailer AI, nhánh `team/FEAT-004-task-54`.
+
+### Deferred (ngoài phạm vi, không chặn)
+- `test_change_decision.py:270-271` `get_roles` của PLAIN/ASSIGNEE/TICKET_CREATOR (tạo trong test, bị rollback) vẫn để lại khóa trong hash `roles`; danh sách không có role Instructor nên không cấp quyền, chỉ là rác cache (minor, STD-TEST-6).

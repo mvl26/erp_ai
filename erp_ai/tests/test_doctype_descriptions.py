@@ -23,10 +23,12 @@ VIETNAMESE_ACCENTS = re.compile(
 DOCTYPE_CONFIG = {
 	"ERP AI Setting": {
 		"folder": "erp_ai_setting",
-		"field_count": 71,
+		"field_count": 72,
 		"phrases": {
 			"enabled": ("Tắt", "4 đơn giá", "từ khóa kích hoạt"),
 			"permission_level": ("L0", "L1", "L2", "L3", "ngân sách"),
+			# FEAT-007 design.md:182: the AC-16 watermark of section_activation.
+			"agent_enabled_at": ("Hệ thống tự ghi", "không sửa được"),
 			"unrestricted_enabled": (
 				"L1",
 				"người ra lệnh",
@@ -157,7 +159,12 @@ DOCTYPE_CONFIG = {
 			"budget_alert_sent_month": ("Hệ thống tự ghi", "không sửa được"),
 		},
 		"section_count": 13,
-		"read_only_fields": ("spent_this_month_usd", "daily_report_sent_on", "budget_alert_sent_month"),
+		"read_only_fields": (
+			"spent_this_month_usd",
+			"agent_enabled_at",
+			"daily_report_sent_on",
+			"budget_alert_sent_month",
+		),
 		"sections": (
 			("section_activation", "Bật và mức quyền", "enabled"),
 			("section_permissions", "Năm quyền mở rộng (mặc định tắt)", "unrestricted_enabled"),

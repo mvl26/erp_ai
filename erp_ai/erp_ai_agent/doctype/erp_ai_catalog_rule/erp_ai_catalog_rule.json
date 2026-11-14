@@ -1,0 +1,80 @@
+{
+ "actions": [],
+ "creation": "2026-11-14 10:00:00.000000",
+ "doctype": "DocType",
+ "editable_grid": 1,
+ "engine": "InnoDB",
+ "field_order": [
+  "section_action",
+  "action",
+  "target_doctype",
+  "fields",
+  "section_scope",
+  "categories",
+  "mode"
+ ],
+ "fields": [
+  {
+   "fieldname": "section_action",
+   "fieldtype": "Section Break",
+   "label": "Hành động và DocType đích"
+  },
+  {
+   "description": "Việc bot được làm trên ERP ngoài phiếu: một trong năm hành động có tên (Tạo tài khoản theo mẫu, Thêm người vào nhóm Helpdesk, Thêm ngày nghỉ, Đổi nhóm hàng, Tạo Custom Field) hoặc Đổi trường. Người chọn.",
+   "fieldname": "action",
+   "fieldtype": "Select",
+   "in_list_view": 1,
+   "label": "Hành động",
+   "options": "Tạo tài khoản theo mẫu\nThêm người vào nhóm Helpdesk\nThêm ngày nghỉ\nĐổi nhóm hàng\nTạo Custom Field\nĐổi trường",
+   "reqd": 1
+  },
+  {
+   "description": "DocType có trường được đổi (Đổi trường) hoặc DocType nhận trường mới (Tạo Custom Field); bắt buộc với hai hành động này, phải trống với hành động khác. Dòng trỏ vào dữ liệu của app, phân quyền, tài khoản hay chứng từ submit bị chặn khi lưu.",
+   "fieldname": "target_doctype",
+   "fieldtype": "Link",
+   "in_list_view": 1,
+   "label": "DocType đích",
+   "options": "DocType"
+  },
+  {
+   "description": "Mỗi dòng một fieldname của DocType đích mà bot được đổi. Chỉ dùng cho Đổi trường, khi đó cần ít nhất một dòng; hành động khác để trống.",
+   "fieldname": "fields",
+   "fieldtype": "Small Text",
+   "label": "Trường được đổi"
+  },
+  {
+   "fieldname": "section_scope",
+   "fieldtype": "Section Break",
+   "label": "Đầu mục và chế độ"
+  },
+  {
+   "description": "Các chữ A đến F cách nhau bằng dấu phẩy, ví dụ A,B: dòng chỉ áp cho phiếu thuộc các đầu mục này. Khi lưu được bỏ trùng và sắp xếp.",
+   "fieldname": "categories",
+   "fieldtype": "Data",
+   "in_list_view": 1,
+   "label": "Đầu mục",
+   "reqd": 1
+  },
+  {
+   "default": "Cần duyệt",
+   "description": "Cấm: bot không làm. Cần duyệt: bot đề xuất, chỉ chạy khi người có quyền duyệt. Tự làm: chạy không cần duyệt sau khi đủ số đề xuất liên tiếp được duyệt không sửa (ô ở ERP AI Setting). Mặc định Cần duyệt.",
+   "fieldname": "mode",
+   "fieldtype": "Select",
+   "in_list_view": 1,
+   "label": "Chế độ",
+   "options": "Cấm\nCần duyệt\nTự làm",
+   "reqd": 1
+  }
+ ],
+ "istable": 1,
+ "links": [],
+ "modified": "2026-11-14 10:00:00.000000",
+ "modified_by": "Administrator",
+ "module": "ERP AI agent",
+ "name": "ERP AI Catalog Rule",
+ "owner": "Administrator",
+ "permissions": [],
+ "sort_field": "modified",
+ "sort_order": "DESC",
+ "states": []
+}

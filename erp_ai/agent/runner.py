@@ -83,6 +83,10 @@ WRITE_TOOL_TARGETS = {
 	"api_submit_record": (None, "name"),
 	"api_call_method": ("Method", "method"),
 }
+# Record tools: their action entry also carries the before/after values and the instructor (AC-35).
+RECORD_TOOLS = frozenset(
+	("api_create_record", "api_update_record", "api_delete_record", "api_submit_record", "api_call_method")
+)
 ACTION_DOCTYPE_MAX = 80
 PROPOSE_TOOLS = ("propose_file_change", "propose_new_file", "propose_bench_command")
 PROPOSE_STEP = "propose"
@@ -702,4 +706,11 @@ def _action(name, context, outcome, ok, arguments):
 		requested = arguments.get("doctype") if isinstance(arguments, dict) else None
 		doctype = str((outcome or {}).get("doctype") or requested or "")[:ACTION_DOCTYPE_MAX] or None
 	record = context.ticket_name if key is None else (outcome or {}).get(key)
-	return {"tool": name, "doctype": doctype, "name": record, "ok": ok}
+	action = {"tool": name, "doctype": doctype, "name": record, "ok": ok}
+	if name in RECORD_TOOLS:
+		# copied as the tool returned them (already free of secrets and cut); a refused or crashed call has none
+		written = outcome if ok else {}
+		action["value_before"] = written.get("value_before")
+		action["value_after"] = written.get("value_after")
+		action["instructor"] = context.instructor
+	return action

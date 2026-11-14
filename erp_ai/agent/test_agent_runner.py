@@ -21,6 +21,7 @@ from erp_ai.agent.prompts import (
 	build_routing_table,
 )
 from erp_ai.agent.run_log import write_entry
+from erp_ai.agent.tools import site_api
 from erp_ai.agent.tools.read import TOOL_RESULT_MAX_CHARS
 from erp_ai.agent.tools.registry import get_tool_schemas
 from erp_ai.agent.tools.source import GIT_READ_SUBCOMMANDS, git_global_options
@@ -35,6 +36,7 @@ from erp_ai.constants import (
 	KEY_STATUS_BAD_KEY,
 	LOG_DOCTYPE,
 	PROPOSAL_DOCTYPE,
+	ROLE_INSTRUCTOR,
 	TITLE_RUN_FAILED,
 	TITLE_WRONG_USER,
 )
@@ -1151,6 +1153,23 @@ class TestRunnerReasoning(RunnerTestBase):
 
 
 SITE_ADMIN_TOOL_NAMES = ["api_list_records", "api_get_record", "api_create_record", "api_update_record"]
+# Not Administrator: the session user in these tests is Administrator, so the action entry must name this user.
+INSTRUCTOR = "runner.instructor@example.com"
+
+
+def make_instructor(testcase):
+	"""Insert the instructor user with the instructor role; rolled back, then its role cache cleared."""
+
+	def drop():
+		frappe.db.rollback()
+		frappe.clear_cache(user=INSTRUCTOR)
+
+	testcase.addCleanup(drop)
+	user = frappe.get_doc(
+		{"doctype": "User", "email": INSTRUCTOR, "first_name": "Người chỉ thị", "send_welcome_email": 0}
+	)
+	user.append("roles", {"role": ROLE_INSTRUCTOR})
+	user.insert()
 
 
 class TestRunnerSiteAdminTools(RunnerTestBase):
@@ -1225,6 +1244,7 @@ class TestRunnerSiteAdminTools(RunnerTestBase):
 		self.assertNotIn(UNRESTRICTED_TOOLS_BLOCK, call["system"][0]["text"])
 
 	def test_unrestricted_actions_are_logged(self):
+		make_instructor(self)
 		set_agent_settings(unrestricted_enabled=1)
 		self.gateway.results = [
 			tool_turn(
@@ -1238,7 +1258,7 @@ class TestRunnerSiteAdminTools(RunnerTestBase):
 			"api_call_method": {"ok": True, "method": "frappe.client.get_count", "result": 1},
 		}
 		with (
-			patch.object(authority, "latest_instructor", return_value="Administrator"),
+			patch.object(authority, "latest_instructor", return_value=INSTRUCTOR),
 			patch.object(runner, "execute_tool", side_effect=lambda name, args, ctx: results[name]),
 		):
 			self._run("comment_mention")
@@ -1247,12 +1267,23 @@ class TestRunnerSiteAdminTools(RunnerTestBase):
 		self.assertEqual(
 			json.loads(entry.actions),
 			[
-				{"tool": "api_delete_record", "doctype": "Note", "name": "n1", "ok": True},
+				{
+					"tool": "api_delete_record",
+					"doctype": "Note",
+					"name": "n1",
+					"ok": True,
+					"value_before": None,
+					"value_after": None,
+					"instructor": INSTRUCTOR,
+				},
 				{
 					"tool": "api_call_method",
 					"doctype": "Method",
 					"name": "frappe.client.get_count",
 					"ok": True,
+					"value_before": None,
+					"value_after": None,
+					"instructor": INSTRUCTOR,
 				},
 			],
 		)
@@ -1305,6 +1336,7 @@ class TestRunnerSiteAdminTools(RunnerTestBase):
 		self.assertEqual([(row.change_step, row.actor) for row in steps], [("propose", AGENT_USER)])
 
 	def test_record_tool_runs_for_real_and_the_log_names_the_record(self):
+		make_instructor(self)
 		title = f"{PREFIX}site api note"
 		self.gateway.results = [
 			tool_turn(
@@ -1315,7 +1347,7 @@ class TestRunnerSiteAdminTools(RunnerTestBase):
 			),
 			make_model_result(),
 		]
-		with patch.object(authority, "latest_instructor", return_value="Administrator"):
+		with patch.object(authority, "latest_instructor", return_value=INSTRUCTOR):
 			self._run("comment_mention")
 
 		note = frappe.db.get_value("Note", {"title": title}, "name")
@@ -1324,18 +1356,35 @@ class TestRunnerSiteAdminTools(RunnerTestBase):
 		self.assertEqual(
 			json.loads(entry.actions),
 			[
-				{"tool": "api_create_record", "doctype": "Note", "name": note, "ok": True},
-				{"tool": "api_create_record", "doctype": "ERP AI Setting", "name": None, "ok": False},
+				{
+					"tool": "api_create_record",
+					"doctype": "Note",
+					"name": note,
+					"ok": True,
+					"value_before": None,
+					"value_after": {"title": title, "public": 1},
+					"instructor": INSTRUCTOR,
+				},
+				{
+					"tool": "api_create_record",
+					"doctype": "ERP AI Setting",
+					"name": None,
+					"ok": False,
+					"value_before": None,
+					"value_after": None,
+					"instructor": INSTRUCTOR,
+				},
 			],
 		)
 
 	def test_crashed_record_tool_is_logged_with_the_requested_doctype(self):
+		make_instructor(self)
 		self.gateway.results = [
 			tool_turn(tool_use("toolu_1", "api_update_record", doctype="Note", name="x", values={})),
 			make_model_result(),
 		]
 		with (
-			patch.object(authority, "latest_instructor", return_value="Administrator"),
+			patch.object(authority, "latest_instructor", return_value=INSTRUCTOR),
 			patch.object(runner, "execute_tool", side_effect=RuntimeError("boom")),
 		):
 			self._run("comment_mention")
@@ -1343,8 +1392,216 @@ class TestRunnerSiteAdminTools(RunnerTestBase):
 		(entry,) = [row for row in self._entries(entry_type="reason") if row.actions]
 		self.assertEqual(
 			json.loads(entry.actions),
-			[{"tool": "api_update_record", "doctype": "Note", "name": None, "ok": False}],
+			[
+				{
+					"tool": "api_update_record",
+					"doctype": "Note",
+					"name": None,
+					"ok": False,
+					"value_before": None,
+					"value_after": None,
+					"instructor": INSTRUCTOR,
+				}
+			],
 		)
+
+
+FAKE_PASSWORD = "RUNNER-FAKE-PASSWORD-5b71"
+FAKE_API_SECRET = "RUNNER-FAKE-API-SECRET-c09e"
+SECRET_USER = "runner.secret@example.com"
+
+
+class TestRunnerRecordToolValues(RunnerTestBase):
+	"""AC-35: the action entry of a record tool carries the tool's before/after values and the instructor."""
+
+	def setUp(self):
+		super().setUp()
+		set_agent_settings(
+			permission_level="L3", code_change_enabled=1, unrestricted_enabled=1, monthly_budget_usd=1000
+		)
+		make_instructor(self)
+
+	def _note(self, title):
+		return frappe.get_doc({"doctype": "Note", "title": title, "public": 1}).insert().name
+
+	def _run_tools(self, *blocks, execute=None):
+		"""One model turn calling `blocks`; returns the stored actions and the tool results the runner received."""
+		self.gateway.results = [tool_turn(*blocks), make_model_result()]
+		real_execute = runner.execute_tool
+		results = []
+
+		def spy(name, args, ctx):
+			result = (execute or real_execute)(name, args, ctx)
+			results.append(result)
+			return result
+
+		with (
+			patch.object(authority, "latest_instructor", return_value=INSTRUCTOR),
+			patch.object(runner, "execute_tool", side_effect=spy),
+		):
+			self._run("comment_mention")
+		(entry,) = [row for row in self._entries(entry_type="reason") if row.actions]
+		return entry, results
+
+	def test_record_tool_action_carries_before_after_and_instructor(self):
+		old_title, new_title = f"{PREFIX}values old", f"{PREFIX}values new"
+		updated, deleted, submitted = self._note(old_title), self._note(old_title), self._note(old_title)
+		created_title = f"{PREFIX}values created"
+		cases = [
+			(
+				tool_use(
+					"toolu_1",
+					"api_create_record",
+					doctype="Note",
+					values={"title": created_title, "public": 1},
+				),
+				lambda: frappe.db.get_value("Note", {"title": created_title}, "name"),
+				None,
+				{"title": created_title, "public": 1},
+			),
+			(
+				tool_use(
+					"toolu_1", "api_update_record", doctype="Note", name=updated, values={"title": new_title}
+				),
+				lambda: updated,
+				{"title": old_title},
+				{"title": new_title},
+			),
+			(
+				tool_use("toolu_1", "api_submit_record", doctype="Note", name=submitted, action="submit"),
+				lambda: submitted,
+				{"docstatus": 0},
+				{"docstatus": 1},
+			),
+			(
+				tool_use(
+					"toolu_1",
+					"api_call_method",
+					method="frappe.client.get_count",
+					arguments={"doctype": "Note"},
+				),
+				lambda: "frappe.client.get_count",
+				None,
+				{"method": "frappe.client.get_count", "argument_keys": ["doctype"]},
+			),
+		]
+		for block, record, value_before, value_after in cases:
+			tool = block["name"]
+			with self.subTest(tool):
+				frappe.db.delete(LOG_DOCTYPE, {"ticket": self.ticket.name})
+				# The stub moves docstatus in the database the way the real submit would.
+				with (
+					patch.object(site_api, "_is_submittable", return_value=True),
+					patch.object(
+						frappe.model.document.Document,
+						"submit",
+						autospec=True,
+						side_effect=lambda doc: doc.db_set("docstatus", 1),
+					),
+				):
+					entry, (result,) = self._run_tools(block)
+				self.assertTrue(result["ok"], result)
+				doctype = "Method" if tool == "api_call_method" else "Note"
+				self.assertEqual(
+					json.loads(entry.actions),
+					[
+						{
+							"tool": tool,
+							"doctype": doctype,
+							"name": record(),
+							"ok": True,
+							"value_before": value_before,
+							"value_after": value_after,
+							"instructor": INSTRUCTOR,
+						}
+					],
+				)
+		self.assertEqual(frappe.db.get_value("Note", updated, "title"), new_title)
+		self.assertEqual(frappe.db.get_value("Note", submitted, "docstatus"), 1)
+
+		frappe.db.delete(LOG_DOCTYPE, {"ticket": self.ticket.name})
+		entry, (result,) = self._run_tools(
+			tool_use("toolu_1", "api_delete_record", doctype="Note", name=deleted)
+		)
+		self.assertFalse(frappe.db.exists("Note", deleted))
+		(action,) = json.loads(entry.actions)
+		# copied as they are from the tool result, never read again from the (now deleted) record
+		self.assertEqual(action["value_before"], result["value_before"])
+		self.assertEqual(
+			{key: action["value_before"][key] for key in ("name", "title")},
+			{"name": deleted, "title": old_title},
+		)
+		self.assertEqual(
+			{key: value for key, value in action.items() if key != "value_before"},
+			{
+				"tool": "api_delete_record",
+				"doctype": "Note",
+				"name": deleted,
+				"ok": True,
+				"value_after": None,
+				"instructor": INSTRUCTOR,
+			},
+		)
+
+	def test_refused_or_crashed_call_has_one_action_without_values(self):
+		real_execute = runner.execute_tool
+
+		def crash_on_submit(name, args, ctx):
+			if name == "api_submit_record":
+				raise RuntimeError("boom")
+			return real_execute(name, args, ctx)
+
+		entry, results = self._run_tools(
+			tool_use("toolu_1", "api_create_record", doctype="ERP AI Setting", values={"enabled": 0}),
+			tool_use("toolu_2", "api_delete_record", doctype="Note", name=f"{PREFIX}missing"),
+			tool_use("toolu_3", "api_submit_record", doctype="Note", name="x", action="submit"),
+			execute=crash_on_submit,
+		)
+		self.assertEqual([result["ok"] for result in results], [False, False])
+		refused = {"ok": False, "value_before": None, "value_after": None, "instructor": INSTRUCTOR}
+		self.assertEqual(
+			json.loads(entry.actions),
+			[
+				{"tool": "api_create_record", "doctype": "ERP AI Setting", "name": None, **refused},
+				{"tool": "api_delete_record", "doctype": "Note", "name": None, **refused},
+				{"tool": "api_submit_record", "doctype": "Note", "name": None, **refused},
+			],
+		)
+
+	def test_fake_secret_never_in_actions_column(self):
+		frappe.get_doc(
+			{"doctype": "User", "email": SECRET_USER, "first_name": "Bí mật", "send_welcome_email": 0}
+		).insert()
+		real_get_doc = frappe.get_doc
+		planted = []
+
+		def get_doc_with_planted_secrets(*args, **kwargs):
+			doc = real_get_doc(*args, **kwargs)
+			if getattr(doc, "doctype", None) == "User" and doc.name == SECRET_USER:
+				doc.new_password, doc.api_secret = FAKE_PASSWORD, FAKE_API_SECRET
+				planted.append(doc)
+			return doc
+
+		# The cap is lifted so only the secret filter, not the field limit, keeps the planted values out.
+		with (
+			patch.object(frappe, "get_doc", side_effect=get_doc_with_planted_secrets),
+			patch.object(site_api, "DELETED_FIELDS_MAX", 1000),
+		):
+			entry, _ = self._run_tools(
+				tool_use("toolu_1", "api_delete_record", doctype="User", name=SECRET_USER)
+			)
+
+		self.assertTrue(planted)
+		self.assertEqual(
+			(planted[0].as_dict()["new_password"], planted[0].as_dict()["api_secret"]),
+			(FAKE_PASSWORD, FAKE_API_SECRET),
+		)
+		(action,) = json.loads(entry.actions)
+		self.assertTrue(action["ok"], action)
+		self.assertIn("value_before", action)
+		self.assertIn("value_after", action)
+		self.assertEqual(action["value_before"]["first_name"], "Bí mật")
+		self.assertEqual((entry.actions.count(FAKE_PASSWORD), entry.actions.count(FAKE_API_SECRET)), (0, 0))
 
 
 # Hand-written: the tools a run with an instructor gets when no change group is granted (FEAT-001/006 set).

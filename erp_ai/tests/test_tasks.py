@@ -644,15 +644,17 @@ class TestCheckPrivilegeEscalation(FrappeTestCase):
 			{
 				"api_update_record#1": {
 					"name": "dup@example.invalid",
-					"roles": [{"role": "A"}, {"role": "A"}, {"role": "B"}],
+					"roles": [{"role": "A"}, {"role": "A"}, {"role": "A"}, {"role": "B"}],
 				},
 				"api_delete_record#2": {"name": "gone@example.invalid", "roles": [{"role": "C"}]},
 			},
 			{
 				"api_update_record#1": {
 					"name": "dup@example.invalid",
-					"roles": [{"role": "B"}, {"role": "A"}, {"role": "B"}],
+					"roles": [{"role": "B"}, {"role": "A"}, {"role": "B"}, {"role": "B"}],
 				},
+				# The runner writes the key with None for a delete (runner._record_snapshot).
+				"api_delete_record#2": None,
 			},
 		)
 
@@ -660,6 +662,10 @@ class TestCheckPrivilegeEscalation(FrappeTestCase):
 			self._changes(),
 			[
 				"thêm role B cho dup@example.invalid "
+				"(người ra lệnh erpai-tasks-boss@example.invalid, 2031-11-15 08:10)",
+				"thêm role B cho dup@example.invalid "
+				"(người ra lệnh erpai-tasks-boss@example.invalid, 2031-11-15 08:10)",
+				"gỡ role A của dup@example.invalid "
 				"(người ra lệnh erpai-tasks-boss@example.invalid, 2031-11-15 08:10)",
 				"gỡ role A của dup@example.invalid "
 				"(người ra lệnh erpai-tasks-boss@example.invalid, 2031-11-15 08:10)",

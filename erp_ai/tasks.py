@@ -119,11 +119,11 @@ def _role_changes(user: str, key: str, before: dict, after: dict, by: str) -> li
 
 
 def _privilege_changes_by_agent(lower: datetime | None, upper: datetime) -> list[str]:
-	"""One entry per successful generic write on a permission record logged in (lower, upper] (ADR-024 QĐ 1, 3.3).
+	"""Entries for successful generic writes on permission records logged in (lower, upper] (ADR-024 QĐ 1, 3.3).
 
 	Reads `reason` rows of ERP AI Log by `creation`, oldest first; no lower bound when `lower` is None.
-	A DocType write counts only when its `permissions` snapshot changed. `Has Role` rows are User changes: a User
-	write gives one entry per role added or removed.
+	A DocType write gives one entry when its `permissions` snapshot changed. `Has Role` rows are User changes: a
+	User write gives one entry per role added or removed (0..n).
 	"""
 	log = frappe.qb.DocType(LOG_DOCTYPE)
 	query = (

@@ -1,7 +1,7 @@
 """Secret masking shared by logs, tool results, Error Log reads and emails (NFR-6, ADR-034 QĐ 2).
 
 Rules N-1..N-7, K-1..K-8, R-1..R-5 of `design-w0-fixes-3.md` section 3, with K-4, K-4a and K-8 as
-amended by `design-w0-fixes-4.md` point 3, K-4b added and K-7 as amended by `design-w1-fixes-5.md`. One word
+amended by `design-w0-fixes-4.md` point 3, K-4b and K-7 as amended by `design-w1-fixes-16.md`. One word
 list (`SECRET_WORDS`) drives both `is_secret_key` and the key-value scan of `redact_secrets`. Output is
 always NFC (3a).
 """
@@ -69,27 +69,32 @@ def _name_segments(name: str) -> tuple[str, ...]:
 _SECRET_WORD_SEGMENTS = tuple(_name_segments(word) for word in SECRET_WORDS)
 
 _WORD_START = re.compile(r"(?<![\w-])[\w-]")
-_NOT_WORD_CHAR = re.compile(r"[^\w-]")
 
 
 def _secret_value_end(text: str, start: int, end: int) -> int:
-	"""K-4b: end of the secret bare value or K-7 tail read over `text[start:end]`.
+	"""K-4b: end of the one span masked for a secret key whose bare value K-4 reads over `text[start:end]`.
 
-	Stops at the first `MASK` or key candidate with a secret name inside it, less the non-word
-	characters just before that point; otherwise `end`.
+	The span only grows: while a `MASK` starts before its end, or a key candidate with a secret name starts
+	in it and ends at or past its end, it takes in that `MASK` and its K-7 tail, or that candidate and its
+	K-4 value. Each part is read once (K-8).
 	"""
-	stop = text.find(MASK, start, end + len(MASK) - 1)
-	stop = end if stop == -1 else stop
-	for word in _WORD_START.finditer(text, start, stop):
-		candidate = _KEY_CANDIDATE.match(text, word.start())
-		if candidate and is_secret_key(candidate.group("name")):
-			stop = word.start()
-			break
-	if stop == end:
-		return end
-	while stop > start and _NOT_WORD_CHAR.match(text, stop - 1):
-		stop -= 1
-	return stop
+	scan = start
+	while scan < end:
+		mask = text.find(MASK, scan, end + len(MASK) - 1)
+		if mask != -1:
+			scan = mask + len(MASK)
+			end = max(end, _BARE_VALUE_TAIL.match(text, scan).end())
+			continue
+		for word in _WORD_START.finditer(text, scan, end):
+			candidate = _KEY_CANDIDATE.match(text, word.start())
+			if candidate and candidate.end() >= end and is_secret_key(candidate.group("name")):
+				scan = candidate.end()
+				value = _KEY_VALUE.match(text, scan)
+				end = scan if value is None else value.end()
+				break
+		else:
+			return end
+	return end
 
 
 def _mask_key_values(text: str) -> str:
@@ -99,14 +104,10 @@ def _mask_key_values(text: str) -> str:
 	while candidate := _KEY_CANDIDATE.search(text, position):
 		parts.append(text[position : candidate.end()])
 		position = candidate.end()
-		if text.startswith(MASK, position):
-			parts.append(MASK)
-			position += len(MASK)
-			if is_secret_key(candidate.group("name")):
-				position = _secret_value_end(text, position, _BARE_VALUE_TAIL.match(text, position).end())
+		if not is_secret_key(candidate.group("name")):
 			continue
 		value = _KEY_VALUE.match(text, position)
-		if value is None or not is_secret_key(candidate.group("name")):
+		if value is None:
 			continue
 		if value.group("double") is not None:
 			parts.append(f'"{MASK}"')
@@ -114,9 +115,9 @@ def _mask_key_values(text: str) -> str:
 		elif value.group("single") is not None:
 			parts.append(f"'{MASK}'")
 			position = value.end()
-		elif (end := _secret_value_end(text, position, value.end())) > position:
+		else:
 			parts.append(MASK)
-			position = end
+			position = _secret_value_end(text, position, value.end())
 	parts.append(text[position:])
 	return "".join(parts)
 

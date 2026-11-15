@@ -23,6 +23,7 @@ from erp_ai.constants import (
 	SETTING_DOCTYPE,
 )
 from erp_ai.erp_ai_agent.doctype.erp_ai_setting import erp_ai_setting
+from erp_ai.erp_ai_agent.report.erp_ai_accuracy.erp_ai_accuracy import GateResult
 from erp_ai.test_utils import TempAppsRoot, keep_agent_settings, set_agent_settings
 
 PRICES = {
@@ -1008,6 +1009,67 @@ class TestPermissionSwitchNotice(FrappeTestCase):
 		self.assertIn("gọi hàm whitelist", message)
 		self.assertIn("Gọi hàm là tự do", message)
 		self.assertIn("chỉ là cố gắng", message)
+
+
+GATE_WARNING_TITLE = "Chưa đạt cửa L0 → L1"
+
+
+class TestLevelRaiseWarning(FrappeTestCase):
+	"""AC-18 form part (design.md:323, A-8): raising the level from L0 while the gate is not "Đạt" warns, never
+	blocks. The gate is stubbed with a fixed result, so no log rows and no wall clock are involved."""
+
+	def setUp(self):
+		self.addCleanup(frappe.db.rollback)
+		keep_agent_settings(self)
+
+	def _save_level(self, before, after, gate):
+		"""Store level `before`, then save `after` with `l0_l1_gate` returning `gate`; return the msgprint mock."""
+		set_agent_settings(permission_level=before)
+		doc = frappe.get_single(SETTING_DOCTYPE)
+		doc.permission_level = after
+		doc.flags.ignore_validate = True
+		with (
+			patch.object(erp_ai_setting, "l0_l1_gate", create=True, return_value=gate),
+			patch.object(frappe, "msgprint") as msgprint,
+		):
+			doc.save(ignore_permissions=True)
+		return msgprint
+
+	def _warning_calls(self, msgprint):
+		return [c for c in msgprint.call_args_list if c.kwargs.get("title") == GATE_WARNING_TITLE]
+
+	def test_raise_from_l0_not_passed_warns_and_saves(self):
+		msgprint = self._save_level("L0", "L1", GateResult("Chưa đạt", 40, 33))
+		calls = self._warning_calls(msgprint)
+		self.assertEqual(len(calls), 1)
+		self.assertEqual(
+			calls[0].args[0],
+			"Kết luận cửa L0 → L1 của báo cáo ERP AI Accuracy (14 ngày gần nhất): Chưa đạt, 33/40 phiếu có nhãn"
+			" đúng. Mức vẫn được lưu.",
+		)
+		self.assertEqual(calls[0].kwargs.get("indicator"), "orange")
+		self.assertEqual(frappe.db.get_single_value(SETTING_DOCTYPE, "permission_level", cache=False), "L1")
+
+	def test_raise_from_l0_not_enough_sample_warns_for_every_higher_level(self):
+		for after in ("L1", "L2", "L3"):
+			with self.subTest(after=after):
+				msgprint = self._save_level("L0", after, GateResult("Chưa đủ mẫu", 29, 29))
+				self.assertEqual(len(self._warning_calls(msgprint)), 1)
+				self.assertEqual(
+					frappe.db.get_single_value(SETTING_DOCTYPE, "permission_level", cache=False), after
+				)
+
+	def test_raise_from_l0_passed_no_warning(self):
+		msgprint = self._save_level("L0", "L1", GateResult("Đạt", 40, 34))
+		self.assertEqual(self._warning_calls(msgprint), [])
+
+	def test_change_l1_to_l2_no_gate_warning(self):
+		msgprint = self._save_level("L1", "L2", GateResult("Chưa đạt", 40, 33))
+		self.assertEqual(self._warning_calls(msgprint), [])
+
+	def test_stay_at_l0_no_gate_warning(self):
+		msgprint = self._save_level("L0", "L0", GateResult("Chưa đạt", 40, 33))
+		self.assertEqual(self._warning_calls(msgprint), [])
 
 
 CATALOG_RULE_DOCTYPE = "ERP AI Catalog Rule"

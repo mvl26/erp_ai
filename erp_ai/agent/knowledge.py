@@ -40,6 +40,16 @@ def tokenize(text) -> list[str]:
 	return _words(text)[:QUERY_MAX_WORDS]
 
 
+def text_words(text) -> set[str]:
+	"""The words of a document text by the rules of `tokenize`, all of them: D-12 caps only the query."""
+	return set(_words(text))
+
+
+def plain_text(html) -> str:
+	"""HTML without its tags; a space before each block tag keeps the words of adjacent blocks apart."""
+	return strip_html(_BLOCK_TAG.sub(" <", html or ""))
+
+
 def search_kb_articles(query: str, limit: int) -> list[dict]:
 	"""Published articles the session user may read, ranked by the number of query words they contain.
 
@@ -63,12 +73,11 @@ def search_kb_articles(query: str, limit: int) -> list[dict]:
 	)
 	ranked = []
 	for row in rows:
-		# One space keeps the last title word and the first content word apart; a space before each block tag
-		# keeps the last word of one HTML block and the first word of the next apart.
-		text = f"{row.title or ''} {strip_html(_BLOCK_TAG.sub(' <', row.content or ''))}"
-		matched = set(words) & set(_words(text))
+		# One space keeps the last title word and the first content word apart.
+		text = f"{row.title or ''} {plain_text(row.content)}"
+		matched = set(words) & text_words(text)
 		if matched:
-			in_title = len(matched & set(_words(row.title)))
+			in_title = len(matched & text_words(row.title))
 			ranked.append((len(matched), in_title, row.modified, row, text, matched))
 	ranked.sort(key=lambda item: item[:3], reverse=True)
 	return [

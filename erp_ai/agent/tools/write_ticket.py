@@ -90,6 +90,15 @@ FAILURE_PENDING = "Đề xuất đã tạo, đang chờ duyệt: "
 FAILURE_MANUAL = "Việc người phải làm tay: "
 REASON_GUIDANCE_EXISTS = "phiếu đã có hướng xử lý"
 REASON_NO_CONTENT = "không có nội dung"
+# The post_comment tool's refusals and hold around the guidance comment (w1.md:39-42, :96).
+REASON_MARKER = "nội dung chứa dấu hiệu dành riêng cho comment hướng xử lý của hệ thống; bỏ dấu hiệu đó"
+REASON_GUIDANCE_HEADER = (
+	f"{REASON_GUIDANCE_EXISTS}: chỉ báo kết quả việc vừa làm, không viết mục '{GUIDANCE_HEADER}'"
+)
+HELD_NOTE = "đã giữ làm nhận định của comment hướng xử lý; bot đăng một lần ở cuối lần chạy"
+# The done line of a classification written in a guidance run (U4b.md:210, :215; the runner imports them).
+ROUTE_DONE = "Bot đã phân loại phiếu: {fields}."
+FIELD_LABELS = {"ticket_type": "Loại", "agent_group": "Nhóm", "priority": "Ưu tiên"}
 # The plan section ends at the next line opening a `**…:**` heading or the confidence line (Điểm 1.2 bước 2).
 _PLAN_END = re.compile(r"^[ \t]*(?:\*\*[^*\n]+:\*\*|Độ tin cậy:)", re.M)
 
@@ -207,6 +216,11 @@ def set_classification(args: dict, ctx: ToolContext) -> dict:
 	doc.ai_classified_by = CLASSIFIED_BY_AI
 	doc.ai_updated_at = now_datetime()
 	doc.save()
+	# In a guidance run the write is a line of "Đã làm", not a comment (U4b-8, AC-66 (a)).
+	fields = ", ".join(
+		f"{FIELD_LABELS[field]} {value}" for field, value in values.items() if field in FIELD_LABELS
+	)
+	collect(ctx.run_id, SECTION_DONE, ROUTE_DONE.format(fields=fields))
 	return {"ok": True, "before": before, "after": dict(values), "skipped": skipped}
 
 
@@ -290,11 +304,20 @@ def _ask_below_threshold(kind: str, content: str, ctx: ToolContext) -> dict:
 	return result
 
 
-def _proposal_refusal(content: str) -> dict | None:
-	"""Step (3): a kind=de_xuat comment needs a 'Độ tin cậy: NN%' line (NN at most 100) and non-empty grounds."""
+def _confidence_refusal(content: str) -> dict | None:
+	"""Step (3): a kind=de_xuat comment needs a 'Độ tin cậy: NN%' line, NN at most 100."""
 	confidence = CONFIDENCE_LINE.search(content)
 	if confidence is None or int(confidence.group(1)) > CONFIDENCE_PCT_MAX:
 		return _fail(REASON_NO_CONFIDENCE)
+	return None
+
+
+def _hold_or_refuse(content: str, ctx: ToolContext) -> dict | None:
+	"""Steps (3c), (3d) of a kind=de_xuat comment (design-w1-fixes-20 Điểm 1.4): in a guidance run it is held as the
+	analysis of the guidance comment, no grounds needed; outside one it needs non-empty grounds (AC-22)."""
+	if collecting(ctx.run_id):
+		hold_analysis(ctx.run_id, content)
+		return {"ok": True, "held": True, "note": HELD_NOTE}
 	if not section_text(content, EVIDENCE_HEADER):
 		return _fail(REASON_NO_EVIDENCE)
 	return None
@@ -455,15 +478,24 @@ def failure_summary(run_id: str) -> str:
 
 
 def post_comment_tool(args: dict, ctx: ToolContext) -> dict:
-	"""Handler of the post_comment tool (AC-22, U4b.md:171): checks the kind's rules, then posts; a refusal posts nothing."""
+	"""Handler of the post_comment tool (AC-22, U4b.md:171, w1.md:96): checks the steps in order, then posts; a
+	refusal posts nothing, and in a guidance run a proposal is held for post_guidance instead."""
 	kind, content = args.get("kind"), args["content"]
+	# Step (0): the marker is the writer's alone, whatever the kind, before any other check (AC-65 (d)).
+	if _GUIDANCE_KEY in re.sub(r"\s+", "", content).lower():
+		return _fail(REASON_MARKER)
 	if kind not in COMMENT_KINDS:
 		return _fail(_REASON_BAD_KIND)
 	if ctx.below_threshold:
 		return _ask_below_threshold(kind, content, ctx)
-	if kind == "de_xuat" and (refusal := _proposal_refusal(content)):
+	if kind == "de_xuat" and (refusal := _confidence_refusal(content)):
 		return refusal
-	# Step (4): a question above the threshold needs nothing more.
+	# Step (3b): once the ticket has its guidance, a comment only reports the work just done (AC-65 (c)).
+	if ctx.run_id in frappe.flags.get(_WORK_ONLY_FLAG, set()) and section_text(content, GUIDANCE_HEADER):
+		return _fail(REASON_GUIDANCE_HEADER)
+	if kind == "de_xuat" and (outcome := _hold_or_refuse(content, ctx)):
+		return outcome
+	# Steps (4), (5): a question above the threshold needs nothing more.
 	return _post(ctx.ticket_name, content)
 
 
@@ -545,10 +577,12 @@ TOOLS: list[ToolSpec] = [
 			"name": "post_comment",
 			"description": (
 				"Đăng một comment lên phiếu hiện tại. "
-				"kind=de_xuat: nhận định, phương án hoặc báo việc đã làm; phải có dòng 'Độ tin cậy: NN%' "
-				f"và phần '**{EVIDENCE_HEADER}:**' có nội dung. "
+				"kind=de_xuat: nhận định và phương án, hoặc báo việc đã làm; phải có dòng 'Độ tin cậy: NN%'. "
 				"kind=hoi: câu hỏi; khi độ tin cậy dưới ngưỡng chỉ được dùng kind này, một lần, "
-				f"và vẫn phải có '**{EVIDENCE_HEADER}:**' nêu vì sao chưa chắc."
+				f"và vẫn phải có '**{EVIDENCE_HEADER}:**' nêu vì sao chưa chắc. "
+				"Không tự liệt kê việc đã làm, đề xuất đang chờ hay việc hệ thống từ chối: "
+				"hệ thống tự thêm chúng vào comment. "
+				"Khi phiếu đã có hướng xử lý: chỉ báo kết quả việc vừa làm."
 			),
 			"input_schema": {
 				"type": "object",

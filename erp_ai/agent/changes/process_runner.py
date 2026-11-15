@@ -8,13 +8,28 @@ from dataclasses import dataclass
 import frappe
 
 from erp_ai.agent.tools import source
-from erp_ai.constants import COMMAND_TIMEOUT_S, JOB_SAFETY_MARGIN_S
+from erp_ai.constants import (
+	COMMAND_TIMEOUT_S,
+	JOB_SAFETY_MARGIN_S,
+	RESTART_LAUNCH_TIMEOUT_S,
+	RESTART_TIMEOUT_S,
+)
 
 ENV_ALLOWLIST = ("PATH", "HOME", "LANG", "LC_ALL", "USER")
 OUTPUT_MAX_LINES = source.READ_MAX_LINES
 OUTPUT_LINE_MAX_CHARS = 1000
 GIT_OUTPUT_MAX_LINES = 20
 NOT_FOUND_EXIT_CODE = 127
+RESTART_ARGV = (
+	source.SETSID_EXECUTABLE,
+	"-f",
+	source.TIMEOUT_EXECUTABLE,
+	"-s",
+	"KILL",
+	str(RESTART_TIMEOUT_S),
+	source.BENCH_EXECUTABLE,
+	"restart",
+)
 
 
 @dataclass(frozen=True)
@@ -139,6 +154,29 @@ def git_unstage_new(repo_root: str, rel_in_repo: str, limit_s: int) -> CommandRe
 	"""`git rm --cached -q -- rel_in_repo`: take a new file back out of the index after a failed commit."""
 	_check_git_write_call(repo_root, rel_in_repo, limit_s)
 	return _run_git_write(repo_root, (rel_in_repo,), limit_s, ["rm", "--cached", "-q"])
+
+
+def launch_restart() -> tuple[bool, str | None]:
+	"""Start `bench restart` detached in its own session and return at once (design 3.4, 4.4; ADR-040 QĐ 7).
+
+	Never raises for a launch failure: returns (False, <error class name>) and the caller logs it (STD-ERR-1).
+	"""
+	try:
+		done = subprocess.run(
+			RESTART_ARGV,
+			cwd=frappe.utils.get_bench_path(),
+			env=_minimal_env(),
+			stdin=subprocess.DEVNULL,
+			stdout=subprocess.DEVNULL,
+			stderr=subprocess.DEVNULL,
+			timeout=RESTART_LAUNCH_TIMEOUT_S,
+			start_new_session=True,
+		)
+	except (subprocess.TimeoutExpired, OSError) as error:
+		return False, type(error).__name__
+	if done.returncode != 0:
+		return False, subprocess.CalledProcessError.__name__
+	return True, None
 
 
 def _run_wrapped(command, *, cwd, env, limit_s, backstop_s, max_lines) -> CommandResult:

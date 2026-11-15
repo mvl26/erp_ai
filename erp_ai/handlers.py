@@ -92,18 +92,16 @@ def ticket_validate(doc, method=None):
 	if doc.is_new() or not any(doc.has_value_changed(field) for field in CLASSIFICATION_FIELDS):
 		return
 
-	skip_reason = None
+	# The session alone tells the bot's write from a person's (AC-21).
 	if frappe.session.user == AGENT_USER:
-		skip_reason = "changed_by_agent"
-	else:
-		latest = _latest_classify_log(doc.name)
-		if not latest or not latest.predicted_category:
-			skip_reason = "no_prediction"
-
-	if skip_reason:
-		_log_decision(doc.name, TRIGGER_HUMAN_CORRECTION, "skipped", skip_reason)
+		_log_decision(doc.name, TRIGGER_HUMAN_CORRECTION, "skipped", "changed_by_agent")
 		return
 	doc.ai_classified_by = CLASSIFIED_BY_HUMAN
+	latest = _latest_classify_log(doc.name)
+	if not latest or not latest.predicted_category:
+		# No prediction row to correct yet: the person is still the one who classified the ticket.
+		_log_decision(doc.name, TRIGGER_HUMAN_CORRECTION, "recorded", "human_changed_before_prediction")
+		return
 	doc.flags.erp_ai_human_corrected = latest.name
 
 

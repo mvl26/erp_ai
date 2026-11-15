@@ -93,9 +93,10 @@ def search_manuals(
 
 	Only the configured manuals directory is scanned, each file through `source.resolve_manual_path`: at most
 	`MANUALS_MAX_FILES` files, files over `MANUALS_FILE_MAX_BYTES` skipped, stop after `MANUALS_BUDGET_S` of
-	`clock`. A section starts at each line beginning with `#`; the text before the first one is a section with an
-	empty heading. Order: matched words desc, matched words in the heading desc, document, line. Returns `limit`
-	rows `{document (path relative to the manuals directory), heading, line (1-based), excerpt}`.
+	`clock`. A file that raises `OSError` on reading is skipped with one warning log line. A section starts at
+	each line beginning with `#`; the text before the first one is a section with an empty heading. Order:
+	matched words desc, matched words in the heading desc, document, line. Returns `limit` rows
+	`{document (path relative to the manuals directory), heading, line (1-based), excerpt}`.
 	"""
 	manuals_dir = (manuals_dir or "").strip()
 	if not manuals_dir:
@@ -109,7 +110,15 @@ def search_manuals(
 		return []
 	ranked = []
 	for document, path in _manual_files(top, clock):
-		for line, heading, text in _sections(path):
+		try:
+			sections = list(_sections(path))
+		except OSError as error:
+			# Skip only this file; no absolute path and no `str(error)` in the log (it carries one).
+			frappe.logger(source.LOGGER_NAME).warning(
+				"search_manuals skipped %s: %s", document, type(error).__name__
+			)
+			continue
+		for line, heading, text in sections:
 			matched = set(words) & set(_words(text))
 			if matched:
 				in_heading = len(matched & set(_words(heading)))

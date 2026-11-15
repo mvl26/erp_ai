@@ -1240,17 +1240,19 @@ class TestGuidanceWriter(TicketCommentCase):
 		self.assertEqual(comments, [{"name": posted["comment"]}])
 
 	def _delete_committed(self, tickets):
-		# After its first use, secondary_connection() leaves frappe.local.db on the second connection.
-		frappe.local.db = self._primary_connection
+		# The primary's locks go first; then the deletes run on the second connection, which committed the rows:
+		# Database.delete builds its query through frappe.db, so frappe.local.db must point at that connection.
 		self._primary_connection.rollback()
-		if not tickets:
-			return
-		for ticket in tickets:
-			self._secondary_connection.delete(
-				"Comment", {"reference_doctype": "HD Ticket", "reference_name": ticket}
-			)
-			self._secondary_connection.delete("HD Ticket", {"name": ticket})
-		self._secondary_connection.commit()
+		try:
+			if tickets:
+				frappe.local.db = self._secondary_connection
+				for ticket in tickets:
+					frappe.db.delete("Comment", {"reference_doctype": "HD Ticket", "reference_name": ticket})
+					frappe.db.delete("HD Ticket", {"name": ticket})
+				frappe.db.commit()
+		finally:
+			# After its first use, secondary_connection() leaves frappe.local.db on the second connection.
+			frappe.local.db = self._primary_connection
 
 	def test_deleted_guidance_allows_new_one(self):
 		# ADR-036 QĐ 6: the comment is the source of truth; once deleted, a later run posts again.

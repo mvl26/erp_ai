@@ -20,7 +20,15 @@ from erp_ai.constants import (
 OPT_OUT_FIELD = "ai_opt_out"
 EXCLUDED_TEAMS_FIELD = "excluded_teams"
 TEAM_FIELD = "agent_group"
-SEND_POLICY_FIELDS = (OPT_OUT_FIELD, TEAM_FIELD)
+SUBJECT_FIELD = "subject"
+SEND_POLICY_FIELDS = (OPT_OUT_FIELD, TEAM_FIELD, SUBJECT_FIELD)
+EXCLUDED_BY_CLASSIFICATION = "excluded_by_classification"  # stop_reason of the classify row of such a ticket
+# Refusal codes of send_refusal: codes only, never ticket content.
+REFUSAL_OPTED_OUT = "opted_out"
+REFUSAL_EXCLUDED_TEAM = "excluded_team"
+REFUSAL_EXCLUDED_TITLE = "excluded_title"
+REFUSAL_EXCLUDED_BY_CLASSIFICATION = "excluded_by_classification"
+REFUSAL_MISSING = "missing"
 
 OVER_BUDGET_LEVEL = "L1"
 
@@ -33,19 +41,50 @@ def _normalize(name) -> str:
 	return " ".join((name or "").split()).casefold()
 
 
-def can_send_ticket(ticket) -> bool:
-	"""The only send condition: not opted out and not in an excluded team."""
+def is_excluded_by_classification(ticket_name: str) -> bool:
+	"""The ticket has a classify row of ERP AI Log that stopped as EXCLUDED_BY_CLASSIFICATION."""
+	return bool(
+		ticket_name
+		and frappe.db.exists(
+			LOG_DOCTYPE,
+			{"ticket": ticket_name, "entry_type": "classify", "stop_reason": EXCLUDED_BY_CLASSIFICATION},
+		)
+	)
+
+
+def send_refusal(ticket) -> str | None:
+	"""The only send predicate (ADR-034 QĐ 1): why the agent must not take this ticket, or None when it may.
+
+	`ticket` is a name or a doc. First match wins: missing, opted out, excluded team, excluded title (with or
+	without a team: the prefix is the creator's intent), excluded by classification (only while no team is
+	set, so a person's team choice ends it).
+	"""
 	if not ticket:
-		return False
+		return REFUSAL_MISSING
 	if isinstance(ticket, str):
-		values = frappe.db.get_value("HD Ticket", ticket, list(SEND_POLICY_FIELDS), as_dict=True)
+		values = frappe.db.get_value(TICKET_DOCTYPE, ticket, ["name", *SEND_POLICY_FIELDS], as_dict=True)
 		if not values:
-			return False
+			return REFUSAL_MISSING
 	else:
-		values = {field: ticket.get(field) for field in SEND_POLICY_FIELDS}
+		values = {field: ticket.get(field) for field in ("name", *SEND_POLICY_FIELDS)}
+		is_new = getattr(ticket, "is_new", None)
+		if callable(is_new) and is_new():
+			values["name"] = None  # not saved yet: there is no log row to look up
 	if values.get(OPT_OUT_FIELD):
-		return False
-	return not is_excluded_team(values.get(TEAM_FIELD))
+		return REFUSAL_OPTED_OUT
+	team = values.get(TEAM_FIELD)
+	if is_excluded_team(team):
+		return REFUSAL_EXCLUDED_TEAM
+	if has_excluded_title(values.get(SUBJECT_FIELD)):
+		return REFUSAL_EXCLUDED_TITLE
+	if not (team or "").strip() and is_excluded_by_classification(values.get("name")):
+		return REFUSAL_EXCLUDED_BY_CLASSIFICATION
+	return None
+
+
+def can_send_ticket(ticket) -> bool:
+	"""The only send condition: send_refusal(ticket) is None."""
+	return send_refusal(ticket) is None
 
 
 def is_excluded_team(team) -> bool:
@@ -58,7 +97,6 @@ def is_excluded_team(team) -> bool:
 
 
 EXCLUDED_TITLE_PREFIXES_FIELD = "excluded_title_prefixes"
-SUBJECT_FIELD = "subject"
 
 
 def _title_key(text) -> str:

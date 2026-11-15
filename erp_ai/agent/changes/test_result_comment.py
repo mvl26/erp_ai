@@ -23,6 +23,7 @@ from erp_ai.constants import (
 	CHANGE_STATUS_UNDONE,
 	PROPOSAL_DOCTYPE,
 	ROLE_INSTRUCTOR,
+	TRIGGER_COMMENT_MENTION,
 )
 from erp_ai.test_utils import make_change_proposal, set_agent_settings
 
@@ -338,7 +339,7 @@ class TestResultIsNotAnInstruction(ResultCommentTestCase):
 		frappe.set_user("Administrator")
 		fetched = {row["name"] for row in authority.fetch_ticket_comments(self.ticket)}
 		self.assertNotIn(comment, fetched)
-		self.assertIsNone(authority.latest_instructor(self.ticket))
+		self.assertIsNone(authority.run_instructor(self.ticket, TRIGGER_COMMENT_MENTION, comment))
 
 		# The same text as a human Comment from the same person does start a run and is an instruction,
 		# so the zeros above come from the Info type, not from the setup.
@@ -347,4 +348,4 @@ class TestResultIsNotAnInstruction(ResultCommentTestCase):
 		self.assertEqual(len(self.agent_runs()), 1)
 		frappe.set_user("Administrator")
 		self.assertIn(human, {row["name"] for row in authority.fetch_ticket_comments(self.ticket)})
-		self.assertEqual(authority.latest_instructor(self.ticket), INSTRUCTOR)
+		self.assertEqual(authority.run_instructor(self.ticket, TRIGGER_COMMENT_MENTION, human), INSTRUCTOR)

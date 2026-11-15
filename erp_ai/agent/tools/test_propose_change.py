@@ -1546,6 +1546,15 @@ class TestProposeBlock(FrappeTestCase):
 				self.assertEqual(self.stored(result).operations[0].content_after or "", content)
 		self.assertEqual(len(self.proposals()), 2)
 
+	def test_new_file_description_tells_parent_and_commands_rules(self):
+		# design 3.1: the parent folder may be missing (no NO_PARENT); commands as in propose_file_change
+		(spec,) = [spec for spec in propose_change.TOOLS if spec.name == "propose_new_file"]
+		description = spec.schema["description"]
+		self.assertNotIn("phải có sẵn", description)
+		self.assertIn("thư mục cha chưa có sẽ được tạo", description)
+		self.assertIn("commands là các lệnh bench chạy sau khi ghi file, đúng thứ tự", description)
+		self.assertIn("có file .py thì kết thúc bằng migrate rồi restart", description)
+
 	def test_edit_with_11_replacements_accepted(self):
 		# design 3.1: no limit on the number of edits in one item (AC-43 case 2), in both call shapes
 		before = "".join(f"v{i} = {i}\n" for i in range(11))

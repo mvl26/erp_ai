@@ -498,8 +498,9 @@ TOOLS: list[ToolSpec] = [
 		schema={
 			"name": "propose_new_file",
 			"description": (
-				"Tạo đề xuất thêm một file mới trong apps/ (thư mục chứa phải có sẵn). "
-				"Chỉ tạo đề xuất Chờ duyệt, chưa ghi gì xuống đĩa."
+				"Tạo đề xuất thêm một file mới trong apps/; thư mục cha chưa có sẽ được tạo. "
+				"commands là các lệnh bench chạy sau khi ghi file, đúng thứ tự; có file .py thì "
+				"kết thúc bằng migrate rồi restart. Chỉ tạo đề xuất Chờ duyệt, chưa ghi gì xuống đĩa."
 			),
 			"input_schema": {
 				"type": "object",

@@ -914,6 +914,11 @@ class TestTitlePrefix(FrappeTestCase):
 		for subject in ("Hỏi về [HR]", "[HRM] X", "", None):
 			with self.subTest(subject=subject):
 				self.assertFalse(policy.has_excluded_title(subject))
+		# Each config line goes through _title_key too: an NFD line with extra spaces gives the NFC key,
+		# so an admin typing the prefix in NFD (some IMEs, macOS) still gets the rule.
+		set_agent_settings(excluded_title_prefixes="  " + unicodedata.normalize("NFD", "[Kế   toán]") + " ")
+		self.assertEqual(policy.excluded_title_prefixes(), ("[kế toán]",))
+		self.assertTrue(policy.has_excluded_title(f"{ke_toan_nfc}X"))
 		# An empty configuration has no rule.
 		set_agent_settings(excluded_title_prefixes="\n  \n")
 		self.assertEqual(policy.excluded_title_prefixes(), ())
@@ -924,3 +929,17 @@ class TestTitlePrefix(FrappeTestCase):
 		with patch.object(frappe.db, "get_single_value", side_effect=missing):
 			self.assertEqual(policy.excluded_title_prefixes(), ())
 			self.assertFalse(policy.has_excluded_title("[HR] X"))
+
+	def test_missing_field_adds_no_message(self):
+		# Before migrate the DocType has no excluded_title_prefixes field: no rule, never raises, and nothing
+		# lands in message_log (a web request would show it as a red dialog, STD-ERR-3).
+		set_agent_settings(excluded_title_prefixes="[HR]")
+		frappe.db.value_cache.pop(policy.SETTING_DOCTYPE, None)
+		self.addCleanup(frappe.db.value_cache.pop, policy.SETTING_DOCTYPE, None)
+		fields = frappe.get_meta(policy.SETTING_DOCTYPE)._fields
+		frappe.clear_messages()
+		with patch.dict(fields):
+			del fields[policy.EXCLUDED_TITLE_PREFIXES_FIELD]
+			self.assertEqual(policy.excluded_title_prefixes(), ())
+			self.assertFalse(policy.has_excluded_title("[HR] X"))
+		self.assertEqual(frappe.get_message_log(), [])

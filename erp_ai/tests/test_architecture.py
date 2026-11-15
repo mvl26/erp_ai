@@ -4954,6 +4954,18 @@ class TestArchitecture(unittest.TestCase):
 		self.assertIn("permission_level", self.sources[POLICY_FILE])
 		self.assertEqual(check_policy_fields_only_in_policy(self.sources), [])
 
+	def test_runner_takes_tools_and_flags_from_grant(self):
+		self.assertIn("grant(", self.sources[RUNNER_FILE])
+		self.assertEqual(check_runner_takes_tools_and_flags_from_grant(self.sources), [])
+
+	def test_threshold_compared_only_in_policy(self):
+		self.assertIn("confidence_threshold", self.sources[POLICY_FILE])
+		self.assertEqual(check_threshold_compared_only_in_policy(self.sources), [])
+
+	def test_no_spent_comparison_outside_policy(self):
+		self.assertIn("monthly_budget_usd", self.sources[POLICY_FILE])
+		self.assertEqual(check_no_spent_comparison_outside_policy(self.sources), [])
+
 	def test_handlers_do_not_import_gateway_or_runner(self):
 		scanned = {rel: src for rel, src in self.sources.items() if rel == HANDLERS_FILE}
 		self.assertGreater(len(scanned), 0)
@@ -6722,6 +6734,157 @@ class TestScannersCatchViolations(unittest.TestCase):
 		self.assertEqual(check_policy_fields_only_in_policy({POLICY_FILE: inside}), [])
 		prose = "def f():\n\t'''The only reader of permission_level.'''\n"
 		self.assertEqual(check_policy_fields_only_in_policy({"handlers.py": prose}), [])
+
+	# threshold and spend comparisons -----------------------------------------------------------
+
+	def test_threshold_scanner_catches_comparison_outside_policy_and_allows_reads(self):
+		catch = (
+			(
+				"agent/runner.py",
+				"def f(settings, pct):\n\treturn pct < settings.confidence_threshold\n",
+				"agent/runner.py:2: compares confidence_threshold outside agent/policy.py",
+			),
+			(
+				"agent/tools/registry.py",
+				"def f(classification, threshold):\n\treturn classification.confidence_pct < threshold\n",
+				"compares confidence_pct",
+			),
+			(
+				"agent/tools/route_ticket.py",
+				"def f(c):\n\treturn c.confidence_pct < 70\n",
+				"compares confidence_pct",
+			),
+			(
+				"agent/runner.py",
+				"from erp_ai.agent import policy\ndef f(s, p):\n\treturn policy.confidence_threshold(s) > p\n",
+				"compares confidence_threshold",
+			),
+			(
+				"agent/classification.py",
+				"def f(data):\n\treturn 0 <= data['do_tin_cay_pct'] <= 100\n",
+				"compares do_tin_cay_pct",
+			),
+		)
+		for rel, source, fragment in catch:
+			with self.subTest(source=source):
+				self.assertCaught(check_threshold_compared_only_in_policy({rel: source}), fragment)
+		allow = (
+			(
+				"agent/runner.py",
+				"from erp_ai.agent import policy\n"
+				"def f(settings, pct):\n"
+				"\tthreshold = policy.confidence_threshold(settings)\n"
+				"\treturn policy.is_below_confidence(pct, threshold, has_instructor=True, act_now=False)\n",
+			),
+			(
+				"erp_ai_agent/doctype/erp_ai_setting/erp_ai_setting.py",
+				"INT_LIMITS = {'confidence_threshold': ('Ngưỡng độ tin cậy', 0, 100)}\n"
+				"def f(doc):\n"
+				"\tfor fieldname, (label, low, high) in INT_LIMITS.items():\n"
+				"\t\tvalue = doc.get(fieldname)\n"
+				"\t\tif value < low or (high is not None and value > high):\n"
+				"\t\t\treturn label\n",
+			),
+			(
+				"agent/classification.py",
+				"CONFIDENCE_PCT_MIN = 0\nCONFIDENCE_PCT_MAX = 100\n"
+				"def f(confidence_pct):\n\treturn CONFIDENCE_PCT_MIN <= confidence_pct <= CONFIDENCE_PCT_MAX\n",
+			),
+			("agent/runner.py", "def f(c):\n\treturn c.confidence_pct is None\n"),
+			(POLICY_FILE, "def f(pct, threshold):\n\treturn pct is None or pct < threshold\n"),
+		)
+		for rel, source in allow:
+			with self.subTest(allowed=source):
+				self.assertEqual(check_threshold_compared_only_in_policy({rel: source}), [])
+
+	def test_spent_scanner_catches_comparison_outside_policy_and_allows_reads(self):
+		catch = (
+			(
+				"agent/runner.py",
+				"def f(settings):\n\treturn settings.spent_this_month_usd > settings.monthly_budget_usd\n",
+				"agent/runner.py:2: compares spent_this_month_usd outside agent/policy.py",
+			),
+			(
+				"erp_ai_agent/report/erp_ai_cost/erp_ai_cost.py",
+				"import frappe\ndef f(budget):\n"
+				"\treturn frappe.db.get_single_value('ERP AI Setting', 'spent_this_month_usd', cache=False) >= budget\n",
+				"compares spent_this_month_usd",
+			),
+			(
+				"agent/tools/registry.py",
+				"from erp_ai.agent import policy\ndef f(settings, spend):\n\treturn spend > settings.monthly_budget_usd\n",
+				"compares monthly_budget_usd",
+			),
+			(
+				"agent/runner.py",
+				"from erp_ai.agent import policy\ndef f(limit):\n\treturn policy.month_spend_usd() > limit\n",
+				"compares month_spend_usd",
+			),
+		)
+		for rel, source, fragment in catch:
+			with self.subTest(source=source):
+				self.assertCaught(check_no_spent_comparison_outside_policy({rel: source}), fragment)
+		allow = (
+			(
+				"erp_ai_agent/report/erp_ai_cost/erp_ai_cost.py",
+				"import frappe\ndef f():\n"
+				"\tspent = frappe.db.get_single_value('ERP AI Setting', 'spent_this_month_usd', cache=False)\n"
+				"\treturn [('Đã chi', spent)]\n",
+			),
+			(
+				"tasks.py",
+				"import frappe\ndef f(spent_by_label):\n"
+				"\tfrappe.db.set_single_value('ERP AI Setting', 'spent_this_month_usd', sum(spent_by_label.values()))\n",
+			),
+			(
+				"erp_ai_agent/doctype/erp_ai_setting/erp_ai_setting.py",
+				"import frappe\nINT_LIMITS = {'monthly_budget_usd': ('Ngân sách tháng', 0, None)}\ndef f(doc):\n"
+				"\tdoc.spent_this_month_usd = frappe.db.get_single_value('ERP AI Setting', 'spent_this_month_usd', cache=False)\n",
+			),
+			(
+				"agent/runner.py",
+				"from erp_ai.agent import policy\ndef f(settings):\n\treturn policy.is_over_budget(settings)\n",
+			),
+			("agent/runner.py", "def f(settings):\n\treturn settings.spent_this_month_usd is None\n"),
+			(POLICY_FILE, "def f(settings, spend):\n\treturn spend > (settings.monthly_budget_usd or 0)\n"),
+		)
+		for rel, source in allow:
+			with self.subTest(allowed=source):
+				self.assertEqual(check_no_spent_comparison_outside_policy({rel: source}), [])
+
+	def test_runner_grant_scanner_catches_old_grant_path_and_allows_grant_reads(self):
+		runner = "from erp_ai.agent.tools.registry import grant\n"
+		catch = (
+			(runner + "def f(c):\n\treturn grants_change_tools(c)\n", "grants_change_tools"),
+			(
+				runner + "def f(c):\n\treturn registry.get_unrestricted_tool_schemas('L3')\n",
+				"get_unrestricted_tool_schemas",
+			),
+			(runner + "def f(c):\n\ttools = grant(c).schemas()\n\ttools.extend(more)\n", "tools"),
+			(runner + "def f(c):\n\ttools = [t for t in grant(c).schemas() if t]\n", "filters"),
+			(runner + "def f(c):\n\ttools = get_tool_schemas(c)\n", "get_tool_schemas"),
+		)
+		for source, fragment in catch:
+			with self.subTest(source=source):
+				self.assertCaught(
+					check_runner_takes_tools_and_flags_from_grant({RUNNER_FILE: source}), fragment
+				)
+		clean = (
+			runner
+			+ "def f(c, skipped, notes):\n"
+			+ "\tgranted = grant(c.grant_inputs())\n"
+			+ "\ttools = granted.schemas()\n"
+			+ "\tif tools:\n\t\ttools[-1]['cache_control'] = {}\n"
+			+ "\tskipped.extend(notes)\n"
+			+ "\treturn tools, granted.change_block\n"
+		)
+		self.assertEqual(check_runner_takes_tools_and_flags_from_grant({RUNNER_FILE: clean}), [])
+		self.assertEqual(
+			check_runner_takes_tools_and_flags_from_grant(
+				{"agent/other.py": "def f(c):\n\treturn grants_x(c)\n"}
+			),
+			[],
+		)
 
 	# handlers ----------------------------------------------------------------------------------
 

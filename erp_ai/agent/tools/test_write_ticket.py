@@ -1,4 +1,5 @@
-from unittest.mock import patch
+import json
+from unittest.mock import MagicMock, patch
 
 import frappe
 from frappe.model.document import Document
@@ -11,7 +12,14 @@ from erp_ai.agent.classification import Classification
 from erp_ai.agent.routing import decide_route
 from erp_ai.agent.tools import registry, write_ticket
 from erp_ai.agent.tools.registry import ToolContext, execute_tool
-from erp_ai.constants import AGENT_USER, CLASSIFIED_BY_AI, CLASSIFIED_BY_HUMAN, ROLE_AGENT
+from erp_ai.constants import (
+	AGENT_USER,
+	CLASSIFICATION_FIELDS,
+	CLASSIFIED_BY_AI,
+	CLASSIFIED_BY_HUMAN,
+	ROLE_AGENT,
+)
+from erp_ai.test_utils import keep_agent_settings
 
 AGENT = "t25.agent@example.com"
 CUSTOMER = "t25.customer@example.com"
@@ -86,7 +94,7 @@ class TestWriteTicket(FrappeTestCase):
 	def test_agent_writes_mapped_fields_and_ai_marks(self):
 		before = self._row()
 		started = now_datetime().replace(microsecond=0)
-		result = self._run(AGENT)
+		result = self._run(AGENT_USER)
 		self.assertTrue(result["ok"], result)
 		row = self._row()
 		self.assertEqual((row.ticket_type, row.agent_group, row.priority), (TICKET_TYPE, TEAM, "High"))
@@ -163,7 +171,7 @@ class TestWriteTicket(FrappeTestCase):
 	def test_mapping_to_missing_value_skips_field(self):
 		mapping = {"A": {"ticket_type": MISSING_TYPE, "agent_group": TEAM, "priority": "High"}}
 		before = self._row()
-		result = self._run(AGENT, mapping)
+		result = self._run(AGENT_USER, mapping)
 		self.assertTrue(result["ok"], result)
 		self.assertEqual([s["field"] for s in result["skipped"]], ["ticket_type"])
 		self.assertTrue(result["skipped"][0]["reason"])
@@ -612,3 +620,140 @@ class TestSetClassification(FrappeTestCase):
 		result = write_ticket.set_classification({"category": "A", "confidence": "Cao"}, self._ctx(mapping))
 		self.assertTrue(result["ok"], result)
 		self.assertEqual(result["skipped"], [{"field": "agent_group", "reason": "ánh xạ không có giá trị"}])
+
+
+T98_OTHER_TYPE = "T98 Loại khác"
+T98_OTHER_TEAM = "T98 Nhóm khác"
+T98_FIELDS = (*CLASSIFICATION_FIELDS, "ai_confidence", "ai_confidence_pct", "ai_classified_by")
+
+
+class ClassificationWriteCase(FrappeTestCase):
+	"""set_classification under AGENT_USER, the session runs use (design-w1-fixes-13 Điểm 1). Nothing commits."""
+
+	def setUp(self):
+		commit_guard = patch.object(frappe.db, "commit", side_effect=AssertionError("commit in test"))
+		commit_guard.start()
+		self.addCleanup(commit_guard.stop)
+		self.addCleanup(frappe.cache.hdel, "assignment_rule_map", "HD Ticket")
+		self.addCleanup(frappe.db.rollback)
+		self.addCleanup(frappe.set_user, "Administrator")
+		frappe.set_user("Administrator")
+		keep_agent_settings(self)
+		create_agent(AGENT)
+		_make_user(CUSTOMER, "HD Customer")
+		for ticket_type in (TICKET_TYPE, T98_OTHER_TYPE):
+			if not frappe.db.exists("HD Ticket Type", ticket_type):
+				frappe.get_doc({"doctype": "HD Ticket Type", "name": ticket_type}).insert()
+		for team in (TEAM, T98_OTHER_TEAM):
+			if not frappe.db.exists("HD Team", team):
+				frappe.get_doc({"doctype": "HD Team", "team_name": team, "users": [{"user": AGENT}]}).insert()
+		self.mapping = {"A": {"ticket_type": TICKET_TYPE, "agent_group": TEAM, "priority": "High"}}
+
+	def _ticket(self, **typed):
+		return make_ticket(subject="T98 phiếu", raised_by=CUSTOMER, **typed).name
+
+	def _row(self, ticket):
+		return frappe.db.get_value("HD Ticket", ticket, T98_FIELDS, as_dict=True)
+
+	def _run(self, ticket, **extra):
+		ctx = ToolContext(
+			ticket_name=ticket,
+			effective_level="L1",
+			instructor=None,
+			run_id="run-t98",
+			category_mapping=self.mapping,
+			agent_user=AGENT_USER,
+		)
+		frappe.set_user(AGENT_USER)
+		try:
+			return write_ticket.set_classification({"category": "A", "confidence": "Cao", **extra}, ctx)
+		finally:
+			frappe.set_user("Administrator")
+
+
+class TestHumanFields(ClassificationWriteCase):
+	"""AC-21: a field the person typed at creation is never overwritten by set_classification."""
+
+	def test_set_classification_skips_created_fields(self):
+		cases = (
+			({"priority": "Low"}, {"ticket_type": TICKET_TYPE, "agent_group": TEAM}),
+			({"ticket_type": T98_OTHER_TYPE, "agent_group": T98_OTHER_TEAM, "priority": "Low"}, {}),
+		)
+		for typed, written in cases:
+			with self.subTest(typed=typed):
+				ticket = self._ticket(**typed)
+				stored = frappe.db.get_value("HD Ticket", ticket, write_ticket.CREATED_LABELS_FIELD)
+				self.assertEqual(json.loads(stored), typed)
+				before = self._row(ticket)
+
+				result = self._run(ticket)
+
+				self.assertTrue(result["ok"], result)
+				row = self._row(ticket)
+				self.assertEqual({field: row[field] for field in CLASSIFICATION_FIELDS}, {**written, **typed})
+				self.assertEqual(
+					result["skipped"],
+					[
+						{"field": field, "reason": write_ticket.REASON_HUMAN_FILLED}
+						for field in CLASSIFICATION_FIELDS
+						if field in typed
+					],
+				)
+				self.assertFalse(set(result["after"]) & set(typed), result["after"])
+				self.assertFalse(set(result["before"]) & set(typed), result["before"])
+				self.assertEqual(
+					row.ai_classified_by, CLASSIFIED_BY_AI if written else before.ai_classified_by
+				)
+
+	def test_invalid_created_labels_write_none_of_three(self):
+		every = dict.fromkeys(CLASSIFICATION_FIELDS, True)
+		self.assertEqual(write_ticket.created_labels(None), {})
+		self.assertEqual(write_ticket.created_labels(""), {})
+		self.assertEqual(write_ticket.created_labels('{"priority": "Low"}'), {"priority": "Low"})
+		ticket = self._ticket()
+		before = self._row(ticket)
+		every_field_human = [
+			{"field": field, "reason": write_ticket.REASON_HUMAN_FILLED} for field in CLASSIFICATION_FIELDS
+		]
+		for raw in ("{không phải JSON", "[]", '"priority"', "null", '{"priority": "Low", "status": "Open"}'):
+			with self.subTest(raw=raw):
+				self.assertEqual(write_ticket.created_labels(raw), every)
+				frappe.db.set_value(
+					"HD Ticket", ticket, write_ticket.CREATED_LABELS_FIELD, raw, update_modified=False
+				)
+				logger = MagicMock()
+
+				with patch.object(frappe, "logger", return_value=logger):
+					result = self._run(ticket)
+
+				self.assertTrue(result["ok"], result)
+				self.assertEqual((result["before"], result["after"]), ({}, {}))
+				self.assertEqual(result["skipped"], every_field_human)
+				self.assertEqual(self._row(ticket), before)
+				self.assertEqual(
+					[call.args[0] for call in logger.warning.call_args_list],
+					[f"erp_ai created_labels invalid ticket={ticket}"],
+				)
+
+
+class TestConfidenceSource(ClassificationWriteCase):
+	"""AC-22 (W-2): apply_route is the only writer of ai_confidence_pct; set_classification neither takes nor writes it."""
+
+	def test_set_classification_never_writes_confidence_pct(self):
+		ticket = self._ticket()
+		frappe.db.set_value("HD Ticket", ticket, "ai_confidence_pct", 85, update_modified=False)
+
+		result = self._run(ticket, confidence_pct=40)
+
+		self.assertTrue(result["ok"], result)
+		self.assertEqual(result["after"]["priority"], "High")
+		self.assertNotIn("ai_confidence_pct", result["before"])
+		self.assertNotIn("ai_confidence_pct", result["after"])
+		self.assertEqual(self._row(ticket).ai_confidence_pct, 85)
+
+	def test_set_classification_schema_has_no_confidence_pct(self):
+		(spec,) = [spec for spec in write_ticket.TOOLS if spec.name == "set_classification"]
+		input_schema = spec.schema["input_schema"]
+		self.assertEqual(set(input_schema["properties"]), {"category", "confidence"})
+		self.assertNotIn("confidence_pct", input_schema["required"])
+		self.assertNotIn("confidence_pct", json.dumps(spec.schema))

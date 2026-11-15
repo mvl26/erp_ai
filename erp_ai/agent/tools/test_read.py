@@ -1,4 +1,3 @@
-import json
 import uuid
 from unittest.mock import patch
 
@@ -443,6 +442,7 @@ class TestSearchResolvedTickets(FrappeTestCase):
 					"users": [{"user": "Administrator"}],
 				}
 			).insert(ignore_permissions=True)
+		create_agent(AGENT_A)  # the assignee of a ToDo must be a real user
 		# Words no other ticket of the site holds.
 		self.tag = f"zq{uuid.uuid4().hex[:8]}"
 
@@ -523,3 +523,84 @@ class TestSearchResolvedTickets(FrappeTestCase):
 		word = f"{self.tag}_ma_loi"
 		ticket = self.resolved(f"Lỗi {word} khi in")
 		self.assertEqual(self.names(word), [ticket])
+
+	def without_details(self, assigned):
+		"""A resolved ticket with no resolution detail, assigned (ToDo rows, as Frappe assigns) to `assigned`."""
+		name = self.resolved(f"{self.word('tim')} máy in", details="")
+		for user in assigned:
+			frappe.get_doc(
+				{
+					"doctype": "ToDo",
+					"reference_type": "HD Ticket",
+					"reference_name": name,
+					"allocated_to": user,
+					"description": "t154",
+				}
+			).insert(ignore_permissions=True)
+		return name
+
+	def comment(self, ticket, owner, content, creation, comment_type="Comment"):
+		"""A comment of `owner` on the ticket at `creation`, saved without hooks."""
+		frappe.get_doc(
+			{
+				"doctype": "Comment",
+				"comment_type": comment_type,
+				"reference_doctype": "HD Ticket",
+				"reference_name": ticket,
+				"content": content,
+				"owner": owner,
+				"creation": creation,
+				"modified": creation,
+			}
+		).db_insert()
+
+	def found(self, ticket):
+		result = read.search_resolved_tickets({"query": self.word("tim")}, _ctx())
+		self.assertTrue(result["ok"], result)
+		return next(row for row in result["tickets"] if row["name"] == ticket)
+
+	def test_empty_resolution_returns_resolver_comments(self):
+		ticket = self.without_details([AGENT_A])
+		contents = ("<p>c0</p>", "<p>c1</p>", "<p>Đã <b>thay</b> mực</p>", "<p>" + "a" * 2500 + "</p>")
+		for index, content in enumerate(contents):
+			self.comment(ticket, AGENT_A, content, f"2030-01-0{index + 1} 00:00:00")
+		# Newer, but not a ticket comment, or not written by an assignee.
+		self.comment(ticket, AGENT_A, "<p>hệ thống</p>", "2030-02-01 00:00:00", comment_type="Info")
+		self.comment(ticket, INSTRUCTOR, "<p>không phụ trách</p>", "2030-02-02 00:00:00")
+		row = self.found(ticket)
+		self.assertEqual(set(row), RESULT_KEYS | {"resolver_comments"})
+		self.assertEqual(row["resolution_details"], "")
+		self.assertEqual(row["resolver_comments"], ["a" * read.COMMENT_MAX_CHARS, "Đã thay mực", "c1"])
+		self.assertEqual(read.RESOLVER_COMMENTS_MAX, 3)
+		# A ticket with a resolution detail has no such key.
+		detailed = self.resolved(f"{self.word('tim')} khác")
+		frappe.get_doc(
+			{
+				"doctype": "ToDo",
+				"reference_type": "HD Ticket",
+				"reference_name": detailed,
+				"allocated_to": AGENT_A,
+				"description": "t154",
+			}
+		).insert(ignore_permissions=True)
+		self.comment(detailed, AGENT_A, "<p>c</p>", "2030-01-01 00:00:00")
+		self.assertEqual(set(self.found(detailed)), RESULT_KEYS)
+
+	def test_empty_resolution_no_comment(self):
+		assigned = self.without_details([AGENT_A])
+		self.comment(assigned, INSTRUCTOR, "<p>người khác</p>", "2030-01-01 00:00:00")
+		unassigned = self.without_details([])
+		self.comment(unassigned, AGENT_A, "<p>chưa giao</p>", "2030-01-01 00:00:00")
+		for ticket in (assigned, unassigned):
+			with self.subTest(ticket=ticket):
+				self.assertEqual(self.found(ticket)["resolver_comments"], [])
+
+	def test_bot_comments_excluded(self):
+		ticket = self.without_details([AGENT_USER, AGENT_A])
+		self.comment(ticket, AGENT_A, "<p>người phụ trách</p>", "2030-01-01 00:00:00")
+		for index in range(3):
+			self.comment(ticket, AGENT_USER, f"<p>bot {index}</p>", f"2030-01-0{index + 2} 00:00:00")
+		self.assertEqual(self.found(ticket)["resolver_comments"], ["người phụ trách"])
+		bot_only = self.without_details([AGENT_USER])
+		self.comment(bot_only, AGENT_USER, "<p>bot</p>", "2030-01-01 00:00:00")
+		self.assertEqual(self.found(bot_only)["resolver_comments"], [])

@@ -119,6 +119,48 @@ def has_excluded_title(subject) -> bool:
 	return any(title.startswith(prefix) for prefix in excluded_title_prefixes())
 
 
+def _like_core(key: str) -> str:
+	"""A LIKE pattern that matches every subject whose normalized start is `key`, and a few more.
+
+	Words are joined with `%` so a subject with other spaces still matches; `\\ % _` are escaped like
+	read._like_pattern (policy must not import tools).
+	"""
+	words = (word.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") for word in key.split())
+	return "%" + "%".join(words) + "%"
+
+
+def excluded_team_names() -> list[str]:
+	"""Names of the real HD Teams listed in excluded_teams (same comparison as is_excluded_team)."""
+	excluded = frappe.db.get_single_value(SETTING_DOCTYPE, EXCLUDED_TEAMS_FIELD) or ""
+	keys = {_normalize(line) for line in excluded.splitlines()} - {""}
+	if not keys:
+		return []
+	return [name for name in frappe.get_all("HD Team", pluck="name") if _normalize(name) in keys]
+
+
+def excluded_ticket_names() -> list:
+	"""Names of the HD Tickets that send_refusal refuses: the query form of the send predicate.
+
+	Step 1 selects a superset with one frappe.get_all (an OR of the rules; the optional arms only when their
+	set is not empty); step 2 keeps the rows the predicate itself refuses, so the two forms cannot differ.
+	A database error is raised to the caller.
+	"""
+	or_filters = [[OPT_OUT_FIELD, "=", 1]]
+	if teams := excluded_team_names():
+		or_filters.append([TEAM_FIELD, "in", teams])
+	or_filters.extend([SUBJECT_FIELD, "like", _like_core(prefix)] for prefix in excluded_title_prefixes())
+	classified = frappe.get_all(
+		LOG_DOCTYPE,
+		filters={"entry_type": "classify", "stop_reason": EXCLUDED_BY_CLASSIFICATION},
+		pluck="ticket",
+		distinct=True,
+	)
+	if classified := [name for name in classified if name]:
+		or_filters.append(["name", "in", classified])
+	rows = frappe.get_all(TICKET_DOCTYPE, or_filters=or_filters, fields=["name", *SEND_POLICY_FIELDS])
+	return [row.name for row in rows if send_refusal(row) is not None]
+
+
 def auto_assign_enabled(settings) -> bool:
 	"""The only reader of the auto-assign switch; missing or 0 means off."""
 	return bool(getattr(settings, "auto_assign_enabled", 0))

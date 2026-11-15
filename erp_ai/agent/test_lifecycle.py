@@ -1,13 +1,14 @@
 import ast
 import inspect
+from datetime import datetime, timedelta
 from unittest.mock import patch
 
 import frappe
 from frappe.tests.utils import FrappeTestCase
 from helpdesk.test_utils import make_ticket
 
-from erp_ai.agent import lifecycle, policy
-from erp_ai.constants import SETTING_DOCTYPE, TRIGGER_TICKET_INSERT
+from erp_ai.agent import authority, lifecycle, policy
+from erp_ai.constants import AGENT_USER, SETTING_DOCTYPE, TRIGGER_TICKET_INSERT
 from erp_ai.test_utils import keep_agent_settings, make_log_entry, pin_agent_roles, set_agent_settings
 
 # A real HD Ticket field erp_ai installs (Small Text), so no test creates a Custom Field (its ALTER TABLE commits).
@@ -17,6 +18,14 @@ OTHER_ORIGIN = "Phòng ban"
 LIFECYCLE_MODULE = "erp_ai.agent.lifecycle"
 GATEWAY_MODULES = ("erp_ai.gateway",)
 TOOLS_OR_RUNNER_MODULES = ("erp_ai.agent.tools", "erp_ai.agent.runner")
+# Every test message is dated in 2001: no live Communication of the shared site falls in a test's window.
+DAY0 = datetime(2001, 1, 1, 8, 0, 0)
+# Helpdesk sends an agent reply as an email (Email Queue, delayed) only with these settings.
+EMAIL_REPLY_SETTINGS = {
+	"enable_reply_email_via_agent": 1,
+	"skip_email_workflow": 0,
+	"instantly_send_email": 0,
+}
 
 
 def _forbidden_imports(source: str, forbidden: tuple[str, ...]) -> list[str]:
@@ -93,6 +102,47 @@ class LifecycleTestCase(FrappeTestCase):
 				predicted_category=category,
 			)
 		return str(ticket.name)
+
+	def _requester(self, ticket) -> str:
+		return frappe.db.get_value("HD Ticket", ticket, "raised_by")
+
+	def _message(self, ticket, sent_or_received, creation, sender, owner="Administrator", name=None) -> str:
+		"""A Communication of `ticket` stored as is (no Helpdesk hook runs, so the ticket is left as it was)."""
+		doc = frappe.get_doc(
+			{
+				"doctype": "Communication",
+				"name": name,
+				"communication_type": "Communication",
+				"communication_medium": "Email",
+				"sent_or_received": sent_or_received,
+				"reference_doctype": "HD Ticket",
+				"reference_name": ticket,
+				"sender": sender,
+				"subject": "ERPAI-TEST lifecycle",
+				"content": "ERPAI-TEST lifecycle message",
+				"owner": owner,
+				"modified_by": owner,
+				"creation": creation,
+				"modified": creation,
+			}
+		)
+		doc.db_insert()
+		return doc.name
+
+	def _bot_message(self, ticket, creation) -> str:
+		return self._message(ticket, "Sent", creation, sender=AGENT_USER, owner=AGENT_USER)
+
+	def _requester_message(self, ticket, creation, name=None) -> str:
+		return self._message(ticket, "Received", creation, sender=self._requester(ticket), name=name)
+
+	def _email_settings(self) -> None:
+		"""Helpdesk queues an email for an agent reply; the cached HD Settings doc is dropped after the test."""
+		self.addCleanup(frappe.clear_document_cache, "HD Settings", "HD Settings")
+		frappe.db.set_single_value("HD Settings", EMAIL_REPLY_SETTINGS)
+		self.assertTrue(
+			frappe.db.exists("Email Account", {"enable_outgoing": 1, "default_outgoing": 1}),
+			"the site needs a default outgoing Email Account",
+		)
 
 
 class TestLifecycleSettings(LifecycleTestCase):
@@ -178,6 +228,102 @@ class TestStatusGuard(LifecycleTestCase):
 			"chưa cấu hình trường Nguồn phát sinh (field_origin, origin_board_value)",
 		)
 		self.assertEqual(lifecycle.TITLE_LIFECYCLE_FAILED, "ERP AI lifecycle failed")
+
+
+class TestRequesterMessages(LifecycleTestCase):
+	def test_sender_match_ignores_display_name_and_case(self):
+		"""A-U6b-9: senders compare by their email address only, after casefold."""
+		requester = "nguyen.a@example.com"
+		for sender, expected in (
+			("nguyen.a@example.com", True),
+			("Nguyễn Văn A <Nguyen.A@Example.COM>", True),
+			("NGUYEN.A@EXAMPLE.COM", True),
+			("nguyen.b@example.com", False),
+			("Nguyen A <nguyen.a@example.org>", False),
+			("", False),
+			(None, False),
+		):
+			with self.subTest(sender=sender):
+				self.assertIs(lifecycle.is_requester_sender(sender, requester), expected)
+		self.assertTrue(lifecycle.is_requester_sender(requester, "Người tạo <Nguyen.A@example.com>"))
+		self.assertFalse(lifecycle.is_requester_sender("", ""))
+		self.assertFalse(lifecycle.is_requester_sender(None, None))
+
+	def test_newer_message_detected_by_creation_then_name(self):
+		"""U6b-fixes :64: another Received message of the requester with a larger (creation, name)."""
+		ticket = self._ticket()
+		base = f"ERPAI-TEST-{frappe.generate_hash(length=8)}"
+		given = self._requester_message(ticket, DAY0, name=f"{base}-b")
+		self.assertFalse(lifecycle.newer_requester_message_exists(ticket, given))
+
+		self._message(ticket, "Received", DAY0 + timedelta(hours=1), sender="other@example.com")
+		self._bot_message(ticket, DAY0 + timedelta(hours=1))
+		self._requester_message(ticket, DAY0, name=f"{base}-a")  # same creation, smaller name: not newer
+		self.assertFalse(lifecycle.newer_requester_message_exists(ticket, given))
+
+		self._requester_message(ticket, DAY0, name=f"{base}-c")  # same creation, larger name: newer
+		self.assertTrue(lifecycle.newer_requester_message_exists(ticket, given))
+
+		later = self._ticket()
+		first = self._requester_message(later, DAY0, name=f"{base}-z")
+		self._requester_message(later, DAY0 + timedelta(seconds=1), name=f"{base}-y")  # later creation wins
+		self.assertTrue(lifecycle.newer_requester_message_exists(later, first))
+
+	def test_silent_since_stops_on_requester_reply_and_restarts_on_next_bot_message(self):
+		"""AC-41 last sentence, AC-44: the clock runs from the bot's last message until the requester replies."""
+		ticket = self._ticket()
+		requester = self._requester(ticket)
+		self.assertIsNone(lifecycle.silent_since(ticket))
+		self._requester_message(ticket, DAY0)  # the opening email: no bot message yet
+		self.assertIsNone(lifecycle.silent_since(ticket))
+
+		first_bot = DAY0 + timedelta(hours=1)
+		self._bot_message(ticket, first_bot)
+		self.assertEqual(lifecycle.silent_since(ticket), first_bot)
+		self._message(ticket, "Sent", DAY0 + timedelta(hours=2), sender="Administrator")  # a person's reply
+		self._message(ticket, "Received", DAY0 + timedelta(hours=3), sender="other@example.com")
+		self._bot_message(self._ticket(), DAY0 + timedelta(hours=4))  # another ticket's bot message
+		self.assertEqual(lifecycle.silent_since(ticket), first_bot)
+
+		self._message(ticket, "Received", DAY0 + timedelta(days=1), sender=f"Người tạo <{requester.upper()}>")
+		self.assertIsNone(lifecycle.silent_since(ticket))
+
+		next_bot = DAY0 + timedelta(days=2)
+		self._bot_message(ticket, next_bot)
+		self.assertEqual(lifecycle.silent_since(ticket), next_bot)
+
+	def test_send_goes_only_to_raised_by(self):
+		"""AC-40, ADR-034 QĐ 7: one Communication Sent by the agent to raised_by, one queued email, no comment."""
+		self._email_settings()
+		ticket = self._ticket()
+		requester = self._requester(ticket)
+		self._bot_message(ticket, DAY0)  # an older bot message: the name returned is the new one
+		self.assertTrue(authority.enter_agent_session())
+
+		name = lifecycle.send_to_requester(ticket, "<p>ERPAI-TEST trả lời người tạo</p>")
+
+		communication = frappe.get_doc("Communication", name)
+		self.assertEqual(communication.recipients, requester)
+		self.assertEqual(communication.sent_or_received, "Sent")
+		self.assertEqual(communication.owner, AGENT_USER)
+		self.assertEqual(
+			(communication.reference_doctype, communication.reference_name), ("HD Ticket", ticket)
+		)
+		self.assertIn("ERPAI-TEST trả lời người tạo", communication.content)
+		queues = frappe.get_all("Email Queue", filters={"communication": name}, fields=["name", "status"])
+		self.assertEqual(len(queues), 1)
+		self.assertEqual(queues[0].status, "Not Sent")
+		self.assertEqual(
+			frappe.get_all("Email Queue Recipient", filters={"parent": queues[0].name}, pluck="recipient"),
+			[requester],
+		)
+		self.assertEqual(
+			frappe.db.count(
+				"Comment",
+				{"reference_doctype": "HD Ticket", "reference_name": ticket, "comment_type": "Comment"},
+			),
+			0,
+		)
 
 
 class TestArchitecture(FrappeTestCase):

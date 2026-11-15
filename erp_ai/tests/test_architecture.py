@@ -157,9 +157,22 @@ TOOL_FORBIDDEN_CALL_SUFFIXES = ("db.set_value", "set_user", "db.multisql", "db_u
 SQL_READ_ONLY = re.compile(r"^\s*(select|show|describe)\b", re.IGNORECASE)
 
 # ADR-001: product code imports only the standard library, frappe, helpdesk and itself; `anthropic` (declared
-# in pyproject.toml `dependencies`) only in gateway/client.py (NFR-5). Anything else, any other app, is a violation.
+# in pyproject.toml `dependencies`) only in gateway/client.py (NFR-5); the one named exception is
+# NAMED_LIBRARY_IMPORTS below. Anything else, any other app, is a violation.
 ALLOWED_TOP_LEVEL_MODULES = frozenset({PACKAGE, "frappe", "helpdesk", *sys.stdlib_module_names})
 ANTHROPIC_MODULE = "anthropic"
+# ADR-040 Phán quyết C-3: the one named exception to ADR-001, `{file: top-level libraries it may import}`
+# (versions pinned by frappe, not by erp_ai); how restart_check uses them is check_restart_check_library_use's.
+RESTART_CHECK_FILE = "agent/changes/restart_check.py"
+NAMED_LIBRARY_IMPORTS = {RESTART_CHECK_FILE: frozenset({"psutil", "redis"})}
+RESTART_CHECK_LIBRARIES = tuple(sorted(NAMED_LIBRARY_IMPORTS[RESTART_CHECK_FILE]))
+RESTART_CHECK_ALLOWED_NAMES = frozenset(
+	{"psutil", "redis", "psutil.Process", "psutil.Error", "redis.exceptions", "redis.exceptions.RedisError"}
+)
+RESTART_CHECK_FORBIDDEN_METHODS = frozenset(
+	{"kill", "terminate", "send_signal", "suspend", "resume", "nice", "ionice", "rlimit", "cpu_affinity"}
+)
+RESTART_CHECK_FORBIDDEN_MODULES = ("subprocess", "signal", "os.kill", "os.killpg")
 
 POLICY_FIELDS = (
 	"permission_level",
@@ -536,18 +549,83 @@ def check_layer_imports(sources: dict, rules=LAYER_RULES) -> list:
 
 
 def check_import_boundaries(sources: dict) -> list:
-	"""ADR-001 allowlist: stdlib, frappe, helpdesk, erp_ai; NFR-5/ADR-002: `anthropic` only in gateway/client.py."""
+	"""ADR-001 allowlist: stdlib, frappe, helpdesk, erp_ai; NFR-5/ADR-002: `anthropic` only in gateway/client.py;
+	ADR-040 C-3: a library in NAMED_LIBRARY_IMPORTS only in its file, and a dead exception (the file is gone,
+	or no longer imports a listed name) is itself a violation. "Gone" is read from disk, so a partial
+	`sources` (the self-checks) does not count as a deleted file."""
 	violations = []
 	for rel, source in only_python(sources).items():
 		imports = imported_modules(parse(rel, source), module_name(rel), rel.endswith("__init__.py"))
+		named = NAMED_LIBRARY_IMPORTS.get(rel, ())
 		for lineno, target in imports:
 			if module_in(target, ANTHROPIC_MODULE):
 				if rel != CLIENT_FILE:
 					violations.append(f"{rel}:{lineno}: imports {target} outside {CLIENT_FILE} (NFR-5)")
-			elif target.split(".")[0] not in ALLOWED_TOP_LEVEL_MODULES:
+			elif target.split(".")[0] not in ALLOWED_TOP_LEVEL_MODULES and target.split(".")[0] not in named:
 				violations.append(
 					f"{rel}:{lineno}: imports {target}, not stdlib/frappe/helpdesk/erp_ai (ADR-001: no other app or library)"
 				)
+	for rel, names in NAMED_LIBRARY_IMPORTS.items():
+		if rel not in sources:
+			if not (PACKAGE_ROOT / rel).is_file():
+				violations.append(f"{rel}: file gone, dead exception in NAMED_LIBRARY_IMPORTS (ADR-040 C-3)")
+			continue
+		imported = {
+			target.split(".")[0]
+			for _lineno, target in imported_modules(parse(rel, sources[rel]), module_name(rel), False)
+		}
+		violations.extend(
+			f"{rel}: no longer imports {name}, dead exception in NAMED_LIBRARY_IMPORTS (ADR-040 C-3)"
+			for name in sorted(names - imported)
+		)
+	return violations
+
+
+def _is_restart_library(name: str) -> bool:
+	return any(module_in(name, library) for library in RESTART_CHECK_LIBRARIES)
+
+
+def check_restart_check_library_use(sources: dict) -> list:
+	"""ADR-040 C-3: restart_check.py only reads. psutil/redis only as psutil.Process, psutil.Error,
+	redis.exceptions(.RedisError), in imports and attribute references; no signalling or tuning method call
+	(kill, terminate, ...); no subprocess, os.kill, os.killpg or signal (design 4.4: no subprocess)."""
+	source = sources.get(RESTART_CHECK_FILE)
+	if source is None:
+		return _missing(RESTART_CHECK_FILE)
+	tree = parse(RESTART_CHECK_FILE, source)
+	aliases = import_aliases(tree)
+	violations = []
+	for node in ast.walk(tree):
+		if isinstance(node, ast.Import | ast.ImportFrom):
+			base = "" if isinstance(node, ast.Import) or node.level else f"{node.module}."
+			for alias in node.names:
+				name = base + alias.name
+				if _is_restart_library(name) and name not in RESTART_CHECK_ALLOWED_NAMES:
+					violations.append(violation(RESTART_CHECK_FILE, node, f"imports {name} (ADR-040 C-3)"))
+				elif any(module_in(name, forbidden) for forbidden in RESTART_CHECK_FORBIDDEN_MODULES):
+					violations.append(
+						violation(RESTART_CHECK_FILE, node, f"imports {name} (ADR-040 C-3: read only)")
+					)
+		elif isinstance(node, ast.Attribute) and "()" not in (name := resolved_name(node, aliases)):
+			# a chain through a call (`psutil.Process(pid).create_time`) is a method of an allowed object
+			if _is_restart_library(name) and name not in RESTART_CHECK_ALLOWED_NAMES:
+				violations.append(violation(RESTART_CHECK_FILE, node, f"uses {name} (ADR-040 C-3)"))
+			elif any(module_in(name, forbidden) for forbidden in RESTART_CHECK_FORBIDDEN_MODULES):
+				violations.append(
+					violation(RESTART_CHECK_FILE, node, f"uses {name} (ADR-040 C-3: read only)")
+				)
+		if (
+			isinstance(node, ast.Call)
+			and isinstance(node.func, ast.Attribute)
+			and node.func.attr in RESTART_CHECK_FORBIDDEN_METHODS
+		):
+			violations.append(
+				violation(
+					RESTART_CHECK_FILE,
+					node,
+					f"calls .{node.func.attr}() (ADR-040 C-3: never signal a process)",
+				)
+			)
 	return violations
 
 
@@ -4455,6 +4533,11 @@ class TestArchitecture(unittest.TestCase):
 			)
 		self.assertEqual(check_layer_imports(self.sources), [])
 		self.assertEqual(check_import_boundaries(self.sources), [])
+		self.assertIn("import psutil", self.sources["agent/changes/restart_check.py"])
+
+	def test_restart_check_library_use(self):
+		self.assertIn("agent/changes/restart_check.py", self.sources)
+		self.assertEqual(check_restart_check_library_use(self.sources), [])
 
 	def test_single_enqueue_call_site(self):
 		scanned = only_python(self.sources)
@@ -5605,6 +5688,81 @@ class TestScannersCatchViolations(unittest.TestCase):
 			"from erp_ai import alerts\nfrom . import policy\nfrom .prompts import build\n"
 		)
 		self.assertEqual(check_import_boundaries({"agent/runner.py": clean}), [])
+
+	def test_import_boundaries_named_library_only_in_restart_check(self):
+		restart = "agent/changes/restart_check.py"
+		caught = {
+			"psutil elsewhere": ("agent/changes/apply_job.py", "import psutil\n", "psutil"),
+			"redis elsewhere": ("agent/runner.py", "import redis\n", "redis"),
+			"requests in restart_check": (
+				restart,
+				"import psutil\nimport redis\nimport requests\n",
+				"requests",
+			),
+			"rq in restart_check": (restart, "import psutil\nimport redis\nimport rq\n", "rq"),
+		}
+		for label, (rel, source, fragment) in caught.items():
+			with self.subTest(label):
+				self.assertCaught(check_import_boundaries({rel: source}), f"{rel}:", fragment)
+		self.assertEqual(check_import_boundaries({restart: "import psutil\nimport redis\n"}), [])
+		self.assertEqual(
+			check_import_boundaries({restart: "from psutil import Process\nfrom redis import exceptions\n"}),
+			[],
+		)
+		# dead exception: the file no longer imports a listed name (a comment or a string does not count)
+		no_redis = "import psutil\n# import redis\nNAME = 'redis'\n"
+		self.assertCaught(check_import_boundaries({restart: no_redis}), restart, "redis", "dead exception")
+		with patch(f"{__name__}.NAMED_LIBRARY_IMPORTS", {"agent/changes/gone.py": frozenset({"psutil"})}):
+			self.assertCaught(
+				check_import_boundaries({restart: "import os\n"}), "agent/changes/gone.py", "dead exception"
+			)
+		self.assertEqual(NAMED_LIBRARY_IMPORTS, {restart: frozenset({"psutil", "redis"})})
+
+	def test_restart_check_library_use_catches_signals_and_clients(self):
+		restart = "agent/changes/restart_check.py"
+		head = "import os\nimport psutil\nimport redis\n"
+		cases = {
+			# a method call that signals or tunes a process (only the attribute-call condition sees it)
+			"kill": "psutil.Process(1).kill()\n",
+			"terminate": "p = psutil.Process(1)\np.terminate()\n",
+			"send_signal": "psutil.Process(1).send_signal(15)\n",
+			"suspend": "psutil.Process(1).suspend()\n",
+			"resume": "psutil.Process(1).resume()\n",
+			"nice": "psutil.Process(1).nice(5)\n",
+			"ionice": "psutil.Process(1).ionice(0)\n",
+			"rlimit": "psutil.Process(1).rlimit(0)\n",
+			"cpu_affinity": "psutil.Process(1).cpu_affinity([0])\n",
+			# an attribute of psutil/redis outside the allowed set (only the attribute-reference condition)
+			"psutil.process_iter": "psutil.process_iter()\n",
+			"redis.Redis": "redis.Redis()\n",
+			"redis.Redis#alias": "import redis as r\nr.Redis()\n",
+			"redis.exceptions.ConnectionError": "E = redis.exceptions.ConnectionError\n",
+			# an import of a name outside the allowed set (only the import condition)
+			"psutil.process_iter#from": "from psutil import process_iter\n",
+			"redis.Redis#from": "from redis import Redis as R\n",
+			"redis.client": "import redis.client\n",
+			# subprocess, os.kill, os.killpg, signal (only the forbidden-module condition)
+			"os.kill": "os.kill(1, 15)\n",
+			"os.kill#alias": "from os import kill as k\nk(1, 15)\n",
+			"os.killpg": "os.killpg(1, 15)\n",
+			"subprocess": "import subprocess\n",
+			"signal": "import signal\n",
+			"signal.SIGTERM": "import signal as s\nn = s.SIGTERM\n",
+		}
+		for fragment, body in cases.items():
+			with self.subTest(fragment):
+				self.assertCaught(
+					check_restart_check_library_use({restart: head + body}),
+					f"{restart}:",
+					fragment.partition("#")[0],
+				)
+		allowed = (
+			head + "from psutil import Error, Process\nfrom redis.exceptions import RedisError\n"
+			"ERRORS = (redis.exceptions.RedisError, psutil.Error)\n"
+			"t = psutil.Process(os.getppid()).create_time()\nos.getppid()\n"
+		)
+		self.assertEqual(check_restart_check_library_use({restart: allowed}), [])
+		self.assertCaught(check_restart_check_library_use({}), restart, "missing")
 
 	# enqueue -----------------------------------------------------------------------------------
 

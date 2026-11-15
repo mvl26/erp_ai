@@ -27,7 +27,7 @@ import unittest
 from pathlib import Path
 from typing import ClassVar, NamedTuple
 
-from erp_ai.constants import AGENT_STATUS_EVENT, PANEL_METHODS
+from erp_ai.constants import AGENT_STATUS_EVENT, AGENT_USER, PANEL_METHODS
 
 PACKAGE_ROOT = Path(__file__).resolve().parent.parent
 REPO_ROOT = PACKAGE_ROOT.parent
@@ -4517,6 +4517,83 @@ def check_run_limit_triggers_subset_of_log_triggers(sources: dict) -> list:
 	return violations
 
 
+# ADR-033 QĐ 1 / U1.md: the one function that switches a job's session to the agent account.
+SESSION_SWITCH_FUNCTION = "enter_agent_session"
+SET_USER_NAME = "set_user"
+
+
+def _sets_agent_user(node, aliases: dict) -> bool:
+	"""`set_user(AGENT_USER)` in any spelling: module path, alias, keyword or the account's literal."""
+	if not isinstance(node, ast.Call) or resolved_name(node.func, aliases).split(".")[-1] != SET_USER_NAME:
+		return False
+	for value in (*node.args, *(keyword.value for keyword in node.keywords)):
+		if isinstance(value, ast.Constant) and value.value == AGENT_USER:
+			return True
+		if resolved_name(value, aliases).split(".")[-1] == AGENT_USER_NAME:
+			return True
+	return False
+
+
+def check_set_user_agent_only_in_enter_agent_session(sources: dict) -> list:
+	"""ADR-033 QĐ 1: `set_user(AGENT_USER)` is called exactly once, inside authority.enter_agent_session."""
+	if AUTHORITY_FILE not in sources:
+		return _missing(AUTHORITY_FILE)
+	violations = []
+	allowed = 0
+	for rel, source in only_python(sources).items():
+		tree = parse(rel, source)
+		aliases = import_aliases(tree)
+		inside = set()
+		if rel == AUTHORITY_FILE:
+			for function in tree.body:
+				if isinstance(function, ast.FunctionDef) and function.name == SESSION_SWITCH_FUNCTION:
+					inside = {id(node) for node in ast.walk(function)}
+		for node in ast.walk(tree):
+			if not _sets_agent_user(node, aliases):
+				continue
+			if id(node) in inside:
+				allowed += 1
+			else:
+				violations.append(
+					violation(
+						rel,
+						node,
+						f"switches to the agent account outside {AUTHORITY_FILE} "
+						f"{SESSION_SWITCH_FUNCTION} (ADR-033 QĐ 1)",
+					)
+				)
+	if allowed != 1:
+		violations.append(
+			f"{AUTHORITY_FILE}: {SESSION_SWITCH_FUNCTION} must call {SET_USER_NAME}({AGENT_USER_NAME}) "
+			f"exactly once, found {allowed} (ADR-033 QĐ 1)"
+		)
+	return violations
+
+
+# Compliant sample of the ADR-033 QĐ 1 rule; each violating sample is one change of it.
+SESSION_SWITCH_CLEAN = {
+	AUTHORITY_FILE: """import frappe
+
+from erp_ai.constants import AGENT_USER
+
+
+def enter_agent_session():
+	frappe.set_user(AGENT_USER)
+	return frappe.session.user == AGENT_USER
+""",
+	RUNNER_FILE: """import frappe
+
+from erp_ai.agent import authority
+
+
+def _run(ticket_name):
+	if not authority.enter_agent_session():
+		return
+	frappe.set_user("Administrator")
+""",
+}
+
+
 # Compliant sample: policy names the two constants, the log lists the same triggers as strings.
 RUN_LIMIT_SAMPLE = {
 	CONSTANTS_FILE: (
@@ -5550,6 +5627,10 @@ class TestArchitecture(unittest.TestCase):
 				)
 			},
 		)
+
+	def test_set_user_agent_only_in_enter_agent_session(self):
+		self.assertEqual(check_set_user_agent_only_in_enter_agent_session(self.sources), [])
+		self.assertIn(f"def {SESSION_SWITCH_FUNCTION}(", self.sources[AUTHORITY_FILE])
 
 	def test_agent_modules_import_alone_in_fresh_process(self):
 		# STD-DESIGN-6: an import cycle stays hidden in-process when another test imported a module first.
@@ -8452,6 +8533,62 @@ class TestScannersCatchViolations(unittest.TestCase):
 			check_agent_write_flag_only_in_run_log_and_propose_tool(unknown),
 			AGENT_WRITE_GUARD_FILE,
 			"ADR-023",
+		)
+
+	def test_set_user_agent_scanner_catches_each_switch_outside_enter_agent_session(self):
+		self.assertEqual(check_set_user_agent_only_in_enter_agent_session(SESSION_SWITCH_CLEAN), [])
+		runner_switch = "\n\ndef _switch():\n\t{}\n"
+		for call in (
+			# the runner keeping its own switch (the pre-T74 shape)
+			"frappe.set_user(AGENT_USER)",
+			"frappe.set_user(user=AGENT_USER)",
+			"frappe.set_user(constants.AGENT_USER)",
+			f"frappe.set_user({AGENT_USER!r})",
+		):
+			with self.subTest(call=call):
+				sources = self.changed(SESSION_SWITCH_CLEAN, RUNNER_FILE, runner_switch.format(call))
+				self.assertCaught(
+					check_set_user_agent_only_in_enter_agent_session(sources), RUNNER_FILE, "ADR-033 QĐ 1"
+				)
+		aliased = (
+			"from frappe import set_user as switch\nfrom erp_ai.constants import AGENT_USER as BOT\n\n"
+			"switch(BOT)\n"
+		)
+		self.assertCaught(
+			check_set_user_agent_only_in_enter_agent_session(
+				self.changed(SESSION_SWITCH_CLEAN, "agent/tasks_like.py", aliased)
+			),
+			"agent/tasks_like.py",
+		)
+		# inside authority.py but in another function
+		other_function = self.changed(
+			SESSION_SWITCH_CLEAN, AUTHORITY_FILE, "\n\ndef helper():\n\tfrappe.set_user(AGENT_USER)\n"
+		)
+		self.assertCaught(
+			check_set_user_agent_only_in_enter_agent_session(other_function), f"{AUTHORITY_FILE}:"
+		)
+		# enter_agent_session without the switch, or with two of them
+		for replacement in (
+			"frappe.session.user",
+			"frappe.set_user(AGENT_USER)\n\tfrappe.set_user(AGENT_USER)",
+		):
+			with self.subTest(replacement=replacement):
+				sources = self.changed(
+					SESSION_SWITCH_CLEAN,
+					AUTHORITY_FILE,
+					replace=("frappe.set_user(AGENT_USER)", replacement),
+				)
+				self.assertCaught(check_set_user_agent_only_in_enter_agent_session(sources), "exactly once")
+		missing = {rel: src for rel, src in SESSION_SWITCH_CLEAN.items() if rel != AUTHORITY_FILE}
+		self.assertCaught(
+			check_set_user_agent_only_in_enter_agent_session(missing), AUTHORITY_FILE, "missing"
+		)
+		clean = "\n\ndef _back(previous):\n\tfrappe.set_user(previous)\n\tfrappe.set_user('Guest')\n"
+		self.assertEqual(
+			check_set_user_agent_only_in_enter_agent_session(
+				self.changed(SESSION_SWITCH_CLEAN, RUNNER_FILE, clean)
+			),
+			[],
 		)
 
 

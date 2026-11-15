@@ -791,6 +791,16 @@ def check_tools_never_bypass_permissions(sources: dict) -> list:
 	return violations
 
 
+def check_tools_never_pass_trusted_messages(sources: dict) -> list:
+	"""Inside agent/tools/**, no call passes `trusted=True`: the bot's tools never skip the DocType permission."""
+	violations = []
+	for rel, source in only_python(scoped(sources, TOOLS_PREFIX)).items():
+		for node in ast.walk(parse(rel, source)):
+			if isinstance(node, ast.keyword) and node.arg == "trusted" and _is_constant(node.value, True):
+				violations.append(violation(rel, node.value, "trusted=True in a tool"))
+	return violations
+
+
 def check_subprocess_only_in_source_tool(sources: dict) -> list:
 	"""ADR-005, ADR-013, ADR-022: processes start only in SUBPROCESS_FILES."""
 	violations = []
@@ -5167,6 +5177,9 @@ class TestArchitecture(unittest.TestCase):
 		self.assertGreater(len(scanned), 0)
 		self.assertEqual(check_tools_never_bypass_permissions(self.sources), [])
 
+	def test_tools_never_pass_trusted_messages(self):
+		self.assertEqual(check_tools_never_pass_trusted_messages(self.sources), [])
+
 	def test_subprocess_only_in_source_tool(self):
 		scanned = only_python(self.sources)
 		self.assertGreater(len(scanned), 0)
@@ -6786,6 +6799,19 @@ class TestScannersCatchViolations(unittest.TestCase):
 			"frappe.get_all('DocType', {'module': 'ERP AI agent'}, pluck='name')\n"
 		)
 		self.assertEqual(check_tools_never_bypass_permissions({"agent/tools/read.py": source}), [])
+
+	def test_tools_trusted_scanner_flags_only_trusted_true_in_tools(self):
+		flagged = "from erp_ai.agent.messages import add_message\nadd_message(t, 'x', 'chat', trusted=True)\n"
+		self.assertCaught(
+			check_tools_never_pass_trusted_messages({"agent/tools/x.py": flagged}), "agent/tools/x.py:2: "
+		)
+		clean = (
+			"add_message(t, 'x', 'chat')\n"
+			"add_message(t, 'x', 'chat', trusted=False)\n"
+			"add_message(t, 'x', 'chat', trusted=flag)\n"
+		)
+		self.assertEqual(check_tools_never_pass_trusted_messages({"agent/tools/x.py": clean}), [])
+		self.assertEqual(check_tools_never_pass_trusted_messages({"agent/runner.py": flagged}), [])
 
 	def test_tools_bypass_ignores_code_outside_tools(self):
 		source = "import frappe\nfrappe.db.set_value('X', 'y', 'z', 1)\nfrappe.get_all('X')\n"

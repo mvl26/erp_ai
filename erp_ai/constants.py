@@ -88,6 +88,19 @@ RESTART_WEB_STOP_S = 40
 RESTART_TIMEOUT_S = JOB_TIMEOUT_S + RESTART_WEB_STOP_S + JOB_SAFETY_MARGIN_S
 RESTART_LAUNCH_TIMEOUT_S = 10
 
+# Bot conversation DocType (bot-messages): the human<->bot messages live here, not in HD Ticket comments.
+MESSAGE_DOCTYPE = "ERP AI Message"
+MESSAGE_KIND_CHAT = "chat"
+MESSAGE_KIND_ROUTING = "routing"
+MESSAGE_KIND_PROPOSAL = "proposal"
+MESSAGE_KIND_RESULT = "result"
+MESSAGE_KINDS = (
+	MESSAGE_KIND_CHAT,
+	MESSAGE_KIND_ROUTING,
+	MESSAGE_KIND_PROPOSAL,
+	MESSAGE_KIND_RESULT,
+)
+
 # FEAT-007 (F-1): catalog actions and modes, KPI ids, ticket-content DocTypes; one block, keep it last.
 ACTION_CREATE_USER = "Tạo tài khoản theo mẫu"
 ACTION_ADD_TEAM_MEMBER = "Thêm người vào nhóm Helpdesk"

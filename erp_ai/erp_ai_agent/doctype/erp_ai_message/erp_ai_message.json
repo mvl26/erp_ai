@@ -1,0 +1,108 @@
+{
+ "actions": [],
+ "creation": "2026-11-16 10:00:00.000000",
+ "doctype": "DocType",
+ "engine": "InnoDB",
+ "autoname": "hash",
+ "field_order": [
+  "section_message",
+  "ticket",
+  "kind",
+  "content",
+  "section_source",
+  "run_id",
+  "proposal",
+  "source_comment"
+ ],
+ "fields": [
+  {
+   "fieldname": "section_message",
+   "fieldtype": "Section Break",
+   "label": "Tin nhắn"
+  },
+  {
+   "description": "Hệ thống tự ghi, không sửa được. Phiếu hỗ trợ mà tin nhắn này thuộc về.",
+   "fieldname": "ticket",
+   "fieldtype": "Link",
+   "label": "Phiếu",
+   "read_only": 1,
+   "options": "HD Ticket",
+   "reqd": 1,
+   "in_list_view": 1,
+   "in_standard_filter": 1
+  },
+  {
+   "description": "Hệ thống tự ghi, không sửa được. Loại tin: chat là lời người hoặc bot nói với nhau, routing là kết quả phân luồng, proposal là đề xuất chờ duyệt, result là kết quả sau khi duyệt.",
+   "fieldname": "kind",
+   "fieldtype": "Select",
+   "label": "Loại",
+   "read_only": 1,
+   "options": "chat\nrouting\nproposal\nresult",
+   "reqd": 1,
+   "in_list_view": 1,
+   "in_standard_filter": 1
+  },
+  {
+   "description": "Hệ thống tự ghi, không sửa được. Nội dung tin nhắn, lưu dạng chữ thường, không có thẻ HTML.",
+   "fieldname": "content",
+   "fieldtype": "Long Text",
+   "label": "Nội dung",
+   "read_only": 1,
+   "reqd": 1
+  },
+  {
+   "fieldname": "section_source",
+   "fieldtype": "Section Break",
+   "label": "Nguồn gốc"
+  },
+  {
+   "description": "Hệ thống tự ghi, không sửa được. Mã lần chạy của bot đã ghi tin này; rỗng với tin do người gửi.",
+   "fieldname": "run_id",
+   "fieldtype": "Data",
+   "label": "Mã lần chạy",
+   "read_only": 1
+  },
+  {
+   "description": "Hệ thống tự ghi, không sửa được. Đề xuất thay đổi liên quan khi tin là đề xuất hoặc kết quả duyệt; rỗng nếu không có.",
+   "fieldname": "proposal",
+   "fieldtype": "Link",
+   "label": "Đề xuất",
+   "read_only": 1,
+   "options": "ERP AI Change Proposal"
+  },
+  {
+   "description": "Hệ thống tự ghi, không sửa được. Tên comment @ai trên phiếu mà tin này được chép từ đó; rỗng với tin gửi từ ngăn trao đổi.",
+   "fieldname": "source_comment",
+   "fieldtype": "Data",
+   "label": "Comment nguồn",
+   "read_only": 1
+  }
+ ],
+ "links": [],
+ "modified": "2026-11-16 10:00:00.000000",
+ "modified_by": "Administrator",
+ "module": "ERP AI agent",
+ "name": "ERP AI Message",
+ "owner": "Administrator",
+ "permissions": [
+  {
+   "read": 1,
+   "report": 1,
+   "role": "System Manager"
+  },
+  {
+   "create": 1,
+   "read": 1,
+   "role": "ERP AI Agent"
+  },
+  {
+   "read": 1,
+   "report": 1,
+   "role": "ERP AI Instructor"
+  }
+ ],
+ "sort_field": "creation",
+ "sort_order": "DESC",
+ "states": [],
+ "track_changes": 0
+}

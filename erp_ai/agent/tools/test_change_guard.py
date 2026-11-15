@@ -7,13 +7,15 @@ from frappe.tests.utils import FrappeTestCase
 
 import erp_ai
 from erp_ai.agent.changes import process_runner
-from erp_ai.agent.tools import change_guard, source
+from erp_ai.agent.tools import change_guard, propose_change, source
+from erp_ai.agent.tools.registry import ToolContext
 from erp_ai.constants import (
 	CHANGE_OP_CREATE,
 	CHANGE_OP_DELETE,
 	CHANGE_OP_EDIT,
 	CHANGE_OP_RENAME,
 	CORE_APPS,
+	PROPOSAL_DOCTYPE,
 )
 from erp_ai.test_utils import GitSandbox, TempAppsRoot, keep_agent_settings, set_agent_settings
 
@@ -1839,3 +1841,49 @@ class TestCheckBlock(FrappeTestCase):
 				self.assert_refused_in_both_moments(
 					[edit(README), op], f"mục 2 ({op.path}): mục {action} thiếu hoặc thừa trường"
 				)
+
+
+class TestManualsExcluded(FrappeTestCase):
+	"""CI-15 (arch-impact-chg-002.md G-19): after `text_refusal`, a block item never writes into the manuals store."""
+
+	def setUp(self):
+		self.addCleanup(frappe.db.rollback)
+		keep_agent_settings(self)
+		self.sandbox = GitSandbox(self, apps=("myapp",))
+		self.sandbox.commit_file("myapp", "docs/hdsd.md", "# HDSD\n")
+		self.sandbox.commit_file("myapp", "notes.md", "# notes\n")
+		set_agent_settings(manuals_dir="myapp/docs")
+		self.ctx = ToolContext(
+			ticket_name="ERPAI-TEST-manuals",
+			effective_level="L3",
+			instructor="Administrator",
+			run_id="run-manuals",
+			category_mapping={},
+			agent_user="Administrator",
+			change_enabled=True,
+			allowed_apps=ALLOWED,
+		)
+
+	def test_block_operations_in_manuals_refused(self):
+		for label, item in (
+			(
+				"create in a new folder under the store",
+				{"action": "create", "path": "myapp/docs/new_dir/a.md", "content": "a\n"},
+			),
+			("delete in the store", {"action": "delete", "path": "myapp/docs/hdsd.md"}),
+			(
+				"rename source in the store",
+				{"action": "rename", "path": "myapp/docs/hdsd.md", "new_path": "myapp/hdsd.md"},
+			),
+			(
+				"rename target into the store",
+				{"action": "rename", "path": "myapp/notes.md", "new_path": "myapp/docs/notes.md"},
+			),
+		):
+			with self.subTest(case=label):
+				proposals = frappe.db.count(PROPOSAL_DOCTYPE)
+				result = propose_change.propose_file_change({"changes": [item], "reason": "r"}, self.ctx)
+				self.assertEqual(
+					result, {"ok": False, "reason": f"mục 1 ({item['path']}): {PATH_INVALID_REFUSAL}"}
+				)
+				self.assertEqual(frappe.db.count(PROPOSAL_DOCTYPE), proposals)

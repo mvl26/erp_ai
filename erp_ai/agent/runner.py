@@ -18,7 +18,7 @@ from erp_ai.agent.prompts import (
 	build_routing_table,
 )
 from erp_ai.agent.routing import decide_route, departments, load_routing_config, sla_lag
-from erp_ai.agent.run_log import ENTRY_TYPE_CHANGE, write_entry
+from erp_ai.agent.run_log import ENTRY_TYPE_CHANGE, action_entry, write_entry
 from erp_ai.agent.run_status import CLASSIFY_STEP, RunStatus
 from erp_ai.agent.tools.read import TOOL_RESULT_MAX_CHARS
 from erp_ai.agent.tools.registry import ToolContext, execute_tool, grant
@@ -36,6 +36,7 @@ from erp_ai.agent.tools.route_ticket import (
 	create_routed_task,
 	post_routing_comment,
 )
+from erp_ai.agent.tools.write_ticket import HINT_FIELD
 from erp_ai.constants import (
 	AGENT_USER,
 	JOB_SAFETY_MARGIN_S,
@@ -79,17 +80,14 @@ WRITE_TOOL_TARGETS = {
 }
 # Generic write tools: the model names the DocType; each successful call keeps its full snapshot (AC-13).
 GENERIC_WRITE_TOOLS = tuple(name for name, (doctype, _) in WRITE_TOOL_TARGETS.items() if doctype is None)
-# Record tools: their action entry also carries the before/after values and the instructor (AC-35).
-RECORD_TOOLS = frozenset(
-	("api_create_record", "api_update_record", "api_delete_record", "api_submit_record", "api_call_method")
-)
-ACTION_DOCTYPE_MAX = 80
 # `ERP AI Log.actions` is a Small Text column: MariaDB `text`, 65535 bytes. The JSON the runner stores there
 # stays within ACTIONS_MAX_BYTES (utf-8); each string in it within ACTION_VALUE_MAX_BYTES. A cut is marked.
 ACTIONS_MAX_BYTES = 60000
 ACTION_VALUE_MAX_BYTES = 1024
 ACTION_CUT_MARKER = "[đã cắt]"
 ACTION_VALUE_KEYS = ("value_before", "value_after")
+# Tools that create a record without returning before/after: their entry carries the call arguments as `value_after`.
+CREATING_TOOLS = ("post_comment", "create_task")
 PROPOSE_TOOLS = ("propose_file_change", "propose_new_file", "propose_bench_command")
 PROPOSE_STEP = "propose"
 UNPARSEABLE_ERROR = "UNPARSEABLE: không phân loại được"
@@ -415,15 +413,20 @@ def _route(log_name, classification, decision, context, auto_assign, subject):
 	return lines
 
 
-def _route_action(tool, doctype, name, ok, reason=None, rule=None):
-	return {
-		"tool": tool,
-		"doctype": doctype,
-		"name": name,
-		"ok": ok,
-		**({"reason": reason} if reason else {}),
-		**({"rule": rule} if rule else {}),
-	}
+def _route_action(
+	tool, doctype, name, ok, reason=None, rule=None, *, value_before=None, value_after=None, instructor=None
+):
+	return action_entry(
+		tool,
+		doctype,
+		name,
+		ok,
+		reason=reason,
+		rule=rule,
+		value_before=value_before,
+		value_after=value_after,
+		instructor=instructor,
+	)
 
 
 def _run_unit(tool, call, doctype, name, actions, errors):
@@ -458,16 +461,22 @@ def _assign_unit(decision, context, actions, lines, errors):
 		users = ", ".join(dict.fromkeys(row["allocated_to"] for row in existing))
 		rule = next((row["assignment_rule"] for row in existing if row["assignment_rule"]), None)
 		reason = f"phiếu đã có người được gán: {users}"
-		actions.append(_route_action("assign_owner", "HD Ticket", ticket, False, reason, rule))
+		actions.append(
+			_route_action(
+				"assign_owner", "HD Ticket", ticket, False, reason, rule, instructor=context.instructor
+			)
+		)
 		return None
 	user = decision.assignee
 	if user is None:
 		note = next((item["reason"] for item in decision.notes if item["field"] == "assignee"), None)
-		actions.append(_route_action("assign_owner", "HD Ticket", ticket, False, note))
+		actions.append(
+			_route_action("assign_owner", "HD Ticket", ticket, False, note, instructor=context.instructor)
+		)
 		lines.append(ASSIGN_REQUEST.format(reason=REASON_NO_VALID_ASSIGNEE))
 		return None
 	if _run_unit("assign_owner", lambda: assign_owner(user, context), "HD Ticket", user, actions, errors):
-		actions.append(_route_action("assign_owner", "HD Ticket", user, True))
+		actions.append(_route_action("assign_owner", "HD Ticket", user, True, instructor=context.instructor))
 		return user
 	lines.append(ASSIGN_REQUEST.format(reason=REASON_ASSIGN_FAILED))
 	return None
@@ -482,7 +491,11 @@ def _task_unit(user, subject, classification, context, actions, lines, errors):
 	"""
 	ticket = context.ticket_name
 	if site_facts.has_linked_task(ticket):
-		actions.append(_route_action("create_routed_task", "Task", None, False, REASON_TASK_EXISTS))
+		actions.append(
+			_route_action(
+				"create_routed_task", "Task", None, False, REASON_TASK_EXISTS, instructor=context.instructor
+			)
+		)
 		return None
 	failures = len(errors)
 	sharing_off = []
@@ -507,7 +520,9 @@ def _task_unit(user, subject, classification, context, actions, lines, errors):
 			reason = REASON_TASK_NOT_ASSIGNED if sharing_off else REASON_TASK_FAILED
 			lines.append(TASK_REQUEST.format(reason=reason))
 		return None
-	actions.append(_route_action("create_routed_task", "Task", result["task"], True))
+	actions.append(
+		_route_action("create_routed_task", "Task", result["task"], True, instructor=context.instructor)
+	)
 	return result["task"]
 
 
@@ -525,7 +540,11 @@ def _comment_unit(lines, context, actions, errors):
 	)
 	if result is None:
 		return False
-	actions.append(_route_action("post_routing_comment", "Comment", result["comment"], True))
+	actions.append(
+		_route_action(
+			"post_routing_comment", "Comment", result["comment"], True, instructor=context.instructor
+		)
+	)
 	return True
 
 
@@ -538,12 +557,28 @@ def _apply_route_unit(decision, classification, context, actions, errors):
 		frappe.db.rollback(save_point=ROUTE_SAVEPOINT)
 		name = type(exc).__name__
 		errors.append(f"route apply_route: {name}")
-		actions.append(_route_action("apply_route", "HD Ticket", ticket, False, name))
+		actions.append(
+			_route_action("apply_route", "HD Ticket", ticket, False, name, instructor=context.instructor)
+		)
 		return None
 	if not result.get("ok"):
-		actions.append(_route_action("apply_route", "HD Ticket", ticket, False, result.get("reason")))
+		actions.append(
+			_route_action(
+				"apply_route", "HD Ticket", ticket, False, result.get("reason"), instructor=context.instructor
+			)
+		)
 		return None
-	actions.append(_route_action("apply_route", "HD Ticket", ticket, True))
+	actions.append(
+		_route_action(
+			"apply_route",
+			"HD Ticket",
+			ticket,
+			True,
+			value_before=result.get("before"),
+			value_after=result.get("after"),
+			instructor=context.instructor,
+		)
+	)
 	return result
 
 
@@ -563,7 +598,9 @@ def _check_sla(category, context, actions, lines):
 			return "ok"
 		reason = f"SLA {fact['sla']} xử lý {int(lag[0])} phút > mong đợi {lag[1]} phút ({category})"
 		state = "slow"
-	actions.append(_route_action("sla_check", "HD Ticket", ticket, False, reason))
+	actions.append(
+		_route_action("sla_check", "HD Ticket", ticket, False, reason, instructor=context.instructor)
+	)
 	frappe.logger(LOGGER_NAME).warning("erp_ai sla ticket=%s run_id=%s %s", ticket, context.run_id, reason)
 	return state
 
@@ -787,7 +824,7 @@ def _run_tool(block, context, actions, before, after, tool_errors, skipped):
 	except Exception as exc:
 		tool_errors.append(f"tool {name}: {type(exc).__name__}")
 		if name in WRITE_TOOL_TARGETS:
-			actions.append(_action(name, context, None, False, arguments))
+			actions.append(_action(name, context, None, False, arguments, crash=f"lỗi: {type(exc).__name__}"))
 		return {
 			"type": "tool_result",
 			"tool_use_id": block["id"],
@@ -815,20 +852,40 @@ def _record_snapshot(name, outcome, n, before, after) -> None:
 		after[f"{name}#{n}"] = snapshot["after"]
 
 
-def _action(name, context, outcome, ok, arguments):
+def _action(name, context, outcome, ok, arguments, *, crash=None):
+	"""One action entry of a write tool, through the one builder `run_log.action_entry` (U3 3.2)."""
 	doctype, key = WRITE_TOOL_TARGETS[name]
 	if doctype is None:
 		requested = arguments.get("doctype") if isinstance(arguments, dict) else None
-		doctype = str((outcome or {}).get("doctype") or requested or "")[:ACTION_DOCTYPE_MAX] or None
+		doctype = str((outcome or {}).get("doctype") or requested or "") or None
 	record = context.ticket_name if key is None else (outcome or {}).get(key)
-	action = {"tool": name, "doctype": doctype, "name": record, "ok": ok}
-	if name in RECORD_TOOLS:
-		# copied as the tool returned them (already free of secrets and cut); a refused or crashed call has none
-		written = outcome if ok else {}
-		action["value_before"] = written.get("value_before")
-		action["value_after"] = written.get("value_after")
-		action["instructor"] = context.instructor
-	return action
+	value_before, value_after = _entry_values(name, outcome, arguments) if ok else (None, None)
+	return action_entry(
+		name,
+		doctype,
+		record,
+		ok,
+		reason=crash or (outcome or {}).get("reason"),
+		value_before=value_before,
+		value_after=value_after,
+		instructor=context.instructor,
+	)
+
+
+def _entry_values(name, outcome, arguments):
+	"""The (before, after) values of a successful write tool's action entry (U3 3.2 table)."""
+	if "value_before" in outcome or "value_after" in outcome:
+		return outcome.get("value_before"), outcome.get("value_after")
+	if "before" in outcome or "after" in outcome:
+		before, after = outcome.get("before"), outcome.get("after")
+		if isinstance(after, dict) or isinstance(before, dict):
+			return before, after
+		return {HINT_FIELD: before}, {HINT_FIELD: after}
+	if name in PROPOSE_TOOLS:
+		return None, {"change_status": outcome.get("status")}
+	if name in CREATING_TOOLS and isinstance(arguments, dict):
+		return None, arguments
+	return None, None
 
 
 def _stored_bytes(value) -> int:

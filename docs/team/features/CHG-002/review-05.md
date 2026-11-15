@@ -8,9 +8,10 @@ Approved-by:
 # Review 05 — CHG-002 T5
 
 - Diff: vòng 1 `git diff fd69e5f..8a21623`; vòng 2 (sửa) `git diff 8a21623..e5f7109` (nhánh `team/CHG-002-task-5`, còn giữ)
-- Vòng: 2 (max_rework = 3)
-- Verdict của reviewer: vòng 1 request-changes; vòng 2 approve
-- Trạng thái task: **CHƯA merge, DỪNG** (xem "Sau review"): mã đúng thiết kế nhưng một luật kiến trúc có sẵn đỏ vì tên hàm thiết kế bắt buộc.
+- Diff lượt 3 (đề bài mới theo `arch-ruling-2.md`, ADR-040 C-2): vòng 3 `git diff a6a6560..22fee8c` (cả task sau khi dev merge `team/CHG-002` vào nhánh, 3 file, +417/−0); vòng 4 (sửa) `git diff 22fee8c..4fc0217` (2 file, +79)
+- Vòng: 4 lần review; theo quyết định 07:31 của team-leader bộ đếm vòng sửa của đề bài mới tính lại từ 0: đề bài cũ 2 vòng, đề bài mới 2 vòng (1 vòng sửa, max_rework = 3)
+- Verdict của reviewer: vòng 1 request-changes; vòng 2 approve; vòng 3 request-changes; vòng 4 **approve**
+- Trạng thái task: lượt 2 **DỪNG** sau vòng 2 (xem "Sau review"); lượt 3 merge `2e2b9ad`, **đã tick** (xem "Lượt 3" cuối file).
 
 ## Vòng 1 — request-changes
 | severity | STD | file:line | description | fix |
@@ -53,3 +54,41 @@ minor | — | — | 5 điểm nhỏ (xem deferred) | tùy dev
 3. STD-STYLE-4: `APP_DIR_BEFORE` chen giữa hai hằng `VIETNAMESE_CRLF_*`.
 4. STD-DOC-7: docstring `make_parents` chưa nói `ValueError` và phần trả lại.
 5. Phần trả lại tự lỗi (`rmdir`/`unlink` ném) thì lỗi đó che `ValueError` gốc; A-3.1 không nói ca này.
+
+## Lượt 3 — đề bài mới theo `arch-ruling-2.md` (ADR-040 C-2)
+
+### Vòng 3 — request-changes (`git diff a6a6560..22fee8c`)
+
+| severity | STD | file:line | description | fix |
+|---|---|---|---|---|
+| major | STD-TEST-8 | erp_ai/agent/changes/test_file_writer.py:261-271 (mã ở file_writer.py:27) | C-2 chỉ nhận đường dẫn khi bộ phân giải trả **đúng** `abspath` của nó; mọi ca symlink trong test đều trỏ ra `outside/`, nơi `resolve_safe_path` đã trả `None`, nên đổi `!= full` thành `is None` thì mọi test vẫn xanh và `make_parents` tạo thư mục qua symlink nằm trong gốc | Thêm symlink trong gốc (`myapp/inner_link -> myapp/`): `ValueError` cho `inner_link/x.py`, `inner_link/pkg/new.py`; ca `make_parents(myapp/inner_link/pkg/new.py)`: `ValueError`, 0 lời gọi `mkdir`, thư mục đích không đổi |
+| major | STD-TEST-8 | erp_ai/agent/changes/file_writer.py:52-54 (test ở test_file_writer.py:232) | Hai phép kiểm sau `mkdir` che nhau: bỏ một trong hai thì mọi test vẫn xanh. Nhánh `islink` tới được (symlink tự trỏ: `realpath` của Python 3.12 trả nguyên đường dẫn) | Mỗi phép kiểm một ca: (a) symlink tự trỏ ở tầng 2, chỉ `islink` bắt; (b) tầng 1 đã tạo bị tráo thành symlink ra `outside` rồi mới tạo tầng 2, chỉ phép kiểm chuẩn bắt |
+
+minor | — | — | 4 điểm nhỏ (xem deferred lượt 3) | tùy dev
+
+Lớp 1: `_refuse_unless_canonical` đúng thân của phán quyết; `make_parents` kiểm trước và sau `mkdir`; `remove_empty_dirs` bỏ phép so `realpath`; `file_writer.py` không còn `realpath`, `commonpath`, `is_relative_to`, `readlink`; luật ADR-011 không đổi (diff của `test_architecture.py` 0 dòng xóa); chỉ ba file touchpoint. Lo ngại của dev về `patch` và ba hằng phụ ở `test_architecture.py`: reviewer nhận, không phải lỗi (cờ `FILE_WRITER_RECHECKS_ALL = False` chỉ có nghĩa khi điều kiện 4 đã viết và có test).
+
+Bằng chứng của dev: RED `FAIL: test_symlinked_ancestor_refused_before_mkdir ... Lists differ: ['/tmp/tmph8mhslhd/apps/myapp/dir_out/pkg'] != []`, `AttributeError: … no attribute '_refuse_unless_canonical'` (`Ran 24 tests` / `FAILED (failures=1, errors=13)`); `test_architecture` `Ran 181 tests` / `FAILED (failures=11)`; GREEN `test_file_writer` `Ran 24 tests in 0.071s` / `OK`, `test_architecture` `Ran 181 tests in 14.452s` / `OK`.
+
+### Vòng 4 — scoped re-review (`22fee8c..4fc0217`), approve
+
+- Phát hiện 1: ADDRESSED. `test_symlink_inside_root_refused`, `test_symlink_inside_root_refused_before_mkdir`, `test_dir_under_symlink_inside_root_skipped`; đột biến `!= full` → `is None`: `FAILED (failures=5)`.
+- Phát hiện 2: ADDRESSED. (a) `test_level_turned_self_loop_symlink_after_mkdir_rolls_back` (bỏ `islink`: `failures=1`); (b) `test_created_level_swapped_for_symlink_before_next_mkdir_rolls_back` (bỏ phép kiểm chuẩn thứ hai: `failures=1`).
+- Chỉ sửa test; `file_writer.py` không đổi so với `22fee8c`. Hai ca tự kiểm thêm ở `test_architecture.py` (thân chỉ gọi `source.get_source_root()`; `remove_empty_dirs` thiếu phép kiểm lại): reviewer nhận.
+- Blocker/major mới từ diff sửa: không.
+- GREEN sau sửa: `test_file_writer` `Ran 29 tests` / `OK`, `test_architecture` `Ran 181 tests` / `OK`.
+- Review checklist (10): 10/10 đạt.
+
+### Không kiểm được từ diff (tech-lead đã xử lý hoặc chuyển tiếp)
+
+- Module sau merge trên `team/CHG-002` @ `2e2b9ad` (08:36): `test_file_writer` `Ran 29 tests in 0.085s` / `OK`, `test_architecture` `Ran 181 tests in 14.383s` / `OK` (gồm `test_change_guard_uses_resolve_safe_path`, test đã đỏ ở lượt 2).
+- Cả app sau merge (đợt 7, `2e2b9ad`, một lần giữ khóa 08:37–08:46 gồm `cmd.migrate` thoát 0): `Ran 1666 tests in 508.667s` / `FAILED (failures=6)`, đúng 6 test của dòng `baseline:`.
+- Bố cục bench: nơi gọi phải truyền `full_path` dạng `realpath` (kết quả của `check_write_path`) → ghi vào lệnh giao T6 và T35.
+- Xung đột văn bản với T23 ở `test_architecture.py`: T23 làm sau khi T5 merge, dev T23 merge `team/CHG-002` @ `2e2b9ad` vào nhánh trước khi sửa.
+
+### deferred (lượt 3)
+
+6. Phần trả lại tự lỗi vẫn che `ValueError` gốc (điểm 5 ở trên, còn mở).
+7. Commit merge `d0ff3e5` trên nhánh task dùng thông điệp mặc định của git.
+8. Trong test symlink tự trỏ, `assertEqual(os.listdir(self.apps.outside), ["plain.py"])` không bao giờ đỏ được; hai test dùng `assertRaises(ValueError)` không so thông điệp.
+9. Cho T6: ca tự kiểm `rename_file` đã có ở T5; T6 đặt cờ `True`, bỏ lớp `patch` và các assert trạng thái `False`.

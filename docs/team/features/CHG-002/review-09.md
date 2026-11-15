@@ -8,8 +8,9 @@ Approved-by:
 # Review 09 — CHG-002 T9
 
 - Diff: `git diff a83923b..3a56462` (nhánh `team/CHG-002-task-9`, 2 commit `da795ea` và `3a56462` (rỗng, chỉ sửa một tên test trong dòng `test-shape:`), 3 file, +146/−23; CHƯA merge)
-- Vòng: 1 (max_rework = 3)
-- Verdict: design-defect (dev cũng trả `DESIGN_CONFLICT`)
+- Diff vòng 2 (lượt 3, sau `design-addendum-4.md` P-1, L-2): `git diff a6a6560..dd5ffe8` (cả task sau khi dev merge `team/CHG-002` vào nhánh, 4 file, +156/−35)
+- Vòng: 2 (max_rework = 3)
+- Verdict: vòng 1 design-defect (dev cũng trả `DESIGN_CONFLICT`); vòng 2 **approve** → merge `de130a4`, tick (xem "Vòng 2" cuối file)
 
 ## Vòng 1 — design-defect
 Mã đúng và theo §3.2; hai test lỗi cũ không sửa được theo addendum-2 L-1 như đang viết.
@@ -48,3 +49,21 @@ Ghi chú thiết kế (không chặn, cho designer):
 2. `test_propose_change.py:317`: dòng `tool.sh` không còn là từ chối của bộ chặn và lặp dòng `missing.py` ở `:323`.
 3. `:317` dùng chữ `"file không tồn tại"` thay vì `propose_change.NOT_FOUND` (L-1 "lấy từ hằng nếu hằng có"); byte trùng, kiểu của file là chữ viết thẳng.
 4. `3a56462` là commit rỗng; khi merge, dòng `test-shape:` đã sửa phải nằm trong thân commit của task (STD-GIT-2).
+
+## Vòng 2 — approve (lượt 3, `git diff a6a6560..dd5ffe8`)
+- Blocker 1 (STD-TEST-5, `test_propose_change.py:430`): ADDRESSED. Addendum-4 L-2a nhận dòng `pkg/.gitattributes` → `change_guard.GIT_DIR`, nay có dòng `test-input:`.
+- Blocker 2 (STD-DESIGN-1, `test_apply_job.py:1734-1745`): ADDRESSED. Phần dựng vá `source.TEN_CAM` (`:1737`), lý do `change_guard.NAME_FORBIDDEN` (`:1746`); `test_apply_job.py` nay thuộc touchpoint (addendum-4).
+- Deferred 1..4 của vòng 1: ADDRESSED cả bốn (test nói ngược tên đã bỏ theo L-2c; dòng `:317` giữ theo P-1.1 và dùng hằng `propose_change.NOT_FOUND`; thân `dd5ffe8` mang danh sách đầy đủ: 4 `test-shape:`, 2 `test-input:`, 1 `test-drop:`; L-1: 4, L-2: 3).
+- Ghi chú thiết kế 2: ADDRESSED ở `change_guard.py:187` (đích là chính thư mục app → `PATH_INVALID`); ghi chú 1, 3: addendum xác nhận mã, không đổi.
+- Blocker/major mới: không.
+- Bằng chứng của dev: RED `AssertionError: None != 'đường dẫn không hợp lệ hoặc nằm ngoài apps/'` ×6 (`Ran 41 tests` / `FAILED (failures=6)`); GREEN `test_change_guard` `Ran 40 tests in 0.878s` / `OK`, `test_propose_change` `Ran 32 tests in 23.722s` / `OK`, `test_apply_job` `Ran 117 tests in 140.572s` / `OK`, `test_architecture` `Ran 179 tests in 14.075s` / `OK`.
+- Review checklist (10): 10/10 đạt.
+
+### Không kiểm được từ diff (tech-lead đã xử lý)
+- Cả app sau merge (đợt 6, `5f418c1`): `Ran 1645 tests in 519.329s` / `FAILED (failures=6)`, đúng 6 test của dòng `baseline:`; không test nào ngoài touchpoint ghim `reason=None` cho chính thư mục app hay câu `GIT_DIR` cũ.
+- Giả định A4-2 (hoàn tác kiểm lại qua `check_write_path`): `test_apply_job` xanh với `NAME_FORBIDDEN` trên `5f418c1` (`Ran 117 tests in 132.235s` / `OK`).
+- Lint: dev báo `pre-commit run --files` trên 4 file thoát 0; `cmd.lint` cả cây chạy ở T51.
+- Cho T10: dòng `test_change_guard.py:236` (`sh_link.py` → `None`) lật sang `PATH_SYMLINK` theo L-1 (đã ghi vào lệnh giao T10).
+
+### deferred (vòng 2)
+5. `change_guard.py:187`: chưa có test ghim thứ tự "chính thư mục app" trước `APP_FORBIDDEN` (thêm dòng `("erp_ai", ("myapp", "erp_ai"))` → `PATH_INVALID`).

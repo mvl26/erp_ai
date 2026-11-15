@@ -9,7 +9,7 @@ import time
 import unicodedata
 
 import frappe
-from frappe.utils import get_fullname
+from frappe.utils import cstr, get_fullname
 from frappe.utils.file_lock import LockTimeoutError
 from frappe.utils.synchronization import filelock
 
@@ -19,7 +19,7 @@ from erp_ai.agent.changes import block, file_writer, process_runner, result_comm
 from erp_ai.agent.tools import change_guard, source
 from erp_ai.constants import (
 	BOT_GIT_EMAIL,
-	CHANGE_KIND_CODE,
+	CHANGE_OP_CREATE,
 	CHANGE_OP_EDIT,
 	CHANGE_STATUS_APPLIED,
 	CHANGE_STATUS_APPLYING,
@@ -201,13 +201,21 @@ def _run(proposal, action: str, actor: str, deadline: float) -> str:
 	if action == ACTION_UNDO:
 		_undo_code(proposal, actor, _recheck(proposal, action), deadline)
 		return CHANGE_STATUS_UNDONE
-	allowed_apps = _recheck(proposal, action)
-	if block.is_block(proposal):
-		_apply_block(proposal, actor, allowed_apps, deadline)
-	elif proposal.change_kind == CHANGE_KIND_CODE:
-		_apply_code(proposal, actor, allowed_apps, deadline)
+	check = _recheck_block(proposal, _recheck(proposal, action))
+	if not block.is_block(proposal):
+		if check.targets:
+			_apply_code(proposal, check.targets[0], actor, deadline)
+		else:
+			_apply_command(proposal, actor, deadline)
+	elif (
+		len(check.targets) == 1
+		and check.targets[0].op.kind == CHANGE_OP_EDIT
+		and not block.commands_of(proposal)
+	):
+		_apply_code(proposal, check.targets[0], actor, deadline)
 	else:
-		_apply_command(proposal, actor, deadline)
+		# Writing several items (design 4.2 step 6) and running a block's commands come in later tasks.
+		raise _Stop(CHANGE_STATUS_FAILED, change_guard.OP_UNKNOWN)
 	return CHANGE_STATUS_APPLIED
 
 
@@ -216,12 +224,11 @@ def _has_authority(user) -> bool:
 
 
 def _recheck(proposal, action: str) -> tuple[str, ...]:
-	"""Design 4.3 step 4.2, in table order: the first failing row ends the job as `Lỗi` with its reason.
+	"""Design 4.2 step 1 (4.4 step 2 for undo): the first failing row ends the job as `Lỗi` with its reason.
 
-	Undo (design 4.4 step 2) runs only the runner, role, digest and guard rows against `undo_by`: not the
-	switch (G-1), not the stored-hash and commit-message preview rows (apply-only). Its guard allows the
-	proposal's own app, so undo stays possible after the app left the list. Returns the apps the guard
-	allowed.
+	Runner, role, switch (apply only, G-1) and digest. Undo then runs the guard of its target against
+	`undo_by`, allowing the proposal's own app so undo stays possible after the app left the list; apply runs
+	`_recheck_block` on what this returns. Returns the apps the guard allows.
 	"""
 	runner = proposal.decided_by if action == ACTION_APPLY else proposal.undo_by
 	if frappe.session.user != runner:
@@ -237,38 +244,66 @@ def _recheck(proposal, action: str) -> tuple[str, ...]:
 		allowed_apps = (proposal.app,)
 	if transitions.content_digest(proposal) != proposal.approved_digest:
 		raise _Stop(CHANGE_STATUS_FAILED, DIGEST_CHANGED)
-	if block.is_block(proposal):
-		# CHG-002 T1 walking skeleton: runner, role, switch and digest only; `_apply_block` guards its item.
-		return allowed_apps
-	if proposal.change_kind == CHANGE_KIND_CODE:
+	if action == ACTION_UNDO:
 		# The applied file exists at undo time, so the guard sees it as a changed file then.
-		new_file = action == ACTION_APPLY and bool(proposal.is_new_file)
 		guard = change_guard.check_write_path(
-			proposal.file_path, allowed_apps, new_file=new_file, read_git=False
+			proposal.file_path, allowed_apps, new_file=False, read_git=False
 		)
-		refusal = guard.reason
-	else:
-		args = json.loads(proposal.command_args or "null")
-		refusal = change_guard.check_bench_args(args, settings.allowed_apps, frappe.local.site)
-	if refusal:
-		raise _Stop(CHANGE_STATUS_FAILED, refusal)
-	if action == ACTION_APPLY and proposal.change_kind == CHANGE_KIND_CODE:
-		content_after = (proposal.content_after or "").encode("utf-8")
-		if hashlib.sha256(content_after).hexdigest() != proposal.after_hash:
+		if guard.reason:
+			raise _Stop(CHANGE_STATUS_FAILED, guard.reason)
+	return allowed_apps
+
+
+def _sha256_text(text: str) -> str:
+	return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _apply_message(proposal, operations, approver: str) -> tuple[str, str]:
+	"""(subject, body) of the apply commit, labelled as the proposal controller labels its preview (design 3.7)."""
+	if block.is_block(proposal):
+		return change_text.apply_message(
+			proposal.name,
+			cstr(proposal.ticket),
+			change_text.block_label(operations),
+			approver,
+			operations=operations,
+		)
+	return change_text.apply_message(proposal.name, cstr(proposal.ticket), cstr(proposal.file_path), approver)
+
+
+def _recheck_block(proposal, allowed_apps) -> change_guard.BlockCheck:
+	"""Design 4.2 steps 2 to 3 on the adapter's items and commands, for a block and for the old shape alike.
+
+	`check_block` at apply time (`legacy` for the old shape) → `Lỗi` with its item or command prefix; then
+	every row's stored text against its hashes (`STORED_HASH_MISMATCH`) and the commit preview against
+	`commit_message` (`DIGEST_CHANGED`). Nothing is written before this passes. Returns the `BlockCheck`.
+	"""
+	operations = block.operations_of(proposal)
+	check = change_guard.check_block(
+		operations,
+		block.commands_of(proposal),
+		allowed_apps,
+		frappe.local.site,
+		at_apply=True,
+		diff_text=cstr(proposal.diff),
+		legacy=not block.is_block(proposal),
+	)
+	if check.reason:
+		raise _Stop(CHANGE_STATUS_FAILED, check.reason)
+	for operation in operations:
+		if (operation.after is not None and _sha256_text(operation.after) != operation.after_hash) or (
+			operation.before is not None and _sha256_text(operation.before) != operation.base_hash
+		):
 			raise _Stop(CHANGE_STATUS_FAILED, STORED_HASH_MISMATCH)
+	if operations:
 		# The real message with the approver put back as the placeholder is the stored preview (design 3.9);
 		# `apply_message` only places the approver in its own line, so building it with the placeholder is that.
 		preview = change_text.message_text(
-			*change_text.apply_message(
-				proposal.name,
-				str(proposal.ticket or ""),
-				proposal.file_path,
-				change_text.APPROVER_PLACEHOLDER,
-			)
+			*_apply_message(proposal, operations, change_text.APPROVER_PLACEHOLDER)
 		)
 		if preview != proposal.commit_message:
 			raise _Stop(CHANGE_STATUS_FAILED, DIGEST_CHANGED)
-	return allowed_apps
+	return check
 
 
 def _failed(result) -> bool:
@@ -326,23 +361,22 @@ def _commit_record(
 	return {"fields": fields, "before": {"sha256": sha_before, "head": old_head}, "after": after}
 
 
-def _apply_record(proposal, full_path: str, old_head: str, commit: str | None, branch: str | None) -> dict:
-	return _commit_record("apply_commit_sha", full_path, proposal.base_hash, old_head, commit, branch)
+def _apply_record(operation, full_path: str, old_head: str, commit: str | None, branch: str | None) -> dict:
+	return _commit_record("apply_commit_sha", full_path, operation.base_hash, old_head, commit, branch)
 
 
 def _undo_record(proposal, full_path: str, old_head: str, commit: str | None, branch: str | None) -> dict:
 	return _commit_record("undo_commit_sha", full_path, proposal.after_hash, old_head, commit, branch)
 
 
-def _apply_postcheck(proposal, state, full_path: str, summary=None):
+def _apply_postcheck(proposal, operation, state, full_path: str, summary=None):
 	"""Design 4.3 step 3.5 (ADR-022 decision 1 step 5); returns the `CommitSummary` of the bot commit."""
-	content_after = (proposal.content_after or "").encode("utf-8")
 	return _postcheck(
 		state,
 		proposal.target_branch,
-		content_after,
+		operation.after.encode("utf-8"),
 		summary,
-		lambda commit, branch: _apply_record(proposal, full_path, state.head, commit, branch),
+		lambda commit, branch: _apply_record(operation, full_path, state.head, commit, branch),
 	)
 
 
@@ -379,18 +413,17 @@ def _postcheck(state, branch: str, blob: bytes | None, summary, record):
 	raise _Stop(CHANGE_STATUS_FAILED, GIT_COMMIT_MISMATCH, **record(commit, branch))
 
 
-def _apply_code(proposal, actor: str, allowed_apps, deadline: float) -> None:
-	"""Design 4.3 step 4.3: file hash, git pre-read, write, commit, post-check, done."""
-	new_file = bool(proposal.is_new_file)
-	guard = change_guard.check_write_path(proposal.file_path, allowed_apps, new_file=new_file, read_git=False)
-	if guard.reason:
-		raise _Stop(CHANGE_STATUS_FAILED, guard.reason)
-	full = guard.full_path
+def _apply_code(proposal, target, actor: str, deadline: float) -> None:
+	"""Design 4.3 step 4.3 for the one file item `target` that passed `_recheck_block`: file hash, git
+	pre-read, write, commit, post-check, done."""
+	operation = target.op
+	new_file = operation.kind == CHANGE_OP_CREATE
+	full = target.full_path
 	# D-19: the file hash first, git after; a stale target never reaches git.
 	on_disk = file_writer.sha256_of(full)
 	if new_file and (on_disk is not None or os.path.lexists(full)):
 		raise _Stop(CHANGE_STATUS_STALE, TARGET_CHANGED)
-	if not new_file and on_disk != proposal.base_hash:
+	if not new_file and on_disk != operation.base_hash:
 		raise _Stop(CHANGE_STATUS_STALE, TARGET_CHANGED)
 	# Git pre-check (design 4.3 step 4.3 item 2): a git refusal is `Lỗi` (AC-18, ADR-022 decision 7); only
 	# a changed branch is `Hết hiệu lực` (spec D-1, ADR-022 decision 6). A held `index.lock` is refused at
@@ -410,7 +443,7 @@ def _apply_code(proposal, actor: str, allowed_apps, deadline: float) -> None:
 		if new_file:
 			file_writer.remove_file(full)
 			return not added or not _failed(process_runner.git_unstage_new(repo, rel, source.GIT_TIMEOUT_S))
-		return file_writer.write_atomic(full, proposal.content_before, new_file=False) == proposal.base_hash
+		return file_writer.write_atomic(full, operation.before, new_file=False) == operation.base_hash
 
 	def give_back(reason: str, expected_head: str):
 		"""Design 4.3 step 3.6, then `Lỗi` with `reason`, or `GIT_RESTORE_FAILED` when the repo is not as before."""
@@ -418,26 +451,24 @@ def _apply_code(proposal, actor: str, allowed_apps, deadline: float) -> None:
 			reason = GIT_RESTORE_FAILED
 		raise _Stop(CHANGE_STATUS_FAILED, reason)
 
-	written = file_writer.write_atomic(full, proposal.content_after, new_file=new_file)
+	written = file_writer.write_atomic(full, operation.after, new_file=new_file)
 	try:
-		if written != proposal.after_hash:
+		if written != operation.after_hash:
 			give_back(WRITE_MISMATCH, old_head)
 		if new_file:
 			result = process_runner.git_add_new(repo, rel, source.GIT_TIMEOUT_S)
 			if _failed(result):
 				give_back(_commit_failed_reason(result), old_head)
 			added = True
-		subject, body = change_text.apply_message(
-			proposal.name, str(proposal.ticket or ""), proposal.file_path, _person(actor)
-		)
+		subject, body = _apply_message(proposal, (operation,), _person(actor))
 		result = process_runner.git_commit_only(repo, (rel,), subject, body, _git_limit(deadline))
 		if _failed(result):
 			summary = _commit_landed(
 				repo, old_head, lambda head: give_back(_commit_failed_reason(result), head)
 			)
 		committed = True
-		summary = _apply_postcheck(proposal, state, full, summary)
-		record = _apply_record(proposal, full, old_head, summary.commit, summary.branch)
+		summary = _apply_postcheck(proposal, operation, state, full, summary)
+		record = _apply_record(operation, full, old_head, summary.commit, summary.branch)
 		transitions.finish(
 			proposal.name,
 			CHANGE_STATUS_APPLYING,
@@ -465,7 +496,7 @@ def _apply_code(proposal, actor: str, allowed_apps, deadline: float) -> None:
 				old_head,
 				summary,
 				exc,
-				lambda commit, branch: _apply_record(proposal, full, old_head, commit, branch),
+				lambda commit, branch: _apply_record(operation, full, old_head, commit, branch),
 			)
 		_give_back_after_crash(
 			proposal,
@@ -474,32 +505,6 @@ def _apply_code(proposal, actor: str, allowed_apps, deadline: float) -> None:
 			lambda: _give_back(proposal, full, repo, restore, new_file=new_file, expected_head=old_head),
 		)
 		raise
-
-
-def _apply_block(proposal, actor: str, allowed_apps, deadline: float) -> None:
-	"""CHG-002 T1 walking skeleton: a block of exactly one `Sửa` item takes the one-file apply path.
-
-	The item is seen through the fields `_apply_code` reads, so the guard, stale check, write, one commit
-	of that one path, post-check and `Đã áp dụng` are those of the old shape. Later tasks replace this.
-	"""
-	operations = block.operations_of(proposal)
-	if len(operations) != 1 or operations[0].kind != CHANGE_OP_EDIT or block.commands_of(proposal):
-		raise _Stop(CHANGE_STATUS_FAILED, change_guard.OP_UNKNOWN)
-	(operation,) = operations
-	if hashlib.sha256(operation.after.encode("utf-8")).hexdigest() != operation.after_hash:
-		raise _Stop(CHANGE_STATUS_FAILED, STORED_HASH_MISMATCH)
-	item = frappe._dict(
-		name=proposal.name,
-		ticket=proposal.ticket,
-		target_branch=proposal.target_branch,
-		file_path=operation.path,
-		is_new_file=0,
-		content_before=operation.before,
-		content_after=operation.after,
-		base_hash=operation.base_hash,
-		after_hash=operation.after_hash,
-	)
-	_apply_code(item, actor, allowed_apps, deadline)
 
 
 def _give_back(proposal, full: str, repo: str, restore, *, new_file: bool, expected_head: str) -> bool:

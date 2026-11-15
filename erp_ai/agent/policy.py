@@ -113,6 +113,53 @@ def main_path_level(settings, permission_level: str, category: str | None) -> st
 	return min(permission_level, category_level_cap(settings, category), key=LEVELS.index)
 
 
+CONFIDENCE_THRESHOLD_FIELD = "confidence_threshold"
+DEFAULT_CONFIDENCE_THRESHOLD = 70
+
+
+def _known_pct(value) -> int | None:
+	"""An int 0..100 (not a bool) as is; anything else (-1, None, outside 0..100) is unknown: None."""
+	if isinstance(value, int) and not isinstance(value, bool) and 0 <= value <= 100:
+		return value
+	return None
+
+
+def confidence_threshold(settings) -> int:
+	"""The only reader of confidence_threshold; missing, empty, garbage or outside 0..100 reads the default."""
+	value = getattr(settings, CONFIDENCE_THRESHOLD_FIELD, None)
+	if isinstance(value, bool):
+		return DEFAULT_CONFIDENCE_THRESHOLD
+	try:
+		threshold = _known_pct(int(value))
+	except (TypeError, ValueError):
+		threshold = None  # missing or not a number: behave like a fresh install
+	return DEFAULT_CONFIDENCE_THRESHOLD if threshold is None else threshold
+
+
+def is_below_confidence(
+	confidence_pct: int | None, threshold: int, *, has_instructor: bool, act_now: bool
+) -> bool:
+	"""The single below-threshold predicate (ADR-030 QĐ 4): unknown is below, unless instructor AND act_now."""
+	if has_instructor and act_now:
+		return False
+	pct = _known_pct(confidence_pct)
+	return pct is None or pct < threshold
+
+
+def latest_classification(ticket_name: str) -> tuple[str | None, int | None]:
+	"""(predicted_category, pct) of the ticket's newest classify row with a category; (None, None) without one."""
+	rows = frappe.get_all(
+		LOG_DOCTYPE,
+		filters={"ticket": ticket_name, "entry_type": "classify", "predicted_category": ("is", "set")},
+		fields=["predicted_category", "predicted_confidence_pct"],
+		order_by="creation desc",
+		limit=1,
+	)
+	if not rows:
+		return None, None
+	return rows[0].predicted_category, _known_pct(rows[0].predicted_confidence_pct)
+
+
 def runs_today(ticket_name, now=None) -> int:
 	"""Distinct run_id of classify/reason log entries since 00:00 today (system time)."""
 	start = get_datetime(now or now_datetime()).replace(hour=0, minute=0, second=0, microsecond=0)

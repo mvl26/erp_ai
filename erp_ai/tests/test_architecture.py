@@ -163,9 +163,9 @@ ALLOWED_TOP_LEVEL_MODULES = frozenset({PACKAGE, "frappe", "helpdesk", *sys.stdli
 ANTHROPIC_MODULE = "anthropic"
 # ADR-040 Phán quyết C-3: the one named exception to ADR-001, `{file: top-level libraries it may import}`
 # (versions pinned by frappe, not by erp_ai); how restart_check uses them is check_restart_check_library_use's.
-NAMED_LIBRARY_IMPORTS = {"agent/changes/restart_check.py": frozenset({"psutil", "redis"})}
 RESTART_CHECK_FILE = "agent/changes/restart_check.py"
-RESTART_CHECK_LIBRARIES = ("psutil", "redis")
+NAMED_LIBRARY_IMPORTS = {RESTART_CHECK_FILE: frozenset({"psutil", "redis"})}
+RESTART_CHECK_LIBRARIES = tuple(sorted(NAMED_LIBRARY_IMPORTS[RESTART_CHECK_FILE]))
 RESTART_CHECK_ALLOWED_NAMES = frozenset(
 	{"psutil", "redis", "psutil.Process", "psutil.Error", "redis.exceptions", "redis.exceptions.RedisError"}
 )

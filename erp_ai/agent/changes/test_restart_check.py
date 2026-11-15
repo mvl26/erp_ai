@@ -38,6 +38,7 @@ class TestOutcome(FrappeTestCase):
 		)
 		# Started exactly at the sent moment is not "after" it.
 		self.assertIsNone(restart_check.outcome(SENT, BEFORE_DEADLINE, SENT, SENT + 2))
+		self.assertIsNone(restart_check.outcome(SENT, BEFORE_DEADLINE, SENT + 2, SENT))
 
 	def test_web_old_after_deadline_unconfirmed(self):
 		self.assertEqual(
@@ -70,6 +71,15 @@ class TestOutcome(FrappeTestCase):
 			self.assertIsNone(restart_check.web_started())
 		# No evidence never confirms.
 		self.assertIsNone(restart_check.outcome(SENT, BEFORE_DEADLINE, None, None))
+
+	def test_programming_error_is_not_no_evidence(self):
+		# ADR-040 C-3: only redis/psutil errors mean "no evidence"; a bug must propagate.
+		with patch(GET_WORKERS, side_effect=ValueError("bug")):
+			with self.assertRaises(ValueError):
+				restart_check.workers_started()
+		with patch.object(restart_check.psutil, "Process", side_effect=ValueError("bug")):
+			with self.assertRaises(ValueError):
+				restart_check.web_started()
 
 	def test_evidence_sources(self):
 		with patch(GET_WORKERS, return_value=[_worker(BIRTH_AFTER), _worker(BIRTH_BEFORE)]):

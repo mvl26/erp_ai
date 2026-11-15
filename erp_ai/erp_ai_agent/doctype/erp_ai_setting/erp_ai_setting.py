@@ -25,8 +25,10 @@ from erp_ai.constants import (
 	KEY_STATUS_ACTIVE,
 	KEY_STATUS_BAD_KEY,
 	KPI_IDS,
+	LEVELS,
 	SETTING_DOCTYPE,
 )
+from erp_ai.erp_ai_agent.report.erp_ai_accuracy.erp_ai_accuracy import GATE_WINDOW_DAYS, l0_l1_gate
 
 SELF_MANAGED_KEY_FIELDS = (
 	"status",
@@ -82,6 +84,10 @@ PROBE_RESULT_FIELDS = ("label", "ok", "error_kind", "status")
 # D-7: the switches are the Check fields of this section, read from the meta; no switch name is written here.
 PERMISSION_SECTION = "section_permissions"
 PERMISSION_NOTICE_TITLE = "Đã bật quyền mở rộng"
+# AC-18 form part (design.md:323, A-8): the warning when the level leaves L0 while the gate is not passed.
+GATE_FROM_LEVEL = "L0"
+GATE_PASSED_VERDICT = "Đạt"
+GATE_WARNING_TITLE = "Chưa đạt cửa L0 → L1"
 # design.md:214-221: the only catalog actions whose row names a DocType; the others act on a fixed one.
 DOCTYPE_ACTIONS = (ACTION_CREATE_CUSTOM_FIELD, ACTION_UPDATE_FIELDS)
 # AC-24: the settings naming an HD Ticket field, in form order; the due field must hold a date (E-2).
@@ -197,6 +203,26 @@ class ERPAISetting(Document):
 
 	def on_update(self):
 		self.notify_permission_switches()
+		self.warn_level_raise_without_gate()
+
+	def warn_level_raise_without_gate(self):
+		"""AC-18, A-8: the level goes from L0 to L1 or higher and the L0 → L1 gate is not "Đạt": warn, the save
+		stands. The levels are read through policy.effective_level, the only reader of the level field."""
+		before = self.get_doc_before_save()
+		if not before or policy.effective_level(before, over_budget=False) != GATE_FROM_LEVEL:
+			return
+		level = policy.effective_level(self, over_budget=False)
+		if level not in LEVELS or LEVELS.index(level) <= LEVELS.index(GATE_FROM_LEVEL):
+			return
+		gate = l0_l1_gate()
+		if gate.verdict == GATE_PASSED_VERDICT:
+			return
+		frappe.msgprint(
+			f"Kết luận cửa L0 → L1 của báo cáo ERP AI Accuracy ({GATE_WINDOW_DAYS} ngày gần nhất): {gate.verdict},"
+			f" {gate.correct}/{gate.labeled} phiếu có nhãn đúng. Mức vẫn được lưu.",
+			title=GATE_WARNING_TITLE,
+			indicator="orange",
+		)
 
 	def notify_permission_switches(self):
 		"""AC-4: one notice listing every switch turned 0 -> 1 by this save, then the site environment."""

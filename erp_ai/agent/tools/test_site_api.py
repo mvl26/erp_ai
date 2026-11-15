@@ -1996,3 +1996,110 @@ class TestExcludedTicketReads(_ExcludedTicketCase):
 	def test_record_tools_granted_when_switch_on(self):
 		inputs = registry.GrantInputs("L3", "L3", True, PermissionSwitches(record_tools=True))
 		self.assertLessEqual({"api_list_records", "api_get_record"}, registry.grant(inputs).names())
+
+
+# One harmless change per DocType, for the update tool.
+WRITE_VALUES = {
+	"HD Ticket": {"subject": "U2 đổi"},
+	"Comment": {"content": "U2 đổi"},
+	"Communication": {"content": "U2 đổi"},
+	"File": {"file_name": "U2-doi.txt"},
+	LEGACY_NOTE_DOCTYPE: {"content": "U2 đổi"},
+	"Task": {"subject": "U2 đổi"},
+}
+
+
+class TestExcludedTicketWrites(_ExcludedTicketCase):
+	def assert_refused(self, result, doctype):
+		self.assertEqual(result, {"ok": False, "reason": policy.EXCLUDED_TICKET_REASON, "doctype": doctype})
+		self.assert_no_seed(result)
+
+	def stored(self, doctype, name):
+		return frappe.db.get_value(doctype, name, "*", as_dict=True)
+
+	def test_update_delete_submit_refused_on_excluded_records(self):
+		made = self.make_tickets()
+		for kind in EXCLUDED_KINDS:
+			ticket = made[kind]["HD Ticket"]
+			made[kind]["Task"] = _db_insert({"doctype": "Task", "subject": self.seed, "ai_ticket": ticket})
+		for unrestricted in (False, True):
+			context = _context(unrestricted=unrestricted)
+			for kind in EXCLUDED_KINDS:
+				for doctype, name in made[kind].items():
+					calls = {
+						"update": (
+							site_api.update_record,
+							{"doctype": doctype, "name": name, "values": WRITE_VALUES[doctype]},
+						),
+						"delete": (site_api.delete_record, {"doctype": doctype, "name": name}),
+						"submit": (
+							site_api.submit_record,
+							{"doctype": doctype, "name": name, "action": "submit"},
+						),
+					}
+					for tool, (handler, arguments) in calls.items():
+						with self.subTest(unrestricted=unrestricted, kind=kind, doctype=doctype, tool=tool):
+							before = self.stored(doctype, name)
+							self.assertTrue(before)
+							self.assert_refused(handler(arguments, context), doctype)
+							self.assertEqual(self.stored(doctype, name), before)
+
+	def test_create_linked_to_excluded_ticket_refused(self):
+		excluded = self.ticket("team", self.seed)
+		normal = self.ticket("normal", self.plain)
+		comment = {"comment_type": "Comment", "reference_doctype": "HD Ticket", "content": self.seed}
+		communication = {
+			"communication_type": "Communication",
+			"communication_medium": "Email",
+			"sent_or_received": "Sent",
+			"reference_doctype": "HD Ticket",
+			"subject": self.seed,
+			"content": self.seed,
+		}
+		# `(doctype, values, column holding the seed)`; the name as a number and as text, the type in any case.
+		cases = (
+			("Comment", {**comment, "reference_name": excluded}, "content"),
+			(
+				"Comment",
+				{**comment, "reference_doctype": "hd ticket", "reference_name": str(excluded)},
+				"content",
+			),
+			("Communication", {**communication, "reference_name": excluded}, "content"),
+			(LEGACY_NOTE_DOCTYPE, {"reference_ticket": excluded, "content": self.seed}, "content"),
+			("Task", {"subject": self.seed, "ai_ticket": excluded}, "subject"),
+		)
+		for unrestricted in (False, True):
+			context = _context(unrestricted=unrestricted)
+			for doctype, values, column in cases:
+				with self.subTest(unrestricted=unrestricted, doctype=doctype, values=values):
+					result = site_api.create_record({"doctype": doctype, "values": values}, context)
+					self.assert_refused(result, doctype)
+					self.assertEqual(frappe.db.count(doctype, {column: ["like", f"%{self.seed}%"]}), 0)
+		# The same link to a normal ticket is created.
+		values = {**comment, "reference_name": normal, "content": self.plain}
+		result = site_api.create_record({"doctype": "Comment", "values": values}, _context())
+		self.assertTrue(result["ok"], result)
+		self.assertEqual(frappe.db.get_value("Comment", result["name"], "reference_name"), str(normal))
+
+	def test_update_moving_record_into_excluded_ticket_refused(self):
+		excluded = self.ticket("team", self.seed)
+		normal = self.ticket("normal", self.plain)
+		comment = self.comment(normal, self.plain)
+		task = _db_insert({"doctype": "Task", "subject": self.plain, "ai_ticket": normal})
+		note = _db_insert({"doctype": LEGACY_NOTE_DOCTYPE, "reference_ticket": normal, "content": self.plain})
+		# A ToDo's comment whose reference_name is the excluded ticket's number: only the type column moves it.
+		todo_comment = self.comment(str(excluded), self.plain, "ToDo")
+		cases = (
+			("Comment", comment, {"reference_name": excluded}),
+			("Task", task, {"ai_ticket": excluded}),
+			(LEGACY_NOTE_DOCTYPE, note, {"reference_ticket": excluded}),
+			("Comment", todo_comment, {"reference_doctype": "HD Ticket"}),
+		)
+		for unrestricted in (False, True):
+			context = _context(unrestricted=unrestricted)
+			for doctype, name, values in cases:
+				with self.subTest(unrestricted=unrestricted, doctype=doctype, values=values):
+					before = self.stored(doctype, name)
+					arguments = {"doctype": doctype, "name": name, "values": values}
+					self.assert_refused(site_api.update_record(arguments, context), doctype)
+					self.assertEqual(self.stored(doctype, name), before)

@@ -1272,3 +1272,184 @@ class TestProposeBlock(FrappeTestCase):
 			with self.subTest(reason=reason):
 				self.assert_refused_whole(self.block([good, second]), reason, snapshot)
 		self.assert_refused_whole(self.block([]), change_guard.BLOCK_EMPTY, snapshot)
+
+	# CHG-002 T27: `delete` and `rename` items (design 3.1, 4.1 step 2; R-7, R-8, D-8).
+
+	def test_five_item_block_makes_one_pending_proposal_one_comment_three_links(self):
+		self.sandbox.commit_file(APP, "pkg/a.txt", "một\nhai\n")
+		self.sandbox.commit_file(APP, "pkg/d.txt", "xóa\n")
+		self.sandbox.commit_file(APP, "pkg/r.txt", "giữ\n")
+		snapshot = self.git_snapshot()
+		changes = [
+			{"action": "edit", "path": f"{APP}/pkg/a.txt", "find": ["hai"], "replace": ["ba"]},
+			{"action": "create", "path": f"{APP}/pkg/n.md", "content": "n\n"},
+			{"action": "delete", "path": f"{APP}/pkg/d.txt"},
+			{"action": "rename", "path": f"{APP}/pkg/r.txt", "new_path": f"{APP}/doc/r.txt"},
+			{"action": "create", "path": f"{APP}/doc/sub/x.yaml", "content": "a: 1\n"},
+		]
+		with patch.object(change_guard, "check_block", wraps=change_guard.check_block) as check_block:
+			result = self.block(changes)
+		self.assertTrue(result["ok"], result)
+		self.assertEqual(self.proposals(), [result["proposal"]])
+		doc = self.stored(result)
+		rows = [
+			(row.idx, row.operation, row.file_path, row.new_path, row.content_before, row.content_after)
+			for row in doc.operations
+		]
+		self.assertEqual(
+			rows,
+			[
+				(1, "Sửa", f"{APP}/pkg/a.txt", None, "một\nhai\n", "một\nba\n"),
+				(2, "Tạo", f"{APP}/pkg/n.md", None, None, "n\n"),
+				(3, "Xóa", f"{APP}/pkg/d.txt", None, "xóa\n", None),
+				(4, "Đổi tên", f"{APP}/pkg/r.txt", f"{APP}/doc/r.txt", "giữ\n", "giữ\n"),
+				(5, "Tạo", f"{APP}/doc/sub/x.yaml", None, None, "a: 1\n"),
+			],
+		)
+		hashes = [(row.base_hash, row.after_hash) for row in doc.operations[2:4]]
+		self.assertEqual(hashes, [(_sha("xóa\n"), None), (_sha("giữ\n"), _sha("giữ\n"))])
+		expected_diff = (
+			f"--- a/{APP}/pkg/a.txt\n+++ b/{APP}/pkg/a.txt\n@@ -1,2 +1,2 @@\n một\n-hai\n+ba\n"
+			f"--- a/{APP}/pkg/n.md\n+++ b/{APP}/pkg/n.md\n@@ -0,0 +1 @@\n+n\n"
+			f"--- a/{APP}/pkg/d.txt\n+++ /dev/null\n@@ -1 +0,0 @@\n-xóa\n"
+			f"rename from {APP}/pkg/r.txt\nrename to {APP}/doc/r.txt\n"
+			f"--- a/{APP}/doc/sub/x.yaml\n+++ b/{APP}/doc/sub/x.yaml\n@@ -0,0 +1 @@\n+a: 1\n"
+		)
+		self.assertEqual(doc.diff, expected_diff)
+		self.assertEqual(check_block.call_args.kwargs["diff_text"], doc.diff)
+		self.assertEqual(doc.change_status, CHANGE_STATUS_PENDING)
+		(comment,) = self.comments()
+		links = re.findall(r'<a href="([^"]+)"', comment["content"])
+		decisions = [
+			change_link.decision_path(doc.name, action)
+			for action in (change_link.ACTION_APPROVE, change_link.ACTION_REJECT)
+		]
+		form = f"/app/erp-ai-change-proposal/{doc.name}"
+		self.assertEqual(links[1:], [frappe.utils.escape_html(path) for path in (*decisions, form)])
+		self.assertEqual(self.git_snapshot(), snapshot)
+		self.assertTrue(os.path.isfile(os.path.join(self.sandbox.repo(APP), "pkg/d.txt")))
+		self.assertFalse(os.path.lexists(os.path.join(self.sandbox.repo(APP), "doc")))
+
+	def test_ten_item_block(self):
+		for number in range(5):
+			self.sandbox.commit_file(APP, f"pkg/f{number}.txt", f"{number}\n")
+		snapshot = self.git_snapshot()
+		changes = [
+			{"action": "delete", "path": f"{APP}/pkg/f0.txt"},
+			{"action": "delete", "path": f"{APP}/pkg/f1.txt"},
+			{"action": "rename", "path": f"{APP}/pkg/f2.txt", "new_path": f"{APP}/pkg/g2.txt"},
+			{"action": "rename", "path": f"{APP}/pkg/f3.txt", "new_path": f"{APP}/pkg/g3.txt"},
+			{"action": "edit", "path": f"{APP}/pkg/f4.txt", "find": ["4"], "replace": ["5"]},
+			*(
+				{"action": "create", "path": f"{APP}/pkg/c{number}.md", "content": "c\n"}
+				for number in range(5)
+			),
+		]
+		result = self.block(changes)
+		self.assertTrue(result["ok"], result)
+		self.assertEqual(self.proposals(), [result["proposal"]])
+		self.assertEqual(len(self.comments()), 1)
+		operations = [row.operation for row in self.stored(result).operations]
+		self.assertEqual(operations, ["Xóa", "Xóa", "Đổi tên", "Đổi tên", "Sửa", *["Tạo"] * 5])
+		self.assertEqual(self.git_snapshot(), snapshot)
+
+	def assert_item_refused(self, item, reason, number=1, **context):
+		snapshot = self.git_snapshot()
+		result = self.block([item], **context)
+		self.assert_refused_whole(result, f"mục {number} ({item['path']}): {reason}", snapshot)
+
+	def test_delete_directory_refused(self):
+		self.sandbox.commit_file(APP, "pkg/dir/a.txt", "a\n")
+		item = {"action": "delete", "path": f"{APP}/pkg/dir"}
+		self.assert_item_refused(item, change_guard.NOT_REGULAR_FILE)
+
+	def test_delete_missing_refused(self):
+		item = {"action": "delete", "path": f"{APP}/pkg/none.txt"}
+		self.assert_item_refused(item, change_guard.NOT_REGULAR_FILE)
+
+	def test_delete_dirty_refused(self):
+		self.sandbox.commit_file(APP, "pkg/d.txt", "d\n")
+		self.sandbox.write_unstaged(APP, "pkg/d.txt", "e\n")
+		item = {"action": "delete", "path": f"{APP}/pkg/d.txt"}
+		self.assert_item_refused(item, source.GIT_DIRTY)
+
+	def test_delete_untracked_refused(self):
+		self.sandbox.write_unstaged(APP, "pkg/u.txt", "u\n")
+		item = {"action": "delete", "path": f"{APP}/pkg/u.txt"}
+		self.assert_item_refused(item, source.GIT_DIRTY)
+
+	def test_delete_binary_refused(self):
+		self.sandbox.commit_file(APP, "pkg/img.png", b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR")
+		item = {"action": "delete", "path": f"{APP}/pkg/img.png"}
+		self.assert_item_refused(item, "file có byte NUL, không phải văn bản")
+
+	def test_delete_executable_refused(self):
+		self.sandbox.commit_file(APP, "pkg/run.sh", "echo a\n")
+		os.chmod(os.path.join(self.sandbox.repo(APP), "pkg/run.sh"), 0o744)
+		for item in (
+			{"action": "delete", "path": f"{APP}/pkg/run.sh"},
+			{"action": "rename", "path": f"{APP}/pkg/run.sh", "new_path": f"{APP}/pkg/go.sh"},
+		):
+			with self.subTest(action=item["action"]):
+				self.assert_item_refused(item, change_guard.EXECUTABLE_FILE)
+
+	def test_delete_symlink_refused(self):
+		self.sandbox.commit_file(APP, "pkg/a.txt", "a\n")
+		os.symlink("a.txt", os.path.join(self.sandbox.repo(APP), "pkg/link.txt"))
+		snapshot = self.git_snapshot()
+		result = self.block([{"action": "delete", "path": f"{APP}/pkg/link.txt"}])
+		self.assertFalse(result["ok"], result)
+		self.assertTrue(result["reason"].startswith(f"mục 1 ({APP}/pkg/link.txt): "), result)
+		self.assert_refused_whole(result, result["reason"], snapshot)
+		self.assertTrue(os.path.islink(os.path.join(self.sandbox.repo(APP), "pkg/link.txt")))
+
+	def test_rename_dest_exists_refused(self):
+		self.sandbox.commit_file(APP, "pkg/r.txt", "r\n")
+		self.sandbox.commit_file(APP, "pkg/s.txt", "s\n")
+		item = {"action": "rename", "path": f"{APP}/pkg/r.txt", "new_path": f"{APP}/pkg/s.txt"}
+		self.assert_item_refused(item, propose_change.EXISTS)
+
+	def test_rename_source_missing_refused(self):
+		item = {"action": "rename", "path": f"{APP}/pkg/none.txt", "new_path": f"{APP}/pkg/s.txt"}
+		self.assert_item_refused(item, change_guard.NOT_REGULAR_FILE)
+
+	def test_rename_across_apps_refused(self):
+		self.sandbox.commit_file(APP, "pkg/r.txt", "r\n")
+		self.sandbox.commit_file("hrms", "pkg/b.txt", "b\n")
+		item = {"action": "rename", "path": f"{APP}/pkg/r.txt", "new_path": "hrms/pkg/r.txt"}
+		reason = change_guard.BLOCK_TWO_APPS.format(a=APP, b="hrms")
+		self.assert_item_refused(item, reason, allowed_apps=(APP, "hrms"))
+
+	def test_rename_end_in_ring_refused(self):
+		self.sandbox.commit_file(APP, "pkg/r.txt", "r\n")
+		item = {"action": "rename", "path": f"{APP}/pkg/r.txt", "new_path": "erp_ai/r.txt"}
+		self.assert_item_refused(item, change_guard.APP_FORBIDDEN, allowed_apps=(APP, "erp_ai"))
+
+	def test_nine_valid_plus_one_erp_ai_refused_whole(self):
+		self.sandbox.commit_file(APP, "pkg/d.txt", "d\n")
+		self.sandbox.commit_file(APP, "pkg/r.txt", "r\n")
+		snapshot = self.git_snapshot()
+		changes = [
+			{"action": "delete", "path": f"{APP}/pkg/d.txt"},
+			{"action": "rename", "path": f"{APP}/pkg/r.txt", "new_path": f"{APP}/pkg/s.txt"},
+			*(
+				{"action": "create", "path": f"{APP}/pkg/c{number}.md", "content": "c\n"}
+				for number in range(7)
+			),
+			{"action": "create", "path": "erp_ai/x.md", "content": "x\n"},
+		]
+		result = self.block(changes, allowed_apps=(APP, "erp_ai"))
+		reason = f"mục 10 (erp_ai/x.md): {change_guard.APP_FORBIDDEN}"
+		self.assert_refused_whole(result, reason, snapshot)
+
+	def test_create_under_a_parent_that_is_a_file_refused(self):
+		self.sandbox.commit_file(APP, "README.md", "r\n")
+		self.sandbox.commit_file(APP, "pkg/r.txt", "r\n")
+		for item in (
+			{"action": "create", "path": f"{APP}/README.md/x.txt", "content": "x\n"},
+			{"action": "create", "path": f"{APP}/README.md/sub/x.txt", "content": "x\n"},
+			{"action": "rename", "path": f"{APP}/pkg/r.txt", "new_path": f"{APP}/README.md/r.txt"},
+		):
+			with self.subTest(item=item):
+				self.assert_item_refused(item, change_guard.PATH_INVALID)
+		self.assertTrue(os.path.isfile(os.path.join(self.sandbox.repo(APP), "README.md")))

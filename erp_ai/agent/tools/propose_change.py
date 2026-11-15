@@ -19,7 +19,9 @@ from erp_ai.constants import (
 	CHANGE_KIND_COMMAND,
 	CHANGE_MAX_FILE_OPS,
 	CHANGE_OP_CREATE,
+	CHANGE_OP_DELETE,
 	CHANGE_OP_EDIT,
+	CHANGE_OP_RENAME,
 	PROPOSAL_DOCTYPE,
 	PROPOSAL_TEXT_MAX_CHARS,
 	REPLACE_MAX_ITEMS,
@@ -46,8 +48,14 @@ EDIT_OVERLAP = "các đoạn find chồng nhau"
 NO_CHANGE = "nội dung sau trùng nội dung trước"
 EXISTS = "file đã tồn tại"
 BLOCK_SHAPE = change_guard.BLOCK_SHAPE
-# CHG-002 design 3.1: the fields of an `edit` and of a `create` item of `changes`.
-ITEM_FIELDS = {"edit": {"action", "path", "find", "replace"}, "create": {"action", "path", "content"}}
+# CHG-002 design 3.1: the fields of each kind of item of `changes`.
+ITEM_FIELDS = {
+	"edit": {"action", "path", "find", "replace"},
+	"create": {"action", "path", "content"},
+	"delete": {"action", "path"},
+	"rename": {"action", "path", "new_path"},
+}
+EXECUTABLE_BITS = 0o111
 LEGACY_EDIT_KEYS = ("path", "find", "replace")
 # CHG-002 addendum-6: `restart` reaches the model only as a block command (T28); the single-command
 # apply path would run it inside the worker instead of through `launch_restart`.
@@ -98,12 +106,12 @@ def _apply_edits(text: str, find: list, replace: list) -> tuple[str | None, str 
 	return "".join(pieces), None
 
 
-def _diff(rel_path: str, before: str, after: str) -> str:
+def _diff(rel_path: str, before: str, after: str, tofile: str | None = None) -> str:
 	lines = difflib.unified_diff(
 		before.splitlines(keepends=True),
 		after.splitlines(keepends=True),
 		fromfile=f"a/{rel_path}",
-		tofile=f"b/{rel_path}",
+		tofile=tofile or f"b/{rel_path}",
 		n=DIFF_CONTEXT_LINES,
 	)
 	return "".join(line if line.endswith("\n") else line + "\n" for line in lines)
@@ -157,15 +165,17 @@ def _is_text_list(value) -> bool:
 
 
 def _item_shape(change) -> str | None:
-	"""Design 3.1: the kind of an `edit` or `create` item of `changes`, or the refusal reason."""
+	"""Design 3.1: the fields of an item of `changes` for its `action`, or the refusal reason."""
 	action = change.get("action") if isinstance(change, dict) else None
 	if action not in ITEM_FIELDS:
 		return change_guard.OP_UNKNOWN
 	fields_ok = set(change) == ITEM_FIELDS[action] and isinstance(change["path"], str)
 	if action == "edit":
 		fields_ok = fields_ok and _is_text_list(change["find"]) and _is_text_list(change["replace"])
-	else:
+	elif action == "create":
 		fields_ok = fields_ok and isinstance(change["content"], str)
+	elif action == "rename":
+		fields_ok = fields_ok and isinstance(change["new_path"], str)
 	return None if fields_ok else change_guard.OP_FIELDS.format(action=action)
 
 
@@ -199,6 +209,14 @@ def _edited_op(change: dict, ctx: ToolContext) -> change_guard.FileOp | str:
 	)
 
 
+def _under_a_folder(full: str) -> bool:
+	"""A new file's nearest existing parent is a folder, not a file (`app/README.md/x.txt` is refused)."""
+	parent = os.path.dirname(full)
+	while not os.path.lexists(parent):
+		parent = os.path.dirname(parent)
+	return os.path.isdir(parent)
+
+
 def _created_op(change: dict, ctx: ToolContext) -> change_guard.FileOp | str:
 	"""Design 4.1 step 2 for a `create` item: an existing path (`lexists`) is `EXISTS`; folders may be new."""
 	guard = change_guard.check_write_path(change["path"], ctx.allowed_apps, new_file=True, read_git=False)
@@ -206,6 +224,8 @@ def _created_op(change: dict, ctx: ToolContext) -> change_guard.FileOp | str:
 		return guard.reason
 	if os.path.lexists(guard.full_path):
 		return EXISTS
+	if not _under_a_folder(guard.full_path):
+		return change_guard.PATH_INVALID
 	content = change["content"]
 	return change_guard.FileOp(
 		kind=CHANGE_OP_CREATE,
@@ -218,9 +238,85 @@ def _created_op(change: dict, ctx: ToolContext) -> change_guard.FileOp | str:
 	)
 
 
+def _removed_text(path: str, ctx: ToolContext) -> tuple[str, str | None]:
+	"""Design 4.1 step 2 for the file a `delete` or `rename` item takes away (R-7, R-8): a regular file and
+	not a symlink (`NOT_REGULAR_FILE`), no execute bit (`EXECUTABLE_FILE`), then at most
+	`TEXT_MAX_BYTES + 1` bytes through `text_refusal`; (text, None) or ("", refusal reason)."""
+	guard = change_guard.check_write_path(path, ctx.allowed_apps, new_file=False, read_git=False)
+	if guard.reason:
+		return "", guard.reason
+	full = guard.full_path
+	if not os.path.isfile(full) or os.path.islink(full):
+		return "", change_guard.NOT_REGULAR_FILE
+	if os.stat(full).st_mode & EXECUTABLE_BITS:
+		return "", change_guard.EXECUTABLE_FILE
+	with open(full, "rb") as handle:
+		data = handle.read(source.TEXT_MAX_BYTES + 1)
+	refusal = source.text_refusal(guard.rel_path, data)
+	if refusal:
+		return "", refusal
+	return data.decode("utf-8"), None
+
+
+def _deleted_op(change: dict, ctx: ToolContext) -> change_guard.FileOp | str:
+	"""Design 4.1 step 2 for a `delete` item: the file's text is kept as the content before."""
+	before, refusal = _removed_text(change["path"], ctx)
+	if refusal:
+		return refusal
+	return change_guard.FileOp(
+		kind=CHANGE_OP_DELETE,
+		path=change["path"],
+		new_path=None,
+		before=before,
+		after=None,
+		base_hash=_sha256(before.encode("utf-8")),
+		after_hash=None,
+	)
+
+
+def _renamed_op(change: dict, ctx: ToolContext) -> change_guard.FileOp | str:
+	"""Design 4.1 step 2 for a `rename` item: the source as for `delete`, a target that exists
+	(`lexists`) is `EXISTS`; the content moves unchanged."""
+	text, refusal = _removed_text(change["path"], ctx)
+	if refusal:
+		return refusal
+	guard = change_guard.check_write_path(change["new_path"], ctx.allowed_apps, new_file=True, read_git=False)
+	if guard.reason:
+		return guard.reason
+	if os.path.lexists(guard.full_path):
+		return EXISTS
+	if not _under_a_folder(guard.full_path):
+		return change_guard.PATH_INVALID
+	digest = _sha256(text.encode("utf-8"))
+	return change_guard.FileOp(
+		kind=CHANGE_OP_RENAME,
+		path=change["path"],
+		new_path=change["new_path"],
+		before=text,
+		after=text,
+		base_hash=digest,
+		after_hash=digest,
+	)
+
+
+_BUILDERS = {"edit": _edited_op, "create": _created_op, "delete": _deleted_op, "rename": _renamed_op}
+
+
+def _op_diff(op: change_guard.FileOp) -> str:
+	"""One item's part of `diff_text`: a unified diff (a deletion against `/dev/null`), or for a rename
+	the two lines `rename from` / `rename to`."""
+	path = os.path.normpath(op.path)
+	if op.kind == CHANGE_OP_RENAME:
+		return f"rename from {path}\nrename to {os.path.normpath(op.new_path)}\n"
+	tofile = "/dev/null" if op.kind == CHANGE_OP_DELETE else None
+	return _diff(path, op.before or "", op.after or "", tofile)
+
+
 def _row(target: change_guard.OpTarget) -> dict:
 	op = target.op
 	row = {"operation": op.kind, "file_path": target.guard.rel_path, "content_after": op.after}
+	if op.new_path is not None:
+		row["new_path"] = os.path.normpath(op.new_path)
 	if op.before is not None:
 		row.update(content_before=op.before, base_hash=op.base_hash)
 	row["after_hash"] = op.after_hash
@@ -228,7 +324,7 @@ def _row(target: change_guard.OpTarget) -> dict:
 
 
 def _propose_block(changes: list, commands: list, reason: str, ctx: ToolContext) -> dict:
-	"""CHG-002 design 4.1: one block proposal of `edit` and `create` items (design 3.1).
+	"""CHG-002 design 4.1: one block proposal of `edit`, `create`, `delete` and `rename` items (design 3.1).
 
 	Step 2 turns each item into a `FileOp`; step 2b builds the joined `diff_text` once (design-addendum-1
 	A-1.5); step 3 is `check_block` at proposal time, whose paths and git state are the ones stored; step 4
@@ -241,13 +337,13 @@ def _propose_block(changes: list, commands: list, reason: str, ctx: ToolContext)
 	for number, change in enumerate(changes, start=1):
 		refusal = _item_shape(change)
 		if refusal is None:
-			built = (_edited_op if change["action"] == "edit" else _created_op)(change, ctx)
+			built = _BUILDERS[change["action"]](change, ctx)
 			refusal = built if isinstance(built, str) else None
 		if refusal:
 			path = change.get("path") if isinstance(change, dict) else None
 			return _fail(change_guard.OP_PREFIX.format(number=number, path=path) + refusal)
 		ops.append(built)
-	diff_text = "".join(_diff(os.path.normpath(op.path), op.before or "", op.after or "") for op in ops)
+	diff_text = "".join(_op_diff(op) for op in ops)
 	check = change_guard.check_block(
 		ops, commands, ctx.allowed_apps, frappe.local.site, at_apply=False, diff_text=diff_text
 	)

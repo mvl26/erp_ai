@@ -27,15 +27,37 @@ ROLE_PROFILE_DOCTYPE = "Role Profile"
 ROLE_DOCTYPE = "Role"
 DOCTYPE_DOCTYPE = "DocType"
 # Changing these grants permissions the way a forbidden role would: denied unless the unrestricted switch is on.
+# Customize Form saves Property Setters, permlevel ones included (R10d).
 PERMISSION_DOCTYPES = frozenset(
-	{"Custom Role", "Custom DocPerm", DOCTYPE_DOCTYPE, ROLE_DOCTYPE, "User Permission", "DocShare"}
+	{
+		"Custom Role",
+		"Custom DocPerm",
+		DOCTYPE_DOCTYPE,
+		ROLE_DOCTYPE,
+		"User Permission",
+		"DocShare",
+		"Customize Form",
+	}
 )
+# Closed to these tools in every mode: a Deleted Document holds a whole deleted record, a ticket of an excluded team
+# and its content included (R10b).
+RECORD_DENIED_DOCTYPES = frozenset({"Deleted Document"})
 PROPERTY_SETTER_DOCTYPE = "Property Setter"
 CUSTOM_FIELD_DOCTYPE = "Custom Field"
 PERMLEVEL_PROPERTY = "permlevel"
 PERMLEVEL_REASON = "Property Setter đổi permlevel là sửa phân quyền, không làm qua công cụ"
 # Setting a field's permlevel changes permissions too (AC-5, C-6): refused unless the unrestricted switch is on.
 PERMLEVEL_DOCTYPES = (PROPERTY_SETTER_DOCTYPE, CUSTOM_FIELD_DOCTYPE)
+# The stored fields of a Property Setter / Custom Field that the schema checks compare a write with.
+SCHEMA_FIELDS = {
+	PROPERTY_SETTER_DOCTYPE: ("doc_type", "field_name", "property"),
+	CUSTOM_FIELD_DOCTYPE: ("dt", "fieldname", "fieldtype", "options", "permlevel"),
+}
+TICKET_LINK_SCHEMA_REASON = "Custom Field / Property Setter đổi trường liên kết tới phiếu là gỡ chặn phiếu loại trừ, không làm qua công cụ"
+# Changing these on a field of policy.ticket_link_columns takes it out of the exclusion (R10c): refused in every
+# mode. Moving a Custom Field to another DocType or fieldname takes its Link away too.
+TICKET_LINK_PROPERTIES = ("fieldtype", "options")
+CUSTOM_FIELD_TARGET_KEYS = ("dt", "fieldname")
 # Roles that would let an account command the bot or administer the site; never assignable here.
 FORBIDDEN_ROLES = frozenset({"System Manager", "Administrator", ROLE_INSTRUCTOR, ROLE_AGENT, "Guest", "All"})
 PROTECTED_USERS = frozenset({"Administrator", "Guest", AGENT_USER})
@@ -111,9 +133,9 @@ def always_denied_doctypes() -> frozenset:
 
 def _denied_doctypes(ctx: ToolContext) -> frozenset:
 	if ctx.unrestricted:
-		return always_denied_doctypes()
+		return always_denied_doctypes() | RECORD_DENIED_DOCTYPES
 	# The read tool hides User from the model; these tools manage users, so only User is taken off that list.
-	return frozenset(read.denied_doctypes() - {USER_DOCTYPE}) | PERMISSION_DOCTYPES
+	return frozenset(read.denied_doctypes() - {USER_DOCTYPE}) | PERMISSION_DOCTYPES | RECORD_DENIED_DOCTYPES
 
 
 def _stored_name(doctype: str, name):
@@ -194,35 +216,87 @@ def _values_refusal(doctype: str, values: dict, ctx: ToolContext) -> dict | None
 	return None
 
 
+def _key(text) -> str:
+	"""A field or property name as the schema checks compare it: stripped and casefolded."""
+	return str(text).strip().casefold()
+
+
 def _is_permlevel(text) -> bool:
-	return str(text).strip().casefold() == PERMLEVEL_PROPERTY
+	return _key(text) == PERMLEVEL_PROPERTY
+
+
+def _schema_write(doctype: str, values: dict, name) -> tuple[str | None, dict, dict]:
+	"""`(kind, stored, written)` of a Property Setter or Custom Field write (`kind` says which): the stored record
+	`name` (`{}` for a new one) and the record as `values` would leave it, keys taken by _key; `(None, {}, {})` for
+	any other DocType."""
+	kind = next((item for item in SCHEMA_FIELDS if _named_in(doctype, (item,))), None)
+	if kind is None:
+		return None, {}, {}
+	stored = frappe.db.get_value(kind, name, SCHEMA_FIELDS[kind], as_dict=True) if name is not None else None
+	stored = dict(stored or {})
+	return kind, stored, {**stored, **{_key(key): value for key, value in values.items()}}
 
 
 def permlevel_refusal(doctype: str, values: dict, *, name: str | None = None) -> str | None:
 	"""PERMLEVEL_REASON when `values` would set a field's permlevel (C-6), else None. A Property Setter is refused
 	when it sets `permlevel`, or (`name` given) already does; a Custom Field when a permlevel key holds another
 	level than the stored one (0 for a new field)."""
-	if _named_in(doctype, (PROPERTY_SETTER_DOCTYPE,)):
-		stored = frappe.db.get_value(PROPERTY_SETTER_DOCTYPE, name, "property") if name is not None else None
-		if _is_permlevel(values.get("property", "")) or (stored is not None and _is_permlevel(stored)):
+	kind, stored, written = _schema_write(doctype, values, name)
+	if kind == PROPERTY_SETTER_DOCTYPE:
+		if any(_is_permlevel(record.get("property", "")) for record in (stored, written)):
 			return PERMLEVEL_REASON
-		return None
-	if _named_in(doctype, (CUSTOM_FIELD_DOCTYPE,)):
+	elif kind == CUSTOM_FIELD_DOCTYPE:
 		levels = [cint(value) for key, value in values.items() if _is_permlevel(key)]
-		stored = 0
-		if levels and name is not None:
-			stored = cint(frappe.db.get_value(CUSTOM_FIELD_DOCTYPE, name, "permlevel"))
-		if any(level != stored for level in levels):
+		if any(level != cint(stored.get("permlevel")) for level in levels):
 			return PERMLEVEL_REASON
 	return None
 
 
-def _permlevel_refusal(doctype: str, name, values: dict, ctx: ToolContext) -> dict | None:
-	if ctx.unrestricted:
-		return None
-	if reason := permlevel_refusal(doctype, values, name=name):
-		return _fail(reason, doctype)
-	return None
+def _points_at_ticket(doctype, fieldname) -> bool:
+	"""`fieldname` is a column of policy.ticket_link_columns(doctype), compared by _key."""
+	if not isinstance(doctype, str) or not doctype or fieldname in EMPTY_VALUES:
+		return False
+	columns = policy.ticket_link_columns(doctype)
+	return _key(fieldname) in {_key(column) for pair in columns for column in pair if column}
+
+
+def ticket_link_schema_refusal(
+	doctype: str, values: dict, *, name: str | None = None, delete: bool = False
+) -> str | None:
+	"""TICKET_LINK_SCHEMA_REASON when the write would change the fieldtype or options of a field that points at a
+	ticket (policy.ticket_link_columns), or move, rename or delete its Custom Field (R10c), else None. Same
+	mechanism as permlevel_refusal: a Property Setter is refused when it sets, or (`name` given) already sets, a
+	property of TICKET_LINK_PROPERTIES on such a field; a Custom Field of such a field, before or after the write,
+	on `delete` or when a key of TICKET_LINK_PROPERTIES or CUSTOM_FIELD_TARGET_KEYS holds another value than the
+	stored one."""
+	kind, stored, written = _schema_write(doctype, values, name)
+	if kind == PROPERTY_SETTER_DOCTYPE:
+		refused = any(
+			_key(record.get("property", "")) in TICKET_LINK_PROPERTIES
+			and _points_at_ticket(record.get("doc_type"), record.get("field_name"))
+			for record in (stored, written)
+		)
+	elif kind == CUSTOM_FIELD_DOCTYPE:
+		keys = (*TICKET_LINK_PROPERTIES, *CUSTOM_FIELD_TARGET_KEYS)
+		changed = delete or any(
+			_key(key) in keys and value != stored.get(_key(key)) for key, value in values.items()
+		)
+		refused = changed and any(
+			_points_at_ticket(record.get("dt"), record.get("fieldname")) for record in (stored, written)
+		)
+	else:
+		refused = False
+	return TICKET_LINK_SCHEMA_REASON if refused else None
+
+
+def _schema_refusal(
+	doctype: str, name, values: dict, ctx: ToolContext, *, delete: bool = False
+) -> dict | None:
+	"""R10c in every mode, then C-6 unless the unrestricted switch is on."""
+	reason = ticket_link_schema_refusal(doctype, values, name=name, delete=delete)
+	if reason is None and not ctx.unrestricted:
+		reason = permlevel_refusal(doctype, values, name=name)
+	return _fail(reason, doctype) if reason else None
 
 
 def _shown_value(value):
@@ -388,7 +462,7 @@ def create_record(args: dict, ctx: ToolContext) -> dict:
 	if refusal := (
 		_doctype_refusal(doctype, ctx)
 		or _values_refusal(doctype, values, ctx)
-		or _permlevel_refusal(doctype, None, values, ctx)
+		or _schema_refusal(doctype, None, values, ctx)
 		or _link_refusal(doctype, values)
 	):
 		return refusal
@@ -407,7 +481,7 @@ def update_record(args: dict, ctx: ToolContext) -> dict:
 	if refusal := (
 		_doctype_refusal(doctype, ctx)
 		or _values_refusal(doctype, values, ctx)
-		or _permlevel_refusal(doctype, name, values, ctx)
+		or _schema_refusal(doctype, name, values, ctx)
 	):
 		return refusal
 	if "name" in values:
@@ -445,7 +519,9 @@ def _existing_refusal(doctype: str, name: str, ctx: ToolContext) -> dict | None:
 
 def delete_record(args: dict, ctx: ToolContext) -> dict:
 	doctype, name = _stored_name(DOCTYPE_DOCTYPE, args["doctype"]), args["name"]
-	if refusal := _existing_refusal(doctype, name, ctx):
+	if refusal := _existing_refusal(doctype, name, ctx) or _schema_refusal(
+		doctype, name, {}, ctx, delete=True
+	):
 		return refusal
 
 	def delete():

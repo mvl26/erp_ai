@@ -428,7 +428,17 @@ TICKET_LINK_FIELDS = {
 	"Comment": ("reference_doctype", "reference_name"),
 	"Communication": ("reference_doctype", "reference_name"),
 	"File": ("attached_to_doctype", "attached_to_name"),
+	# R10b: column names of the installed DocType JSON (the Version pair waits on ADR-024, which bars reading it).
+	"ToDo": ("reference_type", "reference_name"),
+	"Notification Log": ("document_type", "document_name"),
+	"Activity Log": ("reference_doctype", "reference_name"),
+	"Email Queue": ("reference_doctype", "reference_name"),
 }
+# Records of a ticket that hold records of their own (R10a): Helpdesk keeps comment attachments on the Comment and
+# email attachments on the Communication, and Frappe points an "Attachment" Comment at its Comment. A record whose
+# dynamic pair names one of them belongs to that record's tickets (one hop, no deeper). Helpdesk's legacy note
+# DocType waits on D8, which bars naming it.
+TICKET_PARENT_DOCTYPES = ("Comment", "Communication")
 
 
 def ticket_link_columns(doctype: str) -> tuple[tuple[str | None, str], ...]:
@@ -442,45 +452,86 @@ def ticket_link_columns(doctype: str) -> tuple[tuple[str | None, str], ...]:
 	return (*((pair,) if pair else ()), *((None, field) for field in ticket_link_fieldnames(name)))
 
 
+def _excluded_parent_names(names: list) -> list:
+	"""Names of the records of TICKET_PARENT_DOCTYPES that point at one of the tickets `names` (one hop)."""
+	found = []
+	for parent in TICKET_PARENT_DOCTYPES:
+		for type_column, name_column in ticket_link_columns(parent):
+			filters = {name_column: ["in", names]}
+			if type_column:
+				filters[type_column] = TICKET_DOCTYPE
+			found.extend(frappe.get_all(parent, filters=filters, pluck="name"))
+	return list(dict.fromkeys(found))
+
+
 def ticket_content_filters(doctype: str) -> tuple[list, list]:
-	"""`(filters, or_filters)` for frappe.get_list that hide the records of excluded tickets; ([], []) when the
-	DocType carries no ticket content or no ticket is excluded. The OR group keeps a row that does not point
-	at a ticket (type != HD Ticket) or points at a ticket that is not excluded."""
-	if not is_ticket_content_doctype(doctype) or not (names := excluded_ticket_names()):
-		return [], []
+	"""`(filters, or_filters)` for frappe.get_list that hide the records of excluded tickets; ([], []) when no
+	column of the DocType points at a ticket (ticket_link_columns) or no ticket is excluded. The OR group keeps a
+	row whose dynamic pair names neither a ticket nor a record of TICKET_PARENT_DOCTYPES, or names one that is
+	neither an excluded ticket nor a record of one (R10a)."""
 	name = _stored_doctype_name(doctype)
+	columns = ticket_link_columns(name) if name else ()
+	if not (name == TICKET_DOCTYPE or columns) or not (names := excluded_ticket_names()):
+		return [], []
 	if name == TICKET_DOCTYPE:
 		return [["name", "not in", names]], []
 	filters, or_filters = [], []
-	for type_column, name_column in ticket_link_columns(name):
+	for type_column, name_column in columns:
 		if type_column:
-			or_filters = [[type_column, "!=", TICKET_DOCTYPE], [name_column, "not in", names]]
+			owners = [*names, *_excluded_parent_names(names)]
+			or_filters = [
+				[type_column, "not in", [TICKET_DOCTYPE, *TICKET_PARENT_DOCTYPES]],
+				[name_column, "not in", owners],
+			]
 		else:
 			filters.append([name_column, "not in", names])
 	return filters, or_filters
 
 
+def _doctype_of(value) -> str | None:
+	"""The stored name of the DocType a type column holds (the collation matches "comment" to Comment), or None."""
+	if value == TICKET_DOCTYPE or value in TICKET_PARENT_DOCTYPES:
+		return value
+	return _stored_doctype_name(value) if isinstance(value, str) and value else None
+
+
+def _linked_records(doctype: str, name) -> list[tuple[str, str]]:
+	"""`(DocType, name)` of each record the stored record names over the columns of ticket_link_columns: HD Ticket
+	for a static Link, the type column's DocType for a dynamic pair."""
+	columns = ticket_link_columns(doctype)
+	if not columns:
+		return []
+	fields = list(dict.fromkeys(column for pair in columns for column in pair if column))
+	values = frappe.db.get_value(doctype, name, fields, as_dict=True)
+	if not values:
+		return []
+	records = []
+	for type_column, name_column in columns:
+		kind = _doctype_of(values.get(type_column)) if type_column else TICKET_DOCTYPE
+		if kind and (linked := values.get(name_column)):
+			records.append((kind, linked))
+	return records
+
+
+def _tickets_of(kind: str, linked) -> list:
+	"""The tickets a linked record stands for: the ticket itself, or the tickets a record of TICKET_PARENT_DOCTYPES
+	points at (R10a: one hop, no deeper); [] for a record of any other DocType."""
+	if kind == TICKET_DOCTYPE:
+		return [linked]
+	if kind in TICKET_PARENT_DOCTYPES:
+		return [ticket for owner, ticket in _linked_records(kind, linked) if owner == TICKET_DOCTYPE]
+	return []
+
+
 def _owning_tickets(doctype: str, name: str) -> list[str]:
-	"""Names of the tickets this record points at, over every column of ticket_link_columns."""
+	"""Names of the tickets this record points at, over every column of ticket_link_columns, first seen first."""
 	stored = _stored_doctype_name(doctype)
 	if not stored or not name:
 		return []
 	if stored == TICKET_DOCTYPE:
 		return [name] if frappe.db.exists(TICKET_DOCTYPE, name) else []
-	columns = ticket_link_columns(stored)
-	if not columns:
-		return []
-	fields = list(dict.fromkeys(column for pair in columns for column in pair if column))
-	values = frappe.db.get_value(stored, name, fields, as_dict=True)
-	if not values:
-		return []
-	tickets = []
-	for type_column, name_column in columns:
-		if type_column and values.get(type_column) != TICKET_DOCTYPE:
-			continue
-		if (ticket := values.get(name_column)) and ticket not in tickets:
-			tickets.append(ticket)
-	return tickets
+	linked = _linked_records(stored, name)
+	return list(dict.fromkeys(ticket for kind, record in linked for ticket in _tickets_of(kind, record)))
 
 
 def owning_ticket(doctype: str, name: str) -> str | None:

@@ -8,7 +8,7 @@ import frappe
 from frappe.model.document import Document
 
 from erp_ai import gateway
-from erp_ai.agent import policy
+from erp_ai.agent import policy, run_log
 from erp_ai.agent.agent_write_guard import refuse_agent_write
 from erp_ai.agent.classification import validate_mapping
 from erp_ai.agent.hard_bans import hard_ban_reason
@@ -82,7 +82,6 @@ PRICE_FIELDS = (
 )
 PROBE_RESULT_FIELDS = ("label", "ok", "error_kind", "status")
 # D-7: the switches are the Check fields of this section, read from the meta; no switch name is written here.
-PERMISSION_SECTION = "section_permissions"
 PERMISSION_NOTICE_TITLE = "Đã bật quyền mở rộng"
 # AC-18 form part (design.md:323, A-8): the warning when the level leaves L0 while the gate is not passed.
 GATE_FROM_LEVEL = "L0"
@@ -151,15 +150,9 @@ PROMPT_REVISION_FIELDS = (
 )
 
 
-def permission_switch_fields(meta) -> list:
-	"""The Check fields between `PERMISSION_SECTION` and the next Section Break, in form order."""
-	switches, inside = [], False
-	for field in meta.fields:
-		if field.fieldtype == "Section Break":
-			inside = field.fieldname == PERMISSION_SECTION
-		elif inside and field.fieldtype == "Check":
-			switches.append(field)
-	return switches
+def _permission_switch_fields() -> tuple:
+	"""The five permission switches in form order; the one list the notice and the log row both read (D-7)."""
+	return policy.PERMISSION_SWITCH_FIELDS
 
 
 EMPTY_DATETIME = datetime(1, 1, 1)  # what frappe.utils.cast returns for an empty Datetime
@@ -204,6 +197,7 @@ class ERPAISetting(Document):
 	def on_update(self):
 		self.notify_permission_switches()
 		self.warn_level_raise_without_gate()
+		self.record_permission_switch_changes()
 
 	def warn_level_raise_without_gate(self):
 		"""AC-18, A-8: the level goes from L0 to L1 or higher and the L0 → L1 gate is not "Đạt": warn, the save
@@ -230,13 +224,42 @@ class ERPAISetting(Document):
 		escape = frappe.utils.escape_html
 		lines = [
 			f"<b>{escape(field.label)}</b>: {escape(field.description or '')}"
-			for field in permission_switch_fields(self.meta)
+			for field in map(self.meta.get_field, _permission_switch_fields())
 			if self.get(field.fieldname) and not (before and before.get(field.fieldname))
 		]
 		if not lines:
 			return
 		lines.append(f"Môi trường site: {escape(self.site_environment or '')}")
 		frappe.msgprint("<br>".join(lines), title=PERMISSION_NOTICE_TITLE, indicator="orange")
+
+	def record_permission_switch_changes(self) -> str | None:
+		"""One `bot_action` log row listing every permission switch this save turned on or off, else None.
+
+		A failure to write the row fails the save (the audit trail is not optional). The agent account never
+		gets here: `validate` refuses its writes, so the instructor is always a person.
+		"""
+		before = self.get_doc_before_save()
+		entries = [
+			run_log.action_entry(
+				run_log.TOOL_PERMISSION_SWITCH,
+				SETTING_DOCTYPE,
+				SETTING_DOCTYPE,
+				True,
+				value_before={fieldname: int(bool(before and before.get(fieldname)))},
+				value_after={fieldname: int(bool(self.get(fieldname)))},
+				instructor=frappe.session.user,
+			)
+			for fieldname in _permission_switch_fields()
+			if bool(self.get(fieldname)) != bool(before and before.get(fieldname))
+		]
+		if not entries:
+			return None
+		return run_log.write_bot_action(
+			trigger=run_log.TRIGGER_SETTING_SAVE,
+			actions=entries,
+			instructor=frappe.session.user,
+			site_environment=self.site_environment,
+		)
 
 	def on_trash(self):
 		refuse_agent_write(self)

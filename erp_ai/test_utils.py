@@ -572,38 +572,62 @@ class GitSandbox:
 
 
 ERP_AI_REPO = "erp_ai"
+ERP_AI_SESSION_PATHS = ("docs", ".team", ".claude")
+
+
+def _read_git(repo: str, *args: str) -> str:
+	"""Stdout of read-only `git -C <repo> --no-optional-locks <args>`; inherited `GIT_*` dropped, no stdin."""
+	env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
+	env["LC_ALL"] = "C"
+	command = ["git", "-C", repo, "--no-optional-locks", *args]
+	completed = subprocess.run(
+		command,
+		env=env,
+		stdin=subprocess.DEVNULL,
+		capture_output=True,
+		text=True,
+		timeout=GIT_SANDBOX_TIMEOUT_S,
+	)
+	if completed.returncode != 0:
+		raise AssertionError(f"{' '.join(command)} failed: {completed.stderr}")
+	return completed.stdout
+
+
+def erp_ai_code_state(repo: str) -> tuple[str, str]:
+	"""`(top-level tree of HEAD, status --porcelain)` of `repo`, both without `ERP_AI_SESSION_PATHS` (NFR-14).
+
+	Other sessions write and commit docs and team state under those names in the main checkout, so only the
+	code part of the real `erp_ai` repo is compared (CHG-002 design R-11, addendum-4 P-2).
+	"""
+	tree = "".join(
+		line
+		for line in _read_git(repo, "ls-tree", "HEAD").splitlines(keepends=True)
+		if line.rstrip("\n").split("\t", 1)[-1] not in ERP_AI_SESSION_PATHS
+	)
+	excludes = [f":(exclude){name}" for name in ERP_AI_SESSION_PATHS]
+	return tree, _read_git(repo, "status", "--porcelain", "--", ".", *excludes)
 
 
 def real_core_repos_snapshot() -> dict:
-	"""`{app: (HEAD sha, status --porcelain)}` of the real core repos and the real `erp_ai` repo (NFR-14).
+	"""`{app: (HEAD sha, status --porcelain)}` of the real core repos, plus `erp_ai: erp_ai_code_state(...)` (NFR-14).
 
 	Read-only git, no optional locks.
 	"""
 	apps_dir = os.path.join(get_bench_path(), "apps")
-	env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
-	env["LC_ALL"] = "C"
 	snapshot = {}
-	for app in (*CORE_APPS, ERP_AI_REPO):
-		outputs = []
-		for args in (("rev-parse", "HEAD"), ("status", "--porcelain")):
-			command = ["git", "-C", os.path.join(apps_dir, app), "--no-optional-locks", *args]
-			completed = subprocess.run(
-				command,
-				env=env,
-				stdin=subprocess.DEVNULL,
-				capture_output=True,
-				text=True,
-				timeout=GIT_SANDBOX_TIMEOUT_S,
-			)
-			if completed.returncode != 0:
-				raise AssertionError(f"{' '.join(command)} failed: {completed.stderr}")
-			outputs.append(completed.stdout)
-		snapshot[app] = (outputs[0].strip(), outputs[1])
+	for app in CORE_APPS:
+		repo = os.path.join(apps_dir, app)
+		head = _read_git(repo, "rev-parse", "HEAD")
+		snapshot[app] = (head.strip(), _read_git(repo, "status", "--porcelain"))
+	snapshot[ERP_AI_REPO] = erp_ai_code_state(os.path.join(apps_dir, ERP_AI_REPO))
 	return snapshot
 
 
 class RealCoreReposUntouchedMixin:
-	"""Fail the test class when HEAD or `status --porcelain` of a real core repo changed while it ran (NFR-9)."""
+	"""Fail the test class when HEAD or `status --porcelain` of a real core repo changed while it ran (NFR-9, NFR-14).
+
+	erp_ai: the code part only, without `ERP_AI_SESSION_PATHS` (`erp_ai_code_state`).
+	"""
 
 	@classmethod
 	def setUpClass(cls):

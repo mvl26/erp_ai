@@ -1,7 +1,6 @@
 import hashlib
 import json
 import os
-import subprocess
 import unittest
 from unittest.mock import patch
 
@@ -9,6 +8,7 @@ import frappe
 from frappe.tests.utils import FrappeTestCase
 from frappe.utils import get_bench_path
 
+from erp_ai import test_utils
 from erp_ai.agent.changes import block
 from erp_ai.agent.tools.change_guard import FileOp
 from erp_ai.constants import (
@@ -27,6 +27,7 @@ from erp_ai.constants import (
 )
 from erp_ai.test_utils import (
 	PREFIX,
+	GitSandbox,
 	make_active_agent,
 	make_block_proposal,
 	make_routing_rules,
@@ -330,22 +331,42 @@ class TestMakeBlockProposal(FrappeTestCase):
 		self.assertTrue(block.is_block(commands_only))
 
 
-def _git_output(repo: str, *args: str) -> str:
-	return subprocess.run(
-		["git", "-C", repo, "--no-optional-locks", *args],
-		capture_output=True,
-		text=True,
-		check=True,
-		timeout=30,
-	).stdout
-
-
 class TestRealCoreRepos(FrappeTestCase):
 	def test_snapshot_includes_erp_ai(self):
 		snapshot = real_core_repos_snapshot()
 
 		self.assertEqual(set(snapshot), {*CORE_APPS, "erp_ai"})
 		repo = os.path.join(get_bench_path(), "apps", "erp_ai")
-		head, status = snapshot["erp_ai"]
-		self.assertEqual(head, _git_output(repo, "rev-parse", "HEAD").strip())
-		self.assertIsInstance(status, str)
+		self.assertEqual(snapshot["erp_ai"], test_utils.erp_ai_code_state(repo))
+
+	def test_erp_ai_code_state_ignores_session_paths_only(self):
+		sandbox = GitSandbox(self, apps=("custom_app",), erp_ai_worktree=None)
+		repo = sandbox.repo("custom_app")
+		start = test_utils.erp_ai_code_state(repo)
+		self.assertIn("\tREADME.md\n", start[0])
+		self.assertEqual(start[1], "")
+
+		sandbox.commit_file("custom_app", "docs/team/x.md", "a\n")
+		sandbox.commit_file("custom_app", ".team/current.json", "{}\n")
+		sandbox.commit_file("custom_app", ".claude/agent-memory/a.md", "a\n")
+		sandbox.write_unstaged("custom_app", ".team/miyano-site.lock", "")
+		sandbox.write_unstaged("custom_app", ".claude/m.md", "m\n")
+		sandbox.write_unstaged("custom_app", "docs/team/x.md", "b\n")
+		self.assertNotEqual(sandbox.git("custom_app", "status", "--porcelain"), "")
+		self.assertEqual(test_utils.erp_ai_code_state(repo), start)
+
+		sandbox.write_unstaged("custom_app", "README2.md", "x\n")
+		untracked = test_utils.erp_ai_code_state(repo)
+		self.assertEqual(untracked[0], start[0])
+		self.assertEqual(untracked[1], "?? README2.md\n")
+
+		sandbox.commit_file("custom_app", "pkg/x.py", "x = 1\n")
+		committed = test_utils.erp_ai_code_state(repo)
+		self.assertNotEqual(committed[0], start[0])
+		self.assertIn("\tpkg\n", committed[0])
+		self.assertEqual(test_utils.ERP_AI_SESSION_PATHS, ("docs", ".team", ".claude"))
+
+	def test_erp_ai_code_state_fails_on_git_error(self):
+		sandbox = GitSandbox(self, apps=(), erp_ai_worktree=None)
+		with self.assertRaisesRegex(AssertionError, "ls-tree HEAD failed"):
+			test_utils.erp_ai_code_state(sandbox.root)

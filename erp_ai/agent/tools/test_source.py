@@ -935,8 +935,9 @@ class TestRealCoreReposUntouchedMixin(unittest.TestCase):
 
 	def test_real_core_repos_snapshot_reads_the_four_core_repos(self):
 		snapshot = test_utils.real_core_repos_snapshot()
-		self.assertEqual(sorted(snapshot), ["erpnext", "frappe", "helpdesk", "hrms"])
-		for app, (head, _status) in snapshot.items():
+		self.assertEqual(sorted(snapshot), ["erp_ai", "erpnext", "frappe", "helpdesk", "hrms"])
+		for app in ("frappe", "erpnext", "helpdesk", "hrms"):
+			head, _status = snapshot[app]
 			with self.subTest(app=app):
 				self.assertRegex(head, r"^[0-9a-f]{40}$")
 		self.assertEqual(test_utils.real_core_repos_snapshot(), snapshot)
@@ -956,6 +957,23 @@ class TestRealCoreReposUntouchedMixin(unittest.TestCase):
 			repo = os.path.join(apps_dir, app)
 			expected.append(["git", "-C", repo, "--no-optional-locks", "rev-parse", "HEAD"])
 			expected.append(["git", "-C", repo, "--no-optional-locks", "status", "--porcelain"])
+		erp_ai = os.path.join(apps_dir, "erp_ai")
+		expected.append(["git", "-C", erp_ai, "--no-optional-locks", "ls-tree", "HEAD"])
+		expected.append(
+			[
+				"git",
+				"-C",
+				erp_ai,
+				"--no-optional-locks",
+				"status",
+				"--porcelain",
+				"--",
+				".",
+				":(exclude)docs",
+				":(exclude).team",
+				":(exclude).claude",
+			]
+		)
 		self.assertEqual([args for args, _ in calls], expected)
 		for _, kwargs in calls:
 			self.assertEqual(kwargs["stdin"], subprocess.DEVNULL)
@@ -989,7 +1007,9 @@ class TestRealCoreReposUntouchedMixin(unittest.TestCase):
 	def test_real_core_repos_mixin_on_real_repos_passes_when_untouched(self):
 		probe = self.make_probe()
 		probe.setUpClass()
-		self.assertEqual(sorted(probe._real_core_repos_before), ["erpnext", "frappe", "helpdesk", "hrms"])
+		self.assertEqual(
+			sorted(probe._real_core_repos_before), ["erp_ai", "erpnext", "frappe", "helpdesk", "hrms"]
+		)
 		probe.tearDownClass()
 
 

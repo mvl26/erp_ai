@@ -1435,7 +1435,8 @@ class TestRunChangeSkeleton(ApplyJobTestCase):
 		# CHG-001 design 4 step 4: the line gains `comment=`.
 		self.assertEqual(
 			template,
-			"erp_ai change proposal=%s action=%s outcome=%s duration_ms=%d commit=%s comment=%s",
+			"erp_ai change proposal=%s action=%s outcome=%s duration_ms=%d commit=%s comment=%s"
+			" ops=%s commands=%s restart=%s",
 		)
 		self.assertEqual(values[:3], [name, "apply", CHANGE_STATUS_APPLIED])
 		self.assertIsInstance(values[3], int)
@@ -3235,9 +3236,9 @@ class TestResultComment(ApplyJobTestCase):
 			if call.args and call.args[0].startswith("erp_ai change ")
 		]
 		self.assertEqual(len(lines), 1, lines)
-		self.assertTrue(lines[0][0].endswith(" comment=%s"), lines[0][0])
+		self.assertTrue(lines[0][0].endswith(" comment=%s ops=%s commands=%s restart=%s"), lines[0][0])
 		return {
-			"comment": lines[0][-1],
+			"comment": lines[0][-4],
 			"posted": posted,
 			"rollback": rollback,
 			"commits_at_post": seen["commits_at_post"],

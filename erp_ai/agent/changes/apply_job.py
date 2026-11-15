@@ -70,12 +70,28 @@ GIT_NOT_ANCESTOR = "commit áp dụng không còn nằm trong lịch sử nhánh
 COMMAND_FAILED = "lệnh trả mã {0}"
 COMMAND_OUT_OF_TIME = "quá thời gian"
 COMMAND_NOT_FOUND = "không tìm thấy bench trên máy chủ"
+# Design 4.2 step 9: the reason of a block's command names it by its number and argv.
+COMMAND_PREFIX = "lệnh {number} (bench {command}): "
+# Design addendum 2 QĐ-A3: no process when under 1 s is left; no exit code (addendum 3 QĐ-B4).
+_NOT_RUN = process_runner.CommandResult(
+	exit_code=None, output="", duration_ms=0, timed_out=True, not_found=False
+)
 
 
 class _Stop(Exception):
 	"""Ends a job with a final status and reason, and the git `fields` and log `before`/`after` to record."""
 
-	def __init__(self, status: str, reason: str, result=None, *, fields=None, before=None, after=None):
+	def __init__(
+		self,
+		status: str,
+		reason: str,
+		result=None,
+		*,
+		fields=None,
+		before=None,
+		after=None,
+		command_results=None,
+	):
 		super().__init__(reason)
 		self.status = status
 		self.reason = reason
@@ -83,6 +99,7 @@ class _Stop(Exception):
 		self.fields = fields
 		self.before = before
 		self.after = after
+		self.command_results = command_results
 
 
 def run_change(proposal_name: str, action: str) -> None:
@@ -97,19 +114,31 @@ def run_change(proposal_name: str, action: str) -> None:
 	outcome = _locked_run(proposal_name, action, deadline)
 	commit = "-"
 	comment = "-"
+	ops = commands = restart = "-"
 	if outcome != OUTCOME_SKIPPED:
 		commit_field = "apply_commit_sha" if action == ACTION_APPLY else "undo_commit_sha"
 		commit = frappe.db.get_value(PROPOSAL_DOCTYPE, proposal_name, commit_field) or "-"
 		comment = _post_result(proposal_name, action)
+		ops, commands, restart = _log_counts(proposal_name)
 	frappe.logger(LOGGER_NAME).info(
-		"erp_ai change proposal=%s action=%s outcome=%s duration_ms=%d commit=%s comment=%s",
+		"erp_ai change proposal=%s action=%s outcome=%s duration_ms=%d commit=%s comment=%s"
+		" ops=%s commands=%s restart=%s",
 		proposal_name,
 		action,
 		outcome,
 		int((time.monotonic() - started) * 1000),
 		commit,
 		comment,
+		ops,
+		commands,
+		restart,
 	)
+
+
+def _log_counts(proposal_name: str) -> tuple[int, int, str]:
+	"""Design 4.2 step 12 (STD-OPS-5): the stored item and command counts and the `restart_status` (`-`)."""
+	doc = frappe.get_doc(PROPOSAL_DOCTYPE, proposal_name)
+	return len(block.operations_of(doc)), len(block.commands_of(doc)), doc.get("restart_status") or "-"
 
 
 def _post_result(proposal_name: str, action: str) -> str:
@@ -181,6 +210,7 @@ def _run_in_lock(proposal_name: str, action: str, actor: str, deadline: float) -
 			fields=stop.fields,
 			before=stop.before,
 			after=stop.after,
+			command_results=stop.command_results,
 		)
 		outcome = stop.status
 	except Exception as exc:
@@ -217,12 +247,8 @@ def _run(proposal, action: str, actor: str, deadline: float) -> str:
 		and not block.commands_of(proposal)
 	):
 		_apply_code(proposal, check.targets[0], actor, deadline)
-	elif block.commands_of(proposal) or not check.targets:
-		# The commands of a block (design 4.2 step 9) come in a later task: until then every item written goes
-		# back again and a block with commands ends as one not yet runnable.
-		if check.targets and not _write_block(proposal, check, old_head)[0]():
-			raise _Stop(CHANGE_STATUS_FAILED, GIT_RESTORE_FAILED)
-		raise _Stop(CHANGE_STATUS_FAILED, change_guard.OP_UNKNOWN)
+	elif not check.targets:
+		_run_block_commands(proposal, actor, deadline)
 	else:
 		_commit_block(proposal, check, old_head, actor, deadline)
 	return CHANGE_STATUS_APPLIED
@@ -411,8 +437,8 @@ def _commit_ends(target) -> tuple[tuple[str, bytes | None], ...]:
 def _commit_block(
 	proposal, check: change_guard.BlockCheck, old_head: str, actor: str, deadline: float
 ) -> None:
-	"""Design 4.2 steps 6 to 8 then 10 for a block without commands: write every item, one `commit --only`
-	of every path (both ends of a rename), the post-check, the git fields recorded and committed, done.
+	"""Design 4.2 steps 6 to 10 for a block with items: write every item, one `commit --only` of every path
+	(both ends of a rename), the post-check, the git fields recorded and committed, then the commands.
 
 	A commit that fails with HEAD unchanged gives every item back as step 6; once the bot commit exists
 	nothing is given back (design-addendum-3 QĐ-B2). Log rows carry `{"head", "files"}` before and
@@ -471,15 +497,7 @@ def _commit_block(
 			},
 		)
 		frappe.db.commit()
-		transitions.finish(
-			proposal.name,
-			CHANGE_STATUS_APPLYING,
-			CHANGE_STATUS_APPLIED,
-			step="apply",
-			actor=actor,
-			before=values["before"],
-			after=values["after"],
-		)
+		_run_block_commands(proposal, actor, deadline, before=values["before"], after=values["after"])
 	except _Stop:
 		raise
 	except Exception as exc:
@@ -953,19 +971,11 @@ def _apply_command(proposal, actor: str, deadline: float) -> None:
 	args = json.loads(proposal.command_args)
 	limit = int(deadline - time.monotonic())
 	if limit < 1:
-		# Design addendum 2 QĐ-A3: no process when under 1 s is left; no exit code (addendum 3 QĐ-B4).
-		no_run = process_runner.CommandResult(
-			exit_code=None, output="", duration_ms=0, timed_out=True, not_found=False
-		)
-		raise _Stop(CHANGE_STATUS_FAILED, COMMAND_OUT_OF_TIME, no_run)
+		raise _Stop(CHANGE_STATUS_FAILED, COMMAND_OUT_OF_TIME, _NOT_RUN)
 	result = process_runner.run_bench(args, limit)
-	# Design 4.3 step 4, in its order: timed out, bench not found, non-zero exit, done.
-	if result.timed_out:
-		raise _Stop(CHANGE_STATUS_FAILED, COMMAND_OUT_OF_TIME, result)
-	if result.not_found:
-		raise _Stop(CHANGE_STATUS_FAILED, COMMAND_NOT_FOUND, result)
-	if result.exit_code != 0:
-		raise _Stop(CHANGE_STATUS_FAILED, COMMAND_FAILED.format(result.exit_code), result)
+	failure = _command_failure(result)
+	if failure is not None:
+		raise _Stop(CHANGE_STATUS_FAILED, failure, result)
 	transitions.finish(
 		proposal.name,
 		CHANGE_STATUS_APPLYING,
@@ -973,4 +983,86 @@ def _apply_command(proposal, actor: str, deadline: float) -> None:
 		step="apply",
 		actor=actor,
 		result=result,
+	)
+
+
+def _command_failure(result) -> str | None:
+	"""Design 4.3 step 4, in its order: timed out, bench not found, non-zero exit; `None` when it passed."""
+	if result.timed_out:
+		return COMMAND_OUT_OF_TIME
+	if result.not_found:
+		return COMMAND_NOT_FOUND
+	if result.exit_code != 0:
+		return COMMAND_FAILED.format(result.exit_code)
+	return None
+
+
+def _commands_to_run(proposal) -> list[list[str]]:
+	"""The stored commands in order, without the `restart` that ends the list (design 4.2 steps 9, 11)."""
+	commands = block.commands_of(proposal)
+	if commands and commands[-1] == [change_guard.RESTART_COMMAND]:
+		return commands[:-1]
+	return commands
+
+
+def _command_entry(args: list[str], result) -> dict:
+	"""One element of `command_results` (plan "Shared constraints")."""
+	return {
+		"args": args,
+		"exit_code": result.exit_code,
+		"duration_ms": result.duration_ms,
+		"timed_out": result.timed_out,
+		"output": result.output,
+	}
+
+
+def _run_block_commands(proposal, actor: str, deadline: float, *, before=None, after=None) -> None:
+	"""Design 4.2 steps 9 and 10: the block's commands in stored order, each with what is left of the job's
+	budget (NFR-3), then `Đã áp dụng` with `command_results`.
+
+	Under 1 s left, command j is not run (recorded as timed out, no exit code); command j failing or
+	timing out stops the rest: `Lỗi` with `lệnh j (bench …): <reason>`, nothing given back (A-33). The
+	scalar result fields are those of the last command run. No command → `Đã áp dụng` with the commit's
+	`before`/`after` only. `restart` is not run here.
+	"""
+	commands = _commands_to_run(proposal)
+	if not commands:
+		transitions.finish(
+			proposal.name,
+			CHANGE_STATUS_APPLYING,
+			CHANGE_STATUS_APPLIED,
+			step="apply",
+			actor=actor,
+			before=before,
+			after=after,
+		)
+		return
+	results = []
+	last = None
+	for number, args in enumerate(commands, start=1):
+		prefix = COMMAND_PREFIX.format(number=number, command=" ".join(args))
+		limit = int(deadline - time.monotonic())
+		if limit < 1:
+			results.append(_command_entry(args, _NOT_RUN))
+			raise _Stop(
+				CHANGE_STATUS_FAILED,
+				prefix + COMMAND_OUT_OF_TIME,
+				last,
+				before=before,
+				command_results=results,
+			)
+		last = process_runner.run_bench(args, limit)
+		results.append(_command_entry(args, last))
+		failure = _command_failure(last)
+		if failure is not None:
+			raise _Stop(CHANGE_STATUS_FAILED, prefix + failure, last, before=before, command_results=results)
+	transitions.finish(
+		proposal.name,
+		CHANGE_STATUS_APPLYING,
+		CHANGE_STATUS_APPLIED,
+		step="apply",
+		actor=actor,
+		result=last,
+		before=before,
+		command_results=results,
 	)

@@ -31,7 +31,8 @@ from erp_ai.test_utils import FakeGateway, make_model_result, set_agent_settings
 
 THINKING_TEXT = "Đang suy nghĩ…"
 # AC-22 (T100): the answer is a kind=de_xuat comment, so it carries a confidence line and non-empty grounds.
-ANSWER_GROUNDS = "\nĐộ tin cậy: 90%\n**Căn cứ:** đã đọc phiếu"
+# The grounds share no text with a WORK_LABELS label: test_status_text_never_in_logs forbids those in the logs.
+ANSWER_GROUNDS = "\nĐộ tin cậy: 90%\n**Căn cứ:** mô tả của người tạo"
 ANSWER = f"Đã xử lý{ANSWER_GROUNDS}"
 
 

@@ -1,4 +1,5 @@
 import json
+import uuid
 
 import frappe
 
@@ -162,3 +163,35 @@ def write_entry(**fields) -> str:
 	if not frappe.flags.in_test:
 		frappe.db.commit()
 	return doc.name
+
+
+def write_bot_action(
+	*,
+	trigger: str,
+	actions: list[dict],
+	ticket: str | None = None,
+	instructor: str | None = None,
+	run_id: str | None = None,
+	site_environment: str | None = None,
+) -> str:
+	"""Write one `bot_action` row (cost 0) and return its name (U3 3.1, ADR-033 QĐ 6).
+
+	`run_id` is a new `uuid4().hex` when not given; `site_environment` is passed on only when not None
+	(else `write_entry` fills it). Outside tests `write_entry` commits in this call, so the caller writes its
+	own effect and its cycle lock first and calls this last: one commit covers all three.
+
+	Raises:
+		ValueError: as `write_entry` for a `trigger` outside `BOT_ACTION_TRIGGERS` or `actions` not a non-empty list.
+	"""
+	fields = {
+		"entry_type": ENTRY_TYPE_BOT_ACTION,
+		"trigger": trigger,
+		"ticket": ticket,
+		"instructor": instructor,
+		"run_id": run_id or uuid.uuid4().hex,
+		"actions": actions,
+		"cost_usd": 0,
+	}
+	if site_environment is not None:
+		fields["site_environment"] = site_environment
+	return write_entry(**fields)

@@ -31,7 +31,8 @@ from erp_ai.constants import (
 	ROLE_INSTRUCTOR,
 	SETTING_DOCTYPE,
 )
-from erp_ai.test_utils import GitSandbox, make_change_proposal, set_agent_settings
+from erp_ai.erp_ai_agent.doctype.erp_ai_change_proposal import erp_ai_change_proposal as proposal_form
+from erp_ai.test_utils import GitSandbox, keep_agent_settings, make_change_proposal, set_agent_settings
 
 INSTRUCTOR = "decision.instructor@example.com"
 PLAIN = "decision.plain@example.com"
@@ -76,8 +77,8 @@ def _not_whitelisted_for_guest() -> str:
 	return f"<details><summary>{summary}</summary>{detail}</details>"
 
 
-class TestChangeDecision(FrappeTestCase):
-	"""ADR-023 QĐ 1 / M1: the signed link opens the form, the form POSTs `decide` once (AC-5, AC-25, AC-26)."""
+class _DecisionCase(FrappeTestCase):
+	"""One pending proposal, a stubbed queue and the helpers that run `decide` the way a request does."""
 
 	@classmethod
 	def tearDownClass(cls):
@@ -96,6 +97,8 @@ class TestChangeDecision(FrappeTestCase):
 		self.addCleanup(frappe.db.rollback)
 		self.addCleanup(frappe.set_user, "Administrator")
 		frappe.set_user("Administrator")
+		keep_agent_settings(self)
+		set_agent_settings(one_click_approval_enabled=1)  # NFR-8: the POST tests run with switch (5) on
 		for email in (INSTRUCTOR, PLAIN, ASSIGNEE, TICKET_CREATOR):
 			create_agent(email)
 		if not frappe.db.exists("User", AGENT_USER):
@@ -182,6 +185,10 @@ class TestChangeDecision(FrappeTestCase):
 		self.assertEqual((self.status(), self.log_rows()), before)
 		self.assertEqual(self.status(), CHANGE_STATUS_PENDING)
 		self.assertEqual(self.jobs(), [])
+
+
+class TestChangeDecision(_DecisionCase):
+	"""ADR-023 QĐ 1 / M1: the signed link opens the form, the form POSTs `decide` once (AC-5, AC-25, AC-26)."""
 
 	def test_method_is_post_only_and_never_guest(self):
 		fn = change_decision.decide
@@ -483,3 +490,44 @@ class TestChangeDecision(FrappeTestCase):
 				)
 				self.assertIsNotNone(row.creation)
 				self.assertEqual(frappe.db.get_value(PROPOSAL_DOCTYPE, name, "decided_by"), INSTRUCTOR)
+
+
+ONE_CLICK_OFF_REFUSAL = (
+	"Duyệt một lần bấm đang tắt. Mở đề xuất và dùng nút Duyệt hoặc Từ chối trên form (có bước xác nhận)."
+)
+
+
+class TestOneClickGate(_DecisionCase):
+	"""FEAT-007 U3 3.3, ADR-032 QĐ 4 (AC-11): a click on the link is refused while switch (5) is off."""
+
+	def test_switch_off_old_link_refused_state_unchanged_zero_jobs(self):
+		set_agent_settings(one_click_approval_enabled=0)
+		self.assertEqual(change_decision.ONE_CLICK_OFF, ONE_CLICK_OFF_REFUSAL)
+		for action in change_link.ACTIONS:
+			with self.subTest(action=action):
+				self.assertRefused(INSTRUCTOR, "POST", action, ONE_CLICK_OFF_REFUSAL)
+		self.assertEqual(self.status(), CHANGE_STATUS_PENDING)
+
+	def test_switch_checked_before_signature(self):
+		set_agent_settings(one_click_approval_enabled=0)
+		for signature in ("0" * 128, ""):
+			with self.subTest(signature=signature):
+				self.assertRefused(INSTRUCTOR, "POST", "approve", ONE_CLICK_OFF_REFUSAL, signature=signature)
+		self.assertRefused(INSTRUCTOR, "POST", "undo", ONE_CLICK_OFF_REFUSAL, signature="0" * 128)
+
+	def test_switch_read_at_request_time(self):
+		set_agent_settings(one_click_approval_enabled=0)
+		self.assertRefused(INSTRUCTOR, "POST", "approve", ONE_CLICK_OFF_REFUSAL)
+		set_agent_settings(one_click_approval_enabled=1)
+		self.assertEqual(self.post(INSTRUCTOR, "approve"), {"ok": True, "status": CHANGE_STATUS_APPROVED})
+		self.assertEqual(self.status(), CHANGE_STATUS_APPROVED)
+
+	def test_switch_off_form_method_still_decides(self):
+		# The form buttons (with their confirm step) do not pass through the link gate.
+		set_agent_settings(one_click_approval_enabled=0)
+		frappe.set_user(INSTRUCTOR)
+		try:
+			status = proposal_form.reject(self.proposal.name)["status"]
+		finally:
+			frappe.set_user("Administrator")
+		self.assertEqual(status, CHANGE_STATUS_REJECTED)

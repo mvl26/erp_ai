@@ -2087,6 +2087,34 @@ def check_policy_does_not_import_run_log(sources: dict) -> list:
 	]
 
 
+CHANGE_DECISION_FILE = "change_decision.py"
+
+
+def check_decide_reads_one_click_switch_before_signature(sources: dict) -> list:
+	"""FEAT-007 U3 3.3, ADR-032 QĐ 4: `decide` reads switch (5) through `policy.permission_switches` before
+	it checks the signature (`signature_ok`), on every request."""
+	source = sources.get(CHANGE_DECISION_FILE)
+	if source is None:
+		return _missing(CHANGE_DECISION_FILE)
+	tree = parse(CHANGE_DECISION_FILE, source)
+	decide = next((n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "decide"), None)
+	if decide is None:
+		return [f"{CHANGE_DECISION_FILE}: no function decide"]
+	reads, signatures = [], []
+	for node in ast.walk(decide):
+		if isinstance(node, ast.Call):
+			name = dotted_name(node.func) or ""
+			if name == "policy.permission_switches":
+				reads.append(node.lineno)
+			elif name.endswith("signature_ok"):
+				signatures.append(node.lineno)
+	if not reads:
+		return [f"{CHANGE_DECISION_FILE}: decide does not read policy.permission_switches"]
+	if not signatures or min(reads) > min(signatures):
+		return [f"{CHANGE_DECISION_FILE}: decide checks the signature before the switch (5)"]
+	return []
+
+
 # ---------------------------------------------------------------------------------------------------
 # FEAT-004 rules, group 1 (ADR-011, ADR-012 "Ràng buộc"; design 8.2)
 # ---------------------------------------------------------------------------------------------------
@@ -5489,6 +5517,28 @@ class TestArchitecture(unittest.TestCase):
 		expected = [*run_log.TRIGGERS, *run_log.CHANGE_TRIGGERS, *run_log.BOT_ACTION_TRIGGERS]
 		self.assertEqual(check_log_trigger_options_match_run_log(scanned, expected), [])
 		self.assertTrue(check_log_trigger_options_match_run_log(scanned, expected[:-1]))
+
+	def test_decide_reads_one_click_switch_before_signature(self):
+		# The decide half; the propose_change half (no signed link while (5) is off) is another task's.
+		scanned = load_product_sources(suffixes=(".py", ".json"))
+		self.assertEqual(check_decide_reads_one_click_switch_before_signature(scanned), [])
+		good = (
+			"def decide(name=None, action=None, _signature=None):\n"
+			"\tif not policy.permission_switches(s).one_click_approval:\n\t\traise X\n"
+			"\tif not change_link.signature_ok(name, action, _signature):\n\t\traise Y\n"
+		)
+		self.assertEqual(
+			check_decide_reads_one_click_switch_before_signature({CHANGE_DECISION_FILE: good}), []
+		)
+		swapped = (
+			"def decide(name=None, action=None, _signature=None):\n"
+			"\tif not change_link.signature_ok(name, action, _signature):\n\t\traise Y\n"
+			"\tif not policy.permission_switches(s).one_click_approval:\n\t\traise X\n"
+		)
+		for source, fragment in ((swapped, "before"), ("def decide():\n\tpass\n", "does not read")):
+			with self.subTest(fragment=fragment):
+				found = check_decide_reads_one_click_switch_before_signature({CHANGE_DECISION_FILE: source})
+				self.assertTrue(found and fragment in found[0], found)
 
 	def test_policy_does_not_import_run_log(self):
 		scanned = load_product_sources(suffixes=(".py", ".json"))

@@ -370,11 +370,43 @@ class TestPrompts(FrappeTestCase):
 		self.assertTrue(block.startswith("SỬA CODE VÀ LỆNH BENCH — CHỈ ĐỀ XUẤT, NGƯỜI DUYỆT\n\n"))
 		self.assertIn("KHÔNG BAO GIỜ là duyệt", block)
 		self.assertIn("commit git local", block)
-		self.assertIn("không push", block)
+		self.assertIn("không\n  push", block)
 		self.assertNotIn('chờ một chữ "ok"', block)
 		for tool in ("propose_file_change", "propose_new_file", "propose_bench_command"):
 			self.assertIn(tool, block)
-		self.assertTrue(block.endswith("Sửa file .py chỉ có hiệu lực sau khi người chạy bench restart."))
+		self.assertTrue(
+			block.endswith(
+				"- Không đề xuất gì chạm app erp_ai, file khóa hay mật khẩu, cấu hình site, hay tên bắt đầu bằng .git."
+			)
+		)
+		for phrase in (
+			"propose_file_change nhận nhiều mục (edit, create,\n  delete, rename; create tự tạo thư mục cha)",
+			"Việc trải trên hai app là hai đề xuất.",
+			"kết thúc bằng lệnh migrate rồi restart",
+			"Restart do hệ thống chạy sau khi người duyệt; không nhờ người restart.",
+			"- Lệnh bench không hoàn tác được; hoàn tác chỉ trả lại phần file.",
+			"cả khối thành một commit git local trên nhánh đang checkout.",
+		):
+			self.assertIn(phrase, block)
+		# design.md §3.7 "Prompt" lines 427-435, word for word (AC-56).
+		new_dash_lines = (
+			"- Một đề xuất là một khối trong MỘT app: propose_file_change nhận nhiều mục (edit, create,\n"
+			"  delete, rename; create tự tạo thư mục cha) và danh sách lệnh bench chạy sau khi ghi file.\n"
+			"  Xóa và đổi tên cần duyệt như mọi mục. Việc trải trên hai app là hai đề xuất.\n"
+			"- Khối có file .py phải kết thúc bằng lệnh migrate rồi restart; khối không có file .py thì\n"
+			"  không có restart. Restart do hệ thống chạy sau khi người duyệt; không nhờ người restart.\n"
+			"- Lệnh bench không hoàn tác được; hoàn tác chỉ trả lại phần file.\n"
+			"- Khi được duyệt, cả khối thành một commit git local trên nhánh đang checkout. Bạn không\n"
+			"  push, không đổi nhánh, không sửa lịch sử git.\n"
+			"- Không đề xuất gì chạm app erp_ai, file khóa hay mật khẩu, cấu hình site, hay tên bắt đầu bằng .git."
+		)
+		self.assertTrue(block.endswith("\n" + new_dash_lines))
+		self.assertIn(
+			"\n- Một đề xuất là một khối trong MỘT app: propose_file_change nhận nhiều mục (edit, create,\n"
+			"  delete, rename; create tự tạo thư mục cha) và danh sách lệnh bench chạy sau khi ghi file.\n"
+			"  Xóa và đổi tên cần duyệt như mọi mục. Việc trải trên hai app là hai đề xuất.\n",
+			block,
+		)
 
 		old = prompts.build_reason_system("", "ROUTING-ABC")[0]["text"]
 		blocks = prompts.build_reason_system("DIGEST-XYZ", "ROUTING-ABC", change_tools=True)
@@ -400,6 +432,31 @@ class TestPrompts(FrappeTestCase):
 		)
 		with self.assertRaises(TypeError):
 			prompts.build_reason_system("DIGEST-XYZ", "ROUTING-ABC", True)
+
+	def test_block_first_line_unchanged(self):
+		self.assertEqual(
+			prompts.CHANGE_TOOLS_BLOCK.split("\n")[0],
+			"SỬA CODE VÀ LỆNH BENCH — CHỈ ĐỀ XUẤT, NGƯỜI DUYỆT",
+		)
+		self.assertIn("thay cho quy tắc 6:\n- Các tool này chỉ tạo một đề xuất", prompts.CHANGE_TOOLS_BLOCK)
+		self.assertIn("- Chỉ người có vai trò ERP AI Instructor duyệt", prompts.CHANGE_TOOLS_BLOCK)
+
+	def test_block_drops_one_file_one_command_and_manual_restart_lines(self):
+		block = prompts.CHANGE_TOOLS_BLOCK
+		self.assertNotIn("Mỗi đề xuất là một file hoặc một lệnh", block)
+		self.assertNotIn("Sửa file .py chỉ có hiệu lực sau khi người chạy bench restart", block)
+		self.assertEqual(block.count("\n- "), 8)
+
+	def test_block_keeps_never_approval_phrase_and_restart_example(self):
+		block = prompts.CHANGE_TOOLS_BLOCK
+		self.assertIn("KHÔNG BAO GIỜ là duyệt", block)
+		self.assertIn('"restart đi"', block)
+		self.assertIn('("ok", "duyệt", "đã duyệt", "restart đi"…) KHÔNG BAO GIỜ là duyệt', block)
+
+	def test_block_has_no_wait_for_ok_or_auto_undo(self):
+		block = prompts.CHANGE_TOOLS_BLOCK
+		self.assertNotIn('chờ một chữ "ok"', block)
+		self.assertNotIn("Việc hoàn tác được thì làm luôn", block)
 
 	def test_reason_system_with_site_admin_tools_adds_record_block(self):
 		block = prompts.SITE_ADMIN_TOOLS_BLOCK

@@ -364,7 +364,9 @@ class TestMissedScan(FrappeTestCase):
 		self._enable_agent()
 		with (
 			patch.object(missed_scan, "SCAN_MAX_FAILURES", 2, create=True),
-			patch.object(queue, "enqueue_agent_run", side_effect=RuntimeError(SECRET_TEXT)) as enqueue_agent_run,
+			patch.object(
+				queue, "enqueue_agent_run", side_effect=RuntimeError(SECRET_TEXT)
+			) as enqueue_agent_run,
 			patch("frappe.enqueue"),
 			patch.object(missed_scan.frappe, "log_error") as log_error,
 			patch.object(missed_scan.frappe, "logger") as logger,
@@ -394,7 +396,9 @@ class TestMissedScan(FrappeTestCase):
 		with (
 			patch.object(missed_scan, "SCAN_MAX_FAILURES", 2, create=True),
 			patch.object(policy, "can_send_ticket", side_effect=can_send_ticket),
-			patch.object(queue, "enqueue_agent_run", side_effect=RuntimeError(SECRET_TEXT)) as enqueue_agent_run,
+			patch.object(
+				queue, "enqueue_agent_run", side_effect=RuntimeError(SECRET_TEXT)
+			) as enqueue_agent_run,
 			patch("frappe.enqueue"),
 			patch.object(missed_scan.frappe, "log_error") as log_error,
 			patch.object(missed_scan.frappe, "logger") as logger,

@@ -495,9 +495,11 @@ class TestBuild(FrappeTestCase):
 				]
 			),
 		)
-		# unreadable actions count as none; a blank error is no error; the 7th decimal of the raw sum
-		# (0.3000014) is rounded away
-		_log(day + timedelta(hours=12), entry_type="reason", actions="not json", error="  ", cost_usd=0.0000004)
+		# unreadable actions count as none; a blank error is no error; cost_usd is a decimal(21,6) column
+		# (precision 6), so 0.0000004 is stored as 0 and the sum stays 0.300001
+		_log(
+			day + timedelta(hours=12), entry_type="reason", actions="not json", error="  ", cost_usd=0.0000004
+		)
 		# change steps: propose x2, approve, reject; other steps not counted
 		for step in ("propose", "propose", "approve", "reject", "apply", "undo"):
 			_log(day + timedelta(hours=13), entry_type="change", trigger="change_action", change_step=step)

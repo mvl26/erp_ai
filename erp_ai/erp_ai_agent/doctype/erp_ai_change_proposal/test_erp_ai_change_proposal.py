@@ -1526,7 +1526,7 @@ class TestChangeProposalFormScript(FrappeTestCase):
 
 		with self.subTest(rule="signed link: one extra POST call to decide, no confirm (ADR-023 QĐ 1)"):
 			outside = source.replace(helper.group(0), "")
-			# The other call outside the helper is the one to confirm_restart (T25), without confirm either.
+			# The other call outside the helper is the one to confirm_restart (T25); its shape is pinned in test_calls_confirm_restart_only_when_sent.
 			self.assertEqual(outside.count("frappe.call("), 2)
 			call_at = outside.index("frappe.call(", outside.index("\nfunction decide_from_link(frm) {"))
 			function_at = outside.rindex("\nfunction ", 0, call_at)
@@ -1625,6 +1625,8 @@ class TestChangeProposalFormScript(FrappeTestCase):
 			)
 			self.assertIsNotNone(undo_message, "undo_confirm_message missing")
 			self.assertNotIn("File được ghi lại như cũ", source)
+			self.assertIn("file mới thì bị xóa", undo_message.group(1))
+			# New value (design 3.3): both wordings of the confirmation, block and single change, say it.
 			self.assertEqual(undo_message.group(1).count("file mới thì bị xóa"), 2)
 
 		with self.subTest(rule="no HTML built by concatenation"):

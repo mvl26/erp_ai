@@ -1997,8 +1997,8 @@ class TestRunnerHooks(RoutingTestBase):
 
 		self.assertEqual(self._follows(watcher), 0)
 		self.assertEqual(entry.applied, 1)
-		row = frappe.db.get_value("HD Ticket", self.ticket.name, ["ticket_type", "agent_group"], as_dict=True)
-		self.assertEqual((row.ticket_type, row.agent_group), (ROUTE_TYPE, self.team))
+		# a D ticket takes its team from the department (the mapping names no type for D)
+		self.assertEqual(frappe.db.get_value("HD Ticket", self.ticket.name, "agent_group"), self.team)
 		todos = frappe.get_all(
 			"ToDo", {"reference_type": "HD Ticket", "reference_name": self.ticket.name}, pluck="allocated_to"
 		)

@@ -1,5 +1,6 @@
 import os
 import re
+import unicodedata
 from dataclasses import dataclass
 
 import frappe
@@ -54,6 +55,30 @@ def is_excluded_team(team) -> bool:
 		return False
 	excluded = frappe.db.get_single_value(SETTING_DOCTYPE, EXCLUDED_TEAMS_FIELD) or ""
 	return team in {_normalize(line) for line in excluded.splitlines()}
+
+
+EXCLUDED_TITLE_PREFIXES_FIELD = "excluded_title_prefixes"
+SUBJECT_FIELD = "subject"
+
+
+def _title_key(text) -> str:
+	"""NFC, then the same spaces + casefold key as the team names."""
+	return _normalize(unicodedata.normalize("NFC", text or ""))
+
+
+def excluded_title_prefixes() -> tuple[str, ...]:
+	"""Keys of the non-empty lines of excluded_title_prefixes; () when the field is missing (before migrate)."""
+	try:
+		raw = frappe.db.get_single_value(SETTING_DOCTYPE, EXCLUDED_TITLE_PREFIXES_FIELD)
+	except frappe.ValidationError:  # get_single_value throws for a field the DocType does not have yet
+		return ()
+	return tuple(key for key in map(_title_key, (raw or "").splitlines()) if key)
+
+
+def has_excluded_title(subject) -> bool:
+	"""The title starts with an excluded prefix (only the start of the title counts)."""
+	title = _title_key(subject)
+	return any(title.startswith(prefix) for prefix in excluded_title_prefixes())
 
 
 def auto_assign_enabled(settings) -> bool:

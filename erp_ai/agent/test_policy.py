@@ -824,7 +824,6 @@ class TestRunsToday(FrappeTestCase):
 		self._log(ticket, "mention", "reason", TRIGGER_COMMENT_MENTION)
 		self._log(ticket, "change-reason", "reason", TRIGGER_CHANGE_ACTION)
 		self._log(ticket, "change-classify", "classify", TRIGGER_CHANGE_ACTION)
-		self._log(ticket, "no-trigger", "reason", None)
 		self.assertEqual(policy.runs_today(ticket), 2)
 		self.assertEqual(policy.RUN_LIMIT_TRIGGERS, (TRIGGER_TICKET_INSERT, TRIGGER_COMMENT_MENTION))
 

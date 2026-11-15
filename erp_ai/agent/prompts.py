@@ -307,6 +307,11 @@ PROMPT_CONFLICT_PAIRS: tuple[tuple[str, str], ...] = (
 
 TASK_NEW_TICKET = "Việc cần làm: phiếu mới. Gọi set_resolution_hint một lần, rồi post_comment nếu cần."
 TASK_COMMENT = "Việc cần làm: có comment gọi bạn. Trả lời bằng post_comment."
+# w1.md:100 (U4b-10): the ticket already has the bot's guidance comment (a fact of the ticket, not configuration).
+TASK_AFTER_GUIDANCE = (
+	"Phiếu đã có comment Hướng xử lý của bot. Chỉ làm việc người vừa nhờ và báo kết quả; "
+	"không viết lại hướng xử lý."
+)
 
 
 # The seven ticket fields (U4b.md:188-191): key = the part after "field_" of the U0 setting; the runner passes the
@@ -473,8 +478,15 @@ def build_reason_system(
 
 
 def build_initial_message(
-	ticket: dict, comments: list[dict], trigger: str, classification: dict | None
+	ticket: dict,
+	comments: list[dict],
+	trigger: str,
+	classification: dict | None,
+	ticket_fields: dict | None = None,
+	guidance_posted: bool = False,
 ) -> str:
+	"""The first message of the reasoning turn. The ticket fields (non-empty ones) and the "already has guidance"
+	fact are data of the ticket (AC-24, AC-65 (c)); without them the payload is the one of before."""
 	payload = {
 		"ticket": {
 			"subject": ticket.get("subject"),
@@ -496,5 +508,10 @@ def build_initial_message(
 		"trigger": trigger,
 		"classification": classification,
 	}
+	if fields := _field_values(ticket_fields or {}):
+		payload["ticket"]["fields"] = fields
 	task = TASK_COMMENT if trigger == TRIGGER_COMMENT_MENTION else TASK_NEW_TICKET
+	if guidance_posted:
+		payload["ticket"]["guidance_posted"] = True
+		task += "\n" + TASK_AFTER_GUIDANCE
 	return json.dumps(payload, ensure_ascii=False, indent=2, default=str) + "\n\n" + task

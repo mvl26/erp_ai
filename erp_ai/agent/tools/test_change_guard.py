@@ -43,6 +43,10 @@ BLOCK_TOO_LARGE_REFUSAL = "tổng nội dung của khối (kể cả diff) lớn
 TEXT_TOO_LARGE_REFUSAL = "file lớn hơn 2 MiB"
 TEXT_HAS_NUL_REFUSAL = "file có byte NUL, không phải văn bản"
 TEXT_NOT_UTF8_REFUSAL = "file không phải văn bản UTF-8"
+RESTART_PLACE_REFUSAL = "restart chỉ được một lần và phải là lệnh cuối"
+RESTART_NEEDS_MIGRATE_REFUSAL = "khối có file và restart phải có migrate đứng trước restart"
+PY_NEEDS_RESTART_REFUSAL = "khối có file .py phải kết thúc bằng migrate rồi restart"
+RESTART_WITHOUT_PY_REFUSAL = "khối có file nhưng không có file .py thì không restart"
 MIB = 1024 * 1024
 
 HAND_WRITTEN_CORE_APPS = ("frappe", "erpnext", "helpdesk", "hrms")
@@ -1160,6 +1164,10 @@ def rename(path, new_path, text="x = 1\n"):
 
 MOMENTS = (False, True)  # `at_apply`: proposal time (git read) and apply time (CHG-002 design 3.2)
 README = "myapp/README.md"
+MIGRATE = ["--site", SITE, "migrate"]
+RESTART = ["restart"]
+# A block with a `.py` file must end with migrate then restart (CHG-002 design 3.2 step 4, D-3).
+MIGRATE_RESTART = (MIGRATE, RESTART)
 
 
 class TestCheckBlock(FrappeTestCase):
@@ -1169,7 +1177,7 @@ class TestCheckBlock(FrappeTestCase):
 		self.sandbox = GitSandbox(self, apps=("myapp", "otherapp"))
 		self.root = self.sandbox.root
 
-	def check(self, ops, commands=(), allowed=ALLOWED, *, at_apply, diff_text=""):
+	def check(self, ops, commands=(), allowed=ALLOWED, *, at_apply, diff_text="", legacy=False):
 		return change_guard.check_block(
 			list(ops),
 			[list(args) for args in commands],
@@ -1177,6 +1185,7 @@ class TestCheckBlock(FrappeTestCase):
 			SITE,
 			at_apply=at_apply,
 			diff_text=diff_text,
+			legacy=legacy,
 		)
 
 	def reason(self, ops, commands=(), allowed=ALLOWED, *, at_apply):
@@ -1220,7 +1229,7 @@ class TestCheckBlock(FrappeTestCase):
 		repo = self.sandbox.repo("myapp")
 		for at_apply in MOMENTS:
 			with self.subTest(at_apply=at_apply):
-				result = self.check(ops, at_apply=at_apply)
+				result = self.check(ops, MIGRATE_RESTART, at_apply=at_apply)
 				self.assertIsNone(result.reason)
 				self.assertEqual(result.app, "myapp")
 				self.assertEqual(
@@ -1339,7 +1348,11 @@ class TestCheckBlock(FrappeTestCase):
 						)
 				# A shared name prefix is not nesting.
 				self.assertIsNone(
-					self.reason([create("myapp/pkg/a.py"), create("myapp/pkg2/a.py")], at_apply=at_apply)
+					self.reason(
+						[create("myapp/pkg/a.py"), create("myapp/pkg2/a.py")],
+						MIGRATE_RESTART,
+						at_apply=at_apply,
+					)
 				)
 
 	def test_new_dir_directly_under_apps_refused(self):
@@ -1465,7 +1478,7 @@ class TestCheckBlock(FrappeTestCase):
 			with self.subTest(ops=ops):
 				reason = self.reason(ops, at_apply=False)
 				self.assertTrue(reason.startswith(f"mục {len(ops)} ({path}): "), reason)
-				self.assertIsNone(self.reason(ops, at_apply=True))
+				self.assertIsNone(self.reason(ops, MIGRATE_RESTART, at_apply=True))
 		# A dirty rename target is refused at proposal time, not at apply time.
 		self.sandbox.commit_file("myapp", "target.md", "x = 1\n")
 		os.remove(os.path.join(self.sandbox.repo("myapp"), "target.md"))
@@ -1487,13 +1500,19 @@ class TestCheckBlock(FrappeTestCase):
 			),
 		)
 
-	def assert_refused_in_both_moments(self, ops, expected, diff_text=""):
+	def assert_refused_in_both_moments(self, ops, expected, diff_text="", commands=(), legacy=False):
 		for at_apply in MOMENTS:
-			with self.subTest(ops=[(op.kind, op.path, op.new_path) for op in ops], at_apply=at_apply):
-				self.assertEqual(self.check(ops, at_apply=at_apply, diff_text=diff_text).reason, expected)
+			with self.subTest(
+				ops=[(op.kind, op.path, op.new_path) for op in ops],
+				commands=commands,
+				legacy=legacy,
+				at_apply=at_apply,
+			):
+				result = self.check(ops, commands, at_apply=at_apply, diff_text=diff_text, legacy=legacy)
+				self.assertEqual(result.reason, expected)
 
-	def assert_accepted_in_both_moments(self, ops, diff_text=""):
-		self.assert_refused_in_both_moments(ops, None, diff_text)
+	def assert_accepted_in_both_moments(self, ops, diff_text="", commands=(), legacy=False):
+		self.assert_refused_in_both_moments(ops, None, diff_text, commands, legacy)
 
 	def test_py_syntax_error_refused_with_line(self):
 		self.sandbox.commit_file("myapp", "a.py", "x = 1\n")
@@ -1526,7 +1545,8 @@ class TestCheckBlock(FrappeTestCase):
 				edit("myapp/a.py", "def f(:\n", "x = 2\n"),
 				delete("myapp/broken.py", "def f(:\n"),
 				create("myapp/bad.txt", "def f(:\n"),
-			]
+			],
+			commands=MIGRATE_RESTART,
 		)
 
 	def test_json_invalid_refused_with_line(self):
@@ -1559,7 +1579,9 @@ class TestCheckBlock(FrappeTestCase):
 			"mục 1 (myapp/data.txt): file .json không phải JSON hợp lệ: dòng 1",
 		)
 		# The source name of a rename is not compiled.
-		self.assert_accepted_in_both_moments([rename("myapp/old.py", "myapp/old.txt", "def f(:\n")])
+		self.assert_accepted_in_both_moments(
+			[rename("myapp/old.py", "myapp/old.txt", "def f(:\n")], commands=MIGRATE_RESTART
+		)
 
 	def test_total_bytes_at_limit_ok_plus_one_refused(self):
 		two_mib = "é" * MIB  # 2 MiB of UTF-8 in 1 Mi characters: bytes are counted, not characters.
@@ -1646,3 +1668,148 @@ class TestCheckBlock(FrappeTestCase):
 			[edit("myapp/a.txt", "a", "\ud800")],
 		):
 			self.assert_refused_in_both_moments(ops, f"mục 1 ({ops[0].path}): {TEXT_NOT_UTF8_REFUSAL}")
+
+	def test_command_refusal_wording_matches_design_table(self):
+		self.assertEqual(
+			(
+				change_guard.RESTART_PLACE,
+				change_guard.RESTART_NEEDS_MIGRATE,
+				change_guard.PY_NEEDS_RESTART,
+				change_guard.RESTART_WITHOUT_PY,
+			),
+			(
+				RESTART_PLACE_REFUSAL,
+				RESTART_NEEDS_MIGRATE_REFUSAL,
+				PY_NEEDS_RESTART_REFUSAL,
+				RESTART_WITHOUT_PY_REFUSAL,
+			),
+		)
+
+	def assert_commands_in_both_moments(self, commands, expected, legacy=False):
+		for at_apply in MOMENTS:
+			with self.subTest(commands=commands, legacy=legacy, at_apply=at_apply):
+				result = self.check((), commands, at_apply=at_apply, legacy=legacy)
+				self.assertEqual((result.reason, result.app, tuple(result.targets)), (expected, None, ()))
+
+	def test_command_only_restart_block_valid(self):
+		# R-5, AC-47: with no file item, a lone restart needs no migrate and no `.py`.
+		for legacy in (False, True):
+			self.assert_commands_in_both_moments([RESTART], None, legacy)
+			self.assert_commands_in_both_moments([["version"], RESTART], None, legacy)
+			self.assert_commands_in_both_moments([MIGRATE, RESTART], None, legacy)
+
+	def test_restart_twice_or_not_last_refused(self):
+		self.sandbox.commit_file("myapp", "a.py", "x = 1\n")
+		for legacy in (False, True):
+			self.assert_commands_in_both_moments([RESTART, RESTART], RESTART_PLACE_REFUSAL, legacy)
+			self.assert_commands_in_both_moments([RESTART, ["version"]], RESTART_PLACE_REFUSAL, legacy)
+			self.assert_commands_in_both_moments([MIGRATE, RESTART, MIGRATE], RESTART_PLACE_REFUSAL, legacy)
+			for commands in (
+				[MIGRATE, RESTART, RESTART],
+				[RESTART, MIGRATE, RESTART],
+				[RESTART, MIGRATE],
+			):
+				self.assert_refused_in_both_moments(
+					[edit("myapp/a.py")], RESTART_PLACE_REFUSAL, commands=commands, legacy=legacy
+				)
+
+	def test_py_without_restart_refused(self):
+		self.sandbox.commit_file("myapp", "a.py", "x = 1\n")
+		self.sandbox.commit_file("myapp", "old.py", "x = 1\n")
+		self.sandbox.commit_file("myapp", "notes.txt", "x = 1\n")
+		# A `.py` on any path of the block counts: edit, create, delete, rename source, rename target.
+		for ops in (
+			[edit("myapp/a.py")],
+			[edit(README), create("myapp/pkg/new.py")],
+			[delete("myapp/a.py")],
+			[rename("myapp/old.py", "myapp/old.txt")],
+			[rename("myapp/notes.txt", "myapp/notes.py")],
+		):
+			for commands in ((), [MIGRATE], [MIGRATE, ["--site", SITE, "clear-cache"]]):
+				self.assert_refused_in_both_moments(ops, PY_NEEDS_RESTART_REFUSAL, commands=commands)
+			self.assert_accepted_in_both_moments(ops, commands=MIGRATE_RESTART)
+
+	def test_restart_without_py_refused(self):
+		self.sandbox.commit_file("myapp", "a.py.txt", "x = 1\n")
+		for ops in (
+			[edit(README)],
+			[create("myapp/x.json", "{}"), edit("myapp/a.py.txt")],
+			[rename(README, "myapp/py/README.md")],
+		):
+			for commands in (MIGRATE_RESTART, [RESTART]):
+				self.assert_refused_in_both_moments(ops, RESTART_WITHOUT_PY_REFUSAL, commands=commands)
+			self.assert_accepted_in_both_moments(ops, commands=[MIGRATE])
+			self.assert_accepted_in_both_moments(ops)
+
+	def test_file_block_restart_without_migrate_refused(self):
+		self.sandbox.commit_file("myapp", "a.py", "x = 1\n")
+		for commands in (
+			[RESTART],
+			[["version"], RESTART],
+			[["--site", SITE, "clear-cache"], RESTART],
+		):
+			self.assert_refused_in_both_moments(
+				[edit("myapp/a.py")], RESTART_NEEDS_MIGRATE_REFUSAL, commands=commands
+			)
+		# Migrate anywhere before restart passes.
+		self.assert_accepted_in_both_moments(
+			[edit("myapp/a.py")], commands=[MIGRATE, ["--site", SITE, "clear-cache"], RESTART]
+		)
+		# The migrate rule still applies to a legacy block that has a file and restart.
+		self.assert_refused_in_both_moments(
+			[edit(README)], RESTART_NEEDS_MIGRATE_REFUSAL, commands=[RESTART], legacy=True
+		)
+		self.assert_accepted_in_both_moments([edit(README)], commands=MIGRATE_RESTART, legacy=True)
+
+	def test_legacy_py_without_restart_allowed(self):
+		self.sandbox.commit_file("myapp", "a.py", "x = 1\n")
+		self.sandbox.commit_file("myapp", "old.py", "x = 1\n")
+		for ops in ([edit("myapp/a.py")], [rename("myapp/old.py", "myapp/new.txt")]):
+			self.assert_accepted_in_both_moments(ops, legacy=True)
+			self.assert_accepted_in_both_moments(ops, commands=[MIGRATE], legacy=True)
+		# Legacy also lets a file block without `.py` restart.
+		self.assert_accepted_in_both_moments([edit(README)], commands=MIGRATE_RESTART, legacy=True)
+
+	def test_denied_command_in_block_names_command_number(self):
+		self.sandbox.commit_file("myapp", "a.py", "x = 1\n")
+		for commands, expected in (
+			([["--site", SITE, "migrate", "--force"]], f"lệnh 1: {FORCE_REFUSAL}"),
+			([["version"], ["restart", "--now"]], f"lệnh 2: {NOT_LISTED_REFUSAL}"),
+			([["version"], MIGRATE, ["--site", "other.test", "migrate"]], f"lệnh 3: {OTHER_SITE_REFUSAL}"),
+			([["version"], ["version;", "x"], ["console"]], f"lệnh 2: {SHELL_REFUSAL}"),
+			([["build", "--app", "otherapp"]], f"lệnh 1: {NOT_LISTED_REFUSAL}"),
+			([["console"], RESTART, RESTART], f"lệnh 1: {NOT_LISTED_REFUSAL}"),
+		):
+			self.assert_commands_in_both_moments(commands, expected)
+			self.assert_refused_in_both_moments([edit("myapp/a.py")], expected, commands=commands)
+		# Item reasons (step 2) and the total (step 3) come before the commands (step 4).
+		self.assert_refused_in_both_moments(
+			[create("otherapp/x.txt")],
+			f"mục 1 (otherapp/x.txt): {APP_NOT_ALLOWED_REFUSAL}",
+			commands=[["console"]],
+		)
+		self.assert_refused_in_both_moments(
+			[create("myapp/x.txt")], BLOCK_TOO_LARGE_REFUSAL, "d" * (8 * MIB), commands=[["console"]]
+		)
+
+	def test_empty_path_item_refused(self):
+		# Design-addendum-5 P-6: an empty path (or rename target) is a shape refusal, in both moments.
+		self.sandbox.commit_file("myapp", "notes.txt", "x = 1\n")
+		text = "x = 1\n"
+		for blank in ("", "   ", "\t\n"):
+			for action, op in (
+				("edit", change_guard.FileOp(CHANGE_OP_EDIT, blank, None, text, text, None, None)),
+				("create", change_guard.FileOp(CHANGE_OP_CREATE, blank, None, None, text, None, None)),
+				("delete", change_guard.FileOp(CHANGE_OP_DELETE, blank, None, text, None, None, None)),
+				(
+					"rename",
+					change_guard.FileOp(CHANGE_OP_RENAME, blank, "myapp/b.txt", text, text, None, None),
+				),
+				(
+					"rename",
+					change_guard.FileOp(CHANGE_OP_RENAME, "myapp/notes.txt", blank, text, text, None, None),
+				),
+			):
+				self.assert_refused_in_both_moments(
+					[edit(README), op], f"mục 2 ({op.path}): mục {action} thiếu hoặc thừa trường"
+				)

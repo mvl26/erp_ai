@@ -59,6 +59,20 @@ NOTICE_PREFIXES = {
 	"ask_fallback": "Bot chưa đủ chắc để xử lý phiếu này:",
 }
 REASON_NOTICE_SENT = "đã thông báo"
+# The guidance comment (ADR-036, w1.md:30-63): at most one per ticket, line 1 is the marker; defined here only.
+_GUIDANCE_KEY = "erp_ai:huong-xu-ly"
+GUIDANCE_MARKER = f"<!-- {_GUIDANCE_KEY} -->"
+GUIDANCE_HEADER = "Hướng xử lý"
+SECTION_DONE, SECTION_PENDING = "Đã làm", "Chờ duyệt"
+# Collector key of "work a person must do by hand, with the reason": shown inside the plan section, no heading of
+# its own (design-w1-fixes-20 Điểm 1.1, spec-addendum-5 AC-65 (a)).
+SECTION_DECIDE = GUIDANCE_HEADER
+GUIDANCE_SECTIONS = (SECTION_DONE, SECTION_PENDING, SECTION_DECIDE)
+# Per-job state, like the asked runs: run_id -> {"analysis": str | None, <section>: [raw lines]}.
+_GUIDANCE_FLAG = "erp_ai_guidance"
+_ANALYSIS_KEY = "analysis"
+# Runs on a ticket that already has its guidance comment.
+_WORK_ONLY_FLAG = "erp_ai_work_only_runs"
 
 
 def _fail(reason: str) -> dict:
@@ -287,6 +301,66 @@ def post_notice(ticket_name: str, notice: str, body: str, since: datetime) -> di
 	if locked_count(ticket_name, "Comment", filters):
 		return _fail(REASON_NOTICE_SENT)
 	return _post(ticket_name, f"{prefix} {body}")
+
+
+def guidance_filters(ticket_name: str) -> dict:
+	"""The agent's guidance comment of the ticket: the marker at position 0, so the model's text inside another
+	comment never counts; an `Info` row never counts (ADR-036 QĐ 3)."""
+	return {**_agent_comment_filters(ticket_name), "content": ["like", f"{GUIDANCE_MARKER}%"]}
+
+
+def count_guidance(ticket_name: str, *, lock: bool = False) -> int:
+	"""The one count of the ticket's guidance comments (ADR-036 QĐ 3): lock=True locks the ticket and reads with a lock."""
+	if lock:
+		return locked_count(ticket_name, "Comment", guidance_filters(ticket_name))
+	return frappe.db.count("Comment", guidance_filters(ticket_name))
+
+
+def open_collector(run_id: str) -> None:
+	"""Start the run's guidance collector: no analysis yet, every section empty."""
+	frappe.flags.setdefault(_GUIDANCE_FLAG, {})[run_id] = {
+		_ANALYSIS_KEY: None,
+		**{section: [] for section in GUIDANCE_SECTIONS},
+	}
+
+
+def collecting(run_id: str) -> bool:
+	return run_id in frappe.flags.get(_GUIDANCE_FLAG, {})
+
+
+def collect(run_id: str, section: str, line: str) -> None:
+	"""Add `line` (raw text, no HTML) to `section` of the run's collector; no open collector → nothing; the same
+	(section, line) pair twice → kept once (AD3.md:127). A section outside GUIDANCE_SECTIONS → ValueError."""
+	if section not in GUIDANCE_SECTIONS:
+		raise ValueError(f"mục lạ: {section}")
+	if not collecting(run_id):
+		return
+	lines = frappe.flags.get(_GUIDANCE_FLAG)[run_id][section]
+	if line not in lines:
+		lines.append(line)
+
+
+def hold_analysis(run_id: str, content: str) -> None:
+	"""Keep the model's analysis for the guidance comment; a later hold replaces an earlier one; no collector → nothing."""
+	if collecting(run_id):
+		frappe.flags.get(_GUIDANCE_FLAG)[run_id][_ANALYSIS_KEY] = content
+
+
+def collected(run_id: str) -> tuple[str | None, dict[str, list[str]]]:
+	"""(analysis, {section: lines}) of the run's collector, as copies; no collector → (None, every section empty)."""
+	collector = frappe.flags.get(_GUIDANCE_FLAG, {}).get(run_id, {})
+	return collector.get(_ANALYSIS_KEY), {
+		section: list(collector.get(section, ())) for section in GUIDANCE_SECTIONS
+	}
+
+
+def close_collector(run_id: str) -> None:
+	frappe.flags.get(_GUIDANCE_FLAG, {}).pop(run_id, None)
+
+
+def mark_work_only(run_id: str) -> None:
+	"""Record a run on a ticket that already has its guidance comment (ADR-036 QĐ 7)."""
+	frappe.flags.setdefault(_WORK_ONLY_FLAG, set()).add(run_id)
 
 
 def post_comment_tool(args: dict, ctx: ToolContext) -> dict:

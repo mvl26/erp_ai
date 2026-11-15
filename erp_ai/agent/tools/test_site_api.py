@@ -1693,6 +1693,15 @@ EXCLUDED_KINDS = ("team", "opt_out", "title", "classified")
 # The 4 DocTypes of TICKET_CONTENT_DOCTYPES plus Helpdesk's legacy ticket note DocType.
 LEGACY_NOTE_DOCTYPE = "HD Ticket Comment"
 CONTENT_DOCTYPES = (*TICKET_CONTENT_DOCTYPES, LEGACY_NOTE_DOCTYPE)
+# Listed columns that hold the ticket's text, so a leaked row would carry the seed.
+LIST_FIELDS = {
+	"HD Ticket": ["name", "subject", "description"],
+	"Comment": ["name", "content"],
+	"Communication": ["name", "subject", "content"],
+	"File": ["name", "file_name"],
+	LEGACY_NOTE_DOCTYPE: ["name", "content"],
+	"Task": ["name", "subject", "ai_ticket"],
+}
 
 
 def _db_insert(values):
@@ -1802,6 +1811,23 @@ class _ExcludedTicketCase(FrappeTestCase):
 	def assert_no_seed(self, result):
 		self.assertEqual(json.dumps(result, ensure_ascii=False, default=str).count(self.seed), 0, result)
 
+	def list_rows(self, doctype, filters, unrestricted=False, limit=site_api.MAX_LIMIT):
+		arguments = {
+			"doctype": doctype,
+			"filters": filters,
+			"fields": LIST_FIELDS.get(doctype, ["name"]),
+			"limit": limit,
+		}
+		result = site_api.list_records(arguments, _context(unrestricted=unrestricted))
+		self.assertTrue(result["ok"], result)
+		return result
+
+	def listed(self, doctype, filters, unrestricted=False):
+		"""Names of the listed rows, as text; the seed never appears in the result."""
+		result = self.list_rows(doctype, filters, unrestricted)
+		self.assert_no_seed(result)
+		return [str(row["name"]) for row in result["records"]]
+
 
 class TestExcludedTicketReads(_ExcludedTicketCase):
 	def test_get_refuses_excluded_record_in_both_modes(self):
@@ -1821,3 +1847,152 @@ class TestExcludedTicketReads(_ExcludedTicketCase):
 								result,
 								{"ok": False, "reason": policy.EXCLUDED_TICKET_REASON, "doctype": doctype},
 							)
+
+	def test_list_hides_excluded_rows_in_both_modes(self):
+		made = self.make_tickets()
+		for unrestricted in (False, True):
+			for doctype in CONTENT_DOCTYPES:
+				with self.subTest(unrestricted=unrestricted, doctype=doctype):
+					names = [records[doctype] for records in made.values()]
+					result = self.list_rows(doctype, [["name", "in", names]], unrestricted)
+					self.assert_no_seed(result)
+					self.assertEqual(
+						[str(row["name"]) for row in result["records"]], [str(made["normal"][doctype])]
+					)
+					self.assertEqual(result["excluded_note"], site_api.EXCLUDED_LIST_NOTE)
+
+	def test_list_result_identical_when_excluded_ticket_added(self):
+		# ADR-034 Ràng buộc 2: the condition is in the query, so `limit` and the order never reveal the excluded.
+		marker = f"U2-LIST-{uuid.uuid4().hex}"
+		for index in range(3):
+			old = f"2001-01-0{index + 1} 00:00:00"
+			normal = self.ticket("normal", f"{marker} {self.plain} {index}")
+			frappe.db.set_value("HD Ticket", normal, "modified", old, update_modified=False)
+			self.comment(normal, f"{marker} {self.plain} {index}", creation=old, modified=old)
+		filters = {
+			"HD Ticket": [["subject", "like", f"{marker}%"]],
+			"Comment": [["content", "like", f"{marker}%"]],
+		}
+
+		def results():
+			return {doctype: self.list_rows(doctype, rows, limit=2) for doctype, rows in filters.items()}
+
+		before = results()
+		# The newest ticket of all, excluded, with three comments newer than every other row.
+		excluded = self.ticket("team", f"{marker} {self.seed}")
+		for index in range(3):
+			self.comment(excluded, f"{marker} {self.seed} {index}")
+		after = results()
+		self.assertEqual(after, before)
+		self.assertEqual([len(result["records"]) for result in after.values()], [2, 2])
+		self.assert_no_seed(after)
+
+	def test_name_filter_on_excluded_ticket_returns_zero_rows_with_note(self):
+		excluded = self.ticket("team", self.seed)
+		self.comment(excluded, self.seed)
+		for unrestricted in (False, True):
+			for doctype, filters in (
+				("Comment", [["reference_name", "=", excluded]]),
+				("HD Ticket", [["name", "=", excluded]]),
+			):
+				with self.subTest(unrestricted=unrestricted, doctype=doctype):
+					result = self.list_rows(doctype, filters, unrestricted)
+					self.assertEqual(result["records"], [])
+					self.assertEqual(result["excluded_note"], site_api.EXCLUDED_LIST_NOTE)
+
+	def test_excluded_note_present_even_with_nothing_excluded(self):
+		self.assertEqual(
+			site_api.EXCLUDED_LIST_NOTE,
+			"Phiếu nhóm loại trừ, phiếu không dùng AI và mọi bản ghi của chúng không bao giờ có trong danh sách.",
+		)
+		comment = self.comment(self.ticket("normal", self.plain), self.plain)
+		with patch.object(policy, "excluded_ticket_names", return_value=[]):
+			result = self.list_rows("Comment", [["name", "=", comment]])
+		self.assertEqual([row["name"] for row in result["records"]], [comment])
+		self.assertEqual(result["excluded_note"], site_api.EXCLUDED_LIST_NOTE)
+		# A DocType that carries no ticket content gets no note.
+		todo = _db_insert({"doctype": "ToDo", "description": self.plain})
+		result = self.list_rows("ToDo", [["name", "=", todo]])
+		self.assertEqual([row["name"] for row in result["records"]], [todo])
+		self.assertNotIn("excluded_note", result)
+
+	def test_comment_without_reference_still_listed(self):
+		marker = f"U2-LIST-{uuid.uuid4().hex}"
+		excluded = self.ticket("team", self.seed)
+		no_reference = self.comment(None, f"{marker} a", reference_doctype=None)
+		# Another DocType's comment whose reference_name is the excluded ticket's number.
+		other_doctype = self.comment(str(excluded), f"{marker} b", reference_doctype="ToDo")
+		self.comment(excluded, f"{marker} {self.seed}")
+		for unrestricted in (False, True):
+			with self.subTest(unrestricted=unrestricted):
+				listed = self.listed("Comment", [["content", "like", f"{marker}%"]], unrestricted)
+				self.assertEqual(sorted(listed), sorted([no_reference, other_doctype]))
+
+	def test_empty_ticket_link_row_still_listed(self):
+		excluded = self.ticket("team", self.seed)
+		empty_note = _db_insert(
+			{"doctype": LEGACY_NOTE_DOCTYPE, "reference_ticket": None, "content": self.plain}
+		)
+		excluded_note = _db_insert(
+			{"doctype": LEGACY_NOTE_DOCTYPE, "reference_ticket": excluded, "content": self.seed}
+		)
+		# A Task a person made has no ai_ticket (A-11).
+		empty_task = _db_insert({"doctype": "Task", "subject": self.plain})
+		excluded_task = _db_insert({"doctype": "Task", "subject": self.seed, "ai_ticket": excluded})
+		for unrestricted in (False, True):
+			with self.subTest(unrestricted=unrestricted):
+				notes = self.listed(
+					LEGACY_NOTE_DOCTYPE, [["name", "in", [empty_note, excluded_note]]], unrestricted
+				)
+				self.assertEqual(notes, [empty_note])
+				tasks = self.listed("Task", [["name", "in", [empty_task, excluded_task]]], unrestricted)
+				self.assertEqual(tasks, [empty_task])
+
+	def test_task_of_excluded_ticket_hidden(self):
+		normal_task = _db_insert(
+			{"doctype": "Task", "subject": self.plain, "ai_ticket": self.ticket("normal", self.plain)}
+		)
+		excluded_task = _db_insert(
+			{"doctype": "Task", "subject": self.seed, "ai_ticket": self.ticket("team", self.seed)}
+		)
+		for unrestricted in (False, True):
+			with self.subTest(unrestricted=unrestricted):
+				listed = self.listed("Task", [["name", "in", [normal_task, excluded_task]]], unrestricted)
+				self.assertEqual(listed, [normal_task])
+				result = site_api.get_record(
+					{"doctype": "Task", "name": excluded_task}, _context(unrestricted=unrestricted)
+				)
+				self.assertEqual(
+					result, {"ok": False, "reason": policy.EXCLUDED_TICKET_REASON, "doctype": "Task"}
+				)
+
+	def test_static_link_on_dynamic_doctype_also_filtered(self):
+		excluded = self.ticket("team", self.seed)
+		normal = self.ticket("normal", self.plain)
+		todo = _db_insert({"doctype": "ToDo", "description": self.plain})
+		# The dynamic pair names a ToDo; only the static Link points at a ticket.
+		via_static = self.comment(todo, self.seed, "ToDo", link_doctype="HD Ticket", link_name=excluded)
+		via_static_normal = self.comment(todo, self.plain, "ToDo", link_doctype="HD Ticket", link_name=normal)
+		real_fieldnames = policy.ticket_link_fieldnames
+
+		def fieldnames(doctype):
+			# Comment as if a Custom Field made `link_name` a Link to HD Ticket. Stubbed in this process only: a
+			# real Custom Field runs ALTER TABLE (frappe.db.updatedb commits) and would put the changed meta of
+			# Comment into the Redis cache other sessions of the shared site read.
+			return ("link_name",) if doctype == "Comment" else real_fieldnames(doctype)
+
+		with patch.object(policy, "ticket_link_fieldnames", side_effect=fieldnames):
+			self.assertEqual(
+				policy.ticket_link_columns("Comment"),
+				(("reference_doctype", "reference_name"), (None, "link_name")),
+			)
+			for unrestricted in (False, True):
+				with self.subTest(unrestricted=unrestricted):
+					listed = self.listed(
+						"Comment", [["name", "in", [via_static, via_static_normal]]], unrestricted
+					)
+					self.assertEqual(listed, [via_static_normal])
+
+	def test_record_tools_granted_when_switch_on(self):
+		inputs = registry.GrantInputs("L3", "L3", True, PermissionSwitches(record_tools=True))
+		self.assertLessEqual({"api_list_records", "api_get_record"}, registry.grant(inputs).names())

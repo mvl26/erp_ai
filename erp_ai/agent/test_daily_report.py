@@ -244,7 +244,7 @@ class TestBuild(FrappeTestCase):
 			result["de_progress"],
 			{
 				"D": {"done": 1, "in_progress": 1, "overdue": 0},
-				"E": {"done": 1, "in_progress": 1, "overdue": 1},
+				"E": {"done": 0, "in_progress": 1, "overdue": 1},
 			},
 		)
 

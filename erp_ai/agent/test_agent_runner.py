@@ -31,7 +31,7 @@ from erp_ai.agent.prompts import (
 	build_routing_table,
 )
 from erp_ai.agent.run_log import action_entry, write_entry
-from erp_ai.agent.tools import registry, site_api
+from erp_ai.agent.tools import registry, site_api, write_ticket
 from erp_ai.agent.tools.read import TOOL_RESULT_MAX_CHARS
 from erp_ai.agent.tools.registry import ASK_TOOL_NAMES, get_tool_schemas
 from erp_ai.agent.tools.source import GIT_READ_SUBCOMMANDS, git_global_options
@@ -3730,3 +3730,186 @@ class TestTicketFields(RunnerTestBase):
 		self.assertNotIn("fields", payload["ticket"])
 		self.assertEqual(entry.predicted_category, "A")
 		self.log_error.assert_not_called()
+
+
+class TestRunNotices(RunnerTestBase):
+	"""AC-23, AC-61, AC-10 (T110, U4b.md:236-242, :250-251, U4b-fixes Fix 8): a status notice of the run is one comment
+	per kind and period, posted by post_notice, with one action entry on the row of the step that posted it."""
+
+	def setUp(self):
+		super().setUp()
+		keep_agent_settings(self)
+		# every switch and limit the notices depend on is set here, never read from the shared site
+		set_agent_settings(
+			permission_level="L1",
+			code_change_enabled=0,
+			record_tools_enabled=0,
+			act_now_enabled=0,
+			unrestricted_enabled=0,
+			monthly_budget_usd=1000,
+			max_runs_per_ticket_per_day=DAILY_LIMIT,
+		)
+		log_error = patch.object(frappe, "log_error")
+		self.log_error = log_error.start()
+		self.addCleanup(log_error.stop)
+
+	def _notices(self, notice, ticket=None):
+		"""The ticket's comments of one notice kind, oldest first."""
+		return frappe.get_all(
+			"Comment",
+			filters={
+				**authority.ticket_comment_filters(ticket or self.ticket.name),
+				"content": ["like", f"{write_ticket.NOTICE_PREFIXES[notice]}%"],
+			},
+			pluck="name",
+			order_by="creation asc",
+		)
+
+	def _content(self, notice, body):
+		return f"{write_ticket.NOTICE_PREFIXES[notice]} {body}"
+
+	def _entry(self, comment, notice, instructor=None):
+		return action_entry(
+			runner.NOTICE_TOOL,
+			"Comment",
+			comment,
+			True,
+			value_after={"notice": notice},
+			instructor=instructor,
+		)
+
+	def test_daily_limit_repeated_same_day_one_comment(self):
+		self._seed_runs(DAILY_LIMIT)
+		for _ in range(3):
+			self._run("comment_mention")
+
+		self.assertEqual(self.gateway.call_count, 0)
+		self.assertEqual([e.stop_reason for e in self._entries(entry_type="skip")], ["daily_limit"] * 3)
+		(notice,) = self._notices("daily_limit")
+		self.assertEqual(
+			frappe.db.get_value("Comment", notice, "content"),
+			self._content("daily_limit", runner.DAILY_LIMIT_BODY.format(limit=DAILY_LIMIT)),
+		)
+
+		# the notice of yesterday does not count for today (the mark is 00:00 of today, as runs_today's)
+		yesterday = frappe.utils.add_days(frappe.utils.now_datetime(), -1)
+		frappe.db.set_value("Comment", notice, "creation", yesterday, update_modified=False)
+		self._run("comment_mention")
+		self.assertEqual(len(self._notices("daily_limit")), 2)
+
+		# at L0 the bot does nothing on the ticket anyway: no notice
+		set_agent_settings(permission_level="L0")
+		other = make_ticket(subject=f"{PREFIX}daily limit L0").name
+		for index in range(DAILY_LIMIT):
+			write_entry(
+				ticket=other,
+				run_id=f"{PREFIX}l0-{index}",
+				entry_type="classify",
+				trigger="ticket_insert",
+				turn=0,
+			)
+		runner.run_for_ticket(other, "ticket_insert")
+		self.assertEqual(self._notices("daily_limit", other), [])
+
+	def test_over_budget_once_a_day_only_when_level_lost(self):
+		self.month_spend.return_value = 2000.0
+		set_agent_settings(permission_level="L3")
+		self._run("comment_mention")
+		self._run("comment_mention")
+
+		(notice,) = self._notices("over_budget")
+		self.assertEqual(
+			frappe.db.get_value("Comment", notice, "content"),
+			self._content("over_budget", runner.OVER_BUDGET_BODY),
+		)
+		first, second = self._entries(entry_type="reason")
+		self.assertEqual(json.loads(first.actions), [self._entry(notice, "over_budget")])
+		self.assertFalse(second.actions)
+
+		# a base level of L1 loses nothing over budget: nothing to say
+		set_agent_settings(permission_level="L1")
+		other = make_ticket(subject=f"{PREFIX}over budget L1").name
+		runner.run_for_ticket(other, "comment_mention")
+		self.assertEqual(self._notices("over_budget", other), [])
+
+	def test_failures_one_comment_until_next_success(self):
+		set_agent_settings(max_runs_per_ticket_per_day=10)
+		self.gateway.results = [GatewayError("deadline")]
+		self._run("comment_mention")
+		self.gateway.results = [GatewayError("server_error", status=500)]
+		self._run("comment_mention")
+
+		(first,) = self._notices("run_failed")
+		self.assertEqual(
+			frappe.db.get_value("Comment", first, "content"),
+			self._content("run_failed", runner.RUN_FAILED_BODY.format(cause=runner.CAUSE_TIME)),
+		)
+		failed = self._entries(entry_type="reason")
+		self.assertEqual(json.loads(failed[0].actions), [self._entry(first, "run_failed")])
+		self.assertFalse(failed[1].actions)
+
+		# a successful run, then a failure: one new notice
+		self.gateway.results = [make_model_result()]
+		self._run("comment_mention")
+		self.gateway.results = [GatewayError("server_error", status=500)]
+		self._run("comment_mention")
+		notices = self._notices("run_failed")
+		self.assertEqual(len(notices), 2)
+		self.assertEqual(
+			frappe.db.get_value("Comment", notices[1], "content"),
+			self._content("run_failed", runner.RUN_FAILED_BODY.format(cause=runner.CAUSE_GATEWAY)),
+		)
+
+	def test_gateway_error_at_l0_no_comment(self):
+		set_agent_settings(permission_level="L0")
+		before = self._comment_count()
+		self.gateway.results = [GatewayError("server_error", status=500)]
+		self._run()
+
+		self.assertEqual(self._comment_count(), before)
+		(entry,) = self._entries(entry_type="classify")
+		self.assertFalse(entry.actions)
+
+		# the same classification failure above L0 posts the notice; its entry is on the failed classify row
+		set_agent_settings(permission_level="L1")
+		other = make_ticket(subject=f"{PREFIX}classify failed L1").name
+		self.gateway.results = [GatewayError("server_error", status=500)]
+		runner.run_for_ticket(other, "ticket_insert")
+		(notice,) = self._notices("run_failed", other)
+		(row,) = frappe.get_all(
+			LOG_DOCTYPE, {"ticket": other, "entry_type": "classify"}, ["actions", "error"]
+		)
+		self.assertEqual(row.error, "server_error status=500")
+		instructor = authority.run_instructor(other, "ticket_insert")
+		self.assertEqual(json.loads(row.actions), [self._entry(notice, "run_failed", instructor)])
+
+	def test_notice_only_for_listed_triggers(self):
+		self.assertEqual(set(runner.NOTICE_TRIGGERS), {"over_budget", "run_failed", "ask_fallback"})
+		frappe.set_user(AGENT_USER)
+		since = datetime(2000, 1, 1)
+		before = self._comment_count()
+		for notice in runner.NOTICE_TRIGGERS:
+			with self.subTest(notice):
+				self.assertIsNone(
+					runner._notice(self.ticket.name, notice, f"{PREFIX}x", since, trigger="x_unlisted")
+				)
+		self.assertEqual(self._comment_count(), before)
+
+		# daily_limit is not in the table: it holds for every trigger that reaches step (d)
+		entry = runner._notice(self.ticket.name, "daily_limit", f"{PREFIX}x", since, trigger="x_unlisted")
+		(notice,) = self._notices("daily_limit")
+		self.assertEqual(entry, self._entry(notice, "daily_limit"))
+		self.assertEqual(self._comment_count(), before + 1)
+
+	def test_each_notice_has_one_action_entry(self):
+		self._seed_runs(DAILY_LIMIT)
+		self._run("comment_mention")
+		self._run("comment_mention")
+
+		first, second = self._entries(entry_type="skip")
+		(notice,) = self._notices("daily_limit")
+		(entry,) = json.loads(first.actions)
+		self.assertEqual(tuple(entry), run_log.ACTION_KEYS)
+		self.assertEqual(entry, self._entry(notice, "daily_limit"))
+		# the second notice was refused as already sent: nothing written, so no entry
+		self.assertFalse(second.actions)

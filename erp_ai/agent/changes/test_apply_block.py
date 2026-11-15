@@ -242,17 +242,20 @@ class TestBlockAllOrNothing(BlockApplyTestCase):
 				full = os.path.join(self.sandbox.repo(APP), TEXT_RELS[index])
 				os.rename(full, f"{full}.real")
 				os.symlink(f"{full}.real", full)
-				before = self.snapshot()
+				# Put back before the next subtest even when this one fails, so only item `index` is a symlink.
+				try:
+					before = self.snapshot()
 
-				self.run_apply(name)
+					self.run_apply(name)
 
-				self.assert_failed_untouched(
-					name,
-					f"mục {index + 1} ({APP}/{TEXT_RELS[index]}): {change_guard.PATH_SYMLINK}",
-					before,
-				)
-				os.remove(full)
-				os.replace(f"{full}.real", full)
+					self.assert_failed_untouched(
+						name,
+						f"mục {index + 1} ({APP}/{TEXT_RELS[index]}): {change_guard.PATH_SYMLINK}",
+						before,
+					)
+				finally:
+					os.remove(full)
+					os.replace(f"{full}.real", full)
 
 	def test_app_removed_from_list_error(self):
 		name = self.approve(self.block(self.edits()))
@@ -371,18 +374,29 @@ class TestApplyBlock(BlockApplyTestCase):
 	def test_stored_command_edited_to_denied_blocked_at_apply(self):
 		site = frappe.local.site
 		denied = ["--site", site, "execute", "frappe.db.truncate"]
+		migrate = ["--site", site, "migrate"]
+		py_edit = [{"kind": CHANGE_OP_EDIT, "path": f"{APP}/{LEGACY_REL}", "before": BEFORE, "after": AFTER}]
 		cases = (
-			("denied command", [denied], f"lệnh 1: {change_guard.CMD_NOT_LISTED}"),
+			("denied command", self.edits(count=1), [denied], f"lệnh 1: {change_guard.CMD_NOT_LISTED}"),
 			(
 				"denied second command",
-				[["--site", site, "migrate"], denied],
+				self.edits(count=1),
+				[migrate, denied],
 				f"lệnh 2: {change_guard.CMD_NOT_LISTED}",
 			),
-			("empty argv", [[]], "lệnh 1: " + change_guard.check_bench_args([], (APP,), site)),
+			("empty argv", self.edits(count=1), [[]], f"lệnh 1: {change_guard.CMD_NOT_LISTED}"),
+			# Block-wide rules with no command prefix, refused only because a block is not the old shape.
+			("block .py without restart", py_edit, [migrate], change_guard.PY_NEEDS_RESTART),
+			(
+				"block restart without .py",
+				self.edits(count=1),
+				[migrate, ["restart"]],
+				change_guard.RESTART_WITHOUT_PY,
+			),
 		)
-		for label, commands, reason in cases:
+		for label, operations, commands, reason in cases:
 			with self.subTest(label):
-				name = self.approve(self.block(self.edits(count=1), [["--site", site, "migrate"]]))
+				name = self.approve(self.block(operations, [migrate]))
 				frappe.db.set_value(
 					PROPOSAL_DOCTYPE, name, "command_list", json.dumps(commands), update_modified=False
 				)
@@ -439,7 +453,8 @@ class TestLegacyThroughAdapter(BlockApplyTestCase):
 		return make_change_proposal(CHANGE_KIND_CODE, **values).name
 
 	def test_legacy_approved_proposal_applies(self):
-		name = self.approve(self.legacy())
+		diff = f"--- a/{LEGACY_REL}\n+++ b/{LEGACY_REL}\n-x = 1\n+x = 2\n"
+		name = self.approve(self.legacy(diff=diff))
 		head = self.git("rev-parse", "HEAD")
 
 		with (
@@ -456,6 +471,7 @@ class TestLegacyThroughAdapter(BlockApplyTestCase):
 		guard.assert_called_once()
 		self.assertEqual(guard.call_args.kwargs["legacy"], True)
 		self.assertEqual(guard.call_args.kwargs["at_apply"], True)
+		self.assertEqual(guard.call_args.kwargs["diff_text"], diff)
 		with open(os.path.join(self.sandbox.repo(APP), LEGACY_REL), "rb") as handle:
 			self.assertEqual(handle.read(), AFTER.encode("utf-8"))
 		self.assertEqual(self.git("rev-parse", "HEAD"), state.apply_commit_sha)

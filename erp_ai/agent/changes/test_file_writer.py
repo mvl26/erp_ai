@@ -204,6 +204,22 @@ class TestMakeParents(FrappeTestCase):
 			file_writer.make_parents(full, self.app_dir)
 		self.assertEqual(os.listdir(self.apps.outside), ["plain.py"])
 
+	def test_symlinked_ancestor_refused_before_mkdir(self):
+		full = os.path.join(self.app_dir, "dir_out", "pkg", "new.py")
+		made = []
+		real_mkdir = os.mkdir
+
+		def spy(path, mode=0o777):
+			made.append(path)
+			return real_mkdir(path, mode)
+
+		with patch.object(file_writer.os, "mkdir", side_effect=spy):
+			with self.assertRaises(ValueError):
+				file_writer.make_parents(full, self.app_dir)
+		self.assertEqual(made, [])
+		self.assertEqual(os.listdir(self.apps.outside), ["plain.py"])
+		self.assertEqual(sorted(os.listdir(self.app_dir)), APP_DIR_BEFORE)
+
 	def test_file_outside_app_dir_raises(self):
 		for parts in (("other", "x"), ("loose",)):
 			with self.subTest(parts=parts):
@@ -229,6 +245,37 @@ class TestMakeParents(FrappeTestCase):
 		self.assertFalse(os.path.lexists(os.path.join(self.app_dir, "a")))
 		self.assertEqual(sorted(os.listdir(self.app_dir)), APP_DIR_BEFORE)
 		self.assertEqual(os.listdir(self.apps.outside), ["plain.py"])
+
+
+class TestRefuseUnlessCanonical(FrappeTestCase):
+	def setUp(self):
+		self.apps = TempAppsRoot(self)
+		self.app_dir = os.path.join(self.apps.root, "myapp")
+
+	def test_plain_path_accepted(self):
+		for parts in (("ok.py",), ("pkg", "new.py"), ("pkg",)):
+			with self.subTest(parts=parts):
+				self.assertIsNone(file_writer._refuse_unless_canonical(os.path.join(self.app_dir, *parts)))
+		self.assertIsNone(file_writer._refuse_unless_canonical(self.app_dir))
+
+	def test_outside_git_secret_and_symlinked_target_refused(self):
+		cases = {
+			"outside the apps root": os.path.join(self.apps.outside, "plain.py"),
+			"the apps root itself": self.apps.root,
+			"a .git* component": os.path.join(self.app_dir, ".github", "workflows", "x.yml"),
+			"a .git directory": os.path.join(self.app_dir, ".git", "config"),
+			"a secret name": os.path.join(self.app_dir, "site_config.json"),
+			"a symlinked parent": os.path.join(self.app_dir, "dir_out", "plain.py"),
+			"a symlinked ancestor": os.path.join(self.app_dir, "dir_out", "pkg", "new.py"),
+			"a symlinked target file": os.path.join(self.app_dir, "link_out.py"),
+			"a symlinked target directory": os.path.join(self.app_dir, "dir_out"),
+		}
+		for name, full in cases.items():
+			with self.subTest(case=name):
+				with self.assertRaises(ValueError):
+					file_writer._refuse_unless_canonical(full)
+		self.assertEqual(os.listdir(self.apps.outside), ["plain.py"])
+		self.assertEqual(sorted(os.listdir(self.app_dir)), APP_DIR_BEFORE)
 
 
 class TestRemoveEmptyDirs(FrappeTestCase):

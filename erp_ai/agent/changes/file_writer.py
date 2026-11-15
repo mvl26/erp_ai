@@ -21,18 +21,13 @@ def _refuse_git_dir(full_path):
 		raise ValueError("file_writer does not write inside .git")
 
 
-def _refuse_unsafe_path(full_path) -> None:
-	"""Raise ValueError when the path is outside the apps root, has a `.git*` component, or a symlinked parent."""
+def _refuse_unless_canonical(full_path) -> None:
+	"""Raise ValueError unless the one resolver accepts the path and leaves it unchanged (ADR-040 C-2)."""
 	full = os.path.abspath(full_path)
-	rel = os.path.relpath(full, os.path.realpath(source.get_source_root()))
-	parts = PurePath(rel).parts
-	if os.path.isabs(rel) or not parts or parts[0] == os.pardir:
-		raise ValueError("file_writer does not touch paths outside the apps root")
-	if any(part.startswith(GIT_DIR_NAME) for part in parts):
-		raise ValueError("file_writer does not touch .git* paths")
-	parent = os.path.dirname(full)
-	if os.path.realpath(parent) != parent:
-		raise ValueError("file_writer does not touch paths under a symlinked directory")
+	if source.resolve_safe_path(os.path.relpath(full, source.get_source_root())) != full:
+		raise ValueError(
+			"file_writer does not touch this path (outside the apps root, .git*, secret name or symlink)"
+		)
 
 
 def make_parents(full_path, app_dir) -> list[str]:
@@ -51,9 +46,10 @@ def make_parents(full_path, app_dir) -> list[str]:
 			current = os.path.join(current, part)
 			if os.path.lexists(current):
 				continue
+			_refuse_unless_canonical(current)
 			os.mkdir(current, NEW_DIR_MODE)
 			created.append(current)
-			_refuse_unsafe_path(current)
+			_refuse_unless_canonical(current)
 			if os.path.islink(current):
 				raise ValueError("file_writer does not create directories through a symlink")
 	except BaseException:
@@ -70,10 +66,10 @@ def remove_empty_dirs(dirs) -> list[str]:
 	"""Remove the listed directories that are safe and empty, deepest first; skip the rest; return those removed."""
 	removed = []
 	for directory in sorted(dirs, key=lambda d: len(PurePath(os.path.abspath(d)).parts), reverse=True):
-		if os.path.islink(directory) or os.path.realpath(directory) != os.path.abspath(directory):
+		if os.path.islink(directory):
 			continue
 		try:
-			_refuse_unsafe_path(directory)
+			_refuse_unless_canonical(directory)
 		except ValueError:
 			continue
 		if not os.path.isdir(directory) or os.listdir(directory):

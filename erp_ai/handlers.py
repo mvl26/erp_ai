@@ -123,6 +123,46 @@ def ticket_on_update(doc, method=None):
 	_log_decision(doc.name, TRIGGER_HUMAN_CORRECTION, "recorded", "human_changed_classification")
 
 
+def ticket_series_name() -> str | None:
+	"""The `tabSeries` row HD Ticket numbers come from: the text before `.####` of its autoname ("" for ".####").
+
+	None when the autoname is not a plain "<prefix>.####" (date parts, naming series): no counter to keep.
+	"""
+	prefix, dot, hashes = (frappe.get_meta(TICKET_DOCTYPE).autoname or "").rpartition(".")
+	if not dot or not hashes or hashes.strip("#") or "." in prefix:
+		return None
+	return prefix
+
+
+def ticket_number(name: str) -> int | None:
+	"""The counter value a ticket name was made from, or None for a name the counter did not make."""
+	prefix = ticket_series_name()
+	if prefix is None or not name or not name.startswith(prefix):
+		return None
+	digits = name[len(prefix) :]
+	return int(digits) if digits.isdigit() else None
+
+
+def raise_ticket_series(number: int) -> None:
+	"""Move the HD Ticket counter up to `number` when it is lower; never move it down."""
+	series = ticket_series_name()
+	if series is None:
+		return
+	rows = frappe.db.sql("select current from `tabSeries` where name = %s for update", (series,))
+	if not rows:
+		frappe.db.sql("insert into `tabSeries` (name, current) values (%s, %s)", (series, number))
+	elif (rows[0][0] or 0) < number:
+		frappe.db.sql("update `tabSeries` set current = %s where name = %s", (number, series))
+
+
+def ticket_after_delete(doc, method=None):
+	# Frappe's delete_doc moves the counter back when the newest ticket goes (revert_series_if_last).
+	# The ERP AI Log rows of a deleted ticket stay (D7), so a reused name would inherit them: put it back.
+	number = ticket_number(doc.name)
+	if number is not None:
+		raise_ticket_series(number)
+
+
 def comment_after_insert(doc, method=None):
 	# Step 0: this hook fires for every Comment on the site; return before any DB read.
 	if doc.reference_doctype != TICKET_DOCTYPE or doc.comment_type != HUMAN_COMMENT_TYPE:

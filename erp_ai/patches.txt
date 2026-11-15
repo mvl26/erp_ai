@@ -5,3 +5,4 @@
 [post_model_sync]
 # Patches added in this section will be executed after doctypes are migrated
 erp_ai.patches.feat007_unknown_confidence_pct
+erp_ai.patches.feat007_ticket_series_past_logged_tickets

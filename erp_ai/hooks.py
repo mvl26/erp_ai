@@ -144,6 +144,7 @@ doc_events = {
 		"after_insert": "erp_ai.handlers.ticket_after_insert",
 		"validate": "erp_ai.handlers.ticket_validate",
 		"on_update": "erp_ai.handlers.ticket_on_update",
+		"after_delete": "erp_ai.handlers.ticket_after_delete",
 	},
 	"Comment": {
 		"after_insert": "erp_ai.handlers.comment_after_insert",

@@ -1,4 +1,5 @@
 import ast
+import errno
 import inspect
 import os
 import unicodedata
@@ -524,46 +525,55 @@ class TestManuals(FrappeTestCase):
 	def test_unreadable_file_skipped_and_logged(self):
 		"""`design-w1b-fixes-1.md` điểm 2: an `OSError` on one file skips it with one warning; other errors raise."""
 		word = _word("mn")
-		self._manual("a.md", f"# Mục\n{word}\n")
+		self._manual("sub/a.md", f"# Mục\n{word}\n")
 		self._manual("b.md", f"# Mục\n{word}\n")
 		real_open = open
 		marker = "secret-detail-mn"
 
-		def failing_open(names, error_class):
+		def failing_open(names, make_error):
 			def fake(path, *args, **kwargs):
 				if os.path.basename(path) in names:
-					raise error_class(13, marker, path)
+					raise make_error(path)
 				return real_open(path, *args, **kwargs)
 
 			return fake
 
-		def run(names, error_class=PermissionError):
+		def run(names, make_error):
 			logger = patch.object(knowledge.frappe, "logger")
 			with (
 				logger as get_logger,
-				patch.object(knowledge, "open", side_effect=failing_open(names, error_class), create=True),
+				patch.object(knowledge, "open", side_effect=failing_open(names, make_error), create=True),
 			):
 				found = self._found(word)
 			get_logger.assert_called_with(knowledge.source.LOGGER_NAME)
 			calls = get_logger.return_value.warning.call_args_list
 			lines = [call.args[0] % call.args[1:] if call.args[1:] else call.args[0] for call in calls]
 			for line in lines:
-				self.assertIn("PermissionError", line)
 				self.assertNotIn(self.sandbox.root, line)
 				self.assertNotIn(marker, line)
 			return found, lines
 
-		found, lines = run({"a.md"})
-		self.assertEqual(found, [("b.md", 1)])
-		self.assertEqual(len(lines), 1)
-		self.assertIn("a.md", lines[0])
+		errors = {
+			"PermissionError": lambda path: PermissionError(errno.EACCES, marker, path),
+			"FileNotFoundError": lambda path: FileNotFoundError(errno.ENOENT, marker, path),
+			"OSError": lambda path: OSError(errno.EIO, marker, path),
+		}
+		for name, make_error in errors.items():
+			with self.subTest(name):
+				found, lines = run({"a.md"}, make_error)
+				self.assertEqual(found, [("b.md", 1)])
+				self.assertEqual(lines, [f"search_manuals skipped sub/a.md: {name}"])
 
 		with self.subTest("both unreadable"):
-			found, lines = run({"a.md", "b.md"})
+			found, lines = run({"a.md", "b.md"}, errors["PermissionError"])
 			self.assertEqual(found, [])
-			self.assertEqual(len(lines), 2)
-			self.assertIn("a.md", lines[0])
-			self.assertIn("b.md", lines[1])
+			self.assertEqual(
+				lines,
+				[
+					"search_manuals skipped b.md: PermissionError",
+					"search_manuals skipped sub/a.md: PermissionError",
+				],
+			)
 
 		with self.subTest("not an OSError"):
 			with patch.object(knowledge, "open", side_effect=ValueError(marker), create=True):

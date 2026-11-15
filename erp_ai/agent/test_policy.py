@@ -1183,8 +1183,15 @@ class TestExcludedQuery(FrappeTestCase):
 				"Comment": ("reference_doctype", "reference_name"),
 				"Communication": ("reference_doctype", "reference_name"),
 				"File": ("attached_to_doctype", "attached_to_name"),
+				# R10b: the column names of the installed DocType JSON.
+				"ToDo": ("reference_type", "reference_name"),
+				"Notification Log": ("document_type", "document_name"),
+				"Version": ("ref_doctype", "docname"),
+				"Activity Log": ("reference_doctype", "reference_name"),
+				"Email Queue": ("reference_doctype", "reference_name"),
 			},
 		)
+		self.assertEqual(policy.TICKET_PARENT_DOCTYPES, ("Comment", "Communication", "HD Ticket Comment"))
 		self.assertEqual(policy.EXCLUDED_TICKET_REASON, "bản ghi thuộc phiếu không được phép đưa cho AI")
 
 	def test_owning_ticket_per_doctype(self):
@@ -1250,30 +1257,82 @@ class TestExcludedQuery(FrappeTestCase):
 					self.assertEqual(policy.ticket_content_filters(doctype), ([], []))
 
 	def test_ticket_content_filters_shapes(self):
+		# No Comment, Communication or HD Ticket Comment points at these names: the name list is the tickets only.
 		names = ["T-1", "T-2"]
+		owners = ["HD Ticket", "Comment", "Communication", "HD Ticket Comment"]
+		real_fieldnames = policy.ticket_link_fieldnames
 		with patch.object(policy, "excluded_ticket_names", return_value=names):
 			self.assertEqual(policy.ticket_content_filters("HD Ticket"), ([["name", "not in", names]], []))
-			self.assertEqual(
-				policy.ticket_content_filters("Comment"),
-				([], [["reference_doctype", "!=", "HD Ticket"], ["reference_name", "not in", names]]),
-			)
-			self.assertEqual(
-				policy.ticket_content_filters("File"),
-				([], [["attached_to_doctype", "!=", "HD Ticket"], ["attached_to_name", "not in", names]]),
-			)
+			for doctype, (type_column, name_column) in (
+				("Comment", ("reference_doctype", "reference_name")),
+				("File", ("attached_to_doctype", "attached_to_name")),
+				("ToDo", ("reference_type", "reference_name")),
+				("Version", ("ref_doctype", "docname")),
+			):
+				with self.subTest(doctype=doctype):
+					self.assertEqual(
+						policy.ticket_content_filters(doctype),
+						([], [[type_column, "not in", owners], [name_column, "not in", names]]),
+					)
 			self.assertEqual(policy.ticket_content_filters("Task"), ([["ai_ticket", "not in", names]], []))
 			self.assertEqual(
 				policy.ticket_content_filters("HD Ticket Comment"),
 				([["reference_ticket", "not in", names]], []),
 			)
-			with patch.object(policy, "ticket_link_fieldnames", return_value=("custom_ticket",)):
+			# A stub column on File only: the parent DocTypes are queried on their real columns.
+			with patch.object(
+				policy,
+				"ticket_link_fieldnames",
+				side_effect=lambda doctype: ("custom_ticket",)
+				if doctype == "File"
+				else real_fieldnames(doctype),
+			):
 				self.assertEqual(
-					policy.ticket_content_filters("Comment"),
+					policy.ticket_content_filters("File"),
 					(
 						[["custom_ticket", "not in", names]],
-						[["reference_doctype", "!=", "HD Ticket"], ["reference_name", "not in", names]],
+						[["attached_to_doctype", "not in", owners], ["attached_to_name", "not in", names]],
 					),
 				)
+
+	def test_record_on_a_ticket_comment_or_communication_belongs_to_the_ticket(self):
+		# R10a: one hop more through Comment, Communication and HD Ticket Comment, no deeper; R10b: ToDo names its
+		# ticket by its own pair.
+		set_agent_settings(excluded_teams=TEAM, excluded_title_prefixes="")
+		excluded = self._ticket(agent_group=TEAM)
+		comment = self._comment(excluded)
+		communication = self._communication(excluded)
+		legacy = self._legacy_comment(excluded)
+		on_comment = self._comment(comment, "Comment")
+		todo = frappe.get_doc(
+			{
+				"doctype": "ToDo",
+				"description": "ERPAI-TEST",
+				"reference_type": "HD Ticket",
+				"reference_name": excluded,
+			}
+		)
+		todo.db_insert()
+		for doctype, name in (
+			("File", self._file("Comment", comment)),
+			("File", self._file("Communication", communication)),
+			("File", self._file("HD Ticket Comment", legacy)),
+			("Comment", on_comment),
+			("ToDo", todo.name),
+		):
+			with self.subTest(doctype=doctype):
+				self.assertEqual(policy.owning_ticket(doctype, name), excluded)
+				self.assertTrue(policy.is_ticket_record_excluded(doctype, name))
+		self.assertIsNone(policy.owning_ticket("File", self._file("Comment", on_comment)))
+		filters, or_filters = policy.ticket_content_filters("File")
+		self.assertEqual(filters, [])
+		self.assertEqual(
+			or_filters[0],
+			["attached_to_doctype", "not in", ["HD Ticket", "Comment", "Communication", "HD Ticket Comment"]],
+		)
+		self.assertEqual(or_filters[1][:2], ["attached_to_name", "not in"])
+		self.assertLessEqual({excluded, comment, communication, legacy}, set(or_filters[1][2]))
+		self.assertNotIn(on_comment, or_filters[1][2])
 
 	def test_is_ticket_record_excluded_follows_the_owning_ticket(self):
 		set_agent_settings(excluded_teams=TEAM, excluded_title_prefixes="")

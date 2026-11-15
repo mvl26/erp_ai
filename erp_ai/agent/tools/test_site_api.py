@@ -1702,7 +1702,22 @@ LIST_FIELDS = {
 	"File": ["name", "file_name"],
 	LEGACY_NOTE_DOCTYPE: ["name", "content"],
 	"Task": ["name", "subject", "ai_ticket"],
+	"ToDo": ["name", "description"],
+	"Notification Log": ["name", "subject"],
+	"Version": ["name", "data"],
+	"Activity Log": ["name", "subject"],
+	"Email Queue": ["name", "message"],
 }
+# R10b: DocTypes outside TICKET_CONTENT_DOCTYPES that name a ticket by a dynamic pair, with the column names of the
+# installed DocType JSON: `{doctype: (type column, name column, column holding the text)}`.
+LINKED_DOCTYPES = {
+	"ToDo": ("reference_type", "reference_name", "description"),
+	"Notification Log": ("document_type", "document_name", "subject"),
+	"Version": ("ref_doctype", "docname", "data"),
+	"Activity Log": ("reference_doctype", "reference_name", "subject"),
+	"Email Queue": ("reference_doctype", "reference_name", "message"),
+}
+DELETED_DOCUMENT = "Deleted Document"
 
 
 def _db_insert(values):
@@ -1762,13 +1777,13 @@ class _ExcludedTicketCase(FrappeTestCase):
 			}
 		)
 
-	def file(self, ticket, text):
+	def file(self, owner, text, attached_to_doctype="HD Ticket"):
 		doc = frappe.get_doc(
 			{
 				"doctype": "File",
 				"file_name": f"{text}.txt",
-				"attached_to_doctype": "HD Ticket",
-				"attached_to_name": ticket,
+				"attached_to_doctype": attached_to_doctype,
+				"attached_to_name": owner,
 				"is_private": 1,
 				"content": f"{text} {uuid.uuid4().hex}",
 			}
@@ -1995,6 +2010,85 @@ class TestExcludedTicketReads(_ExcludedTicketCase):
 					)
 					self.assertEqual(listed, [via_static_normal])
 
+	def assert_follows_the_ticket(self, made):
+		"""`made` is `{kind: {label: (doctype, name)}}` for an excluded and a normal ticket: in both modes the
+		excluded record is refused by get and absent from the list, the normal one is returned by both."""
+		for unrestricted in (False, True):
+			context = _context(unrestricted=unrestricted)
+			for label, (doctype, normal) in made["normal"].items():
+				excluded = made["team"][label][1]
+				with self.subTest(unrestricted=unrestricted, record=label):
+					result = site_api.get_record({"doctype": doctype, "name": excluded}, context)
+					self.assertEqual(
+						result, {"ok": False, "reason": policy.EXCLUDED_TICKET_REASON, "doctype": doctype}
+					)
+					result = site_api.get_record({"doctype": doctype, "name": normal}, context)
+					self.assertTrue(result["ok"], result)
+					self.assert_no_seed(result)
+					listed = self.listed(doctype, [["name", "in", [normal, excluded]]], unrestricted)
+					self.assertEqual(listed, [normal])
+
+	def test_record_on_a_comment_or_communication_of_the_ticket_follows_the_ticket(self):
+		# R10a: Helpdesk keeps agent-only comment attachments on the Comment and email attachments on the
+		# Communication; Frappe points an "Attachment" Comment at its Comment (reference_doctype=Comment).
+		made = {}
+		for kind, text in (("team", self.seed), ("normal", self.plain)):
+			parents = self.records(self.ticket(kind, text), text)
+			made[kind] = {
+				"File on Comment": ("File", self.file(parents["Comment"], text, "Comment")),
+				"File on Communication": ("File", self.file(parents["Communication"], text, "Communication")),
+				"File on HD Ticket Comment": (
+					"File",
+					self.file(parents[LEGACY_NOTE_DOCTYPE], text, LEGACY_NOTE_DOCTYPE),
+				),
+				"Comment on Comment": (
+					"Comment",
+					self.comment(parents["Comment"], text, "Comment", comment_type="Attachment"),
+				),
+			}
+		self.assert_follows_the_ticket(made)
+
+	def test_rows_of_the_other_dynamic_link_doctypes_follow_the_ticket(self):
+		# R10b: a mention notification, an assignment, a version, an activity and a queued email of a ticket.
+		tickets = {"team": self.ticket("team", self.seed), "normal": self.ticket("normal", self.plain)}
+		made = {"team": {}, "normal": {}}
+		for doctype, (type_column, name_column, text_column) in LINKED_DOCTYPES.items():
+			for kind, ticket in tickets.items():
+				text = self.seed if kind == "team" else self.plain
+				row = {"doctype": doctype, type_column: "HD Ticket", name_column: ticket, text_column: text}
+				made[kind][doctype] = (doctype, _db_insert(row))
+		self.assert_follows_the_ticket(made)
+
+	def test_deleted_document_closed_in_both_modes(self):
+		# R10b: a Deleted Document holds a whole deleted record, a ticket of an excluded team included.
+		data = json.dumps({"doctype": "HD Ticket", "subject": self.seed})
+		deleted = _db_insert(
+			{"doctype": DELETED_DOCUMENT, "deleted_doctype": "HD Ticket", "deleted_name": "1", "data": data}
+		)
+		calls = (
+			(site_api.list_records, {"doctype": DELETED_DOCUMENT, "fields": ["name", "data"]}),
+			(site_api.get_record, {"doctype": DELETED_DOCUMENT, "name": deleted}),
+			(site_api.create_record, {"doctype": DELETED_DOCUMENT, "values": {"data": data}}),
+			(
+				site_api.update_record,
+				{"doctype": DELETED_DOCUMENT, "name": deleted, "values": {"data": "{}"}},
+			),
+			(site_api.delete_record, {"doctype": DELETED_DOCUMENT, "name": deleted}),
+			(site_api.submit_record, {"doctype": DELETED_DOCUMENT, "name": deleted, "action": "submit"}),
+		)
+		for unrestricted in (False, True):
+			for handler, arguments in calls:
+				# Stubbed so that a write the tool lets through changes nothing.
+				with (
+					self.subTest(unrestricted=unrestricted, tool=handler.__name__),
+					patch.object(site_api, "_write") as write,
+				):
+					result = handler(arguments, _context(unrestricted=unrestricted))
+					self.assertEqual(
+						result, {"ok": False, "reason": PERMISSION_REFUSAL, "doctype": DELETED_DOCUMENT}
+					)
+					write.assert_not_called()
+
 	def test_record_tools_granted_when_switch_on(self):
 		inputs = registry.GrantInputs("L3", "L3", True, PermissionSwitches(record_tools=True))
 		self.assertLessEqual({"api_list_records", "api_get_record"}, registry.grant(inputs).names())
@@ -2113,6 +2207,7 @@ class TestExcludedTicketWrites(_ExcludedTicketCase):
 PERMISSION_REFUSAL = "DocType này không được phép dùng qua công cụ"
 # Written out by hand so a change of the constant's text fails here (C-6).
 PERMLEVEL_REFUSAL = "Property Setter đổi permlevel là sửa phân quyền, không làm qua công cụ"
+TICKET_LINK_SCHEMA_REFUSAL = "Custom Field / Property Setter đổi trường liên kết tới phiếu là gỡ chặn phiếu loại trừ, không làm qua công cụ"
 # Fields of Note that the Property Setters of these tests change; the stored setter and the new ones never share one.
 SETTER_FIELD = "content"
 STORED_SETTER_FIELD = "title"
@@ -2338,6 +2433,137 @@ class TestPermissionVectors(FrappeTestCase):
 		):
 			with self.subTest(doctype=doctype, values=values, name=name):
 				self.assertEqual(site_api.permlevel_refusal(doctype, values, name=name), reason)
+
+	def test_customize_form_refused_in_normal_mode(self):
+		# R10d: Customize Form saves Property Setters, permlevel ones included.
+		for tool, arguments in (
+			(
+				"api_update_record",
+				{"doctype": "Customize Form", "name": "Customize Form", "values": {"doc_type": "Note"}},
+			),
+			("api_create_record", {"doctype": "Customize Form", "values": {"doc_type": "Note"}}),
+		):
+			with self.subTest(tool), patch.object(site_api, "_write") as write:
+				self.assert_refused(self.run_tool(tool, arguments), PERMISSION_REFUSAL, "Customize Form")
+				write.assert_not_called()
+
+	def ticket_link_field(self):
+		"""The Custom Field Task.ai_ticket that erp_ai installs (test_install pins it)."""
+		field = frappe.db.get_value(
+			"Custom Field",
+			{"dt": "Task", "fieldname": "ai_ticket", "fieldtype": "Link", "options": "HD Ticket"},
+		)
+		self.assertTrue(field, "Custom Field Task.ai_ticket of erp_ai is missing")
+		return field
+
+	def test_ticket_link_schema_change_refused_in_both_modes(self):
+		# R10c: policy reads the fields that point at a ticket from the live schema; changing the type or options
+		# of one, or moving, renaming or deleting its Custom Field, would lift the exclusion. A Custom Field save
+		# runs ALTER TABLE and a Property Setter clears the shared meta cache: the write is stubbed, the refusal
+		# has to come before it.
+		field = self.ticket_link_field()
+		# A setter that already targets the field and changes nothing, saved without hooks so no cache is touched.
+		stored_setter = _db_insert(
+			{
+				"doctype": "Property Setter",
+				"name": f"{NOTE_TITLE} ai_ticket {uuid.uuid4().hex}",
+				"doctype_or_field": "DocField",
+				"doc_type": "Task",
+				"field_name": "ai_ticket",
+				"property": "options",
+				"value": "HD Ticket",
+				"property_type": "Text",
+			}
+		)
+
+		def setter(doc_type, field_name, prop, value):
+			values = {"doc_type": doc_type, "field_name": field_name, "property": prop, "value": value}
+			return {"doctype": "Property Setter", "values": {"doctype_or_field": "DocField", **values}}
+
+		writes = {
+			"setter options of Task.ai_ticket": (
+				"api_create_record",
+				setter("Task", "ai_ticket", "options", "ToDo"),
+			),
+			"setter fieldtype of Task.ai_ticket, other spelling": (
+				"api_create_record",
+				setter("task", "AI_Ticket", " FieldType ", "Data"),
+			),
+			"setter options of HD Ticket Comment.reference_ticket": (
+				"api_create_record",
+				setter("HD Ticket Comment", "reference_ticket", "options", "ToDo"),
+			),
+			"setter options of the dynamic pair Comment.reference_doctype": (
+				"api_create_record",
+				setter("Comment", "reference_doctype", "options", "Role"),
+			),
+			"stored setter of Task.ai_ticket, new value": (
+				"api_update_record",
+				{"doctype": "Property Setter", "name": stored_setter, "values": {"value": "ToDo"}},
+			),
+			"Custom Field options": (
+				"api_update_record",
+				{"doctype": "Custom Field", "name": field, "values": {"options": "ToDo"}},
+			),
+			"Custom Field fieldtype": (
+				"api_update_record",
+				{"doctype": "Custom Field", "name": field, "values": {"fieldtype": "Data"}},
+			),
+			"Custom Field renamed": (
+				"api_update_record",
+				{"doctype": "Custom Field", "name": field, "values": {"fieldname": "ai_ticket_cu"}},
+			),
+			"Custom Field that redefines Task.ai_ticket": (
+				"api_create_record",
+				{
+					"doctype": "Custom Field",
+					"values": {
+						"dt": "Task",
+						"fieldname": "ai_ticket",
+						"label": "SITEAPI ai_ticket",
+						"fieldtype": "Data",
+						"insert_after": "subject",
+					},
+				},
+			),
+		}
+		unrestricted_writes = {
+			"Custom Field deleted": ("api_delete_record", {"doctype": "Custom Field", "name": field}),
+			"stored setter deleted": (
+				"api_delete_record",
+				{"doctype": "Property Setter", "name": stored_setter},
+			),
+		}
+		normal = _context()
+		unrestricted = _context(level="L1", change_enabled=False, unrestricted=True)
+		for context, calls in ((normal, writes), (unrestricted, {**writes, **unrestricted_writes})):
+			for label, (tool, arguments) in calls.items():
+				with (
+					self.subTest(label, unrestricted=context.unrestricted),
+					patch.object(site_api, "_write") as write,
+				):
+					result = self.run_tool(tool, arguments, context)
+					self.assert_refused(result, TICKET_LINK_SCHEMA_REFUSAL, arguments["doctype"])
+					write.assert_not_called()
+
+	def test_schema_write_on_other_fields_still_allowed(self):
+		# R10c targets the fields that point at a ticket and their type and options only.
+		before = self.setter_count()
+		values = self.setter_values("options", "SITEAPI", "Text")
+		result = self.run_tool("api_create_record", {"doctype": "Property Setter", "values": values})
+		self.assertTrue(result["ok"], result)
+		self.assertEqual(self.setter_count(), before + 1)
+		field = self.ticket_link_field()
+		for doctype, values, name in (
+			("Custom Field", {"label": "SITEAPI nhãn"}, field),
+			("Custom Field", {"fieldtype": "Link", "options": "HD Ticket", "fieldname": "ai_ticket"}, field),
+			("Custom Field", {"dt": "Task", "fieldname": "siteapi_other", "fieldtype": "Data"}, None),
+			("Property Setter", {"doc_type": "Task", "field_name": "ai_ticket", "property": "label"}, None),
+			("Property Setter", {"doc_type": "Task", "field_name": "status", "property": "options"}, None),
+			("Note", {"options": "ToDo"}, None),
+		):
+			with self.subTest(doctype=doctype, values=values, name=name):
+				self.assertIsNone(site_api.ticket_link_schema_refusal(doctype, values, name=name))
 
 	def test_business_role_assignment_still_works(self):
 		# Role assignment stays a right of the record tools switch: only the six admin roles are refused.

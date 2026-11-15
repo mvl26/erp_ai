@@ -1549,6 +1549,7 @@ class TestProposeBlock(FrappeTestCase):
 			([{"command": "version"}, {"command": "build"}], "lệnh 2: lệnh build cần app"),
 			([{"command": "migrate", "app": APP}], "lệnh 1: lệnh này không nhận app"),
 			([{"command": "version", "extra": 1}], "tham số không hợp lệ: commands"),
+			([{"app": APP}], "tham số không hợp lệ: commands"),
 			(["version"], "tham số không hợp lệ: commands"),
 			({"command": "version"}, "tham số không hợp lệ: commands"),
 		)

@@ -2115,6 +2115,24 @@ def check_decide_reads_one_click_switch_before_signature(sources: dict) -> list:
 	return []
 
 
+RUN_LOG_FILE = "agent/run_log.py"
+
+
+def check_action_entries_built_only_in_run_log(sources: dict) -> list:
+	"""FEAT-007 U3 3.1, ADR-033 Ràng buộc: no dict literal with the keys "tool" and "ok" (an action entry)
+	outside `agent/run_log.py`; the entry is built by `run_log.action_entry` and nowhere else."""
+	found = []
+	for rel, source in only_python(sources).items():
+		if rel == RUN_LOG_FILE:
+			continue
+		for node in ast.walk(parse(rel, source)):
+			if isinstance(node, ast.Dict):
+				keys = {key.value for key in node.keys if isinstance(key, ast.Constant)}
+				if {"tool", "ok"} <= keys:
+					found.append(f"{rel}:{node.lineno}: hand-built action entry (use run_log.action_entry)")
+	return found
+
+
 def check_comment_signs_only_when_one_click(sources: dict) -> list:
 	"""FEAT-007 U3 3.4: `propose_change._comment` calls `change_link.decision_path` only inside a branch
 	whose test reads `one_click_approval`."""
@@ -5568,6 +5586,17 @@ class TestArchitecture(unittest.TestCase):
 			with self.subTest(fragment=fragment):
 				found = check_decide_reads_one_click_switch_before_signature({CHANGE_DECISION_FILE: source})
 				self.assertTrue(found and fragment in found[0], found)
+
+	def test_action_entries_built_only_in_run_log(self):
+		scanned = load_product_sources()
+		self.assertEqual(check_action_entries_built_only_in_run_log(scanned), [])
+		hand_built = 'entry = {"tool": "x", "doctype": None, "name": "n", "ok": True}\n'
+		found = check_action_entries_built_only_in_run_log({"agent/runner.py": hand_built})
+		self.assertTrue(found and "agent/runner.py:1" in found[0], found)
+		self.assertEqual(check_action_entries_built_only_in_run_log({RUN_LOG_FILE: hand_built}), [])
+		self.assertEqual(
+			check_action_entries_built_only_in_run_log({"agent/x.py": 'schema = {"tool": 1}\n'}), []
+		)
 
 	def test_policy_does_not_import_run_log(self):
 		scanned = load_product_sources(suffixes=(".py", ".json"))

@@ -621,6 +621,26 @@ class TestWriteEntry(_RollbackCase):
 			)
 		self.assertEqual(frappe.db.get_value(LOG_DOCTYPE, name, "site_environment"), "production")
 
+	def test_hand_built_entry_rejected(self):
+		good = run_log.action_entry("set_classification", "HD Ticket", "1", True)
+		missing = {key: value for key, value in good.items() if key != "value_before"}
+		before = frappe.db.count(LOG_DOCTYPE)
+		for shape, actions in (
+			("missing value_before", [missing]),
+			("old four keys", [{"tool": "t", "doctype": None, "name": None, "ok": True}]),
+			("one good, one hand-built", [good, missing]),
+			("not a dict", [good, "x"]),
+		):
+			with self.subTest(shape=shape), self.assertRaises(ValueError):
+				run_log.write_entry(
+					run_id="ERPAI-TEST-hand", entry_type="reason", trigger="comment_mention", actions=actions
+				)
+		self.assertEqual(frappe.db.count(LOG_DOCTYPE), before)
+		name = run_log.write_entry(
+			run_id="ERPAI-TEST-hand", entry_type="reason", trigger="comment_mention", actions=[good]
+		)
+		self.assertEqual(json.loads(frappe.db.get_value(LOG_DOCTYPE, name, "actions")), [good])
+
 
 class TestBotAction(_RollbackCase):
 	def _write(self, **fields):

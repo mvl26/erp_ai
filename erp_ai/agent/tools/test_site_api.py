@@ -1,16 +1,20 @@
 import datetime
 import json
+import os
+import uuid
 from decimal import Decimal
 from unittest.mock import patch
 
 import frappe
 from frappe.tests.utils import FrappeTestCase
+from helpdesk.test_utils import make_ticket
 
-from erp_ai.agent import change_link
+from erp_ai.agent import change_link, policy
 from erp_ai.agent.policy import PermissionSwitches
 from erp_ai.agent.tools import registry, site_api
 from erp_ai.agent.tools.registry import ToolContext, execute_tool, get_tool_schemas
-from erp_ai.constants import ROLE_AGENT, ROLE_INSTRUCTOR
+from erp_ai.constants import ROLE_AGENT, ROLE_INSTRUCTOR, TICKET_CONTENT_DOCTYPES
+from erp_ai.test_utils import keep_agent_settings, make_log_entry, set_agent_settings
 
 AGENT = "siteapi.agent@example.com"
 PLAIN_AGENT = "siteapi.plain@example.com"
@@ -1681,3 +1685,139 @@ class TestSiteApiChildSecretsAtRealCut(FrappeTestCase):
 		self.assertEqual(shown, '[{"name": "r1", "api_key": "[đã ẩn]", "label": "' + "x" * 152)
 		self.assertEqual(len(shown), 200)
 		self.assertEqual(shown.count(FAKE_CHILD_KEY), 0)
+
+
+U2_TEAM = "U2 Nhân sự loại trừ"
+U2_PREFIX = "[HR]"
+EXCLUDED_KINDS = ("team", "opt_out", "title", "classified")
+# The 4 DocTypes of TICKET_CONTENT_DOCTYPES plus Helpdesk's legacy ticket note DocType.
+LEGACY_NOTE_DOCTYPE = "HD Ticket Comment"
+CONTENT_DOCTYPES = (*TICKET_CONTENT_DOCTYPES, LEGACY_NOTE_DOCTYPE)
+
+
+def _db_insert(values):
+	"""Insert the row without hooks or notifications and return its name."""
+	doc = frappe.get_doc(values)
+	doc.db_insert()
+	return doc.name
+
+
+class _ExcludedTicketCase(FrappeTestCase):
+	"""A ticket of every exclusion rule plus a normal one, each with a record of every ticket content DocType.
+
+	The session user is Administrator, who reads every row: only the exclusion can hide or refuse one."""
+
+	def setUp(self):
+		# Runs after the rollback: HD Team.after_insert caches an Assignment Rule in Redis.
+		self.addCleanup(frappe.cache.hdel, "assignment_rule_map", "HD Ticket")
+		commit_guard = patch.object(frappe.db, "commit", side_effect=AssertionError("commit in test"))
+		commit_guard.start()
+		self.addCleanup(commit_guard.stop)
+		self.addCleanup(frappe.db.rollback)
+		self.addCleanup(frappe.set_user, "Administrator")
+		frappe.set_user("Administrator")
+		keep_agent_settings(self)
+		set_agent_settings(enabled=0, excluded_teams=U2_TEAM, excluded_title_prefixes=U2_PREFIX)
+		if not frappe.db.exists("HD Team", U2_TEAM):
+			frappe.get_doc(
+				{"doctype": "HD Team", "team_name": U2_TEAM, "users": [{"user": "Administrator"}]}
+			).insert(ignore_permissions=True)
+		self.seed = f"U2-SEED-{uuid.uuid4().hex}"
+		self.plain = f"U2-THUONG-{uuid.uuid4().hex}"
+
+	def ticket(self, kind, text):
+		"""A ticket refused by the rule `kind` (or a normal one) holding `text` in its subject and description."""
+		subject = f"{U2_PREFIX} {text}" if kind == "title" else f"{text} {kind}"
+		name = make_ticket(subject=subject, description=f"<p>{text}</p>").name
+		if kind == "team":
+			frappe.db.set_value("HD Ticket", name, "agent_group", U2_TEAM)
+		elif kind == "opt_out":
+			frappe.db.set_value("HD Ticket", name, "ai_opt_out", 1)
+		elif kind == "classified":
+			make_log_entry(
+				ticket=name, entry_type="classify", stop_reason=policy.EXCLUDED_BY_CLASSIFICATION, applied=0
+			)
+		self.assertEqual(policy.send_refusal(name) is None, kind == "normal", kind)
+		return name
+
+	def comment(self, ticket, text, reference_doctype="HD Ticket", **values):
+		return _db_insert(
+			{
+				"doctype": "Comment",
+				"comment_type": "Comment",
+				"reference_doctype": reference_doctype,
+				"reference_name": ticket,
+				"content": text,
+				**values,
+			}
+		)
+
+	def file(self, ticket, text):
+		doc = frappe.get_doc(
+			{
+				"doctype": "File",
+				"file_name": f"{text}.txt",
+				"attached_to_doctype": "HD Ticket",
+				"attached_to_name": ticket,
+				"is_private": 1,
+				"content": f"{text} {uuid.uuid4().hex}",
+			}
+		).insert(ignore_permissions=True)
+		physical = doc.get_full_path()
+		self.addCleanup(lambda: os.path.exists(physical) and os.remove(physical))
+		return doc.name
+
+	def records(self, ticket, text):
+		"""`{doctype: name}`: the ticket and one record of every other DocType of CONTENT_DOCTYPES on it."""
+		communication = {
+			"doctype": "Communication",
+			"communication_type": "Communication",
+			"communication_medium": "Email",
+			"sent_or_received": "Sent",
+			"reference_doctype": "HD Ticket",
+			"reference_name": ticket,
+			"subject": text,
+			"content": text,
+		}
+		return {
+			"HD Ticket": ticket,
+			"Comment": self.comment(ticket, text),
+			"Communication": _db_insert(communication),
+			"File": self.file(ticket, text),
+			LEGACY_NOTE_DOCTYPE: _db_insert(
+				{"doctype": LEGACY_NOTE_DOCTYPE, "reference_ticket": ticket, "content": text}
+			),
+		}
+
+	def make_tickets(self):
+		"""`{kind: {doctype: name}}` for every exclusion rule and the normal ticket; only the normal one is
+		free of the seed."""
+		made = {}
+		for kind in (*EXCLUDED_KINDS, "normal"):
+			text = self.plain if kind == "normal" else self.seed
+			made[kind] = self.records(self.ticket(kind, text), text)
+		self.assertEqual(sorted(made["normal"]), sorted(CONTENT_DOCTYPES))
+		return made
+
+	def assert_no_seed(self, result):
+		self.assertEqual(json.dumps(result, ensure_ascii=False, default=str).count(self.seed), 0, result)
+
+
+class TestExcludedTicketReads(_ExcludedTicketCase):
+	def test_get_refuses_excluded_record_in_both_modes(self):
+		made = self.make_tickets()
+		for unrestricted in (False, True):
+			context = _context(unrestricted=unrestricted)
+			for kind, records in made.items():
+				for doctype, name in records.items():
+					with self.subTest(unrestricted=unrestricted, kind=kind, doctype=doctype):
+						result = site_api.get_record({"doctype": doctype, "name": name}, context)
+						self.assert_no_seed(result)
+						if kind == "normal":
+							self.assertTrue(result["ok"], result)
+							self.assertEqual(str(result["record"]["name"]), str(name))
+						else:
+							self.assertEqual(
+								result,
+								{"ok": False, "reason": policy.EXCLUDED_TICKET_REASON, "doctype": doctype},
+							)

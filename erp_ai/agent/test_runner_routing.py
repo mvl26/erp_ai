@@ -56,14 +56,24 @@ ROUTE_TEAM = f"{PREFIX}route-team"
 SCORE_FIELDS = ("ai_complexity", "ai_importance", "ai_score_reason")
 SCORE_REASON = f"{PREFIX}lý do chấm điểm"
 CLASSIFY_B2 = json.dumps(
-	{"dau_muc": "B", "do_tin_cay": "Cao", "ly_do": "x", "do_phuc_tap": 1, "do_quan_trong": 2}
+	{
+		"dau_muc": "B",
+		"do_tin_cay": "Cao",
+		"do_tin_cay_pct": 90,
+		"ly_do": "x",
+		"do_phuc_tap": 1,
+		"do_quan_trong": 2,
+	}
 )
-CLASSIFY_E_NO_DEPARTMENT = json.dumps({"dau_muc": "E", "do_tin_cay": "Cao", "ly_do": "x"})
+CLASSIFY_E_NO_DEPARTMENT = json.dumps(
+	{"dau_muc": "E", "do_tin_cay": "Cao", "do_tin_cay_pct": 90, "ly_do": "x"}
+)
 SLA_DOCTYPE = "HD Service Level Agreement"
 CLASSIFY_SCORED = json.dumps(
 	{
 		"dau_muc": "A",
 		"do_tin_cay": "Cao",
+		"do_tin_cay_pct": 90,
 		"ly_do": "x",
 		"do_phuc_tap": 2,
 		"do_quan_trong": 3,
@@ -74,6 +84,7 @@ CLASSIFY_C = json.dumps(
 	{
 		"dau_muc": "C",
 		"do_tin_cay": "Cao",
+		"do_tin_cay_pct": 90,
 		"ly_do": "x",
 		"do_phuc_tap": 2,
 		"do_quan_trong": 3,
@@ -84,6 +95,7 @@ CLASSIFY_A2 = json.dumps(
 	{
 		"dau_muc": "A",
 		"do_tin_cay": "Cao",
+		"do_tin_cay_pct": 90,
 		"ly_do": "x",
 		"do_phuc_tap": 1,
 		"do_quan_trong": 2,

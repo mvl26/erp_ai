@@ -63,7 +63,7 @@ from erp_ai.test_utils import (
 )
 
 PREFIX = "ERPAI-TEST-"
-CLASSIFY_A = json.dumps({"dau_muc": "A", "do_tin_cay": "Cao", "ly_do": "x"})
+CLASSIFY_A = json.dumps({"dau_muc": "A", "do_tin_cay": "Cao", "do_tin_cay_pct": 90, "ly_do": "x"})
 TICKET_FIELDS = [
 	"ticket_type",
 	"agent_group",

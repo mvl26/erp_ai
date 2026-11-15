@@ -656,7 +656,7 @@
    "fieldtype": "Long Text",
    "label": "Ghi đè prompt phân loại",
    "ignore_xss_filter": 1,
-   "description": "Để trống = dùng bản dựng sẵn. Nội dung thay bước phân loại; phải có các mục bắt buộc là 11 khóa JSON \"dau_muc\", \"do_tin_cay\", \"ly_do\", \"nhom\", \"uu_tien\", \"can_tach\", \"cac_yeu_cau\", \"do_phuc_tap\", \"do_quan_trong\", \"ly_do_diem\", \"bo_phan\" và ≤ 20000 ký tự. Các câu cấm và khối năm quyền không bị ghi đè. Mỗi lần sửa được lưu vào Lịch sử ghi đè prompt."
+   "description": "Để trống = dùng bản dựng sẵn. Nội dung thay bước phân loại; phải có các mục bắt buộc là 12 khóa JSON \"dau_muc\", \"do_tin_cay\", \"do_tin_cay_pct\", \"ly_do\", \"nhom\", \"uu_tien\", \"can_tach\", \"cac_yeu_cau\", \"do_phuc_tap\", \"do_quan_trong\", \"ly_do_diem\", \"bo_phan\" và ≤ 20000 ký tự. Các câu cấm và khối năm quyền không bị ghi đè. Mỗi lần sửa được lưu vào Lịch sử ghi đè prompt."
   },
   {
    "fieldname": "prompt_override_reasoning",
@@ -709,7 +709,7 @@
  ],
  "issingle": 1,
  "links": [],
- "modified": "2026-11-15 16:00:00.000000",
+ "modified": "2026-11-15 17:00:00.000000",
  "modified_by": "Administrator",
  "module": "ERP AI agent",
  "name": "ERP AI Setting",

@@ -520,3 +520,52 @@ class TestManuals(FrappeTestCase):
 		self.assertEqual(row["heading"], "Lỗi in")
 		self.assertTrue(unicodedata.is_normalized("NFC", row["excerpt"]))
 		self.assertEqual(self._search(f"ma{suffix}"), [])
+
+	def test_unreadable_file_skipped_and_logged(self):
+		"""`design-w1b-fixes-1.md` điểm 2: an `OSError` on one file skips it with one warning; other errors raise."""
+		word = _word("mn")
+		self._manual("a.md", f"# Mục\n{word}\n")
+		self._manual("b.md", f"# Mục\n{word}\n")
+		real_open = open
+		marker = "secret-detail-mn"
+
+		def failing_open(names, error_class):
+			def fake(path, *args, **kwargs):
+				if os.path.basename(path) in names:
+					raise error_class(13, marker, path)
+				return real_open(path, *args, **kwargs)
+
+			return fake
+
+		def run(names, error_class=PermissionError):
+			logger = patch.object(knowledge.frappe, "logger")
+			with (
+				logger as get_logger,
+				patch.object(knowledge, "open", side_effect=failing_open(names, error_class), create=True),
+			):
+				found = self._found(word)
+			get_logger.assert_called_with(knowledge.source.LOGGER_NAME)
+			calls = get_logger.return_value.warning.call_args_list
+			lines = [call.args[0] % call.args[1:] if call.args[1:] else call.args[0] for call in calls]
+			for line in lines:
+				self.assertIn("PermissionError", line)
+				self.assertNotIn(self.sandbox.root, line)
+				self.assertNotIn(marker, line)
+			return found, lines
+
+		found, lines = run({"a.md"})
+		self.assertEqual(found, [("b.md", 1)])
+		self.assertEqual(len(lines), 1)
+		self.assertIn("a.md", lines[0])
+
+		with self.subTest("both unreadable"):
+			found, lines = run({"a.md", "b.md"})
+			self.assertEqual(found, [])
+			self.assertEqual(len(lines), 2)
+			self.assertIn("a.md", lines[0])
+			self.assertIn("b.md", lines[1])
+
+		with self.subTest("not an OSError"):
+			with patch.object(knowledge, "open", side_effect=ValueError(marker), create=True):
+				with self.assertRaises(ValueError):
+					self._found(word)

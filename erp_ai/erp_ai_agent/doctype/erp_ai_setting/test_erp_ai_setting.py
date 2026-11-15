@@ -2264,6 +2264,7 @@ PROMPT_PARTS = {
 		(
 			'"dau_muc"',
 			'"do_tin_cay"',
+			'"do_tin_cay_pct"',
 			'"ly_do"',
 			'"nhom"',
 			'"uu_tien"',
@@ -2527,7 +2528,7 @@ class TestPromptOverrides(FrappeTestCase):
 				self.assertIn(f'frm.set_df_property("prompt_revisions", "{flag}", 1);', script)
 
 	def test_required_markers_match_design(self):
-		# design.md:314-316 and the plan.md risk row: classify holds exactly the 11 keys ("do_tin_cay_pct" is U1's).
+		# design.md:314-316, U1.md:249-253 (T72): classify holds exactly the 12 keys, "do_tin_cay_pct" right after "do_tin_cay".
 		self.assertEqual(getattr(erp_ai_setting, "PROMPT_OVERRIDE_MAX_CHARS", None), PROMPT_MAX_CHARS)
 		self.assertEqual(
 			getattr(erp_ai_setting, "PROMPT_REQUIRED_MARKERS", None),

@@ -10,7 +10,13 @@ from helpdesk.test_utils import create_agent, make_ticket
 
 from erp_ai.agent.policy import PermissionSwitches
 from erp_ai.agent.tools import registry, route_ticket
-from erp_ai.agent.tools.registry import ToolContext, ToolSpec, execute_tool, get_tool_schemas
+from erp_ai.agent.tools.registry import (
+	ASK_TOOL_NAMES,
+	ToolContext,
+	ToolSpec,
+	execute_tool,
+	get_tool_schemas,
+)
 from erp_ai.agent.tools.source import GIT_SUBCOMMANDS
 from erp_ai.constants import PROPOSAL_DOCTYPE, ROLE_AGENT
 from erp_ai.test_utils import GitSandbox
@@ -721,10 +727,18 @@ class TestGrantTable(FrappeTestCase):
 				self.assertEqual([s["name"] for s in granted.schemas()], names)
 				self.assertEqual(granted.names(), frozenset(names))
 				self.assertIs(granted.change_block, "propose_file_change" in names)
-				self.assertIs(granted.record_block, "api_list_records" in names)
+				# FEAT-007 T77 (U1.md:396): the four block flags; the full-power block replaces the record one.
+				self.assertIs(
+					granted.record_block, "api_list_records" in names and "api_delete_record" not in names
+				)
 				self.assertIs(granted.unrestricted_block, "api_delete_record" in names)
-				# Design w1-fixes-3 Điểm 2 item 2: both stay constant False until T77.
-				self.assertIs(granted.act_now_block, False)
+				self.assertIs(
+					granted.act_now_block,
+					any(
+						name in names
+						for name in ("propose_file_change", "api_list_records", "api_delete_record")
+					),
+				)
 				self.assertIs(granted.ask_only_block, False)
 				self.assertEqual([s["name"] for s in get_tool_schemas(*legacy)], names)
 				self.assertIs(registry.grants_change_tools(*legacy), "propose_file_change" in names)
@@ -873,7 +887,7 @@ class TestGrantInputs(FrappeTestCase):
 
 
 class TestGrantFeat007(FrappeTestCase):
-	"""FEAT-007 T76: the six group rows of grant(GrantInputs), called directly, with the real specs."""
+	"""FEAT-007 T76, T77: the grant table and flags of grant(GrantInputs), called directly, real specs."""
 
 	def setUp(self):
 		self.addCleanup(frappe.db.rollback)
@@ -924,3 +938,139 @@ class TestGrantFeat007(FrappeTestCase):
 					self.assertEqual(granted, registry.Grant(specs=()))
 		with self.subTest("main-path L0"):
 			self.assertEqual(_granted_names(_inputs("L3", True, main_path_level="L0")), SNAPSHOT_BASE)
+
+	def test_act_now_block_needs_a_power_group(self):
+		# AC-6 (U1.md:186): (3) shows the act-now block only next to a granted change, record or
+		# full-power group; no other group and no other switch turns it on.
+		cases = {
+			"(3) alone at L3": (_inputs("L3", True, act_now=True), False),
+			"(3)+(5) at L3": (_inputs("L3", True, act_now=True, one_click_approval=True), False),
+			"(3)+(2) at L3": (_inputs("L3", True, act_now=True, record_tools=True), True),
+			"(3)+(4) at L3": (_inputs("L3", True, act_now=True, code_change=True), True),
+			"(3)+(1) at L1": (_inputs("L1", True, act_now=True, unrestricted=True), True),
+			"(3)+(2)+(4) at L2, groups closed": (
+				_inputs("L2", True, act_now=True, record_tools=True, code_change=True),
+				False,
+			),
+			"(3)+(1) without instructor": (_inputs("L3", False, act_now=True, unrestricted=True), False),
+			"(1)+(2)+(4) with (3) off": (
+				_inputs("L3", True, unrestricted=True, record_tools=True, code_change=True),
+				False,
+			),
+		}
+		for case, (inputs, expected) in cases.items():
+			with self.subTest(case):
+				self.assertIs(registry.grant(inputs).act_now_block, expected)
+
+	def test_record_on_act_now_off_grants_record_tools_without_act_now_block(self):
+		# AC-6 extra case: (2) on, (3) off -> the record tools and their block, no act-now block.
+		granted = registry.grant(_inputs("L3", True, record_tools=True))
+		self.assertEqual(granted.names(), frozenset([*SNAPSHOT_WITH_TASK, *SNAPSHOT_RECORD]))
+		self.assertEqual(
+			(
+				granted.record_block,
+				granted.act_now_block,
+				granted.change_block,
+				granted.unrestricted_block,
+				granted.ask_only_block,
+			),
+			(True, False, False, False, False),
+		)
+
+	def test_record_block_hidden_when_unrestricted_granted(self):
+		# U1.md:185: the full-power block replaces the record block while site_admin stays granted.
+		both = registry.grant(_inputs("L3", True, unrestricted=True, record_tools=True))
+		self.assertTrue(set(SNAPSHOT_RECORD) <= both.names())
+		self.assertEqual((both.unrestricted_block, both.record_block), (True, False))
+		# Over budget closes full power only: the record tools of (2) stay, and so does their block.
+		over_budget = registry.grant(
+			dataclasses.replace(_inputs("L3", True, unrestricted=True, record_tools=True), over_budget=True)
+		)
+		self.assertEqual(over_budget.names(), frozenset([*SNAPSHOT_WITH_TASK, *SNAPSHOT_RECORD]))
+		self.assertEqual((over_budget.unrestricted_block, over_budget.record_block), (False, True))
+
+	def test_over_budget_with_all_switches_equals_l1_all_off(self):
+		# AC-7: the level is already cut to L1; with all five on and over budget, the tool set is the
+		# L1 set with all five off, with no full-power group and every flag off.
+		every_switch = dict.fromkeys(
+			("unrestricted", "record_tools", "act_now", "code_change", "one_click_approval"), True
+		)
+		for has_instructor in (False, True):
+			with self.subTest(has_instructor=has_instructor):
+				all_off = registry.grant(_inputs("L1", has_instructor))
+				granted = registry.grant(
+					dataclasses.replace(_inputs("L1", has_instructor, **every_switch), over_budget=True)
+				)
+				self.assertEqual(granted, all_off)
+				self.assertNotIn("api_delete_record", granted.names())
+		self.assertEqual(
+			_granted_names(dataclasses.replace(_inputs("L1", True, **every_switch), over_budget=True)),
+			SNAPSHOT_WITH_TASK,
+		)
+
+	def test_below_threshold_grants_read_and_ask_tool_only(self):
+		# AC-22: below the threshold, all five on, L3, an instructor -> read + post_comment only, in the
+		# _all_specs() order; only the ask-only block.
+		every_switch = dict.fromkeys(
+			("unrestricted", "record_tools", "act_now", "code_change", "one_click_approval"), True
+		)
+		self.assertEqual(ASK_TOOL_NAMES, frozenset({"post_comment"}))
+		read_names = [*READ_TOOL_NAMES, *SOURCE_TOOL_NAMES]
+		below = dataclasses.replace(_inputs("L3", True, **every_switch), below_threshold=True)
+		granted = registry.grant(below)
+		self.assertEqual([spec.name for spec in granted.specs], [*read_names, "post_comment"])
+		self.assertEqual(
+			(
+				granted.ask_only_block,
+				granted.change_block,
+				granted.record_block,
+				granted.unrestricted_block,
+				granted.act_now_block,
+			),
+			(True, False, False, False, False),
+		)
+		with self.subTest("all switches off, no instructor"):
+			plain = registry.grant(dataclasses.replace(_inputs("L1", False), below_threshold=True))
+			self.assertEqual([spec.name for spec in plain.specs], [*read_names, "post_comment"])
+			self.assertIs(plain.ask_only_block, True)
+		with self.subTest("not below the threshold"):
+			self.assertIs(registry.grant(_inputs("L3", True, **every_switch)).ask_only_block, False)
+		with self.subTest("L0 stays empty"):
+			at_l0 = registry.grant(dataclasses.replace(_inputs("L0", True), below_threshold=True))
+			self.assertEqual(at_l0, registry.Grant(specs=()))
+		with self.subTest("the added ticket_write specs follow ASK_TOOL_NAMES"):
+			with patch.object(registry, "ASK_TOOL_NAMES", frozenset({"set_resolution_hint"})):
+				self.assertEqual(_granted_names(below), [*read_names, "set_resolution_hint"])
+
+	def test_category_c_cap_keeps_code_tools_at_l3(self):
+		# AC-31: the category cap lowers only the main path; the permission level keeps (4) at L3.
+		names = _granted_names(_inputs("L3", True, main_path_level="L1", code_change=True))
+		self.assertEqual(names, [*SNAPSHOT_WITH_TASK, *SNAPSHOT_PROPOSE])
+		self.assertEqual(
+			_granted_names(_inputs("L1", True, main_path_level="L1", code_change=True)), SNAPSHOT_WITH_TASK
+		)
+
+	def test_l1_main_path_has_no_erp_write_tools(self):
+		# AC-32: at L1 with full power off, no record, full-power or propose tool even with (2)-(5) on;
+		# create_task only with an instructor.
+		switches = dict.fromkeys(("record_tools", "act_now", "code_change", "one_click_approval"), True)
+		for has_instructor, expected in ((True, SNAPSHOT_WITH_TASK), (False, SNAPSHOT_BASE)):
+			with self.subTest(has_instructor=has_instructor):
+				granted = registry.grant(_inputs("L1", has_instructor, **switches))
+				self.assertEqual([spec.name for spec in granted.specs], expected)
+				self.assertEqual(
+					(granted.change_block, granted.record_block, granted.unrestricted_block), (False,) * 3
+				)
+
+	def test_unrestricted_at_l1_not_over_budget_is_granted(self):
+		# AC-32: full power stays above L0, so at L1 too, unless over budget.
+		inputs = _inputs("L1", True, unrestricted=True)
+		granted = registry.grant(inputs)
+		self.assertEqual(
+			[spec.name for spec in granted.specs],
+			[*SNAPSHOT_WITH_TASK, *SNAPSHOT_RECORD, *SNAPSHOT_FULL_POWER],
+		)
+		self.assertIs(granted.unrestricted_block, True)
+		over_budget = registry.grant(dataclasses.replace(inputs, over_budget=True))
+		self.assertEqual([spec.name for spec in over_budget.specs], SNAPSHOT_WITH_TASK)
+		self.assertIs(over_budget.unrestricted_block, False)

@@ -202,21 +202,6 @@ class TestCheckWritePath(FrappeTestCase):
 		os.symlink(os.path.join(self.root, "myapp", ".env"), os.path.join(self.root, "myapp", "env_link.py"))
 		self.assertEqual(self.reason("myapp/env_link.py"), change_guard.NAME_FORBIDDEN)
 
-	def test_refuses_extension_outside_read_list_even_for_new_file(self):
-		self.apps.write("myapp/run.sh", "echo\n")
-		for rel, new_file in (
-			("myapp/run.sh", False),
-			("myapp/new.sh", True),
-			("myapp/lib.so", True),
-			("myapp/Makefile", True),
-			("myapp/conf/settings", True),
-			("myapp", True),
-		):
-			with self.subTest(rel=rel):
-				self.assertEqual(self.reason(rel, new_file=new_file), None)
-		os.symlink(os.path.join(self.root, "myapp", "run.sh"), os.path.join(self.root, "myapp", "sh_link.py"))
-		self.assertEqual(self.reason("myapp/sh_link.py"), None)
-
 	def test_refuses_git_dir_component(self):
 		self.apps.write("myapp/.git/info.txt", "x\n")
 		self.assertEqual(self.reason("myapp/.git/info.txt"), change_guard.GIT_DIR)
@@ -247,6 +232,8 @@ class TestCheckWritePath(FrappeTestCase):
 						full_path=os.path.join(self.root, rel), rel_path=rel, app="myapp", reason=None
 					),
 				)
+		os.symlink(os.path.join(self.root, "myapp", "run.sh"), os.path.join(self.root, "myapp", "sh_link.py"))
+		self.assertEqual(self.reason("myapp/sh_link.py"), None)
 
 	def test_gitignore_gitattributes_github_refused_git_dir(self):
 		# AC-50, design 3.2 step 4: any component starting with ".git", with the new wording of table 3.1.
@@ -320,6 +307,15 @@ class TestCheckWritePath(FrappeTestCase):
 		# Order: a name not on the list stays APP_NOT_ALLOWED, folder or not.
 		self.assertEqual(self.reason("ghost/x.py", ALLOWED, new_file=True), APP_NOT_ALLOWED_REFUSAL)
 		self.assertIsNone(self.reason("myapp/x.py", listed, new_file=True))
+
+	def test_app_dir_itself_path_invalid(self):
+		# Design 3.2 step 2 (addendum-4 P-1.2 note 2): the app folder itself is no file to write.
+		for rel in ("myapp", "myapp/", "myapp/."):
+			for new_file in (True, False):
+				with self.subTest(rel=rel, new_file=new_file):
+					self.assertEqual(self.reason(rel, new_file=new_file), change_guard.PATH_INVALID)
+		# Order (addendum-4 P-1.2 note 3): a name not on the list stays APP_NOT_ALLOWED.
+		self.assertEqual(self.reason("helpdesk", new_file=True), change_guard.APP_NOT_ALLOWED)
 
 	def test_erp_ai_in_allowed_list_still_refused(self):
 		# AC-16 kept by design 3.2 step 3: `erp_ai` and its worktrees are refused before the name and git rules.

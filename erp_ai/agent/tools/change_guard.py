@@ -163,9 +163,10 @@ def check_write_path(
 	"""Check a write target relative to `apps/`; refusals follow steps 1-5 of CHG-002 design 3.2.
 
 	1. invalid or outside `apps/` → `PATH_INVALID`; 2. app not listed → `APP_NOT_ALLOWED`; a listed app
-	with no folder → `PATH_INVALID`; 3. `erp_ai` by repo identity → `APP_FORBIDDEN`; 4. `license.txt`,
-	then `source.text_refusal` (secret name, then a ".git*" component) → `NAME_FORBIDDEN` / `GIT_DIR`;
-	5. git pattern → `PATH_GIT_PATTERN`. Any file extension passes.
+	with no folder, or the app folder itself → `PATH_INVALID`; 3. `erp_ai` by repo identity →
+	`APP_FORBIDDEN`; 4. `license.txt`, then `source.text_refusal` (secret name, then a ".git*"
+	component) → `NAME_FORBIDDEN` / `GIT_DIR`; 5. git pattern → `PATH_GIT_PATTERN`. Any file
+	extension passes.
 
 	`source.resolve_safe_path` is the only path resolver; when it refuses, the same real path is only
 	classified to pick the reason, and an unclassified refusal stays `PATH_INVALID`. With `read_git`
@@ -183,7 +184,7 @@ def check_write_path(
 	parts = rel.split(os.sep)
 	if parts[0] not in allowed_apps:
 		return _refused(APP_NOT_ALLOWED)
-	if not os.path.isdir(os.path.join(root, parts[0])):
+	if len(parts) == 1 or not os.path.isdir(os.path.join(root, parts[0])):
 		return _refused(PATH_INVALID)
 	if _is_erp_ai(target, root, parts[0]):
 		return _refused(APP_FORBIDDEN)

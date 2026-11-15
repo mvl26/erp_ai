@@ -314,7 +314,7 @@ class TestProposeChange(FrappeTestCase):
 			("helpdesk/README.md", "app không có trong danh sách được sửa"),
 			("erp_ai/README.md", "không được sửa app erp_ai hoặc kho git của nó"),
 			(f"{APP}/pkg/secret_key.py", "tên file thuộc loại bí mật hoặc được bảo vệ"),
-			(f"{APP}/pkg/tool.sh", "file không tồn tại"),
+			(f"{APP}/pkg/tool.sh", propose_change.NOT_FOUND),
 			(f"{APP}/.git/notes.md", change_guard.GIT_DIR),
 			(
 				f"{APP}/pkg/star*.py",

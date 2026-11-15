@@ -7102,6 +7102,8 @@ class TestScannersCatchViolations(unittest.TestCase):
 			"keyword": "frappe.new_doc(D, applied_branch='main')\n",
 			"qb set attribute": "frappe.qb.update(T).set(T.change_status, v).run()\n",
 			"dict() keyword": "doc.update(dict(change_status=v))\n",
+			"return dict": "def f(n, v):\n\treturn {'name': n, 'restart_status': v}\n",
+			"helper dict to a write": "def f(v):\n\treturn {'change_status': v}\n\nfrappe.db.set_value(D, n, f(v))\n",
 		}
 		for shape, source in shapes.items():
 			with self.subTest(shape=shape):

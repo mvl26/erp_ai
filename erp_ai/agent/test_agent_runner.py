@@ -3373,7 +3373,13 @@ class TestRunnerGrant(RunnerTestBase):
 		self.gateway.results = [
 			tool_turn(
 				tool_use("t_cls", "set_classification", category="A", confidence="Cao"),
-				tool_use("t_ask", "post_comment", content=f"{PREFIX}cần biết thêm"),
+				# AC-22 (T100): a question is kind=hoi; below the threshold it needs non-empty grounds.
+				tool_use(
+					"t_ask",
+					"post_comment",
+					kind="hoi",
+					content=f"{PREFIX}cần biết thêm\n**Căn cứ:** {PREFIX}phiếu",
+				),
 			),
 			make_model_result(),
 		]

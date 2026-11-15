@@ -589,7 +589,11 @@ class TestRealToolsRunWithoutCommit(FrappeTestCase):
 			"git_source": {"app": "erp_ai", "subcommand": "log", "args": ["--oneline", "-n", "1"]},
 			"set_classification": {"category": "A", "confidence": "Cao"},
 			"set_resolution_hint": {"text": "ERPAI-TEST-T27 gợi ý"},
-			"post_comment": {"content": "ERPAI-TEST-T27 bình luận"},
+			# AC-22 (T100): a plain comment is kind=de_xuat, with a confidence line and non-empty grounds.
+			"post_comment": {
+				"kind": "de_xuat",
+				"content": "ERPAI-TEST-T27 bình luận\nĐộ tin cậy: 90%\n**Căn cứ:** ERPAI-TEST-T27 phiếu",
+			},
 			"create_task": {"subject": "ERPAI-TEST-T27 việc", "description": "ERPAI-TEST-T27 mô tả"},
 			"propose_file_change": {
 				"path": f"{SANDBOX_APP}/README.md",

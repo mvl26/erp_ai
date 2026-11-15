@@ -30,6 +30,9 @@ from erp_ai.gateway import GatewayError
 from erp_ai.test_utils import FakeGateway, make_model_result, set_agent_settings
 
 THINKING_TEXT = "Đang suy nghĩ…"
+# AC-22 (T100): the answer is a kind=de_xuat comment, so it carries a confidence line and non-empty grounds.
+ANSWER_GROUNDS = "\nĐộ tin cậy: 90%\n**Căn cứ:** đã đọc phiếu"
+ANSWER = f"Đã xử lý{ANSWER_GROUNDS}"
 
 
 class TestRunnerStatus(RunnerTestBase):
@@ -128,7 +131,7 @@ class TestRunnerStatus(RunnerTestBase):
 
 	def test_done_last_when_answered(self):
 		self._gateway(
-			tool_turn(tool_use("t1", "post_comment", content="Đã xử lý")),
+			tool_turn(tool_use("t1", "post_comment", kind="de_xuat", content=ANSWER)),
 			make_model_result(text="xong"),
 		)
 		comments_before = self._comment_count()
@@ -164,7 +167,7 @@ class TestRunnerStatus(RunnerTestBase):
 
 	def _answer_turns(self, cost_usd=0.0):
 		return (
-			tool_turn(tool_use("t1", "post_comment", content="Đã xử lý"), cost_usd=cost_usd),
+			tool_turn(tool_use("t1", "post_comment", kind="de_xuat", content=ANSWER), cost_usd=cost_usd),
 			make_model_result(text="xong", cost_usd=cost_usd),
 		)
 
@@ -201,7 +204,7 @@ class TestRunnerStatus(RunnerTestBase):
 		self._gateway(
 			tool_turn(
 				tool_use("t1", "set_classification", category="A", confidence="Cao"),
-				tool_use("t2", "post_comment", content="Đã xử lý"),
+				tool_use("t2", "post_comment", kind="de_xuat", content=ANSWER),
 			),
 			make_model_result(text="xong"),
 		)
@@ -319,7 +322,7 @@ class TestRunnerStatus(RunnerTestBase):
 	def test_signal_sequence_read_tool_then_answer(self):
 		self._gateway(
 			tool_turn(tool_use("t1", "get_ticket")),
-			tool_turn(tool_use("t2", "post_comment", content="Đã xử lý")),
+			tool_turn(tool_use("t2", "post_comment", kind="de_xuat", content=ANSWER)),
 			make_model_result(text="xong"),
 		)
 
@@ -376,7 +379,7 @@ class TestRunnerStatus(RunnerTestBase):
 					set_agent_settings(permission_level=level)
 					self._gateway(
 						make_model_result(text=CLASSIFY_A),
-						tool_turn(tool_use("t1", "post_comment", content="Đã xử lý")),
+						tool_turn(tool_use("t1", "post_comment", kind="de_xuat", content=ANSWER)),
 						make_model_result(text="xong"),
 					)
 
@@ -395,7 +398,7 @@ class TestRunnerStatus(RunnerTestBase):
 		self._gateway(
 			tool_turn(
 				tool_use("t1", f"tool_{marker}", secret=marker),
-				tool_use("t2", "post_comment", content=f"{marker} answer"),
+				tool_use("t2", "post_comment", kind="de_xuat", content=f"{marker} answer{ANSWER_GROUNDS}"),
 			),
 			make_model_result(text="xong"),
 		)
@@ -559,7 +562,7 @@ class TestRunnerStatus(RunnerTestBase):
 	def test_done_after_last_log_entry(self):
 		self._gateway(
 			tool_turn(tool_use("t1", "get_ticket")),
-			tool_turn(tool_use("t2", "post_comment", content="Đã xử lý")),
+			tool_turn(tool_use("t2", "post_comment", kind="de_xuat", content=ANSWER)),
 			make_model_result(text="xong"),
 		)
 

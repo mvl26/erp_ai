@@ -239,11 +239,12 @@ class TestRunLog(FrappeTestCase):
 	def test_log_change_fields_match_design(self):
 		meta = frappe.get_meta(LOG_DOCTYPE)
 		self.assertEqual(
-			meta.get_field("entry_type").options.split("\n"), ["classify", "reason", "skip", "change"]
+			meta.get_field("entry_type").options.split("\n"),
+			["classify", "reason", "skip", "change", "bot_action"],
 		)
 		self.assertEqual(
 			meta.get_field("trigger").options.split("\n"),
-			["ticket_insert", "comment_mention", "change_action"],
+			["ticket_insert", "comment_mention", "change_action", "setting_save", "scheduled_job"],
 		)
 		expected = {
 			"change_proposal": ("Link", "ERP AI Change Proposal"),

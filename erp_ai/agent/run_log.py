@@ -2,15 +2,20 @@ import json
 
 import frappe
 
-from erp_ai.agent import redact
+from erp_ai.agent import policy, redact
 from erp_ai.agent.agent_write_guard import allow_agent_write
 from erp_ai.agent.tools.site_api import SECRET_FIELDS
 from erp_ai.constants import CHANGE_STEPS, LOG_DOCTYPE, TRIGGER_CHANGE_ACTION
 
 ENTRY_TYPE_CHANGE = "change"
-ENTRY_TYPES = ("classify", "reason", "skip", "change")
+ENTRY_TYPE_BOT_ACTION = "bot_action"
+ENTRY_TYPES = ("classify", "reason", "skip", "change", "bot_action")
 TRIGGERS = ("ticket_insert", "comment_mention")
 CHANGE_TRIGGERS = (TRIGGER_CHANGE_ACTION,)
+TRIGGER_SETTING_SAVE = "setting_save"
+TRIGGER_SCHEDULED_JOB = "scheduled_job"
+BOT_ACTION_TRIGGERS = (TRIGGER_SETTING_SAVE, TRIGGER_SCHEDULED_JOB)
+TOOL_PERMISSION_SWITCH = "permission_switch"
 # The one action-entry shape (ADR-033 QĐ 5): these keys always, in this order; then `reason`, `rule`.
 ACTION_KEYS = ("tool", "doctype", "name", "ok", "value_before", "value_after", "instructor")
 SECRET_MASK = "[đã ẩn]"
@@ -101,11 +106,25 @@ def _check_change_fields(fields) -> None:
 			raise ValueError(f"{fieldname} must be a non-empty name, got {fields.get(fieldname)!r}")
 
 
+def _check_bot_action_fields(fields) -> None:
+	actions = fields.get("actions")
+	if not isinstance(actions, list) or not actions:
+		raise ValueError(f"actions must be a non-empty list for a bot_action row, got {actions!r}")
+	if fields.get("cost_usd") not in (None, 0):
+		raise ValueError(
+			f"cost_usd must be missing or 0 for a bot_action row, got {fields.get('cost_usd')!r}"
+		)
+
+
 def write_entry(**fields) -> str:
 	"""Create one ERP AI Log row; the only place that does (ADR-004, ADR-012 QĐ 6).
 
 	List/dict values (`keys_tried`, `tools_called`, `actions`, `value_before`, `value_after`) are stored as JSON.
 	`entry_type` and `trigger` are required (Frappe would silently default a Select to its first option).
+	`bot_action` rows (the bot's own work or a permission-switch change, never a model call) take
+	`setting_save|scheduled_job`, a non-empty `actions` list and cost 0, and are inserted with
+	`ignore_permissions=True`; every row without a `site_environment` gets `policy.site_environment()`.
+	The checks run before the insert, so a refused row leaves nothing; insert and commit stay in this one call.
 	`classify|reason|skip` rows take `ticket_insert|comment_mention` and are inserted under the session
 	user's permissions. `change` rows (one per proposal step) take `trigger="change_action"` plus
 	`change_step` in `CHANGE_STEPS`, `actor` and `change_proposal`, and are inserted with
@@ -122,18 +141,24 @@ def write_entry(**fields) -> str:
 	if entry_type not in ENTRY_TYPES:
 		raise ValueError(f"entry_type must be one of {ENTRY_TYPES}, got {entry_type!r}")
 	is_change = entry_type == ENTRY_TYPE_CHANGE
-	triggers = CHANGE_TRIGGERS if is_change else TRIGGERS
+	is_bot_action = entry_type == ENTRY_TYPE_BOT_ACTION
+	triggers = CHANGE_TRIGGERS if is_change else BOT_ACTION_TRIGGERS if is_bot_action else TRIGGERS
 	if fields.get("trigger") not in triggers:
 		raise ValueError(f"trigger must be one of {triggers}, got {fields.get('trigger')!r}")
 	if is_change:
 		_check_change_fields(fields)
+	if is_bot_action:
+		_check_bot_action_fields(fields)
+		fields = {**fields, "cost_usd": 0}
+	if not fields.get("site_environment"):
+		fields = {**fields, "site_environment": policy.site_environment()}
 	values = {
 		key: json.dumps(value, ensure_ascii=False) if isinstance(value, list | dict) else value
 		for key, value in fields.items()
 	}
 	doc = frappe.get_doc({**values, "doctype": LOG_DOCTYPE})
 	with allow_agent_write():
-		doc.insert(ignore_permissions=is_change)
+		doc.insert(ignore_permissions=is_change or is_bot_action)
 	if not frappe.flags.in_test:
 		frappe.db.commit()
 	return doc.name

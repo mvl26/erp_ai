@@ -20,7 +20,9 @@ class TestEnqueueAgentRun(FrappeTestCase):
 		with patch("frappe.enqueue") as enqueue:
 			first = queue.enqueue_agent_run("TKT-1", TRIGGER_TICKET_INSERT)
 			second = queue.enqueue_agent_run("TKT-1", TRIGGER_TICKET_INSERT)
-			other_trigger = queue.enqueue_agent_run("TKT-1", TRIGGER_COMMENT_MENTION, comment_name="COMMENT-1")
+			other_trigger = queue.enqueue_agent_run(
+				"TKT-1", TRIGGER_COMMENT_MENTION, comment_name="COMMENT-1"
+			)
 			other_ticket = queue.enqueue_agent_run("TKT-2", TRIGGER_TICKET_INSERT)
 
 		self.assertTrue(first)
@@ -31,7 +33,9 @@ class TestEnqueueAgentRun(FrappeTestCase):
 
 	def test_enqueue_parameters(self):
 		with patch("frappe.enqueue") as enqueue:
-			self.assertTrue(queue.enqueue_agent_run("TKT-1", TRIGGER_COMMENT_MENTION, comment_name="COMMENT-1"))
+			self.assertTrue(
+				queue.enqueue_agent_run("TKT-1", TRIGGER_COMMENT_MENTION, comment_name="COMMENT-1")
+			)
 
 		enqueue.assert_called_once_with(
 			RUN_FOR_TICKET_PATH,
@@ -47,7 +51,9 @@ class TestEnqueueAgentRun(FrappeTestCase):
 
 	def test_comment_mention_job_carries_comment_name(self):
 		with patch("frappe.enqueue") as enqueue:
-			self.assertTrue(queue.enqueue_agent_run("TKT-1", TRIGGER_COMMENT_MENTION, comment_name="COMMENT-9"))
+			self.assertTrue(
+				queue.enqueue_agent_run("TKT-1", TRIGGER_COMMENT_MENTION, comment_name="COMMENT-9")
+			)
 			# A-U1-3: the job id stays per ticket, so a second @ai in the same transaction is merged.
 			self.assertFalse(
 				queue.enqueue_agent_run("TKT-1", TRIGGER_COMMENT_MENTION, comment_name="COMMENT-10")

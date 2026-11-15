@@ -116,5 +116,5 @@ def comment_after_insert(doc, method=None):
 	if skip_reason:
 		_log_decision(ticket, TRIGGER_COMMENT_MENTION, "skipped", skip_reason)
 		return
-	enqueue_agent_run(ticket, TRIGGER_COMMENT_MENTION)
+	enqueue_agent_run(ticket, TRIGGER_COMMENT_MENTION, comment_name=doc.name)
 	_log_decision(ticket, TRIGGER_COMMENT_MENTION, "enqueued", "conditions_met")

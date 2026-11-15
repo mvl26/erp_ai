@@ -305,6 +305,8 @@ class TestCommentHandler(HandlerTestCase):
 			}
 		)
 		doc.owner = "Administrator"
+		# after_insert always sees a named comment; the hook passes that name to the job.
+		doc.name = f"{PREFIX}comment"
 
 		handlers.comment_after_insert(doc)
 

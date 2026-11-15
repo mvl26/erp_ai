@@ -1,6 +1,7 @@
 import itertools
 import json
 import sys
+from contextlib import contextmanager
 from datetime import datetime
 from unittest.mock import MagicMock, patch
 
@@ -12,10 +13,10 @@ from helpdesk.test_utils import make_ticket
 
 from erp_ai import tasks
 from erp_ai.agent import authority, runner
-from erp_ai.agent.classification import parse_classification, split_request_comment
+from erp_ai.agent.classification import Classification, parse_classification, split_request_comment
 from erp_ai.agent.prompts import build_classify_request
-from erp_ai.agent.routing import DUE_FIELD_MISSING_NOTE, departments, load_routing_config
-from erp_ai.agent.run_log import action_entry
+from erp_ai.agent.routing import DUE_FIELD_MISSING_NOTE, RouteDecision, departments, load_routing_config
+from erp_ai.agent.run_log import action_entry, write_entry
 from erp_ai.agent.runner import BAD_ROUTING_ERROR, NO_SLA_REASON
 from erp_ai.agent.test_agent_runner import (
 	CLASSIFY_A,
@@ -37,7 +38,7 @@ from erp_ai.agent.tools.route_ticket import (
 	TASK_REQUEST,
 	create_routed_task,
 )
-from erp_ai.agent.tools.write_ticket import CREATED_LABELS_FIELD, REASON_HUMAN_FILLED
+from erp_ai.agent.tools.write_ticket import CREATED_LABELS_FIELD, REASON_HUMAN_FILLED, locked_rows
 from erp_ai.constants import (
 	AGENT_USER,
 	CLASSIFICATION_FIELDS,
@@ -1143,10 +1144,14 @@ class TestRoutingTask(AssignTestBase):
 		self.assertEqual(self._tasks(), [task])
 		self.assertEqual(self._task_todos(self.person), 1)
 		(second,) = [e for e in self._entries(entry_type="classify") if e.name != first.name]
-		# AC-23 (T109): the second route changes nothing and still posts its one comment
+		# ADR-037 QĐ 4 (T112): the ticket was routed once; the second run's route step writes nothing
 		self.assertEqual(
-			[a["tool"] for a in json.loads(second.actions)],
-			["apply_route", "assign_owner", "post_routing_comment"],
+			json.loads(second.actions),
+			[
+				action_entry(
+					"apply_route", "HD Ticket", self.ticket.name, False, reason=runner.ROUTE_ALREADY_DONE
+				)
+			],
 		)
 
 	def test_existing_linked_task_no_new_task(self):
@@ -2087,3 +2092,184 @@ class TestOneCommentPerAction(AssignTestBase):
 		self.assertEqual(text, runner.ROUTE_NO_CHANGE)
 		(applied,) = self._action("apply_route")
 		self.assertTrue(applied["ok"])
+
+
+ROUTE_ONCE_PERSON = "erpai-test-route.once@example.com"
+
+
+class TestRouteOnce(AssignTestBase):
+	"""ADR-037 QĐ 4, AD3-1, NFR-3 (T112): `_route` starts by locking the ticket and reading its applied classify rows
+	with a lock; a ticket routed once is never routed again, however two runs interleave."""
+
+	def setUp(self):
+		super().setUp()
+		keep_agent_settings(self)
+
+	def _skipped(self, ticket):
+		instructor = authority.run_instructor(ticket, "ticket_insert")
+		return action_entry(
+			"apply_route", "HD Ticket", ticket, False, reason=runner.ROUTE_ALREADY_DONE, instructor=instructor
+		)
+
+	def test_second_route_call_skips_units_and_logs(self):
+		self._run()
+		(first,) = self._entries(entry_type="classify")
+		self.assertEqual(first.applied, 1)
+		# a person changes the priority after the route; a second run must not route the ticket again
+		frappe.db.set_value("HD Ticket", self.ticket.name, "priority", "Low")
+		comments = self._comment_count()
+		self.gateway.results = [
+			make_model_result(text=CLASSIFY_SCORED),
+			make_model_result(stop_reason="end_turn"),
+		]
+		logger = MagicMock()
+		with (
+			patch.object(runner, "apply_route", wraps=runner.apply_route) as apply,
+			patch.object(runner, "assign_owner", wraps=runner.assign_owner) as assign,
+			patch.object(frappe, "logger", return_value=logger),
+		):
+			self._run()
+
+		apply.assert_not_called()
+		assign.assert_not_called()
+		(second,) = [e for e in self._entries(entry_type="classify") if e.name != first.name]
+		self.assertEqual(second.applied, 0)
+		self.assertEqual(json.loads(second.actions), [self._skipped(self.ticket.name)])
+		self.assertEqual(frappe.db.get_value("HD Ticket", self.ticket.name, "priority"), "Low")
+		self.assertEqual(self._assigned_to(), [self.person])
+		self.assertEqual(self._comment_count(), comments)
+		routed = [c.args for c in logger.info.call_args_list if str(c.args[0]).startswith("erp_ai route")]
+		self.assertEqual(
+			routed,
+			[
+				(
+					"erp_ai route_skipped ticket=%s run_id=%s reason=already_routed",
+					self.ticket.name,
+					second.run_id,
+				)
+			],
+		)
+		# the run goes on to reasoning
+		self.assertEqual([call["task"] for call in self.gateway.calls][-2:], ["classify", "reason"])
+
+	# Two connections: the second connection commits for real; `_drop_committed` deletes what it committed.
+
+	def _drop_committed(self):
+		frappe.local.db = self._primary_connection
+		frappe.db.rollback()
+		if getattr(self, "committed", None):
+			frappe.local.db = self._secondary_connection
+			try:
+				frappe.db.rollback()
+				for doctype, filters in (
+					("ToDo", {"reference_type": "HD Ticket", "reference_name": self.committed}),
+					(LOG_DOCTYPE, {"ticket": self.committed}),
+					("HD Ticket", {"name": self.committed}),
+				):
+					frappe.db.delete(doctype, filters)
+				frappe.db.commit()
+			finally:
+				frappe.local.db = self._primary_connection
+
+	def _committed_ticket(self):
+		"""A bare HD Ticket (no hooks: no job, no mail, no rule) and one classify row per run, committed."""
+		doc = frappe.new_doc("HD Ticket")
+		doc.subject = f"{PREFIX}route once, two connections"
+		doc.set_new_name()
+		self.committed = doc.name
+		doc.db_insert()
+		self.rows = [
+			write_entry(
+				ticket=doc.name,
+				run_id=f"{PREFIX}route-once-{run}",
+				entry_type="classify",
+				trigger="ticket_insert",
+				turn=0,
+				applied=0,
+			)
+			for run in "ab"
+		]
+		frappe.db.commit()
+		return doc.name
+
+	def _route_args(self, ticket, run):
+		"""Everything `_route` takes after the log row name: classification, decision, context, switch, subject."""
+		classification = Classification(category="A", confidence="Cao", confidence_pct=90)
+		decision = RouteDecision(
+			ticket_type=None,
+			agent_group=None,
+			priority=None,
+			assignee=ROUTE_ONCE_PERSON,
+			needs_task=False,
+			notes=(),
+		)
+		context = ToolContext(
+			ticket_name=ticket,
+			effective_level="L1",
+			instructor=None,
+			run_id=f"{PREFIX}route-once-{run}",
+			category_mapping={},
+			agent_user=AGENT_USER,
+		)
+		return classification, decision, context, True, f"{PREFIX}route once"
+
+	@contextmanager
+	def _route_units(self):
+		"""The units write only what the lock is about: the route result and one ToDo per assignment."""
+
+		def assign(user, context):
+			todo = frappe.new_doc("ToDo")
+			todo.update(
+				{
+					"allocated_to": user,
+					"reference_type": "HD Ticket",
+					"reference_name": context.ticket_name,
+					"description": f"{PREFIX}route once",
+					"status": "Open",
+				}
+			)
+			todo.set_new_name()
+			todo.db_insert()
+			return {"ok": True, "assignee": user}
+
+		routed = {"ok": True, "before": {}, "after": {}, "skipped": []}
+		with (
+			patch.object(runner, "apply_route", return_value=routed),
+			patch.object(runner, "assign_owner", side_effect=assign),
+			patch.object(runner, "post_routing_comment", return_value={"ok": True, "comment": f"{PREFIX}c"}),
+		):
+			yield
+
+	def test_two_connections_one_applied_row_one_todo(self):
+		# setUp's ticket holds the naming series row the second connection needs: give its locks back first
+		frappe.db.rollback()
+		self.addCleanup(self._drop_committed)
+		with self.secondary_connection():
+			ticket = self._committed_ticket()
+		with self.primary_connection():
+			# the first plain read takes this transaction's snapshot: two rows, none applied
+			self.assertEqual(frappe.db.count(LOG_DOCTYPE, {"ticket": ticket, "applied": 0}), 2)
+		with self.secondary_connection(), self._route_units():
+			first = runner._route(self.rows[0], *self._route_args(ticket, "a"))
+			frappe.db.commit()
+		with self.primary_connection(), self._route_units():
+			# precondition: a plain read still sees the snapshot, so only a locking read sees the first route
+			self.assertEqual(frappe.db.count(LOG_DOCTYPE, {"ticket": ticket, "applied": 1}), 0)
+			second = runner._route(self.rows[1], *self._route_args(ticket, "b"))
+			applied = locked_rows(
+				ticket, LOG_DOCTYPE, {"ticket": ticket, "entry_type": "classify", "applied": 1}
+			)
+			todos = locked_rows(ticket, "ToDo", {"reference_type": "HD Ticket", "reference_name": ticket})
+			tasks = locked_rows(ticket, "Task", {"ai_ticket": ticket})
+			(row,) = locked_rows(ticket, LOG_DOCTYPE, {"name": self.rows[1]}, fields=("applied", "actions"))
+
+		self.assertTrue(first)
+		self.assertEqual(second, [])
+		self.assertEqual([item["name"] for item in applied], [self.rows[0]])
+		self.assertEqual(len(todos), 1)
+		self.assertLessEqual(len(tasks), 1)
+		self.assertEqual(row["applied"], 0)
+		self.assertEqual(
+			json.loads(row["actions"]),
+			[action_entry("apply_route", "HD Ticket", ticket, False, reason=runner.ROUTE_ALREADY_DONE)],
+		)

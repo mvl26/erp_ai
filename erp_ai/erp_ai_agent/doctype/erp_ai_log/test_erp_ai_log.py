@@ -147,7 +147,8 @@ class TestERPAILog(FrappeTestCase):
 
 def _actions_just_over_small_text(byte_size):
 	"""One `actions` entry whose JSON is exactly `byte_size` UTF-8 bytes, mostly 3-byte Vietnamese letters."""
-	entry = {"action": "post_comment", "note": ""}
+	entry = run_log.action_entry("post_comment", "Comment", None, True)
+	entry["note"] = ""
 	base = len(json.dumps([entry], ensure_ascii=False).encode("utf-8"))
 	letters, ascii_tail = divmod(byte_size - base, len("ệ".encode()))
 	entry["note"] = "ệ" * letters + "a" * ascii_tail

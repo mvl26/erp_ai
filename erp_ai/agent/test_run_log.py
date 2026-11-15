@@ -20,7 +20,7 @@ KEYS_TRIED = [
 	{"label": "ERPAI-TEST-k2", "outcome": "ok"},
 ]
 TOOLS_CALLED = ["get_ticket", "set_classification"]
-ACTIONS = [{"tool": "set_classification", "doctype": "HD Ticket", "name": "1", "ok": True}]
+ACTIONS = [run_log.action_entry("set_classification", "HD Ticket", "1", True)]
 # FEAT-004 design 2.5 / ADR-012 QĐ 6: the closed set of proposal steps and the single change trigger.
 CHANGE_STEP_VALUES = ("propose", "approve", "reject", "apply", "fail", "stale", "undo")
 CHANGE_TRIGGER = "change_action"
@@ -100,7 +100,7 @@ class TestRunLog(FrappeTestCase):
 			trigger="ticket_insert",
 			turn=0,
 			keys_tried='[{"a": 1}]',
-			actions=[{"note": "Không phân loại"}],
+			actions=[run_log.action_entry("set_classification", None, None, False, reason="Không phân loại")],
 		)
 
 		doc = frappe.get_doc(LOG_DOCTYPE, name)

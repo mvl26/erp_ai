@@ -70,7 +70,7 @@ def _add_log(cost_usd, label, creation):
 
 def _hand_action(tool, doctype, name, ok=True):
 	"""An action entry of a `reason` row as the runner writes it, for cases the tools cannot seed."""
-	return {"tool": tool, "doctype": doctype, "name": name, "ok": ok, "instructor": INSTRUCTOR}
+	return run_log.action_entry(tool, doctype, name, ok, instructor=INSTRUCTOR)
 
 
 class TestRecomputeMonthlySpend(FrappeTestCase):
@@ -278,6 +278,24 @@ class TestCheckPrivilegeEscalation(FrappeTestCase):
 		)
 		frappe.db.set_value(LOG_DOCTYPE, name, "creation", at, update_modified=False)
 		return name
+
+	def _bad_actions_row(self, actions_text, at=SEEDED_AT):
+		"""A `reason` row whose `actions` column is not an `ACTION_KEYS` list, as `write_entry` now refuses; made
+		by `db_insert` like `erp_ai/agent/test_kpi.py` does, and back-dated."""
+		doc = frappe.get_doc(
+			{
+				"doctype": LOG_DOCTYPE,
+				"run_id": "ERPAI-TEST-run",
+				"entry_type": "reason",
+				"trigger": TRIGGER_TICKET_INSERT,
+				"turn": 1,
+				"instructor": INSTRUCTOR,
+				"actions": actions_text,
+			}
+		)
+		doc.db_insert()
+		frappe.db.set_value(LOG_DOCTYPE, doc.name, "creation", at, update_modified=False)
+		return doc.name
 
 	def _agent_calls(self, *calls, at=SEEDED_AT, instructor=INSTRUCTOR, unrestricted=False):
 		"""Run generic write tools as the agent account and log them as one `reason` row, as the runner does.
@@ -1057,7 +1075,7 @@ class TestCheckPrivilegeEscalation(FrappeTestCase):
 		):
 			at += timedelta(minutes=1)
 			with self.subTest(actions=shape):
-				name = self._log_row(actions, at=at)
+				name = self._bad_actions_row(actions, at=at)
 
 				self.assertEqual(
 					self._changes(at - timedelta(seconds=1), at), [f"ERP AI Log {name}{NO_BEFORE_AFTER}"]
@@ -1130,7 +1148,7 @@ class TestCheckPrivilegeEscalation(FrappeTestCase):
 			{"api_update_record#1": {"name": "broken@example.invalid", "roles": []}},
 			at=datetime(2031, 11, 15, 8, 10, 0),
 		)
-		broken_actions = self._log_row(
+		broken_actions = self._bad_actions_row(
 			'[{"tool": "api_update_record", "doctype": "User", "name": "cut@example.invalid", "ok": tr',
 			at=datetime(2031, 11, 15, 8, 20, 0),
 		)

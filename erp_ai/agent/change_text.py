@@ -4,6 +4,7 @@ Pure module: standard library and erp_ai.constants only, no I/O. Shared by the t
 the controller and the apply job.
 """
 
+import datetime
 import json
 import unicodedata
 
@@ -17,6 +18,10 @@ from erp_ai.constants import (
 	CHANGE_OP_RENAME,
 	CHANGE_STATUS_APPLIED,
 	CHANGE_STATUS_UNDONE,
+	RESTART_STATUS_CONFIRMED,
+	RESTART_STATUS_LAUNCH_FAILED,
+	RESTART_STATUS_SENT,
+	RESTART_STATUS_UNCONFIRMED,
 )
 
 APPROVER_PLACEHOLDER = "<người duyệt>"
@@ -149,12 +154,51 @@ def _block_notes(rows, commands) -> list[str]:
 	return notes
 
 
+# Restart label, the last line of the notes (CHG-002 design 3.7, design-addendum-5 P-1).
+RESTART_SENT_AT_LABEL = "Restart: đã gửi lúc {sent_at}, chờ xác nhận."
+RESTART_LABELS = {
+	RESTART_STATUS_SENT: "Restart: đã gửi, chờ xác nhận.",
+	RESTART_STATUS_CONFIRMED: "Restart: đã xác nhận, web và worker đã khởi động lại.",
+	RESTART_STATUS_UNCONFIRMED: (
+		"Restart: chưa xác nhận (có thể chưa được cấp quyền restart)."
+		" Việc người còn phải làm: restart bench."
+	),
+	RESTART_STATUS_LAUNCH_FAILED: "Restart: lỗi khởi chạy. Việc người còn phải làm: restart bench.",
+}
+RESTART_SENT_AT_FORMAT = "%H:%M %d/%m/%Y"
+
+
+def _sent_at_text(sent_at) -> str:
+	"""`restart_sent_at` as `HH:MM dd/mm/YYYY`, the stored clock time unchanged (no time zone).
+
+	Takes a naive datetime or an ISO string; raises ValueError for an aware datetime, an
+	unreadable string or another type.
+	"""
+	if isinstance(sent_at, str):
+		sent_at = datetime.datetime.fromisoformat(sent_at)
+	if not isinstance(sent_at, datetime.datetime):
+		raise ValueError(f"restart_sent_at is not a datetime: {sent_at!r}")
+	if sent_at.tzinfo is not None:
+		raise ValueError(f"restart_sent_at has a time zone: {sent_at!r}")
+	return sent_at.strftime(RESTART_SENT_AT_FORMAT)
+
+
+def _restart_label(status, sent_at) -> str:
+	"""The restart label of `restart_status`; ValueError for a status it does not know."""
+	if status not in RESTART_LABELS:
+		raise ValueError(f"restart_status không hỗ trợ: {status!r}")
+	if status == RESTART_STATUS_SENT and sent_at:
+		return RESTART_SENT_AT_LABEL.format(sent_at=_sent_at_text(sent_at))
+	return RESTART_LABELS[status]
+
+
 def proposal_notes(proposal_fields) -> list[str]:
 	"""Sentences for the bot comment and the review form (design 3.9; block shape CHG-002 3.7).
 
 	`proposal_fields` is the proposal document or a dict of its fields; only those stored
 	fields are read, never git. A sentence whose value is missing or carries a URL is left out.
 	A block (child rows or a `command_list`) starts with its counts, items and commands.
+	A filled `restart_status` adds its label as the last line, for every shape.
 	"""
 	rows = proposal_fields.get("operations")
 	command_list = proposal_fields.get("command_list")
@@ -197,4 +241,7 @@ def proposal_notes(proposal_fields) -> list[str]:
 			notes.append("Sau khi áp dụng cần người chạy bench restart.")
 	elif not is_block and proposal_fields.get("change_kind") == CHANGE_KIND_COMMAND:
 		notes.append("Lệnh bench không hoàn tác được.")
+	restart_status = proposal_fields.get("restart_status")
+	if restart_status:
+		notes.append(_restart_label(restart_status, proposal_fields.get("restart_sent_at")))
 	return notes

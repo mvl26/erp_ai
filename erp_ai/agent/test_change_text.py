@@ -1,3 +1,4 @@
+import datetime
 import json
 
 import frappe
@@ -12,7 +13,16 @@ from erp_ai.agent.change_text import (
 	undo_message,
 )
 from erp_ai.agent.tools.change_guard import FileOp
-from erp_ai.constants import CHANGE_OP_CREATE, CHANGE_OP_DELETE, CHANGE_OP_EDIT, CHANGE_OP_RENAME
+from erp_ai.constants import (
+	CHANGE_OP_CREATE,
+	CHANGE_OP_DELETE,
+	CHANGE_OP_EDIT,
+	CHANGE_OP_RENAME,
+	RESTART_STATUS_CONFIRMED,
+	RESTART_STATUS_LAUNCH_FAILED,
+	RESTART_STATUS_SENT,
+	RESTART_STATUS_UNCONFIRMED,
+)
 
 
 class TestChangeText(FrappeTestCase):
@@ -605,3 +615,173 @@ class TestBlockNotes(FrappeTestCase):
 				self.assertNotIn("://", text)
 				self.assertNotIn("ghp_FAKE123", text)
 				self.assertNotIn("github.com", text)
+
+
+SENT_AT = datetime.datetime(2026, 11, 15, 14, 5, 9, 123456)
+SENT_LABEL = "Restart: đã gửi lúc 14:05 15/11/2026, chờ xác nhận."
+SENT_NO_TIME_LABEL = "Restart: đã gửi, chờ xác nhận."
+CONFIRMED_LABEL = "Restart: đã xác nhận, web và worker đã khởi động lại."
+UNCONFIRMED_LABEL = (
+	"Restart: chưa xác nhận (có thể chưa được cấp quyền restart). Việc người còn phải làm: restart bench."
+)
+LAUNCH_FAILED_LABEL = "Restart: lỗi khởi chạy. Việc người còn phải làm: restart bench."
+
+
+class TestRestartLabel(FrappeTestCase):
+	def test_four_values_exact_text(self):
+		# each status gives its own line; a swapped constant fails on exact text
+		for status, label in (
+			(RESTART_STATUS_SENT, SENT_LABEL),
+			(RESTART_STATUS_CONFIRMED, CONFIRMED_LABEL),
+			(RESTART_STATUS_UNCONFIRMED, UNCONFIRMED_LABEL),
+			(RESTART_STATUS_LAUNCH_FAILED, LAUNCH_FAILED_LABEL),
+		):
+			with self.subTest(status=status):
+				self.assertEqual(
+					proposal_notes(code_fields(restart_status=status, restart_sent_at=SENT_AT)),
+					[BRANCH_NOTE, UPSTREAM_NOTE, label],
+				)
+
+	def test_unconfirmed_says_permission_may_be_missing_and_todo_restart(self):
+		label = proposal_notes(code_fields(restart_status=RESTART_STATUS_UNCONFIRMED))[-1]
+		self.assertEqual(label, UNCONFIRMED_LABEL)
+		self.assertIn("có thể chưa được cấp quyền restart", label)
+		self.assertIn("Việc người còn phải làm: restart bench.", label)
+
+	def test_empty_status_no_label(self):
+		# None or "": exactly the output without the label (e6cda3e), even with a sent time stored
+		for status in (None, ""):
+			with self.subTest(status=status):
+				self.assertEqual(
+					proposal_notes(code_fields(restart_status=status, restart_sent_at=SENT_AT)),
+					[BRANCH_NOTE, UPSTREAM_NOTE],
+				)
+				self.assertEqual(
+					proposal_notes(code_fields(file_path="helpdesk/helpdesk/api.py", restart_status=status)),
+					[BRANCH_NOTE, UPSTREAM_NOTE, RESTART_NOTE],
+				)
+				self.assertEqual(
+					proposal_notes(block_fields(ONE_EDIT, [], restart_status=status)),
+					[
+						"Gồm 1 sửa, 0 tạo, 0 xóa, 0 đổi tên; 0 lệnh.",
+						"sửa helpdesk/helpdesk/hooks.py",
+						BRANCH_NOTE,
+						UPSTREAM_NOTE,
+					],
+				)
+
+	def test_label_is_last_line(self):
+		# block with commands, applied with a commit: the label follows the commit sentence
+		self.assertEqual(
+			proposal_notes(
+				block_fields(
+					ONE_EDIT,
+					[MIGRATE_COMMAND, ["restart"]],
+					change_status="Đã áp dụng",
+					apply_commit_sha=APPLY_SHA,
+					restart_status=RESTART_STATUS_CONFIRMED,
+				)
+			),
+			[
+				"Gồm 1 sửa, 0 tạo, 0 xóa, 0 đổi tên; 2 lệnh.",
+				"sửa helpdesk/helpdesk/hooks.py",
+				"lệnh: bench --site miyano migrate",
+				"lệnh: bench restart",
+				BLOCK_RESTART_NOTE,
+				BLOCK_COMMANDS_NOTE,
+				BRANCH_NOTE,
+				UPSTREAM_NOTE,
+				f"Commit áp dụng: {APPLY_SHA}.",
+				CONFIRMED_LABEL,
+			],
+		)
+		# legacy .py, applied with a commit: the label follows the old restart sentence
+		self.assertEqual(
+			proposal_notes(
+				code_fields(
+					file_path="helpdesk/helpdesk/api.py",
+					change_status="Đã áp dụng",
+					apply_commit_sha=APPLY_SHA,
+					restart_status=RESTART_STATUS_LAUNCH_FAILED,
+				)
+			),
+			[BRANCH_NOTE, UPSTREAM_NOTE, f"Commit áp dụng: {APPLY_SHA}.", RESTART_NOTE, LAUNCH_FAILED_LABEL],
+		)
+		# commands-only block: the label follows the block lines
+		self.assertEqual(
+			proposal_notes(
+				block_fields(
+					[],
+					[["restart"]],
+					change_kind="Lệnh bench",
+					target_branch="",
+					upstream_ref="",
+					restart_status=RESTART_STATUS_UNCONFIRMED,
+				)
+			),
+			[
+				"Gồm 0 sửa, 0 tạo, 0 xóa, 0 đổi tên; 1 lệnh.",
+				"lệnh: bench restart",
+				BLOCK_RESTART_NOTE,
+				BLOCK_COMMANDS_NOTE,
+				UNCONFIRMED_LABEL,
+			],
+		)
+
+	def test_sent_time_from_datetime_and_iso_string(self):
+		# a naive datetime and the Frappe string of the same time give the same clock time, unchanged
+		for sent_at in (
+			SENT_AT,
+			"2026-11-15 14:05:09.123456",
+			"2026-11-15 14:05:09",
+			"2026-11-15T14:05:00",
+		):
+			with self.subTest(sent_at=sent_at):
+				self.assertEqual(
+					proposal_notes(code_fields(restart_status=RESTART_STATUS_SENT, restart_sent_at=sent_at))[
+						-1
+					],
+					SENT_LABEL,
+				)
+		# day and month are not swapped: 03/11 reads as day 3, month 11
+		self.assertEqual(
+			proposal_notes(
+				code_fields(
+					restart_status=RESTART_STATUS_SENT,
+					restart_sent_at=datetime.datetime(2026, 11, 3, 9, 7),
+				)
+			)[-1],
+			"Restart: đã gửi lúc 09:07 03/11/2026, chờ xác nhận.",
+		)
+
+	def test_sent_without_time_drops_time_part(self):
+		for sent_at in (None, ""):
+			with self.subTest(sent_at=sent_at):
+				self.assertEqual(
+					proposal_notes(code_fields(restart_status=RESTART_STATUS_SENT, restart_sent_at=sent_at)),
+					[BRANCH_NOTE, UPSTREAM_NOTE, SENT_NO_TIME_LABEL],
+				)
+		self.assertEqual(
+			proposal_notes(code_fields(restart_status=RESTART_STATUS_SENT)),
+			[BRANCH_NOTE, UPSTREAM_NOTE, SENT_NO_TIME_LABEL],
+		)
+
+	def test_aware_or_bad_sent_at_raises_value_error(self):
+		for sent_at in (
+			SENT_AT.replace(tzinfo=datetime.UTC),
+			"2026-11-15 14:05:00+07:00",
+			"15/11/2026 14:05",
+			"not a date",
+			1763215500,
+			datetime.date(2026, 11, 15),
+		):
+			with self.subTest(sent_at=sent_at):
+				with self.assertRaises(ValueError):
+					proposal_notes(code_fields(restart_status=RESTART_STATUS_SENT, restart_sent_at=sent_at))
+
+	def test_unknown_status_raises_value_error(self):
+		for status in ("Đang gửi", "đã gửi", "Restart"):
+			with self.subTest(status=status):
+				with self.assertRaises(ValueError) as caught:
+					proposal_notes(code_fields(restart_status=status))
+				self.assertEqual(str(caught.exception), f"restart_status không hỗ trợ: {status!r}")

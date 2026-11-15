@@ -2,10 +2,11 @@ import dataclasses
 import json
 import time
 import uuid
+from datetime import datetime
 
 import frappe
 from frappe.desk.form.document_follow import follow_document
-from frappe.utils import escape_html, get_fullname, now_datetime
+from frappe.utils import escape_html, get_fullname, getdate, now_datetime
 
 from erp_ai import gateway
 from erp_ai.agent import authority, policy, site_facts
@@ -45,6 +46,7 @@ from erp_ai.agent.tools.write_ticket import (
 	ROUTE_DONE,
 	created_labels,
 	keep_human_fields,
+	post_notice,
 )
 from erp_ai.constants import (
 	AGENT_USER,
@@ -118,6 +120,25 @@ ROUTE_WATCHER = "Đã thêm {person} làm người theo dõi."
 WATCHER_TOOL = "add_watcher"
 REASON_ALREADY_FOLLOWING = "đã theo dõi"
 REASON_FOLLOW_OFF = "người theo dõi tắt nhận theo dõi tài liệu"
+# Status notices of the run (AC-23, U4b.md:216-222): one comment per kind and period, through write_ticket.post_notice.
+NOTICE_TOOL = "post_notice"
+DAILY_LIMIT_BODY = (
+	"đã dùng hết {limit} lần chạy trong ngày. Bot xử lý tiếp từ ngày mai; cần gấp thì nhờ người phụ trách."
+)
+OVER_BUDGET_BODY = (
+	"chi phí AI tháng này đã vượt ngân sách, bot chỉ đọc, phân loại và đề xuất, không làm thay đổi gì ngoài phiếu. "
+	"Quản trị tăng ngân sách trên ERP AI Setting để mở lại."
+)
+RUN_FAILED_BODY = "{cause}. Bot sẽ thử lại ở lần quét kế tiếp; cần gấp thì nhờ người phụ trách."
+CAUSE_GATEWAY = "lỗi khi gọi mô hình AI"
+CAUSE_TIME = "hết thời gian của lần chạy"
+# The triggers each notice may be posted for (U4b-fixes Fix 8, A-U4b-13): an allow list, fail-closed for a new
+# trigger. "daily_limit" is not in it: it holds for every trigger that reaches step (d).
+NOTICE_TRIGGERS = {
+	"over_budget": (TRIGGER_TICKET_INSERT, TRIGGER_COMMENT_MENTION, TRIGGER_CHANGE_ACTION),
+	"run_failed": (TRIGGER_TICKET_INSERT, TRIGGER_COMMENT_MENTION, TRIGGER_CHANGE_ACTION),
+	"ask_fallback": (TRIGGER_TICKET_INSERT, TRIGGER_COMMENT_MENTION, TRIGGER_CHANGE_ACTION),
+}
 ROUTE_SAVEPOINT = "erp_ai_route"
 # One write unit after (u1) (assign, comment) nests inside the savepoint above.
 ROUTE_UNIT_SAVEPOINT = "erp_ai_route_unit"
@@ -173,9 +194,13 @@ def _run(ticket_name, trigger, comment_name=None):
 	if not policy.can_send_ticket(ticket_name):
 		_log_skip(ticket_name, trigger, run_id, "not_sendable")
 		return
-	# (d) daily limit counted from the log (AC-15)
-	if policy.runs_today(ticket_name) >= settings.max_runs_per_ticket_per_day:
-		_log_skip(ticket_name, trigger, run_id, "daily_limit")
+	# (d) daily limit counted from the log (AC-15); above L0 the person is told once a day (AC-23, AC-61)
+	limit = settings.max_runs_per_ticket_per_day
+	if policy.runs_today(ticket_name) >= limit:
+		notice = None
+		if policy.effective_level(settings, over_budget=False) != LEVELS[0]:
+			notice = ("daily_limit", DAILY_LIMIT_BODY.format(limit=limit), _start_of_today())
+		_log_skip(ticket_name, trigger, run_id, "daily_limit", notice)
 		return
 	# (e)
 	over_budget = policy.is_over_budget(settings)
@@ -244,6 +269,18 @@ def _run(ticket_name, trigger, comment_name=None):
 			if not proceed:
 				return
 		if level != LEVELS[0]:
+			notices = []
+			# over budget at a base level of L2/L3 the run lost something: said once a day (A-U4b-7)
+			if over_budget and policy.effective_level(settings, over_budget=False) in LEVELS[2:]:
+				entry = _notice(
+					ticket_name,
+					"over_budget",
+					OVER_BUDGET_BODY,
+					_start_of_today(),
+					trigger=trigger,
+					instructor=context.instructor,
+				)
+				notices = [entry] if entry else []
 			_reason(
 				ticket_name,
 				trigger,
@@ -255,6 +292,7 @@ def _run(ticket_name, trigger, comment_name=None):
 				status,
 				delay,
 				field_map=field_map,
+				notices=notices,
 			)
 	finally:
 		_end_status(status, delay, ticket_name, run_id, trigger)
@@ -325,9 +363,11 @@ def _end_status(status, delay, ticket_name, run_id, trigger):
 		pass
 
 
-def _log_skip(ticket_name, trigger, run_id, stop_reason):
+def _log_skip(ticket_name, trigger, run_id, stop_reason, notice=None):
+	"""One `skip` entry; `notice` = (kind, body, since) posts that status notice first, its entry on the row."""
 	# a ticket deleted before the job ran cannot be a Link target; keep the skip entry without it
 	exists = frappe.db.exists("HD Ticket", ticket_name)
+	entry = _notice(ticket_name, *notice, trigger=trigger) if notice and exists else None
 	write_entry(
 		ticket=ticket_name if exists else None,
 		error=None if exists else f"ticket_missing {ticket_name}",
@@ -336,6 +376,65 @@ def _log_skip(ticket_name, trigger, run_id, stop_reason):
 		trigger=trigger,
 		turn=0,
 		stop_reason=stop_reason,
+		actions=[entry] if entry else None,
+	)
+
+
+def _start_of_today() -> datetime:
+	"""00:00 of today, system time: the same mark as `policy.runs_today`."""
+	return datetime.combine(getdate(), datetime.min.time())
+
+
+def _notice(ticket_name, notice, body, since, *, trigger, instructor=None) -> dict | None:
+	"""Post one status notice of the run (U4b-fixes Fix 8); returns its action entry, or None when nothing was written.
+
+	A kind of NOTICE_TRIGGERS is posted only for its listed triggers. One of the kind already posted on the ticket
+	since `since` (or any refusal of post_notice) writes nothing, so it has no entry.
+	"""
+	if notice in NOTICE_TRIGGERS and trigger not in NOTICE_TRIGGERS[notice]:
+		return None
+	result = post_notice(ticket_name, notice, body, since)
+	if not result.get("ok"):
+		return None
+	return action_entry(
+		NOTICE_TOOL, "Comment", result["comment"], True, value_after={"notice": notice}, instructor=instructor
+	)
+
+
+def _last_success_at(ticket_name) -> datetime | None:
+	"""When the ticket last had a successful step: a classify row with a category, or a reason row that did not stop
+	on the gateway or the time budget (U4b.md:241). The mark of the run_failed notice (A-U4b-5)."""
+	classified = frappe.get_all(
+		LOG_DOCTYPE,
+		filters={"ticket": ticket_name, "entry_type": "classify", "predicted_category": ("is", "set")},
+		pluck="creation",
+		order_by="creation desc",
+		limit=1,
+	)
+	reasoned = frappe.get_all(
+		LOG_DOCTYPE,
+		filters={
+			"ticket": ticket_name,
+			"entry_type": "reason",
+			"stop_reason": ("not in", (STOP_GATEWAY_ERROR, STOP_TIME_BUDGET)),
+		},
+		pluck="creation",
+		order_by="creation desc",
+		limit=1,
+	)
+	return max([*classified, *reasoned], default=None)
+
+
+def _failure_notice(ticket_name, exc, trigger, instructor) -> dict | None:
+	"""The run_failed notice of a gateway error, once per chain of failures since the last success (AC-23)."""
+	cause = CAUSE_TIME if exc.kind == DEADLINE_KIND else CAUSE_GATEWAY
+	return _notice(
+		ticket_name,
+		"run_failed",
+		RUN_FAILED_BODY.format(cause=cause),
+		_last_success_at(ticket_name) or datetime.min,
+		trigger=trigger,
+		instructor=instructor,
 	)
 
 
@@ -401,12 +500,17 @@ def _classify(
 			deadline=deadline,
 		)
 	except gateway.GatewayError as exc:
+		# above L0 the person is told, its entry on this failed row; at L0 the bot says nothing (AC-23)
+		failed = None
+		if context is not None:
+			failed = _failure_notice(ticket_name, exc, trigger, context.instructor)
 		write_entry(
 			**base,
 			error="; ".join([f"{exc.kind} status={exc.status}", *status.take_errors()]),
 			stop_reason="gateway_error",
 			credential_label=exc.credential_label,
 			keys_tried=exc.keys_tried,
+			actions=[failed] if failed else None,
 		)
 		_log_classify(ticket_name, run_id, False, ticket.creation)
 		return False, None, context
@@ -877,12 +981,25 @@ def _routing_table(context) -> str:
 
 
 def _reason(
-	ticket_name, trigger, run_id, settings, context, classification, deadline, status, delay, field_map=None
+	ticket_name,
+	trigger,
+	run_id,
+	settings,
+	context,
+	classification,
+	deadline,
+	status,
+	delay,
+	field_map=None,
+	notices=None,
 ):
 	"""Reasoning step (design 4.3 step 8): at most `max_turns_per_run` model turns, one `reason` entry each.
 
 	The first message carries the configured ticket fields that hold a value as data (AC-24, U4b.md:249).
+	`notices` are the entries of notices posted before this step: they go on the first entry written (U4b.md:250).
+	A gateway error posts the run_failed notice on its own entry (U4b.md:251).
 	"""
+	pending = list(notices or [])
 	comments = authority.fetch_ticket_comments(ticket_name)
 	# the role is decided on the owner; only then is the author replaced by the full name shown to the model
 	labelled = [
@@ -935,6 +1052,7 @@ def _reason(
 				deadline=deadline,
 			)
 		except gateway.GatewayError as exc:
+			failed = _failure_notice(ticket_name, exc, trigger, context.instructor)
 			write_entry(
 				**base,
 				turn=turn,
@@ -942,6 +1060,7 @@ def _reason(
 				stop_reason=STOP_TIME_BUDGET if exc.kind == DEADLINE_KIND else STOP_GATEWAY_ERROR,
 				credential_label=exc.credential_label,
 				keys_tried=exc.keys_tried,
+				actions=[*pending, *([failed] if failed else [])] or None,
 			)
 			return
 
@@ -962,6 +1081,9 @@ def _reason(
 			wants_tools = stop_reason == STOP_TOOL_USE
 			if wants_tools and turn == max_turns:
 				stop_reason = STOP_MAX_TURNS
+			# the notices posted before this step go on its first entry, ahead of the turn's own writes
+			actions[:0] = pending
+			pending = []
 			write_entry(
 				**base,
 				**_call_fields(result),

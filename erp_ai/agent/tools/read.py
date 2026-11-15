@@ -34,6 +34,16 @@ MAX_SEARCH_LIMIT = 10
 QUERY_MIN_CHARS = 2
 QUERY_MAX_CHARS = 100
 SEARCH_SCAN_MAX = 50
+EMPTY_QUERY_REASON = "câu tìm cần ít nhất một từ dài 2 ký tự"
+SEARCH_FIELDS = ("subject", "description", "resolution_details")
+SEARCH_RESULT_FIELDS = (
+	"name",
+	"subject",
+	"ticket_type",
+	"agent_group",
+	"resolution_date",
+	"resolution_details",
+)
 MAX_DOCTYPE_ECHO = 80
 
 
@@ -95,12 +105,15 @@ def list_comments(args: dict, ctx: ToolContext) -> dict:
 	return {"ok": True, "comments": comments}
 
 
-def _like_pattern(query: str) -> str:
-	escaped = query.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
-	return f"%{escaped}%"
+def _like_pattern(word: str) -> str:
+	# Frappe escapes `\\` and `%` of a like value itself; a `_` left as a wildcard only widens the scan.
+	return f"%{word}%"
 
 
 def search_resolved_tickets(args: dict, ctx: ToolContext) -> dict:
+	# Imported on call: knowledge imports tools.source, which imports `_schema` from this module as it loads.
+	from erp_ai.agent import knowledge
+
 	args = args if isinstance(args, dict) else {}
 	query = args.get("query")
 	limit = args.get("limit", DEFAULT_SEARCH_LIMIT)
@@ -108,33 +121,41 @@ def search_resolved_tickets(args: dict, ctx: ToolContext) -> dict:
 		return _refuse(f"query phải dài {QUERY_MIN_CHARS}..{QUERY_MAX_CHARS} ký tự")
 	if not _is_int(limit) or not 1 <= limit <= MAX_SEARCH_LIMIT:
 		return _refuse(f"limit phải từ 1 đến {MAX_SEARCH_LIMIT}")
-	pattern = _like_pattern(query)
+	words = set(knowledge.tokenize(query))
+	if not words:
+		return _refuse(EMPTY_QUERY_REASON)
+	# ADR-034: excluded tickets are left out by the query itself, before the scan limit and the ranking.
+	excluded, ticket_or = policy.ticket_content_filters("HD Ticket")
+	if ticket_or:
+		raise ValueError("policy.ticket_content_filters gave an OR group for HD Ticket")
 	try:
 		rows = frappe.get_list(
 			"HD Ticket",
-			filters={"status_category": "Resolved"},
-			or_filters=[["subject", "like", pattern], ["description", "like", pattern]],
-			fields=[
-				"name",
-				"subject",
-				"ticket_type",
-				"agent_group",
-				"resolution_date",
-				"resolution_details",
+			filters=[["status_category", "=", "Resolved"], *excluded],
+			or_filters=[
+				[field, "like", _like_pattern(word)] for word in sorted(words) for field in SEARCH_FIELDS
 			],
+			fields=[*SEARCH_RESULT_FIELDS, "description", "modified"],
 			order_by="modified desc",
 			limit_page_length=SEARCH_SCAN_MAX,
 		)
 	except frappe.PermissionError:
 		return _refuse("không có quyền đọc phiếu")
-	tickets = []
+	ranked = []
 	for row in rows:
-		if not policy.can_send_ticket(row.name):
-			continue
-		row["resolution_details"] = _clean(row.get("resolution_details"), RESOLUTION_MAX_CHARS)
-		tickets.append(dict(row))
-		if len(tickets) == limit:
-			break
+		# Score: distinct query words found whole; one space between the fields keeps their words apart.
+		description, details = (
+			knowledge.plain_text(row.description),
+			knowledge.plain_text(row.resolution_details),
+		)
+		if score := len(words & knowledge.text_words(f"{row.subject or ''} {description} {details}")):
+			ranked.append((score, row.modified, row))
+	ranked.sort(key=lambda item: item[:2], reverse=True)
+	tickets = []
+	for _score, _modified, row in ranked[:limit]:
+		ticket = {field: row.get(field) for field in SEARCH_RESULT_FIELDS}
+		ticket["resolution_details"] = _clean(row.resolution_details, RESOLUTION_MAX_CHARS)
+		tickets.append(ticket)
 	return {"ok": True, "tickets": tickets}
 
 

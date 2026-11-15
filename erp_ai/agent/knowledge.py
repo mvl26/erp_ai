@@ -114,9 +114,7 @@ def search_manuals(
 			sections = list(_sections(path))
 		except OSError as error:
 			# Skip only this file; no absolute path and no `str(error)` in the log (it carries one).
-			source._logger().warning(
-				"search_manuals skipped %s: %s", document, type(error).__name__
-			)
+			source._logger().warning("search_manuals skipped %s: %s", document, type(error).__name__)
 			continue
 		for line, heading, text in sections:
 			matched = set(words) & set(_words(text))

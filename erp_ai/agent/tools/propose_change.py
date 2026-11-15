@@ -34,6 +34,7 @@ PATH_MAX_CHARS = 300
 APP_MAX_CHARS = 100
 DIFF_CONTEXT_LINES = 3
 COMMENT_DOCTYPE = "Comment"
+OPEN_PROPOSAL_LABEL = "Mở đề xuất để Duyệt hoặc Từ chối"
 NO_INSTRUCTOR = "không có người ra lệnh"
 # Design table 3.1: these sentences are the contract with the model and the tests.
 NO_PERMISSION = "thiếu quyền tạo đề xuất"
@@ -116,7 +117,7 @@ def _diff(rel_path: str, before: str, after: str, tofile: str | None = None) -> 
 
 def _comment(ctx: ToolContext, proposal) -> str:
 	"""One ticket comment (design 3.8): the escaped first sentence, the notes of design 3.9 and the
-	Duyệt / Từ chối links; returns the Comment name.
+	Duyệt / Từ chối links (only while switch (5) is on; otherwise one link to the form); returns the Comment name.
 
 	A block (child rows or a `command_list`, CHG-002 design 3.7) says `khối {n} mục trong app {app}`
 	with `{n}` the number of items, or `{m} lệnh bench` when it has only commands, `{m}` counting
@@ -142,13 +143,16 @@ def _comment(ctx: ToolContext, proposal) -> str:
 	form = f"/app/erp-ai-change-proposal/{proposal.name}"
 	html = f'<p>Đề xuất <a href="{escape(form)}">{escape(name)}</a> đang chờ duyệt: {target}.</p>'
 	html += "".join(f"<p>{escape(line)}</p>" for line in change_text.proposal_notes(proposal))
-	approve = change_link.decision_path(proposal.name, change_link.ACTION_APPROVE)
-	reject = change_link.decision_path(proposal.name, change_link.ACTION_REJECT)
-	html += (
-		f'<p><a href="{escape(approve)}"><strong>Duyệt</strong></a> · '
-		f'<a href="{escape(reject)}"><strong>Từ chối</strong></a> · '
-		f'<a href="{escape(form)}">Xem nội dung thay đổi</a></p>'
-	)
+	if ctx.one_click_approval:
+		approve = change_link.decision_path(proposal.name, change_link.ACTION_APPROVE)
+		reject = change_link.decision_path(proposal.name, change_link.ACTION_REJECT)
+		html += (
+			f'<p><a href="{escape(approve)}"><strong>Duyệt</strong></a> · '
+			f'<a href="{escape(reject)}"><strong>Từ chối</strong></a> · '
+			f'<a href="{escape(form)}">Xem nội dung thay đổi</a></p>'
+		)
+	else:
+		html += f'<p><a href="{escape(form)}">{OPEN_PROPOSAL_LABEL}</a></p>'
 	return frappe.get_doc(TICKET_DOCTYPE, ctx.ticket_name).new_comment(html)
 
 

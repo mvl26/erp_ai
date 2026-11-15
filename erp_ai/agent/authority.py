@@ -106,14 +106,6 @@ def _trigger_comment_author(ticket_name: str, comment_name: str | None) -> str |
 	)
 
 
-def latest_instructor(ticket_name: str) -> str | None:
-	for comment in fetch_ticket_comments(ticket_name):
-		if is_instruction(comment["author"], ticket_name):
-			return comment["author"]
-	owner = frappe.db.get_value("HD Ticket", ticket_name, "owner")
-	return owner if is_instruction(owner, ticket_name) else None
-
-
 def label_comments(ticket_name: str, comments: list[dict]) -> list[dict]:
 	verdicts: dict[str, bool] = {}
 	labelled = []

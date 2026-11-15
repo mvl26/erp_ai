@@ -4594,6 +4594,82 @@ def _run(ticket_name):
 }
 
 
+# ADR-030 QĐ 6 and Ràng buộc: the instructor comes only from the event that queued the run.
+REMOVED_INSTRUCTOR_SCAN = "latest_instructor"
+RUN_INSTRUCTOR_FUNCTION = "run_instructor"
+COMMENT_FETCH_FUNCTION = "fetch_ticket_comments"
+INSTRUCTION_PREDICATE = "is_instruction"
+INSTRUCTOR_SCAN_FILES = (AUTHORITY_FILE, RUNNER_FILE)
+
+
+def check_authority_has_no_comment_scan_for_instructor(sources: dict) -> list:
+	"""ADR-030 QĐ 6: no product code names the removed comment scan, and no function of authority.py or
+	runner.py both fetches the ticket's comments and asks who among them may instruct (AC-13)."""
+	if AUTHORITY_FILE not in sources:
+		return _missing(AUTHORITY_FILE)
+	violations = []
+	for rel, source in only_python(sources).items():
+		tree = parse(rel, source)
+		aliases, docstrings = import_aliases(tree), _docstring_ids(tree)
+		for node in ast.walk(tree):
+			texts = [node.name] if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef) else []
+			if REMOVED_INSTRUCTOR_SCAN in texts + _node_texts(node, aliases, docstrings):
+				violations.append(
+					violation(rel, node, f"names {REMOVED_INSTRUCTOR_SCAN}, a comment scan (ADR-030 QĐ 6)")
+				)
+		if rel not in INSTRUCTOR_SCAN_FILES:
+			continue
+		for function in ast.walk(tree):
+			if not isinstance(function, ast.FunctionDef | ast.AsyncFunctionDef):
+				continue
+			called = {
+				resolved_name(node.func, aliases).rpartition(".")[2]
+				for node in ast.walk(function)
+				if isinstance(node, ast.Call)
+			}
+			if {COMMENT_FETCH_FUNCTION, INSTRUCTION_PREDICATE} <= called:
+				violations.append(
+					violation(
+						rel,
+						function,
+						f"{function.name} picks the instructor by scanning the ticket's comments (ADR-030 QĐ 6)",
+					)
+				)
+	return violations
+
+
+# Compliant sample of the ADR-030 QĐ 6 rule; each violating sample is one change of it.
+INSTRUCTOR_SCAN_CLEAN = {
+	AUTHORITY_FILE: """import frappe
+
+
+def fetch_ticket_comments(ticket_name):
+	return frappe.get_list("Comment", filters={"reference_name": ticket_name})
+
+
+def is_instruction(author, ticket_name):
+	return bool(author)
+
+
+def run_instructor(ticket_name, trigger, comment_name=None):
+	author = frappe.db.get_value("Comment", comment_name, "owner")
+	return author if is_instruction(author, ticket_name) else None
+
+
+def label_comments(ticket_name, comments):
+	return [is_instruction(comment["author"], ticket_name) for comment in comments]
+""",
+	RUNNER_FILE: """from erp_ai.agent import authority
+
+
+def _run(ticket_name, trigger, comment_name):
+	instructor = authority.run_instructor(ticket_name, trigger, comment_name)
+	comments = authority.label_comments(ticket_name, authority.fetch_ticket_comments(ticket_name))
+	return instructor, comments
+""",
+}
+
+
 # Compliant sample: policy names the two constants, the log lists the same triggers as strings.
 RUN_LIMIT_SAMPLE = {
 	CONSTANTS_FILE: (
@@ -5631,6 +5707,11 @@ class TestArchitecture(unittest.TestCase):
 	def test_set_user_agent_only_in_enter_agent_session(self):
 		self.assertEqual(check_set_user_agent_only_in_enter_agent_session(self.sources), [])
 		self.assertIn(f"def {SESSION_SWITCH_FUNCTION}(", self.sources[AUTHORITY_FILE])
+
+	def test_authority_has_no_comment_scan_for_instructor(self):
+		self.assertIn(f"def {RUN_INSTRUCTOR_FUNCTION}(", self.sources[AUTHORITY_FILE])
+		self.assertIn(f"authority.{RUN_INSTRUCTOR_FUNCTION}(", self.sources[RUNNER_FILE])
+		self.assertEqual(check_authority_has_no_comment_scan_for_instructor(self.sources), [])
 
 	def test_agent_modules_import_alone_in_fresh_process(self):
 		# STD-DESIGN-6: an import cycle stays hidden in-process when another test imported a module first.
@@ -8589,6 +8670,54 @@ class TestScannersCatchViolations(unittest.TestCase):
 				self.changed(SESSION_SWITCH_CLEAN, RUNNER_FILE, clean)
 			),
 			[],
+		)
+
+	def test_instructor_scan_scanner_catches_each_comment_scan(self):
+		self.assertEqual(check_authority_has_no_comment_scan_for_instructor(INSTRUCTOR_SCAN_CLEAN), [])
+		scan = (
+			"\n\ndef {}(ticket_name):\n\tfor comment in fetch_ticket_comments(ticket_name):\n"
+			"\t\tif is_instruction(comment['author'], ticket_name):\n\t\t\treturn comment['author']\n"
+		)
+		# the removed function back (the pre-T80 shape), and the same loop under another name
+		for name, fragment in (
+			(REMOVED_INSTRUCTOR_SCAN, REMOVED_INSTRUCTOR_SCAN),
+			("newest_boss", "newest_boss"),
+		):
+			with self.subTest(name=name):
+				sources = self.changed(INSTRUCTOR_SCAN_CLEAN, AUTHORITY_FILE, scan.format(name))
+				self.assertCaught(
+					check_authority_has_no_comment_scan_for_instructor(sources),
+					f"{AUTHORITY_FILE}:",
+					fragment,
+					"ADR-030 QĐ 6",
+				)
+		# the runner calling it, by attribute, by alias or by name in a string
+		for caller in (
+			"authority.latest_instructor(ticket_name)",
+			"from erp_ai.agent.authority import latest_instructor as pick",
+			"patch_target = 'latest_instructor'",
+		):
+			with self.subTest(caller=caller):
+				sources = self.changed(INSTRUCTOR_SCAN_CLEAN, RUNNER_FILE, f"\n{caller}\n")
+				self.assertCaught(
+					check_authority_has_no_comment_scan_for_instructor(sources),
+					f"{RUNNER_FILE}:",
+					"ADR-030 QĐ 6",
+				)
+		# a runner function doing the scan itself
+		runner_scan = (
+			"\n\ndef _boss(ticket_name):\n\tfor comment in authority.fetch_ticket_comments(ticket_name):\n"
+			"\t\tif authority.is_instruction(comment['author'], ticket_name):\n\t\t\treturn comment['author']\n"
+		)
+		self.assertCaught(
+			check_authority_has_no_comment_scan_for_instructor(
+				self.changed(INSTRUCTOR_SCAN_CLEAN, RUNNER_FILE, runner_scan)
+			),
+			"_boss",
+		)
+		missing = {rel: src for rel, src in INSTRUCTOR_SCAN_CLEAN.items() if rel != AUTHORITY_FILE}
+		self.assertCaught(
+			check_authority_has_no_comment_scan_for_instructor(missing), AUTHORITY_FILE, "missing"
 		)
 
 

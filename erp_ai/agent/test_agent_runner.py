@@ -14,7 +14,7 @@ from frappe.tests.utils import FrappeTestCase
 from helpdesk.test_utils import make_ticket
 
 from erp_ai import tasks
-from erp_ai.agent import answer_delay, authority, runner
+from erp_ai.agent import answer_delay, authority, policy, runner
 from erp_ai.agent.agent_write_guard import allow_agent_write
 from erp_ai.agent.classification import DEFAULT_CATEGORY_MAPPING
 from erp_ai.agent.prompts import (
@@ -28,7 +28,7 @@ from erp_ai.agent.prompts import (
 	build_routing_table,
 )
 from erp_ai.agent.run_log import write_entry
-from erp_ai.agent.tools import site_api
+from erp_ai.agent.tools import registry, site_api
 from erp_ai.agent.tools.read import TOOL_RESULT_MAX_CHARS
 from erp_ai.agent.tools.registry import get_tool_schemas
 from erp_ai.agent.tools.source import GIT_READ_SUBCOMMANDS, git_global_options
@@ -77,6 +77,9 @@ TICKET_FIELDS = [
 	"ai_resolution_hint",
 ]
 DAILY_LIMIT = 2  # not the DocType default (5), so the run must read the Setting
+# A classified ticket above every threshold (pct 100 >= any 0..100 threshold); the category is outside
+# policy.CATEGORIES so main_path_level reads UNKNOWN_CATEGORY_LEVEL and no level_cap_<x> of the shared site (STD-TEST-6).
+SEEDED_CLASSIFICATION = (f"{PREFIX}category", 100)
 
 
 def tool_use(block_id, tool_name, /, **arguments):
@@ -105,6 +108,7 @@ class RunnerTestBase(FrappeTestCase):
 			answer_delay_max_s=0,
 			routing_rules=make_routing_rules(),
 			auto_assign_enabled=0,
+			confidence_threshold=policy.DEFAULT_CONFIDENCE_THRESHOLD,
 		)
 		# No status signal reaches Redis and no run sleeps for real (the delay is 0 here; a test that sets one reads `sleeps`).
 		self.signals = record_status_signals(self)
@@ -120,6 +124,12 @@ class RunnerTestBase(FrappeTestCase):
 		month_spend_patch = patch("erp_ai.agent.policy.month_spend_usd", return_value=0.0)
 		self.month_spend = month_spend_patch.start()
 		self.addCleanup(month_spend_patch.stop)
+		# The newest classify row never comes from the shared site's live ERP AI Log rows (STD-TEST-6); a test that needs
+		# the real reader sets `self.latest_classification.side_effect = self.real_latest_classification`.
+		self.real_latest_classification = policy.latest_classification
+		latest_patch = patch.object(policy, "latest_classification", return_value=SEEDED_CLASSIFICATION)
+		self.latest_classification = latest_patch.start()
+		self.addCleanup(latest_patch.stop)
 
 	def _entries(self, **filters):
 		return frappe.get_all(
@@ -849,7 +859,7 @@ class TestRunnerReasoning(RunnerTestBase):
 				latency_ms=90,
 			),
 		]
-		with patch.object(authority, "latest_instructor", return_value="Administrator"):
+		with patch.object(authority, "run_instructor", return_value="Administrator"):
 			self._run("comment_mention")
 
 		first, second = self._reason_entries()
@@ -933,7 +943,7 @@ class TestRunnerReasoning(RunnerTestBase):
 			self.assertNotIn(f": {uid}", text)
 
 	def test_create_task_offered_only_with_instructor(self):
-		with patch.object(authority, "latest_instructor", return_value="Administrator"):
+		with patch.object(authority, "run_instructor", return_value="Administrator"):
 			self._run("comment_mention")
 
 		self.assertIn("create_task", [tool["name"] for tool in self.gateway.calls[0]["tools"]])
@@ -943,7 +953,7 @@ class TestRunnerReasoning(RunnerTestBase):
 			{"name": "c1", "author": "Administrator", "creation": "2026-01-01", "content": "<p>xin chào</p>"}
 		]
 		with (
-			patch.object(authority, "latest_instructor", return_value=None),
+			patch.object(authority, "run_instructor", return_value=None),
 			patch.object(authority, "fetch_ticket_comments", return_value=comments) as fetch,
 			patch.object(authority, "is_instruction", wraps=authority.is_instruction) as is_instruction,
 			patch.object(runner, "get_fullname", return_value=f"{PREFIX}Họ Tên") as get_fullname,
@@ -1211,7 +1221,7 @@ class TestRunnerSiteAdminTools(RunnerTestBase):
 		return [name for name in names if name in SITE_ADMIN_TOOL_NAMES], call["system"][0]["text"]
 
 	def test_offered_with_switch_l3_and_instructor(self):
-		with patch.object(authority, "latest_instructor", return_value="Administrator"):
+		with patch.object(authority, "run_instructor", return_value="Administrator"):
 			self._run("comment_mention")
 
 		names, system = self._offered()
@@ -1219,7 +1229,7 @@ class TestRunnerSiteAdminTools(RunnerTestBase):
 		self.assertIn(SITE_ADMIN_TOOLS_BLOCK, system)
 
 	def test_not_offered_without_instructor(self):
-		with patch.object(authority, "latest_instructor", return_value=None):
+		with patch.object(authority, "run_instructor", return_value=None):
 			self._run("comment_mention")
 
 		names, system = self._offered()
@@ -1231,7 +1241,7 @@ class TestRunnerSiteAdminTools(RunnerTestBase):
 			set_agent_settings(permission_level="L3", code_change_enabled=1)
 			set_agent_settings(**settings)
 			self.gateway.calls.clear()
-			with patch.object(authority, "latest_instructor", return_value="Administrator"):
+			with patch.object(authority, "run_instructor", return_value="Administrator"):
 				self._run("comment_mention")
 
 			names, system = self._offered()
@@ -1246,7 +1256,7 @@ class TestRunnerSiteAdminTools(RunnerTestBase):
 		):
 			set_agent_settings(**settings)
 			self.gateway.calls.clear()
-			with patch.object(authority, "latest_instructor", return_value="Administrator"):
+			with patch.object(authority, "run_instructor", return_value="Administrator"):
 				self._run("comment_mention")
 
 			(call,) = self.gateway.calls
@@ -1260,7 +1270,7 @@ class TestRunnerSiteAdminTools(RunnerTestBase):
 
 	def test_unrestricted_switch_offers_nothing_without_instructor(self):
 		set_agent_settings(unrestricted_enabled=1)
-		with patch.object(authority, "latest_instructor", return_value=None):
+		with patch.object(authority, "run_instructor", return_value=None):
 			self._run("comment_mention")
 
 		(call,) = self.gateway.calls
@@ -1282,7 +1292,7 @@ class TestRunnerSiteAdminTools(RunnerTestBase):
 			"api_call_method": {"ok": True, "method": "frappe.client.get_count", "result": 1},
 		}
 		with (
-			patch.object(authority, "latest_instructor", return_value=INSTRUCTOR),
+			patch.object(authority, "run_instructor", return_value=INSTRUCTOR),
 			patch.object(runner, "execute_tool", side_effect=lambda name, args, ctx: results[name]),
 		):
 			self._run("comment_mention")
@@ -1326,7 +1336,7 @@ class TestRunnerSiteAdminTools(RunnerTestBase):
 			"propose_bench_command": {"ok": False, "reason": "lệnh không có trong danh sách cho phép"},
 		}
 		with (
-			patch.object(authority, "latest_instructor", return_value="Administrator"),
+			patch.object(authority, "run_instructor", return_value="Administrator"),
 			patch.object(runner, "execute_tool", side_effect=lambda name, args, ctx: results[name]),
 		):
 			self._run("comment_mention")
@@ -1371,7 +1381,7 @@ class TestRunnerSiteAdminTools(RunnerTestBase):
 			),
 			make_model_result(),
 		]
-		with patch.object(authority, "latest_instructor", return_value=INSTRUCTOR):
+		with patch.object(authority, "run_instructor", return_value=INSTRUCTOR):
 			self._run("comment_mention")
 
 		note = frappe.db.get_value("Note", {"title": title}, "name")
@@ -1408,7 +1418,7 @@ class TestRunnerSiteAdminTools(RunnerTestBase):
 			make_model_result(),
 		]
 		with (
-			patch.object(authority, "latest_instructor", return_value=INSTRUCTOR),
+			patch.object(authority, "run_instructor", return_value=INSTRUCTOR),
 			patch.object(runner, "execute_tool", side_effect=RuntimeError("boom")),
 		):
 			self._run("comment_mention")
@@ -1460,7 +1470,7 @@ class TestRunnerRecordToolValues(RunnerTestBase):
 			return result
 
 		with (
-			patch.object(authority, "latest_instructor", return_value=INSTRUCTOR),
+			patch.object(authority, "run_instructor", return_value=INSTRUCTOR),
 			patch.object(runner, "execute_tool", side_effect=spy),
 		):
 			self._run("comment_mention")
@@ -1650,7 +1660,7 @@ class TestRunnerRecordToolValues(RunnerTestBase):
 			make_model_result(),
 		]
 		with (
-			patch.object(authority, "latest_instructor", return_value=INSTRUCTOR),
+			patch.object(authority, "run_instructor", return_value=INSTRUCTOR),
 			patch.object(runner, "execute_tool", side_effect=delete_with_large_values),
 		):
 			self._run("comment_mention")
@@ -1818,7 +1828,7 @@ class TestRunnerRecordSnapshots(RunnerTestBase):
 		self.gateway.calls.clear()
 		self.gateway.results = [tool_turn(*blocks), make_model_result()]
 		with (
-			patch.object(authority, "latest_instructor", return_value=INSTRUCTOR),
+			patch.object(authority, "run_instructor", return_value=INSTRUCTOR),
 			patch.object(runner, "execute_tool", side_effect=execute or runner.execute_tool),
 		):
 			self._run("comment_mention")
@@ -2263,7 +2273,7 @@ class TestRunnerTurnUndo(RunnerTestBase):
 			return real_release(save_point)
 
 		with (
-			patch.object(authority, "latest_instructor", return_value=INSTRUCTOR),
+			patch.object(authority, "run_instructor", return_value=INSTRUCTOR),
 			patch.object(frappe.db, "savepoint", side_effect=savepoint),
 			patch.object(frappe.db, "rollback", side_effect=rollback),
 			patch.object(frappe.db, "release_savepoint", side_effect=release_savepoint),
@@ -2711,7 +2721,7 @@ class TestRunnerPrivilegeAlarmEndToEnd(RunnerTestBase):
 			),
 			make_model_result(),
 		]
-		with patch.object(authority, "latest_instructor", return_value=INSTRUCTOR):
+		with patch.object(authority, "run_instructor", return_value=INSTRUCTOR):
 			self._run("comment_mention")
 
 		self.assertEqual(self._roles(), sorted([ALARM_KEPT_ROLE, ALARM_ADDED_ROLE]))
@@ -2770,7 +2780,7 @@ class TestRunnerChangeGrant(RunnerTestBase):
 
 	def _call(self, instructor="Administrator"):
 		self.gateway.calls.clear()
-		with patch.object(authority, "latest_instructor", return_value=instructor):
+		with patch.object(authority, "run_instructor", return_value=instructor):
 			self._run("comment_mention")
 		(call,) = self.gateway.calls
 		return [tool["name"] for tool in call["tools"]], call["system"]
@@ -2944,7 +2954,7 @@ class TestRunnerProposeLogAndInjection(RunnerTestBase):
 			"propose_new_file": {"ok": False, "reason": "file đã tồn tại; dùng propose_file_change để sửa"},
 		}
 		with (
-			patch.object(authority, "latest_instructor", return_value="Administrator"),
+			patch.object(authority, "run_instructor", return_value="Administrator"),
 			patch.object(runner, "execute_tool", side_effect=lambda name, args, ctx: results[name]),
 		):
 			self._run("comment_mention")
@@ -2999,7 +3009,7 @@ class TestRunnerProposeLogAndInjection(RunnerTestBase):
 		]
 		real_popen = subprocess.Popen
 		with (
-			patch.object(authority, "latest_instructor", return_value="Administrator"),
+			patch.object(authority, "run_instructor", return_value="Administrator"),
 			patch.object(frappe, "enqueue") as enqueue,
 			patch.object(
 				subprocess, "Popen", side_effect=lambda *args, **kwargs: real_popen(*args, **kwargs)
@@ -3028,3 +3038,103 @@ class TestRunnerProposeLogAndInjection(RunnerTestBase):
 		self.assertEqual(self.sandbox.git(SANDBOX_APP, "status", "--porcelain"), "")
 		with open(os.path.join(self.sandbox.repo(SANDBOX_APP), SANDBOX_REL), encoding="utf-8") as handle:
 			self.assertEqual(handle.read(), SANDBOX_BEFORE)
+
+
+# The tool groups that need an instructor (AC-13).
+INSTRUCTOR_GROUPS = frozenset({"task_write", "change_propose", "site_admin"})
+
+
+class TestRunnerGrant(RunnerTestBase):
+	"""T80: a non-insert run builds its context from `run_instructor` and the ticket's newest classify row
+	(AC-13, AC-22 on the `execute_tool` side; U1.md:259-260)."""
+
+	def setUp(self):
+		super().setUp()
+		# every switch the grant depends on is set here, never read from the shared site
+		set_agent_settings(
+			permission_level="L1",
+			code_change_enabled=0,
+			record_tools_enabled=0,
+			act_now_enabled=0,
+			unrestricted_enabled=0,
+			monthly_budget_usd=1000,
+		)
+
+	def _comment(self, author, creation):
+		"""A human Comment on the ticket whose server-set author (`owner`) is `author`."""
+		name = frappe.get_doc("HD Ticket", self.ticket.name).add_comment("Comment", "x").name
+		frappe.db.set_value("Comment", name, {"owner": author, "creation": creation}, update_modified=False)
+		return name
+
+	def _offered_groups(self, call):
+		groups = {spec.name: spec.group for spec in registry._all_specs()}
+		return {groups[tool["name"]] for tool in call["tools"]}
+
+	def _tool_results(self):
+		blocks = self.gateway.calls[1]["messages"][-1]["content"]
+		return {block["tool_use_id"]: json.loads(block["content"]) for block in blocks}
+
+	def test_plain_user_mention_after_instructor_gets_no_write_tools(self):
+		make_instructor(self)
+		plain = make_active_agent(self)
+		set_agent_settings(permission_level="L3", code_change_enabled=1, record_tools_enabled=1)
+		instructor_comment = self._comment(INSTRUCTOR, "2024-01-01 10:00:00")
+		plain_comment = self._comment(plain, "2024-01-02 10:00:00")
+
+		runner.run_for_ticket(self.ticket.name, "comment_mention", plain_comment)
+
+		(call,) = self.gateway.calls
+		self.assertFalse(self._offered_groups(call) & INSTRUCTOR_GROUPS)
+		(entry,) = self._entries(entry_type="reason")
+		self.assertFalse(entry.instructor)
+
+		# The same settings with the instructor's own comment as the trigger offer every group.
+		self.gateway.calls.clear()
+		runner.run_for_ticket(self.ticket.name, "comment_mention", instructor_comment)
+
+		(call,) = self.gateway.calls
+		self.assertLessEqual(INSTRUCTOR_GROUPS, self._offered_groups(call))
+
+	def test_comment_run_reads_latest_classification_of_its_ticket(self):
+		self._run("comment_mention")
+
+		self.latest_classification.assert_called_once_with(self.ticket.name)
+
+		self.latest_classification.reset_mock()
+		self._run("ticket_insert")
+
+		self.latest_classification.assert_not_called()
+
+	def _run_classified(self, confidence_pct):
+		self.latest_classification.side_effect = self.real_latest_classification
+		write_entry(
+			ticket=self.ticket.name,
+			run_id=f"{PREFIX}run-classified",
+			entry_type="classify",
+			trigger="ticket_insert",
+			turn=0,
+			# outside CATEGORIES (as for the base): main_path_level reads no level_cap_<x> of the shared site
+			predicted_category=SEEDED_CLASSIFICATION[0],
+			predicted_confidence_pct=confidence_pct,
+		)
+		self.gateway.results = [
+			tool_turn(
+				tool_use("t_cls", "set_classification", category="A", confidence="Cao"),
+				tool_use("t_ask", "post_comment", content=f"{PREFIX}cần biết thêm"),
+			),
+			make_model_result(),
+		]
+		self._run("comment_mention")
+		return self._tool_results()
+
+	def test_comment_run_below_threshold_from_classify_row_is_ask_only(self):
+		results = self._run_classified(69)
+
+		self.assertFalse(results["t_cls"]["ok"])
+		self.assertIn("không được cấp", results["t_cls"]["reason"])
+		self.assertTrue(results["t_ask"]["ok"])
+
+	def test_comment_run_at_threshold_from_classify_row_gets_ticket_write(self):
+		results = self._run_classified(70)
+
+		self.assertTrue(results["t_cls"]["ok"])

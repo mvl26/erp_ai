@@ -141,26 +141,13 @@ class TestAuthority(AuthorityTestBase):
 		self.assertFalse(authority.is_instruction(contact, self.ticket_p))
 		self.assertFalse(authority.is_instruction(PLAIN, self.ticket_p))
 
-	def test_latest_instructor_prefers_latest_comment_then_owner(self):
-		frappe.db.set_value("HD Ticket", self.ticket_p, "owner", "Administrator")
-		self.assertIsNone(authority.latest_instructor(self.ticket_p))
-
-		frappe.db.set_value("HD Ticket", self.ticket_p, "owner", INSTRUCTOR)
-		self.assertEqual(authority.latest_instructor(self.ticket_p), INSTRUCTOR)
-
-		self._assign(self.ticket_p, ASSIGNEE, ASSIGNER)
-		self._comment(self.ticket_p, INSTRUCTOR, "2024-01-01 10:00:00")
-		self._comment(self.ticket_p, ASSIGNEE, "2024-01-02 10:00:00")
-		self._comment(self.ticket_p, PLAIN, "2024-01-03 10:00:00")
-		self.assertEqual(authority.latest_instructor(self.ticket_p), ASSIGNEE)
-
 	def test_spoofed_comment_author_fields_ignored(self):
 		frappe.db.set_value("HD Ticket", self.ticket_p, "owner", PLAIN)
 		name = self._comment(
 			self.ticket_p, PLAIN, "2024-01-01 10:00:00", comment_email=INSTRUCTOR, comment_by=INSTRUCTOR
 		)
 		self.assertEqual(frappe.db.get_value("Comment", name, "comment_email"), INSTRUCTOR)
-		self.assertIsNone(authority.latest_instructor(self.ticket_p))
+		self.assertIsNone(authority.run_instructor(self.ticket_p, TRIGGER_COMMENT_MENTION, name))
 
 		fetched = authority.fetch_ticket_comments(self.ticket_p)
 		self.assertEqual([c["author"] for c in fetched], [PLAIN])
@@ -200,7 +187,7 @@ class TestAuthority(AuthorityTestBase):
 		)
 		self.assertEqual({c["author"] for c in fetched}, {ASSIGNEE})
 		self.assertEqual(len(authority.fetch_ticket_comments(self.ticket_p, limit=2)), 2)
-		self.assertIsNone(authority.latest_instructor(self.ticket_p))
+		self.assertIsNone(authority.run_instructor(self.ticket_p, TRIGGER_COMMENT_MENTION, legacy.name))
 		for edge in (1, 50):
 			self.assertLessEqual(len(authority.fetch_ticket_comments(self.ticket_p, limit=edge)), edge)
 		self.assertEqual(len(authority.fetch_ticket_comments(self.ticket_p, limit=1)), 1)

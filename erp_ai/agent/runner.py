@@ -1121,7 +1121,7 @@ def _reason(
 				asked = _notice(
 					ticket_name,
 					"ask_fallback",
-					_ask_fallback_body(ticket_name, settings),
+					_ask_fallback_body(run_id, classification, settings),
 					datetime.min,
 					trigger=trigger,
 					instructor=context.instructor,
@@ -1155,9 +1155,22 @@ def _reason(
 		messages.append({"role": "user", "content": tool_results})
 
 
-def _ask_fallback_body(ticket_name, settings) -> str:
-	"""The fallback question with the footer the question tool adds: the run's confidence and the threshold."""
-	pct = policy.latest_classification(ticket_name)[1]
+def _ask_fallback_body(run_id, classification, settings) -> str:
+	"""The fallback question with the footer the question tool adds: the run's confidence and the threshold.
+
+	The confidence is this run's own: its classify row (an insert run; none when it could not classify), else the
+	pair the context was built from (U1.md:260). An insert run reads no other run's classification (U1.md:261).
+	"""
+	own = frappe.get_all(
+		LOG_DOCTYPE,
+		filters={"run_id": run_id, "entry_type": "classify"},
+		fields=["predicted_category", "predicted_confidence_pct"],
+		limit=1,
+	)
+	if own:
+		pct = own[0].predicted_confidence_pct if own[0].predicted_category else None
+	else:
+		pct = (classification or {}).get("confidence_pct")
 	footer = ASK_FOOTER.format(
 		pct=ASK_PCT_UNKNOWN if pct is None else f"{pct}%", threshold=policy.confidence_threshold(settings)
 	)

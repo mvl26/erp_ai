@@ -2980,7 +2980,7 @@ class TestNoKeyLeak(ApplyJobTestCase):
 			]
 			frappe.set_user(ACTOR)
 			self.assertEqual([result["ok"] for result in results], [True, True], results)
-			code, command = (result["proposal"] for result in results)
+			code, block_command = (result["proposal"] for result in results)
 			# The tool makes a block proposal; undoing a block is T39, so the apply and undo run on a file
 			# proposal of the old form for the same file, content and branch (read by the tool), on the same ticket.
 			legacy = self.code_proposal(
@@ -2989,6 +2989,16 @@ class TestNoKeyLeak(ApplyJobTestCase):
 				reason="sửa theo yêu cầu",
 				target_branch=frappe.db.get_value(PROPOSAL_DOCTYPE, code, "target_branch"),
 			)
+			# The bench tool makes a block too (`command_list`), which apply sends to OP_UNKNOWN: the apply runs
+			# on a command proposal of the old form (`command_args`) for the tool's command, on the same ticket.
+			app, command_list = frappe.db.get_value(PROPOSAL_DOCTYPE, block_command, ["app", "command_list"])
+			command = make_change_proposal(
+				CHANGE_KIND_COMMAND,
+				ticket=ticket,
+				app=app,
+				reason="xem phiên bản",
+				command_args=json.dumps(json.loads(command_list)[0]),
+			).name
 			for name in (legacy, command):
 				transitions.approve(name, ACTOR)
 				apply_job.run_change(name, "apply")
@@ -2999,7 +3009,9 @@ class TestNoKeyLeak(ApplyJobTestCase):
 		self.assertEqual(
 			[self.state(name).change_status for name in names], [CHANGE_STATUS_UNDONE, CHANGE_STATUS_APPLIED]
 		)
-		proposals = [frappe.get_doc(PROPOSAL_DOCTYPE, name).as_dict() for name in [*names, code]]
+		proposals = [
+			frappe.get_doc(PROPOSAL_DOCTYPE, name).as_dict() for name in [*names, code, block_command]
+		]
 		logs = frappe.get_all(LOG_DOCTYPE, filters={"change_proposal": ["in", names]}, fields=["*"])
 		comments = frappe.get_all(
 			"Comment", filters=authority.ticket_comment_filters(ticket), pluck="content"

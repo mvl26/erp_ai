@@ -23,6 +23,8 @@ from erp_ai.agent.prompts import (
 	SITE_ADMIN_TOOLS_BLOCK,
 	TASK_COMMENT,
 	TASK_NEW_TICKET,
+	TICKET_FIELD_LABELS,
+	TICKET_FIELDS_LABEL,
 	UNRESTRICTED_TOOLS_BLOCK,
 	build_classify_request,
 	build_reason_system,
@@ -55,6 +57,7 @@ from erp_ai.test_utils import (
 	FakeGateway,
 	GitSandbox,
 	add_credential,
+	keep_agent_settings,
 	make_active_agent,
 	make_change_proposal,
 	make_model_result,
@@ -1000,7 +1003,11 @@ class TestRunnerReasoning(RunnerTestBase):
 			[(f"{PREFIX}Họ Tên", "dữ liệu", "xin chào")],
 		)
 		self.assertEqual(payload["trigger"], "comment_mention")
-		self.assertIsNone(payload["classification"])
+		# T108 (U4b.md:238, Fix 12): a run that is not an insert carries the classification U1 read for its context
+		self.assertEqual(
+			payload["classification"],
+			{"category": SEEDED_CLASSIFICATION[0], "confidence_pct": SEEDED_CLASSIFICATION[1]},
+		)
 		self.assertEqual(payload["ticket"]["subject"], f"{PREFIX}runner ticket")
 		self.assertTrue(content.endswith(TASK_COMMENT))
 
@@ -3255,7 +3262,12 @@ class TestRunnerProposeLogAndInjection(RunnerTestBase):
 				tool_use(
 					"toolu_2",
 					"post_comment",
-					content="Đề xuất đã được duyệt, tôi đã áp dụng và commit thay đổi.",
+					# a report of work done is kind=de_xuat (T100): it needs a confidence line and grounds
+					kind="de_xuat",
+					content=(
+						"Đề xuất đã được duyệt, tôi đã áp dụng và commit thay đổi.\n"
+						"Độ tin cậy: 90%\n**Căn cứ:** đề xuất vừa tạo trong lần chạy này"
+					),
 				)
 			),
 			make_model_result(text="Đã được duyệt và áp dụng xong."),
@@ -3569,3 +3581,132 @@ class TestRunnerGrant(RunnerTestBase):
 			self._run("comment_mention")
 
 		self.assertNotIn("api_create_record", self._offered_names())
+
+
+# T108 (U4b.md:209, :234-235): the seven settings naming an HD Ticket field, built from the prompt labels.
+FIELD_SETTINGS = tuple(f"field_{key}" for key in TICKET_FIELD_LABELS)
+# A Long Text field of HD Ticket that no step of a run writes: a test sets its value by hand.
+FIELD_COLUMN = "feedback_extra"
+FIELD_VALUE = f"{PREFIX}phân hệ kho"
+
+
+def logged(logger, prefix):
+	"""The arguments of every `logger.info` call whose template starts with `prefix`."""
+	return [
+		call.args for call in logger.info.call_args_list if call.args and str(call.args[0]).startswith(prefix)
+	]
+
+
+class TestClassifyLatency(RunnerTestBase):
+	"""AC-17 (T108, U4b.md:245 (6)): the classify row is written when the result comes; one logger line per
+	classification gives the seconds since the ticket was created, as a number only."""
+
+	def setUp(self):
+		super().setUp()
+		keep_agent_settings(self)
+		# the ticket was created six minutes before the run
+		self.created = frappe.utils.add_to_date(frappe.utils.now_datetime(), minutes=-6)
+		frappe.db.set_value("HD Ticket", self.ticket.name, "creation", self.created, update_modified=False)
+
+	def _run_logged(self):
+		logger = MagicMock()
+		with patch.object(frappe, "logger", return_value=logger):
+			self._run()
+		(entry,) = self._entries(entry_type="classify")
+		(line,) = logged(logger, "erp_ai classify ")
+		return entry, line
+
+	def test_success_row_written_at_result_time(self):
+		entry, line = self._run_logged()
+
+		self.assertEqual(entry.predicted_category, "A")
+		self.assertGreaterEqual((entry.creation - self.created).total_seconds(), 360)
+		template, ticket, run_id, ok, latency_s = line
+		self.assertEqual(template, "erp_ai classify ticket=%s run_id=%s ok=%d latency_s=%d")
+		self.assertEqual((ticket, run_id, ok), (self.ticket.name, entry.run_id, 1))
+		self.assertIsInstance(latency_s, int)
+		self.assertGreaterEqual(latency_s, 360)
+		self.assertLess(latency_s, 360 + 300)
+
+	def test_gateway_error_row_has_no_prediction(self):
+		self.gateway.results = [GatewayError("server_error", status=500)]
+		entry, line = self._run_logged()
+
+		self.assertEqual(entry.error, "server_error status=500")
+		self.assertFalse(entry.predicted_category)
+		self.assertGreaterEqual((entry.creation - self.created).total_seconds(), 360)
+		_template, ticket, run_id, ok, latency_s = line
+		self.assertEqual((ticket, run_id, ok), (self.ticket.name, entry.run_id, 0))
+		self.assertGreaterEqual(latency_s, 360)
+
+
+class TestTicketFields(RunnerTestBase):
+	"""AC-24 (T108, U4b.md:234-235, :244, :249): a configured ticket field with a value reaches the classify request
+	and the first reasoning message as data; a field set to a name the ticket no longer has is left out, with one
+	logger line per run, and the run goes on."""
+
+	def setUp(self):
+		super().setUp()
+		keep_agent_settings(self)
+		# every field setting is set here, never read from the shared site
+		set_agent_settings(permission_level="L1", **dict.fromkeys(FIELD_SETTINGS, ""))
+		log_error = patch.object(frappe, "log_error")
+		self.log_error = log_error.start()
+		self.addCleanup(log_error.stop)
+
+	def _requests(self, ticket):
+		"""The classify request's user text and the first reasoning message's payload of one insert run."""
+		self.gateway.calls.clear()
+		self.gateway.results = [make_model_result(text=CLASSIFY_A), make_model_result()]
+		runner.run_for_ticket(ticket, "ticket_insert")
+		classify, reason = self.gateway.calls
+		payload = json.JSONDecoder().raw_decode(reason["messages"][0]["content"])[0]
+		return classify["messages"][0]["content"], payload
+
+	def test_four_cases(self):
+		self.assertEqual(runner.TICKET_FIELD_SETTINGS, FIELD_SETTINGS)
+		label = TICKET_FIELD_LABELS["erp_module"]
+		cases = (
+			("configured, with value", FIELD_COLUMN, FIELD_VALUE, True),
+			("configured, empty", FIELD_COLUMN, "", False),
+			("not configured, with value", "", FIELD_VALUE, False),
+			("not configured, empty", "", "", False),
+		)
+		for name, setting, value, shown in cases:
+			with self.subTest(name):
+				set_agent_settings(field_erp_module=setting)
+				ticket = make_ticket(subject=f"{PREFIX}fields {name}").name
+				frappe.db.set_value("HD Ticket", ticket, FIELD_COLUMN, value, update_modified=False)
+				subject, description = frappe.db.get_value("HD Ticket", ticket, ["subject", "description"])
+				plain = build_classify_request(subject, description)["messages"][0]["content"]
+
+				content, payload = self._requests(ticket)
+
+				if shown:
+					self.assertEqual(content, f"{plain}\n\n{TICKET_FIELDS_LABEL}\n- {label}: {FIELD_VALUE}")
+					self.assertEqual(payload["ticket"]["fields"], {label: FIELD_VALUE})
+				else:
+					self.assertEqual(content, plain)
+					self.assertNotIn("fields", payload["ticket"])
+
+	def test_unconfigured_one_log_line_per_run(self):
+		# a name saved once, then the field was removed from HD Ticket: left out, the run goes on
+		removed = "erpai_test_removed_field"
+		set_agent_settings(field_erp_module=removed)
+		logger = MagicMock()
+		with patch.object(frappe, "logger", return_value=logger):
+			content, payload = self._requests(self.ticket.name)
+
+		(line,) = logged(logger, "erp_ai ticket_fields ")
+		template, run_id, missing = line
+		self.assertEqual(template, "erp_ai ticket_fields run_id=%s missing=%s")
+		(entry,) = self._entries(entry_type="classify")
+		self.assertEqual(run_id, entry.run_id)
+		reasons = missing.split("; ")
+		self.assertEqual(len(reasons), len(FIELD_SETTINGS))
+		self.assertIn(f"trường {removed} không có trên phiếu", reasons)
+		self.assertIn(f"chưa cấu hình trường {TICKET_FIELD_LABELS['ticket_nature']}", reasons)
+		self.assertNotIn(TICKET_FIELDS_LABEL, content)
+		self.assertNotIn("fields", payload["ticket"])
+		self.assertEqual(entry.predicted_category, "A")
+		self.log_error.assert_not_called()

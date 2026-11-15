@@ -1,3 +1,4 @@
+import itertools
 import json
 import sys
 from unittest.mock import MagicMock, patch
@@ -15,6 +16,7 @@ from erp_ai.agent.run_log import action_entry
 from erp_ai.agent.runner import BAD_ROUTING_ERROR, NO_SLA_REASON
 from erp_ai.agent.test_agent_runner import (
 	CLASSIFY_A,
+	CLASSIFY_A_PCT,
 	CLASSIFY_FIELDS,
 	PREFIX,
 	RunnerTestBase,
@@ -31,8 +33,10 @@ from erp_ai.agent.tools.route_ticket import (
 	TASK_REQUEST,
 	create_routed_task,
 )
+from erp_ai.agent.tools.write_ticket import CREATED_LABELS_FIELD, REASON_HUMAN_FILLED
 from erp_ai.constants import (
 	AGENT_USER,
+	CLASSIFICATION_FIELDS,
 	CLASSIFIED_BY_HUMAN,
 	CREDENTIAL_DOCTYPE,
 	HELPDESK_AGENT_ROLE,
@@ -42,6 +46,7 @@ from erp_ai.constants import (
 )
 from erp_ai.test_utils import (
 	add_credential,
+	keep_agent_settings,
 	make_active_agent,
 	make_model_result,
 	make_routing_rules,
@@ -1604,3 +1609,154 @@ class TestRoutingPermissions(AssignTestBase):
 		after = self._findings()
 		self.assertEqual(after["privilege_changes"], [])
 		self.assertEqual(after, before)
+
+
+HUMAN_TYPE = f"{PREFIX}human-type"
+HUMAN_PRIORITY = "Low"
+# CLASSIFY_A with RoutingTestBase's mapping: what the bot routes a field to when no person typed it.
+ROUTED = {"ticket_type": ROUTE_TYPE, "agent_group": ROUTE_TEAM, "priority": "High"}
+
+
+class TestHumanFilledFields(RoutingTestBase):
+	"""AC-19, AC-21 (T108, U4b.md:245 (2)-(4), A-U4b-2, A-U4b-4): a field the person typed at creation keeps the
+	person's value, a blank one is routed; the classify row keeps the model's prediction and the typed set."""
+
+	def setUp(self):
+		super().setUp()
+		keep_agent_settings(self)
+		if not frappe.db.exists("HD Ticket Type", HUMAN_TYPE):
+			frappe.get_doc({"doctype": "HD Ticket Type", "name": HUMAN_TYPE}).insert()
+		self.typed_values = {
+			"ticket_type": HUMAN_TYPE,
+			"agent_group": make_team(self),
+			"priority": HUMAN_PRIORITY,
+		}
+
+	def _typed_ticket(self, typed, record=None):
+		"""A ticket whose `typed` fields hold the person's values and whose creation record names them (T95)."""
+		values = {field: self.typed_values[field] for field in typed}
+		ticket = make_ticket(subject=f"{PREFIX}typed {' '.join(typed)}").name
+		labels = json.dumps(values, ensure_ascii=False, sort_keys=True) if values else ""
+		frappe.db.set_value(
+			"HD Ticket", ticket, {**values, CREATED_LABELS_FIELD: labels if record is None else record}
+		)
+		return ticket
+
+	def _run_insert(self, ticket):
+		self.gateway.results = [make_model_result(text=CLASSIFY_A), make_model_result(stop_reason="end_turn")]
+		runner.run_for_ticket(ticket, "ticket_insert")
+		(entry,) = frappe.get_all(LOG_DOCTYPE, {"ticket": ticket, "entry_type": "classify"}, ["*"])
+		return entry
+
+	def test_partial_fill_kept_blank_filled(self):
+		subsets = [
+			subset for size in (1, 2) for subset in itertools.combinations(CLASSIFICATION_FIELDS, size)
+		]
+		self.assertEqual(len(subsets), 6)
+		for level in ("L1", "L2", "L3"):
+			set_agent_settings(permission_level=level)
+			for typed in subsets:
+				with self.subTest(level=level, typed=typed):
+					ticket = self._typed_ticket(typed)
+					entry = self._run_insert(ticket)
+
+					row = frappe.db.get_value("HD Ticket", ticket, CLASSIFICATION_FIELDS, as_dict=True)
+					expected = {
+						f: self.typed_values[f] if f in typed else ROUTED[f] for f in CLASSIFICATION_FIELDS
+					}
+					self.assertEqual(dict(row), expected)
+					self.assertEqual(entry.applied, 1)
+					kept = [
+						item
+						for item in json.loads(entry.skipped_fields)
+						if item["reason"] == REASON_HUMAN_FILLED
+					]
+					self.assertEqual([item["field"] for item in kept], list(typed))
+
+	def test_log_keeps_model_prediction_and_created_labels(self):
+		ticket = self._typed_ticket(("priority",))
+		entry = self._run_insert(ticket)
+
+		self.assertEqual(frappe.db.get_value("HD Ticket", ticket, "priority"), HUMAN_PRIORITY)
+		# AC-19: the prediction is the model's, not what the ticket kept
+		self.assertEqual(
+			(entry.predicted_ticket_type, entry.predicted_agent_group, entry.predicted_priority),
+			(ROUTE_TYPE, ROUTE_TEAM, "High"),
+		)
+		self.assertEqual(json.loads(entry.created_labels), {"priority": HUMAN_PRIORITY})
+		self.assertFalse(entry.human_corrected_to)
+
+		with self.subTest("nothing typed"):
+			entry = self._run_insert(self._typed_ticket(()))
+			self.assertFalse(entry.created_labels)
+
+		with self.subTest("broken record: none of the three written, one warning"):
+			ticket = self._typed_ticket((), record="{không phải json")
+			before = frappe.db.get_value("HD Ticket", ticket, CLASSIFICATION_FIELDS, as_dict=True)
+			logger = MagicMock()
+			with patch.object(frappe, "logger", return_value=logger):
+				entry = self._run_insert(ticket)
+			self.assertEqual(
+				frappe.db.get_value("HD Ticket", ticket, CLASSIFICATION_FIELDS, as_dict=True), before
+			)
+			self.assertFalse(entry.created_labels)
+			self.assertEqual(entry.predicted_priority, "High")
+			warnings = [c.args for c in logger.warning.call_args_list if "created_labels" in str(c.args[0])]
+			self.assertEqual(warnings, [("erp_ai created_labels invalid ticket=%s", ticket)])
+
+	def test_insert_run_after_pre_log_edit_writes_nothing(self):
+		# A-U4b-4: a person changed the classification before the first classify row: the ticket is Người
+		ticket = make_ticket(subject=f"{PREFIX}edited before the first row").name
+		frappe.db.set_value(
+			"HD Ticket", ticket, {"priority": HUMAN_PRIORITY, "ai_classified_by": CLASSIFIED_BY_HUMAN}
+		)
+		before = frappe.db.get_value("HD Ticket", ticket, CLASSIFICATION_FIELDS, as_dict=True)
+		entry = self._run_insert(ticket)
+
+		self.assertEqual(
+			frappe.db.get_value("HD Ticket", ticket, CLASSIFICATION_FIELDS, as_dict=True), before
+		)
+		self.assertEqual(entry.applied, 0)
+		self.assertEqual(
+			json.loads(entry.actions),
+			[
+				action_entry(
+					"apply_route", "HD Ticket", ticket, False, reason="người đã phân loại, không ghi đè"
+				)
+			],
+		)
+		self.assertEqual(json.loads(entry.human_corrected_to), dict(before))
+		self.assertEqual(entry.predicted_priority, "High")
+
+
+class TestConfidencePct(RoutingTestBase):
+	"""AC-22 (phán quyết 2, T108): the number on the ticket is the classify row's, written only by the route step."""
+
+	def test_classify_row_pct_equals_ticket_after_route(self):
+		self._run()
+
+		entry = self._single_entry()
+		self.assertEqual(entry.applied, 1)
+		self.assertEqual(entry.predicted_confidence_pct, CLASSIFY_A_PCT)
+		self.assertEqual(
+			frappe.db.get_value("HD Ticket", self.ticket.name, "ai_confidence_pct"),
+			entry.predicted_confidence_pct,
+		)
+
+	def test_below_threshold_ticket_pct_unchanged(self):
+		before = frappe.db.get_value(
+			"HD Ticket", self.ticket.name, ["ai_confidence_pct", *CLASSIFICATION_FIELDS]
+		)
+		stub = {"dau_muc": "A", "do_tin_cay": "Cao", "do_tin_cay_pct": 69, "ly_do": "x"}
+		self.gateway.results = [
+			make_model_result(text=json.dumps(stub)),
+			make_model_result(stop_reason="end_turn"),
+		]
+		self._run()
+
+		entry = self._single_entry()
+		self.assertEqual((entry.applied, entry.predicted_confidence_pct), (0, 69))
+		self.assertEqual(
+			frappe.db.get_value("HD Ticket", self.ticket.name, ["ai_confidence_pct", *CLASSIFICATION_FIELDS]),
+			before,
+		)

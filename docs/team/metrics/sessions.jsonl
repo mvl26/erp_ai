@@ -45,3 +45,14 @@
 {"ts":"2026-11-14T21:59:06+07:00","event":"end","session_id":"2d940539-6061-4dd2-bb77-4dac1d52f6e2","feature":"FEAT-004","stage":"wave","reason":"other","duration_s":77400,"compactions":1}
 {"ts":"2026-11-14T22:03:01+07:00","event":"end","session_id":"d6349641-136b-4c9c-9f47-7001008168d6","feature":"FEAT-004","stage":"wave","reason":"other","duration_s":110522,"compactions":0}
 {"ts":"2026-11-14T23:19:41+07:00","event":"compact","session_id":"6c38287b-bf21-45d8-bbe6-babd0767ec62","feature":"FEAT-004","stage":"wave","trigger":"auto"}
+{"ts":"2026-11-15T00:57:03+07:00","event":"compact","session_id":"2d940539-6061-4dd2-bb77-4dac1d52f6e2","feature":"","stage":"idle","trigger":"auto"}
+{"ts":"2026-11-15T04:10:15+07:00","event":"compact","session_id":"6c38287b-bf21-45d8-bbe6-babd0767ec62","feature":"CHG-002","stage":"build","trigger":"auto"}
+{"ts":"2026-11-15T05:32:31+07:00","event":"compact","session_id":"2d940539-6061-4dd2-bb77-4dac1d52f6e2","feature":"CHG-002","stage":"build","trigger":"auto"}
+{"ts":"2026-11-15T14:40:45+07:00","event":"end","session_id":"c58fcfb7-27d6-4828-9671-76743cdcfe51","feature":"","stage":"","reason":"other","duration_s":1,"compactions":0}
+{"ts":"2026-11-15T14:40:45+07:00","event":"end","session_id":"9d384389-ba09-4883-aa27-0aa1a3087a83","feature":"","stage":"","reason":"other","duration_s":1,"compactions":0}
+{"ts":"2026-11-15T14:40:45+07:00","event":"end","session_id":"cd7ca063-56bd-4e95-a6dd-f45f5046f796","feature":"","stage":"","reason":"other","duration_s":1,"compactions":0}
+{"ts":"2026-11-15T17:39:27+07:00","event":"end","session_id":"85e796ef-0414-4144-93dd-ba84077d7bc6","feature":"","stage":"","reason":"other","duration_s":1,"compactions":0}
+{"ts":"2026-11-15T17:39:32+07:00","event":"end","session_id":"76ddd900-25b3-4fbd-8043-f3f2bd6cc761","feature":"","stage":"","reason":"other","duration_s":0,"compactions":0}
+{"ts":"2026-11-15T17:40:09+07:00","event":"end","session_id":"6c38287b-bf21-45d8-bbe6-babd0767ec62","feature":"","stage":"","reason":"other","duration_s":196515,"compactions":2}
+{"ts":"2026-11-15T22:23:29+07:00","event":"end","session_id":"a66a355f-523c-4c5e-aaeb-07b055d8a297","feature":"FEAT-007","stage":"build","reason":"other","duration_s":17034,"compactions":0}
+{"ts":"2026-11-15T22:23:31+07:00","event":"end","session_id":"90288caf-9b46-496c-9823-af661b69ebe3","feature":"CHG-002","stage":"build","reason":"other","duration_s":17022,"compactions":0}

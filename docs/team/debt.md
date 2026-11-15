@@ -71,6 +71,16 @@ Người chọn "Chấp nhận với bằng chứng hiện có" (bỏ điều ki
 | O-18..O-24: 7 điểm "Còn lệch" của spec P-5 (Amendment 3): ADR-023 còn proposed; AC-34 ca cực đoan; AC-35/A-27 cần người xác nhận; chữ "agent không có System Manager" (ADR-006); chưa có bằng chứng gỡ `ERP AI Instructor` khỏi agent trên `miyano`; AC-25 "mở được Desk" chưa kiểm cho Hiếu, Việt, Tiến; cột "Mã nhận về" N-7 | STD-DOC-2 | `docs/team/features/FEAT-004/spec.md` P-5 | chủ ghi ở cuối mỗi dòng P-5 (architect, team-leader, người, tech-lead) |
 | Kèm: 21 Comment mồ côi trên HD Ticket đã mất vẫn còn trên site `miyano` | — | `DELETE` bị MariaDB từ chối `ERROR 1175` (journal 2026-11-14) | xóa có backup, tắt safe-update trong phiên đó. Team-leader |
 
+## FEAT-007 — test còn thiếu, hoãn từ review vòng build 19 (2026-11-15)
+Ba điểm `deferred` không chặn, không đổi hành vi; ghi theo quyết định 19:06 (g) của team-leader (`docs/team/journal/FEAT-007.md`). Mã đã merge trên `team/FEAT-007` @ `69a56cf`.
+
+| Mục | STD | Bằng chứng | Đề xuất / chủ |
+|---|---|---|---|
+| D7-1: việc quét 15 phút báo lỗi đầu tiên hay lỗi cuối không có test phân biệt | STD-TEST-2 | `docs/team/features/FEAT-007/review-180.md:58` (1): mọi lỗi trong mọi test đều là `RuntimeError`, nên đổi `failures[0]` thành `failures[-1]` ở `erp_ai/agent/missed_scan.py:120-121` vẫn xanh | cho vị từ và lần xếp job ném hai lớp lỗi khác nhau ở test `erp_ai/agent/test_missed_scan.py:385`, chờ `error=ValueError`. Tech-lead xếp thành task test |
+| D7-2: lỗi từ câu SQL ứng viên và từ lần đọc `max_runs` của việc quét 15 phút chưa có test | STD-TEST-2 | `docs/team/features/FEAT-007/review-180.md:58` (2) | thêm hai ca lỗi vào `erp_ai/agent/test_missed_scan.py`. Tech-lead xếp cùng task với D7-1 |
+| D7-3: lần tạo phiếu có instructor VÀ `act_now` chưa có test ở runner | STD-TEST-2 | `docs/team/features/FEAT-007/review-81.md:35` minor (b), `NOT ADDRESSED`; thuộc vị từ của T69 | thêm một ca vào `erp_ai/agent/test_agent_runner.py`. Tech-lead xếp thành task test |
+| D7-4: lần chạy không tạo phiếu lấy mức theo đầu mục của dòng `classify` (`erp_ai/agent/runner.py:204`, mã của T80) chưa có test ghim | STD-TEST-2 | `docs/team/features/FEAT-007/review-80.md:42` minor (a); không vào T82 (`docs/team/features/FEAT-007/design-w1-fixes-21.md` mục 2.3; quyết định 19:15 (c) của team-leader) | dạng test ở mục 2.3 của `design-w1-fixes-21.md`: bản sao `TestRunnerGrant::test_insert_reason_context_takes_category_cap_of_classification` cho lần chạy comment, đặt `level_cap_<x>="L0"`, khẳng định `main_path_level == "L0"`; xanh ngay trên `69a56cf` nên là test ghim, đứng sau T82 trên chuỗi chủ `test_agent_runner.py`. Tech-lead xếp thành task test |
+
 ## Đã quét / Chưa quét / Độ tin cậy
 | Tầng | Đã quét | Chưa quét | Độ tin cậy |
 |---|---|---|---|

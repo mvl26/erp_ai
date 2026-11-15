@@ -1,0 +1,1 @@
+# Journal FEAT-007 — dòng chờ gộp của team-leader, phần nối 5 (viết lúc 19:06 ngày 2026-11-15: tech-lead chép các dòng của `FEAT-007.pending.md`, rồi `.pending-2.md`, `.pending-3.md`, `.pending-4.md`, rồi file này, nguyên văn, vào cuối `FEAT-007.md`; sau đó để cả năm file chỉ còn dòng tiêu đề)

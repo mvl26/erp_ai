@@ -186,7 +186,7 @@ def confirm_restart(name=None) -> dict:
 	stored = frappe.db.get_value(PROPOSAL_DOCTYPE, name, ["restart_status", "restart_sent_at"], as_dict=True)
 	# `get_datetime(None)` is "now": a send without its moment has nothing to measure against.
 	if stored.restart_status != RESTART_STATUS_SENT or not stored.restart_sent_at:
-		return {"name": name, "restart_status": stored.restart_status}
+		return {"name": name, "status": stored.restart_status}
 	timezone = get_system_timezone()
 	value = restart_check.outcome(
 		restart_check.epoch_of_system_time(get_datetime(stored.restart_sent_at), timezone),
@@ -195,8 +195,8 @@ def confirm_restart(name=None) -> dict:
 		restart_check.workers_started(),
 	)
 	if value is None:
-		return {"name": name, "restart_status": stored.restart_status}
+		return {"name": name, "status": stored.restart_status}
 	if not transitions.confirm_restart(name, value, sent_at=stored.restart_sent_at):
-		return {"name": name, "restart_status": frappe.db.get_value(PROPOSAL_DOCTYPE, name, "restart_status")}
+		return {"name": name, "status": frappe.db.get_value(PROPOSAL_DOCTYPE, name, "restart_status")}
 	frappe.logger("erp_ai").info("erp_ai restart proposal=%s status=%s", name, value)
-	return {"name": name, "restart_status": value}
+	return {"name": name, "status": value}

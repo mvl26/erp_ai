@@ -1169,7 +1169,7 @@ class TestConfirmRestart(FrappeTestCase):
 				before = _restart_row(name)
 				with patch.object(transitions, "confirm_restart", wraps=transitions.confirm_restart) as write:
 					result = self._call_as(METHOD_INSTRUCTOR, name)
-				self.assertEqual(result, {"name": name, "restart_status": status})
+				self.assertEqual(result, {"name": name, "status": status})
 				self.assertEqual(write.call_count, 0)
 				self.assertEqual(_restart_row(name), before)
 				self.assertEqual(self._conclusion_lines(), [])
@@ -1192,7 +1192,7 @@ class TestConfirmRestart(FrappeTestCase):
 				before = _restart_row(name)
 				with patch.object(transitions, "confirm_restart") as write:
 					result = self._call_as(METHOD_INSTRUCTOR, name)
-				self.assertEqual(result, {"name": name, "restart_status": RESTART_STATUS_SENT})
+				self.assertEqual(result, {"name": name, "status": RESTART_STATUS_SENT})
 				self.assertEqual(write.call_count, 0)
 				self.assertEqual(_restart_row(name), before)
 				self.assertEqual(self._conclusion_lines(), [])
@@ -1204,7 +1204,7 @@ class TestConfirmRestart(FrappeTestCase):
 			before = _restart_row(name)
 			with patch.object(transitions, "confirm_restart") as write:
 				result = self._call_as(METHOD_INSTRUCTOR, name)
-			self.assertEqual(result, {"name": name, "restart_status": RESTART_STATUS_SENT})
+			self.assertEqual(result, {"name": name, "status": RESTART_STATUS_SENT})
 			self.assertEqual(write.call_count, 0)
 			self.assertEqual(_restart_row(name), before)
 			self.assertEqual(self._conclusion_lines(), [])
@@ -1250,7 +1250,7 @@ class TestConfirmRestart(FrappeTestCase):
 				self.web.return_value, self.workers.return_value = web, workers
 				self.now.return_value = RESTART_SENT_AT + datetime.timedelta(seconds=elapsed)
 				result = self._call_as(METHOD_INSTRUCTOR, name)
-				self.assertEqual(result, {"name": name, "restart_status": expected})
+				self.assertEqual(result, {"name": name, "status": expected})
 				stored = _restart_row(name)
 				self.assertEqual((stored.restart_status, stored.restart_sent_at), (expected, RESTART_SENT_AT))
 				self.assertEqual(self._conclusion_lines(), [call(RESTART_LOG_FORMAT, name, expected)])
@@ -1280,7 +1280,7 @@ class TestConfirmRestart(FrappeTestCase):
 		self.assertEqual(order.count("decider"), 1)
 		self.assertIn("read", order)
 		self.assertIn("evidence", order)
-		self.assertEqual(result, {"name": name, "restart_status": RESTART_STATUS_CONFIRMED})
+		self.assertEqual(result, {"name": name, "status": RESTART_STATUS_CONFIRMED})
 		with self.subTest(check="the decider's refusal stops everything"):
 			other = self._proposal()
 			refusal = frappe.PermissionError("refused by the decider")
@@ -1314,7 +1314,7 @@ class TestConfirmRestart(FrappeTestCase):
 			write.call_args_list, [call(name, RESTART_STATUS_CONFIRMED, sent_at=RESTART_SENT_AT)]
 		)
 		self.assertIsInstance(write.call_args.kwargs["sent_at"], datetime.datetime)
-		self.assertEqual(result, {"name": name, "restart_status": RESTART_STATUS_CONFIRMED})
+		self.assertEqual(result, {"name": name, "status": RESTART_STATUS_CONFIRMED})
 
 	def test_resent_between_read_and_write_keeps_new_status(self):
 		resent_at = RESTART_SENT_AT + datetime.timedelta(seconds=30)
@@ -1345,7 +1345,7 @@ class TestConfirmRestart(FrappeTestCase):
 				self.assertEqual(
 					write.call_args_list, [call(name, RESTART_STATUS_CONFIRMED, sent_at=RESTART_SENT_AT)]
 				)
-				self.assertEqual(result, {"name": name, "restart_status": new_status})
+				self.assertEqual(result, {"name": name, "status": new_status})
 				stored = _restart_row(name)
 				self.assertEqual((stored.restart_status, stored.restart_sent_at), (new_status, new_sent_at))
 				self.assertEqual(self._conclusion_lines(), [])

@@ -26,6 +26,7 @@ import sys
 import unittest
 from pathlib import Path
 from typing import ClassVar, NamedTuple
+from unittest.mock import patch
 
 from erp_ai.constants import AGENT_STATUS_EVENT, PANEL_METHODS
 
@@ -156,9 +157,22 @@ TOOL_FORBIDDEN_CALL_SUFFIXES = ("db.set_value", "set_user", "db.multisql", "db_u
 SQL_READ_ONLY = re.compile(r"^\s*(select|show|describe)\b", re.IGNORECASE)
 
 # ADR-001: product code imports only the standard library, frappe, helpdesk and itself; `anthropic` (declared
-# in pyproject.toml `dependencies`) only in gateway/client.py (NFR-5). Anything else, any other app, is a violation.
+# in pyproject.toml `dependencies`) only in gateway/client.py (NFR-5); the one named exception is
+# NAMED_LIBRARY_IMPORTS below. Anything else, any other app, is a violation.
 ALLOWED_TOP_LEVEL_MODULES = frozenset({PACKAGE, "frappe", "helpdesk", *sys.stdlib_module_names})
 ANTHROPIC_MODULE = "anthropic"
+# ADR-040 Phán quyết C-3: the one named exception to ADR-001, `{file: top-level libraries it may import}`
+# (versions pinned by frappe, not by erp_ai); how restart_check uses them is check_restart_check_library_use's.
+RESTART_CHECK_FILE = "agent/changes/restart_check.py"
+NAMED_LIBRARY_IMPORTS = {RESTART_CHECK_FILE: frozenset({"psutil", "redis"})}
+RESTART_CHECK_LIBRARIES = tuple(sorted(NAMED_LIBRARY_IMPORTS[RESTART_CHECK_FILE]))
+RESTART_CHECK_ALLOWED_NAMES = frozenset(
+	{"psutil", "redis", "psutil.Process", "psutil.Error", "redis.exceptions", "redis.exceptions.RedisError"}
+)
+RESTART_CHECK_FORBIDDEN_METHODS = frozenset(
+	{"kill", "terminate", "send_signal", "suspend", "resume", "nice", "ionice", "rlimit", "cpu_affinity"}
+)
+RESTART_CHECK_FORBIDDEN_MODULES = ("subprocess", "signal", "os.kill", "os.killpg")
 
 POLICY_FIELDS = (
 	"permission_level",
@@ -535,18 +549,83 @@ def check_layer_imports(sources: dict, rules=LAYER_RULES) -> list:
 
 
 def check_import_boundaries(sources: dict) -> list:
-	"""ADR-001 allowlist: stdlib, frappe, helpdesk, erp_ai; NFR-5/ADR-002: `anthropic` only in gateway/client.py."""
+	"""ADR-001 allowlist: stdlib, frappe, helpdesk, erp_ai; NFR-5/ADR-002: `anthropic` only in gateway/client.py;
+	ADR-040 C-3: a library in NAMED_LIBRARY_IMPORTS only in its file, and a dead exception (the file is gone,
+	or no longer imports a listed name) is itself a violation. "Gone" is read from disk, so a partial
+	`sources` (the self-checks) does not count as a deleted file."""
 	violations = []
 	for rel, source in only_python(sources).items():
 		imports = imported_modules(parse(rel, source), module_name(rel), rel.endswith("__init__.py"))
+		named = NAMED_LIBRARY_IMPORTS.get(rel, ())
 		for lineno, target in imports:
 			if module_in(target, ANTHROPIC_MODULE):
 				if rel != CLIENT_FILE:
 					violations.append(f"{rel}:{lineno}: imports {target} outside {CLIENT_FILE} (NFR-5)")
-			elif target.split(".")[0] not in ALLOWED_TOP_LEVEL_MODULES:
+			elif target.split(".")[0] not in ALLOWED_TOP_LEVEL_MODULES and target.split(".")[0] not in named:
 				violations.append(
 					f"{rel}:{lineno}: imports {target}, not stdlib/frappe/helpdesk/erp_ai (ADR-001: no other app or library)"
 				)
+	for rel, names in NAMED_LIBRARY_IMPORTS.items():
+		if rel not in sources:
+			if not (PACKAGE_ROOT / rel).is_file():
+				violations.append(f"{rel}: file gone, dead exception in NAMED_LIBRARY_IMPORTS (ADR-040 C-3)")
+			continue
+		imported = {
+			target.split(".")[0]
+			for _lineno, target in imported_modules(parse(rel, sources[rel]), module_name(rel), False)
+		}
+		violations.extend(
+			f"{rel}: no longer imports {name}, dead exception in NAMED_LIBRARY_IMPORTS (ADR-040 C-3)"
+			for name in sorted(names - imported)
+		)
+	return violations
+
+
+def _is_restart_library(name: str) -> bool:
+	return any(module_in(name, library) for library in RESTART_CHECK_LIBRARIES)
+
+
+def check_restart_check_library_use(sources: dict) -> list:
+	"""ADR-040 C-3: restart_check.py only reads. psutil/redis only as psutil.Process, psutil.Error,
+	redis.exceptions(.RedisError), in imports and attribute references; no signalling or tuning method call
+	(kill, terminate, ...); no subprocess, os.kill, os.killpg or signal (design 4.4: no subprocess)."""
+	source = sources.get(RESTART_CHECK_FILE)
+	if source is None:
+		return _missing(RESTART_CHECK_FILE)
+	tree = parse(RESTART_CHECK_FILE, source)
+	aliases = import_aliases(tree)
+	violations = []
+	for node in ast.walk(tree):
+		if isinstance(node, ast.Import | ast.ImportFrom):
+			base = "" if isinstance(node, ast.Import) or node.level else f"{node.module}."
+			for alias in node.names:
+				name = base + alias.name
+				if _is_restart_library(name) and name not in RESTART_CHECK_ALLOWED_NAMES:
+					violations.append(violation(RESTART_CHECK_FILE, node, f"imports {name} (ADR-040 C-3)"))
+				elif any(module_in(name, forbidden) for forbidden in RESTART_CHECK_FORBIDDEN_MODULES):
+					violations.append(
+						violation(RESTART_CHECK_FILE, node, f"imports {name} (ADR-040 C-3: read only)")
+					)
+		elif isinstance(node, ast.Attribute) and "()" not in (name := resolved_name(node, aliases)):
+			# a chain through a call (`psutil.Process(pid).create_time`) is a method of an allowed object
+			if _is_restart_library(name) and name not in RESTART_CHECK_ALLOWED_NAMES:
+				violations.append(violation(RESTART_CHECK_FILE, node, f"uses {name} (ADR-040 C-3)"))
+			elif any(module_in(name, forbidden) for forbidden in RESTART_CHECK_FORBIDDEN_MODULES):
+				violations.append(
+					violation(RESTART_CHECK_FILE, node, f"uses {name} (ADR-040 C-3: read only)")
+				)
+		if (
+			isinstance(node, ast.Call)
+			and isinstance(node.func, ast.Attribute)
+			and node.func.attr in RESTART_CHECK_FORBIDDEN_METHODS
+		):
+			violations.append(
+				violation(
+					RESTART_CHECK_FILE,
+					node,
+					f"calls .{node.func.attr}() (ADR-040 C-3: never signal a process)",
+				)
+			)
 	return violations
 
 
@@ -2615,6 +2694,80 @@ def check_fs_writes_only_in_file_writer(sources: dict) -> list:
 	return violations
 
 
+FILE_WRITER_CANONICAL_CHECK = "_refuse_unless_canonical"
+FILE_WRITER_SECOND_RESOLVER_CALLS = ("realpath", "commonpath", "is_relative_to", "readlink")
+FILE_WRITER_RECHECKERS = ("make_parents", "remove_empty_dirs")  # T6 adds "write_atomic", "remove_file"
+FILE_WRITER_RECHECKS_ALL = False  # condition 4 of the rule; T6 sets True, T49 deletes the flag
+FILE_WRITER_FS_CALLS = frozenset(
+	{"os.mkdir", "os.rmdir", "os.remove", "os.unlink", "os.replace", "os.rename", "tempfile.mkstemp"}
+)
+
+
+def check_file_writer_rechecks_through_resolver(sources: dict) -> list:
+	"""ADR-040 Phán quyết C-2: file_writer re-checks a path only by asking the one resolver.
+	1. a top-level `_refuse_unless_canonical` calls `source.resolve_safe_path`;
+	2. file_writer.py calls no `realpath`/`commonpath`/`is_relative_to`/`readlink` (a second resolver);
+	3. every function in FILE_WRITER_RECHECKERS calls `_refuse_unless_canonical`;
+	4. (FILE_WRITER_RECHECKS_ALL) every top-level function touching the file system is in FILE_WRITER_RECHECKERS."""
+	writer = sources.get(FILE_WRITER_FILE)
+	if writer is None:
+		return _missing(FILE_WRITER_FILE)
+	tree = parse(FILE_WRITER_FILE, writer)
+	aliases = import_aliases(tree)
+	functions = _module_functions(tree)
+	violations = []
+	canonical = functions.get(FILE_WRITER_CANONICAL_CHECK)
+	if canonical is None:
+		violations.append(f"{FILE_WRITER_FILE}: no top-level {FILE_WRITER_CANONICAL_CHECK}() (ADR-040 C-2)")
+	elif not any(
+		isinstance(node, ast.Call) and resolved_name(node.func, aliases) == SAFE_PATH_CALL
+		for node in ast.walk(canonical)
+	):
+		violations.append(
+			violation(
+				FILE_WRITER_FILE,
+				canonical,
+				f"{FILE_WRITER_CANONICAL_CHECK} does not call {SAFE_PATH_CALL} (ADR-040 C-2)",
+			)
+		)
+	for node in ast.walk(tree):
+		if not isinstance(node, ast.Call):
+			continue
+		name = (resolved_name(node.func, aliases) or "").rsplit(".", 1)[-1]
+		if name in FILE_WRITER_SECOND_RESOLVER_CALLS:
+			violations.append(
+				violation(FILE_WRITER_FILE, node, f"calls {name}: a second path resolver (ADR-040 C-2)")
+			)
+	for name in FILE_WRITER_RECHECKERS:
+		function = functions.get(name)
+		if function is None:
+			violations.append(f"{FILE_WRITER_FILE}: no top-level {name}() (ADR-040 C-2)")
+		elif FILE_WRITER_CANONICAL_CHECK not in _called_names(function):
+			violations.append(
+				violation(
+					FILE_WRITER_FILE,
+					function,
+					f"{name} does not call {FILE_WRITER_CANONICAL_CHECK} (ADR-040 C-2)",
+				)
+			)
+	if FILE_WRITER_RECHECKS_ALL:
+		for name, function in functions.items():
+			if name in FILE_WRITER_RECHECKERS:
+				continue
+			if any(
+				isinstance(node, ast.Call) and resolved_name(node.func, aliases) in FILE_WRITER_FS_CALLS
+				for node in ast.walk(function)
+			):
+				violations.append(
+					violation(
+						FILE_WRITER_FILE,
+						function,
+						f"{name} touches the file system but is not in FILE_WRITER_RECHECKERS (ADR-040 C-2)",
+					)
+				)
+	return violations
+
+
 def _names_forbidden(name: str) -> bool:
 	return any(name == forbidden or name.endswith("." + forbidden) for forbidden in CHANGES_FORBIDDEN_NAMES)
 
@@ -4380,6 +4533,11 @@ class TestArchitecture(unittest.TestCase):
 			)
 		self.assertEqual(check_layer_imports(self.sources), [])
 		self.assertEqual(check_import_boundaries(self.sources), [])
+		self.assertIn("import psutil", self.sources["agent/changes/restart_check.py"])
+
+	def test_restart_check_library_use(self):
+		self.assertIn("agent/changes/restart_check.py", self.sources)
+		self.assertEqual(check_restart_check_library_use(self.sources), [])
 
 	def test_single_enqueue_call_site(self):
 		scanned = only_python(self.sources)
@@ -4687,6 +4845,10 @@ class TestArchitecture(unittest.TestCase):
 		for expected in ("os.replace", "os.remove", "tempfile.mkstemp", "os.fdopen with mode 'wb'"):
 			self.assertIn(expected, found)
 		self.assertEqual(check_fs_writes_only_in_file_writer(self.sources), [])
+
+	def test_file_writer_rechecks_through_resolver(self):
+		self.assertIn("def _refuse_unless_canonical(", self.sources[FILE_WRITER_FILE])
+		self.assertEqual(check_file_writer_rechecks_through_resolver(self.sources), [])
 
 	def test_changes_never_set_user_or_publish(self):
 		self.assertIn("frappe.session.user", self.sources["agent/changes/apply_job.py"])  # a read is allowed
@@ -5526,6 +5688,81 @@ class TestScannersCatchViolations(unittest.TestCase):
 			"from erp_ai import alerts\nfrom . import policy\nfrom .prompts import build\n"
 		)
 		self.assertEqual(check_import_boundaries({"agent/runner.py": clean}), [])
+
+	def test_import_boundaries_named_library_only_in_restart_check(self):
+		restart = "agent/changes/restart_check.py"
+		caught = {
+			"psutil elsewhere": ("agent/changes/apply_job.py", "import psutil\n", "psutil"),
+			"redis elsewhere": ("agent/runner.py", "import redis\n", "redis"),
+			"requests in restart_check": (
+				restart,
+				"import psutil\nimport redis\nimport requests\n",
+				"requests",
+			),
+			"rq in restart_check": (restart, "import psutil\nimport redis\nimport rq\n", "rq"),
+		}
+		for label, (rel, source, fragment) in caught.items():
+			with self.subTest(label):
+				self.assertCaught(check_import_boundaries({rel: source}), f"{rel}:", fragment)
+		self.assertEqual(check_import_boundaries({restart: "import psutil\nimport redis\n"}), [])
+		self.assertEqual(
+			check_import_boundaries({restart: "from psutil import Process\nfrom redis import exceptions\n"}),
+			[],
+		)
+		# dead exception: the file no longer imports a listed name (a comment or a string does not count)
+		no_redis = "import psutil\n# import redis\nNAME = 'redis'\n"
+		self.assertCaught(check_import_boundaries({restart: no_redis}), restart, "redis", "dead exception")
+		with patch(f"{__name__}.NAMED_LIBRARY_IMPORTS", {"agent/changes/gone.py": frozenset({"psutil"})}):
+			self.assertCaught(
+				check_import_boundaries({restart: "import os\n"}), "agent/changes/gone.py", "dead exception"
+			)
+		self.assertEqual(NAMED_LIBRARY_IMPORTS, {restart: frozenset({"psutil", "redis"})})
+
+	def test_restart_check_library_use_catches_signals_and_clients(self):
+		restart = "agent/changes/restart_check.py"
+		head = "import os\nimport psutil\nimport redis\n"
+		cases = {
+			# a method call that signals or tunes a process (only the attribute-call condition sees it)
+			"kill": "psutil.Process(1).kill()\n",
+			"terminate": "p = psutil.Process(1)\np.terminate()\n",
+			"send_signal": "psutil.Process(1).send_signal(15)\n",
+			"suspend": "psutil.Process(1).suspend()\n",
+			"resume": "psutil.Process(1).resume()\n",
+			"nice": "psutil.Process(1).nice(5)\n",
+			"ionice": "psutil.Process(1).ionice(0)\n",
+			"rlimit": "psutil.Process(1).rlimit(0)\n",
+			"cpu_affinity": "psutil.Process(1).cpu_affinity([0])\n",
+			# an attribute of psutil/redis outside the allowed set (only the attribute-reference condition)
+			"psutil.process_iter": "psutil.process_iter()\n",
+			"redis.Redis": "redis.Redis()\n",
+			"redis.Redis#alias": "import redis as r\nr.Redis()\n",
+			"redis.exceptions.ConnectionError": "E = redis.exceptions.ConnectionError\n",
+			# an import of a name outside the allowed set (only the import condition)
+			"psutil.process_iter#from": "from psutil import process_iter\n",
+			"redis.Redis#from": "from redis import Redis as R\n",
+			"redis.client": "import redis.client\n",
+			# subprocess, os.kill, os.killpg, signal (only the forbidden-module condition)
+			"os.kill": "os.kill(1, 15)\n",
+			"os.kill#alias": "from os import kill as k\nk(1, 15)\n",
+			"os.killpg": "os.killpg(1, 15)\n",
+			"subprocess": "import subprocess\n",
+			"signal": "import signal\n",
+			"signal.SIGTERM": "import signal as s\nn = s.SIGTERM\n",
+		}
+		for fragment, body in cases.items():
+			with self.subTest(fragment):
+				self.assertCaught(
+					check_restart_check_library_use({restart: head + body}),
+					f"{restart}:",
+					fragment.partition("#")[0],
+				)
+		allowed = (
+			head + "from psutil import Error, Process\nfrom redis.exceptions import RedisError\n"
+			"ERRORS = (redis.exceptions.RedisError, psutil.Error)\n"
+			"t = psutil.Process(os.getppid()).create_time()\nos.getppid()\n"
+		)
+		self.assertEqual(check_restart_check_library_use({restart: allowed}), [])
+		self.assertCaught(check_restart_check_library_use({}), restart, "missing")
 
 	# enqueue -----------------------------------------------------------------------------------
 
@@ -7298,6 +7535,109 @@ class TestScannersCatchViolations(unittest.TestCase):
 			"install.py": "import os\nos.remove(p)\n",
 		}
 		self.assertEqual(check_fs_writes_only_in_file_writer(clean), [])
+
+	def test_file_writer_recheck_rule_catches_bypass(self):
+		canonical = (
+			"def _refuse_unless_canonical(full_path):\n"
+			"\tfull = os.path.abspath(full_path)\n"
+			"\tif source.resolve_safe_path(os.path.relpath(full, source.get_source_root())) != full:\n"
+			"\t\traise ValueError(full)\n"
+		)
+		writer = (
+			"import os\nfrom erp_ai.agent.tools import source\n\n{canonical}\n"
+			"def make_parents(full_path, app_dir):\n\t{make}\n\tos.mkdir(full_path)\n\n"
+			"def remove_empty_dirs(dirs):\n\tfor d in dirs:\n\t\t_refuse_unless_canonical(d)\n\t\t{remove}\n"
+		)
+		recheck = "_refuse_unless_canonical(full_path)"
+		good = {"canonical": canonical, "make": recheck, "remove": "os.rmdir(d)"}
+		self.assertEqual(
+			check_file_writer_rechecks_through_resolver({FILE_WRITER_FILE: writer.format(**good)}), []
+		)
+		direct = (
+			"from erp_ai.agent.tools.source import resolve_safe_path as resolve\n\n"
+			"def _refuse_unless_canonical(full_path):\n\tif resolve(full_path) != full_path:\n"
+			"\t\traise ValueError(full_path)\n"
+		)
+		self.assertEqual(
+			check_file_writer_rechecks_through_resolver(
+				{
+					FILE_WRITER_FILE: writer.format(**{**good, "canonical": direct}).replace(
+						"from erp_ai.agent.tools import source\n", ""
+					)
+				}
+			),
+			[],
+		)
+		cases = {
+			"resolver not called": (
+				{"canonical": "def _refuse_unless_canonical(full_path):\n\tpass\n"},
+				"_refuse_unless_canonical",
+			),
+			"resolver not called, decoy source call": (
+				{"canonical": "def _refuse_unless_canonical(full_path):\n\tsource.get_source_root()\n"},
+				"_refuse_unless_canonical",
+			),
+			"no canonical function": (
+				{"canonical": "def _refuse_other(full_path):\n\tsource.resolve_safe_path(full_path)\n"},
+				"_refuse_unless_canonical",
+			),
+			"realpath in remove_empty_dirs": (
+				{"remove": "os.path.realpath(d)"},
+				"realpath",
+			),
+			"aliased realpath": (
+				{"remove": "rp(d)", "canonical": "from os.path import realpath as rp\n" + canonical},
+				"realpath",
+			),
+			"commonpath": ({"remove": "os.path.commonpath([d, d])"}, "commonpath"),
+			"is_relative_to": ({"remove": "PurePath(d).is_relative_to(d)"}, "is_relative_to"),
+			"readlink": ({"remove": "os.readlink(d)"}, "readlink"),
+			"make_parents skips the recheck": ({"make": "pass"}, "make_parents"),
+		}
+		for name, (overrides, fragment) in cases.items():
+			with self.subTest(case=name):
+				source = writer.format(**{**good, **overrides})
+				self.assertCaught(
+					check_file_writer_rechecks_through_resolver({FILE_WRITER_FILE: source}), fragment
+				)
+		no_remover = (
+			"import os\nfrom erp_ai.agent.tools import source\n\n"
+			+ canonical
+			+ ("\ndef make_parents(full_path, app_dir):\n\t_refuse_unless_canonical(full_path)\n")
+		)
+		self.assertCaught(
+			check_file_writer_rechecks_through_resolver({FILE_WRITER_FILE: no_remover}), "remove_empty_dirs"
+		)
+		remover_skips_recheck = (
+			no_remover + "\ndef remove_empty_dirs(dirs):\n\tfor d in dirs:\n\t\tos.rmdir(d)\n"
+		)
+		self.assertCaught(
+			check_file_writer_rechecks_through_resolver({FILE_WRITER_FILE: remover_skips_recheck}),
+			"remove_empty_dirs",
+		)
+		self.assertCaught(check_file_writer_rechecks_through_resolver({}), FILE_WRITER_FILE)
+		# Condition 4 (on from T6): a file-system function outside FILE_WRITER_RECHECKERS is caught.
+		renamer = writer.format(**good) + "\ndef rename_file(a, b):\n\tos.replace(a, b)\n"
+		self.assertEqual(check_file_writer_rechecks_through_resolver({FILE_WRITER_FILE: renamer}), [])
+		with patch(f"{__name__}.FILE_WRITER_RECHECKS_ALL", True):
+			self.assertCaught(
+				check_file_writer_rechecks_through_resolver({FILE_WRITER_FILE: renamer}), "rename_file"
+			)
+			self.assertEqual(
+				check_file_writer_rechecks_through_resolver({FILE_WRITER_FILE: writer.format(**good)}), []
+			)
+		# The ADR-011 name rule still catches the old name in this file: the new rule does not loosen it.
+		old_name = {
+			CHANGE_GUARD_FILE: "from erp_ai.agent.tools import source\n\ndef check_write_path(rel):\n"
+			"\tfull = source.resolve_safe_path(rel)\n\tif full is None:\n\t\treturn _refused(PATH_INVALID)\n"
+			"\treturn full\n",
+			FILE_WRITER_FILE: "def _refuse_unsafe_path(full_path):\n\treturn None\n",
+		}
+		self.assertCaught(
+			check_change_guard_uses_resolve_safe_path(old_name), FILE_WRITER_FILE, "second path resolver"
+		)
+		self.assertFalse(FILE_WRITER_RECHECKS_ALL)
+		self.assertEqual(FILE_WRITER_RECHECKERS, ("make_parents", "remove_empty_dirs"))
 
 	def test_changes_set_user_or_publish_caught(self):
 		cases = {

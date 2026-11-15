@@ -3,6 +3,7 @@ import hashlib
 import json
 import os
 import subprocess
+import time
 from unittest.mock import patch
 
 import frappe
@@ -19,6 +20,7 @@ from erp_ai.constants import (
 	CHANGE_OP_CREATE,
 	CHANGE_OP_DELETE,
 	CHANGE_OP_EDIT,
+	CHANGE_OP_RENAME,
 	CHANGE_STATUS_APPLIED,
 	CHANGE_STATUS_APPROVED,
 	CHANGE_STATUS_FAILED,
@@ -346,6 +348,103 @@ class TestBlockAllOrNothing(BlockApplyTestCase):
 		self.assert_failed_untouched(name, self.stale_reason(2, "docs/new.txt"), before, CHANGE_STATUS_STALE)
 		with open(os.path.join(self.sandbox.repo(APP), "docs/new.txt"), encoding="utf-8") as handle:
 			self.assertEqual(handle.read(), "người khác tạo\n")
+
+	def rename_item(self):
+		"""Renames `TEXT_RELS[1]` to `docs/moved.txt`, its content kept."""
+		return {
+			"kind": CHANGE_OP_RENAME,
+			"path": f"{APP}/{TEXT_RELS[1]}",
+			"new_path": f"{APP}/docs/moved.txt",
+			"before": TEXT_BEFORE,
+			"after": TEXT_BEFORE,
+		}
+
+	def precheck(self, name):
+		"""Steps 2 to 5 of design 4.2 called on their own, so the value step 5 returns can be read."""
+		proposal = frappe.get_doc(PROPOSAL_DOCTYPE, name)
+		check = apply_job._recheck_block(proposal, (APP,))
+		return apply_job._precheck_block(proposal, check, time.monotonic() + 60)
+
+	def test_rename_source_changed_or_target_exists_stale(self):
+		cases = (
+			("source changed", TEXT_RELS[1], "người khác sửa\n"),
+			("target exists", "docs/moved.txt", "người khác tạo\n"),
+		)
+		moved = os.path.join(self.sandbox.repo(APP), "docs/moved.txt")
+		for label, rel, text in cases:
+			with self.subTest(label):
+				self.sandbox.git(APP, "checkout", "--quiet", "--", ".")
+				name = self.approve(self.block([*self.edits(count=1), self.rename_item()]))
+				self.write(rel, text)
+				try:
+					before = self.snapshot()
+
+					self.run_apply(name)
+
+					self.assert_failed_untouched(
+						name, self.stale_reason(2, TEXT_RELS[1]), before, CHANGE_STATUS_STALE
+					)
+				finally:
+					if os.path.lexists(moved):
+						os.remove(moved)
+
+	def test_git_read_new_file_by_kind_returns_shared_head(self):
+		# Step 5: git is read for every path, `new_file` only for a created file and a rename target; the HEAD
+		# they all share is what step 5 remembers as `old_head`.
+		created = {"kind": CHANGE_OP_CREATE, "path": f"{APP}/docs/new.txt", "after": "mới\n"}
+		name = self.approve(self.block([*self.edits(count=1), created, self.rename_item()]))
+		repo = self.sandbox.repo(APP)
+
+		with patch.object(source, "read_git_state", wraps=source.read_git_state) as spy:
+			old_head = self.precheck(name)
+
+		self.assertEqual(old_head, self.git("rev-parse", "HEAD"))
+		self.assertEqual(
+			[(call.args[0], call.kwargs["new_file"]) for call in spy.call_args_list],
+			[
+				(os.path.join(repo, TEXT_RELS[0]), False),
+				(os.path.join(repo, "docs/new.txt"), True),
+				(os.path.join(repo, TEXT_RELS[1]), False),
+				(os.path.join(repo, "docs/moved.txt"), True),
+			],
+		)
+
+	def test_head_differs_between_paths_error_names_item(self):
+		# Design 4.2 step 5 has no sentence for it: every path must show the one HEAD that becomes `old_head`.
+		real = source.read_git_state
+		seen = []
+
+		def read_git_state(full, **kwargs):
+			seen.append(full)
+			state = real(full, **kwargs)
+			return dataclasses.replace(state, head="0" * 40) if len(seen) == 2 else state
+
+		name = self.approve(self.block(self.edits()))
+		before = self.snapshot()
+
+		with patch.object(source, "read_git_state", side_effect=read_git_state):
+			self.run_apply(name)
+
+		self.assert_failed_untouched(name, f"mục 2 ({APP}/{TEXT_RELS[1]}): {source.GIT_ERROR}", before)
+
+	def test_every_row_compared_before_any_git_read(self):
+		# Item 3 is stale and git would refuse item 1: step 4 finishes before step 5 starts.
+		real = source.read_git_state
+		refused = os.path.join(self.sandbox.repo(APP), TEXT_RELS[0])
+
+		def read_git_state(full, **kwargs):
+			state = real(full, **kwargs)
+			return dataclasses.replace(state, refusal="git bị khóa") if full == refused else state
+
+		name = self.approve(self.block(self.edits()))
+		self.write(TEXT_RELS[2], "người khác sửa\n")
+		before = self.snapshot()
+
+		with patch.object(source, "read_git_state", side_effect=read_git_state) as spy:
+			self.run_apply(name)
+
+		self.assert_failed_untouched(name, self.stale_reason(3, TEXT_RELS[2]), before, CHANGE_STATUS_STALE)
+		spy.assert_not_called()
 
 
 class TestDelete(BlockApplyTestCase):

@@ -309,13 +309,15 @@ def _recheck_block(proposal, allowed_apps) -> change_guard.BlockCheck:
 	return check
 
 
-def _precheck_block(proposal, check: change_guard.BlockCheck, deadline: float) -> None:
-	"""Design 4.2 steps 4 to 5 for a block, before any byte is written; returns once every row passed.
+def _precheck_block(proposal, check: change_guard.BlockCheck, deadline: float) -> str | None:
+	"""Design 4.2 steps 4 to 5 for a block, before any byte is written; returns `old_head` once every row passed.
 
 	Step 4 compares every row first: an edit, a deletion and a rename source must hash to `base_hash`, a
 	created file and a rename target must not `lexists` → else `Hết hiệu lực` naming the item. Step 5 then
 	reads git for every path: a refusal is `Lỗi` naming the item, a branch other than `target_branch` is
-	`Hết hiệu lực`. The one-file path keeps the HEAD it reads itself.
+	`Hết hiệu lực`. Every path must show the same HEAD, else `Lỗi` naming the item with `GIT_ERROR`
+	(step 5 has no sentence for it); that HEAD is the `old_head` returned, `None` for a block without
+	items. The one-file path keeps the HEAD it reads itself.
 	"""
 	paths = []
 	for number, target in enumerate(check.targets, start=1):
@@ -332,12 +334,17 @@ def _precheck_block(proposal, check: change_guard.BlockCheck, deadline: float) -
 		):
 			raise _Stop(CHANGE_STATUS_STALE, prefix + TARGET_CHANGED)
 		paths.extend((prefix, full, full in new) for full in (existing, *new) if full is not None)
+	old_head = None
 	for prefix, full, new_file in paths:
 		state = source.read_git_state(full, new_file=new_file, limit_s=_git_limit(deadline))
 		if state.refusal:
 			raise _Stop(CHANGE_STATUS_FAILED, prefix + state.refusal)
 		if state.branch != proposal.target_branch:
 			raise _Stop(CHANGE_STATUS_STALE, GIT_BRANCH_CHANGED)
+		if old_head is not None and state.head != old_head:
+			raise _Stop(CHANGE_STATUS_FAILED, prefix + source.GIT_ERROR)
+		old_head = state.head
+	return old_head
 
 
 def _failed(result) -> bool:

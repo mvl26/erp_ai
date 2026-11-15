@@ -1089,6 +1089,7 @@ class TestPostNotice(TicketCommentCase):
 # The analysis a model writes to the reasoning template (design-w1-fixes-20 Điểm 1.2): no "Căn cứ" section.
 ANALYSIS = "**Nhận định:** A\n**Hướng xử lý:** B\nĐộ tin cậy: 90%"
 _HEADING = re.compile(r"(?m)^[ \t]*\*\*([^*\n]+):\*\*|<strong>([^<]+):</strong>")
+_PLAN_HEADING = re.compile(r"(?m)^[ \t]*(?:\*\*)?Hướng xử lý:|<strong>Hướng xử lý:</strong>")
 
 
 def _headings(content: str) -> list[str]:
@@ -1358,13 +1359,12 @@ class TestGuidanceWriter(TicketCommentCase):
 				content = self._body(self._run(analysis, manual=["L"]))
 
 				self.assertEqual(content, f"{write_ticket.GUIDANCE_MARKER}\n{text}")
-				self.assertEqual(_headings(content).count("Hướng xử lý"), 1)
+				# exactly one plan heading, a heading written without stars included
+				(plan_at,) = [m.start() for m in _PLAN_HEADING.finditer(content)]
 				if analysis is not None and "Hướng xử lý:" not in analysis:
 					self.assertEqual(content.count(plan), 1)
 				# the list sits after the plan heading and before the next heading
-				spans = [(m.start(), m.group(1) or m.group(2)) for m in _HEADING.finditer(content)]
-				(plan_at,) = [at for at, name in spans if name == "Hướng xử lý"]
-				later = [at for at, _name in spans if at > plan_at]
+				later = [m.start() for m in _HEADING.finditer(content) if m.start() > plan_at]
 				self.assertGreater(content.index(ul), plan_at)
 				if later:
 					self.assertLess(content.index(ul), later[0])

@@ -174,7 +174,7 @@ class TestRunner(RunnerTestBase):
 
 	def test_missing_agent_user_stops(self):
 		with (
-			patch.object(runner, "AGENT_USER", f"{PREFIX.lower()}missing@example.com"),
+			patch.object(authority, "AGENT_USER", f"{PREFIX.lower()}missing@example.com"),
 			patch.object(frappe, "log_error") as log_error,
 		):
 			self._run()

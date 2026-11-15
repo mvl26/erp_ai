@@ -4,7 +4,7 @@ import frappe
 from frappe.tests.utils import FrappeTestCase
 from helpdesk.test_utils import create_agent, create_contact, make_ticket, make_todo
 
-from erp_ai.agent import authority
+from erp_ai.agent import authority, runner
 from erp_ai.constants import (
 	AGENT_USER,
 	ROLE_INSTRUCTOR,
@@ -354,3 +354,57 @@ class TestRunInstructor(AuthorityTestBase):
 		self.assertIsNone(authority.run_instructor(self.ticket_p, TRIGGER_TICKET_INSERT))
 		frappe.db.set_value("ToDo", todo, "assigned_by", ASSIGNER)
 		self.assertEqual(authority.run_instructor(self.ticket_p, TRIGGER_TICKET_INSERT), ASSIGNEE)
+
+
+class TestEnterAgentSession(FrappeTestCase):
+	"""ADR-033 QĐ 1 / U1.md: the one place a job switches its session to the agent account."""
+
+	def setUp(self):
+		keep_agent_settings(self)
+		self.addCleanup(frappe.db.rollback)
+		self.addCleanup(frappe.set_user, frappe.session.user)
+		frappe.set_user("Administrator")
+		frappe.db.set_value("User", AGENT_USER, "enabled", 1)
+
+	def _enter(self):
+		with patch.object(frappe, "log_error") as log_error:
+			entered = authority.enter_agent_session()
+		return entered, log_error
+
+	def test_switches_to_agent(self):
+		entered, log_error = self._enter()
+
+		self.assertIs(entered, True)
+		self.assertEqual(frappe.session.user, AGENT_USER)
+		log_error.assert_not_called()
+
+	def test_disabled_agent_refused_and_logged(self):
+		frappe.db.set_value("User", AGENT_USER, "enabled", 0)
+
+		entered, log_error = self._enter()
+
+		self.assertIs(entered, False)
+		log_error.assert_called_once_with(authority.TITLE_WRONG_USER, "Không có tài khoản agent")
+		self.assertEqual(frappe.session.user, "Administrator")
+
+	def test_missing_agent_refused_and_logged(self):
+		with patch.object(authority, "AGENT_USER", "authority.missing.agent@example.com"):
+			entered, log_error = self._enter()
+
+		self.assertIs(entered, False)
+		log_error.assert_called_once_with(authority.TITLE_WRONG_USER, "Không có tài khoản agent")
+		self.assertEqual(frappe.session.user, "Administrator")
+
+	def test_session_not_switched_refused_and_logged(self):
+		with patch.object(frappe, "set_user") as set_user:
+			entered, log_error = self._enter()
+
+		set_user.assert_called_once_with(AGENT_USER)
+		self.assertIs(entered, False)
+		log_error.assert_called_once_with(authority.TITLE_WRONG_USER, "Sai tài khoản: Administrator")
+		self.assertEqual(frappe.session.user, "Administrator")
+
+	def test_title_is_the_runner_title(self):
+		# The title moved here; the old name `runner.TITLE_WRONG_USER` stays the same object (U1.md:264).
+		self.assertIs(runner.TITLE_WRONG_USER, authority.TITLE_WRONG_USER)
+		self.assertEqual(authority.TITLE_WRONG_USER, "erp_ai: sai tài khoản job")

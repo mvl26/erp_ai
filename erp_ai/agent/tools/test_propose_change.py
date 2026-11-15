@@ -126,6 +126,7 @@ class TestProposeChange(FrappeTestCase):
 			"agent_user": AGENT,
 			"change_enabled": True,
 			"allowed_apps": (APP,),
+			"one_click_approval": True,
 		}
 		return ToolContext(**{**values, **fields})
 
@@ -1973,3 +1974,63 @@ class TestBlockComment(FrappeTestCase):
 			with self.subTest(shape=shape):
 				name = propose_change._comment(ctx, frappe._dict(fields))
 				self.assertEqual(frappe.db.get_value("Comment", name, "content"), expected)
+
+
+class TestOneClickGate(FrappeTestCase):
+	"""FEAT-007 T89: the proposal comment signs an approval link only while switch (5) is on."""
+
+	setUp = TestProposeChange.setUp
+	context = TestProposeChange.context
+	run_tool = TestProposeChange.run_tool
+	comments = TestProposeChange.comments
+	change = TestProposeChange.change
+	block = TestProposeBlock.block
+
+	def content(self, result):
+		(comment,) = [row for row in self.comments() if row.name == result["comment"]]
+		return comment.content
+
+	def test_switch_off_comment_has_no_decision_links(self):
+		changes = [
+			{"action": "create", "path": f"{APP}/pkg/n1.md", "content": "n\n"},
+			{"action": "create", "path": f"{APP}/pkg/n2.md", "content": "n\n"},
+			{"action": "create", "path": f"{APP}/pkg/n3.md", "content": "n\n"},
+		]
+		results = (
+			self.change(["x = 1"], ["x = 2"], one_click_approval=False),
+			self.block(changes, one_click_approval=False),
+		)
+		for result in results:
+			with self.subTest(result=result):
+				self.assertTrue(result["ok"], result)
+				content = self.content(result)
+				form = f"/app/erp-ai-change-proposal/{result['proposal']}"
+				self.assertNotIn(change_link.SIGNATURE_MARK, content)
+				self.assertNotIn("<strong>Duyệt</strong>", content)
+				self.assertNotIn("<strong>Từ chối</strong>", content)
+				self.assertTrue(
+					content.endswith(f'<p><a href="{form}">{propose_change.OPEN_PROPOSAL_LABEL}</a></p>'),
+					content,
+				)
+
+	def test_switch_off_never_signs(self):
+		with patch.object(change_link, "decision_path", wraps=change_link.decision_path) as signed:
+			result = self.change(["x = 1"], ["x = 2"], one_click_approval=False)
+		self.assertTrue(result["ok"], result)
+		signed.assert_not_called()
+
+	def test_switch_on_comment_matches_feat004_links(self):
+		result = self.change(["x = 1"], ["x = 2"], one_click_approval=True)
+		name = result["proposal"]
+		escape = frappe.utils.escape_html
+		approve = change_link.decision_path(name, change_link.ACTION_APPROVE)
+		reject = change_link.decision_path(name, change_link.ACTION_REJECT)
+		form = f"/app/erp-ai-change-proposal/{name}"
+		self.assertTrue(
+			self.content(result).endswith(
+				f'<p><a href="{escape(approve)}"><strong>Duyệt</strong></a> · '
+				f'<a href="{escape(reject)}"><strong>Từ chối</strong></a> · '
+				f'<a href="{escape(form)}">Xem nội dung thay đổi</a></p>'
+			)
+		)
+		self.assertNotIn(propose_change.OPEN_PROPOSAL_LABEL, self.content(result))

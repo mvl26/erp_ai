@@ -2115,6 +2115,31 @@ def check_decide_reads_one_click_switch_before_signature(sources: dict) -> list:
 	return []
 
 
+def check_comment_signs_only_when_one_click(sources: dict) -> list:
+	"""FEAT-007 U3 3.4: `propose_change._comment` calls `change_link.decision_path` only inside a branch
+	whose test reads `one_click_approval`."""
+	source = sources.get(PROPOSE_TOOL_FILE)
+	if source is None:
+		return _missing(PROPOSE_TOOL_FILE)
+	tree = parse(PROPOSE_TOOL_FILE, source)
+	comment = next(
+		(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "_comment"), None
+	)
+	if comment is None:
+		return [f"{PROPOSE_TOOL_FILE}: no function _comment"]
+	guarded = set()
+	for node in ast.walk(comment):
+		if isinstance(node, ast.If) and "one_click_approval" in ast.dump(node.test):
+			guarded.update(id(inner) for stmt in node.body for inner in ast.walk(stmt))
+	return [
+		f"{PROPOSE_TOOL_FILE}:{node.lineno}: _comment signs a link outside the one_click_approval branch"
+		for node in ast.walk(comment)
+		if isinstance(node, ast.Call)
+		and (dotted_name(node.func) or "").endswith("decision_path")
+		and id(node) not in guarded
+	]
+
+
 # ---------------------------------------------------------------------------------------------------
 # FEAT-004 rules, group 1 (ADR-011, ADR-012 "Ràng buộc"; design 8.2)
 # ---------------------------------------------------------------------------------------------------
@@ -5519,8 +5544,12 @@ class TestArchitecture(unittest.TestCase):
 		self.assertTrue(check_log_trigger_options_match_run_log(scanned, expected[:-1]))
 
 	def test_decide_reads_one_click_switch_before_signature(self):
-		# The decide half; the propose_change half (no signed link while (5) is off) is another task's.
 		scanned = load_product_sources(suffixes=(".py", ".json"))
+		self.assertEqual(check_comment_signs_only_when_one_click(scanned), [])
+		unguarded = "def _comment(ctx, p):\n\tx = change_link.decision_path(p.name, 'approve')\n"
+		self.assertTrue(check_comment_signs_only_when_one_click({PROPOSE_TOOL_FILE: unguarded}))
+		guarded = "def _comment(ctx, p):\n\tif ctx.one_click_approval:\n\t\tx = change_link.decision_path(p.name, 'a')\n"
+		self.assertEqual(check_comment_signs_only_when_one_click({PROPOSE_TOOL_FILE: guarded}), [])
 		self.assertEqual(check_decide_reads_one_click_switch_before_signature(scanned), [])
 		good = (
 			"def decide(name=None, action=None, _signature=None):\n"

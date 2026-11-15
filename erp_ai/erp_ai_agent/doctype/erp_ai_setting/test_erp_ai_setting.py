@@ -10,7 +10,7 @@ from frappe.tests.utils import FrappeTestCase
 from frappe.utils import get_datetime
 
 from erp_ai import constants, install
-from erp_ai.agent import prompts
+from erp_ai.agent import policy, prompts, run_log
 from erp_ai.agent.classification import DEFAULT_CATEGORY_MAPPING
 from erp_ai.agent.routing import DEFAULT_ROUTING_RULES
 from erp_ai.agent.tools import read, site_api
@@ -20,6 +20,7 @@ from erp_ai.constants import (
 	KEY_STATUS_ACTIVE,
 	KEY_STATUS_BAD_KEY,
 	KEY_STATUS_PAUSED,
+	LOG_DOCTYPE,
 	SETTING_DOCTYPE,
 )
 from erp_ai.erp_ai_agent.doctype.erp_ai_setting import erp_ai_setting
@@ -1009,6 +1010,109 @@ class TestPermissionSwitchNotice(FrappeTestCase):
 		self.assertIn("gọi hàm whitelist", message)
 		self.assertIn("Gọi hàm là tự do", message)
 		self.assertIn("chỉ là cố gắng", message)
+
+
+class TestPermissionSwitchLog(FrappeTestCase):
+	"""FEAT-007 U3 3.6: a save that changes a permission switch writes one bot_action row."""
+
+	def setUp(self):
+		self.addCleanup(frappe.db.rollback)
+		keep_agent_settings(self)
+		self._save({fieldname: 0 for fieldname in PERMISSION_SWITCHES} | {"site_environment": "production"})
+
+	def _save(self, values):
+		doc = frappe.get_single(SETTING_DOCTYPE)
+		doc.update(values)
+		doc.flags.ignore_validate = True
+		with patch.object(frappe, "msgprint") as msgprint:
+			doc.save(ignore_permissions=True)
+		return msgprint
+
+	def _rows(self):
+		return set(
+			frappe.get_all(
+				LOG_DOCTYPE, filters={"entry_type": "bot_action", "trigger": "setting_save"}, pluck="name"
+			)
+		)
+
+	def _new_row(self, values):
+		before = self._rows()
+		self._save(values)
+		added = self._rows() - before
+		return added
+
+	def _entry(self, fieldname, was, now):
+		return {
+			"tool": "permission_switch",
+			"doctype": SETTING_DOCTYPE,
+			"name": SETTING_DOCTYPE,
+			"ok": True,
+			"value_before": {fieldname: was},
+			"value_after": {fieldname: now},
+			"instructor": frappe.session.user,
+		}
+
+	def test_each_switch_on_writes_one_row(self):
+		for fieldname in PERMISSION_SWITCHES:
+			with self.subTest(fieldname=fieldname):
+				self._save({name: 0 for name in PERMISSION_SWITCHES})
+				added = self._new_row({fieldname: 1, "site_environment": "test"})
+				self.assertEqual(len(added), 1)
+				row = frappe.get_doc(LOG_DOCTYPE, added.pop())
+				self.assertEqual(
+					(row.entry_type, row.trigger, row.cost_usd), ("bot_action", "setting_save", 0)
+				)
+				self.assertFalse(row.ticket)
+				self.assertEqual(row.instructor, frappe.session.user)
+				self.assertEqual(row.site_environment, "test")
+				self.assertRegex(row.run_id, r"^[0-9a-f]{32}$")
+				self.assertEqual(json.loads(row.actions), [self._entry(fieldname, 0, 1)])
+
+	def test_two_switches_on_one_row_two_entries(self):
+		added = self._new_row({"act_now_enabled": 1, "one_click_approval_enabled": 1})
+		self.assertEqual(len(added), 1)
+		actions = json.loads(frappe.db.get_value(LOG_DOCTYPE, added.pop(), "actions"))
+		self.assertEqual(
+			actions,
+			[self._entry("act_now_enabled", 0, 1), self._entry("one_click_approval_enabled", 0, 1)],
+		)
+
+	def test_save_without_switch_change_no_row(self):
+		self._save({"record_tools_enabled": 1})
+		self.assertEqual(self._new_row({"site_environment": "test"}), set())
+		self.assertEqual(self._new_row({}), set())
+
+	def test_switch_off_writes_row_without_notice(self):
+		self._save({"act_now_enabled": 1})
+		before = self._rows()
+		msgprint = self._save({"act_now_enabled": 0})
+		added = self._rows() - before
+		self.assertEqual(len(added), 1)
+		actions = json.loads(frappe.db.get_value(LOG_DOCTYPE, added.pop(), "actions"))
+		self.assertEqual(actions, [self._entry("act_now_enabled", 1, 0)])
+		self.assertEqual([c for c in msgprint.call_args_list if c.kwargs.get("title") == NOTICE_TITLE], [])
+
+	def test_log_failure_fails_the_save(self):
+		doc = frappe.get_single(SETTING_DOCTYPE)
+		doc.update({"unrestricted_enabled": 1})
+		doc.flags.ignore_validate = True
+		with (
+			patch.object(run_log, "write_bot_action", side_effect=ValueError("boom")),
+			patch.object(frappe, "msgprint"),
+			self.assertRaises(ValueError),
+		):
+			doc.save(ignore_permissions=True)
+
+	def test_switch_set_matches_section_checks(self):
+		inside, checks = False, []
+		for field in frappe.get_meta(SETTING_DOCTYPE).fields:
+			if field.fieldtype == "Section Break":
+				inside = field.fieldname == "section_permissions"
+			elif inside and field.fieldtype == "Check":
+				checks.append(field.fieldname)
+		self.assertEqual(tuple(checks), tuple(PERMISSION_SWITCHES))
+		self.assertEqual(tuple(erp_ai_setting._permission_switch_fields()), policy.PERMISSION_SWITCH_FIELDS)
+		self.assertEqual(policy.PERMISSION_SWITCH_FIELDS, tuple(PERMISSION_SWITCHES))
 
 
 GATE_WARNING_TITLE = "Chưa đạt cửa L0 → L1"

@@ -6,7 +6,7 @@ import frappe
 from frappe import _
 from frappe.utils import add_months, get_datetime, now_datetime
 
-from erp_ai.constants import LEVELS, LOG_DOCTYPE, SETTING_DOCTYPE, TICKET_CONTENT_DOCTYPES
+from erp_ai.constants import CATEGORIES, LEVELS, LOG_DOCTYPE, SETTING_DOCTYPE, TICKET_CONTENT_DOCTYPES
 
 OPT_OUT_FIELD = "ai_opt_out"
 EXCLUDED_TEAMS_FIELD = "excluded_teams"
@@ -94,6 +94,23 @@ def effective_level(settings, *, over_budget: bool) -> str:
 	if over_budget:
 		return min(level, OVER_BUDGET_LEVEL, key=LEVELS.index)
 	return level
+
+
+LEVEL_CAP_FIELD_PREFIX = "level_cap_"
+UNKNOWN_CATEGORY_LEVEL = "L1"
+
+
+def category_level_cap(settings, category: str | None) -> str:
+	"""The only reader of level_cap_<x>; an unknown category, a missing field or a value outside LEVELS reads L1."""
+	if category not in CATEGORIES:
+		return UNKNOWN_CATEGORY_LEVEL
+	cap = getattr(settings, LEVEL_CAP_FIELD_PREFIX + category.lower(), None)
+	return cap if cap in LEVELS else UNKNOWN_CATEGORY_LEVEL
+
+
+def main_path_level(settings, permission_level: str, category: str | None) -> str:
+	"""The main-path level (AC-31): the smaller of the permission level and the category cap."""
+	return min(permission_level, category_level_cap(settings, category), key=LEVELS.index)
 
 
 def runs_today(ticket_name, now=None) -> int:

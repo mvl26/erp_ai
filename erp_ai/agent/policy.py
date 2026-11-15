@@ -6,7 +6,15 @@ import frappe
 from frappe import _
 from frappe.utils import add_months, get_datetime, now_datetime
 
-from erp_ai.constants import CATEGORIES, LEVELS, LOG_DOCTYPE, SETTING_DOCTYPE, TICKET_CONTENT_DOCTYPES
+from erp_ai.constants import (
+	CATEGORIES,
+	LEVELS,
+	LOG_DOCTYPE,
+	SETTING_DOCTYPE,
+	TICKET_CONTENT_DOCTYPES,
+	TRIGGER_COMMENT_MENTION,
+	TRIGGER_TICKET_INSERT,
+)
 
 OPT_OUT_FIELD = "ai_opt_out"
 EXCLUDED_TEAMS_FIELD = "excluded_teams"
@@ -160,14 +168,19 @@ def latest_classification(ticket_name: str) -> tuple[str | None, int | None]:
 	return rows[0].predicted_category, _known_pct(rows[0].predicted_confidence_pct)
 
 
+# The triggers whose runs count toward the daily limit (ADR-033 QĐ 4).
+RUN_LIMIT_TRIGGERS = (TRIGGER_TICKET_INSERT, TRIGGER_COMMENT_MENTION)
+
+
 def runs_today(ticket_name, now=None) -> int:
-	"""Distinct run_id of classify/reason log entries since 00:00 today (system time)."""
+	"""Distinct run_id of classify/reason log entries of a RUN_LIMIT_TRIGGERS trigger since 00:00 today (system time)."""
 	start = get_datetime(now or now_datetime()).replace(hour=0, minute=0, second=0, microsecond=0)
 	rows = frappe.get_all(
 		LOG_DOCTYPE,
 		filters={
 			"ticket": ticket_name,
 			"entry_type": ("in", ("classify", "reason")),
+			"trigger": ("in", RUN_LIMIT_TRIGGERS),
 			"creation": (">=", start),
 		},
 		pluck="run_id",

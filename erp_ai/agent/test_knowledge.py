@@ -579,3 +579,28 @@ class TestManuals(FrappeTestCase):
 			with patch.object(knowledge, "open", side_effect=ValueError(marker), create=True):
 				with self.assertRaises(ValueError):
 					self._found(word)
+
+	def test_unreadable_file_logged_even_when_log_file_fails(self):
+		"""`design-w1-fixes-14.md` Điểm 2: a log file that cannot be opened does not break the search."""
+		word = _word("mn")
+		self._manual("sub/a.md", f"# Mục\n{word}\n")
+		self._manual("b.md", f"# Mục\n{word}\n")
+		real_open = open
+
+		def fake_open(path, *args, **kwargs):
+			if os.path.basename(path) == "a.md":
+				raise PermissionError(errno.EACCES, "denied", path)
+			return real_open(path, *args, **kwargs)
+
+		with (
+			patch.object(knowledge, "open", side_effect=fake_open, create=True),
+			patch.object(knowledge.frappe, "logger", side_effect=PermissionError(errno.EACCES, "log")),
+			self.assertLogs(knowledge.source.LOGGER_NAME, "WARNING") as logs,
+		):
+			found = self._found(word)
+
+		self.assertEqual(found, [("b.md", 1)])
+		self.assertEqual(
+			[record.getMessage() for record in logs.records],
+			["search_manuals skipped sub/a.md: PermissionError"],
+		)

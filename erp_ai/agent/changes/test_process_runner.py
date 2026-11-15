@@ -13,6 +13,7 @@ from erp_ai.agent.changes.process_runner import (
 	run_bench,
 )
 from erp_ai.agent.tools import source
+from erp_ai.constants import RESTART_LAUNCH_TIMEOUT_S, RESTART_TIMEOUT_S
 from erp_ai.test_utils import GitSandbox
 
 RUN_PATH = "erp_ai.agent.changes.process_runner.subprocess.run"
@@ -602,3 +603,92 @@ class TestCommitOnlyRecordsDeletion(FrappeTestCase):
 		self.assertEqual(self._git("show", f":{OTHER_STAGED_REL}"), "s = 1\n")
 		with open(full(unstaged), encoding="utf-8") as handle:
 			self.assertEqual(handle.read(), "u = 2\n")
+
+
+class TestLaunchRestart(FrappeTestCase):
+	"""Design 3.4, 4.4 step 2, A-5 (AC-45): detached `setsid -f timeout … bench restart`; every run() is a stub."""
+
+	def setUp(self):
+		patcher = patch(BENCH_PATH, return_value=FAKE_BENCH)
+		patcher.start()
+		self.addCleanup(patcher.stop)
+
+	def _launch(self, result):
+		effect = result if isinstance(result, BaseException) else None
+		value = None if effect else result
+		with patch(RUN_PATH, return_value=value, side_effect=effect) as run:
+			outcome = process_runner.launch_restart()
+		return outcome, run
+
+	def test_argv_shape(self):
+		self.assertEqual(
+			process_runner.RESTART_ARGV,
+			(
+				source.SETSID_EXECUTABLE,
+				"-f",
+				source.TIMEOUT_EXECUTABLE,
+				"-s",
+				"KILL",
+				str(RESTART_TIMEOUT_S),
+				source.BENCH_EXECUTABLE,
+				"restart",
+			),
+		)
+		self.assertIsInstance(process_runner.RESTART_ARGV, tuple)
+		self.assertEqual(process_runner.RESTART_ARGV[5], "700")
+		with open(process_runner.__file__, encoding="utf-8") as handle:
+			text = handle.read()
+		self.assertNotIn('"setsid"', text)
+		self.assertNotIn("'setsid'", text)
+
+	def test_argv_cwd_env_devnull_timeout_new_session(self):
+		full = {"PATH": "/usr/bin:/bin", "HOME": "/home/frappe", "OPENAI_API_KEY": "sk-fake-never-leak"}
+		with patch.dict(process_runner.os.environ, full, clear=True):
+			outcome, run = self._launch(completed(0))
+		self.assertEqual(outcome, (True, None))
+		run.assert_called_once()
+		self.assertEqual(run.call_args.args, (process_runner.RESTART_ARGV,))
+		kwargs = run.call_args.kwargs
+		self.assertEqual(
+			set(kwargs), {"cwd", "env", "stdin", "stdout", "stderr", "timeout", "start_new_session"}
+		)
+		self.assertEqual(kwargs["cwd"], FAKE_BENCH)
+		self.assertEqual(kwargs["env"], {"PATH": "/usr/bin:/bin", "HOME": "/home/frappe"})
+		self.assertIsNot(kwargs["env"], process_runner.os.environ)
+		self.assertIs(kwargs["stdin"], subprocess.DEVNULL)
+		self.assertIs(kwargs["stdout"], subprocess.DEVNULL)
+		self.assertIs(kwargs["stderr"], subprocess.DEVNULL)
+		self.assertEqual(kwargs["timeout"], RESTART_LAUNCH_TIMEOUT_S)
+		self.assertEqual(kwargs["timeout"], 10)
+		self.assertIs(kwargs["start_new_session"], True)
+
+	def test_nonzero_exit_returns_false(self):
+		for returncode in (1, 2, 124, 126, 127, -9):
+			with self.subTest(returncode=returncode):
+				outcome, run = self._launch(completed(returncode))
+				run.assert_called_once()
+				self.assertEqual(outcome, (False, "CalledProcessError"))
+
+	def test_file_not_found_timeout_oserror_return_class_name(self):
+		cases = (
+			(FileNotFoundError(2, "No such file", "setsid"), "FileNotFoundError"),
+			(subprocess.TimeoutExpired(cmd=["setsid"], timeout=10), "TimeoutExpired"),
+			(OSError(7, "Argument list too long"), "OSError"),
+			(PermissionError(13, "Permission denied", "setsid"), "PermissionError"),
+		)
+		for error, class_name in cases:
+			with self.subTest(class_name):
+				outcome, run = self._launch(error)
+				run.assert_called_once()
+				self.assertEqual(outcome, (False, class_name))
+
+	def test_unlisted_error_returns_class_name(self):
+		cases = (
+			(ValueError("embedded null byte"), "ValueError"),
+			(subprocess.SubprocessError("popen failed"), "SubprocessError"),
+		)
+		for error, class_name in cases:
+			with self.subTest(class_name):
+				outcome, run = self._launch(error)
+				run.assert_called_once()
+				self.assertEqual(outcome, (False, class_name))

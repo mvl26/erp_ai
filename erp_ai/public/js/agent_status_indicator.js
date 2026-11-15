@@ -466,6 +466,9 @@ function setupForm({ doc, call, router }) {
 				}
 				if (msg.state === "done") {
 					finish(runId);
+					if (state.panel.open) {
+						reload();
+					}
 					return;
 				}
 				if (msg.state !== "thinking" && msg.state !== "working") {

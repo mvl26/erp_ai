@@ -332,6 +332,8 @@ STATUS_SCRIPT_REQUIRED = (
 	# Payload keys: frappe comment.py:59-67 (key, doc.reference_doctype/name) and document.py:1370-1385 (doctype, name).
 	r'const onDocinfo = \(msg\) => \{\s*try \{\s*if \(\s*msg\?\.key === "comments" &&\s*msg\.doc\?\.reference_doctype === "HD Ticket" &&\s*String\(msg\.doc\.reference_name\) === state\.ticket\s*\) \{\s*reload\(\);',
 	r'const onDocUpdate = \(msg\) => \{\s*try \{\s*if \(msg\?\.doctype === "HD Ticket" && String\(msg\.name\) === state\.ticket\) \{\s*reload\(\);',
+	# A finished run refills an open panel: a bot reply no longer fires docinfo_update (ERP AI Message).
+	r'if \(msg\.state === "done"\) \{\s*finish\(runId\);\s*if \(state\.panel\.open\) \{\s*reload\(\);\s*\}\s*return;',
 	# Reconnect: re-join the room, then refill an open panel.
 	r'socket\.emit\("doc_subscribe", "HD Ticket", state\.ticket\);\s*\}\s*if \(state\.panel\.open\) \{\s*reload\(\);',
 	# Reset (ticket change or leaving the page): cancel pending loads, close the panel (returns the indicator), clear texts and the input.

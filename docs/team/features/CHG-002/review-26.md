@@ -9,8 +9,22 @@ Approved-by:
 
 - Diff: `git diff ae8edc5..77bfc62` (vòng 1) và `git diff 5d67400..a70a273` (sửa vòng 1), nhánh `team/CHG-002-task-26` (`5d67400` = merge `team/CHG-002` @ `7b7f000`, không mang thay đổi của task)
 - Gói: T26 (sửa vòng 1) + T27 cùng nhánh, một reviewer chấm cả gói ở vòng 2; verdict của T27 ở `review-27.md`
-- Vòng: 2 (max_rework = 3)
-- Verdict: **approve** ở vòng 2 → merge cùng T27 (sha ở dòng progress của T26 trong `tasks.md`), tick
+- Vòng: 3 (max_rework = 3)
+- Verdict: **approve** ở vòng 2 → merge cùng T27 (`a034a2d`); lần `cmd.test` cả app sau merge có một test đỏ ngoài baseline → vòng 3 (`git diff a034a2d..9837061`) **approve** → merge `c44bf86`, tick
+
+## Vòng 3 — approve (`git diff a034a2d..9837061`, 1 commit, 1 file, +4/−2)
+
+Vì sao có vòng 3: lần `cmd.test` cả app của đợt merge 16 mất kết quả khi máy khởi động lại (17:38). Chạy lại ở lượt 5 trên `a034a2d` (17:46–17:56): `Ran 1834 tests in 575.639s` / `FAILED (failures=6, errors=1)`; lỗi ngoài baseline là `ERROR: test_model_claims_approved_after_proposing_zero_applies (erp_ai.agent.test_agent_runner.TestRunnerProposeLogAndInjection)`, `test_agent_runner.py:2991` `ValueError: not enough values to unpack (expected 1, got 0)`; chạy lại riêng module (18:28) vẫn đỏ; trên `7b7f000` thì xanh. Test đỏ sau merge tính là review trượt, giao lại dev (touchpoint thêm `erp_ai/agent/test_agent_runner.py`, luật ở `tasks.md` dòng 19).
+
+1. ADDRESSED | STD-TEST-3 | `test_agent_runner.py:2870`, `:2873`: `SANDBOX_REL` từ `pkg/mod.py` thành `pkg/mod.js`, đường dẫn trong `INJECTION` đổi theo. Lý do tool từ chối đầu vào cũ là `change_guard.PY_NEEDS_RESTART` (`propose_file_change` dạng cũ gửi `commands=[]`). Không assertion nào đổi; test vẫn kiểm "model tự nhận đã duyệt sau khi đề xuất, 0 lần áp dụng" (1 đề xuất `Chờ duyệt`, dòng change chỉ có `propose`, 0 `enqueue`, mọi Popen là git đọc, HEAD và file không đổi). Hai test dùng chung hằng giữ nguyên nghĩa; dòng `test-input:` thứ hai (test không đỏ, đổi đầu vào vì chung hằng) được reviewer nhận là đúng chỗ. Đếm: L-2: 1, cộng một dòng lan do chung hằng.
+
+Lỗi mới trong các dòng đổi: không. Minor: không.
+
+Bằng chứng của dev (vòng 3): RED `ERROR: test_model_claims_approved_after_proposing_zero_applies` / `ValueError: not enough values to unpack (expected 1, got 0)` / `Ran 109 tests in 29.186s` / `FAILED (failures=3, errors=1)`; GREEN `MIGRATE 0` / `Ran 109 tests in 27.848s` / `FAILED (failures=3)` (còn đúng 3 test `TestRunnerL1Classification` của dòng `baseline:`).
+
+Tech-lead kiểm sau merge `c44bf86` (đợt merge 17, 19:42–19:53, `cmd.migrate` thoát 0): `cmd.test` `Ran 1853 tests in 619.227s` / `FAILED (failures=6)`, đúng 6 test của dòng `baseline:`.
+
+deferred của vòng 3: L-2 của addendum-4 chỉ viết cho "luật chặn bị gỡ làm đầu vào lỗi cũ thành hợp lệ"; vòng này dùng nó cho chiều ngược (luật mới làm đầu vào hợp lệ cũ thành không hợp lệ). Đề nghị designer thêm một câu vào L-2.
 
 ## Vòng 1 — request-changes (`git diff ae8edc5..77bfc62`, 1 commit, 2 file)
 

@@ -10,7 +10,8 @@ Approved-by:
 - Diff: `git diff a70a273..fa330af` (nhánh `team/CHG-002-task-26`, 1 commit, 2 file, +286/−9)
 - Gói: T26 (sửa vòng 1) + T27 cùng nhánh, một reviewer chấm cả gói; verdict của T26 ở `review-26.md`
 - Vòng: 1 (max_rework = 3)
-- Verdict: **approve** → merge cùng T26 (sha ở dòng progress của T27 trong `tasks.md`), tick
+- Verdict: **approve** → merge cùng T26 (`a034a2d`), tick sau đợt merge 17 (`team/CHG-002` @ `c44bf86`, 19:42–19:53: `cmd.test` `Ran 1853 tests in 619.227s` / `FAILED (failures=6)`, đúng 6 test của dòng `baseline:`)
+- OPEN-1, OPEN-2 ở dưới đã có phán quyết: `design-addendum-8.md` A8-3 (hằng mới `propose_change.PARENT_NOT_DIR` ở tool) và A8-4 (symlink nhận `PATH_SYMLINK`, `islink` là lớp phòng thủ); việc sửa câu và hai test giao cho T30 (cùng hai file), T27 không mở lại
 
 ## Vòng 1 — approve
 

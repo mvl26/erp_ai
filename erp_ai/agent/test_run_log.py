@@ -8,7 +8,7 @@ from frappe.tests.utils import FrappeTestCase
 
 from erp_ai.agent import redact, run_log
 from erp_ai.agent.agent_write_guard import AGENT_WRITE_FLAG
-from erp_ai.agent.tools.site_api import SECRET_FIELDS
+from erp_ai.agent.tools.site_api import SCRUBBED_VALUE, SECRET_FIELDS
 from erp_ai.constants import AGENT_USER, HELPDESK_AGENT_ROLE, LOG_DOCTYPE, ROLE_AGENT
 from erp_ai.erp_ai_agent.doctype.erp_ai_log.erp_ai_log import ERPAILog
 from erp_ai.test_utils import make_change_proposal, make_log_entry
@@ -471,6 +471,39 @@ class TestActionEntry(FrappeTestCase):
 				)
 				self.assertEqual(tuple(entry), (*ACTION_KEYS_EXPECTED, "reason"))
 				self.assertEqual(entry["reason"], run_log.NO_REASON)
+
+	def test_refused_reason_secret_masked(self):
+		reason = "ERPAI-TEST lỗi: password=ERPAI-TEST-p9 và Bearer ERPAITESTbearer12345"
+		entry = run_log.action_entry(
+			"api_update_record", "ToDo", "ERPAI-TEST-todo-3", False, reason=reason, rule="ERPAI-TEST-rule-9"
+		)
+		self.assertEqual(entry["reason"], redact.redact_secrets(reason))
+		self.assertIn(redact.MASK, entry["reason"])
+		self.assertNotIn("ERPAI-TEST-p9", entry["reason"])
+		self.assertNotIn("ERPAITESTbearer12345", entry["reason"])
+		with self.subTest(reason="khóa sk-ant-FAKE0000 hết hạn"):
+			key_entry = run_log.action_entry(
+				"api_update_record", "ToDo", "ERPAI-TEST-todo-3", False, reason="khóa sk-ant-FAKE0000 hết hạn"
+			)
+			self.assertEqual(key_entry["reason"], "khóa [đã che] hết hạn")
+		with self.subTest(rule="ERPAI-TEST-rule-9"):
+			self.assertEqual(entry["rule"], "ERPAI-TEST-rule-9")
+
+	def test_two_mask_words_have_distinct_meanings(self):
+		self.assertEqual(run_log.SECRET_MASK, "[đã ẩn]")
+		self.assertEqual(SCRUBBED_VALUE, run_log.SECRET_MASK)
+		self.assertEqual(redact.MASK, "[đã che]")
+		self.assertNotEqual(run_log.SECRET_MASK, redact.MASK)
+		entry = run_log.action_entry(
+			"api_update_record",
+			"ToDo",
+			"ERPAI-TEST-todo-4",
+			True,
+			value_after={"api_key": "ERPAI-TEST-k", "note": BEARER_TEXT},
+		)
+		self.assertEqual(entry["value_after"]["api_key"], run_log.SECRET_MASK)
+		self.assertIn(redact.MASK, entry["value_after"]["note"])
+		self.assertNotIn(run_log.SECRET_MASK, entry["value_after"]["note"])
 
 	def test_masks_secret_keys_password_fields_and_secret_text(self):
 		self.assertEqual(run_log.SECRET_MASK, "[đã ẩn]")

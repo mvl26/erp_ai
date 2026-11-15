@@ -27,7 +27,9 @@ ROLE_PROFILE_DOCTYPE = "Role Profile"
 ROLE_DOCTYPE = "Role"
 DOCTYPE_DOCTYPE = "DocType"
 # Changing these grants permissions the way a forbidden role would: denied unless the unrestricted switch is on.
-PERMISSION_DOCTYPES = frozenset({"Custom Role", "Custom DocPerm", DOCTYPE_DOCTYPE, ROLE_DOCTYPE})
+PERMISSION_DOCTYPES = frozenset(
+	{"Custom Role", "Custom DocPerm", DOCTYPE_DOCTYPE, ROLE_DOCTYPE, "User Permission", "DocShare"}
+)
 # Roles that would let an account command the bot or administer the site; never assignable here.
 FORBIDDEN_ROLES = frozenset({"System Manager", "Administrator", ROLE_INSTRUCTOR, ROLE_AGENT, "Guest", "All"})
 PROTECTED_USERS = frozenset({"Administrator", "Guest", AGENT_USER})

@@ -112,14 +112,14 @@ REASON_TURN_SAVEPOINT = "erp_ai_reason_turn"
 USAGE_COLUMNS = ("input_tokens", "output_tokens", "cache_creation_input_tokens", "cache_read_input_tokens")
 
 
-def run_for_ticket(ticket_name: str, trigger: str) -> None:
+def run_for_ticket(ticket_name: str, trigger: str, comment_name: str | None = None) -> None:
 	"""Agent job (design 4.3). Never raises: a failed run is logged and the job ends normally.
 
 	No rollback on the error path: the gateway writes key breaker state without committing, and a
 	rollback would lose the key status and the alarm that state drives (committed by `_call_model`).
 	"""
 	try:
-		_run(ticket_name, trigger)
+		_run(ticket_name, trigger, comment_name)
 	except Exception as exc:
 		frappe.log_error(
 			TITLE_RUN_FAILED, f"ticket={ticket_name} trigger={trigger} error={type(exc).__name__}"
@@ -135,7 +135,7 @@ def _call_model(task, **kwargs):
 			frappe.db.commit()
 
 
-def _run(ticket_name, trigger):
+def _run(ticket_name, trigger, comment_name=None):
 	# (a) the job must run as the agent account, checked before the ticket is read (AC-6)
 	if not authority.enter_agent_session():
 		return

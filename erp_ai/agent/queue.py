@@ -12,9 +12,11 @@ def _clear_pending_job_ids():
 	frappe.flags.pop(PENDING_JOB_IDS_FLAG, None)
 
 
-def enqueue_agent_run(ticket_name: str, trigger: str) -> bool:
+def enqueue_agent_run(ticket_name: str, trigger: str, comment_name: str | None = None) -> bool:
 	if trigger not in VALID_TRIGGERS:
 		raise ValueError(f"Unknown trigger: {trigger!r}")
+	if trigger == TRIGGER_COMMENT_MENTION and not comment_name:
+		raise ValueError(f"comment_name is required for trigger {trigger!r}")
 
 	job_id = f"erp_ai::{ticket_name}::{trigger}"
 
@@ -37,6 +39,7 @@ def enqueue_agent_run(ticket_name: str, trigger: str) -> bool:
 		deduplicate=True,
 		ticket_name=ticket_name,
 		trigger=trigger,
+		comment_name=comment_name,
 	)
 	return True
 

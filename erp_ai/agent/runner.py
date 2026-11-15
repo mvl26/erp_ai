@@ -48,6 +48,7 @@ from erp_ai.agent.tools.write_ticket import (
 	asked_in_run,
 	created_labels,
 	keep_human_fields,
+	locked_rows,
 	mark_asked,
 	post_notice,
 )
@@ -148,6 +149,8 @@ NOTICE_TRIGGERS = {
 	"run_failed": (TRIGGER_TICKET_INSERT, TRIGGER_COMMENT_MENTION, TRIGGER_CHANGE_ACTION),
 	"ask_fallback": (TRIGGER_TICKET_INSERT, TRIGGER_COMMENT_MENTION, TRIGGER_CHANGE_ACTION),
 }
+# ADR-037 QĐ 4: a ticket is routed at most once; a later route call writes only this refusal on its classify row.
+ROUTE_ALREADY_DONE = "đã định tuyến"
 ROUTE_SAVEPOINT = "erp_ai_route"
 # One write unit after (u1) (assign, comment) nests inside the savepoint above.
 ROUTE_UNIT_SAVEPOINT = "erp_ai_route_unit"
@@ -640,7 +643,14 @@ def _route(log_name, classification, decision, context, auto_assign, subject, sp
 	The ticket change and the entry update share a savepoint: an exception between them undoes the
 	ticket change, so the entry never says applied=0 over a changed ticket (the entry row itself was
 	committed before and survives). Nothing is committed until both are written.
+
+	It starts by locking the ticket row and reading its applied classify rows with a lock (ADR-037 QĐ 4): one
+	there → no unit runs, this entry records the refusal, one logger line. The lock holds until the commit at
+	the end of this step, so never across a model call.
 	"""
+	ticket = context.ticket_name
+	if locked_rows(ticket, LOG_DOCTYPE, {"ticket": ticket, "entry_type": "classify", "applied": 1}):
+		return _route_skipped(log_name, decision, context)
 	actions, lines, errors = [], [], []
 	assigned = task = watcher = commented = None
 	sla = None
@@ -670,6 +680,21 @@ def _route(log_name, classification, decision, context, auto_assign, subject, sp
 	if not frappe.flags.in_test:
 		frappe.db.commit()
 	return lines
+
+
+def _route_skipped(log_name, decision, context) -> list:
+	"""The ticket was routed by an earlier run: record the refusal on this entry, commit to free the lock."""
+	ticket = context.ticket_name
+	refusal = _route_action(
+		"apply_route", "HD Ticket", ticket, False, ROUTE_ALREADY_DONE, instructor=context.instructor
+	)
+	_record_route(log_name, None, decision, None, None, [refusal], [])
+	frappe.logger(LOGGER_NAME).info(
+		"erp_ai route_skipped ticket=%s run_id=%s reason=already_routed", ticket, context.run_id
+	)
+	if not frappe.flags.in_test:
+		frappe.db.commit()
+	return []
 
 
 def _route_action(

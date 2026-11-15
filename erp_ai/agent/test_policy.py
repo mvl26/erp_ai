@@ -1176,22 +1176,31 @@ class TestExcludedQuery(FrappeTestCase):
 			.name
 		)
 
+	def _row(self, doctype, **values):
+		doc = frappe.get_doc({"doctype": doctype, **values})
+		doc.db_insert()
+		return doc.name
+
 	def test_constants(self):
 		self.assertEqual(
 			policy.TICKET_LINK_FIELDS,
 			{
-				"Comment": ("reference_doctype", "reference_name"),
-				"Communication": ("reference_doctype", "reference_name"),
-				"File": ("attached_to_doctype", "attached_to_name"),
-				# R10b: the column names of the installed DocType JSON; Version (ref_doctype, docname) is held until
-				# ADR-024, which bars product code from reading Version, is ruled on.
-				"ToDo": ("reference_type", "reference_name"),
-				"Notification Log": ("document_type", "document_name"),
-				"Activity Log": ("reference_doctype", "reference_name"),
-				"Email Queue": ("reference_doctype", "reference_name"),
+				"Comment": (("reference_doctype", "reference_name"),),
+				"Communication": (("reference_doctype", "reference_name"),),
+				"File": (("attached_to_doctype", "attached_to_name"),),
+				# R10b, R10g: the column names of the installed DocType JSON, every pair of the DocType. Version is
+				# refused by the record tool instead (R10e).
+				"ToDo": (("reference_type", "reference_name"),),
+				"Notification Log": (("document_type", "document_name"), ("source_doctype", "source_name")),
+				"Activity Log": (
+					("reference_doctype", "reference_name"),
+					("timeline_doctype", "timeline_name"),
+					("link_doctype", "link_name"),
+				),
+				"Email Queue": (("reference_doctype", "reference_name"),),
 			},
 		)
-		# R10a; HD Ticket Comment is held until D8, which bars product code from naming it, is ruled on.
+		# R10a; HD Ticket Comment is a known gap (R10f): D8 bars product code from naming it.
 		self.assertEqual(policy.TICKET_PARENT_DOCTYPES, ("Comment", "Communication"))
 		self.assertEqual(policy.EXCLUDED_TICKET_REASON, "bản ghi thuộc phiếu không được phép đưa cho AI")
 
@@ -1230,6 +1239,19 @@ class TestExcludedQuery(FrappeTestCase):
 		self.assertEqual(policy.ticket_link_columns("File"), (("attached_to_doctype", "attached_to_name"),))
 		self.assertEqual(policy.ticket_link_columns("HD Ticket Comment"), ((None, "reference_ticket"),))
 		self.assertEqual(policy.ticket_link_columns("task"), ((None, "ai_ticket"),))
+		# R10g: every pair of the DocType, in declaration order.
+		self.assertEqual(
+			policy.ticket_link_columns("Activity Log"),
+			(
+				("reference_doctype", "reference_name"),
+				("timeline_doctype", "timeline_name"),
+				("link_doctype", "link_name"),
+			),
+		)
+		self.assertEqual(
+			policy.ticket_link_columns("Notification Log"),
+			(("document_type", "document_name"), ("source_doctype", "source_name")),
+		)
 		for doctype in ("HD Ticket", "User", "Không có DocType này"):
 			self.assertEqual(policy.ticket_link_columns(doctype), ())
 		# A DocType with both: the dynamic pair plus every static Link, neither excludes the other.
@@ -1237,6 +1259,44 @@ class TestExcludedQuery(FrappeTestCase):
 			self.assertEqual(
 				policy.ticket_link_columns("Comment"),
 				(("reference_doctype", "reference_name"), (None, "custom_ticket")),
+			)
+
+	def test_parent_link_fields(self):
+		# R10g: a Link to Comment or Communication, read from the live schema like a Link to HD Ticket.
+		for doctype in ("Email Queue", "email queue"):
+			self.assertEqual(policy.parent_link_fields(doctype), (("communication", "Communication"),))
+		self.assertEqual(policy.parent_link_fields("Communication"), (("in_reply_to", "Communication"),))
+		for doctype in ("Comment", "File", "Task", "Không có DocType này"):
+			self.assertEqual(policy.parent_link_fields(doctype), ())
+		self.assertEqual(
+			policy.link_column_names("Email Queue"), ["reference_doctype", "reference_name", "communication"]
+		)
+		self.assertEqual(policy.link_column_names("task"), ["ai_ticket"])
+		self.assertEqual(policy.link_column_names("User"), [])
+
+	def test_ticket_content_filters_other_pairs_and_parent_links(self):
+		# R10g: get_list takes one OR group, so the rows that another pair points at an excluded ticket (or a record
+		# of one) are left out by name; a Link to Comment or Communication is compared with the records of the
+		# excluded tickets.
+		names = ["T-1", "T-2"]
+		owners = ["HD Ticket", "Comment", "Communication"]
+		communication = self._communication("T-1")
+		timeline = self._row("Activity Log", timeline_doctype="HD Ticket", timeline_name="T-2")
+		linked = self._row("Activity Log", link_doctype="Communication", link_name=communication)
+		other = self._row("Activity Log", timeline_doctype="ToDo", timeline_name="T-1")
+		pair = [
+			["reference_doctype", "not in", owners],
+			["reference_name", "not in", [*names, communication]],
+		]
+		with patch.object(policy, "excluded_ticket_names", return_value=names):
+			filters, or_filters = policy.ticket_content_filters("Activity Log")
+			self.assertEqual(or_filters, pair)
+			self.assertEqual([row[:2] for row in filters], [["name", "not in"]])
+			self.assertEqual(set(filters[0][2]), {timeline, linked})
+			self.assertNotIn(other, filters[0][2])
+			self.assertEqual(
+				policy.ticket_content_filters("Email Queue"),
+				([["communication", "not in", [communication]]], pair),
 			)
 
 	def test_ticket_content_filters_empty_when_nothing_excluded(self):
@@ -1297,8 +1357,9 @@ class TestExcludedQuery(FrappeTestCase):
 				)
 
 	def test_record_on_a_ticket_comment_or_communication_belongs_to_the_ticket(self):
-		# R10a: one hop more through Comment and Communication, no deeper (HD Ticket Comment is held until D8 is
-		# ruled on); R10b: ToDo names its ticket by its own pair.
+		# R10a: one hop more through Comment and Communication, no deeper (HD Ticket Comment is a known gap, R10f);
+		# R10b: ToDo names its ticket by its own pair; R10g: the other pairs of the log DocTypes and Email Queue's
+		# Link to Communication go the same hop.
 		set_agent_settings(excluded_teams=TEAM, excluded_title_prefixes="")
 		excluded = self._ticket(agent_group=TEAM)
 		comment = self._comment(excluded)
@@ -1318,11 +1379,34 @@ class TestExcludedQuery(FrappeTestCase):
 			("File", self._file("Communication", communication)),
 			("Comment", on_comment),
 			("ToDo", todo.name),
+			("Activity Log", self._row("Activity Log", timeline_doctype="HD Ticket", timeline_name=excluded)),
+			("Activity Log", self._row("Activity Log", link_doctype="Comment", link_name=comment)),
+			(
+				"Notification Log",
+				self._row("Notification Log", source_doctype="Communication", source_name=communication),
+			),
+			("Email Queue", self._row("Email Queue", communication=communication)),
 		):
-			with self.subTest(doctype=doctype):
+			with self.subTest(doctype=doctype, name=name):
 				self.assertEqual(policy.owning_ticket(doctype, name), excluded)
 				self.assertTrue(policy.is_ticket_record_excluded(doctype, name))
 		self.assertIsNone(policy.owning_ticket("File", self._file("Comment", on_comment)))
+		# R10h: the values of a record about to be written; the type in any case, the name as a number.
+		for doctype, values in (
+			("File", {"attached_to_doctype": "comment", "attached_to_name": comment}),
+			("Comment", {"reference_doctype": "Communication", "reference_name": communication}),
+			("Email Queue", {"communication": communication}),
+			("ToDo", {"reference_type": "HD Ticket", "reference_name": int(excluded)}),
+		):
+			with self.subTest(values=values):
+				self.assertEqual(policy.linked_tickets(doctype, values), [str(excluded)])
+		for values in (
+			{"attached_to_doctype": "Comment", "attached_to_name": on_comment},
+			{"attached_to_doctype": "Comment", "attached_to_name": ""},
+			{"attached_to_doctype": "", "attached_to_name": comment},
+		):
+			with self.subTest(values=values):
+				self.assertEqual(policy.linked_tickets("File", values), [])
 		filters, or_filters = policy.ticket_content_filters("File")
 		self.assertEqual(filters, [])
 		self.assertEqual(

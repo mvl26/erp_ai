@@ -1707,16 +1707,24 @@ LIST_FIELDS = {
 	"Activity Log": ["name", "subject"],
 	"Email Queue": ["name", "message"],
 }
-# R10b: DocTypes outside TICKET_CONTENT_DOCTYPES that name a ticket by a dynamic pair, with the column names of the
-# installed DocType JSON: `{doctype: (type column, name column, column holding the text)}`. Version (ref_doctype,
-# docname) is held until ADR-024, which bars product code from reading Version, is ruled on.
-LINKED_DOCTYPES = {
-	"ToDo": ("reference_type", "reference_name", "description"),
-	"Notification Log": ("document_type", "document_name", "subject"),
-	"Activity Log": ("reference_doctype", "reference_name", "subject"),
-	"Email Queue": ("reference_doctype", "reference_name", "message"),
+# R10b, R10g: the dynamic pairs by which DocTypes outside TICKET_CONTENT_DOCTYPES name a ticket, with the column names
+# of the installed DocType JSON, each pair tried alone: `{label: (doctype, type column, name column, column holding
+# the text)}`.
+LINKED_PAIRS = {
+	"ToDo": ("ToDo", "reference_type", "reference_name", "description"),
+	"Notification Log": ("Notification Log", "document_type", "document_name", "subject"),
+	"Notification Log source": ("Notification Log", "source_doctype", "source_name", "subject"),
+	"Activity Log": ("Activity Log", "reference_doctype", "reference_name", "subject"),
+	"Activity Log timeline": ("Activity Log", "timeline_doctype", "timeline_name", "subject"),
+	"Activity Log link": ("Activity Log", "link_doctype", "link_name", "subject"),
+	"Email Queue": ("Email Queue", "reference_doctype", "reference_name", "message"),
 }
-DELETED_DOCUMENT = "Deleted Document"
+# Closed to the record tools in every mode: a Deleted Document holds a whole deleted record (R10b); product code never
+# reads Version (ADR-024, R10e). `{doctype: (type column, name column, column holding the text)}` of a seeded row.
+RECORD_DENIED = {
+	"Deleted Document": ("deleted_doctype", "deleted_name", "data"),
+	"Version": ("ref_doctype", "docname", "data"),
+}
 
 
 def _db_insert(values):
@@ -2030,7 +2038,7 @@ class TestExcludedTicketReads(_ExcludedTicketCase):
 	def test_record_on_a_comment_or_communication_of_the_ticket_follows_the_ticket(self):
 		# R10a: Helpdesk keeps agent-only comment attachments on the Comment and email attachments on the
 		# Communication; Frappe points an "Attachment" Comment at its Comment (reference_doctype=Comment). A File on
-		# an HD Ticket Comment is held until D8, which bars product code from naming that DocType, is ruled on.
+		# an HD Ticket Comment is a known gap (R10f): D8 bars product code from naming that DocType.
 		made = {}
 		for kind, text in (("team", self.seed), ("normal", self.plain)):
 			parents = self.records(self.ticket(kind, text), text)
@@ -2045,45 +2053,100 @@ class TestExcludedTicketReads(_ExcludedTicketCase):
 		self.assert_follows_the_ticket(made)
 
 	def test_rows_of_the_other_dynamic_link_doctypes_follow_the_ticket(self):
-		# R10b: a mention notification, an assignment, a version, an activity and a queued email of a ticket.
+		# R10b, R10g: a mention notification, an assignment, an activity and a queued email of a ticket, by every
+		# pair of their DocType.
 		tickets = {"team": self.ticket("team", self.seed), "normal": self.ticket("normal", self.plain)}
 		made = {"team": {}, "normal": {}}
-		for doctype, (type_column, name_column, text_column) in LINKED_DOCTYPES.items():
+		for label, (doctype, type_column, name_column, text_column) in LINKED_PAIRS.items():
 			for kind, ticket in tickets.items():
 				text = self.seed if kind == "team" else self.plain
 				row = {"doctype": doctype, type_column: "HD Ticket", name_column: ticket, text_column: text}
-				made[kind][doctype] = (doctype, _db_insert(row))
+				made[kind][label] = (doctype, _db_insert(row))
 		self.assert_follows_the_ticket(made)
 
-	def test_deleted_document_closed_in_both_modes(self):
-		# R10b: a Deleted Document holds a whole deleted record, a ticket of an excluded team included.
-		data = json.dumps({"doctype": "HD Ticket", "subject": self.seed})
-		deleted = _db_insert(
-			{"doctype": DELETED_DOCUMENT, "deleted_doctype": "HD Ticket", "deleted_name": "1", "data": data}
+	def test_log_rows_on_a_comment_or_communication_of_the_ticket_follow_the_ticket(self):
+		# R10g: Email Queue's Link to Communication and the other pairs of the log DocTypes go one hop, as R10a.
+		made = {}
+		for kind, text in (("team", self.seed), ("normal", self.plain)):
+			parents = self.records(self.ticket(kind, text), text)
+			rows = {
+				"Email Queue on Communication": (
+					"Email Queue",
+					{"communication": parents["Communication"], "message": text},
+				),
+				"Activity Log linked to Comment": (
+					"Activity Log",
+					{"link_doctype": "Comment", "link_name": parents["Comment"], "subject": text},
+				),
+				"Notification Log from Communication": (
+					"Notification Log",
+					{
+						"source_doctype": "Communication",
+						"source_name": parents["Communication"],
+						"subject": text,
+					},
+				),
+			}
+			made[kind] = {
+				label: (doctype, _db_insert({"doctype": doctype, **values}))
+				for label, (doctype, values) in rows.items()
+			}
+		self.assert_follows_the_ticket(made)
+
+	def test_log_row_naming_the_ticket_number_under_another_doctype_still_listed(self):
+		# R10g: an extra pair hides a row only when its type is a ticket or a record of one.
+		excluded = self.ticket("team", self.seed)
+		other = _db_insert(
+			{
+				"doctype": "Activity Log",
+				"timeline_doctype": "ToDo",
+				"timeline_name": str(excluded),
+				"subject": self.plain,
+			}
 		)
-		calls = (
-			(site_api.list_records, {"doctype": DELETED_DOCUMENT, "fields": ["name", "data"]}),
-			(site_api.get_record, {"doctype": DELETED_DOCUMENT, "name": deleted}),
-			(site_api.create_record, {"doctype": DELETED_DOCUMENT, "values": {"data": data}}),
-			(
-				site_api.update_record,
-				{"doctype": DELETED_DOCUMENT, "name": deleted, "values": {"data": "{}"}},
-			),
-			(site_api.delete_record, {"doctype": DELETED_DOCUMENT, "name": deleted}),
-			(site_api.submit_record, {"doctype": DELETED_DOCUMENT, "name": deleted, "action": "submit"}),
+		hidden = _db_insert(
+			{
+				"doctype": "Activity Log",
+				"timeline_doctype": "HD Ticket",
+				"timeline_name": excluded,
+				"subject": self.seed,
+			}
 		)
 		for unrestricted in (False, True):
-			for handler, arguments in calls:
-				# Stubbed so that a write the tool lets through changes nothing.
-				with (
-					self.subTest(unrestricted=unrestricted, tool=handler.__name__),
-					patch.object(site_api, "_write") as write,
-				):
-					result = handler(arguments, _context(unrestricted=unrestricted))
-					self.assertEqual(
-						result, {"ok": False, "reason": PERMISSION_REFUSAL, "doctype": DELETED_DOCUMENT}
-					)
-					write.assert_not_called()
+			with self.subTest(unrestricted=unrestricted):
+				self.assertEqual(
+					self.listed("Activity Log", [["name", "in", [other, hidden]]], unrestricted), [other]
+				)
+
+	def test_record_denied_doctypes_closed_in_both_modes(self):
+		# R10b: a Deleted Document holds a whole deleted record, a ticket of an excluded team included. R10e: product
+		# code never reads Version (ADR-024), so the record tools refuse it rather than filter it.
+		ticket = self.ticket("team", self.seed)
+		data = json.dumps({"doctype": "HD Ticket", "subject": self.seed})
+		for doctype, (type_column, name_column, text_column) in RECORD_DENIED.items():
+			stored = _db_insert(
+				{"doctype": doctype, type_column: "HD Ticket", name_column: ticket, text_column: data}
+			)
+			calls = (
+				(site_api.list_records, {"doctype": doctype, "fields": ["name", text_column]}),
+				(site_api.get_record, {"doctype": doctype, "name": stored}),
+				(site_api.create_record, {"doctype": doctype, "values": {text_column: data}}),
+				(site_api.update_record, {"doctype": doctype, "name": stored, "values": {text_column: "{}"}}),
+				(site_api.delete_record, {"doctype": doctype, "name": stored}),
+				(site_api.submit_record, {"doctype": doctype, "name": stored, "action": "submit"}),
+			)
+			for unrestricted in (False, True):
+				for handler, arguments in calls:
+					# Stubbed so that a write the tool lets through changes nothing.
+					with (
+						self.subTest(doctype, unrestricted=unrestricted, tool=handler.__name__),
+						patch.object(site_api, "_write") as write,
+					):
+						result = handler(arguments, _context(unrestricted=unrestricted))
+						self.assertEqual(
+							result, {"ok": False, "reason": PERMISSION_REFUSAL, "doctype": doctype}
+						)
+						write.assert_not_called()
 
 	def test_record_tools_granted_when_switch_on(self):
 		inputs = registry.GrantInputs("L3", "L3", True, PermissionSwitches(record_tools=True))
@@ -2198,6 +2261,66 @@ class TestExcludedTicketWrites(_ExcludedTicketCase):
 					arguments = {"doctype": doctype, "name": name, "values": values}
 					self.assert_refused(site_api.update_record(arguments, context), doctype)
 					self.assertEqual(self.stored(doctype, name), before)
+
+	def test_write_linked_to_a_comment_or_communication_of_an_excluded_ticket_refused(self):
+		# R10h: a record linked to a Comment or Communication of a ticket is linked to that ticket, one hop as on read.
+		excluded = self.records(self.ticket("team", self.seed), self.seed)
+		normal = self.records(self.ticket("normal", self.plain), self.plain)
+
+		def file(parents, parent, text):
+			# A remote file_url: File takes no content through the tool, and nothing is written to disk or fetched.
+			return {
+				"file_name": f"{text}.txt",
+				"file_url": f"https://example.invalid/{text}-{uuid.uuid4().hex}.txt",
+				"attached_to_doctype": parent,
+				"attached_to_name": parents[parent],
+			}
+
+		creates = (
+			("File", file(excluded, "Comment", self.seed)),
+			("File", {**file(excluded, "Comment", self.seed), "attached_to_doctype": "comment"}),
+			("File", file(excluded, "Communication", self.seed)),
+			(
+				"Comment",
+				{
+					"comment_type": "Comment",
+					"reference_doctype": "Comment",
+					"reference_name": excluded["Comment"],
+					"content": self.seed,
+				},
+			),
+			("Email Queue", {"communication": excluded["Communication"], "message": self.seed}),
+		)
+		on_normal = self.file(normal["Comment"], self.plain, "Comment")
+		move = {"attached_to_name": excluded["Comment"]}
+		for unrestricted in (False, True):
+			context = _context(unrestricted=unrestricted)
+			calls = [
+				(site_api.create_record, {"doctype": doctype, "values": values})
+				for doctype, values in creates
+			]
+			calls.append((site_api.update_record, {"doctype": "File", "name": on_normal, "values": move}))
+			for handler, arguments in calls:
+				# Stubbed so that a write the tool lets through changes nothing.
+				with (
+					self.subTest(
+						unrestricted=unrestricted, tool=handler.__name__, values=arguments["values"]
+					),
+					patch.object(site_api, "_write") as write,
+				):
+					self.assert_refused(handler(arguments, context), arguments["doctype"])
+					write.assert_not_called()
+		# The same File on a Comment of an allowed ticket is created, in both modes.
+		for unrestricted in (False, True):
+			with self.subTest(unrestricted=unrestricted):
+				values = file(normal, "Comment", self.plain)
+				result = site_api.create_record(
+					{"doctype": "File", "values": values}, _context(unrestricted=unrestricted)
+				)
+				self.assertTrue(result["ok"], result)
+				self.assertEqual(
+					frappe.db.get_value("File", result["name"], "attached_to_name"), normal["Comment"]
+				)
 
 
 PERMISSION_REFUSAL = "DocType này không được phép dùng qua công cụ"
@@ -2492,6 +2615,15 @@ class TestPermissionVectors(FrappeTestCase):
 			"setter options of the dynamic pair Comment.reference_doctype": (
 				"api_create_record",
 				setter("Comment", "reference_doctype", "options", "Role"),
+			),
+			# R10g: an extra pair, and a Link that points at a ticket through its Communication.
+			"setter options of the extra pair Activity Log.timeline_doctype": (
+				"api_create_record",
+				setter("Activity Log", "timeline_doctype", "options", "Role"),
+			),
+			"setter options of the Link Email Queue.communication": (
+				"api_create_record",
+				setter("Email Queue", "communication", "options", "ToDo"),
 			),
 			"stored setter of Task.ai_ticket, new value": (
 				"api_update_record",

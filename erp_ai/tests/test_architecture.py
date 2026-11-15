@@ -1046,8 +1046,8 @@ def check_secret_handling(sources: dict) -> list:
 	return violations
 
 
-def _allowed_legacy_nodes(rel: str, tree: ast.AST) -> set:
-	target = LEGACY_ALLOWED_ASSIGNMENTS.get(rel)
+def _allowed_legacy_nodes(rel: str, tree: ast.AST, allowlist: dict = LEGACY_ALLOWED_ASSIGNMENTS) -> set:
+	target = allowlist.get(rel)
 	allowed = set()
 	for node in ast.walk(tree):
 		if isinstance(node, ast.Assign) and any(
@@ -4353,6 +4353,9 @@ FOREIGN_CLOCK_CALLS = ("datetime.datetime.now", "datetime.datetime.utcnow")
 QUERY_BUILDER_NOW = "Now"
 SQL_NOW = re.compile(r"\bnow\s*\(", re.IGNORECASE)
 VERSION_DOCTYPE = "Version"
+# ADR-024 Ràng buộc 1, ruling R10e (C3b): the record tool refuses Version in every mode, which enforces the rule; its
+# refused set is the one constant of product code that may name it.
+VERSION_ALLOWED_ASSIGNMENTS = {SITE_API_FILE: "RECORD_DENIED_DOCTYPES"}
 VERSION_TABLE = re.compile(r"\btabVersion\b")
 VERSION_JS = re.compile(r"""(["'`])Version\1|\btabVersion\b""")
 PRIVILEGE_CONDITION_FUNCTION = "_privilege_changes_by_agent"
@@ -4545,15 +4548,17 @@ def check_privilege_job_reads_no_other_clock(sources: dict) -> list:
 
 
 def check_no_version_reads(sources: dict) -> list:
-	"""ADR-024 Ràng buộc 1: product code (Python and JS) never names the `Version` DocType or its table."""
+	"""ADR-024 Ràng buộc 1: product code (Python and JS) never names the `Version` DocType or its table, save the
+	constant of VERSION_ALLOWED_ASSIGNMENTS."""
 	violations = []
 	for rel, source in sources.items():
 		if rel.endswith(".py"):
 			tree = parse(rel, source)
+			allowed = _allowed_legacy_nodes(rel, tree, VERSION_ALLOWED_ASSIGNMENTS)
 			violations.extend(
 				violation(rel, node, f"reads Version through {text!r} (ADR-024)")
 				for node, text in _string_texts(tree, _docstring_ids(tree))
-				if text.strip() == VERSION_DOCTYPE or VERSION_TABLE.search(text)
+				if id(node) not in allowed and (text.strip() == VERSION_DOCTYPE or VERSION_TABLE.search(text))
 			)
 		elif rel.endswith(".js"):
 			violations.extend(

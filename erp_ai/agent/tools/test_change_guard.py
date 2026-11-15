@@ -7,7 +7,13 @@ from frappe.tests.utils import FrappeTestCase
 import erp_ai
 from erp_ai.agent.changes import process_runner
 from erp_ai.agent.tools import change_guard, source
-from erp_ai.constants import CORE_APPS
+from erp_ai.constants import (
+	CHANGE_OP_CREATE,
+	CHANGE_OP_DELETE,
+	CHANGE_OP_EDIT,
+	CHANGE_OP_RENAME,
+	CORE_APPS,
+)
 from erp_ai.test_utils import GitSandbox, TempAppsRoot
 
 ALLOWED = ("myapp",)
@@ -28,6 +34,11 @@ NAME_FORBIDDEN_REFUSAL = "tên file thuộc loại bí mật hoặc được b�
 GIT_DIR_REFUSAL = "không được chạm .git hoặc tên bắt đầu bằng .git"
 PATH_SYMLINK_REFUSAL = "đường dẫn đi qua symlink"
 NESTED_REPO_REFUSAL = "đường dẫn nằm trong một kho git lồng trong app"
+BLOCK_EMPTY_REFUSAL = "khối không có mục file hay lệnh nào"
+BLOCK_TOO_MANY_OPS_REFUSAL = "khối có hơn 50 mục file"
+BLOCK_TOO_MANY_COMMANDS_REFUSAL = "khối có hơn 6 lệnh"
+BLOCK_PATH_TWICE_REFUSAL = "đường dẫn trùng hoặc nằm trong đường dẫn khác của cùng khối"
+OP_UNKNOWN_REFUSAL = "loại mục phải là edit, create, delete hoặc rename"
 
 HAND_WRITTEN_CORE_APPS = ("frappe", "erpnext", "helpdesk", "hrms")
 # design-addendum-2 QĐ-A2: refused and allowed names, under one app.
@@ -1124,3 +1135,335 @@ class TestBenchArgs(FrappeTestCase):
 		self.assertEqual(self.build("build", "app", "myapp"), APP_NOT_ALLOWED_REFUSAL)
 		self.assertEqual(self.build("build", "myapp", ["myapp"]), ["build", "--app", "myapp"])
 		self.assertEqual(self.build("build", "myapp", frozenset({"myapp"})), ["build", "--app", "myapp"])
+
+
+def edit(path, before="x = 1\n", after="x = 2\n"):
+	return change_guard.FileOp(CHANGE_OP_EDIT, path, None, before, after, None, None)
+
+
+def create(path, after="x = 1\n"):
+	return change_guard.FileOp(CHANGE_OP_CREATE, path, None, None, after, None, None)
+
+
+def delete(path, before="x = 1\n"):
+	return change_guard.FileOp(CHANGE_OP_DELETE, path, None, before, None, None, None)
+
+
+def rename(path, new_path, text="x = 1\n"):
+	return change_guard.FileOp(CHANGE_OP_RENAME, path, new_path, text, text, None, None)
+
+
+MOMENTS = (False, True)  # `at_apply`: proposal time (git read) and apply time (CHG-002 design 3.2)
+README = "myapp/README.md"
+
+
+class TestCheckBlock(FrappeTestCase):
+	"""CHG-002 design 3.2 `check_block`, on `GitSandbox` repos `myapp` and `otherapp` (both moments)."""
+
+	def setUp(self):
+		self.sandbox = GitSandbox(self, apps=("myapp", "otherapp"))
+		self.root = self.sandbox.root
+
+	def check(self, ops, commands=(), allowed=ALLOWED, *, at_apply, diff_text=""):
+		return change_guard.check_block(
+			list(ops),
+			[list(args) for args in commands],
+			allowed,
+			SITE,
+			at_apply=at_apply,
+			diff_text=diff_text,
+		)
+
+	def reason(self, ops, commands=(), allowed=ALLOWED, *, at_apply):
+		return self.check(ops, commands, allowed, at_apply=at_apply).reason
+
+	def test_refusal_wording_matches_design_table(self):
+		self.assertEqual(
+			(
+				change_guard.BLOCK_EMPTY,
+				change_guard.BLOCK_TOO_MANY_OPS,
+				change_guard.BLOCK_TOO_MANY_COMMANDS,
+				change_guard.BLOCK_TWO_APPS.format(a="a", b="b"),
+				change_guard.BLOCK_PATH_TWICE,
+				change_guard.OP_UNKNOWN,
+				change_guard.OP_FIELDS.format(action="edit"),
+				change_guard.NOT_REGULAR_FILE,
+				change_guard.EXECUTABLE_FILE,
+			),
+			(
+				BLOCK_EMPTY_REFUSAL,
+				BLOCK_TOO_MANY_OPS_REFUSAL,
+				BLOCK_TOO_MANY_COMMANDS_REFUSAL,
+				"các mục file thuộc hai app a và b; mỗi app một đề xuất",
+				BLOCK_PATH_TWICE_REFUSAL,
+				OP_UNKNOWN_REFUSAL,
+				"mục edit thiếu hoặc thừa trường",
+				"đường dẫn không phải file thường",
+				"file có quyền thực thi, bot không xóa hay đổi tên được",
+			),
+		)
+
+	def test_valid_block_returns_app_and_targets_in_item_order(self):
+		self.sandbox.commit_file("myapp", "old.py", "x = 1\n")
+		ops = (
+			edit(README),
+			create("myapp/pkg/sub/new.py"),
+			delete("myapp/old.py"),
+			rename("myapp/README2.md", "myapp/moved/README2.md"),
+		)
+		self.sandbox.commit_file("myapp", "README2.md", "x = 1\n")
+		repo = self.sandbox.repo("myapp")
+		for at_apply in MOMENTS:
+			with self.subTest(at_apply=at_apply):
+				result = self.check(ops, at_apply=at_apply)
+				self.assertIsNone(result.reason)
+				self.assertEqual(result.app, "myapp")
+				self.assertEqual(
+					[
+						(target.op, target.full_path, target.full_new_path, target.new_dirs)
+						for target in result.targets
+					],
+					[
+						(ops[0], os.path.join(repo, "README.md"), None, ()),
+						(
+							ops[1],
+							os.path.join(repo, "pkg", "sub", "new.py"),
+							None,
+							(os.path.join(repo, "pkg"), os.path.join(repo, "pkg", "sub")),
+						),
+						(ops[2], os.path.join(repo, "old.py"), None, ()),
+						(
+							ops[3],
+							os.path.join(repo, "README2.md"),
+							os.path.join(repo, "moved", "README2.md"),
+							(os.path.join(repo, "moved"),),
+						),
+					],
+				)
+				# `read_git = not at_apply`: the git state is read only at proposal time.
+				self.assertEqual(
+					[target.guard.git is None for target in result.targets], [at_apply] * len(ops)
+				)
+				self.assertEqual([target.guard.app for target in result.targets], ["myapp"] * len(ops))
+
+	def test_command_only_block_has_no_app(self):
+		for at_apply in MOMENTS:
+			with self.subTest(at_apply=at_apply):
+				result = self.check((), (["version"],), at_apply=at_apply)
+				self.assertEqual((result.reason, result.app, tuple(result.targets)), (None, None, ()))
+
+	def test_empty_block_refused(self):
+		for at_apply in MOMENTS:
+			with self.subTest(at_apply=at_apply):
+				result = self.check((), (), at_apply=at_apply)
+				self.assertEqual(
+					(result.reason, result.app, tuple(result.targets)), (BLOCK_EMPTY_REFUSAL, None, ())
+				)
+
+	def test_ops_50_ok_51_refused(self):
+		fifty = [create(f"myapp/f{index}.txt") for index in range(50)]
+		for at_apply in MOMENTS:
+			with self.subTest(at_apply=at_apply):
+				self.assertIsNone(self.reason(fifty, at_apply=at_apply))
+				self.assertEqual(
+					self.reason([*fifty, create("myapp/f50.txt")], at_apply=at_apply),
+					BLOCK_TOO_MANY_OPS_REFUSAL,
+				)
+				# The count comes before any item check: 51 items whose first is refused still name the count.
+				self.assertEqual(
+					self.reason([create("otherapp/x.txt"), *fifty], at_apply=at_apply),
+					BLOCK_TOO_MANY_OPS_REFUSAL,
+				)
+
+	def test_commands_6_ok_7_refused(self):
+		for at_apply in MOMENTS:
+			with self.subTest(at_apply=at_apply):
+				self.assertIsNone(self.reason((), [["version"]] * 6, at_apply=at_apply))
+				self.assertIsNone(self.reason([edit(README)], [["version"]] * 6, at_apply=at_apply))
+				self.assertEqual(
+					self.reason((), [["version"]] * 7, at_apply=at_apply), BLOCK_TOO_MANY_COMMANDS_REFUSAL
+				)
+				self.assertEqual(
+					self.reason([create("otherapp/x.txt")], [["version"]] * 7, at_apply=at_apply),
+					BLOCK_TOO_MANY_COMMANDS_REFUSAL,
+				)
+
+	def test_two_apps_refused_names_both(self):
+		both = ("myapp", "otherapp")
+		for at_apply in MOMENTS:
+			with self.subTest(at_apply=at_apply):
+				self.assertEqual(
+					self.reason([edit(README), edit("otherapp/README.md")], allowed=both, at_apply=at_apply),
+					"mục 2 (otherapp/README.md): các mục file thuộc hai app myapp và otherapp; mỗi app một đề xuất",
+				)
+				self.assertEqual(
+					self.reason([rename(README, "otherapp/moved.md")], allowed=both, at_apply=at_apply),
+					"mục 1 (myapp/README.md): các mục file thuộc hai app myapp và otherapp; mỗi app một đề xuất",
+				)
+				self.assertIsNone(
+					self.reason([edit(README), create("myapp/x.txt")], allowed=both, at_apply=at_apply)
+				)
+
+	def test_path_twice_refused(self):
+		for at_apply in MOMENTS:
+			with self.subTest(at_apply=at_apply):
+				for ops, number, path in (
+					([edit(README), edit(README)], 2, README),
+					([edit(README), delete("myapp/./README.md")], 2, "myapp/./README.md"),
+					([edit(README), rename("myapp/a.md", README)], 2, "myapp/a.md"),
+					([rename(README, README)], 1, README),
+				):
+					with self.subTest(ops=ops):
+						self.assertEqual(
+							self.reason(ops, at_apply=at_apply),
+							f"mục {number} ({path}): {BLOCK_PATH_TWICE_REFUSAL}",
+						)
+
+	def test_path_inside_another_path_refused(self):
+		for at_apply in MOMENTS:
+			with self.subTest(at_apply=at_apply):
+				for ops, number, path in (
+					([create("myapp/pkg"), create("myapp/pkg/a.py")], 2, "myapp/pkg/a.py"),
+					([create("myapp/pkg/a.py"), create("myapp/pkg")], 2, "myapp/pkg"),
+					([rename(README, "myapp/README.md/x.md")], 1, README),
+				):
+					with self.subTest(ops=ops):
+						self.assertEqual(
+							self.reason(ops, at_apply=at_apply),
+							f"mục {number} ({path}): {BLOCK_PATH_TWICE_REFUSAL}",
+						)
+				# A shared name prefix is not nesting.
+				self.assertIsNone(
+					self.reason([create("myapp/pkg/a.py"), create("myapp/pkg2/a.py")], at_apply=at_apply)
+				)
+
+	def test_new_dir_directly_under_apps_refused(self):
+		for at_apply in MOMENTS:
+			with self.subTest(at_apply=at_apply):
+				self.assertEqual(
+					self.reason([create("newapp/x.py")], allowed=("myapp", "newapp"), at_apply=at_apply),
+					f"mục 1 (newapp/x.py): {PATH_INVALID_REFUSAL}",
+				)
+				self.assertEqual(
+					self.reason(
+						[rename(README, "newapp/x.md")], allowed=("myapp", "newapp"), at_apply=at_apply
+					),
+					f"mục 1 (myapp/README.md): {PATH_INVALID_REFUSAL}",
+				)
+
+	def test_new_dir_under_sites_refused(self):
+		for at_apply in MOMENTS:
+			with self.subTest(at_apply=at_apply):
+				for path in ("../sites/new/x.txt", "myapp/../../sites/new/x.txt"):
+					with self.subTest(path=path):
+						self.assertEqual(
+							self.reason([create(path)], at_apply=at_apply),
+							f"mục 1 ({path}): {PATH_INVALID_REFUSAL}",
+						)
+
+	def test_new_dir_in_unlisted_app_refused(self):
+		for at_apply in MOMENTS:
+			with self.subTest(at_apply=at_apply):
+				self.assertEqual(
+					self.reason([create("otherapp/newdir/x.py")], at_apply=at_apply),
+					f"mục 1 (otherapp/newdir/x.py): {APP_NOT_ALLOWED_REFUSAL}",
+				)
+				self.assertEqual(
+					self.reason([rename(README, "otherapp/newdir/x.md")], at_apply=at_apply),
+					f"mục 1 ({README}): {APP_NOT_ALLOWED_REFUSAL}",
+				)
+
+	def test_each_new_dir_checked_on_its_own(self):
+		# The file path passes `check_write_path`; only the new folder `license.txt` is a protected name.
+		for path in ("myapp/license.txt/x.py", "myapp/a/LICENSE.TXT/b/x.py"):
+			self.assertIsNone(
+				change_guard.check_write_path(path, ALLOWED, new_file=True, read_git=False).reason
+			)
+			for at_apply in MOMENTS:
+				with self.subTest(path=path, at_apply=at_apply):
+					self.assertEqual(
+						self.reason([create(path)], at_apply=at_apply),
+						f"mục 1 ({path}): {NAME_FORBIDDEN_REFUSAL}",
+					)
+					self.assertEqual(
+						self.reason([rename(README, path)], at_apply=at_apply),
+						f"mục 1 ({README}): {NAME_FORBIDDEN_REFUSAL}",
+					)
+
+	def test_unknown_kind_refused(self):
+		for at_apply in MOMENTS:
+			for kind in ("edit", "Sua", None, ""):
+				with self.subTest(kind=kind, at_apply=at_apply):
+					op = change_guard.FileOp(kind, README, None, "x = 1\n", "x = 2\n", None, None)
+					self.assertEqual(
+						self.reason([edit("myapp/a.md"), op], at_apply=at_apply),
+						f"mục 2 ({README}): {OP_UNKNOWN_REFUSAL}",
+					)
+
+	def test_fields_missing_or_extra_for_kind_refused(self):
+		text = "x = 1\n"
+		cases = (
+			("edit", change_guard.FileOp(CHANGE_OP_EDIT, README, "myapp/b.md", text, text, None, None)),
+			("edit", change_guard.FileOp(CHANGE_OP_EDIT, README, None, None, text, None, None)),
+			("edit", change_guard.FileOp(CHANGE_OP_EDIT, README, None, text, None, None, None)),
+			("create", change_guard.FileOp(CHANGE_OP_CREATE, "myapp/n.md", None, text, text, None, None)),
+			("create", change_guard.FileOp(CHANGE_OP_CREATE, "myapp/n.md", None, None, None, None, None)),
+			(
+				"create",
+				change_guard.FileOp(CHANGE_OP_CREATE, "myapp/n.md", "myapp/b.md", None, text, None, None),
+			),
+			("delete", change_guard.FileOp(CHANGE_OP_DELETE, README, None, text, text, None, None)),
+			("delete", change_guard.FileOp(CHANGE_OP_DELETE, README, None, None, None, None, None)),
+			("delete", change_guard.FileOp(CHANGE_OP_DELETE, README, "myapp/b.md", text, None, None, None)),
+			("rename", change_guard.FileOp(CHANGE_OP_RENAME, README, None, text, text, None, None)),
+			("rename", change_guard.FileOp(CHANGE_OP_RENAME, README, "myapp/b.md", None, text, None, None)),
+			("rename", change_guard.FileOp(CHANGE_OP_RENAME, README, "myapp/b.md", text, None, None, None)),
+			("rename", change_guard.FileOp(CHANGE_OP_RENAME, README, 5, text, text, None, None)),
+			("edit", change_guard.FileOp(CHANGE_OP_EDIT, README, None, b"x", text, None, None)),
+		)
+		for at_apply in MOMENTS:
+			for action, op in cases:
+				with self.subTest(op=op, at_apply=at_apply):
+					self.assertEqual(
+						self.reason([op], at_apply=at_apply),
+						f"mục 1 ({op.path}): mục {action} thiếu hoặc thừa trường",
+					)
+			# A path that is not a string is a missing field too (the shown path is T14's concern).
+			for path in (None, 5, b"myapp/a.md"):
+				with self.subTest(path=path, at_apply=at_apply):
+					op = change_guard.FileOp(CHANGE_OP_EDIT, path, None, text, text, None, None)
+					self.assertTrue(
+						self.reason([op], at_apply=at_apply).endswith("): mục edit thiếu hoặc thừa trường")
+					)
+
+	def test_reason_names_item_number_and_path(self):
+		for at_apply in MOMENTS:
+			with self.subTest(at_apply=at_apply):
+				ops = [edit(README), create("myapp/x.txt"), create("myapp/.env.txt")]
+				self.assertEqual(
+					self.reason(ops, at_apply=at_apply), f"mục 3 (myapp/.env.txt): {NAME_FORBIDDEN_REFUSAL}"
+				)
+				# The first refused item is the one named, even when a later item is refused too.
+				ops = [edit(README), create("otherapp/x.txt"), create("myapp/.env.txt")]
+				self.assertEqual(
+					self.reason(ops, at_apply=at_apply), f"mục 2 (otherapp/x.txt): {APP_NOT_ALLOWED_REFUSAL}"
+				)
+
+	def test_proposal_time_reads_git_state_of_every_path(self):
+		self.sandbox.commit_file("myapp", "old.py", "x = 1\n")
+		with open(os.path.join(self.sandbox.repo("myapp"), "old.py"), "a", encoding="utf-8") as handle:
+			handle.write("changed\n")
+		for ops, path in (
+			([edit("myapp/old.py")], "myapp/old.py"),
+			([edit(README), edit("myapp/old.py")], "myapp/old.py"),
+		):
+			with self.subTest(ops=ops):
+				reason = self.reason(ops, at_apply=False)
+				self.assertTrue(reason.startswith(f"mục {len(ops)} ({path}): "), reason)
+				self.assertIsNone(self.reason(ops, at_apply=True))
+		# A dirty rename target is refused at proposal time, not at apply time.
+		self.sandbox.commit_file("myapp", "target.md", "x = 1\n")
+		os.remove(os.path.join(self.sandbox.repo("myapp"), "target.md"))
+		ops = [rename(README, "myapp/target.md")]
+		self.assertTrue(self.reason(ops, at_apply=False).startswith(f"mục 1 ({README}): "))
+		self.assertIsNone(self.reason(ops, at_apply=True))

@@ -1031,3 +1031,89 @@ class TestSendRefusal(FrappeTestCase):
 				self.assertEqual(policy.can_send_ticket(name), policy.send_refusal(name) is None)
 		self.assertFalse(policy.can_send_ticket(None))
 		self.assertFalse(policy.can_send_ticket("không có phiếu này"))
+
+
+class TestExcludedQuery(FrappeTestCase):
+	# AC-8, ADR-034 QĐ 1, Ràng buộc 2, U2.md:114, :118, :129, :133: the query form of the send predicate
+	# selects exactly the tickets the predicate refuses.
+	def setUp(self):
+		self.addCleanup(frappe.cache.hdel, "assignment_rule_map", "HD Ticket")
+		commit_guard = patch.object(
+			frappe.db, "commit", side_effect=AssertionError("test must not commit the transaction")
+		)
+		commit_guard.start()
+		self.addCleanup(commit_guard.stop)
+		self.addCleanup(frappe.db.rollback)
+		keep_agent_settings(self)
+		for name in TEAMS:
+			_ensure_team(name)
+
+	def _ticket(self, subject="Hỏi về máy in", **values):
+		ticket = make_ticket(subject=subject)
+		for key, value in values.items():
+			frappe.db.set_value("HD Ticket", ticket.name, key, value)
+		return ticket.name
+
+	def test_excluded_team_names_use_the_predicate_comparison(self):
+		set_agent_settings(excluded_teams=f"  {TEAM.upper()}  \nKhông có nhóm này")
+		self.assertEqual(policy.excluded_team_names(), [TEAM])
+		set_agent_settings(excluded_teams="")
+		self.assertEqual(policy.excluded_team_names(), [])
+
+	def test_query_form_matches_predicate(self):
+		set_agent_settings(
+			excluded_teams=TEAM, excluded_title_prefixes="[HR]\n50%_off\n[Kế   toán]\nback\\slash"
+		)
+		opted_out = self._ticket(ai_opt_out=1)
+		in_team = self._ticket(agent_group=TEAM)
+		prefixed = self._ticket(subject="[HR] Nghỉ phép")
+		classified = self._ticket()
+		make_log_entry(
+			ticket=classified, entry_type="classify", stop_reason=policy.EXCLUDED_BY_CLASSIFICATION, applied=0
+		)
+		combined = self._ticket(subject="[HR] X", agent_group=TEAM, ai_opt_out=1)
+		normal = self._ticket()
+		spaced = self._ticket(subject="   [hr]    Lương")
+		upper = self._ticket(subject="[Kế TOÁN] Sổ sách")
+		escapes = self._ticket(subject="50%_off sale")
+		lookalike = self._ticket(subject="50Xaoff sale")
+		backslash = self._ticket(subject="back\\slash x")
+		not_prefix = self._ticket(subject="Hỏi về [HR]")
+		classified_then_team = self._ticket(agent_group="IT")
+		make_log_entry(
+			ticket=classified_then_team,
+			entry_type="classify",
+			stop_reason=policy.EXCLUDED_BY_CLASSIFICATION,
+			applied=0,
+		)
+		names = policy.excluded_ticket_names()
+		self.assertEqual(len(names), len(set(names)))
+		everything = frappe.get_all("HD Ticket", pluck="name")
+		self.assertEqual(set(names), {name for name in everything if not policy.can_send_ticket(name)})
+		for excluded in (
+			opted_out,
+			in_team,
+			prefixed,
+			classified,
+			combined,
+			spaced,
+			upper,
+			escapes,
+			backslash,
+		):
+			self.assertIn(excluded, names)
+		for sendable in (normal, lookalike, not_prefix, classified_then_team):
+			self.assertNotIn(sendable, names)
+
+	def test_no_rule_set_and_no_opt_out_gives_empty_candidates(self):
+		set_agent_settings(excluded_teams="", excluded_title_prefixes="")
+		opted_out = frappe.get_all("HD Ticket", filters={"ai_opt_out": 1}, pluck="name")
+		classified = frappe.get_all(
+			LOG_DOCTYPE,
+			filters={"entry_type": "classify", "stop_reason": policy.EXCLUDED_BY_CLASSIFICATION},
+			pluck="ticket",
+		)
+		self.assertEqual(
+			set(policy.excluded_ticket_names()),
+			{name for name in (*opted_out, *classified) if not policy.can_send_ticket(name)},
+		)

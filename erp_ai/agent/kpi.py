@@ -189,18 +189,23 @@ def _bot_closed(names: list[str]) -> set[str]:
 	"""Tickets with an ERP AI Log action that is ok and set the ticket's status to Resolved/Closed (ADR-024)."""
 	closed = set()
 	for row in frappe.get_all(LOG_DOCTYPE, filters={"ticket": ["in", names]}, fields=["ticket", "actions"]):
-		for action in _actions(row.actions):
-			if (
-				action.get("ok") is True
-				and action.get("doctype") == TICKET
-				and action.get("name") == row.ticket
-				and (action.get("value_after") or {}).get("status") in CLOSED_STATUSES
-			):
-				closed.add(row.ticket)
+		if any(is_bot_close(action, row.ticket) for action in log_actions(row.actions)):
+			closed.add(row.ticket)
 	return closed
 
 
-def _actions(raw) -> list[dict]:
+def is_bot_close(action: dict, ticket: str | None) -> bool:
+	"""True when an action entry is ok and set `ticket`'s status to Resolved/Closed (ADR-024)."""
+	return bool(
+		ticket
+		and action.get("ok") is True
+		and action.get("doctype") == TICKET
+		and action.get("name") == ticket
+		and (action.get("value_after") or {}).get("status") in CLOSED_STATUSES
+	)
+
+
+def log_actions(raw) -> list[dict]:
 	"""The `actions` list of a log row; an unreadable value counts as no action."""
 	try:
 		actions = json.loads(raw or "[]")

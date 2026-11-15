@@ -5,15 +5,16 @@ resolved in that window. Every state is read when the job runs: "open" means cre
 `status_category` not "Resolved"; first response, BA notes and Tasks are read as they are at run time.
 """
 
-from datetime import datetime, timedelta
+from datetime import datetime, time, timedelta
 
 import frappe
 
 from erp_ai.agent import policy
 from erp_ai.agent.classification import load_mapping
+from erp_ai.agent.kpi import is_bot_close, log_actions
 from erp_ai.agent.ops_data import BA_NOTE_MARKER, category_by_ticket_type, ticket_category
 from erp_ai.agent.routing import load_routing_config, processing_deadline, response_overdue
-from erp_ai.constants import AGENT_USER, LOGGER_NAME, SETTING_DOCTYPE
+from erp_ai.constants import AGENT_USER, LOG_DOCTYPE, LOGGER_NAME, SETTING_DOCTYPE
 
 TICKET = "HD Ticket"
 WINDOW = timedelta(hours=24)
@@ -21,6 +22,39 @@ UNKNOWN_CATEGORY = "?"
 PROGRESS_CATEGORIES = ("D", "E")
 # Same rule as the setting's E-2 check; the agent core may not import the controller (ADR-001).
 DUE_FIELD_TYPES = ("Date", "Datetime")
+# The kind an ok action entry of ERP AI Log counts as in `bot_actions`; any other tool counts as OTHER_ACTION_KIND
+# (design-w1-fixes-18 Điểm 2.2).
+ACTION_KIND_BY_TOOL = {
+	"set_classification": "phân loại",
+	"assign_owner": "gán",
+	"create_task": "Task",
+	"create_routed_task": "Task",
+	"post_comment": "comment",
+	"post_routing_comment": "comment",
+}
+# Ok entries of these tools are not counted: their row is already counted ("phân loại" through `applied`, or the
+# `change_step="propose"` row each ok propose entry writes).
+TOOLS_COUNTED_ELSEWHERE = frozenset(
+	{"apply_route", "propose_file_change", "propose_new_file", "propose_bench_command"}
+)
+OTHER_ACTION_KIND = "khác"
+KIND_CLASSIFY = "phân loại"
+KIND_CLOSE = "đóng"
+KIND_ERROR = "lỗi"
+KIND_BY_CHANGE_STEP = {"propose": "đề xuất chờ duyệt", "approve": "đã duyệt", "reject": "bị từ chối"}
+# Every kind of AC-51, in its order, each reported even when 0.
+BOT_ACTION_KINDS = (
+	KIND_CLASSIFY,
+	"gán",
+	"Task",
+	"comment",
+	"trả lời",
+	KIND_CLOSE,
+	*KIND_BY_CHANGE_STEP.values(),
+	KIND_ERROR,
+	OTHER_ACTION_KIND,
+)
+COST_DIGITS = 6
 
 
 def build_daily_report(anchor: datetime) -> dict:
@@ -71,7 +105,44 @@ def build_daily_report(anchor: datetime) -> dict:
 		"c_missing_ba_note": _items(row for row in c_old if row.name not in ba_noted),
 		"cd_missing_task": _items(row for row in cd_old if row.name not in with_task),
 		"de_progress": _de_progress(start, anchor, open_rows, overdue, reverse_map),
+		**_bot_day(anchor),
 	}
+
+
+def _bot_day(anchor: datetime) -> dict:
+	"""`bot_actions` and `cost_yesterday` from the ERP AI Log rows created on the day before `anchor`'s date."""
+	day_start = datetime.combine(anchor.date() - timedelta(days=1), time.min)
+	rows = frappe.get_all(
+		LOG_DOCTYPE,
+		filters=[["creation", ">=", day_start], ["creation", "<", day_start + timedelta(days=1)]],
+		fields=["ticket", "entry_type", "applied", "change_step", "actions", "error", "cost_usd"],
+	)
+	counts = dict.fromkeys(BOT_ACTION_KINDS, 0)
+	for row in rows:
+		if row.entry_type == "classify" and row.applied:
+			counts[KIND_CLASSIFY] += 1
+		if row.change_step in KIND_BY_CHANGE_STEP:
+			counts[KIND_BY_CHANGE_STEP[row.change_step]] += 1
+		if (row.error or "").strip():
+			counts[KIND_ERROR] += 1
+		for action in log_actions(row.actions):
+			kind = _action_kind(action, row.ticket)
+			if kind:
+				counts[kind] += 1
+	cost = round(float(sum(row.cost_usd or 0 for row in rows)), COST_DIGITS)
+	return {"bot_actions": counts, "cost_yesterday": cost}
+
+
+def _action_kind(action: dict, ticket: str | None) -> str | None:
+	"""The kind an action entry counts as, or None when it is not ok or its row already counts it."""
+	if action.get("ok") is not True:
+		return None
+	if is_bot_close(action, ticket):
+		return KIND_CLOSE
+	tool = action.get("tool")
+	if tool in TOOLS_COUNTED_ELSEWHERE:
+		return None
+	return ACTION_KIND_BY_TOOL.get(tool, OTHER_ACTION_KIND)
 
 
 def _due_field(due_field: str | None) -> str | None:

@@ -87,9 +87,8 @@ class TestSourceTools(SourceRootMixin, FrappeTestCase):
 
 		self.write("myapp/Notes.MD", "hello\n")
 		self.assertIsNotNone(source.resolve_safe_path("myapp/Notes.MD"))
-		self.assertEqual(
-			source.DUOI_CHO_PHEP, {".py", ".js", ".vue", ".json", ".md", ".html", ".css", ".txt"}
-		)
+		# CHG-002 design 3.2 "Nơi dùng hàm", CI-20: `text_refusal` decides what is text; the extension list is gone.
+		self.assertFalse(hasattr(source, "DUOI_CHO_PHEP"))
 
 	def test_each_forbidden_name_pattern_blocked_with_allowed_extension(self):
 		for rel in (
@@ -2505,7 +2504,7 @@ class TestManualsExcluded(FrappeTestCase):
 		self.assertEqual(source.resolve_manual_path("myapp/docs/hdsd.md"), self.manual)
 		self.assertEqual(source.resolve_manual_path(self.manual), self.manual)
 		self.sandbox.write("myapp/docs/.env", "x\n")
-		self.sandbox.write("myapp/docs/tool.exe", "x\n")
+		self.sandbox.write("myapp/docs/.gitignore", "x\n")
 		for rel in (
 			"myapp/code.py",
 			"myapp/docs",
@@ -2513,7 +2512,8 @@ class TestManualsExcluded(FrappeTestCase):
 			"myapp/docs/../../../outside/plain.py",
 			os.path.join(self.sandbox.outside, "plain.py"),
 			"myapp/docs/.env",
-			"myapp/docs/tool.exe",
+			# CHG-002 design 3.2: no extension list; a ".git*" name is refused (as in test_secret_names_and_extensions_refused).
+			"myapp/docs/.gitignore",
 			"",
 			"   ",
 			None,

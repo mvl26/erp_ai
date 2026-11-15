@@ -17,6 +17,8 @@ from erp_ai.constants import (
 TICKET_DOCTYPE = "HD Ticket"
 HUMAN_COMMENT_TYPE = "Comment"
 TRIGGER_HUMAN_CORRECTION = "human_correction"
+CREATED_LABELS_FIELD = "ai_created_labels"
+CREATED_LABELS_FLAG = "erp_ai_created_labels"
 
 
 def _log_decision(ticket, trigger, outcome, reason):
@@ -27,6 +29,10 @@ def _log_decision(ticket, trigger, outcome, reason):
 def ticket_before_insert(doc, method=None):
 	# Runs before Helpdesk fills defaults, so it sees only what the person typed.
 	doc.flags.erp_ai_prefilled = all(doc.get(field) for field in CLASSIFICATION_FIELDS)
+	# Kept in a flag, not the field: Frappe resets permlevel 8 fields of a creator without that level.
+	doc.flags[CREATED_LABELS_FLAG] = {
+		field: doc.get(field) for field in CLASSIFICATION_FIELDS if doc.get(field)
+	}
 
 
 def ticket_after_insert(doc, method=None):
@@ -59,7 +65,27 @@ def _latest_classify_log(ticket):
 	return rows[0] if rows else None
 
 
+def _record_created_labels(doc):
+	"""Server-computed at creation, overwriting any client value; only typed values the ticket still holds."""
+	typed = doc.flags.get(CREATED_LABELS_FLAG) or {}
+	kept = {field: value for field, value in typed.items() if doc.get(field) == value}
+	doc.set(CREATED_LABELS_FIELD, json.dumps(kept, ensure_ascii=False, sort_keys=True) if kept else "")
+
+
+def _freeze_created_labels(doc):
+	"""No later save may change the record, in any session."""
+	before = doc.get_doc_before_save()
+	if before and doc.has_value_changed(CREATED_LABELS_FIELD):
+		doc.set(CREATED_LABELS_FIELD, before.get(CREATED_LABELS_FIELD))
+
+
 def ticket_validate(doc, method=None):
+	# Before any early return; the field is absent until migrate has installed it.
+	if doc.meta.has_field(CREATED_LABELS_FIELD):
+		if doc.is_new():
+			_record_created_labels(doc)
+		else:
+			_freeze_created_labels(doc)
 	# The flag carries the name of the classify log row to update; stale on a re-used doc object.
 	doc.flags.erp_ai_human_corrected = None
 	# Runs for every ticket save: leave before any DB read unless a classification field changed.

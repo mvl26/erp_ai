@@ -572,3 +572,163 @@ class TestHumanCorrection(HandlerTestCase):
 		logged = " ".join(str(arg) for call in logger.info.call_args_list for arg in call.args)
 		self.assertNotIn("SECRET", logged)
 		self.assertIn("human_correction", logged)
+
+
+CREATED_LABELS_FIELD = "ai_created_labels"
+CREATED_LABELS_FLAG = "erp_ai_created_labels"
+
+
+def _labels(values):
+	return json.dumps(values, ensure_ascii=False, sort_keys=True) if values else ""
+
+
+def _ensure_user(email, role):
+	if not frappe.db.exists("User", email):
+		frappe.get_doc(
+			{"doctype": "User", "email": email, "first_name": email.split("@")[0], "send_welcome_email": 0}
+		).insert(ignore_permissions=True)
+	frappe.get_doc("User", email).add_roles(role)
+	return email
+
+
+class TestCreatedLabels(HandlerTestCase):
+	"""AC-21, AC-19: the classification fields the person typed at creation, fixed for the ticket's life."""
+
+	CUSTOMER = f"{PREFIX}labels-customer@example.com"
+	AGENT = f"{PREFIX}labels-agent@example.com"
+
+	def _new_ticket(self, **values):
+		return frappe.get_doc(
+			{"doctype": "HD Ticket", "subject": f"{PREFIX}labels", "description": "labels", **values}
+		)
+
+	def _stored(self, ticket_name):
+		return frappe.db.get_value("HD Ticket", ticket_name, CREATED_LABELS_FIELD) or ""
+
+	def _insert_as(self, user, permlevels=None, **values):
+		"""Insert as `user` through the permission checks; `permlevels` fixes the write levels it holds."""
+		frappe.set_user(user)
+		doc = self._new_ticket(**values)
+		if permlevels is None:
+			doc.insert()
+		else:
+			with patch("frappe.model.document.Document.get_permlevel_access", return_value=permlevels):
+				self.assertEqual(doc.get_permlevel_access("write"), permlevels)
+				doc.insert()
+		frappe.set_user("Administrator")
+		return doc
+
+	def test_insert_records_typed_fields_only(self):
+		self.assertEqual(getattr(handlers, "CREATED_LABELS_FIELD", None), CREATED_LABELS_FIELD)
+		self.assertEqual(getattr(handlers, "CREATED_LABELS_FLAG", None), CREATED_LABELS_FLAG)
+		every = {"ticket_type": TICKET_TYPE, "agent_group": OPEN_TEAM, "priority": "High"}
+		keys = list(every)
+		subsets = [()] + [(k,) for k in keys] + [tuple(k for k in keys if k != skip) for skip in keys]
+		subsets.append(tuple(keys))
+		self.assertEqual(len(subsets), 8)
+		for subset in subsets:
+			typed = {key: every[key] for key in subset}
+			with self.subTest(typed=typed):
+				# before_insert only keeps the typed set in the flag; the field is written at validate.
+				doc = self._new_ticket(**typed)
+				with (
+					patch.object(frappe.db, "set_value") as set_value,
+					patch.object(type(doc), "save") as save,
+				):
+					handlers.ticket_before_insert(doc)
+					self.assertEqual(doc.flags.get(CREATED_LABELS_FLAG), typed)
+					self.assertFalse(doc.get(CREATED_LABELS_FIELD))
+					doc.set("__islocal", 1)
+					handlers.ticket_validate(doc)
+				self.assertEqual(doc.get(CREATED_LABELS_FIELD) or "", _labels(typed))
+				set_value.assert_not_called()
+				save.assert_not_called()
+
+				ticket = make_ticket(subject=f"{PREFIX}labels", **typed)
+				self.assertEqual(self._stored(ticket.name), _labels(typed))
+
+	def test_customer_portal_insert_records_typed_fields(self):
+		customer = _ensure_user(self.CUSTOMER, "HD Customer")
+		frappe.set_user(customer)
+		self.assertNotIn(8, self._new_ticket().get_permlevel_access("write"))
+		# Seed the template instead of reading the site's: it lets a customer fill `priority`.
+		template = patch(
+			"helpdesk.helpdesk.doctype.hd_ticket.hd_ticket.HDTicket.customer_writable_rows",
+			return_value=[frappe._dict(fieldname="priority")],
+		)
+
+		with template:
+			doc = self._insert_as(customer, priority="High")
+
+		self.assertEqual(frappe.db.get_value("HD Ticket", doc.name, "via_customer_portal"), 1)
+		self.assertEqual(self._stored(doc.name), _labels({"priority": "High"}))
+
+	def test_user_without_level8_insert_records_typed_fields(self):
+		# The classification fields are permlevel 7 on HD Ticket; level 8 is the one withheld.
+		agent = _ensure_user(self.AGENT, "Agent")
+		typed = {"ticket_type": TICKET_TYPE, "priority": "High"}
+
+		doc = self._insert_as(agent, permlevels=[0, 7], **typed)
+
+		self.assertEqual(self._stored(doc.name), _labels(typed))
+
+	def test_level8_user_client_value_overwritten(self):
+		agent = _ensure_user(self.AGENT, "Agent")
+		forged = json.dumps({"ticket_type": TICKET_TYPE, "agent_group": OPEN_TEAM, "priority": "Low"})
+
+		typed = self._insert_as(
+			agent, permlevels=[0, 7, 8], priority="High", **{CREATED_LABELS_FIELD: forged}
+		)
+		untyped = self._insert_as(agent, permlevels=[0, 7, 8], **{CREATED_LABELS_FIELD: forged})
+
+		self.assertEqual(self._stored(typed.name), _labels({"priority": "High"}))
+		self.assertEqual(self._stored(untyped.name), "")
+
+	def test_only_values_still_on_ticket_recorded(self):
+		for typed, on_ticket, expected in (
+			({"priority": "High"}, {"priority": "Medium"}, ""),
+			(
+				{"priority": "High", "ticket_type": TICKET_TYPE},
+				{"priority": "Medium", "ticket_type": TICKET_TYPE},
+				_labels({"ticket_type": TICKET_TYPE}),
+			),
+		):
+			with self.subTest(typed=typed):
+				doc = frappe.new_doc("HD Ticket")
+				doc.update(on_ticket)
+				doc.flags[CREATED_LABELS_FLAG] = typed
+
+				handlers.ticket_validate(doc)
+
+				self.assertEqual(doc.get(CREATED_LABELS_FIELD) or "", expected)
+
+	def test_created_labels_frozen_after_insert(self):
+		ticket = make_ticket(subject=f"{PREFIX}labels", priority="High")
+		recorded = _labels({"priority": "High"})
+		self.assertEqual(self._stored(ticket.name), recorded)
+		forged = json.dumps({"priority": "Low"})
+
+		for user in ("Administrator", AGENT_USER):
+			with self.subTest(user=user):
+				frappe.set_user(user)
+				doc = frappe.get_doc("HD Ticket", ticket.name)
+				doc.set(CREATED_LABELS_FIELD, forged)
+				doc.save(ignore_permissions=True)
+				frappe.set_user("Administrator")
+				self.assertEqual(self._stored(ticket.name), recorded)
+
+		# A later save that changes a typed field does not recompute the record either.
+		doc = frappe.get_doc("HD Ticket", ticket.name)
+		doc.priority = "Low"
+		doc.save(ignore_permissions=True)
+		self.assertEqual(self._stored(ticket.name), recorded)
+
+		# The freeze works on the doc being saved: no extra save, no db.set_value on HD Ticket.
+		doc = frappe.get_doc("HD Ticket", ticket.name)
+		doc.load_doc_before_save()
+		doc.set(CREATED_LABELS_FIELD, forged)
+		with patch.object(frappe.db, "set_value") as set_value, patch.object(type(doc), "save") as save:
+			handlers.ticket_validate(doc)
+		self.assertEqual(doc.get(CREATED_LABELS_FIELD), recorded)
+		set_value.assert_not_called()
+		save.assert_not_called()

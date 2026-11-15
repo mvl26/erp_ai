@@ -1,3 +1,6 @@
+import json
+
+import frappe
 from frappe.tests.utils import FrappeTestCase
 
 from erp_ai.agent import change_text
@@ -388,3 +391,217 @@ class TestBlockMessage(FrappeTestCase):
 		self.assertEqual(change_text.block_label([BLOCK_OPS[3]]), "helpdesk/helpdesk/a.py")
 		self.assertEqual(change_text.block_label(BLOCK_OPS[:2]), "2 file")
 		self.assertEqual(change_text.block_label(BLOCK_OPS), "4 file")
+
+
+BLOCK_RESTART_NOTE = "Sau khi áp dụng, hệ thống sẽ restart bench (lệnh cuối)."
+BLOCK_COMMANDS_NOTE = "Lệnh trong khối không hoàn tác được; hoàn tác chỉ trả lại phần file."
+MIGRATE_COMMAND = ["--site", "miyano", "migrate"]
+
+
+def op_row(idx, operation, file_path, new_path=""):
+	return frappe._dict(idx=idx, operation=operation, file_path=file_path, new_path=new_path)
+
+
+def block_fields(rows, commands, **overrides):
+	"""Fields of a block proposal; `commands` is an argv list (stored as JSON) or a raw stored value."""
+	fields = code_fields(
+		file_path="",
+		operations=list(rows),
+		command_list=commands if commands is None or isinstance(commands, str) else json.dumps(commands),
+	)
+	fields.update(overrides)
+	return fields
+
+
+ONE_EDIT = [op_row(1, CHANGE_OP_EDIT, "helpdesk/helpdesk/hooks.py")]
+
+
+class TestBlockNotes(FrappeTestCase):
+	def test_counts_then_items_then_commands_in_order(self):
+		# rows arrive out of `idx` order; the notes list them in `idx` order
+		rows = [
+			op_row(3, CHANGE_OP_DELETE, "helpdesk/helpdesk/old.py"),
+			op_row(1, CHANGE_OP_EDIT, "helpdesk/helpdesk/hooks.py"),
+			op_row(5, CHANGE_OP_EDIT, "helpdesk/helpdesk/api.py"),
+			op_row(2, CHANGE_OP_CREATE, "helpdesk/helpdesk/api/new.py"),
+			op_row(4, CHANGE_OP_RENAME, "helpdesk/helpdesk/a.py", "helpdesk/helpdesk/b.py"),
+			op_row(6, CHANGE_OP_CREATE, "helpdesk/helpdesk/api/other.py"),
+		]
+		commands = [MIGRATE_COMMAND, ["build", "--app", "helpdesk"], ["restart"]]
+		self.assertEqual(
+			proposal_notes(block_fields(rows, commands)),
+			[
+				"Gồm 2 sửa, 2 tạo, 1 xóa, 1 đổi tên; 3 lệnh.",
+				"sửa helpdesk/helpdesk/hooks.py",
+				"tạo helpdesk/helpdesk/api/new.py",
+				"XÓA helpdesk/helpdesk/old.py",
+				"ĐỔI TÊN helpdesk/helpdesk/a.py → helpdesk/helpdesk/b.py",
+				"sửa helpdesk/helpdesk/api.py",
+				"tạo helpdesk/helpdesk/api/other.py",
+				"lệnh: bench --site miyano migrate",
+				"lệnh: bench build --app helpdesk",
+				"lệnh: bench restart",
+				BLOCK_RESTART_NOTE,
+				BLOCK_COMMANDS_NOTE,
+				BRANCH_NOTE,
+				UPSTREAM_NOTE,
+			],
+		)
+		# one item, no command: count line, the item, then the branch sentences
+		self.assertEqual(
+			proposal_notes(block_fields(ONE_EDIT, [])),
+			[
+				"Gồm 1 sửa, 0 tạo, 0 xóa, 0 đổi tên; 0 lệnh.",
+				"sửa helpdesk/helpdesk/hooks.py",
+				BRANCH_NOTE,
+				UPSTREAM_NOTE,
+			],
+		)
+		# the core warning and the commit sentence keep their place after the block lines
+		self.assertEqual(
+			proposal_notes(
+				block_fields(
+					ONE_EDIT,
+					[MIGRATE_COMMAND],
+					app="frappe",
+					upstream_ref="",
+					is_core_app=1,
+					change_status="Đã áp dụng",
+					apply_commit_sha=APPLY_SHA,
+				)
+			),
+			[
+				"Gồm 1 sửa, 0 tạo, 0 xóa, 0 đổi tên; 1 lệnh.",
+				"sửa helpdesk/helpdesk/hooks.py",
+				"lệnh: bench --site miyano migrate",
+				BLOCK_COMMANDS_NOTE,
+				"Commit sẽ vào nhánh develop của app frappe.",
+				NO_UPSTREAM_NOTE,
+				CORE_WARNING_FRAPPE,
+				f"Commit áp dụng: {APPLY_SHA}.",
+			],
+		)
+
+	def test_restart_line_iff_restart_listed(self):
+		# commands without restart: no restart line, the not-undoable line stays
+		self.assertEqual(
+			proposal_notes(block_fields(ONE_EDIT, [["build", "--app", "helpdesk"]])),
+			[
+				"Gồm 1 sửa, 0 tạo, 0 xóa, 0 đổi tên; 1 lệnh.",
+				"sửa helpdesk/helpdesk/hooks.py",
+				"lệnh: bench build --app helpdesk",
+				BLOCK_COMMANDS_NOTE,
+				BRANCH_NOTE,
+				UPSTREAM_NOTE,
+			],
+		)
+		# a .py item without restart listed: no restart line (D-4 follows the list, not the extension)
+		self.assertNotIn(BLOCK_RESTART_NOTE, proposal_notes(block_fields(ONE_EDIT, [MIGRATE_COMMAND])))
+		# a commands-only block with just restart (R-6): the restart line shows, no branch sentence
+		self.assertEqual(
+			proposal_notes(
+				block_fields([], [["restart"]], change_kind="Lệnh bench", target_branch="", upstream_ref="")
+			),
+			[
+				"Gồm 0 sửa, 0 tạo, 0 xóa, 0 đổi tên; 1 lệnh.",
+				"lệnh: bench restart",
+				BLOCK_RESTART_NOTE,
+				BLOCK_COMMANDS_NOTE,
+			],
+		)
+		# the restart line shows once, right after the last command line
+		notes = proposal_notes(block_fields(ONE_EDIT, [MIGRATE_COMMAND, ["restart"]]))
+		self.assertEqual(notes.count(BLOCK_RESTART_NOTE), 1)
+		self.assertEqual(notes.index(BLOCK_RESTART_NOTE), notes.index("lệnh: bench restart") + 1)
+
+	def test_commands_not_undoable_line(self):
+		no_command = [
+			"Gồm 1 sửa, 0 tạo, 0 xóa, 0 đổi tên; 0 lệnh.",
+			"sửa helpdesk/helpdesk/hooks.py",
+			BRANCH_NOTE,
+			UPSTREAM_NOTE,
+		]
+		# empty, missing or empty-list command_list: no command, no not-undoable line
+		for command_list in ("[]", "", None):
+			with self.subTest(command_list=command_list):
+				self.assertEqual(proposal_notes(block_fields(ONE_EDIT, command_list)), no_command)
+		# a stored command_list that is not a JSON list of argv lists is read strictly, like
+		# block.commands_of (design 2.3): it raises, never shows the approver "0 lệnh"
+		for command_list in ("not json", '{"args": ["restart"]}', '["restart"]'):
+			with self.subTest(command_list=command_list):
+				with self.assertRaises(ValueError):
+					proposal_notes(block_fields(ONE_EDIT, command_list))
+		# a commands-only block gets the block line, not the old "Lệnh bench không hoàn tác được."
+		self.assertEqual(
+			proposal_notes(
+				block_fields(
+					[],
+					[MIGRATE_COMMAND, ["build", "--app", "helpdesk"]],
+					change_kind="Lệnh bench",
+					target_branch="",
+					upstream_ref="",
+				)
+			),
+			[
+				"Gồm 0 sửa, 0 tạo, 0 xóa, 0 đổi tên; 2 lệnh.",
+				"lệnh: bench --site miyano migrate",
+				"lệnh: bench build --app helpdesk",
+				BLOCK_COMMANDS_NOTE,
+			],
+		)
+
+	def test_legacy_py_note_only_for_legacy(self):
+		# a block with .py items never carries the old sentence, even with a legacy file_path left over
+		for commands in ([], [MIGRATE_COMMAND, ["restart"]]):
+			with self.subTest(commands=commands):
+				notes = proposal_notes(
+					block_fields(
+						[op_row(1, CHANGE_OP_CREATE, "helpdesk/helpdesk/api/new.py")],
+						commands,
+						file_path="helpdesk/helpdesk/api/new.py",
+					)
+				)
+				self.assertNotIn(RESTART_NOTE, notes)
+		# the legacy shape (no rows, no command_list) keeps exactly the old output
+		for empty in ({}, {"operations": [], "command_list": ""}, {"operations": None, "command_list": None}):
+			with self.subTest(empty=empty):
+				self.assertEqual(
+					proposal_notes(code_fields(file_path="helpdesk/helpdesk/api.py", **empty)),
+					[BRANCH_NOTE, UPSTREAM_NOTE, RESTART_NOTE],
+				)
+				self.assertEqual(
+					proposal_notes({"change_kind": "Lệnh bench", "app": "helpdesk", **empty}),
+					[COMMAND_NOTE],
+				)
+
+	def test_no_remote_url(self):
+		rows = [
+			op_row(1, CHANGE_OP_EDIT, "helpdesk/helpdesk/hooks.py"),
+			op_row(2, CHANGE_OP_RENAME, "helpdesk/helpdesk/a.py", "helpdesk/helpdesk/b.py"),
+		]
+		commands = [MIGRATE_COMMAND, ["restart"]]
+		# a URL in the remote drops only the upstream sentence; the block lines stay whole
+		self.assertEqual(
+			proposal_notes(block_fields(rows, commands, upstream_ref=TOKEN_URL)),
+			[
+				"Gồm 1 sửa, 0 tạo, 0 xóa, 1 đổi tên; 2 lệnh.",
+				"sửa helpdesk/helpdesk/hooks.py",
+				"ĐỔI TÊN helpdesk/helpdesk/a.py → helpdesk/helpdesk/b.py",
+				"lệnh: bench --site miyano migrate",
+				"lệnh: bench restart",
+				BLOCK_RESTART_NOTE,
+				BLOCK_COMMANDS_NOTE,
+				BRANCH_NOTE,
+			],
+		)
+		for overrides in (
+			{"upstream_ref": TOKEN_URL},
+			{"target_branch": TOKEN_URL},
+			{"app": TOKEN_URL, "is_core_app": 1},
+			{"change_status": "Đã áp dụng", "apply_commit_sha": TOKEN_URL},
+		):
+			with self.subTest(**overrides):
+				text = "\n".join(proposal_notes(block_fields(rows, commands, **overrides)))
+				self.assertNotIn("://", text)
+				self.assertNotIn("ghp_FAKE123", text)
+				self.assertNotIn("github.com", text)

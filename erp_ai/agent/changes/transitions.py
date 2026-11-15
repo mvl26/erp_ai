@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+from datetime import datetime
 
 import frappe
 from frappe.utils import now_datetime
@@ -22,6 +23,10 @@ from erp_ai.constants import (
 	CHANGE_STATUS_UNDOING,
 	CHANGE_STATUS_UNDONE,
 	PROPOSAL_DOCTYPE,
+	RESTART_STATUS_CONFIRMED,
+	RESTART_STATUS_LAUNCH_FAILED,
+	RESTART_STATUS_SENT,
+	RESTART_STATUS_UNCONFIRMED,
 	TRIGGER_CHANGE_ACTION,
 )
 
@@ -85,6 +90,10 @@ GIT_RESULT_FIELDS = (
 )
 # CHG-002 design 3.6: the states `record_commit` writes in (a job between its commit and its end).
 RECORD_COMMIT_STATES = (CHANGE_STATUS_APPLYING, CHANGE_STATUS_UNDOING)
+# CHG-002 design 3.6: the states a restart is launched from, its two launch outcomes, its two conclusions.
+RESTART_EXPECTED_STATES = (CHANGE_STATUS_APPLIED, CHANGE_STATUS_UNDONE)
+RESTART_LAUNCH_VALUES = (RESTART_STATUS_SENT, RESTART_STATUS_LAUNCH_FAILED)
+RESTART_CONCLUSIONS = (RESTART_STATUS_CONFIRMED, RESTART_STATUS_UNCONFIRMED)
 # Design 2.2: the edges a job ends with, each with the one log step it writes.
 FINISH_EDGES = {
 	(CHANGE_STATUS_APPROVED, CHANGE_STATUS_FAILED): "fail",
@@ -121,10 +130,12 @@ def content_digest(doc) -> str:
 	"""sha256 hex of the JSON list of the 14 design 2.3 fields (`ensure_ascii=False`), as stored on `doc`.
 
 	A block proposal (CHG-002 design 2.4) appends the list of its child rows in `idx` order, each as
-	`OPERATION_DIGEST_FIELDS`, then its `command_list`; the old shape keeps its digest byte for byte.
+	`OPERATION_DIGEST_FIELDS`, then its `command_list`; the old shape keeps its digest byte for byte and
+	only for its two kinds (A3 RQ-5).
 
 	Raises:
-		ValueError: `doc` is not an ERP AI Change Proposal.
+		ValueError: `doc` is not an ERP AI Change Proposal, or it has the old shape and a `change_kind`
+			other than a file change or a bench command.
 	"""
 	_require_proposal(doc)
 	values = [doc.get(fieldname) for fieldname in DIGEST_FIELDS]
@@ -132,6 +143,8 @@ def content_digest(doc) -> str:
 		rows = sorted(doc.get("operations") or [], key=lambda row: row.idx)
 		values.append([[row.get(fieldname) for fieldname in OPERATION_DIGEST_FIELDS] for row in rows])
 		values.append(doc.get("command_list"))
+	else:
+		block.require_code_kind(doc)
 	return hashlib.sha256(json.dumps(values, ensure_ascii=False).encode("utf-8")).hexdigest()
 
 
@@ -169,8 +182,8 @@ def _require_text(value, label) -> None:
 		raise ValueError(f"{label} must be a non-empty string, got {value!r}")
 
 
-def _lock(name) -> frappe._dict:
-	"""Lock the proposal row (D-2); return its `change_status`, `change_kind` and both commit SHAs.
+def _lock(name, *extra) -> frappe._dict:
+	"""Lock the proposal row (D-2); return its `change_status`, `change_kind`, both commit SHAs and `extra` fields.
 
 	Raises:
 		ValueError: `name` is not a non-empty string.
@@ -180,7 +193,7 @@ def _lock(name) -> frappe._dict:
 	row = frappe.db.get_value(
 		PROPOSAL_DOCTYPE,
 		name,
-		["change_status", "change_kind", "apply_commit_sha", "undo_commit_sha"],
+		["change_status", "change_kind", "apply_commit_sha", "undo_commit_sha", *extra],
 		as_dict=True,
 		for_update=True,
 	)
@@ -299,6 +312,51 @@ def record_commit(name, expected, *, fields) -> bool:
 	if _lock(name).change_status != expected:
 		return False
 	frappe.db.set_value(PROPOSAL_DOCTYPE, name, values, update_modified=True)
+	return True
+
+
+def record_restart(name, expected, value, sent_at) -> bool:
+	"""Store the launch outcome of a restart (`value`) and `sent_at` while the proposal is still `expected`.
+
+	`expected` is `Đã áp dụng` or `Đã hoàn tác`, `value` is `Đã gửi` or `Lỗi khởi chạy` (CHG-002 design
+	3.6, 4.4 step 3). `change_status` stays as it is and no log row is written. Returns `False` and writes
+	nothing when the proposal is no longer `expected`.
+
+	Raises:
+		ValueError: `expected`, `value` outside those sets, or `sent_at` not a datetime; see `_lock`.
+		frappe.DoesNotExistError: see `_lock`.
+	"""
+	if expected not in RESTART_EXPECTED_STATES:
+		raise ValueError(f"record_restart runs in {RESTART_EXPECTED_STATES}, got {expected!r}")
+	if value not in RESTART_LAUNCH_VALUES:
+		raise ValueError(f"value must be one of {RESTART_LAUNCH_VALUES}, got {value!r}")
+	if not isinstance(sent_at, datetime):
+		raise ValueError(f"sent_at must be a datetime, got {sent_at!r}")
+	if _lock(name).change_status != expected:
+		return False
+	frappe.db.set_value(
+		PROPOSAL_DOCTYPE,
+		name,
+		{"restart_status": value, "restart_sent_at": sent_at},
+		update_modified=True,
+	)
+	return True
+
+
+def confirm_restart(name, value) -> bool:
+	"""`restart_status`: `Đã gửi → value`, `value` being `Đã xác nhận` or `Chưa xác nhận` (CHG-002 design 3.6).
+
+	Returns `False` and writes nothing when `restart_status` is not `Đã gửi`. No log row is written.
+
+	Raises:
+		ValueError: `value` outside that set; see `_lock`.
+		frappe.DoesNotExistError: see `_lock`.
+	"""
+	if value not in RESTART_CONCLUSIONS:
+		raise ValueError(f"value must be one of {RESTART_CONCLUSIONS}, got {value!r}")
+	if _lock(name, "restart_status").restart_status != RESTART_STATUS_SENT:
+		return False
+	frappe.db.set_value(PROPOSAL_DOCTYPE, name, {"restart_status": value}, update_modified=True)
 	return True
 
 

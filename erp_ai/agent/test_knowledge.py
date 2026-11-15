@@ -171,6 +171,33 @@ class TestKbSearch(KnowledgeCase):
 		self.assertEqual(knowledge.tokenize(" ".join(words)), words[:8])
 		self.assertEqual(knowledge.tokenize(None), [])
 
+	def test_text_words_not_capped(self):
+		words = [f"w{index}" for index in range(20)]
+		self.assertEqual(knowledge.text_words(" ".join(words)), set(words))
+		self.assertEqual(knowledge.tokenize(" ".join(words)), words[:8])
+		# same rules as `tokenize`: NFC + casefold, words of at least 2 characters, duplicates once
+		self.assertEqual(knowledge.text_words("a Bé, x9 lỗi_in! đ BÉ"), {"bé", "x9", "lỗi_in"})
+		self.assertEqual(knowledge.text_words(unicodedata.normalize("NFD", "MÃ Mã")), {"mã"})
+		for blank in (None, "", "   ", "a b c", "!! ?"):
+			with self.subTest(text=blank):
+				self.assertEqual(knowledge.text_words(blank), set())
+
+	def test_plain_text_keeps_block_words_apart(self):
+		self.assertEqual(knowledge.text_words(knowledge.plain_text("<p>một</p><p>hai</p>")), {"một", "hai"})
+		# inline tags do not split a word
+		self.assertEqual(knowledge.text_words(knowledge.plain_text("<b>ha</b>i")), {"hai"})
+		self.assertEqual(knowledge.plain_text("<b>ha</b>i"), "hai")
+		# nested blocks, any case, self-closing, a block tag never closed
+		self.assertEqual(
+			knowledge.text_words(knowledge.plain_text("<DIV><ul><li>một<br/>hai</LI><li>ba<p>bốn")),
+			{"một", "hai", "ba", "bốn"},
+		)
+		# entities stay as text (no unescaping): the words on both sides of one stay apart
+		self.assertEqual(knowledge.plain_text("<p>một&lt;hai</p>"), " một&lt;hai ")
+		for blank in (None, ""):
+			with self.subTest(html=blank):
+				self.assertEqual(knowledge.plain_text(blank), "")
+
 	def test_scan_bounded_under_session_and_wildcards_escaped(self):
 		self.assertEqual(knowledge.KB_SCAN_MAX, 200)
 		suffix = frappe.generate_hash(length=10).lower()

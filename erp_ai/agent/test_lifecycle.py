@@ -81,6 +81,10 @@ class LifecycleTestCase(FrappeTestCase):
 			field_origin=ORIGIN_FIELD,
 			origin_board_value=BOARD_VALUE,
 		)
+		# Error Log rows outlive the test transaction and ticket names are reused: count only the new ones.
+		self.old_error_logs = frappe.get_all(
+			"Error Log", filters={"method": lifecycle.TITLE_LIFECYCLE_FAILED}, pluck="name"
+		)
 
 	def _settings(self, **fields) -> None:
 		set_agent_settings(**fields)
@@ -175,13 +179,14 @@ class LifecycleTestCase(FrappeTestCase):
 			fields=["name", "trigger", "run_id", "cost_usd", "actions"],
 			order_by="creation",
 		)
-		return [{**row, "actions": json.loads(row.actions)} for row in rows]
+		return [frappe._dict(row, actions=json.loads(row.actions)) for row in rows]
 
 	def _error_logs(self, ticket) -> int:
-		return frappe.db.count(
-			"Error Log",
-			{"method": lifecycle.TITLE_LIFECYCLE_FAILED, "error": ("like", f"%ticket={ticket} %")},
-		)
+		"""TITLE_LIFECYCLE_FAILED Error Logs of `ticket` written since setUp."""
+		filters = {"method": lifecycle.TITLE_LIFECYCLE_FAILED, "error": ("like", f"ticket={ticket} %")}
+		if self.old_error_logs:
+			filters["name"] = ("not in", self.old_error_logs)
+		return frappe.db.count("Error Log", filters)
 
 	def _status(self, ticket) -> str:
 		return frappe.db.get_value("HD Ticket", ticket, "status")

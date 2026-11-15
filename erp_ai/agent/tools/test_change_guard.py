@@ -505,6 +505,8 @@ class TestCheckWritePath(FrappeTestCase):
 		os.makedirs(os.path.join(self.root, "myapp", "sub"))
 		self.link("myapp/real", "myapp/pkg_link")
 		self.link("myapp/real", "myapp/sub/deep_link")
+		os.makedirs(os.path.join(self.root, "myapp", "real", "inner"))
+		self.link("myapp/real/inner", "myapp/deeper_link")
 		self.link("myapp/real.py", "myapp/file_link.py")
 		self.link("myapp/missing.py", "myapp/dangling.py")
 		self.link("otherapp", "myapp/other_dir")
@@ -514,6 +516,9 @@ class TestCheckWritePath(FrappeTestCase):
 			("myapp/pkg_link/ok.py", False),
 			("myapp/pkg_link/new.py", True),
 			("myapp/sub/deep_link/ok.py", False),
+			# ".." after a symlink is applied to its target, not dropped as text.
+			("myapp/deeper_link/../x.py", True),
+			("myapp/sub/deep_link/../x.py", True),
 			("myapp/file_link.py", False),
 			("myapp/dangling.py", True),
 			("myapp/other_dir/ok.py", False),
@@ -599,9 +604,12 @@ class TestCheckWritePath(FrappeTestCase):
 				self.assertIsNone(self.reason(rel, listed, new_file=new_file))
 		# Order: the git pattern step and the symlink step come before the nested repo step.
 		self.link("myapp/vendor/lib", "myapp/lib_link")
+		self.link("myapp/vendor/lib/deep", "myapp/deep_link")
 		for rel, expected in (
 			("myapp/vendor/lib/a*.py", GIT_PATTERN_REFUSAL),
 			("myapp/lib_link/new.py", PATH_SYMLINK_REFUSAL),
+			# "link/.." reaches a file of the nested repo (myapp/vendor/lib/x.py), not myapp/x.py.
+			("myapp/deep_link/../x.py", PATH_SYMLINK_REFUSAL),
 		):
 			with self.subTest(rel=rel):
 				self.assertEqual(self.reason(rel, listed, new_file=True), expected)

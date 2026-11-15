@@ -181,8 +181,9 @@ def check_write_path(
 	with no folder, or the app folder itself → `PATH_INVALID`; 3. `erp_ai` by repo identity →
 	`APP_FORBIDDEN`; 4. `license.txt`, then `source.text_refusal` (secret name, then a ".git*"
 	component) → `NAME_FORBIDDEN` / `GIT_DIR`; 5. git pattern → `PATH_GIT_PATTERN`; 6. a symlink on
-	the existing part of the path → `PATH_SYMLINK`; 7. the nearest `.git` from the deepest existing
-	folder is not the app folder's repo → `NESTED_REPO`. Any file extension passes.
+	the existing part of the path (the normalized path differs from the real one) → `PATH_SYMLINK`;
+	7. the nearest `.git` from the deepest existing folder of the real path is not the app folder's
+	repo → `NESTED_REPO`. Any file extension passes.
 
 	`source.resolve_safe_path` is the only path resolver; when it refuses, the same real path is only
 	classified to pick the reason, and an unclassified refusal stays `PATH_INVALID`. With `read_git`
@@ -213,10 +214,11 @@ def check_write_path(
 		return _refused(PATH_GIT_PATTERN)
 	if full is None:
 		return _refused(PATH_INVALID)
-	existing = _existing_part(os.path.normpath(os.path.join(root, rel_path)))
-	if os.path.realpath(existing) != existing:
+	# Compared with the real path, so a symlink followed by ".." is caught too: normpath drops
+	# "link/.." as text while realpath applies ".." to the link's target.
+	if os.path.normpath(os.path.join(root, rel_path)) != full:
 		return _refused(PATH_SYMLINK)
-	if _is_nested_repo(existing, os.path.join(root, parts[0])):
+	if _is_nested_repo(_existing_part(full), os.path.join(root, parts[0])):
 		return _refused(NESTED_REPO)
 	state = None
 	if read_git:

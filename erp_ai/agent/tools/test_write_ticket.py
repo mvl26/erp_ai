@@ -831,8 +831,9 @@ class TestLockedCount(FrappeTestCase):
 			filters = {"reference_doctype": "HD Ticket", "reference_name": ticket}
 			# The first plain read takes this transaction's snapshot.
 			self.assertEqual(frappe.db.count("Comment", filters), 0)
-		frappe.set_user(AGENT_USER)
 		with self.secondary_connection():
+			# Set inside: opening the second connection (frappe.connect) makes Administrator the session user.
+			frappe.set_user(AGENT_USER)
 			posted = write_ticket.post_notice(ticket, "run_failed", f"{T99_PREFIX} lần một", since)
 			frappe.db.commit()
 		with self.primary_connection():

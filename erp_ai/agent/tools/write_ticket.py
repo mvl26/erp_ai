@@ -1,6 +1,7 @@
 import dataclasses
 import json
 import re
+from datetime import datetime
 
 import frappe
 from frappe.utils import escape_html, now_datetime
@@ -10,6 +11,7 @@ from erp_ai.agent.classification import CONFIDENCE_PCT_MAX, Classification
 from erp_ai.agent.routing import RouteDecision, decide_route
 from erp_ai.agent.tools.registry import ToolContext, ToolSpec
 from erp_ai.constants import (
+	AGENT_USER,
 	CATEGORIES,
 	CLASSIFICATION_FIELDS,
 	CLASSIFIED_BY_AI,
@@ -49,6 +51,14 @@ _PCT_UNKNOWN = "chưa có"
 _ASKED_RUNS_FLAG = "erp_ai_asked_runs"
 # A section ends at the next line that opens with a `**…:**` heading (U4b.md:168).
 _NEXT_HEADING = re.compile(r"^[ \t]*\*\*[^*\n]+:\*\*", re.M)
+# Status notices (AC-23): a notice is "<prefix> <body>"; one of a kind per ticket since a mark (U4b.md:134-140).
+NOTICE_PREFIXES = {
+	"daily_limit": "Bot tạm dừng trên phiếu này hôm nay:",
+	"over_budget": "Bot đang chạy ở mức L1:",
+	"run_failed": "Bot chưa xử lý xong phiếu này:",
+	"ask_fallback": "Bot chưa đủ chắc để xử lý phiếu này:",
+}
+REASON_NOTICE_SENT = "đã thông báo"
 
 
 def _fail(reason: str) -> dict:
@@ -250,6 +260,33 @@ def _proposal_refusal(content: str) -> dict | None:
 	if not section_text(content, EVIDENCE_HEADER):
 		return _fail(REASON_NO_EVIDENCE)
 	return None
+
+
+def _agent_comment_filters(ticket_name: str) -> dict:
+	"""The ticket's core `Comment` rows written by the agent account (an `Info` row is no comment)."""
+	return {
+		"reference_doctype": TICKET_DOCTYPE,
+		"reference_name": ticket_name,
+		"comment_type": "Comment",
+		"owner": AGENT_USER,
+	}
+
+
+def post_notice(ticket_name: str, notice: str, body: str, since: datetime) -> dict:
+	"""Post the `notice` status comment unless the agent posted one of that kind on the ticket since `since`
+	(AC-23, NFR-3, w1.md:97). The dedup read is locked_count's (ticket lock, then a locking read); no lock of its own.
+	"""
+	if notice not in NOTICE_PREFIXES:
+		raise ValueError(f"notice lạ: {notice}")
+	prefix = NOTICE_PREFIXES[notice]
+	filters = {
+		**_agent_comment_filters(ticket_name),
+		"creation": [">=", since],
+		"content": ["like", f"{prefix}%"],
+	}
+	if locked_count(ticket_name, "Comment", filters):
+		return _fail(REASON_NOTICE_SENT)
+	return _post(ticket_name, f"{prefix} {body}")
 
 
 def post_comment_tool(args: dict, ctx: ToolContext) -> dict:

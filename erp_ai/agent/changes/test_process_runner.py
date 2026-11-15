@@ -682,6 +682,13 @@ class TestLaunchRestart(FrappeTestCase):
 				run.assert_called_once()
 				self.assertEqual(outcome, (False, class_name))
 
-	def test_error_outside_the_design_list_is_not_swallowed(self):
-		with self.assertRaises(ValueError):
-			self._launch(ValueError("embedded null byte"))
+	def test_unlisted_error_returns_class_name(self):
+		cases = (
+			(ValueError("embedded null byte"), "ValueError"),
+			(subprocess.SubprocessError("popen failed"), "SubprocessError"),
+		)
+		for error, class_name in cases:
+			with self.subTest(class_name):
+				outcome, run = self._launch(error)
+				run.assert_called_once()
+				self.assertEqual(outcome, (False, class_name))

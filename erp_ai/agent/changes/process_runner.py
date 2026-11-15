@@ -159,7 +159,7 @@ def git_unstage_new(repo_root: str, rel_in_repo: str, limit_s: int) -> CommandRe
 def launch_restart() -> tuple[bool, str | None]:
 	"""Start `bench restart` detached in its own session and return at once (design 3.4, 4.4; ADR-040 QĐ 7).
 
-	Never raises for a launch failure: returns (False, <error class name>) and the caller logs it (STD-ERR-1).
+	Never raises: any error returns (False, <error class name>) and the caller logs it (STD-ERR-1).
 	"""
 	try:
 		done = subprocess.run(
@@ -172,7 +172,7 @@ def launch_restart() -> tuple[bool, str | None]:
 			timeout=RESTART_LAUNCH_TIMEOUT_S,
 			start_new_session=True,
 		)
-	except (subprocess.TimeoutExpired, OSError) as error:
+	except Exception as error:
 		return False, type(error).__name__
 	if done.returncode != 0:
 		return False, subprocess.CalledProcessError.__name__

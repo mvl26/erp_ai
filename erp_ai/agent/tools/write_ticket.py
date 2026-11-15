@@ -73,6 +73,25 @@ _GUIDANCE_FLAG = "erp_ai_guidance"
 _ANALYSIS_KEY = "analysis"
 # Runs on a ticket that already has its guidance comment.
 _WORK_ONLY_FLAG = "erp_ai_work_only_runs"
+# The body when the model wrote no analysis (design-w1-fixes-20 Điểm 1.3): the plan line is last, so the work left
+# to a person lands right under it.
+GUIDANCE_FALLBACK = (
+	"**Nhận định:** bot chưa viết được nhận định cho phiếu này.\n"
+	f"**{GUIDANCE_HEADER}:** người phụ trách làm các việc ghi ngay dưới (nếu có); việc bot đã làm và đề xuất chờ "
+	"duyệt nằm ở các mục cuối comment; cần bot làm tiếp thì nhắc @ai."
+)
+# Once per comment, in the heading paragraph of the pending section (design-w1-fixes-20 Điểm 2.1); a trusted constant.
+PENDING_NOTE = (
+	'Nút "Duyệt ngay" nằm ở ngăn "Trao đổi với bot" của phiếu; đề xuất không có nút thì duyệt ở form đề xuất.'
+)
+# The run_failed notice names done, pending and manual lines apart (design-w1-fixes-20 Điểm 3.1).
+FAILURE_DONE = "Trước khi lỗi, bot đã làm: "
+FAILURE_PENDING = "Đề xuất đã tạo, đang chờ duyệt: "
+FAILURE_MANUAL = "Việc người phải làm tay: "
+REASON_GUIDANCE_EXISTS = "phiếu đã có hướng xử lý"
+REASON_NO_CONTENT = "không có nội dung"
+# The plan section ends at the next line opening a `**…:**` heading or the confidence line (Điểm 1.2 bước 2).
+_PLAN_END = re.compile(r"^[ \t]*(?:\*\*[^*\n]+:\*\*|Độ tin cậy:)", re.M)
 
 
 def _fail(reason: str) -> dict:
@@ -223,10 +242,15 @@ def post_comment(args: dict, ctx: ToolContext) -> dict:
 	return _post(ctx.ticket_name, args["content"])
 
 
+def _heading_line(header: str) -> re.Pattern:
+	"""A line opening with the `<header>:` heading, the `**` around it optional (U4b.md:168)."""
+	return re.compile(rf"^[ \t]*(?:\*\*)?{re.escape(header)}:(?:\*\*)?", re.M)
+
+
 def section_text(content: str, header: str) -> str | None:
 	"""The text of the `**<header>:**` section (the `**` may be left out), stripped: the rest of its heading line and
 	the lines after it up to the next line opening with `**…:**`. No line opens with that heading → None."""
-	heading = re.compile(rf"^[ \t]*(?:\*\*)?{re.escape(header)}:(?:\*\*)?", re.M).search(content)
+	heading = _heading_line(header).search(content)
 	if heading is None:
 		return None
 	end = _NEXT_HEADING.search(content, heading.end())
@@ -361,6 +385,73 @@ def close_collector(run_id: str) -> None:
 def mark_work_only(run_id: str) -> None:
 	"""Record a run on a ticket that already has its guidance comment (ADR-036 QĐ 7)."""
 	frappe.flags.setdefault(_WORK_ONLY_FLAG, set()).add(run_id)
+
+
+def _plan_end(text: str) -> int | None:
+	"""The end of the plan section of `text`: the index of the `\\n` before the first line after its heading line that
+	opens a `**…:**` heading or the confidence line; no such line → len(text); no plan heading → None."""
+	heading = _heading_line(GUIDANCE_HEADER).search(text)
+	if heading is None:
+		return None
+	line_end = text.find("\n", heading.end())
+	if line_end < 0:
+		return len(text)
+	stop = _PLAN_END.search(text, line_end + 1)
+	return stop.start() - 1 if stop else len(text)
+
+
+def _items(lines: list[str]) -> str:
+	"""Collected raw lines as a list, each escaped exactly once (AD3-4)."""
+	return "<ul>" + "".join(f"<li>{escape_html(line)}</li>" for line in lines) + "</ul>"
+
+
+def _with_manual_lines(text: str, manual: list[str]) -> str:
+	"""`text` with the work left to a person listed at the end of its plan section; no plan heading → the system adds
+	exactly one (design-w1-fixes-20 Điểm 1.2 bước 2)."""
+	if not manual:
+		return text
+	end = _plan_end(text)
+	if end is None:
+		return f"{text}\n<p><strong>{GUIDANCE_HEADER}:</strong></p>{_items(manual)}"
+	return f"{text[:end]}\n{_items(manual)}{text[end:]}"
+
+
+def post_guidance(ticket_name: str, run_id: str) -> dict:
+	"""The one writer of the ticket's guidance comment (ADR-036 QĐ 1, 4); the runner calls it once, at the end of a
+	guidance run; not a tool. Counted under the ticket lock, so a ticket has at most one. Body (design-w1-fixes-20
+	Điểm 1.2): marker, the model's analysis as written (or the fallback) with the manual lines inside its plan
+	section, then the done and the pending sections; an empty section does not show."""
+	if count_guidance(ticket_name, lock=True):
+		return _fail(REASON_GUIDANCE_EXISTS)
+	analysis, sections = collected(run_id)
+	if not analysis and not any(sections.values()):
+		return _fail(REASON_NO_CONTENT)
+	parts = [GUIDANCE_MARKER, _with_manual_lines(analysis or GUIDANCE_FALLBACK, sections[SECTION_DECIDE])]
+	for section in (SECTION_DONE, SECTION_PENDING):
+		if sections[section]:
+			note = f" {PENDING_NOTE}" if section == SECTION_PENDING else ""
+			parts.append(f"<p><strong>{section}:</strong>{note}</p>{_items(sections[section])}")
+	result = _post(ticket_name, "\n".join(parts))
+	if not result["ok"]:
+		return result
+	return {**result, "counts": {section: len(sections[section]) for section in GUIDANCE_SECTIONS}}
+
+
+def failure_summary(run_id: str) -> str:
+	"""What the run did before it failed, for its run_failed notice (design-w1-fixes-20 Điểm 3.1): one part per
+	non-empty section, done, pending and manual apart, each line escaped once; not collecting → ""."""
+	if not collecting(run_id):
+		return ""
+	sections = collected(run_id)[1]
+	return "\n".join(
+		prefix + "; ".join(escape_html(line) for line in sections[section])
+		for prefix, section in (
+			(FAILURE_DONE, SECTION_DONE),
+			(FAILURE_PENDING, SECTION_PENDING),
+			(FAILURE_MANUAL, SECTION_DECIDE),
+		)
+		if sections[section]
+	)
 
 
 def post_comment_tool(args: dict, ctx: ToolContext) -> dict:

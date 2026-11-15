@@ -16,6 +16,7 @@ from erp_ai.test_utils import keep_agent_settings, make_routing_rules, set_agent
 ANCHOR_TWELVE = datetime(2002, 3, 11, 8, 0)
 ANCHOR_DE = datetime(2002, 4, 8, 8, 0)
 ANCHOR_HOURS = datetime(2002, 5, 6, 8, 0)
+ANCHOR_BOT = datetime(2002, 6, 4, 8, 0)
 REPORT_KEYS = {
 	"new_by_category_priority",
 	"new_list",
@@ -25,6 +26,8 @@ REPORT_KEYS = {
 	"c_missing_ba_note",
 	"cd_missing_task",
 	"de_progress",
+	"bot_actions",
+	"cost_yesterday",
 }
 HUMAN_AGENT = "erpai-test-daily-human@example.com"
 TYPE_PREFIX = "ERPAI-TEST daily "
@@ -81,6 +84,19 @@ def _comment(ticket: str, owner: str, content: str, comment_type: str = "Comment
 
 def _task(ticket: str) -> None:
 	frappe.get_doc({"doctype": "Task", "subject": "ERPAI-TEST daily", "ai_ticket": ticket}).db_insert()
+
+
+def _log(creation: datetime, **values) -> None:
+	"""An ERP AI Log row inserted straight into the database with its `creation` set."""
+	doc = frappe.get_doc(
+		{"doctype": LOG_DOCTYPE, "run_id": "ERPAI-TEST-daily", "entry_type": "skip", **values}
+	)
+	doc.db_insert()
+	frappe.db.set_value(LOG_DOCTYPE, doc.name, "creation", creation, update_modified=False)
+
+
+def _action(tool: str, ok: bool = True) -> dict:
+	return {"tool": tool, "doctype": "HD Ticket", "name": None, "ok": ok}
 
 
 def _names(rows: list[dict], mine: set[str]) -> list[str]:
@@ -420,3 +436,90 @@ class TestBuild(FrappeTestCase):
 		result = daily_report.build_daily_report(anchor)
 
 		self.assertEqual(_names(result["c_missing_ba_note"], {name}), [name])
+
+	def test_empty_due_field_logs_no_warning(self):
+		anchor = ANCHOR_HOURS
+		set_agent_settings(field_due_date="")
+		name = _ticket(
+			"d_empty_due_field", anchor - timedelta(days=2), "D", resolution_by=anchor - timedelta(hours=1)
+		)
+
+		with patch("frappe.logger") as get_logger:
+			result = daily_report.build_daily_report(anchor)
+
+		self.assertEqual(_deadlines(result["overdue"], {name}), {name: anchor - timedelta(hours=1)})
+		self.assertEqual(get_logger.return_value.warning.call_args_list, [])
+
+	def test_bot_actions_and_cost_yesterday(self):
+		anchor = ANCHOR_BOT
+		day = datetime(2002, 6, 3)
+		frappe.db.delete(
+			LOG_DOCTYPE, {"creation": ["between", [day - timedelta(days=1), anchor + timedelta(days=1)]]}
+		)
+		# yesterday, first second: classified and applied with an assignee -> classify and assign
+		_log(day, entry_type="classify", applied=1, predicted_assignee=HUMAN_AGENT, cost_usd=0.1)
+		# classified, applied, no assignee: classify only
+		_log(day + timedelta(hours=9), entry_type="classify", applied=1, cost_usd=0.2)
+		# classified, not applied: neither; its error counts
+		_log(
+			day + timedelta(hours=10),
+			entry_type="classify",
+			applied=0,
+			predicted_assignee=HUMAN_AGENT,
+			error="model timeout",
+			cost_usd=0.000001,
+		)
+		# actions: ok ones by kind (an unknown tool -> other), a failed one not counted
+		_log(
+			day + timedelta(hours=11),
+			entry_type="reason",
+			actions=json.dumps(
+				[
+					_action("create_task"),
+					_action("create_task"),
+					_action("post_comment"),
+					_action("set_priority"),
+					_action("post_comment", ok=False),
+				]
+			),
+		)
+		# unreadable actions count as none; a blank error is no error
+		_log(day + timedelta(hours=12), entry_type="reason", actions="not json", error="  ")
+		# change steps: propose x2, approve, reject; other steps not counted
+		for step in ("propose", "propose", "approve", "reject", "apply", "undo"):
+			_log(day + timedelta(hours=13), entry_type="change", trigger="change_action", change_step=step)
+		# last second of yesterday
+		_log(day + timedelta(hours=23, minutes=59, seconds=59), entry_type="classify", applied=1)
+		# outside yesterday: the day before, and today before the anchor
+		for creation in (day - timedelta(seconds=1), day + timedelta(days=1)):
+			_log(
+				creation,
+				entry_type="classify",
+				applied=1,
+				predicted_assignee=HUMAN_AGENT,
+				error="outside",
+				cost_usd=5.0,
+				actions=json.dumps([_action("create_task")]),
+			)
+			_log(creation, entry_type="change", trigger="change_action", change_step="propose")
+
+		result = daily_report.build_daily_report(anchor)
+
+		self.assertEqual(daily_report.ACTION_KIND_BY_TOOL, {"create_task": "Task", "post_comment": "comment"})
+		self.assertEqual(
+			result["bot_actions"],
+			{
+				"phân loại": 3,
+				"gán": 1,
+				"Task": 2,
+				"comment": 1,
+				"trả lời": 0,
+				"đóng": 0,
+				"đề xuất chờ duyệt": 2,
+				"đã duyệt": 1,
+				"bị từ chối": 1,
+				"lỗi": 1,
+				"khác": 1,
+			},
+		)
+		self.assertEqual(result["cost_yesterday"], 0.300001)

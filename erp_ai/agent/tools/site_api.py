@@ -40,8 +40,9 @@ PERMISSION_DOCTYPES = frozenset(
 	}
 )
 # Closed to these tools in every mode: a Deleted Document holds a whole deleted record, a ticket of an excluded team
-# and its content included (R10b).
-RECORD_DENIED_DOCTYPES = frozenset({"Deleted Document"})
+# and its content included (R10b); product code never reads Version (ADR-024 Ràng buộc 1), so it is refused rather
+# than filtered (R10e).
+RECORD_DENIED_DOCTYPES = frozenset({"Deleted Document", "Version"})
 PROPERTY_SETTER_DOCTYPE = "Property Setter"
 CUSTOM_FIELD_DOCTYPE = "Custom Field"
 PERMLEVEL_PROPERTY = "permlevel"
@@ -54,7 +55,7 @@ SCHEMA_FIELDS = {
 	CUSTOM_FIELD_DOCTYPE: ("dt", "fieldname", "fieldtype", "options", "permlevel"),
 }
 TICKET_LINK_SCHEMA_REASON = "Custom Field / Property Setter đổi trường liên kết tới phiếu là gỡ chặn phiếu loại trừ, không làm qua công cụ"
-# Changing these on a field of policy.ticket_link_columns takes it out of the exclusion (R10c): refused in every
+# Changing these on a field of policy.link_column_names takes it out of the exclusion (R10c): refused in every
 # mode. Moving a Custom Field to another DocType or fieldname takes its Link away too.
 TICKET_LINK_PROPERTIES = ("fieldtype", "options")
 CUSTOM_FIELD_TARGET_KEYS = ("dt", "fieldname")
@@ -253,18 +254,17 @@ def permlevel_refusal(doctype: str, values: dict, *, name: str | None = None) ->
 
 
 def _points_at_ticket(doctype, fieldname) -> bool:
-	"""`fieldname` is a column of policy.ticket_link_columns(doctype), compared by _key."""
+	"""`fieldname` is a column of policy.link_column_names(doctype), compared by _key."""
 	if not isinstance(doctype, str) or not doctype or fieldname in EMPTY_VALUES:
 		return False
-	columns = policy.ticket_link_columns(doctype)
-	return _key(fieldname) in {_key(column) for pair in columns for column in pair if column}
+	return _key(fieldname) in {_key(column) for column in policy.link_column_names(doctype)}
 
 
 def ticket_link_schema_refusal(
 	doctype: str, values: dict, *, name: str | None = None, delete: bool = False
 ) -> str | None:
 	"""TICKET_LINK_SCHEMA_REASON when the write would change the fieldtype or options of a field that points at a
-	ticket (policy.ticket_link_columns), or move, rename or delete its Custom Field (R10c), else None. Same
+	ticket (policy.link_column_names), or move, rename or delete its Custom Field (R10c), else None. Same
 	mechanism as permlevel_refusal: a Property Setter is refused when it sets, or (`name` given) already sets, a
 	property of TICKET_LINK_PROPERTIES on such a field; a Custom Field of such a field, before or after the write,
 	on `delete` or when a key of TICKET_LINK_PROPERTIES or CUSTOM_FIELD_TARGET_KEYS holds another value than the
@@ -428,31 +428,16 @@ def _excluded_refusal(doctype: str, name) -> dict | None:
 	return None
 
 
-def _linked_tickets(columns, values: dict) -> list[str]:
-	"""Names of the tickets `values` point at, over the `(type column, name column)` pairs of
-	policy.ticket_link_columns; the type is compared by its stored DocType name."""
-	tickets = []
-	for type_column, name_column in columns:
-		ticket = values.get(name_column)
-		if ticket in EMPTY_VALUES:
-			continue
-		if type_column and _stored_name(DOCTYPE_DOCTYPE, values.get(type_column)) != policy.TICKET_DOCTYPE:
-			continue
-		tickets.append(str(ticket))
-	return tickets
-
-
 def _link_refusal(doctype: str, values: dict, name=None) -> dict | None:
-	"""C-7, in every mode: `values` would link the record to a ticket that fails can_send_ticket. On an update
+	"""C-7, in every mode: `values` would link the record to a ticket that fails can_send_ticket, directly or
+	through a record of policy.TICKET_PARENT_DOCTYPES (R10h: policy.linked_tickets, as on read). On an update
 	(`name` given) the stored value stands in for each link column `values` does not set."""
-	pairs = policy.ticket_link_columns(doctype)
-	columns = [column for pair in pairs for column in pair if column]
+	columns = policy.link_column_names(doctype)
 	if not any(column in values for column in columns):
 		return None
 	stored = frappe.db.get_value(doctype, name, columns, as_dict=True) if name is not None else None
-	if any(
-		not policy.can_send_ticket(ticket) for ticket in _linked_tickets(pairs, {**(stored or {}), **values})
-	):
+	tickets = policy.linked_tickets(doctype, {**(stored or {}), **values})
+	if any(not policy.can_send_ticket(ticket) for ticket in tickets):
 		return _fail(policy.EXCLUDED_TICKET_REASON, doctype)
 	return None
 

@@ -423,33 +423,58 @@ def is_ticket_content_doctype(doctype: str) -> bool:
 
 
 EXCLUDED_TICKET_REASON = "bản ghi thuộc phiếu không được phép đưa cho AI"
-# DocType that names its ticket by a (type column, name column) pair -> the pair.
+# DocType that names its ticket by (type column, name column) pairs -> the pairs, each enough alone.
 TICKET_LINK_FIELDS = {
-	"Comment": ("reference_doctype", "reference_name"),
-	"Communication": ("reference_doctype", "reference_name"),
-	"File": ("attached_to_doctype", "attached_to_name"),
-	# R10b: column names of the installed DocType JSON (the Version pair waits on ADR-024, which bars reading it).
-	"ToDo": ("reference_type", "reference_name"),
-	"Notification Log": ("document_type", "document_name"),
-	"Activity Log": ("reference_doctype", "reference_name"),
-	"Email Queue": ("reference_doctype", "reference_name"),
+	"Comment": (("reference_doctype", "reference_name"),),
+	"Communication": (("reference_doctype", "reference_name"),),
+	"File": (("attached_to_doctype", "attached_to_name"),),
+	# R10b, R10g: column names of the installed DocType JSON, every pair of the DocType. Version is refused by the
+	# record tool instead (R10e).
+	"ToDo": (("reference_type", "reference_name"),),
+	"Notification Log": (("document_type", "document_name"), ("source_doctype", "source_name")),
+	"Activity Log": (
+		("reference_doctype", "reference_name"),
+		("timeline_doctype", "timeline_name"),
+		("link_doctype", "link_name"),
+	),
+	"Email Queue": (("reference_doctype", "reference_name"),),
 }
 # Records of a ticket that hold records of their own (R10a): Helpdesk keeps comment attachments on the Comment and
 # email attachments on the Communication, and Frappe points an "Attachment" Comment at its Comment. A record whose
-# dynamic pair names one of them belongs to that record's tickets (one hop, no deeper). Helpdesk's legacy note
-# DocType waits on D8, which bars naming it.
+# dynamic pair or Link (R10g: Email Queue's `communication`) names one of them belongs to that record's tickets (one
+# hop, no deeper). Helpdesk's legacy note DocType is a known gap (R10f): D8 bars naming it.
 TICKET_PARENT_DOCTYPES = ("Comment", "Communication")
+# Column values that name no record.
+EMPTY_LINK_VALUES = (None, "", [])
 
 
 def ticket_link_columns(doctype: str) -> tuple[tuple[str | None, str], ...]:
-	"""Every column that points a record of this DocType at a ticket: the dynamic pair of TICKET_LINK_FIELDS
+	"""Every column that points a record of this DocType at a ticket: the dynamic pairs of TICKET_LINK_FIELDS
 	(if any) plus `(None, fieldname)` for each Link to HD Ticket; () for HD Ticket and for a missing DocType.
 	The one reader of TICKET_LINK_FIELDS (C-U2-1)."""
 	name = _stored_doctype_name(doctype)
 	if not name or name == TICKET_DOCTYPE:
 		return ()
-	pair = TICKET_LINK_FIELDS.get(name)
-	return (*((pair,) if pair else ()), *((None, field) for field in ticket_link_fieldnames(name)))
+	return (*TICKET_LINK_FIELDS.get(name, ()), *((None, field) for field in ticket_link_fieldnames(name)))
+
+
+def parent_link_fields(doctype: str) -> tuple[tuple[str, str], ...]:
+	"""`(fieldname, DocType)` of each field of this DocType (Custom Fields included, meta order) that Links to a
+	DocType of TICKET_PARENT_DOCTYPES (R10g); () for a missing DocType."""
+	name = _stored_doctype_name(doctype)
+	if not name:
+		return ()
+	return tuple(
+		(field.fieldname, field.options)
+		for field in frappe.get_meta(name).fields
+		if field.fieldtype == "Link" and field.options in TICKET_PARENT_DOCTYPES
+	)
+
+
+def link_column_names(doctype: str) -> list[str]:
+	"""Every column of ticket_link_columns and parent_link_fields of this DocType, each once, in that order."""
+	columns = [column for pair in ticket_link_columns(doctype) for column in pair if column]
+	return list(dict.fromkeys([*columns, *(field for field, _parent in parent_link_fields(doctype))]))
 
 
 def _excluded_parent_names(names: list) -> list:
@@ -464,27 +489,51 @@ def _excluded_parent_names(names: list) -> list:
 	return list(dict.fromkeys(found))
 
 
+def _rows_naming(doctype: str, pairs, owners: list) -> list:
+	"""Names of the rows of this DocType whose type column, for one of the dynamic `pairs`, is HD Ticket or a DocType
+	of TICKET_PARENT_DOCTYPES and whose name column is one of `owners`."""
+	rows = []
+	for type_column, name_column in pairs:
+		filters = {
+			type_column: ["in", [TICKET_DOCTYPE, *TICKET_PARENT_DOCTYPES]],
+			name_column: ["in", owners],
+		}
+		rows.extend(frappe.get_all(doctype, filters=filters, pluck="name"))
+	return list(dict.fromkeys(rows))
+
+
 def ticket_content_filters(doctype: str) -> tuple[list, list]:
 	"""`(filters, or_filters)` for frappe.get_list that hide the records of excluded tickets; ([], []) when no
-	column of the DocType points at a ticket (ticket_link_columns) or no ticket is excluded. The OR group keeps a
-	row whose dynamic pair names neither a ticket nor a record of TICKET_PARENT_DOCTYPES, or names one that is
-	neither an excluded ticket nor a record of one (R10a)."""
+	column of the DocType points at a ticket (ticket_link_columns, parent_link_fields) or no ticket is excluded.
+	The OR group keeps a row whose first dynamic pair names neither a ticket nor a record of TICKET_PARENT_DOCTYPES,
+	or names one that is neither an excluded ticket nor a record of one (R10a). get_list takes one OR group, so the
+	rows another pair points at one of those are left out by name, and a Link to a DocType of
+	TICKET_PARENT_DOCTYPES must name none of those records (R10g)."""
 	name = _stored_doctype_name(doctype)
 	columns = ticket_link_columns(name) if name else ()
-	if not (name == TICKET_DOCTYPE or columns) or not (names := excluded_ticket_names()):
+	parents = parent_link_fields(name) if name else ()
+	if not (name == TICKET_DOCTYPE or columns or parents) or not (names := excluded_ticket_names()):
 		return [], []
 	if name == TICKET_DOCTYPE:
 		return [["name", "not in", names]], []
-	filters, or_filters = [], []
-	for type_column, name_column in columns:
-		if type_column:
-			owners = [*names, *_excluded_parent_names(names)]
-			or_filters = [
-				[type_column, "not in", [TICKET_DOCTYPE, *TICKET_PARENT_DOCTYPES]],
-				[name_column, "not in", owners],
-			]
-		else:
-			filters.append([name_column, "not in", names])
+	filters = [[name_column, "not in", names] for type_column, name_column in columns if not type_column]
+	pairs = [pair for pair in columns if pair[0]]
+	if not (pairs or parents):
+		return filters, []
+	parent_names = _excluded_parent_names(names)
+	owners = [*names, *parent_names]
+	or_filters = []
+	if pairs:
+		(type_column, name_column), *others = pairs
+		or_filters = [
+			[type_column, "not in", [TICKET_DOCTYPE, *TICKET_PARENT_DOCTYPES]],
+			[name_column, "not in", owners],
+		]
+		if rows := _rows_naming(name, others, owners):
+			filters.append(["name", "not in", rows])
+	# An empty `not in` list would hide every empty Link (frappe compares ifnull(column, '') with '').
+	if parent_names:
+		filters.extend([field, "not in", parent_names] for field, _parent in parents)
 	return filters, or_filters
 
 
@@ -495,22 +544,25 @@ def _doctype_of(value) -> str | None:
 	return _stored_doctype_name(value) if isinstance(value, str) and value else None
 
 
+def _records_named(doctype: str, values) -> list[tuple[str, str]]:
+	"""`(DocType, name)` of each record that `values` (columns of a record of this DocType, stored or about to be
+	written) name over link_column_names: HD Ticket for a static Link of ticket_link_columns, the type column's
+	DocType for a dynamic pair, the Link's DocType for one of parent_link_fields. Names as text."""
+	named = [
+		(_doctype_of(values.get(type_column)) if type_column else TICKET_DOCTYPE, values.get(name_column))
+		for type_column, name_column in ticket_link_columns(doctype)
+	]
+	named += [(parent, values.get(field)) for field, parent in parent_link_fields(doctype)]
+	return [(kind, str(linked)) for kind, linked in named if kind and linked not in EMPTY_LINK_VALUES]
+
+
 def _linked_records(doctype: str, name) -> list[tuple[str, str]]:
-	"""`(DocType, name)` of each record the stored record names over the columns of ticket_link_columns: HD Ticket
-	for a static Link, the type column's DocType for a dynamic pair."""
-	columns = ticket_link_columns(doctype)
-	if not columns:
+	"""_records_named of the stored record."""
+	fields = link_column_names(doctype)
+	if not fields:
 		return []
-	fields = list(dict.fromkeys(column for pair in columns for column in pair if column))
 	values = frappe.db.get_value(doctype, name, fields, as_dict=True)
-	if not values:
-		return []
-	records = []
-	for type_column, name_column in columns:
-		kind = _doctype_of(values.get(type_column)) if type_column else TICKET_DOCTYPE
-		if kind and (linked := values.get(name_column)):
-			records.append((kind, linked))
-	return records
+	return _records_named(doctype, values) if values else []
 
 
 def _tickets_of(kind: str, linked) -> list:
@@ -523,15 +575,25 @@ def _tickets_of(kind: str, linked) -> list:
 	return []
 
 
+def _tickets_named(records) -> list[str]:
+	"""The tickets the `(DocType, name)` records stand for (_tickets_of), first seen first."""
+	return list(dict.fromkeys(ticket for kind, record in records for ticket in _tickets_of(kind, record)))
+
+
+def linked_tickets(doctype: str, values) -> list[str]:
+	"""Names of the tickets `values` (columns of a record of this DocType about to be written) point at, the same
+	way as a stored record (R10h)."""
+	return _tickets_named(_records_named(doctype, values))
+
+
 def _owning_tickets(doctype: str, name: str) -> list[str]:
-	"""Names of the tickets this record points at, over every column of ticket_link_columns, first seen first."""
+	"""Names of the tickets this record points at, over every column of link_column_names, first seen first."""
 	stored = _stored_doctype_name(doctype)
 	if not stored or not name:
 		return []
 	if stored == TICKET_DOCTYPE:
 		return [name] if frappe.db.exists(TICKET_DOCTYPE, name) else []
-	linked = _linked_records(stored, name)
-	return list(dict.fromkeys(ticket for kind, record in linked for ticket in _tickets_of(kind, record)))
+	return _tickets_named(_linked_records(stored, name))
 
 
 def owning_ticket(doctype: str, name: str) -> str | None:

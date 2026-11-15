@@ -4,7 +4,7 @@ import time
 import uuid
 
 import frappe
-from frappe.utils import get_fullname
+from frappe.utils import get_fullname, now_datetime
 
 from erp_ai import gateway
 from erp_ai.agent import authority, policy, site_facts
@@ -12,6 +12,7 @@ from erp_ai.agent.answer_delay import AnswerDelay
 from erp_ai.agent.authority import TITLE_WRONG_USER as TITLE_WRONG_USER  # re-export, U1.md:264
 from erp_ai.agent.classification import load_mapping, parse_classification
 from erp_ai.agent.prompts import (
+	TICKET_FIELD_LABELS,
 	build_classify_request,
 	build_initial_message,
 	build_reason_system,
@@ -36,9 +37,16 @@ from erp_ai.agent.tools.route_ticket import (
 	create_routed_task,
 	post_routing_comment,
 )
-from erp_ai.agent.tools.write_ticket import HINT_FIELD
+from erp_ai.agent.tools.write_ticket import (
+	CREATED_LABELS_FIELD,
+	HINT_FIELD,
+	created_labels,
+	keep_human_fields,
+)
 from erp_ai.constants import (
 	AGENT_USER,
+	CLASSIFICATION_FIELDS,
+	CLASSIFIED_BY_HUMAN,
 	JOB_SAFETY_MARGIN_S,
 	JOB_TIMEOUT_S,
 	LEVELS,
@@ -104,6 +112,8 @@ ROUTE_UNIT_SAVEPOINT = "erp_ai_route_unit"
 # Set right after each reason turn's model call: a failing turn is undone to here (ADR-024 QĐ 2).
 REASON_TURN_SAVEPOINT = "erp_ai_reason_turn"
 USAGE_COLUMNS = ("input_tokens", "output_tokens", "cache_creation_input_tokens", "cache_read_input_tokens")
+# The settings naming an HD Ticket field (U4b.md:209, AC-24): "field_<key>" for each key of the prompt labels.
+TICKET_FIELD_SETTINGS = tuple(f"field_{key}" for key in TICKET_FIELD_LABELS)
 
 
 def run_for_ticket(ticket_name: str, trigger: str, comment_name: str | None = None) -> None:
@@ -141,6 +151,12 @@ def _run(ticket_name, trigger, comment_name=None):
 	routing = load_routing_config(settings.routing_rules)
 
 	run_id = uuid.uuid4().hex
+	field_map, missing = _ticket_fields(settings)
+	if missing:
+		# one line per run, configuration names only (AC-24)
+		frappe.logger(LOGGER_NAME).info(
+			"erp_ai ticket_fields run_id=%s missing=%s", run_id, "; ".join(missing)
+		)
 	# (c) the single send condition, re-checked at run time (NFR-4)
 	if not policy.can_send_ticket(ticket_name):
 		_log_skip(ticket_name, trigger, run_id, "not_sendable")
@@ -170,12 +186,16 @@ def _run(ticket_name, trigger, comment_name=None):
 		mapping = load_mapping(settings.category_mapping)
 		# One context for the whole run (classification and reasoning); never built at L0, which calls no tool.
 		context = None
+		classification = None
 		if level != LEVELS[0]:
 			instructor = authority.run_instructor(ticket_name, trigger, comment_name)
 			# An insert run has no classification yet: `_classify` recomputes both from its own (U1.md:261).
 			category, pct = (None, None)
 			if trigger != TRIGGER_TICKET_INSERT:
 				category, pct = policy.latest_classification(ticket_name)
+				if category is not None:
+					# the reasoning step knows the earlier classification, the same pair (U4b.md:238, Fix 12)
+					classification = {"category": category, "confidence_pct": pct}
 			context = ToolContext(
 				ticket_name=ticket_name,
 				effective_level=level,
@@ -194,7 +214,6 @@ def _run(ticket_name, trigger, comment_name=None):
 				main_path_level=policy.main_path_level(settings, level, category),
 				below_threshold=_below_threshold(pct, threshold, instructor, switches.act_now),
 			)
-		classification = None
 		if trigger == TRIGGER_TICKET_INSERT:
 			proceed, classification, context = _classify(
 				ticket_name,
@@ -208,13 +227,55 @@ def _run(ticket_name, trigger, comment_name=None):
 				status,
 				settings,
 				threshold,
+				field_map,
 			)
 			if not proceed:
 				return
 		if level != LEVELS[0]:
-			_reason(ticket_name, trigger, run_id, settings, context, classification, deadline, status, delay)
+			_reason(
+				ticket_name,
+				trigger,
+				run_id,
+				settings,
+				context,
+				classification,
+				deadline,
+				status,
+				delay,
+				field_map=field_map,
+			)
 	finally:
 		_end_status(status, delay, ticket_name, run_id, trigger)
+
+
+def _ticket_fields(settings) -> tuple[dict[str, str], list[str]]:
+	"""The configured ticket fields still on HD Ticket as {key: fieldname}, and why each other one is left out (AC-24).
+
+	A setting saved once and then the field removed from the ticket is left out like an empty one: the run goes on.
+	"""
+	meta = frappe.get_meta("HD Ticket")
+	field_map, missing = {}, []
+	for (key, label), setting in zip(TICKET_FIELD_LABELS.items(), TICKET_FIELD_SETTINGS, strict=True):
+		fieldname = (settings.get(setting) or "").strip()
+		if not fieldname:
+			missing.append(f"chưa cấu hình trường {label}")
+		elif not meta.has_field(fieldname):
+			missing.append(f"trường {fieldname} không có trên phiếu")
+		else:
+			field_map[key] = fieldname
+	return field_map, missing
+
+
+def _ticket_field_values(ticket_name: str, field_map: dict[str, str]) -> dict[str, object]:
+	"""{key: value} of the configured ticket fields that hold a value, in one read of the ticket (U4b.md:235)."""
+	if not field_map:
+		return {}
+	row = frappe.db.get_value("HD Ticket", ticket_name, list(field_map.values()), as_dict=True) or {}
+	return {
+		key: row.get(fieldname)
+		for key, fieldname in field_map.items()
+		if row.get(fieldname) not in (None, "")
+	}
 
 
 def _below_threshold(pct, threshold, instructor, act_now):
@@ -289,21 +350,41 @@ def _classify(
 	status,
 	settings,
 	threshold,
+	field_map,
 ):
 	"""Classification step (design 4.3 step 6). Writes one `classify` entry; with a context (L1+) recomputes its
 	main-path level and below-threshold flag from the classification, then routes only at the threshold or above.
+
+	The request carries the configured ticket fields (AC-24). The route leaves out the fields the person typed at
+	creation, while the entry keeps the model's prediction and names the typed set (AC-19, AC-21, A-U4b-2).
 
 	Returns `(proceed, classification, context)`: `proceed` is False when the run must end here (gateway error);
 	`classification` is the summary handed to the reasoning step, or None when nothing was classified;
 	`context` is the one the reasoning step uses (recomputed when a classification was parsed).
 	"""
-	subject, description = frappe.db.get_value("HD Ticket", ticket_name, ["subject", "description"])
+	ticket = frappe.db.get_value(
+		"HD Ticket",
+		ticket_name,
+		[
+			"subject",
+			"description",
+			"creation",
+			"ai_classified_by",
+			CREATED_LABELS_FIELD,
+			*CLASSIFICATION_FIELDS,
+		],
+		as_dict=True,
+	)
+	subject = ticket.subject
+	field_values = _ticket_field_values(ticket_name, field_map)
 	base = {"ticket": ticket_name, "run_id": run_id, "entry_type": "classify", "trigger": trigger, "turn": 0}
 	status.working(CLASSIFY_STEP)
 	try:
 		result = _call_model(
 			"classify",
-			**build_classify_request(subject, description, departments(routing)),
+			**build_classify_request(
+				subject, ticket.description, departments(routing), ticket_fields=field_values
+			),
 			max_tokens=CLASSIFY_MAX_TOKENS,
 			deadline=deadline,
 		)
@@ -315,6 +396,7 @@ def _classify(
 			credential_label=exc.credential_label,
 			keys_tried=exc.keys_tried,
 		)
+		_log_classify(ticket_name, run_id, False, ticket.creation)
 		return False, None, context
 
 	call_fields = _call_fields(result)
@@ -322,6 +404,7 @@ def _classify(
 	if classification is None:
 		error = "; ".join([UNPARSEABLE_ERROR, *status.take_errors()])
 		write_entry(**base, **call_fields, error=error, stop_reason="unparseable")
+		_log_classify(ticket_name, run_id, False, ticket.creation)
 		return True, None, context
 
 	decision = decide_route(
@@ -333,11 +416,24 @@ def _classify(
 		is_excluded_team=policy.is_excluded_team,
 		is_active_agent=site_facts.is_active_agent,
 	)
+	labels = created_labels(ticket.get(CREATED_LABELS_FIELD))
+	# a broken record reads as all three typed (fail-closed): no value of it is a typed one
+	typed = {field: value for field, value in labels.items() if value is not True}
+	if len(typed) < len(labels):
+		frappe.logger(LOGGER_NAME).warning("erp_ai created_labels invalid ticket=%s", ticket_name)
+	route_decision = keep_human_fields(decision, labels)
+	# `predicted_*` stay the model's own prediction (AC-19); the route gets the decision without the typed fields
 	values = {
 		"ticket_type": decision.ticket_type,
 		"agent_group": decision.agent_group,
 		"priority": decision.priority,
 	}
+	# A-U4b-4: the ticket is Người before this row; the fields it holds are the person's label of the prediction
+	corrected = (
+		json.dumps({field: ticket.get(field) for field in CLASSIFICATION_FIELDS})
+		if ticket.ai_classified_by == CLASSIFIED_BY_HUMAN
+		else None
+	)
 	# The entry is written first with applied=0 and committed before the ticket is touched (D-20).
 	log_name = write_entry(
 		**base,
@@ -361,8 +457,11 @@ def _classify(
 		predicted_importance=classification.importance,
 		predicted_score_reason=classification.score_reason or NO_SCORE_REASON,
 		predicted_assignee=decision.assignee,
+		created_labels=json.dumps(typed, ensure_ascii=False, sort_keys=True) if typed else None,
+		human_corrected_to=corrected,
 		applied=0,
 	)
+	_log_classify(ticket_name, run_id, True, ticket.creation)
 	if context is not None:
 		context = dataclasses.replace(
 			context,
@@ -375,9 +474,20 @@ def _classify(
 		)
 		if not context.below_threshold:
 			status.working("set_classification")
-			_route(log_name, classification, decision, context, auto_assign, subject)
+			_route(log_name, classification, route_decision, context, auto_assign, subject)
 	summary = {"category": classification.category, "confidence": classification.confidence, **values}
 	return True, summary, context
+
+
+def _log_classify(ticket_name, run_id, ok, created) -> None:
+	"""AC-17: one line per classification, codes and numbers only: the seconds from the ticket's creation."""
+	frappe.logger(LOGGER_NAME).info(
+		"erp_ai classify ticket=%s run_id=%s ok=%d latency_s=%d",
+		ticket_name,
+		run_id,
+		1 if ok else 0,
+		int((now_datetime() - created).total_seconds()),
+	)
 
 
 def _route(log_name, classification, decision, context, auto_assign, subject):
@@ -666,8 +776,13 @@ def _routing_table(context) -> str:
 	return build_routing_table(context.category_mapping, routing, names)
 
 
-def _reason(ticket_name, trigger, run_id, settings, context, classification, deadline, status, delay):
-	"""Reasoning step (design 4.3 step 8): at most `max_turns_per_run` model turns, one `reason` entry each."""
+def _reason(
+	ticket_name, trigger, run_id, settings, context, classification, deadline, status, delay, field_map=None
+):
+	"""Reasoning step (design 4.3 step 8): at most `max_turns_per_run` model turns, one `reason` entry each.
+
+	The first message carries the configured ticket fields that hold a value as data (AC-24, U4b.md:249).
+	"""
 	comments = authority.fetch_ticket_comments(ticket_name)
 	# the role is decided on the owner; only then is the author replaced by the full name shown to the model
 	labelled = [
@@ -693,7 +808,13 @@ def _reason(ticket_name, trigger, run_id, settings, context, classification, dea
 		act_now=granted.act_now_block,
 		ask_only=granted.ask_only_block,
 	)
-	messages = [{"role": "user", "content": build_initial_message(ticket, labelled, trigger, classification)}]
+	fields = _ticket_field_values(ticket_name, field_map or {})
+	messages = [
+		{
+			"role": "user",
+			"content": build_initial_message(ticket, labelled, trigger, classification, ticket_fields=fields),
+		}
+	]
 	base = {
 		"ticket": ticket_name,
 		"run_id": run_id,

@@ -11,7 +11,7 @@ import re
 import frappe
 from frappe.model import table_fields
 from frappe.model.base_document import BaseDocument
-from frappe.utils import strip_html
+from frappe.utils import cint, strip_html
 
 from erp_ai.agent import policy
 from erp_ai.agent.tools import read
@@ -30,6 +30,12 @@ DOCTYPE_DOCTYPE = "DocType"
 PERMISSION_DOCTYPES = frozenset(
 	{"Custom Role", "Custom DocPerm", DOCTYPE_DOCTYPE, ROLE_DOCTYPE, "User Permission", "DocShare"}
 )
+PROPERTY_SETTER_DOCTYPE = "Property Setter"
+CUSTOM_FIELD_DOCTYPE = "Custom Field"
+PERMLEVEL_PROPERTY = "permlevel"
+PERMLEVEL_REASON = "Property Setter đổi permlevel là sửa phân quyền, không làm qua công cụ"
+# Setting a field's permlevel changes permissions too (AC-5, C-6): refused unless the unrestricted switch is on.
+PERMLEVEL_DOCTYPES = (PROPERTY_SETTER_DOCTYPE, CUSTOM_FIELD_DOCTYPE)
 # Roles that would let an account command the bot or administer the site; never assignable here.
 FORBIDDEN_ROLES = frozenset({"System Manager", "Administrator", ROLE_INSTRUCTOR, ROLE_AGENT, "Guest", "All"})
 PROTECTED_USERS = frozenset({"Administrator", "Guest", AGENT_USER})
@@ -185,6 +191,37 @@ def _values_refusal(doctype: str, values: dict, ctx: ToolContext) -> dict | None
 	forbidden = sorted(role for role in stored_roles if _named_in(role, FORBIDDEN_ROLES))
 	if forbidden:
 		return _fail(f"vai trò không được gán qua công cụ: {', '.join(forbidden)}", doctype)
+	return None
+
+
+def _is_permlevel(text) -> bool:
+	return str(text).strip().casefold() == PERMLEVEL_PROPERTY
+
+
+def permlevel_refusal(doctype: str, values: dict, *, name: str | None = None) -> str | None:
+	"""PERMLEVEL_REASON when `values` would set a field's permlevel (C-6), else None. A Property Setter is refused
+	when it sets `permlevel`, or (`name` given) already does; a Custom Field when a permlevel key holds another
+	level than the stored one (0 for a new field)."""
+	if _named_in(doctype, (PROPERTY_SETTER_DOCTYPE,)):
+		stored = frappe.db.get_value(PROPERTY_SETTER_DOCTYPE, name, "property") if name is not None else None
+		if _is_permlevel(values.get("property", "")) or (stored is not None and _is_permlevel(stored)):
+			return PERMLEVEL_REASON
+		return None
+	if _named_in(doctype, (CUSTOM_FIELD_DOCTYPE,)):
+		levels = [cint(value) for key, value in values.items() if _is_permlevel(key)]
+		stored = 0
+		if levels and name is not None:
+			stored = cint(frappe.db.get_value(CUSTOM_FIELD_DOCTYPE, name, "permlevel"))
+		if any(level != stored for level in levels):
+			return PERMLEVEL_REASON
+	return None
+
+
+def _permlevel_refusal(doctype: str, name, values: dict, ctx: ToolContext) -> dict | None:
+	if ctx.unrestricted:
+		return None
+	if reason := permlevel_refusal(doctype, values, name=name):
+		return _fail(reason, doctype)
 	return None
 
 
@@ -351,6 +388,7 @@ def create_record(args: dict, ctx: ToolContext) -> dict:
 	if refusal := (
 		_doctype_refusal(doctype, ctx)
 		or _values_refusal(doctype, values, ctx)
+		or _permlevel_refusal(doctype, None, values, ctx)
 		or _link_refusal(doctype, values)
 	):
 		return refusal
@@ -366,7 +404,11 @@ def create_record(args: dict, ctx: ToolContext) -> dict:
 
 def update_record(args: dict, ctx: ToolContext) -> dict:
 	doctype, name, values = _stored_name(DOCTYPE_DOCTYPE, args["doctype"]), args["name"], args["values"]
-	if refusal := _doctype_refusal(doctype, ctx) or _values_refusal(doctype, values, ctx):
+	if refusal := (
+		_doctype_refusal(doctype, ctx)
+		or _values_refusal(doctype, values, ctx)
+		or _permlevel_refusal(doctype, name, values, ctx)
+	):
 		return refusal
 	if "name" in values:
 		return _fail("không đổi tên bản ghi qua công cụ: name", doctype)

@@ -3113,7 +3113,8 @@ class TestRunnerGrant(RunnerTestBase):
 			entry_type="classify",
 			trigger="ticket_insert",
 			turn=0,
-			predicted_category="A",
+			# outside CATEGORIES (as for the base): main_path_level reads no level_cap_<x> of the shared site
+			predicted_category=SEEDED_CLASSIFICATION[0],
 			predicted_confidence_pct=confidence_pct,
 		)
 		self.gateway.results = [

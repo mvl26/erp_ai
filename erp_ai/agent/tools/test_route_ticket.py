@@ -1,3 +1,5 @@
+import ast
+from pathlib import Path
 from unittest.mock import patch
 
 import frappe
@@ -298,6 +300,73 @@ class TestApplyRoute(RouteTicketTestCase):
 		self.assertEqual(
 			set(result["after"]), {"ai_confidence", "ai_complexity", "ai_importance", "ai_score_reason"}
 		)
+
+
+PCT_FIELD = "ai_confidence_pct"
+PCT_WRITERS = {"agent/tools/route_ticket.py", "install.py"}
+SETTER_NAMES = {"set", "db_set", "set_value"}
+
+
+def _pct_writes(source: str) -> list[int]:
+	"""Line numbers where `source` assigns `ai_confidence_pct` (design Fix 5 checkable constraint)."""
+	lines = []
+	for node in ast.walk(ast.parse(source)):
+		if isinstance(node, ast.keyword) and node.arg == PCT_FIELD:
+			lines.append(node.value.lineno)
+		elif isinstance(node, ast.Attribute) and node.attr == PCT_FIELD and isinstance(node.ctx, ast.Store):
+			lines.append(node.lineno)
+		elif isinstance(node, ast.Dict):
+			lines.extend(
+				key.lineno for key in node.keys if isinstance(key, ast.Constant) and key.value == PCT_FIELD
+			)
+		elif (
+			isinstance(node, ast.Call)
+			and isinstance(node.func, ast.Attribute | ast.Name)
+			and getattr(node.func, "attr", getattr(node.func, "id", None)) in SETTER_NAMES
+		):
+			lines.extend(
+				arg.lineno for arg in node.args if isinstance(arg, ast.Constant) and arg.value == PCT_FIELD
+			)
+	return sorted(lines)
+
+
+class TestConfidencePct(RouteTicketTestCase):
+	def test_apply_route_writes_confidence_pct(self):
+		ticket = self._ticket()
+		result = self._apply_as_agent(ticket, classification=self._classification(confidence_pct=85))
+		self.assertTrue(result["ok"], result)
+		self.assertEqual(result["after"].get(PCT_FIELD), 85)
+		self.assertIn(PCT_FIELD, result["before"])
+		self.assertIsNone(result["before"][PCT_FIELD])
+		self.assertEqual(frappe.db.get_value("HD Ticket", ticket, PCT_FIELD), 85)
+
+	def test_human_classified_pct_not_written(self):
+		ticket = self._ticket()
+		frappe.db.set_value("HD Ticket", ticket, "ai_classified_by", CLASSIFIED_BY_HUMAN)
+		result = self._apply_as_agent(ticket, classification=self._classification(confidence_pct=85))
+		self.assertFalse(result["ok"])
+		self.assertFalse(frappe.db.get_value("HD Ticket", ticket, PCT_FIELD))
+
+	def test_only_route_ticket_assigns_ai_confidence_pct(self):
+		# The scanner sees each of the four write forms the design names.
+		sample = (
+			"f(ai_confidence_pct=1)\n"
+			"doc.ai_confidence_pct = 1\n"
+			"doc.update({'ai_confidence_pct': 1})\n"
+			"frappe.db.set_value('HD Ticket', n, 'ai_confidence_pct', 1)\n"
+			"doc.get('ai_confidence_pct')\n"
+		)
+		self.assertEqual(_pct_writes(sample), [1, 2, 3, 4])
+
+		root = Path(frappe.get_app_path("erp_ai"))
+		writers = {}
+		for path in sorted(root.rglob("*.py")):
+			if path.name.startswith("test_"):
+				continue
+			if lines := _pct_writes(path.read_text(encoding="utf-8")):
+				writers[path.relative_to(root).as_posix()] = lines
+		self.assertLessEqual(set(writers), PCT_WRITERS, writers)
+		self.assertIn("agent/tools/route_ticket.py", writers)
 
 
 class TestSlaFromHelpdesk(RouteTicketTestCase):

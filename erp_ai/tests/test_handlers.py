@@ -7,6 +7,8 @@ from helpdesk.test_utils import make_ticket
 
 from erp_ai import handlers
 from erp_ai.agent import answer_delay, runner
+from erp_ai.agent.tools import site_api
+from erp_ai.agent.tools.registry import ToolContext
 from erp_ai.constants import AGENT_USER, LOG_DOCTYPE, LOGGER_NAME
 from erp_ai.test_utils import (
 	FakeGateway,
@@ -502,21 +504,71 @@ class TestHumanCorrection(HandlerTestCase):
 		self.assertEqual(self._log(log).human_corrected_by, email)
 
 	def test_ticket_without_classify_log_saves_without_error(self):
+		# AC-21 changed the FEAT-001 rule "no prediction yet → skip": the person is marked (NFR-8).
 		ticket = self._ticket_without_job(priority="Low")
-		make_log_entry(ticket=ticket.name, entry_type="skip", run_id=f"{PREFIX}skip")
+		skip_log = make_log_entry(ticket=ticket.name, entry_type="skip", run_id=f"{PREFIX}skip")
 
 		self._save_priority(ticket, "High")
 
 		self.assertEqual(frappe.db.get_value("HD Ticket", ticket.name, "priority"), "High")
-		self.assertNotEqual(self._classified_by(ticket), "Người")
+		self.assertEqual(self._classified_by(ticket), "Người")
+		self.assertIsNone(self._log(skip_log).human_corrected_to)
 
 	def test_log_without_predicted_category_not_recorded(self):
+		# The row has nothing to correct, so it stays as it is; the person is still marked (AC-21, NFR-8).
 		ticket, log = self._classified_ticket(predicted_category="")
 
 		self._save_priority(ticket, "High")
 
 		self.assertIsNone(self._log(log).human_corrected_to)
-		self.assertNotEqual(self._classified_by(ticket), "Người")
+		self.assertEqual(self._classified_by(ticket), "Người")
+
+	def test_edit_before_first_log_marks_human(self):
+		ticket = self._ticket_without_job(priority="Low")
+		self.assertEqual(frappe.db.count(LOG_DOCTYPE, {"ticket": ticket.name}), 0)
+		logger = MagicMock()
+
+		with patch.object(frappe, "logger", return_value=logger):
+			self._save_priority(ticket, "High")
+
+		self.assertEqual(frappe.db.get_value("HD Ticket", ticket.name, "priority"), "High")
+		self.assertEqual(self._classified_by(ticket), "Người")
+		self.assertEqual(frappe.db.count(LOG_DOCTYPE, {"ticket": ticket.name}), 0)
+		self.assertFalse(ticket.flags.erp_ai_human_corrected)
+		logged = [str(arg) for call in logger.info.call_args_list for arg in call.args]
+		self.assertIn(
+			f"erp_ai handler ticket={ticket.name} trigger=human_correction recorded: human_changed_before_prediction",
+			logged,
+		)
+
+	def test_record_tool_write_is_not_human(self):
+		# Only the session tells the bot's write from a person's: a record tool runs as AGENT_USER.
+		for with_log in (True, False):
+			with self.subTest(with_log=with_log):
+				if with_log:
+					ticket, log = self._classified_ticket(run_id=f"{PREFIX}record")
+				else:
+					ticket, log = self._ticket_without_job(priority="Low"), None
+				context = ToolContext(
+					ticket_name=ticket.name,
+					effective_level="L3",
+					instructor=None,
+					run_id=f"{PREFIX}record",
+					category_mapping={},
+					agent_user=AGENT_USER,
+					record_tools=True,
+				)
+				frappe.set_user(AGENT_USER)
+				result = site_api.update_record(
+					{"doctype": "HD Ticket", "name": ticket.name, "values": {"priority": "High"}}, context
+				)
+				frappe.set_user("Administrator")
+
+				self.assertTrue(result["ok"], result)
+				self.assertEqual(frappe.db.get_value("HD Ticket", ticket.name, "priority"), "High")
+				self.assertNotEqual(self._classified_by(ticket), "Người")
+				if log:
+					self.assertIsNone(self._log(log).human_corrected_to)
 
 	def test_change_outside_classification_fields_not_recorded(self):
 		ticket, log = self._classified_ticket()

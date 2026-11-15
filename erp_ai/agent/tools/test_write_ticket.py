@@ -1082,3 +1082,164 @@ class TestPostNotice(TicketCommentCase):
 		with self.assertRaises(ValueError):
 			write_ticket.post_notice(self.ticket, "x_unknown", "x", since)
 		self.assertEqual(len(self._comments()), before)
+
+
+class TestGuidanceWriter(TicketCommentCase):
+	"""AC-65, ADR-036 QĐ 3: the guidance comment is the agent's core Comment whose content opens with the marker."""
+
+	def test_count_ignores_info_other_owner_and_non_prefix(self):
+		marker = write_ticket.GUIDANCE_MARKER
+		self.assertEqual(
+			write_ticket.guidance_filters(self.ticket),
+			{
+				"reference_doctype": "HD Ticket",
+				"reference_name": self.ticket,
+				"comment_type": "Comment",
+				"owner": AGENT_USER,
+				"content": ["like", f"{marker}%"],
+			},
+		)
+		frappe.set_user("Administrator")
+		other = make_ticket(subject=f"{T100_PREFIX} phiếu khác", raised_by=CUSTOMER).name
+		# a person's comment opening with the marker
+		self.assertTrue(write_ticket._post(self.ticket, f"{marker}\nngười viết")["ok"])
+		frappe.set_user(AGENT_USER)
+		# the agent's Info row opening with the marker (ADR-035 QĐ 7)
+		frappe.get_doc("HD Ticket", self.ticket).add_comment("Info", f"{marker}\nthông tin")
+		# the agent's comment with the marker inside, not at position 0 (a proposal or BA note quoting it)
+		self.assertTrue(write_ticket._post(self.ticket, f"Đề xuất của bot\n{marker}")["ok"])
+		# another ticket's guidance
+		self.assertTrue(write_ticket._post(other, f"{marker}\n**Nhận định:** B")["ok"])
+
+		self.assertEqual(write_ticket.count_guidance(self.ticket), 0)
+		self.assertEqual(write_ticket.count_guidance(self.ticket, lock=True), 0)
+
+		self.assertTrue(write_ticket._post(self.ticket, f"{marker}\n**Nhận định:** A")["ok"])
+
+		self.assertEqual(write_ticket.count_guidance(self.ticket), 1)
+		self.assertEqual(write_ticket.count_guidance(self.ticket, lock=True), 1)
+		self.assertEqual(write_ticket.count_guidance(other), 1)
+
+	def test_count_with_lock_goes_through_locked_count(self):
+		with patch.object(write_ticket, "locked_count", return_value=7) as counted:
+			self.assertEqual(write_ticket.count_guidance(self.ticket, lock=True), 7)
+		counted.assert_called_once_with(self.ticket, "Comment", write_ticket.guidance_filters(self.ticket))
+
+	def test_marker_survives_save(self):
+		marker = write_ticket.GUIDANCE_MARKER
+		posted = write_ticket._post(self.ticket, f"{marker}\n**Nhận định:** A\n**Hướng xử lý:** B")
+		self.assertTrue(posted["ok"], posted)
+
+		stored = frappe.db.get_value("Comment", posted["comment"], "content")
+		self.assertTrue(stored.startswith(f"{marker}\n"), stored)
+		frappe.set_user("Administrator")
+		frappe.get_doc("Comment", posted["comment"]).save()
+
+		self.assertTrue(
+			frappe.db.get_value("Comment", posted["comment"], "content").startswith(f"{marker}\n")
+		)
+		self.assertEqual(write_ticket.count_guidance(self.ticket), 1)
+
+
+class TestCollector(FrappeTestCase):
+	"""ADR-036 QĐ 2, 6 (w1.md:62, AD3.md:126-129): the run's collector lives in frappe.flags under its run_id."""
+
+	def setUp(self):
+		keep_agent_settings(self)
+		self.run_id = f"{T100_PREFIX}-{frappe.generate_hash(length=10)}"
+		self.addCleanup(write_ticket.close_collector, self.run_id)
+		self.empty = {section: [] for section in write_ticket.GUIDANCE_SECTIONS}
+
+	def test_collect_without_open_collector_is_noop(self):
+		self.assertFalse(write_ticket.collecting(self.run_id))
+		write_ticket.collect(self.run_id, write_ticket.SECTION_DONE, "Đã ghi Loại.")
+		write_ticket.hold_analysis(self.run_id, "**Nhận định:** A")
+		self.assertFalse(write_ticket.collecting(self.run_id))
+		self.assertEqual(write_ticket.collected(self.run_id), (None, self.empty))
+
+		other = f"{self.run_id}-khác"
+		self.addCleanup(write_ticket.close_collector, other)
+		write_ticket.open_collector(other)
+		self.assertFalse(write_ticket.collecting(self.run_id))
+
+		write_ticket.open_collector(self.run_id)
+		write_ticket.collect(self.run_id, write_ticket.SECTION_DONE, "Đã ghi Loại.")
+		write_ticket.close_collector(self.run_id)
+		write_ticket.collect(self.run_id, write_ticket.SECTION_DONE, "Đã ghi Nhóm.")
+
+		self.assertFalse(write_ticket.collecting(self.run_id))
+		self.assertEqual(write_ticket.collected(self.run_id), (None, self.empty))
+		self.assertTrue(write_ticket.collecting(other))
+
+	def test_bad_section_raises(self):
+		write_ticket.open_collector(self.run_id)
+		for section in ("Cần ai quyết", "Căn cứ", "Nhận định", "analysis", ""):
+			with self.subTest(section=section), self.assertRaises(ValueError):
+				write_ticket.collect(self.run_id, section, "x")
+		self.assertEqual(write_ticket.collected(self.run_id), (None, self.empty))
+		write_ticket.close_collector(self.run_id)
+		with self.assertRaises(ValueError):
+			write_ticket.collect(self.run_id, "Cần ai quyết", "x")
+
+	def test_same_line_twice_kept_once(self):
+		done, pending, decide = (
+			write_ticket.SECTION_DONE,
+			write_ticket.SECTION_PENDING,
+			write_ticket.SECTION_DECIDE,
+		)
+		write_ticket.open_collector(self.run_id)
+		write_ticket.collect(self.run_id, done, "Đã ghi Loại: A.")
+		write_ticket.collect(self.run_id, done, "Đã ghi Loại: A.")
+		write_ticket.collect(self.run_id, done, "Đã gán cho người phụ trách.")
+		# the same line under another section is another pair
+		write_ticket.collect(self.run_id, pending, "Đã ghi Loại: A.")
+		# raw text: kept as given, escaping is the writer's
+		write_ticket.collect(self.run_id, decide, "<b>&x")
+
+		analysis, sections = write_ticket.collected(self.run_id)
+
+		self.assertIsNone(analysis)
+		self.assertEqual(
+			sections,
+			{
+				done: ["Đã ghi Loại: A.", "Đã gán cho người phụ trách."],
+				pending: ["Đã ghi Loại: A."],
+				decide: ["<b>&x"],
+			},
+		)
+		sections[done].append("ngoài bộ gom")
+		self.assertEqual(len(write_ticket.collected(self.run_id)[1][done]), 2)
+
+	def test_later_hold_wins(self):
+		write_ticket.open_collector(self.run_id)
+		write_ticket.hold_analysis(self.run_id, "**Nhận định:** lần một")
+		write_ticket.hold_analysis(self.run_id, "**Nhận định:** lần hai")
+
+		self.assertEqual(write_ticket.collected(self.run_id), ("**Nhận định:** lần hai", self.empty))
+
+	def test_sections_are_done_pending_plan(self):
+		# design-w1-fixes-20 Điểm 1.1 (spec-addendum-5 AC-65 (a)): no "Cần ai quyết" section; the decide key is the plan.
+		self.assertEqual(write_ticket.GUIDANCE_SECTIONS, ("Đã làm", "Chờ duyệt", "Hướng xử lý"))
+		self.assertEqual(
+			(write_ticket.SECTION_DONE, write_ticket.SECTION_PENDING, write_ticket.SECTION_DECIDE),
+			write_ticket.GUIDANCE_SECTIONS,
+		)
+		self.assertEqual(write_ticket.SECTION_DECIDE, write_ticket.GUIDANCE_HEADER)
+		for value in (
+			*write_ticket.GUIDANCE_SECTIONS,
+			write_ticket.GUIDANCE_HEADER,
+			write_ticket.GUIDANCE_MARKER,
+		):
+			self.assertNotIn("Cần ai quyết", value)
+			self.assertNotIn("Căn cứ", value)
+		# an HTML comment on line 1: stored as is, never shown to the reader (A-W1-1)
+		self.assertTrue(write_ticket.GUIDANCE_MARKER.startswith("<!-- "), write_ticket.GUIDANCE_MARKER)
+		self.assertTrue(write_ticket.GUIDANCE_MARKER.endswith(" -->"), write_ticket.GUIDANCE_MARKER)
+
+	def test_mark_work_only_flags_run(self):
+		self.addCleanup(lambda: frappe.flags.get("erp_ai_work_only_runs", set()).discard(self.run_id))
+
+		write_ticket.mark_work_only(self.run_id)
+
+		self.assertIn(self.run_id, frappe.flags.erp_ai_work_only_runs)
+		self.assertFalse(write_ticket.collecting(self.run_id))

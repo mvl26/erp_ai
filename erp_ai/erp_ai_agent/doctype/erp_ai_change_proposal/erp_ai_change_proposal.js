@@ -1,8 +1,12 @@
 // Buttons are only a convenience: the server checks role and state again (AC-5).
 const BRANCH_NOTE_PREFIX = "Commit sẽ vào nhánh ";
 const CORE_WARNING_PREFIX = "Cảnh báo app lõi: ";
+const COMMAND_UNDO_NOTE_PREFIX = "Lệnh trong khối không hoàn tác được";
 
 frappe.ui.form.on("ERP AI Change Proposal", {
+	onload(frm) {
+		confirm_restart_on_open(frm);
+	},
 	refresh(frm) {
 		decide_from_link(frm);
 		const notes = (frm.doc.__onload && frm.doc.__onload.change_notes) || [];
@@ -29,20 +33,73 @@ frappe.ui.form.on("ERP AI Change Proposal", {
 				"erp_ai.erp_ai_agent.doctype.erp_ai_change_proposal.erp_ai_change_proposal.reject"
 			);
 		}
-		if (frm.doc.change_status === "Đã áp dụng" && frm.doc.change_kind === "Thay đổi code") {
+		if (undo_allowed(frm)) {
 			add_action_button(
 				frm,
 				__("Hoàn tác"),
-				frappe.utils.escape_html(
-					__(
-						"Hoàn tác thay đổi này? File trở lại như trước khi áp dụng (file mới thì bị xóa) và có một commit hoàn tác."
-					)
-				),
+				undo_confirm_message(frm, notes),
 				"erp_ai.erp_ai_agent.doctype.erp_ai_change_proposal.erp_ai_change_proposal.undo"
 			);
 		}
 	},
 });
+
+// Same edges as the server's undo (CHG-002 design 3.3): Đã áp dụng, or Lỗi that kept its apply commit
+// and has no undo commit yet.
+function undo_allowed(frm) {
+	return (
+		frm.doc.change_kind === "Thay đổi code" &&
+		(frm.doc.change_status === "Đã áp dụng" ||
+			(frm.doc.change_status === "Lỗi" &&
+				frm.doc.apply_commit_sha &&
+				!frm.doc.undo_commit_sha))
+	);
+}
+
+// A block states its item count; its commands are not undone, as the notes already say (AC-42).
+function undo_confirm_message(frm, notes) {
+	const items = (frm.doc.operations || []).length;
+	const lines = items
+		? [
+				__(
+					"Hoàn tác khối {0} mục? File trở lại như trước khi áp dụng (file mới thì bị xóa) và có một commit hoàn tác.",
+					[items]
+				),
+		  ]
+		: [
+				__(
+					"Hoàn tác thay đổi này? File trở lại như trước khi áp dụng (file mới thì bị xóa) và có một commit hoàn tác."
+				),
+		  ];
+	const command_note = notes.find((note) => note.startsWith(COMMAND_UNDO_NOTE_PREFIX));
+	if (command_note) {
+		lines.push(command_note);
+	}
+	return lines.map(frappe.utils.escape_html).join("<br>");
+}
+
+// Lazy restart check (CHG-002 design 4.4, addendum 1 D-17): only an Instructor may record the conclusion,
+// so a System Manager alone gets no call and no error box.
+function restart_check_due(frm) {
+	return frm.doc.restart_status === "Đã gửi" && frappe.user.has_role("ERP AI Instructor");
+}
+
+// Once when the form opens; reloads only when the recorded status changed (ADR-040 C-4: key `status`).
+function confirm_restart_on_open(frm) {
+	if (!restart_check_due(frm)) {
+		return;
+	}
+	frappe.call({
+		method: "erp_ai.erp_ai_agent.doctype.erp_ai_change_proposal.erp_ai_change_proposal.confirm_restart",
+		args: { name: frm.doc.name },
+		type: "POST",
+		callback: (r) => {
+			if (r.message.status !== frm.doc.restart_status) {
+				frm.reload_doc();
+			}
+		},
+	});
+}
 
 // The signed Duyệt / Từ chối link of the ticket comment opens this form (ADR-023 QĐ 1): one click
 // decides, so no confirmation here. The address is cleaned first, so a refresh or reload never sends it again.

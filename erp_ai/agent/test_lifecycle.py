@@ -1,14 +1,16 @@
 import ast
 import inspect
+import json
 from datetime import datetime, timedelta
 from unittest.mock import patch
 
 import frappe
 from frappe.tests.utils import FrappeTestCase
+from helpdesk.helpdesk.doctype.hd_ticket.hd_ticket import HDTicket
 from helpdesk.test_utils import make_ticket
 
 from erp_ai.agent import authority, lifecycle, policy
-from erp_ai.constants import AGENT_USER, SETTING_DOCTYPE, TRIGGER_TICKET_INSERT
+from erp_ai.constants import AGENT_USER, LOG_DOCTYPE, SETTING_DOCTYPE, TRIGGER_TICKET_INSERT
 from erp_ai.test_utils import keep_agent_settings, make_log_entry, pin_agent_roles, set_agent_settings
 
 # A real HD Ticket field erp_ai installs (Small Text), so no test creates a Custom Field (its ALTER TABLE commits).
@@ -143,6 +145,64 @@ class LifecycleTestCase(FrappeTestCase):
 			frappe.db.exists("Email Account", {"enable_outgoing": 1, "default_outgoing": 1}),
 			"the site needs a default outgoing Email Account",
 		)
+
+	def _task(self, ticket, status, linked=True) -> str:
+		frappe.set_user("Administrator")
+		values = {
+			"doctype": "Task",
+			"subject": f"ERPAI-TEST lifecycle task of {ticket}",
+			"description": "ERPAI-TEST lifecycle",
+			"status": status,
+		}
+		if linked:
+			values["ai_ticket"] = ticket
+		if status == "Completed":
+			values.update(completed_by="Administrator", completed_on=DAY0.date())
+		return frappe.get_doc(values).insert(ignore_permissions=True).name
+
+	def _comments(self, ticket) -> list:
+		return frappe.get_all(
+			"Comment",
+			filters={"reference_doctype": "HD Ticket", "reference_name": ticket, "comment_type": "Comment"},
+			fields=["name", "owner", "content"],
+		)
+
+	def _rows(self, ticket) -> list:
+		"""The ticket's bot_action rows of ERP AI Log, `actions` decoded."""
+		rows = frappe.get_all(
+			LOG_DOCTYPE,
+			filters={"ticket": ticket, "entry_type": "bot_action"},
+			fields=["name", "trigger", "run_id", "cost_usd", "actions"],
+			order_by="creation",
+		)
+		return [{**row, "actions": json.loads(row.actions)} for row in rows]
+
+	def _error_logs(self, ticket) -> int:
+		return frappe.db.count(
+			"Error Log",
+			{"method": lifecycle.TITLE_LIFECYCLE_FAILED, "error": ("like", f"%ticket={ticket} %")},
+		)
+
+	def _status(self, ticket) -> str:
+		return frappe.db.get_value("HD Ticket", ticket, "status")
+
+	def _assert_unchanged(self, ticket, status="Open") -> None:
+		self.assertEqual(self._status(ticket), status)
+		self.assertEqual(self._comments(ticket), [])
+		self.assertEqual(self._rows(ticket), [])
+
+	def _fail_once(self, method_name: str, when=lambda doc: True):
+		"""Patch HDTicket.<method_name> to raise once, on the first call where `when(doc)` holds; real otherwise."""
+		real = getattr(HDTicket, method_name)
+		failed = []
+
+		def method(doc, *args, **kwargs):
+			if not failed and when(doc):
+				failed.append(doc.name)
+				raise frappe.ValidationError("ERPAI-TEST injected failure")
+			return real(doc, *args, **kwargs)
+
+		return patch.object(HDTicket, method_name, method)
 
 
 class TestLifecycleSettings(LifecycleTestCase):
@@ -324,6 +384,154 @@ class TestRequesterMessages(LifecycleTestCase):
 			),
 			0,
 		)
+
+
+class TestResolveOnTasksDone(LifecycleTestCase):
+	"""AC-43: the 7 cases of the spec plus A-11, under the agent account."""
+
+	def setUp(self):
+		super().setUp()
+		self._settings(resolve_on_tasks_done_enabled=1)
+
+	def _run(self, ticket) -> None:
+		lifecycle.run_task_lifecycle(ticket)
+		frappe.set_user("Administrator")
+
+	def _assert_resolved_once(self, ticket, completed: int) -> None:
+		values = frappe.db.get_value(
+			"HD Ticket", ticket, ["status", "status_category", "modified_by"], as_dict=True
+		)
+		self.assertEqual(
+			(values.status, values.status_category, values.modified_by), ("Resolved", "Resolved", AGENT_USER)
+		)
+		content = lifecycle.COMMENT_RESOLVED.format(completed=completed)
+		comments = self._comments(ticket)
+		self.assertEqual([(c.owner, c.content) for c in comments], [(AGENT_USER, content)])
+		rows = self._rows(ticket)
+		self.assertEqual(len(rows), 1)
+		self.assertEqual((rows[0].trigger, rows[0].cost_usd), ("scheduled_job", 0))
+		self.assertEqual(
+			rows[0].actions,
+			[
+				{
+					"tool": "resolve_on_tasks_done",
+					"doctype": "HD Ticket",
+					"name": ticket,
+					"ok": True,
+					"value_before": {"status": "Open"},
+					"value_after": {"status": "Resolved"},
+					"instructor": None,
+				},
+				{
+					"tool": "lifecycle_comment",
+					"doctype": "Comment",
+					"name": comments[0].name,
+					"ok": True,
+					"value_before": None,
+					"value_after": {"content": content},
+					"instructor": None,
+				},
+			],
+		)
+
+	def test_two_of_two_completed_resolved(self):
+		ticket = self._ticket(category="C")
+		self._task(ticket, "Completed")
+		self._task(ticket, "Completed")
+		self.assertEqual(lifecycle.tasks_done(ticket), (True, 2))
+
+		self._run(ticket)
+
+		self._assert_resolved_once(ticket, completed=2)
+
+	def test_one_of_two_not_changed(self):
+		ticket = self._ticket(category="C")
+		self._task(ticket, "Completed")
+		self._task(ticket, "Working")
+		self.assertEqual(lifecycle.tasks_done(ticket), (False, 1))
+
+		self._run(ticket)
+
+		self._assert_unchanged(ticket)
+
+	def test_no_task_not_changed(self):
+		ticket = self._ticket(category="C")
+		self.assertEqual(lifecycle.tasks_done(ticket), (False, 0))
+
+		self._run(ticket)
+
+		self._assert_unchanged(ticket)
+
+	def test_cancelled_plus_completed_resolved(self):
+		ticket = self._ticket(category="C")
+		self._task(ticket, "Cancelled")
+		self._task(ticket, "Completed")
+		self.assertEqual(lifecycle.tasks_done(ticket), (True, 1))
+
+		self._run(ticket)
+
+		self._assert_resolved_once(ticket, completed=1)
+
+	def test_all_cancelled_not_changed(self):
+		ticket = self._ticket(category="C")
+		self._task(ticket, "Cancelled")
+		self._task(ticket, "Cancelled")
+		self.assertEqual(lifecycle.tasks_done(ticket), (False, 0))
+
+		self._run(ticket)
+
+		self._assert_unchanged(ticket)
+
+	def test_closed_ticket_not_changed(self):
+		ticket = self._ticket(category="C")
+		frappe.db.set_value(
+			"HD Ticket", ticket, {"status": "Closed", "status_category": "Resolved"}, update_modified=False
+		)
+		self._task(ticket, "Completed")
+		self._task(ticket, "Completed")
+
+		self._run(ticket)
+
+		self._assert_unchanged(ticket, status="Closed")
+
+	def test_repeated_event_changes_once(self):
+		ticket = self._ticket(category="C")
+		self._task(ticket, "Completed")
+
+		for _ in range(3):
+			self._run(ticket)
+
+		self._assert_resolved_once(ticket, completed=1)
+
+	def test_task_without_ticket_link_not_counted(self):
+		"""A-11: a Task with no ai_ticket never counts, whether open or done."""
+		resolved = self._ticket(category="C")
+		self._task(resolved, "Completed")
+		self._task(resolved, "Open", linked=False)
+		unlinked_only = self._ticket(category="C")
+		self._task(unlinked_only, "Completed", linked=False)
+		self.assertEqual(lifecycle.tasks_done(resolved), (True, 1))
+		self.assertEqual(lifecycle.tasks_done(unlinked_only), (False, 0))
+
+		self._run(resolved)
+		self._run(unlinked_only)
+
+		self._assert_resolved_once(resolved, completed=1)
+		self._assert_unchanged(unlinked_only)
+
+	def test_failure_midway_rolls_back_then_once(self):
+		"""ADR-033 Ràng buộc, U6b-fixes Sửa 2: a failure after the status save undoes it; the next run does it once."""
+		ticket = self._ticket(category="C")
+		self._task(ticket, "Completed")
+
+		with self._fail_once("new_comment"):
+			self._run(ticket)
+			self._assert_unchanged(ticket)
+			self.assertEqual(self._error_logs(ticket), 1)
+			self._run(ticket)
+
+		self._assert_resolved_once(ticket, completed=1)
+		self.assertEqual(self._error_logs(ticket), 1)
 
 
 class TestArchitecture(FrappeTestCase):

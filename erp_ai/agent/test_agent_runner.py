@@ -14,7 +14,7 @@ from frappe.tests.utils import FrappeTestCase
 from helpdesk.test_utils import make_ticket
 
 from erp_ai import tasks
-from erp_ai.agent import answer_delay, authority, policy, runner
+from erp_ai.agent import answer_delay, authority, policy, run_log, runner
 from erp_ai.agent.agent_write_guard import allow_agent_write
 from erp_ai.agent.classification import DEFAULT_CATEGORY_MAPPING
 from erp_ai.agent.prompts import (
@@ -28,7 +28,7 @@ from erp_ai.agent.prompts import (
 	build_reason_system,
 	build_routing_table,
 )
-from erp_ai.agent.run_log import write_entry
+from erp_ai.agent.run_log import action_entry, write_entry
 from erp_ai.agent.tools import registry, site_api
 from erp_ai.agent.tools.read import TOOL_RESULT_MAX_CHARS
 from erp_ai.agent.tools.registry import ASK_TOOL_NAMES, get_tool_schemas
@@ -551,13 +551,24 @@ class TestRunnerL1Classification(RunnerTestBase):
 		patcher.start()
 		self.addCleanup(patcher.stop)
 		expected = json.loads(make_routing_rules())["expected_sla"]["A"]["resolution_min"]
-		return {
-			"tool": "sla_check",
-			"doctype": "HD Ticket",
-			"name": self.ticket.name,
-			"ok": False,
-			"reason": f"SLA {fact['sla']} xử lý {fact['resolution_s'] // 60} phút > mong đợi {expected} phút (A)",
-		}
+		return action_entry(
+			"sla_check",
+			"HD Ticket",
+			self.ticket.name,
+			False,
+			reason=f"SLA {fact['sla']} xử lý {fact['resolution_s'] // 60} phút > mong đợi {expected} phút (A)",
+		)
+
+	def _applied_route(self, entry):
+		"""The `apply_route` entry of a run whose ticket write succeeded: the shared shape (NFR-8)."""
+		return action_entry(
+			"apply_route",
+			"HD Ticket",
+			self.ticket.name,
+			True,
+			value_before=json.loads(entry.value_before)["ticket"],
+			value_after=json.loads(entry.value_after)["ticket"],
+		)
 
 	def test_l1_applies_mapping_confidence_and_hint(self):
 		before = self._ticket_row()
@@ -593,7 +604,7 @@ class TestRunnerL1Classification(RunnerTestBase):
 		)
 		self.assertEqual(
 			json.loads(entry.actions),
-			[{"tool": "apply_route", "doctype": "HD Ticket", "name": self.ticket.name, "ok": True}],
+			[self._applied_route(entry)],
 		)
 		self.assertEqual((entry.predicted_category, entry.predicted_confidence), ("A", "Cao"))
 		self.assertEqual(json.loads(entry.skipped_fields), [ASSIGNEE_NOTE])
@@ -610,13 +621,13 @@ class TestRunnerL1Classification(RunnerTestBase):
 		self.assertEqual(
 			json.loads(entry.actions),
 			[
-				{
-					"tool": "apply_route",
-					"doctype": "HD Ticket",
-					"name": self.ticket.name,
-					"ok": False,
-					"reason": "người đã phân loại, không ghi đè",
-				}
+				action_entry(
+					"apply_route",
+					"HD Ticket",
+					self.ticket.name,
+					False,
+					reason="người đã phân loại, không ghi đè",
+				)
 			],
 		)
 		self.assertFalse(entry.skipped_fields)
@@ -642,7 +653,7 @@ class TestRunnerL1Classification(RunnerTestBase):
 		self.assertEqual(
 			json.loads(entry.actions),
 			[
-				{"tool": "apply_route", "doctype": "HD Ticket", "name": self.ticket.name, "ok": True},
+				self._applied_route(entry),
 				sla_action,
 			],
 		)
@@ -691,7 +702,7 @@ class TestRunnerL1Classification(RunnerTestBase):
 		self.assertEqual(
 			json.loads(entry.actions),
 			[
-				{"tool": "apply_route", "doctype": "HD Ticket", "name": self.ticket.name, "ok": True},
+				self._applied_route(entry),
 				sla_action,
 			],
 		)
@@ -885,7 +896,17 @@ class TestRunnerReasoning(RunnerTestBase):
 		self.assertEqual(json.loads(first.tools_called), ["set_resolution_hint", "get_ticket"])
 		self.assertEqual(
 			json.loads(first.actions),
-			[{"tool": "set_resolution_hint", "doctype": "HD Ticket", "name": self.ticket.name, "ok": True}],
+			[
+				action_entry(
+					"set_resolution_hint",
+					"HD Ticket",
+					self.ticket.name,
+					True,
+					value_before={"ai_resolution_hint": None},
+					value_after={"ai_resolution_hint": hint},
+					instructor="Administrator",
+				)
+			],
 		)
 		stored_hint = frappe.db.get_value("HD Ticket", self.ticket.name, "ai_resolution_hint")
 		self.assertIn(hint, stored_hint)
@@ -1052,7 +1073,11 @@ class TestRunnerReasoning(RunnerTestBase):
 		first = self._reason_entries()[0]
 		self.assertEqual(
 			json.loads(first.actions),
-			[{"tool": "set_resolution_hint", "doctype": "HD Ticket", "name": self.ticket.name, "ok": False}],
+			[
+				action_entry(
+					"set_resolution_hint", "HD Ticket", self.ticket.name, False, reason="lỗi: RuntimeError"
+				)
+			],
 		)
 		self.assertFalse(first.value_after)
 
@@ -1074,8 +1099,8 @@ class TestRunnerReasoning(RunnerTestBase):
 		self.assertEqual(
 			json.loads(self._reason_entries()[0].actions),
 			[
-				{"tool": "post_comment", "doctype": "Comment", "name": "CMT-1", "ok": True},
-				{"tool": "create_task", "doctype": "Task", "name": None, "ok": False},
+				action_entry("post_comment", "Comment", "CMT-1", True, value_after={"content": "x"}),
+				action_entry("create_task", "Task", None, False, reason="không có người ra lệnh"),
 			],
 		)
 
@@ -1364,18 +1389,22 @@ class TestRunnerSiteAdminTools(RunnerTestBase):
 		self.assertEqual(
 			json.loads(entry.actions),
 			[
-				{
-					"tool": "propose_new_file",
-					"doctype": "ERP AI Change Proposal",
-					"name": proposal,
-					"ok": True,
-				},
-				{
-					"tool": "propose_bench_command",
-					"doctype": "ERP AI Change Proposal",
-					"name": None,
-					"ok": False,
-				},
+				action_entry(
+					"propose_new_file",
+					"ERP AI Change Proposal",
+					proposal,
+					True,
+					value_after={"change_status": "Chờ duyệt"},
+					instructor="Administrator",
+				),
+				action_entry(
+					"propose_bench_command",
+					"ERP AI Change Proposal",
+					None,
+					False,
+					reason="lệnh không có trong danh sách cho phép",
+					instructor="Administrator",
+				),
 			],
 		)
 		steps = frappe.get_all(
@@ -1413,15 +1442,14 @@ class TestRunnerSiteAdminTools(RunnerTestBase):
 					"value_after": {"title": title, "public": 1},
 					"instructor": INSTRUCTOR,
 				},
-				{
-					"tool": "api_create_record",
-					"doctype": "ERP AI Setting",
-					"name": None,
-					"ok": False,
-					"value_before": None,
-					"value_after": None,
-					"instructor": INSTRUCTOR,
-				},
+				action_entry(
+					"api_create_record",
+					"ERP AI Setting",
+					None,
+					False,
+					reason="DocType này không được phép dùng qua công cụ",
+					instructor=INSTRUCTOR,
+				),
 			],
 		)
 
@@ -1441,17 +1469,197 @@ class TestRunnerSiteAdminTools(RunnerTestBase):
 		self.assertEqual(
 			json.loads(entry.actions),
 			[
-				{
-					"tool": "api_update_record",
-					"doctype": "Note",
-					"name": None,
-					"ok": False,
-					"value_before": None,
-					"value_after": None,
-					"instructor": INSTRUCTOR,
-				}
+				action_entry(
+					"api_update_record",
+					"Note",
+					None,
+					False,
+					reason="lỗi: RuntimeError",
+					instructor=INSTRUCTOR,
+				)
 			],
 		)
+
+
+class TestActionLog(RunnerTestBase):
+	"""FEAT-007 U3: every action entry of the runner is built by `run_log.action_entry` (AC-10)."""
+
+	def setUp(self):
+		super().setUp()
+		set_agent_settings(permission_level="L3", code_change_enabled=1, monthly_budget_usd=1000)
+		make_instructor(self)
+
+	def _run_with(self, blocks, results=None, *, crash=None):
+		"""One model turn calling `blocks`, `execute_tool` answering from `results` (a name -> result dict or list)."""
+		self.gateway.results = [tool_turn(*blocks), make_model_result()]
+		queue = {
+			name: list(value) if isinstance(value, list) else [value]
+			for name, value in (results or {}).items()
+		}
+
+		def fake(name, args, ctx):
+			if crash and name in crash:
+				raise RuntimeError("boom")
+			return queue[name].pop(0)
+
+		with (
+			patch.object(authority, "run_instructor", return_value=INSTRUCTOR),
+			patch.object(runner, "execute_tool", side_effect=fake),
+		):
+			self._run("comment_mention")
+		(entry,) = [row for row in self._entries(entry_type="reason") if row.actions]
+		return json.loads(entry.actions), entry
+
+	def test_each_write_tool_has_one_entry_with_values_and_instructor(self):
+		ticket = self.ticket.name
+		blocks = [
+			tool_use("t1", "set_classification", category="A"),
+			tool_use("t2", "set_resolution_hint", text="gợi ý"),
+			tool_use("t3", "post_comment", content="xin chào"),
+			tool_use("t4", "create_task", subject="s", description="d"),
+			tool_use("t5", "propose_new_file", path="custom_app/a.py", content="x", reason="r"),
+		]
+		results = {
+			"set_classification": {"ok": True, "before": {"priority": "Low"}, "after": {"priority": "High"}},
+			"set_resolution_hint": {"ok": True, "before": None, "after": "gợi ý"},
+			"post_comment": {"ok": True, "comment": "CMT-9"},
+			"create_task": {"ok": True, "task": "TASK-9"},
+			"propose_new_file": {"ok": True, "proposal": "AICHG-9", "status": "Chờ duyệt"},
+		}
+		actions, _ = self._run_with(blocks, results)
+		kwargs = {"instructor": INSTRUCTOR}
+		self.assertEqual(
+			actions,
+			[
+				action_entry(
+					"set_classification",
+					"HD Ticket",
+					ticket,
+					True,
+					value_before={"priority": "Low"},
+					value_after={"priority": "High"},
+					**kwargs,
+				),
+				action_entry(
+					"set_resolution_hint",
+					"HD Ticket",
+					ticket,
+					True,
+					value_before={"ai_resolution_hint": None},
+					value_after={"ai_resolution_hint": "gợi ý"},
+					**kwargs,
+				),
+				action_entry(
+					"post_comment", "Comment", "CMT-9", True, value_after={"content": "xin chào"}, **kwargs
+				),
+				action_entry(
+					"create_task",
+					"Task",
+					"TASK-9",
+					True,
+					value_after={"subject": "s", "description": "d"},
+					**kwargs,
+				),
+				action_entry(
+					"propose_new_file",
+					"ERP AI Change Proposal",
+					"AICHG-9",
+					True,
+					value_after={"change_status": "Chờ duyệt"},
+					**kwargs,
+				),
+			],
+		)
+		for action in actions:
+			self.assertEqual(tuple(action)[:7], run_log.ACTION_KEYS)
+
+	def test_same_tool_twice_two_entries(self):
+		blocks = [
+			tool_use("t1", "post_comment", content="một"),
+			tool_use("t2", "post_comment", content="hai"),
+		]
+		results = {"post_comment": [{"ok": True, "comment": "C-1"}, {"ok": True, "comment": "C-2"}]}
+		actions, _ = self._run_with(blocks, results)
+		self.assertEqual(
+			[(action["name"], action["value_after"]) for action in actions],
+			[("C-1", {"content": "một"}), ("C-2", {"content": "hai"})],
+		)
+
+	def test_refused_call_entry_has_reason(self):
+		actions, _ = self._run_with(
+			[tool_use("t1", "create_task", subject="s", description="d")],
+			{"create_task": {"ok": False, "reason": "không có người ra lệnh"}},
+		)
+		self.assertEqual(
+			actions,
+			[
+				action_entry(
+					"create_task", "Task", None, False, reason="không có người ra lệnh", instructor=INSTRUCTOR
+				)
+			],
+		)
+		self.assertEqual((actions[0]["value_before"], actions[0]["value_after"]), (None, None))
+
+	def test_crashed_call_entry_reason_is_class_name(self):
+		actions, _ = self._run_with([tool_use("t1", "post_comment", content="x")], crash={"post_comment"})
+		(action,) = actions
+		self.assertEqual((action["ok"], action["reason"]), (False, "lỗi: RuntimeError"))
+		self.assertNotIn("boom", json.dumps(action))
+
+	def test_fake_password_never_in_actions_column(self):
+		results = {
+			"api_update_record": {
+				"ok": True,
+				"doctype": "User",
+				"name": "u@example.com",
+				"value_before": {"new_password": FAKE_PASSWORD, "first_name": "A"},
+				"value_after": {"api_secret": FAKE_API_SECRET, "note": f"password={FAKE_PASSWORD}"},
+			}
+		}
+		set_agent_settings(unrestricted_enabled=1)
+		_, entry = self._run_with(
+			[tool_use("t1", "api_update_record", doctype="User", name="u@example.com", values={})], results
+		)
+		self.assertEqual((entry.actions.count(FAKE_PASSWORD), entry.actions.count(FAKE_API_SECRET)), (0, 0))
+		self.assertIn("A", entry.actions)
+
+	def test_record_tool_and_ticket_field_same_run_same_shape(self):
+		set_agent_settings(unrestricted_enabled=1)
+		results = {
+			"set_classification": {"ok": True, "before": {"priority": "Low"}, "after": {"priority": "High"}},
+			"api_create_record": {
+				"ok": True,
+				"doctype": "Note",
+				"name": "N-1",
+				"value_before": None,
+				"value_after": {"t": 1},
+			},
+		}
+		actions, _ = self._run_with(
+			[
+				tool_use("t1", "set_classification", category="A"),
+				tool_use("t2", "api_create_record", doctype="Note", values={}),
+			],
+			results,
+		)
+		self.assertEqual([tuple(action) for action in actions], [run_log.ACTION_KEYS] * 2)
+		self.assertEqual({action["instructor"] for action in actions}, {INSTRUCTOR})
+
+	def test_route_entries_use_shared_shape(self):
+		set_agent_settings(permission_level="L1")
+		self.addCleanup(frappe.cache.hdel, "assignment_rule_map", "HD Ticket")
+		fact = {"sla": f"{PREFIX}SLA", "priority": "High", "resolution_s": 86400}
+		with patch.object(runner.site_facts, "applied_sla", return_value=fact):
+			self._run()
+		(entry,) = self._entries(entry_type="classify")
+		actions = json.loads(entry.actions)
+		self.assertEqual([action["tool"] for action in actions][:2], ["apply_route", "sla_check"])
+		for action in actions:
+			with self.subTest(tool=action["tool"]):
+				self.assertEqual(tuple(action)[:7], run_log.ACTION_KEYS)
+		applied = actions[0]
+		self.assertEqual(applied["value_after"], json.loads(entry.value_after)["ticket"])
+		self.assertEqual(applied["value_before"], json.loads(entry.value_before)["ticket"])
 
 
 FAKE_PASSWORD = "RUNNER-FAKE-PASSWORD-5b71"
@@ -1606,13 +1814,22 @@ class TestRunnerRecordToolValues(RunnerTestBase):
 			execute=crash_on_submit,
 		)
 		self.assertEqual([result["ok"] for result in results], [False, False])
-		refused = {"ok": False, "value_before": None, "value_after": None, "instructor": INSTRUCTOR}
+		refused = {"instructor": INSTRUCTOR}
 		self.assertEqual(
 			json.loads(entry.actions),
 			[
-				{"tool": "api_create_record", "doctype": "ERP AI Setting", "name": None, **refused},
-				{"tool": "api_delete_record", "doctype": "Note", "name": None, **refused},
-				{"tool": "api_submit_record", "doctype": "Note", "name": None, **refused},
+				action_entry(
+					"api_create_record",
+					"ERP AI Setting",
+					None,
+					False,
+					reason="DocType này không được phép dùng qua công cụ",
+					**refused,
+				),
+				action_entry(
+					"api_delete_record", "Note", None, False, reason="không tìm thấy bản ghi", **refused
+				),
+				action_entry("api_submit_record", "Note", None, False, reason="lỗi: RuntimeError", **refused),
 			],
 		)
 
@@ -3016,7 +3233,15 @@ class TestRunnerProposeLogAndInjection(RunnerTestBase):
 		self.assertIsNone(reason.instructor)
 		self.assertEqual(
 			json.loads(reason.actions),
-			[{"tool": "propose_file_change", "doctype": "ERP AI Change Proposal", "name": None, "ok": False}],
+			[
+				action_entry(
+					"propose_file_change",
+					"ERP AI Change Proposal",
+					None,
+					False,
+					reason="tool không được cấp ở mức/thẩm quyền hiện tại",
+				)
+			],
 		)
 		self.assertEqual(self._proposals(), [])
 		self.assertEqual(self._entries(entry_type="change"), [])

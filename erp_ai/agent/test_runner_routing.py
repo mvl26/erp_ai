@@ -11,6 +11,7 @@ from erp_ai import tasks
 from erp_ai.agent import authority, runner
 from erp_ai.agent.prompts import build_classify_request
 from erp_ai.agent.routing import departments, load_routing_config
+from erp_ai.agent.run_log import action_entry
 from erp_ai.agent.runner import BAD_ROUTING_ERROR, NO_SLA_REASON
 from erp_ai.agent.test_agent_runner import (
 	CLASSIFY_A,
@@ -204,7 +205,16 @@ class TestRoutingEndToEnd(RoutingTestBase):
 		self.assertEqual(entry.applied, 1)
 		self.assertEqual(
 			json.loads(entry.actions),
-			[{"tool": "apply_route", "doctype": "HD Ticket", "name": self.ticket.name, "ok": True}],
+			[
+				action_entry(
+					"apply_route",
+					"HD Ticket",
+					self.ticket.name,
+					True,
+					value_before=json.loads(entry.value_before)["ticket"],
+					value_after=json.loads(entry.value_after)["ticket"],
+				)
+			],
 		)
 		after = json.loads(entry.value_after)["ticket"]
 		self.assertEqual((after["ai_complexity"], after["ai_importance"]), (2, 3))

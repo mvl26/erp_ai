@@ -4,7 +4,7 @@ from unittest.mock import MagicMock, patch
 import frappe
 from frappe.model.document import Document
 from frappe.tests.utils import FrappeTestCase
-from frappe.utils import now_datetime
+from frappe.utils import get_datetime, now_datetime
 from helpdesk.test_utils import create_agent, make_ticket
 
 from erp_ai.agent import policy, site_facts
@@ -822,6 +822,31 @@ class TestLockedCount(FrappeTestCase):
 		self.assertEqual(rows, [{"name": other.name, "content": f"{T99_PREFIX} khác"}])
 		self.assertEqual(count, 1)
 
+	def test_post_notice_sees_comment_committed_after_snapshot(self):
+		# AC-23, AR3-7: a notice another job committed after this transaction's snapshot still blocks a second one.
+		self.addCleanup(frappe.set_user, "Administrator")
+		since = get_datetime("2024-01-01 10:00:00")
+		with self.primary_connection():
+			ticket = self._committed_ticket()
+			filters = {"reference_doctype": "HD Ticket", "reference_name": ticket}
+			# The first plain read takes this transaction's snapshot.
+			self.assertEqual(frappe.db.count("Comment", filters), 0)
+		frappe.set_user(AGENT_USER)
+		with self.secondary_connection():
+			posted = write_ticket.post_notice(ticket, "run_failed", f"{T99_PREFIX} lần một", since)
+			frappe.db.commit()
+		with self.primary_connection():
+			# Precondition: a plain read still sees the snapshot, so only a locking read can see the notice.
+			self.assertEqual(frappe.db.count("Comment", filters), 0)
+			with patch.object(frappe.db, "commit", side_effect=AssertionError("post_notice must not commit")):
+				result = write_ticket.post_notice(ticket, "run_failed", f"{T99_PREFIX} lần hai", since)
+			comments = write_ticket.locked_rows(ticket, "Comment", filters, fields=("name", "content"))
+
+		self.assertTrue(posted["ok"], posted)
+		self.assertEqual(result, {"ok": False, "reason": write_ticket.REASON_NOTICE_SENT})
+		prefix = write_ticket.NOTICE_PREFIXES["run_failed"]
+		self.assertEqual(comments, [{"name": posted["comment"], "content": f"{prefix} {T99_PREFIX} lần một"}])
+
 
 T100_PREFIX = "ERPAI-TEST-T100"
 EVIDENCE = "**Căn cứ:** đã đọc mô tả phiếu và comment cuối"
@@ -1009,3 +1034,50 @@ class TestPostCommentKinds(TicketCommentCase):
 		self.assertEqual(self._comments(), [])
 		with self.assertRaises(ValueError):
 			write_ticket.mark_asked("")
+
+
+class TestPostNotice(TicketCommentCase):
+	"""AC-23, NFR-3: one status notice of a kind per ticket since the mark; the dedup read is locked_count's."""
+
+	def test_same_notice_since_mark_posted_once(self):
+		since = get_datetime("2024-01-01 10:00:00")
+		prefix = write_ticket.NOTICE_PREFIXES["daily_limit"]
+		self.assertEqual(
+			set(write_ticket.NOTICE_PREFIXES), {"daily_limit", "over_budget", "run_failed", "ask_fallback"}
+		)
+		# A person's comment with the same text is no notice of the bot.
+		frappe.set_user("Administrator")
+		self.assertTrue(write_ticket._post(self.ticket, f"{prefix} người viết")["ok"])
+		frappe.set_user(AGENT_USER)
+
+		with patch.object(write_ticket, "locked_count", wraps=write_ticket.locked_count) as counted:
+			first = write_ticket.post_notice(self.ticket, "daily_limit", "đủ 5 lần hôm nay.", since)
+			again = write_ticket.post_notice(self.ticket, "daily_limit", "lần hai.", since)
+
+		self.assertTrue(first["ok"], first)
+		self.assertEqual(frappe.db.get_value("Comment", first["comment"], "owner"), AGENT_USER)
+		self.assertEqual(again, {"ok": False, "reason": write_ticket.REASON_NOTICE_SENT})
+		self.assertEqual(self._comments(), [f"{prefix} người viết", f"{prefix} đủ 5 lần hôm nay."])
+		self.assertEqual([call.args[:2] for call in counted.call_args_list], [(self.ticket, "Comment")] * 2)
+
+		# Another notice is its own key.
+		other = write_ticket.post_notice(self.ticket, "run_failed", "lỗi cổng.", since)
+		self.assertTrue(other["ok"], other)
+		self.assertEqual(len(self._comments()), 3)
+
+		# A notice from before the mark does not count; from after it, it does.
+		frappe.db.set_value(
+			"Comment", first["comment"], "creation", "2024-01-01 09:00:00", update_modified=False
+		)
+		earlier = get_datetime("2024-01-01 08:00:00")
+		self.assertEqual(
+			write_ticket.post_notice(self.ticket, "daily_limit", "x", earlier),
+			{"ok": False, "reason": write_ticket.REASON_NOTICE_SENT},
+		)
+		self.assertTrue(write_ticket.post_notice(self.ticket, "daily_limit", "ngày mới.", since)["ok"])
+		self.assertEqual(self._comments()[-1], f"{prefix} ngày mới.")
+
+		before = len(self._comments())
+		with self.assertRaises(ValueError):
+			write_ticket.post_notice(self.ticket, "x_unknown", "x", since)
+		self.assertEqual(len(self._comments()), before)

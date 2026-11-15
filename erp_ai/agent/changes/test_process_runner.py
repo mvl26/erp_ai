@@ -514,7 +514,7 @@ class TestCommitOnlyRecordsDeletion(FrappeTestCase):
 		self.sandbox.stage(SANDBOX_APP, OTHER_STAGED_REL, "s = 1\n")
 		before_head = self._git("rev-parse", "HEAD").strip()
 
-		file_writer.remove_created(os.path.join(self.repo_root, DELETED_REL))
+		file_writer.remove_file(os.path.join(self.repo_root, DELETED_REL))
 		outcome = process_runner.git_commit_only(self.repo_root, DELETED_REL, SUBJECT, BODY, 20)
 
 		self.assertEqual(outcome.exit_code, 0, outcome.output)

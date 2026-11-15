@@ -68,10 +68,10 @@ def _title_key(text) -> str:
 
 def excluded_title_prefixes() -> tuple[str, ...]:
 	"""Keys of the non-empty lines of excluded_title_prefixes; () when the field is missing (before migrate)."""
-	try:
-		raw = frappe.db.get_single_value(SETTING_DOCTYPE, EXCLUDED_TITLE_PREFIXES_FIELD)
-	except frappe.ValidationError:  # get_single_value throws for a field the DocType does not have yet
+	# Checked on the meta: get_single_value would throw and leave its message in message_log (a red dialog).
+	if not frappe.get_meta(SETTING_DOCTYPE).has_field(EXCLUDED_TITLE_PREFIXES_FIELD):
 		return ()
+	raw = frappe.db.get_single_value(SETTING_DOCTYPE, EXCLUDED_TITLE_PREFIXES_FIELD)
 	return tuple(key for key in map(_title_key, (raw or "").splitlines()) if key)
 
 

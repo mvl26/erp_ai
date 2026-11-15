@@ -923,12 +923,6 @@ class TestTitlePrefix(FrappeTestCase):
 		set_agent_settings(excluded_title_prefixes="\n  \n")
 		self.assertEqual(policy.excluded_title_prefixes(), ())
 		self.assertFalse(policy.has_excluded_title("[HR] X"))
-		# The field missing (before migrate): get_single_value throws; no rule, never raises.
-		set_agent_settings(excluded_title_prefixes="[HR]")
-		missing = frappe.ValidationError("Field excluded_title_prefixes does not exist on ERP AI Setting")
-		with patch.object(frappe.db, "get_single_value", side_effect=missing):
-			self.assertEqual(policy.excluded_title_prefixes(), ())
-			self.assertFalse(policy.has_excluded_title("[HR] X"))
 
 	def test_missing_field_adds_no_message(self):
 		# Before migrate the DocType has no excluded_title_prefixes field: no rule, never raises, and nothing

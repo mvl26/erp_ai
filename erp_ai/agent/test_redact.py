@@ -265,6 +265,64 @@ class TestRedact(FrappeTestCase):
 			with self.subTest(text=text):
 				self.assertEqual(redact.redact_secrets(text), expected)
 
+	def test_value_stops_before_next_secret_key(self):
+		# K-4b: a secret bare value or K-7 tail stops before a key candidate with a secret name.
+		cases = (
+			("password=sk-ant-FAKE|api_key: hunter2", f"password={MASK}|api_key: {MASK}"),
+			("password=sk-ant-FAKE.pwd = hunter2", f"password={MASK}.pwd = {MASK}"),
+			("password=sk-ant-FAKE&tailFAKE|api_key: hunter2", f"password={MASK}|api_key: {MASK}"),
+			("password=sk-ant-FAKE|my api key: hunter2", f"password={MASK}|my api key: {MASK}"),
+			("password=abc|api_key: hunter2", f"password={MASK}|api_key: {MASK}"),
+			("password=api_key: hunter2", f"password=api_key: {MASK}"),
+		)
+		for text, expected in cases:
+			with self.subTest(text=text):
+				result = redact.redact_secrets(text)
+				self.assertEqual(result, expected)
+				self.assertNotIn("hunter2", result)
+
+	def test_value_stops_before_mask(self):
+		# K-4b: a secret bare value or K-7 tail stops before another MASK, never `[đã che] che]`.
+		cases = (
+			("password=sk-ant-A&sk-ant-B", f"password={MASK}&{MASK}"),
+			("password=sk-ant-FAKE&tailFAKE.sk-ant-B", f"password={MASK}.{MASK}"),
+			("password=x&sk-ant-FAKE", f"password={MASK}&{MASK}"),
+		)
+		for text, expected in cases:
+			with self.subTest(text=text):
+				result = redact.redact_secrets(text)
+				self.assertEqual(result, expected)
+				self.assertNotIn("che] che]", result)
+
+	def test_non_secret_key_inside_value_stays_value(self):
+		# K-4b: a key candidate with a non-secret name inside a secret value stays part of the value.
+		cases = (
+			("password=sk-ant-FAKE|user:bob", f"password={MASK}"),
+			("password=ab|user:bob", f"password={MASK}"),
+			('password=sk-ant-FAKE|"api_key": "hunter2"', f'password={MASK}"api_key": "{MASK}"'),
+		)
+		for text, expected in cases:
+			with self.subTest(text=text):
+				result = redact.redact_secrets(text)
+				self.assertEqual(result, expected)
+				self.assertNotIn("hunter2", result)
+
+	def test_secret_value_cut_stays_linear(self):
+		# K-8 with K-4b: same generous 10-second bound as test_long_run_without_secret_untouched.
+		cases = (
+			("password=" + "|user:" * 30_000, f"password={MASK}"),
+			("pwd=a|x " * 25_000, f"pwd={MASK}"),
+			("password=" + "a." * 50_000 + "api_key: z", f"password={MASK}"),
+		)
+		for text, prefix in cases:
+			with self.subTest(length=len(text), prefix=prefix):
+				started = time.monotonic()
+				result = redact.redact_secrets(text)
+				self.assertLess(time.monotonic() - started, 10)
+				self.assertTrue(result.startswith(prefix))
+				self.assertNotIn("a|x", result)
+				self.assertNotIn("api_key: z", result)
+
 	def test_secret_patterns_are_the_five_value_patterns(self):
 		samples = (
 			"khóa sk-ant-abc hết hạn",

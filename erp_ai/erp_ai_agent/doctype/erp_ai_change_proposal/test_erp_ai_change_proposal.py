@@ -1356,7 +1356,18 @@ FORM_SCRIPT_PATH = Path(__file__).resolve().parent / "erp_ai_change_proposal.js"
 APPROVE_PATH = "erp_ai.erp_ai_agent.doctype.erp_ai_change_proposal.erp_ai_change_proposal.approve"
 REJECT_PATH = "erp_ai.erp_ai_agent.doctype.erp_ai_change_proposal.erp_ai_change_proposal.reject"
 UNDO_PATH = "erp_ai.erp_ai_agent.doctype.erp_ai_change_proposal.erp_ai_change_proposal.undo"
+CONFIRM_RESTART_PATH = (
+	"erp_ai.erp_ai_agent.doctype.erp_ai_change_proposal.erp_ai_change_proposal.confirm_restart"
+)
 ROLE_CHECK = 'frappe.user.has_role("ERP AI Instructor")'
+# Design 3.7 line 5 of the block notes, which the undo confirmation repeats.
+COMMAND_UNDO_NOTE = "Lệnh trong khối không hoàn tác được; hoàn tác chỉ trả lại phần file."
+# The only pieces a form condition is written with; anything else makes `_condition_holds` fail.
+_CONDITION_TOKEN = re.compile(
+	r"\s+|frm\.doc\.(?P<field>\w+)|frappe\.user\.has_role\(\"(?P<role>[^\"]+)\"\)"
+	r'|"(?P<text>[^"\\]*)"|(?P<op>===|!==|&&|\|\||!|\(|\))'
+)
+_CONDITION_OPERATORS = {"===": " == ", "!==": " != ", "&&": " and ", "||": " or ", "(": "(", ")": ")"}
 
 
 def _without_comments(source: str) -> str:
@@ -1403,6 +1414,47 @@ def _block_after(source: str, condition_pattern: str) -> str:
 	return match.group(2) if match else ""
 
 
+def _function_return(source: str, name: str) -> str:
+	"""The expression of `function <name>(frm) { return <expression>; }`, the whole body of that function."""
+	match = re.search(r"\nfunction " + name + r"\(frm\) \{\s*return (.*?);\s*\n\}", source, re.DOTALL)
+	return match.group(1) if match else ""
+
+
+def _condition_holds(expression: str, doc: dict, roles: set) -> bool:
+	"""Value of a form condition for one document and one user's roles, read token by token.
+
+	Only `frm.doc.<field>`, `frappe.user.has_role("<role>")`, string literals, `===`, `!==`, `&&`, `||`,
+	`!` and parentheses are understood, with JavaScript truthiness for an empty or missing field.
+	`!` must stand right before a field or a role check, so it binds as tightly as in JavaScript.
+	"""
+	if not expression:
+		raise AssertionError("condition not found in the form script")
+	parts, at, negate = [], 0, False
+	while at < len(expression):
+		token = _CONDITION_TOKEN.match(expression, at)
+		if not token:
+			raise AssertionError(f"condition piece not understood: {expression[at:at + 30]!r}")
+		at = token.end()
+		if token.group("field"):
+			atom = f"doc.get({token.group('field')!r})"
+		elif token.group("role"):
+			atom = f"({token.group('role')!r} in roles)"
+		elif token.group("text") is not None:
+			atom = repr(token.group("text"))
+		elif token.group("op") == "!":
+			negate = True
+			continue
+		elif token.group("op"):
+			atom = _CONDITION_OPERATORS[token.group("op")]
+		else:
+			continue
+		if negate and not (token.group("field") or token.group("role")):
+			raise AssertionError(f"`!` before something other than a field or a role check: {expression!r}")
+		parts.append(f"(not {atom})" if negate else atom)
+		negate = False
+	return bool(eval("".join(parts), {"__builtins__": {}}, {"doc": doc, "roles": roles}))
+
+
 class TestChangeProposalFormScript(FrappeTestCase):
 	"""Design 3.3 "Form Desk", AC-5, AC-22, ADR-022 QĐ 9: static rules on the form script text.
 
@@ -1440,11 +1492,8 @@ class TestChangeProposalFormScript(FrappeTestCase):
 			self.assertRegex(pending, _button_pattern("Từ chối", REJECT_PATH))
 			self.assertNotIn(UNDO_PATH, pending)
 
-		with self.subTest(rule="Hoàn tác only when Đã áp dụng and Thay đổi code"):
-			applied = _block_after(
-				source,
-				r'frm\.doc\.change_status === "Đã áp dụng" &&\s*frm\.doc\.change_kind === "Thay đổi code"',
-			)
+		with self.subTest(rule="Hoàn tác only when undo_allowed"):
+			applied = _block_after(source, r"undo_allowed\(frm\)")
 			self.assertRegex(applied, _button_pattern("Hoàn tác", UNDO_PATH))
 			self.assertNotIn(APPROVE_PATH, applied)
 			self.assertNotIn(REJECT_PATH, applied)
@@ -1477,8 +1526,9 @@ class TestChangeProposalFormScript(FrappeTestCase):
 
 		with self.subTest(rule="signed link: one extra POST call to decide, no confirm (ADR-023 QĐ 1)"):
 			outside = source.replace(helper.group(0), "")
-			self.assertEqual(outside.count("frappe.call("), 1)
-			call_at = outside.index("frappe.call(")
+			# The other call outside the helper is the one to confirm_restart (T25); its shape is pinned in test_calls_confirm_restart_only_when_sent.
+			self.assertEqual(outside.count("frappe.call("), 2)
+			call_at = outside.index("frappe.call(", outside.index("\nfunction decide_from_link(frm) {"))
 			function_at = outside.rindex("\nfunction ", 0, call_at)
 			function_end = outside.index("\n}", call_at)
 			auto_block = outside[function_at:function_end]
@@ -1570,12 +1620,14 @@ class TestChangeProposalFormScript(FrappeTestCase):
 			pending = _block_after(source, r'frm\.doc\.change_status === "Chờ duyệt"')
 			self.assertNotIn("Không có gì được ghi", source)
 			self.assertIn("Không có file nào được ghi, không có lệnh nào chạy.", pending)
-			applied = _block_after(
-				source,
-				r'frm\.doc\.change_status === "Đã áp dụng" &&\s*frm\.doc\.change_kind === "Thay đổi code"',
+			undo_message = re.search(
+				r"function undo_confirm_message\(frm, notes\) \{\n(.*?)\n\}", source, re.DOTALL
 			)
+			self.assertIsNotNone(undo_message, "undo_confirm_message missing")
 			self.assertNotIn("File được ghi lại như cũ", source)
-			self.assertIn("file mới thì bị xóa", applied)
+			self.assertIn("file mới thì bị xóa", undo_message.group(1))
+			# New value (design 3.3): both wordings of the confirmation, block and single change, say it.
+			self.assertEqual(undo_message.group(1).count("file mới thì bị xóa"), 2)
 
 		with self.subTest(rule="no HTML built by concatenation"):
 			self.assertNotIn("`", source)
@@ -1593,3 +1645,181 @@ class TestChangeProposalFormScript(FrappeTestCase):
 		):
 			with self.subTest(forbidden=forbidden):
 				self.assertNotIn(forbidden, source)
+
+	def _undo_shown(self, **fields) -> bool:
+		doc = {"change_kind": CHANGE_KIND_CODE, "apply_commit_sha": "", "undo_commit_sha": "", **fields}
+		return _condition_holds(_function_return(self.source, "undo_allowed"), doc, {ROLE_INSTRUCTOR})
+
+	def test_undo_button_shown_for_failed_with_commit(self):
+		# Design 3.3 `undo`: Đã áp dụng, or Lỗi with an apply commit and no undo commit, for Thay đổi code.
+		applied = _block_after(self.source, r"undo_allowed\(frm\)")
+		self.assertRegex(
+			applied,
+			r'add_action_button\(\s*frm,\s*__\("Hoàn tác"\),\s*undo_confirm_message\(frm, notes\),\s*"'
+			+ re.escape(UNDO_PATH)
+			+ r'"\s*\)',
+		)
+		self.assertEqual(self.source.count("undo_allowed(frm)"), 2)
+		sha = "a" * 40
+		for name, fields, shown in (
+			("applied", {"change_status": CHANGE_STATUS_APPLIED}, True),
+			("applied with commit", {"change_status": CHANGE_STATUS_APPLIED, "apply_commit_sha": sha}, True),
+			("failed with commit", {"change_status": CHANGE_STATUS_FAILED, "apply_commit_sha": sha}, True),
+			("failed without commit", {"change_status": CHANGE_STATUS_FAILED}, False),
+			("failed commit None", {"change_status": CHANGE_STATUS_FAILED, "apply_commit_sha": None}, False),
+			(
+				"failed already undone",
+				{"change_status": CHANGE_STATUS_FAILED, "apply_commit_sha": sha, "undo_commit_sha": "b" * 40},
+				False,
+			),
+			(
+				"failed command kind",
+				{
+					"change_status": CHANGE_STATUS_FAILED,
+					"apply_commit_sha": sha,
+					"change_kind": CHANGE_KIND_COMMAND,
+				},
+				False,
+			),
+			(
+				"applied command kind",
+				{"change_status": CHANGE_STATUS_APPLIED, "change_kind": CHANGE_KIND_COMMAND},
+				False,
+			),
+			("undone", {"change_status": CHANGE_STATUS_UNDONE, "apply_commit_sha": sha}, False),
+			("undoing", {"change_status": CHANGE_STATUS_UNDOING, "apply_commit_sha": sha}, False),
+			("pending", {"change_status": CHANGE_STATUS_PENDING}, False),
+			("stale with commit", {"change_status": CHANGE_STATUS_STALE, "apply_commit_sha": sha}, False),
+		):
+			with self.subTest(case=name):
+				self.assertIs(self._undo_shown(**fields), shown)
+
+	def test_undo_confirmation_counts_items_and_names_commands(self):
+		# AC-42: the block's item count, and the command line of the notes, are said before the click.
+		body = re.search(r"function undo_confirm_message\(frm, notes\) \{\n(.*?)\n\}", self.source, re.DOTALL)
+		self.assertIsNotNone(body, "undo_confirm_message missing")
+		literal = re.search(r'const COMMAND_UNDO_NOTE_PREFIX = "([^"]+)";', self.source)
+		self.assertIsNotNone(literal, "COMMAND_UNDO_NOTE_PREFIX")
+		self.assertTrue(literal.group(1).startswith("Lệnh trong khối không hoàn tác được"))
+		rows = [{"operation": CHANGE_OP_EDIT, "file_path": "myapp/myapp/a.py", "idx": 1}]
+		for commands, has_note in (([["migrate"]], True), ([], False)):
+			with self.subTest(commands=commands):
+				notes = change_text.proposal_notes(
+					{
+						"change_kind": CHANGE_KIND_CODE,
+						"operations": rows,
+						"command_list": json.dumps(commands),
+					}
+				)
+				self.assertIs(any(note.startswith(literal.group(1)) for note in notes), has_note)
+				self.assertIs(COMMAND_UNDO_NOTE in notes, has_note)
+		self.assertRegex(
+			body.group(1),
+			_statement(
+				"const items = (frm.doc.operations || []).length; const lines = items ? [__("
+				+ json.dumps(
+					"Hoàn tác khối {0} mục? File trở lại như trước khi áp dụng (file mới thì bị xóa)"
+					" và có một commit hoàn tác.",
+					ensure_ascii=False,
+				)
+				+ ", [items])] : [__("
+				+ json.dumps(
+					"Hoàn tác thay đổi này? File trở lại như trước khi áp dụng (file mới thì bị xóa)"
+					" và có một commit hoàn tác.",
+					ensure_ascii=False,
+				)
+				+ ")];"
+				" const command_note = notes.find((note) => note.startsWith(COMMAND_UNDO_NOTE_PREFIX));"
+				" if (command_note) { lines.push(command_note); }"
+				' return lines.map(frappe.utils.escape_html).join("<br>");'
+			),
+		)
+
+	def _confirm_called(self, restart_status, roles) -> bool:
+		doc = {"restart_status": restart_status, "change_status": CHANGE_STATUS_APPLIED}
+		return _condition_holds(_function_return(self.source, "restart_check_due"), doc, roles)
+
+	def test_calls_confirm_restart_only_when_sent(self):
+		# Design 4.4 step 5 and arch-ruling-3 (ADR-040 C-4): once on open, only from Đã gửi; the answer's
+		# `status` is compared with the field and the form reloads only when it changed.
+		source = self.source
+		self.assertEqual(source.count(f'"{CONFIRM_RESTART_PATH}"'), 1)
+		onload = re.search(r"\n\tonload\(frm\) \{\n(.*?)\n\t\},", source, re.DOTALL)
+		self.assertIsNotNone(onload, "onload handler missing")
+		self.assertRegex(onload.group(1), _statement("confirm_restart_on_open(frm);"))
+		self.assertEqual(source.count("confirm_restart_on_open(frm)"), 2)
+		function = re.search(r"\nfunction confirm_restart_on_open\(frm\) \{\n(.*?)\n\}", source, re.DOTALL)
+		self.assertIsNotNone(function, "confirm_restart_on_open missing")
+		self.assertRegex(
+			function.group(1),
+			_statement(
+				"if (!restart_check_due(frm)) { return; } frappe.call({ method: "
+				+ json.dumps(CONFIRM_RESTART_PATH)
+				+ ', args: { name: frm.doc.name }, type: "POST", callback: (r) => {'
+				" if (r.message.status !== frm.doc.restart_status) { frm.reload_doc(); } }, });"
+			),
+		)
+		self.assertEqual(source.count("restart_check_due(frm)"), 2)
+		self.assertNotIn("message.restart_status", source)
+		self.assertNotIn("frappe.realtime", source)
+		self.assertNotIn("open_doc:", source)
+		for status, called in (
+			(RESTART_STATUS_SENT, True),
+			(RESTART_STATUS_CONFIRMED, False),
+			(RESTART_STATUS_UNCONFIRMED, False),
+			(RESTART_STATUS_LAUNCH_FAILED, False),
+			("", False),
+			(None, False),
+		):
+			with self.subTest(restart_status=status):
+				self.assertIs(self._confirm_called(status, {ROLE_INSTRUCTOR}), called)
+
+	def test_confirm_restart_called_only_for_instructor(self):
+		# Design addendum 1 A-2.1, D-17: a System Manager without the Instructor role gets no call, so no error box.
+		for roles, called in (
+			({ROLE_INSTRUCTOR}, True),
+			({ROLE_INSTRUCTOR, "System Manager"}, True),
+			({"System Manager"}, False),
+			(set(), False),
+		):
+			with self.subTest(roles=sorted(roles)):
+				self.assertIs(self._confirm_called(RESTART_STATUS_SENT, roles), called)
+
+	def test_form_diff_covers_every_item(self):
+		# AC-48 (form): the one `diff` field Desk receives holds the hunk of every item of the block.
+		operations = [
+			{"kind": CHANGE_OP_EDIT, "path": "myapp/myapp/a.py", "before": "x = 1\n", "after": "x = 2\n"},
+			{"kind": CHANGE_OP_CREATE, "path": "myapp/myapp/new/b.py", "after": "y = 1\n"},
+			{"kind": CHANGE_OP_DELETE, "path": "myapp/myapp/c.py", "before": "z = 1\n"},
+			{
+				"kind": CHANGE_OP_RENAME,
+				"path": "myapp/myapp/d.py",
+				"new_path": "myapp/myapp/e.py",
+				"before": "w = 1\n",
+				"after": "w = 1\n",
+			},
+		]
+		proposal = make_block_proposal(operations, [["migrate"], ["restart"]])
+		frappe.response.docs = []
+		try:
+			frappe.desk.form.load.getdoc(PROPOSAL_DOCTYPE, proposal.name)
+			diff = frappe.response.docs[0].diff
+		finally:
+			frappe.response.docs = []
+		for name, segment in (
+			("edit", "--- a/myapp/myapp/a.py\n+++ b/myapp/myapp/a.py\n@@ -1 +1 @@\n-x = 1\n+x = 2\n"),
+			("create", "--- /dev/null\n+++ b/myapp/myapp/new/b.py\n@@ -0,0 +1 @@\n+y = 1\n"),
+			("delete", "--- a/myapp/myapp/c.py\n+++ /dev/null\n@@ -1 +0,0 @@\n-z = 1\n"),
+			("rename", "rename from myapp/myapp/d.py\nrename to myapp/myapp/e.py\n"),
+		):
+			with self.subTest(item=name):
+				self.assertIn(segment, diff)
+		fields = _fields_by_name()
+		self.assertEqual(fields["diff"]["fieldtype"], "Code")
+		self.assertFalse(fields["diff"].get("hidden"))
+		self.assertFalse(fields["diff"].get("depends_on"))
+		self.assertLess(FIELD_ORDER.index("section_diff"), FIELD_ORDER.index("diff"))
+		self.assertLess(FIELD_ORDER.index("diff"), FIELD_ORDER.index("section_content"))
+		# The form script never hides or trims the field.
+		self.assertNotIn('"diff"', self.source)
+		self.assertNotIn(".diff", self.source)

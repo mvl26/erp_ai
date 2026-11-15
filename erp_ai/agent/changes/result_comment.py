@@ -98,3 +98,59 @@ def post_result(proposal_name: str) -> str | None:
 		return None
 	text = frappe.utils.escape_html(LINE_SEPARATOR.join(result_lines(fields)))
 	return frappe.get_doc(TICKET_DOCTYPE, fields.ticket).add_comment(COMMENT_TYPE_INFO, text).name
+
+
+# CHG-002 design 3.7: the only fields the restart notice reads; never `upstream_ref` (a remote URL).
+NOTICE_FIELDS = (
+	"name",
+	"ticket",
+	"app",
+	"target_branch",
+	"applied_branch",
+	"apply_commit_sha",
+	"undo_commit_sha",
+)
+NOTICE_ACTIONS = {"apply": ("áp dụng", "apply_commit_sha"), "undo": ("hoàn tác", "undo_commit_sha")}
+
+
+def restart_notice_text(fields: dict, action: str) -> str:
+	"""The comment written before a restart (CHG-002 design 3.7, AC-46 b); pure, unknown action → KeyError.
+
+	The action's sha set → the commit template: commit, branch, app and the `git revert` recovery.
+	The sha empty (`None` or "") → the no-commit template of addendum-5 P-2: only `bench restart`, and
+	neither `app` nor a branch is read.
+	"""
+	verb, sha_field = NOTICE_ACTIONS[action]
+	sha = fields.get(sha_field) or ""
+	if not sha:
+		return (
+			f"Đề xuất {fields.get('name')} đã {verb}. Hệ thống sắp restart bench. "
+			"Nếu site không lên sau vài phút: trên máy chủ chạy `bench restart`."
+		)
+	app = fields.get("app")
+	branch = fields.get("applied_branch") or fields.get("target_branch")
+	return (
+		f"Đề xuất {fields.get('name')} đã {verb}: commit {sha[:SHORT_SHA_CHARS]} trên nhánh {branch} của app {app}. "
+		"Hệ thống sắp restart bench. Nếu site không lên sau vài phút: trên máy chủ chạy "
+		f"`git -C apps/{app} revert --no-edit {sha}` rồi `bench restart`."
+	)
+
+
+def post_restart_notice(name: str, action: str) -> str | None:
+	"""Write one `Info` notice on the proposal's ticket as the session user and return the Comment name.
+
+	Same `add_comment` call as `post_result` (addendum-3 RQ-4). No proposal or no ticket → None. A failed
+	write is logged like the job logs `post_result` and returns None: the restart still goes ahead (STD-ERR-1).
+	Never commits: the caller does.
+	"""
+	try:
+		fields = frappe.db.get_value(PROPOSAL_DOCTYPE, name, list(NOTICE_FIELDS), as_dict=True)
+		if not fields or not fields.ticket or not frappe.db.exists(TICKET_DOCTYPE, fields.ticket):
+			return None
+		text = frappe.utils.escape_html(restart_notice_text(fields, action))
+		return frappe.get_doc(TICKET_DOCTYPE, fields.ticket).add_comment(COMMENT_TYPE_INFO, text).name
+	except Exception as exc:
+		frappe.log_error(
+			TITLE_RESULT_COMMENT_FAILED, f"proposal={name} action={action} error={type(exc).__name__}"
+		)
+		return None

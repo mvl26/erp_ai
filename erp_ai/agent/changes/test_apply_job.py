@@ -3,6 +3,7 @@ import dataclasses
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -1732,8 +1733,8 @@ class TestUndoCode(ApplyJobTestCase):
 			frappe.set_user(ACTOR)
 
 		def guard_refusal():
-			# The guard of design 3.2 with the extension list of today: `.py` is no longer writable.
-			patcher = patch.object(source, "DUOI_CHO_PHEP", {".txt"})
+			# The guard of design 3.2 with a patched secret-name list: `mod.py` is now a secret name.
+			patcher = patch.object(source, "TEN_CAM", re.compile(re.escape(os.path.basename(REL))))
 			patcher.start()
 			return patcher
 
@@ -1742,7 +1743,7 @@ class TestUndoCode(ApplyJobTestCase):
 			("wrong session user", approver_session, "sai người chạy job"),
 			("role lost", role_lost, "người duyệt không còn quyền"),
 			("digest edited", digest_edited, "nội dung đề xuất đã bị sửa sau khi duyệt"),
-			("guard refusal", guard_refusal, "đuôi file không được phép"),
+			("guard refusal", guard_refusal, change_guard.NAME_FORBIDDEN),
 		)
 		for label, change, reason in cases:
 			with self.subTest(label):

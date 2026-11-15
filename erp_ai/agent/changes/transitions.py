@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+from datetime import datetime
 
 import frappe
 from frappe.utils import now_datetime
@@ -10,6 +11,7 @@ from erp_ai.agent.changes import block
 from erp_ai.agent.changes.process_runner import CommandResult
 from erp_ai.agent.run_log import ENTRY_TYPE_CHANGE, write_entry
 from erp_ai.constants import (
+	CHANGE_KIND_CODE,
 	CHANGE_KIND_COMMAND,
 	CHANGE_STATUS_APPLIED,
 	CHANGE_STATUS_APPLYING,
@@ -21,6 +23,10 @@ from erp_ai.constants import (
 	CHANGE_STATUS_UNDOING,
 	CHANGE_STATUS_UNDONE,
 	PROPOSAL_DOCTYPE,
+	RESTART_STATUS_CONFIRMED,
+	RESTART_STATUS_LAUNCH_FAILED,
+	RESTART_STATUS_SENT,
+	RESTART_STATUS_UNCONFIRMED,
 	TRIGGER_CHANGE_ACTION,
 )
 
@@ -36,7 +42,11 @@ STATE_FIELDS = (
 	"exit_code",
 	"duration_ms",
 	"command_output",
+	"command_results",
 	"failure_reason",
+	"created_dirs",
+	"restart_status",
+	"restart_sent_at",
 	"applied_branch",
 	"applied_ahead_count",
 	"apply_commit_sha",
@@ -69,8 +79,21 @@ OPERATION_DIGEST_FIELDS = (
 	"content_after",
 	"after_hash",
 )
-# The state fields a job may pass to `finish(fields=)` (design 3.5, round 1).
-GIT_RESULT_FIELDS = ("applied_branch", "applied_ahead_count", "apply_commit_sha", "undo_commit_sha")
+# The state fields a job may pass to `finish(fields=)` and `record_commit(fields=)` (design 3.5, round 1;
+# CHG-002 design 3.6). `created_dirs` is given as a list and stored as JSON.
+GIT_RESULT_FIELDS = (
+	"applied_branch",
+	"applied_ahead_count",
+	"apply_commit_sha",
+	"undo_commit_sha",
+	"created_dirs",
+)
+# CHG-002 design 3.6: the states `record_commit` writes in (a job between its commit and its end).
+RECORD_COMMIT_STATES = (CHANGE_STATUS_APPLYING, CHANGE_STATUS_UNDOING)
+# CHG-002 design 3.6: the states a restart is launched from, its two launch outcomes, its two conclusions.
+RESTART_EXPECTED_STATES = (CHANGE_STATUS_APPLIED, CHANGE_STATUS_UNDONE)
+RESTART_LAUNCH_VALUES = (RESTART_STATUS_SENT, RESTART_STATUS_LAUNCH_FAILED)
+RESTART_CONCLUSIONS = (RESTART_STATUS_CONFIRMED, RESTART_STATUS_UNCONFIRMED)
 # Design 2.2: the edges a job ends with, each with the one log step it writes.
 FINISH_EDGES = {
 	(CHANGE_STATUS_APPROVED, CHANGE_STATUS_FAILED): "fail",
@@ -107,10 +130,12 @@ def content_digest(doc) -> str:
 	"""sha256 hex of the JSON list of the 14 design 2.3 fields (`ensure_ascii=False`), as stored on `doc`.
 
 	A block proposal (CHG-002 design 2.4) appends the list of its child rows in `idx` order, each as
-	`OPERATION_DIGEST_FIELDS`, then its `command_list`; the old shape keeps its digest byte for byte.
+	`OPERATION_DIGEST_FIELDS`, then its `command_list`; the old shape keeps its digest byte for byte and
+	only for its two kinds (A3 RQ-5).
 
 	Raises:
-		ValueError: `doc` is not an ERP AI Change Proposal.
+		ValueError: `doc` is not an ERP AI Change Proposal, or it has the old shape and a `change_kind`
+			other than a file change or a bench command.
 	"""
 	_require_proposal(doc)
 	values = [doc.get(fieldname) for fieldname in DIGEST_FIELDS]
@@ -118,6 +143,8 @@ def content_digest(doc) -> str:
 		rows = sorted(doc.get("operations") or [], key=lambda row: row.idx)
 		values.append([[row.get(fieldname) for fieldname in OPERATION_DIGEST_FIELDS] for row in rows])
 		values.append(doc.get("command_list"))
+	else:
+		block.require_code_kind(doc)
 	return hashlib.sha256(json.dumps(values, ensure_ascii=False).encode("utf-8")).hexdigest()
 
 
@@ -155,8 +182,8 @@ def _require_text(value, label) -> None:
 		raise ValueError(f"{label} must be a non-empty string, got {value!r}")
 
 
-def _lock(name) -> frappe._dict:
-	"""Lock the proposal row (D-2) and return its `change_status` and `change_kind`.
+def _lock(name, *extra) -> frappe._dict:
+	"""Lock the proposal row (D-2); return its `change_status`, `change_kind`, both commit SHAs and `extra` fields.
 
 	Raises:
 		ValueError: `name` is not a non-empty string.
@@ -164,7 +191,11 @@ def _lock(name) -> frappe._dict:
 	"""
 	_require_text(name, "name")
 	row = frappe.db.get_value(
-		PROPOSAL_DOCTYPE, name, ["change_status", "change_kind"], as_dict=True, for_update=True
+		PROPOSAL_DOCTYPE,
+		name,
+		["change_status", "change_kind", "apply_commit_sha", "undo_commit_sha", *extra],
+		as_dict=True,
+		for_update=True,
 	)
 	if row is None:
 		frappe.throw(f"Không có đề xuất {frappe.utils.escape_html(name)}", frappe.DoesNotExistError)
@@ -206,15 +237,24 @@ def reject(name, user) -> str:
 def request_undo(name, user) -> str:
 	"""`Đã áp dụng → Đang hoàn tác` for a code change: write `undo_by`, `undo_at`; the job logs `undo`.
 
+	CHG-002 design 3.3, 4.3: also from `Lỗi` when the change is `Thay đổi code`, its `apply_commit_sha`
+	is set and its `undo_commit_sha` is empty.
+
 	Raises:
-		InvalidTransition: a bench command (any state), or a code change not `Đã áp dụng`; nothing is written.
+		InvalidTransition: a bench command (any state), or a change that has neither edge; nothing is written.
 		ValueError, frappe.DoesNotExistError: see `_lock`; `user` is not a non-empty string.
 	"""
 	_require_text(user, "user")
 	row = _lock(name)
 	if row.change_kind == CHANGE_KIND_COMMAND:
 		frappe.throw("Lệnh bench không hoàn tác được", InvalidTransition)
-	if row.change_status != CHANGE_STATUS_APPLIED:
+	undoable_failure = (
+		row.change_status == CHANGE_STATUS_FAILED
+		and row.change_kind == CHANGE_KIND_CODE
+		and bool(row.apply_commit_sha)
+		and not row.undo_commit_sha
+	)
+	if row.change_status != CHANGE_STATUS_APPLIED and not undoable_failure:
 		_refuse(row.change_status, "hoàn tác")
 	frappe.db.set_value(
 		PROPOSAL_DOCTYPE,
@@ -239,6 +279,87 @@ def begin_apply(name) -> bool:
 	return True
 
 
+def _git_values(fields) -> dict:
+	"""The column values of the git `fields`; `created_dirs` (a list) becomes JSON.
+
+	Raises:
+		ValueError: `fields` is not a dict of `GIT_RESULT_FIELDS` keys, or `created_dirs` is not a list.
+	"""
+	fields = {} if fields is None else fields
+	if not isinstance(fields, dict) or not set(fields) <= set(GIT_RESULT_FIELDS):
+		raise ValueError(f"fields must be a dict of {GIT_RESULT_FIELDS}, got {fields!r}")
+	values = dict(fields)
+	if "created_dirs" in values:
+		if not isinstance(values["created_dirs"], list):
+			raise ValueError(f"created_dirs must be a list, got {values['created_dirs']!r}")
+		values["created_dirs"] = json.dumps(values["created_dirs"], ensure_ascii=False)
+	return values
+
+
+def record_commit(name, expected, *, fields) -> bool:
+	"""Write the git `fields` of a job's commit while it is still `expected`; status and log stay as they are.
+
+	`expected` is `Đang áp dụng` or `Đang hoàn tác` (CHG-002 design 3.6). Returns `False` and writes
+	nothing when the proposal is no longer `expected`.
+
+	Raises:
+		ValueError: `expected` is not a running state; `fields` as `_git_values`; see `_lock`.
+		frappe.DoesNotExistError: see `_lock`.
+	"""
+	if expected not in RECORD_COMMIT_STATES:
+		raise ValueError(f"record_commit runs in {RECORD_COMMIT_STATES}, got {expected!r}")
+	values = _git_values(fields)
+	if _lock(name).change_status != expected:
+		return False
+	frappe.db.set_value(PROPOSAL_DOCTYPE, name, values, update_modified=True)
+	return True
+
+
+def record_restart(name, expected, value, sent_at) -> bool:
+	"""Store the launch outcome of a restart (`value`) and `sent_at` while the proposal is still `expected`.
+
+	`expected` is `Đã áp dụng` or `Đã hoàn tác`, `value` is `Đã gửi` or `Lỗi khởi chạy` (CHG-002 design
+	3.6, 4.4 step 3). `change_status` stays as it is and no log row is written. Returns `False` and writes
+	nothing when the proposal is no longer `expected`.
+
+	Raises:
+		ValueError: `expected`, `value` outside those sets, or `sent_at` not a datetime; see `_lock`.
+		frappe.DoesNotExistError: see `_lock`.
+	"""
+	if expected not in RESTART_EXPECTED_STATES:
+		raise ValueError(f"record_restart runs in {RESTART_EXPECTED_STATES}, got {expected!r}")
+	if value not in RESTART_LAUNCH_VALUES:
+		raise ValueError(f"value must be one of {RESTART_LAUNCH_VALUES}, got {value!r}")
+	if not isinstance(sent_at, datetime):
+		raise ValueError(f"sent_at must be a datetime, got {sent_at!r}")
+	if _lock(name).change_status != expected:
+		return False
+	frappe.db.set_value(
+		PROPOSAL_DOCTYPE,
+		name,
+		{"restart_status": value, "restart_sent_at": sent_at},
+		update_modified=True,
+	)
+	return True
+
+
+def confirm_restart(name, value) -> bool:
+	"""`restart_status`: `Đã gửi → value`, `value` being `Đã xác nhận` or `Chưa xác nhận` (CHG-002 design 3.6).
+
+	Returns `False` and writes nothing when `restart_status` is not `Đã gửi`. No log row is written.
+
+	Raises:
+		ValueError: `value` outside that set; see `_lock`.
+		frappe.DoesNotExistError: see `_lock`.
+	"""
+	if value not in RESTART_CONCLUSIONS:
+		raise ValueError(f"value must be one of {RESTART_CONCLUSIONS}, got {value!r}")
+	if _lock(name, "restart_status").restart_status != RESTART_STATUS_SENT:
+		return False
+	frappe.db.set_value(PROPOSAL_DOCTYPE, name, {"restart_status": value}, update_modified=True)
+	return True
+
+
 def finish(
 	name,
 	expected,
@@ -251,17 +372,18 @@ def finish(
 	fields=None,
 	before=None,
 	after=None,
+	command_results=None,
 ) -> bool:
 	"""End a job: `expected → new_status` (an edge of `FINISH_EDGES` with its `step`) and one log row.
 
-	Writes `finished_at`, `failure_reason = reason`, the git `fields` and, with a `CommandResult`
-	`result`, `exit_code`/`duration_ms`/`command_output` (also the row's `value_after`). `before` and
-	`after` go to the row's `value_before`/`value_after` (design 4.3 step 3.7, 4.4 step 7).
-	Returns `False` and writes nothing when the proposal is no longer `expected`.
+	Writes `finished_at`, `failure_reason = reason`, the git `fields`, `command_results` (a list, stored
+	as JSON) and, with a `CommandResult` `result`, `exit_code`/`duration_ms`/`command_output` (also the
+	row's `value_after`). `before` and `after` go to the row's `value_before`/`value_after` (design 4.3
+	step 3.7, 4.4 step 7). Returns `False` and writes nothing when the proposal is no longer `expected`.
 
 	Raises:
-		ValueError: not an edge of `FINISH_EDGES` or `step` not its step; `fields` not a dict of
-			`GIT_RESULT_FIELDS` keys; `result` not a `CommandResult`, or given with `after`; `actor`
+		ValueError: not an edge of `FINISH_EDGES` or `step` not its step; `fields` as `_git_values`;
+			`command_results` not a list; `result` not a `CommandResult`, or given with `after`; `actor`
 			not a non-empty string; see `_lock`.
 		frappe.DoesNotExistError: see `_lock`.
 	"""
@@ -270,9 +392,11 @@ def finish(
 		raise ValueError(f"{expected!r} → {new_status!r} is not a job edge")
 	if step != edge_step:
 		raise ValueError(f"{expected!r} → {new_status!r} logs step {edge_step!r}, got {step!r}")
-	fields = {} if fields is None else fields
-	if not isinstance(fields, dict) or not set(fields) <= set(GIT_RESULT_FIELDS):
-		raise ValueError(f"fields must be a dict of {GIT_RESULT_FIELDS}, got {fields!r}")
+	fields = _git_values(fields)
+	if command_results is not None:
+		if not isinstance(command_results, list):
+			raise ValueError(f"command_results must be a list, got {command_results!r}")
+		fields["command_results"] = json.dumps(command_results, ensure_ascii=False)
 	if result is not None:
 		if not isinstance(result, CommandResult):
 			raise ValueError(f"result must be a CommandResult, got {result!r}")

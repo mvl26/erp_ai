@@ -3883,10 +3883,11 @@ REMOVED_GRANT_NAMES = ("_unrestricted_specs", "get_unrestricted_tool_schemas")
 GRANT_TABLE_NAME = "GRANT_TABLE"
 SCHEMA_FUNCTION = "get_tool_schemas"
 SCHEMA_CALL_MARK = "schema"
+RUNNER_SCHEMA_CALL = "schemas"
 SPEC_SOURCE = "_all_specs"
 IDENTIFIER = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 TOOL_MODULES_NAME = "TOOL_MODULES"
-SPEC_CONSUMERS = (SCHEMA_FUNCTION, "_grants_group", "execute_tool")
+SPEC_CONSUMERS = (SCHEMA_FUNCTION, "execute_tool")
 AGENT_WRITE_OPENER = "allow_agent_write"
 AGENT_WRITE_OPENER_FILES = (RUN_LOG_FILE, PROPOSE_TOOL_FILE)
 AGENT_WRITE_FLAG_NAME = "AGENT_WRITE_FLAG"
@@ -4099,8 +4100,8 @@ def _grant_path_violations(tree: ast.Module, reader: str) -> list:
 
 def check_registry_has_one_grant_function(sources: dict) -> list:
 	"""ADR-023 Ràng buộc (ADR-011 QĐ 6): one grant table read by one grant function in registry.py; the
-	removed names `_unrestricted_specs`, `get_unrestricted_tool_schemas` exist nowhere; runner.py calls one
-	schema function, `get_tool_schemas`, once."""
+	removed names `_unrestricted_specs`, `get_unrestricted_tool_schemas` exist nowhere; runner.py makes one
+	schema call, `.schemas()` on the Grant (U1), once."""
 	violations = []
 	for rel, source in only_python(sources).items():
 		tree = parse(rel, source)
@@ -4153,10 +4154,10 @@ def check_registry_has_one_grant_function(sources: dict) -> list:
 			if isinstance(node, ast.Call)
 		]
 		schema_calls = [(node, name) for node, name in calls if SCHEMA_CALL_MARK in name.lower()]
-		if [name for _node, name in schema_calls] != [SCHEMA_FUNCTION]:
+		if [name for _node, name in schema_calls] != [RUNNER_SCHEMA_CALL]:
 			violations.append(
 				f"{RUNNER_FILE}: schema calls {[violation(RUNNER_FILE, n, name) for n, name in schema_calls]}; "
-				f"exactly one {SCHEMA_FUNCTION}() call (ADR-023)"
+				f"exactly one .{RUNNER_SCHEMA_CALL}() call on the grant (ADR-023)"
 			)
 	return violations
 
@@ -5502,7 +5503,7 @@ class TestArchitecture(unittest.TestCase):
 
 	def test_registry_has_one_grant_function(self):
 		self.assertIn(f"{GRANT_TABLE_NAME} = (", self.sources[REGISTRY_FILE])
-		self.assertIn(f"{SCHEMA_FUNCTION}(", self.sources[RUNNER_FILE])
+		self.assertIn(f".{RUNNER_SCHEMA_CALL}()", self.sources[RUNNER_FILE])
 		self.assertEqual(check_registry_has_one_grant_function(self.sources), [])
 
 	def test_agent_write_flag_only_in_run_log_and_propose_tool(self):
@@ -8829,10 +8830,16 @@ class TestScannersCatchViolations(unittest.TestCase):
 		aliased = self.changed(
 			GRANT_CLEAN,
 			RUNNER_FILE,
-			replace=("import get_tool_schemas\n", "import get_tool_schemas as schemas\n"),
+			replace=("import grant\n", "import grant as issue\n"),
 		)
-		aliased[RUNNER_FILE] = aliased[RUNNER_FILE].replace("return get_tool_schemas(", "return schemas(")
+		aliased[RUNNER_FILE] = aliased[RUNNER_FILE].replace("granted = grant(", "granted = issue(")
 		self.assertEqual(check_registry_has_one_grant_function(aliased), [])
+		chained = self.changed(
+			GRANT_CLEAN,
+			RUNNER_FILE,
+			replace=("\tgranted = grant(inputs)\n\treturn granted.", "\treturn grant(inputs)."),
+		)
+		self.assertEqual(check_registry_has_one_grant_function(chained), [])
 		documented = self.changed(
 			GRANT_CLEAN,
 			QUEUE_FILE,
@@ -8868,15 +8875,20 @@ class TestScannersCatchViolations(unittest.TestCase):
 			"second table": (REGISTRY_FILE, f"\n{GRANT_TABLE_NAME} = ()\n", None),
 			"second schema call": (
 				RUNNER_FILE,
-				"\n\ndef again(grant):\n\treturn get_tool_schemas(*grant)\n",
+				"\n\ndef again(granted):\n\treturn granted.schemas()\n",
 				None,
 			),
 			"other schema function": (
 				RUNNER_FILE,
 				"",
-				("return get_tool_schemas(*grant)", "return registry.schemas_for(*grant)"),
+				("return granted.schemas()", "return registry.schemas_for(inputs)"),
 			),
-			"no schema call": (RUNNER_FILE, "", ("return get_tool_schemas(*grant)", "return []")),
+			"no schema call": (RUNNER_FILE, "", ("return granted.schemas()", "return []")),
+			"runner back on the legacy schema function": (
+				RUNNER_FILE,
+				"",
+				("return granted.schemas()", f"return {SCHEMA_FUNCTION}(inputs)"),
+			),
 			"removed name as dotted path": (
 				QUEUE_FILE,
 				"\nX = frappe.get_attr('erp_ai.agent.tools.registry.get_unrestricted_tool_schemas')\n",
@@ -8904,11 +8916,6 @@ class TestScannersCatchViolations(unittest.TestCase):
 				REGISTRY_FILE,
 				"",
 				("granted = _granted_specs(context.effective_level)", "granted = context.specs"),
-			),
-			"_grants_group skips the grant function": (
-				REGISTRY_FILE,
-				"",
-				("for spec in _granted_specs(level))", "for spec in ())"),
 			),
 			"execute_tool missing": (REGISTRY_FILE, "", ("def execute_tool(", "def run_tool(")),
 			"spec source reached from the runner": (
@@ -9226,19 +9233,16 @@ def {SCHEMA_FUNCTION}(level):
 	return _granted_specs(level)
 
 
-def _grants_group(group, level):
-	return any(spec.group == group for spec in _granted_specs(level))
-
-
 def execute_tool(name, arguments, context):
 	granted = _granted_specs(context.effective_level)
 	return next(spec for spec in granted if spec.name == name)
 """,
-	RUNNER_FILE: f"""from erp_ai.agent.tools.registry import {SCHEMA_FUNCTION}
+	RUNNER_FILE: f"""from erp_ai.agent.tools.registry import grant
 
 
-def run(grant):
-	return {SCHEMA_FUNCTION}(*grant)
+def run(inputs):
+	granted = grant(inputs)
+	return granted.{RUNNER_SCHEMA_CALL}()
 """,
 	QUEUE_FILE: "from erp_ai.agent.tools import registry\n",
 }

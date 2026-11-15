@@ -404,9 +404,9 @@ def build_reason_system(
 		routing_table,
 		CONVENTIONS,
 		CHANGE_TOOLS_BLOCK if change_tools else "",
-		SITE_ADMIN_TOOLS_BLOCK if site_admin_tools and not unrestricted_tools else "",
+		SITE_ADMIN_TOOLS_BLOCK if site_admin_tools else "",
 		UNRESTRICTED_TOOLS_BLOCK if unrestricted_tools else "",
-		ACT_NOW_BLOCK if act_now or change_tools or site_admin_tools or unrestricted_tools else "",
+		ACT_NOW_BLOCK if act_now else "",
 		ASK_ONLY_BLOCK if ask_only else "",
 	]
 	parts = [part for part in parts if part]

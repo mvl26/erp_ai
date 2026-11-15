@@ -21,14 +21,7 @@ from erp_ai.agent.routing import decide_route, departments, load_routing_config,
 from erp_ai.agent.run_log import ENTRY_TYPE_CHANGE, write_entry
 from erp_ai.agent.run_status import CLASSIFY_STEP, RunStatus
 from erp_ai.agent.tools.read import TOOL_RESULT_MAX_CHARS
-from erp_ai.agent.tools.registry import (
-	ToolContext,
-	execute_tool,
-	get_tool_schemas,
-	grants_change_tools,
-	grants_site_admin_tools,
-	grants_unrestricted_tools,
-)
+from erp_ai.agent.tools.registry import ToolContext, execute_tool, grant
 from erp_ai.agent.tools.route_ticket import (
 	ASSIGN_REQUEST,
 	NO_SLA,
@@ -648,16 +641,18 @@ def _reason(ticket_name, trigger, run_id, settings, context, classification, dea
 		["subject", "description", "status", "priority", "ticket_type", "agent_group", "creation"],
 		as_dict=True,
 	)
-	grant = (context.effective_level, bool(context.instructor), context.change_enabled, context.unrestricted)
-	tools = get_tool_schemas(*grant)
+	granted = grant(context.grant_inputs())
+	tools = granted.schemas()
 	if tools:
 		tools[-1]["cache_control"] = {"type": "ephemeral"}
 	system = build_reason_system(
 		settings.prompt_digest,
 		_routing_table(context),
-		change_tools=grants_change_tools(*grant),
-		site_admin_tools=grants_site_admin_tools(*grant),
-		unrestricted_tools=grants_unrestricted_tools(*grant),
+		change_tools=granted.change_block,
+		site_admin_tools=granted.record_block,
+		unrestricted_tools=granted.unrestricted_block,
+		act_now=granted.act_now_block,
+		ask_only=granted.ask_only_block,
 	)
 	messages = [{"role": "user", "content": build_initial_message(ticket, labelled, trigger, classification)}]
 	base = {

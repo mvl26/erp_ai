@@ -42,8 +42,7 @@ class ToolContext:
 	def grant_inputs(self) -> GrantInputs:
 		switches = PermissionSwitches(
 			unrestricted=self.unrestricted,
-			# temporary bridge, removed in T82, source design-w1-fixes-3.md Điểm 1
-			record_tools=self.record_tools or self.change_enabled,
+			record_tools=self.record_tools,
 			act_now=self.act_now,
 			code_change=self.change_enabled,
 			one_click_approval=self.one_click_approval,
@@ -173,49 +172,8 @@ def grant(inputs: GrantInputs) -> Grant:
 	)
 
 
-def _legacy_inputs(
-	effective_level: str, has_instructor: bool, change_enabled: bool, unrestricted: bool = False
-) -> GrantInputs:
-	# The old four-argument callers until T82: (2) and (4) both follow change_enabled; (3), (5) off.
-	return GrantInputs(
-		effective_level=effective_level,
-		main_path_level=effective_level,
-		has_instructor=has_instructor,
-		switches=PermissionSwitches(
-			unrestricted=unrestricted, record_tools=change_enabled, code_change=change_enabled
-		),
-	)
-
-
-def get_tool_schemas(
-	effective_level: str, has_instructor: bool, change_enabled: bool, unrestricted: bool = False
-) -> list[dict]:
-	return grant(_legacy_inputs(effective_level, has_instructor, change_enabled, unrestricted)).schemas()
-
-
-def _grants_group(
-	group: str, effective_level: str, has_instructor: bool, change_enabled: bool, unrestricted: bool
-) -> bool:
-	granted = grant(_legacy_inputs(effective_level, has_instructor, change_enabled, unrestricted)).specs
-	return any(spec.group == group for spec in granted)
-
-
-def grants_change_tools(
-	effective_level: str, has_instructor: bool, change_enabled: bool, unrestricted: bool = False
-) -> bool:
-	return _grants_group(CHANGE_GROUP, effective_level, has_instructor, change_enabled, unrestricted)
-
-
-def grants_site_admin_tools(
-	effective_level: str, has_instructor: bool, change_enabled: bool, unrestricted: bool = False
-) -> bool:
-	return _grants_group(SITE_ADMIN_GROUP, effective_level, has_instructor, change_enabled, unrestricted)
-
-
-def grants_unrestricted_tools(
-	effective_level: str, has_instructor: bool, change_enabled: bool, unrestricted: bool = False
-) -> bool:
-	return _grants_group(UNRESTRICTED_GROUP, effective_level, has_instructor, change_enabled, unrestricted)
+def get_tool_schemas(inputs: GrantInputs) -> list[dict]:
+	return grant(inputs).schemas()
 
 
 def _invalid(key) -> dict:

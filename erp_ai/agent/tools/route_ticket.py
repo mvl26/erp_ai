@@ -52,6 +52,7 @@ def apply_route(decision: RouteDecision, classification: Classification, ctx: To
 		ai_complexity=classification.complexity,
 		ai_importance=classification.importance,
 		ai_score_reason=classification.score_reason,
+		ai_confidence_pct=classification.confidence_pct,
 	)
 	for field in ("ai_classified_by", "ai_updated_at"):
 		if not doc.has_permlevel_access_to(field, permission_type="write"):

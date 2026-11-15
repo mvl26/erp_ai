@@ -2073,9 +2073,12 @@ class TestExcludedTicketWrites(_ExcludedTicketCase):
 			context = _context(unrestricted=unrestricted)
 			for doctype, values, column in cases:
 				with self.subTest(unrestricted=unrestricted, doctype=doctype, values=values):
+					# Helpdesk already made one Communication holding the description of the ticket itself.
+					seeded = {column: ["like", f"%{self.seed}%"]}
+					count = frappe.db.count(doctype, seeded)
 					result = site_api.create_record({"doctype": doctype, "values": values}, context)
 					self.assert_refused(result, doctype)
-					self.assertEqual(frappe.db.count(doctype, {column: ["like", f"%{self.seed}%"]}), 0)
+					self.assertEqual(frappe.db.count(doctype, seeded), count)
 		# The same link to a normal ticket is created.
 		values = {**comment, "reference_name": normal, "content": self.plain}
 		result = site_api.create_record({"doctype": "Comment", "values": values}, _context())

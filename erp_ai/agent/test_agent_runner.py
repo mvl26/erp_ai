@@ -16,7 +16,7 @@ from frappe.utils import escape_html
 from helpdesk.test_utils import make_ticket
 
 from erp_ai import handlers, tasks
-from erp_ai.agent import answer_delay, authority, missed_scan, policy, run_log, runner
+from erp_ai.agent import answer_delay, authority, messages, missed_scan, policy, run_log, runner
 from erp_ai.agent.agent_write_guard import allow_agent_write
 from erp_ai.agent.changes import apply_job, transitions
 from erp_ai.agent.classification import DEFAULT_CATEGORY_MAPPING
@@ -3343,9 +3343,12 @@ class TestRunnerGrant(RunnerTestBase):
 		)
 
 	def _comment(self, author, creation):
-		"""A human Comment on the ticket whose server-set author (`owner`) is `author`."""
-		name = frappe.get_doc("HD Ticket", self.ticket.name).add_comment("Comment", "x").name
-		frappe.db.set_value("Comment", name, {"owner": author, "creation": creation}, update_modified=False)
+		"""A `chat` message on the ticket whose server-set author (`owner`) is `author`."""
+		with patch.object(frappe, "enqueue"):
+			name = messages.add_message(self.ticket.name, "x", "chat", trusted=True)
+		frappe.db.set_value(
+			"ERP AI Message", name, {"owner": author, "creation": creation}, update_modified=False
+		)
 		return name
 
 	def _offered_groups(self, call):
@@ -5810,7 +5813,7 @@ class TestRequesterReplyRun(RequesterReplyRunBase):
 		runner.run_for_ticket(
 			job["ticket_name"],
 			job["trigger"],
-			job["comment_name"],
+			job["message_name"],
 			communication_name=job["communication_name"],
 		)
 

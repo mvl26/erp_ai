@@ -821,7 +821,7 @@ class TestTicketPanelGateParity(FrappeTestCase):
 
 		with patch.object(policy, "effective_level", side_effect=record_level):
 			for job in jobs:
-				runner.run_for_ticket(job["ticket_name"], job["trigger"], job.get("comment_name"))
+				runner.run_for_ticket(job["ticket_name"], job["trigger"], job.get("message_name"))
 		frappe.set_user("Administrator")
 		entries = [
 			row

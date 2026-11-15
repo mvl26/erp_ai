@@ -207,7 +207,7 @@ ALREADY_HANDLED_LOG = "erp_ai skip ticket=%s run_id=%s reason=already_handled"
 
 
 def run_for_ticket(
-	ticket_name: str, trigger: str, comment_name: str | None = None, communication_name: str | None = None
+	ticket_name: str, trigger: str, message_name: str | None = None, communication_name: str | None = None
 ) -> None:
 	"""Agent job (design 4.3). Never raises: a failed run is logged and the job ends normally.
 
@@ -215,7 +215,7 @@ def run_for_ticket(
 	rollback would lose the key status and the alarm that state drives (committed by `_call_model`).
 	"""
 	try:
-		_run(ticket_name, trigger, comment_name, communication_name)
+		_run(ticket_name, trigger, message_name, communication_name)
 	except Exception as exc:
 		frappe.log_error(
 			TITLE_RUN_FAILED, f"ticket={ticket_name} trigger={trigger} error={type(exc).__name__}"
@@ -231,7 +231,7 @@ def _call_model(task, **kwargs):
 			frappe.db.commit()
 
 
-def _run(ticket_name, trigger, comment_name=None, communication_name=None):
+def _run(ticket_name, trigger, message_name=None, communication_name=None):
 	# (a) the job must run as the agent account, checked before the ticket is read (AC-6)
 	if not authority.enter_agent_session():
 		return
@@ -307,7 +307,7 @@ def _run(ticket_name, trigger, comment_name=None, communication_name=None):
 		posted = reclassify = False
 		if level != LEVELS[0]:
 			# the knowledge-draft run has its fixed grant row: no instructor, never below the threshold, no reply
-			instructor = None if kb_run else authority.run_instructor(ticket_name, trigger, comment_name)
+			instructor = None if kb_run else authority.run_instructor(ticket_name, trigger, message_name)
 			# An insert run has no classification yet: `_classify` recomputes both from its own (U1.md:261).
 			category, pct = (None, None)
 			if trigger != TRIGGER_TICKET_INSERT:

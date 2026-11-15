@@ -3,7 +3,14 @@ import json
 import frappe
 
 from erp_ai.agent.prompts import MAX_COMMENTS
-from erp_ai.constants import AGENT_USER, ROLE_INSTRUCTOR, TITLE_WRONG_USER, TRIGGER_COMMENT_MENTION
+from erp_ai.constants import (
+	AGENT_USER,
+	MESSAGE_DOCTYPE,
+	MESSAGE_KIND_CHAT,
+	ROLE_INSTRUCTOR,
+	TITLE_WRONG_USER,
+	TRIGGER_COMMENT_MENTION,
+)
 
 ROLE_LABEL_INSTRUCTION = "chỉ thị"
 ROLE_LABEL_DATA = "dữ liệu"
@@ -85,24 +92,26 @@ def _assigned_by_other(author: str, ticket_name: str) -> bool:
 	return bool(todo.assigned_by) and todo.assigned_by not in (author, AGENT_USER)
 
 
-def run_instructor(ticket_name: str, trigger: str, comment_name: str | None = None) -> str | None:
+def run_instructor(ticket_name: str, trigger: str, message_name: str | None = None) -> str | None:
 	"""ADR-030 QĐ 6: the instructor comes only from the event that queued the run (fail-closed, never raises).
 
-	A comment run reads the author (`owner`, set by the server) of exactly that comment; no other comment
-	is scanned. Any other trigger falls back to the ticket owner.
+	A comment run reads the author (`owner`, set by the server) of exactly that `chat` message; no other
+	message is scanned. Any other trigger falls back to the ticket owner.
 	"""
 	if trigger == TRIGGER_COMMENT_MENTION:
-		author = _trigger_comment_author(ticket_name, comment_name)
+		author = _trigger_message_author(ticket_name, message_name)
 	else:
 		author = frappe.db.get_value("HD Ticket", ticket_name, "owner")
 	return author if is_instruction(author, ticket_name) else None
 
 
-def _trigger_comment_author(ticket_name: str, comment_name: str | None) -> str | None:
-	if not comment_name:
+def _trigger_message_author(ticket_name: str, message_name: str | None) -> str | None:
+	if not message_name:
 		return None
 	return frappe.db.get_value(
-		"Comment", {"name": comment_name, **ticket_comment_filters(ticket_name)}, "owner"
+		MESSAGE_DOCTYPE,
+		{"name": message_name, "ticket": ticket_name, "kind": MESSAGE_KIND_CHAT},
+		"owner",
 	)
 
 

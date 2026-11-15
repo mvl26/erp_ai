@@ -5088,8 +5088,8 @@ def is_instruction(author, ticket_name):
 	return bool(author)
 
 
-def run_instructor(ticket_name, trigger, comment_name=None):
-	author = frappe.db.get_value("Comment", comment_name, "owner")
+def run_instructor(ticket_name, trigger, message_name=None):
+	author = frappe.db.get_value("ERP AI Message", message_name, "owner")
 	return author if is_instruction(author, ticket_name) else None
 
 
@@ -5099,8 +5099,8 @@ def label_comments(ticket_name, comments):
 	RUNNER_FILE: """from erp_ai.agent import authority
 
 
-def _run(ticket_name, trigger, comment_name):
-	instructor = authority.run_instructor(ticket_name, trigger, comment_name)
+def _run(ticket_name, trigger, message_name):
+	instructor = authority.run_instructor(ticket_name, trigger, message_name)
 	comments = authority.label_comments(ticket_name, authority.fetch_ticket_comments(ticket_name))
 	return instructor, comments
 """,

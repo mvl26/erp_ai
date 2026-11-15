@@ -9,13 +9,14 @@ from frappe.tests.utils import FrappeTestCase
 from helpdesk.test_utils import make_ticket
 
 from erp_ai import handlers, hooks
-from erp_ai.agent import answer_delay, queue, runner
+from erp_ai.agent import answer_delay, messages, queue, runner
 from erp_ai.agent.tools import site_api
 from erp_ai.agent.tools.registry import ToolContext
 from erp_ai.constants import (
 	AGENT_USER,
 	LOG_DOCTYPE,
 	LOGGER_NAME,
+	MESSAGE_DOCTYPE,
 	TRIGGER_KB_DRAFT,
 	TRIGGER_REQUESTER_REPLY,
 )
@@ -111,6 +112,13 @@ class HandlerTestCase(FrappeTestCase):
 		self.enqueue.reset_mock()
 		return ticket
 
+	def _messages(self, ticket_name):
+		return frappe.get_all(
+			MESSAGE_DOCTYPE,
+			filters={"ticket": ticket_name},
+			fields=["name", "kind", "content", "owner", "source_comment"],
+		)
+
 	def _comment(self, ticket_name, content, comment_type="Comment", reference_doctype="HD Ticket"):
 		comment = frappe.get_doc(
 			{
@@ -193,6 +201,7 @@ class TestTicketHandlers(HandlerTestCase):
 		comment = self._comment(ticket.name, f"{KEYWORD} please look")
 		self.assertEqual(comment.owner, AGENT_USER)
 		self.assertEqual(self._jobs(), [])
+		self.assertEqual(self._messages(ticket.name), [])
 
 	def test_opt_out_or_excluded_team_no_job_no_model_call(self):
 		make_ticket(subject=f"{PREFIX}opt out", ai_opt_out=1)
@@ -204,10 +213,12 @@ class TestTicketHandlers(HandlerTestCase):
 		ticket = self._ticket_without_job(ai_opt_out=1)
 		self._comment(ticket.name, f"{KEYWORD} hello")
 		self.assertEqual(self._jobs(), [])
+		self.assertEqual(self._messages(ticket.name), [])
 
 		other = self._ticket_without_job(agent_group=EXCLUDED_TEAM)
 		self._comment(other.name, f"{KEYWORD} hello")
 		self.assertEqual(self._jobs(), [])
+		self.assertEqual(self._messages(other.name), [])
 
 		self.assertEqual(self.gateway.call_count, 0)
 
@@ -268,16 +279,77 @@ class TestCommentHandler(HandlerTestCase):
 		self.assertEqual(jobs[0].kwargs["job_id"], f"erp_ai::{ticket.name}::comment_mention")
 		self.assertEqual(comment.comment_type, "Comment")
 
-	def test_mention_enqueues_with_comment_name(self):
+	def test_mention_copies_comment_into_one_chat_message_and_one_job(self):
 		ticket = self._ticket_without_job()
 
-		comment = self._comment(ticket.name, f"{KEYWORD} xem giúp")
+		comment = self._comment(ticket.name, f"{KEYWORD} xem <b>giúp</b><script>x()</script>")
+
+		rows = self._messages(ticket.name)
+		self.assertEqual(len(rows), 1)
+		self.assertEqual(rows[0].kind, "chat")
+		self.assertEqual(rows[0].source_comment, comment.name)
+		self.assertEqual(rows[0].owner, comment.owner)
+		self.assertNotIn("<", rows[0].content)
+		self.assertIn("giúp", rows[0].content)
+		jobs = self._jobs()
+		self.assertEqual(len(jobs), 1)
+		self.assertEqual(jobs[0].kwargs["message_name"], rows[0].name)
+		self.assertEqual(jobs[0].kwargs["job_id"], f"erp_ai::{ticket.name}::comment_mention")
+
+	def test_panel_style_chat_message_enqueues_once(self):
+		ticket = self._ticket_without_job()
+		frappe.set_user("Administrator")
+
+		name = messages.add_message(ticket.name, "xem giúp", "chat", trusted=True)
 
 		jobs = self._jobs()
 		self.assertEqual(len(jobs), 1)
-		self.assertTrue(comment.name)
-		self.assertEqual(jobs[0].kwargs["comment_name"], comment.name)
-		self.assertEqual(jobs[0].kwargs["job_id"], f"erp_ai::{ticket.name}::comment_mention")
+		self.assertEqual(jobs[0].kwargs["message_name"], name)
+		self.assertEqual(jobs[0].kwargs["trigger"], "comment_mention")
+
+	def test_two_chat_messages_same_transaction_one_job(self):
+		ticket = self._ticket_without_job()
+
+		messages.add_message(ticket.name, "một", "chat", trusted=True)
+		messages.add_message(ticket.name, "hai", "chat", trusted=True)
+
+		self.assertEqual(len(self._jobs()), 1)
+
+	def test_bot_and_non_chat_messages_never_enqueue(self):
+		ticket = self._ticket_without_job()
+
+		frappe.set_user(AGENT_USER)
+		messages.add_message(ticket.name, "bot nói", "chat", trusted=True)
+		self.assertEqual(self._jobs(), [])
+
+		frappe.set_user("Administrator")
+		for kind in ("result", "routing", "proposal"):
+			messages.add_message(ticket.name, "x", kind, trusted=True)
+		self.assertEqual(self._jobs(), [])
+
+		def no_db(*args, **kwargs):
+			raise AssertionError("a non-chat message must return before any database read")
+
+		for kind in ("result", "routing", "proposal"):
+			doc = frappe.get_doc(
+				{"doctype": MESSAGE_DOCTYPE, "ticket": ticket.name, "kind": kind, "content": "x"}
+			)
+			with patch.object(frappe.db, "get_value", side_effect=no_db):
+				handlers.message_after_insert(doc)
+		self.assertEqual(self._jobs(), [])
+
+	def test_message_with_agent_disabled_or_not_sendable_no_job(self):
+		ticket = self._ticket_without_job()
+		set_agent_settings(enabled=0)
+		messages.add_message(ticket.name, "xem giúp", "chat", trusted=True)
+		self.assertEqual(self._jobs(), [])
+
+		set_agent_settings(enabled=1)
+		opted_out = self._ticket_without_job(ai_opt_out=1)
+		messages.add_message(opted_out.name, "xem giúp", "chat", trusted=True)
+		excluded = self._ticket_without_job(agent_group=EXCLUDED_TEAM)
+		messages.add_message(excluded.name, "xem giúp", "chat", trusted=True)
+		self.assertEqual(self._jobs(), [])
 
 	def test_comment_without_keyword_no_job(self):
 		ticket = self._ticket_without_job()
@@ -285,6 +357,7 @@ class TestCommentHandler(HandlerTestCase):
 		self._comment(ticket.name, "Không nhắc ai cả")
 
 		self.assertEqual(self._jobs(), [])
+		self.assertEqual(self._messages(ticket.name), [])
 
 	def test_comment_with_agent_disabled_no_job(self):
 		ticket = self._ticket_without_job()
@@ -293,6 +366,7 @@ class TestCommentHandler(HandlerTestCase):
 		self._comment(ticket.name, f"{KEYWORD} xem giúp")
 
 		self.assertEqual(self._jobs(), [])
+		self.assertEqual(self._messages(ticket.name), [])
 		self.assertEqual(self.gateway.call_count, 0)
 
 	def test_comment_with_empty_keyword_setting_no_job(self):
@@ -302,6 +376,7 @@ class TestCommentHandler(HandlerTestCase):
 		self._comment(ticket.name, "any content")
 
 		self.assertEqual(self._jobs(), [])
+		self.assertEqual(self._messages(ticket.name), [])
 
 	def test_comment_author_is_owner_not_spoofable_fields(self):
 		ticket = self._ticket_without_job()
@@ -317,11 +392,14 @@ class TestCommentHandler(HandlerTestCase):
 			}
 		)
 		doc.owner = "Administrator"
-		# after_insert always sees a named comment; the hook passes that name to the job.
 		doc.name = f"{PREFIX}comment"
 
 		handlers.comment_after_insert(doc)
 
+		rows = self._messages(ticket.name)
+		self.assertEqual(len(rows), 1)
+		self.assertEqual(rows[0].owner, "Administrator")
+		self.assertEqual(rows[0].source_comment, doc.name)
 		self.assertEqual(len(self._jobs()), 1)
 
 	def test_comment_on_other_doctype_or_type_no_job(self):
@@ -365,6 +443,7 @@ class TestCommentHandler(HandlerTestCase):
 		self._comment(OPEN_TEAM, f"{KEYWORD} help", reference_doctype="HD Team")
 		self._comment(ticket.name, f"{KEYWORD} help", comment_type="Info")
 		self.assertEqual(self._jobs(), [])
+		self.assertEqual(self._messages(ticket.name), [])
 
 	def test_comment_decisions_are_logged_without_content(self):
 		ticket = self._ticket_without_job()
@@ -377,6 +456,7 @@ class TestCommentHandler(HandlerTestCase):
 		logged = " ".join(str(arg) for call in logger.info.call_args_list for arg in call.args)
 		self.assertNotIn("SECRET", logged)
 		self.assertIn("comment_mention", logged)
+		self.assertIn("copied", logged)
 
 
 class TestExcludedTitle(HandlerTestCase):

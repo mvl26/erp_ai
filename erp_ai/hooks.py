@@ -149,6 +149,9 @@ doc_events = {
 	"Comment": {
 		"after_insert": "erp_ai.handlers.comment_after_insert",
 	},
+	"ERP AI Message": {
+		"after_insert": "erp_ai.handlers.message_after_insert",
+	},
 	"HD Article": {
 		"validate": "erp_ai.agent.article_guard.check_article_write",
 		"on_trash": "erp_ai.agent.article_guard.check_article_delete",

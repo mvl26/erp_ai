@@ -39,12 +39,12 @@ def _claim_pending(job_id: str) -> bool:
 
 
 def enqueue_agent_run(
-	ticket_name: str, trigger: str, comment_name: str | None = None, communication_name: str | None = None
+	ticket_name: str, trigger: str, message_name: str | None = None, communication_name: str | None = None
 ) -> bool:
 	if trigger not in VALID_TRIGGERS:
 		raise ValueError(f"Unknown trigger: {trigger!r}")
-	if trigger == TRIGGER_COMMENT_MENTION and not comment_name:
-		raise ValueError(f"comment_name is required for trigger {trigger!r}")
+	if trigger == TRIGGER_COMMENT_MENTION and not message_name:
+		raise ValueError(f"message_name is required for trigger {trigger!r}")
 	is_reply = trigger == TRIGGER_REQUESTER_REPLY
 	if is_reply and not (isinstance(communication_name, str) and communication_name):
 		raise ValueError(f"communication_name is required for trigger {trigger!r}")
@@ -72,7 +72,7 @@ def enqueue_agent_run(
 		deduplicate=True,
 		ticket_name=ticket_name,
 		trigger=trigger,
-		comment_name=comment_name,
+		message_name=message_name,
 		**reply_kwargs,
 	)
 	return True

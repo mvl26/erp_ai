@@ -26,7 +26,7 @@ class TestEnqueueAgentRun(FrappeTestCase):
 			first = queue.enqueue_agent_run("TKT-1", TRIGGER_TICKET_INSERT)
 			second = queue.enqueue_agent_run("TKT-1", TRIGGER_TICKET_INSERT)
 			other_trigger = queue.enqueue_agent_run(
-				"TKT-1", TRIGGER_COMMENT_MENTION, comment_name="COMMENT-1"
+				"TKT-1", TRIGGER_COMMENT_MENTION, message_name="MESSAGE-1"
 			)
 			other_ticket = queue.enqueue_agent_run("TKT-2", TRIGGER_TICKET_INSERT)
 
@@ -39,7 +39,7 @@ class TestEnqueueAgentRun(FrappeTestCase):
 	def test_enqueue_parameters(self):
 		with patch("frappe.enqueue") as enqueue:
 			self.assertTrue(
-				queue.enqueue_agent_run("TKT-1", TRIGGER_COMMENT_MENTION, comment_name="COMMENT-1")
+				queue.enqueue_agent_run("TKT-1", TRIGGER_COMMENT_MENTION, message_name="MESSAGE-1")
 			)
 
 		enqueue.assert_called_once_with(
@@ -51,37 +51,37 @@ class TestEnqueueAgentRun(FrappeTestCase):
 			deduplicate=True,
 			ticket_name="TKT-1",
 			trigger=TRIGGER_COMMENT_MENTION,
-			comment_name="COMMENT-1",
+			message_name="MESSAGE-1",
 		)
 
-	def test_comment_mention_job_carries_comment_name(self):
+	def test_comment_mention_job_carries_message_name(self):
 		with patch("frappe.enqueue") as enqueue:
 			self.assertTrue(
-				queue.enqueue_agent_run("TKT-1", TRIGGER_COMMENT_MENTION, comment_name="COMMENT-9")
+				queue.enqueue_agent_run("TKT-1", TRIGGER_COMMENT_MENTION, message_name="MESSAGE-9")
 			)
 			# A-U1-3: the job id stays per ticket, so a second @ai in the same transaction is merged.
 			self.assertFalse(
-				queue.enqueue_agent_run("TKT-1", TRIGGER_COMMENT_MENTION, comment_name="COMMENT-10")
+				queue.enqueue_agent_run("TKT-1", TRIGGER_COMMENT_MENTION, message_name="MESSAGE-10")
 			)
 
 		enqueue.assert_called_once()
-		self.assertEqual(enqueue.call_args.kwargs["comment_name"], "COMMENT-9")
+		self.assertEqual(enqueue.call_args.kwargs["message_name"], "MESSAGE-9")
 		self.assertEqual(enqueue.call_args.kwargs["job_id"], "erp_ai::TKT-1::comment_mention")
 
-	def test_comment_mention_without_comment_name_raises(self):
-		for kwargs in ({}, {"comment_name": None}, {"comment_name": ""}):
+	def test_comment_mention_without_message_name_raises(self):
+		for kwargs in ({}, {"message_name": None}, {"message_name": ""}):
 			with self.subTest(kwargs=kwargs), patch("frappe.enqueue") as enqueue:
-				with self.assertRaisesRegex(ValueError, "comment_name"):
+				with self.assertRaisesRegex(ValueError, "message_name"):
 					queue.enqueue_agent_run("TKT-1", TRIGGER_COMMENT_MENTION, **kwargs)
 				enqueue.assert_not_called()
 		self.assertFalse(frappe.flags.get("erp_ai_pending_job_ids"))
 
-	def test_ticket_insert_without_comment_name_enqueues(self):
+	def test_ticket_insert_without_message_name_enqueues(self):
 		with patch("frappe.enqueue") as enqueue:
 			self.assertTrue(queue.enqueue_agent_run("TKT-3", TRIGGER_TICKET_INSERT))
 
 		enqueue.assert_called_once()
-		self.assertIsNone(enqueue.call_args.kwargs["comment_name"])
+		self.assertIsNone(enqueue.call_args.kwargs["message_name"])
 
 	def test_requeue_after_rollback(self):
 		with patch("frappe.enqueue") as enqueue:
@@ -122,7 +122,7 @@ class TestEnqueueAgentRun(FrappeTestCase):
 	def test_communication_name_rejected_for_other_triggers(self):
 		for trigger, kwargs in (
 			(TRIGGER_TICKET_INSERT, {}),
-			(TRIGGER_COMMENT_MENTION, {"comment_name": "COMMENT-1"}),
+			(TRIGGER_COMMENT_MENTION, {"message_name": "MESSAGE-1"}),
 			(TRIGGER_KB_DRAFT, {}),
 		):
 			with self.subTest(trigger=trigger), patch("frappe.enqueue") as enqueue:
@@ -176,19 +176,19 @@ class TestEnqueueAgentRun(FrappeTestCase):
 			deduplicate=True,
 			ticket_name="TKT-7",
 			trigger="ticket_insert",
-			comment_name=None,
+			message_name=None,
 		)
 
 
 class TestRunForTicketCommentName(FrappeTestCase):
-	def test_comment_name_passed_down_to_run(self):
+	def test_message_name_passed_down_to_run(self):
 		with patch.object(runner, "_run") as run:
-			runner.run_for_ticket("TKT-1", TRIGGER_COMMENT_MENTION, comment_name="COMMENT-9")
+			runner.run_for_ticket("TKT-1", TRIGGER_COMMENT_MENTION, message_name="MESSAGE-9")
 			runner.run_for_ticket("TKT-2", TRIGGER_TICKET_INSERT)
 
 		self.assertEqual(
 			run.call_args_list[0].args,
-			("TKT-1", TRIGGER_COMMENT_MENTION, "COMMENT-9", None),
+			("TKT-1", TRIGGER_COMMENT_MENTION, "MESSAGE-9", None),
 			run.call_args_list,
 		)
 		self.assertEqual(run.call_args_list[1].args, ("TKT-2", TRIGGER_TICKET_INSERT, None, None))

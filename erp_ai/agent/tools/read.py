@@ -1,8 +1,9 @@
 import frappe
 from frappe.utils import get_fullname
 
-from erp_ai.agent import authority, policy, prompts
+from erp_ai.agent import authority, policy, prompts, site_facts
 from erp_ai.agent.tools.registry import ToolContext, ToolSpec
+from erp_ai.constants import AGENT_USER
 
 AI_MODULE = "ERP AI agent"
 DENIED_DOCTYPES = frozenset(
@@ -34,6 +35,7 @@ MAX_SEARCH_LIMIT = 10
 QUERY_MIN_CHARS = 2
 QUERY_MAX_CHARS = 100
 SEARCH_SCAN_MAX = 50
+RESOLVER_COMMENTS_MAX = 3
 EMPTY_QUERY_REASON = "câu tìm cần ít nhất một từ dài 2 ký tự"
 SEARCH_FIELDS = ("subject", "description", "resolution_details")
 SEARCH_RESULT_FIELDS = (
@@ -110,6 +112,21 @@ def _like_pattern(word: str) -> str:
 	return f"%{word}%"
 
 
+def _resolver_comments(ticket) -> list[str]:
+	"""The newest RESOLVER_COMMENTS_MAX comments of the ticket written by its assignees (ToDo rows, ADR-019), bot left out."""
+	owners = sorted({row.allocated_to for row in site_facts.ticket_assignments(ticket)} - {AGENT_USER, None})
+	if not owners:
+		return []
+	rows = frappe.get_list(
+		"Comment",
+		filters={**authority.ticket_comment_filters(ticket), "owner": ["in", owners]},
+		fields=["content"],
+		order_by="creation desc",
+		limit_page_length=RESOLVER_COMMENTS_MAX,
+	)
+	return [_clean(row.content, COMMENT_MAX_CHARS) for row in rows]
+
+
 def search_resolved_tickets(args: dict, ctx: ToolContext) -> dict:
 	# Imported on call: knowledge imports tools.source, which imports `_schema` from this module as it loads.
 	from erp_ai.agent import knowledge
@@ -155,6 +172,8 @@ def search_resolved_tickets(args: dict, ctx: ToolContext) -> dict:
 	for _score, _modified, row in ranked[:limit]:
 		ticket = {field: row.get(field) for field in SEARCH_RESULT_FIELDS}
 		ticket["resolution_details"] = _clean(row.resolution_details, RESOLUTION_MAX_CHARS)
+		if not ticket["resolution_details"]:
+			ticket["resolver_comments"] = _resolver_comments(row.name)
 		tickets.append(ticket)
 	return {"ok": True, "tickets": tickets}
 

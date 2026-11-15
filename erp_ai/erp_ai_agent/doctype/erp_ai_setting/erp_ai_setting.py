@@ -120,7 +120,7 @@ PROMPT_REQUIRED_MARKERS = {
 		'"ly_do_diem"',
 		'"bo_phan"',
 	),
-	"reasoning": ("**Nhận định:**", "**Căn cứ:**", "**Hướng xử lý:**", "**Cần ai quyết:**"),
+	"reasoning": ("**Nhận định:**", "**Căn cứ:**", "**Hướng xử lý:**"),
 	"category_guide": tuple(f"| {category} |" for category in CATEGORIES),
 }
 TABLE_ROW_PART = "category_guide"

@@ -132,8 +132,8 @@ Tiếng Việt, giọng đồng nghiệp, không trang trọng quá. Ngắn. C�
 
 **Nhận định:** nguyên nhân, một hai câu.
 **Căn cứ:** bản ghi hoặc dòng code cụ thể đã xem (ghi rõ file và số dòng).
-**Hướng xử lý:** các bước. Nếu bạn đã làm thì nói đã làm gì.
-**Cần ai quyết:** nếu có.
+**Hướng xử lý:** các bước người cần làm hoặc bot sẽ làm.
+Không tự liệt kê việc đã làm, đề xuất đang chờ hay việc bị từ chối: bot tự thêm các mục "Đã làm", "Chờ duyệt", "Cần ai quyết" từ những gì đã ghi trong lần chạy.
 
 Không dùng bullet khi chỉ có một điểm. Không nhắc lại nội dung phiếu —
 người đọc vừa viết nó. Không xin lỗi, không rào trước.
@@ -270,6 +270,13 @@ các quy tắc dưới đây thay cho quy tắc 6 và cho mục "Cần ai quyế
 - Chỉ ghi "Cần ai quyết" khi tool trả ok=false hoặc việc nằm ngoài các tool bạn có;
   khi đó nêu đúng lý do tool trả về."""
 
+# Appended last when the confidence is below the threshold (U1.md:229); the question itself belongs to U4b.
+ASK_ONLY_BLOCK = """CHỈ HỎI — ĐỘ TIN CẬY DƯỚI NGƯỠNG
+
+Lần chạy này bạn chỉ có tool đọc và post_comment.
+Không ghi trường, không gán, không tạo Task, không làm gì trên hệ thống.
+Đăng đúng một comment hỏi điều cần biết để chắc."""
+
 # (forbidden sentence of the old core, sentence a block allows) — never both in one prompt (AC-6, AC-66).
 PROMPT_CONFLICT_PAIRS: tuple[tuple[str, str], ...] = (
 	# P-1, change_tools: CHANGE_TOOLS_BLOCK
@@ -375,16 +382,25 @@ def build_reason_system(
 	change_tools: bool = False,
 	site_admin_tools: bool = False,
 	unrestricted_tools: bool = False,
+	act_now: bool = False,
+	ask_only: bool = False,
 ) -> list[dict]:
 	parts = [
-		CORE_PROMPT,
+		core_prompt(
+			change_tools=change_tools,
+			site_admin_tools=site_admin_tools,
+			unrestricted_tools=unrestricted_tools,
+			act_now=act_now,
+			ask_only=ask_only,
+		),
 		CATEGORY_TABLE,
 		routing_table,
 		CONVENTIONS,
 		CHANGE_TOOLS_BLOCK if change_tools else "",
 		SITE_ADMIN_TOOLS_BLOCK if site_admin_tools and not unrestricted_tools else "",
 		UNRESTRICTED_TOOLS_BLOCK if unrestricted_tools else "",
-		ACT_NOW_BLOCK if change_tools or site_admin_tools or unrestricted_tools else "",
+		ACT_NOW_BLOCK if act_now or change_tools or site_admin_tools or unrestricted_tools else "",
+		ASK_ONLY_BLOCK if ask_only else "",
 	]
 	parts = [part for part in parts if part]
 	if prompt_digest:

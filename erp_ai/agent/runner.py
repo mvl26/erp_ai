@@ -4,13 +4,14 @@ import time
 import uuid
 
 import frappe
-from frappe.utils import get_fullname, now_datetime
+from frappe.desk.form.document_follow import follow_document
+from frappe.utils import escape_html, get_fullname, now_datetime
 
 from erp_ai import gateway
 from erp_ai.agent import authority, policy, site_facts
 from erp_ai.agent.answer_delay import AnswerDelay
 from erp_ai.agent.authority import TITLE_WRONG_USER as TITLE_WRONG_USER  # re-export, U1.md:264
-from erp_ai.agent.classification import load_mapping, parse_classification
+from erp_ai.agent.classification import load_mapping, parse_classification, split_request_comment
 from erp_ai.agent.prompts import (
 	TICKET_FIELD_LABELS,
 	build_classify_request,
@@ -39,7 +40,9 @@ from erp_ai.agent.tools.route_ticket import (
 )
 from erp_ai.agent.tools.write_ticket import (
 	CREATED_LABELS_FIELD,
+	FIELD_LABELS,
 	HINT_FIELD,
+	ROUTE_DONE,
 	created_labels,
 	keep_human_fields,
 )
@@ -106,6 +109,15 @@ BAD_ROUTING_ERROR = "routing_rules không hợp lệ, định tuyến dùng giá
 NO_SCORE_REASON = "không có điểm"
 NO_SLA_REASON = "chưa có SLA áp vào phiếu"
 REASON_TASK_EXISTS = "phiếu đã có Task liên kết"
+# The route comment's own sentences (U4b.md:210-214); ROUTE_DONE and FIELD_LABELS come from write_ticket (U4b-8).
+ROUTE_NO_CHANGE = "Bot đã phân loại phiếu, các trường đã đúng nên không đổi."
+ROUTE_ASSIGNED = "Đã gán cho {person}."
+ROUTE_TASK = "Đã tạo Task {task}."
+ROUTE_WATCHER = "Đã thêm {person} làm người theo dõi."
+# (u5) the D watcher (AC-27, U4b-fixes Fix 6)
+WATCHER_TOOL = "add_watcher"
+REASON_ALREADY_FOLLOWING = "đã theo dõi"
+REASON_FOLLOW_OFF = "người theo dõi tắt nhận theo dõi tài liệu"
 ROUTE_SAVEPOINT = "erp_ai_route"
 # One write unit after (u1) (assign, comment) nests inside the savepoint above.
 ROUTE_UNIT_SAVEPOINT = "erp_ai_route_unit"
@@ -415,6 +427,10 @@ def _classify(
 		team_exists=site_facts.team_exists,
 		is_excluded_team=policy.is_excluded_team,
 		is_active_agent=site_facts.is_active_agent,
+		due_at=field_values.get("due_date"),
+		due_field_configured="due_date" in field_map,
+		d_watcher=settings.get("d_ticket_watcher") or "",
+		now=now_datetime(),
 	)
 	labels = created_labels(ticket.get(CREATED_LABELS_FIELD))
 	# a broken record reads as all three typed (fail-closed): no value of it is a typed one
@@ -428,6 +444,12 @@ def _classify(
 		"agent_group": decision.agent_group,
 		"priority": decision.priority,
 	}
+	# AC-28: the split question is asked once per ticket, the first time a classify row records it
+	split_text = split_request_comment(classification)
+	if split_text and frappe.db.exists(
+		LOG_DOCTYPE, {"ticket": ticket_name, "entry_type": "classify", "split_requested": 1}
+	):
+		split_text = None
 	# A-U4b-4: the ticket is Người before this row; the fields it holds are the person's label of the prediction
 	corrected = (
 		json.dumps({field: ticket.get(field) for field in CLASSIFICATION_FIELDS})
@@ -459,6 +481,8 @@ def _classify(
 		predicted_assignee=decision.assignee,
 		created_labels=json.dumps(typed, ensure_ascii=False, sort_keys=True) if typed else None,
 		human_corrected_to=corrected,
+		split_requested=1 if split_text else 0,
+		split_requests=json.dumps(classification.requests, ensure_ascii=False) if split_text else None,
 		applied=0,
 	)
 	_log_classify(ticket_name, run_id, True, ticket.creation)
@@ -474,7 +498,7 @@ def _classify(
 		)
 		if not context.below_threshold:
 			status.working("set_classification")
-			_route(log_name, classification, route_decision, context, auto_assign, subject)
+			_route(log_name, classification, route_decision, context, auto_assign, subject, split_text)
 	summary = {"category": classification.category, "confidence": classification.confidence, **values}
 	return True, summary, context
 
@@ -490,19 +514,22 @@ def _log_classify(ticket_name, run_id, ok, created) -> None:
 	)
 
 
-def _route(log_name, classification, decision, context, auto_assign, subject):
+def _route(log_name, classification, decision, context, auto_assign, subject, split_text=None):
 	"""Run the route unit (u1), check the SLA and record the outcome on the entry as one unit (design 4.2).
 
-	Returns `lines`, the fixed sentences gathered for the one routing comment (already posted by (u4)).
+	Deterministic code, no model call (ADR-033 QĐ 3). After (u1) succeeds: SLA check, (u2) assign, (u3) Task,
+	(u5) the D watcher, each write one unit with one action entry; then exactly one comment says what was
+	classified, given, created and followed, the gathered sentences and the split question after it (AC-23, AC-28).
+	Returns `lines`, the sentences of that one comment (already posted by (u4)).
 	Nothing here raises for an unusable unit: it is rolled back, recorded as `ok=false` with the exception
-	class only (D-16). (u1) failing or refusing stops the SLA check and (u2)-(u4).
+	class only (D-16). (u1) failing or refusing stops the SLA check and (u2)-(u5).
 
 	The ticket change and the entry update share a savepoint: an exception between them undoes the
 	ticket change, so the entry never says applied=0 over a changed ticket (the entry row itself was
 	committed before and survives). Nothing is committed until both are written.
 	"""
 	actions, lines, errors = [], [], []
-	assigned = task = commented = None
+	assigned = task = watcher = commented = None
 	sla = None
 	frappe.db.savepoint(ROUTE_SAVEPOINT)
 	try:
@@ -513,6 +540,13 @@ def _route(log_name, classification, decision, context, auto_assign, subject):
 				assigned = _assign_unit(decision, context, actions, lines, errors)
 			if assigned and decision.needs_task:
 				task = _task_unit(assigned, subject, classification, context, actions, lines, errors)
+			if decision.watcher:
+				watcher = _watch_unit(decision.watcher, context, actions, errors)
+			lines = [
+				*_route_lines(result, assigned, task, watcher),
+				*lines,
+				*([split_text] if split_text else []),
+			]
 			commented = _comment_unit(lines, context, actions, errors)
 		_record_route(log_name, result, decision, assigned, task, actions, errors)
 		_log_route_summary(context, result, assigned, task, commented, sla)
@@ -642,9 +676,10 @@ def _comment_unit(lines, context, actions, errors):
 	"""(u4): post the gathered sentences as at most one comment. Returns True when it was posted."""
 	if not lines:
 		return False
+	# the split question quotes the model's reading of the ticket: every line is escaped once, here, where it is posted
 	result = _run_unit(
 		"post_routing_comment",
-		lambda: post_routing_comment(lines, context),
+		lambda: post_routing_comment([escape_html(line) for line in lines], context),
 		"Comment",
 		None,
 		actions,
@@ -658,6 +693,71 @@ def _comment_unit(lines, context, actions, errors):
 		)
 	)
 	return True
+
+
+def _route_lines(result, assigned, task, watcher) -> list[str]:
+	"""The route comment's own sentences (U4b.md:247): fields written, person given, Task created, watcher added.
+
+	Fixed text with names only, never the ticket's content. No field changed → the "already right" sentence.
+	"""
+	fields = ", ".join(
+		f"{FIELD_LABELS[field]} {value}"
+		for field, value in (result.get("after") or {}).items()
+		if field in FIELD_LABELS
+	)
+	lines = [ROUTE_DONE.format(fields=fields) if fields else ROUTE_NO_CHANGE]
+	if assigned:
+		lines.append(ROUTE_ASSIGNED.format(person=get_fullname(assigned)))
+	if task:
+		lines.append(ROUTE_TASK.format(task=task))
+	if watcher:
+		lines.append(ROUTE_WATCHER.format(person=get_fullname(watcher)))
+	return lines
+
+
+def _watch_unit(watcher, context, actions, errors) -> str | None:
+	"""(u5): the D watcher follows the ticket through Frappe's `follow_document`, once (AC-27). Returns the user or None.
+
+	Already following → an `ok=false` entry, nothing written. An exception undoes only this unit (Fix 6).
+	"""
+	ticket = context.ticket_name
+	if frappe.db.exists(
+		"Document Follow", {"ref_doctype": "HD Ticket", "ref_docname": ticket, "user": watcher}
+	):
+		actions.append(
+			_route_action(
+				WATCHER_TOOL,
+				"HD Ticket",
+				ticket,
+				False,
+				REASON_ALREADY_FOLLOWING,
+				instructor=context.instructor,
+			)
+		)
+		return None
+	if (
+		_run_unit(WATCHER_TOOL, lambda: _follow(watcher, ticket), "HD Ticket", ticket, actions, errors)
+		is None
+	):
+		return None
+	actions.append(
+		_route_action(
+			WATCHER_TOOL,
+			"HD Ticket",
+			ticket,
+			True,
+			value_after={"watcher": watcher},
+			instructor=context.instructor,
+		)
+	)
+	return watcher
+
+
+def _follow(watcher, ticket) -> dict:
+	"""`follow_document` returns nothing when the person turned follow notifications off (A-U4b-9): not forced."""
+	if not follow_document("HD Ticket", ticket, watcher):
+		return {"ok": False, "reason": REASON_FOLLOW_OFF}
+	return {"ok": True}
 
 
 def _apply_route_unit(decision, classification, context, actions, errors):

@@ -3164,7 +3164,22 @@ class TestRunnerGrant(RunnerTestBase):
 		(entry,) = self._entries(entry_type="classify")
 		self.assertEqual(entry.applied, 0)
 		self.assertEqual(entry.predicted_confidence_pct, 69)
-		# the reasoning step gets the context recomputed after classification: below threshold, ask only
+		# a 69 % classification leaves the reasoning step ask only
+		self.assertFalse(results["t_cls"]["ok"])
+		self.assertIn("không được cấp", results["t_cls"]["reason"])
+
+	def test_unparseable_insert_reasons_below_threshold(self):
+		# nothing classified: the context built before classification (category, pct unknown) reaches `_reason`
+		self.gateway.results = [
+			make_model_result(text="không phải JSON"),
+			tool_turn(tool_use("t_cls", "set_classification", category="A", confidence="Cao")),
+			make_model_result(),
+		]
+		self._run("ticket_insert")
+
+		self.assertEqual(self._entries(entry_type="classify")[0].stop_reason, "unparseable")
+		blocks = self.gateway.calls[2]["messages"][-1]["content"]
+		results = {block["tool_use_id"]: json.loads(block["content"]) for block in blocks}
 		self.assertFalse(results["t_cls"]["ok"])
 		self.assertIn("không được cấp", results["t_cls"]["reason"])
 

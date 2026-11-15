@@ -298,7 +298,7 @@ def _classify(
 	threshold,
 ):
 	"""Classification step (design 4.3 step 6). Writes one `classify` entry; with a context (L1+) recomputes its
-	main-path level and below-threshold flag from the classification, then routes only above the threshold.
+	main-path level and below-threshold flag from the classification, then routes only at the threshold or above.
 
 	Returns `(proceed, classification, context)`: `proceed` is False when the run must end here (gateway error);
 	`classification` is the summary handed to the reasoning step, or None when nothing was classified;

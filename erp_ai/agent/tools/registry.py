@@ -139,13 +139,12 @@ def grant(inputs: GrantInputs) -> Grant:
 		return Grant(specs=())
 	groups = {group for group, condition in GRANT_TABLE if condition(inputs)}
 	specs = tuple(spec for spec in _all_specs() if spec.group in groups)
-	granted_groups = {spec.group for spec in specs}
 	# act_now_block and ask_only_block stay False until T77 (design-w1-fixes-3.md Điểm 2).
 	return Grant(
 		specs=specs,
-		change_block=CHANGE_GROUP in granted_groups,
-		record_block=SITE_ADMIN_GROUP in granted_groups,
-		unrestricted_block=UNRESTRICTED_GROUP in granted_groups,
+		change_block=CHANGE_GROUP in groups,
+		record_block=SITE_ADMIN_GROUP in groups,
+		unrestricted_block=UNRESTRICTED_GROUP in groups,
 	)
 
 

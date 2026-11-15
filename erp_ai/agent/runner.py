@@ -40,12 +40,15 @@ from erp_ai.agent.tools.route_ticket import (
 	post_routing_comment,
 )
 from erp_ai.agent.tools.write_ticket import (
+	ASK_FOOTER,
 	CREATED_LABELS_FIELD,
 	FIELD_LABELS,
 	HINT_FIELD,
 	ROUTE_DONE,
+	asked_in_run,
 	created_labels,
 	keep_human_fields,
+	mark_asked,
 	post_notice,
 )
 from erp_ai.constants import (
@@ -132,6 +135,12 @@ OVER_BUDGET_BODY = (
 RUN_FAILED_BODY = "{cause}. Bot sẽ thử lại ở lần quét kế tiếp; cần gấp thì nhờ người phụ trách."
 CAUSE_GATEWAY = "lỗi khi gọi mô hình AI"
 CAUSE_TIME = "hết thời gian của lần chạy"
+# A run below the threshold whose model asked nothing ends with this question (AC-22, U4b.md:220, :252).
+ASK_FALLBACK_BODY = (
+	"anh/chị bổ sung giúp mô tả cụ thể hơn (màn hình, mã chứng từ, bước làm).\n"
+	"**Căn cứ:** nội dung phiếu chưa đủ để chọn đầu mục và nhóm."
+)
+ASK_PCT_UNKNOWN = "chưa có"
 # The triggers each notice may be posted for (U4b-fixes Fix 8, A-U4b-13): an allow list, fail-closed for a new
 # trigger. "daily_limit" is not in it: it holds for every trigger that reaches step (d).
 NOTICE_TRIGGERS = {
@@ -1081,6 +1090,20 @@ def _reason(
 			wants_tools = stop_reason == STOP_TOOL_USE
 			if wants_tools and turn == max_turns:
 				stop_reason = STOP_MAX_TURNS
+			final = not wants_tools or not tool_results or turn == max_turns
+			# below the threshold the run asks exactly one question, the model's or this one (AC-22, Fix 9)
+			if final and context.below_threshold and not asked_in_run(run_id):
+				asked = _notice(
+					ticket_name,
+					"ask_fallback",
+					_ask_fallback_body(ticket_name, settings),
+					datetime.min,
+					trigger=trigger,
+					instructor=context.instructor,
+				)
+				if asked:
+					actions.append(asked)
+					mark_asked(run_id)
 			# the notices posted before this step go on its first entry, ahead of the turn's own writes
 			actions[:0] = pending
 			pending = []
@@ -1105,6 +1128,15 @@ def _reason(
 			return
 		messages.append({"role": "assistant", "content": result.content})
 		messages.append({"role": "user", "content": tool_results})
+
+
+def _ask_fallback_body(ticket_name, settings) -> str:
+	"""The fallback question with the footer the question tool adds: the run's confidence and the threshold."""
+	pct = policy.latest_classification(ticket_name)[1]
+	footer = ASK_FOOTER.format(
+		pct=ASK_PCT_UNKNOWN if pct is None else f"{pct}%", threshold=policy.confidence_threshold(settings)
+	)
+	return f"{ASK_FALLBACK_BODY}\n\n{footer}"
 
 
 def _undo_turn(run_id) -> None:

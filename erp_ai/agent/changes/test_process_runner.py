@@ -254,7 +254,7 @@ class TestGitWrites(FrappeTestCase):
 	def _call(self, function, repo=None, rel=REL, limit_s=20, subject=SUBJECT, body=BODY):
 		repo = self.repo if repo is None else repo
 		if function == "git_commit_only":
-			return process_runner.git_commit_only(repo, rel, subject, body, limit_s)
+			return process_runner.git_commit_only(repo, (rel,), subject, body, limit_s)
 		return getattr(process_runner, function)(repo, rel, limit_s)
 
 	def _run(self, function, result, limit_s=20, elapsed_s=1.0):
@@ -492,6 +492,46 @@ class TestGitWrites(FrappeTestCase):
 					self.assertEqual(run.call_args.args[0][-1], rel)
 					self.assertEqual(run.call_args.args[0][-2], "--")
 
+	def test_commit_paths_sorted_after_separator(self):
+		rels = ("b.py", "a/z.py", ".github/x.yml", "a/b.py")
+		with (
+			patch(RUN_PATH, return_value=completed(0)) as run,
+			patch(CLOCK_PATH, side_effect=[1000.0, 1001.0]),
+		):
+			process_runner.git_commit_only(self.repo, rels, SUBJECT, BODY, 20)
+		argv = run.call_args.args[0]
+		self.assertEqual(argv[-5:], ["--", ".github/x.yml", "a/b.py", "a/z.py", "b.py"])
+		self.assertEqual(argv.count("--"), 1)
+		self.assertEqual(argv[-6], BODY)
+
+	def test_empty_or_duplicate_rels_refused(self):
+		cases = [
+			("rels empty", ()),
+			("rels duplicate", ("a.py", "b.py", "a.py")),
+			("rels a string", "a.py"),
+			("rels a list", ["a.py"]),
+			("rels None", None),
+		]
+		for label, bad in (
+			("empty", ""),
+			("not a string", 1),
+			("NUL", "a\0b.py"),
+			("starts with -", "-a"),
+			("absolute", "/etc/passwd"),
+			("starts with :", ":x.py"),
+			("not normalised", "a//b.py"),
+			("is ..", ".."),
+			("parent", "../x.py"),
+			("is .", "."),
+			("glob", "api/*.py"),
+		):
+			cases.append((f"second element {label}", ("ok.py", bad)))
+		for label, rels in cases:
+			with self.subTest(label), patch(RUN_PATH) as run:
+				with self.assertRaises(ValueError):
+					process_runner.git_commit_only(self.repo, rels, SUBJECT, BODY, 20)
+				run.assert_not_called()
+
 
 SANDBOX_APP = "custom_app"
 DELETED_REL = "myapp/a.py"
@@ -515,7 +555,7 @@ class TestCommitOnlyRecordsDeletion(FrappeTestCase):
 		before_head = self._git("rev-parse", "HEAD").strip()
 
 		file_writer.remove_file(os.path.join(self.repo_root, DELETED_REL))
-		outcome = process_runner.git_commit_only(self.repo_root, DELETED_REL, SUBJECT, BODY, 20)
+		outcome = process_runner.git_commit_only(self.repo_root, (DELETED_REL,), SUBJECT, BODY, 20)
 
 		self.assertEqual(outcome.exit_code, 0, outcome.output)
 		self.assertEqual(self._git("rev-parse", "HEAD~1").strip(), before_head)
@@ -526,3 +566,39 @@ class TestCommitOnlyRecordsDeletion(FrappeTestCase):
 		self.assertEqual(self._git("status", "--porcelain", "--", DELETED_REL), "")
 		self.assertEqual(self._git("status", "--porcelain"), f"A  {OTHER_STAGED_REL}\n")
 		self.assertEqual(self._git("diff", "--cached", "--name-only"), f"{OTHER_STAGED_REL}\n")
+
+	def test_multi_path_delete_add_modify_rename_in_one_commit(self):
+		modified, created, old, new = "myapp/b.py", "myapp/c.py", "myapp/old.txt", "myapp/new/dir/new.txt"
+		unstaged = "myapp/unstaged.py"
+		for rel, content in ((modified, "b = 1\n"), (old, "old\n"), (unstaged, "u = 1\n")):
+			self.sandbox.commit_file(SANDBOX_APP, rel, content)
+		self.sandbox.stage(SANDBOX_APP, OTHER_STAGED_REL, "s = 1\n")
+		self.sandbox.write_unstaged(SANDBOX_APP, unstaged, "u = 2\n")
+		before_head = self._git("rev-parse", "HEAD").strip()
+
+		def full(rel):
+			return os.path.join(self.repo_root, rel)
+
+		file_writer.remove_file(full(DELETED_REL))
+		file_writer.write_atomic(full(modified), "b = 2\n", new_file=False)
+		file_writer.write_atomic(full(created), "c = 1\n", new_file=True)
+		file_writer.make_parents(full(new), self.repo_root)
+		file_writer.write_atomic(full(new), "old\n", new_file=True)
+		file_writer.remove_file(full(old))
+		for rel in (created, new):
+			self.assertEqual(process_runner.git_add_new(self.repo_root, rel, 20).exit_code, 0)
+		rels = (DELETED_REL, modified, created, old, new)
+		outcome = process_runner.git_commit_only(self.repo_root, rels, SUBJECT, BODY, 20)
+
+		self.assertEqual(outcome.exit_code, 0, outcome.output)
+		self.assertEqual(self._git("rev-parse", "HEAD~1").strip(), before_head)
+		self.assertEqual(
+			set(self._git("diff-tree", "--no-commit-id", "--name-status", "-r", "HEAD").splitlines()),
+			{f"D\t{DELETED_REL}", f"M\t{modified}", f"A\t{created}", f"D\t{old}", f"A\t{new}"},
+		)
+		self.assertEqual(self._git("show", f"HEAD:{modified}"), "b = 2\n")
+		self.assertEqual(self._git("show", f"HEAD:{new}"), "old\n")
+		self.assertEqual(self._git("status", "--porcelain"), f"A  {OTHER_STAGED_REL}\n M {unstaged}\n")
+		self.assertEqual(self._git("show", f":{OTHER_STAGED_REL}"), "s = 1\n")
+		with open(full(unstaged), encoding="utf-8") as handle:
+			self.assertEqual(handle.read(), "u = 2\n")

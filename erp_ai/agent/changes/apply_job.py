@@ -430,7 +430,7 @@ def _apply_code(proposal, actor: str, allowed_apps, deadline: float) -> None:
 		subject, body = change_text.apply_message(
 			proposal.name, str(proposal.ticket or ""), proposal.file_path, _person(actor)
 		)
-		result = process_runner.git_commit_only(repo, rel, subject, body, _git_limit(deadline))
+		result = process_runner.git_commit_only(repo, (rel,), subject, body, _git_limit(deadline))
 		if _failed(result):
 			summary = _commit_landed(
 				repo, old_head, lambda head: give_back(_commit_failed_reason(result), head)
@@ -628,7 +628,7 @@ def _undo_code(proposal, actor: str, allowed_apps, deadline: float) -> None:
 			str(proposal.apply_commit_sha or ""),
 			_person(actor),
 		)
-		result = process_runner.git_commit_only(repo, rel, subject, body, _git_limit(deadline))
+		result = process_runner.git_commit_only(repo, (rel,), subject, body, _git_limit(deadline))
 		if _failed(result):
 			# Design 4.4 step 6 follows 4.3 step 3.4 (D-17, design-addendum-3 QĐ-B2 items 2 and 3).
 			summary = _commit_landed(

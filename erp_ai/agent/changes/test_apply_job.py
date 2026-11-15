@@ -966,10 +966,11 @@ class TestCommitFailure(ApplyJobTestCase):
 	def test_postcheck_mismatch_keeps_commit_and_fails(self):
 		real_commit = process_runner.git_commit_only
 
-		def overwrite_then_commit(repo, rel, *args):
+		def overwrite_then_commit(repo, rels, *args):
 			# A person overwrites the target between the job's write and its commit.
+			(rel,) = rels
 			self.sandbox.write_unstaged(APP, rel, "x = 7\n")
-			return real_commit(repo, rel, *args)
+			return real_commit(repo, rels, *args)
 
 		for kind in ("changed file", "new file"):
 			with self.subTest(kind):

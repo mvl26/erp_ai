@@ -420,3 +420,75 @@ def is_ticket_content_doctype(doctype: str) -> bool:
 	"""ADR-034: a DocType of TICKET_CONTENT_DOCTYPES or one with a Link to HD Ticket carries ticket content."""
 	name = _stored_doctype_name(doctype)
 	return bool(name) and (name in TICKET_CONTENT_DOCTYPES or bool(ticket_link_fieldnames(name)))
+
+
+EXCLUDED_TICKET_REASON = "bản ghi thuộc phiếu không được phép đưa cho AI"
+# DocType that names its ticket by a (type column, name column) pair -> the pair.
+TICKET_LINK_FIELDS = {
+	"Comment": ("reference_doctype", "reference_name"),
+	"Communication": ("reference_doctype", "reference_name"),
+	"File": ("attached_to_doctype", "attached_to_name"),
+}
+
+
+def ticket_link_columns(doctype: str) -> tuple[tuple[str | None, str], ...]:
+	"""Every column that points a record of this DocType at a ticket: the dynamic pair of TICKET_LINK_FIELDS
+	(if any) plus `(None, fieldname)` for each Link to HD Ticket; () for HD Ticket and for a missing DocType.
+	The one reader of TICKET_LINK_FIELDS (C-U2-1)."""
+	name = _stored_doctype_name(doctype)
+	if not name or name == TICKET_DOCTYPE:
+		return ()
+	pair = TICKET_LINK_FIELDS.get(name)
+	return (*((pair,) if pair else ()), *((None, field) for field in ticket_link_fieldnames(name)))
+
+
+def ticket_content_filters(doctype: str) -> tuple[list, list]:
+	"""`(filters, or_filters)` for frappe.get_list that hide the records of excluded tickets; ([], []) when the
+	DocType carries no ticket content or no ticket is excluded. The OR group keeps a row that does not point
+	at a ticket (type != HD Ticket) or points at a ticket that is not excluded."""
+	if not is_ticket_content_doctype(doctype) or not (names := excluded_ticket_names()):
+		return [], []
+	name = _stored_doctype_name(doctype)
+	if name == TICKET_DOCTYPE:
+		return [["name", "not in", names]], []
+	filters, or_filters = [], []
+	for type_column, name_column in ticket_link_columns(name):
+		if type_column:
+			or_filters = [[type_column, "!=", TICKET_DOCTYPE], [name_column, "not in", names]]
+		else:
+			filters.append([name_column, "not in", names])
+	return filters, or_filters
+
+
+def _owning_tickets(doctype: str, name: str) -> list[str]:
+	"""Names of the tickets this record points at, over every column of ticket_link_columns."""
+	stored = _stored_doctype_name(doctype)
+	if not stored or not name:
+		return []
+	if stored == TICKET_DOCTYPE:
+		return [name] if frappe.db.exists(TICKET_DOCTYPE, name) else []
+	columns = ticket_link_columns(stored)
+	if not columns:
+		return []
+	fields = list(dict.fromkeys(column for pair in columns for column in pair if column))
+	values = frappe.db.get_value(stored, name, fields, as_dict=True)
+	if not values:
+		return []
+	tickets = []
+	for type_column, name_column in columns:
+		if type_column and values.get(type_column) != TICKET_DOCTYPE:
+			continue
+		if (ticket := values.get(name_column)) and ticket not in tickets:
+			tickets.append(ticket)
+	return tickets
+
+
+def owning_ticket(doctype: str, name: str) -> str | None:
+	"""The ticket a record belongs to (the first column that names one), None when there is none."""
+	tickets = _owning_tickets(doctype, name)
+	return tickets[0] if tickets else None
+
+
+def is_ticket_record_excluded(doctype: str, name: str) -> bool:
+	"""True when any ticket the record points at fails can_send_ticket."""
+	return any(not can_send_ticket(ticket) for ticket in _owning_tickets(doctype, name))

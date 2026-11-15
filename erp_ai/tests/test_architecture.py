@@ -26,6 +26,7 @@ import sys
 import unittest
 from pathlib import Path
 from typing import ClassVar, NamedTuple
+from unittest.mock import patch
 
 from erp_ai.constants import AGENT_STATUS_EVENT, PANEL_METHODS
 
@@ -2615,6 +2616,80 @@ def check_fs_writes_only_in_file_writer(sources: dict) -> list:
 	return violations
 
 
+FILE_WRITER_CANONICAL_CHECK = "_refuse_unless_canonical"
+FILE_WRITER_SECOND_RESOLVER_CALLS = ("realpath", "commonpath", "is_relative_to", "readlink")
+FILE_WRITER_RECHECKERS = ("make_parents", "remove_empty_dirs")  # T6 adds "write_atomic", "remove_file"
+FILE_WRITER_RECHECKS_ALL = False  # condition 4 of the rule; T6 sets True, T49 deletes the flag
+FILE_WRITER_FS_CALLS = frozenset(
+	{"os.mkdir", "os.rmdir", "os.remove", "os.unlink", "os.replace", "os.rename", "tempfile.mkstemp"}
+)
+
+
+def check_file_writer_rechecks_through_resolver(sources: dict) -> list:
+	"""ADR-040 Phán quyết C-2: file_writer re-checks a path only by asking the one resolver.
+	1. a top-level `_refuse_unless_canonical` calls `source.resolve_safe_path`;
+	2. file_writer.py calls no `realpath`/`commonpath`/`is_relative_to`/`readlink` (a second resolver);
+	3. every function in FILE_WRITER_RECHECKERS calls `_refuse_unless_canonical`;
+	4. (FILE_WRITER_RECHECKS_ALL) every top-level function touching the file system is in FILE_WRITER_RECHECKERS."""
+	writer = sources.get(FILE_WRITER_FILE)
+	if writer is None:
+		return _missing(FILE_WRITER_FILE)
+	tree = parse(FILE_WRITER_FILE, writer)
+	aliases = import_aliases(tree)
+	functions = _module_functions(tree)
+	violations = []
+	canonical = functions.get(FILE_WRITER_CANONICAL_CHECK)
+	if canonical is None:
+		violations.append(f"{FILE_WRITER_FILE}: no top-level {FILE_WRITER_CANONICAL_CHECK}() (ADR-040 C-2)")
+	elif not any(
+		isinstance(node, ast.Call) and resolved_name(node.func, aliases) == SAFE_PATH_CALL
+		for node in ast.walk(canonical)
+	):
+		violations.append(
+			violation(
+				FILE_WRITER_FILE,
+				canonical,
+				f"{FILE_WRITER_CANONICAL_CHECK} does not call {SAFE_PATH_CALL} (ADR-040 C-2)",
+			)
+		)
+	for node in ast.walk(tree):
+		if not isinstance(node, ast.Call):
+			continue
+		name = (resolved_name(node.func, aliases) or "").rsplit(".", 1)[-1]
+		if name in FILE_WRITER_SECOND_RESOLVER_CALLS:
+			violations.append(
+				violation(FILE_WRITER_FILE, node, f"calls {name}: a second path resolver (ADR-040 C-2)")
+			)
+	for name in FILE_WRITER_RECHECKERS:
+		function = functions.get(name)
+		if function is None:
+			violations.append(f"{FILE_WRITER_FILE}: no top-level {name}() (ADR-040 C-2)")
+		elif FILE_WRITER_CANONICAL_CHECK not in _called_names(function):
+			violations.append(
+				violation(
+					FILE_WRITER_FILE,
+					function,
+					f"{name} does not call {FILE_WRITER_CANONICAL_CHECK} (ADR-040 C-2)",
+				)
+			)
+	if FILE_WRITER_RECHECKS_ALL:
+		for name, function in functions.items():
+			if name in FILE_WRITER_RECHECKERS:
+				continue
+			if any(
+				isinstance(node, ast.Call) and resolved_name(node.func, aliases) in FILE_WRITER_FS_CALLS
+				for node in ast.walk(function)
+			):
+				violations.append(
+					violation(
+						FILE_WRITER_FILE,
+						function,
+						f"{name} touches the file system but is not in FILE_WRITER_RECHECKERS (ADR-040 C-2)",
+					)
+				)
+	return violations
+
+
 def _names_forbidden(name: str) -> bool:
 	return any(name == forbidden or name.endswith("." + forbidden) for forbidden in CHANGES_FORBIDDEN_NAMES)
 
@@ -4687,6 +4762,10 @@ class TestArchitecture(unittest.TestCase):
 		for expected in ("os.replace", "os.remove", "tempfile.mkstemp", "os.fdopen with mode 'wb'"):
 			self.assertIn(expected, found)
 		self.assertEqual(check_fs_writes_only_in_file_writer(self.sources), [])
+
+	def test_file_writer_rechecks_through_resolver(self):
+		self.assertIn("def _refuse_unless_canonical(", self.sources[FILE_WRITER_FILE])
+		self.assertEqual(check_file_writer_rechecks_through_resolver(self.sources), [])
 
 	def test_changes_never_set_user_or_publish(self):
 		self.assertIn("frappe.session.user", self.sources["agent/changes/apply_job.py"])  # a read is allowed
@@ -7298,6 +7377,109 @@ class TestScannersCatchViolations(unittest.TestCase):
 			"install.py": "import os\nos.remove(p)\n",
 		}
 		self.assertEqual(check_fs_writes_only_in_file_writer(clean), [])
+
+	def test_file_writer_recheck_rule_catches_bypass(self):
+		canonical = (
+			"def _refuse_unless_canonical(full_path):\n"
+			"\tfull = os.path.abspath(full_path)\n"
+			"\tif source.resolve_safe_path(os.path.relpath(full, source.get_source_root())) != full:\n"
+			"\t\traise ValueError(full)\n"
+		)
+		writer = (
+			"import os\nfrom erp_ai.agent.tools import source\n\n{canonical}\n"
+			"def make_parents(full_path, app_dir):\n\t{make}\n\tos.mkdir(full_path)\n\n"
+			"def remove_empty_dirs(dirs):\n\tfor d in dirs:\n\t\t_refuse_unless_canonical(d)\n\t\t{remove}\n"
+		)
+		recheck = "_refuse_unless_canonical(full_path)"
+		good = {"canonical": canonical, "make": recheck, "remove": "os.rmdir(d)"}
+		self.assertEqual(
+			check_file_writer_rechecks_through_resolver({FILE_WRITER_FILE: writer.format(**good)}), []
+		)
+		direct = (
+			"from erp_ai.agent.tools.source import resolve_safe_path as resolve\n\n"
+			"def _refuse_unless_canonical(full_path):\n\tif resolve(full_path) != full_path:\n"
+			"\t\traise ValueError(full_path)\n"
+		)
+		self.assertEqual(
+			check_file_writer_rechecks_through_resolver(
+				{
+					FILE_WRITER_FILE: writer.format(**{**good, "canonical": direct}).replace(
+						"from erp_ai.agent.tools import source\n", ""
+					)
+				}
+			),
+			[],
+		)
+		cases = {
+			"resolver not called": (
+				{"canonical": "def _refuse_unless_canonical(full_path):\n\tpass\n"},
+				"_refuse_unless_canonical",
+			),
+			"resolver not called, decoy source call": (
+				{"canonical": "def _refuse_unless_canonical(full_path):\n\tsource.get_source_root()\n"},
+				"_refuse_unless_canonical",
+			),
+			"no canonical function": (
+				{"canonical": "def _refuse_other(full_path):\n\tsource.resolve_safe_path(full_path)\n"},
+				"_refuse_unless_canonical",
+			),
+			"realpath in remove_empty_dirs": (
+				{"remove": "os.path.realpath(d)"},
+				"realpath",
+			),
+			"aliased realpath": (
+				{"remove": "rp(d)", "canonical": "from os.path import realpath as rp\n" + canonical},
+				"realpath",
+			),
+			"commonpath": ({"remove": "os.path.commonpath([d, d])"}, "commonpath"),
+			"is_relative_to": ({"remove": "PurePath(d).is_relative_to(d)"}, "is_relative_to"),
+			"readlink": ({"remove": "os.readlink(d)"}, "readlink"),
+			"make_parents skips the recheck": ({"make": "pass"}, "make_parents"),
+		}
+		for name, (overrides, fragment) in cases.items():
+			with self.subTest(case=name):
+				source = writer.format(**{**good, **overrides})
+				self.assertCaught(
+					check_file_writer_rechecks_through_resolver({FILE_WRITER_FILE: source}), fragment
+				)
+		no_remover = (
+			"import os\nfrom erp_ai.agent.tools import source\n\n"
+			+ canonical
+			+ ("\ndef make_parents(full_path, app_dir):\n\t_refuse_unless_canonical(full_path)\n")
+		)
+		self.assertCaught(
+			check_file_writer_rechecks_through_resolver({FILE_WRITER_FILE: no_remover}), "remove_empty_dirs"
+		)
+		remover_skips_recheck = (
+			no_remover + "\ndef remove_empty_dirs(dirs):\n\tfor d in dirs:\n\t\tos.rmdir(d)\n"
+		)
+		self.assertCaught(
+			check_file_writer_rechecks_through_resolver({FILE_WRITER_FILE: remover_skips_recheck}),
+			"remove_empty_dirs",
+		)
+		self.assertCaught(check_file_writer_rechecks_through_resolver({}), FILE_WRITER_FILE)
+		# Condition 4 (on from T6): a file-system function outside FILE_WRITER_RECHECKERS is caught.
+		renamer = writer.format(**good) + "\ndef rename_file(a, b):\n\tos.replace(a, b)\n"
+		self.assertEqual(check_file_writer_rechecks_through_resolver({FILE_WRITER_FILE: renamer}), [])
+		with patch(f"{__name__}.FILE_WRITER_RECHECKS_ALL", True):
+			self.assertCaught(
+				check_file_writer_rechecks_through_resolver({FILE_WRITER_FILE: renamer}), "rename_file"
+			)
+			self.assertEqual(
+				check_file_writer_rechecks_through_resolver({FILE_WRITER_FILE: writer.format(**good)}), []
+			)
+		# The ADR-011 name rule still catches the old name in this file: the new rule does not loosen it.
+		old_name = {
+			CHANGE_GUARD_FILE: "from erp_ai.agent.tools import source\n\ndef check_write_path(rel):\n"
+			"\tfull = source.resolve_safe_path(rel)\n\tif full is None:\n\t\treturn _refused(PATH_INVALID)\n"
+			"\treturn full\n",
+			FILE_WRITER_FILE: "def _refuse_unsafe_path(full_path):\n\treturn None\n",
+		}
+		self.assertCaught(
+			check_change_guard_uses_resolve_safe_path(old_name), FILE_WRITER_FILE, "second path resolver"
+		)
+		self.assertFalse(FILE_WRITER_RECHECKS_ALL)
+		self.assertEqual(FILE_WRITER_RECHECKERS, ("make_parents", "remove_empty_dirs"))
 
 	def test_changes_set_user_or_publish_caught(self):
 		cases = {

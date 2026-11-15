@@ -1,6 +1,7 @@
 from unittest.mock import patch
 
 import frappe
+from frappe.permissions import rights, setup_custom_perms
 from frappe.tests.utils import FrappeTestCase
 from helpdesk.helpdesk.doctype.hd_form_script.hd_form_script import get_form_script
 from helpdesk.test_utils import make_ticket
@@ -10,11 +11,15 @@ from erp_ai.agent.routing import DEFAULT_ROUTING_RULES
 from erp_ai.constants import (
 	AGENT_USER,
 	HELPDESK_AGENT_ROLE,
+	LOG_DOCTYPE,
 	LOGGER_NAME,
 	ROLE_AGENT,
 	ROLE_INSTRUCTOR,
 	SETTING_DOCTYPE,
 )
+from erp_ai.test_utils import keep_agent_settings
+
+INSTRUCTOR_LOG_RIGHTS = ("read", "report")
 
 AI_FIELDS = (
 	"ai_section",
@@ -30,6 +35,41 @@ AI_FIELDS = (
 TEMPLATE = "Default"
 
 AUTOMATIC_ROLES = {"Guest", "All", "Administrator", "Desk User"}
+
+# FEAT-007 AC-1: switches (1) and (4) existed before FEAT-007; (2), (3), (5) are new.
+OLD_SWITCHES = ("unrestricted_enabled", "code_change_enabled")
+NEW_SWITCHES = ("record_tools_enabled", "act_now_enabled", "one_click_approval_enabled")
+FIVE_SWITCHES = (
+	"unrestricted_enabled",
+	"record_tools_enabled",
+	"act_now_enabled",
+	"code_change_enabled",
+	"one_click_approval_enabled",
+)
+
+# FEAT-007 AC-16: patched clocks for the enable mark filled by install.
+# FEAT-007 T60 (design "T22a"): hidden HD Ticket field and the Instructor read right on HD Article.
+CREATED_LABELS_FIELD = "ai_created_labels"
+ARTICLE = "HD Article"
+ARTICLE_STANDARD_ROLES = ("System Manager", "Agent", "HD Customer", "HD Customer Manager")
+PERM_FLAGS = (*rights, "if_owner")
+
+# FEAT-007 T23, STD-OPS-2 down (design.md:529): what a rollback of U0 leaves behind. A field removed from the meta
+# keeps its `tabSingles` row; a child table whose field is removed keeps its rows. Names absent from the meta
+# stand in for the rolled-back ones, since Frappe filters both by the meta alone.
+LEFTOVER_SINGLES = {
+	"erp_ai_rolled_back_switch": "1",
+	"erp_ai_rolled_back_note": "còn lại sau khi lùi phiên bản",
+	"erp_ai_rolled_back_blank": None,
+}
+ORPHAN_PARENTFIELD = "erp_ai_rolled_back_rows"
+U0_CHILD_TABLES = ("catalog_rules", "user_templates", "prompt_revisions")
+LEFTOVER_LABELS = '["Lỗi phần mềm"]'
+
+EARLIER = "2025-12-31 08:00:00"
+ENABLED_AT = "2026-01-02 03:04:05"
+ENABLED_AT_MICROSECONDS = "2026-01-02 03:04:05.000123"
+LATER = "2026-02-03 04:05:06"
 
 
 def _agent_roles():
@@ -90,7 +130,7 @@ class TestInstall(FrappeTestCase):
 		self.assertEqual(_counts(), before)
 		self.assertEqual(before["roles"], 2)
 		self.assertEqual(before["users"], 1)
-		self.assertEqual(before["ai_fields"], 9)
+		self.assertEqual(before["ai_fields"], 11)
 
 	def test_ai_fields_permlevel_8_and_template_rows_agents_only(self):
 		for name in AI_FIELDS:
@@ -141,7 +181,7 @@ class TestInstall(FrappeTestCase):
 			fields=["name", "idx", "fieldname", "required", "visible_to", "editable_after_creation"],
 			order_by="idx",
 		)
-		self.assertEqual(len(rows), 9)
+		self.assertEqual(len(rows), 10)
 		first = rows[0]
 		self.assertEqual(
 			(
@@ -154,12 +194,13 @@ class TestInstall(FrappeTestCase):
 			),
 			("erp-ai-t12-keep", 1, "priority", 1, "Everyone", 1),
 		)
-		self.assertEqual([r.idx for r in rows], [1, 2, 3, 4, 5, 6, 7, 8, 9])
+		self.assertEqual([r.idx for r in rows], [1, 2, 3, 4, 5, 6, 7, 8, 9, 10])
 		self.assertEqual(
 			[r.fieldname for r in rows[1:]],
 			[
 				"ai_resolution_hint",
 				"ai_confidence",
+				"ai_confidence_pct",
 				"ai_complexity",
 				"ai_importance",
 				"ai_score_reason",
@@ -625,3 +666,565 @@ class TestInstall(FrappeTestCase):
 		install.before_uninstall()
 		install.before_uninstall()
 		self.assertEqual(_counts()["status_scripts"], 0)
+
+
+def _stored_settings():
+	return dict(frappe.db.sql("select field, value from `tabSingles` where doctype=%s", SETTING_DOCTYPE))
+
+
+def _perm_key(row):
+	"""Role, permlevel and every permission flag of one DocPerm / Custom DocPerm row."""
+	return (row.role, row.permlevel, tuple((flag, row.get(flag) or 0) for flag in PERM_FLAGS))
+
+
+def _article_custom_perms(**filters):
+	return frappe.get_all(
+		"Custom DocPerm", filters={"parent": ARTICLE, **filters}, fields=["*"], order_by="name"
+	)
+
+
+def _article_custom_perm_snapshot():
+	return [(row.name, _perm_key(row), str(row.modified)) for row in _article_custom_perms()]
+
+
+def _labels_field():
+	return frappe.db.get_value(
+		"Custom Field",
+		{"dt": "HD Ticket", "fieldname": CREATED_LABELS_FIELD},
+		[
+			"name",
+			"fieldtype",
+			"permlevel",
+			"hidden",
+			"read_only",
+			"no_copy",
+			"module",
+			"insert_after",
+			"modified",
+		],
+		as_dict=True,
+	)
+
+
+class TestFeat007Migrate(FrappeTestCase):
+	def setUp(self):
+		frappe.db.rollback()
+		self.addCleanup(frappe.db.rollback)
+		keep_agent_settings(self)
+		# Custom fields already exist (migrate); never let a create path run DDL (implicit commit).
+		patcher = patch.object(frappe.db, "updatedb")
+		patcher.start()
+		self.addCleanup(patcher.stop)
+
+	def test_fresh_install_five_switches_off(self):
+		frappe.db.delete("Singles", {"doctype": SETTING_DOCTYPE})
+		install.ensure_setup()
+		stored = _stored_settings()
+		self.assertEqual(
+			{name: stored.get(name, "<missing>") for name in FIVE_SWITCHES}, dict.fromkeys(FIVE_SWITCHES, "0")
+		)
+
+	def test_migrate_keeps_old_switches_new_switches_off(self):
+		frappe.db.delete("Singles", {"doctype": SETTING_DOCTYPE, "field": ("in", FIVE_SWITCHES)})
+		for name in OLD_SWITCHES:
+			frappe.db.set_single_value(SETTING_DOCTYPE, name, 1)
+		install.after_migrate()
+		stored = _stored_settings()
+		self.assertEqual(
+			{name: stored.get(name, "<missing>") for name in FIVE_SWITCHES},
+			{**dict.fromkeys(OLD_SWITCHES, "1"), **dict.fromkeys(NEW_SWITCHES, "0")},
+		)
+
+	def test_second_migrate_changes_nothing(self):
+		frappe.db.delete("Singles", {"doctype": SETTING_DOCTYPE, "field": ("in", FIVE_SWITCHES)})
+		frappe.db.set_single_value(SETTING_DOCTYPE, "code_change_enabled", 1)
+		install.after_migrate()
+		first = _stored_settings()
+		self.assertLessEqual(set(FIVE_SWITCHES), set(first))
+		install.after_migrate()
+		self.assertEqual(_stored_settings(), first)
+
+	def _setup_at(self, now):
+		with patch("frappe.utils.now_datetime", return_value=frappe.utils.get_datetime(now)):
+			install.ensure_setup()
+
+	def _enabled_at(self):
+		stored = _stored_settings().get("agent_enabled_at", "<missing>")
+		return str(frappe.utils.get_datetime(stored)) if stored not in ("<missing>", None, "") else stored
+
+	def test_agent_enabled_at_filled_once_when_enabled(self):
+		"""AC-16, ADR-006: a site enabled before the upgrade gets its enable mark once, never moved."""
+		frappe.db.set_single_value(SETTING_DOCTYPE, "enabled", 1)
+		frappe.db.delete("Singles", {"doctype": SETTING_DOCTYPE, "field": "agent_enabled_at"})
+		self._setup_at(ENABLED_AT)
+		self.assertEqual(self._enabled_at(), ENABLED_AT)
+		self._setup_at(LATER)
+		self.assertEqual(self._enabled_at(), ENABLED_AT)
+
+	def test_agent_enabled_at_null_or_empty_counts_as_missing(self):
+		frappe.db.set_single_value(SETTING_DOCTYPE, "enabled", 1)
+		for stored in (None, ""):
+			with self.subTest(stored=stored):
+				frappe.db.delete("Singles", {"doctype": SETTING_DOCTYPE, "field": "agent_enabled_at"})
+				frappe.db.sql(
+					"insert into `tabSingles` (doctype, field, value) values (%s, 'agent_enabled_at', %s)",
+					(SETTING_DOCTYPE, stored),
+				)
+				self._setup_at(ENABLED_AT)
+				self.assertEqual(self._enabled_at(), ENABLED_AT)
+
+	def test_agent_enabled_at_stored_as_form_save_shape(self):
+		"""T125, STD-DESIGN-3: the install path stores the raw shape a form save writes, str(datetime)."""
+		frappe.db.set_single_value(SETTING_DOCTYPE, "enabled", 1)
+		for moment in (ENABLED_AT, ENABLED_AT_MICROSECONDS):
+			with self.subTest(moment=moment):
+				frappe.db.delete("Singles", {"doctype": SETTING_DOCTYPE, "field": "agent_enabled_at"})
+				self._setup_at(moment)
+				raw = _stored_settings().get("agent_enabled_at", "<missing>")
+				self.assertEqual(raw, moment)
+				self.assertEqual(raw, str(frappe.utils.get_datetime(moment)))
+
+	def test_agent_enabled_at_already_set_is_kept(self):
+		frappe.db.set_single_value(SETTING_DOCTYPE, "enabled", 1)
+		frappe.db.set_single_value(SETTING_DOCTYPE, "agent_enabled_at", EARLIER)
+		self._setup_at(ENABLED_AT)
+		self.assertEqual(self._enabled_at(), EARLIER)
+
+	def test_agent_enabled_at_left_unset_when_disabled(self):
+		frappe.db.set_single_value(SETTING_DOCTYPE, "enabled", 0)
+		frappe.db.delete("Singles", {"doctype": SETTING_DOCTYPE, "field": "agent_enabled_at"})
+		self._setup_at(ENABLED_AT)
+		self.assertEqual(self._enabled_at(), "<missing>")
+		frappe.db.sql(
+			"insert into `tabSingles` (doctype, field, value) values (%s, 'agent_enabled_at', NULL)",
+			SETTING_DOCTYPE,
+		)
+		self._setup_at(ENABLED_AT)
+		self.assertIsNone(self._enabled_at())
+
+	def _custom_field(self, doctype, fieldname):
+		return frappe.db.get_value(
+			"Custom Field",
+			{"dt": doctype, "fieldname": fieldname},
+			[
+				"name",
+				"fieldtype",
+				"options",
+				"read_only",
+				"permlevel",
+				"search_index",
+				"module",
+				"insert_after",
+				"label",
+			],
+			as_dict=True,
+		)
+
+	def test_confidence_pct_field_installed(self):
+		"""AC-22, D-14: HD Ticket `ai_confidence_pct` Int, read-only, permlevel 8, after `ai_confidence`."""
+		frappe.db.delete("Custom Field", {"dt": "HD Ticket", "fieldname": "ai_confidence_pct"})
+		frappe.db.delete("HD Ticket Template Field", {"parent": TEMPLATE, "fieldname": "ai_confidence_pct"})
+		frappe.clear_cache(doctype="HD Ticket")
+		install.ensure_setup()
+		field = self._custom_field("HD Ticket", "ai_confidence_pct")
+		self.assertIsNotNone(field)
+		self.assertEqual(
+			(field.fieldtype, field.read_only, field.permlevel, field.module, field.insert_after),
+			("Int", 1, 8, "ERP AI agent", "ai_confidence"),
+		)
+		self.assertEqual(
+			frappe.db.get_value(
+				"Custom Field", {"dt": "HD Ticket", "fieldname": "ai_complexity"}, "insert_after"
+			),
+			"ai_confidence_pct",
+		)
+		rows = frappe.get_all(
+			"HD Ticket Template Field",
+			filters={"parent": TEMPLATE, "fieldname": "ai_confidence_pct"},
+			fields=["visible_to", "required", "editable_after_creation"],
+		)
+		self.assertEqual(
+			[(r.visible_to, r.required, r.editable_after_creation) for r in rows], [("Agents", 0, 0)]
+		)
+		install.after_migrate()
+		self.assertEqual(
+			frappe.db.count("Custom Field", {"dt": "HD Ticket", "fieldname": "ai_confidence_pct"}), 1
+		)
+		self.assertEqual(
+			frappe.db.count(
+				"HD Ticket Template Field", {"parent": TEMPLATE, "fieldname": "ai_confidence_pct"}
+			),
+			1,
+		)
+
+	def test_article_source_field_installed_idempotent(self):
+		"""AC-45, D-15: HD Article `ai_source_ticket` Link HD Ticket, read-only, indexed; a human edit is kept."""
+		frappe.db.delete("Custom Field", {"dt": "HD Article", "fieldname": "ai_source_ticket"})
+		frappe.clear_cache(doctype="HD Article")
+		install.ensure_setup()
+		field = self._custom_field("HD Article", "ai_source_ticket")
+		self.assertIsNotNone(field)
+		self.assertEqual(
+			(field.fieldtype, field.options, field.read_only, field.search_index),
+			("Link", "HD Ticket", 1, 1),
+		)
+		self.assertEqual((field.module, field.insert_after), ("ERP AI agent", "category"))
+		frappe.db.set_value("Custom Field", field.name, {"label": "Do người sửa", "search_index": 0})
+		install.after_migrate()
+		field = self._custom_field("HD Article", "ai_source_ticket")
+		self.assertEqual((field.label, field.search_index), ("Do người sửa", 0))
+		self.assertEqual(
+			frappe.db.count("Custom Field", {"dt": "HD Article", "fieldname": "ai_source_ticket"}), 1
+		)
+
+	def test_article_field_skipped_when_doctype_missing(self):
+		frappe.db.delete("Custom Field", {"dt": "HD Article", "fieldname": "ai_source_ticket"})
+		real = frappe.db.exists
+		with (
+			patch.object(
+				install.frappe.db,
+				"exists",
+				side_effect=lambda *a, **k: None if a[:2] == ("DocType", "HD Article") else real(*a, **k),
+			),
+			patch.object(install.frappe, "logger") as logger,
+		):
+			install.ensure_setup()
+		warnings = [
+			c.args
+			for c in logger.return_value.warning.call_args_list
+			if "HD Article" in c.args[0] and "permission" not in c.args[0]
+		]
+		self.assertEqual(len(warnings), 1)
+		self.assertIn("not found", warnings[0][0])
+		self.assertIsNone(self._custom_field("HD Article", "ai_source_ticket"))
+
+	def test_instructor_can_report_on_log(self):
+		"""AC-20, D-5: ERP AI Instructor reads ERP AI Log through reports, nothing else (append-only kept)."""
+		rows = [p for p in frappe.get_meta(LOG_DOCTYPE).permissions if p.role == ROLE_INSTRUCTOR]
+		self.assertEqual(len(rows), 1)
+		row = rows[0]
+		self.assertEqual((row.permlevel, row.if_owner), (0, 0))
+		checked = [right for right in frappe.permissions.rights if right != "select"]
+		expected = {right: int(right in INSTRUCTOR_LOG_RIGHTS) for right in checked}
+		self.assertEqual(
+			{right: row.get(right) or 0 for right in checked},
+			expected,
+		)
+
+		instructor = "feat007-instructor@example.com"
+		frappe.local.role_permissions.clear()
+		self.addCleanup(frappe.local.role_permissions.clear)
+		with patch.object(frappe, "get_roles", return_value=[ROLE_INSTRUCTOR, "All", "Guest"]):
+			effective = frappe.permissions.get_role_permissions(LOG_DOCTYPE, user=instructor)
+		self.assertEqual(
+			{right: effective[right] for right in checked},
+			expected,
+		)
+
+	def _clear_article_meta_after_test(self):
+		# get_meta and the install path cache in-transaction permissions in redis; rollback does not clear it.
+		self.addCleanup(frappe.clear_cache, doctype=ARTICLE)
+
+	def _instructor_article_perms(self):
+		return _article_custom_perms(role=ROLE_INSTRUCTOR)
+
+	def _assert_instructor_read_report_only(self):
+		rows = self._instructor_article_perms()
+		self.assertEqual(len(rows), 1)
+		self.assertEqual(
+			_perm_key(rows[0]),
+			(
+				ROLE_INSTRUCTOR,
+				0,
+				tuple((flag, int(flag in INSTRUCTOR_LOG_RIGHTS)) for flag in PERM_FLAGS),
+			),
+		)
+
+	def test_created_labels_field_installed(self):
+		"""Ruling (1), ADR-006: hidden HD Ticket `ai_created_labels`, permlevel 8, last of the AI fields."""
+		frappe.db.delete("Custom Field", {"dt": "HD Ticket", "fieldname": CREATED_LABELS_FIELD})
+		frappe.clear_cache(doctype="HD Ticket")
+		opt_out_after = frappe.db.get_value(
+			"Custom Field", {"dt": "HD Ticket", "fieldname": "ai_opt_out"}, "insert_after"
+		)
+		install.ensure_setup()
+		field = _labels_field()
+		self.assertIsNotNone(field)
+		self.assertEqual(
+			(field.fieldtype, field.permlevel, field.hidden, field.read_only, field.no_copy, field.module),
+			("Small Text", 8, 1, 1, 1, "ERP AI agent"),
+		)
+		self.assertEqual(field.insert_after, "ai_opt_out")
+		self.assertEqual(
+			frappe.db.get_value(
+				"Custom Field", {"dt": "HD Ticket", "fieldname": "ai_opt_out"}, "insert_after"
+			),
+			opt_out_after,
+		)
+
+	def test_hidden_labels_field_has_no_template_row(self):
+		"""design-w0-fixes-2 (4): a hidden AI field gets no HD Ticket Template row."""
+		frappe.db.delete("Custom Field", {"dt": "HD Ticket", "fieldname": CREATED_LABELS_FIELD})
+		frappe.db.delete("HD Ticket Template Field", {"parent": TEMPLATE, "fieldname": CREATED_LABELS_FIELD})
+		frappe.clear_cache(doctype="HD Ticket")
+		install.ensure_setup()
+		install.ensure_setup()
+		field = _labels_field()
+		self.assertIsNotNone(field)
+		self.assertEqual(field.hidden, 1)
+		self.assertEqual(
+			frappe.db.count(
+				"HD Ticket Template Field", {"parent": TEMPLATE, "fieldname": CREATED_LABELS_FIELD}
+			),
+			0,
+		)
+
+	def test_existing_template_row_of_hidden_field_kept(self):
+		"""design-w0-fixes-2 (4): a template row a human added for the hidden field is not deleted."""
+		frappe.db.delete("HD Ticket Template Field", {"parent": TEMPLATE, "fieldname": CREATED_LABELS_FIELD})
+		template = frappe.get_doc("HD Ticket Template", TEMPLATE)
+		template.append("fields", {"fieldname": CREATED_LABELS_FIELD, "required": 0, "visible_to": "Agents"})
+		template.flags.ignore_permissions = True
+		template.save()
+		install.ensure_setup()
+		self.assertEqual(
+			frappe.db.count(
+				"HD Ticket Template Field", {"parent": TEMPLATE, "fieldname": CREATED_LABELS_FIELD}
+			),
+			1,
+		)
+
+	def test_instructor_article_perm_read_report_only(self):
+		"""Ruling (1b), ADR-015, AC-45: ERP AI Instructor reads HD Article (read, report), nothing else."""
+		self._clear_article_meta_after_test()
+		# Own starting state: no Custom DocPerm on HD Article, whatever an earlier run left on the site.
+		frappe.db.delete("Custom DocPerm", {"parent": ARTICLE})
+		install.ensure_setup()
+		self._assert_instructor_read_report_only()
+		meta_rows = [p for p in frappe.get_meta(ARTICLE).permissions if p.role == ROLE_INSTRUCTOR]
+		self.assertEqual([(p.permlevel, p.read, p.report, p.write) for p in meta_rows], [(0, 1, 1, 0)])
+
+	def test_article_perms_of_other_roles_unchanged(self):
+		"""Ruling (1b): the standard DocPerm is copied first, so the four standard roles keep their rights."""
+		self._clear_article_meta_after_test()
+		frappe.db.delete("Custom DocPerm", {"parent": ARTICLE})
+		standard = sorted(
+			_perm_key(row) for row in frappe.get_all("DocPerm", filters={"parent": ARTICLE}, fields=["*"])
+		)
+		self.assertEqual({key[0] for key in standard}, set(ARTICLE_STANDARD_ROLES))
+		install.ensure_setup()
+		custom = _article_custom_perms()
+		self.assertEqual(
+			sorted(_perm_key(row) for row in custom if row.role in ARTICLE_STANDARD_ROLES), standard
+		)
+		self.assertEqual(len(custom), len(standard) + 1)
+		self._assert_instructor_read_report_only()
+
+	def test_existing_article_custom_perm_kept(self):
+		"""Ruling (1b): a Custom DocPerm a human edited or added stays as is; only the Instructor row is added."""
+		self._clear_article_meta_after_test()
+		frappe.db.delete("Custom DocPerm", {"parent": ARTICLE})
+		setup_custom_perms(ARTICLE)
+		agent = frappe.db.get_value("Custom DocPerm", {"parent": ARTICLE, "role": "Agent"})
+		frappe.db.set_value(
+			"Custom DocPerm",
+			agent,
+			{"write": 0, "delete": 0, "modified": "2020-01-01 00:00:00"},
+			update_modified=False,
+		)
+		frappe.get_doc(
+			{
+				"doctype": "Custom DocPerm",
+				"parent": ARTICLE,
+				"parenttype": "DocType",
+				"parentfield": "permissions",
+				"role": "Blogger",
+				"permlevel": 0,
+				"read": 1,
+			}
+		).insert(ignore_permissions=True)
+		before = _article_custom_perm_snapshot()
+		install.ensure_setup()
+		after = [row for row in _article_custom_perm_snapshot() if row[1][0] != ROLE_INSTRUCTOR]
+		self.assertEqual(after, before)
+		self.assertEqual(len(_article_custom_perms()), len(before) + 1)
+		self._assert_instructor_read_report_only()
+
+	def test_second_setup_keeps_labels_field_and_article_perms(self):
+		"""Ruling (ii): a second setup changes nothing, also an Instructor row a human edited (no second row)."""
+		self._clear_article_meta_after_test()
+		frappe.db.delete("Custom DocPerm", {"parent": ARTICLE})
+		install.ensure_setup()
+		self._assert_instructor_read_report_only()
+		frappe.db.set_value(
+			"Custom DocPerm",
+			self._instructor_article_perms()[0].name,
+			{"export": 1, "modified": "2020-01-01 00:00:00"},
+			update_modified=False,
+		)
+		perms = _article_custom_perm_snapshot()
+		field = _labels_field()
+		self.assertIsNotNone(field)
+		install.ensure_setup()
+		install.after_migrate()
+		self.assertEqual(_article_custom_perm_snapshot(), perms)
+		self.assertEqual(_labels_field(), field)
+		self.assertEqual(
+			frappe.db.count("Custom Field", {"dt": "HD Ticket", "fieldname": CREATED_LABELS_FIELD}), 1
+		)
+		self.assertEqual(len(self._instructor_article_perms()), 1)
+
+	def test_article_perm_skipped_when_doctype_missing(self):
+		"""No HD Article DocType: one permission warning, no Custom DocPerm copied or added."""
+		self._clear_article_meta_after_test()
+		frappe.db.delete("Custom DocPerm", {"parent": ARTICLE})
+		real = frappe.db.exists
+		with (
+			patch.object(
+				install.frappe.db,
+				"exists",
+				side_effect=lambda *a, **k: None if a[:2] == ("DocType", ARTICLE) else real(*a, **k),
+			),
+			patch.object(install.frappe, "logger") as logger,
+		):
+			install.ensure_setup()
+		# The source field logs its own warning (T22); this one speaks for the permission only.
+		warnings = [
+			c.args
+			for c in logger.return_value.warning.call_args_list
+			if ARTICLE in c.args[0] and "permission" in c.args[0]
+		]
+		self.assertEqual(len(warnings), 1)
+		self.assertIn("not found", warnings[0][0])
+		self.assertNotIn("source ticket field", warnings[0][0])
+		self.assertEqual(_article_custom_perms(), [])
+
+	def _fresh_settings(self):
+		"""Own starting state: default settings and no child rows, whatever the site holds (keep_agent_settings)."""
+		frappe.db.delete("Singles", {"doctype": SETTING_DOCTYPE})
+		for child in {field.options for field in frappe.get_meta(SETTING_DOCTYPE).get_table_fields()}:
+			frappe.db.delete(child, {"parent": SETTING_DOCTYPE, "parenttype": SETTING_DOCTYPE})
+		install.ensure_setup()
+		install.after_migrate()
+		frappe.db.value_cache.pop(SETTING_DOCTYPE, None)
+
+	def _setting_values(self):
+		"""Every value field of the loaded form, as a human opening it would see them.
+
+		A save stores a never-set text field as "" where it had no row; both read as blank, so both count as None.
+		"""
+		doc = frappe.get_single(SETTING_DOCTYPE)
+		return {
+			field.fieldname: None if doc.get(field.fieldname) == "" else doc.get(field.fieldname)
+			for field in frappe.get_meta(SETTING_DOCTYPE).fields
+			if field.fieldtype not in frappe.model.no_value_fields
+			and field.fieldtype not in frappe.model.table_fields
+		}
+
+	def test_leftover_single_rows_dropped_on_next_human_save(self):
+		"""STD-OPS-2 down: `tabSingles` rows of removed fields are harmless; the next human save drops them."""
+		self._fresh_settings()
+		meta = frappe.get_meta(SETTING_DOCTYPE)
+		self.assertEqual([name for name in LEFTOVER_SINGLES if meta.has_field(name)], [])
+		kept = self._setting_values()
+		for field, value in LEFTOVER_SINGLES.items():
+			frappe.db.sql(
+				"insert into `tabSingles` (doctype, field, value) values (%s, %s, %s)",
+				(SETTING_DOCTYPE, field, value),
+			)
+		# Harmless: the form loads with the same values, and a migrate neither fails nor drops the rows.
+		self.assertEqual(self._setting_values(), kept)
+		install.after_migrate()
+		self.assertLessEqual(set(LEFTOVER_SINGLES), set(_stored_settings()))
+		frappe.get_single(SETTING_DOCTYPE).save()
+		self.assertEqual(set(LEFTOVER_SINGLES) & set(_stored_settings()), set())
+		self.assertEqual(self._setting_values(), kept)
+
+	def test_orphan_child_rows_do_not_break_get_single(self):
+		"""STD-OPS-2 down: rows of a removed table field are never loaded, and a save neither fails nor deletes them."""
+		self._fresh_settings()
+		meta = frappe.get_meta(SETTING_DOCTYPE)
+		self.assertFalse(meta.has_field(ORPHAN_PARENTFIELD))
+		orphans = {}
+		for fieldname in U0_CHILD_TABLES:
+			row = frappe.get_doc(
+				{
+					"doctype": meta.get_field(fieldname).options,
+					"parent": SETTING_DOCTYPE,
+					"parenttype": SETTING_DOCTYPE,
+					"parentfield": ORPHAN_PARENTFIELD,
+					"idx": 1,
+				}
+			)
+			row.db_insert()
+			orphans[row.doctype] = row.name
+		# One live row next to the orphan of the same table: only the orphan is left out.
+		live = frappe.get_doc(
+			{
+				"doctype": meta.get_field("prompt_revisions").options,
+				"parent": SETTING_DOCTYPE,
+				"parenttype": SETTING_DOCTYPE,
+				"parentfield": "prompt_revisions",
+				"idx": 1,
+				"part": "classify",
+				"changed_by": "Administrator",
+				"changed_at": EARLIER,
+				"new_length": 0,
+			}
+		)
+		live.db_insert()
+		expected = {"catalog_rules": [], "user_templates": [], "prompt_revisions": [live.name]}
+		doc = frappe.get_single(SETTING_DOCTYPE)
+		self.assertEqual({name: [row.name for row in doc.get(name)] for name in U0_CHILD_TABLES}, expected)
+		doc.save()
+		doc = frappe.get_single(SETTING_DOCTYPE)
+		self.assertEqual({name: [row.name for row in doc.get(name)] for name in U0_CHILD_TABLES}, expected)
+		self.assertEqual(
+			{child: frappe.db.exists(child, name) for child, name in orphans.items()},
+			{child: name for child, name in orphans.items()},
+		)
+
+	def _stored_labels(self, ticket):
+		rows = frappe.db.sql(
+			f"select `{CREATED_LABELS_FIELD}` from `tabHD Ticket` where name=%s", ticket, pluck=True
+		)
+		return rows[0] if rows else "<missing>"
+
+	def test_leftover_created_labels_column_does_not_break_ticket(self):
+		"""STD-OPS-2 down, ruling (1): the Custom Field record is gone, the column stays; tickets still load and save."""
+		frappe.db.set_single_value(SETTING_DOCTYPE, "enabled", 0)
+		field = _labels_field()
+		self.assertIsNotNone(field)
+		record = frappe.get_doc("Custom Field", field.name).as_dict()
+
+		def put_record_back():
+			if not frappe.db.exists("Custom Field", record.name):
+				frappe.get_doc(record).db_insert()
+			frappe.clear_cache(doctype="HD Ticket")
+
+		self.addCleanup(put_record_back)
+		before = make_ticket(subject="erp_ai T23 before rollback")
+		frappe.db.sql(
+			f"update `tabHD Ticket` set `{CREATED_LABELS_FIELD}`=%s where name=%s",
+			(LEFTOVER_LABELS, before.name),
+		)
+		# The rollback: DML on the record only, no DDL, so the column and its values stay.
+		frappe.db.delete("Custom Field", {"name": field.name})
+		frappe.clear_cache(doctype="HD Ticket")
+		self.assertFalse(frappe.get_meta("HD Ticket").has_field(CREATED_LABELS_FIELD))
+		self.assertTrue(frappe.db.has_column("HD Ticket", CREATED_LABELS_FIELD))
+
+		ticket = frappe.get_doc("HD Ticket", before.name)
+		ticket.subject = "erp_ai T23 saved after rollback"
+		ticket.save(ignore_permissions=True)
+		self.assertEqual(
+			frappe.db.get_value("HD Ticket", before.name, "subject"), "erp_ai T23 saved after rollback"
+		)
+		self.assertEqual(self._stored_labels(before.name), LEFTOVER_LABELS)
+		after = make_ticket(subject="erp_ai T23 after rollback")
+		self.assertTrue(frappe.db.exists("HD Ticket", after.name))
+		self.assertIsNone(self._stored_labels(after.name))
+
+		put_record_back()
+		self.assertTrue(frappe.get_meta("HD Ticket").has_field(CREATED_LABELS_FIELD))
+		self.assertEqual(_labels_field(), field)

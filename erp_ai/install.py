@@ -20,6 +20,8 @@ AI_SECTION_FIELD = "ai_section"
 AI_PERMLEVEL = 8
 TASK_DOCTYPE = "Task"
 TASK_TICKET_FIELD = "ai_ticket"
+ARTICLE_DOCTYPE = "HD Article"
+ARTICLE_SOURCE_FIELD = "ai_source_ticket"
 FORM_SCRIPT_DOCTYPE = "HD Form Script"
 AGENT_STATUS_SCRIPT = "ERP AI Agent Status"
 AGENT_STATUS_SCRIPT_FILE = ("public", "js", "agent_status_indicator.js")
@@ -49,7 +51,9 @@ def ensure_setup() -> None:
 	_ensure_ticket_custom_fields()
 	_ensure_template_rows()
 	_ensure_task_ticket_field()
+	_ensure_article_source_field()
 	_ensure_task_permission()
+	_ensure_article_instructor_permission()
 	_ensure_agent_status_script()
 
 
@@ -102,6 +106,15 @@ def _ensure_default_settings() -> None:
 		)
 		if not stored or stored[0][0] is None:
 			frappe.db.set_single_value(SETTING_DOCTYPE, fieldname, default)
+	# A site enabled before the upgrade gets its enable mark once (AC-16, ADR-006); absent, NULL or "" is missing.
+	enabled_at = frappe.db.sql(
+		"select value from `tabSingles` where doctype=%s and field='agent_enabled_at'", SETTING_DOCTYPE
+	)
+	if frappe.db.get_single_value(SETTING_DOCTYPE, "enabled", cache=False) and not (
+		enabled_at and enabled_at[0][0]
+	):
+		# str(datetime) is the shape a form save stores (space, no ".000000"); a datetime goes through isoformat().
+		frappe.db.set_single_value(SETTING_DOCTYPE, "agent_enabled_at", str(frappe.utils.now_datetime()))
 
 
 def _ensure_ticket_custom_fields() -> None:
@@ -142,6 +155,12 @@ def _ai_field_specs() -> list[dict]:
 			"read_only": 1,
 		},
 		{
+			"fieldname": "ai_confidence_pct",
+			"label": "Độ tin cậy % (AI)",
+			"fieldtype": "Int",
+			"read_only": 1,
+		},
+		{
 			"fieldname": "ai_complexity",
 			"label": "Độ phức tạp (AI)",
 			"fieldtype": "Int",
@@ -179,6 +198,15 @@ def _ai_field_specs() -> list[dict]:
 			"label": "Không dùng AI cho phiếu này",
 			"fieldtype": "Check",
 		},
+		{
+			# Server-only: labels the requester filled at creation; no template row (hidden).
+			"fieldname": "ai_created_labels",
+			"label": "Nhãn người tạo điền (AI)",
+			"fieldtype": "Small Text",
+			"hidden": 1,
+			"read_only": 1,
+			"no_copy": 1,
+		},
 	]
 
 
@@ -190,9 +218,14 @@ def _ensure_template_rows() -> None:
 		return
 	template = frappe.get_doc("HD Ticket Template", TEMPLATE_NAME)
 	present = {row.fieldname for row in template.fields}
+	# A hidden field is server-only, so it gets no row; a row already there is a human decision and stays.
 	missing = [
 		name
-		for name in (spec["fieldname"] for spec in _ai_field_specs() if spec["fieldname"] != AI_SECTION_FIELD)
+		for name in (
+			spec["fieldname"]
+			for spec in _ai_field_specs()
+			if spec["fieldname"] != AI_SECTION_FIELD and not spec.get("hidden")
+		)
 		if name not in present
 	]
 	for name in missing:
@@ -233,6 +266,30 @@ def _ensure_task_ticket_field() -> None:
 	)
 
 
+def _ensure_article_source_field() -> None:
+	if not frappe.db.exists("DocType", ARTICLE_DOCTYPE):
+		frappe.logger(LOGGER_NAME).warning("DocType HD Article not found; source ticket field not added")
+		return
+	# update=False: a field that exists is left as the human set it.
+	create_custom_fields(
+		{
+			ARTICLE_DOCTYPE: [
+				{
+					"fieldname": ARTICLE_SOURCE_FIELD,
+					"label": "Phiếu nguồn (AI)",
+					"fieldtype": "Link",
+					"options": TICKET_DOCTYPE,
+					"read_only": 1,
+					"search_index": 1,
+					"module": AI_MODULE,
+					"insert_after": "category",
+				}
+			]
+		},
+		update=False,
+	)
+
+
 def _ensure_task_permission() -> None:
 	if not frappe.db.exists("DocType", TASK_DOCTYPE):
 		frappe.logger(LOGGER_NAME).warning("DocType Task not found; agent permission not added")
@@ -261,6 +318,30 @@ def _ensure_task_permission() -> None:
 		}
 	).insert(ignore_permissions=True)
 	frappe.clear_cache(doctype=TASK_DOCTYPE)
+
+
+def _ensure_article_instructor_permission() -> None:
+	if not frappe.db.exists("DocType", ARTICLE_DOCTYPE):
+		frappe.logger(LOGGER_NAME).warning("DocType HD Article not found; instructor permission not added")
+		return
+	# Copy the standard DocPerm first: once a Custom DocPerm exists, the standard rows are ignored (ADR-015).
+	setup_custom_perms(ARTICLE_DOCTYPE)
+	if frappe.db.exists("Custom DocPerm", {"parent": ARTICLE_DOCTYPE, "role": ROLE_INSTRUCTOR}):
+		return
+	frappe.get_doc(
+		{
+			"doctype": "Custom DocPerm",
+			"parent": ARTICLE_DOCTYPE,
+			"parenttype": "DocType",
+			"parentfield": "permissions",
+			"role": ROLE_INSTRUCTOR,
+			"permlevel": 0,
+			"read": 1,
+			"report": 1,
+			"export": 0,  # the Custom DocPerm default is 1; the Instructor only reads and reports
+		}
+	).insert(ignore_permissions=True)
+	frappe.clear_cache(doctype=ARTICLE_DOCTYPE)
 
 
 def _ensure_agent_status_script() -> None:

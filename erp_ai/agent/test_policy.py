@@ -10,8 +10,15 @@ from frappe.utils import now_datetime
 from helpdesk.test_utils import make_ticket
 
 from erp_ai.agent import policy
-from erp_ai.constants import CORE_APPS, LOG_DOCTYPE, SETTING_DOCTYPE
-from erp_ai.test_utils import TempAppsRoot, set_agent_settings
+from erp_ai.constants import (
+	CORE_APPS,
+	LOG_DOCTYPE,
+	SETTING_DOCTYPE,
+	TRIGGER_CHANGE_ACTION,
+	TRIGGER_COMMENT_MENTION,
+	TRIGGER_TICKET_INSERT,
+)
+from erp_ai.test_utils import TempAppsRoot, keep_agent_settings, set_agent_settings
 
 TEAM = "Nhân sự & Hành chính"
 
@@ -61,10 +68,6 @@ class TestPolicy(FrappeTestCase):
 		for key, value in values.items():
 			frappe.db.set_value("HD Ticket", ticket.name, key, value)
 		return ticket.name
-
-	def _settings(self, **fields):
-		set_agent_settings(**fields)
-		return frappe.get_doc(SETTING_DOCTYPE)
 
 	def test_is_enabled_follows_setting(self):
 		self.assertFalse(policy.is_enabled())
@@ -162,22 +165,29 @@ class TestPolicy(FrappeTestCase):
 		cases = [("L3", "L1"), ("L2", "L1"), ("L1", "L1"), ("L0", "L0")]
 		for level, expected in cases:
 			with self.subTest(level=level):
-				settings = self._settings(
-					permission_level=level, monthly_budget_usd=10, spent_this_month_usd=10.5
-				)
-				self.assertEqual(policy.effective_level(settings), expected)
+				settings = frappe._dict(permission_level=level)
+				self.assertEqual(policy.effective_level(settings, over_budget=True), expected)
 
 	def test_effective_level_at_budget_does_not_lower(self):
-		settings = self._settings(permission_level="L3", monthly_budget_usd=10, spent_this_month_usd=10)
-		self.assertEqual(policy.effective_level(settings), "L3")
+		settings = frappe._dict(permission_level="L3", monthly_budget_usd=10)
+		with patch.object(policy, "month_spend_usd", return_value=10.0):
+			over_budget = policy.is_over_budget(settings, now=datetime(2001, 2, 15, 12, 0))
+		self.assertEqual(policy.effective_level(settings, over_budget=over_budget), "L3")
 
 	def test_effective_level_under_budget_unchanged(self):
-		settings = self._settings(permission_level="L2", spent_this_month_usd=1)
-		self.assertEqual(policy.effective_level(settings), "L2")
+		settings = frappe._dict(permission_level="L2")
+		self.assertEqual(policy.effective_level(settings, over_budget=False), "L2")
 
 	def _log(self, ticket, run_id, entry_type="classify", created=None):
 		log = frappe.get_doc(
-			{"doctype": LOG_DOCTYPE, "ticket": ticket, "run_id": run_id, "entry_type": entry_type, "turn": 0}
+			{
+				"doctype": LOG_DOCTYPE,
+				"ticket": ticket,
+				"run_id": run_id,
+				"entry_type": entry_type,
+				"trigger": TRIGGER_TICKET_INSERT,
+				"turn": 0,
+			}
 		).insert(ignore_permissions=True)
 		if created:
 			frappe.db.set_value(LOG_DOCTYPE, log.name, "creation", created, update_modified=False)
@@ -346,3 +356,531 @@ class TestPolicy(FrappeTestCase):
 		self._assert_refused("onlygiven", "Không có thư mục apps/onlygiven", other)
 		self._assert_refused("onlyother", "Không có thư mục apps/onlyother", given)
 		self.assertIsNone(policy.validate_change_apps(frappe._dict(code_change_apps="onlyother"), other))
+
+
+class TestTicketContentDoctype(FrappeTestCase):
+	# ADR-034 QĐ 1: the four names of TICKET_CONTENT_DOCTYPES (T8 pins the constant itself).
+	CONSTANT_NAMES = ("HD Ticket", "Comment", "Communication", "File")
+
+	def setUp(self):
+		self.addCleanup(frappe.db.rollback)
+		keep_agent_settings(self)
+		for function in ("ticket_link_fieldnames", "is_ticket_content_doctype"):
+			self.assertTrue(callable(getattr(policy, function, None)), f"policy has no {function}()")
+		# The Custom Field erp_ai installs (test_install pins it); no test creates one (ALTER TABLE commits).
+		self.assertTrue(
+			frappe.db.exists(
+				"Custom Field", {"dt": "Task", "fieldname": "ai_ticket", "options": "HD Ticket"}
+			),
+			"Custom Field Task.ai_ticket of erp_ai is missing",
+		)
+
+	def test_constant_and_ticket_links(self):
+		# design-w0-fixes-3.md ruling 2, C-T15-2: the constant by name, any other DocType by its Link fields to
+		# HD Ticket (standard or Custom Field), always on the stored DocType name.
+		for doctype in (*self.CONSTANT_NAMES, "comment", "HD Ticket Comment", "Task", "task"):
+			with self.subTest(doctype=doctype):
+				self.assertTrue(policy.is_ticket_content_doctype(doctype))
+		for doctype in ("User", "Note", "Không có DocType này"):
+			with self.subTest(doctype=doctype):
+				self.assertFalse(policy.is_ticket_content_doctype(doctype))
+		cases = (
+			("HD Ticket Comment", ("reference_ticket",)),
+			("Task", ("ai_ticket",)),
+			("task", ("ai_ticket",)),
+			# HD Ticket links to itself (split from, merged with) but is the ticket, not a linked record.
+			("HD Ticket", ()),
+			("hd ticket", ()),
+			("Comment", ()),
+			("User", ()),
+			("Không có DocType này", ()),
+		)
+		for doctype, fieldnames in cases:
+			with self.subTest(doctype=doctype):
+				self.assertEqual(policy.ticket_link_fieldnames(doctype), fieldnames)
+
+
+class TestPermissionSwitches(FrappeTestCase):
+	# U1 3.1: the five permission switches, read in one place, in the spec's order (1)..(5).
+	FIELD_FLAGS = (
+		("unrestricted_enabled", "unrestricted"),
+		("record_tools_enabled", "record_tools"),
+		("act_now_enabled", "act_now"),
+		("code_change_enabled", "code_change"),
+		("one_click_approval_enabled", "one_click_approval"),
+	)
+
+	def setUp(self):
+		self.addCleanup(frappe.db.rollback)
+		keep_agent_settings(self)
+		for name in ("permission_switches", "PermissionSwitches", "PERMISSION_SWITCH_FIELDS"):
+			self.assertTrue(hasattr(policy, name), f"policy has no {name}")
+
+	def _flags(self, switches):
+		return {flag: getattr(switches, flag) for _field, flag in self.FIELD_FLAGS}
+
+	def test_missing_fields_read_off(self):
+		off = {flag: False for _field, flag in self.FIELD_FLAGS}
+		self.assertEqual(policy.PermissionSwitches(), policy.PermissionSwitches(*off.values()))
+		# A settings object without the fields (before migrate) reads every switch off and never raises.
+		for settings in (frappe._dict(), object()):
+			with self.subTest(settings=settings):
+				self.assertEqual(self._flags(policy.permission_switches(settings)), off)
+		for value in (0, None, ""):
+			with self.subTest(value=value):
+				settings = frappe._dict({field: value for field, _flag in self.FIELD_FLAGS})
+				self.assertEqual(self._flags(policy.permission_switches(settings)), off)
+		set_agent_settings(**{field: 0 for field, _flag in self.FIELD_FLAGS})
+		self.assertEqual(self._flags(policy.permission_switches(frappe.get_doc(SETTING_DOCTYPE))), off)
+		with self.assertRaises(AttributeError):
+			policy.permission_switches(frappe._dict()).act_now = True
+
+	def test_each_field_maps_to_its_flag(self):
+		self.assertEqual(
+			(
+				policy.UNRESTRICTED_FIELD,
+				policy.RECORD_TOOLS_FIELD,
+				policy.ACT_NOW_FIELD,
+				policy.ONE_CLICK_APPROVAL_FIELD,
+			),
+			("unrestricted_enabled", "record_tools_enabled", "act_now_enabled", "one_click_approval_enabled"),
+		)
+		self.assertEqual(policy.PERMISSION_SWITCH_FIELDS, tuple(field for field, _flag in self.FIELD_FLAGS))
+		for field, flag in self.FIELD_FLAGS:
+			with self.subTest(field=field):
+				switches = policy.permission_switches(frappe._dict({field: 1}))
+				self.assertEqual(
+					self._flags(switches), {other: other == flag for _f, other in self.FIELD_FLAGS}
+				)
+		self.assertTrue(
+			all(
+				self._flags(
+					policy.permission_switches(frappe._dict.fromkeys(policy.PERMISSION_SWITCH_FIELDS, 1))
+				).values()
+			)
+		)
+		# Read from the stored setting: (2) and (5) on, the rest off.
+		set_agent_settings(
+			unrestricted_enabled=0,
+			record_tools_enabled=1,
+			act_now_enabled=0,
+			code_change_enabled=0,
+			one_click_approval_enabled=1,
+		)
+		self.assertEqual(
+			policy.permission_switches(frappe.get_doc(SETTING_DOCTYPE)),
+			policy.PermissionSwitches(record_tools=True, one_click_approval=True),
+		)
+
+
+class TestBudget(FrappeTestCase):
+	# AC-61: the month's spend is summed from live ERP AI Log rows, never from spent_this_month_usd.
+	# February 2001 has no real rows on the site; every row here is written inside the test transaction.
+	FEB = datetime(2001, 2, 15, 12, 0)
+
+	def setUp(self):
+		commit_guard = patch.object(
+			frappe.db, "commit", side_effect=AssertionError("test must not commit the transaction")
+		)
+		commit_guard.start()
+		self.addCleanup(commit_guard.stop)
+		self.addCleanup(frappe.db.rollback)
+
+	def _log(self, created, cost_usd=None, entry_type="classify"):
+		values = {"doctype": LOG_DOCTYPE, "run_id": f"budget-{created}", "entry_type": entry_type, "turn": 0}
+		if cost_usd is not None:
+			values["cost_usd"] = cost_usd
+		log = frappe.get_doc(values).insert(ignore_permissions=True)
+		frappe.db.set_value(LOG_DOCTYPE, log.name, "creation", created, update_modified=False)
+
+	def _february_rows(self):
+		"""February 2001 spends 4.0 + 6.0 = 10.0; the two boundary rows are outside [start, end)."""
+		self._log(datetime(2001, 1, 31, 23, 59, 59), 100.0)  # last second of the month before
+		self._log(datetime(2001, 2, 1, 0, 0, 0), 4.0)  # first instant of the month counts
+		self._log(datetime(2001, 2, 15, 9, 0), None, "skip")  # no cost_usd: adds nothing
+		self._log(datetime(2001, 2, 28, 23, 59, 59), 6.0, "reason")
+		self._log(datetime(2001, 3, 1, 0, 0, 0), 1000.0)  # first instant of the next month
+
+	def test_month_spend_sums_live_log_rows(self):
+		self.assertEqual(policy.month_spend_usd(now=self.FEB), 0.0)  # a month without rows
+		self._february_rows()
+		spend = policy.month_spend_usd(now=self.FEB)
+		self.assertIsInstance(spend, float)
+		self.assertEqual(spend, 10.0)
+
+	def test_over_budget_reads_log_not_spent_field(self):
+		self._february_rows()
+		cases = [
+			({"monthly_budget_usd": 9.5, "spent_this_month_usd": 0}, True),
+			({"monthly_budget_usd": 10.5, "spent_this_month_usd": 999}, False),
+			({"monthly_budget_usd": None, "spent_this_month_usd": 0}, True),
+		]
+		for fields, expected in cases:
+			with self.subTest(**fields):
+				self.assertIs(policy.is_over_budget(frappe._dict(fields), now=self.FEB), expected)
+		# The spend goes through the module-level seam, called with the given `now`.
+		with patch.object(policy, "month_spend_usd", return_value=10.01) as month_spend:
+			self.assertIs(policy.is_over_budget(frappe._dict(monthly_budget_usd=10), now=self.FEB), True)
+		month_spend.assert_called_once_with(self.FEB)
+
+	def test_over_budget_caps_permission_level_at_l1(self):
+		self._february_rows()
+		over = {"L3": "L1", "L2": "L1", "L1": "L1", "L0": "L0"}
+		for level, expected in over.items():
+			with self.subTest(level=level):
+				# the spent field says "under" but the log rows (10.0) are over the budget of 9.5
+				settings = frappe._dict(
+					permission_level=level, monthly_budget_usd=9.5, spent_this_month_usd=0
+				)
+				over_budget = policy.is_over_budget(settings, now=self.FEB)
+				self.assertIs(over_budget, True)
+				self.assertEqual(policy.effective_level(settings, over_budget=over_budget), expected)
+				self.assertEqual(policy.effective_level(settings, over_budget=False), level)
+		with self.assertRaises(TypeError):
+			policy.effective_level(frappe._dict(permission_level="L3"), True)
+
+	def test_spend_equal_to_budget_is_not_over(self):
+		# No spend and no budget: 0 > 0 is not over.
+		self.assertIs(policy.is_over_budget(frappe._dict(monthly_budget_usd=0), now=self.FEB), False)
+		self._february_rows()
+		settings = frappe._dict(permission_level="L3", monthly_budget_usd=10, spent_this_month_usd=999)
+		self.assertIs(policy.is_over_budget(settings, now=self.FEB), False)
+		self.assertEqual(policy.effective_level(settings, over_budget=False), "L3")
+
+
+class TestLevels(FrappeTestCase):
+	# AC-31, U1 3.1: the main-path level of a ticket = the smaller of the permission level and the category cap.
+	# (category, default cap, expected main-path level for permission_level L0, L1, L2, L3 under budget)
+	CATEGORY_ROWS = (
+		("A", "L2", ("L0", "L1", "L2", "L2")),
+		("B", "L3", ("L0", "L1", "L2", "L3")),
+		("C", "L1", ("L0", "L1", "L1", "L1")),
+		("D", "L2", ("L0", "L1", "L2", "L2")),
+		("E", "L1", ("L0", "L1", "L1", "L1")),
+		("F", "L3", ("L0", "L1", "L2", "L3")),
+	)
+	# Over budget the permission level is already capped at L1 (never raises L0): every category reads <= L1.
+	OVER_BUDGET = ("L0", "L1", "L1", "L1")
+
+	def setUp(self):
+		self.addCleanup(frappe.db.rollback)
+		keep_agent_settings(self)
+		for name in (
+			"LEVEL_CAP_FIELD_PREFIX",
+			"UNKNOWN_CATEGORY_LEVEL",
+			"category_level_cap",
+			"main_path_level",
+		):
+			self.assertTrue(hasattr(policy, name), f"policy has no {name}")
+
+	def _caps(self, cap=None):
+		"""level_cap_<x> of every category: the default caps, or `cap` for all."""
+		return {
+			f"level_cap_{category.lower()}": cap or default for category, default, _ in self.CATEGORY_ROWS
+		}
+
+	def test_main_path_level_matrix(self):
+		self.assertEqual(policy.LEVEL_CAP_FIELD_PREFIX, "level_cap_")
+		meta = frappe.get_meta(SETTING_DOCTYPE)
+		for field, level in self._caps().items():
+			with self.subTest(default=field):
+				self.assertEqual(meta.get_field(field).default, level)
+		# Read from the stored setting carrying the default caps (the matrix of AC-31: 6 x 4 x 2 = 48 cases).
+		set_agent_settings(monthly_budget_usd=0, **self._caps())
+		cases = 0
+		for level_index, level in enumerate(("L0", "L1", "L2", "L3")):
+			set_agent_settings(permission_level=level)
+			settings = frappe.get_doc(SETTING_DOCTYPE)
+			for over_budget in (False, True):
+				permission_level = policy.effective_level(settings, over_budget=over_budget)
+				for category, default_cap, expected_by_level in self.CATEGORY_ROWS:
+					expected = (self.OVER_BUDGET if over_budget else expected_by_level)[level_index]
+					with self.subTest(category=category, level=level, over_budget=over_budget):
+						self.assertEqual(policy.category_level_cap(settings, category), default_cap)
+						self.assertEqual(
+							policy.main_path_level(settings, permission_level, category), expected
+						)
+					cases += 1
+		self.assertEqual(cases, 48)
+
+	def test_cap_above_or_below_permission_level(self):
+		# The cap only lowers: a cap above the permission level keeps the permission level, L0 always wins.
+		cases = (
+			("L3", "L0", "L0"),
+			("L1", "L0", "L0"),
+			("L0", "L3", "L0"),
+			("L1", "L3", "L1"),
+			("L3", "L1", "L1"),
+			("L2", "L2", "L2"),
+		)
+		for permission_level, cap, expected in cases:
+			with self.subTest(permission_level=permission_level, cap=cap):
+				settings = frappe._dict(level_cap_d=cap)
+				self.assertEqual(policy.category_level_cap(settings, "D"), cap)
+				self.assertEqual(policy.main_path_level(settings, permission_level, "D"), expected)
+
+	def test_unknown_category_or_bad_cap_reads_l1(self):
+		self.assertEqual(policy.UNKNOWN_CATEGORY_LEVEL, "L1")
+		all_l3 = frappe._dict(self._caps("L3"))
+		# An unknown category (None, empty, lower case, not one of A..F) reads L1 even when every cap is L3.
+		for category in (None, "", "a", "G", "AB", " A", "level_cap_a"):
+			with self.subTest(category=category):
+				self.assertEqual(policy.category_level_cap(all_l3, category), "L1")
+				self.assertEqual(policy.main_path_level(all_l3, "L3", category), "L1")
+				self.assertEqual(policy.main_path_level(all_l3, "L1", category), "L1")
+				self.assertEqual(policy.main_path_level(all_l3, "L0", category), "L0")
+		# A missing field (before migrate) or a value outside LEVELS reads L1 (fail-closed, NFR-4).
+		for settings in (frappe._dict(), object()):
+			with self.subTest(settings=settings):
+				self.assertEqual(policy.category_level_cap(settings, "B"), "L1")
+				self.assertEqual(policy.main_path_level(settings, "L3", "B"), "L1")
+		for value in (None, "", "L4", "l3", "L-1", " L3", 3, "Toàn quyền"):
+			with self.subTest(value=value):
+				settings = frappe._dict(level_cap_b=value)
+				self.assertEqual(policy.category_level_cap(settings, "B"), "L1")
+				self.assertEqual(policy.main_path_level(settings, "L3", "B"), "L1")
+				self.assertEqual(policy.main_path_level(settings, "L0", "B"), "L0")
+		# A bad cap on one category does not leak into another.
+		settings = frappe._dict(level_cap_b="L9", level_cap_f="L3")
+		self.assertEqual(policy.main_path_level(settings, "L3", "F"), "L3")
+		# Read from the stored setting: an empty cap reads L1.
+		set_agent_settings(level_cap_a="")
+		self.assertEqual(policy.category_level_cap(frappe.get_doc(SETTING_DOCTYPE), "A"), "L1")
+
+
+class TestConfidence(FrappeTestCase):
+	# AC-22, A-U1-1, U1 3.1: the single below-threshold predicate; unknown confidence (None, -1, outside 0..100)
+	# is below every threshold unless an instructor gave the order and switch (3) act_now is on.
+	def setUp(self):
+		commit_guard = patch.object(
+			frappe.db, "commit", side_effect=AssertionError("test must not commit the transaction")
+		)
+		commit_guard.start()
+		self.addCleanup(commit_guard.stop)
+		self.addCleanup(frappe.db.rollback)
+		keep_agent_settings(self)
+
+	def _below(self, pct, threshold, has_instructor=False, act_now=False):
+		return policy.is_below_confidence(pct, threshold, has_instructor=has_instructor, act_now=act_now)
+
+	def test_threshold_boundaries(self):
+		self.assertEqual(policy.CONFIDENCE_THRESHOLD_FIELD, "confidence_threshold")
+		self.assertEqual(policy.DEFAULT_CONFIDENCE_THRESHOLD, 70)
+		cases = (
+			(69, 70, True),
+			(70, 70, False),
+			(71, 70, False),
+			(0, 70, True),
+			(100, 70, False),
+			(None, 70, True),
+			(-1, 70, True),
+			# threshold 0: unknown is still below, a known 0 is not (design-w0-fixes-2.md ruling (1))
+			(None, 0, True),
+			(-1, 0, True),
+			(0, 0, False),
+			(99, 100, True),
+			(100, 100, False),
+			# outside 0..100, a bool or a non-int reads unknown: below even at threshold 0
+			(101, 0, True),
+			(-5, 0, True),
+			(True, 0, True),
+			(False, 0, True),
+			("80", 70, True),
+			(80.0, 70, True),
+		)
+		for pct, threshold, expected in cases:
+			with self.subTest(pct=pct, threshold=threshold):
+				self.assertIs(self._below(pct, threshold), expected)
+		# The stored default threshold (a fresh install) gives the same 69/70 boundary.
+		set_agent_settings(confidence_threshold=70)
+		threshold = policy.confidence_threshold(frappe.get_doc(SETTING_DOCTYPE))
+		self.assertEqual(threshold, 70)
+		self.assertIs(self._below(69, threshold), True)
+		self.assertIs(self._below(70, threshold), False)
+
+	def test_threshold_changed_to_80(self):
+		set_agent_settings(confidence_threshold=80)
+		threshold = policy.confidence_threshold(frappe.get_doc(SETTING_DOCTYPE))
+		self.assertIsInstance(threshold, int)
+		self.assertEqual(threshold, 80)
+		self.assertIs(self._below(70, threshold), True)
+		self.assertIs(self._below(79, threshold), True)
+		self.assertIs(self._below(80, threshold), False)
+		for value in (0, 100):
+			with self.subTest(stored=value):
+				set_agent_settings(confidence_threshold=value)
+				self.assertEqual(policy.confidence_threshold(frappe.get_doc(SETTING_DOCTYPE)), value)
+
+	def test_threshold_missing_or_invalid_reads_default(self):
+		# A missing field (before migrate), empty, garbage, a bool or a value outside 0..100 reads the default 70.
+		self.assertEqual(policy.confidence_threshold(frappe._dict()), 70)
+		self.assertEqual(policy.confidence_threshold(object()), 70)
+		for value in (None, "", "abc", "7O", True, False, -1, 101, [80]):
+			with self.subTest(value=value):
+				self.assertEqual(policy.confidence_threshold(frappe._dict(confidence_threshold=value)), 70)
+		for value, expected in ((0, 0), (100, 100), ("80", 80), (85.0, 85)):
+			with self.subTest(value=value):
+				threshold = policy.confidence_threshold(frappe._dict(confidence_threshold=value))
+				self.assertIsInstance(threshold, int)
+				self.assertEqual(threshold, expected)
+
+	def test_instructor_with_act_now_is_never_below(self):
+		for pct in (None, -1, 0, 1, 69, 70, 100, 101, True, "80"):
+			for threshold in (0, 70, 80, 100):
+				with self.subTest(pct=pct, threshold=threshold):
+					self.assertIs(self._below(pct, threshold, has_instructor=True, act_now=True), False)
+
+	def test_act_now_off_instructor_still_below(self):
+		# Only the pair instructor AND act_now lifts the threshold; either one alone does not.
+		for has_instructor, act_now in ((True, False), (False, True), (False, False)):
+			for pct, expected in ((69, True), (None, True), (-1, True), (70, False)):
+				with self.subTest(has_instructor=has_instructor, act_now=act_now, pct=pct):
+					self.assertIs(self._below(pct, 70, has_instructor, act_now), expected)
+		# The two flags are keyword-only.
+		with self.assertRaises(TypeError):
+			policy.is_below_confidence(69, 70, True, True)
+
+	def _classify_row(self, ticket, category, pct=None, created=None, entry_type="classify"):
+		values = {
+			"doctype": LOG_DOCTYPE,
+			"ticket": ticket,
+			"run_id": f"conf-{frappe.generate_hash(length=8)}",
+			"entry_type": entry_type,
+			"turn": 0,
+			"predicted_category": category,
+		}
+		log = frappe.get_doc(values).insert(ignore_permissions=True)
+		if pct is not None:
+			frappe.db.set_value(LOG_DOCTYPE, log.name, "predicted_confidence_pct", pct, update_modified=False)
+		if created:
+			frappe.db.set_value(LOG_DOCTYPE, log.name, "creation", created, update_modified=False)
+		return log.name
+
+	def test_latest_classification_minus_one_reads_none(self):
+		for pct, expected in ((-1, None), (0, 0), (70, 70), (100, 100), (101, None), (-7, None)):
+			with self.subTest(pct=pct):
+				ticket = make_ticket(subject="T69 confidence").name
+				self._classify_row(ticket, "C", pct)
+				self.assertEqual(policy.latest_classification(ticket), ("C", expected))
+		# A row written without the pct takes the column default -1: unknown.
+		ticket = make_ticket(subject="T69 confidence").name
+		self._classify_row(ticket, "D")
+		self.assertEqual(frappe.db.get_value(LOG_DOCTYPE, {"ticket": ticket}, "predicted_confidence_pct"), -1)
+		self.assertEqual(policy.latest_classification(ticket), ("D", None))
+
+	def test_latest_classification_without_row_reads_none(self):
+		ticket = make_ticket(subject="T69 confidence").name
+		self.assertEqual(policy.latest_classification(ticket), (None, None))
+		self.assertEqual(policy.latest_classification("no-such-ticket"), (None, None))
+		# Rows that do not count: an empty category, another entry type, another ticket.
+		self._classify_row(ticket, "", 90)
+		self._classify_row(ticket, None, 90)
+		self._classify_row(ticket, "B", 90, entry_type="reason")
+		self._classify_row(make_ticket(subject="T69 other").name, "A", 90)
+		self.assertEqual(policy.latest_classification(ticket), (None, None))
+
+	def test_latest_classification_newest_row_wins(self):
+		ticket = make_ticket(subject="T69 confidence").name
+		now = now_datetime()
+		self._classify_row(ticket, "B", 95, created=now - timedelta(hours=1))
+		self._classify_row(ticket, "A", 40, created=now - timedelta(hours=2))
+		self._classify_row(ticket, "E", 80, created=now - timedelta(days=1))
+		self.assertEqual(policy.latest_classification(ticket), ("B", 95))
+		# A newer row with an empty category, or of another entry type, does not replace the classification.
+		self._classify_row(ticket, "", 10, created=now)
+		self._classify_row(ticket, "F", 10, created=now, entry_type="reason")
+		self.assertEqual(policy.latest_classification(ticket), ("B", 95))
+		# A newer classify row with an unknown pct wins and reads None (no fallback to an older number).
+		self._classify_row(ticket, "C", -1, created=now + timedelta(minutes=1))
+		self.assertEqual(policy.latest_classification(ticket), ("C", None))
+
+
+class TestRunsToday(FrappeTestCase):
+	# arch-review w1a C-3 and ruling (2), ADR-033 QĐ 4: the daily limit counts only the runs started by a
+	# trigger of RUN_LIMIT_TRIGGERS; classify/reason rows of any other trigger (or none) are not a run.
+	def setUp(self):
+		commit_guard = patch.object(
+			frappe.db, "commit", side_effect=AssertionError("test must not commit the transaction")
+		)
+		commit_guard.start()
+		self.addCleanup(commit_guard.stop)
+		self.addCleanup(frappe.db.rollback)
+
+	def _log(self, ticket, run_id, entry_type, trigger):
+		frappe.get_doc(
+			{
+				"doctype": LOG_DOCTYPE,
+				"ticket": ticket,
+				"run_id": run_id,
+				"entry_type": entry_type,
+				"trigger": trigger,
+				"turn": 0,
+			}
+		).insert(ignore_permissions=True)
+
+	def test_counts_only_run_limit_triggers(self):
+		ticket = make_ticket(subject="T71 runs_today ticket").name
+		self._log(ticket, "insert", "classify", TRIGGER_TICKET_INSERT)
+		self._log(ticket, "mention", "reason", TRIGGER_COMMENT_MENTION)
+		self._log(ticket, "change-reason", "reason", TRIGGER_CHANGE_ACTION)
+		self._log(ticket, "change-classify", "classify", TRIGGER_CHANGE_ACTION)
+		self.assertEqual(policy.runs_today(ticket), 2)
+		self.assertEqual(policy.RUN_LIMIT_TRIGGERS, (TRIGGER_TICKET_INSERT, TRIGGER_COMMENT_MENTION))
+
+
+class TestSiteEnvironment(FrappeTestCase):
+	# ADR-031 QĐ 7, arch-review w1a C-1: the one reader of the site environment; anything but an exact
+	# "production" or "test" (missing field, empty, unknown, other case) fails closed to "production".
+	def setUp(self):
+		commit_guard = patch.object(
+			frappe.db, "commit", side_effect=AssertionError("test must not commit the transaction")
+		)
+		commit_guard.start()
+		self.addCleanup(commit_guard.stop)
+		self.addCleanup(frappe.db.rollback)
+		keep_agent_settings(self)
+
+	def test_values_and_fail_closed(self):
+		self.assertEqual(policy.SITE_ENVIRONMENT_FIELD, "site_environment")
+		self.assertEqual(policy.SITE_ENVIRONMENTS, ("production", "test"))
+		self.assertEqual(policy.DEFAULT_SITE_ENVIRONMENT, "production")
+		for value in ("production", "test"):
+			with self.subTest(value=value):
+				self.assertEqual(policy.site_environment(frappe._dict(site_environment=value)), value)
+		# A settings object without the field (before migrate) reads production and never raises.
+		for settings in (frappe._dict(), object()):
+			with self.subTest(settings=settings):
+				self.assertEqual(policy.site_environment(settings), "production")
+		for value in (
+			"",
+			None,
+			"staging",
+			"Test",
+			"TEST",
+			"Production",
+			" test",
+			"test ",
+			0,
+			1,
+			True,
+			["test"],
+		):
+			with self.subTest(value=value):
+				self.assertEqual(policy.site_environment(frappe._dict(site_environment=value)), "production")
+		# settings=None reads the stored ERP AI Setting (a value written without validate, as an old row could be).
+		for stored, expected in (
+			("test", "test"),
+			("production", "production"),
+			("staging", "production"),
+			("", "production"),
+		):
+			with self.subTest(stored=stored):
+				set_agent_settings(site_environment=stored)
+				self.assertEqual(policy.site_environment(), expected)
+				self.assertEqual(policy.site_environment(None), expected)
+		# A given settings object wins over the stored value.
+		set_agent_settings(site_environment="production")
+		self.assertEqual(policy.site_environment(frappe._dict(site_environment="test")), "test")
+		set_agent_settings(site_environment="test")
+		self.assertEqual(policy.site_environment(frappe._dict()), "production")
+		self.assertEqual(policy.site_environment(frappe.get_doc(SETTING_DOCTYPE)), "test")

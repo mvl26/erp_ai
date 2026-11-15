@@ -148,6 +148,10 @@ doc_events = {
 	"Comment": {
 		"after_insert": "erp_ai.handlers.comment_after_insert",
 	},
+	"HD Article": {
+		"validate": "erp_ai.agent.article_guard.check_article_write",
+		"on_trash": "erp_ai.agent.article_guard.check_article_delete",
+	},
 }
 
 # Deleting a ticket must not be blocked by its audit-log rows (the log is kept)
@@ -159,6 +163,9 @@ ignore_links_on_delete = ["ERP AI Log"]
 scheduler_events = {
 	"hourly": ["erp_ai.tasks.reprobe_exhausted_keys"],
 	"daily": ["erp_ai.tasks.recompute_monthly_spend", "erp_ai.tasks.check_privilege_escalation"],
+	"cron": {
+		"*/15 * * * *": ["erp_ai.agent.missed_scan.scan_missed_tickets"],
+	},
 }
 
 # Testing

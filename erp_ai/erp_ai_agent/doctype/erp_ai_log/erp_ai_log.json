@@ -16,6 +16,7 @@
   "change_proposal",
   "change_step",
   "actor",
+  "site_environment",
   "section_usage",
   "input_tokens",
   "output_tokens",
@@ -35,6 +36,7 @@
   "section_prediction",
   "predicted_category",
   "predicted_confidence",
+  "predicted_confidence_pct",
   "predicted_ticket_type",
   "predicted_agent_group",
   "predicted_priority",
@@ -43,6 +45,9 @@
   "predicted_score_reason",
   "predicted_assignee",
   "applied",
+  "created_labels",
+  "split_requested",
+  "split_requests",
   "section_correction",
   "human_corrected_to",
   "human_corrected_by",
@@ -136,6 +141,13 @@
    "read_only": 1
   },
   {
+   "fieldname": "site_environment",
+   "fieldtype": "Data",
+   "label": "Môi trường site",
+   "description": "Môi trường site lúc ghi dòng này: production hoặc test, lấy từ ô Môi trường site của Setting. Giá trị được giữ nguyên khi Setting đổi sau đó. Hệ thống tự ghi khi ghi nhật ký, không sửa được.",
+   "read_only": 1
+  },
+  {
    "fieldname": "section_usage",
    "fieldtype": "Section Break",
    "label": "Token, chi phí và khóa"
@@ -218,7 +230,7 @@
   },
   {
    "fieldname": "actions",
-   "fieldtype": "Small Text",
+   "fieldtype": "Long Text",
    "label": "Hành động",
    "description": "Các hành động agent đã thực hiện trên phiếu, ví dụ ghi phân loại hoặc đăng bình luận. Để trống nếu chỉ đọc. Hệ thống tự ghi khi agent chạy, không sửa được.",
    "read_only": 1
@@ -263,6 +275,14 @@
    "fieldtype": "Data",
    "label": "Độ tin cậy dự đoán",
    "description": "Độ tin cậy của dự đoán: Cao, Trung bình hoặc Thấp. Khi dự đoán được áp dụng, giá trị này được ghi vào trường ai_confidence của phiếu. Hệ thống tự ghi khi agent chạy, không sửa được.",
+   "read_only": 1
+  },
+  {
+   "fieldname": "predicted_confidence_pct",
+   "fieldtype": "Int",
+   "label": "Độ tin cậy dự đoán (%)",
+   "default": "-1",
+   "description": "Độ tin cậy 0–100 của bước phân loại. -1 = không biết (dòng tạo trước khi có cột, hoặc model không trả số). Hệ thống tự ghi khi agent chạy, không sửa được.",
    "read_only": 1
   },
   {
@@ -322,6 +342,27 @@
    "read_only": 1
   },
   {
+   "fieldname": "created_labels",
+   "fieldtype": "Small Text",
+   "label": "Nhãn lúc tạo phiếu",
+   "description": "Nhãn người gõ lúc tạo phiếu, ghi trước khi agent ghi gì vào phiếu: JSON gồm ticket_type, agent_group, priority, chỉ có khóa có giá trị. Chỉ dòng classify mới ghi. Báo cáo độ chính xác so dự đoán với nhãn này trước, không có thì mới dùng nhãn người sửa sau. Hệ thống tự ghi khi agent chạy, không sửa được.",
+   "read_only": 1
+  },
+  {
+   "fieldname": "split_requested",
+   "fieldtype": "Check",
+   "label": "Đã xin tách phiếu",
+   "description": "Được chọn khi bước phân loại thấy phiếu gộp từ 2 yêu cầu trở lên và bot đã đăng comment xin người tạo xác nhận. Cờ này giúp lần chạy lại không đăng lần hai. Bot không tạo, sửa, đóng phiếu nào vì việc này. Hệ thống tự ghi khi agent chạy, không sửa được.",
+   "read_only": 1
+  },
+  {
+   "fieldname": "split_requests",
+   "fieldtype": "Small Text",
+   "label": "Các yêu cầu trong phiếu gộp",
+   "description": "Danh sách JSON các yêu cầu mà bước phân loại tách ra từ phiếu gộp, đúng như comment xin xác nhận đã liệt kê. Để trống khi phiếu chỉ có một yêu cầu. Hệ thống tự ghi khi agent chạy, không sửa được.",
+   "read_only": 1
+  },
+  {
    "fieldname": "section_correction",
    "fieldtype": "Section Break",
    "label": "Người sửa sau dự đoán"
@@ -378,6 +419,11 @@
    "create": 1,
    "read": 1,
    "role": "ERP AI Agent"
+  },
+  {
+   "read": 1,
+   "report": 1,
+   "role": "ERP AI Instructor"
   }
  ],
  "sort_field": "modified",

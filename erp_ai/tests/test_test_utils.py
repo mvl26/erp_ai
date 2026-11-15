@@ -1,18 +1,23 @@
+import hashlib
 import json
 import unittest
 from unittest.mock import patch
 
 import frappe
 from frappe.tests.utils import FrappeTestCase
+from frappe.utils.password import remove_encrypted_password, set_encrypted_password
 
-from erp_ai.constants import AGENT_USER, HELPDESK_AGENT_ROLE, ROLE_AGENT
+from erp_ai.constants import AGENT_USER, CREDENTIAL_DOCTYPE, HELPDESK_AGENT_ROLE, ROLE_AGENT, SETTING_DOCTYPE
 from erp_ai.test_utils import (
 	PREFIX,
+	add_credential,
+	keep_agent_settings,
 	make_active_agent,
 	make_routing_rules,
 	make_sla,
 	make_team,
 	pin_agent_roles,
+	set_agent_settings,
 )
 
 AUTOMATIC_ROLES = {"Guest", "All", "Administrator", "Desk User"}
@@ -207,3 +212,99 @@ class TestMakeHelpers(FrappeTestCase):
 		)
 		priorities = frappe.get_all("HD Service Level Priority", filters={"parent": plain}, pluck="priority")
 		self.assertEqual(set(priorities), {"Low", "Medium", "High", "Urgent"})
+
+
+def _setting_singles() -> list[tuple]:
+	return [
+		tuple(row)
+		for row in frappe.db.sql(
+			"select field, value from `tabSingles` where doctype=%s order by field", SETTING_DOCTYPE
+		)
+	]
+
+
+def _credential_rows() -> list[dict]:
+	return frappe.get_all(
+		CREDENTIAL_DOCTYPE,
+		filters={"parent": SETTING_DOCTYPE, "parenttype": SETTING_DOCTYPE},
+		fields=["*"],
+		order_by="name",
+	)
+
+
+def _credential_auth_rows() -> list[tuple]:
+	"""`__Auth` rows of ERP AI Credential; the stored (encrypted) value appears only as its sha256, never printed."""
+	rows = frappe.db.sql(
+		"select doctype, name, fieldname, password, encrypted from `__Auth` where doctype=%s",
+		CREDENTIAL_DOCTYPE,
+		as_dict=True,
+	)
+	return sorted(
+		(
+			row.doctype,
+			row.name,
+			row.fieldname,
+			hashlib.sha256(row.password.encode("utf-8")).hexdigest(),
+			row.encrypted,
+		)
+		for row in rows
+	)
+
+
+class TestKeepAgentSettings(FrappeTestCase):
+	def setUp(self):
+		frappe.db.rollback()
+		# Registered first so it is undone last: the rollback cleanup runs while commits are still guarded.
+		commit_guard = patch.object(frappe.db, "commit", side_effect=AssertionError("test must not commit"))
+		commit_guard.start()
+		self.addCleanup(commit_guard.stop)
+		# The rollback empties `value_cache` but not the document cache the test fills.
+		self.addCleanup(frappe.clear_document_cache, SETTING_DOCTYPE, SETTING_DOCTYPE)
+		self.addCleanup(frappe.db.rollback)
+
+	def test_restores_singles_and_child_rows(self):
+		set_agent_settings(trigger_keyword=f"{PREFIX}keyword", thinking_text=f"{PREFIX}thinking")
+		add_credential(f"{PREFIX}keep-A")
+		add_credential(f"{PREFIX}keep-B")
+		singles_before = _setting_singles()
+		rows_before = _credential_rows()
+		inner = unittest.TestCase()
+
+		keep_agent_settings(inner)
+		set_agent_settings(trigger_keyword=f"{PREFIX}changed")
+		frappe.db.delete("Singles", {"doctype": SETTING_DOCTYPE, "field": "thinking_text"})
+		frappe.db.delete(CREDENTIAL_DOCTYPE, {"parent": SETTING_DOCTYPE, "label": f"{PREFIX}keep-A"})
+		add_credential(f"{PREFIX}keep-new")
+		self.assertNotEqual(_setting_singles(), singles_before)
+		self.assertNotEqual(_credential_rows(), rows_before)
+		# Fill both caches with the changed values; the raw-SQL restore does not touch them.
+		self.assertEqual(frappe.db.get_single_value(SETTING_DOCTYPE, "trigger_keyword"), f"{PREFIX}changed")
+		self.assertIsNone(frappe.get_cached_doc(SETTING_DOCTYPE).thinking_text)
+
+		inner.doCleanups()
+
+		self.assertEqual(_setting_singles(), singles_before)
+		self.assertEqual(_credential_rows(), rows_before)
+		self.assertEqual(frappe.db.get_single_value(SETTING_DOCTYPE, "trigger_keyword"), f"{PREFIX}keyword")
+		self.assertEqual(frappe.get_cached_doc(SETTING_DOCTYPE).thinking_text, f"{PREFIX}thinking")
+
+	def test_restores_auth_rows_of_credentials(self):
+		# Own rows, so the test never depends on the site's credentials.
+		changed = add_credential(f"{PREFIX}auth-changed")
+		deleted = add_credential(f"{PREFIX}auth-deleted")
+		auth_before = _credential_auth_rows()
+		inner = unittest.TestCase()
+
+		keep_agent_settings(inner)
+		set_encrypted_password(CREDENTIAL_DOCTYPE, changed, f"sk-{PREFIX}FAKE-changed", "api_key")
+		remove_encrypted_password(CREDENTIAL_DOCTYPE, deleted, "api_key")
+		added = add_credential(f"{PREFIX}auth-added")
+		auth_changed = _credential_auth_rows()
+		self.assertNotEqual(auth_changed, auth_before)
+		self.assertEqual(len(auth_changed), len(auth_before))
+		self.assertIn(added, {row[1] for row in auth_changed})
+
+		inner.doCleanups()
+
+		self.assertEqual(_credential_auth_rows(), auth_before)
+		self.assertEqual(len(_credential_auth_rows()), len(auth_before))

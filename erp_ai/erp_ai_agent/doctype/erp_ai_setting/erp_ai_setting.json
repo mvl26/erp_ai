@@ -7,7 +7,26 @@
   "section_activation",
   "enabled",
   "permission_level",
+  "agent_enabled_at",
+  "section_permissions",
   "unrestricted_enabled",
+  "record_tools_enabled",
+  "act_now_enabled",
+  "code_change_enabled",
+  "one_click_approval_enabled",
+  "site_environment",
+  "section_autonomy",
+  "level_cap_a",
+  "level_cap_b",
+  "level_cap_c",
+  "level_cap_d",
+  "level_cap_e",
+  "level_cap_f",
+  "confidence_threshold",
+  "auto_approve_streak",
+  "section_catalog",
+  "catalog_rules",
+  "user_templates",
   "section_limits",
   "max_turns_per_run",
   "max_runs_per_ticket_per_day",
@@ -28,13 +47,50 @@
   "answer_delay_max_s",
   "section_routing",
   "excluded_teams",
+  "excluded_title_prefixes",
   "category_mapping",
   "auto_assign_enabled",
   "routing_rules",
   "prompt_digest",
+  "section_ticket_fields",
+  "field_ticket_nature",
+  "field_erp_module",
+  "field_origin",
+  "origin_board_value",
+  "field_due_date",
+  "field_project",
+  "field_item_code",
+  "field_serial_no",
   "section_code_change",
-  "code_change_enabled",
   "code_change_apps",
+  "section_knowledge",
+  "reply_enabled",
+  "resolve_on_tasks_done_enabled",
+  "close_silent_f_enabled",
+  "close_silent_f_days",
+  "kb_draft_enabled",
+  "knowledge_search_limit",
+  "manuals_dir",
+  "allowed_reports",
+  "report_row_limit",
+  "section_operations",
+  "coo_report_recipients",
+  "daily_report_weekends",
+  "monthly_reviewers",
+  "review_sample_size",
+  "d_ticket_watcher",
+  "due_reminder_hours",
+  "ba_note_due_hours",
+  "task_due_days",
+  "max_tasks_per_run",
+  "kpi_targets",
+  "daily_report_sent_on",
+  "budget_alert_sent_month",
+  "section_prompts",
+  "prompt_override_classify",
+  "prompt_override_reasoning",
+  "prompt_override_category_guide",
+  "prompt_revisions",
   "section_alerts",
   "alert_recipients",
   "privilege_alert_checked_until",
@@ -59,14 +115,148 @@
    "label": "Mức quyền",
    "options": "L0\nL1\nL2\nL3",
    "default": "L0",
-   "description": "L0: chỉ phân loại phiếu mới và ghi vào Log, không sửa phiếu, không trả lời bình luận. L1: đọc dữ liệu, ghi phân loại hoặc gợi ý lên phiếu, đăng bình luận. L2 có đúng bộ công cụ như L1. L3 thêm công cụ tạo, sửa bản ghi và đề xuất sửa code khi bật ô Cho phép sửa code và lệnh bench. Khi đã chi vượt ngân sách tháng thì tự hạ về L1 (L0 giữ nguyên)."
+   "description": "L0: chỉ phân loại phiếu mới vào Log, không ghi gì lên phiếu. L1: đọc dữ liệu, ghi phân loại, gợi ý lên phiếu, bình luận. Từ L2: ghi ERP ngoài phiếu qua đề xuất hoặc dòng Tự làm. L3: mức của công cụ bản ghi chung, sửa code. Mức thực tế của từng phiếu trên đường danh mục trắng không vượt Mức tối đa của đầu mục; năm quyền mở rộng tính theo ô này. Vượt ngân sách tháng thì tự hạ về L1 (L0 giữ nguyên)."
+  },
+  {
+   "fieldname": "agent_enabled_at",
+   "fieldtype": "Datetime",
+   "label": "Thời điểm bật agent",
+   "read_only": 1,
+   "description": "Hệ thống tự ghi thời điểm gần nhất ô Bật agent đổi từ tắt sang bật; site đã bật agent từ trước khi nâng cấp lên bản có trường này thì mốc là thời điểm nâng cấp. Việc quét phiếu bị lỡ chỉ xét phiếu tạo sau mốc này. Lưu khi agent đã bật thì mốc giữ nguyên; không sửa được."
+  },
+  {
+   "fieldname": "section_permissions",
+   "fieldtype": "Section Break",
+   "label": "Năm quyền mở rộng (mặc định tắt)"
   },
   {
    "fieldname": "unrestricted_enabled",
    "fieldtype": "Check",
    "label": "Toàn quyền (khẩn cấp)",
    "default": "0",
-   "description": "Bật thì ở mọi mức từ L1 và khi có người ra lệnh, bot được tạo, sửa, xóa, submit, hủy bản ghi và gọi hàm whitelist theo quyền của tài khoản agent, không qua duyệt: gán được mọi vai trò kể cả System Manager, sửa được phân quyền và mọi tài khoản. Vẫn đóng: cấu hình, khóa API, Log và đề xuất của ERP AI; mật khẩu người dùng. Việc bot làm vẫn ghi vào Log. Chỉ bật khi cần gấp, xong thì tắt."
+   "description": "Toàn quyền. Bật thì từ L1, khi có người ra lệnh và chưa vượt ngân sách tháng, bot được tạo, sửa, xóa, submit, hủy bản ghi, gán mọi vai trò kể cả System Manager và gọi hàm whitelist, không qua duyệt. Gọi hàm là tự do: bot không tự đổi công tắc và không đọc phiếu nhóm loại trừ qua gọi hàm chỉ là cố gắng. Vẫn đóng: cấu hình, khóa API, Log, đề xuất; mật khẩu. Chỉ bật khi cần gấp."
+  },
+  {
+   "fieldname": "record_tools_enabled",
+   "fieldtype": "Check",
+   "label": "Công cụ bản ghi chung",
+   "default": "0",
+   "description": "Công cụ bản ghi chung. Bật thì ở L3 và khi có người ra lệnh, bot liệt kê, đọc, tạo, sửa bản ghi của DocType không bị cấm, ghi thẳng không qua duyệt (không xóa, không submit, không gán 6 vai trò quản trị). Không theo danh mục trắng. Mọi lần ghi có trong Log. Sau cập nhật ô này tắt, kể cả khi ô sửa code đang bật."
+  },
+  {
+   "fieldname": "act_now_enabled",
+   "fieldtype": "Check",
+   "label": "Làm luôn, không hỏi lại",
+   "default": "0",
+   "description": "Làm luôn. Bật thì khi có người ra lệnh và có ít nhất một quyền mở rộng được cấp, bot làm ngay trong lượt, không hỏi lại, không bị ngưỡng độ tin cậy chặn. Không thêm công cụ nào. Tắt thì dưới ngưỡng bot chỉ hỏi."
+  },
+  {
+   "fieldname": "code_change_enabled",
+   "fieldtype": "Check",
+   "label": "Cho phép sửa code và lệnh bench",
+   "default": "0",
+   "description": "Sửa code và lệnh bench. Bật thì ở L3 và khi có người ra lệnh, bot đề xuất sửa file, tạo file, lệnh bench; mọi thay đổi phải được duyệt bởi ERP AI Instructor trên form đề xuất. Mỗi thay đổi đã áp dụng là một commit git local; bot không push. Ô này không còn mở công cụ bản ghi. Tắt thì bot không có ba công cụ đó."
+  },
+  {
+   "fieldname": "one_click_approval_enabled",
+   "fieldtype": "Check",
+   "label": "Duyệt một lần bấm",
+   "default": "0",
+   "description": "Duyệt một lần bấm. Bật thì comment đề xuất có liên kết Duyệt và Từ chối: một lần bấm là chạy, không hộp xác nhận; người có quyền duyệt bấm liên kết được chuyển tiếp cũng duyệt. Tắt thì máy chủ từ chối liên kết, kể cả liên kết cũ; duyệt trên form hoặc ngăn của bot, có bước xác nhận."
+  },
+  {
+   "fieldname": "site_environment",
+   "fieldtype": "Select",
+   "label": "Môi trường site",
+   "options": "production\ntest",
+   "default": "production",
+   "description": "test hoặc production. Ở production bot từ chối Custom Field, Server Script, Client Script, Property Setter, Workflow, Data Import trên đường danh mục trắng và đề nghị làm trên site test. Năm quyền mở rộng không bị chặn theo môi trường; giá trị ghi vào cảnh báo và Log."
+  },
+  {
+   "fieldname": "section_autonomy",
+   "fieldtype": "Section Break",
+   "label": "Mức tự chủ theo đầu mục và độ tin cậy"
+  },
+  {
+   "fieldname": "level_cap_a",
+   "fieldtype": "Select",
+   "label": "Mức tối đa đầu mục A",
+   "options": "L0\nL1\nL2\nL3",
+   "default": "L2",
+   "description": "Mức cao nhất của bot cho phiếu đầu mục A trên đường danh mục trắng, Task, đề xuất. Mức thực tế là mức nhỏ hơn giữa ô này và Mức quyền. Không áp cho năm quyền mở rộng. Đầu mục chưa biết tính L1."
+  },
+  {
+   "fieldname": "level_cap_b",
+   "fieldtype": "Select",
+   "label": "Mức tối đa đầu mục B",
+   "options": "L0\nL1\nL2\nL3",
+   "default": "L3",
+   "description": "Mức cao nhất của bot cho phiếu đầu mục B trên đường danh mục trắng, Task, đề xuất. Mức thực tế là mức nhỏ hơn giữa ô này và Mức quyền. Không áp cho năm quyền mở rộng. Đầu mục chưa biết tính L1."
+  },
+  {
+   "fieldname": "level_cap_c",
+   "fieldtype": "Select",
+   "label": "Mức tối đa đầu mục C",
+   "options": "L0\nL1\nL2\nL3",
+   "default": "L1",
+   "description": "Mức cao nhất của bot cho phiếu đầu mục C trên đường danh mục trắng, Task, đề xuất. Mức thực tế là mức nhỏ hơn giữa ô này và Mức quyền. Không áp cho năm quyền mở rộng. Đầu mục chưa biết tính L1."
+  },
+  {
+   "fieldname": "level_cap_d",
+   "fieldtype": "Select",
+   "label": "Mức tối đa đầu mục D",
+   "options": "L0\nL1\nL2\nL3",
+   "default": "L2",
+   "description": "Mức cao nhất của bot cho phiếu đầu mục D trên đường danh mục trắng, Task, đề xuất. Mức thực tế là mức nhỏ hơn giữa ô này và Mức quyền. Không áp cho năm quyền mở rộng. Đầu mục chưa biết tính L1."
+  },
+  {
+   "fieldname": "level_cap_e",
+   "fieldtype": "Select",
+   "label": "Mức tối đa đầu mục E",
+   "options": "L0\nL1\nL2\nL3",
+   "default": "L1",
+   "description": "Mức cao nhất của bot cho phiếu đầu mục E trên đường danh mục trắng, Task, đề xuất. Mức thực tế là mức nhỏ hơn giữa ô này và Mức quyền. Không áp cho năm quyền mở rộng. Đầu mục chưa biết tính L1."
+  },
+  {
+   "fieldname": "level_cap_f",
+   "fieldtype": "Select",
+   "label": "Mức tối đa đầu mục F",
+   "options": "L0\nL1\nL2\nL3",
+   "default": "L3",
+   "description": "Mức cao nhất của bot cho phiếu đầu mục F trên đường danh mục trắng, Task, đề xuất. Mức thực tế là mức nhỏ hơn giữa ô này và Mức quyền. Không áp cho năm quyền mở rộng. Đầu mục chưa biết tính L1."
+  },
+  {
+   "fieldname": "confidence_threshold",
+   "fieldtype": "Int",
+   "label": "Ngưỡng độ tin cậy (%)",
+   "default": "70",
+   "description": "Độ tin cậy tối thiểu, từ 0 đến 100 (phần trăm). Dưới ngưỡng bot không ghi gì, chỉ đăng một comment hỏi; trừ khi có người ra lệnh và ô Làm luôn bật."
+  },
+  {
+   "fieldname": "auto_approve_streak",
+   "fieldtype": "Int",
+   "label": "Số lần duyệt liên tiếp để Tự làm",
+   "default": "20",
+   "description": "Số đề xuất liên tiếp được duyệt không sửa của một loại hành động để dòng Tự làm chạy không cần duyệt, từ 1 đến 100. Từ chối, duyệt có sửa, hoàn tác đếm lại từ 0."
+  },
+  {
+   "fieldname": "section_catalog",
+   "fieldtype": "Section Break",
+   "label": "Danh mục trắng"
+  },
+  {
+   "fieldname": "catalog_rules",
+   "fieldtype": "Table",
+   "label": "Danh mục trắng",
+   "options": "ERP AI Catalog Rule",
+   "description": "Danh mục trắng của đường chính. Không có dòng nào: 6 hành động có tên thành đề xuất chờ Duyệt; riêng \"Đổi trường\" và thêm người vào nhóm loại trừ cần một dòng, không có thì bị từ chối. Mỗi dòng: hành động, DocType, trường, đầu mục, chế độ Cấm / Cần duyệt / Tự làm. Bảng con không bao giờ là đích. Dòng trỏ vào dữ liệu của app, phân quyền, tài khoản hay chứng từ submit bị chặn khi lưu."
+  },
+  {
+   "fieldname": "user_templates",
+   "fieldtype": "Table",
+   "label": "Mẫu tài khoản",
+   "options": "ERP AI User Template",
+   "description": "Mẫu cho hành động tạo tài khoản theo mẫu: tên mẫu và vai trò (mỗi dòng một vai trò). Không được chứa System Manager, Administrator, ERP AI Instructor, ERP AI Agent, Guest, All."
   },
   {
    "fieldname": "section_limits",
@@ -204,6 +394,13 @@
    "description": "Mỗi dòng một tên nhóm, so với Nhóm xử lý của phiếu, không phân biệt hoa thường. Phiếu thuộc các nhóm này thì agent bỏ qua."
   },
   {
+   "fieldname": "excluded_title_prefixes",
+   "fieldtype": "Small Text",
+   "label": "Tiền tố tiêu đề loại trừ",
+   "default": "[HR]\n[Kế toán]",
+   "description": "Mỗi dòng một tiền tố tiêu đề của bộ phận loại trừ, ví dụ [HR]. Phiếu có tiền tố này bị bỏ qua như phiếu nhóm loại trừ, không gửi cho model."
+  },
+  {
    "fieldname": "category_mapping",
    "fieldtype": "Code",
    "label": "Ánh xạ đầu mục",
@@ -232,22 +429,256 @@
    "description": "Người tự nhập, hệ thống không tự điền. Được nối vào cuối hướng dẫn của bước lập luận, không dùng ở bước phân loại."
   },
   {
+   "fieldname": "section_ticket_fields",
+   "fieldtype": "Section Break",
+   "label": "Trường sẵn có của phiếu"
+  },
+  {
+   "fieldname": "field_ticket_nature",
+   "fieldtype": "Data",
+   "label": "Tính chất phiếu",
+   "description": "Tên trường (fieldname) trên HD Ticket chứa Tính chất phiếu. Để trống nếu site chưa có; phần phụ thuộc không chạy và ghi log. Tên không có trên phiếu thì không lưu được."
+  },
+  {
+   "fieldname": "field_erp_module",
+   "fieldtype": "Data",
+   "label": "Phân hệ ERP",
+   "description": "Tên trường (fieldname) trên HD Ticket chứa Phân hệ ERP. Để trống nếu site chưa có; phần phụ thuộc không chạy và ghi log. Tên không có trên phiếu thì không lưu được."
+  },
+  {
+   "fieldname": "field_origin",
+   "fieldtype": "Data",
+   "label": "Nguồn phát sinh",
+   "description": "Tên trường (fieldname) trên HD Ticket chứa Nguồn phát sinh. Để trống nếu site chưa có; phần phụ thuộc không chạy và ghi log. Tên không có trên phiếu thì không lưu được."
+  },
+  {
+   "fieldname": "origin_board_value",
+   "fieldtype": "Data",
+   "label": "Giá trị Chỉ đạo BGĐ",
+   "description": "Giá trị của trường Nguồn phát sinh nghĩa là Chỉ đạo BGĐ. Phiếu có giá trị này không bao giờ bị bot đổi trạng thái theo hai đường tự động. Cần đặt trường Nguồn phát sinh trước."
+  },
+  {
+   "fieldname": "field_due_date",
+   "fieldtype": "Data",
+   "label": "Hạn hoàn thành",
+   "description": "Tên trường (fieldname) trên HD Ticket chứa Hạn hoàn thành, kiểu Date hoặc Datetime. Để trống nếu site chưa có; phần phụ thuộc không chạy và ghi log. Tên không có trên phiếu thì không lưu được."
+  },
+  {
+   "fieldname": "field_project",
+   "fieldtype": "Data",
+   "label": "Dự án",
+   "description": "Tên trường (fieldname) trên HD Ticket chứa Dự án. Để trống nếu site chưa có; phần phụ thuộc không chạy và ghi log. Tên không có trên phiếu thì không lưu được."
+  },
+  {
+   "fieldname": "field_item_code",
+   "fieldtype": "Data",
+   "label": "Mã hàng",
+   "description": "Tên trường (fieldname) trên HD Ticket chứa Mã hàng. Để trống nếu site chưa có; phần phụ thuộc không chạy và ghi log. Tên không có trên phiếu thì không lưu được."
+  },
+  {
+   "fieldname": "field_serial_no",
+   "fieldtype": "Data",
+   "label": "Số sê-ri",
+   "description": "Tên trường (fieldname) trên HD Ticket chứa Số sê-ri. Để trống nếu site chưa có; phần phụ thuộc không chạy và ghi log. Tên không có trên phiếu thì không lưu được."
+  },
+  {
    "fieldname": "section_code_change",
    "fieldtype": "Section Break",
    "label": "Sửa code và lệnh bench"
-  },
-  {
-   "fieldname": "code_change_enabled",
-   "fieldtype": "Check",
-   "label": "Cho phép sửa code và lệnh bench",
-   "default": "0",
-   "description": "Bật thì ở mức L3 và khi có người ra lệnh, bot được: (1) tạo và sửa bản ghi trực tiếp theo quyền của tài khoản agent, không qua duyệt (không xóa, không submit, không gán vai trò quản trị); (2) đề xuất sửa code và lệnh bench, mọi thay đổi code phải được duyệt trên form đề xuất. Mỗi thay đổi code đã áp dụng thành một commit git local; bot không push. Tắt thì bot trở lại như cũ."
   },
   {
    "fieldname": "code_change_apps",
    "fieldtype": "Small Text",
    "label": "App được phép sửa",
    "description": "Mỗi dòng một tên thư mục app trong apps/. Có thể thêm app lõi frappe, erpnext, helpdesk, hrms; sửa app lõi ảnh hưởng mọi site trên bench. Không bao giờ được thêm erp_ai. Bỏ trống thì không file nào được sửa."
+  },
+  {
+   "fieldname": "section_knowledge",
+   "fieldtype": "Section Break",
+   "label": "Trả lời, đóng phiếu và tri thức"
+  },
+  {
+   "fieldname": "reply_enabled",
+   "fieldtype": "Check",
+   "label": "Trả lời người tạo phiếu",
+   "default": "0",
+   "description": "Trả lời người tạo phiếu. Bật thì bot được gửi email trả lời hoặc câu hỏi cho người tạo phiếu ngay trên phiếu. Tắt thì bot không có công cụ trả lời, chỉ đăng comment nội bộ. Ô này mặc định tắt."
+  },
+  {
+   "fieldname": "resolve_on_tasks_done_enabled",
+   "fieldtype": "Check",
+   "label": "Giải quyết phiếu khi xong Task",
+   "default": "0",
+   "description": "Giải quyết phiếu khi mọi Task của phiếu đã xong. Bật thì bot chuyển phiếu sang trạng thái đã giải quyết và báo người tạo; phiếu Chỉ đạo BGĐ không bị đổi trạng thái. Ô này mặc định tắt; chỉ bật sau khi đã đặt trường Nguồn phát sinh."
+  },
+  {
+   "fieldname": "close_silent_f_enabled",
+   "fieldtype": "Check",
+   "label": "Đóng phiếu F khi người tạo im lặng",
+   "default": "0",
+   "description": "Đóng phiếu đầu mục F khi người tạo không phản hồi sau số ngày chờ bên dưới, tính từ lần bot trả lời hoặc hỏi. Bot báo người tạo trước khi đóng; phiếu Chỉ đạo BGĐ không bị đóng. Ô này mặc định tắt; chỉ bật sau khi đã đặt trường Nguồn phát sinh."
+  },
+  {
+   "fieldname": "close_silent_f_days",
+   "fieldtype": "Int",
+   "label": "Số ngày chờ trước khi đóng phiếu F",
+   "default": "3",
+   "description": "Số ngày chờ người tạo phiếu F phản hồi trước khi bot đóng phiếu, từ 1 đến 30 ngày. Người tạo trả lời trước hạn thì đếm lại từ đầu."
+  },
+  {
+   "fieldname": "kb_draft_enabled",
+   "fieldtype": "Check",
+   "label": "Soạn bài cơ sở tri thức",
+   "default": "0",
+   "description": "Soạn bài cơ sở tri thức. Bật thì khi phiếu được giải quyết, bot soạn một bài nháp từ cách xử lý của phiếu; người duyệt mới xuất bản. Ô này mặc định tắt; chỉ bật sau khi đã đặt trường Nguồn phát sinh."
+  },
+  {
+   "fieldname": "knowledge_search_limit",
+   "fieldtype": "Int",
+   "label": "Số kết quả tìm tri thức tối đa",
+   "default": "5",
+   "description": "Số kết quả tối đa mỗi lần bot tìm trong cơ sở tri thức, bộ HDSD hoặc phiếu cũ, từ 1 đến 20."
+  },
+  {
+   "fieldname": "manuals_dir",
+   "fieldtype": "Data",
+   "label": "Kho HDSD",
+   "description": "Thư mục chứa file .md của bộ HDSD, tính từ thư mục apps/, ví dụ erpnext/docs. Để trống thì bot trả lời chưa có kho HDSD. File trong thư mục này không đọc được qua công cụ đọc mã nguồn."
+  },
+  {
+   "fieldname": "allowed_reports",
+   "fieldtype": "Small Text",
+   "label": "Báo cáo bot được chạy",
+   "description": "Mỗi dòng một tên báo cáo bot được chạy (Script Report hoặc Query Report), theo quyền của tài khoản agent, chỉ đọc. Để trống thì bot không chạy báo cáo nào. Báo cáo dựa trên phiếu, comment, email bị chặn khi lưu."
+  },
+  {
+   "fieldname": "report_row_limit",
+   "fieldtype": "Int",
+   "label": "Số dòng báo cáo tối đa",
+   "default": "20",
+   "description": "Số dòng tối đa của kết quả báo cáo bot nhận mỗi lần chạy, từ 1 đến 100; các dòng sau bị cắt."
+  },
+  {
+   "fieldname": "section_operations",
+   "fieldtype": "Section Break",
+   "label": "Báo cáo và vận hành"
+  },
+  {
+   "fieldname": "coo_report_recipients",
+   "fieldtype": "Small Text",
+   "label": "Người nhận báo cáo COO",
+   "description": "Mỗi dòng một email nhận báo cáo 08:00 hằng ngày, ví dụ coo@congty.vn; không tách bằng dấu phẩy. Để trống thì không gửi. Dòng không phải một email hợp lệ thì không lưu được."
+  },
+  {
+   "fieldname": "daily_report_weekends",
+   "fieldtype": "Check",
+   "label": "Gửi báo cáo cả cuối tuần",
+   "default": "1",
+   "description": "Bật thì báo cáo 08:00 gửi cả thứ Bảy và Chủ nhật; tắt thì chỉ gửi từ thứ Hai đến thứ Sáu. Ô này mặc định bật."
+  },
+  {
+   "fieldname": "monthly_reviewers",
+   "fieldtype": "Small Text",
+   "label": "Người rà soát tháng",
+   "description": "Mỗi dòng một tài khoản (email đăng nhập) nhận thông báo danh sách rà soát tháng. Để trống thì danh sách vẫn được tạo nhưng không thông báo. Tài khoản không có hoặc đang tắt thì không lưu được."
+  },
+  {
+   "fieldname": "review_sample_size",
+   "fieldtype": "Int",
+   "label": "Số phiếu rà soát mỗi tháng",
+   "default": "10",
+   "description": "Số phiếu chọn ngẫu nhiên mỗi tháng trong các phiếu bot đã ghi để người rà soát chấm đúng hoặc sai, từ 1 đến 50 phiếu. Ít phiếu hơn thì lấy hết."
+  },
+  {
+   "fieldname": "d_ticket_watcher",
+   "fieldtype": "Link",
+   "label": "Người theo dõi phiếu D",
+   "options": "User",
+   "description": "Người (thường là IT) được thêm làm người theo dõi phiếu đầu mục D, một lần mỗi phiếu. Để trống thì không thêm. Phải là tài khoản người đang bật, không phải tài khoản agent."
+  },
+  {
+   "fieldname": "due_reminder_hours",
+   "fieldtype": "Int",
+   "label": "Số giờ báo trước hạn",
+   "default": "24",
+   "description": "Số giờ còn lại tới mốc xử lý hoặc Hạn hoàn thành để phiếu được tính là sắp quá hạn trong báo cáo 08:00 và được nhắc, từ 1 đến 168 giờ."
+  },
+  {
+   "fieldname": "ba_note_due_hours",
+   "fieldtype": "Int",
+   "label": "Số giờ chờ BA note",
+   "default": "24",
+   "description": "Số giờ từ lúc tạo phiếu đầu mục C mà chưa có BA note thì phiếu được nêu trong báo cáo 08:00 và được nhắc, từ 1 đến 168 giờ."
+  },
+  {
+   "fieldname": "task_due_days",
+   "fieldtype": "Int",
+   "label": "Số ngày chờ Task",
+   "default": "3",
+   "description": "Số ngày từ lúc tạo phiếu đầu mục C hoặc D mà chưa có Task liên kết thì phiếu được nêu trong báo cáo 08:00 và được nhắc, từ 1 đến 30 ngày."
+  },
+  {
+   "fieldname": "max_tasks_per_run",
+   "fieldtype": "Int",
+   "label": "Số Task tối đa mỗi lần chạy",
+   "default": "10",
+   "description": "Số Task tối đa bot tạo cho một phiếu trong một lần chạy, từ 1 đến 20; Task vượt số này không được tạo."
+  },
+  {
+   "fieldname": "kpi_targets",
+   "fieldtype": "Code",
+   "label": "Mục tiêu KPI",
+   "options": "JSON",
+   "default": "{\n  \"first_response_minutes\": {\"gd2\": 15, \"gd4\": 5},\n  \"complete_fields_pct\": {\"gd2\": 100, \"gd4\": 100},\n  \"closed_without_human_pct\": {\"gd2\": 10, \"gd4\": 30},\n  \"b_resolution_hours\": {\"gd2\": 4, \"gd4\": 1},\n  \"c_task_in_3_days_pct\": {\"gd2\": 80, \"gd4\": 100},\n  \"stale_over_5_days\": {\"gd2\": 10, \"gd4\": 4}\n}",
+   "description": "JSON mục tiêu 6 KPI theo giai đoạn: mỗi KPI có gd2 và gd4 là số không âm. Sai cú pháp hoặc thiếu KPI thì không lưu được."
+  },
+  {
+   "fieldname": "daily_report_sent_on",
+   "fieldtype": "Date",
+   "label": "Ngày đã gửi báo cáo 08:00",
+   "read_only": 1,
+   "description": "Hệ thống tự ghi ngày gần nhất đã gửi báo cáo 08:00, để mỗi ngày chỉ gửi một lần; không sửa được."
+  },
+  {
+   "fieldname": "budget_alert_sent_month",
+   "fieldtype": "Data",
+   "label": "Tháng đã gửi cảnh báo ngân sách",
+   "read_only": 1,
+   "description": "Hệ thống tự ghi tháng (dạng YYYY-MM) đã gửi email vượt ngân sách tháng, để mỗi tháng chỉ gửi một lần; không sửa được."
+  },
+  {
+   "fieldname": "section_prompts",
+   "fieldtype": "Section Break",
+   "label": "Ghi đè prompt"
+  },
+  {
+   "fieldname": "prompt_override_classify",
+   "fieldtype": "Long Text",
+   "label": "Ghi đè prompt phân loại",
+   "ignore_xss_filter": 1,
+   "description": "Để trống = dùng bản dựng sẵn. Nội dung thay bước phân loại; phải có các mục bắt buộc là 12 khóa JSON \"dau_muc\", \"do_tin_cay\", \"do_tin_cay_pct\", \"ly_do\", \"nhom\", \"uu_tien\", \"can_tach\", \"cac_yeu_cau\", \"do_phuc_tap\", \"do_quan_trong\", \"ly_do_diem\", \"bo_phan\" và ≤ 20000 ký tự. Các câu cấm và khối năm quyền không bị ghi đè. Mỗi lần sửa được lưu vào Lịch sử ghi đè prompt."
+  },
+  {
+   "fieldname": "prompt_override_reasoning",
+   "fieldtype": "Long Text",
+   "label": "Ghi đè prompt chỉ dẫn lập luận",
+   "ignore_xss_filter": 1,
+   "description": "Để trống = dùng bản dựng sẵn. Nội dung thay phần chỉ dẫn lập luận; phải có các mục bắt buộc **Nhận định:**, **Hướng xử lý:** và ≤ 20000 ký tự. Các mục Đã làm, Chờ duyệt do bot tự thêm. Mục Căn cứ, Cần ai quyết đã bỏ: ghi đè cũ còn chúng vẫn lưu được và bot viết theo ghi đè. Các câu cấm và khối năm quyền không bị ghi đè. Mỗi lần sửa được lưu vào Lịch sử ghi đè prompt."
+  },
+  {
+   "fieldname": "prompt_override_category_guide",
+   "fieldtype": "Long Text",
+   "label": "Ghi đè prompt bảng hướng dẫn đầu mục",
+   "ignore_xss_filter": 1,
+   "description": "Để trống = dùng bản dựng sẵn. Nội dung thay bảng hướng dẫn đầu mục; phải có các mục bắt buộc là một dòng bảng cho mỗi đầu mục A đến F, đầu dòng dạng | A | và ≤ 20000 ký tự. Các câu cấm và khối năm quyền không bị ghi đè. Mỗi lần sửa được lưu vào Lịch sử ghi đè prompt."
+  },
+  {
+   "fieldname": "prompt_revisions",
+   "fieldtype": "Table",
+   "label": "Lịch sử ghi đè prompt",
+   "options": "ERP AI Prompt Revision",
+   "read_only": 1,
+   "description": "Hệ thống tự ghi mỗi lần sửa ghi đè prompt: phần, người sửa, thời điểm, giá trị cũ; không sửa được."
   },
   {
    "fieldname": "section_alerts",
@@ -278,7 +709,7 @@
  ],
  "issingle": 1,
  "links": [],
- "modified": "2026-11-14 18:40:00.000000",
+ "modified": "2026-11-15 19:29:13.000000",
  "modified_by": "Administrator",
  "module": "ERP AI agent",
  "name": "ERP AI Setting",

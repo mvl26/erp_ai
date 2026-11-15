@@ -3,7 +3,7 @@ import json
 import frappe
 from frappe.tests.utils import FrappeTestCase
 
-from erp_ai.agent import classification, prompts
+from erp_ai.agent import classification, policy, prompts
 from erp_ai.agent.prompts import DESCRIPTION_MAX_CHARS
 from erp_ai.constants import (
 	CATEGORIES,
@@ -11,11 +11,12 @@ from erp_ai.constants import (
 	TRIGGER_COMMENT_MENTION,
 	TRIGGER_TICKET_INSERT,
 )
-from erp_ai.test_utils import make_routing_rules
+from erp_ai.test_utils import keep_agent_settings, make_routing_rules
 
 VALID = {
 	"dau_muc": "A",
 	"do_tin_cay": "Cao",
+	"do_tin_cay_pct": 85,
 	"ly_do": "Đơn bán đã hủy nhưng trạng thái sai",
 	"nhom": "IT",
 	"uu_tien": "High",
@@ -41,6 +42,7 @@ class TestParseClassification(FrappeTestCase):
 				priority="High",
 				needs_split=False,
 				requests=[],
+				confidence_pct=85,
 			),
 		)
 
@@ -133,7 +135,7 @@ class TestParseClassification(FrappeTestCase):
 				self.assertEqual((result.category, result.confidence), (category, confidence))
 
 	def test_optional_fields_default_safely(self):
-		minimal = json.dumps({"dau_muc": "F", "do_tin_cay": "Thấp"})
+		minimal = json.dumps({"dau_muc": "F", "do_tin_cay": "Thấp", "do_tin_cay_pct": 20})
 		result = classification.parse_classification(minimal)
 		self.assertEqual(result.category, "F")
 		self.assertEqual(result.reason, "")
@@ -149,6 +151,45 @@ class TestParseClassification(FrappeTestCase):
 		garbage = classification.parse_classification(_text(can_tach="yes", cac_yeu_cau="x"))
 		self.assertFalse(garbage.needs_split)
 		self.assertEqual(garbage.requests, [])
+
+
+class TestConfidencePct(FrappeTestCase):
+	# AC-22 (D-14), U1.md:249-253: do_tin_cay_pct is a whole number 0..100; the label do_tin_cay stays.
+	def test_parse_accepts_0_to_100(self):
+		self.assertEqual((classification.CONFIDENCE_PCT_MIN, classification.CONFIDENCE_PCT_MAX), (0, 100))
+		for value in (0, 1, 50, 99, 100):
+			with self.subTest(value=value):
+				result = classification.parse_classification(_text(do_tin_cay_pct=value))
+				self.assertIsNotNone(result)
+				self.assertEqual(result.confidence_pct, value)
+				self.assertIs(type(result.confidence_pct), int)
+				self.assertEqual(result.confidence, "Cao")
+
+	def test_parse_rejects_missing_bool_negative_over_100_float(self):
+		bad_inputs = {
+			"missing": json.dumps({k: v for k, v in VALID.items() if k != "do_tin_cay_pct"}),
+			"null": _text(do_tin_cay_pct=None),
+			"bool_true": _text(do_tin_cay_pct=True),
+			"bool_false": _text(do_tin_cay_pct=False),
+			"negative": _text(do_tin_cay_pct=-1),
+			"over_100": _text(do_tin_cay_pct=101),
+			"float_whole": _text(do_tin_cay_pct=50.0),
+			"float_fraction": _text(do_tin_cay_pct=80.5),
+			"string": _text(do_tin_cay_pct="80"),
+		}
+		for case, text in bad_inputs.items():
+			with self.subTest(case=case):
+				self.assertIsNone(classification.parse_classification(text), text)
+
+	def test_direct_build_is_unknown_and_below_any_threshold(self):
+		# design-w1-fixes-14.md Point 1: a direct build carries no pct, so it is unknown (None), never 0.
+		result = classification.Classification(category="A", confidence="Cao")
+		self.assertIsNone(result.confidence_pct)
+		self.assertTrue(
+			policy.is_below_confidence(
+				result.confidence_pct, classification.CONFIDENCE_PCT_MIN, has_instructor=False, act_now=False
+			)
+		)
 
 
 class TestMapping(FrappeTestCase):
@@ -376,21 +417,23 @@ class TestPrompts(FrappeTestCase):
 			self.assertIn(tool, block)
 		self.assertTrue(block.endswith("Sửa file .py chỉ có hiệu lực sau khi người chạy bench restart."))
 
-		old = prompts.build_reason_system("", "ROUTING-ABC")[0]["text"]
+		core = prompts.core_prompt(change_tools=True)
+		head = "\n\n".join([core, prompts.CATEGORY_TABLE, "ROUTING-ABC", prompts.CONVENTIONS])
+		self.assertNotEqual(core, prompts.CORE_PROMPT)
 		blocks = prompts.build_reason_system("DIGEST-XYZ", "ROUTING-ABC", change_tools=True)
 		self.assertEqual(len(blocks), 1)
 		self.assertEqual(blocks[0]["cache_control"], {"type": "ephemeral"})
 		text = blocks[0]["text"]
-		self.assertEqual(text, "\n\n".join([old, block, prompts.ACT_NOW_BLOCK, "DIGEST-XYZ"]))
-		self.assertTrue(text.startswith(prompts.CORE_PROMPT))
-		self.assertEqual(text[: text.index(block)], old + "\n\n")
+		self.assertEqual(text, "\n\n".join([head, block, prompts.ACT_NOW_BLOCK, "DIGEST-XYZ"]))
+		self.assertTrue(text.startswith(core))
+		self.assertEqual(text[: text.index(block)], head + "\n\n")
 
 		no_digest = prompts.build_reason_system("", "", change_tools=True)[0]["text"]
 		self.assertEqual(
 			no_digest,
 			"\n\n".join(
 				[
-					prompts.CORE_PROMPT,
+					core,
 					prompts.CATEGORY_TABLE,
 					prompts.CONVENTIONS,
 					block,
@@ -408,9 +451,16 @@ class TestPrompts(FrappeTestCase):
 		for phrase in ("người ra lệnh", "System Manager", "không đặt mật khẩu", "Không xóa", "dữ liệu"):
 			self.assertIn(phrase, block)
 
-		old = prompts.build_reason_system("", "ROUTING-ABC")[0]["text"]
+		head = "\n\n".join(
+			[
+				prompts.core_prompt(site_admin_tools=True),
+				prompts.CATEGORY_TABLE,
+				"ROUTING-ABC",
+				prompts.CONVENTIONS,
+			]
+		)
 		text = prompts.build_reason_system("DIGEST-XYZ", "ROUTING-ABC", site_admin_tools=True)[0]["text"]
-		self.assertEqual(text, "\n\n".join([old, block, prompts.ACT_NOW_BLOCK, "DIGEST-XYZ"]))
+		self.assertEqual(text, "\n\n".join([head, block, prompts.ACT_NOW_BLOCK, "DIGEST-XYZ"]))
 		both = prompts.build_reason_system("", "", change_tools=True, site_admin_tools=True)[0]["text"]
 		self.assertTrue(
 			both.endswith("\n\n".join([prompts.CHANGE_TOOLS_BLOCK, block, prompts.ACT_NOW_BLOCK]))
@@ -432,9 +482,16 @@ class TestPrompts(FrappeTestCase):
 		for phrase in ("TOÀN QUYỀN", "người ra lệnh", "dữ liệu", "ERP AI Setting", "mật khẩu"):
 			self.assertIn(phrase, block)
 
-		old = prompts.build_reason_system("", "ROUTING-ABC")[0]["text"]
+		head = "\n\n".join(
+			[
+				prompts.core_prompt(unrestricted_tools=True),
+				prompts.CATEGORY_TABLE,
+				"ROUTING-ABC",
+				prompts.CONVENTIONS,
+			]
+		)
 		text = prompts.build_reason_system("DIGEST-XYZ", "ROUTING-ABC", unrestricted_tools=True)[0]["text"]
-		self.assertEqual(text, "\n\n".join([old, block, prompts.ACT_NOW_BLOCK, "DIGEST-XYZ"]))
+		self.assertEqual(text, "\n\n".join([head, block, prompts.ACT_NOW_BLOCK, "DIGEST-XYZ"]))
 		# the full-access block replaces the record block, never joins it
 		both = prompts.build_reason_system("", "", site_admin_tools=True, unrestricted_tools=True)[0]["text"]
 		self.assertIn(block, both)
@@ -445,7 +502,7 @@ class TestPrompts(FrappeTestCase):
 		for phrase in (
 			"LÀM LUÔN, KHÔNG HỎI LẠI",
 			"quy tắc 6",
-			"Cần ai quyết",
+			'"Hướng xử lý" là việc người phải làm',
 			"Không hỏi lại",
 			"tạo đề xuất luôn",
 			"Nút Duyệt / Từ chối",
@@ -453,6 +510,8 @@ class TestPrompts(FrappeTestCase):
 			"người ra lệnh",
 		):
 			self.assertIn(phrase, block)
+		# spec changed (spec-addendum-5 AC-66): the sentence telling the model to write "Cần ai quyết" is gone.
+		self.assertNotIn("Cần ai quyết", block)
 		self.assertNotIn(block, prompts.build_reason_system("DIGEST-XYZ", "ROUTING-ABC")[0]["text"])
 		for flags in ({"change_tools": True}, {"site_admin_tools": True}, {"unrestricted_tools": True}):
 			text = prompts.build_reason_system("", "", **flags)[0]["text"]
@@ -511,3 +570,126 @@ class TestPrompts(FrappeTestCase):
 		self.assertEqual(len(payload["comments"][0]["content"]), 2000)
 		self.assertEqual(payload["comments"][0]["role"], "dữ liệu")
 		self.assertTrue(payload["comments"][0]["content"].startswith("cyyy"))
+
+
+SPLIT_QUESTION = "Anh/chị xác nhận có muốn tách thành các phiếu riêng không? Bot không tự tách phiếu."
+
+
+class TestSplitComment(FrappeTestCase):
+	"""AC-28, pure part (design-w0-fixes-2.md 5b): the comment asking whether to split a merged ticket."""
+
+	def setUp(self):
+		keep_agent_settings(self)
+
+	def _comment(self, needs_split, requests):
+		parsed = classification.parse_classification(_text(can_tach=needs_split, cac_yeu_cau=requests))
+		self.assertIsNotNone(parsed)
+		return classification.split_request_comment(parsed)
+
+	def test_four_requests(self):
+		comment = self._comment(True, ["Sửa đơn bán", "Thêm kho mới", "Đổi giá", "Tạo tài khoản"])
+		self.assertEqual(
+			comment,
+			"Phiếu này có vẻ gồm 4 yêu cầu:\n"
+			"1. Sửa đơn bán\n"
+			"2. Thêm kho mới\n"
+			"3. Đổi giá\n"
+			"4. Tạo tài khoản\n"
+			"Anh/chị xác nhận có muốn tách thành các phiếu riêng không? Bot không tự tách phiếu.",
+		)
+
+	def test_two_requests_is_enough(self):
+		self.assertEqual(
+			self._comment(True, ["Một", "Hai"]),
+			"Phiếu này có vẻ gồm 2 yêu cầu:\n1. Một\n2. Hai\n" + SPLIT_QUESTION,
+		)
+
+	def test_single_request_none(self):
+		self.assertIsNone(self._comment(True, ["Chỉ một việc"]))
+		self.assertIsNone(self._comment(True, []))
+
+	def test_needs_split_false_with_several_requests_none(self):
+		self.assertIsNone(self._comment(False, ["Một", "Hai", "Ba"]))
+
+	def test_no_classification_none(self):
+		self.assertIsNone(classification.split_request_comment(None))
+
+	def test_request_of_200_chars_kept_201_cut(self):
+		exactly_200 = "a" * 200
+		over_by_one = "b" * 200 + "Z"
+		comment = self._comment(True, [exactly_200, over_by_one])
+		self.assertEqual(
+			comment,
+			"Phiếu này có vẻ gồm 2 yêu cầu:\n1. " + "a" * 200 + "\n2. " + "b" * 200 + "\n" + SPLIT_QUESTION,
+		)
+		self.assertNotIn("Z", comment)
+
+	def test_caps_at_ten(self):
+		eleven = [f"Việc {i}" for i in range(1, 12)]
+		self.assertEqual(
+			self._comment(True, eleven),
+			"Phiếu này có vẻ gồm 11 yêu cầu:\n"
+			"1. Việc 1\n2. Việc 2\n3. Việc 3\n4. Việc 4\n5. Việc 5\n"
+			"6. Việc 6\n7. Việc 7\n8. Việc 8\n9. Việc 9\n10. Việc 10\n"
+			"… và 1 yêu cầu khác không liệt kê.\n" + SPLIT_QUESTION,
+		)
+
+	def test_cap_applies_after_dropping_empty(self):
+		ten = [f"Việc {i}" for i in range(1, 11)]
+		self.assertEqual(
+			self._comment(True, ["", "   ", " \n\t ", *ten]),
+			"Phiếu này có vẻ gồm 10 yêu cầu:\n"
+			"1. Việc 1\n2. Việc 2\n3. Việc 3\n4. Việc 4\n5. Việc 5\n"
+			"6. Việc 6\n7. Việc 7\n8. Việc 8\n9. Việc 9\n10. Việc 10\n" + SPLIT_QUESTION,
+		)
+
+	def test_overflow_line_counts_after_dropping_empty(self):
+		twelve = [f"Việc {i}" for i in range(1, 13)]
+		requests = [*twelve[:3], "", *twelve[3:7], "  \n ", *twelve[7:]]
+		self.assertEqual(
+			self._comment(True, requests),
+			"Phiếu này có vẻ gồm 12 yêu cầu:\n"
+			"1. Việc 1\n2. Việc 2\n3. Việc 3\n4. Việc 4\n5. Việc 5\n"
+			"6. Việc 6\n7. Việc 7\n8. Việc 8\n9. Việc 9\n10. Việc 10\n"
+			"… và 2 yêu cầu khác không liệt kê.\n" + SPLIT_QUESTION,
+		)
+
+	def test_newline_inside_request_collapsed(self):
+		self.assertEqual(
+			self._comment(True, ["x\n2. y", "a \t\n  b"]),
+			"Phiếu này có vẻ gồm 2 yêu cầu:\n1. x 2. y\n2. a b\n" + SPLIT_QUESTION,
+		)
+
+	def test_cut_applies_after_collapsing(self):
+		comment = self._comment(True, ["d" * 100 + " \n\n " + "e" * 150, "Hai"])
+		self.assertEqual(
+			comment,
+			"Phiếu này có vẻ gồm 2 yêu cầu:\n1. "
+			+ "d" * 100
+			+ " "
+			+ "e" * 99
+			+ "\n2. Hai\n"
+			+ SPLIT_QUESTION,
+		)
+
+	def test_exactly_ten_all_listed(self):
+		ten = [f"Việc {i}" for i in range(1, 11)]
+		self.assertEqual(
+			self._comment(True, ten),
+			"Phiếu này có vẻ gồm 10 yêu cầu:\n"
+			"1. Việc 1\n2. Việc 2\n3. Việc 3\n4. Việc 4\n5. Việc 5\n"
+			"6. Việc 6\n7. Việc 7\n8. Việc 8\n9. Việc 9\n10. Việc 10\n" + SPLIT_QUESTION,
+		)
+
+	def test_blank_requests_dropped_and_not_counted(self):
+		self.assertEqual(
+			self._comment(True, ["  Một  ", "", "   ", "Hai"]),
+			"Phiếu này có vẻ gồm 2 yêu cầu:\n1. Một\n2. Hai\n" + SPLIT_QUESTION,
+		)
+		self.assertIsNone(self._comment(True, ["Một", "", " \n\t "]))
+
+	def test_cut_counts_after_trimming_spaces(self):
+		comment = self._comment(True, ["   " + "c" * 200 + "   ", "Hai"])
+		self.assertEqual(
+			comment, "Phiếu này có vẻ gồm 2 yêu cầu:\n1. " + "c" * 200 + "\n2. Hai\n" + SPLIT_QUESTION
+		)

@@ -10,8 +10,14 @@ PRIORITIES = ("Low", "Medium", "High", "Urgent")
 PRIORITY_URGENT = "Urgent"
 SCORE_VALUES = (1, 2, 3)
 SCORE_REASON_MAX_WORDS = 25
+# AC-22 (D-14), U1.md:249-253: do_tin_cay_pct is a whole number in this range; anything else is a parse error.
+CONFIDENCE_PCT_MIN = 0
+CONFIDENCE_PCT_MAX = 100
 # The guide spells the tag "[GẬP]"; "[GẤP]" is the standard spelling. Accept both.
 URGENT_TAGS = ("[GẤP]", "[GẬP]")
+# AC-28 (design.md:409): the split question lists at most 10 requests, each cut to 200 characters.
+SPLIT_MAX_REQUESTS = 10
+SPLIT_REQUEST_MAX_CHARS = 200
 
 # D-8: ticket_type = category name; agent_group and priority per guide 16.1-16.2.
 DEFAULT_CATEGORY_MAPPING = {
@@ -39,6 +45,8 @@ class Classification:
 	importance: int = 0
 	score_reason: str = ""
 	department: str | None = None
+	# None = unknown (direct builders such as set_classification); never 0 for unknown (design-w0-fixes-2.md section 1).
+	confidence_pct: int | None = None
 
 
 def _load_json_object(text):
@@ -80,6 +88,9 @@ def parse_classification(text: str) -> Classification | None:
 		return None
 	if not isinstance(confidence, str) or confidence not in CONFIDENCE_VALUES:
 		return None
+	confidence_pct = data.get("do_tin_cay_pct")
+	if type(confidence_pct) is not int or not CONFIDENCE_PCT_MIN <= confidence_pct <= CONFIDENCE_PCT_MAX:
+		return None
 	reason = data.get("ly_do")
 	team = data.get("nhom")
 	priority = data.get("uu_tien")
@@ -98,7 +109,29 @@ def parse_classification(text: str) -> Classification | None:
 		importance=importance,
 		score_reason=score_reason,
 		department=department if isinstance(department, str) else None,
+		confidence_pct=confidence_pct,
 	)
+
+
+def split_request_comment(classification) -> str | None:
+	"""AC-28: the comment asking the creator whether to split a merged ticket; None when there is nothing to ask.
+
+	Whitespace runs collapse to one space, blank requests are dropped; n counts what is left
+	(design-w0-fixes-2.md 5b). At most 10 are listed, the rest are counted on one line.
+	"""
+	if classification is None or not classification.needs_split:
+		return None
+	requests = [" ".join(r.split()) for r in classification.requests]
+	requests = [r for r in requests if r]
+	if len(requests) < 2:
+		return None
+	listed = [r[:SPLIT_REQUEST_MAX_CHARS] for r in requests[:SPLIT_MAX_REQUESTS]]
+	lines = [f"Phiếu này có vẻ gồm {len(requests)} yêu cầu:"]
+	lines += [f"{number}. {request}" for number, request in enumerate(listed, start=1)]
+	if len(requests) > SPLIT_MAX_REQUESTS:
+		lines.append(f"… và {len(requests) - SPLIT_MAX_REQUESTS} yêu cầu khác không liệt kê.")
+	lines.append("Anh/chị xác nhận có muốn tách thành các phiếu riêng không? Bot không tự tách phiếu.")
+	return "\n".join(lines)
 
 
 def _mapping_error(raw):

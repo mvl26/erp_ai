@@ -27,7 +27,7 @@ import unittest
 from pathlib import Path
 from typing import ClassVar, NamedTuple
 
-from erp_ai.constants import AGENT_STATUS_EVENT, PANEL_METHODS
+from erp_ai.constants import AGENT_STATUS_EVENT, AGENT_USER, PANEL_METHODS
 
 PACKAGE_ROOT = Path(__file__).resolve().parent.parent
 REPO_ROOT = PACKAGE_ROOT.parent
@@ -141,7 +141,13 @@ LAYER_RULES = (
 
 ENQUEUE_NAMES = ("enqueue", "enqueue_doc")
 ENQUEUE_REQUIRED_KEYWORDS = ("queue", "timeout", "enqueue_after_commit", "job_id", "deduplicate")
-ENQUEUE_TARGETS = ("erp_ai.agent.runner.run_for_ticket", "erp_ai.agent.changes.apply_job.run_change")
+ENQUEUE_TARGETS = (
+	"erp_ai.agent.runner.run_for_ticket",
+	"erp_ai.agent.changes.apply_job.run_change",
+	"erp_ai.agent.daily_report.run_daily_report",
+	"erp_ai.agent.kpi.run_weekly_kpi",
+	"erp_ai.agent.monthly_review.run_monthly_review",
+)
 
 CONFIG_DOCTYPES = ("ERP AI Setting", "ERP AI Credential")
 CONFIG_DOCTYPE_CONSTANTS = ("SETTING_DOCTYPE", "CREDENTIAL_DOCTYPE")
@@ -566,7 +572,7 @@ def check_single_enqueue_site(sources: dict) -> list:
 
 
 def check_enqueue_call_shape(sources: dict) -> list:
-	"""ADR-003/ADR-013 QĐ 2: exactly two calls, one per target (runner, change job), each with all five parameters."""
+	"""ADR-003/ADR-013 QĐ 2, ADR-033 QĐ 6: exactly one call per target, each with all five parameters."""
 	source = sources.get(QUEUE_FILE)
 	if source is None:
 		return [f"{QUEUE_FILE}: file missing"]
@@ -576,7 +582,10 @@ def check_enqueue_call_shape(sources: dict) -> list:
 		if isinstance(node, ast.Call) and referenced_name(node.func) in ENQUEUE_NAMES
 	]
 	if len(calls) != len(ENQUEUE_TARGETS):
-		return [f"{QUEUE_FILE}: expected exactly two enqueue calls, found {len(calls)}"]
+		return [
+			f"{QUEUE_FILE}: expected exactly {len(ENQUEUE_TARGETS)} enqueue calls, one per target, "
+			f"found {len(calls)}"
+		]
 	violations = []
 	targets = []
 	for call in calls:
@@ -649,10 +658,19 @@ def check_tools_never_bypass_permissions(sources: dict) -> list:
 
 	Exception (design 3.5, `denied_doctypes`): `get_all("DocType", ...)` lists the app's own DocType names,
 	which is metadata, not user data.
+	ADR-005 + ADR-034: the query builder checks no permission either, so every `frappe.qb` reference and
+	every `frappe.query_builder` import in a tool is a violation (design-w0-fixes-5 point 1).
 	"""
 	violations = []
 	for rel, source in only_python(scoped(sources, TOOLS_PREFIX)).items():
-		for node in ast.walk(parse(rel, source)):
+		tree = parse(rel, source)
+		aliases = import_aliases(tree)
+		for lineno, target in imported_modules(tree, module_name(rel), False):
+			if module_in(target, "frappe.query_builder") or target == "frappe.qb":
+				violations.append(f"{rel}:{lineno}: imports {target} in a tool (ADR-034)")
+		for node in ast.walk(tree):
+			if isinstance(node, ast.Attribute) and resolved_name(node, aliases) == "frappe.qb":
+				violations.append(violation(rel, node, "frappe.qb in a tool (ADR-034)"))
 			if referenced_name(node) == "ignore_permissions" or (
 				isinstance(node, ast.Constant) and node.value == "ignore_permissions"
 			):
@@ -4345,6 +4363,328 @@ def write_entry(**fields):
 """
 
 
+# ---------------------------------------------------------------------------------------------------
+# ADR-031 QĐ 7, arch-review w1a C-1/C-2: one reader of the site environment (`policy.site_environment`)
+# ---------------------------------------------------------------------------------------------------
+
+SITE_ENVIRONMENT_FIELD = "site_environment"
+SITE_ENVIRONMENT_CONSTANT = "SITE_ENVIRONMENT_FIELD"
+SITE_ENVIRONMENT_READER = f"{module_name(POLICY_FILE)}.{SITE_ENVIRONMENT_FIELD}"
+SITE_ENVIRONMENT_NAME = re.compile(r"(?<![A-Za-z0-9_])site_environment(?![A-Za-z0-9_])")
+# The Python files that may name the field, one reason each (C-2; tests and JSON are never scanned by the
+# rule). The other product files that read the ERP AI Log column of the same name are listed here too (grep
+# `site_environment` in erp_ai/**/*.py on the T70 base: only the Setting controller, so none so far).
+SITE_ENVIRONMENT_FILES = {
+	POLICY_FILE: "the one reader of the Setting field, site_environment() (ADR-031 QĐ 7)",
+	SETTING_CONTROLLER_FILE: "the ERP AI Setting controller owns the field (its own form summary)",
+	RUN_LOG_FILE: "writes the ERP AI Log column of the same name (ADR-033 QĐ 5)",
+	INSTALL_FILE: "sets up the ERP AI Setting defaults at install",
+}
+
+
+def check_site_environment_readers(sources: dict) -> list:
+	"""ADR-031 QĐ 7, C-2: outside SITE_ENVIRONMENT_FILES no Python file names `site_environment` (an attribute,
+	a keyword, a string, a built string) or policy's SITE_ENVIRONMENT_FIELD; the one exception is the policy
+	function itself (`policy.site_environment(...)`, or imported from erp_ai.agent.policy)."""
+	violations = []
+	for rel, source in only_python(sources).items():
+		if rel in SITE_ENVIRONMENT_FILES:
+			continue
+		tree = parse(rel, source)
+		aliases = import_aliases(tree)
+		reader_imports = {
+			id(alias)
+			for node in ast.walk(tree)
+			if isinstance(node, ast.ImportFrom) and not node.level and node.module == module_name(POLICY_FILE)
+			for alias in node.names
+			if alias.name == SITE_ENVIRONMENT_FIELD
+		}
+		lines = set()
+		for node in ast.walk(tree):
+			if id(node) in reader_imports or isinstance(node, ast.Constant):
+				continue  # strings are checked below, built ones included
+			names = _node_names(node)
+			if SITE_ENVIRONMENT_FIELD in names and resolved_name(node, aliases) == SITE_ENVIRONMENT_READER:
+				continue  # `policy.site_environment(...)` is the reader, not a field read
+			if SITE_ENVIRONMENT_FIELD in names or SITE_ENVIRONMENT_CONSTANT in names:
+				lines.add(node.lineno)
+		lines |= {
+			node.lineno
+			for node, text in _string_texts(tree, _docstring_ids(tree))
+			if SITE_ENVIRONMENT_NAME.search(text)
+		}
+		violations.extend(
+			f"{rel}:{line}: names {SITE_ENVIRONMENT_FIELD} outside {POLICY_FILE}; read it with "
+			f"policy.site_environment() (ADR-031 QĐ 7)"
+			for line in sorted(lines)
+		)
+	return violations
+
+
+# Compliant sample: each allow-listed file names the field, two callers use the reader.
+SITE_ENVIRONMENT_SAMPLE = {
+	POLICY_FILE: (
+		'import frappe\n\nSITE_ENVIRONMENT_FIELD = "site_environment"\n\n\n'
+		"def site_environment(settings=None):\n"
+		"\treturn getattr(settings or frappe.get_single('ERP AI Setting'), SITE_ENVIRONMENT_FIELD, None)\n"
+	),
+	SETTING_CONTROLLER_FILE: "def summary(self):\n\treturn f'Môi trường site: {self.site_environment}'\n",
+	RUN_LOG_FILE: (
+		"from erp_ai.agent import policy\n\n\ndef write_entry(**fields):\n"
+		'\treturn {**fields, "site_environment": policy.site_environment()}\n'
+	),
+	INSTALL_FILE: 'DEFAULTS = {"site_environment": "production"}\n',
+	TASKS_FILE: (
+		"import frappe\n\nfrom erp_ai.agent import policy\n\n\ndef job():\n"
+		"\tsettings = frappe.get_single('ERP AI Setting')\n\treturn policy.site_environment(settings)\n"
+	),
+	"agent/executor.py": (
+		"from erp_ai.agent.policy import site_environment\n"
+		"from erp_ai.agent.policy import site_environment as env\n\n\n"
+		'def gate():\n\t"""Refuse on production; site_environment is read once."""\n'
+		'\treturn site_environment() == "production" or env() == "production"\n'
+	),
+}
+
+
+# ---------------------------------------------------------------------------------------------------
+# ADR-033 QĐ 4, arch-review w1a C-3 / ruling (2): the daily limit counts only RUN_LIMIT_TRIGGERS
+# ---------------------------------------------------------------------------------------------------
+
+RUN_LIMIT_TRIGGERS_NAME = "RUN_LIMIT_TRIGGERS"
+LOG_TRIGGERS_NAME = "TRIGGERS"
+
+
+def _module_strings(tree: ast.AST) -> dict:
+	"""`{name: value}` of the module-level `NAME = "text"` assignments."""
+	return {
+		target.id: node.value.value
+		for node in tree.body
+		if isinstance(node, ast.Assign)
+		and isinstance(node.value, ast.Constant)
+		and isinstance(node.value.value, str)
+		for target in node.targets
+		if isinstance(target, ast.Name)
+	}
+
+
+def _trigger_tuple(rel: str, source: str, name: str, constants: dict) -> tuple:
+	"""(trigger values or None, violations) of the module-level tuple `name` in `rel`; each element is a
+	string, or a string constant of erp_ai/constants.py or of the file itself."""
+	tree = parse(rel, source)
+	known = {**constants, **_module_strings(tree)}
+	nodes = [
+		node
+		for node in tree.body
+		if isinstance(node, ast.Assign) and any(getattr(t, "id", None) == name for t in node.targets)
+	]
+	if not nodes:
+		return None, [f"{rel}: {name} missing"]
+	node = nodes[-1]
+	if not isinstance(node.value, ast.Tuple):
+		return None, [f"{rel}:{node.lineno}: {name} is not a tuple of trigger names"]
+	values, violations = [], []
+	for element in node.value.elts:
+		if isinstance(element, ast.Constant) and isinstance(element.value, str):
+			values.append(element.value)
+		elif isinstance(element, ast.Name) and element.id in known:
+			values.append(known[element.id])
+		else:
+			violations.append(
+				f"{rel}:{element.lineno}: {name} element {ast.unparse(element)} is not a trigger name"
+			)
+	return tuple(values), violations
+
+
+def check_run_limit_triggers_subset_of_log_triggers(sources: dict) -> list:
+	"""ADR-033 QĐ 4, C-3: every trigger of policy.RUN_LIMIT_TRIGGERS is a trigger of run_log.TRIGGERS."""
+	for rel in (POLICY_FILE, RUN_LOG_FILE, CONSTANTS_FILE):
+		if rel not in sources:
+			return _missing(rel)
+	constants = _module_strings(parse(CONSTANTS_FILE, sources[CONSTANTS_FILE]))
+	limited, violations = _trigger_tuple(
+		POLICY_FILE, sources[POLICY_FILE], RUN_LIMIT_TRIGGERS_NAME, constants
+	)
+	logged, log_violations = _trigger_tuple(RUN_LOG_FILE, sources[RUN_LOG_FILE], LOG_TRIGGERS_NAME, constants)
+	violations += log_violations
+	if limited is not None and logged is not None:
+		violations.extend(
+			f"{POLICY_FILE}: {RUN_LIMIT_TRIGGERS_NAME} has {trigger!r}, not in {RUN_LOG_FILE} "
+			f"{LOG_TRIGGERS_NAME} (ADR-033 QĐ 4)"
+			for trigger in limited
+			if trigger not in logged
+		)
+	return violations
+
+
+# ADR-033 QĐ 1 / U1.md: the one function that switches a job's session to the agent account.
+SESSION_SWITCH_FUNCTION = "enter_agent_session"
+SET_USER_NAME = "set_user"
+
+
+def _sets_agent_user(node, aliases: dict) -> bool:
+	"""`set_user(AGENT_USER)` in any spelling: module path, alias, keyword or the account's literal."""
+	if not isinstance(node, ast.Call) or resolved_name(node.func, aliases).split(".")[-1] != SET_USER_NAME:
+		return False
+	for value in (*node.args, *(keyword.value for keyword in node.keywords)):
+		if isinstance(value, ast.Constant) and value.value == AGENT_USER:
+			return True
+		if resolved_name(value, aliases).split(".")[-1] == AGENT_USER_NAME:
+			return True
+	return False
+
+
+def check_set_user_agent_only_in_enter_agent_session(sources: dict) -> list:
+	"""ADR-033 QĐ 1: `set_user(AGENT_USER)` is called exactly once, inside authority.enter_agent_session."""
+	if AUTHORITY_FILE not in sources:
+		return _missing(AUTHORITY_FILE)
+	violations = []
+	allowed = 0
+	for rel, source in only_python(sources).items():
+		tree = parse(rel, source)
+		aliases = import_aliases(tree)
+		inside = set()
+		if rel == AUTHORITY_FILE:
+			for function in tree.body:
+				if isinstance(function, ast.FunctionDef) and function.name == SESSION_SWITCH_FUNCTION:
+					inside = {id(node) for node in ast.walk(function)}
+		for node in ast.walk(tree):
+			if not _sets_agent_user(node, aliases):
+				continue
+			if id(node) in inside:
+				allowed += 1
+			else:
+				violations.append(
+					violation(
+						rel,
+						node,
+						f"switches to the agent account outside {AUTHORITY_FILE} "
+						f"{SESSION_SWITCH_FUNCTION} (ADR-033 QĐ 1)",
+					)
+				)
+	if allowed != 1:
+		violations.append(
+			f"{AUTHORITY_FILE}: {SESSION_SWITCH_FUNCTION} must call {SET_USER_NAME}({AGENT_USER_NAME}) "
+			f"exactly once, found {allowed} (ADR-033 QĐ 1)"
+		)
+	return violations
+
+
+# Compliant sample of the ADR-033 QĐ 1 rule; each violating sample is one change of it.
+SESSION_SWITCH_CLEAN = {
+	AUTHORITY_FILE: """import frappe
+
+from erp_ai.constants import AGENT_USER
+
+
+def enter_agent_session():
+	frappe.set_user(AGENT_USER)
+	return frappe.session.user == AGENT_USER
+""",
+	RUNNER_FILE: """import frappe
+
+from erp_ai.agent import authority
+
+
+def _run(ticket_name):
+	if not authority.enter_agent_session():
+		return
+	frappe.set_user("Administrator")
+""",
+}
+
+
+# ADR-030 QĐ 6 and Ràng buộc: the instructor comes only from the event that queued the run.
+REMOVED_INSTRUCTOR_SCAN = "latest_instructor"
+RUN_INSTRUCTOR_FUNCTION = "run_instructor"
+COMMENT_FETCH_FUNCTION = "fetch_ticket_comments"
+INSTRUCTION_PREDICATE = "is_instruction"
+INSTRUCTOR_SCAN_FILES = (AUTHORITY_FILE, RUNNER_FILE)
+
+
+def check_authority_has_no_comment_scan_for_instructor(sources: dict) -> list:
+	"""ADR-030 QĐ 6: no product code names the removed comment scan, and no function of authority.py or
+	runner.py both fetches the ticket's comments and asks who among them may instruct (AC-13)."""
+	if AUTHORITY_FILE not in sources:
+		return _missing(AUTHORITY_FILE)
+	violations = []
+	for rel, source in only_python(sources).items():
+		tree = parse(rel, source)
+		aliases, docstrings = import_aliases(tree), _docstring_ids(tree)
+		for node in ast.walk(tree):
+			texts = [node.name] if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef) else []
+			if REMOVED_INSTRUCTOR_SCAN in texts + _node_texts(node, aliases, docstrings):
+				violations.append(
+					violation(rel, node, f"names {REMOVED_INSTRUCTOR_SCAN}, a comment scan (ADR-030 QĐ 6)")
+				)
+		if rel not in INSTRUCTOR_SCAN_FILES:
+			continue
+		for function in ast.walk(tree):
+			if not isinstance(function, ast.FunctionDef | ast.AsyncFunctionDef):
+				continue
+			called = {
+				resolved_name(node.func, aliases).rpartition(".")[2]
+				for node in ast.walk(function)
+				if isinstance(node, ast.Call)
+			}
+			if {COMMENT_FETCH_FUNCTION, INSTRUCTION_PREDICATE} <= called:
+				violations.append(
+					violation(
+						rel,
+						function,
+						f"{function.name} picks the instructor by scanning the ticket's comments (ADR-030 QĐ 6)",
+					)
+				)
+	return violations
+
+
+# Compliant sample of the ADR-030 QĐ 6 rule; each violating sample is one change of it.
+INSTRUCTOR_SCAN_CLEAN = {
+	AUTHORITY_FILE: """import frappe
+
+
+def fetch_ticket_comments(ticket_name):
+	return frappe.get_list("Comment", filters={"reference_name": ticket_name})
+
+
+def is_instruction(author, ticket_name):
+	return bool(author)
+
+
+def run_instructor(ticket_name, trigger, comment_name=None):
+	author = frappe.db.get_value("Comment", comment_name, "owner")
+	return author if is_instruction(author, ticket_name) else None
+
+
+def label_comments(ticket_name, comments):
+	return [is_instruction(comment["author"], ticket_name) for comment in comments]
+""",
+	RUNNER_FILE: """from erp_ai.agent import authority
+
+
+def _run(ticket_name, trigger, comment_name):
+	instructor = authority.run_instructor(ticket_name, trigger, comment_name)
+	comments = authority.label_comments(ticket_name, authority.fetch_ticket_comments(ticket_name))
+	return instructor, comments
+""",
+}
+
+
+# Compliant sample: policy names the two constants, the log lists the same triggers as strings.
+RUN_LIMIT_SAMPLE = {
+	CONSTANTS_FILE: (
+		'TRIGGER_TICKET_INSERT = "ticket_insert"\n'
+		'TRIGGER_COMMENT_MENTION = "comment_mention"\n'
+		'TRIGGER_KB_DRAFT = "kb_draft"\n'
+	),
+	POLICY_FILE: (
+		"from erp_ai.constants import TRIGGER_COMMENT_MENTION, TRIGGER_KB_DRAFT, TRIGGER_TICKET_INSERT\n\n"
+		"RUN_LIMIT_TRIGGERS = (TRIGGER_TICKET_INSERT, TRIGGER_COMMENT_MENTION)\n"
+	),
+	RUN_LOG_FILE: 'TRIGGERS = ("ticket_insert", "comment_mention")\n',
+}
+
+
 class TestArchitecture(unittest.TestCase):
 	@classmethod
 	def setUpClass(cls):
@@ -4610,6 +4950,172 @@ class TestArchitecture(unittest.TestCase):
 		# The runner gets the switch only by calling the policy function, never by reading the field.
 		self.assertIn("policy.auto_assign_enabled(", self.sources[RUNNER_FILE])
 		self.assertEqual(check_policy_fields_only_in_policy(self.sources), [])
+
+	def test_site_environment_read_only_via_policy(self):
+		changed = TestScannersCatchViolations.changed
+		sample = SITE_ENVIRONMENT_SAMPLE
+		# C-2: the field is not a POLICY_FIELDS name (the ERP AI Log column of the same name is written by
+		# run_log.py); its own rule below holds on the real tree, and policy.py defines the reader.
+		self.assertNotIn(SITE_ENVIRONMENT_FIELD, POLICY_FIELDS)
+		for rel in SITE_ENVIRONMENT_FILES:
+			self.assertIn(rel, self.sources)
+		self.assertIn(f'{SITE_ENVIRONMENT_CONSTANT} = "{SITE_ENVIRONMENT_FIELD}"', self.sources[POLICY_FILE])
+		self.assertIn(f"def {SITE_ENVIRONMENT_FIELD}(settings=None) -> str:", self.sources[POLICY_FILE])
+		self.assertEqual(check_site_environment_readers(self.sources), [])
+
+		def in_function(rel: str, body: str) -> dict:
+			return changed(sample, rel, f"\n\ndef _sample(settings):\n\t{body}\n")
+
+		outside = f"names {SITE_ENVIRONMENT_FIELD} outside {POLICY_FILE}"
+		self.assertRuleSamples(
+			check_site_environment_readers,
+			sample,
+			{
+				"tasks.py reads settings.site_environment": (
+					in_function(TASKS_FILE, "return settings.site_environment"),
+					f"{TASKS_FILE}:12: {outside}",
+				),
+				"getattr with the name": (
+					in_function(TASKS_FILE, 'return getattr(settings, "site_environment", "production")'),
+					f"{TASKS_FILE}:12",
+				),
+				"stored value read directly": (
+					in_function(
+						"agent/executor.py",
+						'return frappe.db.get_single_value("ERP AI Setting", "site_environment")',
+					),
+					"agent/executor.py:11",
+				),
+				"policy constant used to read the field": (
+					in_function(
+						"agent/executor.py", "return getattr(settings, policy.SITE_ENVIRONMENT_FIELD)"
+					),
+					"agent/executor.py:11",
+				),
+				"constant imported from policy": (
+					changed(
+						sample,
+						"agent/executor.py",
+						"\nfrom erp_ai.agent.policy import SITE_ENVIRONMENT_FIELD\n",
+					),
+					"agent/executor.py:9",
+				),
+				"Log column read by a report": (
+					changed(
+						sample,
+						"report.py",
+						'import frappe\n\nROWS = frappe.get_all("ERP AI Log", fields=["site_environment"])\n',
+					),
+					"report.py:3",
+				),
+				"keyword argument": (
+					changed(sample, "report.py", "ROWS = dict(site_environment=1)\n"),
+					"report.py:1",
+				),
+				"built by concatenation": (
+					changed(sample, "report.py", 'FIELD = "site_" + "environment"\n'),
+					"report.py:1",
+				),
+				"named in an SQL string": (
+					changed(sample, "report.py", "SQL = 'select site_environment from `tabERP AI Log`'\n"),
+					"report.py:1",
+				),
+				"another module's reader of the same name": (
+					changed(
+						sample,
+						"report.py",
+						"from erp_ai.agent.run_log import site_environment\n\nX = site_environment()\n",
+					),
+					"report.py:1",
+				),
+			},
+		)
+		# An allow-listed file stays allowed whatever it does with the field.
+		for rel in SITE_ENVIRONMENT_FILES:
+			with self.subTest(allowed=rel):
+				self.assertEqual(
+					check_site_environment_readers(changed(sample, rel, "\nX = settings.site_environment\n")),
+					[],
+				)
+
+	def test_run_limit_triggers_subset_of_log_triggers(self):
+		changed = TestScannersCatchViolations.changed
+		self.assertEqual(check_run_limit_triggers_subset_of_log_triggers(self.sources), [])
+		sample = RUN_LIMIT_SAMPLE
+		limit_line = "RUN_LIMIT_TRIGGERS = (TRIGGER_TICKET_INSERT, TRIGGER_COMMENT_MENTION)"
+		log_line = 'TRIGGERS = ("ticket_insert", "comment_mention")'
+		# A log trigger outside the limit (U6b's KB draft) is allowed, and the log may name the constants.
+		for case, log in {
+			"log has one more trigger": 'TRIGGERS = ("ticket_insert", "comment_mention", "kb_draft")',
+			"log names the constants": (
+				"from erp_ai.constants import TRIGGER_COMMENT_MENTION, TRIGGER_KB_DRAFT, TRIGGER_TICKET_INSERT\n"
+				"TRIGGERS = (TRIGGER_TICKET_INSERT, TRIGGER_COMMENT_MENTION, TRIGGER_KB_DRAFT)"
+			),
+		}.items():
+			with self.subTest(allowed=case):
+				allowed = changed(sample, RUN_LOG_FILE, replace=(log_line, log))
+				self.assertEqual(check_run_limit_triggers_subset_of_log_triggers(allowed), [])
+		not_logged = f"{RUN_LIMIT_TRIGGERS_NAME} has 'kb_draft', not in {RUN_LOG_FILE}"
+		self.assertRuleSamples(
+			check_run_limit_triggers_subset_of_log_triggers,
+			sample,
+			{
+				"limit names a trigger the log does not have": (
+					changed(
+						sample,
+						POLICY_FILE,
+						replace=(
+							limit_line,
+							"RUN_LIMIT_TRIGGERS = (TRIGGER_TICKET_INSERT, TRIGGER_KB_DRAFT)",
+						),
+					),
+					not_logged,
+				),
+				"limit lists a string the log does not have": (
+					changed(
+						sample,
+						POLICY_FILE,
+						replace=(limit_line, 'RUN_LIMIT_TRIGGERS = ("ticket_insert", "kb_draft")'),
+					),
+					not_logged,
+				),
+				"log drops a limit trigger": (
+					changed(sample, RUN_LOG_FILE, replace=(log_line, 'TRIGGERS = ("ticket_insert",)')),
+					f"{RUN_LIMIT_TRIGGERS_NAME} has 'comment_mention', not in {RUN_LOG_FILE}",
+				),
+				"limit missing": (
+					changed(sample, POLICY_FILE, replace=(limit_line, "")),
+					f"{POLICY_FILE}: {RUN_LIMIT_TRIGGERS_NAME} missing",
+				),
+				"log triggers missing": (
+					changed(sample, RUN_LOG_FILE, replace=(log_line, "")),
+					f"{RUN_LOG_FILE}: {LOG_TRIGGERS_NAME} missing",
+				),
+				"limit computed": (
+					changed(
+						sample,
+						POLICY_FILE,
+						replace=(limit_line, "RUN_LIMIT_TRIGGERS = tuple(VALID_TRIGGERS)"),
+					),
+					f"{POLICY_FILE}:3: {RUN_LIMIT_TRIGGERS_NAME} is not a tuple",
+				),
+				"limit names an unknown constant": (
+					changed(
+						sample,
+						POLICY_FILE,
+						replace=(
+							limit_line,
+							"RUN_LIMIT_TRIGGERS = (TRIGGER_TICKET_INSERT, TRIGGER_REQUESTER_REPLY)",
+						),
+					),
+					"element TRIGGER_REQUESTER_REPLY is not a trigger name",
+				),
+				"policy file missing": (
+					{rel: text for rel, text in sample.items() if rel != POLICY_FILE},
+					f"{POLICY_FILE}: file missing",
+				),
+			},
+		)
 
 	def test_entry_types_unchanged(self):
 		scanned = load_product_sources(suffixes=(".py", ".json"))
@@ -5198,6 +5704,15 @@ class TestArchitecture(unittest.TestCase):
 			},
 		)
 
+	def test_set_user_agent_only_in_enter_agent_session(self):
+		self.assertEqual(check_set_user_agent_only_in_enter_agent_session(self.sources), [])
+		self.assertIn(f"def {SESSION_SWITCH_FUNCTION}(", self.sources[AUTHORITY_FILE])
+
+	def test_authority_has_no_comment_scan_for_instructor(self):
+		self.assertIn(f"def {RUN_INSTRUCTOR_FUNCTION}(", self.sources[AUTHORITY_FILE])
+		self.assertIn(f"authority.{RUN_INSTRUCTOR_FUNCTION}(", self.sources[RUNNER_FILE])
+		self.assertEqual(check_authority_has_no_comment_scan_for_instructor(self.sources), [])
+
 	def test_agent_modules_import_alone_in_fresh_process(self):
 		# STD-DESIGN-6: an import cycle stays hidden in-process when another test imported a module first.
 		env = dict(os.environ, PYTHONPATH=os.pathsep.join([str(REPO_ROOT), os.environ.get("PYTHONPATH", "")]))
@@ -5544,7 +6059,13 @@ class TestScannersCatchViolations(unittest.TestCase):
 	def test_enqueue_targets_pinned(self):
 		self.assertEqual(
 			ENQUEUE_TARGETS,
-			("erp_ai.agent.runner.run_for_ticket", "erp_ai.agent.changes.apply_job.run_change"),
+			(
+				"erp_ai.agent.runner.run_for_ticket",
+				"erp_ai.agent.changes.apply_job.run_change",
+				"erp_ai.agent.daily_report.run_daily_report",
+				"erp_ai.agent.kpi.run_weekly_kpi",
+				"erp_ai.agent.monthly_review.run_monthly_review",
+			),
 		)
 
 	@staticmethod
@@ -5555,29 +6076,32 @@ class TestScannersCatchViolations(unittest.TestCase):
 		good = "import frappe\n" + "".join(self.enqueue_call(target) for target in ENQUEUE_TARGETS)
 		self.assertEqual(check_enqueue_call_shape({QUEUE_FILE: good}), [])
 
-	def test_enqueue_call_shape_requires_exactly_two_calls(self):
-		runner, change = (self.enqueue_call(target) for target in ENQUEUE_TARGETS)
-		for label, body in (("one", runner), ("three", runner + change + change)):
+	def test_enqueue_call_shape_requires_one_call_per_target(self):
+		calls = [self.enqueue_call(target) for target in ENQUEUE_TARGETS]
+		for label, body in (("missing one", calls[1:]), ("one extra", calls + calls[-1:])):
 			with self.subTest(calls=label):
 				self.assertCaught(
-					check_enqueue_call_shape({QUEUE_FILE: "import frappe\n" + body}), "exactly two"
+					check_enqueue_call_shape({QUEUE_FILE: "import frappe\n" + "".join(body)}),
+					"one per target",
 				)
 
 	def test_enqueue_call_shape_requires_each_target_once(self):
-		for target in ENQUEUE_TARGETS:
+		for index, target in enumerate(ENQUEUE_TARGETS):
 			with self.subTest(target=target):
-				body = "import frappe\n" + self.enqueue_call(target) * 2
+				calls = [self.enqueue_call(other) for other in ENQUEUE_TARGETS]
+				calls[index - 1] = self.enqueue_call(target)
+				body = "import frappe\n" + "".join(calls)
 				violations = check_enqueue_call_shape({QUEUE_FILE: body})
 				self.assertCaught(violations, "each of")
 				self.assertFalse(any("first argument" in text for text in violations), violations)
 
 	def test_enqueue_call_shape_rejects_target_outside_set(self):
-		runner = self.enqueue_call(ENQUEUE_TARGETS[0])
+		others = "".join(self.enqueue_call(target) for target in ENQUEUE_TARGETS[:-1])
 		for bad in ("erp_ai.other.fn", "erp_ai.agent.changes.apply_job", "erp_ai.agent.runner.run"):
 			with self.subTest(target=bad):
-				body = "import frappe\n" + runner + self.enqueue_call(bad)
+				body = "import frappe\n" + others + self.enqueue_call(bad)
 				self.assertCaught(check_enqueue_call_shape({QUEUE_FILE: body}), "first argument")
-		not_literal = "import frappe\n" + runner + f"frappe.enqueue(TARGET, {ENQUEUE_GOOD_KEYWORDS})\n"
+		not_literal = "import frappe\n" + others + f"frappe.enqueue(TARGET, {ENQUEUE_GOOD_KEYWORDS})\n"
 		self.assertCaught(check_enqueue_call_shape({QUEUE_FILE: not_literal}), "first argument")
 
 	def test_enqueue_call_shape_requires_five_parameters_on_each_call(self):
@@ -5653,6 +6177,36 @@ class TestScannersCatchViolations(unittest.TestCase):
 	def test_tools_bypass_ignores_code_outside_tools(self):
 		source = "import frappe\nfrappe.db.set_value('X', 'y', 'z', 1)\nfrappe.get_all('X')\n"
 		self.assertEqual(check_tools_never_bypass_permissions({"agent/runner.py": source}), [])
+
+	QUERY_BUILDER_SOURCES = (
+		# (source, line of the reported violation); the first three are design-w0-fixes-5 point 1 (a)-(c).
+		('import frappe\nt = frappe.qb.DocType("Error Log")\n', 2),
+		('import frappe\nfrappe.qb.from_("HD Ticket").select("*").run()\n', 2),
+		("from frappe.query_builder import DocType\n", 1),
+		("import frappe\nfrappe.qb.get_query('HD Ticket')\n", 2),
+		("import frappe\nbuilder = frappe.qb\n", 2),
+		("import frappe as f\nf.qb.DocType('HD Ticket')\n", 2),
+		("from frappe import qb\n", 1),
+		("import frappe.query_builder\n", 1),
+		("import frappe.query_builder as builder\n", 1),
+		("from frappe.query_builder.functions import Count\n", 1),
+	)
+
+	def test_tools_never_bypass_permissions_flags_query_builder(self):
+		for source, line in self.QUERY_BUILDER_SOURCES:
+			with self.subTest(source=source):
+				self.assertCaught(
+					check_tools_never_bypass_permissions({"agent/tools/x.py": source}),
+					f"agent/tools/x.py:{line}: ",
+					"ADR-034",
+				)
+
+	def test_query_builder_outside_tools_allowed(self):
+		outside = ("agent/system_read.py", "agent/tools_x.py", "agent/toolset/x.py", "eval/agent/tools/x.py")
+		for rel in outside:
+			for source, _line in self.QUERY_BUILDER_SOURCES:
+				with self.subTest(rel=rel, source=source):
+					self.assertEqual(check_tools_never_bypass_permissions({rel: source}), [])
 
 	# subprocess --------------------------------------------------------------------------------
 
@@ -8060,6 +8614,110 @@ class TestScannersCatchViolations(unittest.TestCase):
 			check_agent_write_flag_only_in_run_log_and_propose_tool(unknown),
 			AGENT_WRITE_GUARD_FILE,
 			"ADR-023",
+		)
+
+	def test_set_user_agent_scanner_catches_each_switch_outside_enter_agent_session(self):
+		self.assertEqual(check_set_user_agent_only_in_enter_agent_session(SESSION_SWITCH_CLEAN), [])
+		runner_switch = "\n\ndef _switch():\n\t{}\n"
+		for call in (
+			# the runner keeping its own switch (the pre-T74 shape)
+			"frappe.set_user(AGENT_USER)",
+			"frappe.set_user(user=AGENT_USER)",
+			"frappe.set_user(constants.AGENT_USER)",
+			f"frappe.set_user({AGENT_USER!r})",
+		):
+			with self.subTest(call=call):
+				sources = self.changed(SESSION_SWITCH_CLEAN, RUNNER_FILE, runner_switch.format(call))
+				self.assertCaught(
+					check_set_user_agent_only_in_enter_agent_session(sources), RUNNER_FILE, "ADR-033 QĐ 1"
+				)
+		aliased = (
+			"from frappe import set_user as switch\nfrom erp_ai.constants import AGENT_USER as BOT\n\n"
+			"switch(BOT)\n"
+		)
+		self.assertCaught(
+			check_set_user_agent_only_in_enter_agent_session(
+				self.changed(SESSION_SWITCH_CLEAN, "agent/tasks_like.py", aliased)
+			),
+			"agent/tasks_like.py",
+		)
+		# inside authority.py but in another function
+		other_function = self.changed(
+			SESSION_SWITCH_CLEAN, AUTHORITY_FILE, "\n\ndef helper():\n\tfrappe.set_user(AGENT_USER)\n"
+		)
+		self.assertCaught(
+			check_set_user_agent_only_in_enter_agent_session(other_function), f"{AUTHORITY_FILE}:"
+		)
+		# enter_agent_session without the switch, or with two of them
+		for replacement in (
+			"frappe.session.user",
+			"frappe.set_user(AGENT_USER)\n\tfrappe.set_user(AGENT_USER)",
+		):
+			with self.subTest(replacement=replacement):
+				sources = self.changed(
+					SESSION_SWITCH_CLEAN,
+					AUTHORITY_FILE,
+					replace=("frappe.set_user(AGENT_USER)", replacement),
+				)
+				self.assertCaught(check_set_user_agent_only_in_enter_agent_session(sources), "exactly once")
+		missing = {rel: src for rel, src in SESSION_SWITCH_CLEAN.items() if rel != AUTHORITY_FILE}
+		self.assertCaught(
+			check_set_user_agent_only_in_enter_agent_session(missing), AUTHORITY_FILE, "missing"
+		)
+		clean = "\n\ndef _back(previous):\n\tfrappe.set_user(previous)\n\tfrappe.set_user('Guest')\n"
+		self.assertEqual(
+			check_set_user_agent_only_in_enter_agent_session(
+				self.changed(SESSION_SWITCH_CLEAN, RUNNER_FILE, clean)
+			),
+			[],
+		)
+
+	def test_instructor_scan_scanner_catches_each_comment_scan(self):
+		self.assertEqual(check_authority_has_no_comment_scan_for_instructor(INSTRUCTOR_SCAN_CLEAN), [])
+		scan = (
+			"\n\ndef {}(ticket_name):\n\tfor comment in fetch_ticket_comments(ticket_name):\n"
+			"\t\tif is_instruction(comment['author'], ticket_name):\n\t\t\treturn comment['author']\n"
+		)
+		# the removed function back (the pre-T80 shape), and the same loop under another name
+		for name, fragment in (
+			(REMOVED_INSTRUCTOR_SCAN, REMOVED_INSTRUCTOR_SCAN),
+			("newest_boss", "newest_boss"),
+		):
+			with self.subTest(name=name):
+				sources = self.changed(INSTRUCTOR_SCAN_CLEAN, AUTHORITY_FILE, scan.format(name))
+				self.assertCaught(
+					check_authority_has_no_comment_scan_for_instructor(sources),
+					f"{AUTHORITY_FILE}:",
+					fragment,
+					"ADR-030 QĐ 6",
+				)
+		# the runner calling it, by attribute, by alias or by name in a string
+		for caller in (
+			"authority.latest_instructor(ticket_name)",
+			"from erp_ai.agent.authority import latest_instructor as pick",
+			"patch_target = 'latest_instructor'",
+		):
+			with self.subTest(caller=caller):
+				sources = self.changed(INSTRUCTOR_SCAN_CLEAN, RUNNER_FILE, f"\n{caller}\n")
+				self.assertCaught(
+					check_authority_has_no_comment_scan_for_instructor(sources),
+					f"{RUNNER_FILE}:",
+					"ADR-030 QĐ 6",
+				)
+		# a runner function doing the scan itself
+		runner_scan = (
+			"\n\ndef _boss(ticket_name):\n\tfor comment in authority.fetch_ticket_comments(ticket_name):\n"
+			"\t\tif authority.is_instruction(comment['author'], ticket_name):\n\t\t\treturn comment['author']\n"
+		)
+		self.assertCaught(
+			check_authority_has_no_comment_scan_for_instructor(
+				self.changed(INSTRUCTOR_SCAN_CLEAN, RUNNER_FILE, runner_scan)
+			),
+			"_boss",
+		)
+		missing = {rel: src for rel, src in INSTRUCTOR_SCAN_CLEAN.items() if rel != AUTHORITY_FILE}
+		self.assertCaught(
+			check_authority_has_no_comment_scan_for_instructor(missing), AUTHORITY_FILE, "missing"
 		)
 
 

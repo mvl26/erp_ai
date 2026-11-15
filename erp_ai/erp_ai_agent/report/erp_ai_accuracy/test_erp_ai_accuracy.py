@@ -1,21 +1,34 @@
+import itertools
 import json
 from datetime import datetime, timedelta
 from unittest.mock import patch
 
 import frappe
+from frappe.desk.query_report import run
+from frappe.permissions import AUTOMATIC_ROLES
 from frappe.tests.utils import FrappeTestCase
-from frappe.utils import add_days, getdate, now_datetime
+from frappe.utils import add_days, get_datetime, getdate, now_datetime
+from helpdesk.test_utils import make_ticket
 
-from erp_ai.constants import CATEGORIES, LOG_DOCTYPE
-from erp_ai.erp_ai_agent.report.erp_ai_accuracy.erp_ai_accuracy import CORRECTION_WINDOW, execute
-from erp_ai.test_utils import make_log_entry
+from erp_ai.constants import AGENT_USER, CATEGORIES, LOG_DOCTYPE, ROLE_AGENT, ROLE_INSTRUCTOR
+from erp_ai.erp_ai_agent.report.erp_ai_accuracy import erp_ai_accuracy
+from erp_ai.erp_ai_agent.report.erp_ai_accuracy.erp_ai_accuracy import (
+	GATE_MIN_ACCURACY,
+	GATE_MIN_SAMPLE,
+	GATE_WINDOW_DAYS,
+	GateResult,
+	execute,
+	l0_l1_gate,
+)
+from erp_ai.test_utils import keep_agent_settings, make_log_entry, set_agent_settings
 
 PREFIX = "ERPAI-TEST-"
 REPORT = "ERP AI Accuracy"
 PLAIN_USER = "erp-ai-accuracy-plain@example.com"
 PREDICTED = {"ticket_type": "T1", "agent_group": "G1", "priority": "Low"}
-COLUMN_FIELDS = ["category", "predictions", "corrected", "pending", "accuracy_pct"]
+COLUMN_FIELDS = ["category", "predictions", "labeled", "correct", "accuracy_pct", "failed_runs"]
 DAY = timedelta(days=1)
+TICKET_NUMBERS = itertools.count(1)
 
 
 class AccuracyTestCase(FrappeTestCase):
@@ -33,7 +46,8 @@ class AccuracyTestCase(FrappeTestCase):
 		self.now = now_datetime().replace(microsecond=0)
 
 	def _log(self, category, days_ago, corrected_after=None, corrected_to=None, entry_type="classify"):
-		"""One log row created `days_ago` days ago; `corrected_after` (timedelta) sets the correction time."""
+		"""One log row of a new ticket created `days_ago` days ago; `corrected_after` (timedelta) sets the
+		correction time."""
 		name = make_log_entry(
 			run_id=f"{PREFIX}{category}",
 			entry_type=entry_type,
@@ -43,7 +57,7 @@ class AccuracyTestCase(FrappeTestCase):
 			predicted_priority=PREDICTED["priority"],
 		)
 		created = self.now - timedelta(days=days_ago)
-		values = {"creation": created}
+		values = {"creation": created, "ticket": f"{PREFIX}{next(TICKET_NUMBERS)}"}
 		if corrected_after is not None:
 			values["human_corrected_at"] = created + corrected_after
 			values["human_corrected_to"] = (
@@ -58,24 +72,24 @@ class AccuracyTestCase(FrappeTestCase):
 		return {"from_date": add_days(getdate(self.now), -60), "to_date": getdate(self.now)}
 
 	def _rows(self, filters=None):
-		_, data = execute(filters or self._filters())
+		_, data, *_ = execute(filters or self._filters())
 		return {row["category"]: row for row in data}
 
 
 class TestAccuracyTenLogSample(AccuracyTestCase):
 	def _make_sample(self):
-		# A: 3 predictions, 1 corrected (a correction after 7 days does not count)
+		# A: 3 predictions, 2 labeled by a correction (also after 7 days), both wrong
 		self._log("A", 20)
 		self._log("A", 20, corrected_after=2 * DAY, corrected_to={"priority": "High"})
 		self._log("A", 20, corrected_after=9 * DAY, corrected_to={"priority": "High"})
-		# B: set back to the predicted value is no correction; exactly 7 days still counts; one pending
+		# B: set back to the predicted value is a correct label; a changed group is a wrong one; one silent
 		self._log("B", 15, corrected_after=1 * DAY)
 		self._log("B", 15, corrected_after=7 * DAY, corrected_to={"agent_group": "G2"})
 		self._log("B", 3)
 		# C
 		self._log("C", 3, corrected_after=1 * DAY, corrected_to={"ticket_type": "T2"})
 		self._log("C", 10)
-		# D: only a pending prediction
+		# D: only a silent prediction
 		self._log("D", 2)
 		# F
 		self._log("F", 10, corrected_after=1 * DAY, corrected_to={"priority": "Urgent"})
@@ -83,40 +97,41 @@ class TestAccuracyTenLogSample(AccuracyTestCase):
 	def test_accuracy_ten_log_sample(self):
 		self._make_sample()
 		rows = self._rows()
-		# Hand-computed: accuracy = (predictions - pending - corrected) / (predictions - pending) * 100
+		# Hand-computed (AC-19: silence is no label): accuracy = correct / labeled * 100
 		expected = {
-			"A": (3, 1, 0, 66.67),
-			"B": (3, 1, 1, 50.0),
-			"C": (2, 1, 0, 50.0),
-			"D": (1, 0, 1, None),
+			"A": (3, 2, 0, 0.0),
+			"B": (3, 2, 1, 50.0),
+			"C": (2, 1, 0, 0.0),
+			"D": (1, 0, 0, None),
 			"E": (0, 0, 0, None),
 			"F": (1, 1, 0, 0.0),
-			"Tổng": (10, 4, 2, 50.0),
+			"Tổng": (10, 6, 1, 16.67),
 		}
 		self.assertEqual(list(rows), [*CATEGORIES, "Tổng"])
-		for category, (predictions, corrected, pending, accuracy) in expected.items():
+		for category, (predictions, labeled, correct, accuracy) in expected.items():
 			with self.subTest(category=category):
 				row = rows[category]
 				self.assertEqual(row["predictions"], predictions)
-				self.assertEqual(row["corrected"], corrected)
-				self.assertEqual(row["pending"], pending)
+				self.assertEqual(row["labeled"], labeled)
+				self.assertEqual(row["correct"], correct)
 				self.assertEqual(row["accuracy_pct"], accuracy)
 
-	def test_correction_after_seven_days_counts_as_correct(self):
+	def test_correction_after_seven_days_is_still_a_label(self):
 		self._log("A", 20, corrected_after=timedelta(days=7, seconds=1), corrected_to={"priority": "High"})
 		row = self._rows()["A"]
-		self.assertEqual((row["corrected"], row["accuracy_pct"]), (0, 100.0))
+		self.assertEqual((row["labeled"], row["correct"], row["accuracy_pct"]), (1, 0, 0.0))
 
-	def test_correction_back_to_predicted_value_is_not_a_correction(self):
+	def test_correction_back_to_predicted_value_is_a_correct_label(self):
 		self._log("A", 20, corrected_after=DAY)
 		row = self._rows()["A"]
-		self.assertEqual((row["corrected"], row["accuracy_pct"]), (0, 100.0))
+		self.assertEqual((row["labeled"], row["correct"], row["accuracy_pct"]), (1, 1, 100.0))
 
-	def test_unparseable_correction_counts_as_correction(self):
+	def test_unparseable_correction_is_no_label(self):
 		self._log("A", 20, corrected_after=DAY, corrected_to="not json")
-		self.assertEqual(self._rows()["A"]["corrected"], 1)
+		row = self._rows()["A"]
+		self.assertEqual((row["labeled"], row["correct"]), (0, 0))
 
-	def test_empty_predicted_and_corrected_values_are_equal(self):
+	def test_empty_predicted_or_label_value_is_not_compared(self):
 		# NULL is what the database stores for an unset field; "" must count as the same "empty".
 		cases = (
 			("predicted empty string, corrected null", "", None),
@@ -135,25 +150,12 @@ class TestAccuracyTenLogSample(AccuracyTestCase):
 						),
 					},
 				)
-				self.assertEqual(self._rows()["A"]["corrected"], 0)
+				row = self._rows()["A"]
+				self.assertEqual((row["labeled"], row["correct"]), (1, 1))
 				frappe.db.set_value(LOG_DOCTYPE, name, "entry_type", "reason")
 
-	def test_prediction_exactly_seven_days_old_is_no_longer_pending(self):
-		with patch(f"{execute.__module__}.now_datetime", return_value=self.now):
-			self._log("A", 7)
-			self._log("B", 7, corrected_after=None)
-			frappe.db.set_value(
-				LOG_DOCTYPE,
-				self._log("C", 0),
-				"creation",
-				self.now - (CORRECTION_WINDOW - timedelta(seconds=1)),
-			)
-			rows = self._rows()
-		self.assertEqual((rows["A"]["pending"], rows["A"]["accuracy_pct"]), (0, 100.0))
-		self.assertEqual((rows["C"]["pending"], rows["C"]["accuracy_pct"]), (1, None))
-
 	def test_no_prediction_in_range_gives_empty_data(self):
-		columns, data = execute(self._filters())
+		columns, data, *_ = execute(self._filters())
 		self.assertEqual(data, [])
 		self.assertEqual([column["fieldname"] for column in columns], COLUMN_FIELDS)
 
@@ -187,9 +189,13 @@ class TestAccuracyFiltersAndColumns(AccuracyTestCase):
 		self.assertEqual(rows["Tổng"]["predictions"], 2)
 
 	def test_columns_have_the_documented_fieldnames(self):
-		columns, _ = execute(self._filters())
+		columns, *_ = execute(self._filters())
 		self.assertEqual([column["fieldname"] for column in columns], COLUMN_FIELDS)
-		self.assertEqual(columns[-1]["fieldtype"], "Percent")
+		fieldtypes = {column["fieldname"]: column["fieldtype"] for column in columns}
+		self.assertEqual(fieldtypes["accuracy_pct"], "Percent")
+		self.assertEqual(
+			[fieldtypes[name] for name in ("predictions", "labeled", "correct", "failed_runs")], ["Int"] * 4
+		)
 
 	def test_missing_or_inverted_dates_are_rejected(self):
 		today = getdate(self.now)
@@ -215,11 +221,499 @@ class TestAccuracyFiltersAndColumns(AccuracyTestCase):
 		with self.assertRaises(frappe.PermissionError):
 			execute(self._filters())
 
-	def test_report_record_is_system_manager_only_script_report(self):
+	def test_report_record_is_script_report_for_system_manager_and_instructor(self):
 		report = frappe.get_doc("Report", REPORT)
 		self.assertEqual(report.report_type, "Script Report")
 		self.assertEqual(report.ref_doctype, LOG_DOCTYPE)
 		self.assertEqual(report.module, "ERP AI agent")
-		self.assertEqual([row.role for row in report.roles], ["System Manager"])
+		self.assertEqual([row.role for row in report.roles], ["System Manager", ROLE_INSTRUCTOR])
 		self.assertEqual(report.is_standard, "Yes")
 		self.assertTrue(frappe.has_permission("Report", doc=report, user="Administrator"))
+
+
+class TestLabels(AccuracyTestCase):
+	"""AC-19, D-9: a prediction is compared with the label typed at creation, else the label a person set later."""
+
+	def setUp(self):
+		super().setUp()
+		keep_agent_settings(self)
+		self.now = datetime(2026, 11, 10, 12, 0, 0)
+
+	def _classify(
+		self,
+		ticket,
+		category,
+		days_ago=5,
+		predicted=None,
+		created_labels=None,
+		corrected_to=None,
+		entry_type="classify",
+	):
+		"""One row of `ticket` (`None` = no ticket); `category=None` is a failed run (no predicted category)."""
+		prediction = PREDICTED if predicted is None else predicted
+		name = make_log_entry(
+			run_id=f"{PREFIX}{ticket}",
+			entry_type=entry_type,
+			predicted_category=category,
+			**(
+				{}
+				if category is None
+				else {f"predicted_{field}": value for field, value in prediction.items()}
+			),
+		)
+		values = {"creation": self.now - timedelta(days=days_ago)}
+		if ticket is not None:
+			values["ticket"] = f"{PREFIX}{ticket}"
+		if created_labels is not None:
+			values["created_labels"] = json.dumps(created_labels)
+		if corrected_to is not None:
+			values["human_corrected_to"] = json.dumps(corrected_to)
+		frappe.db.set_value(LOG_DOCTYPE, name, values, update_modified=False)
+		return name
+
+	def test_six_label_cases(self):
+		# A, label typed at creation equal to the prediction: labeled and correct
+		self._classify("created", "A", created_labels=PREDICTED)
+		# B, no label at creation, a person changed the priority later: labeled and wrong
+		self._classify("corrected", "B", corrected_to={**PREDICTED, "priority": "High"})
+		# C, nobody labeled anything: not labeled, so neither correct nor wrong
+		self._classify("silent", "C")
+		# failed run: no predicted category; only in `failed_runs` of the total row
+		self._classify("failed", None)
+		# D, the bot left the group empty and a person set it: the group is not compared, the rest is equal
+		self._classify(
+			"d-blank-group",
+			"D",
+			predicted={**PREDICTED, "agent_group": ""},
+			created_labels={**PREDICTED, "agent_group": "G9"},
+		)
+		# E, the label at creation equals the prediction, the later one differs: the label at creation wins
+		self._classify(
+			"two-labels", "E", created_labels=PREDICTED, corrected_to={**PREDICTED, "priority": "Urgent"}
+		)
+		rows = self._rows()
+		expected = {
+			# category: (predictions, labeled, correct, accuracy_pct, failed_runs)
+			"A": (1, 1, 1, 100.0, None),
+			"B": (1, 1, 0, 0.0, None),
+			"C": (1, 0, 0, None, None),
+			"D": (1, 1, 1, 100.0, None),
+			"E": (1, 1, 1, 100.0, None),
+			"F": (0, 0, 0, None, None),
+			"Tổng": (5, 4, 3, 75.0, 1),
+		}
+		self.assertEqual(list(rows), [*CATEGORIES, "Tổng"])
+		for category, numbers in expected.items():
+			with self.subTest(category=category):
+				row = rows[category]
+				self.assertEqual(
+					tuple(
+						row.get(key)
+						for key in ("predictions", "labeled", "correct", "accuracy_pct", "failed_runs")
+					),
+					numbers,
+				)
+
+	def _numbers(self, row):
+		return tuple(row.get(key) for key in ("predictions", "labeled", "correct", "failed_runs"))
+
+	def test_each_field_falls_back_to_the_later_label_on_its_own(self):
+		# A: the label at creation has only the priority (equal); the later ticket type differs → wrong
+		self._classify("partial", "A", created_labels={"priority": "Low"}, corrected_to={"ticket_type": "T2"})
+		# B: an empty priority at creation is no label; the later priority differs → wrong
+		self._classify(
+			"empty-created", "B", created_labels={"priority": ""}, corrected_to={"priority": "High"}
+		)
+		rows = self._rows()
+		self.assertEqual(self._numbers(rows["A"]), (1, 1, 0, None))
+		self.assertEqual(self._numbers(rows["B"]), (1, 1, 0, None))
+
+	def test_label_only_for_a_field_the_bot_left_empty_is_no_label(self):
+		self._classify(
+			"group-only",
+			"D",
+			predicted={**PREDICTED, "agent_group": ""},
+			created_labels={"agent_group": "G9"},
+			corrected_to={"agent_group": "G8"},
+		)
+		row = self._rows()["D"]
+		self.assertEqual((row["labeled"], row["correct"], row["accuracy_pct"]), (0, 0, None))
+
+	def test_only_the_first_successful_row_of_a_ticket_counts(self):
+		# one ticket: a failed run, then a correct A, then a wrong B; only the A row counts, no failed run
+		self._classify("rerun", None, days_ago=6)
+		self._classify("rerun", "A", days_ago=5, created_labels=PREDICTED)
+		self._classify("rerun", "B", days_ago=4, created_labels={"priority": "High"})
+		# first success before the range (filter starts 60 days back): a later success in range does not count
+		self._classify("old", "C", days_ago=70)
+		self._classify("old", "C", days_ago=3)
+		rows = self._rows()
+		self.assertEqual(self._numbers(rows["A"]), (1, 1, 1, None))
+		self.assertEqual(self._numbers(rows["B"]), (0, 0, 0, None))
+		self.assertEqual(self._numbers(rows["C"]), (0, 0, 0, None))
+		self.assertEqual(self._numbers(rows["Tổng"]), (1, 1, 1, 0))
+
+	def test_failed_runs_count_tickets_without_success_in_the_range(self):
+		self._classify("failed-twice", None, days_ago=5)
+		self._classify("failed-twice", None, days_ago=4)
+		# decoys: failed before the range, failed after the range end, success before the range,
+		# another entry type, no ticket (failed and successful)
+		self._classify("failed-before", None, days_ago=70)
+		self._classify("failed-after", None, days_ago=-1)
+		self._classify("succeeded-before", "A", days_ago=70)
+		self._classify("succeeded-before", None, days_ago=5)
+		self._classify("reason-row", None, entry_type="reason")
+		self._classify(None, None)
+		self._classify(None, "A")
+		_, data, *_ = execute(self._filters())
+		self.assertEqual([row["category"] for row in data], [*CATEGORIES, "Tổng"])
+		self.assertEqual(self._numbers(data[-1]), (0, 0, 0, 1))
+		self.assertEqual([row["failed_runs"] for row in data[:-1]], [None] * len(CATEGORIES))
+
+	def test_failed_run_at_the_first_second_of_the_range_counts(self):
+		# the filter starts at 00:00:00 of the day 60 days back; one second earlier is outside
+		start = datetime.combine(getdate(self._filters()["from_date"]), datetime.min.time())
+		for ticket, created in (("at-start", start), ("before-start", start - timedelta(seconds=1))):
+			name = self._classify(ticket, None)
+			frappe.db.set_value(LOG_DOCTYPE, name, "creation", created, update_modified=False)
+		self.assertEqual(self._numbers(self._rows()["Tổng"]), (0, 0, 0, 1))
+
+
+class TestGate(AccuracyTestCase):
+	"""AC-18, design 3.5.3: verdict of the L0 → L1 gate over the 14 days before `now`."""
+
+	def setUp(self):
+		super().setUp()
+		keep_agent_settings(self)
+		self.now = datetime(2026, 11, 10, 12, 0, 0)
+
+	def _classify(self, created, correct=True, labeled=True):
+		"""A new ticket with one `classify` row created at `created`; its label equals the prediction when
+		`correct`, else differs in the priority; `labeled=False` leaves it without a label."""
+		ticket = f"{PREFIX}gate-{next(TICKET_NUMBERS)}"
+		self._row(ticket, created, "A", correct if labeled else None)
+		return ticket
+
+	def _row(self, ticket, created, category, correct):
+		name = make_log_entry(
+			run_id=ticket,
+			entry_type="classify",
+			predicted_category=category,
+			**(
+				{}
+				if category is None
+				else {f"predicted_{field}": value for field, value in PREDICTED.items()}
+			),
+		)
+		values = {"creation": created, "ticket": ticket}
+		if correct is not None:
+			values["created_labels"] = json.dumps(PREDICTED if correct else {**PREDICTED, "priority": "High"})
+		frappe.db.set_value(LOG_DOCTYPE, name, values, update_modified=False)
+
+	def _sample(self, labeled, correct, days_ago=3):
+		for index in range(labeled):
+			self._classify(self.now - timedelta(days=days_ago), correct=index < correct)
+
+	def _gate(self):
+		result = l0_l1_gate(self.now)
+		return result.verdict, result.labeled, result.correct
+
+	def test_constants_are_the_documented_numbers(self):
+		self.assertEqual((GATE_WINDOW_DAYS, GATE_MIN_SAMPLE, GATE_MIN_ACCURACY), (14, 30, 0.85))
+
+	def test_not_enough_sample_29(self):
+		self._sample(29, 29)
+		# unlabeled tickets are not in the sample of 30
+		for _ in range(5):
+			self._classify(self.now - DAY, labeled=False)
+		self.assertEqual(self._gate(), ("Chưa đủ mẫu", 29, 29))
+
+	def test_no_sample_at_all(self):
+		self.assertEqual(self._gate(), ("Chưa đủ mẫu", 0, 0))
+
+	def test_pass_exactly_85(self):
+		self._sample(40, 34)
+		self.assertEqual(self._gate(), ("Đạt", 40, 34))
+
+	def test_fail_82_5(self):
+		self._sample(40, 33)
+		self.assertEqual(self._gate(), ("Chưa đạt", 40, 33))
+
+	def test_pass_30_26(self):
+		self._sample(30, 26)
+		self.assertEqual(self._gate(), ("Đạt", 30, 26))
+
+	def test_fail_30_25(self):
+		self._sample(30, 25)
+		self.assertEqual(self._gate(), ("Chưa đạt", 30, 25))
+
+	def test_outside_window_ignored(self):
+		start = self.now - timedelta(days=14)
+		second = timedelta(seconds=1)
+		self._sample(30, 30)
+		# in the window (now - 14 days, now]: one second after its start, and `now` itself (both wrong)
+		self._classify(start + second, correct=False)
+		self._classify(self.now, correct=False)
+		# outside: exactly at its start, one second after `now`, well before it
+		self._classify(start, correct=False)
+		self._classify(self.now + second, correct=False)
+		self._classify(self.now - timedelta(days=20), correct=False)
+		self.assertEqual(self._gate(), ("Đạt", 32, 30))
+
+	def test_window_uses_the_first_successful_row_of_each_ticket(self):
+		self._sample(30, 30)
+		# first success before the window, a later (wrong) success inside it: the ticket is not counted
+		old = self._classify(self.now - timedelta(days=15))
+		self._row(old, self.now - DAY, "B", correct=False)
+		# a failed run before the window, then the first success inside it (wrong): the ticket counts
+		late = f"{PREFIX}gate-late"
+		self._row(late, self.now - timedelta(days=20), None, None)
+		self._row(late, self.now - DAY, "A", correct=False)
+		# first success inside the window is wrong, a later one is right: the first one decides
+		rerun = self._classify(self.now - 2 * DAY, correct=False)
+		self._row(rerun, self.now - DAY, "A", correct=True)
+		self.assertEqual(self._gate(), ("Đạt", 32, 30))
+
+	def test_rows_of_other_entry_types_are_ignored(self):
+		self._sample(29, 29)
+		# a full, correct prediction: only the `entry_type` keeps it out of the sample (else 30 of 30, "Đạt")
+		name = make_log_entry(
+			run_id=f"{PREFIX}gate-reason",
+			entry_type="reason",
+			predicted_category="A",
+			**{f"predicted_{field}": value for field, value in PREDICTED.items()},
+		)
+		frappe.db.set_value(
+			LOG_DOCTYPE,
+			name,
+			{
+				"creation": self.now - DAY,
+				"ticket": f"{PREFIX}gate-reason",
+				"created_labels": json.dumps(PREDICTED),
+			},
+			update_modified=False,
+		)
+		self.assertEqual(self._gate(), ("Chưa đủ mẫu", 29, 29))
+
+	def test_default_now_is_the_current_time(self):
+		# far from the real clock, so the sample counts only when `now` comes from `now_datetime()`
+		self.now = datetime(2020, 1, 1, 12, 0, 0)
+		self._sample(30, 30, days_ago=0)
+		with patch(
+			"erp_ai.erp_ai_agent.report.erp_ai_accuracy.erp_ai_accuracy.now_datetime", return_value=self.now
+		):
+			result = l0_l1_gate()
+		self.assertEqual(result, GateResult("Đạt", 30, 30))
+
+
+SUMMARY_LABELS = ["Phân loại ≤ 5 phút", "Phân loại > 5 phút", "Chưa phân loại", "Cửa L0 → L1"]
+EXCLUDED_TEAM = f"{PREFIX}excluded-team"
+MINUTE = timedelta(minutes=1)
+
+
+class TestLatencySummary(AccuracyTestCase):
+	"""AC-17, D-8: classification latency of the tickets created in the range, in the report summary."""
+
+	def setUp(self):
+		super().setUp()
+		keep_agent_settings(self)
+		# off: inserting a ticket must not queue a run; the excluded team makes `can_send_ticket` false
+		set_agent_settings(enabled=0, excluded_teams=EXCLUDED_TEAM)
+		# far from real use of the site, so the tickets made here are the only ones in the range
+		self.now = datetime(2001, 1, 10, 12, 0, 0)
+		self.created = datetime(2001, 1, 10, 9, 0, 0)
+
+	def _ticket(self, created=None, **values):
+		"""A new ticket created at `created` (default 09:00 of the filter day); the group is left empty, so
+		the ticket is not full unless `values` set it."""
+		ticket = make_ticket(subject=f"{PREFIX}latency").name
+		frappe.db.set_value(
+			"HD Ticket",
+			ticket,
+			{"creation": created or self.created, "agent_group": "", **values},
+			update_modified=False,
+		)
+		return ticket
+
+	def _full_ticket(self, **values):
+		"""A ticket whose three classification fields are all set."""
+		return self._ticket(**{**PREDICTED, **values})
+
+	def _classify(self, ticket, after, category="A", created_labels=None):
+		"""A `classify` row of `ticket` created `after` its creation; `category=None` is a failed run."""
+		name = make_log_entry(
+			run_id=f"{PREFIX}{ticket}",
+			entry_type="classify",
+			predicted_category=category,
+			**(
+				{}
+				if category is None
+				else {f"predicted_{field}": value for field, value in PREDICTED.items()}
+			),
+		)
+		ticket_created = get_datetime(frappe.db.get_value("HD Ticket", ticket, "creation"))
+		values = {"creation": ticket_created + after, "ticket": ticket}
+		if created_labels is not None:
+			values["created_labels"] = json.dumps(created_labels)
+		frappe.db.set_value(LOG_DOCTYPE, name, values, update_modified=False)
+
+	def _day_filters(self, day=None):
+		day = day or getdate(self.created)
+		return {"from_date": day, "to_date": day}
+
+	def _summary(self, filters=None):
+		"""The report summary as {label: value}, with `now` fixed at `self.now`."""
+		with patch.object(erp_ai_accuracy, "now_datetime", return_value=self.now):
+			result = execute(filters or self._day_filters())
+		self.assertEqual(len(result), 5)
+		summary = result[4]
+		self.assertEqual([item["label"] for item in summary], SUMMARY_LABELS)
+		return {item["label"]: item["value"] for item in summary}
+
+	def _numbers(self, filters=None):
+		summary = self._summary(filters)
+		return tuple(summary[label] for label in SUMMARY_LABELS[:3])
+
+	def test_six_tickets_three_numbers(self):
+		# 1 min and exactly 5:00 are "≤ 5"; 6 min is "> 5"
+		self._classify(self._ticket(), MINUTE)
+		self._classify(self._ticket(), 5 * MINUTE)
+		self._classify(self._ticket(), 6 * MINUTE)
+		# a failed run and a ticket the bot never ran on: not classified
+		self._classify(self._ticket(), MINUTE, category=None)
+		self._ticket()
+		# skipped on purpose (the requester opted out): not counted, else "Chưa phân loại" would be 3
+		self._ticket(ai_opt_out=1)
+		self.assertEqual(
+			self._summary(),
+			dict(zip(SUMMARY_LABELS, [2, 1, 2, "Chưa đủ mẫu (0/0)"], strict=True)),
+		)
+
+	def test_five_minutes_and_one_second_is_over_five(self):
+		self._classify(self._ticket(), 5 * MINUTE + timedelta(seconds=1))
+		self.assertEqual(self._numbers(), (0, 1, 0))
+
+	def test_latency_is_measured_to_the_first_successful_row(self):
+		# a failed run at 1 min does not count as a result: the first success at 7 min does
+		failed_first = self._ticket()
+		self._classify(failed_first, MINUTE, category=None)
+		self._classify(failed_first, 7 * MINUTE)
+		# a later rerun at 10 min does not move the first success at 3 min
+		rerun = self._ticket()
+		self._classify(rerun, 3 * MINUTE)
+		self._classify(rerun, 10 * MINUTE)
+		self.assertEqual(self._numbers(), (1, 1, 0))
+
+	def test_tickets_skipped_on_purpose_are_not_counted(self):
+		# each one would change a number if it were counted
+		self._ticket(owner=AGENT_USER)
+		self._classify(self._ticket(ai_opt_out=1), MINUTE)
+		self._classify(self._ticket(agent_group=EXCLUDED_TEAM), 6 * MINUTE)
+		# full at creation: the three fields are set and the bot never ran ...
+		self._full_ticket()
+		# ... or the first successful row holds a label for each of the three fields (at 6 min, so that
+		# counting it and dropping the bot-filled ticket below cannot cancel out)
+		self._classify(self._ticket(), 6 * MINUTE, created_labels=PREDICTED)
+		# counted: two labels at creation only; fields the bot filled (no label at creation); never ran
+		self._classify(self._ticket(), MINUTE, created_labels={"ticket_type": "T1", "priority": "Low"})
+		self._classify(self._full_ticket(), 2 * MINUTE)
+		self._ticket()
+		self.assertEqual(self._numbers(), (2, 0, 1))
+
+	def test_success_after_the_range_end_still_gives_the_latency(self):
+		# created two minutes before the range ends, classified one minute after it: 3 minutes, "≤ 5"
+		end = datetime.combine(getdate(self.created) + DAY, datetime.min.time())
+		self.now = end + DAY
+		self._classify(self._ticket(created=end - 2 * MINUTE), 3 * MINUTE)
+		self.assertEqual(self._numbers(), (1, 0, 0))
+
+	def test_only_tickets_created_in_the_range_count(self):
+		start = datetime.combine(getdate(self.created), datetime.min.time())
+		second = timedelta(seconds=1)
+		# counted: the first second of the range and the last second of its last day
+		self._ticket(created=start)
+		self._ticket(created=start + DAY - second)
+		# not counted: one second before the range, the first second after it
+		self._ticket(created=start - second)
+		self._ticket(created=start + DAY)
+		self.assertEqual(self._numbers(), (0, 0, 2))
+
+	def _gate_row(self, created, correct):
+		"""A `classify` row of a new log-only ticket, created at `created`, labeled right or wrong."""
+		ticket = f"{PREFIX}gate-{next(TICKET_NUMBERS)}"
+		name = make_log_entry(
+			run_id=ticket,
+			entry_type="classify",
+			predicted_category="A",
+			**{f"predicted_{field}": value for field, value in PREDICTED.items()},
+		)
+		labels = PREDICTED if correct else {**PREDICTED, "priority": "High"}
+		frappe.db.set_value(
+			LOG_DOCTYPE,
+			name,
+			{"creation": created, "ticket": ticket, "created_labels": json.dumps(labels)},
+			update_modified=False,
+		)
+
+	def test_gate_item_does_not_follow_the_range(self):
+		# the range is a day long before the gate window: the gate still counts its own 14 days
+		for _ in range(GATE_MIN_SAMPLE):
+			self._gate_row(self.now - DAY, correct=True)
+		summary = self._summary(self._day_filters(getdate(self.now - 30 * DAY)))
+		self.assertEqual(summary["Cửa L0 → L1"], "Đạt (30/30)")
+
+	def test_gate_item_stops_at_now_inside_the_range(self):
+		# the range is today: rows up to `now` (included) count, a row one second later does not
+		for _ in range(GATE_MIN_SAMPLE - 1):
+			self._gate_row(self.now - DAY, correct=True)
+		self._gate_row(self.now, correct=True)
+		self._gate_row(self.now + timedelta(seconds=1), correct=False)
+		self.assertEqual(self._summary(self._day_filters(getdate(self.now)))["Cửa L0 → L1"], "Đạt (30/30)")
+
+	def test_classify_rows_are_read_once(self):
+		self._classify(self._ticket(), MINUTE)
+		with patch.object(
+			erp_ai_accuracy, "_fetch_classify_rows", wraps=erp_ai_accuracy._fetch_classify_rows
+		) as fetch:
+			self._summary()
+		self.assertEqual(fetch.call_count, 1)
+
+
+class TestAccess(AccuracyTestCase):
+	"""AC-20: the Instructor runs the report, only ERP AI Agent is refused, System Manager runs it."""
+
+	def setUp(self):
+		super().setUp()
+		keep_agent_settings(self)
+		self._log("A", 1)
+
+	def _user_with_only(self, role):
+		"""A new user whose only non-automatic role is `role`, so no other role can grant or refuse access."""
+		email = f"erp-ai-accuracy-{frappe.scrub(role).replace('_', '-')}@example.com"
+		user = frappe.get_doc(
+			{"doctype": "User", "email": email, "first_name": "access", "send_welcome_email": 0}
+		)
+		user.append("roles", {"role": role})
+		user.insert(ignore_permissions=True)
+		self.assertEqual(set(frappe.get_roles(email)) - set(AUTOMATIC_ROLES), {role})
+		return email
+
+	def _run_as(self, role):
+		frappe.set_user(self._user_with_only(role))
+		filters = json.dumps({key: str(value) for key, value in self._filters().items()})
+		return run(REPORT, filters=filters)
+
+	def _predictions_of_a(self, result):
+		return next(row["predictions"] for row in result["result"] if row["category"] == "A")
+
+	def test_three_accounts(self):
+		with self.subTest(account=ROLE_INSTRUCTOR):
+			self.assertEqual(self._predictions_of_a(self._run_as(ROLE_INSTRUCTOR)), 1)
+
+		with self.subTest(account=ROLE_AGENT):
+			with self.assertRaises(frappe.PermissionError):
+				self._run_as(ROLE_AGENT)
+			self.assertFalse(frappe.get_doc("Report", REPORT).is_permitted())
+
+		with self.subTest(account="System Manager"):
+			self.assertEqual(self._predictions_of_a(self._run_as("System Manager")), 1)

@@ -1,3 +1,4 @@
+import copy
 import json
 from unittest.mock import patch
 
@@ -5,8 +6,9 @@ import frappe
 import frappe.client
 from frappe.tests.utils import FrappeTestCase
 
-from erp_ai.agent import run_log
+from erp_ai.agent import redact, run_log
 from erp_ai.agent.agent_write_guard import AGENT_WRITE_FLAG
+from erp_ai.agent.tools.site_api import SCRUBBED_VALUE, SECRET_FIELDS
 from erp_ai.constants import AGENT_USER, HELPDESK_AGENT_ROLE, LOG_DOCTYPE, ROLE_AGENT
 from erp_ai.erp_ai_agent.doctype.erp_ai_log.erp_ai_log import ERPAILog
 from erp_ai.test_utils import make_change_proposal, make_log_entry
@@ -385,3 +387,195 @@ class TestRunLogAgentWriteGuard(FrappeTestCase):
 				}
 			).insert(ignore_permissions=True)
 		)
+
+
+# U3 3.1 (ADR-033 QĐ 5): the one action-entry shape, in this order.
+ACTION_KEYS_EXPECTED = ("tool", "doctype", "name", "ok", "value_before", "value_after", "instructor")
+# A core DocType with a `Password` field whose name holds no secret word: only the meta can mask it.
+PASSWORD_DOCTYPE = "Google Calendar"
+PASSWORD_FIELD = "authorization_code"
+BEARER_TEXT = "Gọi lại với Authorization: Bearer ERPAITESTbearer12345 nhé"
+
+
+class TestActionEntry(FrappeTestCase):
+	def test_shape_has_all_keys_in_order(self):
+		self.assertEqual(run_log.ACTION_KEYS, ACTION_KEYS_EXPECTED)
+		self.assertEqual(run_log.ACTION_DOCTYPE_MAX, 80)
+		before, after = {"priority": "Low"}, {"priority": "High"}
+		entry = run_log.action_entry(
+			"api_update_record",
+			"HD Ticket",
+			"ERPAI-TEST-ticket-7",
+			True,
+			reason="ERPAI-TEST-ignored-when-ok",
+			value_before=before,
+			value_after=after,
+			instructor="erpai-test-instructor@example.com",
+			rule="ERPAI-TEST-rule-3",
+		)
+
+		self.assertEqual(tuple(entry), (*ACTION_KEYS_EXPECTED, "rule"))
+		self.assertEqual(
+			list(entry.values()),
+			[
+				"api_update_record",
+				"HD Ticket",
+				"ERPAI-TEST-ticket-7",
+				True,
+				{"priority": "Low"},
+				{"priority": "High"},
+				"erpai-test-instructor@example.com",
+				"ERPAI-TEST-rule-3",
+			],
+		)
+		self.assertIsNot(entry["value_before"], before)
+
+		bare = run_log.action_entry("route_ticket", None, None, True, rule="")
+		self.assertEqual(tuple(bare), ACTION_KEYS_EXPECTED)
+		self.assertEqual(list(bare.values()), ["route_ticket", None, None, True, None, None, None])
+
+		long_doctype = "D" * 79 + "EF"
+		cut = run_log.action_entry("api_create_record", long_doctype, "ERPAI-TEST-new", True)
+		self.assertEqual(cut["doctype"], "D" * 79 + "E")
+
+	def test_refused_entry_keeps_reason(self):
+		self.assertEqual(run_log.NO_REASON, "tool không nêu lý do")
+		refused = run_log.action_entry(
+			"api_delete_record",
+			"ToDo",
+			"ERPAI-TEST-todo-1",
+			False,
+			reason="ERPAI-TEST-not-permitted",
+			instructor="erpai-test-boss@example.com",
+			rule="ERPAI-TEST-rule-9",
+		)
+		self.assertEqual(tuple(refused), (*ACTION_KEYS_EXPECTED, "reason", "rule"))
+		self.assertEqual(
+			list(refused.values()),
+			[
+				"api_delete_record",
+				"ToDo",
+				"ERPAI-TEST-todo-1",
+				False,
+				None,
+				None,
+				"erpai-test-boss@example.com",
+				"ERPAI-TEST-not-permitted",
+				"ERPAI-TEST-rule-9",
+			],
+		)
+		for blank in (None, "", "   "):
+			with self.subTest(reason=blank):
+				entry = run_log.action_entry(
+					"api_delete_record", "ToDo", "ERPAI-TEST-todo-2", False, reason=blank
+				)
+				self.assertEqual(tuple(entry), (*ACTION_KEYS_EXPECTED, "reason"))
+				self.assertEqual(entry["reason"], run_log.NO_REASON)
+
+	def test_refused_reason_secret_masked(self):
+		reason = "ERPAI-TEST lỗi: password=ERPAI-TEST-p9 và Bearer ERPAITESTbearer12345"
+		entry = run_log.action_entry(
+			"api_update_record", "ToDo", "ERPAI-TEST-todo-3", False, reason=reason, rule="ERPAI-TEST-rule-9"
+		)
+		self.assertEqual(entry["reason"], redact.redact_secrets(reason))
+		self.assertIn(redact.MASK, entry["reason"])
+		self.assertNotIn("ERPAI-TEST-p9", entry["reason"])
+		self.assertNotIn("ERPAITESTbearer12345", entry["reason"])
+		with self.subTest(reason="khóa sk-ant-FAKE0000 hết hạn"):
+			key_entry = run_log.action_entry(
+				"api_update_record", "ToDo", "ERPAI-TEST-todo-3", False, reason="khóa sk-ant-FAKE0000 hết hạn"
+			)
+			self.assertEqual(key_entry["reason"], "khóa [đã che] hết hạn")
+		with self.subTest(rule="ERPAI-TEST-rule-9"):
+			self.assertEqual(entry["rule"], "ERPAI-TEST-rule-9")
+
+	def test_two_mask_words_have_distinct_meanings(self):
+		self.assertEqual(run_log.SECRET_MASK, "[đã ẩn]")
+		self.assertEqual(SCRUBBED_VALUE, run_log.SECRET_MASK)
+		self.assertEqual(redact.MASK, "[đã che]")
+		self.assertNotEqual(run_log.SECRET_MASK, redact.MASK)
+		entry = run_log.action_entry(
+			"api_update_record",
+			"ToDo",
+			"ERPAI-TEST-todo-4",
+			True,
+			value_after={"api_key": "ERPAI-TEST-k", "note": BEARER_TEXT},
+		)
+		self.assertEqual(entry["value_after"]["api_key"], run_log.SECRET_MASK)
+		self.assertIn(redact.MASK, entry["value_after"]["note"])
+		self.assertNotIn(run_log.SECRET_MASK, entry["value_after"]["note"])
+
+	def test_masks_secret_keys_password_fields_and_secret_text(self):
+		self.assertEqual(run_log.SECRET_MASK, "[đã ẩn]")
+		mask = run_log.SECRET_MASK
+		value_before = {
+			"api_key": "ERPAI-TEST-k1",
+			"subject": "ERPAI-TEST-plain-subject",
+			"nested": {
+				"new_password": "ERPAI-TEST-p2",
+				"rows": [{"Mật khẩu": "ERPAI-TEST-m3", "note": BEARER_TEXT}, "ERPAI-TEST-leaf", 42],
+			},
+		}
+		value_after = {field: f"ERPAI-TEST-{field}" for field in sorted(SECRET_FIELDS)}
+		value_after["count"] = 5
+		originals = copy.deepcopy((value_before, value_after))
+
+		entry = run_log.action_entry(
+			"api_update_record",
+			"User",
+			"ERPAI-TEST-user",
+			True,
+			value_before=value_before,
+			value_after=value_after,
+		)
+
+		self.assertEqual(
+			entry["value_before"],
+			{
+				"api_key": mask,
+				"subject": "ERPAI-TEST-plain-subject",
+				"nested": {
+					"new_password": mask,
+					"rows": [
+						{"Mật khẩu": mask, "note": redact.redact_secrets(BEARER_TEXT)},
+						"ERPAI-TEST-leaf",
+						42,
+					],
+				},
+			},
+		)
+		self.assertNotIn("ERPAITESTbearer12345", entry["value_before"]["nested"]["rows"][0]["note"])
+		self.assertEqual(entry["value_after"], {**{field: mask for field in SECRET_FIELDS}, "count": 5})
+		self.assertEqual((value_before, value_after), originals)
+
+		values = {PASSWORD_FIELD: "ERPAI-TEST-code-4", "calendar_name": "ERPAI-TEST-cal"}
+		on_meta = run_log.action_entry(
+			"api_update_record", PASSWORD_DOCTYPE, "ERPAI-TEST-cal", True, value_after=values
+		)
+		self.assertEqual(on_meta["value_after"], {PASSWORD_FIELD: mask, "calendar_name": "ERPAI-TEST-cal"})
+		not_a_doctype = run_log.action_entry(
+			"api_update_record", "ERPAI-TEST-no-such-doctype", "x", True, value_before=values
+		)
+		self.assertEqual(not_a_doctype["value_before"], values)
+
+	def test_rejects_blank_tool_non_bool_ok_non_dict_values(self):
+		cases = [
+			{"tool": ""},
+			{"tool": "   "},
+			{"tool": None},
+			{"tool": 7},
+			{"ok": 1},
+			{"ok": "true"},
+			{"ok": None},
+			{"value_before": ["ERPAI-TEST-a"]},
+			{"value_before": "ERPAI-TEST-b"},
+			{"value_after": ("ERPAI-TEST-c",)},
+			{"value_after": 0},
+		]
+		for case in cases:
+			arguments = {"tool": "api_update_record", "ok": True, **case}
+			with self.subTest(**{key: repr(value) for key, value in case.items()}):
+				with self.assertRaises(ValueError):
+					run_log.action_entry(
+						arguments.pop("tool"), "ToDo", "ERPAI-TEST-todo", arguments.pop("ok"), **arguments
+					)

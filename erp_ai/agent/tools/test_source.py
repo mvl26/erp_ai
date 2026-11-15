@@ -13,7 +13,13 @@ from frappe.tests.utils import FrappeTestCase
 
 from erp_ai import test_utils
 from erp_ai.agent.tools import source
-from erp_ai.test_utils import GitSandbox, RealCoreReposUntouchedMixin
+from erp_ai.test_utils import (
+	GitSandbox,
+	RealCoreReposUntouchedMixin,
+	TempAppsRoot,
+	keep_agent_settings,
+	set_agent_settings,
+)
 
 ROOT_PATH = "erp_ai.agent.tools.source.get_source_root"
 
@@ -2319,6 +2325,174 @@ class TestGitCommitReaders(RealCoreReposUntouchedMixin, unittest.TestCase):
 					with self.assertRaisesRegex(ValueError, "rev"):
 						source.git_is_ancestor(repo, older, rev)
 		run.assert_not_called()
+
+
+class TestManualsExcluded(FrappeTestCase):
+	"""AC-47, ADR-034 QĐ 5: files inside the manuals directory are not source; the directory itself still resolves."""
+
+	def setUp(self):
+		self.addCleanup(frappe.db.rollback)
+		keep_agent_settings(self)
+		self.sandbox = TempAppsRoot(self, apps=("myapp",))
+		self.root = self.sandbox.root
+		self.docs = os.path.join(self.root, "myapp", "docs")
+		self.manual = self.sandbox.write("myapp/docs/hdsd.md", "# HDSD\nneedle in manual\n")
+		self.code = self.sandbox.write("myapp/code.py", "needle = 1\n")
+		set_agent_settings(manuals_dir="myapp/docs")
+
+	def git(self, subcommand, args):
+		return source.git_source({"app": "myapp", "subcommand": subcommand, "args": args}, None)
+
+	def test_read_source_refuses_manual_file(self):
+		self.assertIsNone(source.resolve_safe_path("myapp/docs/hdsd.md"))
+		self.assertIsNone(source.resolve_safe_path(self.manual))
+		self.assertFalse(source.read_source({"path": "myapp/docs/hdsd.md"}, None)["ok"])
+		self.assertEqual(source.resolve_safe_path("myapp/code.py"), self.code)
+		self.assertTrue(source.read_source({"path": "myapp/code.py"}, None)["ok"])
+
+	def test_manuals_directory_itself_still_resolves(self):
+		# E-7: check_manuals_dir needs the stored directory itself to pass resolve_safe_path.
+		self.assertEqual(source.resolve_safe_path("myapp/docs"), self.docs)
+		self.assertEqual(source.resolve_safe_path("myapp/docs/"), self.docs)
+		self.assertEqual(source.manuals_root(), self.docs)
+
+	def test_manuals_subdirectory_resolves_but_its_files_do_not(self):
+		# Files are refused (design-w0-fixes-4 điểm 5): an existing subdirectory of the manuals directory still resolves (E-7).
+		sub = os.path.join(self.docs, "vi")
+		self.sandbox.write("myapp/docs/vi/x.md", "# HDSD vi\n")
+		self.assertEqual(source.resolve_safe_path("myapp/docs/vi"), sub)
+		self.assertIsNone(source.resolve_safe_path("myapp/docs/vi/x.md"))
+		self.assertFalse(source.read_source({"path": "myapp/docs/vi/x.md"}, None)["ok"])
+		os.makedirs(os.path.join(self.root, "myapp", ".git"))
+		with patch(RUN_PATH, return_value=completed("ok")):
+			self.assertTrue(self.git("log", ["--", "docs/vi"])["ok"])
+			self.assertFalse(self.git("log", ["--", "docs/vi/x.md"])["ok"])
+
+	def test_new_path_inside_manuals_refused(self):
+		# design-w0-fixes-4 điểm 5: a path not yet on disk inside the store is refused like an existing file.
+		self.sandbox.write("myapp/docs/vi/x.md", "# HDSD vi\n")
+		for rel in (
+			"myapp/docs/new.md",
+			"myapp/docs/vi/new.md",
+			"myapp/docs/new_dir/deeper/new.md",
+			"myapp/docs/new_dir/",
+			"myapp/docs/./new.md",
+			"myapp/docs/vi/../new.md",
+			os.path.join(self.docs, "new.md"),
+		):
+			with self.subTest(rel=rel):
+				self.assertFalse(os.path.lexists(os.path.join(self.root, rel)))
+				self.assertIsNone(source.resolve_safe_path(rel))
+		self.assertFalse(source.read_source({"path": "myapp/docs/new.md"}, None)["ok"])
+		# The store itself, its existing subdirectory and new paths just outside it still resolve.
+		for rel, expected in (
+			("myapp/docs", self.docs),
+			("myapp/docs/", self.docs),
+			("myapp/docs/vi", os.path.join(self.docs, "vi")),
+			("myapp/docs-other/new.md", os.path.join(self.root, "myapp", "docs-other", "new.md")),
+			("myapp/docsnew.md", os.path.join(self.root, "myapp", "docsnew.md")),
+			("myapp/new.md", os.path.join(self.root, "myapp", "new.md")),
+			("myapp/docs/../new.md", os.path.join(self.root, "myapp", "new.md")),
+		):
+			with self.subTest(rel=rel):
+				self.assertEqual(source.resolve_safe_path(rel), expected)
+
+	def test_new_path_via_symlink_into_manuals_refused(self):
+		# The comparison uses the real path: a symlink leading into the store is refused for new paths too.
+		os.symlink(self.docs, os.path.join(self.root, "myapp", "docs_link"))
+		os.symlink(os.path.join(self.docs, "ghost.md"), os.path.join(self.root, "myapp", "ghost_link.md"))
+		for rel in ("myapp/docs_link/new.md", "myapp/docs_link/new_dir/new.md", "myapp/ghost_link.md"):
+			with self.subTest(rel=rel):
+				self.assertIsNone(source.resolve_safe_path(rel))
+		self.assertEqual(source.resolve_safe_path("myapp/docs_link"), self.docs)
+		# A symlink inside the store leading out of it: the new path's real location is outside, so it resolves.
+		pkg = os.path.join(self.root, "myapp", "pkg")
+		os.makedirs(pkg)
+		os.symlink(pkg, os.path.join(self.docs, "pkg_link"))
+		self.assertEqual(source.resolve_safe_path("myapp/docs/pkg_link/new.py"), os.path.join(pkg, "new.py"))
+
+	def test_search_source_skips_manuals(self):
+		result = source.search_source({"pattern": "needle"}, None)
+		self.assertTrue(result["ok"])
+		self.assertEqual([hit["path"] for hit in result["hits"]], ["myapp/code.py"])
+		scoped = source.search_source({"pattern": "needle", "app": "myapp/docs"}, None)
+		self.assertEqual(scoped, {"ok": True, "hits": []})
+
+	def test_git_source_refuses_manual_file(self):
+		os.makedirs(os.path.join(self.root, "myapp", ".git"))
+		with patch(RUN_PATH, return_value=completed("ok")) as run:
+			for sub, args in (
+				("blame", ["docs/hdsd.md"]),
+				("log", ["--", "docs/hdsd.md"]),
+				("log", ["HEAD:docs/hdsd.md"]),
+			):
+				with self.subTest(sub=sub, args=args):
+					self.assertFalse(self.git(sub, args)["ok"])
+			run.assert_not_called()
+			self.assertTrue(self.git("log", ["--", "code.py"])["ok"])
+			self.assertTrue(self.git("log", ["--", "docs"])["ok"])
+
+	def test_symlink_into_manuals_refused_and_out_of_manuals_allowed(self):
+		os.symlink(self.manual, os.path.join(self.root, "myapp", "into.md"))
+		os.symlink(self.code, os.path.join(self.docs, "out.py"))
+		self.assertIsNone(source.resolve_safe_path("myapp/into.md"))
+		self.assertEqual(source.resolve_manual_path("myapp/into.md"), self.manual)
+		self.assertEqual(source.resolve_safe_path("myapp/docs/out.py"), self.code)
+		self.assertIsNone(source.resolve_manual_path("myapp/docs/out.py"))
+
+	def test_symlinked_manuals_dir_excludes_its_real_files(self):
+		os.symlink(self.docs, os.path.join(self.root, "myapp", "docs_link"))
+		set_agent_settings(manuals_dir="myapp/docs_link")
+		self.assertEqual(source.manuals_root(), self.docs)
+		self.assertIsNone(source.resolve_safe_path("myapp/docs/hdsd.md"))
+
+	def test_empty_manuals_dir_excludes_nothing(self):
+		for value in ("", "   ", None):
+			with self.subTest(value=value):
+				set_agent_settings(manuals_dir=value)
+				self.assertIsNone(source.manuals_root())
+				self.assertEqual(source.resolve_safe_path("myapp/docs/hdsd.md"), self.manual)
+				self.assertIsNone(source.resolve_manual_path("myapp/docs/hdsd.md"))
+				self.assertTrue(source.read_source({"path": "myapp/docs/hdsd.md"}, None)["ok"])
+
+	def test_missing_or_unsafe_manuals_dir_has_no_root(self):
+		# Nothing crashes and nothing is excluded when the stored value is not a safe directory under apps/.
+		for value in (
+			"myapp/khong_co",
+			"myapp/docs/hdsd.md",
+			"../outside",
+			self.sandbox.outside,
+			"myapp/dir_out",
+			".",
+			"myapp/..",
+			self.root,
+		):
+			with self.subTest(value=value):
+				set_agent_settings(manuals_dir=value)
+				self.assertIsNone(source.manuals_root())
+				self.assertIsNone(source.resolve_manual_path("myapp/docs/hdsd.md"))
+				self.assertEqual(source.resolve_safe_path("myapp/code.py"), self.code)
+
+	def test_resolve_manual_path_only_inside(self):
+		self.assertEqual(source.resolve_manual_path("myapp/docs/hdsd.md"), self.manual)
+		self.assertEqual(source.resolve_manual_path(self.manual), self.manual)
+		self.sandbox.write("myapp/docs/.env", "x\n")
+		self.sandbox.write("myapp/docs/tool.exe", "x\n")
+		for rel in (
+			"myapp/code.py",
+			"myapp/docs",
+			"myapp/docs/../code.py",
+			"myapp/docs/../../../outside/plain.py",
+			os.path.join(self.sandbox.outside, "plain.py"),
+			"myapp/docs/.env",
+			"myapp/docs/tool.exe",
+			"",
+			"   ",
+			None,
+			"myapp/docs/hdsd.md\0",
+		):
+			with self.subTest(rel=rel):
+				self.assertIsNone(source.resolve_manual_path(rel))
 
 
 EXPECTED_LOGGER_NAME = "erp_ai.source"

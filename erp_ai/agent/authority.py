@@ -3,7 +3,7 @@ import json
 import frappe
 
 from erp_ai.agent.prompts import MAX_COMMENTS
-from erp_ai.constants import AGENT_USER, ROLE_INSTRUCTOR
+from erp_ai.constants import AGENT_USER, ROLE_INSTRUCTOR, TITLE_WRONG_USER, TRIGGER_COMMENT_MENTION
 
 ROLE_LABEL_INSTRUCTION = "chỉ thị"
 ROLE_LABEL_DATA = "dữ liệu"
@@ -13,6 +13,21 @@ NEVER_AUTHORITY = frozenset({"Administrator", "Guest", AGENT_USER})
 
 MIN_COMMENT_LIMIT = 1
 MAX_COMMENT_LIMIT = 50
+
+
+def enter_agent_session() -> bool:
+	"""ADR-033 QĐ 1: the only place a job switches its session to the agent account.
+
+	The previous user is not restored (the caller is a job). False (logged) means the caller must stop.
+	"""
+	if not frappe.db.get_value("User", AGENT_USER, "enabled"):
+		frappe.log_error(TITLE_WRONG_USER, "Không có tài khoản agent")
+		return False
+	frappe.set_user(AGENT_USER)
+	if frappe.session.user != AGENT_USER:
+		frappe.log_error(TITLE_WRONG_USER, f"Sai tài khoản: {frappe.session.user}")
+		return False
+	return True
 
 
 def ticket_comment_filters(ticket_name: str) -> dict:
@@ -66,15 +81,29 @@ def _assigned_by_other(author: str, ticket_name: str) -> bool:
 	)
 	if not todo or todo.status != "Open":
 		return False
-	return bool(todo.assigned_by) and todo.assigned_by != author
+	# ADR-030 QĐ 6: an assignment made by the bot itself never creates authority.
+	return bool(todo.assigned_by) and todo.assigned_by not in (author, AGENT_USER)
 
 
-def latest_instructor(ticket_name: str) -> str | None:
-	for comment in fetch_ticket_comments(ticket_name):
-		if is_instruction(comment["author"], ticket_name):
-			return comment["author"]
-	owner = frappe.db.get_value("HD Ticket", ticket_name, "owner")
-	return owner if is_instruction(owner, ticket_name) else None
+def run_instructor(ticket_name: str, trigger: str, comment_name: str | None = None) -> str | None:
+	"""ADR-030 QĐ 6: the instructor comes only from the event that queued the run (fail-closed, never raises).
+
+	A comment run reads the author (`owner`, set by the server) of exactly that comment; no other comment
+	is scanned. Any other trigger falls back to the ticket owner.
+	"""
+	if trigger == TRIGGER_COMMENT_MENTION:
+		author = _trigger_comment_author(ticket_name, comment_name)
+	else:
+		author = frappe.db.get_value("HD Ticket", ticket_name, "owner")
+	return author if is_instruction(author, ticket_name) else None
+
+
+def _trigger_comment_author(ticket_name: str, comment_name: str | None) -> str | None:
+	if not comment_name:
+		return None
+	return frappe.db.get_value(
+		"Comment", {"name": comment_name, **ticket_comment_filters(ticket_name)}, "owner"
+	)
 
 
 def label_comments(ticket_name: str, comments: list[dict]) -> list[dict]:

@@ -1,3 +1,4 @@
+import dataclasses
 import json
 from collections import Counter
 from datetime import datetime, timedelta
@@ -10,6 +11,7 @@ from frappe.utils.file_lock import LockTimeoutError
 from frappe.utils.synchronization import filelock
 
 from erp_ai import alerts, gateway
+from erp_ai.agent import policy
 from erp_ai.agent.runner import GENERIC_WRITE_TOOLS
 from erp_ai.agent.tools.site_api import FORBIDDEN_ROLES
 from erp_ai.constants import (
@@ -35,6 +37,7 @@ PRIVILEGE_ALERT_SETTLE_S = 300
 PRIVILEGE_ALERT_LOCK = "erp_ai_privilege_alert"
 PRIVILEGE_ALERT_LOCK_TIMEOUT_S = 60
 PRIVILEGE_CHANGES_SUBJECT = "Agent đã sửa bản ghi phân quyền"
+PERMISSION_SWITCHES_ON_SUBJECT = "Quyền mở rộng đang bật"
 UNKNOWN_INSTRUCTOR = "không rõ"
 # Marks a role entry whose role the tools refuse without the unrestricted switch; such entries are listed first.
 ADMIN_ROLE_MARK = "[QUẢN TRỊ] "
@@ -242,6 +245,18 @@ def _enabled_keys_without_value() -> list[str]:
 	return [row.label for row in rows if not row.api_key]
 
 
+def _enabled_permission_switches() -> list[str]:
+	"""Labels of the permission switches that are on, in the order (1)..(5); field names come only from policy."""
+	settings = frappe.get_single(SETTING_DOCTYPE)
+	switches = dataclasses.astuple(policy.permission_switches(settings))
+	meta = frappe.get_meta(SETTING_DOCTYPE)
+	return [
+		meta.get_label(field)
+		for field, on in zip(policy.PERMISSION_SWITCH_FIELDS, switches, strict=True)
+		if on
+	]
+
+
 def _raise_alarm(subject: str, names: list[str]) -> None:
 	"""Record and mail one alarm; an email failure is logged and must not stop later conditions."""
 	try:
@@ -262,7 +277,8 @@ def check_privilege_escalation(now: datetime | None = None) -> None:
 	Conditions: the agent account's roles (minus automatic ones) differ from {ERP AI Agent, Agent}
 	(extra or missing, or the account is gone); permission records the agent wrote, read from the ERP AI Log
 	rows created in (watermark, now - PRIVILEGE_ALERT_SETTLE_S]; enabled Server Script/Webhook owned by the
-	agent; an enabled key with an empty `api_key`. Messages list at most 5 names and never any key text.
+	agent; an enabled key with an empty `api_key`; any permission switch on (by label, ADR-030 QĐ 7).
+	Messages list at most 5 names and never any key text.
 	A failing alarm email is logged under TITLE_RUN_FAILED and the alarm Error Log is kept; the remaining
 	conditions still run. After every condition it advances the watermark to the upper bound (never back)
 	in the same transaction as the alarms, before the job's commit (ADR-024 QĐ 3.3, 3.5). On any error it
@@ -287,6 +303,8 @@ def _check_privilege_escalation_locked(now: datetime | None) -> None:
 			(PRIVILEGE_CHANGES_SUBJECT, lambda: _privilege_changes_by_agent(lower, upper)),
 			("Server Script/Webhook do agent tạo đang bật", _enabled_scripts_by_agent),
 			("Khóa đang bật nhưng không có giá trị", _enabled_keys_without_value),
+			# Daily, read-only: never reads or moves the watermark and writes no ERP AI Log row (ADR-030 QĐ 7).
+			(PERMISSION_SWITCHES_ON_SUBJECT, _enabled_permission_switches),
 		)
 		found = {}
 		for subject, find in checks:

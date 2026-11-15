@@ -4,8 +4,15 @@ import frappe
 from frappe.tests.utils import FrappeTestCase
 from helpdesk.test_utils import create_agent, create_contact, make_ticket, make_todo
 
-from erp_ai.agent import authority
-from erp_ai.constants import AGENT_USER, ROLE_INSTRUCTOR
+from erp_ai.agent import authority, runner
+from erp_ai.constants import (
+	AGENT_USER,
+	ROLE_INSTRUCTOR,
+	TRIGGER_CHANGE_ACTION,
+	TRIGGER_COMMENT_MENTION,
+	TRIGGER_TICKET_INSERT,
+)
+from erp_ai.test_utils import keep_agent_settings
 
 INSTRUCTOR = "authority.instructor@example.com"
 PLAIN = "authority.plain@example.com"
@@ -14,7 +21,7 @@ ASSIGNER = "authority.assigner@example.com"
 CONTACT = "authority.contact@example.com"
 
 
-class TestAuthority(FrappeTestCase):
+class AuthorityTestBase(FrappeTestCase):
 	def setUp(self):
 		self.addCleanup(frappe.db.rollback)
 		self.addCleanup(frappe.set_user, frappe.session.user)
@@ -50,6 +57,8 @@ class TestAuthority(FrappeTestCase):
 		frappe.db.set_value("Comment", name, "creation", creation, update_modified=False)
 		return name
 
+
+class TestAuthority(AuthorityTestBase):
 	def test_instructor_role_has_authority_on_any_ticket(self):
 		self.assertTrue(authority.is_instruction(INSTRUCTOR, self.ticket_p))
 		self.assertTrue(authority.is_instruction(INSTRUCTOR, self.ticket_q))
@@ -132,26 +141,13 @@ class TestAuthority(FrappeTestCase):
 		self.assertFalse(authority.is_instruction(contact, self.ticket_p))
 		self.assertFalse(authority.is_instruction(PLAIN, self.ticket_p))
 
-	def test_latest_instructor_prefers_latest_comment_then_owner(self):
-		frappe.db.set_value("HD Ticket", self.ticket_p, "owner", "Administrator")
-		self.assertIsNone(authority.latest_instructor(self.ticket_p))
-
-		frappe.db.set_value("HD Ticket", self.ticket_p, "owner", INSTRUCTOR)
-		self.assertEqual(authority.latest_instructor(self.ticket_p), INSTRUCTOR)
-
-		self._assign(self.ticket_p, ASSIGNEE, ASSIGNER)
-		self._comment(self.ticket_p, INSTRUCTOR, "2024-01-01 10:00:00")
-		self._comment(self.ticket_p, ASSIGNEE, "2024-01-02 10:00:00")
-		self._comment(self.ticket_p, PLAIN, "2024-01-03 10:00:00")
-		self.assertEqual(authority.latest_instructor(self.ticket_p), ASSIGNEE)
-
 	def test_spoofed_comment_author_fields_ignored(self):
 		frappe.db.set_value("HD Ticket", self.ticket_p, "owner", PLAIN)
 		name = self._comment(
 			self.ticket_p, PLAIN, "2024-01-01 10:00:00", comment_email=INSTRUCTOR, comment_by=INSTRUCTOR
 		)
 		self.assertEqual(frappe.db.get_value("Comment", name, "comment_email"), INSTRUCTOR)
-		self.assertIsNone(authority.latest_instructor(self.ticket_p))
+		self.assertIsNone(authority.run_instructor(self.ticket_p, TRIGGER_COMMENT_MENTION, name))
 
 		fetched = authority.fetch_ticket_comments(self.ticket_p)
 		self.assertEqual([c["author"] for c in fetched], [PLAIN])
@@ -191,7 +187,7 @@ class TestAuthority(FrappeTestCase):
 		)
 		self.assertEqual({c["author"] for c in fetched}, {ASSIGNEE})
 		self.assertEqual(len(authority.fetch_ticket_comments(self.ticket_p, limit=2)), 2)
-		self.assertIsNone(authority.latest_instructor(self.ticket_p))
+		self.assertIsNone(authority.run_instructor(self.ticket_p, TRIGGER_COMMENT_MENTION, legacy.name))
 		for edge in (1, 50):
 			self.assertLessEqual(len(authority.fetch_ticket_comments(self.ticket_p, limit=edge)), edge)
 		self.assertEqual(len(authority.fetch_ticket_comments(self.ticket_p, limit=1)), 1)
@@ -236,3 +232,166 @@ class TestAuthority(FrappeTestCase):
 		frappe.set_user(PLAIN)
 		fetched = authority.fetch_ticket_comments(self.ticket_p)
 		self.assertEqual([c["author"] for c in fetched], [ASSIGNEE])
+
+
+class TestRunInstructor(AuthorityTestBase):
+	"""ADR-030 QĐ 6 / AC-13: the instructor of a run comes only from the event that queued it."""
+
+	def setUp(self):
+		keep_agent_settings(self)
+		super().setUp()
+
+	def _mention(self, comment_name, ticket=None):
+		return authority.run_instructor(ticket or self.ticket_p, TRIGGER_COMMENT_MENTION, comment_name)
+
+	def _set_owner(self, owner):
+		frappe.db.set_value("HD Ticket", self.ticket_p, "owner", owner, update_modified=False)
+
+	def test_old_instructor_comment_does_not_lend_authority(self):
+		# The owner is an instructor too: a comment run must not fall back to the owner.
+		self._set_owner(INSTRUCTOR)
+		self._comment(self.ticket_p, INSTRUCTOR, "2024-01-01 10:00:00")
+		mention = self._comment(self.ticket_p, PLAIN, "2024-01-02 10:00:00")
+		self.assertIsNone(self._mention(mention))
+
+	def test_instructor_mention_is_instructor(self):
+		self._set_owner(PLAIN)
+		mention = self._comment(self.ticket_p, INSTRUCTOR, "2024-01-01 10:00:00")
+		# A newer comment by a plain agent is not the trigger and changes nothing.
+		self._comment(self.ticket_p, PLAIN, "2024-01-02 10:00:00")
+		self.assertEqual(self._mention(mention), INSTRUCTOR)
+
+	def test_assigned_by_agent_is_not_instruction(self):
+		self._assign(self.ticket_p, ASSIGNEE, AGENT_USER)
+		# The user is listed in `_assign` with an Open ToDo: only `assigned_by` decides.
+		self.assertIn(ASSIGNEE, frappe.parse_json(frappe.db.get_value("HD Ticket", self.ticket_p, "_assign")))
+		self.assertFalse(authority.is_instruction(ASSIGNEE, self.ticket_p))
+		mention = self._comment(self.ticket_p, ASSIGNEE, "2024-01-01 10:00:00")
+		self.assertIsNone(self._mention(mention))
+
+		# Assigned by the bot, but holding the role: the role decides, not the assignment.
+		self._assign(self.ticket_p, INSTRUCTOR, AGENT_USER)
+		mention = self._comment(self.ticket_p, INSTRUCTOR, "2024-01-02 10:00:00")
+		self.assertEqual(self._mention(mention), INSTRUCTOR)
+
+	def test_assigned_by_another_person_is_instruction(self):
+		todo = self._assign(self.ticket_p, ASSIGNEE, ASSIGNER, creation="2024-01-01 10:00:00")
+		self.assertTrue(authority.is_instruction(ASSIGNEE, self.ticket_p))
+		mention = self._comment(self.ticket_p, ASSIGNEE, "2024-01-01 11:00:00")
+		self.assertEqual(self._mention(mention), ASSIGNEE)
+
+		# A newer ToDo from the bot replaces the person's assignment.
+		self._assign(self.ticket_p, ASSIGNEE, AGENT_USER, creation="2024-01-02 10:00:00")
+		self.assertFalse(authority.is_instruction(ASSIGNEE, self.ticket_p))
+		self.assertIsNone(self._mention(mention))
+		frappe.db.set_value("ToDo", todo, "creation", "2024-01-03 10:00:00", update_modified=False)
+		self.assertEqual(self._mention(mention), ASSIGNEE)
+
+	def test_thirty_one_comments_do_not_change_result(self):
+		instructor_mention = self._comment(self.ticket_p, INSTRUCTOR, "2024-01-01 09:00:00")
+		for minute in range(31):
+			self._comment(self.ticket_p, PLAIN, f"2024-01-02 10:{minute:02d}:00")
+		self.assertEqual(self._mention(instructor_mention), INSTRUCTOR)
+
+		plain_mention = self._comment(self.ticket_p, PLAIN, "2024-01-03 09:00:00")
+		for minute in range(31):
+			self._comment(self.ticket_p, INSTRUCTOR, f"2024-01-04 10:{minute:02d}:00")
+		self.assertIsNone(self._mention(plain_mention))
+		self.assertEqual(self._mention(instructor_mention), INSTRUCTOR)
+
+	def test_bad_comment_reference_gives_none(self):
+		# The owner is an instructor: every bad reference must give None, never fall back to the owner.
+		self._set_owner(INSTRUCTOR)
+		for missing in (None, "", "no-such-comment"):
+			self.assertIsNone(self._mention(missing), repr(missing))
+
+		other_ticket = self._comment(self.ticket_q, INSTRUCTOR, "2024-01-01 10:00:00")
+		self.assertIsNone(self._mention(other_ticket))
+		self.assertEqual(self._mention(other_ticket, ticket=self.ticket_q), INSTRUCTOR)
+
+		info = self._comment(self.ticket_p, INSTRUCTOR, "2024-01-02 10:00:00", comment_type="Info")
+		self.assertIsNone(self._mention(info))
+
+		other_doctype = self._comment(self.ticket_p, INSTRUCTOR, "2024-01-03 10:00:00")
+		self.assertEqual(self._mention(other_doctype), INSTRUCTOR)
+		frappe.db.set_value("Comment", other_doctype, "reference_doctype", "ToDo", update_modified=False)
+		self.assertIsNone(self._mention(other_doctype))
+
+	def test_other_trigger_uses_valid_owner_only(self):
+		plain_comment = self._comment(self.ticket_p, PLAIN, "2024-01-01 10:00:00")
+		instructor_comment = self._comment(self.ticket_p, INSTRUCTOR, "2024-01-02 10:00:00")
+
+		self._set_owner(INSTRUCTOR)
+		for trigger in (TRIGGER_TICKET_INSERT, TRIGGER_CHANGE_ACTION):
+			self.assertEqual(authority.run_instructor(self.ticket_p, trigger), INSTRUCTOR, trigger)
+			# A comment name is ignored outside the comment trigger.
+			self.assertEqual(
+				authority.run_instructor(self.ticket_p, trigger, plain_comment), INSTRUCTOR, trigger
+			)
+
+		for owner in (PLAIN, "Administrator", AGENT_USER):
+			self._set_owner(owner)
+			self.assertIsNone(authority.run_instructor(self.ticket_p, TRIGGER_TICKET_INSERT), owner)
+			self.assertIsNone(
+				authority.run_instructor(self.ticket_p, TRIGGER_TICKET_INSERT, instructor_comment), owner
+			)
+
+		self._set_owner(ASSIGNEE)
+		todo = self._assign(self.ticket_p, ASSIGNEE, AGENT_USER)
+		self.assertIsNone(authority.run_instructor(self.ticket_p, TRIGGER_TICKET_INSERT))
+		frappe.db.set_value("ToDo", todo, "assigned_by", ASSIGNER)
+		self.assertEqual(authority.run_instructor(self.ticket_p, TRIGGER_TICKET_INSERT), ASSIGNEE)
+
+
+class TestEnterAgentSession(FrappeTestCase):
+	"""ADR-033 QĐ 1 / U1.md: the one place a job switches its session to the agent account."""
+
+	def setUp(self):
+		keep_agent_settings(self)
+		self.addCleanup(frappe.db.rollback)
+		self.addCleanup(frappe.set_user, frappe.session.user)
+		frappe.set_user("Administrator")
+		frappe.db.set_value("User", AGENT_USER, "enabled", 1)
+
+	def _enter(self):
+		with patch.object(frappe, "log_error") as log_error:
+			entered = authority.enter_agent_session()
+		return entered, log_error
+
+	def test_switches_to_agent(self):
+		entered, log_error = self._enter()
+
+		self.assertIs(entered, True)
+		self.assertEqual(frappe.session.user, AGENT_USER)
+		log_error.assert_not_called()
+
+	def test_disabled_agent_refused_and_logged(self):
+		frappe.db.set_value("User", AGENT_USER, "enabled", 0)
+
+		entered, log_error = self._enter()
+
+		self.assertIs(entered, False)
+		log_error.assert_called_once_with(authority.TITLE_WRONG_USER, "Không có tài khoản agent")
+		self.assertEqual(frappe.session.user, "Administrator")
+
+	def test_missing_agent_refused_and_logged(self):
+		with patch.object(authority, "AGENT_USER", "authority.missing.agent@example.com"):
+			entered, log_error = self._enter()
+
+		self.assertIs(entered, False)
+		log_error.assert_called_once_with(authority.TITLE_WRONG_USER, "Không có tài khoản agent")
+		self.assertEqual(frappe.session.user, "Administrator")
+
+	def test_session_not_switched_refused_and_logged(self):
+		with patch.object(frappe, "set_user") as set_user:
+			entered, log_error = self._enter()
+
+		set_user.assert_called_once_with(AGENT_USER)
+		self.assertIs(entered, False)
+		log_error.assert_called_once_with(authority.TITLE_WRONG_USER, "Sai tài khoản: Administrator")
+		self.assertEqual(frappe.session.user, "Administrator")
+
+	def test_title_is_the_runner_title(self):
+		# The title moved here; the old name `runner.TITLE_WRONG_USER` stays the same object (U1.md:264).
+		self.assertIs(runner.TITLE_WRONG_USER, authority.TITLE_WRONG_USER)
+		self.assertEqual(authority.TITLE_WRONG_USER, "erp_ai: sai tài khoản job")

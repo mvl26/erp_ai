@@ -9,7 +9,7 @@ import frappe
 from frappe.tests.utils import FrappeTestCase
 from helpdesk.test_utils import make_ticket
 
-from erp_ai.agent import runner
+from erp_ai.agent import ops_data, runner
 from erp_ai.agent.classification import DEFAULT_CATEGORY_MAPPING
 from erp_ai.agent.prompts import build_classify_request
 from erp_ai.agent.routing import decide_route
@@ -281,7 +281,9 @@ class TestRunEval(FrappeTestCase):
 
 
 def classify_reply(category):
-	return make_model_result(text=json.dumps({"dau_muc": category, "do_tin_cay": "Cao", "ly_do": "x"}))
+	return make_model_result(
+		text=json.dumps({"dau_muc": category, "do_tin_cay": "Cao", "do_tin_cay_pct": 90, "ly_do": "x"})
+	)
 
 
 def scored_reply(category, complexity, importance, output_tokens, stop_reason="end_turn"):
@@ -289,6 +291,7 @@ def scored_reply(category, complexity, importance, output_tokens, stop_reason="e
 		{
 			"dau_muc": category,
 			"do_tin_cay": "Cao",
+			"do_tin_cay_pct": 90,
 			"ly_do": "x",
 			"do_phuc_tap": complexity,
 			"do_quan_trong": importance,
@@ -561,3 +564,24 @@ class TestRunEvalRun(FrappeTestCase):
 			self._run(FakeGateway())
 
 		self.assertIn("line 2", str(ctx.exception))
+
+
+class TestCategoryRuleShared(FrappeTestCase):
+	"""run_eval and ops_data must put a ticket type in the same category (design-w0-fixes-2 section 3)."""
+
+	def test_expected_category_agrees_with_ops_data(self):
+		colliding = {"C": {"ticket_type": "X"}, "A": {"ticket_type": "X"}, "B": {"ticket_type": "Y"}}
+		mappings = {
+			"colliding": colliding,
+			"colliding, keys reversed": dict(reversed(list(colliding.items()))),
+			"default": DEFAULT_CATEGORY_MAPPING,
+		}
+		for label, mapping in mappings.items():
+			reverse_map = ops_data.category_by_ticket_type(mapping)
+			ticket_types = [entry.get("ticket_type") for entry in mapping.values()] + ["", "Unknown"]
+			for ticket_type in ticket_types:
+				with self.subTest(mapping=label, ticket_type=ticket_type):
+					self.assertEqual(
+						run_eval._expected_category(ticket_type, mapping),
+						ops_data.ticket_category({"ticket_type": ticket_type}, reverse_map),
+					)

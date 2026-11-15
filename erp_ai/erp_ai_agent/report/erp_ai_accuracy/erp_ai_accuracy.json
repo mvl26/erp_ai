@@ -6,7 +6,7 @@
  "doctype": "Report",
  "idx": 0,
  "is_standard": "Yes",
- "modified": "2026-11-11 12:00:00.000000",
+ "modified": "2026-11-14 12:00:02.000000",
  "modified_by": "Administrator",
  "module": "ERP AI agent",
  "name": "ERP AI Accuracy",
@@ -18,6 +18,9 @@
  "roles": [
   {
    "role": "System Manager"
+  },
+  {
+   "role": "ERP AI Instructor"
   }
  ]
 }

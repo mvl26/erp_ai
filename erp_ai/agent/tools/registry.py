@@ -6,7 +6,18 @@ from typing import Literal
 
 import frappe
 
+from erp_ai.agent.policy import PermissionSwitches
 from erp_ai.constants import LEVELS
+
+
+@dataclass(frozen=True)
+class GrantInputs:
+	effective_level: str
+	main_path_level: str
+	has_instructor: bool
+	switches: PermissionSwitches
+	over_budget: bool = False
+	below_threshold: bool = False
 
 
 @dataclass(frozen=True)
@@ -21,6 +32,30 @@ class ToolContext:
 	change_enabled: bool = False
 	allowed_apps: tuple[str, ...] = ()
 	unrestricted: bool = False
+	record_tools: bool = False
+	act_now: bool = False
+	one_click_approval: bool = False
+	over_budget: bool = False
+	main_path_level: str | None = None
+	below_threshold: bool = False
+
+	def grant_inputs(self) -> GrantInputs:
+		switches = PermissionSwitches(
+			unrestricted=self.unrestricted,
+			# temporary bridge, removed in T82, source design-w1-fixes-3.md Điểm 1
+			record_tools=self.record_tools or self.change_enabled,
+			act_now=self.act_now,
+			code_change=self.change_enabled,
+			one_click_approval=self.one_click_approval,
+		)
+		return GrantInputs(
+			effective_level=self.effective_level,
+			main_path_level=self.effective_level if self.main_path_level is None else self.main_path_level,
+			has_instructor=bool(self.instructor),
+			switches=switches,
+			over_budget=self.over_budget,
+			below_threshold=self.below_threshold,
+		)
 
 
 @dataclass(frozen=True)
@@ -29,6 +64,22 @@ class ToolSpec:
 	group: Literal["read", "ticket_write", "task_write", "change_propose", "site_admin", "site_unrestricted"]
 	schema: dict
 	handler: Callable[[dict, ToolContext], dict]
+
+
+@dataclass(frozen=True)
+class Grant:
+	specs: tuple[ToolSpec, ...]
+	change_block: bool = False
+	record_block: bool = False
+	unrestricted_block: bool = False
+	act_now_block: bool = False
+	ask_only_block: bool = False
+
+	def schemas(self) -> list[dict]:
+		return [copy.deepcopy(spec.schema) for spec in self.specs]
+
+	def names(self) -> frozenset[str]:
+		return frozenset(spec.name for spec in self.specs)
 
 
 TOOL_MODULES = (
@@ -43,39 +94,49 @@ KEY_REASON_MAX = 100  # model-supplied argument names are cut so reason stays sh
 CHANGE_GROUP = "change_propose"
 SITE_ADMIN_GROUP = "site_admin"
 UNRESTRICTED_GROUP = "site_unrestricted"
+# The only ticket_write tools left below the confidence threshold (U1.md:158).
+ASK_TOOL_NAMES = frozenset({"post_comment"})
 
 
-def _unrestricted_grant(level: str, has_instructor: bool, unrestricted: bool) -> bool:
-	# The full-power switch: any level above L0 (so also L1 after a budget cut), with an instructor.
-	return unrestricted and level != LEVELS[0] and has_instructor
+def unrestricted_granted(inputs: GrantInputs) -> bool:
+	# The full-power switch: any level above L0, with an instructor, never over budget or below threshold.
+	return (
+		inputs.switches.unrestricted
+		and inputs.effective_level in LEVELS[1:]
+		and inputs.has_instructor
+		and not inputs.over_budget
+		and not inputs.below_threshold
+	)
 
 
-# ADR-011 QĐ 2, 6 and ADR-023 QĐ 4: the only grant table, one row per group, checked above L0:
-# group -> condition on (effective_level, has_instructor, change_enabled, unrestricted).
+# ADR-011 QĐ 2, 6, ADR-023 QĐ 4 and ADR-030 QĐ 3: the only grant table, one row per group, checked
+# above L0: (group, Callable[[GrantInputs], bool]).
 GRANT_TABLE = (
-	("read", lambda level, has_instructor, change_enabled, unrestricted: True),
-	("ticket_write", lambda level, has_instructor, change_enabled, unrestricted: True),
-	("task_write", lambda level, has_instructor, change_enabled, unrestricted: has_instructor),
+	("read", lambda inputs: True),
+	("ticket_write", lambda inputs: not inputs.below_threshold),
+	(
+		"task_write",
+		lambda inputs: inputs.has_instructor
+		and inputs.main_path_level in LEVELS[1:]
+		and not inputs.below_threshold,
+	),
 	(
 		CHANGE_GROUP,
-		lambda level, has_instructor, change_enabled, unrestricted: (
-			change_enabled and level == "L3" and has_instructor
-		),
+		lambda inputs: inputs.switches.code_change
+		and inputs.effective_level == "L3"
+		and inputs.has_instructor
+		and not inputs.below_threshold,
 	),
-	# Generic record tools (site_api.py): the change tools' switch, level and authority, or full power.
+	# Generic record tools (site_api.py): the record-tools switch, level and authority, or full power.
 	(
 		SITE_ADMIN_GROUP,
-		lambda level, has_instructor, change_enabled, unrestricted: (
-			(change_enabled and level == "L3" and has_instructor)
-			or _unrestricted_grant(level, has_instructor, unrestricted)
-		),
+		lambda inputs: (
+			(inputs.switches.record_tools and inputs.effective_level == "L3" and inputs.has_instructor)
+			or unrestricted_granted(inputs)
+		)
+		and not inputs.below_threshold,
 	),
-	(
-		UNRESTRICTED_GROUP,
-		lambda level, has_instructor, change_enabled, unrestricted: _unrestricted_grant(
-			level, has_instructor, unrestricted
-		),
-	),
+	(UNRESTRICTED_GROUP, unrestricted_granted),
 )
 
 
@@ -87,30 +148,55 @@ def _all_specs() -> list[ToolSpec]:
 	return specs
 
 
-def _granted_specs(
+def grant(inputs: GrantInputs) -> Grant:
+	"""The one grant function: the granted specs, in _all_specs() order, and the prompt block flags."""
+	if inputs.effective_level not in LEVELS or inputs.effective_level == LEVELS[0]:
+		return Grant(specs=())
+	groups = {group for group, condition in GRANT_TABLE if condition(inputs)}
+	# Below the threshold only the ask tools of ticket_write are added back (U1.md:179 step 3).
+	specs = tuple(
+		spec
+		for spec in _all_specs()
+		if spec.group in groups
+		or (inputs.below_threshold and spec.group == "ticket_write" and spec.name in ASK_TOOL_NAMES)
+	)
+	unrestricted_block = UNRESTRICTED_GROUP in groups
+	# U1.md:181-187: the full-power block replaces the record block; act-now needs a power group.
+	return Grant(
+		specs=specs,
+		change_block=CHANGE_GROUP in groups,
+		record_block=SITE_ADMIN_GROUP in groups and not unrestricted_block,
+		unrestricted_block=unrestricted_block,
+		act_now_block=inputs.switches.act_now
+		and bool(groups & {CHANGE_GROUP, SITE_ADMIN_GROUP, UNRESTRICTED_GROUP}),
+		ask_only_block=inputs.below_threshold,
+	)
+
+
+def _legacy_inputs(
 	effective_level: str, has_instructor: bool, change_enabled: bool, unrestricted: bool = False
-) -> list[ToolSpec]:
-	if effective_level not in LEVELS or effective_level == LEVELS[0]:
-		return []
-	groups = {
-		group
-		for group, condition in GRANT_TABLE
-		if condition(effective_level, has_instructor, change_enabled, unrestricted)
-	}
-	return [spec for spec in _all_specs() if spec.group in groups]
+) -> GrantInputs:
+	# The old four-argument callers until T82: (2) and (4) both follow change_enabled; (3), (5) off.
+	return GrantInputs(
+		effective_level=effective_level,
+		main_path_level=effective_level,
+		has_instructor=has_instructor,
+		switches=PermissionSwitches(
+			unrestricted=unrestricted, record_tools=change_enabled, code_change=change_enabled
+		),
+	)
 
 
 def get_tool_schemas(
 	effective_level: str, has_instructor: bool, change_enabled: bool, unrestricted: bool = False
 ) -> list[dict]:
-	granted = _granted_specs(effective_level, has_instructor, change_enabled, unrestricted)
-	return [copy.deepcopy(spec.schema) for spec in granted]
+	return grant(_legacy_inputs(effective_level, has_instructor, change_enabled, unrestricted)).schemas()
 
 
 def _grants_group(
 	group: str, effective_level: str, has_instructor: bool, change_enabled: bool, unrestricted: bool
 ) -> bool:
-	granted = _granted_specs(effective_level, has_instructor, change_enabled, unrestricted)
+	granted = grant(_legacy_inputs(effective_level, has_instructor, change_enabled, unrestricted)).specs
 	return any(spec.group == group for spec in granted)
 
 
@@ -184,9 +270,7 @@ def _first_invalid_key(arguments, input_schema: dict) -> str | None:
 
 
 def execute_tool(name: str, arguments: dict, context: ToolContext) -> dict:
-	granted = _granted_specs(
-		context.effective_level, bool(context.instructor), context.change_enabled, context.unrestricted
-	)
+	granted = grant(context.grant_inputs()).specs
 	spec = next((s for s in granted if s.name == name), None)
 	if spec is None:
 		return {"ok": False, "reason": "tool không được cấp ở mức/thẩm quyền hiện tại"}

@@ -45,7 +45,7 @@
   {
    "description": "Hệ thống tự ghi, không sửa được. Nội dung tin nhắn, lưu dạng chữ thường, không có thẻ HTML.",
    "fieldname": "content",
-   "fieldtype": "Long Text",
+   "fieldtype": "Code",
    "label": "Nội dung",
    "read_only": 1,
    "reqd": 1

@@ -19,7 +19,7 @@ JSON_PATH = Path(__file__).resolve().parent / "erp_ai_message.json"
 FIELD_TYPES = {
 	"ticket": "Link",
 	"kind": "Select",
-	"content": "Long Text",
+	"content": "Code",
 	"run_id": "Data",
 	"proposal": "Link",
 	"source_comment": "Data",

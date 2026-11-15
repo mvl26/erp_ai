@@ -4,6 +4,7 @@ from contextlib import ExitStack
 from unittest.mock import MagicMock, patch
 
 import frappe
+from frappe.core.utils import html_to_plain_text
 from frappe.model.document import Document
 from frappe.tests.utils import FrappeTestCase
 from helpdesk.test_utils import make_ticket
@@ -289,7 +290,9 @@ class TestCommentHandler(HandlerTestCase):
 		self.assertEqual(rows[0].kind, "chat")
 		self.assertEqual(rows[0].source_comment, comment.name)
 		self.assertEqual(rows[0].owner, comment.owner)
-		self.assertNotIn("<", rows[0].content)
+		# stored verbatim (Code field): the markup stripping is html_to_plain_text's job
+		self.assertEqual(rows[0].content, html_to_plain_text(comment.content))
+		self.assertNotIn("<b>", rows[0].content)
 		self.assertIn("giúp", rows[0].content)
 		jobs = self._jobs()
 		self.assertEqual(len(jobs), 1)

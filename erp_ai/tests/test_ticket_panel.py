@@ -522,7 +522,7 @@ class TestTicketPanelSend(FrappeTestCase):
 		return logger
 
 	def test_send_creates_one_chat_message_owned_by_sender(self):
-		text = "  Question & more\nsecond line  "
+		text = "  <b>Question</b> & more < x\nsecond line  "
 		before = frappe.db.count("Comment")
 		result = self._send(text)
 		self.assertEqual(list(result), ["message"])

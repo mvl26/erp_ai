@@ -56,6 +56,12 @@ class TestMessages(FrappeTestCase):
 		name = add_message(self.ticket, "trả lời", MESSAGE_KIND_CHAT)
 		self.assertTrue(frappe.db.exists(MESSAGE_DOCTYPE, name))
 
+	def test_content_with_markup_stored_verbatim(self):
+		text = "<b>x</b> & y < z"
+		name = add_message(self.ticket, text, MESSAGE_KIND_CHAT, trusted=True)
+		self.assertEqual(frappe.db.get_value(MESSAGE_DOCTYPE, name, "content"), text)
+		self.assertEqual(thread(self.ticket)[-1]["text"], text)
+
 	def test_rejects_unknown_kind_and_blank_content(self):
 		for kind, content in (("note", "x"), (MESSAGE_KIND_CHAT, "  "), (MESSAGE_KIND_CHAT, None)):
 			with self.subTest(kind=kind, content=content), self.assertRaises(ValueError):

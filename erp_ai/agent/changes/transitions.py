@@ -130,10 +130,12 @@ def content_digest(doc) -> str:
 	"""sha256 hex of the JSON list of the 14 design 2.3 fields (`ensure_ascii=False`), as stored on `doc`.
 
 	A block proposal (CHG-002 design 2.4) appends the list of its child rows in `idx` order, each as
-	`OPERATION_DIGEST_FIELDS`, then its `command_list`; the old shape keeps its digest byte for byte.
+	`OPERATION_DIGEST_FIELDS`, then its `command_list`; the old shape keeps its digest byte for byte and
+	only for its two kinds (A3 RQ-5).
 
 	Raises:
-		ValueError: `doc` is not an ERP AI Change Proposal.
+		ValueError: `doc` is not an ERP AI Change Proposal, or it has the old shape and a `change_kind`
+			other than a file change or a bench command.
 	"""
 	_require_proposal(doc)
 	values = [doc.get(fieldname) for fieldname in DIGEST_FIELDS]
@@ -141,6 +143,8 @@ def content_digest(doc) -> str:
 		rows = sorted(doc.get("operations") or [], key=lambda row: row.idx)
 		values.append([[row.get(fieldname) for fieldname in OPERATION_DIGEST_FIELDS] for row in rows])
 		values.append(doc.get("command_list"))
+	else:
+		block.require_code_kind(doc)
 	return hashlib.sha256(json.dumps(values, ensure_ascii=False).encode("utf-8")).hexdigest()
 
 

@@ -1,4 +1,5 @@
 import json
+from typing import ClassVar
 from unittest.mock import MagicMock, patch
 
 import frappe
@@ -7,7 +8,7 @@ from helpdesk.test_utils import create_agent, make_ticket, make_todo
 from helpdesk.utils import is_agent
 
 from erp_ai import ticket_panel
-from erp_ai.agent import answer_delay, runner
+from erp_ai.agent import answer_delay, policy, runner
 from erp_ai.agent.policy import contains_keyword
 from erp_ai.agent.queue import PENDING_JOB_IDS_FLAG
 from erp_ai.agent.run_log import write_entry
@@ -563,6 +564,8 @@ class TestTicketPanelGateParity(FrappeTestCase):
 	INSTRUCTOR_EMAIL = "panel.instructor@example.com"
 	SAVEPOINT = "erp_ai_gate_parity"
 	RUN_ROUTE = "erp_ai.agent.runner.run_for_ticket"
+	SPEND_BY_BRANCH: ClassVar[dict] = {"over_budget": 2.0}
+	LEVEL_BY_BRANCH: ClassVar[dict] = {"over_budget": "L1", "instructor_role": "L2", "assignee": "L2"}
 
 	def setUp(self):
 		# Cleanups run LIFO: set_user, rollback, then the roles cache that the rollback leaves stale.
@@ -587,6 +590,9 @@ class TestTicketPanelGateParity(FrappeTestCase):
 		enqueue_patch = patch.object(frappe, "enqueue")
 		self.enqueue = enqueue_patch.start()
 		self.addCleanup(enqueue_patch.stop)
+		month_spend_patch = patch.object(policy, "month_spend_usd", return_value=0.0)
+		self.month_spend = month_spend_patch.start()
+		self.addCleanup(month_spend_patch.stop)
 
 		if not frappe.db.exists("Role", ROLE_INSTRUCTOR):
 			frappe.get_doc({"doctype": "Role", "role_name": ROLE_INSTRUCTOR}).insert(ignore_permissions=True)
@@ -604,7 +610,7 @@ class TestTicketPanelGateParity(FrappeTestCase):
 			"permission_level": "L1",
 			"max_runs_per_ticket_per_day": 5,
 			"max_turns_per_run": 4,
-			"monthly_budget_usd": 0,
+			"monthly_budget_usd": 1,
 			"spent_this_month_usd": 0,
 			"excluded_teams": "",
 		}
@@ -666,7 +672,7 @@ class TestTicketPanelGateParity(FrappeTestCase):
 				None,
 			),
 			"over_budget": (
-				{**l1, "permission_level": "L2", "monthly_budget_usd": 1, "spent_this_month_usd": 2},
+				{**l1, "permission_level": "L2"},
 				{},
 				0,
 				False,
@@ -713,8 +719,17 @@ class TestTicketPanelGateParity(FrappeTestCase):
 			]
 		finally:
 			frappe.set_user("Administrator")
-		for job in jobs:
-			runner.run_for_ticket(job["ticket_name"], job["trigger"])
+		real_effective_level = policy.effective_level
+		levels = []
+
+		def record_level(*args, **kwargs):
+			level = real_effective_level(*args, **kwargs)
+			levels.append(level)
+			return level
+
+		with patch.object(policy, "effective_level", side_effect=record_level):
+			for job in jobs:
+				runner.run_for_ticket(job["ticket_name"], job["trigger"])
 		frappe.set_user("Administrator")
 		entries = [
 			row
@@ -735,6 +750,7 @@ class TestTicketPanelGateParity(FrappeTestCase):
 			"log": [(e.entry_type, e.trigger, e.turn, e.stop_reason, e.instructor) for e in entries],
 			"decisions": [line for line in decisions if line.startswith("erp_ai handler ")],
 			"comment": frappe.db.get_value("Comment", content_of, ["owner", "comment_type", "content"]),
+			"levels": levels,
 		}
 		frappe.flags.pop(PENDING_JOB_IDS_FLAG, None)
 		frappe.db.rollback(save_point=self.SAVEPOINT)
@@ -769,6 +785,7 @@ class TestTicketPanelGateParity(FrappeTestCase):
 				def panel():
 					return ticket_panel.send_message(ticket, self.TEXT)["comment"]
 
+				self.month_spend.return_value = self.SPEND_BY_BRANCH.get(name, 0.0)
 				via_box = self._decision(ticket, user, comments_box, results)
 				via_panel = self._decision(ticket, user, panel, results)
 
@@ -783,3 +800,5 @@ class TestTicketPanelGateParity(FrappeTestCase):
 				)
 				if name in ("excluded_group", "ai_opt_out"):
 					self.assertEqual(self.gateway.call_count, 0)
+				if name in self.LEVEL_BY_BRANCH:
+					self.assertEqual(set(via_panel["levels"]), {self.LEVEL_BY_BRANCH[name]})

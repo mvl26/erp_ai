@@ -3060,13 +3060,11 @@ class TestRunnerGrant(RunnerTestBase):
 			monthly_budget_usd=1000,
 		)
 
-	def _comment(self, author):
-		previous = frappe.session.user
-		frappe.set_user(author)
-		try:
-			return frappe.get_doc("HD Ticket", self.ticket.name).add_comment("Comment", "x").name
-		finally:
-			frappe.set_user(previous)
+	def _comment(self, author, creation):
+		"""A human Comment on the ticket whose server-set author (`owner`) is `author`."""
+		name = frappe.get_doc("HD Ticket", self.ticket.name).add_comment("Comment", "x").name
+		frappe.db.set_value("Comment", name, {"owner": author, "creation": creation}, update_modified=False)
+		return name
 
 	def _offered_groups(self, call):
 		groups = {spec.name: spec.group for spec in registry._all_specs()}
@@ -3080,8 +3078,8 @@ class TestRunnerGrant(RunnerTestBase):
 		make_instructor(self)
 		plain = make_active_agent(self)
 		set_agent_settings(permission_level="L3", code_change_enabled=1, record_tools_enabled=1)
-		instructor_comment = self._comment(INSTRUCTOR)
-		plain_comment = self._comment(plain)
+		instructor_comment = self._comment(INSTRUCTOR, "2024-01-01 10:00:00")
+		plain_comment = self._comment(plain, "2024-01-02 10:00:00")
 
 		runner.run_for_ticket(self.ticket.name, "comment_mention", plain_comment)
 

@@ -1,15 +1,30 @@
+import dataclasses
+import json
+
 import frappe
 from frappe.utils import escape_html, now_datetime
 
 from erp_ai.agent import policy, site_facts
 from erp_ai.agent.classification import Classification
-from erp_ai.agent.routing import decide_route
+from erp_ai.agent.routing import RouteDecision, decide_route
 from erp_ai.agent.tools.registry import ToolContext, ToolSpec
-from erp_ai.constants import CATEGORIES, CLASSIFIED_BY_AI, CLASSIFIED_BY_HUMAN, CONFIDENCE_VALUES
+from erp_ai.constants import (
+	CATEGORIES,
+	CLASSIFICATION_FIELDS,
+	CLASSIFIED_BY_AI,
+	CLASSIFIED_BY_HUMAN,
+	CONFIDENCE_VALUES,
+	LOGGER_NAME,
+)
 
 TICKET_DOCTYPE = "HD Ticket"
 TASK_DOCTYPE = "Task"
 HINT_FIELD = "ai_resolution_hint"
+# Written by handlers.ticket_validate at creation; erp_ai.agent may not import erp_ai.handlers (LAYER_RULES).
+CREATED_LABELS_FIELD = "ai_created_labels"
+REASON_HUMAN_FILLED = "người đã điền lúc tạo phiếu"
+# A broken record reads fail-closed: every classification field counts as filled by the person.
+_EVERY_FIELD_HUMAN = dict.fromkeys(CLASSIFICATION_FIELDS, True)
 # Target field -> DocType holding its allowed values (design 3.5).
 LINKED_DOCTYPES = {
 	"ticket_type": "HD Ticket Type",
@@ -40,6 +55,32 @@ def _existing_values(wanted: dict, reasons: dict | None = None) -> tuple[dict, l
 	return values, skipped
 
 
+def created_labels(raw: str | None) -> dict:
+	"""The classification fields a person typed at creation, read from `ai_created_labels`; empty → {}.
+
+	Broken JSON, a value that is not a dict or a key outside CLASSIFICATION_FIELDS → all three (fail-closed);
+	the caller logs the warning, it knows the ticket.
+	"""
+	if not raw:
+		return {}
+	try:
+		labels = json.loads(raw)
+	except (TypeError, ValueError):
+		return dict(_EVERY_FIELD_HUMAN)
+	if not isinstance(labels, dict) or not set(labels) <= set(CLASSIFICATION_FIELDS):
+		return dict(_EVERY_FIELD_HUMAN)
+	return labels
+
+
+def keep_human_fields(decision: RouteDecision, labels: dict) -> RouteDecision:
+	"""`decision` with every field of `labels` emptied and noted REASON_HUMAN_FILLED; the rest unchanged."""
+	filled = [field for field in CLASSIFICATION_FIELDS if field in labels]
+	if not filled:
+		return decision
+	notes = (*decision.notes, *({"field": field, "reason": REASON_HUMAN_FILLED} for field in filled))
+	return dataclasses.replace(decision, **dict.fromkeys(filled), notes=notes)
+
+
 def _mapped_values(doc, args: dict, ctx: ToolContext) -> tuple[dict, list]:
 	classification = Classification(
 		category=args["category"],
@@ -47,14 +88,20 @@ def _mapped_values(doc, args: dict, ctx: ToolContext) -> tuple[dict, list]:
 		complexity=doc.ai_complexity or 0,
 		importance=doc.ai_importance or 0,
 	)
-	decision = decide_route(
-		classification,
-		doc.subject,
-		ctx.category_mapping,
-		ctx.routing_config or {},
-		team_exists=site_facts.team_exists,
-		is_excluded_team=policy.is_excluded_team,
-		is_active_agent=site_facts.is_active_agent,
+	labels = created_labels(doc.get(CREATED_LABELS_FIELD))
+	if labels == _EVERY_FIELD_HUMAN:
+		frappe.logger(LOGGER_NAME).warning(f"erp_ai created_labels invalid ticket={doc.name}")
+	decision = keep_human_fields(
+		decide_route(
+			classification,
+			doc.subject,
+			ctx.category_mapping,
+			ctx.routing_config or {},
+			team_exists=site_facts.team_exists,
+			is_excluded_team=policy.is_excluded_team,
+			is_active_agent=site_facts.is_active_agent,
+		),
+		labels,
 	)
 	wanted = {
 		"ticket_type": decision.ticket_type,

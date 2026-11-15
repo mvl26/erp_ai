@@ -1,4 +1,5 @@
 from datetime import datetime, timedelta
+from unittest.mock import call as unittest_call
 from unittest.mock import patch
 
 import frappe
@@ -161,3 +162,103 @@ class TestMissedScan(FrappeTestCase):
 
 		self.assertEqual(found, oldest_first[: missed_scan.SCAN_BATCH])
 		self.assertNotIn(refused, found)
+
+	def _enable_agent(self):
+		set_agent_settings(enabled=1)
+		frappe.db.value_cache.pop(SETTING_DOCTYPE, None)
+
+	def _cap(self, limit):
+		"""Patch the candidate cap (design-w1-fixes-6 Point 2); `create` so the test also runs on code without it."""
+		return patch.object(missed_scan, "SCAN_CANDIDATE_LIMIT", limit, create=True)
+
+	@staticmethod
+	def _queued_tickets(enqueue) -> list[str]:
+		return [call.kwargs["ticket_name"] for call in enqueue.call_args_list]
+
+	def test_two_scans_one_job_per_ticket(self):
+		"""AC-16, NFR-3: a second scan in the same transaction queues nothing new; one logger line per scan (D-17)."""
+		tickets = [self._ticket(creation=OLD_ENOUGH + timedelta(seconds=second)) for second in range(2)]
+		self._enable_agent()
+
+		with patch("frappe.enqueue") as enqueue, patch.object(missed_scan.frappe, "logger") as logger:
+			missed_scan.scan_missed_tickets(NOW)
+			self.assertEqual(self._queued_tickets(enqueue), tickets)
+			self.assertEqual(
+				logger.return_value.info.call_args_list, [unittest_call("missed_scan: xếp 2 phiếu")]
+			)
+
+			logger.reset_mock()
+			missed_scan.scan_missed_tickets(NOW)
+			self.assertEqual(self._queued_tickets(enqueue), tickets)
+			self.assertEqual(
+				logger.return_value.info.call_args_list, [unittest_call("missed_scan: xếp 0 phiếu")]
+			)
+
+		for call in enqueue.call_args_list:
+			with self.subTest(ticket=call.kwargs["ticket_name"]):
+				self.assertEqual(call.kwargs["trigger"], TRIGGER_TICKET_INSERT)
+				self.assertEqual(
+					call.kwargs["job_id"], f"erp_ai::{call.kwargs['ticket_name']}::{TRIGGER_TICKET_INSERT}"
+				)
+		logger.return_value.warning.assert_not_called()
+
+	def test_agent_disabled_noop(self):
+		"""Agent off: no candidate query, no job, exactly one logger line."""
+		self._ticket()
+		with (
+			patch("frappe.enqueue") as enqueue,
+			patch.object(missed_scan.frappe, "logger") as logger,
+			patch.object(missed_scan, "find_missed_tickets", wraps=missed_scan.find_missed_tickets) as find,
+		):
+			missed_scan.scan_missed_tickets(NOW)
+
+		enqueue.assert_not_called()
+		find.assert_not_called()
+		self.assertEqual(
+			logger.return_value.info.call_args_list, [unittest_call("missed_scan: agent tắt, bỏ qua")]
+		)
+		logger.return_value.warning.assert_not_called()
+
+	def test_cron_declared_every_15_minutes(self):
+		"""ADR-033 QĐ 2, AC-16: hooks.py declares the cron and migrate turned it into a Scheduled Job Type."""
+		method = "erp_ai.agent.missed_scan.scan_missed_tickets"
+		self.assertEqual(frappe.get_hooks("scheduler_events").get("cron", {}).get("*/15 * * * *"), [method])
+		self.assertEqual(
+			frappe.db.get_value("Scheduled Job Type", {"method": method}, ["frequency", "cron_format"]),
+			("Cron", "*/15 * * * *"),
+		)
+
+	def test_candidate_window_keeps_the_newest(self):
+		"""D-16 cap: only the SCAN_CANDIDATE_LIMIT newest candidates are considered, still returned oldest first."""
+		a, b, c, d = (self._ticket(creation=OLD_ENOUGH + timedelta(seconds=second)) for second in range(4))
+		with self._cap(3):
+			self.assertEqual(self._found([a, b, c, d]), [b, c, d])
+
+	def test_old_refused_tickets_do_not_starve_a_new_one(self):
+		"""Old opted-out tickets never leave the candidate set; the cap keeps them from crowding out a new one."""
+		refused = [
+			self._ticket(creation=OLD_ENOUGH - timedelta(minutes=10 - minute), **{policy.OPT_OUT_FIELD: 1})
+			for minute in range(5)
+		]
+		new = self._ticket(creation=OLD_ENOUGH)
+		with (
+			self._cap(3),
+			patch.object(policy, "can_send_ticket", wraps=policy.can_send_ticket) as can_send,
+		):
+			self.assertEqual(self._found([*refused, new]), [new])
+		self.assertEqual(can_send.call_count, 3)
+
+	def test_warns_once_when_candidate_limit_reached(self):
+		"""One warning when the candidate query returns exactly the cap; none one below it."""
+		tickets = [self._ticket(creation=OLD_ENOUGH + timedelta(seconds=second)) for second in range(2)]
+		with self._cap(3), patch.object(missed_scan.frappe, "logger") as logger:
+			self.assertEqual(self._found(tickets), tickets)
+			logger.return_value.warning.assert_not_called()
+
+			tickets.append(self._ticket(creation=OLD_ENOUGH + timedelta(seconds=2)))
+			self.assertEqual(self._found(tickets), tickets)
+		self.assertEqual(
+			logger.return_value.warning.call_args_list,
+			[unittest_call("missed_scan: chạm trần %s ứng viên, phiếu cũ hơn không được xét", 3)],
+		)
+		self.assertEqual(getattr(missed_scan, "SCAN_CANDIDATE_LIMIT", None), 1000)

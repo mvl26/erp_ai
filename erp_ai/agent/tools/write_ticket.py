@@ -38,6 +38,23 @@ def _fail(reason: str) -> dict:
 	return {"ok": False, "reason": reason[:REASON_MAX]}
 
 
+def locked_rows(
+	ticket_name: str, doctype: str, filters: dict, fields: tuple[str, ...] = ("name",)
+) -> list[dict]:
+	"""Lock the ticket row, then read `fields` of the `doctype` rows matching `filters` with a lock (ADR-036 QĐ 4).
+
+	A locking read sees the latest committed rows, not this transaction's REPEATABLE READ snapshot; both locks
+	hold until the transaction's next commit. The one `for_update` of this module. No such ticket → ValueError.
+	"""
+	if not ticket_name or not frappe.db.get_value(TICKET_DOCTYPE, ticket_name, "name", for_update=True):
+		raise ValueError("phiếu không có")
+	return frappe.db.get_values(doctype, filters, list(fields), as_dict=True, for_update=True)
+
+
+def locked_count(ticket_name: str, doctype: str, filters: dict) -> int:
+	return len(locked_rows(ticket_name, doctype, filters))
+
+
 def _existing_values(wanted: dict, reasons: dict | None = None) -> tuple[dict, list]:
 	"""Values to write (only those that exist on the site) and the skipped fields with a reason.
 

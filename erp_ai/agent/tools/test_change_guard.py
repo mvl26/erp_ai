@@ -23,6 +23,9 @@ TAKES_NO_APP_REFUSAL = "lệnh này không nhận app"
 APP_NOT_ALLOWED_REFUSAL = "app không có trong danh sách được sửa"
 APP_FORBIDDEN_REFUSAL = "không được sửa app erp_ai hoặc kho git của nó"
 GIT_PATTERN_REFUSAL = 'tên file có ký tự * ? [ ] hoặc bắt đầu bằng ":" hay "-", git không commit an toàn được'
+PATH_INVALID_REFUSAL = "đường dẫn không hợp lệ hoặc nằm ngoài apps/"
+NAME_FORBIDDEN_REFUSAL = "tên file thuộc loại bí mật hoặc được bảo vệ"
+GIT_DIR_REFUSAL = "không được chạm .git hoặc tên bắt đầu bằng .git"
 
 HAND_WRITTEN_CORE_APPS = ("frappe", "erpnext", "helpdesk", "hrms")
 # design-addendum-2 QĐ-A2: refused and allowed names, under one app.
@@ -109,7 +112,6 @@ class TestCheckWritePath(FrappeTestCase):
 				change_guard.APP_NOT_ALLOWED,
 				change_guard.APP_FORBIDDEN,
 				change_guard.NAME_FORBIDDEN,
-				change_guard.EXT_FORBIDDEN,
 				change_guard.GIT_DIR,
 				change_guard.PATH_GIT_PATTERN,
 			),
@@ -118,8 +120,7 @@ class TestCheckWritePath(FrappeTestCase):
 				"app không có trong danh sách được sửa",
 				"không được sửa app erp_ai hoặc kho git của nó",
 				"tên file thuộc loại bí mật hoặc được bảo vệ",
-				"đuôi file không được phép",
-				"không được chạm thư mục .git",
+				"không được chạm .git hoặc tên bắt đầu bằng .git",
 				'tên file có ký tự * ? [ ] hoặc bắt đầu bằng ":" hay "-", git không commit an toàn được',
 			),
 		)
@@ -129,8 +130,8 @@ class TestCheckWritePath(FrappeTestCase):
 			("otherapp/.env", change_guard.APP_NOT_ALLOWED),
 			("otherapp/run.sh", change_guard.APP_NOT_ALLOWED),
 			("otherapp/.git/x.py", change_guard.APP_NOT_ALLOWED),
-			("myapp/.git/run.sh", change_guard.EXT_FORBIDDEN),
-			("myapp/.git/config", change_guard.EXT_FORBIDDEN),
+			("myapp/.git/run.sh", change_guard.GIT_DIR),
+			("myapp/.git/config", change_guard.GIT_DIR),
 			("myapp/.git/secret.py", change_guard.NAME_FORBIDDEN),
 		):
 			with self.subTest(rel=rel):
@@ -201,21 +202,6 @@ class TestCheckWritePath(FrappeTestCase):
 		os.symlink(os.path.join(self.root, "myapp", ".env"), os.path.join(self.root, "myapp", "env_link.py"))
 		self.assertEqual(self.reason("myapp/env_link.py"), change_guard.NAME_FORBIDDEN)
 
-	def test_refuses_extension_outside_read_list_even_for_new_file(self):
-		self.apps.write("myapp/run.sh", "echo\n")
-		for rel, new_file in (
-			("myapp/run.sh", False),
-			("myapp/new.sh", True),
-			("myapp/lib.so", True),
-			("myapp/Makefile", True),
-			("myapp/conf/settings", True),
-			("myapp", True),
-		):
-			with self.subTest(rel=rel):
-				self.assertEqual(self.reason(rel, new_file=new_file), change_guard.EXT_FORBIDDEN)
-		os.symlink(os.path.join(self.root, "myapp", "run.sh"), os.path.join(self.root, "myapp", "sh_link.py"))
-		self.assertEqual(self.reason("myapp/sh_link.py"), change_guard.EXT_FORBIDDEN)
-
 	def test_refuses_git_dir_component(self):
 		self.apps.write("myapp/.git/info.txt", "x\n")
 		self.assertEqual(self.reason("myapp/.git/info.txt"), change_guard.GIT_DIR)
@@ -223,6 +209,133 @@ class TestCheckWritePath(FrappeTestCase):
 		self.assertEqual(self.reason("myapp/sub/.git/x.json", new_file=True), change_guard.GIT_DIR)
 		os.symlink(os.path.join(self.root, "myapp", ".git"), os.path.join(self.root, "myapp", "gitlink"))
 		self.assertEqual(self.reason("myapp/gitlink/info.txt"), change_guard.GIT_DIR)
+
+	def test_any_text_extension_allowed(self):
+		# AC-44, design 3.2: the extension step is gone; which bytes are text is `text_refusal`'s call later.
+		self.apps.write("myapp/run.sh", "echo\n")
+		self.assertFalse(hasattr(change_guard, "EXT_FORBIDDEN"))
+		for rel, new_file in (
+			("myapp/run.sh", False),
+			("myapp/new.sh", True),
+			("myapp/lib.so", True),
+			("myapp/tool.exe", True),
+			("myapp/Makefile", True),
+			("myapp/conf/settings", True),
+			("myapp/pkg/Dockerfile.prod", True),
+			("myapp/pyproject.toml", True),
+		):
+			with self.subTest(rel=rel):
+				result = change_guard.check_write_path(rel, ALLOWED, new_file=new_file, read_git=False)
+				self.assertEqual(
+					result,
+					change_guard.GuardResult(
+						full_path=os.path.join(self.root, rel), rel_path=rel, app="myapp", reason=None
+					),
+				)
+		os.symlink(os.path.join(self.root, "myapp", "run.sh"), os.path.join(self.root, "myapp", "sh_link.py"))
+		self.assertEqual(self.reason("myapp/sh_link.py"), None)
+
+	def test_gitignore_gitattributes_github_refused_git_dir(self):
+		# AC-50, design 3.2 step 4: any component starting with ".git", with the new wording of table 3.1.
+		self.assertIs(change_guard.GIT_DIR, source.GIT_DIR)
+		self.apps.write("myapp/.gitignore", "build/\n")
+		for rel, new_file in (
+			("myapp/.gitignore", False),
+			("myapp/.gitattributes", True),
+			("myapp/.github/workflows/ci.yml", True),
+			("myapp/sub/.gitmodules", True),
+			("myapp/.git/config", True),
+			("myapp/.gitkeep", True),
+		):
+			with self.subTest(rel=rel):
+				result = change_guard.check_write_path(rel, ALLOWED, new_file=new_file, read_git=False)
+				self.assertEqual(result, change_guard.GuardResult(None, None, None, GIT_DIR_REFUSAL))
+		# A component only containing ".git", not starting with it, is not the git rule.
+		for rel in ("myapp/my.gitignore", "myapp/docs/notes.git", "myapp/.gi/x.py", "myapp/git/x.py"):
+			with self.subTest(rel=rel):
+				self.assertIsNone(self.reason(rel, new_file=True))
+		# Order: app checks come before the git rule, the git rule before the git pattern rule.
+		self.fake_erp_ai_repo()
+		for rel, allowed, expected in (
+			("otherapp/.github/ci.yml", ALLOWED, APP_NOT_ALLOWED_REFUSAL),
+			("erp_ai/.github/ci.yml", ("myapp", "erp_ai"), APP_FORBIDDEN_REFUSAL),
+			("myapp/.github/a*.yml", ALLOWED, GIT_DIR_REFUSAL),
+			("myapp/-x/.gitignore", ALLOWED, GIT_DIR_REFUSAL),
+		):
+			with self.subTest(rel=rel):
+				self.assertEqual(self.reason(rel, allowed, new_file=True), expected)
+
+	def test_secret_name_refused_before_git_rule(self):
+		# AC-51, design 3.2 step 4: the name rule is `text_refusal`'s, checked before the ".git*" one.
+		self.assertIs(change_guard.NAME_FORBIDDEN, source.TEXT_SECRET_NAME)
+		for rel in (
+			"myapp/.github/.env",
+			"myapp/.git/secret.py",
+			"myapp/.gitignore/password.txt",
+			"myapp/.github/license.txt",
+			"myapp/.git/LICENSE.txt",
+			"myapp/.github/deploy.pem",
+		):
+			with self.subTest(rel=rel):
+				result = change_guard.check_write_path(rel, ALLOWED, new_file=True, read_git=False)
+				self.assertEqual(result, change_guard.GuardResult(None, None, None, NAME_FORBIDDEN_REFUSAL))
+		# Order: app checks come before the name rule, the name rule before the git pattern rule.
+		for rel, expected in (
+			("otherapp/.github/.env", APP_NOT_ALLOWED_REFUSAL),
+			("myapp/a*secret.py", NAME_FORBIDDEN_REFUSAL),
+			("myapp/-x/license.txt", NAME_FORBIDDEN_REFUSAL),
+			("myapp/:x.key", NAME_FORBIDDEN_REFUSAL),
+		):
+			with self.subTest(rel=rel):
+				self.assertEqual(self.reason(rel, new_file=True), expected)
+
+	def test_missing_app_dir_path_invalid(self):
+		# AC-52, design 3.2: the app folder must exist; a listed name with no folder is PATH_INVALID.
+		self.apps.write("flat.py", "x = 1\n")
+		listed = ("myapp", "ghost", "flat.py")
+		for rel in (
+			"ghost/x.py",
+			"ghost/pkg/new.py",
+			"ghost/.env",
+			"ghost/.github/ci.yml",
+			"ghost/a*.py",
+			"flat.py",
+		):
+			with self.subTest(rel=rel):
+				result = change_guard.check_write_path(rel, listed, new_file=True, read_git=False)
+				self.assertEqual(result, change_guard.GuardResult(None, None, None, PATH_INVALID_REFUSAL))
+		# Order: a name not on the list stays APP_NOT_ALLOWED, folder or not.
+		self.assertEqual(self.reason("ghost/x.py", ALLOWED, new_file=True), APP_NOT_ALLOWED_REFUSAL)
+		self.assertIsNone(self.reason("myapp/x.py", listed, new_file=True))
+
+	def test_app_dir_itself_path_invalid(self):
+		# Design 3.2 step 2 (addendum-4 P-1.2 note 2): the app folder itself is no file to write.
+		for rel in ("myapp", "myapp/", "myapp/."):
+			for new_file in (True, False):
+				with self.subTest(rel=rel, new_file=new_file):
+					self.assertEqual(self.reason(rel, new_file=new_file), change_guard.PATH_INVALID)
+		# Order (addendum-4 P-1.2 note 3): a name not on the list stays APP_NOT_ALLOWED.
+		self.assertEqual(self.reason("helpdesk", new_file=True), change_guard.APP_NOT_ALLOWED)
+
+	def test_erp_ai_in_allowed_list_still_refused(self):
+		# AC-16 kept by design 3.2 step 3: `erp_ai` and its worktrees are refused before the name and git rules.
+		self.fake_erp_ai_repo()
+		listed = ("myapp", "erp_ai", "erp_ai-wt")
+		for rel in (
+			"erp_ai/run.sh",
+			"erp_ai/Makefile",
+			"erp_ai/.github/workflows/ci.yml",
+			"erp_ai/.gitignore",
+			"erp_ai/.env",
+			"erp_ai/a*.py",
+			"erp_ai-wt/tool.exe",
+			"erp_ai-wt/.gitattributes",
+			"erp_ai-wt/secret.py",
+		):
+			with self.subTest(rel=rel):
+				result = change_guard.check_write_path(rel, listed, new_file=True, read_git=False)
+				self.assertEqual(result, change_guard.GuardResult(None, None, None, APP_FORBIDDEN_REFUSAL))
+		self.assertIsNone(self.reason("myapp/run.sh", listed, new_file=True))
 
 	def test_allows_file_in_allowed_app(self):
 		full = os.path.join(self.root, "myapp", "ok.py")
@@ -497,9 +610,9 @@ class TestCheckWritePathGit(FrappeTestCase):
 		for rel, expected in (
 			("other/a*.py", APP_NOT_ALLOWED_REFUSAL),
 			("custom_app/-secret.py", "tên file thuộc loại bí mật hoặc được bảo vệ"),
-			("custom_app/a*.sh", "đuôi file không được phép"),
-			("custom_app/.git/a*.py", "không được chạm thư mục .git"),
-			("custom_app/:x/.git/a.py", "không được chạm thư mục .git"),
+			("custom_app/a*.sh", GIT_PATTERN_REFUSAL),
+			("custom_app/.git/a*.py", change_guard.GIT_DIR),
+			("custom_app/:x/.git/a.py", change_guard.GIT_DIR),
 		):
 			with self.subTest(rel=rel):
 				self.assertEqual(

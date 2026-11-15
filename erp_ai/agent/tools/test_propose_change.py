@@ -14,7 +14,7 @@ from helpdesk.test_utils import create_agent, make_ticket
 from erp_ai.agent import authority, change_link
 from erp_ai.agent.agent_write_guard import AGENT_WRITE_FLAG
 from erp_ai.agent.changes import transitions
-from erp_ai.agent.tools import propose_change
+from erp_ai.agent.tools import change_guard, propose_change
 from erp_ai.agent.tools.registry import ToolContext, execute_tool, get_tool_schemas
 from erp_ai.constants import (
 	AGENT_USER,
@@ -314,8 +314,8 @@ class TestProposeChange(FrappeTestCase):
 			("helpdesk/README.md", "app không có trong danh sách được sửa"),
 			("erp_ai/README.md", "không được sửa app erp_ai hoặc kho git của nó"),
 			(f"{APP}/pkg/secret_key.py", "tên file thuộc loại bí mật hoặc được bảo vệ"),
-			(f"{APP}/pkg/tool.sh", "đuôi file không được phép"),
-			(f"{APP}/.git/notes.md", "không được chạm thư mục .git"),
+			(f"{APP}/pkg/tool.sh", propose_change.NOT_FOUND),
+			(f"{APP}/.git/notes.md", change_guard.GIT_DIR),
 			(
 				f"{APP}/pkg/star*.py",
 				'tên file có ký tự * ? [ ] hoặc bắt đầu bằng ":" hay "-", git không commit an toàn được',
@@ -427,7 +427,7 @@ class TestProposeChange(FrappeTestCase):
 		cases = (
 			(PATH, "file đã tồn tại"),
 			(f"{APP}/khong_co/new.py", "thư mục cha chưa có"),
-			(f"{APP}/pkg/tool.exe", "đuôi file không được phép"),
+			(f"{APP}/pkg/.gitattributes", change_guard.GIT_DIR),
 			(f"{APP}/pkg/secret_key.py", "tên file thuộc loại bí mật hoặc được bảo vệ"),
 			(f"{APP}/pkg/ignored_new.py", "file đích bị git bỏ qua (.gitignore)"),
 			# path minLength is 1 (design 3.1): a one-character path reaches the guard, not the schema

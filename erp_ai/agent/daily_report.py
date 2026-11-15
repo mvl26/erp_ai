@@ -1,7 +1,8 @@
 """The 08:00 daily report (design 3.6.3, AC-51, AC-26, D-18, A-D5).
 
-Every figure is computed as of `anchor` (the cycle's 08:00), never from the moment the job runs: "new"
-means created in `[anchor - 24 h, anchor)`, "open" means created before `anchor` and not resolved.
+Windows come from `anchor` (the cycle's 08:00): "new" means created in `[anchor - 24 h, anchor)`, "done" means
+resolved in that window. Every state is read when the job runs: "open" means created before `anchor` and
+`status_category` not "Resolved"; first response, BA notes and Tasks are read as they are at run time.
 """
 
 from datetime import datetime, timedelta
@@ -12,12 +13,14 @@ from erp_ai.agent import policy
 from erp_ai.agent.classification import load_mapping
 from erp_ai.agent.ops_data import BA_NOTE_MARKER, category_by_ticket_type, ticket_category
 from erp_ai.agent.routing import load_routing_config, processing_deadline, response_overdue
-from erp_ai.constants import AGENT_USER, SETTING_DOCTYPE
+from erp_ai.constants import AGENT_USER, LOGGER_NAME, SETTING_DOCTYPE
 
 TICKET = "HD Ticket"
 WINDOW = timedelta(hours=24)
 UNKNOWN_CATEGORY = "?"
 PROGRESS_CATEGORIES = ("D", "E")
+# Same rule as the setting's E-2 check; the agent core may not import the controller (ADR-001).
+DUE_FIELD_TYPES = ("Date", "Datetime")
 
 
 def build_daily_report(anchor: datetime) -> dict:
@@ -25,7 +28,7 @@ def build_daily_report(anchor: datetime) -> dict:
 	settings = frappe.get_single(SETTING_DOCTYPE)
 	reverse_map = category_by_ticket_type(load_mapping(settings.category_mapping))
 	routing = load_routing_config(settings.routing_rules)
-	due_field = settings.field_due_date
+	due_field = _due_field(settings.field_due_date)
 	start = anchor - WINDOW
 
 	new = _tickets([["creation", ">=", start], ["creation", "<", anchor]], reverse_map)
@@ -55,8 +58,11 @@ def build_daily_report(anchor: datetime) -> dict:
 	return {
 		"new_by_category_priority": _count_by_category_priority(new),
 		"new_list": _items(new),
-		"due_soon": _items(row for row in open_rows if row.deadline and anchor < row.deadline <= due_until),
-		"overdue": _items(overdue),
+		"due_soon": _items(
+			(row for row in open_rows if row.deadline and anchor < row.deadline <= due_until),
+			with_deadline=True,
+		),
+		"overdue": _items(overdue, with_deadline=True),
 		"response_overdue": _items(
 			row
 			for row in open_rows
@@ -66,6 +72,20 @@ def build_daily_report(anchor: datetime) -> dict:
 		"cd_missing_task": _items(row for row in cd_old if row.name not in with_task),
 		"de_progress": _de_progress(start, anchor, open_rows, overdue, reverse_map),
 	}
+
+
+def _due_field(due_field: str | None) -> str | None:
+	"""The configured due field, or None when it is unset or no longer a Date/Datetime field of HD Ticket."""
+	if not due_field:
+		return None
+	field = frappe.get_meta(TICKET).get_field(due_field)
+	if field is None or field.fieldtype not in DUE_FIELD_TYPES:
+		frappe.logger(LOGGER_NAME).warning(
+			"erp_ai daily_report: due field %s is not a Date/Datetime field of HD Ticket, using resolution_by",
+			due_field,
+		)
+		return None
+	return due_field
 
 
 def _tickets(filters: list, reverse_map: dict[str, str], due_field: str | None = None) -> list:
@@ -90,13 +110,18 @@ def _tickets(filters: list, reverse_map: dict[str, str], due_field: str | None =
 	return rows
 
 
-def _items(rows) -> list[dict]:
-	"""List entries; an excluded ticket (A-D5) carries only its number, category and priority."""
+def _items(rows, with_deadline: bool = False) -> list[dict]:
+	"""List entries; an excluded ticket (A-D5) carries only its number, category and priority.
+
+	With `with_deadline`, a sendable ticket's entry also carries the processing deadline it was listed by.
+	"""
 	items = []
 	for row in rows:
-		item = {"name": row.name, "category": row.category or UNKNOWN_CATEGORY, "priority": row.priority}
+		item = {"name": row.name, "category": row.category or UNKNOWN_CATEGORY, "priority": _priority(row)}
 		if policy.can_send_ticket(row.name):
 			item.update(subject=row.subject, excluded=False)
+			if with_deadline:
+				item["deadline"] = row.deadline
 		else:
 			item["excluded"] = True
 		items.append(item)
@@ -107,8 +132,14 @@ def _count_by_category_priority(rows: list) -> dict[str, dict[str, int]]:
 	counts: dict[str, dict[str, int]] = {}
 	for row in rows:
 		by_priority = counts.setdefault(row.category or UNKNOWN_CATEGORY, {})
-		by_priority[row.priority] = by_priority.get(row.priority, 0) + 1
+		priority = _priority(row)
+		by_priority[priority] = by_priority.get(priority, 0) + 1
 	return counts
+
+
+def _priority(row) -> str:
+	"""HD Ticket does not require a priority; an empty one counts as UNKNOWN_CATEGORY."""
+	return row.priority or UNKNOWN_CATEGORY
 
 
 def _ba_noted(names: list[str]) -> set[str]:
@@ -141,10 +172,14 @@ def _with_task(names: list[str]) -> set[str]:
 def _de_progress(
 	start: datetime, anchor: datetime, open_rows: list, overdue: list, reverse_map: dict
 ) -> dict:
-	"""For D and E: resolved in the window, open, open past the processing deadline."""
+	"""For D and E: resolved in the window and still Resolved, open, open past the processing deadline."""
 	resolved = frappe.get_all(
 		TICKET,
-		filters=[["resolution_date", ">=", start], ["resolution_date", "<", anchor]],
+		filters=[
+			["resolution_date", ">=", start],
+			["resolution_date", "<", anchor],
+			["status_category", "=", "Resolved"],
+		],
 		fields=["ticket_type"],
 	)
 	resolved_categories = [ticket_category(row, reverse_map) for row in resolved]

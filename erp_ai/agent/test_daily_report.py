@@ -1,5 +1,6 @@
 import json
 from datetime import datetime, timedelta
+from unittest.mock import call, patch
 
 import frappe
 from frappe.tests.utils import FrappeTestCase
@@ -7,7 +8,7 @@ from helpdesk.test_utils import make_ticket
 
 from erp_ai.agent import daily_report
 from erp_ai.agent.ops_data import BA_NOTE_MARKER
-from erp_ai.constants import AGENT_USER, LOG_DOCTYPE
+from erp_ai.constants import AGENT_USER, LOG_DOCTYPE, LOGGER_NAME, SETTING_DOCTYPE
 from erp_ai.test_utils import keep_agent_settings, make_routing_rules, set_agent_settings
 
 # Anchors long before any real ticket on the shared site, one per test, so "open" and "created in the
@@ -31,6 +32,8 @@ TYPE_UNMAPPED = "ERPAI-TEST daily unmapped"
 CATEGORY_MAPPING = {category: {"ticket_type": f"{TYPE_PREFIX}{category}"} for category in "ABCDEF"}
 # A real Datetime Custom Field erp_ai installs on HD Ticket (test_install pins it): no test creates a field.
 DUE_FIELD = "ai_updated_at"
+# A Date field of HD Ticket itself (Helpdesk core), for a due field of type Date.
+DATE_DUE_FIELD = "opening_date"
 
 
 def _ticket(label: str, creation: datetime, category: str | None, **values) -> str:
@@ -62,11 +65,11 @@ def _resolved(on: datetime) -> dict:
 	return {"status": "Resolved", "status_category": "Resolved", "resolution_date": on}
 
 
-def _comment(ticket: str, owner: str, content: str) -> None:
+def _comment(ticket: str, owner: str, content: str, comment_type: str = "Comment") -> None:
 	doc = frappe.get_doc(
 		{
 			"doctype": "Comment",
-			"comment_type": "Comment",
+			"comment_type": comment_type,
 			"reference_doctype": "HD Ticket",
 			"reference_name": ticket,
 			"content": content,
@@ -83,6 +86,11 @@ def _task(ticket: str) -> None:
 def _names(rows: list[dict], mine: set[str]) -> list[str]:
 	"""Names of the report rows that belong to this test, in report order."""
 	return [row["name"] for row in rows if row["name"] in mine]
+
+
+def _deadlines(rows: list[dict], mine: set[str]) -> dict[str, datetime]:
+	"""The `deadline` of each report row that belongs to this test."""
+	return {row["name"]: row["deadline"] for row in rows if row["name"] in mine}
 
 
 def _item(name: str, category: str, priority: str = "Medium") -> dict:
@@ -193,6 +201,15 @@ class TestBuild(FrappeTestCase):
 			_names(result["due_soon"], mine), [t["d_task_due_field"], t["c_old_no_task"], t["a_before"]]
 		)
 		self.assertEqual(_names(result["overdue"], mine), [t["b_overdue_exact"]])
+		self.assertEqual(
+			_deadlines(result["due_soon"], mine),
+			{
+				t["d_task_due_field"]: anchor + timedelta(hours=2),
+				t["c_old_no_task"]: anchor + timedelta(seconds=1),
+				t["a_before"]: anchor + timedelta(hours=24),
+			},
+		)
+		self.assertEqual(_deadlines(result["overdue"], mine), {t["b_overdue_exact"]: anchor})
 		self.assertEqual(_names(result["response_overdue"], mine), [t["b_overdue_exact"]])
 		self.assertEqual(_names(result["c_missing_ba_note"], mine), [t["c_old_no_task"], t["c_new_start"]])
 		self.assertEqual(_names(result["cd_missing_task"], mine), [t["c_old_no_task"]])
@@ -210,7 +227,7 @@ class TestBuild(FrappeTestCase):
 
 	def test_excluded_ticket_number_only_in_every_list(self):
 		anchor = ANCHOR_TWELVE
-		name = _ticket(
+		overdue = _ticket(
 			"excluded_overdue",
 			anchor - timedelta(days=5),
 			"C",
@@ -218,12 +235,31 @@ class TestBuild(FrappeTestCase):
 			resolution_by=anchor - timedelta(hours=1),
 			ai_opt_out=1,
 		)
+		due_soon = _ticket(
+			"excluded_due_soon",
+			anchor - timedelta(days=4),
+			"C",
+			first_responded_on=None,
+			resolution_by=anchor + timedelta(hours=1),
+			ai_opt_out=1,
+		)
+		in_list = {
+			"due_soon": [due_soon],
+			"overdue": [overdue],
+			"response_overdue": [overdue, due_soon],
+			"c_missing_ba_note": [overdue, due_soon],
+			"cd_missing_task": [overdue, due_soon],
+		}
 
 		result = daily_report.build_daily_report(anchor)
 
-		expected = {"name": name, "category": "C", "priority": "Medium", "excluded": True}
-		for key in ("overdue", "response_overdue", "c_missing_ba_note", "cd_missing_task"):
-			self.assertEqual([row for row in result[key] if row["name"] == name], [expected], key)
+		for key, names in in_list.items():
+			expected = [
+				{"name": name, "category": "C", "priority": "Medium", "excluded": True} for name in names
+			]
+			self.assertEqual(
+				[row for row in result[key] if row["name"] in (overdue, due_soon)], expected, key
+			)
 
 	def test_de_progress_window_edges(self):
 		anchor = ANCHOR_DE
@@ -282,4 +318,105 @@ class TestBuild(FrappeTestCase):
 		result = daily_report.build_daily_report(anchor)
 
 		self.assertEqual(_names(result["overdue"], {name}), [name])
+		self.assertEqual(_deadlines(result["overdue"], {name}), {name: anchor - timedelta(hours=1)})
 		self.assertEqual(_names(result["due_soon"], {name}), [])
+
+	def test_due_lists_carry_deadline(self):
+		anchor = ANCHOR_HOURS
+		set_agent_settings(field_due_date=DATE_DUE_FIELD)
+		a_due_soon = _ticket(
+			"a_due_soon", anchor - timedelta(days=2), "A", resolution_by=anchor + timedelta(hours=3)
+		)
+		# E past its due field of type Date: the deadline is the end of that day; resolution_by is later
+		e_overdue = _ticket(
+			"e_overdue_date",
+			anchor - timedelta(days=3),
+			"E",
+			resolution_by=anchor + timedelta(days=2),
+			**{DATE_DUE_FIELD: (anchor - timedelta(days=1)).date()},
+		)
+		excluded_overdue = _ticket(
+			"b_excluded_overdue",
+			anchor - timedelta(days=4),
+			"B",
+			resolution_by=anchor - timedelta(hours=1),
+			ai_opt_out=1,
+		)
+		mine = {a_due_soon, e_overdue, excluded_overdue}
+
+		result = daily_report.build_daily_report(anchor)
+
+		due_soon = [row for row in result["due_soon"] if row["name"] in mine]
+		self.assertEqual(due_soon, [{**_item(a_due_soon, "A"), "deadline": anchor + timedelta(hours=3)}])
+		overdue = [row for row in result["overdue"] if row["name"] in mine]
+		self.assertEqual(
+			overdue,
+			[
+				{"name": excluded_overdue, "category": "B", "priority": "Medium", "excluded": True},
+				{**_item(e_overdue, "E"), "deadline": datetime(2002, 5, 5, 23, 59, 59)},
+			],
+		)
+
+	def test_empty_priority_counted_as_unknown(self):
+		anchor = ANCHOR_HOURS
+		name = _ticket("a_no_priority", anchor - timedelta(hours=1), "A", priority=None)
+
+		result = daily_report.build_daily_report(anchor)
+
+		self.assertEqual(result["new_by_category_priority"]["A"]["?"], 1)
+		self.assertEqual([row for row in result["new_list"] if row["name"] == name], [_item(name, "A", "?")])
+
+	def test_reopened_ticket_not_done(self):
+		anchor = ANCHOR_DE
+		start = anchor - timedelta(hours=24)
+		# written straight to the database: open again, yet resolution_date still in the window
+		_ticket(
+			"d_reopened",
+			start - timedelta(days=1),
+			"D",
+			status="Open",
+			status_category="Open",
+			resolution_date=start + timedelta(hours=1),
+		)
+
+		result = daily_report.build_daily_report(anchor)
+
+		self.assertEqual(result["de_progress"]["D"], {"done": 0, "in_progress": 1, "overdue": 0})
+
+	def test_due_field_not_on_ticket_uses_resolution_by(self):
+		anchor = ANCHOR_HOURS
+		# "subject" exists on HD Ticket but is not a Date/Datetime field
+		for due_field in ("erpai_test_no_such_field", "subject"):
+			with self.subTest(due_field=due_field):
+				frappe.db.set_single_value(SETTING_DOCTYPE, "field_due_date", due_field)
+				name = _ticket(
+					f"d_lost_due_field {due_field}",
+					anchor - timedelta(days=2),
+					"D",
+					resolution_by=anchor - timedelta(hours=1),
+				)
+
+				with patch("frappe.logger") as get_logger:
+					result = daily_report.build_daily_report(anchor)
+
+				self.assertEqual(_deadlines(result["overdue"], {name}), {name: anchor - timedelta(hours=1)})
+				get_logger.assert_called_with(LOGGER_NAME)
+				self.assertEqual(
+					get_logger.return_value.warning.call_args_list,
+					[
+						call(
+							"erp_ai daily_report: due field %s is not a Date/Datetime field of HD Ticket, "
+							"using resolution_by",
+							due_field,
+						)
+					],
+				)
+
+	def test_ba_note_other_comment_type_not_counted(self):
+		anchor = ANCHOR_HOURS
+		name = _ticket("c_info_note", anchor - timedelta(days=2), "C")
+		_comment(name, AGENT_USER, f"{BA_NOTE_MARKER}\nPhân tích nghiệp vụ", comment_type="Info")
+
+		result = daily_report.build_daily_report(anchor)
+
+		self.assertEqual(_names(result["c_missing_ba_note"], {name}), [name])

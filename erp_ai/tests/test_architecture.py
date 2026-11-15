@@ -2917,6 +2917,19 @@ GIT_RUNNING_BENCH_SUBCOMMANDS = (
 	"setup",
 	"init",
 )
+RESTART_BENCH_COMMAND = "restart"  # ADR-040 QĐ 6: the one shape added to the table
+FORBIDDEN_BENCH_COMMANDS = (  # ADR-040 QĐ 6: still forbidden
+	"execute",
+	"console",
+	"install-app",
+	"uninstall-app",
+	"reinstall",
+	"backup",
+	"restore",
+	"set-config",
+	"drop-site",
+	"new-site",
+)
 APPS_ROOT_FUNCTION = "get_source_root"
 APPS_ROOT_SEGMENT = re.compile(r"(?:^|[/\\])apps(?:[/\\]|$)")
 APP_PATH_CALLS = ("get_app_path",)
@@ -3762,7 +3775,8 @@ def check_no_git_in_web_and_runner(sources: dict) -> list:
 
 
 def check_bench_allowlist_has_no_git_running_subcommands(sources: dict) -> list:
-	"""ADR-022 QĐ 2: change_guard's bench command table never holds a subcommand that runs git in an app repo."""
+	"""ADR-022 QĐ 2: change_guard's bench command table never holds a subcommand that runs git in an app repo.
+	ADR-040 QĐ 6: the table holds `restart` and none of the commands that stay forbidden."""
 	scan = GitScan(sources)
 	if CHANGE_GUARD_FILE not in scan.trees:
 		return [f"{CHANGE_GUARD_FILE}: file missing"]
@@ -3777,6 +3791,14 @@ def check_bench_allowlist_has_no_git_running_subcommands(sources: dict) -> list:
 		violations.extend(
 			f"{CHANGE_GUARD_FILE}: {BENCH_COMMANDS_NAME} holds {command!r}, which runs git in an app repo (ADR-022 QĐ 2)"
 			for command in sorted(commands & set(GIT_RUNNING_BENCH_SUBCOMMANDS))
+		)
+		if RESTART_BENCH_COMMAND not in commands:
+			violations.append(
+				f"{CHANGE_GUARD_FILE}: {BENCH_COMMANDS_NAME} lacks {RESTART_BENCH_COMMAND!r} (ADR-040 QĐ 6)"
+			)
+		violations.extend(
+			f"{CHANGE_GUARD_FILE}: {BENCH_COMMANDS_NAME} holds {command!r}, which stays forbidden (ADR-040 QĐ 6)"
+			for command in sorted(commands & set(FORBIDDEN_BENCH_COMMANDS))
 		)
 	for node, value in scan.code_texts(CHANGE_GUARD_FILE):
 		if value in GIT_RUNNING_BENCH_SUBCOMMANDS:
@@ -4853,6 +4875,8 @@ class TestArchitecture(unittest.TestCase):
 		found = " ".join(message for _node, message in _fs_writes(FILE_WRITER_FILE, writer))
 		for expected in ("os.replace", "os.remove", "tempfile.mkstemp", "os.fdopen with mode 'wb'"):
 			self.assertIn(expected, found)
+		# Design §8.2, AC-47: the os.* directory and rename functions are in the scanned table.
+		self.assertLessEqual(set(FS_WRITE_OS_FUNCTIONS), FS_WRITE_FUNCTIONS)
 		self.assertEqual(check_fs_writes_only_in_file_writer(self.sources), [])
 
 	def test_file_writer_rechecks_through_resolver(self):
@@ -4946,6 +4970,9 @@ class TestArchitecture(unittest.TestCase):
 		scan = self._git_scan()
 		commands = scan.strings(CHANGE_GUARD_FILE, scan.assignments[CHANGE_GUARD_FILE][BENCH_COMMANDS_NAME])
 		self.assertIn("migrate", commands)
+		# ADR-040 QĐ 6: restart is listed, the still-forbidden commands are not.
+		self.assertIn(RESTART_BENCH_COMMAND, commands)
+		self.assertEqual(commands & set(FORBIDDEN_BENCH_COMMANDS), set())
 		self.assertEqual(check_bench_allowlist_has_no_git_running_subcommands(self.sources), [])
 
 	def test_apps_root_single_function(self):
@@ -5507,7 +5534,8 @@ def _run_wrapped(command, *, cwd, env, limit_s):
 PATH_INVALID = "đường dẫn nằm ngoài apps/"
 SITE_COMMANDS = ("migrate", "clear-cache")
 BUILD_COMMAND = "build"
-BENCH_COMMANDS = (*SITE_COMMANDS, BUILD_COMMAND, "version")
+RESTART_COMMAND = "restart"
+BENCH_COMMANDS = (*SITE_COMMANDS, BUILD_COMMAND, "version", RESTART_COMMAND)
 
 
 def check_write_path(rel):
@@ -8085,8 +8113,8 @@ class TestScannersCatchViolations(unittest.TestCase):
 				(
 					"table",
 					(
-						'BENCH_COMMANDS = (*SITE_COMMANDS, BUILD_COMMAND, "version")',
-						f'BENCH_COMMANDS = (*SITE_COMMANDS, "{command}")',
+						'BENCH_COMMANDS = (*SITE_COMMANDS, BUILD_COMMAND, "version", RESTART_COMMAND)',
+						f'BENCH_COMMANDS = (*SITE_COMMANDS, "{command}", RESTART_COMMAND)',
 					),
 				),
 				("shape", ('["--site", site, command]', f'["--site", site, "{command}"]')),
@@ -8099,7 +8127,7 @@ class TestScannersCatchViolations(unittest.TestCase):
 		unreadable = self.git_product(
 			CHANGE_GUARD_FILE,
 			replace=(
-				'BENCH_COMMANDS = (*SITE_COMMANDS, BUILD_COMMAND, "version")',
+				'BENCH_COMMANDS = (*SITE_COMMANDS, BUILD_COMMAND, "version", RESTART_COMMAND)',
 				"BENCH_COMMANDS = tuple(load())",
 			),
 		)
@@ -8775,6 +8803,15 @@ def restart_after_apply():
 ''',
 }
 RESTART_JOB_FILE = "agent/changes/apply_job.py"
+FS_WRITE_OS_FUNCTIONS = (
+	"os.mkdir",
+	"os.makedirs",
+	"os.rmdir",
+	"os.rename",
+	"os.replace",
+	"os.remove",
+	"os.unlink",
+)
 
 
 class TestChangeBlockRules(unittest.TestCase):
@@ -8937,6 +8974,60 @@ class TestChangeBlockRules(unittest.TestCase):
 			with self.subTest(case=case):
 				found = check_change_block_no_sudo_or_supervisorctl_argv(self.restart_product(rel, extra))
 				self.assertCaught(found, rel, fragment)
+
+	# T48: file system writes only in file_writer; the bench table (AC-47, AC-52; ADR-040 QĐ 6) -------
+
+	def test_fs_write_os_functions_caught_outside_file_writer(self):
+		for function in FS_WRITE_OS_FUNCTIONS:
+			for rel in (RESTART_JOB_FILE, PROCESS_RUNNER_FILE, PROPOSE_TOOL_FILE, CHANGE_GUARD_FILE):
+				with self.subTest(function=function, rel=rel):
+					source = f"import os\n{function}(path)\n"
+					self.assertCaught(check_fs_writes_only_in_file_writer({rel: source}), rel, function)
+			with self.subTest(function=function, rel=FILE_WRITER_FILE):
+				writer = {FILE_WRITER_FILE: f"import os\n{function}(path)\n"}
+				self.assertEqual(check_fs_writes_only_in_file_writer(writer), [])
+
+	def bench_table(self, table: str, site_commands: str = "") -> dict:
+		"""GIT_CLEAN with change_guard's `BENCH_COMMANDS = ...` line (and `SITE_COMMANDS`, if given) replaced."""
+		text, count = re.subn(
+			r"^BENCH_COMMANDS = .*$", f"BENCH_COMMANDS = {table}", GIT_CLEAN[CHANGE_GUARD_FILE], flags=re.M
+		)
+		self.assertEqual(count, 1)
+		if site_commands:
+			text, count = re.subn(
+				r"^SITE_COMMANDS = .*$", f"SITE_COMMANDS = {site_commands}", text, flags=re.M
+			)
+			self.assertEqual(count, 1)
+		return {**GIT_CLEAN, CHANGE_GUARD_FILE: text}
+
+	def test_bench_table_with_restart_is_clean(self):
+		clean = self.bench_table('(*SITE_COMMANDS, BUILD_COMMAND, "version", "restart")')
+		self.assertEqual(check_bench_allowlist_has_no_git_running_subcommands(clean), [])
+
+	def test_bench_table_without_restart_caught(self):
+		found = check_bench_allowlist_has_no_git_running_subcommands(
+			self.bench_table('(*SITE_COMMANDS, BUILD_COMMAND, "version")')
+		)
+		self.assertCaught(found, CHANGE_GUARD_FILE, "lacks 'restart'", "ADR-040 QĐ 6")
+
+	def test_bench_table_with_forbidden_command_caught(self):
+		for command in FORBIDDEN_BENCH_COMMANDS:
+			for case, table, site_commands in (
+				("table", f'(*SITE_COMMANDS, BUILD_COMMAND, "version", "restart", "{command}")', ""),
+				("site list", '(*SITE_COMMANDS, "restart")', f'("migrate", "{command}")'),
+			):
+				with self.subTest(command=command, case=case):
+					found = check_bench_allowlist_has_no_git_running_subcommands(
+						self.bench_table(table, site_commands)
+					)
+					self.assertCaught(found, CHANGE_GUARD_FILE, f"holds {command!r}", "ADR-040 QĐ 6")
+					self.assertFalse(any("lacks 'restart'" in text for text in found), found)
+
+	def test_bench_table_without_restart_and_with_forbidden_command_reports_both(self):
+		found = check_bench_allowlist_has_no_git_running_subcommands(
+			self.bench_table('(*SITE_COMMANDS, "execute")')
+		)
+		self.assertCaught(found, "lacks 'restart'", "holds 'execute'")
 
 
 if __name__ == "__main__":

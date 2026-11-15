@@ -1,5 +1,5 @@
-"""Change-proposal tools: the model proposes one file change or one bench command; nothing is written to
-disk and no command runs here. A person approves on the proposal form, then the change job applies it."""
+"""Change-proposal tools: the model proposes one block of file items and bench commands; nothing is written
+to disk and no command runs here. A person approves on the proposal form, then the change job applies it."""
 
 import difflib
 import hashlib
@@ -57,11 +57,8 @@ ITEM_FIELDS = {
 }
 EXECUTABLE_BITS = 0o111
 LEGACY_EDIT_KEYS = ("path", "find", "replace")
-# CHG-002 addendum-6: `restart` reaches the model only as a block command (T28); the single-command
-# apply path would run it inside the worker instead of through `launch_restart`.
-_SINGLE_BENCH_COMMANDS = tuple(
-	command for command in change_guard.BENCH_COMMANDS if command != change_guard.RESTART_COMMAND
-)
+# CHG-002 design 3.1: the fields of one item of `commands`.
+COMMAND_FIELDS = {"command", "app"}
 
 
 def _fail(reason: str) -> dict:
@@ -128,7 +125,7 @@ def _comment(ctx: ToolContext, proposal) -> str:
 		path = first.file_path if first else proposal.file_path
 		target = f"{verb} <code>{escape(path)}</code>"
 	else:
-		args = " ".join(json.loads(proposal.command_args or "[]"))
+		args = "; ".join(" ".join(argv) for argv in json.loads(proposal.command_list or "[]"))
 		target = f"lệnh <code>bench {escape(args)}</code>"
 	form = f"/app/erp-ai-change-proposal/{proposal.name}"
 	html = f'<p>Đề xuất <a href="{escape(form)}">{escape(proposal.name)}</a> đang chờ duyệt: {target}.</p>'
@@ -299,6 +296,24 @@ def _renamed_op(change: dict, ctx: ToolContext) -> change_guard.FileOp | str:
 	)
 
 
+def _built_commands(commands, ctx: ToolContext) -> list | dict:
+	"""Design 3.1: each `{command, app?}` of `commands` as its argv from `build_bench_args`, in order, or the
+	refusal: a malformed list or item is refused like the schema, a command reason gets `lệnh {n}: `."""
+	if not isinstance(commands, list):
+		return registry_invalid("commands")
+	built = []
+	for number, command in enumerate(commands, start=1):
+		if not isinstance(command, dict) or "command" not in command or not set(command) <= COMMAND_FIELDS:
+			return registry_invalid("commands")
+		args = change_guard.build_bench_args(
+			command["command"], command.get("app"), ctx.allowed_apps, frappe.local.site
+		)
+		if isinstance(args, str):
+			return _fail(change_guard.COMMAND_PREFIX.format(number=number) + args)
+		built.append(args)
+	return built
+
+
 _BUILDERS = {"edit": _edited_op, "create": _created_op, "delete": _deleted_op, "rename": _renamed_op}
 
 
@@ -329,7 +344,8 @@ def _propose_block(changes: list, commands: list, reason: str, ctx: ToolContext)
 	Step 2 turns each item into a `FileOp`; step 2b builds the joined `diff_text` once (design-addendum-1
 	A-1.5); step 3 is `check_block` at proposal time, whose paths and git state are the ones stored; step 4
 	inserts one parent with one child row per item and exactly that `diff_text`. Every refusal comes before
-	the insert: 0 proposals, 0 comments. `commands` are argv lists passed on to `check_block`.
+	the insert: 0 proposals, 0 comments. `commands` are argv lists passed on to `check_block` and stored in
+	`command_list` in order; a block with only commands carries no git field and no `branch`.
 	"""
 	if not isinstance(changes, list):
 		return _fail(change_guard.OP_UNKNOWN)
@@ -349,20 +365,33 @@ def _propose_block(changes: list, commands: list, reason: str, ctx: ToolContext)
 	)
 	if check.reason:
 		return _fail(check.reason)
-	guard = check.targets[0].guard
-	values = {
-		"change_kind": CHANGE_KIND_CODE,
-		"app": check.app,
-		"reversible": 1,
-		"operations": [_row(target) for target in check.targets],
-		"diff": diff_text,
-		"reason": reason,
-		"target_branch": guard.git.branch,
-		"upstream_ref": guard.git.upstream_ref,
-		"ahead_count": guard.git.ahead_count,
-		"is_core_app": int(guard.is_core_app),
-	}
-	return {**_insert(ctx, values), "branch": guard.git.branch}
+	values = {"command_list": json.dumps(commands, ensure_ascii=False), "reason": reason}
+	if check.targets:
+		guard = check.targets[0].guard
+		values.update(
+			change_kind=CHANGE_KIND_CODE,
+			app=check.app,
+			reversible=1,
+			operations=[_row(target) for target in check.targets],
+			diff=diff_text,
+			target_branch=guard.git.branch,
+			upstream_ref=guard.git.upstream_ref,
+			ahead_count=guard.git.ahead_count,
+			is_core_app=int(guard.is_core_app),
+		)
+		return {**_insert(ctx, values), "branch": guard.git.branch}
+	# design 2.2: a block with only commands takes the app of `build --app`, if any, and no git field
+	built_apps = [args[-1] for args in commands if args[0] == change_guard.BUILD_COMMAND]
+	values.update(
+		change_kind=CHANGE_KIND_COMMAND,
+		app=built_apps[0] if built_apps else None,
+		reversible=0,
+		target_branch="",
+		upstream_ref="",
+		ahead_count=0,
+		is_core_app=0,
+	)
+	return _insert(ctx, values)
 
 
 def propose_file_change(args: dict, ctx: ToolContext) -> dict:
@@ -371,51 +400,51 @@ def propose_file_change(args: dict, ctx: ToolContext) -> dict:
 	if "changes" in args:
 		if "path" in args:
 			return _fail(BLOCK_SHAPE)
-		return _propose_block(args["changes"], [], args["reason"], ctx)
-	# The old shape: the schema no longer requires these keys, so a missing one is refused as before.
-	for key in LEGACY_EDIT_KEYS:
-		if key not in args:
-			return registry_invalid(key)
-	change = {"action": "edit", **{key: args[key] for key in LEGACY_EDIT_KEYS}}
-	return _propose_block([change], [], args["reason"], ctx)
+		changes = args["changes"]
+	else:
+		# The old shape: the schema no longer requires these keys, so a missing one is refused as before.
+		for key in LEGACY_EDIT_KEYS:
+			if key not in args:
+				return registry_invalid(key)
+		changes = [{"action": "edit", **{key: args[key] for key in LEGACY_EDIT_KEYS}}]
+	commands = _built_commands(args.get("commands", []), ctx)
+	if isinstance(commands, dict):
+		return commands
+	return _propose_block(changes, commands, args["reason"], ctx)
 
 
 def propose_new_file(args: dict, ctx: ToolContext) -> dict:
 	if refusal := _entry_refusal(ctx):
 		return refusal
 	change = {"action": "create", "path": args["path"], "content": args["content"]}
-	return _propose_block([change], [], args["reason"], ctx)
+	commands = _built_commands(args.get("commands", []), ctx)
+	if isinstance(commands, dict):
+		return commands
+	return _propose_block([change], commands, args["reason"], ctx)
 
 
 def propose_bench_command(args: dict, ctx: ToolContext) -> dict:
 	if refusal := _entry_refusal(ctx):
 		return refusal
-	if args["command"] not in _SINGLE_BENCH_COMMANDS:
-		return _fail(change_guard.CMD_NOT_LISTED)
 	built = change_guard.build_bench_args(
 		args["command"], args.get("app"), ctx.allowed_apps, frappe.local.site
 	)
 	if isinstance(built, str):
 		return _fail(built)
-	values = {
-		"change_kind": CHANGE_KIND_COMMAND,
-		"app": args.get("app"),
-		"command_args": json.dumps(built, ensure_ascii=False),
-		"reversible": 0,
-		"reason": args["reason"],
-		# design 2.1: a bench command carries no git field
-		"target_branch": "",
-		"upstream_ref": "",
-		"ahead_count": 0,
-		"is_core_app": 0,
-	}
-	return _insert(ctx, values)
+	return _propose_block([], [built], args["reason"], ctx)
 
 
 _PATH = {"type": "string", "minLength": 1, "maxLength": PATH_MAX_CHARS}
 _REASON = {"type": "string", "minLength": 1, "maxLength": REASON_MAX_CHARS}
 _FIND_ITEM = {"type": "string", "minLength": 1, "maxLength": PROPOSAL_TEXT_MAX_CHARS}
 _REPLACE_ITEM = {"type": "string", "maxLength": PROPOSAL_TEXT_MAX_CHARS}
+_APP = {"type": "string", "minLength": 1, "maxLength": APP_MAX_CHARS}
+_COMMAND = {"type": "string", "enum": list(change_guard.BENCH_COMMANDS)}
+# CHG-002 design 3.1: the bench commands run after the files, in order.
+_COMMANDS = {
+	"type": "array",
+	"items": {"type": "object", "properties": {"command": _COMMAND, "app": _APP}, "required": ["command"]},
+}
 # CHG-002 design 3.1: one item of `changes`.
 _CHANGE_ITEM = {
 	"type": "object",
@@ -440,7 +469,8 @@ TOOLS: list[ToolSpec] = [
 				"Tạo đề xuất sửa một file đã có trong apps/ (đường dẫn tính từ apps/, ví dụ "
 				"helpdesk/helpdesk/api/ticket.py). find và replace là hai mảng cùng số phần tử: mỗi find[i] "
 				"phải xuất hiện đúng 1 lần trong file, các đoạn find không chồng nhau, và được thay bằng "
-				"replace[i]. Chỉ tạo đề xuất Chờ duyệt, chưa ghi gì xuống đĩa."
+				"replace[i]. commands là các lệnh bench chạy sau khi ghi file, đúng thứ tự; có file .py thì "
+				"kết thúc bằng migrate rồi restart. Chỉ tạo đề xuất Chờ duyệt, chưa ghi gì xuống đĩa."
 			),
 			"input_schema": {
 				"type": "object",
@@ -449,6 +479,7 @@ TOOLS: list[ToolSpec] = [
 					"path": _PATH,
 					"find": {"type": "array", "maxItems": REPLACE_MAX_ITEMS, "items": _FIND_ITEM},
 					"replace": {"type": "array", "maxItems": REPLACE_MAX_ITEMS, "items": _REPLACE_ITEM},
+					"commands": _COMMANDS,
 					"reason": _REASON,
 				},
 				"required": ["reason"],
@@ -470,6 +501,7 @@ TOOLS: list[ToolSpec] = [
 				"properties": {
 					"path": _PATH,
 					"content": {"type": "string", "minLength": 1, "maxLength": PROPOSAL_TEXT_MAX_CHARS},
+					"commands": _COMMANDS,
 					"reason": _REASON,
 				},
 				"required": ["path", "content", "reason"],
@@ -489,8 +521,8 @@ TOOLS: list[ToolSpec] = [
 			"input_schema": {
 				"type": "object",
 				"properties": {
-					"command": {"type": "string", "enum": list(_SINGLE_BENCH_COMMANDS)},
-					"app": {"type": "string", "minLength": 1, "maxLength": APP_MAX_CHARS},
+					"command": _COMMAND,
+					"app": _APP,
 					"reason": _REASON,
 				},
 				"required": ["command", "reason"],

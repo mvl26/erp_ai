@@ -13,7 +13,7 @@ from helpdesk.test_utils import create_agent, make_ticket
 
 from erp_ai.agent import authority, change_link
 from erp_ai.agent.agent_write_guard import AGENT_WRITE_FLAG
-from erp_ai.agent.changes import transitions
+from erp_ai.agent.changes import process_runner, transitions
 from erp_ai.agent.tools import change_guard, propose_change, source
 from erp_ai.agent.tools.registry import ToolContext, execute_tool, get_tool_schemas
 from erp_ai.constants import (
@@ -472,8 +472,8 @@ class TestProposeChange(FrappeTestCase):
 		doc = frappe.get_doc(PROPOSAL_DOCTYPE, result["proposal"])
 		frappe.set_user(AGENT)
 		self.assertEqual(
-			(doc.change_kind, json.loads(doc.command_args), doc.reversible, doc.commit_message),
-			(CHANGE_KIND_COMMAND, ["build", "--app", APP], 0, None),
+			(doc.change_kind, json.loads(doc.command_list), doc.reversible, doc.commit_message),
+			(CHANGE_KIND_COMMAND, [["build", "--app", APP]], 0, None),
 		)
 		migrate = self.run_tool(
 			"propose_bench_command", {"command": "migrate", "reason": "sau khi sửa DocType"}
@@ -489,10 +489,6 @@ class TestProposeChange(FrappeTestCase):
 			refused = self.run_tool("propose_bench_command", arguments)
 			self.assertFalse(refused["ok"], arguments)
 			self.assertIn(phrase, refused["reason"], arguments)
-		self.assertEqual(
-			self.run_tool("propose_bench_command", {"command": "restart", "reason": "x"})["reason"],
-			"tham số không hợp lệ: command",
-		)
 		self.assertEqual(len(self.proposals()), 2)
 
 	def bench(self, command, app=None, **context):
@@ -535,8 +531,8 @@ class TestProposeChange(FrappeTestCase):
 	def test_bench_command_tool_refuses_enum_outside_and_app_misuse(self):
 		(spec,) = [spec for spec in propose_change.TOOLS if spec.name == "propose_bench_command"]
 		properties = spec.schema["input_schema"]["properties"]
-		self.assertEqual(set(properties["command"]["enum"]), set(BENCH_COMMANDS_TABLE))
-		self.assertEqual(len(properties["command"]["enum"]), len(BENCH_COMMANDS_TABLE))
+		self.assertEqual(set(properties["command"]["enum"]), set(BENCH_COMMANDS_TABLE) | {"restart"})
+		self.assertEqual(len(properties["command"]["enum"]), len(BENCH_COMMANDS_TABLE) + 1)
 		self.assertNotIn("update", properties["command"]["enum"])
 		self.assertEqual((properties["app"]["minLength"], properties["app"]["maxLength"]), (1, 100))
 		self.assertEqual(spec.schema["input_schema"]["required"], ["command", "reason"])
@@ -546,7 +542,6 @@ class TestProposeChange(FrappeTestCase):
 		cases = (
 			# outside the enum: the schema refuses before the handler
 			({"command": "update"}, "tham số không hợp lệ: command"),
-			({"command": "restart"}, "tham số không hợp lệ: command"),
 			({"command": "build", "app": ""}, "tham số không hợp lệ: app"),
 			({"command": "build", "app": "a" * 101}, "tham số không hợp lệ: app"),
 			# build needs an app that passes the app guard
@@ -575,20 +570,6 @@ class TestProposeChange(FrappeTestCase):
 		self.assertEqual(self.proposals(), [])
 		self.assertEqual(self.comments(), [])
 
-	def test_bench_command_handler_refuses_restart_until_blocks(self):
-		# CHG-002 addendum-6 P-1: restart is in the guard table but the single-command tool stays closed
-		self.assertIn(change_guard.RESTART_COMMAND, change_guard.BENCH_COMMANDS)
-		(spec,) = [spec for spec in propose_change.TOOLS if spec.name == "propose_bench_command"]
-		self.assertNotIn(
-			change_guard.RESTART_COMMAND, spec.schema["input_schema"]["properties"]["command"]["enum"]
-		)
-		direct = propose_change.propose_bench_command(
-			{"command": "restart", "reason": "x"}, self.context(allowed_apps=(APP,))
-		)
-		self.assertEqual(direct, {"ok": False, "reason": change_guard.CMD_NOT_LISTED})
-		self.assertEqual(self.proposals(), [])
-		self.assertEqual(self.comments(), [])
-
 	def test_command_args_built_by_server_for_each_command(self):
 		site = frappe.local.site
 		expected = {
@@ -609,7 +590,7 @@ class TestProposeChange(FrappeTestCase):
 				frappe.set_user("Administrator")
 				doc = frappe.get_doc(PROPOSAL_DOCTYPE, result["proposal"])
 				frappe.set_user(AGENT)
-				self.assertEqual(json.loads(doc.command_args), command_args)
+				self.assertEqual(json.loads(doc.command_list), [command_args])
 				self.assertEqual(
 					(doc.change_kind, doc.change_status, doc.reversible, doc.is_new_file),
 					(CHANGE_KIND_COMMAND, CHANGE_STATUS_PENDING, 0, 0),
@@ -1453,3 +1434,179 @@ class TestProposeBlock(FrappeTestCase):
 			with self.subTest(item=item):
 				self.assert_item_refused(item, change_guard.PATH_INVALID)
 		self.assertTrue(os.path.isfile(os.path.join(self.sandbox.repo(APP), "README.md")))
+
+	# CHG-002 T28: commands in a block; the three tools go through `_propose_block`.
+
+	def tree(self):
+		"""Every file under the sandbox `apps/` (outside `.git`) with its bytes."""
+		root = os.path.dirname(self.sandbox.repo(APP))
+		files = {}
+		for folder, dirs, names in os.walk(root):
+			dirs[:] = [name for name in dirs if name != ".git"]
+			for name in names:
+				full = os.path.join(folder, name)
+				with open(full, "rb") as handle:
+					files[os.path.relpath(full, root)] = handle.read()
+		return files
+
+	def test_py_block_with_migrate_restart_stored_in_order(self):
+		self.sandbox.commit_file(APP, "pkg/mod.py", "x = 1\n")
+		site = frappe.local.site
+		migrate, build, restart = (
+			{"command": "migrate"},
+			{"command": "build", "app": APP},
+			{"command": "restart"},
+		)
+		item = {"action": "edit", "path": f"{APP}/pkg/mod.py", "find": ["x = 1"], "replace": ["x = 2"]}
+		calls = {
+			"changes": ("propose_file_change", {"changes": [item], "commands": [migrate, build, restart]}),
+			"legacy edit": (
+				"propose_file_change",
+				{
+					"path": item["path"],
+					"find": ["x = 1"],
+					"replace": ["x = 3"],
+					"commands": [build, migrate, restart],
+				},
+			),
+			"new file": (
+				"propose_new_file",
+				{"path": f"{APP}/pkg/new_mod.py", "content": "z = 1\n", "commands": [migrate, restart]},
+			),
+		}
+		expected = {
+			"changes": [["--site", site, "migrate"], ["build", "--app", APP], ["restart"]],
+			"legacy edit": [["build", "--app", APP], ["--site", site, "migrate"], ["restart"]],
+			"new file": [["--site", site, "migrate"], ["restart"]],
+		}
+		for shape, (tool, arguments) in calls.items():
+			with self.subTest(shape=shape):
+				result = self.run_tool(tool, {**arguments, "reason": "r"})
+				self.assertTrue(result["ok"], result)
+				doc = self.stored(result)
+				self.assertEqual(json.loads(doc.command_list), expected[shape])
+				self.assertEqual(
+					(doc.change_kind, doc.reversible, doc.app, len(doc.operations)),
+					(CHANGE_KIND_CODE, 1, APP, 1),
+				)
+
+	def test_py_block_without_restart_refused(self):
+		self.sandbox.commit_file(APP, "pkg/mod.py", "x = 1\n")
+		snapshot = self.git_snapshot()
+		item = {"action": "edit", "path": f"{APP}/pkg/mod.py", "find": ["x = 1"], "replace": ["x = 2"]}
+		for commands in ([{"command": "migrate"}], [{"command": "migrate"}, {"command": "version"}]):
+			with self.subTest(commands=commands):
+				result = self.run_tool(
+					"propose_file_change", {"changes": [item], "commands": commands, "reason": "r"}
+				)
+				self.assert_refused_whole(result, change_guard.PY_NEEDS_RESTART, snapshot)
+
+	def test_command_only_block_has_no_branch(self):
+		snapshot = self.git_snapshot()
+		result = self.run_tool("propose_bench_command", {"command": "build", "app": APP, "reason": "r"})
+		self.assertEqual(set(result), {"ok", "proposal", "status", "comment"}, result)
+		doc = self.stored(result)
+		self.assertEqual(json.loads(doc.command_list), [["build", "--app", APP]])
+		self.assertEqual(
+			(doc.change_kind, doc.reversible, doc.app, len(doc.operations), doc.command_args or ""),
+			(CHANGE_KIND_COMMAND, 0, APP, 0, ""),
+		)
+		self.assertEqual(
+			(doc.target_branch, doc.upstream_ref, doc.ahead_count, doc.is_core_app), ("", "", 0, 0)
+		)
+		migrate = self.stored(self.run_tool("propose_bench_command", {"command": "migrate", "reason": "r"}))
+		self.assertEqual(
+			(migrate.app or "", json.loads(migrate.command_list)),
+			("", [["--site", frappe.local.site, "migrate"]]),
+		)
+		self.assertEqual(self.git_snapshot(), snapshot)
+
+	def test_bench_command_restart_plain_ok(self):
+		(spec,) = [spec for spec in propose_change.TOOLS if spec.name == "propose_bench_command"]
+		self.assertIn(
+			change_guard.RESTART_COMMAND, spec.schema["input_schema"]["properties"]["command"]["enum"]
+		)
+		self.assertFalse(hasattr(propose_change, "_SINGLE_BENCH_COMMANDS"))
+		through_tool = self.run_tool("propose_bench_command", {"command": "restart", "reason": "r"})
+		direct = propose_change.propose_bench_command({"command": "restart", "reason": "r"}, self.context())
+		for result in (through_tool, direct):
+			with self.subTest(result=result):
+				self.assertEqual((result["ok"], result["status"]), (True, CHANGE_STATUS_PENDING), result)
+				doc = self.stored(result)
+				self.assertEqual((json.loads(doc.command_list), doc.reversible), ([["restart"]], 0))
+		self.assertEqual(len(self.proposals()), 2)
+
+	def test_denied_command_refused_names_command(self):
+		self.sandbox.commit_file(APP, "pkg/a.txt", "a\n")
+		snapshot = self.git_snapshot()
+		item = {"action": "edit", "path": f"{APP}/pkg/a.txt", "find": ["a"], "replace": ["b"]}
+		cases = (
+			(
+				[{"command": "version"}, {"command": "update"}],
+				"lệnh 2: lệnh không có trong danh sách cho phép",
+			),
+			([{"command": "build", "app": "helpdesk"}], "lệnh 1: app không có trong danh sách được sửa"),
+			([{"command": "version"}, {"command": "build"}], "lệnh 2: lệnh build cần app"),
+			([{"command": "migrate", "app": APP}], "lệnh 1: lệnh này không nhận app"),
+			([{"command": "version", "extra": 1}], "tham số không hợp lệ: commands"),
+			(["version"], "tham số không hợp lệ: commands"),
+			({"command": "version"}, "tham số không hợp lệ: commands"),
+		)
+		for commands, reason in cases:
+			with self.subTest(commands=commands):
+				arguments = {"changes": [item], "commands": commands, "reason": "r"}
+				direct = propose_change.propose_file_change(arguments, self.context())
+				self.assert_refused_whole(direct, reason, snapshot)
+		new_file = {
+			"path": f"{APP}/pkg/n.txt",
+			"content": "n\n",
+			"commands": [{"command": "update"}],
+			"reason": "r",
+		}
+		refused = propose_change.propose_new_file(new_file, self.context())
+		self.assert_refused_whole(refused, "lệnh 1: lệnh không có trong danh sách cho phép", snapshot)
+
+	def test_no_effect_before_approval_tree_head_process_restart_stubs_unchanged(self):
+		self.sandbox.commit_file(APP, "pkg/a.py", "a = 1\n")
+		self.sandbox.commit_file(APP, "pkg/d.txt", "d\n")
+		self.sandbox.commit_file(APP, "pkg/r.txt", "r\n")
+		snapshot, tree = self.git_snapshot(), self.tree()
+		changes = [
+			{"action": "edit", "path": f"{APP}/pkg/a.py", "find": ["a = 1"], "replace": ["a = 2"]},
+			{"action": "create", "path": f"{APP}/pkg/new/n.py", "content": "n = 1\n"},
+			{"action": "delete", "path": f"{APP}/pkg/d.txt"},
+			{"action": "rename", "path": f"{APP}/pkg/r.txt", "new_path": f"{APP}/doc/r.txt"},
+		]
+		commands = [{"command": "migrate"}, {"command": "build", "app": APP}, {"command": "restart"}]
+		with (
+			patch.object(process_runner, "run_bench") as run_bench,
+			patch.object(process_runner, "launch_restart") as launch_restart,
+			patch("subprocess.Popen") as popen,
+		):
+			block = self.run_tool(
+				"propose_file_change", {"changes": changes, "commands": commands, "reason": "r"}
+			)
+			alone = self.run_tool("propose_bench_command", {"command": "restart", "reason": "r"})
+		self.assertTrue(block["ok"], block)
+		self.assertTrue(alone["ok"], alone)
+		self.assertEqual([len(self.stored(block).operations), len(self.proposals())], [4, 2])
+		self.assertEqual((run_bench.call_count, launch_restart.call_count, popen.call_count), (0, 0, 0))
+		self.assertEqual(self.git_snapshot(), snapshot)
+		self.assertEqual(self.tree(), tree)
+
+	def test_result_keys_stable(self):
+		self.sandbox.commit_file(APP, "pkg/a.txt", "a\n")
+		self.assertEqual(propose_change.PROPOSE_TOOL_NAMES, tuple(TOOL_NAMES))
+		with patch.object(propose_change, "_insert", wraps=propose_change._insert) as insert:
+			code = self.change(["a"], ["b"], f"{APP}/pkg/a.txt")
+			command = self.run_tool("propose_bench_command", {"command": "version", "reason": "r"})
+		self.assertEqual(set(code), {"ok", "proposal", "status", "comment", "branch"}, code)
+		self.assertEqual(set(command), {"ok", "proposal", "status", "comment"}, command)
+		for call in insert.call_args_list:
+			values = call.args[1]
+			with self.subTest(kind=values["change_kind"]):
+				self.assertIn("command_list", values)
+				self.assertEqual(set(values) & set(transitions.STATE_FIELDS), set())
+		with open(propose_change.__file__, encoding="utf-8") as handle:
+			code_text = handle.read()
+		self.assertEqual((code_text.count(".insert("), code_text.count("allow_agent_write()")), (1, 1))

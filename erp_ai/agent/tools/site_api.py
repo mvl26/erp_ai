@@ -55,10 +55,22 @@ SCHEMA_FIELDS = {
 	CUSTOM_FIELD_DOCTYPE: ("dt", "fieldname", "fieldtype", "options", "permlevel"),
 }
 TICKET_LINK_SCHEMA_REASON = "Custom Field / Property Setter đổi trường liên kết tới phiếu là gỡ chặn phiếu loại trừ, không làm qua công cụ"
-# Changing these on a field of policy.link_column_names takes it out of the exclusion (R10c): refused in every
-# mode. Moving a Custom Field to another DocType or fieldname takes its Link away too.
+# Changing these on a Custom Field of policy.link_column_names takes the field out of the exclusion (R10c): refused
+# in every mode. Moving a Custom Field to another DocType or fieldname takes its Link away too.
 TICKET_LINK_PROPERTIES = ("fieldtype", "options")
 CUSTOM_FIELD_TARGET_KEYS = ("dt", "fieldname")
+# Frappe applies every property of a Property Setter to the field, `fieldname` renaming it (R11b): on a field of
+# policy.link_column_names a Property Setter sets only these display properties, in every mode.
+TICKET_LINK_SETTER_PROPERTIES = (
+	"label",
+	"description",
+	"in_list_view",
+	"in_standard_filter",
+	"bold",
+	"print_hide",
+	"columns",
+	"width",
+)
 # Roles that would let an account command the bot or administer the site; never assignable here.
 FORBIDDEN_ROLES = frozenset({"System Manager", "Administrator", ROLE_INSTRUCTOR, ROLE_AGENT, "Guest", "All"})
 PROTECTED_USERS = frozenset({"Administrator", "Guest", AGENT_USER})
@@ -263,16 +275,16 @@ def _points_at_ticket(doctype, fieldname) -> bool:
 def ticket_link_schema_refusal(
 	doctype: str, values: dict, *, name: str | None = None, delete: bool = False
 ) -> str | None:
-	"""TICKET_LINK_SCHEMA_REASON when the write would change the fieldtype or options of a field that points at a
-	ticket (policy.link_column_names), or move, rename or delete its Custom Field (R10c), else None. Same
-	mechanism as permlevel_refusal: a Property Setter is refused when it sets, or (`name` given) already sets, a
-	property of TICKET_LINK_PROPERTIES on such a field; a Custom Field of such a field, before or after the write,
-	on `delete` or when a key of TICKET_LINK_PROPERTIES or CUSTOM_FIELD_TARGET_KEYS holds another value than the
-	stored one."""
+	"""TICKET_LINK_SCHEMA_REASON when the write would change a field that points at a ticket
+	(policy.link_column_names) other than by a display property (R11b), or change the fieldtype or options of its
+	Custom Field or move, rename or delete it (R10c), else None. Same mechanism as permlevel_refusal: a Property
+	Setter is refused when it sets, or (`name` given) already sets, a property outside TICKET_LINK_SETTER_PROPERTIES
+	on such a field; a Custom Field of such a field, before or after the write, on `delete` or when a key of
+	TICKET_LINK_PROPERTIES or CUSTOM_FIELD_TARGET_KEYS holds another value than the stored one."""
 	kind, stored, written = _schema_write(doctype, values, name)
 	if kind == PROPERTY_SETTER_DOCTYPE:
 		refused = any(
-			_key(record.get("property", "")) in TICKET_LINK_PROPERTIES
+			_key(record.get("property", "")) not in TICKET_LINK_SETTER_PROPERTIES
 			and _points_at_ticket(record.get("doc_type"), record.get("field_name"))
 			for record in (stored, written)
 		)
@@ -292,7 +304,7 @@ def ticket_link_schema_refusal(
 def _schema_refusal(
 	doctype: str, name, values: dict, ctx: ToolContext, *, delete: bool = False
 ) -> dict | None:
-	"""R10c in every mode, then C-6 unless the unrestricted switch is on."""
+	"""R10c and R11b in every mode, then C-6 unless the unrestricted switch is on."""
 	reason = ticket_link_schema_refusal(doctype, values, name=name, delete=delete)
 	if reason is None and not ctx.unrestricted:
 		reason = permlevel_refusal(doctype, values, name=name)

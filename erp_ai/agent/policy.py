@@ -428,8 +428,8 @@ TICKET_LINK_FIELDS = {
 	"Comment": (("reference_doctype", "reference_name"),),
 	"Communication": (("reference_doctype", "reference_name"),),
 	"File": (("attached_to_doctype", "attached_to_name"),),
-	# R10b, R10g: column names of the installed DocType JSON, every pair of the DocType. Version is refused by the
-	# record tool instead (R10e).
+	# R10b, R10g, R11a: column names of the installed DocType JSON, every pair of the DocType. Version is refused by
+	# the record tool instead (R10e).
 	"ToDo": (("reference_type", "reference_name"),),
 	"Notification Log": (("document_type", "document_name"), ("source_doctype", "source_name")),
 	"Activity Log": (
@@ -438,6 +438,11 @@ TICKET_LINK_FIELDS = {
 		("link_doctype", "link_name"),
 	),
 	"Email Queue": (("reference_doctype", "reference_name"),),
+	# R11a: Frappe's add_tag, which Helpdesk tags tickets with, stores the ticket subject in the Tag Link title.
+	"Tag Link": (("document_type", "document_name"),),
+	"Document Follow": (("ref_doctype", "ref_docname"),),
+	"Workflow Action": (("reference_doctype", "reference_name"),),
+	"Reminder": (("reminder_doctype", "reminder_docname"),),
 }
 # Records of a ticket that hold records of their own (R10a): Helpdesk keeps comment attachments on the Comment and
 # email attachments on the Communication, and Frappe points an "Attachment" Comment at its Comment. A record whose

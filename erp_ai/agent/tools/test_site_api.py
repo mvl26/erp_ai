@@ -1,3 +1,4 @@
+import contextlib
 import datetime
 import json
 import os
@@ -9,7 +10,7 @@ import frappe
 from frappe.tests.utils import FrappeTestCase
 from helpdesk.test_utils import make_ticket
 
-from erp_ai.agent import change_link, policy
+from erp_ai.agent import change_link, hard_bans, policy
 from erp_ai.agent.policy import PermissionSwitches
 from erp_ai.agent.tools import registry, site_api
 from erp_ai.agent.tools.registry import ToolContext, execute_tool, get_tool_schemas
@@ -2107,3 +2108,114 @@ class TestExcludedTicketWrites(_ExcludedTicketCase):
 					arguments = {"doctype": doctype, "name": name, "values": values}
 					self.assert_refused(site_api.update_record(arguments, context), doctype)
 					self.assertEqual(self.stored(doctype, name), before)
+
+
+PERMISSION_REFUSAL = "DocType này không được phép dùng qua công cụ"
+
+
+class TestPermissionVectors(FrappeTestCase):
+	"""AC-5: with the unrestricted switch off every permission vector is refused and its data stays as it was."""
+
+	def setUp(self):
+		commit_guard = patch.object(frappe.db, "commit", side_effect=AssertionError("commit in test"))
+		commit_guard.start()
+		self.addCleanup(commit_guard.stop)
+		self.addCleanup(frappe.db.rollback)
+		self.addCleanup(frappe.set_user, "Administrator")
+		frappe.set_user("Administrator")
+		keep_agent_settings(self)
+		_make_user(AGENT, ROLE_AGENT, "System Manager")
+		_make_user(BOSS, ROLE_INSTRUCTOR)
+		self.note = (
+			frappe.get_doc({"doctype": "Note", "title": f"{NOTE_TITLE} {uuid.uuid4().hex}"}).insert().name
+		)
+		frappe.set_user(AGENT)
+
+	def run_tool(self, name, arguments, context=None):
+		return execute_tool(name, arguments, context or _context())
+
+	def vectors(self):
+		"""`{label: (tool, arguments, stored)}`: one write per vector; `stored()` reads the data it would change."""
+		return {
+			"User Permission": (
+				"api_create_record",
+				{
+					"doctype": "User Permission",
+					"values": {"user": BOSS, "allow": "Role", "for_value": ALLOWED_ROLE},
+				},
+				lambda: frappe.db.count("User Permission", {"user": BOSS}),
+			),
+			"DocShare": (
+				"api_create_record",
+				{
+					"doctype": "DocShare",
+					"values": {"share_doctype": "Note", "share_name": self.note, "user": BOSS, "read": 1},
+				},
+				lambda: frappe.db.count("DocShare", {"share_doctype": "Note", "share_name": self.note}),
+			),
+			"Custom DocPerm": (
+				"api_create_record",
+				{"doctype": "Custom DocPerm", "values": {"role": ALLOWED_ROLE, "read": 1, "write": 1}},
+				lambda: frappe.db.count("Custom DocPerm", {"role": ALLOWED_ROLE}),
+			),
+			"Role": (
+				"api_update_record",
+				{"doctype": "Role", "name": ALLOWED_ROLE, "values": {"desk_access": 0}},
+				lambda: frappe.db.get_value("Role", ALLOWED_ROLE, "*", as_dict=True),
+			),
+			"DocType": (
+				"api_update_record",
+				{
+					"doctype": "DocType",
+					"name": "Note",
+					"values": {"permissions": [{"role": ALLOWED_ROLE, "read": 1, "write": 1}]},
+				},
+				lambda: frappe.get_all(
+					"DocPerm", {"parent": "Note"}, ["role", "permlevel", "read", "write"], order_by="idx asc"
+				),
+			),
+		}
+
+	def test_one_shared_list(self):
+		self.assertLessEqual({"User Permission", "DocShare"}, site_api.PERMISSION_DOCTYPES)
+		for doctype in ("User Permission", "DocShare"):
+			self.assertEqual(hard_bans.hard_ban_reason(doctype), "DocType phân quyền", doctype)
+
+	def test_six_vectors_refused_in_normal_mode(self):
+		for label, (tool, arguments, stored) in self.vectors().items():
+			# developer_mode is on: a DocType save would export JSON into the frappe app, so that write is stubbed.
+			write = patch.object(site_api, "_write") if label == "DocType" else contextlib.nullcontext()
+			with self.subTest(label), write:
+				before = stored()
+				result = self.run_tool(tool, arguments)
+				self.assertEqual(
+					result, {"ok": False, "reason": PERMISSION_REFUSAL, "doctype": arguments["doctype"]}
+				)
+				self.assertEqual(stored(), before)
+
+	def test_business_role_assignment_still_works(self):
+		# Role assignment stays a right of the record tools switch: only the six admin roles are refused.
+		for doctype in ("Has Role", "Role Profile", "User"):
+			self.assertNotIn(doctype, site_api.PERMISSION_DOCTYPES)
+		profile = self.run_tool(
+			"api_create_record",
+			{
+				"doctype": "Role Profile",
+				"values": {"role_profile": OTHER_PROFILE, "roles": [{"role": ALLOWED_ROLE}]},
+			},
+		)
+		self.assertTrue(profile["ok"], profile)
+		values = {
+			"email": NEW_USER,
+			"first_name": "Người mới",
+			"send_welcome_email": 0,
+			"roles": [{"role": ALLOWED_ROLE}],
+		}
+		created = self.run_tool("api_create_record", {"doctype": "User", "values": values})
+		self.assertTrue(created["ok"], created)
+		updated = self.run_tool(
+			"api_update_record",
+			{"doctype": "User", "name": NEW_USER, "values": {"role_profile_name": OTHER_PROFILE}},
+		)
+		self.assertTrue(updated["ok"], updated)
+		self.assertEqual({row.role for row in frappe.get_doc("User", NEW_USER).roles}, {ALLOWED_ROLE})

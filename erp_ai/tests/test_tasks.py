@@ -464,6 +464,8 @@ class TestCheckPrivilegeEscalation(FrappeTestCase):
 					"values": {"user": INSTRUCTOR, "allow": "Role", "for_value": "Desk User"},
 				},
 			),
+			# User Permission is a permission DocType (FEAT-007 AC-5): only the unrestricted mode writes it.
+			unrestricted=True,
 		)
 		self._agent_calls(
 			(

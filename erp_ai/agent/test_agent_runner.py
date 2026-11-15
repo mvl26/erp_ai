@@ -3175,3 +3175,13 @@ class TestRunnerGrant(RunnerTestBase):
 		(entry,) = self._entries(entry_type="classify")
 		self.assertEqual(entry.predicted_confidence_pct, 70)
 		self.assertTrue(results["t_cls"]["ok"])
+
+	def test_insert_reason_context_takes_category_cap_of_classification(self):
+		# before classification the category is unknown (UNKNOWN_CATEGORY_LEVEL L1); the stub's A is capped at L0
+		set_agent_settings(level_cap_a="L0")
+		self.gateway.results = [make_model_result(text=CLASSIFY_A), make_model_result()]
+		with patch.object(runner, "_reason", wraps=runner._reason) as reason:
+			self._run("ticket_insert")
+
+		context = reason.call_args.args[4]
+		self.assertEqual(context.main_path_level, "L0")

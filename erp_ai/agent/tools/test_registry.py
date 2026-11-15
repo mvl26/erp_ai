@@ -816,7 +816,7 @@ class TestGrantInputs(FrappeTestCase):
 		for main_path_level, expected in ((None, "L3"), ("L1", "L1"), ("L0", "L0")):
 			context = dataclasses.replace(base, main_path_level=main_path_level)
 			self.assertEqual(context.grant_inputs().main_path_level, expected, main_path_level)
-			self.assertEqual(context.grant_inputs().permission_level, "L3", main_path_level)
+			self.assertEqual(context.grant_inputs().effective_level, "L3", main_path_level)
 		for instructor, expected in ((None, False), ("", False), ("boss@x.com", True)):
 			context = dataclasses.replace(base, instructor=instructor)
 			self.assertIs(context.grant_inputs().has_instructor, expected, instructor)

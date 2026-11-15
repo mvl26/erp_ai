@@ -308,9 +308,49 @@ def _snapshot_fields(doctype: str, values: dict) -> tuple:
 	return (*values, *SNAPSHOT_TABLES.get(doctype, ()))
 
 
+def _excluded_refusal(doctype: str, name) -> dict | None:
+	"""ADR-034, in every mode: the stored record belongs to an excluded ticket (A-U2-3)."""
+	if policy.is_ticket_record_excluded(doctype, name):
+		return _fail(policy.EXCLUDED_TICKET_REASON, doctype)
+	return None
+
+
+def _linked_tickets(columns, values: dict) -> list[str]:
+	"""Names of the tickets `values` point at, over the `(type column, name column)` pairs of
+	policy.ticket_link_columns; the type is compared by its stored DocType name."""
+	tickets = []
+	for type_column, name_column in columns:
+		ticket = values.get(name_column)
+		if ticket in EMPTY_VALUES:
+			continue
+		if type_column and _stored_name(DOCTYPE_DOCTYPE, values.get(type_column)) != policy.TICKET_DOCTYPE:
+			continue
+		tickets.append(str(ticket))
+	return tickets
+
+
+def _link_refusal(doctype: str, values: dict, name=None) -> dict | None:
+	"""C-7, in every mode: `values` would link the record to a ticket that fails can_send_ticket. On an update
+	(`name` given) the stored value stands in for each link column `values` does not set."""
+	pairs = policy.ticket_link_columns(doctype)
+	columns = [column for pair in pairs for column in pair if column]
+	if not any(column in values for column in columns):
+		return None
+	stored = frappe.db.get_value(doctype, name, columns, as_dict=True) if name is not None else None
+	if any(
+		not policy.can_send_ticket(ticket) for ticket in _linked_tickets(pairs, {**(stored or {}), **values})
+	):
+		return _fail(policy.EXCLUDED_TICKET_REASON, doctype)
+	return None
+
+
 def create_record(args: dict, ctx: ToolContext) -> dict:
 	doctype, values = _stored_name(DOCTYPE_DOCTYPE, args["doctype"]), args["values"]
-	if refusal := _doctype_refusal(doctype, ctx) or _values_refusal(doctype, values, ctx):
+	if refusal := (
+		_doctype_refusal(doctype, ctx)
+		or _values_refusal(doctype, values, ctx)
+		or _link_refusal(doctype, values)
+	):
 		return refusal
 
 	def save():
@@ -333,6 +373,8 @@ def update_record(args: dict, ctx: ToolContext) -> dict:
 		return _fail("tài khoản này không được sửa qua công cụ", doctype)
 	if not frappe.get_meta(doctype).issingle and not frappe.db.exists(doctype, name):
 		return _fail("không tìm thấy bản ghi", doctype)
+	if refusal := _excluded_refusal(doctype, name) or _link_refusal(doctype, values, name):
+		return refusal
 
 	def save():
 		doc = frappe.get_doc(doctype, name)
@@ -354,7 +396,7 @@ def _existing_refusal(doctype: str, name: str, ctx: ToolContext) -> dict | None:
 		return refusal
 	if not frappe.db.exists(doctype, name):
 		return _fail("không tìm thấy bản ghi", doctype)
-	return None
+	return _excluded_refusal(doctype, name)
 
 
 def delete_record(args: dict, ctx: ToolContext) -> dict:

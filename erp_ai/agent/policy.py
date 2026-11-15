@@ -423,7 +423,10 @@ def is_ticket_content_doctype(doctype: str) -> bool:
 
 
 EXCLUDED_TICKET_REASON = "bản ghi thuộc phiếu không được phép đưa cho AI"
-# DocType that names its ticket by (type column, name column) pairs -> the pairs, each enough alone.
+# DocType that names its ticket by (type column, name column) pairs -> the pairs, each enough alone. R11d:
+# ticket_link_columns adds every (Link to DocType, Dynamic Link) pair of the live meta, so only a pair whose name
+# column is not a Dynamic Link has to be listed here (File, Email Queue, Notification Log's document pair); the
+# other entries are derived too and stay as pins that hold whatever the meta says.
 TICKET_LINK_FIELDS = {
 	"Comment": (("reference_doctype", "reference_name"),),
 	"Communication": (("reference_doctype", "reference_name"),),
@@ -454,13 +457,24 @@ EMPTY_LINK_VALUES = (None, "", [])
 
 
 def ticket_link_columns(doctype: str) -> tuple[tuple[str | None, str], ...]:
-	"""Every column that points a record of this DocType at a ticket: the dynamic pairs of TICKET_LINK_FIELDS
-	(if any) plus `(None, fieldname)` for each Link to HD Ticket; () for HD Ticket and for a missing DocType.
-	The one reader of TICKET_LINK_FIELDS (C-U2-1)."""
+	"""Every column that points a record of this DocType at a ticket: its dynamic pairs, each once, plus
+	`(None, fieldname)` for each Link to HD Ticket; () for HD Ticket and for a missing DocType. The dynamic pairs are
+	its entries of TICKET_LINK_FIELDS, then (R11d) each `(Link to DocType, Dynamic Link whose options name that
+	Link)` of the live meta, Custom Fields included, meta order. The one reader of TICKET_LINK_FIELDS (C-U2-1)."""
 	name = _stored_doctype_name(doctype)
 	if not name or name == TICKET_DOCTYPE:
 		return ()
-	return (*TICKET_LINK_FIELDS.get(name, ()), *((None, field) for field in ticket_link_fieldnames(name)))
+	fields = frappe.get_meta(name).fields
+	type_columns = {
+		field.fieldname for field in fields if field.fieldtype == "Link" and field.options == "DocType"
+	}
+	derived = (
+		(field.options, field.fieldname)
+		for field in fields
+		if field.fieldtype == "Dynamic Link" and field.options in type_columns
+	)
+	pairs = dict.fromkeys((*TICKET_LINK_FIELDS.get(name, ()), *derived))
+	return (*pairs, *((None, field) for field in ticket_link_fieldnames(name)))
 
 
 def parent_link_fields(doctype: str) -> tuple[tuple[str, str], ...]:

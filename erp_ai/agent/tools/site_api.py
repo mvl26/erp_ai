@@ -49,19 +49,18 @@ PERMLEVEL_PROPERTY = "permlevel"
 PERMLEVEL_REASON = "Property Setter đổi permlevel là sửa phân quyền, không làm qua công cụ"
 # Setting a field's permlevel changes permissions too (AC-5, C-6): refused unless the unrestricted switch is on.
 PERMLEVEL_DOCTYPES = (PROPERTY_SETTER_DOCTYPE, CUSTOM_FIELD_DOCTYPE)
-# The stored fields of a Property Setter / Custom Field that the schema checks compare a write with.
+# The stored fields of a Property Setter / Custom Field that the schema checks compare a write with, besides every
+# column the write sets.
 SCHEMA_FIELDS = {
 	PROPERTY_SETTER_DOCTYPE: ("doc_type", "field_name", "property"),
 	CUSTOM_FIELD_DOCTYPE: ("dt", "fieldname", "fieldtype", "options", "permlevel"),
 }
 TICKET_LINK_SCHEMA_REASON = "Custom Field / Property Setter đổi trường liên kết tới phiếu là gỡ chặn phiếu loại trừ, không làm qua công cụ"
-# Changing these on a Custom Field of policy.link_column_names takes the field out of the exclusion (R10c): refused
-# in every mode. Moving a Custom Field to another DocType or fieldname takes its Link away too.
-TICKET_LINK_PROPERTIES = ("fieldtype", "options")
-CUSTOM_FIELD_TARGET_KEYS = ("dt", "fieldname")
-# Frappe applies every property of a Property Setter to the field, `fieldname` renaming it (R11b): on a field of
-# policy.link_column_names a Property Setter sets only these display properties, in every mode.
-TICKET_LINK_SETTER_PROPERTIES = (
+# Frappe applies every property of a Property Setter to the field, `fieldname` renaming it (R11b), and a Custom Field
+# key such as `fetch_from` can rewrite the stored link (R11e): on a field of policy.link_column_names a Property Setter
+# sets, and a Custom Field changes, only these display properties, in every mode. Moving, retyping or deleting such
+# a Custom Field takes the field out of the exclusion too (R10c).
+TICKET_LINK_DISPLAY_PROPERTIES = (
 	"label",
 	"description",
 	"in_list_view",
@@ -71,6 +70,8 @@ TICKET_LINK_SETTER_PROPERTIES = (
 	"columns",
 	"width",
 )
+# The Property Setter property that renames a field (R11f).
+RENAME_PROPERTY = "fieldname"
 # Roles that would let an account command the bot or administer the site; never assignable here.
 FORBIDDEN_ROLES = frozenset({"System Manager", "Administrator", ROLE_INSTRUCTOR, ROLE_AGENT, "Guest", "All"})
 PROTECTED_USERS = frozenset({"Administrator", "Guest", AGENT_USER})
@@ -239,15 +240,18 @@ def _is_permlevel(text) -> bool:
 
 
 def _schema_write(doctype: str, values: dict, name) -> tuple[str | None, dict, dict]:
-	"""`(kind, stored, written)` of a Property Setter or Custom Field write (`kind` says which): the stored record
-	`name` (`{}` for a new one) and the record as `values` would leave it, keys taken by _key; `(None, {}, {})` for
-	any other DocType."""
+	"""`(kind, stored, written)` of a Property Setter or Custom Field write (`kind` says which): the SCHEMA_FIELDS and
+	every column `values` sets of the stored record `name` (`{}` for a new one), and the record as `values` would
+	leave it, keys taken by _key; `(None, {}, {})` for any other DocType."""
 	kind = next((item for item in SCHEMA_FIELDS if _named_in(doctype, (item,))), None)
 	if kind is None:
 		return None, {}, {}
-	stored = frappe.db.get_value(kind, name, SCHEMA_FIELDS[kind], as_dict=True) if name is not None else None
+	changes = {_key(key): value for key, value in values.items()}
+	meta = frappe.get_meta(kind)
+	columns = list(dict.fromkeys([*SCHEMA_FIELDS[kind], *(key for key in changes if meta.has_field(key))]))
+	stored = frappe.db.get_value(kind, name, columns, as_dict=True) if name is not None else None
 	stored = dict(stored or {})
-	return kind, stored, {**stored, **{_key(key): value for key, value in values.items()}}
+	return kind, stored, {**stored, **changes}
 
 
 def permlevel_refusal(doctype: str, values: dict, *, name: str | None = None) -> str | None:
@@ -266,32 +270,44 @@ def permlevel_refusal(doctype: str, values: dict, *, name: str | None = None) ->
 
 
 def _points_at_ticket(doctype, fieldname) -> bool:
-	"""`fieldname` is a column of policy.link_column_names(doctype), compared by _key."""
+	"""`fieldname` is a column of policy.link_column_names(doctype), compared by _key, or the name a stored Property
+	Setter renamed one of them from (R11f: Frappe applies the rename, so the live meta knows the field by its new
+	name only)."""
 	if not isinstance(doctype, str) or not doctype or fieldname in EMPTY_VALUES:
 		return False
-	return _key(fieldname) in {_key(column) for column in policy.link_column_names(doctype)}
+	columns = policy.link_column_names(doctype)
+	if _key(fieldname) in {_key(column) for column in columns}:
+		return True
+	rename = {
+		"doc_type": doctype,
+		"field_name": str(fieldname).strip(),
+		"property": RENAME_PROPERTY,
+		"value": ["in", columns],
+	}
+	return bool(columns) and bool(frappe.db.exists(PROPERTY_SETTER_DOCTYPE, rename))
 
 
 def ticket_link_schema_refusal(
 	doctype: str, values: dict, *, name: str | None = None, delete: bool = False
 ) -> str | None:
 	"""TICKET_LINK_SCHEMA_REASON when the write would change a field that points at a ticket
-	(policy.link_column_names) other than by a display property (R11b), or change the fieldtype or options of its
-	Custom Field or move, rename or delete it (R10c), else None. Same mechanism as permlevel_refusal: a Property
-	Setter is refused when it sets, or (`name` given) already sets, a property outside TICKET_LINK_SETTER_PROPERTIES
-	on such a field; a Custom Field of such a field, before or after the write, on `delete` or when a key of
-	TICKET_LINK_PROPERTIES or CUSTOM_FIELD_TARGET_KEYS holds another value than the stored one."""
+	(policy.link_column_names, or a name a stored rename came from) other than by a display property (R11b, R11e),
+	or move, rename or delete its Custom Field (R10c), else None. Same mechanism as permlevel_refusal: a Property
+	Setter is refused when it sets, or (`name` given) already sets, a property outside TICKET_LINK_DISPLAY_PROPERTIES
+	on such a field (R11f: the stored row is judged too, so a rename a person made stays); a Custom Field of such a
+	field, before or after the write, on `delete` or when a key outside TICKET_LINK_DISPLAY_PROPERTIES holds another
+	value than the stored one."""
 	kind, stored, written = _schema_write(doctype, values, name)
 	if kind == PROPERTY_SETTER_DOCTYPE:
 		refused = any(
-			_key(record.get("property", "")) not in TICKET_LINK_SETTER_PROPERTIES
+			_key(record.get("property", "")) not in TICKET_LINK_DISPLAY_PROPERTIES
 			and _points_at_ticket(record.get("doc_type"), record.get("field_name"))
 			for record in (stored, written)
 		)
 	elif kind == CUSTOM_FIELD_DOCTYPE:
-		keys = (*TICKET_LINK_PROPERTIES, *CUSTOM_FIELD_TARGET_KEYS)
 		changed = delete or any(
-			_key(key) in keys and value != stored.get(_key(key)) for key, value in values.items()
+			_key(key) not in TICKET_LINK_DISPLAY_PROPERTIES and value != stored.get(_key(key))
+			for key, value in values.items()
 		)
 		refused = changed and any(
 			_points_at_ticket(record.get("dt"), record.get("fieldname")) for record in (stored, written)
@@ -304,7 +320,7 @@ def ticket_link_schema_refusal(
 def _schema_refusal(
 	doctype: str, name, values: dict, ctx: ToolContext, *, delete: bool = False
 ) -> dict | None:
-	"""R10c and R11b in every mode, then C-6 unless the unrestricted switch is on."""
+	"""R10c, R11b, R11e and R11f in every mode, then C-6 unless the unrestricted switch is on."""
 	reason = ticket_link_schema_refusal(doctype, values, name=name, delete=delete)
 	if reason is None and not ctx.unrestricted:
 		reason = permlevel_refusal(doctype, values, name=name)

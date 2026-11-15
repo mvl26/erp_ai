@@ -18,6 +18,7 @@ from erp_ai.agent import answer_delay, authority, policy, runner
 from erp_ai.agent.agent_write_guard import allow_agent_write
 from erp_ai.agent.classification import DEFAULT_CATEGORY_MAPPING
 from erp_ai.agent.prompts import (
+	ACT_NOW_BLOCK,
 	CHANGE_TOOLS_BLOCK,
 	SITE_ADMIN_TOOLS_BLOCK,
 	TASK_COMMENT,
@@ -30,7 +31,7 @@ from erp_ai.agent.prompts import (
 from erp_ai.agent.run_log import write_entry
 from erp_ai.agent.tools import registry, site_api
 from erp_ai.agent.tools.read import TOOL_RESULT_MAX_CHARS
-from erp_ai.agent.tools.registry import get_tool_schemas
+from erp_ai.agent.tools.registry import ASK_TOOL_NAMES, get_tool_schemas
 from erp_ai.agent.tools.source import GIT_READ_SUBCOMMANDS, git_global_options
 from erp_ai.constants import (
 	AGENT_USER,
@@ -921,7 +922,14 @@ class TestRunnerReasoning(RunnerTestBase):
 		self.assertNotIn("create_task", names)
 		self.assertEqual(call["tools"][-1]["cache_control"], {"type": "ephemeral"})
 		self.assertTrue(all("cache_control" not in tool for tool in call["tools"][:-1]))
-		self.assertTrue(all("cache_control" not in tool for tool in get_tool_schemas("L1", False, False)))
+		self.assertTrue(
+			all(
+				"cache_control" not in tool
+				for tool in get_tool_schemas(
+					registry.GrantInputs("L1", "L1", False, policy.PermissionSwitches())
+				)
+			)
+		)
 
 	def test_reason_system_shows_configured_people(self):
 		user, prefix_user, head = (make_active_agent(self) for _ in range(3))
@@ -1212,7 +1220,11 @@ class TestRunnerSiteAdminTools(RunnerTestBase):
 	def setUp(self):
 		super().setUp()
 		set_agent_settings(
-			permission_level="L3", code_change_enabled=1, unrestricted_enabled=0, monthly_budget_usd=1000
+			permission_level="L3",
+			code_change_enabled=1,
+			record_tools_enabled=1,
+			unrestricted_enabled=0,
+			monthly_budget_usd=1000,
 		)
 
 	def _offered(self):
@@ -1237,8 +1249,8 @@ class TestRunnerSiteAdminTools(RunnerTestBase):
 		self.assertNotIn(SITE_ADMIN_TOOLS_BLOCK, system)
 
 	def test_not_offered_with_switch_off_or_below_l3(self):
-		for settings in ({"code_change_enabled": 0}, {"permission_level": "L2"}):
-			set_agent_settings(permission_level="L3", code_change_enabled=1)
+		for settings in ({"record_tools_enabled": 0}, {"permission_level": "L2"}):
+			set_agent_settings(permission_level="L3", code_change_enabled=1, record_tools_enabled=1)
 			set_agent_settings(**settings)
 			self.gateway.calls.clear()
 			with patch.object(authority, "run_instructor", return_value="Administrator"):
@@ -1815,7 +1827,11 @@ class TestRunnerRecordSnapshots(RunnerTestBase):
 	def setUp(self):
 		super().setUp()
 		set_agent_settings(
-			permission_level="L3", code_change_enabled=1, unrestricted_enabled=0, monthly_budget_usd=1000
+			permission_level="L3",
+			code_change_enabled=1,
+			record_tools_enabled=1,
+			unrestricted_enabled=0,
+			monthly_budget_usd=1000,
 		)
 		make_instructor(self)
 
@@ -2190,6 +2206,7 @@ class TestRunnerTurnUndo(RunnerTestBase):
 		set_agent_settings(
 			permission_level="L3",
 			code_change_enabled=1,
+			record_tools_enabled=1,
 			unrestricted_enabled=0,
 			monthly_budget_usd=1000,
 			max_turns_per_run=8,
@@ -2680,7 +2697,11 @@ class TestRunnerPrivilegeAlarmEndToEnd(RunnerTestBase):
 	def setUp(self):
 		super().setUp()
 		set_agent_settings(
-			permission_level="L3", code_change_enabled=1, unrestricted_enabled=0, monthly_budget_usd=1000
+			permission_level="L3",
+			code_change_enabled=1,
+			record_tools_enabled=1,
+			unrestricted_enabled=0,
+			monthly_budget_usd=1000,
 		)
 		make_instructor(self)
 		self.addCleanup(frappe.clear_cache, user=ALARM_USER)
@@ -2769,7 +2790,9 @@ class TestRunnerChangeGrant(RunnerTestBase):
 		set_agent_settings(
 			permission_level="L3",
 			code_change_enabled=1,
+			record_tools_enabled=1,
 			code_change_apps="frappe\nhrms\nfrappe",
+			act_now_enabled=0,
 			unrestricted_enabled=0,
 			monthly_budget_usd=1000,
 			spent_this_month_usd=0,
@@ -2789,7 +2812,7 @@ class TestRunnerChangeGrant(RunnerTestBase):
 		return build_reason_system(f"{PREFIX}digest", self.table)
 
 	def test_switch_off_run_sends_base_tools_and_prompt(self):
-		set_agent_settings(code_change_enabled=0)
+		set_agent_settings(code_change_enabled=0, record_tools_enabled=0)
 		names, system = self._call()
 
 		self.assertEqual(names, BASE_TOOL_NAMES_WITH_INSTRUCTOR)
@@ -2815,38 +2838,35 @@ class TestRunnerChangeGrant(RunnerTestBase):
 		self.assertEqual(system, self._base_system())
 		self.assertNotIn(CHANGE_TOOLS_BLOCK, system[0]["text"])
 
-	def test_over_budget_l3_keeps_unrestricted_tools(self):
-		# AC-2 (c): the budget lowers L3 to L1, the full-power switch still grants every record tool.
+	def test_over_budget_l3_drops_unrestricted_tools(self):
+		# FEAT-007 AC-7 [changed] (K-4, replaces FEAT-004 AC-2 (c)): the budget lowers L3 to L1 and the full-power
+		# switch no longer grants the record tools.
 		set_agent_settings(monthly_budget_usd=10, unrestricted_enabled=1)
 		self.month_spend.return_value = 10.01
 		names, system = self._call()
 
-		self.assertEqual(
-			names,
-			[
-				*BASE_TOOL_NAMES_WITH_INSTRUCTOR,
-				*SITE_ADMIN_TOOL_NAMES,
-				"api_delete_record",
-				"api_submit_record",
-				"api_call_method",
-			],
-		)
-		self.assertEqual(
-			system,
-			build_reason_system(
-				f"{PREFIX}digest", self.table, site_admin_tools=True, unrestricted_tools=True
-			),
-		)
-		self.assertIn(UNRESTRICTED_TOOLS_BLOCK, system[0]["text"])
+		self.assertEqual(names, BASE_TOOL_NAMES_WITH_INSTRUCTOR)
+		self.assertEqual(system, self._base_system())
+		self.assertNotIn(UNRESTRICTED_TOOLS_BLOCK, system[0]["text"])
 		self.assertNotIn(CHANGE_TOOLS_BLOCK, system[0]["text"])
 
 	def test_runner_asks_registry_once(self):
-		# ADR-023 QĐ 4: one schema call per `_reason`, carrying all four grant inputs.
+		# ADR-023 QĐ 4, U1.md:263: one grant call per `_reason`, carrying the grant inputs of the run.
 		set_agent_settings(unrestricted_enabled=1)
-		with patch.object(runner, "get_tool_schemas", wraps=runner.get_tool_schemas) as schemas:
+		with patch.object(runner, "grant", wraps=runner.grant) as granted:
 			names, _system = self._call()
 
-		schemas.assert_called_once_with("L3", True, True, True)
+		granted.assert_called_once()
+		(inputs,) = granted.call_args.args
+		self.assertEqual(
+			(
+				inputs.effective_level,
+				inputs.has_instructor,
+				inputs.switches.code_change,
+				inputs.switches.unrestricted,
+			),
+			("L3", True, True, True),
+		)
 		self.assertFalse(hasattr(runner, "get_unrestricted_tool_schemas"))
 		self.assertEqual(len(names), len(set(names)))
 
@@ -2879,10 +2899,14 @@ class TestRunnerChangeGrant(RunnerTestBase):
 		for case, settings, instructor in (
 			("L3 without instructor", {}, None),
 			("L2 with the switch on", {"permission_level": "L2"}, "Administrator"),
-			("L3 with the switch off", {"code_change_enabled": 0}, "Administrator"),
+			(
+				"L3 with the switch off",
+				{"code_change_enabled": 0, "record_tools_enabled": 0},
+				"Administrator",
+			),
 		):
 			with self.subTest(case):
-				set_agent_settings(permission_level="L3", code_change_enabled=1)
+				set_agent_settings(permission_level="L3", code_change_enabled=1, record_tools_enabled=1)
 				set_agent_settings(**settings)
 				names, system = self._call(instructor)
 
@@ -3135,6 +3159,10 @@ class TestRunnerGrant(RunnerTestBase):
 		self.assertFalse(results["t_cls"]["ok"])
 		self.assertIn("không được cấp", results["t_cls"]["reason"])
 		self.assertTrue(results["t_ask"]["ok"])
+		offered = {tool["name"] for tool in self.gateway.calls[0]["tools"]}
+		ticket_write = {spec.name for spec in registry._all_specs() if spec.group == "ticket_write"}
+		self.assertLessEqual(offered & ticket_write, ASK_TOOL_NAMES)
+		self.assertIn("post_comment", offered)
 
 	def test_comment_run_at_threshold_from_classify_row_gets_ticket_write(self):
 		results = self._run_classified(70)
@@ -3202,3 +3230,109 @@ class TestRunnerGrant(RunnerTestBase):
 
 		context = reason.call_args.args[4]
 		self.assertEqual(context.main_path_level, "L0")
+
+	# T82 (U1.md:263): `_reason` takes its tools and prompt block flags from grant(context.grant_inputs()).
+
+	def _offered_names(self):
+		(call,) = self.gateway.calls
+		return [tool["name"] for tool in call["tools"]]
+
+	def _month_spend_from_ticket_log(self, now=None):
+		"""The month's spend summed over this ticket's own ERP AI Log rows, never the shared site's (STD-TEST-6)."""
+		costs = frappe.get_all(LOG_DOCTYPE, filters={"ticket": self.ticket.name}, pluck="cost_usd")
+		return float(sum(cost or 0 for cost in costs))
+
+	def _seed_spend(self, cost_usd):
+		"""A costed `reason` row of this ticket, as a run earlier in the day leaves; read by the month's spend."""
+		frappe.set_user("Administrator")
+		write_entry(
+			ticket=self.ticket.name,
+			run_id=f"{PREFIX}run-spend",
+			entry_type="reason",
+			trigger="comment_mention",
+			turn=1,
+			cost_usd=cost_usd,
+		)
+
+	def _all_switches_on(self):
+		set_agent_settings(
+			permission_level="L3",
+			code_change_enabled=1,
+			record_tools_enabled=1,
+			act_now_enabled=1,
+			unrestricted_enabled=1,
+			one_click_approval_enabled=1,
+			monthly_budget_usd=1,
+			max_runs_per_ticket_per_day=10,  # two runs and a seeded row on one ticket
+		)
+		self.month_spend.side_effect = self._month_spend_from_ticket_log
+
+	def _l1_tool_names(self):
+		"""The tools of L1 with an instructor and the five switches off (AC-7)."""
+		inputs = registry.GrantInputs("L1", "L1", True, policy.PermissionSwitches())
+		return [schema["name"] for schema in get_tool_schemas(inputs)]
+
+	def test_reason_prompt_flags_come_from_grant(self):
+		# AC-6: (2) on, (3) off at L3 with an instructor -> the record block and no act-now block.
+		set_agent_settings(permission_level="L3", record_tools_enabled=1, prompt_digest=f"{PREFIX}digest")
+		table = build_routing_table(DEFAULT_CATEGORY_MAPPING, json.loads(make_routing_rules()), {})
+		with patch.object(authority, "run_instructor", return_value="Administrator"):
+			self._run("comment_mention")
+
+		(call,) = self.gateway.calls
+		self.assertEqual(call["system"], build_reason_system(f"{PREFIX}digest", table, site_admin_tools=True))
+		system = call["system"][0]["text"]
+		self.assertIn(SITE_ADMIN_TOOLS_BLOCK, system)
+		self.assertNotIn(ACT_NOW_BLOCK, system)
+
+		# (3) on as well: the act-now flag of the grant reaches the prompt.
+		set_agent_settings(act_now_enabled=1)
+		self.gateway.calls.clear()
+		with patch.object(authority, "run_instructor", return_value="Administrator"):
+			self._run("comment_mention")
+
+		(call,) = self.gateway.calls
+		self.assertEqual(
+			call["system"],
+			build_reason_system(f"{PREFIX}digest", table, site_admin_tools=True, act_now=True),
+		)
+
+	def test_over_budget_run_offers_l1_tool_set(self):
+		# AC-7: a log row above the budget, all five switches on, an instructor -> the L1 tool set.
+		self._all_switches_on()
+		self._seed_spend(2.0)
+		with patch.object(authority, "run_instructor", return_value="Administrator"):
+			self._run("comment_mention")
+
+		self.assertEqual(self._offered_names(), self._l1_tool_names())
+
+	def test_log_seeded_midday_over_budget_next_run_l1(self):
+		# AC-61: each run reads the month's spend from the log; a row seeded between two runs lowers the next.
+		self._all_switches_on()
+		with patch.object(authority, "run_instructor", return_value="Administrator"):
+			self._run("comment_mention")
+			first = self._offered_names()
+			self._seed_spend(2.0)
+			self.gateway.calls.clear()
+			self._run("comment_mention")
+
+		self.assertIn("propose_file_change", first)
+		self.assertIn("api_delete_record", first)
+		self.assertEqual(self._offered_names(), self._l1_tool_names())
+
+	def test_low_confidence_with_instructor_and_act_now_keeps_record_tools(self):
+		# AC-22: an instructor with (3) on is never below the threshold, so 69 % keeps the record tools of (2).
+		set_agent_settings(permission_level="L3", record_tools_enabled=1, act_now_enabled=1)
+		self.latest_classification.return_value = (SEEDED_CLASSIFICATION[0], 69)
+		with patch.object(authority, "run_instructor", return_value="Administrator"):
+			self._run("comment_mention")
+
+		self.assertIn("api_create_record", self._offered_names())
+
+		# (3) off: the same 69 % is below the threshold and the record tools are gone.
+		set_agent_settings(act_now_enabled=0)
+		self.gateway.calls.clear()
+		with patch.object(authority, "run_instructor", return_value="Administrator"):
+			self._run("comment_mention")
+
+		self.assertNotIn("api_create_record", self._offered_names())

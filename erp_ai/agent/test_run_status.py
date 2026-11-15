@@ -3,6 +3,7 @@ from unittest.mock import patch
 import frappe
 from frappe.tests.utils import FrappeTestCase
 
+from erp_ai.agent.policy import PermissionSwitches
 from erp_ai.agent.run_status import (
 	CLASSIFY_STEP,
 	FALLBACK_WORK_LABEL,
@@ -11,7 +12,7 @@ from erp_ai.agent.run_status import (
 	WORKING_TEXT,
 	RunStatus,
 )
-from erp_ai.agent.tools.registry import get_tool_schemas
+from erp_ai.agent.tools.registry import GrantInputs, get_tool_schemas
 from erp_ai.constants import LEVELS
 from erp_ai.test_utils import record_status_signals
 
@@ -42,7 +43,17 @@ class TestRunStatus(FrappeTestCase):
 		return status
 
 	def test_every_granted_tool_and_classify_step_has_label(self):
-		granted = {schema["name"] for schema in get_tool_schemas(LEVELS[-1], True, False)}
+		granted = {
+			schema["name"]
+			for schema in get_tool_schemas(
+				GrantInputs(
+					effective_level=LEVELS[-1],
+					main_path_level=LEVELS[-1],
+					has_instructor=True,
+					switches=PermissionSwitches(),
+				)
+			)
+		}
 
 		self.assertEqual(CLASSIFY_STEP, "classify")
 		self.assertEqual(set(WORK_LABELS), granted | {CLASSIFY_STEP})

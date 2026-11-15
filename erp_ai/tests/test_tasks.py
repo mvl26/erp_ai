@@ -291,6 +291,7 @@ class TestCheckPrivilegeEscalation(FrappeTestCase):
 			agent_user=AGENT_USER,
 			change_enabled=True,
 			unrestricted=unrestricted,
+			record_tools=True,
 		)
 		actions, before, after = [], {}, {}
 		with self._as_agent():

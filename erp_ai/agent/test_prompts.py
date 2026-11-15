@@ -3,6 +3,8 @@ import itertools
 from frappe.tests.utils import FrappeTestCase
 
 from erp_ai.agent import prompts
+from erp_ai.agent.policy import PermissionSwitches
+from erp_ai.agent.tools import registry
 from erp_ai.test_utils import keep_agent_settings
 
 FLAG_NAMES = ("change_tools", "site_admin_tools", "unrestricted_tools", "act_now", "ask_only")
@@ -99,18 +101,9 @@ def _flag_blocks():
 def _expected_blocks(flags):
 	"""Names of the blocks build_reason_system appends for these flags.
 
-	The record block yields to the full-access block, and every tool flag brings ACT_NOW_BLOCK: both derivations stay
-	until T82 moves them into `grant`.
+	Each block follows its own flag (U1.md:227); the record-block and act-now rules now live in `grant`.
 	"""
-	tools = flags["change_tools"] or flags["site_admin_tools"] or flags["unrestricted_tools"]
-	present = {
-		"change_tools": flags["change_tools"],
-		"site_admin_tools": flags["site_admin_tools"] and not flags["unrestricted_tools"],
-		"unrestricted_tools": flags["unrestricted_tools"],
-		"act_now": flags["act_now"] or tools,
-		"ask_only": flags["ask_only"],
-	}
-	return [name for name, _block in _flag_blocks() if present[name]]
+	return [name for name, _block in _flag_blocks() if flags[name]]
 
 
 def _parts(text):
@@ -245,6 +238,23 @@ class TestCorePrompt(FrappeTestCase):
 		for name, block in _flag_blocks():
 			for heading in RETIRED_HEADINGS:
 				self.assertNotIn(heading, block, name)
+
+	def test_no_wait_for_ok_five_switches_off_l1_to_l3(self):
+		# AC-66, AC-6 (design-addendum-3-w1 U1-7): flags from `grant` with the five switches off, at L1, L2, L3.
+		for level in ("L1", "L2", "L3"):
+			granted = registry.grant(registry.GrantInputs(level, level, True, PermissionSwitches()))
+			text = prompts.build_reason_system(
+				"DIGEST-XYZ",
+				"ROUTING-ABC",
+				change_tools=granted.change_block,
+				site_admin_tools=granted.record_block,
+				unrestricted_tools=granted.unrestricted_block,
+				act_now=granted.act_now_block,
+				ask_only=granted.ask_only_block,
+			)[0]["text"]
+			self.assertNotIn('chờ một chữ "ok"', text, level)
+			self.assertNotIn("Việc hoàn tác được thì làm luôn", text, level)
+			self.assertIn(prompts.NO_OK_APPROVAL, text, level)
 
 	def test_rule_6_points_to_approve_now_in_the_bot_panel(self):
 		# AC-39, AC-65 (a) of spec-addendum-5: the button is "Duyệt ngay" in the "Trao đổi với bot" panel.

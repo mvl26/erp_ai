@@ -456,7 +456,8 @@ class TestPrompts(FrappeTestCase):
 		self.assertEqual(len(blocks), 1)
 		self.assertEqual(blocks[0]["cache_control"], {"type": "ephemeral"})
 		text = blocks[0]["text"]
-		self.assertEqual(text, "\n\n".join([head, block, prompts.ACT_NOW_BLOCK, "DIGEST-XYZ"]))
+		self.assertEqual(text, "\n\n".join([head, block, "DIGEST-XYZ"]))
+		self.assertNotIn(prompts.ACT_NOW_BLOCK, text)
 		self.assertTrue(text.startswith(core))
 		self.assertEqual(text[: text.index(block)], head + "\n\n")
 
@@ -469,7 +470,6 @@ class TestPrompts(FrappeTestCase):
 					prompts.CATEGORY_TABLE,
 					prompts.CONVENTIONS,
 					block,
-					prompts.ACT_NOW_BLOCK,
 				]
 			),
 		)
@@ -517,11 +517,9 @@ class TestPrompts(FrappeTestCase):
 			]
 		)
 		text = prompts.build_reason_system("DIGEST-XYZ", "ROUTING-ABC", site_admin_tools=True)[0]["text"]
-		self.assertEqual(text, "\n\n".join([head, block, prompts.ACT_NOW_BLOCK, "DIGEST-XYZ"]))
+		self.assertEqual(text, "\n\n".join([head, block, "DIGEST-XYZ"]))
 		both = prompts.build_reason_system("", "", change_tools=True, site_admin_tools=True)[0]["text"]
-		self.assertTrue(
-			both.endswith("\n\n".join([prompts.CHANGE_TOOLS_BLOCK, block, prompts.ACT_NOW_BLOCK]))
-		)
+		self.assertTrue(both.endswith("\n\n".join([prompts.CHANGE_TOOLS_BLOCK, block])))
 		self.assertNotIn(block, prompts.build_reason_system("DIGEST-XYZ", "ROUTING-ABC")[0]["text"])
 
 	def test_reason_system_with_unrestricted_tools_adds_full_access_block(self):
@@ -548,11 +546,11 @@ class TestPrompts(FrappeTestCase):
 			]
 		)
 		text = prompts.build_reason_system("DIGEST-XYZ", "ROUTING-ABC", unrestricted_tools=True)[0]["text"]
-		self.assertEqual(text, "\n\n".join([head, block, prompts.ACT_NOW_BLOCK, "DIGEST-XYZ"]))
-		# the full-access block replaces the record block, never joins it
+		self.assertEqual(text, "\n\n".join([head, block, "DIGEST-XYZ"]))
+		# U1.md:227: the builder follows each flag; grant() keeps record_block off when unrestricted (U1.md:185)
 		both = prompts.build_reason_system("", "", site_admin_tools=True, unrestricted_tools=True)[0]["text"]
 		self.assertIn(block, both)
-		self.assertNotIn(prompts.SITE_ADMIN_TOOLS_BLOCK, both)
+		self.assertIn(prompts.SITE_ADMIN_TOOLS_BLOCK, both)
 
 	def test_act_now_block_only_with_action_tools(self):
 		block = prompts.ACT_NOW_BLOCK
@@ -570,10 +568,15 @@ class TestPrompts(FrappeTestCase):
 		# spec changed (spec-addendum-5 AC-66): the sentence telling the model to write "Cần ai quyết" is gone.
 		self.assertNotIn("Cần ai quyết", block)
 		self.assertNotIn(block, prompts.build_reason_system("DIGEST-XYZ", "ROUTING-ABC")[0]["text"])
+		# U1.md:227: ACT_NOW_BLOCK follows act_now alone; grant() sets act_now_block with the action tools
 		for flags in ({"change_tools": True}, {"site_admin_tools": True}, {"unrestricted_tools": True}):
-			text = prompts.build_reason_system("", "", **flags)[0]["text"]
+			self.assertNotIn(block, prompts.build_reason_system("", "", **flags)[0]["text"], flags)
+			text = prompts.build_reason_system("", "", act_now=True, **flags)[0]["text"]
 			self.assertEqual(text.count(block), 1, flags)
 			self.assertTrue(text.endswith(block), flags)
+		text = prompts.build_reason_system("", "", act_now=True)[0]["text"]
+		self.assertEqual(text.count(block), 1)
+		self.assertTrue(text.endswith(block))
 
 	def _ticket(self, **override):
 		return {

@@ -130,7 +130,12 @@ class TestRegistry(FrappeTestCase):
 		self.addCleanup(specs_patcher.stop)
 
 	def names(self, level, has_instructor):
-		return [s["name"] for s in get_tool_schemas(level, has_instructor, False)]
+		return [
+			s["name"]
+			for s in get_tool_schemas(
+				registry.GrantInputs(level, level, has_instructor, PermissionSwitches())
+			)
+		]
 
 	def test_l0_has_no_tools(self):
 		self.assertEqual(self.names("L0", True), [])
@@ -146,10 +151,10 @@ class TestRegistry(FrappeTestCase):
 		self.assertEqual(self.names("L1", True), ["do_read", "do_ticket", "do_task"])
 
 	def test_returned_schemas_are_copies(self):
-		first = get_tool_schemas("L1", False, False)
+		first = get_tool_schemas(registry.GrantInputs("L1", "L1", False, PermissionSwitches()))
 		first[0]["cache_control"] = {"type": "ephemeral"}
 		first[0]["input_schema"]["properties"].clear()
-		second = get_tool_schemas("L1", False, False)
+		second = get_tool_schemas(registry.GrantInputs("L1", "L1", False, PermissionSwitches()))
 		self.assertNotIn("cache_control", second[0])
 		self.assertIn("query", second[0]["input_schema"]["properties"])
 
@@ -287,7 +292,10 @@ class TestRegistry(FrappeTestCase):
 			patch.object(route_ticket, "create_routed_task") as create_routed_task,
 			patch.object(route_ticket, "post_routing_comment") as post_routing_comment,
 		):
-			granted = [spec["name"] for spec in get_tool_schemas("L3", True, False)]
+			granted = [
+				spec["name"]
+				for spec in get_tool_schemas(registry.GrantInputs("L3", "L3", True, PermissionSwitches()))
+			]
 			for name in ROUTE_FUNCTION_NAMES:
 				self.assertNotIn(name, granted)
 				for given in arguments:
@@ -322,15 +330,14 @@ class TestRegistry(FrappeTestCase):
 		)
 		self.assertEqual(len(fields), 16)
 
-	def test_grant_functions_take_change_enabled_without_default(self):
-		for function in (registry._legacy_inputs, get_tool_schemas, registry.grants_change_tools):
+	def test_grant_functions_take_grant_inputs_without_default(self):
+		for function in (registry.grant, get_tool_schemas):
 			parameters = inspect.signature(function).parameters
-			self.assertEqual(
-				list(parameters),
-				["effective_level", "has_instructor", "change_enabled", "unrestricted"],
-				function.__name__,
-			)
-			self.assertIs(parameters["change_enabled"].default, inspect.Parameter.empty, function.__name__)
+			self.assertEqual(list(parameters), ["inputs"], function.__name__)
+			self.assertIs(parameters["inputs"].default, inspect.Parameter.empty, function.__name__)
+		fields = {field.name: field for field in dataclasses.fields(registry.GrantInputs)}
+		for name in ("effective_level", "main_path_level", "has_instructor", "switches"):
+			self.assertIs(fields[name].default, dataclasses.MISSING, name)
 
 	def test_change_group_only_when_switch_l3_and_instructor(self):
 		# AC-2 full matrix: 4 levels (+ unknown) x authority x switch; change_propose only at
@@ -358,21 +365,21 @@ class TestRegistry(FrappeTestCase):
 		}
 		with patch.object(registry, "_all_specs", _specs_with_change):
 			for (level, has_instructor, change_enabled), names in expected.items():
-				key = (level, has_instructor, change_enabled)
-				schemas = get_tool_schemas(level, has_instructor, change_enabled)
-				self.assertEqual([s["name"] for s in schemas], names, key)
-				self.assertIs(
-					registry.grants_change_tools(level, has_instructor, change_enabled),
-					key == ("L3", True, True),
-					key,
+				inputs = registry.GrantInputs(
+					level,
+					level,
+					has_instructor,
+					PermissionSwitches(record_tools=change_enabled, code_change=change_enabled),
 				)
+				key = (level, has_instructor, change_enabled)
+				schemas = get_tool_schemas(inputs)
+				self.assertEqual([s["name"] for s in schemas], names, key)
+				self.assertIs(registry.grant(inputs).change_block, key == ("L3", True, True), key)
 
-	def test_grants_change_tools_follows_granted_specs_not_conditions(self):
-		# Design 3.6, ADR-011 QĐ 3/6: with every condition met but no change_propose spec
-		# registered, nothing is granted, so the prompt flag must say False too.
-		schemas = get_tool_schemas("L3", True, True)
-		self.assertEqual([s["name"] for s in schemas], ["do_read", "do_ticket", "do_task"])
-		self.assertIs(registry.grants_change_tools("L3", True, True), False)
+	def test_flag_groups_always_have_a_registered_tool(self):
+		groups = {spec.group for spec in REAL_ALL_SPECS()}
+		for group in (registry.CHANGE_GROUP, registry.SITE_ADMIN_GROUP, registry.UNRESTRICTED_GROUP):
+			self.assertIn(group, groups, group)
 
 	def test_execute_rejects_change_tool_when_not_granted(self):
 		denied = (
@@ -434,7 +441,12 @@ class TestRealToolSet(FrappeTestCase):
 		self.addCleanup(frappe.db.rollback)
 
 	def names(self, level, has_instructor):
-		return [s["name"] for s in get_tool_schemas(level, has_instructor, False)]
+		return [
+			s["name"]
+			for s in get_tool_schemas(
+				registry.GrantInputs(level, level, has_instructor, PermissionSwitches())
+			)
+		]
 
 	def test_tool_names_per_level_and_authority(self):
 		granted = READ_TOOL_NAMES + SOURCE_TOOL_NAMES + TICKET_WRITE_TOOL_NAMES
@@ -466,7 +478,11 @@ class TestRealToolSet(FrappeTestCase):
 			("L3", True): with_task + CHANGE_TOOL_NAMES + SITE_ADMIN_TOOL_NAMES,
 		}
 		for (level, has_instructor), names in expected.items():
-			schemas = get_tool_schemas(level, has_instructor, True)
+			schemas = get_tool_schemas(
+				registry.GrantInputs(
+					level, level, has_instructor, PermissionSwitches(record_tools=True, code_change=True)
+				)
+			)
 			self.assertEqual([s["name"] for s in schemas], names, (level, has_instructor))
 
 	def test_switch_off_tool_names_match_base_for_all_levels_and_authority(self):
@@ -494,11 +510,10 @@ class TestRealToolSet(FrappeTestCase):
 			("L3", True): [*base, "create_task"],
 		}
 		for (level, has_instructor), names in expected.items():
-			schemas = get_tool_schemas(level, has_instructor, False)
+			inputs = registry.GrantInputs(level, level, has_instructor, PermissionSwitches())
+			schemas = get_tool_schemas(inputs)
 			self.assertEqual([s["name"] for s in schemas], names, (level, has_instructor))
-			self.assertFalse(
-				registry.grants_change_tools(level, has_instructor, False), (level, has_instructor)
-			)
+			self.assertFalse(registry.grant(inputs).change_block, (level, has_instructor))
 
 	def test_no_write_tool_accepts_doctype_or_field(self):
 		write_specs = [s for s in registry._all_specs() if s.group in ("ticket_write", "task_write")]
@@ -713,7 +728,14 @@ class TestGrantTable(FrappeTestCase):
 		self.assertEqual(len(GRANT_SNAPSHOT), 32)
 		for key, names in GRANT_SNAPSHOT.items():
 			change_enabled, unrestricted, level, has_instructor = key
-			legacy = (level, has_instructor, change_enabled, unrestricted)
+			legacy = registry.GrantInputs(
+				level,
+				level,
+				has_instructor,
+				PermissionSwitches(
+					unrestricted=unrestricted, record_tools=change_enabled, code_change=change_enabled
+				),
+			)
 			switches = PermissionSwitches(
 				unrestricted=unrestricted,
 				record_tools=change_enabled,
@@ -740,20 +762,23 @@ class TestGrantTable(FrappeTestCase):
 					),
 				)
 				self.assertIs(granted.ask_only_block, False)
-				self.assertEqual([s["name"] for s in get_tool_schemas(*legacy)], names)
-				self.assertIs(registry.grants_change_tools(*legacy), "propose_file_change" in names)
-				self.assertIs(registry.grants_site_admin_tools(*legacy), "api_list_records" in names)
-				self.assertIs(registry.grants_unrestricted_tools(*legacy), "api_delete_record" in names)
+				self.assertEqual([s["name"] for s in get_tool_schemas(legacy)], names)
 
 	def test_unknown_level_grants_like_l0(self):
 		for change_enabled in (False, True):
 			for unrestricted in (False, True):
 				for has_instructor in (False, True):
-					grant = ("LX", has_instructor, change_enabled, unrestricted)
-					with self.subTest(grant):
-						self.assertEqual(get_tool_schemas(*grant), [])
-						self.assertIs(registry.grants_site_admin_tools(*grant), False)
-						self.assertIs(registry.grants_unrestricted_tools(*grant), False)
+					legacy = registry.GrantInputs(
+						"LX",
+						"LX",
+						has_instructor,
+						PermissionSwitches(
+							unrestricted=unrestricted, record_tools=change_enabled, code_change=change_enabled
+						),
+					)
+					with self.subTest(legacy):
+						self.assertEqual(get_tool_schemas(legacy), [])
+						self.assertEqual(registry.grant(legacy), registry.Grant(specs=()))
 
 	def test_registry_has_one_grant_function_and_one_table(self):
 		for name in (
@@ -769,14 +794,18 @@ class TestGrantTable(FrappeTestCase):
 		)
 
 	def test_execute_asks_the_one_grant_function(self):
-		# The context is chosen so context.grant_inputs() differs from the four-argument builder.
+		# The context is chosen so context.grant_inputs() differs from the inputs the removed
+		# four-argument builder made.
 		context = dataclasses.replace(
 			_context("L2", "boss@x.com", unrestricted=True),
 			record_tools=True,
 			act_now=True,
 			main_path_level="L1",
 		)
-		self.assertNotEqual(context.grant_inputs(), registry._legacy_inputs("L2", True, False, True))
+		self.assertNotEqual(
+			context.grant_inputs(),
+			registry.GrantInputs("L2", "L2", True, PermissionSwitches(unrestricted=True)),
+		)
 		with patch.object(registry, "grant", wraps=registry.grant) as granted:
 			execute_tool("get_ticket", {"name": "x"}, context)
 		granted.assert_called_once_with(context.grant_inputs())
@@ -848,12 +877,12 @@ class TestGrantInputs(FrappeTestCase):
 		for instructor, expected in ((None, False), ("", False), ("boss@x.com", True)):
 			context = dataclasses.replace(base, instructor=instructor)
 			self.assertIs(context.grant_inputs().has_instructor, expected, instructor)
-		# One context field on at a time -> exactly the switch it feeds ((4) also feeds (2), the bridge).
+		# One context field on at a time -> exactly the switch it feeds.
 		switch_of_field = {
 			"unrestricted": {"unrestricted": True},
 			"record_tools": {"record_tools": True},
 			"act_now": {"act_now": True},
-			"change_enabled": {"code_change": True, "record_tools": True},
+			"change_enabled": {"code_change": True},
 			"one_click_approval": {"one_click_approval": True},
 		}
 		for field, switches in switch_of_field.items():
@@ -869,9 +898,9 @@ class TestGrantInputs(FrappeTestCase):
 					(over_budget, below_threshold),
 				)
 
-	def test_bridge_change_switch_still_brings_record_tools(self):
-		# Design w1-fixes-3 Điểm 1: (2) = record_tools or change_enabled until T82.
-		cases = {(True, False): True, (False, True): True, (True, True): True, (False, False): False}
+	def test_record_tools_only_from_its_own_switch(self):
+		# U1.md:166: (2) comes from record_tools alone; the T76 bridge from change_enabled is gone (T82).
+		cases = {(True, False): False, (False, True): True, (True, True): True, (False, False): False}
 		for (change_enabled, record_tools), expected in cases.items():
 			context = dataclasses.replace(
 				_context("L3", "boss@x.com"), change_enabled=change_enabled, record_tools=record_tools
@@ -879,9 +908,9 @@ class TestGrantInputs(FrappeTestCase):
 			switches = context.grant_inputs().switches
 			self.assertIs(switches.record_tools, expected, (change_enabled, record_tools))
 			self.assertIs(switches.code_change, change_enabled, (change_enabled, record_tools))
-		# The bridge keeps the record tools runnable where only change_enabled is set (runner, test_site_api).
-		bridged = _context("L3", "boss@x.com", change_enabled=True)
-		self.assertNotEqual(execute_tool("api_list_records", {"doctype": "Note"}, bridged), NOT_GRANTED)
+		# change_enabled alone no longer runs the record tools.
+		change_only = _context("L3", "boss@x.com", change_enabled=True)
+		self.assertEqual(execute_tool("api_list_records", {"doctype": "Note"}, change_only), NOT_GRANTED)
 		closed = _context("L3", "boss@x.com")
 		self.assertEqual(execute_tool("api_list_records", {"doctype": "Note"}, closed), NOT_GRANTED)
 

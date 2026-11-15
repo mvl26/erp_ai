@@ -16,8 +16,9 @@ from erp_ai import constants
 from erp_ai.agent import authority, change_link
 from erp_ai.agent.agent_write_guard import AGENT_WRITE_FLAG
 from erp_ai.agent.changes import process_runner, transitions
+from erp_ai.agent.policy import PermissionSwitches
 from erp_ai.agent.tools import change_guard, propose_change, source
-from erp_ai.agent.tools.registry import ToolContext, execute_tool, get_tool_schemas
+from erp_ai.agent.tools.registry import GrantInputs, ToolContext, execute_tool, get_tool_schemas
 from erp_ai.constants import (
 	AGENT_USER,
 	CHANGE_KIND_CODE,
@@ -77,7 +78,14 @@ def _sha(text: str) -> str:
 class TestProposeGrant(FrappeTestCase):
 	def test_offered_only_with_switch_l3_and_instructor(self):
 		def names(level, has_instructor, change_enabled):
-			granted = get_tool_schemas(level, has_instructor, change_enabled)
+			granted = get_tool_schemas(
+				GrantInputs(
+					effective_level=level,
+					main_path_level=level,
+					has_instructor=has_instructor,
+					switches=PermissionSwitches(record_tools=change_enabled, code_change=change_enabled),
+				)
+			)
 			return [spec["name"] for spec in granted if spec["name"] in TOOL_NAMES]
 
 		self.assertEqual(names("L3", True, True), TOOL_NAMES)
@@ -449,7 +457,14 @@ class TestProposeChange(FrappeTestCase):
 
 	def test_no_delete_or_rename_operation_exists(self):
 		operation_words = ("delete", "remove", "rename", "move", "unlink", "xoa", "xóa", "doi_ten", "đổi tên")
-		for spec in get_tool_schemas("L3", True, True):
+		for spec in get_tool_schemas(
+			GrantInputs(
+				effective_level="L3",
+				main_path_level="L3",
+				has_instructor=True,
+				switches=PermissionSwitches(record_tools=True, code_change=True),
+			)
+		):
 			words = [spec["name"], *spec["input_schema"].get("properties", {})]
 			for word in words:
 				with self.subTest(tool=spec["name"], word=word):

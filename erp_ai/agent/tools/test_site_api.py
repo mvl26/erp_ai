@@ -7,6 +7,7 @@ import frappe
 from frappe.tests.utils import FrappeTestCase
 
 from erp_ai.agent import change_link
+from erp_ai.agent.policy import PermissionSwitches
 from erp_ai.agent.tools import registry, site_api
 from erp_ai.agent.tools.registry import ToolContext, execute_tool, get_tool_schemas
 from erp_ai.constants import ROLE_AGENT, ROLE_INSTRUCTOR
@@ -88,7 +89,9 @@ def _make_user(email, *roles):
 		frappe.get_doc("User", email).add_roles(*roles)
 
 
-def _context(level="L3", instructor=BOSS, change_enabled=True, agent_user=AGENT, unrestricted=False):
+def _context(
+	level="L3", instructor=BOSS, change_enabled=True, agent_user=AGENT, unrestricted=False, record_tools=True
+):
 	return ToolContext(
 		ticket_name="TKT-SITEAPI",
 		effective_level=level,
@@ -98,12 +101,16 @@ def _context(level="L3", instructor=BOSS, change_enabled=True, agent_user=AGENT,
 		agent_user=agent_user,
 		change_enabled=change_enabled,
 		unrestricted=unrestricted,
+		record_tools=record_tools,
 	)
 
 
 class TestSiteApiGrant(FrappeTestCase):
-	def names(self, level, has_instructor, change_enabled):
-		granted = get_tool_schemas(level, has_instructor, change_enabled)
+	def names(self, level, has_instructor, record_tools):
+		inputs = registry.GrantInputs(
+			level, level, has_instructor, PermissionSwitches(record_tools=record_tools)
+		)
+		granted = get_tool_schemas(inputs)
 		return [spec["name"] for spec in granted if spec["name"] in TOOL_NAMES]
 
 	def test_granted_only_with_switch_l3_and_instructor(self):
@@ -120,15 +127,19 @@ class TestSiteApiGrant(FrappeTestCase):
 			)
 
 	def test_grants_site_admin_tools_matches_the_grant(self):
-		self.assertIs(registry.grants_site_admin_tools("L3", True, True), True)
-		self.assertIs(registry.grants_site_admin_tools("L3", True, False), False)
-		self.assertIs(registry.grants_site_admin_tools("L3", False, True), False)
-		self.assertIs(registry.grants_site_admin_tools("L2", True, True), False)
+		def record_block(level, has_instructor, record_tools):
+			switches = PermissionSwitches(record_tools=record_tools)
+			return registry.grant(registry.GrantInputs(level, level, has_instructor, switches)).record_block
+
+		self.assertIs(record_block("L3", True, True), True)
+		self.assertIs(record_block("L3", True, False), False)
+		self.assertIs(record_block("L3", False, True), False)
+		self.assertIs(record_block("L2", True, True), False)
 
 	def test_execute_refuses_when_not_granted(self):
 		arguments = {"doctype": "Note", "values": {"title": NOTE_TITLE}}
 		for context in (
-			_context(change_enabled=False),
+			_context(record_tools=False),
 			_context(instructor=None),
 			_context(level="L2"),
 		):
@@ -858,11 +869,10 @@ class TestUnrestrictedGrant(FrappeTestCase):
 	def names(self, level, has_instructor, unrestricted):
 		# Only the site_admin + site_unrestricted tools (site_api.TOOLS), change switch off.
 		record_tools = {spec.name for spec in site_api.TOOLS}
-		return [
-			spec["name"]
-			for spec in get_tool_schemas(level, has_instructor, False, unrestricted)
-			if spec["name"] in record_tools
-		]
+		inputs = registry.GrantInputs(
+			level, level, has_instructor, PermissionSwitches(unrestricted=unrestricted)
+		)
+		return [spec["name"] for spec in get_tool_schemas(inputs) if spec["name"] in record_tools]
 
 	def test_switch_grants_every_record_tool_at_any_level_above_l0_with_instructor(self):
 		for level in ("L1", "L2", "L3"):
@@ -877,7 +887,10 @@ class TestUnrestrictedGrant(FrappeTestCase):
 
 	def test_normal_grant_never_holds_the_unrestricted_tools(self):
 		for level in ("L1", "L2", "L3"):
-			names = [spec["name"] for spec in get_tool_schemas(level, True, True)]
+			inputs = registry.GrantInputs(
+				level, level, True, PermissionSwitches(record_tools=True, code_change=True)
+			)
+			names = [spec["name"] for spec in get_tool_schemas(inputs)]
 			for name in UNRESTRICTED_TOOL_NAMES:
 				self.assertNotIn(name, names)
 

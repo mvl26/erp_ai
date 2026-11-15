@@ -1294,14 +1294,17 @@ class TestExcludedQuery(FrappeTestCase):
 		self.assertFalse(policy.is_ticket_record_excluded("Comment", "không có bản ghi này"))
 		# Any one excluded ticket among the columns excludes the record.
 		comment = self._comment(normal)
+		real_get_value = frappe.db.get_value
+
+		def get_value(doctype, name=None, *args, **kwargs):
+			if doctype == "Comment" and name == comment:
+				return frappe._dict(
+					reference_doctype="HD Ticket", reference_name=normal, custom_ticket=excluded
+				)
+			return real_get_value(doctype, name, *args, **kwargs)
+
 		with (
 			patch.object(policy, "ticket_link_fieldnames", return_value=("custom_ticket",)),
-			patch.object(
-				frappe.db,
-				"get_value",
-				return_value=frappe._dict(
-					reference_doctype="HD Ticket", reference_name=normal, custom_ticket=excluded
-				),
-			),
+			patch.object(frappe.db, "get_value", side_effect=get_value),
 		):
 			self.assertTrue(policy.is_ticket_record_excluded("Comment", comment))

@@ -122,11 +122,11 @@ def has_excluded_title(subject) -> bool:
 def _like_core(key: str) -> str:
 	"""A LIKE pattern that matches every subject whose normalized start is `key`, and a few more.
 
-	Words are joined with `%` so a subject with other spaces still matches; `\\ % _` are escaped like
-	read._like_pattern (policy must not import tools).
+	Words are joined with `%` so a subject with other spaces still matches. `%`, `_` and `\\` in the key are
+	left as they are: frappe's `like` filter treats a backslash literally and gives no way to escape `%` or
+	`_` (checked on this site), so they only widen the candidates; send_refusal then drops the extras.
 	"""
-	words = (word.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") for word in key.split())
-	return "%" + "%".join(words) + "%"
+	return "%" + "%".join(key.split()) + "%"
 
 
 def excluded_team_names() -> list[str]:

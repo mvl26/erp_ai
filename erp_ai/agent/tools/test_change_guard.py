@@ -39,6 +39,11 @@ BLOCK_TOO_MANY_OPS_REFUSAL = "khối có hơn 50 mục file"
 BLOCK_TOO_MANY_COMMANDS_REFUSAL = "khối có hơn 6 lệnh"
 BLOCK_PATH_TWICE_REFUSAL = "đường dẫn trùng hoặc nằm trong đường dẫn khác của cùng khối"
 OP_UNKNOWN_REFUSAL = "loại mục phải là edit, create, delete hoặc rename"
+BLOCK_TOO_LARGE_REFUSAL = "tổng nội dung của khối (kể cả diff) lớn hơn 8 MiB"
+TEXT_TOO_LARGE_REFUSAL = "file lớn hơn 2 MiB"
+TEXT_HAS_NUL_REFUSAL = "file có byte NUL, không phải văn bản"
+TEXT_NOT_UTF8_REFUSAL = "file không phải văn bản UTF-8"
+MIB = 1024 * 1024
 
 HAND_WRITTEN_CORE_APPS = ("frappe", "erpnext", "helpdesk", "hrms")
 # design-addendum-2 QĐ-A2: refused and allowed names, under one app.
@@ -1467,3 +1472,177 @@ class TestCheckBlock(FrappeTestCase):
 		ops = [rename(README, "myapp/target.md")]
 		self.assertTrue(self.reason(ops, at_apply=False).startswith(f"mục 1 ({README}): "))
 		self.assertIsNone(self.reason(ops, at_apply=True))
+
+	def test_content_refusal_wording_matches_design_table(self):
+		self.assertEqual(
+			(
+				change_guard.BLOCK_TOO_LARGE,
+				change_guard.PY_SYNTAX.format(n=3),
+				change_guard.JSON_SYNTAX.format(n=4),
+			),
+			(
+				BLOCK_TOO_LARGE_REFUSAL,
+				"file .py không biên dịch được: dòng 3",
+				"file .json không phải JSON hợp lệ: dòng 4",
+			),
+		)
+
+	def assert_refused_in_both_moments(self, ops, expected, diff_text=""):
+		for at_apply in MOMENTS:
+			with self.subTest(ops=[(op.kind, op.path, op.new_path) for op in ops], at_apply=at_apply):
+				self.assertEqual(self.check(ops, at_apply=at_apply, diff_text=diff_text).reason, expected)
+
+	def assert_accepted_in_both_moments(self, ops, diff_text=""):
+		self.assert_refused_in_both_moments(ops, None, diff_text)
+
+	def test_py_syntax_error_refused_with_line(self):
+		self.sandbox.commit_file("myapp", "a.py", "x = 1\n")
+		self.sandbox.commit_file("myapp", "broken.py", "def f(:\n")
+		self.assert_refused_in_both_moments(
+			[create("myapp/bad.py", "x = 1\ndef f(:\n")],
+			"mục 1 (myapp/bad.py): file .py không biên dịch được: dòng 2",
+		)
+		self.assert_refused_in_both_moments(
+			[edit(README), edit("myapp/a.py", "x = 1\n", "x = 1\n\n\nif x\n")],
+			"mục 2 (myapp/a.py): file .py không biên dịch được: dòng 4",
+		)
+		# Parser stack overflow is a MemoryError: line 0.
+		self.assert_refused_in_both_moments(
+			[create("myapp/deep.py", "-" * 100000 + "1\n")],
+			"mục 1 (myapp/deep.py): file .py không biên dịch được: dòng 0",
+		)
+		with patch.object(change_guard, "compile", side_effect=RecursionError, create=True) as compiled:
+			self.assert_refused_in_both_moments(
+				[create("myapp/rec.py", "x = 1\n")],
+				"mục 1 (myapp/rec.py): file .py không biên dịch được: dòng 0",
+			)
+		self.assertEqual(compiled.call_args.args, ("x = 1\n", "myapp/rec.py", "exec"))
+		self.assertEqual(compiled.call_args.kwargs, {"dont_inherit": True})
+		# `compile` does not run the code; only the content after the change of a `.py` target is compiled.
+		self.assert_accepted_in_both_moments(
+			[
+				create("myapp/exits.py", "raise SystemExit(1)\n"),
+				create("myapp/empty.py", ""),
+				edit("myapp/a.py", "def f(:\n", "x = 2\n"),
+				delete("myapp/broken.py", "def f(:\n"),
+				create("myapp/bad.txt", "def f(:\n"),
+			]
+		)
+
+	def test_json_invalid_refused_with_line(self):
+		self.assert_refused_in_both_moments(
+			[create("myapp/a.json", '{\n"a": 1,\n}\n')],
+			"mục 1 (myapp/a.json): file .json không phải JSON hợp lệ: dòng 3",
+		)
+		self.assert_refused_in_both_moments(
+			[create("myapp/x.txt"), create("myapp/empty.json", "")],
+			"mục 2 (myapp/empty.json): file .json không phải JSON hợp lệ: dòng 1",
+		)
+		self.assert_refused_in_both_moments(
+			[create("myapp/deep.json", "[" * 100000 + "]" * 100000)],
+			"mục 1 (myapp/deep.json): file .json không phải JSON hợp lệ: dòng 0",
+		)
+		self.assert_accepted_in_both_moments(
+			[create("myapp/ok.json", '{"a": [1, 2]}\n'), create("myapp/bad.txt", '{"a": 1,}')]
+		)
+
+	def test_rename_dest_py_checked(self):
+		self.sandbox.commit_file("myapp", "notes.txt", "def f(:\n")
+		self.sandbox.commit_file("myapp", "old.py", "def f(:\n")
+		self.sandbox.commit_file("myapp", "data.txt", "{,}\n")
+		self.assert_refused_in_both_moments(
+			[rename("myapp/notes.txt", "myapp/notes.py", "def f(:\n")],
+			"mục 1 (myapp/notes.txt): file .py không biên dịch được: dòng 1",
+		)
+		self.assert_refused_in_both_moments(
+			[rename("myapp/data.txt", "myapp/data.json", "{,}\n")],
+			"mục 1 (myapp/data.txt): file .json không phải JSON hợp lệ: dòng 1",
+		)
+		# The source name of a rename is not compiled.
+		self.assert_accepted_in_both_moments([rename("myapp/old.py", "myapp/old.txt", "def f(:\n")])
+
+	def test_total_bytes_at_limit_ok_plus_one_refused(self):
+		two_mib = "é" * MIB  # 2 MiB of UTF-8 in 1 Mi characters: bytes are counted, not characters.
+		self.sandbox.commit_file("myapp", "big.txt", two_mib)
+		self.sandbox.commit_file("myapp", "a.txt", "x = 1\n")
+		self.sandbox.commit_file("myapp", "d.txt", "x = 1\n")
+		# A rename stores its content twice and counts twice: 4 + 2 + (2 MiB - 10) = 8 MiB - 10.
+		renamed = [
+			rename("myapp/big.txt", "myapp/big2.txt", two_mib),
+			create("myapp/c1.txt", two_mib),
+			create("myapp/c2.txt", "x" * (2 * MIB - 10)),
+		]
+		self.assert_accepted_in_both_moments(renamed, "d" * 10)
+		self.assert_accepted_in_both_moments(renamed, "é" * 5)
+		self.assert_refused_in_both_moments(renamed, BLOCK_TOO_LARGE_REFUSAL, "d" * 11)
+		self.assert_refused_in_both_moments(renamed, BLOCK_TOO_LARGE_REFUSAL, "é" * 5 + "d")
+		# An edit counts before and after, a deletion its before: 2 + 2 + 2 + 2 = 8 MiB.
+		edited = [
+			edit("myapp/a.txt", "a" * (2 * MIB), "b" * (2 * MIB)),
+			delete("myapp/d.txt", "d" * (2 * MIB)),
+			create("myapp/c.txt", "c" * (2 * MIB)),
+		]
+		self.assert_accepted_in_both_moments(edited, "")
+		self.assert_refused_in_both_moments(edited, BLOCK_TOO_LARGE_REFUSAL, "d")
+
+	def test_total_counts_diff_bytes(self):
+		small = [create("myapp/a.txt", "x")]
+		self.assert_accepted_in_both_moments(small, "d" * (8 * MIB - 1))
+		self.assert_refused_in_both_moments(small, BLOCK_TOO_LARGE_REFUSAL, "d" * (8 * MIB))
+		self.assert_refused_in_both_moments(small, BLOCK_TOO_LARGE_REFUSAL, "é" * (4 * MIB))
+		# A block with only commands has its diff counted too.
+		for at_apply in MOMENTS:
+			with self.subTest(at_apply=at_apply):
+				self.assertIsNone(
+					self.check([], [["version"]], at_apply=at_apply, diff_text="d" * 8 * MIB).reason
+				)
+				self.assertEqual(
+					self.check([], [["version"]], at_apply=at_apply, diff_text="d" * (8 * MIB + 1)).reason,
+					BLOCK_TOO_LARGE_REFUSAL,
+				)
+
+	def test_file_at_text_max_ok_plus_one_refused(self):
+		self.sandbox.commit_file("myapp", "a.txt", "x = 1\n")
+		self.sandbox.commit_file("myapp", "r.txt", "x = 1\n")
+		at_max, over = "x" * (2 * MIB), "x" * (2 * MIB + 1)
+		wide_over = "é" * MIB + "x"  # 1 Mi + 1 characters, 2 MiB + 1 bytes
+		self.assert_accepted_in_both_moments(
+			[create("myapp/f.txt", at_max), edit("myapp/a.txt", at_max, at_max)]
+		)
+		for ops, path in (
+			([create("myapp/f.txt", over)], "myapp/f.txt"),
+			([create("myapp/f.txt", wide_over)], "myapp/f.txt"),
+			([edit("myapp/a.txt", over, "x")], "myapp/a.txt"),
+			([edit("myapp/a.txt", "x", over)], "myapp/a.txt"),
+			([delete("myapp/a.txt", over)], "myapp/a.txt"),
+			([rename("myapp/r.txt", "myapp/r2.txt", over)], "myapp/r.txt"),
+		):
+			self.assert_refused_in_both_moments(ops, f"mục 1 ({path}): {TEXT_TOO_LARGE_REFUSAL}")
+		self.assertIn("2 MiB", TEXT_TOO_LARGE_REFUSAL)
+		# The item's own limit is checked in step 2, before the block total of step 3.
+		self.assert_refused_in_both_moments(
+			[create("myapp/x.txt"), create("myapp/f.txt", over)],
+			f"mục 2 (myapp/f.txt): {TEXT_TOO_LARGE_REFUSAL}",
+			"d" * (8 * MIB),
+		)
+
+	def test_content_with_nul_refused(self):
+		self.sandbox.commit_file("myapp", "a.txt", "x = 1\n")
+		for ops, path in (
+			([create("myapp/n.txt", "a\0b")], "myapp/n.txt"),
+			([create("myapp/n.py", "x = 1\0\n")], "myapp/n.py"),
+			([edit("myapp/a.txt", "a\0", "b")], "myapp/a.txt"),
+			([edit("myapp/a.txt", "a", "b\0")], "myapp/a.txt"),
+			([delete("myapp/a.txt", "\0")], "myapp/a.txt"),
+			([rename("myapp/a.txt", "myapp/b.txt", "\0")], "myapp/a.txt"),
+		):
+			self.assert_refused_in_both_moments(ops, f"mục 1 ({path}): {TEXT_HAS_NUL_REFUSAL}")
+
+	def test_content_not_utf8_refused(self):
+		self.sandbox.commit_file("myapp", "a.txt", "x = 1\n")
+		for ops in (
+			[create("myapp/n.txt", "a\ud800")],
+			[edit("myapp/a.txt", "\udcff", "b")],
+			[edit("myapp/a.txt", "a", "\ud800")],
+		):
+			self.assert_refused_in_both_moments(ops, f"mục 1 ({ops[0].path}): {TEXT_NOT_UTF8_REFUSAL}")

@@ -1,3 +1,4 @@
+import json
 import os
 from dataclasses import dataclass
 
@@ -6,6 +7,7 @@ from erp_ai.agent.tools import source
 from erp_ai.constants import (
 	CHANGE_MAX_COMMANDS,
 	CHANGE_MAX_FILE_OPS,
+	CHANGE_MAX_TOTAL_BYTES,
 	CHANGE_OP_CREATE,
 	CHANGE_OP_DELETE,
 	CHANGE_OP_EDIT,
@@ -48,6 +50,12 @@ OP_UNKNOWN = "loại mục phải là edit, create, delete hoặc rename"
 OP_FIELDS = "mục {action} thiếu hoặc thừa trường"
 NOT_REGULAR_FILE = "đường dẫn không phải file thường"
 EXECUTABLE_FILE = "file có quyền thực thi, bot không xóa hay đổi tên được"
+# design-addendum-1 A-1.3: the total counts the stored `diff` too.
+BLOCK_TOO_LARGE = f"tổng nội dung của khối (kể cả diff) lớn hơn {CHANGE_MAX_TOTAL_BYTES // (1024 * 1024)} MiB"
+PY_SYNTAX = "file .py không biên dịch được: dòng {n}"
+JSON_SYNTAX = "file .json không phải JSON hợp lệ: dòng {n}"
+PY_SUFFIX = ".py"
+JSON_SUFFIX = ".json"
 # Prefix of a reason tied to one file item, n counted from 1 (design 3.1).
 OP_PREFIX = "mục {number} ({path}): "
 
@@ -326,6 +334,42 @@ def _new_dirs(guard: GuardResult) -> tuple[tuple[str, str], ...]:
 	return tuple(reversed(missing))
 
 
+def _utf8(text: str) -> bytes:
+	"""UTF-8 bytes of `text`; a lone surrogate is kept as bytes so `text_refusal` refuses it as not UTF-8."""
+	return text.encode("utf-8", errors="surrogatepass")
+
+
+def _syntax_reason(text: str, rel: str) -> str | None:
+	"""Design 3.2 step 2: a `.py` target must compile (never run), a `.json` target must parse."""
+	if rel.endswith(PY_SUFFIX):
+		try:
+			compile(text, rel, "exec", dont_inherit=True)
+		except SyntaxError as error:
+			return PY_SYNTAX.format(n=error.lineno or 0)
+		except (RecursionError, MemoryError):
+			return PY_SYNTAX.format(n=0)  # Too deep for the parser: refused, with no line to name.
+	elif rel.endswith(JSON_SUFFIX):
+		try:
+			json.loads(text)
+		except ValueError as error:
+			return JSON_SYNTAX.format(n=getattr(error, "lineno", 0))
+		except RecursionError:
+			return JSON_SYNTAX.format(n=0)  # Nested deeper than the decoder can go: refused, no line.
+	return None
+
+
+def _content_reason(op: FileOp, source_rel: str, target_rel: str) -> str | None:
+	"""`source.text_refusal` for the content before (under the source name) and after (under the target
+	name), then the syntax of the content after for an edit, a created file and a rename target."""
+	if op.before is not None:
+		reason = source.text_refusal(source_rel, _utf8(op.before))
+		if reason is not None:
+			return reason
+	if op.after is None:
+		return None
+	return source.text_refusal(target_rel, _utf8(op.after)) or _syntax_reason(op.after, target_rel)
+
+
 def _check_op(op: FileOp, seen: list[str], allowed_apps, block_app: str | None, at_apply: bool):
 	"""Design 3.2 step 2 for one item: an `OpTarget`, or the refusal reason as a `str`.
 
@@ -358,6 +402,9 @@ def _check_op(op: FileOp, seen: list[str], allowed_apps, block_app: str | None, 
 	other_app = next((guard.app for guard in guards if guard.app != block_app), None)
 	if other_app is not None:
 		return BLOCK_TWO_APPS.format(a=block_app, b=other_app)
+	reason = _content_reason(op, guards[0].rel_path, guards[-1].rel_path)
+	if reason is not None:
+		return reason
 	return OpTarget(
 		op=op,
 		full_path=guards[0].full_path,
@@ -384,8 +431,11 @@ def check_block(
 	2. each item in order, its reason prefixed by `OP_PREFIX`: shape (`OP_UNKNOWN`, `OP_FIELDS`); a path
 	equal to or inside another path of the block → `BLOCK_PATH_TWICE`; `check_write_path` for every
 	path of the item, with the git state read only at proposal time; `check_write_path` for each folder
-	to create; an app other than item 1's → `BLOCK_TWO_APPS`. `diff_text` (the stored `diff`) has no
-	default so no caller forgets it in the total; `site` and `legacy` serve the command rules.
+	to create; an app other than item 1's → `BLOCK_TWO_APPS`; `source.text_refusal` of the content
+	before and after (the only per-file size limit); `PY_SYNTAX` / `JSON_SYNTAX` for the content after
+	of a `.py` / `.json` target. 3. the UTF-8 bytes of every before and after plus `diff_text` (the
+	stored `diff`, no default so no caller forgets it) over `CHANGE_MAX_TOTAL_BYTES` → `BLOCK_TOO_LARGE`;
+	exactly the limit passes. `site` and `legacy` serve the command rules.
 	"""
 	ops, commands = tuple(ops), tuple(commands)
 	if not ops and not commands:
@@ -403,6 +453,10 @@ def check_block(
 			)
 		app = app or target.guard.app
 		targets.append(target)
+	# A rename stores its content as before and after, so it counts twice (design-addendum-1 A-1.2).
+	total = sum(len(_utf8(text)) for op in ops for text in (op.before, op.after) if text is not None)
+	if total + len(_utf8(diff_text)) > CHANGE_MAX_TOTAL_BYTES:
+		return BlockCheck(reason=BLOCK_TOO_LARGE, app=None, targets=())
 	return BlockCheck(reason=None, app=app, targets=tuple(targets))
 
 

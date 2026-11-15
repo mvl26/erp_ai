@@ -5,11 +5,13 @@ the lifecycle switches and the origin field itself (`lifecycle_settings`) and ne
 """
 
 from dataclasses import dataclass
+from datetime import datetime
 
 import frappe
+from frappe.utils import extract_email_id
 
 from erp_ai.agent import policy
-from erp_ai.constants import SETTING_DOCTYPE
+from erp_ai.constants import AGENT_USER, SETTING_DOCTYPE
 
 STATUS_RESOLVED = "Resolved"
 STATUS_CLOSED = "Closed"
@@ -114,3 +116,77 @@ def status_change_refusal(ticket_name: str, ls: LifecycleSettings) -> str | None
 	if policy.latest_classification(ticket_name)[0] == CATEGORY_E:
 		return REFUSAL_CATEGORY_E
 	return None
+
+
+def _ticket_messages(ticket_name: str, sent_or_received: str) -> dict:
+	return {
+		"reference_doctype": TICKET_DOCTYPE,
+		"reference_name": ticket_name,
+		"sent_or_received": sent_or_received,
+	}
+
+
+def _bot_messages(ticket_name: str) -> dict:
+	"""The filter of the bot's own messages to the requester on a ticket."""
+	return {**_ticket_messages(ticket_name, "Sent"), "owner": AGENT_USER}
+
+
+def is_requester_sender(sender, raised_by) -> bool:
+	"""Same email address (display name dropped, casefold; A-U6b-9); a blank side never matches."""
+	requester = extract_email_id(raised_by or "").casefold()
+	return bool(requester) and extract_email_id(sender or "").casefold() == requester
+
+
+def send_to_requester(ticket_name: str, html: str) -> str:
+	"""Reply to the ticket's requester only, through Helpdesk (a Communication Sent, its email queued; never a
+	comment), under the session user. Returns the newest Sent Communication of the agent on the ticket.
+
+	Errors are not caught: the caller decides.
+	"""
+	doc = frappe.get_doc(TICKET_DOCTYPE, ticket_name)
+	doc.reply_via_agent(message=html, to=doc.raised_by)
+	return frappe.db.get_value(
+		"Communication", _bot_messages(ticket_name), "name", order_by="creation desc, name desc"
+	)
+
+
+def newer_requester_message_exists(ticket_name: str, communication_name: str) -> bool:
+	"""Another Communication of the requester on the ticket (Received, type Communication) with a larger
+	(creation, name) than `communication_name`."""
+	given = frappe.db.get_value("Communication", communication_name, ["name", "creation"], as_dict=True)
+	if not given:
+		return False
+	raised_by = frappe.db.get_value(TICKET_DOCTYPE, ticket_name, "raised_by")
+	rows = frappe.get_all(
+		"Communication",
+		filters={
+			**_ticket_messages(ticket_name, "Received"),
+			"communication_type": "Communication",
+			"name": ("!=", given.name),
+			"creation": (">=", given.creation),
+		},
+		fields=["name", "creation", "sender"],
+	)
+	return any(
+		is_requester_sender(row.sender, raised_by) and (row.creation, row.name) > (given.creation, given.name)
+		for row in rows
+	)
+
+
+def silent_since(ticket_name: str) -> datetime | None:
+	"""When the requester's silence began: the bot's last message, unless the requester wrote after it (then
+	None until the bot's next message; AC-41, AC-44). None when the bot never wrote."""
+	last_bot = frappe.db.get_value(
+		"Communication", _bot_messages(ticket_name), "creation", order_by="creation desc"
+	)
+	if not last_bot:
+		return None
+	raised_by = frappe.db.get_value(TICKET_DOCTYPE, ticket_name, "raised_by")
+	senders = frappe.get_all(
+		"Communication",
+		filters={**_ticket_messages(ticket_name, "Received"), "creation": (">", last_bot)},
+		pluck="sender",
+	)
+	if any(is_requester_sender(sender, raised_by) for sender in senders):
+		return None
+	return last_bot

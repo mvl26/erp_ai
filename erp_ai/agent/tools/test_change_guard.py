@@ -41,7 +41,8 @@ GIT_PATTERN_REFUSED = (
 )
 GIT_PATTERN_ALLOWED = ("custom_app/sub/-x.py", "custom_app/a:b.py")
 
-# Denied list of spec A-6 plus ADR-022 QĐ 2 (design 8.1): 23 names.
+# Denied list of spec A-6 plus ADR-022 QĐ 2 (design 8.1), without `restart` (FEAT-004 Amd-4 Q-2,
+# AC-47): 22 names.
 A6_DENIED_COMMANDS = (
 	"execute",
 	"console",
@@ -61,7 +62,6 @@ A6_DENIED_COMMANDS = (
 	"get-app",
 	"update",
 	"setup",
-	"restart",
 	"run-tests",
 	"switch-to-branch",
 	"new-app",
@@ -867,8 +867,8 @@ class TestBenchArgs(FrappeTestCase):
 		)
 
 	def test_bench_args_refuse_every_a6_denied_command(self):
-		self.assertEqual(len(A6_DENIED_COMMANDS), 23)
-		self.assertEqual(len(set(A6_DENIED_COMMANDS)), 23)
+		self.assertEqual(len(A6_DENIED_COMMANDS), 22)
+		self.assertEqual(len(set(A6_DENIED_COMMANDS)), 22)
 		for name in A6_DENIED_COMMANDS:
 			with self.subTest(command=name):
 				self.assertEqual(self.build(name), NOT_LISTED_REFUSAL)
@@ -878,13 +878,13 @@ class TestBenchArgs(FrappeTestCase):
 				self.assertEqual(self.check([name, "--app", "myapp"]), NOT_LISTED_REFUSAL)
 				self.assertEqual(self.check(["--site", "site1.test", name, "myapp"]), NOT_LISTED_REFUSAL)
 
-	def test_bench_allow_list_is_exactly_the_six_design_commands(self):
+	def test_bench_allow_list_is_exactly_the_seven_design_commands(self):
 		# Design 3.2 / spec A-6: the allow-list is the mechanism; every other command is refused.
 		self.assertEqual(
 			set(change_guard.BENCH_COMMANDS),
-			{"migrate", "build", "clear-cache", "clear-website-cache", "list-apps", "version"},
+			{"migrate", "build", "clear-cache", "clear-website-cache", "list-apps", "version", "restart"},
 		)
-		self.assertEqual(len(change_guard.BENCH_COMMANDS), 6)
+		self.assertEqual(len(change_guard.BENCH_COMMANDS), 7)
 		for name in ("trim-database", "doctor", "show-config", "destroy-all-sessions"):
 			with self.subTest(command=name):
 				self.assertNotIn(name, A6_DENIED_COMMANDS)
@@ -892,6 +892,109 @@ class TestBenchArgs(FrappeTestCase):
 				self.assertEqual(self.build(name, "myapp"), NOT_LISTED_REFUSAL)
 				self.assertEqual(self.check(["--site", "site1.test", name]), NOT_LISTED_REFUSAL)
 				self.assertEqual(self.check([name]), NOT_LISTED_REFUSAL)
+
+	def test_restart_plain_accepted(self):
+		# Design 3.2 / AC-47: the one new shape is `["restart"]`, no site, no app, no flag.
+		self.assertEqual(self.build("restart"), ["restart"])
+		self.assertIsNone(self.check(["restart"]))
+		self.assertEqual(change_guard.RESTART_COMMAND, "restart")
+		self.assertIn(change_guard.RESTART_COMMAND, change_guard.BENCH_COMMANDS)
+		# Like `version`, the shape names no site, so it needs no running site.
+		self.assertEqual(self.build("restart", None, ALLOWED, None), ["restart"])
+		self.assertIsNone(self.check(["restart"], ALLOWED, None))
+		self.assertIsNone(self.check(["restart"], ()))
+
+	def test_restart_with_any_arg_refused(self):
+		# Proposal time: an app given with `restart`.
+		for app in ("myapp", "otherapp", ""):
+			with self.subTest(build_app=app):
+				self.assertEqual(self.build("restart", app), change_guard.CMD_TAKES_NO_APP)
+		# Apply time: the whole stored argv must be exactly `["restart"]`.
+		for args in (
+			# an app
+			["restart", "myapp"],
+			["restart", "--app", "myapp"],
+			["build", "--app", "myapp", "restart"],
+			["--site", "site1.test", "restart", "myapp"],
+			# a flag
+			["restart", "--web"],
+			["restart", "--supervisor"],
+			["restart", "--systemd"],
+			["--web", "restart"],
+			# a site option, even the running site
+			["--site", "site1.test", "restart"],
+			["restart", "--site", "site1.test"],
+			["--site=site1.test", "restart"],
+			# a second word
+			["restart", "restart"],
+			["restart", "migrate"],
+			["restart", ""],
+			["bench", "restart"],
+			# not the plain word
+			["Restart"],
+			[" restart"],
+			["restart "],
+		):
+			with self.subTest(args=args):
+				self.assertEqual(self.check(args), change_guard.CMD_NOT_LISTED)
+		for command in ("Restart", "restart ", "restart --web"):
+			with self.subTest(build_command=command):
+				self.assertEqual(self.build(command), change_guard.CMD_NOT_LISTED)
+
+	def test_every_denied_command_refused(self):
+		# AC-47: 21 items (`mariadb`/`db-console` is one), refused at proposal and at apply time.
+		denied = (
+			"execute",
+			"console",
+			"mariadb",
+			"db-console",
+			"backup",
+			"restore",
+			"drop-site",
+			"reinstall",
+			"set-config",
+			"set-admin-password",
+			"add-system-manager",
+			"add-user",
+			"install-app",
+			"uninstall-app",
+			"remove-app",
+			"get-app",
+			"update",
+			"setup",
+			"run-tests",
+			"new-app",
+			"switch-to-branch",
+			"init",
+		)
+		self.assertEqual(len(set(denied)), 22)
+		for name in denied:
+			with self.subTest(command=name):
+				self.assertNotIn(name, change_guard.BENCH_COMMANDS)
+				self.assertEqual(self.build(name), change_guard.CMD_NOT_LISTED)
+				self.assertEqual(self.build(name, "myapp"), change_guard.CMD_NOT_LISTED)
+				self.assertEqual(self.check([name]), change_guard.CMD_NOT_LISTED)
+				self.assertEqual(self.check(["--site", "site1.test", name]), change_guard.CMD_NOT_LISTED)
+				self.assertEqual(self.check(["restart", name]), change_guard.CMD_NOT_LISTED)
+
+	def test_force_shell_other_site_refused(self):
+		# AC-47: the earlier steps of `check_bench_args` still win over the new `restart` shape.
+		for char in (";", "|", "&", "`", "$(", ">", "<", "\n"):
+			with self.subTest(char=char):
+				self.assertEqual(self.check([f"restart{char}"]), change_guard.CMD_SHELL)
+				self.assertEqual(self.check(["restart", f"x{char}y"]), change_guard.CMD_SHELL)
+				self.assertEqual(self.build(f"restart{char}"), change_guard.CMD_NOT_LISTED)
+		for args in (["restart", "--force"], ["--force", "restart"], ["restart", "--force=1"]):
+			with self.subTest(args=args):
+				self.assertEqual(self.check(args), change_guard.CMD_FORCE)
+		for args in (
+			["--site", "other", "restart"],
+			["restart", "--site", "other"],
+			["restart", "--site=other"],
+			["restart", "--site"],
+		):
+			with self.subTest(args=args):
+				self.assertEqual(self.check(args), change_guard.CMD_OTHER_SITE)
 
 	def test_bench_args_refuse_shell_metacharacters(self):
 		for char in (";", "|", "&", "`", "$(", ">", "<", "\n"):

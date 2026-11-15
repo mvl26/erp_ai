@@ -1445,6 +1445,196 @@ class TestGuidanceWriter(TicketCommentCase):
 		self.assertEqual(_headings(summary), [])
 		self.assertEqual(self._comments(), [])
 
+	def _ctx(self, run_id=None, below_threshold=False, category_mapping=None):
+		return ToolContext(
+			ticket_name=self.ticket,
+			effective_level="L1",
+			instructor=None,
+			run_id=run_id or f"{T100_PREFIX}-{frappe.generate_hash(length=10)}",
+			category_mapping=category_mapping or {},
+			agent_user=AGENT_USER,
+			below_threshold=below_threshold,
+		)
+
+	def _tool(self, kind, content, ctx=None):
+		return write_ticket.post_comment_tool({"kind": kind, "content": content}, ctx or self._ctx())
+
+	def test_post_comment_marker_refused_every_kind(self):
+		# AC-65 (d), ADR-036 QĐ 3: the model's text never carries the marker, whatever the kind; step (0) runs first.
+		refused = {"ok": False, "reason": write_ticket.REASON_MARKER}
+		guidance_run = self._run()
+		# passes every other check of a proposal
+		content = f"{write_ticket.GUIDANCE_MARKER}\n{ANALYSIS}\n{EVIDENCE}"
+		for kind in ("de_xuat", "hoi", "ba_note", "x"):
+			for case, ctx in (
+				("above the threshold", self._ctx()),
+				("below the threshold", self._ctx(below_threshold=True)),
+				("guidance run", self._ctx(guidance_run)),
+			):
+				with self.subTest(kind=kind, case=case):
+					self.assertEqual(self._tool(kind, content, ctx), refused)
+		with patch.object(registry, "_all_specs", lambda: write_ticket.TOOLS):
+			self.assertEqual(
+				execute_tool("post_comment", {"kind": "de_xuat", "content": content}, self._ctx()), refused
+			)
+
+		self.assertEqual(self._comments(), [])
+		self.assertEqual(write_ticket.collected(guidance_run)[0], None)
+		self.assertEqual(write_ticket.count_guidance(self.ticket), 0)
+
+	def test_marker_case_and_spacing_variants_refused(self):
+		refused = {"ok": False, "reason": write_ticket.REASON_MARKER}
+		variants = (
+			"<!-- ERP_AI:HUONG-XU-LY -->",
+			"<!--erp_ai:huong-xu-ly-->",
+			"<!-- Erp_Ai : Huong - Xu - Ly -->",
+			"<!--\terp_ai:\nhuong-xu-ly\t-->",
+			"erp_ai:huong-xu-ly",
+			"ERP_AI: huong-xu-ly",
+		)
+		for variant in variants:
+			for case, content in (
+				("first line", f"{variant}\n{ANALYSIS}\n{EVIDENCE}"),
+				("inside", f"{ANALYSIS}\n{variant}\n{EVIDENCE}"),
+			):
+				with self.subTest(variant=variant, case=case):
+					self.assertEqual(self._tool("de_xuat", content), refused)
+		self.assertEqual(self._comments(), [])
+		# the plan heading alone is no marker
+		proposal = f"{ANALYSIS}\n{EVIDENCE}"
+		self.assertTrue(self._tool("de_xuat", proposal)["ok"])
+		self.assertEqual(self._comments(), [proposal])
+
+	def test_work_only_run_guidance_header_refused(self):
+		# AC-65 (c): on a ticket that already has its guidance, a comment only reports the work just done.
+		run_id = f"{T100_PREFIX}-{frappe.generate_hash(length=10)}"
+		self.addCleanup(lambda: frappe.flags.get("erp_ai_work_only_runs", set()).discard(run_id))
+		write_ticket.mark_work_only(run_id)
+		ctx = self._ctx(run_id)
+		refused = {"ok": False, "reason": write_ticket.REASON_GUIDANCE_HEADER}
+		with_plan = f"{ANALYSIS}\n{EVIDENCE}"
+		self.assertIn(write_ticket.GUIDANCE_HEADER, write_ticket.REASON_GUIDANCE_HEADER)
+
+		self.assertEqual(self._tool("de_xuat", with_plan, ctx), refused)
+		self.assertEqual(self._tool("hoi", "Hướng xử lý: làm lại từ đầu?", ctx), refused)
+		self.assertEqual(self._comments(), [])
+
+		report = f"**Nhận định:** đã tạo Task cho phiếu.\n{EVIDENCE}\nĐộ tin cậy: 90%"
+		empty_plan = f"**Hướng xử lý:**\n{EVIDENCE}\nĐộ tin cậy: 90%"
+		self.assertTrue(self._tool("de_xuat", report, ctx)["ok"])
+		self.assertTrue(self._tool("de_xuat", empty_plan, ctx)["ok"])
+		# another run of the ticket that is not work-only posts the plan
+		self.assertTrue(self._tool("de_xuat", with_plan)["ok"])
+		self.assertEqual(self._comments(), [report, empty_plan, with_plan])
+
+	def test_de_xuat_held_in_guidance_run(self):
+		# AC-65 (a), w1.md:66: in a guidance run the model's proposal is the analysis of the guidance comment.
+		run_id = self._run()
+		ctx = self._ctx(run_id)
+		held = {"ok": True, "held": True, "note": write_ticket.HELD_NOTE}
+		later = "**Nhận định:** lần hai\n**Hướng xử lý:** C\nĐộ tin cậy: 80%"
+
+		self.assertEqual(self._tool("de_xuat", f"{ANALYSIS}\n{EVIDENCE}", ctx), held)
+		self.assertEqual(self._tool("de_xuat", later, ctx), held)
+
+		self.assertEqual(self._comments(), [])
+		self.assertEqual(write_ticket.collected(run_id)[0], later)
+		# a question above the threshold is no guidance: posted on its own (step 4)
+		self.assertTrue(self._tool("hoi", "Máy in nào?", ctx)["ok"])
+		self.assertEqual(self._comments(), ["Máy in nào?"])
+		self.assertEqual(write_ticket.collected(run_id)[0], later)
+		guidance = write_ticket.post_guidance(self.ticket, run_id)
+		self.assertTrue(guidance["ok"], guidance)
+		self.assertEqual(
+			frappe.db.get_value("Comment", guidance["comment"], "content"),
+			f"{write_ticket.GUIDANCE_MARKER}\n{later}",
+		)
+
+	def test_set_classification_collects_done_line(self):
+		# AC-66 (a), U4b-8: a classification written in a guidance run is a line of "Đã làm", not a comment.
+		self.assertEqual(write_ticket.ROUTE_DONE, "Bot đã phân loại phiếu: {fields}.")
+		self.assertEqual(
+			write_ticket.FIELD_LABELS, {"ticket_type": "Loại", "agent_group": "Nhóm", "priority": "Ưu tiên"}
+		)
+		frappe.set_user("Administrator")
+		self.addCleanup(frappe.cache.hdel, "assignment_rule_map", "HD Ticket")
+		create_agent(AGENT)
+		if not frappe.db.exists("HD Ticket Type", TICKET_TYPE):
+			frappe.get_doc({"doctype": "HD Ticket Type", "name": TICKET_TYPE}).insert()
+		if not frappe.db.exists("HD Team", TEAM):
+			frappe.get_doc({"doctype": "HD Team", "team_name": TEAM, "users": [{"user": AGENT}]}).insert()
+		frappe.set_user(AGENT_USER)
+		mapping = {"A": {"ticket_type": TICKET_TYPE, "agent_group": TEAM, "priority": "High"}}
+		args = {"category": "A", "confidence": "Cao"}
+		guidance_run, other_run, nothing_run = self._run(), f"{T100_PREFIX}-không gom", self._run()
+
+		written = write_ticket.set_classification(args, self._ctx(guidance_run, category_mapping=mapping))
+		again = write_ticket.set_classification(args, self._ctx(other_run, category_mapping=mapping))
+		nothing = write_ticket.set_classification(
+			args, self._ctx(nothing_run, category_mapping={"A": {"ticket_type": MISSING_TYPE}})
+		)
+
+		self.assertTrue(written["after"], written)
+		self.assertEqual(
+			write_ticket.collected(guidance_run),
+			(
+				None,
+				{
+					write_ticket.SECTION_DONE: [
+						write_ticket.ROUTE_DONE.format(
+							fields=f"Loại {TICKET_TYPE}, Nhóm {TEAM}, Ưu tiên High"
+						)
+					],
+					write_ticket.SECTION_PENDING: [],
+					write_ticket.SECTION_DECIDE: [],
+				},
+			),
+		)
+		self.assertTrue(again["ok"], again)
+		self.assertFalse(write_ticket.collecting(other_run))
+		self.assertEqual(nothing, {"ok": True, "before": {}, "after": {}, "skipped": nothing["skipped"]})
+		self.assertEqual(write_ticket.collected(nothing_run)[1][write_ticket.SECTION_DONE], [])
+		self.assertEqual(self._comments(), [])
+
+	def test_de_xuat_held_without_evidence_in_guidance_run(self):
+		# design-w1-fixes-20 Điểm 1.4 (3c): the held analysis needs no "Căn cứ" section.
+		run_id = self._run()
+
+		result = self._tool("de_xuat", ANALYSIS, self._ctx(run_id))
+
+		self.assertEqual(result, {"ok": True, "held": True, "note": write_ticket.HELD_NOTE})
+		self.assertEqual(self._comments(), [])
+		self.assertEqual(write_ticket.collected(run_id)[0], ANALYSIS)
+
+	def test_de_xuat_outside_guidance_run_still_needs_evidence(self):
+		# design-w1-fixes-20 Điểm 1.4 (3d), AC-22 unchanged outside the guidance comment.
+		result = self._tool("de_xuat", ANALYSIS)
+
+		self.assertEqual(result, {"ok": False, "reason": write_ticket.REASON_NO_EVIDENCE})
+		self.assertEqual(self._comments(), [])
+
+	def test_held_needs_confidence(self):
+		# AC-32 [changed]: the guidance keeps its confidence line; without it nothing is held.
+		run_id = self._run()
+		refused = {"ok": False, "reason": write_ticket.REASON_NO_CONFIDENCE}
+		for content in ("**Nhận định:** A\n**Hướng xử lý:** B", "**Nhận định:** A\nĐộ tin cậy: 101%"):
+			with self.subTest(content=content):
+				self.assertEqual(self._tool("de_xuat", content, self._ctx(run_id)), refused)
+		self.assertEqual(write_ticket.collected(run_id)[0], None)
+		self.assertEqual(self._comments(), [])
+
+	def test_post_comment_schema_has_no_section_templates(self):
+		# design-w1-fixes-20 Điểm 1.5: no "Cần ai quyết"; the kind=de_xuat sentence asks no "Căn cứ".
+		(spec,) = [spec for spec in write_ticket.TOOLS if spec.name == "post_comment"]
+		description = spec.schema["description"]
+		(proposal,) = [part for part in description.split("kind=") if part.startswith("de_xuat")]
+
+		self.assertNotIn("Cần ai quyết", description)
+		self.assertNotIn("Căn cứ", proposal)
+		self.assertIn("'Độ tin cậy: NN%'", proposal)
+		self.assertIn("hệ thống tự thêm chúng vào comment", description)
+		self.assertIn("Khi phiếu đã có hướng xử lý: chỉ báo kết quả việc vừa làm.", description)
+
 
 class TestCollector(FrappeTestCase):
 	"""ADR-036 QĐ 2, 6 (w1.md:62, AD3.md:126-129): the run's collector lives in frappe.flags under its run_id."""

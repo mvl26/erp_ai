@@ -572,6 +572,20 @@ class TestProposeChange(FrappeTestCase):
 		self.assertEqual(self.proposals(), [])
 		self.assertEqual(self.comments(), [])
 
+	def test_bench_command_handler_refuses_restart_until_blocks(self):
+		# CHG-002 addendum-6 P-1: restart is in the guard table but the single-command tool stays closed
+		self.assertIn(change_guard.RESTART_COMMAND, change_guard.BENCH_COMMANDS)
+		(spec,) = [spec for spec in propose_change.TOOLS if spec.name == "propose_bench_command"]
+		self.assertNotIn(
+			change_guard.RESTART_COMMAND, spec.schema["input_schema"]["properties"]["command"]["enum"]
+		)
+		direct = propose_change.propose_bench_command(
+			{"command": "restart", "reason": "x"}, self.context(allowed_apps=(APP,))
+		)
+		self.assertEqual(direct, {"ok": False, "reason": change_guard.CMD_NOT_LISTED})
+		self.assertEqual(self.proposals(), [])
+		self.assertEqual(self.comments(), [])
+
 	def test_command_args_built_by_server_for_each_command(self):
 		site = frappe.local.site
 		expected = {

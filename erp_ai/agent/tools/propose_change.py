@@ -50,6 +50,11 @@ NO_PARENT = "thư mục cha chưa có"
 # CHG-002 design 3.1: the fields of an `edit` item of `changes`.
 EDIT_FIELDS = {"action", "path", "find", "replace"}
 LEGACY_EDIT_KEYS = ("path", "find", "replace")
+# CHG-002 addendum-6: `restart` reaches the model only as a block command (T28); the single-command
+# apply path would run it inside the worker instead of through `launch_restart`.
+_SINGLE_BENCH_COMMANDS = tuple(
+	command for command in change_guard.BENCH_COMMANDS if command != change_guard.RESTART_COMMAND
+)
 
 
 def _fail(reason: str) -> dict:
@@ -276,6 +281,8 @@ def propose_new_file(args: dict, ctx: ToolContext) -> dict:
 def propose_bench_command(args: dict, ctx: ToolContext) -> dict:
 	if refusal := _entry_refusal(ctx):
 		return refusal
+	if args["command"] not in _SINGLE_BENCH_COMMANDS:
+		return _fail(change_guard.CMD_NOT_LISTED)
 	built = change_guard.build_bench_args(
 		args["command"], args.get("app"), ctx.allowed_apps, frappe.local.site
 	)
@@ -373,7 +380,7 @@ TOOLS: list[ToolSpec] = [
 			"input_schema": {
 				"type": "object",
 				"properties": {
-					"command": {"type": "string", "enum": list(change_guard.BENCH_COMMANDS)},
+					"command": {"type": "string", "enum": list(_SINGLE_BENCH_COMMANDS)},
 					"app": {"type": "string", "minLength": 1, "maxLength": APP_MAX_CHARS},
 					"reason": _REASON,
 				},

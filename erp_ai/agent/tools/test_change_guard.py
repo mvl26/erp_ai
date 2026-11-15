@@ -878,7 +878,7 @@ class TestBenchArgs(FrappeTestCase):
 				self.assertEqual(self.check([name, "--app", "myapp"]), NOT_LISTED_REFUSAL)
 				self.assertEqual(self.check(["--site", "site1.test", name, "myapp"]), NOT_LISTED_REFUSAL)
 
-	def test_bench_allow_list_is_exactly_the_six_design_commands(self):
+	def test_bench_allow_list_is_exactly_the_seven_design_commands(self):
 		# Design 3.2 / spec A-6: the allow-list is the mechanism; every other command is refused.
 		self.assertEqual(
 			set(change_guard.BENCH_COMMANDS),

@@ -779,3 +779,61 @@ class TestConfidence(FrappeTestCase):
 		# A newer classify row with an unknown pct wins and reads None (no fallback to an older number).
 		self._classify_row(ticket, "C", -1, created=now + timedelta(minutes=1))
 		self.assertEqual(policy.latest_classification(ticket), ("C", None))
+
+
+class TestSiteEnvironment(FrappeTestCase):
+	# ADR-031 QĐ 7, arch-review w1a C-1: the one reader of the site environment; anything but an exact
+	# "production" or "test" (missing field, empty, unknown, other case) fails closed to "production".
+	def setUp(self):
+		commit_guard = patch.object(
+			frappe.db, "commit", side_effect=AssertionError("test must not commit the transaction")
+		)
+		commit_guard.start()
+		self.addCleanup(commit_guard.stop)
+		self.addCleanup(frappe.db.rollback)
+		keep_agent_settings(self)
+
+	def test_values_and_fail_closed(self):
+		self.assertEqual(policy.SITE_ENVIRONMENT_FIELD, "site_environment")
+		self.assertEqual(policy.SITE_ENVIRONMENTS, ("production", "test"))
+		self.assertEqual(policy.DEFAULT_SITE_ENVIRONMENT, "production")
+		for value in ("production", "test"):
+			with self.subTest(value=value):
+				self.assertEqual(policy.site_environment(frappe._dict(site_environment=value)), value)
+		# A settings object without the field (before migrate) reads production and never raises.
+		for settings in (frappe._dict(), object()):
+			with self.subTest(settings=settings):
+				self.assertEqual(policy.site_environment(settings), "production")
+		for value in (
+			"",
+			None,
+			"staging",
+			"Test",
+			"TEST",
+			"Production",
+			" test",
+			"test ",
+			0,
+			1,
+			True,
+			["test"],
+		):
+			with self.subTest(value=value):
+				self.assertEqual(policy.site_environment(frappe._dict(site_environment=value)), "production")
+		# settings=None reads the stored ERP AI Setting (a value written without validate, as an old row could be).
+		for stored, expected in (
+			("test", "test"),
+			("production", "production"),
+			("staging", "production"),
+			("", "production"),
+		):
+			with self.subTest(stored=stored):
+				set_agent_settings(site_environment=stored)
+				self.assertEqual(policy.site_environment(), expected)
+				self.assertEqual(policy.site_environment(None), expected)
+		# A given settings object wins over the stored value.
+		set_agent_settings(site_environment="production")
+		self.assertEqual(policy.site_environment(frappe._dict(site_environment="test")), "test")
+		set_agent_settings(site_environment="test")
+		self.assertEqual(policy.site_environment(frappe._dict()), "production")
+		self.assertEqual(policy.site_environment(frappe.get_doc(SETTING_DOCTYPE)), "test")

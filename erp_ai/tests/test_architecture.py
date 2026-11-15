@@ -4363,6 +4363,90 @@ def write_entry(**fields):
 """
 
 
+# ---------------------------------------------------------------------------------------------------
+# ADR-031 QĐ 7, arch-review w1a C-1/C-2: one reader of the site environment (`policy.site_environment`)
+# ---------------------------------------------------------------------------------------------------
+
+SITE_ENVIRONMENT_FIELD = "site_environment"
+SITE_ENVIRONMENT_CONSTANT = "SITE_ENVIRONMENT_FIELD"
+SITE_ENVIRONMENT_READER = f"{module_name(POLICY_FILE)}.{SITE_ENVIRONMENT_FIELD}"
+SITE_ENVIRONMENT_NAME = re.compile(r"(?<![A-Za-z0-9_])site_environment(?![A-Za-z0-9_])")
+# The Python files that may name the field, one reason each (C-2; tests and JSON are never scanned by the
+# rule). The other product files that read the ERP AI Log column of the same name are listed here too (grep
+# `site_environment` in erp_ai/**/*.py on the T70 base: only the Setting controller, so none so far).
+SITE_ENVIRONMENT_FILES = {
+	POLICY_FILE: "the one reader of the Setting field, site_environment() (ADR-031 QĐ 7)",
+	SETTING_CONTROLLER_FILE: "the ERP AI Setting controller owns the field (its own form summary)",
+	RUN_LOG_FILE: "writes the ERP AI Log column of the same name (ADR-033 QĐ 5)",
+	INSTALL_FILE: "sets up the ERP AI Setting defaults at install",
+}
+
+
+def check_site_environment_readers(sources: dict) -> list:
+	"""ADR-031 QĐ 7, C-2: outside SITE_ENVIRONMENT_FILES no Python file names `site_environment` (an attribute,
+	a keyword, a string, a built string) or policy's SITE_ENVIRONMENT_FIELD; the one exception is the policy
+	function itself (`policy.site_environment(...)`, or imported from erp_ai.agent.policy)."""
+	violations = []
+	for rel, source in only_python(sources).items():
+		if rel in SITE_ENVIRONMENT_FILES:
+			continue
+		tree = parse(rel, source)
+		aliases = import_aliases(tree)
+		reader_imports = {
+			id(alias)
+			for node in ast.walk(tree)
+			if isinstance(node, ast.ImportFrom) and not node.level and node.module == module_name(POLICY_FILE)
+			for alias in node.names
+			if alias.name == SITE_ENVIRONMENT_FIELD
+		}
+		lines = set()
+		for node in ast.walk(tree):
+			if id(node) in reader_imports or isinstance(node, ast.Constant):
+				continue  # strings are checked below, built ones included
+			names = _node_names(node)
+			if SITE_ENVIRONMENT_FIELD in names and resolved_name(node, aliases) == SITE_ENVIRONMENT_READER:
+				continue  # `policy.site_environment(...)` is the reader, not a field read
+			if SITE_ENVIRONMENT_FIELD in names or SITE_ENVIRONMENT_CONSTANT in names:
+				lines.add(node.lineno)
+		lines |= {
+			node.lineno
+			for node, text in _string_texts(tree, _docstring_ids(tree))
+			if SITE_ENVIRONMENT_NAME.search(text)
+		}
+		violations.extend(
+			f"{rel}:{line}: names {SITE_ENVIRONMENT_FIELD} outside {POLICY_FILE}; read it with "
+			f"policy.site_environment() (ADR-031 QĐ 7)"
+			for line in sorted(lines)
+		)
+	return violations
+
+
+# Compliant sample: each allow-listed file names the field, two callers use the reader.
+SITE_ENVIRONMENT_SAMPLE = {
+	POLICY_FILE: (
+		'import frappe\n\nSITE_ENVIRONMENT_FIELD = "site_environment"\n\n\n'
+		"def site_environment(settings=None):\n"
+		"\treturn getattr(settings or frappe.get_single('ERP AI Setting'), SITE_ENVIRONMENT_FIELD, None)\n"
+	),
+	SETTING_CONTROLLER_FILE: "def summary(self):\n\treturn f'Môi trường site: {self.site_environment}'\n",
+	RUN_LOG_FILE: (
+		"from erp_ai.agent import policy\n\n\ndef write_entry(**fields):\n"
+		'\treturn {**fields, "site_environment": policy.site_environment()}\n'
+	),
+	INSTALL_FILE: 'DEFAULTS = {"site_environment": "production"}\n',
+	TASKS_FILE: (
+		"import frappe\n\nfrom erp_ai.agent import policy\n\n\ndef job():\n"
+		"\tsettings = frappe.get_single('ERP AI Setting')\n\treturn policy.site_environment(settings)\n"
+	),
+	"agent/executor.py": (
+		"from erp_ai.agent.policy import site_environment\n"
+		"from erp_ai.agent.policy import site_environment as env\n\n\n"
+		'def gate():\n\t"""Refuse on production; site_environment is read once."""\n'
+		'\treturn site_environment() == "production" or env() == "production"\n'
+	),
+}
+
+
 class TestArchitecture(unittest.TestCase):
 	@classmethod
 	def setUpClass(cls):
@@ -4628,6 +4712,93 @@ class TestArchitecture(unittest.TestCase):
 		# The runner gets the switch only by calling the policy function, never by reading the field.
 		self.assertIn("policy.auto_assign_enabled(", self.sources[RUNNER_FILE])
 		self.assertEqual(check_policy_fields_only_in_policy(self.sources), [])
+
+	def test_site_environment_read_only_via_policy(self):
+		changed = TestScannersCatchViolations.changed
+		sample = SITE_ENVIRONMENT_SAMPLE
+		# C-2: the field is not a POLICY_FIELDS name (the ERP AI Log column of the same name is written by
+		# run_log.py); its own rule below holds on the real tree, and policy.py defines the reader.
+		self.assertNotIn(SITE_ENVIRONMENT_FIELD, POLICY_FIELDS)
+		for rel in SITE_ENVIRONMENT_FILES:
+			self.assertIn(rel, self.sources)
+		self.assertIn(f'{SITE_ENVIRONMENT_CONSTANT} = "{SITE_ENVIRONMENT_FIELD}"', self.sources[POLICY_FILE])
+		self.assertIn(f"def {SITE_ENVIRONMENT_FIELD}(settings=None) -> str:", self.sources[POLICY_FILE])
+		self.assertEqual(check_site_environment_readers(self.sources), [])
+
+		def in_function(rel: str, body: str) -> dict:
+			return changed(sample, rel, f"\n\ndef _sample(settings):\n\t{body}\n")
+
+		outside = f"names {SITE_ENVIRONMENT_FIELD} outside {POLICY_FILE}"
+		self.assertRuleSamples(
+			check_site_environment_readers,
+			sample,
+			{
+				"tasks.py reads settings.site_environment": (
+					in_function(TASKS_FILE, "return settings.site_environment"),
+					f"{TASKS_FILE}:12: {outside}",
+				),
+				"getattr with the name": (
+					in_function(TASKS_FILE, 'return getattr(settings, "site_environment", "production")'),
+					f"{TASKS_FILE}:12",
+				),
+				"stored value read directly": (
+					in_function(
+						"agent/executor.py",
+						'return frappe.db.get_single_value("ERP AI Setting", "site_environment")',
+					),
+					"agent/executor.py:11",
+				),
+				"policy constant used to read the field": (
+					in_function(
+						"agent/executor.py", "return getattr(settings, policy.SITE_ENVIRONMENT_FIELD)"
+					),
+					"agent/executor.py:11",
+				),
+				"constant imported from policy": (
+					changed(
+						sample,
+						"agent/executor.py",
+						"\nfrom erp_ai.agent.policy import SITE_ENVIRONMENT_FIELD\n",
+					),
+					"agent/executor.py:9",
+				),
+				"Log column read by a report": (
+					changed(
+						sample,
+						"report.py",
+						'import frappe\n\nROWS = frappe.get_all("ERP AI Log", fields=["site_environment"])\n',
+					),
+					"report.py:3",
+				),
+				"keyword argument": (
+					changed(sample, "report.py", "ROWS = dict(site_environment=1)\n"),
+					"report.py:1",
+				),
+				"built by concatenation": (
+					changed(sample, "report.py", 'FIELD = "site_" + "environment"\n'),
+					"report.py:1",
+				),
+				"named in an SQL string": (
+					changed(sample, "report.py", "SQL = 'select site_environment from `tabERP AI Log`'\n"),
+					"report.py:1",
+				),
+				"another module's reader of the same name": (
+					changed(
+						sample,
+						"report.py",
+						"from erp_ai.agent.run_log import site_environment\n\nX = site_environment()\n",
+					),
+					"report.py:1",
+				),
+			},
+		)
+		# An allow-listed file stays allowed whatever it does with the field.
+		for rel in SITE_ENVIRONMENT_FILES:
+			with self.subTest(allowed=rel):
+				self.assertEqual(
+					check_site_environment_readers(changed(sample, rel, "\nX = settings.site_environment\n")),
+					[],
+				)
 
 	def test_entry_types_unchanged(self):
 		scanned = load_product_sources(suffixes=(".py", ".json"))

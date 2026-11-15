@@ -251,6 +251,20 @@ def permission_switches(settings) -> PermissionSwitches:
 	)
 
 
+SITE_ENVIRONMENT_FIELD = "site_environment"
+SITE_ENVIRONMENTS = ("production", "test")
+DEFAULT_SITE_ENVIRONMENT = "production"
+
+
+def site_environment(settings=None) -> str:
+	"""The only reader of site_environment (ADR-031 QĐ 7); `settings` None reads the stored ERP AI Setting.
+	Anything but an exact value of SITE_ENVIRONMENTS (missing, empty, unknown, other case) reads production."""
+	if settings is None:
+		settings = frappe.get_single(SETTING_DOCTYPE)
+	value = getattr(settings, SITE_ENVIRONMENT_FIELD, None)
+	return value if isinstance(value, str) and value in SITE_ENVIRONMENTS else DEFAULT_SITE_ENVIRONMENT
+
+
 def validate_change_apps(settings, apps_root: str) -> None:
 	"""Raise frappe.ValidationError for a bad name or erp_ai (every line), then for a missing `apps_root`/<x> directory."""
 	apps = _change_app_lines(getattr(settings, CODE_CHANGE_APPS_FIELD, None))

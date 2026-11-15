@@ -19,7 +19,7 @@ from erp_ai.constants import (
 	TRIGGER_COMMENT_MENTION,
 	TRIGGER_TICKET_INSERT,
 )
-from erp_ai.test_utils import TempAppsRoot, keep_agent_settings, set_agent_settings
+from erp_ai.test_utils import TempAppsRoot, keep_agent_settings, make_log_entry, set_agent_settings
 
 TEAM = "Nhân sự & Hành chính"
 
@@ -937,3 +937,97 @@ class TestTitlePrefix(FrappeTestCase):
 			self.assertEqual(policy.excluded_title_prefixes(), ())
 			self.assertFalse(policy.has_excluded_title("[HR] X"))
 		self.assertEqual(frappe.get_message_log(), [])
+
+
+class TestSendRefusal(FrappeTestCase):
+	# AC-9, ADR-034 QĐ 1, U2.md:95-102, :115-117, :130-132: one send predicate that answers with a reason code;
+	# can_send_ticket is `send_refusal(ticket) is None`.
+	def setUp(self):
+		self.addCleanup(frappe.cache.hdel, "assignment_rule_map", "HD Ticket")
+		commit_guard = patch.object(
+			frappe.db, "commit", side_effect=AssertionError("test must not commit the transaction")
+		)
+		commit_guard.start()
+		self.addCleanup(commit_guard.stop)
+		self.addCleanup(frappe.db.rollback)
+		keep_agent_settings(self)
+		set_agent_settings(excluded_teams=TEAM, excluded_title_prefixes="[HR]")
+		for name in TEAMS:
+			_ensure_team(name)
+
+	def _ticket(self, **values):
+		ticket = make_ticket(subject=values.pop("subject", "Hỏi về máy in"))
+		for key, value in values.items():
+			frappe.db.set_value("HD Ticket", ticket.name, key, value)
+		return ticket.name
+
+	def _classified_excluded(self, ticket):
+		make_log_entry(
+			ticket=ticket, entry_type="classify", stop_reason=policy.EXCLUDED_BY_CLASSIFICATION, applied=0
+		)
+
+	def test_order_and_codes(self):
+		self.assertEqual(policy.EXCLUDED_BY_CLASSIFICATION, "excluded_by_classification")
+		self.assertEqual(
+			(
+				policy.REFUSAL_OPTED_OUT,
+				policy.REFUSAL_EXCLUDED_TEAM,
+				policy.REFUSAL_EXCLUDED_TITLE,
+				policy.REFUSAL_EXCLUDED_BY_CLASSIFICATION,
+				policy.REFUSAL_MISSING,
+			),
+			("opted_out", "excluded_team", "excluded_title", "excluded_by_classification", "missing"),
+		)
+		self.assertEqual(
+			policy.SEND_POLICY_FIELDS, (policy.OPT_OUT_FIELD, policy.TEAM_FIELD, policy.SUBJECT_FIELD)
+		)
+		self.assertEqual(policy.send_refusal("không có phiếu này"), policy.REFUSAL_MISSING)
+		self.assertEqual(policy.send_refusal(None), policy.REFUSAL_MISSING)
+		self.assertIsNone(policy.send_refusal(self._ticket()))
+		self.assertIsNone(policy.send_refusal(self._ticket(agent_group="IT")))
+
+		opted_out = self._ticket(ai_opt_out=1, agent_group=TEAM, subject="[HR] X")
+		self.assertEqual(policy.send_refusal(opted_out), policy.REFUSAL_OPTED_OUT)
+		team_and_title = self._ticket(agent_group=TEAM, subject="[HR] X")
+		self.assertEqual(policy.send_refusal(team_and_title), policy.REFUSAL_EXCLUDED_TEAM)
+		self.assertEqual(
+			policy.send_refusal(self._ticket(subject="[hr] Nghỉ phép")), policy.REFUSAL_EXCLUDED_TITLE
+		)
+		# The prefix is the creator's intent: it counts with or without a team.
+		self.assertEqual(
+			policy.send_refusal(self._ticket(agent_group="IT", subject="[HR] Nghỉ phép")),
+			policy.REFUSAL_EXCLUDED_TITLE,
+		)
+		self.assertIsNone(policy.send_refusal(self._ticket(subject="Hỏi về [HR]")))
+
+		# A name or the saved doc gives the same answer.
+		self.assertEqual(
+			policy.send_refusal(frappe.get_doc("HD Ticket", team_and_title)), policy.REFUSAL_EXCLUDED_TEAM
+		)
+
+		# Excluded by classification: only while no team is set; a person's team choice ends it (A-U2-2).
+		classified = self._ticket()
+		self._classified_excluded(classified)
+		self.assertTrue(policy.is_excluded_by_classification(classified))
+		self.assertFalse(policy.is_excluded_by_classification(self._ticket()))
+		self.assertEqual(policy.send_refusal(classified), policy.REFUSAL_EXCLUDED_BY_CLASSIFICATION)
+		self.assertEqual(
+			policy.send_refusal(frappe.get_doc("HD Ticket", classified)),
+			policy.REFUSAL_EXCLUDED_BY_CLASSIFICATION,
+		)
+		frappe.db.set_value("HD Ticket", classified, "agent_group", "IT")
+		self.assertIsNone(policy.send_refusal(classified))
+		frappe.db.set_value("HD Ticket", classified, "agent_group", TEAM)
+		self.assertEqual(policy.send_refusal(classified), policy.REFUSAL_EXCLUDED_TEAM)
+		# A classify row with another stop_reason does not exclude.
+		other = self._ticket()
+		make_log_entry(ticket=other, entry_type="classify", stop_reason="end_turn", applied=0)
+		self.assertIsNone(policy.send_refusal(other))
+
+	def test_can_send_ticket_is_send_refusal_is_none(self):
+		for values in ({}, {"ai_opt_out": 1}, {"agent_group": TEAM}, {"subject": "[HR] X"}):
+			with self.subTest(values=values):
+				name = self._ticket(**values)
+				self.assertEqual(policy.can_send_ticket(name), policy.send_refusal(name) is None)
+		self.assertFalse(policy.can_send_ticket(None))
+		self.assertFalse(policy.can_send_ticket("không có phiếu này"))

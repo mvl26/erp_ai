@@ -72,6 +72,9 @@ UNEXPECTED_ERROR_REASON = "lỗi hệ thống khi lưu, không có gì thay đ�
 DOCTYPE_ECHO_MAX = 80
 DEFAULT_LIMIT = 20
 MAX_LIMIT = 50
+EXCLUDED_LIST_NOTE = (
+	"Phiếu nhóm loại trừ, phiếu không dùng AI và mọi bản ghi của chúng không bao giờ có trong danh sách."
+)
 MAX_FIELDS = 20
 MAX_FILTERS = 10
 NAME_MAX = 140
@@ -550,17 +553,25 @@ def list_records(args: dict, ctx: ToolContext) -> dict:
 		return _fail(
 			"filters phải là danh sách [trường, toán tử, giá trị] với trường và toán tử hợp lệ", doctype
 		)
+	# ADR-034 Ràng buộc 2: the exclusion is part of the query, so `limit` and the order never reveal it. The
+	# model gives no or_filters: the only OR group is the policy's.
+	extra, or_filters = policy.ticket_content_filters(doctype)
 	try:
 		rows = frappe.get_list(
 			doctype,
-			filters=filters,
+			filters=[*filters, *extra],
+			or_filters=or_filters,
 			fields=fields,
 			limit_page_length=args.get("limit", DEFAULT_LIMIT),
 			order_by="modified desc",
 		)
 	except frappe.PermissionError:
 		return _fail("thiếu quyền đọc DocType này", doctype)
-	return {"ok": True, "doctype": doctype, "records": [dict(row) for row in rows]}
+	result = {"ok": True, "doctype": doctype, "records": [dict(row) for row in rows]}
+	if policy.is_ticket_content_doctype(doctype):
+		# Always present, so the reason is given without revealing whether anything was hidden.
+		result["excluded_note"] = EXCLUDED_LIST_NOTE
+	return result
 
 
 _DOCTYPE = {"type": "string", "minLength": 1, "maxLength": NAME_MAX}

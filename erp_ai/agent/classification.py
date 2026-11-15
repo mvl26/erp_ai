@@ -45,7 +45,8 @@ class Classification:
 	importance: int = 0
 	score_reason: str = ""
 	department: str | None = None
-	confidence_pct: int = 0
+	# None = unknown (direct builders such as set_classification); never 0 for unknown (design-w0-fixes-2.md section 1).
+	confidence_pct: int | None = None
 
 
 def _load_json_object(text):

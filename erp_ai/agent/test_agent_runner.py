@@ -3138,3 +3138,65 @@ class TestRunnerGrant(RunnerTestBase):
 		results = self._run_classified(70)
 
 		self.assertTrue(results["t_cls"]["ok"])
+
+	def _run_insert_classified(self, confidence_pct):
+		"""T81: an insert run whose classification stub carries `confidence_pct` (threshold 70 from the base).
+
+		Returns the `apply_route` spy and the reason turn's tool results.
+		"""
+		# the stub's category A is inside CATEGORIES: its cap is set here, never read from the shared site
+		set_agent_settings(level_cap_a="L1")
+		stub = {"dau_muc": "A", "do_tin_cay": "Cao", "do_tin_cay_pct": confidence_pct, "ly_do": "x"}
+		self.gateway.results = [
+			make_model_result(text=json.dumps(stub)),
+			tool_turn(tool_use("t_cls", "set_classification", category="A", confidence="Cao")),
+			make_model_result(),
+		]
+		with patch.object(runner, "apply_route", wraps=runner.apply_route) as route:
+			self._run("ticket_insert")
+		blocks = self.gateway.calls[2]["messages"][-1]["content"]
+		return route, {block["tool_use_id"]: json.loads(block["content"]) for block in blocks}
+
+	def test_low_confidence_insert_skips_routing_writes(self):
+		route, results = self._run_insert_classified(69)
+
+		route.assert_not_called()
+		(entry,) = self._entries(entry_type="classify")
+		self.assertEqual(entry.applied, 0)
+		self.assertEqual(entry.predicted_confidence_pct, 69)
+		# a 69 % classification leaves the reasoning step ask only
+		self.assertFalse(results["t_cls"]["ok"])
+		self.assertIn("không được cấp", results["t_cls"]["reason"])
+
+	def test_unparseable_insert_reasons_below_threshold(self):
+		# nothing classified: the context built before classification (category, pct unknown) reaches `_reason`
+		self.gateway.results = [
+			make_model_result(text="không phải JSON"),
+			tool_turn(tool_use("t_cls", "set_classification", category="A", confidence="Cao")),
+			make_model_result(),
+		]
+		self._run("ticket_insert")
+
+		self.assertEqual(self._entries(entry_type="classify")[0].stop_reason, "unparseable")
+		blocks = self.gateway.calls[2]["messages"][-1]["content"]
+		results = {block["tool_use_id"]: json.loads(block["content"]) for block in blocks}
+		self.assertFalse(results["t_cls"]["ok"])
+		self.assertIn("không được cấp", results["t_cls"]["reason"])
+
+	def test_insert_at_threshold_routes_and_writes(self):
+		route, results = self._run_insert_classified(70)
+
+		route.assert_called_once()
+		(entry,) = self._entries(entry_type="classify")
+		self.assertEqual(entry.predicted_confidence_pct, 70)
+		self.assertTrue(results["t_cls"]["ok"])
+
+	def test_insert_reason_context_takes_category_cap_of_classification(self):
+		# before classification the category is unknown (UNKNOWN_CATEGORY_LEVEL L1); the stub's A is capped at L0
+		set_agent_settings(level_cap_a="L0")
+		self.gateway.results = [make_model_result(text=CLASSIFY_A), make_model_result()]
+		with patch.object(runner, "_reason", wraps=runner._reason) as reason:
+			self._run("ticket_insert")
+
+		context = reason.call_args.args[4]
+		self.assertEqual(context.main_path_level, "L0")

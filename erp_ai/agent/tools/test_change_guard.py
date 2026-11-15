@@ -1712,6 +1712,12 @@ class TestCheckBlock(FrappeTestCase):
 				self.assert_refused_in_both_moments(
 					[edit("myapp/a.py")], RESTART_PLACE_REFUSAL, commands=commands, legacy=legacy
 				)
+		# Design 3.2 step 4: the place of restart is checked before `.py <=> restart`, so a block
+		# with no `.py` and a misplaced restart gets RESTART_PLACE, not RESTART_WITHOUT_PY.
+		for commands in ([MIGRATE, RESTART, RESTART], [RESTART, MIGRATE]):
+			self.assert_refused_in_both_moments(
+				[edit(README)], RESTART_PLACE_REFUSAL, commands=commands, legacy=False
+			)
 
 	def test_py_without_restart_refused(self):
 		self.sandbox.commit_file("myapp", "a.py", "x = 1\n")

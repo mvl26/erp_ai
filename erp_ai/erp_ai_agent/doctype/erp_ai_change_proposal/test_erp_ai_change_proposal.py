@@ -2,7 +2,7 @@ import json
 import re
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import call, patch
 
 import frappe
 import frappe.desk.form.load
@@ -16,6 +16,10 @@ from erp_ai.constants import (
 	AGENT_USER,
 	CHANGE_KIND_CODE,
 	CHANGE_KIND_COMMAND,
+	CHANGE_OP_CREATE,
+	CHANGE_OP_DELETE,
+	CHANGE_OP_EDIT,
+	CHANGE_OP_RENAME,
 	CHANGE_STATUS_APPLIED,
 	CHANGE_STATUS_APPLYING,
 	CHANGE_STATUS_APPROVED,
@@ -35,7 +39,7 @@ from erp_ai.constants import (
 	ROLE_INSTRUCTOR,
 )
 from erp_ai.erp_ai_agent.doctype.erp_ai_change_proposal import erp_ai_change_proposal as controller
-from erp_ai.test_utils import PREFIX, make_change_proposal
+from erp_ai.test_utils import PREFIX, make_block_proposal, make_change_proposal
 
 JSON_PATH = Path(__file__).resolve().parent / "erp_ai_change_proposal.json"
 
@@ -153,6 +157,33 @@ STATE_FIELD_NEW_VALUES = {
 	"apply_commit_sha": "a" * 40,
 	"undo_commit_sha": "b" * 40,
 }
+
+
+# CHG-002 design 2.1: the 7 fields of a child row, all content.
+OPERATION_ROW_FIELDS = (
+	"operation",
+	"file_path",
+	"new_path",
+	"content_before",
+	"content_after",
+	"base_hash",
+	"after_hash",
+)
+# Two items of a block: an edit, then a rename (so `new_path` has a value to compare).
+BLOCK_OPERATIONS = [
+	{"kind": CHANGE_OP_EDIT, "path": "myapp/myapp/a.py", "before": "x = 1\n", "after": "x = 2\n"},
+	{
+		"kind": CHANGE_OP_RENAME,
+		"path": "myapp/myapp/b.py",
+		"new_path": "myapp/myapp/c.py",
+		"before": "y = 1\n",
+		"after": "y = 1\n",
+	},
+]
+CONTENT_REFUSAL = "Nội dung đề xuất không sửa được sau khi tạo"
+UNREADABLE_NOTES = (
+	"Không đọc được nội dung đã lưu của đề xuất này (dữ liệu hỏng); báo quản trị trước khi duyệt."
+)
 
 
 def _load_json():
@@ -400,6 +431,152 @@ class TestERPAIChangeProposal(FrappeTestCase):
 				doc = frappe.get_doc(PROPOSAL_DOCTYPE, proposal.name)
 				doc.save(ignore_permissions=True)
 				self.assertEqual(frappe.db.get_value(PROPOSAL_DOCTYPE, proposal.name, "change_kind"), kind)
+
+	def _stored_rows(self, name) -> list:
+		return frappe.get_all(
+			OPERATION_DOCTYPE,
+			filters={"parent": name, "parenttype": PROPOSAL_DOCTYPE},
+			fields=["idx", *OPERATION_ROW_FIELDS],
+			order_by="idx asc",
+		)
+
+	def assertContentRefused(self, doc, fieldname):
+		"""Saving `doc` raises the immutability sentence naming `fieldname`; the stored rows are unchanged."""
+		before = (
+			self._stored_rows(doc.name),
+			frappe.db.get_value(PROPOSAL_DOCTYPE, doc.name, "command_list"),
+		)
+		with self.assertRaises(frappe.ValidationError) as caught:
+			doc.save(ignore_permissions=True)
+		self.assertEqual(str(caught.exception), f"{CONTENT_REFUSAL}: {fieldname}")
+		self.assertEqual(
+			(self._stored_rows(doc.name), frappe.db.get_value(PROPOSAL_DOCTYPE, doc.name, "command_list")),
+			before,
+		)
+
+	def test_child_rows_immutable_after_insert(self):
+		# One replacement per row field, each a valid value so only the immutability rule can refuse it.
+		new_values = {
+			"operation": CHANGE_OP_CREATE,
+			"file_path": "myapp/myapp/other.py",
+			"new_path": "myapp/myapp/z.py",
+			"content_before": "x = 9\n",
+			"content_after": "x = 8\n",
+			"base_hash": "0" * 64,
+			"after_hash": "1" * 64,
+		}
+		self.assertEqual(tuple(new_values), OPERATION_ROW_FIELDS)
+		for fieldname, new_value in new_values.items():
+			with self.subTest(fieldname=fieldname):
+				proposal = make_block_proposal(BLOCK_OPERATIONS, [])
+				doc = frappe.get_doc(PROPOSAL_DOCTYPE, proposal.name)
+				self.assertNotEqual(doc.operations[0].get(fieldname), new_value)
+				doc.operations[0].set(fieldname, new_value)
+				self.assertContentRefused(doc, "operations")
+
+	def test_row_added_or_removed_refused(self):
+		def add_row(doc):
+			doc.append(
+				"operations",
+				{"operation": CHANGE_OP_DELETE, "file_path": "myapp/myapp/d.py", "content_before": "z = 1\n"},
+			)
+
+		def remove_row(doc):
+			doc.remove(doc.operations[-1])
+
+		def reorder_rows(doc):
+			doc.operations.reverse()
+			for index, row in enumerate(doc.operations, start=1):
+				row.idx = index
+
+		def renumber_rows(doc):
+			# Same list, swapped `idx`: the stored order changes all the same.
+			first, second = doc.operations
+			first.idx, second.idx = second.idx, first.idx
+
+		for change in (add_row, remove_row, reorder_rows, renumber_rows):
+			with self.subTest(change=change.__name__):
+				proposal = make_block_proposal(BLOCK_OPERATIONS, [])
+				doc = frappe.get_doc(PROPOSAL_DOCTYPE, proposal.name)
+				change(doc)
+				self.assertContentRefused(doc, "operations")
+
+	def test_block_unchanged_resave_is_allowed(self):
+		proposal = make_block_proposal(BLOCK_OPERATIONS, [["--site", "miyano", "migrate"]])
+		before = self._stored_rows(proposal.name)
+		doc = frappe.get_doc(PROPOSAL_DOCTYPE, proposal.name)
+		doc.save(ignore_permissions=True)
+		self.assertEqual(self._stored_rows(proposal.name), before)
+
+	def test_command_list_immutable(self):
+		for operations in (BLOCK_OPERATIONS, []):
+			with self.subTest(file_items=len(operations)):
+				proposal = make_block_proposal(operations, [["--site", "miyano", "migrate"]])
+				doc = frappe.get_doc(PROPOSAL_DOCTYPE, proposal.name)
+				doc.command_list = json.dumps([["build", "--app", "myapp"]])
+				self.assertContentRefused(doc, "command_list")
+
+	def test_block_commit_preview_lists_items(self):
+		many = make_block_proposal(BLOCK_OPERATIONS, [])
+		self.assertEqual(
+			many.commit_message,
+			f"erp_ai: áp dụng {many.name} (2 file)\n"
+			"\n"
+			f"Đề xuất: {many.name}\n"
+			f"Phiếu: {many.ticket}\n"
+			"sửa myapp/myapp/a.py\n"
+			"đổi tên myapp/myapp/b.py → myapp/myapp/c.py\n"
+			"Người duyệt: <người duyệt>\n"
+			"Commit do ERP AI Agent tạo sau khi người duyệt bấm Duyệt.",
+		)
+		self.assertEqual(
+			frappe.db.get_value(PROPOSAL_DOCTYPE, many.name, "commit_message"), many.commit_message
+		)
+		one = make_block_proposal(BLOCK_OPERATIONS[:1], [])
+		self.assertEqual(
+			one.commit_message,
+			f"erp_ai: áp dụng {one.name} (myapp/myapp/a.py)\n"
+			"\n"
+			f"Đề xuất: {one.name}\n"
+			f"Phiếu: {one.ticket}\n"
+			"sửa myapp/myapp/a.py\n"
+			"Người duyệt: <người duyệt>\n"
+			"Commit do ERP AI Agent tạo sau khi người duyệt bấm Duyệt.",
+		)
+		commands_only = make_block_proposal([], [["build", "--app", "myapp"]])
+		self.assertFalse(frappe.db.get_value(PROPOSAL_DOCTYPE, commands_only.name, "commit_message"))
+
+	def test_onload_unreadable_notes_opens_with_one_warning_line(self):
+		corruptions = {
+			"command_list not a list of argv lists": {"command_list": '["migrate"]'},
+			"unknown restart_status": {"restart_status": "Không rõ"},
+		}
+		for case, values in corruptions.items():
+			with self.subTest(case=case):
+				proposal = make_block_proposal(BLOCK_OPERATIONS, [["--site", "miyano", "migrate"]])
+				frappe.db.set_value(PROPOSAL_DOCTYPE, proposal.name, values, update_modified=False)
+				error_logs = frappe.db.count("Error Log")
+				with patch.object(controller.frappe, "logger") as logger:
+					frappe.response.docs = []
+					try:
+						frappe.desk.form.load.getdoc(PROPOSAL_DOCTYPE, proposal.name)
+						form = frappe.response.docs[0]
+					finally:
+						frappe.response.docs = []
+				self.assertEqual(form.name, proposal.name)
+				self.assertEqual(form.get("__onload").change_notes, [UNREADABLE_NOTES])
+				self.assertEqual(
+					logger.return_value.warning.call_args_list,
+					[call("erp_ai notes proposal=%s error=%s", proposal.name, "ValueError")],
+				)
+				self.assertIn(call("erp_ai"), logger.call_args_list)
+				self.assertEqual(frappe.db.count("Error Log"), error_logs)
+		with self.subTest(case="other exception classes are not caught"):
+			proposal = make_block_proposal(BLOCK_OPERATIONS, [])
+			doc = frappe.get_doc(PROPOSAL_DOCTYPE, proposal.name)
+			with patch.object(controller.change_text, "proposal_notes", side_effect=TypeError("x")):
+				with self.assertRaises(TypeError):
+					doc.run_method("onload")
 
 	def test_sample_proposals_are_pending_with_git_fields(self):
 		code = make_change_proposal()

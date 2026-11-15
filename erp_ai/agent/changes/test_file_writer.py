@@ -246,11 +246,72 @@ class TestMakeParents(FrappeTestCase):
 		self.assertEqual(sorted(os.listdir(self.app_dir)), APP_DIR_BEFORE)
 		self.assertEqual(os.listdir(self.apps.outside), ["plain.py"])
 
+	def test_level_turned_self_loop_symlink_after_mkdir_rolls_back(self):
+		full = os.path.join(self.app_dir, "a", "b", "new.py")
+		second = os.path.join(self.app_dir, "a", "b")
+		real_mkdir = os.mkdir
+
+		def loop(path, mode=0o777):
+			if path == second:
+				return os.symlink(path, path)
+			return real_mkdir(path, mode)
+
+		with patch.object(file_writer.os, "mkdir", side_effect=loop):
+			with self.assertRaisesRegex(ValueError, "through a symlink"):
+				file_writer.make_parents(full, self.app_dir)
+		self.assertFalse(os.path.lexists(os.path.join(self.app_dir, "a")))
+		self.assertEqual(sorted(os.listdir(self.app_dir)), APP_DIR_BEFORE)
+		self.assertEqual(os.listdir(self.apps.outside), ["plain.py"])
+
+	def test_created_level_swapped_for_symlink_before_next_mkdir_rolls_back(self):
+		full = os.path.join(self.app_dir, "a", "b", "new.py")
+		first = os.path.join(self.app_dir, "a")
+		second = os.path.join(self.app_dir, "a", "b")
+		real_mkdir = os.mkdir
+
+		def swap_parent(path, mode=0o777):
+			if path == second:
+				os.rmdir(first)
+				os.symlink(self.apps.outside, first)
+			return real_mkdir(path, mode)
+
+		with patch.object(file_writer.os, "mkdir", side_effect=swap_parent):
+			with self.assertRaisesRegex(ValueError, "does not touch this path"):
+				file_writer.make_parents(full, self.app_dir)
+		self.assertFalse(os.path.lexists(first))
+		self.assertEqual(sorted(os.listdir(self.app_dir)), APP_DIR_BEFORE)
+		self.assertEqual(os.listdir(self.apps.outside), ["plain.py"])
+
+	def test_symlink_inside_root_refused_before_mkdir(self):
+		os.symlink(self.app_dir, os.path.join(self.app_dir, "inner_link"))
+		full = os.path.join(self.app_dir, "inner_link", "pkg", "new.py")
+		made = []
+		real_mkdir = os.mkdir
+
+		def spy(path, mode=0o777):
+			made.append(path)
+			return real_mkdir(path, mode)
+
+		with patch.object(file_writer.os, "mkdir", side_effect=spy):
+			with self.assertRaises(ValueError):
+				file_writer.make_parents(full, self.app_dir)
+		self.assertEqual(made, [])
+		self.assertFalse(os.path.lexists(os.path.join(self.app_dir, "pkg")))
+		self.assertEqual(sorted(os.listdir(self.app_dir)), sorted([*APP_DIR_BEFORE, "inner_link"]))
+
 
 class TestRefuseUnlessCanonical(FrappeTestCase):
 	def setUp(self):
 		self.apps = TempAppsRoot(self)
 		self.app_dir = os.path.join(self.apps.root, "myapp")
+
+	def test_symlink_inside_root_refused(self):
+		os.symlink(self.app_dir, os.path.join(self.app_dir, "inner_link"))
+		for parts in (("inner_link", "x.py"), ("inner_link", "pkg", "new.py"), ("inner_link",)):
+			with self.subTest(parts=parts):
+				with self.assertRaises(ValueError):
+					file_writer._refuse_unless_canonical(os.path.join(self.app_dir, *parts))
+		self.assertEqual(sorted(os.listdir(self.app_dir)), sorted([*APP_DIR_BEFORE, "inner_link"]))
 
 	def test_plain_path_accepted(self):
 		for parts in (("ok.py",), ("pkg", "new.py"), ("pkg",)):
@@ -332,3 +393,10 @@ class TestRemoveEmptyDirs(FrappeTestCase):
 		through_link = os.path.join(self.app_dir, "dir_out", "empty")
 		self.assertEqual(file_writer.remove_empty_dirs([through_link, outside_empty]), [])
 		self.assertTrue(os.path.isdir(outside_empty))
+
+	def test_dir_under_symlink_inside_root_skipped(self):
+		empty = self._dir("empty")
+		os.symlink(self.app_dir, os.path.join(self.app_dir, "inner_link"))
+		through_link = os.path.join(self.app_dir, "inner_link", "empty")
+		self.assertEqual(file_writer.remove_empty_dirs([through_link]), [])
+		self.assertTrue(os.path.isdir(empty))

@@ -7415,6 +7415,10 @@ class TestScannersCatchViolations(unittest.TestCase):
 				{"canonical": "def _refuse_unless_canonical(full_path):\n\tpass\n"},
 				"_refuse_unless_canonical",
 			),
+			"resolver not called, decoy source call": (
+				{"canonical": "def _refuse_unless_canonical(full_path):\n\tsource.get_source_root()\n"},
+				"_refuse_unless_canonical",
+			),
 			"no canonical function": (
 				{"canonical": "def _refuse_other(full_path):\n\tsource.resolve_safe_path(full_path)\n"},
 				"_refuse_unless_canonical",
@@ -7445,6 +7449,13 @@ class TestScannersCatchViolations(unittest.TestCase):
 		)
 		self.assertCaught(
 			check_file_writer_rechecks_through_resolver({FILE_WRITER_FILE: no_remover}), "remove_empty_dirs"
+		)
+		remover_skips_recheck = (
+			no_remover + "\ndef remove_empty_dirs(dirs):\n\tfor d in dirs:\n\t\tos.rmdir(d)\n"
+		)
+		self.assertCaught(
+			check_file_writer_rechecks_through_resolver({FILE_WRITER_FILE: remover_skips_recheck}),
+			"remove_empty_dirs",
 		)
 		self.assertCaught(check_file_writer_rechecks_through_resolver({}), FILE_WRITER_FILE)
 		# Condition 4 (on from T6): a file-system function outside FILE_WRITER_RECHECKERS is caught.

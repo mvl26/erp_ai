@@ -1,10 +1,12 @@
+import itertools
 import json
-from unittest.mock import MagicMock, patch
+import re
+from unittest.mock import MagicMock, call, patch
 
 import frappe
 from frappe.model.document import Document
 from frappe.tests.utils import FrappeTestCase
-from frappe.utils import get_datetime, now_datetime
+from frappe.utils import escape_html, get_datetime, now_datetime
 from helpdesk.test_utils import create_agent, make_ticket
 
 from erp_ai.agent import policy, site_facts
@@ -1084,8 +1086,43 @@ class TestPostNotice(TicketCommentCase):
 		self.assertEqual(len(self._comments()), before)
 
 
+# The analysis a model writes to the reasoning template (design-w1-fixes-20 Điểm 1.2): no "Căn cứ" section.
+ANALYSIS = "**Nhận định:** A\n**Hướng xử lý:** B\nĐộ tin cậy: 90%"
+_HEADING = re.compile(r"(?m)^[ \t]*\*\*([^*\n]+):\*\*|<strong>([^<]+):</strong>")
+
+
+def _headings(content: str) -> list[str]:
+	"""The section names of a comment, in order (design-w1-fixes-20 Điểm 3.3)."""
+	return [model or system for model, system in _HEADING.findall(content)]
+
+
 class TestGuidanceWriter(TicketCommentCase):
 	"""AC-65, ADR-036 QĐ 3: the guidance comment is the agent's core Comment whose content opens with the marker."""
+
+	def _run(self, analysis=None, done=(), pending=(), manual=()):
+		"""A fresh guidance collector holding `analysis` and the raw lines of each section; closed at cleanup."""
+		run_id = f"{T100_PREFIX}-{frappe.generate_hash(length=10)}"
+		self.addCleanup(write_ticket.close_collector, run_id)
+		write_ticket.open_collector(run_id)
+		if analysis is not None:
+			write_ticket.hold_analysis(run_id, analysis)
+		for section, lines in (
+			(write_ticket.SECTION_DONE, done),
+			(write_ticket.SECTION_PENDING, pending),
+			(write_ticket.SECTION_DECIDE, manual),
+		):
+			for line in lines:
+				write_ticket.collect(run_id, section, line)
+		return run_id
+
+	def _body(self, run_id):
+		"""The stored content of the guidance comment post_guidance posts for `run_id`; the comment is then deleted,
+		so the next case of a test may post again."""
+		result = write_ticket.post_guidance(self.ticket, run_id)
+		self.assertTrue(result["ok"], result)
+		content = frappe.db.get_value("Comment", result["comment"], "content")
+		frappe.db.delete("Comment", result["comment"])
+		return content
 
 	def test_count_ignores_info_other_owner_and_non_prefix(self):
 		marker = write_ticket.GUIDANCE_MARKER
@@ -1139,6 +1176,274 @@ class TestGuidanceWriter(TicketCommentCase):
 			frappe.db.get_value("Comment", posted["comment"], "content").startswith(f"{marker}\n")
 		)
 		self.assertEqual(write_ticket.count_guidance(self.ticket), 1)
+
+	def test_writer_posts_once_second_call_refused(self):
+		# AC-65, ADR-036 QĐ 1, 4: one guidance comment per ticket; the count runs under the ticket lock.
+		run_id = self._run(ANALYSIS, done=["Bot đã phân loại phiếu: Loại A."])
+		refused = {"ok": False, "reason": write_ticket.REASON_GUIDANCE_EXISTS}
+		with patch.object(write_ticket, "locked_count", wraps=write_ticket.locked_count) as counted:
+			first = write_ticket.post_guidance(self.ticket, run_id)
+			again = write_ticket.post_guidance(self.ticket, self._run(ANALYSIS))
+			same_run = write_ticket.post_guidance(self.ticket, run_id)
+
+		self.assertTrue(first["ok"], first)
+		self.assertEqual(
+			first["counts"],
+			{write_ticket.SECTION_DONE: 1, write_ticket.SECTION_PENDING: 0, write_ticket.SECTION_DECIDE: 0},
+		)
+		self.assertEqual(frappe.db.get_value("Comment", first["comment"], "owner"), AGENT_USER)
+		self.assertEqual(again, refused)
+		self.assertEqual(same_run, refused)
+		self.assertEqual(len(self._comments()), 1)
+		self.assertEqual(write_ticket.count_guidance(self.ticket), 1)
+		self.assertEqual(
+			counted.call_args_list,
+			[call(self.ticket, "Comment", write_ticket.guidance_filters(self.ticket))] * 3,
+		)
+
+	def test_concurrent_snapshot_does_not_double_post(self):
+		# ADR-036 QĐ 4: two runs of one ticket both counted 0 at their start. The later writer still sees the
+		# guidance the other committed after this transaction's REPEATABLE READ snapshot. Only the second
+		# connection commits (the primary keeps its commit guard); the cleanup deletes what it committed.
+		committed = []
+		self.addCleanup(self._delete_committed, committed)
+		# setUp's ticket holds the naming-series row lock: drop it so the second connection can name its ticket.
+		frappe.db.rollback()
+		later_run = self._run(ANALYSIS)
+		with self.secondary_connection():
+			doc = frappe.new_doc("HD Ticket")
+			doc.subject = f"{T100_PREFIX} phiếu hai kết nối"
+			doc.set_new_name()
+			committed.append(doc.name)
+			# a bare row: no hooks, no job, no mail
+			doc.db_insert()
+			frappe.db.commit()
+		ticket = committed[0]
+		filters = {"reference_doctype": "HD Ticket", "reference_name": ticket}
+		with self.primary_connection():
+			# The first plain read takes this transaction's snapshot.
+			self.assertEqual(frappe.db.count("Comment", filters), 0)
+		with self.secondary_connection():
+			# Set inside: opening the second connection (frappe.connect) makes Administrator the session user.
+			frappe.set_user(AGENT_USER)
+			posted = write_ticket.post_guidance(ticket, self._run(ANALYSIS, done=["D"]))
+			frappe.db.commit()
+		with self.primary_connection():
+			# Precondition: a plain read still sees the snapshot, so only a locking read can see the guidance.
+			self.assertEqual(frappe.db.count("Comment", filters), 0)
+			result = write_ticket.post_guidance(ticket, later_run)
+			comments = write_ticket.locked_rows(ticket, "Comment", filters)
+
+		self.assertTrue(posted["ok"], posted)
+		self.assertEqual(result, {"ok": False, "reason": write_ticket.REASON_GUIDANCE_EXISTS})
+		self.assertEqual(comments, [{"name": posted["comment"]}])
+
+	def _delete_committed(self, tickets):
+		# After its first use, secondary_connection() leaves frappe.local.db on the second connection.
+		frappe.local.db = self._primary_connection
+		self._primary_connection.rollback()
+		if not tickets:
+			return
+		for ticket in tickets:
+			self._secondary_connection.delete(
+				"Comment", {"reference_doctype": "HD Ticket", "reference_name": ticket}
+			)
+			self._secondary_connection.delete("HD Ticket", {"name": ticket})
+		self._secondary_connection.commit()
+
+	def test_deleted_guidance_allows_new_one(self):
+		# ADR-036 QĐ 6: the comment is the source of truth; once deleted, a later run posts again.
+		first = write_ticket.post_guidance(self.ticket, self._run(ANALYSIS))
+		self.assertTrue(first["ok"], first)
+		frappe.set_user("Administrator")
+		frappe.delete_doc("Comment", first["comment"])
+		frappe.set_user(AGENT_USER)
+		self.assertEqual(write_ticket.count_guidance(self.ticket), 0)
+
+		second = write_ticket.post_guidance(self.ticket, self._run(ANALYSIS))
+
+		self.assertTrue(second["ok"], second)
+		self.assertNotEqual(second["comment"], first["comment"])
+		self.assertEqual(write_ticket.count_guidance(self.ticket), 1)
+
+	def test_no_analysis_no_items_posts_nothing(self):
+		# w1.md:64 step (2): nothing to say → no comment, so a later run is still offered guidance.
+		for case, run_id in (("open, empty", self._run()), ("no collector", f"{T100_PREFIX}-không gom")):
+			with self.subTest(case):
+				self.assertEqual(
+					write_ticket.post_guidance(self.ticket, run_id),
+					{"ok": False, "reason": write_ticket.REASON_NO_CONTENT},
+				)
+				self.assertEqual(self._comments(), [])
+		self.assertTrue(write_ticket.post_guidance(self.ticket, self._run(ANALYSIS))["ok"])
+
+	def test_no_analysis_with_done_items_uses_fallback(self):
+		content = self._body(self._run(done=["D"]))
+
+		self.assertEqual(
+			content,
+			f"{write_ticket.GUIDANCE_MARKER}\n{write_ticket.GUIDANCE_FALLBACK}"
+			f"\n<p><strong>{write_ticket.SECTION_DONE}:</strong></p><ul><li>D</li></ul>",
+		)
+		self.assertEqual(_headings(content), ["Nhận định", "Hướng xử lý", "Đã làm"])
+
+	def test_collected_line_html_escaped_once(self):
+		# AD3-4: a collected line is raw text; the writer escapes it exactly once, the model's analysis not at all.
+		value = "<b>&x"
+		self.assertEqual(escape_html(value), "&lt;b&gt;&amp;x")
+
+		content = self._body(self._run(ANALYSIS, done=[value], manual=[value]))
+
+		self.assertEqual(content.count("&lt;b&gt;&amp;x"), 2)
+		self.assertNotIn(value, content)
+		self.assertNotIn("&amp;lt;", content)
+		self.assertNotIn("&amp;amp;", content)
+		self.assertIn(ANALYSIS.split("\n", 1)[0], content)
+
+	def test_body_order_analysis_plan_done_pending(self):
+		# design-w1-fixes-20 Điểm 1.2: the example body, byte for byte.
+		result = write_ticket.post_guidance(
+			self.ticket, self._run(ANALYSIS, done=["D"], pending=["P"], manual=["L"])
+		)
+		self.assertTrue(result["ok"], result)
+		content = frappe.db.get_value("Comment", result["comment"], "content")
+
+		self.assertEqual(
+			content,
+			"<!-- erp_ai:huong-xu-ly -->\n"
+			"**Nhận định:** A\n"
+			"**Hướng xử lý:** B\n"
+			"<ul><li>L</li></ul>\n"
+			"Độ tin cậy: 90%\n"
+			"<p><strong>Đã làm:</strong></p><ul><li>D</li></ul>\n"
+			f"<p><strong>Chờ duyệt:</strong> {write_ticket.PENDING_NOTE}</p><ul><li>P</li></ul>",
+		)
+		self.assertEqual(_headings(content), ["Nhận định", "Hướng xử lý", "Đã làm", "Chờ duyệt"])
+		self.assertEqual(result["counts"], {"Đã làm": 1, "Chờ duyệt": 1, "Hướng xử lý": 1})
+
+	def test_manual_lines_inside_plan_section(self):
+		# AC-66 [changed], AC-23 [changed] (2): work left to a person goes inside "Hướng xử lý", no heading of its own.
+		ul = "<ul><li>L</li></ul>"
+		plan = "<strong>Hướng xử lý:</strong>"
+		cases = (
+			(
+				"plan is the last section",
+				"**Nhận định:** A\n**Hướng xử lý:** B\nbước 2",
+				f"**Nhận định:** A\n**Hướng xử lý:** B\nbước 2\n{ul}",
+			),
+			(
+				"before the confidence heading",
+				"**Nhận định:** A\n**Hướng xử lý:** B\n**Độ tin cậy:** 90%",
+				f"**Nhận định:** A\n**Hướng xử lý:** B\n{ul}\n**Độ tin cậy:** 90%",
+			),
+			(
+				"before the analysis heading",
+				"**Hướng xử lý:** B\nbước 2\n**Nhận định:** A\nĐộ tin cậy: 90%",
+				f"**Hướng xử lý:** B\nbước 2\n{ul}\n**Nhận định:** A\nĐộ tin cậy: 90%",
+			),
+			(
+				"headings without stars",
+				"Nhận định: A\nHướng xử lý: B\nĐộ tin cậy: 90%",
+				f"Nhận định: A\nHướng xử lý: B\n{ul}\nĐộ tin cậy: 90%",
+			),
+			(
+				"no plan heading",
+				"**Nhận định:** A\nĐộ tin cậy: 90%",
+				f"**Nhận định:** A\nĐộ tin cậy: 90%\n<p>{plan}</p>{ul}",
+			),
+			("fallback", None, f"{write_ticket.GUIDANCE_FALLBACK}\n{ul}"),
+		)
+		for case, analysis, text in cases:
+			with self.subTest(case):
+				content = self._body(self._run(analysis, manual=["L"]))
+
+				self.assertEqual(content, f"{write_ticket.GUIDANCE_MARKER}\n{text}")
+				self.assertEqual(_headings(content).count("Hướng xử lý"), 1)
+				if analysis is not None and "Hướng xử lý:" not in analysis:
+					self.assertEqual(content.count(plan), 1)
+				# the list sits after the plan heading and before the next heading
+				spans = [(m.start(), m.group(1) or m.group(2)) for m in _HEADING.finditer(content)]
+				(plan_at,) = [at for at, name in spans if name == "Hướng xử lý"]
+				later = [at for at, _name in spans if at > plan_at]
+				self.assertGreater(content.index(ul), plan_at)
+				if later:
+					self.assertLess(content.index(ul), later[0])
+
+	def test_no_evidence_or_decide_heading(self):
+		# AC-65 (a) [changed]: no "Căn cứ" and no "Cần ai quyết" section, whatever the run collected.
+		for constant in (write_ticket.GUIDANCE_FALLBACK, write_ticket.PENDING_NOTE):
+			for forbidden in ("Căn cứ", "Cần ai quyết"):
+				self.assertNotIn(forbidden, constant)
+		for analysis in (ANALYSIS, None):
+			for done, pending, manual in itertools.product(((), ("x",)), repeat=3):
+				if analysis is None and not (done or pending or manual):
+					continue
+				with self.subTest(analysis=analysis, done=done, pending=pending, manual=manual):
+					content = self._body(self._run(analysis, done, pending, manual))
+					headings = _headings(content)
+
+					self.assertNotIn("Căn cứ", headings)
+					self.assertNotIn("Cần ai quyết", headings)
+					self.assertNotIn("Cần ai quyết", content)
+					self.assertLessEqual(set(headings), {"Nhận định", "Hướng xử lý", "Đã làm", "Chờ duyệt"})
+					# an empty section does not show
+					self.assertEqual("Đã làm" in headings, bool(done))
+					self.assertEqual("Chờ duyệt" in headings, bool(pending))
+
+	def test_pending_note_and_one_item_per_proposal(self):
+		# AC-65 (a) [changed], AC-67: one line per proposal; the pointer to "Duyệt ngay" once, in the heading paragraph.
+		head = "<strong>Chờ duyệt:</strong>"
+		self.assertIn('"Duyệt ngay"', write_ticket.PENDING_NOTE)
+		self.assertIn('"Trao đổi với bot"', write_ticket.PENDING_NOTE)
+
+		content = self._body(self._run(ANALYSIS, pending=["Đề xuất CR-1 (sửa code)", "Đề xuất CR-2 (lệnh)"]))
+
+		pending = content[content.index(head) :]
+		paragraph = pending[: pending.index("</p>")]
+		self.assertIn(write_ticket.PENDING_NOTE, paragraph)
+		self.assertEqual(content.count(write_ticket.PENDING_NOTE), 1)
+		self.assertEqual(pending.count("<li>"), 2)
+		self.assertEqual(
+			pending[pending.index("<ul>") :],
+			"<ul><li>Đề xuất CR-1 (sửa code)</li><li>Đề xuất CR-2 (lệnh)</li></ul>",
+		)
+
+		empty = self._body(self._run(ANALYSIS, done=["D"]))
+
+		self.assertNotIn(head, empty)
+		self.assertNotIn(write_ticket.PENDING_NOTE, empty)
+
+	def test_failure_summary_three_parts_escaped_once(self):
+		# design-w1-fixes-20 Điểm 3.1: done, pending and manual lines apart, each escaped once; no marker, no heading.
+		self.assertEqual(write_ticket.FAILURE_DONE, "Trước khi lỗi, bot đã làm: ")
+		self.assertEqual(write_ticket.FAILURE_PENDING, "Đề xuất đã tạo, đang chờ duyệt: ")
+		self.assertEqual(write_ticket.FAILURE_MANUAL, "Việc người phải làm tay: ")
+		self.assertEqual(write_ticket.failure_summary(f"{T100_PREFIX}-không gom"), "")
+		self.assertEqual(write_ticket.failure_summary(self._run()), "")
+		self.assertEqual(write_ticket.failure_summary(self._run(ANALYSIS)), "")
+
+		summary = write_ticket.failure_summary(
+			self._run(
+				ANALYSIS,
+				done=["Bot đã phân loại phiếu: Loại A.", "<b>&x"],
+				pending=["Đề xuất CR-1"],
+				manual=["Nhờ trưởng nhóm phân công."],
+			)
+		)
+
+		self.assertEqual(
+			summary,
+			f"{write_ticket.FAILURE_DONE}Bot đã phân loại phiếu: Loại A.; &lt;b&gt;&amp;x\n"
+			f"{write_ticket.FAILURE_PENDING}Đề xuất CR-1\n"
+			f"{write_ticket.FAILURE_MANUAL}Nhờ trưởng nhóm phân công.",
+		)
+		self.assertEqual(
+			write_ticket.failure_summary(self._run(manual=["<b>&x"])),
+			f"{write_ticket.FAILURE_MANUAL}&lt;b&gt;&amp;x",
+		)
+		self.assertNotIn(write_ticket.GUIDANCE_MARKER, summary)
+		self.assertEqual(_headings(summary), [])
+		self.assertEqual(self._comments(), [])
 
 
 class TestCollector(FrappeTestCase):

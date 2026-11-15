@@ -1,13 +1,13 @@
 import frappe
 from frappe import _
 from frappe.model.document import Document
-from frappe.utils import cint, cstr
+from frappe.utils import cint, cstr, get_datetime, get_system_timezone, now_datetime
 
 from erp_ai.agent import change_text, queue
 from erp_ai.agent.agent_write_guard import refuse_agent_write
 from erp_ai.agent.authority import NEVER_AUTHORITY
-from erp_ai.agent.changes import block, transitions
-from erp_ai.constants import CHANGE_KIND_CODE, PROPOSAL_DOCTYPE, ROLE_INSTRUCTOR
+from erp_ai.agent.changes import block, restart_check, transitions
+from erp_ai.constants import CHANGE_KIND_CODE, PROPOSAL_DOCTYPE, RESTART_STATUS_SENT, ROLE_INSTRUCTOR
 
 # Design 2.1 content group (ADR-012 QĐ 1): written once at insert, never changed afterwards.
 CONTENT_FIELDS = (
@@ -172,3 +172,31 @@ def undo(name=None) -> dict:
 	status = transitions.request_undo(name, user)
 	queue.enqueue_change_job(name, "undo")
 	return {"name": name, "status": status}
+
+
+@frappe.whitelist(methods=["POST"])
+def confirm_restart(name=None) -> dict:
+	"""`restart_status`: `Đã gửi → Đã xác nhận / Chưa xác nhận` from lazy evidence (design 3.3, 4.4 step 5).
+
+	Writes only when the stored status is `Đã gửi` and `restart_check.outcome` concludes; the conclusion is
+	written against the very `restart_sent_at` the evidence was measured from (addendum-5 P-4), so a send
+	recorded in between wins and its status is returned.
+	"""
+	_decider(name)
+	stored = frappe.db.get_value(PROPOSAL_DOCTYPE, name, ["restart_status", "restart_sent_at"], as_dict=True)
+	# `get_datetime(None)` is "now": a send without its moment has nothing to measure against.
+	if stored.restart_status != RESTART_STATUS_SENT or not stored.restart_sent_at:
+		return {"name": name, "restart_status": stored.restart_status}
+	timezone = get_system_timezone()
+	value = restart_check.outcome(
+		restart_check.epoch_of_system_time(get_datetime(stored.restart_sent_at), timezone),
+		restart_check.epoch_of_system_time(now_datetime(), timezone),
+		restart_check.web_started(),
+		restart_check.workers_started(),
+	)
+	if value is None:
+		return {"name": name, "restart_status": stored.restart_status}
+	if not transitions.confirm_restart(name, value, sent_at=stored.restart_sent_at):
+		return {"name": name, "restart_status": frappe.db.get_value(PROPOSAL_DOCTYPE, name, "restart_status")}
+	frappe.logger("erp_ai").info("erp_ai restart proposal=%s status=%s", name, value)
+	return {"name": name, "restart_status": value}

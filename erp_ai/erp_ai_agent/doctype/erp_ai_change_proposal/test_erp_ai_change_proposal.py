@@ -1,3 +1,4 @@
+import datetime
 import json
 import re
 from pathlib import Path
@@ -11,7 +12,7 @@ from frappe.tests.utils import FrappeTestCase
 from helpdesk.test_utils import create_agent, make_ticket, make_todo
 
 from erp_ai.agent import authority, change_text
-from erp_ai.agent.changes import transitions
+from erp_ai.agent.changes import restart_check, transitions
 from erp_ai.constants import (
 	AGENT_USER,
 	CHANGE_KIND_CODE,
@@ -36,6 +37,7 @@ from erp_ai.constants import (
 	RESTART_STATUS_LAUNCH_FAILED,
 	RESTART_STATUS_SENT,
 	RESTART_STATUS_UNCONFIRMED,
+	RESTART_TIMEOUT_S,
 	ROLE_INSTRUCTOR,
 )
 from erp_ai.erp_ai_agent.doctype.erp_ai_change_proposal import erp_ai_change_proposal as controller
@@ -654,6 +656,8 @@ class TestERPAIChangeProposal(FrappeTestCase):
 
 METHOD_MODULE = "erp_ai.erp_ai_agent.doctype.erp_ai_change_proposal.erp_ai_change_proposal"
 METHOD_NAMES = ("approve", "reject", "undo")
+# Every whitelisted method of the controller (CHG-002 T24 adds `confirm_restart`).
+WHITELISTED_NAMES = (*METHOD_NAMES, "confirm_restart")
 RUN_CHANGE = "erp_ai.agent.changes.apply_job.run_change"
 # Design 3.3 error sentences, copied by hand.
 ROLE_REFUSAL = "Chỉ người có vai trò ERP AI Instructor mới duyệt, từ chối hoặc hoàn tác được"
@@ -846,8 +850,8 @@ class TestChangeProposalMethods(FrappeTestCase):
 
 	def test_methods_are_post_only_and_not_guest(self):
 		own = {fn.__name__ for fn in frappe.whitelisted if getattr(fn, "__module__", None) == METHOD_MODULE}
-		self.assertEqual(own, set(METHOD_NAMES))
-		for method in METHOD_NAMES:
+		self.assertEqual(own, set(WHITELISTED_NAMES))
+		for method in WHITELISTED_NAMES:
 			with self.subTest(method=method):
 				fn = getattr(controller, method)
 				self.assertIn(fn, frappe.whitelisted)
@@ -1061,6 +1065,290 @@ class TestChangeProposalMethods(FrappeTestCase):
 			form = self._form_as(METHOD_INSTRUCTOR, command.name)
 			self.assertFalse(form.commit_message)
 			self.assertEqual(form.get("__onload").change_notes, ["Lệnh bench không hoàn tác được."])
+
+
+RESTART_SYSTEM_MANAGER = "change.restart.sysmanager@example.com"
+RESTART_LOG_FORMAT = "erp_ai restart proposal=%s status=%s"
+# A fixed send moment in the site's timezone (naive, as Frappe stores Datetime fields); never the wall clock.
+RESTART_SENT_AT = datetime.datetime(2026, 1, 5, 10, 0, 0)
+NOT_SENT_STATUSES = (
+	None,
+	RESTART_STATUS_CONFIRMED,
+	RESTART_STATUS_UNCONFIRMED,
+	RESTART_STATUS_LAUNCH_FAILED,
+)
+
+
+def _sent_epoch(sent_at=RESTART_SENT_AT) -> float:
+	return restart_check.epoch_of_system_time(sent_at, frappe.utils.get_system_timezone())
+
+
+def _restart_row(name) -> frappe._dict:
+	return frappe.db.get_value(
+		PROPOSAL_DOCTYPE, name, ["restart_status", "restart_sent_at", "modified"], as_dict=True
+	)
+
+
+class TestConfirmRestart(FrappeTestCase):
+	"""CHG-002 T24: `confirm_restart` (design 3.3, 4.4 step 5; addendum-1 A-2.1; addendum-5 P-4)."""
+
+	def setUp(self):
+		self.addCleanup(frappe.db.rollback)
+		self.addCleanup(frappe.set_user, "Administrator")
+		frappe.set_user("Administrator")
+		if not frappe.db.exists("Role", ROLE_INSTRUCTOR):
+			frappe.get_doc({"doctype": "Role", "role_name": ROLE_INSTRUCTOR}).insert(ignore_permissions=True)
+		for email in (METHOD_INSTRUCTOR, METHOD_PLAIN, RESTART_SYSTEM_MANAGER):
+			create_agent(email)
+		if not frappe.db.exists("User", AGENT_USER):
+			create_agent(AGENT_USER)
+		frappe.get_doc("User", METHOD_INSTRUCTOR).add_roles(ROLE_INSTRUCTOR)
+		frappe.get_doc("User", RESTART_SYSTEM_MANAGER).add_roles("System Manager")
+		# Evidence and "now" are stubbed: no real process, no Redis, no wall clock.
+		self.web = self._start(patch.object(restart_check, "web_started", return_value=None))
+		self.workers = self._start(patch.object(restart_check, "workers_started", return_value=None))
+		self.now = self._start(
+			patch.object(
+				controller, "now_datetime", return_value=RESTART_SENT_AT + datetime.timedelta(seconds=5)
+			)
+		)
+		self.logger = self._start(patch.object(controller.frappe, "logger"))
+
+	def _start(self, patcher):
+		mock = patcher.start()
+		self.addCleanup(patcher.stop)
+		return mock
+
+	def _proposal(self, restart_status=RESTART_STATUS_SENT, sent_at=RESTART_SENT_AT) -> str:
+		name = _proposal_in(CHANGE_STATUS_APPLIED)
+		frappe.db.set_value(
+			PROPOSAL_DOCTYPE,
+			name,
+			{"restart_status": restart_status, "restart_sent_at": sent_at},
+			update_modified=False,
+		)
+		return name
+
+	def _evidence_confirms(self):
+		"""Both processes started after the send: `outcome` would conclude `Đã xác nhận`."""
+		self.web.return_value = _sent_epoch() + 3
+		self.workers.return_value = _sent_epoch() + 4
+
+	def _call_as(self, user, name):
+		frappe.set_user(user)
+		try:
+			return controller.confirm_restart(name)
+		finally:
+			frappe.set_user("Administrator")
+
+	def _conclusion_lines(self) -> list:
+		return [
+			c for c in self.logger.return_value.info.call_args_list if c.args[:1] == (RESTART_LOG_FORMAT,)
+		]
+
+	def assertRefused(self, user, name, error, message, proposal=None):
+		"""`confirm_restart(name)` as `user` raises exactly `error`/`message`; no evidence read, nothing written."""
+		proposal = name if proposal is None else proposal
+		before = _restart_row(proposal)
+		self._evidence_confirms()
+		with patch.object(transitions, "confirm_restart") as write:
+			with self.assertRaises(error) as caught:
+				self._call_as(user, name)
+		self.assertIs(type(caught.exception), error)
+		self.assertEqual(str(caught.exception), message)
+		self.assertEqual(write.call_count, 0)
+		self.assertEqual((self.web.call_count, self.workers.call_count), (0, 0))
+		self.assertEqual(_restart_row(proposal), before)
+		self.assertEqual(self._conclusion_lines(), [])
+
+	def test_only_from_sent(self):
+		for status in NOT_SENT_STATUSES:
+			with self.subTest(restart_status=status):
+				name = self._proposal(restart_status=status)
+				self._evidence_confirms()
+				before = _restart_row(name)
+				with patch.object(transitions, "confirm_restart", wraps=transitions.confirm_restart) as write:
+					result = self._call_as(METHOD_INSTRUCTOR, name)
+				self.assertEqual(result, {"name": name, "restart_status": status})
+				self.assertEqual(write.call_count, 0)
+				self.assertEqual(_restart_row(name), before)
+				self.assertEqual(self._conclusion_lines(), [])
+
+	def test_no_conclusion_writes_nothing(self):
+		cases = {
+			"no evidence, before the deadline": (None, None, 5),
+			"web only, before the deadline": (_sent_epoch() + 3, None, 5),
+			"started before the send, at the deadline": (
+				_sent_epoch() - 1,
+				_sent_epoch() - 1,
+				RESTART_TIMEOUT_S,
+			),
+		}
+		for label, (web, workers, elapsed) in cases.items():
+			with self.subTest(case=label):
+				name = self._proposal()
+				self.web.return_value, self.workers.return_value = web, workers
+				self.now.return_value = RESTART_SENT_AT + datetime.timedelta(seconds=elapsed)
+				before = _restart_row(name)
+				with patch.object(transitions, "confirm_restart") as write:
+					result = self._call_as(METHOD_INSTRUCTOR, name)
+				self.assertEqual(result, {"name": name, "restart_status": RESTART_STATUS_SENT})
+				self.assertEqual(write.call_count, 0)
+				self.assertEqual(_restart_row(name), before)
+				self.assertEqual(self._conclusion_lines(), [])
+		with self.subTest(case="sent without a send time"):
+			# Both processes "start" ~300 years after the fixed send: later than any moment a missing send
+			# time could be read as (`get_datetime(None)` is the real now), so only the guard stops a write.
+			name = self._proposal(sent_at=None)
+			self.web.return_value = self.workers.return_value = _sent_epoch() + 10**10
+			before = _restart_row(name)
+			with patch.object(transitions, "confirm_restart") as write:
+				result = self._call_as(METHOD_INSTRUCTOR, name)
+			self.assertEqual(result, {"name": name, "restart_status": RESTART_STATUS_SENT})
+			self.assertEqual(write.call_count, 0)
+			self.assertEqual(_restart_row(name), before)
+			self.assertEqual(self._conclusion_lines(), [])
+
+	def test_agent_account_refused(self):
+		for holds_role in (False, True):
+			with self.subTest(holds_role=holds_role):
+				name = self._proposal()
+				with patch("frappe.get_roles", return_value=[ROLE_INSTRUCTOR] if holds_role else []):
+					self.assertRefused(AGENT_USER, name, frappe.PermissionError, ROLE_REFUSAL)
+
+	def test_administrator_guest_no_role_refused(self):
+		self.assertNotIn(ROLE_INSTRUCTOR, frappe.get_roles(METHOD_PLAIN))
+		for user in ("Administrator", "Guest", METHOD_PLAIN):
+			with self.subTest(user=user):
+				self.assertRefused(user, self._proposal(), frappe.PermissionError, ROLE_REFUSAL)
+		for user in ("Administrator", "Guest"):
+			with self.subTest(user=user, holds_role=True):
+				with patch("frappe.get_roles", return_value=[ROLE_INSTRUCTOR]):
+					self.assertRefused(user, self._proposal(), frappe.PermissionError, ROLE_REFUSAL)
+		with self.subTest(check="role before existence"):
+			self.assertRefused(
+				METHOD_PLAIN, "AICHG-99999", frappe.PermissionError, ROLE_REFUSAL, proposal=self._proposal()
+			)
+
+	def test_system_manager_without_instructor_refused_status_unchanged(self):
+		roles = frappe.get_roles(RESTART_SYSTEM_MANAGER)
+		self.assertIn("System Manager", roles)
+		self.assertNotIn(ROLE_INSTRUCTOR, roles)
+		name = self._proposal()
+		self.assertRefused(RESTART_SYSTEM_MANAGER, name, frappe.PermissionError, ROLE_REFUSAL)
+		self.assertEqual(frappe.db.get_value(PROPOSAL_DOCTYPE, name, "restart_status"), RESTART_STATUS_SENT)
+
+	def test_instructor_records_conclusion(self):
+		cases = {
+			RESTART_STATUS_CONFIRMED: (_sent_epoch() + 3, _sent_epoch() + 4, 5),
+			RESTART_STATUS_UNCONFIRMED: (_sent_epoch() + 3, None, RESTART_TIMEOUT_S + 1),
+		}
+		for expected, (web, workers, elapsed) in cases.items():
+			with self.subTest(conclusion=expected):
+				self.logger.reset_mock()
+				name = self._proposal()
+				self.web.return_value, self.workers.return_value = web, workers
+				self.now.return_value = RESTART_SENT_AT + datetime.timedelta(seconds=elapsed)
+				result = self._call_as(METHOD_INSTRUCTOR, name)
+				self.assertEqual(result, {"name": name, "restart_status": expected})
+				stored = _restart_row(name)
+				self.assertEqual((stored.restart_status, stored.restart_sent_at), (expected, RESTART_SENT_AT))
+				self.assertEqual(self._conclusion_lines(), [call(RESTART_LOG_FORMAT, name, expected)])
+				self.assertIn(call("erp_ai"), self.logger.call_args_list)
+
+	def test_uses_decider(self):
+		name = self._proposal()
+		self._evidence_confirms()
+		order = []
+		real_get_value = frappe.db.get_value
+
+		def reading(doctype, *args, **kwargs):
+			if doctype == PROPOSAL_DOCTYPE:
+				order.append("read")
+			return real_get_value(doctype, *args, **kwargs)
+
+		def deciding(_name):
+			order.append("decider")
+			return METHOD_INSTRUCTOR
+
+		self.web.side_effect = lambda: order.append("evidence") or _sent_epoch() + 3
+		with patch.object(controller, "_decider", side_effect=deciding) as decider:
+			with patch.object(frappe.db, "get_value", side_effect=reading):
+				result = self._call_as(METHOD_INSTRUCTOR, name)
+		self.assertEqual(decider.call_args_list, [call(name)])
+		self.assertEqual(order[0], "decider")
+		self.assertEqual(order.count("decider"), 1)
+		self.assertIn("read", order)
+		self.assertIn("evidence", order)
+		self.assertEqual(result, {"name": name, "restart_status": RESTART_STATUS_CONFIRMED})
+		with self.subTest(check="the decider's refusal stops everything"):
+			other = self._proposal()
+			refusal = frappe.PermissionError("refused by the decider")
+			with patch.object(controller, "_decider", side_effect=refusal) as decider:
+				with self.assertRaises(frappe.PermissionError):
+					self._call_as(METHOD_INSTRUCTOR, other)
+			self.assertEqual(decider.call_args_list, [call(other)])
+			self.assertEqual(
+				frappe.db.get_value(PROPOSAL_DOCTYPE, other, "restart_status"), RESTART_STATUS_SENT
+			)
+
+	def test_missing_proposal_does_not_exist(self):
+		witness = self._proposal()
+		cases = (
+			(None, "Không có đề xuất "),
+			("", "Không có đề xuất "),
+			("AICHG-99999", "Không có đề xuất AICHG-99999"),
+		)
+		for name, message in cases:
+			with self.subTest(name=name):
+				self.assertRefused(
+					METHOD_INSTRUCTOR, name, frappe.DoesNotExistError, message, proposal=witness
+				)
+
+	def test_passes_sent_at_it_read(self):
+		name = self._proposal()
+		self._evidence_confirms()
+		with patch.object(transitions, "confirm_restart", return_value=True) as write:
+			result = self._call_as(METHOD_INSTRUCTOR, name)
+		self.assertEqual(
+			write.call_args_list, [call(name, RESTART_STATUS_CONFIRMED, sent_at=RESTART_SENT_AT)]
+		)
+		self.assertIsInstance(write.call_args.kwargs["sent_at"], datetime.datetime)
+		self.assertEqual(result, {"name": name, "restart_status": RESTART_STATUS_CONFIRMED})
+
+	def test_resent_between_read_and_write_keeps_new_status(self):
+		resent_at = RESTART_SENT_AT + datetime.timedelta(seconds=30)
+		cases = {
+			"sent again": (RESTART_STATUS_SENT, resent_at),
+			"launch failed": (RESTART_STATUS_LAUNCH_FAILED, resent_at),
+		}
+		for label, (new_status, new_sent_at) in cases.items():
+			with self.subTest(case=label):
+				self.logger.reset_mock()
+				name = self._proposal()
+				self.workers.return_value = _sent_epoch() + 4
+
+				def resend_while_reading(name=name, new_status=new_status, new_sent_at=new_sent_at):
+					# The undo job's `record_restart` lands between the evidence read and the write.
+					frappe.db.set_value(
+						PROPOSAL_DOCTYPE,
+						name,
+						{"restart_status": new_status, "restart_sent_at": new_sent_at},
+						update_modified=False,
+					)
+					return _sent_epoch() + 3
+
+				self.web.side_effect = resend_while_reading
+				with patch.object(transitions, "confirm_restart", wraps=transitions.confirm_restart) as write:
+					result = self._call_as(METHOD_INSTRUCTOR, name)
+				self.web.side_effect = None
+				self.assertEqual(
+					write.call_args_list, [call(name, RESTART_STATUS_CONFIRMED, sent_at=RESTART_SENT_AT)]
+				)
+				self.assertEqual(result, {"name": name, "restart_status": new_status})
+				stored = _restart_row(name)
+				self.assertEqual((stored.restart_status, stored.restart_sent_at), (new_status, new_sent_at))
+				self.assertEqual(self._conclusion_lines(), [])
 
 
 FORM_SCRIPT_PATH = Path(__file__).resolve().parent / "erp_ai_change_proposal.js"

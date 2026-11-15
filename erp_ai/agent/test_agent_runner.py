@@ -64,7 +64,8 @@ from erp_ai.test_utils import (
 )
 
 PREFIX = "ERPAI-TEST-"
-CLASSIFY_A = json.dumps({"dau_muc": "A", "do_tin_cay": "Cao", "do_tin_cay_pct": 90, "ly_do": "x"})
+CLASSIFY_A_PCT = 90
+CLASSIFY_A = json.dumps({"dau_muc": "A", "do_tin_cay": "Cao", "do_tin_cay_pct": CLASSIFY_A_PCT, "ly_do": "x"})
 TICKET_FIELDS = [
 	"ticket_type",
 	"agent_group",
@@ -586,6 +587,7 @@ class TestRunnerL1Classification(RunnerTestBase):
 					"priority": "High",
 					"ai_confidence": "Cao",
 					"ai_score_reason": "",
+					"ai_confidence_pct": CLASSIFY_A_PCT,
 				}
 			},
 		)
@@ -635,7 +637,7 @@ class TestRunnerL1Classification(RunnerTestBase):
 		self.assertEqual(entry.applied, 1)
 		self.assertEqual(
 			json.loads(entry.value_after),
-			{"ticket": {"ai_confidence": "Cao", "ai_score_reason": ""}},
+			{"ticket": {"ai_confidence": "Cao", "ai_score_reason": "", "ai_confidence_pct": CLASSIFY_A_PCT}},
 		)
 		self.assertEqual(
 			json.loads(entry.actions),
@@ -684,7 +686,7 @@ class TestRunnerL1Classification(RunnerTestBase):
 		self.assertEqual(entry.applied, 1)
 		self.assertEqual(
 			set(json.loads(entry.value_after)["ticket"]),
-			{"ai_confidence", "ai_score_reason"},
+			{"ai_confidence", "ai_score_reason", "ai_confidence_pct"},
 		)
 		self.assertEqual(
 			json.loads(entry.actions),

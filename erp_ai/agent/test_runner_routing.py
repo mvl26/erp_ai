@@ -110,6 +110,7 @@ TRACKED_TICKET_FIELDS = (
 	"ai_complexity",
 	"ai_importance",
 	"ai_score_reason",
+	"ai_confidence_pct",
 )
 PINNED_ROLES = {ROLE_AGENT, HELPDESK_AGENT_ROLE}
 ROUTE_UNITS = ("apply_route", "assign_owner", "create_routed_task", "post_routing_comment")

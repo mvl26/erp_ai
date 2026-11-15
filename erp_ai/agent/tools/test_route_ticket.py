@@ -117,7 +117,7 @@ class TestApplyRoute(RouteTicketTestCase):
 	def test_scores_written_readable_by_agent_role_user(self):
 		# Priority is set explicitly so the changed set does not depend on the site's default SLA priority.
 		ticket = self._ticket(priority="Low")
-		result = self._apply_as_agent(ticket)
+		result = self._apply_as_agent(ticket, classification=self._classification(confidence_pct=70))
 		self.assertTrue(result["ok"], result)
 		self.assertEqual(result["skipped"], [])
 		self.assertEqual(
@@ -130,6 +130,7 @@ class TestApplyRoute(RouteTicketTestCase):
 				"ai_complexity": 2,
 				"ai_importance": 3,
 				"ai_score_reason": REASON_TEXT,
+				"ai_confidence_pct": 70,
 			},
 		)
 		self.assertEqual(set(result["before"]), set(result["after"]))
@@ -283,7 +284,7 @@ class TestApplyRoute(RouteTicketTestCase):
 		before = self._row(ticket)
 		decision = self._decision(ticket_type=None, agent_group=None, priority=None)
 		classification = self._classification(
-			category="E", complexity=1, importance=2, score_reason="E có điểm"
+			category="E", complexity=1, importance=2, score_reason="E có điểm", confidence_pct=60
 		)
 		result = self._apply_as_agent(ticket, decision=decision, classification=classification)
 		self.assertTrue(result["ok"], result)
@@ -298,7 +299,8 @@ class TestApplyRoute(RouteTicketTestCase):
 			(before.ticket_type, before.agent_group, before.priority),
 		)
 		self.assertEqual(
-			set(result["after"]), {"ai_confidence", "ai_complexity", "ai_importance", "ai_score_reason"}
+			set(result["after"]),
+			{"ai_confidence", "ai_complexity", "ai_importance", "ai_score_reason", "ai_confidence_pct"},
 		)
 
 
@@ -337,7 +339,8 @@ class TestConfidencePct(RouteTicketTestCase):
 		self.assertTrue(result["ok"], result)
 		self.assertEqual(result["after"].get(PCT_FIELD), 85)
 		self.assertIn(PCT_FIELD, result["before"])
-		self.assertIsNone(result["before"][PCT_FIELD])
+		# An Int column of Frappe 15 is NOT NULL DEFAULT 0: a ticket never routed reads 0, not None.
+		self.assertEqual(result["before"][PCT_FIELD], 0)
 		self.assertEqual(frappe.db.get_value("HD Ticket", ticket, PCT_FIELD), 85)
 
 	def test_human_classified_pct_not_written(self):

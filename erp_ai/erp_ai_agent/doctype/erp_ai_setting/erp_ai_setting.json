@@ -663,7 +663,7 @@
    "fieldtype": "Long Text",
    "label": "Ghi đè prompt chỉ dẫn lập luận",
    "ignore_xss_filter": 1,
-   "description": "Để trống = dùng bản dựng sẵn. Nội dung thay phần chỉ dẫn lập luận; phải có các mục bắt buộc **Nhận định:**, **Căn cứ:**, **Hướng xử lý:** và ≤ 20000 ký tự. Các mục Đã làm, Chờ duyệt, Cần ai quyết do bot tự thêm. Các câu cấm và khối năm quyền không bị ghi đè. Mỗi lần sửa được lưu vào Lịch sử ghi đè prompt."
+   "description": "Để trống = dùng bản dựng sẵn. Nội dung thay phần chỉ dẫn lập luận; phải có các mục bắt buộc **Nhận định:**, **Hướng xử lý:** và ≤ 20000 ký tự. Các mục Đã làm, Chờ duyệt do bot tự thêm. Mục Căn cứ, Cần ai quyết đã bỏ: ghi đè cũ còn chúng vẫn lưu được và bot viết theo ghi đè. Các câu cấm và khối năm quyền không bị ghi đè. Mỗi lần sửa được lưu vào Lịch sử ghi đè prompt."
   },
   {
    "fieldname": "prompt_override_category_guide",
@@ -709,7 +709,7 @@
  ],
  "issingle": 1,
  "links": [],
- "modified": "2026-11-15 18:00:00.000000",
+ "modified": "2026-11-15 19:29:13.000000",
  "modified_by": "Administrator",
  "module": "ERP AI agent",
  "name": "ERP AI Setting",

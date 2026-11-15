@@ -579,8 +579,10 @@ class TestApplyCodeSteps(ApplyJobTestCase):
 		state = self.state(name)
 		self.assertEqual(state.apply_commit_sha, self.head())
 		before, after = self.log_row(name, "apply")
-		self.assertEqual(before, {"sha256": _sha(BEFORE), "head": old_head})
-		self.assertEqual(after, {"sha256": _sha(AFTER), "commit": state.apply_commit_sha, "branch": "main"})
+		self.assertEqual(before, {"head": old_head, "files": {REL: _sha(BEFORE)}})
+		self.assertEqual(
+			after, {"commit": state.apply_commit_sha, "branch": "main", "files": {REL: _sha(AFTER)}}
+		)
 
 	def test_git_commit_limit_comes_from_the_job_deadline(self):
 		start = self.head()
@@ -620,9 +622,9 @@ class TestApplyCodeSteps(ApplyJobTestCase):
 		self.assertEqual(writes.call_count, 1)
 		self.assertEqual(self.steps(name), ["approve", "fail"])
 		before, after = self.log_row(name, "fail")
-		self.assertEqual(before, {"sha256": _sha(BEFORE), "head": start})
+		self.assertEqual(before, {"head": start, "files": {REL: _sha(BEFORE)}})
 		self.assertEqual(after["commit"], state.apply_commit_sha)
-		self.assertEqual(after["sha256"], _sha(AFTER))
+		self.assertEqual(after["files"][REL], _sha(AFTER))
 
 	def test_postcheck_unreadable_keeps_commit_and_fails(self):
 		start = self.head()
@@ -1271,7 +1273,7 @@ class TestCommitFailure(ApplyJobTestCase):
 				self.assertEqual(self.sandbox.git(APP, "rev-parse", "HEAD~1").strip(), start)
 				self.assertEqual(state.apply_commit_sha, self.head())
 				before, after = self.log_row(name, "fail")
-				self.assertEqual(before, {"sha256": _sha(BEFORE), "head": start})
+				self.assertEqual(before, {"head": start, "files": {REL: _sha(BEFORE)}})
 				self.assertEqual(after["commit"], state.apply_commit_sha)
 
 	def test_fail_row_with_commit_sha_carries_value_after_commit(self):
@@ -1292,9 +1294,9 @@ class TestCommitFailure(ApplyJobTestCase):
 				self.assertTrue(state.apply_commit_sha)
 				before, after = self.log_row(name, "fail")
 				self.assertEqual(
-					after, {"sha256": _sha(AFTER), "commit": state.apply_commit_sha, "branch": "main"}
+					after, {"commit": state.apply_commit_sha, "branch": "main", "files": {REL: _sha(AFTER)}}
 				)
-				self.assertEqual(before, {"sha256": _sha(BEFORE), "head": start})
+				self.assertEqual(before, {"head": start, "files": {REL: _sha(BEFORE)}})
 
 
 class TestRunChangeSkeleton(ApplyJobTestCase):
@@ -1712,10 +1714,15 @@ class TestUndoCode(ApplyJobTestCase):
 				self.assertEqual(state.change_status, CHANGE_STATUS_UNDONE)
 				before, after = self.log_row(name, "undo")
 				# Design 4.4 step 7 and design-addendum-3 QĐ-B5.
-				self.assertEqual(before, {"sha256": _sha(AFTER), "head": apply_commit})
+				self.assertEqual(before, {"head": apply_commit, "files": {self.target(kind): _sha(AFTER)}})
 				restored = None if kind == "new file" else _sha(BEFORE)
 				self.assertEqual(
-					after, {"sha256": restored, "commit": state.undo_commit_sha, "branch": "main"}
+					after,
+					{
+						"commit": state.undo_commit_sha,
+						"branch": "main",
+						"files": {self.target(kind): restored},
+					},
 				)
 
 	def test_undo_rechecks_fail_without_writing(self):
@@ -1840,9 +1847,11 @@ class TestUndoCode(ApplyJobTestCase):
 		self.assertEqual(state.undo_commit_sha, self.head())
 		self.assertEqual(self.steps(name), ["approve", "apply", "fail"])
 		before, after = self.log_row(name, "fail")
-		self.assertEqual(before, {"sha256": _sha(AFTER), "head": apply_commit})
+		self.assertEqual(before, {"head": apply_commit, "files": {self.target(kind): _sha(AFTER)}})
 		restored = None if kind == "new file" else _sha(BEFORE)
-		self.assertEqual(after, {"sha256": restored, "commit": state.undo_commit_sha, "branch": branch})
+		self.assertEqual(
+			after, {"commit": state.undo_commit_sha, "branch": branch, "files": {self.target(kind): restored}}
+		)
 
 	def test_undo_postcheck_wrong_commit_keeps_commit_and_fails(self):
 		real_summary = source.git_commit_summary
@@ -2312,9 +2321,9 @@ class TestUndoCode(ApplyJobTestCase):
 				self.assertTrue(state.undo_commit_sha)
 				before, after = self.log_row(name, "fail")
 				self.assertEqual(
-					after, {"sha256": _sha(BEFORE), "commit": state.undo_commit_sha, "branch": "main"}
+					after, {"commit": state.undo_commit_sha, "branch": "main", "files": {REL: _sha(BEFORE)}}
 				)
-				self.assertEqual(before, {"sha256": _sha(AFTER), "head": apply_commit})
+				self.assertEqual(before, {"head": apply_commit, "files": {REL: _sha(AFTER)}})
 
 	def test_undo_exception_after_commit_landed_does_not_restore(self):
 		for kind in self.KINDS:
@@ -2340,7 +2349,7 @@ class TestUndoCode(ApplyJobTestCase):
 				self.assertEqual(self.sandbox.git(APP, "rev-parse", "HEAD~1").strip(), apply_commit)
 				self.assertEqual(state.undo_commit_sha, self.head())
 				before, after = self.log_row(name, "fail")
-				self.assertEqual(before, {"sha256": _sha(AFTER), "head": apply_commit})
+				self.assertEqual(before, {"head": apply_commit, "files": {self.target(kind): _sha(AFTER)}})
 				self.assertEqual(after["commit"], state.undo_commit_sha)
 
 	def test_undo_unexpected_exception_after_write_restores_file(self):

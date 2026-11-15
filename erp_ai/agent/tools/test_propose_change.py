@@ -1377,12 +1377,31 @@ class TestProposeBlock(FrappeTestCase):
 	def test_delete_symlink_refused(self):
 		self.sandbox.commit_file(APP, "pkg/a.txt", "a\n")
 		os.symlink("a.txt", os.path.join(self.sandbox.repo(APP), "pkg/link.txt"))
-		snapshot = self.git_snapshot()
-		result = self.block([{"action": "delete", "path": f"{APP}/pkg/link.txt"}])
-		self.assertFalse(result["ok"], result)
-		self.assertTrue(result["reason"].startswith(f"mục 1 ({APP}/pkg/link.txt): "), result)
-		self.assert_refused_whole(result, result["reason"], snapshot)
+		for item in (
+			{"action": "delete", "path": f"{APP}/pkg/link.txt"},
+			{"action": "rename", "path": f"{APP}/pkg/link.txt", "new_path": f"{APP}/pkg/moved.txt"},
+		):
+			with self.subTest(action=item["action"]):
+				self.assert_item_refused(item, change_guard.PATH_SYMLINK)
 		self.assertTrue(os.path.islink(os.path.join(self.sandbox.repo(APP), "pkg/link.txt")))
+
+	def test_symlink_past_guard_is_not_regular_file(self):
+		"""design-addendum-8 A8-4: the `islink` branch of `_removed_text` refuses a symlink the guard let by."""
+		self.sandbox.commit_file(APP, "pkg/a.txt", "a\n")
+		link = os.path.join(self.sandbox.repo(APP), "pkg/link.txt")
+		os.symlink("a.txt", link)
+		rel = f"{APP}/pkg/link.txt"
+		real = change_guard.check_write_path
+
+		def guard(path, *args, **kwargs):
+			# only the step-2 read of `_removed_text`; `check_block` keeps the real guard
+			if path == rel and kwargs.get("read_git") is False:
+				return change_guard.GuardResult(full_path=link, rel_path=rel, app=APP, reason=None)
+			return real(path, *args, **kwargs)
+
+		with patch.object(change_guard, "check_write_path", side_effect=guard):
+			self.assert_item_refused({"action": "delete", "path": rel}, change_guard.NOT_REGULAR_FILE)
+		self.assertTrue(os.path.islink(link))
 
 	def test_rename_dest_exists_refused(self):
 		self.sandbox.commit_file(APP, "pkg/r.txt", "r\n")
@@ -1432,7 +1451,8 @@ class TestProposeBlock(FrappeTestCase):
 			{"action": "rename", "path": f"{APP}/pkg/r.txt", "new_path": f"{APP}/README.md/r.txt"},
 		):
 			with self.subTest(item=item):
-				self.assert_item_refused(item, change_guard.PATH_INVALID)
+				self.assert_item_refused(item, propose_change.PARENT_NOT_DIR)
+		self.assertEqual(propose_change.PARENT_NOT_DIR, "thư mục cha trên đường dẫn là một file")
 		self.assertTrue(os.path.isfile(os.path.join(self.sandbox.repo(APP), "README.md")))
 
 	# CHG-002 T28: commands in a block; the three tools go through `_propose_block`.

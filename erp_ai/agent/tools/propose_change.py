@@ -46,6 +46,7 @@ EDIT_AMBIGUOUS = "đoạn find[{index}] xuất hiện nhiều hơn một lần"
 EDIT_OVERLAP = "các đoạn find chồng nhau"
 NO_CHANGE = "nội dung sau trùng nội dung trước"
 EXISTS = "file đã tồn tại"
+PARENT_NOT_DIR = "thư mục cha trên đường dẫn là một file"
 BLOCK_SHAPE = change_guard.BLOCK_SHAPE
 # CHG-002 design 3.1: the fields of each kind of item of `changes`.
 ITEM_FIELDS = {
@@ -221,7 +222,7 @@ def _created_op(change: dict, ctx: ToolContext) -> change_guard.FileOp | str:
 	if os.path.lexists(guard.full_path):
 		return EXISTS
 	if not _under_a_folder(guard.full_path):
-		return change_guard.PATH_INVALID
+		return PARENT_NOT_DIR
 	content = change["content"]
 	return change_guard.FileOp(
 		kind=CHANGE_OP_CREATE,
@@ -282,7 +283,7 @@ def _renamed_op(change: dict, ctx: ToolContext) -> change_guard.FileOp | str:
 	if os.path.lexists(guard.full_path):
 		return EXISTS
 	if not _under_a_folder(guard.full_path):
-		return change_guard.PATH_INVALID
+		return PARENT_NOT_DIR
 	digest = _sha256(text.encode("utf-8"))
 	return change_guard.FileOp(
 		kind=CHANGE_OP_RENAME,

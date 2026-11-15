@@ -8596,5 +8596,348 @@ def validate(doc):
 }
 
 
+# ---------------------------------------------------------------------------------------------------
+# CHG-002 change-block rules (design §8.2; addendum-3 RQ-8: own block, own class, self-checks inside)
+# ---------------------------------------------------------------------------------------------------
+
+SETSID_TEXT = "setsid"
+SETSID_EXECUTABLE_NAME = "SETSID_EXECUTABLE"
+RESTART_ARGV_NAME = "RESTART_ARGV"
+RESTART_STREAMS = ("stdin", "stdout", "stderr")
+RESTART_REQUIRED_KEYWORDS = ("timeout", "cwd")
+PRIVILEGE_COMMANDS = ("sudo", "supervisorctl")
+
+
+def _command_tokens(text: str) -> list:
+	"""Words of a string as a command sees them: `"/usr/bin/sudo -n"` -> ["usr", "bin", "sudo", "-n"]."""
+	return [token for token in re.split(r"[\s/]+", text) if token]
+
+
+def _code_strings(tree: ast.AST):
+	"""Every string constant of the code, f-string pieces included, docstrings excluded."""
+	docstrings = _docstring_ids(tree)
+	for node in ast.walk(tree):
+		if isinstance(node, ast.Constant) and isinstance(node.value, str) and id(node) not in docstrings:
+			yield node
+
+
+def _is_named(node, name: str) -> bool:
+	"""`name` or `<anything>.name`."""
+	return (isinstance(node, ast.Name) and node.id == name) or (
+		isinstance(node, ast.Attribute) and node.attr == name
+	)
+
+
+def _module_value(tree: ast.AST, name: str):
+	for node in tree.body:
+		if isinstance(node, ast.Assign) and any(_is_named(target, name) for target in node.targets):
+			return node.value
+	return None
+
+
+def _is_none(node) -> bool:
+	return isinstance(node, ast.Constant) and node.value is None
+
+
+def restart_launch_calls(tree: ast.AST) -> list:
+	"""Calls whose first argument is `RESTART_ARGV` (or `<module>.RESTART_ARGV`)."""
+	return [
+		node
+		for node in ast.walk(tree)
+		if isinstance(node, ast.Call) and node.args and _is_named(node.args[0], RESTART_ARGV_NAME)
+	]
+
+
+def _restart_launch_violations(rel: str, call: ast.Call) -> list:
+	keywords = {keyword.arg: keyword.value for keyword in call.keywords if keyword.arg}
+	found = [
+		violation(rel, call, f"restart launch lacks {stream}=DEVNULL (ADR-040 QĐ 7)")
+		for stream in RESTART_STREAMS
+		if (dotted_name(keywords.get(stream)) or "").rsplit(".", 1)[-1] != "DEVNULL"
+	]
+	found.extend(
+		violation(rel, call, f"restart launch lacks {name}= (ADR-040 QĐ 7)")
+		for name in RESTART_REQUIRED_KEYWORDS
+		if name not in keywords or _is_none(keywords[name])
+	)
+	env = keywords.get("env")
+	if env is None or _is_none(env):
+		found.append(
+			violation(rel, call, "restart launch lacks env= and would inherit os.environ (ADR-040 QĐ 7)")
+		)
+	elif any(
+		dotted_name(node) == "os.environ" or (isinstance(node, ast.Name) and node.id == "environ")
+		for node in ast.walk(env)
+	):
+		found.append(
+			violation(rel, call, "restart launch passes os.environ as env= (ADR-040 QĐ 7: minimal env)")
+		)
+	return found
+
+
+def check_change_block_restart_launch_shape(sources: dict) -> list:
+	"""A-5, ADR-040 QĐ 7: `"setsid"` is written once, as `source.SETSID_EXECUTABLE`; that name is used once,
+	as element 0 of `process_runner.RESTART_ARGV`; every launch of `RESTART_ARGV` has stdin, stdout and
+	stderr DEVNULL, `timeout=`, `cwd=` and an `env=` that is not `os.environ`."""
+	trees = {rel: parse(rel, src) for rel, src in only_python(sources).items()}
+	missing = [rel for rel in (SOURCE_TOOL_FILE, PROCESS_RUNNER_FILE) if rel not in trees]
+	if missing:
+		return [f"{rel}: file missing" for rel in missing]
+	violations = []
+	setsid_value = _module_value(trees[SOURCE_TOOL_FILE], SETSID_EXECUTABLE_NAME)
+	if not (isinstance(setsid_value, ast.Constant) and setsid_value.value == SETSID_TEXT):
+		violations.append(
+			f"{SOURCE_TOOL_FILE}: {SETSID_EXECUTABLE_NAME} is not the constant {SETSID_TEXT!r} (A-5)"
+		)
+	argv = _module_value(trees[PROCESS_RUNNER_FILE], RESTART_ARGV_NAME)
+	first = argv.elts[0] if isinstance(argv, ast.Tuple | ast.List) and argv.elts else None
+	if not _is_named(first, SETSID_EXECUTABLE_NAME):
+		violations.append(
+			f"{PROCESS_RUNNER_FILE}: element 0 of {RESTART_ARGV_NAME} is not {SETSID_EXECUTABLE_NAME} (A-5)"
+		)
+	launches = 0
+	for rel, tree in trees.items():
+		for node in _code_strings(tree):
+			if SETSID_TEXT in _command_tokens(node.value) and node is not setsid_value:
+				text = f"{SETSID_TEXT!r} written outside {SOURCE_TOOL_FILE} {SETSID_EXECUTABLE_NAME} (A-5)"
+				violations.append(violation(rel, node, text))
+		for node in ast.walk(tree):
+			if (
+				_is_named(node, SETSID_EXECUTABLE_NAME)
+				and not isinstance(node.ctx, ast.Store)
+				and node is not first
+			):
+				text = f"{SETSID_EXECUTABLE_NAME} used outside element 0 of {RESTART_ARGV_NAME} (A-5: one argv use)"
+				violations.append(violation(rel, node, text))
+		for call in restart_launch_calls(tree):
+			launches += 1
+			violations.extend(_restart_launch_violations(rel, call))
+	if not launches:
+		violations.append(f"{PROCESS_RUNNER_FILE}: {RESTART_ARGV_NAME} is never launched (ADR-040 QĐ 7)")
+	return violations
+
+
+def check_change_block_no_sudo_or_supervisorctl_argv(sources: dict) -> list:
+	"""Design §8.2, AC-45: no string of the product code holds the command `sudo` or `supervisorctl`."""
+	violations = []
+	for rel, src in only_python(sources).items():
+		for node in _code_strings(parse(rel, src)):
+			tokens = _command_tokens(node.value)
+			violations.extend(
+				violation(
+					rel, node, f"{command!r} in product code (design §8.2, AC-45: no sudo, no supervisorctl)"
+				)
+				for command in PRIVILEGE_COMMANDS
+				if command in tokens
+			)
+	return violations
+
+
+RESTART_LAUNCH_CLEAN = {
+	SOURCE_TOOL_FILE: '''"""Server-fixed executables; `setsid` detaches `bench restart` (A-5)."""
+TIMEOUT_EXECUTABLE = "timeout"
+BENCH_EXECUTABLE = "bench"
+SETSID_EXECUTABLE = "setsid"
+''',
+	PROCESS_RUNNER_FILE: '''"""Starts bench and git; never through sudo or supervisorctl."""
+import os
+import subprocess
+
+import frappe
+
+from erp_ai.agent.tools import source
+
+RESTART_ARGV = (source.SETSID_EXECUTABLE, "-f", source.TIMEOUT_EXECUTABLE, "-s", "KILL", "1500", source.BENCH_EXECUTABLE, "restart")
+
+
+def _minimal_env():
+	return {name: os.environ[name] for name in ("PATH", "HOME") if name in os.environ}
+
+
+def launch_restart():
+	return subprocess.run(
+		RESTART_ARGV,
+		cwd=frappe.utils.get_bench_path(),
+		env=_minimal_env(),
+		stdin=subprocess.DEVNULL,
+		stdout=subprocess.DEVNULL,
+		stderr=subprocess.DEVNULL,
+		timeout=30,
+		start_new_session=True,
+	)
+''',
+	"agent/changes/apply_job.py": '''"""Runs the approved block; asks process_runner to restart."""
+from erp_ai.agent.changes import process_runner
+
+
+def restart_after_apply():
+	return process_runner.launch_restart()
+''',
+}
+RESTART_JOB_FILE = "agent/changes/apply_job.py"
+
+
+class TestChangeBlockRules(unittest.TestCase):
+	"""CHG-002 rules on the product, then each rule's self-checks on samples (addendum-3 RQ-8)."""
+
+	@classmethod
+	def setUpClass(cls):
+		cls.sources = load_product_sources()
+
+	def assertCaught(self, violations, *fragments):
+		self.assertGreater(len(violations), 0, "scanner missed the violation")
+		for fragment in fragments:
+			self.assertTrue(any(fragment in text for text in violations), f"{fragment!r} not in {violations}")
+
+	def restart_product(self, rel: str, extra: str = "", replace: tuple = ()) -> dict:
+		"""RESTART_LAUNCH_CLEAN with `replace=(old, new)` applied to `rel` and `extra` appended."""
+		text = RESTART_LAUNCH_CLEAN.get(rel, "")
+		if replace:
+			self.assertIn(replace[0], text)
+			text = text.replace(*replace)
+		return {**RESTART_LAUNCH_CLEAN, rel: text + extra}
+
+	# T47: restart launch shape, no sudo (AC-57, AC-45; A-5; ADR-040 QĐ 7) ------------------------
+
+	def test_restart_launch_shape(self):
+		for rel in (SOURCE_TOOL_FILE, PROCESS_RUNNER_FILE):
+			self.assertIn(rel, self.sources)
+		# Not a blind scan: the real `"setsid"` and the real launch call are seen.
+		setsid_texts = [
+			(rel, node.value)
+			for rel, src in only_python(self.sources).items()
+			for node in _code_strings(parse(rel, src))
+			if SETSID_TEXT in _command_tokens(node.value)
+		]
+		self.assertEqual(setsid_texts, [(SOURCE_TOOL_FILE, SETSID_TEXT)])
+		runner = parse(PROCESS_RUNNER_FILE, self.sources[PROCESS_RUNNER_FILE])
+		self.assertEqual(len(restart_launch_calls(runner)), 1)
+		self.assertEqual(check_change_block_restart_launch_shape(self.sources), [])
+
+	def test_no_sudo_or_supervisorctl_argv(self):
+		self.assertIn(PROCESS_RUNNER_FILE, self.sources)
+		self.assertEqual(check_change_block_no_sudo_or_supervisorctl_argv(self.sources), [])
+
+	def test_restart_rules_pass_on_the_clean_sample(self):
+		self.assertEqual(check_change_block_restart_launch_shape(RESTART_LAUNCH_CLEAN), [])
+		# A docstring may name sudo; a word holding the letters is not the command.
+		clean = self.restart_product(RESTART_JOB_FILE, extra='\nLABEL = "pseudo-restart"\n')
+		self.assertEqual(check_change_block_no_sudo_or_supervisorctl_argv(clean), [])
+
+	def test_restart_launch_shape_caught(self):
+		run = PROCESS_RUNNER_FILE
+		cases = {
+			"stdin not DEVNULL": (run, "", ("\t\tstdin=subprocess.DEVNULL,\n", ""), "stdin=DEVNULL"),
+			"stdout not DEVNULL": (run, "", ("\t\tstdout=subprocess.DEVNULL,\n", ""), "stdout=DEVNULL"),
+			"stderr not DEVNULL": (run, "", ("\t\tstderr=subprocess.DEVNULL,\n", ""), "stderr=DEVNULL"),
+			"stdout PIPE": (
+				run,
+				"",
+				("stdout=subprocess.DEVNULL", "stdout=subprocess.PIPE"),
+				"stdout=DEVNULL",
+			),
+			"no timeout=": (run, "", ("\t\ttimeout=30,\n", ""), "timeout="),
+			"timeout=None": (run, "", ("timeout=30", "timeout=None"), "timeout="),
+			"no cwd=": (run, "", ("\t\tcwd=frappe.utils.get_bench_path(),\n", ""), "cwd="),
+			"no env=": (run, "", ("\t\tenv=_minimal_env(),\n", ""), "lacks env="),
+			"env=None": (run, "", ("env=_minimal_env()", "env=None"), "lacks env="),
+			"env=os.environ": (run, "", ("env=_minimal_env()", "env=os.environ"), "os.environ"),
+			"env copies os.environ": (run, "", ("env=_minimal_env()", "env={**os.environ}"), "os.environ"),
+			"env=dict(os.environ)": (run, "", ("env=_minimal_env()", "env=dict(os.environ)"), "os.environ"),
+			"setsid rewritten in another file": (
+				RESTART_JOB_FILE,
+				'\nARGV = ["setsid", "-f", "bench", "restart"]\n',
+				(),
+				f"{RESTART_JOB_FILE}:8: 'setsid' written outside",
+			),
+			"setsid inside a command string": (
+				RESTART_JOB_FILE,
+				'\nCOMMAND = "setsid -f bench restart"\n',
+				(),
+				"'setsid' written outside",
+			),
+			"setsid literal in RESTART_ARGV": (
+				run,
+				"",
+				("(source.SETSID_EXECUTABLE, ", '("setsid", '),
+				f"{run}:9: 'setsid' written outside",
+			),
+			"SETSID_EXECUTABLE not 'setsid'": (
+				SOURCE_TOOL_FILE,
+				"",
+				('SETSID_EXECUTABLE = "setsid"', 'SETSID_EXECUTABLE = "/usr/bin/setsid"'),
+				"is not the constant 'setsid'",
+			),
+			"SETSID_EXECUTABLE defined outside source.py": (
+				SOURCE_TOOL_FILE,
+				"",
+				('SETSID_EXECUTABLE = "setsid"\n', ""),
+				"is not the constant 'setsid'",
+			),
+			"SETSID_EXECUTABLE not element 0": (
+				run,
+				"",
+				(
+					'(source.SETSID_EXECUTABLE, "-f", source.TIMEOUT_EXECUTABLE,',
+					'(source.TIMEOUT_EXECUTABLE, "-f", source.SETSID_EXECUTABLE,',
+				),
+				"element 0 of RESTART_ARGV is not SETSID_EXECUTABLE",
+			),
+			"SETSID_EXECUTABLE used twice": (
+				run,
+				'\nOTHER_ARGV = (source.SETSID_EXECUTABLE, "bench")\n',
+				(),
+				"SETSID_EXECUTABLE used outside element 0",
+			),
+			"SETSID_EXECUTABLE used in another file": (
+				RESTART_JOB_FILE,
+				'\nfrom erp_ai.agent.tools.source import SETSID_EXECUTABLE\nARGV = [SETSID_EXECUTABLE, "bench"]\n',
+				(),
+				f"{RESTART_JOB_FILE}:9: SETSID_EXECUTABLE used outside element 0",
+			),
+			"RESTART_ARGV never launched": (
+				run,
+				"",
+				("\t\tRESTART_ARGV,\n", "\t\tlist(source.BENCH_EXECUTABLE),\n"),
+				"RESTART_ARGV is never launched",
+			),
+			"second launch without DEVNULL": (
+				RESTART_JOB_FILE,
+				"\nimport subprocess\nsubprocess.run(process_runner.RESTART_ARGV, timeout=5)\n",
+				(),
+				f"{RESTART_JOB_FILE}:9: restart launch lacks stdin=DEVNULL",
+			),
+		}
+		for case, (rel, extra, replace, fragment) in cases.items():
+			with self.subTest(case=case):
+				found = check_change_block_restart_launch_shape(self.restart_product(rel, extra, replace))
+				self.assertCaught(found, fragment)
+		missing = {SOURCE_TOOL_FILE: RESTART_LAUNCH_CLEAN[SOURCE_TOOL_FILE]}
+		self.assertCaught(
+			check_change_block_restart_launch_shape(missing), PROCESS_RUNNER_FILE, "file missing"
+		)
+
+	def test_sudo_or_supervisorctl_caught(self):
+		cases = {
+			"sudo argv": (PROCESS_RUNNER_FILE, '\nARGV = ["sudo", "bench", "restart"]\n', "'sudo'"),
+			"supervisorctl argv": (
+				PROCESS_RUNNER_FILE,
+				'\nARGV = ("supervisorctl", "restart", "all")\n',
+				"'supervisorctl'",
+			),
+			"sudo path in another file": (RESTART_JOB_FILE, '\nSUDO = "/usr/bin/sudo"\n', "'sudo'"),
+			"command string": (
+				RESTART_JOB_FILE,
+				'\nCOMMAND = "sudo supervisorctl restart all"\n',
+				"'supervisorctl'",
+			),
+			"f-string": (RESTART_JOB_FILE, '\nCOMMAND = f"sudo {name}"\n', "'sudo'"),
+		}
+		for case, (rel, extra, fragment) in cases.items():
+			with self.subTest(case=case):
+				found = check_change_block_no_sudo_or_supervisorctl_argv(self.restart_product(rel, extra))
+				self.assertCaught(found, rel, fragment)
+
+
 if __name__ == "__main__":
 	unittest.main()

@@ -502,7 +502,7 @@ class TestPrompts(FrappeTestCase):
 		for phrase in (
 			"LÀM LUÔN, KHÔNG HỎI LẠI",
 			"quy tắc 6",
-			"Cần ai quyết",
+			'"Hướng xử lý" là việc người phải làm',
 			"Không hỏi lại",
 			"tạo đề xuất luôn",
 			"Nút Duyệt / Từ chối",
@@ -510,6 +510,8 @@ class TestPrompts(FrappeTestCase):
 			"người ra lệnh",
 		):
 			self.assertIn(phrase, block)
+		# spec changed (spec-addendum-5 AC-66): the sentence telling the model to write "Cần ai quyết" is gone.
+		self.assertNotIn("Cần ai quyết", block)
 		self.assertNotIn(block, prompts.build_reason_system("DIGEST-XYZ", "ROUTING-ABC")[0]["text"])
 		for flags in ({"change_tools": True}, {"site_admin_tools": True}, {"unrestricted_tools": True}):
 			text = prompts.build_reason_system("", "", **flags)[0]["text"]

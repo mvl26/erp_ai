@@ -70,15 +70,19 @@ OLD_HEAD = OLD_CORE_PROMPT[: OLD_CORE_PROMPT.index(RULE_6_START) + 1]
 OLD_LIMITS = OLD_CORE_PROMPT[OLD_CORE_PROMPT.index(LIMITS_START) : OLD_CORE_PROMPT.index(WRITING_START)]
 OLD_WRITING = OLD_CORE_PROMPT[OLD_CORE_PROMPT.index(WRITING_START) :]
 
-# spec changed (AC-23 [changed], AC-65 (a), U1-5 of w1.md:80): in VIẾT COMMENT only these lines change; the bot
-# writes the "Cần ai quyết" section itself. The rest of VIẾT COMMENT stays the old text byte for byte.
-OLD_WRITING_LINES = """**Hướng xử lý:** các bước. Nếu bạn đã làm thì nói đã làm gì.
+# spec changed (spec-addendum-5 AC-65 (a), AC-66, AC-38): in VIẾT COMMENT only these lines change; no "Căn cứ",
+# no "Cần ai quyết". The rest of VIẾT COMMENT stays the old text byte for byte.
+OLD_WRITING_LINES = """**Nhận định:** nguyên nhân, một hai câu.
+**Căn cứ:** bản ghi hoặc dòng code cụ thể đã xem (ghi rõ file và số dòng).
+**Hướng xử lý:** các bước. Nếu bạn đã làm thì nói đã làm gì.
 **Cần ai quyết:** nếu có.
 """
-U1_5_WRITING_LINES = """**Hướng xử lý:** các bước người cần làm hoặc bot sẽ làm.
-Không tự liệt kê việc đã làm, đề xuất đang chờ hay việc bị từ chối: bot tự thêm các mục "Đã làm", "Chờ duyệt", "Cần ai quyết" từ những gì đã ghi trong lần chạy.
+A5_WRITING_LINES = """**Nhận định:** nguyên nhân, một hai câu; nêu luôn bản ghi, dòng code (file và số dòng) hoặc nguồn tra cứu đã dựa vào.
+**Hướng xử lý:** phương án của bot: các bước bot sẽ làm sau khi người bấm "Duyệt ngay" (nếu có đề xuất) và các bước người phải làm tay, kèm lý do. Cần người chọn giữa hai cách thì chọn một cách, nêu cách kia ngay trong mục này.
+Không tự liệt kê việc đã làm, đề xuất đang chờ hay đề xuất tool không tạo được: bot tự thêm các mục "Đã làm", "Chờ duyệt" và tự ghi đề xuất không tạo được vào "Hướng xử lý" như việc người phải làm tay, kèm lý do.
 """
-NEW_WRITING = OLD_WRITING.replace(OLD_WRITING_LINES, U1_5_WRITING_LINES)
+NEW_WRITING = OLD_WRITING.replace(OLD_WRITING_LINES, A5_WRITING_LINES)
+RETIRED_HEADINGS = ("Căn cứ", "Cần ai quyết")
 
 
 def _flag_blocks():
@@ -140,10 +144,11 @@ class TestCorePrompt(FrappeTestCase):
 		keep_agent_settings(self)
 
 	def test_default_core_prompt_keeps_rules_1_5_and_limits(self):
-		# spec changed (AC-66, AC-65 (a)): rule 6 is RULE_6_ACT + NO_OK_APPROVAL, VIẾT COMMENT is the U1-5 text;
-		# rules 1-5 and GIỚI HẠN stay byte for byte.
+		# spec changed (AC-66, AC-65 (a) of spec-addendum-5): rule 6 is RULE_6_ACT + NO_OK_APPROVAL, VIẾT COMMENT is
+		# the addendum-5 text without "Căn cứ" and "Cần ai quyết"; rules 1-5 and GIỚI HẠN stay byte for byte.
 		self.assertEqual(OLD_WRITING.count(OLD_WRITING_LINES), 1)
-		self.assertNotIn("**Cần ai quyết:**", NEW_WRITING)
+		for heading in RETIRED_HEADINGS:
+			self.assertNotIn(heading, NEW_WRITING)
 		self.assertEqual(prompts.core_prompt(), prompts.CORE_PROMPT)
 		self.assertEqual(
 			prompts.CORE_PROMPT,
@@ -206,7 +211,7 @@ class TestCorePrompt(FrappeTestCase):
 		self.assertEqual(prompts.core_prompt(act_now=True), default)
 
 	def test_no_conflict_pair_in_any_flag_combination(self):
-		self.assertEqual(len(prompts.PROMPT_CONFLICT_PAIRS), 8)  # P-1..P-5, P-7, P-8, P-9
+		self.assertEqual(len(prompts.PROMPT_CONFLICT_PAIRS), 10)  # P-1..P-5, P-7..P-11
 		for forbidden, allowed in prompts.PROMPT_CONFLICT_PAIRS:
 			# every pair is real: its forbidden sentence was in the old core prompt
 			self.assertIn(forbidden, OLD_CORE_PROMPT)
@@ -228,6 +233,24 @@ class TestCorePrompt(FrappeTestCase):
 				self.assertTrue(any(allowed in source for source in sources))
 		# P-7: the ask-only block is what allows "not writing anything".
 		self.assertIn(prompts.PROMPT_CONFLICT_PAIRS[5][1], prompts.ASK_ONLY_BLOCK)
+
+	def test_no_retired_heading_in_any_built_prompt(self):
+		# AC-65 (a) of spec-addendum-5: no "Căn cứ", no "Cần ai quyết" in any flag combination.
+		for flags in ALL_FLAGS:
+			text = prompts.build_reason_system("DIGEST-XYZ", "ROUTING-ABC", **flags)[0]["text"]
+			for heading in RETIRED_HEADINGS:
+				self.assertNotIn(heading, text, flags)
+			self.assertEqual(text.count("**Nhận định:**"), 1, flags)
+			self.assertEqual(text.count("**Hướng xử lý:**"), 1, flags)
+		for name, block in _flag_blocks():
+			for heading in RETIRED_HEADINGS:
+				self.assertNotIn(heading, block, name)
+
+	def test_rule_6_points_to_approve_now_in_the_bot_panel(self):
+		# AC-39, AC-65 (a) of spec-addendum-5: the button is "Duyệt ngay" in the "Trao đổi với bot" panel.
+		self.assertIn('bấm "Duyệt ngay" trong ngăn "Trao đổi với bot"', prompts.RULE_6_ACT)
+		self.assertNotIn("ngăn của bot", prompts.RULE_6_ACT)
+		self.assertNotIn("\n", prompts.RULE_6_ACT)
 
 
 class TestReasonSystem(FrappeTestCase):

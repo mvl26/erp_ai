@@ -6,7 +6,7 @@ import frappe
 from frappe.tests.utils import FrappeTestCase
 from helpdesk.test_utils import make_ticket
 
-from erp_ai.agent import daily_report
+from erp_ai.agent import daily_report, runner
 from erp_ai.agent.ops_data import BA_NOTE_MARKER
 from erp_ai.constants import AGENT_USER, LOG_DOCTYPE, LOGGER_NAME, SETTING_DOCTYPE
 from erp_ai.test_utils import keep_agent_settings, make_routing_rules, set_agent_settings
@@ -17,6 +17,7 @@ ANCHOR_TWELVE = datetime(2002, 3, 11, 8, 0)
 ANCHOR_DE = datetime(2002, 4, 8, 8, 0)
 ANCHOR_HOURS = datetime(2002, 5, 6, 8, 0)
 ANCHOR_BOT = datetime(2002, 6, 4, 8, 0)
+ANCHOR_BOT_KINDS = datetime(2002, 7, 2, 8, 0)
 REPORT_KEYS = {
 	"new_by_category_priority",
 	"new_list",
@@ -119,18 +120,28 @@ def _item(name: str, category: str, priority: str = "Medium") -> dict:
 	}
 
 
+def _report_settings(test: FrappeTestCase) -> None:
+	"""Seed the settings the report reads; restore them and roll the test's rows back after the test."""
+	keep_agent_settings(test)
+	test.addCleanup(frappe.db.rollback)
+	set_agent_settings(
+		category_mapping=json.dumps(CATEGORY_MAPPING),
+		routing_rules=make_routing_rules(),
+		field_due_date=DUE_FIELD,
+		due_reminder_hours=24,
+		ba_note_due_hours=24,
+		task_due_days=3,
+	)
+
+
+def _bot_actions(**counts: int) -> dict[str, int]:
+	"""Every kind of `bot_actions` at 0, except the given ones; keys with a space are passed as `**{...}`."""
+	return {kind: counts.get(kind, 0) for kind in daily_report.BOT_ACTION_KINDS}
+
+
 class TestBuild(FrappeTestCase):
 	def setUp(self):
-		keep_agent_settings(self)
-		self.addCleanup(frappe.db.rollback)
-		set_agent_settings(
-			category_mapping=json.dumps(CATEGORY_MAPPING),
-			routing_rules=make_routing_rules(),
-			field_due_date=DUE_FIELD,
-			due_reminder_hours=24,
-			ba_note_due_hours=24,
-			task_due_days=3,
-		)
+		_report_settings(self)
 
 	def test_twelve_tickets_sections(self):
 		anchor = ANCHOR_TWELVE
@@ -456,7 +467,8 @@ class TestBuild(FrappeTestCase):
 		frappe.db.delete(
 			LOG_DOCTYPE, {"creation": ["between", [day - timedelta(days=1), anchor + timedelta(days=1)]]}
 		)
-		# yesterday, first second: classified and applied with an assignee -> classify and assign
+		# yesterday, first second: classified and applied with a predicted assignee but no ok assign_owner
+		# entry -> classify only
 		_log(day, entry_type="classify", applied=1, predicted_assignee=HUMAN_AGENT, cost_usd=0.1)
 		# classified, applied, no assignee: classify only
 		_log(day + timedelta(hours=9), entry_type="classify", applied=1, cost_usd=0.2)
@@ -483,8 +495,9 @@ class TestBuild(FrappeTestCase):
 				]
 			),
 		)
-		# unreadable actions count as none; a blank error is no error
-		_log(day + timedelta(hours=12), entry_type="reason", actions="not json", error="  ")
+		# unreadable actions count as none; a blank error is no error; the 7th decimal of the raw sum
+		# (0.3000014) is rounded away
+		_log(day + timedelta(hours=12), entry_type="reason", actions="not json", error="  ", cost_usd=0.0000004)
 		# change steps: propose x2, approve, reject; other steps not counted
 		for step in ("propose", "propose", "approve", "reject", "apply", "undo"):
 			_log(day + timedelta(hours=13), entry_type="change", trigger="change_action", change_step=step)
@@ -505,12 +518,26 @@ class TestBuild(FrappeTestCase):
 
 		result = daily_report.build_daily_report(anchor)
 
-		self.assertEqual(daily_report.ACTION_KIND_BY_TOOL, {"create_task": "Task", "post_comment": "comment"})
+		self.assertEqual(
+			daily_report.ACTION_KIND_BY_TOOL,
+			{
+				"set_classification": "phân loại",
+				"assign_owner": "gán",
+				"create_task": "Task",
+				"create_routed_task": "Task",
+				"post_comment": "comment",
+				"post_routing_comment": "comment",
+			},
+		)
+		self.assertEqual(
+			daily_report.TOOLS_COUNTED_ELSEWHERE,
+			frozenset({"apply_route", "propose_file_change", "propose_new_file", "propose_bench_command"}),
+		)
 		self.assertEqual(
 			result["bot_actions"],
 			{
 				"phân loại": 3,
-				"gán": 1,
+				"gán": 0,
 				"Task": 2,
 				"comment": 1,
 				"trả lời": 0,
@@ -523,3 +550,137 @@ class TestBuild(FrappeTestCase):
 			},
 		)
 		self.assertEqual(result["cost_yesterday"], 0.300001)
+
+
+class TestBotActions(FrappeTestCase):
+	"""How each ok action entry of yesterday's ERP AI Log rows is counted (design-w1-fixes-18 Điểm 1-3)."""
+
+	def setUp(self):
+		_report_settings(self)
+		self.day = ANCHOR_BOT_KINDS.date() - timedelta(days=1)
+		self.yesterday = datetime.combine(self.day, datetime.min.time()) + timedelta(hours=10)
+		frappe.db.delete(
+			LOG_DOCTYPE,
+			{
+				"creation": [
+					"between",
+					[ANCHOR_BOT_KINDS - timedelta(days=3), ANCHOR_BOT_KINDS + timedelta(days=1)],
+				]
+			},
+		)
+
+	def _report(self) -> dict:
+		return daily_report.build_daily_report(ANCHOR_BOT_KINDS)
+
+	def test_assign_counted_from_ok_assign_owner_only(self):
+		already_assigned = {**_action("assign_owner", ok=False), "reason": "phiếu đã có người được gán"}
+		for assign in (_action("assign_owner"), already_assigned, _action("assign_owner", ok=False)):
+			_log(
+				self.yesterday,
+				entry_type="classify",
+				applied=1,
+				predicted_assignee=HUMAN_AGENT,
+				actions=json.dumps([_action("apply_route"), assign]),
+			)
+
+		result = self._report()
+
+		self.assertEqual(result["bot_actions"], _bot_actions(**{"phân loại": 3, "gán": 1}))
+
+	def test_routing_task_and_comment_kinds(self):
+		_log(
+			self.yesterday,
+			entry_type="classify",
+			applied=1,
+			actions=json.dumps(
+				[
+					_action("apply_route"),
+					_action("sla_check", ok=False),
+					_action("assign_owner"),
+					_action("create_routed_task"),
+					_action("post_routing_comment"),
+				]
+			),
+		)
+
+		result = self._report()
+
+		self.assertEqual(
+			result["bot_actions"], _bot_actions(**{"phân loại": 1, "gán": 1, "Task": 1, "comment": 1})
+		)
+
+	def test_propose_counted_once(self):
+		self.assertEqual(
+			daily_report.TOOLS_COUNTED_ELSEWHERE, frozenset({"apply_route", *runner.PROPOSE_TOOLS})
+		)
+		_log(
+			self.yesterday,
+			entry_type="reason",
+			actions=json.dumps([_action("propose_file_change"), _action("propose_new_file", ok=False)]),
+		)
+		_log(self.yesterday, entry_type="change", trigger="change_action", change_step="propose")
+
+		result = self._report()
+
+		self.assertEqual(result["bot_actions"], _bot_actions(**{"đề xuất chờ duyệt": 1}))
+
+	def test_close_reply_and_classification_kinds(self):
+		ticket = _ticket("bot_close", self.yesterday, "A")
+		other = _ticket("bot_close_other", self.yesterday, "A")
+
+		def update(name: str, status: str, ok: bool = True) -> dict:
+			return {
+				"tool": "api_update_record",
+				"doctype": "HD Ticket",
+				"name": name,
+				"ok": ok,
+				"value_before": {"status": "Open"},
+				"value_after": {"status": status},
+			}
+
+		_log(
+			self.yesterday,
+			entry_type="reason",
+			ticket=ticket,
+			actions=json.dumps(
+				[
+					update(ticket, "Closed"),
+					update(ticket, "Resolved"),
+					update(other, "Closed"),
+					update(ticket, "Open"),
+					update(ticket, "Closed", ok=False),
+					{**_action("set_classification"), "name": ticket},
+					{**_action("post_comment"), "name": ticket},
+				]
+			),
+		)
+
+		result = self._report()
+
+		self.assertEqual(
+			result["bot_actions"],
+			_bot_actions(**{"đóng": 2, "khác": 2, "phân loại": 1, "comment": 1, "trả lời": 0}),
+		)
+
+	def test_empty_day_zero_float(self):
+		result = self._report()
+
+		self.assertEqual(list(result["bot_actions"]), list(daily_report.BOT_ACTION_KINDS))
+		self.assertEqual(result["bot_actions"], _bot_actions())
+		self.assertEqual(result["cost_yesterday"], 0.0)
+		self.assertIsInstance(result["cost_yesterday"], float)
+
+	def test_unreadable_actions_and_non_classify_applied(self):
+		# an applied reason row is no classification
+		_log(self.yesterday, entry_type="reason", applied=1, actions="{}")
+		_log(self.yesterday, entry_type="reason", actions="null")
+		# entries that are not dicts, and an `ok` that is truthy but not True
+		_log(
+			self.yesterday,
+			entry_type="reason",
+			actions=json.dumps([1, "x", {"tool": "create_task", "ok": "yes"}]),
+		)
+
+		result = self._report()
+
+		self.assertEqual(result["bot_actions"], _bot_actions())

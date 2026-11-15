@@ -7,6 +7,7 @@ from decimal import Decimal
 from unittest.mock import patch
 
 import frappe
+from frappe.model.meta import load_meta
 from frappe.tests.utils import FrappeTestCase
 from helpdesk.test_utils import make_ticket
 
@@ -1710,8 +1711,12 @@ LIST_FIELDS = {
 	"Document Follow": ["name", "user"],
 	"Workflow Action": ["name", "workflow_state"],
 	"Reminder": ["name", "description"],
+	"Integration Request": ["name", "data"],
+	"Discussion Topic": ["name", "title"],
+	"Auto Repeat": ["name", "subject"],
+	"View Log": ["name", "viewed_by"],
 }
-# R10b, R10g, R11a: the dynamic pairs by which DocTypes outside TICKET_CONTENT_DOCTYPES name a ticket, with the column
+# R10b, R10g, R11a, R11d: the dynamic pairs by which DocTypes outside TICKET_CONTENT_DOCTYPES name a ticket, with the column
 # names of the installed DocType JSON, each pair tried alone: `{label: (doctype, type column, name column, column
 # holding the text)}`. Document Follow has no text column: its `user` column carries the text.
 LINKED_PAIRS = {
@@ -1727,6 +1732,12 @@ LINKED_PAIRS = {
 	"Document Follow": ("Document Follow", "ref_doctype", "ref_docname", "user"),
 	"Workflow Action": ("Workflow Action", "reference_doctype", "reference_name", "workflow_state"),
 	"Reminder": ("Reminder", "reminder_doctype", "reminder_docname", "description"),
+	# R11d: pairs read from the live schema, none listed in TICKET_LINK_FIELDS. View Log has no text column: its
+	# `viewed_by` column carries the text.
+	"Integration Request": ("Integration Request", "reference_doctype", "reference_docname", "data"),
+	"Discussion Topic": ("Discussion Topic", "reference_doctype", "reference_docname", "title"),
+	"Auto Repeat": ("Auto Repeat", "reference_doctype", "reference_document", "subject"),
+	"View Log": ("View Log", "reference_doctype", "reference_name", "viewed_by"),
 }
 # Closed to the record tools in every mode: a Deleted Document holds a whole deleted record (R10b); product code never
 # reads Version (ADR-024, R10e). `{doctype: (type column, name column, column holding the text)}` of a seeded row.
@@ -2063,7 +2074,8 @@ class TestExcludedTicketReads(_ExcludedTicketCase):
 
 	def test_rows_of_the_other_dynamic_link_doctypes_follow_the_ticket(self):
 		# R10b, R10g: a mention notification, an assignment, an activity and a queued email of a ticket, by every
-		# pair of their DocType; R11a: a tag, a follow, a workflow action and a reminder of a ticket.
+		# pair of their DocType; R11a: a tag, a follow, a workflow action and a reminder of a ticket; R11d: an
+		# integration request, a discussion topic, an auto repeat and a view log of a ticket, by the pair of the meta.
 		tickets = {"team": self.ticket("team", self.seed), "normal": self.ticket("normal", self.plain)}
 		made = {"team": {}, "normal": {}}
 		for label, (doctype, type_column, name_column, text_column) in LINKED_PAIRS.items():
@@ -2812,6 +2824,101 @@ class TestPermissionVectors(FrappeTestCase):
 					patch.object(site_api, "_write", return_value={"ok": True}) as write,
 				):
 					self.assertEqual(handler(arguments, context), {"ok": True})
+					write.assert_called_once()
+
+	def test_ticket_link_custom_field_takes_only_display_properties_in_both_modes(self):
+		# R11e: the R11b allowlist governs the Custom Field of a field that points at a ticket too: any other key whose
+		# value differs from the stored one is refused (`fetch_from` could rewrite the stored link on later saves). A
+		# Custom Field save runs ALTER TABLE: the write is stubbed.
+		field = self.ticket_link_field()
+		refused = {
+			"fetch_from": "project.ai_ticket",
+			"default": "1",
+			"hidden": 1,
+			"read_only": 1,
+			"reqd": 1,
+			"depends_on": "eval:0",
+		}
+		allowed = {"label": "SITEAPI nhãn", "description": "SITEAPI mô tả", "bold": 1}
+		normal = _context()
+		unrestricted = _context(level="L1", change_enabled=False, unrestricted=True)
+		for context in (normal, unrestricted):
+			for key, value in refused.items():
+				arguments = {"doctype": "Custom Field", "name": field, "values": {key: value}}
+				with (
+					self.subTest(key, unrestricted=context.unrestricted),
+					patch.object(site_api, "_write") as write,
+				):
+					result = self.run_tool("api_update_record", arguments, context)
+					self.assert_refused(result, TICKET_LINK_SCHEMA_REFUSAL, "Custom Field")
+					write.assert_not_called()
+			for key, value in allowed.items():
+				arguments = {"doctype": "Custom Field", "name": field, "values": {key: value}}
+				with (
+					self.subTest(key, unrestricted=context.unrestricted),
+					patch.object(site_api, "_write", return_value={"ok": True}) as write,
+				):
+					self.assertEqual(site_api.update_record(arguments, context), {"ok": True})
+					write.assert_called_once()
+
+	def test_stored_rename_of_a_ticket_link_field_stays_in_both_modes(self):
+		# R11f: a person renamed Task.ai_ticket by a Property Setter, and Frappe applies it, so the live meta knows the
+		# field by the setter's value only. The bot neither edits nor deletes that setter, nor sets another property on
+		# the old name. The setter is saved without hooks and the meta Frappe builds with it is a private copy
+		# (load_meta never caches); the write is stubbed, so no cache is touched.
+		renamed = "ai_ticket_siteapi"
+		rename = _db_insert(
+			{
+				"doctype": "Property Setter",
+				"name": f"{NOTE_TITLE} ai_ticket fieldname {uuid.uuid4().hex}",
+				"doctype_or_field": "DocField",
+				"doc_type": "Task",
+				"field_name": "ai_ticket",
+				"property": "fieldname",
+				"value": renamed,
+				"property_type": "Data",
+			}
+		)
+		meta = load_meta("Task")
+		real_get_meta = frappe.get_meta
+
+		def get_meta(doctype, *args, **kwargs):
+			return meta if doctype == "Task" else real_get_meta(doctype, *args, **kwargs)
+
+		def setter(field_name, prop):
+			values = {"doc_type": "Task", "field_name": field_name, "property": prop, "value": "1"}
+			return {"doctype": "Property Setter", "values": {"doctype_or_field": "DocField", **values}}
+
+		writes = {
+			"rename setter, new value": (
+				"api_update_record",
+				{"doctype": "Property Setter", "name": rename, "values": {"value": "ai_ticket_other"}},
+			),
+			"setter options on the old name": ("api_create_record", setter("ai_ticket", "options")),
+			"setter fieldtype on the new name": ("api_create_record", setter(renamed, "fieldtype")),
+		}
+		unrestricted_writes = {
+			"rename setter deleted": ("api_delete_record", {"doctype": "Property Setter", "name": rename}),
+		}
+		normal = _context()
+		unrestricted = _context(level="L1", change_enabled=False, unrestricted=True)
+		with patch.object(frappe, "get_meta", side_effect=get_meta):
+			self.assertEqual(policy.link_column_names("Task"), [renamed])
+			for context, calls in ((normal, writes), (unrestricted, {**writes, **unrestricted_writes})):
+				for label, (tool, arguments) in calls.items():
+					with (
+						self.subTest(label, unrestricted=context.unrestricted),
+						patch.object(site_api, "_write") as write,
+					):
+						result = self.run_tool(tool, arguments, context)
+						self.assert_refused(result, TICKET_LINK_SCHEMA_REFUSAL, "Property Setter")
+						write.assert_not_called()
+				# A display property on the renamed field still passes (R11b).
+				with (
+					self.subTest("label on the new name", unrestricted=context.unrestricted),
+					patch.object(site_api, "_write", return_value={"ok": True}) as write,
+				):
+					self.assertEqual(site_api.create_record(setter(renamed, "label"), context), {"ok": True})
 					write.assert_called_once()
 
 	def test_business_role_assignment_still_works(self):

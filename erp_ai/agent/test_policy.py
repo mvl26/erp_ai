@@ -6,6 +6,7 @@ from datetime import datetime, timedelta
 from unittest.mock import patch
 
 import frappe
+from frappe.model.meta import load_meta
 from frappe.tests.utils import FrappeTestCase
 from frappe.utils import now_datetime
 from helpdesk.test_utils import make_ticket
@@ -1265,6 +1266,66 @@ class TestExcludedQuery(FrappeTestCase):
 				policy.ticket_link_columns("Comment"),
 				(("reference_doctype", "reference_name"), (None, "custom_ticket")),
 			)
+
+	def test_link_columns_derived_from_the_live_schema(self):
+		# R11d: every (Link to DocType, Dynamic Link on it) pair of the live meta, none listed in TICKET_LINK_FIELDS;
+		# the column names of the installed DocType JSON.
+		for doctype, pair in (
+			("Integration Request", ("reference_doctype", "reference_docname")),
+			("Discussion Topic", ("reference_doctype", "reference_docname")),
+			("Auto Repeat", ("reference_doctype", "reference_document")),
+			("View Log", ("reference_doctype", "reference_name")),
+			("Event", ("reference_doctype", "reference_docname")),
+		):
+			with self.subTest(doctype=doctype):
+				self.assertNotIn(doctype, policy.TICKET_LINK_FIELDS)
+				self.assertEqual(policy.ticket_link_columns(doctype), (pair,))
+
+	def test_custom_dynamic_pair_is_picked_up(self):
+		# R11d: a (Link to DocType, Dynamic Link on it) pair a Custom Field adds is read from the live meta. Note's
+		# `title` and `content` columns stand in for the columns of that pair, in a private meta (load_meta never
+		# caches): a real Custom Field runs ALTER TABLE, which commits, and puts its meta into the shared cache.
+		set_agent_settings(excluded_teams=TEAM, excluded_title_prefixes="")
+		excluded = self._ticket(agent_group=TEAM)
+		normal = self._ticket()
+		on_excluded = self._row("Note", title="HD Ticket", content=excluded)
+		on_normal = self._row("Note", title="HD Ticket", content=normal)
+		meta = load_meta("Note")
+		meta.get_field("title").update({"fieldtype": "Link", "options": "DocType"})
+		meta.get_field("content").update({"fieldtype": "Dynamic Link", "options": "title"})
+		# Not pairs: a Dynamic Link on a Link to another DocType, and one on no field.
+		meta.fields.extend(
+			[
+				frappe._dict(fieldname="custom_party_type", fieldtype="Link", options="User"),
+				frappe._dict(fieldname="custom_party", fieldtype="Dynamic Link", options="custom_party_type"),
+				frappe._dict(fieldname="custom_orphan", fieldtype="Dynamic Link", options="no_such_field"),
+			]
+		)
+		real_get_meta = frappe.get_meta
+
+		def get_meta(doctype, *args, **kwargs):
+			return meta if doctype == "Note" else real_get_meta(doctype, *args, **kwargs)
+
+		with patch.object(frappe, "get_meta", side_effect=get_meta):
+			self.assertEqual(policy.ticket_link_columns("Note"), (("title", "content"),))
+			self.assertEqual(policy.link_column_names("Note"), ["title", "content"])
+			self.assertEqual(
+				policy.linked_tickets("Note", {"title": "HD Ticket", "content": excluded}), [excluded]
+			)
+			self.assertTrue(policy.is_ticket_record_excluded("Note", on_excluded))
+			self.assertFalse(policy.is_ticket_record_excluded("Note", on_normal))
+			filters, or_filters = policy.ticket_content_filters("Note")
+			self.assertEqual(filters, [])
+			self.assertEqual(or_filters[0], ["title", "not in", ["HD Ticket", "Comment", "Communication"]])
+			self.assertIn(excluded, or_filters[1][2])
+			# The exclusion is part of the query.
+			listed = frappe.get_list(
+				"Note",
+				filters=[["name", "in", [on_excluded, on_normal]], *filters],
+				or_filters=or_filters,
+				pluck="name",
+			)
+			self.assertEqual(listed, [on_normal])
 
 	def test_parent_link_fields(self):
 		# R10g: a Link to Comment or Communication, read from the live schema like a Link to HD Ticket.

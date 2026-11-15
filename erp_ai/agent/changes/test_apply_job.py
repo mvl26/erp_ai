@@ -2830,21 +2830,37 @@ class TestCommitCrossChecks(RealCoreReposUntouchedMixin, ApplyJobTestCase):
 			}
 		).insert(ignore_permissions=True).add_roles(ROLE_INSTRUCTOR)
 		ticket = str(make_ticket(subject="ERPAI-TEST T48 metadata", raised_by=PROPOSER).name)
+		# A `.py` file needs a restart command the tool does not take yet (design 3.2 step 4): a text file.
+		text_rel = "pkg/mod.txt"
+		self.sandbox.commit_file(APP, text_rel, BEFORE)
 		# The proposal comes from the propose tool, which writes its own ticket comment (design 3.8, 3.9).
 		frappe.set_user(PROPOSER)
 		result = execute_tool(
 			"propose_file_change",
-			{"path": FILE_PATH, "find": ["x = 1"], "replace": ["x = 2"], "reason": "sửa theo yêu cầu"},
+			{
+				"path": f"{APP}/{text_rel}",
+				"find": ["x = 1"],
+				"replace": ["x = 2"],
+				"reason": "sửa theo yêu cầu",
+			},
 			self.tool_context(ticket, "run-t48"),
 		)
 		frappe.set_user(ACTOR)
 		self.assertTrue(result["ok"], result)
 		name = result["proposal"]
 		self.assertEqual(frappe.db.get_value(PROPOSAL_DOCTYPE, name, "upstream_ref"), "origin/main")
+		# The tool makes a block proposal; undoing a block is T39, so the apply and undo run on a file
+		# proposal of the old form for the same file and content, on the same ticket.
+		legacy = self.code_proposal(
+			file_path=f"{APP}/{text_rel}",
+			ticket=ticket,
+			upstream_ref="origin/main",
+			reason="sửa theo yêu cầu",
+		)
 
-		self.apply_then_undo(name, actor=approver)
+		self.apply_then_undo(legacy, actor=approver)
 
-		state = self.state(name)
+		state = self.state(legacy)
 		commits = {"apply": state.apply_commit_sha, "undo": state.undo_commit_sha}
 		self.assertEqual(self.sandbox.git(APP, "rev-parse", "HEAD~1").strip(), commits["apply"])
 		self.assertEqual(self.head(), commits["undo"])
@@ -2861,7 +2877,7 @@ class TestCommitCrossChecks(RealCoreReposUntouchedMixin, ApplyJobTestCase):
 				for leak in (HOME_EMAIL, HOME_NAME, approver, APPROVER_NAME_EMAIL, "x-token-FAKE"):
 					self.assertNotIn(leak, meta)
 
-		doc = frappe.get_doc(PROPOSAL_DOCTYPE, name)
+		doc = frappe.get_doc(PROPOSAL_DOCTYPE, legacy)
 		doc.run_method("onload")
 		notes = json.dumps(doc.get("__onload"), ensure_ascii=False, default=str)
 		self.assertIn("origin/main", notes)
@@ -2877,7 +2893,7 @@ class TestCommitCrossChecks(RealCoreReposUntouchedMixin, ApplyJobTestCase):
 		comments = json.dumps(
 			frappe.get_all(
 				"Comment",
-				filters={"reference_name": ("in", [name, doc.ticket])},
+				filters={"reference_name": ("in", [name, legacy, doc.ticket])},
 				fields=["content", "subject"],
 			)
 			+ frappe.get_all(
@@ -2885,7 +2901,7 @@ class TestCommitCrossChecks(RealCoreReposUntouchedMixin, ApplyJobTestCase):
 			)
 			+ frappe.get_all(
 				LOG_DOCTYPE,
-				filters={"change_proposal": name},
+				filters={"change_proposal": ("in", [name, legacy])},
 				fields=["value_before", "value_after", "error"],
 			),
 			ensure_ascii=False,
@@ -2920,6 +2936,10 @@ class TestNoKeyLeak(ApplyJobTestCase):
 		frappe.set_user("Administrator")
 		ticket = str(make_ticket(subject="ERPAI-TEST T22 leak", raised_by=PROPOSER).name)
 		context = self.tool_context(ticket, "run-t22")
+		# A `.py` file needs a restart command the tool does not take yet (design 3.2 step 4): a text file.
+		text_rel = "pkg/mod.txt"
+		if not os.path.lexists(self.path(text_rel)):
+			self.sandbox.commit_file(APP, text_rel, BEFORE)
 		base = self.head()
 		calls = []
 		real_run = subprocess.run
@@ -2938,7 +2958,7 @@ class TestNoKeyLeak(ApplyJobTestCase):
 				execute_tool(
 					"propose_file_change",
 					{
-						"path": FILE_PATH,
+						"path": f"{APP}/{text_rel}",
 						"find": ["x = 1"],
 						"replace": ["x = 2"],
 						"reason": "sửa theo yêu cầu",
@@ -2952,17 +2972,25 @@ class TestNoKeyLeak(ApplyJobTestCase):
 			frappe.set_user(ACTOR)
 			self.assertEqual([result["ok"] for result in results], [True, True], results)
 			code, command = (result["proposal"] for result in results)
-			for name in (code, command):
+			# The tool makes a block proposal; undoing a block is T39, so the apply and undo run on a file
+			# proposal of the old form for the same file, content and branch (read by the tool), on the same ticket.
+			legacy = self.code_proposal(
+				file_path=f"{APP}/{text_rel}",
+				ticket=ticket,
+				reason="sửa theo yêu cầu",
+				target_branch=frappe.db.get_value(PROPOSAL_DOCTYPE, code, "target_branch"),
+			)
+			for name in (legacy, command):
 				transitions.approve(name, ACTOR)
 				apply_job.run_change(name, "apply")
-			transitions.request_undo(code, ACTOR)
-			apply_job.run_change(code, "undo")
+			transitions.request_undo(legacy, ACTOR)
+			apply_job.run_change(legacy, "undo")
 
-		names = [code, command]
+		names = [legacy, command]
 		self.assertEqual(
 			[self.state(name).change_status for name in names], [CHANGE_STATUS_UNDONE, CHANGE_STATUS_APPLIED]
 		)
-		proposals = [frappe.get_doc(PROPOSAL_DOCTYPE, name).as_dict() for name in names]
+		proposals = [frappe.get_doc(PROPOSAL_DOCTYPE, name).as_dict() for name in [*names, code]]
 		logs = frappe.get_all(LOG_DOCTYPE, filters={"change_proposal": ["in", names]}, fields=["*"])
 		comments = frappe.get_all(
 			"Comment", filters=authority.ticket_comment_filters(ticket), pluck="content"

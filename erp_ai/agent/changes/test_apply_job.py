@@ -287,7 +287,7 @@ class TestApplyCode(ApplyJobTestCase):
 	def test_switch_off_or_app_removed_fails_without_writing(self):
 		for settings, reason in (
 			({"code_change_enabled": 0}, "công tắc đang tắt"),
-			({"code_change_apps": "helpdesk"}, "app không có trong danh sách được sửa"),
+			({"code_change_apps": "helpdesk"}, f"mục 1 ({FILE_PATH}): app không có trong danh sách được sửa"),
 		):
 			set_agent_settings(code_change_enabled=1, code_change_apps=APP)
 			name = self.approved(self.code_proposal())
@@ -1330,7 +1330,7 @@ class TestRunChangeSkeleton(ApplyJobTestCase):
 			("switch off", None, switch_off, "công tắc đang tắt"),
 			("role lost", None, role_lost, "người duyệt không còn quyền"),
 			("digest edited", None, digest_edited, "nội dung đề xuất đã bị sửa sau khi duyệt"),
-			("app removed", None, app_removed, "app không có trong danh sách được sửa"),
+			("app removed", None, app_removed, f"mục 1 ({FILE_PATH}): app không có trong danh sách được sửa"),
 			("wrong session user", None, other_session_user, "sai người chạy job"),
 			(
 				"commit_message edited",
@@ -2505,7 +2505,7 @@ class TestApplyCommand(ApplyJobTestCase):
 		denied = ["--site", frappe.local.site, "execute", "frappe.db.truncate"]
 		for refresh_digest, reason in (
 			(False, "nội dung đề xuất đã bị sửa sau khi duyệt"),
-			(True, "lệnh không có trong danh sách cho phép"),
+			(True, "lệnh 1: lệnh không có trong danh sách cho phép"),
 		):
 			with self.subTest(refresh_digest=refresh_digest):
 				name = self.command_proposal(["--site", frappe.local.site, "migrate"])

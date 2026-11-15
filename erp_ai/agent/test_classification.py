@@ -3,7 +3,7 @@ import json
 import frappe
 from frappe.tests.utils import FrappeTestCase
 
-from erp_ai.agent import classification, prompts
+from erp_ai.agent import classification, policy, prompts
 from erp_ai.agent.prompts import DESCRIPTION_MAX_CHARS
 from erp_ai.constants import (
 	CATEGORIES,
@@ -180,6 +180,16 @@ class TestConfidencePct(FrappeTestCase):
 		for case, text in bad_inputs.items():
 			with self.subTest(case=case):
 				self.assertIsNone(classification.parse_classification(text), text)
+
+	def test_direct_build_is_unknown_and_below_any_threshold(self):
+		# design-w1-fixes-14.md Point 1: a direct build carries no pct, so it is unknown (None), never 0.
+		result = classification.Classification(category="A", confidence="Cao")
+		self.assertIsNone(result.confidence_pct)
+		self.assertTrue(
+			policy.is_below_confidence(
+				result.confidence_pct, classification.CONFIDENCE_PCT_MIN, has_instructor=False, act_now=False
+			)
+		)
 
 
 class TestMapping(FrappeTestCase):

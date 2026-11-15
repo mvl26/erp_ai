@@ -408,7 +408,7 @@ def _apply_code(proposal, actor: str, allowed_apps, deadline: float) -> None:
 		"""Design 4.3 step 3.6: `content_before` back (read-back hash = `base_hash`), or the new file removed
 		and unstaged when `git add` went through."""
 		if new_file:
-			file_writer.remove_created(full)
+			file_writer.remove_file(full)
 			return not added or not _failed(process_runner.git_unstage_new(repo, rel, source.GIT_TIMEOUT_S))
 		return file_writer.write_atomic(full, proposal.content_before, new_file=False) == proposal.base_hash
 
@@ -615,7 +615,7 @@ def _undo_code(proposal, actor: str, allowed_apps, deadline: float) -> None:
 		raise _Stop(CHANGE_STATUS_FAILED, reason)
 
 	if new_file:
-		file_writer.remove_created(full)
+		file_writer.remove_file(full)
 		if os.path.lexists(full):
 			raise _Stop(CHANGE_STATUS_FAILED, WRITE_MISMATCH)
 	elif file_writer.write_atomic(full, proposal.content_before, new_file=False) != proposal.base_hash:

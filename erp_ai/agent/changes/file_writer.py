@@ -8,17 +8,10 @@ from pathlib import PurePath
 
 from erp_ai.agent.tools import source
 
-PROPOSAL_FILE_MAX_BYTES = source.SEARCH_FILE_MAX_BYTES
 NEW_FILE_MODE = 0o644
 TEMP_PREFIX = ".erp_ai_"
 TEMP_SUFFIX = ".tmp"
-GIT_DIR_NAME = ".git"
 NEW_DIR_MODE = 0o755
-
-
-def _refuse_git_dir(full_path):
-	if GIT_DIR_NAME in PurePath(os.path.abspath(full_path)).parts:
-		raise ValueError("file_writer does not write inside .git")
 
 
 def _refuse_unless_canonical(full_path) -> None:
@@ -89,7 +82,9 @@ def sha256_of(full_path) -> str | None:
 
 def write_atomic(full_path, content: str, *, new_file: bool) -> str:
 	"""Write `content` as UTF-8 bytes via a temp file in the same directory; return the sha256 read back."""
-	_refuse_git_dir(full_path)
+	_refuse_unless_canonical(full_path)
+	if os.path.islink(full_path):
+		raise ValueError("file_writer does not write through a symlink")
 	data = content.encode("utf-8")
 	mode = NEW_FILE_MODE if new_file else stat.S_IMODE(os.stat(full_path).st_mode)
 	fd, temp_path = tempfile.mkstemp(dir=os.path.dirname(full_path), prefix=TEMP_PREFIX, suffix=TEMP_SUFFIX)
@@ -106,7 +101,9 @@ def write_atomic(full_path, content: str, *, new_file: bool) -> str:
 	return sha256_of(full_path)
 
 
-def remove_created(full_path) -> None:
-	"""Remove a file the proposal created (undo, or giving back a new file after a failed commit)."""
-	_refuse_git_dir(full_path)
+def remove_file(full_path) -> None:
+	"""Remove one regular file (Delete, undo, or giving back a created file); never a symlink or a directory."""
+	_refuse_unless_canonical(full_path)
+	if os.path.islink(full_path) or not os.path.isfile(full_path):
+		raise ValueError("file_writer removes only a regular file")
 	os.remove(full_path)

@@ -949,7 +949,7 @@ class TestCommitFailure(ApplyJobTestCase):
 				with (
 					patch.object(process_runner, "git_commit_only", side_effect=commit_then_report_failure),
 					patch.object(file_writer, "write_atomic", wraps=file_writer.write_atomic) as writes,
-					patch.object(file_writer, "remove_created", wraps=file_writer.remove_created) as removes,
+					patch.object(file_writer, "remove_file", wraps=file_writer.remove_file) as removes,
 				):
 					apply_job.run_change(name, "apply")
 
@@ -1192,7 +1192,7 @@ class TestCommitFailure(ApplyJobTestCase):
 					patch.object(process_runner, "git_commit_only", return_value=self.failed()),
 					patch.object(source, "git_head", return_value=None),
 					patch.object(file_writer, "write_atomic", wraps=file_writer.write_atomic) as writes,
-					patch.object(file_writer, "remove_created", wraps=file_writer.remove_created) as removes,
+					patch.object(file_writer, "remove_file", wraps=file_writer.remove_file) as removes,
 					patch.object(
 						process_runner, "git_unstage_new", wraps=process_runner.git_unstage_new
 					) as unstage,
@@ -1228,7 +1228,7 @@ class TestCommitFailure(ApplyJobTestCase):
 					patch.object(process_runner, "git_commit_only", side_effect=commit_then_report_failure),
 					patch.object(source, "git_commit_summary", side_effect=RuntimeError("không đọc được")),
 					patch.object(file_writer, "write_atomic", wraps=file_writer.write_atomic) as writes,
-					patch.object(file_writer, "remove_created", wraps=file_writer.remove_created) as removes,
+					patch.object(file_writer, "remove_file", wraps=file_writer.remove_file) as removes,
 				):
 					apply_job.run_change(name, "apply")
 
@@ -1685,7 +1685,7 @@ class TestUndoCode(ApplyJobTestCase):
 		name, apply_commit = self.undo_requested("new file")
 		count = self.commit_count()
 
-		with patch.object(file_writer, "remove_created") as remove:
+		with patch.object(file_writer, "remove_file") as remove:
 			apply_job.run_change(name, "undo")
 
 		remove.assert_called_once_with(self.path(NEW_REL))
@@ -1986,7 +1986,7 @@ class TestUndoCode(ApplyJobTestCase):
 		"""Spies on every file write and removal and on the undo commit."""
 		return (
 			patch.object(file_writer, "write_atomic", wraps=file_writer.write_atomic),
-			patch.object(file_writer, "remove_created", wraps=file_writer.remove_created),
+			patch.object(file_writer, "remove_file", wraps=file_writer.remove_file),
 			patch.object(process_runner, "git_commit_only", wraps=process_runner.git_commit_only),
 		)
 

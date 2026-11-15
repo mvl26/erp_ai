@@ -2696,8 +2696,8 @@ def check_fs_writes_only_in_file_writer(sources: dict) -> list:
 
 FILE_WRITER_CANONICAL_CHECK = "_refuse_unless_canonical"
 FILE_WRITER_SECOND_RESOLVER_CALLS = ("realpath", "commonpath", "is_relative_to", "readlink")
-FILE_WRITER_RECHECKERS = ("make_parents", "remove_empty_dirs")  # T6 adds "write_atomic", "remove_file"
-FILE_WRITER_RECHECKS_ALL = False  # condition 4 of the rule; T6 sets True, T49 deletes the flag
+FILE_WRITER_RECHECKERS = ("make_parents", "remove_empty_dirs", "write_atomic", "remove_file")
+FILE_WRITER_RECHECKS_ALL = True  # condition 4 of the rule; T49 deletes the flag
 FILE_WRITER_FS_CALLS = frozenset(
 	{"os.mkdir", "os.rmdir", "os.remove", "os.unlink", "os.replace", "os.rename", "tempfile.mkstemp"}
 )
@@ -7544,9 +7544,12 @@ class TestScannersCatchViolations(unittest.TestCase):
 			"\t\traise ValueError(full)\n"
 		)
 		writer = (
-			"import os\nfrom erp_ai.agent.tools import source\n\n{canonical}\n"
+			"import os\nimport tempfile\nfrom erp_ai.agent.tools import source\n\n{canonical}\n"
 			"def make_parents(full_path, app_dir):\n\t{make}\n\tos.mkdir(full_path)\n\n"
-			"def remove_empty_dirs(dirs):\n\tfor d in dirs:\n\t\t_refuse_unless_canonical(d)\n\t\t{remove}\n"
+			"def remove_empty_dirs(dirs):\n\tfor d in dirs:\n\t\t_refuse_unless_canonical(d)\n\t\t{remove}\n\n"
+			"def write_atomic(full_path, content):\n\t_refuse_unless_canonical(full_path)\n"
+			"\tfd, temp = tempfile.mkstemp(dir=os.path.dirname(full_path))\n\tos.replace(temp, full_path)\n\n"
+			"def remove_file(full_path):\n\t_refuse_unless_canonical(full_path)\n\tos.remove(full_path)\n"
 		)
 		recheck = "_refuse_unless_canonical(full_path)"
 		good = {"canonical": canonical, "make": recheck, "remove": "os.rmdir(d)"}
@@ -7618,14 +7621,9 @@ class TestScannersCatchViolations(unittest.TestCase):
 		self.assertCaught(check_file_writer_rechecks_through_resolver({}), FILE_WRITER_FILE)
 		# Condition 4 (on from T6): a file-system function outside FILE_WRITER_RECHECKERS is caught.
 		renamer = writer.format(**good) + "\ndef rename_file(a, b):\n\tos.replace(a, b)\n"
-		self.assertEqual(check_file_writer_rechecks_through_resolver({FILE_WRITER_FILE: renamer}), [])
-		with patch(f"{__name__}.FILE_WRITER_RECHECKS_ALL", True):
-			self.assertCaught(
-				check_file_writer_rechecks_through_resolver({FILE_WRITER_FILE: renamer}), "rename_file"
-			)
-			self.assertEqual(
-				check_file_writer_rechecks_through_resolver({FILE_WRITER_FILE: writer.format(**good)}), []
-			)
+		self.assertCaught(
+			check_file_writer_rechecks_through_resolver({FILE_WRITER_FILE: renamer}), "rename_file"
+		)
 		# The ADR-011 name rule still catches the old name in this file: the new rule does not loosen it.
 		old_name = {
 			CHANGE_GUARD_FILE: "from erp_ai.agent.tools import source\n\ndef check_write_path(rel):\n"
@@ -7636,8 +7634,10 @@ class TestScannersCatchViolations(unittest.TestCase):
 		self.assertCaught(
 			check_change_guard_uses_resolve_safe_path(old_name), FILE_WRITER_FILE, "second path resolver"
 		)
-		self.assertFalse(FILE_WRITER_RECHECKS_ALL)
-		self.assertEqual(FILE_WRITER_RECHECKERS, ("make_parents", "remove_empty_dirs"))
+		self.assertTrue(FILE_WRITER_RECHECKS_ALL)
+		self.assertEqual(
+			FILE_WRITER_RECHECKERS, ("make_parents", "remove_empty_dirs", "write_atomic", "remove_file")
+		)
 
 	def test_changes_set_user_or_publish_caught(self):
 		cases = {

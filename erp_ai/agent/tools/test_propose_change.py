@@ -12,6 +12,7 @@ from frappe.model.rename_doc import rename_doc
 from frappe.tests.utils import FrappeTestCase
 from helpdesk.test_utils import create_agent, make_ticket
 
+from erp_ai import constants
 from erp_ai.agent import authority, change_link
 from erp_ai.agent.agent_write_guard import AGENT_WRITE_FLAG
 from erp_ai.agent.changes import process_runner, transitions
@@ -21,6 +22,8 @@ from erp_ai.constants import (
 	AGENT_USER,
 	CHANGE_KIND_CODE,
 	CHANGE_KIND_COMMAND,
+	CHANGE_MAX_COMMANDS,
+	CHANGE_MAX_FILE_OPS,
 	CHANGE_OP_CREATE,
 	CHANGE_STATUS_APPLIED,
 	CHANGE_STATUS_APPROVED,
@@ -245,7 +248,7 @@ class TestProposeChange(FrappeTestCase):
 			)
 
 	def test_edit_errors_create_nothing(self):
-		shape = "find và replace phải cùng số phần tử, từ 1 đến 10"
+		shape = "find và replace phải cùng số phần tử, ít nhất 1"
 		no_change = "nội dung sau trùng nội dung trước"
 		cases = (
 			(["không có"], ["x"], "đoạn find[0] không có trong file"),
@@ -267,10 +270,10 @@ class TestProposeChange(FrappeTestCase):
 				)
 		# shapes the schema refuses before the handler runs
 		for find, replace, key in (
-			(["x = 1"] * 11, ["x = 2"] * 11, "find"),
+			("x = 1", ["x = 2"], "find"),
 			([""], ["x"], "find"),
 			([1], ["x"], "find"),
-			(["x = 1"], ["x" * 20001], "replace"),
+			(["x = 1"], [1], "replace"),
 		):
 			with self.subTest(key=key, find=find[:1]):
 				refused = self.change(find, replace)
@@ -452,15 +455,8 @@ class TestProposeChange(FrappeTestCase):
 					self.assertFalse([w for w in operation_words if w in word.lower()])
 		(new_file,) = [spec for spec in propose_change.TOOLS if spec.name == "propose_new_file"]
 		content = new_file.schema["input_schema"]["properties"]["content"]
-		self.assertEqual((content["minLength"], content["maxLength"]), (1, 20000))
+		self.assertEqual((content.get("minLength"), content.get("maxLength")), (None, None))
 		self.assertEqual(new_file.schema["input_schema"]["properties"]["path"]["minLength"], 1)
-		# an empty file is the closest a new-file proposal gets to a delete: the schema refuses it
-		for text in ("", "x" * 20001):
-			with self.subTest(length=len(text)):
-				self.assertEqual(
-					self.new_file(content=text), {"ok": False, "reason": "tham số không hợp lệ: content"}
-				)
-		self.assert_nothing_created()
 
 	def test_bench_command_proposal_and_its_refusals(self):
 		result = self.run_tool(
@@ -1144,7 +1140,7 @@ class TestProposeBlock(FrappeTestCase):
 				result = self.create(f"{APP}/pkg/{name}", content)
 				self.assertTrue(result["ok"], result)
 				self.assertEqual(self.stored(result).operations[0].content_after or "", content)
-		# empty content is allowed by the handler; the schema keeps minLength 1 until T29
+		# empty content is allowed by the handler too (the schema path: test_new_file_20001_chars_accepted)
 		arguments = {"path": f"{APP}/pkg/empty.md", "content": "", "reason": "r"}
 		empty = propose_change.propose_new_file(arguments, self.context())
 		self.assertTrue(empty["ok"], empty)
@@ -1539,6 +1535,80 @@ class TestProposeBlock(FrappeTestCase):
 				doc = self.stored(result)
 				self.assertEqual((json.loads(doc.command_list), doc.reversible), ([["restart"]], 0))
 		self.assertEqual(len(self.proposals()), 2)
+
+	def test_new_file_20001_chars_accepted(self):
+		# design 3.1 / 2.5: `content` has no minLength / maxLength (AC-43 case 1); empty is `__init__.py`
+		for content in ("x" * 20001 + "\n", ""):
+			with self.subTest(length=len(content)):
+				path = f"{APP}/pkg/big_{len(content)}.txt"
+				result = self.run_tool("propose_new_file", {"path": path, "content": content, "reason": "r"})
+				self.assertTrue(result["ok"], result)
+				self.assertEqual(self.stored(result).operations[0].content_after or "", content)
+		self.assertEqual(len(self.proposals()), 2)
+
+	def test_edit_with_11_replacements_accepted(self):
+		# design 3.1: no limit on the number of edits in one item (AC-43 case 2), in both call shapes
+		before = "".join(f"v{i} = {i}\n" for i in range(11))
+		find = [f"v{i} = {i}" for i in range(11)]
+		replace = [f"v{i} = {i + 100}" for i in range(11)]
+		after = "".join(f"v{i} = {i + 100}\n" for i in range(11))
+		shapes = {
+			"changes": lambda path: {
+				"changes": [{"action": "edit", "path": path, "find": find, "replace": replace}],
+				"reason": "r",
+			},
+			"legacy edit": lambda path: {"path": path, "find": find, "replace": replace, "reason": "r"},
+		}
+		for number, (shape, arguments) in enumerate(shapes.items()):
+			with self.subTest(shape=shape):
+				self.sandbox.commit_file(APP, f"pkg/many_{number}.txt", before)
+				result = self.run_tool("propose_file_change", arguments(f"{APP}/pkg/many_{number}.txt"))
+				self.assertTrue(result["ok"], result)
+				self.assertEqual(self.stored(result).operations[0].content_after, after)
+
+	def test_schema_matches_design_table(self):
+		schemas = {spec.name: spec.schema["input_schema"] for spec in propose_change.TOOLS}
+		self.assertEqual(list(schemas), TOOL_NAMES)
+		change, new_file, bench = (schemas[name] for name in TOOL_NAMES)
+		self.assertEqual(
+			(change["required"], new_file["required"], bench["required"]),
+			(["reason"], ["path", "content", "reason"], ["command", "reason"]),
+		)
+		changes = change["properties"]["changes"]
+		self.assertEqual((changes.get("minItems"), changes.get("maxItems")), (1, CHANGE_MAX_FILE_OPS))
+		for commands in (change["properties"]["commands"], new_file["properties"]["commands"]):
+			self.assertEqual(
+				(commands.get("minItems"), commands.get("maxItems")), (None, CHANGE_MAX_COMMANDS)
+			)
+		for key in ("find", "replace"):
+			array = change["properties"][key]
+			with self.subTest(key=key):
+				self.assertEqual((array.get("maxItems"), array["items"].get("maxLength")), (None, None))
+		content = new_file["properties"]["content"]
+		self.assertEqual((content.get("minLength"), content.get("maxLength")), (None, None))
+		self.assertIn(change_guard.RESTART_COMMAND, bench["properties"]["command"]["enum"])
+		self.assertEqual(propose_change.EDIT_SHAPE, "find và replace phải cùng số phần tử, ít nhất 1")
+		self.assertEqual(
+			[hasattr(constants, name) for name in ("PROPOSAL_TEXT_MAX_CHARS", "REPLACE_MAX_ITEMS")],
+			[False, False],
+		)
+		# the registry checks maxItems before the handler (51 items, 7 commands); it does not check
+		# minItems, so an empty block reaches check_block and gets BLOCK_EMPTY
+		self.assertEqual(
+			self.run_tool("propose_file_change", {"changes": [], "reason": "r"}),
+			{"ok": False, "reason": change_guard.BLOCK_EMPTY},
+		)
+		item = {"action": "delete", "path": f"{APP}/pkg/a.txt"}
+		for arguments, key in (
+			({"changes": [item] * (CHANGE_MAX_FILE_OPS + 1), "reason": "r"}, "changes"),
+			({"changes": [item], "commands": [{"command": "version"}] * 7, "reason": "r"}, "commands"),
+		):
+			with self.subTest(key=key, size=len(arguments[key])):
+				self.assertEqual(
+					self.run_tool("propose_file_change", arguments),
+					{"ok": False, "reason": f"tham số không hợp lệ: {key}"},
+				)
+		self.assertEqual(len(self.proposals()), 0)
 
 	def test_denied_command_refused_names_command(self):
 		self.sandbox.commit_file(APP, "pkg/a.txt", "a\n")

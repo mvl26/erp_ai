@@ -17,14 +17,13 @@ from erp_ai.agent.tools.registry import _invalid as registry_invalid  # design-a
 from erp_ai.constants import (
 	CHANGE_KIND_CODE,
 	CHANGE_KIND_COMMAND,
+	CHANGE_MAX_COMMANDS,
 	CHANGE_MAX_FILE_OPS,
 	CHANGE_OP_CREATE,
 	CHANGE_OP_DELETE,
 	CHANGE_OP_EDIT,
 	CHANGE_OP_RENAME,
 	PROPOSAL_DOCTYPE,
-	PROPOSAL_TEXT_MAX_CHARS,
-	REPLACE_MAX_ITEMS,
 )
 
 GROUP = "change_propose"
@@ -41,7 +40,7 @@ NO_PERMISSION = "thiếu quyền tạo đề xuất"
 NO_COMMENT_PERMISSION = "thiếu quyền tạo comment"
 NOT_FOUND = "file không tồn tại"
 NOT_UTF8 = source.TEXT_NOT_UTF8
-EDIT_SHAPE = f"find và replace phải cùng số phần tử, từ 1 đến {REPLACE_MAX_ITEMS}"
+EDIT_SHAPE = "find và replace phải cùng số phần tử, ít nhất 1"
 EDIT_NOT_FOUND = "đoạn find[{index}] không có trong file"
 EDIT_AMBIGUOUS = "đoạn find[{index}] xuất hiện nhiều hơn một lần"
 EDIT_OVERLAP = "các đoạn find chồng nhau"
@@ -82,7 +81,7 @@ def _entry_refusal(ctx: ToolContext) -> dict | None:
 def _apply_edits(text: str, find: list, replace: list) -> tuple[str | None, str | None]:
 	"""Replace each find[i] (exactly once in `text`, spans not overlapping) by replace[i], by position
 	on the original text (design 3.1); (new text, None) or (None, refusal reason)."""
-	if len(find) != len(replace) or not 1 <= len(find) <= REPLACE_MAX_ITEMS:
+	if len(find) != len(replace) or not find:
 		return None, EDIT_SHAPE
 	spans = []
 	for index, needle in enumerate(find):
@@ -436,13 +435,14 @@ def propose_bench_command(args: dict, ctx: ToolContext) -> dict:
 
 _PATH = {"type": "string", "minLength": 1, "maxLength": PATH_MAX_CHARS}
 _REASON = {"type": "string", "minLength": 1, "maxLength": REASON_MAX_CHARS}
-_FIND_ITEM = {"type": "string", "minLength": 1, "maxLength": PROPOSAL_TEXT_MAX_CHARS}
-_REPLACE_ITEM = {"type": "string", "maxLength": PROPOSAL_TEXT_MAX_CHARS}
+_FIND_ITEM = {"type": "string", "minLength": 1}
+_REPLACE_ITEM = {"type": "string"}
 _APP = {"type": "string", "minLength": 1, "maxLength": APP_MAX_CHARS}
 _COMMAND = {"type": "string", "enum": list(change_guard.BENCH_COMMANDS)}
 # CHG-002 design 3.1: the bench commands run after the files, in order.
 _COMMANDS = {
 	"type": "array",
+	"maxItems": CHANGE_MAX_COMMANDS,
 	"items": {"type": "object", "properties": {"command": _COMMAND, "app": _APP}, "required": ["command"]},
 }
 # CHG-002 design 3.1: one item of `changes`.
@@ -452,8 +452,8 @@ _CHANGE_ITEM = {
 		"action": {"type": "string", "enum": ["edit", "create", "delete", "rename"]},
 		"path": _PATH,
 		"new_path": _PATH,
-		"find": {"type": "array", "items": {"type": "string", "minLength": 1}},
-		"replace": {"type": "array", "items": {"type": "string"}},
+		"find": {"type": "array", "items": _FIND_ITEM},
+		"replace": {"type": "array", "items": _REPLACE_ITEM},
 		"content": {"type": "string"},
 	},
 	"required": ["action", "path"],
@@ -475,10 +475,15 @@ TOOLS: list[ToolSpec] = [
 			"input_schema": {
 				"type": "object",
 				"properties": {
-					"changes": {"type": "array", "maxItems": CHANGE_MAX_FILE_OPS, "items": _CHANGE_ITEM},
+					"changes": {
+						"type": "array",
+						"minItems": 1,
+						"maxItems": CHANGE_MAX_FILE_OPS,
+						"items": _CHANGE_ITEM,
+					},
 					"path": _PATH,
-					"find": {"type": "array", "maxItems": REPLACE_MAX_ITEMS, "items": _FIND_ITEM},
-					"replace": {"type": "array", "maxItems": REPLACE_MAX_ITEMS, "items": _REPLACE_ITEM},
+					"find": {"type": "array", "items": _FIND_ITEM},
+					"replace": {"type": "array", "items": _REPLACE_ITEM},
 					"commands": _COMMANDS,
 					"reason": _REASON,
 				},
@@ -500,7 +505,7 @@ TOOLS: list[ToolSpec] = [
 				"type": "object",
 				"properties": {
 					"path": _PATH,
-					"content": {"type": "string", "minLength": 1, "maxLength": PROPOSAL_TEXT_MAX_CHARS},
+					"content": {"type": "string"},
 					"commands": _COMMANDS,
 					"reason": _REASON,
 				},

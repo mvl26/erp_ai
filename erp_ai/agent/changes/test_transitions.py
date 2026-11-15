@@ -7,6 +7,7 @@ from unittest.mock import Mock, patch
 import frappe
 from frappe.tests.utils import FrappeTestCase
 
+from erp_ai import constants
 from erp_ai.agent.changes import transitions
 from erp_ai.agent.changes.process_runner import CommandResult
 from erp_ai.constants import (
@@ -30,8 +31,6 @@ from erp_ai.constants import (
 	JOB_TIMEOUT_S,
 	LOG_DOCTYPE,
 	PROPOSAL_DOCTYPE,
-	PROPOSAL_TEXT_MAX_CHARS,
-	REPLACE_MAX_ITEMS,
 	RESTART_STATUS_CONFIRMED,
 	RESTART_STATUS_LAUNCH_FAILED,
 	RESTART_STATUS_SENT,
@@ -141,7 +140,11 @@ class TestChangeConstants(FrappeTestCase):
 		self.assertEqual(CHANGE_STEPS, ("propose", "approve", "reject", "apply", "fail", "stale", "undo"))
 		self.assertEqual(TRIGGER_CHANGE_ACTION, "change_action")
 		self.assertEqual(TITLE_CHANGE_FAILED, "erp_ai: áp dụng thay đổi lỗi")
-		self.assertEqual((PROPOSAL_TEXT_MAX_CHARS, REPLACE_MAX_ITEMS), (20000, 10))
+		# CHG-002 design 2.5 deletes the two old proposal limits
+		self.assertEqual(
+			[hasattr(constants, name) for name in ("PROPOSAL_TEXT_MAX_CHARS", "REPLACE_MAX_ITEMS")],
+			[False, False],
+		)
 
 	def test_command_timeout_is_job_timeout_minus_margin(self):
 		self.assertEqual(COMMAND_TIMEOUT_S, JOB_TIMEOUT_S - JOB_SAFETY_MARGIN_S)

@@ -284,35 +284,93 @@ class TestMissedScan(FrappeTestCase):
 			missed_scan.scan_missed_tickets(NOW)
 		return log_error, logger
 
-	def _assert_one_constant_title_error(self, log_error, tickets):
+	def _assert_one_constant_title_error(self, log_error, tickets, message="missed_scan error=RuntimeError"):
 		"""D-17: exactly one log_error, constant title, message names only the exception type (no ticket data)."""
-		self.assertEqual(
-			log_error.call_args_list,
-			[unittest_call(TITLE_RUN_FAILED, "missed_scan error=RuntimeError")],
-		)
+		self.assertEqual(log_error.call_args_list, [unittest_call(TITLE_RUN_FAILED, message)])
 		logged = " ".join(str(arg) for arg in log_error.call_args.args)
 		self.assertNotIn(SECRET_TEXT, logged)
 		for ticket in tickets:
 			self.assertNotIn(ticket, logged)
 
-	def test_enqueue_error_logged_once_and_swallowed(self):
-		"""D-17 error path: enqueue raising on the second ticket ends the run with one log_error and one logger line."""
+	def test_ticket_that_always_raises_does_not_starve_newer_ones(self):
+		"""AC-16 (design-w1-fixes-17 Điểm 2): a predicate error on the oldest ticket skips only that ticket."""
+		tickets = [self._ticket(creation=OLD_ENOUGH + timedelta(seconds=second)) for second in range(3)]
+		real_can_send = policy.can_send_ticket
+
+		def can_send_ticket(name):
+			if name == tickets[0]:
+				raise RuntimeError(SECRET_TEXT)
+			return real_can_send(name)
+
+		self._enable_agent()
+		with (
+			patch.object(policy, "can_send_ticket", side_effect=can_send_ticket),
+			patch.object(queue, "enqueue_agent_run", wraps=queue.enqueue_agent_run) as enqueue_agent_run,
+			patch("frappe.enqueue"),
+			patch.object(missed_scan.frappe, "log_error") as log_error,
+			patch.object(missed_scan.frappe, "logger") as logger,
+		):
+			missed_scan.scan_missed_tickets(NOW)
+
+		self.assertEqual([queued.args[0] for queued in enqueue_agent_run.call_args_list], tickets[1:])
+		self._assert_one_constant_title_error(
+			log_error, tickets, message="missed_scan failed=1 error=RuntimeError"
+		)
+		self.assertEqual(
+			logger.return_value.method_calls,
+			[unittest_call.error("missed_scan: lỗi %s ở %s phiếu, đã xếp %s phiếu", "RuntimeError", 1, 2)],
+		)
+
+	def test_enqueue_error_on_one_ticket_still_queues_the_rest(self):
+		"""An enqueue error on the second ticket does not stop the run: the third is still queued (D-17 one line)."""
 		tickets = [self._ticket(creation=OLD_ENOUGH + timedelta(seconds=second)) for second in range(3)]
 		log_error, logger = self._scan_with_error(
 			queue, "enqueue_agent_run", [True, RuntimeError(SECRET_TEXT), True]
 		)
-		self._assert_one_constant_title_error(log_error, tickets)
+		self._assert_one_constant_title_error(
+			log_error, tickets, message="missed_scan failed=1 error=RuntimeError"
+		)
 		self.assertEqual(
 			logger.return_value.method_calls,
-			[unittest_call.error("missed_scan: lỗi %s, đã xếp %s phiếu", "RuntimeError", 1)],
+			[unittest_call.error("missed_scan: lỗi %s ở %s phiếu, đã xếp %s phiếu", "RuntimeError", 1, 2)],
 		)
 
-	def test_policy_error_logged_once_and_swallowed(self):
-		"""D-17 error path: can_send_ticket raising stops the run before any job, one log_error, one logger line."""
+	def test_per_ticket_failures_stop_at_the_cap(self):
+		"""D-16: per-ticket errors stop the run once SCAN_MAX_FAILURES is reached."""
+		tickets = [self._ticket(creation=OLD_ENOUGH + timedelta(seconds=second)) for second in range(3)]
+		self._enable_agent()
+		with (
+			patch.object(missed_scan, "SCAN_MAX_FAILURES", 2, create=True),
+			patch.object(policy, "can_send_ticket", side_effect=RuntimeError(SECRET_TEXT)) as can_send,
+			patch("frappe.enqueue"),
+			patch.object(missed_scan.frappe, "log_error") as log_error,
+			patch.object(missed_scan.frappe, "logger") as logger,
+		):
+			missed_scan.scan_missed_tickets(NOW)
+
+		self.assertEqual(can_send.call_count, 2)
+		self._assert_one_constant_title_error(
+			log_error, tickets, message="missed_scan failed=2 error=RuntimeError"
+		)
+		self.assertEqual(
+			logger.return_value.method_calls,
+			[unittest_call.error("missed_scan: lỗi %s ở %s phiếu, đã xếp %s phiếu", "RuntimeError", 2, 0)],
+		)
+		self.assertEqual(getattr(missed_scan, "SCAN_MAX_FAILURES", None), missed_scan.SCAN_BATCH)
+
+	def test_run_level_error_logged_once_and_swallowed(self):
+		"""D-17 run-level error path (unchanged from T34): one log_error, one logger line, no exception escapes."""
 		tickets = [self._ticket(creation=OLD_ENOUGH + timedelta(seconds=second)) for second in range(2)]
-		log_error, logger = self._scan_with_error(policy, "can_send_ticket", RuntimeError(SECRET_TEXT))
+		log_error, logger = self._scan_with_error(policy, "is_enabled", RuntimeError(SECRET_TEXT))
 		self._assert_one_constant_title_error(log_error, tickets)
 		self.assertEqual(
 			logger.return_value.method_calls,
 			[unittest_call.error("missed_scan: lỗi %s, đã xếp %s phiếu", "RuntimeError", 0)],
 		)
+
+	def test_find_without_failures_list_still_raises(self):
+		"""Called without `failures`, find_missed_tickets lets a predicate error escape as before (T33)."""
+		self._ticket()
+		with patch.object(policy, "can_send_ticket", side_effect=RuntimeError(SECRET_TEXT)):
+			with self.assertRaises(RuntimeError):
+				missed_scan.find_missed_tickets(NOW)

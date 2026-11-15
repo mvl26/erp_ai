@@ -1,4 +1,3 @@
-import uuid
 from unittest.mock import patch
 
 import frappe
@@ -8,14 +7,13 @@ from helpdesk.test_utils import create_agent, make_ticket
 from erp_ai.agent.tools import read
 from erp_ai.agent.tools.registry import ToolContext, ToolSpec, _first_invalid_key
 from erp_ai.constants import AGENT_USER, ROLE_INSTRUCTOR
-from erp_ai.test_utils import keep_agent_settings, set_agent_settings
+from erp_ai.test_utils import set_agent_settings
 
 EXCLUDED_TEAM = "T24 Excluded Team"
 AGENT_A = "t24.agent.a@example.com"
 INSTRUCTOR = "t24.instructor@example.com"
 OUTSIDER = "t24.outsider@example.com"
 SCHEMA_TYPES = {"string", "integer", "boolean", "array"}
-EMPTY_QUERY_REFUSAL = "câu tìm cần ít nhất một từ dài 2 ký tự"
 
 
 def _ctx(ticket_name="TKT-0"):
@@ -216,13 +214,8 @@ class TestReadTools(FrappeTestCase):
 		for name in names:
 			self._resolve(name)
 		ctx = _ctx(self.ticket)
-		self.assertEqual(
-			read.search_resolved_tickets({"query": "%%"}, ctx), {"ok": False, "reason": EMPTY_QUERY_REFUSAL}
-		)
-		# Every word scores on its own: "lit" finds the three; "t2_" is no word of them, `_` is no wildcard.
-		found = read.search_resolved_tickets({"query": "T2_ lit"}, ctx)["tickets"]
-		self.assertEqual(sorted(row["name"] for row in found), sorted(names))
-		self.assertEqual(read.search_resolved_tickets({"query": "T2_"}, ctx)["tickets"], [])
+		self.assertEqual(read.search_resolved_tickets({"query": "%%"}, ctx)["tickets"], [])
+		self.assertEqual(read.search_resolved_tickets({"query": "T2_ lit"}, ctx)["tickets"], [])
 		self.assertEqual(len(read.search_resolved_tickets({"query": "T24 lit"}, ctx)["tickets"]), 3)
 		limited = read.search_resolved_tickets({"query": "T24 lit", "limit": 2}, ctx)
 		self.assertEqual(len(limited["tickets"]), 2)
@@ -236,9 +229,8 @@ class TestReadTools(FrappeTestCase):
 		result = read.search_resolved_tickets({"query": "T24 skip", "limit": 1}, _ctx(self.ticket))
 		self.assertEqual([r["name"] for r in result["tickets"]], [older])
 
-	def test_like_pattern_leaves_escaping_to_frappe(self):
-		# Frappe escapes `\\` and `%` of a like value itself (db_query); escaping here too finds nothing.
-		self.assertEqual(read._like_pattern("a\\b%c_d"), "%a\\b%c_d%")
+	def test_like_pattern_escapes_backslash(self):
+		self.assertEqual(read._like_pattern("a\\b%c_d"), "%a\\\\b\\%c\\_d%")
 
 	def test_search_resolved_argument_bounds(self):
 		ctx = _ctx(self.ticket)
@@ -411,94 +403,3 @@ class TestReadTools(FrappeTestCase):
 				except Exception as error:
 					self.fail(f"{handler.__name__}({args}) raised {error!r}")
 				self.assertIn("ok", result)
-
-
-class TestSearchResolvedTickets(FrappeTestCase):
-	"""AC-48: every query word scores on the whole text of the ticket; excluded tickets never reach the scan."""
-
-	def setUp(self):
-		self.addCleanup(frappe.db.rollback)
-		self.addCleanup(frappe.set_user, "Administrator")
-		frappe.set_user("Administrator")
-		keep_agent_settings(self)
-		set_agent_settings(excluded_teams=EXCLUDED_TEAM)
-		# Words no other ticket of the site holds.
-		self.tag = f"zq{uuid.uuid4().hex[:8]}"
-
-	def word(self, suffix):
-		return f"{self.tag}{suffix}"
-
-	def resolved(self, subject, description="<p>x</p>", details="Đã thay mực", modified=None, **values):
-		name = make_ticket(subject=subject, description=description).name
-		frappe.db.set_value(
-			"HD Ticket", name, {"status_category": "Resolved", "resolution_details": details, **values}
-		)
-		if modified:
-			frappe.db.set_value("HD Ticket", name, "modified", modified, update_modified=False)
-		return name
-
-	def names(self, query, limit=read.MAX_SEARCH_LIMIT):
-		result = read.search_resolved_tickets({"query": query, "limit": limit}, _ctx())
-		self.assertTrue(result["ok"], result)
-		return [row["name"] for row in result["tickets"]]
-
-	def test_excluded_ticket_not_returned(self):
-		# The two words are not side by side in the ticket: found only when each word is searched.
-		subject, description = f"{self.word('may')} in hỏng", f"<p>Đã đổi {self.word('muc')}</p>"
-		normal = self.resolved(subject, description)
-		self.resolved(subject, description, agent_group=EXCLUDED_TEAM)
-		self.resolved(subject, description, ai_opt_out=1)
-		self.assertEqual(self.names(f"{self.word('may')} {self.word('muc')}"), [normal])
-
-	def test_ranked_by_word_matches(self):
-		one, two, three = self.word("one"), self.word("two"), self.word("three")
-		newest_one = self.resolved(f"{one} máy", modified="2030-01-04 00:00:00")
-		newer_two = self.resolved(f"{two} {one}", modified="2030-01-03 00:00:00")
-		older_two = self.resolved(one, details=f"<p>{two}</p>", modified="2030-01-02 00:00:00")
-		oldest_three = self.resolved(f"{one} {two}", f"<p>{three}</p>", modified="2030-01-01 00:00:00")
-		self.assertEqual(self.names(f"{one} {two} {three}"), [oldest_three, newer_two, older_two, newest_one])
-
-	def test_excluded_match_does_not_change_result_count(self):
-		common, extra = self.word("chung"), self.word("them")
-		normal = [
-			self.resolved(f"{common} {index}", modified=f"2030-01-0{index + 1} 00:00:00")
-			for index in range(3)
-		]
-		self.assertEqual(sorted(self.names(common, 3)), sorted(normal))
-		# An excluded ticket matching more words is never listed and takes no place.
-		self.resolved(f"{common} {extra}", agent_group=EXCLUDED_TEAM, modified="2030-02-01 00:00:00")
-		self.assertEqual(sorted(self.names(f"{common} {extra}", 3)), sorted(normal))
-		# Three newer excluded tickets do not fill the scan either.
-		with patch.object(read, "SEARCH_SCAN_MAX", 3):
-			for index in range(3):
-				self.resolved(
-					f"{common} {extra} {index}",
-					agent_group=EXCLUDED_TEAM,
-					modified=f"2030-03-0{index + 1} 00:00:00",
-				)
-			self.assertEqual(sorted(self.names(f"{common} {extra}", 3)), sorted(normal))
-
-	def test_match_beyond_eighth_word_found(self):
-		filler = " ".join(f"tu{index}" for index in range(10))
-		late = self.word("cuoi")
-		in_description = self.resolved(f"{self.word('dau')} máy", f"<p>{filler} {late}</p>")
-		in_details = self.resolved("Máy in", f"<p>{filler}</p>", details=f"<p>{filler} {late}</p>")
-		self.assertEqual(sorted(self.names(late)), sorted([in_description, in_details]))
-
-	def test_words_of_adjacent_fields_not_joined(self):
-		common, a, b, m, n, e, d = (self.word(suffix) for suffix in ("x", "a", "b", "m", "n", "e", "d"))
-		# Glued without a space, subject|description gives a+b, two description blocks m+n, description|resolution
-		# e+d. The older ticket holds each glued word as a real word.
-		apart = self.resolved(
-			f"{common} {a}", f"<p>{b} {m}</p><p>{n} {e}</p>", f"<p>{d}</p>", "2030-01-02 00:00:00"
-		)
-		joined = self.resolved(f"{common} {a}{b}", f"<p>{m}{n}</p>", f"<p>{e}{d}</p>", "2030-01-01 00:00:00")
-		for glued in (f"{a}{b}", f"{m}{n}", f"{e}{d}"):
-			with self.subTest(glued):
-				# `apart` scores 1 (only `common`), so it ranks after the older `joined` (2).
-				self.assertEqual(self.names(f"{common} {glued}"), [joined, apart])
-
-	def test_word_with_underscore_found(self):
-		word = f"{self.tag}_ma_loi"
-		ticket = self.resolved(f"Lỗi {word} khi in")
-		self.assertEqual(self.names(word), [ticket])

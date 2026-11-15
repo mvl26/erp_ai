@@ -1225,6 +1225,26 @@ class TestConfirmRestart(TransitionTestCase):
 					self.assertIs(transitions.confirm_restart(proposal.name, value, sent_at=stale), False)
 					self.assertNothingChanged(proposal.name, state, modified)
 
+	# `get_datetime(None)` reads frappe's own `now_datetime`; pinned to `SENT_AT`, a missing stored
+	# time would compare equal to `sent_at` unless the guard refuses it first.
+	def test_missing_stored_sent_at_writes_nothing_even_when_now_equals_sent_at(self):
+		for value in RESTART_CONCLUSIONS:
+			with self.subTest(value=value):
+				proposal = _with_restart(CHANGE_STATUS_APPLIED, RESTART_STATUS_SENT, None)
+				state, modified = _state(proposal.name), _modified(proposal.name)
+				with patch("frappe.utils.data.now_datetime", return_value=SENT_AT):
+					self.assertIs(transitions.confirm_restart(proposal.name, value, sent_at=SENT_AT), False)
+				self.assertNothingChanged(proposal.name, state, modified)
+
+	def test_non_date_sent_at_raises_value_error(self):
+		for wrong in (20261113, 1.5, ["2026-11-13 09:29:01"]):
+			with self.subTest(sent_at=wrong):
+				proposal = _with_restart(CHANGE_STATUS_APPLIED, RESTART_STATUS_SENT, SENT_AT)
+				state, modified = _state(proposal.name), _modified(proposal.name)
+				with self.assertRaises(ValueError):
+					transitions.confirm_restart(proposal.name, RESTART_STATUS_CONFIRMED, sent_at=wrong)
+				self.assertNothingChanged(proposal.name, state, modified)
+
 	def test_equal_sent_at_as_datetime_or_string_writes(self):
 		for given in (SENT_AT, "2026-11-13 09:29:01"):
 			with self.subTest(sent_at=given):

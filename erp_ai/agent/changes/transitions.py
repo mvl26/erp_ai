@@ -351,13 +351,14 @@ def confirm_restart(name, value, *, sent_at) -> bool:
 	`sent_at`. No log row is written.
 
 	Raises:
-		ValueError: `value` outside that set, or `sent_at` empty; see `_lock`.
+		ValueError: `value` outside that set, or `sent_at` empty or neither a datetime nor a string;
+			see `_lock`.
 		frappe.DoesNotExistError: see `_lock`.
 	"""
 	if value not in RESTART_CONCLUSIONS:
 		raise ValueError(f"value must be one of {RESTART_CONCLUSIONS}, got {value!r}")
-	if not sent_at:
-		raise ValueError(f"sent_at must be given, got {sent_at!r}")
+	if not sent_at or not isinstance(sent_at, datetime | str):
+		raise ValueError(f"sent_at must be a datetime or a datetime string, got {sent_at!r}")
 	row = _lock(name, "restart_status", "restart_sent_at")
 	if row.restart_status != RESTART_STATUS_SENT:
 		return False

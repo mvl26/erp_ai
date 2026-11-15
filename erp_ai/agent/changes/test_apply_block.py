@@ -11,7 +11,7 @@ from frappe.tests.utils import FrappeTestCase
 from helpdesk.test_utils import create_agent, make_ticket
 
 from erp_ai.agent import authority, queue
-from erp_ai.agent.changes import apply_job, transitions
+from erp_ai.agent.changes import apply_job, process_runner, transitions
 from erp_ai.agent.tools import change_guard, source
 from erp_ai.agent.tools.registry import ToolContext, execute_tool
 from erp_ai.constants import (
@@ -232,6 +232,126 @@ class BlockApplyTestCase(FrappeTestCase):
 		)
 		self.assertEqual(self.snapshot(), before)
 
+	def full(self, rel):
+		return os.path.join(self.sandbox.repo(APP), rel)
+
+	def tree(self):
+		"""Every directory and file's bytes under the repo but `.git`, HEAD, commit count, index and status."""
+		repo = self.sandbox.repo(APP)
+		dirs, files = [], {}
+		for top, subdirs, names in os.walk(repo):
+			subdirs[:] = sorted(d for d in subdirs if d != ".git")
+			dirs.append(os.path.relpath(top, repo))
+			for entry in sorted(names):
+				path = os.path.join(top, entry)
+				with open(path, "rb") as handle:
+					files[os.path.relpath(path, repo)] = handle.read()
+		return (
+			dirs,
+			files,
+			self.git("rev-parse", "HEAD"),
+			self.git("rev-list", "--count", "HEAD"),
+			self.git("ls-files", "--stage"),
+			self.git("status", "--porcelain"),
+		)
+
+	def assert_given_back(self, name, reason, before):
+		"""`Lỗi` with `reason`, no commit sha, and the tree, HEAD and index as `before`."""
+		state = frappe.db.get_value(
+			PROPOSAL_DOCTYPE, name, ["change_status", "failure_reason", "apply_commit_sha"], as_dict=True
+		)
+		self.assertEqual(
+			(state.change_status, state.failure_reason, state.apply_commit_sha),
+			(CHANGE_STATUS_FAILED, reason, None),
+		)
+		self.assertEqual(self.tree(), before)
+
+	def mixed_block(self):
+		"""Five items, one of each kind and a second edit: edit a, create in two new folders, delete b,
+		rename c into two new folders, edit e."""
+		if not os.path.exists(self.full(EXTRA_REL)):
+			self.sandbox.commit_file(APP, EXTRA_REL, TEXT_BEFORE)
+		return self.approve(
+			self.block(
+				[
+					*self.edits(count=1),
+					{"kind": CHANGE_OP_CREATE, "path": f"{APP}/{CREATED_REL}", "after": CREATED_TEXT},
+					{"kind": CHANGE_OP_DELETE, "path": f"{APP}/{TEXT_RELS[1]}", "before": TEXT_BEFORE},
+					{
+						"kind": CHANGE_OP_RENAME,
+						"path": f"{APP}/{TEXT_RELS[2]}",
+						"new_path": f"{APP}/{MOVED_REL}",
+						"before": TEXT_BEFORE,
+						"after": TEXT_BEFORE,
+					},
+					{
+						"kind": CHANGE_OP_EDIT,
+						"path": f"{APP}/{EXTRA_REL}",
+						"before": TEXT_BEFORE,
+						"after": TEXT_AFTER,
+					},
+				]
+			)
+		)
+
+	def write_reason(self, number, path):
+		# Design 4.2 step 6, written by hand so a changed constant cannot hide a changed sentence.
+		return f"ghi mục {number} ({APP}/{path}) lỗi, đã trả mọi file về như trước"
+
+	def record(self):
+		"""Wrap the four `file_writer` functions and the two staging calls; return the list each call is
+		appended to as `(name, args, kwargs)`. `self.failing(name, args, kwargs)`, when set, may return an
+		exception to raise instead, or a value to return instead."""
+		calls = []
+		self.failing = None
+		for module, names in (
+			(apply_job.file_writer, ("make_parents", "write_atomic", "remove_file", "remove_empty_dirs")),
+			(apply_job.process_runner, ("git_add_new", "git_unstage_new")),
+		):
+			for name in names:
+				real = getattr(module, name)
+
+				def wrapper(*args, _real=real, _name=name, **kwargs):
+					calls.append((_name, args, kwargs))
+					instead = self.failing(_name, args, kwargs) if self.failing else None
+					if isinstance(instead, BaseException):
+						raise instead
+					if instead is not None:
+						return instead
+					return _real(*args, **kwargs)
+
+				patcher = patch.object(module, name, side_effect=wrapper)
+				patcher.start()
+				self.addCleanup(patcher.stop)
+		return calls
+
+
+def _once(test):
+	"""A `fail` for `record` that answers `test(name, args, kwargs)` only the first time it is not None."""
+	done = []
+
+	def fail(name, args, kwargs):
+		if done:
+			return None
+		instead = test(name, args, kwargs)
+		if instead is not None:
+			done.append(True)
+		return instead
+
+	return fail
+
+
+EXTRA_REL = "notes/e.txt"
+CREATED_REL = "fresh/deep/n.txt"
+CREATED_TEXT = "file mới\n"
+MOVED_REL = "moved/deep/c.txt"
+ADD_FAILED = process_runner.CommandResult(
+	exit_code=128, output="fatal: add lỗi", duration_ms=1, timed_out=False, not_found=False
+)
+UNSTAGE_FAILED = process_runner.CommandResult(
+	exit_code=128, output="fatal: rm lỗi", duration_ms=1, timed_out=False, not_found=False
+)
+
 
 class TestBlockAllOrNothing(BlockApplyTestCase):
 	"""Design 4.2 steps 1 to 3: the guard runs again at apply time; a refusal writes 0 bytes and makes 0 commits."""
@@ -446,6 +566,295 @@ class TestBlockAllOrNothing(BlockApplyTestCase):
 		self.assert_failed_untouched(name, self.stale_reason(3, TEXT_RELS[2]), before, CHANGE_STATUS_STALE)
 		spy.assert_not_called()
 
+	def reset_sandbox(self):
+		"""Put the sandbox repo back at HEAD with nothing untracked, between sub-cases that leave it broken."""
+		self.sandbox.git(APP, "reset", "--quiet", "--hard", "HEAD")
+		self.sandbox.git(APP, "clean", "-fdq")
+
+	def raises_on(self, name, full, content=None):
+		"""A `failing` hook raising `OSError` at the first `name(full, …)` call (with `content`, if given)."""
+		return _once(
+			lambda called, args, kwargs: OSError("đĩa đầy")
+			if called == name and args[0] == full and (content is None or args[1] == content)
+			else None
+		)
+
+	def test_writer_fails_at_item_3_of_5_restores_bytes_dirs_zero_commit(self):
+		# Design 4.2 step 6, NFR-13: the delete of item 3 fails after items 1 and 2 were written.
+		name = self.mixed_block()
+		before = self.tree()
+		calls = self.record()
+		self.failing = self.raises_on("remove_file", self.full(TEXT_RELS[1]))
+
+		self.run_apply(name)
+
+		self.assert_given_back(name, self.write_reason(3, TEXT_RELS[1]), before)
+		self.assertNotIn("git_add_new", [call[0] for call in calls])
+
+	def test_writer_fails_at_first_and_last_item(self):
+		# NFR-13: a failure at the first item writes nothing else; at the last item all four kinds go back.
+		calls = self.record()
+		for number, rel in ((1, TEXT_RELS[0]), (5, EXTRA_REL)):
+			with self.subTest(item=number):
+				name = self.mixed_block()
+				before = self.tree()
+				calls.clear()
+				self.failing = self.raises_on("write_atomic", self.full(rel), TEXT_AFTER)
+
+				self.run_apply(name)
+
+				self.assert_given_back(name, self.write_reason(number, rel), before)
+				if number == 1:
+					self.assertEqual(len(calls), 2, calls)
+
+	def test_give_back_reverse_order_with_kind_arguments(self):
+		# Design 4.2 step 6 table and give-back list: each kind's calls and arguments, then the reverse order.
+		name = self.mixed_block()
+		repo = self.sandbox.repo(APP)
+		a, b, c, e = (self.full(rel) for rel in (*TEXT_RELS, EXTRA_REL))
+		created, moved = self.full(CREATED_REL), self.full(MOVED_REL)
+		calls = self.record()
+		self.failing = self.raises_on("write_atomic", e)
+
+		self.run_apply(name)
+
+		self.assertEqual(
+			calls,
+			[
+				("write_atomic", (a, TEXT_AFTER), {"new_file": False}),
+				("make_parents", (created, repo), {}),
+				("write_atomic", (created, CREATED_TEXT), {"new_file": True}),
+				("remove_file", (b,), {}),
+				("make_parents", (moved, repo), {}),
+				("write_atomic", (moved, TEXT_BEFORE), {"new_file": True}),
+				("remove_file", (c,), {}),
+				("write_atomic", (e, TEXT_AFTER), {"new_file": False}),
+				("write_atomic", (c, TEXT_BEFORE), {"new_file": True}),
+				("remove_file", (moved,), {}),
+				("write_atomic", (b, TEXT_BEFORE), {"new_file": True}),
+				("remove_file", (created,), {}),
+				("write_atomic", (a, TEXT_BEFORE), {"new_file": False}),
+				(
+					"remove_empty_dirs",
+					(
+						[
+							self.full("fresh"),
+							self.full("fresh/deep"),
+							self.full("moved"),
+							self.full("moved/deep"),
+						],
+					),
+					{},
+				),
+			],
+		)
+
+	def test_read_back_hash_mismatch_restores_all(self):
+		# Design 4.2 step 6: a read-back hash other than `after_hash` gives everything back like an error,
+		# for an edit, a created file and a rename target alike. The bytes are written; only the hash is wrong.
+		real_write = apply_job.file_writer.write_atomic
+		self.record()
+		for number, written, rel in (
+			(5, EXTRA_REL, EXTRA_REL),
+			(2, CREATED_REL, CREATED_REL),
+			(4, MOVED_REL, TEXT_RELS[2]),
+		):
+			with self.subTest(item=number):
+				self.reset_sandbox()
+				name = self.mixed_block()
+				before = self.tree()
+				full = self.full(written)
+				self.failing = _once(
+					lambda called, args, kwargs, full=full: real_write(*args, **kwargs) and "0" * 64
+					if called == "write_atomic" and args[0] == full
+					else None
+				)
+
+				self.run_apply(name)
+
+				self.assert_given_back(name, self.write_reason(number, rel), before)
+
+	def test_rename_into_new_dir_fails_after_add_restores_index_and_dirs(self):
+		# `git add` of the rename target fails after the created file was staged: unstaged, dirs gone.
+		name = self.mixed_block()
+		repo = self.sandbox.repo(APP)
+		before = self.tree()
+		calls = self.record()
+		self.failing = _once(
+			lambda called, args, kwargs: ADD_FAILED
+			if called == "git_add_new" and args[1] == MOVED_REL
+			else None
+		)
+
+		self.run_apply(name)
+
+		self.assert_given_back(name, self.write_reason(4, TEXT_RELS[2]), before)
+		staging = [(call[0], call[1][:2]) for call in calls if call[0].startswith("git_")]
+		self.assertEqual(
+			staging,
+			[
+				("git_add_new", (repo, CREATED_REL)),
+				("git_add_new", (repo, MOVED_REL)),
+				("git_unstage_new", (repo, CREATED_REL)),
+			],
+		)
+		self.assertEqual(calls[-1][0], "remove_empty_dirs")
+
+	def test_restore_incomplete_reports_restore_failed(self):
+		# Design 4.2 step 6: a give-back that does not hold is `GIT_RESTORE_FAILED`; the other steps still run.
+		calls = self.record()
+		a, e, moved = self.full(TEXT_RELS[0]), self.full(EXTRA_REL), self.full(MOVED_REL)
+
+		def add_fails(called, args, kwargs):
+			return ADD_FAILED if called == "git_add_new" and args[1] == MOVED_REL else None
+
+		cases = {
+			# case: (failing hooks, bytes of item 1 after the give-back)
+			"remove of a created file raises": (
+				(self.raises_on("write_atomic", e), self.raises_on("remove_file", moved)),
+				TEXT_BEFORE,
+			),
+			"read-back of a rewritten file wrong": (
+				(
+					self.raises_on("write_atomic", e),
+					_once(
+						lambda called, args, kwargs: "0" * 64
+						if called == "write_atomic" and args == (a, TEXT_BEFORE)
+						else None
+					),
+				),
+				TEXT_AFTER,
+			),
+			"unstage fails": (
+				(
+					_once(add_fails),
+					_once(
+						lambda called, args, kwargs: UNSTAGE_FAILED if called == "git_unstage_new" else None
+					),
+				),
+				TEXT_BEFORE,
+			),
+		}
+		for case, (hooks, item_1) in cases.items():
+			with self.subTest(case=case):
+				self.reset_sandbox()
+				name = self.mixed_block()
+				head = self.git("rev-parse", "HEAD")
+				calls.clear()
+				self.failing = lambda *call, hooks=hooks: next(
+					(instead for instead in (hook(*call) for hook in hooks) if instead is not None), None
+				)
+
+				self.run_apply(name)
+
+				state = frappe.db.get_value(
+					PROPOSAL_DOCTYPE,
+					name,
+					["change_status", "failure_reason", "apply_commit_sha"],
+					as_dict=True,
+				)
+				self.assertEqual(
+					(state.change_status, state.failure_reason, state.apply_commit_sha),
+					(CHANGE_STATUS_FAILED, apply_job.GIT_RESTORE_FAILED, None),
+				)
+				# The steps after the one that did not hold still ran, down to the folders.
+				self.assertEqual(self.tree()[1][TEXT_RELS[0]], item_1.encode())
+				self.assertEqual(calls[-1][0], "remove_empty_dirs")
+				self.assertEqual(self.git("rev-parse", "HEAD"), head)
+
+	def test_each_give_back_check_alone_reports_restore_failed(self):
+		# Design 4.2 step 6: each condition of "the give-back held" is caught on its own; the write of
+		# item 5 fails, so items 1 to 4 (with two staged files and four new folders) go back.
+		real_write = apply_job.file_writer.write_atomic
+		real_head = source.git_head
+		calls = self.record()
+		a, e, moved = self.full(TEXT_RELS[0]), self.full(EXTRA_REL), self.full(MOVED_REL)
+		head_moved = []
+
+		def git_head(app_dir):
+			return "f" * 40 if head_moved else real_head(app_dir)
+
+		def give_back_of_a(answer):
+			return _once(
+				lambda called, args, kwargs: answer(*args, **kwargs)
+				if called == "write_atomic" and args == (a, TEXT_BEFORE)
+				else None
+			)
+
+		def at_dirs(answer):
+			return lambda called, args, kwargs: answer(args[0]) if called == "remove_empty_dirs" else None
+
+		def flip_head(created):
+			head_moved.append(True)
+
+		cases = {
+			# case: (failing hook after item 5 fails, the tree is as before)
+			"a: read-back hash wrong after real bytes": (
+				give_back_of_a(lambda *args, **kwargs: real_write(*args, **kwargs) and "0" * 64),
+				True,
+			),
+			"b: base_hash returned, bytes not written": (
+				give_back_of_a(lambda *args, **kwargs: _sha(TEXT_BEFORE)),
+				False,
+			),
+			"c: created folders not removed": (at_dirs(lambda created: []), False),
+			"d: HEAD moved": (at_dirs(flip_head), True),
+			"e: created file not removed": (
+				lambda called, args, kwargs: True
+				if called == "remove_file" and args == (moved,)
+				else (list(args[0]) if called == "remove_empty_dirs" else None),
+				False,
+			),
+		}
+		with patch.object(source, "git_head", side_effect=git_head):
+			for case, (hook, same_tree) in cases.items():
+				with self.subTest(case=case):
+					self.reset_sandbox()
+					head_moved.clear()
+					name = self.mixed_block()
+					before = self.tree()
+					calls.clear()
+					fail_e = self.raises_on("write_atomic", e, TEXT_AFTER)
+					self.failing = lambda *call, hook=hook, fail_e=fail_e: fail_e(*call) or hook(*call)
+
+					self.run_apply(name)
+
+					head_moved.clear()
+					state = frappe.db.get_value(
+						PROPOSAL_DOCTYPE,
+						name,
+						["change_status", "failure_reason", "apply_commit_sha"],
+						as_dict=True,
+					)
+					self.assertEqual(
+						(state.change_status, state.failure_reason, state.apply_commit_sha),
+						(CHANGE_STATUS_FAILED, apply_job.GIT_RESTORE_FAILED, None),
+					)
+					self.assertEqual(calls[-1][0], "remove_empty_dirs")
+					now = self.tree()
+					self.assertEqual(now[2:5], before[2:5])
+					if same_tree:
+						self.assertEqual(now, before)
+
+	def test_whole_block_written_then_given_back_until_one_commit_exists(self):
+		# T35 boundary: one commit for a whole block comes later; after every write, everything goes back.
+		name = self.mixed_block()
+		before = self.tree()
+		calls = self.record()
+
+		self.run_apply(name)
+
+		self.assert_given_back(name, change_guard.OP_UNKNOWN, before)
+		self.assertEqual(
+			[(call[0], call[1][1]) for call in calls if call[0].startswith("git_")],
+			[
+				("git_add_new", CREATED_REL),
+				("git_add_new", MOVED_REL),
+				("git_unstage_new", MOVED_REL),
+				("git_unstage_new", CREATED_REL),
+			],
+		)
+
 
 class TestDelete(BlockApplyTestCase):
 	"""Design 4.2 step 4 for a `delete` item: its file must still hash to `base_hash`."""
@@ -465,6 +874,49 @@ class TestDelete(BlockApplyTestCase):
 		self.assert_failed_untouched(
 			name, f"mục 2 ({APP}/{TEXT_RELS[1]}): {apply_job.TARGET_CHANGED}", before, CHANGE_STATUS_STALE
 		)
+
+	def test_parent_swapped_to_symlink_after_check_zero_deleted_outside(self):
+		# Design-addendum-1 A-3.3: once `check_block` passed, the delete's folder becomes a symlink out of
+		# the app; the delete is refused, the file outside stays, item 1 goes back byte for byte.
+		self.sandbox.commit_file(APP, "sub/x.txt", TEXT_BEFORE)
+		outside = os.path.join(self.sandbox.base, "outside")
+		os.makedirs(outside)
+		with open(os.path.join(outside, "x.txt"), "w", encoding="utf-8") as handle:
+			handle.write(TEXT_BEFORE)
+		name = self.approve(
+			self.block(
+				[
+					*self.edits(count=1),
+					{"kind": CHANGE_OP_DELETE, "path": f"{APP}/sub/x.txt", "before": TEXT_BEFORE},
+				]
+			)
+		)
+		real_check, real_write = change_guard.check_block, apply_job.file_writer.write_atomic
+		swapped = {}
+
+		def check_block(*args, **kwargs):
+			swapped["checked"] = True
+			return real_check(*args, **kwargs)
+
+		def write_atomic(*args, **kwargs):
+			# Any moment after `check_block` returned; here right before the first byte is written, so the
+			# git reads of step 5 have passed and the delete itself meets the symlink.
+			if swapped.pop("checked", False):
+				os.rename(self.full("sub"), os.path.join(self.sandbox.base, "sub_kept"))
+				os.symlink(outside, self.full("sub"))
+				swapped["tree"] = self.tree()
+			return real_write(*args, **kwargs)
+
+		with (
+			patch.object(change_guard, "check_block", side_effect=check_block),
+			patch.object(apply_job.file_writer, "write_atomic", side_effect=write_atomic),
+		):
+			self.run_apply(name)
+
+		self.assert_given_back(name, self.write_reason(2, "sub/x.txt"), swapped.get("tree"))
+		with open(os.path.join(outside, "x.txt"), encoding="utf-8") as handle:
+			self.assertEqual(handle.read(), TEXT_BEFORE)
+		self.assertEqual(self.tree()[1][TEXT_RELS[0]], TEXT_BEFORE.encode())
 
 
 class TestApplyBlock(BlockApplyTestCase):

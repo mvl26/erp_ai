@@ -20,6 +20,7 @@ from erp_ai.agent.tools import change_guard, source
 from erp_ai.constants import (
 	BOT_GIT_EMAIL,
 	CHANGE_OP_CREATE,
+	CHANGE_OP_DELETE,
 	CHANGE_OP_EDIT,
 	CHANGE_OP_RENAME,
 	CHANGE_STATUS_APPLIED,
@@ -52,6 +53,7 @@ STORED_HASH_MISMATCH = "nội dung lưu không khớp dấu"
 TARGET_CHANGED = "file đích đã đổi kể từ lúc đề xuất"
 FILE_CHANGED_AFTER_APPLY = "file đã đổi sau khi áp dụng, không hoàn tác"
 WRITE_MISMATCH = "đọc lại sau khi ghi không khớp"
+BLOCK_WRITE_FAILED = "ghi mục {number} ({path}) lỗi, đã trả mọi file về như trước"
 # Design table 3.2 (exact wording).
 GIT_COMMIT_FAILED = "commit git lỗi, đã trả file về như trước"
 GIT_COMMIT_TIMED_OUT_SUFFIX = " (quá thời gian)"
@@ -203,8 +205,7 @@ def _run(proposal, action: str, actor: str, deadline: float) -> str:
 		_undo_code(proposal, actor, _recheck(proposal, action), deadline)
 		return CHANGE_STATUS_UNDONE
 	check = _recheck_block(proposal, _recheck(proposal, action))
-	if block.is_block(proposal):
-		_precheck_block(proposal, check, deadline)
+	old_head = _precheck_block(proposal, check, deadline) if block.is_block(proposal) else None
 	if not block.is_block(proposal):
 		if check.targets:
 			_apply_code(proposal, check.targets[0], actor, deadline)
@@ -217,7 +218,10 @@ def _run(proposal, action: str, actor: str, deadline: float) -> str:
 	):
 		_apply_code(proposal, check.targets[0], actor, deadline)
 	else:
-		# Writing several items (design 4.2 step 6) and running a block's commands come in later tasks.
+		# One commit for the whole block (design 4.2 step 7) and its commands come in later tasks: until then
+		# every item written goes back again and the block ends as one not yet writable.
+		if check.targets and not _write_block(proposal, check, old_head)():
+			raise _Stop(CHANGE_STATUS_FAILED, GIT_RESTORE_FAILED)
 		raise _Stop(CHANGE_STATUS_FAILED, change_guard.OP_UNKNOWN)
 	return CHANGE_STATUS_APPLIED
 
@@ -345,6 +349,119 @@ def _precheck_block(proposal, check: change_guard.BlockCheck, deadline: float) -
 			raise _Stop(CHANGE_STATUS_FAILED, prefix + source.GIT_ERROR)
 		old_head = state.head
 	return old_head
+
+
+class _ItemRefused(Exception):
+	"""A read-back hash other than `after_hash`, or a `git add` that did not go through (design 4.2 step 6)."""
+
+
+def _write_block(proposal, check: change_guard.BlockCheck, old_head: str):
+	"""Design 4.2 step 6: every item by `idx` through `file_writer`, then `git_add_new` one path at a time for
+	each created file and rename target, with the give-back log kept in memory.
+
+	An error at item k, a wrong read-back hash or a failed `git add` gives everything back in reverse and
+	ends `Lỗi` with `BLOCK_WRITE_FAILED` naming item k, or `GIT_RESTORE_FAILED` when the give-back did not
+	hold. Returns the give-back (True when it held) for a later step that has to undo the writes.
+	"""
+	app_dir = os.path.join(source.get_source_root(), check.app)
+	steps, staged, created = [], [], []
+
+	def give_back() -> bool:
+		return _give_back_block(proposal, app_dir, old_head, steps, staged, created)
+
+	number = 0
+	try:
+		for target in check.targets:
+			number += 1
+			_write_item(target, app_dir, steps, created)
+		number = 0
+		for target in check.targets:
+			number += 1
+			for full in _staged_paths(target):
+				rel = os.path.relpath(full, app_dir)
+				if _failed(process_runner.git_add_new(app_dir, rel, source.GIT_TIMEOUT_S)):
+					raise _ItemRefused(rel)
+				staged.append(rel)
+	except Exception as exc:
+		frappe.log_error(
+			TITLE_CHANGE_FAILED,
+			f"proposal={proposal.name} action=apply item={number} error={type(exc).__name__}",
+		)
+		reason = BLOCK_WRITE_FAILED.format(number=number, path=check.targets[number - 1].op.path)
+		raise _Stop(CHANGE_STATUS_FAILED, reason if give_back() else GIT_RESTORE_FAILED) from exc
+	return give_back
+
+
+def _staged_paths(target) -> tuple[str, ...]:
+	"""The paths of an item that `git add` stages before the commit: a created file, a rename target."""
+	if target.op.kind == CHANGE_OP_CREATE:
+		return (target.full_path,)
+	if target.op.kind == CHANGE_OP_RENAME:
+		return (target.full_new_path,)
+	return ()
+
+
+def _write_item(target, app_dir: str, steps: list, created: list) -> None:
+	"""One row of the design 4.2 step 6 table. Each step done is logged in `steps` as its give-back
+	`(full, before, new_file, base_hash)`: `before` written back, or the file removed when `before` is None;
+	the folders `make_parents` made go to `created`."""
+	operation = target.op
+	if operation.kind == CHANGE_OP_DELETE:
+		file_writer.remove_file(target.full_path)
+		steps.append((target.full_path, operation.before, True, operation.base_hash))
+		return
+	if operation.kind == CHANGE_OP_EDIT:
+		written = file_writer.write_atomic(target.full_path, operation.after, new_file=False)
+		steps.append((target.full_path, operation.before, False, operation.base_hash))
+	else:
+		full = target.full_path if operation.kind == CHANGE_OP_CREATE else target.full_new_path
+		created.extend(file_writer.make_parents(full, app_dir))
+		written = file_writer.write_atomic(full, operation.after, new_file=True)
+		steps.append((full, None, True, None))
+	if written != operation.after_hash:
+		raise _ItemRefused(WRITE_MISMATCH)
+	if operation.kind == CHANGE_OP_RENAME:
+		file_writer.remove_file(target.full_path)
+		steps.append((target.full_path, operation.before, True, operation.base_hash))
+
+
+def _give_back_block(proposal, app_dir: str, old_head: str, steps, staged, created) -> bool:
+	"""Design 4.2 step 6 give-back in reverse: every file back (`before` with its read-back hash, or the file
+	created removed), every staged path unstaged, the folders made removed. True when every step held, every
+	file written back is clean in git and HEAD is still `old_head`; a step that fails does not stop the rest.
+	"""
+	held = True
+	for full, before, new_file, base_hash in reversed(steps):
+		try:
+			if before is None:
+				file_writer.remove_file(full)
+				held = not os.path.lexists(full) and held
+			else:
+				held = file_writer.write_atomic(full, before, new_file=new_file) == base_hash and held
+		except Exception as exc:
+			held = _give_back_broke(proposal, exc)
+	for rel in reversed(staged):
+		try:
+			held = not _failed(process_runner.git_unstage_new(app_dir, rel, source.GIT_TIMEOUT_S)) and held
+		except Exception as exc:
+			held = _give_back_broke(proposal, exc)
+	try:
+		held = set(file_writer.remove_empty_dirs(list(created))) == set(created) and held
+		held = source.git_head(app_dir) == old_head and held
+		for full, before, _new_file, _base_hash in steps:
+			if before is not None:
+				held = source.read_git_state(full, new_file=False).refusal is None and held
+	except Exception as exc:
+		held = _give_back_broke(proposal, exc)
+	return held
+
+
+def _give_back_broke(proposal, exc: Exception) -> bool:
+	"""A give-back step that broke leaves the repo state unknown, which is what `GIT_RESTORE_FAILED` says."""
+	frappe.log_error(
+		TITLE_CHANGE_FAILED, f"proposal={proposal.name} action=give_back error={type(exc).__name__}"
+	)
+	return False
 
 
 def _failed(result) -> bool:

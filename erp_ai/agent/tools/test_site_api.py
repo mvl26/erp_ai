@@ -1706,10 +1706,14 @@ LIST_FIELDS = {
 	"Notification Log": ["name", "subject"],
 	"Activity Log": ["name", "subject"],
 	"Email Queue": ["name", "message"],
+	"Tag Link": ["name", "title"],
+	"Document Follow": ["name", "user"],
+	"Workflow Action": ["name", "workflow_state"],
+	"Reminder": ["name", "description"],
 }
-# R10b, R10g: the dynamic pairs by which DocTypes outside TICKET_CONTENT_DOCTYPES name a ticket, with the column names
-# of the installed DocType JSON, each pair tried alone: `{label: (doctype, type column, name column, column holding
-# the text)}`.
+# R10b, R10g, R11a: the dynamic pairs by which DocTypes outside TICKET_CONTENT_DOCTYPES name a ticket, with the column
+# names of the installed DocType JSON, each pair tried alone: `{label: (doctype, type column, name column, column
+# holding the text)}`. Document Follow has no text column: its `user` column carries the text.
 LINKED_PAIRS = {
 	"ToDo": ("ToDo", "reference_type", "reference_name", "description"),
 	"Notification Log": ("Notification Log", "document_type", "document_name", "subject"),
@@ -1718,6 +1722,11 @@ LINKED_PAIRS = {
 	"Activity Log timeline": ("Activity Log", "timeline_doctype", "timeline_name", "subject"),
 	"Activity Log link": ("Activity Log", "link_doctype", "link_name", "subject"),
 	"Email Queue": ("Email Queue", "reference_doctype", "reference_name", "message"),
+	# Frappe's add_tag, which Helpdesk tags tickets with, stores the ticket subject in the title.
+	"Tag Link": ("Tag Link", "document_type", "document_name", "title"),
+	"Document Follow": ("Document Follow", "ref_doctype", "ref_docname", "user"),
+	"Workflow Action": ("Workflow Action", "reference_doctype", "reference_name", "workflow_state"),
+	"Reminder": ("Reminder", "reminder_doctype", "reminder_docname", "description"),
 }
 # Closed to the record tools in every mode: a Deleted Document holds a whole deleted record (R10b); product code never
 # reads Version (ADR-024, R10e). `{doctype: (type column, name column, column holding the text)}` of a seeded row.
@@ -2054,7 +2063,7 @@ class TestExcludedTicketReads(_ExcludedTicketCase):
 
 	def test_rows_of_the_other_dynamic_link_doctypes_follow_the_ticket(self):
 		# R10b, R10g: a mention notification, an assignment, an activity and a queued email of a ticket, by every
-		# pair of their DocType.
+		# pair of their DocType; R11a: a tag, a follow, a workflow action and a reminder of a ticket.
 		tickets = {"team": self.ticket("team", self.seed), "normal": self.ticket("normal", self.plain)}
 		made = {"team": {}, "normal": {}}
 		for label, (doctype, type_column, name_column, text_column) in LINKED_PAIRS.items():
@@ -2116,6 +2125,31 @@ class TestExcludedTicketReads(_ExcludedTicketCase):
 			with self.subTest(unrestricted=unrestricted):
 				self.assertEqual(
 					self.listed("Activity Log", [["name", "in", [other, hidden]]], unrestricted), [other]
+				)
+
+	def test_email_queue_without_any_link_still_listed_and_readable(self):
+		# R11c: a queued email that names no record has no ticket. The excluded ticket's Communication puts the
+		# `communication not in` filter into the query, which must keep the empty Link.
+		excluded = self.records(self.ticket("team", self.seed), self.seed)
+		filters, _or_filters = policy.ticket_content_filters("Email Queue")
+		self.assertIn(["communication", "not in"], [row[:2] for row in filters])
+		self.assertIn(excluded["Communication"], next(row[2] for row in filters if row[0] == "communication"))
+		email = _db_insert({"doctype": "Email Queue", "message": self.plain})
+		for unrestricted in (False, True):
+			with self.subTest(unrestricted=unrestricted):
+				self.assertEqual(self.listed("Email Queue", [["name", "=", email]], unrestricted), [email])
+				result = site_api.get_record(
+					{"doctype": "Email Queue", "name": email}, _context(unrestricted=unrestricted)
+				)
+				self.assertTrue(result["ok"], result)
+				record = result["record"]
+				self.assertEqual(str(record["name"]), str(email))
+				self.assertEqual(
+					[
+						record.get(column)
+						for column in ("communication", "reference_doctype", "reference_name")
+					],
+					[None, None, None],
 				)
 
 	def test_record_denied_doctypes_closed_in_both_modes(self):
@@ -2692,6 +2726,93 @@ class TestPermissionVectors(FrappeTestCase):
 		):
 			with self.subTest(doctype=doctype, values=values, name=name):
 				self.assertIsNone(site_api.ticket_link_schema_refusal(doctype, values, name=name))
+
+	def test_ticket_link_setter_takes_only_display_properties_in_both_modes(self):
+		# R11b: Frappe applies every property of a Property Setter to the field (`fieldname` renames it, so policy
+		# reads an empty column): on a field that points at a ticket only the display properties pass. The write is
+		# stubbed, as above.
+		label = frappe.get_meta("Task").get_field("ai_ticket").label
+		# A setter that already sets the label, to its current value: saved without hooks, so no cache is touched.
+		stored_label = _db_insert(
+			{
+				"doctype": "Property Setter",
+				"name": f"{NOTE_TITLE} ai_ticket label {uuid.uuid4().hex}",
+				"doctype_or_field": "DocField",
+				"doc_type": "Task",
+				"field_name": "ai_ticket",
+				"property": "label",
+				"value": label,
+				"property_type": "Data",
+			}
+		)
+		targets = (("Task", "ai_ticket"), ("Email Queue", "communication"))
+		refused = (
+			"fieldname",
+			" FieldName ",
+			"options",
+			"fieldtype",
+			"hidden",
+			"reqd",
+			"read_only",
+			"default",
+			"fetch_from",
+			"permlevel",
+			"ignore_user_permissions",
+		)
+		allowed = (
+			"label",
+			"description",
+			"in_list_view",
+			"in_standard_filter",
+			"bold",
+			"print_hide",
+			"columns",
+			"width",
+		)
+
+		def setter(doc_type, field_name, prop):
+			values = {"doc_type": doc_type, "field_name": field_name, "property": prop, "value": "1"}
+			return {"doctype": "Property Setter", "values": {"doctype_or_field": "DocField", **values}}
+
+		normal = _context()
+		unrestricted = _context(level="L1", change_enabled=False, unrestricted=True)
+		for context in (normal, unrestricted):
+			calls = {
+				f"{doc_type}.{field_name} {prop!r}": ("api_create_record", setter(doc_type, field_name, prop))
+				for doc_type, field_name in targets
+				for prop in refused
+			}
+			calls["stored label setter turned into fieldname"] = (
+				"api_update_record",
+				{"doctype": "Property Setter", "name": stored_label, "values": {"property": "fieldname"}},
+			)
+			for call, (tool, arguments) in calls.items():
+				with (
+					self.subTest(call, unrestricted=context.unrestricted),
+					patch.object(site_api, "_write") as write,
+				):
+					result = self.run_tool(tool, arguments, context)
+					self.assert_refused(result, TICKET_LINK_SCHEMA_REFUSAL, "Property Setter")
+					write.assert_not_called()
+			passed = {
+				f"{doc_type}.{field_name} {prop!r}": (
+					site_api.create_record,
+					setter(doc_type, field_name, prop),
+				)
+				for doc_type, field_name in targets
+				for prop in allowed
+			}
+			passed["stored label setter, same label"] = (
+				site_api.update_record,
+				{"doctype": "Property Setter", "name": stored_label, "values": {"value": label}},
+			)
+			for call, (handler, arguments) in passed.items():
+				with (
+					self.subTest(call, unrestricted=context.unrestricted),
+					patch.object(site_api, "_write", return_value={"ok": True}) as write,
+				):
+					self.assertEqual(handler(arguments, context), {"ok": True})
+					write.assert_called_once()
 
 	def test_business_role_assignment_still_works(self):
 		# Role assignment stays a right of the record tools switch: only the six admin roles are refused.

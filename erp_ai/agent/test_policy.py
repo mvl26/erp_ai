@@ -1198,6 +1198,11 @@ class TestExcludedQuery(FrappeTestCase):
 					("link_doctype", "link_name"),
 				),
 				"Email Queue": (("reference_doctype", "reference_name"),),
+				# R11a: Frappe's add_tag stores the ticket subject in the Tag Link title.
+				"Tag Link": (("document_type", "document_name"),),
+				"Document Follow": (("ref_doctype", "ref_docname"),),
+				"Workflow Action": (("reference_doctype", "reference_name"),),
+				"Reminder": (("reminder_doctype", "reminder_docname"),),
 			},
 		)
 		# R10a; HD Ticket Comment is a known gap (R10f): D8 bars product code from naming it.

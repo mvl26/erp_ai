@@ -6,8 +6,14 @@ import frappe
 from frappe.tests.utils import FrappeTestCase
 from helpdesk.test_utils import make_ticket
 
-from erp_ai.agent import missed_scan, policy
-from erp_ai.constants import AGENT_USER, LOG_DOCTYPE, SETTING_DOCTYPE, TRIGGER_TICKET_INSERT
+from erp_ai.agent import missed_scan, policy, queue
+from erp_ai.constants import (
+	AGENT_USER,
+	LOG_DOCTYPE,
+	SETTING_DOCTYPE,
+	TITLE_RUN_FAILED,
+	TRIGGER_TICKET_INSERT,
+)
 from erp_ai.test_utils import keep_agent_settings, make_log_entry, set_agent_settings
 
 # A window no live ticket can fall into: every ticket a test needs gets its `creation` set inside it.
@@ -20,6 +26,8 @@ OTHER_TEAM = "ERPAI-TEST-missed-scan other"
 # Standard Helpdesk records (created by its install).
 TICKET_TYPE = "Unspecified"
 PRIORITY = "Medium"
+# Text an exception may carry (ticket content); it must never reach the Error Log message.
+SECRET_TEXT = "ERPAI-TEST nội dung phiếu bí mật"
 
 
 class TestMissedScan(FrappeTestCase):
@@ -168,12 +176,12 @@ class TestMissedScan(FrappeTestCase):
 		frappe.db.value_cache.pop(SETTING_DOCTYPE, None)
 
 	def _cap(self, limit):
-		"""Patch the candidate cap (design-w1-fixes-6 Point 2); `create` so the test also runs on code without it."""
+		"""Patch the candidate cap (design-w1-fixes-6 Điểm 2); `create` so the test also runs on code without it."""
 		return patch.object(missed_scan, "SCAN_CANDIDATE_LIMIT", limit, create=True)
 
 	@staticmethod
 	def _queued_tickets(enqueue) -> list[str]:
-		return [call.kwargs["ticket_name"] for call in enqueue.call_args_list]
+		return [queued.kwargs["ticket_name"] for queued in enqueue.call_args_list]
 
 	def test_two_scans_one_job_per_ticket(self):
 		"""AC-16, NFR-3: a second scan in the same transaction queues nothing new; one logger line per scan (D-17)."""
@@ -194,11 +202,12 @@ class TestMissedScan(FrappeTestCase):
 				logger.return_value.info.call_args_list, [unittest_call("missed_scan: xếp 0 phiếu")]
 			)
 
-		for call in enqueue.call_args_list:
-			with self.subTest(ticket=call.kwargs["ticket_name"]):
-				self.assertEqual(call.kwargs["trigger"], TRIGGER_TICKET_INSERT)
+		for queued in enqueue.call_args_list:
+			with self.subTest(ticket=queued.kwargs["ticket_name"]):
+				self.assertEqual(queued.kwargs["trigger"], TRIGGER_TICKET_INSERT)
 				self.assertEqual(
-					call.kwargs["job_id"], f"erp_ai::{call.kwargs['ticket_name']}::{TRIGGER_TICKET_INSERT}"
+					queued.kwargs["job_id"],
+					f"erp_ai::{queued.kwargs['ticket_name']}::{TRIGGER_TICKET_INSERT}",
 				)
 		logger.return_value.warning.assert_not_called()
 
@@ -262,3 +271,48 @@ class TestMissedScan(FrappeTestCase):
 			[unittest_call("missed_scan: chạm trần %s ứng viên, phiếu cũ hơn không được xét", 3)],
 		)
 		self.assertEqual(getattr(missed_scan, "SCAN_CANDIDATE_LIMIT", None), 1000)
+
+	def _scan_with_error(self, target, attribute, side_effect):
+		"""Run the scan with `target.attribute` raising; returns (log_error mock, logger mock). No exception may escape."""
+		self._enable_agent()
+		with (
+			patch.object(target, attribute, side_effect=side_effect),
+			patch("frappe.enqueue"),
+			patch.object(missed_scan.frappe, "log_error") as log_error,
+			patch.object(missed_scan.frappe, "logger") as logger,
+		):
+			missed_scan.scan_missed_tickets(NOW)
+		return log_error, logger
+
+	def _assert_one_constant_title_error(self, log_error, tickets):
+		"""D-17: exactly one log_error, constant title, message names only the exception type (no ticket data)."""
+		self.assertEqual(
+			log_error.call_args_list,
+			[unittest_call(TITLE_RUN_FAILED, "missed_scan error=RuntimeError")],
+		)
+		logged = " ".join(str(arg) for arg in log_error.call_args.args)
+		self.assertNotIn(SECRET_TEXT, logged)
+		for ticket in tickets:
+			self.assertNotIn(ticket, logged)
+
+	def test_enqueue_error_logged_once_and_swallowed(self):
+		"""D-17 error path: enqueue raising on the second ticket ends the run with one log_error and one logger line."""
+		tickets = [self._ticket(creation=OLD_ENOUGH + timedelta(seconds=second)) for second in range(3)]
+		log_error, logger = self._scan_with_error(
+			queue, "enqueue_agent_run", [True, RuntimeError(SECRET_TEXT), True]
+		)
+		self._assert_one_constant_title_error(log_error, tickets)
+		self.assertEqual(
+			logger.return_value.method_calls,
+			[unittest_call.error("missed_scan: lỗi %s, đã xếp %s phiếu", "RuntimeError", 1)],
+		)
+
+	def test_policy_error_logged_once_and_swallowed(self):
+		"""D-17 error path: can_send_ticket raising stops the run before any job, one log_error, one logger line."""
+		tickets = [self._ticket(creation=OLD_ENOUGH + timedelta(seconds=second)) for second in range(2)]
+		log_error, logger = self._scan_with_error(policy, "can_send_ticket", RuntimeError(SECRET_TEXT))
+		self._assert_one_constant_title_error(log_error, tickets)
+		self.assertEqual(
+			logger.return_value.method_calls,
+			[unittest_call.error("missed_scan: lỗi %s, đã xếp %s phiếu", "RuntimeError", 0)],
+		)

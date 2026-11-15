@@ -661,3 +661,60 @@ class TestBotAction(_RollbackCase):
 		self.assertEqual(frappe.db.count(LOG_DOCTYPE), before + 2)
 		with self.assertRaises(ValueError):
 			self._write(entry_type="classify", trigger="setting_save")
+
+	def test_bot_action_row_cost_zero_not_counted(self):
+		from erp_ai.agent import policy
+
+		spent = policy.month_spend_usd()
+		name = run_log.write_bot_action(
+			trigger="setting_save",
+			actions=[BOT_ACTION_ENTRY],
+			instructor="Administrator",
+			site_environment="test",
+		)
+		row = frappe.db.get_value(
+			LOG_DOCTYPE,
+			name,
+			[
+				"entry_type",
+				"trigger",
+				"ticket",
+				"instructor",
+				"cost_usd",
+				"site_environment",
+				"run_id",
+				"actions",
+			],
+			as_dict=True,
+		)
+		self.assertEqual(
+			(row.entry_type, row.trigger, row.ticket, row.instructor, row.cost_usd, row.site_environment),
+			("bot_action", "setting_save", None, "Administrator", 0, "test"),
+		)
+		self.assertRegex(row.run_id, r"^[0-9a-f]{32}$")
+		self.assertEqual(json.loads(row.actions), [BOT_ACTION_ENTRY])
+		self.assertEqual(policy.month_spend_usd(), spent)
+		# Two calls get two run ids; an explicit one is kept; no site_environment given -> filled from policy.
+		other = run_log.write_bot_action(
+			trigger="scheduled_job", actions=[BOT_ACTION_ENTRY], run_id="ERPAI-TEST-r1"
+		)
+		self.assertEqual(frappe.db.get_value(LOG_DOCTYPE, other, "run_id"), "ERPAI-TEST-r1")
+		self.assertEqual(
+			frappe.db.get_value(LOG_DOCTYPE, other, "site_environment"), policy.site_environment()
+		)
+		with self.assertRaises(ValueError):
+			run_log.write_bot_action(trigger="ticket_insert", actions=[BOT_ACTION_ENTRY])
+		with self.assertRaises(ValueError):
+			run_log.write_bot_action(trigger="setting_save", actions=[])
+
+	def test_bot_action_under_agent_and_human_sessions(self):
+		_make_user(HD_AGENT_USER, HELPDESK_AGENT_ROLE)
+		for user in (AGENT_USER, HD_AGENT_USER, "Administrator"):
+			with self.subTest(user=user):
+				frappe.set_user(user)
+				name = run_log.write_bot_action(
+					trigger="scheduled_job", actions=[BOT_ACTION_ENTRY], instructor=None
+				)
+				frappe.set_user("Administrator")
+				self.assertEqual(frappe.db.get_value(LOG_DOCTYPE, name, "owner"), user)
+				self.assertFalse(frappe.flags.get(AGENT_WRITE_FLAG))

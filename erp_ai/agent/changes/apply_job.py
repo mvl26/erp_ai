@@ -21,6 +21,7 @@ from erp_ai.constants import (
 	BOT_GIT_EMAIL,
 	CHANGE_OP_CREATE,
 	CHANGE_OP_EDIT,
+	CHANGE_OP_RENAME,
 	CHANGE_STATUS_APPLIED,
 	CHANGE_STATUS_APPLYING,
 	CHANGE_STATUS_APPROVED,
@@ -202,6 +203,8 @@ def _run(proposal, action: str, actor: str, deadline: float) -> str:
 		_undo_code(proposal, actor, _recheck(proposal, action), deadline)
 		return CHANGE_STATUS_UNDONE
 	check = _recheck_block(proposal, _recheck(proposal, action))
+	if block.is_block(proposal):
+		_precheck_block(proposal, check, deadline)
 	if not block.is_block(proposal):
 		if check.targets:
 			_apply_code(proposal, check.targets[0], actor, deadline)
@@ -304,6 +307,37 @@ def _recheck_block(proposal, allowed_apps) -> change_guard.BlockCheck:
 		if preview != proposal.commit_message:
 			raise _Stop(CHANGE_STATUS_FAILED, DIGEST_CHANGED)
 	return check
+
+
+def _precheck_block(proposal, check: change_guard.BlockCheck, deadline: float) -> None:
+	"""Design 4.2 steps 4 to 5 for a block, before any byte is written; returns once every row passed.
+
+	Step 4 compares every row first: an edit, a deletion and a rename source must hash to `base_hash`, a
+	created file and a rename target must not `lexists` → else `Hết hiệu lực` naming the item. Step 5 then
+	reads git for every path: a refusal is `Lỗi` naming the item, a branch other than `target_branch` is
+	`Hết hiệu lực`. The one-file path keeps the HEAD it reads itself.
+	"""
+	paths = []
+	for number, target in enumerate(check.targets, start=1):
+		operation = target.op
+		prefix = change_guard.OP_PREFIX.format(number=number, path=operation.path)
+		if operation.kind == CHANGE_OP_CREATE:
+			existing, new = None, (target.full_path,)
+		elif operation.kind == CHANGE_OP_RENAME:
+			existing, new = target.full_path, (target.full_new_path,)
+		else:
+			existing, new = target.full_path, ()
+		if (existing is not None and file_writer.sha256_of(existing) != operation.base_hash) or any(
+			os.path.lexists(full) for full in new
+		):
+			raise _Stop(CHANGE_STATUS_STALE, prefix + TARGET_CHANGED)
+		paths.extend((prefix, full, full in new) for full in (existing, *new) if full is not None)
+	for prefix, full, new_file in paths:
+		state = source.read_git_state(full, new_file=new_file, limit_s=_git_limit(deadline))
+		if state.refusal:
+			raise _Stop(CHANGE_STATUS_FAILED, prefix + state.refusal)
+		if state.branch != proposal.target_branch:
+			raise _Stop(CHANGE_STATUS_STALE, GIT_BRANCH_CHANGED)
 
 
 def _failed(result) -> bool:

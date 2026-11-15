@@ -1,3 +1,4 @@
+import dataclasses
 import hashlib
 import json
 import os
@@ -10,17 +11,19 @@ from helpdesk.test_utils import create_agent, make_ticket
 
 from erp_ai.agent import authority, queue
 from erp_ai.agent.changes import apply_job, transitions
-from erp_ai.agent.tools import change_guard
+from erp_ai.agent.tools import change_guard, source
 from erp_ai.agent.tools.registry import ToolContext, execute_tool
 from erp_ai.constants import (
 	AGENT_USER,
 	CHANGE_KIND_CODE,
 	CHANGE_OP_CREATE,
+	CHANGE_OP_DELETE,
 	CHANGE_OP_EDIT,
 	CHANGE_STATUS_APPLIED,
 	CHANGE_STATUS_APPROVED,
 	CHANGE_STATUS_FAILED,
 	CHANGE_STATUS_PENDING,
+	CHANGE_STATUS_STALE,
 	PROPOSAL_DOCTYPE,
 	ROLE_INSTRUCTOR,
 )
@@ -277,6 +280,89 @@ class TestBlockAllOrNothing(BlockApplyTestCase):
 			name, f"mục 2 ({APP}/docs/new.json): {change_guard.JSON_SYNTAX.format(n=1)}", before
 		)
 		self.assertFalse(os.path.lexists(os.path.join(self.sandbox.repo(APP), "docs/new.json")))
+
+	def write(self, rel, text):
+		with open(os.path.join(self.sandbox.repo(APP), rel), "w", encoding="utf-8") as handle:
+			handle.write(text)
+
+	def stale_reason(self, number, rel):
+		return f"mục {number} ({APP}/{rel}): {apply_job.TARGET_CHANGED}"
+
+	def test_stale_target_first_middle_last_zero_written(self):
+		# Design 4.2 step 4: every row is compared before any byte is written, wherever the stale one is.
+		for index in range(3):
+			with self.subTest(item=index + 1):
+				self.sandbox.git(APP, "checkout", "--quiet", "--", ".")
+				name = self.approve(self.block(self.edits()))
+				self.write(TEXT_RELS[index], "người khác sửa\n")
+				before = self.snapshot()
+
+				self.run_apply(name)
+
+				self.assert_failed_untouched(
+					name, self.stale_reason(index + 1, TEXT_RELS[index]), before, CHANGE_STATUS_STALE
+				)
+
+	def test_branch_changed_stale(self):
+		name = self.approve(self.block(self.edits()))
+		self.git("checkout", "--quiet", "-b", "other")
+		before = self.snapshot()
+
+		self.run_apply(name)
+
+		self.assert_failed_untouched(name, apply_job.GIT_BRANCH_CHANGED, before, CHANGE_STATUS_STALE)
+
+	def test_git_refusal_error_names_item(self):
+		# Design 4.2 step 5: `read_git_state` for every path; a refusal is `Lỗi` naming its item (here item 2).
+		real = source.read_git_state
+		refused = os.path.join(self.sandbox.repo(APP), TEXT_RELS[1])
+
+		def read_git_state(full, **kwargs):
+			state = real(full, **kwargs)
+			return dataclasses.replace(state, refusal="git bị khóa") if full == refused else state
+
+		name = self.approve(self.block(self.edits()))
+		before = self.snapshot()
+
+		with patch.object(source, "read_git_state", side_effect=read_git_state):
+			self.run_apply(name)
+
+		self.assert_failed_untouched(name, f"mục 2 ({APP}/{TEXT_RELS[1]}): git bị khóa", before)
+
+	def test_create_target_appeared_stale(self):
+		operations = [
+			*self.edits(count=1),
+			{"kind": CHANGE_OP_CREATE, "path": f"{APP}/docs/new.txt", "after": "mới\n"},
+		]
+		name = self.approve(self.block(operations))
+		self.write("docs/new.txt", "người khác tạo\n")
+		before = self.snapshot()
+
+		self.run_apply(name)
+
+		self.assert_failed_untouched(name, self.stale_reason(2, "docs/new.txt"), before, CHANGE_STATUS_STALE)
+		with open(os.path.join(self.sandbox.repo(APP), "docs/new.txt"), encoding="utf-8") as handle:
+			self.assertEqual(handle.read(), "người khác tạo\n")
+
+
+class TestDelete(BlockApplyTestCase):
+	"""Design 4.2 step 4 for a `delete` item: its file must still hash to `base_hash`."""
+
+	def test_changed_since_proposal_stale_zero_deleted(self):
+		operations = [
+			*self.edits(count=1),
+			{"kind": CHANGE_OP_DELETE, "path": f"{APP}/{TEXT_RELS[1]}", "before": TEXT_BEFORE},
+		]
+		name = self.approve(self.block(operations))
+		with open(os.path.join(self.sandbox.repo(APP), TEXT_RELS[1]), "w", encoding="utf-8") as handle:
+			handle.write("người khác sửa\n")
+		before = self.snapshot()
+
+		self.run_apply(name)
+
+		self.assert_failed_untouched(
+			name, f"mục 2 ({APP}/{TEXT_RELS[1]}): {apply_job.TARGET_CHANGED}", before, CHANGE_STATUS_STALE
+		)
 
 
 class TestApplyBlock(BlockApplyTestCase):

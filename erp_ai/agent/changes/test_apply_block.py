@@ -24,6 +24,7 @@ from erp_ai.constants import (
 	CHANGE_OP_EDIT,
 	CHANGE_OP_RENAME,
 	CHANGE_STATUS_APPLIED,
+	CHANGE_STATUS_APPLYING,
 	CHANGE_STATUS_APPROVED,
 	CHANGE_STATUS_FAILED,
 	CHANGE_STATUS_PENDING,
@@ -1405,6 +1406,85 @@ class TestBlockCommit(BlockApplyTestCase):
 		self.assertEqual(self.git("rev-parse", "HEAD~1"), start)
 		self.assertEqual(self.name_status(), MIXED_COMMIT)
 		self.assert_mixed_files_applied()
+
+	def test_commit_fails_after_a_person_committed_restores_all_keeps_their_commit(self):
+		# Design 4.2 step 7 → `_commit_landed`: HEAD moved to a person's commit, so every item goes back and
+		# the give-back is checked against that commit, as on the one-file path.
+		name = self.mixed_block()
+		before = self.tree()
+		person_rel, person_text = "person.txt", "của người\n"
+		person = []
+
+		def person_commits_then_fails(*args):
+			person.append(self.sandbox.commit_file(APP, person_rel, person_text))
+			return self.commit_result(output="fatal: không commit được")
+
+		with patch.object(apply_job.process_runner, "git_commit_only", side_effect=person_commits_then_fails):
+			self.run_apply(name)
+
+		state = self.state(name)
+		self.assertEqual(
+			(state.change_status, state.failure_reason, state.apply_commit_sha),
+			(
+				CHANGE_STATUS_FAILED,
+				"commit git lỗi, đã trả file về như trước: fatal: không commit được",
+				None,
+			),
+		)
+		self.assertEqual(self.git("rev-parse", "HEAD"), person[0])
+		self.assertEqual(self.git("rev-parse", "HEAD~1"), before[2])
+		now = self.tree()
+		files = dict(now[1])
+		self.assertEqual(files.pop(person_rel), person_text.encode())
+		index = [line for line in now[4].splitlines() if not line.endswith(f"\t{person_rel}")]
+		self.assertEqual(
+			(now[0], files, index, now[5]), (before[0], before[1], before[4].splitlines(), before[5])
+		)
+
+	def test_crash_before_commit_restores_all_zero_commit(self):
+		# Design-addendum-3 QĐ-B2 item 4: an error before any bot commit gives every item back (HEAD unchanged).
+		name = self.mixed_block()
+		before = self.tree()
+		# The job rolls back before it records `Lỗi`; inside a test that would drop the proposal itself.
+		with (
+			patch.object(apply_job.process_runner, "git_commit_only", side_effect=RuntimeError("hỏng")),
+			patch.object(frappe.db, "rollback"),
+		):
+			self.run_apply(name)
+
+		self.assert_given_back(name, "RuntimeError", before)
+
+	def test_git_fields_committed_to_db_before_done(self):
+		# ADR-040 QĐ 2 step 6 (design 4.2 step 8): `record_commit(...)` then `frappe.db.commit()`, and only then
+		# `finish`, so the commit sha and the folders made survive a crash at `finish`.
+		name = self.mixed_block()
+		seen = []
+		real_finish = transitions.finish
+
+		def finish(*args, **kwargs):
+			seen.append("finish")
+			return real_finish(*args, **kwargs)
+
+		with (
+			patch.object(frappe.db, "commit", side_effect=lambda *args: seen.append(self.state(name))),
+			patch.object(apply_job.transitions, "finish", side_effect=finish),
+		):
+			self.run_apply(name)
+
+		final = self.state(name)
+		self.assertEqual(final.change_status, CHANGE_STATUS_APPLIED)
+		self.assertTrue(final.apply_commit_sha)
+		self.assertTrue(final.created_dirs)
+		at_commit = seen[seen.index("finish") - 1]
+		self.assertEqual(
+			(
+				at_commit.change_status,
+				at_commit.apply_commit_sha,
+				at_commit.applied_branch,
+				at_commit.created_dirs,
+			),
+			(CHANGE_STATUS_APPLYING, final.apply_commit_sha, final.applied_branch, final.created_dirs),
+		)
 
 	def test_commit_limit_comes_from_the_job_deadline(self):
 		# Design 3.5: the one commit's `limit_s` is what is left of the job budget, capped by `GIT_TIMEOUT_S`.

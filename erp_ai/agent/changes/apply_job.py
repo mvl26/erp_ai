@@ -369,8 +369,8 @@ def _write_block(proposal, check: change_guard.BlockCheck, old_head: str):
 	app_dir = os.path.join(source.get_source_root(), check.app)
 	steps, staged, created = [], [], []
 
-	def give_back() -> bool:
-		return _give_back_block(proposal, app_dir, old_head, steps, staged, created)
+	def give_back(expected_head: str = old_head) -> bool:
+		return _give_back_block(proposal, app_dir, expected_head, steps, staged, created)
 
 	number = 0
 	try:
@@ -433,8 +433,8 @@ def _commit_block(
 		after_paths = {rel: full for rel, (full, _blob) in ends.items()}
 		return _commit_record("apply_commit_sha", before_files, after_paths, old_head, commit, branch)
 
-	def given_back(reason: str):
-		held = give_back()
+	def given_back(reason: str, expected_head: str):
+		held = give_back(expected_head)
 		raise _Stop(
 			CHANGE_STATUS_FAILED, reason if held else GIT_RESTORE_FAILED, before=record(None, None)["before"]
 		)
@@ -447,7 +447,9 @@ def _commit_block(
 			repo, tuple(sorted(ends)), subject, body, _git_limit(deadline)
 		)
 		if _failed(result):
-			summary = _commit_landed(repo, old_head, lambda _head: given_back(_commit_failed_reason(result)))
+			summary = _commit_landed(
+				repo, old_head, lambda head: given_back(_commit_failed_reason(result), head)
+			)
 		committed = True
 		blobs = {rel: blob for rel, (_full, blob) in ends.items()}
 		summary = _postcheck(repo, old_head, proposal.target_branch, blobs, summary, record)
@@ -520,10 +522,11 @@ def _write_item(target, app_dir: str, steps: list, created: list) -> None:
 		steps.append((target.full_path, operation.before, True, operation.base_hash))
 
 
-def _give_back_block(proposal, app_dir: str, old_head: str, steps, staged, created) -> bool:
+def _give_back_block(proposal, app_dir: str, expected_head: str, steps, staged, created) -> bool:
 	"""Design 4.2 step 6 give-back in reverse: every file back (`before` with its read-back hash, or the file
 	created removed), every staged path unstaged, the folders made removed. True when every step held, every
-	file written back is clean in git and HEAD is still `old_head`; a step that fails does not stop the rest.
+	file written back is clean in git and HEAD is `expected_head` (`old_head`, or a person's commit that
+	`_commit_landed` found); a step that fails does not stop the rest.
 	"""
 	held = True
 	for full, before, new_file, base_hash in reversed(steps):
@@ -542,7 +545,7 @@ def _give_back_block(proposal, app_dir: str, old_head: str, steps, staged, creat
 			held = _give_back_broke(proposal, exc)
 	try:
 		held = set(file_writer.remove_empty_dirs(list(created))) == set(created) and held
-		held = source.git_head(app_dir) == old_head and held
+		held = source.git_head(app_dir) == expected_head and held
 		for full, before, _new_file, _base_hash in steps:
 			if before is not None:
 				held = source.read_git_state(full, new_file=False).refusal is None and held

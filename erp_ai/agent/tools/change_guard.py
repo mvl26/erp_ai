@@ -56,8 +56,14 @@ PY_SYNTAX = "file .py không biên dịch được: dòng {n}"
 JSON_SYNTAX = "file .json không phải JSON hợp lệ: dòng {n}"
 PY_SUFFIX = ".py"
 JSON_SUFFIX = ".json"
+RESTART_PLACE = "restart chỉ được một lần và phải là lệnh cuối"
+RESTART_NEEDS_MIGRATE = "khối có file và restart phải có migrate đứng trước restart"
+PY_NEEDS_RESTART = "khối có file .py phải kết thúc bằng migrate rồi restart"
+RESTART_WITHOUT_PY = "khối có file nhưng không có file .py thì không restart"
 # Prefix of a reason tied to one file item, n counted from 1 (design 3.1).
 OP_PREFIX = "mục {number} ({path}): "
+# Prefix of a reason tied to one command, n counted from 1 (design 3.1).
+COMMAND_PREFIX = "lệnh {number}: "
 
 # Fields of `FileOp` each kind needs as `str` (True) or leaves `None` (False): new_path, before, after.
 OP_SHAPES = {
@@ -77,6 +83,7 @@ OP_ACTIONS = {
 # Command table of design 3.1: the only bench argument shapes an agent may propose (ADR-011 QĐ 4).
 # No subcommand here runs git in an app repo (ADR-022 QĐ 2).
 SITE_COMMANDS = ("migrate", "clear-cache", "clear-website-cache", "list-apps")
+MIGRATE_COMMAND = SITE_COMMANDS[0]  # must come before `restart` in a block with files (design 3.2)
 BUILD_COMMAND = "build"
 VERSION_COMMAND = "version"
 # CHG-002 design 3.2 (ADR-040 QĐ 6): the plain form only, shape `["restart"]`.
@@ -304,16 +311,25 @@ def check_write_path(
 
 def _shape_reason(op: FileOp) -> str | None:
 	"""`OP_UNKNOWN` for a kind outside `CHANGE_OPS`; `OP_FIELDS` when a field the kind needs is not a
-	string or one it leaves out is set (`OP_SHAPES`)."""
+	string or one it leaves out is set (`OP_SHAPES`), or when `path` (or a rename's `new_path`) is
+	empty after `strip()` (design-addendum-5 P-6)."""
 	if not isinstance(op.kind, str) or op.kind not in OP_SHAPES:
 		return OP_UNKNOWN
 	fields = (op.new_path, op.before, op.after)
-	if not isinstance(op.path, str) or any(
-		not isinstance(value, str) if needed else value is not None
-		for value, needed in zip(fields, OP_SHAPES[op.kind], strict=True)
+	if (
+		not _is_named(op.path)
+		or any(
+			not isinstance(value, str) if needed else value is not None
+			for value, needed in zip(fields, OP_SHAPES[op.kind], strict=True)
+		)
+		or (op.kind == CHANGE_OP_RENAME and not _is_named(op.new_path))
 	):
 		return OP_FIELDS.format(action=OP_ACTIONS[op.kind])
 	return None
+
+
+def _is_named(path) -> bool:
+	return isinstance(path, str) and bool(path.strip())
 
 
 def _paths_of(op: FileOp) -> tuple[str, ...]:
@@ -435,7 +451,12 @@ def check_block(
 	before and after (the only per-file size limit); `PY_SYNTAX` / `JSON_SYNTAX` for the content after
 	of a `.py` / `.json` target. 3. the UTF-8 bytes of every before and after plus `diff_text` (the
 	stored `diff`, no default so no caller forgets it) over `CHANGE_MAX_TOTAL_BYTES` → `BLOCK_TOO_LARGE`;
-	exactly the limit passes. `site` and `legacy` serve the command rules.
+	exactly the limit passes. 4. each command through `check_bench_args`, its reason prefixed by
+	`COMMAND_PREFIX`; `["restart"]` more than once or not last → `RESTART_PLACE`; only for a block with
+	file items: unless `legacy`, a `.py` on any path of the block (a rename source and target too)
+	without `restart` → `PY_NEEDS_RESTART`, `restart` without one → `RESTART_WITHOUT_PY`; `restart`
+	with no `[--site, site, migrate]` before it → `RESTART_NEEDS_MIGRATE`. A block with only commands
+	may hold a lone `["restart"]` (R-5).
 	"""
 	ops, commands = tuple(ops), tuple(commands)
 	if not ops and not commands:
@@ -457,7 +478,32 @@ def check_block(
 	total = sum(len(_utf8(text)) for op in ops for text in (op.before, op.after) if text is not None)
 	if total + len(_utf8(diff_text)) > CHANGE_MAX_TOTAL_BYTES:
 		return BlockCheck(reason=BLOCK_TOO_LARGE, app=None, targets=())
+	reason = _commands_reason(ops, commands, allowed_apps, site, legacy)
+	if reason is not None:
+		return BlockCheck(reason=reason, app=None, targets=())
 	return BlockCheck(reason=None, app=app, targets=tuple(targets))
+
+
+def _commands_reason(ops: tuple, commands: tuple, allowed_apps, site, legacy: bool) -> str | None:
+	"""Design 3.2 step 4, on items that already passed step 2 (so every path is a string)."""
+	for number, args in enumerate(commands, start=1):
+		reason = check_bench_args(args, allowed_apps, site)
+		if reason is not None:
+			return COMMAND_PREFIX.format(number=number) + reason
+	restarts = [index for index, args in enumerate(commands) if args == [RESTART_COMMAND]]
+	if restarts and restarts[0] != len(commands) - 1:  # a second restart leaves the first not last
+		return RESTART_PLACE
+	if not ops:
+		return None
+	if not legacy:
+		has_py = any(path.endswith(PY_SUFFIX) for op in ops for path in _paths_of(op))
+		if has_py and not restarts:
+			return PY_NEEDS_RESTART
+		if restarts and not has_py:
+			return RESTART_WITHOUT_PY
+	if restarts and [SITE_FLAG, site, MIGRATE_COMMAND] not in commands[: restarts[0]]:
+		return RESTART_NEEDS_MIGRATE
+	return None
 
 
 def _app_names(allowed_apps) -> tuple[str, ...]:

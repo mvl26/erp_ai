@@ -256,6 +256,17 @@ class TestCommentHandler(HandlerTestCase):
 		self.assertEqual(jobs[0].kwargs["job_id"], f"erp_ai::{ticket.name}::comment_mention")
 		self.assertEqual(comment.comment_type, "Comment")
 
+	def test_mention_enqueues_with_comment_name(self):
+		ticket = self._ticket_without_job()
+
+		comment = self._comment(ticket.name, f"{KEYWORD} xem giúp")
+
+		jobs = self._jobs()
+		self.assertEqual(len(jobs), 1)
+		self.assertTrue(comment.name)
+		self.assertEqual(jobs[0].kwargs["comment_name"], comment.name)
+		self.assertEqual(jobs[0].kwargs["job_id"], f"erp_ai::{ticket.name}::comment_mention")
+
 	def test_comment_without_keyword_no_job(self):
 		ticket = self._ticket_without_job()
 

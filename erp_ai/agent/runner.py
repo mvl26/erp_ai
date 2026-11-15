@@ -8,6 +8,7 @@ from frappe.utils import get_fullname
 from erp_ai import gateway
 from erp_ai.agent import authority, policy, site_facts
 from erp_ai.agent.answer_delay import AnswerDelay
+from erp_ai.agent.authority import TITLE_WRONG_USER as TITLE_WRONG_USER  # re-export, U1.md:264
 from erp_ai.agent.classification import load_mapping, parse_classification
 from erp_ai.agent.prompts import (
 	build_classify_request,
@@ -52,7 +53,6 @@ from erp_ai.constants import (
 	SETTING_DOCTYPE,
 	TITLE_RUN_FAILED,
 	TITLE_STATUS_FAILED,
-	TITLE_WRONG_USER,
 	TRIGGER_CHANGE_ACTION,
 	TRIGGER_COMMENT_MENTION,
 	TRIGGER_TICKET_INSERT,
@@ -137,12 +137,7 @@ def _call_model(task, **kwargs):
 
 def _run(ticket_name, trigger):
 	# (a) the job must run as the agent account, checked before the ticket is read (AC-6)
-	if not frappe.db.get_value("User", AGENT_USER, "enabled"):
-		frappe.log_error(TITLE_WRONG_USER, "Không có tài khoản agent")
-		return
-	frappe.set_user(AGENT_USER)
-	if frappe.session.user != AGENT_USER:
-		frappe.log_error(TITLE_WRONG_USER, f"Sai tài khoản: {frappe.session.user}")
+	if not authority.enter_agent_session():
 		return
 
 	# (b) disabled at run time: stop without a log entry

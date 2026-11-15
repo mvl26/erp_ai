@@ -3,7 +3,7 @@ import json
 import frappe
 
 from erp_ai.agent.prompts import MAX_COMMENTS
-from erp_ai.constants import AGENT_USER, ROLE_INSTRUCTOR, TRIGGER_COMMENT_MENTION
+from erp_ai.constants import AGENT_USER, ROLE_INSTRUCTOR, TITLE_WRONG_USER, TRIGGER_COMMENT_MENTION
 
 ROLE_LABEL_INSTRUCTION = "chỉ thị"
 ROLE_LABEL_DATA = "dữ liệu"
@@ -13,6 +13,21 @@ NEVER_AUTHORITY = frozenset({"Administrator", "Guest", AGENT_USER})
 
 MIN_COMMENT_LIMIT = 1
 MAX_COMMENT_LIMIT = 50
+
+
+def enter_agent_session() -> bool:
+	"""ADR-033 QĐ 1: the only place a job switches its session to the agent account.
+
+	The previous user is not restored (the caller is a job). False (logged) means the caller must stop.
+	"""
+	if not frappe.db.get_value("User", AGENT_USER, "enabled"):
+		frappe.log_error(TITLE_WRONG_USER, "Không có tài khoản agent")
+		return False
+	frappe.set_user(AGENT_USER)
+	if frappe.session.user != AGENT_USER:
+		frappe.log_error(TITLE_WRONG_USER, f"Sai tài khoản: {frappe.session.user}")
+		return False
+	return True
 
 
 def ticket_comment_filters(ticket_name: str) -> dict:

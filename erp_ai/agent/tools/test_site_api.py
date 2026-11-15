@@ -1970,21 +1970,22 @@ class TestExcludedTicketReads(_ExcludedTicketCase):
 		excluded = self.ticket("team", self.seed)
 		normal = self.ticket("normal", self.plain)
 		todo = _db_insert({"doctype": "ToDo", "description": self.plain})
-		# The dynamic pair names a ToDo; only the static Link points at a ticket.
-		via_static = self.comment(todo, self.seed, "ToDo", link_doctype="HD Ticket", link_name=excluded)
-		via_static_normal = self.comment(todo, self.plain, "ToDo", link_doctype="HD Ticket", link_name=normal)
+		# Comment's existing `ip_address` column stands in for the column of a temporary Custom Field Link to
+		# HD Ticket. The dynamic pair names a ToDo; only that static Link points at a ticket.
+		column = "ip_address"
+		via_static = self.comment(todo, self.seed, "ToDo", **{column: excluded})
+		via_static_normal = self.comment(todo, self.plain, "ToDo", **{column: normal})
 		real_fieldnames = policy.ticket_link_fieldnames
 
 		def fieldnames(doctype):
-			# Comment as if a Custom Field made `link_name` a Link to HD Ticket. Stubbed in this process only: a
-			# real Custom Field runs ALTER TABLE (frappe.db.updatedb commits) and would put the changed meta of
-			# Comment into the Redis cache other sessions of the shared site read.
-			return ("link_name",) if doctype == "Comment" else real_fieldnames(doctype)
+			# Stubbed in this process only: a real Custom Field runs ALTER TABLE (frappe.db.updatedb commits) and
+			# would put the changed meta of Comment into the Redis cache other sessions of the shared site read.
+			return (column,) if doctype == "Comment" else real_fieldnames(doctype)
 
 		with patch.object(policy, "ticket_link_fieldnames", side_effect=fieldnames):
 			self.assertEqual(
 				policy.ticket_link_columns("Comment"),
-				(("reference_doctype", "reference_name"), (None, "link_name")),
+				(("reference_doctype", "reference_name"), (None, column)),
 			)
 			for unrestricted in (False, True):
 				with self.subTest(unrestricted=unrestricted):

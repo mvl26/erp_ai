@@ -94,24 +94,38 @@ KEY_REASON_MAX = 100  # model-supplied argument names are cut so reason stays sh
 CHANGE_GROUP = "change_propose"
 SITE_ADMIN_GROUP = "site_admin"
 UNRESTRICTED_GROUP = "site_unrestricted"
+# The only ticket_write tools left below the confidence threshold (U1.md:158).
+ASK_TOOL_NAMES = frozenset({"post_comment"})
 
 
 def unrestricted_granted(inputs: GrantInputs) -> bool:
-	# The full-power switch: any level above L0 (so also L1 after a budget cut), with an instructor.
-	return inputs.switches.unrestricted and inputs.effective_level in LEVELS[1:] and inputs.has_instructor
+	# The full-power switch: any level above L0, with an instructor, never over budget or below threshold.
+	return (
+		inputs.switches.unrestricted
+		and inputs.effective_level in LEVELS[1:]
+		and inputs.has_instructor
+		and not inputs.over_budget
+		and not inputs.below_threshold
+	)
 
 
 # ADR-011 QĐ 2, 6, ADR-023 QĐ 4 and ADR-030 QĐ 3: the only grant table, one row per group, checked
-# above L0: (group, Callable[[GrantInputs], bool]). The below-threshold and over-budget terms come in T77.
+# above L0: (group, Callable[[GrantInputs], bool]).
 GRANT_TABLE = (
 	("read", lambda inputs: True),
-	("ticket_write", lambda inputs: True),
-	("task_write", lambda inputs: inputs.has_instructor and inputs.main_path_level in LEVELS[1:]),
+	("ticket_write", lambda inputs: not inputs.below_threshold),
+	(
+		"task_write",
+		lambda inputs: inputs.has_instructor
+		and inputs.main_path_level in LEVELS[1:]
+		and not inputs.below_threshold,
+	),
 	(
 		CHANGE_GROUP,
 		lambda inputs: inputs.switches.code_change
 		and inputs.effective_level == "L3"
-		and inputs.has_instructor,
+		and inputs.has_instructor
+		and not inputs.below_threshold,
 	),
 	# Generic record tools (site_api.py): the record-tools switch, level and authority, or full power.
 	(
@@ -119,7 +133,8 @@ GRANT_TABLE = (
 		lambda inputs: (
 			(inputs.switches.record_tools and inputs.effective_level == "L3" and inputs.has_instructor)
 			or unrestricted_granted(inputs)
-		),
+		)
+		and not inputs.below_threshold,
 	),
 	(UNRESTRICTED_GROUP, unrestricted_granted),
 )
@@ -138,13 +153,23 @@ def grant(inputs: GrantInputs) -> Grant:
 	if inputs.effective_level not in LEVELS or inputs.effective_level == LEVELS[0]:
 		return Grant(specs=())
 	groups = {group for group, condition in GRANT_TABLE if condition(inputs)}
-	specs = tuple(spec for spec in _all_specs() if spec.group in groups)
-	# act_now_block and ask_only_block stay False until T77 (design-w1-fixes-3.md Điểm 2).
+	# Below the threshold only the ask tools of ticket_write are added back (U1.md:179 step 3).
+	specs = tuple(
+		spec
+		for spec in _all_specs()
+		if spec.group in groups
+		or (inputs.below_threshold and spec.group == "ticket_write" and spec.name in ASK_TOOL_NAMES)
+	)
+	unrestricted_block = UNRESTRICTED_GROUP in groups
+	# U1.md:181-187: the full-power block replaces the record block; act-now needs a power group.
 	return Grant(
 		specs=specs,
 		change_block=CHANGE_GROUP in groups,
-		record_block=SITE_ADMIN_GROUP in groups,
-		unrestricted_block=UNRESTRICTED_GROUP in groups,
+		record_block=SITE_ADMIN_GROUP in groups and not unrestricted_block,
+		unrestricted_block=unrestricted_block,
+		act_now_block=inputs.switches.act_now
+		and bool(groups & {CHANGE_GROUP, SITE_ADMIN_GROUP, UNRESTRICTED_GROUP}),
+		ask_only_block=inputs.below_threshold,
 	)
 
 

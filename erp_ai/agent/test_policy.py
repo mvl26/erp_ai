@@ -1117,3 +1117,191 @@ class TestExcludedQuery(FrappeTestCase):
 			set(policy.excluded_ticket_names()),
 			{name for name in (*opted_out, *classified) if not policy.can_send_ticket(name)},
 		)
+
+	def _comment(self, ticket, doctype="HD Ticket"):
+		doc = frappe.get_doc(
+			{
+				"doctype": "Comment",
+				"comment_type": "Comment",
+				"reference_doctype": doctype,
+				"reference_name": ticket,
+				"content": "ERPAI-TEST",
+			}
+		)
+		doc.db_insert()
+		return doc.name
+
+	def _communication(self, ticket):
+		doc = frappe.get_doc(
+			{
+				"doctype": "Communication",
+				"communication_type": "Communication",
+				"communication_medium": "Email",
+				"sent_or_received": "Sent",
+				"reference_doctype": "HD Ticket",
+				"reference_name": ticket,
+				"subject": "ERPAI-TEST",
+				"content": "ERPAI-TEST",
+			}
+		)
+		doc.db_insert()
+		return doc.name
+
+	def _file(self, doctype, name):
+		doc = frappe.get_doc(
+			{
+				"doctype": "File",
+				"file_name": "ERPAI-TEST-links.txt",
+				"attached_to_doctype": doctype,
+				"attached_to_name": name,
+				"is_private": 1,
+				"content": "ERPAI-TEST",
+			}
+		).insert(ignore_permissions=True)
+		physical = doc.get_full_path()
+		self.addCleanup(lambda: os.path.exists(physical) and os.remove(physical))
+		return doc.name
+
+	def _task(self, ticket):
+		doc = frappe.get_doc({"doctype": "Task", "subject": "ERPAI-TEST links", "ai_ticket": ticket})
+		doc.db_insert()
+		return doc.name
+
+	def _legacy_comment(self, ticket):
+		return (
+			frappe.get_doc(
+				{"doctype": "HD Ticket Comment", "reference_ticket": ticket, "content": "ERPAI-TEST"}
+			)
+			.insert(ignore_permissions=True)
+			.name
+		)
+
+	def test_constants(self):
+		self.assertEqual(
+			policy.TICKET_LINK_FIELDS,
+			{
+				"Comment": ("reference_doctype", "reference_name"),
+				"Communication": ("reference_doctype", "reference_name"),
+				"File": ("attached_to_doctype", "attached_to_name"),
+			},
+		)
+		self.assertEqual(policy.EXCLUDED_TICKET_REASON, "bản ghi thuộc phiếu không được phép đưa cho AI")
+
+	def test_owning_ticket_per_doctype(self):
+		ticket = self._ticket()
+		records = (
+			("HD Ticket", ticket),
+			("Comment", self._comment(ticket)),
+			("Communication", self._communication(ticket)),
+			("File", self._file("HD Ticket", ticket)),
+			("HD Ticket Comment", self._legacy_comment(ticket)),
+			("Task", self._task(ticket)),
+		)
+		for doctype, name in records:
+			with self.subTest(doctype=doctype):
+				self.assertEqual(policy.owning_ticket(doctype, name), ticket)
+		# Attached to or commenting on another DocType: no ticket.
+		todo = frappe.get_doc({"doctype": "ToDo", "description": "ERPAI-TEST"}).insert(
+			ignore_permissions=True
+		)
+		self.assertIsNone(policy.owning_ticket("File", self._file("ToDo", todo.name)))
+		self.assertIsNone(policy.owning_ticket("Comment", self._comment(todo.name, "ToDo")))
+		# Missing record, empty name, DocType outside the set.
+		for doctype, name in (
+			("Comment", "không có bản ghi này"),
+			("HD Ticket", "không có phiếu này"),
+			("Task", ""),
+			("User", "Administrator"),
+			("Không có DocType này", "x"),
+		):
+			with self.subTest(doctype=doctype, name=name):
+				self.assertIsNone(policy.owning_ticket(doctype, name))
+
+	def test_link_columns_dynamic_plus_static(self):
+		self.assertEqual(policy.ticket_link_columns("Comment"), (("reference_doctype", "reference_name"),))
+		self.assertEqual(policy.ticket_link_columns("File"), (("attached_to_doctype", "attached_to_name"),))
+		self.assertEqual(policy.ticket_link_columns("HD Ticket Comment"), ((None, "reference_ticket"),))
+		self.assertEqual(policy.ticket_link_columns("task"), ((None, "ai_ticket"),))
+		for doctype in ("HD Ticket", "User", "Không có DocType này"):
+			self.assertEqual(policy.ticket_link_columns(doctype), ())
+		# A DocType with both: the dynamic pair plus every static Link, neither excludes the other.
+		with patch.object(policy, "ticket_link_fieldnames", return_value=("custom_ticket",)):
+			self.assertEqual(
+				policy.ticket_link_columns("Comment"),
+				(("reference_doctype", "reference_name"), (None, "custom_ticket")),
+			)
+
+	def test_ticket_content_filters_empty_when_nothing_excluded(self):
+		with patch.object(policy, "excluded_ticket_names", return_value=[]):
+			for doctype in (
+				"HD Ticket",
+				"Comment",
+				"Communication",
+				"File",
+				"HD Ticket Comment",
+				"Task",
+				"User",
+			):
+				with self.subTest(doctype=doctype):
+					self.assertEqual(policy.ticket_content_filters(doctype), ([], []))
+		with patch.object(policy, "excluded_ticket_names", return_value=["T-1"]):
+			for doctype in ("User", "Không có DocType này"):
+				with self.subTest(doctype=doctype):
+					self.assertEqual(policy.ticket_content_filters(doctype), ([], []))
+
+	def test_ticket_content_filters_shapes(self):
+		names = ["T-1", "T-2"]
+		with patch.object(policy, "excluded_ticket_names", return_value=names):
+			self.assertEqual(policy.ticket_content_filters("HD Ticket"), ([["name", "not in", names]], []))
+			self.assertEqual(
+				policy.ticket_content_filters("Comment"),
+				([], [["reference_doctype", "!=", "HD Ticket"], ["reference_name", "not in", names]]),
+			)
+			self.assertEqual(
+				policy.ticket_content_filters("File"),
+				([], [["attached_to_doctype", "!=", "HD Ticket"], ["attached_to_name", "not in", names]]),
+			)
+			self.assertEqual(policy.ticket_content_filters("Task"), ([["ai_ticket", "not in", names]], []))
+			self.assertEqual(
+				policy.ticket_content_filters("HD Ticket Comment"),
+				([["reference_ticket", "not in", names]], []),
+			)
+			with patch.object(policy, "ticket_link_fieldnames", return_value=("custom_ticket",)):
+				self.assertEqual(
+					policy.ticket_content_filters("Comment"),
+					(
+						[["custom_ticket", "not in", names]],
+						[["reference_doctype", "!=", "HD Ticket"], ["reference_name", "not in", names]],
+					),
+				)
+
+	def test_is_ticket_record_excluded_follows_the_owning_ticket(self):
+		set_agent_settings(excluded_teams=TEAM, excluded_title_prefixes="")
+		normal = self._ticket()
+		excluded = self._ticket(agent_group=TEAM)
+		for doctype, make in (
+			("HD Ticket", lambda ticket: ticket),
+			("Comment", self._comment),
+			("Communication", self._communication),
+			("File", lambda ticket: self._file("HD Ticket", ticket)),
+			("HD Ticket Comment", self._legacy_comment),
+			("Task", self._task),
+		):
+			with self.subTest(doctype=doctype):
+				self.assertFalse(policy.is_ticket_record_excluded(doctype, make(normal)))
+				self.assertTrue(policy.is_ticket_record_excluded(doctype, make(excluded)))
+		self.assertFalse(policy.is_ticket_record_excluded("User", "Administrator"))
+		self.assertFalse(policy.is_ticket_record_excluded("Comment", "không có bản ghi này"))
+		# Any one excluded ticket among the columns excludes the record.
+		comment = self._comment(normal)
+		with (
+			patch.object(policy, "ticket_link_fieldnames", return_value=("custom_ticket",)),
+			patch.object(
+				frappe.db,
+				"get_value",
+				return_value=frappe._dict(
+					reference_doctype="HD Ticket", reference_name=normal, custom_ticket=excluded
+				),
+			),
+		):
+			self.assertTrue(policy.is_ticket_record_excluded("Comment", comment))

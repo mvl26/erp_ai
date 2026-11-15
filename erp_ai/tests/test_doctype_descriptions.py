@@ -46,7 +46,8 @@ DOCTYPE_CONFIG = {
 				"(L0 giữ nguyên)",
 			),
 			# FEAT-007 design.md:182: the AC-16 watermark of section_activation.
-			"agent_enabled_at": ("Hệ thống tự ghi", "không sửa được"),
+			# T125 (design-w0-fixes-7.md ruling 2b): a site enabled before the upgrade gets the upgrade moment.
+			"agent_enabled_at": ("Hệ thống tự ghi", "không sửa được", "thời điểm nâng cấp"),
 			"unrestricted_enabled": (
 				"L1",
 				"người ra lệnh",

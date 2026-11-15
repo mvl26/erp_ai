@@ -68,6 +68,7 @@ LEFTOVER_LABELS = '["Lỗi phần mềm"]'
 
 EARLIER = "2025-12-31 08:00:00"
 ENABLED_AT = "2026-01-02 03:04:05"
+ENABLED_AT_MICROSECONDS = "2026-01-02 03:04:05.000123"
 LATER = "2026-02-03 04:05:06"
 
 
@@ -771,6 +772,17 @@ class TestFeat007Migrate(FrappeTestCase):
 				)
 				self._setup_at(ENABLED_AT)
 				self.assertEqual(self._enabled_at(), ENABLED_AT)
+
+	def test_agent_enabled_at_stored_as_form_save_shape(self):
+		"""T125, STD-DESIGN-3: the install path stores the raw shape a form save writes, str(datetime)."""
+		frappe.db.set_single_value(SETTING_DOCTYPE, "enabled", 1)
+		for moment in (ENABLED_AT, ENABLED_AT_MICROSECONDS):
+			with self.subTest(moment=moment):
+				frappe.db.delete("Singles", {"doctype": SETTING_DOCTYPE, "field": "agent_enabled_at"})
+				self._setup_at(moment)
+				raw = _stored_settings().get("agent_enabled_at", "<missing>")
+				self.assertEqual(raw, moment)
+				self.assertEqual(raw, str(frappe.utils.get_datetime(moment)))
 
 	def test_agent_enabled_at_already_set_is_kept(self):
 		frappe.db.set_single_value(SETTING_DOCTYPE, "enabled", 1)

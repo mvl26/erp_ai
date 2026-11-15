@@ -113,7 +113,8 @@ def _ensure_default_settings() -> None:
 	if frappe.db.get_single_value(SETTING_DOCTYPE, "enabled", cache=False) and not (
 		enabled_at and enabled_at[0][0]
 	):
-		frappe.db.set_single_value(SETTING_DOCTYPE, "agent_enabled_at", frappe.utils.now_datetime())
+		# str(datetime) is the shape a form save stores (space, no ".000000"); a datetime goes through isoformat().
+		frappe.db.set_single_value(SETTING_DOCTYPE, "agent_enabled_at", str(frappe.utils.now_datetime()))
 
 
 def _ensure_ticket_custom_fields() -> None:

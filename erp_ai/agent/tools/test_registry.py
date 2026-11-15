@@ -755,10 +755,24 @@ class TestGrantTable(FrappeTestCase):
 		)
 
 	def test_execute_asks_the_one_grant_function(self):
-		context = _context("L2", "boss@x.com", change_enabled=True, unrestricted=True)
+		# The context is chosen so context.grant_inputs() differs from the four-argument builder.
+		context = dataclasses.replace(
+			_context("L2", "boss@x.com", unrestricted=True),
+			record_tools=True,
+			act_now=True,
+			main_path_level="L1",
+		)
+		self.assertNotEqual(context.grant_inputs(), registry._legacy_inputs("L2", True, False, True))
 		with patch.object(registry, "grant", wraps=registry.grant) as granted:
 			execute_tool("get_ticket", {"name": "x"}, context)
 		granted.assert_called_once_with(context.grant_inputs())
+
+	def test_execute_grants_by_the_context_fields_not_the_legacy_switches(self):
+		# (2) on with (4) off still runs the record tools; the main-path level alone closes task tools.
+		records_only = dataclasses.replace(_context("L3", "boss@x.com"), record_tools=True)
+		self.assertNotEqual(execute_tool("api_list_records", {"doctype": "Note"}, records_only), NOT_GRANTED)
+		main_path_l0 = dataclasses.replace(_context("L3", "boss@x.com"), main_path_level="L0")
+		self.assertEqual(execute_tool("create_task", {}, main_path_l0), NOT_GRANTED)
 
 	def test_execute_denies_with_the_same_reason_when_grant_is_empty(self):
 		# The refusal text is unchanged: a tool missing from grant(...).specs is "not granted", the

@@ -4447,6 +4447,91 @@ SITE_ENVIRONMENT_SAMPLE = {
 }
 
 
+# ---------------------------------------------------------------------------------------------------
+# ADR-033 QĐ 4, arch-review w1a C-3 / ruling (2): the daily limit counts only RUN_LIMIT_TRIGGERS
+# ---------------------------------------------------------------------------------------------------
+
+RUN_LIMIT_TRIGGERS_NAME = "RUN_LIMIT_TRIGGERS"
+LOG_TRIGGERS_NAME = "TRIGGERS"
+
+
+def _module_strings(tree: ast.AST) -> dict:
+	"""`{name: value}` of the module-level `NAME = "text"` assignments."""
+	return {
+		target.id: node.value.value
+		for node in tree.body
+		if isinstance(node, ast.Assign)
+		and isinstance(node.value, ast.Constant)
+		and isinstance(node.value.value, str)
+		for target in node.targets
+		if isinstance(target, ast.Name)
+	}
+
+
+def _trigger_tuple(rel: str, source: str, name: str, constants: dict) -> tuple:
+	"""(trigger values or None, violations) of the module-level tuple `name` in `rel`; each element is a
+	string, or a string constant of erp_ai/constants.py or of the file itself."""
+	tree = parse(rel, source)
+	known = {**constants, **_module_strings(tree)}
+	nodes = [
+		node
+		for node in tree.body
+		if isinstance(node, ast.Assign) and any(getattr(t, "id", None) == name for t in node.targets)
+	]
+	if not nodes:
+		return None, [f"{rel}: {name} missing"]
+	node = nodes[-1]
+	if not isinstance(node.value, ast.Tuple):
+		return None, [f"{rel}:{node.lineno}: {name} is not a tuple of trigger names"]
+	values, violations = [], []
+	for element in node.value.elts:
+		if isinstance(element, ast.Constant) and isinstance(element.value, str):
+			values.append(element.value)
+		elif isinstance(element, ast.Name) and element.id in known:
+			values.append(known[element.id])
+		else:
+			violations.append(
+				f"{rel}:{element.lineno}: {name} element {ast.unparse(element)} is not a trigger name"
+			)
+	return tuple(values), violations
+
+
+def check_run_limit_triggers_subset_of_log_triggers(sources: dict) -> list:
+	"""ADR-033 QĐ 4, C-3: every trigger of policy.RUN_LIMIT_TRIGGERS is a trigger of run_log.TRIGGERS."""
+	for rel in (POLICY_FILE, RUN_LOG_FILE, CONSTANTS_FILE):
+		if rel not in sources:
+			return _missing(rel)
+	constants = _module_strings(parse(CONSTANTS_FILE, sources[CONSTANTS_FILE]))
+	limited, violations = _trigger_tuple(
+		POLICY_FILE, sources[POLICY_FILE], RUN_LIMIT_TRIGGERS_NAME, constants
+	)
+	logged, log_violations = _trigger_tuple(RUN_LOG_FILE, sources[RUN_LOG_FILE], LOG_TRIGGERS_NAME, constants)
+	violations += log_violations
+	if limited is not None and logged is not None:
+		violations.extend(
+			f"{POLICY_FILE}: {RUN_LIMIT_TRIGGERS_NAME} has {trigger!r}, not in {RUN_LOG_FILE} "
+			f"{LOG_TRIGGERS_NAME} (ADR-033 QĐ 4)"
+			for trigger in limited
+			if trigger not in logged
+		)
+	return violations
+
+
+# Compliant sample: policy names the two constants, the log lists the same triggers as strings.
+RUN_LIMIT_SAMPLE = {
+	CONSTANTS_FILE: (
+		'TRIGGER_TICKET_INSERT = "ticket_insert"\n'
+		'TRIGGER_COMMENT_MENTION = "comment_mention"\n'
+		'TRIGGER_KB_DRAFT = "kb_draft"\n'
+	),
+	POLICY_FILE: (
+		"from erp_ai.constants import TRIGGER_COMMENT_MENTION, TRIGGER_KB_DRAFT, TRIGGER_TICKET_INSERT\n\n"
+		"RUN_LIMIT_TRIGGERS = (TRIGGER_TICKET_INSERT, TRIGGER_COMMENT_MENTION)\n"
+	),
+	RUN_LOG_FILE: 'TRIGGERS = ("ticket_insert", "comment_mention")\n',
+}
+
+
 class TestArchitecture(unittest.TestCase):
 	@classmethod
 	def setUpClass(cls):
@@ -4799,6 +4884,85 @@ class TestArchitecture(unittest.TestCase):
 					check_site_environment_readers(changed(sample, rel, "\nX = settings.site_environment\n")),
 					[],
 				)
+
+	def test_run_limit_triggers_subset_of_log_triggers(self):
+		changed = TestScannersCatchViolations.changed
+		self.assertEqual(check_run_limit_triggers_subset_of_log_triggers(self.sources), [])
+		sample = RUN_LIMIT_SAMPLE
+		limit_line = "RUN_LIMIT_TRIGGERS = (TRIGGER_TICKET_INSERT, TRIGGER_COMMENT_MENTION)"
+		log_line = 'TRIGGERS = ("ticket_insert", "comment_mention")'
+		# A log trigger outside the limit (U6b's KB draft) is allowed, and the log may name the constants.
+		for case, log in {
+			"log has one more trigger": 'TRIGGERS = ("ticket_insert", "comment_mention", "kb_draft")',
+			"log names the constants": (
+				"from erp_ai.constants import TRIGGER_COMMENT_MENTION, TRIGGER_KB_DRAFT, TRIGGER_TICKET_INSERT\n"
+				"TRIGGERS = (TRIGGER_TICKET_INSERT, TRIGGER_COMMENT_MENTION, TRIGGER_KB_DRAFT)"
+			),
+		}.items():
+			with self.subTest(allowed=case):
+				allowed = changed(sample, RUN_LOG_FILE, replace=(log_line, log))
+				self.assertEqual(check_run_limit_triggers_subset_of_log_triggers(allowed), [])
+		not_logged = f"{RUN_LIMIT_TRIGGERS_NAME} has 'kb_draft', not in {RUN_LOG_FILE}"
+		self.assertRuleSamples(
+			check_run_limit_triggers_subset_of_log_triggers,
+			sample,
+			{
+				"limit names a trigger the log does not have": (
+					changed(
+						sample,
+						POLICY_FILE,
+						replace=(
+							limit_line,
+							"RUN_LIMIT_TRIGGERS = (TRIGGER_TICKET_INSERT, TRIGGER_KB_DRAFT)",
+						),
+					),
+					not_logged,
+				),
+				"limit lists a string the log does not have": (
+					changed(
+						sample,
+						POLICY_FILE,
+						replace=(limit_line, 'RUN_LIMIT_TRIGGERS = ("ticket_insert", "kb_draft")'),
+					),
+					not_logged,
+				),
+				"log drops a limit trigger": (
+					changed(sample, RUN_LOG_FILE, replace=(log_line, 'TRIGGERS = ("ticket_insert",)')),
+					f"{RUN_LIMIT_TRIGGERS_NAME} has 'comment_mention', not in {RUN_LOG_FILE}",
+				),
+				"limit missing": (
+					changed(sample, POLICY_FILE, replace=(limit_line, "")),
+					f"{POLICY_FILE}: {RUN_LIMIT_TRIGGERS_NAME} missing",
+				),
+				"log triggers missing": (
+					changed(sample, RUN_LOG_FILE, replace=(log_line, "")),
+					f"{RUN_LOG_FILE}: {LOG_TRIGGERS_NAME} missing",
+				),
+				"limit computed": (
+					changed(
+						sample,
+						POLICY_FILE,
+						replace=(limit_line, "RUN_LIMIT_TRIGGERS = tuple(VALID_TRIGGERS)"),
+					),
+					f"{POLICY_FILE}:3: {RUN_LIMIT_TRIGGERS_NAME} is not a tuple",
+				),
+				"limit names an unknown constant": (
+					changed(
+						sample,
+						POLICY_FILE,
+						replace=(
+							limit_line,
+							"RUN_LIMIT_TRIGGERS = (TRIGGER_TICKET_INSERT, TRIGGER_REQUESTER_REPLY)",
+						),
+					),
+					"element TRIGGER_REQUESTER_REPLY is not a trigger name",
+				),
+				"policy file missing": (
+					{rel: text for rel, text in sample.items() if rel != POLICY_FILE},
+					f"{POLICY_FILE}: file missing",
+				),
+			},
+		)
 
 	def test_entry_types_unchanged(self):
 		scanned = load_product_sources(suffixes=(".py", ".json"))

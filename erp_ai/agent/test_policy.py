@@ -10,7 +10,14 @@ from frappe.utils import now_datetime
 from helpdesk.test_utils import make_ticket
 
 from erp_ai.agent import policy
-from erp_ai.constants import CORE_APPS, LOG_DOCTYPE, SETTING_DOCTYPE
+from erp_ai.constants import (
+	CORE_APPS,
+	LOG_DOCTYPE,
+	SETTING_DOCTYPE,
+	TRIGGER_CHANGE_ACTION,
+	TRIGGER_COMMENT_MENTION,
+	TRIGGER_TICKET_INSERT,
+)
 from erp_ai.test_utils import TempAppsRoot, keep_agent_settings, set_agent_settings
 
 TEAM = "Nhân sự & Hành chính"
@@ -173,7 +180,14 @@ class TestPolicy(FrappeTestCase):
 
 	def _log(self, ticket, run_id, entry_type="classify", created=None):
 		log = frappe.get_doc(
-			{"doctype": LOG_DOCTYPE, "ticket": ticket, "run_id": run_id, "entry_type": entry_type, "turn": 0}
+			{
+				"doctype": LOG_DOCTYPE,
+				"ticket": ticket,
+				"run_id": run_id,
+				"entry_type": entry_type,
+				"trigger": TRIGGER_TICKET_INSERT,
+				"turn": 0,
+			}
 		).insert(ignore_permissions=True)
 		if created:
 			frappe.db.set_value(LOG_DOCTYPE, log.name, "creation", created, update_modified=False)
@@ -779,6 +793,39 @@ class TestConfidence(FrappeTestCase):
 		# A newer classify row with an unknown pct wins and reads None (no fallback to an older number).
 		self._classify_row(ticket, "C", -1, created=now + timedelta(minutes=1))
 		self.assertEqual(policy.latest_classification(ticket), ("C", None))
+
+
+class TestRunsToday(FrappeTestCase):
+	# arch-review w1a C-3 and ruling (2), ADR-033 QĐ 4: the daily limit counts only the runs started by a
+	# trigger of RUN_LIMIT_TRIGGERS; classify/reason rows of any other trigger (or none) are not a run.
+	def setUp(self):
+		commit_guard = patch.object(
+			frappe.db, "commit", side_effect=AssertionError("test must not commit the transaction")
+		)
+		commit_guard.start()
+		self.addCleanup(commit_guard.stop)
+		self.addCleanup(frappe.db.rollback)
+
+	def _log(self, ticket, run_id, entry_type, trigger):
+		frappe.get_doc(
+			{
+				"doctype": LOG_DOCTYPE,
+				"ticket": ticket,
+				"run_id": run_id,
+				"entry_type": entry_type,
+				"trigger": trigger,
+				"turn": 0,
+			}
+		).insert(ignore_permissions=True)
+
+	def test_counts_only_run_limit_triggers(self):
+		ticket = make_ticket(subject="T71 runs_today ticket").name
+		self._log(ticket, "insert", "classify", TRIGGER_TICKET_INSERT)
+		self._log(ticket, "mention", "reason", TRIGGER_COMMENT_MENTION)
+		self._log(ticket, "change-reason", "reason", TRIGGER_CHANGE_ACTION)
+		self._log(ticket, "change-classify", "classify", TRIGGER_CHANGE_ACTION)
+		self.assertEqual(policy.runs_today(ticket), 2)
+		self.assertEqual(policy.RUN_LIMIT_TRIGGERS, (TRIGGER_TICKET_INSERT, TRIGGER_COMMENT_MENTION))
 
 
 class TestSiteEnvironment(FrappeTestCase):

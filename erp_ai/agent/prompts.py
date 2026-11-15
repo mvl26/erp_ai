@@ -108,7 +108,7 @@ CÁCH LÀM VIỆC
 RULE_6_ACT = (
 	"6. Việc ghi trên phiếu (điền trường phân loại còn trống, gán người, tạo Task) mà bạn có tool thì làm"
 	" luôn, không hỏi. Việc ghi ngoài phiếu chỉ làm qua tool được cấp; tool nào tạo đề xuất thì việc đó chờ"
-	" người bấm Duyệt trong ngăn của bot."
+	' người bấm "Duyệt ngay" trong ngăn "Trao đổi với bot" của phiếu.'
 )
 RULE_6_ASK = "6. Lần này chỉ hỏi: không ghi gì, đăng đúng một comment hỏi."
 # In every flag combination, never overridden (w1.md:78).
@@ -130,10 +130,9 @@ _CORE_WRITING = """VIẾT COMMENT
 
 Tiếng Việt, giọng đồng nghiệp, không trang trọng quá. Ngắn. Cấu trúc:
 
-**Nhận định:** nguyên nhân, một hai câu.
-**Căn cứ:** bản ghi hoặc dòng code cụ thể đã xem (ghi rõ file và số dòng).
-**Hướng xử lý:** các bước người cần làm hoặc bot sẽ làm.
-Không tự liệt kê việc đã làm, đề xuất đang chờ hay việc bị từ chối: bot tự thêm các mục "Đã làm", "Chờ duyệt", "Cần ai quyết" từ những gì đã ghi trong lần chạy.
+**Nhận định:** nguyên nhân, một hai câu; nêu luôn bản ghi, dòng code (file và số dòng) hoặc nguồn tra cứu đã dựa vào.
+**Hướng xử lý:** phương án của bot: các bước bot sẽ làm sau khi người bấm "Duyệt ngay" (nếu có đề xuất) và các bước người phải làm tay, kèm lý do. Cần người chọn giữa hai cách thì chọn một cách, nêu cách kia ngay trong mục này.
+Không tự liệt kê việc đã làm, đề xuất đang chờ hay đề xuất tool không tạo được: bot tự thêm các mục "Đã làm", "Chờ duyệt" và tự ghi đề xuất không tạo được vào "Hướng xử lý" như việc người phải làm tay, kèm lý do.
 
 Không dùng bullet khi chỉ có một điểm. Không nhắc lại nội dung phiếu —
 người đọc vừa viết nó. Không xin lỗi, không rào trước.
@@ -254,7 +253,7 @@ dụng, và quy tắc 6 được thay bằng các quy tắc dưới đây:
 ACT_NOW_BLOCK = """LÀM LUÔN, KHÔNG HỎI LẠI
 
 Khi người ra lệnh (comment có role "chỉ thị") giao một việc mà bạn có tool để làm,
-các quy tắc dưới đây thay cho quy tắc 6 và cho mục "Cần ai quyết" của comment:
+các quy tắc dưới đây thay cho quy tắc 6:
 - Làm ngay trong lượt này. Không hỏi lại "có muốn tôi làm không", không xin xác
   nhận, không chờ chữ "ok", không đề nghị người khác làm việc bạn tự làm được.
 - Tạo hoặc sửa bản ghi: gọi tool luôn, rồi báo đã làm gì.
@@ -267,8 +266,8 @@ các quy tắc dưới đây thay cho quy tắc 6 và cho mục "Cần ai quyế
 - Thiếu một thông tin bắt buộc mà không tra được bằng tool (ví dụ email của người
   cần tạo tài khoản) thì hỏi đúng một câu về thông tin đó. Các lựa chọn còn lại tự
   quyết theo cách hợp lý nhất và nêu trong comment.
-- Chỉ ghi "Cần ai quyết" khi tool trả ok=false hoặc việc nằm ngoài các tool bạn có;
-  khi đó nêu đúng lý do tool trả về."""
+- Việc nằm ngoài các tool bạn có thì ghi trong "Hướng xử lý" là việc người phải làm
+  tay, kèm lý do. Tool trả ok=false thì không thử đường khác."""
 
 # Appended last when the confidence is below the threshold (U1.md:229); the question itself belongs to U4b.
 ASK_ONLY_BLOCK = """CHỈ HỎI — ĐỘ TIN CẬY DƯỚI NGƯỠNG
@@ -296,6 +295,9 @@ PROMPT_CONFLICT_PAIRS: tuple[tuple[str, str], ...] = (
 	('chờ một chữ "ok"', "không bao giờ là duyệt"),
 	# P-9: doing everything at once against writes outside the ticket going through granted tools
 	("Việc hoàn tác được thì làm luôn", "Việc ghi ngoài phiếu chỉ làm qua tool được cấp"),
+	# P-10, P-11 (spec-addendum-5 AC-65 (a)): the retired headings of the old VIẾT COMMENT against the new direction line
+	("**Căn cứ:**", "**Hướng xử lý:** phương án của bot"),
+	("**Cần ai quyết:**", "**Hướng xử lý:** phương án của bot"),
 )
 
 TASK_NEW_TICKET = "Việc cần làm: phiếu mới. Gọi set_resolution_hint một lần, rồi post_comment nếu cần."

@@ -2342,7 +2342,8 @@ PROMPT_PARTS = {
 		"prompt_override_reasoning",
 		"chỉ dẫn lập luận",
 		prompts.CORE_PROMPT,
-		("**Nhận định:**", "**Căn cứ:**", "**Hướng xử lý:**"),
+		# spec changed (spec-addendum-5 AC-38): "Căn cứ" is no longer required.
+		("**Nhận định:**", "**Hướng xử lý:**"),
 	),
 	"category_guide": (
 		"prompt_override_category_guide",
@@ -2636,6 +2637,36 @@ class TestPromptOverrides(FrappeTestCase):
 		value = prompts.CORE_PROMPT + "\n**Cần ai quyết:** nếu có."
 		self.assertIsNone(self._save(prompt_override_reasoning=value))
 		self.assertEqual(self._stored("prompt_override_reasoning"), value)
+
+	def test_reasoning_override_from_before_addendum_5_still_saves(self):
+		# spec-addendum-5 AC-38: an override still holding "Căn cứ" and "Cần ai quyết" saves as written.
+		value = (
+			prompts.CORE_PROMPT
+			+ "\n**Căn cứ:** bản ghi hoặc dòng code cụ thể đã xem (ghi rõ file và số dòng).\n**Cần ai quyết:** nếu có."
+		)
+		self.assertIsNone(self._save(prompt_override_reasoning=value))
+		self.assertEqual(self._stored("prompt_override_reasoning"), value)
+
+	def test_reasoning_override_without_evidence_heading_saves(self):
+		# spec-addendum-5 AC-38: the required headings are "Nhận định" and "Hướng xử lý"; "Căn cứ" alone does not
+		# stand in for "Hướng xử lý".
+		value = "**Nhận định:** a\n**Hướng xử lý:** b"
+		self.assertIsNone(self._save(prompt_override_reasoning=value))
+		self.assertEqual(self._stored("prompt_override_reasoning"), value)
+		self.assertEqual(
+			self._save(prompt_override_reasoning="**Nhận định:** a\n**Căn cứ:** c"),
+			_missing_error("chỉ dẫn lập luận", "**Hướng xử lý:**"),
+		)
+		self.assertEqual(self._stored("prompt_override_reasoning"), value)
+
+	def test_builtin_reasoning_has_no_retired_heading(self):
+		# spec-addendum-5 AC-38, AC-65 (a): the built-in prompt and the form description no longer name the
+		# retired headings as headings.
+		for heading in ("Căn cứ", "Cần ai quyết"):
+			self.assertNotIn(heading, prompts.CORE_PROMPT)
+		description = frappe.get_meta(SETTING_DOCTYPE).get_field("prompt_override_reasoning").description
+		for heading in ("**Căn cứ:**", "**Cần ai quyết:**"):
+			self.assertNotIn(heading, description)
 
 	def test_markers_need_their_exact_form(self):
 		# classify: a key without its JSON quotes does not count; category_guide: the row must start the line

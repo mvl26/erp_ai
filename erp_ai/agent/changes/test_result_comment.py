@@ -359,6 +359,62 @@ class TestRestartNotice(ResultCommentTestCase):
 		self.assertIn("hoàn tác", row.content)
 		self.assertNotIn(APPLY_SHA[:12], row.content)
 
+	@staticmethod
+	def expected_without_commit(name, verb):
+		"""The no-commit template of addendum-5 P-2."""
+		return (
+			f"Đề xuất {name} đã {verb}. Hệ thống sắp restart bench. "
+			"Nếu site không lên sau vài phút: trên máy chủ chạy `bench restart`."
+		)
+
+	def assert_names_no_commit(self, text):
+		for part in ("None", "commit", "git -C", "apps/", "nhánh", NOTICE_APP, NOTICE_BRANCH):
+			self.assertNotIn(part, text)
+
+	def test_command_only_apply_notice_has_no_commit_branch_app(self):
+		for sha in (None, ""):
+			with self.subTest(sha=sha):
+				fields = frappe._dict(
+					name="P-9",
+					ticket="T-1",
+					app=None,
+					target_branch=None,
+					applied_branch=None,
+					apply_commit_sha=sha,
+					undo_commit_sha=None,
+				)
+				text = result_comment.restart_notice_text(fields, "apply")
+				self.assertEqual(text, self.expected_without_commit("P-9", "áp dụng"))
+				self.assert_names_no_commit(text)
+
+	def test_undo_without_commit_notice_text(self):
+		for sha in (None, ""):
+			with self.subTest(sha=sha):
+				fields = frappe._dict(
+					name="P-9",
+					ticket="T-1",
+					app=None,
+					target_branch=None,
+					applied_branch=None,
+					apply_commit_sha=APPLY_SHA,
+					undo_commit_sha=sha,
+				)
+				text = result_comment.restart_notice_text(fields, "undo")
+				self.assertEqual(text, self.expected_without_commit("P-9", "hoàn tác"))
+				self.assert_names_no_commit(text)
+		name = self.notice_proposal(undo_commit_sha="")
+		row = self.new_comments("undo", name)
+		self.assertEqual(
+			row.content, frappe.utils.escape_html(self.expected_without_commit(name, "hoàn tác"))
+		)
+		self.assert_names_no_commit(row.content)
+
+	def test_apply_without_commit_comment_on_ticket(self):
+		name = self.notice_proposal(apply_commit_sha="")
+		row = self.new_comments("apply", name)
+		self.assertEqual(row.content, frappe.utils.escape_html(self.expected_without_commit(name, "áp dụng")))
+		self.assert_names_no_commit(row.content)
+
 	def test_no_remote_url_or_token(self):
 		name = self.notice_proposal()
 		for action in ("apply", "undo"):
@@ -368,6 +424,9 @@ class TestRestartNotice(ResultCommentTestCase):
 					self.assertNotIn(part, content)
 
 	def test_info_comment_session_user_not_result_prefix(self):
+		"""Addendum-5 P-2 (RQ-4): 0 calls of its own to `frappe.set_user`, `frappe.publish_realtime` and
+		`new_comment`; the only realtime events are the `doc_update` and `list_update` Frappe sends when the
+		new Comment is inserted (`Document.notify_update`), as for `post_result`."""
 		name = self.notice_proposal()
 		frappe.set_user(APPROVER)
 		with (
@@ -377,8 +436,8 @@ class TestRestartNotice(ResultCommentTestCase):
 		):
 			row = self.new_comments("apply", name)
 			set_user.assert_not_called()
-			# Zero calls of its own: only Frappe's after-commit refresh of the new Comment row
-			# (`Document.notify_update`, sent for every inserted document), the same as `post_result`.
+			# 0 calls of its own; the only events are `doc_update` and `list_update` that Frappe sends
+			# on `insert` of the new Comment (`Document.notify_update`), the same as `post_result`.
 			self.assertEqual(
 				[
 					(call.args[0], call.kwargs.get("doctype"), call.kwargs.get("docname"))

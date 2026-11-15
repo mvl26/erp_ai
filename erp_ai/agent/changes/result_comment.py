@@ -114,9 +114,19 @@ NOTICE_ACTIONS = {"apply": ("áp dụng", "apply_commit_sha"), "undo": ("hoàn t
 
 
 def restart_notice_text(fields: dict, action: str) -> str:
-	"""The comment written before a restart (CHG-002 design 3.7, AC-46 b); pure, unknown action → KeyError."""
+	"""The comment written before a restart (CHG-002 design 3.7, AC-46 b); pure, unknown action → KeyError.
+
+	The action's sha set → the commit template: commit, branch, app and the `git revert` recovery.
+	The sha empty (`None` or "") → the no-commit template of addendum-5 P-2: only `bench restart`, and
+	neither `app` nor a branch is read.
+	"""
 	verb, sha_field = NOTICE_ACTIONS[action]
 	sha = fields.get(sha_field) or ""
+	if not sha:
+		return (
+			f"Đề xuất {fields.get('name')} đã {verb}. Hệ thống sắp restart bench. "
+			"Nếu site không lên sau vài phút: trên máy chủ chạy `bench restart`."
+		)
 	app = fields.get("app")
 	branch = fields.get("applied_branch") or fields.get("target_branch")
 	return (

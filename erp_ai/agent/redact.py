@@ -1,7 +1,7 @@
 """Secret masking shared by logs, tool results, Error Log reads and emails (NFR-6, ADR-034 QĐ 2).
 
 Rules N-1..N-7, K-1..K-8, R-1..R-5 of `design-w0-fixes-3.md` section 3, with K-4, K-4a and K-8 as
-amended by `design-w0-fixes-4.md` point 3 and K-7 as amended by `design-w1-fixes-2.md` point 3. One word
+amended by `design-w0-fixes-4.md` point 3, K-4b added and K-7 as amended by `design-w1-fixes-5.md`. One word
 list (`SECRET_WORDS`) drives both `is_secret_key` and the key-value scan of `redact_secrets`. Output is
 always NFC (3a).
 """
@@ -68,6 +68,29 @@ def _name_segments(name: str) -> tuple[str, ...]:
 
 _SECRET_WORD_SEGMENTS = tuple(_name_segments(word) for word in SECRET_WORDS)
 
+_WORD_START = re.compile(r"(?<![\w-])[\w-]")
+_NOT_WORD_CHAR = re.compile(r"[^\w-]")
+
+
+def _secret_value_end(text: str, start: int, end: int) -> int:
+	"""K-4b: end of the secret bare value or K-7 tail read over `text[start:end]`.
+
+	Stops at the first `MASK` or key candidate with a secret name inside it, less the non-word
+	characters just before that point; otherwise `end`.
+	"""
+	stop = text.find(MASK, start, end + len(MASK) - 1)
+	stop = end if stop == -1 else stop
+	for word in _WORD_START.finditer(text, start, stop):
+		candidate = _KEY_CANDIDATE.match(text, word.start())
+		if candidate and is_secret_key(candidate.group("name")):
+			stop = word.start()
+			break
+	if stop == end:
+		return end
+	while stop > start and _NOT_WORD_CHAR.match(text, stop - 1):
+		stop -= 1
+	return stop
+
 
 def _mask_key_values(text: str) -> str:
 	"""K-1..K-8: mask the value after each key-name candidate that `is_secret_key` accepts; one pass."""
@@ -80,18 +103,20 @@ def _mask_key_values(text: str) -> str:
 			parts.append(MASK)
 			position += len(MASK)
 			if is_secret_key(candidate.group("name")):
-				position = _BARE_VALUE_TAIL.match(text, position).end()
+				position = _secret_value_end(text, position, _BARE_VALUE_TAIL.match(text, position).end())
 			continue
 		value = _KEY_VALUE.match(text, position)
 		if value is None or not is_secret_key(candidate.group("name")):
 			continue
 		if value.group("double") is not None:
 			parts.append(f'"{MASK}"')
+			position = value.end()
 		elif value.group("single") is not None:
 			parts.append(f"'{MASK}'")
-		else:
+			position = value.end()
+		elif (end := _secret_value_end(text, position, value.end())) > position:
 			parts.append(MASK)
-		position = value.end()
+			position = end
 	parts.append(text[position:])
 	return "".join(parts)
 

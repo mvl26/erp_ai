@@ -188,7 +188,18 @@ POLICY_FIELDS = (
 	"code_change_enabled",
 	"code_change_apps",
 	"unrestricted_enabled",
+	"record_tools_enabled",
+	"act_now_enabled",
+	"one_click_approval_enabled",
+	"level_cap_a",
+	"level_cap_b",
+	"level_cap_c",
+	"level_cap_d",
+	"level_cap_e",
+	"level_cap_f",
+	"confidence_threshold",
 )
+SETTING_CONTROLLER_FILE = "erp_ai_agent/doctype/erp_ai_setting/erp_ai_setting.py"
 
 SECRET_READERS = ("get_decrypted_password", "get_password")
 SECRET_NAMES = ("api_key", "apikey", "secret", "password", "token")
@@ -885,8 +896,8 @@ def check_policy_fields_only_in_policy(sources: dict) -> list:
 	"""ADR-003/ADR-005: level and send-policy fields are read only by agent/policy.py."""
 	violations = []
 	for rel, source in only_python(sources).items():
-		if rel == POLICY_FILE:
-			continue
+		if rel in (POLICY_FILE, SETTING_CONTROLLER_FILE):
+			continue  # the controller of ERP AI Setting owns its own fields (INT_LIMITS, validation)
 		tree = parse(rel, source)
 		aliases = import_aliases(tree)
 		for node in ast.walk(tree):
@@ -897,6 +908,78 @@ def check_policy_fields_only_in_policy(sources: dict) -> list:
 				violations.append(violation(rel, node, f"reads {name} outside {POLICY_FILE}"))
 			elif isinstance(node, ast.Constant) and node.value in POLICY_FIELDS:
 				violations.append(violation(rel, node, f"reads {node.value!r} outside {POLICY_FILE}"))
+	return violations
+
+
+ORDERING_OPS = (ast.Lt, ast.LtE, ast.Gt, ast.GtE)
+CONFIDENCE_EXACT_NAMES = ("threshold", "do_tin_cay_pct")
+CONFIDENCE_RANGE_BOUNDS = ("CONFIDENCE_PCT_MIN", "CONFIDENCE_PCT_MAX")
+SPEND_NAMES = ("spent_this_month_usd", "monthly_budget_usd", "month_spend_usd")
+
+
+def operand_names(node) -> set:
+	"""referenced_name of every Name/Attribute inside one compare operand, plus every str Constant inside it."""
+	names = set()
+	for child in ast.walk(node):
+		name = referenced_name(child)
+		if name:
+			names.add(name)
+		elif isinstance(child, ast.Constant) and isinstance(child.value, str):
+			names.add(child.value)
+	return names
+
+
+def ordering_compares(tree: ast.AST):
+	"""Every Compare node with at least one <, <=, >, >= (is/in/==/!= alone are not a threshold or budget decision)."""
+	for node in ast.walk(tree):
+		if isinstance(node, ast.Compare) and any(isinstance(op, ORDERING_OPS) for op in node.ops):
+			yield node
+
+
+def is_confidence_name(name: str) -> bool:
+	lowered = name.lower()
+	return (
+		lowered in CONFIDENCE_EXACT_NAMES
+		or "confidence_threshold" in lowered
+		or lowered.endswith("confidence_pct")
+	)
+
+
+def check_threshold_compared_only_in_policy(sources: dict) -> list:
+	"""ADR-030 QĐ 4: a confidence value is compared with a threshold only in agent/policy.py."""
+	violations = []
+	for rel, source in only_python(sources).items():
+		if rel == POLICY_FILE:
+			continue
+		for compare in ordering_compares(parse(rel, source)):
+			operands = [compare.left, *compare.comparators]
+			matched = [o for o in operands if any(is_confidence_name(n) for n in operand_names(o))]
+			if not matched:
+				continue
+			others = [o for o in operands if all(o is not m for m in matched)]
+			if (
+				len(matched) == 1
+				and others
+				and all(referenced_name(o) in CONFIDENCE_RANGE_BOUNDS for o in others)
+			):
+				continue  # range check of a parsed pct against its declared bounds (classification.py)
+			name = sorted(n for n in operand_names(matched[0]) if is_confidence_name(n))[0]
+			violations.append(violation(rel, compare, f"compares {name} outside {POLICY_FILE}"))
+	return violations
+
+
+def check_no_spent_comparison_outside_policy(sources: dict) -> list:
+	"""AC-61, ADR-030: spend is compared with the budget only in agent/policy.py (policy.is_over_budget)."""
+	violations = []
+	for rel, source in only_python(sources).items():
+		if rel == POLICY_FILE:
+			continue
+		for compare in ordering_compares(parse(rel, source)):
+			for operand in [compare.left, *compare.comparators]:
+				names = sorted(operand_names(operand) & set(SPEND_NAMES))
+				if names:
+					violations.append(violation(rel, compare, f"compares {names[0]} outside {POLICY_FILE}"))
+					break
 	return violations
 
 
@@ -4159,6 +4242,45 @@ def check_registry_has_one_grant_function(sources: dict) -> list:
 				f"{RUNNER_FILE}: schema calls {[violation(RUNNER_FILE, n, name) for n, name in schema_calls]}; "
 				f"exactly one .{RUNNER_SCHEMA_CALL}() call on the grant (ADR-023)"
 			)
+	return violations
+
+
+GRANT_REMOVED_PREFIX = "grants_"
+RUNNER_REMOVED_NAMES = (*REMOVED_GRANT_NAMES, "_legacy_inputs", "_grants_group", SCHEMA_FUNCTION)
+LIST_MUTATORS = ("append", "extend", "insert", "remove", "pop", "clear", "sort")
+
+
+def check_runner_takes_tools_and_flags_from_grant(sources: dict) -> list:
+	"""AC-3, ADR-023: runner.py takes its tool schemas and prompt flags from the Grant only: no call or
+	reference to the removed grant functions or `get_tool_schemas`, no list mutation or filtering of the
+	tools list that `.schemas()` returned."""
+	if RUNNER_FILE not in sources:
+		return []
+	tree = parse(RUNNER_FILE, sources[RUNNER_FILE])
+	aliases, docstrings = import_aliases(tree), _docstring_ids(tree)
+	violations = []
+	for node in ast.walk(tree):
+		for text in _node_texts(node, aliases, docstrings):
+			last = text.rpartition(".")[2]
+			if last in RUNNER_REMOVED_NAMES or last.startswith(GRANT_REMOVED_PREFIX):
+				violations.append(
+					violation(RUNNER_FILE, node, f"uses {last}; take tools and flags from grant()")
+				)
+		if isinstance(node, ast.Assign) and any(
+			isinstance(target, ast.Name) and target.id == "tools" for target in node.targets
+		):
+			if any(isinstance(child, ast.comprehension) for child in ast.walk(node.value)):
+				violations.append(
+					violation(RUNNER_FILE, node, "filters tools; take them from Grant.schemas()")
+				)
+		if (
+			isinstance(node, ast.Call)
+			and isinstance(node.func, ast.Attribute)
+			and node.func.attr in LIST_MUTATORS
+			and isinstance(node.func.value, ast.Name)
+			and node.func.value.id == "tools"
+		):
+			violations.append(violation(RUNNER_FILE, node, f"mutates tools with .{node.func.attr}()"))
 	return violations
 
 

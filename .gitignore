@@ -10,6 +10,8 @@ __pycache__
 .team/current.json
 .team/plugin_root
 .team/active-build
+.team/active-build-*
+.team/*.lock
 .team/session/
 .claude/settings.local.json
 .claude/worktrees/

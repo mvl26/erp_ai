@@ -6,3 +6,4 @@
 - [Frappe add_comment realtime](frappe_add_comment_realtime.md) — add_comment always sends doc_update+list_update; "0 publish_realtime" in designs = none of our own (CHG-002 T31)
 - [Static-pin mutation method](static_pin_mutation_method.md) — hook blocks python/bench for reviewer; use `sed -z ... | grep -Pzc pin` per mutation
 - [Claimed tests missing from diff](recurring-defects.md) — T5 r2: dev named a test not in the diff; FEAT-003 T11 r2: import/handle added, assertion never written; FEAT-006 T2 r2: fix left uncommitted, same tree; CHG-002 T25: L-1 declared, no test-shape lines; T9/T25 r2 test-shape names a nonexistent subtest; T28 L-1/L-2 counts and body lines miss task-ordered drops; T30 test-shape lines miss the `— design §x.y (addendum-2 L-1)` tail
+- [redact.py rulings regress](redact-rulings-regress.md) — 2026-11-15: two redact rulings in a row shipped a leak / an O(n^2) cut; time inputs at N, 2N, 4N

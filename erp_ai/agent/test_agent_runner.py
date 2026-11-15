@@ -3913,3 +3913,191 @@ class TestRunNotices(RunnerTestBase):
 		self.assertEqual(entry, self._entry(notice, "daily_limit"))
 		# the second notice was refused as already sent: nothing written, so no entry
 		self.assertFalse(second.actions)
+
+
+def classify_at(pct):
+	return make_model_result(
+		text=json.dumps({"dau_muc": "A", "do_tin_cay": "Cao", "do_tin_cay_pct": pct, "ly_do": "x"})
+	)
+
+
+ASK_EVIDENCE = f"**Căn cứ:** {PREFIX}phiếu chưa nói màn hình nào"
+# What a run below the threshold must leave as it was on the ticket.
+ASK_TICKET_FIELDS = (*CLASSIFY_FIELDS, "ai_confidence_pct")
+
+
+class TestAskOnly(RunnerTestBase):
+	"""AC-22 (T111, U4b.md:252, U4b-fixes Fix 9): a run below the threshold ends with exactly one question: the
+	model's own (kind=hoi, once) or, when it asked nothing, the run's ask_fallback notice on its last turn."""
+
+	def setUp(self):
+		super().setUp()
+		keep_agent_settings(self)
+		# the stub's category A is inside CATEGORIES: its cap is set here, never read from the shared site
+		set_agent_settings(
+			permission_level="L1",
+			level_cap_a="L1",
+			act_now_enabled=0,
+			confidence_threshold=policy.DEFAULT_CONFIDENCE_THRESHOLD,
+		)
+		# the footer reads this run's own classify row
+		self.latest_classification.side_effect = self.real_latest_classification
+		log_error = patch.object(frappe, "log_error")
+		self.log_error = log_error.start()
+		self.addCleanup(log_error.stop)
+
+	def _fallbacks(self, ticket=None):
+		prefix = write_ticket.NOTICE_PREFIXES["ask_fallback"]
+		return frappe.get_all(
+			"Comment",
+			filters={
+				**authority.ticket_comment_filters(ticket or self.ticket.name),
+				"content": ["like", f"{prefix}%"],
+			},
+			pluck="name",
+		)
+
+	def _comments(self, ticket=None):
+		return frappe.get_all(
+			"Comment", filters=authority.ticket_comment_filters(ticket or self.ticket.name), pluck="content"
+		)
+
+	def _fallback_text(self, pct, threshold=policy.DEFAULT_CONFIDENCE_THRESHOLD):
+		footer = write_ticket.ASK_FOOTER.format(pct=f"{pct}%", threshold=threshold)
+		return f"{write_ticket.NOTICE_PREFIXES['ask_fallback']} {runner.ASK_FALLBACK_BODY}\n\n{footer}"
+
+	def _ask(self, block_id, content):
+		return tool_use(block_id, "post_comment", kind="hoi", content=content)
+
+	def test_stub_69_70_100(self):
+		for pct in (69, 70, 100):
+			with self.subTest(pct=pct):
+				ticket = make_ticket(subject=f"{PREFIX}ask {pct}").name
+				before = frappe.db.get_value("HD Ticket", ticket, ASK_TICKET_FIELDS, as_dict=True)
+				self.gateway.results = [classify_at(pct), make_model_result()]
+				runner.run_for_ticket(ticket, "ticket_insert")
+
+				(entry,) = frappe.get_all(LOG_DOCTYPE, {"ticket": ticket, "entry_type": "classify"}, ["*"])
+				if pct < policy.DEFAULT_CONFIDENCE_THRESHOLD:
+					# nothing written on the ticket; the one comment is the question
+					self.assertEqual((entry.applied, entry.actions), (0, None))
+					self.assertEqual(
+						frappe.db.get_value("HD Ticket", ticket, ASK_TICKET_FIELDS, as_dict=True), before
+					)
+					self.assertEqual(self._comments(ticket), [self._fallback_text(pct)])
+				else:
+					self.assertEqual(entry.applied, 1)
+					self.assertEqual(self._fallbacks(ticket), [])
+
+	def test_model_posts_nothing_fallback_one_comment(self):
+		self.gateway.results = [
+			classify_at(69),
+			tool_turn(tool_use("t_read", "get_ticket")),
+			make_model_result(),
+		]
+		self._run()
+
+		(fallback,) = self._fallbacks()
+		self.assertEqual(self._comments(), [self._fallback_text(69)])
+		first, last = self._entries(entry_type="reason")
+		self.assertFalse(first.actions)
+		instructor = authority.run_instructor(self.ticket.name, "ticket_insert")
+		self.assertEqual(
+			json.loads(last.actions),
+			[
+				action_entry(
+					runner.NOTICE_TOOL,
+					"Comment",
+					fallback,
+					True,
+					value_after={"notice": "ask_fallback"},
+					instructor=instructor,
+				)
+			],
+		)
+
+	def test_model_asks_twice_one_posted(self):
+		question = f"{PREFIX}màn hình nào báo lỗi?\n{ASK_EVIDENCE}"
+		self.gateway.results = [
+			classify_at(69),
+			tool_turn(self._ask("t_ask1", question), self._ask("t_ask2", question)),
+			make_model_result(),
+		]
+		self._run()
+
+		(posted,) = self._comments()
+		self.assertTrue(posted.startswith(question))
+		self.assertEqual(self._fallbacks(), [])
+		results = {
+			block["tool_use_id"]: json.loads(block["content"])
+			for block in self.gateway.calls[2]["messages"][-1]["content"]
+		}
+		self.assertTrue(results["t_ask1"]["ok"])
+		self.assertEqual(results["t_ask2"], {"ok": False, "reason": write_ticket.REASON_ONE_ASK})
+
+	def test_marked_run_no_fallback(self):
+		# the run already asked (a question by email counts too, Fix 9): the last turn adds nothing
+		run_id = f"{PREFIX}asked-{frappe.generate_hash(length=10)}"
+		write_ticket.mark_asked(run_id)
+		fixed = MagicMock()
+		fixed.uuid4.return_value.hex = run_id
+		self.gateway.results = [classify_at(69), make_model_result()]
+		with patch.object(runner, "uuid", fixed):
+			self._run()
+
+		(entry,) = self._entries(entry_type="reason")
+		self.assertEqual(entry.run_id, run_id)
+		self.assertFalse(entry.actions)
+		self.assertEqual(self._comments(), [])
+
+	def test_threshold_80_with_75_asks(self):
+		set_agent_settings(confidence_threshold=80)
+		self.gateway.results = [classify_at(75), make_model_result()]
+		self._run()
+
+		(entry,) = self._entries(entry_type="classify")
+		self.assertEqual(entry.applied, 0)
+		self.assertEqual(self._comments(), [self._fallback_text(75, threshold=80)])
+
+	def test_missing_evidence_error_reaches_model_comment_not_posted(self):
+		question = f"{PREFIX}máy in nào?"
+		self.gateway.results = [classify_at(69), tool_turn(self._ask("t_ask", question)), make_model_result()]
+		self._run()
+
+		blocks = self.gateway.calls[2]["messages"][-1]["content"]
+		(result,) = [json.loads(block["content"]) for block in blocks if block["tool_use_id"] == "t_ask"]
+		self.assertEqual(result, {"ok": False, "reason": write_ticket.REASON_NO_EVIDENCE})
+		# the refused question is never posted; the run's one question is its fallback
+		comments = self._comments()
+		self.assertFalse([text for text in comments if question in text])
+		self.assertEqual(comments, [self._fallback_text(69)])
+
+
+class TestConfidenceSource(RunnerTestBase):
+	"""AC-22 (W-2, U4b-fixes Fix 2, T111): the number on the ticket is the classification step's, never the model's."""
+
+	def setUp(self):
+		super().setUp()
+		keep_agent_settings(self)
+		set_agent_settings(permission_level="L1", level_cap_a="L1", act_now_enabled=0)
+		self.latest_classification.side_effect = self.real_latest_classification
+		log_error = patch.object(frappe, "log_error")
+		self.log_error = log_error.start()
+		self.addCleanup(log_error.stop)
+
+	def test_after_mention_ticket_pct_equals_latest_classification(self):
+		self.gateway.results = [classify_at(85), make_model_result()]
+		self._run()
+		self.assertEqual(frappe.db.get_value("HD Ticket", self.ticket.name, "ai_confidence_pct"), 85)
+
+		self.gateway.results = [
+			tool_turn(
+				tool_use("t_cls", "set_classification", category="A", confidence="Cao", confidence_pct=40)
+			),
+			make_model_result(),
+		]
+		self._run("comment_mention")
+
+		self.assertEqual(frappe.db.get_value("HD Ticket", self.ticket.name, "ai_confidence_pct"), 85)
+		self.assertEqual(self.real_latest_classification(self.ticket.name), ("A", 85))
+		self.log_error.assert_not_called()

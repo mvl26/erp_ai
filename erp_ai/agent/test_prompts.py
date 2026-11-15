@@ -65,18 +65,48 @@ viết tự tin thì tệ hơn việc nói "chưa đủ dữ kiện, cần xem t
 RULE_6_START = "\n6. "
 LIMITS_START = "\n\nGIỚI HẠN"
 WRITING_START = "\n\nVIẾT COMMENT"
-# The old text up to rule 6, and from GIỚI HẠN on; VIẾT COMMENT stays the old text until T79.
+# The old text up to rule 6, and from GIỚI HẠN on.
 OLD_HEAD = OLD_CORE_PROMPT[: OLD_CORE_PROMPT.index(RULE_6_START) + 1]
 OLD_LIMITS = OLD_CORE_PROMPT[OLD_CORE_PROMPT.index(LIMITS_START) : OLD_CORE_PROMPT.index(WRITING_START)]
 OLD_WRITING = OLD_CORE_PROMPT[OLD_CORE_PROMPT.index(WRITING_START) :]
 
-# The block each flag appends to the reason prompt (U1.md:227); ASK_ONLY_BLOCK arrives with T79.
-FLAG_BLOCKS = (
-	("change_tools", prompts.CHANGE_TOOLS_BLOCK),
-	("site_admin_tools", prompts.SITE_ADMIN_TOOLS_BLOCK),
-	("unrestricted_tools", prompts.UNRESTRICTED_TOOLS_BLOCK),
-	("act_now", prompts.ACT_NOW_BLOCK),
-)
+# spec changed (AC-23 [changed], AC-65 (a), U1-5 of w1.md:80): in VIẾT COMMENT only these lines change; the bot
+# writes the "Cần ai quyết" section itself. The rest of VIẾT COMMENT stays the old text byte for byte.
+OLD_WRITING_LINES = """**Hướng xử lý:** các bước. Nếu bạn đã làm thì nói đã làm gì.
+**Cần ai quyết:** nếu có.
+"""
+U1_5_WRITING_LINES = """**Hướng xử lý:** các bước người cần làm hoặc bot sẽ làm.
+Không tự liệt kê việc đã làm, đề xuất đang chờ hay việc bị từ chối: bot tự thêm các mục "Đã làm", "Chờ duyệt", "Cần ai quyết" từ những gì đã ghi trong lần chạy.
+"""
+NEW_WRITING = OLD_WRITING.replace(OLD_WRITING_LINES, U1_5_WRITING_LINES)
+
+
+def _flag_blocks():
+	"""The block each flag appends to the reason prompt, in prompt order (U1.md:227)."""
+	return (
+		("change_tools", prompts.CHANGE_TOOLS_BLOCK),
+		("site_admin_tools", prompts.SITE_ADMIN_TOOLS_BLOCK),
+		("unrestricted_tools", prompts.UNRESTRICTED_TOOLS_BLOCK),
+		("act_now", prompts.ACT_NOW_BLOCK),
+		("ask_only", prompts.ASK_ONLY_BLOCK),
+	)
+
+
+def _expected_blocks(flags):
+	"""Names of the blocks build_reason_system appends for these flags.
+
+	The record block yields to the full-access block, and every tool flag brings ACT_NOW_BLOCK: both derivations stay
+	until T82 moves them into `grant`.
+	"""
+	tools = flags["change_tools"] or flags["site_admin_tools"] or flags["unrestricted_tools"]
+	present = {
+		"change_tools": flags["change_tools"],
+		"site_admin_tools": flags["site_admin_tools"] and not flags["unrestricted_tools"],
+		"unrestricted_tools": flags["unrestricted_tools"],
+		"act_now": flags["act_now"] or tools,
+		"ask_only": flags["ask_only"],
+	}
+	return [name for name, _block in _flag_blocks() if present[name]]
 
 
 def _parts(text):
@@ -110,11 +140,14 @@ class TestCorePrompt(FrappeTestCase):
 		keep_agent_settings(self)
 
 	def test_default_core_prompt_keeps_rules_1_5_and_limits(self):
-		# spec changed (AC-66): rule 6 is RULE_6_ACT + NO_OK_APPROVAL; rules 1-5 and GIỚI HẠN stay byte for byte.
+		# spec changed (AC-66, AC-65 (a)): rule 6 is RULE_6_ACT + NO_OK_APPROVAL, VIẾT COMMENT is the U1-5 text;
+		# rules 1-5 and GIỚI HẠN stay byte for byte.
+		self.assertEqual(OLD_WRITING.count(OLD_WRITING_LINES), 1)
+		self.assertNotIn("**Cần ai quyết:**", NEW_WRITING)
 		self.assertEqual(prompts.core_prompt(), prompts.CORE_PROMPT)
 		self.assertEqual(
 			prompts.CORE_PROMPT,
-			OLD_HEAD + prompts.RULE_6_ACT + "\n" + prompts.NO_OK_APPROVAL + OLD_LIMITS + OLD_WRITING,
+			OLD_HEAD + prompts.RULE_6_ACT + "\n" + prompts.NO_OK_APPROVAL + OLD_LIMITS + NEW_WRITING,
 		)
 		self.assertTrue(prompts.RULE_6_ACT.startswith("6. "))
 		self.assertNotIn("\n", prompts.RULE_6_ACT)
@@ -140,7 +173,7 @@ class TestCorePrompt(FrappeTestCase):
 			head, _rule_6, limits, writing = _parts(prompts.core_prompt(**flags))
 			self.assertEqual(limits, _expected_limits(flags), flags)
 			self.assertEqual(head, OLD_HEAD, flags)
-			self.assertEqual(writing, OLD_WRITING, flags)
+			self.assertEqual(writing, NEW_WRITING, flags)
 
 	def test_each_tool_flag_changes_its_limit_lines(self):
 		# Values a hard-coded GIỚI HẠN cannot meet: each flag alone moves the lines of its own row.
@@ -178,8 +211,62 @@ class TestCorePrompt(FrappeTestCase):
 			# every pair is real: its forbidden sentence was in the old core prompt
 			self.assertIn(forbidden, OLD_CORE_PROMPT)
 			self.assertNotIn(allowed, OLD_CORE_PROMPT)
+		texts = []
 		for flags in ALL_FLAGS:
-			blocks = [block for name, block in FLAG_BLOCKS if flags[name]]
-			text = "\n\n".join([prompts.core_prompt(**flags), *blocks])
-			for forbidden, allowed in prompts.PROMPT_CONFLICT_PAIRS:
-				self.assertFalse(forbidden in text and allowed in text, (flags, forbidden, allowed))
+			blocks = [block for name, block in _flag_blocks() if flags[name]]
+			texts.append("\n\n".join([prompts.core_prompt(**flags), *blocks]))
+			texts.append(prompts.build_reason_system("", "", **flags)[0]["text"])
+		for text, (forbidden, allowed) in itertools.product(texts, prompts.PROMPT_CONFLICT_PAIRS):
+			self.assertFalse(forbidden in text and allowed in text, (text, forbidden, allowed))
+
+	def test_every_allowed_sentence_is_in_the_core_or_a_block(self):
+		# review-78: an anchor typo would make its pair pass silently, so each allowed sentence must really occur.
+		sources = [prompts.core_prompt(**flags) for flags in ALL_FLAGS]
+		sources += [block for _name, block in _flag_blocks()]
+		for _forbidden, allowed in prompts.PROMPT_CONFLICT_PAIRS:
+			with self.subTest(allowed=allowed):
+				self.assertTrue(any(allowed in source for source in sources))
+		# P-7: the ask-only block is what allows "not writing anything".
+		self.assertIn(prompts.PROMPT_CONFLICT_PAIRS[5][1], prompts.ASK_ONLY_BLOCK)
+
+
+class TestReasonSystem(FrappeTestCase):
+	"""AC-6 (U1.md:225-229): the core follows the five flags; each block is on exactly when its flag is."""
+
+	def setUp(self):
+		keep_agent_settings(self)
+
+	def test_ask_only_block_asks_one_question_and_writes_nothing(self):
+		block = prompts.ASK_ONLY_BLOCK
+		self.assertTrue(block.startswith("CHỈ HỎI — ĐỘ TIN CẬY DƯỚI NGƯỠNG\n\n"))
+		for phrase in ("tool đọc và post_comment", "không làm gì trên hệ thống", "đúng một comment hỏi"):
+			self.assertIn(phrase, block)
+		for _name, other in _flag_blocks()[:-1]:
+			self.assertNotIn(block, other)
+			self.assertNotIn(other, block)
+
+	def test_core_follows_flags(self):
+		for flags in ALL_FLAGS:
+			text = prompts.build_reason_system("DIGEST-XYZ", "ROUTING-ABC", **flags)[0]["text"]
+			head = "\n\n".join(
+				[prompts.core_prompt(**flags), prompts.CATEGORY_TABLE, "ROUTING-ABC", prompts.CONVENTIONS]
+			)
+			self.assertTrue(text.startswith(head + "\n\n"), flags)
+			self.assertTrue(text.endswith("\n\nDIGEST-XYZ"), flags)
+		self.assertNotEqual(prompts.core_prompt(ask_only=True), prompts.CORE_PROMPT)
+
+	def test_each_block_present_iff_its_flag(self):
+		blocks = dict(_flag_blocks())
+		for flags in ALL_FLAGS:
+			text = prompts.build_reason_system("", "", **flags)[0]["text"]
+			expected = _expected_blocks(flags)
+			for name, block in blocks.items():
+				self.assertEqual(text.count(block), 1 if name in expected else 0, (name, flags))
+			# blocks follow in the order of U1.md:227, ASK_ONLY_BLOCK after ACT_NOW_BLOCK and last
+			self.assertTrue(text.endswith("\n\n".join(blocks[name] for name in expected)), flags)
+			if "act_now" in expected and "ask_only" in expected:
+				self.assertLess(text.index(blocks["act_now"]), text.index(blocks["ask_only"]), flags)
+		# ask_only alone brings its block and nothing else; without it the block is never there
+		only = prompts.build_reason_system("", "", ask_only=True)[0]["text"]
+		self.assertTrue(only.endswith("\n\n" + prompts.CONVENTIONS + "\n\n" + prompts.ASK_ONLY_BLOCK))
+		self.assertEqual(_expected_blocks(dict.fromkeys(FLAG_NAMES, False)), [])

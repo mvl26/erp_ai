@@ -407,21 +407,23 @@ class TestPrompts(FrappeTestCase):
 			self.assertIn(tool, block)
 		self.assertTrue(block.endswith("Sửa file .py chỉ có hiệu lực sau khi người chạy bench restart."))
 
-		old = prompts.build_reason_system("", "ROUTING-ABC")[0]["text"]
+		core = prompts.core_prompt(change_tools=True)
+		head = "\n\n".join([core, prompts.CATEGORY_TABLE, "ROUTING-ABC", prompts.CONVENTIONS])
+		self.assertNotEqual(core, prompts.CORE_PROMPT)
 		blocks = prompts.build_reason_system("DIGEST-XYZ", "ROUTING-ABC", change_tools=True)
 		self.assertEqual(len(blocks), 1)
 		self.assertEqual(blocks[0]["cache_control"], {"type": "ephemeral"})
 		text = blocks[0]["text"]
-		self.assertEqual(text, "\n\n".join([old, block, prompts.ACT_NOW_BLOCK, "DIGEST-XYZ"]))
-		self.assertTrue(text.startswith(prompts.CORE_PROMPT))
-		self.assertEqual(text[: text.index(block)], old + "\n\n")
+		self.assertEqual(text, "\n\n".join([head, block, prompts.ACT_NOW_BLOCK, "DIGEST-XYZ"]))
+		self.assertTrue(text.startswith(core))
+		self.assertEqual(text[: text.index(block)], head + "\n\n")
 
 		no_digest = prompts.build_reason_system("", "", change_tools=True)[0]["text"]
 		self.assertEqual(
 			no_digest,
 			"\n\n".join(
 				[
-					prompts.CORE_PROMPT,
+					core,
 					prompts.CATEGORY_TABLE,
 					prompts.CONVENTIONS,
 					block,
@@ -439,9 +441,16 @@ class TestPrompts(FrappeTestCase):
 		for phrase in ("người ra lệnh", "System Manager", "không đặt mật khẩu", "Không xóa", "dữ liệu"):
 			self.assertIn(phrase, block)
 
-		old = prompts.build_reason_system("", "ROUTING-ABC")[0]["text"]
+		head = "\n\n".join(
+			[
+				prompts.core_prompt(site_admin_tools=True),
+				prompts.CATEGORY_TABLE,
+				"ROUTING-ABC",
+				prompts.CONVENTIONS,
+			]
+		)
 		text = prompts.build_reason_system("DIGEST-XYZ", "ROUTING-ABC", site_admin_tools=True)[0]["text"]
-		self.assertEqual(text, "\n\n".join([old, block, prompts.ACT_NOW_BLOCK, "DIGEST-XYZ"]))
+		self.assertEqual(text, "\n\n".join([head, block, prompts.ACT_NOW_BLOCK, "DIGEST-XYZ"]))
 		both = prompts.build_reason_system("", "", change_tools=True, site_admin_tools=True)[0]["text"]
 		self.assertTrue(
 			both.endswith("\n\n".join([prompts.CHANGE_TOOLS_BLOCK, block, prompts.ACT_NOW_BLOCK]))
@@ -463,9 +472,16 @@ class TestPrompts(FrappeTestCase):
 		for phrase in ("TOÀN QUYỀN", "người ra lệnh", "dữ liệu", "ERP AI Setting", "mật khẩu"):
 			self.assertIn(phrase, block)
 
-		old = prompts.build_reason_system("", "ROUTING-ABC")[0]["text"]
+		head = "\n\n".join(
+			[
+				prompts.core_prompt(unrestricted_tools=True),
+				prompts.CATEGORY_TABLE,
+				"ROUTING-ABC",
+				prompts.CONVENTIONS,
+			]
+		)
 		text = prompts.build_reason_system("DIGEST-XYZ", "ROUTING-ABC", unrestricted_tools=True)[0]["text"]
-		self.assertEqual(text, "\n\n".join([old, block, prompts.ACT_NOW_BLOCK, "DIGEST-XYZ"]))
+		self.assertEqual(text, "\n\n".join([head, block, prompts.ACT_NOW_BLOCK, "DIGEST-XYZ"]))
 		# the full-access block replaces the record block, never joins it
 		both = prompts.build_reason_system("", "", site_admin_tools=True, unrestricted_tools=True)[0]["text"]
 		self.assertIn(block, both)

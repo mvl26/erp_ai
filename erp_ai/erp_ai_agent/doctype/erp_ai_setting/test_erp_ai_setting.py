@@ -2280,7 +2280,7 @@ PROMPT_PARTS = {
 		"prompt_override_reasoning",
 		"chỉ dẫn lập luận",
 		prompts.CORE_PROMPT,
-		("**Nhận định:**", "**Căn cứ:**", "**Hướng xử lý:**", "**Cần ai quyết:**"),
+		("**Nhận định:**", "**Căn cứ:**", "**Hướng xử lý:**"),
 	),
 	"category_guide": (
 		"prompt_override_category_guide",
@@ -2568,6 +2568,12 @@ class TestPromptOverrides(FrappeTestCase):
 				first, last = markers[0], markers[-1]
 				text = _without_marker(part, _without_marker(part, builtin, last), first)
 				self.assertEqual(self._save(**{fieldname: text}), _missing_error(label, first, last))
+
+	def test_reasoning_override_with_retired_marker_still_saves(self):
+		# design-w1-fixes-7 Điểm 3 (STD-DESIGN-3): an override written for the four old markers stays valid.
+		value = prompts.CORE_PROMPT + "\n**Cần ai quyết:** nếu có."
+		self.assertIsNone(self._save(prompt_override_reasoning=value))
+		self.assertEqual(self._stored("prompt_override_reasoning"), value)
 
 	def test_markers_need_their_exact_form(self):
 		# classify: a key without its JSON quotes does not count; category_guide: the row must start the line

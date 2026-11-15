@@ -14,6 +14,7 @@ from erp_ai.agent.agent_write_guard import allow_agent_write
 from erp_ai.agent.tools import change_guard, source
 from erp_ai.agent.tools.registry import ToolContext, ToolSpec
 from erp_ai.agent.tools.registry import _invalid as registry_invalid  # design-addendum-2 A2-2
+from erp_ai.agent.tools.write_ticket import SECTION_PENDING, collect, collecting
 from erp_ai.constants import (
 	CHANGE_KIND_CODE,
 	CHANGE_KIND_COMMAND,
@@ -60,6 +61,10 @@ EXECUTABLE_BITS = 0o111
 LEGACY_EDIT_KEYS = ("path", "find", "replace")
 # CHG-002 design 3.1: the fields of one item of `commands`.
 COMMAND_FIELDS = {"command", "app"}
+# The "Chờ duyệt" line of a code or command proposal in the guidance comment (design-w1-fixes-20 Điểm 2.2): these
+# kinds have no "Duyệt ngay" button (AC-39 (3)); the label is the fixed kind, never an argument (B-3).
+PENDING_LINE = "Đề xuất {proposal} ({label}): duyệt ở form đề xuất, không có nút Duyệt ngay."
+PENDING_KINDS = (CHANGE_KIND_CODE, CHANGE_KIND_COMMAND)
 
 
 def _fail(reason: str) -> dict:
@@ -156,7 +161,16 @@ def _comment(ctx: ToolContext, proposal) -> str:
 	return frappe.get_doc(TICKET_DOCTYPE, ctx.ticket_name).new_comment(html)
 
 
+def pending_line(proposal) -> str:
+	"""The raw "Chờ duyệt" line of a code or command proposal: its name and kind, no argument (AD3.md:130)."""
+	if proposal.change_kind not in PENDING_KINDS:
+		raise ValueError(f"loại đề xuất lạ: {proposal.change_kind}")
+	return PENDING_LINE.format(proposal=proposal.name, label=proposal.change_kind)
+
+
 def _insert(ctx: ToolContext, values: dict) -> dict:
+	"""The one insert of a proposal (ADR-031 QĐ 3): the record, its comment (AC-33) and, in a guidance run, its line
+	of "Chờ duyệt" (AD3-5: the only place that line is added)."""
 	proposal = frappe.get_doc(
 		{
 			"doctype": PROPOSAL_DOCTYPE,
@@ -170,6 +184,8 @@ def _insert(ctx: ToolContext, values: dict) -> dict:
 	with allow_agent_write():
 		proposal.insert()
 	comment = _comment(ctx, proposal)
+	if collecting(ctx.run_id):
+		collect(ctx.run_id, SECTION_PENDING, pending_line(proposal))
 	return {"ok": True, "proposal": proposal.name, "status": proposal.change_status, "comment": comment}
 
 

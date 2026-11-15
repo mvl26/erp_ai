@@ -8637,16 +8637,22 @@ PRIVILEGE_COMMANDS = ("sudo", "supervisorctl")
 
 
 def _command_tokens(text: str) -> list:
-	"""Words of a string as a command sees them: `"/usr/bin/sudo -n"` -> ["usr", "bin", "sudo", "-n"]."""
-	return [token for token in re.split(r"[\s/]+", text) if token]
+	"""Words of a string as a command sees them: `"/usr/bin/sudo -n"` -> ["usr", "bin", "sudo", "-n"];
+	shell quotes and metacharacters split too: `"x||'sudo' $(y)"` -> ["x", "sudo", "y"]."""
+	return [token for token in re.split(r"[^\w.-]+", text) if token]
 
 
 def _code_strings(tree: ast.AST):
-	"""Every string constant of the code, f-string pieces included, docstrings excluded."""
+	"""`(node, text)` for every str or bytes constant of the code (bytes decoded), f-string pieces
+	included, docstrings excluded."""
 	docstrings = _docstring_ids(tree)
 	for node in ast.walk(tree):
-		if isinstance(node, ast.Constant) and isinstance(node.value, str) and id(node) not in docstrings:
-			yield node
+		if not isinstance(node, ast.Constant) or id(node) in docstrings:
+			continue
+		if isinstance(node.value, str):
+			yield node, node.value
+		elif isinstance(node.value, bytes):
+			yield node, node.value.decode("utf-8", "replace")
 
 
 def _is_named(node, name: str) -> bool:
@@ -8667,13 +8673,31 @@ def _is_none(node) -> bool:
 	return isinstance(node, ast.Constant) and node.value is None
 
 
+ARGV_COPIERS = ("list", "tuple")
+
+
+def _is_restart_argv(node) -> bool:
+	"""`RESTART_ARGV`, `list(RESTART_ARGV)`, `tuple(RESTART_ARGV)` or `[*RESTART_ARGV, ...]`."""
+	if _is_named(node, RESTART_ARGV_NAME):
+		return True
+	if isinstance(node, ast.Call) and dotted_name(node.func) in ARGV_COPIERS and node.args:
+		return _is_restart_argv(node.args[0])
+	if isinstance(node, ast.List | ast.Tuple):
+		return any(isinstance(elt, ast.Starred) and _is_restart_argv(elt.value) for elt in node.elts)
+	return False
+
+
 def restart_launch_calls(tree: ast.AST) -> list:
-	"""Calls whose first argument is `RESTART_ARGV` (or `<module>.RESTART_ARGV`)."""
-	return [
-		node
-		for node in ast.walk(tree)
-		if isinstance(node, ast.Call) and node.args and _is_named(node.args[0], RESTART_ARGV_NAME)
-	]
+	"""Calls whose argv (first argument or `args=`) is `RESTART_ARGV` (or `<module>.RESTART_ARGV`),
+	a `list()`/`tuple()` copy of it or a literal unpacking it; the copy calls themselves are not launches."""
+	calls = []
+	for node in ast.walk(tree):
+		if not isinstance(node, ast.Call) or dotted_name(node.func) in ARGV_COPIERS:
+			continue
+		argv = node.args[0] if node.args else next((k.value for k in node.keywords if k.arg == "args"), None)
+		if argv is not None and _is_restart_argv(argv):
+			calls.append(node)
+	return calls
 
 
 def _restart_launch_violations(rel: str, call: ast.Call) -> list:
@@ -8725,8 +8749,8 @@ def check_change_block_restart_launch_shape(sources: dict) -> list:
 		)
 	launches = 0
 	for rel, tree in trees.items():
-		for node in _code_strings(tree):
-			if SETSID_TEXT in _command_tokens(node.value) and node is not setsid_value:
+		for node, text in _code_strings(tree):
+			if SETSID_TEXT in _command_tokens(text) and node is not setsid_value:
 				text = f"{SETSID_TEXT!r} written outside {SOURCE_TOOL_FILE} {SETSID_EXECUTABLE_NAME} (A-5)"
 				violations.append(violation(rel, node, text))
 		for node in ast.walk(tree):
@@ -8749,8 +8773,8 @@ def check_change_block_no_sudo_or_supervisorctl_argv(sources: dict) -> list:
 	"""Design §8.2, AC-45: no string of the product code holds the command `sudo` or `supervisorctl`."""
 	violations = []
 	for rel, src in only_python(sources).items():
-		for node in _code_strings(parse(rel, src)):
-			tokens = _command_tokens(node.value)
+		for node, text in _code_strings(parse(rel, src)):
+			tokens = _command_tokens(text)
 			violations.extend(
 				violation(
 					rel, node, f"{command!r} in product code (design §8.2, AC-45: no sudo, no supervisorctl)"
@@ -8841,10 +8865,10 @@ class TestChangeBlockRules(unittest.TestCase):
 			self.assertIn(rel, self.sources)
 		# Not a blind scan: the real `"setsid"` and the real launch call are seen.
 		setsid_texts = [
-			(rel, node.value)
+			(rel, text)
 			for rel, src in only_python(self.sources).items()
-			for node in _code_strings(parse(rel, src))
-			if SETSID_TEXT in _command_tokens(node.value)
+			for _node, text in _code_strings(parse(rel, src))
+			if SETSID_TEXT in _command_tokens(text)
 		]
 		self.assertEqual(setsid_texts, [(SOURCE_TOOL_FILE, SETSID_TEXT)])
 		runner = parse(PROCESS_RUNNER_FILE, self.sources[PROCESS_RUNNER_FILE])
@@ -8893,6 +8917,36 @@ class TestChangeBlockRules(unittest.TestCase):
 				(),
 				"'setsid' written outside",
 			),
+			"setsid glued to ||": (
+				RESTART_JOB_FILE,
+				'\nCOMMAND = "bench restart||setsid -f bench restart"\n',
+				(),
+				"'setsid' written outside",
+			),
+			"setsid glued to ;": (
+				RESTART_JOB_FILE,
+				'\nCOMMAND = "x;setsid -f y"\n',
+				(),
+				"'setsid' written outside",
+			),
+			"setsid inside $(": (
+				RESTART_JOB_FILE,
+				'\nCOMMAND = "$(setsid -f y)"\n',
+				(),
+				"'setsid' written outside",
+			),
+			"setsid quoted": (
+				RESTART_JOB_FILE,
+				"\nCOMMAND = \"'setsid' -f bench restart\"\n",
+				(),
+				"'setsid' written outside",
+			),
+			"setsid bytes argv": (
+				RESTART_JOB_FILE,
+				'\nARGV = [b"setsid", b"-f", b"bench", b"restart"]\n',
+				(),
+				f"{RESTART_JOB_FILE}:8: 'setsid' written outside",
+			),
 			"setsid literal in RESTART_ARGV": (
 				run,
 				"",
@@ -8905,11 +8959,17 @@ class TestChangeBlockRules(unittest.TestCase):
 				('SETSID_EXECUTABLE = "setsid"', 'SETSID_EXECUTABLE = "/usr/bin/setsid"'),
 				"is not the constant 'setsid'",
 			),
-			"SETSID_EXECUTABLE defined outside source.py": (
+			"SETSID_EXECUTABLE missing from source.py": (
 				SOURCE_TOOL_FILE,
 				"",
 				('SETSID_EXECUTABLE = "setsid"\n', ""),
 				"is not the constant 'setsid'",
+			),
+			"SETSID_EXECUTABLE defined outside source.py": (
+				RESTART_JOB_FILE,
+				'\nSETSID_EXECUTABLE = "setsid"\n',
+				(),
+				f"{RESTART_JOB_FILE}:8: 'setsid' written outside",
 			),
 			"SETSID_EXECUTABLE not element 0": (
 				run,
@@ -8944,6 +9004,24 @@ class TestChangeBlockRules(unittest.TestCase):
 				(),
 				f"{RESTART_JOB_FILE}:9: restart launch lacks stdin=DEVNULL",
 			),
+			"second launch via args=": (
+				RESTART_JOB_FILE,
+				"\nimport subprocess\nsubprocess.run(args=process_runner.RESTART_ARGV, timeout=5)\n",
+				(),
+				f"{RESTART_JOB_FILE}:9: restart launch lacks stdin=DEVNULL",
+			),
+			"second launch via list()": (
+				RESTART_JOB_FILE,
+				"\nimport subprocess\nsubprocess.run(list(process_runner.RESTART_ARGV), timeout=5)\n",
+				(),
+				f"{RESTART_JOB_FILE}:9: restart launch lacks stdin=DEVNULL",
+			),
+			"second launch via [*]": (
+				RESTART_JOB_FILE,
+				"\nimport subprocess\nsubprocess.run([*process_runner.RESTART_ARGV, '-v'], timeout=5)\n",
+				(),
+				f"{RESTART_JOB_FILE}:9: restart launch lacks stdin=DEVNULL",
+			),
 		}
 		for case, (rel, extra, replace, fragment) in cases.items():
 			with self.subTest(case=case):
@@ -8969,6 +9047,19 @@ class TestChangeBlockRules(unittest.TestCase):
 				"'supervisorctl'",
 			),
 			"f-string": (RESTART_JOB_FILE, '\nCOMMAND = f"sudo {name}"\n', "'sudo'"),
+			"glued to ||": (RESTART_JOB_FILE, '\nCOMMAND = "bench restart||sudo bench restart"\n', "'sudo'"),
+			"glued to ;": (
+				RESTART_JOB_FILE,
+				'\nCOMMAND = "x;supervisorctl restart all"\n',
+				"'supervisorctl'",
+			),
+			"inside $(": (RESTART_JOB_FILE, '\nCOMMAND = "$(sudo x)"\n', "'sudo'"),
+			"quoted": (RESTART_JOB_FILE, "\nCOMMAND = \"'sudo' bench restart\"\n", "'sudo'"),
+			"bytes argv": (
+				PROCESS_RUNNER_FILE,
+				'\nARGV = [b"sudo", b"supervisorctl", b"restart", b"all"]\n',
+				"'supervisorctl'",
+			),
 		}
 		for case, (rel, extra, fragment) in cases.items():
 			with self.subTest(case=case):

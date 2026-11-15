@@ -8,10 +8,10 @@ from dataclasses import dataclass
 from datetime import datetime
 
 import frappe
-from frappe.utils import extract_email_id
+from frappe.utils import extract_email_id, get_datetime, now_datetime
 
-from erp_ai.agent import policy
-from erp_ai.constants import AGENT_USER, SETTING_DOCTYPE
+from erp_ai.agent import authority, policy, run_log
+from erp_ai.constants import AGENT_USER, LOG_DOCTYPE, LOGGER_NAME, SETTING_DOCTYPE
 
 STATUS_RESOLVED = "Resolved"
 STATUS_CLOSED = "Closed"
@@ -35,6 +35,10 @@ NOTICE_SILENT_CLOSE = (
 )
 
 TICKET_DOCTYPE = "HD Ticket"
+# erp_ai.install.TASK_TICKET_FIELD (the Task Link to its ticket); agent core may not import install (ADR-001).
+TASK_TICKET_FIELD = "ai_ticket"
+LIFECYCLE_SAVEPOINT = "erp_ai_lifecycle"
+CONFIG_RUN_ID_PREFIX = "lifecycle-config-"
 # Refusal codes of status_change_refusal, in the order they are checked (AC-42 (b), (c); A-U6b-5).
 REFUSAL_ORIGIN_NOT_CONFIGURED = "origin_not_configured"
 REFUSAL_NOT_SENDABLE = "not_sendable"
@@ -190,3 +194,104 @@ def silent_since(ticket_name: str) -> datetime | None:
 	if any(is_requester_sender(sender, raised_by) for sender in senders):
 		return None
 	return last_bot
+
+
+def tasks_done(ticket_name: str) -> tuple[bool, int]:
+	"""(every linked Task done, Completed count): Cancelled ones dropped, at least one left and all of those
+	Completed. A Task without the ticket link is never counted (A-11)."""
+	statuses = [
+		status
+		for status in frappe.get_all("Task", filters={TASK_TICKET_FIELD: ticket_name}, pluck="status")
+		if status != TASK_CANCELLED
+	]
+	completed = statuses.count(TASK_COMPLETED)
+	return bool(statuses) and completed == len(statuses), completed
+
+
+def _log_config_missing_daily(now) -> None:
+	"""One bot_action row a day while the origin field is not configured (AC-42 (c)); the row is its own day key."""
+	run_id = f"{CONFIG_RUN_ID_PREFIX}{get_datetime(now).date().isoformat()}"
+	if frappe.db.exists(LOG_DOCTYPE, {"run_id": run_id}):
+		return
+	run_log.write_bot_action(
+		trigger=run_log.TRIGGER_SCHEDULED_JOB,
+		run_id=run_id,
+		actions=[
+			run_log.action_entry(
+				TOOL_LIFECYCLE_CONFIG, None, None, False, reason=REASON_ORIGIN_NOT_CONFIGURED
+			)
+		],
+	)
+
+
+def _current_settings() -> LifecycleSettings:
+	return lifecycle_settings(frappe.get_single(SETTING_DOCTYPE))
+
+
+def _locked_status_category(ticket_name: str) -> str | None:
+	return frappe.db.get_value(TICKET_DOCTYPE, ticket_name, "status_category", for_update=True)
+
+
+def _log_refusal(ticket_name: str, job: str, refusal: str) -> None:
+	frappe.logger(LOGGER_NAME).info(
+		"erp_ai lifecycle skip job=%s ticket=%s reason=%s", job, ticket_name, refusal
+	)
+
+
+def _resolve_if_tasks_done(ticket_name: str, ls: LifecycleSettings) -> None:
+	"""Steps (4)-(8) of run_task_lifecycle; the bot_action row, written last, is the one commit."""
+	if _locked_status_category(ticket_name) == RESOLVED_CATEGORY:
+		return
+	refusal = status_change_refusal(ticket_name, ls)
+	if refusal:
+		_log_refusal(ticket_name, "resolve_on_tasks_done", refusal)
+		return
+	done, completed = tasks_done(ticket_name)
+	if not done:
+		return
+	doc = frappe.get_doc(TICKET_DOCTYPE, ticket_name)
+	before = doc.status
+	doc.status = STATUS_RESOLVED
+	doc.save()
+	content = COMMENT_RESOLVED.format(completed=completed)
+	comment = doc.new_comment(content)
+	run_log.write_bot_action(
+		trigger=run_log.TRIGGER_SCHEDULED_JOB,
+		ticket=ticket_name,
+		actions=[
+			run_log.action_entry(
+				TOOL_RESOLVE_ON_TASKS_DONE,
+				TICKET_DOCTYPE,
+				ticket_name,
+				True,
+				value_before={"status": before},
+				value_after={"status": STATUS_RESOLVED},
+			),
+			run_log.action_entry(
+				TOOL_LIFECYCLE_COMMENT, "Comment", comment, True, value_after={"content": content}
+			),
+		],
+	)
+
+
+def run_task_lifecycle(ticket_name: str) -> None:
+	"""AC-43, the job of enqueue_lifecycle_job: the ticket moves to Resolved when every linked Task is done.
+
+	Under the agent account; off switch: nothing written (AC-42 (a)); origin not configured: the daily row only
+	(AC-42 (c)). Steps (4)-(8) share one savepoint: any failure undoes them, goes to the Error Log and the job
+	ends normally (U6b-fixes Sửa 2).
+	"""
+	if not authority.enter_agent_session():
+		return
+	ls = _current_settings()
+	if not ls.resolve_on_tasks_done:
+		return
+	if not origin_configured(ls):
+		_log_config_missing_daily(now_datetime())
+		return
+	frappe.db.savepoint(LIFECYCLE_SAVEPOINT)
+	try:
+		_resolve_if_tasks_done(ticket_name, ls)
+	except Exception as exc:
+		frappe.db.rollback(save_point=LIFECYCLE_SAVEPOINT)
+		frappe.log_error(TITLE_LIFECYCLE_FAILED, f"ticket={ticket_name} error={type(exc).__name__}")

@@ -2696,8 +2696,8 @@ def check_fs_writes_only_in_file_writer(sources: dict) -> list:
 
 FILE_WRITER_CANONICAL_CHECK = "_refuse_unless_canonical"
 FILE_WRITER_SECOND_RESOLVER_CALLS = ("realpath", "commonpath", "is_relative_to", "readlink")
-FILE_WRITER_RECHECKERS = ("make_parents", "remove_empty_dirs")  # T6 adds "write_atomic", "remove_file"
-FILE_WRITER_RECHECKS_ALL = False  # condition 4 of the rule; T6 sets True, T49 deletes the flag
+FILE_WRITER_RECHECKERS = ("make_parents", "remove_empty_dirs", "write_atomic", "remove_file")
+FILE_WRITER_RECHECKS_ALL = True  # condition 4 of the rule; T49 deletes the flag
 FILE_WRITER_FS_CALLS = frozenset(
 	{"os.mkdir", "os.rmdir", "os.remove", "os.unlink", "os.replace", "os.rename", "tempfile.mkstemp"}
 )
@@ -3499,18 +3499,26 @@ def _commit_flag_forbidden(flag: str) -> bool:
 
 
 def _write_argv_problems(scan: GitScan, subcommand: str, tail: list) -> list:
-	"""What is wrong with the elements after `add`/`commit`/`rm` (ADR-022 Ràng buộc; addendum 2 QĐ-A1)."""
-	if any(spread for _rel, _node, spread in tail):
+	"""What is wrong with the elements after `add`/`commit`/`rm` (ADR-022 Ràng buộc; addendum 2 QĐ-A1; ADR-040:
+	commit ends with "--" and 1..N paths, a spread allowed only after "--"; add and rm with exactly one path)."""
+	texts = [None if spread else scan.text(rel, node) for rel, node, spread in tail]
+	separators = [index for index, value in enumerate(texts) if value == PATHSPEC_SEPARATOR]
+	if any(spread for _rel, _node, spread in tail[: separators[0] if separators else len(tail)]):
 		return ["has an argument the scan cannot read (a spread or a list that is not constant)"]
-	texts = [scan.text(rel, node) for rel, node, _spread in tail]
-	if [index for index, value in enumerate(texts) if value == PATHSPEC_SEPARATOR] != [len(tail) - 2]:
+	paths = tail[separators[0] + 1 :] if separators else []
+	if subcommand == "commit":
+		if len(separators) != 1 or not paths:
+			return [f'must end with "{PATHSPEC_SEPARATOR}" and one or more paths']
+	elif len(separators) != 1 or len(paths) != 1 or paths[0][2]:
 		return [f'must end with "{PATHSPEC_SEPARATOR}" and exactly one path']
 	problems = []
-	path_rel, path, _spread = tail[-1]
-	if scan.prefix(path_rel, path).startswith(PATHSPEC_MAGIC):
-		problems.append(f'path after "{PATHSPEC_SEPARATOR}" starts with "{PATHSPEC_MAGIC}" (pathspec magic)')
+	for path_rel, path, spread in paths:
+		if not spread and scan.prefix(path_rel, path).startswith(PATHSPEC_MAGIC):
+			problems.append(
+				f'path after "{PATHSPEC_SEPARATOR}" starts with "{PATHSPEC_MAGIC}" (pathspec magic)'
+			)
 	options, message_next = [], False
-	for value in texts[:-2]:
+	for value in texts[: separators[0]]:
 		if message_next:
 			message_next = False
 		elif value is None:
@@ -3528,8 +3536,9 @@ def _write_argv_problems(scan: GitScan, subcommand: str, tail: list) -> list:
 
 
 def check_git_commit_add_rm_argv_shape(sources: dict) -> list:
-	"""ADR-022 Ràng buộc, design-addendum-2 QĐ-A1: commit has --only and --no-gpg-sign, add/rm/commit end with
-	"--" and exactly one path that does not start with ":", rm has --cached, commit has no forbidden flag."""
+	"""ADR-022 Ràng buộc, design-addendum-2 QĐ-A1, ADR-040: commit has --only and --no-gpg-sign and ends with "--"
+	and 1..N paths, add/rm end with "--" and exactly one path, no known path starts with ":", rm has --cached,
+	commit has no forbidden flag."""
 	scan = GitScan(sources)
 	violations = []
 	for argv in scan.argvs:
@@ -5462,9 +5471,9 @@ import frappe
 from erp_ai.agent.tools import source
 
 
-def _run_git_write(repo_root, rel, limit_s, subcommand_args):
+def _run_git_write(repo_root, rels, limit_s, subcommand_args):
 	return _run_wrapped(
-		["git", *source.git_global_options(read=False), *subcommand_args, "--", rel],
+		["git", *source.git_global_options(read=False), *subcommand_args, "--", *rels],
 		cwd=repo_root,
 		env=source.git_env(identity=True),
 		limit_s=limit_s,
@@ -5472,17 +5481,17 @@ def _run_git_write(repo_root, rel, limit_s, subcommand_args):
 
 
 def git_add_new(repo_root, rel, limit_s):
-	return _run_git_write(repo_root, rel, limit_s, ["add"])
+	return _run_git_write(repo_root, (rel,), limit_s, ["add"])
 
 
-def git_commit_only(repo_root, rel, subject, body, limit_s):
+def git_commit_only(repo_root, rels, subject, body, limit_s):
 	return _run_git_write(
-		repo_root, rel, limit_s, ["commit", "--only", "--no-gpg-sign", "--quiet", "-m", subject, "-m", body]
+		repo_root, sorted(rels), limit_s, ["commit", "--only", "--no-gpg-sign", "--quiet", "-m", subject, "-m", body]
 	)
 
 
 def git_unstage_new(repo_root, rel, limit_s):
-	return _run_git_write(repo_root, rel, limit_s, ["rm", "--cached", "-q"])
+	return _run_git_write(repo_root, (rel,), limit_s, ["rm", "--cached", "-q"])
 
 
 def run_bench(args, limit_s):
@@ -5517,7 +5526,7 @@ from erp_ai.agent.tools import source
 def run_change(name, repo, rel, subject, body):
 	if source.git_head(repo) is None:
 		return None
-	return process_runner.git_commit_only(repo, rel, subject, body, source.GIT_TIMEOUT_S)
+	return process_runner.git_commit_only(repo, (rel,), subject, body, source.GIT_TIMEOUT_S)
 
 
 def _full(root, rel):
@@ -7544,9 +7553,12 @@ class TestScannersCatchViolations(unittest.TestCase):
 			"\t\traise ValueError(full)\n"
 		)
 		writer = (
-			"import os\nfrom erp_ai.agent.tools import source\n\n{canonical}\n"
+			"import os\nimport tempfile\nfrom erp_ai.agent.tools import source\n\n{canonical}\n"
 			"def make_parents(full_path, app_dir):\n\t{make}\n\tos.mkdir(full_path)\n\n"
-			"def remove_empty_dirs(dirs):\n\tfor d in dirs:\n\t\t_refuse_unless_canonical(d)\n\t\t{remove}\n"
+			"def remove_empty_dirs(dirs):\n\tfor d in dirs:\n\t\t_refuse_unless_canonical(d)\n\t\t{remove}\n\n"
+			"def write_atomic(full_path, content):\n\t_refuse_unless_canonical(full_path)\n"
+			"\tfd, temp = tempfile.mkstemp(dir=os.path.dirname(full_path))\n\tos.replace(temp, full_path)\n\n"
+			"def remove_file(full_path):\n\t_refuse_unless_canonical(full_path)\n\tos.remove(full_path)\n"
 		)
 		recheck = "_refuse_unless_canonical(full_path)"
 		good = {"canonical": canonical, "make": recheck, "remove": "os.rmdir(d)"}
@@ -7618,14 +7630,9 @@ class TestScannersCatchViolations(unittest.TestCase):
 		self.assertCaught(check_file_writer_rechecks_through_resolver({}), FILE_WRITER_FILE)
 		# Condition 4 (on from T6): a file-system function outside FILE_WRITER_RECHECKERS is caught.
 		renamer = writer.format(**good) + "\ndef rename_file(a, b):\n\tos.replace(a, b)\n"
-		self.assertEqual(check_file_writer_rechecks_through_resolver({FILE_WRITER_FILE: renamer}), [])
-		with patch(f"{__name__}.FILE_WRITER_RECHECKS_ALL", True):
-			self.assertCaught(
-				check_file_writer_rechecks_through_resolver({FILE_WRITER_FILE: renamer}), "rename_file"
-			)
-			self.assertEqual(
-				check_file_writer_rechecks_through_resolver({FILE_WRITER_FILE: writer.format(**good)}), []
-			)
+		self.assertCaught(
+			check_file_writer_rechecks_through_resolver({FILE_WRITER_FILE: renamer}), "rename_file"
+		)
 		# The ADR-011 name rule still catches the old name in this file: the new rule does not loosen it.
 		old_name = {
 			CHANGE_GUARD_FILE: "from erp_ai.agent.tools import source\n\ndef check_write_path(rel):\n"
@@ -7636,8 +7643,10 @@ class TestScannersCatchViolations(unittest.TestCase):
 		self.assertCaught(
 			check_change_guard_uses_resolve_safe_path(old_name), FILE_WRITER_FILE, "second path resolver"
 		)
-		self.assertFalse(FILE_WRITER_RECHECKS_ALL)
-		self.assertEqual(FILE_WRITER_RECHECKERS, ("make_parents", "remove_empty_dirs"))
+		self.assertTrue(FILE_WRITER_RECHECKS_ALL)
+		self.assertEqual(
+			FILE_WRITER_RECHECKERS, ("make_parents", "remove_empty_dirs", "write_atomic", "remove_file")
+		)
 
 	def test_changes_set_user_or_publish_caught(self):
 		cases = {
@@ -7901,6 +7910,13 @@ class TestScannersCatchViolations(unittest.TestCase):
 			"add magic path": "\nX = _run_wrapped(['git', *source.git_global_options(read=False), 'add', '--', f':(literal){rel}'], cwd=r, env=e)\n",
 			"add magic constant": "\nX = _run_wrapped(['git', *source.git_global_options(read=False), 'add', '--', ':' + rel], cwd=r, env=e)\n",
 			"rm two separators": "\nX = _run_wrapped(['git', *source.git_global_options(read=False), 'rm', '--cached', '--', '--', rel], cwd=r, env=e)\n",
+			"commit no path": "\nX = _run_wrapped(['git', *source.git_global_options(read=False), 'commit', '--only', '--no-gpg-sign', '--'], cwd=r, env=e)\n",
+			"commit without --": "\nX = _run_wrapped(['git', *source.git_global_options(read=False), 'commit', '--only', '--no-gpg-sign', *rels], cwd=r, env=e)\n",
+			"commit magic among paths": "\nX = _run_git_write(r, ('a.py', f':(literal){rel}', 'b.py'), 1, ['commit', '--only', '--no-gpg-sign'])\n",
+			"add spread path": "\nX = _run_git_write(r, rels, 1, ['add'])\n",
+			"add two paths through the helper": "\nX = _run_git_write(r, (a, b), 1, ['add'])\n",
+			"rm spread path": "\nX = _run_git_write(r, sorted(rels), 1, ['rm', '--cached'])\n",
+			"rm no path through the helper": "\nX = _run_git_write(r, (), 1, ['rm', '--cached'])\n",
 		}
 		for flag in (*COMMIT_FORBIDDEN_FLAGS, "--amen", "-am", "--fixup=HEAD", "--squash=HEAD"):
 			cases[f"commit {flag}"] = write.format(
@@ -7910,6 +7926,19 @@ class TestScannersCatchViolations(unittest.TestCase):
 			with self.subTest(case=case):
 				found = check_git_commit_add_rm_argv_shape(self.git_product(PROCESS_RUNNER_FILE, extra))
 				self.assertCaught(found, PROCESS_RUNNER_FILE, "ADR-022")
+
+	def test_git_write_argv_shape_allows_commit_with_one_to_n_paths(self):
+		cases = {
+			"one constant": "\nX = _run_git_write(r, ('a.py',), 1, ['commit', '--only', '--no-gpg-sign'])\n",
+			"three names": "\nX = _run_git_write(r, (a, b, c), 1, ['commit', '--only', '--no-gpg-sign'])\n",
+			"spread of a sorted tuple": "\nX = _run_git_write(r, sorted(rels), 1, ['commit', '--only', '--no-gpg-sign'])\n",
+			"literal argv with paths": "\nX = _run_wrapped(['git', *source.git_global_options(read=False), 'commit', '--only', '--no-gpg-sign', '--', a, *rest], cwd=r, env=e)\n",
+		}
+		for case, extra in cases.items():
+			with self.subTest(case=case):
+				self.assertEqual(
+					check_git_commit_add_rm_argv_shape(self.git_product(PROCESS_RUNNER_FILE, extra)), []
+				)
 
 	def test_git_write_argv_shape_allows_a_message_that_looks_like_a_flag(self):
 		extra = "\nX = _run_git_write(r, rel, 1, ['commit', '--only', '--no-gpg-sign', '-m', '-a', '-m', '--amend'])\n"

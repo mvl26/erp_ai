@@ -1,4 +1,5 @@
 import hashlib
+import inspect
 import json
 from datetime import datetime
 from unittest.mock import Mock, patch
@@ -6,6 +7,7 @@ from unittest.mock import Mock, patch
 import frappe
 from frappe.tests.utils import FrappeTestCase
 
+from erp_ai import constants
 from erp_ai.agent.changes import transitions
 from erp_ai.agent.changes.process_runner import CommandResult
 from erp_ai.constants import (
@@ -29,15 +31,17 @@ from erp_ai.constants import (
 	JOB_TIMEOUT_S,
 	LOG_DOCTYPE,
 	PROPOSAL_DOCTYPE,
-	PROPOSAL_TEXT_MAX_CHARS,
-	REPLACE_MAX_ITEMS,
+	RESTART_STATUS_CONFIRMED,
+	RESTART_STATUS_LAUNCH_FAILED,
+	RESTART_STATUS_SENT,
+	RESTART_STATUS_UNCONFIRMED,
 	RUN_BACKSTOP_S,
 	TITLE_CHANGE_FAILED,
 	TRIGGER_CHANGE_ACTION,
 )
 from erp_ai.test_utils import make_change_proposal
 
-# Design 2.1 state group, written out by hand (11 fields + 4 git fields of round 1).
+# Design 2.1 state group, written out by hand (11 fields + 4 CHG-002 fields + 4 git fields of round 1).
 STATE_FIELDS_EXPECTED = (
 	"change_status",
 	"decided_by",
@@ -49,7 +53,11 @@ STATE_FIELDS_EXPECTED = (
 	"exit_code",
 	"duration_ms",
 	"command_output",
+	"command_results",
 	"failure_reason",
+	"created_dirs",
+	"restart_status",
+	"restart_sent_at",
 	"applied_branch",
 	"applied_ahead_count",
 	"apply_commit_sha",
@@ -132,7 +140,11 @@ class TestChangeConstants(FrappeTestCase):
 		self.assertEqual(CHANGE_STEPS, ("propose", "approve", "reject", "apply", "fail", "stale", "undo"))
 		self.assertEqual(TRIGGER_CHANGE_ACTION, "change_action")
 		self.assertEqual(TITLE_CHANGE_FAILED, "erp_ai: áp dụng thay đổi lỗi")
-		self.assertEqual((PROPOSAL_TEXT_MAX_CHARS, REPLACE_MAX_ITEMS), (20000, 10))
+		# CHG-002 design 2.5 deletes the two old proposal limits
+		self.assertEqual(
+			[hasattr(constants, name) for name in ("PROPOSAL_TEXT_MAX_CHARS", "REPLACE_MAX_ITEMS")],
+			[False, False],
+		)
 
 	def test_command_timeout_is_job_timeout_minus_margin(self):
 		self.assertEqual(COMMAND_TIMEOUT_S, JOB_TIMEOUT_S - JOB_SAFETY_MARGIN_S)
@@ -512,6 +524,123 @@ class TestRequestUndo(TransitionTestCase):
 					proposal.name,
 				)
 
+	# CHG-002 design 3.3 `undo`, 4.3 "Cạnh mới": `Lỗi → Đang hoàn tác` for a code change whose apply
+	# commit exists and was not undone yet; each condition failing on its own keeps the old refusal.
+	def _failed_with(self, kind=CHANGE_KIND_CODE, **fields):
+		proposal = _proposal_in(CHANGE_STATUS_FAILED, kind=kind)
+		if fields:
+			frappe.db.set_value(PROPOSAL_DOCTYPE, proposal.name, fields, update_modified=False)
+		return proposal
+
+	def test_from_failed_needs_apply_sha_and_no_undo_sha(self):
+		proposal = self._failed_with(apply_commit_sha="a" * 40)
+		before = _state(proposal.name)
+		self.assertEqual(transitions.request_undo(proposal.name, ACTOR), "Đang hoàn tác")
+		self.assertEqual(
+			_state(proposal.name),
+			{**before, "change_status": "Đang hoàn tác", "undo_by": ACTOR, "undo_at": NOW},
+		)
+		self.assertEqual(_state(proposal.name).apply_commit_sha, "a" * 40)
+		self.assertEqual(_rows(proposal.name), [])
+
+	def test_from_failed_without_sha_refused(self):
+		for apply_sha in (None, ""):
+			with self.subTest(apply_commit_sha=apply_sha):
+				proposal = self._failed_with(apply_commit_sha=apply_sha)
+				self.assertRefused(
+					lambda: transitions.request_undo(proposal.name, ACTOR),
+					"Đề xuất đang ở trạng thái Lỗi, không hoàn tác được",
+					proposal.name,
+				)
+				self.assertEqual(_state(proposal.name).change_status, "Lỗi")
+
+	def test_from_failed_with_undo_sha_refused(self):
+		proposal = self._failed_with(apply_commit_sha="a" * 40, undo_commit_sha="b" * 40)
+		self.assertRefused(
+			lambda: transitions.request_undo(proposal.name, ACTOR),
+			"Đề xuất đang ở trạng thái Lỗi, không hoàn tác được",
+			proposal.name,
+		)
+		self.assertEqual(_state(proposal.name).change_status, "Lỗi")
+
+	def test_from_failed_other_kind_refused(self):
+		proposal = self._failed_with(apply_commit_sha="a" * 40)
+		frappe.db.set_value(PROPOSAL_DOCTYPE, proposal.name, "change_kind", "Loại lạ", update_modified=False)
+		self.assertRefused(
+			lambda: transitions.request_undo(proposal.name, ACTOR),
+			"Đề xuất đang ở trạng thái Lỗi, không hoàn tác được",
+			proposal.name,
+		)
+		self.assertEqual(_state(proposal.name).change_status, "Lỗi")
+
+	def test_request_undo_refused_for_other_kind_when_applied(self):
+		# Addendum-5 P-3: only `Thay đổi code` is undoable, on the `Đã áp dụng` edge too.
+		for apply_sha in (None, "a" * 40):
+			with self.subTest(apply_commit_sha=apply_sha):
+				proposal = _proposal_in(CHANGE_STATUS_APPLIED)
+				frappe.db.set_value(
+					PROPOSAL_DOCTYPE,
+					proposal.name,
+					{"change_kind": "Loại lạ", "apply_commit_sha": apply_sha},
+					update_modified=False,
+				)
+				self.assertRefused(
+					lambda: transitions.request_undo(proposal.name, ACTOR),
+					"Đề xuất đang ở trạng thái Đã áp dụng, không hoàn tác được",
+					proposal.name,
+				)
+				self.assertEqual(_state(proposal.name).change_status, "Đã áp dụng")
+				self.assertIsNone(_state(proposal.name).undo_by)
+
+	def test_command_only_block_not_undoable(self):
+		proposal = self._failed_with(
+			kind=CHANGE_KIND_COMMAND, command_list=json.dumps([["migrate"]]), apply_commit_sha="a" * 40
+		)
+		self.assertRefused(
+			lambda: transitions.request_undo(proposal.name, ACTOR),
+			"Lệnh bench không hoàn tác được",
+			proposal.name,
+		)
+		self.assertEqual(_state(proposal.name).change_status, "Lỗi")
+
+	def test_other_statuses_refused_even_with_apply_sha(self):
+		for status in (s for s in ALL_STATUSES if s not in ("Đã áp dụng", "Lỗi")):
+			with self.subTest(status=status):
+				proposal = _proposal_in(status)
+				frappe.db.set_value(
+					PROPOSAL_DOCTYPE, proposal.name, "apply_commit_sha", "a" * 40, update_modified=False
+				)
+				self.assertRefused(
+					lambda: transitions.request_undo(proposal.name, ACTOR),
+					f"Đề xuất đang ở trạng thái {status}, không hoàn tác được",
+					proposal.name,
+				)
+
+	def test_two_callers_one_wins(self):
+		proposal = self._failed_with(apply_commit_sha="a" * 40)
+		self.assertEqual(transitions.request_undo(proposal.name, ACTOR), "Đang hoàn tác")
+		self.assertRefused(
+			lambda: transitions.request_undo(proposal.name, "Guest"),
+			"Đề xuất đang ở trạng thái Đang hoàn tác, không hoàn tác được",
+			proposal.name,
+		)
+		self.assertEqual(_state(proposal.name).undo_by, ACTOR)
+
+	def test_lock_reads_status_kind_and_both_commit_shas(self):
+		proposal = self._failed_with(apply_commit_sha="a" * 40)
+		with patch.object(frappe.db, "get_value", wraps=frappe.db.get_value) as get_value:
+			transitions.request_undo(proposal.name, ACTOR)
+		locks = [entry for entry in get_value.call_args_list if entry.kwargs.get("for_update") is True]
+		self.assertEqual(len(locks), 1)
+		self.assertEqual(
+			locks[0].args,
+			(
+				PROPOSAL_DOCTYPE,
+				proposal.name,
+				["change_status", "change_kind", "apply_commit_sha", "undo_commit_sha"],
+			),
+		)
+
 
 class TestBeginApply(TransitionTestCase):
 	def test_begin_apply_only_from_approved_and_second_call_false(self):
@@ -783,6 +912,387 @@ class TestFinish(TransitionTestCase):
 					)
 				self.assertNothingChanged(proposal.name, state, modified)
 
+	def test_command_results_stored(self):
+		results = [
+			{
+				"args": ["migrate"],
+				"exit_code": 0,
+				"duration_ms": 1200,
+				"timed_out": False,
+				"output": "xong\n",
+			},
+			{"args": ["clear-cache"], "exit_code": None, "duration_ms": 0, "timed_out": True, "output": ""},
+		]
+		proposal = _proposal_in(CHANGE_STATUS_APPLYING)
+		before = _state(proposal.name)
+		self.assertIs(
+			transitions.finish(
+				proposal.name,
+				CHANGE_STATUS_APPLYING,
+				CHANGE_STATUS_APPLIED,
+				step="apply",
+				actor=ACTOR,
+				command_results=results,
+			),
+			True,
+		)
+		state = _state(proposal.name)
+		self.assertEqual(json.loads(state.command_results), results)
+		self.assertEqual(
+			state,
+			{
+				**before,
+				"change_status": "Đã áp dụng",
+				"finished_at": NOW,
+				"command_results": state.command_results,
+			},
+		)
+		self.assertEqual([row.change_step for row in _rows(proposal.name)], ["apply"])
+		# Without `command_results` the field stays empty.
+		other = _proposal_in(CHANGE_STATUS_APPLYING)
+		transitions.finish(
+			other.name, CHANGE_STATUS_APPLYING, CHANGE_STATUS_APPLIED, step="apply", actor=ACTOR
+		)
+		self.assertIsNone(_state(other.name).command_results)
+
+	def test_command_results_refused_when_not_a_list(self):
+		proposal = _proposal_in(CHANGE_STATUS_APPLYING)
+		state, modified = _state(proposal.name), _modified(proposal.name)
+		with self.assertRaises(ValueError):
+			transitions.finish(
+				proposal.name,
+				CHANGE_STATUS_APPLYING,
+				CHANGE_STATUS_APPLIED,
+				step="apply",
+				actor=ACTOR,
+				command_results='[{"args": ["migrate"]}]',
+			)
+		self.assertNothingChanged(proposal.name, state, modified)
+
+	def test_command_results_is_keyword_only(self):
+		parameters = inspect.signature(transitions.finish).parameters
+		self.assertEqual(
+			[name for name, p in parameters.items() if p.kind is inspect.Parameter.POSITIONAL_OR_KEYWORD],
+			["name", "expected", "new_status"],
+		)
+		self.assertIs(parameters["command_results"].kind, inspect.Parameter.KEYWORD_ONLY)
+		self.assertIsNone(parameters["command_results"].default)
+		results = [{"args": ["migrate"], "exit_code": 0, "duration_ms": 5, "timed_out": False, "output": ""}]
+		proposal = _proposal_in(CHANGE_STATUS_APPLYING)
+		state, modified = _state(proposal.name), _modified(proposal.name)
+		with self.assertRaises(TypeError):
+			transitions.finish(
+				proposal.name,
+				CHANGE_STATUS_APPLYING,
+				CHANGE_STATUS_APPLIED,
+				results,
+				step="apply",
+				actor=ACTOR,
+			)
+		self.assertNothingChanged(proposal.name, state, modified)
+		transitions.finish(
+			proposal.name,
+			CHANGE_STATUS_APPLYING,
+			CHANGE_STATUS_APPLIED,
+			step="apply",
+			actor=ACTOR,
+			command_results=results,
+		)
+		self.assertEqual(json.loads(_state(proposal.name).command_results), results)
+
+
+class TestPrepareNew(FrappeTestCase):
+	def test_new_state_fields_cleared(self):
+		new_values = {
+			"command_results": '[{"args": ["migrate"], "exit_code": 0}]',
+			"created_dirs": '["erp_ai/erp_ai/moi"]',
+			"restart_status": "Đã gửi",
+			"restart_sent_at": "2026-11-13 12:00:00",
+		}
+		for fieldname in new_values:
+			self.assertIn(fieldname, transitions.STATE_FIELDS)
+		doc = frappe.get_doc({"doctype": PROPOSAL_DOCTYPE, **STATE_VALUES, **new_values})
+		transitions.prepare_new(doc)
+		self.assertEqual(doc.change_status, "Chờ duyệt")
+		for fieldname in new_values:
+			with self.subTest(fieldname=fieldname):
+				self.assertIsNone(doc.get(fieldname))
+
+
+class TestRecordCommit(TransitionTestCase):
+	def test_git_result_fields_add_created_dirs(self):
+		self.assertEqual(transitions.GIT_RESULT_FIELDS, (*GIT_FIELDS_EXPECTED, "created_dirs"))
+
+	def test_writes_git_fields_keeps_status_no_log_row(self):
+		cases = {
+			CHANGE_STATUS_APPLYING: {
+				"apply_commit_sha": "c" * 40,
+				"applied_branch": "main",
+				"applied_ahead_count": 1,
+				"created_dirs": ["erp_ai/erp_ai/moi", "erp_ai/erp_ai/moi/con"],
+			},
+			CHANGE_STATUS_UNDOING: {"undo_commit_sha": "e" * 40},
+		}
+		for status, fields in cases.items():
+			with self.subTest(status=status):
+				proposal = _proposal_in(status)
+				before = _state(proposal.name)
+				self.assertIs(transitions.record_commit(proposal.name, status, fields=fields), True)
+				state = _state(proposal.name)
+				stored = {**fields}
+				if "created_dirs" in fields:
+					self.assertEqual(json.loads(state.created_dirs), fields["created_dirs"])
+					stored["created_dirs"] = state.created_dirs
+				self.assertEqual(state, {**before, **stored})
+				self.assertEqual(state.change_status, status)
+				self.assertEqual(_rows(proposal.name), [])
+
+	def test_wrong_status_returns_false(self):
+		for expected in (CHANGE_STATUS_APPLYING, CHANGE_STATUS_UNDOING):
+			for current in (s for s in ALL_STATUSES if s != expected):
+				with self.subTest(expected=expected, current=current):
+					proposal = _proposal_in(current)
+					state, modified = _state(proposal.name), _modified(proposal.name)
+					self.assertIs(
+						transitions.record_commit(
+							proposal.name, expected, fields={"apply_commit_sha": "c" * 40}
+						),
+						False,
+					)
+					self.assertNothingChanged(proposal.name, state, modified)
+
+	def test_refuses_expected_outside_running_states_and_bad_fields(self):
+		cases = [
+			(status, {"apply_commit_sha": "c" * 40})
+			for status in ALL_STATUSES
+			if status not in (CHANGE_STATUS_APPLYING, CHANGE_STATUS_UNDOING)
+		]
+		cases += [
+			(CHANGE_STATUS_APPLYING, {"change_status": CHANGE_STATUS_APPLIED}),
+			(CHANGE_STATUS_APPLYING, {"command_results": "[]"}),
+			(CHANGE_STATUS_APPLYING, {"created_dirs": "erp_ai/erp_ai/moi"}),
+			(CHANGE_STATUS_APPLYING, [("apply_commit_sha", "c" * 40)]),
+		]
+		for expected, fields in cases:
+			with self.subTest(expected=expected, fields=fields):
+				proposal = _proposal_in(expected)
+				state, modified = _state(proposal.name), _modified(proposal.name)
+				with self.assertRaises(ValueError):
+					transitions.record_commit(proposal.name, expected, fields=fields)
+				self.assertNothingChanged(proposal.name, state, modified)
+
+	def test_fields_is_keyword_only(self):
+		with self.assertRaises(TypeError):
+			transitions.record_commit("x", CHANGE_STATUS_APPLYING, {"apply_commit_sha": "c" * 40})
+
+
+# CHG-002 design 3.6: the only states a restart is launched from, and the two launch outcomes.
+RESTART_EXPECTED_STATES = (CHANGE_STATUS_APPLIED, CHANGE_STATUS_UNDONE)
+RESTART_LAUNCH_VALUES = (RESTART_STATUS_SENT, RESTART_STATUS_LAUNCH_FAILED)
+RESTART_CONCLUSIONS = (RESTART_STATUS_CONFIRMED, RESTART_STATUS_UNCONFIRMED)
+# Different from NOW, so a stored `restart_sent_at` cannot come from `now_datetime()`.
+SENT_AT = datetime(2026, 11, 13, 9, 29, 1)
+
+
+def _with_restart(status, restart_status, sent_at=None):
+	proposal = _proposal_in(status)
+	frappe.db.set_value(
+		PROPOSAL_DOCTYPE,
+		proposal.name,
+		{"restart_status": restart_status, "restart_sent_at": sent_at},
+		update_modified=False,
+	)
+	return proposal
+
+
+class TestRecordRestart(TransitionTestCase):
+	def test_sent_and_launch_failed_stored_status_unchanged(self):
+		for expected in RESTART_EXPECTED_STATES:
+			for value in RESTART_LAUNCH_VALUES:
+				with self.subTest(expected=expected, value=value):
+					proposal = _proposal_in(expected)
+					before = _state(proposal.name)
+					self.assertIs(transitions.record_restart(proposal.name, expected, value, SENT_AT), True)
+					self.assertEqual(
+						_state(proposal.name),
+						{**before, "restart_status": value, "restart_sent_at": SENT_AT},
+					)
+					self.assertEqual(_state(proposal.name).change_status, expected)
+					self.assertEqual(_rows(proposal.name), [])
+
+	def test_wrong_expected_or_value_refused(self):
+		cases = [
+			(status, RESTART_STATUS_SENT) for status in ALL_STATUSES if status not in RESTART_EXPECTED_STATES
+		]
+		cases += [
+			(CHANGE_STATUS_APPLIED, value)
+			for value in (*RESTART_CONCLUSIONS, "", None, "Lạ", CHANGE_STATUS_APPLIED)
+		]
+		for expected, value in cases:
+			with self.subTest(expected=expected, value=value):
+				# The proposal is in `expected`, so only the argument check can refuse.
+				proposal = _proposal_in(expected)
+				state, modified = _state(proposal.name), _modified(proposal.name)
+				with self.assertRaises(ValueError):
+					transitions.record_restart(proposal.name, expected, value, SENT_AT)
+				self.assertNothingChanged(proposal.name, state, modified)
+
+	def test_sent_at_must_be_a_datetime(self):
+		for bad in (None, "2026-11-13 09:29:01", 1763026141):
+			with self.subTest(sent_at=bad):
+				proposal = _proposal_in(CHANGE_STATUS_APPLIED)
+				state, modified = _state(proposal.name), _modified(proposal.name)
+				with self.assertRaises(ValueError):
+					transitions.record_restart(proposal.name, CHANGE_STATUS_APPLIED, RESTART_STATUS_SENT, bad)
+				self.assertNothingChanged(proposal.name, state, modified)
+
+	def test_current_status_differs_returns_false(self):
+		for expected in RESTART_EXPECTED_STATES:
+			for current in (s for s in ALL_STATUSES if s != expected):
+				with self.subTest(expected=expected, current=current):
+					proposal = _proposal_in(current)
+					state, modified = _state(proposal.name), _modified(proposal.name)
+					self.assertIs(
+						transitions.record_restart(proposal.name, expected, RESTART_STATUS_SENT, SENT_AT),
+						False,
+					)
+					self.assertNothingChanged(proposal.name, state, modified)
+
+	def test_unknown_proposal_raises_does_not_exist(self):
+		with self.assertRaises(frappe.DoesNotExistError):
+			transitions.record_restart("AICHG-99999999", CHANGE_STATUS_APPLIED, RESTART_STATUS_SENT, SENT_AT)
+
+
+class TestConfirmRestart(TransitionTestCase):
+	def test_only_from_sent(self):
+		for status in RESTART_EXPECTED_STATES:
+			for value in RESTART_CONCLUSIONS:
+				with self.subTest(status=status, value=value):
+					proposal = _with_restart(status, RESTART_STATUS_SENT, SENT_AT)
+					before = _state(proposal.name)
+					self.assertIs(transitions.confirm_restart(proposal.name, value, sent_at=SENT_AT), True)
+					self.assertEqual(_state(proposal.name), {**before, "restart_status": value})
+					self.assertEqual(_rows(proposal.name), [])
+		for current in (None, *RESTART_CONCLUSIONS, RESTART_STATUS_LAUNCH_FAILED):
+			for value in RESTART_CONCLUSIONS:
+				with self.subTest(current=current, value=value):
+					proposal = _with_restart(CHANGE_STATUS_APPLIED, current, SENT_AT)
+					state, modified = _state(proposal.name), _modified(proposal.name)
+					self.assertIs(transitions.confirm_restart(proposal.name, value, sent_at=SENT_AT), False)
+					self.assertNothingChanged(proposal.name, state, modified)
+
+	def test_invalid_value_refused(self):
+		for value in (RESTART_STATUS_SENT, RESTART_STATUS_LAUNCH_FAILED, "", None, "Lạ"):
+			with self.subTest(value=value):
+				proposal = _with_restart(CHANGE_STATUS_APPLIED, RESTART_STATUS_SENT, SENT_AT)
+				state, modified = _state(proposal.name), _modified(proposal.name)
+				with self.assertRaises(ValueError):
+					transitions.confirm_restart(proposal.name, value, sent_at=SENT_AT)
+				self.assertNothingChanged(proposal.name, state, modified)
+
+	def test_unknown_proposal_raises_does_not_exist(self):
+		with self.assertRaises(frappe.DoesNotExistError):
+			transitions.confirm_restart("AICHG-99999999", RESTART_STATUS_CONFIRMED, sent_at=SENT_AT)
+
+	def test_reads_restart_status_under_one_lock_before_writing(self):
+		proposal = _with_restart(CHANGE_STATUS_APPLIED, RESTART_STATUS_SENT, SENT_AT)
+		db = Mock()
+		with (
+			patch.object(frappe.db, "get_value", wraps=frappe.db.get_value) as get_value,
+			patch.object(frappe.db, "set_value", wraps=frappe.db.set_value) as set_value,
+		):
+			db.attach_mock(get_value, "get_value")
+			db.attach_mock(set_value, "set_value")
+			transitions.confirm_restart(proposal.name, RESTART_STATUS_CONFIRMED, sent_at=SENT_AT)
+		names = [entry[0] for entry in db.mock_calls]
+		self.assertEqual(names.count("set_value"), 1)
+		first_write = names.index("set_value")
+		locks = [
+			entry
+			for entry in db.mock_calls[:first_write]
+			if entry[0] == "get_value" and entry.kwargs.get("for_update") is True
+		]
+		self.assertEqual(len(locks), 1, db.mock_calls[:first_write])
+		self.assertEqual(locks[0].args[:2], (PROPOSAL_DOCTYPE, proposal.name))
+		self.assertIn("restart_status", locks[0].args[2])
+		self.assertIs(db.mock_calls[first_write].kwargs.get("update_modified"), True)
+
+	# Addendum-5 P-4: write only while `restart_sent_at` is still the `sent_at` the caller read.
+	def test_stale_sent_at_writes_nothing(self):
+		for stored in (SENT_AT, None):
+			for value in RESTART_CONCLUSIONS:
+				with self.subTest(stored=stored, value=value):
+					proposal = _with_restart(CHANGE_STATUS_APPLIED, RESTART_STATUS_SENT, stored)
+					state, modified = _state(proposal.name), _modified(proposal.name)
+					stale = datetime(2026, 11, 13, 9, 29, 2)
+					self.assertIs(transitions.confirm_restart(proposal.name, value, sent_at=stale), False)
+					self.assertNothingChanged(proposal.name, state, modified)
+
+	# `get_datetime(None)` reads frappe's own `now_datetime`; pinned to `SENT_AT`, a missing stored
+	# time would compare equal to `sent_at` unless the guard refuses it first.
+	def test_missing_stored_sent_at_writes_nothing_even_when_now_equals_sent_at(self):
+		for value in RESTART_CONCLUSIONS:
+			with self.subTest(value=value):
+				proposal = _with_restart(CHANGE_STATUS_APPLIED, RESTART_STATUS_SENT, None)
+				state, modified = _state(proposal.name), _modified(proposal.name)
+				with patch("frappe.utils.data.now_datetime", return_value=SENT_AT):
+					self.assertIs(transitions.confirm_restart(proposal.name, value, sent_at=SENT_AT), False)
+				self.assertNothingChanged(proposal.name, state, modified)
+
+	def test_non_date_sent_at_raises_value_error(self):
+		for wrong in (20261113, 1.5, ["2026-11-13 09:29:01"]):
+			with self.subTest(sent_at=wrong):
+				proposal = _with_restart(CHANGE_STATUS_APPLIED, RESTART_STATUS_SENT, SENT_AT)
+				state, modified = _state(proposal.name), _modified(proposal.name)
+				with self.assertRaises(ValueError):
+					transitions.confirm_restart(proposal.name, RESTART_STATUS_CONFIRMED, sent_at=wrong)
+				self.assertNothingChanged(proposal.name, state, modified)
+
+	def test_equal_sent_at_as_datetime_or_string_writes(self):
+		for given in (SENT_AT, "2026-11-13 09:29:01"):
+			with self.subTest(sent_at=given):
+				proposal = _with_restart(CHANGE_STATUS_UNDONE, RESTART_STATUS_SENT, SENT_AT)
+				before = _state(proposal.name)
+				self.assertIs(
+					transitions.confirm_restart(proposal.name, RESTART_STATUS_CONFIRMED, sent_at=given), True
+				)
+				self.assertEqual(
+					_state(proposal.name), {**before, "restart_status": RESTART_STATUS_CONFIRMED}
+				)
+				self.assertEqual(_rows(proposal.name), [])
+
+	def test_missing_sent_at_raises_value_error(self):
+		for missing in (None, ""):
+			with self.subTest(sent_at=missing):
+				proposal = _with_restart(CHANGE_STATUS_APPLIED, RESTART_STATUS_SENT, SENT_AT)
+				state, modified = _state(proposal.name), _modified(proposal.name)
+				with self.assertRaises(ValueError):
+					transitions.confirm_restart(proposal.name, RESTART_STATUS_CONFIRMED, sent_at=missing)
+				self.assertNothingChanged(proposal.name, state, modified)
+
+	def test_sent_at_is_keyword_only_and_required(self):
+		proposal = _with_restart(CHANGE_STATUS_APPLIED, RESTART_STATUS_SENT, SENT_AT)
+		state, modified = _state(proposal.name), _modified(proposal.name)
+		for shape, call in (
+			("omitted", lambda: transitions.confirm_restart(proposal.name, RESTART_STATUS_CONFIRMED)),
+			(
+				"positional",
+				lambda: transitions.confirm_restart(proposal.name, RESTART_STATUS_CONFIRMED, SENT_AT),
+			),
+		):
+			with self.subTest(sent_at=shape), self.assertRaises(TypeError):
+				call()
+		self.assertNothingChanged(proposal.name, state, modified)
+
+	def test_lock_reads_restart_status_and_sent_at(self):
+		proposal = _with_restart(CHANGE_STATUS_APPLIED, RESTART_STATUS_SENT, SENT_AT)
+		with patch.object(frappe.db, "get_value", wraps=frappe.db.get_value) as get_value:
+			transitions.confirm_restart(proposal.name, RESTART_STATUS_CONFIRMED, sent_at=SENT_AT)
+		locks = [entry for entry in get_value.call_args_list if entry.kwargs.get("for_update") is True]
+		self.assertEqual(len(locks), 1)
+		self.assertIn("restart_status", locks[0].args[2])
+		self.assertIn("restart_sent_at", locks[0].args[2])
+
 
 class TestTransitionInput(TransitionTestCase):
 	def _calls(self, name, person=ACTOR):
@@ -845,6 +1355,20 @@ class TestLockBeforeWrite(TransitionTestCase):
 				CHANGE_STATUS_APPLYING,
 				lambda name: transitions.finish(
 					name, CHANGE_STATUS_APPLYING, CHANGE_STATUS_APPLIED, step="apply", actor=ACTOR
+				),
+			),
+			(
+				"record_commit",
+				CHANGE_STATUS_UNDOING,
+				lambda name: transitions.record_commit(
+					name, CHANGE_STATUS_UNDOING, fields={"undo_commit_sha": "e" * 40}
+				),
+			),
+			(
+				"record_restart",
+				CHANGE_STATUS_UNDONE,
+				lambda name: transitions.record_restart(
+					name, CHANGE_STATUS_UNDONE, RESTART_STATUS_SENT, SENT_AT
 				),
 			),
 		)

@@ -1,5 +1,5 @@
-"""Change-proposal tools: the model proposes one file change or one bench command; nothing is written to
-disk and no command runs here. A person approves on the proposal form, then the change job applies it."""
+"""Change-proposal tools: the model proposes one block of file items and bench commands; nothing is written
+to disk and no command runs here. A person approves on the proposal form, then the change job applies it."""
 
 import difflib
 import hashlib
@@ -13,12 +13,17 @@ from erp_ai.agent import change_link, change_text
 from erp_ai.agent.agent_write_guard import allow_agent_write
 from erp_ai.agent.tools import change_guard, source
 from erp_ai.agent.tools.registry import ToolContext, ToolSpec
+from erp_ai.agent.tools.registry import _invalid as registry_invalid  # design-addendum-2 A2-2
 from erp_ai.constants import (
 	CHANGE_KIND_CODE,
 	CHANGE_KIND_COMMAND,
+	CHANGE_MAX_COMMANDS,
+	CHANGE_MAX_FILE_OPS,
+	CHANGE_OP_CREATE,
+	CHANGE_OP_DELETE,
+	CHANGE_OP_EDIT,
+	CHANGE_OP_RENAME,
 	PROPOSAL_DOCTYPE,
-	PROPOSAL_TEXT_MAX_CHARS,
-	REPLACE_MAX_ITEMS,
 )
 
 GROUP = "change_propose"
@@ -28,22 +33,32 @@ REASON_MAX_CHARS = 1000
 PATH_MAX_CHARS = 300
 APP_MAX_CHARS = 100
 DIFF_CONTEXT_LINES = 3
-PROPOSAL_FILE_MAX_BYTES = source.SEARCH_FILE_MAX_BYTES
 COMMENT_DOCTYPE = "Comment"
 NO_INSTRUCTOR = "không có người ra lệnh"
 # Design table 3.1: these sentences are the contract with the model and the tests.
 NO_PERMISSION = "thiếu quyền tạo đề xuất"
 NO_COMMENT_PERMISSION = "thiếu quyền tạo comment"
 NOT_FOUND = "file không tồn tại"
-TOO_LARGE = "file lớn hơn 1 MiB"
-NOT_UTF8 = "file không phải UTF-8"
-EDIT_SHAPE = f"find và replace phải cùng số phần tử, từ 1 đến {REPLACE_MAX_ITEMS}"
+NOT_UTF8 = source.TEXT_NOT_UTF8
+EDIT_SHAPE = "find và replace phải cùng số phần tử, ít nhất 1"
 EDIT_NOT_FOUND = "đoạn find[{index}] không có trong file"
 EDIT_AMBIGUOUS = "đoạn find[{index}] xuất hiện nhiều hơn một lần"
 EDIT_OVERLAP = "các đoạn find chồng nhau"
 NO_CHANGE = "nội dung sau trùng nội dung trước"
 EXISTS = "file đã tồn tại"
-NO_PARENT = "thư mục cha chưa có"
+PARENT_NOT_DIR = "thư mục cha trên đường dẫn là một file"
+BLOCK_SHAPE = change_guard.BLOCK_SHAPE
+# CHG-002 design 3.1: the fields of each kind of item of `changes`.
+ITEM_FIELDS = {
+	"edit": {"action", "path", "find", "replace"},
+	"create": {"action", "path", "content"},
+	"delete": {"action", "path"},
+	"rename": {"action", "path", "new_path"},
+}
+EXECUTABLE_BITS = 0o111
+LEGACY_EDIT_KEYS = ("path", "find", "replace")
+# CHG-002 design 3.1: the fields of one item of `commands`.
+COMMAND_FIELDS = {"command", "app"}
 
 
 def _fail(reason: str) -> dict:
@@ -67,7 +82,7 @@ def _entry_refusal(ctx: ToolContext) -> dict | None:
 def _apply_edits(text: str, find: list, replace: list) -> tuple[str | None, str | None]:
 	"""Replace each find[i] (exactly once in `text`, spans not overlapping) by replace[i], by position
 	on the original text (design 3.1); (new text, None) or (None, refusal reason)."""
-	if len(find) != len(replace) or not 1 <= len(find) <= REPLACE_MAX_ITEMS:
+	if len(find) != len(replace) or not find:
 		return None, EDIT_SHAPE
 	spans = []
 	for index, needle in enumerate(find):
@@ -88,12 +103,12 @@ def _apply_edits(text: str, find: list, replace: list) -> tuple[str | None, str 
 	return "".join(pieces), None
 
 
-def _diff(rel_path: str, before: str, after: str) -> str:
+def _diff(rel_path: str, before: str, after: str, tofile: str | None = None) -> str:
 	lines = difflib.unified_diff(
 		before.splitlines(keepends=True),
 		after.splitlines(keepends=True),
 		fromfile=f"a/{rel_path}",
-		tofile=f"b/{rel_path}",
+		tofile=tofile or f"b/{rel_path}",
 		n=DIFF_CONTEXT_LINES,
 	)
 	return "".join(line if line.endswith("\n") else line + "\n" for line in lines)
@@ -101,16 +116,31 @@ def _diff(rel_path: str, before: str, after: str) -> str:
 
 def _comment(ctx: ToolContext, proposal) -> str:
 	"""One ticket comment (design 3.8): the escaped first sentence, the notes of design 3.9 and the
-	Duyệt / Từ chối links; returns the Comment name."""
+	Duyệt / Từ chối links; returns the Comment name.
+
+	A block (child rows or a `command_list`, CHG-002 design 3.7) says `khối {n} mục trong app {app}`
+	with `{n}` the number of items, or `{m} lệnh bench` when it has only commands, `{m}` counting
+	`restart`; its name and app go through `change_text._shown` (no URL). Any other proposal keeps
+	the first sentence of today, naming its file or command.
+	"""
 	escape = frappe.utils.escape_html
-	if proposal.change_kind == CHANGE_KIND_CODE:
+	name = proposal.name
+	# the test of `block.is_block` (design 2.3), written here: tools do not import `erp_ai.agent.changes`
+	if proposal.get("operations") or proposal.get("command_list"):
+		name = change_text._shown(proposal.name)
+		if proposal.get("operations"):
+			app = change_text._shown(proposal.app)
+			target = f"khối {len(proposal.operations)} mục trong app {escape(app)}"
+		else:
+			target = f"{len(json.loads(proposal.command_list))} lệnh bench"
+	elif proposal.change_kind == CHANGE_KIND_CODE:
 		verb = "tạo" if proposal.is_new_file else "sửa"
 		target = f"{verb} <code>{escape(proposal.file_path)}</code>"
 	else:
-		args = " ".join(json.loads(proposal.command_args or "[]"))
+		args = "; ".join(" ".join(argv) for argv in json.loads(proposal.command_list or "[]"))
 		target = f"lệnh <code>bench {escape(args)}</code>"
 	form = f"/app/erp-ai-change-proposal/{proposal.name}"
-	html = f'<p>Đề xuất <a href="{escape(form)}">{escape(proposal.name)}</a> đang chờ duyệt: {target}.</p>'
+	html = f'<p>Đề xuất <a href="{escape(form)}">{escape(name)}</a> đang chờ duyệt: {target}.</p>'
 	html += "".join(f"<p>{escape(line)}</p>" for line in change_text.proposal_notes(proposal))
 	approve = change_link.decision_path(proposal.name, change_link.ACTION_APPROVE)
 	reject = change_link.decision_path(proposal.name, change_link.ACTION_REJECT)
@@ -139,64 +169,270 @@ def _insert(ctx: ToolContext, values: dict) -> dict:
 	return {"ok": True, "proposal": proposal.name, "status": proposal.change_status, "comment": comment}
 
 
-def _code_values(guard, *, before: str | None, after: str, reason: str) -> dict:
-	new_file = before is None
-	return {
-		"change_kind": CHANGE_KIND_CODE,
-		"app": guard.app,
-		"file_path": guard.rel_path,
-		"is_new_file": int(new_file),
-		"reversible": 1,
-		"base_hash": "" if new_file else _sha256(before.encode("utf-8")),
-		"content_before": "" if new_file else before,
-		"content_after": after,
-		"after_hash": _sha256(after.encode("utf-8")),
-		"diff": _diff(guard.rel_path, before or "", after),
-		"reason": reason,
-		"target_branch": guard.git.branch,
-		"upstream_ref": guard.git.upstream_ref,
-		"ahead_count": guard.git.ahead_count,
-		"is_core_app": int(guard.is_core_app),
-	}
+def _is_text_list(value) -> bool:
+	return isinstance(value, list) and all(isinstance(item, str) for item in value)
+
+
+def _item_shape(change) -> str | None:
+	"""Design 3.1: the fields of an item of `changes` for its `action`, or the refusal reason."""
+	action = change.get("action") if isinstance(change, dict) else None
+	if action not in ITEM_FIELDS:
+		return change_guard.OP_UNKNOWN
+	fields_ok = set(change) == ITEM_FIELDS[action] and isinstance(change["path"], str)
+	if action == "edit":
+		fields_ok = fields_ok and _is_text_list(change["find"]) and _is_text_list(change["replace"])
+	elif action == "create":
+		fields_ok = fields_ok and isinstance(change["content"], str)
+	elif action == "rename":
+		fields_ok = fields_ok and isinstance(change["new_path"], str)
+	return None if fields_ok else change_guard.OP_FIELDS.format(action=action)
+
+
+def _edited_op(change: dict, ctx: ToolContext) -> change_guard.FileOp | str:
+	"""Design 4.1 step 2 for an `edit` item: read at most `TEXT_MAX_BYTES + 1` bytes, `text_refusal`, then
+	the edits; the `FileOp` or the refusal reason."""
+	guard = change_guard.check_write_path(change["path"], ctx.allowed_apps, new_file=False, read_git=False)
+	if guard.reason:
+		return guard.reason
+	if not os.path.isfile(guard.full_path):
+		return NOT_FOUND
+	with open(guard.full_path, "rb") as handle:
+		data = handle.read(source.TEXT_MAX_BYTES + 1)
+	refusal = source.text_refusal(guard.rel_path, data)
+	if refusal:
+		return refusal
+	before = data.decode("utf-8")
+	after, refusal = _apply_edits(before, change["find"], change["replace"])
+	if refusal:
+		return refusal
+	if after == before:
+		return NO_CHANGE
+	return change_guard.FileOp(
+		kind=CHANGE_OP_EDIT,
+		path=change["path"],
+		new_path=None,
+		before=before,
+		after=after,
+		base_hash=_sha256(before.encode("utf-8")),
+		after_hash=_sha256(after.encode("utf-8")),
+	)
+
+
+def _under_a_folder(full: str) -> bool:
+	"""A new file's nearest existing parent is a folder, not a file (`app/README.md/x.txt` is refused)."""
+	parent = os.path.dirname(full)
+	while not os.path.lexists(parent):
+		parent = os.path.dirname(parent)
+	return os.path.isdir(parent)
+
+
+def _created_op(change: dict, ctx: ToolContext) -> change_guard.FileOp | str:
+	"""Design 4.1 step 2 for a `create` item: an existing path (`lexists`) is `EXISTS`; folders may be new."""
+	guard = change_guard.check_write_path(change["path"], ctx.allowed_apps, new_file=True, read_git=False)
+	if guard.reason:
+		return guard.reason
+	if os.path.lexists(guard.full_path):
+		return EXISTS
+	if not _under_a_folder(guard.full_path):
+		return PARENT_NOT_DIR
+	content = change["content"]
+	return change_guard.FileOp(
+		kind=CHANGE_OP_CREATE,
+		path=change["path"],
+		new_path=None,
+		before=None,
+		after=content,
+		base_hash=None,
+		after_hash=_sha256(content.encode("utf-8", errors="surrogatepass")),
+	)
+
+
+def _removed_text(path: str, ctx: ToolContext) -> tuple[str, str | None]:
+	"""Design 4.1 step 2 for the file a `delete` or `rename` item takes away (R-7, R-8): a regular file and
+	not a symlink (`NOT_REGULAR_FILE`), no execute bit (`EXECUTABLE_FILE`), then at most
+	`TEXT_MAX_BYTES + 1` bytes through `text_refusal`; (text, None) or ("", refusal reason)."""
+	guard = change_guard.check_write_path(path, ctx.allowed_apps, new_file=False, read_git=False)
+	if guard.reason:
+		return "", guard.reason
+	full = guard.full_path
+	if not os.path.isfile(full) or os.path.islink(full):
+		return "", change_guard.NOT_REGULAR_FILE
+	if os.stat(full).st_mode & EXECUTABLE_BITS:
+		return "", change_guard.EXECUTABLE_FILE
+	with open(full, "rb") as handle:
+		data = handle.read(source.TEXT_MAX_BYTES + 1)
+	refusal = source.text_refusal(guard.rel_path, data)
+	if refusal:
+		return "", refusal
+	return data.decode("utf-8"), None
+
+
+def _deleted_op(change: dict, ctx: ToolContext) -> change_guard.FileOp | str:
+	"""Design 4.1 step 2 for a `delete` item: the file's text is kept as the content before."""
+	before, refusal = _removed_text(change["path"], ctx)
+	if refusal:
+		return refusal
+	return change_guard.FileOp(
+		kind=CHANGE_OP_DELETE,
+		path=change["path"],
+		new_path=None,
+		before=before,
+		after=None,
+		base_hash=_sha256(before.encode("utf-8")),
+		after_hash=None,
+	)
+
+
+def _renamed_op(change: dict, ctx: ToolContext) -> change_guard.FileOp | str:
+	"""Design 4.1 step 2 for a `rename` item: the source as for `delete`, a target that exists
+	(`lexists`) is `EXISTS`; the content moves unchanged."""
+	text, refusal = _removed_text(change["path"], ctx)
+	if refusal:
+		return refusal
+	guard = change_guard.check_write_path(change["new_path"], ctx.allowed_apps, new_file=True, read_git=False)
+	if guard.reason:
+		return guard.reason
+	if os.path.lexists(guard.full_path):
+		return EXISTS
+	if not _under_a_folder(guard.full_path):
+		return PARENT_NOT_DIR
+	digest = _sha256(text.encode("utf-8"))
+	return change_guard.FileOp(
+		kind=CHANGE_OP_RENAME,
+		path=change["path"],
+		new_path=change["new_path"],
+		before=text,
+		after=text,
+		base_hash=digest,
+		after_hash=digest,
+	)
+
+
+def _built_commands(commands, ctx: ToolContext) -> list | dict:
+	"""Design 3.1: each `{command, app?}` of `commands` as its argv from `build_bench_args`, in order, or the
+	refusal: a malformed list or item is refused like the schema, a command reason gets `lệnh {n}: `."""
+	if not isinstance(commands, list):
+		return registry_invalid("commands")
+	built = []
+	for number, command in enumerate(commands, start=1):
+		if not isinstance(command, dict) or "command" not in command or not set(command) <= COMMAND_FIELDS:
+			return registry_invalid("commands")
+		args = change_guard.build_bench_args(
+			command["command"], command.get("app"), ctx.allowed_apps, frappe.local.site
+		)
+		if isinstance(args, str):
+			return _fail(change_guard.COMMAND_PREFIX.format(number=number) + args)
+		built.append(args)
+	return built
+
+
+_BUILDERS = {"edit": _edited_op, "create": _created_op, "delete": _deleted_op, "rename": _renamed_op}
+
+
+def _op_diff(op: change_guard.FileOp) -> str:
+	"""One item's part of `diff_text`: a unified diff (a deletion against `/dev/null`), or for a rename
+	the two lines `rename from` / `rename to`."""
+	path = os.path.normpath(op.path)
+	if op.kind == CHANGE_OP_RENAME:
+		return f"rename from {path}\nrename to {os.path.normpath(op.new_path)}\n"
+	tofile = "/dev/null" if op.kind == CHANGE_OP_DELETE else None
+	return _diff(path, op.before or "", op.after or "", tofile)
+
+
+def _row(target: change_guard.OpTarget) -> dict:
+	op = target.op
+	row = {"operation": op.kind, "file_path": target.guard.rel_path, "content_after": op.after}
+	if op.new_path is not None:
+		row["new_path"] = os.path.normpath(op.new_path)
+	if op.before is not None:
+		row.update(content_before=op.before, base_hash=op.base_hash)
+	row["after_hash"] = op.after_hash
+	return row
+
+
+def _propose_block(changes: list, commands: list, reason: str, ctx: ToolContext) -> dict:
+	"""CHG-002 design 4.1: one block proposal of `edit`, `create`, `delete` and `rename` items (design 3.1).
+
+	Step 2 turns each item into a `FileOp`; step 2b builds the joined `diff_text` once (design-addendum-1
+	A-1.5); step 3 is `check_block` at proposal time, whose paths and git state are the ones stored; step 4
+	inserts one parent with one child row per item and exactly that `diff_text`. Every refusal comes before
+	the insert: 0 proposals, 0 comments. `commands` are argv lists passed on to `check_block` and stored in
+	`command_list` in order; a block with only commands carries no git field and no `branch`.
+	"""
+	if not isinstance(changes, list):
+		return _fail(change_guard.OP_UNKNOWN)
+	ops = []
+	for number, change in enumerate(changes, start=1):
+		refusal = _item_shape(change)
+		if refusal is None:
+			built = _BUILDERS[change["action"]](change, ctx)
+			refusal = built if isinstance(built, str) else None
+		if refusal:
+			path = change.get("path") if isinstance(change, dict) else None
+			return _fail(change_guard.OP_PREFIX.format(number=number, path=path) + refusal)
+		ops.append(built)
+	diff_text = "".join(_op_diff(op) for op in ops)
+	check = change_guard.check_block(
+		ops, commands, ctx.allowed_apps, frappe.local.site, at_apply=False, diff_text=diff_text
+	)
+	if check.reason:
+		return _fail(check.reason)
+	values = {"command_list": json.dumps(commands, ensure_ascii=False), "reason": reason}
+	if check.targets:
+		guard = check.targets[0].guard
+		values.update(
+			change_kind=CHANGE_KIND_CODE,
+			app=check.app,
+			reversible=1,
+			operations=[_row(target) for target in check.targets],
+			diff=diff_text,
+			target_branch=guard.git.branch,
+			upstream_ref=guard.git.upstream_ref,
+			ahead_count=guard.git.ahead_count,
+			is_core_app=int(guard.is_core_app),
+		)
+		return {**_insert(ctx, values), "branch": guard.git.branch}
+	# design 2.2: a block with only commands takes the app of `build --app`, if any, and no git field
+	built_apps = [args[-1] for args in commands if args[0] == change_guard.BUILD_COMMAND]
+	values.update(
+		change_kind=CHANGE_KIND_COMMAND,
+		app=built_apps[0] if built_apps else None,
+		reversible=0,
+		target_branch="",
+		upstream_ref="",
+		ahead_count=0,
+		is_core_app=0,
+	)
+	return _insert(ctx, values)
 
 
 def propose_file_change(args: dict, ctx: ToolContext) -> dict:
 	if refusal := _entry_refusal(ctx):
 		return refusal
-	guard = change_guard.check_write_path(args["path"], ctx.allowed_apps, new_file=False)
-	if guard.reason:
-		return _fail(guard.reason)
-	if not os.path.isfile(guard.full_path):
-		return _fail(NOT_FOUND)
-	with open(guard.full_path, "rb") as handle:
-		data = handle.read(PROPOSAL_FILE_MAX_BYTES + 1)
-	if len(data) > PROPOSAL_FILE_MAX_BYTES:
-		return _fail(TOO_LARGE)
-	try:
-		before = data.decode("utf-8")
-	except UnicodeDecodeError:
-		return _fail(NOT_UTF8)
-	after, reason = _apply_edits(before, args["find"], args["replace"])
-	if reason:
-		return _fail(reason)
-	if after == before:
-		return _fail(NO_CHANGE)
-	result = _insert(ctx, _code_values(guard, before=before, after=after, reason=args["reason"]))
-	return {**result, "branch": guard.git.branch}
+	if "changes" in args:
+		if "path" in args:
+			return _fail(BLOCK_SHAPE)
+		changes = args["changes"]
+	else:
+		# The old shape: the schema no longer requires these keys, so a missing one is refused as before.
+		for key in LEGACY_EDIT_KEYS:
+			if key not in args:
+				return registry_invalid(key)
+		changes = [{"action": "edit", **{key: args[key] for key in LEGACY_EDIT_KEYS}}]
+	commands = _built_commands(args.get("commands", []), ctx)
+	if isinstance(commands, dict):
+		return commands
+	return _propose_block(changes, commands, args["reason"], ctx)
 
 
 def propose_new_file(args: dict, ctx: ToolContext) -> dict:
 	if refusal := _entry_refusal(ctx):
 		return refusal
-	guard = change_guard.check_write_path(args["path"], ctx.allowed_apps, new_file=True)
-	if guard.reason:
-		return _fail(guard.reason)
-	if os.path.lexists(guard.full_path):
-		return _fail(EXISTS)
-	if not os.path.isdir(os.path.dirname(guard.full_path)):
-		return _fail(NO_PARENT)
-	result = _insert(ctx, _code_values(guard, before=None, after=args["content"], reason=args["reason"]))
-	return {**result, "branch": guard.git.branch}
+	change = {"action": "create", "path": args["path"], "content": args["content"]}
+	commands = _built_commands(args.get("commands", []), ctx)
+	if isinstance(commands, dict):
+		return commands
+	return _propose_block([change], commands, args["reason"], ctx)
 
 
 def propose_bench_command(args: dict, ctx: ToolContext) -> dict:
@@ -207,25 +443,34 @@ def propose_bench_command(args: dict, ctx: ToolContext) -> dict:
 	)
 	if isinstance(built, str):
 		return _fail(built)
-	values = {
-		"change_kind": CHANGE_KIND_COMMAND,
-		"app": args.get("app"),
-		"command_args": json.dumps(built, ensure_ascii=False),
-		"reversible": 0,
-		"reason": args["reason"],
-		# design 2.1: a bench command carries no git field
-		"target_branch": "",
-		"upstream_ref": "",
-		"ahead_count": 0,
-		"is_core_app": 0,
-	}
-	return _insert(ctx, values)
+	return _propose_block([], [built], args["reason"], ctx)
 
 
 _PATH = {"type": "string", "minLength": 1, "maxLength": PATH_MAX_CHARS}
 _REASON = {"type": "string", "minLength": 1, "maxLength": REASON_MAX_CHARS}
-_FIND_ITEM = {"type": "string", "minLength": 1, "maxLength": PROPOSAL_TEXT_MAX_CHARS}
-_REPLACE_ITEM = {"type": "string", "maxLength": PROPOSAL_TEXT_MAX_CHARS}
+_FIND_ITEM = {"type": "string", "minLength": 1}
+_REPLACE_ITEM = {"type": "string"}
+_APP = {"type": "string", "minLength": 1, "maxLength": APP_MAX_CHARS}
+_COMMAND = {"type": "string", "enum": list(change_guard.BENCH_COMMANDS)}
+# CHG-002 design 3.1: the bench commands run after the files, in order.
+_COMMANDS = {
+	"type": "array",
+	"maxItems": CHANGE_MAX_COMMANDS,
+	"items": {"type": "object", "properties": {"command": _COMMAND, "app": _APP}, "required": ["command"]},
+}
+# CHG-002 design 3.1: one item of `changes`.
+_CHANGE_ITEM = {
+	"type": "object",
+	"properties": {
+		"action": {"type": "string", "enum": ["edit", "create", "delete", "rename"]},
+		"path": _PATH,
+		"new_path": _PATH,
+		"find": {"type": "array", "items": _FIND_ITEM},
+		"replace": {"type": "array", "items": _REPLACE_ITEM},
+		"content": {"type": "string"},
+	},
+	"required": ["action", "path"],
+}
 
 TOOLS: list[ToolSpec] = [
 	ToolSpec(
@@ -237,17 +482,25 @@ TOOLS: list[ToolSpec] = [
 				"Tạo đề xuất sửa một file đã có trong apps/ (đường dẫn tính từ apps/, ví dụ "
 				"helpdesk/helpdesk/api/ticket.py). find và replace là hai mảng cùng số phần tử: mỗi find[i] "
 				"phải xuất hiện đúng 1 lần trong file, các đoạn find không chồng nhau, và được thay bằng "
-				"replace[i]. Chỉ tạo đề xuất Chờ duyệt, chưa ghi gì xuống đĩa."
+				"replace[i]. commands là các lệnh bench chạy sau khi ghi file, đúng thứ tự; có file .py thì "
+				"kết thúc bằng migrate rồi restart. Chỉ tạo đề xuất Chờ duyệt, chưa ghi gì xuống đĩa."
 			),
 			"input_schema": {
 				"type": "object",
 				"properties": {
+					"changes": {
+						"type": "array",
+						"minItems": 1,
+						"maxItems": CHANGE_MAX_FILE_OPS,
+						"items": _CHANGE_ITEM,
+					},
 					"path": _PATH,
-					"find": {"type": "array", "maxItems": REPLACE_MAX_ITEMS, "items": _FIND_ITEM},
-					"replace": {"type": "array", "maxItems": REPLACE_MAX_ITEMS, "items": _REPLACE_ITEM},
+					"find": {"type": "array", "items": _FIND_ITEM},
+					"replace": {"type": "array", "items": _REPLACE_ITEM},
+					"commands": _COMMANDS,
 					"reason": _REASON,
 				},
-				"required": ["path", "find", "replace", "reason"],
+				"required": ["reason"],
 			},
 		},
 		handler=propose_file_change,
@@ -258,14 +511,16 @@ TOOLS: list[ToolSpec] = [
 		schema={
 			"name": "propose_new_file",
 			"description": (
-				"Tạo đề xuất thêm một file mới trong apps/ (thư mục chứa phải có sẵn). "
-				"Chỉ tạo đề xuất Chờ duyệt, chưa ghi gì xuống đĩa."
+				"Tạo đề xuất thêm một file mới trong apps/; thư mục cha chưa có sẽ được tạo. "
+				"commands là các lệnh bench chạy sau khi ghi file, đúng thứ tự; có file .py thì "
+				"kết thúc bằng migrate rồi restart. Chỉ tạo đề xuất Chờ duyệt, chưa ghi gì xuống đĩa."
 			),
 			"input_schema": {
 				"type": "object",
 				"properties": {
 					"path": _PATH,
-					"content": {"type": "string", "minLength": 1, "maxLength": PROPOSAL_TEXT_MAX_CHARS},
+					"content": {"type": "string"},
+					"commands": _COMMANDS,
 					"reason": _REASON,
 				},
 				"required": ["path", "content", "reason"],
@@ -285,8 +540,8 @@ TOOLS: list[ToolSpec] = [
 			"input_schema": {
 				"type": "object",
 				"properties": {
-					"command": {"type": "string", "enum": list(change_guard.BENCH_COMMANDS)},
-					"app": {"type": "string", "minLength": 1, "maxLength": APP_MAX_CHARS},
+					"command": _COMMAND,
+					"app": _APP,
 					"reason": _REASON,
 				},
 				"required": ["command", "reason"],

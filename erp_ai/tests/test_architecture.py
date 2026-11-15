@@ -26,6 +26,7 @@ import sys
 import unittest
 from pathlib import Path
 from typing import ClassVar, NamedTuple
+from unittest.mock import patch
 
 from erp_ai.constants import AGENT_STATUS_EVENT, AGENT_USER, PANEL_METHODS
 
@@ -162,9 +163,22 @@ TOOL_FORBIDDEN_CALL_SUFFIXES = ("db.set_value", "set_user", "db.multisql", "db_u
 SQL_READ_ONLY = re.compile(r"^\s*(select|show|describe)\b", re.IGNORECASE)
 
 # ADR-001: product code imports only the standard library, frappe, helpdesk and itself; `anthropic` (declared
-# in pyproject.toml `dependencies`) only in gateway/client.py (NFR-5). Anything else, any other app, is a violation.
+# in pyproject.toml `dependencies`) only in gateway/client.py (NFR-5); the one named exception is
+# NAMED_LIBRARY_IMPORTS below. Anything else, any other app, is a violation.
 ALLOWED_TOP_LEVEL_MODULES = frozenset({PACKAGE, "frappe", "helpdesk", *sys.stdlib_module_names})
 ANTHROPIC_MODULE = "anthropic"
+# ADR-040 Phán quyết C-3: the one named exception to ADR-001, `{file: top-level libraries it may import}`
+# (versions pinned by frappe, not by erp_ai); how restart_check uses them is check_restart_check_library_use's.
+RESTART_CHECK_FILE = "agent/changes/restart_check.py"
+NAMED_LIBRARY_IMPORTS = {RESTART_CHECK_FILE: frozenset({"psutil", "redis"})}
+RESTART_CHECK_LIBRARIES = tuple(sorted(NAMED_LIBRARY_IMPORTS[RESTART_CHECK_FILE]))
+RESTART_CHECK_ALLOWED_NAMES = frozenset(
+	{"psutil", "redis", "psutil.Process", "psutil.Error", "redis.exceptions", "redis.exceptions.RedisError"}
+)
+RESTART_CHECK_FORBIDDEN_METHODS = frozenset(
+	{"kill", "terminate", "send_signal", "suspend", "resume", "nice", "ionice", "rlimit", "cpu_affinity"}
+)
+RESTART_CHECK_FORBIDDEN_MODULES = ("subprocess", "signal", "os.kill", "os.killpg")
 
 POLICY_FIELDS = (
 	"permission_level",
@@ -541,18 +555,83 @@ def check_layer_imports(sources: dict, rules=LAYER_RULES) -> list:
 
 
 def check_import_boundaries(sources: dict) -> list:
-	"""ADR-001 allowlist: stdlib, frappe, helpdesk, erp_ai; NFR-5/ADR-002: `anthropic` only in gateway/client.py."""
+	"""ADR-001 allowlist: stdlib, frappe, helpdesk, erp_ai; NFR-5/ADR-002: `anthropic` only in gateway/client.py;
+	ADR-040 C-3: a library in NAMED_LIBRARY_IMPORTS only in its file, and a dead exception (the file is gone,
+	or no longer imports a listed name) is itself a violation. "Gone" is read from disk, so a partial
+	`sources` (the self-checks) does not count as a deleted file."""
 	violations = []
 	for rel, source in only_python(sources).items():
 		imports = imported_modules(parse(rel, source), module_name(rel), rel.endswith("__init__.py"))
+		named = NAMED_LIBRARY_IMPORTS.get(rel, ())
 		for lineno, target in imports:
 			if module_in(target, ANTHROPIC_MODULE):
 				if rel != CLIENT_FILE:
 					violations.append(f"{rel}:{lineno}: imports {target} outside {CLIENT_FILE} (NFR-5)")
-			elif target.split(".")[0] not in ALLOWED_TOP_LEVEL_MODULES:
+			elif target.split(".")[0] not in ALLOWED_TOP_LEVEL_MODULES and target.split(".")[0] not in named:
 				violations.append(
 					f"{rel}:{lineno}: imports {target}, not stdlib/frappe/helpdesk/erp_ai (ADR-001: no other app or library)"
 				)
+	for rel, names in NAMED_LIBRARY_IMPORTS.items():
+		if rel not in sources:
+			if not (PACKAGE_ROOT / rel).is_file():
+				violations.append(f"{rel}: file gone, dead exception in NAMED_LIBRARY_IMPORTS (ADR-040 C-3)")
+			continue
+		imported = {
+			target.split(".")[0]
+			for _lineno, target in imported_modules(parse(rel, sources[rel]), module_name(rel), False)
+		}
+		violations.extend(
+			f"{rel}: no longer imports {name}, dead exception in NAMED_LIBRARY_IMPORTS (ADR-040 C-3)"
+			for name in sorted(names - imported)
+		)
+	return violations
+
+
+def _is_restart_library(name: str) -> bool:
+	return any(module_in(name, library) for library in RESTART_CHECK_LIBRARIES)
+
+
+def check_restart_check_library_use(sources: dict) -> list:
+	"""ADR-040 C-3: restart_check.py only reads. psutil/redis only as psutil.Process, psutil.Error,
+	redis.exceptions(.RedisError), in imports and attribute references; no signalling or tuning method call
+	(kill, terminate, ...); no subprocess, os.kill, os.killpg or signal (design 4.4: no subprocess)."""
+	source = sources.get(RESTART_CHECK_FILE)
+	if source is None:
+		return _missing(RESTART_CHECK_FILE)
+	tree = parse(RESTART_CHECK_FILE, source)
+	aliases = import_aliases(tree)
+	violations = []
+	for node in ast.walk(tree):
+		if isinstance(node, ast.Import | ast.ImportFrom):
+			base = "" if isinstance(node, ast.Import) or node.level else f"{node.module}."
+			for alias in node.names:
+				name = base + alias.name
+				if _is_restart_library(name) and name not in RESTART_CHECK_ALLOWED_NAMES:
+					violations.append(violation(RESTART_CHECK_FILE, node, f"imports {name} (ADR-040 C-3)"))
+				elif any(module_in(name, forbidden) for forbidden in RESTART_CHECK_FORBIDDEN_MODULES):
+					violations.append(
+						violation(RESTART_CHECK_FILE, node, f"imports {name} (ADR-040 C-3: read only)")
+					)
+		elif isinstance(node, ast.Attribute) and "()" not in (name := resolved_name(node, aliases)):
+			# a chain through a call (`psutil.Process(pid).create_time`) is a method of an allowed object
+			if _is_restart_library(name) and name not in RESTART_CHECK_ALLOWED_NAMES:
+				violations.append(violation(RESTART_CHECK_FILE, node, f"uses {name} (ADR-040 C-3)"))
+			elif any(module_in(name, forbidden) for forbidden in RESTART_CHECK_FORBIDDEN_MODULES):
+				violations.append(
+					violation(RESTART_CHECK_FILE, node, f"uses {name} (ADR-040 C-3: read only)")
+				)
+		if (
+			isinstance(node, ast.Call)
+			and isinstance(node.func, ast.Attribute)
+			and node.func.attr in RESTART_CHECK_FORBIDDEN_METHODS
+		):
+			violations.append(
+				violation(
+					RESTART_CHECK_FILE,
+					node,
+					f"calls .{node.func.attr}() (ADR-040 C-3: never signal a process)",
+				)
+			)
 	return violations
 
 
@@ -1928,7 +2007,8 @@ ROOT_CHECK_ALLOWLIST = frozenset(
 	}
 )
 
-# Design 2.1 state group (11 names) + the 4 git result fields of amendment 1, in transitions.STATE_FIELDS order.
+# Design 2.1 state group (11 names) + the 4 git result fields of amendment 1 + the 4 CHG-002 design 3.6 fields,
+# in transitions.STATE_FIELDS order.
 STATE_FIELDS = (
 	"change_status",
 	"decided_by",
@@ -1940,7 +2020,11 @@ STATE_FIELDS = (
 	"exit_code",
 	"duration_ms",
 	"command_output",
+	"command_results",
 	"failure_reason",
+	"created_dirs",
+	"restart_status",
+	"restart_sent_at",
 	"applied_branch",
 	"applied_ahead_count",
 	"apply_commit_sha",
@@ -2628,6 +2712,80 @@ def check_fs_writes_only_in_file_writer(sources: dict) -> list:
 	return violations
 
 
+FILE_WRITER_CANONICAL_CHECK = "_refuse_unless_canonical"
+FILE_WRITER_SECOND_RESOLVER_CALLS = ("realpath", "commonpath", "is_relative_to", "readlink")
+FILE_WRITER_RECHECKERS = ("make_parents", "remove_empty_dirs", "write_atomic", "remove_file")
+FILE_WRITER_RECHECKS_ALL = True  # condition 4 of the rule; T49 deletes the flag
+FILE_WRITER_FS_CALLS = frozenset(
+	{"os.mkdir", "os.rmdir", "os.remove", "os.unlink", "os.replace", "os.rename", "tempfile.mkstemp"}
+)
+
+
+def check_file_writer_rechecks_through_resolver(sources: dict) -> list:
+	"""ADR-040 Phán quyết C-2: file_writer re-checks a path only by asking the one resolver.
+	1. a top-level `_refuse_unless_canonical` calls `source.resolve_safe_path`;
+	2. file_writer.py calls no `realpath`/`commonpath`/`is_relative_to`/`readlink` (a second resolver);
+	3. every function in FILE_WRITER_RECHECKERS calls `_refuse_unless_canonical`;
+	4. (FILE_WRITER_RECHECKS_ALL) every top-level function touching the file system is in FILE_WRITER_RECHECKERS."""
+	writer = sources.get(FILE_WRITER_FILE)
+	if writer is None:
+		return _missing(FILE_WRITER_FILE)
+	tree = parse(FILE_WRITER_FILE, writer)
+	aliases = import_aliases(tree)
+	functions = _module_functions(tree)
+	violations = []
+	canonical = functions.get(FILE_WRITER_CANONICAL_CHECK)
+	if canonical is None:
+		violations.append(f"{FILE_WRITER_FILE}: no top-level {FILE_WRITER_CANONICAL_CHECK}() (ADR-040 C-2)")
+	elif not any(
+		isinstance(node, ast.Call) and resolved_name(node.func, aliases) == SAFE_PATH_CALL
+		for node in ast.walk(canonical)
+	):
+		violations.append(
+			violation(
+				FILE_WRITER_FILE,
+				canonical,
+				f"{FILE_WRITER_CANONICAL_CHECK} does not call {SAFE_PATH_CALL} (ADR-040 C-2)",
+			)
+		)
+	for node in ast.walk(tree):
+		if not isinstance(node, ast.Call):
+			continue
+		name = (resolved_name(node.func, aliases) or "").rsplit(".", 1)[-1]
+		if name in FILE_WRITER_SECOND_RESOLVER_CALLS:
+			violations.append(
+				violation(FILE_WRITER_FILE, node, f"calls {name}: a second path resolver (ADR-040 C-2)")
+			)
+	for name in FILE_WRITER_RECHECKERS:
+		function = functions.get(name)
+		if function is None:
+			violations.append(f"{FILE_WRITER_FILE}: no top-level {name}() (ADR-040 C-2)")
+		elif FILE_WRITER_CANONICAL_CHECK not in _called_names(function):
+			violations.append(
+				violation(
+					FILE_WRITER_FILE,
+					function,
+					f"{name} does not call {FILE_WRITER_CANONICAL_CHECK} (ADR-040 C-2)",
+				)
+			)
+	if FILE_WRITER_RECHECKS_ALL:
+		for name, function in functions.items():
+			if name in FILE_WRITER_RECHECKERS:
+				continue
+			if any(
+				isinstance(node, ast.Call) and resolved_name(node.func, aliases) in FILE_WRITER_FS_CALLS
+				for node in ast.walk(function)
+			):
+				violations.append(
+					violation(
+						FILE_WRITER_FILE,
+						function,
+						f"{name} touches the file system but is not in FILE_WRITER_RECHECKERS (ADR-040 C-2)",
+					)
+				)
+	return violations
+
+
 def _names_forbidden(name: str) -> bool:
 	return any(name == forbidden or name.endswith("." + forbidden) for forbidden in CHANGES_FORBIDDEN_NAMES)
 
@@ -2776,6 +2934,19 @@ GIT_RUNNING_BENCH_SUBCOMMANDS = (
 	"new-app",
 	"setup",
 	"init",
+)
+RESTART_BENCH_COMMAND = "restart"  # ADR-040 QĐ 6: the one shape added to the table
+FORBIDDEN_BENCH_COMMANDS = (  # ADR-040 QĐ 6: still forbidden
+	"execute",
+	"console",
+	"install-app",
+	"uninstall-app",
+	"reinstall",
+	"backup",
+	"restore",
+	"set-config",
+	"drop-site",
+	"new-site",
 )
 APPS_ROOT_FUNCTION = "get_source_root"
 APPS_ROOT_SEGMENT = re.compile(r"(?:^|[/\\])apps(?:[/\\]|$)")
@@ -3359,18 +3530,26 @@ def _commit_flag_forbidden(flag: str) -> bool:
 
 
 def _write_argv_problems(scan: GitScan, subcommand: str, tail: list) -> list:
-	"""What is wrong with the elements after `add`/`commit`/`rm` (ADR-022 Ràng buộc; addendum 2 QĐ-A1)."""
-	if any(spread for _rel, _node, spread in tail):
+	"""What is wrong with the elements after `add`/`commit`/`rm` (ADR-022 Ràng buộc; addendum 2 QĐ-A1; ADR-040:
+	commit ends with "--" and 1..N paths, a spread allowed only after "--"; add and rm with exactly one path)."""
+	texts = [None if spread else scan.text(rel, node) for rel, node, spread in tail]
+	separators = [index for index, value in enumerate(texts) if value == PATHSPEC_SEPARATOR]
+	if any(spread for _rel, _node, spread in tail[: separators[0] if separators else len(tail)]):
 		return ["has an argument the scan cannot read (a spread or a list that is not constant)"]
-	texts = [scan.text(rel, node) for rel, node, _spread in tail]
-	if [index for index, value in enumerate(texts) if value == PATHSPEC_SEPARATOR] != [len(tail) - 2]:
+	paths = tail[separators[0] + 1 :] if separators else []
+	if subcommand == "commit":
+		if len(separators) != 1 or not paths:
+			return [f'must end with "{PATHSPEC_SEPARATOR}" and one or more paths']
+	elif len(separators) != 1 or len(paths) != 1 or paths[0][2]:
 		return [f'must end with "{PATHSPEC_SEPARATOR}" and exactly one path']
 	problems = []
-	path_rel, path, _spread = tail[-1]
-	if scan.prefix(path_rel, path).startswith(PATHSPEC_MAGIC):
-		problems.append(f'path after "{PATHSPEC_SEPARATOR}" starts with "{PATHSPEC_MAGIC}" (pathspec magic)')
+	for path_rel, path, spread in paths:
+		if not spread and scan.prefix(path_rel, path).startswith(PATHSPEC_MAGIC):
+			problems.append(
+				f'path after "{PATHSPEC_SEPARATOR}" starts with "{PATHSPEC_MAGIC}" (pathspec magic)'
+			)
 	options, message_next = [], False
-	for value in texts[:-2]:
+	for value in texts[: separators[0]]:
 		if message_next:
 			message_next = False
 		elif value is None:
@@ -3388,8 +3567,9 @@ def _write_argv_problems(scan: GitScan, subcommand: str, tail: list) -> list:
 
 
 def check_git_commit_add_rm_argv_shape(sources: dict) -> list:
-	"""ADR-022 Ràng buộc, design-addendum-2 QĐ-A1: commit has --only and --no-gpg-sign, add/rm/commit end with
-	"--" and exactly one path that does not start with ":", rm has --cached, commit has no forbidden flag."""
+	"""ADR-022 Ràng buộc, design-addendum-2 QĐ-A1, ADR-040: commit has --only and --no-gpg-sign and ends with "--"
+	and 1..N paths, add/rm end with "--" and exactly one path, no known path starts with ":", rm has --cached,
+	commit has no forbidden flag."""
 	scan = GitScan(sources)
 	violations = []
 	for argv in scan.argvs:
@@ -3613,7 +3793,8 @@ def check_no_git_in_web_and_runner(sources: dict) -> list:
 
 
 def check_bench_allowlist_has_no_git_running_subcommands(sources: dict) -> list:
-	"""ADR-022 QĐ 2: change_guard's bench command table never holds a subcommand that runs git in an app repo."""
+	"""ADR-022 QĐ 2: change_guard's bench command table never holds a subcommand that runs git in an app repo.
+	ADR-040 QĐ 6: the table holds `restart` and none of the commands that stay forbidden."""
 	scan = GitScan(sources)
 	if CHANGE_GUARD_FILE not in scan.trees:
 		return [f"{CHANGE_GUARD_FILE}: file missing"]
@@ -3628,6 +3809,14 @@ def check_bench_allowlist_has_no_git_running_subcommands(sources: dict) -> list:
 		violations.extend(
 			f"{CHANGE_GUARD_FILE}: {BENCH_COMMANDS_NAME} holds {command!r}, which runs git in an app repo (ADR-022 QĐ 2)"
 			for command in sorted(commands & set(GIT_RUNNING_BENCH_SUBCOMMANDS))
+		)
+		if RESTART_BENCH_COMMAND not in commands:
+			violations.append(
+				f"{CHANGE_GUARD_FILE}: {BENCH_COMMANDS_NAME} lacks {RESTART_BENCH_COMMAND!r} (ADR-040 QĐ 6)"
+			)
+		violations.extend(
+			f"{CHANGE_GUARD_FILE}: {BENCH_COMMANDS_NAME} holds {command!r}, which stays forbidden (ADR-040 QĐ 6)"
+			for command in sorted(commands & set(FORBIDDEN_BENCH_COMMANDS))
 		)
 	for node, value in scan.code_texts(CHANGE_GUARD_FILE):
 		if value in GIT_RUNNING_BENCH_SUBCOMMANDS:
@@ -4715,6 +4904,11 @@ class TestArchitecture(unittest.TestCase):
 			)
 		self.assertEqual(check_layer_imports(self.sources), [])
 		self.assertEqual(check_import_boundaries(self.sources), [])
+		self.assertIn("import psutil", self.sources["agent/changes/restart_check.py"])
+
+	def test_restart_check_library_use(self):
+		self.assertIn("agent/changes/restart_check.py", self.sources)
+		self.assertEqual(check_restart_check_library_use(self.sources), [])
 
 	def test_single_enqueue_call_site(self):
 		scanned = only_python(self.sources)
@@ -5155,7 +5349,7 @@ class TestArchitecture(unittest.TestCase):
 		self.assertEqual(check_transitions_imported_only_by_controller_and_changes(self.sources), [])
 
 	def test_change_state_fields_written_only_in_changes(self):
-		self.assertEqual(len(STATE_FIELDS), 15)
+		self.assertEqual(len(STATE_FIELDS), 19)
 		declared = [
 			ast.literal_eval(node.value)
 			for node in parse(TRANSITIONS_FILE, self.sources[TRANSITIONS_FILE]).body
@@ -5187,7 +5381,13 @@ class TestArchitecture(unittest.TestCase):
 		found = " ".join(message for _node, message in _fs_writes(FILE_WRITER_FILE, writer))
 		for expected in ("os.replace", "os.remove", "tempfile.mkstemp", "os.fdopen with mode 'wb'"):
 			self.assertIn(expected, found)
+		# Design §8.2, AC-47: the os.* directory and rename functions are in the scanned table.
+		self.assertLessEqual(set(FS_WRITE_OS_FUNCTIONS), FS_WRITE_FUNCTIONS)
 		self.assertEqual(check_fs_writes_only_in_file_writer(self.sources), [])
+
+	def test_file_writer_rechecks_through_resolver(self):
+		self.assertIn("def _refuse_unless_canonical(", self.sources[FILE_WRITER_FILE])
+		self.assertEqual(check_file_writer_rechecks_through_resolver(self.sources), [])
 
 	def test_changes_never_set_user_or_publish(self):
 		self.assertIn("frappe.session.user", self.sources["agent/changes/apply_job.py"])  # a read is allowed
@@ -5276,6 +5476,9 @@ class TestArchitecture(unittest.TestCase):
 		scan = self._git_scan()
 		commands = scan.strings(CHANGE_GUARD_FILE, scan.assignments[CHANGE_GUARD_FILE][BENCH_COMMANDS_NAME])
 		self.assertIn("migrate", commands)
+		# ADR-040 QĐ 6: restart is listed, the still-forbidden commands are not.
+		self.assertIn(RESTART_BENCH_COMMAND, commands)
+		self.assertEqual(commands & set(FORBIDDEN_BENCH_COMMANDS), set())
 		self.assertEqual(check_bench_allowlist_has_no_git_running_subcommands(self.sources), [])
 
 	def test_apps_root_single_function(self):
@@ -5810,9 +6013,9 @@ import frappe
 from erp_ai.agent.tools import source
 
 
-def _run_git_write(repo_root, rel, limit_s, subcommand_args):
+def _run_git_write(repo_root, rels, limit_s, subcommand_args):
 	return _run_wrapped(
-		["git", *source.git_global_options(read=False), *subcommand_args, "--", rel],
+		["git", *source.git_global_options(read=False), *subcommand_args, "--", *rels],
 		cwd=repo_root,
 		env=source.git_env(identity=True),
 		limit_s=limit_s,
@@ -5820,17 +6023,17 @@ def _run_git_write(repo_root, rel, limit_s, subcommand_args):
 
 
 def git_add_new(repo_root, rel, limit_s):
-	return _run_git_write(repo_root, rel, limit_s, ["add"])
+	return _run_git_write(repo_root, (rel,), limit_s, ["add"])
 
 
-def git_commit_only(repo_root, rel, subject, body, limit_s):
+def git_commit_only(repo_root, rels, subject, body, limit_s):
 	return _run_git_write(
-		repo_root, rel, limit_s, ["commit", "--only", "--no-gpg-sign", "--quiet", "-m", subject, "-m", body]
+		repo_root, sorted(rels), limit_s, ["commit", "--only", "--no-gpg-sign", "--quiet", "-m", subject, "-m", body]
 	)
 
 
 def git_unstage_new(repo_root, rel, limit_s):
-	return _run_git_write(repo_root, rel, limit_s, ["rm", "--cached", "-q"])
+	return _run_git_write(repo_root, (rel,), limit_s, ["rm", "--cached", "-q"])
 
 
 def run_bench(args, limit_s):
@@ -5846,7 +6049,8 @@ def _run_wrapped(command, *, cwd, env, limit_s):
 PATH_INVALID = "đường dẫn nằm ngoài apps/"
 SITE_COMMANDS = ("migrate", "clear-cache")
 BUILD_COMMAND = "build"
-BENCH_COMMANDS = (*SITE_COMMANDS, BUILD_COMMAND, "version")
+RESTART_COMMAND = "restart"
+BENCH_COMMANDS = (*SITE_COMMANDS, BUILD_COMMAND, "version", RESTART_COMMAND)
 
 
 def check_write_path(rel):
@@ -5865,7 +6069,7 @@ from erp_ai.agent.tools import source
 def run_change(name, repo, rel, subject, body):
 	if source.git_head(repo) is None:
 		return None
-	return process_runner.git_commit_only(repo, rel, subject, body, source.GIT_TIMEOUT_S)
+	return process_runner.git_commit_only(repo, (rel,), subject, body, source.GIT_TIMEOUT_S)
 
 
 def _full(root, rel):
@@ -6036,6 +6240,81 @@ class TestScannersCatchViolations(unittest.TestCase):
 			"from erp_ai import alerts\nfrom . import policy\nfrom .prompts import build\n"
 		)
 		self.assertEqual(check_import_boundaries({"agent/runner.py": clean}), [])
+
+	def test_import_boundaries_named_library_only_in_restart_check(self):
+		restart = "agent/changes/restart_check.py"
+		caught = {
+			"psutil elsewhere": ("agent/changes/apply_job.py", "import psutil\n", "psutil"),
+			"redis elsewhere": ("agent/runner.py", "import redis\n", "redis"),
+			"requests in restart_check": (
+				restart,
+				"import psutil\nimport redis\nimport requests\n",
+				"requests",
+			),
+			"rq in restart_check": (restart, "import psutil\nimport redis\nimport rq\n", "rq"),
+		}
+		for label, (rel, source, fragment) in caught.items():
+			with self.subTest(label):
+				self.assertCaught(check_import_boundaries({rel: source}), f"{rel}:", fragment)
+		self.assertEqual(check_import_boundaries({restart: "import psutil\nimport redis\n"}), [])
+		self.assertEqual(
+			check_import_boundaries({restart: "from psutil import Process\nfrom redis import exceptions\n"}),
+			[],
+		)
+		# dead exception: the file no longer imports a listed name (a comment or a string does not count)
+		no_redis = "import psutil\n# import redis\nNAME = 'redis'\n"
+		self.assertCaught(check_import_boundaries({restart: no_redis}), restart, "redis", "dead exception")
+		with patch(f"{__name__}.NAMED_LIBRARY_IMPORTS", {"agent/changes/gone.py": frozenset({"psutil"})}):
+			self.assertCaught(
+				check_import_boundaries({restart: "import os\n"}), "agent/changes/gone.py", "dead exception"
+			)
+		self.assertEqual(NAMED_LIBRARY_IMPORTS, {restart: frozenset({"psutil", "redis"})})
+
+	def test_restart_check_library_use_catches_signals_and_clients(self):
+		restart = "agent/changes/restart_check.py"
+		head = "import os\nimport psutil\nimport redis\n"
+		cases = {
+			# a method call that signals or tunes a process (only the attribute-call condition sees it)
+			"kill": "psutil.Process(1).kill()\n",
+			"terminate": "p = psutil.Process(1)\np.terminate()\n",
+			"send_signal": "psutil.Process(1).send_signal(15)\n",
+			"suspend": "psutil.Process(1).suspend()\n",
+			"resume": "psutil.Process(1).resume()\n",
+			"nice": "psutil.Process(1).nice(5)\n",
+			"ionice": "psutil.Process(1).ionice(0)\n",
+			"rlimit": "psutil.Process(1).rlimit(0)\n",
+			"cpu_affinity": "psutil.Process(1).cpu_affinity([0])\n",
+			# an attribute of psutil/redis outside the allowed set (only the attribute-reference condition)
+			"psutil.process_iter": "psutil.process_iter()\n",
+			"redis.Redis": "redis.Redis()\n",
+			"redis.Redis#alias": "import redis as r\nr.Redis()\n",
+			"redis.exceptions.ConnectionError": "E = redis.exceptions.ConnectionError\n",
+			# an import of a name outside the allowed set (only the import condition)
+			"psutil.process_iter#from": "from psutil import process_iter\n",
+			"redis.Redis#from": "from redis import Redis as R\n",
+			"redis.client": "import redis.client\n",
+			# subprocess, os.kill, os.killpg, signal (only the forbidden-module condition)
+			"os.kill": "os.kill(1, 15)\n",
+			"os.kill#alias": "from os import kill as k\nk(1, 15)\n",
+			"os.killpg": "os.killpg(1, 15)\n",
+			"subprocess": "import subprocess\n",
+			"signal": "import signal\n",
+			"signal.SIGTERM": "import signal as s\nn = s.SIGTERM\n",
+		}
+		for fragment, body in cases.items():
+			with self.subTest(fragment):
+				self.assertCaught(
+					check_restart_check_library_use({restart: head + body}),
+					f"{restart}:",
+					fragment.partition("#")[0],
+				)
+		allowed = (
+			head + "from psutil import Error, Process\nfrom redis.exceptions import RedisError\n"
+			"ERRORS = (redis.exceptions.RedisError, psutil.Error)\n"
+			"t = psutil.Process(os.getppid()).create_time()\nos.getppid()\n"
+		)
+		self.assertEqual(check_restart_check_library_use({restart: allowed}), [])
+		self.assertCaught(check_restart_check_library_use({}), restart, "missing")
 
 	# enqueue -----------------------------------------------------------------------------------
 
@@ -7405,6 +7684,8 @@ class TestScannersCatchViolations(unittest.TestCase):
 			"keyword": "frappe.new_doc(D, applied_branch='main')\n",
 			"qb set attribute": "frappe.qb.update(T).set(T.change_status, v).run()\n",
 			"dict() keyword": "doc.update(dict(change_status=v))\n",
+			"return dict": "def f(n, v):\n\treturn {'name': n, 'restart_status': v}\n",
+			"helper dict to a write": "def f(v):\n\treturn {'change_status': v}\n\nfrappe.db.set_value(D, n, f(v))\n",
 		}
 		for shape, source in shapes.items():
 			with self.subTest(shape=shape):
@@ -7848,6 +8129,109 @@ class TestScannersCatchViolations(unittest.TestCase):
 		}
 		self.assertEqual(check_fs_writes_only_in_file_writer(clean), [])
 
+	def test_file_writer_recheck_rule_catches_bypass(self):
+		canonical = (
+			"def _refuse_unless_canonical(full_path):\n"
+			"\tfull = os.path.abspath(full_path)\n"
+			"\tif source.resolve_safe_path(os.path.relpath(full, source.get_source_root())) != full:\n"
+			"\t\traise ValueError(full)\n"
+		)
+		writer = (
+			"import os\nimport tempfile\nfrom erp_ai.agent.tools import source\n\n{canonical}\n"
+			"def make_parents(full_path, app_dir):\n\t{make}\n\tos.mkdir(full_path)\n\n"
+			"def remove_empty_dirs(dirs):\n\tfor d in dirs:\n\t\t_refuse_unless_canonical(d)\n\t\t{remove}\n\n"
+			"def write_atomic(full_path, content):\n\t_refuse_unless_canonical(full_path)\n"
+			"\tfd, temp = tempfile.mkstemp(dir=os.path.dirname(full_path))\n\tos.replace(temp, full_path)\n\n"
+			"def remove_file(full_path):\n\t_refuse_unless_canonical(full_path)\n\tos.remove(full_path)\n"
+		)
+		recheck = "_refuse_unless_canonical(full_path)"
+		good = {"canonical": canonical, "make": recheck, "remove": "os.rmdir(d)"}
+		self.assertEqual(
+			check_file_writer_rechecks_through_resolver({FILE_WRITER_FILE: writer.format(**good)}), []
+		)
+		direct = (
+			"from erp_ai.agent.tools.source import resolve_safe_path as resolve\n\n"
+			"def _refuse_unless_canonical(full_path):\n\tif resolve(full_path) != full_path:\n"
+			"\t\traise ValueError(full_path)\n"
+		)
+		self.assertEqual(
+			check_file_writer_rechecks_through_resolver(
+				{
+					FILE_WRITER_FILE: writer.format(**{**good, "canonical": direct}).replace(
+						"from erp_ai.agent.tools import source\n", ""
+					)
+				}
+			),
+			[],
+		)
+		cases = {
+			"resolver not called": (
+				{"canonical": "def _refuse_unless_canonical(full_path):\n\tpass\n"},
+				"_refuse_unless_canonical",
+			),
+			"resolver not called, decoy source call": (
+				{"canonical": "def _refuse_unless_canonical(full_path):\n\tsource.get_source_root()\n"},
+				"_refuse_unless_canonical",
+			),
+			"no canonical function": (
+				{"canonical": "def _refuse_other(full_path):\n\tsource.resolve_safe_path(full_path)\n"},
+				"_refuse_unless_canonical",
+			),
+			"realpath in remove_empty_dirs": (
+				{"remove": "os.path.realpath(d)"},
+				"realpath",
+			),
+			"aliased realpath": (
+				{"remove": "rp(d)", "canonical": "from os.path import realpath as rp\n" + canonical},
+				"realpath",
+			),
+			"commonpath": ({"remove": "os.path.commonpath([d, d])"}, "commonpath"),
+			"is_relative_to": ({"remove": "PurePath(d).is_relative_to(d)"}, "is_relative_to"),
+			"readlink": ({"remove": "os.readlink(d)"}, "readlink"),
+			"make_parents skips the recheck": ({"make": "pass"}, "make_parents"),
+		}
+		for name, (overrides, fragment) in cases.items():
+			with self.subTest(case=name):
+				source = writer.format(**{**good, **overrides})
+				self.assertCaught(
+					check_file_writer_rechecks_through_resolver({FILE_WRITER_FILE: source}), fragment
+				)
+		no_remover = (
+			"import os\nfrom erp_ai.agent.tools import source\n\n"
+			+ canonical
+			+ ("\ndef make_parents(full_path, app_dir):\n\t_refuse_unless_canonical(full_path)\n")
+		)
+		self.assertCaught(
+			check_file_writer_rechecks_through_resolver({FILE_WRITER_FILE: no_remover}), "remove_empty_dirs"
+		)
+		remover_skips_recheck = (
+			no_remover + "\ndef remove_empty_dirs(dirs):\n\tfor d in dirs:\n\t\tos.rmdir(d)\n"
+		)
+		self.assertCaught(
+			check_file_writer_rechecks_through_resolver({FILE_WRITER_FILE: remover_skips_recheck}),
+			"remove_empty_dirs",
+		)
+		self.assertCaught(check_file_writer_rechecks_through_resolver({}), FILE_WRITER_FILE)
+		# Condition 4 (on from T6): a file-system function outside FILE_WRITER_RECHECKERS is caught.
+		renamer = writer.format(**good) + "\ndef rename_file(a, b):\n\tos.replace(a, b)\n"
+		self.assertCaught(
+			check_file_writer_rechecks_through_resolver({FILE_WRITER_FILE: renamer}), "rename_file"
+		)
+		# The ADR-011 name rule still catches the old name in this file: the new rule does not loosen it.
+		old_name = {
+			CHANGE_GUARD_FILE: "from erp_ai.agent.tools import source\n\ndef check_write_path(rel):\n"
+			"\tfull = source.resolve_safe_path(rel)\n\tif full is None:\n\t\treturn _refused(PATH_INVALID)\n"
+			"\treturn full\n",
+			FILE_WRITER_FILE: "def _refuse_unsafe_path(full_path):\n\treturn None\n",
+		}
+		self.assertCaught(
+			check_change_guard_uses_resolve_safe_path(old_name), FILE_WRITER_FILE, "second path resolver"
+		)
+		self.assertTrue(FILE_WRITER_RECHECKS_ALL)
+		self.assertEqual(
+			FILE_WRITER_RECHECKERS, ("make_parents", "remove_empty_dirs", "write_atomic", "remove_file")
+		)
+
 	def test_changes_set_user_or_publish_caught(self):
 		cases = {
 			"set_user": "import frappe\nfrappe.set_user('Administrator')\n",
@@ -8110,6 +8494,13 @@ class TestScannersCatchViolations(unittest.TestCase):
 			"add magic path": "\nX = _run_wrapped(['git', *source.git_global_options(read=False), 'add', '--', f':(literal){rel}'], cwd=r, env=e)\n",
 			"add magic constant": "\nX = _run_wrapped(['git', *source.git_global_options(read=False), 'add', '--', ':' + rel], cwd=r, env=e)\n",
 			"rm two separators": "\nX = _run_wrapped(['git', *source.git_global_options(read=False), 'rm', '--cached', '--', '--', rel], cwd=r, env=e)\n",
+			"commit no path": "\nX = _run_wrapped(['git', *source.git_global_options(read=False), 'commit', '--only', '--no-gpg-sign', '--'], cwd=r, env=e)\n",
+			"commit without --": "\nX = _run_wrapped(['git', *source.git_global_options(read=False), 'commit', '--only', '--no-gpg-sign', *rels], cwd=r, env=e)\n",
+			"commit magic among paths": "\nX = _run_git_write(r, ('a.py', f':(literal){rel}', 'b.py'), 1, ['commit', '--only', '--no-gpg-sign'])\n",
+			"add spread path": "\nX = _run_git_write(r, rels, 1, ['add'])\n",
+			"add two paths through the helper": "\nX = _run_git_write(r, (a, b), 1, ['add'])\n",
+			"rm spread path": "\nX = _run_git_write(r, sorted(rels), 1, ['rm', '--cached'])\n",
+			"rm no path through the helper": "\nX = _run_git_write(r, (), 1, ['rm', '--cached'])\n",
 		}
 		for flag in (*COMMIT_FORBIDDEN_FLAGS, "--amen", "-am", "--fixup=HEAD", "--squash=HEAD"):
 			cases[f"commit {flag}"] = write.format(
@@ -8119,6 +8510,19 @@ class TestScannersCatchViolations(unittest.TestCase):
 			with self.subTest(case=case):
 				found = check_git_commit_add_rm_argv_shape(self.git_product(PROCESS_RUNNER_FILE, extra))
 				self.assertCaught(found, PROCESS_RUNNER_FILE, "ADR-022")
+
+	def test_git_write_argv_shape_allows_commit_with_one_to_n_paths(self):
+		cases = {
+			"one constant": "\nX = _run_git_write(r, ('a.py',), 1, ['commit', '--only', '--no-gpg-sign'])\n",
+			"three names": "\nX = _run_git_write(r, (a, b, c), 1, ['commit', '--only', '--no-gpg-sign'])\n",
+			"spread of a sorted tuple": "\nX = _run_git_write(r, sorted(rels), 1, ['commit', '--only', '--no-gpg-sign'])\n",
+			"literal argv with paths": "\nX = _run_wrapped(['git', *source.git_global_options(read=False), 'commit', '--only', '--no-gpg-sign', '--', a, *rest], cwd=r, env=e)\n",
+		}
+		for case, extra in cases.items():
+			with self.subTest(case=case):
+				self.assertEqual(
+					check_git_commit_add_rm_argv_shape(self.git_product(PROCESS_RUNNER_FILE, extra)), []
+				)
 
 	def test_git_write_argv_shape_allows_a_message_that_looks_like_a_flag(self):
 		extra = "\nX = _run_git_write(r, rel, 1, ['commit', '--only', '--no-gpg-sign', '-m', '-a', '-m', '--amend'])\n"
@@ -8263,8 +8667,8 @@ class TestScannersCatchViolations(unittest.TestCase):
 				(
 					"table",
 					(
-						'BENCH_COMMANDS = (*SITE_COMMANDS, BUILD_COMMAND, "version")',
-						f'BENCH_COMMANDS = (*SITE_COMMANDS, "{command}")',
+						'BENCH_COMMANDS = (*SITE_COMMANDS, BUILD_COMMAND, "version", RESTART_COMMAND)',
+						f'BENCH_COMMANDS = (*SITE_COMMANDS, "{command}", RESTART_COMMAND)',
 					),
 				),
 				("shape", ('["--site", site, command]', f'["--site", site, "{command}"]')),
@@ -8277,7 +8681,7 @@ class TestScannersCatchViolations(unittest.TestCase):
 		unreadable = self.git_product(
 			CHANGE_GUARD_FILE,
 			replace=(
-				'BENCH_COMMANDS = (*SITE_COMMANDS, BUILD_COMMAND, "version")',
+				'BENCH_COMMANDS = (*SITE_COMMANDS, BUILD_COMMAND, "version", RESTART_COMMAND)',
 				"BENCH_COMMANDS = tuple(load())",
 			),
 		)
@@ -8876,6 +9280,503 @@ def validate(doc):
 	refuse_agent_write(doc)
 """,
 }
+
+
+# ---------------------------------------------------------------------------------------------------
+# CHG-002 change-block rules (design §8.2; addendum-3 RQ-8: own block, own class, self-checks inside)
+# ---------------------------------------------------------------------------------------------------
+
+SETSID_TEXT = "setsid"
+SETSID_EXECUTABLE_NAME = "SETSID_EXECUTABLE"
+RESTART_ARGV_NAME = "RESTART_ARGV"
+RESTART_STREAMS = ("stdin", "stdout", "stderr")
+RESTART_REQUIRED_KEYWORDS = ("timeout", "cwd")
+PRIVILEGE_COMMANDS = ("sudo", "supervisorctl")
+
+
+def _command_tokens(text: str) -> list:
+	"""Words of a string as a command sees them: `"/usr/bin/sudo -n"` -> ["usr", "bin", "sudo", "-n"];
+	shell quotes and metacharacters split too: `"x||'sudo' $(y)"` -> ["x", "sudo", "y"]."""
+	return [token for token in re.split(r"[^\w.-]+", text) if token]
+
+
+def _code_strings(tree: ast.AST):
+	"""`(node, text)` for every str or bytes constant of the code (bytes decoded), f-string pieces
+	included, docstrings excluded."""
+	docstrings = _docstring_ids(tree)
+	for node in ast.walk(tree):
+		if not isinstance(node, ast.Constant) or id(node) in docstrings:
+			continue
+		if isinstance(node.value, str):
+			yield node, node.value
+		elif isinstance(node.value, bytes):
+			yield node, node.value.decode("utf-8", "replace")
+
+
+def _is_named(node, name: str) -> bool:
+	"""`name` or `<anything>.name`."""
+	return (isinstance(node, ast.Name) and node.id == name) or (
+		isinstance(node, ast.Attribute) and node.attr == name
+	)
+
+
+def _module_value(tree: ast.AST, name: str):
+	for node in tree.body:
+		if isinstance(node, ast.Assign) and any(_is_named(target, name) for target in node.targets):
+			return node.value
+	return None
+
+
+def _is_none(node) -> bool:
+	return isinstance(node, ast.Constant) and node.value is None
+
+
+ARGV_COPIERS = ("list", "tuple")
+
+
+def _is_restart_argv(node) -> bool:
+	"""`RESTART_ARGV`, `list(RESTART_ARGV)`, `tuple(RESTART_ARGV)` or `[*RESTART_ARGV, ...]`."""
+	if _is_named(node, RESTART_ARGV_NAME):
+		return True
+	if isinstance(node, ast.Call) and dotted_name(node.func) in ARGV_COPIERS and node.args:
+		return _is_restart_argv(node.args[0])
+	if isinstance(node, ast.List | ast.Tuple):
+		return any(isinstance(elt, ast.Starred) and _is_restart_argv(elt.value) for elt in node.elts)
+	return False
+
+
+def restart_launch_calls(tree: ast.AST) -> list:
+	"""Calls whose argv (first argument or `args=`) is `RESTART_ARGV` (or `<module>.RESTART_ARGV`),
+	a `list()`/`tuple()` copy of it or a literal unpacking it; the copy calls themselves are not launches."""
+	calls = []
+	for node in ast.walk(tree):
+		if not isinstance(node, ast.Call) or dotted_name(node.func) in ARGV_COPIERS:
+			continue
+		argv = node.args[0] if node.args else next((k.value for k in node.keywords if k.arg == "args"), None)
+		if argv is not None and _is_restart_argv(argv):
+			calls.append(node)
+	return calls
+
+
+def _restart_launch_violations(rel: str, call: ast.Call) -> list:
+	keywords = {keyword.arg: keyword.value for keyword in call.keywords if keyword.arg}
+	found = [
+		violation(rel, call, f"restart launch lacks {stream}=DEVNULL (ADR-040 QĐ 7)")
+		for stream in RESTART_STREAMS
+		if (dotted_name(keywords.get(stream)) or "").rsplit(".", 1)[-1] != "DEVNULL"
+	]
+	found.extend(
+		violation(rel, call, f"restart launch lacks {name}= (ADR-040 QĐ 7)")
+		for name in RESTART_REQUIRED_KEYWORDS
+		if name not in keywords or _is_none(keywords[name])
+	)
+	env = keywords.get("env")
+	if env is None or _is_none(env):
+		found.append(
+			violation(rel, call, "restart launch lacks env= and would inherit os.environ (ADR-040 QĐ 7)")
+		)
+	elif any(
+		dotted_name(node) == "os.environ" or (isinstance(node, ast.Name) and node.id == "environ")
+		for node in ast.walk(env)
+	):
+		found.append(
+			violation(rel, call, "restart launch passes os.environ as env= (ADR-040 QĐ 7: minimal env)")
+		)
+	return found
+
+
+def check_change_block_restart_launch_shape(sources: dict) -> list:
+	"""A-5, ADR-040 QĐ 7: `"setsid"` is written once, as `source.SETSID_EXECUTABLE`; that name is used once,
+	as element 0 of `process_runner.RESTART_ARGV`; every launch of `RESTART_ARGV` has stdin, stdout and
+	stderr DEVNULL, `timeout=`, `cwd=` and an `env=` that is not `os.environ`."""
+	trees = {rel: parse(rel, src) for rel, src in only_python(sources).items()}
+	missing = [rel for rel in (SOURCE_TOOL_FILE, PROCESS_RUNNER_FILE) if rel not in trees]
+	if missing:
+		return [f"{rel}: file missing" for rel in missing]
+	violations = []
+	setsid_value = _module_value(trees[SOURCE_TOOL_FILE], SETSID_EXECUTABLE_NAME)
+	if not (isinstance(setsid_value, ast.Constant) and setsid_value.value == SETSID_TEXT):
+		violations.append(
+			f"{SOURCE_TOOL_FILE}: {SETSID_EXECUTABLE_NAME} is not the constant {SETSID_TEXT!r} (A-5)"
+		)
+	argv = _module_value(trees[PROCESS_RUNNER_FILE], RESTART_ARGV_NAME)
+	first = argv.elts[0] if isinstance(argv, ast.Tuple | ast.List) and argv.elts else None
+	if not _is_named(first, SETSID_EXECUTABLE_NAME):
+		violations.append(
+			f"{PROCESS_RUNNER_FILE}: element 0 of {RESTART_ARGV_NAME} is not {SETSID_EXECUTABLE_NAME} (A-5)"
+		)
+	launches = 0
+	for rel, tree in trees.items():
+		for node, text in _code_strings(tree):
+			if SETSID_TEXT in _command_tokens(text) and node is not setsid_value:
+				text = f"{SETSID_TEXT!r} written outside {SOURCE_TOOL_FILE} {SETSID_EXECUTABLE_NAME} (A-5)"
+				violations.append(violation(rel, node, text))
+		for node in ast.walk(tree):
+			if (
+				_is_named(node, SETSID_EXECUTABLE_NAME)
+				and not isinstance(node.ctx, ast.Store)
+				and node is not first
+			):
+				text = f"{SETSID_EXECUTABLE_NAME} used outside element 0 of {RESTART_ARGV_NAME} (A-5: one argv use)"
+				violations.append(violation(rel, node, text))
+		for call in restart_launch_calls(tree):
+			launches += 1
+			violations.extend(_restart_launch_violations(rel, call))
+	if not launches:
+		violations.append(f"{PROCESS_RUNNER_FILE}: {RESTART_ARGV_NAME} is never launched (ADR-040 QĐ 7)")
+	return violations
+
+
+def check_change_block_no_sudo_or_supervisorctl_argv(sources: dict) -> list:
+	"""Design §8.2, AC-45: no string of the product code holds the command `sudo` or `supervisorctl`."""
+	violations = []
+	for rel, src in only_python(sources).items():
+		for node, text in _code_strings(parse(rel, src)):
+			tokens = _command_tokens(text)
+			violations.extend(
+				violation(
+					rel, node, f"{command!r} in product code (design §8.2, AC-45: no sudo, no supervisorctl)"
+				)
+				for command in PRIVILEGE_COMMANDS
+				if command in tokens
+			)
+	return violations
+
+
+RESTART_LAUNCH_CLEAN = {
+	SOURCE_TOOL_FILE: '''"""Server-fixed executables; `setsid` detaches `bench restart` (A-5)."""
+TIMEOUT_EXECUTABLE = "timeout"
+BENCH_EXECUTABLE = "bench"
+SETSID_EXECUTABLE = "setsid"
+''',
+	PROCESS_RUNNER_FILE: '''"""Starts bench and git; never through sudo or supervisorctl."""
+import os
+import subprocess
+
+import frappe
+
+from erp_ai.agent.tools import source
+
+RESTART_ARGV = (source.SETSID_EXECUTABLE, "-f", source.TIMEOUT_EXECUTABLE, "-s", "KILL", "1500", source.BENCH_EXECUTABLE, "restart")
+
+
+def _minimal_env():
+	return {name: os.environ[name] for name in ("PATH", "HOME") if name in os.environ}
+
+
+def launch_restart():
+	return subprocess.run(
+		RESTART_ARGV,
+		cwd=frappe.utils.get_bench_path(),
+		env=_minimal_env(),
+		stdin=subprocess.DEVNULL,
+		stdout=subprocess.DEVNULL,
+		stderr=subprocess.DEVNULL,
+		timeout=30,
+		start_new_session=True,
+	)
+''',
+	"agent/changes/apply_job.py": '''"""Runs the approved block; asks process_runner to restart."""
+from erp_ai.agent.changes import process_runner
+
+
+def restart_after_apply():
+	return process_runner.launch_restart()
+''',
+}
+RESTART_JOB_FILE = "agent/changes/apply_job.py"
+FS_WRITE_OS_FUNCTIONS = (
+	"os.mkdir",
+	"os.makedirs",
+	"os.rmdir",
+	"os.rename",
+	"os.replace",
+	"os.remove",
+	"os.unlink",
+)
+
+
+class TestChangeBlockRules(unittest.TestCase):
+	"""CHG-002 rules on the product, then each rule's self-checks on samples (addendum-3 RQ-8)."""
+
+	@classmethod
+	def setUpClass(cls):
+		cls.sources = load_product_sources()
+
+	def assertCaught(self, violations, *fragments):
+		self.assertGreater(len(violations), 0, "scanner missed the violation")
+		for fragment in fragments:
+			self.assertTrue(any(fragment in text for text in violations), f"{fragment!r} not in {violations}")
+
+	def restart_product(self, rel: str, extra: str = "", replace: tuple = ()) -> dict:
+		"""RESTART_LAUNCH_CLEAN with `replace=(old, new)` applied to `rel` and `extra` appended."""
+		text = RESTART_LAUNCH_CLEAN.get(rel, "")
+		if replace:
+			self.assertIn(replace[0], text)
+			text = text.replace(*replace)
+		return {**RESTART_LAUNCH_CLEAN, rel: text + extra}
+
+	# T47: restart launch shape, no sudo (AC-57, AC-45; A-5; ADR-040 QĐ 7) ------------------------
+
+	def test_restart_launch_shape(self):
+		for rel in (SOURCE_TOOL_FILE, PROCESS_RUNNER_FILE):
+			self.assertIn(rel, self.sources)
+		# Not a blind scan: the real `"setsid"` and the real launch call are seen.
+		setsid_texts = [
+			(rel, text)
+			for rel, src in only_python(self.sources).items()
+			for _node, text in _code_strings(parse(rel, src))
+			if SETSID_TEXT in _command_tokens(text)
+		]
+		self.assertEqual(setsid_texts, [(SOURCE_TOOL_FILE, SETSID_TEXT)])
+		runner = parse(PROCESS_RUNNER_FILE, self.sources[PROCESS_RUNNER_FILE])
+		self.assertEqual(len(restart_launch_calls(runner)), 1)
+		self.assertEqual(check_change_block_restart_launch_shape(self.sources), [])
+
+	def test_no_sudo_or_supervisorctl_argv(self):
+		self.assertIn(PROCESS_RUNNER_FILE, self.sources)
+		self.assertEqual(check_change_block_no_sudo_or_supervisorctl_argv(self.sources), [])
+
+	def test_restart_rules_pass_on_the_clean_sample(self):
+		self.assertEqual(check_change_block_restart_launch_shape(RESTART_LAUNCH_CLEAN), [])
+		# A docstring may name sudo; a word holding the letters is not the command.
+		clean = self.restart_product(RESTART_JOB_FILE, extra='\nLABEL = "pseudo-restart"\n')
+		self.assertEqual(check_change_block_no_sudo_or_supervisorctl_argv(clean), [])
+
+	def test_restart_launch_shape_caught(self):
+		run = PROCESS_RUNNER_FILE
+		cases = {
+			"stdin not DEVNULL": (run, "", ("\t\tstdin=subprocess.DEVNULL,\n", ""), "stdin=DEVNULL"),
+			"stdout not DEVNULL": (run, "", ("\t\tstdout=subprocess.DEVNULL,\n", ""), "stdout=DEVNULL"),
+			"stderr not DEVNULL": (run, "", ("\t\tstderr=subprocess.DEVNULL,\n", ""), "stderr=DEVNULL"),
+			"stdout PIPE": (
+				run,
+				"",
+				("stdout=subprocess.DEVNULL", "stdout=subprocess.PIPE"),
+				"stdout=DEVNULL",
+			),
+			"no timeout=": (run, "", ("\t\ttimeout=30,\n", ""), "timeout="),
+			"timeout=None": (run, "", ("timeout=30", "timeout=None"), "timeout="),
+			"no cwd=": (run, "", ("\t\tcwd=frappe.utils.get_bench_path(),\n", ""), "cwd="),
+			"no env=": (run, "", ("\t\tenv=_minimal_env(),\n", ""), "lacks env="),
+			"env=None": (run, "", ("env=_minimal_env()", "env=None"), "lacks env="),
+			"env=os.environ": (run, "", ("env=_minimal_env()", "env=os.environ"), "os.environ"),
+			"env copies os.environ": (run, "", ("env=_minimal_env()", "env={**os.environ}"), "os.environ"),
+			"env=dict(os.environ)": (run, "", ("env=_minimal_env()", "env=dict(os.environ)"), "os.environ"),
+			"setsid rewritten in another file": (
+				RESTART_JOB_FILE,
+				'\nARGV = ["setsid", "-f", "bench", "restart"]\n',
+				(),
+				f"{RESTART_JOB_FILE}:8: 'setsid' written outside",
+			),
+			"setsid inside a command string": (
+				RESTART_JOB_FILE,
+				'\nCOMMAND = "setsid -f bench restart"\n',
+				(),
+				"'setsid' written outside",
+			),
+			"setsid glued to ||": (
+				RESTART_JOB_FILE,
+				'\nCOMMAND = "bench restart||setsid -f bench restart"\n',
+				(),
+				"'setsid' written outside",
+			),
+			"setsid glued to ;": (
+				RESTART_JOB_FILE,
+				'\nCOMMAND = "x;setsid -f y"\n',
+				(),
+				"'setsid' written outside",
+			),
+			"setsid inside $(": (
+				RESTART_JOB_FILE,
+				'\nCOMMAND = "$(setsid -f y)"\n',
+				(),
+				"'setsid' written outside",
+			),
+			"setsid quoted": (
+				RESTART_JOB_FILE,
+				"\nCOMMAND = \"'setsid' -f bench restart\"\n",
+				(),
+				"'setsid' written outside",
+			),
+			"setsid bytes argv": (
+				RESTART_JOB_FILE,
+				'\nARGV = [b"setsid", b"-f", b"bench", b"restart"]\n',
+				(),
+				f"{RESTART_JOB_FILE}:8: 'setsid' written outside",
+			),
+			"setsid literal in RESTART_ARGV": (
+				run,
+				"",
+				("(source.SETSID_EXECUTABLE, ", '("setsid", '),
+				f"{run}:9: 'setsid' written outside",
+			),
+			"SETSID_EXECUTABLE not 'setsid'": (
+				SOURCE_TOOL_FILE,
+				"",
+				('SETSID_EXECUTABLE = "setsid"', 'SETSID_EXECUTABLE = "/usr/bin/setsid"'),
+				"is not the constant 'setsid'",
+			),
+			"SETSID_EXECUTABLE missing from source.py": (
+				SOURCE_TOOL_FILE,
+				"",
+				('SETSID_EXECUTABLE = "setsid"\n', ""),
+				"is not the constant 'setsid'",
+			),
+			"SETSID_EXECUTABLE defined outside source.py": (
+				RESTART_JOB_FILE,
+				'\nSETSID_EXECUTABLE = "setsid"\n',
+				(),
+				f"{RESTART_JOB_FILE}:8: 'setsid' written outside",
+			),
+			"SETSID_EXECUTABLE not element 0": (
+				run,
+				"",
+				(
+					'(source.SETSID_EXECUTABLE, "-f", source.TIMEOUT_EXECUTABLE,',
+					'(source.TIMEOUT_EXECUTABLE, "-f", source.SETSID_EXECUTABLE,',
+				),
+				"element 0 of RESTART_ARGV is not SETSID_EXECUTABLE",
+			),
+			"SETSID_EXECUTABLE used twice": (
+				run,
+				'\nOTHER_ARGV = (source.SETSID_EXECUTABLE, "bench")\n',
+				(),
+				"SETSID_EXECUTABLE used outside element 0",
+			),
+			"SETSID_EXECUTABLE used in another file": (
+				RESTART_JOB_FILE,
+				'\nfrom erp_ai.agent.tools.source import SETSID_EXECUTABLE\nARGV = [SETSID_EXECUTABLE, "bench"]\n',
+				(),
+				f"{RESTART_JOB_FILE}:9: SETSID_EXECUTABLE used outside element 0",
+			),
+			"RESTART_ARGV never launched": (
+				run,
+				"",
+				("\t\tRESTART_ARGV,\n", "\t\tlist(source.BENCH_EXECUTABLE),\n"),
+				"RESTART_ARGV is never launched",
+			),
+			"second launch without DEVNULL": (
+				RESTART_JOB_FILE,
+				"\nimport subprocess\nsubprocess.run(process_runner.RESTART_ARGV, timeout=5)\n",
+				(),
+				f"{RESTART_JOB_FILE}:9: restart launch lacks stdin=DEVNULL",
+			),
+			"second launch via args=": (
+				RESTART_JOB_FILE,
+				"\nimport subprocess\nsubprocess.run(args=process_runner.RESTART_ARGV, timeout=5)\n",
+				(),
+				f"{RESTART_JOB_FILE}:9: restart launch lacks stdin=DEVNULL",
+			),
+			"second launch via list()": (
+				RESTART_JOB_FILE,
+				"\nimport subprocess\nsubprocess.run(list(process_runner.RESTART_ARGV), timeout=5)\n",
+				(),
+				f"{RESTART_JOB_FILE}:9: restart launch lacks stdin=DEVNULL",
+			),
+			"second launch via [*]": (
+				RESTART_JOB_FILE,
+				"\nimport subprocess\nsubprocess.run([*process_runner.RESTART_ARGV, '-v'], timeout=5)\n",
+				(),
+				f"{RESTART_JOB_FILE}:9: restart launch lacks stdin=DEVNULL",
+			),
+		}
+		for case, (rel, extra, replace, fragment) in cases.items():
+			with self.subTest(case=case):
+				found = check_change_block_restart_launch_shape(self.restart_product(rel, extra, replace))
+				self.assertCaught(found, fragment)
+		missing = {SOURCE_TOOL_FILE: RESTART_LAUNCH_CLEAN[SOURCE_TOOL_FILE]}
+		self.assertCaught(
+			check_change_block_restart_launch_shape(missing), PROCESS_RUNNER_FILE, "file missing"
+		)
+
+	def test_sudo_or_supervisorctl_caught(self):
+		cases = {
+			"sudo argv": (PROCESS_RUNNER_FILE, '\nARGV = ["sudo", "bench", "restart"]\n', "'sudo'"),
+			"supervisorctl argv": (
+				PROCESS_RUNNER_FILE,
+				'\nARGV = ("supervisorctl", "restart", "all")\n',
+				"'supervisorctl'",
+			),
+			"sudo path in another file": (RESTART_JOB_FILE, '\nSUDO = "/usr/bin/sudo"\n', "'sudo'"),
+			"command string": (
+				RESTART_JOB_FILE,
+				'\nCOMMAND = "sudo supervisorctl restart all"\n',
+				"'supervisorctl'",
+			),
+			"f-string": (RESTART_JOB_FILE, '\nCOMMAND = f"sudo {name}"\n', "'sudo'"),
+			"glued to ||": (RESTART_JOB_FILE, '\nCOMMAND = "bench restart||sudo bench restart"\n', "'sudo'"),
+			"glued to ;": (
+				RESTART_JOB_FILE,
+				'\nCOMMAND = "x;supervisorctl restart all"\n',
+				"'supervisorctl'",
+			),
+			"inside $(": (RESTART_JOB_FILE, '\nCOMMAND = "$(sudo x)"\n', "'sudo'"),
+			"quoted": (RESTART_JOB_FILE, "\nCOMMAND = \"'sudo' bench restart\"\n", "'sudo'"),
+			"bytes argv": (
+				PROCESS_RUNNER_FILE,
+				'\nARGV = [b"sudo", b"supervisorctl", b"restart", b"all"]\n',
+				"'supervisorctl'",
+			),
+		}
+		for case, (rel, extra, fragment) in cases.items():
+			with self.subTest(case=case):
+				found = check_change_block_no_sudo_or_supervisorctl_argv(self.restart_product(rel, extra))
+				self.assertCaught(found, rel, fragment)
+
+	# T48: file system writes only in file_writer; the bench table (AC-47, AC-52; ADR-040 QĐ 6) -------
+
+	def test_fs_write_os_functions_caught_outside_file_writer(self):
+		for function in FS_WRITE_OS_FUNCTIONS:
+			for rel in (RESTART_JOB_FILE, PROCESS_RUNNER_FILE, PROPOSE_TOOL_FILE, CHANGE_GUARD_FILE):
+				with self.subTest(function=function, rel=rel):
+					source = f"import os\n{function}(path)\n"
+					self.assertCaught(check_fs_writes_only_in_file_writer({rel: source}), rel, function)
+			with self.subTest(function=function, rel=FILE_WRITER_FILE):
+				writer = {FILE_WRITER_FILE: f"import os\n{function}(path)\n"}
+				self.assertEqual(check_fs_writes_only_in_file_writer(writer), [])
+
+	def bench_table(self, table: str, site_commands: str = "") -> dict:
+		"""GIT_CLEAN with change_guard's `BENCH_COMMANDS = ...` line (and `SITE_COMMANDS`, if given) replaced."""
+		text, count = re.subn(
+			r"^BENCH_COMMANDS = .*$", f"BENCH_COMMANDS = {table}", GIT_CLEAN[CHANGE_GUARD_FILE], flags=re.M
+		)
+		self.assertEqual(count, 1)
+		if site_commands:
+			text, count = re.subn(
+				r"^SITE_COMMANDS = .*$", f"SITE_COMMANDS = {site_commands}", text, flags=re.M
+			)
+			self.assertEqual(count, 1)
+		return {**GIT_CLEAN, CHANGE_GUARD_FILE: text}
+
+	def test_bench_table_with_restart_is_clean(self):
+		clean = self.bench_table('(*SITE_COMMANDS, BUILD_COMMAND, "version", "restart")')
+		self.assertEqual(check_bench_allowlist_has_no_git_running_subcommands(clean), [])
+
+	def test_bench_table_without_restart_caught(self):
+		found = check_bench_allowlist_has_no_git_running_subcommands(
+			self.bench_table('(*SITE_COMMANDS, BUILD_COMMAND, "version")')
+		)
+		self.assertCaught(found, CHANGE_GUARD_FILE, "lacks 'restart'", "ADR-040 QĐ 6")
+
+	def test_bench_table_with_forbidden_command_caught(self):
+		for command in FORBIDDEN_BENCH_COMMANDS:
+			for case, table, site_commands in (
+				("table", f'(*SITE_COMMANDS, BUILD_COMMAND, "version", "restart", "{command}")', ""),
+				("site list", '(*SITE_COMMANDS, "restart")', f'("migrate", "{command}")'),
+			):
+				with self.subTest(command=command, case=case):
+					found = check_bench_allowlist_has_no_git_running_subcommands(
+						self.bench_table(table, site_commands)
+					)
+					self.assertCaught(found, CHANGE_GUARD_FILE, f"holds {command!r}", "ADR-040 QĐ 6")
+					self.assertFalse(any("lacks 'restart'" in text for text in found), found)
+
+	def test_bench_table_without_restart_and_with_forbidden_command_reports_both(self):
+		found = check_bench_allowlist_has_no_git_running_subcommands(
+			self.bench_table('(*SITE_COMMANDS, "execute")')
+		)
+		self.assertCaught(found, "lacks 'restart'", "holds 'execute'")
 
 
 if __name__ == "__main__":

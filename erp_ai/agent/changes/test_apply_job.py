@@ -3,6 +3,7 @@ import dataclasses
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -286,7 +287,7 @@ class TestApplyCode(ApplyJobTestCase):
 	def test_switch_off_or_app_removed_fails_without_writing(self):
 		for settings, reason in (
 			({"code_change_enabled": 0}, "công tắc đang tắt"),
-			({"code_change_apps": "helpdesk"}, "app không có trong danh sách được sửa"),
+			({"code_change_apps": "helpdesk"}, f"mục 1 ({FILE_PATH}): app không có trong danh sách được sửa"),
 		):
 			set_agent_settings(code_change_enabled=1, code_change_apps=APP)
 			name = self.approved(self.code_proposal())
@@ -578,8 +579,10 @@ class TestApplyCodeSteps(ApplyJobTestCase):
 		state = self.state(name)
 		self.assertEqual(state.apply_commit_sha, self.head())
 		before, after = self.log_row(name, "apply")
-		self.assertEqual(before, {"sha256": _sha(BEFORE), "head": old_head})
-		self.assertEqual(after, {"sha256": _sha(AFTER), "commit": state.apply_commit_sha, "branch": "main"})
+		self.assertEqual(before, {"head": old_head, "files": {REL: _sha(BEFORE)}})
+		self.assertEqual(
+			after, {"commit": state.apply_commit_sha, "branch": "main", "files": {REL: _sha(AFTER)}}
+		)
 
 	def test_git_commit_limit_comes_from_the_job_deadline(self):
 		start = self.head()
@@ -619,9 +622,9 @@ class TestApplyCodeSteps(ApplyJobTestCase):
 		self.assertEqual(writes.call_count, 1)
 		self.assertEqual(self.steps(name), ["approve", "fail"])
 		before, after = self.log_row(name, "fail")
-		self.assertEqual(before, {"sha256": _sha(BEFORE), "head": start})
+		self.assertEqual(before, {"head": start, "files": {REL: _sha(BEFORE)}})
 		self.assertEqual(after["commit"], state.apply_commit_sha)
-		self.assertEqual(after["sha256"], _sha(AFTER))
+		self.assertEqual(after["files"][REL], _sha(AFTER))
 
 	def test_postcheck_unreadable_keeps_commit_and_fails(self):
 		start = self.head()
@@ -948,7 +951,7 @@ class TestCommitFailure(ApplyJobTestCase):
 				with (
 					patch.object(process_runner, "git_commit_only", side_effect=commit_then_report_failure),
 					patch.object(file_writer, "write_atomic", wraps=file_writer.write_atomic) as writes,
-					patch.object(file_writer, "remove_created", wraps=file_writer.remove_created) as removes,
+					patch.object(file_writer, "remove_file", wraps=file_writer.remove_file) as removes,
 				):
 					apply_job.run_change(name, "apply")
 
@@ -965,10 +968,11 @@ class TestCommitFailure(ApplyJobTestCase):
 	def test_postcheck_mismatch_keeps_commit_and_fails(self):
 		real_commit = process_runner.git_commit_only
 
-		def overwrite_then_commit(repo, rel, *args):
+		def overwrite_then_commit(repo, rels, *args):
 			# A person overwrites the target between the job's write and its commit.
+			(rel,) = rels
 			self.sandbox.write_unstaged(APP, rel, "x = 7\n")
-			return real_commit(repo, rel, *args)
+			return real_commit(repo, rels, *args)
 
 		for kind in ("changed file", "new file"):
 			with self.subTest(kind):
@@ -1191,7 +1195,7 @@ class TestCommitFailure(ApplyJobTestCase):
 					patch.object(process_runner, "git_commit_only", return_value=self.failed()),
 					patch.object(source, "git_head", return_value=None),
 					patch.object(file_writer, "write_atomic", wraps=file_writer.write_atomic) as writes,
-					patch.object(file_writer, "remove_created", wraps=file_writer.remove_created) as removes,
+					patch.object(file_writer, "remove_file", wraps=file_writer.remove_file) as removes,
 					patch.object(
 						process_runner, "git_unstage_new", wraps=process_runner.git_unstage_new
 					) as unstage,
@@ -1227,7 +1231,7 @@ class TestCommitFailure(ApplyJobTestCase):
 					patch.object(process_runner, "git_commit_only", side_effect=commit_then_report_failure),
 					patch.object(source, "git_commit_summary", side_effect=RuntimeError("không đọc được")),
 					patch.object(file_writer, "write_atomic", wraps=file_writer.write_atomic) as writes,
-					patch.object(file_writer, "remove_created", wraps=file_writer.remove_created) as removes,
+					patch.object(file_writer, "remove_file", wraps=file_writer.remove_file) as removes,
 				):
 					apply_job.run_change(name, "apply")
 
@@ -1269,7 +1273,7 @@ class TestCommitFailure(ApplyJobTestCase):
 				self.assertEqual(self.sandbox.git(APP, "rev-parse", "HEAD~1").strip(), start)
 				self.assertEqual(state.apply_commit_sha, self.head())
 				before, after = self.log_row(name, "fail")
-				self.assertEqual(before, {"sha256": _sha(BEFORE), "head": start})
+				self.assertEqual(before, {"head": start, "files": {REL: _sha(BEFORE)}})
 				self.assertEqual(after["commit"], state.apply_commit_sha)
 
 	def test_fail_row_with_commit_sha_carries_value_after_commit(self):
@@ -1290,9 +1294,9 @@ class TestCommitFailure(ApplyJobTestCase):
 				self.assertTrue(state.apply_commit_sha)
 				before, after = self.log_row(name, "fail")
 				self.assertEqual(
-					after, {"sha256": _sha(AFTER), "commit": state.apply_commit_sha, "branch": "main"}
+					after, {"commit": state.apply_commit_sha, "branch": "main", "files": {REL: _sha(AFTER)}}
 				)
-				self.assertEqual(before, {"sha256": _sha(BEFORE), "head": start})
+				self.assertEqual(before, {"head": start, "files": {REL: _sha(BEFORE)}})
 
 
 class TestRunChangeSkeleton(ApplyJobTestCase):
@@ -1328,7 +1332,7 @@ class TestRunChangeSkeleton(ApplyJobTestCase):
 			("switch off", None, switch_off, "công tắc đang tắt"),
 			("role lost", None, role_lost, "người duyệt không còn quyền"),
 			("digest edited", None, digest_edited, "nội dung đề xuất đã bị sửa sau khi duyệt"),
-			("app removed", None, app_removed, "app không có trong danh sách được sửa"),
+			("app removed", None, app_removed, f"mục 1 ({FILE_PATH}): app không có trong danh sách được sửa"),
 			("wrong session user", None, other_session_user, "sai người chạy job"),
 			(
 				"commit_message edited",
@@ -1684,7 +1688,7 @@ class TestUndoCode(ApplyJobTestCase):
 		name, apply_commit = self.undo_requested("new file")
 		count = self.commit_count()
 
-		with patch.object(file_writer, "remove_created") as remove:
+		with patch.object(file_writer, "remove_file") as remove:
 			apply_job.run_change(name, "undo")
 
 		remove.assert_called_once_with(self.path(NEW_REL))
@@ -1710,10 +1714,15 @@ class TestUndoCode(ApplyJobTestCase):
 				self.assertEqual(state.change_status, CHANGE_STATUS_UNDONE)
 				before, after = self.log_row(name, "undo")
 				# Design 4.4 step 7 and design-addendum-3 QĐ-B5.
-				self.assertEqual(before, {"sha256": _sha(AFTER), "head": apply_commit})
+				self.assertEqual(before, {"head": apply_commit, "files": {self.target(kind): _sha(AFTER)}})
 				restored = None if kind == "new file" else _sha(BEFORE)
 				self.assertEqual(
-					after, {"sha256": restored, "commit": state.undo_commit_sha, "branch": "main"}
+					after,
+					{
+						"commit": state.undo_commit_sha,
+						"branch": "main",
+						"files": {self.target(kind): restored},
+					},
 				)
 
 	def test_undo_rechecks_fail_without_writing(self):
@@ -1732,8 +1741,8 @@ class TestUndoCode(ApplyJobTestCase):
 			frappe.set_user(ACTOR)
 
 		def guard_refusal():
-			# The guard of design 3.2 with the extension list of today: `.py` is no longer writable.
-			patcher = patch.object(source, "DUOI_CHO_PHEP", {".txt"})
+			# The guard of design 3.2 with a patched secret-name list: `mod.py` is now a secret name.
+			patcher = patch.object(source, "TEN_CAM", re.compile(re.escape(os.path.basename(REL))))
 			patcher.start()
 			return patcher
 
@@ -1742,7 +1751,7 @@ class TestUndoCode(ApplyJobTestCase):
 			("wrong session user", approver_session, "sai người chạy job"),
 			("role lost", role_lost, "người duyệt không còn quyền"),
 			("digest edited", digest_edited, "nội dung đề xuất đã bị sửa sau khi duyệt"),
-			("guard refusal", guard_refusal, "đuôi file không được phép"),
+			("guard refusal", guard_refusal, change_guard.NAME_FORBIDDEN),
 		)
 		for label, change, reason in cases:
 			with self.subTest(label):
@@ -1838,9 +1847,11 @@ class TestUndoCode(ApplyJobTestCase):
 		self.assertEqual(state.undo_commit_sha, self.head())
 		self.assertEqual(self.steps(name), ["approve", "apply", "fail"])
 		before, after = self.log_row(name, "fail")
-		self.assertEqual(before, {"sha256": _sha(AFTER), "head": apply_commit})
+		self.assertEqual(before, {"head": apply_commit, "files": {self.target(kind): _sha(AFTER)}})
 		restored = None if kind == "new file" else _sha(BEFORE)
-		self.assertEqual(after, {"sha256": restored, "commit": state.undo_commit_sha, "branch": branch})
+		self.assertEqual(
+			after, {"commit": state.undo_commit_sha, "branch": branch, "files": {self.target(kind): restored}}
+		)
 
 	def test_undo_postcheck_wrong_commit_keeps_commit_and_fails(self):
 		real_summary = source.git_commit_summary
@@ -1985,7 +1996,7 @@ class TestUndoCode(ApplyJobTestCase):
 		"""Spies on every file write and removal and on the undo commit."""
 		return (
 			patch.object(file_writer, "write_atomic", wraps=file_writer.write_atomic),
-			patch.object(file_writer, "remove_created", wraps=file_writer.remove_created),
+			patch.object(file_writer, "remove_file", wraps=file_writer.remove_file),
 			patch.object(process_runner, "git_commit_only", wraps=process_runner.git_commit_only),
 		)
 
@@ -2310,9 +2321,9 @@ class TestUndoCode(ApplyJobTestCase):
 				self.assertTrue(state.undo_commit_sha)
 				before, after = self.log_row(name, "fail")
 				self.assertEqual(
-					after, {"sha256": _sha(BEFORE), "commit": state.undo_commit_sha, "branch": "main"}
+					after, {"commit": state.undo_commit_sha, "branch": "main", "files": {REL: _sha(BEFORE)}}
 				)
-				self.assertEqual(before, {"sha256": _sha(AFTER), "head": apply_commit})
+				self.assertEqual(before, {"head": apply_commit, "files": {REL: _sha(AFTER)}})
 
 	def test_undo_exception_after_commit_landed_does_not_restore(self):
 		for kind in self.KINDS:
@@ -2338,7 +2349,7 @@ class TestUndoCode(ApplyJobTestCase):
 				self.assertEqual(self.sandbox.git(APP, "rev-parse", "HEAD~1").strip(), apply_commit)
 				self.assertEqual(state.undo_commit_sha, self.head())
 				before, after = self.log_row(name, "fail")
-				self.assertEqual(before, {"sha256": _sha(AFTER), "head": apply_commit})
+				self.assertEqual(before, {"head": apply_commit, "files": {self.target(kind): _sha(AFTER)}})
 				self.assertEqual(after["commit"], state.undo_commit_sha)
 
 	def test_undo_unexpected_exception_after_write_restores_file(self):
@@ -2503,7 +2514,7 @@ class TestApplyCommand(ApplyJobTestCase):
 		denied = ["--site", frappe.local.site, "execute", "frappe.db.truncate"]
 		for refresh_digest, reason in (
 			(False, "nội dung đề xuất đã bị sửa sau khi duyệt"),
-			(True, "lệnh không có trong danh sách cho phép"),
+			(True, "lệnh 1: lệnh không có trong danh sách cho phép"),
 		):
 			with self.subTest(refresh_digest=refresh_digest):
 				name = self.command_proposal(["--site", frappe.local.site, "migrate"])
@@ -2828,21 +2839,37 @@ class TestCommitCrossChecks(RealCoreReposUntouchedMixin, ApplyJobTestCase):
 			}
 		).insert(ignore_permissions=True).add_roles(ROLE_INSTRUCTOR)
 		ticket = str(make_ticket(subject="ERPAI-TEST T48 metadata", raised_by=PROPOSER).name)
+		# A `.py` file needs a restart command the tool does not take yet (design 3.2 step 4): a text file.
+		text_rel = "pkg/mod.txt"
+		self.sandbox.commit_file(APP, text_rel, BEFORE)
 		# The proposal comes from the propose tool, which writes its own ticket comment (design 3.8, 3.9).
 		frappe.set_user(PROPOSER)
 		result = execute_tool(
 			"propose_file_change",
-			{"path": FILE_PATH, "find": ["x = 1"], "replace": ["x = 2"], "reason": "sửa theo yêu cầu"},
+			{
+				"path": f"{APP}/{text_rel}",
+				"find": ["x = 1"],
+				"replace": ["x = 2"],
+				"reason": "sửa theo yêu cầu",
+			},
 			self.tool_context(ticket, "run-t48"),
 		)
 		frappe.set_user(ACTOR)
 		self.assertTrue(result["ok"], result)
 		name = result["proposal"]
 		self.assertEqual(frappe.db.get_value(PROPOSAL_DOCTYPE, name, "upstream_ref"), "origin/main")
+		# The tool makes a block proposal; undoing a block is T39, so the apply and undo run on a file
+		# proposal of the old form for the same file and content, on the same ticket.
+		legacy = self.code_proposal(
+			file_path=f"{APP}/{text_rel}",
+			ticket=ticket,
+			upstream_ref="origin/main",
+			reason="sửa theo yêu cầu",
+		)
 
-		self.apply_then_undo(name, actor=approver)
+		self.apply_then_undo(legacy, actor=approver)
 
-		state = self.state(name)
+		state = self.state(legacy)
 		commits = {"apply": state.apply_commit_sha, "undo": state.undo_commit_sha}
 		self.assertEqual(self.sandbox.git(APP, "rev-parse", "HEAD~1").strip(), commits["apply"])
 		self.assertEqual(self.head(), commits["undo"])
@@ -2859,7 +2886,7 @@ class TestCommitCrossChecks(RealCoreReposUntouchedMixin, ApplyJobTestCase):
 				for leak in (HOME_EMAIL, HOME_NAME, approver, APPROVER_NAME_EMAIL, "x-token-FAKE"):
 					self.assertNotIn(leak, meta)
 
-		doc = frappe.get_doc(PROPOSAL_DOCTYPE, name)
+		doc = frappe.get_doc(PROPOSAL_DOCTYPE, legacy)
 		doc.run_method("onload")
 		notes = json.dumps(doc.get("__onload"), ensure_ascii=False, default=str)
 		self.assertIn("origin/main", notes)
@@ -2875,7 +2902,7 @@ class TestCommitCrossChecks(RealCoreReposUntouchedMixin, ApplyJobTestCase):
 		comments = json.dumps(
 			frappe.get_all(
 				"Comment",
-				filters={"reference_name": ("in", [name, doc.ticket])},
+				filters={"reference_name": ("in", [name, legacy, doc.ticket])},
 				fields=["content", "subject"],
 			)
 			+ frappe.get_all(
@@ -2883,7 +2910,7 @@ class TestCommitCrossChecks(RealCoreReposUntouchedMixin, ApplyJobTestCase):
 			)
 			+ frappe.get_all(
 				LOG_DOCTYPE,
-				filters={"change_proposal": name},
+				filters={"change_proposal": ("in", [name, legacy])},
 				fields=["value_before", "value_after", "error"],
 			),
 			ensure_ascii=False,
@@ -2918,6 +2945,10 @@ class TestNoKeyLeak(ApplyJobTestCase):
 		frappe.set_user("Administrator")
 		ticket = str(make_ticket(subject="ERPAI-TEST T22 leak", raised_by=PROPOSER).name)
 		context = self.tool_context(ticket, "run-t22")
+		# A `.py` file needs a restart command the tool does not take yet (design 3.2 step 4): a text file.
+		text_rel = "pkg/mod.txt"
+		if not os.path.lexists(self.path(text_rel)):
+			self.sandbox.commit_file(APP, text_rel, BEFORE)
 		base = self.head()
 		calls = []
 		real_run = subprocess.run
@@ -2936,7 +2967,7 @@ class TestNoKeyLeak(ApplyJobTestCase):
 				execute_tool(
 					"propose_file_change",
 					{
-						"path": FILE_PATH,
+						"path": f"{APP}/{text_rel}",
 						"find": ["x = 1"],
 						"replace": ["x = 2"],
 						"reason": "sửa theo yêu cầu",
@@ -2949,18 +2980,38 @@ class TestNoKeyLeak(ApplyJobTestCase):
 			]
 			frappe.set_user(ACTOR)
 			self.assertEqual([result["ok"] for result in results], [True, True], results)
-			code, command = (result["proposal"] for result in results)
-			for name in (code, command):
+			code, block_command = (result["proposal"] for result in results)
+			# The tool makes a block proposal; undoing a block is T39, so the apply and undo run on a file
+			# proposal of the old form for the same file, content and branch (read by the tool), on the same ticket.
+			legacy = self.code_proposal(
+				file_path=f"{APP}/{text_rel}",
+				ticket=ticket,
+				reason="sửa theo yêu cầu",
+				target_branch=frappe.db.get_value(PROPOSAL_DOCTYPE, code, "target_branch"),
+			)
+			# The bench tool makes a block too (`command_list`), which apply sends to OP_UNKNOWN: the apply runs
+			# on a command proposal of the old form (`command_args`) for the tool's command, on the same ticket.
+			app, command_list = frappe.db.get_value(PROPOSAL_DOCTYPE, block_command, ["app", "command_list"])
+			command = make_change_proposal(
+				CHANGE_KIND_COMMAND,
+				ticket=ticket,
+				app=app,
+				reason="xem phiên bản",
+				command_args=json.dumps(json.loads(command_list)[0]),
+			).name
+			for name in (legacy, command):
 				transitions.approve(name, ACTOR)
 				apply_job.run_change(name, "apply")
-			transitions.request_undo(code, ACTOR)
-			apply_job.run_change(code, "undo")
+			transitions.request_undo(legacy, ACTOR)
+			apply_job.run_change(legacy, "undo")
 
-		names = [code, command]
+		names = [legacy, command]
 		self.assertEqual(
 			[self.state(name).change_status for name in names], [CHANGE_STATUS_UNDONE, CHANGE_STATUS_APPLIED]
 		)
-		proposals = [frappe.get_doc(PROPOSAL_DOCTYPE, name).as_dict() for name in names]
+		proposals = [
+			frappe.get_doc(PROPOSAL_DOCTYPE, name).as_dict() for name in [*names, code, block_command]
+		]
 		logs = frappe.get_all(LOG_DOCTYPE, filters={"change_proposal": ["in", names]}, fields=["*"])
 		comments = frappe.get_all(
 			"Comment", filters=authority.ticket_comment_filters(ticket), pluck="content"

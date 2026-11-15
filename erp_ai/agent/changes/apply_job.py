@@ -9,17 +9,20 @@ import time
 import unicodedata
 
 import frappe
-from frappe.utils import get_fullname
+from frappe.utils import cstr, get_fullname
 from frappe.utils.file_lock import LockTimeoutError
 from frappe.utils.synchronization import filelock
 
 from erp_ai.agent import change_text, policy
 from erp_ai.agent.authority import NEVER_AUTHORITY
-from erp_ai.agent.changes import file_writer, process_runner, result_comment, transitions
+from erp_ai.agent.changes import block, file_writer, process_runner, result_comment, transitions
 from erp_ai.agent.tools import change_guard, source
 from erp_ai.constants import (
 	BOT_GIT_EMAIL,
-	CHANGE_KIND_CODE,
+	CHANGE_OP_CREATE,
+	CHANGE_OP_DELETE,
+	CHANGE_OP_EDIT,
+	CHANGE_OP_RENAME,
 	CHANGE_STATUS_APPLIED,
 	CHANGE_STATUS_APPLYING,
 	CHANGE_STATUS_APPROVED,
@@ -50,6 +53,7 @@ STORED_HASH_MISMATCH = "nội dung lưu không khớp dấu"
 TARGET_CHANGED = "file đích đã đổi kể từ lúc đề xuất"
 FILE_CHANGED_AFTER_APPLY = "file đã đổi sau khi áp dụng, không hoàn tác"
 WRITE_MISMATCH = "đọc lại sau khi ghi không khớp"
+BLOCK_WRITE_FAILED = "ghi mục {number} ({path}) lỗi, đã trả mọi file về như trước"
 # Design table 3.2 (exact wording).
 GIT_COMMIT_FAILED = "commit git lỗi, đã trả file về như trước"
 GIT_COMMIT_TIMED_OUT_SUFFIX = " (quá thời gian)"
@@ -200,11 +204,27 @@ def _run(proposal, action: str, actor: str, deadline: float) -> str:
 	if action == ACTION_UNDO:
 		_undo_code(proposal, actor, _recheck(proposal, action), deadline)
 		return CHANGE_STATUS_UNDONE
-	allowed_apps = _recheck(proposal, action)
-	if proposal.change_kind == CHANGE_KIND_CODE:
-		_apply_code(proposal, actor, allowed_apps, deadline)
+	check = _recheck_block(proposal, _recheck(proposal, action))
+	old_head = _precheck_block(proposal, check, deadline) if block.is_block(proposal) else None
+	if not block.is_block(proposal):
+		if check.targets:
+			_apply_code(proposal, check.targets[0], actor, deadline)
+		else:
+			_apply_command(proposal, actor, deadline)
+	elif (
+		len(check.targets) == 1
+		and check.targets[0].op.kind == CHANGE_OP_EDIT
+		and not block.commands_of(proposal)
+	):
+		_apply_code(proposal, check.targets[0], actor, deadline)
+	elif block.commands_of(proposal) or not check.targets:
+		# The commands of a block (design 4.2 step 9) come in a later task: until then every item written goes
+		# back again and a block with commands ends as one not yet runnable.
+		if check.targets and not _write_block(proposal, check, old_head)[0]():
+			raise _Stop(CHANGE_STATUS_FAILED, GIT_RESTORE_FAILED)
+		raise _Stop(CHANGE_STATUS_FAILED, change_guard.OP_UNKNOWN)
 	else:
-		_apply_command(proposal, actor, deadline)
+		_commit_block(proposal, check, old_head, actor, deadline)
 	return CHANGE_STATUS_APPLIED
 
 
@@ -213,12 +233,11 @@ def _has_authority(user) -> bool:
 
 
 def _recheck(proposal, action: str) -> tuple[str, ...]:
-	"""Design 4.3 step 4.2, in table order: the first failing row ends the job as `Lỗi` with its reason.
+	"""Design 4.2 step 1 (4.4 step 2 for undo): the first failing row ends the job as `Lỗi` with its reason.
 
-	Undo (design 4.4 step 2) runs only the runner, role, digest and guard rows against `undo_by`: not the
-	switch (G-1), not the stored-hash and commit-message preview rows (apply-only). Its guard allows the
-	proposal's own app, so undo stays possible after the app left the list. Returns the apps the guard
-	allowed.
+	Runner, role, switch (apply only, G-1) and digest. Undo then runs the guard of its target against
+	`undo_by`, allowing the proposal's own app so undo stays possible after the app left the list; apply runs
+	`_recheck_block` on what this returns. Returns the apps the guard allows.
 	"""
 	runner = proposal.decided_by if action == ACTION_APPLY else proposal.undo_by
 	if frappe.session.user != runner:
@@ -234,35 +253,313 @@ def _recheck(proposal, action: str) -> tuple[str, ...]:
 		allowed_apps = (proposal.app,)
 	if transitions.content_digest(proposal) != proposal.approved_digest:
 		raise _Stop(CHANGE_STATUS_FAILED, DIGEST_CHANGED)
-	if proposal.change_kind == CHANGE_KIND_CODE:
+	if action == ACTION_UNDO:
 		# The applied file exists at undo time, so the guard sees it as a changed file then.
-		new_file = action == ACTION_APPLY and bool(proposal.is_new_file)
 		guard = change_guard.check_write_path(
-			proposal.file_path, allowed_apps, new_file=new_file, read_git=False
+			proposal.file_path, allowed_apps, new_file=False, read_git=False
 		)
-		refusal = guard.reason
-	else:
-		args = json.loads(proposal.command_args or "null")
-		refusal = change_guard.check_bench_args(args, settings.allowed_apps, frappe.local.site)
-	if refusal:
-		raise _Stop(CHANGE_STATUS_FAILED, refusal)
-	if action == ACTION_APPLY and proposal.change_kind == CHANGE_KIND_CODE:
-		content_after = (proposal.content_after or "").encode("utf-8")
-		if hashlib.sha256(content_after).hexdigest() != proposal.after_hash:
+		if guard.reason:
+			raise _Stop(CHANGE_STATUS_FAILED, guard.reason)
+	return allowed_apps
+
+
+def _sha256_text(text: str) -> str:
+	return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _apply_message(proposal, operations, approver: str) -> tuple[str, str]:
+	"""(subject, body) of the apply commit, labelled as the proposal controller labels its preview (design 3.7)."""
+	if block.is_block(proposal):
+		return change_text.apply_message(
+			proposal.name,
+			cstr(proposal.ticket),
+			change_text.block_label(operations),
+			approver,
+			operations=operations,
+		)
+	return change_text.apply_message(proposal.name, cstr(proposal.ticket), cstr(proposal.file_path), approver)
+
+
+def _recheck_block(proposal, allowed_apps) -> change_guard.BlockCheck:
+	"""Design 4.2 steps 2 to 3 on the adapter's items and commands, for a block and for the old shape alike.
+
+	`check_block` at apply time (`legacy` for the old shape) → `Lỗi` with its item or command prefix; then
+	every row's stored text against its hashes (`STORED_HASH_MISMATCH`) and the commit preview against
+	`commit_message` (`DIGEST_CHANGED`). Nothing is written before this passes. Returns the `BlockCheck`.
+	"""
+	operations = block.operations_of(proposal)
+	check = change_guard.check_block(
+		operations,
+		block.commands_of(proposal),
+		allowed_apps,
+		frappe.local.site,
+		at_apply=True,
+		diff_text=cstr(proposal.diff),
+		legacy=not block.is_block(proposal),
+	)
+	if check.reason:
+		raise _Stop(CHANGE_STATUS_FAILED, check.reason)
+	for operation in operations:
+		if (operation.after is not None and _sha256_text(operation.after) != operation.after_hash) or (
+			operation.before is not None and _sha256_text(operation.before) != operation.base_hash
+		):
 			raise _Stop(CHANGE_STATUS_FAILED, STORED_HASH_MISMATCH)
+	if operations:
 		# The real message with the approver put back as the placeholder is the stored preview (design 3.9);
 		# `apply_message` only places the approver in its own line, so building it with the placeholder is that.
 		preview = change_text.message_text(
-			*change_text.apply_message(
-				proposal.name,
-				str(proposal.ticket or ""),
-				proposal.file_path,
-				change_text.APPROVER_PLACEHOLDER,
-			)
+			*_apply_message(proposal, operations, change_text.APPROVER_PLACEHOLDER)
 		)
 		if preview != proposal.commit_message:
 			raise _Stop(CHANGE_STATUS_FAILED, DIGEST_CHANGED)
-	return allowed_apps
+	return check
+
+
+def _precheck_block(proposal, check: change_guard.BlockCheck, deadline: float) -> str | None:
+	"""Design 4.2 steps 4 to 5 for a block, before any byte is written; returns `old_head` once every row passed.
+
+	Step 4 compares every row first: an edit, a deletion and a rename source must hash to `base_hash`, a
+	created file and a rename target must not `lexists` → else `Hết hiệu lực` naming the item. Step 5 then
+	reads git for every path: a refusal is `Lỗi` naming the item, a branch other than `target_branch` is
+	`Hết hiệu lực`. Every path must show the same HEAD, else `Lỗi` naming the item with `GIT_ERROR`
+	(design addendum-8 A8-1, A8-2); that HEAD is the `old_head` returned, `None` for a block without
+	items. The one-file path keeps the HEAD it reads itself.
+	"""
+	paths = []
+	for number, target in enumerate(check.targets, start=1):
+		operation = target.op
+		prefix = change_guard.OP_PREFIX.format(number=number, path=operation.path)
+		if operation.kind == CHANGE_OP_CREATE:
+			existing, new = None, (target.full_path,)
+		elif operation.kind == CHANGE_OP_RENAME:
+			existing, new = target.full_path, (target.full_new_path,)
+		else:
+			existing, new = target.full_path, ()
+		if (existing is not None and file_writer.sha256_of(existing) != operation.base_hash) or any(
+			os.path.lexists(full) for full in new
+		):
+			raise _Stop(CHANGE_STATUS_STALE, prefix + TARGET_CHANGED)
+		paths.extend((prefix, full, full in new) for full in (existing, *new) if full is not None)
+	old_head = None
+	for prefix, full, new_file in paths:
+		state = source.read_git_state(full, new_file=new_file, limit_s=_git_limit(deadline))
+		if state.refusal:
+			raise _Stop(CHANGE_STATUS_FAILED, prefix + state.refusal)
+		if state.branch != proposal.target_branch:
+			raise _Stop(CHANGE_STATUS_STALE, GIT_BRANCH_CHANGED)
+		if old_head is not None and state.head != old_head:
+			raise _Stop(CHANGE_STATUS_FAILED, prefix + source.GIT_ERROR)
+		old_head = state.head
+	return old_head
+
+
+class _ItemRefused(Exception):
+	"""A read-back hash other than `after_hash`, or a `git add` that did not go through (design 4.2 step 6)."""
+
+
+def _write_block(proposal, check: change_guard.BlockCheck, old_head: str):
+	"""Design 4.2 step 6: every item by `idx` through `file_writer`, then `git_add_new` one path at a time for
+	each created file and rename target, with the give-back log kept in memory.
+
+	An error at item k, a wrong read-back hash or a failed `git add` gives everything back in reverse and
+	ends `Lỗi` with `BLOCK_WRITE_FAILED` naming item k, or `GIT_RESTORE_FAILED` when the give-back did not
+	hold. Returns the give-back (True when it held) for a later step that has to undo the writes, and the
+	full paths of the folders `make_parents` made, in the order they were made.
+	"""
+	app_dir = os.path.join(source.get_source_root(), check.app)
+	steps, staged, created = [], [], []
+
+	def give_back(expected_head: str = old_head) -> bool:
+		return _give_back_block(proposal, app_dir, expected_head, steps, staged, created)
+
+	number = 0
+	try:
+		for target in check.targets:
+			number += 1
+			_write_item(target, app_dir, steps, created)
+		number = 0
+		for target in check.targets:
+			number += 1
+			for full in _staged_paths(target):
+				rel = os.path.relpath(full, app_dir)
+				if _failed(process_runner.git_add_new(app_dir, rel, source.GIT_TIMEOUT_S)):
+					raise _ItemRefused(rel)
+				staged.append(rel)
+	except Exception as exc:
+		frappe.log_error(
+			TITLE_CHANGE_FAILED,
+			f"proposal={proposal.name} action=apply item={number} error={type(exc).__name__}",
+		)
+		reason = BLOCK_WRITE_FAILED.format(number=number, path=check.targets[number - 1].op.path)
+		raise _Stop(CHANGE_STATUS_FAILED, reason if give_back() else GIT_RESTORE_FAILED) from exc
+	return give_back, created
+
+
+def _commit_ends(target) -> tuple[tuple[str, bytes | None], ...]:
+	"""`(full path, bytes in the commit)` of each path an item puts in the block commit (design 4.2 step 7):
+	the `after` bytes for an edit, a created file and a rename target, `None` for a deletion and a rename
+	source."""
+	operation = target.op
+	if operation.kind == CHANGE_OP_DELETE:
+		return ((target.full_path, None),)
+	after = operation.after.encode("utf-8")
+	if operation.kind == CHANGE_OP_RENAME:
+		return ((target.full_path, None), (target.full_new_path, after))
+	return ((target.full_path, after),)
+
+
+def _commit_block(
+	proposal, check: change_guard.BlockCheck, old_head: str, actor: str, deadline: float
+) -> None:
+	"""Design 4.2 steps 6 to 8 then 10 for a block without commands: write every item, one `commit --only`
+	of every path (both ends of a rename), the post-check, the git fields recorded and committed, done.
+
+	A commit that fails with HEAD unchanged gives every item back as step 6; once the bot commit exists
+	nothing is given back (design-addendum-3 QĐ-B2). Log rows carry `{"head", "files"}` before and
+	`{"commit", "branch", "files"}` after (design 6 "Quan sát").
+	"""
+	give_back, created = _write_block(proposal, check, old_head)
+	source_root = source.get_source_root()
+	repo = os.path.join(source_root, check.app)
+	ends = {}
+	before_files = {}
+	for target in check.targets:
+		if target.op.kind != CHANGE_OP_CREATE:
+			before_files[os.path.relpath(target.full_path, repo)] = target.op.base_hash
+		for full, blob in _commit_ends(target):
+			ends[os.path.relpath(full, repo)] = (full, blob)
+
+	def record(commit, branch):
+		after_paths = {rel: full for rel, (full, _blob) in ends.items()}
+		return _commit_record("apply_commit_sha", before_files, after_paths, old_head, commit, branch)
+
+	def given_back(reason: str, expected_head: str):
+		held = give_back(expected_head)
+		raise _Stop(
+			CHANGE_STATUS_FAILED, reason if held else GIT_RESTORE_FAILED, before=record(None, None)["before"]
+		)
+
+	committed = False
+	summary = None
+	try:
+		subject, body = _apply_message(proposal, block.operations_of(proposal), _person(actor))
+		result = process_runner.git_commit_only(
+			repo, tuple(sorted(ends)), subject, body, _git_limit(deadline)
+		)
+		if _failed(result):
+			summary = _commit_landed(
+				repo, old_head, lambda head: given_back(_commit_failed_reason(result), head)
+			)
+		committed = True
+		blobs = {rel: blob for rel, (_full, blob) in ends.items()}
+		summary = _postcheck(repo, old_head, proposal.target_branch, blobs, summary, record)
+		values = record(summary.commit, summary.branch)
+		# The upstream is read again after the commit, so the count already holds the bot commit.
+		state = source.read_git_state(
+			check.targets[0].full_path, new_file=False, limit_s=_git_limit(deadline)
+		)
+		if state.refusal:
+			raise _Stop(CHANGE_STATUS_FAILED, state.refusal, **values)
+		transitions.record_commit(
+			proposal.name,
+			CHANGE_STATUS_APPLYING,
+			fields={
+				**values["fields"],
+				"applied_branch": summary.branch,
+				"applied_ahead_count": state.ahead_count,
+				"created_dirs": [os.path.relpath(folder, source_root) for folder in created],
+			},
+		)
+		frappe.db.commit()
+		transitions.finish(
+			proposal.name,
+			CHANGE_STATUS_APPLYING,
+			CHANGE_STATUS_APPLIED,
+			step="apply",
+			actor=actor,
+			before=values["before"],
+			after=values["after"],
+		)
+	except _Stop:
+		raise
+	except Exception as exc:
+		if committed:
+			_fail_after_commit(proposal, ACTION_APPLY, repo, old_head, summary, exc, record)
+		_give_back_after_crash(proposal, repo, old_head, give_back)
+		raise
+
+
+def _staged_paths(target) -> tuple[str, ...]:
+	"""The paths of an item that `git add` stages before the commit: a created file, a rename target."""
+	if target.op.kind == CHANGE_OP_CREATE:
+		return (target.full_path,)
+	if target.op.kind == CHANGE_OP_RENAME:
+		return (target.full_new_path,)
+	return ()
+
+
+def _write_item(target, app_dir: str, steps: list, created: list) -> None:
+	"""One row of the design 4.2 step 6 table. Each step done is logged in `steps` as its give-back
+	`(full, before, new_file, base_hash)`: `before` written back, or the file removed when `before` is None;
+	the folders `make_parents` made go to `created`."""
+	operation = target.op
+	if operation.kind == CHANGE_OP_DELETE:
+		file_writer.remove_file(target.full_path)
+		steps.append((target.full_path, operation.before, True, operation.base_hash))
+		return
+	if operation.kind == CHANGE_OP_EDIT:
+		written = file_writer.write_atomic(target.full_path, operation.after, new_file=False)
+		steps.append((target.full_path, operation.before, False, operation.base_hash))
+	else:
+		full = target.full_path if operation.kind == CHANGE_OP_CREATE else target.full_new_path
+		created.extend(file_writer.make_parents(full, app_dir))
+		written = file_writer.write_atomic(full, operation.after, new_file=True)
+		steps.append((full, None, True, None))
+	if written != operation.after_hash:
+		raise _ItemRefused(WRITE_MISMATCH)
+	if operation.kind == CHANGE_OP_RENAME:
+		file_writer.remove_file(target.full_path)
+		steps.append((target.full_path, operation.before, True, operation.base_hash))
+
+
+def _give_back_block(proposal, app_dir: str, expected_head: str, steps, staged, created) -> bool:
+	"""Design 4.2 step 6 give-back in reverse: every file back (`before` with its read-back hash, or the file
+	created removed), every staged path unstaged, the folders made removed. True when every step held, every
+	file written back is clean in git and HEAD is `expected_head` (`old_head`, or a person's commit that
+	`_commit_landed` found); a step that fails does not stop the rest.
+	"""
+	held = True
+	for full, before, new_file, base_hash in reversed(steps):
+		try:
+			if before is None:
+				file_writer.remove_file(full)
+				held = not os.path.lexists(full) and held
+			else:
+				held = file_writer.write_atomic(full, before, new_file=new_file) == base_hash and held
+		except Exception as exc:
+			held = _give_back_broke(proposal, exc)
+	for rel in reversed(staged):
+		try:
+			held = not _failed(process_runner.git_unstage_new(app_dir, rel, source.GIT_TIMEOUT_S)) and held
+		except Exception as exc:
+			held = _give_back_broke(proposal, exc)
+	try:
+		held = set(file_writer.remove_empty_dirs(list(created))) == set(created) and held
+		held = source.git_head(app_dir) == expected_head and held
+		for full, before, _new_file, _base_hash in steps:
+			if before is not None:
+				held = source.read_git_state(full, new_file=False).refusal is None and held
+	except Exception as exc:
+		held = _give_back_broke(proposal, exc)
+	return held
+
+
+def _give_back_broke(proposal, exc: Exception) -> bool:
+	"""A give-back step that broke leaves the repo state unknown, which is what `GIT_RESTORE_FAILED` says."""
+	frappe.log_error(
+		TITLE_CHANGE_FAILED, f"proposal={proposal.name} action=give_back error={type(exc).__name__}"
+	)
+	return False
 
 
 def _failed(result) -> bool:
@@ -304,61 +601,68 @@ def _person(user: str) -> str:
 
 
 def _commit_record(
-	field: str, full_path: str, sha_before: str, old_head: str, commit: str | None, branch: str | None
+	field: str, before_files: dict, after_paths: dict, old_head: str, commit: str | None, branch: str | None
 ) -> dict:
-	"""`fields`, `before` and `after` of a `finish` after the commit ran (design-addendum-3 QĐ-B5).
+	"""`fields`, `before` and `after` of a `finish` after the commit ran (design 6 "Quan sát", ADR-040 QĐ 2).
 
-	`field` is `apply_commit_sha` or `undo_commit_sha`; without a commit sha, neither `fields` nor `after`
-	carries one.
+	`field` is `apply_commit_sha` or `undo_commit_sha`; `before_files` maps a path in the repo to its sha256
+	before the job, `after_paths` maps a path in the repo to its full path, hashed now (`None`: not on disk).
+	Without a commit sha, neither `fields` nor `after` carries one.
 	"""
-	after = {"sha256": file_writer.sha256_of(full_path)}
+	after = {}
 	fields = {}
 	if commit:
 		fields[field] = commit
 		after["commit"] = commit
 	after["branch"] = branch
-	return {"fields": fields, "before": {"sha256": sha_before, "head": old_head}, "after": after}
+	after["files"] = {rel: file_writer.sha256_of(full) for rel, full in after_paths.items()}
+	return {"fields": fields, "before": {"head": old_head, "files": before_files}, "after": after}
 
 
-def _apply_record(proposal, full_path: str, old_head: str, commit: str | None, branch: str | None) -> dict:
-	return _commit_record("apply_commit_sha", full_path, proposal.base_hash, old_head, commit, branch)
-
-
-def _undo_record(proposal, full_path: str, old_head: str, commit: str | None, branch: str | None) -> dict:
-	return _commit_record("undo_commit_sha", full_path, proposal.after_hash, old_head, commit, branch)
-
-
-def _apply_postcheck(proposal, state, full_path: str, summary=None):
-	"""Design 4.3 step 3.5 (ADR-022 decision 1 step 5); returns the `CommitSummary` of the bot commit."""
-	content_after = (proposal.content_after or "").encode("utf-8")
-	return _postcheck(
-		state,
-		proposal.target_branch,
-		content_after,
-		summary,
-		lambda commit, branch: _apply_record(proposal, full_path, state.head, commit, branch),
+def _apply_record(operation, state, full_path: str, commit: str | None, branch: str | None) -> dict:
+	rel = state.rel_in_repo
+	return _commit_record(
+		"apply_commit_sha", {rel: operation.base_hash}, {rel: full_path}, state.head, commit, branch
 	)
 
 
-def _postcheck(state, branch: str, blob: bytes | None, summary, record):
-	"""The post-check of design 4.3 step 3.5 and 4.4 step 6; returns the `CommitSummary` of the bot commit.
+def _undo_record(proposal, state, full_path: str, commit: str | None, branch: str | None) -> dict:
+	rel = state.rel_in_repo
+	return _commit_record(
+		"undo_commit_sha", {rel: proposal.after_hash}, {rel: full_path}, state.head, commit, branch
+	)
 
-	The commit must have one parent with `state.head` as its ancestor, only the target path, `branch`, and
-	`blob` as the target's bytes (`None`: not in the tree). The bot commit exists (the commit command exited
-	0, or HEAD moved to a bot commit whose `summary` is given), so the file is never given back and history
+
+def _apply_postcheck(proposal, operation, state, full_path: str, summary=None):
+	"""Design 4.3 step 3.5 (ADR-022 decision 1 step 5); returns the `CommitSummary` of the bot commit."""
+	return _postcheck(
+		state.repo_root,
+		state.head,
+		proposal.target_branch,
+		{state.rel_in_repo: operation.after.encode("utf-8")},
+		summary,
+		lambda commit, branch: _apply_record(operation, state, full_path, commit, branch),
+	)
+
+
+def _postcheck(repo: str, old_head: str, branch: str, blobs: dict, summary, record):
+	"""The post-check of design 4.2 step 7 (4.4 step 6 for undo); returns the `CommitSummary` of the bot commit.
+
+	The commit must have one parent with `old_head` as its ancestor, exactly the paths of `blobs`, `branch`,
+	and for each path its `blobs` bytes (`None`: not in the tree). The bot commit exists (the commit command
+	exited 0, or HEAD moved to a bot commit whose `summary` is given), so no file is given back and history
 	is never rewritten (design-addendum-3 QĐ-B2 item 1): a check that fails or cannot be read ends the job as
 	`Lỗi` `GIT_COMMIT_MISMATCH` with `record(commit, branch)`, keeping the commit sha when it is known.
 	"""
-	repo, rel, old_head = state.repo_root, state.rel_in_repo, state.head
 	try:
 		if summary is None:
 			summary = source.git_commit_summary(repo)
 		matches = (
 			len(summary.parents) == 1
 			and source.git_is_ancestor(repo, old_head, summary.parents[0]) is True
-			and summary.paths == (rel,)
+			and set(summary.paths) == set(blobs)
 			and summary.branch == branch
-			and source.git_blob(repo, summary.commit, rel) == blob
+			and all(source.git_blob(repo, summary.commit, rel) == blob for rel, blob in blobs.items())
 		)
 	except RuntimeError:
 		# git could not be read: the check is not passed (QĐ-B2 item 1), the reason below says so.
@@ -373,18 +677,17 @@ def _postcheck(state, branch: str, blob: bytes | None, summary, record):
 	raise _Stop(CHANGE_STATUS_FAILED, GIT_COMMIT_MISMATCH, **record(commit, branch))
 
 
-def _apply_code(proposal, actor: str, allowed_apps, deadline: float) -> None:
-	"""Design 4.3 step 4.3: file hash, git pre-read, write, commit, post-check, done."""
-	new_file = bool(proposal.is_new_file)
-	guard = change_guard.check_write_path(proposal.file_path, allowed_apps, new_file=new_file, read_git=False)
-	if guard.reason:
-		raise _Stop(CHANGE_STATUS_FAILED, guard.reason)
-	full = guard.full_path
+def _apply_code(proposal, target, actor: str, deadline: float) -> None:
+	"""Design 4.3 step 4.3 for the one file item `target` that passed `_recheck_block`: file hash, git
+	pre-read, write, commit, post-check, done."""
+	operation = target.op
+	new_file = operation.kind == CHANGE_OP_CREATE
+	full = target.full_path
 	# D-19: the file hash first, git after; a stale target never reaches git.
 	on_disk = file_writer.sha256_of(full)
 	if new_file and (on_disk is not None or os.path.lexists(full)):
 		raise _Stop(CHANGE_STATUS_STALE, TARGET_CHANGED)
-	if not new_file and on_disk != proposal.base_hash:
+	if not new_file and on_disk != operation.base_hash:
 		raise _Stop(CHANGE_STATUS_STALE, TARGET_CHANGED)
 	# Git pre-check (design 4.3 step 4.3 item 2): a git refusal is `Lỗi` (AC-18, ADR-022 decision 7); only
 	# a changed branch is `Hết hiệu lực` (spec D-1, ADR-022 decision 6). A held `index.lock` is refused at
@@ -402,9 +705,9 @@ def _apply_code(proposal, actor: str, allowed_apps, deadline: float) -> None:
 		"""Design 4.3 step 3.6: `content_before` back (read-back hash = `base_hash`), or the new file removed
 		and unstaged when `git add` went through."""
 		if new_file:
-			file_writer.remove_created(full)
+			file_writer.remove_file(full)
 			return not added or not _failed(process_runner.git_unstage_new(repo, rel, source.GIT_TIMEOUT_S))
-		return file_writer.write_atomic(full, proposal.content_before, new_file=False) == proposal.base_hash
+		return file_writer.write_atomic(full, operation.before, new_file=False) == operation.base_hash
 
 	def give_back(reason: str, expected_head: str):
 		"""Design 4.3 step 3.6, then `Lỗi` with `reason`, or `GIT_RESTORE_FAILED` when the repo is not as before."""
@@ -412,26 +715,24 @@ def _apply_code(proposal, actor: str, allowed_apps, deadline: float) -> None:
 			reason = GIT_RESTORE_FAILED
 		raise _Stop(CHANGE_STATUS_FAILED, reason)
 
-	written = file_writer.write_atomic(full, proposal.content_after, new_file=new_file)
+	written = file_writer.write_atomic(full, operation.after, new_file=new_file)
 	try:
-		if written != proposal.after_hash:
+		if written != operation.after_hash:
 			give_back(WRITE_MISMATCH, old_head)
 		if new_file:
 			result = process_runner.git_add_new(repo, rel, source.GIT_TIMEOUT_S)
 			if _failed(result):
 				give_back(_commit_failed_reason(result), old_head)
 			added = True
-		subject, body = change_text.apply_message(
-			proposal.name, str(proposal.ticket or ""), proposal.file_path, _person(actor)
-		)
-		result = process_runner.git_commit_only(repo, rel, subject, body, _git_limit(deadline))
+		subject, body = _apply_message(proposal, (operation,), _person(actor))
+		result = process_runner.git_commit_only(repo, (rel,), subject, body, _git_limit(deadline))
 		if _failed(result):
 			summary = _commit_landed(
 				repo, old_head, lambda head: give_back(_commit_failed_reason(result), head)
 			)
 		committed = True
-		summary = _apply_postcheck(proposal, state, full, summary)
-		record = _apply_record(proposal, full, old_head, summary.commit, summary.branch)
+		summary = _apply_postcheck(proposal, operation, state, full, summary)
+		record = _apply_record(operation, state, full, summary.commit, summary.branch)
 		transitions.finish(
 			proposal.name,
 			CHANGE_STATUS_APPLYING,
@@ -459,7 +760,7 @@ def _apply_code(proposal, actor: str, allowed_apps, deadline: float) -> None:
 				old_head,
 				summary,
 				exc,
-				lambda commit, branch: _apply_record(proposal, full, old_head, commit, branch),
+				lambda commit, branch: _apply_record(operation, state, full, commit, branch),
 			)
 		_give_back_after_crash(
 			proposal,
@@ -583,7 +884,7 @@ def _undo_code(proposal, actor: str, allowed_apps, deadline: float) -> None:
 		raise _Stop(CHANGE_STATUS_FAILED, reason)
 
 	if new_file:
-		file_writer.remove_created(full)
+		file_writer.remove_file(full)
 		if os.path.lexists(full):
 			raise _Stop(CHANGE_STATUS_FAILED, WRITE_MISMATCH)
 	elif file_writer.write_atomic(full, proposal.content_before, new_file=False) != proposal.base_hash:
@@ -596,7 +897,7 @@ def _undo_code(proposal, actor: str, allowed_apps, deadline: float) -> None:
 			str(proposal.apply_commit_sha or ""),
 			_person(actor),
 		)
-		result = process_runner.git_commit_only(repo, rel, subject, body, _git_limit(deadline))
+		result = process_runner.git_commit_only(repo, (rel,), subject, body, _git_limit(deadline))
 		if _failed(result):
 			# Design 4.4 step 6 follows 4.3 step 3.4 (D-17, design-addendum-3 QĐ-B2 items 2 and 3).
 			summary = _commit_landed(
@@ -606,13 +907,14 @@ def _undo_code(proposal, actor: str, allowed_apps, deadline: float) -> None:
 		# D-18: the undo commit of a new file has the path deleted from the tree.
 		restored = None if new_file else (proposal.content_before or "").encode("utf-8")
 		summary = _postcheck(
-			state,
+			repo,
+			old_head,
 			state.branch,
-			restored,
+			{rel: restored},
 			summary,
-			lambda commit, branch: _undo_record(proposal, full, old_head, commit, branch),
+			lambda commit, branch: _undo_record(proposal, state, full, commit, branch),
 		)
-		record = _undo_record(proposal, full, old_head, summary.commit, summary.branch)
+		record = _undo_record(proposal, state, full, summary.commit, summary.branch)
 		transitions.finish(
 			proposal.name,
 			CHANGE_STATUS_UNDOING,
@@ -635,7 +937,7 @@ def _undo_code(proposal, actor: str, allowed_apps, deadline: float) -> None:
 				old_head,
 				summary,
 				exc,
-				lambda commit, branch: _undo_record(proposal, full, old_head, commit, branch),
+				lambda commit, branch: _undo_record(proposal, state, full, commit, branch),
 			)
 		_give_back_after_crash(
 			proposal,

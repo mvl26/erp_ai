@@ -5,7 +5,7 @@ from unittest.mock import patch
 
 from frappe.tests.utils import FrappeTestCase
 
-from erp_ai.agent.changes import process_runner
+from erp_ai.agent.changes import file_writer, process_runner
 from erp_ai.agent.changes.process_runner import (
 	ENV_ALLOWLIST,
 	OUTPUT_MAX_LINES,
@@ -13,6 +13,8 @@ from erp_ai.agent.changes.process_runner import (
 	run_bench,
 )
 from erp_ai.agent.tools import source
+from erp_ai.constants import RESTART_LAUNCH_TIMEOUT_S, RESTART_TIMEOUT_S
+from erp_ai.test_utils import GitSandbox
 
 RUN_PATH = "erp_ai.agent.changes.process_runner.subprocess.run"
 CLOCK_PATH = "erp_ai.agent.changes.process_runner.time.monotonic"
@@ -253,7 +255,7 @@ class TestGitWrites(FrappeTestCase):
 	def _call(self, function, repo=None, rel=REL, limit_s=20, subject=SUBJECT, body=BODY):
 		repo = self.repo if repo is None else repo
 		if function == "git_commit_only":
-			return process_runner.git_commit_only(repo, rel, subject, body, limit_s)
+			return process_runner.git_commit_only(repo, (rel,), subject, body, limit_s)
 		return getattr(process_runner, function)(repo, rel, limit_s)
 
 	def _run(self, function, result, limit_s=20, elapsed_s=1.0):
@@ -490,3 +492,203 @@ class TestGitWrites(FrappeTestCase):
 						self._call(function, rel=rel)
 					self.assertEqual(run.call_args.args[0][-1], rel)
 					self.assertEqual(run.call_args.args[0][-2], "--")
+
+	def test_commit_paths_sorted_after_separator(self):
+		rels = ("b.py", "a/z.py", ".github/x.yml", "a/b.py")
+		with (
+			patch(RUN_PATH, return_value=completed(0)) as run,
+			patch(CLOCK_PATH, side_effect=[1000.0, 1001.0]),
+		):
+			process_runner.git_commit_only(self.repo, rels, SUBJECT, BODY, 20)
+		argv = run.call_args.args[0]
+		self.assertEqual(argv[-5:], ["--", ".github/x.yml", "a/b.py", "a/z.py", "b.py"])
+		self.assertEqual(argv.count("--"), 1)
+		self.assertEqual(argv[-6], BODY)
+
+	def test_empty_or_duplicate_rels_refused(self):
+		cases = [
+			("rels empty", ()),
+			("rels duplicate", ("a.py", "b.py", "a.py")),
+			("rels a string", "a.py"),
+			("rels a list", ["a.py"]),
+			("rels None", None),
+		]
+		for label, bad in (
+			("empty", ""),
+			("not a string", 1),
+			("NUL", "a\0b.py"),
+			("starts with -", "-a"),
+			("absolute", "/etc/passwd"),
+			("starts with :", ":x.py"),
+			("not normalised", "a//b.py"),
+			("is ..", ".."),
+			("parent", "../x.py"),
+			("is .", "."),
+			("glob", "api/*.py"),
+		):
+			cases.append((f"second element {label}", ("ok.py", bad)))
+		for label, rels in cases:
+			with self.subTest(label), patch(RUN_PATH) as run:
+				with self.assertRaises(ValueError):
+					process_runner.git_commit_only(self.repo, rels, SUBJECT, BODY, 20)
+				run.assert_not_called()
+
+
+SANDBOX_APP = "custom_app"
+DELETED_REL = "myapp/a.py"
+OTHER_STAGED_REL = "myapp/staged.py"
+
+
+class TestCommitOnlyRecordsDeletion(FrappeTestCase):
+	"""T-0 (design 8.0, AC-38, AC-52): a real `git commit --only -- <deleted path>` on a `GitSandbox` repo."""
+
+	def setUp(self):
+		self.sandbox = GitSandbox(self, apps=(SANDBOX_APP,), erp_ai_worktree=None)
+		self.sandbox.commit_file(SANDBOX_APP, DELETED_REL, "a = 1\n")
+		self.repo_root = self.sandbox.repo(SANDBOX_APP)
+
+	def _git(self, *args) -> str:
+		return self.sandbox.git(SANDBOX_APP, *args)
+
+	def test_single_deleted_path_recorded(self):
+		print(f"T-0 {self._git('--version').strip()}")
+		self.sandbox.stage(SANDBOX_APP, OTHER_STAGED_REL, "s = 1\n")
+		before_head = self._git("rev-parse", "HEAD").strip()
+
+		file_writer.remove_file(os.path.join(self.repo_root, DELETED_REL))
+		outcome = process_runner.git_commit_only(self.repo_root, (DELETED_REL,), SUBJECT, BODY, 20)
+
+		self.assertEqual(outcome.exit_code, 0, outcome.output)
+		self.assertEqual(self._git("rev-parse", "HEAD~1").strip(), before_head)
+		self.assertEqual(
+			self._git("diff-tree", "--no-commit-id", "--name-status", "-r", "HEAD"), f"D\t{DELETED_REL}\n"
+		)
+		self.assertEqual(self._git("ls-files", "--", DELETED_REL), "")
+		self.assertEqual(self._git("status", "--porcelain", "--", DELETED_REL), "")
+		self.assertEqual(self._git("status", "--porcelain"), f"A  {OTHER_STAGED_REL}\n")
+		self.assertEqual(self._git("diff", "--cached", "--name-only"), f"{OTHER_STAGED_REL}\n")
+
+	def test_multi_path_delete_add_modify_rename_in_one_commit(self):
+		modified, created, old, new = "myapp/b.py", "myapp/c.py", "myapp/old.txt", "myapp/new/dir/new.txt"
+		unstaged = "myapp/unstaged.py"
+		for rel, content in ((modified, "b = 1\n"), (old, "old\n"), (unstaged, "u = 1\n")):
+			self.sandbox.commit_file(SANDBOX_APP, rel, content)
+		self.sandbox.stage(SANDBOX_APP, OTHER_STAGED_REL, "s = 1\n")
+		self.sandbox.write_unstaged(SANDBOX_APP, unstaged, "u = 2\n")
+		before_head = self._git("rev-parse", "HEAD").strip()
+
+		def full(rel):
+			return os.path.join(self.repo_root, rel)
+
+		file_writer.remove_file(full(DELETED_REL))
+		file_writer.write_atomic(full(modified), "b = 2\n", new_file=False)
+		file_writer.write_atomic(full(created), "c = 1\n", new_file=True)
+		file_writer.make_parents(full(new), self.repo_root)
+		file_writer.write_atomic(full(new), "old\n", new_file=True)
+		file_writer.remove_file(full(old))
+		for rel in (created, new):
+			self.assertEqual(process_runner.git_add_new(self.repo_root, rel, 20).exit_code, 0)
+		rels = (DELETED_REL, modified, created, old, new)
+		outcome = process_runner.git_commit_only(self.repo_root, rels, SUBJECT, BODY, 20)
+
+		self.assertEqual(outcome.exit_code, 0, outcome.output)
+		self.assertEqual(self._git("rev-parse", "HEAD~1").strip(), before_head)
+		self.assertEqual(
+			set(self._git("diff-tree", "--no-commit-id", "--name-status", "-r", "HEAD").splitlines()),
+			{f"D\t{DELETED_REL}", f"M\t{modified}", f"A\t{created}", f"D\t{old}", f"A\t{new}"},
+		)
+		self.assertEqual(self._git("show", f"HEAD:{modified}"), "b = 2\n")
+		self.assertEqual(self._git("show", f"HEAD:{new}"), "old\n")
+		self.assertEqual(self._git("status", "--porcelain"), f"A  {OTHER_STAGED_REL}\n M {unstaged}\n")
+		self.assertEqual(self._git("show", f":{OTHER_STAGED_REL}"), "s = 1\n")
+		with open(full(unstaged), encoding="utf-8") as handle:
+			self.assertEqual(handle.read(), "u = 2\n")
+
+
+class TestLaunchRestart(FrappeTestCase):
+	"""Design 3.4, 4.4 step 2, A-5 (AC-45): detached `setsid -f timeout … bench restart`; every run() is a stub."""
+
+	def setUp(self):
+		patcher = patch(BENCH_PATH, return_value=FAKE_BENCH)
+		patcher.start()
+		self.addCleanup(patcher.stop)
+
+	def _launch(self, result):
+		effect = result if isinstance(result, BaseException) else None
+		value = None if effect else result
+		with patch(RUN_PATH, return_value=value, side_effect=effect) as run:
+			outcome = process_runner.launch_restart()
+		return outcome, run
+
+	def test_argv_shape(self):
+		self.assertEqual(
+			process_runner.RESTART_ARGV,
+			(
+				source.SETSID_EXECUTABLE,
+				"-f",
+				source.TIMEOUT_EXECUTABLE,
+				"-s",
+				"KILL",
+				str(RESTART_TIMEOUT_S),
+				source.BENCH_EXECUTABLE,
+				"restart",
+			),
+		)
+		self.assertIsInstance(process_runner.RESTART_ARGV, tuple)
+		self.assertEqual(process_runner.RESTART_ARGV[5], "700")
+		with open(process_runner.__file__, encoding="utf-8") as handle:
+			text = handle.read()
+		self.assertNotIn('"setsid"', text)
+		self.assertNotIn("'setsid'", text)
+
+	def test_argv_cwd_env_devnull_timeout_new_session(self):
+		full = {"PATH": "/usr/bin:/bin", "HOME": "/home/frappe", "OPENAI_API_KEY": "sk-fake-never-leak"}
+		with patch.dict(process_runner.os.environ, full, clear=True):
+			outcome, run = self._launch(completed(0))
+		self.assertEqual(outcome, (True, None))
+		run.assert_called_once()
+		self.assertEqual(run.call_args.args, (process_runner.RESTART_ARGV,))
+		kwargs = run.call_args.kwargs
+		self.assertEqual(
+			set(kwargs), {"cwd", "env", "stdin", "stdout", "stderr", "timeout", "start_new_session"}
+		)
+		self.assertEqual(kwargs["cwd"], FAKE_BENCH)
+		self.assertEqual(kwargs["env"], {"PATH": "/usr/bin:/bin", "HOME": "/home/frappe"})
+		self.assertIsNot(kwargs["env"], process_runner.os.environ)
+		self.assertIs(kwargs["stdin"], subprocess.DEVNULL)
+		self.assertIs(kwargs["stdout"], subprocess.DEVNULL)
+		self.assertIs(kwargs["stderr"], subprocess.DEVNULL)
+		self.assertEqual(kwargs["timeout"], RESTART_LAUNCH_TIMEOUT_S)
+		self.assertEqual(kwargs["timeout"], 10)
+		self.assertIs(kwargs["start_new_session"], True)
+
+	def test_nonzero_exit_returns_false(self):
+		for returncode in (1, 2, 124, 126, 127, -9):
+			with self.subTest(returncode=returncode):
+				outcome, run = self._launch(completed(returncode))
+				run.assert_called_once()
+				self.assertEqual(outcome, (False, "CalledProcessError"))
+
+	def test_file_not_found_timeout_oserror_return_class_name(self):
+		cases = (
+			(FileNotFoundError(2, "No such file", "setsid"), "FileNotFoundError"),
+			(subprocess.TimeoutExpired(cmd=["setsid"], timeout=10), "TimeoutExpired"),
+			(OSError(7, "Argument list too long"), "OSError"),
+			(PermissionError(13, "Permission denied", "setsid"), "PermissionError"),
+		)
+		for error, class_name in cases:
+			with self.subTest(class_name):
+				outcome, run = self._launch(error)
+				run.assert_called_once()
+				self.assertEqual(outcome, (False, class_name))
+
+	def test_unlisted_error_returns_class_name(self):
+		cases = (
+			(ValueError("embedded null byte"), "ValueError"),
+			(subprocess.SubprocessError("popen failed"), "SubprocessError"),
+		)
+		for error, class_name in cases:
+			with self.subTest(class_name):
+				outcome, run = self._launch(error)
+				run.assert_called_once()
+				self.assertEqual(outcome, (False, class_name))

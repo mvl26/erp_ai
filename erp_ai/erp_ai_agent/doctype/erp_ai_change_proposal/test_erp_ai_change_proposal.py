@@ -1,8 +1,9 @@
+import datetime
 import json
 import re
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import call, patch
 
 import frappe
 import frappe.desk.form.load
@@ -11,11 +12,15 @@ from frappe.tests.utils import FrappeTestCase
 from helpdesk.test_utils import create_agent, make_ticket, make_todo
 
 from erp_ai.agent import authority, change_text
-from erp_ai.agent.changes import transitions
+from erp_ai.agent.changes import restart_check, transitions
 from erp_ai.constants import (
 	AGENT_USER,
 	CHANGE_KIND_CODE,
 	CHANGE_KIND_COMMAND,
+	CHANGE_OP_CREATE,
+	CHANGE_OP_DELETE,
+	CHANGE_OP_EDIT,
+	CHANGE_OP_RENAME,
 	CHANGE_STATUS_APPLIED,
 	CHANGE_STATUS_APPLYING,
 	CHANGE_STATUS_APPROVED,
@@ -26,11 +31,17 @@ from erp_ai.constants import (
 	CHANGE_STATUS_UNDOING,
 	CHANGE_STATUS_UNDONE,
 	LOG_DOCTYPE,
+	OPERATION_DOCTYPE,
 	PROPOSAL_DOCTYPE,
+	RESTART_STATUS_CONFIRMED,
+	RESTART_STATUS_LAUNCH_FAILED,
+	RESTART_STATUS_SENT,
+	RESTART_STATUS_UNCONFIRMED,
+	RESTART_TIMEOUT_S,
 	ROLE_INSTRUCTOR,
 )
 from erp_ai.erp_ai_agent.doctype.erp_ai_change_proposal import erp_ai_change_proposal as controller
-from erp_ai.test_utils import PREFIX, make_change_proposal
+from erp_ai.test_utils import PREFIX, make_block_proposal, make_change_proposal
 
 JSON_PATH = Path(__file__).resolve().parent / "erp_ai_change_proposal.json"
 
@@ -63,6 +74,7 @@ FIELD_ORDER = [
 	"undo_commit_sha",
 	"section_diff",
 	"diff",
+	"operations",
 	"section_content",
 	"content_before",
 	"content_after",
@@ -70,9 +82,11 @@ FIELD_ORDER = [
 	"after_hash",
 	"section_command",
 	"command_args",
+	"command_list",
 	"exit_code",
 	"duration_ms",
 	"command_output",
+	"command_results",
 	"section_decision",
 	"decided_by",
 	"decided_at",
@@ -81,6 +95,9 @@ FIELD_ORDER = [
 	"finished_at",
 	"failure_reason",
 	"approved_digest",
+	"created_dirs",
+	"restart_status",
+	"restart_sent_at",
 ]
 GIT_FIELDS = (
 	"target_branch",
@@ -101,6 +118,8 @@ CODE_FIELDS = {
 	"commit_message",
 	"command_output",
 }
+# Design 2.2 block fields stored as JSON text.
+BLOCK_CODE_FIELDS = {"command_list", "command_results", "created_dirs"}
 # Design 2.1 content group, each with a valid replacement value so only the immutability rule can refuse it.
 CONTENT_FIELD_NEW_VALUES = {
 	"run_id": "ERPAI-TEST-other-run",
@@ -140,6 +159,33 @@ STATE_FIELD_NEW_VALUES = {
 	"apply_commit_sha": "a" * 40,
 	"undo_commit_sha": "b" * 40,
 }
+
+
+# CHG-002 design 2.1: the 7 fields of a child row, all content.
+OPERATION_ROW_FIELDS = (
+	"operation",
+	"file_path",
+	"new_path",
+	"content_before",
+	"content_after",
+	"base_hash",
+	"after_hash",
+)
+# Two items of a block: an edit, then a rename (so `new_path` has a value to compare).
+BLOCK_OPERATIONS = [
+	{"kind": CHANGE_OP_EDIT, "path": "myapp/myapp/a.py", "before": "x = 1\n", "after": "x = 2\n"},
+	{
+		"kind": CHANGE_OP_RENAME,
+		"path": "myapp/myapp/b.py",
+		"new_path": "myapp/myapp/c.py",
+		"before": "y = 1\n",
+		"after": "y = 1\n",
+	},
+]
+CONTENT_REFUSAL = "Nội dung đề xuất không sửa được sau khi tạo"
+UNREADABLE_NOTES = (
+	"Không đọc được nội dung đã lưu của đề xuất này (dữ liệu hỏng); báo quản trị trước khi duyệt."
+)
 
 
 def _load_json():
@@ -233,18 +279,38 @@ class TestERPAIChangeProposal(FrappeTestCase):
 		)
 		self.assertEqual([CHANGE_KIND_CODE, CHANGE_KIND_COMMAND], kind_options)
 		select_fields = {name for name, field in fields.items() if field["fieldtype"] == "Select"}
-		self.assertEqual(select_fields, {"change_status", "change_kind"})
+		self.assertEqual(select_fields, {"change_status", "change_kind", "restart_status"})
+		restart_options = ["", "Đã gửi", "Đã xác nhận", "Chưa xác nhận", "Lỗi khởi chạy"]
+		self.assertEqual(fields["restart_status"]["options"].split("\n"), restart_options)
+		self.assertEqual(
+			[
+				"",
+				RESTART_STATUS_SENT,
+				RESTART_STATUS_CONFIRMED,
+				RESTART_STATUS_UNCONFIRMED,
+				RESTART_STATUS_LAUNCH_FAILED,
+			],
+			restart_options,
+		)
+		# Empty restart status means "no restart needed" (ADR-040 decision 7).
+		self.assertFalse(fields["restart_status"].get("default"))
 
 	def test_content_fields_are_code_and_read_only(self):
 		fields = _fields_by_name()
 		code_fields = {name for name, field in fields.items() if field["fieldtype"] == "Code"}
-		self.assertEqual(code_fields, CODE_FIELDS)
+		self.assertEqual(code_fields, CODE_FIELDS | BLOCK_CODE_FIELDS)
+		for name in BLOCK_CODE_FIELDS:
+			with self.subTest(fieldname=name):
+				self.assertEqual(fields[name]["options"], "JSON")
+		self.assertEqual(fields["operations"]["fieldtype"], "Table")
+		self.assertEqual(fields["operations"]["options"], OPERATION_DOCTYPE)
+		self.assertEqual(fields["restart_sent_at"]["fieldtype"], "Datetime")
 		data_fields = [
 			name
 			for name, field in fields.items()
 			if field["fieldtype"] not in ("Section Break", "Column Break", "Tab Break")
 		]
-		self.assertEqual(len(data_fields), 35)
+		self.assertEqual(len(data_fields), 41)
 		for name in data_fields:
 			with self.subTest(fieldname=name):
 				self.assertEqual(fields[name].get("read_only"), 1)
@@ -368,6 +434,152 @@ class TestERPAIChangeProposal(FrappeTestCase):
 				doc.save(ignore_permissions=True)
 				self.assertEqual(frappe.db.get_value(PROPOSAL_DOCTYPE, proposal.name, "change_kind"), kind)
 
+	def _stored_rows(self, name) -> list:
+		return frappe.get_all(
+			OPERATION_DOCTYPE,
+			filters={"parent": name, "parenttype": PROPOSAL_DOCTYPE},
+			fields=["idx", *OPERATION_ROW_FIELDS],
+			order_by="idx asc",
+		)
+
+	def assertContentRefused(self, doc, fieldname):
+		"""Saving `doc` raises the immutability sentence naming `fieldname`; the stored rows are unchanged."""
+		before = (
+			self._stored_rows(doc.name),
+			frappe.db.get_value(PROPOSAL_DOCTYPE, doc.name, "command_list"),
+		)
+		with self.assertRaises(frappe.ValidationError) as caught:
+			doc.save(ignore_permissions=True)
+		self.assertEqual(str(caught.exception), f"{CONTENT_REFUSAL}: {fieldname}")
+		self.assertEqual(
+			(self._stored_rows(doc.name), frappe.db.get_value(PROPOSAL_DOCTYPE, doc.name, "command_list")),
+			before,
+		)
+
+	def test_child_rows_immutable_after_insert(self):
+		# One replacement per row field, each a valid value so only the immutability rule can refuse it.
+		new_values = {
+			"operation": CHANGE_OP_CREATE,
+			"file_path": "myapp/myapp/other.py",
+			"new_path": "myapp/myapp/z.py",
+			"content_before": "x = 9\n",
+			"content_after": "x = 8\n",
+			"base_hash": "0" * 64,
+			"after_hash": "1" * 64,
+		}
+		self.assertEqual(tuple(new_values), OPERATION_ROW_FIELDS)
+		for fieldname, new_value in new_values.items():
+			with self.subTest(fieldname=fieldname):
+				proposal = make_block_proposal(BLOCK_OPERATIONS, [])
+				doc = frappe.get_doc(PROPOSAL_DOCTYPE, proposal.name)
+				self.assertNotEqual(doc.operations[0].get(fieldname), new_value)
+				doc.operations[0].set(fieldname, new_value)
+				self.assertContentRefused(doc, "operations")
+
+	def test_row_added_or_removed_refused(self):
+		def add_row(doc):
+			doc.append(
+				"operations",
+				{"operation": CHANGE_OP_DELETE, "file_path": "myapp/myapp/d.py", "content_before": "z = 1\n"},
+			)
+
+		def remove_row(doc):
+			doc.remove(doc.operations[-1])
+
+		def reorder_rows(doc):
+			doc.operations.reverse()
+			for index, row in enumerate(doc.operations, start=1):
+				row.idx = index
+
+		def renumber_rows(doc):
+			# Same list, swapped `idx`: the stored order changes all the same.
+			first, second = doc.operations
+			first.idx, second.idx = second.idx, first.idx
+
+		for change in (add_row, remove_row, reorder_rows, renumber_rows):
+			with self.subTest(change=change.__name__):
+				proposal = make_block_proposal(BLOCK_OPERATIONS, [])
+				doc = frappe.get_doc(PROPOSAL_DOCTYPE, proposal.name)
+				change(doc)
+				self.assertContentRefused(doc, "operations")
+
+	def test_block_unchanged_resave_is_allowed(self):
+		proposal = make_block_proposal(BLOCK_OPERATIONS, [["--site", "miyano", "migrate"]])
+		before = self._stored_rows(proposal.name)
+		doc = frappe.get_doc(PROPOSAL_DOCTYPE, proposal.name)
+		doc.save(ignore_permissions=True)
+		self.assertEqual(self._stored_rows(proposal.name), before)
+
+	def test_command_list_immutable(self):
+		for operations in (BLOCK_OPERATIONS, []):
+			with self.subTest(file_items=len(operations)):
+				proposal = make_block_proposal(operations, [["--site", "miyano", "migrate"]])
+				doc = frappe.get_doc(PROPOSAL_DOCTYPE, proposal.name)
+				doc.command_list = json.dumps([["build", "--app", "myapp"]])
+				self.assertContentRefused(doc, "command_list")
+
+	def test_block_commit_preview_lists_items(self):
+		many = make_block_proposal(BLOCK_OPERATIONS, [])
+		self.assertEqual(
+			many.commit_message,
+			f"erp_ai: áp dụng {many.name} (2 file)\n"
+			"\n"
+			f"Đề xuất: {many.name}\n"
+			f"Phiếu: {many.ticket}\n"
+			"sửa myapp/myapp/a.py\n"
+			"đổi tên myapp/myapp/b.py → myapp/myapp/c.py\n"
+			"Người duyệt: <người duyệt>\n"
+			"Commit do ERP AI Agent tạo sau khi người duyệt bấm Duyệt.",
+		)
+		self.assertEqual(
+			frappe.db.get_value(PROPOSAL_DOCTYPE, many.name, "commit_message"), many.commit_message
+		)
+		one = make_block_proposal(BLOCK_OPERATIONS[:1], [])
+		self.assertEqual(
+			one.commit_message,
+			f"erp_ai: áp dụng {one.name} (myapp/myapp/a.py)\n"
+			"\n"
+			f"Đề xuất: {one.name}\n"
+			f"Phiếu: {one.ticket}\n"
+			"sửa myapp/myapp/a.py\n"
+			"Người duyệt: <người duyệt>\n"
+			"Commit do ERP AI Agent tạo sau khi người duyệt bấm Duyệt.",
+		)
+		commands_only = make_block_proposal([], [["build", "--app", "myapp"]])
+		self.assertFalse(frappe.db.get_value(PROPOSAL_DOCTYPE, commands_only.name, "commit_message"))
+
+	def test_onload_unreadable_notes_opens_with_one_warning_line(self):
+		corruptions = {
+			"command_list not a list of argv lists": {"command_list": '["migrate"]'},
+			"unknown restart_status": {"restart_status": "Không rõ"},
+		}
+		for case, values in corruptions.items():
+			with self.subTest(case=case):
+				proposal = make_block_proposal(BLOCK_OPERATIONS, [["--site", "miyano", "migrate"]])
+				frappe.db.set_value(PROPOSAL_DOCTYPE, proposal.name, values, update_modified=False)
+				error_logs = frappe.db.count("Error Log")
+				with patch.object(controller.frappe, "logger") as logger:
+					frappe.response.docs = []
+					try:
+						frappe.desk.form.load.getdoc(PROPOSAL_DOCTYPE, proposal.name)
+						form = frappe.response.docs[0]
+					finally:
+						frappe.response.docs = []
+				self.assertEqual(form.name, proposal.name)
+				self.assertEqual(form.get("__onload").change_notes, [UNREADABLE_NOTES])
+				self.assertEqual(
+					logger.return_value.warning.call_args_list,
+					[call("erp_ai notes proposal=%s error=%s", proposal.name, "ValueError")],
+				)
+				self.assertIn(call("erp_ai"), logger.call_args_list)
+				self.assertEqual(frappe.db.count("Error Log"), error_logs)
+		with self.subTest(case="other exception classes are not caught"):
+			proposal = make_block_proposal(BLOCK_OPERATIONS, [])
+			doc = frappe.get_doc(PROPOSAL_DOCTYPE, proposal.name)
+			with patch.object(controller.change_text, "proposal_notes", side_effect=TypeError("x")):
+				with self.assertRaises(TypeError):
+					doc.run_method("onload")
+
 	def test_sample_proposals_are_pending_with_git_fields(self):
 		code = make_change_proposal()
 		self.assertRegex(code.name, r"^AICHG-\d{5}$")
@@ -444,6 +656,8 @@ class TestERPAIChangeProposal(FrappeTestCase):
 
 METHOD_MODULE = "erp_ai.erp_ai_agent.doctype.erp_ai_change_proposal.erp_ai_change_proposal"
 METHOD_NAMES = ("approve", "reject", "undo")
+# Every whitelisted method of the controller (CHG-002 T24 adds `confirm_restart`).
+WHITELISTED_NAMES = (*METHOD_NAMES, "confirm_restart")
 RUN_CHANGE = "erp_ai.agent.changes.apply_job.run_change"
 # Design 3.3 error sentences, copied by hand.
 ROLE_REFUSAL = "Chỉ người có vai trò ERP AI Instructor mới duyệt, từ chối hoặc hoàn tác được"
@@ -636,8 +850,8 @@ class TestChangeProposalMethods(FrappeTestCase):
 
 	def test_methods_are_post_only_and_not_guest(self):
 		own = {fn.__name__ for fn in frappe.whitelisted if getattr(fn, "__module__", None) == METHOD_MODULE}
-		self.assertEqual(own, set(METHOD_NAMES))
-		for method in METHOD_NAMES:
+		self.assertEqual(own, set(WHITELISTED_NAMES))
+		for method in WHITELISTED_NAMES:
 			with self.subTest(method=method):
 				fn = getattr(controller, method)
 				self.assertIn(fn, frappe.whitelisted)
@@ -853,12 +1067,307 @@ class TestChangeProposalMethods(FrappeTestCase):
 			self.assertEqual(form.get("__onload").change_notes, ["Lệnh bench không hoàn tác được."])
 
 
+RESTART_SYSTEM_MANAGER = "change.restart.sysmanager@example.com"
+RESTART_LOG_FORMAT = "erp_ai restart proposal=%s status=%s"
+# A fixed send moment in the site's timezone (naive, as Frappe stores Datetime fields); never the wall clock.
+RESTART_SENT_AT = datetime.datetime(2026, 1, 5, 10, 0, 0)
+NOT_SENT_STATUSES = (
+	None,
+	RESTART_STATUS_CONFIRMED,
+	RESTART_STATUS_UNCONFIRMED,
+	RESTART_STATUS_LAUNCH_FAILED,
+)
+
+
+def _sent_epoch(sent_at=RESTART_SENT_AT) -> float:
+	return restart_check.epoch_of_system_time(sent_at, frappe.utils.get_system_timezone())
+
+
+def _restart_row(name) -> frappe._dict:
+	return frappe.db.get_value(
+		PROPOSAL_DOCTYPE, name, ["restart_status", "restart_sent_at", "modified"], as_dict=True
+	)
+
+
+class TestConfirmRestart(FrappeTestCase):
+	"""CHG-002 T24: `confirm_restart` (design 3.3, 4.4 step 5; addendum-1 A-2.1; addendum-5 P-4)."""
+
+	def setUp(self):
+		self.addCleanup(frappe.db.rollback)
+		self.addCleanup(frappe.set_user, "Administrator")
+		frappe.set_user("Administrator")
+		if not frappe.db.exists("Role", ROLE_INSTRUCTOR):
+			frappe.get_doc({"doctype": "Role", "role_name": ROLE_INSTRUCTOR}).insert(ignore_permissions=True)
+		for email in (METHOD_INSTRUCTOR, METHOD_PLAIN, RESTART_SYSTEM_MANAGER):
+			create_agent(email)
+		if not frappe.db.exists("User", AGENT_USER):
+			create_agent(AGENT_USER)
+		frappe.get_doc("User", METHOD_INSTRUCTOR).add_roles(ROLE_INSTRUCTOR)
+		frappe.get_doc("User", RESTART_SYSTEM_MANAGER).add_roles("System Manager")
+		# Evidence and "now" are stubbed: no real process, no Redis, no wall clock.
+		self.web = self._start(patch.object(restart_check, "web_started", return_value=None))
+		self.workers = self._start(patch.object(restart_check, "workers_started", return_value=None))
+		self.now = self._start(
+			patch.object(
+				controller, "now_datetime", return_value=RESTART_SENT_AT + datetime.timedelta(seconds=5)
+			)
+		)
+		self.logger = self._start(patch.object(controller.frappe, "logger"))
+
+	def _start(self, patcher):
+		mock = patcher.start()
+		self.addCleanup(patcher.stop)
+		return mock
+
+	def _proposal(self, restart_status=RESTART_STATUS_SENT, sent_at=RESTART_SENT_AT) -> str:
+		name = _proposal_in(CHANGE_STATUS_APPLIED)
+		frappe.db.set_value(
+			PROPOSAL_DOCTYPE,
+			name,
+			{"restart_status": restart_status, "restart_sent_at": sent_at},
+			update_modified=False,
+		)
+		return name
+
+	def _evidence_confirms(self):
+		"""Both processes started after the send: `outcome` would conclude `Đã xác nhận`."""
+		self.web.return_value = _sent_epoch() + 3
+		self.workers.return_value = _sent_epoch() + 4
+
+	def _call_as(self, user, name):
+		frappe.set_user(user)
+		try:
+			return controller.confirm_restart(name)
+		finally:
+			frappe.set_user("Administrator")
+
+	def _conclusion_lines(self) -> list:
+		return [
+			c for c in self.logger.return_value.info.call_args_list if c.args[:1] == (RESTART_LOG_FORMAT,)
+		]
+
+	def assertRefused(self, user, name, error, message, proposal=None):
+		"""`confirm_restart(name)` as `user` raises exactly `error`/`message`; no evidence read, nothing written."""
+		proposal = name if proposal is None else proposal
+		before = _restart_row(proposal)
+		self._evidence_confirms()
+		with patch.object(transitions, "confirm_restart") as write:
+			with self.assertRaises(error) as caught:
+				self._call_as(user, name)
+		self.assertIs(type(caught.exception), error)
+		self.assertEqual(str(caught.exception), message)
+		self.assertEqual(write.call_count, 0)
+		self.assertEqual((self.web.call_count, self.workers.call_count), (0, 0))
+		self.assertEqual(_restart_row(proposal), before)
+		self.assertEqual(self._conclusion_lines(), [])
+
+	def test_only_from_sent(self):
+		for status in NOT_SENT_STATUSES:
+			with self.subTest(restart_status=status):
+				name = self._proposal(restart_status=status)
+				self._evidence_confirms()
+				before = _restart_row(name)
+				with patch.object(transitions, "confirm_restart", wraps=transitions.confirm_restart) as write:
+					result = self._call_as(METHOD_INSTRUCTOR, name)
+				self.assertEqual(result, {"name": name, "status": status})
+				self.assertEqual(write.call_count, 0)
+				self.assertEqual(_restart_row(name), before)
+				self.assertEqual(self._conclusion_lines(), [])
+
+	def test_no_conclusion_writes_nothing(self):
+		cases = {
+			"no evidence, before the deadline": (None, None, 5),
+			"web only, before the deadline": (_sent_epoch() + 3, None, 5),
+			"started before the send, at the deadline": (
+				_sent_epoch() - 1,
+				_sent_epoch() - 1,
+				RESTART_TIMEOUT_S,
+			),
+		}
+		for label, (web, workers, elapsed) in cases.items():
+			with self.subTest(case=label):
+				name = self._proposal()
+				self.web.return_value, self.workers.return_value = web, workers
+				self.now.return_value = RESTART_SENT_AT + datetime.timedelta(seconds=elapsed)
+				before = _restart_row(name)
+				with patch.object(transitions, "confirm_restart") as write:
+					result = self._call_as(METHOD_INSTRUCTOR, name)
+				self.assertEqual(result, {"name": name, "status": RESTART_STATUS_SENT})
+				self.assertEqual(write.call_count, 0)
+				self.assertEqual(_restart_row(name), before)
+				self.assertEqual(self._conclusion_lines(), [])
+		with self.subTest(case="sent without a send time"):
+			# Both processes "start" ~300 years after the fixed send: later than any moment a missing send
+			# time could be read as (`get_datetime(None)` is the real now), so only the guard stops a write.
+			name = self._proposal(sent_at=None)
+			self.web.return_value = self.workers.return_value = _sent_epoch() + 10**10
+			before = _restart_row(name)
+			with patch.object(transitions, "confirm_restart") as write:
+				result = self._call_as(METHOD_INSTRUCTOR, name)
+			self.assertEqual(result, {"name": name, "status": RESTART_STATUS_SENT})
+			self.assertEqual(write.call_count, 0)
+			self.assertEqual(_restart_row(name), before)
+			self.assertEqual(self._conclusion_lines(), [])
+
+	def test_agent_account_refused(self):
+		for holds_role in (False, True):
+			with self.subTest(holds_role=holds_role):
+				name = self._proposal()
+				with patch("frappe.get_roles", return_value=[ROLE_INSTRUCTOR] if holds_role else []):
+					self.assertRefused(AGENT_USER, name, frappe.PermissionError, ROLE_REFUSAL)
+
+	def test_administrator_guest_no_role_refused(self):
+		self.assertNotIn(ROLE_INSTRUCTOR, frappe.get_roles(METHOD_PLAIN))
+		for user in ("Administrator", "Guest", METHOD_PLAIN):
+			with self.subTest(user=user):
+				self.assertRefused(user, self._proposal(), frappe.PermissionError, ROLE_REFUSAL)
+		for user in ("Administrator", "Guest"):
+			with self.subTest(user=user, holds_role=True):
+				with patch("frappe.get_roles", return_value=[ROLE_INSTRUCTOR]):
+					self.assertRefused(user, self._proposal(), frappe.PermissionError, ROLE_REFUSAL)
+		with self.subTest(check="role before existence"):
+			self.assertRefused(
+				METHOD_PLAIN, "AICHG-99999", frappe.PermissionError, ROLE_REFUSAL, proposal=self._proposal()
+			)
+
+	def test_system_manager_without_instructor_refused_status_unchanged(self):
+		roles = frappe.get_roles(RESTART_SYSTEM_MANAGER)
+		self.assertIn("System Manager", roles)
+		self.assertNotIn(ROLE_INSTRUCTOR, roles)
+		name = self._proposal()
+		self.assertRefused(RESTART_SYSTEM_MANAGER, name, frappe.PermissionError, ROLE_REFUSAL)
+		self.assertEqual(frappe.db.get_value(PROPOSAL_DOCTYPE, name, "restart_status"), RESTART_STATUS_SENT)
+
+	def test_instructor_records_conclusion(self):
+		cases = {
+			RESTART_STATUS_CONFIRMED: (_sent_epoch() + 3, _sent_epoch() + 4, 5),
+			RESTART_STATUS_UNCONFIRMED: (_sent_epoch() + 3, None, RESTART_TIMEOUT_S + 1),
+		}
+		for expected, (web, workers, elapsed) in cases.items():
+			with self.subTest(conclusion=expected):
+				self.logger.reset_mock()
+				name = self._proposal()
+				self.web.return_value, self.workers.return_value = web, workers
+				self.now.return_value = RESTART_SENT_AT + datetime.timedelta(seconds=elapsed)
+				result = self._call_as(METHOD_INSTRUCTOR, name)
+				self.assertEqual(result, {"name": name, "status": expected})
+				stored = _restart_row(name)
+				self.assertEqual((stored.restart_status, stored.restart_sent_at), (expected, RESTART_SENT_AT))
+				self.assertEqual(self._conclusion_lines(), [call(RESTART_LOG_FORMAT, name, expected)])
+				self.assertIn(call("erp_ai"), self.logger.call_args_list)
+
+	def test_uses_decider(self):
+		name = self._proposal()
+		self._evidence_confirms()
+		order = []
+		real_get_value = frappe.db.get_value
+
+		def reading(doctype, *args, **kwargs):
+			if doctype == PROPOSAL_DOCTYPE:
+				order.append("read")
+			return real_get_value(doctype, *args, **kwargs)
+
+		def deciding(_name):
+			order.append("decider")
+			return METHOD_INSTRUCTOR
+
+		self.web.side_effect = lambda: order.append("evidence") or _sent_epoch() + 3
+		with patch.object(controller, "_decider", side_effect=deciding) as decider:
+			with patch.object(frappe.db, "get_value", side_effect=reading):
+				result = self._call_as(METHOD_INSTRUCTOR, name)
+		self.assertEqual(decider.call_args_list, [call(name)])
+		self.assertEqual(order[0], "decider")
+		self.assertEqual(order.count("decider"), 1)
+		self.assertIn("read", order)
+		self.assertIn("evidence", order)
+		self.assertEqual(result, {"name": name, "status": RESTART_STATUS_CONFIRMED})
+		with self.subTest(check="the decider's refusal stops everything"):
+			other = self._proposal()
+			refusal = frappe.PermissionError("refused by the decider")
+			with patch.object(controller, "_decider", side_effect=refusal) as decider:
+				with self.assertRaises(frappe.PermissionError):
+					self._call_as(METHOD_INSTRUCTOR, other)
+			self.assertEqual(decider.call_args_list, [call(other)])
+			self.assertEqual(
+				frappe.db.get_value(PROPOSAL_DOCTYPE, other, "restart_status"), RESTART_STATUS_SENT
+			)
+
+	def test_missing_proposal_does_not_exist(self):
+		witness = self._proposal()
+		cases = (
+			(None, "Không có đề xuất "),
+			("", "Không có đề xuất "),
+			("AICHG-99999", "Không có đề xuất AICHG-99999"),
+		)
+		for name, message in cases:
+			with self.subTest(name=name):
+				self.assertRefused(
+					METHOD_INSTRUCTOR, name, frappe.DoesNotExistError, message, proposal=witness
+				)
+
+	def test_passes_sent_at_it_read(self):
+		name = self._proposal()
+		self._evidence_confirms()
+		with patch.object(transitions, "confirm_restart", return_value=True) as write:
+			result = self._call_as(METHOD_INSTRUCTOR, name)
+		self.assertEqual(
+			write.call_args_list, [call(name, RESTART_STATUS_CONFIRMED, sent_at=RESTART_SENT_AT)]
+		)
+		self.assertIsInstance(write.call_args.kwargs["sent_at"], datetime.datetime)
+		self.assertEqual(result, {"name": name, "status": RESTART_STATUS_CONFIRMED})
+
+	def test_resent_between_read_and_write_keeps_new_status(self):
+		resent_at = RESTART_SENT_AT + datetime.timedelta(seconds=30)
+		cases = {
+			"sent again": (RESTART_STATUS_SENT, resent_at),
+			"launch failed": (RESTART_STATUS_LAUNCH_FAILED, resent_at),
+		}
+		for label, (new_status, new_sent_at) in cases.items():
+			with self.subTest(case=label):
+				self.logger.reset_mock()
+				name = self._proposal()
+				self.workers.return_value = _sent_epoch() + 4
+
+				def resend_while_reading(name=name, new_status=new_status, new_sent_at=new_sent_at):
+					# The undo job's `record_restart` lands between the evidence read and the write.
+					frappe.db.set_value(
+						PROPOSAL_DOCTYPE,
+						name,
+						{"restart_status": new_status, "restart_sent_at": new_sent_at},
+						update_modified=False,
+					)
+					return _sent_epoch() + 3
+
+				self.web.side_effect = resend_while_reading
+				with patch.object(transitions, "confirm_restart", wraps=transitions.confirm_restart) as write:
+					result = self._call_as(METHOD_INSTRUCTOR, name)
+				self.web.side_effect = None
+				self.assertEqual(
+					write.call_args_list, [call(name, RESTART_STATUS_CONFIRMED, sent_at=RESTART_SENT_AT)]
+				)
+				self.assertEqual(result, {"name": name, "status": new_status})
+				stored = _restart_row(name)
+				self.assertEqual((stored.restart_status, stored.restart_sent_at), (new_status, new_sent_at))
+				self.assertEqual(self._conclusion_lines(), [])
+
+
 FORM_SCRIPT_PATH = Path(__file__).resolve().parent / "erp_ai_change_proposal.js"
 # The three whitelisted methods (design 3.3), written out by hand.
 APPROVE_PATH = "erp_ai.erp_ai_agent.doctype.erp_ai_change_proposal.erp_ai_change_proposal.approve"
 REJECT_PATH = "erp_ai.erp_ai_agent.doctype.erp_ai_change_proposal.erp_ai_change_proposal.reject"
 UNDO_PATH = "erp_ai.erp_ai_agent.doctype.erp_ai_change_proposal.erp_ai_change_proposal.undo"
+CONFIRM_RESTART_PATH = (
+	"erp_ai.erp_ai_agent.doctype.erp_ai_change_proposal.erp_ai_change_proposal.confirm_restart"
+)
 ROLE_CHECK = 'frappe.user.has_role("ERP AI Instructor")'
+# Design 3.7 line 5 of the block notes, which the undo confirmation repeats.
+COMMAND_UNDO_NOTE = "Lệnh trong khối không hoàn tác được; hoàn tác chỉ trả lại phần file."
+# The only pieces a form condition is written with; anything else makes `_condition_holds` fail.
+_CONDITION_TOKEN = re.compile(
+	r"\s+|frm\.doc\.(?P<field>\w+)|frappe\.user\.has_role\(\"(?P<role>[^\"]+)\"\)"
+	r'|"(?P<text>[^"\\]*)"|(?P<op>===|!==|&&|\|\||!|\(|\))'
+)
+_CONDITION_OPERATORS = {"===": " == ", "!==": " != ", "&&": " and ", "||": " or ", "(": "(", ")": ")"}
 
 
 def _without_comments(source: str) -> str:
@@ -905,6 +1414,47 @@ def _block_after(source: str, condition_pattern: str) -> str:
 	return match.group(2) if match else ""
 
 
+def _function_return(source: str, name: str) -> str:
+	"""The expression of `function <name>(frm) { return <expression>; }`, the whole body of that function."""
+	match = re.search(r"\nfunction " + name + r"\(frm\) \{\s*return (.*?);\s*\n\}", source, re.DOTALL)
+	return match.group(1) if match else ""
+
+
+def _condition_holds(expression: str, doc: dict, roles: set) -> bool:
+	"""Value of a form condition for one document and one user's roles, read token by token.
+
+	Only `frm.doc.<field>`, `frappe.user.has_role("<role>")`, string literals, `===`, `!==`, `&&`, `||`,
+	`!` and parentheses are understood, with JavaScript truthiness for an empty or missing field.
+	`!` must stand right before a field or a role check, so it binds as tightly as in JavaScript.
+	"""
+	if not expression:
+		raise AssertionError("condition not found in the form script")
+	parts, at, negate = [], 0, False
+	while at < len(expression):
+		token = _CONDITION_TOKEN.match(expression, at)
+		if not token:
+			raise AssertionError(f"condition piece not understood: {expression[at:at + 30]!r}")
+		at = token.end()
+		if token.group("field"):
+			atom = f"doc.get({token.group('field')!r})"
+		elif token.group("role"):
+			atom = f"({token.group('role')!r} in roles)"
+		elif token.group("text") is not None:
+			atom = repr(token.group("text"))
+		elif token.group("op") == "!":
+			negate = True
+			continue
+		elif token.group("op"):
+			atom = _CONDITION_OPERATORS[token.group("op")]
+		else:
+			continue
+		if negate and not (token.group("field") or token.group("role")):
+			raise AssertionError(f"`!` before something other than a field or a role check: {expression!r}")
+		parts.append(f"(not {atom})" if negate else atom)
+		negate = False
+	return bool(eval("".join(parts), {"__builtins__": {}}, {"doc": doc, "roles": roles}))
+
+
 class TestChangeProposalFormScript(FrappeTestCase):
 	"""Design 3.3 "Form Desk", AC-5, AC-22, ADR-022 QĐ 9: static rules on the form script text.
 
@@ -942,11 +1492,8 @@ class TestChangeProposalFormScript(FrappeTestCase):
 			self.assertRegex(pending, _button_pattern("Từ chối", REJECT_PATH))
 			self.assertNotIn(UNDO_PATH, pending)
 
-		with self.subTest(rule="Hoàn tác only when Đã áp dụng and Thay đổi code"):
-			applied = _block_after(
-				source,
-				r'frm\.doc\.change_status === "Đã áp dụng" &&\s*frm\.doc\.change_kind === "Thay đổi code"',
-			)
+		with self.subTest(rule="Hoàn tác only when undo_allowed"):
+			applied = _block_after(source, r"undo_allowed\(frm\)")
 			self.assertRegex(applied, _button_pattern("Hoàn tác", UNDO_PATH))
 			self.assertNotIn(APPROVE_PATH, applied)
 			self.assertNotIn(REJECT_PATH, applied)
@@ -979,8 +1526,9 @@ class TestChangeProposalFormScript(FrappeTestCase):
 
 		with self.subTest(rule="signed link: one extra POST call to decide, no confirm (ADR-023 QĐ 1)"):
 			outside = source.replace(helper.group(0), "")
-			self.assertEqual(outside.count("frappe.call("), 1)
-			call_at = outside.index("frappe.call(")
+			# The other call outside the helper is the one to confirm_restart (T25); its shape is pinned in test_calls_confirm_restart_only_when_sent.
+			self.assertEqual(outside.count("frappe.call("), 2)
+			call_at = outside.index("frappe.call(", outside.index("\nfunction decide_from_link(frm) {"))
 			function_at = outside.rindex("\nfunction ", 0, call_at)
 			function_end = outside.index("\n}", call_at)
 			auto_block = outside[function_at:function_end]
@@ -1072,12 +1620,14 @@ class TestChangeProposalFormScript(FrappeTestCase):
 			pending = _block_after(source, r'frm\.doc\.change_status === "Chờ duyệt"')
 			self.assertNotIn("Không có gì được ghi", source)
 			self.assertIn("Không có file nào được ghi, không có lệnh nào chạy.", pending)
-			applied = _block_after(
-				source,
-				r'frm\.doc\.change_status === "Đã áp dụng" &&\s*frm\.doc\.change_kind === "Thay đổi code"',
+			undo_message = re.search(
+				r"function undo_confirm_message\(frm, notes\) \{\n(.*?)\n\}", source, re.DOTALL
 			)
+			self.assertIsNotNone(undo_message, "undo_confirm_message missing")
 			self.assertNotIn("File được ghi lại như cũ", source)
-			self.assertIn("file mới thì bị xóa", applied)
+			self.assertIn("file mới thì bị xóa", undo_message.group(1))
+			# New value (design 3.3): both wordings of the confirmation, block and single change, say it.
+			self.assertEqual(undo_message.group(1).count("file mới thì bị xóa"), 2)
 
 		with self.subTest(rule="no HTML built by concatenation"):
 			self.assertNotIn("`", source)
@@ -1095,3 +1645,181 @@ class TestChangeProposalFormScript(FrappeTestCase):
 		):
 			with self.subTest(forbidden=forbidden):
 				self.assertNotIn(forbidden, source)
+
+	def _undo_shown(self, **fields) -> bool:
+		doc = {"change_kind": CHANGE_KIND_CODE, "apply_commit_sha": "", "undo_commit_sha": "", **fields}
+		return _condition_holds(_function_return(self.source, "undo_allowed"), doc, {ROLE_INSTRUCTOR})
+
+	def test_undo_button_shown_for_failed_with_commit(self):
+		# Design 3.3 `undo`: Đã áp dụng, or Lỗi with an apply commit and no undo commit, for Thay đổi code.
+		applied = _block_after(self.source, r"undo_allowed\(frm\)")
+		self.assertRegex(
+			applied,
+			r'add_action_button\(\s*frm,\s*__\("Hoàn tác"\),\s*undo_confirm_message\(frm, notes\),\s*"'
+			+ re.escape(UNDO_PATH)
+			+ r'"\s*\)',
+		)
+		self.assertEqual(self.source.count("undo_allowed(frm)"), 2)
+		sha = "a" * 40
+		for name, fields, shown in (
+			("applied", {"change_status": CHANGE_STATUS_APPLIED}, True),
+			("applied with commit", {"change_status": CHANGE_STATUS_APPLIED, "apply_commit_sha": sha}, True),
+			("failed with commit", {"change_status": CHANGE_STATUS_FAILED, "apply_commit_sha": sha}, True),
+			("failed without commit", {"change_status": CHANGE_STATUS_FAILED}, False),
+			("failed commit None", {"change_status": CHANGE_STATUS_FAILED, "apply_commit_sha": None}, False),
+			(
+				"failed already undone",
+				{"change_status": CHANGE_STATUS_FAILED, "apply_commit_sha": sha, "undo_commit_sha": "b" * 40},
+				False,
+			),
+			(
+				"failed command kind",
+				{
+					"change_status": CHANGE_STATUS_FAILED,
+					"apply_commit_sha": sha,
+					"change_kind": CHANGE_KIND_COMMAND,
+				},
+				False,
+			),
+			(
+				"applied command kind",
+				{"change_status": CHANGE_STATUS_APPLIED, "change_kind": CHANGE_KIND_COMMAND},
+				False,
+			),
+			("undone", {"change_status": CHANGE_STATUS_UNDONE, "apply_commit_sha": sha}, False),
+			("undoing", {"change_status": CHANGE_STATUS_UNDOING, "apply_commit_sha": sha}, False),
+			("pending", {"change_status": CHANGE_STATUS_PENDING}, False),
+			("stale with commit", {"change_status": CHANGE_STATUS_STALE, "apply_commit_sha": sha}, False),
+		):
+			with self.subTest(case=name):
+				self.assertIs(self._undo_shown(**fields), shown)
+
+	def test_undo_confirmation_counts_items_and_names_commands(self):
+		# AC-42: the block's item count, and the command line of the notes, are said before the click.
+		body = re.search(r"function undo_confirm_message\(frm, notes\) \{\n(.*?)\n\}", self.source, re.DOTALL)
+		self.assertIsNotNone(body, "undo_confirm_message missing")
+		literal = re.search(r'const COMMAND_UNDO_NOTE_PREFIX = "([^"]+)";', self.source)
+		self.assertIsNotNone(literal, "COMMAND_UNDO_NOTE_PREFIX")
+		self.assertTrue(literal.group(1).startswith("Lệnh trong khối không hoàn tác được"))
+		rows = [{"operation": CHANGE_OP_EDIT, "file_path": "myapp/myapp/a.py", "idx": 1}]
+		for commands, has_note in (([["migrate"]], True), ([], False)):
+			with self.subTest(commands=commands):
+				notes = change_text.proposal_notes(
+					{
+						"change_kind": CHANGE_KIND_CODE,
+						"operations": rows,
+						"command_list": json.dumps(commands),
+					}
+				)
+				self.assertIs(any(note.startswith(literal.group(1)) for note in notes), has_note)
+				self.assertIs(COMMAND_UNDO_NOTE in notes, has_note)
+		self.assertRegex(
+			body.group(1),
+			_statement(
+				"const items = (frm.doc.operations || []).length; const lines = items ? [__("
+				+ json.dumps(
+					"Hoàn tác khối {0} mục? File trở lại như trước khi áp dụng (file mới thì bị xóa)"
+					" và có một commit hoàn tác.",
+					ensure_ascii=False,
+				)
+				+ ", [items])] : [__("
+				+ json.dumps(
+					"Hoàn tác thay đổi này? File trở lại như trước khi áp dụng (file mới thì bị xóa)"
+					" và có một commit hoàn tác.",
+					ensure_ascii=False,
+				)
+				+ ")];"
+				" const command_note = notes.find((note) => note.startsWith(COMMAND_UNDO_NOTE_PREFIX));"
+				" if (command_note) { lines.push(command_note); }"
+				' return lines.map(frappe.utils.escape_html).join("<br>");'
+			),
+		)
+
+	def _confirm_called(self, restart_status, roles) -> bool:
+		doc = {"restart_status": restart_status, "change_status": CHANGE_STATUS_APPLIED}
+		return _condition_holds(_function_return(self.source, "restart_check_due"), doc, roles)
+
+	def test_calls_confirm_restart_only_when_sent(self):
+		# Design 4.4 step 5 and arch-ruling-3 (ADR-040 C-4): once on open, only from Đã gửi; the answer's
+		# `status` is compared with the field and the form reloads only when it changed.
+		source = self.source
+		self.assertEqual(source.count(f'"{CONFIRM_RESTART_PATH}"'), 1)
+		onload = re.search(r"\n\tonload\(frm\) \{\n(.*?)\n\t\},", source, re.DOTALL)
+		self.assertIsNotNone(onload, "onload handler missing")
+		self.assertRegex(onload.group(1), _statement("confirm_restart_on_open(frm);"))
+		self.assertEqual(source.count("confirm_restart_on_open(frm)"), 2)
+		function = re.search(r"\nfunction confirm_restart_on_open\(frm\) \{\n(.*?)\n\}", source, re.DOTALL)
+		self.assertIsNotNone(function, "confirm_restart_on_open missing")
+		self.assertRegex(
+			function.group(1),
+			_statement(
+				"if (!restart_check_due(frm)) { return; } frappe.call({ method: "
+				+ json.dumps(CONFIRM_RESTART_PATH)
+				+ ', args: { name: frm.doc.name }, type: "POST", callback: (r) => {'
+				" if (r.message.status !== frm.doc.restart_status) { frm.reload_doc(); } }, });"
+			),
+		)
+		self.assertEqual(source.count("restart_check_due(frm)"), 2)
+		self.assertNotIn("message.restart_status", source)
+		self.assertNotIn("frappe.realtime", source)
+		self.assertNotIn("open_doc:", source)
+		for status, called in (
+			(RESTART_STATUS_SENT, True),
+			(RESTART_STATUS_CONFIRMED, False),
+			(RESTART_STATUS_UNCONFIRMED, False),
+			(RESTART_STATUS_LAUNCH_FAILED, False),
+			("", False),
+			(None, False),
+		):
+			with self.subTest(restart_status=status):
+				self.assertIs(self._confirm_called(status, {ROLE_INSTRUCTOR}), called)
+
+	def test_confirm_restart_called_only_for_instructor(self):
+		# Design addendum 1 A-2.1, D-17: a System Manager without the Instructor role gets no call, so no error box.
+		for roles, called in (
+			({ROLE_INSTRUCTOR}, True),
+			({ROLE_INSTRUCTOR, "System Manager"}, True),
+			({"System Manager"}, False),
+			(set(), False),
+		):
+			with self.subTest(roles=sorted(roles)):
+				self.assertIs(self._confirm_called(RESTART_STATUS_SENT, roles), called)
+
+	def test_form_diff_covers_every_item(self):
+		# AC-48 (form): the one `diff` field Desk receives holds the hunk of every item of the block.
+		operations = [
+			{"kind": CHANGE_OP_EDIT, "path": "myapp/myapp/a.py", "before": "x = 1\n", "after": "x = 2\n"},
+			{"kind": CHANGE_OP_CREATE, "path": "myapp/myapp/new/b.py", "after": "y = 1\n"},
+			{"kind": CHANGE_OP_DELETE, "path": "myapp/myapp/c.py", "before": "z = 1\n"},
+			{
+				"kind": CHANGE_OP_RENAME,
+				"path": "myapp/myapp/d.py",
+				"new_path": "myapp/myapp/e.py",
+				"before": "w = 1\n",
+				"after": "w = 1\n",
+			},
+		]
+		proposal = make_block_proposal(operations, [["migrate"], ["restart"]])
+		frappe.response.docs = []
+		try:
+			frappe.desk.form.load.getdoc(PROPOSAL_DOCTYPE, proposal.name)
+			diff = frappe.response.docs[0].diff
+		finally:
+			frappe.response.docs = []
+		for name, segment in (
+			("edit", "--- a/myapp/myapp/a.py\n+++ b/myapp/myapp/a.py\n@@ -1 +1 @@\n-x = 1\n+x = 2\n"),
+			("create", "--- /dev/null\n+++ b/myapp/myapp/new/b.py\n@@ -0,0 +1 @@\n+y = 1\n"),
+			("delete", "--- a/myapp/myapp/c.py\n+++ /dev/null\n@@ -1 +0,0 @@\n-z = 1\n"),
+			("rename", "rename from myapp/myapp/d.py\nrename to myapp/myapp/e.py\n"),
+		):
+			with self.subTest(item=name):
+				self.assertIn(segment, diff)
+		fields = _fields_by_name()
+		self.assertEqual(fields["diff"]["fieldtype"], "Code")
+		self.assertFalse(fields["diff"].get("hidden"))
+		self.assertFalse(fields["diff"].get("depends_on"))
+		self.assertLess(FIELD_ORDER.index("section_diff"), FIELD_ORDER.index("diff"))
+		self.assertLess(FIELD_ORDER.index("diff"), FIELD_ORDER.index("section_content"))
+		# The form script never hides or trims the field.
+		self.assertNotIn('"diff"', self.source)
+		self.assertNotIn(".diff", self.source)

@@ -8,13 +8,28 @@ from dataclasses import dataclass
 import frappe
 
 from erp_ai.agent.tools import source
-from erp_ai.constants import COMMAND_TIMEOUT_S, JOB_SAFETY_MARGIN_S
+from erp_ai.constants import (
+	COMMAND_TIMEOUT_S,
+	JOB_SAFETY_MARGIN_S,
+	RESTART_LAUNCH_TIMEOUT_S,
+	RESTART_TIMEOUT_S,
+)
 
 ENV_ALLOWLIST = ("PATH", "HOME", "LANG", "LC_ALL", "USER")
 OUTPUT_MAX_LINES = source.READ_MAX_LINES
 OUTPUT_LINE_MAX_CHARS = 1000
 GIT_OUTPUT_MAX_LINES = 20
 NOT_FOUND_EXIT_CODE = 127
+RESTART_ARGV = (
+	source.SETSID_EXECUTABLE,
+	"-f",
+	source.TIMEOUT_EXECUTABLE,
+	"-s",
+	"KILL",
+	str(RESTART_TIMEOUT_S),
+	source.BENCH_EXECUTABLE,
+	"restart",
+)
 
 
 @dataclass(frozen=True)
@@ -66,6 +81,12 @@ def run_bench(args: list[str], limit_s: int) -> CommandResult:
 def _check_git_write_call(repo_root, rel, limit_s) -> None:
 	if not isinstance(repo_root, str) or not os.path.isabs(repo_root) or not os.path.isdir(repo_root):
 		raise ValueError(f"repo_root must be an existing absolute directory: {repo_root!r}")
+	_check_git_rel(rel)
+	if not isinstance(limit_s, int) or isinstance(limit_s, bool) or not 1 <= limit_s <= source.GIT_TIMEOUT_S:
+		raise ValueError(f"limit_s must be an integer from 1 to {source.GIT_TIMEOUT_S}: {limit_s!r}")
+
+
+def _check_git_rel(rel) -> None:
 	if (
 		not isinstance(rel, str)
 		or not rel
@@ -78,8 +99,15 @@ def _check_git_write_call(repo_root, rel, limit_s) -> None:
 		or source.GIT_GLOB_CHARS.search(rel)
 	):
 		raise ValueError(f"rel must be a plain relative file path inside the repo: {rel!r}")
-	if not isinstance(limit_s, int) or isinstance(limit_s, bool) or not 1 <= limit_s <= source.GIT_TIMEOUT_S:
-		raise ValueError(f"limit_s must be an integer from 1 to {source.GIT_TIMEOUT_S}: {limit_s!r}")
+
+
+def _check_commit_rels(rels) -> None:
+	if not isinstance(rels, tuple) or not rels:
+		raise ValueError(f"rels must be a non-empty tuple of paths: {rels!r}")
+	for rel in rels:
+		_check_git_rel(rel)
+	if len(set(rels)) != len(rels):
+		raise ValueError(f"rels must not repeat a path: {rels!r}")
 
 
 def _check_commit_message(subject, body) -> None:
@@ -89,10 +117,10 @@ def _check_commit_message(subject, body) -> None:
 		raise ValueError("body must be non-empty text without NUL")
 
 
-def _run_git_write(repo_root: str, rel: str, limit_s: int, subcommand_args: list[str]) -> CommandResult:
-	"""Run one git write subcommand on rel in repo_root with the bot identity (ADR-022 QĐ 2, 4, 5)."""
+def _run_git_write(repo_root: str, rels, limit_s: int, subcommand_args: list[str]) -> CommandResult:
+	"""Run one git write subcommand on the paths rels in repo_root with the bot identity (ADR-022 QĐ 2, 4, 5)."""
 	return _run_wrapped(
-		["git", *source.git_global_options(read=False), *subcommand_args, "--", rel],
+		["git", *source.git_global_options(read=False), *subcommand_args, "--", *rels],
 		cwd=repo_root,
 		env=source.git_env(identity=True),
 		limit_s=limit_s,
@@ -104,16 +132,19 @@ def _run_git_write(repo_root: str, rel: str, limit_s: int, subcommand_args: list
 def git_add_new(repo_root: str, rel_in_repo: str, limit_s: int) -> CommandResult:
 	"""`git add -- rel_in_repo`: stage a file the proposal created."""
 	_check_git_write_call(repo_root, rel_in_repo, limit_s)
-	return _run_git_write(repo_root, rel_in_repo, limit_s, ["add"])
+	return _run_git_write(repo_root, (rel_in_repo,), limit_s, ["add"])
 
 
-def git_commit_only(repo_root: str, rel_in_repo: str, subject: str, body: str, limit_s: int) -> CommandResult:
-	"""`git commit --only -- rel_in_repo`: one local commit holding just that path, never `-a`/`--amend`."""
-	_check_git_write_call(repo_root, rel_in_repo, limit_s)
+def git_commit_only(
+	repo_root: str, rels: tuple[str, ...], subject: str, body: str, limit_s: int
+) -> CommandResult:
+	"""`git commit --only -- *sorted(rels)`: one local commit holding just those paths, never `-a`/`--amend`."""
+	_check_commit_rels(rels)
+	_check_git_write_call(repo_root, rels[0], limit_s)
 	_check_commit_message(subject, body)
 	return _run_git_write(
 		repo_root,
-		rel_in_repo,
+		sorted(rels),
 		limit_s,
 		["commit", "--only", "--no-gpg-sign", "--quiet", "-m", subject, "-m", body],
 	)
@@ -122,7 +153,30 @@ def git_commit_only(repo_root: str, rel_in_repo: str, subject: str, body: str, l
 def git_unstage_new(repo_root: str, rel_in_repo: str, limit_s: int) -> CommandResult:
 	"""`git rm --cached -q -- rel_in_repo`: take a new file back out of the index after a failed commit."""
 	_check_git_write_call(repo_root, rel_in_repo, limit_s)
-	return _run_git_write(repo_root, rel_in_repo, limit_s, ["rm", "--cached", "-q"])
+	return _run_git_write(repo_root, (rel_in_repo,), limit_s, ["rm", "--cached", "-q"])
+
+
+def launch_restart() -> tuple[bool, str | None]:
+	"""Start `bench restart` detached in its own session and return at once (design 3.4, 4.4; ADR-040 QĐ 7).
+
+	Never raises: any error returns (False, <error class name>) and the caller logs it (STD-ERR-1).
+	"""
+	try:
+		done = subprocess.run(
+			RESTART_ARGV,
+			cwd=frappe.utils.get_bench_path(),
+			env=_minimal_env(),
+			stdin=subprocess.DEVNULL,
+			stdout=subprocess.DEVNULL,
+			stderr=subprocess.DEVNULL,
+			timeout=RESTART_LAUNCH_TIMEOUT_S,
+			start_new_session=True,
+		)
+	except Exception as error:
+		return False, type(error).__name__
+	if done.returncode != 0:
+		return False, subprocess.CalledProcessError.__name__
+	return True, None
 
 
 def _run_wrapped(command, *, cwd, env, limit_s, backstop_s, max_lines) -> CommandResult:

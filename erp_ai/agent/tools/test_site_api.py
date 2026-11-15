@@ -2111,6 +2111,12 @@ class TestExcludedTicketWrites(_ExcludedTicketCase):
 
 
 PERMISSION_REFUSAL = "DocType này không được phép dùng qua công cụ"
+# Written out by hand so a change of the constant's text fails here (C-6).
+PERMLEVEL_REFUSAL = "Property Setter đổi permlevel là sửa phân quyền, không làm qua công cụ"
+# Fields of Note that the Property Setters of these tests change; the stored setter and the new ones never share one.
+SETTER_FIELD = "content"
+STORED_SETTER_FIELD = "title"
+CUSTOM_FIELD_PREFIX = "siteapi_permlevel"
 
 
 class TestPermissionVectors(FrappeTestCase):
@@ -2120,22 +2126,53 @@ class TestPermissionVectors(FrappeTestCase):
 		commit_guard = patch.object(frappe.db, "commit", side_effect=AssertionError("commit in test"))
 		commit_guard.start()
 		self.addCleanup(commit_guard.stop)
+		# Runs after the rollback: Note's meta in Redis must not keep a Property Setter or Custom Field of the test.
+		self.addCleanup(frappe.clear_cache, doctype="Note")
 		self.addCleanup(frappe.db.rollback)
 		self.addCleanup(frappe.set_user, "Administrator")
 		frappe.set_user("Administrator")
 		keep_agent_settings(self)
 		_make_user(AGENT, ROLE_AGENT, "System Manager")
 		_make_user(BOSS, ROLE_INSTRUCTOR)
-		self.note = (
-			frappe.get_doc({"doctype": "Note", "title": f"{NOTE_TITLE} {uuid.uuid4().hex}"}).insert().name
-		)
+		# Public, so the agent account may share it (Note.has_permission).
+		note = {"doctype": "Note", "title": f"{NOTE_TITLE} {uuid.uuid4().hex}", "public": 1}
+		self.note = frappe.get_doc(note).insert().name
 		frappe.set_user(AGENT)
 
 	def run_tool(self, name, arguments, context=None):
 		return execute_tool(name, arguments, context or _context())
 
+	def setter_values(self, prop, value="1", property_type="Int"):
+		return {
+			"doctype_or_field": "DocField",
+			"doc_type": "Note",
+			"field_name": SETTER_FIELD,
+			"property": prop,
+			"value": value,
+			"property_type": property_type,
+		}
+
+	def setter_count(self):
+		return frappe.db.count("Property Setter", {"doc_type": "Note", "field_name": SETTER_FIELD})
+
+	def stored_permlevel_setter(self):
+		"""A Property Setter that already sets a permlevel, saved without hooks so no cache is touched."""
+		return _db_insert(
+			{
+				**self.setter_values("permlevel"),
+				"doctype": "Property Setter",
+				"name": f"{NOTE_TITLE} permlevel {uuid.uuid4().hex}",
+				"field_name": STORED_SETTER_FIELD,
+			}
+		)
+
+	def assert_refused(self, result, reason, doctype):
+		self.assertEqual(result, {"ok": False, "reason": reason, "doctype": doctype})
+
 	def vectors(self):
-		"""`{label: (tool, arguments, stored)}`: one write per vector; `stored()` reads the data it would change."""
+		"""`{label: (tool, arguments, stored, reason)}`: one write per vector; `stored()` reads the data it would
+		change, `reason` is the refusal expected."""
+		setter = self.stored_permlevel_setter()
 		return {
 			"User Permission": (
 				"api_create_record",
@@ -2144,6 +2181,7 @@ class TestPermissionVectors(FrappeTestCase):
 					"values": {"user": BOSS, "allow": "Role", "for_value": ALLOWED_ROLE},
 				},
 				lambda: frappe.db.count("User Permission", {"user": BOSS}),
+				PERMISSION_REFUSAL,
 			),
 			"DocShare": (
 				"api_create_record",
@@ -2152,16 +2190,19 @@ class TestPermissionVectors(FrappeTestCase):
 					"values": {"share_doctype": "Note", "share_name": self.note, "user": BOSS, "read": 1},
 				},
 				lambda: frappe.db.count("DocShare", {"share_doctype": "Note", "share_name": self.note}),
+				PERMISSION_REFUSAL,
 			),
 			"Custom DocPerm": (
 				"api_create_record",
 				{"doctype": "Custom DocPerm", "values": {"role": ALLOWED_ROLE, "read": 1, "write": 1}},
 				lambda: frappe.db.count("Custom DocPerm", {"role": ALLOWED_ROLE}),
+				PERMISSION_REFUSAL,
 			),
 			"Role": (
 				"api_update_record",
 				{"doctype": "Role", "name": ALLOWED_ROLE, "values": {"desk_access": 0}},
 				lambda: frappe.db.get_value("Role", ALLOWED_ROLE, "*", as_dict=True),
+				PERMISSION_REFUSAL,
 			),
 			"DocType": (
 				"api_update_record",
@@ -2173,6 +2214,19 @@ class TestPermissionVectors(FrappeTestCase):
 				lambda: frappe.get_all(
 					"DocPerm", {"parent": "Note"}, ["role", "permlevel", "read", "write"], order_by="idx asc"
 				),
+				PERMISSION_REFUSAL,
+			),
+			"Property Setter permlevel (create)": (
+				"api_create_record",
+				{"doctype": "Property Setter", "values": self.setter_values("permlevel")},
+				self.setter_count,
+				PERMLEVEL_REFUSAL,
+			),
+			"Property Setter permlevel (update value)": (
+				"api_update_record",
+				{"doctype": "Property Setter", "name": setter, "values": {"value": "0"}},
+				lambda: frappe.db.get_value("Property Setter", setter, "*", as_dict=True),
+				PERMLEVEL_REFUSAL,
 			),
 		}
 
@@ -2182,16 +2236,108 @@ class TestPermissionVectors(FrappeTestCase):
 			self.assertEqual(hard_bans.hard_ban_reason(doctype), "DocType phân quyền", doctype)
 
 	def test_six_vectors_refused_in_normal_mode(self):
-		for label, (tool, arguments, stored) in self.vectors().items():
+		for label, (tool, arguments, stored, reason) in self.vectors().items():
 			# developer_mode is on: a DocType save would export JSON into the frappe app, so that write is stubbed.
 			write = patch.object(site_api, "_write") if label == "DocType" else contextlib.nullcontext()
 			with self.subTest(label), write:
 				before = stored()
-				result = self.run_tool(tool, arguments)
-				self.assertEqual(
-					result, {"ok": False, "reason": PERMISSION_REFUSAL, "doctype": arguments["doctype"]}
-				)
+				self.assert_refused(self.run_tool(tool, arguments), reason, arguments["doctype"])
 				self.assertEqual(stored(), before)
+
+	def test_property_setter_casing_and_spaces(self):
+		for spelling in (" PermLevel ", "PERMLEVEL"):
+			with self.subTest(spelling):
+				before = self.setter_count()
+				values = self.setter_values(spelling)
+				result = self.run_tool("api_create_record", {"doctype": "Property Setter", "values": values})
+				self.assert_refused(result, PERMLEVEL_REFUSAL, "Property Setter")
+				self.assertEqual(self.setter_count(), before)
+		values = self.setter_values("label", "SITEAPI nhãn", "Data")
+		label = self.run_tool("api_create_record", {"doctype": "Property Setter", "values": values})
+		self.assertTrue(label["ok"], label)
+		self.assertEqual(frappe.db.get_value("Property Setter", label["name"], "property"), "label")
+
+	def test_vectors_allowed_when_unrestricted(self):
+		context = _context(level="L1", change_enabled=False, unrestricted=True)
+		vectors = self.vectors()
+		for label in ("User Permission", "DocShare", "Property Setter permlevel (create)"):
+			tool, arguments, stored, _reason = vectors[label]
+			with self.subTest(label):
+				before = stored()
+				result = self.run_tool(tool, arguments, context)
+				self.assertTrue(result["ok"], result)
+				self.assertEqual(stored(), before + 1)
+		tool, arguments, _stored, _reason = vectors["Property Setter permlevel (update value)"]
+		result = self.run_tool(tool, arguments, context)
+		self.assertTrue(result["ok"], result)
+		self.assertEqual(frappe.db.get_value("Property Setter", arguments["name"], "value"), "0")
+
+	def custom_field(self, permlevel, suffix):
+		return {
+			"dt": "Note",
+			"fieldname": f"{CUSTOM_FIELD_PREFIX}_{suffix}",
+			"label": f"SITEAPI permlevel {suffix}",
+			"fieldtype": "Data",
+			"insert_after": "title",
+			"permlevel": permlevel,
+		}
+
+	def custom_field_count(self, suffix):
+		return frappe.db.count("Custom Field", {"dt": "Note", "fieldname": f"{CUSTOM_FIELD_PREFIX}_{suffix}"})
+
+	def test_custom_field_permlevel_refused(self):
+		field = frappe.db.get_value(
+			"Custom Field",
+			{"dt": "HD Ticket", "fieldname": "ai_confidence_pct"},
+			["name", "permlevel"],
+			as_dict=True,
+		)
+		self.assertEqual(field.permlevel, 8)
+		# A saved Custom Field runs ALTER TABLE, which commits the transaction: the schema sync is stubbed.
+		with patch.object(frappe.db, "updatedb") as updatedb:
+			with self.subTest("create permlevel 1"):
+				values = self.custom_field(1, "one")
+				result = self.run_tool("api_create_record", {"doctype": "Custom Field", "values": values})
+				self.assert_refused(result, PERMLEVEL_REFUSAL, "Custom Field")
+				self.assertEqual(self.custom_field_count("one"), 0)
+			with self.subTest("update ai_* field 8 -> 0"):
+				arguments = {"doctype": "Custom Field", "name": field.name, "values": {"permlevel": 0}}
+				self.assert_refused(
+					self.run_tool("api_update_record", arguments), PERMLEVEL_REFUSAL, "Custom Field"
+				)
+				self.assertEqual(frappe.db.get_value("Custom Field", field.name, "permlevel"), 8)
+			updatedb.assert_not_called()
+			with self.subTest("create permlevel 0"):
+				values = self.custom_field(0, "zero")
+				result = self.run_tool("api_create_record", {"doctype": "Custom Field", "values": values})
+				self.assertTrue(result["ok"], result)
+				self.assertEqual(self.custom_field_count("zero"), 1)
+			with self.subTest("unrestricted"):
+				context = _context(unrestricted=True)
+				values = self.custom_field(1, "unrestricted")
+				result = self.run_tool(
+					"api_create_record", {"doctype": "Custom Field", "values": values}, context
+				)
+				self.assertTrue(result["ok"], result)
+				self.assertEqual(frappe.db.get_value("Custom Field", result["name"], "permlevel"), 1, result)
+
+	def test_permlevel_refusal_compares_with_the_stored_record(self):
+		field = frappe.db.get_value("Custom Field", {"dt": "HD Ticket", "fieldname": "ai_confidence_pct"})
+		setter = self.stored_permlevel_setter()
+		self.assertEqual(site_api.PERMLEVEL_DOCTYPES, ("Property Setter", "Custom Field"))
+		self.assertEqual(site_api.PERMLEVEL_REASON, PERMLEVEL_REFUSAL)
+		for doctype, values, name, reason in (
+			("Custom Field", {"permlevel": 8}, field, None),
+			("Custom Field", {"permlevel": "0"}, field, PERMLEVEL_REFUSAL),
+			("Custom Field", {"label": "x"}, field, None),
+			("Custom Field", {"permlevel": 0}, None, None),
+			("custom field", {" PermLevel ": 2}, None, PERMLEVEL_REFUSAL),
+			("Property Setter", {"value": "0"}, setter, PERMLEVEL_REFUSAL),
+			("Property Setter", {"property": "label"}, None, None),
+			("Note", {"permlevel": 1}, None, None),
+		):
+			with self.subTest(doctype=doctype, values=values, name=name):
+				self.assertEqual(site_api.permlevel_refusal(doctype, values, name=name), reason)
 
 	def test_business_role_assignment_still_works(self):
 		# Role assignment stays a right of the record tools switch: only the six admin roles are refused.

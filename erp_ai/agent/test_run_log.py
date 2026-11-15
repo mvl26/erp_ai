@@ -579,3 +579,84 @@ class TestActionEntry(FrappeTestCase):
 					run_log.action_entry(
 						arguments.pop("tool"), "ToDo", "ERPAI-TEST-todo", arguments.pop("ok"), **arguments
 					)
+
+
+BOT_ACTION_ENTRY = {
+	"tool": "permission_switch",
+	"doctype": "ERP AI Setting",
+	"name": "ERP AI Setting",
+	"ok": True,
+	"value_before": {"a": 0},
+	"value_after": {"a": 1},
+	"instructor": "Administrator",
+}
+
+
+class _RollbackCase(FrappeTestCase):
+	def setUp(self):
+		commit_guard = patch.object(frappe.db, "commit", side_effect=AssertionError("test must not commit"))
+		commit_guard.start()
+		self.addCleanup(commit_guard.stop)
+		self.addCleanup(frappe.db.rollback)
+		self.addCleanup(frappe.set_user, "Administrator")
+		frappe.set_user("Administrator")
+
+
+class TestWriteEntry(_RollbackCase):
+	def test_every_row_gets_site_environment(self):
+		for entry_type, trigger in (("reason", "comment_mention"), ("skip", "ticket_insert")):
+			with (
+				self.subTest(entry_type=entry_type),
+				patch("erp_ai.agent.policy.site_environment", return_value="test"),
+			):
+				name = run_log.write_entry(run_id="ERPAI-TEST-env", entry_type=entry_type, trigger=trigger)
+				self.assertEqual(frappe.db.get_value(LOG_DOCTYPE, name, "site_environment"), "test")
+		with patch("erp_ai.agent.policy.site_environment", return_value="test"):
+			name = run_log.write_entry(
+				run_id="ERPAI-TEST-env",
+				entry_type="reason",
+				trigger="comment_mention",
+				site_environment="production",
+			)
+		self.assertEqual(frappe.db.get_value(LOG_DOCTYPE, name, "site_environment"), "production")
+
+
+class TestBotAction(_RollbackCase):
+	def _write(self, **fields):
+		values = {
+			"run_id": "ERPAI-TEST-bot",
+			"entry_type": "bot_action",
+			"trigger": "setting_save",
+			"actions": [BOT_ACTION_ENTRY],
+			**fields,
+		}
+		return run_log.write_entry(**values)
+
+	def test_bot_action_needs_known_trigger_actions_and_zero_cost(self):
+		self.assertEqual(run_log.ENTRY_TYPE_BOT_ACTION, "bot_action")
+		self.assertEqual(run_log.ENTRY_TYPES, ("classify", "reason", "skip", "change", "bot_action"))
+		self.assertEqual(run_log.TRIGGER_SETTING_SAVE, "setting_save")
+		self.assertEqual(run_log.TRIGGER_SCHEDULED_JOB, "scheduled_job")
+		self.assertEqual(run_log.BOT_ACTION_TRIGGERS, ("setting_save", "scheduled_job"))
+		self.assertEqual(run_log.TOOL_PERMISSION_SWITCH, "permission_switch")
+		bad = {
+			"trigger ticket_insert": {"trigger": "ticket_insert"},
+			"trigger change_action": {"trigger": "change_action"},
+			"trigger missing": {"trigger": None},
+			"actions missing": {"actions": None},
+			"actions empty": {"actions": []},
+			"actions not a list": {"actions": "x"},
+			"cost not zero": {"cost_usd": 0.5},
+		}
+		before = frappe.db.count(LOG_DOCTYPE)
+		for case, change in bad.items():
+			with self.subTest(case=case), self.assertRaises(ValueError):
+				self._write(**change)
+		self.assertEqual(frappe.db.count(LOG_DOCTYPE), before)
+		for trigger in run_log.BOT_ACTION_TRIGGERS:
+			with self.subTest(trigger=trigger):
+				name = self._write(trigger=trigger)
+				self.assertEqual(frappe.db.get_value(LOG_DOCTYPE, name, "cost_usd"), 0)
+		self.assertEqual(frappe.db.count(LOG_DOCTYPE), before + 2)
+		with self.assertRaises(ValueError):
+			self._write(entry_type="classify", trigger="setting_save")

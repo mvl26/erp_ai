@@ -1793,7 +1793,7 @@ TODO_DOCTYPE = "ToDo"
 DOC_CREATE_CALLS = ("get_doc", "new_doc")
 SHARE_BYPASS_NAMES = ("ignore_share_permission", "add_docshare")
 SHARE_BYPASS_SUFFIXES = ("assign_to._add", "frappe.share.add")
-ENTRY_TYPES_EXPECTED = ("classify", "reason", "skip", "change")
+ENTRY_TYPES_EXPECTED = ("classify", "reason", "skip", "change", "bot_action")
 
 # `_assign` is the denormalised JSON column of HD Ticket. Routing must read ToDo through site_facts instead.
 # authority.py (FEAT-002, "who may instruct the bot") predates routing and is the one reader allowed.
@@ -2033,7 +2033,7 @@ def check_no_default_people_in_agent_python(sources: dict) -> list:
 
 
 def check_entry_types_unchanged(sources: dict) -> list:
-	"""ADR-019 QĐ 7 + ADR-012 QĐ 6: the log keeps its four entry types, in the code and in the DocType options."""
+	"""ADR-019 QĐ 7 + ADR-012 QĐ 6 + FEAT-007 U3: the log keeps its five entry types, in the code and in the DocType options."""
 	run_log, doctype = sources.get(RUN_LOG_FILE), sources.get(LOG_DOCTYPE_FILE)
 	if run_log is None:
 		return _missing(RUN_LOG_FILE)
@@ -2059,6 +2059,32 @@ def check_entry_types_unchanged(sources: dict) -> list:
 	if options != ["\n".join(ENTRY_TYPES_EXPECTED)]:
 		violations.append(f"{LOG_DOCTYPE_FILE}: entry_type options are {options!r}")
 	return violations
+
+
+def check_log_trigger_options_match_run_log(sources: dict, expected: list) -> list:
+	"""FEAT-007 U3 F-5: the `trigger` options of ERP AI Log are the run_log trigger constants, in order."""
+	doctype = sources.get(LOG_DOCTYPE_FILE)
+	if doctype is None:
+		return _missing(LOG_DOCTYPE_FILE)
+	options = [
+		field.get("options") for field in json.loads(doctype)["fields"] if field.get("fieldname") == "trigger"
+	]
+	if options != ["\n".join(expected)]:
+		return [f"{LOG_DOCTYPE_FILE}: trigger options are {options!r}, run_log has {expected!r}"]
+	return []
+
+
+def check_policy_does_not_import_run_log(sources: dict) -> list:
+	"""FEAT-007 U3 3.1: policy.py never imports run_log (run_log reads policy.site_environment; no cycle)."""
+	source = sources.get(POLICY_FILE)
+	if source is None:
+		return _missing(POLICY_FILE)
+	module = "erp_ai." + POLICY_FILE[: -len(".py")].replace("/", ".")
+	return [
+		f"{POLICY_FILE}:{lineno}: imports {name}"
+		for lineno, name in imported_modules(parse(POLICY_FILE, source), module, False)
+		if name == "erp_ai.agent.run_log"
+	]
 
 
 # ---------------------------------------------------------------------------------------------------
@@ -5456,6 +5482,20 @@ class TestArchitecture(unittest.TestCase):
 		self.assertIn(LOG_DOCTYPE_FILE, scanned)
 		self.assertEqual(check_entry_types_unchanged(scanned), [])
 
+	def test_log_trigger_options_match_run_log(self):
+		from erp_ai.agent import run_log
+
+		scanned = load_product_sources(suffixes=(".py", ".json"))
+		expected = [*run_log.TRIGGERS, *run_log.CHANGE_TRIGGERS, *run_log.BOT_ACTION_TRIGGERS]
+		self.assertEqual(check_log_trigger_options_match_run_log(scanned, expected), [])
+		self.assertTrue(check_log_trigger_options_match_run_log(scanned, expected[:-1]))
+
+	def test_policy_does_not_import_run_log(self):
+		scanned = load_product_sources(suffixes=(".py", ".json"))
+		self.assertEqual(check_policy_does_not_import_run_log(scanned), [])
+		bad = {POLICY_FILE: "from erp_ai.agent import run_log\n"}
+		self.assertTrue(check_policy_does_not_import_run_log(bad))
+
 	def test_assign_field_not_used_for_decision(self):
 		self.assertEqual(
 			(ASSIGN_FIELD_ALLOWED_FILE, ASSIGN_FIELD_ALLOWED_FUNCTION), (AUTHORITY_FILE, "_assigned_by_other")
@@ -7776,22 +7816,32 @@ class TestScannersCatchViolations(unittest.TestCase):
 		)
 
 	def test_entry_types_scanner_catches_new_type_in_code_or_doctype(self):
-		run_log = 'ENTRY_TYPES = ("classify", "reason", "skip", "change")\n'
+		run_log = 'ENTRY_TYPES = ("classify", "reason", "skip", "change", "bot_action")\n'
 		doctype = json.dumps(
-			{"fields": [{"fieldname": "entry_type", "options": "classify\nreason\nskip\nchange"}]}
+			{"fields": [{"fieldname": "entry_type", "options": "classify\nreason\nskip\nchange\nbot_action"}]}
 		)
 		good = {RUN_LOG_FILE: run_log, LOG_DOCTYPE_FILE: doctype}
 		self.assertEqual(check_entry_types_unchanged(good), [])
-		extra = {**good, RUN_LOG_FILE: 'ENTRY_TYPES = ("classify", "reason", "skip", "change", "route")\n'}
+		extra = {
+			**good,
+			RUN_LOG_FILE: 'ENTRY_TYPES = ("classify", "reason", "skip", "change", "bot_action", "route")\n',
+		}
 		self.assertCaught(check_entry_types_unchanged(extra), "ENTRY_TYPES")
-		without_change = {**good, RUN_LOG_FILE: 'ENTRY_TYPES = ("classify", "reason", "skip")\n'}
+		without_change = {**good, RUN_LOG_FILE: 'ENTRY_TYPES = ("classify", "reason", "skip", "change")\n'}
 		self.assertCaught(check_entry_types_unchanged(without_change), "ENTRY_TYPES")
 		options = json.dumps(
-			{"fields": [{"fieldname": "entry_type", "options": "classify\nreason\nskip\nchange\nroute"}]}
+			{
+				"fields": [
+					{
+						"fieldname": "entry_type",
+						"options": "classify\nreason\nskip\nchange\nbot_action\nroute",
+					}
+				]
+			}
 		)
 		self.assertCaught(check_entry_types_unchanged({**good, LOG_DOCTYPE_FILE: options}), "options")
 		old_options = json.dumps(
-			{"fields": [{"fieldname": "entry_type", "options": "classify\nreason\nskip"}]}
+			{"fields": [{"fieldname": "entry_type", "options": "classify\nreason\nskip\nchange"}]}
 		)
 		self.assertCaught(check_entry_types_unchanged({**good, LOG_DOCTYPE_FILE: old_options}), "options")
 		computed = {**good, RUN_LOG_FILE: "ENTRY_TYPES = tuple(x)\n"}

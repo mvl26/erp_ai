@@ -1,4 +1,7 @@
 import hashlib
+import json
+import os
+import subprocess
 from unittest.mock import patch
 
 import frappe
@@ -6,22 +9,32 @@ from frappe.tests.utils import FrappeTestCase
 from helpdesk.test_utils import create_agent, make_ticket
 
 from erp_ai.agent import authority, queue
-from erp_ai.agent.changes import apply_job
+from erp_ai.agent.changes import apply_job, transitions
+from erp_ai.agent.tools import change_guard
 from erp_ai.agent.tools.registry import ToolContext, execute_tool
 from erp_ai.constants import (
 	AGENT_USER,
 	CHANGE_KIND_CODE,
+	CHANGE_OP_CREATE,
+	CHANGE_OP_EDIT,
 	CHANGE_STATUS_APPLIED,
 	CHANGE_STATUS_APPROVED,
+	CHANGE_STATUS_FAILED,
 	CHANGE_STATUS_PENDING,
 	PROPOSAL_DOCTYPE,
 	ROLE_INSTRUCTOR,
 )
 from erp_ai.erp_ai_agent.doctype.erp_ai_change_proposal import erp_ai_change_proposal as controller
-from erp_ai.test_utils import GitSandbox, pin_agent_roles, set_agent_settings
+from erp_ai.test_utils import (
+	GitSandbox,
+	make_block_proposal,
+	make_change_proposal,
+	pin_agent_roles,
+	set_agent_settings,
+)
 
 APP = "custom_app"
-REL = "pkg/mod.py"
+REL = "pkg/mod.txt"
 FILE_PATH = f"{APP}/{REL}"
 BEFORE = "x = 1\n# Tiếng Việt\ny = 1\n"
 AFTER = "x = 2\n# Tiếng Việt\ny = 1\n"
@@ -127,3 +140,253 @@ class TestWalkingSkeleton(FrappeTestCase):
 		self.assertEqual(self.git("rev-parse", "HEAD~1"), head_before)
 		self.assertEqual(self.git("diff-tree", "--no-commit-id", "--name-only", "-r", "HEAD"), REL)
 		self.assertEqual(self.git("status", "--porcelain"), "")
+
+
+# Text files that need no restart (design 3.2 step 4), so a block of them passes the guard without commands.
+TEXT_RELS = ("docs/a.txt", "docs/b.txt", "docs/c.txt")
+TEXT_BEFORE = "dòng một\n"
+TEXT_AFTER = "dòng hai\n"
+LEGACY_REL = "pkg/legacy.py"
+
+
+class BlockApplyTestCase(FrappeTestCase):
+	"""A sandbox app with three committed text files and one `.py`, an approver, and the change switch on."""
+
+	def setUp(self):
+		self.addCleanup(frappe.db.rollback)
+		pin_agent_roles(self)
+		commit = patch.object(frappe.db, "commit")
+		commit.start()
+		self.addCleanup(commit.stop)
+		log_error = patch.object(frappe, "log_error")
+		log_error.start()
+		self.addCleanup(log_error.stop)
+		self.addCleanup(frappe.set_user, "Administrator")
+		frappe.set_user("Administrator")
+		create_agent(ACTOR)
+		frappe.get_doc("User", ACTOR).add_roles(ROLE_INSTRUCTOR)
+		self.sandbox = GitSandbox(self)
+		for rel in TEXT_RELS:
+			self.sandbox.commit_file(APP, rel, TEXT_BEFORE)
+		self.sandbox.commit_file(APP, LEGACY_REL, BEFORE)
+		set_agent_settings(code_change_enabled=1, code_change_apps=APP)
+		frappe.set_user(ACTOR)
+
+	def git(self, *args):
+		return self.sandbox.git(APP, *args).strip()
+
+	def snapshot(self):
+		"""Every file's bytes, HEAD, the commit count and the porcelain status: what "0 written" compares."""
+		files = {}
+		for rel in (*TEXT_RELS, LEGACY_REL):
+			with open(os.path.join(self.sandbox.repo(APP), rel), "rb") as handle:
+				files[rel] = handle.read()
+		return (
+			files,
+			self.git("rev-parse", "HEAD"),
+			self.git("rev-list", "--count", "HEAD"),
+			self.git("status", "--porcelain"),
+		)
+
+	def edits(self, count=3, overrides=None):
+		"""`count` `edit` items over `TEXT_RELS`; `overrides` maps an item index to the fields it replaces."""
+		items = []
+		for index, rel in enumerate(TEXT_RELS[:count]):
+			item = {
+				"kind": CHANGE_OP_EDIT,
+				"path": f"{APP}/{rel}",
+				"before": TEXT_BEFORE,
+				"after": TEXT_AFTER,
+			}
+			item.update((overrides or {}).get(index, {}))
+			items.append(item)
+		return items
+
+	def block(self, operations, commands=(), **fields):
+		return make_block_proposal(operations, list(commands), **fields).name
+
+	def approve(self, name):
+		transitions.approve(name, ACTOR)
+		return name
+
+	def refresh_digest(self, name):
+		digest = transitions.content_digest(frappe.get_doc(PROPOSAL_DOCTYPE, name))
+		frappe.db.set_value(PROPOSAL_DOCTYPE, name, "approved_digest", digest, update_modified=False)
+
+	def run_apply(self, name):
+		with patch("subprocess.run", wraps=subprocess.run) as run:
+			apply_job.run_change(name, "apply")
+		return run
+
+	def assert_failed_untouched(self, name, reason, before, status=CHANGE_STATUS_FAILED):
+		state = frappe.db.get_value(
+			PROPOSAL_DOCTYPE, name, ["change_status", "failure_reason", "apply_commit_sha"], as_dict=True
+		)
+		self.assertEqual(
+			(state.change_status, state.failure_reason, state.apply_commit_sha), (status, reason, None)
+		)
+		self.assertEqual(self.snapshot(), before)
+
+
+class TestBlockAllOrNothing(BlockApplyTestCase):
+	"""Design 4.2 steps 1 to 3: the guard runs again at apply time; a refusal writes 0 bytes and makes 0 commits."""
+
+	def test_guard_fails_at_apply_error_names_item(self):
+		# A refusal at item 1, 2 or 3 names that item: the target became a symlink after approval.
+		for index in range(3):
+			with self.subTest(item=index + 1):
+				name = self.approve(self.block(self.edits()))
+				full = os.path.join(self.sandbox.repo(APP), TEXT_RELS[index])
+				os.rename(full, f"{full}.real")
+				os.symlink(f"{full}.real", full)
+				before = self.snapshot()
+
+				self.run_apply(name)
+
+				self.assert_failed_untouched(
+					name,
+					f"mục {index + 1} ({APP}/{TEXT_RELS[index]}): {change_guard.PATH_SYMLINK}",
+					before,
+				)
+				os.remove(full)
+				os.replace(f"{full}.real", full)
+
+	def test_app_removed_from_list_error(self):
+		name = self.approve(self.block(self.edits()))
+		set_agent_settings(code_change_apps="helpdesk")
+		before = self.snapshot()
+
+		self.run_apply(name)
+
+		self.assert_failed_untouched(
+			name, f"mục 1 ({APP}/{TEXT_RELS[0]}): {change_guard.APP_NOT_ALLOWED}", before
+		)
+
+	def test_syntax_broken_at_apply_error(self):
+		# Stored straight into the database (the tool would refuse it), hashes matching, approved.
+		operations = [
+			*self.edits(count=1),
+			{"kind": CHANGE_OP_CREATE, "path": f"{APP}/docs/new.json", "after": '{"a": }\n'},
+		]
+		name = self.approve(self.block(operations))
+		before = self.snapshot()
+
+		self.run_apply(name)
+
+		self.assert_failed_untouched(
+			name, f"mục 2 ({APP}/docs/new.json): {change_guard.JSON_SYNTAX.format(n=1)}", before
+		)
+		self.assertFalse(os.path.lexists(os.path.join(self.sandbox.repo(APP), "docs/new.json")))
+
+
+class TestApplyBlock(BlockApplyTestCase):
+	"""Design 4.2 steps 2 to 3 on the stored commands and rows of an approved block."""
+
+	def test_stored_command_edited_to_denied_blocked_at_apply(self):
+		site = frappe.local.site
+		denied = ["--site", site, "execute", "frappe.db.truncate"]
+		cases = (
+			("denied command", [denied], f"lệnh 1: {change_guard.CMD_NOT_LISTED}"),
+			(
+				"denied second command",
+				[["--site", site, "migrate"], denied],
+				f"lệnh 2: {change_guard.CMD_NOT_LISTED}",
+			),
+			("empty argv", [[]], "lệnh 1: " + change_guard.check_bench_args([], (APP,), site)),
+		)
+		for label, commands, reason in cases:
+			with self.subTest(label):
+				name = self.approve(self.block(self.edits(count=1), [["--site", site, "migrate"]]))
+				frappe.db.set_value(
+					PROPOSAL_DOCTYPE, name, "command_list", json.dumps(commands), update_modified=False
+				)
+				self.refresh_digest(name)
+				before = self.snapshot()
+
+				run = self.run_apply(name)
+
+				run.assert_not_called()
+				self.assert_failed_untouched(name, reason, before)
+
+	def test_stored_hash_mismatch_refused(self):
+		# Edited before approval, so the approved digest covers it and only the stored-hash row catches it.
+		cases = (
+			("after_hash item 1", 0, {"after_hash": _sha("autre\n")}),
+			("base_hash item 2", 1, {"base_hash": _sha("autre\n")}),
+			("after_hash item 3", 2, {"after_hash": _sha("autre\n")}),
+		)
+		for label, index, override in cases:
+			with self.subTest(label):
+				name = self.approve(self.block(self.edits(overrides={index: override})))
+				before = self.snapshot()
+
+				self.run_apply(name)
+
+				self.assert_failed_untouched(name, apply_job.STORED_HASH_MISMATCH, before)
+
+	def test_commit_message_preview_edited_refused(self):
+		name = self.block(self.edits())
+		frappe.db.set_value(PROPOSAL_DOCTYPE, name, "commit_message", "erp_ai: khác", update_modified=False)
+		self.approve(name)
+		before = self.snapshot()
+
+		self.run_apply(name)
+
+		self.assert_failed_untouched(name, apply_job.DIGEST_CHANGED, before)
+
+
+class TestLegacyThroughAdapter(BlockApplyTestCase):
+	"""Design 2.3 and 4.2 step 2: a proposal of the old shape goes through the adapter and `legacy=True`."""
+
+	def legacy(self, **fields):
+		values = {
+			"app": APP,
+			"file_path": f"{APP}/{LEGACY_REL}",
+			"content_before": BEFORE,
+			"content_after": AFTER,
+			"base_hash": _sha(BEFORE),
+			"after_hash": _sha(AFTER),
+			"target_branch": "main",
+			"upstream_ref": "",
+			**fields,
+		}
+		return make_change_proposal(CHANGE_KIND_CODE, **values).name
+
+	def test_legacy_approved_proposal_applies(self):
+		name = self.approve(self.legacy())
+		head = self.git("rev-parse", "HEAD")
+
+		with (
+			patch.object(apply_job.block, "operations_of", wraps=apply_job.block.operations_of) as adapter,
+			patch.object(change_guard, "check_block", wraps=change_guard.check_block) as guard,
+		):
+			self.run_apply(name)
+
+		state = frappe.db.get_value(
+			PROPOSAL_DOCTYPE, name, ["change_status", "failure_reason", "apply_commit_sha"], as_dict=True
+		)
+		self.assertEqual((state.change_status, state.failure_reason), (CHANGE_STATUS_APPLIED, None))
+		self.assertTrue(adapter.called)
+		guard.assert_called_once()
+		self.assertEqual(guard.call_args.kwargs["legacy"], True)
+		self.assertEqual(guard.call_args.kwargs["at_apply"], True)
+		with open(os.path.join(self.sandbox.repo(APP), LEGACY_REL), "rb") as handle:
+			self.assertEqual(handle.read(), AFTER.encode("utf-8"))
+		self.assertEqual(self.git("rev-parse", "HEAD"), state.apply_commit_sha)
+		self.assertEqual(self.git("rev-parse", "HEAD~1"), head)
+		self.assertEqual(self.git("diff-tree", "--no-commit-id", "--name-only", "-r", "HEAD"), LEGACY_REL)
+		self.assertEqual(self.git("status", "--porcelain"), "")
+
+	def test_legacy_edit_empty_path_refused_at_apply_zero_writes(self):
+		name = self.legacy()
+		frappe.db.set_value(PROPOSAL_DOCTYPE, name, "file_path", "", update_modified=False)
+		self.approve(name)
+		before = self.snapshot()
+
+		self.run_apply(name)
+
+		self.assert_failed_untouched(
+			name,
+			"mục 1 (): " + change_guard.OP_FIELDS.format(action=change_guard.OP_ACTIONS[CHANGE_OP_EDIT]),
+			before,
+		)

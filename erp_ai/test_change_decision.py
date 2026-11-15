@@ -437,7 +437,7 @@ class TestChangeDecision(FrappeTestCase):
 				app_removed,
 				CHANGE_STATUS_FAILED,
 				"fail",
-				"app không có trong danh sách được sửa",
+				"mục 1 (custom_app/pkg/mod.py): app không có trong danh sách được sửa",
 			),
 		}
 		for case, (change, status, step, reason) in cases.items():

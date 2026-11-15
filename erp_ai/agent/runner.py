@@ -1,3 +1,4 @@
+import dataclasses
 import json
 import time
 import uuid
@@ -156,7 +157,10 @@ def _run(ticket_name, trigger, comment_name=None):
 		_log_skip(ticket_name, trigger, run_id, "daily_limit")
 		return
 	# (e)
-	level = policy.effective_level(settings, over_budget=policy.is_over_budget(settings))
+	over_budget = policy.is_over_budget(settings)
+	level = policy.effective_level(settings, over_budget=over_budget)
+	switches = policy.permission_switches(settings)
+	threshold = policy.confidence_threshold(settings)
 	auto_assign = policy.auto_assign_enabled(settings)
 	deadline = time.monotonic() + JOB_TIMEOUT_S - JOB_SAFETY_MARGIN_S
 
@@ -174,23 +178,43 @@ def _run(ticket_name, trigger, comment_name=None):
 		# One context for the whole run (classification and reasoning); never built at L0, which calls no tool.
 		context = None
 		if level != LEVELS[0]:
-			change = policy.change_settings(settings)
+			instructor = authority.run_instructor(ticket_name, trigger, comment_name)
+			# An insert run has no classification yet: `_classify` recomputes both from its own (U1.md:261).
+			category, pct = (None, None)
+			if trigger != TRIGGER_TICKET_INSERT:
+				category, pct = policy.latest_classification(ticket_name)
 			context = ToolContext(
 				ticket_name=ticket_name,
 				effective_level=level,
-				instructor=authority.latest_instructor(ticket_name),
+				instructor=instructor,
 				run_id=run_id,
 				category_mapping=mapping,
 				agent_user=AGENT_USER,
 				routing_config=routing,
-				change_enabled=change.enabled,
-				allowed_apps=change.allowed_apps,
-				unrestricted=policy.unrestricted_enabled(settings),
+				change_enabled=switches.code_change,
+				allowed_apps=policy.change_settings(settings).allowed_apps,
+				unrestricted=switches.unrestricted,
+				record_tools=switches.record_tools,
+				act_now=switches.act_now,
+				one_click_approval=switches.one_click_approval,
+				over_budget=over_budget,
+				main_path_level=policy.main_path_level(settings, level, category),
+				below_threshold=_below_threshold(pct, threshold, instructor, switches.act_now),
 			)
 		classification = None
 		if trigger == TRIGGER_TICKET_INSERT:
-			proceed, classification = _classify(
-				ticket_name, trigger, run_id, mapping, routing, context, auto_assign, deadline, status
+			proceed, classification, context = _classify(
+				ticket_name,
+				trigger,
+				run_id,
+				mapping,
+				routing,
+				context,
+				auto_assign,
+				deadline,
+				status,
+				settings,
+				threshold,
 			)
 			if not proceed:
 				return
@@ -198,6 +222,11 @@ def _run(ticket_name, trigger, comment_name=None):
 			_reason(ticket_name, trigger, run_id, settings, context, classification, deadline, status, delay)
 	finally:
 		_end_status(status, delay, ticket_name, run_id, trigger)
+
+
+def _below_threshold(pct, threshold, instructor, act_now):
+	"""The run's one below-threshold predicate (ADR-030 QD 4), for both kinds of run."""
+	return policy.is_below_confidence(pct, threshold, has_instructor=bool(instructor), act_now=act_now)
 
 
 def _end_status(status, delay, ticket_name, run_id, trigger):
@@ -255,11 +284,25 @@ def _call_fields(result):
 	}
 
 
-def _classify(ticket_name, trigger, run_id, mapping, routing, context, auto_assign, deadline, status):
-	"""Classification step (design 4.3 step 6). Writes one `classify` entry; with a context (L1+) also applies it.
+def _classify(
+	ticket_name,
+	trigger,
+	run_id,
+	mapping,
+	routing,
+	context,
+	auto_assign,
+	deadline,
+	status,
+	settings,
+	threshold,
+):
+	"""Classification step (design 4.3 step 6). Writes one `classify` entry; with a context (L1+) recomputes its
+	main-path level and below-threshold flag from the classification, then routes only at the threshold or above.
 
-	Returns `(proceed, classification)`: `proceed` is False when the run must end here (gateway error);
-	`classification` is the summary handed to the reasoning step, or None when nothing was classified.
+	Returns `(proceed, classification, context)`: `proceed` is False when the run must end here (gateway error);
+	`classification` is the summary handed to the reasoning step, or None when nothing was classified;
+	`context` is the one the reasoning step uses (recomputed when a classification was parsed).
 	"""
 	subject, description = frappe.db.get_value("HD Ticket", ticket_name, ["subject", "description"])
 	base = {"ticket": ticket_name, "run_id": run_id, "entry_type": "classify", "trigger": trigger, "turn": 0}
@@ -279,14 +322,14 @@ def _classify(ticket_name, trigger, run_id, mapping, routing, context, auto_assi
 			credential_label=exc.credential_label,
 			keys_tried=exc.keys_tried,
 		)
-		return False, None
+		return False, None, context
 
 	call_fields = _call_fields(result)
 	classification = parse_classification(result.text)
 	if classification is None:
 		error = "; ".join([UNPARSEABLE_ERROR, *status.take_errors()])
 		write_entry(**base, **call_fields, error=error, stop_reason="unparseable")
-		return True, None
+		return True, None, context
 
 	decision = decide_route(
 		classification,
@@ -317,6 +360,7 @@ def _classify(ticket_name, trigger, run_id, mapping, routing, context, auto_assi
 		or None,
 		predicted_category=classification.category,
 		predicted_confidence=classification.confidence,
+		predicted_confidence_pct=classification.confidence_pct,
 		predicted_ticket_type=values["ticket_type"],
 		predicted_agent_group=values["agent_group"],
 		predicted_priority=values["priority"],
@@ -327,10 +371,20 @@ def _classify(ticket_name, trigger, run_id, mapping, routing, context, auto_assi
 		applied=0,
 	)
 	if context is not None:
-		status.working("set_classification")
-		_route(log_name, classification, decision, context, auto_assign, subject)
+		context = dataclasses.replace(
+			context,
+			main_path_level=policy.main_path_level(
+				settings, context.effective_level, classification.category
+			),
+			below_threshold=_below_threshold(
+				classification.confidence_pct, threshold, context.instructor, context.act_now
+			),
+		)
+		if not context.below_threshold:
+			status.working("set_classification")
+			_route(log_name, classification, decision, context, auto_assign, subject)
 	summary = {"category": classification.category, "confidence": classification.confidence, **values}
-	return True, summary
+	return True, summary, context
 
 
 def _route(log_name, classification, decision, context, auto_assign, subject):

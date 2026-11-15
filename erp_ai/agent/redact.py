@@ -1,8 +1,9 @@
 """Secret masking shared by logs, tool results, Error Log reads and emails (NFR-6, ADR-034 QĐ 2).
 
 Rules N-1..N-7, K-1..K-8, R-1..R-5 of `design-w0-fixes-3.md` section 3, with K-4, K-4a and K-8 as
-amended by `design-w0-fixes-4.md` point 3. One word list (`SECRET_WORDS`)
-drives both `is_secret_key` and the key-value scan of `redact_secrets`. Output is always NFC (3a).
+amended by `design-w0-fixes-4.md` point 3, K-4b and K-7 as amended by `design-w1-fixes-16.md`. One word
+list (`SECRET_WORDS`) drives both `is_secret_key` and the key-value scan of `redact_secrets`. Output is
+always NFC (3a).
 """
 
 import re
@@ -35,13 +36,16 @@ _KEY_CANDIDATE = re.compile(
 )
 # Key value (K-4): double-quoted, single-quoted or bare. A bare value runs over `,` `;` `&` too, unless
 # the separator is followed by the end of the text, whitespace or the start of a key candidate (K-1..K-3);
-# the look-ahead reads that candidate with the same taken-whole runs (K-8).
-_KEY_VALUE = re.compile(
-	r"\"(?P<double>[^\"]*)\"|'(?P<single>[^']*)'"
-	r"|(?P<bare>[^\s,;&\"'}\]]"
-	r"(?:(?=(?P<chunk>[^\s,;&\"'}\]]+))(?P=chunk)"
-	rf"|[,;&](?!\Z|\s|{_KEY_NAME_RUNS}{_KEY_NAME_END}))*)"
+# the look-ahead reads that candidate with the same taken-whole runs (K-8). `_BARE_VALUE_STEP` is the
+# repeated part of a bare value, shared with `_BARE_VALUE_TAIL` so the two cannot drift apart.
+_BARE_VALUE_STEP = (
+	rf"(?:(?=(?P<chunk>[^\s,;&\"'}}\]]+))(?P=chunk)|[,;&](?!\Z|\s|{_KEY_NAME_RUNS}{_KEY_NAME_END}))"
 )
+_KEY_VALUE = re.compile(
+	rf"\"(?P<double>[^\"]*)\"|'(?P<single>[^']*)'|(?P<bare>[^\s,;&\"'}}\]]{_BARE_VALUE_STEP}*)"
+)
+# K-7: the tail of a bare value after a `MASK` that a value pattern (R-3) already put in.
+_BARE_VALUE_TAIL = re.compile(rf"{_BARE_VALUE_STEP}*")
 
 
 def _name_segments(name: str) -> tuple[str, ...]:
@@ -64,6 +68,34 @@ def _name_segments(name: str) -> tuple[str, ...]:
 
 _SECRET_WORD_SEGMENTS = tuple(_name_segments(word) for word in SECRET_WORDS)
 
+_WORD_START = re.compile(r"(?<![\w-])[\w-]")
+
+
+def _secret_value_end(text: str, start: int, end: int) -> int:
+	"""K-4b: end of the one span masked for a secret key whose bare value K-4 reads over `text[start:end]`.
+
+	The span only grows: while a `MASK` starts before its end, or a key candidate with a secret name starts
+	in it and ends at or past its end, it takes in that `MASK` and its K-7 tail, or that candidate and its
+	K-4 value. Each part is read once (K-8).
+	"""
+	scan = start
+	while scan < end:
+		mask = text.find(MASK, scan, end + len(MASK) - 1)
+		if mask != -1:
+			scan = mask + len(MASK)
+			end = max(end, _BARE_VALUE_TAIL.match(text, scan).end())
+			continue
+		for word in _WORD_START.finditer(text, scan, end):
+			candidate = _KEY_CANDIDATE.match(text, word.start())
+			if candidate and candidate.end() >= end and is_secret_key(candidate.group("name")):
+				scan = candidate.end()
+				value = _KEY_VALUE.match(text, scan)
+				end = scan if value is None else value.end()
+				break
+		else:
+			return end
+	return end
+
 
 def _mask_key_values(text: str) -> str:
 	"""K-1..K-8: mask the value after each key-name candidate that `is_secret_key` accepts; one pass."""
@@ -72,20 +104,20 @@ def _mask_key_values(text: str) -> str:
 	while candidate := _KEY_CANDIDATE.search(text, position):
 		parts.append(text[position : candidate.end()])
 		position = candidate.end()
-		if text.startswith(MASK, position):
-			parts.append(MASK)
-			position += len(MASK)
+		if not is_secret_key(candidate.group("name")):
 			continue
 		value = _KEY_VALUE.match(text, position)
-		if value is None or not is_secret_key(candidate.group("name")):
+		if value is None:
 			continue
 		if value.group("double") is not None:
 			parts.append(f'"{MASK}"')
+			position = value.end()
 		elif value.group("single") is not None:
 			parts.append(f"'{MASK}'")
+			position = value.end()
 		else:
 			parts.append(MASK)
-		position = value.end()
+			position = _secret_value_end(text, position, value.end())
 	parts.append(text[position:])
 	return "".join(parts)
 

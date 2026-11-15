@@ -26,6 +26,8 @@ GIT_PATTERN_REFUSAL = 'tên file có ký tự * ? [ ] hoặc bắt đầu bằng
 PATH_INVALID_REFUSAL = "đường dẫn không hợp lệ hoặc nằm ngoài apps/"
 NAME_FORBIDDEN_REFUSAL = "tên file thuộc loại bí mật hoặc được bảo vệ"
 GIT_DIR_REFUSAL = "không được chạm .git hoặc tên bắt đầu bằng .git"
+PATH_SYMLINK_REFUSAL = "đường dẫn đi qua symlink"
+NESTED_REPO_REFUSAL = "đường dẫn nằm trong một kho git lồng trong app"
 
 HAND_WRITTEN_CORE_APPS = ("frappe", "erpnext", "helpdesk", "hrms")
 # design-addendum-2 QĐ-A2: refused and allowed names, under one app.
@@ -233,7 +235,7 @@ class TestCheckWritePath(FrappeTestCase):
 					),
 				)
 		os.symlink(os.path.join(self.root, "myapp", "run.sh"), os.path.join(self.root, "myapp", "sh_link.py"))
-		self.assertEqual(self.reason("myapp/sh_link.py"), None)
+		self.assertEqual(self.reason("myapp/sh_link.py"), change_guard.PATH_SYMLINK)
 
 	def test_gitignore_gitattributes_github_refused_git_dir(self):
 		# AC-50, design 3.2 step 4: any component starting with ".git", with the new wording of table 3.1.
@@ -486,6 +488,150 @@ class TestCheckWritePath(FrappeTestCase):
 			with self.subTest(rel=rel):
 				self.assertEqual(self.reason(rel, allowed, new_file=new_file), change_guard.APP_FORBIDDEN)
 		self.assertIsNone(self.reason("myapp/ok.py", allowed))
+
+	def fake_repo(self, rel):
+		"""A plain repo at `apps/<rel>` (a `.git` dir), written with file writes only."""
+		self.apps.write(os.path.join(rel, ".git", "HEAD"), "ref: refs/heads/main\n")
+
+	def link(self, target_rel, link_rel):
+		"""Symlink `apps/<link_rel>` to `apps/<target_rel>`: a target inside the apps root."""
+		os.symlink(os.path.join(self.root, target_rel), os.path.join(self.root, link_rel))
+
+	def test_path_through_symlink_refused(self):
+		# AC-50, design 3.2 step 6: any symlink on the existing part, even one pointing inside the apps root.
+		self.assertEqual(change_guard.PATH_SYMLINK, PATH_SYMLINK_REFUSAL)
+		self.apps.write("myapp/real/ok.py", "x = 1\n")
+		self.apps.write("myapp/real.py", "x = 1\n")
+		os.makedirs(os.path.join(self.root, "myapp", "sub"))
+		self.link("myapp/real", "myapp/pkg_link")
+		self.link("myapp/real", "myapp/sub/deep_link")
+		self.link("myapp/real.py", "myapp/file_link.py")
+		self.link("myapp/missing.py", "myapp/dangling.py")
+		self.link("otherapp", "myapp/other_dir")
+		self.link("otherapp/ok.py", "myapp/other_file.py")
+		listed = ("myapp", "otherapp")
+		for rel, new_file in (
+			("myapp/pkg_link/ok.py", False),
+			("myapp/pkg_link/new.py", True),
+			("myapp/sub/deep_link/ok.py", False),
+			("myapp/file_link.py", False),
+			("myapp/dangling.py", True),
+			("myapp/other_dir/ok.py", False),
+			("myapp/other_dir/new.py", True),
+			("myapp/other_file.py", False),
+		):
+			with self.subTest(rel=rel):
+				result = change_guard.check_write_path(rel, listed, new_file=new_file, read_git=False)
+				self.assertEqual(result, change_guard.GuardResult(None, None, None, PATH_SYMLINK_REFUSAL))
+		# The same files by their real path pass: only the symlink on the way is refused.
+		for rel in ("myapp/real/ok.py", "myapp/real.py", "otherapp/ok.py"):
+			with self.subTest(rel=rel):
+				self.assertIsNone(self.reason(rel, listed))
+		# Order: earlier rules of design 3.2 classify the resolved path before the symlink step.
+		for rel, allowed, expected in (
+			("myapp/other_file.py", ALLOWED, APP_NOT_ALLOWED_REFUSAL),
+			("myapp/link_out.py", listed, PATH_INVALID_REFUSAL),
+			("myapp/pkg_link/a*.py", listed, GIT_PATTERN_REFUSAL),
+		):
+			with self.subTest(rel=rel, allowed=allowed):
+				self.assertEqual(self.reason(rel, allowed, new_file=True), expected)
+
+	def test_symlink_to_erp_ai_refused(self):
+		# AC-50: a symlink into `erp_ai` or its worktree, at a middle or the last component, stays
+		# APP_FORBIDDEN (design 3.2 step 3 comes before step 6); the symlink step does not hide it.
+		self.fake_erp_ai_repo()
+		os.makedirs(os.path.join(self.root, "myapp", "sub"))
+		self.link("erp_ai", "myapp/sub/link_to_erp_ai")
+		self.link("erp_ai/ok.py", "myapp/ai_file.py")
+		self.link("erp_ai-wt", "myapp/link_to_wt")
+		listed = ("myapp", "erp_ai", "erp_ai-wt")
+		for rel, new_file in (
+			("myapp/sub/link_to_erp_ai/ok.py", False),
+			("myapp/sub/link_to_erp_ai/pkg/new.py", True),
+			("myapp/ai_file.py", False),
+			("myapp/link_to_wt/ok.py", False),
+			("myapp/link_to_wt/new.py", True),
+		):
+			with self.subTest(rel=rel):
+				result = change_guard.check_write_path(rel, listed, new_file=new_file, read_git=False)
+				self.assertEqual(result, change_guard.GuardResult(None, None, None, APP_FORBIDDEN_REFUSAL))
+		# A symlink to a plain listed app next to it is the symlink step's.
+		self.link("myapp/ok.py", "myapp/plain_link.py")
+		self.assertEqual(self.reason("myapp/plain_link.py", listed), PATH_SYMLINK_REFUSAL)
+
+	def test_nested_repo_refused(self):
+		# Design 3.2 step 7: the nearest `.git` from the deepest existing folder must be the app's repo.
+		self.assertEqual(change_guard.NESTED_REPO, NESTED_REPO_REFUSAL)
+		self.fake_repo("myapp")
+		self.fake_repo("myapp/vendor/lib")
+		self.apps.write("myapp/vendor/lib/x.py", "x = 1\n")
+		self.apps.write("myapp/vendor/lib/deep/y.py", "x = 1\n")
+		self.apps.write("myapp/vendor/plain.py", "x = 1\n")
+		# A submodule-like `gitdir:` file leading to another repo.
+		self.apps.write("myapp/.git/modules/sub2/HEAD", "ref: refs/heads/main\n")
+		self.apps.write("myapp/sub2/.git", f"gitdir: {self.root}/myapp/.git/modules/sub2\n")
+		# A worktree of the app's own repo inside the app: same common dir, so not a nested repo.
+		self.apps.write("myapp/.git/worktrees/wt/commondir", "../..\n")
+		self.apps.write("myapp/wt/.git", f"gitdir: {self.root}/myapp/.git/worktrees/wt\n")
+		self.apps.write("myapp/wt/ok.py", "x = 1\n")
+		# An app with no repo of its own still refuses a repo inside it.
+		self.fake_repo("otherapp/inner")
+		listed = ("myapp", "otherapp")
+		for rel, new_file in (
+			("myapp/vendor/lib/x.py", False),
+			("myapp/vendor/lib/new.py", True),
+			("myapp/vendor/lib/deep/y.py", False),
+			("myapp/sub2/new.py", True),
+			("otherapp/inner/new.py", True),
+		):
+			with self.subTest(rel=rel):
+				result = change_guard.check_write_path(rel, listed, new_file=new_file, read_git=False)
+				self.assertEqual(result, change_guard.GuardResult(None, None, None, NESTED_REPO_REFUSAL))
+		for rel, new_file in (
+			("myapp/vendor/plain.py", False),
+			("myapp/vendor/new.py", True),
+			("myapp/wt/ok.py", False),
+			("myapp/wt/pkg/new.py", True),
+			("myapp/ok.py", False),
+			("otherapp/ok.py", False),
+		):
+			with self.subTest(rel=rel):
+				self.assertIsNone(self.reason(rel, listed, new_file=new_file))
+		# Order: the git pattern step and the symlink step come before the nested repo step.
+		self.link("myapp/vendor/lib", "myapp/lib_link")
+		for rel, expected in (
+			("myapp/vendor/lib/a*.py", GIT_PATTERN_REFUSAL),
+			("myapp/lib_link/new.py", PATH_SYMLINK_REFUSAL),
+		):
+			with self.subTest(rel=rel):
+				self.assertEqual(self.reason(rel, listed, new_file=True), expected)
+
+	def test_new_dirs_not_yet_existing_use_deepest_existing(self):
+		# Design 3.2 steps 6-7 look at the existing part only; a missing tail is judged by its deepest
+		# existing folder (a dangling symlink counts as existing).
+		self.fake_repo("myapp")
+		self.fake_repo("myapp/vendor/lib")
+		self.apps.write("myapp/real/ok.py", "x = 1\n")
+		self.link("myapp/real", "myapp/pkg_link")
+		self.link("myapp/missing_dir", "myapp/dangling_dir")
+		for rel in ("myapp/a", "myapp/a/b", "myapp/a/b/c/new.py", "myapp/real/x/y/new.py"):
+			with self.subTest(rel=rel):
+				result = change_guard.check_write_path(rel, ALLOWED, new_file=True, read_git=False)
+				self.assertEqual(
+					result,
+					change_guard.GuardResult(
+						full_path=os.path.join(self.root, rel), rel_path=rel, app="myapp", reason=None
+					),
+				)
+		for rel, expected in (
+			("myapp/pkg_link/x/y/new.py", PATH_SYMLINK_REFUSAL),
+			("myapp/pkg_link/x", PATH_SYMLINK_REFUSAL),
+			("myapp/dangling_dir/new.py", PATH_SYMLINK_REFUSAL),
+			("myapp/vendor/lib/x/y/new.py", NESTED_REPO_REFUSAL),
+			("myapp/vendor/lib/x", NESTED_REPO_REFUSAL),
+		):
+			with self.subTest(rel=rel):
+				self.assertEqual(self.reason(rel, new_file=True), expected)
 
 
 class TestCheckWritePathGit(FrappeTestCase):

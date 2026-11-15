@@ -21,6 +21,8 @@ APP_FORBIDDEN = "không được sửa app erp_ai hoặc kho git của nó"
 NAME_FORBIDDEN = source.TEXT_SECRET_NAME
 GIT_DIR = source.GIT_DIR
 PATH_GIT_PATTERN = 'tên file có ký tự * ? [ ] hoặc bắt đầu bằng ":" hay "-", git không commit an toàn được'
+PATH_SYMLINK = "đường dẫn đi qua symlink"
+NESTED_REPO = "đường dẫn nằm trong một kho git lồng trong app"
 CMD_SHELL = "đối số chứa ký tự điều khiển shell"
 CMD_FORCE = "cờ --force bị cấm"
 CMD_OTHER_SITE = "chỉ chạy cho site đang chạy"
@@ -151,6 +153,19 @@ def _is_erp_ai(target: str, root: str, app: str) -> bool:
 	return bool(repos & _erp_ai_common_dirs(root))
 
 
+def _existing_part(path: str) -> str:
+	"""The longest prefix of `path` that exists on disk; a dangling symlink counts as existing."""
+	while not os.path.lexists(path):
+		path = os.path.dirname(path)
+	return path
+
+
+def _is_nested_repo(existing: str, app_dir: str) -> bool:
+	"""Design 3.2 step 7: the repo git would use from the deepest existing folder is not the app folder's."""
+	start = existing if os.path.isdir(existing) else os.path.dirname(existing)
+	return _common_dirs_upward(start, nearest_only=True) != _common_dirs_upward(app_dir, nearest_only=True)
+
+
 def _is_git_pattern(rel_in_repo: str) -> bool:
 	"""Same condition as `process_runner._check_git_write_call` (design-addendum-2 QĐ-A2): a bare path
 	git would read as a glob, a magic pathspec or an option cannot be committed safely."""
@@ -160,13 +175,14 @@ def _is_git_pattern(rel_in_repo: str) -> bool:
 def check_write_path(
 	rel_path: str, allowed_apps: tuple[str, ...], *, new_file: bool, read_git: bool = True
 ) -> GuardResult:
-	"""Check a write target relative to `apps/`; refusals follow steps 1-5 of CHG-002 design 3.2.
+	"""Check a write target relative to `apps/`; refusals follow steps 1-7 of CHG-002 design 3.2.
 
 	1. invalid or outside `apps/` → `PATH_INVALID`; 2. app not listed → `APP_NOT_ALLOWED`; a listed app
 	with no folder, or the app folder itself → `PATH_INVALID`; 3. `erp_ai` by repo identity →
 	`APP_FORBIDDEN`; 4. `license.txt`, then `source.text_refusal` (secret name, then a ".git*"
-	component) → `NAME_FORBIDDEN` / `GIT_DIR`; 5. git pattern → `PATH_GIT_PATTERN`. Any file
-	extension passes.
+	component) → `NAME_FORBIDDEN` / `GIT_DIR`; 5. git pattern → `PATH_GIT_PATTERN`; 6. a symlink on
+	the existing part of the path → `PATH_SYMLINK`; 7. the nearest `.git` from the deepest existing
+	folder is not the app folder's repo → `NESTED_REPO`. Any file extension passes.
 
 	`source.resolve_safe_path` is the only path resolver; when it refuses, the same real path is only
 	classified to pick the reason, and an unclassified refusal stays `PATH_INVALID`. With `read_git`
@@ -197,6 +213,11 @@ def check_write_path(
 		return _refused(PATH_GIT_PATTERN)
 	if full is None:
 		return _refused(PATH_INVALID)
+	existing = _existing_part(os.path.normpath(os.path.join(root, rel_path)))
+	if os.path.realpath(existing) != existing:
+		return _refused(PATH_SYMLINK)
+	if _is_nested_repo(existing, os.path.join(root, parts[0])):
+		return _refused(NESTED_REPO)
 	state = None
 	if read_git:
 		state = source.read_git_state(full, new_file=new_file)

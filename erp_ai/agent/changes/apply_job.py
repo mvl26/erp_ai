@@ -322,7 +322,7 @@ def _precheck_block(proposal, check: change_guard.BlockCheck, deadline: float) -
 	created file and a rename target must not `lexists` → else `Hết hiệu lực` naming the item. Step 5 then
 	reads git for every path: a refusal is `Lỗi` naming the item, a branch other than `target_branch` is
 	`Hết hiệu lực`. Every path must show the same HEAD, else `Lỗi` naming the item with `GIT_ERROR`
-	(step 5 has no sentence for it); that HEAD is the `old_head` returned, `None` for a block without
+	(design addendum-8 A8-1, A8-2); that HEAD is the `old_head` returned, `None` for a block without
 	items. The one-file path keeps the HEAD it reads itself.
 	"""
 	paths = []

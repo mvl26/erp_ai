@@ -1575,6 +1575,62 @@ class TestLegacyThroughAdapter(BlockApplyTestCase):
 		self.assertEqual(self.git("diff-tree", "--no-commit-id", "--name-only", "-r", "HEAD"), LEGACY_REL)
 		self.assertEqual(self.git("status", "--porcelain"), "")
 
+	def test_legacy_steps_4_5_reasons_have_no_item_prefix(self):
+		# Design addendum-8 A8-1: the old shape does steps 4 to 5 in `_apply_code`, its reasons without `mục n`.
+		# The sentences are written by hand (apply_job.TARGET_CHANGED, source.GIT_LOCKED, GIT_BRANCH_CHANGED).
+		repo = self.sandbox.repo(APP)
+		branch = self.git("rev-parse", "--abbrev-ref", "HEAD")
+		lock = self.git("rev-parse", "--path-format=absolute", "--git-path", "index.lock")
+
+		def overwrite():
+			with open(os.path.join(repo, LEGACY_REL), "w", encoding="utf-8") as handle:
+				handle.write("người khác sửa\n")
+
+		def undo_overwrite():
+			self.git("checkout", "--quiet", "--", ".")
+
+		def release_lock():
+			if os.path.exists(lock):
+				os.remove(lock)
+
+		cases = (
+			(
+				"stale",
+				overwrite,
+				undo_overwrite,
+				CHANGE_STATUS_STALE,
+				"file đích đã đổi kể từ lúc đề xuất",
+			),
+			(
+				"git refusal",
+				lambda: self.sandbox.hold_index_lock(APP),
+				release_lock,
+				CHANGE_STATUS_FAILED,
+				"kho git đang bị khóa (index.lock): có thao tác git khác đang chạy hoặc bị dừng giữa chừng",
+			),
+			(
+				"branch",
+				lambda: self.git("checkout", "--quiet", "-b", "other"),
+				lambda: self.git("checkout", "--quiet", branch),
+				CHANGE_STATUS_STALE,
+				"nhánh đang checkout đã đổi kể từ lúc đề xuất",
+			),
+		)
+		for label, arrange, restore, status, reason in cases:
+			with self.subTest(label):
+				name = self.approve(self.legacy())
+				arrange()
+				try:
+					before = self.snapshot()
+
+					with patch.object(apply_job, "_precheck_block", wraps=apply_job._precheck_block) as spy:
+						self.run_apply(name)
+
+					self.assert_failed_untouched(name, reason, before, status)
+					spy.assert_not_called()
+				finally:
+					restore()
+
 	def test_legacy_edit_empty_path_refused_at_apply_zero_writes(self):
 		name = self.legacy()
 		frappe.db.set_value(PROPOSAL_DOCTYPE, name, "file_path", "", update_modified=False)

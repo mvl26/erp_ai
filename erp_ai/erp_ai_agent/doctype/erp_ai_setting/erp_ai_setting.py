@@ -109,6 +109,7 @@ PROMPT_REQUIRED_MARKERS = {
 	"classify": (
 		'"dau_muc"',
 		'"do_tin_cay"',
+		'"do_tin_cay_pct"',
 		'"ly_do"',
 		'"nhom"',
 		'"uu_tien"',

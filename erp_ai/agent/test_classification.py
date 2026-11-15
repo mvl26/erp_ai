@@ -16,6 +16,7 @@ from erp_ai.test_utils import keep_agent_settings, make_routing_rules
 VALID = {
 	"dau_muc": "A",
 	"do_tin_cay": "Cao",
+	"do_tin_cay_pct": 85,
 	"ly_do": "Đơn bán đã hủy nhưng trạng thái sai",
 	"nhom": "IT",
 	"uu_tien": "High",
@@ -41,6 +42,7 @@ class TestParseClassification(FrappeTestCase):
 				priority="High",
 				needs_split=False,
 				requests=[],
+				confidence_pct=85,
 			),
 		)
 
@@ -133,7 +135,7 @@ class TestParseClassification(FrappeTestCase):
 				self.assertEqual((result.category, result.confidence), (category, confidence))
 
 	def test_optional_fields_default_safely(self):
-		minimal = json.dumps({"dau_muc": "F", "do_tin_cay": "Thấp"})
+		minimal = json.dumps({"dau_muc": "F", "do_tin_cay": "Thấp", "do_tin_cay_pct": 20})
 		result = classification.parse_classification(minimal)
 		self.assertEqual(result.category, "F")
 		self.assertEqual(result.reason, "")
@@ -149,6 +151,35 @@ class TestParseClassification(FrappeTestCase):
 		garbage = classification.parse_classification(_text(can_tach="yes", cac_yeu_cau="x"))
 		self.assertFalse(garbage.needs_split)
 		self.assertEqual(garbage.requests, [])
+
+
+class TestConfidencePct(FrappeTestCase):
+	# AC-22 (D-14), U1.md:249-253: do_tin_cay_pct is a whole number 0..100; the label do_tin_cay stays.
+	def test_parse_accepts_0_to_100(self):
+		self.assertEqual((classification.CONFIDENCE_PCT_MIN, classification.CONFIDENCE_PCT_MAX), (0, 100))
+		for value in (0, 1, 50, 99, 100):
+			with self.subTest(value=value):
+				result = classification.parse_classification(_text(do_tin_cay_pct=value))
+				self.assertIsNotNone(result)
+				self.assertEqual(result.confidence_pct, value)
+				self.assertIs(type(result.confidence_pct), int)
+				self.assertEqual(result.confidence, "Cao")
+
+	def test_parse_rejects_missing_bool_negative_over_100_float(self):
+		bad_inputs = {
+			"missing": json.dumps({k: v for k, v in VALID.items() if k != "do_tin_cay_pct"}),
+			"null": _text(do_tin_cay_pct=None),
+			"bool_true": _text(do_tin_cay_pct=True),
+			"bool_false": _text(do_tin_cay_pct=False),
+			"negative": _text(do_tin_cay_pct=-1),
+			"over_100": _text(do_tin_cay_pct=101),
+			"float_whole": _text(do_tin_cay_pct=50.0),
+			"float_fraction": _text(do_tin_cay_pct=80.5),
+			"string": _text(do_tin_cay_pct="80"),
+		}
+		for case, text in bad_inputs.items():
+			with self.subTest(case=case):
+				self.assertIsNone(classification.parse_classification(text), text)
 
 
 class TestMapping(FrappeTestCase):

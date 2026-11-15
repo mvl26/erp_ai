@@ -10,6 +10,9 @@ PRIORITIES = ("Low", "Medium", "High", "Urgent")
 PRIORITY_URGENT = "Urgent"
 SCORE_VALUES = (1, 2, 3)
 SCORE_REASON_MAX_WORDS = 25
+# AC-22 (D-14), U1.md:249-253: do_tin_cay_pct is a whole number in this range; anything else is a parse error.
+CONFIDENCE_PCT_MIN = 0
+CONFIDENCE_PCT_MAX = 100
 # The guide spells the tag "[GẬP]"; "[GẤP]" is the standard spelling. Accept both.
 URGENT_TAGS = ("[GẤP]", "[GẬP]")
 # AC-28 (design.md:409): the split question lists at most 10 requests, each cut to 200 characters.
@@ -42,6 +45,7 @@ class Classification:
 	importance: int = 0
 	score_reason: str = ""
 	department: str | None = None
+	confidence_pct: int = 0
 
 
 def _load_json_object(text):
@@ -83,6 +87,9 @@ def parse_classification(text: str) -> Classification | None:
 		return None
 	if not isinstance(confidence, str) or confidence not in CONFIDENCE_VALUES:
 		return None
+	confidence_pct = data.get("do_tin_cay_pct")
+	if type(confidence_pct) is not int or not CONFIDENCE_PCT_MIN <= confidence_pct <= CONFIDENCE_PCT_MAX:
+		return None
 	reason = data.get("ly_do")
 	team = data.get("nhom")
 	priority = data.get("uu_tien")
@@ -101,6 +108,7 @@ def parse_classification(text: str) -> Classification | None:
 		importance=importance,
 		score_reason=score_reason,
 		department=department if isinstance(department, str) else None,
+		confidence_pct=confidence_pct,
 	)
 
 

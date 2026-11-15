@@ -65,6 +65,7 @@ Trả về DUY NHẤT một object JSON, không giải thích thêm:
 {
   "dau_muc": "A"|"B"|"C"|"D"|"E"|"F",
   "do_tin_cay": "Cao"|"Trung bình"|"Thấp",
+  "do_tin_cay_pct": <số nguyên 0-100>,
   "ly_do": "<một câu, tối đa 25 từ>",
   "nhom": "<tên nhóm theo bảng routing>",
   "uu_tien": "Low"|"Medium"|"High"|"Urgent",
@@ -78,7 +79,8 @@ Trả về DUY NHẤT một object JSON, không giải thích thêm:
 
 Đặt do_tin_cay = "Thấp" khi nội dung quá ngắn hoặc mơ hồ để quyết. Thà nói không
 chắc còn hơn đoán — người sẽ sửa, và bản ghi "Thấp" cho chúng tôi biết chỗ cần
-viết rõ hơn."""
+viết rõ hơn. Đặt do_tin_cay_pct = số phần trăm bạn chắc chắn về đầu mục và
+nhóm."""
 
 # Guide 16.5.
 CORE_PROMPT = """Bạn là nhân viên IT của Công ty TNHH Miyano Việt Nam, làm việc trên

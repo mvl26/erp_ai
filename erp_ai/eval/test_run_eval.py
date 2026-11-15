@@ -281,7 +281,9 @@ class TestRunEval(FrappeTestCase):
 
 
 def classify_reply(category):
-	return make_model_result(text=json.dumps({"dau_muc": category, "do_tin_cay": "Cao", "ly_do": "x"}))
+	return make_model_result(
+		text=json.dumps({"dau_muc": category, "do_tin_cay": "Cao", "do_tin_cay_pct": 90, "ly_do": "x"})
+	)
 
 
 def scored_reply(category, complexity, importance, output_tokens, stop_reason="end_turn"):
@@ -289,6 +291,7 @@ def scored_reply(category, complexity, importance, output_tokens, stop_reason="e
 		{
 			"dau_muc": category,
 			"do_tin_cay": "Cao",
+			"do_tin_cay_pct": 90,
 			"ly_do": "x",
 			"do_phuc_tap": complexity,
 			"do_quan_trong": importance,

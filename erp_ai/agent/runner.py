@@ -156,7 +156,10 @@ def _run(ticket_name, trigger, comment_name=None):
 		_log_skip(ticket_name, trigger, run_id, "daily_limit")
 		return
 	# (e)
-	level = policy.effective_level(settings, over_budget=policy.is_over_budget(settings))
+	over_budget = policy.is_over_budget(settings)
+	level = policy.effective_level(settings, over_budget=over_budget)
+	switches = policy.permission_switches(settings)
+	threshold = policy.confidence_threshold(settings)
 	auto_assign = policy.auto_assign_enabled(settings)
 	deadline = time.monotonic() + JOB_TIMEOUT_S - JOB_SAFETY_MARGIN_S
 
@@ -174,18 +177,32 @@ def _run(ticket_name, trigger, comment_name=None):
 		# One context for the whole run (classification and reasoning); never built at L0, which calls no tool.
 		context = None
 		if level != LEVELS[0]:
-			change = policy.change_settings(settings)
+			instructor = authority.run_instructor(ticket_name, trigger, comment_name)
+			if trigger == TRIGGER_TICKET_INSERT:
+				# T81 (U1.md:261) recomputes main_path_level and below_threshold from the classification, before _route.
+				category, below_threshold = None, False
+			else:
+				category, pct = policy.latest_classification(ticket_name)
+				below_threshold = policy.is_below_confidence(
+					pct, threshold, has_instructor=bool(instructor), act_now=switches.act_now
+				)
 			context = ToolContext(
 				ticket_name=ticket_name,
 				effective_level=level,
-				instructor=authority.latest_instructor(ticket_name),
+				instructor=instructor,
 				run_id=run_id,
 				category_mapping=mapping,
 				agent_user=AGENT_USER,
 				routing_config=routing,
-				change_enabled=change.enabled,
-				allowed_apps=change.allowed_apps,
-				unrestricted=policy.unrestricted_enabled(settings),
+				change_enabled=switches.code_change,
+				allowed_apps=policy.change_settings(settings).allowed_apps,
+				unrestricted=switches.unrestricted,
+				record_tools=switches.record_tools,
+				act_now=switches.act_now,
+				one_click_approval=switches.one_click_approval,
+				over_budget=over_budget,
+				main_path_level=policy.main_path_level(settings, level, category),
+				below_threshold=below_threshold,
 			)
 		classification = None
 		if trigger == TRIGGER_TICKET_INSERT:

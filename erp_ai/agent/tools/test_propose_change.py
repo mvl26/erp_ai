@@ -2,6 +2,7 @@ import hashlib
 import json
 import os
 import re
+import subprocess
 from unittest.mock import patch
 
 import frappe
@@ -606,7 +607,10 @@ class TestProposeChange(FrappeTestCase):
 				(comment,) = [row for row in self.comments() if row.name == result["comment"]]
 				shown = " ".join(command_args)
 				self.assertIn(f"đang chờ duyệt: lệnh <code>bench {shown}</code>.</p>", comment.content)
-				self.assertIn("<p>Lệnh bench không hoàn tác được.</p>", comment.content)
+				self.assertIn(
+					"<p>Lệnh trong khối không hoàn tác được; hoàn tác chỉ trả lại phần file.</p>",
+					comment.content,
+				)
 				self.assertNotIn("Commit sẽ vào nhánh", comment.content)
 				self.assertNotIn("Cảnh báo app lõi", comment.content)
 
@@ -784,7 +788,7 @@ class TestProposeChange(FrappeTestCase):
 		self.assertTrue(command["ok"], command)
 		self.assertNotIn("branch", command)
 		doc = self.stored(command["proposal"])
-		self.assertEqual(json.loads(doc.command_args), ["build", "--app", "frappe"])
+		self.assertEqual(json.loads(doc.command_list), [["build", "--app", "frappe"]])
 		self.assertEqual(
 			(*(doc.get(field) for field in GIT_FIELDS), doc.commit_message or ""), ("", "", 0, 0, "")
 		)
@@ -1582,7 +1586,8 @@ class TestProposeBlock(FrappeTestCase):
 		with (
 			patch.object(process_runner, "run_bench") as run_bench,
 			patch.object(process_runner, "launch_restart") as launch_restart,
-			patch("subprocess.Popen") as popen,
+			# proposal time reads git (rev-parse, status); it must never start anything else
+			patch("subprocess.Popen", wraps=subprocess.Popen) as popen,
 		):
 			block = self.run_tool(
 				"propose_file_change", {"changes": changes, "commands": commands, "reason": "r"}
@@ -1591,7 +1596,10 @@ class TestProposeBlock(FrappeTestCase):
 		self.assertTrue(block["ok"], block)
 		self.assertTrue(alone["ok"], alone)
 		self.assertEqual([len(self.stored(block).operations), len(self.proposals())], [4, 2])
-		self.assertEqual((run_bench.call_count, launch_restart.call_count, popen.call_count), (0, 0, 0))
+		self.assertEqual((run_bench.call_count, launch_restart.call_count), (0, 0))
+		# git reads run as `timeout -s KILL <s> git ...`; anything that is not git (bench, setsid) is an effect
+		argvs = [[os.path.basename(str(part)) for part in call.args[0]] for call in popen.call_args_list]
+		self.assertEqual(([argv for argv in argvs if "git" not in argv], bool(argvs)), ([], True))
 		self.assertEqual(self.git_snapshot(), snapshot)
 		self.assertEqual(self.tree(), tree)
 

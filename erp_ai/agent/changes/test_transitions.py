@@ -570,6 +570,25 @@ class TestRequestUndo(TransitionTestCase):
 		)
 		self.assertEqual(_state(proposal.name).change_status, "Lỗi")
 
+	def test_request_undo_refused_for_other_kind_when_applied(self):
+		# Addendum-5 P-3: only `Thay đổi code` is undoable, on the `Đã áp dụng` edge too.
+		for apply_sha in (None, "a" * 40):
+			with self.subTest(apply_commit_sha=apply_sha):
+				proposal = _proposal_in(CHANGE_STATUS_APPLIED)
+				frappe.db.set_value(
+					PROPOSAL_DOCTYPE,
+					proposal.name,
+					{"change_kind": "Loại lạ", "apply_commit_sha": apply_sha},
+					update_modified=False,
+				)
+				self.assertRefused(
+					lambda: transitions.request_undo(proposal.name, ACTOR),
+					"Đề xuất đang ở trạng thái Đã áp dụng, không hoàn tác được",
+					proposal.name,
+				)
+				self.assertEqual(_state(proposal.name).change_status, "Đã áp dụng")
+				self.assertIsNone(_state(proposal.name).undo_by)
+
 	def test_command_only_block_not_undoable(self):
 		proposal = self._failed_with(
 			kind=CHANGE_KIND_COMMAND, command_list=json.dumps([["migrate"]]), apply_commit_sha="a" * 40
@@ -1148,7 +1167,7 @@ class TestConfirmRestart(TransitionTestCase):
 				with self.subTest(status=status, value=value):
 					proposal = _with_restart(status, RESTART_STATUS_SENT, SENT_AT)
 					before = _state(proposal.name)
-					self.assertIs(transitions.confirm_restart(proposal.name, value), True)
+					self.assertIs(transitions.confirm_restart(proposal.name, value, sent_at=SENT_AT), True)
 					self.assertEqual(_state(proposal.name), {**before, "restart_status": value})
 					self.assertEqual(_rows(proposal.name), [])
 		for current in (None, *RESTART_CONCLUSIONS, RESTART_STATUS_LAUNCH_FAILED):
@@ -1156,7 +1175,7 @@ class TestConfirmRestart(TransitionTestCase):
 				with self.subTest(current=current, value=value):
 					proposal = _with_restart(CHANGE_STATUS_APPLIED, current, SENT_AT)
 					state, modified = _state(proposal.name), _modified(proposal.name)
-					self.assertIs(transitions.confirm_restart(proposal.name, value), False)
+					self.assertIs(transitions.confirm_restart(proposal.name, value, sent_at=SENT_AT), False)
 					self.assertNothingChanged(proposal.name, state, modified)
 
 	def test_invalid_value_refused(self):
@@ -1165,12 +1184,12 @@ class TestConfirmRestart(TransitionTestCase):
 				proposal = _with_restart(CHANGE_STATUS_APPLIED, RESTART_STATUS_SENT, SENT_AT)
 				state, modified = _state(proposal.name), _modified(proposal.name)
 				with self.assertRaises(ValueError):
-					transitions.confirm_restart(proposal.name, value)
+					transitions.confirm_restart(proposal.name, value, sent_at=SENT_AT)
 				self.assertNothingChanged(proposal.name, state, modified)
 
 	def test_unknown_proposal_raises_does_not_exist(self):
 		with self.assertRaises(frappe.DoesNotExistError):
-			transitions.confirm_restart("AICHG-99999999", RESTART_STATUS_CONFIRMED)
+			transitions.confirm_restart("AICHG-99999999", RESTART_STATUS_CONFIRMED, sent_at=SENT_AT)
 
 	def test_reads_restart_status_under_one_lock_before_writing(self):
 		proposal = _with_restart(CHANGE_STATUS_APPLIED, RESTART_STATUS_SENT, SENT_AT)
@@ -1181,7 +1200,7 @@ class TestConfirmRestart(TransitionTestCase):
 		):
 			db.attach_mock(get_value, "get_value")
 			db.attach_mock(set_value, "set_value")
-			transitions.confirm_restart(proposal.name, RESTART_STATUS_CONFIRMED)
+			transitions.confirm_restart(proposal.name, RESTART_STATUS_CONFIRMED, sent_at=SENT_AT)
 		names = [entry[0] for entry in db.mock_calls]
 		self.assertEqual(names.count("set_value"), 1)
 		first_write = names.index("set_value")
@@ -1194,6 +1213,62 @@ class TestConfirmRestart(TransitionTestCase):
 		self.assertEqual(locks[0].args[:2], (PROPOSAL_DOCTYPE, proposal.name))
 		self.assertIn("restart_status", locks[0].args[2])
 		self.assertIs(db.mock_calls[first_write].kwargs.get("update_modified"), True)
+
+	# Addendum-5 P-4: write only while `restart_sent_at` is still the `sent_at` the caller read.
+	def test_stale_sent_at_writes_nothing(self):
+		for stored in (SENT_AT, None):
+			for value in RESTART_CONCLUSIONS:
+				with self.subTest(stored=stored, value=value):
+					proposal = _with_restart(CHANGE_STATUS_APPLIED, RESTART_STATUS_SENT, stored)
+					state, modified = _state(proposal.name), _modified(proposal.name)
+					stale = datetime(2026, 11, 13, 9, 29, 2)
+					self.assertIs(transitions.confirm_restart(proposal.name, value, sent_at=stale), False)
+					self.assertNothingChanged(proposal.name, state, modified)
+
+	def test_equal_sent_at_as_datetime_or_string_writes(self):
+		for given in (SENT_AT, "2026-11-13 09:29:01"):
+			with self.subTest(sent_at=given):
+				proposal = _with_restart(CHANGE_STATUS_UNDONE, RESTART_STATUS_SENT, SENT_AT)
+				before = _state(proposal.name)
+				self.assertIs(
+					transitions.confirm_restart(proposal.name, RESTART_STATUS_CONFIRMED, sent_at=given), True
+				)
+				self.assertEqual(
+					_state(proposal.name), {**before, "restart_status": RESTART_STATUS_CONFIRMED}
+				)
+				self.assertEqual(_rows(proposal.name), [])
+
+	def test_missing_sent_at_raises_value_error(self):
+		for missing in (None, ""):
+			with self.subTest(sent_at=missing):
+				proposal = _with_restart(CHANGE_STATUS_APPLIED, RESTART_STATUS_SENT, SENT_AT)
+				state, modified = _state(proposal.name), _modified(proposal.name)
+				with self.assertRaises(ValueError):
+					transitions.confirm_restart(proposal.name, RESTART_STATUS_CONFIRMED, sent_at=missing)
+				self.assertNothingChanged(proposal.name, state, modified)
+
+	def test_sent_at_is_keyword_only_and_required(self):
+		proposal = _with_restart(CHANGE_STATUS_APPLIED, RESTART_STATUS_SENT, SENT_AT)
+		state, modified = _state(proposal.name), _modified(proposal.name)
+		for shape, call in (
+			("omitted", lambda: transitions.confirm_restart(proposal.name, RESTART_STATUS_CONFIRMED)),
+			(
+				"positional",
+				lambda: transitions.confirm_restart(proposal.name, RESTART_STATUS_CONFIRMED, SENT_AT),
+			),
+		):
+			with self.subTest(sent_at=shape), self.assertRaises(TypeError):
+				call()
+		self.assertNothingChanged(proposal.name, state, modified)
+
+	def test_lock_reads_restart_status_and_sent_at(self):
+		proposal = _with_restart(CHANGE_STATUS_APPLIED, RESTART_STATUS_SENT, SENT_AT)
+		with patch.object(frappe.db, "get_value", wraps=frappe.db.get_value) as get_value:
+			transitions.confirm_restart(proposal.name, RESTART_STATUS_CONFIRMED, sent_at=SENT_AT)
+		locks = [entry for entry in get_value.call_args_list if entry.kwargs.get("for_update") is True]
+		self.assertEqual(len(locks), 1)
+		self.assertIn("restart_status", locks[0].args[2])
+		self.assertIn("restart_sent_at", locks[0].args[2])
 
 
 class TestTransitionInput(TransitionTestCase):

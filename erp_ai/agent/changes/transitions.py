@@ -5,7 +5,7 @@ import json
 from datetime import datetime
 
 import frappe
-from frappe.utils import now_datetime
+from frappe.utils import get_datetime, now_datetime
 
 from erp_ai.agent.changes import block
 from erp_ai.agent.changes.process_runner import CommandResult
@@ -237,22 +237,22 @@ def reject(name, user) -> str:
 def request_undo(name, user) -> str:
 	"""`Đã áp dụng → Đang hoàn tác` for a code change: write `undo_by`, `undo_at`; the job logs `undo`.
 
-	CHG-002 design 3.3, 4.3: also from `Lỗi` when the change is `Thay đổi code`, its `apply_commit_sha`
-	is set and its `undo_commit_sha` is empty.
+	CHG-002 design 3.3, 4.3: also from `Lỗi` when its `apply_commit_sha` is set and its `undo_commit_sha`
+	is empty. Both edges take only `Thay đổi code` (addendum-5 P-3).
 
 	Raises:
-		InvalidTransition: a bench command (any state), or a change that has neither edge; nothing is written.
+		InvalidTransition: a bench command (any state), any other kind but a code change, or a code change
+			that has neither edge; nothing is written.
 		ValueError, frappe.DoesNotExistError: see `_lock`; `user` is not a non-empty string.
 	"""
 	_require_text(user, "user")
 	row = _lock(name)
 	if row.change_kind == CHANGE_KIND_COMMAND:
 		frappe.throw("Lệnh bench không hoàn tác được", InvalidTransition)
+	if row.change_kind != CHANGE_KIND_CODE:
+		_refuse(row.change_status, "hoàn tác")
 	undoable_failure = (
-		row.change_status == CHANGE_STATUS_FAILED
-		and row.change_kind == CHANGE_KIND_CODE
-		and bool(row.apply_commit_sha)
-		and not row.undo_commit_sha
+		row.change_status == CHANGE_STATUS_FAILED and bool(row.apply_commit_sha) and not row.undo_commit_sha
 	)
 	if row.change_status != CHANGE_STATUS_APPLIED and not undoable_failure:
 		_refuse(row.change_status, "hoàn tác")
@@ -343,18 +343,26 @@ def record_restart(name, expected, value, sent_at) -> bool:
 	return True
 
 
-def confirm_restart(name, value) -> bool:
+def confirm_restart(name, value, *, sent_at) -> bool:
 	"""`restart_status`: `Đã gửi → value`, `value` being `Đã xác nhận` or `Chưa xác nhận` (CHG-002 design 3.6).
 
-	Returns `False` and writes nothing when `restart_status` is not `Đã gửi`. No log row is written.
+	`sent_at` is the `restart_sent_at` the caller read its evidence against (addendum-5 P-4). Returns
+	`False` and writes nothing when `restart_status` is not `Đã gửi` or `restart_sent_at` is no longer
+	`sent_at`. No log row is written.
 
 	Raises:
-		ValueError: `value` outside that set; see `_lock`.
+		ValueError: `value` outside that set, or `sent_at` empty; see `_lock`.
 		frappe.DoesNotExistError: see `_lock`.
 	"""
 	if value not in RESTART_CONCLUSIONS:
 		raise ValueError(f"value must be one of {RESTART_CONCLUSIONS}, got {value!r}")
-	if _lock(name, "restart_status").restart_status != RESTART_STATUS_SENT:
+	if not sent_at:
+		raise ValueError(f"sent_at must be given, got {sent_at!r}")
+	row = _lock(name, "restart_status", "restart_sent_at")
+	if row.restart_status != RESTART_STATUS_SENT:
+		return False
+	# `get_datetime(None)` is "now", so a missing stored time must not reach the comparison.
+	if not row.restart_sent_at or get_datetime(row.restart_sent_at) != get_datetime(sent_at):
 		return False
 	frappe.db.set_value(PROPOSAL_DOCTYPE, name, {"restart_status": value}, update_modified=True)
 	return True

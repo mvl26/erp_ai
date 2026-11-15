@@ -1,0 +1,166 @@
+{
+ "actions": [],
+ "creation": "2026-11-15 10:00:00.000000",
+ "doctype": "DocType",
+ "engine": "InnoDB",
+ "field_order": [
+  "section_week",
+  "week_start",
+  "week_end",
+  "computed_at",
+  "section_kpi",
+  "first_response_median_min",
+  "first_response_within_15_pct",
+  "first_response_within_5_pct",
+  "first_response_sample",
+  "complete_fields_pct",
+  "complete_fields_sample",
+  "closed_without_human_pct",
+  "closed_sample",
+  "b_resolution_avg_hours",
+  "b_resolution_sample",
+  "c_task_in_3_days_pct",
+  "c_task_sample",
+  "stale_over_5_days",
+  "stale_over_7_days"
+ ],
+ "fields": [
+  {
+   "fieldname": "section_week",
+   "fieldtype": "Section Break",
+   "label": "Tuần và lúc tính"
+  },
+  {
+   "description": "Thứ Hai 00:00 của tuần ISO được tính. Khóa chu kỳ: mỗi tuần một dòng, tên dòng là KPI-<ngày này>. Job KPI tuần ghi dòng lúc 08:00 thứ Hai cho tuần trước.",
+   "fieldname": "week_start",
+   "fieldtype": "Date",
+   "in_list_view": 1,
+   "label": "Đầu tuần",
+   "reqd": 1,
+   "unique": 1
+  },
+  {
+   "description": "Chủ nhật cuối của tuần, bằng đầu tuần cộng 6 ngày.",
+   "fieldname": "week_end",
+   "fieldtype": "Date",
+   "in_list_view": 1,
+   "label": "Cuối tuần"
+  },
+  {
+   "description": "Thời điểm job tính dòng này. Số liệu lấy theo ranh giới của tuần, không theo lúc tính.",
+   "fieldname": "computed_at",
+   "fieldtype": "Datetime",
+   "label": "Lúc tính"
+  },
+  {
+   "fieldname": "section_kpi",
+   "fieldtype": "Section Break",
+   "label": "Sáu KPI của tuần"
+  },
+  {
+   "description": "KPI 1. Trung vị số phút từ lúc tạo tới phản hồi đầu tiên, trên các phiếu tạo trong tuần đã có phản hồi. Rỗng khi mẫu 0.",
+   "fieldname": "first_response_median_min",
+   "fieldtype": "Float",
+   "label": "Phản hồi đầu tiên: trung vị (phút)"
+  },
+  {
+   "description": "KPI 1. Tỷ lệ phiếu có phản hồi đầu tiên trong 15 phút, trên mọi phiếu tạo trong tuần; phiếu chưa phản hồi tính là không đạt. Rỗng khi mẫu 0.",
+   "fieldname": "first_response_within_15_pct",
+   "fieldtype": "Percent",
+   "label": "Phản hồi trong 15 phút (%)"
+  },
+  {
+   "description": "KPI 1. Tỷ lệ phiếu có phản hồi đầu tiên trong 5 phút, trên mọi phiếu tạo trong tuần; phiếu chưa phản hồi tính là không đạt. Rỗng khi mẫu 0.",
+   "fieldname": "first_response_within_5_pct",
+   "fieldtype": "Percent",
+   "label": "Phản hồi trong 5 phút (%)"
+  },
+  {
+   "description": "KPI 1. Số phiếu tạo trong tuần (mẫu của KPI 1).",
+   "fieldname": "first_response_sample",
+   "fieldtype": "Int",
+   "label": "Mẫu KPI 1"
+  },
+  {
+   "description": "KPI 2. Tỷ lệ phiếu đang mở lúc hết tuần có đủ đầu mục (loại phiếu), nhóm xử lý và ưu tiên. Rỗng khi mẫu 0.",
+   "fieldname": "complete_fields_pct",
+   "fieldtype": "Percent",
+   "label": "Đủ đầu mục, nhóm, ưu tiên (%)"
+  },
+  {
+   "description": "KPI 2. Số phiếu đang mở lúc hết tuần.",
+   "fieldname": "complete_fields_sample",
+   "fieldtype": "Int",
+   "label": "Mẫu KPI 2"
+  },
+  {
+   "description": "KPI 3. Tỷ lệ phiếu đóng trong tuần mà mọi hành động phía agent (comment, email gửi, giao việc) là của bot và bot đặt trạng thái Resolved hoặc Closed. Rỗng khi mẫu 0.",
+   "fieldname": "closed_without_human_pct",
+   "fieldtype": "Percent",
+   "label": "Đóng không cần người (%)"
+  },
+  {
+   "description": "KPI 3. Số phiếu đóng trong tuần.",
+   "fieldname": "closed_sample",
+   "fieldtype": "Int",
+   "label": "Mẫu KPI 3"
+  },
+  {
+   "description": "KPI 4. Trung bình số giờ lịch từ lúc tạo tới lúc đóng, trên các phiếu đầu mục B đóng trong tuần. Rỗng khi mẫu 0.",
+   "fieldname": "b_resolution_avg_hours",
+   "fieldtype": "Float",
+   "label": "Xử lý đầu mục B: trung bình (giờ)"
+  },
+  {
+   "description": "KPI 4. Số phiếu đầu mục B đóng trong tuần.",
+   "fieldname": "b_resolution_sample",
+   "fieldtype": "Int",
+   "label": "Mẫu KPI 4"
+  },
+  {
+   "description": "KPI 5. Tỷ lệ phiếu đầu mục C có ít nhất một Task liên kết tạo trong 72 giờ sau phiếu (đúng 72 giờ tính đạt); tập phiếu là phiếu tạo trong tuần lùi 3 ngày. Rỗng khi mẫu 0.",
+   "fieldname": "c_task_in_3_days_pct",
+   "fieldtype": "Percent",
+   "label": "Đầu mục C có Task trong 3 ngày (%)"
+  },
+  {
+   "description": "KPI 5. Số phiếu đầu mục C tạo trong tuần lùi 3 ngày.",
+   "fieldname": "c_task_sample",
+   "fieldtype": "Int",
+   "label": "Mẫu KPI 5"
+  },
+  {
+   "description": "KPI 6. Số phiếu đang mở lúc hết tuần có tuổi quá 5 ngày (đúng 5 ngày không tính). Không có phiếu nào thì ghi 0.",
+   "fieldname": "stale_over_5_days",
+   "fieldtype": "Int",
+   "label": "Tồn quá 5 ngày"
+  },
+  {
+   "description": "KPI 6. Số phiếu đang mở lúc hết tuần có tuổi quá 7 ngày (đúng 7 ngày không tính). Không có phiếu nào thì ghi 0.",
+   "fieldname": "stale_over_7_days",
+   "fieldtype": "Int",
+   "label": "Tồn quá 7 ngày"
+  }
+ ],
+ "links": [],
+ "modified": "2026-11-15 10:00:00.000000",
+ "modified_by": "Administrator",
+ "module": "ERP AI agent",
+ "name": "ERP AI KPI Week",
+ "owner": "Administrator",
+ "permissions": [
+  {
+   "read": 1,
+   "report": 1,
+   "role": "System Manager"
+  },
+  {
+   "read": 1,
+   "report": 1,
+   "role": "ERP AI Instructor"
+  }
+ ],
+ "sort_field": "modified",
+ "sort_order": "DESC",
+ "states": []
+}

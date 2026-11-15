@@ -458,6 +458,36 @@ DOCTYPE_CONFIG = {
 			("section_error", "Lỗi", "error"),
 		),
 	},
+	# FEAT-007 design.md:254-270, 461-468: one row per ISO week, written by the weekly KPI job.
+	"ERP AI KPI Week": {
+		"folder": "erp_ai_kpi_week",
+		"field_count": 17,
+		"phrases": {
+			"week_start": ("thứ Hai", "mỗi tuần một dòng", "KPI-"),
+			"week_end": ("Chủ nhật",),
+			"computed_at": ("thời điểm", "ranh giới của tuần"),
+			"first_response_median_min": ("KPI 1", "trung vị", "phút", "Rỗng khi mẫu 0"),
+			"first_response_within_15_pct": ("KPI 1", "15 phút", "chưa phản hồi", "Rỗng khi mẫu 0"),
+			"first_response_within_5_pct": ("KPI 1", "5 phút", "chưa phản hồi", "Rỗng khi mẫu 0"),
+			"first_response_sample": ("KPI 1", "số phiếu", "mẫu"),
+			"complete_fields_pct": ("KPI 2", "đang mở", "ưu tiên", "Rỗng khi mẫu 0"),
+			"complete_fields_sample": ("KPI 2", "đang mở"),
+			"closed_without_human_pct": ("KPI 3", "của bot", "Rỗng khi mẫu 0"),
+			"closed_sample": ("KPI 3", "đóng trong tuần"),
+			"b_resolution_avg_hours": ("KPI 4", "đầu mục B", "giờ lịch", "Rỗng khi mẫu 0"),
+			"b_resolution_sample": ("KPI 4", "đầu mục B"),
+			"c_task_in_3_days_pct": ("KPI 5", "đầu mục C", "72 giờ", "Rỗng khi mẫu 0"),
+			"c_task_sample": ("KPI 5", "đầu mục C"),
+			"stale_over_5_days": ("KPI 6", "quá 5 ngày", "đúng 5 ngày không tính"),
+			"stale_over_7_days": ("KPI 6", "quá 7 ngày", "đúng 7 ngày không tính"),
+		},
+		"section_count": 2,
+		"read_only_fields": (),
+		"sections": (
+			("section_week", "Tuần và lúc tính", "week_start"),
+			("section_kpi", "Sáu KPI của tuần", "first_response_median_min"),
+		),
+	},
 }
 
 # FEAT-004 design 2.4: exact contract of the code-change block of ERP AI Setting.

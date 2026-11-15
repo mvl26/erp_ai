@@ -1704,16 +1704,15 @@ LIST_FIELDS = {
 	"Task": ["name", "subject", "ai_ticket"],
 	"ToDo": ["name", "description"],
 	"Notification Log": ["name", "subject"],
-	"Version": ["name", "data"],
 	"Activity Log": ["name", "subject"],
 	"Email Queue": ["name", "message"],
 }
 # R10b: DocTypes outside TICKET_CONTENT_DOCTYPES that name a ticket by a dynamic pair, with the column names of the
-# installed DocType JSON: `{doctype: (type column, name column, column holding the text)}`.
+# installed DocType JSON: `{doctype: (type column, name column, column holding the text)}`. Version (ref_doctype,
+# docname) is held until ADR-024, which bars product code from reading Version, is ruled on.
 LINKED_DOCTYPES = {
 	"ToDo": ("reference_type", "reference_name", "description"),
 	"Notification Log": ("document_type", "document_name", "subject"),
-	"Version": ("ref_doctype", "docname", "data"),
 	"Activity Log": ("reference_doctype", "reference_name", "subject"),
 	"Email Queue": ("reference_doctype", "reference_name", "message"),
 }
@@ -2030,17 +2029,14 @@ class TestExcludedTicketReads(_ExcludedTicketCase):
 
 	def test_record_on_a_comment_or_communication_of_the_ticket_follows_the_ticket(self):
 		# R10a: Helpdesk keeps agent-only comment attachments on the Comment and email attachments on the
-		# Communication; Frappe points an "Attachment" Comment at its Comment (reference_doctype=Comment).
+		# Communication; Frappe points an "Attachment" Comment at its Comment (reference_doctype=Comment). A File on
+		# an HD Ticket Comment is held until D8, which bars product code from naming that DocType, is ruled on.
 		made = {}
 		for kind, text in (("team", self.seed), ("normal", self.plain)):
 			parents = self.records(self.ticket(kind, text), text)
 			made[kind] = {
 				"File on Comment": ("File", self.file(parents["Comment"], text, "Comment")),
 				"File on Communication": ("File", self.file(parents["Communication"], text, "Communication")),
-				"File on HD Ticket Comment": (
-					"File",
-					self.file(parents[LEGACY_NOTE_DOCTYPE], text, LEGACY_NOTE_DOCTYPE),
-				),
 				"Comment on Comment": (
 					"Comment",
 					self.comment(parents["Comment"], text, "Comment", comment_type="Attachment"),

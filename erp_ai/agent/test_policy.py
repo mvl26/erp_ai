@@ -1183,15 +1183,16 @@ class TestExcludedQuery(FrappeTestCase):
 				"Comment": ("reference_doctype", "reference_name"),
 				"Communication": ("reference_doctype", "reference_name"),
 				"File": ("attached_to_doctype", "attached_to_name"),
-				# R10b: the column names of the installed DocType JSON.
+				# R10b: the column names of the installed DocType JSON; Version (ref_doctype, docname) is held until
+				# ADR-024, which bars product code from reading Version, is ruled on.
 				"ToDo": ("reference_type", "reference_name"),
 				"Notification Log": ("document_type", "document_name"),
-				"Version": ("ref_doctype", "docname"),
 				"Activity Log": ("reference_doctype", "reference_name"),
 				"Email Queue": ("reference_doctype", "reference_name"),
 			},
 		)
-		self.assertEqual(policy.TICKET_PARENT_DOCTYPES, ("Comment", "Communication", "HD Ticket Comment"))
+		# R10a; HD Ticket Comment is held until D8, which bars product code from naming it, is ruled on.
+		self.assertEqual(policy.TICKET_PARENT_DOCTYPES, ("Comment", "Communication"))
 		self.assertEqual(policy.EXCLUDED_TICKET_REASON, "bản ghi thuộc phiếu không được phép đưa cho AI")
 
 	def test_owning_ticket_per_doctype(self):
@@ -1257,9 +1258,9 @@ class TestExcludedQuery(FrappeTestCase):
 					self.assertEqual(policy.ticket_content_filters(doctype), ([], []))
 
 	def test_ticket_content_filters_shapes(self):
-		# No Comment, Communication or HD Ticket Comment points at these names: the name list is the tickets only.
+		# No Comment or Communication points at these names: the name list is the tickets only.
 		names = ["T-1", "T-2"]
-		owners = ["HD Ticket", "Comment", "Communication", "HD Ticket Comment"]
+		owners = ["HD Ticket", "Comment", "Communication"]
 		real_fieldnames = policy.ticket_link_fieldnames
 		with patch.object(policy, "excluded_ticket_names", return_value=names):
 			self.assertEqual(policy.ticket_content_filters("HD Ticket"), ([["name", "not in", names]], []))
@@ -1267,7 +1268,7 @@ class TestExcludedQuery(FrappeTestCase):
 				("Comment", ("reference_doctype", "reference_name")),
 				("File", ("attached_to_doctype", "attached_to_name")),
 				("ToDo", ("reference_type", "reference_name")),
-				("Version", ("ref_doctype", "docname")),
+				("Email Queue", ("reference_doctype", "reference_name")),
 			):
 				with self.subTest(doctype=doctype):
 					self.assertEqual(
@@ -1296,13 +1297,12 @@ class TestExcludedQuery(FrappeTestCase):
 				)
 
 	def test_record_on_a_ticket_comment_or_communication_belongs_to_the_ticket(self):
-		# R10a: one hop more through Comment, Communication and HD Ticket Comment, no deeper; R10b: ToDo names its
-		# ticket by its own pair.
+		# R10a: one hop more through Comment and Communication, no deeper (HD Ticket Comment is held until D8 is
+		# ruled on); R10b: ToDo names its ticket by its own pair.
 		set_agent_settings(excluded_teams=TEAM, excluded_title_prefixes="")
 		excluded = self._ticket(agent_group=TEAM)
 		comment = self._comment(excluded)
 		communication = self._communication(excluded)
-		legacy = self._legacy_comment(excluded)
 		on_comment = self._comment(comment, "Comment")
 		todo = frappe.get_doc(
 			{
@@ -1316,7 +1316,6 @@ class TestExcludedQuery(FrappeTestCase):
 		for doctype, name in (
 			("File", self._file("Comment", comment)),
 			("File", self._file("Communication", communication)),
-			("File", self._file("HD Ticket Comment", legacy)),
 			("Comment", on_comment),
 			("ToDo", todo.name),
 		):
@@ -1328,10 +1327,10 @@ class TestExcludedQuery(FrappeTestCase):
 		self.assertEqual(filters, [])
 		self.assertEqual(
 			or_filters[0],
-			["attached_to_doctype", "not in", ["HD Ticket", "Comment", "Communication", "HD Ticket Comment"]],
+			["attached_to_doctype", "not in", ["HD Ticket", "Comment", "Communication"]],
 		)
 		self.assertEqual(or_filters[1][:2], ["attached_to_name", "not in"])
-		self.assertLessEqual({excluded, comment, communication, legacy}, set(or_filters[1][2]))
+		self.assertLessEqual({excluded, comment, communication}, set(or_filters[1][2]))
 		self.assertNotIn(on_comment, or_filters[1][2])
 
 	def test_is_ticket_record_excluded_follows_the_owning_ticket(self):

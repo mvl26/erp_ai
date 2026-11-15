@@ -1,6 +1,7 @@
 import os
 import shutil
 import tempfile
+import unicodedata
 from datetime import datetime, timedelta
 from unittest.mock import patch
 
@@ -884,3 +885,42 @@ class TestSiteEnvironment(FrappeTestCase):
 		set_agent_settings(site_environment="test")
 		self.assertEqual(policy.site_environment(frappe._dict()), "production")
 		self.assertEqual(policy.site_environment(frappe.get_doc(SETTING_DOCTYPE)), "test")
+
+
+class TestTitlePrefix(FrappeTestCase):
+	# AC-9 (a), U2.md:93-94, :112-113, :126-128: a title starting with a configured prefix (same NFC + spaces +
+	# casefold key on both sides) is excluded; only the start of the title counts.
+	def setUp(self):
+		commit_guard = patch.object(
+			frappe.db, "commit", side_effect=AssertionError("test must not commit the transaction")
+		)
+		commit_guard.start()
+		self.addCleanup(commit_guard.stop)
+		self.addCleanup(frappe.db.rollback)
+		keep_agent_settings(self)
+
+	def test_prefix_boundaries(self):
+		self.assertEqual(policy.EXCLUDED_TITLE_PREFIXES_FIELD, "excluded_title_prefixes")
+		self.assertEqual(policy.SUBJECT_FIELD, "subject")
+		ke_toan_nfc = unicodedata.normalize("NFC", "[Kế toán]")
+		ke_toan_nfd = unicodedata.normalize("NFD", "[Kế toán]")
+		self.assertNotEqual(ke_toan_nfc, ke_toan_nfd)
+		# Empty and blank lines are dropped: an empty prefix would exclude every title.
+		set_agent_settings(excluded_title_prefixes=f"[HR]\n\n   \n{ke_toan_nfc}\n")
+		self.assertEqual(policy.excluded_title_prefixes(), ("[hr]", "[kế toán]"))
+		for subject in ("[HR] X", "  [hr]   X", f"{ke_toan_nfc}X", f"{ke_toan_nfd}X"):
+			with self.subTest(subject=subject):
+				self.assertTrue(policy.has_excluded_title(subject))
+		for subject in ("Hỏi về [HR]", "[HRM] X", "", None):
+			with self.subTest(subject=subject):
+				self.assertFalse(policy.has_excluded_title(subject))
+		# An empty configuration has no rule.
+		set_agent_settings(excluded_title_prefixes="\n  \n")
+		self.assertEqual(policy.excluded_title_prefixes(), ())
+		self.assertFalse(policy.has_excluded_title("[HR] X"))
+		# The field missing (before migrate): get_single_value throws; no rule, never raises.
+		set_agent_settings(excluded_title_prefixes="[HR]")
+		missing = frappe.ValidationError("Field excluded_title_prefixes does not exist on ERP AI Setting")
+		with patch.object(frappe.db, "get_single_value", side_effect=missing):
+			self.assertEqual(policy.excluded_title_prefixes(), ())
+			self.assertFalse(policy.has_excluded_title("[HR] X"))

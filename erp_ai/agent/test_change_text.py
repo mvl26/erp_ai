@@ -768,13 +768,20 @@ class TestRestartLabel(FrappeTestCase):
 
 	def test_aware_or_bad_sent_at_raises_value_error(self):
 		for sent_at in (
-			SENT_AT.replace(tzinfo=datetime.UTC),
+			SENT_AT.replace(tzinfo=datetime.timezone.utc),
 			"2026-11-15 14:05:00+07:00",
 			"15/11/2026 14:05",
 			"not a date",
 			1763215500,
 			datetime.date(2026, 11, 15),
 		):
+			with self.subTest(sent_at=sent_at):
+				with self.assertRaises(ValueError):
+					proposal_notes(code_fields(restart_status=RESTART_STATUS_SENT, restart_sent_at=sent_at))
+
+	def test_falsy_sent_at_of_other_type_raises_value_error(self):
+		# only None and "" mean "no time" (P-1 point 4); another type is ValueError (point 3)
+		for sent_at in (0, False, [], {}, 0.0):
 			with self.subTest(sent_at=sent_at):
 				with self.assertRaises(ValueError):
 					proposal_notes(code_fields(restart_status=RESTART_STATUS_SENT, restart_sent_at=sent_at))

@@ -184,10 +184,14 @@ def _sent_at_text(sent_at) -> str:
 
 
 def _restart_label(status, sent_at) -> str:
-	"""The restart label of `restart_status`; ValueError for a status it does not know."""
+	"""The restart label of `restart_status`; ValueError for a status it does not know.
+
+	Only `None` and `""` count as an empty `restart_sent_at` (P-1 point 4); any other value
+	goes through `_sent_at_text`, so a falsy value of another type is a ValueError too.
+	"""
 	if status not in RESTART_LABELS:
 		raise ValueError(f"restart_status không hỗ trợ: {status!r}")
-	if status == RESTART_STATUS_SENT and sent_at:
+	if status == RESTART_STATUS_SENT and sent_at not in (None, ""):
 		return RESTART_SENT_AT_LABEL.format(sent_at=_sent_at_text(sent_at))
 	return RESTART_LABELS[status]
 
@@ -199,6 +203,9 @@ def proposal_notes(proposal_fields) -> list[str]:
 	fields are read, never git. A sentence whose value is missing or carries a URL is left out.
 	A block (child rows or a `command_list`) starts with its counts, items and commands.
 	A filled `restart_status` adds its label as the last line, for every shape.
+
+	Raises ValueError for an unknown `restart_status`, and for a `restart_sent_at` that is
+	an aware datetime, an unreadable string or another type (CHG-002 design-addendum-5 P-1).
 	"""
 	rows = proposal_fields.get("operations")
 	command_list = proposal_fields.get("command_list")

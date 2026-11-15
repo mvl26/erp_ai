@@ -536,47 +536,56 @@ class TestBudget(FrappeTestCase):
 
 class TestLevels(FrappeTestCase):
 	# AC-31, U1 3.1: the main-path level of a ticket = the smaller of the permission level and the category cap.
-	DEFAULT_CAPS = {"A": "L2", "B": "L3", "C": "L1", "D": "L2", "E": "L1", "F": "L3"}
-	# Expected main-path level per category for permission_level L0, L1, L2, L3 under the default caps.
-	UNDER_BUDGET = {
-		"A": ("L0", "L1", "L2", "L2"),
-		"B": ("L0", "L1", "L2", "L3"),
-		"C": ("L0", "L1", "L1", "L1"),
-		"D": ("L0", "L1", "L2", "L2"),
-		"E": ("L0", "L1", "L1", "L1"),
-		"F": ("L0", "L1", "L2", "L3"),
-	}
+	# (category, default cap, expected main-path level for permission_level L0, L1, L2, L3 under budget)
+	CATEGORY_ROWS = (
+		("A", "L2", ("L0", "L1", "L2", "L2")),
+		("B", "L3", ("L0", "L1", "L2", "L3")),
+		("C", "L1", ("L0", "L1", "L1", "L1")),
+		("D", "L2", ("L0", "L1", "L2", "L2")),
+		("E", "L1", ("L0", "L1", "L1", "L1")),
+		("F", "L3", ("L0", "L1", "L2", "L3")),
+	)
 	# Over budget the permission level is already capped at L1 (never raises L0): every category reads <= L1.
 	OVER_BUDGET = ("L0", "L1", "L1", "L1")
 
 	def setUp(self):
 		self.addCleanup(frappe.db.rollback)
 		keep_agent_settings(self)
-		for name in ("LEVEL_CAP_FIELD_PREFIX", "UNKNOWN_CATEGORY_LEVEL", "category_level_cap", "main_path_level"):
+		for name in (
+			"LEVEL_CAP_FIELD_PREFIX",
+			"UNKNOWN_CATEGORY_LEVEL",
+			"category_level_cap",
+			"main_path_level",
+		):
 			self.assertTrue(hasattr(policy, name), f"policy has no {name}")
 
-	def _caps(self, caps):
-		return {f"level_cap_{category.lower()}": level for category, level in caps.items()}
+	def _caps(self, cap=None):
+		"""level_cap_<x> of every category: the default caps, or `cap` for all."""
+		return {
+			f"level_cap_{category.lower()}": cap or default for category, default, _ in self.CATEGORY_ROWS
+		}
 
 	def test_main_path_level_matrix(self):
 		self.assertEqual(policy.LEVEL_CAP_FIELD_PREFIX, "level_cap_")
 		meta = frappe.get_meta(SETTING_DOCTYPE)
-		for field, level in self._caps(self.DEFAULT_CAPS).items():
+		for field, level in self._caps().items():
 			with self.subTest(default=field):
 				self.assertEqual(meta.get_field(field).default, level)
 		# Read from the stored setting carrying the default caps (the matrix of AC-31: 6 x 4 x 2 = 48 cases).
-		set_agent_settings(monthly_budget_usd=0, **self._caps(self.DEFAULT_CAPS))
+		set_agent_settings(monthly_budget_usd=0, **self._caps())
 		cases = 0
 		for level_index, level in enumerate(("L0", "L1", "L2", "L3")):
 			set_agent_settings(permission_level=level)
 			settings = frappe.get_doc(SETTING_DOCTYPE)
 			for over_budget in (False, True):
 				permission_level = policy.effective_level(settings, over_budget=over_budget)
-				for category, expected_by_level in self.UNDER_BUDGET.items():
+				for category, default_cap, expected_by_level in self.CATEGORY_ROWS:
 					expected = (self.OVER_BUDGET if over_budget else expected_by_level)[level_index]
 					with self.subTest(category=category, level=level, over_budget=over_budget):
-						self.assertEqual(policy.category_level_cap(settings, category), self.DEFAULT_CAPS[category])
-						self.assertEqual(policy.main_path_level(settings, permission_level, category), expected)
+						self.assertEqual(policy.category_level_cap(settings, category), default_cap)
+						self.assertEqual(
+							policy.main_path_level(settings, permission_level, category), expected
+						)
 					cases += 1
 		self.assertEqual(cases, 48)
 
@@ -598,7 +607,7 @@ class TestLevels(FrappeTestCase):
 
 	def test_unknown_category_or_bad_cap_reads_l1(self):
 		self.assertEqual(policy.UNKNOWN_CATEGORY_LEVEL, "L1")
-		all_l3 = frappe._dict(self._caps(dict.fromkeys(self.DEFAULT_CAPS, "L3")))
+		all_l3 = frappe._dict(self._caps("L3"))
 		# An unknown category (None, empty, lower case, not one of A..F) reads L1 even when every cap is L3.
 		for category in (None, "", "a", "G", "AB", " A", "level_cap_a"):
 			with self.subTest(category=category):

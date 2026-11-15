@@ -1910,7 +1910,8 @@ ROOT_CHECK_ALLOWLIST = frozenset(
 	}
 )
 
-# Design 2.1 state group (11 names) + the 4 git result fields of amendment 1, in transitions.STATE_FIELDS order.
+# Design 2.1 state group (11 names) + the 4 git result fields of amendment 1 + the 4 CHG-002 design 3.6 fields,
+# in transitions.STATE_FIELDS order.
 STATE_FIELDS = (
 	"change_status",
 	"decided_by",
@@ -1922,7 +1923,11 @@ STATE_FIELDS = (
 	"exit_code",
 	"duration_ms",
 	"command_output",
+	"command_results",
 	"failure_reason",
+	"created_dirs",
+	"restart_status",
+	"restart_sent_at",
 	"applied_branch",
 	"applied_ahead_count",
 	"apply_commit_sha",
@@ -4649,7 +4654,7 @@ class TestArchitecture(unittest.TestCase):
 		self.assertEqual(check_transitions_imported_only_by_controller_and_changes(self.sources), [])
 
 	def test_change_state_fields_written_only_in_changes(self):
-		self.assertEqual(len(STATE_FIELDS), 15)
+		self.assertEqual(len(STATE_FIELDS), 19)
 		declared = [
 			ast.literal_eval(node.value)
 			for node in parse(TRANSITIONS_FILE, self.sources[TRANSITIONS_FILE]).body

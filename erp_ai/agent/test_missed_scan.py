@@ -358,6 +358,88 @@ class TestMissedScan(FrappeTestCase):
 		)
 		self.assertEqual(getattr(missed_scan, "SCAN_MAX_FAILURES", None), missed_scan.SCAN_BATCH)
 
+	def test_enqueue_failures_stop_at_the_cap(self):
+		"""D-16: enqueue errors alone stop the run once SCAN_MAX_FAILURES is reached."""
+		tickets = [self._ticket(creation=OLD_ENOUGH + timedelta(seconds=second)) for second in range(3)]
+		self._enable_agent()
+		with (
+			patch.object(missed_scan, "SCAN_MAX_FAILURES", 2, create=True),
+			patch.object(queue, "enqueue_agent_run", side_effect=RuntimeError(SECRET_TEXT)) as enqueue_agent_run,
+			patch("frappe.enqueue"),
+			patch.object(missed_scan.frappe, "log_error") as log_error,
+			patch.object(missed_scan.frappe, "logger") as logger,
+		):
+			missed_scan.scan_missed_tickets(NOW)
+
+		self.assertEqual(enqueue_agent_run.call_count, 2)
+		self._assert_one_constant_title_error(
+			log_error, tickets, message="missed_scan failed=2 error=RuntimeError"
+		)
+		self.assertEqual(
+			logger.return_value.method_calls,
+			[unittest_call.error("missed_scan: lỗi %s ở %s phiếu, đã xếp %s phiếu", "RuntimeError", 2, 0)],
+		)
+
+	def test_predicate_and_enqueue_failures_share_one_cap(self):
+		"""Design-w1-fixes-17 Điểm 2: one failure list for both loops; one predicate + one enqueue error reach a cap of 2."""
+		tickets = [self._ticket(creation=OLD_ENOUGH + timedelta(seconds=second)) for second in range(4)]
+		real_can_send = policy.can_send_ticket
+
+		def can_send_ticket(name):
+			if name == tickets[0]:
+				raise RuntimeError(SECRET_TEXT)
+			return real_can_send(name)
+
+		self._enable_agent()
+		with (
+			patch.object(missed_scan, "SCAN_MAX_FAILURES", 2, create=True),
+			patch.object(policy, "can_send_ticket", side_effect=can_send_ticket),
+			patch.object(queue, "enqueue_agent_run", side_effect=RuntimeError(SECRET_TEXT)) as enqueue_agent_run,
+			patch("frappe.enqueue"),
+			patch.object(missed_scan.frappe, "log_error") as log_error,
+			patch.object(missed_scan.frappe, "logger") as logger,
+		):
+			missed_scan.scan_missed_tickets(NOW)
+
+		self.assertEqual([queued.args[0] for queued in enqueue_agent_run.call_args_list], [tickets[1]])
+		self._assert_one_constant_title_error(
+			log_error, tickets, message="missed_scan failed=2 error=RuntimeError"
+		)
+		self.assertEqual(
+			logger.return_value.method_calls,
+			[unittest_call.error("missed_scan: lỗi %s ở %s phiếu, đã xếp %s phiếu", "RuntimeError", 2, 0)],
+		)
+
+	def test_failed_tickets_do_not_count_toward_the_batch(self):
+		"""A ticket whose predicate raises is not part of SCAN_BATCH: the batch still fills with good tickets."""
+		tickets = [self._ticket(creation=OLD_ENOUGH + timedelta(seconds=second)) for second in range(3)]
+		real_can_send = policy.can_send_ticket
+
+		def can_send_ticket(name):
+			if name == tickets[0]:
+				raise RuntimeError(SECRET_TEXT)
+			return real_can_send(name)
+
+		failures: list[str] = []
+		with (
+			patch.object(missed_scan, "SCAN_BATCH", 2),
+			patch.object(policy, "can_send_ticket", side_effect=can_send_ticket),
+		):
+			found = missed_scan.find_missed_tickets(NOW, failures=failures)
+
+		self.assertEqual(found, tickets[1:])
+		self.assertEqual(failures, ["RuntimeError"])
+
+	def test_run_level_error_inside_find_logged_once_and_swallowed(self):
+		"""D-17 run-level path for an error raised inside find_missed_tickets outside the per-ticket loop."""
+		tickets = [self._ticket(creation=OLD_ENOUGH + timedelta(seconds=second)) for second in range(2)]
+		log_error, logger = self._scan_with_error(missed_scan, "_agent_enabled_at", RuntimeError(SECRET_TEXT))
+		self._assert_one_constant_title_error(log_error, tickets)
+		self.assertEqual(
+			logger.return_value.method_calls,
+			[unittest_call.error("missed_scan: lỗi %s, đã xếp %s phiếu", "RuntimeError", 0)],
+		)
+
 	def test_run_level_error_logged_once_and_swallowed(self):
 		"""D-17 run-level error path (unchanged from T34): one log_error, one logger line, no exception escapes."""
 		tickets = [self._ticket(creation=OLD_ENOUGH + timedelta(seconds=second)) for second in range(2)]

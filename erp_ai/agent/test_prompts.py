@@ -7,6 +7,7 @@ from frappe.tests.utils import FrappeTestCase
 from erp_ai.agent import prompts
 from erp_ai.agent.policy import PermissionSwitches
 from erp_ai.agent.tools import registry
+from erp_ai.constants import TRIGGER_COMMENT_MENTION, TRIGGER_TICKET_INSERT
 from erp_ai.test_utils import keep_agent_settings
 
 FLAG_NAMES = ("change_tools", "site_admin_tools", "unrestricted_tools", "act_now", "ask_only")
@@ -432,3 +433,117 @@ class TestLaterMessages(FrappeTestCase):
 			alone["messages"][0]["content"],
 			prompts.ticket_text(SUBJECT, DESCRIPTION) + "\n\n" + prompts.LATER_MESSAGES_LABEL + "\n- tin 7",
 		)
+
+
+TICKET = {
+	"subject": SUBJECT,
+	"description": DESCRIPTION,
+	"status": "Open",
+	"priority": "High",
+	"ticket_type": "Bug",
+	"agent_group": "IT",
+	"creation": datetime.datetime(2026, 11, 16, 9, 0),
+}
+COMMENTS = [{"author": "Người tạo", "role": "requester", "content": "<p>còn kẹt</p>"}]
+CLASSIFICATION = {"category": "A", "confidence_pct": 90}
+
+
+def _old_initial_message(trigger, classification):
+	"""The first reasoning message before T107, rebuilt by hand for TICKET and COMMENTS."""
+	payload = {
+		"ticket": {
+			"subject": SUBJECT,
+			"description": "Máy in báo kẹt giấy",
+			"status": "Open",
+			"priority": "High",
+			"ticket_type": "Bug",
+			"agent_group": "IT",
+			"creation": TICKET["creation"],
+		},
+		"comments": [{"author": "Người tạo", "role": "requester", "content": "còn kẹt"}],
+		"trigger": trigger,
+		"classification": classification,
+	}
+	task = prompts.TASK_COMMENT if trigger == TRIGGER_COMMENT_MENTION else prompts.TASK_NEW_TICKET
+	return json.dumps(payload, ensure_ascii=False, indent=2, default=str) + "\n\n" + task
+
+
+def _payload(message: str) -> dict:
+	return json.JSONDecoder().raw_decode(message)[0]
+
+
+class TestInitialMessage(FrappeTestCase):
+	"""AC-24, AC-65 (c) (U4b.md:196-205, w1.md:100): the ticket fields and the "already has guidance" fact are data
+	of the ticket in the first reasoning message, never configuration (ADR-030, ADR-036 QĐ 7)."""
+
+	def setUp(self):
+		keep_agent_settings(self)
+
+	def test_fields_key_only_when_given(self):
+		for trigger in (TRIGGER_COMMENT_MENTION, TRIGGER_TICKET_INSERT):
+			old = _old_initial_message(trigger, CLASSIFICATION)
+			for extra in (
+				{},
+				{"ticket_fields": None},
+				{"ticket_fields": {}},
+				{"ticket_fields": {"project": "", "origin": None}},
+				{"guidance_posted": False},
+			):
+				with self.subTest(trigger=trigger, extra=extra):
+					message = prompts.build_initial_message(
+						TICKET, COMMENTS, trigger, CLASSIFICATION, **extra
+					)
+					self.assertEqual(message, old)
+					self.assertNotIn("fields", _payload(message)["ticket"])
+		labels = prompts.TICKET_FIELD_LABELS
+		fields = {"serial_no": "SN-01", "item_code": LONG, "erp_module": "Kho", "origin": None}
+
+		message = prompts.build_initial_message(
+			TICKET, COMMENTS, TRIGGER_TICKET_INSERT, CLASSIFICATION, ticket_fields=fields
+		)
+
+		payload = _payload(message)
+		self.assertEqual(
+			list(payload["ticket"].pop("fields").items()),
+			[
+				(labels["erp_module"], "Kho"),
+				(labels["item_code"], ("x" + "y" * 300)[:200]),
+				(labels["serial_no"], "SN-01"),
+			],
+		)
+		# nothing else moved
+		self.assertEqual(payload, _payload(_old_initial_message(TRIGGER_TICKET_INSERT, CLASSIFICATION)))
+		self.assertTrue(message.endswith("\n\n" + prompts.TASK_NEW_TICKET), message)
+		with self.assertRaises(ValueError):
+			prompts.build_initial_message(
+				TICKET, COMMENTS, TRIGGER_TICKET_INSERT, None, ticket_fields={"x": 1}
+			)
+
+	def test_guidance_posted_adds_flag_and_task_line(self):
+		self.assertEqual(
+			prompts.TASK_AFTER_GUIDANCE,
+			"Phiếu đã có comment Hướng xử lý của bot. Chỉ làm việc người vừa nhờ và báo kết quả; "
+			"không viết lại hướng xử lý.",
+		)
+		for trigger, task in (
+			(TRIGGER_COMMENT_MENTION, prompts.TASK_COMMENT),
+			(TRIGGER_TICKET_INSERT, prompts.TASK_NEW_TICKET),
+		):
+			with self.subTest(trigger=trigger):
+				message = prompts.build_initial_message(TICKET, COMMENTS, trigger, None, guidance_posted=True)
+				both = prompts.build_initial_message(
+					TICKET, COMMENTS, trigger, None, ticket_fields={"project": "P"}, guidance_posted=True
+				)
+
+				payload = _payload(message)
+				self.assertIs(payload["ticket"].pop("guidance_posted"), True)
+				self.assertEqual(payload, _payload(_old_initial_message(trigger, None)))
+				self.assertTrue(message.endswith(f"\n\n{task}\n{prompts.TASK_AFTER_GUIDANCE}"), message)
+				self.assertEqual(message.count(prompts.TASK_AFTER_GUIDANCE), 1)
+				ticket = _payload(both)["ticket"]
+				self.assertEqual(ticket["fields"], {prompts.TICKET_FIELD_LABELS["project"]: "P"})
+				self.assertIs(ticket["guidance_posted"], True)
+				self.assertTrue(both.endswith(f"\n\n{task}\n{prompts.TASK_AFTER_GUIDANCE}"), both)
+		plain = prompts.build_initial_message(TICKET, COMMENTS, TRIGGER_COMMENT_MENTION, None)
+		self.assertNotIn("guidance_posted", _payload(plain)["ticket"])
+		self.assertNotIn(prompts.TASK_AFTER_GUIDANCE, plain)

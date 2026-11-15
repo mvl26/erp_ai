@@ -29,6 +29,7 @@ from erp_ai.constants import (
 	CHANGE_STATUS_FAILED,
 	CHANGE_STATUS_PENDING,
 	CHANGE_STATUS_STALE,
+	CHANGE_STATUS_UNDOING,
 	LOG_DOCTYPE,
 	PROPOSAL_DOCTYPE,
 	ROLE_INSTRUCTOR,
@@ -912,15 +913,22 @@ class TestBlockAllOrNothing(BlockApplyTestCase):
 						self.assertEqual(now, before)
 
 	def test_whole_block_written_then_given_back_until_one_commit_exists(self):
-		# T36 boundary: the commands of a block come later (T37); a block with a command still has every
-		# write given back, 0 commits, 0 commands.
+		# Design 4.2 steps 6 and 7: a block with a command whose one commit fails has every write given back,
+		# 0 commits and 0 commands.
 		name = self.mixed_block(commands=[["--site", frappe.local.site, "migrate"]])
 		before = self.tree()
 		calls = self.record()
+		failed = self.commit_result(output="fatal: không commit được")
+		with (
+			patch.object(apply_job.process_runner, "git_commit_only", return_value=failed),
+			patch.object(apply_job.process_runner, "run_bench") as bench,
+		):
+			self.run_apply(name)
 
-		self.run_apply(name)
-
-		self.assert_given_back(name, change_guard.OP_UNKNOWN, before)
+		bench.assert_not_called()
+		self.assert_given_back(
+			name, "commit git lỗi, đã trả file về như trước: fatal: không commit được", before
+		)
 		self.assertEqual(
 			[(call[0], call[1][1]) for call in calls if call[0].startswith("git_")],
 			[
@@ -1724,3 +1732,254 @@ class TestLegacyThroughAdapter(BlockApplyTestCase):
 			"mục 1 (): " + change_guard.OP_FIELDS.format(action=change_guard.OP_ACTIONS[CHANGE_OP_EDIT]),
 			before,
 		)
+
+
+class _Clock:
+	"""A `time` stand-in for `apply_job`: `monotonic()` is `now`, moved only by the test."""
+
+	def __init__(self):
+		self.now = 1000.0
+
+	def monotonic(self):
+		return self.now
+
+
+def _bench(exit_code=0, output="", duration_ms=1, timed_out=False):
+	return process_runner.CommandResult(
+		exit_code=exit_code, output=output, duration_ms=duration_ms, timed_out=timed_out, not_found=False
+	)
+
+
+RESTART = ["restart"]
+
+
+class BlockCommandsTestCase(BlockApplyTestCase):
+	"""A block whose commands run through a stubbed `run_bench` under a clock the test moves."""
+
+	def setUp(self):
+		super().setUp()
+		self.site = frappe.local.site
+		self.migrate = ["--site", self.site, "migrate"]
+		self.clear = ["--site", self.site, "clear-cache"]
+		self.clock = _Clock()
+		clock = patch.object(apply_job, "time", self.clock)
+		clock.start()
+		self.addCleanup(clock.stop)
+
+	def py_block(self, commands):
+		"""One edit of the `.py` file, then `commands` (a `.py` block ends with migrate then restart)."""
+		item = {"kind": CHANGE_OP_EDIT, "path": f"{APP}/{LEGACY_REL}", "before": BEFORE, "after": AFTER}
+		return self.approve(self.block([item], commands))
+
+	def stub_bench(self, answers=None, spend=None):
+		"""Patch `run_bench`; each call appends `(args, limit_s, HEAD, stored sha)` to the list returned.
+		`answers[n]` (1-based) is what call n returns, `spend[n]` the seconds it moves the clock."""
+		calls = []
+		self.db_commits_at = []
+
+		def run_bench(args, limit_s):
+			self.db_commits_at.append(frappe.db.commit.call_count)
+			sha = frappe.db.get_value(PROPOSAL_DOCTYPE, self.current, "apply_commit_sha")
+			calls.append((list(args), limit_s, self.git("rev-parse", "HEAD"), sha))
+			number = len(calls)
+			self.clock.now += (spend or {}).get(number, 0)
+			return (answers or {}).get(number, _bench(output=f"xong {number}", duration_ms=10 * number))
+
+		patcher = patch.object(apply_job.process_runner, "run_bench", side_effect=run_bench)
+		patcher.start()
+		self.addCleanup(patcher.stop)
+		return calls
+
+	def results(self, name):
+		row = frappe.db.get_value(
+			PROPOSAL_DOCTYPE,
+			name,
+			[
+				"change_status",
+				"failure_reason",
+				"apply_commit_sha",
+				"command_results",
+				"exit_code",
+				"duration_ms",
+				"command_output",
+				"restart_status",
+			],
+			as_dict=True,
+		)
+		row.command_results = json.loads(row.command_results or "null")
+		return row
+
+	def entry(self, args, exit_code=0, duration_ms=10, output="xong 1", timed_out=False):
+		return {
+			"args": args,
+			"exit_code": exit_code,
+			"duration_ms": duration_ms,
+			"timed_out": timed_out,
+			"output": output,
+		}
+
+
+class TestBlockCommands(BlockCommandsTestCase):
+	"""Design 4.2 steps 9, 10 and 12: the stored commands after the one commit, in order, `restart` left out."""
+
+	def test_commands_run_in_stored_order_results_recorded(self):
+		name = self.current = self.py_block([self.clear, self.migrate, RESTART])
+		start = self.git("rev-parse", "HEAD")
+		answers = {
+			1: _bench(output="đã xóa cache", duration_ms=1234),
+			2: _bench(output="đã migrate", duration_ms=5678),
+		}
+		calls = self.stub_bench(answers, spend={1: 7})
+		# Not written by this job (T38): seeded only to show the logger reads it.
+		frappe.db.set_value(PROPOSAL_DOCTYPE, name, "restart_status", "Đã gửi", update_modified=False)
+		real_record = transitions.record_commit
+		recorded_at = []
+
+		def record_commit(*args, **kwargs):
+			real_record(*args, **kwargs)
+			recorded_at.append(frappe.db.commit.call_count)
+
+		with (
+			patch.object(frappe, "logger") as logger,
+			patch.object(apply_job.transitions, "record_commit", side_effect=record_commit),
+		):
+			self.run_apply(name)
+
+		state = self.results(name)
+		self.assertEqual(state.change_status, CHANGE_STATUS_APPLIED, state.failure_reason)
+		head = self.git("rev-parse", "HEAD")
+		self.assertNotEqual(head, start)
+		self.assertEqual(state.apply_commit_sha, head)
+		# The commit exists and its sha is stored before command 1; each limit is what is left (NFR-3);
+		# `restart` is never run here.
+		limit = int(apply_job.COMMAND_TIMEOUT_S)
+		self.assertEqual(calls, [(self.clear, limit, head, head), (self.migrate, limit - 7, head, head)])
+		self.assertEqual(
+			state.command_results,
+			[
+				self.entry(self.clear, duration_ms=1234, output="đã xóa cache"),
+				self.entry(self.migrate, duration_ms=5678, output="đã migrate"),
+			],
+		)
+		# The scalar result fields are those of the last command run.
+		self.assertEqual((state.exit_code, state.duration_ms, state.command_output), (0, 5678, "đã migrate"))
+		# Design 4.2 step 8 then 9: the recorded sha is committed to the DB before command 1 runs.
+		self.assertEqual(len(recorded_at), 1)
+		self.assertGreater(self.db_commits_at[0], recorded_at[0])
+		line = logger.return_value.info.call_args.args
+		self.assertTrue((line[0] % line[1:]).endswith(" ops=1 commands=3 restart=Đã gửi"), line)
+
+	def test_command_2_fails_stops_keeps_commit_status_failed_undoable(self):
+		third = ["--site", self.site, "clear-website-cache"]
+		name = self.current = self.mixed_block(commands=[self.migrate, self.clear, third])
+		calls = self.stub_bench({2: _bench(exit_code=3, output="hỏng cache", duration_ms=42)})
+
+		self.run_apply(name)
+
+		state = self.results(name)
+		self.assertEqual(
+			(state.change_status, state.failure_reason),
+			(CHANGE_STATUS_FAILED, f"lệnh 2 (bench --site {self.site} clear-cache): lệnh trả mã 3"),
+		)
+		self.assertEqual([call[0] for call in calls], [self.migrate, self.clear])
+		# A-33: nothing is given back after the commit; the sha and the files stay.
+		self.assertEqual(state.apply_commit_sha, self.git("rev-parse", "HEAD"))
+		self.assertEqual(self.name_status(), MIXED_COMMIT)
+		self.assert_mixed_files_applied()
+		self.assertEqual(
+			state.command_results,
+			[
+				self.entry(self.migrate),
+				self.entry(self.clear, exit_code=3, duration_ms=42, output="hỏng cache"),
+			],
+		)
+		self.assertEqual((state.exit_code, state.duration_ms, state.command_output), (3, 42, "hỏng cache"))
+		self.assertEqual(transitions.request_undo(name, ACTOR), CHANGE_STATUS_UNDOING)
+
+	def test_command_timeout_names_command_no_restart(self):
+		name = self.current = self.py_block([self.clear, self.migrate, RESTART])
+		timed_out = _bench(exit_code=None, output="đang migrate", duration_ms=99, timed_out=True)
+		calls = self.stub_bench({2: timed_out})
+
+		self.run_apply(name)
+
+		state = self.results(name)
+		self.assertEqual(
+			(state.change_status, state.failure_reason),
+			(CHANGE_STATUS_FAILED, f"lệnh 2 (bench --site {self.site} migrate): quá thời gian"),
+		)
+		self.assertEqual([call[0] for call in calls], [self.clear, self.migrate])
+		self.assertEqual(state.apply_commit_sha, self.git("rev-parse", "HEAD"))
+		self.assertEqual(
+			state.command_results[1],
+			self.entry(self.migrate, exit_code=None, duration_ms=99, output="đang migrate", timed_out=True),
+		)
+		self.assertFalse(state.restart_status)
+
+	def test_less_than_one_second_left_not_run(self):
+		limit = apply_job.COMMAND_TIMEOUT_S
+		cases = (
+			# Command 1 leaves 0.5 s: command 2 is not run, and the reason names it.
+			(
+				"0.5 s left",
+				limit - 0.5,
+				[self.clear],
+				f"lệnh 2 (bench --site {self.site} migrate): quá thời gian",
+			),
+			# 1.5 s left is still a run, with `limit_s = 1`.
+			("1.5 s left", limit - 1.5, [self.clear, self.migrate], None),
+		)
+		for label, spent, ran, reason in cases:
+			with self.subTest(label):
+				self.clock.now = 1000.0
+				name = self.current = self.approve(self.block([], [self.clear, self.migrate]))
+				calls = self.stub_bench(spend={1: spent})
+
+				self.run_apply(name)
+
+				state = self.results(name)
+				self.assertEqual([call[0] for call in calls], ran)
+				if reason is None:
+					self.assertEqual(state.change_status, CHANGE_STATUS_APPLIED, state.failure_reason)
+					self.assertEqual(calls[1][1], 1)
+					continue
+				self.assertEqual((state.change_status, state.failure_reason), (CHANGE_STATUS_FAILED, reason))
+				self.assertEqual(
+					state.command_results,
+					[
+						self.entry(self.clear),
+						self.entry(self.migrate, exit_code=None, duration_ms=0, output="", timed_out=True),
+					],
+				)
+				# The scalar fields stay those of command 1, the last one run.
+				self.assertEqual((state.duration_ms, state.command_output), (10, "xong 1"))
+
+
+class TestOneApproval(BlockCommandsTestCase):
+	"""AC-54: a command runs only if it was shown before the approval."""
+
+	def test_commands_run_equal_commands_shown(self):
+		cases = (
+			("commands only, no commit", lambda commands: self.approve(self.block([], commands))),
+			("after the commit", self.py_block),
+		)
+		commands = [self.clear, self.migrate, RESTART]
+		for label, make in cases:
+			with self.subTest(label):
+				start = self.git("rev-parse", "HEAD")
+				name = self.current = make(commands if label == "after the commit" else commands[:2])
+				shown = json.loads(frappe.db.get_value(PROPOSAL_DOCTYPE, name, "command_list"))
+				calls = self.stub_bench()
+
+				self.run_apply(name)
+
+				state = self.results(name)
+				self.assertEqual(state.change_status, CHANGE_STATUS_APPLIED, state.failure_reason)
+				self.assertEqual([call[0] for call in calls], [args for args in shown if args != RESTART])
+				self.assertEqual(
+					[entry["args"] for entry in state.command_results], [call[0] for call in calls]
+				)
+				if label == "commands only, no commit":
+					self.assertEqual(self.git("rev-parse", "HEAD"), start)
+					self.assertFalse(state.apply_commit_sha)
+				self.assertFalse(state.restart_status)

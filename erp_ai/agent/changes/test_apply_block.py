@@ -1032,6 +1032,10 @@ class TestBlockAllOrNothing(BlockApplyTestCase):
 			self.run_apply(name)
 
 		self.assert_given_back(name, self.write_reason(2, CREATED_REL), before)
+		self.assertEqual(
+			self.state(name).failure_reason,
+			apply_job.BLOCK_WRITE_FAILED.format(number=2, path=f"{APP}/{CREATED_REL}"),
+		)
 		self.assertEqual(commit.call_count, 0)
 
 

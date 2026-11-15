@@ -114,7 +114,7 @@ def search_manuals(
 			sections = list(_sections(path))
 		except OSError as error:
 			# Skip only this file; no absolute path and no `str(error)` in the log (it carries one).
-			frappe.logger(source.LOGGER_NAME).warning(
+			source._logger().warning(
 				"search_manuals skipped %s: %s", document, type(error).__name__
 			)
 			continue

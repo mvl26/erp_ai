@@ -13,6 +13,7 @@ from frappe.model import table_fields
 from frappe.model.base_document import BaseDocument
 from frappe.utils import strip_html
 
+from erp_ai.agent import policy
 from erp_ai.agent.tools import read
 from erp_ai.agent.tools.registry import ToolContext, ToolSpec
 from erp_ai.constants import AGENT_USER, ROLE_AGENT, ROLE_INSTRUCTOR
@@ -506,6 +507,9 @@ def get_record(args: dict, ctx: ToolContext) -> dict:
 	meta = frappe.get_meta(doctype)
 	if not meta.issingle and not frappe.db.exists(doctype, name):
 		return _fail("không tìm thấy bản ghi", doctype)
+	# ADR-034: in every mode, before any read of the record.
+	if policy.is_ticket_record_excluded(doctype, name):
+		return _fail(policy.EXCLUDED_TICKET_REASON, doctype)
 	doc = frappe.get_doc(doctype, name)
 	if not doc.has_permission("read"):
 		return _fail("thiếu quyền đọc bản ghi này", doctype)

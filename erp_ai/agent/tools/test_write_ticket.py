@@ -757,3 +757,62 @@ class TestConfidenceSource(ClassificationWriteCase):
 		self.assertEqual(set(input_schema["properties"]), {"category", "confidence"})
 		self.assertNotIn("confidence_pct", input_schema["required"])
 		self.assertNotIn("confidence_pct", json.dumps(spec.schema))
+
+
+T99_PREFIX = "ERPAI-TEST-T99"
+
+
+class TestLockedCount(FrappeTestCase):
+	"""ADR-036 QĐ 4: locked_rows locks the ticket row, then reads with a lock, so it sees rows another transaction
+	committed after this one's REPEATABLE READ snapshot. Two connections commit for real; tearDown deletes it all."""
+
+	def setUp(self):
+		frappe.set_user("Administrator")
+		keep_agent_settings(self)
+		self.committed_tickets = []
+
+	def tearDown(self):
+		# After its first use, secondary_connection() leaves frappe.local.db on the second connection.
+		frappe.local.db = self._primary_connection
+		frappe.db.rollback()
+		for ticket in self.committed_tickets:
+			frappe.db.delete("Comment", {"reference_doctype": "HD Ticket", "reference_name": ticket})
+			frappe.db.delete("HD Ticket", ticket)
+		frappe.db.commit()
+
+	def _committed_ticket(self) -> str:
+		"""A bare HD Ticket row (no hooks: no job, no mail, no assignment), committed so both connections see it."""
+		doc = frappe.new_doc("HD Ticket")
+		doc.subject = f"{T99_PREFIX} phiếu"
+		doc.set_new_name()
+		self.committed_tickets.append(doc.name)
+		doc.db_insert()
+		frappe.db.commit()
+		return doc.name
+
+	def test_missing_ticket_raises(self):
+		for name in (f"{T99_PREFIX} không có", "", None):
+			for helper in (write_ticket.locked_rows, write_ticket.locked_count):
+				with self.subTest(name=name, helper=helper.__name__), self.assertRaises(ValueError):
+					helper(name, "Comment", {"reference_doctype": "HD Ticket"})
+
+	def test_rows_committed_after_snapshot_are_seen(self):
+		with self.primary_connection():
+			ticket = self._committed_ticket()
+			filters = {"reference_doctype": "HD Ticket", "reference_name": ticket}
+			# The first plain read takes this transaction's snapshot.
+			self.assertEqual(frappe.db.count("Comment", filters), 0)
+		with self.secondary_connection():
+			other = frappe.get_doc(
+				{"doctype": "Comment", "comment_type": "Info", "content": f"{T99_PREFIX} khác", **filters}
+			).insert(ignore_permissions=True)
+			frappe.db.commit()
+		with self.primary_connection():
+			# Precondition: a plain read still sees the snapshot, so only a locking read can see the new row.
+			self.assertEqual(frappe.db.count("Comment", filters), 0)
+			with patch.object(frappe.db, "commit", side_effect=AssertionError("locked_rows must not commit")):
+				rows = write_ticket.locked_rows(ticket, "Comment", filters, fields=("name", "content"))
+				count = write_ticket.locked_count(ticket, "Comment", filters)
+
+		self.assertEqual(rows, [{"name": other.name, "content": f"{T99_PREFIX} khác"}])
+		self.assertEqual(count, 1)

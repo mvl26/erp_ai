@@ -10231,5 +10231,134 @@ class TestChangeBlockRules(unittest.TestCase):
 		self.assertCaught(found, "lacks 'restart'", "holds 'execute'")
 
 
+LOCK_HELPER_FILE = "agent/tools/write_ticket.py"
+LOCK_HELPER = "locked_rows"
+LOCK_HELPER_READS = ("get_value", "get_values")
+
+
+def _locks(keyword: ast.keyword) -> bool:
+	"""`for_update=<anything but the constant False>`."""
+	return keyword.arg == "for_update" and not (
+		isinstance(keyword.value, ast.Constant) and keyword.value.value is False
+	)
+
+
+def check_locked_count_queries_use_for_update(sources: dict) -> list:
+	"""ADR-036 QĐ 4, AD3-6 (T99): `locked_rows` of write_ticket.py first locks the ticket with
+	`get_value(..., for_update=True)`, then reads with `get_values(..., for_update=True)`; no other code of the
+	file has `for_update`, so every locked read of the module goes through it."""
+	if LOCK_HELPER_FILE not in sources:
+		return [f"{LOCK_HELPER_FILE}: file missing"]
+	tree = parse(LOCK_HELPER_FILE, sources[LOCK_HELPER_FILE])
+	helpers = [node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == LOCK_HELPER]
+	if len(helpers) != 1:
+		return [f"{LOCK_HELPER_FILE}: no single top-level {LOCK_HELPER} (AD3-6)"]
+	(helper,) = helpers
+	locked_calls = sorted(
+		(
+			node
+			for node in ast.walk(helper)
+			if isinstance(node, ast.Call)
+			and isinstance(node.func, ast.Attribute)
+			and any(_locks(keyword) for keyword in node.keywords)
+		),
+		key=lambda node: (node.lineno, node.col_offset),
+	)
+	violations = []
+	if [call.func.attr for call in locked_calls] != list(LOCK_HELPER_READS):
+		text = (
+			f"{LOCK_HELPER} must lock the ticket with get_value(..., for_update=True), then read with "
+			"get_values(..., for_update=True) (ADR-036 QĐ 4)"
+		)
+		violations.append(violation(LOCK_HELPER_FILE, helper, text))
+	inside = {id(node) for node in ast.walk(helper)}
+	violations.extend(
+		violation(LOCK_HELPER_FILE, node, f"for_update outside {LOCK_HELPER} (AD3-6: the one locking place)")
+		for node in ast.walk(tree)
+		if isinstance(node, ast.keyword) and _locks(node) and id(node) not in inside
+	)
+	return violations
+
+
+LOCK_HELPER_CLEAN = """def locked_rows(ticket_name, doctype, filters, fields=("name",)):
+	if not frappe.db.get_value("HD Ticket", ticket_name, "name", for_update=True):
+		raise ValueError("phiếu không có")
+	return frappe.db.get_values(doctype, filters, list(fields), as_dict=True, for_update=True)
+
+
+def locked_count(ticket_name, doctype, filters):
+	return len(locked_rows(ticket_name, doctype, filters))
+"""
+
+
+class TestTicketLockRules(unittest.TestCase):
+	"""T99 rule on the product, then its self-checks on samples."""
+
+	@classmethod
+	def setUpClass(cls):
+		cls.sources = load_product_sources()
+
+	def assertCaught(self, violations, *fragments):
+		self.assertGreater(len(violations), 0, "scanner missed the violation")
+		for fragment in fragments:
+			self.assertTrue(any(fragment in text for text in violations), f"{fragment!r} not in {violations}")
+
+	def lock_sample(self, replace: tuple = (), extra: str = "") -> dict:
+		"""LOCK_HELPER_CLEAN with `replace=(old, new)` applied and `extra` appended, as write_ticket.py."""
+		text = LOCK_HELPER_CLEAN
+		if replace:
+			self.assertIn(replace[0], text)
+			text = text.replace(*replace)
+		return {LOCK_HELPER_FILE: text + extra}
+
+	def test_locked_count_queries_use_for_update(self):
+		self.assertEqual(check_locked_count_queries_use_for_update(self.sources), [])
+
+	def test_locked_count_rule_passes_on_the_clean_sample(self):
+		self.assertEqual(check_locked_count_queries_use_for_update(self.lock_sample()), [])
+		unlocked_elsewhere = self.lock_sample(
+			extra="\n\ndef peek(name):\n\treturn frappe.db.get_value('HD Ticket', name, 'name', for_update=False)\n"
+		)
+		self.assertEqual(check_locked_count_queries_use_for_update(unlocked_elsewhere), [])
+
+	def test_locked_count_rule_catches_each_violation(self):
+		must_lock = "must lock the ticket"
+		cases = {
+			"file missing": ({}, "file missing"),
+			"no helper": (
+				self.lock_sample(("def locked_rows(", "def rows(")),
+				"no single top-level locked_rows",
+			),
+			"read without lock": (
+				self.lock_sample((", as_dict=True, for_update=True)", ", as_dict=True)")),
+				must_lock,
+			),
+			"read with for_update=False": (
+				self.lock_sample((", as_dict=True, for_update=True)", ", as_dict=True, for_update=False)")),
+				must_lock,
+			),
+			"no ticket lock": (self.lock_sample(('"name", for_update=True)', '"name")')), must_lock),
+			"read before the ticket lock": (
+				self.lock_sample(
+					(
+						'	if not frappe.db.get_value("HD Ticket", ticket_name, "name", for_update=True):\n',
+						"	frappe.db.get_values(doctype, filters, for_update=True)\n"
+						'	if not frappe.db.get_value("HD Ticket", ticket_name, "name", for_update=True):\n',
+					)
+				),
+				must_lock,
+			),
+			"lock in another function": (
+				self.lock_sample(
+					extra="\n\ndef post_notice(name):\n\treturn frappe.db.get_values('Comment', {}, for_update=True)\n"
+				),
+				"for_update outside locked_rows",
+			),
+		}
+		for case, (sources, fragment) in cases.items():
+			with self.subTest(case=case):
+				self.assertCaught(check_locked_count_queries_use_for_update(sources), fragment)
+
+
 if __name__ == "__main__":
 	unittest.main()

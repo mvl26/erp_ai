@@ -1,9 +1,19 @@
+import json
 import os
 from dataclasses import dataclass
 
 import erp_ai
 from erp_ai.agent.tools import source
-from erp_ai.constants import CORE_APPS
+from erp_ai.constants import (
+	CHANGE_MAX_COMMANDS,
+	CHANGE_MAX_FILE_OPS,
+	CHANGE_MAX_TOTAL_BYTES,
+	CHANGE_OP_CREATE,
+	CHANGE_OP_DELETE,
+	CHANGE_OP_EDIT,
+	CHANGE_OP_RENAME,
+	CORE_APPS,
+)
 
 PROTECTED_FILE_NAME = "license.txt"
 GIT_DIR_NAME = ".git"
@@ -32,8 +42,37 @@ CMD_TAKES_NO_APP = "lệnh này không nhận app"
 # CHG-002 design table 3.1.
 BLOCK_SHAPE = "đưa changes hoặc path, không cả hai và không thiếu cả hai"
 BLOCK_EMPTY = "khối không có mục file hay lệnh nào"
+BLOCK_TOO_MANY_OPS = f"khối có hơn {CHANGE_MAX_FILE_OPS} mục file"
+BLOCK_TOO_MANY_COMMANDS = f"khối có hơn {CHANGE_MAX_COMMANDS} lệnh"
+BLOCK_TWO_APPS = "các mục file thuộc hai app {a} và {b}; mỗi app một đề xuất"
+BLOCK_PATH_TWICE = "đường dẫn trùng hoặc nằm trong đường dẫn khác của cùng khối"
 OP_UNKNOWN = "loại mục phải là edit, create, delete hoặc rename"
 OP_FIELDS = "mục {action} thiếu hoặc thừa trường"
+NOT_REGULAR_FILE = "đường dẫn không phải file thường"
+EXECUTABLE_FILE = "file có quyền thực thi, bot không xóa hay đổi tên được"
+# design-addendum-1 A-1.3: the total counts the stored `diff` too.
+BLOCK_TOO_LARGE = f"tổng nội dung của khối (kể cả diff) lớn hơn {CHANGE_MAX_TOTAL_BYTES // (1024 * 1024)} MiB"
+PY_SYNTAX = "file .py không biên dịch được: dòng {n}"
+JSON_SYNTAX = "file .json không phải JSON hợp lệ: dòng {n}"
+PY_SUFFIX = ".py"
+JSON_SUFFIX = ".json"
+# Prefix of a reason tied to one file item, n counted from 1 (design 3.1).
+OP_PREFIX = "mục {number} ({path}): "
+
+# Fields of `FileOp` each kind needs as `str` (True) or leaves `None` (False): new_path, before, after.
+OP_SHAPES = {
+	CHANGE_OP_EDIT: (False, True, True),
+	CHANGE_OP_CREATE: (False, False, True),
+	CHANGE_OP_DELETE: (False, True, False),
+	CHANGE_OP_RENAME: (True, True, True),
+}
+# The model's `action` name of each kind, as the sentence `OP_FIELDS` shows it.
+OP_ACTIONS = {
+	CHANGE_OP_EDIT: "edit",
+	CHANGE_OP_CREATE: "create",
+	CHANGE_OP_DELETE: "delete",
+	CHANGE_OP_RENAME: "rename",
+}
 
 # Command table of design 3.1: the only bench argument shapes an agent may propose (ADR-011 QĐ 4).
 # No subcommand here runs git in an app repo (ADR-022 QĐ 2).
@@ -74,6 +113,32 @@ class FileOp:
 	after: str | None
 	base_hash: str | None
 	after_hash: str | None
+
+
+@dataclass(frozen=True)
+class OpTarget:
+	"""One file item that passed `check_block` (CHG-002 design 3.2).
+
+	`full_path` and `full_new_path` are the real paths of `path` and of a rename's `new_path` (else
+	`None`); `new_dirs` are the real paths of the folders to create, top down; `guard` is the
+	`check_write_path` result of `path`.
+	"""
+
+	op: FileOp
+	full_path: str
+	full_new_path: str | None
+	new_dirs: tuple[str, ...]
+	guard: GuardResult
+
+
+@dataclass(frozen=True)
+class BlockCheck:
+	"""Result of `check_block`: the first refusal `reason` (`None` passes), the app of the file items
+	(`None` for a block with only commands or a refused one) and one `OpTarget` per item, in order."""
+
+	reason: str | None
+	app: str | None
+	targets: tuple[OpTarget, ...]
 
 
 def _refused(reason: str) -> GuardResult:
@@ -235,6 +300,164 @@ def check_write_path(
 		is_core_app=parts[0] in CORE_APPS,
 		git=state,
 	)
+
+
+def _shape_reason(op: FileOp) -> str | None:
+	"""`OP_UNKNOWN` for a kind outside `CHANGE_OPS`; `OP_FIELDS` when a field the kind needs is not a
+	string or one it leaves out is set (`OP_SHAPES`)."""
+	if not isinstance(op.kind, str) or op.kind not in OP_SHAPES:
+		return OP_UNKNOWN
+	fields = (op.new_path, op.before, op.after)
+	if not isinstance(op.path, str) or any(
+		not isinstance(value, str) if needed else value is not None
+		for value, needed in zip(fields, OP_SHAPES[op.kind], strict=True)
+	):
+		return OP_FIELDS.format(action=OP_ACTIONS[op.kind])
+	return None
+
+
+def _paths_of(op: FileOp) -> tuple[str, ...]:
+	return (op.path,) if op.new_path is None else (op.path, op.new_path)
+
+
+def _overlaps(path: str, other: str) -> bool:
+	return path == other or path.startswith(other + os.sep) or other.startswith(path + os.sep)
+
+
+def _new_dirs(guard: GuardResult) -> tuple[tuple[str, str], ...]:
+	"""`(rel, real path)` of every missing folder above a checked target, top down; the app folder exists."""
+	missing = []
+	rel, full = os.path.dirname(guard.rel_path), os.path.dirname(guard.full_path)
+	while os.sep in rel and not os.path.lexists(full):
+		missing.append((rel, full))
+		rel, full = os.path.dirname(rel), os.path.dirname(full)
+	return tuple(reversed(missing))
+
+
+def _utf8(text: str) -> bytes:
+	"""UTF-8 bytes of `text`; a lone surrogate is kept as bytes so `text_refusal` refuses it as not UTF-8."""
+	return text.encode("utf-8", errors="surrogatepass")
+
+
+def _syntax_reason(text: str, rel: str) -> str | None:
+	"""Design 3.2 step 2: a `.py` target must compile (never run), a `.json` target must parse."""
+	if rel.endswith(PY_SUFFIX):
+		try:
+			compile(text, rel, "exec", dont_inherit=True)
+		except SyntaxError as error:
+			return PY_SYNTAX.format(n=error.lineno or 0)
+		except (RecursionError, MemoryError):
+			return PY_SYNTAX.format(n=0)  # Too deep for the parser: refused, with no line to name.
+	elif rel.endswith(JSON_SUFFIX):
+		try:
+			json.loads(text)
+		except ValueError as error:
+			return JSON_SYNTAX.format(n=getattr(error, "lineno", 0))
+		except RecursionError:
+			return JSON_SYNTAX.format(n=0)  # Nested deeper than the decoder can go: refused, no line.
+	return None
+
+
+def _content_reason(op: FileOp, source_rel: str, target_rel: str) -> str | None:
+	"""`source.text_refusal` for the content before (under the source name) and after (under the target
+	name), then the syntax of the content after for an edit, a created file and a rename target."""
+	if op.before is not None:
+		reason = source.text_refusal(source_rel, _utf8(op.before))
+		if reason is not None:
+			return reason
+	if op.after is None:
+		return None
+	return source.text_refusal(target_rel, _utf8(op.after)) or _syntax_reason(op.after, target_rel)
+
+
+def _check_op(op: FileOp, seen: list[str], allowed_apps, block_app: str | None, at_apply: bool):
+	"""Design 3.2 step 2 for one item: an `OpTarget`, or the refusal reason as a `str`.
+
+	`seen` holds the normalized paths of the earlier items and gets this item's; `block_app` is the app
+	of item 1 (`None` while checking item 1 itself).
+	"""
+	reason = _shape_reason(op)
+	if reason is not None:
+		return reason
+	paths = _paths_of(op)
+	for path in paths:
+		normal = os.path.normpath(path)
+		if any(_overlaps(normal, other) for other in seen):
+			return BLOCK_PATH_TWICE
+		seen.append(normal)
+	# Only a created file and a rename target are new; an edit, a deletion and a rename source exist.
+	new_files = (op.kind == CHANGE_OP_CREATE, True)
+	guards = []
+	for path, new_file in zip(paths, new_files, strict=False):
+		guard = check_write_path(path, allowed_apps, new_file=new_file, read_git=not at_apply)
+		if guard.reason is not None:
+			return guard.reason
+		guards.append(guard)
+	new_dirs = _new_dirs(guards[-1]) if op.kind in (CHANGE_OP_CREATE, CHANGE_OP_RENAME) else ()
+	for rel, _full in new_dirs:
+		reason = check_write_path(rel, allowed_apps, new_file=True, read_git=False).reason
+		if reason is not None:
+			return reason
+	block_app = block_app or guards[0].app
+	other_app = next((guard.app for guard in guards if guard.app != block_app), None)
+	if other_app is not None:
+		return BLOCK_TWO_APPS.format(a=block_app, b=other_app)
+	reason = _content_reason(op, guards[0].rel_path, guards[-1].rel_path)
+	if reason is not None:
+		return reason
+	return OpTarget(
+		op=op,
+		full_path=guards[0].full_path,
+		full_new_path=guards[1].full_path if len(guards) > 1 else None,
+		new_dirs=tuple(full for _rel, full in new_dirs),
+		guard=guards[0],
+	)
+
+
+def check_block(
+	ops,
+	commands,
+	allowed_apps,
+	site,
+	*,
+	at_apply: bool,
+	diff_text: str,
+	legacy: bool = False,
+) -> BlockCheck:
+	"""Check a whole block at proposal time (`at_apply=False`) and again at apply time; first reason wins.
+
+	CHG-002 design 3.2: 1. no item and no command → `BLOCK_EMPTY`; more than `CHANGE_MAX_FILE_OPS`
+	items → `BLOCK_TOO_MANY_OPS`; more than `CHANGE_MAX_COMMANDS` commands → `BLOCK_TOO_MANY_COMMANDS`.
+	2. each item in order, its reason prefixed by `OP_PREFIX`: shape (`OP_UNKNOWN`, `OP_FIELDS`); a path
+	equal to or inside another path of the block → `BLOCK_PATH_TWICE`; `check_write_path` for every
+	path of the item, with the git state read only at proposal time; `check_write_path` for each folder
+	to create; an app other than item 1's → `BLOCK_TWO_APPS`; `source.text_refusal` of the content
+	before and after (the only per-file size limit); `PY_SYNTAX` / `JSON_SYNTAX` for the content after
+	of a `.py` / `.json` target. 3. the UTF-8 bytes of every before and after plus `diff_text` (the
+	stored `diff`, no default so no caller forgets it) over `CHANGE_MAX_TOTAL_BYTES` → `BLOCK_TOO_LARGE`;
+	exactly the limit passes. `site` and `legacy` serve the command rules.
+	"""
+	ops, commands = tuple(ops), tuple(commands)
+	if not ops and not commands:
+		return BlockCheck(reason=BLOCK_EMPTY, app=None, targets=())
+	if len(ops) > CHANGE_MAX_FILE_OPS:
+		return BlockCheck(reason=BLOCK_TOO_MANY_OPS, app=None, targets=())
+	if len(commands) > CHANGE_MAX_COMMANDS:
+		return BlockCheck(reason=BLOCK_TOO_MANY_COMMANDS, app=None, targets=())
+	app, targets, seen = None, [], []
+	for number, op in enumerate(ops, start=1):
+		target = _check_op(op, seen, allowed_apps, app, at_apply)
+		if isinstance(target, str):
+			return BlockCheck(
+				reason=OP_PREFIX.format(number=number, path=op.path) + target, app=None, targets=()
+			)
+		app = app or target.guard.app
+		targets.append(target)
+	# A rename stores its content as before and after, so it counts twice (design-addendum-1 A-1.2).
+	total = sum(len(_utf8(text)) for op in ops for text in (op.before, op.after) if text is not None)
+	if total + len(_utf8(diff_text)) > CHANGE_MAX_TOTAL_BYTES:
+		return BlockCheck(reason=BLOCK_TOO_LARGE, app=None, targets=())
+	return BlockCheck(reason=None, app=app, targets=tuple(targets))
 
 
 def _app_names(allowed_apps) -> tuple[str, ...]:

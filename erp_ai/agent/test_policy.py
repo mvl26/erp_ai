@@ -632,3 +632,150 @@ class TestLevels(FrappeTestCase):
 		# Read from the stored setting: an empty cap reads L1.
 		set_agent_settings(level_cap_a="")
 		self.assertEqual(policy.category_level_cap(frappe.get_doc(SETTING_DOCTYPE), "A"), "L1")
+
+
+class TestConfidence(FrappeTestCase):
+	# AC-22, A-U1-1, U1 3.1: the single below-threshold predicate; unknown confidence (None, -1, outside 0..100)
+	# is below every threshold unless an instructor gave the order and switch (3) act_now is on.
+	def setUp(self):
+		commit_guard = patch.object(
+			frappe.db, "commit", side_effect=AssertionError("test must not commit the transaction")
+		)
+		commit_guard.start()
+		self.addCleanup(commit_guard.stop)
+		self.addCleanup(frappe.db.rollback)
+		keep_agent_settings(self)
+
+	def _below(self, pct, threshold, has_instructor=False, act_now=False):
+		return policy.is_below_confidence(pct, threshold, has_instructor=has_instructor, act_now=act_now)
+
+	def test_threshold_boundaries(self):
+		self.assertEqual(policy.CONFIDENCE_THRESHOLD_FIELD, "confidence_threshold")
+		self.assertEqual(policy.DEFAULT_CONFIDENCE_THRESHOLD, 70)
+		cases = (
+			(69, 70, True),
+			(70, 70, False),
+			(71, 70, False),
+			(0, 70, True),
+			(100, 70, False),
+			(None, 70, True),
+			(-1, 70, True),
+			# threshold 0: unknown is still below, a known 0 is not (design-w0-fixes-2.md ruling (1))
+			(None, 0, True),
+			(-1, 0, True),
+			(0, 0, False),
+			(99, 100, True),
+			(100, 100, False),
+			# outside 0..100, a bool or a non-int reads unknown: below even at threshold 0
+			(101, 0, True),
+			(-5, 0, True),
+			(True, 0, True),
+			(False, 0, True),
+			("80", 70, True),
+			(80.0, 70, True),
+		)
+		for pct, threshold, expected in cases:
+			with self.subTest(pct=pct, threshold=threshold):
+				self.assertIs(self._below(pct, threshold), expected)
+		# The stored default threshold (a fresh install) gives the same 69/70 boundary.
+		set_agent_settings(confidence_threshold=70)
+		threshold = policy.confidence_threshold(frappe.get_doc(SETTING_DOCTYPE))
+		self.assertEqual(threshold, 70)
+		self.assertIs(self._below(69, threshold), True)
+		self.assertIs(self._below(70, threshold), False)
+
+	def test_threshold_changed_to_80(self):
+		set_agent_settings(confidence_threshold=80)
+		threshold = policy.confidence_threshold(frappe.get_doc(SETTING_DOCTYPE))
+		self.assertIsInstance(threshold, int)
+		self.assertEqual(threshold, 80)
+		self.assertIs(self._below(70, threshold), True)
+		self.assertIs(self._below(79, threshold), True)
+		self.assertIs(self._below(80, threshold), False)
+		for value in (0, 100):
+			with self.subTest(stored=value):
+				set_agent_settings(confidence_threshold=value)
+				self.assertEqual(policy.confidence_threshold(frappe.get_doc(SETTING_DOCTYPE)), value)
+
+	def test_threshold_missing_or_invalid_reads_default(self):
+		# A missing field (before migrate), empty, garbage, a bool or a value outside 0..100 reads the default 70.
+		self.assertEqual(policy.confidence_threshold(frappe._dict()), 70)
+		self.assertEqual(policy.confidence_threshold(object()), 70)
+		for value in (None, "", "abc", "7O", True, False, -1, 101, [80]):
+			with self.subTest(value=value):
+				self.assertEqual(policy.confidence_threshold(frappe._dict(confidence_threshold=value)), 70)
+		for value, expected in ((0, 0), (100, 100), ("80", 80), (85.0, 85)):
+			with self.subTest(value=value):
+				threshold = policy.confidence_threshold(frappe._dict(confidence_threshold=value))
+				self.assertIsInstance(threshold, int)
+				self.assertEqual(threshold, expected)
+
+	def test_instructor_with_act_now_is_never_below(self):
+		for pct in (None, -1, 0, 1, 69, 70, 100, 101, True, "80"):
+			for threshold in (0, 70, 80, 100):
+				with self.subTest(pct=pct, threshold=threshold):
+					self.assertIs(self._below(pct, threshold, has_instructor=True, act_now=True), False)
+
+	def test_act_now_off_instructor_still_below(self):
+		# Only the pair instructor AND act_now lifts the threshold; either one alone does not.
+		for has_instructor, act_now in ((True, False), (False, True), (False, False)):
+			for pct, expected in ((69, True), (None, True), (-1, True), (70, False)):
+				with self.subTest(has_instructor=has_instructor, act_now=act_now, pct=pct):
+					self.assertIs(self._below(pct, 70, has_instructor, act_now), expected)
+		# The two flags are keyword-only.
+		with self.assertRaises(TypeError):
+			policy.is_below_confidence(69, 70, True, True)
+
+	def _classify_row(self, ticket, category, pct=None, created=None, entry_type="classify"):
+		values = {
+			"doctype": LOG_DOCTYPE,
+			"ticket": ticket,
+			"run_id": f"conf-{frappe.generate_hash(length=8)}",
+			"entry_type": entry_type,
+			"turn": 0,
+			"predicted_category": category,
+		}
+		log = frappe.get_doc(values).insert(ignore_permissions=True)
+		if pct is not None:
+			frappe.db.set_value(LOG_DOCTYPE, log.name, "predicted_confidence_pct", pct, update_modified=False)
+		if created:
+			frappe.db.set_value(LOG_DOCTYPE, log.name, "creation", created, update_modified=False)
+		return log.name
+
+	def test_latest_classification_minus_one_reads_none(self):
+		for pct, expected in ((-1, None), (0, 0), (70, 70), (100, 100), (101, None), (-7, None)):
+			with self.subTest(pct=pct):
+				ticket = make_ticket(subject="T69 confidence").name
+				self._classify_row(ticket, "C", pct)
+				self.assertEqual(policy.latest_classification(ticket), ("C", expected))
+		# A row written without the pct takes the column default -1: unknown.
+		ticket = make_ticket(subject="T69 confidence").name
+		self._classify_row(ticket, "D")
+		self.assertEqual(frappe.db.get_value(LOG_DOCTYPE, {"ticket": ticket}, "predicted_confidence_pct"), -1)
+		self.assertEqual(policy.latest_classification(ticket), ("D", None))
+
+	def test_latest_classification_without_row_reads_none(self):
+		ticket = make_ticket(subject="T69 confidence").name
+		self.assertEqual(policy.latest_classification(ticket), (None, None))
+		self.assertEqual(policy.latest_classification("no-such-ticket"), (None, None))
+		# Rows that do not count: an empty category, another entry type, another ticket.
+		self._classify_row(ticket, "", 90)
+		self._classify_row(ticket, None, 90)
+		self._classify_row(ticket, "B", 90, entry_type="reason")
+		self._classify_row(make_ticket(subject="T69 other").name, "A", 90)
+		self.assertEqual(policy.latest_classification(ticket), (None, None))
+
+	def test_latest_classification_newest_row_wins(self):
+		ticket = make_ticket(subject="T69 confidence").name
+		now = now_datetime()
+		self._classify_row(ticket, "B", 95, created=now - timedelta(hours=1))
+		self._classify_row(ticket, "A", 40, created=now - timedelta(hours=2))
+		self._classify_row(ticket, "E", 80, created=now - timedelta(days=1))
+		self.assertEqual(policy.latest_classification(ticket), ("B", 95))
+		# A newer row with an empty category, or of another entry type, does not replace the classification.
+		self._classify_row(ticket, "", 10, created=now)
+		self._classify_row(ticket, "F", 10, created=now, entry_type="reason")
+		self.assertEqual(policy.latest_classification(ticket), ("B", 95))
+		# A newer classify row with an unknown pct wins and reads None (no fallback to an older number).
+		self._classify_row(ticket, "C", -1, created=now + timedelta(minutes=1))
+		self.assertEqual(policy.latest_classification(ticket), ("C", None))

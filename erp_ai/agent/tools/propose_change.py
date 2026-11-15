@@ -46,6 +46,7 @@ EDIT_AMBIGUOUS = "đoạn find[{index}] xuất hiện nhiều hơn một lần"
 EDIT_OVERLAP = "các đoạn find chồng nhau"
 NO_CHANGE = "nội dung sau trùng nội dung trước"
 EXISTS = "file đã tồn tại"
+PARENT_NOT_DIR = "thư mục cha trên đường dẫn là một file"
 BLOCK_SHAPE = change_guard.BLOCK_SHAPE
 # CHG-002 design 3.1: the fields of each kind of item of `changes`.
 ITEM_FIELDS = {
@@ -115,19 +116,31 @@ def _diff(rel_path: str, before: str, after: str, tofile: str | None = None) -> 
 
 def _comment(ctx: ToolContext, proposal) -> str:
 	"""One ticket comment (design 3.8): the escaped first sentence, the notes of design 3.9 and the
-	Duyệt / Từ chối links; returns the Comment name. A block (CHG-002 T1) names its first item's path."""
+	Duyệt / Từ chối links; returns the Comment name.
+
+	A block (child rows or a `command_list`, CHG-002 design 3.7) says `khối {n} mục trong app {app}`
+	with `{n}` the number of items, or `{m} lệnh bench` when it has only commands, `{m}` counting
+	`restart`; its name and app go through `change_text._shown` (no URL). Any other proposal keeps
+	the first sentence of today, naming its file or command.
+	"""
 	escape = frappe.utils.escape_html
-	if proposal.change_kind == CHANGE_KIND_CODE:
-		first = proposal.operations[0] if proposal.get("operations") else None
-		is_new = first.operation == CHANGE_OP_CREATE if first else proposal.is_new_file
-		verb = "tạo" if is_new else "sửa"
-		path = first.file_path if first else proposal.file_path
-		target = f"{verb} <code>{escape(path)}</code>"
+	name = proposal.name
+	# the test of `block.is_block` (design 2.3), written here: tools do not import `erp_ai.agent.changes`
+	if proposal.get("operations") or proposal.get("command_list"):
+		name = change_text._shown(proposal.name)
+		if proposal.get("operations"):
+			app = change_text._shown(proposal.app)
+			target = f"khối {len(proposal.operations)} mục trong app {escape(app)}"
+		else:
+			target = f"{len(json.loads(proposal.command_list))} lệnh bench"
+	elif proposal.change_kind == CHANGE_KIND_CODE:
+		verb = "tạo" if proposal.is_new_file else "sửa"
+		target = f"{verb} <code>{escape(proposal.file_path)}</code>"
 	else:
 		args = "; ".join(" ".join(argv) for argv in json.loads(proposal.command_list or "[]"))
 		target = f"lệnh <code>bench {escape(args)}</code>"
 	form = f"/app/erp-ai-change-proposal/{proposal.name}"
-	html = f'<p>Đề xuất <a href="{escape(form)}">{escape(proposal.name)}</a> đang chờ duyệt: {target}.</p>'
+	html = f'<p>Đề xuất <a href="{escape(form)}">{escape(name)}</a> đang chờ duyệt: {target}.</p>'
 	html += "".join(f"<p>{escape(line)}</p>" for line in change_text.proposal_notes(proposal))
 	approve = change_link.decision_path(proposal.name, change_link.ACTION_APPROVE)
 	reject = change_link.decision_path(proposal.name, change_link.ACTION_REJECT)
@@ -221,7 +234,7 @@ def _created_op(change: dict, ctx: ToolContext) -> change_guard.FileOp | str:
 	if os.path.lexists(guard.full_path):
 		return EXISTS
 	if not _under_a_folder(guard.full_path):
-		return change_guard.PATH_INVALID
+		return PARENT_NOT_DIR
 	content = change["content"]
 	return change_guard.FileOp(
 		kind=CHANGE_OP_CREATE,
@@ -282,7 +295,7 @@ def _renamed_op(change: dict, ctx: ToolContext) -> change_guard.FileOp | str:
 	if os.path.lexists(guard.full_path):
 		return EXISTS
 	if not _under_a_folder(guard.full_path):
-		return change_guard.PATH_INVALID
+		return PARENT_NOT_DIR
 	digest = _sha256(text.encode("utf-8"))
 	return change_guard.FileOp(
 		kind=CHANGE_OP_RENAME,

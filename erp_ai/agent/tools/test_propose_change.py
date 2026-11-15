@@ -197,7 +197,7 @@ class TestProposeChange(FrappeTestCase):
 		self.assertEqual(result["comment"], comment.name)
 		self.assertEqual(comment.owner, AGENT)
 		link = f"/app/erp-ai-change-proposal/{doc.name}"
-		first = f'<p>Đề xuất <a href="{link}">{doc.name}</a> đang chờ duyệt: sửa <code>{PATH}</code>.</p>'
+		first = f'<p>Đề xuất <a href="{link}">{doc.name}</a> đang chờ duyệt: khối 1 mục trong app {APP}.</p>'
 		self.assertTrue(comment.content.startswith(first), comment.content)
 		approve = frappe.utils.escape_html(change_link.decision_path(doc.name, "approve"))
 		reject = frappe.utils.escape_html(change_link.decision_path(doc.name, "reject"))
@@ -386,11 +386,11 @@ class TestProposeChange(FrappeTestCase):
 
 		contents = {row.name: row.content for row in self.comments()}
 		python_comment, markdown_comment = contents[python["comment"]], contents[markdown["comment"]]
-		self.assertIn(f"sửa <code>{APP}/pkg/x&amp;y&apos;z.txt</code>.</p>", python_comment)
+		self.assertIn(f"<p>sửa {APP}/pkg/x&amp;y&apos;z.txt</p>", python_comment)
 		self.assertIn(f"<p>Commit sẽ vào nhánh a&amp;b&quot;c&apos;d của app {APP}.</p>", python_comment)
 		self.assertIn("<p>&lt;script&gt;x&lt;/script&gt;</p>", contents[scripted["comment"]])
 		self.assertNotIn("<script>", contents[scripted["comment"]])
-		self.assertIn(f"sửa <code>{APP}/pkg/notes.md</code>.</p>", markdown_comment)
+		self.assertIn(f"<p>sửa {APP}/pkg/notes.md</p>", markdown_comment)
 		self.assertNotIn("bench restart", markdown_comment)
 
 	def new_file(self, path=f"{APP}/pkg/new_mod.txt", content="z = 1\n"):
@@ -425,7 +425,8 @@ class TestProposeChange(FrappeTestCase):
 		self.assertEqual(self.proposals(), [doc.name])
 		(comment,) = self.comments()
 		self.assertEqual(result["comment"], comment.name)
-		self.assertIn(f"đang chờ duyệt: tạo <code>{new_path}</code>.</p>", comment.content)
+		self.assertIn(f"<p>tạo {new_path}</p>", comment.content)
+		self.assertIn(f"đang chờ duyệt: khối 1 mục trong app {APP}.</p>", comment.content)
 
 	def test_new_file_errors_exists_and_no_parent(self):
 		self.sandbox.commit_file(APP, ".gitignore", "pkg/ignored_new.py\n")
@@ -602,7 +603,8 @@ class TestProposeChange(FrappeTestCase):
 				)
 				(comment,) = [row for row in self.comments() if row.name == result["comment"]]
 				shown = " ".join(command_args)
-				self.assertIn(f"đang chờ duyệt: lệnh <code>bench {shown}</code>.</p>", comment.content)
+				self.assertIn(f"<p>lệnh: bench {shown}</p>", comment.content)
+				self.assertIn("đang chờ duyệt: 1 lệnh bench.</p>", comment.content)
 				self.assertIn(
 					"<p>Lệnh trong khối không hoàn tác được; hoàn tác chỉ trả lại phần file.</p>",
 					comment.content,
@@ -1377,12 +1379,31 @@ class TestProposeBlock(FrappeTestCase):
 	def test_delete_symlink_refused(self):
 		self.sandbox.commit_file(APP, "pkg/a.txt", "a\n")
 		os.symlink("a.txt", os.path.join(self.sandbox.repo(APP), "pkg/link.txt"))
-		snapshot = self.git_snapshot()
-		result = self.block([{"action": "delete", "path": f"{APP}/pkg/link.txt"}])
-		self.assertFalse(result["ok"], result)
-		self.assertTrue(result["reason"].startswith(f"mục 1 ({APP}/pkg/link.txt): "), result)
-		self.assert_refused_whole(result, result["reason"], snapshot)
+		for item in (
+			{"action": "delete", "path": f"{APP}/pkg/link.txt"},
+			{"action": "rename", "path": f"{APP}/pkg/link.txt", "new_path": f"{APP}/pkg/moved.txt"},
+		):
+			with self.subTest(action=item["action"]):
+				self.assert_item_refused(item, change_guard.PATH_SYMLINK)
 		self.assertTrue(os.path.islink(os.path.join(self.sandbox.repo(APP), "pkg/link.txt")))
+
+	def test_symlink_past_guard_is_not_regular_file(self):
+		"""design-addendum-8 A8-4: the `islink` branch of `_removed_text` refuses a symlink the guard let by."""
+		self.sandbox.commit_file(APP, "pkg/a.txt", "a\n")
+		link = os.path.join(self.sandbox.repo(APP), "pkg/link.txt")
+		os.symlink("a.txt", link)
+		rel = f"{APP}/pkg/link.txt"
+		real = change_guard.check_write_path
+
+		def guard(path, *args, **kwargs):
+			# only the step-2 read of `_removed_text`; `check_block` keeps the real guard
+			if path == rel and kwargs.get("read_git") is False:
+				return change_guard.GuardResult(full_path=link, rel_path=rel, app=APP, reason=None)
+			return real(path, *args, **kwargs)
+
+		with patch.object(change_guard, "check_write_path", side_effect=guard):
+			self.assert_item_refused({"action": "delete", "path": rel}, change_guard.NOT_REGULAR_FILE)
+		self.assertTrue(os.path.islink(link))
 
 	def test_rename_dest_exists_refused(self):
 		self.sandbox.commit_file(APP, "pkg/r.txt", "r\n")
@@ -1432,7 +1453,8 @@ class TestProposeBlock(FrappeTestCase):
 			{"action": "rename", "path": f"{APP}/pkg/r.txt", "new_path": f"{APP}/README.md/r.txt"},
 		):
 			with self.subTest(item=item):
-				self.assert_item_refused(item, change_guard.PATH_INVALID)
+				self.assert_item_refused(item, propose_change.PARENT_NOT_DIR)
+		self.assertEqual(propose_change.PARENT_NOT_DIR, "thư mục cha trên đường dẫn là một file")
 		self.assertTrue(os.path.isfile(os.path.join(self.sandbox.repo(APP), "README.md")))
 
 	# CHG-002 T28: commands in a block; the three tools go through `_propose_block`.
@@ -1698,3 +1720,241 @@ class TestProposeBlock(FrappeTestCase):
 		with open(propose_change.__file__, encoding="utf-8") as handle:
 			code_text = handle.read()
 		self.assertEqual((code_text.count(".insert("), code_text.count("allow_agent_write()")), (1, 1))
+
+
+class TestBlockComment(FrappeTestCase):
+	"""CHG-002 T30: the ticket comment of a block proposal (design 3.7, design-addendum-7 P7-10)."""
+
+	setUp = TestProposeChange.setUp
+	context = TestProposeChange.context
+	run_tool = TestProposeChange.run_tool
+	comments = TestProposeChange.comments
+	block = TestProposeBlock.block
+	stored = TestProposeBlock.stored
+
+	def content(self, result):
+		(comment,) = [row for row in self.comments() if row.name == result["comment"]]
+		return comment.content
+
+	def expected(self, name, first, lines):
+		"""The whole comment: the first sentence, one paragraph per note line, the three links."""
+		escape = frappe.utils.escape_html
+		form = f"/app/erp-ai-change-proposal/{name}"
+		approve = change_link.decision_path(name, change_link.ACTION_APPROVE)
+		reject = change_link.decision_path(name, change_link.ACTION_REJECT)
+		return (
+			f'<p>Đề xuất <a href="{escape(form)}">{escape(name)}</a> đang chờ duyệt: {escape(first)}</p>'
+			+ "".join(f"<p>{escape(line)}</p>" for line in lines)
+			+ f'<p><a href="{escape(approve)}"><strong>Duyệt</strong></a> · '
+			f'<a href="{escape(reject)}"><strong>Từ chối</strong></a> · '
+			f'<a href="{escape(form)}">Xem nội dung thay đổi</a></p>'
+		)
+
+	def four_kinds(self):
+		self.sandbox.commit_file(APP, "pkg/a.py", "x = 1\n")
+		self.sandbox.commit_file(APP, "pkg/d.txt", "d\n")
+		self.sandbox.commit_file(APP, "pkg/r.txt", "r\n")
+		return [
+			{"action": "edit", "path": f"{APP}/pkg/a.py", "find": ["x = 1"], "replace": ["x = 2"]},
+			{"action": "create", "path": f"{APP}/pkg/n.md", "content": "n\n"},
+			{"action": "delete", "path": f"{APP}/pkg/d.txt"},
+			{"action": "rename", "path": f"{APP}/pkg/r.txt", "new_path": f"{APP}/doc/r.txt"},
+		]
+
+	def run_block(self, changes, commands):
+		arguments = {"changes": changes, "commands": commands, "reason": "khối"}
+		result = self.run_tool("propose_file_change", arguments)
+		self.assertTrue(result["ok"], result)
+		return result
+
+	def test_comment_counts_paths_delete_rename_lines_commands_restart_note(self):
+		result = self.run_block(self.four_kinds(), [{"command": "migrate"}, {"command": "restart"}])
+		doc = self.stored(result)
+		lines = [
+			"Gồm 1 sửa, 1 tạo, 1 xóa, 1 đổi tên; 2 lệnh.",
+			f"sửa {APP}/pkg/a.py",
+			f"tạo {APP}/pkg/n.md",
+			f"XÓA {APP}/pkg/d.txt",
+			f"ĐỔI TÊN {APP}/pkg/r.txt → {APP}/doc/r.txt",
+			f"lệnh: bench --site {frappe.local.site} migrate",
+			"lệnh: bench restart",
+			"Sau khi áp dụng, hệ thống sẽ restart bench (lệnh cuối).",
+			"Lệnh trong khối không hoàn tác được; hoàn tác chỉ trả lại phần file.",
+			f"Commit sẽ vào nhánh {doc.target_branch} của app {APP}.",
+			"Nhánh này không theo nhánh remote nào.",
+		]
+		first = f"khối 4 mục trong app {APP}."
+		self.assertEqual(self.content(result), self.expected(doc.name, first, lines))
+
+	def test_restart_line_iff_restart_listed(self):
+		# a `.py` item needs `restart`, any other file refuses it; a block of commands may list it alone
+		self.sandbox.commit_file(APP, "pkg/t.txt", "t\n")
+		self.sandbox.commit_file(APP, "pkg/t.py", "t = 1\n")
+		text = {"action": "edit", "path": f"{APP}/pkg/t.txt", "find": ["t"], "replace": ["u"]}
+		code = {"action": "edit", "path": f"{APP}/pkg/t.py", "find": ["t = 1"], "replace": ["t = 2"]}
+		site = frappe.local.site
+		restart_line = "<p>Sau khi áp dụng, hệ thống sẽ restart bench (lệnh cuối).</p>"
+		legacy_line = "<p>Sau khi áp dụng cần người chạy bench restart.</p>"
+		runs = {
+			"file, migrate": (lambda: self.run_block([text], [{"command": "migrate"}]), 0),
+			"py, migrate, restart": (
+				lambda: self.run_block([code], [{"command": "migrate"}, {"command": "restart"}]),
+				1,
+			),
+			"command migrate": (
+				lambda: self.run_tool("propose_bench_command", {"command": "migrate", "reason": "r"}),
+				0,
+			),
+			"commands migrate, restart": (
+				lambda: propose_change._propose_block(
+					[], [["--site", site, "migrate"], ["restart"]], "r", self.context()
+				),
+				1,
+			),
+			"commands restart": (
+				lambda: propose_change._propose_block([], [["restart"]], "r", self.context()),
+				1,
+			),
+		}
+		for shape, (run, count) in runs.items():
+			with self.subTest(shape=shape):
+				result = run()
+				self.assertTrue(result["ok"], result)
+				content = self.content(result)
+				# design-addendum-9 A9-1: the old sentence never, the new line once when `restart` is listed
+				self.assertEqual(
+					(
+						content.count("Sau khi áp dụng cần người chạy bench restart."),
+						content.count("Sau khi áp dụng, hệ thống sẽ restart bench (lệnh cuối)."),
+					),
+					(0, count),
+				)
+				self.assertEqual(content.count(restart_line), count)
+				self.assertNotIn(legacy_line, content)
+
+	def test_no_remote_url(self):
+		self.sandbox.add_remote(APP, url=REMOTE_URL, ahead=1)
+		commands = [{"command": "migrate"}, {"command": "restart"}]
+		content = self.content(self.run_block(self.four_kinds(), commands))
+		for secret in (REMOTE_URL, "x-token-FAKE", "host/r.git"):
+			with self.subTest(secret=secret):
+				self.assertNotIn(secret, content)
+		# `{tên}` and `{app}` of the first sentence go through `_shown` too (P7-10 point 4); the
+		# links carry the name as it is, so only the sentence is checked for the forged name
+		ctx = self.context()
+		forged = frappe._dict(
+			name="CP://T30",
+			change_kind=CHANGE_KIND_CODE,
+			app=REMOTE_URL,
+			operations=[frappe._dict(idx=1, operation=CHANGE_OP_CREATE, file_path=f"{APP}/pkg/x.md")],
+			command_list="[]",
+		)
+		forged_content = frappe.db.get_value("Comment", propose_change._comment(ctx, forged), "content")
+		self.assertIn('"></a> đang chờ duyệt: khối 1 mục trong app .</p>', forged_content)
+		for secret in (REMOTE_URL, "x-token-FAKE", "host/r.git"):
+			with self.subTest(forged=secret):
+				self.assertNotIn(secret, forged_content)
+		# the app is escaped after `_shown`; a block of only commands filters its name too
+		marked = frappe._dict(forged, name="CP-T30-HTML", app="<b>&x")
+		marked_content = frappe.db.get_value("Comment", propose_change._comment(ctx, marked), "content")
+		self.assertIn("khối 1 mục trong app &lt;b&gt;&amp;x.</p>", marked_content)
+		commands_only = frappe._dict(
+			name="CP://T30",
+			change_kind=CHANGE_KIND_COMMAND,
+			operations=[],
+			command_list='[["restart"]]',
+		)
+		commands_content = frappe.db.get_value(
+			"Comment", propose_change._comment(ctx, commands_only), "content"
+		)
+		self.assertIn('"></a> đang chờ duyệt: 1 lệnh bench.</p>', commands_content)
+
+	def test_command_only_first_sentence(self):
+		result = self.run_tool("propose_bench_command", {"command": "migrate", "reason": "r"})
+		self.assertTrue(result["ok"], result)
+		lines = [
+			"Gồm 0 sửa, 0 tạo, 0 xóa, 0 đổi tên; 1 lệnh.",
+			f"lệnh: bench --site {frappe.local.site} migrate",
+			"Lệnh trong khối không hoàn tác được; hoàn tác chỉ trả lại phần file.",
+		]
+		name = result["proposal"]
+		self.assertEqual(self.content(result), self.expected(name, "1 lệnh bench.", lines))
+
+	def test_fifty_items_all_paths_listed(self):
+		self.assertEqual(CHANGE_MAX_FILE_OPS, 50)
+		changes = [
+			{"action": "create", "path": f"{APP}/pkg/many/f{number:02d}.md", "content": "f\n"}
+			for number in range(50)
+		]
+		content = self.content(self.run_block(changes, []))
+		self.assertIn(f"đang chờ duyệt: khối 50 mục trong app {APP}.</p>", content)
+		self.assertIn("<p>Gồm 0 sửa, 50 tạo, 0 xóa, 0 đổi tên; 0 lệnh.</p>", content)
+		for change in changes:
+			with self.subTest(path=change["path"]):
+				self.assertEqual(content.count(f"<p>tạo {change['path']}</p>"), 1)
+
+	def test_mixed_block_first_sentence_counts_items(self):
+		self.sandbox.commit_file(APP, "pkg/t.py", "t = 1\n")
+		changes = [
+			{"action": "edit", "path": f"{APP}/pkg/t.py", "find": ["t = 1"], "replace": ["t = 2"]},
+			{"action": "create", "path": f"{APP}/pkg/m.md", "content": "m\n"},
+		]
+		commands = [{"command": "migrate"}, {"command": "build", "app": APP}, {"command": "restart"}]
+		content = self.content(self.run_block(changes, commands))
+		self.assertIn(f"đang chờ duyệt: khối 2 mục trong app {APP}.</p>", content)
+		self.assertNotIn("lệnh bench.</p>", content)
+		self.assertIn("<p>Gồm 1 sửa, 1 tạo, 0 xóa, 0 đổi tên; 3 lệnh.</p>", content)
+
+	def test_command_count_includes_restart(self):
+		site = frappe.local.site
+		result = propose_change._propose_block(
+			[], [["--site", site, "migrate"], ["restart"]], "r", self.context()
+		)
+		self.assertTrue(result["ok"], result)
+		content = self.content(result)
+		self.assertIn("đang chờ duyệt: 2 lệnh bench.</p>", content)
+		self.assertIn("<p>Gồm 0 sửa, 0 tạo, 0 xóa, 0 đổi tên; 2 lệnh.</p>", content)
+
+	def test_legacy_comment_unchanged(self):
+		"""A proposal without child rows and without `command_list` keeps today's comment byte for byte."""
+		ctx = self.context()
+		approve = frappe.utils.escape_html(
+			change_link.decision_path("CP-T30-OLD", change_link.ACTION_APPROVE)
+		)
+		reject = frappe.utils.escape_html(change_link.decision_path("CP-T30-OLD", change_link.ACTION_REJECT))
+		links = (
+			f'<p><a href="{approve}"><strong>Duyệt</strong></a> · '
+			f'<a href="{reject}"><strong>Từ chối</strong></a> · '
+			'<a href="/app/erp-ai-change-proposal/CP-T30-OLD">Xem nội dung thay đổi</a></p>'
+		)
+		head = '<p>Đề xuất <a href="/app/erp-ai-change-proposal/CP-T30-OLD">CP-T30-OLD</a> đang chờ duyệt: '
+		code = {
+			"name": "CP-T30-OLD",
+			"change_kind": CHANGE_KIND_CODE,
+			"app": APP,
+			"target_branch": "develop",
+			"upstream_ref": "",
+		}
+		cases = {
+			"edit .py": (
+				{**code, "file_path": f"{APP}/pkg/<m>.py", "is_new_file": 0},
+				head + f"sửa <code>{APP}/pkg/&lt;m&gt;.py</code>.</p>"
+				f"<p>Commit sẽ vào nhánh develop của app {APP}.</p>"
+				"<p>Nhánh này không theo nhánh remote nào.</p>"
+				"<p>Sau khi áp dụng cần người chạy bench restart.</p>" + links,
+			),
+			"new file": (
+				{**code, "file_path": f"{APP}/pkg/n.md", "is_new_file": 1},
+				head + f"tạo <code>{APP}/pkg/n.md</code>.</p>"
+				f"<p>Commit sẽ vào nhánh develop của app {APP}.</p>"
+				"<p>Nhánh này không theo nhánh remote nào.</p>" + links,
+			),
+			"command": (
+				{"name": "CP-T30-OLD", "change_kind": CHANGE_KIND_COMMAND, "command_list": ""},
+				head + "lệnh <code>bench </code>.</p><p>Lệnh bench không hoàn tác được.</p>" + links,
+			),
+		}
+		for shape, (fields, expected) in cases.items():
+			with self.subTest(shape=shape):
+				name = propose_change._comment(ctx, frappe._dict(fields))
+				self.assertEqual(frappe.db.get_value("Comment", name, "content"), expected)

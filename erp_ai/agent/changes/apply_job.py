@@ -217,12 +217,14 @@ def _run(proposal, action: str, actor: str, deadline: float) -> str:
 		and not block.commands_of(proposal)
 	):
 		_apply_code(proposal, check.targets[0], actor, deadline)
-	else:
-		# One commit for the whole block (design 4.2 step 7) and its commands come in later tasks: until then
-		# every item written goes back again and the block ends as one not yet writable.
-		if check.targets and not _write_block(proposal, check, old_head)():
+	elif block.commands_of(proposal) or not check.targets:
+		# The commands of a block (design 4.2 step 9) come in a later task: until then every item written goes
+		# back again and a block with commands ends as one not yet runnable.
+		if check.targets and not _write_block(proposal, check, old_head)[0]():
 			raise _Stop(CHANGE_STATUS_FAILED, GIT_RESTORE_FAILED)
 		raise _Stop(CHANGE_STATUS_FAILED, change_guard.OP_UNKNOWN)
+	else:
+		_commit_block(proposal, check, old_head, actor, deadline)
 	return CHANGE_STATUS_APPLIED
 
 
@@ -361,7 +363,8 @@ def _write_block(proposal, check: change_guard.BlockCheck, old_head: str):
 
 	An error at item k, a wrong read-back hash or a failed `git add` gives everything back in reverse and
 	ends `Lỗi` with `BLOCK_WRITE_FAILED` naming item k, or `GIT_RESTORE_FAILED` when the give-back did not
-	hold. Returns the give-back (True when it held) for a later step that has to undo the writes.
+	hold. Returns the give-back (True when it held) for a later step that has to undo the writes, and the
+	full paths of the folders `make_parents` made, in the order they were made.
 	"""
 	app_dir = os.path.join(source.get_source_root(), check.app)
 	steps, staged, created = [], [], []
@@ -389,7 +392,99 @@ def _write_block(proposal, check: change_guard.BlockCheck, old_head: str):
 		)
 		reason = BLOCK_WRITE_FAILED.format(number=number, path=check.targets[number - 1].op.path)
 		raise _Stop(CHANGE_STATUS_FAILED, reason if give_back() else GIT_RESTORE_FAILED) from exc
-	return give_back
+	return give_back, created
+
+
+def _commit_ends(target) -> tuple[tuple[str, bytes | None], ...]:
+	"""`(full path, bytes in the commit)` of each path an item puts in the block commit (design 4.2 step 7):
+	the `after` bytes for an edit, a created file and a rename target, `None` for a deletion and a rename
+	source."""
+	operation = target.op
+	if operation.kind == CHANGE_OP_DELETE:
+		return ((target.full_path, None),)
+	after = operation.after.encode("utf-8")
+	if operation.kind == CHANGE_OP_RENAME:
+		return ((target.full_path, None), (target.full_new_path, after))
+	return ((target.full_path, after),)
+
+
+def _commit_block(
+	proposal, check: change_guard.BlockCheck, old_head: str, actor: str, deadline: float
+) -> None:
+	"""Design 4.2 steps 6 to 8 then 10 for a block without commands: write every item, one `commit --only`
+	of every path (both ends of a rename), the post-check, the git fields recorded and committed, done.
+
+	A commit that fails with HEAD unchanged gives every item back as step 6; once the bot commit exists
+	nothing is given back (design-addendum-3 QĐ-B2). Log rows carry `{"head", "files"}` before and
+	`{"commit", "branch", "files"}` after (design 6 "Quan sát").
+	"""
+	give_back, created = _write_block(proposal, check, old_head)
+	source_root = source.get_source_root()
+	repo = os.path.join(source_root, check.app)
+	ends = {}
+	before_files = {}
+	for target in check.targets:
+		if target.op.kind != CHANGE_OP_CREATE:
+			before_files[os.path.relpath(target.full_path, repo)] = target.op.base_hash
+		for full, blob in _commit_ends(target):
+			ends[os.path.relpath(full, repo)] = (full, blob)
+
+	def record(commit, branch):
+		after_paths = {rel: full for rel, (full, _blob) in ends.items()}
+		return _commit_record("apply_commit_sha", before_files, after_paths, old_head, commit, branch)
+
+	def given_back(reason: str):
+		held = give_back()
+		raise _Stop(
+			CHANGE_STATUS_FAILED, reason if held else GIT_RESTORE_FAILED, before=record(None, None)["before"]
+		)
+
+	committed = False
+	summary = None
+	try:
+		subject, body = _apply_message(proposal, block.operations_of(proposal), _person(actor))
+		result = process_runner.git_commit_only(
+			repo, tuple(sorted(ends)), subject, body, _git_limit(deadline)
+		)
+		if _failed(result):
+			summary = _commit_landed(repo, old_head, lambda _head: given_back(_commit_failed_reason(result)))
+		committed = True
+		blobs = {rel: blob for rel, (_full, blob) in ends.items()}
+		summary = _postcheck(repo, old_head, proposal.target_branch, blobs, summary, record)
+		values = record(summary.commit, summary.branch)
+		# The upstream is read again after the commit, so the count already holds the bot commit.
+		state = source.read_git_state(
+			check.targets[0].full_path, new_file=False, limit_s=_git_limit(deadline)
+		)
+		if state.refusal:
+			raise _Stop(CHANGE_STATUS_FAILED, state.refusal, **values)
+		transitions.record_commit(
+			proposal.name,
+			CHANGE_STATUS_APPLYING,
+			fields={
+				**values["fields"],
+				"applied_branch": summary.branch,
+				"applied_ahead_count": state.ahead_count,
+				"created_dirs": [os.path.relpath(folder, source_root) for folder in created],
+			},
+		)
+		frappe.db.commit()
+		transitions.finish(
+			proposal.name,
+			CHANGE_STATUS_APPLYING,
+			CHANGE_STATUS_APPLIED,
+			step="apply",
+			actor=actor,
+			before=values["before"],
+			after=values["after"],
+		)
+	except _Stop:
+		raise
+	except Exception as exc:
+		if committed:
+			_fail_after_commit(proposal, ACTION_APPLY, repo, old_head, summary, exc, record)
+		_give_back_after_crash(proposal, repo, old_head, give_back)
+		raise
 
 
 def _staged_paths(target) -> tuple[str, ...]:
@@ -503,60 +598,68 @@ def _person(user: str) -> str:
 
 
 def _commit_record(
-	field: str, full_path: str, sha_before: str, old_head: str, commit: str | None, branch: str | None
+	field: str, before_files: dict, after_paths: dict, old_head: str, commit: str | None, branch: str | None
 ) -> dict:
-	"""`fields`, `before` and `after` of a `finish` after the commit ran (design-addendum-3 QĐ-B5).
+	"""`fields`, `before` and `after` of a `finish` after the commit ran (design 6 "Quan sát", ADR-040 QĐ 2).
 
-	`field` is `apply_commit_sha` or `undo_commit_sha`; without a commit sha, neither `fields` nor `after`
-	carries one.
+	`field` is `apply_commit_sha` or `undo_commit_sha`; `before_files` maps a path in the repo to its sha256
+	before the job, `after_paths` maps a path in the repo to its full path, hashed now (`None`: not on disk).
+	Without a commit sha, neither `fields` nor `after` carries one.
 	"""
-	after = {"sha256": file_writer.sha256_of(full_path)}
+	after = {}
 	fields = {}
 	if commit:
 		fields[field] = commit
 		after["commit"] = commit
 	after["branch"] = branch
-	return {"fields": fields, "before": {"sha256": sha_before, "head": old_head}, "after": after}
+	after["files"] = {rel: file_writer.sha256_of(full) for rel, full in after_paths.items()}
+	return {"fields": fields, "before": {"head": old_head, "files": before_files}, "after": after}
 
 
-def _apply_record(operation, full_path: str, old_head: str, commit: str | None, branch: str | None) -> dict:
-	return _commit_record("apply_commit_sha", full_path, operation.base_hash, old_head, commit, branch)
+def _apply_record(operation, state, full_path: str, commit: str | None, branch: str | None) -> dict:
+	rel = state.rel_in_repo
+	return _commit_record(
+		"apply_commit_sha", {rel: operation.base_hash}, {rel: full_path}, state.head, commit, branch
+	)
 
 
-def _undo_record(proposal, full_path: str, old_head: str, commit: str | None, branch: str | None) -> dict:
-	return _commit_record("undo_commit_sha", full_path, proposal.after_hash, old_head, commit, branch)
+def _undo_record(proposal, state, full_path: str, commit: str | None, branch: str | None) -> dict:
+	rel = state.rel_in_repo
+	return _commit_record(
+		"undo_commit_sha", {rel: proposal.after_hash}, {rel: full_path}, state.head, commit, branch
+	)
 
 
 def _apply_postcheck(proposal, operation, state, full_path: str, summary=None):
 	"""Design 4.3 step 3.5 (ADR-022 decision 1 step 5); returns the `CommitSummary` of the bot commit."""
 	return _postcheck(
-		state,
+		state.repo_root,
+		state.head,
 		proposal.target_branch,
-		operation.after.encode("utf-8"),
+		{state.rel_in_repo: operation.after.encode("utf-8")},
 		summary,
-		lambda commit, branch: _apply_record(operation, full_path, state.head, commit, branch),
+		lambda commit, branch: _apply_record(operation, state, full_path, commit, branch),
 	)
 
 
-def _postcheck(state, branch: str, blob: bytes | None, summary, record):
-	"""The post-check of design 4.3 step 3.5 and 4.4 step 6; returns the `CommitSummary` of the bot commit.
+def _postcheck(repo: str, old_head: str, branch: str, blobs: dict, summary, record):
+	"""The post-check of design 4.2 step 7 (4.4 step 6 for undo); returns the `CommitSummary` of the bot commit.
 
-	The commit must have one parent with `state.head` as its ancestor, only the target path, `branch`, and
-	`blob` as the target's bytes (`None`: not in the tree). The bot commit exists (the commit command exited
-	0, or HEAD moved to a bot commit whose `summary` is given), so the file is never given back and history
+	The commit must have one parent with `old_head` as its ancestor, exactly the paths of `blobs`, `branch`,
+	and for each path its `blobs` bytes (`None`: not in the tree). The bot commit exists (the commit command
+	exited 0, or HEAD moved to a bot commit whose `summary` is given), so no file is given back and history
 	is never rewritten (design-addendum-3 QĐ-B2 item 1): a check that fails or cannot be read ends the job as
 	`Lỗi` `GIT_COMMIT_MISMATCH` with `record(commit, branch)`, keeping the commit sha when it is known.
 	"""
-	repo, rel, old_head = state.repo_root, state.rel_in_repo, state.head
 	try:
 		if summary is None:
 			summary = source.git_commit_summary(repo)
 		matches = (
 			len(summary.parents) == 1
 			and source.git_is_ancestor(repo, old_head, summary.parents[0]) is True
-			and summary.paths == (rel,)
+			and set(summary.paths) == set(blobs)
 			and summary.branch == branch
-			and source.git_blob(repo, summary.commit, rel) == blob
+			and all(source.git_blob(repo, summary.commit, rel) == blob for rel, blob in blobs.items())
 		)
 	except RuntimeError:
 		# git could not be read: the check is not passed (QĐ-B2 item 1), the reason below says so.
@@ -626,7 +729,7 @@ def _apply_code(proposal, target, actor: str, deadline: float) -> None:
 			)
 		committed = True
 		summary = _apply_postcheck(proposal, operation, state, full, summary)
-		record = _apply_record(operation, full, old_head, summary.commit, summary.branch)
+		record = _apply_record(operation, state, full, summary.commit, summary.branch)
 		transitions.finish(
 			proposal.name,
 			CHANGE_STATUS_APPLYING,
@@ -654,7 +757,7 @@ def _apply_code(proposal, target, actor: str, deadline: float) -> None:
 				old_head,
 				summary,
 				exc,
-				lambda commit, branch: _apply_record(operation, full, old_head, commit, branch),
+				lambda commit, branch: _apply_record(operation, state, full, commit, branch),
 			)
 		_give_back_after_crash(
 			proposal,
@@ -801,13 +904,14 @@ def _undo_code(proposal, actor: str, allowed_apps, deadline: float) -> None:
 		# D-18: the undo commit of a new file has the path deleted from the tree.
 		restored = None if new_file else (proposal.content_before or "").encode("utf-8")
 		summary = _postcheck(
-			state,
+			repo,
+			old_head,
 			state.branch,
-			restored,
+			{rel: restored},
 			summary,
-			lambda commit, branch: _undo_record(proposal, full, old_head, commit, branch),
+			lambda commit, branch: _undo_record(proposal, state, full, commit, branch),
 		)
-		record = _undo_record(proposal, full, old_head, summary.commit, summary.branch)
+		record = _undo_record(proposal, state, full, summary.commit, summary.branch)
 		transitions.finish(
 			proposal.name,
 			CHANGE_STATUS_UNDOING,
@@ -830,7 +934,7 @@ def _undo_code(proposal, actor: str, allowed_apps, deadline: float) -> None:
 				old_head,
 				summary,
 				exc,
-				lambda commit, branch: _undo_record(proposal, full, old_head, commit, branch),
+				lambda commit, branch: _undo_record(proposal, state, full, commit, branch),
 			)
 		_give_back_after_crash(
 			proposal,

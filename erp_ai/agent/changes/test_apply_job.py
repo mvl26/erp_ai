@@ -580,7 +580,9 @@ class TestApplyCodeSteps(ApplyJobTestCase):
 		self.assertEqual(state.apply_commit_sha, self.head())
 		before, after = self.log_row(name, "apply")
 		self.assertEqual(before, {"head": old_head, "files": {REL: _sha(BEFORE)}})
-		self.assertEqual(after, {"commit": state.apply_commit_sha, "branch": "main", "files": {REL: _sha(AFTER)}})
+		self.assertEqual(
+			after, {"commit": state.apply_commit_sha, "branch": "main", "files": {REL: _sha(AFTER)}}
+		)
 
 	def test_git_commit_limit_comes_from_the_job_deadline(self):
 		start = self.head()
@@ -1712,10 +1714,15 @@ class TestUndoCode(ApplyJobTestCase):
 				self.assertEqual(state.change_status, CHANGE_STATUS_UNDONE)
 				before, after = self.log_row(name, "undo")
 				# Design 4.4 step 7 and design-addendum-3 QĐ-B5.
-				self.assertEqual(before, {"head": apply_commit, "files": {REL: _sha(AFTER)}})
+				self.assertEqual(before, {"head": apply_commit, "files": {self.target(kind): _sha(AFTER)}})
 				restored = None if kind == "new file" else _sha(BEFORE)
 				self.assertEqual(
-					after, {"commit": state.undo_commit_sha, "branch": "main", "files": {REL: restored}}
+					after,
+					{
+						"commit": state.undo_commit_sha,
+						"branch": "main",
+						"files": {self.target(kind): restored},
+					},
 				)
 
 	def test_undo_rechecks_fail_without_writing(self):
@@ -1840,9 +1847,11 @@ class TestUndoCode(ApplyJobTestCase):
 		self.assertEqual(state.undo_commit_sha, self.head())
 		self.assertEqual(self.steps(name), ["approve", "apply", "fail"])
 		before, after = self.log_row(name, "fail")
-		self.assertEqual(before, {"head": apply_commit, "files": {REL: _sha(AFTER)}})
+		self.assertEqual(before, {"head": apply_commit, "files": {self.target(kind): _sha(AFTER)}})
 		restored = None if kind == "new file" else _sha(BEFORE)
-		self.assertEqual(after, {"commit": state.undo_commit_sha, "branch": branch, "files": {REL: restored}})
+		self.assertEqual(
+			after, {"commit": state.undo_commit_sha, "branch": branch, "files": {self.target(kind): restored}}
+		)
 
 	def test_undo_postcheck_wrong_commit_keeps_commit_and_fails(self):
 		real_summary = source.git_commit_summary
@@ -2340,7 +2349,7 @@ class TestUndoCode(ApplyJobTestCase):
 				self.assertEqual(self.sandbox.git(APP, "rev-parse", "HEAD~1").strip(), apply_commit)
 				self.assertEqual(state.undo_commit_sha, self.head())
 				before, after = self.log_row(name, "fail")
-				self.assertEqual(before, {"head": apply_commit, "files": {REL: _sha(AFTER)}})
+				self.assertEqual(before, {"head": apply_commit, "files": {self.target(kind): _sha(AFTER)}})
 				self.assertEqual(after["commit"], state.undo_commit_sha)
 
 	def test_undo_unexpected_exception_after_write_restores_file(self):

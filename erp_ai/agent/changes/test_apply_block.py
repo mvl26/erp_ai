@@ -329,6 +329,11 @@ class BlockApplyTestCase(FrappeTestCase):
 				self.addCleanup(patcher.stop)
 		return calls
 
+	def commit_result(self, **values):
+		"""A failed `git_commit_only` result (exit 128) with `values` replaced."""
+		fields = {"exit_code": 128, "output": "", "duration_ms": 1, "timed_out": False, "not_found": False}
+		fields.update(values)
+		return process_runner.CommandResult(**fields)
 
 	def state(self, name):
 		return frappe.db.get_value(
@@ -370,7 +375,11 @@ class BlockApplyTestCase(FrappeTestCase):
 
 	def assert_mixed_files_applied(self):
 		"""The five items of `mixed_block` are on disk: both edits, the created file, b and c gone, c moved."""
-		self.assertEqual(self.tree()[1], {**MIXED_FILES_AFTER, LEGACY_REL: BEFORE.encode()})
+		files = self.tree()[1]
+		for _status, rel in MIXED_COMMIT:
+			with self.subTest(rel=rel):
+				self.assertEqual(files.get(rel), MIXED_FILES_AFTER.get(rel))
+		self.assertEqual(files[LEGACY_REL], BEFORE.encode())
 
 
 def _once(test):
@@ -921,12 +930,6 @@ class TestBlockAllOrNothing(BlockApplyTestCase):
 			],
 		)
 
-
-	def commit_result(self, **values):
-		fields = {"exit_code": 128, "output": "", "duration_ms": 1, "timed_out": False, "not_found": False}
-		fields.update(values)
-		return process_runner.CommandResult(**fields)
-
 	def test_commit_fails_restores_all_head_and_index_unchanged(self):
 		# Design 4.2 step 7: the one commit fails with HEAD unchanged → every item back as step 6, 0 commits.
 		name = self.mixed_block()
@@ -936,7 +939,9 @@ class TestBlockAllOrNothing(BlockApplyTestCase):
 			self.run_apply(name)
 
 		self.assertEqual(commit.call_count, 1)
-		self.assert_given_back(name, "commit git lỗi, đã trả file về như trước: fatal: không commit được", before)
+		self.assert_given_back(
+			name, "commit git lỗi, đã trả file về như trước: fatal: không commit được", before
+		)
 
 	def test_commit_timeout_restores_all(self):
 		name = self.mixed_block()
@@ -954,7 +959,11 @@ class TestBlockAllOrNothing(BlockApplyTestCase):
 		start = self.git("rev-parse", "HEAD")
 		cases = (
 			("applied", {}, "apply"),
-			("commit failed", {"git_commit_only": lambda *args: self.commit_result(output="fatal: lỗi")}, "fail"),
+			(
+				"commit failed",
+				{"git_commit_only": lambda *args: self.commit_result(output="fatal: lỗi")},
+				"fail",
+			),
 			(
 				"post-check mismatch",
 				{"git_commit_summary": lambda repo: dataclasses.replace(real_summary(repo), branch="khac")},
@@ -972,6 +981,8 @@ class TestBlockAllOrNothing(BlockApplyTestCase):
 					patch.object(owners.get(stub, apply_job.transitions), stub, side_effect=effect)
 					for stub, effect in stubs.items()
 				]
+				# The crash case rolls back before it records `Lỗi`; inside a test that would drop the proposal.
+				patchers.append(patch.object(frappe.db, "rollback"))
 				for patcher in patchers:
 					patcher.start()
 				try:
@@ -1086,11 +1097,12 @@ class TestDelete(BlockApplyTestCase):
 			self.assertEqual(handle.read(), TEXT_BEFORE)
 		self.assertEqual(self.tree()[1][TEXT_RELS[0]], TEXT_BEFORE.encode())
 
-
 	def test_delete_removes_file_commit_records_deletion(self):
 		# Design 4.2 steps 6 to 7 (R-9, T-0): the file is removed and the one commit records it as deleted.
 		rel = TEXT_RELS[1]
-		name = self.approve(self.block([{"kind": CHANGE_OP_DELETE, "path": f"{APP}/{rel}", "before": TEXT_BEFORE}]))
+		name = self.approve(
+			self.block([{"kind": CHANGE_OP_DELETE, "path": f"{APP}/{rel}", "before": TEXT_BEFORE}])
+		)
 		start = self.git("rev-parse", "HEAD")
 
 		self.run_apply(name)
@@ -1177,13 +1189,14 @@ class TestApplyBlock(BlockApplyTestCase):
 
 		self.assert_failed_untouched(name, apply_job.DIGEST_CHANGED, before)
 
-
 	def test_one_approval_applies_whole_block_decision_calls_1(self):
 		# One approval, one run: the five items of every kind land in one commit, no second decision.
 		name = self.mixed_block()
 		start = self.git("rev-parse", "HEAD")
 		with (
-			patch.object(apply_job.process_runner, "git_commit_only", wraps=process_runner.git_commit_only) as commit,
+			patch.object(
+				apply_job.process_runner, "git_commit_only", wraps=process_runner.git_commit_only
+			) as commit,
 			patch.object(apply_job.transitions, "approve", wraps=transitions.approve) as approve,
 		):
 			self.run_apply(name)
@@ -1195,7 +1208,10 @@ class TestApplyBlock(BlockApplyTestCase):
 		self.assertEqual(state.apply_commit_sha, self.git("rev-parse", "HEAD"))
 		self.assertEqual(self.git("rev-parse", "HEAD~1"), start)
 		self.assertEqual((state.applied_branch, state.applied_ahead_count), ("main", 0))
-		self.assertEqual(json.loads(state.created_dirs), [f"{APP}/fresh", f"{APP}/fresh/deep", f"{APP}/moved", f"{APP}/moved/deep"])
+		self.assertEqual(
+			json.loads(state.created_dirs),
+			[f"{APP}/fresh", f"{APP}/fresh/deep", f"{APP}/moved", f"{APP}/moved/deep"],
+		)
 		self.assertEqual(self.name_status(), MIXED_COMMIT)
 		self.assert_mixed_files_applied()
 		self.assertEqual(self.git("status", "--porcelain"), "")
@@ -1289,7 +1305,10 @@ class TestBlockCommit(BlockApplyTestCase):
 		cases = (
 			("two parents", lambda: with_summary(parents=(start, start))),
 			("old head not an ancestor", lambda: {"git_is_ancestor": lambda *args: False}),
-			("a path missing", lambda: with_summary(paths=tuple(r for _s, r in MIXED_COMMIT if r != MOVED_REL))),
+			(
+				"a path missing",
+				lambda: with_summary(paths=tuple(r for _s, r in MIXED_COMMIT if r != MOVED_REL)),
+			),
 			("other branch", lambda: with_summary(branch="khac")),
 			("edit bytes", lambda: with_blob(TEXT_RELS[0], TEXT_BEFORE.encode())),
 			("created bytes", lambda: with_blob(CREATED_REL, b"")),
@@ -1301,7 +1320,9 @@ class TestBlockCommit(BlockApplyTestCase):
 			with self.subTest(label):
 				self.restart_from(start)
 				name = self.mixed_block()
-				patchers = [patch.object(source, stub, side_effect=effect) for stub, effect in stubs().items()]
+				patchers = [
+					patch.object(source, stub, side_effect=effect) for stub, effect in stubs().items()
+				]
 				for patcher in patchers:
 					patcher.start()
 				try:
@@ -1328,11 +1349,15 @@ class TestBlockCommit(BlockApplyTestCase):
 			self.run_apply(name)
 
 		self.assertEqual(self.state(name).change_status, CHANGE_STATUS_APPLIED)
-		self.assertEqual(sorted(call.args[2] for call in blob.call_args_list), sorted(r for _s, r in MIXED_COMMIT))
+		self.assertEqual(
+			sorted(call.args[2] for call in blob.call_args_list), sorted(r for _s, r in MIXED_COMMIT)
+		)
 		for rel, data in MIXED_FILES_AFTER.items():
 			with self.subTest(rel):
 				shown = subprocess.run(
-					["git", "-C", self.sandbox.repo(APP), "show", f"HEAD:{rel}"], capture_output=True, check=True
+					["git", "-C", self.sandbox.repo(APP), "show", f"HEAD:{rel}"],
+					capture_output=True,
+					check=True,
 				)
 				self.assertEqual(shown.stdout, data)
 		self.assertEqual(self.git("ls-tree", "--name-only", "HEAD", "--", TEXT_RELS[1], TEXT_RELS[2]), "")
@@ -1341,11 +1366,86 @@ class TestBlockCommit(BlockApplyTestCase):
 		# Design-addendum-3 QĐ-B2 items 1 and 4: once the bot commit exists nothing is given back.
 		name = self.mixed_block()
 		start = self.git("rev-parse", "HEAD")
-		with patch.object(apply_job.transitions, "record_commit", side_effect=RuntimeError("hỏng")):
+		# The job rolls back before it records `Lỗi`; inside a test that would drop the proposal itself.
+		with (
+			patch.object(apply_job.transitions, "record_commit", side_effect=RuntimeError("hỏng")),
+			patch.object(frappe.db, "rollback"),
+		):
 			self.run_apply(name)
 
 		state = self.state(name)
 		self.assertEqual((state.change_status, state.failure_reason), (CHANGE_STATUS_FAILED, "RuntimeError"))
+		self.assertEqual(state.apply_commit_sha, self.git("rev-parse", "HEAD"))
+		self.assertEqual(self.git("rev-parse", "HEAD~1"), start)
+		self.assert_mixed_files_applied()
+		self.assertEqual(self.log_rows(name)[-1][2]["commit"], state.apply_commit_sha)
+
+	def test_commit_reported_failed_but_bot_commit_landed_goes_to_postcheck(self):
+		# Design 4.2 step 7 → `_commit_landed`: HEAD moved to the bot's commit, so nothing is given back.
+		name = self.mixed_block()
+		start = self.git("rev-parse", "HEAD")
+		real_commit = process_runner.git_commit_only
+
+		def commit_then_report_failure(*args):
+			real_commit(*args)
+			return self.commit_result(output="fatal: báo lỗi sau khi commit")
+
+		with patch.object(
+			apply_job.process_runner, "git_commit_only", side_effect=commit_then_report_failure
+		):
+			self.run_apply(name)
+
+		state = self.state(name)
+		self.assertEqual((state.change_status, state.failure_reason), (CHANGE_STATUS_APPLIED, None))
+		self.assertEqual(state.apply_commit_sha, self.git("rev-parse", "HEAD"))
+		self.assertEqual(self.git("rev-parse", "HEAD~1"), start)
+		self.assertEqual(self.name_status(), MIXED_COMMIT)
+		self.assert_mixed_files_applied()
+
+	def test_commit_limit_comes_from_the_job_deadline(self):
+		# Design 3.5: the one commit's `limit_s` is what is left of the job budget, capped by `GIT_TIMEOUT_S`.
+		self.mixed_block()
+		start = self.git("rev-parse", "HEAD")
+		for spent, limit in ((100, source.GIT_TIMEOUT_S), (apply_job.COMMAND_TIMEOUT_S - 5, 5)):
+			with self.subTest(spent=spent):
+				self.restart_from(start)
+				name = self.mixed_block()
+				clock = iter([1000.0])
+				with (
+					patch("time.monotonic", side_effect=lambda spent=spent: next(clock, 1000.0 + spent)),
+					patch.object(
+						apply_job.process_runner, "git_commit_only", wraps=process_runner.git_commit_only
+					) as commit,
+				):
+					self.run_apply(name)
+
+				self.assertEqual(commit.call_args.args[4], limit)
+				self.assertEqual(self.state(name).change_status, CHANGE_STATUS_APPLIED)
+
+	def test_git_refusal_after_commit_keeps_sha_and_files(self):
+		# Step 8 reads the upstream again after the commit: a refusal then ends `Lỗi` with that sentence and
+		# keeps the commit and every file as applied (design-addendum-3 QĐ-B2 item 1).
+		name = self.mixed_block()
+		start = self.git("rev-parse", "HEAD")
+		real_commit, real_state = process_runner.git_commit_only, source.read_git_state
+		committed = []
+
+		def commit(*args):
+			committed.append(True)
+			return real_commit(*args)
+
+		def read_git_state(full, **kwargs):
+			state = real_state(full, **kwargs)
+			return dataclasses.replace(state, refusal="git bị khóa") if committed else state
+
+		with (
+			patch.object(apply_job.process_runner, "git_commit_only", side_effect=commit),
+			patch.object(source, "read_git_state", side_effect=read_git_state),
+		):
+			self.run_apply(name)
+
+		state = self.state(name)
+		self.assertEqual((state.change_status, state.failure_reason), (CHANGE_STATUS_FAILED, "git bị khóa"))
 		self.assertEqual(state.apply_commit_sha, self.git("rev-parse", "HEAD"))
 		self.assertEqual(self.git("rev-parse", "HEAD~1"), start)
 		self.assert_mixed_files_applied()
@@ -1360,10 +1460,10 @@ class TestBlockCommit(BlockApplyTestCase):
 		environ.start()
 		self.addCleanup(environ.stop)
 		self.sandbox.add_remote(APP, url=REMOTE_URL)
-		frappe.db.set_value("User", ACTOR, "first_name", f"Duyệt {APPROVER_NAME_EMAIL}", update_modified=False)
 		name = self.mixed_block()
 
-		self.run_apply(name)
+		with patch.object(apply_job, "get_fullname", return_value=f"Duyệt {APPROVER_NAME_EMAIL}"):
+			self.run_apply(name)
 
 		state = self.state(name)
 		self.assertEqual(state.change_status, CHANGE_STATUS_APPLIED, state.failure_reason)
@@ -1382,7 +1482,9 @@ class TestBlockCommit(BlockApplyTestCase):
 class TestNewDirs(BlockApplyTestCase):
 	def test_create_three_level_tree_matches_proposal(self):
 		rel = "lop1/lop2/lop3/moi.txt"
-		name = self.approve(self.block([{"kind": CHANGE_OP_CREATE, "path": f"{APP}/{rel}", "after": CREATED_TEXT}]))
+		name = self.approve(
+			self.block([{"kind": CHANGE_OP_CREATE, "path": f"{APP}/{rel}", "after": CREATED_TEXT}])
+		)
 
 		self.run_apply(name)
 

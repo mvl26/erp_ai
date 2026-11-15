@@ -117,6 +117,16 @@ def _check_bot_action_fields(fields) -> None:
 		)
 
 
+def _check_actions(fields) -> None:
+	"""Every element of `actions` (when given as a list) is a dict holding every key of `ACTION_KEYS`."""
+	actions = fields.get("actions")
+	if not isinstance(actions, list):
+		return
+	for index, entry in enumerate(actions):
+		if not isinstance(entry, dict) or not set(ACTION_KEYS) <= entry.keys():
+			raise ValueError(f"actions[{index}] must be an entry built by action_entry, got {entry!r}")
+
+
 def write_entry(**fields) -> str:
 	"""Create one ERP AI Log row; the only place that does (ADR-004, ADR-012 QĐ 6).
 
@@ -125,6 +135,7 @@ def write_entry(**fields) -> str:
 	`bot_action` rows (the bot's own work or a permission-switch change, never a model call) take
 	`setting_save|scheduled_job`, a non-empty `actions` list and cost 0, and are inserted with
 	`ignore_permissions=True`; every row without a `site_environment` gets `policy.site_environment()`.
+	Every element of an `actions` list must hold every key of `ACTION_KEYS` (build it with `action_entry`).
 	The checks run before the insert, so a refused row leaves nothing; insert and commit stay in this one call.
 	`classify|reason|skip` rows take `ticket_insert|comment_mention` and are inserted under the session
 	user's permissions. `change` rows (one per proposal step) take `trigger="change_action"` plus
@@ -134,7 +145,8 @@ def write_entry(**fields) -> str:
 	`allow_agent_write()`: the one path by which the agent account may write ERP AI Log (ADR-023 QĐ 5).
 
 	Raises:
-		ValueError: `entry_type` or `trigger` is missing or not allowed for the entry type, or a `change`
+		ValueError: `entry_type` or `trigger` is missing or not allowed for the entry type, an `actions`
+			element is not a dict with every key of `ACTION_KEYS`, or a `change`
 			row has a missing/unknown `change_step` or a missing/blank `actor` or `change_proposal`.
 		frappe.PermissionError: a non-`change` row and the session user may not create ERP AI Log.
 	"""
@@ -151,6 +163,7 @@ def write_entry(**fields) -> str:
 	if is_bot_action:
 		_check_bot_action_fields(fields)
 		fields = {**fields, "cost_usd": 0}
+	_check_actions(fields)
 	if not fields.get("site_environment"):
 		fields = {**fields, "site_environment": policy.site_environment()}
 	values = {

@@ -1,6 +1,8 @@
+import itertools
 import re
 import time
 import unicodedata
+from unittest import mock
 
 from frappe.tests.utils import FrappeTestCase
 
@@ -64,6 +66,82 @@ def _module_patterns() -> list[re.Pattern]:
 			if isinstance(item, re.Pattern):
 				patterns.append(item)
 	return patterns
+
+
+# K-8 text generators `(unit, head, tail)`: secret keys without a value, long separator runs, many
+# `MASK`s, non-secret keys (design-w1-fixes-16.md section 4a).
+_K8_GENERATORS = (
+	("pwd=a|", "", ""),
+	("password=abc|api_key:,", "", "hunter2"),
+	("api_key: |", "", ""),
+	("pwd= ", "", ""),
+	("pwd=a|x ", "", ""),
+	("&", "password=a", ""),
+	(",;&|", "password=a", "x"),
+	(" ", "pwd=a", "x"),
+	("|", "password=a", "api_key: hunter2"),
+	("a.", "password=", "api_key: z"),
+	("password=sk-ant-A&", "", ""),
+	("sk-ant-A.", "password=", ""),
+	("pwd=a&sk-ant-X|", "", ""),
+	("user=sk-ant-A&", "", ""),
+	("user=a|", "", ""),
+	("|user:", "password=", ""),
+)
+
+
+def _k8_text(unit: str, head: str, tail: str, size: int) -> str:
+	return head + unit * ((size - len(head) - len(tail)) // len(unit)) + tail
+
+
+class _CountingPattern:
+	"""Wraps a compiled pattern and adds the characters each `match` reads to `counter[0]`."""
+
+	def __init__(self, pattern: re.Pattern, counter: list[int]):
+		self.pattern = pattern
+		self.counter = counter
+
+	def match(self, text: str, pos: int = 0):
+		found = self.pattern.match(text, pos)
+		if found:
+			self.counter[0] += found.end() - pos
+		return found
+
+
+_PLANT_KEYS = (("api_key", True), ("my api key", True), ("user", False))
+_PLANT_SEPARATORS = (",", ";", "&", "|", " ", "\n")
+
+
+def _planted_items(index: int, keys=_PLANT_KEYS, key_separators=("=", ":", ": ")) -> list[tuple]:
+	"""Items `(text, token, secret)` for one position; `token` is unique to the position and kind."""
+	items = []
+	for kind in ("empty", "bare", "quoted", "pattern"):
+		token = None if kind == "empty" else f"zq{index}{kind[0]}"
+		value = {"empty": "", "bare": token, "quoted": f'"{token}"', "pattern": f"sk-ant-{token}"}[kind]
+		for key, secret in keys:
+			for key_separator in key_separators:
+				items.append((f"{key}{key_separator}{value}", token, secret and token is not None))
+		items.append((value, token, False))
+	return items
+
+
+def _must_mask(text: str, planted: tuple) -> set[str]:
+	"""Tokens that must not survive: secret by construction, inside a value pattern, or inside the K-4
+	value of any key candidate with a secret name, looked for at every run start (not the code's scan)."""
+	tokens = [token for _, token, _ in planted if token is not None]
+	must = {token for _, token, secret in planted if secret}
+	masked = text
+	for pattern in redact.SECRET_PATTERNS:
+		for found in pattern.finditer(masked):
+			must.update(token for token in tokens if token in found.group())
+		masked = pattern.sub(redact._mask_keep_prefix, masked)
+	for word in re.finditer(r"(?<![\w-])[\w-]", masked):
+		candidate = redact._KEY_CANDIDATE.match(masked, word.start())
+		if candidate and redact.is_secret_key(candidate.group("name")):
+			value = redact._KEY_VALUE.match(masked, candidate.end())
+			if value:
+				must.update(token for token in tokens if token in value.group())
+	return must
 
 
 class TestRedact(FrappeTestCase):
@@ -233,6 +311,153 @@ class TestRedact(FrappeTestCase):
 		for text, expected in cases:
 			with self.subTest(text=text):
 				self.assertEqual(redact.redact_secrets(text), expected)
+
+	def test_pattern_masked_value_tail_masked(self):
+		# K-7 as amended: after a secret key, the tail K-4 still counts as bare value goes with the MASK.
+		cases = (
+			("password=sk-ant-FAKE&tailFAKE", f"password={MASK}"),
+			("password=sk-ant-FAKE&amp;tailFAKE", f"password={MASK}"),
+			("password=sk-ant-FAKE.tailFAKE", f"password={MASK}"),
+			("pwd=sk-FAKE0000000000000000+tailFAKE", f"pwd={MASK}"),
+			("token=eyJa.eyJb.c2ln&tailFAKE", f"token={MASK}"),
+			("password=sk-ant-FAKE,tailFAKE", f"password={MASK}"),
+			("password=sk-ant-FAKE&tailFAKE;pwd=fake-z", f"password={MASK};pwd={MASK}"),
+		)
+		for text, expected in cases:
+			with self.subTest(text=text):
+				result = redact.redact_secrets(text)
+				self.assertEqual(result, expected)
+				self.assertNotIn("tailFAKE", result)
+
+	def test_pattern_masked_value_tail_stops_like_bare_value(self):
+		# The tail stops where a bare value stops (K-4 (a)-(c), `}`); a non-secret key keeps it (K-7).
+		cases = (
+			("password=sk-ant-FAKE&page=2", f"password={MASK}&page=2"),
+			("password=sk-ant-FAKE, tiếp", f"password={MASK}, tiếp"),
+			("password=sk-ant-FAKE;", f"password={MASK};"),
+			("{password=sk-ant-FAKE}", f"{{password={MASK}}}"),
+			("note=sk-ant-FAKE&tailFAKE", f"note={MASK}&tailFAKE"),
+			("api_key=sk-ant-FAKE&pwd=fake-z", f"api_key={MASK}&pwd={MASK}"),
+		)
+		for text, expected in cases:
+			with self.subTest(text=text):
+				self.assertEqual(redact.redact_secrets(text), expected)
+
+	def test_secret_key_inside_secret_value_masked_with_it(self):
+		# K-4b: the masked span of a secret bare value only grows; a key candidate with a secret name
+		# that runs past its end, and that key's value, are masked with it in one MASK.
+		cases = (
+			("password=sk-ant-FAKE|api_key: hunter2", f"password={MASK}"),
+			("password=sk-ant-FAKE.pwd = hunter2", f"password={MASK}"),
+			("password=sk-ant-FAKE&tailFAKE|api_key: hunter2", f"password={MASK}"),
+			("password=sk-ant-FAKE|my api key: hunter2", f"password={MASK}"),
+			("password=abc|api_key: hunter2", f"password={MASK}"),
+			("password=api_key: hunter2", f"password={MASK}"),
+			("password=abc|api_key:,hunter2", f"password={MASK}"),
+			('password=abc|api_key:"hunter2" x', f"password={MASK} x"),
+			("pwd=a|x pwd=b|y", f"pwd={MASK}"),
+		)
+		for text, expected in cases:
+			with self.subTest(text=text):
+				result = redact.redact_secrets(text)
+				self.assertEqual(result, expected)
+				self.assertNotIn("hunter2", result)
+
+	def test_mask_inside_secret_value_masked_once(self):
+		# K-4b, K-7: the span takes in every MASK that starts before its end, never `[đã che] che]`.
+		cases = (
+			("password=sk-ant-A&sk-ant-B", f"password={MASK}"),
+			("password=sk-ant-FAKE&tailFAKE.sk-ant-B", f"password={MASK}"),
+			("password=x&sk-ant-FAKE", f"password={MASK}"),
+			("password=a|api_key: sk-ant-B&tailFAKE x", f"password={MASK} x"),
+		)
+		for text, expected in cases:
+			with self.subTest(text=text):
+				result = redact.redact_secrets(text)
+				self.assertEqual(result, expected)
+				self.assertEqual(result.count(MASK), 1)
+				self.assertNotIn("che] che]", result)
+
+	def test_secret_key_without_value_inside_value_keeps_rest(self):
+		# Like `api_key= , pwd=x`: K-4 gives the inner secret key no value, so the span ends at the key.
+		self.assertEqual(redact.redact_secrets("password=abc|api_key: ,hunter2"), f"password={MASK},hunter2")
+
+	def test_value_reads_stay_linear(self):
+		# K-8, deterministic: the characters `_KEY_VALUE` and `_BARE_VALUE_TAIL` read stay within the text.
+		for unit, head, tail in _K8_GENERATORS:
+			with self.subTest(unit=unit, head=head):
+				text = _k8_text(unit, head, tail, 60 * 1024)
+				counter = [0]
+				with (
+					mock.patch.object(redact, "_KEY_VALUE", _CountingPattern(redact._KEY_VALUE, counter)),
+					mock.patch.object(
+						redact, "_BARE_VALUE_TAIL", _CountingPattern(redact._BARE_VALUE_TAIL, counter)
+					),
+				):
+					redact.redact_secrets(text)
+				self.assertLessEqual(counter[0], len(text))
+
+	def test_value_scan_time_at_240_kb(self):
+		# K-8: generous bound like test_long_run_without_secret_untouched; linear takes under 0.2 s here.
+		for unit, head, tail in _K8_GENERATORS:
+			with self.subTest(unit=unit, head=head):
+				text = _k8_text(unit, head, tail, 240 * 1024)
+				started = time.monotonic()
+				result = redact.redact_secrets(text)
+				self.assertLess(time.monotonic() - started, 2)
+				self.assertNotIn("hunter2", result)
+				self.assertNotIn("che] che]", result)
+
+	def test_no_planted_secret_survives(self):
+		# NFR-6, systematic enumeration (design-w1-fixes-16.md section 4b, smaller sets).
+		full = [_planted_items(i) for i in range(3)]
+		small = [
+			_planted_items(i, keys=(("api_key", True), ("user", False)), key_separators=("=", ": "))
+			for i in range(3)
+		]
+		count = 0
+		leaks = []
+		for item_lists in (full[:1], full[:2], small):
+			for combo in itertools.product(*item_lists):
+				for separators in itertools.product(_PLANT_SEPARATORS, repeat=len(combo) - 1):
+					text = combo[0][0] + "".join(
+						separator + item[0] for separator, item in zip(separators, combo[1:], strict=True)
+					)
+					count += 1
+					result = redact.redact_secrets(text)
+					if any(token in result for token in _must_mask(text, combo)):
+						leaks.append((text, result))
+		self.assertEqual(count, 297_640)
+		self.assertEqual(leaks[:3], [])
+
+	def test_non_secret_key_inside_value_stays_value(self):
+		# K-4b: a key candidate with a non-secret name inside a secret value stays part of the value.
+		cases = (
+			("password=sk-ant-FAKE|user:bob", f"password={MASK}"),
+			("password=ab|user:bob", f"password={MASK}"),
+			('password=sk-ant-FAKE|"api_key": "hunter2"', f'password={MASK}"api_key": "{MASK}"'),
+		)
+		for text, expected in cases:
+			with self.subTest(text=text):
+				result = redact.redact_secrets(text)
+				self.assertEqual(result, expected)
+				self.assertNotIn("hunter2", result)
+
+	def test_secret_value_cut_stays_linear(self):
+		# K-8 with K-4b: same generous 10-second bound as test_long_run_without_secret_untouched.
+		cases = (
+			("password=" + "|user:" * 30_000, f"password={MASK}"),
+			("pwd=a|x " * 25_000, f"pwd={MASK}"),
+			("password=" + "a." * 50_000 + "api_key: z", f"password={MASK}"),
+		)
+		for text, prefix in cases:
+			with self.subTest(length=len(text), prefix=prefix):
+				started = time.monotonic()
+				result = redact.redact_secrets(text)
+				self.assertLess(time.monotonic() - started, 10)
+				self.assertTrue(result.startswith(prefix))
+				self.assertNotIn("a|x", result)
+				self.assertNotIn("api_key: z", result)
 
 	def test_secret_patterns_are_the_five_value_patterns(self):
 		samples = (

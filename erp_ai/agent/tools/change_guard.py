@@ -40,7 +40,9 @@ OP_FIELDS = "mục {action} thiếu hoặc thừa trường"
 SITE_COMMANDS = ("migrate", "clear-cache", "clear-website-cache", "list-apps")
 BUILD_COMMAND = "build"
 VERSION_COMMAND = "version"
-BENCH_COMMANDS = (*SITE_COMMANDS, BUILD_COMMAND, VERSION_COMMAND)
+# CHG-002 design 3.2 (ADR-040 QĐ 6): the plain form only, shape `["restart"]`.
+RESTART_COMMAND = "restart"
+BENCH_COMMANDS = (*SITE_COMMANDS, BUILD_COMMAND, VERSION_COMMAND, RESTART_COMMAND)
 SITE_FLAG = "--site"
 APP_FLAG = "--app"
 FORCE_FLAG = "--force"
@@ -278,8 +280,8 @@ def _bench_shape(command, app, allowed_apps: tuple[str, ...], site) -> list[str]
 		return _build_app_reason(app, allowed_apps) or [BUILD_COMMAND, APP_FLAG, app]
 	if app is not None:
 		return CMD_TAKES_NO_APP
-	if command == VERSION_COMMAND:
-		return [VERSION_COMMAND]
+	if command in (VERSION_COMMAND, RESTART_COMMAND):
+		return [command]
 	if not _is_site(site):
 		return CMD_OTHER_SITE
 	return [SITE_FLAG, site, command]

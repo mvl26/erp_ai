@@ -1430,7 +1430,7 @@ STATUS_SCRIPT_ONCE_BLOCK = "if (state.socket !== socket) {"
 STATUS_SCRIPT_SOCKET_EVENTS = ("docinfo_update", "doc_update", "connect", "disconnect")
 STATUS_SCRIPT_QUERY_CALLS = re.compile(r"\b(querySelector(?:All)?|getElementById|getElementsBy\w+)\(")
 STATUS_SCRIPT_ALLOWED_QUERIES = {"querySelector": "#app", "getElementById": "app"}
-# ADR-010 Amendment 1 (read writes nothing, one comment call) and Decision 8 (no agent gates in the panel).
+# ADR-010 Amendment 1 (read writes nothing, one message call: `messages.add_message`, no Comment) and Decision 8 (no agent gates in the panel).
 PANEL_FORBIDDEN_NAMES = frozenset(
 	{
 		"ignore_permissions",
@@ -1446,11 +1446,12 @@ PANEL_FORBIDDEN_NAMES = frozenset(
 		"rollback",
 		"cache",
 		"publish_realtime",
+		"new_comment",
 	}
 )
 PANEL_FORBIDDEN_PREFIXES = ("delete",)
 PANEL_SEND_FUNCTION = "send_message"
-PANEL_COMMENT_CALL = "new_comment"
+PANEL_COMMENT_CALL = "add_message"
 PANEL_GATE_NAMES = (
 	"is_enabled",
 	"can_send_ticket",
@@ -1740,7 +1741,7 @@ def _comment_calls(root: ast.AST) -> list:
 
 def check_ticket_panel_forbidden_calls(sources: dict) -> list:
 	"""ADR-010 Amendment 1: no permission bypass, user switch, raw query, write, commit, cache or realtime in
-	the panel module; exactly one `.new_comment(` and it sits in `send_message`."""
+	the panel module; exactly one `.add_message(` and it sits in `send_message`."""
 	if PANEL_FILE not in sources:
 		return [f"{PANEL_FILE} is missing"]
 	tree = parse(PANEL_FILE, sources[PANEL_FILE])
@@ -5323,7 +5324,7 @@ class TestArchitecture(unittest.TestCase):
 		self.assertEqual(check_ticket_panel_whitelist(self.sources), [])
 
 	def test_ticket_panel_forbidden_calls(self):
-		self.assertIn(".new_comment(", self.sources[PANEL_FILE])
+		self.assertIn(".add_message(", self.sources[PANEL_FILE])
 		self.assertEqual(check_ticket_panel_forbidden_calls(self.sources), [])
 
 	def test_ticket_panel_does_not_evaluate_agent_gates(self):
@@ -7589,10 +7590,11 @@ class TestScannersCatchViolations(unittest.TestCase):
 	PANEL_SOURCES: ClassVar[dict] = {
 		"ticket_panel.py": (
 			"import frappe\n"
+			"from erp_ai.agent import messages\n"
 			"@frappe.whitelist(methods=['POST'])\n"
 			"def get_panel_data(ticket):\n\treturn 1\n"
 			"@frappe.whitelist(methods=['POST'])\n"
-			"def send_message(ticket, text):\n\treturn frappe.get_doc('HD Ticket', ticket).new_comment(text)\n"
+			"def send_message(ticket, text):\n\treturn messages.add_message(ticket, text, 'chat')\n"
 		)
 	}
 
@@ -7817,6 +7819,7 @@ class TestScannersCatchViolations(unittest.TestCase):
 			"frappe.db.rollback()",
 			"frappe.cache.get('k')",
 			"frappe.publish_realtime('e')",
+			"frappe.get_doc('HD Ticket', 1).new_comment('a')",
 		):
 			with self.subTest(snippet=snippet):
 				source = self.PANEL_SOURCES["ticket_panel.py"] + f"def extra():\n\t{snippet}\n"
@@ -7825,15 +7828,17 @@ class TestScannersCatchViolations(unittest.TestCase):
 				)
 		source = self.PANEL_SOURCES["ticket_panel.py"]
 		self.assertCaught(
-			check_ticket_panel_forbidden_calls({PANEL_FILE: source + "def x(d):\n\td.new_comment('a')\n"}),
+			check_ticket_panel_forbidden_calls(
+				{PANEL_FILE: source + "def x(d):\n\tmessages.add_message(d, 'a', 'chat')\n"}
+			),
 			"found 2",
 		)
 		self.assertCaught(
-			check_ticket_panel_forbidden_calls({PANEL_FILE: source.replace("new_comment", "other")}),
+			check_ticket_panel_forbidden_calls({PANEL_FILE: source.replace("add_message", "other")}),
 			"found 0",
 		)
-		moved = source.replace("return frappe.get_doc('HD Ticket', ticket).new_comment(text)", "return 1")
-		moved += "def helper(d):\n\td.new_comment('a')\n"
+		moved = source.replace("return messages.add_message(ticket, text, 'chat')", "return 1")
+		moved += "def helper(d):\n\tmessages.add_message(d, 'a', 'chat')\n"
 		self.assertCaught(
 			check_ticket_panel_forbidden_calls({PANEL_FILE: moved}), "must be inside send_message"
 		)

@@ -18,6 +18,10 @@ from erp_ai.constants import (
 	CLASSIFICATION_FIELDS,
 	LOG_DOCTYPE,
 	LOGGER_NAME,
+	MESSAGE_DOCTYPE,
+	MESSAGE_KIND_CHAT,
+	MESSAGE_KIND_PROPOSAL,
+	MESSAGE_KIND_ROUTING,
 	PANEL_METHODS,
 	ROLE_INSTRUCTOR,
 	TITLE_RUN_FAILED,
@@ -50,7 +54,8 @@ INACTIVE_EMAIL = "panel.inactive@example.com"
 WEBSITE_EMAIL = "panel.website@example.com"
 CUSTOMER_EMAIL = "panel.customer@example.com"
 KEYWORD = "@ai"
-THREAD_KEYS = {"name", "author", "is_bot", "created_at", "text"}
+RUN_ROUTE = "erp_ai.agent.runner.run_for_ticket"
+THREAD_KEYS = {"name", "author", "is_bot", "kind", "created_at", "text"}
 
 
 def _make_user(email, user_type="Website User"):
@@ -83,6 +88,19 @@ def _add_comment(ticket, content, owner="Administrator", creation=None, comment_
 	if creation:
 		values["creation"] = creation
 	frappe.db.set_value("Comment", doc.name, values, update_modified=False)
+	return doc.name
+
+
+def _add_message(ticket, content, owner="Administrator", creation=None, kind=MESSAGE_KIND_CHAT):
+	"""An ERP AI Message as the DB would hold it; owner and creation are set directly."""
+	with patch.object(frappe, "enqueue"):
+		doc = frappe.get_doc(
+			{"doctype": MESSAGE_DOCTYPE, "ticket": ticket, "kind": kind, "content": "placeholder"}
+		).insert(ignore_permissions=True)
+	values = {"content": content, "owner": owner}
+	if creation:
+		values["creation"] = creation
+	frappe.db.set_value(MESSAGE_DOCTYPE, doc.name, values, update_modified=False)
 	return doc.name
 
 
@@ -270,85 +288,47 @@ class TestTicketPanelThread(FrappeTestCase):
 		frappe.set_user(AGENT_EMAIL)
 		return ticket_panel.get_panel_data(self.ticket)["messages"]
 
-	def test_thread_selects_b5_comments_in_creation_order(self):
-		# AC-8 data: 3 human keyword (1 other case), 2 human plain, 2 agent, 1 keyword on ANOTHER ticket.
+	def test_thread_reads_messages_in_creation_order(self):
 		# Inserted out of order on purpose: the result must follow `creation`, not insertion.
-		other_ticket = make_ticket(subject="Another ticket").name
-		late = _add_comment(self.ticket, f"{KEYWORD} late human", creation="2026-11-12 10:05:00")
-		_add_comment(self.ticket, "plain human chat", creation="2026-11-12 10:01:00")
-		bot_plain = _add_comment(self.ticket, "bot says hi", AGENT_USER, "2026-11-12 10:03:00")
-		early = _add_comment(self.ticket, f"early {KEYWORD.upper()} human", creation="2026-11-12 10:02:00")
-		_add_comment(self.ticket, "another plain human", creation="2026-11-12 10:04:00")
-		bot_kw = _add_comment(self.ticket, f"bot {KEYWORD}", AGENT_USER, "2026-11-12 10:06:00")
-		last = _add_comment(self.ticket, f"last {KEYWORD} human", creation="2026-11-12 10:07:00")
-		_add_comment(other_ticket, f"{KEYWORD} on another ticket", creation="2026-11-12 10:04:30")
+		late = _add_message(self.ticket, "late human", creation="2026-11-12 10:05:00")
+		first = _add_message(self.ticket, "first human", creation="2026-11-12 10:01:00")
+		bot = _add_message(
+			self.ticket, "bot says hi", AGENT_USER, "2026-11-12 10:03:00", MESSAGE_KIND_ROUTING
+		)
 
 		messages = self._messages()
 
-		self.assertEqual([m["name"] for m in messages], [early, bot_plain, late, bot_kw, last])
+		self.assertEqual([m["name"] for m in messages], [first, bot, late])
 		for message in messages:
 			self.assertEqual(set(message), THREAD_KEYS)
 			self.assertNotIn("@", message["author"])
-		self.assertEqual(messages[0]["text"], f"early {KEYWORD.upper()} human")
-		self.assertEqual(messages[0]["created_at"], frappe.utils.format_datetime("2026-11-12 10:02:00"))
-		self.assertRegex(messages[0]["created_at"], r"^\d{2}-\d{2}-\d{4} 10:02:00$")
+		self.assertEqual(messages[0]["text"], "first human")
+		self.assertEqual(messages[0]["created_at"], frappe.utils.format_datetime("2026-11-12 10:01:00"))
+		self.assertRegex(messages[0]["created_at"], r"^\d{2}-\d{2}-\d{4} 10:01:00$")
 		self.assertEqual(messages[0]["author"], frappe.utils.get_fullname("Administrator"))
 
-	def test_thread_is_empty_when_keyword_is_empty(self):
-		# Without a keyword nobody can speak to the bot in a comment: no conversation to show.
-		set_agent_settings(trigger_keyword="")
-		_add_comment(self.ticket, f"{KEYWORD} human", creation="2026-11-12 10:00:00")
-		_add_comment(self.ticket, "bot reply", AGENT_USER, "2026-11-12 10:01:00")
-		self.assertEqual(self._messages(), [])
-
-	def test_thread_ignores_non_comment_types(self):
-		for comment_type in ("Info", "Assignment Completed", "Like", "Label"):
-			_add_comment(self.ticket, f"{KEYWORD} {comment_type}", comment_type=comment_type)
-		_add_comment(self.ticket, "bot info", AGENT_USER, comment_type="Info")
-		kept = _add_comment(self.ticket, f"{KEYWORD} real comment")
+	def test_thread_ignores_other_tickets_and_plain_comments(self):
+		other_ticket = make_ticket(subject="Another ticket").name
+		_add_comment(self.ticket, "plain human comment")
+		_add_comment(self.ticket, f"{KEYWORD} comment without a message")
+		_add_comment(self.ticket, "bot comment", AGENT_USER)
+		_add_message(other_ticket, "on another ticket")
+		kept = _add_message(self.ticket, "mine")
 		self.assertEqual([m["name"] for m in self._messages()], [kept])
 
 	def test_thread_marks_bot_messages(self):
-		_add_comment(self.ticket, f"{KEYWORD} human", creation="2026-11-12 10:00:00")
-		_add_comment(self.ticket, "bot answer", AGENT_USER, "2026-11-12 10:01:00")
+		_add_message(self.ticket, "human", creation="2026-11-12 10:00:00")
+		_add_message(self.ticket, "bot answer", AGENT_USER, "2026-11-12 10:01:00", MESSAGE_KIND_PROPOSAL)
 		messages = self._messages()
 		self.assertEqual([m["is_bot"] for m in messages], [False, True])
 		self.assertEqual(messages[1]["author"], frappe.utils.get_fullname(AGENT_USER))
 
-	def test_thread_leaves_out_what_the_bot_wrote_before_anyone_spoke(self):
-		# What the bot wrote at ticket creation is ticket information, not conversation.
-		_add_comment(self.ticket, "<p>Bot đã phân loại phiếu.</p>", AGENT_USER, "2026-11-12 10:00:00")
-		_add_comment(self.ticket, "bot notice", AGENT_USER, "2026-11-12 10:01:00")
-		_add_comment(self.ticket, "plain human chat", creation="2026-11-12 10:02:00")
-		self.assertEqual(self._messages(), [])
-
-	def test_thread_starts_at_the_first_message_to_the_bot(self):
-		_add_comment(self.ticket, "bot guidance at creation", AGENT_USER, "2026-11-12 10:00:00")
-		asked = _add_comment(self.ticket, f"{KEYWORD} how to reset?", creation="2026-11-12 10:02:00")
-		reply = _add_comment(self.ticket, "bot answer", AGENT_USER, "2026-11-12 10:03:00")
-		messages = self._messages()
-		self.assertEqual([m["name"] for m in messages], [asked, reply])
-		self.assertEqual([m["is_bot"] for m in messages], [False, True])
-
-	def test_read_strips_xss_payloads_to_text(self):
-		payload = (
-			f'<script>alert(1)</script><img src=x onerror="alert(2)">'
-			f'<a href="javascript:alert(3)">link</a> <b>{KEYWORD}</b> bold'
-		)
-		_add_comment(self.ticket, payload)
-		_add_comment(self.ticket, f"<p>one</p><p>two</p>{payload}", AGENT_USER)
-		xss, bot = self._messages()
-		# Markup that can run (img/a handlers, javascript: urls) is gone; whatever text is left (an escaped
-		# <script> literal) is inert because the page renders it with textContent only.
-		for message in (xss, bot):
-			with self.subTest(is_bot=message["is_bot"]):
-				for tag in ("<img", "<a ", "</a", "<b>"):
-					self.assertNotIn(tag, message["text"])
-				self.assertNotIn("onerror", message["text"])
-				self.assertNotIn("javascript:", message["text"])
-				self.assertIn("link", message["text"])
-				self.assertEqual(message["text"].split()[-3:], ["link", KEYWORD, "bold"])
-		self.assertEqual(bot["text"].split()[:2], ["one", "two"])
+	def test_thread_returns_markup_as_literal_text(self):
+		payload = '<img src=x onerror="alert(1)"> <script>alert(2)</script>'
+		_add_message(self.ticket, payload)
+		_add_message(self.ticket, payload, AGENT_USER, kind=MESSAGE_KIND_ROUTING)
+		for message in self._messages():
+			self.assertEqual(message["text"], payload)
 
 
 class TestTicketPanelReadOnly(FrappeTestCase):
@@ -372,6 +352,7 @@ class TestTicketPanelReadOnly(FrappeTestCase):
 	def _counts(self):
 		return {
 			"comments": frappe.db.count("Comment"),
+			"messages": frappe.db.count(MESSAGE_DOCTYPE),
 			"logs": frappe.db.count("ERP AI Log"),
 			"todos": frappe.db.count("ToDo"),
 			"tasks": frappe.db.count("Task"),
@@ -379,8 +360,8 @@ class TestTicketPanelReadOnly(FrappeTestCase):
 		}
 
 	def test_read_writes_nothing_and_calls_no_gateway(self):
-		_add_comment(self.ticket, f"{KEYWORD} human")
-		_add_comment(self.ticket, "bot reply", AGENT_USER)
+		_add_message(self.ticket, "human")
+		_add_message(self.ticket, "bot reply", AGENT_USER)
 		gateway = FakeGateway()
 		frappe.set_user(AGENT_EMAIL)
 		self.assertNotEqual(frappe.session.user, "Administrator")
@@ -401,7 +382,7 @@ class TestTicketPanelReadOnly(FrappeTestCase):
 			thinking_text="zq-unique-thinking",
 		)
 		frappe.db.set_value("HD Ticket", self.ticket, "ai_confidence", "Cao")
-		_add_comment(self.ticket, "bot reply", AGENT_USER)
+		_add_message(self.ticket, "bot reply", AGENT_USER)
 		frappe.set_user(AGENT_EMAIL)
 		result = json.dumps(ticket_panel.get_panel_data(self.ticket), ensure_ascii=False)
 		for secret in ("zq-unique-keyword", "zq-unique-recipient", "zq-unique-thinking"):
@@ -410,8 +391,8 @@ class TestTicketPanelReadOnly(FrappeTestCase):
 		self.assertEqual(set(json.loads(result)), {"ticket", "ai_fields", "messages"})
 
 	def test_read_logs_ids_only_at_debug(self):
-		_add_comment(self.ticket, f"{KEYWORD} secret body text")
-		_add_comment(self.ticket, "bot secret reply", AGENT_USER)
+		_add_message(self.ticket, f"{KEYWORD} secret body text")
+		_add_message(self.ticket, "bot secret reply", AGENT_USER)
 		_add_comment(self.ticket, "plain human note without the trigger")
 		logger, get_logger = self._logger()
 		frappe.set_user(AGENT_EMAIL)
@@ -453,7 +434,7 @@ class TestTicketPanelReadOnly(FrappeTestCase):
 
 
 class TestTicketPanelSend(FrappeTestCase):
-	"""AC-9, AC-13 (send): input checks, content building, one Comment owned by the sender."""
+	"""AC-9, AC-13 (send): input checks, one chat message owned by the sender, no Comment, no keyword."""
 
 	KEYWORD = "!hoibot"
 
@@ -464,7 +445,7 @@ class TestTicketPanelSend(FrappeTestCase):
 		create_agent(AGENT_EMAIL)
 		set_agent_settings(trigger_keyword=self.KEYWORD)
 		self.ticket = make_ticket(subject="Panel send ticket").name
-		# The Comment handler (FEAT-001) is not under test here: keep it from queueing a job.
+		# The message handler (FEAT-007) is not under test here: keep it from queueing a job.
 		enqueue = patch.object(frappe, "enqueue")
 		enqueue.start()
 		self.addCleanup(enqueue.stop)
@@ -474,7 +455,10 @@ class TestTicketPanelSend(FrappeTestCase):
 		return ticket_panel.send_message(ticket or self.ticket, text)
 
 	def _content(self, result):
-		return frappe.db.get_value("Comment", result["comment"], "content")
+		return frappe.db.get_value(MESSAGE_DOCTYPE, result["message"], "content")
+
+	def _message_count(self):
+		return frappe.db.count(MESSAGE_DOCTYPE, {"ticket": self.ticket})
 
 	def _comment_count(self):
 		return frappe.db.count("Comment", {"reference_doctype": "HD Ticket", "reference_name": self.ticket})
@@ -487,59 +471,15 @@ class TestTicketPanelSend(FrappeTestCase):
 		for text in (None, 5):
 			with self.subTest(text=text), self.assertRaises(frappe.FrappeTypeError):
 				self._send(text)
-		self.assertEqual(self._comment_count(), 0)
+		self.assertEqual(self._message_count(), 0)
 
 	def test_send_length_boundary(self):
-		self.assertIn("comment", self._send("a" * 2000))
+		self.assertIn("message", self._send("a" * 2000))
 		# The limit counts the text after strip().
-		self.assertIn("comment", self._send("  " + "a" * 2000 + "  "))
+		self.assertIn("message", self._send("  " + "a" * 2000 + "  "))
 		with self.assertRaises(frappe.ValidationError):
 			self._send("a" * 2001)
-		self.assertEqual(self._comment_count(), 2)
-
-	def test_send_appends_configured_keyword_when_missing(self):
-		self.assertEqual(self._content(self._send("Hello there")), f"<p>Hello there {self.KEYWORD}</p>")
-
-	def test_send_keeps_text_when_keyword_present_other_case(self):
-		self.assertEqual(
-			self._content(self._send(f"Hi {self.KEYWORD.upper()} please")),
-			f"<p>Hi {self.KEYWORD.upper()} please</p>",
-		)
-
-	def test_send_escapes_html(self):
-		# <b> is an allowed tag: only our own escaping keeps it from being stored as markup.
-		result = self._send("<b>x</b> & y")
-		self.assertEqual(self._content(result), f"<p>&lt;b&gt;x&lt;/b&gt; &amp; y {self.KEYWORD}</p>")
-		frappe.set_user(AGENT_EMAIL)
-		texts = [m["text"] for m in ticket_panel.get_panel_data(self.ticket)["messages"]]
-		self.assertEqual(texts, [f"<b>x</b> & y {self.KEYWORD}"])
-
-	def test_send_multiline_keeps_line_breaks(self):
-		content = self._content(self._send("one\ntwo\r\nthree"))
-		self.assertEqual(content, f"<p>one<br>two<br>three {self.KEYWORD}</p>")
-
-	def test_send_creates_one_comment_owned_by_sender(self):
-		result = self._send("Question")
-		self.assertEqual(list(result), ["comment"])
-		self.assertEqual(self._comment_count(), 1)
-		values = frappe.db.get_value(
-			"Comment", result["comment"], ["owner", "comment_type", "comment_email"], as_dict=True
-		)
-		self.assertEqual(values.owner, AGENT_EMAIL)
-		self.assertNotEqual(values.owner, AGENT_USER)
-		self.assertEqual(values.comment_type, "Comment")
-		self.assertEqual(values.comment_email, AGENT_EMAIL)
-
-	def test_send_with_empty_keyword_creates_comment_without_keyword(self):
-		set_agent_settings(trigger_keyword="")
-		self.assertEqual(self._content(self._send("No keyword")), "<p>No keyword</p>")
-		self.assertEqual(self._comment_count(), 1)
-
-	def test_send_calls_new_comment_once_with_built_content(self):
-		with patch("helpdesk.helpdesk.doctype.hd_ticket.hd_ticket.HDTicket.new_comment") as new_comment:
-			new_comment.return_value = "COMMENT-1"
-			self.assertEqual(self._send("Hi"), {"comment": "COMMENT-1"})
-		new_comment.assert_called_once_with(f"<p>Hi {self.KEYWORD}</p>")
+		self.assertEqual(self._message_count(), 2)
 
 	def test_send_denied_for_same_accounts_creates_nothing(self):
 		_make_user(WEBSITE_EMAIL)
@@ -564,15 +504,15 @@ class TestTicketPanelSend(FrappeTestCase):
 				self._send("Hi", user=user)
 		with self.assertRaises(frappe.PermissionError):
 			self._send("Hi", ticket="999999999")
-		self.assertEqual(self._comment_count(), 0)
-		self.assertEqual(frappe.db.count("Comment", {"reference_name": own}), 0)
+		self.assertEqual(self._message_count(), 0)
+		self.assertEqual(frappe.db.count(MESSAGE_DOCTYPE, {"ticket": own}), 0)
 
 	def test_send_denied_for_agent_user(self):
 		frappe.set_user("Administrator")
 		create_agent(AGENT_USER)
 		with self.assertRaises(frappe.PermissionError):
 			self._send("Hi", user=AGENT_USER)
-		self.assertEqual(self._comment_count(), 0)
+		self.assertEqual(self._message_count(), 0)
 
 	def _logger(self):
 		logger = MagicMock()
@@ -581,69 +521,62 @@ class TestTicketPanelSend(FrappeTestCase):
 		self.addCleanup(patcher.stop)
 		return logger
 
-	def test_send_stored_content_passes_contains_keyword(self):
-		for text in ("Hello", "<b>x</b> & y", f"Hi {self.KEYWORD.upper()} there", "one\ntwo"):
-			with self.subTest(text=text):
-				stored = self._content(self._send(text))
-				self.assertTrue(contains_keyword(stored), stored)
+	def test_send_creates_one_chat_message_owned_by_sender(self):
+		text = "  Question & more\nsecond line  "
+		before = frappe.db.count("Comment")
+		result = self._send(text)
+		self.assertEqual(list(result), ["message"])
+		self.assertEqual(self._message_count(), 1)
+		values = frappe.db.get_value(
+			MESSAGE_DOCTYPE, result["message"], ["owner", "kind", "content", "ticket"], as_dict=True
+		)
+		self.assertEqual(values.owner, AGENT_EMAIL)
+		self.assertNotEqual(values.owner, AGENT_USER)
+		self.assertEqual(values.kind, MESSAGE_KIND_CHAT)
+		self.assertEqual(values.content, text.strip())
+		self.assertEqual(values.ticket, self.ticket)
+		self.assertEqual(frappe.db.count("Comment"), before)
 
-	def test_send_checks_keyword_on_sanitized_form(self):
-		# The check must run on what sanitize_html(always_sanitize=True) returns, not on our own escaping.
-		with (
-			patch.object(ticket_panel, "sanitize_html", return_value="<p>stripped</p>") as sanitize,
-			patch("helpdesk.helpdesk.doctype.hd_ticket.hd_ticket.HDTicket.new_comment") as new_comment,
-		):
-			with self.assertRaises(frappe.ValidationError):
-				self._send("Hello")
-		sanitize.assert_called_once_with(f"<p>Hello {self.KEYWORD}</p>", always_sanitize=True)
-		new_comment.assert_not_called()
-
-	def test_send_keyword_with_special_chars_rejected(self):
-		for keyword in ("a&b", "a<b"):
+	def test_send_does_not_add_keyword(self):
+		for keyword in (self.KEYWORD, ""):
 			with self.subTest(keyword=keyword):
 				set_agent_settings(trigger_keyword=keyword)
-				with (
-					patch(
-						"helpdesk.helpdesk.doctype.hd_ticket.hd_ticket.HDTicket.new_comment"
-					) as new_comment,
-					self.assertRaises(frappe.ValidationError) as caught,
-				):
-					self._send("Hello")
-				new_comment.assert_not_called()
-				self.assertNotIn(keyword, str(caught.exception))
-				self.assertNotIn(keyword.casefold(), str(caught.exception).casefold())
-				self.assertEqual(self._comment_count(), 0)
+				content = self._content(self._send("Hello there"))
+				self.assertEqual(content, "Hello there")
+
+	def test_send_enqueues_one_run(self):
+		set_agent_settings(enabled=1)
+		with patch.object(frappe, "enqueue") as enqueue:
+			result = self._send("Please look")
+		jobs = [c.kwargs for c in enqueue.call_args_list if c.args and c.args[0] == RUN_ROUTE]
+		self.assertEqual(len(jobs), 1)
+		self.assertEqual(jobs[0]["message_name"], result["message"])
+		self.assertEqual(jobs[0]["ticket_name"], self.ticket)
 
 	def test_send_logs_without_content_or_email(self):
 		logger = self._logger()
-		added = self._send("Secret body")["comment"]
-		kept = self._send(f"Other {self.KEYWORD}")["comment"]
-		set_agent_settings(trigger_keyword="a&b")
-		with self.assertRaises(frappe.ValidationError):
-			self._send("Secret body")
-		set_agent_settings(trigger_keyword=self.KEYWORD)
+		first = self._send("Secret body")["message"]
+		second = self._send("Other body")["message"]
 		with self.assertRaises(frappe.PermissionError):
 			self._send("Secret body", user="Guest")
 		frappe.set_user("Administrator")
 		create_agent(AGENT_USER)
 		with self.assertRaises(frappe.PermissionError):
 			self._send("Secret body", user=AGENT_USER)
-		# The FEAT-001 handler logs through the same logger name: keep only the panel's lines.
 		lines = [
 			call.args[0] for call in logger.info.call_args_list if call.args[0].startswith("erp_ai panel")
 		]
 		self.assertEqual(
 			lines,
 			[
-				f"erp_ai panel send ticket={self.ticket} comment={added} keyword_added=true",
-				f"erp_ai panel send ticket={self.ticket} comment={kept} keyword_added=false",
-				f"erp_ai panel send rejected ticket={self.ticket} reason=keyword_not_storable",
+				f"erp_ai panel send ticket={self.ticket} message={first}",
+				f"erp_ai panel send ticket={self.ticket} message={second}",
 				f"erp_ai panel denied method=send ticket={self.ticket} reason=not_agent",
 				f"erp_ai panel denied method=send ticket={self.ticket} reason=agent_user",
 			],
 		)
 		logged = str(logger.mock_calls)
-		for leak in ("Secret", "Other", "a&b", self.KEYWORD, AGENT_EMAIL, AGENT_USER):
+		for leak in ("Secret", "Other", self.KEYWORD, AGENT_EMAIL, AGENT_USER):
 			self.assertNotIn(leak, logged)
 
 
@@ -691,6 +624,8 @@ class TestTicketPanelGateParity(FrappeTestCase):
 		create_agent(AGENT_EMAIL)
 		create_agent(self.INSTRUCTOR_EMAIL)
 		frappe.get_doc("User", self.INSTRUCTOR_EMAIL).add_roles(ROLE_INSTRUCTOR)
+
+	panel_messages: ClassVar[dict] = {}
 
 	def _tool_turn(self):
 		block = {"type": "tool_use", "id": "toolu_1", "name": "get_ticket", "input": {}}
@@ -790,7 +725,10 @@ class TestTicketPanelGateParity(FrappeTestCase):
 		}
 
 	def _decision(self, ticket, user, act, results):
-		"""Run `act` as `user`, then every agent job it queued; return what the decision looks like, then undo it all."""
+		"""Run `act` as `user`, then every agent job it queued; return what the decision looks like, then undo it all.
+
+		A gated @ai comment leaves no message (nothing is copied) while the panel always keeps the one it
+		wrote, so stored messages are not part of the decision."""
 		frappe.db.savepoint(self.SAVEPOINT)
 		known = set(frappe.get_all(LOG_DOCTYPE, filters={"ticket": ticket}, pluck="name"))
 		self.enqueue.reset_mock()
@@ -803,7 +741,7 @@ class TestTicketPanelGateParity(FrappeTestCase):
 		logger.info.side_effect = lambda message, *args, **kwargs: decisions.append(str(message))
 		try:
 			with patch.object(frappe, "logger", return_value=logger):
-				content_of = act()
+				act()
 			jobs = [
 				call.kwargs
 				for call in self.enqueue.call_args_list
@@ -840,8 +778,10 @@ class TestTicketPanelGateParity(FrappeTestCase):
 				for call in self.gateway.calls
 			],
 			"log": [(e.entry_type, e.trigger, e.turn, e.stop_reason, e.instructor) for e in entries],
-			"decisions": [line for line in decisions if line.startswith("erp_ai handler ")],
-			"comment": frappe.db.get_value("Comment", content_of, ["owner", "comment_type", "content"]),
+			# The comment handler adds a "copied" line for its copy; the decision is every other handler line.
+			"decisions": [
+				line for line in decisions if line.startswith("erp_ai handler ") and " copied: " not in line
+			],
 			"levels": levels,
 		}
 		frappe.flags.pop(PENDING_JOB_IDS_FLAG, None)
@@ -875,13 +815,15 @@ class TestTicketPanelGateParity(FrappeTestCase):
 					)
 
 				def panel():
-					return ticket_panel.send_message(ticket, self.TEXT)["comment"]
+					sent = ticket_panel.send_message(ticket, self.TEXT)["message"]
+					self.panel_messages[name] = [sent]
 
 				self.month_spend.return_value = self.SPEND_BY_BRANCH.get(name, 0.0)
 				via_box = self._decision(ticket, user, comments_box, results)
 				via_panel = self._decision(ticket, user, panel, results)
 
 				self.assertEqual(via_panel, via_box)
+				self.assertEqual(len(self.panel_messages[name]), 1)
 				self.assertEqual(len(via_panel["jobs"]), want_jobs)
 				self.assertEqual(len(via_panel["gateway"]), want_calls)
 				if want_jobs:

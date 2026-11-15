@@ -732,3 +732,29 @@ class TestCreatedLabels(HandlerTestCase):
 		self.assertEqual(doc.get(CREATED_LABELS_FIELD), recorded)
 		set_value.assert_not_called()
 		save.assert_not_called()
+
+
+class TestTicketNameNotReused(HandlerTestCase):
+	"""Deleting the newest ticket must not hand its name, nor its kept ERP AI Log rows (D7), to the next ticket.
+
+	Frappe's `delete_doc` moves the `.####` counter back when the newest ticket is deleted (C0F R6b).
+	"""
+
+	def _delete_ticket(self, name):
+		frappe.delete_doc("HD Ticket", name, ignore_permissions=True)
+		self.assertFalse(frappe.db.exists("HD Ticket", name))
+
+	def test_next_ticket_after_deleting_the_newest_gets_a_new_name(self):
+		deleted = self._ticket_without_job().name
+		self._delete_ticket(deleted)
+		self.assertNotEqual(self._ticket_without_job().name, deleted)
+
+	def test_next_ticket_does_not_see_the_deleted_tickets_log_rows(self):
+		deleted = self._ticket_without_job().name
+		row = make_log_entry(ticket=deleted, entry_type="classify")
+		self._delete_ticket(deleted)
+		# D7: the audit row stays, under the deleted ticket's name.
+		self.assertEqual(frappe.db.get_value(LOG_DOCTYPE, row, "ticket"), deleted)
+
+		following = self._ticket_without_job().name
+		self.assertNotIn(row, frappe.get_all(LOG_DOCTYPE, filters={"ticket": following}, pluck="name"))

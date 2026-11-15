@@ -309,6 +309,74 @@ class TestPostResult(ResultCommentTestCase):
 			self.assertEqual(count(), before)
 
 
+class TestLegacyResult(ResultCommentTestCase):
+	"""CHG-002 addendum-3 RQ-3: a stored proposal of the old shape keeps the CHG-001 (`f5cfed2`) text."""
+
+	def test_legacy_text_byte_identical_per_status(self):
+		# Pinned from `result_lines` at f5cfed2, one row per final status and per shape it accepts.
+		cases = {
+			"applied code": (
+				CHANGE_KIND_CODE,
+				{"file_path": FILE_PATH},
+				f"kết quả đề xuất {{name}} (sửa {FILE_PATH}): Đã áp dụng; commit 0123456789ab",
+			),
+			"applied command": (
+				CHANGE_KIND_COMMAND,
+				{"command_args": json.dumps(ARGS), "apply_commit_sha": "", "exit_code": 3},
+				"kết quả đề xuất {name} (lệnh bench build --app custom_app): Đã áp dụng; mã thoát 3",
+			),
+			"failed command": (
+				CHANGE_KIND_COMMAND,
+				{
+					"command_args": json.dumps(ARGS),
+					"change_status": CHANGE_STATUS_FAILED,
+					"failure_reason": "lệnh trả mã 2",
+					"apply_commit_sha": "",
+					"exit_code": 2,
+				},
+				"kết quả đề xuất {name} (lệnh bench build --app custom_app): Lỗi; lý do: lệnh trả mã 2, mã thoát 2",
+			),
+			"failed while undoing": (
+				CHANGE_KIND_CODE,
+				{
+					"file_path": FILE_PATH,
+					"is_new_file": 1,
+					"change_status": CHANGE_STATUS_FAILED,
+					"failure_reason": REASON,
+					"undo_by": INSTRUCTOR,
+				},
+				f"kết quả đề xuất {{name}} (tạo {FILE_PATH}): Lỗi; khi hoàn tác, lý do: {REASON}",
+			),
+			"stale": (
+				CHANGE_KIND_CODE,
+				{
+					"file_path": FILE_PATH,
+					"change_status": CHANGE_STATUS_STALE,
+					"failure_reason": REASON,
+					"apply_commit_sha": "",
+				},
+				f"kết quả đề xuất {{name}} (sửa {FILE_PATH}): Hết hiệu lực; lý do: {REASON}",
+			),
+			"undone": (
+				CHANGE_KIND_CODE,
+				{
+					"file_path": FILE_PATH,
+					"change_status": CHANGE_STATUS_UNDONE,
+					"undo_commit_sha": UNDO_SHA,
+					"undo_by": INSTRUCTOR,
+				},
+				f"kết quả đề xuất {{name}} (sửa {FILE_PATH}): Đã hoàn tác; commit hoàn tác fedcba987654",
+			),
+		}
+		for label, (kind, fields, pinned) in cases.items():
+			with self.subTest(label):
+				name = self.proposal(kind, **fields)
+				self.assertFalse(frappe.get_doc(PROPOSAL_DOCTYPE, name).get("operations"))
+				self.assertFalse(frappe.db.get_value(PROPOSAL_DOCTYPE, name, "command_list"))
+				content = frappe.db.get_value("Comment", result_comment.post_result(name), "content")
+				self.assertEqual(content, frappe.utils.escape_html(pinned.format(name=name)))
+
+
 NOTICE_APP = "custom_app"
 NOTICE_BRANCH = "develop"
 NOTICE_REMOTE = "https://x-token-FAKE@host.example/custom_app.git"

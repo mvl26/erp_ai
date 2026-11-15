@@ -253,7 +253,7 @@ def _propose_block(changes: list, commands: list, reason: str, ctx: ToolContext)
 	)
 	if check.reason:
 		return _fail(check.reason)
-	git = check.targets[0].guard
+	guard = check.targets[0].guard
 	values = {
 		"change_kind": CHANGE_KIND_CODE,
 		"app": check.app,
@@ -261,12 +261,12 @@ def _propose_block(changes: list, commands: list, reason: str, ctx: ToolContext)
 		"operations": [_row(target) for target in check.targets],
 		"diff": diff_text,
 		"reason": reason,
-		"target_branch": git.git.branch,
-		"upstream_ref": git.git.upstream_ref,
-		"ahead_count": git.git.ahead_count,
-		"is_core_app": int(git.is_core_app),
+		"target_branch": guard.git.branch,
+		"upstream_ref": guard.git.upstream_ref,
+		"ahead_count": guard.git.ahead_count,
+		"is_core_app": int(guard.is_core_app),
 	}
-	return {**_insert(ctx, values), "branch": git.git.branch}
+	return {**_insert(ctx, values), "branch": guard.git.branch}
 
 
 def propose_file_change(args: dict, ctx: ToolContext) -> dict:

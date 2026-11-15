@@ -53,7 +53,6 @@ CORE_WARNING = (
 	"đột; bench update --reset xóa vĩnh viễn commit chưa đẩy. Đẩy commit lên fork là việc của người, làm "
 	"trước khi chạy bench update.</p>"
 )
-RESTART_NOTE = "<p>Sau khi áp dụng cần người chạy bench restart.</p>"
 REMOTE_URL = "https://x-token-FAKE@host/r.git"
 GIT_FIELDS = ("target_branch", "upstream_ref", "ahead_count", "is_core_app")
 REFUSAL = "Tài khoản agent không được ghi"
@@ -1054,7 +1053,8 @@ class TestProposeBlock(FrappeTestCase):
 			{"action": "edit", "path": f"{APP}/pkg/a.txt", "find": ["hai"], "replace": ["ba"]},
 			{"action": "create", "path": f"{APP}/pkg/new/b.md", "content": "# b\n"},
 		]
-		result = self.block(changes)
+		with patch.object(change_guard, "check_block", wraps=change_guard.check_block) as check_block:
+			result = self.block(changes)
 		self.assertEqual(set(result), {"ok", "proposal", "status", "comment", "branch"})
 		self.assertTrue(result["ok"])
 		self.assertEqual(self.proposals(), [result["proposal"]])
@@ -1092,6 +1092,10 @@ class TestProposeBlock(FrappeTestCase):
 			f"--- a/{APP}/pkg/new/b.md\n+++ b/{APP}/pkg/new/b.md\n@@ -0,0 +1 @@\n+# b\n"
 		)
 		self.assertEqual(doc.diff, expected_diff)
+		# design-addendum-1 A-1.5: the bytes counted by `check_block` are the bytes stored.
+		self.assertEqual(check_block.call_count, 1)
+		self.assertEqual(check_block.call_args.kwargs["diff_text"], doc.diff)
+		self.assertIs(check_block.call_args.kwargs["at_apply"], False)
 		self.assertEqual(
 			(doc.change_kind, doc.app, doc.reversible, doc.change_status),
 			(CHANGE_KIND_CODE, APP, 1, CHANGE_STATUS_PENDING),
@@ -1142,6 +1146,13 @@ class TestProposeBlock(FrappeTestCase):
 			"x.csv": "a,b\n",
 			"Makefile": "a:\n",
 			"x.yml": "a: 1\n",
+			"x.yaml": "a: 1\n",
+			"x.toml": "a = 1\n",
+			"x.po": 'msgid "a"\n',
+			"x.sql": "select 1;\n",
+			"x.scss": "a { b: c; }\n",
+			"x.ts": "let a: number;\n",
+			"x.xml": "<a/>\n",
 		}
 		for name, content in cases.items():
 			with self.subTest(name=name):

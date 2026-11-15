@@ -87,6 +87,8 @@ ACTION_VALUE_MAX_BYTES = 1024
 ACTION_CUT_MARKER = "[đã cắt]"
 ACTION_VALUE_KEYS = ("value_before", "value_after")
 # Tools that create a record without returning before/after: their entry carries the call arguments as `value_after`.
+# Key of the proposal status in a propose tool's entry values (the DocType field; this module never writes it).
+PROPOSAL_STATUS_KEY = "change_status"
 CREATING_TOOLS = ("post_comment", "create_task")
 PROPOSE_TOOLS = ("propose_file_change", "propose_new_file", "propose_bench_command")
 PROPOSE_STEP = "propose"
@@ -882,7 +884,7 @@ def _entry_values(name, outcome, arguments):
 			return before, after
 		return {HINT_FIELD: before}, {HINT_FIELD: after}
 	if name in PROPOSE_TOOLS:
-		return None, {"change_status": outcome.get("status")}
+		return None, {PROPOSAL_STATUS_KEY: outcome.get("status")}
 	if name in CREATING_TOOLS and isinstance(arguments, dict):
 		return None, arguments
 	return None, None

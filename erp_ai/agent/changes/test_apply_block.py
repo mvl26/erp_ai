@@ -650,19 +650,29 @@ class TestBlockAllOrNothing(BlockApplyTestCase):
 		)
 
 	def test_read_back_hash_mismatch_restores_all(self):
-		# Design 4.2 step 6: a read-back hash other than `after_hash` gives everything back like an error.
-		name = self.mixed_block()
-		before = self.tree()
+		# Design 4.2 step 6: a read-back hash other than `after_hash` gives everything back like an error,
+		# for an edit, a created file and a rename target alike. The bytes are written; only the hash is wrong.
+		real_write = apply_job.file_writer.write_atomic
 		self.record()
-		self.failing = _once(
-			lambda called, args, kwargs: "0" * 64
-			if called == "write_atomic" and args[0] == self.full(EXTRA_REL)
-			else None
-		)
+		for number, written, rel in (
+			(5, EXTRA_REL, EXTRA_REL),
+			(2, CREATED_REL, CREATED_REL),
+			(4, MOVED_REL, TEXT_RELS[2]),
+		):
+			with self.subTest(item=number):
+				self.reset_sandbox()
+				name = self.mixed_block()
+				before = self.tree()
+				full = self.full(written)
+				self.failing = _once(
+					lambda called, args, kwargs, full=full: real_write(*args, **kwargs) and "0" * 64
+					if called == "write_atomic" and args[0] == full
+					else None
+				)
 
-		self.run_apply(name)
+				self.run_apply(name)
 
-		self.assert_given_back(name, self.write_reason(5, EXTRA_REL), before)
+				self.assert_given_back(name, self.write_reason(number, rel), before)
 
 	def test_rename_into_new_dir_fails_after_add_restores_index_and_dirs(self):
 		# `git add` of the rename target fails after the created file was staged: unstaged, dirs gone.
@@ -751,6 +761,80 @@ class TestBlockAllOrNothing(BlockApplyTestCase):
 				self.assertEqual(self.tree()[1][TEXT_RELS[0]], item_1.encode())
 				self.assertEqual(calls[-1][0], "remove_empty_dirs")
 				self.assertEqual(self.git("rev-parse", "HEAD"), head)
+
+	def test_each_give_back_check_alone_reports_restore_failed(self):
+		# Design 4.2 step 6: each condition of "the give-back held" is caught on its own; the write of
+		# item 5 fails, so items 1 to 4 (with two staged files and four new folders) go back.
+		real_write = apply_job.file_writer.write_atomic
+		real_head = source.git_head
+		calls = self.record()
+		a, e, moved = self.full(TEXT_RELS[0]), self.full(EXTRA_REL), self.full(MOVED_REL)
+		head_moved = []
+
+		def git_head(app_dir):
+			return "f" * 40 if head_moved else real_head(app_dir)
+
+		def give_back_of_a(answer):
+			return _once(
+				lambda called, args, kwargs: answer(*args, **kwargs)
+				if called == "write_atomic" and args == (a, TEXT_BEFORE)
+				else None
+			)
+
+		def at_dirs(answer):
+			return lambda called, args, kwargs: answer(args[0]) if called == "remove_empty_dirs" else None
+
+		def flip_head(created):
+			head_moved.append(True)
+
+		cases = {
+			# case: (failing hook after item 5 fails, the tree is as before)
+			"a: read-back hash wrong after real bytes": (
+				give_back_of_a(lambda *args, **kwargs: real_write(*args, **kwargs) and "0" * 64),
+				True,
+			),
+			"b: base_hash returned, bytes not written": (
+				give_back_of_a(lambda *args, **kwargs: _sha(TEXT_BEFORE)),
+				False,
+			),
+			"c: created folders not removed": (at_dirs(lambda created: []), False),
+			"d: HEAD moved": (at_dirs(flip_head), True),
+			"e: created file not removed": (
+				lambda called, args, kwargs: True
+				if called == "remove_file" and args == (moved,)
+				else (list(args[0]) if called == "remove_empty_dirs" else None),
+				False,
+			),
+		}
+		with patch.object(source, "git_head", side_effect=git_head):
+			for case, (hook, same_tree) in cases.items():
+				with self.subTest(case=case):
+					self.reset_sandbox()
+					head_moved.clear()
+					name = self.mixed_block()
+					before = self.tree()
+					calls.clear()
+					fail_e = self.raises_on("write_atomic", e, TEXT_AFTER)
+					self.failing = lambda *call, hook=hook, fail_e=fail_e: fail_e(*call) or hook(*call)
+
+					self.run_apply(name)
+
+					head_moved.clear()
+					state = frappe.db.get_value(
+						PROPOSAL_DOCTYPE,
+						name,
+						["change_status", "failure_reason", "apply_commit_sha"],
+						as_dict=True,
+					)
+					self.assertEqual(
+						(state.change_status, state.failure_reason, state.apply_commit_sha),
+						(CHANGE_STATUS_FAILED, apply_job.GIT_RESTORE_FAILED, None),
+					)
+					self.assertEqual(calls[-1][0], "remove_empty_dirs")
+					now = self.tree()
+					self.assertEqual(now[2:5], before[2:5])
+					if same_tree:
+						self.assertEqual(now, before)
 
 	def test_whole_block_written_then_given_back_until_one_commit_exists(self):
 		# T35 boundary: one commit for a whole block comes later; after every write, everything goes back.

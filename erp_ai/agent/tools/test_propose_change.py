@@ -1811,12 +1811,24 @@ class TestBlockComment(FrappeTestCase):
 				),
 				1,
 			),
+			"commands restart": (
+				lambda: propose_change._propose_block([], [["restart"]], "r", self.context()),
+				1,
+			),
 		}
 		for shape, (run, count) in runs.items():
 			with self.subTest(shape=shape):
 				result = run()
 				self.assertTrue(result["ok"], result)
 				content = self.content(result)
+				# design-addendum-9 A9-1: the old sentence never, the new line once when `restart` is listed
+				self.assertEqual(
+					(
+						content.count("Sau khi áp dụng cần người chạy bench restart."),
+						content.count("Sau khi áp dụng, hệ thống sẽ restart bench (lệnh cuối)."),
+					),
+					(0, count),
+				)
 				self.assertEqual(content.count(restart_line), count)
 				self.assertNotIn(legacy_line, content)
 
@@ -1842,6 +1854,20 @@ class TestBlockComment(FrappeTestCase):
 		for secret in (REMOTE_URL, "x-token-FAKE", "host/r.git"):
 			with self.subTest(forged=secret):
 				self.assertNotIn(secret, forged_content)
+		# the app is escaped after `_shown`; a block of only commands filters its name too
+		marked = frappe._dict(forged, name="CP-T30-HTML", app="<b>&x")
+		marked_content = frappe.db.get_value("Comment", propose_change._comment(ctx, marked), "content")
+		self.assertIn("khối 1 mục trong app &lt;b&gt;&amp;x.</p>", marked_content)
+		commands_only = frappe._dict(
+			name="CP://T30",
+			change_kind=CHANGE_KIND_COMMAND,
+			operations=[],
+			command_list='[["restart"]]',
+		)
+		commands_content = frappe.db.get_value(
+			"Comment", propose_change._comment(ctx, commands_only), "content"
+		)
+		self.assertIn('"></a> đang chờ duyệt: 1 lệnh bench.</p>', commands_content)
 
 	def test_command_only_first_sentence(self):
 		result = self.run_tool("propose_bench_command", {"command": "migrate", "reason": "r"})

@@ -24,7 +24,6 @@ def _logger() -> logging.Logger:
 		return logging.getLogger(LOGGER_NAME)
 
 
-DUOI_CHO_PHEP = {".py", ".js", ".vue", ".json", ".md", ".html", ".css", ".txt"}
 TEN_CAM = re.compile(
 	r"(site_config\.json|common_site_config\.json|\.env|\.pem|\.key|" r"id_rsa|credential|secret|password)",
 	re.I,
@@ -130,7 +129,7 @@ def _inside(root, full):
 
 
 def _base_resolve(rel):
-	"""Return the real path of an allowed path under the root (no secret name, allowed extension), else None."""
+	"""Return the real path of an allowed path under the root (`text_refusal` passes on its name), else None."""
 	if not isinstance(rel, str) or not rel.strip() or "\0" in rel:
 		return None
 	root = os.path.realpath(get_source_root())

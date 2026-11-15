@@ -651,16 +651,24 @@ class TestCreatedLabels(HandlerTestCase):
 		customer = _ensure_user(self.CUSTOMER, "HD Customer")
 		frappe.set_user(customer)
 		self.assertNotIn(8, self._new_ticket().get_permlevel_access("write"))
+		# Seed the template instead of reading the site's: it lets a customer fill `priority`.
+		template = patch(
+			"helpdesk.helpdesk.doctype.hd_ticket.hd_ticket.HDTicket.customer_writable_rows",
+			return_value=[frappe._dict(fieldname="priority")],
+		)
 
-		doc = self._insert_as(customer, priority="High")
+		with template:
+			doc = self._insert_as(customer, priority="High")
 
+		self.assertEqual(frappe.db.get_value("HD Ticket", doc.name, "via_customer_portal"), 1)
 		self.assertEqual(self._stored(doc.name), _labels({"priority": "High"}))
 
 	def test_user_without_level8_insert_records_typed_fields(self):
+		# The classification fields are permlevel 7 on HD Ticket; level 8 is the one withheld.
 		agent = _ensure_user(self.AGENT, "Agent")
 		typed = {"ticket_type": TICKET_TYPE, "priority": "High"}
 
-		doc = self._insert_as(agent, permlevels=[0], **typed)
+		doc = self._insert_as(agent, permlevels=[0, 7], **typed)
 
 		self.assertEqual(self._stored(doc.name), _labels(typed))
 
@@ -668,8 +676,10 @@ class TestCreatedLabels(HandlerTestCase):
 		agent = _ensure_user(self.AGENT, "Agent")
 		forged = json.dumps({"ticket_type": TICKET_TYPE, "agent_group": OPEN_TEAM, "priority": "Low"})
 
-		typed = self._insert_as(agent, permlevels=[0, 8], priority="High", **{CREATED_LABELS_FIELD: forged})
-		untyped = self._insert_as(agent, permlevels=[0, 8], **{CREATED_LABELS_FIELD: forged})
+		typed = self._insert_as(
+			agent, permlevels=[0, 7, 8], priority="High", **{CREATED_LABELS_FIELD: forged}
+		)
+		untyped = self._insert_as(agent, permlevels=[0, 7, 8], **{CREATED_LABELS_FIELD: forged})
 
 		self.assertEqual(self._stored(typed.name), _labels({"priority": "High"}))
 		self.assertEqual(self._stored(untyped.name), "")

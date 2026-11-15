@@ -10360,5 +10360,67 @@ class TestTicketLockRules(unittest.TestCase):
 				self.assertCaught(check_locked_count_queries_use_for_update(sources), fragment)
 
 
+PENDING_SECTION_NAME = "SECTION_PENDING"
+# AD3-5 (T105): the guidance writer defines it, the one proposal insert function adds its lines.
+PENDING_SECTION_FILES = ("agent/tools/write_ticket.py", "agent/tools/propose_change.py")
+
+
+def check_section_pending_only_in_writer_and_proposal_module(sources: dict) -> list:
+	"""AD3-5 (T105): the name SECTION_PENDING (a name, an attribute or an imported name) occurs only in
+	write_ticket.py and propose_change.py, so no other module (the runner included) adds a "Chờ duyệt" line."""
+	violations = []
+	for rel, source in sources.items():
+		if rel in PENDING_SECTION_FILES or not rel.endswith(".py"):
+			continue
+		for node in ast.walk(parse(rel, source)):
+			used = (
+				(isinstance(node, ast.Name) and node.id == PENDING_SECTION_NAME)
+				or (isinstance(node, ast.Attribute) and node.attr == PENDING_SECTION_NAME)
+				or (isinstance(node, ast.alias) and PENDING_SECTION_NAME in (node.name, node.asname))
+			)
+			if used:
+				text = f"{PENDING_SECTION_NAME} outside write_ticket.py and propose_change.py (AD3-5)"
+				violations.append(violation(rel, node, text))
+	return violations
+
+
+class TestGuidanceSectionRules(unittest.TestCase):
+	"""T105 rule on the product, then its self-checks on samples."""
+
+	@classmethod
+	def setUpClass(cls):
+		cls.sources = load_product_sources()
+
+	def test_section_pending_only_in_writer_and_proposal_module(self):
+		self.assertEqual(check_section_pending_only_in_writer_and_proposal_module(self.sources), [])
+
+	def test_section_pending_rule_passes_on_the_clean_sample(self):
+		clean = {
+			"agent/tools/write_ticket.py": 'SECTION_PENDING = "Chờ duyệt"\n',
+			"agent/tools/propose_change.py": (
+				"from erp_ai.agent.tools.write_ticket import SECTION_PENDING, collect\n"
+				"collect(run_id, SECTION_PENDING, line)\n"
+			),
+			# a mention in a comment or a string is no use of the name
+			"agent/runner.py": '# SECTION_PENDING is the writer\'s\nNOTE = "SECTION_PENDING"\n',
+		}
+		self.assertEqual(check_section_pending_only_in_writer_and_proposal_module(clean), [])
+
+	def test_section_pending_rule_catches_each_use_elsewhere(self):
+		cases = {
+			"attribute": "write_ticket.collect(run_id, write_ticket.SECTION_PENDING, line)\n",
+			"imported": "from erp_ai.agent.tools.write_ticket import SECTION_PENDING\n",
+			"imported under another name": "from erp_ai.agent.tools.write_ticket import SECTION_PENDING as P\n",
+			"bare name": "collect(run_id, SECTION_PENDING, line)\n",
+		}
+		for case, source in cases.items():
+			for rel in ("agent/runner.py", "agent/tools/catalog_tools.py"):
+				with self.subTest(case=case, rel=rel):
+					found = check_section_pending_only_in_writer_and_proposal_module({rel: source})
+					self.assertEqual(len(found), 1, found)
+					self.assertIn(f"{rel}:", found[0])
+					self.assertIn("outside write_ticket.py and propose_change.py", found[0])
+
+
 if __name__ == "__main__":
 	unittest.main()

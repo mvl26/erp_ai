@@ -17,7 +17,7 @@ from erp_ai.agent import authority, change_link
 from erp_ai.agent.agent_write_guard import AGENT_WRITE_FLAG
 from erp_ai.agent.changes import process_runner, transitions
 from erp_ai.agent.policy import PermissionSwitches
-from erp_ai.agent.tools import change_guard, propose_change, source
+from erp_ai.agent.tools import change_guard, propose_change, source, write_ticket
 from erp_ai.agent.tools.registry import GrantInputs, ToolContext, execute_tool, get_tool_schemas
 from erp_ai.constants import (
 	AGENT_USER,
@@ -2034,3 +2034,120 @@ class TestOneClickGate(FrappeTestCase):
 			)
 		)
 		self.assertNotIn(propose_change.OPEN_PROPOSAL_LABEL, self.content(result))
+
+
+class TestPendingLine(FrappeTestCase):
+	"""FEAT-007 T105 (AD3-5, design-w1-fixes-20 Điểm 2.2): the one insert function collects one "Chờ duyệt" line
+	per new proposal of a guidance run; the line names the proposal and its fixed label, never its arguments."""
+
+	setUp = TestProposeChange.setUp
+	context = TestProposeChange.context
+	run_tool = TestProposeChange.run_tool
+	change = TestProposeChange.change
+	comments = TestProposeChange.comments
+	block = TestProposeBlock.block
+	stored = TestProposeBlock.stored
+
+	def open_run(self, run_id="run-propose"):
+		self.addCleanup(write_ticket.close_collector, run_id)
+		write_ticket.open_collector(run_id)
+		return run_id
+
+	def pending(self, run_id="run-propose"):
+		return write_ticket.collected(run_id)[1][write_ticket.SECTION_PENDING]
+
+	def test_insert_in_guidance_run_collects_one_line(self):
+		run_id = self.open_run()
+
+		result = self.change(["x = 1"], ["x = 2"])
+
+		self.assertTrue(result["ok"], result)
+		doc = self.stored(result)
+		self.assertEqual(self.pending(run_id), [propose_change.pending_line(doc)])
+		analysis, sections = write_ticket.collected(run_id)
+		self.assertIsNone(analysis)
+		self.assertEqual(sections[write_ticket.SECTION_DONE], [])
+		self.assertEqual(sections[write_ticket.SECTION_DECIDE], [])
+		# the proposal keeps its own comment (AC-33)
+		self.assertEqual([row.name for row in self.comments()], [result["comment"]])
+
+	def test_insert_outside_guidance_run_collects_nothing(self):
+		other = self.open_run("run-other")
+
+		result = self.change(["x = 1"], ["x = 2"])
+
+		self.assertTrue(result["ok"], result)
+		self.assertFalse(write_ticket.collecting("run-propose"))
+		self.assertEqual(self.pending("run-propose"), [])
+		self.assertEqual(self.pending(other), [])
+
+	def test_line_has_fixed_label_no_arguments(self):
+		self.open_run()
+
+		result = self.change(["x = 1"], ["x = 2"])
+
+		doc = self.stored(result)
+		(line,) = self.pending()
+		self.assertEqual(line, propose_change.PENDING_LINE.format(proposal=doc.name, label=CHANGE_KIND_CODE))
+		for argument in (PATH, REL, APP, "sửa theo yêu cầu", "x = 1", "x = 2"):
+			with self.subTest(argument=argument):
+				self.assertNotIn(argument, line)
+		# raw text: the writer escapes it once (AD3-4)
+		self.assertNotIn("<", line)
+		with self.assertRaises(ValueError):
+			propose_change.pending_line(frappe._dict(name="CP-T105", change_kind="Khác"))
+
+	def test_code_and_command_lines_point_to_form(self):
+		self.open_run()
+		self.assertEqual(
+			propose_change.PENDING_LINE,
+			"Đề xuất {proposal} ({label}): duyệt ở form đề xuất, không có nút Duyệt ngay.",
+		)
+
+		code = self.change(["x = 1"], ["x = 2"])
+		command = self.run_tool("propose_bench_command", BENCH_ARGUMENTS)
+
+		self.assertTrue(code["ok"], code)
+		self.assertTrue(command["ok"], command)
+		expected = [
+			propose_change.PENDING_LINE.format(proposal=code["proposal"], label=CHANGE_KIND_CODE),
+			propose_change.PENDING_LINE.format(proposal=command["proposal"], label=CHANGE_KIND_COMMAND),
+		]
+		self.assertEqual(self.pending(), expected)
+		self.assertEqual(self.stored(command).change_kind, CHANGE_KIND_COMMAND)
+		for line in self.pending():
+			with self.subTest(line=line):
+				self.assertIn("form đề xuất", line)
+				self.assertNotIn("ngăn", line)
+				self.assertNotIn("migrate", line)
+				self.assertNotIn(frappe.local.site, line)
+
+	def test_block_in_guidance_run_one_line_no_path_refused_block_none(self):
+		# arch-impact-chg-002 CI-2: a block is one proposal, so one line; a refused block collects nothing.
+		self.sandbox.commit_file(APP, "pkg/mod.py", "x = 1\n")
+		self.sandbox.commit_file(APP, "pkg/r.txt", "giữ\n")
+		self.open_run()
+		changes = [
+			{"action": "edit", "path": f"{APP}/pkg/mod.py", "find": ["x = 1"], "replace": ["x = 2"]},
+			{"action": "create", "path": f"{APP}/pkg/new/b.md", "content": "# b\n"},
+			{"action": "rename", "path": f"{APP}/pkg/r.txt", "new_path": f"{APP}/doc/r.txt"},
+		]
+		commands = [{"command": "migrate"}, {"command": "restart"}]
+		refused = [{"action": "edit", "path": f"{APP}/pkg/mod.py", "find": ["không có"], "replace": ["y"]}]
+
+		result = self.run_tool(
+			"propose_file_change", {"changes": changes, "commands": commands, "reason": "khối"}
+		)
+		denied = self.run_tool(
+			"propose_file_change", {"changes": refused, "commands": commands, "reason": "khối"}
+		)
+
+		self.assertTrue(result["ok"], result)
+		self.assertFalse(denied["ok"], denied)
+		(line,) = self.pending()
+		self.assertEqual(
+			line, propose_change.PENDING_LINE.format(proposal=result["proposal"], label=CHANGE_KIND_CODE)
+		)
+		for fragment in ("pkg/", "mod.py", "b.md", "r.txt", APP, "migrate", "restart", frappe.local.site):
+			with self.subTest(fragment=fragment):
+				self.assertNotIn(fragment, line)

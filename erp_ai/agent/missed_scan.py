@@ -10,6 +10,7 @@ from erp_ai.constants import (
 	LOG_DOCTYPE,
 	LOGGER_NAME,
 	SETTING_DOCTYPE,
+	TITLE_RUN_FAILED,
 	TRIGGER_TICKET_INSERT,
 )
 
@@ -46,7 +47,7 @@ def _agent_enabled_at():
 def find_missed_tickets(now: datetime) -> list[str]:
 	"""Tickets whose classification run was missed (AC-16, D-16, A-D3), oldest first, at most SCAN_BATCH.
 
-	Only the SCAN_CANDIDATE_LIMIT newest candidates are considered (design-w1-fixes-6 Point 2).
+	Only the SCAN_CANDIDATE_LIMIT newest candidates are considered (design-w1-fixes-6 Điểm 2).
 	"""
 	enabled_at = _agent_enabled_at()
 	if not enabled_at:
@@ -77,13 +78,21 @@ def find_missed_tickets(now: datetime) -> list[str]:
 
 
 def scan_missed_tickets(now: datetime | None = None) -> None:
-	"""The 15-minute cron (AC-16, ADR-033 QĐ 2): re-queue missed tickets as a ticket_insert run."""
+	"""The 15-minute cron (AC-16, ADR-033 QĐ 2): re-queue missed tickets as a ticket_insert run.
+
+	One logger line per run; an error ends the run with one constant-title log_error (D-17).
+	"""
 	logger = frappe.logger(LOGGER_NAME)
-	if not policy.is_enabled():
-		logger.info("missed_scan: agent tắt, bỏ qua")
-		return
 	queued = 0
-	for name in find_missed_tickets(now or now_datetime()):
-		if queue.enqueue_agent_run(name, TRIGGER_TICKET_INSERT):
-			queued += 1
+	try:
+		if not policy.is_enabled():
+			logger.info("missed_scan: agent tắt, bỏ qua")
+			return
+		for name in find_missed_tickets(now or now_datetime()):
+			if queue.enqueue_agent_run(name, TRIGGER_TICKET_INSERT):
+				queued += 1
+	except Exception as exc:
+		frappe.log_error(TITLE_RUN_FAILED, f"missed_scan error={type(exc).__name__}")
+		logger.error("missed_scan: lỗi %s, đã xếp %s phiếu", type(exc).__name__, queued)
+		return
 	logger.info(f"missed_scan: xếp {queued} phiếu")

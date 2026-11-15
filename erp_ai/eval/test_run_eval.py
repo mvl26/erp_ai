@@ -547,7 +547,12 @@ class TestRunEvalRun(FrappeTestCase):
 		runner_route.assert_called_once()
 		eval_route.assert_called_once()
 		self.assertEqual(eval_route.call_args.args, runner_route.call_args.args)
-		self.assertEqual(eval_route.call_args.kwargs, runner_route.call_args.kwargs)
+		shared = {"team_exists", "is_excluded_team", "is_active_agent"}
+		runner_kwargs, eval_kwargs = runner_route.call_args.kwargs, eval_route.call_args.kwargs
+		# eval measures the model and the mapping, not the due-date exceptions or the D watcher (design-w0-fixes-2.md:157)
+		self.assertEqual(set(eval_kwargs), shared)
+		self.assertEqual(set(runner_kwargs), shared | {"due_at", "due_field_configured", "d_watcher", "now"})
+		self.assertEqual({k: eval_kwargs[k] for k in shared}, {k: runner_kwargs[k] for k in shared})
 		self.assertEqual(eval_route.call_args.args[2], mapping)
 		expected = build_classify_request(subject, description, ("Kế toán",))
 		self.assertEqual(eval_gateway.calls[0]["system"], expected["system"])

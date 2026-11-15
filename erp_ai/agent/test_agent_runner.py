@@ -562,6 +562,18 @@ class TestRunnerL1Classification(RunnerTestBase):
 			reason=f"SLA {fact['sla']} xử lý {fact['resolution_s'] // 60} phút > mong đợi {expected} phút (A)",
 		)
 
+	def _comment_names(self):
+		return set(
+			frappe.get_all(
+				"Comment", filters=authority.ticket_comment_filters(self.ticket.name), pluck="name"
+			)
+		)
+
+	def _route_comment(self, before):
+		"""The `post_routing_comment` entry of the one comment the run posted (design-w1-fixes-12 Điểm 2, T109)."""
+		(comment_name,) = self._comment_names() - before
+		return action_entry("post_routing_comment", "Comment", comment_name, True)
+
 	def _applied_route(self, entry):
 		"""The `apply_route` entry of a run whose ticket write succeeded: the shared shape (NFR-8)."""
 		return action_entry(
@@ -580,6 +592,7 @@ class TestRunnerL1Classification(RunnerTestBase):
 			tool_turn(tool_use("toolu_hint", "set_resolution_hint", text=f"{PREFIX}hướng giải quyết")),
 			make_model_result(stop_reason="end_turn"),
 		]
+		comments = self._comment_names()
 		self._run()
 
 		self.log_error.assert_not_called()
@@ -605,9 +618,10 @@ class TestRunnerL1Classification(RunnerTestBase):
 				}
 			},
 		)
+		# T109 (AC-23): a successful route ends with its one comment
 		self.assertEqual(
 			json.loads(entry.actions),
-			[self._applied_route(entry)],
+			[self._applied_route(entry), self._route_comment(comments)],
 		)
 		self.assertEqual((entry.predicted_category, entry.predicted_confidence), ("A", "Cao"))
 		self.assertEqual(json.loads(entry.skipped_fields), [ASSIGNEE_NOTE])
@@ -640,6 +654,7 @@ class TestRunnerL1Classification(RunnerTestBase):
 		set_agent_settings(category_mapping=json.dumps(unknown))
 		before = self._ticket_row()
 		sla_action = self._slow_sla_action()
+		comments = self._comment_names()
 		self._run()
 
 		# ADR-020 QĐ 1, QĐ 6: the ticket is always saved with the AI fields, even when no route value applies.
@@ -655,9 +670,11 @@ class TestRunnerL1Classification(RunnerTestBase):
 		)
 		self.assertEqual(
 			json.loads(entry.actions),
+			# T109 (AC-23): a successful route ends with its one comment
 			[
 				self._applied_route(entry),
 				sla_action,
+				self._route_comment(comments),
 			],
 		)
 		skipped = json.loads(entry.skipped_fields)
@@ -689,6 +706,7 @@ class TestRunnerL1Classification(RunnerTestBase):
 		set_agent_settings(category_mapping=json.dumps(unknown))
 		before = self._ticket_row()
 		sla_action = self._slow_sla_action()
+		comments = self._comment_names()
 		self._run()
 
 		# ADR-020 QĐ 1, QĐ 6: the ticket is always saved with the AI fields; no route field changes.
@@ -704,9 +722,11 @@ class TestRunnerL1Classification(RunnerTestBase):
 		)
 		self.assertEqual(
 			json.loads(entry.actions),
+			# T109 (AC-23): a successful route ends with its one comment
 			[
 				self._applied_route(entry),
 				sla_action,
+				self._route_comment(comments),
 			],
 		)
 		self.assertEqual(

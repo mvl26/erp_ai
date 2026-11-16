@@ -27,6 +27,13 @@ function setupForm({ doc, call, router }) {
 		const TEXT_DECIDED_BY = "Người duyệt: ";
 		const TEXT_RESTART = "Restart: ";
 		const TEXT_FAILURE_REASON = "Lý do lỗi: ";
+		const TEXT_APPROVE = "Duyệt";
+		const TEXT_REJECT = "Từ chối";
+		const TEXT_DECIDE_FAILED =
+			"Không duyệt hoặc từ chối được đề xuất; hãy xem trạng thái hiện tại trên thẻ.";
+		// The actions of the panel's decision method (server PANEL_DECISIONS), not method paths.
+		const ACTION_APPROVE = "approve";
+		const ACTION_REJECT = "reject";
 		const STATUS_PENDING = "Chờ duyệt";
 		const STATUS_APPLIED = "Đã áp dụng";
 		const PROPOSAL_FORM_PREFIX = "/app/erp-ai-change-proposal/";
@@ -384,12 +391,37 @@ function setupForm({ doc, call, router }) {
 			return button;
 		};
 
+		// Duyệt / Từ chối: one click, no confirm dialog; locked while one waits (design 4.2).
+		const decisionButton = (label, name, action) => {
+			const panel = state.panel;
+			const button = document.createElement("button");
+			button.type = "button";
+			button.textContent = label;
+			button.disabled = panel.deciding;
+			button.addEventListener("click", () => {
+				try {
+					decide(name, action);
+				} catch (e) {
+					// A panel handler must never break the ticket page (ADR-009 decision 4).
+				}
+			});
+			panel.decisionButtons.push(button);
+			return button;
+		};
+
 		const proposalActions = (card) => {
 			const row = document.createElement("div");
 			Object.assign(row.style, { display: "flex", gap: "8px", marginTop: "4px" });
 			const name = String(card?.name ?? "");
+			if (!name) {
+				return row;
+			}
 			const canOpen = card?.can_open === true;
 			if (card?.can_decide === true) {
+				row.append(
+					decisionButton(TEXT_APPROVE, name, ACTION_APPROVE),
+					decisionButton(TEXT_REJECT, name, ACTION_REJECT)
+				);
 				if (canOpen) {
 					row.append(proposalButton(TEXT_OPEN_PROPOSAL, name));
 				}
@@ -492,18 +524,75 @@ function setupForm({ doc, call, router }) {
 							}
 							renderAiFields(data);
 							renderMessages(data);
-							renderProposals(data);
 							panel.errorEl.textContent = "";
 						} catch (e) {
 							panel.aiListEl.replaceChildren();
 							clearProposals();
 							panel.threadEl.replaceChildren();
 							panel.errorEl.textContent = TEXT_LOAD_FAILED;
+							return;
+						}
+						// A card that fails to render clears the proposals only; the thread stays.
+						try {
+							renderProposals(data);
+						} catch (e) {
+							clearProposals();
 						}
 					})
 					.catch(showLoadFailed);
 			} catch (e) {
 				showLoadFailed();
+			}
+		};
+
+		// One click = one POST, then one reload whatever the answer (ADR-044 QĐ 7); no timer.
+		const decide = (name, action) => {
+			const panel = state.panel;
+			if (panel.deciding || !panel.open || !state.ticket) {
+				return;
+			}
+			const ticket = state.ticket;
+			const isStale = () => ticket !== state.ticket;
+			const lockDecisions = (locked) => {
+				for (const button of panel.decisionButtons) {
+					button.disabled = locked;
+				}
+			};
+			// A left ticket was reset (deciding cleared, cards gone): a late answer does nothing.
+			const onDecided = () => {
+				try {
+					if (isStale()) {
+						return;
+					}
+					panel.deciding = false;
+					reload();
+				} catch (e) {
+					// A panel handler must never break the ticket page (ADR-009 decision 4).
+				}
+			};
+			// Fixed sentence, not the server's text (D-2); buttons work again until the reload.
+			const onDecideFailed = () => {
+				try {
+					if (isStale()) {
+						return;
+					}
+					panel.deciding = false;
+					lockDecisions(false);
+					panel.proposalErrorEl.textContent = TEXT_DECIDE_FAILED;
+					reload();
+				} catch (e) {
+					// A panel handler must never break the ticket page (ADR-009 decision 4).
+				}
+			};
+			panel.deciding = true;
+			lockDecisions(true);
+			panel.proposalErrorEl.textContent = "";
+			try {
+				state
+					.call("erp_ai.ticket_panel.decide_proposal", { name, action })
+					.then(onDecided, onDecideFailed);
+			} catch (e) {
+				onDecideFailed();
 			}
 		};
 

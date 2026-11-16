@@ -627,6 +627,8 @@ class TestTicketPanelGateParity(FrappeTestCase):
 		create_agent(AGENT_EMAIL)
 		create_agent(self.INSTRUCTOR_EMAIL)
 		frappe.get_doc("User", self.INSTRUCTOR_EMAIL).add_roles(ROLE_INSTRUCTOR)
+		# learning off: no lesson of the shared site reaches the runs of this test (NFR-7, FEAT-008 ruling R7)
+		set_agent_settings(lessons_enabled=0)
 
 	panel_messages: ClassVar[dict] = {}
 

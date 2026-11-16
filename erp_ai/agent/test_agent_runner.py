@@ -149,6 +149,8 @@ class RunnerTestBase(FrappeTestCase):
 			reply_enabled=0,
 			kb_draft_enabled=0,
 			confidence_threshold=policy.DEFAULT_CONFIDENCE_THRESHOLD,
+			# learning off: no lesson of the shared site reaches a request (NFR-7); TestRunnerLessons turns it on
+			lessons_enabled=0,
 		)
 		# No status signal reaches Redis and no run sleeps for real (the delay is 0 here; a test that sets one reads `sleeps`).
 		self.signals = record_status_signals(self)

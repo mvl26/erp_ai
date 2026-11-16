@@ -328,6 +328,8 @@ class TestRunEvalRun(FrappeTestCase):
 		set_agent_settings(
 			category_mapping=json.dumps(DEFAULT_CATEGORY_MAPPING), routing_rules=make_routing_rules()
 		)
+		# learning off: no lesson of the shared site reaches the runner's request (NFR-7, FEAT-008 ruling R7)
+		set_agent_settings(lessons_enabled=0)
 
 	def _write(self, rows):
 		with open(self.path, "w", encoding="utf-8") as handle:

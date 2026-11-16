@@ -5459,3 +5459,71 @@ class TestExcludedTitle(RunnerTestBase):
 		self.assertEqual(self.gateway.call_count, 0)
 		(skip,) = self._entries(entry_type="skip")
 		self.assertEqual(skip.stop_reason, "not_sendable")
+
+
+class TestPermissionVectorsLogged(RunnerTestBase):
+	"""AC-5, AC-10 (T138, U2.md:308): a permission vector the record tool refuses leaves one failed action entry."""
+
+	def setUp(self):
+		super().setUp()
+		keep_agent_settings(self)
+		# switch (2) on, (1) off: the normal mode of the record tools, at L3 with an instructor
+		set_agent_settings(
+			permission_level="L3",
+			record_tools_enabled=1,
+			unrestricted_enabled=0,
+			code_change_enabled=0,
+			act_now_enabled=0,
+			monthly_budget_usd=1000,
+			max_runs_per_ticket_per_day=10,
+		)
+		make_instructor(self)
+
+	def _shares(self):
+		return frappe.db.count("DocShare", {"share_doctype": "HD Ticket", "share_name": self.ticket.name})
+
+	def test_refused_vector_has_one_failed_action_entry(self):
+		self.assertIn("DocShare", site_api.PERMISSION_DOCTYPES)
+		values = {"share_doctype": "HD Ticket", "share_name": self.ticket.name, "user": INSTRUCTOR, "read": 1}
+		shares = self._shares()
+		self.gateway.results = [
+			tool_turn(tool_use("t_share", "api_create_record", doctype="DocShare", values=values)),
+			make_model_result(),
+		]
+		real_execute = runner.execute_tool
+		results = []
+
+		def spy(name, args, ctx):
+			results.append(real_execute(name, args, ctx))
+			return results[-1]
+
+		with (
+			patch.object(authority, "run_instructor", return_value=INSTRUCTOR),
+			patch.object(runner, "execute_tool", side_effect=spy),
+		):
+			self._run("comment_mention")
+
+		# the real tool refused it with its reason
+		(result,) = results
+		self.assertFalse(result["ok"])
+		self.assertTrue(result["reason"])
+		failed = [
+			action
+			for entry in self._entries()
+			for action in json.loads(entry.actions or "[]")
+			if not action["ok"]
+		]
+		self.assertEqual(
+			failed,
+			[
+				action_entry(
+					"api_create_record",
+					"DocShare",
+					None,
+					False,
+					reason=result["reason"],
+					instructor=INSTRUCTOR,
+				)
+			],
+		)
+		self.assertEqual(self._shares(), shares)

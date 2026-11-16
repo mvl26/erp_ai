@@ -810,15 +810,19 @@ class _EventCase(_RollbackCase):
 		self.old_error_logs = set(
 			frappe.get_all("Error Log", filters={"method": EVENT_FAILED_TITLE}, pluck="name")
 		)
+		self.creation_events = set()
 
-	@staticmethod
-	def _ticket(subject="ERPAI-TEST-run-event ticket") -> str:
-		return str(make_ticket(subject=subject).name)
+	def _ticket(self, subject="ERPAI-TEST-run-event ticket") -> str:
+		"""A new ticket; the run_event row its creation leaves (the ticket handler's) is not the test's."""
+		ticket = str(make_ticket(subject=subject).name)
+		self.creation_events |= set(self._events(ticket))
+		return ticket
 
-	@staticmethod
-	def _events(ticket=None) -> list:
+	def _events(self, ticket=None) -> list:
+		"""The run_event rows (of `ticket`), less those a ticket's creation by `_ticket` left."""
 		filters = {"entry_type": RUN_EVENT, **({"ticket": ticket} if ticket else {})}
-		return frappe.get_all(LOG_DOCTYPE, filters=filters, pluck="name")
+		names = frappe.get_all(LOG_DOCTYPE, filters=filters, pluck="name")
+		return [name for name in names if name not in self.creation_events]
 
 	def _error_messages(self) -> list:
 		"""The messages of the event-write Error Log rows written since setUp."""

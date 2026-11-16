@@ -527,6 +527,8 @@ class TestBuild(FrappeTestCase):
 				"create_routed_task": "Task",
 				"post_comment": "comment",
 				"post_routing_comment": "comment",
+				"reply_to_requester": "trả lời",
+				lifecycle.TOOL_LIFECYCLE_COMMENT: "comment",
 			},
 		)
 		self.assertEqual(
@@ -723,6 +725,10 @@ class TestRun(FrappeTestCase):
 		self.sendmail = patcher.start()
 		self.addCleanup(patcher.stop)
 
+	def _sent_on(self):
+		"""The watermark; an empty Date field reads back as date(1, 1, 1)."""
+		return frappe.utils.getdate(frappe.db.get_single_value(SETTING_DOCTYPE, "daily_report_sent_on"))
+
 	def _sent(self) -> dict:
 		self.sendmail.assert_called_once()
 		return self.sendmail.call_args.kwargs
@@ -827,7 +833,7 @@ class TestRun(FrappeTestCase):
 				"daily_report: chưa có người nhận",
 				[call_.args[0] for call_ in logger.return_value.info.call_args_list],
 			)
-			self.assertFalse(frappe.db.get_single_value(SETTING_DOCTYPE, "daily_report_sent_on"))
+			self.assertNotEqual(self._sent_on(), ANCHOR_RUN.date())
 
 	def test_send_error_logged_not_raised_watermark_kept(self):
 		for error in (frappe.OutgoingEmailError("smtp down"), frappe.ValidationError("bad address")):
@@ -842,7 +848,7 @@ class TestRun(FrappeTestCase):
 			log_error.assert_called_once()
 			self.assertEqual(log_error.call_args.args[0], daily_report.TITLE_DAILY_REPORT_FAILED)
 			self.assertEqual(daily_report.TITLE_DAILY_REPORT_FAILED, "erp_ai: báo cáo hằng ngày lỗi")
-			self.assertFalse(frappe.db.get_single_value(SETTING_DOCTYPE, "daily_report_sent_on"))
+			self.assertNotEqual(self._sent_on(), ANCHOR_RUN.date())
 
 	def test_weekend_skipped_when_off(self):
 		saturday = datetime(2002, 8, 10, 8, 0)

@@ -497,6 +497,24 @@ DOCTYPE_CONFIG = {
 			("section_kpi", "Sáu KPI của tuần", "first_response_median_min"),
 		),
 	},
+	# FEAT-007 design.md:272-274, 477: the monthly random review of tickets; the ticket list is locked.
+	"ERP AI Review Month": {
+		"folder": "erp_ai_review_month",
+		"field_count": 5,
+		"phrases": {
+			"month": ("Hệ thống tự ghi", "không sửa được", "REV-", "tháng"),
+			"period_start": ("Hệ thống tự ghi", "không sửa được", "ngày đầu"),
+			"period_end": ("Hệ thống tự ghi", "không sửa được", "ngày cuối"),
+			"candidate_count": ("Hệ thống tự ghi", "không sửa được", "phiếu", "mẫu"),
+			"items": ("danh sách phiếu", "không đổi được", "Đúng", "Sai"),
+		},
+		"section_count": 2,
+		"read_only_fields": ("month", "period_start", "period_end", "candidate_count"),
+		"sections": (
+			("section_period", "Tháng rà soát", "month"),
+			("section_items", "Phiếu được chọn", "items"),
+		),
+	},
 }
 
 # FEAT-004 design 2.4: exact contract of the code-change block of ERP AI Setting.

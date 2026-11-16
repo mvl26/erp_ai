@@ -4,6 +4,7 @@ import frappe
 from frappe.tests.utils import FrappeTestCase
 from helpdesk.test_utils import make_ticket
 
+from erp_ai.agent import labels
 from erp_ai.agent.redact import MASK
 from erp_ai.agent.tools import kb_draft
 from erp_ai.agent.tools.registry import ToolContext, _first_invalid_key
@@ -124,6 +125,30 @@ class TestCreateKbDraft(KbDraftCase):
 		positions = [article.content.find(part) for part in parts]
 		self.assertNotIn(-1, positions, article.content)
 		self.assertEqual(positions, sorted(positions), article.content)
+
+	def test_draft_carries_the_ticket_labels(self):
+		# ADR-049: the knowledge base keeps the labels of the ticket the article came from
+		ticket = self._ticket()
+		names = ("ERPAI-TEST-Kho", "ERPAI-TEST-In ấn")
+		for name in names:
+			frappe.get_doc("HD Ticket", ticket).add_tag(name)
+
+		result = self._draft(ticket)
+
+		self.assertTrue(result["ok"], result)
+		links = frappe.get_all(
+			"Tag Link",
+			filters={"document_type": "HD Article", "document_name": result["article"]},
+			pluck="tag",
+		)
+		self.assertEqual(sorted(links), sorted(names))
+		tags = frappe.db.get_value("HD Article", result["article"], "_user_tags")
+		self.assertEqual(sorted(labels.parse_tags(tags)), sorted(names))
+
+	def test_draft_of_an_unlabelled_ticket_has_no_tag(self):
+		ticket = self._ticket()
+		result = self._draft(ticket)
+		self.assertFalse(frappe.db.get_value("HD Article", result["article"], "_user_tags"))
 
 	def test_open_ticket_refused(self):
 		ticket = self._ticket(resolved=False)

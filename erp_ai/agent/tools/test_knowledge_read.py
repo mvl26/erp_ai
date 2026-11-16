@@ -124,9 +124,23 @@ class TestSearchKnowledgeBase(KnowledgeToolCase):
 		self.assertTrue(result["ok"], result)
 		self.assertEqual({row["name"] for row in result["articles"]}, published)
 		for row in result["articles"]:
-			self.assertEqual(set(row), {"name", "title", "excerpt"})
+			self.assertEqual(set(row), {"name", "title", "excerpt", "labels"})
 			self.assertEqual(row["title"], frappe.db.get_value("HD Article", row["name"], "title"))
 			self.assertIn(word, row["excerpt"])
+
+	def test_article_carries_its_labels(self):
+		# ADR-049: the knowledge base shows each article's labels
+		word = _word()
+		labelled = self._article(f"<p>Có nhãn {word}</p>")
+		bare = self._article(f"<p>Không nhãn {word}</p>")
+		article = frappe.get_doc("HD Article", labelled)
+		for name in ("ERPAI-TEST-Kho", "ERPAI-TEST-In ấn"):
+			article.add_tag(name)
+
+		result = self._search(word)
+
+		rows = {row["name"]: row["labels"] for row in result["articles"]}
+		self.assertEqual(rows, {labelled: ["ERPAI-TEST-Kho", "ERPAI-TEST-In ấn"], bare: []})
 
 	def test_reversed_words_found(self):
 		one, two = _word(), _word()

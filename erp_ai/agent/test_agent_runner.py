@@ -16,7 +16,7 @@ from frappe.utils import escape_html
 from helpdesk.test_utils import make_ticket
 
 from erp_ai import handlers, tasks
-from erp_ai.agent import answer_delay, authority, messages, missed_scan, policy, run_log, runner
+from erp_ai.agent import answer_delay, authority, labels, messages, missed_scan, policy, run_log, runner
 from erp_ai.agent.agent_write_guard import allow_agent_write
 from erp_ai.agent.changes import apply_job, transitions
 from erp_ai.agent.classification import DEFAULT_CATEGORY_MAPPING
@@ -149,6 +149,11 @@ class RunnerTestBase(FrappeTestCase):
 		latest_patch = patch.object(policy, "latest_classification", return_value=SEEDED_CLASSIFICATION)
 		self.latest_classification = latest_patch.start()
 		self.addCleanup(latest_patch.stop)
+		# The label inputs never come from the shared site's live tags and modules (STD-TEST-6, ADR-049): empty, so
+		# the classify request is the one without labels; a test that needs them sets `self.label_inputs`.
+		label_patch = patch.object(labels, "classify_inputs", return_value=labels.LabelInputs())
+		self.label_inputs = label_patch.start()
+		self.addCleanup(label_patch.stop)
 
 	def _entries(self, **filters):
 		return frappe.get_all(

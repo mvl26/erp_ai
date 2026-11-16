@@ -9,6 +9,7 @@ from frappe.tests.utils import FrappeTestCase
 from helpdesk.test_utils import make_ticket
 
 from erp_ai.agent.classification import Classification
+from erp_ai.agent.labels import IGNORED_LABELS
 from erp_ai.agent.routing import RouteDecision
 from erp_ai.agent.tools.registry import ToolContext
 from erp_ai.agent.tools.route_ticket import (
@@ -19,6 +20,7 @@ from erp_ai.agent.tools.route_ticket import (
 	REASON_TASK_NOT_ASSIGNED,
 	TASK_REQUEST,
 	TaskSharingDisabled,
+	add_labels,
 	apply_route,
 	assign_owner,
 	create_routed_task,
@@ -396,6 +398,76 @@ class TestConfidencePct(RouteTicketTestCase):
 				writers[path.relative_to(root).as_posix()] = lines
 		self.assertLessEqual(set(writers), PCT_WRITERS, writers)
 		self.assertIn("agent/tools/route_ticket.py", writers)
+
+
+class TestAddLabels(RouteTicketTestCase):
+	"""ADR-049: the labels of the classification become Helpdesk Tags of the ticket, added, never removed."""
+
+	def _tags(self, ticket):
+		return frappe.db.get_value("HD Ticket", ticket, "_user_tags") or ""
+
+	def _links(self, ticket):
+		# Helpdesk tags a requester's first ticket itself
+		rows = frappe.get_all(
+			"Tag Link", filters={"document_type": "HD Ticket", "document_name": ticket}, pluck="tag"
+		)
+		return sorted(tag for tag in rows if tag not in IGNORED_LABELS)
+
+	def _add_as_agent(self, ticket, names):
+		pin_agent_roles(self)
+		frappe.set_user(AGENT_USER)
+		return add_labels(names, self._ctx(ticket))
+
+	def test_labels_become_tags_of_the_ticket_as_the_agent(self):
+		ticket = self._ticket()
+		names = (f"{PREFIX}Kho", f"{PREFIX}In ấn")
+
+		result = self._add_as_agent(ticket, names)
+
+		self.assertEqual(result, {"ok": True, "added": list(names)})
+		self.assertEqual(self._links(ticket), sorted(names))
+		for name in names:
+			self.assertIn(name, self._tags(ticket).split(","))
+			# claimed for helpdesk, so the Tags box lists it
+			self.assertEqual(frappe.db.get_value("Tag", name, "app"), "helpdesk")
+
+	def test_a_tag_the_ticket_has_is_kept_and_not_added_twice(self):
+		ticket = self._ticket()
+		person = f"{PREFIX}người gắn"
+		frappe.get_doc("HD Ticket", ticket).add_tag(person)
+		frappe.get_doc("HD Ticket", ticket).add_tag(f"{PREFIX}Kho")
+
+		result = self._add_as_agent(ticket, (f"{PREFIX}kho", f"{PREFIX}Mới"))
+
+		self.assertEqual(result["added"], [f"{PREFIX}Mới"])
+		self.assertEqual(self._links(ticket), sorted([person, f"{PREFIX}Kho", f"{PREFIX}Mới"]))
+
+	def test_existing_tag_keeps_its_spelling(self):
+		frappe.get_doc({"doctype": "Tag", "name": f"{PREFIX}Delivery Note"}).insert(ignore_permissions=True)
+		ticket = self._ticket()
+
+		result = self._add_as_agent(ticket, (f"{PREFIX}delivery note",))
+
+		self.assertEqual(result["added"], [f"{PREFIX}Delivery Note"])
+		self.assertEqual(self._links(ticket), [f"{PREFIX}Delivery Note"])
+
+	def test_no_labels_writes_nothing(self):
+		ticket = self._ticket()
+		before = self._tags(ticket)
+		self.assertEqual(self._add_as_agent(ticket, ()), {"ok": True, "added": []})
+		self.assertEqual(self._tags(ticket), before)
+
+	def test_user_without_write_permission_refused(self):
+		ticket = self._ticket()
+		real = Document.has_permission
+
+		def deny_write(doc, permtype="read", *args, **kwargs):
+			return False if permtype == "write" else real(doc, permtype, *args, **kwargs)
+
+		with patch.object(Document, "has_permission", deny_write):
+			result = self._add_as_agent(ticket, (f"{PREFIX}Kho",))
+		self.assertFalse(result["ok"])
+		self.assertEqual(self._links(ticket), [])
 
 
 class TestSlaFromHelpdesk(RouteTicketTestCase):

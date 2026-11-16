@@ -16,7 +16,15 @@ INSTRUCTOR = "t24.instructor@example.com"
 OUTSIDER = "t24.outsider@example.com"
 SCHEMA_TYPES = {"string", "integer", "boolean", "array"}
 EMPTY_QUERY_REFUSAL = "câu tìm cần ít nhất một từ dài 2 ký tự"
-RESULT_KEYS = {"name", "subject", "ticket_type", "agent_group", "resolution_date", "resolution_details"}
+RESULT_KEYS = {
+	"name",
+	"subject",
+	"ticket_type",
+	"agent_group",
+	"resolution_date",
+	"resolution_details",
+	"labels",
+}
 # A real HD Team: the query form of the send predicate only knows teams that exist (policy.excluded_team_names).
 SEARCH_EXCLUDED_TEAM = "T153 Nhóm loại trừ"
 
@@ -214,10 +222,8 @@ class TestReadTools(FrappeTestCase):
 		self.assertEqual(names, {match, by_description})
 		self.assertNotIn(unresolved, names)
 		row = next(r for r in result["tickets"] if r["name"] == match)
-		self.assertEqual(
-			set(row),
-			{"name", "subject", "ticket_type", "agent_group", "resolution_date", "resolution_details"},
-		)
+		# ADR-034 Amendment 1 (ADR-049): the ticket's labels come with it
+		self.assertEqual(set(row), RESULT_KEYS)
 		self.assertEqual(len(row["resolution_details"]), 1500)
 		self.assertNotIn("<", row["resolution_details"])
 
@@ -585,6 +591,17 @@ class TestSearchResolvedTickets(FrappeTestCase):
 		).insert(ignore_permissions=True)
 		self.comment(detailed, AGENT_A, "<p>c</p>", "2030-01-01 00:00:00")
 		self.assertEqual(set(self.found(detailed)), RESULT_KEYS)
+
+	def test_found_ticket_carries_its_labels(self):
+		# ADR-049: a resolved ticket comes back with its labels, Helpdesk's own tag left out
+		ticket = self.resolved(f"{self.word('tim')} nhãn")
+		doc = frappe.get_doc("HD Ticket", ticket)
+		for name in ("First Ticket", "ERPAI-TEST-Kho", "ERPAI-TEST-In ấn"):
+			doc.add_tag(name)
+		bare = self.resolved(f"{self.word('tim')} trơn")
+
+		self.assertEqual(self.found(ticket)["labels"], ["ERPAI-TEST-Kho", "ERPAI-TEST-In ấn"])
+		self.assertEqual(self.found(bare)["labels"], [])
 
 	def test_empty_resolution_no_comment(self):
 		assigned = self.without_details([AGENT_A])

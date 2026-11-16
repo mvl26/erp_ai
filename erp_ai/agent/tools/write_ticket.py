@@ -11,6 +11,7 @@ from frappe.utils import escape_html, now_datetime
 
 from erp_ai.agent import policy, site_facts
 from erp_ai.agent.classification import CONFIDENCE_PCT_MAX, Classification
+from erp_ai.agent.ops_data import BA_NOTE_MARKER
 from erp_ai.agent.routing import RouteDecision, decide_route
 from erp_ai.agent.tools.registry import ToolContext, ToolSpec
 from erp_ai.constants import (
@@ -20,6 +21,7 @@ from erp_ai.constants import (
 	CLASSIFIED_BY_AI,
 	CLASSIFIED_BY_HUMAN,
 	CONFIDENCE_VALUES,
+	LEVELS,
 	LOGGER_NAME,
 	SETTING_DOCTYPE,
 )
@@ -39,8 +41,8 @@ LINKED_DOCTYPES = {
 	"priority": "HD Ticket Priority",
 }
 REASON_MAX = 200
-# The kinds of the post_comment tool (AC-22, U4b.md:126-133); U8 appends "ba_note".
-COMMENT_KINDS = ("de_xuat", "hoi")
+# The kinds of the post_comment tool (AC-22, U4b.md:126-133); U8 appends "ba_note" (AC-62).
+COMMENT_KINDS = ("de_xuat", "hoi", "ba_note")
 CONFIDENCE_LINE = re.compile(r"Độ tin cậy:\s*(\d{1,3})\s*%")
 EVIDENCE_HEADER = "Căn cứ"
 ASK_FOOTER = "Độ tin cậy phân loại: {pct} (ngưỡng {threshold}%). Bot chỉ hỏi, chưa ghi gì trên phiếu."
@@ -48,6 +50,19 @@ REASON_NO_CONFIDENCE = "comment đề xuất thiếu dòng 'Độ tin cậy: NN%
 REASON_NO_EVIDENCE = f"comment thiếu phần '**{EVIDENCE_HEADER}:**' có nội dung"
 REASON_ASK_ONLY = "độ tin cậy dưới ngưỡng: chỉ được đăng comment hỏi (kind = hoi)"
 REASON_ONE_ASK = "đã đăng comment hỏi trong lần chạy này"
+# The BA note (AC-62, U4b.md:152-156, U4b-fixes Fix 3): five non-empty parts, once per category C ticket, posted under
+# ops_data.BA_NOTE_MARKER (the 08:00 report finds it by that marker).
+BA_NOTE_CATEGORY = "C"
+BA_NOTE_SECTIONS = ("Mục tiêu", "Phạm vi", "Tính năng sẵn có", "Rủi ro", "Câu hỏi mở")
+BA_NOTE_FEATURE = BA_NOTE_SECTIONS[2]
+BA_NOTE_SOURCE = "Nguồn"
+REASON_BA_NOTE_MISSING = "BA note thiếu hoặc rỗng mục: {sections}"
+REASON_BA_NOTE_FEATURE = "mục 'Tính năng sẵn có' phải bắt đầu bằng Có hoặc Không và có 'Nguồn:' không rỗng"
+REASON_BA_NOTE_EXISTS = "phiếu đã có BA note"
+REASON_BA_NOTE_NOT_C = "BA note chỉ dành cho phiếu đầu mục C ở mức L1 trở lên"
+_FEATURE_ANSWER = re.compile(r"[*_\s]*(?:Có|Không)\b")
+# "Nguồn:" inside a line of the feature part, followed by text on that line.
+_INLINE_SOURCE = re.compile(rf"{BA_NOTE_SOURCE}:(?:\*\*)?[ \t]*[^\s*]")
 _REASON_BAD_KIND = f"kind phải là một trong {', '.join(COMMENT_KINDS)}"
 _PCT_UNKNOWN = "chưa có"
 # Runs that already asked their one question (AC-22, A-U4b-12); read and written only by the two functions below.
@@ -520,6 +535,52 @@ def failure_summary(run_id: str) -> str:
 	)
 
 
+def _feature_part(content: str) -> str:
+	"""The 'Tính năng sẵn có' part with its own `**Nguồn:**` line: from its heading to the next `**…:**` heading that
+	is not 'Nguồn'; no such heading → ""."""
+	heading = _heading_line(BA_NOTE_FEATURE).search(content)
+	if heading is None:
+		return ""
+	source_heading = _heading_line(BA_NOTE_SOURCE)
+	for following in _NEXT_HEADING.finditer(content, heading.end()):
+		if not source_heading.match(content, following.start()):
+			return content[heading.end() : following.start()]
+	return content[heading.end() :]
+
+
+def _ba_note_refusal(content: str, ctx: ToolContext) -> dict | None:
+	"""The checks of a kind=ba_note comment before its dedup (U4b-fixes Fix 3): the run's category and the main-path
+	level the runner put in the context (no level is computed here), the confidence line, the five parts, then the
+	feature answer and its source."""
+	level = ctx.grant_inputs().main_path_level
+	if policy.latest_classification(ctx.ticket_name)[0] != BA_NOTE_CATEGORY or level not in LEVELS[1:]:
+		return _fail(REASON_BA_NOTE_NOT_C)
+	if refusal := _confidence_refusal(content):
+		return refusal
+	missing = [section for section in BA_NOTE_SECTIONS if not section_text(content, section)]
+	if missing:
+		return _fail(REASON_BA_NOTE_MISSING.format(sections=", ".join(missing)))
+	feature = _feature_part(content)
+	has_source = section_text(feature, BA_NOTE_SOURCE) or _INLINE_SOURCE.search(feature)
+	if not _FEATURE_ANSWER.match(section_text(content, BA_NOTE_FEATURE)) or not has_source:
+		return _fail(REASON_BA_NOTE_FEATURE)
+	return None
+
+
+def _ba_note_filters(ticket_name: str) -> dict:
+	"""The agent's BA note of the ticket: the marker at position 0; another person's note or an `Info` row never
+	counts."""
+	return {**_agent_comment_filters(ticket_name), "content": ["like", f"{BA_NOTE_MARKER}%"]}
+
+
+def _ba_note_content(content: str) -> str:
+	"""BA_NOTE_MARKER on line 1, then the note without a marker the model already wrote."""
+	body = content.strip()
+	if body.startswith(BA_NOTE_MARKER):
+		body = body[len(BA_NOTE_MARKER) :].lstrip()
+	return f"{BA_NOTE_MARKER}\n{body}"
+
+
 def post_comment_tool(args: dict, ctx: ToolContext) -> dict:
 	"""Handler of the post_comment tool (AC-22, U4b.md:171, w1.md:96): checks the steps in order, then posts; a
 	refusal posts nothing, and in a guidance run a proposal is held for post_guidance instead."""
@@ -539,6 +600,14 @@ def post_comment_tool(args: dict, ctx: ToolContext) -> dict:
 	# Step (3b): once the ticket has its guidance, a comment only reports the work just done (AC-65 (c)).
 	if ctx.run_id in frappe.flags.get(_WORK_ONLY_FLAG, set()) and section_text(content, GUIDANCE_HEADER):
 		return _fail(REASON_GUIDANCE_HEADER)
+	# The BA note (AC-62, w1.md:121): once per ticket, the dedup read is locked_count's; posted on its own, also in a
+	# guidance run, never held for the guidance comment.
+	if kind == "ba_note":
+		if refusal := _ba_note_refusal(content, ctx):
+			return refusal
+		if locked_count(ctx.ticket_name, "Comment", _ba_note_filters(ctx.ticket_name)):
+			return _fail(REASON_BA_NOTE_EXISTS)
+		return _post(ctx.ticket_name, _ba_note_content(content))
 	if kind == "de_xuat" and (outcome := _hold_or_refuse(content, ctx)):
 		return outcome
 	# Steps (4), (5): a question above the threshold needs nothing more.
@@ -656,6 +725,9 @@ TOOLS: list[ToolSpec] = [
 				"kind=de_xuat: nhận định và phương án, hoặc báo việc đã làm; phải có dòng 'Độ tin cậy: NN%'. "
 				"kind=hoi: câu hỏi; khi độ tin cậy dưới ngưỡng chỉ được dùng kind này, một lần, "
 				f"và vẫn phải có '**{EVIDENCE_HEADER}:**' nêu vì sao chưa chắc. "
+				"kind=ba_note: chỉ phiếu đầu mục C, một lần mỗi phiếu; đủ 5 mục **Mục tiêu:**, **Phạm vi:**, "
+				"**Tính năng sẵn có:** (Có/Không, **Nguồn:**), **Rủi ro:**, **Câu hỏi mở:** "
+				"và dòng 'Độ tin cậy: NN%'. "
 				"Không tự liệt kê việc đã làm, đề xuất đang chờ hay việc hệ thống từ chối: "
 				"hệ thống tự thêm chúng vào comment. "
 				"Khi phiếu đã có hướng xử lý: chỉ báo kết quả việc vừa làm."

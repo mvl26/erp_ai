@@ -1,13 +1,14 @@
-"""Knowledge read tools of the `read` group (FEAT-007 U6b, AC-46, AC-47; ADR-034 QĐ 2, 4).
+"""Knowledge read tools of the `read` group (FEAT-007 U6b, AC-46, AC-47, AC-50; ADR-034 QĐ 2, 4).
 
 Every string a tool returns goes through `redact_secrets`; the runner cuts the JSON of each tool result at
-`read.TOOL_RESULT_MAX_CHARS`. `_limits` is the one place this module reads ERP AI Setting.
+`read.TOOL_RESULT_MAX_CHARS`. `_limits` is the one place this module reads ERP AI Setting. No tool here passes
+`ignore_permissions` (ADR-034 Ràng buộc): the Error Log is read by `system_read`, the one permission-free path.
 """
 
 import frappe
-from frappe.utils import cint
+from frappe.utils import cint, get_datetime
 
-from erp_ai.agent import knowledge, policy
+from erp_ai.agent import knowledge, policy, system_read
 from erp_ai.agent.redact import redact_secrets
 from erp_ai.agent.tools import read, source
 from erp_ai.agent.tools.read import _schema
@@ -16,6 +17,7 @@ from erp_ai.constants import SETTING_DOCTYPE
 
 KNOWLEDGE_TOOL_NAMES = frozenset({"search_knowledge_base", "search_manuals", "read_error_logs", "run_report"})
 MANUALS_NOT_CONFIGURED = "chưa có kho HDSD"
+INVALID_TIME = "thời điểm không hợp lệ: {key}"
 ARTICLE_DOCTYPE = "HD Article"
 # ERP AI Setting Int fields (A-13 defaults, the controller's bounds); a value outside them reads the default.
 KNOWLEDGE_SEARCH_LIMIT_DEFAULT, KNOWLEDGE_SEARCH_LIMIT_MAX = 5, 20
@@ -82,6 +84,33 @@ def search_manuals(args: dict, ctx: ToolContext) -> dict:
 	return {"ok": True, "sections": [_masked(row) for row in sections]}
 
 
+def _time(value):
+	"""The naive datetime `value` names, else None (blank, unparsable or with a time zone)."""
+	try:
+		when = get_datetime(value)
+	except (TypeError, ValueError, OverflowError):
+		return None
+	return when if when is not None and when.tzinfo is None else None
+
+
+def read_error_logs(args: dict, ctx: ToolContext) -> dict:
+	"""AC-50: Error Log rows by `system_read.read_error_logs` (window, keyword, limit and masking are its own)."""
+	args = args if isinstance(args, dict) else {}
+	call = {"keyword": args.get("keyword")}
+	if "limit" in args:
+		call["limit"] = args["limit"]
+	for key in ("since", "until"):
+		if args.get(key) is not None:
+			call[key] = _time(args[key])
+			if call[key] is None:
+				return _refuse(INVALID_TIME.format(key=key))
+	try:
+		errors = system_read.read_error_logs(**call)
+	except frappe.ValidationError as exc:
+		return _refuse(str(exc))
+	return {"ok": True, "errors": [_masked(row) for row in errors]}
+
+
 def _query_property() -> dict:
 	return {"type": "string", "minLength": read.QUERY_MIN_CHARS, "maxLength": read.QUERY_MAX_CHARS}
 
@@ -110,5 +139,30 @@ TOOLS: list[ToolSpec] = [
 			["query"],
 		),
 		search_manuals,
+	),
+	ToolSpec(
+		"read_error_logs",
+		"read",
+		_schema(
+			"read_error_logs",
+			"Đọc Error Log của site, mới nhất trước, đã che khóa và mật khẩu. since/until dạng "
+			"'YYYY-MM-DD HH:MM:SS' (mặc định 24 giờ gần nhất, tối đa 7 ngày); keyword lọc theo method hoặc nội dung.",
+			{
+				"since": {"type": "string", "minLength": 1},
+				"until": {"type": "string", "minLength": 1},
+				"keyword": {
+					"type": "string",
+					"minLength": system_read.MIN_KEYWORD_LENGTH,
+					"maxLength": system_read.MAX_KEYWORD_LENGTH,
+				},
+				"limit": {
+					"type": "integer",
+					"minimum": system_read.MIN_LIMIT,
+					"maximum": system_read.MAX_LIMIT,
+				},
+			},
+			[],
+		),
+		read_error_logs,
 	),
 ]

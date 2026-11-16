@@ -8,7 +8,7 @@ from frappe.model.document import Document
 from frappe.tests.utils import FrappeTestCase
 from helpdesk.test_utils import make_ticket
 
-from erp_ai import handlers
+from erp_ai import handlers, hooks
 from erp_ai.agent import answer_delay, queue, runner
 from erp_ai.agent.tools import site_api
 from erp_ai.agent.tools.registry import ToolContext
@@ -1361,3 +1361,32 @@ class TestKbDraftTrigger(HandlerTestCase):
 
 		self.assertEqual(lines, self._skipped(ticket, "kb_exists"))
 		self.assertEqual(len(self._kb_jobs()), 1)
+
+
+# T161 (U6b.md:305-310, U6b-fixes Sửa 14): the hooks of the U6b handlers and the hourly silent-F scan.
+U6B_ON_UPDATE = {
+	"Communication": "erp_ai.handlers.communication_on_update",
+	"Task": "erp_ai.handlers.task_on_update",
+	"HD Ticket": "erp_ai.handlers.ticket_on_update",
+}
+SILENT_F_SCAN = "erp_ai.agent.lifecycle.scan_silent_f_tickets"
+HOURLY_CRON = "0 * * * *"
+
+
+class TestHooksWiring(FrappeTestCase):
+	"""AC-41, AC-43, AC-44: the requester-reply and Task handlers run on `on_update`, the ticket's hook keeps its path,
+	and the hourly cron points straight at the silent-F scan, which migrate made a Scheduled Job Type."""
+
+	def test_u6b_hooks_registered(self):
+		for doctype, path in U6B_ON_UPDATE.items():
+			with self.subTest(doctype):
+				self.assertEqual(hooks.doc_events.get(doctype, {}).get("on_update"), path)
+				self.assertTrue(callable(frappe.get_attr(path)))
+		self.assertIn(SILENT_F_SCAN, hooks.scheduler_events["cron"].get(HOURLY_CRON, []))
+		self.assertTrue(callable(frappe.get_attr(SILENT_F_SCAN)))
+		self.assertEqual(
+			frappe.db.get_value(
+				"Scheduled Job Type", {"method": SILENT_F_SCAN}, ["frequency", "cron_format"]
+			),
+			("Cron", HOURLY_CRON),
+		)

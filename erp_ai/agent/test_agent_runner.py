@@ -3006,6 +3006,8 @@ BASE_TOOL_NAMES_WITH_INSTRUCTOR = [
 	"post_comment",
 	"create_task",
 ]
+# FEAT-007 T155 (AC-46..AC-50): the knowledge read tools every run above L0 now also gets, last in registry order.
+KNOWLEDGE_TOOL_NAMES_IN_ORDER = ["search_knowledge_base", "search_manuals", "read_error_logs", "run_report"]
 CHANGE_TOOL_NAMES = ["propose_file_change", "propose_new_file", "propose_bench_command"]
 
 
@@ -3043,7 +3045,7 @@ class TestRunnerChangeGrant(RunnerTestBase):
 		set_agent_settings(code_change_enabled=0, record_tools_enabled=0)
 		names, system = self._call()
 
-		self.assertEqual(names, BASE_TOOL_NAMES_WITH_INSTRUCTOR)
+		self.assertEqual(names, [*BASE_TOOL_NAMES_WITH_INSTRUCTOR, *KNOWLEDGE_TOOL_NAMES_IN_ORDER])
 		self.assertNotIn("propose_file_change", names)
 		self.assertEqual(system, self._base_system())
 		self.assertNotIn(CHANGE_TOOLS_BLOCK, system[0]["text"])
@@ -3061,7 +3063,7 @@ class TestRunnerChangeGrant(RunnerTestBase):
 		self.assertEqual(made.kwargs["effective_level"], "L1")
 		# the switch is on and an instructor exists: only the lowered level removes the change tools
 		self.assertIs(made.kwargs["change_enabled"], True)
-		self.assertEqual(names, BASE_TOOL_NAMES_WITH_INSTRUCTOR)
+		self.assertEqual(names, [*BASE_TOOL_NAMES_WITH_INSTRUCTOR, *KNOWLEDGE_TOOL_NAMES_IN_ORDER])
 		self.assertFalse(set(CHANGE_TOOL_NAMES) & set(names))
 		self.assertEqual(system, self._base_system())
 		self.assertNotIn(CHANGE_TOOLS_BLOCK, system[0]["text"])
@@ -3073,7 +3075,7 @@ class TestRunnerChangeGrant(RunnerTestBase):
 		self.month_spend.return_value = 10.01
 		names, system = self._call()
 
-		self.assertEqual(names, BASE_TOOL_NAMES_WITH_INSTRUCTOR)
+		self.assertEqual(names, [*BASE_TOOL_NAMES_WITH_INSTRUCTOR, *KNOWLEDGE_TOOL_NAMES_IN_ORDER])
 		self.assertEqual(system, self._base_system())
 		self.assertNotIn(UNRESTRICTED_TOOLS_BLOCK, system[0]["text"])
 		self.assertNotIn(CHANGE_TOOLS_BLOCK, system[0]["text"])

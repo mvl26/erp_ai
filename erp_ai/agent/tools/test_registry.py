@@ -1,6 +1,7 @@
 import dataclasses
 import importlib
 import inspect
+import itertools
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -10,6 +11,7 @@ from helpdesk.test_utils import create_agent, make_ticket
 
 from erp_ai.agent.policy import PermissionSwitches
 from erp_ai.agent.tools import registry, route_ticket
+from erp_ai.agent.tools.knowledge_read import KNOWLEDGE_TOOL_NAMES
 from erp_ai.agent.tools.registry import (
 	ASK_TOOL_NAMES,
 	ToolContext,
@@ -19,7 +21,7 @@ from erp_ai.agent.tools.registry import (
 )
 from erp_ai.agent.tools.source import GIT_SUBCOMMANDS
 from erp_ai.constants import PROPOSAL_DOCTYPE, ROLE_AGENT
-from erp_ai.test_utils import GitSandbox
+from erp_ai.test_utils import GitSandbox, keep_agent_settings
 
 REAL_ALL_SPECS = registry._all_specs
 AGENT_EMAIL = "erpai-test-t27.agent@example.com"
@@ -316,7 +318,8 @@ class TestRegistry(FrappeTestCase):
 				("unrestricted", False),
 			],
 		)
-		# FEAT-007 T76: the grant fields come after `unrestricted`, each with a default.
+		# FEAT-007 T76: the grant fields come after `unrestricted`, each with a default; T155 (U6b.md:142) adds the
+		# reply switch and the KB-draft run after them.
 		self.assertEqual(
 			fields[10:],
 			[
@@ -326,9 +329,11 @@ class TestRegistry(FrappeTestCase):
 				("over_budget", False),
 				("main_path_level", None),
 				("below_threshold", False),
+				("reply_enabled", False),
+				("kb_draft_run", False),
 			],
 		)
-		self.assertEqual(len(fields), 16)
+		self.assertEqual(len(fields), 18)
 
 	def test_grant_functions_take_grant_inputs_without_default(self):
 		for function in (registry.grant, get_tool_schemas):
@@ -409,6 +414,8 @@ CREATED_NOTE = "<note made by api_create_record>"
 CHANGE_TOOL_NAMES = ["propose_file_change", "propose_new_file", "propose_bench_command"]
 SANDBOX_APP = "custom_app"
 SITE_ADMIN_TOOL_NAMES = ["api_list_records", "api_get_record", "api_create_record", "api_update_record"]
+# FEAT-007 T155 (AC-46..AC-50): the knowledge read tools, in registry order; group `read`, so in every grant above L0.
+KNOWLEDGE_NAMES = ["search_knowledge_base", "search_manuals", "read_error_logs", "run_report"]
 FORBIDDEN_WRITE_PARAMETER_WORDS = ("doctype", "field")
 SCHEMA_TYPES = {"string", "integer", "boolean", "array", "object"}
 # Written out by hand, not read from registry.TOOL_MODULES: module -> its tool names, in order.
@@ -431,7 +438,21 @@ TOOLS_BY_MODULE = {
 		"api_submit_record",
 		"api_call_method",
 	],
+	"erp_ai.agent.tools.knowledge_read": [
+		"search_knowledge_base",
+		"search_manuals",
+		"read_error_logs",
+		"run_report",
+	],
+	"erp_ai.agent.tools.reply": ["reply_to_requester"],
+	"erp_ai.agent.tools.kb_draft": ["create_kb_draft"],
 }
+
+
+def _without_knowledge(names):
+	"""`names` in order, less the knowledge read tools (FEAT-007 T155): the U1 and FEAT-006 sets are compared on
+	names - KNOWLEDGE_TOOL_NAMES (AC-46..AC-50 add read tools, NFR-8)."""
+	return [name for name in names if name not in KNOWLEDGE_TOOL_NAMES]
 
 
 class TestRealToolSet(FrappeTestCase):
@@ -453,19 +474,20 @@ class TestRealToolSet(FrappeTestCase):
 		for has_instructor in (False, True):
 			self.assertEqual(self.names("L0", has_instructor), [])
 		for level in ("L1", "L2", "L3"):
-			self.assertEqual(self.names(level, False), granted)
-			self.assertEqual(self.names(level, True), granted + TASK_WRITE_TOOL_NAMES)
-		self.assertEqual(len(registry._all_specs()), 21)
+			self.assertEqual(self.names(level, False), granted + KNOWLEDGE_NAMES)
+			self.assertEqual(self.names(level, True), granted + TASK_WRITE_TOOL_NAMES + KNOWLEDGE_NAMES)
+		self.assertEqual(len(registry._all_specs()), 27)
 
 	def test_tool_modules_register_exactly_the_21_tools(self):
-		# Spec Amendment 2, N-3 items 18-19: 11 base + 3 propose + 4 record + 3 full-power tools.
+		# Spec Amendment 2, N-3 items 18-19: 11 base + 3 propose + 4 record + 3 full-power tools; FEAT-007 T155
+		# (U6b.md:139) adds 4 knowledge read tools, the reply tool and the KB-draft tool: 27.
 		self.assertEqual(registry.TOOL_MODULES, tuple(TOOLS_BY_MODULE))
 		self.assertNotIn("erp_ai.agent.tools.route_ticket", registry.TOOL_MODULES)
 		for module_name, names in TOOLS_BY_MODULE.items():
 			module = importlib.import_module(module_name)
 			self.assertEqual([spec.name for spec in module.TOOLS], names, module_name)
 		expected = [name for names in TOOLS_BY_MODULE.values() for name in names]
-		self.assertEqual(len(expected), 21)
+		self.assertEqual(len(expected), 27)
 		self.assertEqual([spec.name for spec in registry._all_specs()], expected)
 
 	def test_switch_on_adds_site_admin_tools_only_at_l3_with_instructor(self):
@@ -483,7 +505,9 @@ class TestRealToolSet(FrappeTestCase):
 					level, level, has_instructor, PermissionSwitches(record_tools=True, code_change=True)
 				)
 			)
-			self.assertEqual([s["name"] for s in schemas], names, (level, has_instructor))
+			self.assertEqual(
+				[s["name"] for s in schemas], [*names, *KNOWLEDGE_NAMES], (level, has_instructor)
+			)
 
 	def test_switch_off_tool_names_match_base_for_all_levels_and_authority(self):
 		# AC-1: switch off = the exact tool names of the FEAT-006 base, written out as literals.
@@ -512,7 +536,7 @@ class TestRealToolSet(FrappeTestCase):
 		for (level, has_instructor), names in expected.items():
 			inputs = registry.GrantInputs(level, level, has_instructor, PermissionSwitches())
 			schemas = get_tool_schemas(inputs)
-			self.assertEqual([s["name"] for s in schemas], names, (level, has_instructor))
+			self.assertEqual(_without_knowledge(s["name"] for s in schemas), names, (level, has_instructor))
 			self.assertFalse(registry.grant(inputs).change_block, (level, has_instructor))
 
 	def test_no_write_tool_accepts_doctype_or_field(self):
@@ -614,6 +638,12 @@ class TestRealToolsRunWithoutCommit(FrappeTestCase):
 			"api_delete_record": {"doctype": "Note", "name": CREATED_NOTE},
 			"api_submit_record": {"doctype": "Note", "name": CREATED_NOTE, "action": "submit"},
 			"api_call_method": {"method": "frappe.client.get_count", "arguments": {"doctype": "HD Ticket"}},
+			"reply_to_requester": {"message": "ERPAI-TEST-T27 trả lời", "kind": "answer"},
+			"create_kb_draft": {
+				"title": "ERPAI-TEST-T27 bài",
+				"problem": "ERPAI-TEST-T27 máy in kẹt giấy khi in hóa đơn",
+				"resolution_steps": ["ERPAI-TEST-T27 lấy giấy kẹt ra"],
+			},
 		}
 
 	def test_every_real_handler_runs_without_committing(self):
@@ -628,8 +658,18 @@ class TestRealToolsRunWithoutCommit(FrappeTestCase):
 			allowed_apps=(SANDBOX_APP,),
 			unrestricted=True,
 		)
+		# FEAT-007 T155: the reply tool runs with its switch on, the KB-draft tool in its fixed row (read + kb_draft
+		# only); the knowledge read tools need seeded site settings and run in test_knowledge_read, so the real
+		# specs are compared on names - KNOWLEDGE_TOOL_NAMES, as the grant snapshot is.
+		contexts = {
+			"reply_to_requester": dataclasses.replace(context, reply_enabled=True),
+			"create_kb_draft": dataclasses.replace(context, kb_draft_run=True),
+		}
+		# A reply is then a Sent Communication only, with no email to queue; the value rolls back with the test.
+		self.addCleanup(frappe.clear_document_cache, "HD Settings", "HD Settings")
+		frappe.db.set_single_value("HD Settings", "skip_email_workflow", 1)
 		arguments = self.arguments()
-		specs = REAL_ALL_SPECS()
+		specs = [spec for spec in REAL_ALL_SPECS() if spec.name not in KNOWLEDGE_TOOL_NAMES]
 		self.assertEqual(sorted(arguments), sorted(spec.name for spec in specs))
 		frappe.set_user(AGENT_EMAIL)
 		results = {}
@@ -637,7 +677,12 @@ class TestRealToolsRunWithoutCommit(FrappeTestCase):
 			call_arguments = dict(arguments[spec.name])
 			if call_arguments.get("name") == CREATED_NOTE:
 				call_arguments["name"] = results["api_create_record"]["name"]
-			results[spec.name] = execute_tool(spec.name, call_arguments, context)
+			if spec.name == "create_kb_draft":
+				# A draft is written for a closed ticket only.
+				frappe.db.set_value(
+					"HD Ticket", self.ticket, {"status": "Resolved", "status_category": "Resolved"}
+				)
+			results[spec.name] = execute_tool(spec.name, call_arguments, contexts.get(spec.name, context))
 		# The note is deleted before the submit call, so that handler ends at its own "missing record" refusal.
 		self.assertEqual(results.pop("api_submit_record")["reason"], "không tìm thấy bản ghi")
 		for name, result in results.items():
@@ -748,10 +793,11 @@ class TestGrantTable(FrappeTestCase):
 				one_click_approval=True,
 			)
 			with self.subTest(key):
+				# FEAT-007 T155 (U6b.md:451): compared on names - KNOWLEDGE_TOOL_NAMES; AC-46..AC-50 add read tools.
 				granted = registry.grant(registry.GrantInputs(level, level, has_instructor, switches))
-				self.assertEqual([s.name for s in granted.specs], names)
-				self.assertEqual([s["name"] for s in granted.schemas()], names)
-				self.assertEqual(granted.names(), frozenset(names))
+				self.assertEqual(_without_knowledge(s.name for s in granted.specs), names)
+				self.assertEqual(_without_knowledge(s["name"] for s in granted.schemas()), names)
+				self.assertEqual(granted.names() - KNOWLEDGE_TOOL_NAMES, frozenset(names))
 				self.assertIs(granted.change_block, "propose_file_change" in names)
 				# FEAT-007 T77 (U1.md:396): the four block flags; the full-power block replaces the record one.
 				self.assertIs(
@@ -766,7 +812,7 @@ class TestGrantTable(FrappeTestCase):
 					),
 				)
 				self.assertIs(granted.ask_only_block, False)
-				self.assertEqual([s["name"] for s in get_tool_schemas(legacy)], names)
+				self.assertEqual(_without_knowledge(s["name"] for s in get_tool_schemas(legacy)), names)
 
 	def test_unknown_level_grants_like_l0(self):
 		for change_enabled in (False, True):
@@ -794,7 +840,16 @@ class TestGrantTable(FrappeTestCase):
 			self.assertFalse(hasattr(registry, name), name)
 		self.assertEqual(
 			[group for group, _condition in registry.GRANT_TABLE],
-			["read", "ticket_write", "task_write", "change_propose", "site_admin", "site_unrestricted"],
+			[
+				"read",
+				"ticket_write",
+				"task_write",
+				"change_propose",
+				"site_admin",
+				"site_unrestricted",
+				"requester_reply",
+				"kb_draft",
+			],
 		)
 
 	def test_execute_asks_the_one_grant_function(self):
@@ -860,7 +915,8 @@ def _inputs(level="L3", has_instructor=True, main_path_level=None, **switches):
 
 
 def _granted_names(inputs):
-	return [spec.name for spec in registry.grant(inputs).specs]
+	# FEAT-007 T155: the U1 sets of TestGrantFeat007 are compared on names - KNOWLEDGE_TOOL_NAMES.
+	return _without_knowledge(spec.name for spec in registry.grant(inputs).specs)
 
 
 class TestGrantInputs(FrappeTestCase):
@@ -998,7 +1054,9 @@ class TestGrantFeat007(FrappeTestCase):
 	def test_record_on_act_now_off_grants_record_tools_without_act_now_block(self):
 		# AC-6 extra case: (2) on, (3) off -> the record tools and their block, no act-now block.
 		granted = registry.grant(_inputs("L3", True, record_tools=True))
-		self.assertEqual(granted.names(), frozenset([*SNAPSHOT_WITH_TASK, *SNAPSHOT_RECORD]))
+		self.assertEqual(
+			granted.names() - KNOWLEDGE_TOOL_NAMES, frozenset([*SNAPSHOT_WITH_TASK, *SNAPSHOT_RECORD])
+		)
 		self.assertEqual(
 			(
 				granted.record_block,
@@ -1019,7 +1077,9 @@ class TestGrantFeat007(FrappeTestCase):
 		over_budget = registry.grant(
 			dataclasses.replace(_inputs("L3", True, unrestricted=True, record_tools=True), over_budget=True)
 		)
-		self.assertEqual(over_budget.names(), frozenset([*SNAPSHOT_WITH_TASK, *SNAPSHOT_RECORD]))
+		self.assertEqual(
+			over_budget.names() - KNOWLEDGE_TOOL_NAMES, frozenset([*SNAPSHOT_WITH_TASK, *SNAPSHOT_RECORD])
+		)
 		self.assertEqual((over_budget.unrestricted_block, over_budget.record_block), (False, True))
 
 	def test_over_budget_with_all_switches_equals_l1_all_off(self):
@@ -1047,11 +1107,15 @@ class TestGrantFeat007(FrappeTestCase):
 		every_switch = dict.fromkeys(
 			("unrestricted", "record_tools", "act_now", "code_change", "one_click_approval"), True
 		)
-		self.assertEqual(ASK_TOOL_NAMES, frozenset({"post_comment"}))
+		# FEAT-007 T155 (R22b, U6b-fixes Sửa 12): the ask tools are post_comment and reply_to_requester; the reply
+		# switch is off here, so post_comment is the only one granted.
+		self.assertEqual(ASK_TOOL_NAMES, frozenset({"post_comment", "reply_to_requester"}))
 		read_names = [*READ_TOOL_NAMES, *SOURCE_TOOL_NAMES]
 		below = dataclasses.replace(_inputs("L3", True, **every_switch), below_threshold=True)
 		granted = registry.grant(below)
-		self.assertEqual([spec.name for spec in granted.specs], [*read_names, "post_comment"])
+		self.assertEqual(
+			_without_knowledge(spec.name for spec in granted.specs), [*read_names, "post_comment"]
+		)
 		self.assertEqual(
 			(
 				granted.ask_only_block,
@@ -1064,7 +1128,9 @@ class TestGrantFeat007(FrappeTestCase):
 		)
 		with self.subTest("all switches off, no instructor"):
 			plain = registry.grant(dataclasses.replace(_inputs("L1", False), below_threshold=True))
-			self.assertEqual([spec.name for spec in plain.specs], [*read_names, "post_comment"])
+			self.assertEqual(
+				_without_knowledge(spec.name for spec in plain.specs), [*read_names, "post_comment"]
+			)
 			self.assertIs(plain.ask_only_block, True)
 		with self.subTest("not below the threshold"):
 			self.assertIs(registry.grant(_inputs("L3", True, **every_switch)).ask_only_block, False)
@@ -1090,7 +1156,7 @@ class TestGrantFeat007(FrappeTestCase):
 		for has_instructor, expected in ((True, SNAPSHOT_WITH_TASK), (False, SNAPSHOT_BASE)):
 			with self.subTest(has_instructor=has_instructor):
 				granted = registry.grant(_inputs("L1", has_instructor, **switches))
-				self.assertEqual([spec.name for spec in granted.specs], expected)
+				self.assertEqual(_without_knowledge(spec.name for spec in granted.specs), expected)
 				self.assertEqual(
 					(granted.change_block, granted.record_block, granted.unrestricted_block), (False,) * 3
 				)
@@ -1100,10 +1166,136 @@ class TestGrantFeat007(FrappeTestCase):
 		inputs = _inputs("L1", True, unrestricted=True)
 		granted = registry.grant(inputs)
 		self.assertEqual(
-			[spec.name for spec in granted.specs],
+			_without_knowledge(spec.name for spec in granted.specs),
 			[*SNAPSHOT_WITH_TASK, *SNAPSHOT_RECORD, *SNAPSHOT_FULL_POWER],
 		)
 		self.assertIs(granted.unrestricted_block, True)
 		over_budget = registry.grant(dataclasses.replace(inputs, over_budget=True))
-		self.assertEqual([spec.name for spec in over_budget.specs], SNAPSHOT_WITH_TASK)
+		self.assertEqual(_without_knowledge(spec.name for spec in over_budget.specs), SNAPSHOT_WITH_TASK)
 		self.assertIs(over_budget.unrestricted_block, False)
+
+
+EVERY_SWITCH = ("unrestricted", "record_tools", "act_now", "code_change", "one_click_approval")
+# The read group in registry order: the FEAT-006 read and source tools, then the knowledge tools (U6b.md:150).
+READ_GROUP_NAMES = [*READ_TOOL_NAMES, *SOURCE_TOOL_NAMES, *KNOWLEDGE_NAMES]
+
+
+def _knowledge_inputs(level="L3", has_instructor=True, switches=(), **fields):
+	"""GrantInputs with the named switches on and the given U1/U6b fields (below_threshold, reply_enabled, ...)."""
+	return dataclasses.replace(_inputs(level, has_instructor, **dict.fromkeys(switches, True)), **fields)
+
+
+def _switch_sets():
+	"""Every on/off combination of the five permission switches, as tuples of the switches that are on."""
+	return [
+		tuple(switch for switch, on in zip(EVERY_SWITCH, mask, strict=True) if on)
+		for mask in itertools.product((False, True), repeat=len(EVERY_SWITCH))
+	]
+
+
+class TestKnowledgeGrant(FrappeTestCase):
+	"""FEAT-007 T155 (U6b.md:137-159, U6b-fixes Sửa 12): the reply group, the KB-draft fixed row and the ask tools
+	below the threshold, in the one grant table, real specs."""
+
+	def setUp(self):
+		self.addCleanup(frappe.db.rollback)
+		keep_agent_settings(self)
+
+	def test_reply_tool_absent_when_switch_off(self):
+		# AC-40: reply_enabled off -> no reply tool and no reply block, at every level, threshold side and switch set.
+		for level in ("L0", "L1", "L2", "L3"):
+			for has_instructor in (False, True):
+				for below_threshold in (False, True):
+					for switches in ((), EVERY_SWITCH):
+						key = (level, has_instructor, below_threshold, switches)
+						granted = registry.grant(
+							_knowledge_inputs(
+								level,
+								has_instructor,
+								switches,
+								below_threshold=below_threshold,
+								reply_enabled=False,
+							)
+						)
+						self.assertNotIn("reply_to_requester", granted.names(), key)
+						self.assertIs(granted.reply_block, False, key)
+
+	def test_reply_tool_present_when_switch_on(self):
+		# AC-40: reply_enabled on -> the reply tool and its block from L1 to L3, below the threshold too (Sửa 12:
+		# through ASK_TOOL_NAMES); L0 stays empty.
+		for level in ("L1", "L2", "L3"):
+			for has_instructor in (False, True):
+				for below_threshold in (False, True):
+					for switches in ((), EVERY_SWITCH):
+						key = (level, has_instructor, below_threshold, switches)
+						granted = registry.grant(
+							_knowledge_inputs(
+								level,
+								has_instructor,
+								switches,
+								below_threshold=below_threshold,
+								reply_enabled=True,
+							)
+						)
+						self.assertIn("reply_to_requester", granted.names(), key)
+						self.assertIs(granted.reply_block, True, key)
+		at_l0 = registry.grant(_knowledge_inputs("L0", True, EVERY_SWITCH, reply_enabled=True))
+		self.assertEqual(at_l0, registry.Grant(specs=()))
+
+	def test_ask_tools_below_threshold_follow_ask_tool_names(self):
+		# U6b-fixes Sửa 12 (:256-260): below the threshold, L3, every switch on, an instructor.
+		self.assertEqual(ASK_TOOL_NAMES, frozenset({"post_comment", "reply_to_requester"}))
+		cases = {
+			"reply on": ({"reply_enabled": True}, {"post_comment", "reply_to_requester"}),
+			"reply off": ({"reply_enabled": False}, {"post_comment"}),
+		}
+		for case, (fields, asks) in cases.items():
+			with self.subTest(case):
+				granted = registry.grant(
+					_knowledge_inputs("L3", True, EVERY_SWITCH, below_threshold=True, **fields)
+				)
+				self.assertEqual(granted.names(), frozenset(READ_GROUP_NAMES) | asks)
+				self.assertIs(granted.ask_only_block, True)
+		with self.subTest("KB-draft run"):
+			kb = registry.grant(
+				_knowledge_inputs(
+					"L3", True, EVERY_SWITCH, below_threshold=True, reply_enabled=True, kb_draft_run=True
+				)
+			)
+			self.assertEqual(kb.names() & ASK_TOOL_NAMES, frozenset())
+			self.assertIs(kb.ask_only_block, False)
+		with self.subTest("the reply tool below the threshold comes from ASK_TOOL_NAMES"):
+			with patch.object(registry, "ASK_TOOL_NAMES", frozenset({"post_comment"})):
+				granted = registry.grant(
+					_knowledge_inputs("L3", True, EVERY_SWITCH, below_threshold=True, reply_enabled=True)
+				)
+			self.assertEqual(granted.names(), frozenset([*READ_GROUP_NAMES, "post_comment"]))
+
+	def test_kb_draft_fixed_row(self):
+		# AC-45, ADR-033 QĐ 3: kb_draft_run -> exactly read + create_kb_draft, every flag off, whatever the switches,
+		# the authority, the reply switch or the threshold side; L0 stays empty.
+		expected = [*READ_GROUP_NAMES, "create_kb_draft"]
+		for level in ("L1", "L2", "L3"):
+			for has_instructor in (False, True):
+				for switches in _switch_sets():
+					for reply_enabled in (False, True):
+						for below_threshold in (False, True):
+							key = (level, has_instructor, switches, reply_enabled, below_threshold)
+							granted = registry.grant(
+								_knowledge_inputs(
+									level,
+									has_instructor,
+									switches,
+									below_threshold=below_threshold,
+									reply_enabled=reply_enabled,
+									kb_draft_run=True,
+								)
+							)
+							self.assertEqual([spec.name for spec in granted.specs], expected, key)
+							self.assertEqual(
+								dataclasses.replace(granted, specs=()), registry.Grant(specs=()), key
+							)
+		at_l0 = registry.grant(_knowledge_inputs("L0", True, EVERY_SWITCH, kb_draft_run=True))
+		self.assertEqual(at_l0, registry.Grant(specs=()))
+		without = registry.grant(_knowledge_inputs("L3", True, EVERY_SWITCH, kb_draft_run=False))
+		self.assertNotIn("create_kb_draft", without.names())

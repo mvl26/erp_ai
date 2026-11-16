@@ -28,6 +28,11 @@ LABEL_TABLE = {
 	"set_resolution_hint": "ghi hướng giải quyết",
 	"post_comment": "viết trả lời",
 	"create_task": "tạo task",
+	# FEAT-007 T155 (R22a): the knowledge read tools every grant above L0 now holds.
+	"search_knowledge_base": "tìm bài CSKT",
+	"search_manuals": "tìm trong HDSD",
+	"read_error_logs": "đọc nhật ký lỗi",
+	"run_report": "xem báo cáo",
 	"classify": "phân loại phiếu",
 }
 

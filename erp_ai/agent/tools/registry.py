@@ -111,6 +111,9 @@ TOOL_MODULES = (
 	"erp_ai.agent.tools.kb_draft",
 )
 SAVEPOINT = "erp_ai_tool"
+# MariaDB ER_SP_DOES_NOT_EXIST: a COMMIT inside a tool (Frappe's own in `updatedb` when a Custom Field is saved, a
+# controller's commit) dropped every savepoint and kept every write before it (ADR-024 QĐ 5).
+SAVEPOINT_GONE = 1305
 KEY_REASON_MAX = 100  # model-supplied argument names are cut so reason stays short
 CHANGE_GROUP = "change_propose"
 SITE_ADMIN_GROUP = "site_admin"
@@ -269,6 +272,32 @@ def _first_invalid_key(arguments, input_schema: dict) -> str | None:
 	return None
 
 
+def _savepoint_gone(exc: Exception) -> bool:
+	return bool(getattr(exc, "args", None)) and exc.args[0] == SAVEPOINT_GONE
+
+
+def release_savepoint(name: str) -> bool:
+	"""Release savepoint `name`; False when a commit inside the tool already dropped it."""
+	try:
+		frappe.db.release_savepoint(name)
+	except Exception as exc:
+		if not _savepoint_gone(exc):
+			raise
+		return False
+	return True
+
+
+def rollback_to_savepoint(name: str) -> bool:
+	"""Undo back to savepoint `name`; False when a commit inside the tool already dropped it: nothing was undone."""
+	try:
+		frappe.db.rollback(save_point=name)
+	except Exception as exc:
+		if not _savepoint_gone(exc):
+			raise
+		return False
+	return True
+
+
 def execute_tool(name: str, arguments: dict, context: ToolContext) -> dict:
 	granted = grant(context.grant_inputs()).specs
 	spec = next((s for s in granted if s.name == name), None)
@@ -281,7 +310,8 @@ def execute_tool(name: str, arguments: dict, context: ToolContext) -> dict:
 	try:
 		result = spec.handler(arguments, context)
 	except Exception:
-		frappe.db.rollback(save_point=SAVEPOINT)
+		# a commit inside the handler leaves nothing to undo; the handler's own error goes on either way
+		rollback_to_savepoint(SAVEPOINT)
 		raise
-	frappe.db.release_savepoint(SAVEPOINT)
+	release_savepoint(SAVEPOINT)
 	return result

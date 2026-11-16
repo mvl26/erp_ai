@@ -15,7 +15,7 @@ from frappe.utils import cint, strip_html
 
 from erp_ai.agent import policy
 from erp_ai.agent.tools import read
-from erp_ai.agent.tools.registry import ToolContext, ToolSpec
+from erp_ai.agent.tools.registry import ToolContext, ToolSpec, release_savepoint, rollback_to_savepoint
 from erp_ai.constants import AGENT_USER, ROLE_AGENT, ROLE_INSTRUCTOR
 
 GROUP = "site_admin"
@@ -113,6 +113,11 @@ FILTER_OPERATORS = frozenset({"=", "!=", "like", "not like", "in", "not in", ">"
 REASON_MAX = 300
 TITLE_WRITE_FAILED = "erp_ai: công cụ bản ghi lưu lỗi"
 UNEXPECTED_ERROR_REASON = "lỗi hệ thống khi lưu, không có gì thay đổi"
+# A commit inside the save (Frappe commits around the ALTER of a Custom Field) kept part of the write before the error.
+PARTLY_KEPT_REASON = (
+	"hệ thống báo lỗi sau khi đã lưu một phần (lệnh đổi cấu trúc bảng tự commit), không hoàn tác được; "
+	"đọc lại bản ghi trước khi làm tiếp"
+)
 DOCTYPE_ECHO_MAX = 80
 DEFAULT_LIMIT = 20
 MAX_LIMIT = 50
@@ -414,25 +419,20 @@ def _snapshot(doc, fields) -> dict:
 
 def _write(doctype: str, save) -> dict:
 	"""Run `save` (returns the name, the value before, the value after and the full snapshot or None) in its own
-	savepoint; a refused write leaves nothing behind and carries no snapshot."""
+	savepoint; a refused write leaves nothing behind and carries no snapshot. A commit inside the save (Frappe's
+	`updatedb` when a Custom Field is saved) kept the write: `committed` says so, and an error after it can no
+	longer be undone."""
 	frappe.db.savepoint(SAVEPOINT)
 	try:
 		name, value_before, value_after, snapshot = save()
-	except frappe.PermissionError:
-		frappe.db.rollback(save_point=SAVEPOINT)
-		return _fail("thiếu quyền trên DocType hoặc bản ghi này", doctype)
-	except frappe.ValidationError as exc:
-		frappe.db.rollback(save_point=SAVEPOINT)
-		detail = strip_html(str(exc)).strip() or type(exc).__name__
-		return _fail(f"hệ thống từ chối: {detail}", doctype)
 	except Exception as exc:
-		# DuplicateEntryError, TypeError, hook errors: undo the partial write; only the error type reaches Error Log.
-		frappe.db.rollback(save_point=SAVEPOINT)
-		frappe.log_error(TITLE_WRITE_FAILED, f"site_api doctype={doctype} error={type(exc).__name__}")
-		if isinstance(exc, frappe.DuplicateEntryError):
-			return _fail("đã có bản ghi cùng tên", doctype)
-		return _fail(UNEXPECTED_ERROR_REASON, doctype)
-	frappe.db.release_savepoint(SAVEPOINT)
+		if not rollback_to_savepoint(SAVEPOINT):
+			frappe.log_error(
+				TITLE_WRITE_FAILED, f"site_api doctype={doctype} error={type(exc).__name__} committed=1"
+			)
+			return {**_fail(PARTLY_KEPT_REASON, doctype), "committed": True}
+		return _refusal(doctype, exc)
+	committed = not release_savepoint(SAVEPOINT)
 	result = {
 		"ok": True,
 		"doctype": doctype,
@@ -440,9 +440,25 @@ def _write(doctype: str, save) -> dict:
 		"value_before": value_before,
 		"value_after": value_after,
 	}
+	if committed:
+		result["committed"] = True
 	if snapshot is not None:
 		result["_snapshot"] = snapshot
 	return result
+
+
+def _refusal(doctype: str, exc: Exception) -> dict:
+	"""What the tool says of a save that failed and was undone."""
+	if isinstance(exc, frappe.PermissionError):
+		return _fail("thiếu quyền trên DocType hoặc bản ghi này", doctype)
+	if isinstance(exc, frappe.ValidationError):
+		detail = strip_html(str(exc)).strip() or type(exc).__name__
+		return _fail(f"hệ thống từ chối: {detail}", doctype)
+	# DuplicateEntryError, TypeError, hook errors: only the error type reaches Error Log.
+	frappe.log_error(TITLE_WRITE_FAILED, f"site_api doctype={doctype} error={type(exc).__name__}")
+	if isinstance(exc, frappe.DuplicateEntryError):
+		return _fail("đã có bản ghi cùng tên", doctype)
+	return _fail(UNEXPECTED_ERROR_REASON, doctype)
 
 
 def _snapshot_fields(doctype: str, values: dict) -> tuple:

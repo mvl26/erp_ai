@@ -3,14 +3,21 @@ from datetime import datetime, timedelta
 from unittest.mock import call, patch
 
 import frappe
+from frappe.desk.form import assign_to
 from frappe.tests.utils import FrappeTestCase
 from frappe.utils.file_lock import LockTimeoutError
 from helpdesk.test_utils import make_ticket
 
-from erp_ai.agent import daily_report, lifecycle, runner
+from erp_ai.agent import daily_report, due_checks, lifecycle, runner
 from erp_ai.agent.ops_data import BA_NOTE_MARKER
 from erp_ai.constants import AGENT_USER, LOG_DOCTYPE, LOGGER_NAME, SETTING_DOCTYPE
-from erp_ai.test_utils import keep_agent_settings, make_routing_rules, set_agent_settings
+from erp_ai.test_utils import (
+	keep_agent_settings,
+	make_active_agent,
+	make_routing_rules,
+	pin_agent_roles,
+	set_agent_settings,
+)
 
 # Anchors long before any real ticket on the shared site, one per test, so "open" and "created in the
 # window" see only the tickets a test makes.
@@ -19,6 +26,7 @@ ANCHOR_DE = datetime(2002, 4, 8, 8, 0)
 ANCHOR_HOURS = datetime(2002, 5, 6, 8, 0)
 ANCHOR_BOT = datetime(2002, 6, 4, 8, 0)
 ANCHOR_BOT_KINDS = datetime(2002, 7, 2, 8, 0)
+ANCHOR_MATCH = datetime(2002, 8, 6, 8, 0)
 REPORT_KEYS = {
 	"new_by_category_priority",
 	"new_list",
@@ -252,6 +260,66 @@ class TestBuild(FrappeTestCase):
 			for row in result[key]:
 				if row["name"] in mine:
 					self.assertIn("subject", row, key)
+
+	def test_missing_lists_match_due_checks(self):
+		# AC-58 "có trong báo cáo": one fixture, one moment; the report's four lists are the tickets the reminder job
+		# reminds (both read ops_data). C, D, E tickets only: the report lists the deadlines of every category while
+		# the job reminds D and E, and the job never checks the BA note of an excluded C (A-U5b-4).
+		anchor = ANCHOR_MATCH
+		pin_agent_roles(self)
+		self.addCleanup(frappe.set_user, "Administrator")
+		set_agent_settings(enabled=1, permission_level="L2", excluded_teams="", excluded_title_prefixes="")
+		frappe.db.value_cache.pop(SETTING_DOCTYPE, None)
+		person = make_active_agent(self)
+		t = {
+			"d_due_soon": _ticket(
+				"d_due_soon", anchor - timedelta(hours=1), "D", **{DUE_FIELD: anchor + timedelta(hours=2)}
+			),
+			"e_overdue": _ticket(
+				"e_overdue", anchor - timedelta(hours=2), "E", resolution_by=anchor - timedelta(hours=1)
+			),
+			"e_due_later": _ticket(
+				"e_due_later", anchor - timedelta(hours=2), "E", resolution_by=anchor + timedelta(hours=30)
+			),
+			"c_24h": _ticket("c_24h", anchor - timedelta(hours=24), "C"),
+			"c_23h": _ticket("c_23h", anchor - timedelta(hours=23), "C"),
+			"c_noted_with_task": _ticket("c_noted_with_task", anchor - timedelta(days=4), "C"),
+			"d_72h": _ticket("d_72h", anchor - timedelta(days=3), "D"),
+			# excluded, one person in charge: due soon and past its Task mark, reminded by coded notices
+			"d_excluded": _ticket(
+				"d_excluded",
+				anchor - timedelta(days=3),
+				"D",
+				ai_opt_out=1,
+				**{DUE_FIELD: anchor + timedelta(hours=5)},
+			),
+		}
+		_comment(t["c_noted_with_task"], AGENT_USER, f"{BA_NOTE_MARKER}\nPhân tích nghiệp vụ")
+		_task(t["c_noted_with_task"])
+		assign_to.add({"assign_to": [person], "doctype": "HD Ticket", "name": t["d_excluded"]})
+		mine = set(t.values())
+
+		report = daily_report.build_daily_report(anchor)
+		due_checks.run_due_checks(anchor)
+		frappe.set_user("Administrator")
+
+		reminded = due_checks.sent_keys(sorted(mine))
+		kinds = {
+			"due_soon": "due_soon",
+			"overdue": "overdue",
+			"c_missing_ba_note": "ba_note_missing",
+			"cd_missing_task": "task_missing",
+		}
+		for key, kind in kinds.items():
+			with self.subTest(key=key):
+				self.assertEqual(
+					set(_names(report[key], mine)), {ticket for ticket, sent, _ in reminded if sent == kind}
+				)
+		# and none of the four lists is empty
+		self.assertEqual(set(_names(report["due_soon"], mine)), {t["d_due_soon"], t["d_excluded"]})
+		self.assertEqual(_names(report["overdue"], mine), [t["e_overdue"]])
+		self.assertEqual(_names(report["c_missing_ba_note"], mine), [t["c_24h"]])
+		self.assertEqual(set(_names(report["cd_missing_task"], mine)), {t["d_72h"], t["d_excluded"]})
 
 	def test_excluded_ticket_number_only_in_every_list(self):
 		anchor = ANCHOR_TWELVE

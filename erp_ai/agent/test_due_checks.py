@@ -8,6 +8,7 @@ from frappe.tests.utils import FrappeTestCase
 from helpdesk.test_utils import make_ticket
 
 from erp_ai.agent import due_checks, run_log
+from erp_ai.agent.ops_data import BA_NOTE_MARKER
 from erp_ai.constants import AGENT_USER, LOG_DOCTYPE, LOGGER_NAME, SETTING_DOCTYPE
 from erp_ai.test_utils import (
 	keep_agent_settings,
@@ -142,6 +143,29 @@ def _notices(ticket: str) -> list:
 		fields=["name", "for_user", "subject", "type"],
 		order_by="creation asc",
 	)
+
+
+def _comment(ticket: str, owner: str, content: str) -> None:
+	"""A ticket comment by `owner`, inserted straight into the database."""
+	doc = frappe.get_doc(
+		{
+			"doctype": "Comment",
+			"comment_type": "Comment",
+			"reference_doctype": TICKET,
+			"reference_name": ticket,
+			"content": content,
+		}
+	)
+	doc.db_insert()
+	frappe.db.set_value("Comment", doc.name, "owner", owner, update_modified=False)
+
+
+def _task(ticket: str) -> None:
+	frappe.get_doc({"doctype": "Task", "subject": "ERPAI-TEST due", "ai_ticket": ticket}).db_insert()
+
+
+def _sent_kinds(ticket: str) -> set[str]:
+	return {kind for _, kind, _ in due_checks.sent_keys([ticket])}
 
 
 SEED_DOCTYPES = ("Notification Log", LOG_DOCTYPE, "Error Log", "Email Queue")
@@ -530,9 +554,84 @@ class TestGates(DueChecksTestCase):
 				self.assertEqual(get_logger.return_value.method_calls[0][0], "info")
 
 
-class TestMilestones(FrappeTestCase):
-	def setUp(self):
-		keep_agent_settings(self)
+class TestMilestones(DueChecksTestCase):
+	def test_ba_note_23h_24h_with_and_without(self):
+		c_23h = _ticket("C", NOW - timedelta(hours=23, minutes=59))
+		c_24h = _ticket("C", NOW - timedelta(hours=24))
+		c_noted = _ticket("C", NOW - timedelta(hours=30))
+		_comment(c_noted, AGENT_USER, f"{BA_NOTE_MARKER}\nPhân tích nghiệp vụ")
+
+		self._run(NOW)
+
+		self.assertEqual(due_checks.sent_keys([c_23h, c_noted]), set())
+		self.assertEqual(due_checks.sent_keys([c_24h]), {(c_24h, "ba_note_missing", "")})
+		self.assertEqual(
+			[row.content for row in _agent_comments(c_24h)],
+			[due_checks.BA_NOTE_TEXT.format(hours=24, people=due_checks.NO_ASSIGNEE_TEXT)],
+		)
+		self.assertEqual(_agent_comments(c_23h), [])
+		self.assertEqual(len(_agent_comments(c_noted)), 1)  # its BA note only
+		entry = json.loads(_bot_rows(c_24h)[0].actions)[0]
+		self.assertEqual(
+			(entry["tool"], entry["doctype"], entry["value_after"]),
+			("milestone_reminder", "Comment", {"kind": "ba_note_missing", "assignees": []}),
+		)
+
+	def test_task_71h_72h_with_and_without(self):
+		# a C ticket at 72 h also misses its BA note (24 h): only its Task reminder is looked at here
+		for category in ("C", "D"):
+			with self.subTest(category=category):
+				young = _ticket(category, NOW - timedelta(hours=71, minutes=59))
+				due = _ticket(category, NOW - timedelta(hours=72))
+				with_task = _ticket(category, NOW - timedelta(hours=80))
+				_task(with_task)
+
+				self._run(NOW)
+
+				self.assertNotIn("task_missing", _sent_kinds(young))
+				self.assertIn("task_missing", _sent_kinds(due))
+				self.assertNotIn("task_missing", _sent_kinds(with_task))
+				task_texts = [
+					row.content
+					for row in _agent_comments(due)
+					if row.content.startswith("Nhắc mốc: phiếu đã quá")
+				]
+				self.assertEqual(
+					task_texts, [due_checks.TASK_TEXT.format(days=3, people=due_checks.NO_ASSIGNEE_TEXT)]
+				)
+
+	def test_human_comment_with_marker_not_ba_note(self):
+		ticket = _ticket("C", NOW - timedelta(hours=24))
+		_comment(ticket, make_active_agent(self), f"{BA_NOTE_MARKER}\nghi chú của người")
+
+		self._run(NOW)
+
+		self.assertEqual(due_checks.sent_keys([ticket]), {(ticket, "ba_note_missing", "")})
+
+	def test_excluded_c_no_ba_note_check_task_by_code(self):
+		ticket = _ticket("C", NOW - timedelta(hours=72), agent_group=self._excluded_team())
+		person = make_active_agent(self)
+		_assign(ticket, person)
+
+		self._run(NOW)
+
+		self.assertEqual(_agent_comments(ticket), [])
+		self.assertEqual(due_checks.sent_keys([ticket]), {(ticket, "task_missing", "")})
+		notices = _notices(ticket)
+		self.assertEqual(
+			[(row.for_user, row.subject) for row in notices],
+			[(person, f"Phiếu #{ticket}: quá 3 ngày chưa có Task liên kết")],
+		)
+		entry = json.loads(_bot_rows(ticket)[0].actions)[0]
+		self.assertEqual(
+			(entry["tool"], entry["doctype"], entry["name"], entry["value_after"]),
+			(
+				"milestone_reminder",
+				"Notification Log",
+				notices[0].name,
+				{"kind": "task_missing", "assignees": [person], "by_code": True},
+			),
+		)
 
 	def test_milestone_due_boundary(self):
 		cases = (

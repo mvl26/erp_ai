@@ -2,7 +2,13 @@ import json
 
 from frappe.utils import strip_html
 
-from erp_ai.constants import CATEGORIES, TRIGGER_COMMENT_MENTION, TRIGGER_KB_DRAFT, TRIGGER_REQUESTER_REPLY
+from erp_ai.constants import (
+	CATEGORIES,
+	TRIGGER_COMMENT_MENTION,
+	TRIGGER_KB_DRAFT,
+	TRIGGER_REQUESTER_REPLY,
+	TRIGGER_TICKET_INSERT,
+)
 
 DESCRIPTION_MAX_CHARS = 6000
 COMMENT_MAX_CHARS = 2000
@@ -337,6 +343,13 @@ TASK_BY_TRIGGER = {
 	TRIGGER_REQUESTER_REPLY: TASK_REQUESTER_REPLY,
 	TRIGGER_KB_DRAFT: TASK_KB_DRAFT,
 }
+# AC-62 (U4b-fixes.md:186): joined for a C ticket on the ticket-creation and @ai runs only; kb_draft,
+# requester_reply and change_action runs never get it (the prompt follows the grant, ADR-030 QĐ 3).
+TASK_CATEGORY_C = (
+	"Phiếu đầu mục C: tìm tính năng sẵn có bằng search_source trước, rồi đăng BA note bằng post_comment kind = "
+	"ba_note (một lần mỗi phiếu). Nếu có tool create_task, tách việc thành các Task, mỗi Task có ước lượng giờ."
+)
+CATEGORY_HINT_TRIGGERS = (TRIGGER_TICKET_INSERT, TRIGGER_COMMENT_MENTION)
 # w1.md:100 (U4b-10): the ticket already has the bot's guidance comment (a fact of the ticket, not configuration).
 TASK_AFTER_GUIDANCE = (
 	"Phiếu đã có comment Hướng xử lý của bot. Chỉ làm việc người vừa nhờ và báo kết quả; "
@@ -549,6 +562,8 @@ def build_initial_message(
 	if fields := _field_values(ticket_fields or {}):
 		payload["ticket"]["fields"] = fields
 	task = TASK_BY_TRIGGER.get(trigger, TASK_NEW_TICKET)
+	if trigger in CATEGORY_HINT_TRIGGERS and (classification or {}).get("category") == "C":
+		task += "\n" + TASK_CATEGORY_C
 	if guidance_posted:
 		payload["ticket"]["guidance_posted"] = True
 		task += "\n" + TASK_AFTER_GUIDANCE

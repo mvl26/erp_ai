@@ -1,6 +1,8 @@
 import dataclasses
+import html
 import json
 import re
+import unicodedata
 from datetime import datetime
 
 import frappe
@@ -264,19 +266,32 @@ def _heading_line(header: str) -> re.Pattern:
 	return re.compile(rf"^[ \t]*(?:\*\*)?{re.escape(header)}:(?:\*\*)?", re.M)
 
 
-def _bold_heading_line(headers: tuple[str, ...]) -> re.Pattern:
-	"""A line opening, after any opening tags such as `<p>`, with one of `headers` in bold: `**<header>:**` or
-	`<strong><header>:</strong>`, the colon inside the bold or right after it, case and spaces ignored."""
-	names = "|".join(r"\s*".join(map(re.escape, header.split())) for header in headers)
-	bold_open, bold_close = r"(?:\*\*|<strong\b[^>]*>)", r"(?:\*\*|</strong\s*>)"
-	return re.compile(
-		rf"^[ \t]*(?:<[a-z][^>]*>\s*)*{bold_open}\s*(?:{names})\s*(?::\s*{bold_close}|{bold_close}\s*:)",
-		re.M | re.I,
+_BLOCK_TAG = re.compile(r"<\s*/?\s*(?:p|br|div|li|ul|ol|h[1-6]|tr|blockquote|pre)\b[^>]*>", re.I)
+_ANY_TAG = re.compile(r"<[^>]*>")
+_SYSTEM_WORDS = tuple(
+	unicodedata.normalize("NFC", word).casefold() for word in (SECTION_DONE, SECTION_PENDING)
+)
+
+
+def _normalised_lines(text: str):
+	"""Each line of `text` as a reader sees it: block tags end a line, other tags go, entities are unescaped, no-break
+	and zero-width characters become spaces or vanish, emphasis marks (`*`, `_`, `#`) go, spaces collapse, NFC, casefold."""
+	text = _BLOCK_TAG.sub("\n", text)
+	text = html.unescape(_ANY_TAG.sub("", text))
+	text = "".join(ch for ch in text if unicodedata.category(ch) != "Cf")
+	for line in text.split("\n"):
+		line = re.sub(r"[*_#]", "", line)
+		yield re.sub(r"\s+", " ", unicodedata.normalize("NFC", line)).strip().casefold()
+
+
+def opens_system_section(text: str) -> bool:
+	"""True when a line of `text` is, once normalised, "Đã làm" or "Chờ duyệt" alone or followed by a colon; the
+	words in the middle of a sentence do not count (C8-fix1 R13c)."""
+	return any(
+		line == word or line.startswith((f"{word}:", f"{word} :"))
+		for line in _normalised_lines(text)
+		for word in _SYSTEM_WORDS
 	)
-
-
-# The sections only the system writes (AC-66, AC-67): the model's text never opens one (C7-fix1 R13a).
-_SYSTEM_HEADING = _bold_heading_line((SECTION_DONE, SECTION_PENDING))
 
 
 def section_text(content: str, header: str) -> str | None:
@@ -503,7 +518,7 @@ def post_comment_tool(args: dict, ctx: ToolContext) -> dict:
 	if _GUIDANCE_KEY in re.sub(r"\s+", "", content).lower():
 		return _fail(REASON_MARKER)
 	# Step (0b): "Đã làm" and "Chờ duyệt" are the system's, in every kind and in a held analysis (AC-66, AC-67).
-	if _SYSTEM_HEADING.search(content):
+	if opens_system_section(content):
 		return _fail(REASON_SYSTEM_SECTION)
 	if kind not in COMMENT_KINDS:
 		return _fail(_REASON_BAD_KIND)

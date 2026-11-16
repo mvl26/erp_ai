@@ -22,6 +22,7 @@ from erp_ai.agent.classification import DEFAULT_CATEGORY_MAPPING
 from erp_ai.agent.prompts import (
 	ACT_NOW_BLOCK,
 	CHANGE_TOOLS_BLOCK,
+	LATER_MESSAGES_LABEL,
 	SITE_ADMIN_TOOLS_BLOCK,
 	TASK_COMMENT,
 	TASK_NEW_TICKET,
@@ -4565,3 +4566,148 @@ class TestOneGuidance(RunnerTestBase):
 		(last,) = self._entries(entry_type="reason")
 		(posted,) = json.loads(last.actions)
 		self.assertEqual((posted["tool"], posted["ok"]), ("post_routing_comment", True))
+
+	# T113: the run after a question below the threshold classifies again (ADR-037 QĐ 1-3)
+
+	def test_chain_3_low_confidence_reply_then_guidance(self):
+		# AC-65 (b), chain 3: 69 → one question, no guidance; the person answers; 75 → the guidance
+		self.latest_classification.side_effect = self.real_latest_classification
+		earlier = f"{PREFIX}comment trước lần phân loại"
+		self.ticket.new_comment(earlier)
+		self.gateway.results = [classify_at(69), make_model_result()]
+		self._run()
+		self.assertEqual(self._guidance(), 0)
+
+		reply = f"{PREFIX}máy in ở kho 2, phiếu xuất PX-01"
+		self.ticket.new_comment(reply)
+		self.gateway.calls.clear()
+		self.gateway.results = [classify_at(75), make_model_result()]
+		self._run("comment_mention")
+
+		self.assertEqual([call["task"] for call in self.gateway.calls], ["classify", "reason"])
+		self.assertEqual(self._guidance(), 1)
+		questions = frappe.get_all(
+			"Comment",
+			filters={
+				**authority.ticket_comment_filters(self.ticket.name),
+				"content": ["like", f"{write_ticket.NOTICE_PREFIXES['ask_fallback']}%"],
+			},
+		)
+		self.assertEqual(len(questions), 1)
+		first, second = self._entries(entry_type="classify")
+		self.assertEqual((first.predicted_confidence_pct, second.predicted_confidence_pct), (69, 75))
+		self.assertEqual((first.applied, second.applied), (0, 1))
+		# the same request builder, with the message that came after the first classification as data (ADR-037 QĐ 2)
+		content = self.gateway.calls[0]["messages"][0]["content"]
+		self.assertIn(f"{LATER_MESSAGES_LABEL}\n- {reply}", content)
+		self.assertNotIn(earlier, content)
+
+
+class TestReclassify(RunnerTestBase):
+	"""ADR-037 QĐ 1-3, 6 (T113, AD3-1): a later run classifies again only when the ticket's latest classification is
+	below the threshold for this run, the run is above L0 and the ticket has a classification; one call more at most."""
+
+	def setUp(self):
+		super().setUp()
+		keep_agent_settings(self)
+		set_agent_settings(
+			permission_level="L1",
+			level_cap_a="L1",
+			act_now_enabled=0,
+			code_change_enabled=0,
+			record_tools_enabled=0,
+			unrestricted_enabled=0,
+			monthly_budget_usd=1000,
+			max_runs_per_ticket_per_day=10,
+			confidence_threshold=policy.DEFAULT_CONFIDENCE_THRESHOLD,
+		)
+		self.latest_classification.side_effect = self.real_latest_classification
+		log_error = patch.object(frappe, "log_error")
+		self.log_error = log_error.start()
+		self.addCleanup(log_error.stop)
+		sla = patch.object(runner.site_facts, "applied_sla", return_value=NO_LAG_SLA)
+		sla.start()
+		self.addCleanup(sla.stop)
+
+	def _seed_classification(self, pct):
+		write_entry(
+			ticket=self.ticket.name,
+			run_id=f"{PREFIX}seed-{frappe.generate_hash(length=8)}",
+			entry_type="classify",
+			trigger="ticket_insert",
+			turn=0,
+			predicted_category="A",
+			predicted_confidence_pct=pct,
+		)
+
+	def _tasks(self):
+		return [call["task"] for call in self.gateway.calls]
+
+	def test_still_below_asks_again_no_route(self):
+		self._seed_classification(69)
+		self.gateway.results = [classify_at(69), make_model_result()]
+		with patch.object(runner, "_route", wraps=runner._route) as route:
+			self._run("comment_mention")
+
+		self.assertEqual(self._tasks(), ["classify", "reason"])
+		route.assert_not_called()
+		self.assertEqual(write_ticket.count_guidance(self.ticket.name), 0)
+		(question,) = frappe.get_all(
+			"Comment", filters=authority.ticket_comment_filters(self.ticket.name), pluck="content"
+		)
+		self.assertTrue(question.startswith(write_ticket.NOTICE_PREFIXES["ask_fallback"]))
+		(seed, again) = self._entries(entry_type="classify")
+		self.assertEqual((again.predicted_confidence_pct, again.applied), (69, 0))
+		(reason,) = self._entries(entry_type="reason")
+		self.assertEqual(again.run_id, reason.run_id)
+
+	def test_latest_at_threshold_makes_no_classify_call(self):
+		self._seed_classification(policy.DEFAULT_CONFIDENCE_THRESHOLD)
+		self.gateway.results = [make_model_result()]
+		self._run("comment_mention")
+
+		self.assertEqual(self._tasks(), ["reason"])
+		self.assertEqual(len(self._entries(entry_type="classify")), 1)
+
+	def test_level_l0_makes_no_classify_call(self):
+		self._seed_classification(50)
+		set_agent_settings(permission_level="L0")
+		for trigger in ("comment_mention", "change_action"):
+			with self.subTest(trigger):
+				self.gateway.results = [classify_at(90), make_model_result()]
+				self._run(trigger)
+				self.assertEqual(self._tasks(), [])
+		self.assertEqual(len(self._entries(entry_type="classify")), 1)
+
+	def test_no_classification_yet_makes_no_classify_call(self):
+		# the ticket has no classify row with a result: nothing to classify again (ADR-037 QĐ 1, third condition)
+		self.gateway.results = [make_model_result()]
+		self._run("comment_mention")
+
+		self.assertEqual(self._tasks(), ["reason"])
+
+	def test_instructor_with_act_now_not_reclassified(self):
+		self._seed_classification(50)
+		set_agent_settings(act_now_enabled=1)
+		self.gateway.results = [make_model_result()]
+		with patch.object(authority, "run_instructor", return_value="Administrator"):
+			self._run("comment_mention")
+
+		self.assertEqual(self._tasks(), ["reason"])
+
+	def test_one_classify_plus_max_turns_and_runs_today_plus_one(self):
+		# NFR-2, ADR-037 QĐ 6: one classify call more, the same run_id, at most max_turns reasoning turns
+		self._seed_classification(50)
+		set_agent_settings(max_turns_per_run=2)
+		runs = policy.runs_today(self.ticket.name)
+		self.gateway.results = [
+			classify_at(90),
+			tool_turn(tool_use("t1", "get_ticket")),
+			tool_turn(tool_use("t2", "get_ticket")),
+		]
+		self._run("comment_mention")
+
+		self.assertEqual(self._tasks(), ["classify", "reason", "reason"])
+		self.assertEqual(policy.runs_today(self.ticket.name), runs + 1)
+		run_ids = {entry.run_id for entry in self._entries() if entry.entry_type in ("classify", "reason")}
+		self.assertEqual(len(run_ids), 2)

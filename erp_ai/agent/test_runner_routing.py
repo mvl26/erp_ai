@@ -2052,6 +2052,56 @@ class TestRunnerHooks(RoutingTestBase):
 			entry = self._single_entry()
 			self.assertEqual((entry.applied, entry.split_requested, entry.split_requests), (1, 0, None))
 
+	def test_split_marked_asked_only_once_the_guidance_carrying_it_is_posted(self):
+		# C9-fix1 R20a (AC-28, R14c): in a guidance run the route only gathers the split question; the classify row
+		# records it once the run's one comment carrying it was posted, never before
+		split = split_request_comment(parse_classification(CLASSIFY_SPLIT))
+		with self.subTest("the guidance is refused: nothing posted, not asked"):
+			refused = {"ok": False, "reason": f"{PREFIX}thiếu quyền"}
+			with patch.object(runner, "post_guidance", return_value=refused):
+				entry = self._run_with(CLASSIFY_SPLIT)
+			self.assertEqual((entry.applied, entry.split_requested, entry.split_requests), (1, 0, None))
+
+		with self.subTest("the last turn's entry fails: its guidance is undone, not asked"):
+			self.ticket = make_ticket(subject=f"{PREFIX}split guidance undone")
+			real_write_entry = runner.write_entry
+
+			def failing_reason_entry(**fields):
+				if fields.get("entry_type") == "reason":
+					raise RuntimeError(f"{PREFIX}nhật ký hỏng")
+				return real_write_entry(**fields)
+
+			with patch.object(runner, "write_entry", side_effect=failing_reason_entry):
+				entry = self._run_with(CLASSIFY_SPLIT)
+			self.assertEqual(write_ticket.count_guidance(self.ticket.name), 0)
+			self.assertEqual((entry.applied, entry.split_requested, entry.split_requests), (1, 0, None))
+
+		with self.subTest("the guidance is posted: asked, its requests recorded"):
+			self.ticket = make_ticket(subject=f"{PREFIX}split guidance posted")
+			entry = self._run_with(CLASSIFY_SPLIT)
+			self.assertIn(f"<li>{escape_html(split)}</li>", self._route_comment(entry))
+			self.assertEqual((entry.split_requested, json.loads(entry.split_requests)), (1, SPLIT_REQUESTS))
+
+		with self.subTest("lost race: the plain result comment carries the question"):
+			self.ticket = make_ticket(subject=f"{PREFIX}split lost race")
+			ticket = self.ticket.name
+
+			def rival_first(task, kwargs):
+				if task == "reason":
+					write_ticket._post(ticket, f"{write_ticket.GUIDANCE_MARKER}\n{PREFIX}hướng của lần kia")
+
+			self.gateway.on_call = rival_first
+			try:
+				entry = self._run_with(CLASSIFY_SPLIT)
+			finally:
+				self.gateway.on_call = None
+			contents = frappe.get_all(
+				"Comment", filters=authority.ticket_comment_filters(ticket), pluck="content"
+			)
+			(result,) = [text for text in contents if not text.startswith(write_ticket.GUIDANCE_MARKER)]
+			self.assertIn(escape_html(split), result)
+			self.assertEqual((entry.split_requested, json.loads(entry.split_requests)), (1, SPLIT_REQUESTS))
+
 	def test_watcher_failure_rolls_back_only_watcher_unit(self):
 		watcher = self._d_watcher()
 		head = make_active_agent(self)

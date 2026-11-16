@@ -4732,6 +4732,10 @@ class TestOneGuidance(GuidanceTestBase):
 		)
 		self.assertNotIn("Căn cứ", content)
 		self.assertNotIn("Cần ai quyết", content)
+		# U4b-16 (a), C9-fix1 R20c: the held analysis writes no post_comment entry; the run's one comment has its own
+		tools = [a["tool"] for e in self._entries(entry_type="reason") for a in json.loads(e.actions or "[]")]
+		self.assertNotIn("post_comment", tools)
+		self.assertEqual(tools.count(runner.GUIDANCE_TOOL), 1)
 
 		with self.subTest("an empty section does not show"):
 			ticket = make_ticket(subject=f"{PREFIX}guidance no proposal").name
@@ -4983,6 +4987,49 @@ class TestReclassify(RunnerTestBase):
 
 	def _tasks(self):
 		return [call["task"] for call in self.gateway.calls]
+
+	def _communication(self, sent_or_received, content, creation, owner):
+		"""A Communication of the ticket stored as is: no Helpdesk hook runs, the ticket is left as it was."""
+		frappe.get_doc(
+			{
+				"doctype": "Communication",
+				"communication_type": "Communication",
+				"communication_medium": "Email",
+				"sent_or_received": sent_or_received,
+				"reference_doctype": "HD Ticket",
+				"reference_name": self.ticket.name,
+				"sender": owner,
+				"subject": f"{PREFIX}email",
+				"content": content,
+				"owner": owner,
+				"modified_by": owner,
+				"creation": creation,
+				"modified": creation,
+			}
+		).db_insert()
+
+	def test_requester_email_reply_reaches_the_classification_as_data(self):
+		# C9-fix1 R20b (ADR-037 QĐ 2, research-R1 (d)): the requester answers the question by email, a Communication
+		# Received; the run after it classifies again with that reply and the people's comments, oldest first, as
+		# data; the bot's own email is left out
+		self._seed_classification(69)
+		now = frappe.utils.now_datetime()
+		comment = f"{PREFIX}comment của người phụ trách"
+		self.ticket.new_comment(comment)
+		reply = f"{PREFIX}trả lời qua email: máy in ở kho 2"
+		requester = self.ticket.raised_by or "Administrator"
+		self._communication(
+			"Received", f"<p>{reply}</p>", frappe.utils.add_to_date(now, seconds=1), requester
+		)
+		bot = f"{PREFIX}thư của bot"
+		self._communication("Sent", bot, frappe.utils.add_to_date(now, seconds=2), AGENT_USER)
+		self.gateway.results = [classify_at(75), make_model_result()]
+		self._run("comment_mention")
+
+		self.assertEqual(self._tasks(), ["classify", "reason"])
+		content = self.gateway.calls[0]["messages"][0]["content"]
+		self.assertIn(f"{LATER_MESSAGES_LABEL}\n- {comment}\n- {reply}", content)
+		self.assertNotIn(bot, content)
 
 	def test_still_below_asks_again_no_route(self):
 		self._seed_classification(69)

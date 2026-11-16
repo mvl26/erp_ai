@@ -38,6 +38,7 @@ from erp_ai.agent.prompts import (
 	build_routing_table,
 )
 from erp_ai.agent.queue import requester_reply_key
+from erp_ai.agent.redact import MASK
 from erp_ai.agent.run_log import action_entry, write_entry
 from erp_ai.agent.tools import propose_change, registry, site_api, write_ticket
 from erp_ai.agent.tools.read import TOOL_RESULT_MAX_CHARS
@@ -316,7 +317,7 @@ class TestRunner(RunnerTestBase):
 		self.assertEqual(self.gateway.call_count, 1)
 		call = self.gateway.calls[0]
 		self.assertEqual(call["task"], "classify")
-		self.assertEqual(call["max_tokens"], 600)
+		self.assertEqual(call["max_tokens"], 2048)
 		expected = build_classify_request(self.ticket.subject, self.ticket.description)
 		self.assertEqual((call["system"], call["messages"]), (expected["system"], expected["messages"]))
 
@@ -426,7 +427,10 @@ class TestRunner(RunnerTestBase):
 		log_error.assert_not_called()
 		(entry,) = self._entries()
 		self.assertEqual(entry.entry_type, "classify")
-		self.assertEqual((entry.error, entry.stop_reason), (runner.UNPARSEABLE_ERROR, "unparseable"))
+		self.assertEqual(
+			(entry.error, entry.stop_reason),
+			(f"{runner.UNPARSEABLE_ERROR}; stop_reason=end_turn; raw=không phải JSON", "unparseable"),
+		)
 		self.assertFalse(entry.predicted_category)
 		self.assertEqual(entry.cost_usd, 0.5)
 
@@ -3768,6 +3772,47 @@ class TestClassifyLatency(RunnerTestBase):
 		_template, ticket, run_id, ok, latency_s = line
 		self.assertEqual((ticket, run_id, ok), (self.ticket.name, entry.run_id, 0))
 		self.assertGreaterEqual(latency_s, 360)
+
+
+# BUG-004: a classify answer the model cut at its token cap, before `do_tin_cay_pct` and the closing brace.
+CUT_ANSWER = (
+	'{"dau_muc": "A", "do_tin_cay": "Cao", "ly_do": "Dọn dữ liệu Item theo sáu quy tắc: gộp mã trùng, chuẩn'
+)
+FAKE_KEY = "sk-ant-api03-FAKEKEY0123456789"
+
+
+class TestClassifyAnswerCut(RunnerTestBase):
+	"""BUG-004 (C1, C3): an answer cut at `max_tokens` is not classified; its row keeps `stop_reason` unparseable and
+	its error names the model's real stop reason and a short head of the raw answer, secrets masked."""
+
+	def _run_cut(self, text):
+		self.gateway.results = [make_model_result(text=text, stop_reason="max_tokens")]
+		self._run()
+		(entry,) = self._entries(entry_type="classify")
+		return entry
+
+	def test_cut_answer_error_names_the_real_stop_reason_and_the_raw_head(self):
+		entry = self._run_cut(CUT_ANSWER)
+
+		self.assertEqual(entry.stop_reason, "unparseable")
+		self.assertEqual(entry.error, f"{runner.UNPARSEABLE_ERROR}; stop_reason=max_tokens; raw={CUT_ANSWER}")
+		self.assertFalse(entry.predicted_category)
+
+	def test_raw_head_of_a_long_answer_stops_at_its_bound(self):
+		text = CUT_ANSWER + " quy tắc" * 2000
+		entry = self._run_cut(text)
+
+		prefix = f"{runner.UNPARSEABLE_ERROR}; stop_reason=max_tokens; raw="
+		self.assertTrue(entry.error.startswith(prefix), entry.error)
+		self.assertEqual(entry.error, prefix + text[: runner.CLASSIFY_RAW_HEAD_MAX_CHARS])
+
+	def test_raw_head_masks_secrets_even_a_value_the_bound_cuts(self):
+		# the password value runs past the bound: cut before masking, its open quote would leave it unmasked
+		text = f'{{"ly_do": "khóa {FAKE_KEY}", "password": "{"FAKEPASSWORD" * 500}", "dau_muc": "A"'
+		entry = self._run_cut(text)
+
+		self.assertIn(f'raw={{"ly_do": "khóa {MASK}", "password": "{MASK}"', entry.error)
+		self.assertNotIn("FAKE", entry.error)
 
 
 class TestTicketFields(RunnerTestBase):

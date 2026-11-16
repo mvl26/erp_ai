@@ -1,0 +1,87 @@
+{
+ "actions": [],
+ "creation": "2026-11-16 09:30:00.000000",
+ "doctype": "DocType",
+ "engine": "InnoDB",
+ "field_order": [
+  "section_period",
+  "month",
+  "period_start",
+  "period_end",
+  "candidate_count",
+  "section_items",
+  "items"
+ ],
+ "fields": [
+  {
+   "fieldname": "section_period",
+   "fieldtype": "Section Break",
+   "label": "Tháng rà soát"
+  },
+  {
+   "description": "Hệ thống tự ghi: tháng được rà, dạng YYYY-MM, không sửa được. Khóa kỳ: mỗi tháng một dòng, tên dòng là REV-<tháng>. Job rà soát chọn mẫu lúc 08:00 ngày 1 cho tháng trước.",
+   "fieldname": "month",
+   "fieldtype": "Data",
+   "in_list_view": 1,
+   "label": "Tháng",
+   "read_only": 1,
+   "reqd": 1,
+   "unique": 1
+  },
+  {
+   "description": "Hệ thống tự ghi: ngày đầu của tháng được rà, không sửa được.",
+   "fieldname": "period_start",
+   "fieldtype": "Date",
+   "label": "Đầu kỳ",
+   "read_only": 1
+  },
+  {
+   "description": "Hệ thống tự ghi: ngày cuối của tháng được rà, không sửa được.",
+   "fieldname": "period_end",
+   "fieldtype": "Date",
+   "label": "Cuối kỳ",
+   "read_only": 1
+  },
+  {
+   "description": "Hệ thống tự ghi: số phiếu đủ điều kiện được chọn mẫu trong tháng, không sửa được. Mẫu lấy tối đa theo cấu hình số phiếu rà soát mỗi tháng.",
+   "fieldname": "candidate_count",
+   "fieldtype": "Int",
+   "in_list_view": 1,
+   "label": "Số phiếu đủ điều kiện",
+   "read_only": 1
+  },
+  {
+   "fieldname": "section_items",
+   "fieldtype": "Section Break",
+   "label": "Phiếu được chọn"
+  },
+  {
+   "description": "Mẫu phiếu của tháng. Người rà chọn Đúng hoặc Sai và ghi chú cho từng phiếu; danh sách phiếu không đổi được sau khi job tạo.",
+   "fieldname": "items",
+   "fieldtype": "Table",
+   "label": "Phiếu rà soát",
+   "options": "ERP AI Review Item"
+  }
+ ],
+ "links": [],
+ "modified": "2026-11-16 09:30:00.000000",
+ "modified_by": "Administrator",
+ "module": "ERP AI agent",
+ "name": "ERP AI Review Month",
+ "owner": "Administrator",
+ "permissions": [
+  {
+   "read": 1,
+   "role": "System Manager",
+   "write": 1
+  },
+  {
+   "read": 1,
+   "role": "ERP AI Instructor",
+   "write": 1
+  }
+ ],
+ "sort_field": "modified",
+ "sort_order": "DESC",
+ "states": []
+}

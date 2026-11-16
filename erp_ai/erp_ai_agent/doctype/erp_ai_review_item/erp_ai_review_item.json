@@ -1,0 +1,66 @@
+{
+ "actions": [],
+ "creation": "2026-11-16 09:30:00.000000",
+ "doctype": "DocType",
+ "engine": "InnoDB",
+ "field_order": [
+  "ticket",
+  "verdict",
+  "note",
+  "reviewed_by",
+  "reviewed_at"
+ ],
+ "fields": [
+  {
+   "description": "Hệ thống tự ghi: phiếu được chọn vào mẫu của tháng, không sửa được.",
+   "fieldname": "ticket",
+   "fieldtype": "Link",
+   "in_list_view": 1,
+   "label": "Phiếu",
+   "options": "HD Ticket",
+   "read_only": 1,
+   "reqd": 1
+  },
+  {
+   "description": "Kết luận của người rà: Đúng nếu việc bot làm trên phiếu đúng, Sai nếu sai. Để trống khi chưa rà.",
+   "fieldname": "verdict",
+   "fieldtype": "Select",
+   "in_list_view": 1,
+   "label": "Kết luận",
+   "options": "\nĐúng\nSai"
+  },
+  {
+   "description": "Ghi chú của người rà, ví dụ vì sao Sai.",
+   "fieldname": "note",
+   "fieldtype": "Small Text",
+   "in_list_view": 1,
+   "label": "Ghi chú"
+  },
+  {
+   "description": "Hệ thống tự ghi: người đặt kết luận hoặc ghi chú gần nhất, không sửa được.",
+   "fieldname": "reviewed_by",
+   "fieldtype": "Link",
+   "label": "Người rà",
+   "options": "User",
+   "read_only": 1
+  },
+  {
+   "description": "Hệ thống tự ghi: lúc đặt kết luận hoặc ghi chú gần nhất, không sửa được.",
+   "fieldname": "reviewed_at",
+   "fieldtype": "Datetime",
+   "label": "Lúc rà",
+   "read_only": 1
+  }
+ ],
+ "istable": 1,
+ "links": [],
+ "modified": "2026-11-16 09:30:00.000000",
+ "modified_by": "Administrator",
+ "module": "ERP AI agent",
+ "name": "ERP AI Review Item",
+ "owner": "Administrator",
+ "permissions": [],
+ "sort_field": "modified",
+ "sort_order": "DESC",
+ "states": []
+}

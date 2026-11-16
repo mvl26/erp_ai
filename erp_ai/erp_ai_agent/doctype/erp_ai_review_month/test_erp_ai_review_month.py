@@ -142,7 +142,7 @@ class TestReviewMonth(ReviewMonthTestCase):
 		for label, change in (
 			("remove", lambda doc: doc.items.pop()),
 			("add", lambda doc: doc.append("items", {"ticket": extra})),
-			("swap", lambda doc: doc.items[0].__setitem__("ticket", extra)),
+			("swap", lambda doc: setattr(doc.items[0], "ticket", extra)),
 			("reorder", lambda doc: doc.set("items", list(reversed(doc.items)))),
 		):
 			with self.subTest(change=label):

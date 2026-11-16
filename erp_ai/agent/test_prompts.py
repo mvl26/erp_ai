@@ -8,6 +8,8 @@ from erp_ai.agent import prompts
 from erp_ai.agent.policy import PermissionSwitches
 from erp_ai.agent.tools import registry
 from erp_ai.constants import (
+	CATEGORIES,
+	TRIGGER_CHANGE_ACTION,
 	TRIGGER_COMMENT_MENTION,
 	TRIGGER_KB_DRAFT,
 	TRIGGER_REQUESTER_REPLY,
@@ -681,3 +683,51 @@ class TestReplyBlock(FrappeTestCase):
 				# PROMPT_CONFLICT_PAIRS gains no pair: the block allows no sentence the core forbids
 				for forbidden, allowed in prompts.PROMPT_CONFLICT_PAIRS:
 					self.assertFalse(forbidden in text and allowed in text, (forbidden, allowed))
+
+
+class TestCategoryC(FrappeTestCase):
+	"""AC-62 (U4b-fixes.md Fix 7, :186; ADR-030 QĐ 3): the category-C hint only for the ticket-creation run and the
+	`@ai` run of a ticket classified C."""
+
+	def setUp(self):
+		keep_agent_settings(self)
+
+	@staticmethod
+	def _message(trigger, classification, **extra):
+		return prompts.build_initial_message(TICKET, COMMENTS, trigger, classification, **extra)
+
+	def test_hint_only_for_c(self):
+		self.assertEqual(
+			prompts.TASK_CATEGORY_C,
+			"Phiếu đầu mục C: tìm tính năng sẵn có bằng search_source trước, rồi đăng BA note bằng post_comment kind "
+			"= ba_note (một lần mỗi phiếu). Nếu có tool create_task, tách việc thành các Task, mỗi Task có ước lượng "
+			"giờ.",
+		)
+		self.assertEqual(prompts.CATEGORY_HINT_TRIGGERS, (TRIGGER_TICKET_INSERT, TRIGGER_COMMENT_MENTION))
+		for trigger in prompts.CATEGORY_HINT_TRIGGERS:
+			task = prompts.TASK_BY_TRIGGER.get(trigger, prompts.TASK_NEW_TICKET)
+			with self.subTest(trigger=trigger):
+				hinted = self._message(trigger, {"category": "C", "confidence_pct": 90})
+				self.assertEqual(hinted.rsplit("\n\n", 1)[1], f"{task}\n{prompts.TASK_CATEGORY_C}")
+				self.assertEqual(_payload(hinted)["classification"], {"category": "C", "confidence_pct": 90})
+				# the hint follows the task line, before the "already has guidance" line
+				both = self._message(trigger, {"category": "C"}, guidance_posted=True)
+				self.assertTrue(
+					both.endswith(f"\n\n{task}\n{prompts.TASK_CATEGORY_C}\n{prompts.TASK_AFTER_GUIDANCE}"),
+					both,
+				)
+				for classification in [*({"category": c} for c in CATEGORIES if c != "C"), {}, None]:
+					message = self._message(trigger, classification)
+					self.assertNotIn(prompts.TASK_CATEGORY_C, message, classification)
+					self.assertEqual(message.rsplit("\n\n", 1)[1], task, classification)
+
+	def test_hint_skipped_for_other_triggers(self):
+		for trigger in (TRIGGER_KB_DRAFT, TRIGGER_REQUESTER_REPLY, TRIGGER_CHANGE_ACTION):
+			with self.subTest(trigger=trigger):
+				self.assertNotIn(trigger, prompts.CATEGORY_HINT_TRIGGERS)
+				message = self._message(trigger, {"category": "C", "confidence_pct": 90})
+				self.assertNotIn(prompts.TASK_CATEGORY_C, message)
+				self.assertEqual(
+					message.rsplit("\n\n", 1)[1],
+					prompts.TASK_BY_TRIGGER.get(trigger, prompts.TASK_NEW_TICKET),
+				)

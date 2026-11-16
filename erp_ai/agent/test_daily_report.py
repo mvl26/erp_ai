@@ -4,9 +4,10 @@ from unittest.mock import call, patch
 
 import frappe
 from frappe.tests.utils import FrappeTestCase
+from frappe.utils.file_lock import LockTimeoutError
 from helpdesk.test_utils import make_ticket
 
-from erp_ai.agent import daily_report, runner
+from erp_ai.agent import daily_report, lifecycle, runner
 from erp_ai.agent.ops_data import BA_NOTE_MARKER
 from erp_ai.constants import AGENT_USER, LOG_DOCTYPE, LOGGER_NAME, SETTING_DOCTYPE
 from erp_ai.test_utils import keep_agent_settings, make_routing_rules, set_agent_settings
@@ -814,3 +815,103 @@ class TestRun(FrappeTestCase):
 		html = self._sent()["message"]
 		self.assertIn("12/08/2002 10:00", html)
 		self.assertIn("12/08/2002 05:00", html)
+
+	def test_no_recipients_logs_only(self):
+		for value in ("", "  \n \t\n\n"):
+			set_agent_settings(coo_report_recipients=value)
+			with patch("frappe.logger") as logger:
+				daily_report.run_daily_report(now=ANCHOR_RUN)
+
+			self.sendmail.assert_not_called()
+			self.assertIn(
+				"daily_report: chưa có người nhận",
+				[call_.args[0] for call_ in logger.return_value.info.call_args_list],
+			)
+			self.assertFalse(frappe.db.get_single_value(SETTING_DOCTYPE, "daily_report_sent_on"))
+
+	def test_send_error_logged_not_raised_watermark_kept(self):
+		for error in (frappe.OutgoingEmailError("smtp down"), frappe.ValidationError("bad address")):
+			self.sendmail.side_effect = error
+			with (
+				patch("frappe.log_error") as log_error,
+				patch("frappe.db.rollback") as rollback,
+			):
+				daily_report.run_daily_report(now=ANCHOR_RUN)
+
+			rollback.assert_called_once_with()
+			log_error.assert_called_once()
+			self.assertEqual(log_error.call_args.args[0], daily_report.TITLE_DAILY_REPORT_FAILED)
+			self.assertEqual(daily_report.TITLE_DAILY_REPORT_FAILED, "erp_ai: báo cáo hằng ngày lỗi")
+			self.assertFalse(frappe.db.get_single_value(SETTING_DOCTYPE, "daily_report_sent_on"))
+
+	def test_weekend_skipped_when_off(self):
+		saturday = datetime(2002, 8, 10, 8, 0)
+		set_agent_settings(daily_report_weekends=0)
+		for now in (saturday, saturday + timedelta(days=1)):
+			daily_report.run_daily_report(now=now)
+		self.sendmail.assert_not_called()
+
+		set_agent_settings(daily_report_weekends=1)
+		daily_report.run_daily_report(now=saturday)
+		self._sent()
+
+	def test_lock_busy_returns_without_email(self):
+		with patch("erp_ai.agent.daily_report.filelock") as lock:
+			lock.return_value.__enter__.side_effect = LockTimeoutError("held")
+			daily_report.run_daily_report(now=ANCHOR_RUN)
+
+		lock.assert_called_once_with("erp_ai_daily_report", timeout=5)
+		self.sendmail.assert_not_called()
+
+
+class TestActionKinds(FrappeTestCase):
+	"""The four actions of U6b in the report (INT-U6b-1)."""
+
+	def setUp(self):
+		_report_settings(self)
+		self.yesterday = datetime.combine(ANCHOR_BOT_KINDS.date() - timedelta(days=1), datetime.min.time())
+		self.yesterday += timedelta(hours=10)
+		frappe.db.delete(
+			LOG_DOCTYPE,
+			{
+				"creation": [
+					"between",
+					[ANCHOR_BOT_KINDS - timedelta(days=3), ANCHOR_BOT_KINDS + timedelta(days=1)],
+				]
+			},
+		)
+
+	def test_u6b_tools_classified(self):
+		ticket = _ticket("u6b_kinds", self.yesterday, "A")
+
+		def entry(tool: str, status: str | None = None) -> dict:
+			return {
+				"tool": tool,
+				"doctype": "HD Ticket",
+				"name": ticket,
+				"ok": True,
+				"value_after": {"status": status} if status else {},
+			}
+
+		_log(
+			self.yesterday,
+			entry_type="reason",
+			ticket=ticket,
+			actions=json.dumps(
+				[
+					entry("reply_to_requester"),
+					entry(lifecycle.TOOL_LIFECYCLE_COMMENT),
+					entry(lifecycle.TOOL_RESOLVE_ON_TASKS_DONE, "Resolved"),
+					entry(lifecycle.TOOL_CLOSE_SILENT_F, "Closed"),
+					entry(lifecycle.TOOL_REQUESTER_NOTICE),
+					entry("create_kb_draft"),
+				]
+			),
+		)
+
+		result = daily_report.build_daily_report(ANCHOR_BOT_KINDS)
+
+		self.assertEqual(
+			result["bot_actions"],
+			_bot_actions(**{"trả lời": 1, "comment": 1, "đóng": 2, "khác": 2}),
+		)

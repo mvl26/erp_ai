@@ -23,7 +23,9 @@ from erp_ai.agent.classification import DEFAULT_CATEGORY_MAPPING
 from erp_ai.agent.prompts import (
 	ACT_NOW_BLOCK,
 	CHANGE_TOOLS_BLOCK,
+	FIELD_VALUE_MAX_CHARS,
 	LATER_MESSAGES_LABEL,
+	LATER_MESSAGES_MAX,
 	SITE_ADMIN_TOOLS_BLOCK,
 	TASK_COMMENT,
 	TASK_NEW_TICKET,
@@ -5197,3 +5199,263 @@ def classify_c():
 	return make_model_result(
 		text=json.dumps({"dau_muc": "C", "do_tin_cay": "Cao", "do_tin_cay_pct": 90, "ly_do": "x"})
 	)
+
+
+EXCLUDED_DEPARTMENT = f"{PREFIX}Nhân sự"
+NORMAL_DEPARTMENT = f"{PREFIX}Kho"
+KEYWORD = "@ai"
+
+
+def classify_department(department, pct=90):
+	"""A category E reply naming `department` (E routes by the department table, AC-5)."""
+	return make_model_result(
+		text=json.dumps(
+			{"dau_muc": "E", "do_tin_cay": "Cao", "do_tin_cay_pct": pct, "ly_do": "x", "bo_phan": department}
+		)
+	)
+
+
+def u2_seed(label=""):
+	return f"U2-SEED-{label}{frappe.generate_hash(length=12)}"
+
+
+class TestExcludedByClassification(RunnerTestBase):
+	"""AC-9 (b), U2.md:164-172, U2-R1..R3 (T137): a ticket the classification puts in an excluded team stops right after
+	its classify row (no route, comment, notice, Task or reasoning); that row refuses every later run (send_refusal)."""
+
+	def setUp(self):
+		super().setUp()
+		keep_agent_settings(self)
+		self.addCleanup(frappe.cache.hdel, "assignment_rule_map", "HD Ticket")
+		self.excluded_team = make_team(self)
+		normal_team = make_team(self)
+		# every switch and limit a run here depends on is set, never read from the shared site
+		set_agent_settings(
+			permission_level="L1",
+			level_cap_e="L1",
+			act_now_enabled=0,
+			code_change_enabled=0,
+			record_tools_enabled=0,
+			unrestricted_enabled=0,
+			monthly_budget_usd=1000,
+			max_runs_per_ticket_per_day=10,
+			confidence_threshold=policy.DEFAULT_CONFIDENCE_THRESHOLD,
+			trigger_keyword=KEYWORD,
+			excluded_teams=self.excluded_team,
+			excluded_title_prefixes="",
+			routing_rules=make_routing_rules(
+				departments={
+					EXCLUDED_DEPARTMENT: {"team": self.excluded_team, "head": ""},
+					NORMAL_DEPARTMENT: {"team": normal_team, "head": ""},
+				}
+			),
+		)
+		self.latest_classification.side_effect = self.real_latest_classification
+		log_error = patch.object(frappe, "log_error")
+		self.log_error = log_error.start()
+		self.addCleanup(log_error.stop)
+		sla = patch.object(runner.site_facts, "applied_sla", return_value=NO_LAG_SLA)
+		sla.start()
+		self.addCleanup(sla.stop)
+
+	def _tasks(self):
+		return [call["task"] for call in self.gateway.calls]
+
+	def _ticket_row(self):
+		return frappe.db.get_value("HD Ticket", self.ticket.name, TICKET_FIELDS, as_dict=True)
+
+	def _task_count(self):
+		return frappe.db.count("Task", {"ai_ticket": self.ticket.name})
+
+	def _mention(self):
+		"""A person's `@ai` comment through the real hook; returns how many runs it queued."""
+		frappe.set_user("Administrator")
+		with patch("erp_ai.handlers.enqueue_agent_run") as enqueue:
+			self.ticket.new_comment(f"{KEYWORD} {PREFIX}xem giúp")
+		return enqueue.call_count
+
+	def _comment_at(self, content, creation):
+		name = self.ticket.new_comment(content)
+		frappe.db.set_value("Comment", name, "creation", creation, update_modified=False)
+
+	def _reply_at(self, content, creation):
+		"""The requester's email (Communication Received), stored as is."""
+		TestReclassify._communication(
+			self, "Received", content, creation, self.ticket.raised_by or "Administrator"
+		)
+
+	def _assert_stopped(self, entry):
+		"""The classify row of an excluded ticket: not applied, the exclusion as its stop reason."""
+		self.assertEqual((entry.applied, entry.stop_reason), (0, policy.EXCLUDED_BY_CLASSIFICATION))
+
+	def test_classified_into_excluded_team_stops_before_reasoning(self):
+		# lỗ A5-3a (1): no team yet, the department maps to an excluded team; the ticket's comments hold seeds
+		seeds = [u2_seed() for _ in range(3)]
+		for seed in seeds:
+			self.ticket.new_comment(f"{PREFIX}comment {seed}")
+		before = self._ticket_row()
+		comments = self._comment_count()
+		self.gateway.results = [classify_department(EXCLUDED_DEPARTMENT), make_model_result()]
+		self._run()
+
+		self.assertEqual(self._tasks(), ["classify"])
+		payload = json.dumps(self.gateway.calls[0], default=str, ensure_ascii=False)
+		self.assertEqual([payload.count(seed) for seed in seeds], [0, 0, 0])
+		self.assertEqual(self._ticket_row(), before)
+		# no guidance, route or notice comment, no Task, no reasoning step
+		self.assertEqual(self._comment_count(), comments)
+		self.assertEqual(write_ticket.count_guidance(self.ticket.name), 0)
+		self.assertEqual(self._task_count(), 0)
+		self.assertEqual(self._entries(entry_type="reason"), [])
+		(entry,) = self._entries(entry_type="classify")
+		self._assert_stopped(entry)
+		# the prediction columns are kept for the accuracy report
+		self.assertEqual((entry.predicted_category, entry.predicted_confidence_pct), ("E", 90))
+		self.assertEqual(policy.send_refusal(self.ticket.name), policy.REFUSAL_EXCLUDED_BY_CLASSIFICATION)
+
+	def test_later_mention_and_scan_skip(self):
+		self.gateway.results = [classify_department(EXCLUDED_DEPARTMENT), make_model_result()]
+		self._run()
+
+		self.assertEqual(self._mention(), 0)
+		# the 15-minute scan takes a ticket only when can_send_ticket holds (missed_scan.find_missed_tickets)
+		self.assertFalse(policy.can_send_ticket(self.ticket.name))
+		self._run("comment_mention")
+		self.assertEqual(self.gateway.call_count, 1)
+		(skip,) = self._entries(entry_type="skip")
+		self.assertEqual(skip.stop_reason, "not_sendable")
+
+	def test_department_named_as_excluded_team(self):
+		# not in the department table, so decide_route asks nothing: the department itself names an excluded team
+		comments = self._comment_count()
+		self.gateway.results = [
+			classify_department(f"  {self.excluded_team.upper()} "),
+			make_model_result(),
+		]
+		self._run()
+
+		self.assertEqual(self._tasks(), ["classify"])
+		self._assert_stopped(self._entries(entry_type="classify")[0])
+		self.assertEqual(self._comment_count(), comments)
+		self.assertEqual(self._entries(entry_type="reason"), [])
+
+	def test_excluded_wins_over_low_confidence(self):
+		# the U2 gate comes before the below-threshold gate of U1: no question is asked either
+		comments = self._comment_count()
+		self.gateway.results = [classify_department(EXCLUDED_DEPARTMENT, pct=10), make_model_result()]
+		self._run()
+
+		self.assertEqual(self._tasks(), ["classify"])
+		(entry,) = self._entries(entry_type="classify")
+		self._assert_stopped(entry)
+		self.assertEqual(entry.predicted_confidence_pct, 10)
+		self.assertEqual(self._comment_count(), comments)
+		self.assertEqual(self._entries(entry_type="reason"), [])
+
+	def test_l0_still_records_exclusion(self):
+		set_agent_settings(permission_level="L0")
+		self.gateway.results = [classify_department(EXCLUDED_DEPARTMENT)]
+		self._run()
+
+		(entry,) = self._entries(entry_type="classify")
+		self._assert_stopped(entry)
+		self.assertEqual(self._mention(), 0)
+
+	def test_reclassified_into_excluded_team_stops(self):
+		# R5-6, U2-R2, U2-R3: the run that classifies again (T113) goes through the same gate
+		seed_a, seed_b = u2_seed("A-"), u2_seed("B-")
+		self.ticket.new_comment(f"{PREFIX}trước lần phân loại đầu {seed_a}")
+		# run 1: a normal department below the threshold, so it only asks (AC-65 (b)): one classify call, one reason call
+		self.gateway.results = [classify_department(NORMAL_DEPARTMENT, pct=50), make_model_result()]
+		self._run()
+		(first,) = self._entries(entry_type="classify")
+		frappe.set_user("Administrator")
+		# 7 people's messages after that row, comments and the requester's emails by turns; the newest is 500 long
+		later = [f"{PREFIX}tin {index} {seed_b}" for index in range(7)]
+		later[-1] = later[-1].ljust(500, "x")
+		for index, text in enumerate(later):
+			at = frappe.utils.add_to_date(first.creation, seconds=index + 1)
+			(self._reply_at if index % 2 else self._comment_at)(text, at)
+		comments = self._comment_count()
+		before = self._ticket_row()
+		run_id = f"{PREFIX}reclassify-{frappe.generate_hash(length=10)}"
+		fixed = MagicMock()
+		fixed.uuid4.return_value.hex = run_id
+		self.gateway.results = [classify_department(EXCLUDED_DEPARTMENT), make_model_result()]
+		with patch.object(runner, "uuid", fixed):
+			self._run("comment_mention")
+
+		# two classification calls in all; run 2 makes no other call
+		self.assertEqual(self._tasks(), ["classify", "reason", "classify"])
+		payload = self.gateway.calls[2]
+		lines = payload["messages"][0]["content"].split(f"{LATER_MESSAGES_LABEL}\n", 1)[1].split("\n")
+		self.assertEqual(len(lines), LATER_MESSAGES_MAX)
+		self.assertEqual(lines, [f"- {text[:FIELD_VALUE_MAX_CHARS]}" for text in later[-LATER_MESSAGES_MAX:]])
+		self.assertTrue(all(len(line.removeprefix("- ")) <= FIELD_VALUE_MAX_CHARS for line in lines))
+		self.assertEqual(json.dumps(payload, default=str, ensure_ascii=False).count(seed_a), 0)
+		(_first, again) = self._entries(entry_type="classify")
+		self.assertEqual(again.run_id, run_id)
+		self._assert_stopped(again)
+		self.assertEqual(write_ticket.count_guidance(self.ticket.name), 0)
+		self.assertEqual(self._comment_count(), comments)
+		self.assertEqual(self._task_count(), 0)
+		self.assertEqual(self._ticket_row(), before)
+		self.assertEqual(self._entries(entry_type="reason", run_id=run_id), [])
+
+		self.assertEqual(self._mention(), 0)
+		self._run("comment_mention")
+		self.assertEqual(self._tasks().count("classify"), 2)
+		self.assertEqual(self.gateway.call_count, 3)
+
+	def test_excluded_low_confidence_row_not_reclassified(self):
+		# U2-R1: the excluded row is below the threshold too (ADR-037 QĐ 1 holds); check (c) of _run refuses first
+		self.gateway.results = [classify_department(EXCLUDED_DEPARTMENT, pct=50), make_model_result()]
+		self._run()
+		(first,) = self._entries(entry_type="classify")
+		frappe.set_user("Administrator")
+		self._reply_at(f"{PREFIX}người tạo trả lời", frappe.utils.add_to_date(first.creation, seconds=1))
+
+		self.assertEqual(self._mention(), 0)
+		self.gateway.results = [classify_department(NORMAL_DEPARTMENT), make_model_result()]
+		self._run("comment_mention")
+		self.assertEqual(self._tasks(), ["classify"])
+		(skip,) = self._entries(entry_type="skip")
+		self.assertEqual(skip.stop_reason, "not_sendable")
+
+	def test_group_set_excluded_before_reply_not_reclassified(self):
+		# U2-R1, a pin: a person puts the ticket in an excluded team after run 1; check (c) of _run already refuses
+		self.gateway.results = [classify_department(NORMAL_DEPARTMENT, pct=50), make_model_result()]
+		self._run()
+		(first,) = self._entries(entry_type="classify")
+		frappe.set_user("Administrator")
+		frappe.db.set_value(
+			"HD Ticket", self.ticket.name, "agent_group", self.excluded_team, update_modified=False
+		)
+		self._reply_at(f"{PREFIX}người tạo trả lời", frappe.utils.add_to_date(first.creation, seconds=1))
+
+		self.gateway.results = [classify_department(NORMAL_DEPARTMENT), make_model_result()]
+		self._run("comment_mention")
+		# run 1's calls only: one classification, its question
+		self.assertEqual(self._tasks(), ["classify", "reason"])
+		(skip,) = self._entries(entry_type="skip")
+		self.assertEqual(skip.stop_reason, "not_sendable")
+
+
+class TestExcludedTitle(RunnerTestBase):
+	"""AC-9 (a) (T137): a ticket whose title starts with an excluded prefix never reaches the model."""
+
+	def setUp(self):
+		super().setUp()
+		keep_agent_settings(self)
+		set_agent_settings(permission_level="L1", excluded_title_prefixes="[HR]", excluded_teams="")
+		frappe.db.set_value(
+			"HD Ticket", self.ticket.name, "subject", f"[HR] {PREFIX}nghỉ phép", update_modified=False
+		)
+
+	def test_prefixed_ticket_calls_model_zero_times(self):
+		self.gateway.results = [classify_at(90), make_model_result()]
+		self._run()
+
+		self.assertEqual(self.gateway.call_count, 0)
+		(skip,) = self._entries(entry_type="skip")
+		self.assertEqual(skip.stop_reason, "not_sendable")

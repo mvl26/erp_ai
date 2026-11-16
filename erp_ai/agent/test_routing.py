@@ -236,6 +236,22 @@ class TestDecideTeam(FrappeTestCase):
 		self.assertEqual(reason(both), "nhóm 'Accounting' không tồn tại")
 
 
+class TestExcludedTeam(FrappeTestCase):
+	"""C-8 (T137): the runner learns that a classification maps to an excluded team only through the predicate that
+	decide_route consults; this pins that call (a pin: green on arrival)."""
+
+	def setUp(self):
+		keep_agent_settings(self)
+
+	def test_decide_route_consults_excluded_predicate_for_mapped_team(self):
+		for category in "DE":
+			with self.subTest(category=category):
+				predicate = _AgentCheck(True)
+				decision = _decide_team(category, department="Kế toán", is_excluded_team=predicate)
+				self.assertEqual(predicate.calls, ["Accounting"])
+				self.assertIsNone(decision.agent_group)
+
+
 ASSIGN_CONFIG = {
 	"assignees": {
 		"A": {"default": "a.default@x.com", "prefixes": {"[tracecore]": "trace@x.com", "[kho]": "kho@x.com"}},
@@ -824,7 +840,7 @@ WATCHER_INACTIVE_NOTE = {"field": "watcher", "reason": "it@x không phải HD Ag
 
 
 class _AgentCheck:
-	"""Fake is_active_agent: fixed answer, records every user it was asked about."""
+	"""Fake is_active_agent (or is_excluded_team): fixed answer, records every value it was asked about."""
 
 	def __init__(self, active):
 		self.active = active

@@ -1860,6 +1860,7 @@ CLASSIFY_SPLIT = json.dumps(
 CLASSIFY_SPLIT_LOW = json.dumps({**json.loads(CLASSIFY_SPLIT), "do_tin_cay_pct": 69})
 # A Datetime field of HD Ticket that only an on-hold status change writes: the test's due date.
 DUE_COLUMN = "on_hold_since"
+EXCLUDED_TEAM = f"{PREFIX}nhóm loại trừ"
 
 
 class TestRunnerHooks(RoutingTestBase):
@@ -1929,7 +1930,14 @@ class TestRunnerHooks(RoutingTestBase):
 				self.assertIs(kwargs["due_field_configured"], True)
 				self.assertEqual(kwargs["d_watcher"], "")
 				self.assertIsInstance(kwargs["now"], datetime)
-				self.assertIs(kwargs["is_excluded_team"], runner.policy.is_excluded_team)
+				# R23a: the run's probe (U2.md:168) answers as policy.is_excluded_team, and asks it
+				set_agent_settings(excluded_teams=EXCLUDED_TEAM)
+				with patch.object(
+					runner.policy, "is_excluded_team", wraps=runner.policy.is_excluded_team
+				) as asked:
+					answers = [kwargs["is_excluded_team"](team) for team in (EXCLUDED_TEAM, self.team)]
+				self.assertEqual(answers, [True, False])
+				self.assertEqual([c.args for c in asked.call_args_list], [(EXCLUDED_TEAM,), (self.team,)])
 				self.assertEqual(frappe.db.get_value("HD Ticket", ticket, "priority"), priority)
 
 		with self.subTest("no due field configured: B gets the note, the mapping's priority"):

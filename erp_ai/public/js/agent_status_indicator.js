@@ -2,9 +2,9 @@ function setupForm({ doc, call, router }) {
 	try {
 		const EVENT = "erp_ai:agent_status";
 		const ACTION_LABEL = "Trao đổi với bot";
-		const TEXT_PANEL_TITLE = "Hướng giải quyết & trao đổi với bot";
+		const TEXT_PANEL_TITLE = "Thông tin AI của phiếu & trao đổi với bot";
 		const TEXT_CLOSE = "Đóng";
-		const TEXT_AI_SECTION = "Hướng giải quyết của AI";
+		const TEXT_AI_SECTION = "Thông tin AI của phiếu";
 		const TEXT_CHAT_SECTION = "Trao đổi với bot";
 		const TEXT_EMPTY_FIELD = "Chưa có";
 		const TEXT_EMPTY_THREAD = "Chưa có tin nào.";

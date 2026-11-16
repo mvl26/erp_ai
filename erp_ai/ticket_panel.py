@@ -1,4 +1,7 @@
-"""Ticket-page panel (ADR-009, ADR-010): the AI fields of a ticket, read under the caller's own permissions."""
+"""Ticket-page panel (ADR-009, ADR-010): what the bot filled in on a ticket, and the conversation with it.
+
+Everything is read under the caller's own permissions.
+"""
 
 import html
 
@@ -14,7 +17,18 @@ from erp_ai.agent.policy import contains_keyword, get_trigger_keyword
 from erp_ai.constants import AGENT_USER, LOGGER_NAME, PANEL_MAX_MESSAGE_CHARS
 
 TICKET_DOCTYPE = "HD Ticket"
-AI_FIELDS = ("ai_resolution_hint", "ai_confidence", "ai_classified_by", "ai_updated_at")
+# The three fields the bot classifies, with the wording its own "Đã làm" line uses for them.
+CLASSIFICATION_LABELS = {"ticket_type": "Loại", "agent_group": "Nhóm", "priority": "Ưu tiên"}
+AI_FIELDS = (
+	"ai_resolution_hint",
+	"ai_confidence",
+	"ai_confidence_pct",
+	"ai_complexity",
+	"ai_importance",
+	"ai_score_reason",
+	"ai_classified_by",
+	"ai_updated_at",
+)
 
 
 def _log_denied(method, ticket, reason):
@@ -51,17 +65,23 @@ def _field_text(meta, doc, fieldname):
 
 
 def _ai_fields(ticket: str) -> list[dict]:
+	"""The ticket's own record: the classification the bot filled in, then the AI fields."""
 	meta = frappe.get_meta(TICKET_DOCTYPE)
 	doc = frappe.get_doc(TICKET_DOCTYPE, ticket)
 	doc.apply_fieldlevel_read_permissions()
+	labels = {**CLASSIFICATION_LABELS, **{name: meta.get_label(name) for name in AI_FIELDS}}
 	return [
-		{"fieldname": name, "label": meta.get_label(name), "text": _field_text(meta, doc, name)}
-		for name in AI_FIELDS
+		{"fieldname": name, "label": label, "text": _field_text(meta, doc, name)}
+		for name, label in labels.items()
 	]
 
 
 def _thread(ticket: str) -> list[dict]:
-	"""B-5 (ADR-010): Comment items of the timeline written by the agent or containing the keyword, old to new."""
+	"""Conversation with the bot, old to new: keyword comments, and agent comments after the first of them.
+
+	What the agent wrote before anyone spoke to it (classification, guidance at ticket creation) is ticket
+	information, shown from the ticket's fields, not a message here. This narrows B-5 of ADR-010.
+	"""
 	items = get_activity_timeline(TICKET_DOCTYPE, ticket, ["comment"])["activities"]
 	messages = []
 	for item in items:
@@ -69,6 +89,8 @@ def _thread(ticket: str) -> list[dict]:
 			continue
 		content = item["data"]["content"]
 		is_bot = item["author"]["email"] == AGENT_USER
+		if is_bot and not messages:
+			continue
 		if not is_bot and not contains_keyword(content):
 			continue
 		messages.append(

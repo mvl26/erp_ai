@@ -591,3 +591,7 @@ def build_initial_message(
 	if conversation:
 		task += "\n" + TASK_CONVERSATION
 	return json.dumps(payload, ensure_ascii=False, indent=2, default=str) + "\n\n" + task
+
+
+LESSON_ROLE_RULE = "quy tắc của người dạy"
+LESSON_ROLE_DATA = "dữ liệu"

@@ -3,13 +3,21 @@ from datetime import datetime, timedelta
 from unittest.mock import patch
 
 import frappe
+from frappe.desk.form import assign_to
 from frappe.tests.utils import FrappeTestCase
+from helpdesk.test_utils import make_ticket
 
 from erp_ai.agent import due_checks, run_log
-from erp_ai.constants import LOG_DOCTYPE, LOGGER_NAME
-from erp_ai.test_utils import keep_agent_settings
+from erp_ai.constants import AGENT_USER, LOG_DOCTYPE, LOGGER_NAME, SETTING_DOCTYPE
+from erp_ai.test_utils import keep_agent_settings, make_active_agent, pin_agent_roles, set_agent_settings
 
 NOW = datetime(2026, 11, 18, 10, 0)
+TICKET = "HD Ticket"
+TYPE_PREFIX = "ERPAI-TEST due "
+CATEGORY_MAPPING = {category: {"ticket_type": f"{TYPE_PREFIX}{category}"} for category in "ABCDEF"}
+# A real Datetime Custom Field erp_ai installs on HD Ticket (test_install pins it), as in test_daily_report.
+DUE_FIELD = "ai_updated_at"
+SUMMARY = "due_checks: due_soon=%d overdue=%d ba_note=%d task=%d errors=%d no_assignee=%d capped=%s"
 
 
 def _fake_ticket() -> str:
@@ -54,6 +62,109 @@ def _milestone_entry(kind: str, ok: bool = True) -> dict:
 	)
 
 
+def _ticket(category: str | None, creation: datetime, **values) -> str:
+	"""An open ticket of `category` created at `creation`, its fields set straight in the database; the side
+	records of the insert (comments, assignments, log rows, Tasks, notifications) removed."""
+	name = make_ticket(subject="ERPAI-TEST due", description="ERPAI-TEST due").name
+	for doctype in ("Comment", "Communication"):
+		frappe.db.delete(doctype, {"reference_doctype": TICKET, "reference_name": name})
+	frappe.db.delete("ToDo", {"reference_type": TICKET, "reference_name": name})
+	frappe.db.delete("Notification Log", {"document_type": TICKET, "document_name": name})
+	frappe.db.delete(LOG_DOCTYPE, {"ticket": name})
+	frappe.db.delete("Task", {"ai_ticket": name})
+	row = {
+		"ticket_type": f"{TYPE_PREFIX}{category}" if category else f"{TYPE_PREFIX}unmapped",
+		"status": "Open",
+		"status_category": "Open",
+		"agent_group": None,
+		"_assign": None,  # no ToDo left, so no assignee either
+		"resolution_by": None,
+		DUE_FIELD: None,
+		**values,
+	}
+	row["creation"] = creation
+	frappe.db.set_value(TICKET, name, row, update_modified=False)
+	return name
+
+
+def _closed() -> dict:
+	return {"status": "Closed", "status_category": "Resolved"}
+
+
+def _assign(ticket: str, *users: str) -> None:
+	"""People in charge, set the way a user does it (the ToDo rows and the ticket's assignee list agree)."""
+	for user in users:
+		assign_to.add({"assign_to": [user], "doctype": TICKET, "name": ticket})
+
+
+def _agent_comments(ticket: str) -> list:
+	return frappe.get_all(
+		"Comment",
+		filters={"reference_doctype": TICKET, "reference_name": ticket, "comment_type": "Comment"},
+		fields=["name", "owner", "content"],
+		order_by="creation asc",
+	)
+
+
+def _bot_rows(ticket: str) -> list:
+	return frappe.get_all(
+		LOG_DOCTYPE,
+		filters={"ticket": ticket, "entry_type": "bot_action"},
+		fields=["name", "trigger", "actions", "cost_usd", "creation"],
+		order_by="creation asc",
+	)
+
+
+def _iso(moment: datetime) -> str:
+	return f"{moment:%Y-%m-%d %H:%M:%S}"
+
+
+def _shown(moment: datetime) -> str:
+	return f"{moment:%d/%m/%Y %H:%M}"
+
+
+def _mention(user: str) -> str:
+	label = frappe.db.get_value("User", user, "full_name")
+	return f'<span class="mention" data-type="mention" data-id="{user}" data-label="{label}">@{label}</span>'
+
+
+class DueChecksTestCase(FrappeTestCase):
+	"""Own tickets and settings, rolled back after each test; the agent account pinned to its production roles;
+	the job never commits in a test."""
+
+	def setUp(self):
+		commit_guard = patch.object(
+			frappe.db, "commit", side_effect=AssertionError("test must not commit the transaction")
+		)
+		commit_guard.start()
+		self.addCleanup(commit_guard.stop)
+		self.addCleanup(frappe.db.rollback)
+		keep_agent_settings(self)
+		pin_agent_roles(self)
+		self.addCleanup(frappe.set_user, "Administrator")
+		frappe.set_user("Administrator")
+		self._settings(
+			enabled=1,
+			permission_level="L2",
+			category_mapping=json.dumps(CATEGORY_MAPPING),
+			field_due_date=DUE_FIELD,
+			due_reminder_hours=24,
+			ba_note_due_hours=24,
+			task_due_days=3,
+			excluded_teams="",
+			excluded_title_prefixes="",
+		)
+
+	def _settings(self, **fields) -> None:
+		set_agent_settings(**fields)
+		frappe.db.value_cache.pop(SETTING_DOCTYPE, None)
+
+	def _run(self, now: datetime) -> None:
+		"""One run of the job at `now`; the job leaves the agent session on, the test goes on as Administrator."""
+		due_checks.run_due_checks(now)
+		frappe.set_user("Administrator")
+
+
 class TestNames(FrappeTestCase):
 	def setUp(self):
 		keep_agent_settings(self)
@@ -95,9 +206,163 @@ class TestNames(FrappeTestCase):
 		)
 
 
-class TestDueReminder(FrappeTestCase):
-	def setUp(self):
-		keep_agent_settings(self)
+class TestDueReminder(DueChecksTestCase):
+	def test_three_kinds_by_due_overdue_closed(self):
+		# D takes its deadline from the due field, E from resolution_by (no due value): both are D-18 deadlines
+		soon, past = NOW + timedelta(hours=24), NOW - timedelta(hours=1)
+		cases = {
+			("D", "due_soon"): ({DUE_FIELD: soon}, soon, "due_soon"),
+			("D", "overdue"): ({DUE_FIELD: past}, past, "overdue"),
+			("D", "closed"): ({DUE_FIELD: past, **_closed()}, past, None),
+			("E", "due_soon"): ({"resolution_by": soon}, soon, "due_soon"),
+			("E", "overdue"): ({"resolution_by": past}, past, "overdue"),
+			("E", "closed"): ({"resolution_by": soon, **_closed()}, soon, None),
+		}
+		tickets = {
+			case: _ticket(case[0], NOW - timedelta(hours=1), **values)
+			for case, (values, _, _) in cases.items()
+		}
+
+		self._run(NOW)
+
+		for case, (_, deadline, kind) in cases.items():
+			ticket = tickets[case]
+			with self.subTest(case=case):
+				comments = _agent_comments(ticket)
+				if kind is None:
+					self.assertEqual(comments, [])
+					self.assertEqual(due_checks.sent_keys([ticket]), set())
+					continue
+				text = due_checks.DUE_SOON_TEXT if kind == "due_soon" else due_checks.OVERDUE_TEXT
+				expected = text.format(
+					hours=24, deadline=_shown(deadline), people=due_checks.NO_ASSIGNEE_TEXT
+				)
+				self.assertEqual([row.content for row in comments], [expected])
+				self.assertEqual(due_checks.sent_keys([ticket]), {(ticket, kind, _iso(deadline))})
+
+	def test_first_seen_overdue_only_overdue(self):
+		deadline = NOW - timedelta(hours=3)
+		ticket = _ticket("D", NOW - timedelta(hours=10), **{DUE_FIELD: deadline})
+
+		self._run(NOW)
+
+		self.assertEqual(due_checks.sent_keys([ticket]), {(ticket, "overdue", _iso(deadline))})
+		self.assertEqual(len(_agent_comments(ticket)), 1)
+		self.assertTrue(_agent_comments(ticket)[0].content.startswith("Nhắc hạn: phiếu đã quá hạn"))
+
+	def test_due_soon_then_overdue_two_total(self):
+		deadline = NOW + timedelta(hours=20)
+		ticket = _ticket("D", NOW - timedelta(hours=1), **{DUE_FIELD: deadline})
+
+		with patch("frappe.logger") as get_logger:
+			self._run(NOW)
+			self._run(deadline + timedelta(hours=1))
+
+		self.assertEqual(
+			due_checks.sent_keys([ticket]),
+			{(ticket, "due_soon", _iso(deadline)), (ticket, "overdue", _iso(deadline))},
+		)
+		self.assertEqual(len(_agent_comments(ticket)), 2)
+		summaries = [args for args in get_logger.return_value.info.call_args_list if args[0][0] == SUMMARY]
+		self.assertEqual(
+			[args[0][1:] for args in summaries], [(1, 0, 0, 0, 0, 0, False), (0, 1, 0, 0, 0, 0, False)]
+		)
+
+	def test_deadline_moved_is_new_cycle(self):
+		first = NOW + timedelta(hours=20)
+		moved = first + timedelta(days=3)
+		ticket = _ticket("E", NOW - timedelta(hours=1), resolution_by=first)
+
+		self._run(NOW)
+		frappe.db.set_value(TICKET, ticket, "resolution_by", moved, update_modified=False)
+		self._run(NOW + timedelta(hours=1))  # the moved deadline is not near yet
+		self._run(moved - timedelta(hours=20))
+
+		self.assertEqual(
+			due_checks.sent_keys([ticket]),
+			{(ticket, "due_soon", _iso(first)), (ticket, "due_soon", _iso(moved))},
+		)
+		self.assertEqual(len(_agent_comments(ticket)), 2)
+
+	def test_not_d_or_e_not_reminded(self):
+		soon = NOW + timedelta(hours=2)
+		tickets = [
+			_ticket(category, NOW - timedelta(hours=1), resolution_by=soon, **{DUE_FIELD: soon})
+			for category in ("A", "B", "C", "F", None)
+		]
+
+		self._run(NOW)
+
+		for ticket in tickets:
+			with self.subTest(ticket=ticket):
+				self.assertEqual(_agent_comments(ticket), [])
+				self.assertEqual(_bot_rows(ticket), [])
+
+	def test_due_field_not_configured_uses_resolution_by(self):
+		self._settings(field_due_date="")
+		near, far = NOW + timedelta(hours=2), NOW + timedelta(hours=30)
+		by_resolution = _ticket("D", NOW - timedelta(hours=1), resolution_by=near, **{DUE_FIELD: far})
+		by_due_value = _ticket("D", NOW - timedelta(hours=1), resolution_by=far, **{DUE_FIELD: near})
+
+		with patch("frappe.logger") as get_logger:
+			self._run(NOW)
+
+		self.assertEqual(due_checks.sent_keys([by_resolution]), {(by_resolution, "due_soon", _iso(near))})
+		self.assertEqual(due_checks.sent_keys([by_due_value]), set())
+		lines = [
+			args
+			for method in ("info", "warning", "error")
+			for args in getattr(get_logger.return_value, method).call_args_list
+			if "resolution_by" in str(args)
+		]
+		self.assertEqual(len(lines), 1)
+
+	def test_comment_mentions_assignees_owner_is_agent(self):
+		first, second, removed = (make_active_agent(self) for _ in range(3))
+		deadline = NOW + timedelta(hours=5)
+		assigned = _ticket("E", NOW - timedelta(hours=2), resolution_by=deadline)
+		_assign(assigned, first, removed, second)
+		assign_to.remove(TICKET, assigned, removed)  # a closed assignment is nobody in charge
+		nobody = _ticket("E", NOW - timedelta(hours=1), resolution_by=deadline)
+
+		self._run(NOW)
+
+		people = f"{_mention(first)}, {_mention(second)}"
+		for ticket, text, assignees in (
+			(assigned, people, [first, second]),
+			(nobody, due_checks.NO_ASSIGNEE_TEXT, []),
+		):
+			with self.subTest(ticket=ticket):
+				comments = _agent_comments(ticket)
+				self.assertEqual(len(comments), 1)
+				self.assertEqual(comments[0].owner, AGENT_USER)
+				self.assertEqual(
+					comments[0].content,
+					due_checks.DUE_SOON_TEXT.format(hours=24, deadline=_shown(deadline), people=text),
+				)
+				rows = _bot_rows(ticket)
+				self.assertEqual(len(rows), 1)
+				self.assertEqual(rows[0].trigger, "scheduled_job")
+				# U5b.md:356: the record HD Ticket.new_comment makes is a core Comment
+				self.assertEqual(
+					json.loads(rows[0].actions),
+					[
+						run_log.action_entry(
+							"due_reminder",
+							"Comment",
+							comments[0].name,
+							True,
+							value_after={
+								"kind": "due_soon",
+								"deadline": _iso(deadline),
+								"assignees": assignees,
+							},
+						)
+					],
+				)
+		for user in (first, second):
+			self.assertIn(f'data-id="{user}"', _agent_comments(assigned)[0].content)
+		self.assertNotIn(removed, _agent_comments(assigned)[0].content)
 
 	def test_boundary_exactly_24h(self):
 		cases = (
@@ -117,6 +382,23 @@ class TestDueReminder(FrappeTestCase):
 		for deadline, hours, expected in cases:
 			with self.subTest(deadline=deadline, hours=hours):
 				self.assertEqual(due_checks.due_kind(deadline, NOW, hours), expected)
+
+
+class TestGates(DueChecksTestCase):
+	def test_agent_off_or_l0_no_reminder(self):
+		ticket = _ticket("D", NOW - timedelta(hours=1), **{DUE_FIELD: NOW + timedelta(hours=2)})
+		for case, fields in (("agent off", {"enabled": 0}), ("level L0", {"permission_level": "L0"})):
+			with self.subTest(case=case):
+				self._settings(**{"enabled": 1, "permission_level": "L2", **fields})
+
+				with patch("frappe.logger") as get_logger:
+					due_checks.run_due_checks(NOW)
+
+				self.assertEqual(frappe.session.user, "Administrator")
+				self.assertEqual(_agent_comments(ticket), [])
+				self.assertEqual(_bot_rows(ticket), [])
+				self.assertEqual(len(get_logger.return_value.method_calls), 1)
+				self.assertEqual(get_logger.return_value.method_calls[0][0], "info")
 
 
 class TestMilestones(FrappeTestCase):

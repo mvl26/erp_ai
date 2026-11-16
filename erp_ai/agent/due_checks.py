@@ -17,7 +17,7 @@ from frappe.utils.synchronization import filelock
 
 from erp_ai.agent import authority, ops_data, policy, run_log
 from erp_ai.agent.classification import load_mapping
-from erp_ai.constants import AGENT_USER, LEVELS, LOG_DOCTYPE, LOGGER_NAME, SETTING_DOCTYPE
+from erp_ai.constants import AGENT_USER, LEVELS, LOG_DOCTYPE, LOGGER_NAME, SETTING_DOCTYPE, TITLE_RUN_FAILED
 
 DUE_REMINDER_TOOL = "due_reminder"
 MILESTONE_REMINDER_TOOL = "milestone_reminder"
@@ -42,6 +42,7 @@ TICKET = ops_data.TICKET
 COMMENT_DOCTYPE = "Comment"  # the record HD Ticket.new_comment makes (Document.add_comment), U5b.md:356
 NOTIFICATION_DOCTYPE = "Notification Log"
 LOCK_TIMEOUT_S = 5
+SAVEPOINT = "erp_ai_due"
 DUE_CATEGORIES = ("D", "E")
 BA_NOTE_CATEGORIES = ("C",)
 TASK_CATEGORIES = ("C", "D")
@@ -58,8 +59,6 @@ TOOL_BY_KIND = {
 	KIND_BA_NOTE_MISSING: MILESTONE_REMINDER_TOOL,
 	KIND_TASK_MISSING: MILESTONE_REMINDER_TOOL,
 }
-# Structural columns only: never the subject, the description or a comment of a ticket (A-12, NFR-1).
-CANDIDATE_FIELDS = ("name", "creation", "ticket_type", "resolution_by")
 DEADLINE_FORMAT = "%d/%m/%Y %H:%M"
 DEADLINE_KEY_FORMAT = "%Y-%m-%d %H:%M:%S"
 # The mention tag of the Helpdesk editor; Frappe notifies every `data-id` of a `mention` span in a comment.
@@ -148,6 +147,8 @@ def run_due_checks(now: datetime | None = None) -> None:
 	(ticket, kind) whose cycle key is not sent yet, oldest ticket first, then one logger line.
 
 	A busy lock, the agent off and the effective level L0 (after the budget cap, AC-23) send nothing and log one line.
+	Nothing leaves this function as an error: a failed (ticket, kind) is undone to its savepoint, logged and skipped
+	(its key is not written, so the next run sends it once); a failure outside the tickets ends the run, logged.
 	"""
 	logger = frappe.logger(LOGGER_NAME)
 	try:
@@ -155,6 +156,9 @@ def run_due_checks(now: datetime | None = None) -> None:
 			_run_locked(get_datetime(now) if now else now_datetime(), logger)
 	except LockTimeoutError:
 		logger.info("due_checks: lock busy")
+	except Exception as exc:
+		# every (ticket, kind) done before is already committed with its key
+		frappe.log_error(TITLE_RUN_FAILED, f"due_checks error={type(exc).__name__}")
 
 
 def _run_locked(now: datetime, logger) -> None:
@@ -192,8 +196,21 @@ def _run_locked(now: datetime, logger) -> None:
 	people = _people_in_charge(sorted({reminder.ticket for reminder in reminders}))
 	counts = dict.fromkeys(SUMMARY_COUNTS, 0)
 	for reminder in sorted(reminders, key=lambda reminder: (reminder.created, reminder.ticket)):
-		if counted := _remind(reminder, people.get(reminder.ticket, []), settings):
+		frappe.db.savepoint(SAVEPOINT)
+		try:
+			counted = _remind(reminder, people.get(reminder.ticket, []), settings)
+		except Exception as exc:
+			_undo()
+			frappe.log_error(
+				TITLE_RUN_FAILED,
+				f"due_checks ticket={reminder.ticket} kind={reminder.kind} error={type(exc).__name__}",
+			)
+			counted = ERRORS
+		if counted:
 			counts[counted] += 1
+		if not frappe.flags.in_test:
+			# releases the ticket's row lock (a skipped or failed one too) and keeps its Error Log
+			frappe.db.commit()
 	capped = due_capped or ba_note_capped or task_capped
 	logger.info(SUMMARY, *(counts[name] for name in SUMMARY_COUNTS), capped)
 
@@ -206,10 +223,11 @@ def _candidates(
 	ticket_types = [ticket_type for ticket_type, category in reverse_map.items() if category in categories]
 	if not ticket_types:
 		return [], False
+	# structural columns only: never the subject, the description or a comment of a ticket (A-12, NFR-1)
 	rows = frappe.get_all(
 		TICKET,
 		filters=[["status_category", "!=", "Resolved"], ["ticket_type", "in", ticket_types]],
-		fields=[*CANDIDATE_FIELDS, *([due_field] if due_field else [])],
+		fields=["name", "creation", "ticket_type", "resolution_by", *([due_field] if due_field else [])],
 		order_by="creation asc, name asc",
 		limit=CANDIDATE_LIMIT,
 	)
@@ -293,9 +311,14 @@ def _value_after(reminder: _Reminder, users: list[str]) -> dict:
 
 
 def _remind(reminder: _Reminder, users: list[str], settings) -> str | None:
-	"""One (ticket, kind): a comment on a ticket the agent may take (policy.can_send_ticket); else a coded notice to
-	each person in charge, or nothing and no key when there is none (A-U5b-6: tried again next run). Returns the
-	summary count to add one to, or None when nothing is sent."""
+	"""Steps 6.1-6.3 for one (ticket, kind), inside the caller's savepoint: lock the ticket row and read its keys
+	again (a run that started before this one may have sent it since the batch read); then a comment on a ticket the
+	agent may take (policy.can_send_ticket), else a coded notice to each person in charge, or nothing and no key
+	when there is none (A-U5b-6: tried again next run). Returns the summary count to add one to, or None when
+	nothing is sent."""
+	_lock_ticket(reminder.ticket)
+	if reminder.key in sent_keys([reminder.ticket]):
+		return None
 	if policy.can_send_ticket(reminder.ticket):
 		_remind_on_ticket(reminder, users, settings)
 		return reminder.kind
@@ -305,6 +328,19 @@ def _remind(reminder: _Reminder, users: list[str], settings) -> str | None:
 		return NO_ASSIGNEE
 	_notify_by_code(reminder, users, settings)
 	return reminder.kind
+
+
+def _lock_ticket(name: str) -> None:
+	"""Lock the ticket's row until the next commit (U5b.md:227; the one for_update of this module, controller
+	ruling R30): a second run waits here, then finds the key the first one wrote."""
+	frappe.db.get_value(TICKET, name, "name", for_update=True)
+
+
+def _undo() -> None:
+	"""Roll back to SAVEPOINT and drop the commit callbacks the undone work queued (as lifecycle._undo_to does)."""
+	frappe.db.rollback(save_point=SAVEPOINT)
+	frappe.db.before_commit.reset()
+	frappe.db.after_commit.reset()
 
 
 def _remind_on_ticket(reminder: _Reminder, users: list[str], settings) -> None:

@@ -151,6 +151,8 @@ class RunnerTestBase(FrappeTestCase):
 		self.addCleanup(latest_patch.stop)
 
 	def _entries(self, **filters):
+		# ADR-048 QĐ 5 (CHG-009): a run_event row is not a run's row; only a caller asking for that type gets it.
+		filters.setdefault("entry_type", ("!=", "run_event"))
 		return frappe.get_all(
 			LOG_DOCTYPE,
 			filters={"ticket": self.ticket.name, **filters},

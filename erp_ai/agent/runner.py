@@ -68,6 +68,7 @@ from erp_ai.agent.tools.write_ticket import (
 	mark_work_only,
 	open_collector,
 	post_guidance,
+	post_guidance_reply,
 	post_notice,
 )
 from erp_ai.constants import (
@@ -204,6 +205,8 @@ TICKET_FIELD_SETTINGS = tuple(f"field_{key}" for key in TICKET_FIELD_LABELS)
 GUIDANCE_EXISTS_LOG = "erp_ai guidance ticket=%s run_id=%s: đã có hướng xử lý"
 # The action entry of the run's one guidance comment (ADR-036 QĐ 8, w1.md:105).
 GUIDANCE_TOOL = "post_guidance"
+# The answer in the conversation of a run a message started, when the guidance comment took it (CHG-003 Amendment 3).
+GUIDANCE_REPLY_TOOL = "post_guidance_reply"
 # The split question a guidance run's route gathered, per run: (classify row, text, requests), recorded as asked only
 # once the run's one comment carrying it is posted (AC-28, C9-fix1 R20a); dropped when the run ends.
 SPLIT_HELD_FLAG = "erp_ai_split_held"
@@ -1453,7 +1456,9 @@ def _finish_guidance(context, actions) -> None:
 	counts (QĐ 8). A run in parallel posted the ticket's guidance first → one log line, and the run's collected lines
 	go out as before: one result comment without the marker, in the order of GUIDANCE_SECTIONS, one sentence per line,
 	each escaped once, no section heading (design-w1-fixes-20 Điểm 1.6, AD3-4). Nothing to say → one log line.
-	Either comment, once posted, records the split question the route held (`_record_split`); a refusal records none."""
+	Either comment, once posted, records the split question the route held (`_record_split`); a refusal records none.
+	Once the guidance comment is posted, a run a message started that said nothing in the conversation answers there
+	too, with its own entry (CHG-003 Amendment 3)."""
 	ticket, run_id = context.ticket_name, context.run_id
 	result = post_guidance(ticket, run_id)
 	if result.get("ok"):
@@ -1468,6 +1473,18 @@ def _finish_guidance(context, actions) -> None:
 			)
 		)
 		_record_split(run_id, result["comment"])
+		reply = post_guidance_reply(context)
+		if reply is not None:
+			actions.append(
+				action_entry(
+					GUIDANCE_REPLY_TOOL,
+					MESSAGE_DOCTYPE,
+					reply.get("message"),
+					bool(reply.get("ok")),
+					reason=reply.get("reason"),
+					instructor=context.instructor,
+				)
+			)
 		return
 	reason = result.get("reason")
 	if reason == REASON_NO_CONTENT:

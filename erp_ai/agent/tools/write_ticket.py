@@ -25,6 +25,7 @@ from erp_ai.constants import (
 	CONFIDENCE_VALUES,
 	LEVELS,
 	LOGGER_NAME,
+	MESSAGE_DOCTYPE,
 	SETTING_DOCTYPE,
 )
 
@@ -83,6 +84,13 @@ REASON_NOTICE_SENT = "đã thông báo"
 _GUIDANCE_KEY = "erp_ai:huong-xu-ly"
 GUIDANCE_MARKER = f"<!-- {_GUIDANCE_KEY} -->"
 GUIDANCE_HEADER = "Hướng xử lý"
+ANALYSIS_HEADER = "Nhận định"
+# A run a message started whose answer the guidance comment took still answers in the conversation (CHG-003
+# Amendment 3): the finding of its analysis, then where the rest is. Plain text: the panel only sets text.
+GUIDANCE_REPLY = (
+	"Bot đã viết hướng xử lý cho phiếu: nhận định đầy đủ, việc đã làm, đề xuất chờ duyệt và việc cần người làm nằm ở "
+	'mục "Thông tin AI của phiếu" phía trên và ở comment hướng xử lý của phiếu.'
+)
 SECTION_DONE, SECTION_PENDING = "Đã làm", "Chờ duyệt"
 # Collector key of "work a person must do by hand, with the reason": shown inside the plan section, no heading of
 # its own (design-w1-fixes-20 Điểm 1.1, spec-addendum-5 AC-65 (a)).
@@ -312,14 +320,6 @@ def _post_message(content: str, ctx: ToolContext) -> dict:
 	return {"ok": True, "message": name}
 
 
-def _say(content: str, ctx: ToolContext) -> dict:
-	"""Post what the model says to people: in the ticket's conversation when a message there started the run (the bot
-	answers where it was asked), else as a comment on the ticket."""
-	if ctx.in_conversation:
-		return _post_message(content, ctx)
-	return _post(ctx.ticket_name, content)
-
-
 def _heading_line(header: str) -> re.Pattern:
 	"""A line opening with the `<header>:` heading, the `**` around it optional (U4b.md:168)."""
 	return re.compile(rf"^[ \t]*(?:\*\*)?{re.escape(header)}:(?:\*\*)?", re.M)
@@ -391,7 +391,7 @@ def _ask_below_threshold(kind: str, content: str, ctx: ToolContext) -> dict:
 		return _fail(REASON_ONE_ASK)
 	if not section_text(content, EVIDENCE_HEADER):
 		return _fail(REASON_NO_EVIDENCE)
-	result = _say(f"{content}\n\n{_ask_footer(ctx.ticket_name)}", ctx)
+	result = _post_message(f"{content}\n\n{_ask_footer(ctx.ticket_name)}", ctx)
 	if result["ok"]:
 		mark_asked(ctx.run_id)
 	return result
@@ -585,6 +585,22 @@ def post_guidance(ticket_name: str, run_id: str) -> dict:
 	}
 
 
+def post_guidance_reply(ctx: ToolContext) -> dict | None:
+	"""The answer of a run a message started when the guidance comment took it (CHG-003 Amendment 3): one message with
+	the finding of the run's held analysis, when it has one, and where the rest of the guidance is; the runner calls it
+	right after `post_guidance`. A run nothing typed started, or one that already said something in the conversation
+	→ None, nothing written."""
+	if not ctx.in_conversation or frappe.db.exists(
+		MESSAGE_DOCTYPE, {"ticket": ctx.ticket_name, "run_id": ctx.run_id}
+	):
+		return None
+	analysis = collected(ctx.run_id)[0]
+	finding = section_text(analysis, ANALYSIS_HEADER) if analysis else None
+	return _post_message(
+		f"{ANALYSIS_HEADER}: {finding}\n\n{GUIDANCE_REPLY}" if finding else GUIDANCE_REPLY, ctx
+	)
+
+
 def failure_summary(run_id: str) -> str:
 	"""What the run did before it failed, for its run_failed notice (design-w1-fixes-20 Điểm 3.1): one part per
 	non-empty section, done, pending and manual apart, each line escaped once; not collecting → ""."""
@@ -651,7 +667,8 @@ def _ba_note_content(content: str) -> str:
 def post_comment_tool(args: dict, ctx: ToolContext) -> dict:
 	"""Handler of the post_comment tool (AC-22, U4b.md:171, w1.md:96): checks the steps in order, then posts; a
 	refusal posts nothing, and in a guidance run a proposal is held for post_guidance instead. A question or a
-	proposal is what the bot says to people (`_say`); the BA note is ticket information, always a comment."""
+	proposal is what the bot says to people: a message of the ticket's conversation, whatever started the run
+	(CHG-003 Amendment 3); the BA note is ticket information, always a comment."""
 	kind, content = args.get("kind"), args["content"]
 	# Step (0): the marker is the writer's alone, whatever the kind, before any other check (AC-65 (d)).
 	if _GUIDANCE_KEY in re.sub(r"\s+", "", content).lower():
@@ -679,7 +696,7 @@ def post_comment_tool(args: dict, ctx: ToolContext) -> dict:
 	if kind == "de_xuat" and (outcome := _hold_or_refuse(content, ctx)):
 		return outcome
 	# Steps (4), (5): a question above the threshold needs nothing more.
-	return _say(content, ctx)
+	return _post_message(content, ctx)
 
 
 def _ticket_link_html(name: str) -> str:
@@ -795,7 +812,8 @@ TOOLS: list[ToolSpec] = [
 		schema={
 			"name": "post_comment",
 			"description": (
-				"Đăng một comment lên phiếu hiện tại. "
+				"Nói với người trên phiếu hiện tại: câu đề xuất và câu hỏi là tin trong ngăn 'Trao đổi với bot' "
+				"của phiếu, BA note là comment của phiếu. "
 				"kind=de_xuat: nhận định và phương án, hoặc báo việc đã làm; phải có dòng 'Độ tin cậy: NN%'. "
 				"kind=hoi: câu hỏi; khi độ tin cậy dưới ngưỡng chỉ được dùng kind này, một lần, "
 				f"và vẫn phải có '**{EVIDENCE_HEADER}:**' nêu vì sao chưa chắc. "

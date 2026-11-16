@@ -261,6 +261,8 @@ STATUS_SCRIPT_FORBIDDEN = (
 	# CHG-008 T4: the panel only reads proposals; deciding goes through its own method, never the controller.
 	r"change_decision",
 	r"erp_ai_change_proposal\.",
+	# CHG-008 T5 (AC-5): Duyệt / Từ chối is one click, never a confirm dialog of the browser or of Frappe.
+	r"\bconfirm\(",
 )
 # Regexes: the socket guard keeps setupForm (run many times) from registering listeners twice; the
 # `state.ticket = null` leave-page step keeps a left ticket's signals from showing (ADR-008 decision 6).
@@ -351,6 +353,26 @@ STATUS_SCRIPT_REQUIRED = (
 	r"decisionButtons: \[\]",
 	r"Array\.isArray\(proposals\)",
 	r"renderProposals\(data\)",
+	# CHG-008 T5 (design 4.2, 4.3; AC-5, AC-11): Duyệt / Từ chối post once, lock both buttons while waiting, show
+	# the fixed error sentence on failure and reload the panel once in both branches.
+	r'TEXT_APPROVE = "Duyệt";',
+	r'TEXT_REJECT = "Từ chối";',
+	r'TEXT_DECIDE_FAILED =\s*"Không duyệt hoặc từ chối được đề xuất; hãy xem trạng thái hiện tại trên thẻ\."',
+	r"decisionButton\(TEXT_APPROVE, name, ACTION_APPROVE\),\s*decisionButton\(TEXT_REJECT, name, ACTION_REJECT\)",
+	r"button\.disabled = panel\.deciding;",
+	r"panel\.decisionButtons\.push\(button\)",
+	r'addEventListener\("click", \(\) => \{\s*try \{\s*decide\(name, action\);',
+	r"if \(panel\.deciding \|\| !panel\.open \|\| !state\.ticket\) \{\s*return;",
+	r'panel\.deciding = true;\s*lockDecisions\(true\);\s*panel\.proposalErrorEl\.textContent = "";',
+	r'state\s*\.call\("erp_ai\.ticket_panel\.decide_proposal", \{ name, action \}\)\s*\.then\(onDecided, onDecideFailed\)',
+	r"onDecided = \(\) => \{\s*try \{\s*if \(isStale\(\)\) \{\s*return;\s*\}\s*panel\.deciding = false;\s*reload\(\);",
+	r"onDecideFailed = \(\) => \{\s*try \{\s*if \(isStale\(\)\) \{\s*return;\s*\}\s*panel\.deciding = false;\s*"
+	r"lockDecisions\(false\);\s*panel\.proposalErrorEl\.textContent = TEXT_DECIDE_FAILED;\s*reload\(\);",
+	r"catch \(e\) \{\s*onDecideFailed\(\);",
+	# T6 review ruling: a card without a name has no button; a failed card render clears only the proposals.
+	r'const name = String\(card\?\.name \?\? ""\);\s*if \(!name\) \{\s*return row;',
+	r'renderMessages\(data\);\s*panel\.errorEl\.textContent = "";',
+	r"try \{\s*renderProposals\(data\);\s*\} catch \(e\) \{\s*clearProposals\(\);",
 	# T14 live updates (design F3): both listeners are named handlers registered once per socket, in the guard block.
 	r'state\.socket = socket;\s*socket\.on\(EVENT, onStatus\);\s*socket\.on\("docinfo_update", onDocinfo\);\s*socket\.on\("doc_update", onDocUpdate\);',
 	r"docinfo_update",
@@ -1721,7 +1743,8 @@ def check_whitelisted_methods_declare_http_methods(sources: dict) -> list:
 
 
 def check_ticket_panel_whitelist(sources: dict, expected=PANEL_METHODS) -> list:
-	"""ADR-010 Amendment 1: exactly the two panel methods, each `methods=["POST"]` and nothing else."""
+	"""ADR-010 Amendment 1, ADR-044 QĐ 1: exactly the panel methods of `PANEL_METHODS` (read, send, decide), each
+	`methods=["POST"]` and nothing else."""
 	if PANEL_FILE not in sources:
 		return [f"{PANEL_FILE} is missing"]
 	violations = []
@@ -2869,6 +2892,177 @@ def check_role_instructor_only_in_decider_role(sources: dict) -> list:
 				violations.append(violation(rel, node, "ROLE_INSTRUCTOR outside has_decider_role"))
 			elif isinstance(node, ast.Constant) and node.value == "ERP AI Instructor":
 				violations.append(violation(rel, node, "the role literal outside has_decider_role"))
+	return violations
+
+
+PANEL_DECIDE_FUNCTION = "decide_proposal"
+PANEL_DECIDE_METHOD = f"{PANEL_MODULE}.{PANEL_DECIDE_FUNCTION}"
+PANEL_DECISIONS_NAME = "PANEL_DECISIONS"
+PANEL_GATE_FUNCTION = "_require_panel_access"
+PANEL_HEAD_FUNCTION = "proposal_head"
+PANEL_PREDICATE_FUNCTION = "panel_decision_refusal"
+# ADR-044 Ràng buộc 3: names the panel's decision path never uses itself (the controller method does that work).
+PANEL_DECIDE_FORBIDDEN = (
+	"permission_switches",
+	"transitions",
+	"enqueue_change_job",
+	"undo",
+	"confirm_restart",
+)
+# AC-8 (b): what no bot module may name, in code or in text.
+AGENT_PANEL_NEEDLES = (PANEL_MODULE.rpartition(".")[2], PANEL_DECIDE_FUNCTION)
+
+
+def _call_leaf(node: ast.Call) -> str:
+	return (dotted_name(node.func) or "").rpartition(".")[2]
+
+
+def _decide_gate_violations(decide, head, gate) -> list:
+	"""The gate's ticket is `<name>.ticket` of the name `proposal_head(...)` was assigned to, and its label is decide."""
+	violations = []
+	assigned = {
+		target.id
+		for node in ast.walk(decide)
+		if isinstance(node, ast.Assign) and node.value is head
+		for target in node.targets
+		if isinstance(target, ast.Name)
+	}
+	first = gate.args[0] if gate.args else None
+	if not (
+		isinstance(first, ast.Attribute)
+		and first.attr == "ticket"
+		and isinstance(first.value, ast.Name)
+		and first.value.id in assigned
+	):
+		violations.append(
+			violation(
+				PANEL_FILE,
+				gate,
+				f"the first argument of {PANEL_GATE_FUNCTION} is not the ticket of proposal_head(...)",
+			)
+		)
+	label = {kw.arg: kw.value for kw in gate.keywords}.get("method")
+	if not (isinstance(label, ast.Constant) and label.value == "decide"):
+		violations.append(
+			violation(PANEL_FILE, gate, f'{PANEL_GATE_FUNCTION} is not called with method="decide"')
+		)
+	return violations
+
+
+def check_panel_decision_follows_adr_044(sources: dict) -> list:
+	"""CHG-008 design 3.2, 8.2 (ADR-044 QĐ 5, Ràng buộc 3): `decide_proposal(name, action)` takes no ticket; it
+	calls, in this order and once each, `proposal_head(...)`, the panel gate with the `ticket` of that head, the
+	predicate `panel_decision_refusal`, then the controller through `PANEL_DECISIONS[...]` and never `approve`/
+	`reject` directly; neither it nor `PANEL_DECISIONS` names the switch reader, the state machine, the job queue,
+	undo or confirm_restart."""
+	source = sources.get(PANEL_FILE)
+	if source is None:
+		return _missing(PANEL_FILE)
+	tree = parse(PANEL_FILE, source)
+	definitions = _module_definitions(tree)
+	decide = definitions.get(PANEL_DECIDE_FUNCTION)
+	if not isinstance(decide, ast.FunctionDef):
+		return [f"{PANEL_FILE}: no function {PANEL_DECIDE_FUNCTION}"]
+	violations = []
+	params = _parameters(decide)
+	if params != ["name", "action"] or decide.args.vararg or decide.args.kwarg:
+		violations.append(
+			violation(
+				PANEL_FILE, decide, f"{PANEL_DECIDE_FUNCTION} takes {params}, expected ['name', 'action']"
+			)
+		)
+	calls = [node for node in ast.walk(decide) if isinstance(node, ast.Call)]
+	steps = {
+		PANEL_HEAD_FUNCTION: [c for c in calls if _call_leaf(c) == PANEL_HEAD_FUNCTION],
+		PANEL_GATE_FUNCTION: [c for c in calls if _call_leaf(c) == PANEL_GATE_FUNCTION],
+		PANEL_PREDICATE_FUNCTION: [c for c in calls if _call_leaf(c) == PANEL_PREDICATE_FUNCTION],
+		f"{PANEL_DECISIONS_NAME}[...]": [
+			c
+			for c in calls
+			if isinstance(c.func, ast.Subscript) and dotted_name(c.func.value) == PANEL_DECISIONS_NAME
+		],
+	}
+	for label, found in steps.items():
+		if len(found) != 1:
+			violations.append(
+				violation(
+					PANEL_FILE,
+					decide,
+					f"{PANEL_DECIDE_FUNCTION} calls {label} {len(found)} times, expected once",
+				)
+			)
+	for call in calls:
+		if _call_leaf(call) in ("approve", "reject"):
+			violations.append(
+				violation(
+					PANEL_FILE,
+					call,
+					f"{_call_leaf(call)} is called directly, not through {PANEL_DECISIONS_NAME}",
+				)
+			)
+	if all(len(found) == 1 for found in steps.values()):
+		ordered = [found[0] for found in steps.values()]
+		positions = [(node.lineno, node.col_offset) for node in ordered]
+		if positions != sorted(positions):
+			violations.append(
+				violation(
+					PANEL_FILE, decide, f"{PANEL_DECIDE_FUNCTION} order is not {' -> '.join(steps)} (D-3)"
+				)
+			)
+		violations.extend(_decide_gate_violations(decide, ordered[0], ordered[1]))
+	table = definitions.get(PANEL_DECISIONS_NAME)
+	if table is None:
+		violations.append(f"{PANEL_FILE}: no {PANEL_DECISIONS_NAME}")
+	docstrings = _docstring_ids(decide)
+	for scope in (decide, table):
+		for node in ast.walk(scope) if scope is not None else ():
+			if isinstance(node, ast.Name | ast.Attribute):
+				name = node.id if isinstance(node, ast.Name) else node.attr
+			elif (
+				isinstance(node, ast.Constant) and isinstance(node.value, str) and id(node) not in docstrings
+			):
+				name = node.value
+			else:
+				continue
+			if name in PANEL_DECIDE_FORBIDDEN:
+				violations.append(violation(PANEL_FILE, node, f"the panel decision names {name} (ADR-044)"))
+	return violations
+
+
+def check_agent_modules_never_reference_panel(sources: dict) -> list:
+	"""CHG-008 AC-8 (b): no product file under agent/ names the panel module or its decision method, in code,
+	text or comments, so no bot tool can reach the panel's approval path."""
+	return [
+		f"{rel}: names {needle}"
+		for rel, text in scoped(sources, AGENT_PREFIX).items()
+		for needle in AGENT_PANEL_NEEDLES
+		if needle in text
+	]
+
+
+def check_status_script_decides_once(script: str) -> list:
+	"""CHG-008 design 4.2, ADR-044 QĐ 7 (AC-5, AC-11): the decision method is named once, inside `decide`, which
+	reloads the panel once per answer (one `reload()` in each of its two branches) and schedules nothing."""
+	masked = mask_js(script)
+	span = _js_arrow_body_span(masked, "decide")
+	if span is None:
+		return ["function decide is missing"]
+	violations = []
+	calls = [m for m in STATUS_SCRIPT_CALL.finditer(script) if m.group(2) == PANEL_DECIDE_METHOD]
+	if len(calls) != 1:
+		violations.append(f"{PANEL_DECIDE_METHOD} is called {len(calls)} times, expected once")
+	for match in calls:
+		if not span[0] <= match.start() < span[1]:
+			violations.append(
+				f"line {js_line(script, match.start())}: {PANEL_DECIDE_METHOD} is called outside decide"
+			)
+	body = masked[span[0] : span[1]]
+	reloads = len(re.findall(r"\breload\(\)", body))
+	if reloads != 2:
+		violations.append(f"decide calls reload() {reloads} times, expected one per branch (2)")
+	for name in ("setTimeout(", "submit("):
+		if name in body:
+			violations.append(f"decide calls {name}")
 	return violations
 
 
@@ -5441,10 +5635,15 @@ class TestArchitecture(unittest.TestCase):
 		self.assertTrue({(PANEL_FILE, "get_panel_data"), (PANEL_FILE, "send_message")} <= found, found)
 		self.assertEqual(check_whitelisted_methods_declare_http_methods(self.sources), [])
 
-	def test_ticket_panel_has_exactly_two_whitelisted_methods(self):
+	def test_ticket_panel_has_exactly_three_whitelisted_methods(self):
+		# ADR-044 QĐ 1 (CHG-008): the panel gains one decision method; still POST only, still no guest
 		self.assertEqual(
 			sorted(PANEL_METHODS),
-			["erp_ai.ticket_panel.get_panel_data", "erp_ai.ticket_panel.send_message"],
+			[
+				"erp_ai.ticket_panel.decide_proposal",
+				"erp_ai.ticket_panel.get_panel_data",
+				"erp_ai.ticket_panel.send_message",
+			],
 		)
 		self.assertEqual(check_ticket_panel_whitelist(self.sources), [])
 
@@ -5897,6 +6096,92 @@ class TestArchitecture(unittest.TestCase):
 		found = check_role_instructor_only_in_decider_role({**self.sources, "change_decision.py": literal})
 		self.assertTrue(any("role literal" in text for text in found), found)
 
+	def test_panel_decision_follows_adr_044(self):
+		# CHG-008 design 3.2, 8.2: the D-3 order, the gate on the proposal's own ticket, one predicate call and one
+		# controller call through the action table, and nothing of the switch, state machine, queue or undo
+		self.assertEqual(check_panel_decision_follows_adr_044(self.sources), [])
+		panel = self.sources[PANEL_FILE]
+		gate = '\t_require_panel_access(head.ticket, method="decide")\n'
+		predicate = "\trefusal = proposal_form.panel_decision_refusal(head.change_status)\n"
+		cases = {
+			"no predicate": (
+				("proposal_form.panel_decision_refusal(head.change_status)", "None"),
+				"panel_decision_refusal 0 times",
+			),
+			"browser ticket": (
+				(
+					"def decide_proposal(name=None, action=None)",
+					"def decide_proposal(name=None, action=None, ticket=None)",
+				),
+				"expected ['name', 'action']",
+			),
+			"gate on the name": (
+				("_require_panel_access(head.ticket,", "_require_panel_access(name,"),
+				"not the ticket of proposal_head",
+			),
+			"gate label": (('method="decide")', 'method="get")'), 'method="decide"'),
+			"direct controller call": (
+				("PANEL_DECISIONS[action](name)", "proposal_form.approve(name)"),
+				"approve is called directly",
+			),
+			"state machine": (
+				("\tresult = PANEL_DECISIONS", "\ttransitions.finish(name)\n\tresult = PANEL_DECISIONS"),
+				"names transitions",
+			),
+			"switch read": (
+				("\trefusal = ", "\tpolicy.permission_switches(None)\n\trefusal = "),
+				"names permission_switches",
+			),
+			"undo in the table": (("proposal_form.reject,", "proposal_form.undo,"), "names undo"),
+			"predicate before gate": ((gate + predicate, predicate + gate), "order is not"),
+		}
+		for case, ((old, new), fragment) in cases.items():
+			with self.subTest(case=case):
+				self.assertIn(old, panel)
+				found = check_panel_decision_follows_adr_044({PANEL_FILE: panel.replace(old, new, 1)})
+				self.assertTrue(any(fragment in text for text in found), found)
+
+	def test_agent_modules_never_reference_panel(self):
+		# CHG-008 AC-8 (b): no bot module names the panel or its decision method, in code, text or comments
+		scanned = load_product_sources(suffixes=(".py", ".md"))
+		self.assertGreater(len(scoped(scanned, AGENT_PREFIX)), 0)
+		self.assertEqual(check_agent_modules_never_reference_panel(scanned), [])
+		for extra, fragment in (
+			("from erp_ai import ticket_panel\n", "names ticket_panel"),
+			('METHOD = "erp_ai.ticket_panel.decide_proposal"\n', "names decide_proposal"),
+			("# the bot could call decide_proposal\n", "names decide_proposal"),
+		):
+			with self.subTest(extra=extra):
+				found = check_agent_modules_never_reference_panel(
+					{**scanned, "agent/messages.py": scanned["agent/messages.py"] + extra}
+				)
+				self.assertTrue(any(fragment in text for text in found), found)
+
+	def test_status_script_decides_by_one_post_then_one_reload(self):
+		# CHG-008 design 4.2, ADR-044 QĐ 7: one decision call, inside decide, one reload per answer, no timer
+		script = self.status_script()
+		self.assertEqual(check_status_script_decides_once(script), [])
+		cases = {
+			"no reload after a failure": (
+				re.sub(r"(= TEXT_DECIDE_FAILED;)\s*reload\(\);", r"\1", script, count=1),
+				"reload() 1 times",
+			),
+			"a second call": (script + f'\nstate.call("{PANEL_DECIDE_METHOD}", {{}});\n', "called 2 times"),
+			"a timer": (
+				script.replace("panel.deciding = true;", "setTimeout(reload, 1);\npanel.deciding = true;", 1),
+				"setTimeout(",
+			),
+			"no decide": (
+				script.replace("const decide = (", "const decideIt = (", 1),
+				"function decide is missing",
+			),
+		}
+		for case, (source, fragment) in cases.items():
+			with self.subTest(case=case):
+				self.assertNotEqual(source, script)
+				found = check_status_script_decides_once(source)
+				self.assertTrue(any(fragment in text for text in found), found)
+
 	def test_tool_never_saves_proposal(self):
 		self.assertIn("proposal.insert()", self.sources[PROPOSE_TOOL_FILE])
 		self.assertEqual(check_tool_never_saves_proposal(self.sources), [])
@@ -6021,6 +6306,8 @@ class TestArchitecture(unittest.TestCase):
 		for name in CHANGE_STATE_NAMES:
 			self.assertIn((PROPOSAL_CONTROLLER_FILE, name), reaching)
 		self.assertIn(("change_decision.py", "decide"), reaching)
+		# ADR-044 (CHG-008): the panel's decision method reaches approve / reject through PANEL_DECISIONS
+		self.assertIn((PANEL_FILE, PANEL_DECIDE_FUNCTION), reaching)
 		self.assertEqual(check_no_get_whitelist_reaches_change_state(self.sources), [])
 
 	def test_change_link_builds_no_api_method_path(self):
@@ -7768,6 +8055,7 @@ class TestScannersCatchViolations(unittest.TestCase):
 
 	# ticket panel (ADR-009, ADR-010 Amendment 1) -------------------------------------------------
 
+	# ADR-044 QĐ 1 (CHG-008): the clean panel has the third method, decide_proposal, like the product.
 	PANEL_SOURCES: ClassVar[dict] = {
 		"ticket_panel.py": (
 			"import frappe\n"
@@ -7776,12 +8064,19 @@ class TestScannersCatchViolations(unittest.TestCase):
 			"def get_panel_data(ticket):\n\treturn 1\n"
 			"@frappe.whitelist(methods=['POST'])\n"
 			"def send_message(ticket, text):\n\treturn messages.add_message(ticket, text)\n"
+			"@frappe.whitelist(methods=['POST'])\n"
+			"def decide_proposal(name, action):\n\treturn PANEL_DECISIONS[action](name)\n"
 		)
 	}
 
 	def test_call_allow_list_scanner_catches_unlisted_method(self):
 		allowed = tuple(PANEL_METHODS)
-		good = 'state.call("erp_ai.ticket_panel.get_panel_data", {});\nstate.call("erp_ai.ticket_panel.send_message", {});'
+		# ADR-044 QĐ 1 (CHG-008): a clean script calls each of the three panel methods
+		good = (
+			'state.call("erp_ai.ticket_panel.get_panel_data", {});\n'
+			'state.call("erp_ai.ticket_panel.decide_proposal", {});\n'
+			'state.call("erp_ai.ticket_panel.send_message", {});'
+		)
 		self.assertEqual(check_call_allow_list(good, allowed, self.PANEL_SOURCES), [])
 		self.assertCaught(
 			check_call_allow_list(
@@ -7965,10 +8260,11 @@ class TestScannersCatchViolations(unittest.TestCase):
 		ok = "import frappe\n@frappe.whitelist(methods=['POST'])\ndef f():\n\tpass\n"
 		self.assertEqual(check_whitelisted_methods_declare_http_methods({"x.py": ok}), [])
 
-	def test_ticket_panel_whitelist_scanner_catches_third_method_and_get(self):
+	def test_ticket_panel_whitelist_scanner_catches_fourth_method_and_get(self):
+		# ADR-044 QĐ 1 (CHG-008): three methods are the clean panel, so the extra one is now the fourth
 		self.assertEqual(check_ticket_panel_whitelist(self.PANEL_SOURCES), [])
 		source = self.PANEL_SOURCES["ticket_panel.py"]
-		extra = source + "@frappe.whitelist(methods=['POST'])\ndef third():\n\tpass\n"
+		extra = source + "@frappe.whitelist(methods=['POST'])\ndef fourth():\n\tpass\n"
 		self.assertCaught(check_ticket_panel_whitelist({PANEL_FILE: extra}), "whitelisted functions are")
 		self.assertCaught(
 			check_ticket_panel_whitelist({PANEL_FILE: source.replace("'POST'", "'GET'", 1)}),
@@ -7981,6 +8277,15 @@ class TestScannersCatchViolations(unittest.TestCase):
 		self.assertCaught(
 			check_ticket_panel_whitelist({PANEL_FILE: source.replace("def get_panel_data", "def get_data")}),
 			"whitelisted functions are",
+		)
+		decide_by_get = source.replace(
+			"@frappe.whitelist(methods=['POST'])\ndef decide_proposal",
+			"@frappe.whitelist(methods=['GET'])\ndef decide_proposal",
+		)
+		self.assertNotEqual(decide_by_get, source)
+		self.assertCaught(
+			check_ticket_panel_whitelist({PANEL_FILE: decide_by_get}),
+			'decide_proposal: methods must be exactly ["POST"]',
 		)
 
 	def test_ticket_panel_forbidden_scanner_catches_each_name(self):

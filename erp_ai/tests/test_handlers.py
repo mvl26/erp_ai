@@ -1,8 +1,10 @@
 import datetime
 import json
+from contextlib import ExitStack
 from unittest.mock import MagicMock, patch
 
 import frappe
+from frappe.model.document import Document
 from frappe.tests.utils import FrappeTestCase
 from helpdesk.test_utils import make_ticket
 
@@ -10,7 +12,13 @@ from erp_ai import handlers
 from erp_ai.agent import answer_delay, queue, runner
 from erp_ai.agent.tools import site_api
 from erp_ai.agent.tools.registry import ToolContext
-from erp_ai.constants import AGENT_USER, LOG_DOCTYPE, LOGGER_NAME, TRIGGER_REQUESTER_REPLY
+from erp_ai.constants import (
+	AGENT_USER,
+	LOG_DOCTYPE,
+	LOGGER_NAME,
+	TRIGGER_KB_DRAFT,
+	TRIGGER_REQUESTER_REPLY,
+)
 from erp_ai.test_utils import (
 	FakeGateway,
 	keep_agent_settings,
@@ -1113,6 +1121,53 @@ class TestRequesterReply(RequesterReplyTestCase):
 		self.assertEqual([job["communication_name"] for job in received], [first.name, second.name])
 		self.assertEqual(received[1]["job_id"], f"erp_ai::{ticket}::{TRIGGER_REQUESTER_REPLY}::{second.name}")
 
+	def test_handlers_write_nothing(self):
+		# ADR-033 QĐ 2: the three new handlers only read and queue, on the path that queues as well.
+		set_agent_settings(kb_draft_enabled=1)
+		ticket = self._requester_ticket().name
+		self._bot_message(ticket)
+		reply = self._reply(ticket)
+		task = frappe.get_doc(
+			{
+				"doctype": "Task",
+				"subject": f"{PREFIX}write nothing",
+				"description": f"{PREFIX}write nothing",
+				"status": "Open",
+				"ai_ticket": ticket,
+			}
+		).insert(ignore_permissions=True)
+		task.status = "Working"
+		task.save(ignore_permissions=True)
+		resolved = frappe.get_doc("HD Ticket", ticket)
+		resolved.status = "Resolved"
+		resolved.save(ignore_permissions=True)
+		# what the hooks queued while saving is dropped: the handlers run again below as a new transaction
+		queue._clear_pending_job_ids()
+		self.enqueue.reset_mock()
+
+		with ExitStack() as stack:
+			writes = {
+				name: stack.enter_context(patch.object(owner, name))
+				for owner, name in (
+					(Document, "save"),
+					(Document, "insert"),
+					(Document, "db_set"),
+					(Document, "delete"),
+					(frappe.db, "set_value"),
+					(frappe.db, "set_single_value"),
+					(frappe.db, "delete"),
+				)
+			}
+			handlers.communication_on_update(reply)
+			handlers.task_on_update(task)
+			handlers.ticket_on_update(resolved)
+
+		self.assertEqual({name: mock.call_count for name, mock in writes.items()}, dict.fromkeys(writes, 0))
+		self.assertEqual(
+			sorted(call.kwargs.get("trigger", call.args[0]) for call in self.enqueue.call_args_list),
+			sorted([TRIGGER_REQUESTER_REPLY, LIFECYCLE_JOB_PATH, TRIGGER_KB_DRAFT]),
+		)
+
 
 LIFECYCLE_JOB_PATH = "erp_ai.agent.lifecycle.run_task_lifecycle"
 
@@ -1201,3 +1256,108 @@ class TestTaskLifecycle(HandlerTestCase):
 			handlers.task_on_update(changed)
 
 		self.assertEqual(self._lifecycle_jobs(), [])
+
+
+class TestKbDraftTrigger(HandlerTestCase):
+	"""AC-45 (U6b.md:268, :275; ADR-033 QĐ 2): a ticket moving into the Resolved group queues the knowledge-draft
+	run; the ticket's `on_update` hook runs on a real save."""
+
+	def setUp(self):
+		super().setUp()
+		keep_agent_settings(self)
+		set_agent_settings(kb_draft_enabled=1)
+
+	def _kb_jobs(self):
+		return [call.kwargs for call in self._jobs() if call.kwargs["trigger"] == TRIGGER_KB_DRAFT]
+
+	def _set_status(self, ticket, status, **flags):
+		"""Save the ticket with `status` and `flags`; return the kb_draft lines its handler logged."""
+		doc = frappe.get_doc("HD Ticket", ticket)
+		doc.status = status
+		doc.flags.update(flags)
+		logger = MagicMock()
+		with patch.object(frappe, "logger", return_value=logger):
+			doc.save(ignore_permissions=True)
+		lines = [str(arg) for call in logger.info.call_args_list for arg in call.args]
+		return [line for line in lines if f"trigger={TRIGGER_KB_DRAFT} " in line]
+
+	@staticmethod
+	def _skipped(ticket, reason):
+		return [f"erp_ai handler ticket={ticket} trigger={TRIGGER_KB_DRAFT} skipped: {reason}"]
+
+	def test_resolved_enqueues_kb_draft(self):
+		ticket = self._ticket_without_job().name
+		# a status change outside the Resolved group, and a save without a status change: nothing
+		self.assertEqual(self._set_status(ticket, "Replied"), [])
+		self.assertEqual(self._set_status(ticket, "Replied"), [])
+		self.assertEqual(self._kb_jobs(), [])
+
+		lines = self._set_status(ticket, "Resolved")
+
+		jobs = self._kb_jobs()
+		self.assertEqual(len(jobs), 1)
+		self.assertEqual(jobs[0]["ticket_name"], ticket)
+		self.assertEqual(jobs[0]["job_id"], f"erp_ai::{ticket}::{TRIGGER_KB_DRAFT}")
+		self.assertNotIn("communication_name", jobs[0])
+		self.assertEqual(
+			lines, [f"erp_ai handler ticket={ticket} trigger={TRIGGER_KB_DRAFT} enqueued: conditions_met"]
+		)
+		self.assertEqual(self.gateway.call_count, 0)
+
+	def test_excluded_team_no_job(self):
+		ticket = self._ticket_without_job(agent_group=EXCLUDED_TEAM).name
+
+		self.assertEqual(
+			self._set_status(ticket, "Resolved"), self._skipped(ticket, "not_sendable:excluded_team")
+		)
+		self.assertEqual(self._kb_jobs(), [])
+
+	def test_ai_opt_out_no_job(self):
+		ticket = self._ticket_without_job(ai_opt_out=1).name
+
+		self.assertEqual(self._set_status(ticket, "Closed"), self._skipped(ticket, "not_sendable:opted_out"))
+		self.assertEqual(self._kb_jobs(), [])
+
+	def test_silent_close_no_job(self):
+		# the lifecycle job's own close of a silent F ticket (U6b.md:260 step 7)
+		ticket = self._ticket_without_job().name
+
+		lines = self._set_status(ticket, "Closed", erp_ai_silent_close=True)
+
+		self.assertEqual(lines, self._skipped(ticket, "silent_close"))
+		self.assertEqual(self._kb_jobs(), [])
+
+	def test_switch_off_no_job(self):
+		switch_off = self._ticket_without_job().name
+		agent_off = self._ticket_without_job().name
+
+		set_agent_settings(kb_draft_enabled=0)
+		self.assertEqual(self._set_status(switch_off, "Resolved"), self._skipped(switch_off, "kb_draft_off"))
+		set_agent_settings(kb_draft_enabled=1, enabled=0)
+		self.assertEqual(self._set_status(agent_off, "Resolved"), self._skipped(agent_off, "agent_disabled"))
+
+		self.assertEqual(self._kb_jobs(), [])
+
+	def test_second_close_no_second_job(self):
+		ticket = self._ticket_without_job().name
+		self._set_status(ticket, "Resolved")
+		# Resolved then Closed in one transaction: the job is already claimed
+		self._set_status(ticket, "Closed")
+		self.assertEqual(len(self._kb_jobs()), 1)
+
+		# a later transaction, after the first run wrote its draft: reopened, then closed again
+		frappe.get_doc(
+			{
+				"doctype": "HD Article",
+				"title": f"{PREFIX}kb draft",
+				"content": "<p>ERPAI-TEST</p>",
+				"status": "Draft",
+				"ai_source_ticket": ticket,
+			}
+		).insert(ignore_permissions=True)
+		queue._clear_pending_job_ids()
+		self._set_status(ticket, "Open")
+		lines = self._set_status(ticket, "Closed")
+
+		self.assertEqual(lines, self._skipped(ticket, "kb_exists"))
+		self.assertEqual(len(self._kb_jobs()), 1)

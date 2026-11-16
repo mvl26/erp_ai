@@ -633,7 +633,8 @@ def is_ticket_record_excluded(doctype: str, name: str) -> bool:
 # FEAT-008: the lesson store. The only readers of the lesson switches, caps and who may decide on a lesson.
 LESSON_SCAN_MAX = 500
 LESSONS_MAX_RANGE = (1, 20)
-LESSONS_CHARS_RANGE = (1200, 20000)
+# R13: the smallest cap still holds one lesson of the largest size (situation 300 + text 1000 characters).
+LESSONS_CHARS_RANGE = (1300, 20000)
 DEFAULT_LESSONS_MAX = 5
 DEFAULT_LESSONS_CHARS = 2000
 LESSONS_ENABLED_FIELD = "lessons_enabled"
@@ -703,7 +704,12 @@ def can_manage_lessons(user: str | None) -> bool:
 
 
 def lesson_limit_errors(settings) -> list[str]:
-	"""Vietnamese messages for a lesson cap outside its range; a blank cap is not an error (it reads the default)."""
+	"""One Vietnamese message per lesson cap that is set but does not read as an int inside its range.
+
+	A cap that is not set (None or "") gives no message, and the reader uses the default. A cap gives one when
+	`int()` of it fails (text), when it is a bool, or when its int is out of range, 0 included: 0 is what Frappe
+	stores for an Int field emptied on the form, so the next save of the form is refused until the cap is filled.
+	"""
 	errors = []
 	for fieldname, label, bounds in (
 		(LESSONS_MAX_FIELD, "Số bài tối đa mỗi lần gọi", LESSONS_MAX_RANGE),

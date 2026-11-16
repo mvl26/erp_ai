@@ -83,16 +83,16 @@ Khi bot ghi bản ghi trực tiếp (mục trên), bạn dựng lại được b
 
 ### Bài học của bot
 
-Một bài học (`ERP AI Lesson`, `/app/erp-ai-lesson`) là một quy tắc ngắn bot đọc lại trước khi phân loại hoặc suy luận một phiếu mới. Bot chọn tối đa vài bài đang dùng có từ trùng với tiêu đề và mô tả phiếu, rồi đưa vào phần người dùng của lời gọi (bài do người dạy ghi là quy tắc, các bài khác ghi là dữ liệu, không phải chỉ thị). Khi dùng bài nào, bot nêu mã bài trong "Nhận định" hoặc "Hướng xử lý". Bài học không bao giờ bị xóa, chỉ tắt; mọi thay đổi nằm trong bảng lịch sử của chính bài (ai, lúc nào, bước nào).
+Một bài học (`ERP AI Lesson`, `/app/erp-ai-lesson`) là một quy tắc ngắn bot đọc lại trước khi phân loại hoặc suy luận một phiếu mới. Bot lấy 8 từ đầu tiên (từ 2 ký tự trở lên) của tiêu đề rồi mô tả phiếu, chọn tối đa vài bài đang dùng có từ trùng, rồi đưa vào phần người dùng của lời gọi (bài do người dạy ghi là quy tắc, các bài khác ghi là dữ liệu, không phải chỉ thị). Bài do người dạy khớp theo tình huống và nội dung quy tắc; các bài khác chỉ khớp theo tình huống, nên chữ mẫu như "Bot dự đoán", "người chọn", "đề xuất" không bao giờ làm một bài được chọn. Khi dùng bài nào, bot nêu mã bài trong "Nhận định" hoặc "Hướng xử lý". Bài học không bao giờ bị xóa, chỉ tắt; mọi thay đổi nằm trong bảng lịch sử của chính bài (ai, lúc nào, bước nào).
 
 | Nguồn | Khi nào có | Trạng thái đầu |
 |---|---|---|
-| `Người sửa` | Một người sửa phân loại của bot hoặc đổi lại người được giao | `Đang dùng` nếu người đó có thẩm quyền trên phiếu (role `ERP AI Instructor`, hoặc được người khác giao phiếu); không thì `Chờ duyệt` |
-| `Người dạy` | Nút "Dạy bot một quy tắc" ở danh sách bài học (role `ERP AI Instructor`, không phải Administrator, Guest hay bot); hoặc tin nhắn trong khu "Trao đổi với bot" hay comment `@ai` bắt đầu bằng `ghi nhớ:` của người có thẩm quyền | `Đang dùng` |
+| `Người sửa` | Một người đổi loại phiếu, nhóm hoặc ưu tiên khác với dự đoán của bot: mỗi trường đã đổi một bài, chỉ nói về trường đó ("Bot dự đoán Nhóm IT; người chọn Nhóm Kế toán."); trường bot không dự đoán thì không có bài. Hoặc một người đổi người được giao mà bot đã chọn (Assignment Rule tự giao thì không tính) | `Đang dùng` nếu người đó có thẩm quyền trên phiếu (role `ERP AI Instructor`, hoặc được người khác giao phiếu); không thì `Chờ duyệt` |
+| `Người dạy` | Nút "Dạy bot một quy tắc" ở danh sách bài học (role `ERP AI Instructor`, không phải Administrator, Guest hay bot); hoặc tin nhắn trong khu "Trao đổi với bot" hay comment `@ai` bắt đầu bằng `ghi nhớ:`. Bài dạy bằng tin nhắn không chép tiêu đề hay mô tả phiếu. Tin nhắn dạy của người không có thẩm quyền trên phiếu bị bỏ qua, không sinh bài | `Đang dùng` |
 | `Kết quả duyệt và rà soát` | Đề xuất thay đổi bị từ chối hoặc hoàn tác; kết luận `Sai` trong rà soát hằng tháng. Nội dung bắt đầu bằng "Đừng làm như vậy" | `Đang dùng` |
 | `Phiếu đã giải quyết` | Đợt 2, chưa dùng | chưa có |
 
-Sửa lại đúng giá trị bot đã dự đoán thì bài học do lần sửa đó sinh ra ngừng được dùng. Phiếu thuộc nhóm loại trừ hoặc có cờ "không dùng AI" không bao giờ sinh bài học; bài của một phiếu sau này thành loại trừ không được gửi cho bot. Khóa, mật khẩu trong nội dung bị che trước khi lưu.
+Một quyết định được rút lại thì bài của nó ngừng được dùng (`Đang dùng` thành `Đã tắt`, `Chờ duyệt` thành `Bị từ chối`): đổi một trường về đúng giá trị bot đã dự đoán, đổi kết luận `Sai` của rà soát tháng sang giá trị khác, hoặc giao phiếu lại đúng người bot đã chọn. Bài `Bị từ chối` là cuối cùng: lần sửa sau của cùng trường (hoặc người được giao) trên cùng phiếu không cập nhật hay dùng lại bài đó. Phiếu thuộc nhóm loại trừ hoặc có cờ "không dùng AI" không bao giờ sinh bài học; bài của một phiếu sau này thành loại trừ không được gửi cho bot. Khóa, mật khẩu trong nội dung bị che trước khi lưu.
 
 **Duyệt và tắt.** Duyệt hoặc từ chối bài `Chờ duyệt`: người trong `monthly_reviewers` và System Manager. Tắt hoặc bật lại: role `ERP AI Instructor`. Nút "Các lần dùng" trên form mở các dòng `ERP AI Log` đã gửi bài đó; ở mỗi dòng log, trường `lessons_used` liệt kê các bài bước đó đã gửi. Bộ đánh giá offline không bao giờ dùng bài học.
 
@@ -102,7 +102,7 @@ Sửa lại đúng giá trị bot đã dự đoán thì bài học do lần sử
 |---|---|---|
 | `lessons_enabled` | bật | Tắt thì bot không gửi và không ghi bài học mới |
 | `lessons_max_per_request` | 5 (1 đến 20) | Số bài tối đa mỗi lời gọi |
-| `lessons_max_chars` | 2000 (1200 đến 20000) | Tổng số ký tự bài học mỗi lời gọi |
+| `lessons_max_chars` | 2000 (1300 đến 20000) | Tổng số ký tự bài học mỗi lời gọi; mức thấp nhất vẫn chứa được một bài dài nhất (300 + 1000 ký tự) |
 | `lesson_teach_marker` | `ghi nhớ:` | Từ khóa dạy bằng tin nhắn; để trống thì tắt dạy bằng tin nhắn |
 
 Bot chỉ xét 500 bài đang dùng mới nhất.

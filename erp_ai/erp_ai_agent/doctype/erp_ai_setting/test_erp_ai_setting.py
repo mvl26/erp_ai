@@ -2869,7 +2869,7 @@ class TestLessonLimits(FrappeTestCase):
 		for fieldname, value in (
 			("lessons_max_per_request", 25),
 			("lessons_max_per_request", 0),
-			("lessons_max_chars", 1199),
+			("lessons_max_chars", 1299),
 			("lessons_max_chars", 20001),
 		):
 			doc = frappe.get_single(SETTING_DOCTYPE)

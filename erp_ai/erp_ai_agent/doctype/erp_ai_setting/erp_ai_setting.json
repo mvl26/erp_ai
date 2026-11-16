@@ -721,7 +721,7 @@
    "fieldtype": "Check",
    "label": "Học và dùng bài học",
    "default": "1",
-   "description": "Bật thì bot ghi nhận bài học từ người sửa, phiếu đã giải quyết và lời dạy, và đưa bài đang dùng vào yêu cầu gửi cho model. Tắt thì bot không học và không dùng bài nào; bài đã lưu vẫn giữ nguyên."
+   "description": "Bật thì bot ghi nhận bài học từ người sửa phân loại hoặc người được giao, từ lời dạy, từ đề xuất bị từ chối hoặc hoàn tác và kết luận Sai của rà soát tháng, rồi đưa bài đang dùng vào yêu cầu gửi cho model. Tắt thì bot không học và không dùng bài nào; bài đã lưu vẫn giữ nguyên."
   },
   {
    "fieldname": "lessons_max_per_request",
@@ -735,14 +735,14 @@
    "fieldtype": "Int",
    "label": "Số ký tự bài học tối đa mỗi lần gọi",
    "default": "2000",
-   "description": "Tổng số ký tự bài học nhiều nhất đưa vào một lần gọi model, từ 1200 đến 20000. Ngoài khoảng này thì không lưu được. Mặc định 2000."
+   "description": "Tổng số ký tự bài học nhiều nhất đưa vào một lần gọi model, từ 1300 đến 20000 (một bài dài nhất luôn vừa). Ngoài khoảng này thì không lưu được. Mặc định 2000."
   },
   {
    "fieldname": "lesson_teach_marker",
    "fieldtype": "Data",
    "label": "Dấu hiệu dạy bot trong tin nhắn",
    "default": "ghi nhớ:",
-   "description": "Tin nhắn của người có dấu hiệu này thì phần sau dấu hiệu được lưu thành bài học chờ duyệt. Không phân biệt hoa thường. Để trống thì tắt cách dạy này. Giá trị điền sẵn là một cụm tiếng Việt kết thúc bằng dấu hai chấm."
+   "description": "Tin nhắn với bot hoặc comment gọi bot bắt đầu bằng dấu hiệu này: nếu người gửi có thẩm quyền trên phiếu thì phần sau dấu hiệu được lưu thành bài học Đang dùng; tin của người không có thẩm quyền bị bỏ qua. Không phân biệt hoa thường. Để trống thì tắt cách dạy này. Giá trị điền sẵn là một cụm tiếng Việt kết thúc bằng dấu hai chấm."
   }
  ],
  "issingle": 1,

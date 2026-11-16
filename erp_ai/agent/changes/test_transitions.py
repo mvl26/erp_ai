@@ -1496,7 +1496,7 @@ class TestLessonsFromOutcome(FrappeTestCase):
 		return frappe.get_all(
 			LESSON_DOCTYPE,
 			filters={"change_proposal": proposal},
-			fields=["lesson_source", "lesson_status", "lesson_text", "ticket"],
+			fields=["lesson_source", "lesson_status", "lesson_text", "situation", "ticket"],
 		)
 
 	def test_reject_makes_dont_lesson(self):
@@ -1518,11 +1518,27 @@ class TestLessonsFromOutcome(FrappeTestCase):
 		self.assertTrue(lesson.lesson_text.startswith("Đừng làm như vậy"))
 		self.assertIn("hoàn tác", lesson.lesson_text)
 
+	def test_ticket_description_not_copied(self):
+		# AC-10: the lesson names the change and the ticket's subject, never its description
+		ticket = make_ticket(
+			subject="Phiếu đề xuất sửa code", description="<p>erpaitestmotarieng chi tiết</p>"
+		).name
+		proposal = make_change_proposal(ticket=ticket)
+		transitions.reject(proposal.name, ACTOR)
+		(lesson,) = self._lessons(proposal.name)
+		self.assertEqual(lesson.situation, "Phiếu đề xuất sửa code")
+		self.assertNotIn("erpaitestmotarieng", f"{lesson.situation} {lesson.lesson_text}")
+
 	def test_command_target_falls_back_to_args_then_app(self):
 		proposal = make_change_proposal(kind=CHANGE_KIND_COMMAND)
 		transitions.reject(proposal.name, ACTOR)
 		(lesson,) = self._lessons(proposal.name)
 		self.assertIn("Lệnh bench", lesson.lesson_text)
+		self.assertIn(proposal.command_args, lesson.lesson_text)
+		app_only = make_change_proposal(kind=CHANGE_KIND_COMMAND, command_args="")
+		transitions.reject(app_only.name, ACTOR)
+		(lesson,) = self._lessons(app_only.name)
+		self.assertIn(f"Lệnh bench trong app {app_only.app} đã bị từ chối", lesson.lesson_text)
 
 	def test_approve_makes_none(self):
 		proposal = make_change_proposal()

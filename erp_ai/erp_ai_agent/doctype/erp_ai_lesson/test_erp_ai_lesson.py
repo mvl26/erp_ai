@@ -22,6 +22,7 @@ from erp_ai.erp_ai_agent.doctype.erp_ai_lesson import erp_ai_lesson
 from erp_ai.test_utils import clear_lesson_store, keep_agent_settings, set_agent_settings
 
 DOCTYPE_JSON = Path(__file__).with_name("erp_ai_lesson.json")
+FORM_JS = Path(__file__).with_name("erp_ai_lesson.js")
 
 
 class TestERPAILesson(FrappeTestCase):
@@ -42,6 +43,14 @@ class TestERPAILesson(FrappeTestCase):
 		for row in permissions:
 			granted = {key for key, value in row.items() if key != "role" and value}
 			self.assertEqual(granted, {"read"}, row["role"])
+
+	def test_form_buttons(self):
+		js = FORM_JS.read_text(encoding="utf-8")
+		# AC-17: the quoted name, as the log stores it, so AILSN-00001 never also finds AILSN-000010
+		self.assertIn("""lessons_used: ["like", '%"' + frm.doc.name + '"%']""", js)
+		# A double click must not send the decision twice.
+		decide = js[js.index("erp_ai_lesson.decide") :]
+		self.assertIn("freeze: true", decide[: decide.index("})")])
 
 	def test_ticket_with_lesson_can_be_deleted(self):
 		ticket = make_ticket(subject="erp_ai lesson ticket delete")

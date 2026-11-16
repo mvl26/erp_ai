@@ -202,8 +202,15 @@ DOCTYPE_CONFIG = {
 			# FEAT-008: the lesson store switch, its two caps and the teaching marker.
 			"lessons_enabled": ("bài học", "Tắt", "bài đã lưu vẫn giữ"),
 			"lessons_max_per_request": ("từ 1 đến 20", "không lưu được", "Mặc định 5"),
-			"lessons_max_chars": ("từ 1200 đến 20000", "không lưu được", "Mặc định 2000"),
-			"lesson_teach_marker": ("không phân biệt hoa thường", "Để trống", "bài học chờ duyệt"),
+			"lessons_max_chars": ("từ 1300 đến 20000", "không lưu được", "Mặc định 2000"),
+			# The rule of a person with authority is active at once; a message of anyone else is ignored (no lesson).
+			"lesson_teach_marker": (
+				"không phân biệt hoa thường",
+				"Để trống",
+				"thẩm quyền",
+				"bài học Đang dùng",
+				"bị bỏ qua",
+			),
 		},
 		"section_count": 15,
 		"read_only_fields": (
@@ -647,6 +654,9 @@ FORBIDDEN_PHRASES = {
 		# FEAT-007 spec-addendum-4.md AC-29 (T64): an empty catalog no longer means "no ERP writes".
 		"catalog_rules": ("bot không ghi ERP ngoài phiếu",),
 		"code_change_enabled": ("tạo và sửa bản ghi trực tiếp",),
+		# FEAT-008: a taught rule never waits for approval; resolved tickets are a batch-2 source.
+		"lesson_teach_marker": ("chờ duyệt",),
+		"lessons_enabled": ("phiếu đã giải quyết",),
 	},
 	"ERP AI Log": {
 		"instructor": ("người ra lệnh", "khi phiếu mới tạo"),

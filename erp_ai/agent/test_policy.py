@@ -1626,8 +1626,12 @@ class TestLessonPolicy(FrappeTestCase):
 
 		for value in (0, 21):
 			self.assertEqual(len(errors(lessons_max_per_request=value)), 1, value)
-		for value in (1199, 20001):
+		# R13: one lesson of the largest size (300 + 1000 characters) always fits under the smallest cap
+		self.assertEqual(policy.LESSONS_CHARS_RANGE, (1300, 20000))
+		for value in (1299, 20001):
 			self.assertEqual(len(errors(lessons_max_chars=value)), 1, value)
-		for per_request, chars in ((1, 1200), (20, 20000)):
+		for per_request, chars in ((1, 1300), (20, 20000)):
 			self.assertEqual(errors(lessons_max_per_request=per_request, lessons_max_chars=chars), [])
 		self.assertEqual(errors(), [])
+		for value in ("abc", 0, True):
+			self.assertEqual(len(errors(lessons_max_chars=value)), 1, value)

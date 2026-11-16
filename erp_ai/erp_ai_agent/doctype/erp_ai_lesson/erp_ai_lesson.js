@@ -18,13 +18,14 @@ frappe.ui.form.on("ERP AI Lesson", {
 					method: "erp_ai.erp_ai_agent.doctype.erp_ai_lesson.erp_ai_lesson.decide",
 					type: "POST",
 					args: { name: frm.doc.name, action: action },
+					freeze: true,
 					callback: () => frm.reload_doc(),
 				});
 			});
 		});
 		frm.add_custom_button("Các lần dùng", () => {
 			frappe.set_route("List", "ERP AI Log", {
-				lessons_used: ["like", "%" + frm.doc.name + "%"],
+				lessons_used: ["like", '%"' + frm.doc.name + '"%'],
 			});
 		});
 	},

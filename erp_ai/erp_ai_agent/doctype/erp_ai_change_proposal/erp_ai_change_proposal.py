@@ -7,6 +7,7 @@ from erp_ai.agent import change_text, policy, queue
 from erp_ai.agent.agent_write_guard import refuse_agent_write
 from erp_ai.agent.authority import NEVER_AUTHORITY
 from erp_ai.agent.changes import block, restart_check, result_comment, transitions
+from erp_ai.agent.redact import redact_secrets
 from erp_ai.constants import (
 	CHANGE_KIND_CODE,
 	CHANGE_STATUS_PENDING,
@@ -223,6 +224,7 @@ CARD_FIELDS = (
 	"is_core_app",
 	"apply_commit_sha",
 	"undo_commit_sha",
+	"creation",
 )
 CARD_OPERATION_FIELDS = ("parent", "idx", "operation", "file_path", "new_path")
 CARD_KEYS = (
@@ -235,7 +237,31 @@ CARD_KEYS = (
 	"failure_reason",
 	"can_decide",
 	"can_open",
+	"created",
+	"is_console",
+	"script",
+	"output",
 )
+# CHG-010: only a console proposal's script and output are read, in a second query limited to those names
+CONSOLE_CARD_FIELDS = ("name", "content_after", "command_output")
+CONSOLE_CARD_OUTPUT_MAX_LINES = 20
+
+
+def _console_card_parts(console_names: list[str], readable: set) -> dict:
+	"""`{name: (script, masked output tail)}` for the console proposals in `console_names` the viewer can open."""
+	names = [name for name in console_names if name in readable]
+	if not names:
+		return {}
+	parts = {}
+	for row in frappe.get_all(
+		PROPOSAL_DOCTYPE,
+		filters={"name": ("in", names)},
+		fields=list(CONSOLE_CARD_FIELDS),
+		limit_page_length=0,
+	):
+		output = redact_secrets(row.command_output).splitlines()[-CONSOLE_CARD_OUTPUT_MAX_LINES:]
+		parts[row.name] = (row.content_after or "", "\n".join(output))
+	return parts
 
 
 def _card_notes(proposal_name: str, fields) -> list[str]:
@@ -292,9 +318,20 @@ def panel_cards(ticket: str) -> list[dict]:
 				limit_page_length=0,
 			)
 		)
+	fields_by_name = {row.name: frappe._dict(row, operations=by_parent.get(row.name, [])) for row in rows}
+	console_names = []
+	for name, fields in fields_by_name.items():
+		try:
+			if block.is_console(fields):
+				console_names.append(name)
+		except Exception:
+			continue  # an unreadable proposal gets the reduced card below
+	console_parts = _console_card_parts(console_names, readable)
 	cards = []
 	for row in rows:
-		fields = frappe._dict(row, operations=by_parent.get(row.name, []))
+		fields = fields_by_name[row.name]
+		is_console = row.name in console_names
+		script, output = console_parts.get(row.name, (None, None))
 		decided_by = cstr(row.decided_by)
 		failure_reason = result_comment.masked_reason(row.failure_reason)
 		# values in the order of CARD_KEYS; not a dict literal, which the state-field rule of ADR-012 reads as a write
@@ -307,8 +344,12 @@ def panel_cards(ticket: str) -> list[dict]:
 				row.restart_status or None,
 				change_text.safe_person_name(frappe.utils.get_fullname(decided_by)) if decided_by else None,
 				failure_reason or None,
-				panel_decision_refusal(row.change_status, console=block.is_console(row)) is None,
+				panel_decision_refusal(row.change_status, console=is_console) is None,
 				row.name in readable,
+				str(row.creation),
+				is_console,
+				script,
+				output,
 			)
 		except Exception as exc:
 			# One unreadable proposal must not break the panel (AC-11, ADR-009 QĐ 4): a reduced card that cannot be
@@ -324,6 +365,10 @@ def panel_cards(ticket: str) -> list[dict]:
 				None,
 				False,
 				row.name in readable,
+				str(row.creation),
+				is_console,
+				None,
+				None,
 			)
 		cards.append(dict(zip(CARD_KEYS, values, strict=True)))
 	return cards

@@ -84,6 +84,7 @@ def thread(ticket: str) -> list[dict]:
 			"author": get_fullname(row.owner),
 			"is_bot": row.owner == AGENT_USER,
 			"created_at": format_datetime(row.creation),
+			"created": str(row.creation),
 			"text": row.content,
 		}
 		for row in reversed(_rows(ticket, THREAD_LIMIT))

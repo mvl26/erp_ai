@@ -88,7 +88,12 @@ class TestMessages(FrappeTestCase):
 		rows = thread(self.ticket)
 		self.assertEqual([row["name"] for row in rows], [human, bot])
 		self.assertEqual([row["is_bot"] for row in rows], [False, True])
-		self.assertEqual(set(rows[0]), {"name", "author", "is_bot", "created_at", "text"})
+		# CHG-010: each thread row also carries the raw creation time, so the panel can order cards among rows
+		self.assertEqual(set(rows[0]), {"name", "author", "is_bot", "created_at", "created", "text"})
+		self.assertEqual(
+			[row["created"] for row in rows],
+			[str(frappe.db.get_value(MESSAGE_DOCTYPE, name, "creation")) for name in (human, bot)],
+		)
 		self.assertEqual(rows[0]["text"], "hỏi")
 		self.assertEqual(rows[0]["author"], frappe.utils.get_fullname(HUMAN_USER))
 

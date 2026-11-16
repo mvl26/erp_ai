@@ -83,7 +83,8 @@ WEBSITE_EMAIL = "panel.website@example.com"
 CUSTOMER_EMAIL = "panel.customer@example.com"
 KEYWORD = "@ai"
 RUN_ROUTE = "erp_ai.agent.runner.run_for_ticket"
-THREAD_KEYS = {"name", "author", "is_bot", "created_at", "text"}
+# CHG-010: thread rows carry the raw creation time as `created`
+THREAD_KEYS = {"name", "author", "is_bot", "created_at", "created", "text"}
 
 
 def _make_user(email, user_type="Website User"):
@@ -980,6 +981,11 @@ class TestPanelProposalCards(FrappeTestCase):
 				"failure_reason",
 				"can_decide",
 				"can_open",
+				# CHG-010: time of the proposal, and the console script and masked output for readers
+				"created",
+				"is_console",
+				"script",
+				"output",
 			),
 		)
 		self.assertEqual(PANEL_MAX_PROPOSALS, 200)
@@ -1003,6 +1009,8 @@ class TestPanelProposalCards(FrappeTestCase):
 				"is_core_app",
 				"apply_commit_sha",
 				"undo_commit_sha",
+				# CHG-010: the proposal time, so cards sort among thread rows
+				"creation",
 			),
 		)
 		self.assertEqual(
@@ -1198,6 +1206,81 @@ class TestPanelProposalCards(FrappeTestCase):
 				set_agent_settings(one_click_approval_enabled=one_click, console_enabled=console)
 				cards = {card["name"]: card for card in self._cards(CARD_INSTRUCTOR)}
 				self.assertIs(cards[name]["can_decide"], expected)
+
+	def _console(self):
+		return make_change_proposal(
+			CHANGE_KIND_COMMAND,
+			ticket=self.ticket,
+			command_args=None,
+			app=None,
+			command_list=json.dumps([["--site", frappe.local.site, "console"]]),
+			content_after="print(1)\n",
+		).name
+
+	def _console_with_output(self, output):
+		name = self._console()
+		self._set(name, command_output=output)
+		return name
+
+	def test_console_card_gives_readers_the_script_and_masked_output(self):
+		# CHG-010: Task 6
+		secret = "zq-secret-token-value-123456"
+		lines = [f"line {i}" for i in range(30)] + [f"password={secret}"]
+		name = self._console_with_output("\n".join(lines))
+		self._set(name, content_after="print('hello')\n")
+		card = {c["name"]: c for c in self._cards(CARD_INSTRUCTOR)}[name]
+		self.assertIs(card["is_console"], True)
+		self.assertEqual(card["script"], "print('hello')\n")
+		self.assertNotIn(secret, card["output"])
+		self.assertIn("[đã che]", card["output"])
+		self.assertLessEqual(len(card["output"].splitlines()), 20)
+		self.assertIn("line 29", card["output"])
+		self.assertNotIn("line 5\n", card["output"])
+
+	def test_console_card_hides_script_and_output_from_a_viewer_who_cannot_open(self):
+		# CHG-010: Task 6
+		name = self._console_with_output("done")
+		card = {c["name"]: c for c in self._cards(AGENT_EMAIL)}[name]
+		self.assertIs(card["can_open"], False)
+		self.assertIs(card["is_console"], True)
+		self.assertIsNone(card["script"])
+		self.assertIsNone(card["output"])
+
+	def test_code_proposal_content_never_reaches_the_panel(self):
+		# CHG-010: Task 6; spec rule since CHG-008, the card reads no content of a code proposal
+		proposal = make_change_proposal(ticket=self.ticket)
+		self._set(
+			proposal.name,
+			content_after="zq-seed-after-text",
+			command_output="zq-seed-output-text",
+		)
+		for user in (AGENT_EMAIL, CARD_INSTRUCTOR):
+			with self.subTest(user=user):
+				frappe.set_user(user)
+				try:
+					text = json.dumps(ticket_panel.get_panel_data(self.ticket), ensure_ascii=False)
+				finally:
+					frappe.set_user("Administrator")
+				self.assertNotIn("zq-seed-after", text)
+				self.assertNotIn("zq-seed-output", text)
+				card = self._cards(user)[0]
+				self.assertIs(card["is_console"], False)
+				self.assertIsNone(card["script"])
+				self.assertIsNone(card["output"])
+
+	def test_card_created_is_the_proposal_creation(self):
+		# CHG-010: Task 6
+		first = make_change_proposal(ticket=self.ticket)
+		second = self._console()
+		for name, stamp in (
+			(first.name, "2001-01-01 10:00:00.123456"),
+			(second, "2001-01-02 10:00:00.654321"),
+		):
+			self._set(name, creation=stamp)
+		for card in self._cards(CARD_INSTRUCTOR):
+			self.assertEqual(
+				card["created"], str(frappe.db.get_value(PROPOSAL_DOCTYPE, card["name"], "creation"))
+			)
 
 	def test_failed_card_masks_reason(self):
 		proposal = make_change_proposal(ticket=self.ticket)

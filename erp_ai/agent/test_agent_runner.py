@@ -124,6 +124,8 @@ class RunnerTestBase(FrappeTestCase):
 			answer_delay_max_s=0,
 			routing_rules=make_routing_rules(),
 			auto_assign_enabled=0,
+			reply_enabled=0,
+			kb_draft_enabled=0,
 			confidence_threshold=policy.DEFAULT_CONFIDENCE_THRESHOLD,
 		)
 		# No status signal reaches Redis and no run sleeps for real (the delay is 0 here; a test that sets one reads `sleeps`).
@@ -4523,6 +4525,8 @@ class GuidanceTestBase(RunnerTestBase):
 			code_change_enabled=0,
 			record_tools_enabled=0,
 			unrestricted_enabled=0,
+			reply_enabled=0,
+			kb_draft_enabled=0,
 			monthly_budget_usd=1000,
 			max_runs_per_ticket_per_day=10,
 			confidence_threshold=policy.DEFAULT_CONFIDENCE_THRESHOLD,

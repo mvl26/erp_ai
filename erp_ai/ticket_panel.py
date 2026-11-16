@@ -12,6 +12,7 @@ from helpdesk.utils import is_agent
 
 from erp_ai.agent import messages
 from erp_ai.constants import AGENT_USER, LOGGER_NAME, PANEL_MAX_MESSAGE_CHARS
+from erp_ai.erp_ai_agent.doctype.erp_ai_change_proposal import erp_ai_change_proposal as proposal_form
 
 TICKET_DOCTYPE = "HD Ticket"
 # The three fields the bot classifies, with the wording its own "Đã làm" line uses for them.
@@ -86,8 +87,11 @@ def get_panel_data(ticket: str) -> dict:
 	ticket = ticket.strip()
 	_require_panel_access(ticket)
 	thread = messages.thread(ticket)
-	frappe.logger(LOGGER_NAME).debug(f"erp_ai panel read ticket={ticket} messages={len(thread)}")
-	return {"ticket": ticket, "ai_fields": _ai_fields(ticket), "messages": thread}
+	proposals = proposal_form.panel_cards(ticket)
+	frappe.logger(LOGGER_NAME).debug(
+		f"erp_ai panel read ticket={ticket} messages={len(thread)} proposals={len(proposals)}"
+	)
+	return {"ticket": ticket, "ai_fields": _ai_fields(ticket), "messages": thread, "proposals": proposals}
 
 
 @frappe.whitelist(methods=["POST"])

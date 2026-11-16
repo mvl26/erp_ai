@@ -6,10 +6,12 @@ from frappe.utils import cint, cstr, get_datetime, get_system_timezone, now_date
 from erp_ai.agent import change_text, policy, queue
 from erp_ai.agent.agent_write_guard import refuse_agent_write
 from erp_ai.agent.authority import NEVER_AUTHORITY
-from erp_ai.agent.changes import block, restart_check, transitions
+from erp_ai.agent.changes import block, restart_check, result_comment, transitions
 from erp_ai.constants import (
 	CHANGE_KIND_CODE,
 	CHANGE_STATUS_PENDING,
+	OPERATION_DOCTYPE,
+	PANEL_MAX_PROPOSALS,
 	PROPOSAL_DOCTYPE,
 	RESTART_STATUS_SENT,
 	ROLE_INSTRUCTOR,
@@ -184,6 +186,105 @@ def proposal_head(name) -> frappe._dict:
 			frappe.DoesNotExistError,
 		)
 	return frappe._dict(ticket=head.ticket, change_status=head.change_status)
+
+
+# CHG-008 design 2, 3.1: what a panel card reads and shows. No content field is ever read (diff, file text,
+# command args and output, commit message, reason, digest, created dirs), so a card cannot show one.
+CARD_FIELDS = (
+	"name",
+	"change_kind",
+	"is_new_file",
+	"file_path",
+	"app",
+	"command_list",
+	"change_status",
+	"restart_status",
+	"restart_sent_at",
+	"decided_by",
+	"failure_reason",
+	"target_branch",
+	"upstream_ref",
+	"ahead_count",
+	"is_core_app",
+	"apply_commit_sha",
+	"undo_commit_sha",
+)
+CARD_OPERATION_FIELDS = ("parent", "idx", "operation", "file_path", "new_path")
+CARD_KEYS = (
+	"name",
+	"target",
+	"notes",
+	"status",
+	"restart_status",
+	"decided_by",
+	"failure_reason",
+	"can_decide",
+	"can_open",
+)
+
+
+def _card_notes(proposal_name: str, fields) -> list[str]:
+	"""`change_text.proposal_notes`, or the one warning line when the stored content is unreadable (D-6)."""
+	try:
+		return change_text.proposal_notes(fields)
+	except ValueError as exc:
+		frappe.logger("erp_ai").warning(
+			"erp_ai notes proposal=%s error=%s", proposal_name, type(exc).__name__
+		)
+		return [UNREADABLE_NOTES]
+
+
+def panel_cards(ticket: str) -> list[dict]:
+	"""One card per change proposal attached to `ticket`, newest first, at most `PANEL_MAX_PROPOSALS`.
+
+	Reads only `CARD_FIELDS` and `CARD_OPERATION_FIELDS` and writes nothing. It checks no gate: the only
+	caller is `ticket_panel.get_panel_data`, after its gate. A proposal without a ticket has no card.
+	`can_decide` reads the one-click switch again on every call (no cache); `can_open` is the viewer's read
+	permission on the proposal doctype and on that proposal. Not whitelisted.
+
+	Returns:
+		list of dicts with exactly the keys of `CARD_KEYS`; every value is plain text, a bool or None.
+	"""
+	if not ticket:
+		return []
+	rows = frappe.get_all(
+		PROPOSAL_DOCTYPE,
+		filters={"ticket": ticket},
+		fields=list(CARD_FIELDS),
+		order_by="creation desc, name desc",
+		limit_page_length=PANEL_MAX_PROPOSALS,
+	)
+	if not rows:
+		return []
+	by_parent: dict[str, list] = {}
+	operations = frappe.get_all(
+		OPERATION_DOCTYPE,
+		filters={"parenttype": PROPOSAL_DOCTYPE, "parent": ("in", [row.name for row in rows])},
+		fields=list(CARD_OPERATION_FIELDS),
+		order_by="idx asc",
+	)
+	for operation in operations:
+		by_parent.setdefault(operation.parent, []).append(operation)
+	may_read = frappe.has_permission(PROPOSAL_DOCTYPE, "read")
+	cards = []
+	for row in rows:
+		fields = frappe._dict(row, operations=by_parent.get(row.name, []))
+		decided_by = cstr(row.decided_by)
+		failure_reason = result_comment.masked_reason(row.failure_reason)
+		# values in the order of CARD_KEYS; not a dict literal, which the state-field rule of ADR-012 reads as a write
+		values = (
+			row.name,
+			change_text.proposal_target_text(fields),
+			_card_notes(row.name, fields),
+			row.change_status,
+			row.restart_status or None,
+			change_text.safe_person_name(frappe.utils.get_fullname(decided_by)) if decided_by else None,
+			failure_reason or None,
+			panel_decision_refusal(row.change_status) is None,
+			bool(may_read and frappe.has_permission(PROPOSAL_DOCTYPE, "read", doc=row.name)),
+		)
+		cards.append(dict(zip(CARD_KEYS, values, strict=True)))
+	return cards
 
 
 def _decider(name) -> str:

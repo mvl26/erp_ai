@@ -1,6 +1,13 @@
-import frappe
+import uuid
 
+import frappe
+from frappe.utils import background_jobs
+
+from erp_ai.agent.run_log import record_event
 from erp_ai.constants import (
+	EVENT_CALL_BUSY,
+	EVENT_CALL_MERGED,
+	EVENT_CALL_RECEIVED,
 	JOB_TIMEOUT_S,
 	TRIGGER_COMMENT_MENTION,
 	TRIGGER_KB_DRAFT,
@@ -13,6 +20,11 @@ VALID_TRIGGERS = (TRIGGER_TICKET_INSERT, TRIGGER_COMMENT_MENTION, TRIGGER_REQUES
 VALID_CHANGE_ACTIONS = ("apply", "undo")
 SCHEDULED_JOB_TIMEOUT_S = 1200
 LIFECYCLE_JOB_TIMEOUT_S = 300
+# What the one RQ read says of a job id (design 3.5): no job yet, waiting in the queue, or running. The last two
+# are the values of RQ's JobStatus (a str enum), so the read compares equal to them without importing rq (ADR-001).
+JOB_STATE_NEW = "new"
+JOB_STATE_QUEUED = "queued"
+JOB_STATE_STARTED = "started"
 
 
 def _clear_pending_job_ids():
@@ -22,6 +34,24 @@ def _clear_pending_job_ids():
 def requester_reply_key(ticket_name: str, communication_name: str) -> str:
 	"""The event key of a requester-reply run (ADR-033 QĐ 2): one per ticket and requester message."""
 	return f"{TRIGGER_REQUESTER_REPLY}:{ticket_name}:{communication_name}"
+
+
+def _job_state(job_id: str) -> str:
+	"""Whether the job `job_id` is new, queued or started, by the RQ read Frappe's dedupe makes (ADR-048 QĐ 2).
+
+	The only read of the RQ job state in the app. Any other status, no job, or a failed read is `new`:
+	`frappe.enqueue` then reads again and queues or fails as it always did (design 3.5).
+	"""
+	try:
+		status = background_jobs.get_job_status(job_id)
+	except Exception:
+		# Dropped on purpose: the read only picks the event row; the call itself must go on to frappe.enqueue.
+		return JOB_STATE_NEW
+	if status == JOB_STATE_QUEUED:
+		return JOB_STATE_QUEUED
+	if status == JOB_STATE_STARTED:
+		return JOB_STATE_STARTED
+	return JOB_STATE_NEW
 
 
 def _claim_pending(job_id: str) -> bool:
@@ -41,6 +71,16 @@ def _claim_pending(job_id: str) -> bool:
 def enqueue_agent_run(
 	ticket_name: str, trigger: str, message_name: str | None = None, communication_name: str | None = None
 ) -> bool:
+	"""Queue one agent run and leave its event row (ADR-048 QĐ 2, design 3.5); True only when the job is new.
+
+	A new job gets a `run_id` (the event key for a requester reply, else a fresh uuid) and a `call_received`
+	row carrying it. A job of the same id already queued or started gets no run of its own: a message
+	(`comment_mention`) is told so by a `call_merged` or `call_busy` row, another trigger leaves none. The rows
+	ride the caller's transaction (never committed here); `frappe.enqueue` is called on every branch (D-3).
+
+	Raises:
+		ValueError: an unknown trigger, or the message or Communication name the trigger needs is missing.
+	"""
 	if trigger not in VALID_TRIGGERS:
 		raise ValueError(f"Unknown trigger: {trigger!r}")
 	if trigger == TRIGGER_COMMENT_MENTION and not message_name:
@@ -63,6 +103,15 @@ def enqueue_agent_run(
 	if not _claim_pending(job_id):
 		return False
 
+	state = _job_state(job_id)
+	run_id = None
+	if state == JOB_STATE_NEW:
+		run_id = requester_reply_key(ticket_name, communication_name) if is_reply else uuid.uuid4().hex
+		record_event(ticket=ticket_name, trigger=trigger, code=EVENT_CALL_RECEIVED, run_id=run_id)
+	elif trigger == TRIGGER_COMMENT_MENTION:
+		code = EVENT_CALL_MERGED if state == JOB_STATE_QUEUED else EVENT_CALL_BUSY
+		record_event(ticket=ticket_name, trigger=trigger, code=code)
+
 	frappe.enqueue(
 		"erp_ai.agent.runner.run_for_ticket",
 		queue="long",
@@ -73,9 +122,10 @@ def enqueue_agent_run(
 		ticket_name=ticket_name,
 		trigger=trigger,
 		message_name=message_name,
+		run_id=run_id,
 		**reply_kwargs,
 	)
-	return True
+	return state == JOB_STATE_NEW
 
 
 def enqueue_lifecycle_job(ticket_name: str) -> bool:

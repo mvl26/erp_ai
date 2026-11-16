@@ -26,6 +26,7 @@ from erp_ai.agent.prompts import (
 	FIELD_VALUE_MAX_CHARS,
 	LATER_MESSAGES_LABEL,
 	LATER_MESSAGES_MAX,
+	REPLY_BLOCK,
 	SITE_ADMIN_TOOLS_BLOCK,
 	TASK_COMMENT,
 	TASK_NEW_TICKET,
@@ -71,6 +72,7 @@ from erp_ai.test_utils import (
 	make_model_result,
 	make_routing_rules,
 	make_team,
+	pin_agent_roles,
 	record_status_signals,
 	set_agent_settings,
 )
@@ -3914,6 +3916,55 @@ class TestRunNotices(RunnerTestBase):
 		self.assertEqual(entry, self._entry(notice, "daily_limit"))
 		self.assertEqual(self._comment_count(), before + 1)
 
+	def test_requester_reply_gets_listed_notices(self):
+		# T163, E-2 (w1b-r2.md:76): the requester-reply run is in the three cells, the knowledge-draft run in none
+		for notice, triggers in runner.NOTICE_TRIGGERS.items():
+			with self.subTest(cell=notice):
+				self.assertIn(REQUESTER_REPLY, triggers)
+				self.assertNotIn("kb_draft", triggers)
+		since = frappe.utils.add_to_date(frappe.utils.now_datetime(), minutes=-30)
+
+		def reply_run(label, results):
+			frappe.set_user("Administrator")
+			ticket = make_ticket(subject=f"{PREFIX}reply notice {label}").name
+			if label == "ask_fallback":
+				# the latest classification is below the threshold: the run classifies again, still below
+				write_entry(
+					ticket=ticket,
+					run_id=f"{PREFIX}seed-{frappe.generate_hash(length=8)}",
+					entry_type="classify",
+					trigger="ticket_insert",
+					turn=0,
+					predicted_category="A",
+					predicted_confidence_pct=69,
+				)
+			self.gateway.results = results
+			runner.run_for_ticket(
+				ticket, REQUESTER_REPLY, communication_name=requester_message(ticket, since)
+			)
+			return ticket
+
+		with self.subTest("over budget at L3"):
+			set_agent_settings(permission_level="L3")
+			self.month_spend.return_value = 2000.0
+			ticket = reply_run("over_budget", [make_model_result()])
+			self.assertEqual(len(self._notices("over_budget", ticket)), 1)
+			self.assertEqual(frappe.db.count("Comment", authority.ticket_comment_filters(ticket)), 1)
+
+		with self.subTest("gateway error"):
+			set_agent_settings(permission_level="L1")
+			self.month_spend.return_value = 0.0
+			ticket = reply_run("run_failed", [GatewayError("server_error", status=500)])
+			self.assertEqual(len(self._notices("run_failed", ticket)), 1)
+			self.assertEqual(frappe.db.count("Comment", authority.ticket_comment_filters(ticket)), 1)
+
+		with self.subTest("below the threshold, the model asks nothing"):
+			set_agent_settings(permission_level="L1", level_cap_a="L1", act_now_enabled=0)
+			self.latest_classification.side_effect = self.real_latest_classification
+			ticket = reply_run("ask_fallback", [classify_at(69), make_model_result()])
+			self.assertEqual(len(self._notices("ask_fallback", ticket)), 1)
+			self.assertEqual(frappe.db.count("Comment", authority.ticket_comment_filters(ticket)), 1)
+
 	def test_each_notice_has_one_action_entry(self):
 		self._seed_runs(DAILY_LIMIT)
 		self._run("comment_mention")
@@ -5711,3 +5762,125 @@ class TestRequesterReplyRun(RequesterReplyRunBase):
 
 		self.assertEqual(self.gateway.call_count, 0)
 		self.assertEqual(self._skips(), [(self._key(first), REQUESTER_REPLY, "level_L0")])
+
+
+REPLY_TOOL = "reply_to_requester"
+REPLY_QUESTION = f"{PREFIX}anh/chị in từ màn hình nào?"
+
+
+def reply_call(block_id, kind="answer", message=f"{PREFIX}máy in đã được cấu hình lại, anh/chị in thử giúp."):
+	return tool_use(block_id, REPLY_TOOL, message=message, kind=kind)
+
+
+class TestKnowledgeActions(RequesterReplyRunBase):
+	"""AC-40, AC-10, AC-22 (T163, U6b.md:287-289, w1b-r2.md:75): with its switch on a run is granted the reply tool and
+	the reply block; each reply is one action entry; an emailed question is the run's one ask."""
+
+	def setUp(self):
+		super().setUp()
+		pin_agent_roles(self)
+		set_agent_settings(reply_enabled=1)
+		# a reply is then a Sent Communication only, with no email to queue; the value rolls back with the test
+		self.addCleanup(frappe.clear_document_cache, "HD Settings", "HD Settings")
+		frappe.db.set_single_value("HD Settings", "skip_email_workflow", 1)
+
+	def _sent(self):
+		return frappe.get_all(
+			"Communication",
+			filters={
+				"reference_doctype": "HD Ticket",
+				"reference_name": self.ticket.name,
+				"sent_or_received": "Sent",
+				"owner": AGENT_USER,
+			},
+			pluck="name",
+		)
+
+	def _below_threshold(self):
+		"""The ticket's latest classification is 69 against the threshold 70: the reply run classifies again, at 69."""
+		self.latest_classification.side_effect = self.real_latest_classification
+		write_entry(
+			ticket=self.ticket.name,
+			run_id=f"{PREFIX}seed-{frappe.generate_hash(length=8)}",
+			entry_type="classify",
+			trigger="ticket_insert",
+			turn=0,
+			predicted_category="A",
+			predicted_confidence_pct=69,
+		)
+
+	def _fallbacks(self):
+		prefix = write_ticket.NOTICE_PREFIXES["ask_fallback"]
+		return frappe.get_all(
+			"Comment",
+			filters={**authority.ticket_comment_filters(self.ticket.name), "content": ["like", f"{prefix}%"]},
+			pluck="name",
+		)
+
+	def test_reply_writes_one_action_entry(self):
+		call = reply_call("t_reply")
+		self.gateway.results = [tool_turn(call), make_model_result()]
+		self._reply_run(self._message())
+
+		(sent,) = self._sent()
+		first = self._entries(entry_type="reason")[0]
+		(entry,) = json.loads(first.actions)
+		self.assertEqual(tuple(entry), run_log.ACTION_KEYS)
+		instructor = authority.run_instructor(self.ticket.name, REQUESTER_REPLY)
+		self.assertEqual(
+			entry,
+			action_entry(
+				REPLY_TOOL, "Communication", sent, True, value_after=call["input"], instructor=instructor
+			),
+		)
+
+	def test_reply_block_only_when_reply_tool_granted(self):
+		# T157/T163: the runner passes reply_tools=granted.reply_block, so the block and the tool come together
+		self.gateway.results = [make_model_result()]
+		self._reply_run(self._message())
+		set_agent_settings(reply_enabled=0)
+		self.gateway.results = [make_model_result()]
+		self._reply_run(self._message(minutes=1))
+
+		on, off = self.gateway.calls
+		self.assertIn(REPLY_TOOL, [tool["name"] for tool in on["tools"]])
+		self.assertEqual(on["system"].count(REPLY_BLOCK), 1)
+		self.assertNotIn(REPLY_TOOL, [tool["name"] for tool in off["tools"]])
+		self.assertNotIn(REPLY_BLOCK, off["system"])
+
+	def test_below_threshold_email_question_is_the_one_ask(self):
+		# E-1 (w1b-r2.md:75): the question went by email; the run asks nothing more, no ask_fallback comment
+		self._below_threshold()
+		self.gateway.results = [
+			classify_at(69),
+			tool_turn(reply_call("t_ask", "question", REPLY_QUESTION)),
+			make_model_result(),
+		]
+		self._reply_run(self._message())
+
+		self.assertEqual(len(self._sent()), 1)
+		self.assertEqual(self._fallbacks(), [])
+		self.assertEqual(self._comment_count(), 0)
+
+	def test_comment_question_then_email_question_refused(self):
+		# the comment question came first in the run: the emailed one is refused, nothing is sent
+		self._below_threshold()
+		question = f"{PREFIX}màn hình nào báo lỗi?\n{ASK_EVIDENCE}"
+		self.gateway.results = [
+			classify_at(69),
+			tool_turn(
+				tool_use("t_hoi", "post_comment", kind="hoi", content=question),
+				reply_call("t_ask", "question", REPLY_QUESTION),
+			),
+			make_model_result(),
+		]
+		self._reply_run(self._message())
+
+		results = {
+			block["tool_use_id"]: json.loads(block["content"])
+			for block in self.gateway.calls[2]["messages"][-1]["content"]
+		}
+		self.assertTrue(results["t_hoi"]["ok"], results["t_hoi"])
+		self.assertEqual(results["t_ask"], {"ok": False, "reason": write_ticket.REASON_ONE_ASK})
+		self.assertEqual(self._sent(), [])
+		self.assertEqual(self._fallbacks(), [])

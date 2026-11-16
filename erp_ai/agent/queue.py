@@ -12,6 +12,7 @@ PENDING_JOB_IDS_FLAG = "erp_ai_pending_job_ids"
 VALID_TRIGGERS = (TRIGGER_TICKET_INSERT, TRIGGER_COMMENT_MENTION, TRIGGER_REQUESTER_REPLY, TRIGGER_KB_DRAFT)
 VALID_CHANGE_ACTIONS = ("apply", "undo")
 SCHEDULED_JOB_TIMEOUT_S = 1200
+LIFECYCLE_JOB_TIMEOUT_S = 300
 
 
 def _clear_pending_job_ids():
@@ -73,6 +74,27 @@ def enqueue_agent_run(
 		trigger=trigger,
 		comment_name=comment_name,
 		**reply_kwargs,
+	)
+	return True
+
+
+def enqueue_lifecycle_job(ticket_name: str) -> bool:
+	"""Queue the ticket lifecycle job (ADR-033 QĐ 6); the target is a string, this module never imports it."""
+	if not isinstance(ticket_name, str) or not ticket_name:
+		raise ValueError(f"Invalid ticket_name: {ticket_name!r}")
+
+	job_id = f"erp_ai_lifecycle::{ticket_name}"
+	if not _claim_pending(job_id):
+		return False
+
+	frappe.enqueue(
+		"erp_ai.agent.lifecycle.run_task_lifecycle",
+		queue="default",
+		timeout=LIFECYCLE_JOB_TIMEOUT_S,
+		enqueue_after_commit=True,
+		job_id=job_id,
+		deduplicate=True,
+		ticket_name=ticket_name,
 	)
 	return True
 

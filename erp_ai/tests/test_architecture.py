@@ -148,6 +148,7 @@ ENQUEUE_TARGETS = (
 	"erp_ai.agent.daily_report.run_daily_report",
 	"erp_ai.agent.kpi.run_weekly_kpi",
 	"erp_ai.agent.monthly_review.run_monthly_review",
+	"erp_ai.agent.lifecycle.run_task_lifecycle",
 )
 
 CONFIG_DOCTYPES = ("ERP AI Setting", "ERP AI Credential")
@@ -6676,6 +6677,7 @@ class TestScannersCatchViolations(unittest.TestCase):
 				"erp_ai.agent.daily_report.run_daily_report",
 				"erp_ai.agent.kpi.run_weekly_kpi",
 				"erp_ai.agent.monthly_review.run_monthly_review",
+				"erp_ai.agent.lifecycle.run_task_lifecycle",
 			),
 		)
 

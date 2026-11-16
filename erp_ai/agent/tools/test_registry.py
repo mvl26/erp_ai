@@ -20,7 +20,7 @@ from erp_ai.agent.tools.registry import (
 	get_tool_schemas,
 )
 from erp_ai.agent.tools.source import GIT_SUBCOMMANDS
-from erp_ai.constants import PROPOSAL_DOCTYPE, ROLE_AGENT
+from erp_ai.constants import MESSAGE_DOCTYPE, PROPOSAL_DOCTYPE, ROLE_AGENT
 from erp_ai.test_utils import GitSandbox, keep_agent_settings
 
 REAL_ALL_SPECS = registry._all_specs
@@ -709,9 +709,10 @@ class TestRealToolsRunWithoutCommit(FrappeTestCase):
 		frappe.set_user("Administrator")
 		ticket = frappe.get_doc("HD Ticket", self.ticket)
 		self.assertEqual(ticket.ticket_type, SEED_TYPE)
+		# CHG-003 Amendment 3: what the bot says to people is a message of the ticket's conversation
 		self.assertTrue(
 			frappe.db.exists(
-				"Comment", {"reference_name": self.ticket, "content": ["like", "%ERPAI-TEST-T27%"]}
+				MESSAGE_DOCTYPE, {"ticket": self.ticket, "content": ["like", "%ERPAI-TEST-T27%"]}
 			)
 		)
 		self.assertTrue(frappe.db.exists("Task", {"subject": "ERPAI-TEST-T27 việc"}))

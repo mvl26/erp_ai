@@ -42,8 +42,8 @@ def ticket_after_insert(doc, method=None):
 		skip_reason = "agent_disabled"
 	elif doc.owner == AGENT_USER:
 		skip_reason = "created_by_agent"
-	elif not policy.can_send_ticket(doc):
-		skip_reason = "not_sendable"
+	elif refusal := policy.send_refusal(doc):
+		skip_reason = f"not_sendable:{refusal}"
 	elif doc.flags.erp_ai_prefilled:
 		skip_reason = "prefilled"
 
@@ -177,8 +177,8 @@ def comment_after_insert(doc, method=None):
 		skip_reason = "written_by_agent"
 	elif not policy.contains_keyword(doc.content):
 		skip_reason = "no_keyword"
-	elif not policy.can_send_ticket(ticket):
-		skip_reason = "not_sendable"
+	elif refusal := policy.send_refusal(ticket):
+		skip_reason = f"not_sendable:{refusal}"
 
 	if skip_reason:
 		_log_decision(ticket, TRIGGER_COMMENT_MENTION, "skipped", skip_reason)

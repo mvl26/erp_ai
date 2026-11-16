@@ -15,7 +15,7 @@ from frappe.tests.utils import FrappeTestCase
 from frappe.utils import escape_html
 from helpdesk.test_utils import make_ticket
 
-from erp_ai import tasks
+from erp_ai import handlers, tasks
 from erp_ai.agent import answer_delay, authority, missed_scan, policy, run_log, runner
 from erp_ai.agent.agent_write_guard import allow_agent_write
 from erp_ai.agent.changes import apply_job, transitions
@@ -5763,7 +5763,109 @@ class TestRequesterReplyRun(RequesterReplyRunBase):
 		self.assertEqual(self.gateway.call_count, 0)
 		self.assertEqual(self._skips(), [(self._key(first), REQUESTER_REPLY, "level_L0")])
 
+	# T165, U6b-1 (w1.md:128): end to end from the Communication hook; the handler only queues, the run's mode is the
+	# runner's (ADR-036 QĐ 7), and the run after a question below the threshold classifies again (ADR-037)
 
+	def _bot_message(self):
+		"""The bot's email to the requester, a minute before the requester's messages (B-1), stored as is."""
+		creation = frappe.utils.add_to_date(self.since, minutes=-1)
+		frappe.get_doc(
+			{
+				"doctype": "Communication",
+				"communication_type": "Communication",
+				"communication_medium": "Email",
+				"sent_or_received": "Sent",
+				"reference_doctype": "HD Ticket",
+				"reference_name": self.ticket.name,
+				"sender": AGENT_USER,
+				"subject": f"{PREFIX}tin của bot",
+				"content": f"{PREFIX}bot hỏi lại",
+				"owner": AGENT_USER,
+				"modified_by": AGENT_USER,
+				"creation": creation,
+				"modified": creation,
+			}
+		).db_insert()
+
+	def _handler_jobs(self, communication):
+		"""The agent runs the Communication `on_update` handler queues for `communication` (recorded, not run)."""
+		frappe.set_user("Administrator")
+		with patch.object(frappe, "enqueue") as enqueue:
+			handlers.communication_on_update(frappe.get_doc("Communication", communication))
+		return [call.kwargs for call in enqueue.call_args_list if call.args[0] == RUN_FOR_TICKET]
+
+	def _run_job(self, job):
+		runner.run_for_ticket(
+			job["ticket_name"],
+			job["trigger"],
+			job["comment_name"],
+			communication_name=job["communication_name"],
+		)
+
+	def test_reply_after_guidance_no_new_guidance(self):
+		self._guidance_by_hand()
+		self._bot_message()
+		reply = self._message()
+		before = self._comment_names()
+
+		(job,) = self._handler_jobs(reply)
+		self.gateway.results = [make_model_result()]
+		logger = MagicMock()
+		with patch.object(frappe, "logger", return_value=logger):
+			self._run_job(job)
+
+		self.assertEqual((job["trigger"], job["communication_name"]), (REQUESTER_REPLY, reply))
+		self.assertEqual(self.gateway.call_count, 1)
+		self.assertEqual(self._guidance(), 1)
+		# nothing to do: no comment at all, so none with the marker; one log line says the ticket has its guidance
+		self.assertEqual(self._new_comments(before), {})
+		(line,) = self._guidance_log_lines(logger)
+		self.assertEqual(line, (runner.GUIDANCE_EXISTS_LOG, self.ticket.name, self._key(reply)))
+
+	def test_reply_after_low_confidence_question_posts_guidance(self):
+		# the first run scores 69 against 70 and asks the requester by email; the requester's answer queues a run that
+		# classifies again with it, at 75, and posts the ticket's one guidance
+		pin_agent_roles(self)
+		set_agent_settings(reply_enabled=1)
+		self.addCleanup(frappe.clear_document_cache, "HD Settings", "HD Settings")
+		frappe.db.set_single_value("HD Settings", "skip_email_workflow", 1)
+		self.latest_classification.side_effect = self.real_latest_classification
+		self.gateway.results = [
+			classify_at(69),
+			tool_turn(reply_call("t_ask", "question", REPLY_QUESTION)),
+			make_model_result(),
+		]
+		self._run()
+
+		sent = frappe.get_all(
+			"Communication",
+			filters={
+				"reference_doctype": "HD Ticket",
+				"reference_name": self.ticket.name,
+				"sent_or_received": "Sent",
+				"owner": AGENT_USER,
+			},
+			pluck="name",
+		)
+		# one question (the email), no ask_fallback comment, no guidance
+		self.assertEqual(len(sent), 1)
+		self.assertEqual(self._comment_count(), 0)
+		self.assertEqual(self._guidance(), 0)
+
+		answer = f"{PREFIX}in phiếu xuất PX-01 ở kho 2"
+		later = frappe.utils.add_to_date(frappe.utils.now_datetime(), seconds=1)
+		reply = requester_message(self.ticket.name, later, content=answer)
+		(job,) = self._handler_jobs(reply)
+		self.gateway.calls.clear()
+		self.gateway.results = [classify_at(75), make_model_result()]
+		self._run_job(job)
+
+		self.assertEqual([call["task"] for call in self.gateway.calls], ["classify", "reason"])
+		self.assertIn(answer, self.gateway.calls[0]["messages"][0]["content"])
+		self.assertEqual(self._guidance(), 1)
+
+
+RUN_FOR_TICKET = "erp_ai.agent.runner.run_for_ticket"
 REPLY_TOOL = "reply_to_requester"
 REPLY_QUESTION = f"{PREFIX}anh/chị in từ màn hình nào?"
 

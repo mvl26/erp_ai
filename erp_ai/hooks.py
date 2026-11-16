@@ -153,6 +153,14 @@ doc_events = {
 		"validate": "erp_ai.agent.article_guard.check_article_write",
 		"on_trash": "erp_ai.agent.article_guard.check_article_delete",
 	},
+	# FEAT-007 U6b: the requester's reply queues its run (on_update: a merge has moved it by then, B-3); a Task's
+	# status change queues the ticket's lifecycle job
+	"Communication": {
+		"on_update": "erp_ai.handlers.communication_on_update",
+	},
+	"Task": {
+		"on_update": "erp_ai.handlers.task_on_update",
+	},
 }
 
 # Deleting a ticket must not be blocked by its audit-log rows (the log is kept)
@@ -169,6 +177,8 @@ scheduler_events = {
 		"0 8 * * *": ["erp_ai.schedules.enqueue_daily_report"],
 		"0 8 * * 1": ["erp_ai.schedules.enqueue_weekly_kpi"],
 		"0 8 1 * *": ["erp_ai.schedules.enqueue_monthly_review"],
+		# FEAT-007 U6b (ADR-033 QĐ 6, U6b-fixes Sửa 14): the light silent-F scan runs as the cron job itself
+		"0 * * * *": ["erp_ai.agent.lifecycle.scan_silent_f_tickets"],
 	},
 }
 

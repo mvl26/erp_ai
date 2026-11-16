@@ -3,11 +3,18 @@ from frappe import _
 from frappe.model.document import Document
 from frappe.utils import cint, cstr, get_datetime, get_system_timezone, now_datetime
 
-from erp_ai.agent import change_text, queue
+from erp_ai.agent import change_text, policy, queue
 from erp_ai.agent.agent_write_guard import refuse_agent_write
 from erp_ai.agent.authority import NEVER_AUTHORITY
 from erp_ai.agent.changes import block, restart_check, transitions
-from erp_ai.constants import CHANGE_KIND_CODE, PROPOSAL_DOCTYPE, RESTART_STATUS_SENT, ROLE_INSTRUCTOR
+from erp_ai.constants import (
+	CHANGE_KIND_CODE,
+	CHANGE_STATUS_PENDING,
+	PROPOSAL_DOCTYPE,
+	RESTART_STATUS_SENT,
+	ROLE_INSTRUCTOR,
+	SETTING_DOCTYPE,
+)
 
 # Design 2.1 content group (ADR-012 QĐ 1): written once at insert, never changed afterwards.
 CONTENT_FIELDS = (
@@ -127,6 +134,58 @@ class ERPAIChangeProposal(Document):
 		self.commit_message = change_text.message_text(subject, body)
 
 
+# CHG-008 design 3.2 lines 4-6: why the ticket panel shows no Duyệt / Từ chối buttons (or why the POST is refused).
+PANEL_REFUSALS = {
+	"role": "Chỉ người có vai trò ERP AI Instructor mới duyệt hoặc từ chối được.",
+	"not_pending": "Đề xuất không còn chờ duyệt.",
+	"switch_off": "Duyệt một lần bấm đang tắt; hãy duyệt ở form đề xuất.",
+}
+
+
+def has_decider_role(user: str) -> bool:
+	"""The one place `ROLE_INSTRUCTOR` is compared: `user` holds it and is not an account of `NEVER_AUTHORITY`.
+
+	The role is read with `frappe.get_roles`, never `is_instruction`: the agent account is refused even with it.
+	Not whitelisted.
+	"""
+	return user not in NEVER_AUTHORITY and ROLE_INSTRUCTOR in frappe.get_roles(user)
+
+
+def panel_decision_refusal(status: str) -> str | None:
+	"""Why the session user cannot decide a proposal in `status` from the ticket panel, or None when they can.
+
+	Checked in this order: role, then pending, then switch (5). The switch is read through
+	`policy.permission_switches` on every call and only when the first two checks pass. Not whitelisted.
+
+	Returns:
+		A value of `PANEL_REFUSALS`, or None.
+	"""
+	if not has_decider_role(frappe.session.user):
+		return PANEL_REFUSALS["role"]
+	if status != CHANGE_STATUS_PENDING:
+		return PANEL_REFUSALS["not_pending"]
+	if not policy.permission_switches(frappe.get_single(SETTING_DOCTYPE)).one_click_approval:
+		return PANEL_REFUSALS["switch_off"]
+	return None
+
+
+def proposal_head(name) -> frappe._dict:
+	"""`{"ticket", "change_status"}` of proposal `name`, read from the stored record. Not whitelisted.
+
+	Raises:
+		frappe.DoesNotExistError: `name` is not a string, is empty, or names no proposal (the text of `_decider`).
+	"""
+	head = None
+	if isinstance(name, str) and name.strip():
+		head = frappe.db.get_value(PROPOSAL_DOCTYPE, name, ["ticket", "change_status"], as_dict=True)
+	if not head:
+		frappe.throw(
+			_("Không có đề xuất {0}").format(frappe.utils.escape_html(cstr(name))),
+			frappe.DoesNotExistError,
+		)
+	return frappe._dict(ticket=head.ticket, change_status=head.change_status)
+
+
 def _decider(name) -> str:
 	"""Design 3.3/4.2 boundary: the session user holds `ERP AI Instructor`, then `name` is an existing proposal.
 
@@ -136,7 +195,7 @@ def _decider(name) -> str:
 	user without the role is refused, and the accounts of `NEVER_AUTHORITY` are refused even with it.
 	"""
 	user = frappe.session.user
-	if user in NEVER_AUTHORITY or ROLE_INSTRUCTOR not in frappe.get_roles(user):
+	if not has_decider_role(user):
 		frappe.throw(
 			_("Chỉ người có vai trò ERP AI Instructor mới duyệt, từ chối hoặc hoàn tác được"),
 			frappe.PermissionError,

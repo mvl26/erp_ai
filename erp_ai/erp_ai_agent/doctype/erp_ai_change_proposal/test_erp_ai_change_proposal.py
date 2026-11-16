@@ -1897,7 +1897,9 @@ class TestPanelDecisionRefusal(FrappeTestCase):
 						elif not switch:
 							expected = "switch_off"
 						got = self._refusal(user, status)
-						self.assertEqual(got, None if expected is None else controller.PANEL_REFUSALS[expected])
+						self.assertEqual(
+							got, None if expected is None else controller.PANEL_REFUSALS[expected]
+						)
 
 	def test_never_authority_is_role_refusal_even_with_role_and_pending_and_switch_on(self):
 		for user in (AGENT_USER, "Administrator", "Guest"):
@@ -1906,7 +1908,9 @@ class TestPanelDecisionRefusal(FrappeTestCase):
 
 	def test_order_role_before_not_pending_before_switch_off(self):
 		set_agent_settings(one_click_approval_enabled=0)
-		self.assertEqual(self._refusal(PANEL_PLAIN, CHANGE_STATUS_APPROVED), controller.PANEL_REFUSALS["role"])
+		self.assertEqual(
+			self._refusal(PANEL_PLAIN, CHANGE_STATUS_APPROVED), controller.PANEL_REFUSALS["role"]
+		)
 		self.assertEqual(
 			self._refusal(PANEL_INSTRUCTOR, CHANGE_STATUS_APPROVED), controller.PANEL_REFUSALS["not_pending"]
 		)
@@ -1919,7 +1923,10 @@ class TestPanelDecisionRefusal(FrappeTestCase):
 		self.assertIsNone(self._refusal(PANEL_INSTRUCTOR))
 
 	def test_switch_not_read_when_role_or_status_already_refuse(self):
-		for user, status in ((PANEL_PLAIN, CHANGE_STATUS_PENDING), (PANEL_INSTRUCTOR, CHANGE_STATUS_APPROVED)):
+		for user, status in (
+			(PANEL_PLAIN, CHANGE_STATUS_PENDING),
+			(PANEL_INSTRUCTOR, CHANGE_STATUS_APPROVED),
+		):
 			with self.subTest(user=user, status=status):
 				with patch("erp_ai.agent.policy.permission_switches") as switches:
 					self._refusal(user, status)

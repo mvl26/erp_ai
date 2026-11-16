@@ -33,6 +33,8 @@ function setupForm({ doc, call, router }) {
 		const TEXT_OPEN_PROPOSAL = "Xem nội dung thay đổi";
 		const OPEN_PROPOSAL_LABEL = "Mở đề xuất để Duyệt hoặc Từ chối";
 		const TEXT_NEEDS_INSTRUCTOR = "Cần người có vai trò ERP AI Instructor duyệt.";
+		// Server PANEL_REFUSALS["console_off"]: why a console card its viewer can open has no Duyệt.
+		const TEXT_CONSOLE_OFF = "Chạy bench console đang tắt.";
 		const TEXT_UNDO_AT_FORM = "Hoàn tác ở form";
 		const TEXT_DECIDED_BY = "Người duyệt: ";
 		const TEXT_RESTART = "Restart: ";
@@ -503,10 +505,14 @@ function setupForm({ doc, call, router }) {
 				if (canOpen && card?.is_console !== true) {
 					row.append(proposalButton(OPEN_PROPOSAL_LABEL, name));
 				} else {
+					// A console card its viewer can open waits for the console switch; the button only shows it.
 					const note = document.createElement("span");
 					note.style.color = "#6b7280";
-					note.textContent = TEXT_NEEDS_INSTRUCTOR;
+					note.textContent = canOpen ? TEXT_CONSOLE_OFF : TEXT_NEEDS_INSTRUCTOR;
 					row.append(note);
+					if (canOpen) {
+						row.append(proposalButton(TEXT_OPEN_PROPOSAL, name));
+					}
 				}
 			} else if (canOpen) {
 				row.append(

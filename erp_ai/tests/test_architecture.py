@@ -381,6 +381,11 @@ STATUS_SCRIPT_REQUIRED = (
 	# CHG-010 final review F-5: an empty script or output (None from the server) draws no block.
 	r"if \(card\?\.script\) \{\s*addBlock\(TEXT_CONSOLE_SCRIPT, card\.script\);",
 	r"if \(card\?\.output\) \{\s*addBlock\(TEXT_CONSOLE_OUTPUT, card\.output\);",
+	# CHG-010 final review F-6: a pending console card the viewer can open but not decide is held by the console
+	# switch (server PANEL_REFUSALS["console_off"]); the viewer keeps the button that only shows it.
+	r'TEXT_CONSOLE_OFF = "Chạy bench console đang tắt\."',
+	r"note\.textContent = canOpen \? TEXT_CONSOLE_OFF : TEXT_NEEDS_INSTRUCTOR;\s*row\.append\(note\);\s*"
+	r"if \(canOpen\) \{\s*row\.append\(proposalButton\(TEXT_OPEN_PROPOSAL, name\)\);",
 	r'maxHeight = "240px"',
 	r'overflow = "auto"',
 	r"\.sort\(\(a, b\) =>[^;]*\.created",

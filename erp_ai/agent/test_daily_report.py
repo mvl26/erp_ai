@@ -705,3 +705,112 @@ class TestBotActions(FrappeTestCase):
 		result = self._report()
 
 		self.assertEqual(result["bot_actions"], _bot_actions())
+
+
+ANCHOR_RUN = datetime(2002, 8, 12, 8, 0)  # a Monday
+ANCHOR_RUN_EMPTY = datetime(2002, 9, 9, 8, 0)  # a Monday
+COO = "coo@example.com"
+
+
+class TestRun(FrappeTestCase):
+	"""`run_daily_report`: one email a day, its content, the recipients."""
+
+	def setUp(self):
+		_report_settings(self)
+		set_agent_settings(coo_report_recipients=COO, daily_report_weekends=1, daily_report_sent_on=None)
+		patcher = patch("frappe.sendmail")
+		self.sendmail = patcher.start()
+		self.addCleanup(patcher.stop)
+
+	def _sent(self) -> dict:
+		self.sendmail.assert_called_once()
+		return self.sendmail.call_args.kwargs
+
+	def test_twice_same_day_one_email(self):
+		daily_report.run_daily_report(now=ANCHOR_RUN)
+		daily_report.run_daily_report(now=ANCHOR_RUN + timedelta(hours=1))
+
+		sent = self._sent()
+		self.assertEqual(sent["recipients"], [COO])
+		self.assertEqual(sent["subject"], "[erp_ai] Báo cáo hằng ngày 12/08/2002")
+		self.assertIs(sent["delayed"], True)
+		self.assertEqual(
+			frappe.utils.getdate(frappe.db.get_single_value(SETTING_DOCTYPE, "daily_report_sent_on")),
+			ANCHOR_RUN.date(),
+		)
+
+	def test_run_at_two_am_belongs_to_the_day_before(self):
+		daily_report.run_daily_report(now=ANCHOR_RUN + timedelta(days=1) - timedelta(hours=6))
+
+		self.assertEqual(self._sent()["subject"], "[erp_ai] Báo cáo hằng ngày 12/08/2002")
+
+	def test_empty_day_sends_zeros(self):
+		day = ANCHOR_RUN_EMPTY.date() - timedelta(days=1)
+		frappe.db.delete(
+			LOG_DOCTYPE,
+			{"creation": ["between", [datetime.combine(day, datetime.min.time()), ANCHOR_RUN_EMPTY]]},
+		)
+
+		daily_report.run_daily_report(now=ANCHOR_RUN_EMPTY)
+
+		html = self._sent()["message"]
+		self.assertIn("Không có", html)
+		for kind in daily_report.BOT_ACTION_KINDS:
+			self.assertIn(f"<td>{kind}</td><td>0</td>", html)
+		self.assertIn("0.000000", html)
+
+	def test_recipients_trimmed_blank_and_duplicate_dropped(self):
+		set_agent_settings(
+			coo_report_recipients="coo@example.com\n\n  ke.toan@congty.vn  \ncoo@example.com\n"
+		)
+
+		daily_report.run_daily_report(now=ANCHOR_RUN)
+
+		self.assertEqual(self._sent()["recipients"], [COO, "ke.toan@congty.vn"])
+
+	def test_excluded_ticket_number_only_no_subject(self):
+		overdue = ANCHOR_RUN - timedelta(hours=1)
+		name = _ticket(
+			"zq_excluded_title",
+			ANCHOR_RUN - timedelta(days=2),
+			"B",
+			ai_opt_out=1,
+			resolution_by=overdue,
+		)
+
+		daily_report.run_daily_report(now=ANCHOR_RUN)
+
+		html = self._sent()["message"]
+		self.assertIn(f"#{name} (nhóm loại trừ)", html)
+		self.assertNotIn("zq_excluded_title", html)
+		self.assertNotIn(overdue.strftime("%d/%m/%Y %H:%M"), html)
+
+	def test_secret_in_subject_redacted(self):
+		name = _ticket("secret", ANCHOR_RUN - timedelta(hours=2), "B")
+		frappe.db.set_value(
+			"HD Ticket",
+			name,
+			"subject",
+			"ERPAI-TEST sk-FAKE000000000000000000 <b>x</b>",
+			update_modified=False,
+		)
+
+		daily_report.run_daily_report(now=ANCHOR_RUN)
+
+		html = self._sent()["message"]
+		self.assertNotIn("sk-FAKE000000000000000000", html)
+		self.assertIn("[đã che]", html)
+		self.assertNotIn("<b>x</b>", html)
+		self.assertIn("&lt;b&gt;x&lt;/b&gt;", html)
+
+	def test_due_lists_show_deadline(self):
+		due = ANCHOR_RUN + timedelta(hours=2)
+		overdue = ANCHOR_RUN - timedelta(hours=3)
+		_ticket("due", ANCHOR_RUN - timedelta(days=2), "B", resolution_by=due)
+		_ticket("late", ANCHOR_RUN - timedelta(days=2), "B", resolution_by=overdue)
+
+		daily_report.run_daily_report(now=ANCHOR_RUN)
+
+		html = self._sent()["message"]
+		self.assertIn("12/08/2002 10:00", html)
+		self.assertIn("12/08/2002 05:00", html)

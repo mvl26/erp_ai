@@ -644,6 +644,52 @@ class TestPrompts(FrappeTestCase):
 		self.assertIn("post_comment", message)
 		self.assertNotIn("set_resolution_hint", message)
 
+	def test_initial_message_carries_the_conversation_as_plain_text(self):
+		conversation = [
+			{"author": "An", "role": "chỉ thị", "content": "máy <b>in</b> hỏng", "name": "SHOULD-NOT-LEAK"},
+			{"author": "Bot", "role": "dữ liệu", "content": "a < b & c"},
+		]
+		message = prompts.build_initial_message(
+			self._ticket(), [], TRIGGER_COMMENT_MENTION, None, conversation=conversation
+		)
+		# A message is plain text as typed: nothing is stripped from it, and only three keys go to the model.
+		self.assertEqual(
+			self._payload(message)["conversation"],
+			[
+				{"author": "An", "role": "chỉ thị", "content": "máy <b>in</b> hỏng"},
+				{"author": "Bot", "role": "dữ liệu", "content": "a < b & c"},
+			],
+		)
+		self.assertNotIn("SHOULD-NOT-LEAK", message)
+
+	def test_initial_message_limits_the_conversation(self):
+		conversation = [{"author": f"Người {i}", "role": "dữ liệu", "content": "y" * 3000} for i in range(31)]
+		payload = self._payload(
+			prompts.build_initial_message(
+				self._ticket(), [], TRIGGER_COMMENT_MENTION, None, conversation=conversation
+			)
+		)
+		self.assertEqual(len(payload["conversation"]), 30)
+		self.assertEqual(payload["conversation"][0]["author"], "Người 1")
+		self.assertEqual(payload["conversation"][-1]["author"], "Người 30")
+		self.assertEqual(len(payload["conversation"][0]["content"]), 2000)
+
+	def test_initial_message_without_a_conversation_has_no_block(self):
+		for conversation in (None, []):
+			payload = self._payload(
+				prompts.build_initial_message(
+					self._ticket(), [], TRIGGER_COMMENT_MENTION, None, conversation=conversation
+				)
+			)
+			self.assertNotIn("conversation", payload)
+
+	def test_task_of_a_message_run_says_where_the_answer_appears(self):
+		self.assertEqual(
+			prompts.TASK_COMMENT,
+			'Việc cần làm: có tin mới trong ngăn "Trao đổi với bot" gọi bạn (tin cuối của khối conversation). '
+			"Trả lời bằng post_comment: câu trả lời hiện trong ngăn đó, không hiện trên timeline phiếu.",
+		)
+
 	def test_initial_message_limits_comments_and_lengths(self):
 		comments = [
 			{"author": f"Người {i}", "role": "dữ liệu", "content": "<b>c</b>" + "y" * 3000} for i in range(35)

@@ -7,7 +7,7 @@ from frappe.tests.utils import FrappeTestCase
 from helpdesk.test_utils import make_ticket
 
 from erp_ai.agent import kpi
-from erp_ai.constants import AGENT_USER, LOG_DOCTYPE
+from erp_ai.constants import AGENT_USER, LOG_DOCTYPE, MESSAGE_DOCTYPE
 from erp_ai.test_utils import keep_agent_settings, set_agent_settings
 
 # Weeks long before any real ticket on the shared site, one per test, so "open at the week end" (A-D2)
@@ -20,6 +20,7 @@ WEEK_NO_RESPONSE = date(2001, 5, 7)
 WEEK_KPI4 = date(2001, 6, 4)
 WEEK_KPI5 = date(2001, 7, 2)
 WEEK_KPI6 = date(2001, 8, 6)
+WEEK_KPI3_CHAT = date(2001, 9, 3)
 KPI_KEYS = {
 	"week_start",
 	"week_end",
@@ -88,6 +89,11 @@ def _comment(ticket: str, owner: str, comment_type: str = "Comment") -> None:
 		}
 	)
 	_insert_as(doc, owner)
+
+
+def _message(ticket: str, owner: str) -> None:
+	"""One message of the ticket's conversation with the bot, written by `owner`."""
+	_insert_as(frappe.get_doc({"doctype": MESSAGE_DOCTYPE, "ticket": ticket, "content": "ERPAI-TEST"}), owner)
 
 
 def _communication(ticket: str, owner: str, sent_or_received: str = "Sent") -> None:
@@ -278,6 +284,30 @@ class TestKpi(FrappeTestCase):
 
 		self.assertEqual(result["closed_sample"], 10)
 		self.assertEqual(result["closed_without_human_pct"], 20.0)
+
+	def test_kpi3_person_in_the_bot_conversation_is_a_human_touch(self):
+		ws = _start(WEEK_KPI3_CHAT)
+
+		def closed_by_bot():
+			ticket = _ticket(
+				ws - timedelta(days=1), resolution_date=ws + timedelta(days=2), raised_by=CUSTOMER
+			)
+			_log(ticket, [_close_action(ticket)])
+			return ticket
+
+		# counts: only the bot and the requester wrote in the conversation
+		bot_only = closed_by_bot()
+		_message(bot_only, AGENT_USER)
+		_message(bot_only, CUSTOMER)
+		# does not count: an agent asked the bot there
+		asked = closed_by_bot()
+		_message(asked, AGENT_USER)
+		_message(asked, HUMAN_AGENT)
+
+		result = kpi.compute_week(WEEK_KPI3_CHAT, self.settings)
+
+		self.assertEqual(result["closed_sample"], 2)
+		self.assertEqual(result["closed_without_human_pct"], 50.0)
 
 	def test_zero_sample_none(self):
 		result = kpi.compute_week(WEEK_EMPTY, self.settings)

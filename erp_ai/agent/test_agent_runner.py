@@ -55,6 +55,7 @@ from erp_ai.constants import (
 	KEY_STATUS_BAD_KEY,
 	LOG_DOCTYPE,
 	LOGGER_NAME,
+	MESSAGE_DOCTYPE,
 	PROPOSAL_DOCTYPE,
 	ROLE_INSTRUCTOR,
 	SETTING_DOCTYPE,
@@ -1026,6 +1027,29 @@ class TestRunnerReasoning(RunnerTestBase):
 		self.assertEqual(payload["ticket"]["subject"], f"{PREFIX}runner ticket")
 		self.assertTrue(content.endswith(TASK_COMMENT))
 
+	def test_initial_message_carries_the_conversation_by_full_name(self):
+		# newest first, as the message reader returns them; the model reads them oldest first
+		history = [
+			{"name": "m2", "author": AGENT_USER, "creation": "2026-01-02", "content": "bot đáp"},
+			{"name": "m1", "author": "Administrator", "creation": "2026-01-01", "content": "hỏi bot"},
+		]
+		with (
+			patch.object(authority, "run_instructor", return_value=None),
+			patch.object(runner, "conversation_history", return_value=history) as fetch,
+			patch.object(runner, "get_fullname", side_effect=lambda user: f"{PREFIX}{user}"),
+		):
+			self._run("comment_mention")
+
+		fetch.assert_called_once_with(self.ticket.name)
+		payload, _content = self._user_message()
+		self.assertEqual(
+			payload["conversation"],
+			[
+				{"author": f"{PREFIX}Administrator", "role": "dữ liệu", "content": "hỏi bot"},
+				{"author": f"{PREFIX}{AGENT_USER}", "role": "dữ liệu", "content": "bot đáp"},
+			],
+		)
+
 	def test_ticket_insert_passes_classification_to_reasoning(self):
 		self._run()
 
@@ -1606,6 +1630,37 @@ class TestActionLog(RunnerTestBase):
 			[(action["name"], action["value_after"]) for action in actions],
 			[("C-1", {"content": "một"}), ("C-2", {"content": "hai"})],
 		)
+
+	def test_answer_in_the_conversation_names_its_message(self):
+		# CHG-003: the entry names the record the tool wrote, here a message of the ticket's conversation.
+		actions, _ = self._run_with(
+			[tool_use("t1", "post_comment", kind="hoi", content="x")],
+			{"post_comment": {"ok": True, "message": "MSG-9"}},
+		)
+		self.assertEqual(
+			actions,
+			[
+				action_entry(
+					"post_comment",
+					MESSAGE_DOCTYPE,
+					"MSG-9",
+					True,
+					value_after={"kind": "hoi", "content": "x"},
+					instructor=INSTRUCTOR,
+				)
+			],
+		)
+
+	def test_only_a_run_a_message_started_answers_in_the_conversation(self):
+		for trigger, expected in (("comment_mention", True), ("ticket_insert", False)):
+			with (
+				self.subTest(trigger=trigger),
+				patch.object(runner, "ToolContext", wraps=runner.ToolContext) as context,
+			):
+				self._run(trigger)
+				self.assertEqual(
+					[call.kwargs["in_conversation"] for call in context.call_args_list], [expected]
+				)
 
 	def test_refused_call_entry_has_reason(self):
 		actions, _ = self._run_with(

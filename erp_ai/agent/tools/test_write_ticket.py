@@ -23,6 +23,7 @@ from erp_ai.constants import (
 	CLASSIFICATION_FIELDS,
 	CLASSIFIED_BY_AI,
 	CLASSIFIED_BY_HUMAN,
+	MESSAGE_DOCTYPE,
 	ROLE_AGENT,
 )
 from erp_ai.test_utils import keep_agent_settings, set_agent_settings
@@ -2428,6 +2429,124 @@ class TestBaNote(TicketCommentCase):
 			(None, {section: [] for section in write_ticket.GUIDANCE_SECTIONS}),
 		)
 		self.assertEqual(write_ticket.count_guidance(self.ticket), 0)
+
+	def test_note_of_a_conversation_run_stays_a_ticket_comment(self):
+		# CHG-003: the BA note is ticket information, not an answer; a run a message started posts it the same way.
+		self._classify_row("C")
+
+		result = self._note(ctx=self._ctx(in_conversation=True))
+
+		self.assertTrue(result["ok"], result)
+		self.assertEqual(self._comments(), [f"{ops_data.BA_NOTE_MARKER}\n{BA_NOTE}"])
+		self.assertEqual(frappe.db.count(MESSAGE_DOCTYPE, {"ticket": self.ticket}), 0)
+
+
+class TestAnswerInConversation(TicketCommentCase):
+	"""CHG-003: a run that a message of the ticket's conversation started answers there. What the post_comment tool
+	posts is then an ERP AI Message written by the agent account, not a ticket comment; a held analysis and every
+	refusal write nothing, as before."""
+
+	def _ctx(self, **fields):
+		run_id = f"{T100_PREFIX}-{frappe.generate_hash(length=10)}"
+		self.addCleanup(lambda: frappe.flags.get("erp_ai_asked_runs", set()).discard(run_id))
+		return ToolContext(
+			ticket_name=self.ticket,
+			effective_level="L1",
+			instructor=None,
+			run_id=run_id,
+			category_mapping={},
+			agent_user=AGENT_USER,
+			in_conversation=True,
+			**fields,
+		)
+
+	def _post(self, kind, content, ctx):
+		return write_ticket.post_comment_tool({"kind": kind, "content": content}, ctx)
+
+	def _messages(self):
+		return frappe.get_all(
+			MESSAGE_DOCTYPE,
+			filters={"ticket": self.ticket},
+			fields=["name", "owner", "content", "run_id"],
+			order_by="creation asc",
+		)
+
+	def test_answer_is_a_message_of_the_run_not_a_comment(self):
+		ctx = self._ctx()
+		answer = f"**Nhận định:** máy in hỏng\n{EVIDENCE}\nĐộ tin cậy: 90%"
+
+		result = self._post("de_xuat", answer, ctx)
+
+		(row,) = self._messages()
+		self.assertEqual(result, {"ok": True, "message": row.name})
+		self.assertEqual((row.owner, row.content, row.run_id), (AGENT_USER, answer, ctx.run_id))
+		self.assertEqual(self._comments(), [])
+
+	def test_question_is_a_message_stored_as_written(self):
+		question = "Máy <b>in</b> nào & ở đâu?"
+
+		result = self._post("hoi", question, self._ctx())
+
+		self.assertTrue(result["ok"], result)
+		self.assertEqual([row.content for row in self._messages()], [question])
+		self.assertEqual(self._comments(), [])
+
+	def test_below_threshold_one_question_with_footer(self):
+		set_agent_settings(confidence_threshold=80)
+		ctx = self._ctx(below_threshold=True)
+
+		first = self._post("hoi", QUESTION, ctx)
+
+		self.assertTrue(first["ok"], first)
+		footer = write_ticket.ASK_FOOTER.format(pct="chưa có", threshold=80)
+		self.assertEqual([row.content for row in self._messages()], [f"{QUESTION}\n\n{footer}"])
+		self.assertTrue(write_ticket.asked_in_run(ctx.run_id))
+		self.assertEqual(
+			self._post("hoi", QUESTION, ctx), {"ok": False, "reason": write_ticket.REASON_ONE_ASK}
+		)
+		self.assertEqual(len(self._messages()), 1)
+		self.assertEqual(self._comments(), [])
+
+	def test_refusal_writes_nothing(self):
+		result = self._post("de_xuat", "**Nhận định:** máy in hỏng", self._ctx())
+
+		self.assertEqual(result, {"ok": False, "reason": write_ticket.REASON_NO_CONFIDENCE})
+		self.assertEqual(self._messages(), [])
+		self.assertEqual(self._comments(), [])
+
+	def test_held_analysis_is_not_a_message(self):
+		ctx = self._ctx()
+		write_ticket.open_collector(ctx.run_id)
+		self.addCleanup(write_ticket.close_collector, ctx.run_id)
+
+		result = self._post("de_xuat", "**Nhận định:** máy in hỏng\nĐộ tin cậy: 90%", ctx)
+
+		self.assertEqual(result, {"ok": True, "held": True, "note": write_ticket.HELD_NOTE})
+		self.assertEqual(self._messages(), [])
+		self.assertEqual(self._comments(), [])
+
+	def test_no_read_on_the_ticket_is_a_refusal(self):
+		with patch.object(Document, "has_permission", return_value=False):
+			result = self._post("hoi", "Máy in nào?", self._ctx())
+
+		self.assertEqual(result, {"ok": False, "reason": "thiếu quyền đọc phiếu"})
+		self.assertEqual(self._messages(), [])
+
+	def test_no_create_permission_is_a_refusal(self):
+		with patch.object(write_ticket, "add_message", side_effect=frappe.PermissionError):
+			result = self._post("hoi", "Máy in nào?", self._ctx())
+
+		self.assertEqual(result, {"ok": False, "reason": "không được phép thêm tin vào ngăn trao đổi"})
+		self.assertEqual(self._comments(), [])
+
+	def test_run_outside_a_conversation_still_posts_a_comment(self):
+		ctx = dataclasses.replace(self._ctx(), in_conversation=False)
+
+		result = self._post("hoi", "Máy in nào?", ctx)
+
+		self.assertEqual(list(result), ["ok", "comment"])
+		self.assertEqual(self._comments(), ["Máy in nào?"])
+		self.assertEqual(self._messages(), [])
 
 
 class TestLevelNotRecomputed(FrappeTestCase):

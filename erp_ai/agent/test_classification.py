@@ -377,7 +377,15 @@ class TestPrompts(FrappeTestCase):
 		self.assertNotIn("BẢNG ROUTING", text)
 		self.assertEqual(
 			text,
-			"\n\n".join([prompts.CORE_PROMPT, prompts.CATEGORY_TABLE, prompts.CONVENTIONS, "DIGEST-XYZ"]),
+			"\n\n".join(
+				[
+					prompts.CORE_PROMPT,
+					prompts.CATEGORY_TABLE,
+					prompts.CONVENTIONS,
+					prompts.KNOWLEDGE_SOURCES_BLOCK,
+					"DIGEST-XYZ",
+				]
+			),
 		)
 
 	def test_build_reason_system_empty_digest(self):
@@ -392,7 +400,15 @@ class TestPrompts(FrappeTestCase):
 			("", "ROUTING-ABC"),
 			("", ""),
 		):
-			parts = [prompts.CORE_PROMPT, prompts.CATEGORY_TABLE, routing, prompts.CONVENTIONS, digest]
+			# spec changed (AC-47, AC-48, T157): KNOWLEDGE_SOURCES_BLOCK always follows CONVENTIONS.
+			parts = [
+				prompts.CORE_PROMPT,
+				prompts.CATEGORY_TABLE,
+				routing,
+				prompts.CONVENTIONS,
+				prompts.KNOWLEDGE_SOURCES_BLOCK,
+				digest,
+			]
 			expected = [
 				{
 					"type": "text",
@@ -450,7 +466,15 @@ class TestPrompts(FrappeTestCase):
 		)
 
 		core = prompts.core_prompt(change_tools=True)
-		head = "\n\n".join([core, prompts.CATEGORY_TABLE, "ROUTING-ABC", prompts.CONVENTIONS])
+		head = "\n\n".join(
+			[
+				core,
+				prompts.CATEGORY_TABLE,
+				"ROUTING-ABC",
+				prompts.CONVENTIONS,
+				prompts.KNOWLEDGE_SOURCES_BLOCK,
+			]
+		)
 		self.assertNotEqual(core, prompts.CORE_PROMPT)
 		blocks = prompts.build_reason_system("DIGEST-XYZ", "ROUTING-ABC", change_tools=True)
 		self.assertEqual(len(blocks), 1)
@@ -469,6 +493,7 @@ class TestPrompts(FrappeTestCase):
 					core,
 					prompts.CATEGORY_TABLE,
 					prompts.CONVENTIONS,
+					prompts.KNOWLEDGE_SOURCES_BLOCK,
 					block,
 				]
 			),
@@ -514,6 +539,7 @@ class TestPrompts(FrappeTestCase):
 				prompts.CATEGORY_TABLE,
 				"ROUTING-ABC",
 				prompts.CONVENTIONS,
+				prompts.KNOWLEDGE_SOURCES_BLOCK,
 			]
 		)
 		text = prompts.build_reason_system("DIGEST-XYZ", "ROUTING-ABC", site_admin_tools=True)[0]["text"]
@@ -543,6 +569,7 @@ class TestPrompts(FrappeTestCase):
 				prompts.CATEGORY_TABLE,
 				"ROUTING-ABC",
 				prompts.CONVENTIONS,
+				prompts.KNOWLEDGE_SOURCES_BLOCK,
 			]
 		)
 		text = prompts.build_reason_system("DIGEST-XYZ", "ROUTING-ABC", unrestricted_tools=True)[0]["text"]

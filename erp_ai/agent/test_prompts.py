@@ -309,7 +309,13 @@ class TestReasonSystem(FrappeTestCase):
 				self.assertLess(text.index(blocks["act_now"]), text.index(blocks["ask_only"]), flags)
 		# ask_only alone brings its block and nothing else; without it the block is never there
 		only = prompts.build_reason_system("", "", ask_only=True)[0]["text"]
-		self.assertTrue(only.endswith("\n\n" + prompts.CONVENTIONS + "\n\n" + prompts.ASK_ONLY_BLOCK))
+		# spec changed (AC-47, AC-48, T157): KNOWLEDGE_SOURCES_BLOCK always follows CONVENTIONS.
+		self.assertTrue(
+			only.endswith(
+				"\n\n"
+				+ "\n\n".join([prompts.CONVENTIONS, prompts.KNOWLEDGE_SOURCES_BLOCK, prompts.ASK_ONLY_BLOCK])
+			)
+		)
 		self.assertEqual(_expected_blocks(dict.fromkeys(FLAG_NAMES, False)), [])
 
 
@@ -601,3 +607,77 @@ class TestTaskByTrigger(FrappeTestCase):
 
 				self.assertEqual(_payload(message), _payload(_old_initial_message(trigger, CLASSIFICATION)))
 				self.assertEqual(message.rsplit("\n\n", 1)[1], task)
+
+
+KNOWLEDGE_TOOLS = ("search_knowledge_base", "search_manuals", "search_resolved_tickets")
+
+
+def _reason_texts():
+	"""The reason prompt of every flag combination, with and without the reply tools."""
+	return [
+		(flags, reply_tools, prompts.build_reason_system("", "", reply_tools=reply_tools, **flags)[0]["text"])
+		for flags in ALL_FLAGS
+		for reply_tools in (False, True)
+	]
+
+
+class TestKnowledgeSources(FrappeTestCase):
+	"""AC-47, AC-48 [changed] (design-w1-fixes-19.md Điểm 3.1, U6b.md:294): the three lookup sources, named in the
+	assessment or the direction, never under a heading of their own."""
+
+	def setUp(self):
+		keep_agent_settings(self)
+
+	def test_reason_prompt_names_three_sources(self):
+		block = prompts.KNOWLEDGE_SOURCES_BLOCK
+		self.assertEqual(
+			block,
+			"Ba nguồn tra trước khi kết luận: bài CSKT (search_knowledge_base), HDSD (search_manuals), phiếu cũ "
+			"(search_resolved_tickets). Nêu nguồn đã dùng ngay trong nhận định hoặc hướng xử lý (tên bài CSKT, tên "
+			"tài liệu HDSD, số phiếu cũ), không có mục riêng. Tool trả 'chưa có kho HDSD' hoặc không có kết quả thì "
+			"không nêu nguồn đó.",
+		)
+		for tool in KNOWLEDGE_TOOLS:
+			self.assertIn(tool, block)
+		self.assertIn("ngay trong nhận định hoặc hướng xử lý", block)
+		both = prompts.build_reason_system("", "", change_tools=True, reply_tools=True)[0]["text"]
+		for text in (block, prompts.REPLY_BLOCK, both):
+			for heading in RETIRED_HEADINGS:
+				self.assertNotIn(heading, text)
+		# Every reasoning run has the read tools (the three searches among them): the block always follows CONVENTIONS.
+		for flags, reply_tools, text in _reason_texts():
+			with self.subTest(flags=flags, reply_tools=reply_tools):
+				self.assertEqual(text.count(block), 1)
+				self.assertIn(prompts.CONVENTIONS + "\n\n" + block, text)
+
+
+class TestReplyBlock(FrappeTestCase):
+	"""AC-40 (U6b.md:295; ADR-030 QĐ 3): the reply block is in the prompt exactly when the reply tool is granted."""
+
+	def setUp(self):
+		keep_agent_settings(self)
+
+	def test_block_follows_reply_tools_flag(self):
+		block = prompts.REPLY_BLOCK
+		self.assertEqual(
+			block,
+			"TRẢ LỜI NGƯỜI TẠO. reply_to_requester gửi tới người tạo phiếu (họ đọc được). Comment thì người tạo không "
+			"đọc được. Đầu mục F: trả lời phải có ít nhất một nguồn, không có thì hỏi lại. Độ tin cậy dưới ngưỡng: chỉ "
+			"hỏi lại (kind=question).",
+		)
+		self.assertNotIn(block, prompts.build_reason_system("DIGEST-XYZ", "ROUTING-ABC")[0]["text"])
+		with self.assertRaises(TypeError):
+			prompts.build_reason_system("", "", False, False, False, False, False, True)
+		for flags, reply_tools, text in _reason_texts():
+			with self.subTest(flags=flags, reply_tools=reply_tools):
+				self.assertEqual(text.count(block), 1 if reply_tools else 0)
+				# the reply block leaves the act-now and ask-only blocks last (U1.md:227)
+				last = [
+					other for name, other in _flag_blocks() if flags[name] and name in ("act_now", "ask_only")
+				]
+				self.assertTrue(text.endswith("\n\n".join(last)))
+				without = prompts.build_reason_system("", "", **flags)[0]["text"]
+				self.assertEqual(text.replace("\n\n" + block, ""), without)
+				# PROMPT_CONFLICT_PAIRS gains no pair: the block allows no sentence the core forbids
+				for forbidden, allowed in prompts.PROMPT_CONFLICT_PAIRS:
+					self.assertFalse(forbidden in text and allowed in text, (forbidden, allowed))

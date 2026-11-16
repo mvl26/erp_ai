@@ -45,11 +45,19 @@ from erp_ai.agent.tools.write_ticket import (
 	FIELD_LABELS,
 	HINT_FIELD,
 	ROUTE_DONE,
+	SECTION_DECIDE,
+	SECTION_DONE,
 	asked_in_run,
+	close_collector,
+	collect,
+	collecting,
+	count_guidance,
 	created_labels,
 	keep_human_fields,
 	locked_rows,
 	mark_asked,
+	mark_work_only,
+	open_collector,
 	post_notice,
 )
 from erp_ai.constants import (
@@ -159,6 +167,8 @@ REASON_TURN_SAVEPOINT = "erp_ai_reason_turn"
 USAGE_COLUMNS = ("input_tokens", "output_tokens", "cache_creation_input_tokens", "cache_read_input_tokens")
 # The settings naming an HD Ticket field (U4b.md:209, AC-24): "field_<key>" for each key of the prompt labels.
 TICKET_FIELD_SETTINGS = tuple(f"field_{key}" for key in TICKET_FIELD_LABELS)
+# A run on a ticket that already has its guidance comment says so once in the log (AC-65 (c), w1.md:68).
+GUIDANCE_EXISTS_LOG = "erp_ai guidance ticket=%s run_id=%s: đã có hướng xử lý"
 
 
 def run_for_ticket(ticket_name: str, trigger: str, comment_name: str | None = None) -> None:
@@ -238,6 +248,7 @@ def _run(ticket_name, trigger, comment_name=None):
 		# One context for the whole run (classification and reasoning); never built at L0, which calls no tool.
 		context = None
 		classification = None
+		posted = False
 		if level != LEVELS[0]:
 			instructor = authority.run_instructor(ticket_name, trigger, comment_name)
 			# An insert run has no classification yet: `_classify` recomputes both from its own (U1.md:261).
@@ -265,6 +276,8 @@ def _run(ticket_name, trigger, comment_name=None):
 				main_path_level=policy.main_path_level(settings, level, category),
 				below_threshold=_below_threshold(pct, threshold, instructor, switches.act_now),
 			)
+			# ADR-036 QĐ 7: the one count, read once; the mode is chosen once the classification is known
+			posted = count_guidance(ticket_name) > 0
 		if trigger == TRIGGER_TICKET_INSERT:
 			proceed, classification, context = _classify(
 				ticket_name,
@@ -279,9 +292,12 @@ def _run(ticket_name, trigger, comment_name=None):
 				settings,
 				threshold,
 				field_map,
+				posted,
 			)
 			if not proceed:
 				return
+		elif context is not None:
+			_choose_mode(context, posted)
 		if level != LEVELS[0]:
 			notices = []
 			# over budget at a base level of L2/L3 the run lost something: said once a day (A-U4b-7)
@@ -311,9 +327,22 @@ def _run(ticket_name, trigger, comment_name=None):
 				started_at=started_at,
 				field_map=field_map,
 				notices=notices,
+				guidance_posted=posted,
 			)
 	finally:
+		close_collector(run_id)
 		_end_status(status, delay, ticket_name, run_id, trigger)
+
+
+def _choose_mode(context, posted: bool) -> None:
+	"""The run's mode (ADR-036 QĐ 7, w1.md:68): a ticket that has its guidance gets a work-only run and one log
+	line; otherwise a run at a main path level above L0 that is not below the threshold opens the collector of the
+	run's one guidance comment. Below the threshold nothing opens: the run only asks (AC-65 (b))."""
+	if posted:
+		mark_work_only(context.run_id)
+		frappe.logger(LOGGER_NAME).info(GUIDANCE_EXISTS_LOG, context.ticket_name, context.run_id)
+	elif context.main_path_level != LEVELS[0] and not context.below_threshold:
+		open_collector(context.run_id)
 
 
 def _ticket_fields(settings) -> tuple[dict[str, str], list[str]]:
@@ -480,9 +509,11 @@ def _classify(
 	settings,
 	threshold,
 	field_map,
+	posted=False,
 ):
 	"""Classification step (design 4.3 step 6). Writes one `classify` entry; with a context (L1+) recomputes its
-	main-path level and below-threshold flag from the classification, then routes only at the threshold or above.
+	main-path level and below-threshold flag from the classification, chooses the run's mode from them and `posted`
+	(the run's one guidance count, ADR-036 QĐ 7, ADR-037 QĐ 3), then routes only at the threshold or above.
 
 	The request carries the configured ticket fields (AC-24). The route leaves out the fields the person typed at
 	creation, while the entry keeps the model's prediction and names the typed set (AC-19, AC-21, A-U4b-2).
@@ -617,6 +648,8 @@ def _classify(
 				classification.confidence_pct, threshold, context.instructor, context.act_now
 			),
 		)
+		# R5-2: after the below-threshold gate, before the route lock
+		_choose_mode(context, posted)
 		if not context.below_threshold:
 			status.working("set_classification")
 			_route(log_name, classification, route_decision, context, auto_assign, subject, split_text)
@@ -635,13 +668,18 @@ def _log_classify(ticket_name, run_id, ok, created) -> None:
 	)
 
 
-def _route(log_name, classification, decision, context, auto_assign, subject, split_text=None):
+def _route(
+	log_name, classification, decision, context, auto_assign, subject, split_text=None, collect_run_id=None
+):
 	"""Run the route unit (u1), check the SLA and record the outcome on the entry as one unit (design 4.2).
 
 	Deterministic code, no model call (ADR-033 QĐ 3). After (u1) succeeds: SLA check, (u2) assign, (u3) Task,
 	(u5) the D watcher, each write one unit with one action entry; then exactly one comment says what was
 	classified, given, created and followed, the gathered sentences and the split question after it (AC-23, AC-28).
 	Returns `lines`, the sentences of that one comment (already posted by (u4)).
+	`collect_run_id` of a run whose collector is open (a guidance run, w1.md:103): no comment of its own; what was
+	done goes to "Đã làm", the other sentences (warnings, requests, the split question) to the plan section of the
+	run's one guidance comment, raw (AD3-4); the same `lines` are returned. None, or no open collector: as above.
 	Nothing here raises for an unusable unit: it is rolled back, recorded as `ok=false` with the exception
 	class only (D-16). (u1) failing or refusing stops the SLA check and (u2)-(u5).
 
@@ -670,12 +708,13 @@ def _route(log_name, classification, decision, context, auto_assign, subject, sp
 				task = _task_unit(assigned, subject, classification, context, actions, lines, errors)
 			if decision.watcher:
 				watcher = _watch_unit(decision.watcher, context, actions, errors)
-			lines = [
-				*_route_lines(result, assigned, task, watcher),
-				*lines,
-				*([split_text] if split_text else []),
-			]
-			commented = _comment_unit(lines, context, actions, errors)
+			done = _route_lines(result, assigned, task, watcher)
+			others = [*lines, *([split_text] if split_text else [])]
+			lines = [*done, *others]
+			if collect_run_id and collecting(collect_run_id):
+				commented = _collect_route_lines(collect_run_id, done, others)
+			else:
+				commented = _comment_unit(lines, context, actions, errors)
 		split = classification.requests if commented and split_text else None
 		_record_route(log_name, result, decision, assigned, task, actions, errors, split)
 		_log_route_summary(context, result, assigned, task, commented, sla)
@@ -837,6 +876,17 @@ def _comment_unit(lines, context, actions, errors):
 		)
 	)
 	return True
+
+
+def _collect_route_lines(run_id, done, others) -> bool:
+	"""(u4) of a guidance run (w1.md:103): the route's sentences go to the run's collector as raw text, the done ones
+	under "Đã làm", the rest inside the plan section; they reach the person in the run's one comment. Returns True
+	when a sentence was gathered, as `_comment_unit` does when it posted."""
+	for line in done:
+		collect(run_id, SECTION_DONE, line)
+	for line in others:
+		collect(run_id, SECTION_DECIDE, line)
+	return bool(done or others)
 
 
 def _route_lines(result, assigned, task, watcher) -> list[str]:
@@ -1037,10 +1087,12 @@ def _reason(
 	started_at,
 	field_map=None,
 	notices=None,
+	guidance_posted=False,
 ):
 	"""Reasoning step (design 4.3 step 8): at most `max_turns_per_run` model turns, one `reason` entry each.
 
-	The first message carries the configured ticket fields that hold a value as data (AC-24, U4b.md:249).
+	The first message carries the configured ticket fields that hold a value as data (AC-24, U4b.md:249), and
+	`guidance_posted` when the ticket already has its guidance comment (ticket data, ADR-036 QĐ 7, U4b-10).
 	`notices` are the entries of notices posted before this step: they go on the first entry written (U4b.md:250).
 	A gateway error posts the run_failed notice on its own entry (U4b.md:251). `started_at` is the run's start: the
 	ask_fallback question counts only the ones posted since, so each run below the threshold asks once (AC-22).
@@ -1075,7 +1127,14 @@ def _reason(
 	messages = [
 		{
 			"role": "user",
-			"content": build_initial_message(ticket, labelled, trigger, classification, ticket_fields=fields),
+			"content": build_initial_message(
+				ticket,
+				labelled,
+				trigger,
+				classification,
+				ticket_fields=fields,
+				guidance_posted=guidance_posted,
+			),
 		}
 	]
 	base = {

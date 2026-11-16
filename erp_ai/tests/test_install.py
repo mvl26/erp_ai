@@ -47,6 +47,9 @@ FIVE_SWITCHES = (
 	"one_click_approval_enabled",
 )
 
+# CHG-010 Task 1: not in FIVE_SWITCHES, whose tests need the migrated meta; it is checked from the JSON on disk.
+CONSOLE_SWITCH = "console_enabled"
+
 # FEAT-007 AC-16: patched clocks for the enable mark filled by install.
 # FEAT-007 T60 (design "T22a"): hidden HD Ticket field and the Instructor read right on HD Article.
 CREATED_LABELS_FIELD = "ai_created_labels"
@@ -732,6 +735,20 @@ class TestFeat007Migrate(FrappeTestCase):
 		self.assertEqual(
 			{name: stored.get(name, "<missing>") for name in FIVE_SWITCHES}, dict.fromkeys(FIVE_SWITCHES, "0")
 		)
+
+	def test_console_switch_installs_off_by_default(self):
+		# CHG-010: install fills Check defaults from the DocType; read the JSON on disk (the site is not migrated).
+		import json
+		import os
+
+		path = os.path.join(
+			frappe.get_app_path("erp_ai"), "erp_ai_agent", "doctype", "erp_ai_setting", "erp_ai_setting.json"
+		)
+		with open(path, encoding="utf-8") as handle:
+			doctype_json = json.load(handle)
+		field = next(f for f in doctype_json["fields"] if f["fieldname"] == CONSOLE_SWITCH)
+		self.assertEqual((field["fieldtype"], field["default"]), ("Check", "0"))
+		self.assertIn(CONSOLE_SWITCH, doctype_json["field_order"])
 
 	def test_migrate_keeps_old_switches_new_switches_off(self):
 		frappe.db.delete("Singles", {"doctype": SETTING_DOCTYPE, "field": ("in", FIVE_SWITCHES)})

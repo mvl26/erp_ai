@@ -383,6 +383,7 @@ def _run(ticket_name, trigger, message_name=None, communication_name=None, run_i
 				record_tools=switches.record_tools,
 				act_now=switches.act_now,
 				one_click_approval=switches.one_click_approval,
+				console=switches.console,
 				over_budget=over_budget,
 				main_path_level=policy.main_path_level(settings, level, category),
 				below_threshold=not kb_run and _below_threshold(pct, threshold, instructor, switches.act_now),
@@ -1547,6 +1548,7 @@ def _reason(
 		act_now=granted.act_now_block,
 		ask_only=granted.ask_only_block,
 		reply_tools=granted.reply_block,
+		console_tools=granted.console_block,
 	)
 	fields = _ticket_field_values(ticket_name, field_map or {})
 	lessons = _lessons(settings, ticket.subject, ticket.description)

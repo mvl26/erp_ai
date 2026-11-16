@@ -306,6 +306,47 @@ class TestReasonSystem(FrappeTestCase):
 			self.assertTrue(text.endswith("\n\nDIGEST-XYZ"), flags)
 		self.assertNotEqual(prompts.core_prompt(ask_only=True), prompts.CORE_PROMPT)
 
+	def test_console_block_present_once_iff_console_tools(self):
+		# CHG-010: its own flag; without it the system text is the one of before
+		for flags in ALL_FLAGS:
+			before = prompts.build_reason_system("D", "R", **flags)[0]["text"]
+			self.assertEqual(before.count(prompts.CONSOLE_TOOLS_BLOCK), 0, flags)
+			self.assertEqual(
+				before, prompts.build_reason_system("D", "R", console_tools=False, **flags)[0]["text"]
+			)
+			text = prompts.build_reason_system("D", "R", console_tools=True, **flags)[0]["text"]
+			self.assertEqual(text.count(prompts.CONSOLE_TOOLS_BLOCK), 1, flags)
+			if flags["change_tools"]:
+				self.assertLess(
+					text.index(prompts.CHANGE_TOOLS_BLOCK), text.index(prompts.CONSOLE_TOOLS_BLOCK)
+				)
+			if flags["act_now"]:
+				self.assertLess(text.index(prompts.CONSOLE_TOOLS_BLOCK), text.index(prompts.ACT_NOW_BLOCK))
+			# the pairs hold with the console block read in
+			for forbidden, allowed in prompts.PROMPT_CONFLICT_PAIRS:
+				self.assertFalse(forbidden in text and allowed in text, (flags, forbidden, allowed))
+
+	def test_console_block_says_the_panel_approves_and_nothing_ran(self):
+		block = prompts.CONSOLE_TOOLS_BLOCK
+		self.assertTrue(
+			block.startswith("SCRIPT BENCH CONSOLE — CHỈ KHI KHÔNG CÓ API, NGƯỜI DUYỆT TRONG KHUNG CHAT\n")
+		)
+		for anchor in (
+			"propose_console_script",
+			"nút Duyệt trong khung Trao đổi với bot",
+			'("ok", "duyệt") không bao giờ là duyệt',
+			"Không gọi frappe.db.commit hay frappe.db.rollback",
+			"Không bao giờ nói script đã chạy",
+		):
+			self.assertIn(anchor, block)
+		# CHG-010 final review F-8: ACT_NOW_BLOCK says the buttons sit in the tool's comment; for a script they do not,
+		# so the console block ends on that correction, read before ACT_NOW_BLOCK.
+		self.assertTrue(
+			block.endswith(
+				"\n- Với script console, nút Duyệt chỉ nằm trong khung Trao đổi với bot, không nằm trong comment."
+			)
+		)
+
 	def test_each_block_present_iff_its_flag(self):
 		blocks = dict(_flag_blocks())
 		for flags in ALL_FLAGS:

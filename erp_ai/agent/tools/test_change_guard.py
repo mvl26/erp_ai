@@ -1,5 +1,6 @@
 import os
 import threading
+import unicodedata
 from unittest.mock import patch
 
 import frappe
@@ -1887,3 +1888,123 @@ class TestManualsExcluded(FrappeTestCase):
 					result, {"ok": False, "reason": f"mục 1 ({item['path']}): {PATH_INVALID_REFUSAL}"}
 				)
 				self.assertEqual(frappe.db.count(PROPOSAL_DOCTYPE), proposals)
+
+
+class TestConsoleScript(FrappeTestCase):
+	"""CHG-010 Task 2: the static rules of a bench console script and the console argv."""
+
+	def test_console_args(self):
+		self.assertEqual(change_guard.console_args("miyano"), ["--site", "miyano", "console"])
+
+	def test_accepted_sample(self):
+		script = 'import frappe\nfor name in frappe.get_all("ToDo", pluck="name", limit=3):\n\tprint(name)\n'
+		self.assertIsNone(change_guard.check_console_script(script))
+
+	def test_name_dunder_is_allowed(self):
+		self.assertIsNone(change_guard.check_console_script("print(__name__)"))
+
+	def test_each_rule_gives_its_exact_reason(self):
+		imports = "script chỉ được import frappe, erpnext, hrms, helpdesk, json, datetime, decimal, re, math"
+		cases = (
+			("", "script trống"),
+			(" \n", "script trống"),
+			(None, "script trống"),
+			("x" * 20001, "script dài quá 20000 ký tự"),
+			("x = 'ERP AI Setting'", "script không được nhắc tới erp ai"),
+			("def f(:", "script không phải Python hợp lệ (dòng 1)"),
+			("import os", f"{imports} (gặp os)"),
+			("from subprocess import run", f"{imports} (gặp subprocess)"),
+			("from . import x", f"{imports} (gặp .)"),
+			("eval('1')", "script không được gọi eval"),
+			("f = eval", "script không được gọi eval"),
+			("getattr(frappe, 'db')", "script không được gọi getattr"),
+			("db = frappe.db\ndb.commit()", "script không được dùng .commit"),
+			("frappe.set_user('Administrator')", "script không được dùng .set_user"),
+			("frappe.conf.db_password", "script không được dùng .conf"),
+			# CHG-010 fix round 1: imported names, dunder access, module loaders
+			(
+				"from frappe.utils.password import get_decrypted_password\nget_decrypted_password('a', 'b')",
+				"script không được dùng .get_decrypted_password",
+			),
+			("from frappe import set_user\nset_user('Administrator')", "script không được dùng .set_user"),
+			("from frappe import conf", "script không được dùng .conf"),
+			("from frappe import *\nset_user('Administrator')", f"{imports} (gặp frappe.*)"),
+			("from frappe import eval", "script không được gọi eval"),
+			("__builtins__['eval']('1')", "script không được dùng __builtins__"),
+			("__builtins__.__import__('os')", "script không được dùng __import__"),
+			("frappe.db.__getattribute__('commit')", "script không được dùng __getattribute__"),
+			("().__class__.__base__.__subclasses__()", "script không được dùng __subclasses__"),
+			("frappe.get_conf()", "script không được dùng .get_conf"),
+			("frappe.get_attr('subprocess.run')", "script không được dùng .get_attr"),
+			("frappe.get_module('os')", "script không được dùng .get_module"),
+			("frappe.importlib.import_module('os')", "script không được dùng .import_module"),
+			# CHG-010 Task 5 fix round 1: sql_ddl commits the open transaction before its statement
+			("frappe.db.sql_ddl('select 1')", "script không được dùng .sql_ddl"),
+		)
+		for script, reason in cases:
+			with self.subTest(script=script if script is None else script[:30]):
+				self.assertEqual(change_guard.check_console_script(script), reason)
+
+	def test_invisible_and_control_characters_are_refused(self):
+		# CHG-010 final review F-1: a bidi control, a zero-width character or a control character lets the card show
+		# a script other than the one that runs ("Trojan Source"); the reason gives the 1-based position of the first.
+		trojan = 'if mode != "dry\u202e \u2066# chỉ xem thử\u2069 \u2066":\n\tfrappe.db.delete("ToDo")\n'
+		cases = (
+			(trojan, 16),
+			("x = 1\u202e", 6),
+			("x = 1 \u2066", 7),
+			("pri\u200bnt(1)", 4),
+			("\ufeffprint(1)", 1),
+			("print(1)\x00", 9),
+			("print('\x1b[2J')", 8),
+			("print(1)\x7f", 9),
+			("print(1)\x85", 9),
+			("print(1)\x9f", 9),
+			("# a\u2028frappe.db.delete('ToDo')", 4),
+			("x = 'ERP AI'\u202e", 13),
+		)
+		for script, position in cases:
+			with self.subTest(script=ascii(script[:20])):
+				self.assertEqual(
+					change_guard.check_console_script(script),
+					f"script có ký tự ẩn hoặc ký tự điều khiển (vị trí {position})",
+				)
+		# the length rule still comes first
+		self.assertEqual(
+			change_guard.check_console_script("x" * 20001 + "\u202e"), "script dài quá 20000 ký tự"
+		)
+
+	def test_tab_newline_and_carriage_return_are_allowed(self):
+		# CHG-010 final review F-1
+		self.assertIsNone(change_guard.check_console_script("if True:\r\n\tprint(1)\r\n"))
+		self.assertIsNone(change_guard.check_console_script("if True:\n\tprint(1)\rprint(2)\n"))
+
+	def test_vietnamese_with_combining_marks_is_allowed(self):
+		# CHG-010 final review F-1: Vietnamese in NFD uses combining marks (Mn), never a format character (Cf)
+		script = unicodedata.normalize("NFD", 'print("Đã cập nhật phiếu của khách hàng")\n')
+		self.assertTrue(any(unicodedata.category(char) == "Mn" for char in script))
+		self.assertIsNone(change_guard.check_console_script(script))
+		self.assertIsNone(change_guard.check_console_script(unicodedata.normalize("NFC", script)))
+
+	def test_frappe_front_doors_are_refused(self):
+		# CHG-010 final review F-2: Frappe's own calls that resolve a dotted path, run a shell, queue a job outside
+		# the one transaction, or read and write files get around the import allowlist.
+		cases = (
+			("frappe.call('subprocess.check_output', ['id'])", "call"),
+			("frappe.enqueue('subprocess.run', args=['id'])", "enqueue"),
+			("frappe.enqueue_doc('ToDo', 'x', 'delete')", "enqueue_doc"),
+			("frappe.utils.execute_in_shell('id')", "execute_in_shell"),
+			("from frappe.utils import execute_in_shell\nexecute_in_shell('id')", "execute_in_shell"),
+			("from frappe import call", "call"),
+			("frappe.read_file('/etc/passwd')", "read_file"),
+			("from frappe.utils.file_manager import write_file", "write_file"),
+			("frappe.write_file('/tmp/x', 'y')", "write_file"),
+			("frappe.get_file_json('/etc/x.json')", "get_file_json"),
+		)
+		for script, name in cases:
+			with self.subTest(script=script):
+				self.assertEqual(change_guard.check_console_script(script), f"script không được dùng .{name}")
+
+	def test_a_local_function_named_call_is_allowed(self):
+		# CHG-010 final review F-2: the rule reads attributes and imported names, not a script's own bare names
+		self.assertIsNone(change_guard.check_console_script("def call(x):\n\treturn x\n\nprint(call(1))\n"))

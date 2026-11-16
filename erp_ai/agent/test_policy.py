@@ -480,6 +480,52 @@ class TestPermissionSwitches(FrappeTestCase):
 		)
 
 
+class TestConsoleSwitch(FrappeTestCase):
+	# CHG-010 Task 1: the console switch, read only by policy. The site meta may not know the field (no migrate),
+	# so values are written with set_agent_settings and read from a document, never get_single_value.
+	def setUp(self):
+		self.addCleanup(frappe.db.rollback)
+		keep_agent_settings(self)
+
+	def test_console_field_name(self):
+		self.assertEqual(policy.CONSOLE_FIELD, "console_enabled")
+
+	def test_console_switch_off_when_missing(self):
+		frappe.db.delete("Singles", {"doctype": SETTING_DOCTYPE, "field": policy.CONSOLE_FIELD})
+		self.assertIs(policy.permission_switches(frappe.get_doc(SETTING_DOCTYPE)).console, False)
+		self.assertIs(policy.permission_switches(frappe._dict()).console, False)
+		self.assertIs(policy.console_enabled_now(), False)
+
+	def test_console_switch_on(self):
+		set_agent_settings(console_enabled=1)
+		self.assertIs(policy.permission_switches(frappe.get_doc(SETTING_DOCTYPE)).console, True)
+
+	def test_console_independent_of_code_change(self):
+		set_agent_settings(code_change_enabled=0, console_enabled=1)
+		switches = policy.permission_switches(frappe.get_doc(SETTING_DOCTYPE))
+		self.assertIs(switches.console, True)
+		self.assertIs(switches.code_change, False)
+		set_agent_settings(code_change_enabled=1, console_enabled=0)
+		switches = policy.permission_switches(frappe.get_doc(SETTING_DOCTYPE))
+		self.assertIs(switches.console, False)
+		self.assertIs(switches.code_change, True)
+
+	def test_console_is_the_sixth_field(self):
+		self.assertEqual(
+			policy.PermissionSwitches(True, True, True, True, True, True).console,
+			True,
+		)
+		self.assertIs(policy.PermissionSwitches().console, False)
+
+	def test_console_enabled_now_reads_fresh(self):
+		set_agent_settings(console_enabled=0)
+		self.assertIs(policy.console_enabled_now(), False)
+		set_agent_settings(console_enabled=1)
+		self.assertIs(policy.console_enabled_now(), True)
+		set_agent_settings(console_enabled=0)
+		self.assertIs(policy.console_enabled_now(), False)
+
+
 class TestBudget(FrappeTestCase):
 	# AC-61: the month's spend is summed from live ERP AI Log rows, never from spent_this_month_usd.
 	# February 2001 has no real rows on the site; every row here is written inside the test transaction.

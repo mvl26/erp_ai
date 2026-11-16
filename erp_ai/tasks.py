@@ -248,7 +248,10 @@ def _enabled_keys_without_value() -> list[str]:
 def _enabled_permission_switches() -> list[str]:
 	"""Labels of the permission switches that are on, in the order (1)..(5); field names come only from policy."""
 	settings = frappe.get_single(SETTING_DOCTYPE)
-	switches = dataclasses.astuple(policy.permission_switches(settings))
+	# CHG-010: `console` is the sixth field of the switches, outside the five of the spec and of this alarm
+	switches = dataclasses.astuple(policy.permission_switches(settings))[
+		: len(policy.PERMISSION_SWITCH_FIELDS)
+	]
 	meta = frappe.get_meta(SETTING_DOCTYPE)
 	return [
 		meta.get_label(field)

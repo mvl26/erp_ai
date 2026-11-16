@@ -42,6 +42,7 @@ class ToolContext:
 	below_threshold: bool = False
 	reply_enabled: bool = False
 	kb_draft_run: bool = False
+	console: bool = False
 	# True when a message of the ticket's conversation started the run: when the guidance comment takes the run's
 	# answer, the run still answers there (CHG-003 Amendment 3).
 	in_conversation: bool = False
@@ -53,6 +54,7 @@ class ToolContext:
 			act_now=self.act_now,
 			code_change=self.change_enabled,
 			one_click_approval=self.one_click_approval,
+			console=self.console,
 		)
 		return GrantInputs(
 			effective_level=self.effective_level,
@@ -78,6 +80,7 @@ class ToolSpec:
 		"site_unrestricted",
 		"requester_reply",
 		"kb_draft",
+		"console_propose",
 	]
 	schema: dict
 	handler: Callable[[dict, ToolContext], dict]
@@ -92,6 +95,7 @@ class Grant:
 	act_now_block: bool = False
 	ask_only_block: bool = False
 	reply_block: bool = False
+	console_block: bool = False
 
 	def schemas(self) -> list[dict]:
 		return [copy.deepcopy(spec.schema) for spec in self.specs]
@@ -120,6 +124,7 @@ SITE_ADMIN_GROUP = "site_admin"
 UNRESTRICTED_GROUP = "site_unrestricted"
 REPLY_GROUP = "requester_reply"
 KB_DRAFT_GROUP = "kb_draft"
+CONSOLE_GROUP = "console_propose"
 # The only tools left below the confidence threshold, each while its group is granted above it (U1.md:158,
 # U6b-fixes Sửa 12).
 ASK_TOOL_NAMES = frozenset({"post_comment", "reply_to_requester"})
@@ -153,6 +158,15 @@ GRANT_TABLE = (
 	(
 		CHANGE_GROUP,
 		lambda inputs: inputs.switches.code_change
+		and inputs.effective_level == "L3"
+		and inputs.has_instructor
+		and not inputs.below_threshold
+		and not inputs.kb_draft_run,
+	),
+	# CHG-010: the console switch alone (not code_change): L3, an instructor, above the threshold, no KB-draft run.
+	(
+		CONSOLE_GROUP,
+		lambda inputs: inputs.switches.console
 		and inputs.effective_level == "L3"
 		and inputs.has_instructor
 		and not inputs.below_threshold
@@ -210,9 +224,10 @@ def grant(inputs: GrantInputs) -> Grant:
 		record_block=SITE_ADMIN_GROUP in groups and not unrestricted_block,
 		unrestricted_block=unrestricted_block,
 		act_now_block=inputs.switches.act_now
-		and bool(groups & {CHANGE_GROUP, SITE_ADMIN_GROUP, UNRESTRICTED_GROUP}),
+		and bool(groups & {CHANGE_GROUP, SITE_ADMIN_GROUP, UNRESTRICTED_GROUP, CONSOLE_GROUP}),
 		ask_only_block=inputs.below_threshold and not inputs.kb_draft_run,
 		reply_block=any(spec.group == REPLY_GROUP for spec in specs),
+		console_block=CONSOLE_GROUP in groups,
 	)
 
 

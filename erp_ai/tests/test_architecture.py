@@ -221,6 +221,7 @@ POLICY_FIELDS = (
 	"record_tools_enabled",
 	"act_now_enabled",
 	"one_click_approval_enabled",
+	"console_enabled",
 	"level_cap_a",
 	"level_cap_b",
 	"level_cap_c",
@@ -304,7 +305,8 @@ STATUS_SCRIPT_REQUIRED = (
 	r"if \(state\.ticket\)",
 	# T12: message thread, labels, B-8 guidance, close button, indicator moved into the panel and back.
 	r"threadEl",
-	r"renderMessages",
+	# CHG-010: one thread of messages and cards, so renderThread replaces renderMessages and renderProposals.
+	r"renderThread",
 	r'TEXT_EMPTY_THREAD = "Chưa có tin nào\."',
 	r'TEXT_BOT_LABEL = "Bot"',
 	r'TEXT_CLOSE = "Đóng"',
@@ -322,7 +324,8 @@ STATUS_SCRIPT_REQUIRED = (
 	# T12: stale-result guard (design F1 reload).
 	r"seq !== panel\.seq \|\| ticket !== state\.ticket \|\| !panel\.open",
 	# T12 use sites (the pins above match declarations; these match where each is used).
-	r"renderMessages\(data\)",
+	# CHG-010: the use site is renderThread(data) now.
+	r"renderThread\(data\)",
 	r"if \(isStale\(\)\) \{\s*return;",
 	r"dockIndicator\(true\)",
 	r"dockIndicator\(false\)",
@@ -369,10 +372,25 @@ STATUS_SCRIPT_REQUIRED = (
 	r"isComposing\) \{\s*event\.preventDefault\(\);\s*submit\(\);",
 	r'addEventListener\("click", \(\) => \{\s*try \{\s*submit\(\);',
 	# CHG-008 T4 (design 4.3): the proposals section, between the thread and the error line, and the fixed texts.
+	# CHG-010: no separate proposals section; the cards sit in threadEl and proposalErrorEl follows it.
 	# CHG-009 design 4.1, 8.2 (A-7): the send box closes the panel; the indicator's slot moved into the status line.
-	r"renderProposals",
-	r"threadEl,\s*proposalsTitle,\s*proposalsEl,\s*proposalErrorEl,\s*errorEl,\s*formEl\s*\)",
-	r'TEXT_PROPOSALS_SECTION = "Đề xuất thay đổi"',
+	r"threadEl,\s*proposalErrorEl,\s*errorEl,\s*formEl\s*\)",
+	# CHG-010: console cards show the script and its result; cards are ordered with the messages by time.
+	# CHG-010 final review F-9: the label says the script runs as Administrator.
+	r'TEXT_CONSOLE_SCRIPT = "Script sẽ chạy \(quyền Administrator\):"',
+	r'TEXT_CONSOLE_OUTPUT = "Kết quả:"',
+	# CHG-010 final review F-5: an empty script or output (None from the server) draws no block.
+	r"if \(card\?\.script\) \{\s*addBlock\(TEXT_CONSOLE_SCRIPT, card\.script\);",
+	r"if \(card\?\.output\) \{\s*addBlock\(TEXT_CONSOLE_OUTPUT, card\.output\);",
+	# CHG-010 final review F-6: a pending console card the viewer can open but not decide is held by the console
+	# switch (server PANEL_REFUSALS["console_off"]); the viewer keeps the button that only shows it.
+	r'TEXT_CONSOLE_OFF = "Chạy bench console đang tắt\."',
+	r"note\.textContent = canOpen \? TEXT_CONSOLE_OFF : TEXT_NEEDS_INSTRUCTOR;\s*row\.append\(note\);\s*"
+	r"if \(canOpen\) \{\s*row\.append\(proposalButton\(TEXT_OPEN_PROPOSAL, name\)\);",
+	r'maxHeight = "240px"',
+	r'overflow = "auto"',
+	r"\.sort\(\(a, b\) =>[^;]*\.created",
+	r"card\?\.is_console !== true",
 	r'TEXT_OPEN_PROPOSAL = "Xem nội dung thay đổi"',
 	r'OPEN_PROPOSAL_LABEL = "Mở đề xuất để Duyệt hoặc Từ chối"',
 	r'TEXT_NEEDS_INSTRUCTOR = "Cần người có vai trò ERP AI Instructor duyệt\."',
@@ -382,7 +400,6 @@ STATUS_SCRIPT_REQUIRED = (
 	r"deciding: false",
 	r"decisionButtons: \[\]",
 	r"Array\.isArray\(proposals\)",
-	r"renderProposals\(data\)",
 	# CHG-008 T5 (design 4.2, 4.3; AC-5, AC-11): Duyệt / Từ chối post once, lock both buttons while waiting, show
 	# the fixed error sentence on failure and reload the panel once in both branches.
 	r'TEXT_APPROVE = "Duyệt";',
@@ -401,8 +418,9 @@ STATUS_SCRIPT_REQUIRED = (
 	r"catch \(e\) \{\s*onDecideFailed\(\);",
 	# T6 review ruling: a card without a name has no button; a failed card render clears only the proposals.
 	r'const name = String\(card\?\.name \?\? ""\);\s*if \(!name\) \{\s*return row;',
-	r'renderMessages\(data\);\s*panel\.errorEl\.textContent = "";',
-	r"try \{\s*renderProposals\(data\);\s*\} catch \(e\) \{\s*clearProposals\(\);",
+	# CHG-010: a failed card build renders the messages without cards and clears the card error line (AC-11).
+	r'renderThread\(data\);\s*panel\.errorEl\.textContent = "";',
+	r"try \{\s*panel\.decisionButtons = \[\];\s*cardNodes = proposals\.map\(proposalCard\);\s*\} catch \(e\) \{\s*cardNodes = \[\];\s*panel\.decisionButtons = \[\];\s*panel\.proposalErrorEl\.replaceChildren\(\);",
 	# T14 live updates (design F3): both listeners are named handlers registered once per socket, in the guard block.
 	r'state\.socket = socket;\s*socket\.on\(EVENT, onStatus\);\s*socket\.on\("docinfo_update", onDocinfo\);\s*socket\.on\("doc_update", onDocUpdate\);',
 	r"docinfo_update",
@@ -432,7 +450,8 @@ STATUS_SCRIPT_REQUIRED = (
 	r"chatTitle,\s*statusEl,\s*guidanceEl,\s*threadEl",
 	r"state\.runs\.size > 0 \? TEXT_STATUS_RUNNING",
 	r"panel\.statusExpired && status\.expired_text",
-	r"renderBotStatus\(data\);\s*renderMessages\(data\)",
+	# CHG-010: the thread (messages, system lines and cards) is drawn by renderThread, still after the status.
+	r"renderBotStatus\(data\);\s*renderThread\(data\)",
 	r"statusExpired = true;\s*showBotStatus\(\)",
 )
 # CHG-009 design 8.2: each pin above with the wiring it guards broken, as (pattern, regex to break, replacement).
@@ -450,10 +469,11 @@ STATUS_LINE_VIOLATIONS = (
 	),
 	(r"state\.runs\.size > 0 \? TEXT_STATUS_RUNNING", r"state\.runs\.size > 0 \?", "false ?"),
 	(r"panel\.statusExpired && status\.expired_text", r"panel\.statusExpired && ", ""),
+	# CHG-010: renderThread replaced renderMessages at this use site.
 	(
-		r"renderBotStatus\(data\);\s*renderMessages\(data\)",
-		r"renderBotStatus\(data\);(\s*)renderMessages\(data\);",
-		r"renderMessages(data);\1renderBotStatus(data);",
+		r"renderBotStatus\(data\);\s*renderThread\(data\)",
+		r"renderBotStatus\(data\);(\s*)renderThread\(data\);",
+		r"renderThread(data);\1renderBotStatus(data);",
 	),
 	(
 		r"statusExpired = true;\s*showBotStatus\(\)",
@@ -3060,7 +3080,8 @@ def check_panel_decision_follows_adr_044(sources: dict) -> list:
 				)
 			)
 	for call in calls:
-		if _call_leaf(call) in ("approve", "reject"):
+		# CHG-010: the panel approves through `panel_approve`, so a direct call to it is banned like `approve`
+		if _call_leaf(call) in ("approve", "panel_approve", "reject"):
 			violations.append(
 				violation(
 					PANEL_FILE,
@@ -3078,6 +3099,19 @@ def check_panel_decision_follows_adr_044(sources: dict) -> list:
 				)
 			)
 		violations.extend(_decide_gate_violations(decide, ordered[0], ordered[1]))
+		# CHG-010: the predicate must be told whether the proposal is a console one, or the console switch is skipped
+		predicate_call = ordered[2]
+		if not any(
+			keyword.arg == "console" and dotted_name(keyword.value) == "head.is_console"
+			for keyword in predicate_call.keywords
+		):
+			violations.append(
+				violation(
+					PANEL_FILE,
+					predicate_call,
+					f"{PANEL_PREDICATE_FUNCTION} is called without console=head.is_console (CHG-010)",
+				)
+			)
 	table = definitions.get(PANEL_DECISIONS_NAME)
 	if table is None:
 		violations.append(f"{PANEL_FILE}: no {PANEL_DECISIONS_NAME}")
@@ -6200,10 +6234,17 @@ class TestArchitecture(unittest.TestCase):
 		self.assertEqual(check_panel_decision_follows_adr_044(self.sources), [])
 		panel = self.sources[PANEL_FILE]
 		gate = '\t_require_panel_access(head.ticket, method="decide")\n'
-		predicate = "\trefusal = proposal_form.panel_decision_refusal(head.change_status)\n"
+		# CHG-010: the predicate call now also passes the proposal's console flag
+		predicate = (
+			"\trefusal = proposal_form.panel_decision_refusal(head.change_status, console=head.is_console)\n"
+		)
 		cases = {
 			"no predicate": (
-				("proposal_form.panel_decision_refusal(head.change_status)", "None"),
+				# CHG-010: same call text with the console flag
+				(
+					"proposal_form.panel_decision_refusal(head.change_status, console=head.is_console)",
+					"None",
+				),
 				"panel_decision_refusal 0 times",
 			),
 			"browser ticket": (
@@ -6229,6 +6270,18 @@ class TestArchitecture(unittest.TestCase):
 			"switch read": (
 				("\trefusal = ", "\tpolicy.permission_switches(None)\n\trefusal = "),
 				"names permission_switches",
+			),
+			# CHG-010: a direct panel_approve call and a predicate without the console flag are caught
+			"direct panel_approve call": (
+				("PANEL_DECISIONS[action](name)", "proposal_form.panel_approve(name)"),
+				"panel_approve is called directly",
+			),
+			"predicate without console flag": (
+				(
+					"panel_decision_refusal(head.change_status, console=head.is_console)",
+					"panel_decision_refusal(head.change_status)",
+				),
+				"without console=head.is_console",
 			),
 			"undo in the table": (("proposal_form.reject,", "proposal_form.undo,"), "names undo"),
 			"predicate before gate": ((gate + predicate, predicate + gate), "order is not"),

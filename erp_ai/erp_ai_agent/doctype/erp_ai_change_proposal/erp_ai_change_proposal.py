@@ -7,6 +7,7 @@ from erp_ai.agent import change_text, policy, queue
 from erp_ai.agent.agent_write_guard import refuse_agent_write
 from erp_ai.agent.authority import NEVER_AUTHORITY
 from erp_ai.agent.changes import block, restart_check, result_comment, transitions
+from erp_ai.agent.redact import redact_secrets
 from erp_ai.constants import (
 	CHANGE_KIND_CODE,
 	CHANGE_STATUS_PENDING,
@@ -141,7 +142,13 @@ PANEL_REFUSALS = {
 	"role": "Chỉ người có vai trò ERP AI Instructor mới duyệt hoặc từ chối được.",
 	"not_pending": "Đề xuất không còn chờ duyệt.",
 	"switch_off": "Duyệt một lần bấm đang tắt; hãy duyệt ở form đề xuất.",
+	# CHG-010: a console proposal is decided with its own switch, not the one-click one
+	"console_off": "Chạy bench console đang tắt.",
 }
+# CHG-010: the form button and the signed link may not approve a console script; only the chat panel may.
+CONSOLE_PANEL_ONLY = "Script console chỉ duyệt được bằng nút Duyệt trong khung Trao đổi với bot."
+# CHG-010 final review F-7: nobody approves a script they cannot read.
+CONSOLE_NEEDS_READ = "Bạn cần quyền xem đề xuất để duyệt script console."
 
 
 def has_decider_role(user: str) -> bool:
@@ -153,10 +160,11 @@ def has_decider_role(user: str) -> bool:
 	return user not in NEVER_AUTHORITY and ROLE_INSTRUCTOR in frappe.get_roles(user)
 
 
-def panel_decision_refusal(status: str) -> str | None:
+def panel_decision_refusal(status: str, *, console: bool = False) -> str | None:
 	"""Why the session user cannot decide a proposal in `status` from the ticket panel, or None when they can.
 
-	Checked in this order: role, then pending, then switch (5). The switch is read through
+	Checked in this order: role, then pending, then the switch (5), or for a `console` proposal the console
+	switch (CHG-010) instead of the one-click one. The switch is read through
 	`policy.permission_switches` on every call and only when the first two checks pass. Not whitelisted.
 
 	Returns:
@@ -166,30 +174,42 @@ def panel_decision_refusal(status: str) -> str | None:
 		return "role"
 	if status != CHANGE_STATUS_PENDING:
 		return "not_pending"
-	if not policy.permission_switches(frappe.get_single(SETTING_DOCTYPE)).one_click_approval:
+	switches = policy.permission_switches(frappe.get_single(SETTING_DOCTYPE))
+	if console:
+		return None if switches.console else "console_off"
+	if not switches.one_click_approval:
 		return "switch_off"
 	return None
 
 
 def proposal_head(name) -> frappe._dict:
-	"""`{"ticket", "change_status"}` of proposal `name`, read from the stored record. Not whitelisted.
+	"""`{"ticket", "change_status", "is_console"}` of proposal `name`, read from the stored record. Not whitelisted.
 
 	Raises:
 		frappe.DoesNotExistError: `name` is not a string, is empty, or names no proposal (the text of `_decider`).
 	"""
 	head = None
 	if isinstance(name, str) and name.strip():
-		head = frappe.db.get_value(PROPOSAL_DOCTYPE, name, ["ticket", "change_status"], as_dict=True)
+		head = frappe.db.get_value(
+			PROPOSAL_DOCTYPE,
+			name,
+			["ticket", "change_status", "change_kind", "command_list", "command_args"],
+			as_dict=True,
+		)
 	if not head:
 		frappe.throw(
 			_("Không có đề xuất {0}").format(frappe.utils.escape_html(cstr(name))),
 			frappe.DoesNotExistError,
 		)
-	return frappe._dict(ticket=head.ticket, change_status=head.change_status)
+	return frappe._dict(
+		ticket=head.ticket, change_status=head.change_status, is_console=block.is_console(head)
+	)
 
 
-# CHG-008 design 2, 3.1: what a panel card reads and shows. No content field is ever read (diff, file text,
-# command args and output, commit message, reason, digest, created dirs), so a card cannot show one.
+# CHG-008 design 2, 3.1: what a panel card reads and shows. None of these is a content field (diff, file
+# text, command args and output, commit message, reason, digest, created dirs). CHG-010: a console card is the
+# one exception; its script and masked output tail are read apart (`CONSOLE_CARD_FIELDS`), and only for a
+# viewer who can open the proposal.
 CARD_FIELDS = (
 	"name",
 	"change_kind",
@@ -208,6 +228,7 @@ CARD_FIELDS = (
 	"is_core_app",
 	"apply_commit_sha",
 	"undo_commit_sha",
+	"creation",
 )
 CARD_OPERATION_FIELDS = ("parent", "idx", "operation", "file_path", "new_path")
 CARD_KEYS = (
@@ -220,7 +241,51 @@ CARD_KEYS = (
 	"failure_reason",
 	"can_decide",
 	"can_open",
+	"created",
+	"is_console",
+	"script",
+	"output",
 )
+# CHG-010: only a console proposal's script and output are read, in a second query limited to those names
+CONSOLE_CARD_FIELDS = ("name", "content_after", "command_output")
+CONSOLE_CARD_OUTPUT_MAX_LINES = 20
+
+
+def _console_card_parts(console_names: list[str], readable: set) -> dict:
+	"""`{name: (script, masked output tail)}` for the console proposals in `console_names` the viewer can open.
+
+	An empty script or output (a pending proposal has no output yet) is None: the card draws no empty block.
+	"""
+	names = [name for name in console_names if name in readable]
+	if not names:
+		return {}
+	parts = {}
+	for row in frappe.get_all(
+		PROPOSAL_DOCTYPE,
+		filters={"name": ("in", names)},
+		fields=list(CONSOLE_CARD_FIELDS),
+		limit_page_length=0,
+	):
+		output = "\n".join(redact_secrets(row.command_output).splitlines()[-CONSOLE_CARD_OUTPUT_MAX_LINES:])
+		script = cstr(row.content_after)
+		parts[row.name] = (script if script.strip() else None, output if output.strip() else None)
+	return parts
+
+
+def _readable_names(names: list[str]) -> set:
+	"""The proposals in `names` the session user may read (CHG-008 ruling): one get_list that reads only
+	`name`, so no content field is loaded (`has_permission(..., doc=name)` would load the whole document);
+	role, user permissions and shares apply. Not whitelisted."""
+	if not names or not frappe.has_permission(PROPOSAL_DOCTYPE, "read"):
+		return set()
+	return set(
+		frappe.get_list(
+			PROPOSAL_DOCTYPE,
+			filters={"name": ("in", names)},
+			pluck="name",
+			limit_page_length=0,
+		)
+	)
 
 
 def _card_notes(proposal_name: str, fields) -> list[str]:
@@ -237,10 +302,12 @@ def _card_notes(proposal_name: str, fields) -> list[str]:
 def panel_cards(ticket: str) -> list[dict]:
 	"""One card per change proposal attached to `ticket`, newest first, at most `PANEL_MAX_PROPOSALS`.
 
-	Reads only `CARD_FIELDS` and `CARD_OPERATION_FIELDS` and writes nothing. It checks no gate: the only
-	caller is `ticket_panel.get_panel_data`, after its gate. A proposal without a ticket has no card.
-	`can_decide` reads the one-click switch again on every call (no cache); `can_open` is the viewer's read
-	permission on the proposal doctype and on that proposal. Not whitelisted.
+	Reads `CARD_FIELDS` and `CARD_OPERATION_FIELDS`, plus `CONSOLE_CARD_FIELDS` of the console proposals the
+	viewer can open (CHG-010), and writes nothing. It checks no gate: the only caller is
+	`ticket_panel.get_panel_data`, after its gate. A proposal without a ticket has no card.
+	`can_decide` reads the one-click switch, or for a console proposal the console switch, again on every call
+	(no cache), and a console card also needs `can_open`, so Duyệt never shows without the script (CHG-010);
+	`can_open` is the viewer's read permission on the proposal doctype and on that proposal. Not whitelisted.
 
 	Returns:
 		list of dicts with exactly the keys of `CARD_KEYS`; every value is plain text, a bool or None.
@@ -265,21 +332,21 @@ def panel_cards(ticket: str) -> list[dict]:
 	)
 	for operation in operations:
 		by_parent.setdefault(operation.parent, []).append(operation)
-	# CHG-008 ruling: per-document read through one get_list that reads only `name`, so no card loads the forbidden
-	# fields (`has_permission(..., doc=name)` would load the whole document); role, user permissions and shares apply.
-	readable = set()
-	if frappe.has_permission(PROPOSAL_DOCTYPE, "read") and rows:
-		readable = set(
-			frappe.get_list(
-				PROPOSAL_DOCTYPE,
-				filters={"name": ("in", [row.name for row in rows])},
-				pluck="name",
-				limit_page_length=0,
-			)
-		)
+	readable = _readable_names([row.name for row in rows])
+	fields_by_name = {row.name: frappe._dict(row, operations=by_parent.get(row.name, [])) for row in rows}
+	console_names = []
+	for name, fields in fields_by_name.items():
+		try:
+			if block.is_console(fields):
+				console_names.append(name)
+		except Exception:
+			continue  # an unreadable proposal gets the reduced card below
+	console_parts = _console_card_parts(console_names, readable)
 	cards = []
 	for row in rows:
-		fields = frappe._dict(row, operations=by_parent.get(row.name, []))
+		fields = fields_by_name[row.name]
+		is_console = row.name in console_names
+		script, output = console_parts.get(row.name, (None, None))
 		decided_by = cstr(row.decided_by)
 		failure_reason = result_comment.masked_reason(row.failure_reason)
 		# values in the order of CARD_KEYS; not a dict literal, which the state-field rule of ADR-012 reads as a write
@@ -292,8 +359,13 @@ def panel_cards(ticket: str) -> list[dict]:
 				row.restart_status or None,
 				change_text.safe_person_name(frappe.utils.get_fullname(decided_by)) if decided_by else None,
 				failure_reason or None,
-				panel_decision_refusal(row.change_status) is None,
+				panel_decision_refusal(row.change_status, console=is_console) is None
+				and (not is_console or row.name in readable),
 				row.name in readable,
+				str(row.creation),
+				is_console,
+				script,
+				output,
 			)
 		except Exception as exc:
 			# One unreadable proposal must not break the panel (AC-11, ADR-009 QĐ 4): a reduced card that cannot be
@@ -309,6 +381,10 @@ def panel_cards(ticket: str) -> list[dict]:
 				None,
 				False,
 				row.name in readable,
+				str(row.creation),
+				is_console,
+				None,
+				None,
 			)
 		cards.append(dict(zip(CARD_KEYS, values, strict=True)))
 	return cards
@@ -338,8 +414,23 @@ def _decider(name) -> str:
 
 @frappe.whitelist(methods=["POST"])
 def approve(name=None) -> dict:
-	"""`Chờ duyệt → Đã duyệt`, then queue the `apply` job (design 3.3, ADR-012 QĐ 4)."""
+	"""`Chờ duyệt → Đã duyệt`, then queue the `apply` job (design 3.3, ADR-012 QĐ 4).
+
+	A console proposal is refused here (CHG-010): it is approved only by `panel_approve`.
+	"""
+	_decider(name)
+	if block.is_console(frappe.get_doc(PROPOSAL_DOCTYPE, name)):
+		frappe.throw(_(CONSOLE_PANEL_ONLY), frappe.PermissionError)
+	return panel_approve(name)
+
+
+def panel_approve(name=None) -> dict:
+	"""The approval itself, for any kind (CHG-010). Not whitelisted: the form's `approve` refuses a console
+	proposal first, and the ticket panel reaches this one only after its own gate. A console proposal is also
+	refused to a decider who cannot read it (`CONSOLE_NEEDS_READ`), before anything is written."""
 	user = _decider(name)
+	if proposal_head(name).is_console and name not in _readable_names([name]):
+		frappe.throw(_(CONSOLE_NEEDS_READ), frappe.PermissionError)
 	status = transitions.approve(name, user)
 	queue.enqueue_change_job(name, "apply")
 	return {"name": name, "status": status}

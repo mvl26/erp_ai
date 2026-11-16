@@ -8,10 +8,12 @@ from frappe.tests.utils import FrappeTestCase
 from erp_ai.agent.changes import file_writer, process_runner
 from erp_ai.agent.changes.process_runner import (
 	ENV_ALLOWLIST,
+	OUTPUT_LINE_MAX_CHARS,
 	OUTPUT_MAX_LINES,
 	CommandResult,
 	run_bench,
 )
+from erp_ai.agent.redact import MASK, redact_secrets
 from erp_ai.agent.tools import source
 from erp_ai.constants import RESTART_LAUNCH_TIMEOUT_S, RESTART_TIMEOUT_S
 from erp_ai.test_utils import GitSandbox
@@ -692,3 +694,144 @@ class TestLaunchRestart(FrappeTestCase):
 				outcome, run = self._launch(error)
 				run.assert_called_once()
 				self.assertEqual(outcome, (False, class_name))
+
+
+CONSOLE_SCRIPT = "print(frappe.local.site)\n"
+CONSOLE_ARGV = ["bench", "--site", "miyano", "execute", "erp_ai.console_entry.run"]
+# A 44-character quoted secret that crosses the 1000-character line cut (a long one-line repr).
+DB_SECRET = "Q7wE9rT2yU4iO6pA8sD0fG1hJ3kL5zX7cV9bN2mQ4wE6"
+LONG_SECRET_LINE = "x" * 960 + f"'db_password': '{DB_SECRET}'"
+
+
+class TestRunConsole(FrappeTestCase):
+	"""CHG-010: an approved script runs as `bench --site <site> execute erp_ai.console_entry.run`, fed on stdin."""
+
+	def setUp(self):
+		patcher = patch(BENCH_PATH, return_value=FAKE_BENCH)
+		patcher.start()
+		self.addCleanup(patcher.stop)
+
+	def _run(self, result, script=CONSOLE_SCRIPT, limit_s=120, elapsed_s=1.0):
+		effect = result if isinstance(result, BaseException) else None
+		value = None if effect else result
+		with (
+			patch(RUN_PATH, return_value=value, side_effect=effect) as run,
+			patch(CLOCK_PATH, side_effect=[1000.0, 1000.0 + elapsed_s]),
+		):
+			outcome = process_runner.run_console(script, "miyano", limit_s)
+		return outcome, run
+
+	def assert_no_piece_of(self, secret: str, output: str):
+		"""No 8 characters in a row of `secret` are left in `output`."""
+		for start in range(len(secret) - 7):
+			self.assertNotIn(secret[start : start + 8], output)
+
+	def test_argv_stdin_and_call_shape(self):
+		outcome, run = self._run(completed(0, "42"), limit_s=123, elapsed_s=2.5)
+		run.assert_called_once()
+		self.assertEqual(run.call_args.args[0], ["timeout", "-s", "KILL", "123", *CONSOLE_ARGV])
+		kwargs = run.call_args.kwargs
+		# The script is the child's stdin, never a file; `stdin=` is not passed next to `input=`.
+		self.assertEqual(
+			set(kwargs),
+			{
+				"cwd",
+				"env",
+				"input",
+				"stdout",
+				"stderr",
+				"text",
+				"encoding",
+				"errors",
+				"timeout",
+				"start_new_session",
+			},
+		)
+		self.assertEqual(kwargs["input"], CONSOLE_SCRIPT)
+		self.assertEqual(kwargs["cwd"], FAKE_BENCH)
+		self.assertEqual(kwargs["env"], process_runner._minimal_env())
+		self.assertIs(kwargs["stdout"], subprocess.PIPE)
+		self.assertIs(kwargs["stderr"], subprocess.STDOUT)
+		self.assertIs(kwargs["text"], True)
+		self.assertEqual(kwargs["encoding"], "utf-8")
+		self.assertEqual(kwargs["errors"], "replace")
+		self.assertEqual(kwargs["timeout"], 153)
+		self.assertIs(kwargs["start_new_session"], True)
+		self.assertEqual(
+			outcome,
+			CommandResult(exit_code=0, output="42", duration_ms=2500, timed_out=False, not_found=False),
+		)
+
+	def test_output_cut_and_timeout_read_like_bench(self):
+		lines = "\n".join(f"line {n}" for n in range(1, 1001))
+		outcome, _run = self._run(completed(1, lines))
+		kept = outcome.output.split("\n")
+		self.assertEqual(len(kept), OUTPUT_MAX_LINES)
+		self.assertEqual(kept[0], "… đã cắt 601 dòng đầu")
+		self.assertEqual(kept[-1], "line 1000")
+		outcome, _run = self._run(completed(137, "x"), limit_s=120, elapsed_s=120.0)
+		self.assertIs(outcome.timed_out, True)
+		outcome, _run = self._run(completed(1, "ValueError"), limit_s=120, elapsed_s=3.0)
+		self.assertEqual((outcome.exit_code, outcome.timed_out, outcome.not_found), (1, False, False))
+
+	def test_output_masked_before_the_line_cut(self):
+		self.assertEqual(len(DB_SECRET), 44)
+		self.assertLess(LONG_SECRET_LINE.index(DB_SECRET), OUTPUT_LINE_MAX_CHARS)
+		self.assertGreater(len(LONG_SECRET_LINE), OUTPUT_LINE_MAX_CHARS)
+		outcome, _run = self._run(completed(1, LONG_SECRET_LINE))
+		self.assertEqual(outcome.output, "x" * 960 + f"'db_password': '{MASK}'")
+		self.assert_no_piece_of(DB_SECRET, outcome.output)
+		# The job masks again before storing: that second pass changes nothing.
+		self.assertEqual(redact_secrets(outcome.output), outcome.output)
+
+	def test_output_masked_before_the_cut_on_the_timeout_path(self):
+		raw = (LONG_SECRET_LINE + "\n").encode("utf-8")
+		expired = subprocess.TimeoutExpired(cmd=["timeout"], timeout=150, output=raw)
+		outcome, _run = self._run(expired, elapsed_s=150.0)
+		self.assertIs(outcome.timed_out, True)
+		self.assertEqual(outcome.output, "x" * 960 + f"'db_password': '{MASK}'")
+		self.assert_no_piece_of(DB_SECRET, outcome.output)
+
+	def test_value_kept_after_its_key_line_was_dropped_is_masked(self):
+		value = "hunter2-Kv8Hs3Jd6Bf1Gc0"
+		lines = ["đầu ra", "password:", value, *(f"line {n}" for n in range(4, 402))]
+		self.assertEqual(len(lines), OUTPUT_MAX_LINES + 1)
+		outcome, _run = self._run(completed(0, "\n".join(lines)))
+		kept = outcome.output.split("\n")
+		self.assertEqual(kept[:2], ["… đã cắt 2 dòng đầu", MASK])
+		self.assertEqual(kept[-1], "line 401")
+		self.assert_no_piece_of(value, outcome.output)
+
+	def test_bad_input_never_reaches_argv(self):
+		cases = (
+			("script not a string", None, "miyano", 120),
+			("script blank", " \n\t", "miyano", 120),
+			("site not a string", CONSOLE_SCRIPT, None, 120),
+			("site with NUL", CONSOLE_SCRIPT, "mi\0yano", 120),
+			("limit zero", CONSOLE_SCRIPT, "miyano", 0),
+			("limit above COMMAND_TIMEOUT_S", CONSOLE_SCRIPT, "miyano", 541),
+			("limit bool", CONSOLE_SCRIPT, "miyano", True),
+		)
+		for label, script, site, limit_s in cases:
+			with self.subTest(label), patch(RUN_PATH) as run:
+				with self.assertRaises(ValueError):
+					process_runner.run_console(script, site, limit_s)
+				run.assert_not_called()
+
+	def test_wrapped_feeds_input_text_to_a_real_child(self):
+		with tempfile.TemporaryDirectory() as folder:
+			fed = process_runner._run_wrapped(
+				["cat"],
+				cwd=folder,
+				env=process_runner._minimal_env(),
+				limit_s=10,
+				backstop_s=5,
+				max_lines=10,
+				input_text="xin chào\n",
+			)
+			# Without `input_text` the child's stdin stays DEVNULL: it reads nothing.
+			empty = process_runner._run_wrapped(
+				["cat"], cwd=folder, env=process_runner._minimal_env(), limit_s=10, backstop_s=5, max_lines=10
+			)
+		self.assertEqual((fed.exit_code, fed.output), (0, "xin chào"))
+		self.assertEqual((empty.exit_code, empty.output), (0, ""))

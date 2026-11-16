@@ -15,7 +15,7 @@ from helpdesk.test_utils import create_agent, make_ticket
 from erp_ai import constants
 from erp_ai.agent import authority, change_link
 from erp_ai.agent.agent_write_guard import AGENT_WRITE_FLAG
-from erp_ai.agent.changes import process_runner, transitions
+from erp_ai.agent.changes import block, process_runner, transitions
 from erp_ai.agent.policy import PermissionSwitches
 from erp_ai.agent.tools import change_guard, propose_change, source, write_ticket
 from erp_ai.agent.tools.registry import GrantInputs, ToolContext, execute_tool, get_tool_schemas
@@ -95,7 +95,10 @@ class TestProposeGrant(FrappeTestCase):
 	def test_propose_tool_names_are_the_three_tools(self):
 		names = ("propose_file_change", "propose_new_file", "propose_bench_command")
 		self.assertEqual(propose_change.PROPOSE_TOOL_NAMES, names)
-		self.assertEqual(tuple(spec.name for spec in propose_change.TOOLS), names)
+		# CHG-010: the console tool follows them in TOOLS, in its own group; PROPOSE_TOOL_NAMES stays the three
+		self.assertEqual(
+			tuple(spec.name for spec in propose_change.TOOLS), (*names, "propose_console_script")
+		)
 		self.assertNotIn("propose_delete_file", propose_change.PROPOSE_TOOL_NAMES)
 
 
@@ -171,6 +174,84 @@ class TestProposeChange(FrappeTestCase):
 		)
 		frappe.set_user(AGENT)
 		return rows
+
+	CONSOLE_SCRIPT = (
+		'import frappe\nfor name in frappe.get_all("ToDo", pluck="name", limit=3):\n\tprint(name)\n'
+	)
+
+	def console(self, script=CONSOLE_SCRIPT, **context):
+		arguments = {"script": script, "reason": "không có API để đổi hàng loạt"}
+		return execute_tool("propose_console_script", arguments, self.context(console=True, **context))
+
+	def test_console_script_creates_one_pending_console_proposal_with_a_panel_only_comment(self):
+		# CHG-010: one pending proposal, the script as content_after, the one command `--site <site> console`
+		result = self.console()
+		self.assertTrue(result["ok"], result)
+		(name,) = self.proposals()
+		frappe.set_user("Administrator")
+		doc = frappe.get_doc(PROPOSAL_DOCTYPE, name)
+		frappe.set_user(AGENT)
+		self.assertEqual(doc.change_status, CHANGE_STATUS_PENDING)
+		self.assertEqual(doc.change_kind, CHANGE_KIND_COMMAND)
+		self.assertEqual(doc.content_after, self.CONSOLE_SCRIPT)
+		self.assertEqual(json.loads(doc.command_list), [["--site", frappe.local.site, "console"]])
+		self.assertTrue(block.is_console(doc))
+		self.assertEqual(doc.reversible, 0)
+		self.assertEqual(doc.app, None)
+		(comment,) = self.comments()
+		self.assertIn(propose_change.CONSOLE_COMMENT_LINE, comment.content)
+		self.assertIn("script console", comment.content)
+		self.assertIn("Xem nội dung thay đổi", comment.content)
+		# one-click approval is on in this context, and still no decision link and no open-to-approve link
+		self.assertNotIn("/api/method/erp_ai.change_decision", comment.content)
+		self.assertNotIn(propose_change.OPEN_PROPOSAL_LABEL, comment.content)
+		self.assertNotIn(self.CONSOLE_SCRIPT.strip().splitlines()[0] + "\n", comment.content)
+
+	def test_console_pending_line_and_copy(self):
+		self.assertEqual(
+			propose_change.CONSOLE_COMMENT_LINE,
+			"Duyệt hoặc Từ chối bằng nút trong khung Trao đổi với bot; script không hoàn tác được.",
+		)
+		self.console()
+		(name,) = self.proposals()
+		frappe.set_user("Administrator")
+		doc = frappe.get_doc(PROPOSAL_DOCTYPE, name)
+		frappe.set_user(AGENT)
+		self.assertEqual(
+			propose_change.pending_line(doc),
+			f"Đề xuất {name} (script console): duyệt bằng nút trong khung Trao đổi với bot.",
+		)
+
+	def test_console_refused_script_makes_nothing(self):
+		result = self.console("x = 'ERP AI Setting'")
+		self.assertEqual(
+			result, {"ok": False, "reason": change_guard.check_console_script("x = 'ERP AI Setting'")}
+		)
+		self.assertEqual(result["reason"], "script không được nhắc tới erp ai")
+		self.assertEqual(self.proposals(), [])
+		self.assertEqual(self.comments(), [])
+
+	def test_console_without_an_instructor_is_the_existing_refusal(self):
+		ctx = self.context(console=True, instructor=None)
+		result = propose_change.propose_console_script({"script": "print(1)", "reason": "x"}, ctx)
+		self.assertEqual(result, {"ok": False, "reason": propose_change.NO_INSTRUCTOR})
+		self.assertEqual(self.proposals(), [])
+
+	def test_console_tool_not_granted_with_the_switch_off(self):
+		arguments = {"script": "print(1)", "reason": "x"}
+		result = execute_tool("propose_console_script", arguments, self.context(console=False))
+		self.assertEqual(result, NOT_GRANTED)
+
+	def test_console_schema(self):
+		schemas = get_tool_schemas(GrantInputs("L3", "L3", True, PermissionSwitches(console=True)))
+		(schema,) = [s for s in schemas if s["name"] == "propose_console_script"]
+		properties = schema["input_schema"]["properties"]
+		self.assertEqual(
+			properties["script"],
+			{"type": "string", "minLength": 1, "maxLength": constants.CONSOLE_SCRIPT_MAX_CHARS},
+		)
+		self.assertEqual(schema["input_schema"]["required"], ["script", "reason"])
+		self.assertEqual(set(properties), {"script", "reason"})
 
 	def test_file_change_creates_pending_proposal_and_comment_without_touching_disk(self):
 		# a branch other than the sandbox default, so a hard-coded branch cannot pass
@@ -1615,7 +1696,7 @@ class TestProposeBlock(FrappeTestCase):
 
 	def test_schema_matches_design_table(self):
 		schemas = {spec.name: spec.schema["input_schema"] for spec in propose_change.TOOLS}
-		self.assertEqual(list(schemas), TOOL_NAMES)
+		self.assertEqual(list(schemas), [*TOOL_NAMES, "propose_console_script"])  # CHG-010
 		change, new_file, bench = (schemas[name] for name in TOOL_NAMES)
 		self.assertEqual(
 			(change["required"], new_file["required"], bench["required"]),

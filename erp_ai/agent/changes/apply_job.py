@@ -1,6 +1,8 @@
-"""The change job: applies an approved proposal (one file + one local commit, or one bench command) and
-undoes an applied code change. Runs in the `long` queue, one job at a time across the bench."""
+"""The change job: applies an approved proposal (one file + one local commit, one bench command, or one
+console script run once in its own transaction, CHG-010) and undoes an applied code change. Runs in the
+`long` queue, one job at a time across the bench."""
 
+import dataclasses
 import hashlib
 import json
 import os
@@ -16,6 +18,7 @@ from frappe.utils.synchronization import filelock
 from erp_ai.agent import change_text, policy
 from erp_ai.agent.authority import NEVER_AUTHORITY
 from erp_ai.agent.changes import block, file_writer, process_runner, result_comment, transitions
+from erp_ai.agent.redact import redact_secrets
 from erp_ai.agent.tools import change_guard, source
 from erp_ai.constants import (
 	BOT_GIT_EMAIL,
@@ -72,6 +75,9 @@ COMMAND_OUT_OF_TIME = "quá thời gian"
 COMMAND_NOT_FOUND = "không tìm thấy bench trên máy chủ"
 # Design 4.2 step 9: the reason of a block's command names it by its number and argv.
 COMMAND_PREFIX = "lệnh {number} (bench {command}): "
+# CHG-010: the console switch read again at apply time, and the prefix of a console run's failure reason.
+CONSOLE_SWITCH_OFF = "công tắc chạy bench console đã tắt"
+CONSOLE_PREFIX = "script console: "
 # Design addendum 2 QĐ-A3: no process when under 1 s is left; no exit code (addendum 3 QĐ-B4).
 _NOT_RUN = process_runner.CommandResult(
 	exit_code=None, output="", duration_ms=0, timed_out=True, not_found=False
@@ -234,6 +240,11 @@ def _run(proposal, action: str, actor: str, deadline: float) -> str:
 	if action == ACTION_UNDO:
 		_undo_code(proposal, actor, _recheck(proposal, action), deadline)
 		return CHANGE_STATUS_UNDONE
+	if block.is_console(proposal):
+		# CHG-010: its own checks before `_recheck`, which reads the code switch; that switch never stops it.
+		_recheck_console(proposal)
+		_run_console(proposal, deadline)
+		return CHANGE_STATUS_APPLIED
 	check = _recheck_block(proposal, _recheck(proposal, action))
 	old_head = _precheck_block(proposal, check, deadline) if block.is_block(proposal) else None
 	if not block.is_block(proposal):
@@ -287,6 +298,59 @@ def _recheck(proposal, action: str) -> tuple[str, ...]:
 		if guard.reason:
 			raise _Stop(CHANGE_STATUS_FAILED, guard.reason)
 	return allowed_apps
+
+
+def _recheck_console(proposal) -> None:
+	"""CHG-010: the apply-time checks of a console proposal; the first failing one ends the job as `Lỗi`.
+
+	Runner, role, the console switch read fresh (`code_change_enabled` is not read), digest, the script rules
+	on the stored script, then the stored command against the running site. Nothing runs before this passes.
+	"""
+	if frappe.session.user != proposal.decided_by:
+		raise _Stop(CHANGE_STATUS_FAILED, WRONG_RUNNER)
+	if not _has_authority(proposal.decided_by):
+		raise _Stop(CHANGE_STATUS_FAILED, APPROVER_LOST_ROLE)
+	if not policy.console_enabled_now():
+		raise _Stop(CHANGE_STATUS_FAILED, CONSOLE_SWITCH_OFF)
+	if transitions.content_digest(proposal) != proposal.approved_digest:
+		raise _Stop(CHANGE_STATUS_FAILED, DIGEST_CHANGED)
+	reason = change_guard.check_console_script(proposal.content_after)
+	if reason:
+		raise _Stop(CHANGE_STATUS_FAILED, reason)
+	if block.commands_of(proposal) != [change_guard.console_args(frappe.local.site)]:
+		raise _Stop(CHANGE_STATUS_FAILED, change_guard.CMD_OTHER_SITE)
+
+
+def _run_console(proposal, deadline: float) -> None:
+	"""CHG-010: the approved script once, in a child process with what is left of the job's budget (NFR-3),
+	then `Đã áp dụng` with its result; a failure is `Lỗi` with `CONSOLE_PREFIX` and the command reason.
+
+	Under 1 s left the child is not started (recorded as timed out, no exit code). The output is masked
+	with `redact_secrets` before anything stores it: the proposal, `command_results` and the log row.
+	"""
+	args = change_guard.console_args(frappe.local.site)
+	limit = int(deadline - time.monotonic())
+	if limit < 1:
+		raise _Stop(
+			CHANGE_STATUS_FAILED,
+			CONSOLE_PREFIX + COMMAND_OUT_OF_TIME,
+			command_results=[_command_entry(args, _NOT_RUN)],
+		)
+	result = process_runner.run_console(proposal.content_after, frappe.local.site, limit)
+	result = dataclasses.replace(result, output=redact_secrets(result.output))
+	results = [_command_entry(args, result)]
+	failure = _command_failure(result)
+	if failure is not None:
+		raise _Stop(CHANGE_STATUS_FAILED, CONSOLE_PREFIX + failure, result, command_results=results)
+	transitions.finish(
+		proposal.name,
+		CHANGE_STATUS_APPLYING,
+		CHANGE_STATUS_APPLIED,
+		step="apply",
+		actor=proposal.decided_by,
+		result=result,
+		command_results=results,
+	)
 
 
 def _sha256_text(text: str) -> str:

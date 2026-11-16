@@ -829,6 +829,11 @@ class TestProposalTarget(FrappeTestCase):
 			proposal_target({"change_kind": CHANGE_KIND_COMMAND, "command_list": None}), ("lệnh", "bench ")
 		)
 
+	def test_console_proposal_names_a_script_console(self):
+		fields = {"change_kind": CHANGE_KIND_COMMAND, "command_list": '[["--site", "miyano", "console"]]'}
+		self.assertEqual(proposal_target(fields), ("script console", None))
+		self.assertEqual(proposal_target_text(fields), "script console")
+
 	def test_accepts_a_document_as_well_as_a_dict(self):
 		doc = frappe._dict(operations=[{}], app="erp_ai")
 		self.assertEqual(proposal_target(doc), ("khối 1 mục trong app erp_ai", None))

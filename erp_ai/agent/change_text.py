@@ -18,6 +18,7 @@ from erp_ai.constants import (
 	CHANGE_OP_RENAME,
 	CHANGE_STATUS_APPLIED,
 	CHANGE_STATUS_UNDONE,
+	CONSOLE_COMMAND,
 	RESTART_STATUS_CONFIRMED,
 	RESTART_STATUS_LAUNCH_FAILED,
 	RESTART_STATUS_SENT,
@@ -115,11 +116,31 @@ def _shown(value) -> str:
 	return "" if "://" in text else text
 
 
+def is_console(proposal_fields) -> bool:
+	"""A console proposal (CHG-010): no file item and the one command `--site <site> console`."""
+	if proposal_fields.get("operations") or proposal_fields.get("change_kind") != CHANGE_KIND_COMMAND:
+		return False
+	try:
+		commands = json.loads(proposal_fields.get("command_list") or "[]")
+	except ValueError:
+		return False
+	return (
+		isinstance(commands, list)
+		and len(commands) == 1
+		and isinstance(commands[0], list)
+		and len(commands[0]) == 3
+		and commands[0][0] == "--site"
+		and commands[0][2] == CONSOLE_COMMAND
+	)
+
+
 def proposal_target(proposal_fields) -> tuple[str, str | None]:
 	"""The target sentence of a proposal as (text, code): `code` is the file path or the bench command that
 	follows the text in `<code>`, else None. One builder for the proposal comment and the panel card (CHG-008
 	design 3.4); the branches are those of the comment: a block with items, a block of commands only, a code
 	proposal, any other (a command)."""
+	if is_console(proposal_fields):
+		return "script console", None
 	if proposal_fields.get("operations") or proposal_fields.get("command_list"):
 		if proposal_fields.get("operations"):
 			count = len(proposal_fields.get("operations"))

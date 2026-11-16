@@ -1,5 +1,7 @@
+import ast
 import json
 import os
+import unicodedata
 from dataclasses import dataclass
 
 import erp_ai
@@ -12,6 +14,8 @@ from erp_ai.constants import (
 	CHANGE_OP_DELETE,
 	CHANGE_OP_EDIT,
 	CHANGE_OP_RENAME,
+	CONSOLE_COMMAND,
+	CONSOLE_SCRIPT_MAX_CHARS,
 	CORE_APPS,
 )
 
@@ -92,6 +96,39 @@ BENCH_COMMANDS = (*SITE_COMMANDS, BUILD_COMMAND, VERSION_COMMAND, RESTART_COMMAN
 SITE_FLAG = "--site"
 APP_FLAG = "--app"
 FORCE_FLAG = "--force"
+CONSOLE_EMPTY = "script trống"
+CONSOLE_TOO_LONG = "script dài quá {max} ký tự"
+CONSOLE_SYNTAX = "script không phải Python hợp lệ (dòng {line})"
+CONSOLE_IMPORT = (
+	"script chỉ được import frappe, erpnext, hrms, helpdesk, json, datetime, decimal, re, math (gặp {name})"
+)
+CONSOLE_CALL = "script không được gọi {name}"
+CONSOLE_ATTR = "script không được dùng .{name}"
+CONSOLE_TEXT = "script không được nhắc tới {text}"
+CONSOLE_DUNDER = "script không được dùng {name}"
+CONSOLE_INVISIBLE = "script có ký tự ẩn hoặc ký tự điều khiển (vị trí {pos})"
+# CHG-010 final review F-1: what a browser shows otherwise than Python reads it ("Trojan Source"): format
+# characters (bidi controls, zero-width characters, BOM), control characters (C0, DEL, C1) and the line and
+# paragraph separators a browser breaks on and Python does not. Tab, newline and carriage return stay allowed.
+CONSOLE_INVISIBLE_CATEGORIES = ("Cf", "Cc", "Zl", "Zp")
+CONSOLE_ALLOWED_CONTROLS = ("\t", "\n", "\r")
+DUNDER_PREFIX = "__"
+DUNDER_ALLOWED = "__name__"
+CONSOLE_IMPORT_ROOTS = ("frappe", "erpnext", "hrms", "helpdesk", "json", "datetime", "decimal", "re", "math")
+CONSOLE_FORBIDDEN_CALLS = (
+	"eval", "exec", "compile", "open", "__import__", "getattr", "setattr", "delattr",
+	"globals", "locals", "vars", "breakpoint", "input", "exit", "quit",
+)  # fmt: skip
+CONSOLE_FORBIDDEN_ATTRS = (
+	"commit", "rollback", "set_user", "get_password", "get_decrypted_password", "conf",
+	"get_site_config", "environ", "system", "popen", "connect", "destroy",
+	"get_conf", "get_attr", "get_module", "import_module", "sql_ddl",
+	# CHG-010 final review F-2: Frappe calls that resolve a dotted path, run a shell, queue a job outside the
+	# one transaction, or read and write files
+	"call", "enqueue", "enqueue_doc", "execute_in_shell",
+	"read_file", "write_file", "get_file_json",
+)  # fmt: skip
+CONSOLE_FORBIDDEN_TEXT = ("erp ai", "__auth", "site_config", ".git")
 SHELL_METACHARACTERS = (";", "|", "&", "`", "$(", ">", "<", "\n")
 
 
@@ -554,6 +591,102 @@ def _bench_shape(command, app, allowed_apps: tuple[str, ...], site) -> list[str]
 	if not _is_site(site):
 		return CMD_OTHER_SITE
 	return [SITE_FLAG, site, command]
+
+
+def console_args(site: str) -> list[str]:
+	"""The stored argv of a console proposal (CHG-010); kept out of BENCH_COMMANDS so the generic bench tool
+	cannot make a console without a script."""
+	return [SITE_FLAG, site, CONSOLE_COMMAND]
+
+
+def _import_root(node) -> list[str]:
+	if isinstance(node, ast.Import):
+		return [alias.name.split(".")[0] for alias in node.names]
+	if node.level:
+		return ["." * node.level + (node.module or "")]
+	return [(node.module or "").split(".")[0]]
+
+
+def _imported_names_reason(node) -> str | None:
+	"""The names a `from x import ...` brings in meet the same rules as the attributes and calls."""
+	for alias in node.names:
+		if alias.name == "*":
+			return CONSOLE_IMPORT.format(name=f"{node.module}.*")
+		if alias.name in CONSOLE_FORBIDDEN_ATTRS:
+			return CONSOLE_ATTR.format(name=alias.name)
+		if alias.name in CONSOLE_FORBIDDEN_CALLS:
+			return CONSOLE_CALL.format(name=alias.name)
+	return None
+
+
+def _is_dunder(name: str) -> bool:
+	return name.startswith(DUNDER_PREFIX) and name != DUNDER_ALLOWED
+
+
+def _tree_reason(tree) -> str | None:
+	for node in ast.walk(tree):
+		if isinstance(node, ast.Import | ast.ImportFrom):
+			for root in _import_root(node):
+				if root not in CONSOLE_IMPORT_ROOTS:
+					return CONSOLE_IMPORT.format(name=root)
+			if isinstance(node, ast.ImportFrom):
+				reason = _imported_names_reason(node)
+				if reason:
+					return reason
+		elif isinstance(node, ast.Call):
+			if isinstance(node.func, ast.Name) and node.func.id in CONSOLE_FORBIDDEN_CALLS:
+				return CONSOLE_CALL.format(name=node.func.id)
+		elif isinstance(node, ast.Attribute):
+			if node.attr in CONSOLE_FORBIDDEN_ATTRS:
+				return CONSOLE_ATTR.format(name=node.attr)
+			if _is_dunder(node.attr):
+				return CONSOLE_DUNDER.format(name=node.attr)
+		elif isinstance(node, ast.Name):
+			if node.id in CONSOLE_FORBIDDEN_CALLS:
+				return CONSOLE_CALL.format(name=node.id)
+			if _is_dunder(node.id):
+				return CONSOLE_DUNDER.format(name=node.id)
+	return None
+
+
+def _invisible_position(script: str) -> int | None:
+	"""The 1-based position of the first character of `CONSOLE_INVISIBLE_CATEGORIES` in `script`, or None.
+
+	Such a character lets the card show a script other than the one that runs (CHG-010 final review F-1).
+	Vietnamese is unaffected: its combining marks are Mn, never one of these categories.
+	"""
+	for index, char in enumerate(script):
+		if char in CONSOLE_ALLOWED_CONTROLS:
+			continue
+		if unicodedata.category(char) in CONSOLE_INVISIBLE_CATEGORIES:
+			return index + 1
+	return None
+
+
+def check_console_script(script) -> str | None:
+	"""Static rules of a bot-drafted console script (CHG-010); the refusal reason, or None when allowed.
+
+	Order: blank, length, hidden or control characters, forbidden text, syntax, then the first import, call or
+	attribute violation.
+	"""
+	if not isinstance(script, str) or not script.strip():
+		return CONSOLE_EMPTY
+	if len(script) > CONSOLE_SCRIPT_MAX_CHARS:
+		return CONSOLE_TOO_LONG.format(max=CONSOLE_SCRIPT_MAX_CHARS)
+	position = _invisible_position(script)
+	if position is not None:
+		return CONSOLE_INVISIBLE.format(pos=position)
+	lowered = script.lower()
+	for text in CONSOLE_FORBIDDEN_TEXT:
+		if text in lowered:
+			return CONSOLE_TEXT.format(text=text)
+	try:
+		tree = ast.parse(script)
+	except SyntaxError as error:
+		return CONSOLE_SYNTAX.format(line=error.lineno or 1)
+	except (ValueError, RecursionError, MemoryError):
+		return CONSOLE_SYNTAX.format(line=1)
+	return _tree_reason(tree)
 
 
 def build_bench_args(

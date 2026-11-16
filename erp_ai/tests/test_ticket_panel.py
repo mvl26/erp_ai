@@ -5,6 +5,7 @@ import json
 from types import SimpleNamespace
 from typing import ClassVar
 from unittest.mock import MagicMock, patch
+from urllib.parse import parse_qs
 
 import frappe
 import frappe.handler
@@ -15,7 +16,7 @@ from helpdesk.test_utils import create_agent, make_ticket, make_todo
 from helpdesk.utils import is_agent
 from rq.job import JobStatus
 
-from erp_ai import ticket_panel
+from erp_ai import change_decision, ticket_panel
 from erp_ai.agent import (
 	answer_delay,
 	bot_status,
@@ -34,6 +35,7 @@ from erp_ai.agent.run_log import write_entry
 from erp_ai.agent.tools import propose_change, write_ticket
 from erp_ai.constants import (
 	AGENT_USER,
+	CHANGE_KIND_COMMAND,
 	CHANGE_STATUS_APPLIED,
 	CHANGE_STATUS_APPROVED,
 	CHANGE_STATUS_FAILED,
@@ -103,8 +105,9 @@ WEBSITE_EMAIL = "panel.website@example.com"
 CUSTOMER_EMAIL = "panel.customer@example.com"
 KEYWORD = "@ai"
 RUN_ROUTE = "erp_ai.agent.runner.run_for_ticket"
+# CHG-010: thread rows carry the raw creation time as `created`
 # ADR-050: "kind" marks the bot's guidance message ("guidance"), "" for any other
-THREAD_KEYS = {"name", "author", "is_bot", "created_at", "text", "kind"}
+THREAD_KEYS = {"name", "author", "is_bot", "created_at", "created", "text", "kind"}
 
 
 def _make_user(email, user_type="Website User"):
@@ -1010,6 +1013,11 @@ class TestPanelProposalCards(FrappeTestCase):
 				"failure_reason",
 				"can_decide",
 				"can_open",
+				# CHG-010: time of the proposal, and the console script and masked output for readers
+				"created",
+				"is_console",
+				"script",
+				"output",
 			),
 		)
 		self.assertEqual(PANEL_MAX_PROPOSALS, 200)
@@ -1033,6 +1041,8 @@ class TestPanelProposalCards(FrappeTestCase):
 				"is_core_app",
 				"apply_commit_sha",
 				"undo_commit_sha",
+				# CHG-010: the proposal time, so cards sort among thread rows
+				"creation",
 			),
 		)
 		self.assertEqual(
@@ -1213,6 +1223,130 @@ class TestPanelProposalCards(FrappeTestCase):
 		self.assertIs(card["can_open"], True)
 		set_agent_settings(one_click_approval_enabled=1)
 		self.assertIs(self._cards(CARD_INSTRUCTOR)[0]["can_decide"], True)
+
+	def test_console_card_can_decide_follows_the_console_switch(self):
+		# CHG-010: a console card reads the console switch, not the one-click switch
+		name = make_change_proposal(
+			CHANGE_KIND_COMMAND,
+			ticket=self.ticket,
+			command_args=None,
+			app=None,
+			command_list=json.dumps([["--site", frappe.local.site, "console"]]),
+			content_after="print(1)\n",
+		).name
+		for one_click, console, expected in ((0, 1, True), (1, 0, False), (0, 0, False), (1, 1, True)):
+			with self.subTest(one_click=one_click, console=console):
+				set_agent_settings(one_click_approval_enabled=one_click, console_enabled=console)
+				cards = {card["name"]: card for card in self._cards(CARD_INSTRUCTOR)}
+				self.assertIs(cards[name]["can_decide"], expected)
+
+	def _console(self):
+		return make_change_proposal(
+			CHANGE_KIND_COMMAND,
+			ticket=self.ticket,
+			command_args=None,
+			app=None,
+			command_list=json.dumps([["--site", frappe.local.site, "console"]]),
+			content_after="print(1)\n",
+		).name
+
+	def _console_with_output(self, output):
+		name = self._console()
+		self._set(name, command_output=output)
+		return name
+
+	def test_console_card_gives_readers_the_script_and_masked_output(self):
+		# CHG-010: Task 6
+		secret = "zq-secret-token-value-123456"
+		lines = [f"line {i}" for i in range(30)] + [f"password={secret}"]
+		name = self._console_with_output("\n".join(lines))
+		self._set(name, content_after="print('hello')\n")
+		card = {c["name"]: c for c in self._cards(CARD_INSTRUCTOR)}[name]
+		self.assertIs(card["is_console"], True)
+		self.assertEqual(card["script"], "print('hello')\n")
+		self.assertNotIn(secret, card["output"])
+		self.assertIn("[đã che]", card["output"])
+		self.assertLessEqual(len(card["output"].splitlines()), 20)
+		self.assertIn("line 29", card["output"])
+		self.assertNotIn("line 5\n", card["output"])
+
+	def test_console_card_hides_script_and_output_from_a_viewer_who_cannot_open(self):
+		# CHG-010: Task 6
+		name = self._console_with_output("done")
+		card = {c["name"]: c for c in self._cards(AGENT_EMAIL)}[name]
+		self.assertIs(card["can_open"], False)
+		self.assertIs(card["is_console"], True)
+		self.assertIsNone(card["script"])
+		self.assertIsNone(card["output"])
+
+	def test_console_card_without_output_or_script_carries_none(self):
+		# CHG-010 final review F-5: a pending console card has no output yet; an empty block is None, never ""
+		name = self._console()
+		card = {c["name"]: c for c in self._cards(CARD_INSTRUCTOR)}[name]
+		self.assertEqual(card["script"], "print(1)\n")
+		self.assertIsNone(card["output"])
+		self._set(name, content_after="", command_output="\n\n")
+		card = {c["name"]: c for c in self._cards(CARD_INSTRUCTOR)}[name]
+		self.assertIsNone(card["script"])
+		self.assertIsNone(card["output"])
+
+	def test_console_card_offers_no_decision_to_a_viewer_who_cannot_open_it(self):
+		# CHG-010 final review F-7: the role and the switch are not enough for a console card; Duyệt never shows
+		# without the script, so the viewer must also read the proposal. Other kinds keep their rule.
+		set_agent_settings(one_click_approval_enabled=1, console_enabled=1)
+		console = self._console()
+		other = make_change_proposal(ticket=self.ticket).name
+		frappe.get_doc(
+			{
+				"doctype": "User Permission",
+				"user": CARD_INSTRUCTOR,
+				"allow": PROPOSAL_DOCTYPE,
+				"for_value": other,
+			}
+		).insert(ignore_permissions=True)
+		frappe.clear_cache(user=CARD_INSTRUCTOR)
+		cards = {c["name"]: c for c in self._cards(CARD_INSTRUCTOR)}
+		self.assertIs(cards[console]["can_open"], False)
+		self.assertIs(cards[console]["can_decide"], False)
+		self.assertIsNone(cards[console]["script"])
+		self.assertIs(cards[other]["can_open"], True)
+		self.assertIs(cards[other]["can_decide"], True)
+
+	def test_code_proposal_content_never_reaches_the_panel(self):
+		# CHG-010: Task 6; spec rule since CHG-008, the card reads no content of a code proposal
+		proposal = make_change_proposal(ticket=self.ticket)
+		self._set(
+			proposal.name,
+			content_after="zq-seed-after-text",
+			command_output="zq-seed-output-text",
+		)
+		for user in (AGENT_EMAIL, CARD_INSTRUCTOR):
+			with self.subTest(user=user):
+				frappe.set_user(user)
+				try:
+					text = json.dumps(ticket_panel.get_panel_data(self.ticket), ensure_ascii=False)
+				finally:
+					frappe.set_user("Administrator")
+				self.assertNotIn("zq-seed-after", text)
+				self.assertNotIn("zq-seed-output", text)
+				card = self._cards(user)[0]
+				self.assertIs(card["is_console"], False)
+				self.assertIsNone(card["script"])
+				self.assertIsNone(card["output"])
+
+	def test_card_created_is_the_proposal_creation(self):
+		# CHG-010: Task 6
+		first = make_change_proposal(ticket=self.ticket)
+		second = self._console()
+		for name, stamp in (
+			(first.name, "2001-01-01 10:00:00.123456"),
+			(second, "2001-01-02 10:00:00.654321"),
+		):
+			self._set(name, creation=stamp)
+		for card in self._cards(CARD_INSTRUCTOR):
+			self.assertEqual(
+				card["created"], str(frappe.db.get_value(PROPOSAL_DOCTYPE, card["name"], "creation"))
+			)
 
 	def test_failed_card_masks_reason(self):
 		proposal = make_change_proposal(ticket=self.ticket)
@@ -1434,6 +1568,87 @@ class TestPanelDecision(FrappeTestCase):
 		create_agent(AGENT_USER)
 		frappe.get_doc("User", AGENT_USER).add_roles(ROLE_INSTRUCTOR)
 		self.assertIn(ROLE_INSTRUCTOR, frappe.get_roles(AGENT_USER))
+
+	def _console(self):
+		return make_change_proposal(
+			CHANGE_KIND_COMMAND,
+			ticket=self.ticket,
+			command_args=None,
+			app=None,
+			command_list=json.dumps([["--site", frappe.local.site, "console"]]),
+			content_after="print(1)\n",
+		).name
+
+	def test_console_approve_needs_only_the_console_switch(self):
+		# CHG-010: the panel is the one place a console proposal is approved; one-click approval is not its switch
+		set_agent_settings(one_click_approval_enabled=0, console_enabled=1)
+		name = self._console()
+		result = self._decide(name, APPROVE)
+		self.assertEqual(result, {"name": name, "status": CHANGE_STATUS_APPROVED})
+		self.assertEqual(self._state(name).change_status, CHANGE_STATUS_APPROVED)
+		self.assertEqual(len(self._jobs()), 1)
+
+	def test_console_approve_refused_when_the_console_switch_is_off(self):
+		set_agent_settings(one_click_approval_enabled=1, console_enabled=0)
+		name = self._console()
+		self.assertRefused(name, APPROVE, frappe.PermissionError, text="Chạy bench console đang tắt.")
+		self.assertEqual(self._state(name).change_status, CHANGE_STATUS_PENDING)
+
+	def test_console_approve_refused_when_the_clicker_cannot_read_the_proposal(self):
+		# CHG-010 final review F-7: approving a script needs the right to read it, so nobody approves unseen code
+		set_agent_settings(console_enabled=1)
+		name = self._console()
+		frappe.get_doc(
+			{
+				"doctype": "User Permission",
+				"user": DECIDE_INSTRUCTOR,
+				"allow": PROPOSAL_DOCTYPE,
+				"for_value": self.proposal,
+			}
+		).insert(ignore_permissions=True)
+		frappe.clear_cache(user=DECIDE_INSTRUCTOR)
+		frappe.set_user(DECIDE_INSTRUCTOR)
+		try:
+			self.assertFalse(frappe.has_permission(PROPOSAL_DOCTYPE, "read", doc=name))
+		finally:
+			frappe.set_user("Administrator")
+		self.assertRefused(
+			name,
+			APPROVE,
+			frappe.PermissionError,
+			text="Bạn cần quyền xem đề xuất để duyệt script console.",
+		)
+		self.assertEqual(self._state(name).change_status, CHANGE_STATUS_PENDING)
+		# the same user still approves a non-console proposal they read
+		self.assertEqual(self._decide(self.proposal, APPROVE)["status"], CHANGE_STATUS_APPROVED)
+
+	def test_console_reject_from_the_panel_with_console_on(self):
+		set_agent_settings(console_enabled=1)
+		name = self._console()
+		self.assertEqual(self._decide(name, REJECT)["status"], CHANGE_STATUS_REJECTED)
+
+	def test_signed_link_cannot_approve_a_console_proposal(self):
+		# CHG-010: the signed one-click link refuses a console proposal and writes nothing
+		set_agent_settings(one_click_approval_enabled=1, console_enabled=1)
+		name = self._console()
+		signature = parse_qs(change_link._signed_query(name, APPROVE))["_signature"][0]
+		before = self._snapshot(name)
+		frappe.set_user(DECIDE_INSTRUCTOR)
+		try:
+			with self.assertRaises(frappe.PermissionError):
+				change_decision.decide(name, APPROVE, signature)
+		finally:
+			frappe.set_user("Administrator")
+		frappe.clear_messages()
+		self.assertEqual(self._snapshot(name), before)
+
+	def test_form_reject_still_works_on_a_console_proposal(self):
+		name = self._console()
+		frappe.set_user(DECIDE_INSTRUCTOR)
+		try:
+			self.assertEqual(proposal_form.reject(name)["status"], CHANGE_STATUS_REJECTED)
+		finally:
+			frappe.set_user("Administrator")
 
 	def test_approve_one_post_one_job(self):
 		result = self._decide(self.proposal, APPROVE)

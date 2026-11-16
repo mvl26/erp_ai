@@ -9,10 +9,13 @@ from datetime import date, datetime, timedelta
 from statistics import median
 
 import frappe
+from frappe.utils import get_datetime, now_datetime
+from frappe.utils.file_lock import LockTimeoutError
+from frappe.utils.synchronization import filelock
 
 from erp_ai.agent.classification import load_mapping
-from erp_ai.agent.ops_data import category_by_ticket_type, ticket_category
-from erp_ai.constants import AGENT_USER, LOG_DOCTYPE
+from erp_ai.agent.ops_data import category_by_ticket_type, ticket_category, weekly_cycle
+from erp_ai.constants import AGENT_USER, LOG_DOCTYPE, LOGGER_NAME, SETTING_DOCTYPE
 
 TICKET = "HD Ticket"
 CLOSED_STATUSES = ("Resolved", "Closed")
@@ -21,6 +24,12 @@ FAST_RESPONSE_MINUTES = 15
 FASTEST_RESPONSE_MINUTES = 5
 TASK_DUE = timedelta(hours=72)
 STALE_DAYS = (5, 7)
+KPI_WEEK_DOCTYPE = "ERP AI KPI Week"
+LOCK_NAME = "erp_ai_weekly_kpi"
+LOCK_TIMEOUT_S = 5
+MAX_BACKFILL_WEEKS = 8
+WEEK = timedelta(days=7)
+TITLE_KPI_FAILED = "erp_ai: KPI tuần lỗi"
 
 
 def compute_week(week_start: date, settings) -> dict:
@@ -38,6 +47,52 @@ def compute_week(week_start: date, settings) -> dict:
 		**_c_task_in_3_days(ws, we, reverse_map),
 		**_stale(we),
 	}
+
+
+def run_weekly_kpi(now: datetime | None = None) -> None:
+	"""Write one `ERP AI KPI Week` row for every week that has none, up to 8 weeks back (D-10, NFR-3).
+
+	The target week is the one before the cycle `now` belongs to. A week that fails is rolled back, logged and
+	ends the run: the rows stay contiguous, so the next run starts at that week.
+	"""
+	logger = frappe.logger(LOGGER_NAME)
+	try:
+		with filelock(LOCK_NAME, timeout=LOCK_TIMEOUT_S):
+			_run_locked(get_datetime(now) if now else now_datetime(), logger)
+	except LockTimeoutError:
+		logger.info("weekly_kpi: lock busy")
+
+
+def _weeks_to_compute(now: datetime) -> list[date]:
+	target = weekly_cycle(now) - WEEK
+	first = target - (MAX_BACKFILL_WEEKS - 1) * WEEK
+	newest = frappe.get_all(
+		KPI_WEEK_DOCTYPE, fields=["week_start"], order_by="week_start desc", limit_page_length=1
+	)
+	if newest:
+		first = max(first, frappe.utils.getdate(newest[0].week_start) + WEEK)
+	return [first + n * WEEK for n in range((target - first) // WEEK + 1)] if first <= target else []
+
+
+def _run_locked(now: datetime, logger) -> None:
+	weeks = _weeks_to_compute(now)
+	settings = frappe.get_single(SETTING_DOCTYPE)
+	written = 0
+	for week_start in weeks:
+		frappe.db.savepoint(LOCK_NAME)
+		try:
+			values = compute_week(week_start, settings)
+			frappe.get_doc({"doctype": KPI_WEEK_DOCTYPE, **values, "computed_at": now}).insert(
+				ignore_permissions=True
+			)
+			written += 1
+		except frappe.DuplicateEntryError:
+			frappe.db.rollback(save_point=LOCK_NAME)
+		except Exception as exc:
+			frappe.db.rollback(save_point=LOCK_NAME)
+			frappe.log_error(TITLE_KPI_FAILED, f"week={week_start} error={type(exc).__name__}")
+			break
+	logger.info("erp_ai weekly_kpi: %s of %s weeks written", written, len(weeks))
 
 
 def _pct(part: int, whole: int) -> float | None:

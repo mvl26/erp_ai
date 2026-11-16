@@ -2,6 +2,7 @@ import frappe
 from frappe.model.document import Document
 from frappe.utils import now_datetime
 
+from erp_ai.agent import lessons
 from erp_ai.agent.agent_write_guard import refuse_agent_write
 
 LOCKED_MESSAGE = "Không được đổi danh sách phiếu của kỳ rà soát"
@@ -20,6 +21,14 @@ class ERPAIReviewMonth(Document):
 		refuse_agent_write(self)
 		self.check_ticket_list_locked()
 		self.stamp_reviewer()
+
+	def on_update(self):
+		"""A verdict newly set to `Sai` teaches the bot one "don't do this" lesson (a failure never blocks the save)."""
+		before = self.get_doc_before_save()
+		previous = {row.name: row.verdict for row in before.items} if before else {}
+		for row in self.items:
+			if row.verdict == "Sai" and previous.get(row.name) != "Sai":
+				lessons.safely(lessons.record_review_verdict, self.name, row.ticket, row.note or "")
 
 	def on_trash(self):
 		refuse_agent_write(self)

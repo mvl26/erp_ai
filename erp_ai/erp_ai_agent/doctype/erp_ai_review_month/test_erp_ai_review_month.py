@@ -1,15 +1,17 @@
 import json
 from datetime import date
 from pathlib import Path
+from unittest.mock import patch
 
 import frappe
 from frappe.tests.utils import FrappeTestCase
 from helpdesk.test_utils import make_ticket
 
-from erp_ai.constants import AGENT_USER, ROLE_INSTRUCTOR
-from erp_ai.test_utils import keep_agent_settings
+from erp_ai.constants import AGENT_USER, LESSON_DOCTYPE, ROLE_INSTRUCTOR
+from erp_ai.test_utils import keep_agent_settings, set_agent_settings
 
 REVIEW_MONTH = "ERP AI Review Month"
+FAKE_KEY = "sk-ant-api03-" + "Ab1" * 13 + "Z"
 REVIEW_ITEM = "ERP AI Review Item"
 JSON_PATH = Path(__file__).resolve().parent / "erp_ai_review_month.json"
 ITEM_JSON_PATH = Path(__file__).resolve().parent.parent / "erp_ai_review_item" / "erp_ai_review_item.json"
@@ -220,3 +222,51 @@ def _set_verdict(name: str) -> None:
 	doc = frappe.get_doc(REVIEW_MONTH, name)
 	doc.items[0].verdict = "Đúng"
 	doc.save(ignore_permissions=True)
+
+
+class TestVerdictLessons(ReviewMonthTestCase):
+	"""A monthly-review verdict "Sai" becomes one "don't do this" lesson (FEAT-008 AC-11)."""
+
+	def setUp(self):
+		frappe.db.rollback()
+		commit_guard = patch.object(frappe.db, "commit", side_effect=AssertionError("test must not commit"))
+		commit_guard.start()
+		self.addCleanup(commit_guard.stop)
+		super().setUp()
+		set_agent_settings(enabled=0, lessons_enabled=1, excluded_teams="", excluded_title_prefixes="")
+		self.ticket = _tickets(1)[0]
+		self.month = _new_month([self.ticket]).insert(ignore_permissions=True)
+
+	def _judge(self, verdict, note=""):
+		doc = frappe.get_doc(REVIEW_MONTH, self.month.name)
+		doc.items[0].verdict = verdict
+		doc.items[0].note = note
+		doc.save(ignore_permissions=True)
+
+	def _lessons(self):
+		return frappe.get_all(
+			LESSON_DOCTYPE,
+			filters={"ticket": self.ticket},
+			fields=["lesson_source", "lesson_status", "lesson_text"],
+		)
+
+	def test_sai_verdict_makes_lesson_with_note(self):
+		self._judge("Sai", f"Phải là nhóm IT, khóa {FAKE_KEY}")
+		(lesson,) = self._lessons()
+		self.assertEqual(
+			(lesson.lesson_source, lesson.lesson_status), ("Kết quả duyệt và rà soát", "Đang dùng")
+		)
+		self.assertTrue(lesson.lesson_text.startswith("Đừng làm như vậy"))
+		self.assertIn("Phải là nhóm IT", lesson.lesson_text)
+		self.assertNotIn("sk-ant-api03-", lesson.lesson_text)
+
+	def test_dung_or_blank_makes_none(self):
+		self._judge("Đúng")
+		self._judge("")
+		self.assertEqual(self._lessons(), [])
+
+	def test_sai_twice_makes_one(self):
+		self._judge("Sai", "lần một")
+		self._judge("Đúng")
+		self._judge("Sai", "lần hai")
+		self.assertEqual(len(self._lessons()), 1)

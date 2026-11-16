@@ -6,8 +6,10 @@ from unittest.mock import Mock, patch
 
 import frappe
 from frappe.tests.utils import FrappeTestCase
+from helpdesk.test_utils import make_ticket
 
 from erp_ai import constants
+from erp_ai.agent import lessons
 from erp_ai.agent.changes import transitions
 from erp_ai.agent.changes.process_runner import CommandResult
 from erp_ai.constants import (
@@ -29,6 +31,7 @@ from erp_ai.constants import (
 	CORE_APPS,
 	JOB_SAFETY_MARGIN_S,
 	JOB_TIMEOUT_S,
+	LESSON_DOCTYPE,
 	LOG_DOCTYPE,
 	PROPOSAL_DOCTYPE,
 	RESTART_STATUS_CONFIRMED,
@@ -39,7 +42,7 @@ from erp_ai.constants import (
 	TITLE_CHANGE_FAILED,
 	TRIGGER_CHANGE_ACTION,
 )
-from erp_ai.test_utils import make_change_proposal
+from erp_ai.test_utils import keep_agent_settings, make_change_proposal, set_agent_settings
 
 # Design 2.1 state group, written out by hand (11 fields + 4 CHG-002 fields + 4 git fields of round 1).
 STATE_FIELDS_EXPECTED = (
@@ -1467,3 +1470,77 @@ class TestEveryStepLogs(TransitionTestCase):
 						"error": errors.get(step),
 					},
 				)
+
+
+class TestLessonsFromOutcome(FrappeTestCase):
+	"""A rejected or undone proposal becomes one "don't do this" lesson (FEAT-008 AC-10)."""
+
+	def setUp(self):
+		frappe.db.rollback()
+		commit_guard = patch.object(frappe.db, "commit", side_effect=AssertionError("test must not commit"))
+		commit_guard.start()
+		self.addCleanup(commit_guard.stop)
+		self.addCleanup(frappe.db.rollback)
+		self.addCleanup(frappe.set_user, "Administrator")
+		keep_agent_settings(self)
+		set_agent_settings(enabled=0, lessons_enabled=1, excluded_teams="", excluded_title_prefixes="")
+
+	def _lessons(self, proposal):
+		return frappe.get_all(
+			LESSON_DOCTYPE,
+			filters={"change_proposal": proposal},
+			fields=["lesson_source", "lesson_status", "lesson_text", "ticket"],
+		)
+
+	def test_reject_makes_dont_lesson(self):
+		proposal = make_change_proposal()
+		transitions.reject(proposal.name, ACTOR)
+		(lesson,) = self._lessons(proposal.name)
+		self.assertEqual(lesson.lesson_source, "Kết quả duyệt và rà soát")
+		self.assertEqual(lesson.lesson_status, "Đang dùng")
+		self.assertEqual(lesson.ticket, proposal.ticket)
+		self.assertTrue(lesson.lesson_text.startswith("Đừng làm như vậy"))
+		self.assertIn(proposal.file_path, lesson.lesson_text)
+		self.assertIn("từ chối", lesson.lesson_text)
+
+	def test_undo_makes_dont_lesson(self):
+		proposal = _proposal_in(CHANGE_STATUS_APPLIED)
+		frappe.db.set_value(PROPOSAL_DOCTYPE, proposal.name, "apply_commit_sha", "a" * 40)
+		transitions.request_undo(proposal.name, ACTOR)
+		(lesson,) = self._lessons(proposal.name)
+		self.assertTrue(lesson.lesson_text.startswith("Đừng làm như vậy"))
+		self.assertIn("hoàn tác", lesson.lesson_text)
+
+	def test_command_target_falls_back_to_args_then_app(self):
+		proposal = make_change_proposal(kind=CHANGE_KIND_COMMAND)
+		transitions.reject(proposal.name, ACTOR)
+		(lesson,) = self._lessons(proposal.name)
+		self.assertIn("Lệnh bench", lesson.lesson_text)
+
+	def test_approve_makes_none(self):
+		proposal = make_change_proposal()
+		transitions.approve(proposal.name, ACTOR)
+		self.assertEqual(self._lessons(proposal.name), [])
+
+	def test_reject_lesson_once(self):
+		proposal = make_change_proposal()
+		transitions.reject(proposal.name, ACTOR)
+		lessons.record_proposal_outcome(proposal.name, "reject")
+		self.assertEqual(len(self._lessons(proposal.name)), 1)
+
+	def test_reject_on_excluded_ticket_makes_none(self):
+		ticket = make_ticket(subject="Phiếu không dùng AI").name
+		frappe.db.set_value("HD Ticket", ticket, "ai_opt_out", 1)
+		proposal = make_change_proposal(ticket=ticket)
+		transitions.reject(proposal.name, ACTOR)
+		self.assertEqual(self._lessons(proposal.name), [])
+		self.assertEqual(_state(proposal.name).change_status, CHANGE_STATUS_REJECTED)
+
+	def test_lesson_failure_keeps_reject(self):
+		proposal = make_change_proposal()
+		logs = frappe.db.count("Error Log", {"method": "erp_ai: ghi bài học lỗi"})
+		with patch("erp_ai.agent.lessons._store", side_effect=RuntimeError("boom")):
+			transitions.reject(proposal.name, ACTOR)
+		self.assertEqual(_state(proposal.name).change_status, CHANGE_STATUS_REJECTED)
+		self.assertEqual(self._lessons(proposal.name), [])
+		self.assertEqual(frappe.db.count("Error Log", {"method": "erp_ai: ghi bài học lỗi"}), logs + 1)

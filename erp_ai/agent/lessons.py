@@ -16,6 +16,7 @@ from erp_ai.agent.knowledge import plain_text
 from erp_ai.agent.redact import redact_secrets
 from erp_ai.constants import (
 	AGENT_USER,
+	CATEGORIES,
 	LESSON_DOCTYPE,
 	LESSON_SOURCE_CORRECTION,
 	LESSON_SOURCE_OUTCOME,
@@ -26,6 +27,7 @@ from erp_ai.constants import (
 	LESSON_STATUS_PENDING,
 	LESSON_STATUS_REJECTED,
 	LOG_DOCTYPE,
+	PROPOSAL_DOCTYPE,
 	SETTING_DOCTYPE,
 	TRIGGER_COMMENT_MENTION,
 )
@@ -235,6 +237,58 @@ def record_correction(ticket: str, log_name: str) -> str | None:
 		situation=_ticket_situation(ticket, with_description=True),
 		text=(
 			f"Bot xếp: Loại {t0}, Nhóm {g0}, Ưu tiên {p0}. Người sửa thành: Loại {t1}, Nhóm {g1}, Ưu tiên {p1}."
+		),
+	)
+
+
+OUTCOME_VERBS = {"reject": "từ chối", "undo": "hoàn tác"}
+
+
+def record_proposal_outcome(proposal: str, outcome: str) -> str | None:
+	"""A change proposal a person rejected (`reject`) or undid (`undo`): one "don't do this" lesson (AC-10).
+
+	The lesson names the kind and the target of the change and nothing of the ticket but its subject.
+	"""
+	if outcome not in OUTCOME_VERBS:
+		raise ValueError(f"unknown proposal outcome: {outcome!r}")
+	row = frappe.db.get_value(
+		PROPOSAL_DOCTYPE,
+		proposal,
+		["ticket", "change_kind", "file_path", "command_args", "app"],
+		as_dict=True,
+	)
+	if not row:
+		return None
+	target = " ".join((row.file_path or row.command_args or f"trong app {row.app or '—'}").split())
+	return _store(
+		LESSON_SOURCE_OUTCOME,
+		f"{outcome}:{proposal}",
+		ticket=row.ticket,
+		change_proposal=proposal,
+		authorized=True,
+		situation=_ticket_situation(row.ticket, with_description=False) if row.ticket else "",
+		text=f"Đừng làm như vậy: đề xuất {row.change_kind} {target} đã bị {OUTCOME_VERBS[outcome]}.",
+	)
+
+
+def record_review_verdict(review_month: str, ticket: str, note: str) -> str | None:
+	"""A monthly-review verdict "Sai" on `ticket`: one "don't do this" lesson with the reviewer's note (AC-11)."""
+	chosen = frappe.db.get_value(
+		LOG_DOCTYPE,
+		{"ticket": ticket, "entry_type": "classify", "predicted_category": ("in", CATEGORIES)},
+		["predicted_ticket_type", "predicted_agent_group", "predicted_priority"],
+		order_by="creation asc, name asc",
+	)
+	t, g, p = (value or "—" for value in (chosen or (None, None, None)))
+	return _store(
+		LESSON_SOURCE_OUTCOME,
+		f"review:{review_month}:{ticket}",
+		ticket=ticket,
+		authorized=True,
+		situation=_ticket_situation(ticket, with_description=True),
+		text=(
+			f"Đừng làm như vậy: rà soát tháng chấm Sai lần phân loại của bot (Loại {t}, Nhóm {g}, Ưu tiên {p}). "
+			f"Ghi chú người rà: {note or '—'}"
 		),
 	)
 

@@ -287,7 +287,8 @@ STATUS_SCRIPT_REQUIRED = (
 	r"if \(state\.ticket\)",
 	# T12: message thread, labels, B-8 guidance, close button, indicator moved into the panel and back.
 	r"threadEl",
-	r"renderMessages",
+	# CHG-010: one thread of messages and cards, so renderThread replaces renderMessages and renderProposals.
+	r"renderThread",
 	r'TEXT_EMPTY_THREAD = "Chưa có tin nào\."',
 	r'TEXT_BOT_LABEL = "Bot"',
 	r'TEXT_CLOSE = "Đóng"',
@@ -300,7 +301,8 @@ STATUS_SCRIPT_REQUIRED = (
 	# T12: stale-result guard (design F1 reload).
 	r"seq !== panel\.seq \|\| ticket !== state\.ticket \|\| !panel\.open",
 	# T12 use sites (the pins above match declarations; these match where each is used).
-	r"renderMessages\(data\)",
+	# CHG-010: the use site is renderThread(data) now.
+	r"renderThread\(data\)",
 	r"if \(isStale\(\)\) \{\s*return;",
 	r"dockIndicator\(true\)",
 	r"dockIndicator\(false\)",
@@ -348,9 +350,15 @@ STATUS_SCRIPT_REQUIRED = (
 	r'addEventListener\("click", \(\) => \{\s*try \{\s*submit\(\);',
 	r"formEl,\s*slotEl",
 	# CHG-008 T4 (design 4.3): the proposals section, between the thread and the error line, and the fixed texts.
-	r"renderProposals",
-	r"threadEl,\s*proposalsTitle,\s*proposalsEl,\s*proposalErrorEl,\s*errorEl,\s*formEl,\s*slotEl",
-	r'TEXT_PROPOSALS_SECTION = "Đề xuất thay đổi"',
+	# CHG-010: no separate proposals section; the cards sit in threadEl and proposalErrorEl follows it.
+	r"threadEl,\s*proposalErrorEl,\s*errorEl,\s*formEl,\s*slotEl",
+	# CHG-010: console cards show the script and its result; cards are ordered with the messages by time.
+	r'TEXT_CONSOLE_SCRIPT = "Script sẽ chạy:"',
+	r'TEXT_CONSOLE_OUTPUT = "Kết quả:"',
+	r'maxHeight = "240px"',
+	r'overflow = "auto"',
+	r"\.sort\(\(a, b\) =>[^;]*\.created",
+	r"card\?\.is_console !== true",
 	r'TEXT_OPEN_PROPOSAL = "Xem nội dung thay đổi"',
 	r'OPEN_PROPOSAL_LABEL = "Mở đề xuất để Duyệt hoặc Từ chối"',
 	r'TEXT_NEEDS_INSTRUCTOR = "Cần người có vai trò ERP AI Instructor duyệt\."',
@@ -360,7 +368,6 @@ STATUS_SCRIPT_REQUIRED = (
 	r"deciding: false",
 	r"decisionButtons: \[\]",
 	r"Array\.isArray\(proposals\)",
-	r"renderProposals\(data\)",
 	# CHG-008 T5 (design 4.2, 4.3; AC-5, AC-11): Duyệt / Từ chối post once, lock both buttons while waiting, show
 	# the fixed error sentence on failure and reload the panel once in both branches.
 	r'TEXT_APPROVE = "Duyệt";',
@@ -379,8 +386,9 @@ STATUS_SCRIPT_REQUIRED = (
 	r"catch \(e\) \{\s*onDecideFailed\(\);",
 	# T6 review ruling: a card without a name has no button; a failed card render clears only the proposals.
 	r'const name = String\(card\?\.name \?\? ""\);\s*if \(!name\) \{\s*return row;',
-	r'renderMessages\(data\);\s*panel\.errorEl\.textContent = "";',
-	r"try \{\s*renderProposals\(data\);\s*\} catch \(e\) \{\s*clearProposals\(\);",
+	# CHG-010: a failed card build renders the messages without cards and clears the card error line (AC-11).
+	r'renderThread\(data\);\s*panel\.errorEl\.textContent = "";',
+	r"try \{\s*panel\.decisionButtons = \[\];\s*cardNodes = proposals\.map\(proposalCard\);\s*\} catch \(e\) \{\s*cardNodes = \[\];\s*panel\.decisionButtons = \[\];\s*panel\.proposalErrorEl\.replaceChildren\(\);",
 	# T14 live updates (design F3): both listeners are named handlers registered once per socket, in the guard block.
 	r'state\.socket = socket;\s*socket\.on\(EVENT, onStatus\);\s*socket\.on\("docinfo_update", onDocinfo\);\s*socket\.on\("doc_update", onDocUpdate\);',
 	r"docinfo_update",

@@ -19,7 +19,8 @@ function setupForm({ doc, call, router }) {
 		const TEXT_EMPTY_MESSAGE = "Hãy nhập nội dung trước khi gửi.";
 		const TEXT_TOO_LONG = "Tin dài quá 2000 ký tự.";
 		const TEXT_SEND_FAILED = "Không gửi được tin. Chữ bạn gõ vẫn còn, hãy thử lại.";
-		const TEXT_PROPOSALS_SECTION = "Đề xuất thay đổi";
+		const TEXT_CONSOLE_SCRIPT = "Script sẽ chạy:";
+		const TEXT_CONSOLE_OUTPUT = "Kết quả:";
 		const TEXT_OPEN_PROPOSAL = "Xem nội dung thay đổi";
 		const OPEN_PROPOSAL_LABEL = "Mở đề xuất để Duyệt hoặc Từ chối";
 		const TEXT_NEEDS_INSTRUCTOR = "Cần người có vai trò ERP AI Instructor duyệt.";
@@ -57,8 +58,6 @@ function setupForm({ doc, call, router }) {
 			slotEl: null,
 			aiListEl: null,
 			threadEl: null,
-			proposalsTitle: null,
-			proposalsEl: null,
 			proposalErrorEl: null,
 			deciding: false,
 			decisionButtons: [],
@@ -223,12 +222,6 @@ function setupForm({ doc, call, router }) {
 			guidanceEl.style.color = "#6b7280";
 			guidanceEl.textContent = TEXT_BOT_GUIDANCE;
 			const threadEl = document.createElement("div");
-			const proposalsTitle = document.createElement("strong");
-			proposalsTitle.style.display = "block";
-			proposalsTitle.style.marginTop = "8px";
-			proposalsTitle.textContent = TEXT_PROPOSALS_SECTION;
-			proposalsTitle.hidden = true;
-			const proposalsEl = document.createElement("div");
 			const proposalErrorEl = document.createElement("div");
 			proposalErrorEl.style.color = "#b91c1c";
 			const errorEl = document.createElement("div");
@@ -268,8 +261,6 @@ function setupForm({ doc, call, router }) {
 				chatTitle,
 				guidanceEl,
 				threadEl,
-				proposalsTitle,
-				proposalsEl,
 				proposalErrorEl,
 				errorEl,
 				formEl,
@@ -280,8 +271,6 @@ function setupForm({ doc, call, router }) {
 			panel.slotEl = slotEl;
 			panel.aiListEl = aiListEl;
 			panel.threadEl = threadEl;
-			panel.proposalsTitle = proposalsTitle;
-			panel.proposalsEl = proposalsEl;
 			panel.proposalErrorEl = proposalErrorEl;
 			panel.errorEl = errorEl;
 			panel.inputEl = inputEl;
@@ -323,49 +312,31 @@ function setupForm({ doc, call, router }) {
 			state.panel.aiListEl.replaceChildren(...nodes);
 		};
 
-		const renderMessages = (data) => {
-			const messages = data?.messages;
-			if (!Array.isArray(messages)) {
-				throw new Error("messages is not a list");
-			}
-			if (messages.length === 0) {
-				const empty = document.createElement("div");
-				empty.style.marginTop = "8px";
-				empty.textContent = TEXT_EMPTY_THREAD;
-				state.panel.threadEl.replaceChildren(empty);
-				return;
-			}
-			const nodes = messages.map((message) => {
-				const row = document.createElement("div");
-				row.style.marginTop = "8px";
-				row.style.padding = "6px 8px";
-				row.style.borderRadius = "6px";
-				row.style.background = message?.is_bot ? "#eef2ff" : "#f9fafb";
-				const head = document.createElement("strong");
-				head.textContent = [
-					message?.is_bot ? TEXT_BOT_LABEL : "",
-					message?.author,
-					message?.created_at,
-				]
-					.filter(Boolean)
-					.join(" · ");
-				const body = document.createElement("div");
-				body.style.whiteSpace = "pre-wrap";
-				body.textContent = message?.text ?? "";
-				row.append(head, body);
-				return row;
-			});
-			state.panel.threadEl.replaceChildren(...nodes);
+		const messageRow = (message) => {
+			const row = document.createElement("div");
+			row.style.marginTop = "8px";
+			row.style.padding = "6px 8px";
+			row.style.borderRadius = "6px";
+			row.style.background = message?.is_bot ? "#eef2ff" : "#f9fafb";
+			const head = document.createElement("strong");
+			head.textContent = [
+				message?.is_bot ? TEXT_BOT_LABEL : "",
+				message?.author,
+				message?.created_at,
+			]
+				.filter(Boolean)
+				.join(" · ");
+			const body = document.createElement("div");
+			body.style.whiteSpace = "pre-wrap";
+			body.textContent = message?.text ?? "";
+			row.append(head, body);
+			return row;
 		};
 
 		const clearProposals = () => {
 			const panel = state.panel;
 			panel.decisionButtons = [];
-			panel.proposalsEl?.replaceChildren();
 			panel.proposalErrorEl?.replaceChildren();
-			if (panel.proposalsTitle) {
-				panel.proposalsTitle.hidden = true;
-			}
 		};
 
 		// Opens the proposal's own form in a new tab; the form checks the reader again (design D-4).
@@ -426,7 +397,8 @@ function setupForm({ doc, call, router }) {
 					row.append(proposalButton(TEXT_OPEN_PROPOSAL, name));
 				}
 			} else if (card?.status === STATUS_PENDING) {
-				if (canOpen) {
+				// A console proposal cannot be approved on its form, so it never gets this button.
+				if (canOpen && card?.is_console !== true) {
 					row.append(proposalButton(OPEN_PROPOSAL_LABEL, name));
 				} else {
 					const note = document.createElement("span");
@@ -472,6 +444,24 @@ function setupForm({ doc, call, router }) {
 					addLine(String(note ?? ""), true);
 				}
 			}
+			if (card?.is_console === true) {
+				const addBlock = (label, value) => {
+					addLine(label, false);
+					const pre = document.createElement("pre");
+					pre.style.whiteSpace = "pre-wrap";
+					pre.style.margin = "0";
+					pre.style.maxHeight = "240px";
+					pre.style.overflow = "auto";
+					pre.textContent = String(value);
+					el.append(pre);
+				};
+				if (card?.script != null) {
+					addBlock(TEXT_CONSOLE_SCRIPT, card.script);
+				}
+				if (card?.output != null) {
+					addBlock(TEXT_CONSOLE_OUTPUT, card.output);
+				}
+			}
 			if (card?.decided_by) {
 				addLine(TEXT_DECIDED_BY + card.decided_by, false);
 			}
@@ -485,20 +475,47 @@ function setupForm({ doc, call, router }) {
 			return el;
 		};
 
-		// Not a list means no cards and no title; it never fails the rest of the panel.
-		const renderProposals = (data) => {
+		// Messages and cards in one thread by `created` (a card after a message of the same time). A card that
+		// fails to build leaves the messages without cards; it never fails the rest of the panel (AC-11).
+		const renderThread = (data) => {
 			const panel = state.panel;
-			if (!panel.proposalsEl) {
-				return;
+			const messages = data?.messages;
+			if (!Array.isArray(messages)) {
+				throw new Error("messages is not a list");
 			}
+			const entries = messages.map((message) => ({
+				created: String(message?.created ?? ""),
+				rank: 0,
+				node: messageRow(message),
+			}));
 			const proposals = data?.proposals;
-			if (!Array.isArray(proposals) || proposals.length === 0) {
+			if (Array.isArray(proposals) && proposals.length > 0) {
+				let cardNodes = [];
+				try {
+					panel.decisionButtons = [];
+					cardNodes = proposals.map(proposalCard);
+				} catch (e) {
+					cardNodes = [];
+					panel.decisionButtons = [];
+					panel.proposalErrorEl.replaceChildren();
+				}
+				cardNodes.forEach((node, i) => {
+					entries.push({ created: String(proposals[i]?.created ?? ""), rank: 1, node });
+				});
+			} else {
 				clearProposals();
+			}
+			entries.sort((a, b) =>
+				a.created < b.created ? -1 : a.created > b.created ? 1 : a.rank - b.rank
+			);
+			if (entries.length === 0) {
+				const empty = document.createElement("div");
+				empty.style.marginTop = "8px";
+				empty.textContent = TEXT_EMPTY_THREAD;
+				panel.threadEl.replaceChildren(empty);
 				return;
 			}
-			panel.decisionButtons = [];
-			panel.proposalsEl.replaceChildren(...proposals.map(proposalCard));
-			panel.proposalsTitle.hidden = false;
+			panel.threadEl.replaceChildren(...entries.map((entry) => entry.node));
 		};
 
 		const reload = () => {
@@ -523,7 +540,7 @@ function setupForm({ doc, call, router }) {
 								return;
 							}
 							renderAiFields(data);
-							renderMessages(data);
+							renderThread(data);
 							panel.errorEl.textContent = "";
 						} catch (e) {
 							panel.aiListEl.replaceChildren();
@@ -531,12 +548,6 @@ function setupForm({ doc, call, router }) {
 							panel.threadEl.replaceChildren();
 							panel.errorEl.textContent = TEXT_LOAD_FAILED;
 							return;
-						}
-						// A card that fails to render clears the proposals only; the thread stays.
-						try {
-							renderProposals(data);
-						} catch (e) {
-							clearProposals();
 						}
 					})
 					.catch(showLoadFailed);

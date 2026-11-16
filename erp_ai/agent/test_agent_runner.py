@@ -5237,12 +5237,13 @@ class TestReclassify(RunnerTestBase):
 				self.assertEqual(self._tasks(), [])
 		self.assertEqual(len(self._entries(entry_type="classify")), 1)
 
-	def test_no_classification_yet_makes_no_classify_call(self):
-		# the ticket has no classify row with a result: nothing to classify again (ADR-037 QĐ 1, third condition)
-		self.gateway.results = [make_model_result()]
+	def test_no_classification_yet_classifies_first(self):
+		# CHG-005 (Amendment 1 of ADR-037 QĐ 1): the ticket has no classify row with a result, so the run classifies
+		# first, once; test_runner_preclassify.py holds the rest
+		self.gateway.results = [classify_at(75), make_model_result()]
 		self._run("comment_mention")
 
-		self.assertEqual(self._tasks(), ["reason"])
+		self.assertEqual(self._tasks(), ["classify", "reason"])
 
 	def test_instructor_with_act_now_not_reclassified(self):
 		self._seed_classification(50)

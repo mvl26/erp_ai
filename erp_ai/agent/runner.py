@@ -1402,10 +1402,10 @@ def _reason(
 			tool_blocks = [block for block in result.content if block.get("type") == "tool_use"]
 			tool_results, actions, before, after, tool_errors, skipped = [], [], {}, {}, [], []
 			# the whole turn waits, before any of its tools runs (D-6)
-			if delay is not None and any(block["name"] == ANSWER_TOOL for block in tool_blocks):
-				delay.wait_before_answer(deadline)
 			# a turn the output cap cut may hold calls whose input stops half way: none of them runs (BUG-005)
 			cut = result.stop_reason == STOP_MAX_TOKENS and bool(tool_blocks)
+			if not cut and delay is not None and any(block["name"] == ANSWER_TOOL for block in tool_blocks):
+				delay.wait_before_answer(deadline)
 			for block in tool_blocks:
 				status.working(block["name"])
 				if cut:

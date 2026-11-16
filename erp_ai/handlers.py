@@ -12,10 +12,11 @@ from erp_ai.constants import (
 	LOG_DOCTYPE,
 	LOGGER_NAME,
 	TRIGGER_COMMENT_MENTION,
+	TRIGGER_KB_DRAFT,
 	TRIGGER_REQUESTER_REPLY,
 	TRIGGER_TICKET_INSERT,
 )
-from erp_ai.install import TASK_TICKET_FIELD
+from erp_ai.install import ARTICLE_DOCTYPE, ARTICLE_SOURCE_FIELD, TASK_TICKET_FIELD
 
 TICKET_DOCTYPE = "HD Ticket"
 HUMAN_COMMENT_TYPE = "Comment"
@@ -115,7 +116,7 @@ def ticket_validate(doc, method=None):
 	doc.flags.erp_ai_human_corrected = reference
 
 
-def ticket_on_update(doc, method=None):
+def _record_human_correction(doc):
 	log_name = doc.flags.erp_ai_human_corrected
 	if doc.flags.in_insert or not log_name:
 		return
@@ -129,6 +130,45 @@ def ticket_on_update(doc, method=None):
 		values["human_corrected_at"] = frappe.utils.now_datetime()
 	frappe.db.set_value(LOG_DOCTYPE, log_name, values, update_modified=False)
 	_log_decision(doc.name, TRIGGER_HUMAN_CORRECTION, "recorded", "human_changed_classification")
+
+
+def _kb_draft_skip(doc) -> str | None:
+	"""Why a ticket entering the Resolved group must not queue the knowledge-draft run, or None; reads only."""
+	if not policy.is_enabled():
+		return "agent_disabled"
+	if not lifecycle.kb_draft_enabled():
+		return "kb_draft_off"
+	# The lifecycle job's own close of a silent F ticket makes no article.
+	if doc.flags.erp_ai_silent_close:
+		return "silent_close"
+	if refusal := policy.send_refusal(doc):
+		return f"not_sendable:{refusal}"
+	if frappe.db.exists(ARTICLE_DOCTYPE, {ARTICLE_SOURCE_FIELD: doc.name}):
+		return "kb_exists"
+	return None
+
+
+def _maybe_enqueue_kb_draft(doc):
+	"""AC-45: a ticket entering the Resolved group queues the knowledge-draft run (ADR-033 QĐ 2: read and queue)."""
+	# Runs for every ticket save: leave before any DB read unless the status moved into the Resolved group.
+	if (
+		doc.flags.in_insert
+		or not doc.has_value_changed("status")
+		or doc.status_category != lifecycle.RESOLVED_CATEGORY
+	):
+		return
+
+	skip_reason = _kb_draft_skip(doc)
+	if skip_reason:
+		_log_decision(doc.name, TRIGGER_KB_DRAFT, "skipped", skip_reason)
+		return
+	enqueue_agent_run(doc.name, TRIGGER_KB_DRAFT)
+	_log_decision(doc.name, TRIGGER_KB_DRAFT, "enqueued", "conditions_met")
+
+
+def ticket_on_update(doc, method=None):
+	_record_human_correction(doc)
+	_maybe_enqueue_kb_draft(doc)
 
 
 def ticket_series_name() -> str | None:

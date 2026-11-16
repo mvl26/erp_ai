@@ -787,7 +787,10 @@ class TestProposeNow(FrappeTestCase):
 	def test_hint_once_iff_propose_now_on_a_hint_trigger(self):
 		hint = getattr(prompts, "TASK_PROPOSE_NOW", "TASK_PROPOSE_NOW")
 		parameter = inspect.signature(prompts.build_initial_message).parameters.get("propose_now")
-		self.assertEqual((parameter.kind, parameter.default) if parameter else None, (inspect.Parameter.KEYWORD_ONLY, False))
+		self.assertEqual(
+			(parameter.kind, parameter.default) if parameter else None,
+			(inspect.Parameter.KEYWORD_ONLY, False),
+		)
 		self.assertEqual(prompts.CATEGORY_HINT_TRIGGERS, CATEGORY_HINT_TRIGGERS_TODAY)
 		classifications = [*({"category": c, "confidence_pct": 90} for c in CATEGORIES), {}, None]
 		for trigger, classification in itertools.product(ALL_TRIGGERS, classifications):
@@ -823,4 +826,6 @@ class TestProposeNow(FrappeTestCase):
 					),
 					message,
 				)
-				self.assertEqual(message.count("Gọi set_resolution_hint một lần"), int(trigger == TRIGGER_TICKET_INSERT))
+				self.assertEqual(
+					message.count("Gọi set_resolution_hint một lần"), int(trigger == TRIGGER_TICKET_INSERT)
+				)

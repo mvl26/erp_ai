@@ -212,6 +212,59 @@ class TestLessonStore(FrappeTestCase):
 		)
 		self.assertEqual([row.step for row in doc.history], ["Tạo", "Duyệt", "Cập nhật", "Cập nhật"])
 
+	def test_rejected_lesson_is_final_for_updates(self):
+		# R12: a later correction of the same thing never brings a rejected lesson back
+		name = self._store(PLAIN, "test:final", updatable=True)
+		self._transition(REVIEWER, name, "reject")
+		modified = frappe.db.get_value(LESSON_DOCTYPE, name, "modified")
+		again = self._store(
+			INSTRUCTOR, "test:final", authorized=True, updatable=True, text="Một bài khác hẳn"
+		)
+		self.assertEqual(again, name)
+		row = frappe.db.get_value(
+			LESSON_DOCTYPE, name, ["lesson_status", "lesson_text", "author", "modified"], as_dict=True
+		)
+		self.assertEqual(
+			(row.lesson_status, row.lesson_text, row.author, row.modified),
+			(LESSON_STATUS_REJECTED, "Phiếu máy in chuyển nhóm IT", PLAIN, modified),
+		)
+		self.assertEqual(_steps(name), ["Tạo", "Từ chối"])
+
+	def test_retire_moves_active_and_pending_only(self):
+		# I5: undoing the decision a lesson came from retires it; a lesson already off or rejected stays as it is
+		active = self._active("test:retire-active")
+		pending = self._pending("test:retire-pending")
+		disabled = self._active("test:retire-disabled")
+		self._transition(INSTRUCTOR, disabled, "disable")
+		rejected = self._pending("test:retire-rejected")
+		self._transition(REVIEWER, rejected, "reject")
+		frappe.set_user(PLAIN)
+		try:
+			for key in ("active", "pending", "disabled", "rejected", "missing"):
+				self.assertEqual(
+					lessons._retire(f"test:retire-{key}"),
+					{"active": active, "pending": pending}.get(key),
+					key,
+				)
+		finally:
+			frappe.set_user("Administrator")
+		expected = {
+			active: (LESSON_STATUS_DISABLED, ["Tạo", "Tắt"]),
+			pending: (LESSON_STATUS_REJECTED, ["Tạo", "Từ chối"]),
+			disabled: (LESSON_STATUS_DISABLED, ["Tạo", "Tắt"]),
+			rejected: (LESSON_STATUS_REJECTED, ["Tạo", "Từ chối"]),
+		}
+		for name, (status, steps) in expected.items():
+			self.assertEqual(
+				(frappe.db.get_value(LESSON_DOCTYPE, name, "lesson_status"), _steps(name)),
+				(status, steps),
+				name,
+			)
+		for name in (active, pending):
+			doc = frappe.get_doc(LESSON_DOCTYPE, name)
+			self.assertEqual((doc.reviewed_by, doc.history[-1].actor), (PLAIN, PLAIN), name)
+		self.assertEqual(_count(event_key="test:retire-missing"), 0)
+
 	def test_learning_off_makes_nothing(self):
 		set_agent_settings(lessons_enabled=0)
 		for source in (LESSON_SOURCE_CORRECTION, LESSON_SOURCE_TEACHING, LESSON_SOURCE_OUTCOME):

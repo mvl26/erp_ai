@@ -249,8 +249,11 @@ class TestVerdictLessons(ReviewMonthTestCase):
 		return frappe.get_all(
 			LESSON_DOCTYPE,
 			filters={"ticket": self.ticket},
-			fields=["lesson_source", "lesson_status", "lesson_text"],
+			fields=["name", "lesson_source", "lesson_status", "lesson_text"],
 		)
+
+	def _steps(self, name):
+		return [row.step for row in frappe.get_doc(LESSON_DOCTYPE, name).history]
 
 	def test_sai_verdict_makes_lesson_with_note(self):
 		self._judge("Sai", f"Phải là nhóm IT, khóa {FAKE_KEY}")
@@ -272,3 +275,42 @@ class TestVerdictLessons(ReviewMonthTestCase):
 		self._judge("Đúng")
 		self._judge("Sai", "lần hai")
 		self.assertEqual(len(self._lessons()), 1)
+
+	def _sai_then(self, verdict):
+		self._judge("Sai", "Phải là nhóm IT")
+		(lesson,) = self._lessons()
+		self.assertEqual(lesson.lesson_status, "Đang dùng")
+		self._judge(verdict, "")
+		(lesson,) = self._lessons()
+		return lesson
+
+	def test_sai_set_to_dung_retires_lesson(self):
+		# I5: the reviewer takes the Sai back; the lesson of that verdict stops being used
+		lesson = self._sai_then("Đúng")
+		self.assertEqual(lesson.lesson_status, "Đã tắt")
+		self.assertEqual(self._steps(lesson.name), ["Tạo", "Tắt"])
+		doc = frappe.get_doc(LESSON_DOCTYPE, lesson.name)
+		self.assertEqual((doc.reviewed_by, doc.history[-1].actor), ("Administrator", "Administrator"))
+
+	def test_sai_cleared_retires_lesson(self):
+		lesson = self._sai_then("")
+		self.assertEqual(lesson.lesson_status, "Đã tắt")
+		self.assertEqual(self._steps(lesson.name), ["Tạo", "Tắt"])
+
+	def test_note_change_keeps_lesson(self):
+		self._judge("Sai", "lần một")
+		self._judge("Sai", "lần hai")
+		(lesson,) = self._lessons()
+		self.assertEqual(lesson.lesson_status, "Đang dùng")
+		self.assertEqual(self._steps(lesson.name), ["Tạo"])
+
+	def test_sai_on_excluded_ticket_makes_none(self):
+		frappe.db.set_value("HD Ticket", self.ticket, "ai_opt_out", 1)
+		self._judge("Sai", "Phải là nhóm IT")
+		self.assertEqual(self._lessons(), [])
+
+	def test_sai_without_classify_row_names_dash(self):
+		self._judge("Sai", "")
+		(lesson,) = self._lessons()
+		self.assertIn("(Loại —, Nhóm —, Ưu tiên —)", lesson.lesson_text)
+		self.assertTrue(lesson.lesson_text.endswith("Ghi chú người rà: —"), lesson.lesson_text)

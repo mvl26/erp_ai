@@ -20,10 +20,13 @@ def relevant_lessons(
 ) -> list[dict]:
 	"""Active lessons sharing words with the ticket, most relevant first, within the count and size caps.
 
-	Scans the `scan_max` newest active lessons, drops those whose source ticket the bot must not take
-	(a deleted source ticket is not excluded), ranks by matched words, matched words in the situation and
-	`modified`, and stops at the first lesson that would take the total past `max_chars`.
-	Returns `[{name, role, situation, text}]`; `[]` when the ticket has no word to match.
+	The query is the first words of the subject and the plain description (`knowledge.tokenize`). Scans the
+	`scan_max` newest active lessons, drops those whose source ticket the bot must not take (a deleted source
+	ticket is not excluded), and matches a taught rule on its situation and text but every other lesson on its
+	situation only, so the words of a lesson template ("Bot dự đoán", "người chọn", "đề xuất") never decide (R10).
+	Ranks by matched words, matched words in the situation and `modified`, and stops at the first lesson that
+	would take the total past `max_chars`. Returns `[{name, role, situation, text}]`; `[]` when the ticket has
+	no word to match.
 	"""
 	words = list(dict.fromkeys(knowledge.tokenize(f"{subject or ''} {knowledge.plain_text(description)}")))
 	if not words:
@@ -42,8 +45,12 @@ def relevant_lessons(
 	ranked = []
 	for row in rows:
 		situation = row.situation or ""
-		text = row.lesson_text or ""
-		score = knowledge.match_score(words, situation, f"{situation} {text}")
+		searched = (
+			f"{situation} {row.lesson_text or ''}"
+			if row.lesson_source == LESSON_SOURCE_TEACHING
+			else situation
+		)
+		score = knowledge.match_score(words, situation, searched)
 		if score:
 			ranked.append((score[0], score[1], row.modified, row))
 	ranked.sort(key=lambda item: item[2], reverse=True)

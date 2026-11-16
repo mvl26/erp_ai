@@ -17,6 +17,7 @@ from erp_ai.agent.redact import redact_secrets
 from erp_ai.constants import (
 	AGENT_USER,
 	CATEGORIES,
+	CLASSIFICATION_FIELDS,
 	LESSON_DOCTYPE,
 	LESSON_SOURCE_CORRECTION,
 	LESSON_SOURCE_OUTCOME,
@@ -36,7 +37,8 @@ SITUATION_MAX = 300
 TEXT_MAX = 1000
 STEP_CREATE = "Tạo"
 STEP_UPDATE = "Cập nhật"
-CLASSIFICATION_FIELDS = ("ticket_type", "agent_group", "priority")
+# R9: the label of each classification field in a correction lesson.
+CORRECTION_LABELS = {"ticket_type": "Loại", "agent_group": "Nhóm", "priority": "Ưu tiên"}
 STEP_DISABLE = "Tắt"
 STEP_REJECT = "Từ chối"
 SAVEPOINT = "erp_ai_lesson"
@@ -127,8 +129,9 @@ def _store(
 
 	With `updatable`, an existing lesson takes the new situation, text, author and recomputed status and one
 	`Cập nhật` event; a new status clears the last decision, and the same situation, text and status write
-	nothing. Returns None (writes nothing) when learning is off, the ticket is one the bot must not
-	take (NFR-1), the source gives no lesson for this actor, or the text is empty.
+	nothing. A `Bị từ chối` lesson is final: an update finds it and writes nothing (R12). Returns None (writes
+	nothing) when learning is off, the ticket is one the bot must not take (NFR-1), the source gives no lesson
+	for this actor, or the text is empty.
 
 	Raises:
 		frappe.PermissionError: the session user is the agent account.
@@ -155,7 +158,7 @@ def _store(
 			return existing
 		doc = frappe.get_doc(LESSON_DOCTYPE, existing, for_update=True)
 		stored = (doc.situation or "", doc.lesson_text or "", doc.lesson_status)
-		if stored == (situation, lesson_text, status):
+		if doc.lesson_status == LESSON_STATUS_REJECTED or stored == (situation, lesson_text, status):
 			return doc.name
 		if doc.lesson_status != status:
 			doc.update({"reviewed_by": None, "reviewed_at": None})
@@ -183,14 +186,16 @@ def _store(
 	return doc.name
 
 
-def _retire_correction(event_key: str) -> None:
-	"""The person put the classification back to the bot's own: their correction lesson stops being used.
+def _retire(event_key: str) -> str | None:
+	"""The person undid the decision the lesson of `event_key` came from: it stops being used (I5).
 
-	It is the person's own correction, so there is no permission check; any status but active or pending is left.
+	`Đang dùng` becomes `Đã tắt` (step `Tắt`), `Chờ duyệt` becomes `Bị từ chối` (step `Từ chối`), with the session
+	user as reviewer and actor. It undoes the person's own decision, so there is no permission check; any other
+	status, or no lesson for the key, is left as it is. Returns the name of the lesson it retired, else None.
 	"""
 	name = frappe.db.get_value(LESSON_DOCTYPE, {"event_key": event_key}, "name")
 	if not name:
-		return
+		return None
 	user = _actor()
 	doc = frappe.get_doc(LESSON_DOCTYPE, name, for_update=True)
 	if doc.lesson_status == LESSON_STATUS_ACTIVE:
@@ -198,55 +203,75 @@ def _retire_correction(event_key: str) -> None:
 	elif doc.lesson_status == LESSON_STATUS_PENDING:
 		doc.lesson_status, step = LESSON_STATUS_REJECTED, STEP_REJECT
 	else:
-		return
+		return None
 	now = now_datetime()
 	doc.update({"reviewed_by": user, "reviewed_at": now})
 	_add_event(doc, step, user, now)
 	# Only the status and the reviewer change: a link the lesson already holds (a deleted ticket) is not re-checked.
 	doc.flags.ignore_links = True
 	_write(doc)
+	return doc.name
 
 
-def record_correction(ticket: str, log_name: str) -> str | None:
-	"""A person's classification of `ticket` differs from the bot's (the classify row `log_name`): one lesson.
+def record_correction(ticket: str, log_name: str, changed_fields) -> list[str]:
+	"""A person changed `changed_fields` of the classification of `ticket` after the bot's classify row `log_name`.
 
-	The same ticket keeps one lesson, updated by each later correction. When the person's values are again
-	exactly the bot's, no lesson is made and the existing one is retired. Returns the lesson name or None.
+	Each changed field is its own lesson `correction:{ticket}:{field}` (R9), updated by each later change of that
+	field, and names only that field: "Bot dự đoán {label} {predicted}; người chọn {label} {value}.". A field the
+	bot made no prediction for gives none; a field set back to the bot's prediction (None and "" equal) retires its
+	lesson instead. Returns the names of the lessons made or updated.
 	"""
 	user = _actor()
+	fields = [field for field in CLASSIFICATION_FIELDS if field in (changed_fields or ())]
+	if not fields:
+		return []
 	predicted = frappe.db.get_value(
-		LOG_DOCTYPE,
-		log_name,
-		[f"predicted_{field}" for field in CLASSIFICATION_FIELDS],
+		LOG_DOCTYPE, log_name, [f"predicted_{field}" for field in fields], as_dict=True
 	)
-	current = frappe.db.get_value(policy.TICKET_DOCTYPE, ticket, list(CLASSIFICATION_FIELDS))
+	current = frappe.db.get_value(policy.TICKET_DOCTYPE, ticket, fields, as_dict=True)
 	if not predicted or not current:
-		return None
-	event_key = f"correction:{ticket}"
-	if all((before or "") == (after or "") for before, after in zip(predicted, current, strict=True)):
-		_retire_correction(event_key)
-		return None
-	t0, g0, p0 = (value or "—" for value in predicted)
-	t1, g1, p1 = (value or "—" for value in current)
-	return _store(
-		LESSON_SOURCE_CORRECTION,
-		event_key,
-		ticket=ticket,
-		updatable=True,
-		authorized=authority.is_instruction(user, ticket),
-		situation=_ticket_situation(ticket, with_description=True),
-		text=(
-			f"Bot xếp: Loại {t0}, Nhóm {g0}, Ưu tiên {p0}. Người sửa thành: Loại {t1}, Nhóm {g1}, Ưu tiên {p1}."
-		),
-	)
+		return []
+	names, context = [], None
+	for field in fields:
+		bot_value, value = predicted[f"predicted_{field}"] or "", current[field] or ""
+		if not bot_value:
+			continue
+		event_key = f"correction:{ticket}:{field}"
+		if value == bot_value:
+			_retire(event_key)
+			continue
+		if context is None:
+			context = {
+				"authorized": authority.is_instruction(user, ticket),
+				"situation": _ticket_situation(ticket, with_description=True),
+			}
+		label = CORRECTION_LABELS[field]
+		name = _store(
+			LESSON_SOURCE_CORRECTION,
+			event_key,
+			ticket=ticket,
+			updatable=True,
+			text=f"Bot dự đoán {label} {bot_value}; người chọn {label} {value or '—'}.",
+			**context,
+		)
+		if name:
+			names.append(name)
+	return names
 
 
 def record_assignee_change(ticket: str, bot_user: str, new_user: str) -> str | None:
-	"""A person assigned `ticket` to `new_user` after the bot had chosen `bot_user`: one lesson per ticket (AC-6)."""
+	"""A person assigned `ticket` to `new_user` after the bot had chosen `bot_user`: one lesson per ticket (AC-6).
+
+	Giving the ticket back to `bot_user` retires that lesson instead (I5).
+	"""
 	user = _actor()
+	event_key = f"assignee:{ticket}"
+	if new_user == bot_user:
+		_retire(event_key)
+		return None
 	return _store(
 		LESSON_SOURCE_CORRECTION,
-		f"assignee:{ticket}",
+		event_key,
 		ticket=ticket,
 		updatable=True,
 		authorized=authority.is_instruction(user, ticket),
@@ -307,6 +332,11 @@ def record_review_verdict(review_month: str, ticket: str, note: str) -> str | No
 	)
 
 
+def retire_review_verdict(review_month: str, ticket: str) -> str | None:
+	"""The reviewer took back the "Sai" verdict on `ticket`: the lesson that verdict made stops being used (I5)."""
+	return _retire(f"review:{review_month}:{ticket}")
+
+
 def _fold(text: str) -> str:
 	return unicodedata.normalize("NFC", text or "")
 
@@ -314,16 +344,17 @@ def _fold(text: str) -> str:
 def teaching_rule(text: str) -> str | None:
 	"""The rule of a "ghi nhớ:" message, or None when the message is not one or has no rule after the marker.
 
-	The trigger keyword is dropped first (once); then the message must start with the teach marker (case and
-	Unicode form ignored, spaces before the colon ignored). A blank marker setting turns this off.
+	A trigger keyword that starts the message is dropped (never one inside the rule); then the message must start
+	with the teach marker (case and Unicode form ignored, spaces before the colon ignored). A blank marker setting
+	turns this off.
 	"""
 	marker = _fold(policy.lesson_teach_marker())
 	if not marker or not isinstance(text, str):
 		return None
-	body = _fold(text)
-	if keyword := _fold(policy.get_trigger_keyword()).strip():
-		body = re.sub(re.escape(keyword), "", body, count=1, flags=re.IGNORECASE)
-	body = body.strip()
+	body = _fold(text).strip()
+	keyword = _fold(policy.get_trigger_keyword()).strip()
+	if keyword and (lead := re.match(re.escape(keyword), body, flags=re.IGNORECASE)):
+		body = body[lead.end() :].strip()
 	words = marker.rstrip(":").split()
 	if not words:
 		return None
@@ -335,13 +366,17 @@ def teaching_rule(text: str) -> str | None:
 
 
 def record_teaching_message(ticket: str, message_name: str, rule: str) -> str | None:
-	"""A "ghi nhớ:" message: a taught rule, kept only when its author has the authority to instruct the bot."""
+	"""A "ghi nhớ:" message: a taught rule, kept only when its author has the authority to instruct the bot.
+
+	The lesson keeps the ticket link but no situation: the subject is the requester's text and a rule lesson is
+	read as the teacher's rule, so none of it may ride along (R11).
+	"""
 	authorized = authority.run_instructor(ticket, TRIGGER_COMMENT_MENTION, message_name) is not None
 	return _store(
 		LESSON_SOURCE_TEACHING,
 		f"teach:{message_name}",
 		ticket=ticket,
-		situation=_ticket_situation(ticket, with_description=False),
+		situation="",
 		text=rule,
 		authorized=authorized,
 	)

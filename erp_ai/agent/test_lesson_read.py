@@ -9,6 +9,7 @@ from erp_ai.agent.prompts import LESSON_ROLE_DATA, LESSON_ROLE_RULE
 from erp_ai.constants import (
 	LESSON_DOCTYPE,
 	LESSON_SOURCE_CORRECTION,
+	LESSON_SOURCE_OUTCOME,
 	LESSON_SOURCE_TEACHING,
 	LESSON_STATUS_ACTIVE,
 	LESSON_STATUS_DISABLED,
@@ -72,11 +73,27 @@ class TestLessonRead(FrappeTestCase):
 		self.assertEqual([row["name"] for row in self._read()], [three, two, one])
 
 	def test_result_shape(self):
-		name = self._lesson(situation="", text="Máy in cần giấy")
+		name = self._lesson(situation="Máy in", text="cần giấy")
 		self.assertEqual(
 			self._read(),
-			[{"name": name, "role": LESSON_ROLE_DATA, "situation": "", "text": "Máy in cần giấy"}],
+			[{"name": name, "role": LESSON_ROLE_DATA, "situation": "Máy in", "text": "cần giấy"}],
 		)
+
+	def test_template_words_never_decide_relevance(self):
+		# R10: a lesson the bot learned from an event is found by its situation; only a taught rule by its text too
+		situation = "Điều hòa phòng họp"
+		self._lesson(situation=situation, text="Bot dự đoán Nhóm IT; người chọn Nhóm Kho.")
+		self._lesson(
+			situation=situation,
+			text="Đừng làm như vậy: đề xuất Sửa code a.py đã bị từ chối.",
+			source=LESSON_SOURCE_OUTCOME,
+		)
+		rule = self._lesson(
+			situation=situation, text="Người dùng hỏi dự đoán thì trả lời ngay", source=LESSON_SOURCE_TEACHING
+		)
+		rows = self._read(subject="Người dùng hỏi dự đoán đề xuất", description="")
+		self.assertEqual([row["name"] for row in rows], [rule])
+		self.assertEqual(rows[0]["role"], LESSON_ROLE_RULE)
 
 	def test_role_by_source_not_by_text(self):
 		rule = self._lesson(source=LESSON_SOURCE_TEACHING)

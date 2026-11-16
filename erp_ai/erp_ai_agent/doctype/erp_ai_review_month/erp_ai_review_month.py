@@ -23,12 +23,16 @@ class ERPAIReviewMonth(Document):
 		self.stamp_reviewer()
 
 	def on_update(self):
-		"""A verdict newly set to `Sai` teaches the bot one "don't do this" lesson (a failure never blocks the save)."""
+		"""A verdict newly set to `Sai` teaches the bot one "don't do this" lesson; a `Sai` taken back retires it
+		(a failure never blocks the save)."""
 		before = self.get_doc_before_save()
 		previous = {row.name: row.verdict for row in before.items} if before else {}
 		for row in self.items:
-			if row.verdict == "Sai" and previous.get(row.name) != "Sai":
+			was_sai = previous.get(row.name) == "Sai"
+			if row.verdict == "Sai" and not was_sai:
 				lessons.safely(lessons.record_review_verdict, self.name, row.ticket, row.note or "")
+			elif was_sai and row.verdict != "Sai":
+				lessons.safely(lessons.retire_review_verdict, self.name, row.ticket)
 
 	def on_trash(self):
 		refuse_agent_write(self)

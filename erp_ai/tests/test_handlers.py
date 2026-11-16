@@ -1207,6 +1207,9 @@ class TestTaskLifecycle(HandlerTestCase):
 	def test_status_change_enqueues_once(self):
 		ticket = self._ticket_without_job().name
 		task = self._task(ticket)
+		# the Task hook (hooks.py, T161) queued the job of the linked insert: dropped, the saves below are a new
+		# transaction
+		queue._clear_pending_job_ids()
 		self.enqueue.reset_mock()
 
 		same_status = self._saved(task, subject=f"{PREFIX}lifecycle task, renamed")

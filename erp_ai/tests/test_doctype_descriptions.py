@@ -474,12 +474,24 @@ DOCTYPE_CONFIG = {
 		"folder": "erp_ai_kpi_week",
 		"field_count": 17,
 		"phrases": {
-			"week_start": ("thứ Hai", "mỗi tuần một dòng", "KPI-"),
+			"week_start": ("thứ Hai", "mỗi tuần một dòng", "KPI-", "tối đa 8 tuần"),
 			"week_end": ("Chủ nhật",),
 			"computed_at": ("thời điểm", "ranh giới của tuần"),
-			"first_response_median_min": ("KPI 1", "trung vị", "phút", "Rỗng khi mẫu 0"),
-			"first_response_within_15_pct": ("KPI 1", "15 phút", "chưa phản hồi", "Rỗng khi mẫu 0"),
-			"first_response_within_5_pct": ("KPI 1", "5 phút", "chưa phản hồi", "Rỗng khi mẫu 0"),
+			"first_response_median_min": ("KPI 1", "trung vị", "phút", "Rỗng khi không phiếu nào"),
+			# R21a (kpi.py _first_response): the rates divide by every ticket of the week, the sample counts only
+			# the answered ones, so a rate is empty only when the week has no ticket.
+			"first_response_within_15_pct": (
+				"KPI 1",
+				"15 phút",
+				"chưa phản hồi",
+				"Rỗng khi tuần không có phiếu",
+			),
+			"first_response_within_5_pct": (
+				"KPI 1",
+				"5 phút",
+				"chưa phản hồi",
+				"Rỗng khi tuần không có phiếu",
+			),
 			"first_response_sample": ("KPI 1", "số phiếu", "mẫu"),
 			"complete_fields_pct": ("KPI 2", "đang mở", "ưu tiên", "Rỗng khi mẫu 0"),
 			"complete_fields_sample": ("KPI 2", "đang mở"),
@@ -567,6 +579,10 @@ FORBIDDEN_PHRASES = {
 		"predicted_confidence": ("thường khiến", "không được áp dụng"),
 		"stop_reason": ("là lỗi khi gọi nhà cung cấp",),
 		"latency_ms": ("có thể để trống",),
+	},
+	"ERP AI KPI Week": {
+		# FEAT-007 design-w1-fixes-14.md Điểm 3: the median is empty when no ticket of the week has a response (kpi.py:61), not only when the sample is 0.
+		"first_response_median_min": ("Rỗng khi mẫu 0",),
 	},
 }
 

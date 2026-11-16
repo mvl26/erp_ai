@@ -589,11 +589,11 @@ class TestCreateTaskEstimate(FrappeTestCase):
 		_make_user(T26_CUSTOMER, "HD Customer")
 		self.ticket = make_ticket(subject=f"{T167_PREFIX} phiếu", raised_by=T26_CUSTOMER).name
 
-	def _ctx(self):
+	def _ctx(self, ticket=None):
 		run_id = f"{T167_PREFIX}-{frappe.generate_hash(length=10)}"
 		self.addCleanup(lambda: frappe.flags.get("erp_ai_run_tasks", {}).pop(run_id, None))
 		return ToolContext(
-			ticket_name=self.ticket,
+			ticket_name=ticket or self.ticket,
 			effective_level="L1",
 			instructor=T26_INSTRUCTOR,
 			run_id=run_id,
@@ -721,6 +721,80 @@ class TestCreateTaskEstimate(FrappeTestCase):
 				)
 			self.assertFalse(self._create(other, f"{T167_PREFIX} lần mới 4", expected_hours=1)["ok"])
 			self.assertEqual(self._task_count(), 16)
+
+	def _ticket_comments(self, ticket=None):
+		return frappe.db.count(
+			"Comment",
+			{
+				"reference_doctype": "HD Ticket",
+				"reference_name": ticket or self.ticket,
+				"comment_type": "Comment",
+			},
+		)
+
+	def test_same_subject_not_duplicated(self):
+		# AC-63 "chạy lại không tạo trùng", AR3-7: the dedup read goes through locked_count, on the stripped subject;
+		# a subject differing only in outer spaces or letter case is the same Task.
+		subject = f"{T167_PREFIX} Kiểm tra máy in"
+		first = self._create(self._ctx(), subject, expected_hours=1)
+		self.assertTrue(first["ok"], first)
+		duplicate = {"ok": False, "reason": write_ticket.REASON_TASK_DUPLICATE.format(task=first["task"])}
+		cases = {
+			"same run, outer spaces": (self._ctx(), f"  {subject} \t"),
+			"another run, letter case": (self._ctx(), subject.upper()),
+			"another run, same text": (self._ctx(), subject),
+		}
+		for case, (ctx, given) in cases.items():
+			with self.subTest(case):
+				with patch.object(write_ticket, "locked_count", wraps=write_ticket.locked_count) as counted:
+					self.assertEqual(self._create(ctx, given, expected_hours=1), duplicate)
+				counted.assert_called_once_with(
+					self.ticket, "Task", {"ai_ticket": self.ticket, "subject": given.strip()}
+				)
+		self.assertEqual(self._task_count(), 1)
+		with self.subTest("another subject on the ticket, the same subject on another ticket"):
+			self.assertTrue(
+				self._create(self._ctx(), f"{T167_PREFIX} Thay mực máy in", expected_hours=1)["ok"]
+			)
+			other = make_ticket(subject=f"{T167_PREFIX} phiếu khác", raised_by=T26_CUSTOMER).name
+			ctx = self._ctx(other)
+			self.assertTrue(self._create(ctx, subject, expected_hours=1)["ok"])
+			self.assertEqual(self._task_count(), 2)
+		# The stored subject is the stripped one, so a later plain subject still finds it.
+		spaced = self._create(self._ctx(), f"  {T167_PREFIX} Cài driver  ", expected_hours=1)
+		self.assertEqual(frappe.db.get_value("Task", spaced["task"], "subject"), f"{T167_PREFIX} Cài driver")
+		self.assertFalse(self._create(self._ctx(), f"{T167_PREFIX} Cài driver", expected_hours=1)["ok"])
+
+	def test_guidance_run_collects_done_line(self):
+		# AC-66 (a), U8-1: in a guidance run a created Task is a line of "Đã làm"; the tool posts no comment.
+		comments = self._ticket_comments()
+		ctx = self._ctx()
+		write_ticket.open_collector(ctx.run_id)
+		self.addCleanup(write_ticket.close_collector, ctx.run_id)
+		result = self._create(ctx, f"{T167_PREFIX} việc gom", expected_hours=1.5)
+		self.assertTrue(result["ok"], result)
+		analysis, sections = write_ticket.collected(ctx.run_id)
+		self.assertIsNone(analysis)
+		self.assertEqual(
+			sections,
+			{
+				write_ticket.SECTION_DONE: [f"Đã tạo Task {result['task']} (1.5 giờ)."],
+				write_ticket.SECTION_PENDING: [],
+				write_ticket.SECTION_DECIDE: [],
+			},
+		)
+		# A refused call adds no line.
+		self.assertFalse(self._create(ctx, f"{T167_PREFIX} việc gom", expected_hours=1)["ok"])
+		self.assertEqual(len(write_ticket.collected(ctx.run_id)[1][write_ticket.SECTION_DONE]), 1)
+		self.assertEqual(self._ticket_comments(), comments)
+		with self.subTest("not collecting: no line"):
+			plain = self._ctx()
+			self.assertTrue(self._create(plain, f"{T167_PREFIX} việc thường", expected_hours=2)["ok"])
+			self.assertEqual(
+				write_ticket.collected(plain.run_id),
+				(None, {section: [] for section in write_ticket.GUIDANCE_SECTIONS}),
+			)
+			self.assertEqual(self._ticket_comments(), comments)
 
 
 class TestSetClassification(FrappeTestCase):

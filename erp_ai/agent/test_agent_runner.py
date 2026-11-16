@@ -36,6 +36,7 @@ from erp_ai.agent.prompts import (
 	build_reason_system,
 	build_routing_table,
 )
+from erp_ai.agent.queue import requester_reply_key
 from erp_ai.agent.run_log import action_entry, write_entry
 from erp_ai.agent.tools import propose_change, registry, site_api, write_ticket
 from erp_ai.agent.tools.read import TOOL_RESULT_MAX_CHARS
@@ -5536,3 +5537,177 @@ class TestPermissionVectorsLogged(RunnerTestBase):
 			],
 		)
 		self.assertEqual(self._shares(), shares)
+
+
+REQUESTER_REPLY = "requester_reply"
+ALREADY_HANDLED_LOG = "erp_ai skip ticket=%s run_id=%s reason=already_handled"
+
+
+def requester_message(ticket, creation, content=f"{PREFIX}máy in ở kho 2 vẫn báo lỗi"):
+	"""The requester's email on `ticket`: a Communication Received from `raised_by`, stored as is (no hook runs)."""
+	doc = frappe.get_doc(
+		{
+			"doctype": "Communication",
+			"communication_type": "Communication",
+			"communication_medium": "Email",
+			"sent_or_received": "Received",
+			"reference_doctype": "HD Ticket",
+			"reference_name": ticket,
+			"sender": frappe.db.get_value("HD Ticket", ticket, "raised_by"),
+			"subject": f"{PREFIX}trả lời",
+			"content": content,
+			"owner": "Administrator",
+			"modified_by": "Administrator",
+			"creation": creation,
+			"modified": creation,
+		}
+	)
+	doc.db_insert()
+	return doc.name
+
+
+class RequesterReplyRunBase(GuidanceTestBase):
+	"""A ticket with its own requester; every switch of a requester-reply run is set by the test."""
+
+	def setUp(self):
+		super().setUp()
+		set_agent_settings(reply_enabled=0)
+		requester = f"{PREFIX.lower()}requester-{frappe.generate_hash(length=8).lower()}@example.com"
+		frappe.db.set_value("HD Ticket", self.ticket.name, "raised_by", requester, update_modified=False)
+		# the requester's messages are written before the run starts, so every one is older than the run's rows
+		self.since = frappe.utils.add_to_date(frappe.utils.now_datetime(), minutes=-30)
+
+	def _message(self, minutes=0, ticket=None):
+		return requester_message(
+			ticket or self.ticket.name, frappe.utils.add_to_date(self.since, minutes=minutes)
+		)
+
+	def _reply_run(self, communication, ticket=None):
+		runner.run_for_ticket(ticket or self.ticket.name, REQUESTER_REPLY, communication_name=communication)
+
+	def _key(self, communication, ticket=None):
+		return requester_reply_key(ticket or self.ticket.name, communication)
+
+	def _skips(self, ticket=None):
+		rows = frappe.get_all(
+			LOG_DOCTYPE,
+			filters={"ticket": ticket or self.ticket.name, "entry_type": "skip"},
+			fields=["run_id", "trigger", "stop_reason"],
+			order_by="creation asc",
+		)
+		return [(row.run_id, row.trigger, row.stop_reason) for row in rows]
+
+	def _reason_run_ids(self, ticket=None):
+		return set(
+			frappe.get_all(
+				LOG_DOCTYPE,
+				filters={"ticket": ticket or self.ticket.name, "entry_type": "reason"},
+				pluck="run_id",
+			)
+		)
+
+
+class TestRequesterReplyRun(RequesterReplyRunBase):
+	"""AC-41 (T162, U6b-fixes Sửa 1, ADR-033 QĐ 2, 4, 6): the requester-reply run takes the event key as its run_id; an
+	event already handled, moved to another ticket or followed by a newer message of the requester is not run."""
+
+	def test_message_during_run_not_lost(self):
+		# X-1 (ii): M2 arrives while M1's run is with the model; M2's own job runs after it, not "already handled"
+		first, later = self._message(), []
+
+		def reply_during_run(task, kwargs):
+			if not later:
+				later.append(self._message(minutes=1))
+
+		self.gateway.on_call = reply_during_run
+		self._reply_run(first)
+		self.gateway.on_call = None
+		self._reply_run(later[0])
+
+		self.assertEqual(self.gateway.call_count, 2)
+		self.assertEqual(self._skips(), [])
+		self.assertEqual(self._reason_run_ids(), {self._key(first), self._key(later[0])})
+
+	def test_both_messages_before_start_one_model_run(self):
+		# the merge rule: a run that starts after both messages reads both; the older message's job stops
+		first, second = self._message(), self._message(minutes=1)
+
+		self._reply_run(first)
+		self.assertEqual(self.gateway.call_count, 0)
+		self.assertEqual(self._skips(), [(self._key(first), REQUESTER_REPLY, "superseded")])
+
+		self._reply_run(second)
+		self.assertEqual(self.gateway.call_count, 1)
+		self.assertEqual(self._reason_run_ids(), {self._key(second)})
+		self.assertEqual(policy.runs_today(self.ticket.name), 1)
+
+	def test_second_event_after_run_already_handled(self):
+		# B-2: the job of a message that already ran runs again: no model call, no row, one logger line
+		first = self._message()
+		self._reply_run(first)
+		self.assertEqual(self.gateway.call_count, 1)
+		rows = frappe.db.count(LOG_DOCTYPE, {"ticket": self.ticket.name})
+		logger = MagicMock()
+		with patch.object(frappe, "logger", return_value=logger):
+			self._reply_run(first)
+
+		self.assertEqual(self.gateway.call_count, 1)
+		self.assertEqual(frappe.db.count(LOG_DOCTYPE, {"ticket": self.ticket.name}), rows)
+		self.assertEqual(
+			[call.args for call in logger.info.call_args_list if "already_handled" in str(call.args[0])],
+			[(ALREADY_HANDLED_LOG, self.ticket.name, self._key(first))],
+		)
+
+	def test_event_moved_skipped(self):
+		# B-3: the message was moved to another ticket (a merge) before its job ran; a deleted one is missing
+		target = make_ticket(subject=f"{PREFIX}merge target").name
+		moved, gone = self._message(), self._message()
+		frappe.db.set_value("Communication", moved, "reference_name", target, update_modified=False)
+		frappe.db.delete("Communication", gone)
+
+		self._reply_run(moved)
+		self._reply_run(gone)
+
+		self.assertEqual(self.gateway.call_count, 0)
+		self.assertEqual(
+			self._skips(),
+			[
+				(self._key(moved), REQUESTER_REPLY, "event_moved"),
+				(self._key(gone), REQUESTER_REPLY, "event_missing"),
+			],
+		)
+
+	def test_moved_event_runs_on_new_ticket(self):
+		target = make_ticket(subject=f"{PREFIX}merge target").name
+		moved = self._message()
+		frappe.db.set_value("Communication", moved, "reference_name", target, update_modified=False)
+		self._reply_run(moved)
+		self.assertEqual(self._skips(), [(self._key(moved), REQUESTER_REPLY, "event_moved")])
+
+		# the skip row carries the old ticket's key; the target's key is another, so the target's job runs
+		self._reply_run(moved, ticket=target)
+
+		self.assertEqual(self.gateway.call_count, 1)
+		self.assertEqual(self._reason_run_ids(target), {self._key(moved, target)})
+		self.assertEqual(self._skips(target), [])
+
+	def test_daily_limit_reached_no_model_call(self):
+		# the reply run is counted like the other counted triggers (RUN_LIMIT_TRIGGERS, step (d))
+		set_agent_settings(max_runs_per_ticket_per_day=DAILY_LIMIT)
+		self._seed_runs(DAILY_LIMIT)
+		first = self._message()
+
+		self._reply_run(first)
+
+		self.assertEqual(self.gateway.call_count, 0)
+		self.assertEqual(self._skips(), [(self._key(first), REQUESTER_REPLY, "daily_limit")])
+
+	def test_level_l0_skipped(self):
+		# U6b.md:286: the L0 stop holds for every trigger other than ticket_insert
+		set_agent_settings(permission_level="L0")
+		first = self._message()
+
+		self._reply_run(first)
+
+		self.assertEqual(self.gateway.call_count, 0)
+		self.assertEqual(self._skips(), [(self._key(first), REQUESTER_REPLY, "level_L0")])

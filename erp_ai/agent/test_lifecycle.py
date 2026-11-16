@@ -6,6 +6,7 @@ from unittest.mock import patch
 
 import frappe
 from frappe.tests.utils import FrappeTestCase
+from frappe.utils import get_datetime
 from helpdesk.helpdesk.doctype.hd_ticket.hd_ticket import HDTicket
 from helpdesk.test_utils import make_ticket
 
@@ -342,6 +343,7 @@ class TestStatusGuard(LifecycleTestCase):
 						with self.subTest(path=path, category=category, origin=origin_case, switch=switch):
 							frappe.db.savepoint(CASE_SAVEPOINT)
 							self._settings(
+								enabled=1,
 								resolve_on_tasks_done_enabled=int(path == PATH_TASK and switch),
 								close_silent_f_enabled=int(path == PATH_SILENT and switch),
 								field_origin=ORIGIN_FIELD if configured else "",
@@ -362,6 +364,7 @@ class TestStatusGuard(LifecycleTestCase):
 	def test_switches_off_no_status_change_any_job(self):
 		"""AC-42 (a): both switches off: no status change and no log row from either job, configured or not."""
 		self._email_settings()
+		self._settings(enabled=1)
 		tickets = {path: self._path_ticket(path, category="F") for path in (PATH_TASK, PATH_SILENT)}
 		for field_origin in (ORIGIN_FIELD, ""):
 			with self.subTest(field_origin=field_origin):
@@ -378,7 +381,7 @@ class TestStatusGuard(LifecycleTestCase):
 	def test_origin_not_configured_one_log_per_day(self):
 		"""AC-42 (c), A-11: not configured: no path runs; one log row a day, its run_id the day key."""
 		self._email_settings()
-		self._settings(resolve_on_tasks_done_enabled=1, close_silent_f_enabled=1)
+		self._settings(enabled=1, resolve_on_tasks_done_enabled=1, close_silent_f_enabled=1)
 		tickets = {path: self._path_ticket(path, category="F") for path in (PATH_TASK, PATH_SILENT)}
 		day = DAY0 + timedelta(days=10)
 		for case, fields in (
@@ -441,7 +444,7 @@ class TestStatusGuard(LifecycleTestCase):
 	def test_every_status_change_has_log_and_one_comment(self):
 		"""AC-42 (d), ADR-033 Ràng buộc: each path logs one bot_action row and one comment, all by the agent."""
 		self._email_settings()
-		self._settings(resolve_on_tasks_done_enabled=1, close_silent_f_enabled=1)
+		self._settings(enabled=1, resolve_on_tasks_done_enabled=1, close_silent_f_enabled=1)
 		for path, status in ((PATH_TASK, "Resolved"), (PATH_SILENT, "Closed")):
 			with self.subTest(path=path):
 				ticket = self._path_ticket(path, category="F")
@@ -563,7 +566,7 @@ class TestResolveOnTasksDone(LifecycleTestCase):
 
 	def setUp(self):
 		super().setUp()
-		self._settings(resolve_on_tasks_done_enabled=1)
+		self._settings(enabled=1, resolve_on_tasks_done_enabled=1)
 
 	def _run(self, ticket) -> None:
 		lifecycle.run_task_lifecycle(ticket)
@@ -711,7 +714,7 @@ class TestSilentClose(LifecycleTestCase):
 
 	def setUp(self):
 		super().setUp()
-		self._settings(close_silent_f_enabled=1, close_silent_f_days=DAYS)
+		self._settings(enabled=1, close_silent_f_enabled=1, close_silent_f_days=DAYS)
 		self._email_settings()
 
 	def _silent_f(self, category="F", **values) -> str:
@@ -952,12 +955,157 @@ class TestSilentClose(LifecycleTestCase):
 		self.assertEqual(self._counts(open_ticket), self._closed())
 
 
+class TestFixRound1(LifecycleTestCase):
+	"""C11 fix round 1: R16a master switch, R16b commit callbacks, R16c locks, R16d once per ticket."""
+
+	def setUp(self):
+		super().setUp()
+		self._settings(
+			enabled=1, resolve_on_tasks_done_enabled=1, close_silent_f_enabled=1, close_silent_f_days=DAYS
+		)
+		self._email_settings()
+
+	def _silent_f(self, category="F") -> str:
+		ticket = self._ticket(category=category)
+		self._bot_message(ticket, DAY0)
+		return ticket
+
+	def _scan(self, now=SCAN_NOW) -> None:
+		lifecycle.scan_silent_f_tickets(now)
+		frappe.set_user("Administrator")
+
+	def _queued(self, callback) -> bool:
+		return callback in frappe.db.after_commit._functions or callback in frappe.db.before_commit._functions
+
+	def test_master_switch_off_scan_does_nothing(self):
+		"""R16a: the agent switched off, the hourly scan sends nothing and closes nothing."""
+		ticket = self._silent_f()
+		self._settings(enabled=0)
+
+		with patch.object(lifecycle, "send_to_requester") as send:
+			self._scan()
+
+		send.assert_not_called()
+		self.assertEqual(self._status(ticket), "Open")
+		self.assertEqual(self._rows(ticket), [])
+
+	def test_master_switch_off_queued_task_job_does_nothing(self):
+		"""R16a: a run_task_lifecycle queued before the agent was switched off does nothing."""
+		ticket = self._ticket(category="C")
+		self._task(ticket, "Completed")
+		self._settings(enabled=0)
+
+		lifecycle.run_task_lifecycle(ticket)
+		frappe.set_user("Administrator")
+
+		self._assert_unchanged(ticket)
+
+	def test_savepoint_rollback_drops_commit_callbacks_scan(self):
+		"""R16b: a commit callback queued inside the failing save does not survive the rollback."""
+		ticket = self._silent_f()
+		callback = lambda: None  # noqa: E731
+		real = HDTicket.save
+
+		def save(doc, *args, **kwargs):
+			if doc.status == "Closed":
+				frappe.db.after_commit.add(callback)
+				frappe.db.before_commit.add(callback)
+				raise frappe.ValidationError("ERPAI-TEST injected failure")
+			return real(doc, *args, **kwargs)
+
+		with patch.object(HDTicket, "save", save):
+			self._scan()
+
+		self.assertEqual(self._error_logs(ticket), 1)
+		self.assertFalse(self._queued(callback))
+
+	def test_savepoint_rollback_drops_commit_callbacks_notice_failure(self):
+		"""R16b: the notice-failure path resets the queues too."""
+		self._silent_f()
+		callback = lambda: None  # noqa: E731
+
+		def reply(doc, *args, **kwargs):
+			frappe.db.after_commit.add(callback)
+			raise frappe.OutgoingEmailError("ERPAI-TEST no account")
+
+		with patch.object(HDTicket, "reply_via_agent", reply):
+			self._scan()
+
+		self.assertFalse(self._queued(callback))
+
+	def test_savepoint_rollback_drops_commit_callbacks_task_job(self):
+		"""R16b: the Task job resets the queues after its rollback."""
+		ticket = self._ticket(category="C")
+		self._task(ticket, "Completed")
+		callback = lambda: None  # noqa: E731
+
+		def new_comment(doc, *args, **kwargs):
+			frappe.db.after_commit.add(callback)
+			raise frappe.ValidationError("ERPAI-TEST injected failure")
+
+		with patch.object(HDTicket, "new_comment", new_comment):
+			lifecycle.run_task_lifecycle(ticket)
+		frappe.set_user("Administrator")
+
+		self.assertEqual(self._error_logs(ticket), 1)
+		self.assertFalse(self._queued(callback))
+
+	def test_scan_commits_once_per_skipped_candidate(self):
+		"""R16c: no row lock outlives its ticket: the scan commits after each candidate, skipped ones included."""
+		tickets = [self._silent_f(category="C"), self._silent_f(category="E"), self._silent_f(category="C")]
+		candidates = [
+			name
+			for name in lifecycle._silent_f_candidates(SCAN_NOW - timedelta(days=DAYS))
+			if name in tickets
+		]
+		self.assertEqual(len(candidates), 3)
+
+		with (
+			patch.dict(frappe.flags, {"in_test": False}),
+			patch.object(frappe.db, "commit") as commit,
+		):
+			lifecycle.scan_silent_f_tickets(SCAN_NOW)
+		frappe.set_user("Administrator")
+
+		self.assertEqual(commit.call_count, 3)
+
+	def test_cheap_checks_before_the_row_lock(self):
+		"""R16c (Minor): a refused or non-F ticket never takes the lock."""
+		tickets = [self._silent_f(category="C"), self._silent_f(category="E")]
+		locked = []
+
+		with patch.object(lifecycle, "_locked_status_category", side_effect=lambda t: locked.append(t)):
+			self._scan()
+
+		self.assertEqual([name for name in locked if name in tickets], [])
+
+	def test_reopened_ticket_not_closed_twice(self):
+		"""R16d: closed once, reopened by a person, silent again: no second close and no second notice."""
+		ticket = self._silent_f()
+		self._scan()
+		self.assertEqual(self._status(ticket), "Closed")
+		self.assertEqual(len(self._rows(ticket)), 1)
+		frappe.db.set_value(
+			"HD Ticket", ticket, {"status": "Open", "status_category": "Open"}, update_modified=False
+		)
+		last_bot = frappe.db.get_value(
+			"Communication", lifecycle._bot_messages(ticket), "creation", order_by="creation desc"
+		)
+
+		with patch.object(lifecycle, "send_to_requester") as send:
+			self._scan(get_datetime(last_bot) + timedelta(days=DAYS * 2))
+
+		send.assert_not_called()
+		self.assertEqual(self._status(ticket), "Open")
+		self.assertEqual(len(self._rows(ticket)), 1)
+
+
 class TestArchitecture(LifecycleTestCase):
 	def test_setting_unchanged_after_jobs(self):
 		"""ADR-033 QĐ 1: under the agent account neither job writes ERP AI Setting, whether it changes a status
 		or only logs the missing configuration."""
 		self._email_settings()
-		self._settings(resolve_on_tasks_done_enabled=1, close_silent_f_enabled=1)
+		self._settings(enabled=1, resolve_on_tasks_done_enabled=1, close_silent_f_enabled=1)
 		tickets = {path: self._path_ticket(path, category="F") for path in (PATH_TASK, PATH_SILENT)}
 		for field_origin in (ORIGIN_FIELD, ""):
 			with self.subTest(field_origin=field_origin):

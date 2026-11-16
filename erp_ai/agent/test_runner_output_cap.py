@@ -6,10 +6,11 @@ All of it is seen through the fake model gateway.
 """
 
 import json
+from unittest.mock import patch
 
 import frappe
 
-from erp_ai.agent import authority
+from erp_ai.agent import answer_delay, authority
 from erp_ai.agent.runner import CUT_REASON, CUT_TOOL_RESULT, REASON_MAX_TOKENS, STOP_MAX_TOKENS
 from erp_ai.agent.test_agent_runner import SANDBOX_APP, SANDBOX_REL, tool_use
 from erp_ai.agent.test_runner_propose_now import CLASSIFY_C_85, ProposeNowBase
@@ -140,3 +141,17 @@ class TestOutputCap(ProposeNowBase):
 		self.assertEqual(self._proposals(), [])
 		self.assertFalse([c for c in self._comment_contents() if CUT_COMMENT in (c or "")])
 		self.assertEqual([e.stop_reason for e in self._entries(entry_type="reason")], [STOP_MAX_TOKENS])
+
+	def test_a_cut_answer_does_not_use_up_the_answer_delay(self):
+		# the delay of an @ai run waits before the answer that runs, not before a cut one that is discarded
+		set_agent_settings(max_turns_per_run=5)
+		self.gateway.results = [
+			CLASSIFY_C_85,
+			cut_turn(self._cut_post_comment()),
+			tool_turn_of(tool_use("toolu_a", "post_comment", content="nhận định đủ")),
+			make_model_result(),
+		]
+		with patch.object(answer_delay.AnswerDelay, "wait_before_answer", return_value=0) as wait:
+			self._run("comment_mention")
+			self.assertEqual(len(self._reason_calls()), 3)
+			self.assertEqual(wait.call_count, 1)

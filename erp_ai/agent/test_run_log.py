@@ -1,17 +1,21 @@
 import copy
 import json
+from collections import Counter
+from datetime import datetime, timedelta
 from unittest.mock import patch
 
 import frappe
 import frappe.client
 from frappe.tests.utils import FrappeTestCase
+from helpdesk.test_utils import make_ticket
 
-from erp_ai.agent import queue, redact, run_log
+from erp_ai.agent import daily_report, missed_scan, policy, queue, redact, run_log
 from erp_ai.agent.agent_write_guard import AGENT_WRITE_FLAG
 from erp_ai.agent.tools.site_api import SCRUBBED_VALUE, SECRET_FIELDS
-from erp_ai.constants import AGENT_USER, HELPDESK_AGENT_ROLE, LOG_DOCTYPE, ROLE_AGENT
+from erp_ai.constants import AGENT_USER, HELPDESK_AGENT_ROLE, LOG_DOCTYPE, ROLE_AGENT, SETTING_DOCTYPE
 from erp_ai.erp_ai_agent.doctype.erp_ai_log.erp_ai_log import ERPAILog
-from erp_ai.test_utils import make_change_proposal, make_log_entry
+from erp_ai.erp_ai_agent.report.erp_ai_cost import erp_ai_cost
+from erp_ai.test_utils import keep_agent_settings, make_change_proposal, make_log_entry, set_agent_settings
 
 AI_USER = "erpai-test-run-log-agent@example.com"
 HD_AGENT_USER = "erpai-test-run-log-hd-agent@example.com"
@@ -240,7 +244,8 @@ class TestRunLog(FrappeTestCase):
 		meta = frappe.get_meta(LOG_DOCTYPE)
 		self.assertEqual(
 			meta.get_field("entry_type").options.split("\n"),
-			["classify", "reason", "skip", "change", "bot_action"],
+			# CHG-009 (ADR-048 QĐ 1, design 2): run_event added last.
+			["classify", "reason", "skip", "change", "bot_action", "run_event"],
 		)
 		self.assertEqual(
 			meta.get_field("trigger").options.split("\n"),
@@ -663,7 +668,10 @@ class TestBotAction(_RollbackCase):
 
 	def test_bot_action_needs_known_trigger_actions_and_zero_cost(self):
 		self.assertEqual(run_log.ENTRY_TYPE_BOT_ACTION, "bot_action")
-		self.assertEqual(run_log.ENTRY_TYPES, ("classify", "reason", "skip", "change", "bot_action"))
+		# CHG-009 (ADR-048 QĐ 1, design 3.4): run_event added last.
+		self.assertEqual(
+			run_log.ENTRY_TYPES, ("classify", "reason", "skip", "change", "bot_action", "run_event")
+		)
 		self.assertEqual(run_log.TRIGGER_SETTING_SAVE, "setting_save")
 		self.assertEqual(run_log.TRIGGER_SCHEDULED_JOB, "scheduled_job")
 		self.assertEqual(run_log.BOT_ACTION_TRIGGERS, ("setting_save", "scheduled_job"))
@@ -760,3 +768,295 @@ class TestTriggers(FrappeTestCase):
 			frappe.get_meta(LOG_DOCTYPE).get_field("trigger").options.split("\n"),
 			[*run_log.TRIGGERS, *run_log.CHANGE_TRIGGERS, *run_log.BOT_ACTION_TRIGGERS],
 		)
+
+
+# CHG-009 (design 2, 3.4, 3.8; ADR-048 QĐ 1, 5): the run_event row, its codes and the Error Log title of a
+# failed write, spelled as the design writes them.
+RUN_EVENT = "run_event"
+CALL_CODES = ("call_received", "call_merged", "call_busy", "run_done", "run_failed")
+RUN_CODES = ("call_received", "run_done", "run_failed")
+REFUSAL_CODES = (
+	"agent_disabled",
+	"created_by_agent",
+	"prefilled",
+	"not_sendable:opted_out",
+	"not_sendable:excluded_team",
+	"not_sendable:excluded_title",
+	"not_sendable:excluded_by_classification",
+)
+EVENT_FAILED_TITLE = "erp_ai: ghi trạng thái bot lỗi"
+PORTAL_USER = "erpai-test-run-event-portal@example.com"
+# Text an exception may carry (ticket content); it must never reach the Error Log message.
+SECRET_TEXT = "ERPAI-TEST nội dung phiếu bí mật"
+EVENT_ROW_FIELDS = (
+	"entry_type",
+	"ticket",
+	"trigger",
+	"stop_reason",
+	"run_id",
+	"cost_usd",
+	"site_environment",
+	"error",
+	"actions",
+)
+
+
+class _EventCase(_RollbackCase):
+	def setUp(self):
+		super().setUp()
+		keep_agent_settings(self)
+		set_agent_settings(enabled=0)
+		# Error Log rows outlive the test transaction and ticket names are reused: count only the new ones.
+		self.old_error_logs = set(
+			frappe.get_all("Error Log", filters={"method": EVENT_FAILED_TITLE}, pluck="name")
+		)
+
+	@staticmethod
+	def _ticket(subject="ERPAI-TEST-run-event ticket") -> str:
+		return str(make_ticket(subject=subject).name)
+
+	@staticmethod
+	def _events(ticket=None) -> list:
+		filters = {"entry_type": RUN_EVENT, **({"ticket": ticket} if ticket else {})}
+		return frappe.get_all(LOG_DOCTYPE, filters=filters, pluck="name")
+
+	def _error_messages(self) -> list:
+		"""The messages of the event-write Error Log rows written since setUp."""
+		rows = frappe.get_all("Error Log", filters={"method": EVENT_FAILED_TITLE}, fields=["name", "error"])
+		return [row.error for row in rows if row.name not in self.old_error_logs]
+
+
+class TestRecordEvent(_EventCase):
+	def test_each_code_writes_one_row_of_codes_only(self):
+		ticket = self._ticket()
+		self.assertEqual(set(run_log.EVENT_CODES), {*CALL_CODES, *REFUSAL_CODES})
+		self.assertEqual(set(run_log.RUN_EVENT_CODES), set(RUN_CODES))
+		triggers = ("requester_reply", "kb_draft", "comment_mention", "ticket_insert")
+		calls = [
+			(
+				code,
+				triggers[index % len(triggers)],
+				f"ERPAI-TEST-event-{index}" if code in RUN_CODES else None,
+			)
+			for index, code in enumerate((*CALL_CODES, *REFUSAL_CODES))
+		]
+		# a blank run id on a code without a run is no run: stored empty, never "" (a run of its own)
+		calls.append(("call_busy", "comment_mention", ""))
+		with patch("erp_ai.agent.policy.site_environment", return_value="test"):
+			for code, trigger, run_id in calls:
+				with self.subTest(code=code, run_id=run_id):
+					name = run_log.record_event(ticket=ticket, trigger=trigger, code=code, run_id=run_id)
+					self.assertIsNotNone(name)
+					row = frappe.db.get_value(LOG_DOCTYPE, name, EVENT_ROW_FIELDS, as_dict=True)
+					# design 2: the other columns stay empty; Frappe would fill this Select with "propose"
+					self.assertFalse(frappe.db.get_value(LOG_DOCTYPE, name, "change_step"))
+					self.assertEqual(
+						{**row},
+						{
+							"entry_type": RUN_EVENT,
+							"ticket": ticket,
+							"trigger": trigger,
+							"stop_reason": code,
+							"run_id": run_id or None,
+							"cost_usd": 0,
+							"site_environment": "test",
+							"error": None,
+							"actions": None,
+						},
+					)
+		self.assertEqual(len(self._events(ticket)), len(calls))
+		self.assertEqual(self._error_messages(), [])
+
+	def test_never_commits(self):
+		ticket = self._ticket()
+		self.addCleanup(setattr, frappe.flags, "in_test", frappe.flags.in_test)
+		frappe.flags.in_test = False
+		with patch.object(frappe.db, "commit") as commit:
+			written = run_log.record_event(ticket=ticket, trigger="comment_mention", code="call_merged")
+			refused = run_log.record_event(ticket=ticket, trigger="comment_mention", code="ERPAI-TEST-bogus")
+		commit.assert_not_called()
+		self.assertIsNotNone(written)
+		self.assertIsNone(refused)
+
+	def test_portal_user_and_agent_account_write(self):
+		ticket = self._ticket()
+		if not frappe.db.exists("User", PORTAL_USER):
+			user = frappe.new_doc("User")
+			user.update({"email": PORTAL_USER, "first_name": "portal", "send_welcome_email": 0})
+			user.insert(ignore_permissions=True)
+		self.assertEqual(frappe.db.get_value("User", PORTAL_USER, "user_type"), "Website User")
+		for user in (PORTAL_USER, AGENT_USER):
+			with self.subTest(user=user):
+				frappe.set_user(user)
+				name = run_log.record_event(
+					ticket=ticket,
+					trigger="requester_reply",
+					code="call_received",
+					run_id=f"ERPAI-TEST-{user}",
+				)
+				frappe.set_user("Administrator")
+				self.assertIsNotNone(name)
+				self.assertEqual(frappe.db.get_value(LOG_DOCTYPE, name, "owner"), user)
+				self.assertFalse(frappe.flags.get(AGENT_WRITE_FLAG))
+		self.assertEqual(self._error_messages(), [])
+
+	def test_wrong_code_run_id_or_trigger_logs_one_code_only_error(self):
+		ticket = self._ticket()
+		cases = {
+			"unknown code": {"code": "ERPAI-TEST-bogus"},
+			"no code": {"code": None},
+			"refusal kind missing": {"code": "not_sendable:missing"},
+			"not_sendable without its kind": {"code": "not_sendable"},
+			"a code of skip rows only": {"code": "level_L0"},
+			"run id on a merged call": {"code": "call_merged", "run_id": "ERPAI-TEST-run"},
+			"run id on a refusal": {"code": "prefilled", "run_id": "ERPAI-TEST-run"},
+			"no run id on a received call": {"code": "call_received"},
+			"blank run id on a finished run": {"code": "run_done", "run_id": "  "},
+			"trigger of another row type": {"code": "call_busy", "trigger": "change_action"},
+		}
+		for case, values in cases.items():
+			call = {"ticket": ticket, "trigger": "comment_mention", **values}
+			before = self._error_messages()
+			with self.subTest(case=case):
+				self.assertIsNone(run_log.record_event(**call))
+				self.assertEqual(self._events(ticket), [])
+				new = list((Counter(self._error_messages()) - Counter(before)).elements())
+				self.assertEqual(
+					new,
+					[f"ticket={ticket} trigger={call['trigger']} code={call['code']} error=ValueError"],
+				)
+
+	def test_missing_ticket_writes_nothing(self):
+		events, errors = self._events(), self._error_messages()
+		for ticket in ("ERPAI-TEST-no-such-ticket", None):
+			with self.subTest(ticket=ticket):
+				self.assertIsNone(
+					run_log.record_event(
+						ticket=ticket, trigger="ticket_insert", code="call_received", run_id="r"
+					)
+				)
+		self.assertEqual(self._events(), events)
+		self.assertEqual(self._error_messages(), errors)
+
+	def test_failure_after_insert_undoes_only_the_event(self):
+		ticket = self._ticket()
+		kept = make_log_entry(ticket=ticket, entry_type="reason", trigger="comment_mention")
+		with patch.object(
+			ERPAILog, "after_insert", create=True, side_effect=RuntimeError(SECRET_TEXT)
+		) as hook:
+			result = run_log.record_event(ticket=ticket, trigger="comment_mention", code="call_merged")
+		hook.assert_called_once()  # the row was inserted before the failure
+		self.assertIsNone(result)
+		self.assertTrue(frappe.db.exists(LOG_DOCTYPE, kept))
+		self.assertEqual(self._events(ticket), [])
+		self.assertEqual(
+			self._error_messages(),
+			[f"ticket={ticket} trigger=comment_mention code=call_merged error=RuntimeError"],
+		)
+
+	def test_failing_rollback_or_error_log_is_dropped(self):
+		ticket = self._ticket()
+		with (
+			patch.object(ERPAILog, "after_insert", create=True, side_effect=RuntimeError(SECRET_TEXT)),
+			patch.object(frappe.db, "rollback", side_effect=RuntimeError("rollback")) as rollback,
+			patch.object(frappe, "log_error", side_effect=RuntimeError("log")) as log_error,
+		):
+			result = run_log.record_event(ticket=ticket, trigger="kb_draft", code="run_failed", run_id="r1")
+		self.assertIsNone(result)
+		rollback.assert_called()
+		log_error.assert_called_once()
+
+	def test_write_entry_run_event_takes_no_actions_error_or_cost(self):
+		ticket = self._ticket()
+		row = {
+			"entry_type": RUN_EVENT,
+			"ticket": ticket,
+			"trigger": "comment_mention",
+			"stop_reason": "call_busy",
+		}
+		for case, extra in {
+			"actions": {"actions": ACTIONS},
+			"error": {"error": "ERPAI-TEST lỗi"},
+			"cost": {"cost_usd": 0.5},
+		}.items():
+			with self.subTest(case=case), self.assertRaises(ValueError):
+				run_log.write_entry(**row, **extra)
+		self.assertEqual(self._events(ticket), [])
+
+
+# A window no live row can fall into: every row the test needs gets its `creation` set inside it.
+NUMBERS_ENABLED_AT = datetime(2097, 3, 1, 0, 0, 0)
+NUMBERS_NOW = datetime(2097, 3, 4, 12, 0, 0)
+NUMBERS_MAX_RUNS = 2
+
+
+class TestRunEventRowsChangeNoNumbers(_EventCase):
+	"""NFR-3 / ADR-048 QĐ 5: the same data plus run_event rows gives the same numbers (DD-1, the received
+	call whose job never ran, is not asserted: the received row here carries the run id of a real run)."""
+
+	def setUp(self):
+		super().setUp()
+		set_agent_settings(
+			agent_enabled_at=NUMBERS_ENABLED_AT,
+			max_runs_per_ticket_per_day=NUMBERS_MAX_RUNS,
+			excluded_teams="",
+			excluded_title_prefixes="",
+		)
+		frappe.db.value_cache.pop(SETTING_DOCTYPE, None)
+
+	def _at(self, name, minutes_before_now):
+		creation = NUMBERS_NOW - timedelta(minutes=minutes_before_now)
+		frappe.db.set_value(LOG_DOCTYPE, name, "creation", creation, update_modified=False)
+
+	def _numbers(self, ticket) -> dict:
+		day = NUMBERS_NOW.date()
+		_columns, by_ticket, *_rest = erp_ai_cost.execute(
+			{"from_date": day, "to_date": day, "group_by": erp_ai_cost.BY_TICKET}, now=NUMBERS_NOW
+		)
+		return {
+			"runs_today": policy.runs_today(ticket, NUMBERS_NOW),
+			"cost_by_ticket": [row for row in by_ticket if row["ticket"] == ticket],
+			"bot_day": daily_report._bot_day(NUMBERS_NOW + timedelta(days=1)),
+			"missed": [name for name in missed_scan.find_missed_tickets(NUMBERS_NOW) if name == ticket],
+		}
+
+	def test_same_numbers(self):
+		ticket = self._ticket("ERPAI-TEST-run-event numbers")
+		frappe.db.set_value(
+			"HD Ticket",
+			ticket,
+			{
+				"ticket_type": "Unspecified",
+				"priority": "Medium",
+				"agent_group": None,
+				"creation": NUMBERS_NOW - timedelta(hours=1),
+			},
+			update_modified=False,
+		)
+		run_id = "ERPAI-TEST-run-event-real-run"
+		for entry_type, cost, minutes in (("classify", 0.001234, 40), ("reason", 0.012345, 39)):
+			name = make_log_entry(
+				ticket=ticket, entry_type=entry_type, run_id=run_id, applied=1, cost_usd=cost
+			)
+			self._at(name, minutes)
+		before = self._numbers(ticket)
+		# the sample counts: one run of the ticket today, in the report and in the scan
+		self.assertEqual(before["runs_today"], 1)
+		self.assertEqual([row["runs"] for row in before["cost_by_ticket"]], [1])
+		self.assertEqual(before["missed"], [ticket])
+
+		events = (
+			("ticket_insert", "call_received", run_id),
+			("ticket_insert", "run_done", run_id),
+			("comment_mention", "call_merged", None),
+			("comment_mention", "call_busy", None),
+			("requester_reply", "agent_disabled", ""),
+			("requester_reply", "not_sendable:opted_out", None),
+		)
+		for minutes, (trigger, code, event_run_id) in enumerate(events, start=20):
+			name = run_log.record_event(ticket=ticket, trigger=trigger, code=code, run_id=event_run_id)
+			self.assertIsNotNone(name, code)
+			self._at(name, minutes)
+		self.assertEqual(len(self._events(ticket)), len(events))
+
+		self.assertEqual(self._numbers(ticket), before)

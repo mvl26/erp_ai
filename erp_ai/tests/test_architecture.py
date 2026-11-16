@@ -1810,7 +1810,8 @@ TODO_DOCTYPE = "ToDo"
 DOC_CREATE_CALLS = ("get_doc", "new_doc")
 SHARE_BYPASS_NAMES = ("ignore_share_permission", "add_docshare")
 SHARE_BYPASS_SUFFIXES = ("assign_to._add", "frappe.share.add")
-ENTRY_TYPES_EXPECTED = ("classify", "reason", "skip", "change", "bot_action")
+# CHG-009 (ADR-048 QĐ 1): run_event added last.
+ENTRY_TYPES_EXPECTED = ("classify", "reason", "skip", "change", "bot_action", "run_event")
 
 # `_assign` is the denormalised JSON column of HD Ticket. Routing must read ToDo through site_facts instead.
 # authority.py (FEAT-002, "who may instruct the bot") predates routing and is the one reader allowed.
@@ -2050,7 +2051,7 @@ def check_no_default_people_in_agent_python(sources: dict) -> list:
 
 
 def check_entry_types_unchanged(sources: dict) -> list:
-	"""ADR-019 QĐ 7 + ADR-012 QĐ 6 + FEAT-007 U3: the log keeps its five entry types, in the code and in the DocType options."""
+	"""ADR-019 QĐ 7 + ADR-012 QĐ 6 + FEAT-007 U3 + ADR-048 QĐ 1: the log keeps its six entry types, in the code and in the DocType options."""
 	run_log, doctype = sources.get(RUN_LOG_FILE), sources.get(LOG_DOCTYPE_FILE)
 	if run_log is None:
 		return _missing(RUN_LOG_FILE)
@@ -8005,32 +8006,45 @@ class TestScannersCatchViolations(unittest.TestCase):
 		)
 
 	def test_entry_types_scanner_catches_new_type_in_code_or_doctype(self):
-		run_log = 'ENTRY_TYPES = ("classify", "reason", "skip", "change", "bot_action")\n'
+		# CHG-009 (ADR-048 QĐ 1): the compliant sample carries run_event; the five types before it are now caught.
+		run_log = 'ENTRY_TYPES = ("classify", "reason", "skip", "change", "bot_action", "run_event")\n'
 		doctype = json.dumps(
-			{"fields": [{"fieldname": "entry_type", "options": "classify\nreason\nskip\nchange\nbot_action"}]}
+			{
+				"fields": [
+					{
+						"fieldname": "entry_type",
+						"options": "classify\nreason\nskip\nchange\nbot_action\nrun_event",
+					}
+				]
+			}
 		)
 		good = {RUN_LOG_FILE: run_log, LOG_DOCTYPE_FILE: doctype}
 		self.assertEqual(check_entry_types_unchanged(good), [])
 		extra = {
 			**good,
-			RUN_LOG_FILE: 'ENTRY_TYPES = ("classify", "reason", "skip", "change", "bot_action", "route")\n',
+			RUN_LOG_FILE: 'ENTRY_TYPES = ("classify", "reason", "skip", "change", "bot_action", "run_event", "route")\n',
 		}
 		self.assertCaught(check_entry_types_unchanged(extra), "ENTRY_TYPES")
 		without_change = {**good, RUN_LOG_FILE: 'ENTRY_TYPES = ("classify", "reason", "skip", "change")\n'}
 		self.assertCaught(check_entry_types_unchanged(without_change), "ENTRY_TYPES")
+		without_run_event = {
+			**good,
+			RUN_LOG_FILE: 'ENTRY_TYPES = ("classify", "reason", "skip", "change", "bot_action")\n',
+		}
+		self.assertCaught(check_entry_types_unchanged(without_run_event), "ENTRY_TYPES")
 		options = json.dumps(
 			{
 				"fields": [
 					{
 						"fieldname": "entry_type",
-						"options": "classify\nreason\nskip\nchange\nbot_action\nroute",
+						"options": "classify\nreason\nskip\nchange\nbot_action\nrun_event\nroute",
 					}
 				]
 			}
 		)
 		self.assertCaught(check_entry_types_unchanged({**good, LOG_DOCTYPE_FILE: options}), "options")
 		old_options = json.dumps(
-			{"fields": [{"fieldname": "entry_type", "options": "classify\nreason\nskip\nchange"}]}
+			{"fields": [{"fieldname": "entry_type", "options": "classify\nreason\nskip\nchange\nbot_action"}]}
 		)
 		self.assertCaught(check_entry_types_unchanged({**good, LOG_DOCTYPE_FILE: old_options}), "options")
 		computed = {**good, RUN_LOG_FILE: "ENTRY_TYPES = tuple(x)\n"}
@@ -11412,6 +11426,231 @@ class TestTicketPolicyRules(unittest.TestCase):
 					"not a string literal",
 				),
 				"the declaration gone": ({CONSTANTS_FILE: clean[CONSTANTS_FILE]}, "missing or not a literal"),
+			},
+		)
+
+
+# ---------------------------------------------------------------------------------------------------
+# ADR-048 Ràng buộc (CHG-009 design 8.2): the RQ job-state reads live only in agent/queue.py; handlers.py and
+# agent/queue.py never commit (an event row rides the person's transaction); comment_after_insert still starts
+# with step 0
+# ---------------------------------------------------------------------------------------------------
+
+RQ_JOB_READS = ("get_job", "get_job_status", "is_job_enqueued")
+RQ_JOB_CLASS = "Job"
+RQ_JOB_FETCH = "fetch"
+RQ_JOB_READ_FILE = QUEUE_FILE
+EVENT_NO_COMMIT_FILES = (HANDLERS_FILE, QUEUE_FILE)
+COMMENT_HOOK = "comment_after_insert"
+# Step 0 tests the comment's own fields, never the database: the hook fires for every Comment of the site.
+COMMENT_STEP_ZERO_FIELD = "reference_doctype"
+
+
+def _rq_job_read(node, aliases: dict) -> str | None:
+	"""The RQ job-state read `node` names (a name, an attribute, an imported name or `Job.fetch`), else None."""
+	if isinstance(node, ast.alias):
+		name = node.name.rpartition(".")[2]
+	elif isinstance(node, ast.Attribute) and node.attr == RQ_JOB_FETCH:
+		job = resolved_name(node.value, aliases).rpartition(".")[2]
+		return f"{RQ_JOB_CLASS}.{RQ_JOB_FETCH}" if job == RQ_JOB_CLASS else None
+	else:
+		name = referenced_name(node)
+	return name if name in RQ_JOB_READS else None
+
+
+def check_rq_job_reads_only_in_queue(sources: dict) -> list:
+	"""ADR-048 Ràng buộc: `get_job`, `get_job_status`, `is_job_enqueued` and `Job.fetch` only in agent/queue.py."""
+	violations = []
+	for rel, source in only_python(sources).items():
+		if rel == RQ_JOB_READ_FILE:
+			continue
+		tree = parse(rel, source)
+		aliases = import_aliases(tree)
+		for node in ast.walk(tree):
+			read = _rq_job_read(node, aliases)
+			if read:
+				violations.append(
+					violation(
+						rel, node, f"reads the RQ job state ({read}) outside {RQ_JOB_READ_FILE} (ADR-048)"
+					)
+				)
+	return violations
+
+
+def check_no_commit_in_event_request_files(sources: dict) -> list:
+	"""ADR-048 Ràng buộc: handlers.py and agent/queue.py never call `frappe.db.commit()`."""
+	violations = []
+	for rel in EVENT_NO_COMMIT_FILES:
+		if rel not in sources:
+			violations.extend(_missing(rel))
+			continue
+		tree = parse(rel, sources[rel])
+		aliases = import_aliases(tree)
+		violations.extend(
+			violation(rel, node, f"calls {COMMIT_CALL}() (ADR-048)")
+			for node in ast.walk(tree)
+			if isinstance(node, ast.Call) and resolved_name(node.func, aliases) == COMMIT_CALL
+		)
+	return violations
+
+
+def check_comment_hook_starts_with_step_zero(sources: dict) -> list:
+	"""ADR-048 Ràng buộc: the first statement of `comment_after_insert` (after a docstring) is still step 0: an
+	`if` on the comment's own `reference_doctype`, with no call in its test and no `else`, that only returns."""
+	if HANDLERS_FILE not in sources:
+		return _missing(HANDLERS_FILE)
+	function = _module_functions(parse(HANDLERS_FILE, sources[HANDLERS_FILE])).get(COMMENT_HOOK)
+	if function is None:
+		return [f"{HANDLERS_FILE}: no function {COMMENT_HOOK} (ADR-048)"]
+	body = function.body[1:] if ast.get_docstring(function) is not None else function.body
+	first = body[0] if body else function
+	is_step_zero = (
+		isinstance(first, ast.If)
+		and COMMENT_STEP_ZERO_FIELD in {referenced_name(node) for node in ast.walk(first.test)}
+		and not any(isinstance(node, ast.Call) for node in ast.walk(first.test))
+		and not first.orelse
+		and len(first.body) == 1
+		and isinstance(first.body[0], ast.Return)
+		and first.body[0].value is None
+	)
+	if is_step_zero:
+		return []
+	return [violation(HANDLERS_FILE, first, f"the first statement of {COMMENT_HOOK} is not step 0 (ADR-048)")]
+
+
+# Clean samples of the three rules: queue.py reads the RQ job state, the comment hook writes its event row after
+# step 0 and nothing commits.
+EVENT_WRITE_SAMPLE = {
+	QUEUE_FILE: (
+		"from frappe.utils.background_jobs import get_job, get_job_status, is_job_enqueued\n"
+		"from rq.job import Job\n\n\n"
+		"def enqueue_agent_run(job_id):\n"
+		"\tjob = get_job(job_id) or Job.fetch(job_id)\n"
+		"\treturn is_job_enqueued(job_id) or get_job_status(job_id) or job\n"
+	),
+	HANDLERS_FILE: (
+		"import frappe\n\n"
+		"from erp_ai.agent import run_log\n\n\n"
+		"def comment_after_insert(doc, method=None):\n"
+		'\t"""Step 0 first: every Comment of the site reaches this hook."""\n'
+		'\tif doc.reference_doctype != "HD Ticket" or doc.comment_type != "Comment":\n'
+		"\t\treturn\n"
+		'\trun_log.record_event(ticket=doc.reference_name, trigger="comment_mention", code="agent_disabled")\n'
+	),
+	"agent/runner.py": "from rq.job import Job\n\n\ndef job_class():\n\treturn Job\n",
+}
+
+
+class TestEventWriteRules(unittest.TestCase):
+	"""CHG-009 T1: the ADR-048 rules on writing event rows, on the product, then each one's clean and violating samples."""
+
+	assertRuleSamples = TestArchitecture.assertRuleSamples
+
+	@classmethod
+	def setUpClass(cls):
+		cls.sources = load_product_sources()
+
+	def test_event_write_rules_follow_adr_048(self):
+		for rel in (QUEUE_FILE, HANDLERS_FILE):
+			self.assertIn(rel, self.sources)
+		self.assertEqual(check_rq_job_reads_only_in_queue(self.sources), [])
+		self.assertEqual(check_no_commit_in_event_request_files(self.sources), [])
+		self.assertEqual(check_comment_hook_starts_with_step_zero(self.sources), [])
+
+		changed = TestScannersCatchViolations.changed
+		clean = EVENT_WRITE_SAMPLE
+		event_call = '\trun_log.record_event(ticket=doc.reference_name, trigger="comment_mention", code="agent_disabled")\n'
+		self.assertRuleSamples(
+			check_rq_job_reads_only_in_queue,
+			clean,
+			{
+				"get_job in a handler": (
+					changed(
+						clean,
+						HANDLERS_FILE,
+						"\n\ndef busy(job_id):\n\treturn frappe.utils.background_jobs.get_job(job_id)\n",
+					),
+					f"{HANDLERS_FILE}:14: reads the RQ job state (get_job)",
+				),
+				"is_job_enqueued imported under another name": (
+					changed(
+						clean,
+						"agent/runner.py",
+						"from frappe.utils.background_jobs import is_job_enqueued as queued\n",
+					),
+					"agent/runner.py:6: reads the RQ job state (is_job_enqueued)",
+				),
+				"get_job_status through its module": (
+					changed(
+						clean,
+						"ticket_panel.py",
+						"from frappe.utils import background_jobs\n\n\n"
+						"def running(job_id):\n\treturn background_jobs.get_job_status(job_id)\n",
+					),
+					"ticket_panel.py:5: reads the RQ job state (get_job_status)",
+				),
+				"Job.fetch under another name": (
+					changed(
+						clean,
+						"agent/bot_status.py",
+						"from rq.job import Job as RQJob\n\n\ndef state(job_id):\n\treturn RQJob.fetch(job_id)\n",
+					),
+					"agent/bot_status.py:5: reads the RQ job state (Job.fetch)",
+				),
+			},
+		)
+		self.assertRuleSamples(
+			check_no_commit_in_event_request_files,
+			clean,
+			{
+				"commit in the comment hook": (
+					changed(clean, HANDLERS_FILE, "\tfrappe.db.commit()\n"),
+					f"{HANDLERS_FILE}:11: calls {COMMIT_CALL}()",
+				),
+				"commit through `from frappe import db` in the queue": (
+					changed(
+						clean, QUEUE_FILE, "\n\ndef flush():\n\tfrom frappe import db\n\n\tdb.commit()\n"
+					),
+					f"{QUEUE_FILE}:13: calls {COMMIT_CALL}()",
+				),
+				"handlers.py missing": ({QUEUE_FILE: clean[QUEUE_FILE]}, f"{HANDLERS_FILE}: file missing"),
+			},
+		)
+		step_zero = '\tif doc.reference_doctype != "HD Ticket" or doc.comment_type != "Comment":\n'
+		not_first = f"{HANDLERS_FILE}:8: the first statement of {COMMENT_HOOK} is not step 0"
+		self.assertRuleSamples(
+			check_comment_hook_starts_with_step_zero,
+			clean,
+			{
+				"event written before step 0": (
+					changed(clean, HANDLERS_FILE, replace=(step_zero, event_call + step_zero)),
+					not_first,
+				),
+				"step 0 reads the database": (
+					changed(
+						clean,
+						HANDLERS_FILE,
+						replace=(
+							'doc.comment_type != "Comment"',
+							'not frappe.db.exists("HD Ticket", doc.reference_name)',
+						),
+					),
+					not_first,
+				),
+				"step 0 writes before returning": (
+					changed(
+						clean, HANDLERS_FILE, replace=("\t\treturn\n", "\t" + event_call + "\t\treturn\n")
+					),
+					not_first,
+				),
+				"step 0 no longer tests the DocType": (
+					changed(clean, HANDLERS_FILE, replace=('doc.reference_doctype != "HD Ticket" or ', "")),
+					not_first,
+				),
+				"the hook renamed": (
+					changed(clean, HANDLERS_FILE, replace=("def comment_after_insert(", "def comment_hook(")),
+					f"{HANDLERS_FILE}: no function {COMMENT_HOOK}",
+				),
 			},
 		)
 

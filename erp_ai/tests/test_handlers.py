@@ -1,3 +1,4 @@
+import datetime
 import json
 from unittest.mock import MagicMock, patch
 
@@ -6,10 +7,10 @@ from frappe.tests.utils import FrappeTestCase
 from helpdesk.test_utils import make_ticket
 
 from erp_ai import handlers
-from erp_ai.agent import answer_delay, runner
+from erp_ai.agent import answer_delay, queue, runner
 from erp_ai.agent.tools import site_api
 from erp_ai.agent.tools.registry import ToolContext
-from erp_ai.constants import AGENT_USER, LOG_DOCTYPE, LOGGER_NAME
+from erp_ai.constants import AGENT_USER, LOG_DOCTYPE, LOGGER_NAME, TRIGGER_REQUESTER_REPLY
 from erp_ai.test_utils import (
 	FakeGateway,
 	keep_agent_settings,
@@ -879,3 +880,235 @@ class TestTicketNameNotReused(HandlerTestCase):
 
 		following = self._ticket_without_job().name
 		self.assertNotIn(row, frappe.get_all(LOG_DOCTYPE, filters={"ticket": following}, pluck="name"))
+
+
+REPLY_DAY = datetime.datetime(2026, 11, 2, 9, 0)
+HOUR = datetime.timedelta(hours=1)
+
+
+class RequesterReplyTestCase(HandlerTestCase):
+	"""Communications stored as is (no Helpdesk hook runs); `communication_on_update` is called the way the
+	Communication `on_update` hook calls it."""
+
+	def setUp(self):
+		super().setUp()
+		keep_agent_settings(self)
+
+	def _requester_ticket(self, **values):
+		requester = f"{PREFIX.lower()}requester-{frappe.generate_hash(length=8).lower()}@example.com"
+		return self._ticket_without_job(raised_by=requester, **values)
+
+	def _message(self, ticket, sent_or_received, creation, sender, owner="Administrator", **values):
+		doc = frappe.get_doc(
+			{
+				"doctype": "Communication",
+				"communication_type": "Communication",
+				"communication_medium": "Email",
+				"sent_or_received": sent_or_received,
+				"reference_doctype": "HD Ticket",
+				"reference_name": ticket,
+				"sender": sender,
+				"subject": f"{PREFIX}reply",
+				"content": "SECRET reply body",
+				"owner": owner,
+				"modified_by": owner,
+				"creation": creation,
+				"modified": creation,
+				**values,
+			}
+		)
+		doc.db_insert()
+		return doc
+
+	def _bot_message(self, ticket, creation=REPLY_DAY):
+		return self._message(ticket, "Sent", creation, sender=AGENT_USER, owner=AGENT_USER)
+
+	def _reply(self, ticket, creation=REPLY_DAY + HOUR, **values):
+		raised_by = frappe.db.get_value("HD Ticket", ticket, "raised_by")
+		return self._message(
+			ticket, "Received", creation, sender=f"Người tạo <{raised_by.upper()}>", **values
+		)
+
+	def _reply_jobs(self):
+		return [call.kwargs for call in self._jobs() if call.kwargs["trigger"] == TRIGGER_REQUESTER_REPLY]
+
+	def _on_update(self, doc):
+		"""Run the handler; return the logger lines it wrote."""
+		logger = MagicMock()
+		with patch.object(frappe, "logger", return_value=logger):
+			handlers.communication_on_update(doc)
+		return [str(arg) for call in logger.info.call_args_list for arg in call.args]
+
+	def assertSkipped(self, lines, ticket, reason):
+		self.assertEqual(
+			lines, [f"erp_ai handler ticket={ticket} trigger={TRIGGER_REQUESTER_REPLY} skipped: {reason}"]
+		)
+
+
+class TestRequesterReply(RequesterReplyTestCase):
+	"""AC-41 (U6b-fixes.md:58-66; ADR-033 QĐ 2): a requester's reply after the bot's message queues exactly one job;
+	the handler only reads and queues (traps B-1, B-2, B-3, X-1)."""
+
+	def test_requester_reply_enqueues_one_job(self):
+		ticket = self._requester_ticket().name
+		self._bot_message(ticket)
+		reply = self._reply(ticket)
+
+		lines = self._on_update(reply)
+
+		jobs = self._reply_jobs()
+		self.assertEqual(len(jobs), 1)
+		self.assertEqual(jobs[0]["ticket_name"], ticket)
+		self.assertEqual(jobs[0]["communication_name"], reply.name)
+		self.assertEqual(jobs[0]["job_id"], f"erp_ai::{ticket}::{TRIGGER_REQUESTER_REPLY}::{reply.name}")
+		self.assertEqual(
+			lines,
+			[f"erp_ai handler ticket={ticket} trigger={TRIGGER_REQUESTER_REPLY} enqueued: conditions_met"],
+		)
+		self.assertNotIn("SECRET", " ".join(lines))
+		self.assertEqual(self.gateway.call_count, 0)
+
+	def test_bot_own_message_no_job(self):
+		ticket = self._requester_ticket().name
+		bot = self._bot_message(ticket)
+		raised_by = frappe.db.get_value("HD Ticket", ticket, "raised_by")
+		cheap = [
+			bot,
+			self._message(
+				ticket, "Received", REPLY_DAY + HOUR, raised_by, communication_type="Automated Message"
+			),
+			self._message(ticket, "Received", REPLY_DAY + HOUR, raised_by, reference_doctype="HD Team"),
+		]
+
+		def no_db(*args, **kwargs):
+			raise AssertionError("the early return must not touch the database")
+
+		with (
+			patch.object(frappe.db, "sql", side_effect=no_db),
+			patch.object(frappe.db, "get_value", side_effect=no_db),
+			patch.object(frappe.db, "get_single_value", side_effect=no_db),
+			patch.object(frappe.db, "exists", side_effect=no_db),
+			patch.object(frappe, "get_all", side_effect=no_db),
+			patch.object(frappe, "logger", side_effect=no_db),
+		):
+			for doc in cheap:
+				handlers.communication_on_update(doc)
+		# a Received message written under the agent account is the bot's own as well
+		by_agent = self._message(ticket, "Received", REPLY_DAY + HOUR, raised_by, owner=AGENT_USER)
+		self.assertSkipped(self._on_update(by_agent), ticket, "written_by_agent")
+
+		self.assertEqual(self._reply_jobs(), [])
+
+	def test_other_person_no_job(self):
+		ticket = self._requester_ticket().name
+		self._bot_message(ticket)
+		other = self._message(ticket, "Received", REPLY_DAY + HOUR, f"{PREFIX.lower()}other@example.com")
+
+		self.assertSkipped(self._on_update(other), ticket, "not_requester")
+		self.assertEqual(self._reply_jobs(), [])
+
+	def test_opening_message_no_job(self):
+		# B-1, portal: the customer's ticket opens with its own Received Communication (new_ticket=True).
+		customer = _ensure_user(f"{PREFIX.lower()}reply-customer@example.com", "HD Customer")
+		set_agent_settings(enabled=0)
+		frappe.set_user(customer)
+		portal = make_ticket(subject=f"{PREFIX}portal", raised_by=customer).name
+		frappe.set_user("Administrator")
+		set_agent_settings(enabled=1)
+		opening = frappe.get_all(
+			"Communication",
+			filters={"reference_doctype": "HD Ticket", "reference_name": portal},
+			pluck="name",
+		)
+		self.assertEqual(len(opening), 1)
+		opening = frappe.get_doc("Communication", opening[0])
+		self.assertEqual((opening.sent_or_received, opening.sender), ("Received", customer))
+		self.assertSkipped(self._on_update(opening), portal, "no_bot_message_before")
+
+		# B-1, email: the mail that opened the ticket; a bot message written after it does not count.
+		emailed = self._requester_ticket().name
+		first = self._reply(emailed, creation=REPLY_DAY)
+		self.assertSkipped(self._on_update(first), emailed, "no_bot_message_before")
+		self._bot_message(emailed, creation=REPLY_DAY + HOUR)
+		self.assertSkipped(self._on_update(first), emailed, "no_bot_message_before")
+
+		self.assertEqual(self._reply_jobs(), [])
+
+	def test_on_update_twice_one_job(self):
+		# B-2: insert then save of one message in one transaction run the hook twice.
+		ticket = self._requester_ticket().name
+		self._bot_message(ticket)
+		reply = self._reply(ticket)
+
+		self._on_update(reply)
+		self._on_update(reply)
+
+		self.assertEqual(len(self._reply_jobs()), 1)
+
+	def test_on_update_after_run_no_job(self):
+		# B-2 after the job ran: its rows carry the event key as run_id.
+		ticket = self._requester_ticket().name
+		self._bot_message(ticket)
+		handled = self._reply(ticket)
+		make_log_entry(
+			ticket=ticket,
+			run_id=queue.requester_reply_key(ticket, handled.name),
+			trigger=TRIGGER_REQUESTER_REPLY,
+			entry_type="skip",
+		)
+
+		self.assertSkipped(self._on_update(handled), ticket, "already_handled")
+		self.assertEqual(self._reply_jobs(), [])
+
+		# the key is the message's own: a later message of the same ticket still gets its job
+		later = self._reply(ticket, creation=REPLY_DAY + 2 * HOUR)
+		self._on_update(later)
+		self.assertEqual([job["communication_name"] for job in self._reply_jobs()], [later.name])
+
+	def test_merged_ticket_uses_final_reference(self):
+		# B-3: Helpdesk moves a reply to a merged ticket onto the merge target before the hook runs.
+		target = self._requester_ticket().name
+		raised_by = frappe.db.get_value("HD Ticket", target, "raised_by")
+		source = self._ticket_without_job(raised_by=raised_by).name
+		frappe.db.set_value(
+			"HD Ticket", source, {"is_merged": 1, "merged_with": target}, update_modified=False
+		)
+		self._bot_message(target)
+		reply = self._reply(source)
+
+		frappe.get_doc("HD Ticket", source).on_communication_update(reply)
+		self.assertEqual(reply.reference_name, target)
+		self.enqueue.reset_mock()
+		self._on_update(reply)
+
+		jobs = self._reply_jobs()
+		self.assertEqual([job["ticket_name"] for job in jobs], [target])
+		self.assertEqual(jobs[0]["job_id"], f"erp_ai::{target}::{TRIGGER_REQUESTER_REPLY}::{reply.name}")
+
+	def test_reply_while_previous_job_started_gets_own_job(self):
+		# X-1: Frappe drops a deduplicated job whose id is QUEUED or STARTED (background_jobs.py:577-578).
+		ticket = self._requester_ticket().name
+		self._bot_message(ticket)
+		statuses, received = {}, []
+
+		def fake_enqueue(method, **kwargs):
+			if kwargs.get("deduplicate") and statuses.get(kwargs["job_id"]) in ("queued", "started"):
+				return None
+			received.append(kwargs)
+			statuses[kwargs["job_id"]] = "queued"
+
+		self.enqueue.side_effect = fake_enqueue
+		first = self._reply(ticket)
+		self._on_update(first)
+		self.assertEqual([job["communication_name"] for job in received], [first.name])
+		statuses[received[0]["job_id"]] = "started"
+		# M1 again in a later transaction while its job runs: Frappe drops it
+		queue._clear_pending_job_ids()
+		self._on_update(first)
+		self.assertEqual(len(received), 1)
+
+		second = self._reply(ticket, creation=REPLY_DAY + 2 * HOUR)
+		self._on_update(second)
+
+		self.assertEqual([job["communication_name"] for job in received], [first.name, second.name])
+		self.assertEqual(received[1]["job_id"], f"erp_ai::{ticket}::{TRIGGER_REQUESTER_REPLY}::{second.name}")

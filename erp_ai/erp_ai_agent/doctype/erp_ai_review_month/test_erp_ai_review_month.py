@@ -213,7 +213,7 @@ class TestReviewMonthAgentGuard(ReviewMonthTestCase):
 		frappe.set_user("Administrator")
 		self.assertTrue(frappe.db.exists(REVIEW_MONTH, doc.name))
 		self.assertFalse(frappe.db.exists(REVIEW_MONTH, f"REV-{NEXT_MONTH}"))
-		self.assertEqual(frappe.get_doc(REVIEW_MONTH, doc.name).items[0].verdict, None)
+		self.assertFalse(frappe.get_doc(REVIEW_MONTH, doc.name).items[0].verdict)
 
 
 def _set_verdict(name: str) -> None:

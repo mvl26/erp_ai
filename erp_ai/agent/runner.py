@@ -14,6 +14,7 @@ from erp_ai.agent.answer_delay import AnswerDelay
 from erp_ai.agent.authority import TITLE_WRONG_USER as TITLE_WRONG_USER  # re-export, U1.md:264
 from erp_ai.agent.classification import load_mapping, parse_classification, split_request_comment
 from erp_ai.agent.prompts import (
+	LATER_MESSAGES_MAX,
 	TICKET_FIELD_LABELS,
 	build_classify_request,
 	build_initial_message,
@@ -177,6 +178,9 @@ TICKET_FIELD_SETTINGS = tuple(f"field_{key}" for key in TICKET_FIELD_LABELS)
 GUIDANCE_EXISTS_LOG = "erp_ai guidance ticket=%s run_id=%s: đã có hướng xử lý"
 # The action entry of the run's one guidance comment (ADR-036 QĐ 8, w1.md:105).
 GUIDANCE_TOOL = "post_guidance"
+# The split question a guidance run's route gathered, per run: (classify row, text, requests), recorded as asked only
+# once the run's one comment carrying it is posted (AC-28, C9-fix1 R20a); dropped when the run ends.
+SPLIT_HELD_FLAG = "erp_ai_split_held"
 
 
 def run_for_ticket(ticket_name: str, trigger: str, comment_name: str | None = None) -> None:
@@ -347,6 +351,7 @@ def _run(ticket_name, trigger, comment_name=None):
 			)
 	finally:
 		close_collector(run_id)
+		frappe.flags.get(SPLIT_HELD_FLAG, {}).pop(run_id, None)
 		_end_status(status, delay, ticket_name, run_id, trigger)
 
 
@@ -362,8 +367,9 @@ def _choose_mode(context, posted: bool) -> None:
 
 
 def _later_messages(ticket_name) -> list[str]:
-	"""The people's comments on the ticket after its latest classify row with a result, oldest first (ADR-037 QĐ 2):
-	data of the classification request, which keeps the newest few, each cut (T106). The bot's own are left out."""
+	"""What people wrote on the ticket after its latest classify row with a result, oldest first (ADR-037 QĐ 2): the
+	requester's emails (Communication Received, research-R1 (d)) and the people's comments, each read newest first;
+	the bot's own are left out. Data of the classification request, which keeps the newest few, each cut (T106)."""
 	since = frappe.get_all(
 		LOG_DOCTYPE,
 		filters={"ticket": ticket_name, "entry_type": "classify", "predicted_category": ("is", "set")},
@@ -371,11 +377,26 @@ def _later_messages(ticket_name) -> list[str]:
 		order_by="creation desc",
 		limit=1,
 	)
-	return [
-		comment["content"]
-		for comment in reversed(authority.fetch_ticket_comments(ticket_name))
+	after = {"creation": (">", since[0])} if since else {}
+	emails = frappe.get_all(
+		"Communication",
+		filters={
+			"reference_doctype": "HD Ticket",
+			"reference_name": ticket_name,
+			"sent_or_received": "Received",
+			**after,
+		},
+		fields=["creation", "content"],
+		order_by="creation desc",
+		limit=LATER_MESSAGES_MAX,
+	)
+	comments = [
+		comment
+		for comment in authority.fetch_ticket_comments(ticket_name)
 		if comment["author"] != AGENT_USER and (not since or comment["creation"] > since[0])
 	]
+	messages = sorted([*emails, *comments], key=lambda message: message["creation"])
+	return [message["content"] for message in messages]
 
 
 def _ticket_fields(settings) -> tuple[dict[str, str], list[str]]:
@@ -650,8 +671,8 @@ def _classify(
 		"agent_group": decision.agent_group,
 		"priority": decision.priority,
 	}
-	# AC-28: the split question is asked once per ticket; a classify row records it only once the route comment
-	# carrying it was posted (`_record_route`), so a run that posts none leaves it to a later run
+	# AC-28: the split question is asked once per ticket; a classify row records it only once the comment carrying it
+	# was posted (`_record_route`, or `_record_split` in a guidance run), so a run that posts none leaves it to a later run
 	split_text = split_request_comment(classification)
 	if split_text and frappe.db.exists(
 		LOG_DOCTYPE, {"ticket": ticket_name, "entry_type": "classify", "split_requested": 1}
@@ -741,7 +762,8 @@ def _route(
 	Returns `lines`, the sentences of that one comment (already posted by (u4)).
 	`collect_run_id` of a run whose collector is open (a guidance run, w1.md:103): no comment of its own; what was
 	done goes to "Đã làm", the other sentences (warnings, requests, the split question) to the plan section of the
-	run's one guidance comment, raw (AD3-4); the same `lines` are returned. None, or no open collector: as above.
+	run's one guidance comment, raw (AD3-4); the same `lines` are returned. The split question is then held for that
+	comment, not recorded here (`_record_split`, C9-fix1 R20a). None, or no open collector: as above.
 	Nothing here raises for an unusable unit: it is rolled back, recorded as `ok=false` with the exception
 	class only (D-16). (u1) failing or refusing stops the SLA check and (u2)-(u5).
 
@@ -757,7 +779,7 @@ def _route(
 	if locked_rows(ticket, LOG_DOCTYPE, {"ticket": ticket, "entry_type": "classify", "applied": 1}):
 		return _route_skipped(log_name, decision, context)
 	actions, lines, errors = [], [], []
-	assigned = task = watcher = commented = None
+	assigned = task = watcher = commented = split = None
 	sla = None
 	frappe.db.savepoint(ROUTE_SAVEPOINT)
 	try:
@@ -775,9 +797,11 @@ def _route(
 			lines = [*done, *others]
 			if collect_run_id and collecting(collect_run_id):
 				commented = _collect_route_lines(collect_run_id, done, others)
+				_hold_split(collect_run_id, log_name, split_text, classification)
 			else:
 				commented = _comment_unit(lines, context, actions, errors)
-		split = classification.requests if commented and split_text else None
+				if commented and split_text:
+					split = classification.requests
 		_record_route(log_name, result, decision, assigned, task, actions, errors, split)
 		_log_route_summary(context, result, assigned, task, commented, sla)
 	except Exception:
@@ -1299,7 +1323,8 @@ def _finish_guidance(context, actions) -> None:
 	and before its entry, so the comment is undone with the turn (R5-16). Posted → one action entry with the section
 	counts (QĐ 8). A run in parallel posted the ticket's guidance first → one log line, and the run's collected lines
 	go out as before: one result comment without the marker, in the order of GUIDANCE_SECTIONS, one sentence per line,
-	each escaped once, no section heading (design-w1-fixes-20 Điểm 1.6, AD3-4). Nothing to say → one log line."""
+	each escaped once, no section heading (design-w1-fixes-20 Điểm 1.6, AD3-4). Nothing to say → one log line.
+	Either comment, once posted, records the split question the route held (`_record_split`); a refusal records none."""
 	ticket, run_id = context.ticket_name, context.run_id
 	result = post_guidance(ticket, run_id)
 	if result.get("ok"):
@@ -1313,6 +1338,7 @@ def _finish_guidance(context, actions) -> None:
 				instructor=context.instructor,
 			)
 		)
+		_record_split(run_id, result["comment"])
 		return
 	reason = result.get("reason")
 	if reason == REASON_NO_CONTENT:
@@ -1339,6 +1365,31 @@ def _finish_guidance(context, actions) -> None:
 			instructor=context.instructor,
 		)
 	)
+	if posted.get("ok"):
+		_record_split(run_id, posted["comment"])
+
+
+def _hold_split(run_id, log_name, split_text, classification) -> None:
+	"""A guidance run's route gathered the split question: keep it for the run's one comment (C9-fix1 R20a)."""
+	if split_text:
+		frappe.flags.setdefault(SPLIT_HELD_FLAG, {})[run_id] = (log_name, split_text, classification.requests)
+
+
+def _record_split(run_id, comment) -> None:
+	"""The split question the run's route held is recorded as asked on its classify row only once the run's comment
+	`comment` was posted and its text carries the question, escaped once (AC-28, R14c, C9-fix1 R20a). Inside the
+	last turn, so it is undone with that turn."""
+	held = frappe.flags.get(SPLIT_HELD_FLAG, {}).get(run_id)
+	if held is None:
+		return
+	log_name, text, requests = held
+	if escape_html(text) in (frappe.db.get_value("Comment", comment, "content") or ""):
+		frappe.db.set_value(
+			LOG_DOCTYPE,
+			log_name,
+			{"split_requested": 1, "split_requests": json.dumps(requests, ensure_ascii=False)},
+			update_modified=False,
+		)
 
 
 def _ask_fallback_body(run_id, classification, settings) -> str:

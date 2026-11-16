@@ -184,6 +184,7 @@ POLICY_FIELDS = (
 	"permission_level",
 	"excluded_teams",
 	"ai_opt_out",
+	"excluded_title_prefixes",
 	"auto_assign_enabled",
 	"code_change_enabled",
 	"code_change_apps",
@@ -10939,6 +10940,395 @@ class TestGuidanceArchitectureRules(unittest.TestCase):
 				found = check_route_locks_ticket_before_first_write_unit(sources)
 				self.assertEqual(len(found), 1, found)
 				self.assertCaught(found, fragment)
+
+
+# ---------------------------------------------------------------------------------------------------
+# ADR-034 Ràng buộc 1-2 (FEAT-007 U2, T139, U2.md:260, :291-293): the ticket send policy is read only in policy.py,
+# the record tool's read paths ask it inside the query, TICKET_LINK_FIELDS covers TICKET_CONTENT_DOCTYPES
+# ---------------------------------------------------------------------------------------------------
+
+TICKET_POLICY_FIELDS = ("excluded_teams", "ai_opt_out", "excluded_title_prefixes")
+# policy.py's constants holding those names: naming one outside policy.py is a read of the field too
+TICKET_POLICY_CONSTANTS = ("EXCLUDED_TEAMS_FIELD", "OPT_OUT_FIELD", "EXCLUDED_TITLE_PREFIXES_FIELD")
+# the policy function that carries a field's name (`policy.excluded_title_prefixes()`): a call, not a field read
+TICKET_POLICY_FUNCTIONS = ("excluded_title_prefixes",)
+TICKET_POLICY_NAME = re.compile(
+	r"(?<![A-Za-z0-9_])(?:excluded_teams|ai_opt_out|excluded_title_prefixes)(?![A-Za-z0-9_])"
+)
+# ADR-034 Ràng buộc 1: "chỉ được đọc trong policy.py (và JSON, cài đặt, test)"; JSON and tests are never scanned.
+TICKET_POLICY_FILES = {
+	POLICY_FILE: "the one reader: send_refusal, is_excluded_team, excluded_title_prefixes (ADR-034 QĐ 1)",
+	SETTING_CONTROLLER_FILE: "the ERP AI Setting controller owns its fields",
+	INSTALL_FILE: "sets up the Setting defaults and the ticket's custom fields at install",
+}
+TICKET_RECORD_CHECK = "is_ticket_record_excluded"
+TICKET_LIST_FILTERS = "ticket_content_filters"
+TICKET_LINK_FIELDS_NAME = "TICKET_LINK_FIELDS"
+TICKET_CONTENT_DOCTYPES_NAME = "TICKET_CONTENT_DOCTYPES"
+TICKET_DOCTYPE_NAME = "HD Ticket"
+# C3b (R10b, R10g, R11a): log DocTypes that name a ticket only by a (DocType, name) pair, declared in
+# TICKET_LINK_FIELDS beyond TICKET_CONTENT_DOCTYPES so the record tool filters them too. The narrowest allowance that
+# keeps the U2.md:293 rule: these names may be declared; no other DocType outside TICKET_CONTENT_DOCTYPES may.
+TICKET_LINK_ONLY_DOCTYPES = frozenset(
+	{
+		"ToDo",
+		"Notification Log",
+		"Activity Log",
+		"Email Queue",
+		"Tag Link",
+		"Document Follow",
+		"Workflow Action",
+		"Reminder",
+	}
+)
+
+
+def check_ticket_policy_fields_read_only_in_policy(sources: dict) -> list:
+	"""ADR-034 Ràng buộc 1: outside TICKET_POLICY_FILES no Python file names a field of TICKET_POLICY_FIELDS (a name, an
+	attribute, a keyword, a string, a built string) or a constant of TICKET_POLICY_CONSTANTS; the one exception is a
+	policy function of TICKET_POLICY_FUNCTIONS (`policy.excluded_title_prefixes()`, or imported from policy)."""
+	policy_module = module_name(POLICY_FILE)
+	functions = {f"{policy_module}.{name}" for name in TICKET_POLICY_FUNCTIONS}
+	flagged = {*TICKET_POLICY_FIELDS, *TICKET_POLICY_CONSTANTS}
+	violations = []
+	for rel, source in only_python(sources).items():
+		if rel in TICKET_POLICY_FILES:
+			continue
+		tree = parse(rel, source)
+		aliases = import_aliases(tree)
+		function_imports = {
+			id(alias)
+			for node in ast.walk(tree)
+			if isinstance(node, ast.ImportFrom) and not node.level and node.module == policy_module
+			for alias in node.names
+			if alias.name in TICKET_POLICY_FUNCTIONS
+		}
+		lines = set()
+		for node in ast.walk(tree):
+			if id(node) in function_imports or isinstance(node, ast.Constant):
+				continue  # strings are checked below, built ones included
+			if not flagged.intersection(_node_names(node)):
+				continue
+			if resolved_name(node, aliases) in functions:
+				continue  # the policy's function, not a field read
+			lines.add(node.lineno)
+		lines |= {
+			node.lineno
+			for node, text in _string_texts(tree, _docstring_ids(tree))
+			if TICKET_POLICY_NAME.search(text)
+		}
+		violations.extend(
+			f"{rel}:{line}: names a ticket policy field outside {POLICY_FILE}; ask policy.py (ADR-034 Ràng buộc 1)"
+			for line in sorted(lines)
+		)
+	return violations
+
+
+def _policy_calls(function, name: str, aliases: dict) -> list:
+	"""The calls of `policy.<name>(...)` inside `function`."""
+	target = f"{module_name(POLICY_FILE)}.{name}"
+	return [
+		node
+		for node in ast.walk(function)
+		if isinstance(node, ast.Call) and resolved_name(node.func, aliases) == target
+	]
+
+
+def _bound_names(function, call) -> set:
+	"""The names an assignment inside `function` binds to the result of `call`; empty when it binds none."""
+	return {
+		name.id
+		for node in ast.walk(function)
+		if isinstance(node, ast.Assign) and node.value is call
+		for target in node.targets
+		for name in ast.walk(target)
+		if isinstance(name, ast.Name)
+	}
+
+
+def check_site_api_read_paths_call_ticket_policy(sources: dict) -> list:
+	"""ADR-034 Ràng buộc 1-2, U2.md:291-292: in site_api.py `get_record` calls policy.is_ticket_record_excluded, and
+	`list_records` calls policy.ticket_content_filters, binds its result and hands every bound name to one
+	frappe.get_list call (the exclusion is part of the query, never a filter after it)."""
+	source = sources.get(SITE_API_FILE)
+	if source is None:
+		return [f"{SITE_API_FILE}: file missing"]
+	tree = parse(SITE_API_FILE, source)
+	aliases = import_aliases(tree)
+	functions = {node.name: node for node in tree.body if isinstance(node, ast.FunctionDef)}
+	violations = [
+		f"{SITE_API_FILE}: {name} missing" for name in ("get_record", "list_records") if name not in functions
+	]
+	get_record, list_records = functions.get("get_record"), functions.get("list_records")
+	if get_record is not None and not _policy_calls(get_record, TICKET_RECORD_CHECK, aliases):
+		violations.append(
+			f"{SITE_API_FILE}:{get_record.lineno}: get_record does not call policy.{TICKET_RECORD_CHECK}"
+		)
+	if list_records is None:
+		return violations
+	calls = _policy_calls(list_records, TICKET_LIST_FILTERS, aliases)
+	if not calls:
+		violations.append(
+			f"{SITE_API_FILE}:{list_records.lineno}: list_records does not call policy.{TICKET_LIST_FILTERS}"
+		)
+	passed = [
+		{name.id for name in ast.walk(node) if isinstance(name, ast.Name)}
+		for node in ast.walk(list_records)
+		if isinstance(node, ast.Call) and resolved_name(node.func, aliases) == "frappe.get_list"
+	]
+	for call in calls:
+		bound = _bound_names(list_records, call)
+		if not bound or not any(bound <= names for names in passed):
+			violations.append(
+				f"{SITE_API_FILE}:{call.lineno}: list_records does not pass the result of "
+				f"policy.{TICKET_LIST_FILTERS} into frappe.get_list (ADR-034 Ràng buộc 2)"
+			)
+	return violations
+
+
+def _module_assignment(rel: str, source: str, name: str):
+	"""The value node of the module-level `name = ...` of `rel`, or None."""
+	return next(
+		(
+			node.value
+			for node in parse(rel, source).body
+			if isinstance(node, ast.Assign)
+			and any(isinstance(target, ast.Name) and target.id == name for target in node.targets)
+		),
+		None,
+	)
+
+
+def check_ticket_link_fields_cover_ticket_content_doctypes(sources: dict) -> list:
+	"""U2.md:293: `set(TICKET_LINK_FIELDS) | {"HD Ticket"} == set(TICKET_CONTENT_DOCTYPES)`, TICKET_LINK_ONLY_DOCTYPES
+	aside: every content DocType but the ticket says how it names its ticket, and no other DocType is declared."""
+	link_fields = _module_assignment(POLICY_FILE, sources.get(POLICY_FILE, ""), TICKET_LINK_FIELDS_NAME)
+	content = _module_assignment(
+		CONSTANTS_FILE, sources.get(CONSTANTS_FILE, ""), TICKET_CONTENT_DOCTYPES_NAME
+	)
+	if not isinstance(link_fields, ast.Dict) or content is None:
+		return [
+			f"{TICKET_LINK_FIELDS_NAME} ({POLICY_FILE}) or {TICKET_CONTENT_DOCTYPES_NAME} ({CONSTANTS_FILE}) "
+			"missing or not a literal"
+		]
+	literal = [isinstance(key, ast.Constant) and isinstance(key.value, str) for key in link_fields.keys]
+	violations = [
+		f"{POLICY_FILE}:{link_fields.lineno}: a {TICKET_LINK_FIELDS_NAME} key that is not a string literal"
+		for ok in literal
+		if not ok
+	]
+	declared = {key.value for key, ok in zip(link_fields.keys, literal, strict=True) if ok}
+	expected = set(ast.literal_eval(content))
+	violations.extend(
+		f"{POLICY_FILE}: {TICKET_LINK_FIELDS_NAME} has no entry for {doctype}"
+		for doctype in sorted(expected - declared - {TICKET_DOCTYPE_NAME})
+	)
+	violations.extend(
+		f"{POLICY_FILE}: {TICKET_LINK_FIELDS_NAME} declares {doctype}, not in {TICKET_CONTENT_DOCTYPES_NAME}"
+		for doctype in sorted(declared - expected - TICKET_LINK_ONLY_DOCTYPES)
+	)
+	return violations
+
+
+# Clean samples of the three rules: each allowed file names what it may, the policy's function is called.
+TICKET_POLICY_SAMPLE = {
+	POLICY_FILE: (
+		'import frappe\n\nEXCLUDED_TEAMS_FIELD = "excluded_teams"\n\n\n'
+		"def excluded_title_prefixes():\n"
+		"\treturn frappe.db.get_single_value('ERP AI Setting', 'excluded_title_prefixes')\n"
+	),
+	SETTING_CONTROLLER_FILE: "def validate(self):\n\tself.excluded_teams = (self.excluded_teams or '').strip()\n",
+	INSTALL_FILE: "TICKET_FIELDS = [{'fieldname': 'ai_opt_out', 'fieldtype': 'Check'}]\n",
+	HANDLERS_FILE: (
+		"from erp_ai.agent import policy\n\n\n"
+		"def hook(doc):\n"
+		'\t"""Not sent when send_refusal says so (excluded_teams, ai_opt_out, excluded_title_prefixes)."""\n'
+		"\treturn policy.send_refusal(doc) or policy.excluded_title_prefixes()\n"
+	),
+	READ_TOOL_FILE: (
+		"from erp_ai.agent.policy import excluded_title_prefixes\n"
+		"from erp_ai.agent.policy import excluded_title_prefixes as prefixes\n\n\n"
+		"def shown():\n\treturn excluded_title_prefixes() + prefixes()\n"
+	),
+}
+
+SITE_API_READ_SAMPLE = {
+	SITE_API_FILE: (
+		"import frappe\n\nfrom erp_ai.agent import policy\n\n\n"
+		"def get_record(args, ctx):\n"
+		"\tif policy.is_ticket_record_excluded(args['doctype'], args['name']):\n"
+		"\t\treturn {'ok': False}\n"
+		"\treturn frappe.get_doc(args['doctype'], args['name']).as_dict()\n\n\n"
+		"def list_records(args, ctx):\n"
+		"\textra, or_filters = policy.ticket_content_filters(args['doctype'])\n"
+		"\treturn frappe.get_list(args['doctype'], filters=[*args['filters'], *extra], or_filters=or_filters)\n"
+	)
+}
+
+TICKET_LINK_SAMPLE = {
+	POLICY_FILE: (
+		"TICKET_LINK_FIELDS = {\n"
+		'\t"Comment": (("reference_doctype", "reference_name"),),\n'
+		'\t"Communication": (("reference_doctype", "reference_name"),),\n'
+		'\t"File": (("attached_to_doctype", "attached_to_name"),),\n'
+		'\t"ToDo": (("reference_type", "reference_name"),),\n'
+		"}\n"
+	),
+	CONSTANTS_FILE: 'TICKET_CONTENT_DOCTYPES = ("HD Ticket", "Comment", "Communication", "File")\n',
+}
+
+
+class TestTicketPolicyRules(unittest.TestCase):
+	"""T139: the rules of ADR-034 Ràng buộc 1-2 on the product, then each one's green and red samples."""
+
+	@classmethod
+	def setUpClass(cls):
+		cls.sources = load_product_sources()
+
+	def assertCaught(self, violations, *fragments):
+		self.assertGreater(len(violations), 0, "scanner missed the violation")
+		for fragment in fragments:
+			self.assertTrue(any(fragment in text for text in violations), f"{fragment!r} not in {violations}")
+
+	def assertSamples(self, check, clean: dict, cases: dict):
+		"""`check` lets `clean` through and catches each case: `{case: (sources, fragment)}`."""
+		self.assertEqual(check(clean), [], "the clean sample is flagged")
+		for case, (sources, fragment) in cases.items():
+			with self.subTest(case=case):
+				self.assertCaught(check(sources), fragment)
+
+	def test_ticket_policy_fields_read_only_in_policy(self):
+		self.assertIn("excluded_title_prefixes", POLICY_FIELDS)
+		for rel in TICKET_POLICY_FILES:
+			self.assertIn(rel, self.sources)
+		self.assertEqual(check_policy_fields_only_in_policy(self.sources), [])
+		self.assertEqual(check_ticket_policy_fields_read_only_in_policy(self.sources), [])
+
+		changed = TestScannersCatchViolations.changed
+		clean = TICKET_POLICY_SAMPLE
+
+		def in_job(body: str) -> dict:
+			return changed(clean, TASKS_FILE, f"import frappe\n\n\ndef job(settings, doc):\n\t{body}\n")
+
+		outside = f"{TASKS_FILE}:5: names a ticket policy field outside {POLICY_FILE}"
+		self.assertSamples(
+			check_ticket_policy_fields_read_only_in_policy,
+			clean,
+			{
+				"Setting field read by its name": (
+					in_job('return frappe.db.get_single_value("ERP AI Setting", "excluded_teams")'),
+					outside,
+				),
+				"ticket flag read as an attribute": (in_job("return doc.ai_opt_out"), outside),
+				"ticket flag as a filter keyword": (
+					in_job('return frappe.get_all("HD Ticket", filters=dict(ai_opt_out=0))'),
+					outside,
+				),
+				"a built string": (in_job('return settings.get("excluded_" + "title_prefixes")'), outside),
+				"an f-string": (
+					in_job('return frappe.db.sql(f"select ai_opt_out from t where name={doc}")'),
+					outside,
+				),
+				"policy's constant outside policy": (
+					in_job("return getattr(settings, policy.EXCLUDED_TEAMS_FIELD)"),
+					outside,
+				),
+				"the Setting field named like the policy function": (
+					in_job("return settings.excluded_title_prefixes"),
+					outside,
+				),
+				"a field name imported from policy": (
+					changed(clean, TASKS_FILE, "from erp_ai.agent.policy import excluded_teams\n"),
+					f"{TASKS_FILE}:1:",
+				),
+				"the handler reads the flag itself": (
+					changed(clean, HANDLERS_FILE, "\n\ndef flag(doc):\n\treturn doc.ai_opt_out\n"),
+					f"{HANDLERS_FILE}:10:",
+				),
+			},
+		)
+
+	def test_site_api_read_paths_call_ticket_policy(self):
+		self.assertEqual(check_site_api_read_paths_call_ticket_policy(self.sources), [])
+
+		changed = TestScannersCatchViolations.changed
+		clean = SITE_API_READ_SAMPLE
+		bind = "\textra, or_filters = policy.ticket_content_filters(args['doctype'])\n"
+		query = "\treturn frappe.get_list(args['doctype'], filters=[*args['filters'], *extra], or_filters=or_filters)\n"
+		not_passed = (
+			f"{SITE_API_FILE}:13: list_records does not pass the result of policy.{TICKET_LIST_FILTERS}"
+		)
+		self.assertSamples(
+			check_site_api_read_paths_call_ticket_policy,
+			clean,
+			{
+				"get_record reads without asking": (
+					changed(
+						clean, SITE_API_FILE, replace=("policy.is_ticket_record_excluded(", "is_hidden(")
+					),
+					f"{SITE_API_FILE}:6: get_record does not call policy.{TICKET_RECORD_CHECK}",
+				),
+				"list_records filters after the query": (
+					changed(
+						clean,
+						SITE_API_FILE,
+						replace=(
+							query,
+							"\trows = frappe.get_list(args['doctype'], filters=args['filters'])\n"
+							"\treturn [row for row in rows if [row] not in (extra, or_filters)]\n",
+						),
+					),
+					not_passed,
+				),
+				"the OR group left out of the query": (
+					changed(clean, SITE_API_FILE, replace=(", or_filters=or_filters)", ")")),
+					not_passed,
+				),
+				"the result not bound": (
+					changed(
+						clean,
+						SITE_API_FILE,
+						replace=(
+							bind,
+							"\tpolicy.ticket_content_filters(args['doctype'])\n\textra = or_filters = []\n",
+						),
+					),
+					not_passed,
+				),
+				"list_records never asks": (
+					changed(clean, SITE_API_FILE, replace=(bind, "\textra, or_filters = [], []\n")),
+					f"{SITE_API_FILE}:12: list_records does not call policy.{TICKET_LIST_FILTERS}",
+				),
+			},
+		)
+
+	def test_ticket_link_fields_cover_ticket_content_doctypes(self):
+		self.assertEqual(check_ticket_link_fields_cover_ticket_content_doctypes(self.sources), [])
+		# the allowance names only DocTypes the product declares (C3b); a name gone from policy.py leaves it
+		for doctype in TICKET_LINK_ONLY_DOCTYPES:
+			self.assertIn(f'"{doctype}": (', self.sources[POLICY_FILE])
+
+		changed = TestScannersCatchViolations.changed
+		clean = TICKET_LINK_SAMPLE
+		self.assertSamples(
+			check_ticket_link_fields_cover_ticket_content_doctypes,
+			clean,
+			{
+				"a content DocType without an entry": (
+					changed(clean, CONSTANTS_FILE, replace=('"File")', '"File", "Note")')),
+					f"{TICKET_LINK_FIELDS_NAME} has no entry for Note",
+				),
+				"an entry outside the content DocTypes": (
+					changed(clean, POLICY_FILE, replace=('\t"ToDo"', '\t"Event"')),
+					f"{TICKET_LINK_FIELDS_NAME} declares Event, not in {TICKET_CONTENT_DOCTYPES_NAME}",
+				),
+				"a key that is not a string literal": (
+					changed(clean, POLICY_FILE, replace=('\t"File":', "\tFILE_DOCTYPE:")),
+					"not a string literal",
+				),
+				"the declaration gone": ({CONSTANTS_FILE: clean[CONSTANTS_FILE]}, "missing or not a literal"),
+			},
+		)
 
 
 if __name__ == "__main__":

@@ -557,10 +557,10 @@ function setupForm({ doc, call, router }) {
 					pre.textContent = String(value);
 					el.append(pre);
 				};
-				if (card?.script != null) {
+				if (card?.script) {
 					addBlock(TEXT_CONSOLE_SCRIPT, card.script);
 				}
-				if (card?.output != null) {
+				if (card?.output) {
 					addBlock(TEXT_CONSOLE_OUTPUT, card.output);
 				}
 			}

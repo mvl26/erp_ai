@@ -248,7 +248,10 @@ CONSOLE_CARD_OUTPUT_MAX_LINES = 20
 
 
 def _console_card_parts(console_names: list[str], readable: set) -> dict:
-	"""`{name: (script, masked output tail)}` for the console proposals in `console_names` the viewer can open."""
+	"""`{name: (script, masked output tail)}` for the console proposals in `console_names` the viewer can open.
+
+	An empty script or output (a pending proposal has no output yet) is None: the card draws no empty block.
+	"""
 	names = [name for name in console_names if name in readable]
 	if not names:
 		return {}
@@ -259,8 +262,9 @@ def _console_card_parts(console_names: list[str], readable: set) -> dict:
 		fields=list(CONSOLE_CARD_FIELDS),
 		limit_page_length=0,
 	):
-		output = redact_secrets(row.command_output).splitlines()[-CONSOLE_CARD_OUTPUT_MAX_LINES:]
-		parts[row.name] = (row.content_after or "", "\n".join(output))
+		output = "\n".join(redact_secrets(row.command_output).splitlines()[-CONSOLE_CARD_OUTPUT_MAX_LINES:])
+		script = cstr(row.content_after)
+		parts[row.name] = (script if script.strip() else None, output if output.strip() else None)
 	return parts
 
 

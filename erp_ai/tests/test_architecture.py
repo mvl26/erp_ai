@@ -378,6 +378,9 @@ STATUS_SCRIPT_REQUIRED = (
 	# CHG-010: console cards show the script and its result; cards are ordered with the messages by time.
 	r'TEXT_CONSOLE_SCRIPT = "Script sẽ chạy:"',
 	r'TEXT_CONSOLE_OUTPUT = "Kết quả:"',
+	# CHG-010 final review F-5: an empty script or output (None from the server) draws no block.
+	r"if \(card\?\.script\) \{\s*addBlock\(TEXT_CONSOLE_SCRIPT, card\.script\);",
+	r"if \(card\?\.output\) \{\s*addBlock\(TEXT_CONSOLE_OUTPUT, card\.output\);",
 	r'maxHeight = "240px"',
 	r'overflow = "auto"',
 	r"\.sort\(\(a, b\) =>[^;]*\.created",

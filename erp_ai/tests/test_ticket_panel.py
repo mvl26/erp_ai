@@ -1279,6 +1279,17 @@ class TestPanelProposalCards(FrappeTestCase):
 		self.assertIsNone(card["script"])
 		self.assertIsNone(card["output"])
 
+	def test_console_card_without_output_or_script_carries_none(self):
+		# CHG-010 final review F-5: a pending console card has no output yet; an empty block is None, never ""
+		name = self._console()
+		card = {c["name"]: c for c in self._cards(CARD_INSTRUCTOR)}[name]
+		self.assertEqual(card["script"], "print(1)\n")
+		self.assertIsNone(card["output"])
+		self._set(name, content_after="", command_output="\n\n")
+		card = {c["name"]: c for c in self._cards(CARD_INSTRUCTOR)}[name]
+		self.assertIsNone(card["script"])
+		self.assertIsNone(card["output"])
+
 	def test_code_proposal_content_never_reaches_the_panel(self):
 		# CHG-010: Task 6; spec rule since CHG-008, the card reads no content of a code proposal
 		proposal = make_change_proposal(ticket=self.ticket)

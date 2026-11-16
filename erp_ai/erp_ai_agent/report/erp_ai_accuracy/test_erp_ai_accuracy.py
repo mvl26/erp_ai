@@ -717,3 +717,40 @@ class TestAccess(AccuracyTestCase):
 
 		with self.subTest(account="System Manager"):
 			self.assertEqual(self._predictions_of_a(self._run_as("System Manager")), 1)
+
+
+class TestAccuracy(AccuracyTestCase):
+	"""ADR-037 QĐ 5 (T114): a ticket classified again has two rows with a result; a person's correction lands on the
+	first, the row this report reads, and the ticket is counted once."""
+
+	def test_ticket_with_two_classify_rows_counted_once(self):
+		keep_agent_settings(self)
+		# the ticket is made with the agent off, so its insert hook queues no run
+		set_agent_settings(enabled=0)
+		ticket = make_ticket(subject=f"{PREFIX}phân loại lại")
+		rows = []
+		for category, days_ago in (("A", 3), ("B", 2)):
+			name = make_log_entry(
+				ticket=ticket.name,
+				run_id=f"{PREFIX}{category}",
+				entry_type="classify",
+				predicted_category=category,
+				**{f"predicted_{field}": value for field, value in PREDICTED.items()},
+			)
+			frappe.db.set_value(
+				LOG_DOCTYPE, name, "creation", self.now - timedelta(days=days_ago), update_modified=False
+			)
+			rows.append(name)
+
+		# a person sets the priority (not the predicted one): the handler writes the label on the reference row
+		ticket.reload()
+		ticket.priority = "High" if ticket.priority == "Urgent" else "Urgent"
+		ticket.save(ignore_permissions=True)
+
+		self.assertTrue(frappe.db.get_value(LOG_DOCTYPE, rows[0], "human_corrected_to"))
+		self.assertFalse(frappe.db.get_value(LOG_DOCTYPE, rows[1], "human_corrected_to"))
+		report = self._rows()
+		numbers = ("predictions", "labeled", "correct")
+		self.assertEqual(tuple(report["A"].get(key) for key in numbers), (1, 1, 0))
+		self.assertEqual(tuple(report["B"].get(key) for key in numbers), (0, 0, 0))
+		self.assertEqual(report["Tổng"].get("predictions"), 1)

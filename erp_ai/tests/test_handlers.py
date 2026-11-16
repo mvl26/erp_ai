@@ -370,7 +370,8 @@ class TestCommentHandler(HandlerTestCase):
 
 
 class TestHumanCorrection(HandlerTestCase):
-	"""AC-11: a person's change to the classification is recorded on the latest `classify` log row."""
+	"""AC-11: a person's change to the classification is recorded on the ticket's reference `classify` row, its
+	first row with a result (ADR-037 QĐ 5, T114): the row the ERP AI Accuracy report reads."""
 
 	FIRST_CORRECTION_AT = "2026-01-01 08:00:00"
 	PAST = "2020-01-01 00:00:00"
@@ -397,19 +398,22 @@ class TestHumanCorrection(HandlerTestCase):
 		ticket.priority = priority
 		ticket.save(ignore_permissions=True)
 
-	def test_human_correction_updates_latest_log(self):
-		ticket, older_log = self._classified_ticket(run_id=f"{PREFIX}old")
-		latest_log = make_log_entry(
+	def test_two_result_rows_correction_lands_on_first(self):
+		# ADR-037 QĐ 5 (T114): a ticket classified again has two rows with a result; the correction goes on the first
+		# (it replaces "updates the latest row": the handler moved from the latest row to the reference row)
+		ticket, first_log = self._classified_ticket(run_id=f"{PREFIX}old")
+		later_log = make_log_entry(
 			ticket=ticket.name,
 			entry_type="classify",
 			predicted_category="B",
 			run_id=f"{PREFIX}new",
 		)
-		frappe.db.set_value(LOG_DOCTYPE, older_log, "creation", self.PAST, update_modified=False)
+		frappe.db.set_value(LOG_DOCTYPE, first_log, "creation", self.PAST, update_modified=False)
+		self.assertEqual(handlers.reference_classify_row(ticket.name), first_log)
 
 		self._save_priority(ticket, "High")
 
-		first = self._log(latest_log)
+		first = self._log(first_log)
 		self.assertEqual(
 			json.loads(first.human_corrected_to),
 			{"ticket_type": ticket.ticket_type, "agent_group": ticket.agent_group, "priority": "High"},
@@ -417,17 +421,36 @@ class TestHumanCorrection(HandlerTestCase):
 		self.assertEqual(first.human_corrected_by, "Administrator")
 		self.assertTrue(first.human_corrected_at)
 		self.assertEqual(self._classified_by(ticket), "Người")
-		self.assertIsNone(self._log(older_log).human_corrected_to)
+		self.assertIsNone(self._log(later_log).human_corrected_to)
 
 		# Second correction: the value is the last one, the time stays the first one.
 		frappe.db.set_value(
-			LOG_DOCTYPE, latest_log, "human_corrected_at", self.FIRST_CORRECTION_AT, update_modified=False
+			LOG_DOCTYPE, first_log, "human_corrected_at", self.FIRST_CORRECTION_AT, update_modified=False
 		)
 		self._save_priority(ticket, "Urgent")
 
-		second = self._log(latest_log)
+		second = self._log(first_log)
 		self.assertEqual(json.loads(second.human_corrected_to)["priority"], "Urgent")
 		self.assertEqual(str(second.human_corrected_at), self.FIRST_CORRECTION_AT)
+		self.assertIsNone(self._log(later_log).human_corrected_to)
+
+	def test_reference_row_is_the_first_with_a_result(self):
+		# a failed run's row (no category) and a row of another entry type are never the reference
+		ticket = self._ticket_without_job(priority="Low")
+		self.assertIsNone(handlers.reference_classify_row(ticket.name))
+		failed = make_log_entry(ticket=ticket.name, entry_type="classify", run_id=f"{PREFIX}failed")
+		reason = make_log_entry(ticket=ticket.name, entry_type="reason", turn=1, run_id=f"{PREFIX}failed")
+		for name in (failed, reason):
+			frappe.db.set_value(LOG_DOCTYPE, name, "creation", self.PAST, update_modified=False)
+		self.assertIsNone(handlers.reference_classify_row(ticket.name))
+		result = make_log_entry(
+			ticket=ticket.name, entry_type="classify", predicted_category="C", run_id=f"{PREFIX}ok"
+		)
+		make_log_entry(
+			ticket=ticket.name, entry_type="classify", predicted_category="A", run_id=f"{PREFIX}again"
+		)
+		frappe.db.set_value(LOG_DOCTYPE, result, "creation", self.FIRST_CORRECTION_AT, update_modified=False)
+		self.assertEqual(handlers.reference_classify_row(ticket.name), result)
 
 	def test_correction_does_not_touch_modified_of_the_log(self):
 		ticket, log = self._classified_ticket()

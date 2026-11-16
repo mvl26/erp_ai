@@ -16,7 +16,7 @@ from frappe.utils.synchronization import filelock
 
 from erp_ai.agent import authority, ops_data, policy, run_log
 from erp_ai.agent.classification import load_mapping
-from erp_ai.constants import LEVELS, LOG_DOCTYPE, LOGGER_NAME, SETTING_DOCTYPE
+from erp_ai.constants import AGENT_USER, LEVELS, LOG_DOCTYPE, LOGGER_NAME, SETTING_DOCTYPE
 
 DUE_REMINDER_TOOL = "due_reminder"
 MILESTONE_REMINDER_TOOL = "milestone_reminder"
@@ -39,6 +39,7 @@ REMINDER_TOOLS = (DUE_REMINDER_TOOL, MILESTONE_REMINDER_TOOL)
 
 TICKET = ops_data.TICKET
 COMMENT_DOCTYPE = "Comment"  # the record HD Ticket.new_comment makes (Document.add_comment), U5b.md:356
+NOTIFICATION_DOCTYPE = "Notification Log"
 LOCK_TIMEOUT_S = 5
 DUE_CATEGORIES = ("D", "E")
 DUE_KINDS = (KIND_DUE_SOON, KIND_OVERDUE)
@@ -177,9 +178,8 @@ def _run_locked(now: datetime, logger) -> None:
 	people = _people_in_charge(sorted({reminder.ticket for reminder in reminders}))
 	counts = dict.fromkeys(SUMMARY_COUNTS, 0)
 	for reminder in sorted(reminders, key=lambda reminder: (reminder.created, reminder.ticket)):
-		if policy.can_send_ticket(reminder.ticket):
-			_remind_on_ticket(reminder, people.get(reminder.ticket, []), settings)
-			counts[reminder.kind] += 1
+		if counted := _remind(reminder, people.get(reminder.ticket, []), settings):
+			counts[counted] += 1
 	logger.info(SUMMARY, *(counts[name] for name in SUMMARY_COUNTS), capped)
 
 
@@ -267,12 +267,50 @@ def _value_after(reminder: _Reminder, users: list[str]) -> dict:
 	return {"kind": reminder.kind, "assignees": users}
 
 
+def _remind(reminder: _Reminder, users: list[str], settings) -> str | None:
+	"""One (ticket, kind): a comment on a ticket the agent may take (policy.can_send_ticket); else a coded notice to
+	each person in charge, or nothing and no key when there is none (A-U5b-6: tried again next run). Returns the
+	summary count to add one to."""
+	if policy.can_send_ticket(reminder.ticket):
+		_remind_on_ticket(reminder, users, settings)
+		return reminder.kind
+	if not users:
+		return NO_ASSIGNEE
+	_notify_by_code(reminder, users, settings)
+	return reminder.kind
+
+
 def _remind_on_ticket(reminder: _Reminder, users: list[str], settings) -> None:
-	"""A comment of the agent account on a sendable ticket, then its cycle key (the bot_action row, written last:
-	its commit covers both)."""
+	"""A comment of the agent account on the ticket, then its cycle key."""
 	text = TEXT_BY_KIND[reminder.kind].format(**_text_values(reminder, settings), people=_people_text(users))
 	comment = frappe.get_doc(TICKET, reminder.ticket).new_comment(text)
-	entry = run_log.action_entry(
-		TOOL_BY_KIND[reminder.kind], COMMENT_DOCTYPE, comment, True, value_after=_value_after(reminder, users)
-	)
+	_write_key(reminder, COMMENT_DOCTYPE, comment, _value_after(reminder, users))
+
+
+def _notify_by_code(reminder: _Reminder, users: list[str], settings) -> None:
+	"""A Notification Log from the agent account to each person in charge of a ticket the agent may not take, with
+	the ticket number and the deadline only (A-12, NFR-1), then its cycle key; nothing is written on the ticket."""
+	subject = CODE_SUBJECT[reminder.kind].format(**_text_values(reminder, settings))
+	notices = [
+		frappe.get_doc(
+			{
+				"doctype": NOTIFICATION_DOCTYPE,
+				"for_user": user,
+				"from_user": AGENT_USER,
+				"type": "Alert",
+				"document_type": TICKET,
+				"document_name": reminder.ticket,
+				"subject": subject,
+			}
+		)
+		.insert(ignore_permissions=True)
+		.name
+		for user in users
+	]
+	_write_key(reminder, NOTIFICATION_DOCTYPE, notices[0], {**_value_after(reminder, users), "by_code": True})
+
+
+def _write_key(reminder: _Reminder, doctype: str, name: str, value_after: dict) -> None:
+	"""The reminder's bot_action row, written last: outside tests its commit covers the reminder and its key."""
+	entry = run_log.action_entry(TOOL_BY_KIND[reminder.kind], doctype, name, True, value_after=value_after)
 	run_log.write_bot_action(trigger=run_log.TRIGGER_SCHEDULED_JOB, ticket=reminder.ticket, actions=[entry])

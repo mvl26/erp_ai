@@ -12,8 +12,10 @@ from erp_ai.agent import answer_delay, policy, runner
 from erp_ai.agent.policy import contains_keyword
 from erp_ai.agent.queue import PENDING_JOB_IDS_FLAG
 from erp_ai.agent.run_log import write_entry
+from erp_ai.agent.tools import write_ticket
 from erp_ai.constants import (
 	AGENT_USER,
+	CLASSIFICATION_FIELDS,
 	LOG_DOCTYPE,
 	LOGGER_NAME,
 	PANEL_METHODS,
@@ -22,9 +24,17 @@ from erp_ai.constants import (
 )
 from erp_ai.test_utils import FakeGateway, make_model_result, record_status_signals, set_agent_settings
 
-AI_FIELD_LABELS = (
+# What the panel lists about the ticket, in display order: what the bot classified, then its AI fields.
+INFO_FIELD_LABELS = (
+	("ticket_type", "Loại"),
+	("agent_group", "Nhóm"),
+	("priority", "Ưu tiên"),
 	("ai_resolution_hint", "Hướng giải quyết (AI)"),
 	("ai_confidence", "Độ tin cậy (AI)"),
+	("ai_confidence_pct", "Độ tin cậy % (AI)"),
+	("ai_complexity", "Độ phức tạp (AI)"),
+	("ai_importance", "Độ quan trọng (AI)"),
+	("ai_score_reason", "Lý do chấm điểm (AI)"),
 	("ai_classified_by", "Phân loại bởi"),
 	("ai_updated_at", "AI cập nhật lúc"),
 )
@@ -116,17 +126,52 @@ class TestTicketPanelRead(FrappeTestCase):
 		self.assertEqual(by_name["ai_updated_at"], "12-11-2026 10:05:00")
 
 	def test_read_empty_ai_fields_are_null(self):
-		data = self._read()
-		self.assertEqual(len(data["ai_fields"]), 4)
-		for item in data["ai_fields"]:
+		ai_items = [item for item in self._read()["ai_fields"] if item["fieldname"].startswith("ai_")]
+		self.assertEqual(len(ai_items), 8)
+		for item in ai_items:
 			with self.subTest(field=item["fieldname"]):
 				self.assertIsNone(item["text"])
 
-	def test_read_ai_fields_use_hd_ticket_labels(self):
+	def test_read_lists_classification_then_ai_fields_with_labels(self):
 		data = self._read()
 		self.assertEqual(
-			[(item["fieldname"], item["label"]) for item in data["ai_fields"]], list(AI_FIELD_LABELS)
+			[(item["fieldname"], item["label"]) for item in data["ai_fields"]], list(INFO_FIELD_LABELS)
 		)
+		meta = frappe.get_meta("HD Ticket")
+		for name in ticket_panel.AI_FIELDS:
+			with self.subTest(field=name):
+				self.assertEqual(dict(INFO_FIELD_LABELS)[name], meta.get_label(name))
+		# One wording for the three fields: the bot's own "Đã làm" line uses the same labels.
+		self.assertEqual(ticket_panel.CLASSIFICATION_LABELS, write_ticket.FIELD_LABELS)
+		self.assertEqual(tuple(ticket_panel.CLASSIFICATION_LABELS), CLASSIFICATION_FIELDS)
+
+	def test_read_returns_classification_and_scores_stored_on_the_ticket(self):
+		# What the bot filled in is the ticket's own information: the panel reads it from the record.
+		frappe.db.set_value(
+			"HD Ticket",
+			self.ticket.name,
+			{
+				"ticket_type": "Câu hỏi, phiếu nhiễu",
+				"priority": "Low",
+				"ai_confidence_pct": 88,
+				"ai_complexity": 1,
+				"ai_importance": 2,
+				"ai_score_reason": "Chỉ cần hướng dẫn thao tác có sẵn.",
+			},
+		)
+		by_name = {item["fieldname"]: item["text"] for item in self._read()["ai_fields"]}
+		self.assertEqual(by_name["ticket_type"], "Câu hỏi, phiếu nhiễu")
+		self.assertEqual(by_name["priority"], "Low")
+		self.assertEqual(by_name["ai_confidence_pct"], "88")
+		self.assertEqual(by_name["ai_complexity"], "1")
+		self.assertEqual(by_name["ai_importance"], "2")
+		self.assertEqual(by_name["ai_score_reason"], "Chỉ cần hướng dẫn thao tác có sẵn.")
+
+	def test_read_returns_the_team_stored_on_the_ticket(self):
+		# Read as Administrator: a team the test agent is not in must not make this a permission test.
+		frappe.db.set_value("HD Ticket", self.ticket.name, "agent_group", "Panel Test Team")
+		by_name = {item["fieldname"]: item["text"] for item in self._read("Administrator")["ai_fields"]}
+		self.assertEqual(by_name["agent_group"], "Panel Test Team")
 
 	def test_read_denied_for_non_agents_and_guest(self):
 		_make_user(WEBSITE_EMAIL)
@@ -153,12 +198,12 @@ class TestTicketPanelRead(FrappeTestCase):
 
 	def test_read_hides_fields_above_the_callers_permlevel(self):
 		frappe.db.set_value("HD Ticket", self.ticket.name, "ai_updated_at", "2026-11-12 10:05:00")
-		self.assertEqual(self._read()["ai_fields"][3]["text"], "12-11-2026 10:05:00")
+		self.assertEqual(self._read()["ai_fields"][-1]["text"], "12-11-2026 10:05:00")
 		self.addCleanup(frappe.clear_cache, doctype="HD Ticket")
 		permlevel = frappe.get_meta("HD Ticket").get_field("ai_updated_at").permlevel
 		frappe.permissions.update_permission_property("HD Ticket", "Agent", permlevel, "read", 0)
 		frappe.clear_cache(doctype="HD Ticket")
-		self.assertIsNone(self._read()["ai_fields"][3]["text"])
+		self.assertIsNone(self._read()["ai_fields"][-1]["text"])
 
 	def test_read_denied_for_agent_without_ticket_read(self):
 		frappe.set_user("Administrator")
@@ -218,11 +263,12 @@ class TestTicketPanelThread(FrappeTestCase):
 		self.assertRegex(messages[0]["created_at"], r"^\d{2}-\d{2}-\d{4} 10:02:00$")
 		self.assertEqual(messages[0]["author"], frappe.utils.get_fullname("Administrator"))
 
-	def test_thread_selects_nothing_for_humans_when_keyword_is_empty(self):
+	def test_thread_is_empty_when_keyword_is_empty(self):
+		# Without a keyword nobody can speak to the bot in a comment: no conversation to show.
 		set_agent_settings(trigger_keyword="")
-		_add_comment(self.ticket, f"{KEYWORD} human")
-		bot = _add_comment(self.ticket, "bot reply", AGENT_USER)
-		self.assertEqual([m["name"] for m in self._messages()], [bot])
+		_add_comment(self.ticket, f"{KEYWORD} human", creation="2026-11-12 10:00:00")
+		_add_comment(self.ticket, "bot reply", AGENT_USER, "2026-11-12 10:01:00")
+		self.assertEqual(self._messages(), [])
 
 	def test_thread_ignores_non_comment_types(self):
 		for comment_type in ("Info", "Assignment Completed", "Like", "Label"):
@@ -237,6 +283,21 @@ class TestTicketPanelThread(FrappeTestCase):
 		messages = self._messages()
 		self.assertEqual([m["is_bot"] for m in messages], [False, True])
 		self.assertEqual(messages[1]["author"], frappe.utils.get_fullname(AGENT_USER))
+
+	def test_thread_leaves_out_what_the_bot_wrote_before_anyone_spoke(self):
+		# What the bot wrote at ticket creation is ticket information, not conversation.
+		_add_comment(self.ticket, "<p>Bot đã phân loại phiếu.</p>", AGENT_USER, "2026-11-12 10:00:00")
+		_add_comment(self.ticket, "bot notice", AGENT_USER, "2026-11-12 10:01:00")
+		_add_comment(self.ticket, "plain human chat", creation="2026-11-12 10:02:00")
+		self.assertEqual(self._messages(), [])
+
+	def test_thread_starts_at_the_first_message_to_the_bot(self):
+		_add_comment(self.ticket, "bot guidance at creation", AGENT_USER, "2026-11-12 10:00:00")
+		asked = _add_comment(self.ticket, f"{KEYWORD} how to reset?", creation="2026-11-12 10:02:00")
+		reply = _add_comment(self.ticket, "bot answer", AGENT_USER, "2026-11-12 10:03:00")
+		messages = self._messages()
+		self.assertEqual([m["name"] for m in messages], [asked, reply])
+		self.assertEqual([m["is_bot"] for m in messages], [False, True])
 
 	def test_read_strips_xss_payloads_to_text(self):
 		payload = (

@@ -166,6 +166,9 @@ scheduler_events = {
 	"daily": ["erp_ai.tasks.recompute_monthly_spend", "erp_ai.tasks.check_privilege_escalation"],
 	"cron": {
 		"*/15 * * * *": ["erp_ai.agent.missed_scan.scan_missed_tickets"],
+		"0 8 * * *": ["erp_ai.schedules.enqueue_daily_report"],
+		"0 8 * * 1": ["erp_ai.schedules.enqueue_weekly_kpi"],
+		"0 8 1 * *": ["erp_ai.schedules.enqueue_monthly_review"],
 	},
 }
 

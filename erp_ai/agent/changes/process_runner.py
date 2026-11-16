@@ -1,4 +1,4 @@
-"""The one module in `erp_ai/agent/changes/` that starts processes: bench and git add/commit/rm (ADR-013 decisions 3, 7; ADR-022; design 3.5/4.3, D-3, D-5, D-12)."""
+"""The one module in `erp_ai/agent/changes/` that starts processes: bench, the console child and git add/commit/rm (ADR-013 decisions 3, 7; ADR-022; design 3.5/4.3, D-3, D-5, D-12; CHG-010)."""
 
 import os
 import subprocess
@@ -20,6 +20,8 @@ OUTPUT_MAX_LINES = source.READ_MAX_LINES
 OUTPUT_LINE_MAX_CHARS = 1000
 GIT_OUTPUT_MAX_LINES = 20
 NOT_FOUND_EXIT_CODE = 127
+# CHG-010: the console child is `bench --site <site> execute CONSOLE_ENTRY`, the script on its stdin.
+CONSOLE_ENTRY = "erp_ai.console_entry.run"
 RESTART_ARGV = (
 	source.SETSID_EXECUTABLE,
 	"-f",
@@ -75,6 +77,25 @@ def run_bench(args: list[str], limit_s: int) -> CommandResult:
 		limit_s=limit_s,
 		backstop_s=JOB_SAFETY_MARGIN_S // 2,
 		max_lines=OUTPUT_MAX_LINES,
+	)
+
+
+def run_console(script: str, site: str, limit_s: int) -> CommandResult:
+	"""Run an approved console script once (CHG-010): `bench --site <site> execute erp_ai.console_entry.run`
+	in the bench directory with `script` on stdin (never written to a file), killed with its process group
+	after limit_s. The child commits only when the script returns; its output is cut like `run_bench`."""
+	if not isinstance(script, str) or not script.strip():
+		raise ValueError("script must be non-empty text")
+	args = ["--site", site, "execute", CONSOLE_ENTRY]
+	_check_bench_call(args, limit_s)
+	return _run_wrapped(
+		[source.BENCH_EXECUTABLE, *args],
+		cwd=frappe.utils.get_bench_path(),
+		env=_minimal_env(),
+		limit_s=limit_s,
+		backstop_s=JOB_SAFETY_MARGIN_S // 2,
+		max_lines=OUTPUT_MAX_LINES,
+		input_text=script,
 	)
 
 
@@ -179,15 +200,21 @@ def launch_restart() -> tuple[bool, str | None]:
 	return True, None
 
 
-def _run_wrapped(command, *, cwd, env, limit_s, backstop_s, max_lines) -> CommandResult:
-	"""Run `timeout -s KILL limit_s *command` in its own process group; timed out like ADR-013 QĐ 7."""
+def _run_wrapped(
+	command, *, cwd, env, limit_s, backstop_s, max_lines, input_text: str | None = None
+) -> CommandResult:
+	"""Run `timeout -s KILL limit_s *command` in its own process group; timed out like ADR-013 QĐ 7.
+
+	`input_text` is written to the child's stdin (CHG-010: the console script); without it stdin is DEVNULL.
+	"""
+	# `subprocess.run` refuses `stdin=` next to `input=`, so exactly one of the two is passed.
+	feed = {"stdin": subprocess.DEVNULL} if input_text is None else {"input": input_text}
 	started = time.monotonic()
 	try:
 		done = subprocess.run(
 			[source.TIMEOUT_EXECUTABLE, "-s", "KILL", str(limit_s), *command],
 			cwd=cwd,
 			env=env,
-			stdin=subprocess.DEVNULL,
 			stdout=subprocess.PIPE,
 			stderr=subprocess.STDOUT,
 			text=True,
@@ -195,6 +222,7 @@ def _run_wrapped(command, *, cwd, env, limit_s, backstop_s, max_lines) -> Comman
 			errors="replace",
 			timeout=limit_s + backstop_s,
 			start_new_session=True,
+			**feed,
 		)
 	except subprocess.TimeoutExpired as expired:
 		return CommandResult(

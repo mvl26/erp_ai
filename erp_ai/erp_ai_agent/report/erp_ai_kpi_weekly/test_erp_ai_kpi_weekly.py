@@ -53,8 +53,11 @@ class TestReport(FrappeTestCase):
 				"doctype": KPI_WEEK,
 				"week_start": LAST_WEEK,
 				"first_response_median_min": 9.25,
+				"first_response_sample": 3,
 				"complete_fields_pct": 80,
+				"complete_fields_sample": 5,
 				"b_resolution_avg_hours": None,
+				"b_resolution_sample": 0,
 				"stale_over_5_days": 7,
 			}
 		).insert()
@@ -63,10 +66,15 @@ class TestReport(FrappeTestCase):
 				"doctype": KPI_WEEK,
 				"week_start": THIS_WEEK,
 				"first_response_median_min": 4,
+				"first_response_sample": 2,
 				"complete_fields_pct": 100,
+				"complete_fields_sample": 6,
 				"closed_without_human_pct": 12.5,
+				"closed_sample": 4,
 				"b_resolution_avg_hours": 3.5,
+				"b_resolution_sample": 2,
 				"c_task_in_3_days_pct": None,
+				"c_task_sample": 0,
 				"stale_over_5_days": 0,
 			}
 		).insert()

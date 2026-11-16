@@ -9,7 +9,13 @@ from helpdesk.test_utils import make_ticket
 
 from erp_ai.agent import due_checks, run_log
 from erp_ai.constants import AGENT_USER, LOG_DOCTYPE, LOGGER_NAME, SETTING_DOCTYPE
-from erp_ai.test_utils import keep_agent_settings, make_active_agent, pin_agent_roles, set_agent_settings
+from erp_ai.test_utils import (
+	keep_agent_settings,
+	make_active_agent,
+	make_team,
+	pin_agent_roles,
+	set_agent_settings,
+)
 
 NOW = datetime(2026, 11, 18, 10, 0)
 TICKET = "HD Ticket"
@@ -128,6 +134,34 @@ def _mention(user: str) -> str:
 	return f'<span class="mention" data-type="mention" data-id="{user}" data-label="{label}">@{label}</span>'
 
 
+def _notices(ticket: str) -> list:
+	"""The Notification Log rows the agent account wrote about `ticket` (an assignment's own notice is not one)."""
+	return frappe.get_all(
+		"Notification Log",
+		filters={"document_type": TICKET, "document_name": ticket, "from_user": AGENT_USER},
+		fields=["name", "for_user", "subject", "type"],
+		order_by="creation asc",
+	)
+
+
+SEED_DOCTYPES = ("Notification Log", LOG_DOCTYPE, "Error Log", "Email Queue")
+TEXT_FIELD_TYPES = ("Data", "Small Text", "Text", "Long Text", "Text Editor", "Code", "JSON", "HTML Editor")
+
+
+def _seed_rows(seed: str) -> dict[str, int]:
+	"""How many rows of each of SEED_DOCTYPES hold `seed` in a text column."""
+	counts = {}
+	for doctype in SEED_DOCTYPES:
+		fields = [
+			field.fieldname
+			for field in frappe.get_meta(doctype).fields
+			if field.fieldtype in TEXT_FIELD_TYPES
+		]
+		or_filters = [[field, "like", f"%{seed}%"] for field in fields]
+		counts[doctype] = len(frappe.get_all(doctype, or_filters=or_filters, pluck="name"))
+	return counts
+
+
 class DueChecksTestCase(FrappeTestCase):
 	"""Own tickets and settings, rolled back after each test; the agent account pinned to its production roles;
 	the job never commits in a test."""
@@ -158,6 +192,12 @@ class DueChecksTestCase(FrappeTestCase):
 	def _settings(self, **fields) -> None:
 		set_agent_settings(**fields)
 		frappe.db.value_cache.pop(SETTING_DOCTYPE, None)
+
+	def _excluded_team(self) -> str:
+		"""A team listed in excluded_teams: the agent may not take its tickets (ADR-034)."""
+		team = make_team(self)
+		self._settings(excluded_teams=team)
+		return team
 
 	def _run(self, now: datetime) -> None:
 		"""One run of the job at `now`; the job leaves the agent session on, the test goes on as Administrator."""
@@ -218,10 +258,23 @@ class TestDueReminder(DueChecksTestCase):
 			("E", "overdue"): ({"resolution_by": past}, past, "overdue"),
 			("E", "closed"): ({"resolution_by": soon, **_closed()}, soon, None),
 		}
+		# D of an excluded team, two people in charge: a coded notice to each of them, never a comment (A-12)
+		team = self._excluded_team()
+		people = [make_active_agent(self), make_active_agent(self)]
+		cases.update(
+			{
+				("D excluded", "due_soon"): ({DUE_FIELD: soon, "agent_group": team}, soon, "due_soon"),
+				("D excluded", "overdue"): ({DUE_FIELD: past, "agent_group": team}, past, "overdue"),
+				("D excluded", "closed"): ({DUE_FIELD: past, "agent_group": team, **_closed()}, past, None),
+			}
+		)
 		tickets = {
-			case: _ticket(case[0], NOW - timedelta(hours=1), **values)
+			case: _ticket(case[0][0], NOW - timedelta(hours=1), **values)
 			for case, (values, _, _) in cases.items()
 		}
+		for case, ticket in tickets.items():
+			if case[0] == "D excluded":
+				_assign(ticket, *people)
 
 		self._run(NOW)
 
@@ -231,14 +284,26 @@ class TestDueReminder(DueChecksTestCase):
 				comments = _agent_comments(ticket)
 				if kind is None:
 					self.assertEqual(comments, [])
+					self.assertEqual(_notices(ticket), [])
 					self.assertEqual(due_checks.sent_keys([ticket]), set())
+					continue
+				self.assertEqual(due_checks.sent_keys([ticket]), {(ticket, kind, _iso(deadline))})
+				if case[0] == "D excluded":
+					self.assertEqual(comments, [])
+					subject = due_checks.CODE_SUBJECT[kind].format(
+						name=ticket, hours=24, deadline=_shown(deadline)
+					)
+					self.assertEqual(
+						[(row.for_user, row.type, row.subject) for row in _notices(ticket)],
+						[(person, "Alert", subject) for person in people],
+					)
 					continue
 				text = due_checks.DUE_SOON_TEXT if kind == "due_soon" else due_checks.OVERDUE_TEXT
 				expected = text.format(
 					hours=24, deadline=_shown(deadline), people=due_checks.NO_ASSIGNEE_TEXT
 				)
 				self.assertEqual([row.content for row in comments], [expected])
-				self.assertEqual(due_checks.sent_keys([ticket]), {(ticket, kind, _iso(deadline))})
+				self.assertEqual(_notices(ticket), [])
 
 	def test_first_seen_overdue_only_overdue(self):
 		deadline = NOW - timedelta(hours=3)
@@ -382,6 +447,70 @@ class TestDueReminder(DueChecksTestCase):
 		for deadline, hours, expected in cases:
 			with self.subTest(deadline=deadline, hours=hours):
 				self.assertEqual(due_checks.due_kind(deadline, NOW, hours), expected)
+
+
+class TestExcluded(DueChecksTestCase):
+	def test_seeded_string_never_leaves_ticket(self):
+		seed = f"ERPAI-SEED-{frappe.generate_hash(length=10)}"
+		deadline = NOW + timedelta(hours=3)
+		team = self._excluded_team()
+		ticket = _ticket("D", NOW - timedelta(hours=1), agent_group=team, **{DUE_FIELD: deadline})
+		frappe.db.set_value(
+			TICKET,
+			ticket,
+			{"subject": f"{seed} tiêu đề", "description": f"<p>{seed} mô tả</p>"},
+			update_modified=False,
+		)
+		person = make_active_agent(self)
+		_assign(ticket, person)
+		before = _seed_rows(seed)
+
+		with (
+			patch("erp_ai.gateway.call_model", side_effect=AssertionError("the model gateway was called")),
+			patch("erp_ai.gateway.client.send", side_effect=AssertionError("the model client was called")),
+		):
+			self._run(NOW)
+
+		self.assertEqual(_agent_comments(ticket), [])
+		notices = _notices(ticket)
+		self.assertEqual(
+			[(row.for_user, row.type, row.subject) for row in notices],
+			[(person, "Alert", f"Phiếu #{ticket}: còn dưới 24 giờ tới hạn {_shown(deadline)}")],
+		)
+		self.assertEqual(_seed_rows(seed), before)
+		after = {"kind": "due_soon", "deadline": _iso(deadline), "assignees": [person], "by_code": True}
+		self.assertEqual(
+			[json.loads(row.actions) for row in _bot_rows(ticket)],
+			[
+				[
+					run_log.action_entry(
+						"due_reminder", "Notification Log", notices[0].name, True, value_after=after
+					)
+				]
+			],
+		)
+
+	def test_no_assignee_no_key_then_reminded_after_assign(self):
+		deadline = NOW - timedelta(hours=2)
+		team = self._excluded_team()
+		ticket = _ticket("E", NOW - timedelta(hours=5), agent_group=team, resolution_by=deadline)
+
+		with patch("frappe.logger") as get_logger:
+			self._run(NOW)
+
+		self.assertEqual((_notices(ticket), _agent_comments(ticket), _bot_rows(ticket)), ([], [], []))
+		summaries = [
+			args[0][1:] for args in get_logger.return_value.info.call_args_list if args[0][0] == SUMMARY
+		]
+		self.assertEqual(summaries, [(0, 0, 0, 0, 0, 1, False)])
+
+		person = make_active_agent(self)
+		_assign(ticket, person)
+		self._run(NOW + timedelta(minutes=15))
+
+		self.assertEqual([row.for_user for row in _notices(ticket)], [person])
+		self.assertEqual(_agent_comments(ticket), [])
+		self.assertEqual(due_checks.sent_keys([ticket]), {(ticket, "overdue", _iso(deadline))})
 
 
 class TestGates(DueChecksTestCase):

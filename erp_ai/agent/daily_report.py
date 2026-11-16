@@ -297,7 +297,7 @@ def run_daily_report(now: datetime | None = None) -> None:
 	only, in the same transaction as the email (design 3.6.3, ADR-033 QĐ 6).
 
 	Nothing leaves this function as an error: a busy lock, an empty recipient list, a weekend with the
-	weekend switch off and a failed send are logged and the job returns (AC-52).
+	weekend switch off and a failed build, render or send are logged and the job returns (AC-52).
 	"""
 	logger = frappe.logger(LOGGER_NAME)
 	try:
@@ -322,19 +322,25 @@ def _run_locked(now: datetime, logger) -> None:
 	if not recipients:
 		logger.info("daily_report: chưa có người nhận")
 		return
-	data = build_daily_report(datetime.combine(cycle, CYCLE_START))
+	step = "build"
 	try:
+		data = build_daily_report(datetime.combine(cycle, CYCLE_START))
+		message = render_daily_report(data)
+		step = "send"
 		frappe.sendmail(
 			recipients=recipients,
 			subject=SUBJECT_FORMAT.format(cycle=cycle),
-			message=render_daily_report(data),
+			message=message,
 			delayed=True,
 		)
 		frappe.db.set_single_value(SETTING_DOCTYPE, "daily_report_sent_on", cycle)
-	except (frappe.ValidationError, frappe.OutgoingEmailError) as exc:
+	except Exception as exc:
 		frappe.db.rollback()
-		frappe.log_error(TITLE_DAILY_REPORT_FAILED, f"send error={type(exc).__name__}")
+		frappe.log_error(TITLE_DAILY_REPORT_FAILED, f"{step} error={type(exc).__name__}")
 		return
+	if not frappe.flags.in_test:
+		# the lock is released after this function: the watermark must be durable by then
+		frappe.db.commit()
 	logger.info(
 		"erp_ai daily_report: %s new tickets, %s past the response mark",
 		len(data["new_list"]),

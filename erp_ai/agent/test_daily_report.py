@@ -882,7 +882,7 @@ class TestRun(FrappeTestCase):
 		events = []
 		with (
 			patch("erp_ai.agent.daily_report.filelock") as lock,
-			patch.object(frappe.flags, "in_test", False),
+			patch.dict(frappe.flags, {"in_test": False}),
 			patch("frappe.db.commit", side_effect=lambda: events.append("commit")),
 		):
 			lock.return_value.__exit__.side_effect = lambda *args: events.append("release")

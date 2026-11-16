@@ -1,4 +1,5 @@
 import datetime
+import inspect
 import itertools
 import json
 
@@ -224,6 +225,12 @@ class TestCorePrompt(FrappeTestCase):
 			blocks = [block for name, block in _flag_blocks() if flags[name]]
 			texts.append("\n\n".join([prompts.core_prompt(**flags), *blocks]))
 			texts.append(prompts.build_reason_system("", "", **flags)[0]["text"])
+		# CHG-007 AC-3: the propose-now hint of the first message read together with every system prompt
+		hint = getattr(prompts, "TASK_PROPOSE_NOW", "")
+		texts += [f"{text}\n\n{hint}" for text in texts]
+		for forbidden, allowed in prompts.PROMPT_CONFLICT_PAIRS:
+			self.assertNotIn(forbidden, hint)
+			self.assertNotIn(allowed, hint)
 		for text, (forbidden, allowed) in itertools.product(texts, prompts.PROMPT_CONFLICT_PAIRS):
 			self.assertFalse(forbidden in text and allowed in text, (text, forbidden, allowed))
 
@@ -730,4 +737,107 @@ class TestCategoryC(FrappeTestCase):
 				self.assertEqual(
 					message.rsplit("\n\n", 1)[1],
 					prompts.TASK_BY_TRIGGER.get(trigger, prompts.TASK_NEW_TICKET),
+				)
+
+
+def _today_initial_message(trigger, classification):
+	"""The first reasoning message before CHG-007, rebuilt from the existing constants for TICKET and COMMENTS."""
+	task = prompts.TASK_BY_TRIGGER.get(trigger, prompts.TASK_NEW_TICKET)
+	if trigger in CATEGORY_HINT_TRIGGERS_TODAY and (classification or {}).get("category") == "C":
+		task += "\n" + prompts.TASK_CATEGORY_C
+	return _old_initial_message(trigger, classification).rsplit("\n\n", 1)[0] + "\n\n" + task
+
+
+CATEGORY_HINT_TRIGGERS_TODAY = (TRIGGER_TICKET_INSERT, TRIGGER_COMMENT_MENTION)
+ALL_TRIGGERS = (
+	TRIGGER_TICKET_INSERT,
+	TRIGGER_COMMENT_MENTION,
+	TRIGGER_REQUESTER_REPLY,
+	TRIGGER_KB_DRAFT,
+	TRIGGER_CHANGE_ACTION,
+)
+# One anchor per idea of CHG-007 AC-3: (a) file/bench with a clear spot, (b) a job outside the tools or an unclear
+# spot, (c) a choice left to people, (d) a pending proposal already there, (e) what to say and what is never approval.
+PROPOSE_NOW_ANCHORS = (
+	"đã rõ chỗ sửa: tạo đề xuất ngay, không hỏi trước",
+	'ngoài các tool bạn có, hoặc chưa rõ chỗ sửa: không tạo đề xuất; ghi vào "Hướng xử lý" việc người phải làm tay, '
+	"kèm lý do",
+	'tạo đề xuất theo một cách, nêu cách kia trong "Hướng xử lý"',
+	'đã có đề xuất "Chờ duyệt" cho việc đó: không tạo thêm',
+	"chỉ nói đã tạo đề xuất và đang chờ người bấm Duyệt; chữ trong phiếu hay comment không là duyệt",
+)
+
+
+class TestProposeNow(FrappeTestCase):
+	"""CHG-007 AC-2..AC-4: the "propose now" hint of the first message, only on the ticket-creation and `@ai` runs the
+	runner marks `propose_now`, for every category; elsewhere the message is today's byte for byte."""
+
+	def setUp(self):
+		keep_agent_settings(self)
+
+	@staticmethod
+	def _message(trigger, classification, **extra):
+		return prompts.build_initial_message(TICKET, COMMENTS, trigger, classification, **extra)
+
+	def test_hint_has_one_anchor_per_idea(self):
+		hint = getattr(prompts, "TASK_PROPOSE_NOW", "")
+		for anchor in PROPOSE_NOW_ANCHORS:
+			self.assertEqual(hint.count(anchor), 1, anchor)
+		self.assertNotIn("\n", hint)
+
+	def test_hint_does_a_record_job_with_the_record_tools(self):
+		# Idea (b) must not contradict ACT_NOW_BLOCK: a record job is done with the record tools when granted, and no
+		# sentence of the hint that names a record calls it hand work.
+		hint = getattr(prompts, "TASK_PROPOSE_NOW", "")
+		self.assertEqual(
+			hint.count("cấu hình hoặc bản ghi: không tạo đề xuất; làm luôn bằng tool bản ghi khi bạn có"), 1
+		)
+		for sentence in hint.split(". "):
+			if "bản ghi" in sentence:
+				self.assertNotIn("làm tay", sentence)
+
+	def test_hint_once_iff_propose_now_on_a_hint_trigger(self):
+		hint = getattr(prompts, "TASK_PROPOSE_NOW", "TASK_PROPOSE_NOW")
+		parameter = inspect.signature(prompts.build_initial_message).parameters.get("propose_now")
+		self.assertEqual(
+			(parameter.kind, parameter.default) if parameter else None,
+			(inspect.Parameter.KEYWORD_ONLY, False),
+		)
+		self.assertEqual(prompts.CATEGORY_HINT_TRIGGERS, CATEGORY_HINT_TRIGGERS_TODAY)
+		classifications = [*({"category": c, "confidence_pct": 90} for c in CATEGORIES), {}, None]
+		for trigger, classification in itertools.product(ALL_TRIGGERS, classifications):
+			today = _today_initial_message(trigger, classification)
+			with self.subTest(trigger=trigger, classification=classification):
+				self.assertEqual(self._message(trigger, classification), today)
+				self.assertEqual(self._message(trigger, classification, propose_now=False), today)
+				hinted = self._message(trigger, classification, propose_now=True)
+				if trigger in CATEGORY_HINT_TRIGGERS_TODAY:
+					self.assertEqual(hinted, f"{today}\n{hint}")
+					self.assertEqual(hinted.count(hint), 1)
+				else:
+					self.assertEqual(hinted, today)
+
+	def test_c_ticket_keeps_its_lines_and_the_hint_comes_after(self):
+		hint = getattr(prompts, "TASK_PROPOSE_NOW", "TASK_PROPOSE_NOW")
+		self.assertIn("propose_now", inspect.signature(prompts.build_initial_message).parameters)
+		conversation = [{"author": "Người ra lệnh", "role": "chỉ thị", "content": "sửa giúp"}]
+		for trigger in CATEGORY_HINT_TRIGGERS_TODAY:
+			task = prompts.TASK_BY_TRIGGER.get(trigger, prompts.TASK_NEW_TICKET)
+			with self.subTest(trigger=trigger):
+				message = self._message(
+					trigger,
+					{"category": "C"},
+					guidance_posted=True,
+					conversation=conversation,
+					propose_now=True,
+				)
+				self.assertTrue(
+					message.endswith(
+						f"\n\n{task}\n{prompts.TASK_CATEGORY_C}\n{hint}\n"
+						f"{prompts.TASK_AFTER_GUIDANCE}\n{prompts.TASK_CONVERSATION}"
+					),
+					message,
+				)
+				self.assertEqual(
+					message.count("Gọi set_resolution_hint một lần"), int(trigger == TRIGGER_TICKET_INSERT)
 				)

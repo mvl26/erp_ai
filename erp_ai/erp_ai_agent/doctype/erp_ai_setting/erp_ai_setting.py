@@ -13,6 +13,7 @@ from erp_ai.agent.agent_write_guard import refuse_agent_write
 from erp_ai.agent.classification import validate_mapping
 from erp_ai.agent.hard_bans import hard_ban_reason
 from erp_ai.agent.routing import validate_routing_config
+from erp_ai.agent.text_lines import filled_lines
 from erp_ai.agent.tools import read, site_api, source
 from erp_ai.constants import (
 	ACTION_CREATE_CUSTOM_FIELD,
@@ -456,11 +457,11 @@ class ERPAISetting(Document):
 		Blank lines are ignored. A recipient line must be exactly one email: `validate_email_address` would
 		accept a comma list or a "Name <email>" line by returning only the address part.
 		"""
-		for typed in _filled_lines(self.coo_report_recipients):
+		for typed in filled_lines(self.coo_report_recipients):
 			if "," in typed or frappe.utils.validate_email_address(typed, throw=False) != typed:
 				shown = frappe.utils.escape_html(typed)
 				frappe.throw(f"Người nhận báo cáo COO: '{shown}' không phải email hợp lệ")
-		for typed in _filled_lines(self.monthly_reviewers):
+		for typed in filled_lines(self.monthly_reviewers):
 			if not frappe.db.get_value("User", typed, "enabled"):
 				frappe.throw(
 					f"Người rà soát: không có tài khoản '{frappe.utils.escape_html(typed)}' đang bật"
@@ -506,11 +507,6 @@ def _has_marker(part, marker, text) -> bool:
 		return marker in text
 	category = re.escape(marker.strip("| "))
 	return re.search(rf"^\|\s*{category}\s*\|", text, re.MULTILINE) is not None
-
-
-def _filled_lines(value) -> list:
-	"""The non-blank lines of a one-entry-per-line field, trimmed."""
-	return [line.strip() for line in (value or "").splitlines() if line.strip()]
 
 
 def kpi_targets_error(raw) -> str | None:

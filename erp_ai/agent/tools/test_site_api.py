@@ -660,6 +660,56 @@ class TestSiteApi(FrappeTestCase):
 		self.assertEqual(frappe.db.count("Note"), before)
 		self.assertFalse(frappe.db.exists("Note", {"title": NOTE_TITLE}))
 
+	def _commit_inside_save(self, *_args, **_kwargs):
+		"""What a COMMIT inside the save does to the tool's savepoints (Frappe's `updatedb` commits before and after
+		its ALTER when a Custom Field is saved): every savepoint is gone. Released here instead of committed, so the
+		shared site keeps nothing."""
+		for name in (site_api.SAVEPOINT, registry.SAVEPOINT):
+			frappe.db.sql(f"release savepoint {name}")
+
+	def test_write_committed_inside_the_save_is_reported_as_done(self):
+		# 43229: the Custom Field was saved and kept, yet the tool crashed on the lost savepoint and the bot said
+		# nothing was created. A commit inside the save keeps the write: the tool says so.
+		from frappe.desk.doctype.note.note import Note
+
+		with patch.object(Note, "on_update", side_effect=self._commit_inside_save, create=True):
+			result = self.create("Note", {"title": NOTE_TITLE, "public": 1})
+
+		self.assertEqual(
+			_without_snapshot(result),
+			{
+				"ok": True,
+				"doctype": "Note",
+				"name": result["name"],
+				"value_before": None,
+				"value_after": {"title": NOTE_TITLE, "public": 1},
+				"committed": True,
+			},
+		)
+		self.assertTrue(frappe.db.exists("Note", result["name"]))
+
+	def test_error_after_a_commit_inside_the_save_says_part_may_be_kept(self):
+		# the ALTER of a Custom Field fails after updatedb committed the row: nothing can be undone any more, and
+		# the original error is what the tool reports, not the lost savepoint
+		from frappe.desk.doctype.note.note import Note
+
+		def commit_then_fail(*args, **kwargs):
+			self._commit_inside_save()
+			raise TypeError("alter boom")
+
+		with (
+			patch.object(Note, "on_update", side_effect=commit_then_fail, create=True),
+			patch.object(frappe, "log_error") as log_error,
+		):
+			result = self.create("Note", {"title": NOTE_TITLE, "public": 1})
+
+		self.assertEqual(
+			result, {"ok": False, "reason": site_api.PARTLY_KEPT_REASON, "doctype": "Note", "committed": True}
+		)
+		log_error.assert_called_once_with(
+			site_api.TITLE_WRITE_FAILED, "site_api doctype=Note error=TypeError committed=1"
+		)
+
 	def test_update_changes_only_the_given_fields(self):
 		created = self.create("Note", {"title": NOTE_TITLE, "public": 1, "content": "cũ"})
 		self.assertTrue(created["ok"], created)

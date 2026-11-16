@@ -196,6 +196,8 @@ def _run(ticket_name, trigger, comment_name=None):
 	routing = load_routing_config(settings.routing_rules)
 
 	run_id = uuid.uuid4().hex
+	# the ask_fallback dedup counts from here: one question per run, not per ticket (AC-22, ADR-037)
+	started_at = now_datetime()
 	field_map, missing = _ticket_fields(settings)
 	if missing:
 		# one line per run, configuration names only (AC-24)
@@ -293,6 +295,9 @@ def _run(ticket_name, trigger, comment_name=None):
 					instructor=context.instructor,
 				)
 				notices = [entry] if entry else []
+				# post_notice's dedup read locked the ticket row: free it before the model call (D-20)
+				if not frappe.flags.in_test:
+					frappe.db.commit()
 			_reason(
 				ticket_name,
 				trigger,
@@ -303,6 +308,7 @@ def _run(ticket_name, trigger, comment_name=None):
 				deadline,
 				status,
 				delay,
+				started_at=started_at,
 				field_map=field_map,
 				notices=notices,
 			)
@@ -560,7 +566,8 @@ def _classify(
 		"agent_group": decision.agent_group,
 		"priority": decision.priority,
 	}
-	# AC-28: the split question is asked once per ticket, the first time a classify row records it
+	# AC-28: the split question is asked once per ticket; a classify row records it only once the route comment
+	# carrying it was posted (`_record_route`), so a run that posts none leaves it to a later run
 	split_text = split_request_comment(classification)
 	if split_text and frappe.db.exists(
 		LOG_DOCTYPE, {"ticket": ticket_name, "entry_type": "classify", "split_requested": 1}
@@ -568,7 +575,7 @@ def _classify(
 		split_text = None
 	# A-U4b-4: the ticket is Người before this row; the fields it holds are the person's label of the prediction
 	corrected = (
-		json.dumps({field: ticket.get(field) for field in CLASSIFICATION_FIELDS})
+		json.dumps({field: ticket.get(field) for field in CLASSIFICATION_FIELDS}, ensure_ascii=False)
 		if ticket.ai_classified_by == CLASSIFIED_BY_HUMAN
 		else None
 	)
@@ -597,8 +604,6 @@ def _classify(
 		predicted_assignee=decision.assignee,
 		created_labels=json.dumps(typed, ensure_ascii=False, sort_keys=True) if typed else None,
 		human_corrected_to=corrected,
-		split_requested=1 if split_text else 0,
-		split_requests=json.dumps(classification.requests, ensure_ascii=False) if split_text else None,
 		applied=0,
 	)
 	_log_classify(ticket_name, run_id, True, ticket.creation)
@@ -671,7 +676,8 @@ def _route(log_name, classification, decision, context, auto_assign, subject, sp
 				*([split_text] if split_text else []),
 			]
 			commented = _comment_unit(lines, context, actions, errors)
-		_record_route(log_name, result, decision, assigned, task, actions, errors)
+		split = classification.requests if commented and split_text else None
+		_record_route(log_name, result, decision, assigned, task, actions, errors, split)
 		_log_route_summary(context, result, assigned, task, commented, sla)
 	except Exception:
 		frappe.db.rollback(save_point=ROUTE_SAVEPOINT)
@@ -955,12 +961,16 @@ def _check_sla(category, context, actions, lines):
 	return state
 
 
-def _record_route(log_name, result, decision, assigned, task, actions, errors):
-	"""Update the `classify` entry once (design 3.5)."""
+def _record_route(log_name, result, decision, assigned, task, actions, errors, split=None):
+	"""Update the `classify` entry once (design 3.5). `split`: the requests of the split question, given only when a
+	comment carrying it was posted; only then is the question recorded as asked (AC-28)."""
 	updates = {
 		"applied": 1 if result else 0,
 		"actions": json.dumps(_bounded_actions(actions), ensure_ascii=False),
 	}
+	if split is not None:
+		updates["split_requested"] = 1
+		updates["split_requests"] = json.dumps(split, ensure_ascii=False)
 	if result:
 		before = {"ticket": result["before"]} if result.get("before") else {}
 		after = {"ticket": result["after"]} if result.get("after") else {}
@@ -1024,6 +1034,7 @@ def _reason(
 	deadline,
 	status,
 	delay,
+	started_at,
 	field_map=None,
 	notices=None,
 ):
@@ -1031,7 +1042,8 @@ def _reason(
 
 	The first message carries the configured ticket fields that hold a value as data (AC-24, U4b.md:249).
 	`notices` are the entries of notices posted before this step: they go on the first entry written (U4b.md:250).
-	A gateway error posts the run_failed notice on its own entry (U4b.md:251).
+	A gateway error posts the run_failed notice on its own entry (U4b.md:251). `started_at` is the run's start: the
+	ask_fallback question counts only the ones posted since, so each run below the threshold asks once (AC-22).
 	"""
 	pending = list(notices or [])
 	comments = authority.fetch_ticket_comments(ticket_name)
@@ -1122,7 +1134,7 @@ def _reason(
 					ticket_name,
 					"ask_fallback",
 					_ask_fallback_body(run_id, classification, settings),
-					datetime.min,
+					started_at,
 					trigger=trigger,
 					instructor=context.instructor,
 				)

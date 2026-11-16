@@ -187,7 +187,7 @@ class TestActionsLongText(FrappeTestCase):
 
 class TestOptions(FrappeTestCase):
 	def test_entry_type_and_trigger_options(self):
-		# FEAT-007 U3 2: five entry types, five triggers, in this order; run_log holds the same constants.
+		# FEAT-007 U3 2, U6b-fixes Sửa 3: five entry types, seven triggers, in this order; run_log holds the same constants.
 		meta = frappe.get_meta(LOG_DOCTYPE)
 		self.assertEqual(
 			meta.get_field("entry_type").options.split("\n"),
@@ -195,7 +195,15 @@ class TestOptions(FrappeTestCase):
 		)
 		self.assertEqual(
 			meta.get_field("trigger").options.split("\n"),
-			["ticket_insert", "comment_mention", "change_action", "setting_save", "scheduled_job"],
+			[
+				"ticket_insert",
+				"comment_mention",
+				"requester_reply",
+				"kb_draft",
+				"change_action",
+				"setting_save",
+				"scheduled_job",
+			],
 		)
 		self.assertEqual(tuple(meta.get_field("entry_type").options.split("\n")), run_log.ENTRY_TYPES)
 		self.assertEqual(

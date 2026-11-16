@@ -6,6 +6,7 @@ from erp_ai.agent import policy
 from erp_ai.agent.queue import enqueue_agent_run
 from erp_ai.constants import (
 	AGENT_USER,
+	CATEGORIES,
 	CLASSIFICATION_FIELDS,
 	CLASSIFIED_BY_HUMAN,
 	LOG_DOCTYPE,
@@ -53,13 +54,15 @@ def ticket_after_insert(doc, method=None):
 	_log_decision(doc.name, TRIGGER_TICKET_INSERT, "enqueued", "conditions_met")
 
 
-def _latest_classify_log(ticket):
-	"""The newest `classify` log row of the ticket (name, predicted_category, human_corrected_at), or None."""
+def reference_classify_row(ticket_name: str) -> str | None:
+	"""The ticket's reference `classify` row (ADR-037 QĐ 5): its first row with a result, a category A-F, oldest by
+	creation then name as the ERP AI Accuracy report reads it; None when it has none. A person's correction goes here.
+	"""
 	rows = frappe.get_all(
 		LOG_DOCTYPE,
-		filters={"ticket": ticket, "entry_type": "classify"},
-		fields=["name", "predicted_category", "human_corrected_at"],
-		order_by="creation desc",
+		filters={"ticket": ticket_name, "entry_type": "classify", "predicted_category": ("in", CATEGORIES)},
+		pluck="name",
+		order_by="creation asc, name asc",
 		limit=1,
 	)
 	return rows[0] if rows else None
@@ -97,12 +100,12 @@ def ticket_validate(doc, method=None):
 		_log_decision(doc.name, TRIGGER_HUMAN_CORRECTION, "skipped", "changed_by_agent")
 		return
 	doc.ai_classified_by = CLASSIFIED_BY_HUMAN
-	latest = _latest_classify_log(doc.name)
-	if not latest or not latest.predicted_category:
+	reference = reference_classify_row(doc.name)
+	if not reference:
 		# No prediction row to correct yet: the person is still the one who classified the ticket.
 		_log_decision(doc.name, TRIGGER_HUMAN_CORRECTION, "recorded", "human_changed_before_prediction")
 		return
-	doc.flags.erp_ai_human_corrected = latest.name
+	doc.flags.erp_ai_human_corrected = reference
 
 
 def ticket_on_update(doc, method=None):

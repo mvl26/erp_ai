@@ -87,6 +87,13 @@ SECTION_DONE, SECTION_PENDING = "Đã làm", "Chờ duyệt"
 # its own (design-w1-fixes-20 Điểm 1.1, spec-addendum-5 AC-65 (a)).
 SECTION_DECIDE = GUIDANCE_HEADER
 GUIDANCE_SECTIONS = (SECTION_DONE, SECTION_PENDING, SECTION_DECIDE)
+# What a run concluded and did, copied onto the ticket so the ticket itself carries it. Information only:
+# whether a ticket has its guidance is still read from the comment (ADR-036 QĐ 6).
+CLASSIFICATION_REASON_FIELD = "ai_classification_reason"
+ANALYSIS_FIELD = "ai_analysis"
+SECTION_FIELDS = {"ai_done": SECTION_DONE, "ai_pending": SECTION_PENDING, "ai_manual": SECTION_DECIDE}
+RUN_INFO_FIELDS = (ANALYSIS_FIELD, *SECTION_FIELDS)
+RUN_INFO_SAVEPOINT = "erp_ai_run_info"
 # Per-job state, like the asked runs: run_id -> {"analysis": str | None, <section>: [raw lines]}.
 _GUIDANCE_FLAG = "erp_ai_guidance"
 _ANALYSIS_KEY = "analysis"
@@ -240,6 +247,9 @@ def set_classification(args: dict, ctx: ToolContext) -> dict:
 	if not values:
 		return {"ok": True, "before": {}, "after": {}, "skipped": skipped}
 	values["ai_confidence"] = args["confidence"]
+	# The tool takes no reason: a reason left by an earlier classification would describe the wrong one.
+	if doc.get(CLASSIFICATION_REASON_FIELD):
+		values[CLASSIFICATION_REASON_FIELD] = ""
 	for field in (*values, "ai_classified_by", "ai_updated_at"):
 		if not doc.has_permlevel_access_to(field, permission_type="write"):
 			return _fail(f"thiếu quyền ghi trường {field}")
@@ -500,6 +510,34 @@ def _with_manual_lines(text: str, manual: list[str]) -> str:
 	return f"{text[:end]}\n{_items(manual)}{text[end:]}"
 
 
+def _store_run_info(ticket_name: str, analysis: str | None, sections: dict[str, list[str]]) -> bool:
+	"""Copy what the guidance comment says onto the ticket's own fields; returns whether it was stored.
+
+	The fallback analysis is not stored: it only points at the comment. The comment stands either way:
+	without the write right on a field nothing is stored, and a save that fails validation is undone
+	back to the point before this copy.
+	"""
+	doc = frappe.get_doc(TICKET_DOCTYPE, ticket_name)
+	values = {ANALYSIS_FIELD: analysis or ""}
+	values.update({field: "\n".join(sections[section]) for field, section in SECTION_FIELDS.items()})
+	if not doc.has_permission("write") or not all(
+		doc.has_permlevel_access_to(field, permission_type="write") for field in values
+	):
+		frappe.logger(LOGGER_NAME).warning(f"erp_ai run_info not stored ticket={ticket_name} reason=no_write")
+		return False
+	doc.update(values)
+	frappe.db.savepoint(RUN_INFO_SAVEPOINT)
+	try:
+		doc.save()
+	except frappe.ValidationError as exc:
+		frappe.db.rollback(save_point=RUN_INFO_SAVEPOINT)
+		frappe.logger(LOGGER_NAME).warning(
+			f"erp_ai run_info not stored ticket={ticket_name} reason={type(exc).__name__}"
+		)
+		return False
+	return True
+
+
 def post_guidance(ticket_name: str, run_id: str) -> dict:
 	"""The one writer of the ticket's guidance comment (ADR-036 QĐ 1, 4); the runner calls it once, at the end of a
 	guidance run; not a tool. Counted under the ticket lock, so a ticket has at most one. Body (design-w1-fixes-20
@@ -518,7 +556,11 @@ def post_guidance(ticket_name: str, run_id: str) -> dict:
 	result = _post(ticket_name, "\n".join(parts))
 	if not result["ok"]:
 		return result
-	return {**result, "counts": {section: len(sections[section]) for section in GUIDANCE_SECTIONS}}
+	return {
+		**result,
+		"counts": {section: len(sections[section]) for section in GUIDANCE_SECTIONS},
+		"stored": _store_run_info(ticket_name, analysis, sections),
+	}
 
 
 def failure_summary(run_id: str) -> str:

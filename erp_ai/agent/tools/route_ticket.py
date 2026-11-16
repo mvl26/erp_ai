@@ -6,6 +6,7 @@ from erp_ai.agent.classification import Classification
 from erp_ai.agent.routing import RouteDecision
 from erp_ai.agent.tools.registry import ToolContext
 from erp_ai.agent.tools.write_ticket import (
+	CLASSIFICATION_REASON_FIELD,
 	LINKED_DOCTYPES,
 	REASON_MAX,
 	TASK_DOCTYPE,
@@ -54,6 +55,9 @@ def apply_route(decision: RouteDecision, classification: Classification, ctx: To
 		ai_score_reason=classification.score_reason,
 		ai_confidence_pct=classification.confidence_pct,
 	)
+	# A classification without a reason clears the reason an earlier one left: it would describe the wrong one.
+	if classification.reason or doc.get(CLASSIFICATION_REASON_FIELD):
+		values[CLASSIFICATION_REASON_FIELD] = classification.reason
 	for field in ("ai_classified_by", "ai_updated_at"):
 		if not doc.has_permlevel_access_to(field, permission_type="write"):
 			return _fail(f"thiếu quyền ghi trường {field}")

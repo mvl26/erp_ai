@@ -115,6 +115,28 @@ def _shown(value) -> str:
 	return "" if "://" in text else text
 
 
+def proposal_target(proposal_fields) -> tuple[str, str | None]:
+	"""The target sentence of a proposal as (text, code): `code` is the file path or the bench command that
+	follows the text in `<code>`, else None. One builder for the proposal comment and the panel card (CHG-008
+	design 3.4); the branches are those of the comment: a block with items, a block of commands only, a code
+	proposal, any other (a command)."""
+	if proposal_fields.get("operations") or proposal_fields.get("command_list"):
+		if proposal_fields.get("operations"):
+			count = len(proposal_fields.get("operations"))
+			return f"khối {count} mục trong app {_shown(proposal_fields.get('app'))}", None
+		return f"{len(json.loads(proposal_fields.get('command_list')))} lệnh bench", None
+	if proposal_fields.get("change_kind") == CHANGE_KIND_CODE:
+		return ("tạo" if proposal_fields.get("is_new_file") else "sửa"), proposal_fields.get("file_path")
+	argv_list = json.loads(proposal_fields.get("command_list") or "[]")
+	return "lệnh", "bench " + "; ".join(" ".join(argv) for argv in argv_list)
+
+
+def proposal_target_text(proposal_fields) -> str:
+	"""`proposal_target` as one plain sentence: the text, or `text code`."""
+	text, code = proposal_target(proposal_fields)
+	return text if code is None else f"{text} {code}"
+
+
 # Verb of each item line of a block's notes; delete and rename in capitals (CHG-002 design 3.7).
 _NOTE_VERBS = {**_ITEM_VERBS, CHANGE_OP_DELETE: "XÓA", CHANGE_OP_RENAME: "ĐỔI TÊN"}
 _RESTART_ARGV = ["restart"]

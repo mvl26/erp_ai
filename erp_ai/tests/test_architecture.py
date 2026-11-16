@@ -10492,8 +10492,9 @@ GUIDANCE_FLAG_DOCTYPE_FILES = (
 # The HD Ticket fields of the app are created from this file (install._ai_field_specs).
 TICKET_FIELDS_FILE = "install.py"
 _FIELDNAME = re.compile(r"[a-z][a-z0-9_]*")
-# Rule A (design-w1-fixes-13 Điểm 3): T168 adds "create_task", T169 "post_comment_tool".
-DEDUP_WRITERS = ("post_notice", "post_guidance")
+# Rule A (design-w1-fixes-13 Điểm 3): every writer here counts its dedup reads through locked_count
+# (T168 added "create_task", T169 "post_comment_tool").
+DEDUP_WRITERS = ("post_notice", "post_guidance", "create_task", "post_comment_tool")
 DEDUP_UNLOCKED_READS = (
 	"frappe.db.count",
 	"frappe.db.exists",
@@ -10857,6 +10858,8 @@ class TestGuidanceArchitectureRules(unittest.TestCase):
 			with self.subTest(case=case):
 				self.assertCaught(check_runner_calls_post_guidance_in_one_place(sources), fragment)
 
+	# the samples define only the original pair, so the rule is run for that pair
+	@patch(f"{__name__}.DEDUP_WRITERS", ("post_notice", "post_guidance"))
 	def test_dedup_rule_samples(self):
 		# design-w1-fixes-13 Điểm 3, verbatim: A0 green; A1, A2, A3 red, one violation each
 		a0 = {

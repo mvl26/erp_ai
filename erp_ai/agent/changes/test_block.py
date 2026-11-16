@@ -5,7 +5,8 @@ from frappe.tests.utils import FrappeTestCase
 
 from erp_ai.agent.changes import block, transitions
 from erp_ai.agent.tools.change_guard import FileOp
-from erp_ai.constants import CHANGE_KIND_CODE, CHANGE_KIND_COMMAND, PROPOSAL_DOCTYPE
+from erp_ai.constants import CHANGE_KIND_CODE, CHANGE_KIND_COMMAND, CHANGE_OP_CREATE, PROPOSAL_DOCTYPE
+from erp_ai.test_utils import make_block_proposal
 
 UNKNOWN_KIND = "Loại lạ"
 BEFORE = "x = 1\n"
@@ -215,3 +216,22 @@ class TestLegacyDigest(FrappeTestCase):
 	def test_unknown_change_kind_block_digest_is_not_refused_here(self):
 		# Branch order (A3 RQ-5): a block takes the block digest before any kind check.
 		self.assertRegex(transitions.content_digest(_block_proposal(UNKNOWN_KIND)), r"^[0-9a-f]{64}$")
+
+
+class TestIsConsole(FrappeTestCase):
+	"""CHG-010 Task 2: a console proposal is one `--site <site> console` command and no file item."""
+
+	def test_console_proposal(self):
+		doc = make_block_proposal([], [["--site", "miyano", "console"]], content_after="print(1)")
+		self.assertTrue(block.is_console(doc))
+
+	def test_other_shapes_are_not_console(self):
+		not_console = (
+			make_block_proposal([], [["--site", "miyano", "migrate"]]),
+			make_block_proposal([], [["--site", "miyano", "console"], ["--site", "miyano", "migrate"]]),
+			make_block_proposal(
+				[FileOp(CHANGE_OP_CREATE, "myapp/a.py", None, None, "x = 1\n", None, None)], []
+			),
+		)
+		for doc in not_console:
+			self.assertFalse(block.is_console(doc))

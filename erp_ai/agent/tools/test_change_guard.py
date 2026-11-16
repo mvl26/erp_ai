@@ -1887,3 +1887,37 @@ class TestManualsExcluded(FrappeTestCase):
 					result, {"ok": False, "reason": f"mục 1 ({item['path']}): {PATH_INVALID_REFUSAL}"}
 				)
 				self.assertEqual(frappe.db.count(PROPOSAL_DOCTYPE), proposals)
+
+
+class TestConsoleScript(FrappeTestCase):
+	"""CHG-010 Task 2: the static rules of a bench console script and the console argv."""
+
+	def test_console_args(self):
+		self.assertEqual(change_guard.console_args("miyano"), ["--site", "miyano", "console"])
+
+	def test_accepted_sample(self):
+		script = 'import frappe\nfor name in frappe.get_all("ToDo", pluck="name", limit=3):\n\tprint(name)\n'
+		self.assertIsNone(change_guard.check_console_script(script))
+
+	def test_each_rule_gives_its_exact_reason(self):
+		imports = "script chỉ được import frappe, erpnext, hrms, helpdesk, json, datetime, decimal, re, math"
+		cases = (
+			("", "script trống"),
+			(" \n", "script trống"),
+			(None, "script trống"),
+			("x" * 20001, "script dài quá 20000 ký tự"),
+			("x = 'ERP AI Setting'", "script không được nhắc tới erp ai"),
+			("def f(:", "script không phải Python hợp lệ (dòng 1)"),
+			("import os", f"{imports} (gặp os)"),
+			("from subprocess import run", f"{imports} (gặp subprocess)"),
+			("from . import x", f"{imports} (gặp .)"),
+			("eval('1')", "script không được gọi eval"),
+			("f = eval", "script không được gọi eval"),
+			("getattr(frappe, 'db')", "script không được gọi getattr"),
+			("db = frappe.db\ndb.commit()", "script không được dùng .commit"),
+			("frappe.set_user('Administrator')", "script không được dùng .set_user"),
+			("frappe.conf.db_password", "script không được dùng .conf"),
+		)
+		for script, reason in cases:
+			with self.subTest(script=script if script is None else script[:30]):
+				self.assertEqual(change_guard.check_console_script(script), reason)

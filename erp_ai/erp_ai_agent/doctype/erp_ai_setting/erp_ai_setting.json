@@ -94,7 +94,12 @@
   "section_alerts",
   "alert_recipients",
   "privilege_alert_checked_until",
-  "credentials"
+  "credentials",
+  "section_lessons",
+  "lessons_enabled",
+  "lessons_max_per_request",
+  "lessons_max_chars",
+  "lesson_teach_marker"
  ],
  "fields": [
   {
@@ -705,6 +710,39 @@
    "label": "Khóa API",
    "options": "ERP AI Credential",
    "description": "Danh sách khóa API. Nhãn bắt buộc và không trùng nhau (không phân biệt hoa thường). Có nút Kiểm tra khóa."
+  },
+  {
+   "fieldname": "section_lessons",
+   "fieldtype": "Section Break",
+   "label": "Bài học của bot"
+  },
+  {
+   "fieldname": "lessons_enabled",
+   "fieldtype": "Check",
+   "label": "Học và dùng bài học",
+   "default": "1",
+   "description": "Bật thì bot ghi nhận bài học từ người sửa, phiếu đã giải quyết và lời dạy, và đưa bài đang dùng vào yêu cầu gửi cho model. Tắt thì bot không học và không dùng bài nào; bài đã lưu vẫn giữ nguyên."
+  },
+  {
+   "fieldname": "lessons_max_per_request",
+   "fieldtype": "Int",
+   "label": "Số bài tối đa mỗi lần gọi",
+   "default": "5",
+   "description": "Số bài học nhiều nhất đưa vào một lần gọi model, từ 1 đến 20. Ngoài khoảng này thì không lưu được. Mặc định 5."
+  },
+  {
+   "fieldname": "lessons_max_chars",
+   "fieldtype": "Int",
+   "label": "Số ký tự bài học tối đa mỗi lần gọi",
+   "default": "2000",
+   "description": "Tổng số ký tự bài học nhiều nhất đưa vào một lần gọi model, từ 1200 đến 20000. Ngoài khoảng này thì không lưu được. Mặc định 2000."
+  },
+  {
+   "fieldname": "lesson_teach_marker",
+   "fieldtype": "Data",
+   "label": "Dấu hiệu dạy bot trong tin nhắn",
+   "default": "ghi nhớ:",
+   "description": "Tin nhắn của người có dấu hiệu này thì phần sau dấu hiệu được lưu thành bài học chờ duyệt. Không phân biệt hoa thường. Để trống thì tắt cách dạy này. Giá trị điền sẵn là một cụm tiếng Việt kết thúc bằng dấu hai chấm."
   }
  ],
  "issingle": 1,

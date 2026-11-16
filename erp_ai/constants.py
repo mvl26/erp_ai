@@ -92,6 +92,19 @@ RESTART_LAUNCH_TIMEOUT_S = 10
 # concluded and did on a ticket is ticket information (its fields), never a message here.
 MESSAGE_DOCTYPE = "ERP AI Message"
 
+# FEAT-008: the bot's lesson store (ERP AI Lesson and its history rows).
+LESSON_DOCTYPE = "ERP AI Lesson"
+LESSON_EVENT_DOCTYPE = "ERP AI Lesson Event"
+LESSON_STATUS_PENDING = "Chờ duyệt"
+LESSON_STATUS_ACTIVE = "Đang dùng"
+LESSON_STATUS_DISABLED = "Đã tắt"
+LESSON_STATUS_REJECTED = "Bị từ chối"
+LESSON_SOURCE_CORRECTION = "Người sửa"
+LESSON_SOURCE_RESOLVED = "Phiếu đã giải quyết"
+LESSON_SOURCE_TEACHING = "Người dạy"
+LESSON_SOURCE_OUTCOME = "Kết quả duyệt và rà soát"
+LESSON_STEPS = ("Tạo", "Cập nhật", "Duyệt", "Từ chối", "Tắt", "Bật")
+
 # FEAT-007 (F-1): catalog actions and modes, KPI ids, ticket-content DocTypes; one block, keep it last.
 ACTION_CREATE_USER = "Tạo tài khoản theo mẫu"
 ACTION_ADD_TEAM_MEMBER = "Thêm người vào nhóm Helpdesk"

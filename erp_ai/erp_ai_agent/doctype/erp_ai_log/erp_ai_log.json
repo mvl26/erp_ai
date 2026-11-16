@@ -33,6 +33,7 @@
   "value_before",
   "value_after",
   "skipped_fields",
+  "lessons_used",
   "section_prediction",
   "predicted_category",
   "predicted_confidence",
@@ -257,6 +258,13 @@
    "label": "Trường bỏ qua khi phân loại",
    "description": "Các trường bị bỏ qua khi phân loại vì giá trị không hợp lệ hoặc không có trong hệ thống. Để trống nếu không bỏ qua trường nào. Hệ thống tự ghi khi agent chạy, không sửa được.",
    "read_only": 1
+  },
+  {
+   "fieldname": "lessons_used",
+   "fieldtype": "Small Text",
+   "label": "Bài học đã dùng",
+   "read_only": 1,
+   "description": "Danh sách JSON tên các bài học đã gửi trong yêu cầu của bước này. Để trống nếu không dùng bài nào. Hệ thống tự ghi khi agent chạy, không sửa được."
   },
   {
    "fieldname": "section_prediction",

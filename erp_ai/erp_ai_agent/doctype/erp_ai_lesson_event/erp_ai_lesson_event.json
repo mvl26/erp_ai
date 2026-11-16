@@ -1,0 +1,62 @@
+{
+ "actions": [],
+ "creation": "2026-11-16 12:00:00.000000",
+ "doctype": "DocType",
+ "engine": "InnoDB",
+ "field_order": [
+  "section_step",
+  "step",
+  "section_actor",
+  "actor",
+  "happened_at"
+ ],
+ "fields": [
+  {
+   "fieldname": "section_step",
+   "fieldtype": "Section Break",
+   "label": "Bước"
+  },
+  {
+   "fieldname": "step",
+   "fieldtype": "Select",
+   "label": "Bước",
+   "options": "Tạo\nCập nhật\nDuyệt\nTừ chối\nTắt\nBật",
+   "in_list_view": 1,
+   "read_only": 1,
+   "description": "Hệ thống tự ghi: bước đã xảy ra với bài học (Tạo, Cập nhật, Duyệt, Từ chối, Tắt hoặc Bật), không sửa được."
+  },
+  {
+   "fieldname": "section_actor",
+   "fieldtype": "Section Break",
+   "label": "Người và lúc"
+  },
+  {
+   "fieldname": "actor",
+   "fieldtype": "Link",
+   "label": "Người thực hiện",
+   "options": "User",
+   "in_list_view": 1,
+   "read_only": 1,
+   "description": "Hệ thống tự ghi: tài khoản làm bước này, không sửa được. Bước do bot tự ghi thì là tài khoản của bot."
+  },
+  {
+   "fieldname": "happened_at",
+   "fieldtype": "Datetime",
+   "label": "Lúc xảy ra",
+   "in_list_view": 1,
+   "read_only": 1,
+   "description": "Hệ thống tự ghi: thời điểm xảy ra bước này, không sửa được."
+  }
+ ],
+ "istable": 1,
+ "links": [],
+ "modified": "2026-11-16 12:00:00.000000",
+ "modified_by": "Administrator",
+ "module": "ERP AI agent",
+ "name": "ERP AI Lesson Event",
+ "owner": "Administrator",
+ "permissions": [],
+ "sort_field": "modified",
+ "sort_order": "DESC",
+ "states": []
+}

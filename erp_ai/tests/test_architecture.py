@@ -200,6 +200,10 @@ POLICY_FIELDS = (
 	"level_cap_e",
 	"level_cap_f",
 	"confidence_threshold",
+	"lessons_enabled",
+	"lessons_max_per_request",
+	"lessons_max_chars",
+	"lesson_teach_marker",
 )
 SETTING_CONTROLLER_FILE = "erp_ai_agent/doctype/erp_ai_setting/erp_ai_setting.py"
 

@@ -166,8 +166,8 @@ doc_events = {
 	},
 }
 
-# Deleting a ticket must not be blocked by its audit-log rows (the log is kept) or its bot messages
-ignore_links_on_delete = ["ERP AI Log", "ERP AI Message"]
+# Deleting a ticket must not be blocked by its audit-log rows (the log is kept), its bot messages or lessons
+ignore_links_on_delete = ["ERP AI Log", "ERP AI Message", "ERP AI Lesson"]
 
 # Scheduled Tasks
 # ---------------

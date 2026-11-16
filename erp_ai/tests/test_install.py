@@ -1268,3 +1268,28 @@ class TestFeat007Migrate(FrappeTestCase):
 		put_record_back()
 		self.assertTrue(frappe.get_meta("HD Ticket").has_field(CREATED_LABELS_FIELD))
 		self.assertEqual(_labels_field(), field)
+
+
+class TestLessonDefaults(FrappeTestCase):
+	FIELDS = ("lessons_enabled", "lessons_max_per_request", "lessons_max_chars", "lesson_teach_marker")
+
+	def setUp(self):
+		frappe.db.rollback()
+		self.addCleanup(frappe.db.rollback)
+		keep_agent_settings(self)
+
+	def _stored(self, fieldname):
+		return frappe.db.get_single_value(SETTING_DOCTYPE, fieldname, cache=False)
+
+	def test_lesson_defaults_filled_on_migrate(self):
+		for fieldname in self.FIELDS:
+			frappe.db.delete("Singles", {"doctype": SETTING_DOCTYPE, "field": fieldname})
+		install.ensure_setup()
+		self.assertEqual(
+			[str(self._stored(fieldname)) for fieldname in self.FIELDS], ["1", "5", "2000", "ghi nhớ:"]
+		)
+
+	def test_lesson_defaults_keep_stored_values(self):
+		frappe.db.set_single_value(SETTING_DOCTYPE, "lessons_enabled", 0)
+		install.ensure_setup()
+		self.assertEqual(str(self._stored("lessons_enabled")), "0")

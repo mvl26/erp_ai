@@ -78,6 +78,12 @@ class RunStatus:
 			self.finished = True
 			self._emit(STATE_DONE, "")
 
+	def stop(self) -> None:
+		"""The one `done` of a run that stopped early on its skip row (ADR-008 Amendment 1): only before `start()`."""
+		if self.active and not self.started and not self.finished:
+			self.finished = True
+			self._emit(STATE_DONE, "")
+
 	def _emit(self, state: str, text: str) -> None:
 		self.last_state = state
 		self.signal_count += 1

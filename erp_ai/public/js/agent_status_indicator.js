@@ -8,6 +8,9 @@ function setupForm({ doc, call, router }) {
 		const TEXT_CHAT_SECTION = "Trao đổi với bot";
 		const TEXT_EMPTY_FIELD = "Chưa có";
 		const TEXT_EMPTY_THREAD = "Chưa có tin nào.";
+		// The one status sentence of the script, shown while an indicator is live (design 4.1);
+		// every other sentence comes from the server.
+		const TEXT_STATUS_RUNNING = "Đang xử lý…";
 		const TEXT_BOT_LABEL = "Bot";
 		const TEXT_BOT_GUIDANCE =
 			'Bot có thể không trả lời khi đang tắt, đang ở chế độ chỉ ghi nhận, phiếu không dùng AI hoặc thuộc nhóm loại trừ, đã hết lượt hôm nay, hoặc đang trả lời tin trước của phiếu này (khi đó hãy gửi lại sau). Nhận định và hướng xử lý của bot là tin trong ngăn này; người có vai trò ERP AI Instructor bấm "Duyệt hướng xử lý" dưới tin đó thì bot làm theo.';
@@ -61,6 +64,10 @@ function setupForm({ doc, call, router }) {
 			el: null,
 			open: false,
 			slotEl: null,
+			statusTextEl: null,
+			botStatus: null,
+			statusExpired: false,
+			expiryTimer: null,
 			aiListEl: null,
 			threadEl: null,
 			proposalsTitle: null,
@@ -151,8 +158,25 @@ function setupForm({ doc, call, router }) {
 			return el;
 		};
 
+		// A live indicator wins, else the server's text; past the deadline, its failed time (A-4).
+		const showBotStatus = () => {
+			const panel = state.panel;
+			if (!panel.statusTextEl) {
+				return;
+			}
+			const status = panel.botStatus;
+			let text = "";
+			if (status) {
+				const expired = panel.statusExpired && status.expired_text;
+				text = expired ? status.expired_text : status.text || "";
+			}
+			panel.statusTextEl.textContent = state.runs.size > 0 ? TEXT_STATUS_RUNNING : text;
+		};
+
 		const render = () => {
 			const el = ensureElement();
+			// The status line follows the indicator, shown or hidden (design 4.1).
+			showBotStatus();
 			if (state.runs.size === 0) {
 				setIndicatorVisible(el, false);
 				return;
@@ -225,6 +249,18 @@ function setupForm({ doc, call, router }) {
 			const aiListEl = document.createElement("div");
 			const chatTitle = document.createElement("strong");
 			chatTitle.textContent = TEXT_CHAT_SECTION;
+			// The status line, above messages and cards, holds the docked indicator (A-7).
+			const statusEl = document.createElement("div");
+			Object.assign(statusEl.style, {
+				display: "flex",
+				alignItems: "center",
+				gap: "8px",
+				flexWrap: "wrap",
+				fontWeight: "bold",
+			});
+			const statusTextEl = document.createElement("span");
+			const slotEl = document.createElement("div");
+			statusEl.append(statusTextEl, slotEl);
 			const guidanceEl = document.createElement("div");
 			guidanceEl.style.color = "#6b7280";
 			guidanceEl.textContent = TEXT_BOT_GUIDANCE;
@@ -266,24 +302,24 @@ function setupForm({ doc, call, router }) {
 				}
 			});
 			formEl.append(inputEl, sendEl);
-			const slotEl = document.createElement("div");
 			el.append(
 				header,
 				aiTitle,
 				aiListEl,
 				chatTitle,
+				statusEl,
 				guidanceEl,
 				threadEl,
 				proposalsTitle,
 				proposalsEl,
 				proposalErrorEl,
 				errorEl,
-				formEl,
-				slotEl
+				formEl
 			);
 			document.body.appendChild(el);
 			panel.el = el;
 			panel.slotEl = slotEl;
+			panel.statusTextEl = statusTextEl;
 			panel.aiListEl = aiListEl;
 			panel.threadEl = threadEl;
 			panel.proposalsTitle = proposalsTitle;
@@ -329,16 +365,67 @@ function setupForm({ doc, call, router }) {
 			state.panel.aiListEl.replaceChildren(...nodes);
 		};
 
+		const clearExpiryTimer = () => {
+			const panel = state.panel;
+			clearTimeout(panel.expiryTimer);
+			panel.expiryTimer = null;
+		};
+
+		// An open call's deadline only changes the text, one timer per load (design 4.1, A-4).
+		const renderBotStatus = (data) => {
+			const panel = state.panel;
+			clearExpiryTimer();
+			panel.statusExpired = false;
+			const status = data?.bot_status;
+			panel.botStatus = status && typeof status === "object" ? status : null;
+			const ms = Number(panel.botStatus?.expires_in_s) * 1000;
+			if (ms > 0) {
+				panel.expiryTimer = setTimeout(() => {
+					try {
+						panel.statusExpired = true;
+						showBotStatus();
+					} catch (e) {
+						// A timer callback must never throw to the console (AC-10 g).
+					}
+				}, ms);
+			}
+			showBotStatus();
+		};
+
+		// A system line: a centred note between the messages, never a message (ADR-048 QĐ 7).
+		const systemLine = (line) => {
+			const row = document.createElement("div");
+			Object.assign(row.style, {
+				marginTop: "8px",
+				textAlign: "center",
+				fontSize: "12px",
+				color: line?.kind === "failed" ? "#b91c1c" : "#6b7280",
+			});
+			row.textContent = String(line?.text ?? "");
+			return row;
+		};
+
 		const renderMessages = (data) => {
 			const messages = data?.messages;
 			if (!Array.isArray(messages)) {
 				throw new Error("messages is not a list");
 			}
+			const lines = data?.bot_status?.lines;
+			// Each line goes under its message: no anchor first, an unknown anchor last.
+			const first = [];
+			const last = [];
+			const below = new Map(messages.map((message) => [message?.name, []]));
+			for (const line of Array.isArray(lines) ? lines : []) {
+				const after = line?.after_message;
+				const place =
+					after === null || after === undefined ? first : below.get(after) || last;
+				place.push(systemLine(line));
+			}
 			if (messages.length === 0) {
 				const empty = document.createElement("div");
 				empty.style.marginTop = "8px";
 				empty.textContent = TEXT_EMPTY_THREAD;
-				state.panel.threadEl.replaceChildren(empty);
+				state.panel.threadEl.replaceChildren(empty, ...first, ...last);
 				return;
 			}
 			let newestGuidance = -1;
@@ -384,9 +471,9 @@ function setupForm({ doc, call, router }) {
 					});
 					row.append(approveEl);
 				}
-				return row;
+				return [row, ...(below.get(message?.name) || [])];
 			});
-			state.panel.threadEl.replaceChildren(...nodes);
+			state.panel.threadEl.replaceChildren(...first, ...nodes.flat(), ...last);
 		};
 
 		const clearProposals = () => {
@@ -554,9 +641,12 @@ function setupForm({ doc, call, router }) {
 								return;
 							}
 							renderAiFields(data);
+							renderBotStatus(data);
 							renderMessages(data);
 							panel.errorEl.textContent = "";
 						} catch (e) {
+							panel.botStatus = null;
+							showBotStatus();
 							panel.aiListEl.replaceChildren();
 							clearProposals();
 							panel.threadEl.replaceChildren();
@@ -717,6 +807,12 @@ function setupForm({ doc, call, router }) {
 			closePanel();
 			panel.aiListEl?.replaceChildren();
 			panel.threadEl?.replaceChildren();
+			clearExpiryTimer();
+			panel.botStatus = null;
+			panel.statusExpired = false;
+			if (panel.statusTextEl) {
+				panel.statusTextEl.textContent = "";
+			}
 			panel.deciding = false;
 			clearProposals();
 			if (panel.inputEl) {

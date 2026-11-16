@@ -13,6 +13,7 @@
   "record_tools_enabled",
   "act_now_enabled",
   "code_change_enabled",
+  "console_enabled",
   "one_click_approval_enabled",
   "site_environment",
   "section_autonomy",
@@ -156,6 +157,13 @@
    "label": "Cho phép sửa code và lệnh bench",
    "default": "0",
    "description": "Sửa code và lệnh bench. Bật thì ở L3 và khi có người ra lệnh, bot đề xuất sửa file, tạo file, lệnh bench; mọi thay đổi phải được duyệt bởi ERP AI Instructor trên form đề xuất. Mỗi thay đổi đã áp dụng là một commit git local; bot không push. Ô này không còn mở công cụ bản ghi. Tắt thì bot không có ba công cụ đó."
+  },
+  {
+   "fieldname": "console_enabled",
+   "fieldtype": "Check",
+   "label": "Cho phép chạy bench console (qua duyệt)",
+   "default": "0",
+   "description": "Bật thì bot được soạn script Python chạy như bench console khi không có API hay công cụ bản ghi nào làm được việc. Mỗi script là một đề xuất Chờ duyệt; chỉ người có vai trò ERP AI Instructor duyệt được, bằng nút Duyệt trong khung Trao đổi với bot. Script chạy một lần trong một giao dịch; lỗi thì không lưu gì. Không hoàn tác được. Không phụ thuộc ô Cho phép sửa code và lệnh bench. Tắt thì bot không soạn được script và script đã duyệt cũng không chạy."
   },
   {
    "fieldname": "one_click_approval_enabled",

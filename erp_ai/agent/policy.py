@@ -5,7 +5,7 @@ from dataclasses import dataclass
 
 import frappe
 from frappe import _
-from frappe.utils import add_months, get_datetime, now_datetime
+from frappe.utils import add_months, cint, get_datetime, now_datetime
 
 from erp_ai.constants import (
 	CATEGORIES,
@@ -340,6 +340,7 @@ def current_change_settings() -> ChangeSettings:
 RECORD_TOOLS_FIELD = "record_tools_enabled"
 ACT_NOW_FIELD = "act_now_enabled"
 ONE_CLICK_APPROVAL_FIELD = "one_click_approval_enabled"
+CONSOLE_FIELD = "console_enabled"  # CHG-010: not in PERMISSION_SWITCH_FIELDS (the five of the spec)
 # The five permission switches in the spec's order (1)..(5).
 PERMISSION_SWITCH_FIELDS = (
 	UNRESTRICTED_FIELD,
@@ -357,6 +358,7 @@ class PermissionSwitches:
 	act_now: bool = False  # (3)
 	code_change: bool = False  # (4)
 	one_click_approval: bool = False  # (5)
+	console: bool = False  # CHG-010: bench console proposals, independent of code_change
 
 
 def permission_switches(settings) -> PermissionSwitches:
@@ -367,7 +369,19 @@ def permission_switches(settings) -> PermissionSwitches:
 		act_now=bool(getattr(settings, ACT_NOW_FIELD, 0)),
 		code_change=change_settings(settings).enabled,
 		one_click_approval=bool(getattr(settings, ONE_CLICK_APPROVAL_FIELD, 0)),
+		console=bool(cint(getattr(settings, CONSOLE_FIELD, 0))),  # a Single without meta gives "0"
 	)
+
+
+def console_enabled_now() -> bool:
+	"""Fresh read of the console switch from the DB (no cache), for the apply job.
+
+	Reads `tabSingles` directly: the DocType meta of a site not yet migrated does not know the field, and
+	`get_single_value` checks the meta. A missing row reads off."""
+	value = frappe.db.sql(
+		"select value from `tabSingles` where doctype=%s and field=%s", (SETTING_DOCTYPE, CONSOLE_FIELD)
+	)
+	return permission_switches(frappe._dict({CONSOLE_FIELD: value[0][0] if value else 0})).console
 
 
 SITE_ENVIRONMENT_FIELD = "site_environment"

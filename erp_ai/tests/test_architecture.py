@@ -207,6 +207,7 @@ POLICY_FIELDS = (
 	"record_tools_enabled",
 	"act_now_enabled",
 	"one_click_approval_enabled",
+	"console_enabled",
 	"level_cap_a",
 	"level_cap_b",
 	"level_cap_c",

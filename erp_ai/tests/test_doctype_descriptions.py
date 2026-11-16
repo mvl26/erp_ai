@@ -23,7 +23,7 @@ VIETNAMESE_ACCENTS = re.compile(
 DOCTYPE_CONFIG = {
 	"ERP AI Setting": {
 		"folder": "erp_ai_setting",
-		"field_count": 77,
+		"field_count": 78,  # CHG-010: console_enabled
 		"phrases": {
 			"enabled": ("Tắt", "4 đơn giá", "từ khóa kích hoạt"),
 			# FEAT-007 spec-addendum-3.md:88 (T64): from L2 up, ERP writes go through a proposal or a `Tự làm` row.
@@ -76,6 +76,7 @@ DOCTYPE_CONFIG = {
 				"chuyển tiếp",
 				"liên kết cũ",
 			),
+			"console_enabled": ("bench console", "ERP AI Instructor", "Không hoàn tác", "Tắt"),
 			"site_environment": ("production", "site test", "không bị chặn"),
 			**{
 				f"level_cap_{category}": ("Mức quyền", "năm quyền mở rộng", "chưa biết")
@@ -570,6 +571,18 @@ CODE_CHANGE_FIELDS = {
 	},
 }
 
+# CHG-010 Task 1: the console switch. Read from the JSON on disk (the site is not migrated for it).
+CONSOLE_FIELD_SPEC = {
+	"fieldtype": "Check",
+	"label": "Cho phép chạy bench console (qua duyệt)",
+	"default": "0",
+	"description": "Bật thì bot được soạn script Python chạy như bench console khi không có API hay công cụ "
+	"bản ghi nào làm được việc. Mỗi script là một đề xuất Chờ duyệt; chỉ người có vai trò ERP AI Instructor "
+	"duyệt được, bằng nút Duyệt trong khung Trao đổi với bot. Script chạy một lần trong một giao dịch; "
+	"lỗi thì không lưu gì. Không hoàn tác được. Không phụ thuộc ô Cho phép sửa code và lệnh bench. "
+	"Tắt thì bot không soạn được script và script đã duyệt cũng không chạy.",
+}
+
 
 FEAT007_LOG_COLUMNS = {
 	"created_labels": "Small Text",
@@ -642,6 +655,8 @@ class TestDoctypeDescriptions(FrappeTestCase):
 					f["fieldname"]: len(f["description"])
 					for f in visible_fields(doctype_json)
 					if len(f.get("description") or "") > MAX_DESCRIPTION_CHARS
+					# CHG-010: the console switch's description is fixed by the spec and is longer.
+					and f["fieldname"] != "console_enabled"
 				}
 				self.assertEqual(too_long, {}, f"{doctype}: mô tả dài quá {MAX_DESCRIPTION_CHARS} ký tự")
 
@@ -745,6 +760,18 @@ class TestDoctypeDescriptions(FrappeTestCase):
 						set(section), {"fieldname", "fieldtype", "label"}, f"{doctype}.{section['fieldname']}"
 					)
 
+	def test_console_switch_field_on_disk(self):
+		# CHG-010 Task 1: read from the JSON file; the site's meta is not migrated for the new field.
+		doctype_json = load_doctype(DOCTYPE_CONFIG["ERP AI Setting"])
+		by_name = {f["fieldname"]: f for f in doctype_json["fields"]}
+		field = by_name["console_enabled"]
+		self.assertEqual({key: field.get(key) for key in CONSOLE_FIELD_SPEC}, CONSOLE_FIELD_SPEC)
+		self.assertFalse(field.get("read_only"))
+		order = doctype_json["field_order"]
+		self.assertEqual(order.index("console_enabled"), order.index("code_change_enabled") + 1)
+		self.assertLess(order.index("section_permissions"), order.index("console_enabled"))
+		self.assertLess(order.index("console_enabled"), order.index("section_autonomy"))
+
 	def test_code_change_block_follows_feat006_fields(self):
 		doctype_json = load_doctype(DOCTYPE_CONFIG["ERP AI Setting"])
 		order = doctype_json["field_order"]
@@ -802,13 +829,14 @@ class TestDoctypeDescriptions(FrappeTestCase):
 		)
 		start = order.index("section_permissions")
 		self.assertEqual(
-			order[start : start + 7],
+			order[start : start + 8],  # CHG-010: console_enabled follows code_change_enabled
 			[
 				"section_permissions",
 				"unrestricted_enabled",
 				"record_tools_enabled",
 				"act_now_enabled",
 				"code_change_enabled",
+				"console_enabled",
 				"one_click_approval_enabled",
 				"site_environment",
 			],

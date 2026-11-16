@@ -4,6 +4,8 @@ Every write runs in the session of the person who acted, never commits, and goes
 permissions bypassed after the store's own checks. Sources in a person's request call it through `safely`.
 """
 
+import uuid
+
 import frappe
 from frappe.utils import escape_html, now_datetime
 
@@ -209,6 +211,29 @@ def transition(name: str, action: str) -> str:
 	doc.flags.ignore_links = True
 	_write(doc)
 	return to_status
+
+
+def teach(rule: str, situation: str = "") -> str:
+	"""An ERP AI Instructor teaches the bot a rule by hand (AC-8); the lesson is active at once and has no ticket.
+
+	Raises:
+		frappe.PermissionError: the agent account, or a user who is not an ERP AI Instructor.
+		frappe.ValidationError: learning is off, or the rule is empty.
+	"""
+	user = _actor()
+	if not policy.can_manage_lessons(user):
+		frappe.throw("Chỉ người có vai trò ERP AI Instructor được dạy bot", frappe.PermissionError)
+	if not policy.lessons_enabled():
+		frappe.throw("Bot đang tắt việc học", frappe.ValidationError)
+	if not isinstance(rule, str) or not _clean(rule, TEXT_MAX):
+		frappe.throw("Cần nhập quy tắc", frappe.ValidationError)
+	return _store(
+		LESSON_SOURCE_TEACHING,
+		f"teach:{uuid.uuid4().hex}",
+		situation=situation if isinstance(situation, str) else "",
+		text=rule,
+		authorized=True,
+	)
 
 
 def safely(func, *args, **kwargs) -> str | None:

@@ -147,6 +147,19 @@ LAYER_RULES = (
 		"STD-DESIGN-6: policy là tầng dưới của tools, không import ngược",
 	),
 	(
+		"erp_ai.agent.bot_status",
+		(
+			"erp_ai.gateway",
+			"erp_ai.agent.runner",
+			"erp_ai.agent.queue",
+			"erp_ai.agent.run_status",
+			"erp_ai.agent.tools",
+			"erp_ai.agent.policy",
+			"erp_ai.agent.run_log",
+		),
+		"ADR-048 QĐ 6: the panel's status reader never calls the model, runs, queues or signals the agent, calls a tool, judges a gate or writes a log row",
+	),
+	(
 		CHANGE_TEXT_MODULE,
 		CHANGE_TEXT_FORBIDDEN,
 		"design 8.2/ADR-022: change_text imports only the standard library and erp_ai.constants",
@@ -12176,6 +12189,182 @@ class TestEventWriteRules(unittest.TestCase):
 					changed(clean, HANDLERS_FILE, replace=("def comment_after_insert(", "def comment_hook(")),
 					f"{HANDLERS_FILE}: no function {COMMENT_HOOK}",
 				),
+			},
+		)
+
+
+# ---------------------------------------------------------------------------------------------------
+# ADR-048 Ràng buộc "module đọc ở QĐ 6" (CHG-009 design 3.2, 8.2): the panel's status reader writes nothing and
+# reads no cache or job state; outside tests only ticket_panel.py imports it; ticket_panel.py still never names
+# "ERP AI Log" (its import rule is the `erp_ai.agent.bot_status` entry of LAYER_RULES)
+# ---------------------------------------------------------------------------------------------------
+
+BOT_STATUS_FILE = "agent/bot_status.py"
+BOT_STATUS_MODULE = "erp_ai.agent.bot_status"
+BOT_STATUS_FORBIDDEN_NAMES = (
+	"insert",
+	"save",
+	"set_value",
+	"db_set",
+	"commit",
+	"write_entry",
+	"cache",
+	"publish_realtime",
+	"get_job",
+)
+PANEL_FORBIDDEN_LOG_TEXT = "ERP AI Log"
+
+
+def check_bot_status_reader_follows_adr_048(sources: dict) -> list:
+	"""ADR-048 Ràng buộc: the reader names no write, commit, cache, realtime publish or job read; no product file
+	but ticket_panel.py imports or names the reader; ticket_panel.py holds no "ERP AI Log" string."""
+	for rel in (BOT_STATUS_FILE, PANEL_FILE):
+		if rel not in sources:
+			return _missing(rel)
+	violations = [
+		violation(
+			BOT_STATUS_FILE, node, f"names {name}: the reader writes nothing, reads no cache or job (ADR-048)"
+		)
+		for node in ast.walk(parse(BOT_STATUS_FILE, sources[BOT_STATUS_FILE]))
+		for name in _node_names(node)
+		if name in BOT_STATUS_FORBIDDEN_NAMES
+	]
+	for rel, source in only_python(sources).items():
+		if rel in (BOT_STATUS_FILE, PANEL_FILE):
+			continue
+		tree = parse(rel, source)
+		for lineno, target in imported_modules(tree, module_name(rel), rel.endswith("__init__.py")):
+			if module_in(target, BOT_STATUS_MODULE):
+				violations.append(f"{rel}:{lineno}: imports {target}; only {PANEL_FILE} may (ADR-048)")
+		violations.extend(
+			violation(rel, node, f"names {BOT_STATUS_MODULE}; only {PANEL_FILE} may (ADR-048)")
+			for node in constant_strings(tree)
+			if BOT_STATUS_MODULE in node.value
+		)
+	violations.extend(
+		violation(
+			PANEL_FILE, node, f'names "{PANEL_FORBIDDEN_LOG_TEXT}": only the reader reads the log (ADR-048)'
+		)
+		for node in constant_strings(parse(PANEL_FILE, sources[PANEL_FILE]))
+		if PANEL_FORBIDDEN_LOG_TEXT in node.value
+	)
+	return violations
+
+
+# Clean sample: the reader reads the log through the allowed imports, the panel imports it, another module does not.
+BOT_STATUS_SAMPLE = {
+	BOT_STATUS_FILE: (
+		"import frappe\n"
+		"from frappe.utils import now_datetime\n\n"
+		"from erp_ai.constants import LOG_DOCTYPE\n\n\n"
+		"def panel_status(ticket, message_names, now=None):\n"
+		'\trows = frappe.get_all(LOG_DOCTYPE, filters={"ticket": ticket}, fields=["name"], limit=500)\n'
+		'\treturn {"lines": rows, "now": now or now_datetime()}\n'
+	),
+	PANEL_FILE: (
+		"from erp_ai.agent import bot_status\n\n\n"
+		"def get_panel_data(ticket):\n"
+		'\treturn {"bot_status": bot_status.panel_status(ticket, [])}\n'
+	),
+	"agent/messages.py": "import frappe\n\nfrom erp_ai.constants import MESSAGE_DOCTYPE\n",
+}
+# design 8.2: what the LAYER_RULES entry of the reader forbids.
+BOT_STATUS_FORBIDDEN_IMPORTS = (
+	"erp_ai.gateway",
+	"erp_ai.agent.runner",
+	"erp_ai.agent.queue",
+	"erp_ai.agent.run_status",
+	"erp_ai.agent.tools",
+	"erp_ai.agent.policy",
+	"erp_ai.agent.run_log",
+)
+
+
+class TestBotStatusReaderRules(unittest.TestCase):
+	"""CHG-009 T4: the ADR-048 rules on the panel's status reader, on the product, then the clean and violating samples."""
+
+	assertRuleSamples = TestArchitecture.assertRuleSamples
+
+	@classmethod
+	def setUpClass(cls):
+		cls.sources = load_product_sources()
+
+	def test_bot_status_reader_follows_adr_048(self):
+		self.assertIn(BOT_STATUS_FILE, self.sources)
+		self.assertEqual(check_bot_status_reader_follows_adr_048(self.sources), [])
+
+		changed = TestScannersCatchViolations.changed
+		clean = BOT_STATUS_SAMPLE
+		in_reader = {
+			"insert": 'frappe.get_doc({"doctype": LOG_DOCTYPE}).insert()',
+			"save": "doc.save()",
+			"set_value": 'frappe.db.set_value(LOG_DOCTYPE, doc, "seen", 1)',
+			"db_set": 'doc.db_set("seen", 1)',
+			"commit": "frappe.db.commit()",
+			"cache": "frappe.cache().get_value(doc)",
+			"publish_realtime": 'frappe.publish_realtime("erp_ai:agent_status", doc)',
+		}
+		cases = {
+			f"{name} in the reader": (
+				changed(clean, BOT_STATUS_FILE, f"\n\ndef touch(doc):\n\treturn {expression}\n"),
+				f"{BOT_STATUS_FILE}:13: names {name}",
+			)
+			for name, expression in in_reader.items()
+		}
+		cases |= {
+			f"{name} imported by the reader": (
+				changed(clean, BOT_STATUS_FILE, f"from {module} import {name}\n"),
+				f"{BOT_STATUS_FILE}:10: names {name}",
+			)
+			for module, name in (
+				("erp_ai.agent.run_log", "write_entry"),
+				("frappe.utils.background_jobs", "get_job"),
+			)
+		}
+		panel_only = f"imports {BOT_STATUS_MODULE}; only {PANEL_FILE} may"
+		cases |= {
+			"another module imports the reader": (
+				changed(clean, "agent/messages.py", "from erp_ai.agent import bot_status\n"),
+				f"agent/messages.py:4: {panel_only}",
+			),
+			"the runner imports it lazily and relatively": (
+				changed(clean, RUNNER_FILE, "def status(ticket):\n\tfrom . import bot_status\n"),
+				f"{RUNNER_FILE}:2: {panel_only}",
+			),
+			"a module names it by its path": (
+				changed(
+					clean,
+					"tasks.py",
+					'import frappe\n\nSTATUS = frappe.get_attr("erp_ai.agent.bot_status.panel_status")\n',
+				),
+				f"tasks.py:3: names {BOT_STATUS_MODULE}; only {PANEL_FILE} may",
+			),
+			"the panel names the log": (
+				changed(
+					clean,
+					PANEL_FILE,
+					'\n\ndef rows(ticket):\n\treturn frappe.get_all("ERP AI Log", filters={"ticket": ticket})\n',
+				),
+				f'{PANEL_FILE}:9: names "{PANEL_FORBIDDEN_LOG_TEXT}"',
+			),
+			"the panel queries the log's table": (
+				changed(clean, PANEL_FILE, 'SQL = "select name from `tabERP AI Log` where ticket=%s"\n'),
+				f'{PANEL_FILE}:6: names "{PANEL_FORBIDDEN_LOG_TEXT}"',
+			),
+			"the reader missing": ({PANEL_FILE: clean[PANEL_FILE]}, f"{BOT_STATUS_FILE}: file missing"),
+			"the panel missing": ({BOT_STATUS_FILE: clean[BOT_STATUS_FILE]}, f"{PANEL_FILE}: file missing"),
+		}
+		self.assertRuleSamples(check_bot_status_reader_follows_adr_048, clean, cases)
+
+		self.assertRuleSamples(
+			check_layer_imports,
+			clean,
+			{
+				target: (
+					changed(clean, BOT_STATUS_FILE, "from {} import {}\n".format(*target.rsplit(".", 1))),
+					f"{BOT_STATUS_FILE}:10: imports {target} (ADR-048 QĐ 6",
+				)
+				for target in BOT_STATUS_FORBIDDEN_IMPORTS
 			},
 		)
 

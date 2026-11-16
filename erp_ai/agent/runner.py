@@ -321,8 +321,13 @@ def _run(ticket_name, trigger, message_name=None, communication_name=None):
 			if trigger != TRIGGER_TICKET_INSERT:
 				category, pct = policy.latest_classification(ticket_name)
 				if category is not None:
-					# the reasoning step knows the earlier classification, the same pair (U4b.md:238, Fix 12)
-					classification = {"category": category, "confidence_pct": pct}
+					# the reasoning step knows the earlier classification, the same pair (U4b.md:238, Fix 12), and
+					# the complexity the ticket holds, to act by it and correct it (ADR-019 Amendment 1)
+					classification = {
+						"category": category,
+						"confidence_pct": pct,
+						**_ticket_complexity(ticket_name),
+					}
 			context = ToolContext(
 				ticket_name=ticket_name,
 				effective_level=level,
@@ -861,8 +866,29 @@ def _classify(
 				split_text,
 				collect_run_id=run_id,
 			)
-	summary = {"category": classification.category, "confidence": classification.confidence, **values}
+	summary = {
+		"category": classification.category,
+		"confidence": classification.confidence,
+		**values,
+		**_complexity(classification.complexity, classification.score_reason),
+	}
 	return True, summary, context
+
+
+def _complexity(score, reason) -> dict:
+	"""The complexity (1-3) and its reason for the reasoning step; {} when there is no score (ADR-019 Amendment 1)."""
+	if score not in (1, 2, 3):
+		return {}
+	return {"complexity": score, "complexity_reason": reason or ""}
+
+
+def _ticket_complexity(ticket_name) -> dict:
+	"""The complexity the ticket holds and its reason, as `_complexity` gives them."""
+	row = (
+		frappe.db.get_value("HD Ticket", ticket_name, ["ai_complexity", "ai_score_reason"], as_dict=True)
+		or {}
+	)
+	return _complexity(row.get("ai_complexity"), row.get("ai_score_reason"))
 
 
 def _log_classify(ticket_name, run_id, ok, created) -> None:

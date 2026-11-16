@@ -44,6 +44,12 @@ LINKED_DOCTYPES = {
 	"priority": "HD Ticket Priority",
 }
 REASON_MAX = 200
+# ADR-019 Amendment 1: the reasoning step corrects the complexity the classify step guessed, always with its reason.
+COMPLEXITY_FIELD = "ai_complexity"
+SCORE_REASON_FIELD = "ai_score_reason"
+COMPLEXITY_VALUES = (1, 2, 3)
+COMPLEXITY_REASON_MAX = 300
+REASON_COMPLEXITY_NO_REASON = "độ phức tạp mới cần lý do (complexity_reason)"
 # The kinds of the post_comment tool (AC-22, U4b.md:126-133); U8 appends "ba_note" (AC-62).
 COMMENT_KINDS = ("de_xuat", "hoi", "ba_note")
 CONFIDENCE_LINE = re.compile(r"Độ tin cậy:\s*(\d{1,3})\s*%")
@@ -252,13 +258,18 @@ def set_classification(args: dict, ctx: ToolContext) -> dict:
 		return _fail("thiếu quyền ghi phiếu")
 	if doc.get("ai_classified_by") == CLASSIFIED_BY_HUMAN:
 		return _fail("người đã phân loại, không ghi đè")
+	scores = _scores(args)
+	if scores is None:
+		return _fail(REASON_COMPLEXITY_NO_REASON)
 	values, skipped = _mapped_values(doc, args, ctx)
-	if not values:
+	if not values and not scores:
 		return {"ok": True, "before": {}, "after": {}, "skipped": skipped}
-	values["ai_confidence"] = args["confidence"]
-	# The tool takes no reason: a reason left by an earlier classification would describe the wrong one.
-	if doc.get(CLASSIFICATION_REASON_FIELD):
-		values[CLASSIFICATION_REASON_FIELD] = ""
+	if values:
+		values["ai_confidence"] = args["confidence"]
+		# The tool takes no classification reason: one left by an earlier classification would describe the wrong one.
+		if doc.get(CLASSIFICATION_REASON_FIELD):
+			values[CLASSIFICATION_REASON_FIELD] = ""
+	values.update(scores)
 	for field in (*values, "ai_classified_by", "ai_updated_at"):
 		if not doc.has_permlevel_access_to(field, permission_type="write"):
 			return _fail(f"thiếu quyền ghi trường {field}")
@@ -271,8 +282,20 @@ def set_classification(args: dict, ctx: ToolContext) -> dict:
 	fields = ", ".join(
 		f"{FIELD_LABELS[field]} {value}" for field, value in values.items() if field in FIELD_LABELS
 	)
-	collect(ctx.run_id, SECTION_DONE, ROUTE_DONE.format(fields=fields))
+	if fields:
+		collect(ctx.run_id, SECTION_DONE, ROUTE_DONE.format(fields=fields))
 	return {"ok": True, "before": before, "after": dict(values), "skipped": skipped}
+
+
+def _scores(args: dict) -> dict | None:
+	"""The complexity the model found while working and its reason, as ticket values; {} when it gave none; None
+	when it gave a complexity without a reason."""
+	if args.get("complexity") is None:
+		return {}
+	reason = (args.get("complexity_reason") or "").strip()
+	if not reason:
+		return None
+	return {COMPLEXITY_FIELD: args["complexity"], SCORE_REASON_FIELD: reason}
 
 
 def set_resolution_hint(args: dict, ctx: ToolContext) -> dict:
@@ -779,13 +802,17 @@ TOOLS: list[ToolSpec] = [
 			"name": "set_classification",
 			"description": (
 				"Ghi phân loại của phiếu hiện tại theo đầu mục A-F và độ tin cậy. "
-				"Loại, nhóm và mức ưu tiên lấy từ ánh xạ đầu mục, không nhận tên trường."
+				"Loại, nhóm và mức ưu tiên lấy từ ánh xạ đầu mục, không nhận tên trường. "
+				"complexity (1-3) và complexity_reason: độ phức tạp thật sau khi đã đọc code và dữ liệu, kèm lý do; "
+				"bỏ trống thì giữ điểm cũ."
 			),
 			"input_schema": {
 				"type": "object",
 				"properties": {
 					"category": {"type": "string", "enum": list(CATEGORIES)},
 					"confidence": {"type": "string", "enum": list(CONFIDENCE_VALUES)},
+					"complexity": {"type": "integer", "enum": list(COMPLEXITY_VALUES)},
+					"complexity_reason": {"type": "string", "maxLength": COMPLEXITY_REASON_MAX},
 				},
 				"required": ["category", "confidence"],
 			},

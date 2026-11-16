@@ -193,7 +193,9 @@ class TestKpi(FrappeTestCase):
 		self.assertEqual(result["first_response_median_min"], 10.0)
 		self.assertEqual(result["first_response_within_15_pct"], 60.0)
 		self.assertEqual(result["first_response_within_5_pct"], 40.0)
-		self.assertEqual(result["first_response_sample"], 5)
+		self.assertEqual(
+			result["first_response_sample"], 4
+		)  # answered tickets only; the rates keep all 5 as base
 
 	def test_kpi2_open_at_week_end(self):
 		ws = _start(WEEK_KPI2)
@@ -308,7 +310,18 @@ class TestKpi(FrappeTestCase):
 		self.assertIsNone(result["first_response_median_min"])
 		self.assertEqual(result["first_response_within_15_pct"], 0.0)
 		self.assertEqual(result["first_response_within_5_pct"], 0.0)
-		self.assertEqual(result["first_response_sample"], 1)
+		self.assertEqual(result["first_response_sample"], 0)
+
+	def test_kpi1_sample_counts_answered_tickets_only(self):
+		ws = _start(WEEK_NO_RESPONSE)
+		_ticket(ws + timedelta(hours=1))
+		_ticket(ws + timedelta(days=2))
+
+		result = kpi.compute_week(WEEK_NO_RESPONSE, self.settings)
+
+		self.assertIsNone(result["first_response_median_min"])
+		self.assertEqual(result["first_response_sample"], 0)
+		self.assertEqual(result["first_response_within_15_pct"], 0.0)
 
 	def test_kpi4_b_resolution_hours(self):
 		ws = _start(WEEK_KPI4)

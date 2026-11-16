@@ -1,9 +1,11 @@
-from datetime import date
+from datetime import date, datetime, timedelta
 
 import frappe
 from frappe.desk.query_report import run as run_report
 from frappe.tests.utils import FrappeTestCase
 
+from erp_ai.agent import kpi
+from erp_ai.agent.test_kpi import _ticket
 from erp_ai.constants import KPI_IDS, ROLE_AGENT, ROLE_INSTRUCTOR
 from erp_ai.erp_ai_agent.report.erp_ai_kpi_weekly.erp_ai_kpi_weekly import NO_DATA_LABEL, execute
 from erp_ai.test_utils import keep_agent_settings
@@ -102,6 +104,19 @@ class TestReport(FrappeTestCase):
 		)
 		self.assertEqual([row["unit"] for row in data], ["phút", "%", "%", "giờ", "%", "phiếu"])
 		self.assertEqual(len({row["kpi"] for row in data}), len(KPI_IDS))
+
+	def test_tickets_but_none_answered_reads_no_data(self):
+		# Computed end to end: 2 tickets created, none answered -> the stored median is empty (0) and the
+		# sample must be 0 too, so KPI 1 shows "chưa có dữ liệu" rather than "0".
+		ws = datetime.combine(THIS_WEEK, datetime.min.time())
+		_ticket(ws + timedelta(hours=1))
+		_ticket(ws + timedelta(days=2))
+		values = kpi.compute_week(THIS_WEEK, frappe.get_single("ERP AI Setting"))
+		frappe.get_doc({"doctype": KPI_WEEK, **values}).insert()
+
+		data = execute({"week_start": THIS_WEEK})[1]
+
+		self.assertEqual(data[0]["this_week"], NO_DATA_LABEL)
 
 	def test_default_week_is_the_newest_row(self):
 		self._rows()

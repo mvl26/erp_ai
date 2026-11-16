@@ -117,7 +117,7 @@ class HandlerTestCase(FrappeTestCase):
 		return frappe.get_all(
 			MESSAGE_DOCTYPE,
 			filters={"ticket": ticket_name},
-			fields=["name", "kind", "content", "owner", "source_comment"],
+			fields=["name", "content", "owner", "source_comment"],
 		)
 
 	def _comment(self, ticket_name, content, comment_type="Comment", reference_doctype="HD Ticket"):
@@ -287,7 +287,6 @@ class TestCommentHandler(HandlerTestCase):
 
 		rows = self._messages(ticket.name)
 		self.assertEqual(len(rows), 1)
-		self.assertEqual(rows[0].kind, "chat")
 		self.assertEqual(rows[0].source_comment, comment.name)
 		self.assertEqual(rows[0].owner, comment.owner)
 		# stored verbatim (Code field): the markup stripping is html_to_plain_text's job
@@ -303,7 +302,7 @@ class TestCommentHandler(HandlerTestCase):
 		ticket = self._ticket_without_job()
 		frappe.set_user("Administrator")
 
-		name = messages.add_message(ticket.name, "xem giúp", "chat", trusted=True)
+		name = messages.add_message(ticket.name, "xem giúp", trusted=True)
 
 		jobs = self._jobs()
 		self.assertEqual(len(jobs), 1)
@@ -313,45 +312,41 @@ class TestCommentHandler(HandlerTestCase):
 	def test_two_chat_messages_same_transaction_one_job(self):
 		ticket = self._ticket_without_job()
 
-		messages.add_message(ticket.name, "một", "chat", trusted=True)
-		messages.add_message(ticket.name, "hai", "chat", trusted=True)
+		messages.add_message(ticket.name, "một", trusted=True)
+		messages.add_message(ticket.name, "hai", trusted=True)
 
 		self.assertEqual(len(self._jobs()), 1)
 
-	def test_bot_and_non_chat_messages_never_enqueue(self):
+	def test_bot_message_never_enqueues(self):
 		ticket = self._ticket_without_job()
 
 		frappe.set_user(AGENT_USER)
-		messages.add_message(ticket.name, "bot nói", "chat", trusted=True)
-		self.assertEqual(self._jobs(), [])
-
-		frappe.set_user("Administrator")
-		for kind in ("result", "routing", "proposal"):
-			messages.add_message(ticket.name, "x", kind, trusted=True)
+		messages.add_message(ticket.name, "bot nói", trusted=True)
 		self.assertEqual(self._jobs(), [])
 
 		def no_db(*args, **kwargs):
-			raise AssertionError("a non-chat message must return before any database read")
+			raise AssertionError("the bot's own message must return before any database read")
 
-		for kind in ("result", "routing", "proposal"):
-			doc = frappe.get_doc(
-				{"doctype": MESSAGE_DOCTYPE, "ticket": ticket.name, "kind": kind, "content": "x"}
-			)
-			with patch.object(frappe.db, "get_value", side_effect=no_db):
-				handlers.message_after_insert(doc)
+		doc = frappe.get_doc({"doctype": MESSAGE_DOCTYPE, "ticket": ticket.name, "content": "x"})
+		doc.owner = AGENT_USER
+		with (
+			patch.object(frappe.db, "get_value", side_effect=no_db),
+			patch.object(frappe.db, "get_single_value", side_effect=no_db),
+		):
+			handlers.message_after_insert(doc)
 		self.assertEqual(self._jobs(), [])
 
 	def test_message_with_agent_disabled_or_not_sendable_no_job(self):
 		ticket = self._ticket_without_job()
 		set_agent_settings(enabled=0)
-		messages.add_message(ticket.name, "xem giúp", "chat", trusted=True)
+		messages.add_message(ticket.name, "xem giúp", trusted=True)
 		self.assertEqual(self._jobs(), [])
 
 		set_agent_settings(enabled=1)
 		opted_out = self._ticket_without_job(ai_opt_out=1)
-		messages.add_message(opted_out.name, "xem giúp", "chat", trusted=True)
+		messages.add_message(opted_out.name, "xem giúp", trusted=True)
 		excluded = self._ticket_without_job(agent_group=EXCLUDED_TEAM)
-		messages.add_message(excluded.name, "xem giúp", "chat", trusted=True)
+		messages.add_message(excluded.name, "xem giúp", trusted=True)
 		self.assertEqual(self._jobs(), [])
 
 	def test_comment_without_keyword_no_job(self):

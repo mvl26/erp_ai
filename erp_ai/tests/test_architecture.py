@@ -6804,14 +6804,14 @@ class TestScannersCatchViolations(unittest.TestCase):
 		self.assertEqual(check_tools_never_bypass_permissions({"agent/tools/read.py": source}), [])
 
 	def test_tools_trusted_scanner_flags_only_trusted_true_in_tools(self):
-		flagged = "from erp_ai.agent.messages import add_message\nadd_message(t, 'x', 'chat', trusted=True)\n"
+		flagged = "from erp_ai.agent.messages import add_message\nadd_message(t, 'x', trusted=True)\n"
 		self.assertCaught(
 			check_tools_never_pass_trusted_messages({"agent/tools/x.py": flagged}), "agent/tools/x.py:2: "
 		)
 		clean = (
-			"add_message(t, 'x', 'chat')\n"
-			"add_message(t, 'x', 'chat', trusted=False)\n"
-			"add_message(t, 'x', 'chat', trusted=flag)\n"
+			"add_message(t, 'x')\n"
+			"add_message(t, 'x', trusted=False)\n"
+			"add_message(t, 'x', trusted=flag)\n"
 		)
 		self.assertEqual(check_tools_never_pass_trusted_messages({"agent/tools/x.py": clean}), [])
 		self.assertEqual(check_tools_never_pass_trusted_messages({"agent/runner.py": flagged}), [])
@@ -7596,7 +7596,7 @@ class TestScannersCatchViolations(unittest.TestCase):
 			"@frappe.whitelist(methods=['POST'])\n"
 			"def get_panel_data(ticket):\n\treturn 1\n"
 			"@frappe.whitelist(methods=['POST'])\n"
-			"def send_message(ticket, text):\n\treturn messages.add_message(ticket, text, 'chat')\n"
+			"def send_message(ticket, text):\n\treturn messages.add_message(ticket, text)\n"
 		)
 	}
 
@@ -7831,7 +7831,7 @@ class TestScannersCatchViolations(unittest.TestCase):
 		source = self.PANEL_SOURCES["ticket_panel.py"]
 		self.assertCaught(
 			check_ticket_panel_forbidden_calls(
-				{PANEL_FILE: source + "def x(d):\n\tmessages.add_message(d, 'a', 'chat')\n"}
+				{PANEL_FILE: source + "def x(d):\n\tmessages.add_message(d, 'a')\n"}
 			),
 			"found 2",
 		)
@@ -7839,8 +7839,8 @@ class TestScannersCatchViolations(unittest.TestCase):
 			check_ticket_panel_forbidden_calls({PANEL_FILE: source.replace("add_message", "other")}),
 			"found 0",
 		)
-		moved = source.replace("return messages.add_message(ticket, text, 'chat')", "return 1")
-		moved += "def helper(d):\n\tmessages.add_message(d, 'a', 'chat')\n"
+		moved = source.replace("return messages.add_message(ticket, text)", "return 1")
+		moved += "def helper(d):\n\tmessages.add_message(d, 'a')\n"
 		self.assertCaught(
 			check_ticket_panel_forbidden_calls({PANEL_FILE: moved}), "must be inside send_message"
 		)

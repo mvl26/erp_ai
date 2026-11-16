@@ -3345,7 +3345,7 @@ class TestRunnerGrant(RunnerTestBase):
 	def _comment(self, author, creation):
 		"""A `chat` message on the ticket whose server-set author (`owner`) is `author`."""
 		with patch.object(frappe, "enqueue"):
-			name = messages.add_message(self.ticket.name, "x", "chat", trusted=True)
+			name = messages.add_message(self.ticket.name, "x", trusted=True)
 		frappe.db.set_value(
 			"ERP AI Message", name, {"owner": author, "creation": creation}, update_modified=False
 		)

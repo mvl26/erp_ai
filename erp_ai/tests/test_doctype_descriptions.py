@@ -321,17 +321,15 @@ DOCTYPE_CONFIG = {
 	# Bot conversation moved off HD Ticket comments: one row per message, written by the one writer, never edited.
 	"ERP AI Message": {
 		"folder": "erp_ai_message",
-		"field_count": 6,
+		"field_count": 4,
 		"phrases": {
 			"ticket": ("phiếu",),
-			"kind": ("chat",),
 			"content": ("chữ thường",),
 			"run_id": ("lần chạy",),
-			"proposal": ("đề xuất",),
 			"source_comment": ("@ai",),
 		},
 		"section_count": 2,
-		"read_only_fields": ("ticket", "kind", "content", "run_id", "proposal", "source_comment"),
+		"read_only_fields": ("ticket", "content", "run_id", "source_comment"),
 		"sections": (
 			("section_message", "Tin nhắn", "ticket"),
 			("section_source", "Nguồn gốc", "run_id"),

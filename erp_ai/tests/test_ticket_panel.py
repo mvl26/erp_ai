@@ -19,9 +19,6 @@ from erp_ai.constants import (
 	LOG_DOCTYPE,
 	LOGGER_NAME,
 	MESSAGE_DOCTYPE,
-	MESSAGE_KIND_CHAT,
-	MESSAGE_KIND_PROPOSAL,
-	MESSAGE_KIND_ROUTING,
 	PANEL_METHODS,
 	ROLE_INSTRUCTOR,
 	TITLE_RUN_FAILED,
@@ -55,7 +52,7 @@ WEBSITE_EMAIL = "panel.website@example.com"
 CUSTOMER_EMAIL = "panel.customer@example.com"
 KEYWORD = "@ai"
 RUN_ROUTE = "erp_ai.agent.runner.run_for_ticket"
-THREAD_KEYS = {"name", "author", "is_bot", "kind", "created_at", "text"}
+THREAD_KEYS = {"name", "author", "is_bot", "created_at", "text"}
 
 
 def _make_user(email, user_type="Website User"):
@@ -91,12 +88,12 @@ def _add_comment(ticket, content, owner="Administrator", creation=None, comment_
 	return doc.name
 
 
-def _add_message(ticket, content, owner="Administrator", creation=None, kind=MESSAGE_KIND_CHAT):
+def _add_message(ticket, content, owner="Administrator", creation=None):
 	"""An ERP AI Message as the DB would hold it; owner and creation are set directly."""
 	with patch.object(frappe, "enqueue"):
-		doc = frappe.get_doc(
-			{"doctype": MESSAGE_DOCTYPE, "ticket": ticket, "kind": kind, "content": "placeholder"}
-		).insert(ignore_permissions=True)
+		doc = frappe.get_doc({"doctype": MESSAGE_DOCTYPE, "ticket": ticket, "content": "placeholder"}).insert(
+			ignore_permissions=True
+		)
 	values = {"content": content, "owner": owner}
 	if creation:
 		values["creation"] = creation
@@ -292,9 +289,7 @@ class TestTicketPanelThread(FrappeTestCase):
 		# Inserted out of order on purpose: the result must follow `creation`, not insertion.
 		late = _add_message(self.ticket, "late human", creation="2026-11-12 10:05:00")
 		first = _add_message(self.ticket, "first human", creation="2026-11-12 10:01:00")
-		bot = _add_message(
-			self.ticket, "bot says hi", AGENT_USER, "2026-11-12 10:03:00", MESSAGE_KIND_ROUTING
-		)
+		bot = _add_message(self.ticket, "bot says hi", AGENT_USER, "2026-11-12 10:03:00")
 
 		messages = self._messages()
 
@@ -318,7 +313,7 @@ class TestTicketPanelThread(FrappeTestCase):
 
 	def test_thread_marks_bot_messages(self):
 		_add_message(self.ticket, "human", creation="2026-11-12 10:00:00")
-		_add_message(self.ticket, "bot answer", AGENT_USER, "2026-11-12 10:01:00", MESSAGE_KIND_PROPOSAL)
+		_add_message(self.ticket, "bot answer", AGENT_USER, "2026-11-12 10:01:00")
 		messages = self._messages()
 		self.assertEqual([m["is_bot"] for m in messages], [False, True])
 		self.assertEqual(messages[1]["author"], frappe.utils.get_fullname(AGENT_USER))
@@ -326,7 +321,7 @@ class TestTicketPanelThread(FrappeTestCase):
 	def test_thread_returns_markup_as_literal_text(self):
 		payload = '<img src=x onerror="alert(1)"> <script>alert(2)</script>'
 		_add_message(self.ticket, payload)
-		_add_message(self.ticket, payload, AGENT_USER, kind=MESSAGE_KIND_ROUTING)
+		_add_message(self.ticket, payload, AGENT_USER)
 		for message in self._messages():
 			self.assertEqual(message["text"], payload)
 
@@ -528,11 +523,10 @@ class TestTicketPanelSend(FrappeTestCase):
 		self.assertEqual(list(result), ["message"])
 		self.assertEqual(self._message_count(), 1)
 		values = frappe.db.get_value(
-			MESSAGE_DOCTYPE, result["message"], ["owner", "kind", "content", "ticket"], as_dict=True
+			MESSAGE_DOCTYPE, result["message"], ["owner", "content", "ticket"], as_dict=True
 		)
 		self.assertEqual(values.owner, AGENT_EMAIL)
 		self.assertNotEqual(values.owner, AGENT_USER)
-		self.assertEqual(values.kind, MESSAGE_KIND_CHAT)
 		self.assertEqual(values.content, text.strip())
 		self.assertEqual(values.ticket, self.ticket)
 		self.assertEqual(frappe.db.count("Comment"), before)

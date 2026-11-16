@@ -244,13 +244,13 @@ class TestRunInstructor(AuthorityTestBase):
 	def _mention(self, message_name, ticket=None):
 		return authority.run_instructor(ticket or self.ticket_p, TRIGGER_COMMENT_MENTION, message_name)
 
-	def _message(self, ticket, author, creation, kind="chat"):
+	def _message(self, ticket, author, creation):
 		"""A message as `author` (owner is set by the server), then its creation time."""
 		previous = frappe.session.user
 		frappe.set_user(author)
 		try:
 			with patch.object(frappe, "enqueue"):
-				name = messages.add_message(ticket, "x", kind, trusted=True)
+				name = messages.add_message(ticket, "x", trusted=True)
 		finally:
 			frappe.set_user(previous)
 		frappe.db.set_value("ERP AI Message", name, "creation", creation, update_modified=False)
@@ -320,9 +320,6 @@ class TestRunInstructor(AuthorityTestBase):
 		other_ticket = self._message(self.ticket_q, INSTRUCTOR, "2024-01-01 10:00:00")
 		self.assertIsNone(self._mention(other_ticket))
 		self.assertEqual(self._mention(other_ticket, ticket=self.ticket_q), INSTRUCTOR)
-
-		info = self._message(self.ticket_p, INSTRUCTOR, "2024-01-02 10:00:00", kind="result")
-		self.assertIsNone(self._mention(info))
 
 	def test_other_trigger_uses_valid_owner_only(self):
 		plain_message = self._message(self.ticket_p, PLAIN, "2024-01-01 10:00:00")

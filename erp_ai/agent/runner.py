@@ -9,7 +9,7 @@ from frappe.desk.form.document_follow import follow_document
 from frappe.utils import escape_html, get_fullname, getdate, now_datetime, strip_html
 
 from erp_ai import gateway
-from erp_ai.agent import authority, lifecycle, policy, queue, site_facts
+from erp_ai.agent import authority, lesson_read, lifecycle, policy, queue, site_facts
 from erp_ai.agent import labels as ticket_labels
 from erp_ai.agent.answer_delay import AnswerDelay
 from erp_ai.agent.authority import TITLE_WRONG_USER as TITLE_WRONG_USER  # re-export, U1.md:264
@@ -232,6 +232,8 @@ GUIDANCE_TOOL = "post_guidance"
 SPLIT_HELD_FLAG = "erp_ai_split_held"
 # A requester-reply event whose key is already on a log row: one logger line, no row (ADR-033 QĐ 6, U6b-fixes Sửa 1).
 ALREADY_HANDLED_LOG = "erp_ai skip ticket=%s run_id=%s reason=already_handled"
+# FEAT-008: reading the lessons of a step failed; the step goes on without lessons (ADR-046).
+TITLE_LESSON_READ_FAILED = "erp_ai: đọc bài học lỗi"
 
 
 def run_for_ticket(
@@ -788,7 +790,8 @@ def _classify(
 	The request carries the configured ticket fields (AC-24) and, when the step runs again on a later run (ADR-037
 	QĐ 2), `later_messages`: the people's messages since the latest classification, as data. The route leaves out
 	the fields the person typed at creation, while the entry keeps the model's prediction and names the typed set
-	(AC-19, AC-21, A-U4b-2).
+	(AC-19, AC-21, A-U4b-2). The matching active lessons go in the request as data (FEAT-008, ADR-046) and every row
+	of the step names them in `lessons_used`.
 
 	Returns `(proceed, classification, context)`: `proceed` is False when the run must end here (gateway error, or
 	a classification that puts the ticket in an excluded team);
@@ -810,8 +813,16 @@ def _classify(
 	)
 	subject = ticket.subject
 	field_values = _ticket_field_values(ticket_name, field_map)
+	lessons = _lessons(settings, subject, ticket.description)
 	label_inputs = _label_inputs(ticket_name, run_id, subject, ticket.description)
-	base = {"ticket": ticket_name, "run_id": run_id, "entry_type": "classify", "trigger": trigger, "turn": 0}
+	base = {
+		"ticket": ticket_name,
+		"run_id": run_id,
+		"entry_type": "classify",
+		"trigger": trigger,
+		"turn": 0,
+		**_lessons_used(lessons),
+	}
 	status.working(CLASSIFY_STEP)
 	try:
 		result = _call_model(
@@ -822,6 +833,7 @@ def _classify(
 				departments(routing),
 				ticket_fields=field_values,
 				later_messages=later_messages,
+				lessons=lessons,
 				**label_inputs._asdict(),
 			),
 			max_tokens=CLASSIFY_MAX_TOKENS,
@@ -969,6 +981,34 @@ def _classify(
 		**_complexity(classification.complexity, classification.score_reason),
 	}
 	return True, summary, context
+
+
+def _lessons(settings, subject: str, description: str) -> list[dict]:
+	"""The active lessons that match the ticket, within the caps of the Setting (FEAT-008, ADR-046 QĐ 1); [] when
+	learning is off. Never stops the run: a failed read leaves one Error Log, secrets masked, and gives []."""
+	try:
+		caps = policy.lesson_settings(settings)
+		if not caps.enabled:
+			return []
+		return lesson_read.relevant_lessons(
+			subject,
+			description,
+			max_lessons=caps.max_lessons,
+			max_chars=caps.max_chars,
+			scan_max=caps.scan_max,
+		)
+	except Exception:
+		frappe.log_error(
+			title=TITLE_LESSON_READ_FAILED,
+			message=redact_secrets(frappe.get_traceback()) or TITLE_LESSON_READ_FAILED,
+		)
+		return []
+
+
+def _lessons_used(lessons: list[dict]) -> dict:
+	"""The usage trace of a step's rows (AC-17): `lessons_used`, the names of the lessons the step sent; none sent
+	gives no key, so the rows stay as before."""
+	return {"lessons_used": [lesson["name"] for lesson in lessons]} if lessons else {}
 
 
 def _label_inputs(ticket_name, run_id, subject, description) -> ticket_labels.LabelInputs:
@@ -1467,7 +1507,8 @@ def _reason(
 	"""Reasoning step (design 4.3 step 8): at most `max_turns_per_run` model turns, one `reason` entry each.
 
 	The first message carries the configured ticket fields that hold a value as data (AC-24, U4b.md:249), and
-	`guidance_posted` when the ticket already has its guidance comment (ticket data, ADR-036 QĐ 7, U4b-10).
+	`guidance_posted` when the ticket already has its guidance comment (ticket data, ADR-036 QĐ 7, U4b-10), and the
+	matching active lessons as data (FEAT-008, ADR-046); every `reason` row of the run names them in `lessons_used`.
 	`notices` are the entries of notices posted before this step: they go on the first entry written (U4b.md:250).
 	A gateway error posts the run_failed notice on its own entry (U4b.md:251). `started_at` is the run's start: the
 	ask_fallback question counts only the ones posted since, so each run below the threshold asks once (AC-22).
@@ -1508,6 +1549,7 @@ def _reason(
 		reply_tools=granted.reply_block,
 	)
 	fields = _ticket_field_values(ticket_name, field_map or {})
+	lessons = _lessons(settings, ticket.subject, ticket.description)
 	messages = [
 		{
 			"role": "user",
@@ -1519,6 +1561,7 @@ def _reason(
 				ticket_fields=fields,
 				guidance_posted=guidance_posted,
 				conversation=conversation,
+				lessons=lessons,
 				propose_now=granted.change_block and granted.act_now_block,
 			),
 		}
@@ -1529,6 +1572,7 @@ def _reason(
 		"entry_type": "reason",
 		"trigger": trigger,
 		"instructor": context.instructor,
+		**_lessons_used(lessons),
 	}
 	max_turns = settings.max_turns_per_run
 	for turn in range(1, max_turns + 1):

@@ -96,6 +96,19 @@ RESTART_LAUNCH_TIMEOUT_S = 10
 # concluded and did on a ticket is ticket information (its fields), never a message here.
 MESSAGE_DOCTYPE = "ERP AI Message"
 
+# FEAT-008: the bot's lesson store (ERP AI Lesson and its history rows).
+LESSON_DOCTYPE = "ERP AI Lesson"
+LESSON_EVENT_DOCTYPE = "ERP AI Lesson Event"
+LESSON_STATUS_PENDING = "Chờ duyệt"
+LESSON_STATUS_ACTIVE = "Đang dùng"
+LESSON_STATUS_DISABLED = "Đã tắt"
+LESSON_STATUS_REJECTED = "Bị từ chối"
+LESSON_SOURCE_CORRECTION = "Người sửa"
+LESSON_SOURCE_RESOLVED = "Phiếu đã giải quyết"
+LESSON_SOURCE_TEACHING = "Người dạy"
+LESSON_SOURCE_OUTCOME = "Kết quả duyệt và rà soát"
+LESSON_STEPS = ("Tạo", "Cập nhật", "Duyệt", "Từ chối", "Tắt", "Bật")
+
 # CHG-009 (design 2, 3.8; ADR-048): the run_event row of ERP AI Log, its event codes, the codes of a refused call
 # or an early stop, how long a received call may wait, the Error Log title of a failed event write.
 LOG_ENTRY_RUN_EVENT = "run_event"

@@ -2006,7 +2006,13 @@ class TestCommentSnapshot(FrappeTestCase):
 				"<p>Nhánh này không theo nhánh remote nào.</p>" + tail("CP-SNAP-1"),
 			),
 			"block of items, app with a URL": (
-				{**git, "name": "CP-SNAP-6", "app": "https://h/r", "operations": created, "command_list": "[]"},
+				{
+					**git,
+					"name": "CP-SNAP-6",
+					"app": "https://h/r",
+					"operations": created,
+					"command_list": "[]",
+				},
 				head("CP-SNAP-6") + "khối 1 mục trong app .</p>"
 				"<p>Gồm 0 sửa, 1 tạo, 0 xóa, 0 đổi tên; 0 lệnh.</p>"
 				"<p>tạo custom_app/pkg/&lt;&amp;&quot;&gt;.md</p>"
@@ -2024,7 +2030,8 @@ class TestCommentSnapshot(FrappeTestCase):
 				"<p>lệnh: bench --site s&lt;&amp;&quot;&gt; migrate</p>"
 				"<p>lệnh: bench restart</p>"
 				"<p>Sau khi áp dụng, hệ thống sẽ restart bench (lệnh cuối).</p>"
-				"<p>Lệnh trong khối không hoàn tác được; hoàn tác chỉ trả lại phần file.</p>" + tail("CP-SNAP-2"),
+				"<p>Lệnh trong khối không hoàn tác được; hoàn tác chỉ trả lại phần file.</p>"
+				+ tail("CP-SNAP-2"),
 			),
 			"edit": (
 				{**git, "name": "CP-SNAP-3", "app": APP, "file_path": f"{marked}.py", "is_new_file": 0},

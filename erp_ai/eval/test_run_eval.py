@@ -328,6 +328,8 @@ class TestRunEvalRun(FrappeTestCase):
 		set_agent_settings(
 			category_mapping=json.dumps(DEFAULT_CATEGORY_MAPPING), routing_rules=make_routing_rules()
 		)
+		# learning off: no lesson of the shared site reaches the runner's request (NFR-7, FEAT-008 ruling R7)
+		set_agent_settings(lessons_enabled=0)
 		# ADR-049: the runner's label inputs are the site's live modules and tags; the offline eval has none, so the
 		# shared builder is compared without them (STD-TEST-6)
 		label_patch = patch.object(labels, "classify_inputs", return_value=labels.LabelInputs())

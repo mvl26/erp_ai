@@ -1,0 +1,147 @@
+{
+ "actions": [],
+ "autoname": "AILSN-.#####",
+ "creation": "2026-11-16 12:00:00.000000",
+ "doctype": "DocType",
+ "engine": "InnoDB",
+ "field_order": [
+  "section_lesson",
+  "lesson_status",
+  "situation",
+  "lesson_text",
+  "section_origin",
+  "lesson_source",
+  "ticket",
+  "change_proposal",
+  "event_key",
+  "author",
+  "reviewed_by",
+  "reviewed_at",
+  "history"
+ ],
+ "fields": [
+  {
+   "fieldname": "section_lesson",
+   "fieldtype": "Section Break",
+   "label": "Bài học"
+  },
+  {
+   "fieldname": "lesson_status",
+   "fieldtype": "Select",
+   "label": "Trạng thái",
+   "options": "Chờ duyệt\nĐang dùng\nĐã tắt\nBị từ chối",
+   "default": "Chờ duyệt",
+   "read_only": 1,
+   "in_list_view": 1,
+   "in_standard_filter": 1,
+   "search_index": 1,
+   "description": "Hệ thống tự ghi: Chờ duyệt, Đang dùng, Đã tắt hoặc Bị từ chối, không sửa được. Chỉ bài Đang dùng được đưa vào yêu cầu gửi cho model."
+  },
+  {
+   "fieldname": "situation",
+   "fieldtype": "Small Text",
+   "label": "Tình huống",
+   "read_only": 1,
+   "description": "Hệ thống tự ghi: tình huống mà bài học áp dụng, tối đa 300 ký tự, đã che khóa và mật khẩu, không sửa được."
+  },
+  {
+   "fieldname": "lesson_text",
+   "fieldtype": "Small Text",
+   "label": "Nội dung bài học",
+   "read_only": 1,
+   "in_list_view": 1,
+   "description": "Hệ thống tự ghi: điều bot cần nhớ khi gặp tình huống này, tối đa 1000 ký tự, đã che khóa và mật khẩu, không sửa được."
+  },
+  {
+   "fieldname": "section_origin",
+   "fieldtype": "Section Break",
+   "label": "Nguồn và người quyết"
+  },
+  {
+   "fieldname": "lesson_source",
+   "fieldtype": "Select",
+   "label": "Nguồn",
+   "options": "Người sửa\nPhiếu đã giải quyết\nNgười dạy\nKết quả duyệt và rà soát",
+   "read_only": 1,
+   "in_list_view": 1,
+   "in_standard_filter": 1,
+   "description": "Hệ thống tự ghi: bài học đến từ người sửa phân loại, phiếu đã giải quyết, người dạy bot hoặc kết quả duyệt và rà soát, không sửa được."
+  },
+  {
+   "fieldname": "ticket",
+   "fieldtype": "Link",
+   "label": "Phiếu nguồn",
+   "options": "HD Ticket",
+   "read_only": 1,
+   "description": "Hệ thống tự ghi: phiếu sinh ra bài học, không sửa được. Xóa phiếu không bị chặn bởi bài học, mã phiếu có thể thành liên kết cũ."
+  },
+  {
+   "fieldname": "change_proposal",
+   "fieldtype": "Link",
+   "label": "Đề xuất thay đổi nguồn",
+   "options": "ERP AI Change Proposal",
+   "read_only": 1,
+   "description": "Hệ thống tự ghi: đề xuất thay đổi đã sinh ra bài học (nếu có), không sửa được. Để trống nếu bài không đến từ đề xuất."
+  },
+  {
+   "fieldname": "event_key",
+   "fieldtype": "Data",
+   "label": "Khóa sự kiện",
+   "unique": 1,
+   "hidden": 1,
+   "read_only": 1,
+   "description": "Hệ thống tự ghi: khóa chống ghi trùng cho cùng một sự kiện nguồn, không sửa được."
+  },
+  {
+   "fieldname": "author",
+   "fieldtype": "Link",
+   "label": "Người tạo",
+   "options": "User",
+   "read_only": 1,
+   "description": "Hệ thống tự ghi: tài khoản người sinh ra bài học, không sửa được."
+  },
+  {
+   "fieldname": "reviewed_by",
+   "fieldtype": "Link",
+   "label": "Người duyệt",
+   "options": "User",
+   "read_only": 1,
+   "description": "Hệ thống tự ghi: tài khoản người duyệt hoặc từ chối bài học gần nhất, không sửa được. Để trống nếu chưa ai quyết."
+  },
+  {
+   "fieldname": "reviewed_at",
+   "fieldtype": "Datetime",
+   "label": "Lúc duyệt",
+   "read_only": 1,
+   "description": "Hệ thống tự ghi: thời điểm duyệt hoặc từ chối gần nhất, không sửa được. Để trống nếu chưa ai quyết."
+  },
+  {
+   "fieldname": "history",
+   "fieldtype": "Table",
+   "label": "Lịch sử",
+   "options": "ERP AI Lesson Event",
+   "read_only": 1,
+   "description": "Hệ thống tự ghi mỗi bước của bài học: bước, người làm, thời điểm; không sửa được."
+  }
+ ],
+ "links": [],
+ "modified": "2026-11-16 12:00:00.000000",
+ "modified_by": "Administrator",
+ "module": "ERP AI agent",
+ "name": "ERP AI Lesson",
+ "owner": "Administrator",
+ "permissions": [
+  {
+   "read": 1,
+   "role": "System Manager"
+  },
+  {
+   "read": 1,
+   "role": "ERP AI Instructor"
+  }
+ ],
+ "sort_field": "modified",
+ "sort_order": "DESC",
+ "states": [],
+ "track_changes": 0
+}

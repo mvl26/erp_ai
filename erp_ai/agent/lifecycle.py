@@ -5,7 +5,7 @@ the lifecycle switches and the origin field itself (`lifecycle_settings`) and ne
 """
 
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import frappe
 from frappe.utils import extract_email_id, get_datetime, now_datetime
@@ -38,6 +38,8 @@ TICKET_DOCTYPE = "HD Ticket"
 # erp_ai.install.TASK_TICKET_FIELD (the Task Link to its ticket); agent core may not import install (ADR-001).
 TASK_TICKET_FIELD = "ai_ticket"
 LIFECYCLE_SAVEPOINT = "erp_ai_lifecycle"
+SILENT_CLOSE_SAVEPOINT = "erp_ai_silent_close"
+REASON_NOTICE_FAILED = "chưa gửi được thông báo tới người tạo ({error})"
 CONFIG_RUN_ID_PREFIX = "lifecycle-config-"
 # Refusal codes of status_change_refusal, in the order they are checked (AC-42 (b), (c); A-U6b-5).
 REFUSAL_ORIGIN_NOT_CONFIGURED = "origin_not_configured"
@@ -295,3 +297,108 @@ def run_task_lifecycle(ticket_name: str) -> None:
 	except Exception as exc:
 		frappe.db.rollback(save_point=LIFECYCLE_SAVEPOINT)
 		frappe.log_error(TITLE_LIFECYCLE_FAILED, f"ticket={ticket_name} error={type(exc).__name__}")
+
+
+def _silent_f_candidates(cutoff) -> list[str]:
+	"""Tickets not in the Resolved category with a bot message at or before `cutoff`, in one query (Sửa 15)."""
+	communication = frappe.qb.DocType("Communication")
+	ticket = frappe.qb.DocType(TICKET_DOCTYPE)
+	return (
+		frappe.qb.from_(communication)
+		.join(ticket)
+		.on(communication.reference_name == ticket.name)
+		.select(ticket.name)
+		.distinct()
+		.where(communication.reference_doctype == TICKET_DOCTYPE)
+		.where(communication.sent_or_received == "Sent")
+		.where(communication.owner == AGENT_USER)
+		.where(communication.creation <= cutoff)
+		.where(ticket.status_category != RESOLVED_CATEGORY)
+		.run(pluck=True)
+	)
+
+
+def _close_if_silent(ticket_name: str, ls: LifecycleSettings, cutoff) -> None:
+	"""Steps (5)-(8) of scan_silent_f_tickets inside its SILENT_CLOSE_SAVEPOINT; the bot_action row, written last,
+	is the one commit (the cycle key is the Closed status itself, U6b-fixes Sửa 2)."""
+	if _locked_status_category(ticket_name) == RESOLVED_CATEGORY:
+		return
+	refusal = status_change_refusal(ticket_name, ls)
+	if refusal:
+		_log_refusal(ticket_name, "close_silent_f", refusal)
+		return
+	if policy.latest_classification(ticket_name)[0] != CATEGORY_F:
+		return
+	since = silent_since(ticket_name)
+	if since is None or since > cutoff:
+		return
+	notice = NOTICE_SILENT_CLOSE.format(ticket=ticket_name, days=ls.close_silent_f_days)
+	try:
+		communication = send_to_requester(ticket_name, notice)
+	except Exception as exc:
+		# A-U6b-7: no notice, no close; the next scan tries again
+		frappe.db.rollback(save_point=SILENT_CLOSE_SAVEPOINT)
+		reason = REASON_NOTICE_FAILED.format(error=type(exc).__name__)
+		run_log.write_bot_action(
+			trigger=run_log.TRIGGER_SCHEDULED_JOB,
+			ticket=ticket_name,
+			actions=[
+				run_log.action_entry(TOOL_REQUESTER_NOTICE, "Communication", None, False, reason=reason)
+			],
+		)
+		return
+	# the reply saved the ticket (Helpdesk's on_communication_update): read it again
+	doc = frappe.get_doc(TICKET_DOCTYPE, ticket_name)
+	before = doc.status
+	doc.flags.erp_ai_silent_close = True
+	doc.status = STATUS_CLOSED
+	doc.save()
+	content = COMMENT_SILENT_CLOSED.format(days=ls.close_silent_f_days)
+	comment = doc.new_comment(content)
+	run_log.write_bot_action(
+		trigger=run_log.TRIGGER_SCHEDULED_JOB,
+		ticket=ticket_name,
+		actions=[
+			run_log.action_entry(
+				TOOL_REQUESTER_NOTICE, "Communication", communication, True, value_after={"content": notice}
+			),
+			run_log.action_entry(
+				TOOL_CLOSE_SILENT_F,
+				TICKET_DOCTYPE,
+				ticket_name,
+				True,
+				value_before={"status": before},
+				value_after={"status": STATUS_CLOSED},
+			),
+			run_log.action_entry(
+				TOOL_LIFECYCLE_COMMENT, "Comment", comment, True, value_after={"content": content}
+			),
+		],
+	)
+
+
+def scan_silent_f_tickets(now=None) -> None:
+	"""AC-44, hourly: close each F ticket whose requester stayed silent `close_silent_f_days` after the bot's last
+	message, with one notice to the requester sent before the status changes.
+
+	Under the agent account; off switch: nothing written (AC-42 (a)); origin not configured: the daily row only
+	(AC-42 (c)). Each ticket has its own savepoint: a failure undoes that ticket only (notice included), goes to
+	the Error Log, and the scan goes on with the next ticket.
+	"""
+	if not authority.enter_agent_session():
+		return
+	ls = _current_settings()
+	if not ls.close_silent_f:
+		return
+	now = get_datetime(now or now_datetime())
+	if not origin_configured(ls):
+		_log_config_missing_daily(now)
+		return
+	cutoff = now - timedelta(days=ls.close_silent_f_days)
+	for ticket_name in _silent_f_candidates(cutoff):
+		frappe.db.savepoint(SILENT_CLOSE_SAVEPOINT)
+		try:
+			_close_if_silent(ticket_name, ls, cutoff)
+		except Exception as exc:
+			frappe.db.rollback(save_point=SILENT_CLOSE_SAVEPOINT)
+			frappe.log_error(TITLE_LIFECYCLE_FAILED, f"ticket={ticket_name} error={type(exc).__name__}")

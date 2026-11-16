@@ -311,7 +311,7 @@ class TestRunnerStatus(RunnerTestBase):
 		on = self._run_with(3, 5, THINKING_TEXT)
 		off = self._run_with(0, 0, "")
 
-		self.assertIn("<id>", on[0])
+		self.assertIn('held\\": true', on[0])
 		self.assertEqual(on[0], off[0])
 
 	def test_same_gateway_calls_and_cost_with_feature_on_and_off(self):

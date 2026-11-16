@@ -690,7 +690,10 @@ class TestRunnerStatus(RunnerTestBase):
 			self._run_closing("ticket_insert")
 
 		entry = self._entries(entry_type="classify")[-1]
-		self.assertEqual(entry.error, f"{runner.UNPARSEABLE_ERROR}; status_thinking: RuntimeError")
+		self.assertEqual(
+			entry.error,
+			f"{runner.UNPARSEABLE_ERROR}; stop_reason=end_turn; raw=không phải JSON; status_thinking: RuntimeError",
+		)
 		self.assertEqual(self.log_error.call_args_list, [])
 
 	def test_thinking_failure_joins_the_reason_gateway_error(self):

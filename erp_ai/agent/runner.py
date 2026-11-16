@@ -24,6 +24,7 @@ from erp_ai.agent.prompts import (
 	build_reason_system,
 	build_routing_table,
 )
+from erp_ai.agent.redact import redact_secrets
 from erp_ai.agent.routing import decide_route, departments, load_routing_config, sla_lag
 from erp_ai.agent.run_log import ENTRY_TYPE_CHANGE, action_entry, write_entry
 from erp_ai.agent.run_status import CLASSIFY_STEP, RunStatus
@@ -93,7 +94,7 @@ from erp_ai.constants import (
 	TRIGGER_TICKET_INSERT,
 )
 
-CLASSIFY_MAX_TOKENS = 600
+CLASSIFY_MAX_TOKENS = 2048
 REASON_MAX_TOKENS = 16000
 STOP_TOOL_USE = "tool_use"
 STOP_MAX_TOKENS = "max_tokens"
@@ -143,6 +144,8 @@ CREATING_TOOLS = ("post_comment", "create_task", "reply_to_requester", "create_k
 PROPOSE_TOOLS = ("propose_file_change", "propose_new_file", "propose_bench_command")
 PROPOSE_STEP = "propose"
 UNPARSEABLE_ERROR = "UNPARSEABLE: không phân loại được"
+# The unparseable classify row's error keeps this many characters of the raw answer, masked first (BUG-004).
+CLASSIFY_RAW_HEAD_MAX_CHARS = 300
 BAD_MAPPING_ERROR = "category_mapping không hợp lệ, không có giá trị dự đoán"
 BAD_ROUTING_ERROR = "routing_rules không hợp lệ, định tuyến dùng giá trị rỗng"
 NO_SCORE_REASON = "không có điểm"
@@ -772,7 +775,10 @@ def _classify(
 	call_fields = _call_fields(result)
 	classification = parse_classification(result.text)
 	if classification is None:
-		error = "; ".join([UNPARSEABLE_ERROR, *status.take_errors()])
+		# masked before the cut: a cut through a secret value would leave it unmasked
+		raw_head = redact_secrets(result.text)[:CLASSIFY_RAW_HEAD_MAX_CHARS]
+		unparseable = f"{UNPARSEABLE_ERROR}; stop_reason={result.stop_reason}; raw={raw_head}"
+		error = "; ".join([unparseable, *status.take_errors()])
 		write_entry(**base, **call_fields, error=error, stop_reason="unparseable")
 		_log_classify(ticket_name, run_id, False, ticket.creation)
 		return True, None, context

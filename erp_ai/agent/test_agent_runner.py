@@ -4000,6 +4000,138 @@ class TestRunNotices(RunnerTestBase):
 				finally:
 					frappe.db.rollback(save_point="erp_ai_matrix_case")
 
+	# T117: a run failing after the route names what it did, apart from what waits and what is left to a person
+
+	def _no_lag_sla(self):
+		sla = patch.object(runner.site_facts, "applied_sla", return_value=NO_LAG_SLA)
+		sla.start()
+		self.addCleanup(sla.stop)
+
+	def _route_spy(self):
+		"""Patch `_route` to record the sentences it returns; returns the list they go to."""
+		routed = []
+		real_route = runner._route
+
+		def spy(*args, **kwargs):
+			routed.append(real_route(*args, **kwargs))
+			return routed[-1]
+
+		patcher = patch.object(runner, "_route", spy)
+		patcher.start()
+		self.addCleanup(patcher.stop)
+		return routed
+
+	def _failure_body(self, *parts):
+		body = runner.RUN_FAILED_BODY.format(cause=runner.CAUSE_GATEWAY)
+		return self._content("run_failed", "\n".join([body, *parts]))
+
+	def test_reason_error_after_route_lines_in_failure_notice(self):
+		self._no_lag_sla()
+		routed = self._route_spy()
+		self.gateway.results = [classify_at(90), GatewayError("server_error", status=500)]
+		self._run()
+
+		((done,),) = routed
+		(notice,) = self._notices("run_failed")
+		self.assertEqual(
+			frappe.db.get_value("Comment", notice, "content"),
+			self._failure_body(write_ticket.FAILURE_DONE + escape_html(done)),
+		)
+		self.assertEqual(write_ticket.count_guidance(self.ticket.name), 0)
+		(failed,) = self._entries(entry_type="reason")
+		instructor = authority.run_instructor(self.ticket.name, "ticket_insert")
+		self.assertEqual(json.loads(failed.actions), [self._entry(notice, "run_failed", instructor)])
+
+	def _collect_on_reason_call(self, run_id, line):
+		def collect(task, kwargs):
+			if task == "reason":
+				write_ticket.collect(run_id, write_ticket.SECTION_DONE, line)
+
+		self.gateway.on_call = collect
+
+	def test_failure_suffix_html_escaped_once(self):
+		# AD3-4: a collected line reaches the notice escaped exactly once
+		self._no_lag_sla()
+		run_id = f"{PREFIX}failed-{frappe.generate_hash(length=10)}"
+		fixed = MagicMock()
+		fixed.uuid4.return_value.hex = run_id
+		raw = f"{PREFIX}<b>&x"
+		self._collect_on_reason_call(run_id, raw)
+		self.gateway.results = [classify_at(90), GatewayError("server_error", status=500)]
+		with patch.object(runner, "uuid", fixed):
+			self._run()
+
+		(notice,) = self._notices("run_failed")
+		content = frappe.db.get_value("Comment", notice, "content")
+		self.assertEqual(content.count(escape_html(raw)), 1)
+		self.assertNotIn(raw, content)
+		self.assertNotIn("&amp;lt;", content)
+
+	def test_deduplicated_failure_notice_logs_dropped_lines(self):
+		# w1.md:70: a notice refused as already sent leaves the run's lines in one logger line, as a count only
+		self._no_lag_sla()
+		self.gateway.results = [classify_at(90), GatewayError("server_error", status=500)]
+		self._run()
+		run_id = f"{PREFIX}failed-again-{frappe.generate_hash(length=10)}"
+		fixed = MagicMock()
+		fixed.uuid4.return_value.hex = run_id
+		self._collect_on_reason_call(run_id, f"{PREFIX}việc đã làm")
+		self.gateway.results = [GatewayError("server_error", status=500)]
+		logger = MagicMock()
+		with patch.object(runner, "uuid", fixed), patch.object(frappe, "logger", return_value=logger):
+			self._run("comment_mention")
+
+		self.assertEqual(len(self._notices("run_failed")), 1)
+		dropped = [call.args for call in logger.info.call_args_list if "dropped=" in str(call.args[0])]
+		self.assertEqual(dropped, [("erp_ai guidance run_id=%s dropped=%d", run_id, 1)])
+
+	def test_failure_notice_names_done_pending_manual_apart(self):
+		# design-w1-fixes-20 Điểm 3.1: done, pending and manual lines under their own prefix; no marker, no heading
+		self._no_lag_sla()
+		routed = self._route_spy()
+		sandbox = GitSandbox(self, apps=(SANDBOX_APP,), erp_ai_worktree=None)
+		sandbox.commit_file(SANDBOX_APP, SANDBOX_REL, SANDBOX_BEFORE)
+		set_agent_settings(
+			permission_level="L3",
+			level_cap_a="L3",
+			code_change_enabled=1,
+			code_change_apps=SANDBOX_APP,
+			auto_assign_enabled=1,
+		)
+		propose = tool_use(
+			"t_propose",
+			"propose_file_change",
+			path=f"{SANDBOX_APP}/{SANDBOX_REL}",
+			find=["x = 1"],
+			replace=["x = 2"],
+			reason="r",
+		)
+		self.gateway.results = [
+			classify_at(90),
+			tool_turn(propose),
+			GatewayError("server_error", status=500),
+		]
+		with patch.object(authority, "run_instructor", return_value="Administrator"):
+			self._run()
+
+		((done, manual),) = routed
+		self.assertEqual(manual, ASSIGN_REQUEST.format(reason=REASON_NO_VALID_ASSIGNEE))
+		(proposal,) = frappe.get_all(PROPOSAL_DOCTYPE, filters={"ticket": self.ticket.name}, pluck="name")
+		pending = propose_change.pending_line(frappe.get_doc(PROPOSAL_DOCTYPE, proposal))
+		(notice,) = self._notices("run_failed")
+		content = frappe.db.get_value("Comment", notice, "content")
+		self.assertEqual(
+			content,
+			self._failure_body(
+				write_ticket.FAILURE_DONE + escape_html(done),
+				write_ticket.FAILURE_PENDING + escape_html(pending),
+				write_ticket.FAILURE_MANUAL + escape_html(manual),
+			),
+		)
+		self.assertNotIn(write_ticket.GUIDANCE_MARKER, content)
+		self.assertNotIn("Cần ai quyết", content)
+		self.assertEqual(write_ticket.count_guidance(self.ticket.name), 0)
+
 
 def classify_at(pct):
 	return make_model_result(
@@ -4612,6 +4744,31 @@ class TestOneGuidance(RunnerTestBase):
 		content = self.gateway.calls[0]["messages"][0]["content"]
 		self.assertIn(f"{LATER_MESSAGES_LABEL}\n- {reply}", content)
 		self.assertNotIn(earlier, content)
+
+	# T117: a run failing after the route lists what it did in its failure notice (design-w1-fixes-20 Điểm 3.1)
+
+	def test_chain_5_failed_run_then_rerun_one_guidance(self):
+		# AC-65 (b), chain 5: the run fails after its route: no guidance, one failure notice naming the work; the run
+		# again posts the guidance
+		self.gateway.results = [classify_at(90), GatewayError("server_error", status=500)]
+		self._run()
+
+		self.assertEqual(self._guidance(), 0)
+		(notice,) = frappe.get_all(
+			"Comment",
+			filters={
+				**authority.ticket_comment_filters(self.ticket.name),
+				"content": ["like", f"{write_ticket.NOTICE_PREFIXES['run_failed']}%"],
+			},
+			pluck="content",
+		)
+		self.assertIn(f"\n{write_ticket.FAILURE_DONE}", notice)
+		self.assertFalse(notice.startswith(write_ticket.GUIDANCE_MARKER))
+
+		self.gateway.results = [classify_at(90), tool_turn(analysis_call("t1")), make_model_result()]
+		self._run()
+		self.assertEqual(self._guidance(), 1)
+		self.assertIn(escape_html(ANALYSIS.splitlines()[0]), self._guidance_content())
 
 
 class TestReclassify(RunnerTestBase):

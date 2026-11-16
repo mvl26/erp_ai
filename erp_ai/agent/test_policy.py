@@ -18,6 +18,8 @@ from erp_ai.constants import (
 	SETTING_DOCTYPE,
 	TRIGGER_CHANGE_ACTION,
 	TRIGGER_COMMENT_MENTION,
+	TRIGGER_KB_DRAFT,
+	TRIGGER_REQUESTER_REPLY,
 	TRIGGER_TICKET_INSERT,
 )
 from erp_ai.test_utils import TempAppsRoot, keep_agent_settings, make_log_entry, set_agent_settings
@@ -808,7 +810,7 @@ class TestRunsToday(FrappeTestCase):
 		self.addCleanup(commit_guard.stop)
 		self.addCleanup(frappe.db.rollback)
 
-	def _log(self, ticket, run_id, entry_type, trigger):
+	def _log(self, ticket, run_id, entry_type, trigger, turn=0, stop_reason=None):
 		frappe.get_doc(
 			{
 				"doctype": LOG_DOCTYPE,
@@ -816,7 +818,8 @@ class TestRunsToday(FrappeTestCase):
 				"run_id": run_id,
 				"entry_type": entry_type,
 				"trigger": trigger,
-				"turn": 0,
+				"turn": turn,
+				"stop_reason": stop_reason,
 			}
 		).insert(ignore_permissions=True)
 
@@ -827,7 +830,38 @@ class TestRunsToday(FrappeTestCase):
 		self._log(ticket, "change-reason", "reason", TRIGGER_CHANGE_ACTION)
 		self._log(ticket, "change-classify", "classify", TRIGGER_CHANGE_ACTION)
 		self.assertEqual(policy.runs_today(ticket), 2)
-		self.assertEqual(policy.RUN_LIMIT_TRIGGERS, (TRIGGER_TICKET_INSERT, TRIGGER_COMMENT_MENTION))
+		# U6b-fixes Sửa 3 (AC-41): the requester-reply run is counted, the KB-draft run never is.
+		self.assertEqual(
+			policy.RUN_LIMIT_TRIGGERS,
+			(TRIGGER_TICKET_INSERT, TRIGGER_COMMENT_MENTION, TRIGGER_REQUESTER_REPLY),
+		)
+
+	def test_kb_draft_reason_row_not_counted(self):
+		# U6b-fixes Sửa 3 (X-2): a KB-draft run is not a run of the daily limit.
+		ticket = make_ticket(subject="T140 kb_draft runs_today ticket").name
+		self._log(ticket, "insert", "classify", TRIGGER_TICKET_INSERT)
+		self.assertEqual(policy.runs_today(ticket), 1)
+		self._log(ticket, "kb-draft", "reason", TRIGGER_KB_DRAFT)
+		self.assertEqual(policy.runs_today(ticket), 1)
+		self.assertNotIn(TRIGGER_KB_DRAFT, policy.RUN_LIMIT_TRIGGERS)
+
+	def test_requester_reply_reason_row_counted(self):
+		# U6b-fixes Sửa 3 (X-2): a requester-reply run counts once per run_id, its turns and skips add nothing.
+		ticket = make_ticket(subject="T140 requester_reply runs_today ticket").name
+		self.assertEqual(policy.runs_today(ticket), 0)
+		run_id = f"{TRIGGER_REQUESTER_REPLY}:{ticket}:COMM-1"
+		self._log(ticket, run_id, "reason", TRIGGER_REQUESTER_REPLY)
+		self.assertEqual(policy.runs_today(ticket), 1)
+		self._log(ticket, run_id, "reason", TRIGGER_REQUESTER_REPLY, turn=1)
+		self.assertEqual(policy.runs_today(ticket), 1)
+		self._log(
+			ticket,
+			f"{TRIGGER_REQUESTER_REPLY}:{ticket}:COMM-2",
+			"skip",
+			TRIGGER_REQUESTER_REPLY,
+			stop_reason="superseded",
+		)
+		self.assertEqual(policy.runs_today(ticket), 1)
 
 
 class TestSiteEnvironment(FrappeTestCase):

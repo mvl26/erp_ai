@@ -255,7 +255,7 @@ def _run(ticket_name, trigger, comment_name=None):
 		# One context for the whole run (classification and reasoning); never built at L0, which calls no tool.
 		context = None
 		classification = None
-		posted = False
+		posted = reclassify = False
 		if level != LEVELS[0]:
 			instructor = authority.run_instructor(ticket_name, trigger, comment_name)
 			# An insert run has no classification yet: `_classify` recomputes both from its own (U1.md:261).
@@ -285,8 +285,11 @@ def _run(ticket_name, trigger, comment_name=None):
 			)
 			# ADR-036 QĐ 7: the one count, read once; the mode is chosen once the classification is known
 			posted = count_guidance(ticket_name) > 0
-		if trigger == TRIGGER_TICKET_INSERT:
-			proceed, classification, context = _classify(
+			# ADR-037 QĐ 1: a later run whose latest classification is below the threshold for this run (its
+			# instructor, its switch) runs the classification step again; decided on the data, not the trigger
+			reclassify = trigger != TRIGGER_TICKET_INSERT and category is not None and context.below_threshold
+		if trigger == TRIGGER_TICKET_INSERT or reclassify:
+			proceed, classified, context = _classify(
 				ticket_name,
 				trigger,
 				run_id,
@@ -300,9 +303,14 @@ def _run(ticket_name, trigger, comment_name=None):
 				threshold,
 				field_map,
 				posted,
+				later_messages=_later_messages(ticket_name) if reclassify else None,
 			)
 			if not proceed:
 				return
+			classification = classified or classification
+			if classified is None and context is not None:
+				# nothing parsed: the mode follows the context the run started with
+				_choose_mode(context, posted)
 		elif context is not None:
 			_choose_mode(context, posted)
 		if level != LEVELS[0]:
@@ -350,6 +358,23 @@ def _choose_mode(context, posted: bool) -> None:
 		frappe.logger(LOGGER_NAME).info(GUIDANCE_EXISTS_LOG, context.ticket_name, context.run_id)
 	elif context.main_path_level != LEVELS[0] and not context.below_threshold:
 		open_collector(context.run_id)
+
+
+def _later_messages(ticket_name) -> list[str]:
+	"""The people's comments on the ticket after its latest classify row with a result, oldest first (ADR-037 QĐ 2):
+	data of the classification request, which keeps the newest few, each cut (T106). The bot's own are left out."""
+	since = frappe.get_all(
+		LOG_DOCTYPE,
+		filters={"ticket": ticket_name, "entry_type": "classify", "predicted_category": ("is", "set")},
+		pluck="creation",
+		order_by="creation desc",
+		limit=1,
+	)
+	return [
+		comment["content"]
+		for comment in reversed(authority.fetch_ticket_comments(ticket_name))
+		if comment["author"] != AGENT_USER and (not since or comment["creation"] > since[0])
+	]
 
 
 def _ticket_fields(settings) -> tuple[dict[str, str], list[str]]:
@@ -517,13 +542,16 @@ def _classify(
 	threshold,
 	field_map,
 	posted=False,
+	later_messages=None,
 ):
 	"""Classification step (design 4.3 step 6). Writes one `classify` entry; with a context (L1+) recomputes its
 	main-path level and below-threshold flag from the classification, chooses the run's mode from them and `posted`
 	(the run's one guidance count, ADR-036 QĐ 7, ADR-037 QĐ 3), then routes only at the threshold or above.
 
-	The request carries the configured ticket fields (AC-24). The route leaves out the fields the person typed at
-	creation, while the entry keeps the model's prediction and names the typed set (AC-19, AC-21, A-U4b-2).
+	The request carries the configured ticket fields (AC-24) and, when the step runs again on a later run (ADR-037
+	QĐ 2), `later_messages`: the people's messages since the latest classification, as data. The route leaves out
+	the fields the person typed at creation, while the entry keeps the model's prediction and names the typed set
+	(AC-19, AC-21, A-U4b-2).
 
 	Returns `(proceed, classification, context)`: `proceed` is False when the run must end here (gateway error);
 	`classification` is the summary handed to the reasoning step, or None when nothing was classified;
@@ -550,7 +578,11 @@ def _classify(
 		result = _call_model(
 			"classify",
 			**build_classify_request(
-				subject, ticket.description, departments(routing), ticket_fields=field_values
+				subject,
+				ticket.description,
+				departments(routing),
+				ticket_fields=field_values,
+				later_messages=later_messages,
 			),
 			max_tokens=CLASSIFY_MAX_TOKENS,
 			deadline=deadline,

@@ -8,13 +8,22 @@ resolved in that window. Every state is read when the job runs: "open" means cre
 from datetime import datetime, time, timedelta
 
 import frappe
+from frappe.utils import escape_html, get_datetime, getdate, now_datetime
 
 from erp_ai.agent import policy
 from erp_ai.agent.classification import load_mapping
 from erp_ai.agent.kpi import is_bot_close, log_actions
-from erp_ai.agent.ops_data import BA_NOTE_MARKER, category_by_ticket_type, ticket_category
+from erp_ai.agent.ops_data import (
+	BA_NOTE_MARKER,
+	CYCLE_START,
+	category_by_ticket_type,
+	daily_cycle,
+	ticket_category,
+)
+from erp_ai.agent.redact import redact_secrets
 from erp_ai.agent.routing import load_routing_config, processing_deadline, response_overdue
-from erp_ai.constants import AGENT_USER, LOG_DOCTYPE, LOGGER_NAME, SETTING_DOCTYPE
+from erp_ai.agent.text_lines import filled_lines
+from erp_ai.constants import AGENT_USER, CATEGORIES, LOG_DOCTYPE, LOGGER_NAME, SETTING_DOCTYPE
 
 TICKET = "HD Ticket"
 WINDOW = timedelta(hours=24)
@@ -55,6 +64,18 @@ BOT_ACTION_KINDS = (
 	OTHER_ACTION_KIND,
 )
 COST_DIGITS = 6
+DEADLINE_FORMAT = "%d/%m/%Y %H:%M"
+EXCLUDED_LABEL = "(nhóm loại trừ)"
+NONE_LABEL = "Không có"
+SUBJECT_FORMAT = "[erp_ai] Báo cáo hằng ngày {cycle:%d/%m/%Y}"
+LIST_SECTIONS = (
+	("new_list", "Phiếu mới"),
+	("due_soon", "Sắp đến mốc xử lý"),
+	("overdue", "Quá mốc xử lý"),
+	("response_overdue", "Quá mốc phản hồi"),
+	("c_missing_ba_note", "Đầu mục C chưa có BA note"),
+	("cd_missing_task", "Đầu mục C/D chưa có Task"),
+)
 
 
 def build_daily_report(anchor: datetime) -> dict:
@@ -262,3 +283,104 @@ def _de_progress(
 		}
 		for category in PROGRESS_CATEGORIES
 	}
+
+
+def run_daily_report(now: datetime | None = None) -> None:
+	"""Build the report of the cycle `now` belongs to and queue its email once; the watermark is written here
+	only, in the same transaction as the email (design 3.6.3, ADR-033 QĐ 6)."""
+	now = get_datetime(now) if now else now_datetime()
+	cycle = daily_cycle(now)
+	sent_on = frappe.db.get_single_value(SETTING_DOCTYPE, "daily_report_sent_on")
+	if sent_on and getdate(sent_on) == cycle:
+		frappe.logger(LOGGER_NAME).info("erp_ai daily_report: already sent for %s", cycle)
+		return
+	recipients = list(
+		dict.fromkeys(filled_lines(frappe.db.get_single_value(SETTING_DOCTYPE, "coo_report_recipients")))
+	)
+	data = build_daily_report(datetime.combine(cycle, CYCLE_START))
+	frappe.sendmail(
+		recipients=recipients,
+		subject=SUBJECT_FORMAT.format(cycle=cycle),
+		message=render_daily_report(data),
+		delayed=True,
+	)
+	frappe.db.set_single_value(SETTING_DOCTYPE, "daily_report_sent_on", cycle)
+	frappe.logger(LOGGER_NAME).info(
+		"erp_ai daily_report: %s new tickets, %s past the response mark",
+		len(data["new_list"]),
+		len(data["response_overdue"]),
+	)
+
+
+def render_daily_report(data: dict) -> str:
+	"""The report as HTML. Ticket text goes through `redact_secrets` then `escape_html`; an excluded ticket is
+	printed by number only. Lists keep the order of `data`."""
+	parts = [
+		_section("Phiếu mới theo đầu mục và ưu tiên", _count_table(data["new_by_category_priority"])),
+	]
+	for key, title in LIST_SECTIONS:
+		parts.append(_section(title, _list_html(data[key])))
+	progress = "".join(
+		f"<tr><td>{category}</td><td>{values['done']}</td><td>{values['in_progress']}</td>"
+		f"<td>{values['overdue']}</td></tr>"
+		for category, values in data["de_progress"].items()
+	)
+	parts.append(
+		_section(
+			"Đầu mục D, E",
+			"<table><tr><th>Đầu mục</th><th>Đã xong</th><th>Đang xử lý</th><th>Quá mốc</th></tr>"
+			f"{progress}</table>",
+		)
+	)
+	actions = "".join(
+		f"<tr><td>{escape_html(kind)}</td><td>{count}</td></tr>"
+		for kind, count in data["bot_actions"].items()
+	)
+	parts.append(_section("Việc bot đã làm hôm qua", f"<table>{actions}</table>"))
+	parts.append(_section("Chi phí hôm qua (USD)", f"{data['cost_yesterday']:.{COST_DIGITS}f}"))
+	return "".join(parts)
+
+
+def _section(title: str, body: str) -> str:
+	return f"<h3>{escape_html(title)}</h3>{body}"
+
+
+def _text(value: str | None) -> str:
+	return escape_html(redact_secrets(value))
+
+
+def _list_html(items: list[dict]) -> str:
+	if not items:
+		return f"<p>{NONE_LABEL}</p>"
+	lines = []
+	for item in items:
+		if item.get("excluded"):
+			lines.append(f"<li>#{escape_html(item['name'])} {EXCLUDED_LABEL}</li>")
+			continue
+		line = (
+			f"#{escape_html(item['name'])} - {escape_html(item['category'])} - "
+			f"{escape_html(item['priority'])} - {_text(item.get('subject'))}"
+		)
+		if item.get("deadline"):
+			line += f" - {item['deadline']:{DEADLINE_FORMAT}}"
+		lines.append(f"<li>{line}</li>")
+	return f"<ul>{''.join(lines)}</ul>"
+
+
+def _count_table(counts: dict[str, dict[str, int]]) -> str:
+	categories = [*CATEGORIES, UNKNOWN_CATEGORY]
+	priorities = sorted(
+		{priority for by in counts.values() for priority in by if priority != UNKNOWN_CATEGORY}
+	)
+	if any(UNKNOWN_CATEGORY in by for by in counts.values()):
+		priorities.append(UNKNOWN_CATEGORY)
+	if not priorities:
+		return f"<p>{NONE_LABEL}</p>"
+	head = "".join(f"<th>{escape_html(priority)}</th>" for priority in priorities)
+	rows = "".join(
+		f"<tr><td>{category}</td>"
+		+ "".join(f"<td>{counts.get(category, {}).get(priority, 0)}</td>" for priority in priorities)
+		+ "</tr>"
+		for category in categories
+	)
+	return f"<table><tr><th>Đầu mục</th>{head}</tr>{rows}</table>"

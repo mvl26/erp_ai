@@ -27,9 +27,11 @@ from erp_ai.agent.test_agent_runner import (
 	tool_use,
 )
 from erp_ai.agent.tools import write_ticket
-from erp_ai.constants import CHANGE_STATUS_PENDING, LOG_DOCTYPE, PROPOSAL_DOCTYPE
+from erp_ai.constants import CHANGE_STATUS_PENDING, LOG_DOCTYPE, MESSAGE_DOCTYPE, PROPOSAL_DOCTYPE
 from erp_ai.test_utils import GitSandbox, make_model_result, pin_agent_roles, set_agent_settings
 
+RUN_FOR_TICKET = "erp_ai.agent.runner.run_for_ticket"
+JOB_ARGUMENTS = ("ticket_name", "trigger", "message_name")
 PROPOSE_TOOLS = ["propose_file_change", "propose_new_file", "propose_bench_command"]
 CLASSIFY_C_85 = make_model_result(
 	text=json.dumps({"dau_muc": "C", "do_tin_cay": "Cao", "do_tin_cay_pct": 85, "ly_do": "x"})
@@ -254,11 +256,33 @@ class TestProposeNowEndToEnd(ProposeNowBase):
 		# nothing is on disk
 		self.assertEqual(self.sandbox.git(SANDBOX_APP, "status", "--porcelain"), "")
 
-		# "ok, duyệt đi" by a person with authority is only a comment
-		with patch.object(frappe, "enqueue") as enqueue, patch("erp_ai.handlers.enqueue_agent_run"):
-			comment = self.ticket.add_comment("Comment", "ok, duyệt đi")
-			# the comment is the instructor's: the author of a comment is its `owner`
+		# "ok, duyệt đi" by a person with authority reaches the bot as an @ai comment: the comment handler copies
+		# it to the conversation and queues a run; that run goes through the fake gateway and ends without a tool.
+		# A plain comment without the keyword starts no run (handlers.comment_after_insert), so it would prove nothing.
+		set_agent_settings(trigger_keyword="@ai")
+		self.gateway.results = [make_model_result()]
+		# the run above left the session as the agent account; the comment is written by a person
+		frappe.set_user("Administrator")
+		with patch.object(frappe, "enqueue") as enqueue:
+			comment = self.ticket.add_comment("Comment", "@ai ok, duyệt đi")
+			jobs = [call for call in enqueue.call_args_list if call.args[0] == RUN_FOR_TICKET]
+			self.assertEqual(len(jobs), 1)
+			message = jobs[0].kwargs["message_name"]
+			# the comment and its copy are the instructor's: the author is the `owner`, which the run reads
 			frappe.db.set_value("Comment", comment.name, "owner", INSTRUCTOR, update_modified=False)
-		self.assertEqual(authority.fetch_ticket_comments(self.ticket.name)[0]["author"], INSTRUCTOR)
+			frappe.db.set_value(MESSAGE_DOCTYPE, message, "owner", INSTRUCTOR, update_modified=False)
+			runner.run_for_ticket(**{k: v for k, v in jobs[0].kwargs.items() if k in JOB_ARGUMENTS})
+		# the @ai run happened, nothing approved, nothing applied, nothing else queued
+		# the insert run made two reason calls; the @ai run made the third, and it saw the words
+		self.assertEqual(len(self._reason_calls()), 3)
+		last = self._reason_calls()[-1]
+		self.assertIn("ok, duyệt đi", self._first_message(last))
 		self.assertEqual(self._proposals(), [proposal])
-		self.assertEqual(enqueue.call_args_list, [])
+		(change,) = frappe.get_all(
+			LOG_DOCTYPE,
+			filters={"ticket": self.ticket.name, "entry_type": "change"},
+			fields=["change_step", "change_proposal"],
+		)
+		self.assertEqual((change.change_step, change.change_proposal), ("propose", proposal.name))
+		self.assertEqual([call.args[0] for call in enqueue.call_args_list], [RUN_FOR_TICKET])
+		self.assertEqual(self.sandbox.git(SANDBOX_APP, "status", "--porcelain"), "")

@@ -367,7 +367,7 @@ def render_daily_report(data: dict) -> str:
 		for kind, count in data["bot_actions"].items()
 	)
 	parts.append(_section("Việc bot đã làm hôm qua", f"<table>{actions}</table>"))
-	parts.append(_section("Chi phí hôm qua (USD)", f"{data['cost_yesterday']:.{COST_DIGITS}f}"))
+	parts.append(_section("Tổng phí hôm qua (USD)", f"{data['cost_yesterday']:.{COST_DIGITS}f}"))
 	return "".join(parts)
 
 

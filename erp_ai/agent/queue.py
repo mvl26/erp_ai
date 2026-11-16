@@ -18,14 +18,13 @@ def _clear_pending_job_ids():
 	frappe.flags.pop(PENDING_JOB_IDS_FLAG, None)
 
 
-def enqueue_agent_run(ticket_name: str, trigger: str, comment_name: str | None = None) -> bool:
-	if trigger not in VALID_TRIGGERS:
-		raise ValueError(f"Unknown trigger: {trigger!r}")
-	if trigger == TRIGGER_COMMENT_MENTION and not comment_name:
-		raise ValueError(f"comment_name is required for trigger {trigger!r}")
+def requester_reply_key(ticket_name: str, communication_name: str) -> str:
+	"""The event key of a requester-reply run (ADR-033 QĐ 2): one per ticket and requester message."""
+	return f"{TRIGGER_REQUESTER_REPLY}:{ticket_name}:{communication_name}"
 
-	job_id = f"erp_ai::{ticket_name}::{trigger}"
 
+def _claim_pending(job_id: str) -> bool:
+	"""False when `job_id` was already queued in this transaction; else remember it until commit or rollback."""
 	pending = frappe.flags.get(PENDING_JOB_IDS_FLAG)
 	if pending is None:
 		pending = set()
@@ -35,6 +34,33 @@ def enqueue_agent_run(ticket_name: str, trigger: str, comment_name: str | None =
 	if job_id in pending:
 		return False
 	pending.add(job_id)
+	return True
+
+
+def enqueue_agent_run(
+	ticket_name: str, trigger: str, comment_name: str | None = None, communication_name: str | None = None
+) -> bool:
+	if trigger not in VALID_TRIGGERS:
+		raise ValueError(f"Unknown trigger: {trigger!r}")
+	if trigger == TRIGGER_COMMENT_MENTION and not comment_name:
+		raise ValueError(f"comment_name is required for trigger {trigger!r}")
+	is_reply = trigger == TRIGGER_REQUESTER_REPLY
+	if is_reply and not (isinstance(communication_name, str) and communication_name):
+		raise ValueError(f"communication_name is required for trigger {trigger!r}")
+	if not is_reply and communication_name is not None:
+		raise ValueError(
+			f"communication_name is only for trigger {TRIGGER_REQUESTER_REPLY!r}, not {trigger!r}"
+		)
+
+	job_id = f"erp_ai::{ticket_name}::{trigger}"
+	reply_kwargs = {}
+	if is_reply:
+		# U6b-fixes Sửa 1 (X-1): one job per requester message, so a message arriving during a run is not
+		# merged away; only this job carries the message name, the other jobs keep their arguments.
+		job_id = f"{job_id}::{communication_name}"
+		reply_kwargs = {"communication_name": communication_name}
+	if not _claim_pending(job_id):
+		return False
 
 	frappe.enqueue(
 		"erp_ai.agent.runner.run_for_ticket",
@@ -46,6 +72,7 @@ def enqueue_agent_run(ticket_name: str, trigger: str, comment_name: str | None =
 		ticket_name=ticket_name,
 		trigger=trigger,
 		comment_name=comment_name,
+		**reply_kwargs,
 	)
 	return True
 

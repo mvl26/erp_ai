@@ -6125,10 +6125,17 @@ class TestArchitecture(unittest.TestCase):
 		self.assertEqual(check_panel_decision_follows_adr_044(self.sources), [])
 		panel = self.sources[PANEL_FILE]
 		gate = '\t_require_panel_access(head.ticket, method="decide")\n'
-		predicate = "\trefusal = proposal_form.panel_decision_refusal(head.change_status)\n"
+		# CHG-010: the predicate call now also passes the proposal's console flag
+		predicate = (
+			"\trefusal = proposal_form.panel_decision_refusal(head.change_status, console=head.is_console)\n"
+		)
 		cases = {
 			"no predicate": (
-				("proposal_form.panel_decision_refusal(head.change_status)", "None"),
+				# CHG-010: same call text with the console flag
+				(
+					"proposal_form.panel_decision_refusal(head.change_status, console=head.is_console)",
+					"None",
+				),
 				"panel_decision_refusal 0 times",
 			),
 			"browser ticket": (

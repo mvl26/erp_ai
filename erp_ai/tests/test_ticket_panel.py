@@ -3,6 +3,7 @@ import json
 from types import SimpleNamespace
 from typing import ClassVar
 from unittest.mock import MagicMock, patch
+from urllib.parse import parse_qs
 
 import frappe
 import frappe.handler
@@ -11,7 +12,7 @@ from frappe.tests.utils import FrappeTestCase
 from helpdesk.test_utils import create_agent, make_ticket, make_todo
 from helpdesk.utils import is_agent
 
-from erp_ai import ticket_panel
+from erp_ai import change_decision, ticket_panel
 from erp_ai.agent import answer_delay, change_link, change_text, policy, runner
 from erp_ai.agent.changes import apply_job, transitions
 from erp_ai.agent.policy import contains_keyword
@@ -20,6 +21,7 @@ from erp_ai.agent.run_log import write_entry
 from erp_ai.agent.tools import propose_change, write_ticket
 from erp_ai.constants import (
 	AGENT_USER,
+	CHANGE_KIND_COMMAND,
 	CHANGE_STATUS_APPLIED,
 	CHANGE_STATUS_APPROVED,
 	CHANGE_STATUS_FAILED,
@@ -1181,6 +1183,22 @@ class TestPanelProposalCards(FrappeTestCase):
 		set_agent_settings(one_click_approval_enabled=1)
 		self.assertIs(self._cards(CARD_INSTRUCTOR)[0]["can_decide"], True)
 
+	def test_console_card_can_decide_follows_the_console_switch(self):
+		# CHG-010: a console card reads the console switch, not the one-click switch
+		name = make_change_proposal(
+			CHANGE_KIND_COMMAND,
+			ticket=self.ticket,
+			command_args=None,
+			app=None,
+			command_list=json.dumps([["--site", frappe.local.site, "console"]]),
+			content_after="print(1)\n",
+		).name
+		for one_click, console, expected in ((0, 1, True), (1, 0, False), (0, 0, False), (1, 1, True)):
+			with self.subTest(one_click=one_click, console=console):
+				set_agent_settings(one_click_approval_enabled=one_click, console_enabled=console)
+				cards = {card["name"]: card for card in self._cards(CARD_INSTRUCTOR)}
+				self.assertIs(cards[name]["can_decide"], expected)
+
 	def test_failed_card_masks_reason(self):
 		proposal = make_change_proposal(ticket=self.ticket)
 		reason = (
@@ -1401,6 +1419,59 @@ class TestPanelDecision(FrappeTestCase):
 		create_agent(AGENT_USER)
 		frappe.get_doc("User", AGENT_USER).add_roles(ROLE_INSTRUCTOR)
 		self.assertIn(ROLE_INSTRUCTOR, frappe.get_roles(AGENT_USER))
+
+	def _console(self):
+		return make_change_proposal(
+			CHANGE_KIND_COMMAND,
+			ticket=self.ticket,
+			command_args=None,
+			app=None,
+			command_list=json.dumps([["--site", frappe.local.site, "console"]]),
+			content_after="print(1)\n",
+		).name
+
+	def test_console_approve_needs_only_the_console_switch(self):
+		# CHG-010: the panel is the one place a console proposal is approved; one-click approval is not its switch
+		set_agent_settings(one_click_approval_enabled=0, console_enabled=1)
+		name = self._console()
+		result = self._decide(name, APPROVE)
+		self.assertEqual(result, {"name": name, "status": CHANGE_STATUS_APPROVED})
+		self.assertEqual(self._state(name).change_status, CHANGE_STATUS_APPROVED)
+		self.assertEqual(len(self._jobs()), 1)
+
+	def test_console_approve_refused_when_the_console_switch_is_off(self):
+		set_agent_settings(one_click_approval_enabled=1, console_enabled=0)
+		name = self._console()
+		self.assertRefused(name, APPROVE, frappe.PermissionError, text="Chạy bench console đang tắt.")
+		self.assertEqual(self._state(name).change_status, CHANGE_STATUS_PENDING)
+
+	def test_console_reject_from_the_panel_with_console_on(self):
+		set_agent_settings(console_enabled=1)
+		name = self._console()
+		self.assertEqual(self._decide(name, REJECT)["status"], CHANGE_STATUS_REJECTED)
+
+	def test_signed_link_cannot_approve_a_console_proposal(self):
+		# CHG-010: the signed one-click link refuses a console proposal and writes nothing
+		set_agent_settings(one_click_approval_enabled=1, console_enabled=1)
+		name = self._console()
+		signature = parse_qs(change_link._signed_query(name, APPROVE))["_signature"][0]
+		before = self._snapshot(name)
+		frappe.set_user(DECIDE_INSTRUCTOR)
+		try:
+			with self.assertRaises(frappe.PermissionError):
+				change_decision.decide(name, APPROVE, signature)
+		finally:
+			frappe.set_user("Administrator")
+		frappe.clear_messages()
+		self.assertEqual(self._snapshot(name), before)
+
+	def test_form_reject_still_works_on_a_console_proposal(self):
+		name = self._console()
+		frappe.set_user(DECIDE_INSTRUCTOR)
+		try:
+			self.assertEqual(proposal_form.reject(name)["status"], CHANGE_STATUS_REJECTED)
+		finally:
+			frappe.set_user("Administrator")
 
 	def test_approve_one_post_one_job(self):
 		result = self._decide(self.proposal, APPROVE)

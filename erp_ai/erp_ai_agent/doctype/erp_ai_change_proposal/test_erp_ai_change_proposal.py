@@ -1867,6 +1867,8 @@ class TestPanelDecisionRefusal(FrappeTestCase):
 				"role": "Chỉ người có vai trò ERP AI Instructor mới duyệt hoặc từ chối được.",
 				"not_pending": "Đề xuất không còn chờ duyệt.",
 				"switch_off": "Duyệt một lần bấm đang tắt; hãy duyệt ở form đề xuất.",
+				# CHG-010: the fourth refusal, for a console proposal whose own switch is off
+				"console_off": "Chạy bench console đang tắt.",
 			},
 		)
 
@@ -1933,8 +1935,11 @@ class TestPanelDecisionRefusal(FrappeTestCase):
 	def test_proposal_head(self):
 		proposal = make_change_proposal()
 		head = controller.proposal_head(proposal.name)
-		self.assertEqual(head, frappe._dict(ticket=proposal.ticket, change_status=CHANGE_STATUS_PENDING))
-		self.assertEqual(set(head), {"ticket", "change_status"})
+		# CHG-010: the head also says whether the proposal is a console one
+		self.assertEqual(
+			head, frappe._dict(ticket=proposal.ticket, change_status=CHANGE_STATUS_PENDING, is_console=False)
+		)
+		self.assertEqual(set(head), {"ticket", "change_status", "is_console"})
 
 	def test_proposal_head_unknown_names_do_not_exist(self):
 		for name in (None, "", "   ", 5, ["x"], "ERP-AI-NO-SUCH-PROPOSAL"):
@@ -1943,7 +1948,13 @@ class TestPanelDecisionRefusal(FrappeTestCase):
 					controller.proposal_head(name)
 
 	def test_new_functions_are_not_whitelisted(self):
-		for fn in (controller.has_decider_role, controller.panel_decision_refusal, controller.proposal_head):
+		# CHG-010: panel_approve is the panel's approval, reachable only through the panel gate
+		for fn in (
+			controller.has_decider_role,
+			controller.panel_decision_refusal,
+			controller.proposal_head,
+			controller.panel_approve,
+		):
 			with self.subTest(fn=fn.__name__):
 				self.assertNotIn(fn, frappe.whitelisted)
 
@@ -1954,3 +1965,131 @@ class TestPanelDecisionRefusal(FrappeTestCase):
 			with self.assertRaises(frappe.PermissionError):
 				controller._decider(proposal.name)
 		role.assert_called_once_with(PANEL_INSTRUCTOR)
+
+
+CONSOLE_PANEL_ONLY_TEXT = "Script console chỉ duyệt được bằng nút Duyệt trong khung Trao đổi với bot."
+CONSOLE_OFF_TEXT = "Chạy bench console đang tắt."
+
+
+def _console_proposal(**fields):
+	return make_change_proposal(
+		CHANGE_KIND_COMMAND,
+		command_args=None,
+		app=None,
+		command_list=json.dumps([["--site", frappe.local.site, "console"]]),
+		content_after="print(1)\n",
+		**fields,
+	)
+
+
+class TestConsoleProposalDecision(FrappeTestCase):
+	"""CHG-010: a console proposal is approved only from the chat panel; rejecting stays possible everywhere."""
+
+	def setUp(self):
+		self.addCleanup(frappe.clear_cache, user=PANEL_INSTRUCTOR)
+		self.addCleanup(frappe.db.rollback)
+		self.addCleanup(frappe.set_user, "Administrator")
+		frappe.set_user("Administrator")
+		keep_agent_settings(self)
+		enqueue = patch("frappe.enqueue")
+		self.enqueue = enqueue.start()
+		self.addCleanup(enqueue.stop)
+		if not frappe.db.exists("Role", ROLE_INSTRUCTOR):
+			frappe.get_doc({"doctype": "Role", "role_name": ROLE_INSTRUCTOR}).insert(ignore_permissions=True)
+		create_agent(PANEL_INSTRUCTOR)
+		if not frappe.db.exists("User", AGENT_USER):
+			create_agent(AGENT_USER)
+		frappe.get_doc("User", PANEL_INSTRUCTOR).add_roles(ROLE_INSTRUCTOR)
+		frappe.get_doc("User", AGENT_USER).add_roles(ROLE_INSTRUCTOR)
+		set_agent_settings(one_click_approval_enabled=1, console_enabled=1)
+
+	def _jobs(self):
+		return [call for call in self.enqueue.call_args_list if call.args and call.args[0] == RUN_CHANGE]
+
+	def _as(self, user, method, name):
+		frappe.set_user(user)
+		try:
+			return getattr(controller, method)(name)
+		finally:
+			frappe.set_user("Administrator")
+
+	def _status(self, name):
+		return frappe.db.get_value(PROPOSAL_DOCTYPE, name, ["change_status", "decided_by"], as_dict=True)
+
+	def test_form_approve_refused_for_a_console_proposal(self):
+		name = _console_proposal().name
+		with self.assertRaises(frappe.PermissionError) as caught:
+			self._as(PANEL_INSTRUCTOR, "approve", name)
+		self.assertEqual(str(caught.exception), controller.CONSOLE_PANEL_ONLY)
+		self.assertEqual(controller.CONSOLE_PANEL_ONLY, CONSOLE_PANEL_ONLY_TEXT)
+		self.assertEqual(self._status(name).change_status, CHANGE_STATUS_PENDING)
+		self.assertEqual(self._jobs(), [])
+
+	def test_form_approve_other_kinds_unchanged(self):
+		name = make_change_proposal(CHANGE_KIND_COMMAND).name
+		self.assertEqual(self._as(PANEL_INSTRUCTOR, "approve", name)["status"], CHANGE_STATUS_APPROVED)
+		self.assertEqual(len(self._jobs()), 1)
+
+	def test_form_reject_still_works_for_a_console_proposal(self):
+		name = _console_proposal().name
+		self.assertEqual(self._as(PANEL_INSTRUCTOR, "reject", name)["status"], CHANGE_STATUS_REJECTED)
+		self.assertEqual(self._jobs(), [])
+
+	def test_role_is_checked_before_the_console_refusal(self):
+		name = _console_proposal().name
+		with self.assertRaises(frappe.PermissionError) as caught:
+			self._as(AGENT_USER, "approve", name)
+		self.assertNotEqual(str(caught.exception), controller.CONSOLE_PANEL_ONLY)
+
+	def test_panel_approve_approves_and_queues_one_job(self):
+		name = _console_proposal().name
+		self.assertEqual(
+			self._as(PANEL_INSTRUCTOR, "panel_approve", name),
+			{"name": name, "status": CHANGE_STATUS_APPROVED},
+		)
+		stored = self._status(name)
+		self.assertEqual(
+			(stored.change_status, stored.decided_by), (CHANGE_STATUS_APPROVED, PANEL_INSTRUCTOR)
+		)
+		jobs = self._jobs()
+		self.assertEqual(len(jobs), 1)
+		self.assertEqual((jobs[0].kwargs["proposal_name"], jobs[0].kwargs["action"]), (name, "apply"))
+
+	def test_panel_approve_refuses_the_agent_account(self):
+		name = _console_proposal().name
+		with self.assertRaises(frappe.PermissionError):
+			self._as(AGENT_USER, "panel_approve", name)
+		self.assertEqual(self._status(name).change_status, CHANGE_STATUS_PENDING)
+		self.assertEqual(self._jobs(), [])
+
+	def test_panel_approve_is_not_whitelisted(self):
+		self.assertNotIn(controller.panel_approve, frappe.whitelisted)
+
+	def test_refusal_console_off_even_with_one_click_on(self):
+		set_agent_settings(one_click_approval_enabled=1, console_enabled=0)
+		frappe.set_user(PANEL_INSTRUCTOR)
+		self.assertEqual(
+			controller.panel_decision_refusal(CHANGE_STATUS_PENDING, console=True), "console_off"
+		)
+		self.assertIsNone(controller.panel_decision_refusal(CHANGE_STATUS_PENDING))
+
+	def test_refusal_none_with_console_on_even_with_one_click_off(self):
+		set_agent_settings(one_click_approval_enabled=0, console_enabled=1)
+		frappe.set_user(PANEL_INSTRUCTOR)
+		self.assertIsNone(controller.panel_decision_refusal(CHANGE_STATUS_PENDING, console=True))
+		self.assertEqual(controller.panel_decision_refusal(CHANGE_STATUS_PENDING), "switch_off")
+
+	def test_refusal_order_role_then_pending_then_switch_for_console(self):
+		set_agent_settings(console_enabled=0)
+		frappe.set_user(AGENT_USER)
+		self.assertEqual(controller.panel_decision_refusal(CHANGE_STATUS_PENDING, console=True), "role")
+		frappe.set_user(PANEL_INSTRUCTOR)
+		self.assertEqual(
+			controller.panel_decision_refusal(CHANGE_STATUS_APPROVED, console=True), "not_pending"
+		)
+
+	def test_proposal_head_flags_a_console_proposal(self):
+		self.assertIs(controller.proposal_head(_console_proposal().name).is_console, True)
+		self.assertIs(
+			controller.proposal_head(make_change_proposal(CHANGE_KIND_COMMAND).name).is_console, False
+		)

@@ -141,7 +141,11 @@ PANEL_REFUSALS = {
 	"role": "Chỉ người có vai trò ERP AI Instructor mới duyệt hoặc từ chối được.",
 	"not_pending": "Đề xuất không còn chờ duyệt.",
 	"switch_off": "Duyệt một lần bấm đang tắt; hãy duyệt ở form đề xuất.",
+	# CHG-010: a console proposal is decided with its own switch, not the one-click one
+	"console_off": "Chạy bench console đang tắt.",
 }
+# CHG-010: the form button and the signed link may not approve a console script; only the chat panel may.
+CONSOLE_PANEL_ONLY = "Script console chỉ duyệt được bằng nút Duyệt trong khung Trao đổi với bot."
 
 
 def has_decider_role(user: str) -> bool:
@@ -153,10 +157,11 @@ def has_decider_role(user: str) -> bool:
 	return user not in NEVER_AUTHORITY and ROLE_INSTRUCTOR in frappe.get_roles(user)
 
 
-def panel_decision_refusal(status: str) -> str | None:
+def panel_decision_refusal(status: str, *, console: bool = False) -> str | None:
 	"""Why the session user cannot decide a proposal in `status` from the ticket panel, or None when they can.
 
-	Checked in this order: role, then pending, then switch (5). The switch is read through
+	Checked in this order: role, then pending, then the switch (5), or for a `console` proposal the console
+	switch (CHG-010) instead of the one-click one. The switch is read through
 	`policy.permission_switches` on every call and only when the first two checks pass. Not whitelisted.
 
 	Returns:
@@ -166,26 +171,36 @@ def panel_decision_refusal(status: str) -> str | None:
 		return "role"
 	if status != CHANGE_STATUS_PENDING:
 		return "not_pending"
-	if not policy.permission_switches(frappe.get_single(SETTING_DOCTYPE)).one_click_approval:
+	switches = policy.permission_switches(frappe.get_single(SETTING_DOCTYPE))
+	if console:
+		return None if switches.console else "console_off"
+	if not switches.one_click_approval:
 		return "switch_off"
 	return None
 
 
 def proposal_head(name) -> frappe._dict:
-	"""`{"ticket", "change_status"}` of proposal `name`, read from the stored record. Not whitelisted.
+	"""`{"ticket", "change_status", "is_console"}` of proposal `name`, read from the stored record. Not whitelisted.
 
 	Raises:
 		frappe.DoesNotExistError: `name` is not a string, is empty, or names no proposal (the text of `_decider`).
 	"""
 	head = None
 	if isinstance(name, str) and name.strip():
-		head = frappe.db.get_value(PROPOSAL_DOCTYPE, name, ["ticket", "change_status"], as_dict=True)
+		head = frappe.db.get_value(
+			PROPOSAL_DOCTYPE,
+			name,
+			["ticket", "change_status", "change_kind", "command_list", "command_args"],
+			as_dict=True,
+		)
 	if not head:
 		frappe.throw(
 			_("Không có đề xuất {0}").format(frappe.utils.escape_html(cstr(name))),
 			frappe.DoesNotExistError,
 		)
-	return frappe._dict(ticket=head.ticket, change_status=head.change_status)
+	return frappe._dict(
+		ticket=head.ticket, change_status=head.change_status, is_console=block.is_console(head)
+	)
 
 
 # CHG-008 design 2, 3.1: what a panel card reads and shows. No content field is ever read (diff, file text,
@@ -292,7 +307,7 @@ def panel_cards(ticket: str) -> list[dict]:
 				row.restart_status or None,
 				change_text.safe_person_name(frappe.utils.get_fullname(decided_by)) if decided_by else None,
 				failure_reason or None,
-				panel_decision_refusal(row.change_status) is None,
+				panel_decision_refusal(row.change_status, console=block.is_console(row)) is None,
 				row.name in readable,
 			)
 		except Exception as exc:
@@ -338,7 +353,19 @@ def _decider(name) -> str:
 
 @frappe.whitelist(methods=["POST"])
 def approve(name=None) -> dict:
-	"""`Chờ duyệt → Đã duyệt`, then queue the `apply` job (design 3.3, ADR-012 QĐ 4)."""
+	"""`Chờ duyệt → Đã duyệt`, then queue the `apply` job (design 3.3, ADR-012 QĐ 4).
+
+	A console proposal is refused here (CHG-010): it is approved only by `panel_approve`.
+	"""
+	_decider(name)
+	if block.is_console(frappe.get_doc(PROPOSAL_DOCTYPE, name)):
+		frappe.throw(_(CONSOLE_PANEL_ONLY), frappe.PermissionError)
+	return panel_approve(name)
+
+
+def panel_approve(name=None) -> dict:
+	"""The approval itself, for any kind (CHG-010). Not whitelisted: the form's `approve` refuses a console
+	proposal first, and the ticket panel reaches this one only after its own gate."""
 	user = _decider(name)
 	status = transitions.approve(name, user)
 	queue.enqueue_change_job(name, "apply")

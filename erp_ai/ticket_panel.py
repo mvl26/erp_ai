@@ -40,7 +40,8 @@ AI_FIELDS = (
 # ADR-044 QĐ 1 (CHG-008 design 3.2): what the panel's Duyệt / Từ chối buttons may do, each the form's own method.
 # FEAT-007 W2 adds its action here, not a method.
 PANEL_DECISIONS = {
-	change_link.ACTION_APPROVE: proposal_form.approve,
+	# CHG-010: the panel approves through `panel_approve`, the only path that may approve a console script.
+	change_link.ACTION_APPROVE: proposal_form.panel_approve,
 	change_link.ACTION_REJECT: proposal_form.reject,
 }
 
@@ -146,13 +147,13 @@ def decide_proposal(name=None, action=None) -> dict:
 	Errors, checked in this order, each writing nothing: ValidationError (`action` not a key of
 	`PANEL_DECISIONS`); DoesNotExistError (no such proposal); PermissionError (the panel gate on the proposal's
 	ticket, which also refuses the agent account; then the panel predicate: role, not pending, one-click switch
-	off). InvalidTransition: a second call that passed the predicate before the first one wrote.
+	off, or for a console proposal the console switch off). InvalidTransition: a second call that passed the predicate before the first one wrote.
 	"""
 	if not isinstance(action, str) or action not in PANEL_DECISIONS:
 		frappe.throw(_("Hành động không hợp lệ."), frappe.ValidationError)
 	head = proposal_form.proposal_head(name)
 	_require_panel_access(head.ticket, method="decide")
-	refusal = proposal_form.panel_decision_refusal(head.change_status)
+	refusal = proposal_form.panel_decision_refusal(head.change_status, console=head.is_console)
 	if refusal is not None:
 		frappe.logger(LOGGER_NAME).info(f"erp_ai panel decide refused proposal={name} reason={refusal}")
 		frappe.throw(_(proposal_form.PANEL_REFUSALS[refusal]), frappe.PermissionError)

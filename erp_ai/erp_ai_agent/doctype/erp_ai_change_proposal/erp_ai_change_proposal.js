@@ -18,12 +18,15 @@ frappe.ui.form.on("ERP AI Change Proposal", {
 			return;
 		}
 		if (frm.doc.change_status === "Chờ duyệt") {
-			add_action_button(
-				frm,
-				__("Duyệt"),
-				approve_confirm_message(frm, notes),
-				"erp_ai.erp_ai_agent.doctype.erp_ai_change_proposal.erp_ai_change_proposal.approve"
-			);
+			// A console script is approved only from the ticket's bot panel (CHG-010).
+			if (!is_console_proposal(frm)) {
+				add_action_button(
+					frm,
+					__("Duyệt"),
+					approve_confirm_message(frm, notes),
+					"erp_ai.erp_ai_agent.doctype.erp_ai_change_proposal.erp_ai_change_proposal.approve"
+				);
+			}
 			add_action_button(
 				frm,
 				__("Từ chối"),
@@ -120,6 +123,22 @@ function decide_from_link(frm) {
 			callback: () => frm.reload_doc(),
 		});
 	}
+}
+
+function is_console_proposal(frm) {
+	let commands = [];
+	try {
+		commands = JSON.parse(frm.doc.command_list || "[]");
+	} catch (e) {
+		return false;
+	}
+	return (
+		Array.isArray(commands) &&
+		commands.length === 1 &&
+		Array.isArray(commands[0]) &&
+		commands[0].length === 3 &&
+		commands[0][2] === "console"
+	);
 }
 
 function approve_confirm_message(frm, notes) {

@@ -1,6 +1,7 @@
 import ast
 import json
 import os
+import unicodedata
 from dataclasses import dataclass
 
 import erp_ai
@@ -105,6 +106,12 @@ CONSOLE_CALL = "script không được gọi {name}"
 CONSOLE_ATTR = "script không được dùng .{name}"
 CONSOLE_TEXT = "script không được nhắc tới {text}"
 CONSOLE_DUNDER = "script không được dùng {name}"
+CONSOLE_INVISIBLE = "script có ký tự ẩn hoặc ký tự điều khiển (vị trí {pos})"
+# CHG-010 final review F-1: what a browser shows otherwise than Python reads it ("Trojan Source"): format
+# characters (bidi controls, zero-width characters, BOM), control characters (C0, DEL, C1) and the line and
+# paragraph separators a browser breaks on and Python does not. Tab, newline and carriage return stay allowed.
+CONSOLE_INVISIBLE_CATEGORIES = ("Cf", "Cc", "Zl", "Zp")
+CONSOLE_ALLOWED_CONTROLS = ("\t", "\n", "\r")
 DUNDER_PREFIX = "__"
 DUNDER_ALLOWED = "__name__"
 CONSOLE_IMPORT_ROOTS = ("frappe", "erpnext", "hrms", "helpdesk", "json", "datetime", "decimal", "re", "math")
@@ -638,15 +645,33 @@ def _tree_reason(tree) -> str | None:
 	return None
 
 
+def _invisible_position(script: str) -> int | None:
+	"""The 1-based position of the first character of `CONSOLE_INVISIBLE_CATEGORIES` in `script`, or None.
+
+	Such a character lets the card show a script other than the one that runs (CHG-010 final review F-1).
+	Vietnamese is unaffected: its combining marks are Mn, never one of these categories.
+	"""
+	for index, char in enumerate(script):
+		if char in CONSOLE_ALLOWED_CONTROLS:
+			continue
+		if unicodedata.category(char) in CONSOLE_INVISIBLE_CATEGORIES:
+			return index + 1
+	return None
+
+
 def check_console_script(script) -> str | None:
 	"""Static rules of a bot-drafted console script (CHG-010); the refusal reason, or None when allowed.
 
-	Order: blank, length, forbidden text, syntax, then the first import, call or attribute violation.
+	Order: blank, length, hidden or control characters, forbidden text, syntax, then the first import, call or
+	attribute violation.
 	"""
 	if not isinstance(script, str) or not script.strip():
 		return CONSOLE_EMPTY
 	if len(script) > CONSOLE_SCRIPT_MAX_CHARS:
 		return CONSOLE_TOO_LONG.format(max=CONSOLE_SCRIPT_MAX_CHARS)
+	position = _invisible_position(script)
+	if position is not None:
+		return CONSOLE_INVISIBLE.format(pos=position)
 	lowered = script.lower()
 	for text in CONSOLE_FORBIDDEN_TEXT:
 		if text in lowered:

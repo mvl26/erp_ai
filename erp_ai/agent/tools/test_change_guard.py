@@ -1,5 +1,6 @@
 import os
 import threading
+import unicodedata
 from unittest.mock import patch
 
 import frappe
@@ -1943,3 +1944,44 @@ class TestConsoleScript(FrappeTestCase):
 		for script, reason in cases:
 			with self.subTest(script=script if script is None else script[:30]):
 				self.assertEqual(change_guard.check_console_script(script), reason)
+
+	def test_invisible_and_control_characters_are_refused(self):
+		# CHG-010 final review F-1: a bidi control, a zero-width character or a control character lets the card show
+		# a script other than the one that runs ("Trojan Source"); the reason gives the 1-based position of the first.
+		trojan = 'if mode != "dry\u202e \u2066# chỉ xem thử\u2069 \u2066":\n\tfrappe.db.delete("ToDo")\n'
+		cases = (
+			(trojan, 16),
+			("x = 1\u202e", 6),
+			("x = 1 \u2066", 7),
+			("pri\u200bnt(1)", 4),
+			("\ufeffprint(1)", 1),
+			("print(1)\x00", 9),
+			("print('\x1b[2J')", 8),
+			("print(1)\x7f", 9),
+			("print(1)\x85", 9),
+			("print(1)\x9f", 9),
+			("# a\u2028frappe.db.delete('ToDo')", 4),
+			("x = 'ERP AI'\u202e", 13),
+		)
+		for script, position in cases:
+			with self.subTest(script=ascii(script[:20])):
+				self.assertEqual(
+					change_guard.check_console_script(script),
+					f"script có ký tự ẩn hoặc ký tự điều khiển (vị trí {position})",
+				)
+		# the length rule still comes first
+		self.assertEqual(
+			change_guard.check_console_script("x" * 20001 + "\u202e"), "script dài quá 20000 ký tự"
+		)
+
+	def test_tab_newline_and_carriage_return_are_allowed(self):
+		# CHG-010 final review F-1
+		self.assertIsNone(change_guard.check_console_script("if True:\r\n\tprint(1)\r\n"))
+		self.assertIsNone(change_guard.check_console_script("if True:\n\tprint(1)\rprint(2)\n"))
+
+	def test_vietnamese_with_combining_marks_is_allowed(self):
+		# CHG-010 final review F-1: Vietnamese in NFD uses combining marks (Mn), never a format character (Cf)
+		script = unicodedata.normalize("NFD", 'print("Đã cập nhật phiếu của khách hàng")\n')
+		self.assertTrue(any(unicodedata.category(char) == "Mn" for char in script))
+		self.assertIsNone(change_guard.check_console_script(script))
+		self.assertIsNone(change_guard.check_console_script(unicodedata.normalize("NFC", script)))

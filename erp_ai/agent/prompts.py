@@ -2,7 +2,7 @@ import json
 
 from frappe.utils import strip_html
 
-from erp_ai.constants import CATEGORIES, TRIGGER_COMMENT_MENTION
+from erp_ai.constants import CATEGORIES, TRIGGER_COMMENT_MENTION, TRIGGER_KB_DRAFT, TRIGGER_REQUESTER_REPLY
 
 DESCRIPTION_MAX_CHARS = 6000
 COMMENT_MAX_CHARS = 2000
@@ -307,6 +307,21 @@ PROMPT_CONFLICT_PAIRS: tuple[tuple[str, str], ...] = (
 
 TASK_NEW_TICKET = "Việc cần làm: phiếu mới. Gọi set_resolution_hint một lần, rồi post_comment nếu cần."
 TASK_COMMENT = "Việc cần làm: có comment gọi bạn. Trả lời bằng post_comment."
+# U6b-fixes.md:91 (one run may follow several requester messages) and U6b.md:293.
+TASK_REQUESTER_REPLY = (
+	"Người tạo phiếu vừa trả lời tin của bạn, có thể bằng nhiều tin. Đọc mọi tin của người tạo sau tin gần nhất "
+	"của bạn. Trả lời người tạo bằng reply_to_requester nếu được cấp, hoặc ghi comment cho người phụ trách."
+)
+TASK_KB_DRAFT = (
+	"Phiếu đã đóng. Soạn đúng một bài CSKT nháp bằng create_kb_draft: vấn đề và các bước đã giải quyết, lấy từ "
+	"chi tiết giải quyết và comment của người phụ trách; không chép tên người, email, số điện thoại, mật khẩu."
+)
+# Any other trigger (ticket_insert, change_action) gets TASK_NEW_TICKET.
+TASK_BY_TRIGGER = {
+	TRIGGER_COMMENT_MENTION: TASK_COMMENT,
+	TRIGGER_REQUESTER_REPLY: TASK_REQUESTER_REPLY,
+	TRIGGER_KB_DRAFT: TASK_KB_DRAFT,
+}
 # w1.md:100 (U4b-10): the ticket already has the bot's guidance comment (a fact of the ticket, not configuration).
 TASK_AFTER_GUIDANCE = (
 	"Phiếu đã có comment Hướng xử lý của bot. Chỉ làm việc người vừa nhờ và báo kết quả; "
@@ -515,7 +530,7 @@ def build_initial_message(
 	}
 	if fields := _field_values(ticket_fields or {}):
 		payload["ticket"]["fields"] = fields
-	task = TASK_COMMENT if trigger == TRIGGER_COMMENT_MENTION else TASK_NEW_TICKET
+	task = TASK_BY_TRIGGER.get(trigger, TASK_NEW_TICKET)
 	if guidance_posted:
 		payload["ticket"]["guidance_posted"] = True
 		task += "\n" + TASK_AFTER_GUIDANCE

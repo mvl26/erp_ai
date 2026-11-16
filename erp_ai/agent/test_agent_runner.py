@@ -3335,7 +3335,8 @@ class TestRunnerGrant(RunnerTestBase):
 		return {groups[tool["name"]] for tool in call["tools"]}
 
 	def _tool_results(self):
-		blocks = self.gateway.calls[1]["messages"][-1]["content"]
+		"""The tool results of the run's last model call."""
+		blocks = self.gateway.calls[-1]["messages"][-1]["content"]
 		return {block["tool_use_id"]: json.loads(block["content"]) for block in blocks}
 
 	def test_plain_user_mention_after_instructor_gets_no_write_tools(self):
@@ -3381,7 +3382,12 @@ class TestRunnerGrant(RunnerTestBase):
 			predicted_category=SEEDED_CLASSIFICATION[0],
 			predicted_confidence_pct=confidence_pct,
 		)
+		# T113 (ADR-037 QĐ 1): below the threshold the run first classifies again; the stub keeps the same number, and
+		# its category A reads the cap set here, never the shared site's
+		set_agent_settings(level_cap_a="L1")
+		again = [classify_at(confidence_pct)] if confidence_pct < policy.DEFAULT_CONFIDENCE_THRESHOLD else []
 		self.gateway.results = [
+			*again,
 			tool_turn(
 				tool_use("t_cls", "set_classification", category="A", confidence="Cao"),
 				# AC-22 (T100): a question is kind=hoi; below the threshold it needs non-empty grounds.
@@ -3403,7 +3409,8 @@ class TestRunnerGrant(RunnerTestBase):
 		self.assertFalse(results["t_cls"]["ok"])
 		self.assertIn("không được cấp", results["t_cls"]["reason"])
 		self.assertTrue(results["t_ask"]["ok"])
-		offered = {tool["name"] for tool in self.gateway.calls[0]["tools"]}
+		first_turn = next(call for call in self.gateway.calls if call["task"] == "reason")
+		offered = {tool["name"] for tool in first_turn["tools"]}
 		ticket_write = {spec.name for spec in registry._all_specs() if spec.group == "ticket_write"}
 		self.assertLessEqual(offered & ticket_write, ASK_TOOL_NAMES)
 		self.assertIn("post_comment", offered)
@@ -3478,7 +3485,7 @@ class TestRunnerGrant(RunnerTestBase):
 	# T82 (U1.md:263): `_reason` takes its tools and prompt block flags from grant(context.grant_inputs()).
 
 	def _offered_names(self):
-		(call,) = self.gateway.calls
+		(call,) = [call for call in self.gateway.calls if call["task"] == "reason"]
 		return [tool["name"] for tool in call["tools"]]
 
 	def _month_spend_from_ticket_log(self, now=None):
@@ -3573,9 +3580,11 @@ class TestRunnerGrant(RunnerTestBase):
 
 		self.assertIn("api_create_record", self._offered_names())
 
-		# (3) off: the same 69 % is below the threshold and the record tools are gone.
-		set_agent_settings(act_now_enabled=0)
+		# (3) off: the same 69 % is below the threshold and the record tools are gone; the run classifies again first
+		# (T113, ADR-037 QĐ 1) and the stub keeps 69
+		set_agent_settings(act_now_enabled=0, level_cap_a="L1")
 		self.gateway.calls.clear()
+		self.gateway.results = [classify_at(69), make_model_result()]
 		with patch.object(authority, "run_instructor", return_value="Administrator"):
 			self._run("comment_mention")
 
@@ -4579,6 +4588,8 @@ class TestOneGuidance(RunnerTestBase):
 		self.assertEqual(self._guidance(), 0)
 
 		reply = f"{PREFIX}máy in ở kho 2, phiếu xuất PX-01"
+		# the run left the session on the agent account: the reply is a person's
+		frappe.set_user("Administrator")
 		self.ticket.new_comment(reply)
 		self.gateway.calls.clear()
 		self.gateway.results = [classify_at(75), make_model_result()]

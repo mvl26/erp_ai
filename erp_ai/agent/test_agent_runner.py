@@ -88,6 +88,7 @@ from erp_ai.test_utils import (
 	FakeGateway,
 	GitSandbox,
 	add_credential,
+	clear_lesson_store,
 	keep_agent_settings,
 	make_active_agent,
 	make_change_proposal,
@@ -6454,6 +6455,8 @@ class TestRunnerLessons(RunnerTestBase):
 		frappe.db.rollback()
 		keep_agent_settings(self)
 		super().setUp()
+		# Only the lessons this test makes: the shared site holds real ones (NFR-7, rolled back, never committed).
+		clear_lesson_store()
 		frappe.set_user("Administrator")
 		set_agent_settings(
 			lessons_enabled=1,
@@ -6585,7 +6588,7 @@ class TestRunnerLessons(RunnerTestBase):
 		self.assertFalse([row.name for row in self._entries() if row.lessons_used])
 		set_agent_settings(lessons_enabled=1)
 		on = self._requests()
-		frappe.db.delete(LESSON_DOCTYPE)  # the store emptied, inside this test's transaction
+		clear_lesson_store()  # only this test's lessons were there (setUp), inside this test's transaction
 		empty = self._requests()
 
 		self.assertEqual(off, empty)

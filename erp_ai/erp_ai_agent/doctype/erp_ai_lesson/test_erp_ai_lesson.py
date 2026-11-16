@@ -19,7 +19,7 @@ from erp_ai.constants import (
 	ROLE_INSTRUCTOR,
 )
 from erp_ai.erp_ai_agent.doctype.erp_ai_lesson import erp_ai_lesson
-from erp_ai.test_utils import keep_agent_settings, set_agent_settings
+from erp_ai.test_utils import clear_lesson_store, keep_agent_settings, set_agent_settings
 
 DOCTYPE_JSON = Path(__file__).with_name("erp_ai_lesson.json")
 
@@ -32,6 +32,9 @@ class TestERPAILesson(FrappeTestCase):
 		self.addCleanup(commit_guard.stop)
 		self.addCleanup(frappe.db.rollback)
 		self.addCleanup(frappe.set_user, "Administrator")
+		keep_agent_settings(self)
+		# Only the lessons this test makes: the shared site holds real ones (NFR-7, rolled back, never committed).
+		clear_lesson_store()
 
 	def test_no_role_can_create_or_write(self):
 		permissions = json.loads(DOCTYPE_JSON.read_text(encoding="utf-8"))["permissions"]
@@ -98,6 +101,8 @@ class TestLessonController(FrappeTestCase):
 		self.addCleanup(frappe.db.rollback)
 		self.addCleanup(frappe.set_user, "Administrator")
 		keep_agent_settings(self)
+		# Only the lessons this test makes: the shared site holds real ones (NFR-7, rolled back, never committed).
+		clear_lesson_store()
 		frappe.set_user("Administrator")
 		_make_user(INSTRUCTOR, ROLE_INSTRUCTOR)
 		_make_user(PLAIN, "Desk User")

@@ -42,7 +42,12 @@ from erp_ai.constants import (
 	TITLE_CHANGE_FAILED,
 	TRIGGER_CHANGE_ACTION,
 )
-from erp_ai.test_utils import keep_agent_settings, make_change_proposal, set_agent_settings
+from erp_ai.test_utils import (
+	clear_lesson_store,
+	keep_agent_settings,
+	make_change_proposal,
+	set_agent_settings,
+)
 
 # Design 2.1 state group, written out by hand (11 fields + 4 CHG-002 fields + 4 git fields of round 1).
 STATE_FIELDS_EXPECTED = (
@@ -1483,6 +1488,8 @@ class TestLessonsFromOutcome(FrappeTestCase):
 		self.addCleanup(frappe.db.rollback)
 		self.addCleanup(frappe.set_user, "Administrator")
 		keep_agent_settings(self)
+		# Only the lessons this test makes: the shared site holds real ones (NFR-7, rolled back, never committed).
+		clear_lesson_store()
 		set_agent_settings(enabled=0, lessons_enabled=1, excluded_teams="", excluded_title_prefixes="")
 
 	def _lessons(self, proposal):

@@ -15,7 +15,7 @@ from erp_ai.constants import (
 	LESSON_STATUS_PENDING,
 	LESSON_STATUS_REJECTED,
 )
-from erp_ai.test_utils import keep_agent_settings, set_agent_settings
+from erp_ai.test_utils import clear_lesson_store, keep_agent_settings, set_agent_settings
 
 SUBJECT = "Máy in phòng kế toán"
 DESCRIPTION = "<p>Máy in báo lỗi giấy kẹt</p>"
@@ -32,6 +32,8 @@ class TestLessonRead(FrappeTestCase):
 		self.addCleanup(frappe.db.rollback)
 		self.addCleanup(frappe.set_user, "Administrator")
 		keep_agent_settings(self)
+		# Only the lessons this test makes: the shared site holds real ones (NFR-7, rolled back, never committed).
+		clear_lesson_store()
 		frappe.set_user("Administrator")
 		set_agent_settings(lessons_enabled=1, excluded_teams="", excluded_title_prefixes="")
 		self.ticket = make_ticket(subject="Phiếu nguồn bài học").name

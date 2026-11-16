@@ -24,6 +24,7 @@ from erp_ai.constants import (
 )
 from erp_ai.test_utils import (
 	FakeGateway,
+	clear_lesson_store,
 	keep_agent_settings,
 	make_log_entry,
 	make_model_result,
@@ -1512,6 +1513,8 @@ class TestLessonSources(HandlerTestCase):
 		frappe.db.rollback()
 		keep_agent_settings(self)
 		super().setUp()
+		# Only the lessons this test makes: the shared site holds real ones (NFR-7, rolled back, never committed).
+		clear_lesson_store()
 		set_agent_settings(lessons_enabled=1, lesson_teach_marker="ghi nhớ:")
 		_ensure_ticket_type(OTHER_TYPE)
 		_ensure_team(OTHER_TEAM)
@@ -1735,6 +1738,8 @@ class TestAssigneeChangeSource(HandlerTestCase):
 		frappe.db.rollback()
 		keep_agent_settings(self)
 		super().setUp()
+		# Only the lessons this test makes: the shared site holds real ones (NFR-7, rolled back, never committed).
+		clear_lesson_store()
 		set_agent_settings(lessons_enabled=1, lesson_teach_marker="ghi nhớ:")
 		_make_user(INSTRUCTOR, "ERP AI Instructor", "Agent")
 		_make_user(PLAIN_USER, "Agent")

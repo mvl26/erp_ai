@@ -1275,7 +1275,11 @@ class TestLessonDefaults(FrappeTestCase):
 
 	def setUp(self):
 		frappe.db.rollback()
+		commit_guard = patch.object(frappe.db, "commit", side_effect=AssertionError("test must not commit"))
+		commit_guard.start()
+		self.addCleanup(commit_guard.stop)
 		self.addCleanup(frappe.db.rollback)
+		self.addCleanup(frappe.set_user, "Administrator")
 		keep_agent_settings(self)
 
 	def _stored(self, fieldname):

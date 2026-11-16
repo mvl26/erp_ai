@@ -8,7 +8,7 @@ from frappe.tests.utils import FrappeTestCase
 from helpdesk.test_utils import make_ticket
 
 from erp_ai.constants import AGENT_USER, LESSON_DOCTYPE, ROLE_INSTRUCTOR
-from erp_ai.test_utils import keep_agent_settings, set_agent_settings
+from erp_ai.test_utils import clear_lesson_store, keep_agent_settings, set_agent_settings
 
 REVIEW_MONTH = "ERP AI Review Month"
 FAKE_KEY = "sk-ant-api03-" + "Ab1" * 13 + "Z"
@@ -233,6 +233,8 @@ class TestVerdictLessons(ReviewMonthTestCase):
 		commit_guard.start()
 		self.addCleanup(commit_guard.stop)
 		super().setUp()
+		# Only the lessons this test makes: the shared site holds real ones (NFR-7, rolled back, never committed).
+		clear_lesson_store()
 		set_agent_settings(enabled=0, lessons_enabled=1, excluded_teams="", excluded_title_prefixes="")
 		self.ticket = _tickets(1)[0]
 		self.month = _new_month([self.ticket]).insert(ignore_permissions=True)

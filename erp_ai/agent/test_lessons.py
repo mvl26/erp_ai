@@ -19,7 +19,7 @@ from erp_ai.constants import (
 	LESSON_STEPS,
 	ROLE_INSTRUCTOR,
 )
-from erp_ai.test_utils import keep_agent_settings, set_agent_settings
+from erp_ai.test_utils import clear_lesson_store, keep_agent_settings, set_agent_settings
 
 INSTRUCTOR = "erp-ai-lesson-instructor@example.com"
 PLAIN = "erp-ai-lesson-plain@example.com"
@@ -70,6 +70,8 @@ class TestLessonStore(FrappeTestCase):
 		self.addCleanup(frappe.db.rollback)
 		self.addCleanup(frappe.set_user, "Administrator")
 		keep_agent_settings(self)
+		# Only the lessons this test makes: the shared site holds real ones (NFR-7, rolled back, never committed).
+		clear_lesson_store()
 		frappe.set_user("Administrator")
 		_make_user(INSTRUCTOR, ROLE_INSTRUCTOR)
 		_make_user(PLAIN, "Desk User")

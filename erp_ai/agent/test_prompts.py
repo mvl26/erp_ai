@@ -24,13 +24,14 @@ ALL_FLAGS = [
 	dict(zip(FLAG_NAMES, values, strict=True)) for values in itertools.product((False, True), repeat=5)
 ]
 
-# CORE_PROMPT before FEAT-007 (guide 16.5), pinned byte for byte: rules 1-5 and GIỚI HẠN must stay this text.
+# CORE_PROMPT before FEAT-007 (guide 16.5), pinned byte for byte: rules 1-5 and GIỚI HẠN must stay this text. ADR-050
+# changed one line on purpose: people talk with the bot in the panel, not in comments.
 OLD_CORE_PROMPT = """Bạn là nhân viên IT của Công ty TNHH Miyano Việt Nam, làm việc trên
 Helpdesk của erp.miyano.com.vn (ERPNext + Frappe Helpdesk). Công ty khoảng 10
 người, phân phối vật tư y tế cho bệnh viện và làm phần mềm quản lý y tế.
 
 Việc của bạn: đọc phiếu, chẩn đoán, và làm được gì thì làm. Mọi trao đổi đi qua
-comment trên phiếu — người dùng không phải học công cụ mới.
+ngăn "Trao đổi với bot" của phiếu — người dùng không phải học công cụ mới.
 
 CÁCH LÀM VIỆC
 
@@ -1085,6 +1086,26 @@ class TestProposeNow(FrappeTestCase):
 				)
 
 
+class TestApprovalInThePanel(FrappeTestCase):
+	"""ADR-050: the bot talks in the panel, and the one approval of its plan is the panel's button."""
+
+	def test_core_prompt_sends_people_to_the_panel(self):
+		self.assertIn('Mọi trao đổi đi qua\nngăn "Trao đổi với bot" của phiếu', prompts.CORE_PROMPT)
+		self.assertNotIn("Mọi trao đổi đi qua\ncomment trên phiếu", prompts.CORE_PROMPT)
+
+	def test_typed_ok_still_approves_no_proposal_but_the_button_message_is_an_order(self):
+		rule = prompts.NO_OK_APPROVAL
+		self.assertIn("không bao giờ là duyệt", rule)
+		self.assertIn("nút của nó", rule)
+		self.assertIn(f'"{prompts.APPROVE_GUIDANCE_TEXT}"', rule)
+
+	def test_approval_text_is_fixed(self):
+		self.assertEqual(
+			prompts.APPROVE_GUIDANCE_TEXT,
+			"Duyệt hướng xử lý: bot làm ngay các bước trong hướng xử lý gần nhất, đúng phạm vi đã nêu.",
+		)
+
+
 class TestOwnDecisionsBlock(FrappeTestCase):
 	"""ADR-019 Amendment 1 (43229): the bot chooses the open points itself and says how to approve, re-reads a record
 	after a system error, and corrects the complexity once it has looked; in every run that is not ask-only."""
@@ -1111,7 +1132,11 @@ class TestOwnDecisionsBlock(FrappeTestCase):
 			'không viết "cần người quyết định", "nhờ … kiểm tra", "chờ … thống nhất"',
 			'viết "Bot chọn …, vì …"',
 			"soạn sẵn phương án cụ thể (danh sách, giá trị, thứ tự) để họ duyệt",
-			'Câu cuối của "Hướng xử lý" nói rõ duyệt bằng cách nào và bot làm gì ngay sau khi được duyệt.',
+			# ADR-050: the plan is approved with one button of the panel, never by a comment
+			'Câu cuối của "Hướng xử lý": Bấm "Duyệt hướng xử lý" trong ngăn "Trao đổi với bot" thì bot làm ngay',
+			f'Tin "{prompts.APPROVE_GUIDANCE_TEXT}" của người ra lệnh (role "chỉ thị") là lệnh làm ngay',
+			"đúng các bước và phạm vi của Hướng xử lý gần nhất của bot",
+			"Không bảo người viết comment chỉ thị",
 			"đọc lại bản ghi để biết đã lưu chưa rồi mới báo",
 			"gọi set_classification với complexity và complexity_reason mới",
 			"1 thì làm xong trong lượt này; 2 thì làm hết phần tool làm được",

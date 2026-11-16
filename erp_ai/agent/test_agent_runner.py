@@ -191,8 +191,11 @@ class RunnerTestBase(FrappeTestCase):
 	def _run(self, trigger="ticket_insert"):
 		runner.run_for_ticket(self.ticket.name, trigger)
 
-	def _comment_count(self):
-		return frappe.db.count("Comment", authority.ticket_comment_filters(self.ticket.name))
+	def _said_count(self):
+		"""Everything said on the ticket: its comments and the bot's messages of its conversation, where ADR-050 moved
+		the bot's guidance, route sentences and notices."""
+		comments = frappe.db.count("Comment", authority.ticket_comment_filters(self.ticket.name))
+		return comments + frappe.db.count(MESSAGE_DOCTYPE, {"ticket": self.ticket.name, "owner": AGENT_USER})
 
 	def _seed_runs(self, count):
 		for index in range(count):
@@ -331,13 +334,13 @@ class TestRunner(RunnerTestBase):
 			},
 		)
 		before = frappe.db.get_value("HD Ticket", self.ticket.name, TICKET_FIELDS, as_dict=True)
-		comments_before = self._comment_count()
+		comments_before = self._said_count()
 		self.assertEqual(comments_before, 1)
 		self._run()
 
 		after = frappe.db.get_value("HD Ticket", self.ticket.name, TICKET_FIELDS, as_dict=True)
 		self.assertEqual(before, after)
-		self.assertEqual(self._comment_count(), comments_before)
+		self.assertEqual(self._said_count(), comments_before)
 		self.assertEqual(self.gateway.call_count, 1)
 		call = self.gateway.calls[0]
 		self.assertEqual(call["task"], "classify")
@@ -3867,6 +3870,20 @@ class TestTicketFields(RunnerTestBase):
 		self.log_error.assert_not_called()
 
 
+def said_on(ticket):
+	"""What was said on the ticket, oldest first: its comments and the bot's messages of its conversation, where ADR-050
+	moved the bot's guidance, route sentences and notices."""
+	rows = frappe.get_all(
+		"Comment", filters=authority.ticket_comment_filters(ticket), fields=["content", "creation", "name"]
+	)
+	rows += frappe.get_all(
+		MESSAGE_DOCTYPE,
+		filters={"ticket": ticket, "owner": AGENT_USER},
+		fields=["content", "creation", "name"],
+	)
+	return [row.content for row in sorted(rows, key=lambda row: (row.creation, row.name))]
+
+
 class TestRunNotices(RunnerTestBase):
 	"""AC-23, AC-61, AC-10 (T110, U4b.md:236-242, :250-251, U4b-fixes Fix 8): a status notice of the run is one comment
 	per kind and period, posted by post_notice, with one action entry on the row of the step that posted it."""
@@ -3889,11 +3906,12 @@ class TestRunNotices(RunnerTestBase):
 		self.addCleanup(log_error.stop)
 
 	def _notices(self, notice, ticket=None):
-		"""The ticket's comments of one notice kind, oldest first."""
+		"""The bot's messages of one notice kind on the ticket, oldest first (ADR-050)."""
 		return frappe.get_all(
-			"Comment",
+			MESSAGE_DOCTYPE,
 			filters={
-				**authority.ticket_comment_filters(ticket or self.ticket.name),
+				"ticket": ticket or self.ticket.name,
+				"owner": AGENT_USER,
 				"content": ["like", f"{write_ticket.NOTICE_PREFIXES[notice]}%"],
 			},
 			pluck="name",
@@ -3903,11 +3921,11 @@ class TestRunNotices(RunnerTestBase):
 	def _content(self, notice, body):
 		return f"{write_ticket.NOTICE_PREFIXES[notice]} {body}"
 
-	def _entry(self, comment, notice, instructor=None):
+	def _entry(self, message, notice, instructor=None):
 		return action_entry(
 			runner.NOTICE_TOOL,
-			"Comment",
-			comment,
+			MESSAGE_DOCTYPE,
+			message,
 			True,
 			value_after={"notice": notice},
 			instructor=instructor,
@@ -3922,13 +3940,13 @@ class TestRunNotices(RunnerTestBase):
 		self.assertEqual([e.stop_reason for e in self._entries(entry_type="skip")], ["daily_limit"] * 3)
 		(notice,) = self._notices("daily_limit")
 		self.assertEqual(
-			frappe.db.get_value("Comment", notice, "content"),
+			frappe.db.get_value(MESSAGE_DOCTYPE, notice, "content"),
 			self._content("daily_limit", runner.DAILY_LIMIT_BODY.format(limit=DAILY_LIMIT)),
 		)
 
 		# the notice of yesterday does not count for today (the mark is 00:00 of today, as runs_today's)
 		yesterday = frappe.utils.add_days(frappe.utils.now_datetime(), -1)
-		frappe.db.set_value("Comment", notice, "creation", yesterday, update_modified=False)
+		frappe.db.set_value(MESSAGE_DOCTYPE, notice, "creation", yesterday, update_modified=False)
 		self._run("comment_mention")
 		self.assertEqual(len(self._notices("daily_limit")), 2)
 
@@ -3954,7 +3972,7 @@ class TestRunNotices(RunnerTestBase):
 
 		(notice,) = self._notices("over_budget")
 		self.assertEqual(
-			frappe.db.get_value("Comment", notice, "content"),
+			frappe.db.get_value(MESSAGE_DOCTYPE, notice, "content"),
 			self._content("over_budget", runner.OVER_BUDGET_BODY),
 		)
 		first, second = self._entries(entry_type="reason")
@@ -3995,7 +4013,7 @@ class TestRunNotices(RunnerTestBase):
 
 		(first,) = self._notices("run_failed")
 		self.assertEqual(
-			frappe.db.get_value("Comment", first, "content"),
+			frappe.db.get_value(MESSAGE_DOCTYPE, first, "content"),
 			self._content("run_failed", runner.RUN_FAILED_BODY.format(cause=runner.CAUSE_TIME)),
 		)
 		failed = self._entries(entry_type="reason")
@@ -4010,17 +4028,17 @@ class TestRunNotices(RunnerTestBase):
 		notices = self._notices("run_failed")
 		self.assertEqual(len(notices), 2)
 		self.assertEqual(
-			frappe.db.get_value("Comment", notices[1], "content"),
+			frappe.db.get_value(MESSAGE_DOCTYPE, notices[1], "content"),
 			self._content("run_failed", runner.RUN_FAILED_BODY.format(cause=runner.CAUSE_GATEWAY)),
 		)
 
 	def test_gateway_error_at_l0_no_comment(self):
 		set_agent_settings(permission_level="L0")
-		before = self._comment_count()
+		before = self._said_count()
 		self.gateway.results = [GatewayError("server_error", status=500)]
 		self._run()
 
-		self.assertEqual(self._comment_count(), before)
+		self.assertEqual(self._said_count(), before)
 		(entry,) = self._entries(entry_type="classify")
 		self.assertFalse(entry.actions)
 
@@ -4041,19 +4059,19 @@ class TestRunNotices(RunnerTestBase):
 		self.assertEqual(set(runner.NOTICE_TRIGGERS), {"over_budget", "run_failed", "ask_fallback"})
 		frappe.set_user(AGENT_USER)
 		since = datetime(2000, 1, 1)
-		before = self._comment_count()
+		before = self._said_count()
 		for notice in runner.NOTICE_TRIGGERS:
 			with self.subTest(notice):
 				self.assertIsNone(
 					runner._notice(self.ticket.name, notice, f"{PREFIX}x", since, trigger="x_unlisted")
 				)
-		self.assertEqual(self._comment_count(), before)
+		self.assertEqual(self._said_count(), before)
 
 		# daily_limit is not in the table: it holds for every trigger that reaches step (d)
 		entry = runner._notice(self.ticket.name, "daily_limit", f"{PREFIX}x", since, trigger="x_unlisted")
 		(notice,) = self._notices("daily_limit")
 		self.assertEqual(entry, self._entry(notice, "daily_limit"))
-		self.assertEqual(self._comment_count(), before + 1)
+		self.assertEqual(self._said_count(), before + 1)
 
 	def test_requester_reply_gets_listed_notices(self):
 		# T163, E-2 (w1b-r2.md:76): the requester-reply run is in the three cells, the knowledge-draft run in none
@@ -4088,21 +4106,21 @@ class TestRunNotices(RunnerTestBase):
 			self.month_spend.return_value = 2000.0
 			ticket = reply_run("over_budget", [make_model_result()])
 			self.assertEqual(len(self._notices("over_budget", ticket)), 1)
-			self.assertEqual(frappe.db.count("Comment", authority.ticket_comment_filters(ticket)), 1)
+			self.assertEqual(len(said_on(ticket)), 1)
 
 		with self.subTest("gateway error"):
 			set_agent_settings(permission_level="L1")
 			self.month_spend.return_value = 0.0
 			ticket = reply_run("run_failed", [GatewayError("server_error", status=500)])
 			self.assertEqual(len(self._notices("run_failed", ticket)), 1)
-			self.assertEqual(frappe.db.count("Comment", authority.ticket_comment_filters(ticket)), 1)
+			self.assertEqual(len(said_on(ticket)), 1)
 
 		with self.subTest("below the threshold, the model asks nothing"):
 			set_agent_settings(permission_level="L1", level_cap_a="L1", act_now_enabled=0)
 			self.latest_classification.side_effect = self.real_latest_classification
 			ticket = reply_run("ask_fallback", [classify_at(69), make_model_result()])
 			self.assertEqual(len(self._notices("ask_fallback", ticket)), 1)
-			self.assertEqual(frappe.db.count("Comment", authority.ticket_comment_filters(ticket)), 1)
+			self.assertEqual(len(said_on(ticket)), 1)
 
 	def test_each_notice_has_one_action_entry(self):
 		self._seed_runs(DAILY_LIMIT)
@@ -4126,9 +4144,7 @@ class TestRunNotices(RunnerTestBase):
 		self.addCleanup(sla.stop)
 
 		def comments_of(ticket):
-			return frappe.get_all(
-				"Comment", filters=authority.ticket_comment_filters(ticket), pluck="content"
-			)
+			return said_on(ticket)
 
 		cases = (
 			("route succeeded", {}, None, "ticket_insert", [classify_at(90), make_model_result()], 1),
@@ -4230,8 +4246,8 @@ class TestRunNotices(RunnerTestBase):
 		((done,),) = routed
 		(notice,) = self._notices("run_failed")
 		self.assertEqual(
-			frappe.db.get_value("Comment", notice, "content"),
-			self._failure_body(write_ticket.FAILURE_DONE + escape_html(done)),
+			frappe.db.get_value(MESSAGE_DOCTYPE, notice, "content"),
+			self._failure_body(write_ticket.FAILURE_DONE + done),
 		)
 		self.assertEqual(write_ticket.count_guidance(self.ticket.name), 0)
 		(failed,) = self._entries(entry_type="reason")
@@ -4245,8 +4261,8 @@ class TestRunNotices(RunnerTestBase):
 
 		self.gateway.on_call = collect
 
-	def test_failure_suffix_html_escaped_once(self):
-		# AD3-4: a collected line reaches the notice escaped exactly once
+	def test_failure_suffix_as_written(self):
+		# AD3-4, ADR-050: the notice is a plain-text message; a collected line reaches it as written, once
 		self._no_lag_sla()
 		run_id = f"{PREFIX}failed-{frappe.generate_hash(length=10)}"
 		fixed = MagicMock()
@@ -4258,10 +4274,9 @@ class TestRunNotices(RunnerTestBase):
 			self._run()
 
 		(notice,) = self._notices("run_failed")
-		content = frappe.db.get_value("Comment", notice, "content")
-		self.assertEqual(content.count(escape_html(raw)), 1)
-		self.assertNotIn(raw, content)
-		self.assertNotIn("&amp;lt;", content)
+		content = frappe.db.get_value(MESSAGE_DOCTYPE, notice, "content")
+		self.assertEqual(content.count(raw), 1)
+		self.assertNotIn(escape_html(raw), content)
 
 	def test_deduplicated_failure_notice_logs_dropped_lines(self):
 		# w1.md:70: a notice refused as already sent leaves the run's lines in one logger line, as a count only
@@ -4315,13 +4330,13 @@ class TestRunNotices(RunnerTestBase):
 		(proposal,) = frappe.get_all(PROPOSAL_DOCTYPE, filters={"ticket": self.ticket.name}, pluck="name")
 		pending = propose_change.pending_line(frappe.get_doc(PROPOSAL_DOCTYPE, proposal))
 		(notice,) = self._notices("run_failed")
-		content = frappe.db.get_value("Comment", notice, "content")
+		content = frappe.db.get_value(MESSAGE_DOCTYPE, notice, "content")
 		self.assertEqual(
 			content,
 			self._failure_body(
-				write_ticket.FAILURE_DONE + escape_html(done),
-				write_ticket.FAILURE_PENDING + escape_html(pending),
-				write_ticket.FAILURE_MANUAL + escape_html(manual),
+				write_ticket.FAILURE_DONE + done,
+				write_ticket.FAILURE_PENDING + pending,
+				write_ticket.FAILURE_MANUAL + manual,
 			),
 		)
 		self.assertNotIn(write_ticket.GUIDANCE_MARKER, content)
@@ -4355,11 +4370,7 @@ class TestRunNotices(RunnerTestBase):
 			replace=["x = 2"],
 			reason="r",
 		)
-		before = set(
-			frappe.get_all(
-				"Comment", filters=authority.ticket_comment_filters(self.ticket.name), pluck="name"
-			)
-		)
+		before = set(said_on(self.ticket.name))
 		self.gateway.results = [
 			classify_c(),
 			tool_turn(propose, analysis_call("t_analysis")),
@@ -4370,14 +4381,8 @@ class TestRunNotices(RunnerTestBase):
 
 		(task,) = frappe.get_all("Task", filters={"ai_ticket": self.ticket.name}, pluck="name")
 		(proposal,) = frappe.get_all(PROPOSAL_DOCTYPE, filters={"ticket": self.ticket.name}, pluck="name")
-		new = frappe.get_all(
-			"Comment",
-			filters={
-				**authority.ticket_comment_filters(self.ticket.name),
-				"name": ["not in", list(before) or [""]],
-			},
-			pluck="content",
-		)
+		# ADR-050: the guidance is a message, the proposal's own note (AC-33) a comment
+		new = [content for content in said_on(self.ticket.name) if content not in before]
 		self.assertEqual(len(new), 2)
 		routed = escape_html(runner.ROUTE_TASK.format(task=task))
 		(guidance,) = [content for content in new if routed in content]
@@ -4425,18 +4430,18 @@ class TestAskOnly(RunnerTestBase):
 	def _fallbacks(self, ticket=None):
 		prefix = write_ticket.NOTICE_PREFIXES["ask_fallback"]
 		return frappe.get_all(
-			"Comment",
+			MESSAGE_DOCTYPE,
 			filters={
-				**authority.ticket_comment_filters(ticket or self.ticket.name),
+				"ticket": ticket or self.ticket.name,
+				"owner": AGENT_USER,
 				"content": ["like", f"{prefix}%"],
 			},
 			pluck="name",
 		)
 
 	def _comments(self, ticket=None):
-		return frappe.get_all(
-			"Comment", filters=authority.ticket_comment_filters(ticket or self.ticket.name), pluck="content"
-		)
+		"""What the run said on the ticket: its comments and the bot's messages, oldest first (ADR-050)."""
+		return said_on(ticket or self.ticket.name)
 
 	def _fallback_text(self, pct, threshold=policy.DEFAULT_CONFIDENCE_THRESHOLD):
 		footer = write_ticket.ASK_FOOTER.format(pct=f"{pct}%", threshold=threshold)
@@ -4491,7 +4496,7 @@ class TestAskOnly(RunnerTestBase):
 			[
 				action_entry(
 					runner.NOTICE_TOOL,
-					"Comment",
+					MESSAGE_DOCTYPE,
 					fallback,
 					True,
 					value_after={"notice": "ask_fallback"},
@@ -4514,7 +4519,7 @@ class TestAskOnly(RunnerTestBase):
 			MESSAGE_DOCTYPE, filters={"ticket": self.ticket.name, "owner": AGENT_USER}, pluck="content"
 		)
 		self.assertTrue(posted.startswith(question))
-		self.assertEqual(self._comments(), [])
+		self.assertEqual(self._comments(), [posted])
 		self.assertEqual(self._fallbacks(), [])
 		results = {
 			block["tool_use_id"]: json.loads(block["content"])
@@ -4685,24 +4690,23 @@ class GuidanceTestBase(RunnerTestBase):
 
 	def _guidance_content(self, ticket=None):
 		(content,) = frappe.get_all(
-			"Comment", filters=write_ticket.guidance_filters(ticket or self.ticket.name), pluck="content"
+			MESSAGE_DOCTYPE,
+			filters=write_ticket.guidance_filters(ticket or self.ticket.name),
+			pluck="content",
 		)
 		return content
 
 	def _new_comments(self, before, ticket=None):
-		"""The ticket's comments made after `before` (a set of names), as {name: content}."""
+		"""What was said on the ticket after `before` (a set of names), as {name: content}: since ADR-050 the bot says
+		everything in the ticket's conversation, so these are its messages."""
 		rows = frappe.get_all(
-			"Comment",
-			filters=authority.ticket_comment_filters(ticket or self.ticket.name),
-			fields=["name", "content"],
+			MESSAGE_DOCTYPE, filters={"ticket": ticket or self.ticket.name}, fields=["name", "content"]
 		)
 		return {row.name: row.content for row in rows if row.name not in before}
 
 	def _comment_names(self, ticket=None):
 		return set(
-			frappe.get_all(
-				"Comment", filters=authority.ticket_comment_filters(ticket or self.ticket.name), pluck="name"
-			)
+			frappe.get_all(MESSAGE_DOCTYPE, filters={"ticket": ticket or self.ticket.name}, pluck="name")
 		)
 
 	def _tool_results(self, call_index):
@@ -4719,16 +4723,16 @@ class GuidanceTestBase(RunnerTestBase):
 		return run_id, patch.object(runner, "uuid", fixed)
 
 	def _guidance_by_hand(self, ticket=None):
-		"""A guidance comment an earlier run posted: the agent account's, the marker on line 1."""
+		"""A guidance an earlier run said: the agent account's message, the marker on line 1 (ADR-050)."""
 		frappe.set_user(AGENT_USER)
 		try:
-			posted = write_ticket._post(
+			posted = write_ticket._say(
 				ticket or self.ticket.name, f"{write_ticket.GUIDANCE_MARKER}\n{PREFIX}hướng"
 			)
 		finally:
 			frappe.set_user("Administrator")
 		self.assertTrue(posted["ok"])
-		return posted["comment"]
+		return posted["message"]
 
 	def _guidance_log_lines(self, logger):
 		return [call.args for call in logger.info.call_args_list if GUIDANCE_EXISTS_LOG in str(call.args[0])]
@@ -4784,13 +4788,13 @@ class TestOneGuidance(GuidanceTestBase):
 	def test_ai_after_guidance_no_work_no_comment_one_log_line(self):
 		# AC-65 (c), T115: the ticket already has its guidance; an @ai with nothing to do posts nothing, one log line
 		self._guidance_by_hand()
-		before = self._comment_count()
+		before = self._said_count()
 		self.gateway.results = [make_model_result()]
 		logger = MagicMock()
 		with patch.object(frappe, "logger", return_value=logger):
 			self._run("comment_mention")
 
-		self.assertEqual(self._comment_count(), before)
+		self.assertEqual(self._said_count(), before)
 		self.assertEqual(self._guidance(), 1)
 		(line,) = self._guidance_log_lines(logger)
 		(entry,) = self._entries(entry_type="reason")
@@ -4834,7 +4838,7 @@ class TestOneGuidance(GuidanceTestBase):
 		self.gateway.results = [classify_at(90), tool_turn(analysis_call("t0")), make_model_result()]
 		self._run()
 		self.assertEqual(self._guidance(), 1)
-		comments = self._comment_count()
+		comments = self._said_count()
 		logger = MagicMock()
 		with patch.object(frappe, "logger", return_value=logger):
 			for index in range(1, 4):
@@ -4847,7 +4851,7 @@ class TestOneGuidance(GuidanceTestBase):
 				)
 
 		self.assertEqual(self._guidance(), 1)
-		self.assertEqual(self._comment_count(), comments)
+		self.assertEqual(self._said_count(), comments)
 		self.assertEqual(len(self._guidance_log_lines(logger)), 3)
 
 	def test_chain_7_ai_after_guidance_creates_task_no_new_guidance(self):
@@ -4874,11 +4878,9 @@ class TestOneGuidance(GuidanceTestBase):
 
 		self.assertEqual(frappe.db.count("Task", {"ai_ticket": self.ticket.name}), 1)
 		# CHG-003: a run a message started reports in the conversation: one message, the model's report as written,
-		# without the marker, and no new ticket comment; still one guidance
-		self.assertEqual(
-			frappe.get_all(MESSAGE_DOCTYPE, filters={"ticket": self.ticket.name}, pluck="content"), [report]
-		)
-		self.assertEqual(self._new_comments(before), {})
+		# without the marker, and no ticket comment (ADR-050: the guidance is a message too); still one guidance
+		self.assertEqual(list(self._new_comments(before).values()), [report])
+		self.assertEqual(frappe.db.count("Comment", authority.ticket_comment_filters(self.ticket.name)), 0)
 		self.assertEqual(self._guidance(), 1)
 
 	def test_chain_8_level_l0_or_excluded_team_zero(self):
@@ -5006,15 +5008,15 @@ class TestOneGuidance(GuidanceTestBase):
 		self.assertEqual(last.stop_reason, runner.STOP_MAX_TURNS)
 		self.assertEqual([a["tool"] for a in json.loads(last.actions)], [runner.GUIDANCE_TOOL])
 
-	def test_lost_race_posts_result_comment_escaped_once(self):
-		# w1.md:105, AD3-4: a run in parallel posted the guidance first; this run reports its lines as before, in one
-		# comment without the marker, each line escaped once, no section heading
+	def test_lost_race_posts_result_message_as_written(self):
+		# w1.md:105, AD3-4, ADR-050: a run in parallel posted the guidance first; this run reports its lines as before,
+		# in one message without the marker, each line as written (the panel shows text only), no section heading
 		run_id, fixed = self._fixed_run_id()
 		raw = f"{PREFIX}<b>&x"
 
 		def rival_then_line(task, kwargs):
 			if task == "reason":
-				write_ticket._post(
+				write_ticket._say(
 					self.ticket.name, f"{write_ticket.GUIDANCE_MARKER}\n{PREFIX}hướng của lần kia"
 				)
 				write_ticket.collect(run_id, write_ticket.SECTION_DONE, raw)
@@ -5028,16 +5030,17 @@ class TestOneGuidance(GuidanceTestBase):
 
 		self.assertEqual(self._guidance(), 1)
 		(result,) = [text for text in self._new_comments(before).values() if not text.startswith("<!--")]
-		self.assertEqual(result.count(escape_html(raw)), 1)
-		self.assertNotIn(raw, result)
-		self.assertNotIn("&amp;lt;", result)
+		self.assertEqual(result.count(raw), 1)
+		self.assertNotIn(escape_html(raw), result)
 		self.assertNotIn("<strong>", result)
 		self.assertNotIn(write_ticket.GUIDANCE_MARKER, result)
-		self.assertTrue(result.endswith(escape_html(raw)))
+		self.assertTrue(result.endswith(raw))
 		self.assertEqual(len(self._guidance_log_lines(logger)), 1)
 		(last,) = self._entries(entry_type="reason")
 		(posted,) = json.loads(last.actions)
-		self.assertEqual((posted["tool"], posted["ok"]), ("post_routing_comment", True))
+		self.assertEqual(
+			(posted["tool"], posted["ok"], posted["doctype"]), ("post_routing_comment", True, MESSAGE_DOCTYPE)
+		)
 
 	# T113: the run after a question below the threshold classifies again (ADR-037 QĐ 1-3)
 
@@ -5061,9 +5064,9 @@ class TestOneGuidance(GuidanceTestBase):
 		self.assertEqual([call["task"] for call in self.gateway.calls], ["classify", "reason"])
 		self.assertEqual(self._guidance(), 1)
 		questions = frappe.get_all(
-			"Comment",
+			MESSAGE_DOCTYPE,
 			filters={
-				**authority.ticket_comment_filters(self.ticket.name),
+				"ticket": self.ticket.name,
 				"content": ["like", f"{write_ticket.NOTICE_PREFIXES['ask_fallback']}%"],
 			},
 		)
@@ -5086,9 +5089,9 @@ class TestOneGuidance(GuidanceTestBase):
 
 		self.assertEqual(self._guidance(), 0)
 		(notice,) = frappe.get_all(
-			"Comment",
+			MESSAGE_DOCTYPE,
 			filters={
-				**authority.ticket_comment_filters(self.ticket.name),
+				"ticket": self.ticket.name,
 				"content": ["like", f"{write_ticket.NOTICE_PREFIXES['run_failed']}%"],
 			},
 			pluck="content",
@@ -5109,7 +5112,7 @@ class TestOneGuidance(GuidanceTestBase):
 		self.gateway.results = [classify_at(90), tool_turn(analysis_call("t1")), make_model_result()]
 		self._run()
 		self.assertEqual(self._guidance(), 1)
-		comments = self._comment_count()
+		comments = self._said_count()
 		set_agent_settings(agent_enabled_at=frappe.utils.add_days(frappe.utils.now_datetime(), -1))
 		queued = []
 		with patch.object(
@@ -5121,7 +5124,7 @@ class TestOneGuidance(GuidanceTestBase):
 		self.gateway.results = [classify_at(90), tool_turn(analysis_call("t2")), make_model_result()]
 		self._run()
 		self.assertEqual(self._guidance(), 1)
-		self.assertEqual(self._comment_count(), comments)
+		self.assertEqual(self._said_count(), comments)
 
 	def test_chain_6_guidance_then_approve_one_guidance_one_result(self):
 		# AC-65 chain 6, AC-23 (1): the proposal waits in "Chờ duyệt"; approved, its job writes one result line
@@ -5160,11 +5163,9 @@ class TestOneGuidance(GuidanceTestBase):
 		self.assertEqual(_info_comments(self.ticket.name), [])
 
 
-class TestGuidanceReplyInConversation(GuidanceTestBase):
-	"""CHG-003 Amendment 3: a run a message started whose answer the guidance comment took still answers in the
-	conversation, in its last turn, with its own action entry; a run nothing typed started writes no message."""
-
-	FINDING = f"{PREFIX}máy in của kho chưa được cấu hình."
+class TestGuidanceInConversation(GuidanceTestBase):
+	"""ADR-050: the guidance of every run is one message of the bot in the ticket's conversation, with its action
+	entry; no ticket comment, and no second answer after it."""
 
 	def _bot_messages(self):
 		return frappe.get_all(
@@ -5174,34 +5175,41 @@ class TestGuidanceReplyInConversation(GuidanceTestBase):
 			order_by="creation asc",
 		)
 
-	def test_message_run_answer_held_for_guidance_gets_a_message_too(self):
+	def _bot_comments(self):
+		return frappe.get_all(
+			"Comment",
+			filters={**authority.ticket_comment_filters(self.ticket.name), "owner": AGENT_USER},
+			pluck="name",
+		)
+
+	def test_insert_run_guidance_is_a_message_with_its_entry(self):
 		run_id, fixed = self._fixed_run_id()
-		self.gateway.results = [tool_turn(analysis_call("t_analysis")), make_model_result()]
+		self.gateway.results = [classify_at(90), tool_turn(analysis_call("t_analysis")), make_model_result()]
 		with fixed:
-			self._run("comment_mention")
+			self._run()
 
 		self.assertEqual(self._guidance(), 1)
 		(row,) = self._bot_messages()
-		self.assertEqual(
-			(row.content, row.run_id), (f"Nhận định: {self.FINDING}\n\n{write_ticket.GUIDANCE_REPLY}", run_id)
-		)
+		self.assertEqual(row.run_id, run_id)
+		self.assertIsNotNone(write_ticket.guidance_text(row.content))
+		self.assertEqual(self._bot_comments(), [])
 		actions = json.loads(self._entries(entry_type="reason")[-1].actions)
-		self.assertEqual([a["tool"] for a in actions], [runner.GUIDANCE_TOOL, runner.GUIDANCE_REPLY_TOOL])
-		instructor = authority.run_instructor(self.ticket.name, "comment_mention")
+		(guidance,) = [a for a in actions if a["tool"] == runner.GUIDANCE_TOOL]
 		self.assertEqual(
-			actions[-1],
-			action_entry(runner.GUIDANCE_REPLY_TOOL, MESSAGE_DOCTYPE, row.name, True, instructor=instructor),
+			(guidance["doctype"], guidance["name"], guidance["ok"]), (MESSAGE_DOCTYPE, row.name, True)
 		)
 
-	def test_insert_run_writes_no_message(self):
-		self.gateway.results = [classify_at(90), tool_turn(analysis_call("t_analysis")), make_model_result()]
-		self._run()
+	def test_message_run_says_its_guidance_once(self):
+		self.gateway.results = [tool_turn(analysis_call("t_analysis")), make_model_result()]
+		self._run("comment_mention")
 
 		self.assertEqual(self._guidance(), 1)
-		self.assertEqual(self._bot_messages(), [])
+		self.assertEqual(len(self._bot_messages()), 1)
+		actions = json.loads(self._entries(entry_type="reason")[-1].actions)
+		self.assertEqual([a["tool"] for a in actions], [runner.GUIDANCE_TOOL])
 
-	def test_last_turn_log_failure_leaves_no_reply(self):
-		# the reply is a write of the last turn, as the guidance comment: its entry failing undoes both
+	def test_last_turn_log_failure_leaves_no_message(self):
+		# the guidance is a write of the last turn: its entry failing undoes it
 		self.gateway.results = [tool_turn(analysis_call("t1")), make_model_result()]
 		real_write_entry = runner.write_entry
 
@@ -5342,9 +5350,7 @@ class TestReclassify(RunnerTestBase):
 		self.assertEqual(self._tasks(), ["classify", "reason"])
 		route.assert_not_called()
 		self.assertEqual(write_ticket.count_guidance(self.ticket.name), 0)
-		(question,) = frappe.get_all(
-			"Comment", filters=authority.ticket_comment_filters(self.ticket.name), pluck="content"
-		)
+		(question,) = said_on(self.ticket.name)
 		self.assertTrue(question.startswith(write_ticket.NOTICE_PREFIXES["ask_fallback"]))
 		(seed, again) = self._entries(entry_type="classify")
 		self.assertEqual((again.predicted_confidence_pct, again.applied), (69, 0))
@@ -5595,7 +5601,7 @@ class TestExcludedByClassification(RunnerTestBase):
 		for seed in seeds:
 			self.ticket.new_comment(f"{PREFIX}comment {seed}")
 		before = self._ticket_row()
-		comments = self._comment_count()
+		comments = self._said_count()
 		self.gateway.results = [classify_department(EXCLUDED_DEPARTMENT), make_model_result()]
 		self._run()
 
@@ -5604,7 +5610,7 @@ class TestExcludedByClassification(RunnerTestBase):
 		self.assertEqual([payload.count(seed) for seed in seeds], [0, 0, 0])
 		self.assertEqual(self._ticket_row(), before)
 		# no guidance, route or notice comment, no Task, no reasoning step
-		self.assertEqual(self._comment_count(), comments)
+		self.assertEqual(self._said_count(), comments)
 		self.assertEqual(write_ticket.count_guidance(self.ticket.name), 0)
 		self.assertEqual(self._task_count(), 0)
 		self.assertEqual(self._entries(entry_type="reason"), [])
@@ -5628,7 +5634,7 @@ class TestExcludedByClassification(RunnerTestBase):
 
 	def test_department_named_as_excluded_team(self):
 		# not in the department table, so decide_route asks nothing: the department itself names an excluded team
-		comments = self._comment_count()
+		comments = self._said_count()
 		self.gateway.results = [
 			classify_department(f"  {self.excluded_team.upper()} "),
 			make_model_result(),
@@ -5637,12 +5643,12 @@ class TestExcludedByClassification(RunnerTestBase):
 
 		self.assertEqual(self._tasks(), ["classify"])
 		self._assert_stopped(self._entries(entry_type="classify")[0])
-		self.assertEqual(self._comment_count(), comments)
+		self.assertEqual(self._said_count(), comments)
 		self.assertEqual(self._entries(entry_type="reason"), [])
 
 	def test_excluded_wins_over_low_confidence(self):
 		# the U2 gate comes before the below-threshold gate of U1: no question is asked either
-		comments = self._comment_count()
+		comments = self._said_count()
 		self.gateway.results = [classify_department(EXCLUDED_DEPARTMENT, pct=10), make_model_result()]
 		self._run()
 
@@ -5650,7 +5656,7 @@ class TestExcludedByClassification(RunnerTestBase):
 		(entry,) = self._entries(entry_type="classify")
 		self._assert_stopped(entry)
 		self.assertEqual(entry.predicted_confidence_pct, 10)
-		self.assertEqual(self._comment_count(), comments)
+		self.assertEqual(self._said_count(), comments)
 		self.assertEqual(self._entries(entry_type="reason"), [])
 
 	def test_l0_still_records_exclusion(self):
@@ -5677,7 +5683,7 @@ class TestExcludedByClassification(RunnerTestBase):
 		for index, text in enumerate(later):
 			at = frappe.utils.add_to_date(first.creation, seconds=index + 1)
 			(self._reply_at if index % 2 else self._comment_at)(text, at)
-		comments = self._comment_count()
+		comments = self._said_count()
 		before = self._ticket_row()
 		run_id = f"{PREFIX}reclassify-{frappe.generate_hash(length=10)}"
 		fixed = MagicMock()
@@ -5698,7 +5704,7 @@ class TestExcludedByClassification(RunnerTestBase):
 		self.assertEqual(again.run_id, run_id)
 		self._assert_stopped(again)
 		self.assertEqual(write_ticket.count_guidance(self.ticket.name), 0)
-		self.assertEqual(self._comment_count(), comments)
+		self.assertEqual(self._said_count(), comments)
 		self.assertEqual(self._task_count(), 0)
 		self.assertEqual(self._ticket_row(), before)
 		self.assertEqual(self._entries(entry_type="reason", run_id=run_id), [])
@@ -6089,7 +6095,7 @@ class TestRequesterReplyRun(RequesterReplyRunBase):
 		)
 		# one question (the email), no ask_fallback comment, no guidance
 		self.assertEqual(len(sent), 1)
-		self.assertEqual(self._comment_count(), 0)
+		self.assertEqual(self._said_count(), 0)
 		self.assertEqual(self._guidance(), 0)
 
 		answer = f"{PREFIX}in phiếu xuất PX-01 ở kho 2"
@@ -6154,8 +6160,8 @@ class TestKnowledgeActions(RequesterReplyRunBase):
 	def _fallbacks(self):
 		prefix = write_ticket.NOTICE_PREFIXES["ask_fallback"]
 		return frappe.get_all(
-			"Comment",
-			filters={**authority.ticket_comment_filters(self.ticket.name), "content": ["like", f"{prefix}%"]},
+			MESSAGE_DOCTYPE,
+			filters={"ticket": self.ticket.name, "owner": AGENT_USER, "content": ["like", f"{prefix}%"]},
 			pluck="name",
 		)
 
@@ -6204,7 +6210,7 @@ class TestKnowledgeActions(RequesterReplyRunBase):
 
 		self.assertEqual(len(self._sent()), 1)
 		self.assertEqual(self._fallbacks(), [])
-		self.assertEqual(self._comment_count(), 0)
+		self.assertEqual(self._said_count(), 0)
 
 	def test_comment_question_then_email_question_refused(self):
 		# the comment question came first in the run: the emailed one is refused, nothing is sent
@@ -6367,9 +6373,11 @@ class TestKbDraftRun(GuidanceTestBase):
 	def test_no_notice_comments_on_kb_draft(self):
 		# U6b-fixes Sửa 9, E-2: no NOTICE_TRIGGERS cell has kb_draft, so a closed ticket hears nothing from this run
 		def agent_comments(ticket):
-			return frappe.db.count(
+			# ADR-050: a notice would be a message of the conversation
+			comments = frappe.db.count(
 				"Comment", {"reference_doctype": "HD Ticket", "reference_name": ticket, "owner": AGENT_USER}
 			)
+			return comments + frappe.db.count(MESSAGE_DOCTYPE, {"ticket": ticket, "owner": AGENT_USER})
 
 		with self.subTest("over budget, base level L3"):
 			set_agent_settings(permission_level="L3")

@@ -4,7 +4,12 @@ import frappe
 from frappe.tests.utils import FrappeTestCase
 
 from erp_ai.agent import queue, runner
-from erp_ai.constants import TRIGGER_COMMENT_MENTION, TRIGGER_TICKET_INSERT
+from erp_ai.constants import (
+	TRIGGER_COMMENT_MENTION,
+	TRIGGER_KB_DRAFT,
+	TRIGGER_REQUESTER_REPLY,
+	TRIGGER_TICKET_INSERT,
+)
 
 RUN_FOR_TICKET_PATH = "erp_ai.agent.runner.run_for_ticket"
 
@@ -99,6 +104,64 @@ class TestEnqueueAgentRun(FrappeTestCase):
 			with self.assertRaises(ValueError):
 				queue.enqueue_agent_run("TKT-1", "bogus")
 		enqueue.assert_not_called()
+
+	def test_requester_reply_requires_communication_name(self):
+		# U6b-fixes Sửa 1: the requester-reply job is keyed by its Communication, so the name is required.
+		for kwargs in (
+			{},
+			{"communication_name": None},
+			{"communication_name": ""},
+			{"communication_name": 17},
+		):
+			with self.subTest(kwargs=kwargs), patch("frappe.enqueue") as enqueue:
+				with self.assertRaisesRegex(ValueError, "communication_name"):
+					queue.enqueue_agent_run("TKT-1", TRIGGER_REQUESTER_REPLY, **kwargs)
+				enqueue.assert_not_called()
+		self.assertFalse(frappe.flags.get("erp_ai_pending_job_ids"))
+
+	def test_communication_name_rejected_for_other_triggers(self):
+		for trigger, kwargs in (
+			(TRIGGER_TICKET_INSERT, {}),
+			(TRIGGER_COMMENT_MENTION, {"comment_name": "COMMENT-1"}),
+			(TRIGGER_KB_DRAFT, {}),
+		):
+			with self.subTest(trigger=trigger), patch("frappe.enqueue") as enqueue:
+				with self.assertRaisesRegex(ValueError, "communication_name"):
+					queue.enqueue_agent_run("TKT-1", trigger, communication_name="COMM-1", **kwargs)
+				enqueue.assert_not_called()
+		self.assertFalse(frappe.flags.get("erp_ai_pending_job_ids"))
+
+	def test_requester_reply_job_id_per_communication(self):
+		# U6b-fixes Sửa 1 (X-1): M2 arriving while M1's job waits or runs gets its own job, not merged away.
+		self.assertEqual(queue.requester_reply_key("TKT-1", "COMM-1"), "requester_reply:TKT-1:COMM-1")
+		with patch("frappe.enqueue") as enqueue:
+			self.assertTrue(
+				queue.enqueue_agent_run("TKT-1", TRIGGER_REQUESTER_REPLY, communication_name="COMM-1")
+			)
+			self.assertTrue(
+				queue.enqueue_agent_run("TKT-1", TRIGGER_REQUESTER_REPLY, communication_name="COMM-2")
+			)
+			# The same message twice in one transaction stays one job.
+			self.assertFalse(
+				queue.enqueue_agent_run("TKT-1", TRIGGER_REQUESTER_REPLY, communication_name="COMM-1")
+			)
+			self.assertTrue(queue.enqueue_agent_run("TKT-1", TRIGGER_TICKET_INSERT))
+
+		job_ids = [call.kwargs["job_id"] for call in enqueue.call_args_list]
+		self.assertEqual(
+			job_ids,
+			[
+				"erp_ai::TKT-1::requester_reply::COMM-1",
+				"erp_ai::TKT-1::requester_reply::COMM-2",
+				"erp_ai::TKT-1::ticket_insert",
+			],
+		)
+		self.assertEqual(
+			[call.kwargs.get("communication_name") for call in enqueue.call_args_list],
+			["COMM-1", "COMM-2", None],
+		)
+		self.assertEqual({call.args[0] for call in enqueue.call_args_list}, {RUN_FOR_TICKET_PATH})
+		self.assertTrue(all(call.kwargs["deduplicate"] for call in enqueue.call_args_list))
 
 	def test_runner_enqueue_unchanged(self):
 		with patch("frappe.enqueue") as enqueue:

@@ -2,6 +2,7 @@ import frappe
 from frappe.utils import get_fullname
 
 from erp_ai.agent import authority, policy, prompts, site_facts
+from erp_ai.agent.labels import parse_tags
 from erp_ai.agent.tools.registry import ToolContext, ToolSpec
 from erp_ai.constants import AGENT_USER
 
@@ -152,7 +153,7 @@ def search_resolved_tickets(args: dict, ctx: ToolContext) -> dict:
 			or_filters=[
 				[field, "like", _like_pattern(word)] for word in sorted(words) for field in SEARCH_FIELDS
 			],
-			fields=[*SEARCH_RESULT_FIELDS, "description", "modified"],
+			fields=[*SEARCH_RESULT_FIELDS, "description", "modified", "_user_tags"],
 			order_by="modified desc",
 			limit_page_length=SEARCH_SCAN_MAX,
 		)
@@ -172,6 +173,8 @@ def search_resolved_tickets(args: dict, ctx: ToolContext) -> dict:
 	for _score, _modified, row in ranked[:limit]:
 		ticket = {field: row.get(field) for field in SEARCH_RESULT_FIELDS}
 		ticket["resolution_details"] = _clean(row.resolution_details, RESOLUTION_MAX_CHARS)
+		# ADR-049: the ticket's labels, Helpdesk's own tag left out
+		ticket["labels"] = parse_tags(row._user_tags)
 		if not ticket["resolution_details"]:
 			ticket["resolver_comments"] = _resolver_comments(row.name)
 		tickets.append(ticket)

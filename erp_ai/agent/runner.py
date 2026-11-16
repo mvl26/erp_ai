@@ -10,6 +10,7 @@ from frappe.utils import escape_html, get_fullname, getdate, now_datetime, strip
 
 from erp_ai import gateway
 from erp_ai.agent import authority, lifecycle, policy, queue, site_facts
+from erp_ai.agent import labels as ticket_labels
 from erp_ai.agent.answer_delay import AnswerDelay
 from erp_ai.agent.authority import TITLE_WRONG_USER as TITLE_WRONG_USER  # re-export, U1.md:264
 from erp_ai.agent.classification import load_mapping, parse_classification, split_request_comment
@@ -38,6 +39,7 @@ from erp_ai.agent.tools.route_ticket import (
 	REASON_TASK_NOT_ASSIGNED,
 	TASK_REQUEST,
 	TaskSharingDisabled,
+	add_labels,
 	apply_route,
 	assign_owner,
 	create_routed_task,
@@ -160,6 +162,9 @@ ROUTE_NO_CHANGE = "Bot đã phân loại phiếu, các trường đã đúng nê
 ROUTE_ASSIGNED = "Đã gán cho {person}."
 ROUTE_TASK = "Đã tạo Task {task}."
 ROUTE_WATCHER = "Đã thêm {person} làm người theo dõi."
+# ADR-049: the labels the route gave the ticket (Helpdesk Tags)
+LABELS_TOOL = "add_labels"
+ROUTE_LABELS = "Bot đã gắn nhãn: {labels}."
 # (u5) the D watcher (AC-27, U4b-fixes Fix 6)
 WATCHER_TOOL = "add_watcher"
 REASON_ALREADY_FOLLOWING = "đã theo dõi"
@@ -799,6 +804,7 @@ def _classify(
 	)
 	subject = ticket.subject
 	field_values = _ticket_field_values(ticket_name, field_map)
+	label_inputs = _label_inputs(ticket_name, run_id, subject, ticket.description)
 	base = {"ticket": ticket_name, "run_id": run_id, "entry_type": "classify", "trigger": trigger, "turn": 0}
 	status.working(CLASSIFY_STEP)
 	try:
@@ -810,6 +816,7 @@ def _classify(
 				departments(routing),
 				ticket_fields=field_values,
 				later_messages=later_messages,
+				**label_inputs._asdict(),
 			),
 			max_tokens=CLASSIFY_MAX_TOKENS,
 			deadline=deadline,
@@ -837,6 +844,9 @@ def _classify(
 		write_entry(**base, **call_fields, error=error, stop_reason="unparseable")
 		_log_classify(ticket_name, run_id, False, ticket.creation)
 		return True, None, context
+	classification = dataclasses.replace(
+		classification, labels=ticket_labels.canonical(classification.labels, label_inputs.modules)
+	)
 
 	# U2 (AC-9 b, U2.md:164-172): the team the department maps to is learnt from the predicate decide_route asks
 	probe_hits = []
@@ -952,6 +962,18 @@ def _classify(
 	return True, summary, context
 
 
+def _label_inputs(ticket_name, run_id, subject, description) -> ticket_labels.LabelInputs:
+	"""The label inputs of the classify request (ADR-049); a failed read never stops the classification: no label
+	inputs then, one logger line with the exception class."""
+	try:
+		return ticket_labels.classify_inputs(ticket_name, subject, description)
+	except Exception as exc:
+		frappe.logger(LOGGER_NAME).warning(
+			"erp_ai labels ticket=%s run_id=%s error=%s", ticket_name, run_id, type(exc).__name__
+		)
+		return ticket_labels.LabelInputs()
+
+
 def _complexity(score, reason) -> dict:
 	"""The complexity (1-3) and its reason for the reasoning step; {} when there is no score (ADR-019 Amendment 1)."""
 	if score not in (1, 2, 3):
@@ -1008,11 +1030,13 @@ def _route(
 		return _route_skipped(log_name, decision, context)
 	actions, lines, errors = [], [], []
 	assigned = task = watcher = commented = split = None
+	labelled = []
 	sla = None
 	frappe.db.savepoint(ROUTE_SAVEPOINT)
 	try:
 		result = _apply_route_unit(decision, classification, context, actions, errors)
 		if result:
+			labelled = _labels_unit(classification.labels, context, actions, errors)
 			sla = _check_sla(classification.category, context, actions, lines)
 			if auto_assign:
 				assigned = _assign_unit(decision, context, actions, lines, errors)
@@ -1020,7 +1044,7 @@ def _route(
 				task = _task_unit(assigned, subject, classification, context, actions, lines, errors)
 			if decision.watcher:
 				watcher = _watch_unit(decision.watcher, context, actions, errors)
-			done = _route_lines(result, assigned, task, watcher)
+			done = _route_lines(result, assigned, task, watcher, labelled)
 			others = [*lines, *([split_text] if split_text else [])]
 			lines = [*done, *others]
 			if collect_run_id and collecting(collect_run_id):
@@ -1030,7 +1054,7 @@ def _route(
 				commented = _comment_unit(lines, context, actions, errors)
 				if commented and split_text:
 					split = classification.requests
-		_record_route(log_name, result, decision, assigned, task, actions, errors, split)
+		_record_route(log_name, result, decision, assigned, task, actions, errors, split, labelled)
 		_log_route_summary(context, result, assigned, task, commented, sla)
 	except Exception:
 		frappe.db.rollback(save_point=ROUTE_SAVEPOINT)
@@ -1203,8 +1227,9 @@ def _collect_route_lines(run_id, done, others) -> bool:
 	return bool(done or others)
 
 
-def _route_lines(result, assigned, task, watcher) -> list[str]:
-	"""The route comment's own sentences (U4b.md:247): fields written, person given, Task created, watcher added.
+def _route_lines(result, assigned, task, watcher, labelled=()) -> list[str]:
+	"""The route comment's own sentences (U4b.md:247): fields written, labels given (ADR-049), person given, Task
+	created, watcher added.
 
 	Fixed text with names only, never the ticket's content. No field changed → the "already right" sentence.
 	"""
@@ -1214,6 +1239,8 @@ def _route_lines(result, assigned, task, watcher) -> list[str]:
 		if field in FIELD_LABELS
 	)
 	lines = [ROUTE_DONE.format(fields=fields) if fields else ROUTE_NO_CHANGE]
+	if labelled:
+		lines.append(ROUTE_LABELS.format(labels=", ".join(labelled)))
 	if assigned:
 		lines.append(ROUTE_ASSIGNED.format(person=get_fullname(assigned)))
 	if task:
@@ -1221,6 +1248,28 @@ def _route_lines(result, assigned, task, watcher) -> list[str]:
 	if watcher:
 		lines.append(ROUTE_WATCHER.format(person=get_fullname(watcher)))
 	return lines
+
+
+def _labels_unit(names, context, actions, errors) -> list[str]:
+	"""(u1b) ADR-049: the classification's labels become Helpdesk Tags of the ticket, after (u1) wrote it. Returns
+	the labels added; none to give, or all carried already → [] and no entry. An exception undoes only this unit."""
+	if not names:
+		return []
+	ticket = context.ticket_name
+	result = _run_unit(LABELS_TOOL, lambda: add_labels(names, context), "HD Ticket", ticket, actions, errors)
+	if result is None or not result["added"]:
+		return []
+	actions.append(
+		_route_action(
+			LABELS_TOOL,
+			"HD Ticket",
+			ticket,
+			True,
+			value_after={"labels": result["added"]},
+			instructor=context.instructor,
+		)
+	)
+	return result["added"]
 
 
 def _watch_unit(watcher, context, actions, errors) -> str | None:
@@ -1325,9 +1374,10 @@ def _check_sla(category, context, actions, lines):
 	return state
 
 
-def _record_route(log_name, result, decision, assigned, task, actions, errors, split=None):
+def _record_route(log_name, result, decision, assigned, task, actions, errors, split=None, labelled=None):
 	"""Update the `classify` entry once (design 3.5). `split`: the requests of the split question, given only when a
-	comment carrying it was posted; only then is the question recorded as asked (AC-28)."""
+	comment carrying it was posted; only then is the question recorded as asked (AC-28). `labelled`: the labels the
+	route added (ADR-049)."""
 	updates = {
 		"applied": 1 if result else 0,
 		"actions": json.dumps(_bounded_actions(actions), ensure_ascii=False),
@@ -1342,6 +1392,8 @@ def _record_route(log_name, result, decision, assigned, task, actions, errors, s
 			after["assign"] = [assigned]
 		if task:
 			after["task"] = task
+		if labelled:
+			after["labels"] = labelled
 		for column, value in (("value_before", before), ("value_after", after)):
 			if value:
 				updates[column] = json.dumps(value, ensure_ascii=False)

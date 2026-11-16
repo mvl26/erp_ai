@@ -9,7 +9,7 @@ import frappe
 from frappe.tests.utils import FrappeTestCase
 from helpdesk.test_utils import make_ticket
 
-from erp_ai.agent import ops_data, runner
+from erp_ai.agent import labels, ops_data, runner
 from erp_ai.agent.classification import DEFAULT_CATEGORY_MAPPING
 from erp_ai.agent.prompts import build_classify_request
 from erp_ai.agent.routing import decide_route
@@ -328,6 +328,11 @@ class TestRunEvalRun(FrappeTestCase):
 		set_agent_settings(
 			category_mapping=json.dumps(DEFAULT_CATEGORY_MAPPING), routing_rules=make_routing_rules()
 		)
+		# ADR-049: the runner's label inputs are the site's live modules and tags; the offline eval has none, so the
+		# shared builder is compared without them (STD-TEST-6)
+		label_patch = patch.object(labels, "classify_inputs", return_value=labels.LabelInputs())
+		label_patch.start()
+		self.addCleanup(label_patch.stop)
 
 	def _write(self, rows):
 		with open(self.path, "w", encoding="utf-8") as handle:

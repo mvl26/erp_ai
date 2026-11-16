@@ -8,7 +8,7 @@ from frappe.tests.utils import FrappeTestCase
 from frappe.utils.file_lock import LockTimeoutError
 from helpdesk.test_utils import make_ticket
 
-from erp_ai.agent import daily_report, due_checks, lifecycle, runner
+from erp_ai.agent import daily_report, due_checks, lifecycle, run_log, runner
 from erp_ai.agent.ops_data import BA_NOTE_MARKER
 from erp_ai.constants import AGENT_USER, LOG_DOCTYPE, LOGGER_NAME, SETTING_DOCTYPE
 from erp_ai.test_utils import (
@@ -693,6 +693,43 @@ class TestBotActions(FrappeTestCase):
 		result = self._report()
 
 		self.assertEqual(result["bot_actions"], _bot_actions(**{"đề xuất chờ duyệt": 1}))
+
+	def test_rows_written_by_write_entry_are_no_proposals(self):
+		# BUG-006: insert() fills the Select `change_step` with its first option, "propose", on every row it writes
+		names = [
+			run_log.write_entry(
+				run_id="ERPAI-TEST-daily", entry_type="classify", trigger="requester_reply", applied=1
+			),
+			run_log.write_entry(
+				run_id="ERPAI-TEST-daily",
+				entry_type="reason",
+				trigger="comment_mention",
+				actions=[
+					run_log.action_entry("create_task", "Task", "ERPAI-TEST task", True),
+					run_log.action_entry("post_comment", "HD Ticket", "ERPAI-TEST ticket", True),
+				],
+			),
+			run_log.write_entry(run_id="ERPAI-TEST-daily", entry_type="skip", trigger="kb_draft"),
+			run_log.write_bot_action(
+				trigger=run_log.TRIGGER_SETTING_SAVE,
+				actions=[
+					run_log.action_entry(
+						run_log.TOOL_PERMISSION_SWITCH, SETTING_DOCTYPE, SETTING_DOCTYPE, True
+					)
+				],
+			),
+		]
+		for name in names:
+			frappe.db.set_value(LOG_DOCTYPE, name, "creation", self.yesterday, update_modified=False)
+		self.assertEqual(
+			frappe.get_all(LOG_DOCTYPE, filters={"name": ["in", names]}, pluck="change_step"), ["propose"] * 4
+		)
+
+		result = self._report()
+
+		self.assertEqual(
+			result["bot_actions"], _bot_actions(**{"phân loại": 1, "Task": 1, "comment": 1, "khác": 1})
+		)
 
 	def test_close_reply_and_classification_kinds(self):
 		ticket = _ticket("bot_close", self.yesterday, "A")

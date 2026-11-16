@@ -153,6 +153,54 @@ class TestParseClassification(FrappeTestCase):
 		self.assertEqual(garbage.requests, [])
 
 
+class TestParseLabels(FrappeTestCase):
+	"""ADR-049: `nhan` gives the ticket 1-3 short labels; a bad label is dropped, never the classification."""
+
+	def test_labels_read_in_order(self):
+		result = classification.parse_classification(_text(nhan=["Stock", "Delivery Note", "In ấn"]))
+		self.assertEqual(result.labels, ("Stock", "Delivery Note", "In ấn"))
+
+	def test_no_labels_is_an_empty_tuple(self):
+		self.assertEqual(classification.parse_classification(_text()).labels, ())
+		for raw in ("Stock", None, 3, {"a": 1}):
+			with self.subTest(raw=raw):
+				self.assertEqual(classification.parse_classification(_text(nhan=raw)).labels, ())
+
+	def test_whitespace_collapses_and_nfc(self):
+		decomposed = "In ấn"  # "In ấn" typed with combining marks
+		result = classification.parse_classification(_text(nhan=["  Delivery \n Note ", decomposed]))
+		self.assertEqual(result.labels, ("Delivery Note", "In ấn"))
+
+	def test_bad_labels_dropped(self):
+		cases = [
+			"x",  # too short
+			"y" * (classification.LABEL_MAX_CHARS + 1),
+			"Stock, HR",  # a comma splits Frappe's tag column
+			"<b>HR</b>",
+			"HR;DROP",
+			7,
+			None,
+			"",
+		]
+		result = classification.parse_classification(_text(nhan=[*cases, "HR"]))
+		self.assertEqual(result.labels, ("HR",))
+		self.assertEqual(classification.LABEL_MAX_CHARS, 40)
+
+	def test_label_of_max_length_kept(self):
+		label = "z" * classification.LABEL_MAX_CHARS
+		self.assertEqual(classification.parse_classification(_text(nhan=[label])).labels, (label,))
+
+	def test_duplicates_ignore_case_and_at_most_three(self):
+		result = classification.parse_classification(
+			_text(nhan=["Stock", "stock", "Delivery Note", "In ấn", "Kho"])
+		)
+		self.assertEqual(result.labels, ("Stock", "Delivery Note", "In ấn"))
+		self.assertEqual(classification.LABELS_MAX, 3)
+
+	def test_direct_build_has_no_labels(self):
+		self.assertEqual(classification.Classification(category="A", confidence="Cao").labels, ())
+
+
 class TestConfidencePct(FrappeTestCase):
 	# AC-22 (D-14), U1.md:249-253: do_tin_cay_pct is a whole number 0..100; the label do_tin_cay stays.
 	def test_parse_accepts_0_to_100(self):

@@ -107,7 +107,22 @@ def run_instructor(ticket_name: str, trigger: str, message_name: str | None = No
 def _trigger_message_author(ticket_name: str, message_name: str | None) -> str | None:
 	if not message_name:
 		return None
-	return frappe.db.get_value(MESSAGE_DOCTYPE, {"name": message_name, "ticket": ticket_name}, "owner")
+	message = frappe.db.get_value(
+		MESSAGE_DOCTYPE,
+		{"name": message_name, "ticket": ticket_name},
+		["owner", "source_comment"],
+		as_dict=True,
+	)
+	if not message:
+		return None
+	# The copy of an @ai comment speaks for whoever wrote that comment, read now: Helpdesk's ticket merge re-inserts
+	# old comments in the merger's session and restores their owner afterwards, so a copy can be owned by someone
+	# who did not write it. Then, or when the comment is gone, the run has no instructor.
+	if message.source_comment and (
+		frappe.db.get_value("Comment", message.source_comment, "owner") != message.owner
+	):
+		return None
+	return message.owner
 
 
 def label_comments(ticket_name: str, comments: list[dict]) -> list[dict]:

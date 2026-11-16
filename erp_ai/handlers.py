@@ -205,6 +205,8 @@ def raise_ticket_series(number: int) -> None:
 
 
 def ticket_after_delete(doc, method=None):
+	# The conversation with the bot goes with its ticket; the ERP AI Log rows stay (D7).
+	messages.forget_ticket(doc.name)
 	# Frappe's delete_doc moves the counter back when the newest ticket goes (revert_series_if_last).
 	# The ERP AI Log rows of a deleted ticket stay (D7), so a reused name would inherit them: put it back.
 	number = ticket_number(doc.name)
@@ -231,8 +233,13 @@ def comment_after_insert(doc, method=None):
 	if skip_reason:
 		_log_decision(ticket, TRIGGER_COMMENT_MENTION, "skipped", skip_reason)
 		return
+	text = html_to_plain_text(doc.content)
+	if not text.strip():
+		# the keyword sat only inside markup: nothing was said, and the comment itself must still be saved
+		_log_decision(ticket, TRIGGER_COMMENT_MENTION, "skipped", "no_text")
+		return
 	# The copy is the one trigger: its after_insert (message_after_insert) queues the run.
-	messages.add_message(ticket, html_to_plain_text(doc.content), source_comment=doc.name, trusted=True)
+	messages.add_message(ticket, text, source_comment=doc.name, trusted=True)
 	_log_decision(ticket, TRIGGER_COMMENT_MENTION, "copied", "conditions_met")
 
 

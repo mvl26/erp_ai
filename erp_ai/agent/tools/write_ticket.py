@@ -301,6 +301,8 @@ def post_comment(args: dict, ctx: ToolContext) -> dict:
 
 def _post_message(content: str, ctx: ToolContext) -> dict:
 	"""One message of the bot in the ticket's conversation, as written, under the session user's permissions."""
+	if not content.strip():
+		return _fail(REASON_NO_CONTENT)
 	if not frappe.get_doc(TICKET_DOCTYPE, ctx.ticket_name).has_permission("read"):
 		return _fail("thiếu quyền đọc phiếu")
 	try:

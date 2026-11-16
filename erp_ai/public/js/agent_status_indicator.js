@@ -10,7 +10,7 @@ function setupForm({ doc, call, router }) {
 		const TEXT_EMPTY_THREAD = "Chưa có tin nào.";
 		const TEXT_BOT_LABEL = "Bot";
 		const TEXT_BOT_GUIDANCE =
-			"Bot có thể không trả lời khi đang tắt, đang ở chế độ chỉ ghi nhận, phiếu không dùng AI hoặc thuộc nhóm loại trừ, hoặc đã hết lượt hôm nay.";
+			"Bot có thể không trả lời khi đang tắt, đang ở chế độ chỉ ghi nhận, phiếu không dùng AI hoặc thuộc nhóm loại trừ, đã hết lượt hôm nay, hoặc đang trả lời tin trước của phiếu này (khi đó hãy gửi lại sau). Nhận định và hướng xử lý của bot hiện ở phần thông tin của phiếu phía trên.";
 		const TEXT_LOAD_FAILED = "Không tải được dữ liệu của khu vực. Hãy đóng rồi mở lại.";
 		const TEXT_INPUT_PLACEHOLDER =
 			"Nhập câu hỏi cho bot. Enter để gửi, Shift+Enter để xuống dòng.";

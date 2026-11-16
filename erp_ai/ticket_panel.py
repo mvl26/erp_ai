@@ -1,6 +1,7 @@
 """Ticket-page panel (ADR-009, ADR-010): what the bot filled in on a ticket, and the conversation with it.
 
-Everything is read under the caller's own permissions.
+The ticket's fields are read under the caller's own permissions; the conversation is read by ticket once the
+caller has passed the panel gate (ADR-010 Amendment 2).
 """
 
 import frappe

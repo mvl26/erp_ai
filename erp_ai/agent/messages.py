@@ -71,6 +71,11 @@ def typed_by_people(ticket: str, after=None, limit: int = MAX_COMMENTS) -> list[
 	)
 
 
+def forget_ticket(ticket: str) -> None:
+	"""Delete the whole conversation of a ticket that was deleted: it goes with its ticket, as the comments do."""
+	frappe.db.delete(MESSAGE_DOCTYPE, {"ticket": ticket})
+
+
 def thread(ticket: str) -> list[dict]:
 	"""The newest THREAD_LIMIT messages, oldest first, shaped for the panel."""
 	return [

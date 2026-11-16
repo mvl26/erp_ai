@@ -9,6 +9,7 @@ import html
 
 import frappe
 
+from erp_ai.agent.labels import parse_tags
 from erp_ai.agent.redact import redact_secrets
 from erp_ai.agent.tools import read
 from erp_ai.agent.tools.read import _schema
@@ -74,6 +75,9 @@ def create_kb_draft(args: dict, ctx: ToolContext) -> dict:
 			SOURCE_TICKET_FIELD: ticket,
 		}
 	).insert()
+	# ADR-049: the knowledge base keeps the labels of the ticket the article came from
+	for label in parse_tags(frappe.db.get_value("HD Ticket", ticket, "_user_tags")):
+		article.add_tag(label)
 	return {"ok": True, "article": article.name}
 
 

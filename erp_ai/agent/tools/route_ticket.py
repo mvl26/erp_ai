@@ -3,6 +3,7 @@ from frappe.desk.form import assign_to
 from frappe.utils import escape_html, now_datetime
 
 from erp_ai.agent.classification import Classification
+from erp_ai.agent.labels import parse_tags
 from erp_ai.agent.routing import RouteDecision
 from erp_ai.agent.tools.registry import ToolContext
 from erp_ai.agent.tools.write_ticket import (
@@ -77,6 +78,25 @@ def apply_route(decision: RouteDecision, classification: Classification, ctx: To
 		"after": {field: values[field] for field in changed},
 		"skipped": skipped,
 	}
+
+
+def add_labels(labels: tuple[str, ...], ctx: ToolContext) -> dict:
+	"""Give the ticket each label it does not carry yet as a Helpdesk Tag, through the ticket's own `add_tag`, which
+	claims a new Tag for helpdesk so the Tags box lists it (ADR-049). Never removes a tag. A label naming an existing
+	Tag in another case takes the Tag's spelling. Not a model tool; `{"ok": True, "added": [...]}`."""
+	doc = frappe.get_doc(TICKET_DOCTYPE, ctx.ticket_name)
+	if not doc.has_permission("write"):
+		return _fail("thiếu quyền ghi phiếu")
+	carried = {tag.casefold() for tag in parse_tags(doc.get("_user_tags"))}
+	added = []
+	for label in labels:
+		label = frappe.db.get_value("Tag", label, "name") or label
+		if label.casefold() in carried:
+			continue
+		doc.add_tag(label)
+		carried.add(label.casefold())
+		added.append(label)
+	return {"ok": True, "added": added}
 
 
 def assign_owner(user: str, ctx: ToolContext) -> dict:

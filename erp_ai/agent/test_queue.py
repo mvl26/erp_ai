@@ -187,9 +187,17 @@ class TestRunForTicketCommentName(FrappeTestCase):
 			runner.run_for_ticket("TKT-2", TRIGGER_TICKET_INSERT)
 
 		self.assertEqual(
-			run.call_args_list[0].args, ("TKT-1", TRIGGER_COMMENT_MENTION, "COMMENT-9"), run.call_args_list
+			run.call_args_list[0].args,
+			("TKT-1", TRIGGER_COMMENT_MENTION, "COMMENT-9", None),
+			run.call_args_list,
 		)
-		self.assertEqual(run.call_args_list[1].args, ("TKT-2", TRIGGER_TICKET_INSERT, None))
+		self.assertEqual(run.call_args_list[1].args, ("TKT-2", TRIGGER_TICKET_INSERT, None, None))
+
+	def test_communication_name_passed_down_to_run(self):
+		with patch.object(runner, "_run") as run:
+			runner.run_for_ticket("TKT-3", TRIGGER_REQUESTER_REPLY, communication_name="COMM-4")
+
+		self.assertEqual(run.call_args_list[0].args, ("TKT-3", TRIGGER_REQUESTER_REPLY, None, "COMM-4"))
 
 
 class TestEnqueueLifecycleJob(FrappeTestCase):

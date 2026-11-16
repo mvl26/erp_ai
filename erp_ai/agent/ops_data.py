@@ -1,4 +1,6 @@
-"""Calendar cycle keys and category lookups shared by the scheduled jobs (design 3.6.2, ADR-033 QĐ 6).
+"""Calendar cycle keys, category lookups, the processing deadline and the milestone sets shared by the scheduled
+jobs (design 3.6.2, ADR-033 QĐ 6; design-addendum-2-U5b 3.1: the 08:00 report and the reminders read the same
+helpers, so they cannot drift apart).
 
 A cycle key comes from the calendar, not from the moment the job runs: every cycle starts at 08:00,
 so a run at 02:00 still belongs to the previous cycle.
@@ -6,10 +8,17 @@ so a run at 02:00 still belongs to the previous cycle.
 
 from datetime import date, datetime, time, timedelta
 
-from erp_ai.constants import CATEGORIES
+import frappe
+from frappe.utils import get_datetime
+
+from erp_ai.agent.routing import processing_deadline
+from erp_ai.constants import AGENT_USER, CATEGORIES, LOGGER_NAME
 
 BA_NOTE_MARKER = "**BA note**"
 CYCLE_START = time(8, 0)
+TICKET = "HD Ticket"
+# Same rule as the setting's E-2 check; the agent core may not import the controller (ADR-001).
+DUE_FIELD_TYPES = ("Date", "Datetime")
 
 
 def daily_cycle(now: datetime) -> date:
@@ -58,3 +67,50 @@ def ticket_category(ticket_row: dict, reverse_map: dict[str, str]) -> str | None
 	if not ticket_type:
 		return None
 	return reverse_map.get(ticket_type)
+
+
+def ticket_deadline(category: str | None, resolution_by, due_value) -> datetime | None:
+	"""The processing deadline of a ticket (D-18): `routing.processing_deadline` with `resolution_by` read as a
+	datetime (a string goes through `get_datetime`); a Date due value is the end of that day, done there (A-U5b-3)."""
+	return processing_deadline(category, get_datetime(resolution_by) if resolution_by else None, due_value)
+
+
+def due_field(fieldname: str | None) -> str | None:
+	"""The configured due field, or None when it is unset or no longer a Date/Datetime field of HD Ticket."""
+	if not fieldname:
+		return None
+	field = frappe.get_meta(TICKET).get_field(fieldname)
+	if field is None or field.fieldtype not in DUE_FIELD_TYPES:
+		frappe.logger(LOGGER_NAME).warning(
+			"erp_ai daily_report: due field %s is not a Date/Datetime field of HD Ticket, using resolution_by",
+			fieldname,
+		)
+		return None
+	return fieldname
+
+
+def tickets_with_ba_note(names: list[str]) -> set[str]:
+	"""Tickets with a comment by the bot that starts with BA_NOTE_MARKER."""
+	if not names:
+		return set()
+	comments = frappe.get_all(
+		"Comment",
+		filters={
+			"reference_doctype": TICKET,
+			"reference_name": ["in", names],
+			"comment_type": "Comment",
+			"owner": AGENT_USER,
+		},
+		fields=["reference_name", "content"],
+	)
+	return {row.reference_name for row in comments if (row.content or "").startswith(BA_NOTE_MARKER)}
+
+
+def tickets_with_task(names: list[str]) -> set[str]:
+	"""Tickets with at least one Task whose `ai_ticket` is the ticket."""
+	if not names:
+		return set()
+	return {
+		row.ai_ticket
+		for row in frappe.get_all("Task", filters={"ai_ticket": ["in", names]}, fields=["ai_ticket"])
+	}

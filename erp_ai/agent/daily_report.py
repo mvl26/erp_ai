@@ -12,27 +12,24 @@ from frappe.utils import escape_html, get_datetime, getdate, now_datetime
 from frappe.utils.file_lock import LockTimeoutError
 from frappe.utils.synchronization import filelock
 
-from erp_ai.agent import lifecycle, policy
+from erp_ai.agent import lifecycle, ops_data, policy
 from erp_ai.agent.classification import load_mapping
 from erp_ai.agent.kpi import is_bot_close, log_actions
 from erp_ai.agent.ops_data import (
-	BA_NOTE_MARKER,
 	CYCLE_START,
 	category_by_ticket_type,
 	daily_cycle,
 	ticket_category,
 )
 from erp_ai.agent.redact import redact_secrets
-from erp_ai.agent.routing import load_routing_config, processing_deadline, response_overdue
+from erp_ai.agent.routing import load_routing_config, response_overdue
 from erp_ai.agent.text_lines import filled_lines
-from erp_ai.constants import AGENT_USER, CATEGORIES, LOG_DOCTYPE, LOGGER_NAME, SETTING_DOCTYPE
+from erp_ai.constants import CATEGORIES, LOG_DOCTYPE, LOGGER_NAME, SETTING_DOCTYPE
 
 TICKET = "HD Ticket"
 WINDOW = timedelta(hours=24)
 UNKNOWN_CATEGORY = "?"
 PROGRESS_CATEGORIES = ("D", "E")
-# Same rule as the setting's E-2 check; the agent core may not import the controller (ADR-001).
-DUE_FIELD_TYPES = ("Date", "Datetime")
 # The kind an ok action entry of ERP AI Log counts as in `bot_actions`; any other tool counts as OTHER_ACTION_KIND
 # (design-w1-fixes-18 Điểm 2.2).
 ACTION_KIND_BY_TOOL = {
@@ -90,7 +87,7 @@ def build_daily_report(anchor: datetime) -> dict:
 	settings = frappe.get_single(SETTING_DOCTYPE)
 	reverse_map = category_by_ticket_type(load_mapping(settings.category_mapping))
 	routing = load_routing_config(settings.routing_rules)
-	due_field = _due_field(settings.field_due_date)
+	due_field = ops_data.due_field(settings.field_due_date)
 	start = anchor - WINDOW
 
 	new = _tickets([["creation", ">=", start], ["creation", "<", anchor]], reverse_map)
@@ -98,7 +95,7 @@ def build_daily_report(anchor: datetime) -> dict:
 		[["creation", "<", anchor], ["status_category", "!=", "Resolved"]], reverse_map, due_field
 	)
 	for row in open_rows:
-		row.deadline = processing_deadline(
+		row.deadline = ops_data.ticket_deadline(
 			row.category, row.resolution_by, row.get(due_field) if due_field else None
 		)
 	due_until = anchor + timedelta(hours=settings.due_reminder_hours)
@@ -109,13 +106,13 @@ def build_daily_report(anchor: datetime) -> dict:
 		for row in open_rows
 		if row.category == "C" and row.creation <= anchor - timedelta(hours=settings.ba_note_due_hours)
 	]
-	ba_noted = _ba_noted([row.name for row in c_old])
+	ba_noted = ops_data.tickets_with_ba_note([row.name for row in c_old])
 	cd_old = [
 		row
 		for row in open_rows
 		if row.category in ("C", "D") and row.creation <= anchor - timedelta(days=settings.task_due_days)
 	]
-	with_task = _with_task([row.name for row in cd_old])
+	with_task = ops_data.tickets_with_task([row.name for row in cd_old])
 
 	return {
 		"new_by_category_priority": _count_by_category_priority(new),
@@ -173,20 +170,6 @@ def _action_kind(action: dict, ticket: str | None) -> str | None:
 	return ACTION_KIND_BY_TOOL.get(tool, OTHER_ACTION_KIND)
 
 
-def _due_field(due_field: str | None) -> str | None:
-	"""The configured due field, or None when it is unset or no longer a Date/Datetime field of HD Ticket."""
-	if not due_field:
-		return None
-	field = frappe.get_meta(TICKET).get_field(due_field)
-	if field is None or field.fieldtype not in DUE_FIELD_TYPES:
-		frappe.logger(LOGGER_NAME).warning(
-			"erp_ai daily_report: due field %s is not a Date/Datetime field of HD Ticket, using resolution_by",
-			due_field,
-		)
-		return None
-	return due_field
-
-
 def _tickets(filters: list, reverse_map: dict[str, str], due_field: str | None = None) -> list:
 	"""Ticket rows oldest first, each with its `category` (None when unknown)."""
 	rows = frappe.get_all(
@@ -239,33 +222,6 @@ def _count_by_category_priority(rows: list) -> dict[str, dict[str, int]]:
 def _priority(row) -> str:
 	"""HD Ticket does not require a priority; an empty one counts as UNKNOWN_CATEGORY."""
 	return row.priority or UNKNOWN_CATEGORY
-
-
-def _ba_noted(names: list[str]) -> set[str]:
-	"""Tickets with a comment by the bot that starts with BA_NOTE_MARKER."""
-	if not names:
-		return set()
-	comments = frappe.get_all(
-		"Comment",
-		filters={
-			"reference_doctype": TICKET,
-			"reference_name": ["in", names],
-			"comment_type": "Comment",
-			"owner": AGENT_USER,
-		},
-		fields=["reference_name", "content"],
-	)
-	return {row.reference_name for row in comments if (row.content or "").startswith(BA_NOTE_MARKER)}
-
-
-def _with_task(names: list[str]) -> set[str]:
-	"""Tickets with at least one Task whose `ai_ticket` is the ticket."""
-	if not names:
-		return set()
-	return {
-		row.ai_ticket
-		for row in frappe.get_all("Task", filters={"ai_ticket": ["in", names]}, fields=["ai_ticket"])
-	}
 
 
 def _de_progress(

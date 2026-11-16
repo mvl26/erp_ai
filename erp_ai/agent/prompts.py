@@ -187,6 +187,21 @@ CONVENTIONS = """BỐN QUY ƯỚC BẮT BUỘC
 3. **Phiếu đầu mục C, D phải có ít nhất 1 Task liên kết trong 3 ngày.**
 4. **Một phiếu một việc.** Phiếu gộp nhiều yêu cầu (#1764 "4 nội dung") thì agent đề xuất tách, người tạo xác nhận. Agent không tự tách."""
 
+# AC-47, AC-48 [changed] (design-w1-fixes-19.md Điểm 3.1): every reasoning run has the read tools, so it always
+# follows CONVENTIONS.
+KNOWLEDGE_SOURCES_BLOCK = (
+	"Ba nguồn tra trước khi kết luận: bài CSKT (search_knowledge_base), HDSD (search_manuals), phiếu cũ "
+	"(search_resolved_tickets). Nêu nguồn đã dùng ngay trong nhận định hoặc hướng xử lý (tên bài CSKT, tên tài liệu "
+	"HDSD, số phiếu cũ), không có mục riêng. Tool trả 'chưa có kho HDSD' hoặc không có kết quả thì không nêu nguồn đó."
+)
+
+# AC-40 (U6b.md:295): appended only when the ticket grants reply_to_requester (Grant.reply_block).
+REPLY_BLOCK = (
+	"TRẢ LỜI NGƯỜI TẠO. reply_to_requester gửi tới người tạo phiếu (họ đọc được). Comment thì người tạo không đọc "
+	"được. Đầu mục F: trả lời phải có ít nhất một nguồn, không có thì hỏi lại. Độ tin cậy dưới ngưỡng: chỉ hỏi lại "
+	"(kind=question)."
+)
+
 # FEAT-004 design 3.7 with CHG-002 design 3.7 (blocks), verbatim; appended only when the ticket grants the change tools.
 CHANGE_TOOLS_BLOCK = """SỬA CODE VÀ LỆNH BENCH — CHỈ ĐỀ XUẤT, NGƯỜI DUYỆT
 
@@ -473,6 +488,7 @@ def build_reason_system(
 	unrestricted_tools: bool = False,
 	act_now: bool = False,
 	ask_only: bool = False,
+	reply_tools: bool = False,
 ) -> list[dict]:
 	parts = [
 		core_prompt(
@@ -485,9 +501,11 @@ def build_reason_system(
 		CATEGORY_TABLE,
 		routing_table,
 		CONVENTIONS,
+		KNOWLEDGE_SOURCES_BLOCK,
 		CHANGE_TOOLS_BLOCK if change_tools else "",
 		SITE_ADMIN_TOOLS_BLOCK if site_admin_tools else "",
 		UNRESTRICTED_TOOLS_BLOCK if unrestricted_tools else "",
+		REPLY_BLOCK if reply_tools else "",
 		ACT_NOW_BLOCK if act_now else "",
 		ASK_ONLY_BLOCK if ask_only else "",
 	]

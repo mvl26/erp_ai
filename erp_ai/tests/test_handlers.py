@@ -1112,3 +1112,92 @@ class TestRequesterReply(RequesterReplyTestCase):
 
 		self.assertEqual([job["communication_name"] for job in received], [first.name, second.name])
 		self.assertEqual(received[1]["job_id"], f"erp_ai::{ticket}::{TRIGGER_REQUESTER_REPLY}::{second.name}")
+
+
+LIFECYCLE_JOB_PATH = "erp_ai.agent.lifecycle.run_task_lifecycle"
+
+
+class TestTaskLifecycle(HandlerTestCase):
+	"""AC-43 (U6b.md:277, A-11): a status change of a Task linked to a ticket queues the ticket's lifecycle job."""
+
+	def setUp(self):
+		super().setUp()
+		keep_agent_settings(self)
+
+	def _task(self, ticket=None):
+		values = {
+			"doctype": "Task",
+			"subject": f"{PREFIX}lifecycle task",
+			"description": f"{PREFIX}lifecycle",
+			"status": "Open",
+		}
+		if ticket:
+			values["ai_ticket"] = ticket
+		return frappe.get_doc(values).insert(ignore_permissions=True).name
+
+	def _saved(self, task, **values):
+		"""The Task saved with `values`, as the `on_update` hook receives it."""
+		doc = frappe.get_doc("Task", task)
+		doc.update(values)
+		doc.save(ignore_permissions=True)
+		return doc
+
+	def _lifecycle_jobs(self):
+		return [
+			call.kwargs
+			for call in self.enqueue.call_args_list
+			if call.args and call.args[0] == LIFECYCLE_JOB_PATH
+		]
+
+	def test_status_change_enqueues_once(self):
+		ticket = self._ticket_without_job().name
+		task = self._task(ticket)
+		self.enqueue.reset_mock()
+
+		same_status = self._saved(task, subject=f"{PREFIX}lifecycle task, renamed")
+		handlers.task_on_update(same_status)
+		self.assertEqual(self._lifecycle_jobs(), [])
+
+		changed = self._saved(task, status="Working")
+		logger = MagicMock()
+		with patch.object(frappe, "logger", return_value=logger):
+			handlers.task_on_update(changed)
+			handlers.task_on_update(changed)
+
+		jobs = self._lifecycle_jobs()
+		self.assertEqual(len(jobs), 1)
+		self.assertEqual(jobs[0]["ticket_name"], ticket)
+		self.assertEqual(jobs[0]["job_id"], f"erp_ai_lifecycle::{ticket}")
+		self.assertEqual(self._jobs(), [])
+		self.assertEqual(self.gateway.call_count, 0)
+
+		set_agent_settings(enabled=0)
+		self.enqueue.reset_mock()
+		off = self._saved(task, status="Pending Review")
+		with patch.object(frappe, "logger", return_value=logger):
+			handlers.task_on_update(off)
+		self.assertEqual(self._lifecycle_jobs(), [])
+		lines = [str(arg) for call in logger.info.call_args_list for arg in call.args]
+		self.assertEqual(
+			lines[-1], f"erp_ai handler ticket={ticket} trigger=task_status skipped: agent_disabled"
+		)
+
+	def test_task_without_ai_ticket_no_job(self):
+		task = self._task()
+		changed = self._saved(task, status="Working")
+		self.enqueue.reset_mock()
+
+		def no_db(*args, **kwargs):
+			raise AssertionError("the early return must not touch the database")
+
+		with (
+			patch.object(frappe.db, "sql", side_effect=no_db),
+			patch.object(frappe.db, "get_value", side_effect=no_db),
+			patch.object(frappe.db, "get_single_value", side_effect=no_db),
+			patch.object(frappe.db, "exists", side_effect=no_db),
+			patch.object(frappe, "get_all", side_effect=no_db),
+			patch.object(frappe, "logger", side_effect=no_db),
+		):
+			handlers.task_on_update(changed)
+
+		self.assertEqual(self._lifecycle_jobs(), [])

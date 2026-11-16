@@ -153,7 +153,7 @@ class TestRunnerStatus(RunnerTestBase):
 		self.assertEqual(len(self.signals[-1]["message"]), 7)
 		self.assertEqual({entry.run_id for entry in self._entries()}, {self.signals[0]["message"]["run_id"]})
 
-	def test_no_signal_when_run_skipped_at_level_l0(self):
+	def test_run_skipped_at_level_l0_sends_only_done(self):
 		set_agent_settings(permission_level="L0")
 		self._gateway()
 
@@ -240,7 +240,7 @@ class TestRunnerStatus(RunnerTestBase):
 		self.assertEqual(self._states()[:2], ["thinking", "working"])
 		self.assertEqual(self.signals[1]["message"]["text"], "Đang làm: viết trả lời…")
 
-	def test_skipped_runs_emit_nothing_and_never_wait(self):
+	def test_skipped_runs_send_only_done_and_never_wait(self):
 		self._set_delay(3, 5)
 		cases = {
 			"disabled": lambda: set_agent_settings(enabled=0),

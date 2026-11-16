@@ -3,6 +3,7 @@ from unittest.mock import patch
 
 import frappe
 from frappe.tests.utils import FrappeTestCase
+from helpdesk.test_utils import make_ticket
 
 from erp_ai.agent import system_read
 from erp_ai.agent.redact import MASK
@@ -30,8 +31,8 @@ class ErrorLogCase(FrappeTestCase):
 		if self.seeded:
 			frappe.db.delete("Error Log", {"name": ("in", self.seeded)})
 
-	def seed(self, creation, method="erp_ai.test.method", error="Traceback: boom") -> str:
-		doc = frappe.get_doc({"doctype": "Error Log", "method": method, "error": error})
+	def seed(self, creation, method="erp_ai.test.method", error="Traceback: boom", **values) -> str:
+		doc = frappe.get_doc({"doctype": "Error Log", "method": method, "error": error, **values})
 		doc.name = frappe.generate_hash(length=12)
 		doc.owner = doc.modified_by = "Administrator"
 		doc.creation = doc.modified = creation
@@ -164,6 +165,22 @@ class TestErrorLogs(ErrorLogCase):
 		for keyword in ("", "z", "z" * 101):
 			with self.subTest(length=len(keyword)), self.assertRaises(frappe.ValidationError):
 				read_error_logs(keyword=keyword)
+
+	def test_rows_of_excluded_tickets_left_out_before_the_cap(self):
+		"""R17c (NFR-1): a row whose reference is an excluded HD Ticket is left out inside the query, so the row cap
+		still counts only rows that are returned; a row of an allowed ticket, a row without a reference and a row of
+		another DocType with the same name stay."""
+		excluded = make_ticket(subject="ERPAI-TEST R17c loại trừ").name
+		frappe.db.set_value("HD Ticket", excluded, "ai_opt_out", 1)
+		allowed = make_ticket(subject="ERPAI-TEST R17c").name
+		self.seed(NOW, reference_doctype="HD Ticket", reference_name=str(excluded))
+		kept = [
+			self.seed(NOW - timedelta(minutes=1), reference_doctype="HD Ticket", reference_name=str(allowed)),
+			self.seed(NOW - timedelta(minutes=2)),
+			self.seed(NOW - timedelta(minutes=3), reference_doctype="ToDo", reference_name=str(excluded)),
+		]
+
+		self.assertEqual(self.names(read_error_logs(limit=3)), kept)
 
 
 class TestReadErrorLogs(ErrorLogCase):

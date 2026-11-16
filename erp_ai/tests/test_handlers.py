@@ -262,7 +262,7 @@ class TestTicketHandlers(HandlerTestCase):
 		self.assertEqual(self.gateway.call_count, 1)
 		call = self.gateway.calls[0]
 		self.assertEqual(call["task"], "classify")
-		self.assertEqual(call["max_tokens"], 600)
+		self.assertEqual(call["max_tokens"], runner.CLASSIFY_MAX_TOKENS)
 		self.assertTrue(call["system"])
 		self.assertTrue(call["messages"])
 

@@ -615,6 +615,7 @@ class TestRunnerL1Classification(RunnerTestBase):
 					"ai_confidence": "Cao",
 					"ai_score_reason": "",
 					"ai_confidence_pct": CLASSIFY_A_PCT,
+					"ai_classification_reason": "x",
 				}
 			},
 		)
@@ -662,7 +663,14 @@ class TestRunnerL1Classification(RunnerTestBase):
 		self.assertEqual(entry.applied, 1)
 		self.assertEqual(
 			json.loads(entry.value_after),
-			{"ticket": {"ai_confidence": "Cao", "ai_score_reason": "", "ai_confidence_pct": CLASSIFY_A_PCT}},
+			{
+				"ticket": {
+					"ai_confidence": "Cao",
+					"ai_score_reason": "",
+					"ai_confidence_pct": CLASSIFY_A_PCT,
+					"ai_classification_reason": "x",
+				}
+			},
 		)
 		self.assertEqual(
 			json.loads(entry.actions),
@@ -709,7 +717,7 @@ class TestRunnerL1Classification(RunnerTestBase):
 		self.assertEqual(entry.applied, 1)
 		self.assertEqual(
 			set(json.loads(entry.value_after)["ticket"]),
-			{"ai_confidence", "ai_score_reason", "ai_confidence_pct"},
+			{"ai_confidence", "ai_score_reason", "ai_confidence_pct", "ai_classification_reason"},
 		)
 		self.assertEqual(
 			json.loads(entry.actions),

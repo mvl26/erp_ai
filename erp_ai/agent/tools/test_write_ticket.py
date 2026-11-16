@@ -896,6 +896,23 @@ class TestSetClassification(FrappeTestCase):
 		self.assertTrue(result["ok"], result)
 		self.assertEqual(result["skipped"], [{"field": "agent_group", "reason": "ánh xạ không có giá trị"}])
 
+	def test_reclassification_clears_the_stored_reason(self):
+		# The tool takes no reason, so the reason of an earlier classification must not stay next to the new one.
+		mapping = {"A": {"ticket_type": TICKET_TYPE, "agent_group": TEAM, "priority": "High"}}
+		frappe.db.set_value("HD Ticket", self.ticket, "ai_classification_reason", "lý do của lần trước")
+		frappe.set_user(AGENT)
+		result = write_ticket.set_classification({"category": "A", "confidence": "Cao"}, self._ctx(mapping))
+		self.assertTrue(result["ok"], result)
+		self.assertEqual(result["after"]["ai_classification_reason"], "")
+		self.assertFalse(frappe.db.get_value("HD Ticket", self.ticket, "ai_classification_reason"))
+
+	def test_classification_without_stored_reason_writes_none(self):
+		mapping = {"A": {"ticket_type": TICKET_TYPE, "agent_group": TEAM, "priority": "High"}}
+		frappe.set_user(AGENT)
+		result = write_ticket.set_classification({"category": "A", "confidence": "Cao"}, self._ctx(mapping))
+		self.assertTrue(result["ok"], result)
+		self.assertNotIn("ai_classification_reason", result["after"])
+
 
 T98_OTHER_TYPE = "T98 Loại khác"
 T98_OTHER_TEAM = "T98 Nhóm khác"
@@ -1392,6 +1409,68 @@ class TestGuidanceWriter(TicketCommentCase):
 		content = frappe.db.get_value("Comment", result["comment"], "content")
 		frappe.db.delete("Comment", result["comment"])
 		return content
+
+	def _run_info(self):
+		return frappe.db.get_value("HD Ticket", self.ticket, list(write_ticket.RUN_INFO_FIELDS), as_dict=True)
+
+	def test_guidance_parts_are_stored_on_the_ticket(self):
+		# What the comment says is also the ticket's own information: the analysis and the lines of each section.
+		run_id = self._run(
+			ANALYSIS, done=["Đã làm một", "Đã làm hai"], pending=["Đề xuất CP-1"], manual=["Nhờ phân công"]
+		)
+		result = write_ticket.post_guidance(self.ticket, run_id)
+		self.assertTrue(result["ok"], result)
+		self.assertTrue(result["stored"])
+		row = self._run_info()
+		self.assertEqual(row.ai_analysis, ANALYSIS)
+		self.assertEqual(row.ai_done, "Đã làm một\nĐã làm hai")
+		self.assertEqual(row.ai_pending, "Đề xuất CP-1")
+		self.assertEqual(row.ai_manual, "Nhờ phân công")
+
+	def test_guidance_without_analysis_stores_an_empty_analysis(self):
+		# The fallback text only points at the comment, so it is not kept as the ticket's analysis.
+		frappe.db.set_value("HD Ticket", self.ticket, {"ai_analysis": "nhận định cũ", "ai_pending": "cũ"})
+		result = write_ticket.post_guidance(self.ticket, self._run(done=["Đã làm"]))
+		self.assertTrue(result["ok"], result)
+		row = self._run_info()
+		self.assertEqual(row.ai_done, "Đã làm")
+		self.assertFalse(row.ai_analysis or row.ai_pending or row.ai_manual)
+
+	def test_refused_guidance_leaves_the_ticket_fields(self):
+		self.assertTrue(write_ticket.post_guidance(self.ticket, self._run(ANALYSIS, done=["lần một"]))["ok"])
+		again = write_ticket.post_guidance(self.ticket, self._run("**Nhận định:** khác", done=["lần hai"]))
+		self.assertFalse(again["ok"])
+		self.assertNotIn("stored", again)
+		row = self._run_info()
+		self.assertEqual((row.ai_analysis, row.ai_done), (ANALYSIS, "lần một"))
+
+	def test_guidance_stands_when_the_fields_cannot_be_written(self):
+		# The comment is the guidance; a missing write right on the information fields does not undo it.
+		original = Document.has_permlevel_access_to
+
+		def deny_run_info(doc, fieldname, df=None, permission_type="read"):
+			if permission_type == "write" and fieldname in write_ticket.RUN_INFO_FIELDS:
+				return False
+			return original(doc, fieldname, df=df, permission_type=permission_type)
+
+		with patch.object(Document, "has_permlevel_access_to", deny_run_info):
+			result = write_ticket.post_guidance(self.ticket, self._run(ANALYSIS, done=["Đã làm"]))
+		self.assertTrue(result["ok"], result)
+		self.assertFalse(result["stored"])
+		self.assertEqual(len(self._comments()), 1)
+		row = self._run_info()
+		self.assertFalse(row.ai_analysis or row.ai_done)
+
+	def test_guidance_stands_when_the_ticket_cannot_be_saved(self):
+		# A ticket that fails validation keeps its guidance comment; only the copy onto the fields is given up.
+		run_id = self._run(ANALYSIS, done=["Đã làm"])
+		with patch.object(Document, "save", side_effect=frappe.ValidationError("phiếu không lưu được")):
+			result = write_ticket.post_guidance(self.ticket, run_id)
+		self.assertTrue(result["ok"], result)
+		self.assertFalse(result["stored"])
+		self.assertEqual(len(self._comments()), 1)
+		row = self._run_info()
+		self.assertFalse(row.ai_analysis or row.ai_done)
 
 	def test_count_ignores_info_other_owner_and_non_prefix(self):
 		marker = write_ticket.GUIDANCE_MARKER

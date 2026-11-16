@@ -28,6 +28,7 @@ from erp_ai.constants import AGENT_USER, CLASSIFIED_BY_AI, CLASSIFIED_BY_HUMAN
 from erp_ai.test_utils import PREFIX, make_active_agent, make_sla, make_team, pin_agent_roles
 
 SCORE_FIELDS = ("ai_complexity", "ai_importance", "ai_score_reason")
+CLASSIFICATION_REASON_FIELD = "ai_classification_reason"
 ROW_FIELDS = (
 	"ticket_type",
 	"agent_group",
@@ -114,6 +115,31 @@ class RouteTicketTestCase(FrappeTestCase):
 
 
 class TestApplyRoute(RouteTicketTestCase):
+	def test_classification_reason_stored_on_the_ticket(self):
+		# Why the model classified the ticket so is ticket information: it is stored with the route.
+		ticket = self._ticket(priority="Low")
+		reason = "ERPAI-TEST người dùng hỏi cách dùng"
+		result = self._apply_as_agent(ticket, classification=self._classification(reason=reason))
+		self.assertTrue(result["ok"], result)
+		self.assertEqual(result["after"][CLASSIFICATION_REASON_FIELD], reason)
+		self.assertEqual(frappe.db.get_value("HD Ticket", ticket, CLASSIFICATION_REASON_FIELD), reason)
+
+	def test_classification_without_reason_writes_no_reason(self):
+		ticket = self._ticket(priority="Low")
+		result = self._apply_as_agent(ticket)
+		self.assertTrue(result["ok"], result)
+		self.assertNotIn(CLASSIFICATION_REASON_FIELD, result["after"])
+		self.assertFalse(frappe.db.get_value("HD Ticket", ticket, CLASSIFICATION_REASON_FIELD))
+
+	def test_classification_without_reason_clears_an_earlier_reason(self):
+		# A reason left by an earlier classification would describe the wrong one.
+		ticket = self._ticket(priority="Low")
+		frappe.db.set_value("HD Ticket", ticket, CLASSIFICATION_REASON_FIELD, "lý do của lần trước")
+		result = self._apply_as_agent(ticket)
+		self.assertTrue(result["ok"], result)
+		self.assertEqual(result["after"][CLASSIFICATION_REASON_FIELD], "")
+		self.assertFalse(frappe.db.get_value("HD Ticket", ticket, CLASSIFICATION_REASON_FIELD))
+
 	def test_scores_written_readable_by_agent_role_user(self):
 		# Priority is set explicitly so the changed set does not depend on the site's default SLA priority.
 		ticket = self._ticket(priority="Low")

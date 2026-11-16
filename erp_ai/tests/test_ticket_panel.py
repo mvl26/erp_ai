@@ -179,7 +179,7 @@ class TestTicketPanelRead(FrappeTestCase):
 			self.ticket.name,
 			{
 				"ai_classification_reason": "Người dùng hỏi cách dùng.",
-				"ai_analysis": "<p>**Nhận định:** hỏi cách dùng.</p><p>**Hướng xử lý:** gửi hướng dẫn.</p>",
+				"ai_analysis": "**Nhận định:** hỏi cách dùng.\n\n**Hướng xử lý:**\n1. Gửi hướng dẫn.",
 				"ai_done": "Bot đã phân loại phiếu: Loại Câu hỏi.\nĐã tạo Task TASK-1 (2 giờ).",
 				"ai_pending": "Đề xuất CP-1",
 				"ai_manual": "Nhờ trưởng nhóm phân công.",
@@ -187,9 +187,10 @@ class TestTicketPanelRead(FrappeTestCase):
 		)
 		by_name = {item["fieldname"]: item["text"] for item in self._read()["ai_fields"]}
 		self.assertEqual(by_name["ai_classification_reason"], "Người dùng hỏi cách dùng.")
-		self.assertNotIn("<p>", by_name["ai_analysis"])
-		self.assertIn("Nhận định", by_name["ai_analysis"])
-		self.assertIn("gửi hướng dẫn.", by_name["ai_analysis"])
+		# The analysis is the model's own text: its line breaks are kept, the page shows it as plain text.
+		self.assertEqual(
+			by_name["ai_analysis"], "**Nhận định:** hỏi cách dùng.\n\n**Hướng xử lý:**\n1. Gửi hướng dẫn."
+		)
 		self.assertEqual(
 			by_name["ai_done"].splitlines(),
 			["Bot đã phân loại phiếu: Loại Câu hỏi.", "Đã tạo Task TASK-1 (2 giờ)."],

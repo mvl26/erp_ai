@@ -3,6 +3,7 @@ import copy
 import inspect
 import json
 import os
+import re
 import subprocess
 import time
 from collections import Counter
@@ -11,6 +12,7 @@ from unittest.mock import MagicMock, patch
 
 import frappe
 from frappe.tests.utils import FrappeTestCase
+from frappe.utils import escape_html
 from helpdesk.test_utils import make_ticket
 
 from erp_ai import tasks
@@ -31,9 +33,10 @@ from erp_ai.agent.prompts import (
 	build_routing_table,
 )
 from erp_ai.agent.run_log import action_entry, write_entry
-from erp_ai.agent.tools import registry, site_api, write_ticket
+from erp_ai.agent.tools import propose_change, registry, site_api, write_ticket
 from erp_ai.agent.tools.read import TOOL_RESULT_MAX_CHARS
 from erp_ai.agent.tools.registry import ASK_TOOL_NAMES, get_tool_schemas
+from erp_ai.agent.tools.route_ticket import ASSIGN_REQUEST, REASON_NO_VALID_ASSIGNEE
 from erp_ai.agent.tools.source import GIT_READ_SUBCOMMANDS, git_global_options
 from erp_ai.constants import (
 	AGENT_USER,
@@ -62,6 +65,7 @@ from erp_ai.test_utils import (
 	make_change_proposal,
 	make_model_result,
 	make_routing_rules,
+	make_team,
 	record_status_signals,
 	set_agent_settings,
 )
@@ -562,18 +566,6 @@ class TestRunnerL1Classification(RunnerTestBase):
 			reason=f"SLA {fact['sla']} xử lý {fact['resolution_s'] // 60} phút > mong đợi {expected} phút (A)",
 		)
 
-	def _comment_names(self):
-		return set(
-			frappe.get_all(
-				"Comment", filters=authority.ticket_comment_filters(self.ticket.name), pluck="name"
-			)
-		)
-
-	def _route_comment(self, before):
-		"""The `post_routing_comment` entry of the one comment the run posted (design-w1-fixes-12 Điểm 2, T109)."""
-		(comment_name,) = self._comment_names() - before
-		return action_entry("post_routing_comment", "Comment", comment_name, True)
-
 	def _applied_route(self, entry):
 		"""The `apply_route` entry of a run whose ticket write succeeded: the shared shape (NFR-8)."""
 		return action_entry(
@@ -592,7 +584,6 @@ class TestRunnerL1Classification(RunnerTestBase):
 			tool_turn(tool_use("toolu_hint", "set_resolution_hint", text=f"{PREFIX}hướng giải quyết")),
 			make_model_result(stop_reason="end_turn"),
 		]
-		comments = self._comment_names()
 		self._run()
 
 		self.log_error.assert_not_called()
@@ -618,11 +609,8 @@ class TestRunnerL1Classification(RunnerTestBase):
 				}
 			},
 		)
-		# T109 (AC-23): a successful route ends with its one comment
-		self.assertEqual(
-			json.loads(entry.actions),
-			[self._applied_route(entry), self._route_comment(comments)],
-		)
+		# T116 (AC-23 [changed]): a guidance run's route posts no comment of its own; its sentence is in the guidance
+		self.assertEqual(json.loads(entry.actions), [self._applied_route(entry)])
 		self.assertEqual((entry.predicted_category, entry.predicted_confidence), ("A", "Cao"))
 		self.assertEqual(json.loads(entry.skipped_fields), [ASSIGNEE_NOTE])
 
@@ -654,7 +642,6 @@ class TestRunnerL1Classification(RunnerTestBase):
 		set_agent_settings(category_mapping=json.dumps(unknown))
 		before = self._ticket_row()
 		sla_action = self._slow_sla_action()
-		comments = self._comment_names()
 		self._run()
 
 		# ADR-020 QĐ 1, QĐ 6: the ticket is always saved with the AI fields, even when no route value applies.
@@ -670,12 +657,8 @@ class TestRunnerL1Classification(RunnerTestBase):
 		)
 		self.assertEqual(
 			json.loads(entry.actions),
-			# T109 (AC-23): a successful route ends with its one comment
-			[
-				self._applied_route(entry),
-				sla_action,
-				self._route_comment(comments),
-			],
+			# T116 (AC-23 [changed]): a guidance run's route posts no comment of its own
+			[self._applied_route(entry), sla_action],
 		)
 		skipped = json.loads(entry.skipped_fields)
 		self.assertIn("ticket_type", [item["field"] for item in skipped])
@@ -706,7 +689,6 @@ class TestRunnerL1Classification(RunnerTestBase):
 		set_agent_settings(category_mapping=json.dumps(unknown))
 		before = self._ticket_row()
 		sla_action = self._slow_sla_action()
-		comments = self._comment_names()
 		self._run()
 
 		# ADR-020 QĐ 1, QĐ 6: the ticket is always saved with the AI fields; no route field changes.
@@ -722,12 +704,8 @@ class TestRunnerL1Classification(RunnerTestBase):
 		)
 		self.assertEqual(
 			json.loads(entry.actions),
-			# T109 (AC-23): a successful route ends with its one comment
-			[
-				self._applied_route(entry),
-				sla_action,
-				self._route_comment(comments),
-			],
+			# T116 (AC-23 [changed]): a guidance run's route posts no comment of its own
+			[self._applied_route(entry), sla_action],
 		)
 		self.assertEqual(
 			json.loads(entry.skipped_fields),
@@ -3933,6 +3911,85 @@ class TestRunNotices(RunnerTestBase):
 		# the second notice was refused as already sent: nothing written, so no entry
 		self.assertFalse(second.actions)
 
+	def test_matrix_eight_situations(self):
+		# AC-23 [changed] (U4b.md:424, w1.md:187): four situations post one comment, four post none; a routed ticket's
+		# one comment is now the guidance comment carrying the route sentence
+		team = make_team(self)
+		sla = patch.object(runner.site_facts, "applied_sla", return_value=NO_LAG_SLA)
+		sla.start()
+		self.addCleanup(sla.stop)
+
+		def comments_of(ticket):
+			return frappe.get_all(
+				"Comment", filters=authority.ticket_comment_filters(ticket), pluck="content"
+			)
+
+		cases = (
+			("route succeeded", {}, None, "ticket_insert", [classify_at(90), make_model_result()], 1),
+			(
+				"gateway error",
+				{},
+				None,
+				"comment_mention",
+				[GatewayError("server_error", status=500)],
+				1,
+			),
+			(
+				"over budget at L3",
+				{"permission_level": "L3"},
+				None,
+				"comment_mention",
+				[make_model_result()],
+				1,
+			),
+			("daily limit", {}, "daily_limit", "comment_mention", [], 1),
+			("agent off", {"enabled": 0}, None, "ticket_insert", [classify_at(90)], 0),
+			("level L0", {"permission_level": "L0"}, None, "ticket_insert", [classify_at(90)], 0),
+			(
+				"excluded team",
+				{"excluded_teams": team},
+				"excluded_team",
+				"ticket_insert",
+				[classify_at(90)],
+				0,
+			),
+			("AI flag off", {}, "opt_out", "ticket_insert", [classify_at(90)], 0),
+		)
+		for name, settings, arrange, trigger, results, expected in cases:
+			with self.subTest(name):
+				frappe.db.savepoint("erp_ai_matrix_case")
+				try:
+					set_agent_settings(**settings)
+					self.month_spend.return_value = 2000.0 if name == "over budget at L3" else 0.0
+					ticket = make_ticket(subject=f"{PREFIX}matrix {name}").name
+					if arrange == "daily_limit":
+						for index in range(DAILY_LIMIT):
+							write_entry(
+								ticket=ticket,
+								run_id=f"{PREFIX}matrix-{index}",
+								entry_type="classify",
+								trigger="ticket_insert",
+								turn=0,
+							)
+					elif arrange == "excluded_team":
+						frappe.db.set_value("HD Ticket", ticket, "agent_group", team, update_modified=False)
+					elif arrange == "opt_out":
+						frappe.db.set_value("HD Ticket", ticket, "ai_opt_out", 1)
+					self.gateway.results = list(results)
+
+					runner.run_for_ticket(ticket, trigger)
+
+					posted = comments_of(ticket)
+					self.assertEqual(len(posted), expected, posted)
+					if name == "route succeeded":
+						self.assertEqual(write_ticket.count_guidance(ticket), 1)
+						self.assertTrue(
+							runner.ROUTE_NO_CHANGE in posted[0]
+							or runner.ROUTE_DONE.split("{")[0] in posted[0]
+						)
+				finally:
+					frappe.db.rollback(save_point="erp_ai_matrix_case")
+
 
 def classify_at(pct):
 	return make_model_result(
@@ -4007,6 +4064,14 @@ class TestAskOnly(RunnerTestBase):
 				else:
 					self.assertEqual(entry.applied, 1)
 					self.assertEqual(self._fallbacks(ticket), [])
+					# T116 (w1.md:207): the route sentence is in the guidance comment, the run's one comment
+					(content,) = self._comments(ticket)
+					self.assertTrue(content.startswith(write_ticket.GUIDANCE_MARKER))
+					self.assertEqual(write_ticket.count_guidance(ticket), 1)
+					self.assertTrue(
+						runner.ROUTE_NO_CHANGE in content or runner.ROUTE_DONE.split("{")[0] in content,
+						content,
+					)
 
 	def test_model_posts_nothing_fallback_one_comment(self):
 		self.gateway.results = [
@@ -4140,6 +4205,23 @@ class TestConfidenceSource(RunnerTestBase):
 
 
 GUIDANCE_EXISTS_LOG = "đã có hướng xử lý"
+NO_LAG_SLA = {"sla": f"{PREFIX}SLA", "priority": "High", "resolution_s": None}
+# A kind=de_xuat analysis written to the prompt's template (spec-addendum-5.md:63): no grounds section in a guidance run.
+ANALYSIS = (
+	f"**Nhận định:** {PREFIX}máy in của kho chưa được cấu hình.\n"
+	f"**Hướng xử lý:** {PREFIX}người phụ trách cấu hình lại máy in.\n"
+	"Độ tin cậy: 90%"
+)
+_HEADING = re.compile(r"(?m)^[ \t]*\*\*([^*\n]+):\*\*|<strong>([^<]+):</strong>")
+
+
+def _headings(content):
+	"""The section headings of a comment, in order: `**name:**` opening a line or `<strong>name:</strong>` (Điểm 3.3)."""
+	return [match.group(1) or match.group(2) for match in _HEADING.finditer(content)]
+
+
+def analysis_call(block_id, content=ANALYSIS):
+	return tool_use(block_id, "post_comment", kind="de_xuat", content=content)
 
 
 class TestOneGuidance(RunnerTestBase):
@@ -4165,9 +4247,48 @@ class TestOneGuidance(RunnerTestBase):
 		log_error = patch.object(frappe, "log_error")
 		self.log_error = log_error.start()
 		self.addCleanup(log_error.stop)
+		# a fact with no resolution time never lags and never lacks: the route adds no SLA sentence of the shared site
+		sla = patch.object(runner.site_facts, "applied_sla", return_value=NO_LAG_SLA)
+		sla.start()
+		self.addCleanup(sla.stop)
 
 	def _guidance(self, ticket=None):
 		return write_ticket.count_guidance(ticket or self.ticket.name)
+
+	def _guidance_content(self, ticket=None):
+		(content,) = frappe.get_all(
+			"Comment", filters=write_ticket.guidance_filters(ticket or self.ticket.name), pluck="content"
+		)
+		return content
+
+	def _new_comments(self, before, ticket=None):
+		"""The ticket's comments made after `before` (a set of names), as {name: content}."""
+		rows = frappe.get_all(
+			"Comment",
+			filters=authority.ticket_comment_filters(ticket or self.ticket.name),
+			fields=["name", "content"],
+		)
+		return {row.name: row.content for row in rows if row.name not in before}
+
+	def _comment_names(self, ticket=None):
+		return set(
+			frappe.get_all(
+				"Comment", filters=authority.ticket_comment_filters(ticket or self.ticket.name), pluck="name"
+			)
+		)
+
+	def _tool_results(self, call_index):
+		"""{tool_use_id: result} of the tool results the model got in call `call_index`."""
+		return {
+			block["tool_use_id"]: json.loads(block["content"])
+			for block in self.gateway.calls[call_index]["messages"][-1]["content"]
+		}
+
+	def _fixed_run_id(self):
+		run_id = f"{PREFIX}guidance-{frappe.generate_hash(length=10)}"
+		fixed = MagicMock()
+		fixed.uuid4.return_value.hex = run_id
+		return run_id, patch.object(runner, "uuid", fixed)
 
 	def _guidance_by_hand(self, ticket=None):
 		"""A guidance comment an earlier run posted: the agent account's, the marker on line 1."""
@@ -4203,3 +4324,244 @@ class TestOneGuidance(RunnerTestBase):
 		# the first message tells the model the ticket has its guidance, as ticket data (ADR-036 QĐ 7, U4b-10)
 		payload = json.JSONDecoder().raw_decode(self.gateway.calls[0]["messages"][0]["content"])[0]
 		self.assertIs(payload["ticket"]["guidance_posted"], True)
+
+	# T116: the last turn posts the run's one guidance comment (w1.md:105, AD3-2, R5-16, design-w1-fixes-20 Điểm 1.6)
+
+	def test_last_turn_log_failure_leaves_no_guidance(self):
+		# R5-16: the guidance comment is a write of the last turn; its entry failing undoes it with the turn
+		self.gateway.results = [classify_at(90), tool_turn(analysis_call("t1")), make_model_result()]
+		real_write_entry = runner.write_entry
+
+		def failing_last_entry(**fields):
+			if fields.get("entry_type") == "reason" and fields.get("turn") == 2:
+				raise RuntimeError(f"{PREFIX}nhật ký hỏng")
+			return real_write_entry(**fields)
+
+		with patch.object(runner, "write_entry", side_effect=failing_last_entry):
+			self._run()
+
+		self.assertEqual(self.gateway.call_count, 3)
+		self.assertEqual(self._guidance(), 0)
+		self.assertEqual([call.args[0] for call in self.log_error.call_args_list], [TITLE_RUN_FAILED])
+
+	def test_chain_1_ticket_insert_one_guidance(self):
+		before = self._comment_names()
+		self.gateway.results = [classify_at(90), make_model_result()]
+		self._run()
+
+		self.assertEqual(self._guidance(), 1)
+		# the route posts no comment of its own: the run's one comment is the guidance comment
+		(content,) = self._new_comments(before).values()
+		self.assertTrue(content.startswith(write_ticket.GUIDANCE_MARKER + "\n"))
+
+	def test_chain_2_insert_then_ai_three_times_one_guidance(self):
+		self.gateway.results = [classify_at(90), tool_turn(analysis_call("t0")), make_model_result()]
+		self._run()
+		self.assertEqual(self._guidance(), 1)
+		comments = self._comment_count()
+		logger = MagicMock()
+		with patch.object(frappe, "logger", return_value=logger):
+			for index in range(1, 4):
+				self.gateway.results = [tool_turn(analysis_call(f"t{index}")), make_model_result()]
+				self._run("comment_mention")
+				# the stub writes its plan section again: refused, the ticket has its guidance (AC-65 (c), (d))
+				self.assertEqual(
+					self._tool_results(-1)[f"t{index}"],
+					{"ok": False, "reason": write_ticket.REASON_GUIDANCE_HEADER},
+				)
+
+		self.assertEqual(self._guidance(), 1)
+		self.assertEqual(self._comment_count(), comments)
+		self.assertEqual(len(self._guidance_log_lines(logger)), 3)
+
+	def test_chain_7_ai_after_guidance_creates_task_no_new_guidance(self):
+		self._guidance_by_hand()
+		make_instructor(self)
+		before = self._comment_names()
+		report = f"{PREFIX}đã tạo Task kiểm tra máy in.\nĐộ tin cậy: 90%\n**Căn cứ:** {PREFIX}yêu cầu trong comment"
+		self.gateway.results = [
+			tool_turn(
+				tool_use("t_task", "create_task", subject=f"{PREFIX}kiểm tra máy in", description="x"),
+				tool_use("t_report", "post_comment", kind="de_xuat", content=report),
+			),
+			make_model_result(),
+		]
+		with patch.object(authority, "run_instructor", return_value=INSTRUCTOR):
+			self._run("comment_mention")
+
+		self.assertEqual(frappe.db.count("Task", {"ai_ticket": self.ticket.name}), 1)
+		# one result comment, the model's report, without the marker; still one guidance
+		self.assertEqual(list(self._new_comments(before).values()), [report])
+		self.assertEqual(self._guidance(), 1)
+
+	def test_chain_8_level_l0_or_excluded_team_zero(self):
+		with self.subTest("level L0"):
+			set_agent_settings(permission_level="L0")
+			ticket = make_ticket(subject=f"{PREFIX}guidance L0").name
+			self.gateway.results = [classify_at(90)]
+			runner.run_for_ticket(ticket, "ticket_insert")
+			self.assertEqual(self._guidance(ticket), 0)
+
+		with self.subTest("excluded team"):
+			team = make_team(self)
+			set_agent_settings(permission_level="L1", excluded_teams=team)
+			ticket = make_ticket(subject=f"{PREFIX}guidance excluded").name
+			frappe.db.set_value("HD Ticket", ticket, "agent_group", team, update_modified=False)
+			self.gateway.calls.clear()
+			self.gateway.results = [classify_at(90), make_model_result()]
+			runner.run_for_ticket(ticket, "ticket_insert")
+			self.assertEqual(self.gateway.call_count, 0)
+			self.assertEqual(self._guidance(ticket), 0)
+
+	def test_chain_9_empty_prompt_two_runs_one_guidance(self):
+		# AC-65 (d), AC-38: with the prompt overridden by an empty text the system still refuses a second guidance
+		forged = f"{write_ticket.GUIDANCE_MARKER}\n**Hướng xử lý:** {PREFIX}lần hai\nĐộ tin cậy: 90%"
+		with patch.object(runner, "build_reason_system", return_value=""):
+			self.gateway.results = [classify_at(90), make_model_result()]
+			self._run()
+			self.gateway.results = [
+				tool_turn(tool_use("t_forged", "post_comment", kind="de_xuat", content=forged)),
+				make_model_result(),
+			]
+			self._run("comment_mention")
+
+		self.assertEqual(
+			self._tool_results(-1)["t_forged"], {"ok": False, "reason": write_ticket.REASON_MARKER}
+		)
+		self.assertEqual(self._guidance(), 1)
+
+	def _proposal_run_settings(self):
+		"""L3 with the code switch on and a sandbox app: the run can make one code proposal (CHANGE_GROUP needs L3)."""
+		self.sandbox = GitSandbox(self, apps=(SANDBOX_APP,), erp_ai_worktree=None)
+		self.sandbox.commit_file(SANDBOX_APP, SANDBOX_REL, SANDBOX_BEFORE)
+		set_agent_settings(
+			permission_level="L3", level_cap_a="L3", code_change_enabled=1, code_change_apps=SANDBOX_APP
+		)
+
+	def _propose_call(self, block_id):
+		return tool_use(
+			block_id,
+			"propose_file_change",
+			path=f"{SANDBOX_APP}/{SANDBOX_REL}",
+			find=["x = 1"],
+			replace=["x = 2"],
+			reason="r",
+		)
+
+	def test_guidance_has_analysis_plan_done_pending(self):
+		# AC-65 (a) [changed], AC-66 [changed]: marker, the model's analysis and plan, then Đã làm, Chờ duyệt; the
+		# route's request to the team lead sits inside the plan section; no grounds, no "who decides" heading
+		self._proposal_run_settings()
+		set_agent_settings(auto_assign_enabled=1)
+		self.gateway.results = [
+			classify_at(90),
+			tool_turn(self._propose_call("t_propose"), analysis_call("t_analysis")),
+			make_model_result(),
+		]
+		with patch.object(authority, "run_instructor", return_value="Administrator"):
+			self._run()
+
+		content = self._guidance_content()
+		self.assertEqual(content.splitlines()[0], write_ticket.GUIDANCE_MARKER)
+		self.assertEqual(_headings(content), ["Nhận định", "Hướng xử lý", "Đã làm", "Chờ duyệt"])
+		manual = escape_html(ASSIGN_REQUEST.format(reason=REASON_NO_VALID_ASSIGNEE))
+		self.assertLess(content.index("**Hướng xử lý:**"), content.index(manual))
+		self.assertLess(content.index(manual), content.index("Độ tin cậy: 90%"))
+		(proposal,) = frappe.get_all(PROPOSAL_DOCTYPE, filters={"ticket": self.ticket.name}, pluck="name")
+		pending = escape_html(propose_change.pending_line(frappe.get_doc(PROPOSAL_DOCTYPE, proposal)))
+		self.assertIn(
+			f"<p><strong>Chờ duyệt:</strong> {write_ticket.PENDING_NOTE}</p><ul><li>{pending}</li></ul>",
+			content,
+		)
+		self.assertNotIn("Căn cứ", content)
+		self.assertNotIn("Cần ai quyết", content)
+
+		with self.subTest("an empty section does not show"):
+			ticket = make_ticket(subject=f"{PREFIX}guidance no proposal").name
+			set_agent_settings(auto_assign_enabled=0)
+			self.gateway.results = [
+				classify_at(90),
+				tool_turn(analysis_call("t_analysis")),
+				make_model_result(),
+			]
+			with patch.object(authority, "run_instructor", return_value="Administrator"):
+				runner.run_for_ticket(ticket, "ticket_insert")
+			self.assertEqual(
+				_headings(self._guidance_content(ticket)), ["Nhận định", "Hướng xử lý", "Đã làm"]
+			)
+
+	def test_marker_refusal_one_failed_action_entry(self):
+		# AC-65 (d), ADR-036 QĐ 8: a refused marker is one ok=false entry with its reason; nothing of it is posted
+		forged = f"{write_ticket.GUIDANCE_MARKER}\n{PREFIX}giả hướng xử lý\nĐộ tin cậy: 90%"
+		self.gateway.results = [
+			classify_at(90),
+			tool_turn(tool_use("t_forged", "post_comment", kind="de_xuat", content=forged)),
+			make_model_result(),
+		]
+		self._run()
+
+		first = self._entries(entry_type="reason")[0]
+		instructor = authority.run_instructor(self.ticket.name, "ticket_insert")
+		self.assertEqual(
+			json.loads(first.actions),
+			[
+				action_entry(
+					"post_comment",
+					"Comment",
+					None,
+					False,
+					reason=write_ticket.REASON_MARKER,
+					instructor=instructor,
+				)
+			],
+		)
+		self.assertEqual(self._guidance(), 1)
+		self.assertNotIn(f"{PREFIX}giả", self._guidance_content())
+
+	def test_max_turns_exit_still_posts_guidance(self):
+		# AD3-2: the loop running out of turns is an exit without error too
+		set_agent_settings(max_turns_per_run=2)
+		self.gateway.results = [
+			classify_at(90),
+			tool_turn(tool_use("t1", "get_ticket")),
+			tool_turn(tool_use("t2", "get_ticket")),
+		]
+		self._run()
+
+		self.assertEqual(self._guidance(), 1)
+		last = self._entries(entry_type="reason")[-1]
+		self.assertEqual(last.stop_reason, runner.STOP_MAX_TURNS)
+		self.assertEqual([a["tool"] for a in json.loads(last.actions)], [runner.GUIDANCE_TOOL])
+
+	def test_lost_race_posts_result_comment_escaped_once(self):
+		# w1.md:105, AD3-4: a run in parallel posted the guidance first; this run reports its lines as before, in one
+		# comment without the marker, each line escaped once, no section heading
+		run_id, fixed = self._fixed_run_id()
+		raw = f"{PREFIX}<b>&x"
+
+		def rival_then_line(task, kwargs):
+			if task == "reason":
+				write_ticket._post(
+					self.ticket.name, f"{write_ticket.GUIDANCE_MARKER}\n{PREFIX}hướng của lần kia"
+				)
+				write_ticket.collect(run_id, write_ticket.SECTION_DONE, raw)
+
+		self.gateway.on_call = rival_then_line
+		self.gateway.results = [classify_at(90), make_model_result()]
+		before = self._comment_names()
+		logger = MagicMock()
+		with fixed, patch.object(frappe, "logger", return_value=logger):
+			self._run()
+
+		self.assertEqual(self._guidance(), 1)
+		(result,) = [text for text in self._new_comments(before).values() if not text.startswith("<!--")]
+		self.assertEqual(result.count(escape_html(raw)), 1)
+		self.assertNotIn(raw, result)
+		self.assertNotIn("&amp;lt;", result)
+		self.assertNotIn("<strong>", result)
+		self.assertNotIn(write_ticket.GUIDANCE_MARKER, result)
+		self.assertTrue(result.endswith(escape_html(raw)))
+		self.assertEqual(len(self._guidance_log_lines(logger)), 1)
+		(last,) = self._entries(entry_type="reason")
+		(posted,) = json.loads(last.actions)
+		self.assertEqual((posted["tool"], posted["ok"]), ("post_routing_comment", True))

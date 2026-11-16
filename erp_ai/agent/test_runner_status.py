@@ -16,6 +16,7 @@ from erp_ai.agent.test_agent_runner import (
 	tool_turn,
 	tool_use,
 )
+from erp_ai.agent.tools import write_ticket
 from erp_ai.constants import (
 	AGENT_STATUS_EVENT,
 	AGENT_USER,
@@ -220,7 +221,9 @@ class TestRunnerStatus(RunnerTestBase):
 		self.assertEqual(self.at_sleep, [(["thinking"], comments_before)])
 		# after the run both did
 		self.assertNotEqual(self._classification(), classification_before)
+		# T116 (G-8, R12b): the run's one comment is its guidance comment, holding the answer and the classification
 		self.assertEqual(self._comment_count(), comments_before + 1)
+		self.assertEqual(write_ticket.count_guidance(self.ticket.name), 1)
 
 	def test_indicator_stays_thinking_while_waiting(self):
 		self._set_delay(4, 4)

@@ -724,7 +724,7 @@ class TestTicketPanelGateParity(FrappeTestCase):
 
 		def record_level(*args, **kwargs):
 			level = real_effective_level(*args, **kwargs)
-			levels.append(level)
+			levels.append((kwargs.get("over_budget"), level))
 			return level
 
 		with patch.object(policy, "effective_level", side_effect=record_level):
@@ -801,4 +801,14 @@ class TestTicketPanelGateParity(FrappeTestCase):
 				if name in ("excluded_group", "ai_opt_out"):
 					self.assertEqual(self.gateway.call_count, 0)
 				if name in self.LEVEL_BY_BRANCH:
-					self.assertEqual(set(via_panel["levels"]), {self.LEVEL_BY_BRANCH[name]})
+					over_budget = name in self.SPEND_BY_BRANCH
+					self.assertEqual(
+						{lvl for ob, lvl in via_panel["levels"] if ob == over_budget},
+						{self.LEVEL_BY_BRANCH[name]},
+					)
+					if over_budget:
+						# the over_budget=False probe of the run reads the base level
+						self.assertEqual(
+							{lvl for ob, lvl in via_panel["levels"] if ob is False},
+							{settings["permission_level"]},
+						)

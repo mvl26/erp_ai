@@ -1786,6 +1786,19 @@ class TestHumanFilledFields(RoutingTestBase):
 		self.assertEqual(json.loads(entry.human_corrected_to), dict(before))
 		self.assertEqual(entry.predicted_priority, "High")
 
+	def test_human_corrected_to_stores_vietnamese_text_as_is(self):
+		# C8-fix1 R14e: the person's label is stored readable, never as \u escapes
+		ticket = make_ticket(subject=f"{PREFIX}nhãn của người").name
+		team = f"{PREFIX}Nhóm kế toán"
+		frappe.db.set_value(
+			"HD Ticket", ticket, {"agent_group": team, "ai_classified_by": CLASSIFIED_BY_HUMAN}
+		)
+
+		entry = self._run_insert(ticket)
+
+		self.assertIn(f'"agent_group": "{team}"', entry.human_corrected_to)
+		self.assertEqual(json.loads(entry.human_corrected_to)["agent_group"], team)
+
 
 class TestConfidencePct(RoutingTestBase):
 	"""AC-22 (phán quyết 2, T108): the number on the ticket is the classify row's, written only by the route step."""
@@ -1836,6 +1849,7 @@ CLASSIFY_SPLIT = json.dumps(
 		"cac_yeu_cau": SPLIT_REQUESTS,
 	}
 )
+CLASSIFY_SPLIT_LOW = json.dumps({**json.loads(CLASSIFY_SPLIT), "do_tin_cay_pct": 69})
 # A Datetime field of HD Ticket that only an on-hold status change writes: the test's due date.
 DUE_COLUMN = "on_hold_since"
 
@@ -1985,6 +1999,37 @@ class TestRunnerHooks(RoutingTestBase):
 			},
 		)
 		self.assertEqual(len(asked), 1)
+
+	def test_split_marked_asked_only_when_its_comment_is_posted(self):
+		# C8-fix1 R14c (AC-28): a classify row records the split question only once a comment carrying it is posted;
+		# a run that posts none leaves it to a later run.
+		split = split_request_comment(parse_classification(CLASSIFY_SPLIT))
+		with self.subTest("below the threshold: no route, no question, the next run at the threshold asks"):
+			entry = self._run_with(CLASSIFY_SPLIT_LOW)
+			self.assertEqual((entry.applied, entry.split_requested, entry.split_requests), (0, 0, None))
+
+			self.gateway.results = [make_model_result(text=CLASSIFY_SPLIT), make_model_result()]
+			self._run()
+			(later,) = [e for e in self._entries(entry_type="classify") if e.name != entry.name]
+			self.assertTrue(self._route_comment(later).endswith(split))
+			self.assertEqual((later.split_requested, json.loads(later.split_requests)), (1, SPLIT_REQUESTS))
+
+		with self.subTest("refused route: the ticket was routed by an earlier run"):
+			self.ticket = make_ticket(subject=f"{PREFIX}split after route")
+			first = self._run_with(CLASSIFY_B_NO_SCORE)
+			self.assertEqual(first.applied, 1)
+			self.gateway.results = [make_model_result(text=CLASSIFY_SPLIT), make_model_result()]
+			self._run()
+			(refused,) = [e for e in self._entries(entry_type="classify") if e.name != first.name]
+			self.assertEqual((refused.applied, refused.split_requested, refused.split_requests), (0, 0, None))
+
+		with self.subTest("the route comment failed"):
+			self.ticket = make_ticket(subject=f"{PREFIX}split comment failed")
+			with patch.object(
+				runner, "post_routing_comment", side_effect=ValueError(f"{PREFIX}comment hỏng")
+			):
+				entry = self._run_with(CLASSIFY_SPLIT)
+			self.assertEqual((entry.applied, entry.split_requested, entry.split_requests), (1, 0, None))
 
 	def test_watcher_failure_rolls_back_only_watcher_unit(self):
 		watcher = self._d_watcher()

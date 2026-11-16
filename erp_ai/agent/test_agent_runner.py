@@ -3832,6 +3832,25 @@ class TestRunNotices(RunnerTestBase):
 		runner.run_for_ticket(other, "comment_mention")
 		self.assertEqual(self._notices("over_budget", other), [])
 
+	def test_over_budget_notice_committed_before_the_model_call(self):
+		# C8-fix1 R14a: the notice's dedup read locks the ticket row; a commit right after it frees the lock before the
+		# first reasoning call, which may take minutes. Commits are recorded with what they would make durable.
+		self.month_spend.return_value = 2000.0
+		set_agent_settings(permission_level="L3")
+		commits = []
+		self.addCleanup(setattr, frappe.flags, "in_test", frappe.flags.in_test)
+		frappe.flags.in_test = False
+		with patch.object(
+			frappe.db,
+			"commit",
+			side_effect=lambda: commits.append((len(self._notices("over_budget")), self.gateway.call_count)),
+		):
+			self._run("comment_mention")
+
+		# the first commit: the notice is written, no model call made yet
+		self.assertEqual(commits[0], (1, 0))
+		self.assertEqual(self.gateway.call_count, 1)
+
 	def test_failures_one_comment_until_next_success(self):
 		set_agent_settings(max_runs_per_ticket_per_day=10)
 		self.gateway.results = [GatewayError("deadline")]
@@ -4058,6 +4077,23 @@ class TestAskOnly(RunnerTestBase):
 		(entry,) = self._entries(entry_type="classify")
 		self.assertEqual(entry.applied, 0)
 		self.assertEqual(self._comments(), [self._fallback_text(75, threshold=80)])
+
+	def test_second_run_below_threshold_asks_again(self):
+		# C8-fix1 R14d (AC-22, ADR-037): the fallback is one per run, not one per ticket ever: a later run that still
+		# scores below the threshold and whose model asks nothing posts its own one question.
+		for _ in range(2):
+			self.gateway.results = [classify_at(69), make_model_result()]
+			self._run()
+
+		self.assertEqual(self._comments(), [self._fallback_text(69)] * 2)
+		first, second = self._entries(entry_type="reason")
+		self.assertNotEqual(first.run_id, second.run_id)
+		posted = [json.loads(entry.actions) for entry in (first, second)]
+		self.assertEqual(
+			[(action["tool"], action["value_after"]) for (action,) in posted],
+			[(runner.NOTICE_TOOL, {"notice": "ask_fallback"})] * 2,
+		)
+		self.assertEqual(sorted(action["name"] for (action,) in posted), sorted(self._fallbacks()))
 
 	def test_missing_evidence_error_reaches_model_comment_not_posted(self):
 		question = f"{PREFIX}máy in nào?"

@@ -10422,5 +10422,521 @@ class TestGuidanceSectionRules(unittest.TestCase):
 					self.assertIn("outside write_ticket.py and propose_change.py", found[0])
 
 
+# ---------------------------------------------------------------------------------------------------
+# ADR-036 and ADR-037 (T119, w1.md:203, AD3-3, design-w1-fixes-13 Điểm 3)
+# ---------------------------------------------------------------------------------------------------
+
+GUIDANCE_WRITER_FILE = "agent/tools/write_ticket.py"
+RUNNER_FILE = "agent/runner.py"
+HANDLERS_FILE = "handlers.py"
+# The marker's names and its text (the key inside the HTML comment): the writer module's alone.
+GUIDANCE_MARKER_NAMES = ("GUIDANCE_MARKER", "_GUIDANCE_KEY")
+GUIDANCE_MARKER_TEXT = "erp_ai:huong-xu-ly"
+GUIDANCE_WRITER = "post_guidance"
+GUIDANCE_WRITER_CALLER = "_finish_guidance"
+WRITE_TICKET_MODULE = "erp_ai.agent.tools.write_ticket"
+# AD3-3: the writer module never depends on the proposal, catalog or runner modules (by their last name).
+WRITE_TICKET_FORBIDDEN_MODULES = ("propose_change", "catalog", "catalog_tools", "runner")
+# ADR-036 QĐ 6: no stored "already has guidance" field; the comment is the truth.
+GUIDANCE_FLAG_WORDS = ("guidance", "huong")
+GUIDANCE_FLAG_DOCTYPE_FILES = (
+	"erp_ai_agent/doctype/erp_ai_log/erp_ai_log.json",
+	"erp_ai_agent/doctype/erp_ai_setting/erp_ai_setting.json",
+)
+# The HD Ticket fields of the app are created from this file (install._ai_field_specs).
+TICKET_FIELDS_FILE = "install.py"
+_FIELDNAME = re.compile(r"[a-z][a-z0-9_]*")
+# Rule A (design-w1-fixes-13 Điểm 3): T168 adds "create_task", T169 "post_comment_tool".
+DEDUP_WRITERS = ("post_notice", "post_guidance")
+DEDUP_UNLOCKED_READS = (
+	"frappe.db.count",
+	"frappe.db.exists",
+	"frappe.db.get_values",
+	"frappe.db.get_all",
+	"frappe.get_all",
+	"frappe.get_list",
+	"frappe.db.sql",
+)
+# Rule B (design-w1-fixes-13 Điểm 3).
+ROUTE_FUNCTION = "_route"
+ROUTE_LOCK_CALLS = ("locked_count", "locked_rows")
+ROUTE_WRITE_CALLS = ("_record_route", "execute_tool", "set_value", "save", "insert", "db_set", "sql")
+FOR_UPDATE_ALLOWED = {
+	("agent/tools/write_ticket.py", "locked_rows"),
+	("agent/changes/transitions.py", "_lock"),
+}
+
+
+def _names_used(tree: ast.AST, names) -> list:
+	"""Name, Attribute and import-alias nodes whose name is one of `names`."""
+	return [
+		node
+		for node in ast.walk(tree)
+		if (isinstance(node, ast.Name) and node.id in names)
+		or (isinstance(node, ast.Attribute) and node.attr in names)
+		or (isinstance(node, ast.alias) and ({node.name.rpartition(".")[2], node.asname} & set(names)))
+	]
+
+
+def _top_level_function(tree: ast.AST, name: str):
+	return next(
+		(
+			node
+			for node in tree.body
+			if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef) and node.name == name
+		),
+		None,
+	)
+
+
+def _enclosing_functions(tree: ast.AST) -> dict:
+	"""`{id(node): name of the nearest enclosing function}` for every node inside a function."""
+	owner = {}
+
+	def visit(node, function):
+		for child in ast.iter_child_nodes(node):
+			name = child.name if isinstance(child, ast.FunctionDef | ast.AsyncFunctionDef) else function
+			if name is not None:
+				owner[id(child)] = name
+			visit(child, name)
+
+	visit(tree, None)
+	return owner
+
+
+def check_guidance_marker_defined_once_used_only_by_writer_module(sources: dict) -> list:
+	"""ADR-036 Ràng buộc: the marker is assigned exactly once, in the writer module, and spelled out only there; no
+	other product module names it or writes its text."""
+	violations = []
+	if GUIDANCE_WRITER_FILE not in sources:
+		return [f"{GUIDANCE_WRITER_FILE}: file missing"]
+	writer = parse(GUIDANCE_WRITER_FILE, sources[GUIDANCE_WRITER_FILE])
+	for name in GUIDANCE_MARKER_NAMES:
+		assigned = [
+			node
+			for node in ast.walk(writer)
+			if isinstance(node, ast.Assign | ast.AnnAssign)
+			and any(
+				isinstance(target, ast.Name) and target.id == name
+				for written in (node.targets if isinstance(node, ast.Assign) else [node.target])
+				for target in ast.walk(written)
+			)
+		]
+		if len(assigned) != 1:
+			violations.append(
+				f"{GUIDANCE_WRITER_FILE}: {name} assigned {len(assigned)} times, not once (ADR-036)"
+			)
+	texts = [node for node in constant_strings(writer) if GUIDANCE_MARKER_TEXT in node.value]
+	if len(texts) != 1:
+		violations.append(f"{GUIDANCE_WRITER_FILE}: the marker text is written {len(texts)} times, not once")
+	for rel, source in sources.items():
+		if rel == GUIDANCE_WRITER_FILE or not rel.endswith(".py"):
+			continue
+		tree = parse(rel, source)
+		for node in _names_used(tree, GUIDANCE_MARKER_NAMES):
+			violations.append(violation(rel, node, "the guidance marker outside write_ticket.py (ADR-036)"))
+		for node in constant_strings(tree):
+			if GUIDANCE_MARKER_TEXT in node.value:
+				violations.append(
+					violation(rel, node, "the guidance marker text outside write_ticket.py (ADR-036)")
+				)
+	return violations
+
+
+def check_runner_calls_post_guidance_in_one_place(sources: dict) -> list:
+	"""ADR-036 QĐ 1, w1.md:105: outside its own module, the guidance writer is called exactly once, by the runner's
+	`_finish_guidance`; no tool, handler, job or route step calls it."""
+	calls = []
+	for rel, source in sources.items():
+		if rel == GUIDANCE_WRITER_FILE or not rel.endswith(".py"):
+			continue
+		tree = parse(rel, source)
+		owners = _enclosing_functions(tree)
+		calls.extend(
+			(rel, node, owners.get(id(node)))
+			for node in ast.walk(tree)
+			if isinstance(node, ast.Call) and referenced_name(node.func) == GUIDANCE_WRITER
+		)
+	violations = [
+		violation(
+			rel, node, f"{GUIDANCE_WRITER} called outside runner.{GUIDANCE_WRITER_CALLER} (ADR-036 QĐ 1)"
+		)
+		for rel, node, owner in calls
+		if (rel, owner) != (RUNNER_FILE, GUIDANCE_WRITER_CALLER)
+	]
+	if len(calls) != 1:
+		violations.append(
+			f"{RUNNER_FILE}: {GUIDANCE_WRITER} called {len(calls)} times, not once (ADR-036 QĐ 1)"
+		)
+	return violations
+
+
+def check_dedup_reads_go_through_locked_count(sources: dict) -> list:
+	"""Rule A (ADR-036 QĐ 4, design-w1-fixes-13 Điểm 3): each DEDUP_WRITERS function of write_ticket.py reads through
+	`locked_count` or `count_guidance(..., lock=True)`, never with its own read or lock."""
+	if GUIDANCE_WRITER_FILE not in sources:
+		return []
+	tree = parse(GUIDANCE_WRITER_FILE, sources[GUIDANCE_WRITER_FILE])
+	violations = []
+	for name in DEDUP_WRITERS:
+		function = _top_level_function(tree, name)
+		if function is None:
+			violations.append(f"{GUIDANCE_WRITER_FILE}: {name}: không thấy hàm")
+			continue
+		calls = [node for node in ast.walk(function) if isinstance(node, ast.Call)]
+		locked = any(
+			referenced_name(call.func) == "locked_count"
+			or (
+				referenced_name(call.func) == "count_guidance"
+				and any(
+					keyword.arg == "lock"
+					and isinstance(keyword.value, ast.Constant)
+					and keyword.value.value is True
+					for keyword in call.keywords
+				)
+			)
+			for call in calls
+		)
+		if not locked:
+			text = f"{name}: no locked_count(...) or count_guidance(..., lock=True) (ADR-036 QĐ 4)"
+			violations.append(violation(GUIDANCE_WRITER_FILE, function, text))
+		for call in calls:
+			if dotted_name(call.func) in DEDUP_UNLOCKED_READS:
+				text = f"{name}: own read {dotted_name(call.func)} instead of locked_count (ADR-036 QĐ 4)"
+				violations.append(violation(GUIDANCE_WRITER_FILE, call, text))
+		violations.extend(
+			violation(
+				GUIDANCE_WRITER_FILE, node, f"{name}: own for_update instead of locked_count (ADR-036 QĐ 4)"
+			)
+			for node in ast.walk(function)
+			if isinstance(node, ast.keyword) and node.arg == "for_update"
+		)
+	return violations
+
+
+def check_handlers_do_not_import_write_ticket(sources: dict) -> list:
+	"""ADR-036 Ràng buộc, ADR-033 QĐ 2: the handlers only queue runs; they never import the guidance writer module."""
+	if HANDLERS_FILE not in sources:
+		return []
+	tree = parse(HANDLERS_FILE, sources[HANDLERS_FILE])
+	return [
+		f"{HANDLERS_FILE}:{line}: imports {module} (ADR-036: the handlers do not read the guidance)"
+		for line, module in imported_modules(tree, module_name(HANDLERS_FILE), False)
+		if module_in(module, WRITE_TICKET_MODULE)
+	]
+
+
+def check_write_ticket_imports_no_proposal_or_catalog_module(sources: dict) -> list:
+	"""AD3-3: write_ticket.py imports no proposal, catalog or runner module; they call it, never the other way."""
+	if GUIDANCE_WRITER_FILE not in sources:
+		return []
+	tree = parse(GUIDANCE_WRITER_FILE, sources[GUIDANCE_WRITER_FILE])
+	return [
+		f"{GUIDANCE_WRITER_FILE}:{line}: imports {module} (AD3-3)"
+		for line, module in imported_modules(tree, module_name(GUIDANCE_WRITER_FILE), False)
+		if module.rpartition(".")[2] in WRITE_TICKET_FORBIDDEN_MODULES
+	]
+
+
+def check_no_guidance_flag_field(sources: dict) -> list:
+	"""ADR-036 QĐ 6: no field named for the guidance on ERP AI Log or ERP AI Setting (their DocType JSON) or on HD
+	Ticket (the field names install.py creates). `sources` holds the JSON files too."""
+	violations = []
+	for rel in GUIDANCE_FLAG_DOCTYPE_FILES:
+		if rel not in sources:
+			violations.append(f"{rel}: file missing")
+			continue
+		for field in json.loads(sources[rel]).get("fields", []):
+			name = field.get("fieldname") or ""
+			if any(word in name for word in GUIDANCE_FLAG_WORDS):
+				violations.append(f"{rel}: field {name} (ADR-036 QĐ 6: no guidance flag)")
+	if TICKET_FIELDS_FILE in sources:
+		for node in constant_strings(parse(TICKET_FIELDS_FILE, sources[TICKET_FIELDS_FILE])):
+			if _FIELDNAME.fullmatch(node.value) and any(word in node.value for word in GUIDANCE_FLAG_WORDS):
+				text = f"HD Ticket field {node.value} (ADR-036 QĐ 6: no guidance flag)"
+				violations.append(violation(TICKET_FIELDS_FILE, node, text))
+	return violations
+
+
+def check_route_locks_ticket_before_first_write_unit(sources: dict) -> list:
+	"""Rule B (ADR-037 Ràng buộc, design-w1-fixes-13 Điểm 3). (B1) `_route` of runner.py calls locked_count or
+	locked_rows before its first write unit, and has one. (B2) no `for_update` other than False in a product module,
+	but in the two places FOR_UPDATE_ALLOWED names."""
+	violations = []
+	if RUNNER_FILE in sources:
+		function = _top_level_function(parse(RUNNER_FILE, sources[RUNNER_FILE]), ROUTE_FUNCTION)
+		calls = [node for node in ast.walk(function) if isinstance(node, ast.Call)] if function else []
+		where = lambda node: (node.lineno, node.col_offset)  # noqa: E731
+		locks = sorted((call for call in calls if referenced_name(call.func) in ROUTE_LOCK_CALLS), key=where)
+		writes = sorted(
+			(
+				call
+				for call in calls
+				if (referenced_name(call.func) or "").endswith("_unit")
+				or referenced_name(call.func) in ROUTE_WRITE_CALLS
+			),
+			key=where,
+		)
+		if function is None or not writes:
+			violations.append(
+				f"{RUNNER_FILE}: {ROUTE_FUNCTION} has no write unit (the rule must not hold empty)"
+			)
+		elif not locks:
+			violations.append(
+				violation(RUNNER_FILE, function, f"{ROUTE_FUNCTION} never locks the ticket (ADR-037 QĐ 4)")
+			)
+		elif where(locks[0]) >= where(writes[0]):
+			text = f"{ROUTE_FUNCTION} writes before it locks the ticket (ADR-037 QĐ 4)"
+			violations.append(violation(RUNNER_FILE, writes[0], text))
+	for rel, source in sources.items():
+		if not rel.endswith(".py") or Path(rel).name.startswith("test_"):
+			continue
+		tree = parse(rel, source)
+		owners = _enclosing_functions(tree)
+		violations.extend(
+			violation(rel, node, "for_update outside locked_rows and transitions._lock (ADR-037 Ràng buộc)")
+			for node in ast.walk(tree)
+			if isinstance(node, ast.keyword)
+			and _locks(node)
+			and (rel, owners.get(id(node))) not in FOR_UPDATE_ALLOWED
+		)
+	return violations
+
+
+class TestGuidanceArchitectureRules(unittest.TestCase):
+	"""T119: the rules of ADR-036 and ADR-037 on the product, then each one's red and green samples."""
+
+	@classmethod
+	def setUpClass(cls):
+		cls.sources = load_product_sources()
+		cls.with_json = load_product_sources(suffixes=(".py", ".json"))
+
+	def assertCaught(self, violations, *fragments):
+		self.assertGreater(len(violations), 0, "scanner missed the violation")
+		for fragment in fragments:
+			self.assertTrue(any(fragment in text for text in violations), f"{fragment!r} not in {violations}")
+
+	# on the product
+
+	def test_guidance_marker_defined_once_used_only_by_writer_module(self):
+		self.assertEqual(check_guidance_marker_defined_once_used_only_by_writer_module(self.sources), [])
+
+	def test_runner_calls_post_guidance_in_one_place(self):
+		self.assertEqual(check_runner_calls_post_guidance_in_one_place(self.sources), [])
+
+	def test_dedup_reads_go_through_locked_count(self):
+		self.assertEqual(check_dedup_reads_go_through_locked_count(self.sources), [])
+
+	def test_handlers_do_not_import_write_ticket(self):
+		self.assertEqual(check_handlers_do_not_import_write_ticket(self.sources), [])
+
+	def test_no_guidance_flag_field(self):
+		self.assertEqual(check_no_guidance_flag_field(self.with_json), [])
+
+	def test_write_ticket_imports_no_proposal_or_catalog_module(self):
+		self.assertEqual(check_write_ticket_imports_no_proposal_or_catalog_module(self.sources), [])
+
+	# samples
+
+	W = GUIDANCE_WRITER_FILE
+	R = RUNNER_FILE
+	WRITER_CLEAN = (
+		'_GUIDANCE_KEY = "erp_ai:huong-xu-ly"\n'
+		'GUIDANCE_MARKER = f"<!-- {_GUIDANCE_KEY} -->"\n'
+		"def guidance_filters(t):\n\treturn {'content': ['like', GUIDANCE_MARKER + '%']}\n"
+	)
+
+	def test_marker_rule_samples(self):
+		clean = {
+			self.W: self.WRITER_CLEAN,
+			self.R: "from erp_ai.agent.tools.write_ticket import post_guidance\n",
+		}
+		self.assertEqual(check_guidance_marker_defined_once_used_only_by_writer_module(clean), [])
+		cases = {
+			"named in the runner": (
+				{
+					self.W: self.WRITER_CLEAN,
+					self.R: "from erp_ai.agent.tools.write_ticket import GUIDANCE_MARKER\n",
+				},
+				"marker outside write_ticket.py",
+			),
+			"attribute in a tool": (
+				{
+					self.W: self.WRITER_CLEAN,
+					"agent/tools/catalog_tools.py": "x = write_ticket.GUIDANCE_MARKER\n",
+				},
+				"marker outside write_ticket.py",
+			),
+			"text spelled out elsewhere": (
+				{self.W: self.WRITER_CLEAN, "handlers.py": 'MARK = "<!-- erp_ai:huong-xu-ly -->"\n'},
+				"marker text outside write_ticket.py",
+			),
+			"assigned twice": (
+				{self.W: self.WRITER_CLEAN + "GUIDANCE_MARKER = '<!-- x -->'\n"},
+				"GUIDANCE_MARKER assigned 2 times",
+			),
+			"text written twice in the writer": (
+				{self.W: self.WRITER_CLEAN + "OTHER = 'erp_ai:huong-xu-ly'\n"},
+				"marker text is written 2 times",
+			),
+		}
+		for case, (sources, fragment) in cases.items():
+			with self.subTest(case=case):
+				self.assertCaught(
+					check_guidance_marker_defined_once_used_only_by_writer_module(sources), fragment
+				)
+
+	FINISH = "def _finish_guidance(context, actions):\n\treturn post_guidance(context.ticket_name, context.run_id)\n"
+
+	def test_post_guidance_rule_samples(self):
+		self.assertEqual(check_runner_calls_post_guidance_in_one_place({self.R: self.FINISH}), [])
+		cases = {
+			"called twice in the runner": (
+				{self.R: self.FINISH + "def _reason():\n\twrite_ticket.post_guidance(t, r)\n"},
+				"outside runner._finish_guidance",
+			),
+			"called by a handler": (
+				{
+					self.R: self.FINISH,
+					"handlers.py": "def on_comment(doc):\n\tpost_guidance(doc.name, 'x')\n",
+				},
+				"called 2 times",
+			),
+			"never called": ({self.R: "def _reason():\n\treturn True\n"}, "called 0 times"),
+		}
+		for case, (sources, fragment) in cases.items():
+			with self.subTest(case=case):
+				self.assertCaught(check_runner_calls_post_guidance_in_one_place(sources), fragment)
+
+	def test_dedup_rule_samples(self):
+		# design-w1-fixes-13 Điểm 3, verbatim: A0 green; A1, A2, A3 red, one violation each
+		a0 = {
+			self.W: "def post_notice(args, ctx):\n    if locked_count(ctx.ticket_name, 'Comment', {}):\n        return {}\n\ndef post_guidance(ctx, text):\n    if count_guidance(ctx.ticket_name, lock=True):\n        return {}\n"
+		}
+		a1 = {
+			self.W: "def post_notice(args, ctx):\n    if frappe.db.count('Comment', {'reference_name': ctx.ticket_name}):\n        return {}\n\ndef post_guidance(ctx, text):\n    if count_guidance(ctx.ticket_name, lock=True):\n        return {}\n"
+		}
+		a2 = {
+			self.W: "def post_notice(args, ctx):\n    if locked_count(ctx.ticket_name, 'Comment', {}):\n        return {}\n\ndef post_guidance(ctx, text):\n    if count_guidance(ctx.ticket_name):\n        return {}\n"
+		}
+		a3 = {
+			self.W: "def post_notice(args, ctx):\n    if locked_count(ctx.ticket_name, 'Comment', {}):\n        return {}\n"
+		}
+		self.assertEqual(check_dedup_reads_go_through_locked_count(a0), [])
+		for case, sources, name in (("A1", a1, "post_notice"), ("A2", a2, "post_guidance")):
+			with self.subTest(case=case):
+				found = check_dedup_reads_go_through_locked_count(sources)
+				self.assertCaught(found, f"{name}:")
+				# only the function at fault
+				self.assertTrue(all(f"{name}:" in text for text in found), found)
+		with self.subTest(case="A3"):
+			self.assertEqual(
+				check_dedup_reads_go_through_locked_count(a3),
+				[f"{GUIDANCE_WRITER_FILE}: post_guidance: không thấy hàm"],
+			)
+
+	def test_handlers_import_rule_samples(self):
+		clean = {
+			"handlers.py": "from erp_ai.agent import policy\nfrom erp_ai.agent.queue import enqueue_agent_run\n"
+		}
+		self.assertEqual(check_handlers_do_not_import_write_ticket(clean), [])
+		for source in (
+			"from erp_ai.agent.tools import write_ticket\n",
+			"from erp_ai.agent.tools.write_ticket import count_guidance\n",
+			"import erp_ai.agent.tools.write_ticket as wt\n",
+			"from .agent.tools.write_ticket import GUIDANCE_MARKER\n",
+		):
+			with self.subTest(source=source):
+				self.assertCaught(
+					check_handlers_do_not_import_write_ticket({"handlers.py": source}), "imports"
+				)
+
+	def test_write_ticket_import_rule_samples(self):
+		clean = {
+			self.W: "from erp_ai.agent import policy\nfrom erp_ai.agent.tools.registry import ToolContext\n"
+		}
+		self.assertEqual(check_write_ticket_imports_no_proposal_or_catalog_module(clean), [])
+		for source in (
+			"from erp_ai.agent.tools import propose_change\n",
+			"from erp_ai.agent.tools.catalog_tools import record_summary\n",
+			"import erp_ai.agent.catalog\n",
+			"from erp_ai.agent import runner\n",
+			"from . import propose_change\n",
+		):
+			with self.subTest(source=source):
+				self.assertCaught(
+					check_write_ticket_imports_no_proposal_or_catalog_module({self.W: source}), "AD3-3"
+				)
+
+	def test_guidance_flag_field_rule_samples(self):
+		log, setting = GUIDANCE_FLAG_DOCTYPE_FILES
+
+		def doctype(*names):
+			return json.dumps({"fields": [{"fieldname": name} for name in names]})
+
+		clean = {
+			log: doctype("ticket", "run_id"),
+			setting: doctype("enabled", "confidence_threshold"),
+			"install.py": "def _ai_field_specs():\n\treturn [{'fieldname': 'ai_confidence', 'label': 'Hướng giải quyết'}]\n",
+		}
+		self.assertEqual(check_no_guidance_flag_field(clean), [])
+		cases = {
+			"log field": ({**clean, log: doctype("ticket", "guidance_posted")}, "field guidance_posted"),
+			"setting field": (
+				{**clean, setting: doctype("huong_xu_ly_da_dang")},
+				"field huong_xu_ly_da_dang",
+			),
+			"ticket field": (
+				{
+					**clean,
+					"install.py": "def _ai_field_specs():\n\treturn [{'fieldname': 'ai_guidance_posted'}]\n",
+				},
+				"HD Ticket field ai_guidance_posted",
+			),
+			"doctype file gone": ({setting: clean[setting]}, "file missing"),
+		}
+		for case, (sources, fragment) in cases.items():
+			with self.subTest(case=case):
+				self.assertCaught(check_no_guidance_flag_field(sources), fragment)
+
+	def test_route_lock_rule_samples(self):
+		# design-w1-fixes-13 Điểm 3, verbatim: B0, B2c, B2d green; B1a, B1b, B2a, B2b red, one violation each
+		b0 = {
+			self.R: "def _route(log_name, c, d, context, a, s):\n    frappe.db.savepoint('r')\n    if locked_count(context.ticket_name, LOG_DOCTYPE, {'applied': 1}):\n        return []\n    _apply_route_unit(d, c, context, [], [])\n"
+		}
+		b1a = {
+			self.R: "def _route(log_name, c, d, context, a, s):\n    _apply_route_unit(d, c, context, [], [])\n    locked_count(context.ticket_name, LOG_DOCTYPE, {'applied': 1})\n"
+		}
+		b1b = {
+			self.R: "def _route(log_name, c, d, context, a, s):\n    _apply_route_unit(d, c, context, [], [])\n"
+		}
+		b2a = {
+			"agent/tools/read.py": "def peek(name):\n    return frappe.db.get_value('HD Ticket', name, 'name', for_update=True)\n"
+		}
+		b2b = {
+			"agent/changes/apply_job.py": "def claim(name):\n    return frappe.db.get_value('ERP AI Change Proposal', name, 'name', for_update=True)\n"
+		}
+		b2c = {
+			self.W: "def locked_rows(t, d, f, fields=('name',)):\n    frappe.db.get_value('HD Ticket', t, 'name', for_update=True)\n    return frappe.db.get_values(d, f, fields, as_dict=True, for_update=True)\n",
+			"agent/changes/transitions.py": "def _lock(name, *extra):\n    return frappe.db.get_value('ERP AI Change Proposal', name, ['change_status'], as_dict=True, for_update=True)\n",
+		}
+		b2d = {
+			"agent/tools/test_write_ticket.py": "def helper(name):\n    return frappe.db.get_value('HD Ticket', name, 'name', for_update=True)\n"
+		}
+		for case, sources in (("B0", b0), ("B2c", b2c), ("B2d", b2d)):
+			with self.subTest(case=case):
+				self.assertEqual(check_route_locks_ticket_before_first_write_unit(sources), [])
+		for case, sources, fragment in (
+			("B1a", b1a, "writes before it locks"),
+			("B1b", b1b, "never locks"),
+			("B2a", b2a, "agent/tools/read.py:2: for_update"),
+			("B2b", b2b, "agent/changes/apply_job.py:2: for_update"),
+		):
+			with self.subTest(case=case):
+				found = check_route_locks_ticket_before_first_write_unit(sources)
+				self.assertEqual(len(found), 1, found)
+				self.assertCaught(found, fragment)
+
+
 if __name__ == "__main__":
 	unittest.main()

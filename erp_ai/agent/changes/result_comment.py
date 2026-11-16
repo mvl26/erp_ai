@@ -82,7 +82,7 @@ TODO_SENT = (
 )
 
 
-def _masked_reason(reason: str | None) -> str:
+def masked_reason(reason: str | None) -> str:
 	"""Whitespace folded, every word holding `://` or `@` masked, then cut to 300 characters.
 
 	Masking comes before the cut so a secret on the cut boundary is never half kept (NFR-8).
@@ -106,14 +106,14 @@ def _outcome_line(fields: dict) -> str:
 			return f"commit {(fields.get('apply_commit_sha') or '')[:SHORT_SHA_CHARS]}"
 		return f"mã thoát {fields.get('exit_code') or 0}"
 	if status == CHANGE_STATUS_FAILED:
-		line = f"lý do: {_masked_reason(fields.get('failure_reason'))}"
+		line = f"lý do: {masked_reason(fields.get('failure_reason'))}"
 		if fields.get("exit_code"):
 			line += f", mã thoát {fields.get('exit_code')}"
 		if fields.get("undo_by"):
 			line = f"khi hoàn tác, {line}"
 		return line
 	if status == CHANGE_STATUS_STALE:
-		return f"lý do: {_masked_reason(fields.get('failure_reason'))}"
+		return f"lý do: {masked_reason(fields.get('failure_reason'))}"
 	if status == CHANGE_STATUS_UNDONE:
 		return f"commit hoàn tác {(fields.get('undo_commit_sha') or '')[:SHORT_SHA_CHARS]}"
 	raise ValueError(f"not a final change status: {status!r}")
@@ -149,7 +149,7 @@ def _block_lines(fields: dict, doc) -> list[str]:
 	restart = _restart_word(status, doc.get("restart_status"), commands)
 
 	label = (
-		_masked_reason(change_text.block_label(operations)) if operations else f"{len(commands)} lệnh bench"
+		masked_reason(change_text.block_label(operations)) if operations else f"{len(commands)} lệnh bench"
 	)
 	lines = [f"kết quả đề xuất {fields.get('name')} ({label}): {status}"]
 	items = [_item_element(operation, undo_sha, apply_sha) for operation in operations]
@@ -178,9 +178,9 @@ def _item_element(operation, undo_sha: str, apply_sha: str) -> str:
 		state = ITEM_APPLIED
 	else:
 		state = ITEM_NOT_APPLIED
-	target = _masked_reason(operation.path)
+	target = masked_reason(operation.path)
 	if operation.kind == CHANGE_OP_RENAME:
-		target += f" → {_masked_reason(operation.new_path)}"
+		target += f" → {masked_reason(operation.new_path)}"
 	return f"{change_text._ITEM_VERBS[operation.kind]} {target}: {state}"
 
 
@@ -190,7 +190,7 @@ def _block_reason(fields: dict, item_count: int) -> tuple[str, int]:
 	status = fields.get("change_status")
 	if status not in (CHANGE_STATUS_FAILED, CHANGE_STATUS_STALE) or not raw:
 		return "", 0
-	reason = f"lý do: {_masked_reason(raw)}"
+	reason = f"lý do: {masked_reason(raw)}"
 	if status == CHANGE_STATUS_FAILED and fields.get("undo_by"):
 		reason = f"khi hoàn tác, {reason}"
 	match = ITEM_REASON.match(raw)
@@ -221,7 +221,7 @@ def _command_results(stored) -> list[dict]:
 
 
 def _command_element(result: dict) -> str:
-	argv = _masked_reason(" ".join(result["args"]))
+	argv = masked_reason(" ".join(result["args"]))
 	if result["timed_out"]:
 		return f"bench {argv}: quá thời gian"
 	return f"bench {argv}: mã thoát {result['exit_code']}"
@@ -257,7 +257,7 @@ def _todo_hints(restart: str, files_changed: bool, operations, results: list[dic
 		if path
 	}
 	if suffixes.intersection(BUILD_SUFFIXES) and not any(_built(result, app) for result in results):
-		hints.append(f"chạy bench build --app {_masked_reason(app)}")
+		hints.append(f"chạy bench build --app {masked_reason(app)}")
 	if MIGRATE_SUFFIX in suffixes and not any(
 		_done(result) and "migrate" in result["args"] for result in results
 	):

@@ -93,8 +93,14 @@ from erp_ai.constants import (
 )
 
 CLASSIFY_MAX_TOKENS = 600
-REASON_MAX_TOKENS = 4096
+REASON_MAX_TOKENS = 16000
 STOP_TOOL_USE = "tool_use"
+STOP_MAX_TOKENS = "max_tokens"
+CUT_REASON = "bị cắt ở trần độ dài, không chạy"
+CUT_TOOL_RESULT = (
+	"Lời gọi này bị cắt vì câu trả lời chạm trần độ dài nên không được chạy. "
+	"Gọi lại với đầu vào ngắn hơn; việc sửa nhiều file thì tách thành nhiều đề xuất nhỏ."
+)
 STOP_MAX_TURNS = "max_turns"
 STOP_TIME_BUDGET = "time_budget"
 STOP_GATEWAY_ERROR = "gateway_error"
@@ -1381,6 +1387,7 @@ def _reason(
 				ticket_fields=fields,
 				guidance_posted=guidance_posted,
 				conversation=conversation,
+				propose_now=granted.change_block and granted.act_now_block,
 			),
 		}
 	]
@@ -1424,14 +1431,21 @@ def _reason(
 			tool_blocks = [block for block in result.content if block.get("type") == "tool_use"]
 			tool_results, actions, before, after, tool_errors, skipped = [], [], {}, {}, [], []
 			# the whole turn waits, before any of its tools runs (D-6)
-			if delay is not None and any(block["name"] == ANSWER_TOOL for block in tool_blocks):
+			# a turn the output cap cut may hold calls whose input stops half way: none of them runs (BUG-005)
+			cut = result.stop_reason == STOP_MAX_TOKENS and bool(tool_blocks)
+			if not cut and delay is not None and any(block["name"] == ANSWER_TOOL for block in tool_blocks):
 				delay.wait_before_answer(deadline)
 			for block in tool_blocks:
 				status.working(block["name"])
-				tool_results.append(_run_tool(block, context, actions, before, after, tool_errors, skipped))
+				if cut:
+					tool_results.append(_cut_tool_result(block, context, actions, tool_errors))
+				else:
+					tool_results.append(
+						_run_tool(block, context, actions, before, after, tool_errors, skipped)
+					)
 			stop_reason = result.stop_reason
-			wants_tools = stop_reason == STOP_TOOL_USE
-			if wants_tools and turn == max_turns:
+			wants_tools = stop_reason == STOP_TOOL_USE or cut
+			if wants_tools and not cut and turn == max_turns:
 				stop_reason = STOP_MAX_TURNS
 			final = not wants_tools or not tool_results or turn == max_turns
 			if final and collecting(run_id):
@@ -1666,6 +1680,15 @@ def _run_tool(block, context, actions, before, after, tool_errors, skipped):
 			skipped.extend(outcome.get("skipped") or [])
 	content = json.dumps(outcome, ensure_ascii=False, default=str)[:TOOL_RESULT_MAX_CHARS]
 	return {"type": "tool_result", "tool_use_id": block["id"], "content": content}
+
+
+def _cut_tool_result(block, context, actions, tool_errors):
+	"""The `tool_result` of a `tool_use` block of a turn the output cap cut: nothing runs, the model is told (BUG-005)."""
+	name = block["name"]
+	tool_errors.append(f"tool {name}: {STOP_MAX_TOKENS}")
+	if name in WRITE_TOOL_TARGETS:
+		actions.append(_action(name, context, None, False, block.get("input") or {}, crash=CUT_REASON))
+	return {"type": "tool_result", "tool_use_id": block["id"], "content": CUT_TOOL_RESULT, "is_error": True}
 
 
 def _record_snapshot(name, outcome, n, before, after) -> None:

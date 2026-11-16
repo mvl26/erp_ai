@@ -955,7 +955,8 @@ class TestRunnerReasoning(RunnerTestBase):
 
 		(call,) = self.gateway.calls
 		self.assertEqual(call["task"], "reason")
-		self.assertEqual(call["max_tokens"], 4096)
+		# BUG-005: the reasoning cap is 16000, thinking tokens count toward it
+		self.assertEqual(call["max_tokens"], 16000)
 		self.assertGreater(call["deadline"], time.monotonic())
 		table = build_routing_table(DEFAULT_CATEGORY_MAPPING, json.loads(make_routing_rules()), {})
 		self.assertEqual(call["system"], build_reason_system(f"{PREFIX}digest", table))

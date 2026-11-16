@@ -109,6 +109,9 @@ FIELD_LABELS = {"ticket_type": "Loại", "agent_group": "Nhóm", "priority": "Ư
 DEFAULT_MAX_TASKS_PER_RUN = 10
 REASON_NO_ESTIMATE = "Task cần ước lượng bằng giờ, số dương"
 REASON_TASK_LIMIT = "đã tạo đủ {limit} Task trong lần chạy này"
+REASON_TASK_DUPLICATE = "phiếu đã có Task cùng tiêu đề: {task}"
+# The done line of a Task created in a guidance run (U8-1, w1.md:120).
+TASK_DONE = "Đã tạo Task {task} ({hours} giờ)."
 # Per-job state, like the asked runs: run_id -> the number of Tasks the run created.
 _RUN_TASKS_FLAG = "erp_ai_run_tasks"
 # The plan section ends at the next line opening a `**…:**` heading or the confidence line (Điểm 1.2 bước 2).
@@ -571,7 +574,8 @@ def _max_tasks_per_run() -> int:
 
 
 def create_task(args: dict, ctx: ToolContext) -> dict:
-	"""AC-63 (U4b.md:174): a Task of the ticket with its hour estimate, at most `max_tasks_per_run` per run."""
+	"""AC-63 (U4b.md:174, w1.md:120): a Task of the ticket with its hour estimate, once per subject, at most
+	`max_tasks_per_run` per run; in a guidance run it becomes a line of "Đã làm", never a comment."""
 	if not ctx.instructor:
 		return _fail("không có người ra lệnh")
 	if refusal := _task_refusal(ctx):
@@ -579,6 +583,13 @@ def create_task(args: dict, ctx: ToolContext) -> dict:
 	hours = args.get("expected_hours")
 	if not _valid_estimate(hours):
 		return _fail(REASON_NO_ESTIMATE)
+	subject = args["subject"].strip()
+	# AR3-7: the dedup read is locked_count's (ticket lock, then a locking read); the Task name is read after it, as a
+	# locking read too, so it sees the same rows (w1.md:120).
+	same_subject = {"ai_ticket": ctx.ticket_name, "subject": subject}
+	if locked_count(ctx.ticket_name, TASK_DOCTYPE, same_subject):
+		existing = locked_rows(ctx.ticket_name, TASK_DOCTYPE, same_subject)[0]["name"]
+		return _fail(REASON_TASK_DUPLICATE.format(task=existing))
 	created = frappe.flags.setdefault(_RUN_TASKS_FLAG, {})
 	limit = _max_tasks_per_run()
 	if created.get(ctx.run_id, 0) >= limit:
@@ -588,7 +599,7 @@ def create_task(args: dict, ctx: ToolContext) -> dict:
 	task = frappe.get_doc(
 		{
 			"doctype": TASK_DOCTYPE,
-			"subject": args["subject"],
+			"subject": subject,
 			"ai_ticket": ctx.ticket_name,
 			"description": f"{link}\n<p>{text}</p>",
 			"expected_time": float(hours),
@@ -596,6 +607,7 @@ def create_task(args: dict, ctx: ToolContext) -> dict:
 	)
 	task.insert()
 	created[ctx.run_id] = created.get(ctx.run_id, 0) + 1
+	collect(ctx.run_id, SECTION_DONE, TASK_DONE.format(task=task.name, hours=f"{float(hours):g}"))
 	return {"ok": True, "task": task.name}
 
 
@@ -666,7 +678,8 @@ TOOLS: list[ToolSpec] = [
 			"name": "create_task",
 			"description": (
 				"Tạo một Task cho phiếu hiện tại; chỉ dùng khi có người ra lệnh. "
-				"Mỗi Task một việc, có ước lượng giờ; tối đa theo cấu hình mỗi lần chạy."
+				"Mỗi Task một việc, có ước lượng giờ; tiêu đề trùng Task đã có của phiếu bị từ chối; "
+				"tối đa theo cấu hình mỗi lần chạy."
 			),
 			"input_schema": {
 				"type": "object",

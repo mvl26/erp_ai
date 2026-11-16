@@ -338,6 +338,8 @@ DOCTYPE_CONFIG = {
 			"trigger": (
 				"ticket_insert",
 				"comment_mention",
+				"requester_reply",
+				"kb_draft",
 				"change_action",
 				"setting_save",
 				"scheduled_job",

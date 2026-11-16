@@ -4868,6 +4868,7 @@ SITE_ENVIRONMENT_SAMPLE = {
 
 RUN_LIMIT_TRIGGERS_NAME = "RUN_LIMIT_TRIGGERS"
 LOG_TRIGGERS_NAME = "TRIGGERS"
+KB_DRAFT_TRIGGER_NAME = "TRIGGER_KB_DRAFT"
 
 
 def _module_strings(tree: ast.AST) -> dict:
@@ -4912,16 +4913,20 @@ def _trigger_tuple(rel: str, source: str, name: str, constants: dict) -> tuple:
 
 
 def check_run_limit_triggers_subset_of_log_triggers(sources: dict) -> list:
-	"""ADR-033 QĐ 4, C-3: every trigger of policy.RUN_LIMIT_TRIGGERS is a trigger of run_log.TRIGGERS."""
+	"""ADR-033 QĐ 4, C-3: every trigger of policy.RUN_LIMIT_TRIGGERS is a trigger of run_log.TRIGGERS, and
+	(w1a ruling (2), U6b-fixes Sửa 3) the KB-draft trigger is the one log trigger the daily limit leaves out."""
 	for rel in (POLICY_FILE, RUN_LOG_FILE, CONSTANTS_FILE):
 		if rel not in sources:
 			return _missing(rel)
 	constants = _module_strings(parse(CONSTANTS_FILE, sources[CONSTANTS_FILE]))
+	kb_draft = constants.get(KB_DRAFT_TRIGGER_NAME)
 	limited, violations = _trigger_tuple(
 		POLICY_FILE, sources[POLICY_FILE], RUN_LIMIT_TRIGGERS_NAME, constants
 	)
 	logged, log_violations = _trigger_tuple(RUN_LOG_FILE, sources[RUN_LOG_FILE], LOG_TRIGGERS_NAME, constants)
 	violations += log_violations
+	if kb_draft is None:
+		violations.append(f"{CONSTANTS_FILE}: {KB_DRAFT_TRIGGER_NAME} missing")
 	if limited is not None and logged is not None:
 		violations.extend(
 			f"{POLICY_FILE}: {RUN_LIMIT_TRIGGERS_NAME} has {trigger!r}, not in {RUN_LOG_FILE} "
@@ -4929,6 +4934,12 @@ def check_run_limit_triggers_subset_of_log_triggers(sources: dict) -> list:
 			for trigger in limited
 			if trigger not in logged
 		)
+		unlimited = set(logged) - set(limited)
+		if kb_draft is not None and unlimited != {kb_draft}:
+			violations.append(
+				f"{RUN_LOG_FILE}: {LOG_TRIGGERS_NAME} minus {POLICY_FILE} {RUN_LIMIT_TRIGGERS_NAME} is "
+				f"{sorted(unlimited)!r}, must be exactly {{{kb_draft!r}}} (w1a ruling (2))"
+			)
 	return violations
 
 
@@ -5085,18 +5096,19 @@ def _run(ticket_name, trigger, comment_name):
 }
 
 
-# Compliant sample: policy names the two constants, the log lists the same triggers as strings.
+# Compliant sample: policy names the three counted constants, the log lists them and the KB draft as strings.
 RUN_LIMIT_SAMPLE = {
 	CONSTANTS_FILE: (
 		'TRIGGER_TICKET_INSERT = "ticket_insert"\n'
 		'TRIGGER_COMMENT_MENTION = "comment_mention"\n'
+		'TRIGGER_REQUESTER_REPLY = "requester_reply"\n'
 		'TRIGGER_KB_DRAFT = "kb_draft"\n'
 	),
 	POLICY_FILE: (
-		"from erp_ai.constants import TRIGGER_COMMENT_MENTION, TRIGGER_KB_DRAFT, TRIGGER_TICKET_INSERT\n\n"
-		"RUN_LIMIT_TRIGGERS = (TRIGGER_TICKET_INSERT, TRIGGER_COMMENT_MENTION)\n"
+		"from erp_ai.constants import TRIGGER_COMMENT_MENTION, TRIGGER_REQUESTER_REPLY, TRIGGER_TICKET_INSERT\n\n"
+		"RUN_LIMIT_TRIGGERS = (TRIGGER_TICKET_INSERT, TRIGGER_COMMENT_MENTION, TRIGGER_REQUESTER_REPLY)\n"
 	),
-	RUN_LOG_FILE: 'TRIGGERS = ("ticket_insert", "comment_mention")\n',
+	RUN_LOG_FILE: 'TRIGGERS = ("ticket_insert", "comment_mention", "requester_reply", "kb_draft")\n',
 }
 
 
@@ -5474,20 +5486,24 @@ class TestArchitecture(unittest.TestCase):
 		changed = TestScannersCatchViolations.changed
 		self.assertEqual(check_run_limit_triggers_subset_of_log_triggers(self.sources), [])
 		sample = RUN_LIMIT_SAMPLE
-		limit_line = "RUN_LIMIT_TRIGGERS = (TRIGGER_TICKET_INSERT, TRIGGER_COMMENT_MENTION)"
-		log_line = 'TRIGGERS = ("ticket_insert", "comment_mention")'
-		# A log trigger outside the limit (U6b's KB draft) is allowed, and the log may name the constants.
-		for case, log in {
-			"log has one more trigger": 'TRIGGERS = ("ticket_insert", "comment_mention", "kb_draft")',
-			"log names the constants": (
-				"from erp_ai.constants import TRIGGER_COMMENT_MENTION, TRIGGER_KB_DRAFT, TRIGGER_TICKET_INSERT\n"
-				"TRIGGERS = (TRIGGER_TICKET_INSERT, TRIGGER_COMMENT_MENTION, TRIGGER_KB_DRAFT)"
+		limit_line = (
+			"RUN_LIMIT_TRIGGERS = (TRIGGER_TICKET_INSERT, TRIGGER_COMMENT_MENTION, TRIGGER_REQUESTER_REPLY)"
+		)
+		log_line = 'TRIGGERS = ("ticket_insert", "comment_mention", "requester_reply", "kb_draft")'
+		# The log may name the constants instead of the strings.
+		named = changed(
+			sample,
+			RUN_LOG_FILE,
+			replace=(
+				log_line,
+				"from erp_ai.constants import TRIGGER_COMMENT_MENTION, TRIGGER_KB_DRAFT, TRIGGER_REQUESTER_REPLY, "
+				"TRIGGER_TICKET_INSERT\n"
+				"TRIGGERS = (TRIGGER_TICKET_INSERT, TRIGGER_COMMENT_MENTION, TRIGGER_REQUESTER_REPLY, TRIGGER_KB_DRAFT)",
 			),
-		}.items():
-			with self.subTest(allowed=case):
-				allowed = changed(sample, RUN_LOG_FILE, replace=(log_line, log))
-				self.assertEqual(check_run_limit_triggers_subset_of_log_triggers(allowed), [])
-		not_logged = f"{RUN_LIMIT_TRIGGERS_NAME} has 'kb_draft', not in {RUN_LOG_FILE}"
+		)
+		self.assertEqual(check_run_limit_triggers_subset_of_log_triggers(named), [])
+		not_logged = f"{RUN_LIMIT_TRIGGERS_NAME} has 'change_action', not in {RUN_LOG_FILE}"
+		only_kb_draft = "must be exactly {'kb_draft'}"
 		self.assertRuleSamples(
 			check_run_limit_triggers_subset_of_log_triggers,
 			sample,
@@ -5498,22 +5514,52 @@ class TestArchitecture(unittest.TestCase):
 						POLICY_FILE,
 						replace=(
 							limit_line,
-							"RUN_LIMIT_TRIGGERS = (TRIGGER_TICKET_INSERT, TRIGGER_KB_DRAFT)",
+							"RUN_LIMIT_TRIGGERS = (TRIGGER_TICKET_INSERT, TRIGGER_COMMENT_MENTION, "
+							'TRIGGER_REQUESTER_REPLY, "change_action")',
 						),
 					),
 					not_logged,
 				),
-				"limit lists a string the log does not have": (
+				# w1a ruling (2): the KB-draft run is never counted toward the daily limit.
+				"limit counts the KB draft": (
 					changed(
 						sample,
 						POLICY_FILE,
-						replace=(limit_line, 'RUN_LIMIT_TRIGGERS = ("ticket_insert", "kb_draft")'),
+						replace=(limit_line, limit_line.replace(")", ", TRIGGER_KB_DRAFT)")),
 					),
-					not_logged,
+					only_kb_draft,
+				),
+				# U6b-fixes Sửa 3: the requester-reply run is counted.
+				"limit leaves out the requester reply": (
+					changed(
+						sample,
+						POLICY_FILE,
+						replace=(
+							limit_line,
+							"RUN_LIMIT_TRIGGERS = (TRIGGER_TICKET_INSERT, TRIGGER_COMMENT_MENTION)",
+						),
+					),
+					only_kb_draft,
+				),
+				"log has another trigger outside the limit": (
+					changed(
+						sample, RUN_LOG_FILE, replace=(log_line, log_line.replace(")", ', "other_trigger")'))
+					),
+					only_kb_draft,
+				),
+				"log drops the KB draft": (
+					changed(sample, RUN_LOG_FILE, replace=(log_line, log_line.replace(', "kb_draft"', ""))),
+					only_kb_draft,
 				),
 				"log drops a limit trigger": (
-					changed(sample, RUN_LOG_FILE, replace=(log_line, 'TRIGGERS = ("ticket_insert",)')),
+					changed(
+						sample, RUN_LOG_FILE, replace=(log_line, log_line.replace('"comment_mention", ', ""))
+					),
 					f"{RUN_LIMIT_TRIGGERS_NAME} has 'comment_mention', not in {RUN_LOG_FILE}",
+				),
+				"constants lack the KB draft": (
+					changed(sample, CONSTANTS_FILE, replace=('TRIGGER_KB_DRAFT = "kb_draft"\n', "")),
+					f"{CONSTANTS_FILE}: {KB_DRAFT_TRIGGER_NAME} missing",
 				),
 				"limit missing": (
 					changed(sample, POLICY_FILE, replace=(limit_line, "")),
@@ -5535,12 +5581,9 @@ class TestArchitecture(unittest.TestCase):
 					changed(
 						sample,
 						POLICY_FILE,
-						replace=(
-							limit_line,
-							"RUN_LIMIT_TRIGGERS = (TRIGGER_TICKET_INSERT, TRIGGER_REQUESTER_REPLY)",
-						),
+						replace=(limit_line, limit_line.replace(")", ", TRIGGER_UNKNOWN)")),
 					),
-					"element TRIGGER_REQUESTER_REPLY is not a trigger name",
+					"element TRIGGER_UNKNOWN is not a trigger name",
 				),
 				"policy file missing": (
 					{rel: text for rel, text in sample.items() if rel != POLICY_FILE},

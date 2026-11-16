@@ -6,7 +6,7 @@ import frappe
 import frappe.client
 from frappe.tests.utils import FrappeTestCase
 
-from erp_ai.agent import redact, run_log
+from erp_ai.agent import queue, redact, run_log
 from erp_ai.agent.agent_write_guard import AGENT_WRITE_FLAG
 from erp_ai.agent.tools.site_api import SCRUBBED_VALUE, SECRET_FIELDS
 from erp_ai.constants import AGENT_USER, HELPDESK_AGENT_ROLE, LOG_DOCTYPE, ROLE_AGENT
@@ -244,7 +244,15 @@ class TestRunLog(FrappeTestCase):
 		)
 		self.assertEqual(
 			meta.get_field("trigger").options.split("\n"),
-			["ticket_insert", "comment_mention", "change_action", "setting_save", "scheduled_job"],
+			[
+				"ticket_insert",
+				"comment_mention",
+				"requester_reply",
+				"kb_draft",
+				"change_action",
+				"setting_save",
+				"scheduled_job",
+			],
 		)
 		expected = {
 			"change_proposal": ("Link", "ERP AI Change Proposal"),
@@ -738,3 +746,17 @@ class TestBotAction(_RollbackCase):
 				frappe.set_user("Administrator")
 				self.assertEqual(frappe.db.get_value(LOG_DOCTYPE, name, "owner"), user)
 				self.assertFalse(frappe.flags.get(AGENT_WRITE_FLAG))
+
+
+class TestTriggers(FrappeTestCase):
+	# U6b F-5, U6b-fixes Sửa 4: every queued trigger is a run trigger; the `trigger` options of ERP AI Log
+	# are TRIGGERS + CHANGE_TRIGGERS + BOT_ACTION_TRIGGERS, in that order.
+	def test_triggers_match_queue_and_json(self):
+		self.assertEqual(
+			run_log.TRIGGERS, ("ticket_insert", "comment_mention", "requester_reply", "kb_draft")
+		)
+		self.assertLessEqual(set(queue.VALID_TRIGGERS), set(run_log.TRIGGERS))
+		self.assertEqual(
+			frappe.get_meta(LOG_DOCTYPE).get_field("trigger").options.split("\n"),
+			[*run_log.TRIGGERS, *run_log.CHANGE_TRIGGERS, *run_log.BOT_ACTION_TRIGGERS],
+		)

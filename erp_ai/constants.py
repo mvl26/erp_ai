@@ -36,6 +36,8 @@ CHANGE_STEPS = ("propose", "approve", "reject", "apply", "fail", "stale", "undo"
 TRIGGER_TICKET_INSERT = "ticket_insert"
 TRIGGER_COMMENT_MENTION = "comment_mention"
 TRIGGER_CHANGE_ACTION = "change_action"
+TRIGGER_REQUESTER_REPLY = "requester_reply"
+TRIGGER_KB_DRAFT = "kb_draft"
 
 JOB_TIMEOUT_S = 600
 ANSWER_DELAY_MAX_S = 30

@@ -11,7 +11,7 @@ from erp_ai.constants import CHANGE_STEPS, LOG_DOCTYPE, TRIGGER_CHANGE_ACTION
 ENTRY_TYPE_CHANGE = "change"
 ENTRY_TYPE_BOT_ACTION = "bot_action"
 ENTRY_TYPES = ("classify", "reason", "skip", "change", "bot_action")
-TRIGGERS = ("ticket_insert", "comment_mention")
+TRIGGERS = ("ticket_insert", "comment_mention", "requester_reply", "kb_draft")
 CHANGE_TRIGGERS = (TRIGGER_CHANGE_ACTION,)
 TRIGGER_SETTING_SAVE = "setting_save"
 TRIGGER_SCHEDULED_JOB = "scheduled_job"

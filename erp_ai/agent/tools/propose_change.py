@@ -12,7 +12,7 @@ import frappe
 from erp_ai.agent import change_link, change_text
 from erp_ai.agent.agent_write_guard import allow_agent_write
 from erp_ai.agent.tools import change_guard, source
-from erp_ai.agent.tools.registry import ToolContext, ToolSpec
+from erp_ai.agent.tools.registry import CONSOLE_GROUP, ToolContext, ToolSpec
 from erp_ai.agent.tools.registry import _invalid as registry_invalid  # design-addendum-2 A2-2
 from erp_ai.agent.tools.write_ticket import SECTION_PENDING, collect, collecting
 from erp_ai.constants import (
@@ -24,6 +24,7 @@ from erp_ai.constants import (
 	CHANGE_OP_DELETE,
 	CHANGE_OP_EDIT,
 	CHANGE_OP_RENAME,
+	CONSOLE_SCRIPT_MAX_CHARS,
 	PROPOSAL_DOCTYPE,
 )
 
@@ -65,6 +66,9 @@ COMMAND_FIELDS = {"command", "app"}
 # kinds have no "Duyệt ngay" button (AC-39 (3)); the label is the fixed kind, never an argument (B-3).
 PENDING_LINE = "Đề xuất {proposal} ({label}): duyệt ở form đề xuất, không có nút Duyệt ngay."
 PENDING_KINDS = (CHANGE_KIND_CODE, CHANGE_KIND_COMMAND)
+# CHG-010: a console proposal is decided only in the bot panel: no signed link, no form link to approve.
+CONSOLE_COMMENT_LINE = "Duyệt hoặc Từ chối bằng nút trong khung Trao đổi với bot; script không hoàn tác được."
+CONSOLE_PENDING_LINE = "Đề xuất {proposal} (script console): duyệt bằng nút trong khung Trao đổi với bot."
 
 
 def _fail(reason: str) -> dict:
@@ -138,7 +142,11 @@ def _comment(ctx: ToolContext, proposal) -> str:
 	form = f"/app/erp-ai-change-proposal/{proposal.name}"
 	html = f'<p>Đề xuất <a href="{escape(form)}">{escape(name)}</a> đang chờ duyệt: {target}.</p>'
 	html += "".join(f"<p>{escape(line)}</p>" for line in change_text.proposal_notes(proposal))
-	if ctx.one_click_approval:
+	if change_text.is_console(proposal):
+		html += (
+			f'<p><a href="{escape(form)}">Xem nội dung thay đổi</a></p><p>{escape(CONSOLE_COMMENT_LINE)}</p>'
+		)
+	elif ctx.one_click_approval:
 		approve = change_link.decision_path(proposal.name, change_link.ACTION_APPROVE)
 		reject = change_link.decision_path(proposal.name, change_link.ACTION_REJECT)
 		html += (
@@ -155,6 +163,8 @@ def pending_line(proposal) -> str:
 	"""The raw "Chờ duyệt" line of a code or command proposal: its name and kind, no argument (AD3.md:130)."""
 	if proposal.change_kind not in PENDING_KINDS:
 		raise ValueError(f"loại đề xuất lạ: {proposal.change_kind}")
+	if change_text.is_console(proposal):
+		return CONSOLE_PENDING_LINE.format(proposal=proposal.name)
 	return PENDING_LINE.format(proposal=proposal.name, label=proposal.change_kind)
 
 
@@ -456,6 +466,30 @@ def propose_bench_command(args: dict, ctx: ToolContext) -> dict:
 	return _propose_block([], [built], args["reason"], ctx)
 
 
+def propose_console_script(args: dict, ctx: ToolContext) -> dict:
+	"""CHG-010: one pending console proposal; the script is stored as `content_after`, nothing runs here."""
+	if refusal := _entry_refusal(ctx):
+		return refusal
+	script = args["script"]
+	if reason := change_guard.check_console_script(script):
+		return _fail(reason)
+	return _insert(
+		ctx,
+		{
+			"change_kind": CHANGE_KIND_COMMAND,
+			"app": None,
+			"command_list": json.dumps([change_guard.console_args(frappe.local.site)]),
+			"content_after": script,
+			"reason": args["reason"],
+			"reversible": 0,
+			"target_branch": "",
+			"upstream_ref": "",
+			"ahead_count": 0,
+			"is_core_app": 0,
+		},
+	)
+
+
 _PATH = {"type": "string", "minLength": 1, "maxLength": PATH_MAX_CHARS}
 _REASON = {"type": "string", "minLength": 1, "maxLength": REASON_MAX_CHARS}
 _FIND_ITEM = {"type": "string", "minLength": 1}
@@ -558,5 +592,26 @@ TOOLS: list[ToolSpec] = [
 			},
 		},
 		handler=propose_bench_command,
+	),
+	ToolSpec(
+		name="propose_console_script",
+		group=CONSOLE_GROUP,
+		schema={
+			"name": "propose_console_script",
+			"description": (
+				"Tạo một đề xuất script Python chạy như bench console, ở trạng thái Chờ duyệt. Chỉ dùng khi "
+				"không công cụ bản ghi hay hàm whitelist nào làm được việc. Script chạy sau khi người bấm "
+				"Duyệt trong khung Trao đổi với bot, một lần, trong một giao dịch."
+			),
+			"input_schema": {
+				"type": "object",
+				"properties": {
+					"script": {"type": "string", "minLength": 1, "maxLength": CONSOLE_SCRIPT_MAX_CHARS},
+					"reason": _REASON,
+				},
+				"required": ["script", "reason"],
+			},
+		},
+		handler=propose_console_script,
 	),
 ]

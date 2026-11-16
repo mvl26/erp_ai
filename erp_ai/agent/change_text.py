@@ -116,7 +116,7 @@ def _shown(value) -> str:
 	return "" if "://" in text else text
 
 
-def _is_console(proposal_fields) -> bool:
+def is_console(proposal_fields) -> bool:
 	"""A console proposal (CHG-010): no file item and the one command `--site <site> console`."""
 	if proposal_fields.get("operations") or proposal_fields.get("change_kind") != CHANGE_KIND_COMMAND:
 		return False
@@ -139,7 +139,7 @@ def proposal_target(proposal_fields) -> tuple[str, str | None]:
 	follows the text in `<code>`, else None. One builder for the proposal comment and the panel card (CHG-008
 	design 3.4); the branches are those of the comment: a block with items, a block of commands only, a code
 	proposal, any other (a command)."""
-	if _is_console(proposal_fields):
+	if is_console(proposal_fields):
 		return "script console", None
 	if proposal_fields.get("operations") or proposal_fields.get("command_list"):
 		if proposal_fields.get("operations"):

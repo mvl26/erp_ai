@@ -1,23 +1,34 @@
-"""Knowledge read tools of the `read` group (FEAT-007 U6b, AC-46, AC-47, AC-50; ADR-034 QĐ 2, 4).
+"""Knowledge read tools of the `read` group (FEAT-007 U6b, AC-46, AC-47, AC-49, AC-50; ADR-034 QĐ 2-4).
 
 Every string a tool returns goes through `redact_secrets`; the runner cuts the JSON of each tool result at
 `read.TOOL_RESULT_MAX_CHARS`. `_limits` is the one place this module reads ERP AI Setting. No tool here passes
-`ignore_permissions` (ADR-034 Ràng buộc): the Error Log is read by `system_read`, the one permission-free path.
+`ignore_permissions` (ADR-034 Ràng buộc): the Error Log is read by `system_read`, the one permission-free path,
+and a report runs under the session user (the agent account).
 """
 
 import frappe
+from frappe.desk import query_report
 from frappe.utils import cint, get_datetime
 
 from erp_ai.agent import knowledge, policy, system_read
 from erp_ai.agent.redact import redact_secrets
 from erp_ai.agent.tools import read, source
 from erp_ai.agent.tools.read import _schema
-from erp_ai.agent.tools.registry import ToolContext, ToolSpec
+from erp_ai.agent.tools.registry import ToolContext, ToolSpec, _invalid
 from erp_ai.constants import SETTING_DOCTYPE
 
 KNOWLEDGE_TOOL_NAMES = frozenset({"search_knowledge_base", "search_manuals", "read_error_logs", "run_report"})
 MANUALS_NOT_CONFIGURED = "chưa có kho HDSD"
 INVALID_TIME = "thời điểm không hợp lệ: {key}"
+REPORT_FILTER_MAX_KEYS = 10
+REPORT_TYPES = ("Script Report", "Query Report")
+REPORT_NAME_MAX_CHARS = 140
+REASON_NO_REPORTS = "chưa cho phép báo cáo nào"
+REASON_REPORT_NOT_ALLOWED = "báo cáo không nằm trong danh sách cho phép"
+REASON_REPORT_NOT_RUNNABLE = "báo cáo không chạy được"
+REASON_REPORT_ON_TICKET_DATA = "báo cáo dựa trên dữ liệu phiếu hoặc dữ liệu của app: bot không được chạy"
+REASON_REPORT_PERMISSION = "tài khoản agent không có quyền chạy báo cáo này"
+FILTER_VALUE_TYPES = (str, int, float, bool)
 ARTICLE_DOCTYPE = "HD Article"
 # ERP AI Setting Int fields (A-13 defaults, the controller's bounds); a value outside them reads the default.
 KNOWLEDGE_SEARCH_LIMIT_DEFAULT, KNOWLEDGE_SEARCH_LIMIT_MAX = 5, 20
@@ -111,6 +122,61 @@ def read_error_logs(args: dict, ctx: ToolContext) -> dict:
 	return {"ok": True, "errors": [_masked(row) for row in errors]}
 
 
+def _filters_ok(filters) -> bool:
+	"""At most REPORT_FILTER_MAX_KEYS keys, each value a string, a number or a boolean (the registry checks only
+	that `filters` is an object)."""
+	return (
+		isinstance(filters, dict)
+		and len(filters) <= REPORT_FILTER_MAX_KEYS
+		and all(isinstance(value, FILTER_VALUE_TYPES) for value in filters.values())
+	)
+
+
+def _cell(value):
+	return redact_secrets(value) if isinstance(value, str) else value
+
+
+def _row(row, fieldnames: list) -> list:
+	"""The cells of one result row in column order (a dict row by fieldname, a list row as it is), masked."""
+	cells = [row.get(fieldname) for fieldname in fieldnames] if isinstance(row, dict) else list(row)
+	return [_cell(value) for value in cells]
+
+
+def run_report(args: dict, ctx: ToolContext) -> dict:
+	"""AC-49: a report of `allowed_reports`, checked again here (the list can be written past the form, ADR-034
+	QĐ 3), run under the session user without a prepared report, cut to `report_row_limit` rows."""
+	args = args if isinstance(args, dict) else {}
+	filters = args.get("filters", {})
+	if not _filters_ok(filters):
+		return _invalid("filters")
+	report_name = args.get("report_name")
+	_search_limit, allowed, row_limit = _limits()
+	if not allowed:
+		return _refuse(REASON_NO_REPORTS)
+	if report_name not in allowed:
+		return _refuse(REASON_REPORT_NOT_ALLOWED)
+	report = frappe.db.get_value(
+		"Report", report_name, ["report_type", "disabled", "ref_doctype"], as_dict=True
+	)
+	if not report or report.disabled or report.report_type not in REPORT_TYPES:
+		return _refuse(REASON_REPORT_NOT_RUNNABLE)
+	if policy.is_ticket_content_doctype(report.ref_doctype) or report.ref_doctype in read.denied_doctypes():
+		return _refuse(REASON_REPORT_ON_TICKET_DATA)
+	try:
+		result = query_report.run(report_name, filters=filters, ignore_prepared_report=True)
+	except frappe.PermissionError:
+		return _refuse(REASON_REPORT_PERMISSION)
+	columns = result.get("columns") or []
+	rows = result.get("result") or []
+	fieldnames = [column.get("fieldname") for column in columns]
+	return {
+		"ok": True,
+		"columns": [_cell(column.get("label") or column.get("fieldname")) for column in columns],
+		"rows": [_row(row, fieldnames) for row in rows[:row_limit]],
+		"truncated": len(rows) > row_limit,
+	}
+
+
 def _query_property() -> dict:
 	return {"type": "string", "minLength": read.QUERY_MIN_CHARS, "maxLength": read.QUERY_MAX_CHARS}
 
@@ -164,5 +230,24 @@ TOOLS: list[ToolSpec] = [
 			[],
 		),
 		read_error_logs,
+	),
+	ToolSpec(
+		"run_report",
+		"read",
+		_schema(
+			"run_report",
+			"Chạy một báo cáo (Script Report hoặc Query Report) có trong danh sách cho phép của cấu hình, theo "
+			"quyền của tài khoản agent; trả nhãn cột và tối đa số dòng cấu hình.",
+			{
+				"report_name": {"type": "string", "minLength": 1, "maxLength": REPORT_NAME_MAX_CHARS},
+				"filters": {
+					"type": "object",
+					"maxProperties": REPORT_FILTER_MAX_KEYS,
+					"additionalProperties": {"type": ["string", "number", "boolean"]},
+				},
+			},
+			["report_name"],
+		),
+		run_report,
 	),
 ]

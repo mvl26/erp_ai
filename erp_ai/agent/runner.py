@@ -1352,6 +1352,7 @@ def _reason(
 				ticket_fields=fields,
 				guidance_posted=guidance_posted,
 				conversation=conversation,
+				propose_now=granted.change_block and granted.act_now_block,
 			),
 		}
 	]

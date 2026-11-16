@@ -12,7 +12,7 @@ from frappe.utils import escape_html, get_datetime, getdate, now_datetime
 from frappe.utils.file_lock import LockTimeoutError
 from frappe.utils.synchronization import filelock
 
-from erp_ai.agent import policy
+from erp_ai.agent import lifecycle, policy
 from erp_ai.agent.classification import load_mapping
 from erp_ai.agent.kpi import is_bot_close, log_actions
 from erp_ai.agent.ops_data import (
@@ -42,6 +42,8 @@ ACTION_KIND_BY_TOOL = {
 	"create_routed_task": "Task",
 	"post_comment": "comment",
 	"post_routing_comment": "comment",
+	"reply_to_requester": "trả lời",
+	lifecycle.TOOL_LIFECYCLE_COMMENT: "comment",
 }
 # Ok entries of these tools are not counted: their row is already counted ("phân loại" through `applied`, or the
 # `change_step="propose"` row each ok propose entry writes).

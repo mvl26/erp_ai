@@ -79,6 +79,7 @@ from erp_ai.constants import (
 	JOB_TIMEOUT_S,
 	LEVELS,
 	LOG_DOCTYPE,
+	LOG_ENTRY_RUN_EVENT,
 	LOGGER_NAME,
 	MESSAGE_DOCTYPE,
 	PROPOSAL_DOCTYPE,
@@ -255,7 +256,10 @@ def _run(ticket_name, trigger, message_name=None, communication_name=None):
 	# ADR-033 QĐ 2: a requester-reply run is named by its event; each row it writes records the event as handled
 	run_id = queue.requester_reply_key(ticket_name, communication_name) if reply_run else uuid.uuid4().hex
 	# (r1) the event already has a row: run again for nothing, not even a row (ADR-033 QĐ 6, B-2)
-	if reply_run and frappe.db.exists(LOG_DOCTYPE, {"run_id": run_id}):
+	# ADR-048 QĐ 4: only a row the run wrote counts, not the queue's call_received row that carries the key too
+	if reply_run and frappe.db.exists(
+		LOG_DOCTYPE, {"run_id": run_id, "entry_type": ("!=", LOG_ENTRY_RUN_EVENT)}
+	):
 		frappe.logger(LOGGER_NAME).info(ALREADY_HANDLED_LOG, ticket_name, run_id)
 		return
 	# the ask_fallback dedup counts from here: one question per run, not per ticket (AC-22, ADR-037)

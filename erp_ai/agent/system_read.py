@@ -7,14 +7,17 @@ so an escaped `%` or `_` cannot be expressed through it; the keyword goes in as 
 
 Every `method` and `error` goes through `redact_secrets` before it leaves; `error` is masked first and
 cut after (`design-w0-fixes-3.md` 3a), so a cut can never drop a key name and leave its value behind.
+A row whose reference is an HD Ticket of `policy.excluded_ticket_names` is never read (R17c).
 """
 
 from datetime import timedelta
 
 import frappe
 from frappe.query_builder import Order
+from frappe.query_builder.functions import Coalesce
 from frappe.utils import now_datetime
 
+from erp_ai.agent import policy
 from erp_ai.agent.redact import redact_secrets
 
 DEFAULT_WINDOW = timedelta(hours=24)
@@ -57,6 +60,12 @@ def read_error_logs(since=None, until=None, keyword=None, limit=20) -> list[dict
 			frappe.throw(f"Từ khóa phải dài từ {MIN_KEYWORD_LENGTH} đến {MAX_KEYWORD_LENGTH} ký tự")
 		pattern = _like_pattern(keyword)
 		query = query.where(error_log.method.like(pattern) | error_log.error.like(pattern))
+	if excluded := [str(name) for name in policy.excluded_ticket_names()]:
+		# R17c (NFR-1): inside the query, so `limit` counts only returned rows; a NULL column keeps its row.
+		query = query.where(
+			(Coalesce(error_log.reference_doctype, "") != policy.TICKET_DOCTYPE)
+			| Coalesce(error_log.reference_name, "").notin(excluded)
+		)
 
 	rows = query.run(as_dict=True)
 	return [

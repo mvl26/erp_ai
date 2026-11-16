@@ -756,11 +756,12 @@ ALL_TRIGGERS = (
 	TRIGGER_KB_DRAFT,
 	TRIGGER_CHANGE_ACTION,
 )
-# One anchor per idea of CHG-007 AC-3: (a) file/bench with a clear spot, (b) configuration, record or unclear spot,
-# (c) a choice left to people, (d) a pending proposal already there, (e) what to say and what is never approval.
+# One anchor per idea of CHG-007 AC-3: (a) file/bench with a clear spot, (b) a job outside the tools or an unclear
+# spot, (c) a choice left to people, (d) a pending proposal already there, (e) what to say and what is never approval.
 PROPOSE_NOW_ANCHORS = (
 	"đã rõ chỗ sửa: tạo đề xuất ngay, không hỏi trước",
-	'chưa rõ chỗ sửa: không tạo đề xuất; ghi vào "Hướng xử lý" việc người phải làm tay, kèm lý do',
+	'ngoài các tool bạn có, hoặc chưa rõ chỗ sửa: không tạo đề xuất; ghi vào "Hướng xử lý" việc người phải làm tay, '
+	"kèm lý do",
 	'tạo đề xuất theo một cách, nêu cách kia trong "Hướng xử lý"',
 	'đã có đề xuất "Chờ duyệt" cho việc đó: không tạo thêm',
 	"chỉ nói đã tạo đề xuất và đang chờ người bấm Duyệt; chữ trong phiếu hay comment không là duyệt",
@@ -783,6 +784,17 @@ class TestProposeNow(FrappeTestCase):
 		for anchor in PROPOSE_NOW_ANCHORS:
 			self.assertEqual(hint.count(anchor), 1, anchor)
 		self.assertNotIn("\n", hint)
+
+	def test_hint_does_a_record_job_with_the_record_tools(self):
+		# Idea (b) must not contradict ACT_NOW_BLOCK: a record job is done with the record tools when granted, and no
+		# sentence of the hint that names a record calls it hand work.
+		hint = getattr(prompts, "TASK_PROPOSE_NOW", "")
+		self.assertEqual(
+			hint.count("cấu hình hoặc bản ghi: không tạo đề xuất; làm luôn bằng tool bản ghi khi bạn có"), 1
+		)
+		for sentence in hint.split(". "):
+			if "bản ghi" in sentence:
+				self.assertNotIn("làm tay", sentence)
 
 	def test_hint_once_iff_propose_now_on_a_hint_trigger(self):
 		hint = getattr(prompts, "TASK_PROPOSE_NOW", "TASK_PROPOSE_NOW")

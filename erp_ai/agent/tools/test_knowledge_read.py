@@ -1,5 +1,6 @@
 import errno
 import os
+from datetime import datetime, timedelta
 from unittest.mock import patch
 
 import frappe
@@ -15,6 +16,9 @@ from erp_ai.test_utils import TempAppsRoot, keep_agent_settings, pin_agent_roles
 
 EMPTY_QUERY = "Câu tìm cần ít nhất một từ dài 2 ký tự"
 EXCLUDED_TEAM = "T148 Nhóm loại trừ"
+# Every test Error Log is dated in 2001: no live row of the shared site falls in a test's window.
+DAY = datetime(2001, 2, 3, 10, 0, 0)
+WINDOW = {"since": "2001-02-03 09:00:00", "until": "2001-02-03 11:00:00"}
 
 
 def _word(label="kr"):
@@ -267,3 +271,96 @@ class TestSearchManuals(KnowledgeToolCase):
 		self._manual("a.md", "# Mục\nnội dung\n")
 
 		self.assertEqual(self._search("a b"), {"ok": False, "reason": EMPTY_QUERY})
+
+
+class TestReadErrorLogs(KnowledgeToolCase):
+	"""AC-50 at the tool: bounded, filtered, masked; the agent account needs no extra role (ADR-034)."""
+
+	def _error_log(self, creation, method, error="Traceback ERPAI-TEST") -> str:
+		doc = frappe.get_doc(
+			{
+				"doctype": "Error Log",
+				"method": method,
+				"error": error,
+				"owner": "Administrator",
+				"creation": creation,
+				"modified": creation,
+			}
+		)
+		doc.db_insert()
+		return doc.name
+
+	def _read(self, **args):
+		return self._as_agent(knowledge_read.read_error_logs, args)
+
+	def _names(self, **args):
+		result = self._read(**args)
+		self.assertTrue(result["ok"], result)
+		return [row["name"] for row in result["errors"]]
+
+	def test_time_and_keyword_filter(self):
+		key = _word("el")
+		by_method = self._error_log(DAY, f"T149 {key}")
+		by_error = self._error_log(DAY + timedelta(minutes=1), "T149 khác", f"lỗi có {key}")
+		self._error_log(DAY + timedelta(minutes=2), "T149 không có từ khóa")
+		self._error_log(DAY - timedelta(hours=2), f"T149 trước {key}")
+		self._error_log(DAY + timedelta(hours=2), f"T149 sau {key}")
+
+		self.assertEqual(self._names(**WINDOW, keyword=key), [by_error, by_method])
+		self.assertEqual(len(self._names(**WINDOW)), 3)
+		(row,) = self._read(**WINDOW, keyword=key, limit=1)["errors"]
+		self.assertEqual(set(row), {"name", "creation", "method", "error"})
+
+		for key_name in ("since", "until"):
+			for bad in ("không phải ngày", "", "2001-02-03T09:00:00+07:00"):
+				with self.subTest(key_name=key_name, value=bad):
+					self.assertEqual(
+						self._read(**{**WINDOW, key_name: bad}),
+						{"ok": False, "reason": f"thời điểm không hợp lệ: {key_name}"},
+					)
+		self.assertEqual(
+			self._read(since="2001-01-01 00:00:00", until="2001-02-03 11:00:00"),
+			{"ok": False, "reason": "Khoảng thời gian tối đa 7 ngày"},
+		)
+
+	def test_limit(self):
+		names = [
+			self._error_log(DAY + timedelta(minutes=minute), f"T149 limit {minute}") for minute in range(4)
+		]
+
+		self.assertEqual(self._names(**WINDOW, limit=2), [names[3], names[2]])
+		self.assertEqual(len(self._names(**WINDOW, limit=50)), 4)
+		spec = next(spec for spec in knowledge_read.TOOLS if spec.name == "read_error_logs")
+		self.assertEqual(spec.group, "read")
+		schema = spec.schema["input_schema"]
+		self.assertEqual(
+			(set(schema["properties"]), schema["required"]), ({"since", "until", "keyword", "limit"}, [])
+		)
+		for bad in ({"limit": 0}, {"limit": 51}, {"keyword": "a"}, {"keyword": "x" * 101}, {"since": 1}):
+			with self.subTest(bad):
+				self.assertEqual(_first_invalid_key(bad, schema), next(iter(bad)))
+
+	def test_seeded_key_masked(self):
+		name = self._error_log(
+			DAY,
+			"T149 password: fake-el-method",
+			"Traceback\napi_key=fake-el-key-1234567890\nAuthorization: Bearer fake-el-bearer-token\n",
+		)
+
+		(row,) = self._read(**WINDOW, keyword="T149 password")["errors"]
+
+		self.assertEqual(row["name"], name)
+		text = f"{row['method']} {row['error']}"
+		for secret in ("fake-el-method", "fake-el-key-1234567890", "fake-el-bearer-token"):
+			self.assertNotIn(secret, text)
+		self.assertIn(MASK, row["method"])
+		self.assertIn(MASK, row["error"])
+
+	def test_agent_roles_unchanged(self):
+		self._error_log(DAY, "T149 roles")
+		before = sorted(frappe.get_roles(AGENT_USER))
+
+		self.assertEqual(len(self._names(**WINDOW)), 1)
+
+		self.assertEqual(sorted(frappe.get_roles(AGENT_USER)), before)
+		self.assertNotIn("System Manager", before)

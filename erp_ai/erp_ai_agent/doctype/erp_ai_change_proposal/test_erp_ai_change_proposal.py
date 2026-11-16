@@ -2062,6 +2062,29 @@ class TestConsoleProposalDecision(FrappeTestCase):
 		self.assertEqual(self._status(name).change_status, CHANGE_STATUS_PENDING)
 		self.assertEqual(self._jobs(), [])
 
+	def test_panel_approve_refuses_a_console_proposal_the_clicker_cannot_read(self):
+		# CHG-010 final review F-7: nobody approves a script they cannot see
+		name = _console_proposal().name
+		readable = make_change_proposal(CHANGE_KIND_COMMAND).name
+		frappe.get_doc(
+			{
+				"doctype": "User Permission",
+				"user": PANEL_INSTRUCTOR,
+				"allow": PROPOSAL_DOCTYPE,
+				"for_value": readable,
+			}
+		).insert(ignore_permissions=True)
+		frappe.clear_cache(user=PANEL_INSTRUCTOR)
+		with self.assertRaises(frappe.PermissionError) as caught:
+			self._as(PANEL_INSTRUCTOR, "panel_approve", name)
+		self.assertEqual(str(caught.exception), "Bạn cần quyền xem đề xuất để duyệt script console.")
+		self.assertEqual(controller.CONSOLE_NEEDS_READ, "Bạn cần quyền xem đề xuất để duyệt script console.")
+		self.assertEqual(self._status(name).change_status, CHANGE_STATUS_PENDING)
+		self.assertEqual(self._jobs(), [])
+		# other kinds are unchanged
+		other = make_change_proposal(CHANGE_KIND_COMMAND).name
+		self.assertEqual(self._as(PANEL_INSTRUCTOR, "panel_approve", other)["status"], CHANGE_STATUS_APPROVED)
+
 	def test_panel_approve_is_not_whitelisted(self):
 		self.assertNotIn(controller.panel_approve, frappe.whitelisted)
 

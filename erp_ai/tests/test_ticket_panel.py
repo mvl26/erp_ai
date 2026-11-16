@@ -1290,6 +1290,28 @@ class TestPanelProposalCards(FrappeTestCase):
 		self.assertIsNone(card["script"])
 		self.assertIsNone(card["output"])
 
+	def test_console_card_offers_no_decision_to_a_viewer_who_cannot_open_it(self):
+		# CHG-010 final review F-7: the role and the switch are not enough for a console card; Duyệt never shows
+		# without the script, so the viewer must also read the proposal. Other kinds keep their rule.
+		set_agent_settings(one_click_approval_enabled=1, console_enabled=1)
+		console = self._console()
+		other = make_change_proposal(ticket=self.ticket).name
+		frappe.get_doc(
+			{
+				"doctype": "User Permission",
+				"user": CARD_INSTRUCTOR,
+				"allow": PROPOSAL_DOCTYPE,
+				"for_value": other,
+			}
+		).insert(ignore_permissions=True)
+		frappe.clear_cache(user=CARD_INSTRUCTOR)
+		cards = {c["name"]: c for c in self._cards(CARD_INSTRUCTOR)}
+		self.assertIs(cards[console]["can_open"], False)
+		self.assertIs(cards[console]["can_decide"], False)
+		self.assertIsNone(cards[console]["script"])
+		self.assertIs(cards[other]["can_open"], True)
+		self.assertIs(cards[other]["can_decide"], True)
+
 	def test_code_proposal_content_never_reaches_the_panel(self):
 		# CHG-010: Task 6; spec rule since CHG-008, the card reads no content of a code proposal
 		proposal = make_change_proposal(ticket=self.ticket)
@@ -1571,6 +1593,34 @@ class TestPanelDecision(FrappeTestCase):
 		name = self._console()
 		self.assertRefused(name, APPROVE, frappe.PermissionError, text="Chạy bench console đang tắt.")
 		self.assertEqual(self._state(name).change_status, CHANGE_STATUS_PENDING)
+
+	def test_console_approve_refused_when_the_clicker_cannot_read_the_proposal(self):
+		# CHG-010 final review F-7: approving a script needs the right to read it, so nobody approves unseen code
+		set_agent_settings(console_enabled=1)
+		name = self._console()
+		frappe.get_doc(
+			{
+				"doctype": "User Permission",
+				"user": DECIDE_INSTRUCTOR,
+				"allow": PROPOSAL_DOCTYPE,
+				"for_value": self.proposal,
+			}
+		).insert(ignore_permissions=True)
+		frappe.clear_cache(user=DECIDE_INSTRUCTOR)
+		frappe.set_user(DECIDE_INSTRUCTOR)
+		try:
+			self.assertFalse(frappe.has_permission(PROPOSAL_DOCTYPE, "read", doc=name))
+		finally:
+			frappe.set_user("Administrator")
+		self.assertRefused(
+			name,
+			APPROVE,
+			frappe.PermissionError,
+			text="Bạn cần quyền xem đề xuất để duyệt script console.",
+		)
+		self.assertEqual(self._state(name).change_status, CHANGE_STATUS_PENDING)
+		# the same user still approves a non-console proposal they read
+		self.assertEqual(self._decide(self.proposal, APPROVE)["status"], CHANGE_STATUS_APPROVED)
 
 	def test_console_reject_from_the_panel_with_console_on(self):
 		set_agent_settings(console_enabled=1)

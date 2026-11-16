@@ -10,7 +10,7 @@ from helpdesk.test_utils import create_agent, make_ticket, make_todo
 from helpdesk.utils import is_agent
 
 from erp_ai import ticket_panel
-from erp_ai.agent import answer_delay, policy, runner
+from erp_ai.agent import answer_delay, change_text, policy, runner
 from erp_ai.agent.policy import contains_keyword
 from erp_ai.agent.queue import PENDING_JOB_IDS_FLAG
 from erp_ai.agent.run_log import write_entry
@@ -1201,3 +1201,48 @@ class TestPanelProposalCards(FrappeTestCase):
 		proposal = make_change_proposal(ticket=self.ticket)
 		self._set(proposal.name, restart_status="Không có trạng thái này")
 		self.assertEqual(self._cards()[0]["notes"], [proposal_form.UNREADABLE_NOTES])
+
+	def test_can_open_loads_no_proposal_document(self):
+		# CHG-008 ruling: the card never reads the forbidden fields, so no proposal document is loaded for can_open
+		for _ in range(3):
+			make_change_proposal(ticket=self.ticket)
+		real_get_doc = frappe.get_doc
+		loads = []
+
+		def counting(*args, **kwargs):
+			if args and (
+				args[0] == PROPOSAL_DOCTYPE
+				or (isinstance(args[0], dict) and args[0].get("doctype") == PROPOSAL_DOCTYPE)
+			):
+				loads.append(args)
+			return real_get_doc(*args, **kwargs)
+
+		with patch.object(frappe, "get_doc", side_effect=counting):
+			cards = self._cards(CARD_INSTRUCTOR)
+		self.assertEqual(len(cards), 3)
+		self.assertTrue(all(card["can_open"] for card in cards))
+		self.assertEqual(loads, [])
+
+	def test_can_open_follows_a_share_per_proposal(self):
+		shared = make_change_proposal(ticket=self.ticket)
+		other = make_change_proposal(ticket=self.ticket)
+		frappe.share.add(
+			PROPOSAL_DOCTYPE, shared.name, AGENT_EMAIL, read=1, flags={"ignore_share_permission": True}
+		)
+		cards = {card["name"]: card for card in self._cards(AGENT_EMAIL)}
+		self.assertIs(cards[shared.name]["can_open"], True)
+		self.assertIs(cards[other.name]["can_open"], False)
+
+	def test_decided_by_without_user_row_or_with_at_sign_is_anonymous(self):
+		# D-5: get_fullname falls back to the email for a missing User, which must never reach the panel
+		proposal = make_change_proposal(ticket=self.ticket)
+		self._set(proposal.name, decided_by="zq.ghost.user@example.com")
+		for name in (None, "zq.at@example.com"):
+			with self.subTest(fullname=name):
+				if name is None:
+					result = json.dumps(self._cards(), ensure_ascii=False)
+				else:
+					with patch.object(frappe.utils, "get_fullname", return_value=name):
+						result = json.dumps(self._cards(), ensure_ascii=False)
+				self.assertEqual(json.loads(result)[0]["decided_by"], change_text.ANONYMOUS_PERSON)
+				self.assertNotIn("@", result)

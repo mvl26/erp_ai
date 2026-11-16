@@ -6864,7 +6864,9 @@ class TestRunnerLessons(RunnerTestBase):
 
 		rows = self._entries()
 		(run_id,) = {row.run_id for row in rows}
-		by_ticket = frappe.get_all(LOG_DOCTYPE, filters={"ticket": self.ticket.name}, pluck="name")
+		# ADR-048 QĐ 5 (CHG-009): a run_event row (a call's row, a run's end row) is no step's row, so it names no lesson
+		run_rows = {"ticket": self.ticket.name, "entry_type": ("!=", "run_event")}
+		by_ticket = frappe.get_all(LOG_DOCTYPE, filters=run_rows, pluck="name")
 		for name in (first, second):
 			with self.subTest(name):
 				used = {"lessons_used": ("like", f'%"{name}"%')}

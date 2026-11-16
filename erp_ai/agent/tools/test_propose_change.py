@@ -1976,6 +1976,81 @@ class TestBlockComment(FrappeTestCase):
 				self.assertEqual(frappe.db.get_value("Comment", name, "content"), expected)
 
 
+class TestCommentSnapshot(FrappeTestCase):
+	"""CHG-008 T1 (AC-10): each branch of the first sentence of `_comment`, pinned byte for byte with
+	file names, an app and a command carrying `<&"`, written by hand before the target moved to
+	`change_text.proposal_target`."""
+
+	setUp = TestProposeChange.setUp
+	context = TestProposeChange.context
+
+	def test_each_branch_byte_for_byte(self):
+		ctx = self.context(one_click_approval=False)
+		marked = 'custom_app/pkg/<&">'
+		git = {"change_kind": CHANGE_KIND_CODE, "target_branch": "develop", "upstream_ref": ""}
+		created = [frappe._dict(idx=1, operation=CHANGE_OP_CREATE, file_path=f"{marked}.md")]
+
+		def head(name):
+			return f'<p>Đề xuất <a href="/app/erp-ai-change-proposal/{name}">{name}</a> đang chờ duyệt: '
+
+		def tail(name):
+			return f'<p><a href="/app/erp-ai-change-proposal/{name}">Mở đề xuất để Duyệt hoặc Từ chối</a></p>'
+
+		cases = {
+			"block of items": (
+				{**git, "name": "CP-SNAP-1", "app": 'app<&">', "operations": created, "command_list": "[]"},
+				head("CP-SNAP-1") + "khối 1 mục trong app app&lt;&amp;&quot;&gt;.</p>"
+				"<p>Gồm 0 sửa, 1 tạo, 0 xóa, 0 đổi tên; 0 lệnh.</p>"
+				"<p>tạo custom_app/pkg/&lt;&amp;&quot;&gt;.md</p>"
+				"<p>Commit sẽ vào nhánh develop của app app&lt;&amp;&quot;&gt;.</p>"
+				"<p>Nhánh này không theo nhánh remote nào.</p>" + tail("CP-SNAP-1"),
+			),
+			"block of items, app with a URL": (
+				{**git, "name": "CP-SNAP-6", "app": "https://h/r", "operations": created, "command_list": "[]"},
+				head("CP-SNAP-6") + "khối 1 mục trong app .</p>"
+				"<p>Gồm 0 sửa, 1 tạo, 0 xóa, 0 đổi tên; 0 lệnh.</p>"
+				"<p>tạo custom_app/pkg/&lt;&amp;&quot;&gt;.md</p>"
+				"<p>Nhánh này không theo nhánh remote nào.</p>" + tail("CP-SNAP-6"),
+			),
+			"block of commands": (
+				{
+					"name": "CP-SNAP-2",
+					"change_kind": CHANGE_KIND_COMMAND,
+					"operations": [],
+					"command_list": json.dumps([["--site", 's<&">', "migrate"], ["restart"]]),
+				},
+				head("CP-SNAP-2") + "2 lệnh bench.</p>"
+				"<p>Gồm 0 sửa, 0 tạo, 0 xóa, 0 đổi tên; 2 lệnh.</p>"
+				"<p>lệnh: bench --site s&lt;&amp;&quot;&gt; migrate</p>"
+				"<p>lệnh: bench restart</p>"
+				"<p>Sau khi áp dụng, hệ thống sẽ restart bench (lệnh cuối).</p>"
+				"<p>Lệnh trong khối không hoàn tác được; hoàn tác chỉ trả lại phần file.</p>" + tail("CP-SNAP-2"),
+			),
+			"edit": (
+				{**git, "name": "CP-SNAP-3", "app": APP, "file_path": f"{marked}.py", "is_new_file": 0},
+				head("CP-SNAP-3") + "sửa <code>custom_app/pkg/&lt;&amp;&quot;&gt;.py</code>.</p>"
+				"<p>Commit sẽ vào nhánh develop của app custom_app.</p>"
+				"<p>Nhánh này không theo nhánh remote nào.</p>"
+				"<p>Sau khi áp dụng cần người chạy bench restart.</p>" + tail("CP-SNAP-3"),
+			),
+			"new file": (
+				{**git, "name": "CP-SNAP-4", "app": APP, "file_path": f"{marked}.md", "is_new_file": 1},
+				head("CP-SNAP-4") + "tạo <code>custom_app/pkg/&lt;&amp;&quot;&gt;.md</code>.</p>"
+				"<p>Commit sẽ vào nhánh develop của app custom_app.</p>"
+				"<p>Nhánh này không theo nhánh remote nào.</p>" + tail("CP-SNAP-4"),
+			),
+			"command": (
+				{"name": "CP-SNAP-5", "change_kind": CHANGE_KIND_COMMAND, "command_list": None},
+				head("CP-SNAP-5") + "lệnh <code>bench </code>.</p>"
+				"<p>Lệnh bench không hoàn tác được.</p>" + tail("CP-SNAP-5"),
+			),
+		}
+		for shape, (fields, expected) in cases.items():
+			with self.subTest(shape=shape):
+				name = propose_change._comment(ctx, frappe._dict(fields))
+				self.assertEqual(frappe.db.get_value("Comment", name, "content"), expected)
+
+
 class TestOneClickGate(FrappeTestCase):
 	"""FEAT-007 T89: the proposal comment signs an approval link only while switch (5) is on."""
 

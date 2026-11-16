@@ -19,6 +19,24 @@ function setupForm({ doc, call, router }) {
 		const TEXT_EMPTY_MESSAGE = "Hãy nhập nội dung trước khi gửi.";
 		const TEXT_TOO_LONG = "Tin dài quá 2000 ký tự.";
 		const TEXT_SEND_FAILED = "Không gửi được tin. Chữ bạn gõ vẫn còn, hãy thử lại.";
+		const TEXT_PROPOSALS_SECTION = "Đề xuất thay đổi";
+		const TEXT_OPEN_PROPOSAL = "Xem nội dung thay đổi";
+		const OPEN_PROPOSAL_LABEL = "Mở đề xuất để Duyệt hoặc Từ chối";
+		const TEXT_NEEDS_INSTRUCTOR = "Cần người có vai trò ERP AI Instructor duyệt.";
+		const TEXT_UNDO_AT_FORM = "Hoàn tác ở form";
+		const TEXT_DECIDED_BY = "Người duyệt: ";
+		const TEXT_RESTART = "Restart: ";
+		const TEXT_FAILURE_REASON = "Lý do lỗi: ";
+		const TEXT_APPROVE = "Duyệt";
+		const TEXT_REJECT = "Từ chối";
+		const TEXT_DECIDE_FAILED =
+			"Không duyệt hoặc từ chối được đề xuất; hãy xem trạng thái hiện tại trên thẻ.";
+		// The actions of the panel's decision method (server PANEL_DECISIONS), not method paths.
+		const ACTION_APPROVE = "approve";
+		const ACTION_REJECT = "reject";
+		const STATUS_PENDING = "Chờ duyệt";
+		const STATUS_APPLIED = "Đã áp dụng";
+		const PROPOSAL_FORM_PREFIX = "/app/erp-ai-change-proposal/";
 		const MAX_MESSAGE_CHARS = 2000;
 		const NARROW_SCREEN_PX = 640;
 		const INDICATOR_FLOATING_STYLE = {
@@ -39,6 +57,11 @@ function setupForm({ doc, call, router }) {
 			slotEl: null,
 			aiListEl: null,
 			threadEl: null,
+			proposalsTitle: null,
+			proposalsEl: null,
+			proposalErrorEl: null,
+			deciding: false,
+			decisionButtons: [],
 			errorEl: null,
 			inputEl: null,
 			sendEl: null,
@@ -200,6 +223,14 @@ function setupForm({ doc, call, router }) {
 			guidanceEl.style.color = "#6b7280";
 			guidanceEl.textContent = TEXT_BOT_GUIDANCE;
 			const threadEl = document.createElement("div");
+			const proposalsTitle = document.createElement("strong");
+			proposalsTitle.style.display = "block";
+			proposalsTitle.style.marginTop = "8px";
+			proposalsTitle.textContent = TEXT_PROPOSALS_SECTION;
+			proposalsTitle.hidden = true;
+			const proposalsEl = document.createElement("div");
+			const proposalErrorEl = document.createElement("div");
+			proposalErrorEl.style.color = "#b91c1c";
 			const errorEl = document.createElement("div");
 			errorEl.style.color = "#b91c1c";
 			const formEl = document.createElement("div");
@@ -237,6 +268,9 @@ function setupForm({ doc, call, router }) {
 				chatTitle,
 				guidanceEl,
 				threadEl,
+				proposalsTitle,
+				proposalsEl,
+				proposalErrorEl,
 				errorEl,
 				formEl,
 				slotEl
@@ -246,6 +280,9 @@ function setupForm({ doc, call, router }) {
 			panel.slotEl = slotEl;
 			panel.aiListEl = aiListEl;
 			panel.threadEl = threadEl;
+			panel.proposalsTitle = proposalsTitle;
+			panel.proposalsEl = proposalsEl;
+			panel.proposalErrorEl = proposalErrorEl;
 			panel.errorEl = errorEl;
 			panel.inputEl = inputEl;
 			panel.sendEl = sendEl;
@@ -321,6 +358,149 @@ function setupForm({ doc, call, router }) {
 			state.panel.threadEl.replaceChildren(...nodes);
 		};
 
+		const clearProposals = () => {
+			const panel = state.panel;
+			panel.decisionButtons = [];
+			panel.proposalsEl?.replaceChildren();
+			panel.proposalErrorEl?.replaceChildren();
+			if (panel.proposalsTitle) {
+				panel.proposalsTitle.hidden = true;
+			}
+		};
+
+		// Opens the proposal's own form in a new tab; the form checks the reader again (design D-4).
+		const openProposal = (name) => {
+			try {
+				window.open(PROPOSAL_FORM_PREFIX + encodeURIComponent(name), "_blank", "noopener");
+			} catch (e) {
+				// A panel handler must never break the ticket page (ADR-009 decision 4).
+			}
+		};
+
+		const proposalButton = (label, name) => {
+			const button = document.createElement("button");
+			button.type = "button";
+			button.textContent = label;
+			button.addEventListener("click", () => {
+				try {
+					openProposal(name);
+				} catch (e) {
+					// A panel handler must never break the ticket page (ADR-009 decision 4).
+				}
+			});
+			return button;
+		};
+
+		// Duyệt / Từ chối: one click, no confirm dialog; locked while one waits (design 4.2).
+		const decisionButton = (label, name, action) => {
+			const panel = state.panel;
+			const button = document.createElement("button");
+			button.type = "button";
+			button.textContent = label;
+			button.disabled = panel.deciding;
+			button.addEventListener("click", () => {
+				try {
+					decide(name, action);
+				} catch (e) {
+					// A panel handler must never break the ticket page (ADR-009 decision 4).
+				}
+			});
+			panel.decisionButtons.push(button);
+			return button;
+		};
+
+		const proposalActions = (card) => {
+			const row = document.createElement("div");
+			Object.assign(row.style, { display: "flex", gap: "8px", marginTop: "4px" });
+			const name = String(card?.name ?? "");
+			if (!name) {
+				return row;
+			}
+			const canOpen = card?.can_open === true;
+			if (card?.can_decide === true) {
+				row.append(
+					decisionButton(TEXT_APPROVE, name, ACTION_APPROVE),
+					decisionButton(TEXT_REJECT, name, ACTION_REJECT)
+				);
+				if (canOpen) {
+					row.append(proposalButton(TEXT_OPEN_PROPOSAL, name));
+				}
+			} else if (card?.status === STATUS_PENDING) {
+				if (canOpen) {
+					row.append(proposalButton(OPEN_PROPOSAL_LABEL, name));
+				} else {
+					const note = document.createElement("span");
+					note.style.color = "#6b7280";
+					note.textContent = TEXT_NEEDS_INSTRUCTOR;
+					row.append(note);
+				}
+			} else if (canOpen) {
+				row.append(
+					proposalButton(
+						card?.status === STATUS_APPLIED ? TEXT_UNDO_AT_FORM : TEXT_OPEN_PROPOSAL,
+						name
+					)
+				);
+			}
+			return row;
+		};
+
+		const proposalCard = (card) => {
+			const el = document.createElement("div");
+			Object.assign(el.style, {
+				marginTop: "8px",
+				padding: "6px 8px",
+				borderRadius: "6px",
+				background: "#f9fafb",
+			});
+			const head = document.createElement("strong");
+			head.textContent = [card?.name, card?.status].filter(Boolean).join(" · ");
+			el.append(head);
+			const addLine = (text, preWrap) => {
+				const line = document.createElement("div");
+				if (preWrap) {
+					line.style.whiteSpace = "pre-wrap";
+				}
+				line.textContent = text;
+				el.append(line);
+			};
+			if (card?.target) {
+				addLine(String(card.target), false);
+			}
+			if (Array.isArray(card?.notes)) {
+				for (const note of card.notes) {
+					addLine(String(note ?? ""), true);
+				}
+			}
+			if (card?.decided_by) {
+				addLine(TEXT_DECIDED_BY + card.decided_by, false);
+			}
+			if (card?.restart_status) {
+				addLine(TEXT_RESTART + card.restart_status, false);
+			}
+			if (card?.failure_reason) {
+				addLine(TEXT_FAILURE_REASON + card.failure_reason, true);
+			}
+			el.append(proposalActions(card));
+			return el;
+		};
+
+		// Not a list means no cards and no title; it never fails the rest of the panel.
+		const renderProposals = (data) => {
+			const panel = state.panel;
+			if (!panel.proposalsEl) {
+				return;
+			}
+			const proposals = data?.proposals;
+			if (!Array.isArray(proposals) || proposals.length === 0) {
+				clearProposals();
+				return;
+			}
+			panel.decisionButtons = [];
+			panel.proposalsEl.replaceChildren(...proposals.map(proposalCard));
+			panel.proposalsTitle.hidden = false;
+		};
+
 		const reload = () => {
 			const panel = state.panel;
 			if (!panel.open || !state.ticket) {
@@ -347,13 +527,72 @@ function setupForm({ doc, call, router }) {
 							panel.errorEl.textContent = "";
 						} catch (e) {
 							panel.aiListEl.replaceChildren();
+							clearProposals();
 							panel.threadEl.replaceChildren();
 							panel.errorEl.textContent = TEXT_LOAD_FAILED;
+							return;
+						}
+						// A card that fails to render clears the proposals only; the thread stays.
+						try {
+							renderProposals(data);
+						} catch (e) {
+							clearProposals();
 						}
 					})
 					.catch(showLoadFailed);
 			} catch (e) {
 				showLoadFailed();
+			}
+		};
+
+		// One click = one POST, then one reload whatever the answer (ADR-044 QĐ 7); no timer.
+		const decide = (name, action) => {
+			const panel = state.panel;
+			if (panel.deciding || !panel.open || !state.ticket) {
+				return;
+			}
+			const ticket = state.ticket;
+			const isStale = () => ticket !== state.ticket;
+			const lockDecisions = (locked) => {
+				for (const button of panel.decisionButtons) {
+					button.disabled = locked;
+				}
+			};
+			// A left ticket was reset (deciding cleared, cards gone): a late answer does nothing.
+			const onDecided = () => {
+				try {
+					if (isStale()) {
+						return;
+					}
+					panel.deciding = false;
+					reload();
+				} catch (e) {
+					// A panel handler must never break the ticket page (ADR-009 decision 4).
+				}
+			};
+			// Fixed sentence, not the server's text (D-2); buttons work again until the reload.
+			const onDecideFailed = () => {
+				try {
+					if (isStale()) {
+						return;
+					}
+					panel.deciding = false;
+					lockDecisions(false);
+					panel.proposalErrorEl.textContent = TEXT_DECIDE_FAILED;
+					reload();
+				} catch (e) {
+					// A panel handler must never break the ticket page (ADR-009 decision 4).
+				}
+			};
+			panel.deciding = true;
+			lockDecisions(true);
+			panel.proposalErrorEl.textContent = "";
+			try {
+				state
+					.call("erp_ai.ticket_panel.decide_proposal", { name, action })
+					.then(onDecided, onDecideFailed);
+			} catch (e) {
+				onDecideFailed();
 			}
 		};
 
@@ -447,6 +686,8 @@ function setupForm({ doc, call, router }) {
 			closePanel();
 			panel.aiListEl?.replaceChildren();
 			panel.threadEl?.replaceChildren();
+			panel.deciding = false;
+			clearProposals();
 			if (panel.inputEl) {
 				panel.inputEl.value = "";
 			}

@@ -66,8 +66,12 @@ LOGGER_NAME = "erp_ai"
 PANEL_METHODS = (
 	"erp_ai.ticket_panel.get_panel_data",
 	"erp_ai.ticket_panel.send_message",
+	# CHG-008 (ADR-044 QĐ 1): the panel's one decision method, for every action of `ticket_panel.PANEL_DECISIONS`.
+	"erp_ai.ticket_panel.decide_proposal",
 )
 PANEL_MAX_MESSAGE_CHARS = 2000
+# CHG-008 design D-7: the most proposal cards the panel returns for one ticket, newest first.
+PANEL_MAX_PROPOSALS = 200
 
 # CHG-002: block proposals (design 2.1, 2.5, design-addendum-1 A-1.2; ADR-040 QĐ 5, 7).
 OPERATION_DOCTYPE = "ERP AI Change Operation"

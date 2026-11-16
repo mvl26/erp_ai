@@ -13,6 +13,7 @@ import unicodedata
 import frappe
 from frappe.utils import strip_html
 
+from erp_ai.agent.labels import parse_tags
 from erp_ai.agent.redact import redact_secrets
 from erp_ai.agent.tools import source
 
@@ -66,7 +67,7 @@ def search_kb_articles(query: str, limit: int) -> list[dict]:
 	"""Published articles the session user may read, ranked by the number of query words they contain.
 
 	Order: matched words desc, matched words in the title desc, `modified` desc. Returns `limit` rows
-	`{name, title, excerpt}`.
+	`{name, title, excerpt, labels}` (ADR-049: the article's labels).
 	"""
 	words = list(dict.fromkeys(tokenize(query)))
 	if not words:
@@ -79,7 +80,7 @@ def search_kb_articles(query: str, limit: int) -> list[dict]:
 		"HD Article",
 		filters={"status": "Published"},
 		or_filters=or_filters,
-		fields=["name", "title", "content", "modified"],
+		fields=["name", "title", "content", "modified", "_user_tags"],
 		order_by="modified desc",
 		limit_page_length=KB_SCAN_MAX,
 	)
@@ -93,7 +94,12 @@ def search_kb_articles(query: str, limit: int) -> list[dict]:
 			ranked.append((count, in_title, row.modified, row, text, matched))
 	ranked.sort(key=lambda item: item[:3], reverse=True)
 	return [
-		{"name": row.name, "title": row.title, "excerpt": _excerpt(text, matched)}
+		{
+			"name": row.name,
+			"title": row.title,
+			"excerpt": _excerpt(text, matched),
+			"labels": parse_tags(row._user_tags),
+		}
 		for _score, _in_title, _modified, row, text, matched in ranked[:limit]
 	]
 

@@ -19,6 +19,7 @@ from erp_ai import handlers, tasks
 from erp_ai.agent import (
 	answer_delay,
 	authority,
+	labels,
 	lesson_read,
 	lessons,
 	messages,
@@ -173,6 +174,11 @@ class RunnerTestBase(FrappeTestCase):
 		latest_patch = patch.object(policy, "latest_classification", return_value=SEEDED_CLASSIFICATION)
 		self.latest_classification = latest_patch.start()
 		self.addCleanup(latest_patch.stop)
+		# The label inputs never come from the shared site's live tags and modules (STD-TEST-6, ADR-049): empty, so
+		# the classify request is the one without labels; a test that needs them sets `self.label_inputs`.
+		label_patch = patch.object(labels, "classify_inputs", return_value=labels.LabelInputs())
+		self.label_inputs = label_patch.start()
+		self.addCleanup(label_patch.stop)
 
 	def _entries(self, **filters):
 		return frappe.get_all(
@@ -979,7 +985,8 @@ class TestRunnerReasoning(RunnerTestBase):
 
 		(call,) = self.gateway.calls
 		self.assertEqual(call["task"], "reason")
-		self.assertEqual(call["max_tokens"], 4096)
+		# BUG-005: the reasoning cap is 16000, thinking tokens count toward it
+		self.assertEqual(call["max_tokens"], 16000)
 		self.assertGreater(call["deadline"], time.monotonic())
 		table = build_routing_table(DEFAULT_CATEGORY_MAPPING, json.loads(make_routing_rules()), {})
 		self.assertEqual(call["system"], build_reason_system(f"{PREFIX}digest", table))
@@ -1072,6 +1079,46 @@ class TestRunnerReasoning(RunnerTestBase):
 				{"author": f"{PREFIX}Administrator", "role": "dữ liệu", "content": "hỏi bot"},
 				{"author": f"{PREFIX}{AGENT_USER}", "role": "dữ liệu", "content": "bot đáp"},
 			],
+		)
+
+	def test_later_run_carries_the_ticket_complexity_and_its_reason(self):
+		# ADR-019 Amendment 1: the reasoning step knows the complexity the ticket holds, to act by it and correct it
+		frappe.db.set_value(
+			"HD Ticket",
+			self.ticket.name,
+			{"ai_complexity": 3, "ai_score_reason": f"{PREFIX}cần phân tích trước"},
+		)
+		with patch.object(authority, "run_instructor", return_value=None):
+			self._run("comment_mention")
+
+		payload, _content = self._user_message()
+		self.assertEqual(
+			payload["classification"],
+			{
+				"category": SEEDED_CLASSIFICATION[0],
+				"confidence_pct": SEEDED_CLASSIFICATION[1],
+				"complexity": 3,
+				"complexity_reason": f"{PREFIX}cần phân tích trước",
+			},
+		)
+
+	def test_insert_run_carries_the_complexity_it_scored(self):
+		scored = {
+			"dau_muc": "A",
+			"do_tin_cay": "Cao",
+			"do_tin_cay_pct": CLASSIFY_A_PCT,
+			"ly_do": "x",
+			"do_phuc_tap": 2,
+			"do_quan_trong": 1,
+			"ly_do_diem": "một Server Script",
+		}
+		self.gateway.results = [make_model_result(text=json.dumps(scored)), make_model_result()]
+		self._run()
+
+		payload, _content = self._user_message(1)
+		self.assertEqual(
+			(payload["classification"]["complexity"], payload["classification"]["complexity_reason"]),
+			(2, "một Server Script"),
 		)
 
 	def test_ticket_insert_passes_classification_to_reasoning(self):
@@ -4462,8 +4509,12 @@ class TestAskOnly(RunnerTestBase):
 		]
 		self._run()
 
-		(posted,) = self._comments()
+		# CHG-003 Amendment 3: the question is a message of the conversation, whatever started the run
+		(posted,) = frappe.get_all(
+			MESSAGE_DOCTYPE, filters={"ticket": self.ticket.name, "owner": AGENT_USER}, pluck="content"
+		)
 		self.assertTrue(posted.startswith(question))
+		self.assertEqual(self._comments(), [])
 		self.assertEqual(self._fallbacks(), [])
 		results = {
 			block["tool_use_id"]: json.loads(block["content"])
@@ -5107,6 +5158,63 @@ class TestOneGuidance(GuidanceTestBase):
 		)
 		self.assertNotIn("Cần ai quyết", content)
 		self.assertEqual(_info_comments(self.ticket.name), [])
+
+
+class TestGuidanceReplyInConversation(GuidanceTestBase):
+	"""CHG-003 Amendment 3: a run a message started whose answer the guidance comment took still answers in the
+	conversation, in its last turn, with its own action entry; a run nothing typed started writes no message."""
+
+	FINDING = f"{PREFIX}máy in của kho chưa được cấu hình."
+
+	def _bot_messages(self):
+		return frappe.get_all(
+			MESSAGE_DOCTYPE,
+			filters={"ticket": self.ticket.name, "owner": AGENT_USER},
+			fields=["name", "content", "run_id"],
+			order_by="creation asc",
+		)
+
+	def test_message_run_answer_held_for_guidance_gets_a_message_too(self):
+		run_id, fixed = self._fixed_run_id()
+		self.gateway.results = [tool_turn(analysis_call("t_analysis")), make_model_result()]
+		with fixed:
+			self._run("comment_mention")
+
+		self.assertEqual(self._guidance(), 1)
+		(row,) = self._bot_messages()
+		self.assertEqual(
+			(row.content, row.run_id), (f"Nhận định: {self.FINDING}\n\n{write_ticket.GUIDANCE_REPLY}", run_id)
+		)
+		actions = json.loads(self._entries(entry_type="reason")[-1].actions)
+		self.assertEqual([a["tool"] for a in actions], [runner.GUIDANCE_TOOL, runner.GUIDANCE_REPLY_TOOL])
+		instructor = authority.run_instructor(self.ticket.name, "comment_mention")
+		self.assertEqual(
+			actions[-1],
+			action_entry(runner.GUIDANCE_REPLY_TOOL, MESSAGE_DOCTYPE, row.name, True, instructor=instructor),
+		)
+
+	def test_insert_run_writes_no_message(self):
+		self.gateway.results = [classify_at(90), tool_turn(analysis_call("t_analysis")), make_model_result()]
+		self._run()
+
+		self.assertEqual(self._guidance(), 1)
+		self.assertEqual(self._bot_messages(), [])
+
+	def test_last_turn_log_failure_leaves_no_reply(self):
+		# the reply is a write of the last turn, as the guidance comment: its entry failing undoes both
+		self.gateway.results = [tool_turn(analysis_call("t1")), make_model_result()]
+		real_write_entry = runner.write_entry
+
+		def failing_last_entry(**fields):
+			if fields.get("entry_type") == "reason" and fields.get("turn") == 2:
+				raise RuntimeError(f"{PREFIX}nhật ký hỏng")
+			return real_write_entry(**fields)
+
+		with patch.object(runner, "write_entry", side_effect=failing_last_entry):
+			self._run("comment_mention")
+
+		self.assertEqual(self._guidance(), 0)
+		self.assertEqual(self._bot_messages(), [])
 
 
 class TestReclassify(RunnerTestBase):

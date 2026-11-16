@@ -23,6 +23,7 @@ from erp_ai.agent.ops_data import (
 )
 from erp_ai.agent.redact import redact_secrets
 from erp_ai.agent.routing import load_routing_config, response_overdue
+from erp_ai.agent.run_log import ENTRY_TYPE_CHANGE
 from erp_ai.agent.text_lines import filled_lines
 from erp_ai.constants import CATEGORIES, LOG_DOCTYPE, LOGGER_NAME, SETTING_DOCTYPE
 
@@ -146,7 +147,7 @@ def _bot_day(anchor: datetime) -> dict:
 	for row in rows:
 		if row.entry_type == "classify" and row.applied:
 			counts[KIND_CLASSIFY] += 1
-		if row.change_step in KIND_BY_CHANGE_STEP:
+		if row.entry_type == ENTRY_TYPE_CHANGE and row.change_step in KIND_BY_CHANGE_STEP:
 			counts[KIND_BY_CHANGE_STEP[row.change_step]] += 1
 		if (row.error or "").strip():
 			counts[KIND_ERROR] += 1

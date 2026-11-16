@@ -124,27 +124,17 @@ def _comment(ctx: ToolContext, proposal) -> str:
 	"""One ticket comment (design 3.8): the escaped first sentence, the notes of design 3.9 and the
 	Duyệt / Từ chối links (only while switch (5) is on; otherwise one link to the form); returns the Comment name.
 
-	A block (child rows or a `command_list`, CHG-002 design 3.7) says `khối {n} mục trong app {app}`
-	with `{n}` the number of items, or `{m} lệnh bench` when it has only commands, `{m}` counting
-	`restart`; its name and app go through `change_text._shown` (no URL). Any other proposal keeps
-	the first sentence of today, naming its file or command.
+	The first sentence comes from `change_text.proposal_target` (CHG-008 design 3.4), shared with the panel card:
+	a block (CHG-002 design 3.7) says `khối {n} mục trong app {app}` or `{m} lệnh bench`, any other proposal
+	names its file or command. A block's name goes through `change_text._shown` (no URL).
 	"""
 	escape = frappe.utils.escape_html
 	name = proposal.name
-	# the test of `block.is_block` (design 2.3), written here: tools do not import `erp_ai.agent.changes`
+	text, code = change_text.proposal_target(proposal)
+	target = escape(text) if code is None else f"{escape(text)} <code>{escape(code)}</code>"
+	# a block shows its name through `_shown` (no URL), any other proposal its plain name
 	if proposal.get("operations") or proposal.get("command_list"):
 		name = change_text._shown(proposal.name)
-		if proposal.get("operations"):
-			app = change_text._shown(proposal.app)
-			target = f"khối {len(proposal.operations)} mục trong app {escape(app)}"
-		else:
-			target = f"{len(json.loads(proposal.command_list))} lệnh bench"
-	elif proposal.change_kind == CHANGE_KIND_CODE:
-		verb = "tạo" if proposal.is_new_file else "sửa"
-		target = f"{verb} <code>{escape(proposal.file_path)}</code>"
-	else:
-		args = "; ".join(" ".join(argv) for argv in json.loads(proposal.command_list or "[]"))
-		target = f"lệnh <code>bench {escape(args)}</code>"
 	form = f"/app/erp-ai-change-proposal/{proposal.name}"
 	html = f'<p>Đề xuất <a href="{escape(form)}">{escape(name)}</a> đang chờ duyệt: {target}.</p>'
 	html += "".join(f"<p>{escape(line)}</p>" for line in change_text.proposal_notes(proposal))

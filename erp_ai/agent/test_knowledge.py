@@ -56,7 +56,7 @@ class TestKbSearch(KnowledgeCase):
 		rows = knowledge.search_kb_articles(word, 5)
 
 		self.assertEqual([row["name"] for row in rows], [published])
-		self.assertEqual(set(rows[0]), {"name", "title", "excerpt"})
+		self.assertEqual(set(rows[0]), {"name", "title", "excerpt", "labels"})
 		self.assertEqual(rows[0]["title"], frappe.db.get_value("HD Article", published, "title"))
 
 	def test_only_articles_the_session_user_may_read(self):

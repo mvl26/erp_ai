@@ -10,6 +10,7 @@ from frappe.utils import escape_html, get_fullname, getdate, now_datetime, strip
 
 from erp_ai import gateway
 from erp_ai.agent import authority, lesson_read, lifecycle, policy, queue, site_facts
+from erp_ai.agent import labels as ticket_labels
 from erp_ai.agent.answer_delay import AnswerDelay
 from erp_ai.agent.authority import TITLE_WRONG_USER as TITLE_WRONG_USER  # re-export, U1.md:264
 from erp_ai.agent.classification import load_mapping, parse_classification, split_request_comment
@@ -39,6 +40,7 @@ from erp_ai.agent.tools.route_ticket import (
 	REASON_TASK_NOT_ASSIGNED,
 	TASK_REQUEST,
 	TaskSharingDisabled,
+	add_labels,
 	apply_route,
 	assign_owner,
 	create_routed_task,
@@ -69,6 +71,7 @@ from erp_ai.agent.tools.write_ticket import (
 	mark_work_only,
 	open_collector,
 	post_guidance,
+	post_guidance_reply,
 	post_notice,
 )
 from erp_ai.constants import (
@@ -93,8 +96,14 @@ from erp_ai.constants import (
 )
 
 CLASSIFY_MAX_TOKENS = 600
-REASON_MAX_TOKENS = 4096
+REASON_MAX_TOKENS = 16000
 STOP_TOOL_USE = "tool_use"
+STOP_MAX_TOKENS = "max_tokens"
+CUT_REASON = "bị cắt ở trần độ dài, không chạy"
+CUT_TOOL_RESULT = (
+	"Lời gọi này bị cắt vì câu trả lời chạm trần độ dài nên không được chạy. "
+	"Gọi lại với đầu vào ngắn hơn; việc sửa nhiều file thì tách thành nhiều đề xuất nhỏ."
+)
 STOP_MAX_TURNS = "max_turns"
 STOP_TIME_BUDGET = "time_budget"
 STOP_GATEWAY_ERROR = "gateway_error"
@@ -146,6 +155,9 @@ ROUTE_NO_CHANGE = "Bot đã phân loại phiếu, các trường đã đúng nê
 ROUTE_ASSIGNED = "Đã gán cho {person}."
 ROUTE_TASK = "Đã tạo Task {task}."
 ROUTE_WATCHER = "Đã thêm {person} làm người theo dõi."
+# ADR-049: the labels the route gave the ticket (Helpdesk Tags)
+LABELS_TOOL = "add_labels"
+ROUTE_LABELS = "Bot đã gắn nhãn: {labels}."
 # (u5) the D watcher (AC-27, U4b-fixes Fix 6)
 WATCHER_TOOL = "add_watcher"
 REASON_ALREADY_FOLLOWING = "đã theo dõi"
@@ -205,6 +217,8 @@ TICKET_FIELD_SETTINGS = tuple(f"field_{key}" for key in TICKET_FIELD_LABELS)
 GUIDANCE_EXISTS_LOG = "erp_ai guidance ticket=%s run_id=%s: đã có hướng xử lý"
 # The action entry of the run's one guidance comment (ADR-036 QĐ 8, w1.md:105).
 GUIDANCE_TOOL = "post_guidance"
+# The answer in the conversation of a run a message started, when the guidance comment took it (CHG-003 Amendment 3).
+GUIDANCE_REPLY_TOOL = "post_guidance_reply"
 # The split question a guidance run's route gathered, per run: (classify row, text, requests), recorded as asked only
 # once the run's one comment carrying it is posted (AC-28, C9-fix1 R20a); dropped when the run ends.
 SPLIT_HELD_FLAG = "erp_ai_split_held"
@@ -321,8 +335,13 @@ def _run(ticket_name, trigger, message_name=None, communication_name=None):
 			if trigger != TRIGGER_TICKET_INSERT:
 				category, pct = policy.latest_classification(ticket_name)
 				if category is not None:
-					# the reasoning step knows the earlier classification, the same pair (U4b.md:238, Fix 12)
-					classification = {"category": category, "confidence_pct": pct}
+					# the reasoning step knows the earlier classification, the same pair (U4b.md:238, Fix 12), and
+					# the complexity the ticket holds, to act by it and correct it (ADR-019 Amendment 1)
+					classification = {
+						"category": category,
+						"confidence_pct": pct,
+						**_ticket_complexity(ticket_name),
+					}
 			context = ToolContext(
 				ticket_name=ticket_name,
 				effective_level=level,
@@ -719,6 +738,7 @@ def _classify(
 	subject = ticket.subject
 	field_values = _ticket_field_values(ticket_name, field_map)
 	lessons = _lessons(settings, subject, ticket.description)
+	label_inputs = _label_inputs(ticket_name, run_id, subject, ticket.description)
 	base = {
 		"ticket": ticket_name,
 		"run_id": run_id,
@@ -738,6 +758,7 @@ def _classify(
 				ticket_fields=field_values,
 				later_messages=later_messages,
 				lessons=lessons,
+				**label_inputs._asdict(),
 			),
 			max_tokens=CLASSIFY_MAX_TOKENS,
 			deadline=deadline,
@@ -765,6 +786,9 @@ def _classify(
 		write_entry(**base, **call_fields, error=error, stop_reason="unparseable")
 		_log_classify(ticket_name, run_id, False, ticket.creation)
 		return True, None, context
+	classification = dataclasses.replace(
+		classification, labels=ticket_labels.canonical(classification.labels, label_inputs.modules)
+	)
 
 	# U2 (AC-9 b, U2.md:164-172): the team the department maps to is learnt from the predicate decide_route asks
 	probe_hits = []
@@ -871,7 +895,12 @@ def _classify(
 				split_text,
 				collect_run_id=run_id,
 			)
-	summary = {"category": classification.category, "confidence": classification.confidence, **values}
+	summary = {
+		"category": classification.category,
+		"confidence": classification.confidence,
+		**values,
+		**_complexity(classification.complexity, classification.score_reason),
+	}
 	return True, summary, context
 
 
@@ -901,6 +930,34 @@ def _lessons_used(lessons: list[dict]) -> dict:
 	"""The usage trace of a step's rows (AC-17): `lessons_used`, the names of the lessons the step sent; none sent
 	gives no key, so the rows stay as before."""
 	return {"lessons_used": [lesson["name"] for lesson in lessons]} if lessons else {}
+
+
+def _label_inputs(ticket_name, run_id, subject, description) -> ticket_labels.LabelInputs:
+	"""The label inputs of the classify request (ADR-049); a failed read never stops the classification: no label
+	inputs then, one logger line with the exception class."""
+	try:
+		return ticket_labels.classify_inputs(ticket_name, subject, description)
+	except Exception as exc:
+		frappe.logger(LOGGER_NAME).warning(
+			"erp_ai labels ticket=%s run_id=%s error=%s", ticket_name, run_id, type(exc).__name__
+		)
+		return ticket_labels.LabelInputs()
+
+
+def _complexity(score, reason) -> dict:
+	"""The complexity (1-3) and its reason for the reasoning step; {} when there is no score (ADR-019 Amendment 1)."""
+	if score not in (1, 2, 3):
+		return {}
+	return {"complexity": score, "complexity_reason": reason or ""}
+
+
+def _ticket_complexity(ticket_name) -> dict:
+	"""The complexity the ticket holds and its reason, as `_complexity` gives them."""
+	row = (
+		frappe.db.get_value("HD Ticket", ticket_name, ["ai_complexity", "ai_score_reason"], as_dict=True)
+		or {}
+	)
+	return _complexity(row.get("ai_complexity"), row.get("ai_score_reason"))
 
 
 def _log_classify(ticket_name, run_id, ok, created) -> None:
@@ -943,11 +1000,13 @@ def _route(
 		return _route_skipped(log_name, decision, context)
 	actions, lines, errors = [], [], []
 	assigned = task = watcher = commented = split = None
+	labelled = []
 	sla = None
 	frappe.db.savepoint(ROUTE_SAVEPOINT)
 	try:
 		result = _apply_route_unit(decision, classification, context, actions, errors)
 		if result:
+			labelled = _labels_unit(classification.labels, context, actions, errors)
 			sla = _check_sla(classification.category, context, actions, lines)
 			if auto_assign:
 				assigned = _assign_unit(decision, context, actions, lines, errors)
@@ -955,7 +1014,7 @@ def _route(
 				task = _task_unit(assigned, subject, classification, context, actions, lines, errors)
 			if decision.watcher:
 				watcher = _watch_unit(decision.watcher, context, actions, errors)
-			done = _route_lines(result, assigned, task, watcher)
+			done = _route_lines(result, assigned, task, watcher, labelled)
 			others = [*lines, *([split_text] if split_text else [])]
 			lines = [*done, *others]
 			if collect_run_id and collecting(collect_run_id):
@@ -965,7 +1024,7 @@ def _route(
 				commented = _comment_unit(lines, context, actions, errors)
 				if commented and split_text:
 					split = classification.requests
-		_record_route(log_name, result, decision, assigned, task, actions, errors, split)
+		_record_route(log_name, result, decision, assigned, task, actions, errors, split, labelled)
 		_log_route_summary(context, result, assigned, task, commented, sla)
 	except Exception:
 		frappe.db.rollback(save_point=ROUTE_SAVEPOINT)
@@ -1138,8 +1197,9 @@ def _collect_route_lines(run_id, done, others) -> bool:
 	return bool(done or others)
 
 
-def _route_lines(result, assigned, task, watcher) -> list[str]:
-	"""The route comment's own sentences (U4b.md:247): fields written, person given, Task created, watcher added.
+def _route_lines(result, assigned, task, watcher, labelled=()) -> list[str]:
+	"""The route comment's own sentences (U4b.md:247): fields written, labels given (ADR-049), person given, Task
+	created, watcher added.
 
 	Fixed text with names only, never the ticket's content. No field changed → the "already right" sentence.
 	"""
@@ -1149,6 +1209,8 @@ def _route_lines(result, assigned, task, watcher) -> list[str]:
 		if field in FIELD_LABELS
 	)
 	lines = [ROUTE_DONE.format(fields=fields) if fields else ROUTE_NO_CHANGE]
+	if labelled:
+		lines.append(ROUTE_LABELS.format(labels=", ".join(labelled)))
 	if assigned:
 		lines.append(ROUTE_ASSIGNED.format(person=get_fullname(assigned)))
 	if task:
@@ -1156,6 +1218,28 @@ def _route_lines(result, assigned, task, watcher) -> list[str]:
 	if watcher:
 		lines.append(ROUTE_WATCHER.format(person=get_fullname(watcher)))
 	return lines
+
+
+def _labels_unit(names, context, actions, errors) -> list[str]:
+	"""(u1b) ADR-049: the classification's labels become Helpdesk Tags of the ticket, after (u1) wrote it. Returns
+	the labels added; none to give, or all carried already → [] and no entry. An exception undoes only this unit."""
+	if not names:
+		return []
+	ticket = context.ticket_name
+	result = _run_unit(LABELS_TOOL, lambda: add_labels(names, context), "HD Ticket", ticket, actions, errors)
+	if result is None or not result["added"]:
+		return []
+	actions.append(
+		_route_action(
+			LABELS_TOOL,
+			"HD Ticket",
+			ticket,
+			True,
+			value_after={"labels": result["added"]},
+			instructor=context.instructor,
+		)
+	)
+	return result["added"]
 
 
 def _watch_unit(watcher, context, actions, errors) -> str | None:
@@ -1260,9 +1344,10 @@ def _check_sla(category, context, actions, lines):
 	return state
 
 
-def _record_route(log_name, result, decision, assigned, task, actions, errors, split=None):
+def _record_route(log_name, result, decision, assigned, task, actions, errors, split=None, labelled=None):
 	"""Update the `classify` entry once (design 3.5). `split`: the requests of the split question, given only when a
-	comment carrying it was posted; only then is the question recorded as asked (AC-28)."""
+	comment carrying it was posted; only then is the question recorded as asked (AC-28). `labelled`: the labels the
+	route added (ADR-049)."""
 	updates = {
 		"applied": 1 if result else 0,
 		"actions": json.dumps(_bounded_actions(actions), ensure_ascii=False),
@@ -1277,6 +1362,8 @@ def _record_route(log_name, result, decision, assigned, task, actions, errors, s
 			after["assign"] = [assigned]
 		if task:
 			after["task"] = task
+		if labelled:
+			after["labels"] = labelled
 		for column, value in (("value_before", before), ("value_after", after)):
 			if value:
 				updates[column] = json.dumps(value, ensure_ascii=False)
@@ -1396,6 +1483,7 @@ def _reason(
 				guidance_posted=guidance_posted,
 				conversation=conversation,
 				lessons=lessons,
+				propose_now=granted.change_block and granted.act_now_block,
 			),
 		}
 	]
@@ -1440,14 +1528,21 @@ def _reason(
 			tool_blocks = [block for block in result.content if block.get("type") == "tool_use"]
 			tool_results, actions, before, after, tool_errors, skipped = [], [], {}, {}, [], []
 			# the whole turn waits, before any of its tools runs (D-6)
-			if delay is not None and any(block["name"] == ANSWER_TOOL for block in tool_blocks):
+			# a turn the output cap cut may hold calls whose input stops half way: none of them runs (BUG-005)
+			cut = result.stop_reason == STOP_MAX_TOKENS and bool(tool_blocks)
+			if not cut and delay is not None and any(block["name"] == ANSWER_TOOL for block in tool_blocks):
 				delay.wait_before_answer(deadline)
 			for block in tool_blocks:
 				status.working(block["name"])
-				tool_results.append(_run_tool(block, context, actions, before, after, tool_errors, skipped))
+				if cut:
+					tool_results.append(_cut_tool_result(block, context, actions, tool_errors))
+				else:
+					tool_results.append(
+						_run_tool(block, context, actions, before, after, tool_errors, skipped)
+					)
 			stop_reason = result.stop_reason
-			wants_tools = stop_reason == STOP_TOOL_USE
-			if wants_tools and turn == max_turns:
+			wants_tools = stop_reason == STOP_TOOL_USE or cut
+			if wants_tools and not cut and turn == max_turns:
 				stop_reason = STOP_MAX_TURNS
 			final = not wants_tools or not tool_results or turn == max_turns
 			if final and collecting(run_id):
@@ -1498,7 +1593,9 @@ def _finish_guidance(context, actions) -> None:
 	counts (QĐ 8). A run in parallel posted the ticket's guidance first → one log line, and the run's collected lines
 	go out as before: one result comment without the marker, in the order of GUIDANCE_SECTIONS, one sentence per line,
 	each escaped once, no section heading (design-w1-fixes-20 Điểm 1.6, AD3-4). Nothing to say → one log line.
-	Either comment, once posted, records the split question the route held (`_record_split`); a refusal records none."""
+	Either comment, once posted, records the split question the route held (`_record_split`); a refusal records none.
+	Once the guidance comment is posted, a run a message started that said nothing in the conversation answers there
+	too, with its own entry (CHG-003 Amendment 3)."""
 	ticket, run_id = context.ticket_name, context.run_id
 	result = post_guidance(ticket, run_id)
 	if result.get("ok"):
@@ -1513,6 +1610,18 @@ def _finish_guidance(context, actions) -> None:
 			)
 		)
 		_record_split(run_id, result["comment"])
+		reply = post_guidance_reply(context)
+		if reply is not None:
+			actions.append(
+				action_entry(
+					GUIDANCE_REPLY_TOOL,
+					MESSAGE_DOCTYPE,
+					reply.get("message"),
+					bool(reply.get("ok")),
+					reason=reply.get("reason"),
+					instructor=context.instructor,
+				)
+			)
 		return
 	reason = result.get("reason")
 	if reason == REASON_NO_CONTENT:
@@ -1668,6 +1777,15 @@ def _run_tool(block, context, actions, before, after, tool_errors, skipped):
 			skipped.extend(outcome.get("skipped") or [])
 	content = json.dumps(outcome, ensure_ascii=False, default=str)[:TOOL_RESULT_MAX_CHARS]
 	return {"type": "tool_result", "tool_use_id": block["id"], "content": content}
+
+
+def _cut_tool_result(block, context, actions, tool_errors):
+	"""The `tool_result` of a `tool_use` block of a turn the output cap cut: nothing runs, the model is told (BUG-005)."""
+	name = block["name"]
+	tool_errors.append(f"tool {name}: {STOP_MAX_TOKENS}")
+	if name in WRITE_TOOL_TARGETS:
+		actions.append(_action(name, context, None, False, block.get("input") or {}, crash=CUT_REASON))
+	return {"type": "tool_result", "tool_use_id": block["id"], "content": CUT_TOOL_RESULT, "is_error": True}
 
 
 def _record_snapshot(name, outcome, n, before, after) -> None:

@@ -219,7 +219,9 @@ class TestWriteTicket(FrappeTestCase):
 		self.assertEqual(spec.group, "ticket_write")
 		self.assertIs(spec.handler, write_ticket.set_classification)
 		input_schema = spec.schema["input_schema"]
-		self.assertEqual(set(input_schema["properties"]), {"category", "confidence"})
+		self.assertEqual(
+			set(input_schema["properties"]), {"category", "confidence", "complexity", "complexity_reason"}
+		)
 		self.assertEqual(set(input_schema["required"]), {"category", "confidence"})
 		self.assertEqual(input_schema["properties"]["category"]["enum"], list("ABCDEF"))
 		self.assertEqual(input_schema["properties"]["confidence"]["enum"], ["Cao", "Trung bình", "Thấp"])
@@ -914,6 +916,85 @@ class TestSetClassification(FrappeTestCase):
 		self.assertTrue(result["ok"], result)
 		self.assertNotIn("ai_classification_reason", result["after"])
 
+	def _scores(self):
+		return frappe.db.get_value(
+			"HD Ticket", self.ticket, ["ai_complexity", "ai_score_reason"], as_dict=True
+		)
+
+	def test_complexity_found_while_working_replaces_the_classify_guess(self):
+		# 43229: the classify step guessed "Customize Form và Naming Series trong một ngày"; the reasoning step read
+		# the code and found a script and a list from HR: what the work really needs is written, with its reason
+		mapping = {"B": {"ticket_type": TICKET_TYPE, "agent_group": TEAM, "priority": "High"}}
+		frappe.db.set_value(
+			"HD Ticket", self.ticket, {"ai_complexity": 1, "ai_score_reason": "đoán lúc phân loại"}
+		)
+		reason = "Cần Server Script sinh mã và bổ sung mã cho nhân sự cũ theo danh sách của HCNS"
+		frappe.set_user(AGENT)
+
+		result = write_ticket.set_classification(
+			{"category": "B", "confidence": "Cao", "complexity": 3, "complexity_reason": reason},
+			self._ctx(mapping),
+		)
+
+		self.assertTrue(result["ok"], result)
+		self.assertEqual(
+			(
+				result["before"]["ai_complexity"],
+				result["after"]["ai_complexity"],
+				result["after"]["ai_score_reason"],
+			),
+			(1, 3, reason),
+		)
+		self.assertEqual(self._scores(), {"ai_complexity": 3, "ai_score_reason": reason})
+
+	def test_complexity_alone_is_written_when_the_route_fields_stay(self):
+		# the category and its mapped fields are already on the ticket: only the score changes
+		mapping = {"A": {"ticket_type": TICKET_TYPE, "agent_group": TEAM, "priority": "High"}}
+		frappe.db.set_value(
+			"HD Ticket",
+			self.ticket,
+			{"ticket_type": TICKET_TYPE, "agent_group": TEAM, "priority": "High", "ai_classified_by": "AI"},
+		)
+		frappe.set_user(AGENT)
+
+		result = write_ticket.set_classification(
+			{"category": "A", "confidence": "Cao", "complexity": 2, "complexity_reason": "một Server Script"},
+			self._ctx(mapping),
+		)
+
+		self.assertTrue(result["ok"], result)
+		self.assertEqual(result["after"]["ai_complexity"], 2)
+		self.assertEqual(self._scores(), {"ai_complexity": 2, "ai_score_reason": "một Server Script"})
+
+	def test_complexity_without_a_reason_is_refused_and_writes_nothing(self):
+		mapping = {"A": {"ticket_type": TICKET_TYPE, "agent_group": TEAM, "priority": "High"}}
+		frappe.db.set_value("HD Ticket", self.ticket, {"ai_complexity": 1, "ai_score_reason": "cũ"})
+		before = self._row()
+		frappe.set_user(AGENT)
+
+		for reason in (None, "", "   "):
+			args = {"category": "A", "confidence": "Cao", "complexity": 3}
+			if reason is not None:
+				args["complexity_reason"] = reason
+			with self.subTest(reason=reason):
+				self.assertEqual(
+					write_ticket.set_classification(args, self._ctx(mapping)),
+					{"ok": False, "reason": write_ticket.REASON_COMPLEXITY_NO_REASON},
+				)
+		self.assertEqual(self._scores(), {"ai_complexity": 1, "ai_score_reason": "cũ"})
+		self.assertEqual(self._row(), before)
+
+	def test_classification_without_complexity_keeps_the_score(self):
+		mapping = {"A": {"ticket_type": TICKET_TYPE, "agent_group": TEAM, "priority": "High"}}
+		frappe.db.set_value("HD Ticket", self.ticket, {"ai_complexity": 3, "ai_score_reason": "giữ nguyên"})
+		frappe.set_user(AGENT)
+
+		result = write_ticket.set_classification({"category": "A", "confidence": "Cao"}, self._ctx(mapping))
+
+		self.assertTrue(result["ok"], result)
+		self.assertNotIn("ai_complexity", result["after"])
+		self.assertEqual(self._scores(), {"ai_complexity": 3, "ai_score_reason": "giữ nguyên"})
+
 
 T98_OTHER_TYPE = "T98 Loại khác"
 T98_OTHER_TEAM = "T98 Nhóm khác"
@@ -1047,7 +1128,11 @@ class TestConfidenceSource(ClassificationWriteCase):
 	def test_set_classification_schema_has_no_confidence_pct(self):
 		(spec,) = [spec for spec in write_ticket.TOOLS if spec.name == "set_classification"]
 		input_schema = spec.schema["input_schema"]
-		self.assertEqual(set(input_schema["properties"]), {"category", "confidence"})
+		# ADR-019 Amendment 1: the reasoning step may correct the complexity, with its reason
+		self.assertEqual(
+			set(input_schema["properties"]), {"category", "confidence", "complexity", "complexity_reason"}
+		)
+		self.assertEqual(input_schema["properties"]["complexity"], {"type": "integer", "enum": [1, 2, 3]})
 		self.assertNotIn("confidence_pct", input_schema["required"])
 		self.assertNotIn("confidence_pct", json.dumps(spec.schema))
 
@@ -1169,6 +1254,15 @@ class TicketCommentCase(FrappeTestCase):
 			order_by="creation asc",
 		)
 
+	def _said(self, ticket=None):
+		"""What the bot said to people on the ticket: its conversation, oldest first (CHG-003 Amendment 3)."""
+		return frappe.get_all(
+			MESSAGE_DOCTYPE,
+			filters={"ticket": ticket or self.ticket},
+			pluck="content",
+			order_by="creation asc",
+		)
+
 
 class TestPostCommentKinds(TicketCommentCase):
 	"""AC-22: the post_comment tool takes a kind; a proposal needs a confidence line and grounds; below the
@@ -1233,17 +1327,17 @@ class TestPostCommentKinds(TicketCommentCase):
 		for case, content, reason in refused:
 			with self.subTest(case):
 				self.assertEqual(self._post("de_xuat", content), self._refused(reason))
-				self.assertEqual(self._comments(), [])
+				self.assertEqual(self._said(), [])
 
 		proposal = f"**Nhận định:** máy in hỏng\n{EVIDENCE}\nĐộ tin cậy: 100%"
 		result = self._post("de_xuat", proposal)
 
 		self.assertTrue(result["ok"], result)
-		self.assertEqual(self._comments(), [proposal])
-		self.assertEqual(frappe.db.get_value("Comment", result["comment"], "content"), proposal)
+		self.assertEqual(self._said(), [proposal])
+		self.assertEqual(frappe.db.get_value(MESSAGE_DOCTYPE, result["message"], "content"), proposal)
 		# Above the threshold a question is posted as written: no grounds, no confidence, no footer (step 4).
 		self.assertTrue(self._post("hoi", "Máy in nào?")["ok"])
-		self.assertEqual(self._comments(), [proposal, "Máy in nào?"])
+		self.assertEqual(self._said(), [proposal, "Máy in nào?"])
 
 	def test_section_text_reads_one_section(self):
 		content = "**Nhận định:** A\n**Căn cứ:** dòng 1\ndòng 2\n**Hướng xử lý:** B\nĐộ tin cậy: 90%"
@@ -1265,10 +1359,10 @@ class TestPostCommentKinds(TicketCommentCase):
 					result = write_ticket.post_comment_tool(args, self._ctx(below_threshold))
 					self.assertFalse(result["ok"], result)
 					self.assertIn("kind", result["reason"])
-					self.assertEqual(self._comments(), [])
+					self.assertEqual(self._said(), [])
 		with patch.object(registry, "_all_specs", lambda: write_ticket.TOOLS):
 			self.assertFalse(execute_tool("post_comment", {"content": QUESTION}, self._ctx())["ok"])
-		self.assertEqual(self._comments(), [])
+		self.assertEqual(self._said(), [])
 
 	def test_below_threshold_one_question_with_footer(self):
 		self._classify_row(69)
@@ -1280,7 +1374,7 @@ class TestPostCommentKinds(TicketCommentCase):
 		self.assertEqual(
 			self._post("hoi", "Máy in báo lỗi gì?", ctx), self._refused(write_ticket.REASON_NO_EVIDENCE)
 		)
-		self.assertEqual(self._comments(), [])
+		self.assertEqual(self._said(), [])
 		self.assertFalse(write_ticket.asked_in_run(ctx.run_id))
 
 		first = self._post("hoi", QUESTION, ctx)
@@ -1288,10 +1382,10 @@ class TestPostCommentKinds(TicketCommentCase):
 		self.assertTrue(first["ok"], first)
 		footer = write_ticket.ASK_FOOTER.format(pct="69%", threshold=70)
 		self.assertIn("69% (ngưỡng 70%)", footer)
-		self.assertEqual(self._comments(), [f"{QUESTION}\n\n{footer}"])
+		self.assertEqual(self._said(), [f"{QUESTION}\n\n{footer}"])
 		self.assertTrue(write_ticket.asked_in_run(ctx.run_id))
 		self.assertEqual(self._post("hoi", QUESTION, ctx), self._refused(write_ticket.REASON_ONE_ASK))
-		self.assertEqual(len(self._comments()), 1)
+		self.assertEqual(len(self._said()), 1)
 
 	def test_footer_threshold_80_and_unknown_pct(self):
 		set_agent_settings(confidence_threshold=80)
@@ -1301,14 +1395,14 @@ class TestPostCommentKinds(TicketCommentCase):
 		self.assertTrue(unknown["ok"], unknown)
 		footer = write_ticket.ASK_FOOTER.format(pct="chưa có", threshold=80)
 		self.assertIn("chưa có (ngưỡng 80%)", footer)
-		self.assertEqual(self._comments(), [f"{QUESTION}\n\n{footer}"])
+		self.assertEqual(self._said(), [f"{QUESTION}\n\n{footer}"])
 
 		self._classify_row(75)
 		known = self._post("hoi", QUESTION, self._ctx(below_threshold=True))
 
 		self.assertTrue(known["ok"], known)
 		self.assertEqual(
-			self._comments()[-1], f"{QUESTION}\n\n{write_ticket.ASK_FOOTER.format(pct='75%', threshold=80)}"
+			self._said()[-1], f"{QUESTION}\n\n{write_ticket.ASK_FOOTER.format(pct='75%', threshold=80)}"
 		)
 
 	def test_marked_run_refuses_comment_question(self):
@@ -1320,7 +1414,7 @@ class TestPostCommentKinds(TicketCommentCase):
 		self.assertTrue(write_ticket.asked_in_run(ctx.run_id))
 		self.assertFalse(write_ticket.asked_in_run(f"{ctx.run_id}-khác"))
 		self.assertEqual(self._post("hoi", QUESTION, ctx), self._refused(write_ticket.REASON_ONE_ASK))
-		self.assertEqual(self._comments(), [])
+		self.assertEqual(self._said(), [])
 		with self.assertRaises(ValueError):
 			write_ticket.mark_asked("")
 
@@ -1828,7 +1922,7 @@ class TestGuidanceWriter(TicketCommentCase):
 				execute_tool("post_comment", {"kind": "de_xuat", "content": content}, self._ctx()), refused
 			)
 
-		self.assertEqual(self._comments(), [])
+		self.assertEqual((self._comments(), self._said()), ([], []))
 		self.assertEqual(write_ticket.collected(guidance_run)[0], None)
 		self.assertEqual(write_ticket.count_guidance(self.ticket), 0)
 
@@ -1849,11 +1943,11 @@ class TestGuidanceWriter(TicketCommentCase):
 			):
 				with self.subTest(variant=variant, case=case):
 					self.assertEqual(self._tool("de_xuat", content), refused)
-		self.assertEqual(self._comments(), [])
+		self.assertEqual(self._said(), [])
 		# the plan heading alone is no marker
 		proposal = f"{ANALYSIS}\n{EVIDENCE}"
 		self.assertTrue(self._tool("de_xuat", proposal)["ok"])
-		self.assertEqual(self._comments(), [proposal])
+		self.assertEqual(self._said(), [proposal])
 
 	def test_system_heading_judged_after_normalising_each_line(self):
 		# C8-fix1 round 2 (R13c): a line is judged after tags, entities, emphasis marks, case and spaces are
@@ -1923,7 +2017,7 @@ class TestGuidanceWriter(TicketCommentCase):
 					with self.subTest(line=line, position=position, kind=kind, case=case):
 						self.assertEqual(self._tool(kind, content, ctx), refused)
 
-		self.assertEqual(self._comments(), [])
+		self.assertEqual((self._comments(), self._said()), ([], []))
 		self.assertIsNone(write_ticket.collected(guidance_run)[0])
 
 	def test_system_section_words_mid_sentence_accepted(self):
@@ -1940,7 +2034,7 @@ class TestGuidanceWriter(TicketCommentCase):
 		self.assertEqual(write_ticket.collected(run_id)[0], mention)
 		proposal = f"{mention}\n{EVIDENCE}"
 		self.assertTrue(self._tool("de_xuat", proposal)["ok"])
-		self.assertEqual(self._comments(), [proposal])
+		self.assertEqual(self._said(), [proposal])
 
 	def test_work_only_run_guidance_header_refused(self):
 		# AC-65 (c): on a ticket that already has its guidance, a comment only reports the work just done.
@@ -1954,7 +2048,7 @@ class TestGuidanceWriter(TicketCommentCase):
 
 		self.assertEqual(self._tool("de_xuat", with_plan, ctx), refused)
 		self.assertEqual(self._tool("hoi", "Hướng xử lý: làm lại từ đầu?", ctx), refused)
-		self.assertEqual(self._comments(), [])
+		self.assertEqual(self._said(), [])
 
 		report = f"**Nhận định:** đã tạo Task cho phiếu.\n{EVIDENCE}\nĐộ tin cậy: 90%"
 		empty_plan = f"**Hướng xử lý:**\n{EVIDENCE}\nĐộ tin cậy: 90%"
@@ -1962,7 +2056,7 @@ class TestGuidanceWriter(TicketCommentCase):
 		self.assertTrue(self._tool("de_xuat", empty_plan, ctx)["ok"])
 		# another run of the ticket that is not work-only posts the plan
 		self.assertTrue(self._tool("de_xuat", with_plan)["ok"])
-		self.assertEqual(self._comments(), [report, empty_plan, with_plan])
+		self.assertEqual(self._said(), [report, empty_plan, with_plan])
 
 	def test_de_xuat_held_in_guidance_run(self):
 		# AC-65 (a), w1.md:66: in a guidance run the model's proposal is the analysis of the guidance comment.
@@ -1974,11 +2068,11 @@ class TestGuidanceWriter(TicketCommentCase):
 		self.assertEqual(self._tool("de_xuat", f"{ANALYSIS}\n{EVIDENCE}", ctx), held)
 		self.assertEqual(self._tool("de_xuat", later, ctx), held)
 
-		self.assertEqual(self._comments(), [])
+		self.assertEqual(self._said(), [])
 		self.assertEqual(write_ticket.collected(run_id)[0], later)
 		# a question above the threshold is no guidance: posted on its own (step 4)
 		self.assertTrue(self._tool("hoi", "Máy in nào?", ctx)["ok"])
-		self.assertEqual(self._comments(), ["Máy in nào?"])
+		self.assertEqual(self._said(), ["Máy in nào?"])
 		self.assertEqual(write_ticket.collected(run_id)[0], later)
 		guidance = write_ticket.post_guidance(self.ticket, run_id)
 		self.assertTrue(guidance["ok"], guidance)
@@ -2040,7 +2134,7 @@ class TestGuidanceWriter(TicketCommentCase):
 		result = self._tool("de_xuat", ANALYSIS, self._ctx(run_id))
 
 		self.assertEqual(result, {"ok": True, "held": True, "note": write_ticket.HELD_NOTE})
-		self.assertEqual(self._comments(), [])
+		self.assertEqual(self._said(), [])
 		self.assertEqual(write_ticket.collected(run_id)[0], ANALYSIS)
 
 	def test_de_xuat_outside_guidance_run_still_needs_evidence(self):
@@ -2048,7 +2142,7 @@ class TestGuidanceWriter(TicketCommentCase):
 		result = self._tool("de_xuat", ANALYSIS)
 
 		self.assertEqual(result, {"ok": False, "reason": write_ticket.REASON_NO_EVIDENCE})
-		self.assertEqual(self._comments(), [])
+		self.assertEqual(self._said(), [])
 
 	def test_held_needs_confidence(self):
 		# AC-32 [changed]: the guidance keeps its confidence line; without it nothing is held.
@@ -2058,7 +2152,7 @@ class TestGuidanceWriter(TicketCommentCase):
 			with self.subTest(content=content):
 				self.assertEqual(self._tool("de_xuat", content, self._ctx(run_id)), refused)
 		self.assertEqual(write_ticket.collected(run_id)[0], None)
-		self.assertEqual(self._comments(), [])
+		self.assertEqual(self._said(), [])
 
 	def test_post_comment_schema_has_no_section_templates(self):
 		# design-w1-fixes-20 Điểm 1.5: no "Cần ai quyết"; the kind=de_xuat sentence asks no "Căn cứ".
@@ -2408,7 +2502,7 @@ class TestBaNote(TicketCommentCase):
 		asked = write_ticket.post_comment_tool({"kind": "hoi", "content": question}, ctx)
 
 		self.assertTrue(asked["ok"], asked)
-		(posted,) = self._comments()
+		(posted,) = self._said()
 		self.assertTrue(posted.startswith(question), posted)
 		self.assertNotIn(ops_data.BA_NOTE_MARKER, posted)
 
@@ -2441,10 +2535,8 @@ class TestBaNote(TicketCommentCase):
 		self.assertEqual(frappe.db.count(MESSAGE_DOCTYPE, {"ticket": self.ticket}), 0)
 
 
-class TestAnswerInConversation(TicketCommentCase):
-	"""CHG-003: a run that a message of the ticket's conversation started answers there. What the post_comment tool
-	posts is then an ERP AI Message written by the agent account, not a ticket comment; a held analysis and every
-	refusal write nothing, as before."""
+class ConversationCase(TicketCommentCase):
+	"""The context of a run that a message of the ticket's conversation started, and the conversation's rows."""
 
 	def _ctx(self, **fields):
 		run_id = f"{T100_PREFIX}-{frappe.generate_hash(length=10)}"
@@ -2470,6 +2562,12 @@ class TestAnswerInConversation(TicketCommentCase):
 			fields=["name", "owner", "content", "run_id"],
 			order_by="creation asc",
 		)
+
+
+class TestAnswerInConversation(ConversationCase):
+	"""CHG-003: what the post_comment tool posts as a question or a proposal is an ERP AI Message written by the agent
+	account, not a ticket comment, whatever started the run (Amendment 3); a held analysis and every refusal write
+	nothing, as before."""
 
 	def test_answer_is_a_message_of_the_run_not_a_comment(self):
 		ctx = self._ctx()
@@ -2545,14 +2643,76 @@ class TestAnswerInConversation(TicketCommentCase):
 		self.assertEqual(result, {"ok": False, "reason": "không được phép thêm tin vào ngăn trao đổi"})
 		self.assertEqual(self._comments(), [])
 
-	def test_run_outside_a_conversation_still_posts_a_comment(self):
+	def test_run_outside_a_conversation_answers_in_the_conversation_too(self):
+		# CHG-003 Amendment 3: whatever started the run, what the bot says to people is a message, never a comment.
 		ctx = dataclasses.replace(self._ctx(), in_conversation=False)
+		answer = f"**Nhận định:** máy in hỏng\n{EVIDENCE}\nĐộ tin cậy: 90%"
 
-		result = self._post("hoi", "Máy in nào?", ctx)
+		asked = self._post("hoi", "Máy in nào?", ctx)
+		proposed = self._post("de_xuat", answer, ctx)
 
-		self.assertEqual(list(result), ["ok", "comment"])
-		self.assertEqual(self._comments(), ["Máy in nào?"])
+		rows = self._messages()
+		self.assertEqual([asked, proposed], [{"ok": True, "message": row.name} for row in rows])
+		self.assertEqual(
+			[(row.owner, row.content, row.run_id) for row in rows],
+			[(AGENT_USER, "Máy in nào?", ctx.run_id), (AGENT_USER, answer, ctx.run_id)],
+		)
+		self.assertEqual(self._comments(), [])
+
+
+class TestGuidanceReply(ConversationCase):
+	"""CHG-003 Amendment 3: a run a message started whose answer was held for the guidance comment still answers in
+	the conversation, once: the analysis's finding and where the rest of the guidance is."""
+
+	FINDING = "máy in của kho chưa được cấu hình."
+	ANALYSIS = f"**Nhận định:** {FINDING}\n**Hướng xử lý:** cấu hình lại máy in.\nĐộ tin cậy: 90%"
+
+	def _collecting(self, ctx, analysis=None):
+		write_ticket.open_collector(ctx.run_id)
+		self.addCleanup(write_ticket.close_collector, ctx.run_id)
+		if analysis is not None:
+			write_ticket.hold_analysis(ctx.run_id, analysis)
+		return ctx
+
+	def test_held_answer_gets_one_message_with_the_finding_and_the_pointer(self):
+		ctx = self._collecting(self._ctx(), self.ANALYSIS)
+
+		result = write_ticket.post_guidance_reply(ctx)
+
+		(row,) = self._messages()
+		self.assertEqual(result, {"ok": True, "message": row.name})
+		self.assertEqual(
+			(row.owner, row.content, row.run_id),
+			(AGENT_USER, f"Nhận định: {self.FINDING}\n\n{write_ticket.GUIDANCE_REPLY}", ctx.run_id),
+		)
+		self.assertEqual(self._comments(), [])
+
+	def test_no_finding_only_the_pointer(self):
+		ctx = self._collecting(self._ctx(), "Cấu hình lại máy in.\nĐộ tin cậy: 90%")
+
+		write_ticket.post_guidance_reply(ctx)
+
+		self.assertEqual([row.content for row in self._messages()], [write_ticket.GUIDANCE_REPLY])
+
+	def test_run_not_started_by_a_message_gets_none(self):
+		ctx = self._collecting(dataclasses.replace(self._ctx(), in_conversation=False), self.ANALYSIS)
+
+		self.assertIsNone(write_ticket.post_guidance_reply(ctx))
 		self.assertEqual(self._messages(), [])
+
+	def test_run_that_already_answered_gets_none(self):
+		ctx = self._collecting(self._ctx(), self.ANALYSIS)
+		self._post("hoi", "Máy in nào?", ctx)
+
+		self.assertIsNone(write_ticket.post_guidance_reply(ctx))
+		self.assertEqual([row.content for row in self._messages()], ["Máy in nào?"])
+
+	def test_another_run_message_does_not_count(self):
+		ctx = self._collecting(self._ctx(), self.ANALYSIS)
+		self._post("hoi", "Máy in nào?", self._ctx())
+
+		self.assertTrue(write_ticket.post_guidance_reply(ctx)["ok"])
+		self.assertEqual(len(self._messages()), 2)
 
 
 class TestLevelNotRecomputed(FrappeTestCase):

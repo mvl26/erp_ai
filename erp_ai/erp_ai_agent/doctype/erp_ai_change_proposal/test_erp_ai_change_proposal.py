@@ -41,7 +41,13 @@ from erp_ai.constants import (
 	ROLE_INSTRUCTOR,
 )
 from erp_ai.erp_ai_agent.doctype.erp_ai_change_proposal import erp_ai_change_proposal as controller
-from erp_ai.test_utils import PREFIX, make_block_proposal, make_change_proposal
+from erp_ai.test_utils import (
+	PREFIX,
+	keep_agent_settings,
+	make_block_proposal,
+	make_change_proposal,
+	set_agent_settings,
+)
 
 JSON_PATH = Path(__file__).resolve().parent / "erp_ai_change_proposal.json"
 
@@ -1823,3 +1829,128 @@ class TestChangeProposalFormScript(FrappeTestCase):
 		# The form script never hides or trims the field.
 		self.assertNotIn('"diff"', self.source)
 		self.assertNotIn(".diff", self.source)
+
+
+PANEL_INSTRUCTOR = "change.panel.instructor@example.com"
+PANEL_PLAIN = "change.panel.plain@example.com"
+
+
+class TestPanelDecisionRefusal(FrappeTestCase):
+	"""CHG-008 design 3.3 (AC-4, AC-6): the predicate behind the panel's Duyệt / Từ chối buttons."""
+
+	def setUp(self):
+		self.addCleanup(frappe.db.rollback)
+		self.addCleanup(frappe.set_user, "Administrator")
+		frappe.set_user("Administrator")
+		keep_agent_settings(self)
+		if not frappe.db.exists("Role", ROLE_INSTRUCTOR):
+			frappe.get_doc({"doctype": "Role", "role_name": ROLE_INSTRUCTOR}).insert(ignore_permissions=True)
+		for email in (PANEL_INSTRUCTOR, PANEL_PLAIN):
+			create_agent(email)
+		if not frappe.db.exists("User", AGENT_USER):
+			create_agent(AGENT_USER)
+		frappe.get_doc("User", PANEL_INSTRUCTOR).add_roles(ROLE_INSTRUCTOR)
+		frappe.get_doc("User", AGENT_USER).add_roles(ROLE_INSTRUCTOR)
+		set_agent_settings(one_click_approval_enabled=1)
+
+	def _refusal(self, user, status=CHANGE_STATUS_PENDING):
+		frappe.set_user(user)
+		try:
+			return controller.panel_decision_refusal(status)
+		finally:
+			frappe.set_user("Administrator")
+
+	def test_refusal_texts_are_the_three_panel_sentences(self):
+		self.assertEqual(
+			controller.PANEL_REFUSALS,
+			{
+				"role": "Chỉ người có vai trò ERP AI Instructor mới duyệt hoặc từ chối được.",
+				"not_pending": "Đề xuất không còn chờ duyệt.",
+				"switch_off": "Duyệt một lần bấm đang tắt; hãy duyệt ở form đề xuất.",
+			},
+		)
+
+	def test_has_decider_role(self):
+		self.assertIn(ROLE_INSTRUCTOR, frappe.get_roles(AGENT_USER))
+		cases = {
+			PANEL_INSTRUCTOR: True,
+			PANEL_PLAIN: False,
+			AGENT_USER: False,
+			"Administrator": False,
+			"Guest": False,
+		}
+		for user, expected in cases.items():
+			with self.subTest(user=user):
+				self.assertIs(controller.has_decider_role(user), expected)
+
+	def test_matrix_role_status_switch(self):
+		for user, role in ((PANEL_INSTRUCTOR, True), (PANEL_PLAIN, False)):
+			for status, pending in ((CHANGE_STATUS_PENDING, True), (CHANGE_STATUS_APPROVED, False)):
+				for switch in (1, 0):
+					with self.subTest(role=role, pending=pending, switch=switch):
+						set_agent_settings(one_click_approval_enabled=switch)
+						expected = None
+						if not role:
+							expected = "role"
+						elif not pending:
+							expected = "not_pending"
+						elif not switch:
+							expected = "switch_off"
+						got = self._refusal(user, status)
+						# design 3.3 contract: the predicate returns the key of PANEL_REFUSALS, not its sentence
+						self.assertEqual(got, expected)
+
+	def test_never_authority_is_role_refusal_even_with_role_and_pending_and_switch_on(self):
+		for user in (AGENT_USER, "Administrator", "Guest"):
+			with self.subTest(user=user):
+				# design 3.3 contract: the predicate returns the key of PANEL_REFUSALS, not its sentence
+				self.assertEqual(self._refusal(user), "role")
+
+	def test_order_role_before_not_pending_before_switch_off(self):
+		set_agent_settings(one_click_approval_enabled=0)
+		# design 3.3 contract: the predicate returns the key of PANEL_REFUSALS, not its sentence
+		self.assertEqual(self._refusal(PANEL_PLAIN, CHANGE_STATUS_APPROVED), "role")
+		self.assertEqual(self._refusal(PANEL_INSTRUCTOR, CHANGE_STATUS_APPROVED), "not_pending")
+
+	def test_switch_read_again_on_every_call(self):
+		self.assertIsNone(self._refusal(PANEL_INSTRUCTOR))
+		set_agent_settings(one_click_approval_enabled=0)
+		# design 3.3 contract: the predicate returns the key of PANEL_REFUSALS, not its sentence
+		self.assertEqual(self._refusal(PANEL_INSTRUCTOR), "switch_off")
+		set_agent_settings(one_click_approval_enabled=1)
+		self.assertIsNone(self._refusal(PANEL_INSTRUCTOR))
+
+	def test_switch_not_read_when_role_or_status_already_refuse(self):
+		for user, status in (
+			(PANEL_PLAIN, CHANGE_STATUS_PENDING),
+			(PANEL_INSTRUCTOR, CHANGE_STATUS_APPROVED),
+		):
+			with self.subTest(user=user, status=status):
+				with patch("erp_ai.agent.policy.permission_switches") as switches:
+					self._refusal(user, status)
+				switches.assert_not_called()
+
+	def test_proposal_head(self):
+		proposal = make_change_proposal()
+		head = controller.proposal_head(proposal.name)
+		self.assertEqual(head, frappe._dict(ticket=proposal.ticket, change_status=CHANGE_STATUS_PENDING))
+		self.assertEqual(set(head), {"ticket", "change_status"})
+
+	def test_proposal_head_unknown_names_do_not_exist(self):
+		for name in (None, "", "   ", 5, ["x"], "ERP-AI-NO-SUCH-PROPOSAL"):
+			with self.subTest(name=name):
+				with self.assertRaises(frappe.DoesNotExistError):
+					controller.proposal_head(name)
+
+	def test_new_functions_are_not_whitelisted(self):
+		for fn in (controller.has_decider_role, controller.panel_decision_refusal, controller.proposal_head):
+			with self.subTest(fn=fn.__name__):
+				self.assertNotIn(fn, frappe.whitelisted)
+
+	def test_decider_uses_has_decider_role(self):
+		proposal = make_change_proposal()
+		frappe.set_user(PANEL_INSTRUCTOR)
+		with patch.object(controller, "has_decider_role", return_value=False) as role:
+			with self.assertRaises(frappe.PermissionError):
+				controller._decider(proposal.name)
+		role.assert_called_once_with(PANEL_INSTRUCTOR)

@@ -207,6 +207,38 @@ def _ai_field_specs() -> list[dict]:
 			"read_only": 1,
 			"no_copy": 1,
 		},
+		# What a run concluded and did, so the ticket itself carries it and not only the bot's comment.
+		# They come after the labels field: every field installed before keeps its place.
+		{
+			"fieldname": "ai_classification_reason",
+			"label": "Lý do phân loại (AI)",
+			"fieldtype": "Small Text",
+			"read_only": 1,
+		},
+		{
+			"fieldname": "ai_analysis",
+			"label": "Nhận định (AI)",
+			"fieldtype": "Text Editor",
+			"read_only": 1,
+		},
+		{
+			"fieldname": "ai_done",
+			"label": "Đã làm (AI)",
+			"fieldtype": "Small Text",
+			"read_only": 1,
+		},
+		{
+			"fieldname": "ai_pending",
+			"label": "Chờ duyệt (AI)",
+			"fieldtype": "Small Text",
+			"read_only": 1,
+		},
+		{
+			"fieldname": "ai_manual",
+			"label": "Cần người xử lý (AI)",
+			"fieldtype": "Small Text",
+			"read_only": 1,
+		},
 	]
 
 

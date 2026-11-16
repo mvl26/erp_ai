@@ -19,13 +19,19 @@ from erp_ai.constants import AGENT_USER, LOGGER_NAME, PANEL_MAX_MESSAGE_CHARS
 TICKET_DOCTYPE = "HD Ticket"
 # The three fields the bot classifies, with the wording its own "Đã làm" line uses for them.
 CLASSIFICATION_LABELS = {"ticket_type": "Loại", "agent_group": "Nhóm", "priority": "Ưu tiên"}
+# Display order: why it was classified so and how it was scored, what the run concluded and did, who and when.
 AI_FIELDS = (
-	"ai_resolution_hint",
+	"ai_classification_reason",
 	"ai_confidence",
 	"ai_confidence_pct",
 	"ai_complexity",
 	"ai_importance",
 	"ai_score_reason",
+	"ai_resolution_hint",
+	"ai_analysis",
+	"ai_done",
+	"ai_pending",
+	"ai_manual",
 	"ai_classified_by",
 	"ai_updated_at",
 )

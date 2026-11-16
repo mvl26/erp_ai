@@ -1,5 +1,6 @@
 import json
 from datetime import date, datetime, timedelta
+from unittest.mock import patch
 
 import frappe
 from frappe.tests.utils import FrappeTestCase
@@ -387,3 +388,93 @@ class TestKpi(FrappeTestCase):
 
 		self.assertEqual(result["stale_over_5_days"], 4)
 		self.assertEqual(result["stale_over_7_days"], 2)
+
+
+KPI_WEEK = "ERP AI KPI Week"
+# A Monday 08:00 long before any real row: the target week is the Monday a week earlier.
+RUN_NOW = datetime(2002, 3, 4, 8, 0)
+RUN_TARGET = date(2002, 2, 25)
+
+
+def _fake_compute(week_start: date, settings) -> dict:
+	return {"week_start": week_start, "week_end": week_start + timedelta(days=6), "first_response_sample": 1}
+
+
+def _weeks() -> list[date]:
+	return sorted(row.week_start for row in frappe.get_all(KPI_WEEK, fields=["week_start"]))
+
+
+class TestRunWeekly(FrappeTestCase):
+	def setUp(self):
+		keep_agent_settings(self)
+		self.addCleanup(frappe.db.rollback)
+		# The shared site may hold real rows: this class sees only its own.
+		frappe.db.delete(KPI_WEEK)
+
+	def _run(self, now: datetime):
+		with patch.object(kpi, "compute_week", side_effect=_fake_compute) as compute:
+			kpi.run_weekly_kpi(now=now)
+		return compute
+
+	def test_same_week_twice_one_row(self):
+		self._run(RUN_NOW)
+		first = _weeks()
+		self._run(RUN_NOW + timedelta(hours=3))
+		self.assertEqual(_weeks(), first)
+		self.assertEqual(frappe.db.count(KPI_WEEK, {"week_start": RUN_TARGET}), 1)
+		self.assertEqual(first[-1], RUN_TARGET)
+
+	def test_early_monday_still_belongs_to_the_previous_cycle(self):
+		self._run(datetime(2002, 3, 4, 7, 59))
+		self.assertEqual(_weeks()[-1], RUN_TARGET - timedelta(days=7))
+
+	def test_next_week_compares(self):
+		self._run(RUN_NOW)
+		compute = self._run(RUN_NOW + timedelta(days=7))
+		self.assertEqual(_weeks()[-2:], [RUN_TARGET, RUN_TARGET + timedelta(days=7)])
+		# Only the missing week is computed, the earlier row is not touched again.
+		self.assertEqual([call.args[0] for call in compute.call_args_list], [RUN_TARGET + timedelta(days=7)])
+
+	def test_backfill_capped_at_eight(self):
+		compute = self._run(date_time_after(RUN_NOW, weeks=20))
+		target = RUN_TARGET + timedelta(weeks=20)
+		self.assertEqual(len(_weeks()), 8)
+		self.assertEqual(_weeks(), [target - timedelta(weeks=n) for n in range(7, -1, -1)])
+		self.assertEqual(compute.call_count, 8)
+
+	def test_error_midway_no_row_then_once(self):
+		now = date_time_after(RUN_NOW, weeks=2)
+		target = RUN_TARGET + timedelta(weeks=2)
+		bad = target - timedelta(weeks=1)
+
+		def compute(week_start, settings):
+			if week_start == bad:
+				raise RuntimeError("boom")
+			return _fake_compute(week_start, settings)
+
+		self.assertTrue(frappe.db.count(KPI_WEEK) == 0)
+		with (
+			patch.object(kpi, "compute_week", side_effect=compute),
+			patch("frappe.log_error") as log_error,
+		):
+			kpi.run_weekly_kpi(now=now)
+		self.assertEqual(log_error.call_args.args[0], kpi.TITLE_KPI_FAILED)
+		log_error.assert_called_once()
+		# The failing week and every later one have no row; the run stopped there.
+		self.assertFalse(frappe.db.exists(KPI_WEEK, {"week_start": bad}))
+		self.assertFalse(frappe.db.exists(KPI_WEEK, {"week_start": target}))
+
+		self._run(now)
+		self.assertEqual(frappe.db.count(KPI_WEEK, {"week_start": bad}), 1)
+		self.assertEqual(frappe.db.count(KPI_WEEK, {"week_start": target}), 1)
+		self.assertEqual(len(_weeks()), len(set(_weeks())))
+
+	def test_row_holds_the_computed_values_and_computed_at(self):
+		self._run(RUN_NOW)
+		row = frappe.get_doc(KPI_WEEK, f"KPI-{RUN_TARGET.isoformat()}")
+		self.assertEqual((row.week_end, row.first_response_sample), (RUN_TARGET + timedelta(days=6), 1))
+		self.assertEqual(row.computed_at, RUN_NOW)
+
+
+def date_time_after(moment: datetime, weeks: int) -> datetime:
+	return moment + timedelta(weeks=weeks)

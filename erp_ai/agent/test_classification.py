@@ -276,13 +276,31 @@ class TestPrompts(FrappeTestCase):
 		prompt = prompts.CLASSIFY_PROMPT
 		for key in ("do_phuc_tap", "do_quan_trong", "ly_do_diem", "bo_phan"):
 			self.assertIn(f'"{key}"', prompt)
+		# ADR-019 Amendment 1: the complexity is scored by what the work needs on the system, not by a time guess
 		for row in (
-			"| 1 | Làm xong dưới 1 giờ làm việc, không cần đổi hệ thống: hỏi đáp, thao tác có sẵn | Ảnh hưởng một người, không chặn việc, không có hạn gần |",
-			"| 2 | Trong 1 ngày làm việc: cấu hình có sẵn, sửa một lỗi xác định, một đợt dữ liệu nhỏ | Chặn việc của một người hoặc một bộ phận; hoặc có hạn trong 24 giờ; hoặc (đầu mục D) có Hạn hoàn thành |",
-			"| 3 | Nhiều ngày, cần phân tích trước (BA), xây mới hoặc tích hợp | Chặn nghiệp vụ kế toán, kho hoặc bán hàng; hoặc nhiều bộ phận ngừng việc |",
+			"| 1 | Một thao tác có sẵn hoặc một bản ghi, một cấu hình: hỏi đáp, tạo tài khoản theo mẫu, thêm ngày nghỉ, dịch một nhãn; dưới 1 giờ | Ảnh hưởng một người, không chặn việc, không có hạn gần |",
+			"| 2 | Vài bản ghi hoặc cấu hình liên quan nhau, một đoạn logic nhỏ (một Server Script, sửa một chỗ code), sửa một lỗi xác định hoặc một đợt dữ liệu nhỏ; xong trong 1 ngày làm việc | Chặn việc của một người hoặc một bộ phận; hoặc có hạn trong 24 giờ; hoặc (đầu mục D) có Hạn hoàn thành |",
+			"| 3 | Logic mới ở nhiều chỗ, tích hợp, màn hình hay báo cáo mới, cần phân tích trước (BA); hoặc phải chờ dữ liệu, quyết định của phòng ban khác; nhiều ngày | Chặn nghiệp vụ kế toán, kho hoặc bán hàng; hoặc nhiều bộ phận ngừng việc |",
 		):
 			self.assertIn(row, prompt)
 		self.assertIn("| Điểm | Độ phức tạp | Độ quan trọng |", prompt)
+
+	def test_classify_prompt_scores_complexity_by_the_work(self):
+		# 43229: "thêm trường Mã nhân viên, mã tự nhảy, thứ tự cho nhân sự cũ do HCNS thống nhất" was scored 2 as
+		# "Customize Form và Naming Series trong một ngày"; a code that numbers itself needs a script, and the old
+		# staff need HR's list
+		prompt = prompts.CLASSIFY_PROMPT
+		for line in (
+			"Chấm độ phức tạp theo việc phải làm trên hệ thống, không theo độ dài phiếu:",
+			"- Tự sinh mã, đánh số, tính toán hay gửi thông báo theo quy tắc riêng mà ERPNext không có sẵn thì cần "
+			"Server Script hoặc code: ít nhất 2.",
+			"- Có dữ liệu cũ phải bổ sung, hoặc phải thống nhất với phòng ban khác: thêm một mức, tối đa 3.",
+			"- Phiếu nhiều yêu cầu: chấm theo yêu cầu khó nhất.",
+			"  Thêm trường kèm một quy tắc tự sinh giá trị làm được bằng một Server Script trong ngày vẫn là B; cần "
+			"nhiều script, màn hình hay báo cáo mới là C.",
+		):
+			self.assertEqual(prompt.count(line), 1, line)
+		self.assertLess(prompt.index("Chấm độ phức tạp theo việc"), prompt.index("Trả về DUY NHẤT"))
 
 	def test_classify_request_appends_departments_only_when_given(self):
 		base = prompts.build_classify_request("Lỗi", "nội dung")
@@ -383,6 +401,7 @@ class TestPrompts(FrappeTestCase):
 					prompts.CATEGORY_TABLE,
 					prompts.CONVENTIONS,
 					prompts.KNOWLEDGE_SOURCES_BLOCK,
+					prompts.OWN_DECISIONS_BLOCK,
 					"DIGEST-XYZ",
 				]
 			),
@@ -400,13 +419,15 @@ class TestPrompts(FrappeTestCase):
 			("", "ROUTING-ABC"),
 			("", ""),
 		):
-			# spec changed (AC-47, AC-48, T157): KNOWLEDGE_SOURCES_BLOCK always follows CONVENTIONS.
+			# spec changed (AC-47, AC-48, T157): KNOWLEDGE_SOURCES_BLOCK always follows CONVENTIONS; ADR-019 Amendment 1:
+			# OWN_DECISIONS_BLOCK follows it in every run that is not ask-only.
 			parts = [
 				prompts.CORE_PROMPT,
 				prompts.CATEGORY_TABLE,
 				routing,
 				prompts.CONVENTIONS,
 				prompts.KNOWLEDGE_SOURCES_BLOCK,
+				prompts.OWN_DECISIONS_BLOCK,
 				digest,
 			]
 			expected = [
@@ -473,6 +494,7 @@ class TestPrompts(FrappeTestCase):
 				"ROUTING-ABC",
 				prompts.CONVENTIONS,
 				prompts.KNOWLEDGE_SOURCES_BLOCK,
+				prompts.OWN_DECISIONS_BLOCK,
 			]
 		)
 		self.assertNotEqual(core, prompts.CORE_PROMPT)
@@ -494,6 +516,7 @@ class TestPrompts(FrappeTestCase):
 					prompts.CATEGORY_TABLE,
 					prompts.CONVENTIONS,
 					prompts.KNOWLEDGE_SOURCES_BLOCK,
+					prompts.OWN_DECISIONS_BLOCK,
 					block,
 				]
 			),
@@ -540,6 +563,7 @@ class TestPrompts(FrappeTestCase):
 				"ROUTING-ABC",
 				prompts.CONVENTIONS,
 				prompts.KNOWLEDGE_SOURCES_BLOCK,
+				prompts.OWN_DECISIONS_BLOCK,
 			]
 		)
 		text = prompts.build_reason_system("DIGEST-XYZ", "ROUTING-ABC", site_admin_tools=True)[0]["text"]
@@ -570,6 +594,7 @@ class TestPrompts(FrappeTestCase):
 				"ROUTING-ABC",
 				prompts.CONVENTIONS,
 				prompts.KNOWLEDGE_SOURCES_BLOCK,
+				prompts.OWN_DECISIONS_BLOCK,
 			]
 		)
 		text = prompts.build_reason_system("DIGEST-XYZ", "ROUTING-ABC", unrestricted_tools=True)[0]["text"]

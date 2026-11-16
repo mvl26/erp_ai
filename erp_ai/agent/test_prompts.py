@@ -731,3 +731,39 @@ class TestCategoryC(FrappeTestCase):
 					message.rsplit("\n\n", 1)[1],
 					prompts.TASK_BY_TRIGGER.get(trigger, prompts.TASK_NEW_TICKET),
 				)
+
+
+class TestOwnDecisionsBlock(FrappeTestCase):
+	"""ADR-019 Amendment 1 (43229): the bot chooses the open points itself and says how to approve, re-reads a record
+	after a system error, and corrects the complexity once it has looked; in every run that is not ask-only."""
+
+	def setUp(self):
+		keep_agent_settings(self)
+
+	def test_block_follows_the_knowledge_sources_unless_ask_only(self):
+		for flags in ALL_FLAGS:
+			text = prompts.build_reason_system("DIGEST-XYZ", "ROUTING-ABC", **flags)[0]["text"]
+			with self.subTest(flags=flags):
+				if flags["ask_only"]:
+					self.assertNotIn(prompts.OWN_DECISIONS_BLOCK, text)
+				else:
+					self.assertEqual(text.count(prompts.OWN_DECISIONS_BLOCK), 1)
+					self.assertIn(
+						prompts.KNOWLEDGE_SOURCES_BLOCK + "\n\n" + prompts.OWN_DECISIONS_BLOCK, text
+					)
+
+	def test_block_says_the_bot_chooses_and_how_to_approve(self):
+		block = prompts.OWN_DECISIONS_BLOCK
+		self.assertTrue(block.startswith("TỰ QUYẾT VÀ ĐỘ PHỨC TẠP\n\n"), block)
+		for phrase in (
+			'không viết "cần người quyết định", "nhờ … kiểm tra", "chờ … thống nhất"',
+			'viết "Bot chọn …, vì …"',
+			"soạn sẵn phương án cụ thể (danh sách, giá trị, thứ tự) để họ duyệt",
+			'Câu cuối của "Hướng xử lý" nói rõ duyệt bằng cách nào và bot làm gì ngay sau khi được duyệt.',
+			"đọc lại bản ghi để biết đã lưu chưa rồi mới báo",
+			"gọi set_classification với complexity và complexity_reason mới",
+			"1 thì làm xong trong lượt này; 2 thì làm hết phần tool làm được",
+		):
+			self.assertIn(phrase, block)
+		# a section heading of the comment stays once, in VIẾT COMMENT
+		self.assertNotIn("**", block)

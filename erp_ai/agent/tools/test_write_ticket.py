@@ -219,7 +219,9 @@ class TestWriteTicket(FrappeTestCase):
 		self.assertEqual(spec.group, "ticket_write")
 		self.assertIs(spec.handler, write_ticket.set_classification)
 		input_schema = spec.schema["input_schema"]
-		self.assertEqual(set(input_schema["properties"]), {"category", "confidence"})
+		self.assertEqual(
+			set(input_schema["properties"]), {"category", "confidence", "complexity", "complexity_reason"}
+		)
 		self.assertEqual(set(input_schema["required"]), {"category", "confidence"})
 		self.assertEqual(input_schema["properties"]["category"]["enum"], list("ABCDEF"))
 		self.assertEqual(input_schema["properties"]["confidence"]["enum"], ["Cao", "Trung bình", "Thấp"])
@@ -914,6 +916,85 @@ class TestSetClassification(FrappeTestCase):
 		self.assertTrue(result["ok"], result)
 		self.assertNotIn("ai_classification_reason", result["after"])
 
+	def _scores(self):
+		return frappe.db.get_value(
+			"HD Ticket", self.ticket, ["ai_complexity", "ai_score_reason"], as_dict=True
+		)
+
+	def test_complexity_found_while_working_replaces_the_classify_guess(self):
+		# 43229: the classify step guessed "Customize Form và Naming Series trong một ngày"; the reasoning step read
+		# the code and found a script and a list from HR: what the work really needs is written, with its reason
+		mapping = {"B": {"ticket_type": TICKET_TYPE, "agent_group": TEAM, "priority": "High"}}
+		frappe.db.set_value(
+			"HD Ticket", self.ticket, {"ai_complexity": 1, "ai_score_reason": "đoán lúc phân loại"}
+		)
+		reason = "Cần Server Script sinh mã và bổ sung mã cho nhân sự cũ theo danh sách của HCNS"
+		frappe.set_user(AGENT)
+
+		result = write_ticket.set_classification(
+			{"category": "B", "confidence": "Cao", "complexity": 3, "complexity_reason": reason},
+			self._ctx(mapping),
+		)
+
+		self.assertTrue(result["ok"], result)
+		self.assertEqual(
+			(
+				result["before"]["ai_complexity"],
+				result["after"]["ai_complexity"],
+				result["after"]["ai_score_reason"],
+			),
+			(1, 3, reason),
+		)
+		self.assertEqual(self._scores(), {"ai_complexity": 3, "ai_score_reason": reason})
+
+	def test_complexity_alone_is_written_when_the_route_fields_stay(self):
+		# the category and its mapped fields are already on the ticket: only the score changes
+		mapping = {"A": {"ticket_type": TICKET_TYPE, "agent_group": TEAM, "priority": "High"}}
+		frappe.db.set_value(
+			"HD Ticket",
+			self.ticket,
+			{"ticket_type": TICKET_TYPE, "agent_group": TEAM, "priority": "High", "ai_classified_by": "AI"},
+		)
+		frappe.set_user(AGENT)
+
+		result = write_ticket.set_classification(
+			{"category": "A", "confidence": "Cao", "complexity": 2, "complexity_reason": "một Server Script"},
+			self._ctx(mapping),
+		)
+
+		self.assertTrue(result["ok"], result)
+		self.assertEqual(result["after"]["ai_complexity"], 2)
+		self.assertEqual(self._scores(), {"ai_complexity": 2, "ai_score_reason": "một Server Script"})
+
+	def test_complexity_without_a_reason_is_refused_and_writes_nothing(self):
+		mapping = {"A": {"ticket_type": TICKET_TYPE, "agent_group": TEAM, "priority": "High"}}
+		frappe.db.set_value("HD Ticket", self.ticket, {"ai_complexity": 1, "ai_score_reason": "cũ"})
+		before = self._row()
+		frappe.set_user(AGENT)
+
+		for reason in (None, "", "   "):
+			args = {"category": "A", "confidence": "Cao", "complexity": 3}
+			if reason is not None:
+				args["complexity_reason"] = reason
+			with self.subTest(reason=reason):
+				self.assertEqual(
+					write_ticket.set_classification(args, self._ctx(mapping)),
+					{"ok": False, "reason": write_ticket.REASON_COMPLEXITY_NO_REASON},
+				)
+		self.assertEqual(self._scores(), {"ai_complexity": 1, "ai_score_reason": "cũ"})
+		self.assertEqual(self._row(), before)
+
+	def test_classification_without_complexity_keeps_the_score(self):
+		mapping = {"A": {"ticket_type": TICKET_TYPE, "agent_group": TEAM, "priority": "High"}}
+		frappe.db.set_value("HD Ticket", self.ticket, {"ai_complexity": 3, "ai_score_reason": "giữ nguyên"})
+		frappe.set_user(AGENT)
+
+		result = write_ticket.set_classification({"category": "A", "confidence": "Cao"}, self._ctx(mapping))
+
+		self.assertTrue(result["ok"], result)
+		self.assertNotIn("ai_complexity", result["after"])
+		self.assertEqual(self._scores(), {"ai_complexity": 3, "ai_score_reason": "giữ nguyên"})
+
 
 T98_OTHER_TYPE = "T98 Loại khác"
 T98_OTHER_TEAM = "T98 Nhóm khác"
@@ -1047,7 +1128,11 @@ class TestConfidenceSource(ClassificationWriteCase):
 	def test_set_classification_schema_has_no_confidence_pct(self):
 		(spec,) = [spec for spec in write_ticket.TOOLS if spec.name == "set_classification"]
 		input_schema = spec.schema["input_schema"]
-		self.assertEqual(set(input_schema["properties"]), {"category", "confidence"})
+		# ADR-019 Amendment 1: the reasoning step may correct the complexity, with its reason
+		self.assertEqual(
+			set(input_schema["properties"]), {"category", "confidence", "complexity", "complexity_reason"}
+		)
+		self.assertEqual(input_schema["properties"]["complexity"], {"type": "integer", "enum": [1, 2, 3]})
 		self.assertNotIn("confidence_pct", input_schema["required"])
 		self.assertNotIn("confidence_pct", json.dumps(spec.schema))
 

@@ -1050,6 +1050,46 @@ class TestRunnerReasoning(RunnerTestBase):
 			],
 		)
 
+	def test_later_run_carries_the_ticket_complexity_and_its_reason(self):
+		# ADR-019 Amendment 1: the reasoning step knows the complexity the ticket holds, to act by it and correct it
+		frappe.db.set_value(
+			"HD Ticket",
+			self.ticket.name,
+			{"ai_complexity": 3, "ai_score_reason": f"{PREFIX}cần phân tích trước"},
+		)
+		with patch.object(authority, "run_instructor", return_value=None):
+			self._run("comment_mention")
+
+		payload, _content = self._user_message()
+		self.assertEqual(
+			payload["classification"],
+			{
+				"category": SEEDED_CLASSIFICATION[0],
+				"confidence_pct": SEEDED_CLASSIFICATION[1],
+				"complexity": 3,
+				"complexity_reason": f"{PREFIX}cần phân tích trước",
+			},
+		)
+
+	def test_insert_run_carries_the_complexity_it_scored(self):
+		scored = {
+			"dau_muc": "A",
+			"do_tin_cay": "Cao",
+			"do_tin_cay_pct": CLASSIFY_A_PCT,
+			"ly_do": "x",
+			"do_phuc_tap": 2,
+			"do_quan_trong": 1,
+			"ly_do_diem": "một Server Script",
+		}
+		self.gateway.results = [make_model_result(text=json.dumps(scored)), make_model_result()]
+		self._run()
+
+		payload, _content = self._user_message(1)
+		self.assertEqual(
+			(payload["classification"]["complexity"], payload["classification"]["complexity_reason"]),
+			(2, "một Server Script"),
+		)
+
 	def test_ticket_insert_passes_classification_to_reasoning(self):
 		self._run()
 

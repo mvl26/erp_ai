@@ -5168,6 +5168,39 @@ class TestReclassify(RunnerTestBase):
 		self.assertIn(f"{LATER_MESSAGES_LABEL}\n- {comment}\n- {reply}", content)
 		self.assertNotIn(bot, content)
 
+	def _chat(self, content, owner, creation, source_comment=None):
+		"""A message of the ticket's conversation written by `owner` at `creation`."""
+		with patch.object(frappe, "enqueue"):
+			name = messages.add_message(
+				self.ticket.name, content, source_comment=source_comment, trusted=True
+			)
+		frappe.db.set_value(
+			"ERP AI Message", name, {"owner": owner, "creation": creation}, update_modified=False
+		)
+
+	def test_person_message_in_the_conversation_reaches_the_classification_as_data(self):
+		# CHG-003 (ADR-037 QĐ 2): what a person typed to the bot in the ticket's conversation was also written after
+		# the last classification; the bot's own message is left out, and the copy of an @ai comment is not read
+		# a second time (the comment itself is among the people's comments)
+		self._seed_classification(69)
+		now = frappe.utils.now_datetime()
+		typed = f"{PREFIX}máy in ở kho 2, tầng 3"
+		self._chat(typed, "Administrator", frappe.utils.add_to_date(now, seconds=1))
+		copied = f"{PREFIX}bản chép của một comment"
+		self._chat(
+			copied, "Administrator", frappe.utils.add_to_date(now, seconds=2), source_comment="comment-1"
+		)
+		bot = f"{PREFIX}câu bot trả lời"
+		self._chat(bot, AGENT_USER, frappe.utils.add_to_date(now, seconds=3))
+		self.gateway.results = [classify_at(75), make_model_result()]
+		self._run("comment_mention")
+
+		self.assertEqual(self._tasks(), ["classify", "reason"])
+		content = self.gateway.calls[0]["messages"][0]["content"]
+		self.assertIn(f"{LATER_MESSAGES_LABEL}\n- {typed}", content)
+		self.assertNotIn(copied, content)
+		self.assertNotIn(bot, content)
+
 	def test_still_below_asks_again_no_route(self):
 		self._seed_classification(69)
 		self.gateway.results = [classify_at(69), make_model_result()]

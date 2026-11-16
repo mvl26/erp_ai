@@ -4,7 +4,7 @@ import frappe
 from frappe.tests.utils import FrappeTestCase
 from helpdesk.test_utils import make_ticket
 
-from erp_ai.agent.messages import add_message, history, thread
+from erp_ai.agent.messages import add_message, history, thread, typed_by_people
 from erp_ai.constants import AGENT_USER, MESSAGE_DOCTYPE
 from erp_ai.test_utils import pin_agent_roles
 
@@ -91,6 +91,28 @@ class TestMessages(FrappeTestCase):
 		self.assertEqual(set(rows[0]), {"name", "author", "is_bot", "created_at", "text"})
 		self.assertEqual(rows[0]["text"], "hỏi")
 		self.assertEqual(rows[0]["author"], frappe.utils.get_fullname(HUMAN_USER))
+
+	def test_typed_by_people_leaves_out_the_bot_and_comment_copies(self):
+		add_message(self.ticket, "người gõ", trusted=True)
+		add_message(self.ticket, "bản chép của comment", source_comment="comment-1", trusted=True)
+		frappe.set_user(AGENT_USER)
+		add_message(self.ticket, "bot đáp", trusted=True)
+		frappe.set_user("Administrator")
+
+		rows = typed_by_people(self.ticket)
+
+		self.assertEqual([row["content"] for row in rows], ["người gõ"])
+		self.assertEqual(set(rows[0]), {"creation", "content"})
+
+	def test_typed_by_people_after_a_time_newest_first_with_limit(self):
+		names = [add_message(self.ticket, f"tin {i}", trusted=True) for i in range(4)]
+		for i, name in enumerate(names):
+			frappe.db.set_value(MESSAGE_DOCTYPE, name, "creation", f"2001-01-0{i + 1} 10:00:00")
+
+		rows = typed_by_people(self.ticket, after="2001-01-01 10:00:00", limit=2)
+
+		self.assertEqual([row["content"] for row in rows], ["tin 3", "tin 2"])
+		self.assertEqual(len(typed_by_people(self.ticket)), 4)
 
 	def test_add_message_never_commits(self):
 		with patch.object(frappe.db, "commit", side_effect=AssertionError("commit")):

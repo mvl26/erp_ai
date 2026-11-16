@@ -124,8 +124,15 @@ LAYER_RULES = (
 	),
 	(
 		"erp_ai.ticket_panel",
-		("erp_ai.gateway", "erp_ai.agent.runner", "erp_ai.agent.queue"),
-		"ADR-001/ADR-010: the panel is an entry layer, it never calls the model, runs the agent or enqueues",
+		(
+			"erp_ai.gateway",
+			"erp_ai.agent.runner",
+			"erp_ai.agent.queue",
+			"erp_ai.agent.authority",
+			"erp_ai.agent.tools",
+			"erp_ai.agent.changes.transitions",
+		),
+		"ADR-001/ADR-010/ADR-044: the panel is an entry layer, it never calls the model, runs the agent, enqueues, judges authority, calls a tool or moves a proposal's state itself",
 	),
 	(
 		"erp_ai.agent.policy",
@@ -2187,6 +2194,7 @@ PROPOSAL_DOCTYPE_FILE = "erp_ai_agent/doctype/erp_ai_change_proposal/erp_ai_chan
 PROPOSAL_DOCTYPE_NAME = "ERP AI Change Proposal"
 PROPOSAL_DOCTYPE_CONSTANT = "PROPOSAL_DOCTYPE"
 PROPOSE_TOOL_FILE = "agent/tools/propose_change.py"
+PANEL_HELPER_FUNCTIONS = ("has_decider_role", "panel_decision_refusal", "proposal_head", "panel_cards")
 CHANGE_GUARD_FILE = "agent/tools/change_guard.py"
 CHANGE_GUARD_FUNCTION = "check_write_path"
 SAFE_PATH_CALL = "erp_ai.agent.tools.source.resolve_safe_path"
@@ -2783,6 +2791,67 @@ def check_propose_change_builds_no_target_itself(sources: dict) -> list:
 			violations.append(f"{PROPOSE_TOOL_FILE}:{node.lineno}: _comment reads is_new_file itself")
 		elif isinstance(node, ast.Attribute) and node.attr == "is_new_file":
 			violations.append(f"{PROPOSE_TOOL_FILE}:{node.lineno}: _comment reads is_new_file itself")
+	return violations
+
+
+def check_panel_cards_called_only_by_panel(sources: dict) -> list:
+	"""CHG-008 design 8.2: the four panel helpers of the proposal controller are not whitelisted, and no product
+	file but `ticket_panel.py` calls `panel_cards` (it does no gate of its own, so only the gated panel may)."""
+	source = sources.get(PROPOSAL_CONTROLLER_FILE)
+	if source is None:
+		return _missing(PROPOSAL_CONTROLLER_FILE)
+	violations = []
+	tree = parse(PROPOSAL_CONTROLLER_FILE, source)
+	defined = {n.name for n in tree.body if isinstance(n, ast.FunctionDef)}
+	whitelisted = {
+		node.name for _rel, node, _decorator in whitelisted_functions({PROPOSAL_CONTROLLER_FILE: source})
+	}
+	for name in PANEL_HELPER_FUNCTIONS:
+		if name not in defined:
+			violations.append(f"{PROPOSAL_CONTROLLER_FILE}: no function {name}")
+		if name in whitelisted:
+			violations.append(f"{PROPOSAL_CONTROLLER_FILE}: {name} must not be whitelisted")
+	called_by_panel = False
+	for rel, text in only_python(sources).items():
+		for node in ast.walk(parse(rel, text)):
+			if not isinstance(node, ast.Call):
+				continue
+			name = (dotted_name(node.func) or "").rpartition(".")[2]
+			if name != "panel_cards":
+				continue
+			if rel == PANEL_FILE:
+				called_by_panel = True
+			else:
+				violations.append(violation(rel, node, "panel_cards is called outside ticket_panel.py"))
+	if PANEL_FILE in sources and not called_by_panel:
+		violations.append(f"{PANEL_FILE}: does not call panel_cards")
+	return violations
+
+
+def check_role_instructor_only_in_decider_role(sources: dict) -> list:
+	"""CHG-008 design 8.2: in the proposal controller, `ticket_panel.py` and `change_decision.py`, the role
+	`ROLE_INSTRUCTOR` (name or literal) is used only inside `has_decider_role`; an import is not a use."""
+	violations = []
+	for rel in (PROPOSAL_CONTROLLER_FILE, PANEL_FILE, "change_decision.py"):
+		if rel not in sources:
+			violations.append(f"{rel} is missing")
+			continue
+		tree = parse(rel, sources[rel])
+		allowed = {
+			id(inner)
+			for n in ast.walk(tree)
+			if isinstance(n, ast.FunctionDef) and n.name == "has_decider_role"
+			for inner in ast.walk(n)
+		}
+		for node in ast.walk(tree):
+			if id(node) in allowed:
+				continue
+			if (isinstance(node, ast.Name) and node.id == "ROLE_INSTRUCTOR") or (
+				isinstance(node, ast.Attribute) and node.attr == "ROLE_INSTRUCTOR"
+			):
+				violations.append(violation(rel, node, "ROLE_INSTRUCTOR outside has_decider_role"))
+			elif isinstance(node, ast.Constant) and node.value == "ERP AI Instructor":
+				violations.append(violation(rel, node, "the role literal outside has_decider_role"))
 	return violations
 
 
@@ -5374,8 +5443,17 @@ class TestArchitecture(unittest.TestCase):
 		rules = {scope: forbidden for scope, forbidden, _reason in LAYER_RULES}
 		for scope in ("erp_ai.gateway", "erp_ai.agent"):
 			self.assertIn("erp_ai.ticket_panel", rules[scope])
+		# ADR-044 (CHG-008): the panel layer rule also forbids authority, tools and the state machine
 		self.assertEqual(
-			rules["erp_ai.ticket_panel"], ("erp_ai.gateway", "erp_ai.agent.runner", "erp_ai.agent.queue")
+			rules["erp_ai.ticket_panel"],
+			(
+				"erp_ai.gateway",
+				"erp_ai.agent.runner",
+				"erp_ai.agent.queue",
+				"erp_ai.agent.authority",
+				"erp_ai.agent.tools",
+				"erp_ai.agent.changes.transitions",
+			),
 		)
 
 	def test_status_event_name_matches_script(self):
@@ -5768,6 +5846,39 @@ class TestArchitecture(unittest.TestCase):
 				source = clean.replace("\tform = f", f"\t_ = {needle}\n\tform = f", 1)
 				found = check_propose_change_builds_no_target_itself({PROPOSE_TOOL_FILE: source})
 				self.assertTrue(any("itself" in text for text in found), found)
+
+	def test_panel_cards_called_only_by_panel(self):
+		# CHG-008 design 8.2: `panel_cards` checks no gate, so only the gated panel method may call it
+		self.assertEqual(check_panel_cards_called_only_by_panel(self.sources), [])
+		controller = self.sources[PROPOSAL_CONTROLLER_FILE]
+		whitelisted = controller.replace(
+			"def panel_cards(", '@frappe.whitelist(methods=["POST"])\ndef panel_cards('
+		)
+		found = check_panel_cards_called_only_by_panel(
+			{**self.sources, PROPOSAL_CONTROLLER_FILE: whitelisted}
+		)
+		self.assertTrue(any("must not be whitelisted" in text for text in found), found)
+		other = {
+			**self.sources,
+			"agent/messages.py": self.sources["agent/messages.py"] + "\nx = panel_cards(1)\n",
+		}
+		found = check_panel_cards_called_only_by_panel(other)
+		self.assertTrue(any("outside ticket_panel.py" in text for text in found), found)
+		silent = {**self.sources, PANEL_FILE: self.sources[PANEL_FILE].replace("panel_cards(", "x(")}
+		found = check_panel_cards_called_only_by_panel(silent)
+		self.assertTrue(any("does not call panel_cards" in text for text in found), found)
+
+	def test_role_instructor_only_in_decider_role(self):
+		# CHG-008 design 8.2: one place compares the decider role, so the panel and the form cannot drift apart
+		self.assertEqual(check_role_instructor_only_in_decider_role(self.sources), [])
+		panel = (
+			self.sources[PANEL_FILE] + "\nfrom erp_ai.constants import ROLE_INSTRUCTOR\nx = ROLE_INSTRUCTOR\n"
+		)
+		found = check_role_instructor_only_in_decider_role({**self.sources, PANEL_FILE: panel})
+		self.assertTrue(any("outside has_decider_role" in text for text in found), found)
+		literal = self.sources["change_decision.py"] + '\nY = "ERP AI Instructor"\n'
+		found = check_role_instructor_only_in_decider_role({**self.sources, "change_decision.py": literal})
+		self.assertTrue(any("role literal" in text for text in found), found)
 
 	def test_tool_never_saves_proposal(self):
 		self.assertIn("proposal.insert()", self.sources[PROPOSE_TOOL_FILE])
@@ -6532,7 +6643,7 @@ class TestScannersCatchViolations(unittest.TestCase):
 			"agent/authority.py": "from erp_ai.erp_ai_agent import doctype\n",
 			"ticket_panel.py": "from erp_ai.gateway import call_model\n",
 			"gateway/cache.py": "from erp_ai import ticket_panel\n",
-			"agent/context.py": "from erp_ai.ticket_panel import get_panel_data\n",
+			"agent/messages.py": "from erp_ai.ticket_panel import get_panel_data\n",
 		}
 		for rel, source in cases.items():
 			with self.subTest(rel=rel):
@@ -8897,7 +9008,12 @@ class TestScannersCatchViolations(unittest.TestCase):
 		):
 			with self.subTest(check=check.__name__):
 				self.assertEqual(check(GIT_CLEAN), [])
-		self.assertEqual(check_layer_imports(GIT_CLEAN), [])
+		# ADR-044 (CHG-008): the panel layer rule now forbids erp_ai.agent.tools, which the fixture's panel imports on
+		# purpose to show the git rules; the layer rules are checked on the rest of the fixture.
+		self.assertEqual(
+			check_layer_imports({rel: text for rel, text in GIT_CLEAN.items() if rel != "ticket_panel.py"}),
+			[],
+		)
 		scan = GitScan(GIT_CLEAN)
 		self.assertEqual(
 			{sub for argv in scan.argvs if argv.root_rel == SOURCE_TOOL_FILE for sub in argv.subcommands},

@@ -1,8 +1,10 @@
 import json
+from types import SimpleNamespace
 from typing import ClassVar
 from unittest.mock import MagicMock, patch
 
 import frappe
+from frappe.core.utils import html_to_plain_text
 from frappe.tests.utils import FrappeTestCase
 from helpdesk.test_utils import create_agent, make_ticket, make_todo
 from helpdesk.utils import is_agent
@@ -12,18 +14,41 @@ from erp_ai.agent import answer_delay, policy, runner
 from erp_ai.agent.policy import contains_keyword
 from erp_ai.agent.queue import PENDING_JOB_IDS_FLAG
 from erp_ai.agent.run_log import write_entry
-from erp_ai.agent.tools import write_ticket
+from erp_ai.agent.tools import propose_change, write_ticket
 from erp_ai.constants import (
 	AGENT_USER,
+	CHANGE_STATUS_APPLIED,
+	CHANGE_STATUS_APPROVED,
+	CHANGE_STATUS_FAILED,
+	CHANGE_STATUS_PENDING,
+	CHANGE_STATUS_REJECTED,
+	CHANGE_STATUS_STALE,
+	CHANGE_STATUS_UNDOING,
+	CHANGE_STATUS_UNDONE,
 	CLASSIFICATION_FIELDS,
 	LOG_DOCTYPE,
 	LOGGER_NAME,
 	MESSAGE_DOCTYPE,
+	PANEL_MAX_PROPOSALS,
 	PANEL_METHODS,
+	PROPOSAL_DOCTYPE,
+	RESTART_STATUS_CONFIRMED,
+	RESTART_STATUS_LAUNCH_FAILED,
+	RESTART_STATUS_SENT,
+	RESTART_STATUS_UNCONFIRMED,
 	ROLE_INSTRUCTOR,
 	TITLE_RUN_FAILED,
 )
-from erp_ai.test_utils import FakeGateway, make_model_result, record_status_signals, set_agent_settings
+from erp_ai.erp_ai_agent.doctype.erp_ai_change_proposal import erp_ai_change_proposal as proposal_form
+from erp_ai.test_utils import (
+	FakeGateway,
+	keep_agent_settings,
+	make_block_proposal,
+	make_change_proposal,
+	make_model_result,
+	record_status_signals,
+	set_agent_settings,
+)
 
 # What the panel lists about the ticket, in display order: what the bot classified and why, how it scored
 # the ticket, what it concluded and did, then who classified and when.
@@ -383,7 +408,8 @@ class TestTicketPanelReadOnly(FrappeTestCase):
 		for secret in ("zq-unique-keyword", "zq-unique-recipient", "zq-unique-thinking"):
 			with self.subTest(secret=secret):
 				self.assertNotIn(secret, result)
-		self.assertEqual(set(json.loads(result)), {"ticket", "ai_fields", "messages"})
+		# ADR-044 (CHG-008): the read result gains `proposals`, the cards of the ticket's change proposals
+		self.assertEqual(set(json.loads(result)), {"ticket", "ai_fields", "messages", "proposals"})
 
 	def test_read_logs_ids_only_at_debug(self):
 		_add_message(self.ticket, f"{KEYWORD} secret body text")
@@ -393,7 +419,8 @@ class TestTicketPanelReadOnly(FrappeTestCase):
 		frappe.set_user(AGENT_EMAIL)
 		ticket_panel.get_panel_data(self.ticket)
 		get_logger.assert_called_with(LOGGER_NAME)
-		logger.debug.assert_called_once_with(f"erp_ai panel read ticket={self.ticket} messages=2")
+		# ADR-044 (CHG-008 design 4.1 step 4): the debug line also counts the proposal cards
+		logger.debug.assert_called_once_with(f"erp_ai panel read ticket={self.ticket} messages=2 proposals=0")
 		logger.info.assert_not_called()
 		logged = str(logger.mock_calls)
 		bot_name = frappe.utils.get_fullname(AGENT_USER)
@@ -859,3 +886,318 @@ class TestTicketPanelGateParity(FrappeTestCase):
 							{lvl for ob, lvl in via_panel["levels"] if ob is False},
 							{settings["permission_level"]},
 						)
+
+
+CARD_INSTRUCTOR = "panel.card.instructor@example.com"
+CARD_ALL_STATUSES = (
+	CHANGE_STATUS_PENDING,
+	CHANGE_STATUS_REJECTED,
+	CHANGE_STATUS_APPROVED,
+	"Đang áp dụng",
+	CHANGE_STATUS_APPLIED,
+	CHANGE_STATUS_FAILED,
+	CHANGE_STATUS_STALE,
+	CHANGE_STATUS_UNDOING,
+	CHANGE_STATUS_UNDONE,
+)
+CARD_ALL_RESTARTS = (
+	RESTART_STATUS_SENT,
+	RESTART_STATUS_CONFIRMED,
+	RESTART_STATUS_UNCONFIRMED,
+	RESTART_STATUS_LAUNCH_FAILED,
+)
+RESTART_SENT_AT = "2026-01-05 10:00:00"
+
+
+class TestPanelProposalCards(FrappeTestCase):
+	"""CHG-008 design 3.1, 4.1 (AC-1..AC-4, AC-9): `get_panel_data` returns one card per proposal of the ticket."""
+
+	def setUp(self):
+		# Cleanups run LIFO: settings restore, roles cache, rollback, set_user.
+		self.addCleanup(frappe.db.rollback)
+		self.addCleanup(frappe.set_user, "Administrator")
+		frappe.set_user("Administrator")
+		keep_agent_settings(self)
+		self.addCleanup(frappe.clear_cache, user=CARD_INSTRUCTOR)
+		if not frappe.db.exists("Role", ROLE_INSTRUCTOR):
+			frappe.get_doc({"doctype": "Role", "role_name": ROLE_INSTRUCTOR}).insert(ignore_permissions=True)
+		create_agent(AGENT_EMAIL)
+		create_agent(CARD_INSTRUCTOR)
+		frappe.get_doc("User", CARD_INSTRUCTOR).add_roles(ROLE_INSTRUCTOR)
+		frappe.clear_cache(user=CARD_INSTRUCTOR)
+		set_agent_settings(one_click_approval_enabled=1)
+		self.ticket = make_ticket(subject="Panel cards ticket").name
+
+	def _cards(self, user=AGENT_EMAIL, ticket=None):
+		frappe.set_user(user)
+		try:
+			return ticket_panel.get_panel_data(ticket or self.ticket)["proposals"]
+		finally:
+			frappe.set_user("Administrator")
+
+	def _set(self, name, **values):
+		frappe.db.set_value(PROPOSAL_DOCTYPE, name, values, update_modified=False)
+
+	def _comment_text(self, proposal):
+		"""The comment `propose_change._comment` posts for `proposal`, as (target, notes) in plain text."""
+		ctx = SimpleNamespace(ticket_name=proposal.ticket, one_click_approval=False)
+		comment = propose_change._comment(ctx, proposal)
+		content = frappe.db.get_value("Comment", comment, "content")
+		lines = [line.strip() for line in html_to_plain_text(content).splitlines() if line.strip()]
+		head, *rest = lines
+		prefix = "đang chờ duyệt: "
+		target = head.split(prefix, 1)[1].removesuffix(".")
+		return target, rest[:-1]
+
+	def _counts(self):
+		return {
+			doctype: frappe.db.count(doctype)
+			for doctype in ("Comment", MESSAGE_DOCTYPE, PROPOSAL_DOCTYPE, LOG_DOCTYPE)
+		}
+
+	def test_card_keys_and_constants(self):
+		self.assertEqual(
+			proposal_form.CARD_KEYS,
+			(
+				"name",
+				"target",
+				"notes",
+				"status",
+				"restart_status",
+				"decided_by",
+				"failure_reason",
+				"can_decide",
+				"can_open",
+			),
+		)
+		self.assertEqual(PANEL_MAX_PROPOSALS, 200)
+		self.assertEqual(
+			proposal_form.CARD_FIELDS,
+			(
+				"name",
+				"change_kind",
+				"is_new_file",
+				"file_path",
+				"app",
+				"command_list",
+				"change_status",
+				"restart_status",
+				"restart_sent_at",
+				"decided_by",
+				"failure_reason",
+				"target_branch",
+				"upstream_ref",
+				"ahead_count",
+				"is_core_app",
+				"apply_commit_sha",
+				"undo_commit_sha",
+			),
+		)
+		self.assertEqual(
+			proposal_form.CARD_OPERATION_FIELDS, ("parent", "idx", "operation", "file_path", "new_path")
+		)
+		self.assertNotIn(proposal_form.panel_cards, frappe.whitelisted)
+
+	def test_card_text_matches_proposal_comment(self):
+		code = make_change_proposal(ticket=self.ticket)
+		command = make_change_proposal(kind="Lệnh bench", ticket=self.ticket)
+		block = make_block_proposal(
+			[{"kind": "Sửa", "path": "erp_ai/a.py", "before": "x = 1\n", "after": "x = 2\n"}],
+			[["clear-cache"]],
+			ticket=self.ticket,
+		)
+		cards = {card["name"]: card for card in self._cards()}
+		self.assertEqual(len(cards), 3)
+		for proposal in (code, command, block):
+			with self.subTest(name=proposal.name):
+				fresh = frappe.get_doc(PROPOSAL_DOCTYPE, proposal.name)
+				target, notes = self._comment_text(fresh)
+				# html_to_plain_text pads `<code>` with spaces; the words are the same
+				self.assertEqual(" ".join(cards[proposal.name]["target"].split()), " ".join(target.split()))
+				self.assertEqual(cards[proposal.name]["notes"], notes)
+
+	def test_read_with_proposals_writes_nothing(self):
+		for status in CARD_ALL_STATUSES:
+			proposal = make_change_proposal(ticket=self.ticket)
+			self._set(proposal.name, change_status=status)
+		before = self._counts()
+		for user in (AGENT_EMAIL, CARD_INSTRUCTOR):
+			frappe.set_user(user)
+			writes = frappe.db.transaction_writes
+			ticket_panel.get_panel_data(self.ticket)
+			self.assertEqual(frappe.db.transaction_writes, writes)
+			frappe.set_user("Administrator")
+		self.assertEqual(self._counts(), before)
+
+	def test_cards_by_ticket_whatever_run(self):
+		other = make_ticket(subject="Panel cards other ticket").name
+		runs = ("run-from-panel", "run-from-mention", "run-from-creation")
+		names = {make_change_proposal(ticket=self.ticket, run_id=run).name for run in runs}
+		make_change_proposal(ticket=other)
+		orphan = make_change_proposal(ticket=self.ticket)
+		self._set(orphan.name, ticket=None)
+		self.assertEqual({card["name"] for card in self._cards()}, names)
+		self.assertEqual(len(self._cards(ticket=other)), 1)
+
+	def test_proposal_without_ticket_has_no_card_anywhere(self):
+		orphan = make_change_proposal(ticket=self.ticket)
+		self._set(orphan.name, ticket=None)
+		self.assertEqual(proposal_form.panel_cards(self.ticket), [])
+		self.assertEqual(proposal_form.panel_cards(""), [])
+		self.assertEqual(self._cards(), [])
+
+	def test_cards_newest_first_capped(self):
+		names = []
+		for index in range(PANEL_MAX_PROPOSALS + 1):
+			proposal = make_change_proposal(ticket=self.ticket)
+			creation = f"2026-01-01 00:{index // 60:02d}:{index % 60:02d}.000000"
+			frappe.db.set_value(PROPOSAL_DOCTYPE, proposal.name, "creation", creation, update_modified=False)
+			names.append(proposal.name)
+		cards = self._cards()
+		self.assertEqual(len(cards), PANEL_MAX_PROPOSALS)
+		self.assertEqual([card["name"] for card in cards], list(reversed(names))[:PANEL_MAX_PROPOSALS])
+
+	def test_cards_same_creation_ordered_by_name_desc(self):
+		names = [make_change_proposal(ticket=self.ticket).name for _ in range(3)]
+		for name in names:
+			frappe.db.set_value(
+				PROPOSAL_DOCTYPE, name, "creation", "2026-01-01 00:00:00", update_modified=False
+			)
+		self.assertEqual([card["name"] for card in self._cards()], sorted(names, reverse=True))
+
+	def test_every_status_has_card_only_pending_decidable(self):
+		by_status = {}
+		for status in CARD_ALL_STATUSES:
+			proposal = make_change_proposal(ticket=self.ticket)
+			self._set(proposal.name, change_status=status)
+			by_status[status] = proposal.name
+		restart_by_name = {}
+		for restart in CARD_ALL_RESTARTS:
+			proposal = make_change_proposal(ticket=self.ticket)
+			self._set(
+				proposal.name,
+				change_status=CHANGE_STATUS_APPLIED,
+				restart_status=restart,
+				restart_sent_at=RESTART_SENT_AT,
+			)
+			restart_by_name[proposal.name] = restart
+		cards = {card["name"]: card for card in self._cards(CARD_INSTRUCTOR)}
+		self.assertEqual(len(cards), len(by_status) + len(restart_by_name))
+		for status, name in by_status.items():
+			with self.subTest(status=status):
+				self.assertEqual(cards[name]["status"], status)
+				self.assertIsNone(cards[name]["restart_status"])
+				self.assertIs(cards[name]["can_decide"], status == CHANGE_STATUS_PENDING)
+		for name, restart in restart_by_name.items():
+			with self.subTest(restart=restart):
+				self.assertEqual(cards[name]["status"], CHANGE_STATUS_APPLIED)
+				self.assertEqual(cards[name]["restart_status"], restart)
+				self.assertIs(cards[name]["can_decide"], False)
+
+	def test_denied_read_returns_no_card(self):
+		make_change_proposal(ticket=self.ticket)
+		_make_user(NO_READ_EMAIL, user_type="System User")
+		for user in ("Guest", WEBSITE_EMAIL, NO_READ_EMAIL):
+			with self.subTest(user=user):
+				if user == WEBSITE_EMAIL:
+					_make_user(user)
+				with self.assertRaises(frappe.PermissionError):
+					self._cards(user)
+
+	def test_card_never_carries_content_fields(self):
+		seeds = {
+			"diff": "zq-seed-diff",
+			"content_before": "zq-seed-before",
+			"content_after": "zq-seed-after",
+			"command_args": '["zq-seed-args"]',
+			"commit_message": "zq-seed-commit",
+			"reason": "zq-seed-reason",
+		}
+		proposal = make_block_proposal(
+			[{"kind": "Sửa", "path": "erp_ai/a.py", "before": "zq-row-before", "after": "zq-row-after"}],
+			[],
+			ticket=self.ticket,
+			**seeds,
+		)
+		self._set(
+			proposal.name,
+			command_output="zq-seed-output",
+			command_results='[{"zq-seed-results": 1}]',
+			approved_digest="zq-seed-digest",
+			created_dirs='["zq-seed-dirs"]',
+			change_status=CHANGE_STATUS_FAILED,
+			failure_reason="that bai tai https://zq-seed-url.example/x xong",
+		)
+		frappe.db.set_value(
+			"ERP AI Change Operation",
+			{"parent": proposal.name},
+			{"base_hash": "zq-row-hash", "after_hash": "zq-row-hash2"},
+			update_modified=False,
+		)
+		frappe.set_user(CARD_INSTRUCTOR)
+		result = ticket_panel.get_panel_data(self.ticket)
+		self.assertEqual(set(result), {"ticket", "ai_fields", "messages", "proposals"})
+		self.assertEqual(len(result["proposals"]), 1)
+		self.assertEqual(set(result["proposals"][0]), set(proposal_form.CARD_KEYS))
+		text = json.dumps(result["proposals"], ensure_ascii=False)
+		for needle in ("zq-seed", "zq-row"):
+			with self.subTest(needle=needle):
+				self.assertNotIn(needle, text)
+
+	def test_decide_flag_matrix(self):
+		proposal = make_change_proposal(ticket=self.ticket)
+		cells = []
+		for user, role in ((CARD_INSTRUCTOR, True), (AGENT_EMAIL, False)):
+			for status in (CHANGE_STATUS_PENDING, CHANGE_STATUS_APPROVED):
+				for switch in (1, 0):
+					self._set(proposal.name, change_status=status)
+					set_agent_settings(one_click_approval_enabled=switch)
+					card = self._cards(user)[0]
+					cells.append((role, status == CHANGE_STATUS_PENDING, switch, card))
+		self.assertEqual(len(cells), 8)
+		self.assertEqual([cell[:3] for cell in cells if cell[3]["can_decide"]], [(True, True, 1)])
+		for role, pending, switch, card in cells:
+			with self.subTest(role=role, pending=pending, switch=switch):
+				self.assertIs(card["can_decide"], role and pending and bool(switch))
+				self.assertIs(card["can_open"], role)
+
+	def test_switch_flip_between_reads_changes_can_decide_without_cache(self):
+		make_change_proposal(ticket=self.ticket)
+		self.assertIs(self._cards(CARD_INSTRUCTOR)[0]["can_decide"], True)
+		set_agent_settings(one_click_approval_enabled=0)
+		card = self._cards(CARD_INSTRUCTOR)[0]
+		self.assertIs(card["can_decide"], False)
+		self.assertIs(card["can_open"], True)
+		set_agent_settings(one_click_approval_enabled=1)
+		self.assertIs(self._cards(CARD_INSTRUCTOR)[0]["can_decide"], True)
+
+	def test_failed_card_masks_reason(self):
+		proposal = make_change_proposal(ticket=self.ticket)
+		reason = (
+			"<script>alert(1)</script> loi tai https://secret.example/x?k=1 va ai@example.com " + "x" * 400
+		)
+		self._set(proposal.name, change_status=CHANGE_STATUS_FAILED, failure_reason=reason)
+		card = self._cards()[0]
+		self.assertNotIn("https://", card["failure_reason"])
+		self.assertNotIn("@", card["failure_reason"])
+		self.assertNotIn("secret.example", card["failure_reason"])
+		self.assertIn("[đã ẩn]", card["failure_reason"])
+		self.assertIn(
+			"<script>alert(1)</script>", card["failure_reason"]
+		)  # plain text; the panel shows it by textContent
+		self.assertLessEqual(len(card["failure_reason"]), 300)
+		self._set(proposal.name, failure_reason=None)
+		self.assertIsNone(self._cards()[0]["failure_reason"])
+
+	def test_decided_by_is_a_safe_person_name_not_an_email(self):
+		proposal = make_change_proposal(ticket=self.ticket)
+		self.assertIsNone(self._cards()[0]["decided_by"])
+		self._set(proposal.name, decided_by=CARD_INSTRUCTOR)
+		decided_by = self._cards()[0]["decided_by"]
+		self.assertEqual(decided_by, frappe.utils.get_fullname(CARD_INSTRUCTOR))
+		self.assertNotIn("@", decided_by)
+
+	def test_unreadable_notes_card_shows_the_warning_line(self):
+		proposal = make_change_proposal(ticket=self.ticket)
+		self._set(proposal.name, restart_status="Không có trạng thái này")
+		self.assertEqual(self._cards()[0]["notes"], [proposal_form.UNREADABLE_NOTES])

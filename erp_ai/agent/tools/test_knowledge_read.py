@@ -375,3 +375,139 @@ class TestReadErrorLogs(KnowledgeToolCase):
 
 		self.assertEqual(sorted(frappe.get_roles(AGENT_USER)), before)
 		self.assertNotIn("System Manager", before)
+
+
+# 25 rows the agent may read: HD Ticket Priority gives the Agent role `report` and links to no ticket.
+REPORT_QUERY = (
+	"select name as `Name`, concat('password=fake-rp-', name) as `Note` "
+	"from `tabDocType` order by name limit 25"
+)
+OPEN_DOCTYPE = "HD Ticket Priority"
+
+
+class TestRunReport(KnowledgeToolCase):
+	"""AC-49 at the tool: the allowlist, re-checked at run time, under the agent account, at most N rows."""
+
+	def _report(self, ref_doctype=OPEN_DOCTYPE, report_type="Query Report", **values) -> str:
+		return (
+			frappe.get_doc(
+				{
+					"doctype": "Report",
+					"report_name": f"T150 {frappe.generate_hash(length=10)}",
+					"ref_doctype": ref_doctype,
+					"report_type": report_type,
+					"is_standard": "No",
+					"query": REPORT_QUERY,
+					**values,
+				}
+			)
+			.insert()
+			.name
+		)
+
+	def _allow(self, *names) -> None:
+		# db.set_single_value skips the form check (check_allowed_reports): the tool checks again on its own.
+		self._settings(allowed_reports="\n".join(names))
+
+	def _run(self, report_name, **args):
+		return self._as_agent(knowledge_read.run_report, {"report_name": report_name, **args})
+
+	def test_specs_are_the_four_knowledge_tools(self):
+		self.assertEqual({spec.name for spec in knowledge_read.TOOLS}, knowledge_read.KNOWLEDGE_TOOL_NAMES)
+		self.assertEqual({spec.group for spec in knowledge_read.TOOLS}, {"read"})
+		self.assertEqual(knowledge_read.REPORT_FILTER_MAX_KEYS, 10)
+		self.assertEqual(knowledge_read.REPORT_TYPES, ("Script Report", "Query Report"))
+		spec = next(spec for spec in knowledge_read.TOOLS if spec.name == "run_report")
+		schema = spec.schema["input_schema"]
+		self.assertEqual(
+			(set(schema["properties"]), schema["required"]), ({"report_name", "filters"}, ["report_name"])
+		)
+		self.assertEqual(schema["properties"]["filters"]["maxProperties"], 10)
+		for bad in ({"report_name": ""}, {"report_name": "x" * 141}, {"report_name": "R", "filters": []}):
+			with self.subTest(bad):
+				self.assertIsNotNone(_first_invalid_key(bad, schema))
+
+	def test_empty_list_refused(self):
+		name = self._report()
+		for value in ("", " \n\n  "):
+			with self.subTest(allowed_reports=value):
+				self._settings(allowed_reports=value)
+				self.assertEqual(self._run(name), {"ok": False, "reason": "chưa cho phép báo cáo nào"})
+
+	def test_not_in_list_refused(self):
+		name, other = self._report(), self._report()
+		self._allow(other)
+
+		self.assertEqual(
+			self._run(name), {"ok": False, "reason": "báo cáo không nằm trong danh sách cho phép"}
+		)
+
+	def test_missing_disabled_or_other_type_not_runnable(self):
+		disabled = self._report(disabled=1)
+		builder = self._report(report_type="Report Builder")
+		missing = "T150 không có báo cáo này"
+		self._allow(disabled, builder, missing)
+		for name in (disabled, builder, missing):
+			with self.subTest(name):
+				self.assertEqual(self._run(name), {"ok": False, "reason": "báo cáo không chạy được"})
+
+	def test_row_limit_20(self):
+		name = self._report()
+		self._allow(name)
+
+		result = self._run(name, filters={"company": "T150", "only_open": True, "days": 3})
+
+		self.assertEqual(set(result), {"ok", "columns", "rows", "truncated"})
+		self.assertTrue(result["ok"], result)
+		self.assertEqual(result["columns"], ["Name", "Note"])
+		self.assertEqual(len(result["rows"]), 20)
+		self.assertTrue(result["truncated"])
+		self.assertEqual(len(result["rows"][0]), 2)
+		self._settings(report_row_limit=30)
+		result = self._run(name)
+		self.assertEqual((len(result["rows"]), result["truncated"]), (25, False))
+
+	def test_ticket_based_report_refused(self):
+		"""ADR-034 QĐ 3: a report on ticket content or on the app's data is refused even when listed."""
+		for ref_doctype in ("HD Ticket", "Task", "User"):
+			with self.subTest(ref_doctype=ref_doctype):
+				name = self._report(ref_doctype=ref_doctype)
+				self._allow(name)
+				with patch.object(knowledge_read.query_report, "run") as run:
+					result = self._run(name)
+				self.assertEqual(
+					result,
+					{
+						"ok": False,
+						"reason": "báo cáo dựa trên dữ liệu phiếu hoặc dữ liệu của app: bot không được chạy",
+					},
+				)
+				run.assert_not_called()
+
+	def test_agent_permission_error_refused(self):
+		name = self._report(roles=[{"role": "System Manager"}])
+		self._allow(name)
+
+		self.assertEqual(
+			self._run(name), {"ok": False, "reason": "tài khoản agent không có quyền chạy báo cáo này"}
+		)
+
+	def test_cells_redacted(self):
+		name = self._report()
+		self._allow(name)
+
+		result = self._run(name)
+
+		self.assertTrue(result["ok"], result)
+		self.assertNotIn("fake-rp-", str(result))
+		self.assertTrue(all(MASK in row[1] for row in result["rows"]), result["rows"][:2])
+
+	def test_bad_filters_invalid(self):
+		name = self._report()
+		self._allow(name)
+		too_many = {f"key_{index}": index for index in range(11)}
+		for filters in (too_many, {"nested": {"a": 1}}, {"items": [1, 2]}, {"none": None}):
+			with self.subTest(filters=filters):
+				self.assertEqual(
+					self._run(name, filters=filters), {"ok": False, "reason": "tham số không hợp lệ: filters"}
+				)

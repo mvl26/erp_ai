@@ -1985,3 +1985,26 @@ class TestConsoleScript(FrappeTestCase):
 		self.assertTrue(any(unicodedata.category(char) == "Mn" for char in script))
 		self.assertIsNone(change_guard.check_console_script(script))
 		self.assertIsNone(change_guard.check_console_script(unicodedata.normalize("NFC", script)))
+
+	def test_frappe_front_doors_are_refused(self):
+		# CHG-010 final review F-2: Frappe's own calls that resolve a dotted path, run a shell, queue a job outside
+		# the one transaction, or read and write files get around the import allowlist.
+		cases = (
+			("frappe.call('subprocess.check_output', ['id'])", "call"),
+			("frappe.enqueue('subprocess.run', args=['id'])", "enqueue"),
+			("frappe.enqueue_doc('ToDo', 'x', 'delete')", "enqueue_doc"),
+			("frappe.utils.execute_in_shell('id')", "execute_in_shell"),
+			("from frappe.utils import execute_in_shell\nexecute_in_shell('id')", "execute_in_shell"),
+			("from frappe import call", "call"),
+			("frappe.read_file('/etc/passwd')", "read_file"),
+			("from frappe.utils.file_manager import write_file", "write_file"),
+			("frappe.write_file('/tmp/x', 'y')", "write_file"),
+			("frappe.get_file_json('/etc/x.json')", "get_file_json"),
+		)
+		for script, name in cases:
+			with self.subTest(script=script):
+				self.assertEqual(change_guard.check_console_script(script), f"script không được dùng .{name}")
+
+	def test_a_local_function_named_call_is_allowed(self):
+		# CHG-010 final review F-2: the rule reads attributes and imported names, not a script's own bare names
+		self.assertIsNone(change_guard.check_console_script("def call(x):\n\treturn x\n\nprint(call(1))\n"))

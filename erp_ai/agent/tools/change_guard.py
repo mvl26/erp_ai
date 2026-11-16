@@ -123,6 +123,10 @@ CONSOLE_FORBIDDEN_ATTRS = (
 	"commit", "rollback", "set_user", "get_password", "get_decrypted_password", "conf",
 	"get_site_config", "environ", "system", "popen", "connect", "destroy",
 	"get_conf", "get_attr", "get_module", "import_module", "sql_ddl",
+	# CHG-010 final review F-2: Frappe calls that resolve a dotted path, run a shell, queue a job outside the
+	# one transaction, or read and write files
+	"call", "enqueue", "enqueue_doc", "execute_in_shell",
+	"read_file", "write_file", "get_file_json",
 )  # fmt: skip
 CONSOLE_FORBIDDEN_TEXT = ("erp ai", "__auth", "site_config", ".git")
 SHELL_METACHARACTERS = (";", "|", "&", "`", "$(", ">", "<", "\n")

@@ -588,7 +588,8 @@ def _classify(
 	the fields the person typed at creation, while the entry keeps the model's prediction and names the typed set
 	(AC-19, AC-21, A-U4b-2).
 
-	Returns `(proceed, classification, context)`: `proceed` is False when the run must end here (gateway error);
+	Returns `(proceed, classification, context)`: `proceed` is False when the run must end here (gateway error, or
+	a classification that puts the ticket in an excluded team);
 	`classification` is the summary handed to the reasoning step, or None when nothing was classified;
 	`context` is the one the reasoning step uses (recomputed when a classification was parsed).
 	"""
@@ -646,19 +647,30 @@ def _classify(
 		_log_classify(ticket_name, run_id, False, ticket.creation)
 		return True, None, context
 
+	# U2 (AC-9 b, U2.md:164-172): the team the department maps to is learnt from the predicate decide_route asks
+	probe_hits = []
+
+	def excluded_probe(team):
+		hit = policy.is_excluded_team(team)
+		if hit:
+			probe_hits.append(team)
+		return hit
+
 	decision = decide_route(
 		classification,
 		subject,
 		mapping,
 		routing,
 		team_exists=site_facts.team_exists,
-		is_excluded_team=policy.is_excluded_team,
+		is_excluded_team=excluded_probe,
 		is_active_agent=site_facts.is_active_agent,
 		due_at=field_values.get("due_date"),
 		due_field_configured="due_date" in field_map,
 		d_watcher=settings.get("d_ticket_watcher") or "",
 		now=now_datetime(),
 	)
+	# a department named like an excluded team counts too
+	excluded = bool(probe_hits) or policy.is_excluded_team(classification.department)
 	labels = created_labels(ticket.get(CREATED_LABELS_FIELD))
 	# a broken record reads as all three typed (fail-closed): no value of it is a typed one
 	typed = {field: value for field, value in labels.items() if value is not True}
@@ -688,7 +700,7 @@ def _classify(
 	log_name = write_entry(
 		**base,
 		**call_fields,
-		stop_reason=result.stop_reason,
+		stop_reason=policy.EXCLUDED_BY_CLASSIFICATION if excluded else result.stop_reason,
 		error="; ".join(
 			[
 				*([] if mapping else [BAD_MAPPING_ERROR]),
@@ -712,6 +724,10 @@ def _classify(
 		applied=0,
 	)
 	_log_classify(ticket_name, run_id, True, ticket.creation)
+	if excluded:
+		# before the below-threshold gate (excluded wins), at every level: no route, comment, notice or reasoning; from
+		# this row on send_refusal refuses the ticket until a person sets its team (C-5, U2-R2)
+		return False, classification, context
 	if context is not None:
 		context = dataclasses.replace(
 			context,

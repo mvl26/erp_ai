@@ -57,6 +57,7 @@ from erp_ai.agent.tools.write_ticket import (
 	collecting,
 	count_guidance,
 	created_labels,
+	failure_summary,
 	keep_human_fields,
 	locked_rows,
 	mark_asked,
@@ -504,17 +505,30 @@ def _last_success_at(ticket_name) -> datetime | None:
 	return max([*classified, *reasoned], default=None)
 
 
-def _failure_notice(ticket_name, exc, trigger, instructor) -> dict | None:
-	"""The run_failed notice of a gateway error, once per chain of failures since the last success (AC-23)."""
+def _failure_notice(ticket_name, exc, trigger, instructor, run_id) -> dict | None:
+	"""The run_failed notice of a gateway error, once per chain of failures since the last success (AC-23). It names
+	what the run did before failing (w1.md:70, A-W1-3); a notice refused as already sent leaves a count in the log."""
 	cause = CAUSE_TIME if exc.kind == DEADLINE_KIND else CAUSE_GATEWAY
-	return _notice(
+	suffix = _done_suffix(run_id)
+	entry = _notice(
 		ticket_name,
 		"run_failed",
-		RUN_FAILED_BODY.format(cause=cause),
+		RUN_FAILED_BODY.format(cause=cause) + suffix,
 		_last_success_at(ticket_name) or datetime.min,
 		trigger=trigger,
 		instructor=instructor,
 	)
+	if entry is None and suffix:
+		dropped = sum(len(lines) for lines in collected(run_id)[1].values())
+		frappe.logger(LOGGER_NAME).info("erp_ai guidance run_id=%s dropped=%d", run_id, dropped)
+	return entry
+
+
+def _done_suffix(run_id) -> str:
+	"""What the run's collector holds, for its failure notice (design-w1-fixes-20 Điểm 3.1): done, pending and manual
+	lines apart, as `failure_summary` writes and escapes them; a line break before it, or "" when there is none."""
+	summary = failure_summary(run_id)
+	return f"\n{summary}" if summary else ""
 
 
 def _call_fields(result):
@@ -591,7 +605,7 @@ def _classify(
 		# above L0 the person is told, its entry on this failed row; at L0 the bot says nothing (AC-23)
 		failed = None
 		if context is not None:
-			failed = _failure_notice(ticket_name, exc, trigger, context.instructor)
+			failed = _failure_notice(ticket_name, exc, trigger, context.instructor, run_id)
 		write_entry(
 			**base,
 			error="; ".join([f"{exc.kind} status={exc.status}", *status.take_errors()]),
@@ -1208,7 +1222,7 @@ def _reason(
 				deadline=deadline,
 			)
 		except gateway.GatewayError as exc:
-			failed = _failure_notice(ticket_name, exc, trigger, context.instructor)
+			failed = _failure_notice(ticket_name, exc, trigger, context.instructor, run_id)
 			write_entry(
 				**base,
 				turn=turn,

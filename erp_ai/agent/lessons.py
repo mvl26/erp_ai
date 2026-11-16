@@ -241,6 +241,20 @@ def record_correction(ticket: str, log_name: str) -> str | None:
 	)
 
 
+def record_assignee_change(ticket: str, bot_user: str, new_user: str) -> str | None:
+	"""A person assigned `ticket` to `new_user` after the bot had chosen `bot_user`: one lesson per ticket (AC-6)."""
+	user = _actor()
+	return _store(
+		LESSON_SOURCE_CORRECTION,
+		f"assignee:{ticket}",
+		ticket=ticket,
+		updatable=True,
+		authorized=authority.is_instruction(user, ticket),
+		situation=_ticket_situation(ticket, with_description=True),
+		text=f"Bot gán người nhận {bot_user}, người đổi sang {new_user}.",
+	)
+
+
 OUTCOME_VERBS = {"reject": "từ chối", "undo": "hoàn tác"}
 
 

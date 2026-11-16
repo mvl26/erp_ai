@@ -1722,3 +1722,114 @@ class TestLessonSources(HandlerTestCase):
 		rows = self._lessons()
 		self.assertEqual(len(rows), 1)
 		self.assertEqual(rows[0].lesson_status, "Đang dùng")
+
+
+BOT_PICK = "bot-pick@example.com"
+HUMAN_PICK = "human-pick@example.com"
+
+
+class TestAssigneeChangeSource(HandlerTestCase):
+	"""AC-6: a person changing the assignee the bot chose makes a lesson."""
+
+	def setUp(self):
+		frappe.db.rollback()
+		keep_agent_settings(self)
+		super().setUp()
+		set_agent_settings(lessons_enabled=1, lesson_teach_marker="ghi nhớ:")
+		_make_user(INSTRUCTOR, "ERP AI Instructor", "Agent")
+		_make_user(PLAIN_USER, "Agent")
+		_make_user(BOT_PICK, "Agent")
+		_make_user(HUMAN_PICK, "Agent")
+
+	def _lessons(self, **filters):
+		return frappe.get_all(
+			"ERP AI Lesson",
+			filters=filters,
+			fields=["name", "lesson_status", "lesson_source", "lesson_text", "ticket", "author"],
+		)
+
+	def _bot_assigns(self, ticket, user=BOT_PICK):
+		todo = frappe.get_doc(
+			{
+				"doctype": "ToDo",
+				"allocated_to": user,
+				"reference_type": "HD Ticket",
+				"reference_name": ticket,
+				"assigned_by": AGENT_USER,
+				"status": "Open",
+			}
+		)
+		todo.set_new_name()
+		todo.db_insert()
+
+	def _person_assigns(self, ticket, session_user, user=HUMAN_PICK):
+		from frappe.desk.form.assign_to import add
+
+		frappe.set_user(session_user)
+		try:
+			add({"doctype": "HD Ticket", "name": ticket, "assign_to": [user]})
+		finally:
+			frappe.set_user("Administrator")
+
+	def test_reassign_after_bot_makes_lesson(self):
+		ticket = self._ticket_without_job()
+		self._bot_assigns(ticket.name)
+		self._person_assigns(ticket.name, INSTRUCTOR)
+		rows = self._lessons(ticket=ticket.name)
+		self.assertEqual(len(rows), 1)
+		self.assertEqual(rows[0].lesson_source, "Người sửa")
+		self.assertEqual(rows[0].lesson_status, "Đang dùng")
+		self.assertIn(BOT_PICK, rows[0].lesson_text)
+		self.assertIn(HUMAN_PICK, rows[0].lesson_text)
+
+	def test_reassign_without_bot_assignment_makes_none(self):
+		ticket = self._ticket_without_job()
+		self._person_assigns(ticket.name, INSTRUCTOR)
+		self.assertEqual(self._lessons(), [])
+
+	def test_bot_own_assignment_makes_none(self):
+		ticket = self._ticket_without_job()
+		self._bot_assigns(ticket.name)
+		self._person_assigns(ticket.name, AGENT_USER)
+		self.assertEqual(self._lessons(), [])
+
+	def test_reassign_by_plain_user_is_pending(self):
+		ticket = self._ticket_without_job()
+		self._bot_assigns(ticket.name)
+		self._person_assigns(ticket.name, PLAIN_USER)
+		rows = self._lessons(ticket=ticket.name)
+		self.assertEqual([row.lesson_status for row in rows], ["Chờ duyệt"])
+		self.assertEqual(rows[0].author, PLAIN_USER)
+
+	def test_second_reassign_updates_same_lesson(self):
+		ticket = self._ticket_without_job()
+		self._bot_assigns(ticket.name)
+		self._person_assigns(ticket.name, INSTRUCTOR)
+		self._person_assigns(ticket.name, INSTRUCTOR, user=PLAIN_USER)
+		rows = self._lessons(ticket=ticket.name)
+		self.assertEqual(len(rows), 1)
+		self.assertIn(PLAIN_USER, rows[0].lesson_text)
+
+	def test_non_ticket_todo_returns_before_db_read(self):
+		note = frappe.get_doc({"doctype": "Note", "title": "ghi chú thử", "public": 1}).insert(
+			ignore_permissions=True
+		)
+		real_get_value = frappe.db.get_value
+
+		def guarded(doctype, *args, **kwargs):
+			# Frappe itself reads DocType metadata while inserting; the handler must not read ToDo rows.
+			if doctype == "ToDo":
+				raise AssertionError("handler read ToDo before step 0")
+			return real_get_value(doctype, *args, **kwargs)
+
+		with patch("frappe.db.get_value", side_effect=guarded):
+			frappe.get_doc(
+				{
+					"doctype": "ToDo",
+					"allocated_to": HUMAN_PICK,
+					"reference_type": "Note",
+					"reference_name": note.name,
+					"description": "x",
+				}
+			).insert(ignore_permissions=True)
+		self.assertEqual(self._lessons(), [])

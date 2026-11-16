@@ -320,3 +320,27 @@ def task_on_update(doc, method=None):
 		return
 	enqueue_lifecycle_job(ticket)
 	_log_decision(ticket, TRIGGER_TASK_STATUS, "enqueued", "conditions_met")
+
+
+def todo_after_insert(doc, method=None):
+	"""AC-6: a person assigns a ticket the bot had already assigned to someone else, so that is a lesson."""
+	# Fires for every ToDo on the site; return before any DB read.
+	ticket, new_user = doc.reference_name, doc.allocated_to
+	if doc.reference_type != policy.TICKET_DOCTYPE or not ticket or not new_user:
+		return
+	if frappe.session.user == AGENT_USER:
+		return
+	bot_user = frappe.db.get_value(
+		"ToDo",
+		{
+			"reference_type": policy.TICKET_DOCTYPE,
+			"reference_name": ticket,
+			"assigned_by": AGENT_USER,
+			"name": ("!=", doc.name),
+		},
+		"allocated_to",
+		order_by="creation desc",
+	)
+	if not bot_user or bot_user == new_user:
+		return
+	lessons.safely(lessons.record_assignee_change, ticket, bot_user, new_user)

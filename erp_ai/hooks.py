@@ -164,6 +164,10 @@ doc_events = {
 	"Task": {
 		"on_update": "erp_ai.handlers.task_on_update",
 	},
+	# FEAT-008 AC-6: a person reassigning what the bot assigned becomes a lesson
+	"ToDo": {
+		"after_insert": "erp_ai.handlers.todo_after_insert",
+	},
 }
 
 # Deleting a ticket must not be blocked by its audit-log rows (the log is kept), its bot messages or lessons

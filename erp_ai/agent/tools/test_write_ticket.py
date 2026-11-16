@@ -2076,11 +2076,14 @@ class TestCollector(FrappeTestCase):
 
 
 T169_PREFIX = "ERPAI-TEST-T169"
+BA_NOTE_SOURCE_PATH = "erpnext/projects/doctype/task/task.json"
+BA_NOTE_FEATURE_LINES = (
+	f"**Tính năng sẵn có:** Có, ERPNext có trường ước lượng giờ trên việc\n**Nguồn:** {BA_NOTE_SOURCE_PATH}"
+)
 BA_NOTE = (
 	f"**Mục tiêu:** {T169_PREFIX} theo dõi giờ làm của từng việc\n"
 	"**Phạm vi:** việc của phiếu đầu mục C, không đụng bảng chấm công\n"
-	"**Tính năng sẵn có:** Có, ERPNext có trường ước lượng giờ trên việc\n"
-	"**Nguồn:** erpnext/projects/doctype/task/task.json\n"
+	f"{BA_NOTE_FEATURE_LINES}\n"
 	"**Rủi ro:** người dùng nhầm giờ ước lượng với giờ thực\n"
 	"**Câu hỏi mở:** có cần báo cáo tổng giờ theo tuần không?\n"
 	"Độ tin cậy: 80%"
@@ -2155,6 +2158,14 @@ class TestBaNote(TicketCommentCase):
 			self.assertNotEqual(inline, BA_NOTE)
 			self.assertTrue(self._note(inline, self._ctx(ticket))["ok"])
 			self.assertEqual(self._comments(ticket), [f"{ops_data.BA_NOTE_MARKER}\n{inline}"])
+		with self.subTest("the feature part last, its source then the confidence line"):
+			ticket = self._c_ticket()
+			last = BA_NOTE.replace(f"{BA_NOTE_FEATURE_LINES}\n", "").replace(
+				"\nĐộ tin cậy: 80%", f"\n{BA_NOTE_FEATURE_LINES}\nĐộ tin cậy: 80%"
+			)
+			self.assertNotEqual(last, BA_NOTE)
+			self.assertTrue(self._note(last, self._ctx(ticket))["ok"])
+			self.assertEqual(self._comments(ticket), [f"{ops_data.BA_NOTE_MARKER}\n{last}"])
 		with patch.object(registry, "_all_specs", lambda: write_ticket.TOOLS):
 			ticket = self._c_ticket()
 			result = execute_tool("post_comment", {"kind": "ba_note", "content": BA_NOTE}, self._ctx(ticket))
@@ -2182,6 +2193,18 @@ class TestBaNote(TicketCommentCase):
 					"có cần báo cáo tổng giờ theo tuần không?\n", "\n**Ghi chú:** x\n"
 				),
 				missing.format(sections="Mục tiêu, Câu hỏi mở"),
+			),
+			# A part ends at the confidence line too: that line is not the content of the part before it.
+			"empty Câu hỏi mở, the confidence line next": (
+				BA_NOTE.replace(" có cần báo cáo tổng giờ theo tuần không?", ""),
+				missing.format(sections="Câu hỏi mở"),
+			),
+			"feature part last, empty source, the confidence line next": (
+				BA_NOTE.replace(f"{BA_NOTE_FEATURE_LINES}\n", "").replace(
+					"\nĐộ tin cậy: 80%",
+					"\n" + BA_NOTE_FEATURE_LINES.replace(BA_NOTE_SOURCE_PATH, "") + "\nĐộ tin cậy: 80%",
+				),
+				write_ticket.REASON_BA_NOTE_FEATURE,
 			),
 			"feature neither Có nor Không": (
 				BA_NOTE.replace("**Tính năng sẵn có:** Có,", "**Tính năng sẵn có:** Chưa rõ,"),

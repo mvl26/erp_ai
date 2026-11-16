@@ -82,8 +82,8 @@
    "fieldname": "entry_type",
    "fieldtype": "Select",
    "label": "Loại bản ghi",
-   "description": "Loại bản ghi: classify là phân loại phiếu, reason là một lượt lập luận, skip là phiếu bị bỏ qua nên không chạy, change là một bước của đề xuất thay đổi, bot_action: việc của bot không qua model, hoặc người đổi công tắc quyền; chi phí 0. Hệ thống tự ghi khi agent chạy hoặc ở mỗi bước của đề xuất (thường do người duyệt thực hiện), không sửa được.",
-   "options": "classify\nreason\nskip\nchange\nbot_action",
+   "description": "Loại bản ghi: classify là phân loại phiếu, reason là một lượt lập luận, skip là phiếu bị bỏ qua nên không chạy, change là một bước của đề xuất thay đổi, bot_action: việc của bot không qua model, hoặc người đổi công tắc quyền; run_event: lời gọi bot được nhận, gộp, từ chối, hoặc lần chạy xong/lỗi (cho ngăn trao đổi); hai loại sau chi phí 0. Hệ thống tự ghi, không sửa được.",
+   "options": "classify\nreason\nskip\nchange\nbot_action\nrun_event",
    "read_only": 1
   },
   {
@@ -213,7 +213,7 @@
    "fieldname": "stop_reason",
    "fieldtype": "Data",
    "label": "Lý do dừng",
-   "description": "Lý do dừng của dòng này, ví dụ: tool_use (model muốn gọi tool), end_turn (model trả lời xong), max_turns, time_budget, gateway_error, unparseable (không đọc được kết quả phân loại); dòng bỏ qua ghi not_sendable, daily_limit hoặc level_L0. Hệ thống tự ghi khi agent chạy, không sửa được.",
+   "description": "Lý do dừng, ví dụ: tool_use, end_turn, max_turns, time_budget, gateway_error, unparseable (không đọc được kết quả phân loại); dòng skip: agent_disabled, not_sendable:<loại>, daily_limit, level_L0; dòng run_event: call_received, call_merged, call_busy, run_done, run_failed hoặc lý do từ chối created_by_agent, prefilled, agent_disabled, not_sendable:<loại>. Hệ thống tự ghi, không sửa được.",
    "read_only": 1
   },
   {

@@ -806,6 +806,10 @@ class _EventCase(_RollbackCase):
 		super().setUp()
 		keep_agent_settings(self)
 		set_agent_settings(enabled=0)
+		# Error Log rows outlive the test transaction and ticket names are reused: count only the new ones.
+		self.old_error_logs = set(
+			frappe.get_all("Error Log", filters={"method": EVENT_FAILED_TITLE}, pluck="name")
+		)
 
 	@staticmethod
 	def _ticket(subject="ERPAI-TEST-run-event ticket") -> str:
@@ -816,9 +820,10 @@ class _EventCase(_RollbackCase):
 		filters = {"entry_type": RUN_EVENT, **({"ticket": ticket} if ticket else {})}
 		return frappe.get_all(LOG_DOCTYPE, filters=filters, pluck="name")
 
-	@staticmethod
-	def _error_messages() -> list:
-		return frappe.get_all("Error Log", filters={"method": EVENT_FAILED_TITLE}, pluck="error")
+	def _error_messages(self) -> list:
+		"""The messages of the event-write Error Log rows written since setUp."""
+		rows = frappe.get_all("Error Log", filters={"method": EVENT_FAILED_TITLE}, fields=["name", "error"])
+		return [row.error for row in rows if row.name not in self.old_error_logs]
 
 
 class TestRecordEvent(_EventCase):
@@ -843,6 +848,8 @@ class TestRecordEvent(_EventCase):
 					name = run_log.record_event(ticket=ticket, trigger=trigger, code=code, run_id=run_id)
 					self.assertIsNotNone(name)
 					row = frappe.db.get_value(LOG_DOCTYPE, name, EVENT_ROW_FIELDS, as_dict=True)
+					# design 2: the other columns stay empty; Frappe would fill this Select with "propose"
+					self.assertFalse(frappe.db.get_value(LOG_DOCTYPE, name, "change_step"))
 					self.assertEqual(
 						{**row},
 						{

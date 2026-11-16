@@ -823,6 +823,7 @@ class TestRun(FrappeTestCase):
 		self.assertIn("12/08/2002 05:00", html)
 
 	def test_no_recipients_logs_only(self):
+		before = self._sent_on()
 		for value in ("", "  \n \t\n\n"):
 			set_agent_settings(coo_report_recipients=value)
 			with patch("frappe.logger") as logger:
@@ -833,9 +834,10 @@ class TestRun(FrappeTestCase):
 				"daily_report: chưa có người nhận",
 				[call_.args[0] for call_ in logger.return_value.info.call_args_list],
 			)
-			self.assertNotEqual(self._sent_on(), ANCHOR_RUN.date())
+			self.assertEqual(self._sent_on(), before)
 
 	def test_send_error_logged_not_raised_watermark_kept(self):
+		before = self._sent_on()
 		for error in (frappe.OutgoingEmailError("smtp down"), frappe.ValidationError("bad address")):
 			self.sendmail.side_effect = error
 			with (
@@ -848,7 +850,45 @@ class TestRun(FrappeTestCase):
 			log_error.assert_called_once()
 			self.assertEqual(log_error.call_args.args[0], daily_report.TITLE_DAILY_REPORT_FAILED)
 			self.assertEqual(daily_report.TITLE_DAILY_REPORT_FAILED, "erp_ai: báo cáo hằng ngày lỗi")
-			self.assertNotEqual(self._sent_on(), ANCHOR_RUN.date())
+			self.assertEqual(self._sent_on(), before)
+
+	def test_build_error_logged_not_raised_watermark_kept(self):
+		before = self._sent_on()
+		with (
+			patch("erp_ai.agent.daily_report.build_daily_report", side_effect=RuntimeError("boom secret")),
+			patch("frappe.log_error") as log_error,
+			patch("frappe.db.rollback") as rollback,
+		):
+			daily_report.run_daily_report(now=ANCHOR_RUN)
+
+		rollback.assert_called_once_with()
+		log_error.assert_called_once_with(daily_report.TITLE_DAILY_REPORT_FAILED, "build error=RuntimeError")
+		self.sendmail.assert_not_called()
+		self.assertEqual(self._sent_on(), before)
+
+	def test_render_error_logged_not_raised_watermark_kept(self):
+		before = self._sent_on()
+		with (
+			patch("erp_ai.agent.daily_report.render_daily_report", side_effect=ValueError("bad")),
+			patch("frappe.log_error") as log_error,
+		):
+			daily_report.run_daily_report(now=ANCHOR_RUN)
+
+		log_error.assert_called_once()
+		self.sendmail.assert_not_called()
+		self.assertEqual(self._sent_on(), before)
+
+	def test_watermark_committed_before_lock_released(self):
+		events = []
+		with (
+			patch("erp_ai.agent.daily_report.filelock") as lock,
+			patch.object(frappe.flags, "in_test", False),
+			patch("frappe.db.commit", side_effect=lambda: events.append("commit")),
+		):
+			lock.return_value.__exit__.side_effect = lambda *args: events.append("release")
+			daily_report.run_daily_report(now=ANCHOR_RUN)
+
+		self.assertEqual(events, ["commit", "release"])
 
 	def test_weekend_skipped_when_off(self):
 		saturday = datetime(2002, 8, 10, 8, 0)

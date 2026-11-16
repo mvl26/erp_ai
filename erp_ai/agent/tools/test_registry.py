@@ -222,6 +222,17 @@ class TestRegistry(FrappeTestCase):
 			accepted = execute_tool("do_read", {"values": {"a": 1}}, _context())
 		self.assertTrue(accepted["ok"])
 
+	def test_execute_checks_number_rule(self):
+		# FEAT-007 T167 (ruling R22d): a `number` property takes an int or a float, never text or a bool.
+		specs = [_spec("do_read", "read", {"hours": {"type": "number"}})]
+		with patch.object(registry, "_all_specs", lambda: specs):
+			for given in ("2", True, False, None, [1]):
+				result = execute_tool("do_read", {"hours": given}, _context())
+				self.assertEqual(result, {"ok": False, "reason": "tham số không hợp lệ: hours"}, given)
+			for given in (1.5, 2):
+				result = execute_tool("do_read", {"hours": given}, _context())
+				self.assertEqual(result["echo"], {"hours": given}, given)
+
 	def test_invalid_reason_cuts_model_supplied_key(self):
 		result = execute_tool("do_read", {"query": "abc", "x" * 5000: 1}, _context())
 		self.assertFalse(result["ok"])
@@ -417,7 +428,8 @@ SITE_ADMIN_TOOL_NAMES = ["api_list_records", "api_get_record", "api_create_recor
 # FEAT-007 T155 (AC-46..AC-50): the knowledge read tools, in registry order; group `read`, so in every grant above L0.
 KNOWLEDGE_NAMES = ["search_knowledge_base", "search_manuals", "read_error_logs", "run_report"]
 FORBIDDEN_WRITE_PARAMETER_WORDS = ("doctype", "field")
-SCHEMA_TYPES = {"string", "integer", "boolean", "array", "object"}
+# FEAT-007 T167 (R22d): create_task's expected_hours is a `number`.
+SCHEMA_TYPES = {"string", "integer", "number", "boolean", "array", "object"}
 # Written out by hand, not read from registry.TOOL_MODULES: module -> its tool names, in order.
 TOOLS_BY_MODULE = {
 	"erp_ai.agent.tools.read": ["get_ticket", "list_comments", "search_resolved_tickets", "get_record"],
@@ -618,7 +630,12 @@ class TestRealToolsRunWithoutCommit(FrappeTestCase):
 				"kind": "de_xuat",
 				"content": "ERPAI-TEST-T27 bình luận\nĐộ tin cậy: 90%\n**Căn cứ:** ERPAI-TEST-T27 phiếu",
 			},
-			"create_task": {"subject": "ERPAI-TEST-T27 việc", "description": "ERPAI-TEST-T27 mô tả"},
+			# AC-63 (T167): a Task needs its hour estimate.
+			"create_task": {
+				"subject": "ERPAI-TEST-T27 việc",
+				"description": "ERPAI-TEST-T27 mô tả",
+				"expected_hours": 1.5,
+			},
 			"propose_file_change": {
 				"path": f"{SANDBOX_APP}/README.md",
 				"find": ["# "],

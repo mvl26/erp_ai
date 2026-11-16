@@ -241,6 +241,8 @@ T26_OUTSIDER = "erpai-test-t26.outsider@example.com"
 T26_AGENT_ONLY = "erpai-test-t26.agent-only@example.com"
 T26_INSTRUCTOR = "erpai-test-t26.instructor@example.com"
 HINT_FIELD = "ai_resolution_hint"
+# AC-63 (T167): every create_task call carries a positive hour estimate.
+TASK_ARGS = {"subject": "s", "description": "d", "expected_hours": 1}
 
 
 def _comment_count():
@@ -402,7 +404,7 @@ class TestWriteTicketTools(FrappeTestCase):
 
 	def test_create_task_creates_task_with_ticket_link_in_first_line(self):
 		before = frappe.db.count("Task")
-		args = {"subject": "ERPAI-TEST-T26 việc", "description": "Kiểm tra máy in"}
+		args = {"subject": "ERPAI-TEST-T26 việc", "description": "Kiểm tra máy in", "expected_hours": 2}
 		result = self._call(write_ticket.create_task, T26_AGENT, args)
 		self.assertTrue(result["ok"], result)
 		self.assertEqual(frappe.db.count("Task"), before + 1)
@@ -415,7 +417,11 @@ class TestWriteTicketTools(FrappeTestCase):
 		self.assertIn("Kiểm tra máy in", task.description)
 
 	def test_create_task_description_is_html_with_clickable_link_and_separated_text(self):
-		args = {"subject": "ERPAI-TEST-T26 việc", "description": "Dòng 1\nDòng 2 <b>x</b>"}
+		args = {
+			"subject": "ERPAI-TEST-T26 việc",
+			"description": "Dòng 1\nDòng 2 <b>x</b>",
+			"expected_hours": 2,
+		}
 		result = self._call(write_ticket.create_task, T26_AGENT, args)
 		self.assertTrue(result["ok"], result)
 		description = frappe.db.get_value("Task", result["task"], "description")
@@ -427,14 +433,14 @@ class TestWriteTicketTools(FrappeTestCase):
 
 	def test_create_task_without_task_role_perm_for_agent_only_user_is_refused(self):
 		before = frappe.db.count("Task")
-		result = self._call(write_ticket.create_task, T26_AGENT_ONLY, {"subject": "s", "description": "d"})
+		result = self._call(write_ticket.create_task, T26_AGENT_ONLY, TASK_ARGS)
 		self._assert_refused(result)
 		self.assertIn("Task", result["reason"])
 		self.assertEqual(frappe.db.count("Task"), before)
 
 	def test_create_task_requires_instructor(self):
 		before = frappe.db.count("Task")
-		args = {"subject": "ERPAI-TEST-T26 việc", "description": "x"}
+		args = {"subject": "ERPAI-TEST-T26 việc", "description": "x", "expected_hours": 2}
 		result = self._call(write_ticket.create_task, T26_AGENT, args, self._ctx(instructor=None))
 		self._assert_refused(result)
 		self.assertEqual(frappe.db.count("Task"), before)
@@ -449,7 +455,7 @@ class TestWriteTicketTools(FrappeTestCase):
 
 		before = frappe.db.count("Task")
 		with patch.object(frappe.db, "exists", no_task_doctype):
-			result = self._call(write_ticket.create_task, T26_AGENT, {"subject": "s", "description": "d"})
+			result = self._call(write_ticket.create_task, T26_AGENT, TASK_ARGS)
 		self._assert_refused(result)
 		self.assertEqual(frappe.db.count("Task"), before)
 
@@ -463,14 +469,14 @@ class TestWriteTicketTools(FrappeTestCase):
 
 		before = frappe.db.count("Task")
 		with patch.object(frappe, "has_permission", deny_task_create):
-			result = self._call(write_ticket.create_task, T26_AGENT, {"subject": "s", "description": "d"})
+			result = self._call(write_ticket.create_task, T26_AGENT, TASK_ARGS)
 		self._assert_refused(result)
 		self.assertEqual(frappe.db.count("Task"), before)
 
 	def test_create_task_without_ticket_access_returns_ok_false(self):
 		_make_user(T26_OUTSIDER, "Projects User")
 		before = frappe.db.count("Task")
-		result = self._call(write_ticket.create_task, T26_OUTSIDER, {"subject": "s", "description": "d"})
+		result = self._call(write_ticket.create_task, T26_OUTSIDER, TASK_ARGS)
 		self._assert_refused(result)
 		self.assertEqual(frappe.db.count("Task"), before)
 
@@ -480,7 +486,7 @@ class TestWriteTicketTools(FrappeTestCase):
 		with patch.object(frappe.db, "commit") as commit:
 			self._call(write_ticket.set_resolution_hint, T26_AGENT, {"text": "x"})
 			self._call(write_ticket.post_comment, T26_AGENT, {"content": "x"})
-			self._call(write_ticket.create_task, T26_AGENT, {"subject": "s", "description": "d"})
+			self._call(write_ticket.create_task, T26_AGENT, TASK_ARGS)
 		commit.assert_not_called()
 
 	def test_new_tool_schemas_take_no_doctype_or_field_names(self):
@@ -489,7 +495,12 @@ class TestWriteTicketTools(FrappeTestCase):
 		expected = {
 			"set_resolution_hint": ("ticket_write", {"text"}, write_ticket.set_resolution_hint),
 			"post_comment": ("ticket_write", {"content", "kind"}, write_ticket.post_comment_tool),
-			"create_task": ("task_write", {"subject", "description"}, write_ticket.create_task),
+			# spec changed (AC-63, T167): a Task needs a positive hour estimate, a JSON number.
+			"create_task": (
+				"task_write",
+				{"subject", "description", "expected_hours"},
+				write_ticket.create_task,
+			),
 		}
 		for name, (group, properties, handler) in expected.items():
 			with self.subTest(tool=name):
@@ -500,6 +511,9 @@ class TestWriteTicketTools(FrappeTestCase):
 				self.assertEqual(set(input_schema["properties"]), properties)
 				self.assertEqual(set(input_schema["required"]), properties)
 				for key, rule in input_schema["properties"].items():
+					if key == "expected_hours":
+						self.assertEqual(rule, {"type": "number", "exclusiveMinimum": 0})
+						continue
 					self.assertEqual(rule["type"], "string")
 					if key == "kind":
 						self.assertEqual(rule["enum"], list(write_ticket.COMMENT_KINDS))
@@ -517,11 +531,11 @@ class TestWriteTicketTools(FrappeTestCase):
 			for name, args in (
 				("set_resolution_hint", {"text": "x", "fieldname": "status"}),
 				("post_comment", {"content": "x", "kind": "hoi", "doctype": "User"}),
-				("create_task", {"subject": "s", "description": "d", "doctype": "User"}),
+				("create_task", {**TASK_ARGS, "doctype": "User"}),
 			):
 				with self.subTest(tool=name):
 					self.assertFalse(execute_tool(name, args, self._ctx())["ok"])
-			no_instructor = execute_tool("create_task", {"subject": "s", "description": "d"}, self._ctx(None))
+			no_instructor = execute_tool("create_task", TASK_ARGS, self._ctx(None))
 			self.assertFalse(no_instructor["ok"])
 		self.assertEqual(frappe.db.count("Task"), before)
 
@@ -549,9 +563,164 @@ class TestCreateTask(FrappeTestCase):
 			agent_user=AGENT_USER,
 		)
 		frappe.set_user(T26_AGENT)
-		result = write_ticket.create_task({"subject": "ERPAI-TEST-T16 việc", "description": "mô tả"}, ctx)
+		args = {"subject": "ERPAI-TEST-T16 việc", "description": "mô tả", "expected_hours": 1}
+		result = write_ticket.create_task(args, ctx)
 		self.assertTrue(result["ok"], result)
 		self.assertEqual(frappe.db.get_value("Task", result["task"], "ai_ticket"), self.ticket)
+
+
+T167_PREFIX = "ERPAI-TEST-T167"
+NOT_VALID_HOURS = {"ok": False, "reason": "tham số không hợp lệ: expected_hours"}
+
+
+class TestCreateTaskEstimate(FrappeTestCase):
+	"""AC-63 (U4b.md:174, :183): create_task needs a positive hour estimate and stops at the run's Task cap."""
+
+	def setUp(self):
+		commit_guard = patch.object(frappe.db, "commit", side_effect=AssertionError("commit in test"))
+		commit_guard.start()
+		self.addCleanup(commit_guard.stop)
+		self.addCleanup(frappe.db.rollback)
+		self.addCleanup(frappe.set_user, "Administrator")
+		frappe.set_user("Administrator")
+		keep_agent_settings(self)
+		create_agent(T26_AGENT)
+		_make_user(T26_AGENT, ROLE_AGENT)
+		_make_user(T26_CUSTOMER, "HD Customer")
+		self.ticket = make_ticket(subject=f"{T167_PREFIX} phiếu", raised_by=T26_CUSTOMER).name
+
+	def _ctx(self):
+		run_id = f"{T167_PREFIX}-{frappe.generate_hash(length=10)}"
+		self.addCleanup(lambda: frappe.flags.get("erp_ai_run_tasks", {}).pop(run_id, None))
+		return ToolContext(
+			ticket_name=self.ticket,
+			effective_level="L1",
+			instructor=T26_INSTRUCTOR,
+			run_id=run_id,
+			category_mapping={},
+			agent_user=AGENT_USER,
+		)
+
+	def _args(self, subject, **extra):
+		return {"subject": subject, "description": f"{T167_PREFIX} mô tả", **extra}
+
+	def _create(self, ctx, subject, **extra):
+		frappe.set_user(T26_AGENT)
+		try:
+			return write_ticket.create_task(self._args(subject, **extra), ctx)
+		finally:
+			frappe.set_user("Administrator")
+
+	def _execute(self, ctx, arguments):
+		frappe.set_user(T26_AGENT)
+		try:
+			with patch.object(registry, "_all_specs", lambda: write_ticket.TOOLS):
+				return execute_tool("create_task", arguments, ctx)
+		finally:
+			frappe.set_user("Administrator")
+
+	def _task_count(self):
+		return frappe.db.count("Task", {"ai_ticket": self.ticket})
+
+	def test_three_tasks_with_estimates(self):
+		ctx = self._ctx()
+		hours = {f"{T167_PREFIX} việc 1": 2, f"{T167_PREFIX} việc 2": 1.5, f"{T167_PREFIX} việc 3": 0.25}
+		results = {
+			subject: self._create(ctx, subject, expected_hours=estimate)
+			for subject, estimate in list(hours.items())[:2]
+		}
+		# The third goes through the registry: the schema takes the estimate as a JSON number.
+		subject = f"{T167_PREFIX} việc 3"
+		results[subject] = self._execute(ctx, self._args(subject, expected_hours=hours[subject]))
+		for subject, result in results.items():
+			with self.subTest(subject):
+				self.assertTrue(result["ok"], result)
+				task = frappe.db.get_value(
+					"Task",
+					result["task"],
+					["subject", "description", "ai_ticket", "expected_time"],
+					as_dict=True,
+				)
+				self.assertEqual(
+					(task.subject, task.ai_ticket, task.expected_time), (subject, self.ticket, hours[subject])
+				)
+				self.assertIn(f"/helpdesk/tickets/{self.ticket}", task.description)
+				self.assertIn(f"{T167_PREFIX} mô tả", task.description)
+		self.assertEqual(self._task_count(), 3)
+		schema = next(spec for spec in write_ticket.TOOLS if spec.name == "create_task").schema
+		self.assertEqual(
+			schema["input_schema"]["properties"]["expected_hours"], {"type": "number", "exclusiveMinimum": 0}
+		)
+		self.assertIn("expected_hours", schema["input_schema"]["required"])
+
+	def test_missing_or_non_positive_estimate_refused(self):
+		ctx = self._ctx()
+		refused = {
+			"missing": {},
+			"zero": {"expected_hours": 0},
+			"negative": {"expected_hours": -1},
+			"text": {"expected_hours": "2"},
+			"bool": {"expected_hours": True},
+			"not a number": {"expected_hours": float("nan")},
+			"infinite": {"expected_hours": float("inf")},
+		}
+		for case, extra in refused.items():
+			with self.subTest(case):
+				result = self._create(ctx, f"{T167_PREFIX} việc", **extra)
+				self.assertEqual(result, {"ok": False, "reason": write_ticket.REASON_NO_ESTIMATE})
+		# Through the registry a missing, text or bool estimate is refused by the schema, a non-positive one by the tool.
+		subject = f"{T167_PREFIX} việc"
+		self.assertEqual(self._execute(ctx, self._args(subject)), NOT_VALID_HOURS)
+		for given in ("2", True):
+			with self.subTest(registry=given):
+				self.assertEqual(
+					self._execute(ctx, self._args(subject, expected_hours=given)), NOT_VALID_HOURS
+				)
+		for given in (0, -1):
+			with self.subTest(registry=given):
+				self.assertEqual(
+					self._execute(ctx, self._args(subject, expected_hours=given)),
+					{"ok": False, "reason": write_ticket.REASON_NO_ESTIMATE},
+				)
+		self.assertEqual(self._task_count(), 0)
+		# A refused call does not count towards the cap: the run still creates its first Task.
+		set_agent_settings(max_tasks_per_run=1)
+		self.assertTrue(self._create(ctx, subject, expected_hours=1)["ok"])
+
+	def test_eleventh_task_in_run_refused(self):
+		self.assertEqual(write_ticket.DEFAULT_MAX_TASKS_PER_RUN, 10)
+		with self.subTest("empty setting: the default 10"):
+			set_agent_settings(max_tasks_per_run=None)
+			ctx = self._ctx()
+			for index in range(1, 11):
+				self.assertTrue(
+					self._create(ctx, f"{T167_PREFIX} việc {index}", expected_hours=1)["ok"], index
+				)
+			self.assertEqual(
+				self._create(ctx, f"{T167_PREFIX} việc 11", expected_hours=1),
+				{"ok": False, "reason": write_ticket.REASON_TASK_LIMIT.format(limit=10)},
+			)
+			self.assertEqual(self._task_count(), 10)
+		with self.subTest("configured 3"):
+			set_agent_settings(max_tasks_per_run=3)
+			ctx = self._ctx()
+			for index in range(1, 4):
+				self.assertTrue(
+					self._create(ctx, f"{T167_PREFIX} cấu hình {index}", expected_hours=1)["ok"], index
+				)
+			self.assertEqual(
+				self._create(ctx, f"{T167_PREFIX} cấu hình 4", expected_hours=1),
+				{"ok": False, "reason": write_ticket.REASON_TASK_LIMIT.format(limit=3)},
+			)
+			self.assertEqual(self._task_count(), 13)
+		with self.subTest("a new run_id counts again"):
+			other = self._ctx()
+			for index in range(1, 4):
+				self.assertTrue(
+					self._create(other, f"{T167_PREFIX} lần mới {index}", expected_hours=1)["ok"], index
+				)
+			self.assertFalse(self._create(other, f"{T167_PREFIX} lần mới 4", expected_hours=1)["ok"])
+			self.assertEqual(self._task_count(), 16)
 
 
 class TestSetClassification(FrappeTestCase):

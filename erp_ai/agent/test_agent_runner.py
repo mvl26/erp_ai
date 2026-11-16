@@ -4660,7 +4660,14 @@ class TestOneGuidance(GuidanceTestBase):
 		report = f"{PREFIX}đã tạo Task kiểm tra máy in.\nĐộ tin cậy: 90%\n**Căn cứ:** {PREFIX}yêu cầu trong comment"
 		self.gateway.results = [
 			tool_turn(
-				tool_use("t_task", "create_task", subject=f"{PREFIX}kiểm tra máy in", description="x"),
+				# AC-63 (T167, ruling R22d): a Task needs its hour estimate.
+				tool_use(
+					"t_task",
+					"create_task",
+					subject=f"{PREFIX}kiểm tra máy in",
+					description="x",
+					expected_hours=2,
+				),
 				tool_use("t_report", "post_comment", kind="de_xuat", content=report),
 			),
 			make_model_result(),

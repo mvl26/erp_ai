@@ -1,15 +1,19 @@
-from unittest.mock import patch
+from unittest.mock import ANY, patch
 
 import frappe
 from frappe.tests.utils import FrappeTestCase
+from helpdesk.test_utils import make_ticket
+from rq.job import JobStatus
 
 from erp_ai.agent import queue, runner
 from erp_ai.constants import (
+	LOG_DOCTYPE,
 	TRIGGER_COMMENT_MENTION,
 	TRIGGER_KB_DRAFT,
 	TRIGGER_REQUESTER_REPLY,
 	TRIGGER_TICKET_INSERT,
 )
+from erp_ai.test_utils import stub_job_states
 
 RUN_FOR_TICKET_PATH = "erp_ai.agent.runner.run_for_ticket"
 
@@ -17,6 +21,8 @@ RUN_FOR_TICKET_PATH = "erp_ai.agent.runner.run_for_ticket"
 class TestEnqueueAgentRun(FrappeTestCase):
 	def setUp(self):
 		frappe.flags.pop("erp_ai_pending_job_ids", None)
+		# ADR-048 QĐ 2: the queue reads the RQ job state; no job exists here, and the test never reaches Redis
+		stub_job_states(self, {})
 
 	def tearDown(self):
 		frappe.flags.pop("erp_ai_pending_job_ids", None)
@@ -52,6 +58,8 @@ class TestEnqueueAgentRun(FrappeTestCase):
 			ticket_name="TKT-1",
 			trigger=TRIGGER_COMMENT_MENTION,
 			message_name="MESSAGE-1",
+			# ADR-048 QĐ 2 (CHG-009): the job gets the run id its call_received row carries
+			run_id=ANY,
 		)
 
 	def test_comment_mention_job_carries_message_name(self):
@@ -177,7 +185,97 @@ class TestEnqueueAgentRun(FrappeTestCase):
 			ticket_name="TKT-7",
 			trigger="ticket_insert",
 			message_name=None,
+			# ADR-048 QĐ 2 (CHG-009): the job gets the run id its call_received row carries
+			run_id=ANY,
 		)
+
+
+class TestEnqueueRunEvents(FrappeTestCase):
+	"""CHG-009 AC-6 (design 3.5, D-3, D-9; ADR-048 QĐ 2): one read of the job state decides the row the call leaves
+	and the value returned; `frappe.enqueue` is still called on every branch."""
+
+	def setUp(self):
+		# FrappeTestCase rolls back only after the whole class: undo each test.
+		self.addCleanup(frappe.db.rollback)
+		self.addCleanup(queue._clear_pending_job_ids)
+		with patch("frappe.enqueue"):
+			self.ticket = make_ticket(subject="ERPAI-TEST-queue events").name
+		self.states = stub_job_states(self, {})
+
+	def _new_request(self):
+		"""Each call below is its own request: no pending claim, no row of an earlier call."""
+		queue._clear_pending_job_ids()
+		frappe.db.delete(LOG_DOCTYPE, {"ticket": self.ticket})
+
+	def _rows(self):
+		return [
+			(row.entry_type, row.trigger, row.stop_reason, row.run_id)
+			for row in frappe.get_all(
+				LOG_DOCTYPE,
+				filters={"ticket": self.ticket},
+				fields=["entry_type", "trigger", "stop_reason", "run_id"],
+				order_by="creation asc",
+			)
+		]
+
+	def test_rows_by_job_state(self):
+		calls = (
+			(TRIGGER_TICKET_INSERT, {}, ""),
+			(TRIGGER_COMMENT_MENTION, {"message_name": "MESSAGE-7"}, ""),
+			(TRIGGER_REQUESTER_REPLY, {"communication_name": "COMM-7"}, "::COMM-7"),
+			(TRIGGER_KB_DRAFT, {}, ""),
+		)
+		# no job, an ended job and a failed read are all a new job; only a waiting or running one is not
+		new_states = (None, JobStatus.FINISHED, JobStatus.FAILED, ConnectionError("redis down"))
+		fresh_run_ids = []
+		for trigger, kwargs, job_suffix in calls:
+			job_id = f"erp_ai::{self.ticket}::{trigger}{job_suffix}"
+			for state in (*new_states, JobStatus.QUEUED, JobStatus.STARTED):
+				with self.subTest(trigger=trigger, state=state):
+					self._new_request()
+					self.states[job_id] = state
+					with patch("frappe.enqueue") as enqueue:
+						queued = queue.enqueue_agent_run(self.ticket, trigger, **kwargs)
+
+					enqueue.assert_called_once()
+					self.assertEqual(enqueue.call_args.kwargs["job_id"], job_id)
+					run_id = enqueue.call_args.kwargs.get("run_id")
+					if state in (JobStatus.QUEUED, JobStatus.STARTED):
+						code = "call_merged" if state == JobStatus.QUEUED else "call_busy"
+						# AC-6: only a message (comment_mention) is told it was merged or must wait
+						expected = (
+							[("run_event", trigger, code, None)] if trigger == TRIGGER_COMMENT_MENTION else []
+						)
+						self.assertEqual(self._rows(), expected)
+						self.assertFalse(queued)
+						self.assertIsNone(run_id)
+					else:
+						self.assertEqual(self._rows(), [("run_event", trigger, "call_received", run_id)])
+						self.assertTrue(queued)
+						if trigger == TRIGGER_REQUESTER_REPLY:
+							# ADR-033 QĐ 2: the requester-reply run keeps its event key
+							self.assertEqual(run_id, queue.requester_reply_key(self.ticket, "COMM-7"))
+						else:
+							self.assertRegex(run_id, r"^[0-9a-f]{32}$")
+							fresh_run_ids.append(run_id)
+					self.assertIn("run_id", enqueue.call_args.kwargs)
+		self.assertEqual(len(fresh_run_ids), 3 * len(new_states))
+		self.assertEqual(len(set(fresh_run_ids)), len(fresh_run_ids))
+
+	def test_same_job_twice_in_one_request_one_row(self):
+		# D-9: the second call of one job in one transaction is the first one's: no row, False
+		for trigger, kwargs in (
+			(TRIGGER_COMMENT_MENTION, {"message_name": "MESSAGE-8"}),
+			(TRIGGER_TICKET_INSERT, {}),
+		):
+			with self.subTest(trigger=trigger):
+				self._new_request()
+				with patch("frappe.enqueue") as enqueue:
+					self.assertTrue(queue.enqueue_agent_run(self.ticket, trigger, **kwargs))
+					self.assertFalse(queue.enqueue_agent_run(self.ticket, trigger, **kwargs))
+
+				enqueue.assert_called_once()
+				self.assertEqual([row[2] for row in self._rows()], ["call_received"])
 
 
 class TestRunForTicketCommentName(FrappeTestCase):

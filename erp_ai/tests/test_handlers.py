@@ -10,7 +10,7 @@ from frappe.tests.utils import FrappeTestCase
 from helpdesk.test_utils import make_ticket
 
 from erp_ai import handlers, hooks
-from erp_ai.agent import answer_delay, messages, queue, runner
+from erp_ai.agent import answer_delay, messages, policy, queue, run_log, runner
 from erp_ai.agent.tools import site_api
 from erp_ai.agent.tools.registry import ToolContext
 from erp_ai.constants import (
@@ -18,6 +18,8 @@ from erp_ai.constants import (
 	LOG_DOCTYPE,
 	LOGGER_NAME,
 	MESSAGE_DOCTYPE,
+	TITLE_EVENT_FAILED,
+	TRIGGER_COMMENT_MENTION,
 	TRIGGER_KB_DRAFT,
 	TRIGGER_REQUESTER_REPLY,
 )
@@ -28,6 +30,7 @@ from erp_ai.test_utils import (
 	make_model_result,
 	record_status_signals,
 	set_agent_settings,
+	stub_job_states,
 )
 
 PREFIX = "ERPAI-TEST-"
@@ -89,6 +92,8 @@ class HandlerTestCase(FrappeTestCase):
 		enqueue_patch = patch.object(frappe, "enqueue")
 		self.enqueue = enqueue_patch.start()
 		self.addCleanup(enqueue_patch.stop)
+		# ADR-048 QĐ 2: the queue's read of the RQ job state never reaches Redis here; every job is new.
+		stub_job_states(self, {})
 
 		set_agent_settings(
 			enabled=1,
@@ -692,7 +697,9 @@ class TestHumanCorrection(HandlerTestCase):
 
 	def test_edit_before_first_log_marks_human(self):
 		ticket = self._ticket_without_job(priority="Low")
-		self.assertEqual(frappe.db.count(LOG_DOCTYPE, {"ticket": ticket.name}), 0)
+		# ADR-048 QĐ 5 (CHG-009): the run_event row of a ticket made while the bot is off is not a run's row
+		run_rows = {"ticket": ticket.name, "entry_type": ("!=", "run_event")}
+		self.assertEqual(frappe.db.count(LOG_DOCTYPE, run_rows), 0)
 		logger = MagicMock()
 
 		with patch.object(frappe, "logger", return_value=logger):
@@ -700,7 +707,7 @@ class TestHumanCorrection(HandlerTestCase):
 
 		self.assertEqual(frappe.db.get_value("HD Ticket", ticket.name, "priority"), "High")
 		self.assertEqual(self._classified_by(ticket), "Người")
-		self.assertEqual(frappe.db.count(LOG_DOCTYPE, {"ticket": ticket.name}), 0)
+		self.assertEqual(frappe.db.count(LOG_DOCTYPE, run_rows), 0)
 		self.assertFalse(ticket.flags.erp_ai_human_corrected)
 		logged = [str(arg) for call in logger.info.call_args_list for arg in call.args]
 		self.assertIn(
@@ -1236,7 +1243,8 @@ class TestRequesterReply(RequesterReplyTestCase):
 
 		with ExitStack() as stack:
 			writes = {
-				name: stack.enter_context(patch.object(owner, name))
+				# autospec on Document: an insert is told by the document it inserts
+				name: stack.enter_context(patch.object(owner, name, autospec=owner is Document))
 				for owner, name in (
 					(Document, "save"),
 					(Document, "insert"),
@@ -1251,11 +1259,200 @@ class TestRequesterReply(RequesterReplyTestCase):
 			handlers.task_on_update(task)
 			handlers.ticket_on_update(resolved)
 
+		# ADR-033 Amd 1 (ADR-048 QĐ 2): the one write left is the call_received row the queue adds through run_log
+		inserted = [call.args[0] for call in writes.pop("insert").call_args_list]
+		self.assertEqual(
+			sorted((doc.doctype, doc.entry_type, doc.stop_reason, doc.trigger) for doc in inserted),
+			sorted(
+				(LOG_DOCTYPE, "run_event", "call_received", trigger)
+				for trigger in (TRIGGER_REQUESTER_REPLY, TRIGGER_KB_DRAFT)
+			),
+		)
 		self.assertEqual({name: mock.call_count for name, mock in writes.items()}, dict.fromkeys(writes, 0))
 		self.assertEqual(
 			sorted(call.kwargs.get("trigger", call.args[0]) for call in self.enqueue.call_args_list),
 			sorted([TRIGGER_REQUESTER_REPLY, LIFECYCLE_JOB_PATH, TRIGGER_KB_DRAFT]),
 		)
+
+	def test_call_row_is_not_handled(self):
+		# ADR-033 QĐ 6, ADR-048 QĐ 4 (CHG-009): the call_received row carries the event key, yet only a row of the run
+		# makes the message handled (B-2), so the hook firing again before the run still queues it
+		ticket = self._requester_ticket().name
+		self._bot_message(ticket)
+		reply = self._reply(ticket)
+		run_log.record_event(
+			ticket=ticket,
+			trigger=TRIGGER_REQUESTER_REPLY,
+			code="call_received",
+			run_id=queue.requester_reply_key(ticket, reply.name),
+		)
+
+		lines = self._on_update(reply)
+
+		self.assertEqual(
+			lines,
+			[f"erp_ai handler ticket={ticket} trigger={TRIGGER_REQUESTER_REPLY} enqueued: conditions_met"],
+		)
+		self.assertEqual([job["communication_name"] for job in self._reply_jobs()], [reply.name])
+
+
+class TestHandlerRefusalRows(HandlerTestCase):
+	"""CHG-009 AC-5 at call time, AC-7, AC-11 (design 3.6, D-6; ADR-048 QĐ 2-4): a refused call leaves one run_event
+	row with its reason code, in the person's transaction; what is not a call leaves none."""
+
+	TITLE_PREFIX = "[THU-43229]"
+
+	def setUp(self):
+		super().setUp()
+		keep_agent_settings(self)
+		set_agent_settings(excluded_title_prefixes=self.TITLE_PREFIX)
+
+	def _created(self, subject=f"{PREFIX}refused", user="Administrator", **values):
+		frappe.set_user(user)
+		try:
+			return make_ticket(subject=subject, **values).name
+		finally:
+			frappe.set_user("Administrator")
+
+	def _rows(self, ticket, trigger=None):
+		filters = {"ticket": ticket, "entry_type": "run_event", **({"trigger": trigger} if trigger else {})}
+		return [
+			(row.trigger, row.stop_reason, row.run_id)
+			for row in frappe.get_all(
+				LOG_DOCTYPE,
+				filters=filters,
+				fields=["trigger", "stop_reason", "run_id"],
+				order_by="creation asc",
+			)
+		]
+
+	def test_new_ticket_seven_reasons(self):
+		# AC-7: a ticket the bot skips at creation says why from its first opening: one row, made at creation
+		before = frappe.utils.now_datetime()
+		set_agent_settings(enabled=0)
+		tickets = {"agent_disabled": self._created()}
+		set_agent_settings(enabled=1)
+		tickets["created_by_agent"] = self._created(user=AGENT_USER)
+		tickets["prefilled"] = self._created(
+			ticket_type=TICKET_TYPE, agent_group=OPEN_TEAM, priority="Medium"
+		)
+		tickets["not_sendable:opted_out"] = self._created(ai_opt_out=1)
+		tickets["not_sendable:excluded_team"] = self._created(agent_group=EXCLUDED_TEAM)
+		tickets["not_sendable:excluded_title"] = self._created(subject=f"{self.TITLE_PREFIX} lương")
+		# a new ticket has no classify row yet: the predicate's own answer stands in for one
+		with patch.object(policy, "is_excluded_by_classification", return_value=True):
+			tickets["not_sendable:excluded_by_classification"] = self._created()
+		after = frappe.utils.now_datetime()
+
+		for code, ticket in tickets.items():
+			with self.subTest(code=code):
+				rows = frappe.get_all(
+					LOG_DOCTYPE,
+					filters={"ticket": ticket},
+					fields=["entry_type", "trigger", "stop_reason", "run_id", "creation"],
+				)
+				self.assertEqual(
+					[(row.entry_type, row.trigger, row.stop_reason, row.run_id) for row in rows],
+					[("run_event", "ticket_insert", code, None)],
+				)
+				self.assertTrue(before <= rows[0].creation <= after, (before, rows[0].creation, after))
+		self.assertEqual(self._jobs(), [])
+		self.assertEqual(self.gateway.call_count, 0)
+
+	def test_reason_kept_after_setting_change(self):
+		# 43229 (AC-7, A-2): the reason is the one decided at creation; taking the prefix out of the settings later
+		# leaves it, though the send predicate would now let the ticket through
+		ticket = self._created(subject=f"{self.TITLE_PREFIX} báo cáo tháng")
+
+		set_agent_settings(excluded_title_prefixes="")
+
+		self.assertIsNone(policy.send_refusal(ticket))
+		self.assertEqual(self._rows(ticket), [("ticket_insert", "not_sendable:excluded_title", None)])
+
+	def test_call_refusals_on_both_paths(self):
+		# AC-5 (a), (c)-(f) at call time, by a panel message and by an @ai comment: one row with its code, no copy of
+		# the comment, no job, no model call
+		set_agent_settings(enabled=0)
+		tickets = {
+			"agent_disabled": self._created(),
+			"not_sendable:opted_out": self._created(ai_opt_out=1),
+			"not_sendable:excluded_team": self._created(agent_group=EXCLUDED_TEAM),
+			"not_sendable:excluded_title": self._created(subject=f"{self.TITLE_PREFIX} lương"),
+			"not_sendable:excluded_by_classification": self._created(),
+		}
+		make_log_entry(
+			ticket=tickets["not_sendable:excluded_by_classification"],
+			entry_type="classify",
+			stop_reason=policy.EXCLUDED_BY_CLASSIFICATION,
+			applied=0,
+		)
+		for code, ticket in tickets.items():
+			for path in ("message", "comment"):
+				with self.subTest(code=code, path=path):
+					set_agent_settings(enabled=int(code != "agent_disabled"))
+					frappe.db.delete(LOG_DOCTYPE, {"ticket": ticket, "entry_type": "run_event"})
+					copies = len(self._messages(ticket))
+					if path == "message":
+						messages.add_message(ticket, "xem giúp", trusted=True)
+						copies += 1
+					else:
+						self._comment(ticket, f"{KEYWORD} xem giúp")
+
+					self.assertEqual(self._rows(ticket), [(TRIGGER_COMMENT_MENTION, code, None)])
+					self.assertEqual(len(self._messages(ticket)), copies)
+		self.assertEqual(self._jobs(), [])
+		self.assertEqual(self.gateway.call_count, 0)
+
+	def test_comments_that_are_not_calls_write_no_row(self):
+		# ADR-048 Ràng buộc, D-6: a comment off a ticket, a ticket comment without the keyword or left with markup only,
+		# and the bot's own comment are no call: no ERP AI Log row, with the bot on and off
+		ticket = self._created()
+		for enabled in (1, 0):
+			with self.subTest(enabled=enabled):
+				set_agent_settings(enabled=enabled)
+				count = frappe.db.count(LOG_DOCTYPE)
+
+				self._comment(OPEN_TEAM, f"{KEYWORD} xem giúp", reference_doctype="HD Team")
+				self._comment(ticket, "Không nhắc ai cả")
+				with patch.object(handlers, "html_to_plain_text", return_value=" \n"):
+					self._comment(ticket, f"{KEYWORD} <b></b>")
+				frappe.set_user(AGENT_USER)
+				self._comment(ticket, f"{KEYWORD} bot tự viết")
+				frappe.set_user("Administrator")
+
+				self.assertEqual(frappe.db.count(LOG_DOCTYPE), count)
+		# control: the same keyword comment by a person while the bot is off is a refused call, so one row
+		self._comment(ticket, f"{KEYWORD} xem giúp")
+		self.assertEqual(
+			self._rows(ticket, TRIGGER_COMMENT_MENTION), [(TRIGGER_COMMENT_MENTION, "agent_disabled", None)]
+		)
+
+	def test_event_write_failure_keeps_the_save(self):
+		# AC-11, ADR-048 QĐ 3: a failing event write is undone back to its savepoint and leaves one Error Log each;
+		# the tickets, the comment, the message and the queued job are kept as they would be without it
+		real_write_entry = run_log.write_entry
+
+		def write_then_fail(**fields):
+			real_write_entry(**fields)
+			raise RuntimeError("forced")
+
+		with (
+			patch.object(run_log, "write_entry", side_effect=write_then_fail),
+			patch.object(frappe, "log_error") as log_error,
+		):
+			queued = self._created()
+			set_agent_settings(enabled=0)
+			refused = self._created()
+			comment = self._comment(refused, f"{KEYWORD} xem giúp")
+			message = messages.add_message(refused, "xem giúp", trusted=True)
+
+		self.assertTrue(frappe.db.exists("HD Ticket", queued))
+		self.assertTrue(frappe.db.exists("HD Ticket", refused))
+		self.assertTrue(frappe.db.exists("Comment", comment.name))
+		self.assertTrue(frappe.db.exists(MESSAGE_DOCTYPE, message))
+		self.assertEqual([job.kwargs["ticket_name"] for job in self._jobs()], [queued])
+		self.assertEqual(frappe.db.count(LOG_DOCTYPE, {"ticket": ("in", [queued, refused])}), 0)
+		self.assertEqual([call.args[0] for call in log_error.call_args_list], [TITLE_EVENT_FAILED] * 4)
 
 
 LIFECYCLE_JOB_PATH = "erp_ai.agent.lifecycle.run_task_lifecycle"

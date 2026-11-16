@@ -5,13 +5,19 @@ from frappe.core.utils import html_to_plain_text
 
 from erp_ai.agent import lifecycle, messages, policy
 from erp_ai.agent.queue import enqueue_agent_run, enqueue_lifecycle_job, requester_reply_key
+from erp_ai.agent.run_log import EVENT_CODES, record_event
 from erp_ai.constants import (
 	AGENT_USER,
 	CATEGORIES,
 	CLASSIFICATION_FIELDS,
 	CLASSIFIED_BY_HUMAN,
 	LOG_DOCTYPE,
+	LOG_ENTRY_RUN_EVENT,
 	LOGGER_NAME,
+	SKIP_AGENT_DISABLED,
+	SKIP_CREATED_BY_AGENT,
+	SKIP_NOT_SENDABLE,
+	SKIP_PREFILLED,
 	TRIGGER_COMMENT_MENTION,
 	TRIGGER_KB_DRAFT,
 	TRIGGER_REQUESTER_REPLY,
@@ -36,6 +42,16 @@ def _log_decision(ticket, trigger, outcome, reason):
 	frappe.logger(LOGGER_NAME).info(f"erp_ai handler ticket={ticket} trigger={trigger} {outcome}: {reason}")
 
 
+def _record_refusal(ticket, trigger, skip_reason):
+	"""A refused call leaves one run_event row with its reason code, in the person's transaction (ADR-048 QĐ 2, 3).
+
+	Only a call's refusal has an event code; a skip that refuses no call (the bot's own text, no keyword, no
+	text, a missing ticket) leaves no row. `record_event` never commits and never raises.
+	"""
+	if skip_reason in EVENT_CODES:
+		record_event(ticket=ticket, trigger=trigger, code=skip_reason)
+
+
 def ticket_before_insert(doc, method=None):
 	# Runs before Helpdesk fills defaults, so it sees only what the person typed.
 	doc.flags.erp_ai_prefilled = all(doc.get(field) for field in CLASSIFICATION_FIELDS)
@@ -48,16 +64,17 @@ def ticket_before_insert(doc, method=None):
 def ticket_after_insert(doc, method=None):
 	skip_reason = None
 	if not policy.is_enabled():
-		skip_reason = "agent_disabled"
+		skip_reason = SKIP_AGENT_DISABLED
 	elif doc.owner == AGENT_USER:
-		skip_reason = "created_by_agent"
+		skip_reason = SKIP_CREATED_BY_AGENT
 	elif refusal := policy.send_refusal(doc):
-		skip_reason = f"not_sendable:{refusal}"
+		skip_reason = f"{SKIP_NOT_SENDABLE}:{refusal}"
 	elif doc.flags.erp_ai_prefilled:
-		skip_reason = "prefilled"
+		skip_reason = SKIP_PREFILLED
 
 	if skip_reason:
 		_log_decision(doc.name, TRIGGER_TICKET_INSERT, "skipped", skip_reason)
+		_record_refusal(doc.name, TRIGGER_TICKET_INSERT, skip_reason)
 		return
 	enqueue_agent_run(doc.name, TRIGGER_TICKET_INSERT)
 	_log_decision(doc.name, TRIGGER_TICKET_INSERT, "enqueued", "conditions_met")
@@ -220,23 +237,23 @@ def comment_after_insert(doc, method=None):
 		return
 
 	ticket = doc.reference_name
+	# D-6: what is no call is told first, so only a call the bot refuses leaves a row (ADR-048 QĐ 2).
 	skip_reason = None
-	if not policy.is_enabled():
-		skip_reason = "agent_disabled"
-	elif doc.owner == AGENT_USER:
+	if doc.owner == AGENT_USER:
 		skip_reason = "written_by_agent"
 	elif not policy.contains_keyword(doc.content):
 		skip_reason = "no_keyword"
+	elif not (text := html_to_plain_text(doc.content)).strip():
+		# the keyword sat only inside markup: nothing was said, and the comment itself must still be saved
+		skip_reason = "no_text"
+	elif not policy.is_enabled():
+		skip_reason = SKIP_AGENT_DISABLED
 	elif refusal := policy.send_refusal(ticket):
-		skip_reason = f"not_sendable:{refusal}"
+		skip_reason = f"{SKIP_NOT_SENDABLE}:{refusal}"
 
 	if skip_reason:
 		_log_decision(ticket, TRIGGER_COMMENT_MENTION, "skipped", skip_reason)
-		return
-	text = html_to_plain_text(doc.content)
-	if not text.strip():
-		# the keyword sat only inside markup: nothing was said, and the comment itself must still be saved
-		_log_decision(ticket, TRIGGER_COMMENT_MENTION, "skipped", "no_text")
+		_record_refusal(ticket, TRIGGER_COMMENT_MENTION, skip_reason)
 		return
 	# The copy is the one trigger: its after_insert (message_after_insert) queues the run.
 	messages.add_message(ticket, text, source_comment=doc.name, trusted=True)
@@ -250,12 +267,13 @@ def message_after_insert(doc, method=None):
 	if doc.owner == AGENT_USER:
 		skip_reason = "written_by_agent"
 	elif not policy.is_enabled():
-		skip_reason = "agent_disabled"
+		skip_reason = SKIP_AGENT_DISABLED
 	elif refusal := policy.send_refusal(ticket):
-		skip_reason = f"not_sendable:{refusal}"
+		skip_reason = f"{SKIP_NOT_SENDABLE}:{refusal}"
 
 	if skip_reason:
 		_log_decision(ticket, TRIGGER_COMMENT_MENTION, "skipped", skip_reason)
+		_record_refusal(ticket, TRIGGER_COMMENT_MENTION, skip_reason)
 		return
 	enqueue_agent_run(ticket, TRIGGER_COMMENT_MENTION, message_name=doc.name)
 	_log_decision(ticket, TRIGGER_COMMENT_MENTION, "enqueued", "conditions_met")
@@ -276,8 +294,12 @@ def _requester_reply_skip(doc, ticket) -> str | None:
 		COMMUNICATION_DOCTYPE, {**lifecycle._bot_messages(ticket), "creation": ("<", doc.creation)}
 	):
 		return "no_bot_message_before"
-	# B-2: the run of this message already wrote its rows under the event key.
-	if frappe.db.exists(LOG_DOCTYPE, {"run_id": requester_reply_key(ticket, doc.name)}):
+	# B-2: the run of this message already wrote its rows under the event key; the call_received row the queue
+	# wrote under it is not the run's (ADR-033 QĐ 6, ADR-048 QĐ 4).
+	if frappe.db.exists(
+		LOG_DOCTYPE,
+		{"run_id": requester_reply_key(ticket, doc.name), "entry_type": ("!=", LOG_ENTRY_RUN_EVENT)},
+	):
 		return "already_handled"
 	if refusal := policy.send_refusal(ticket):
 		return f"not_sendable:{refusal}"

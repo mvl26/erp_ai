@@ -13,6 +13,7 @@ from erp_ai.agent import authority, lifecycle, policy, queue, site_facts
 from erp_ai.agent.answer_delay import AnswerDelay
 from erp_ai.agent.authority import TITLE_WRONG_USER as TITLE_WRONG_USER  # re-export, U1.md:264
 from erp_ai.agent.classification import load_mapping, parse_classification, split_request_comment
+from erp_ai.agent.messages import history as conversation_history
 from erp_ai.agent.prompts import (
 	LATER_MESSAGES_MAX,
 	TICKET_FIELD_LABELS,
@@ -77,6 +78,7 @@ from erp_ai.constants import (
 	LEVELS,
 	LOG_DOCTYPE,
 	LOGGER_NAME,
+	MESSAGE_DOCTYPE,
 	PROPOSAL_DOCTYPE,
 	SETTING_DOCTYPE,
 	TITLE_RUN_FAILED,
@@ -115,6 +117,8 @@ WRITE_TOOL_TARGETS = {
 	"reply_to_requester": ("Communication", "communication"),
 	"create_kb_draft": (ARTICLE_DOCTYPE, "article"),
 }
+# The answer tool wrote a message of the ticket's conversation instead (a run a message there started).
+ANSWER_MESSAGE_TARGET = (MESSAGE_DOCTYPE, "message")
 # Generic write tools: the model names the DocType; each successful call keeps its full snapshot (AC-13).
 GENERIC_WRITE_TOOLS = tuple(name for name, (doctype, _) in WRITE_TOOL_TARGETS.items() if doctype is None)
 # `ERP AI Log.actions` is a Small Text column: MariaDB `text`, 65535 bytes. The JSON the runner stores there
@@ -334,6 +338,7 @@ def _run(ticket_name, trigger, message_name=None, communication_name=None):
 				below_threshold=not kb_run and _below_threshold(pct, threshold, instructor, switches.act_now),
 				reply_enabled=not kb_run and lifecycle.lifecycle_settings(settings).reply,
 				kb_draft_run=kb_run,
+				in_conversation=trigger == TRIGGER_COMMENT_MENTION,
 			)
 			# ADR-036 QĐ 7: the one count, read once; the mode is chosen once the classification is known
 			posted = count_guidance(ticket_name) > 0
@@ -1299,6 +1304,11 @@ def _reason(
 		{**comment, "author": get_fullname(comment["author"])}
 		for comment in authority.label_comments(ticket_name, comments)
 	]
+	# the ticket's conversation with the bot, oldest first, its roles decided the same way
+	conversation = [
+		{**message, "author": get_fullname(message["author"])}
+		for message in authority.label_comments(ticket_name, conversation_history(ticket_name)[::-1])
+	]
 	ticket = frappe.db.get_value(
 		"HD Ticket",
 		ticket_name,
@@ -1330,6 +1340,7 @@ def _reason(
 				classification,
 				ticket_fields=fields,
 				guidance_posted=guidance_posted,
+				conversation=conversation,
 			),
 		}
 	]
@@ -1615,6 +1626,8 @@ def _record_snapshot(name, outcome, n, before, after) -> None:
 def _action(name, context, outcome, ok, arguments, *, crash=None):
 	"""One action entry of a write tool, through the one builder `run_log.action_entry` (U3 3.2)."""
 	doctype, key = WRITE_TOOL_TARGETS[name]
+	if name == ANSWER_TOOL and ANSWER_MESSAGE_TARGET[1] in (outcome or {}):
+		doctype, key = ANSWER_MESSAGE_TARGET
 	if doctype is None:
 		requested = arguments.get("doctype") if isinstance(arguments, dict) else None
 		doctype = str((outcome or {}).get("doctype") or requested or "") or None

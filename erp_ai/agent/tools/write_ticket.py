@@ -12,6 +12,7 @@ from frappe.utils import escape_html, now_datetime
 
 from erp_ai.agent import policy, site_facts
 from erp_ai.agent.classification import CONFIDENCE_PCT_MAX, Classification
+from erp_ai.agent.messages import add_message
 from erp_ai.agent.ops_data import BA_NOTE_MARKER
 from erp_ai.agent.routing import RouteDecision, decide_route
 from erp_ai.agent.tools.registry import ToolContext, ToolSpec
@@ -298,6 +299,25 @@ def post_comment(args: dict, ctx: ToolContext) -> dict:
 	return _post(ctx.ticket_name, args["content"])
 
 
+def _post_message(content: str, ctx: ToolContext) -> dict:
+	"""One message of the bot in the ticket's conversation, as written, under the session user's permissions."""
+	if not frappe.get_doc(TICKET_DOCTYPE, ctx.ticket_name).has_permission("read"):
+		return _fail("thiếu quyền đọc phiếu")
+	try:
+		name = add_message(ctx.ticket_name, content, run_id=ctx.run_id)
+	except frappe.PermissionError:
+		return _fail("không được phép thêm tin vào ngăn trao đổi")
+	return {"ok": True, "message": name}
+
+
+def _say(content: str, ctx: ToolContext) -> dict:
+	"""Post what the model says to people: in the ticket's conversation when a message there started the run (the bot
+	answers where it was asked), else as a comment on the ticket."""
+	if ctx.in_conversation:
+		return _post_message(content, ctx)
+	return _post(ctx.ticket_name, content)
+
+
 def _heading_line(header: str) -> re.Pattern:
 	"""A line opening with the `<header>:` heading, the `**` around it optional (U4b.md:168)."""
 	return re.compile(rf"^[ \t]*(?:\*\*)?{re.escape(header)}:(?:\*\*)?", re.M)
@@ -369,7 +389,7 @@ def _ask_below_threshold(kind: str, content: str, ctx: ToolContext) -> dict:
 		return _fail(REASON_ONE_ASK)
 	if not section_text(content, EVIDENCE_HEADER):
 		return _fail(REASON_NO_EVIDENCE)
-	result = _post(ctx.ticket_name, f"{content}\n\n{_ask_footer(ctx.ticket_name)}")
+	result = _say(f"{content}\n\n{_ask_footer(ctx.ticket_name)}", ctx)
 	if result["ok"]:
 		mark_asked(ctx.run_id)
 	return result
@@ -628,7 +648,8 @@ def _ba_note_content(content: str) -> str:
 
 def post_comment_tool(args: dict, ctx: ToolContext) -> dict:
 	"""Handler of the post_comment tool (AC-22, U4b.md:171, w1.md:96): checks the steps in order, then posts; a
-	refusal posts nothing, and in a guidance run a proposal is held for post_guidance instead."""
+	refusal posts nothing, and in a guidance run a proposal is held for post_guidance instead. A question or a
+	proposal is what the bot says to people (`_say`); the BA note is ticket information, always a comment."""
 	kind, content = args.get("kind"), args["content"]
 	# Step (0): the marker is the writer's alone, whatever the kind, before any other check (AC-65 (d)).
 	if _GUIDANCE_KEY in re.sub(r"\s+", "", content).lower():
@@ -656,7 +677,7 @@ def post_comment_tool(args: dict, ctx: ToolContext) -> dict:
 	if kind == "de_xuat" and (outcome := _hold_or_refuse(content, ctx)):
 		return outcome
 	# Steps (4), (5): a question above the threshold needs nothing more.
-	return _post(ctx.ticket_name, content)
+	return _say(content, ctx)
 
 
 def _ticket_link_html(name: str) -> str:

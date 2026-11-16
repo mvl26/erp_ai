@@ -42,6 +42,8 @@ class ToolContext:
 	below_threshold: bool = False
 	reply_enabled: bool = False
 	kb_draft_run: bool = False
+	# True when a message of the ticket's conversation started the run: what the bot says, it says there.
+	in_conversation: bool = False
 
 	def grant_inputs(self) -> GrantInputs:
 		switches = PermissionSwitches(

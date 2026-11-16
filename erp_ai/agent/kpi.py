@@ -15,7 +15,7 @@ from frappe.utils.synchronization import filelock
 
 from erp_ai.agent.classification import load_mapping
 from erp_ai.agent.ops_data import category_by_ticket_type, ticket_category, weekly_cycle
-from erp_ai.constants import AGENT_USER, LOG_DOCTYPE, LOGGER_NAME, SETTING_DOCTYPE
+from erp_ai.constants import AGENT_USER, LOG_DOCTYPE, LOGGER_NAME, MESSAGE_DOCTYPE, SETTING_DOCTYPE
 
 TICKET = "HD Ticket"
 CLOSED_STATUSES = ("Resolved", "Closed")
@@ -208,7 +208,7 @@ def _closed_without_human(ws: datetime, we: datetime) -> dict:
 
 
 def _human_touched(tickets: list) -> set[str]:
-	"""Tickets with an agent-side comment, sent email or assignment by anyone other than the bot."""
+	"""Tickets with an agent-side comment, message to the bot, sent email or assignment by anyone other than the bot."""
 	names = [row.name for row in tickets]
 	raised_by = {row.name: row.raised_by for row in tickets}
 	reference = {"reference_doctype": TICKET, "reference_name": ["in", names]}
@@ -221,6 +221,14 @@ def _human_touched(tickets: list) -> set[str]:
 		)
 		if row.owner not in (AGENT_USER, raised_by[row.reference_name])
 	}
+	# a person who spoke to the bot in the ticket's conversation worked on the ticket, as with a comment
+	touched.update(
+		row.ticket
+		for row in frappe.get_all(
+			MESSAGE_DOCTYPE, filters={"ticket": ["in", names]}, fields=["ticket", "owner"]
+		)
+		if row.owner not in (AGENT_USER, raised_by[row.ticket])
+	)
 	touched.update(
 		row.reference_name
 		for row in frappe.get_all(

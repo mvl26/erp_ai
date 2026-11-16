@@ -4798,8 +4798,12 @@ class TestOneGuidance(GuidanceTestBase):
 			self._run("comment_mention")
 
 		self.assertEqual(frappe.db.count("Task", {"ai_ticket": self.ticket.name}), 1)
-		# one result comment, the model's report, without the marker; still one guidance
-		self.assertEqual(list(self._new_comments(before).values()), [report])
+		# CHG-003: a run a message started reports in the conversation: one message, the model's report as written,
+		# without the marker, and no new ticket comment; still one guidance
+		self.assertEqual(
+			frappe.get_all(MESSAGE_DOCTYPE, filters={"ticket": self.ticket.name}, pluck="content"), [report]
+		)
+		self.assertEqual(self._new_comments(before), {})
 		self.assertEqual(self._guidance(), 1)
 
 	def test_chain_8_level_l0_or_excluded_team_zero(self):

@@ -327,7 +327,10 @@ PROMPT_CONFLICT_PAIRS: tuple[tuple[str, str], ...] = (
 )
 
 TASK_NEW_TICKET = "Việc cần làm: phiếu mới. Gọi set_resolution_hint một lần, rồi post_comment nếu cần."
-TASK_COMMENT = "Việc cần làm: có comment gọi bạn. Trả lời bằng post_comment."
+TASK_COMMENT = (
+	'Việc cần làm: có tin mới trong ngăn "Trao đổi với bot" gọi bạn (tin cuối của khối conversation). '
+	"Trả lời bằng post_comment: câu trả lời hiện trong ngăn đó, không hiện trên timeline phiếu."
+)
 # U6b-fixes.md:91 (one run may follow several requester messages) and U6b.md:293.
 TASK_REQUESTER_REPLY = (
 	"Người tạo phiếu vừa trả lời tin của bạn, có thể bằng nhiều tin. Đọc mọi tin của người tạo sau tin gần nhất "
@@ -535,9 +538,11 @@ def build_initial_message(
 	classification: dict | None,
 	ticket_fields: dict | None = None,
 	guidance_posted: bool = False,
+	conversation: list[dict] | None = None,
 ) -> str:
 	"""The first message of the reasoning turn. The ticket fields (non-empty ones) and the "already has guidance"
-	fact are data of the ticket (AC-24, AC-65 (c)); without them the payload is the one of before."""
+	fact are data of the ticket (AC-24, AC-65 (c)); without them the payload is the one of before. `conversation`
+	is the ticket's conversation with the bot, oldest first, plain text as typed; an empty one adds no block."""
 	payload = {
 		"ticket": {
 			"subject": ticket.get("subject"),
@@ -559,6 +564,15 @@ def build_initial_message(
 		"trigger": trigger,
 		"classification": classification,
 	}
+	if conversation:
+		payload["conversation"] = [
+			{
+				"author": message.get("author"),
+				"role": message.get("role"),
+				"content": (message.get("content") or "")[:COMMENT_MAX_CHARS],
+			}
+			for message in conversation[-MAX_COMMENTS:]
+		]
 	if fields := _field_values(ticket_fields or {}):
 		payload["ticket"]["fields"] = fields
 	task = TASK_BY_TRIGGER.get(trigger, TASK_NEW_TICKET)

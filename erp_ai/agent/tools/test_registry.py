@@ -330,7 +330,7 @@ class TestRegistry(FrappeTestCase):
 			],
 		)
 		# FEAT-007 T76: the grant fields come after `unrestricted`, each with a default; T155 (U6b.md:142) adds the
-		# reply switch and the KB-draft run after them.
+		# reply switch and the KB-draft run after them; CHG-003 adds where the run answers.
 		self.assertEqual(
 			fields[10:],
 			[
@@ -342,9 +342,10 @@ class TestRegistry(FrappeTestCase):
 				("below_threshold", False),
 				("reply_enabled", False),
 				("kb_draft_run", False),
+				("in_conversation", False),
 			],
 		)
-		self.assertEqual(len(fields), 18)
+		self.assertEqual(len(fields), 19)
 
 	def test_grant_functions_take_grant_inputs_without_default(self):
 		for function in (registry.grant, get_tool_schemas):

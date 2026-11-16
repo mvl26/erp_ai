@@ -3,6 +3,7 @@ import errno
 import inspect
 import os
 import unicodedata
+import unittest
 from unittest.mock import patch
 
 import frappe
@@ -604,3 +605,18 @@ class TestManuals(FrappeTestCase):
 			[record.getMessage() for record in logs.records],
 			["search_manuals skipped sub/a.md: PermissionError"],
 		)
+
+
+class TestMatchScore(unittest.TestCase):
+	def test_counts_matched_words_and_heading_words(self):
+		self.assertEqual(
+			knowledge.match_score(["máy", "in", "lỗi"], "Máy in", "Máy in báo lỗi giấy"),
+			(3, 2, {"máy", "in", "lỗi"}),
+		)
+
+	def test_none_when_no_word_matches(self):
+		self.assertIsNone(knowledge.match_score(["kế", "toán"], "Máy in", "Máy in báo lỗi"))
+
+	def test_accents_and_case_kept_as_tokenize(self):
+		self.assertEqual(knowledge.match_score(["lỗi"], "", "LỖI hệ thống")[0], 1)
+		self.assertIsNone(knowledge.match_score(["loi"], "", "LỖI hệ thống"))

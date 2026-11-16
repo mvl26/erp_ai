@@ -110,6 +110,7 @@ WRITE_TOOL_TARGETS = {
 	"api_delete_record": (None, "name"),
 	"api_submit_record": (None, "name"),
 	"api_call_method": ("Method", "method"),
+	"reply_to_requester": ("Communication", "communication"),
 }
 # Generic write tools: the model names the DocType; each successful call keeps its full snapshot (AC-13).
 GENERIC_WRITE_TOOLS = tuple(name for name, (doctype, _) in WRITE_TOOL_TARGETS.items() if doctype is None)
@@ -122,7 +123,7 @@ ACTION_VALUE_KEYS = ("value_before", "value_after")
 # Tools that create a record without returning before/after: their entry carries the call arguments as `value_after`.
 # Key of the proposal status in a propose tool's entry values (the DocType field; this module never writes it).
 PROPOSAL_STATUS_KEY = "change_status"
-CREATING_TOOLS = ("post_comment", "create_task")
+CREATING_TOOLS = ("post_comment", "create_task", "reply_to_requester")
 PROPOSE_TOOLS = ("propose_file_change", "propose_new_file", "propose_bench_command")
 PROPOSE_STEP = "propose"
 UNPARSEABLE_ERROR = "UNPARSEABLE: không phân loại được"
@@ -159,11 +160,27 @@ ASK_FALLBACK_BODY = (
 )
 ASK_PCT_UNKNOWN = "chưa có"
 # The triggers each notice may be posted for (U4b-fixes Fix 8, A-U4b-13): an allow list, fail-closed for a new
-# trigger. "daily_limit" is not in it: it holds for every trigger that reaches step (d).
+# trigger. "daily_limit" is not in it: it holds for every trigger that reaches step (d). The requester-reply run is in
+# every cell (it can be below the threshold too); the knowledge-draft run in none (w1b-r2.md:76, E-2).
 NOTICE_TRIGGERS = {
-	"over_budget": (TRIGGER_TICKET_INSERT, TRIGGER_COMMENT_MENTION, TRIGGER_CHANGE_ACTION),
-	"run_failed": (TRIGGER_TICKET_INSERT, TRIGGER_COMMENT_MENTION, TRIGGER_CHANGE_ACTION),
-	"ask_fallback": (TRIGGER_TICKET_INSERT, TRIGGER_COMMENT_MENTION, TRIGGER_CHANGE_ACTION),
+	"over_budget": (
+		TRIGGER_TICKET_INSERT,
+		TRIGGER_COMMENT_MENTION,
+		TRIGGER_CHANGE_ACTION,
+		TRIGGER_REQUESTER_REPLY,
+	),
+	"run_failed": (
+		TRIGGER_TICKET_INSERT,
+		TRIGGER_COMMENT_MENTION,
+		TRIGGER_CHANGE_ACTION,
+		TRIGGER_REQUESTER_REPLY,
+	),
+	"ask_fallback": (
+		TRIGGER_TICKET_INSERT,
+		TRIGGER_COMMENT_MENTION,
+		TRIGGER_CHANGE_ACTION,
+		TRIGGER_REQUESTER_REPLY,
+	),
 }
 # ADR-037 QĐ 4: a ticket is routed at most once; a later route call writes only this refusal on its classify row.
 ROUTE_ALREADY_DONE = "đã định tuyến"
@@ -304,6 +321,7 @@ def _run(ticket_name, trigger, comment_name=None, communication_name=None):
 				over_budget=over_budget,
 				main_path_level=policy.main_path_level(settings, level, category),
 				below_threshold=_below_threshold(pct, threshold, instructor, switches.act_now),
+				reply_enabled=lifecycle.lifecycle_settings(settings).reply,
 			)
 			# ADR-036 QĐ 7: the one count, read once; the mode is chosen once the classification is known
 			posted = count_guidance(ticket_name) > 0
@@ -1264,6 +1282,7 @@ def _reason(
 		unrestricted_tools=granted.unrestricted_block,
 		act_now=granted.act_now_block,
 		ask_only=granted.ask_only_block,
+		reply_tools=granted.reply_block,
 	)
 	fields = _ticket_field_values(ticket_name, field_map or {})
 	messages = [

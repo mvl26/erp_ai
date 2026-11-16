@@ -5843,10 +5843,12 @@ class TestKnowledgeActions(RequesterReplyRunBase):
 		self._reply_run(self._message(minutes=1))
 
 		on, off = self.gateway.calls
+		# the system prompt is a list of text blocks (prompt caching)
+		on_text, off_text = ("".join(block["text"] for block in call["system"]) for call in (on, off))
 		self.assertIn(REPLY_TOOL, [tool["name"] for tool in on["tools"]])
-		self.assertEqual(on["system"].count(REPLY_BLOCK), 1)
+		self.assertEqual(on_text.count(REPLY_BLOCK), 1)
 		self.assertNotIn(REPLY_TOOL, [tool["name"] for tool in off["tools"]])
-		self.assertNotIn(REPLY_BLOCK, off["system"])
+		self.assertNotIn(REPLY_BLOCK, off_text)
 
 	def test_below_threshold_email_question_is_the_one_ask(self):
 		# E-1 (w1b-r2.md:75): the question went by email; the run asks nothing more, no ask_fallback comment

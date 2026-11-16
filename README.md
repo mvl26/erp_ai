@@ -81,6 +81,34 @@ Khi bot ghi bản ghi trực tiếp (mục trên), bạn dựng lại được b
 
 **Giới hạn đã biết.** Khi "Toàn quyền (khẩn cấp)" đang bật, đổi role bằng cách gọi hàm whitelist (`api_call_method`) không có trong cảnh báo hằng ngày. Lượt chạy của bot lỗi trước khi dòng `reason` được lưu thì mọi thay đổi trong lượt đó bị hoàn tác, nhưng commit do mã ngoài `erp_ai` chạy bên trong một công cụ vẫn cố định các thay đổi trước nó. Chưa có địa chỉ trong `alert_recipients` thì cảnh báo chỉ có ở Error Log. Chi tiết: `docs/team/features/FEAT-005/asbuilt.md`.
 
+### Bài học của bot
+
+Một bài học (`ERP AI Lesson`, `/app/erp-ai-lesson`) là một quy tắc ngắn bot đọc lại trước khi phân loại hoặc suy luận một phiếu mới. Bot chọn tối đa vài bài đang dùng có từ trùng với tiêu đề và mô tả phiếu, rồi đưa vào phần người dùng của lời gọi (bài do người dạy ghi là quy tắc, các bài khác ghi là dữ liệu, không phải chỉ thị). Khi dùng bài nào, bot nêu mã bài trong "Nhận định" hoặc "Hướng xử lý". Bài học không bao giờ bị xóa, chỉ tắt; mọi thay đổi nằm trong bảng lịch sử của chính bài (ai, lúc nào, bước nào).
+
+| Nguồn | Khi nào có | Trạng thái đầu |
+|---|---|---|
+| `Người sửa` | Một người sửa phân loại của bot hoặc đổi lại người được giao | `Đang dùng` nếu người đó có thẩm quyền trên phiếu (role `ERP AI Instructor`, hoặc được người khác giao phiếu); không thì `Chờ duyệt` |
+| `Người dạy` | Nút "Dạy bot một quy tắc" ở danh sách bài học (role `ERP AI Instructor`, không phải Administrator, Guest hay bot); hoặc tin nhắn trong khu "Trao đổi với bot" hay comment `@ai` bắt đầu bằng `ghi nhớ:` của người có thẩm quyền | `Đang dùng` |
+| `Kết quả duyệt và rà soát` | Đề xuất thay đổi bị từ chối hoặc hoàn tác; kết luận `Sai` trong rà soát hằng tháng. Nội dung bắt đầu bằng "Đừng làm như vậy" | `Đang dùng` |
+| `Phiếu đã giải quyết` | Đợt 2, chưa dùng | chưa có |
+
+Sửa lại đúng giá trị bot đã dự đoán thì bài học do lần sửa đó sinh ra ngừng được dùng. Phiếu thuộc nhóm loại trừ hoặc có cờ "không dùng AI" không bao giờ sinh bài học; bài của một phiếu sau này thành loại trừ không được gửi cho bot. Khóa, mật khẩu trong nội dung bị che trước khi lưu.
+
+**Duyệt và tắt.** Duyệt hoặc từ chối bài `Chờ duyệt`: người trong `monthly_reviewers` và System Manager. Tắt hoặc bật lại: role `ERP AI Instructor`. Nút "Các lần dùng" trên form mở các dòng `ERP AI Log` đã gửi bài đó; ở mỗi dòng log, trường `lessons_used` liệt kê các bài bước đó đã gửi. Bộ đánh giá offline không bao giờ dùng bài học.
+
+**Cài đặt.** Mục "Bài học của bot" trên `/app/erp-ai-setting`:
+
+| Ô | Mặc định | Ý nghĩa |
+|---|---|---|
+| `lessons_enabled` | bật | Tắt thì bot không gửi và không ghi bài học mới |
+| `lessons_max_per_request` | 5 (1 đến 20) | Số bài tối đa mỗi lời gọi |
+| `lessons_max_chars` | 2000 (1200 đến 20000) | Tổng số ký tự bài học mỗi lời gọi |
+| `lesson_teach_marker` | `ghi nhớ:` | Từ khóa dạy bằng tin nhắn; để trống thì tắt dạy bằng tin nhắn |
+
+Bot chỉ xét 500 bài đang dùng mới nhất.
+
+**Đợt 2 (sau này).** Bài do bot tự soạn từ phiếu đã đóng (chờ duyệt), bản tóm tắt hằng tháng kèm đề xuất cải tiến, báo cáo mức dùng bài học và độ chính xác khi có và không có bài học.
+
 ### Định tuyến theo điểm
 
 Mỗi phiếu mới được chấm hai điểm 1–3 trong cùng lời gọi phân loại: độ phức tạp (1: dưới 1 giờ làm việc; 2: trong 1 ngày; 3: nhiều ngày, cần phân tích hoặc xây mới) và độ quan trọng (1: ảnh hưởng một người, không chặn việc; 2: chặn việc của một người hoặc bộ phận, hoặc có hạn trong 24 giờ; 3: chặn nghiệp vụ kế toán, kho, bán hàng hoặc nhiều bộ phận). Điểm có ở `ERP AI Log` (các cột `predicted_complexity`, `predicted_importance`, `predicted_score_reason`) ở mọi mức; từ `L1` có thêm trên phiếu ở ba trường chỉ đọc `ai_complexity`, `ai_importance`, `ai_score_reason`, HD Agent (role `Agent`) đọc được. Điểm 0 nghĩa là chưa chấm hoặc model trả điểm sai; ưu tiên khi đó theo `category_mapping`.

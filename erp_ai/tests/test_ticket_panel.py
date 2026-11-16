@@ -585,6 +585,15 @@ class TestTicketPanelGateParity(FrappeTestCase):
 	RUN_ROUTE = "erp_ai.agent.runner.run_for_ticket"
 	SPEND_BY_BRANCH: ClassVar[dict] = {"over_budget": 2.0}
 	LEVEL_BY_BRANCH: ClassVar[dict] = {"over_budget": "L1", "instructor_role": "L2", "assignee": "L2"}
+	# The branches about the reasoning path start from a ticket already classified at/above the threshold, so a
+	# later run reasons without classifying first (CHG-005 AC-1): one gateway call stays one.
+	CLASSIFIED_BRANCHES: ClassVar[set] = {
+		"turn_limit",
+		"over_budget",
+		"instructor_role",
+		"assignee",
+		"other_person",
+	}
 
 	def setUp(self):
 		# Cleanups run LIFO: set_user, rollback, then the roles cache that the rollback leaves stale.
@@ -800,6 +809,16 @@ class TestTicketPanelGateParity(FrappeTestCase):
 						entry_type="classify",
 						trigger="ticket_insert",
 						turn=0,
+					)
+				if name in self.CLASSIFIED_BRANCHES:
+					write_entry(
+						ticket=ticket,
+						run_id="ERPAI-TEST-parity-classified",
+						entry_type="classify",
+						trigger="ticket_insert",
+						turn=0,
+						predicted_category="A",
+						predicted_confidence_pct=100,
 					)
 				set_agent_settings(**settings)
 

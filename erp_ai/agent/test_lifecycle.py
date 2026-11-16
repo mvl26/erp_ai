@@ -22,12 +22,15 @@ GATEWAY_MODULES = ("erp_ai.gateway",)
 TOOLS_OR_RUNNER_MODULES = ("erp_ai.agent.tools", "erp_ai.agent.runner")
 # Every test message is dated in 2001: no live Communication of the shared site falls in a test's window.
 DAY0 = datetime(2001, 1, 1, 8, 0, 0)
-# Helpdesk sends an agent reply as an email (Email Queue, delayed) only with these settings.
+# Helpdesk sends an agent reply as an email (Email Queue, delayed) only with these settings; a Sent message
+# leaves the ticket status as it is.
 EMAIL_REPLY_SETTINGS = {
 	"enable_reply_email_via_agent": 1,
 	"skip_email_workflow": 0,
 	"instantly_send_email": 0,
+	"auto_update_status": 0,
 }
+DAYS = 3
 
 
 def _forbidden_imports(source: str, forbidden: tuple[str, ...]) -> list[str]:
@@ -537,6 +540,252 @@ class TestResolveOnTasksDone(LifecycleTestCase):
 
 		self._assert_resolved_once(ticket, completed=1)
 		self.assertEqual(self._error_logs(ticket), 1)
+
+
+class TestSilentClose(LifecycleTestCase):
+	"""AC-44, AC-41 (clock reset), ADR-033 QĐ 6: a silent F ticket is closed, with one notice, exactly once."""
+
+	def setUp(self):
+		super().setUp()
+		self._settings(close_silent_f_enabled=1, close_silent_f_days=DAYS)
+		self._email_settings()
+
+	def _silent_f(self, category="F", **values) -> str:
+		"""A ticket of `category` whose only message is the bot's, at DAY0."""
+		ticket = self._ticket(category=category, **values)
+		self._bot_message(ticket, DAY0)
+		return ticket
+
+	def _scan(self, now) -> None:
+		lifecycle.scan_silent_f_tickets(now)
+		frappe.set_user("Administrator")
+
+	def _bot_messages(self, ticket) -> list:
+		return frappe.get_all(
+			"Communication",
+			filters={
+				"reference_doctype": "HD Ticket",
+				"reference_name": ticket,
+				"sent_or_received": "Sent",
+				"owner": AGENT_USER,
+			},
+			pluck="name",
+		)
+
+	def _counts(self, ticket) -> dict:
+		sent = self._bot_messages(ticket)
+		return {
+			"bot messages": len(sent),
+			"emails": frappe.db.count("Email Queue", {"communication": ("in", sent)}) if sent else 0,
+			"comments": len(self._comments(ticket)),
+			"rows": len(self._rows(ticket)),
+			"status": self._status(ticket),
+		}
+
+	def _closed(self) -> dict:
+		"""The counts of a ticket of `_silent_f` once closed: its old message plus one notice and its email."""
+		return {"bot messages": 2, "emails": 1, "comments": 1, "rows": 1, "status": "Closed"}
+
+	def _untouched(self, status="Open", bot_messages=1) -> dict:
+		return {"bot messages": bot_messages, "emails": 0, "comments": 0, "rows": 0, "status": status}
+
+	def test_2d23h_not_closed(self):
+		ticket = self._silent_f()
+
+		self._scan(DAY0 + timedelta(hours=DAYS * 24 - 1))
+
+		self.assertEqual(self._counts(ticket), self._untouched())
+
+	def test_3d_closed_with_comment_and_notice(self):
+		ticket = self._silent_f()
+		requester = self._requester(ticket)
+		old_message = self._bot_messages(ticket)
+
+		self._scan(DAY0 + timedelta(hours=DAYS * 24))
+
+		self.assertEqual(self._counts(ticket), self._closed())
+		values = frappe.db.get_value("HD Ticket", ticket, ["status_category", "modified_by"], as_dict=True)
+		self.assertEqual((values.status_category, values.modified_by), ("Resolved", AGENT_USER))
+		(notice_name,) = set(self._bot_messages(ticket)) - set(old_message)
+		notice = frappe.get_doc("Communication", notice_name)
+		notice_text = lifecycle.NOTICE_SILENT_CLOSE.format(ticket=ticket, days=DAYS)
+		self.assertEqual((notice.recipients, notice.owner), (requester, AGENT_USER))
+		self.assertIn(notice_text, notice.content)
+		content = lifecycle.COMMENT_SILENT_CLOSED.format(days=DAYS)
+		(comment,) = self._comments(ticket)
+		self.assertEqual((comment.owner, comment.content), (AGENT_USER, content))
+		(row,) = self._rows(ticket)
+		self.assertEqual((row.trigger, row.cost_usd), ("scheduled_job", 0))
+		self.assertEqual(
+			row.actions,
+			[
+				{
+					"tool": "requester_notice",
+					"doctype": "Communication",
+					"name": notice_name,
+					"ok": True,
+					"value_before": None,
+					"value_after": {"content": notice_text},
+					"instructor": None,
+				},
+				{
+					"tool": "close_silent_f",
+					"doctype": "HD Ticket",
+					"name": ticket,
+					"ok": True,
+					"value_before": {"status": "Open"},
+					"value_after": {"status": "Closed"},
+					"instructor": None,
+				},
+				{
+					"tool": "lifecycle_comment",
+					"doctype": "Comment",
+					"name": comment.name,
+					"ok": True,
+					"value_before": None,
+					"value_after": {"content": content},
+					"instructor": None,
+				},
+			],
+		)
+
+	def test_reply_on_day2_not_closed(self):
+		ticket = self._silent_f()
+		self._requester_message(ticket, DAY0 + timedelta(days=2))
+
+		self._scan(DAY0 + timedelta(days=DAYS, hours=1))
+
+		self.assertEqual(self._counts(ticket), self._untouched())
+
+	def test_board_f_not_closed(self):
+		ticket = self._silent_f(origin=BOARD_VALUE)
+
+		self._scan(DAY0 + timedelta(days=DAYS, hours=1))
+
+		self.assertEqual(self._counts(ticket), self._untouched())
+
+	def test_category_e_not_closed(self):
+		ticket = self._silent_f(category="E")
+
+		self._scan(DAY0 + timedelta(days=DAYS, hours=1))
+
+		self.assertEqual(self._counts(ticket), self._untouched())
+
+	def test_category_c_not_closed(self):
+		ticket = self._silent_f(category="C")
+
+		self._scan(DAY0 + timedelta(days=DAYS, hours=1))
+
+		self.assertEqual(self._counts(ticket), self._untouched())
+
+	def test_f_never_replied_not_closed(self):
+		"""The clock starts only at a bot message: the requester's own opening email never starts it."""
+		ticket = self._ticket(category="F")
+		self._requester_message(ticket, DAY0)
+
+		self._scan(DAY0 + timedelta(days=DAYS * 3))
+
+		self.assertEqual(self._counts(ticket), self._untouched(bot_messages=0))
+
+	def test_notice_failure_not_closed(self):
+		"""A-U6b-7: no notice, no close; one requester_notice entry ok=False; the next scan tries again."""
+		ticket = self._silent_f()
+		now = DAY0 + timedelta(days=DAYS, hours=1)
+
+		with patch.object(
+			HDTicket, "reply_via_agent", side_effect=frappe.OutgoingEmailError("ERPAI-TEST no account")
+		):
+			self._scan(now)
+
+		self.assertEqual(self._counts(ticket), {**self._untouched(), "rows": 1})
+		(row,) = self._rows(ticket)
+		(entry,) = row.actions
+		self.assertEqual(
+			(entry["tool"], entry["doctype"], entry["name"], entry["ok"]),
+			("requester_notice", "Communication", None, False),
+		)
+		self.assertIn("OutgoingEmailError", entry["reason"])
+		self.assertEqual(self._error_logs(ticket), 0)
+
+		self._scan(now)
+
+		self.assertEqual(self._counts(ticket), {**self._closed(), "rows": 2})
+
+	def test_requester_reply_resets_clock(self):
+		"""Design 8: bot day 0, requester day 2, scan day 4: open; bot again day 4, scan day 7: closed."""
+		ticket = self._silent_f()
+		self._requester_message(ticket, DAY0 + timedelta(days=2))
+
+		self._scan(DAY0 + timedelta(days=4))
+		self.assertEqual(self._counts(ticket), self._untouched())
+
+		self._bot_message(ticket, DAY0 + timedelta(days=4))
+		self._scan(DAY0 + timedelta(days=7))
+		self.assertEqual(self._counts(ticket), {**self._closed(), "bot messages": 3})
+
+	def test_two_runs_same_now_one_close(self):
+		"""ADR-033 Ràng buộc (X-3): two scans at the same simulated time: 0 email, comment or row more."""
+		ticket = self._silent_f()
+		now = DAY0 + timedelta(days=DAYS, hours=1)
+
+		self._scan(now)
+		self.assertEqual(self._counts(ticket), self._closed())
+		self._scan(now)
+		self.assertEqual(self._counts(ticket), self._closed())
+
+	def test_failure_after_notice_rolls_back_then_once(self):
+		"""ADR-033 Ràng buộc (X-3): a failure at the Closed save undoes the notice too; the next scan does it once.
+
+		It also shows Helpdesk's reply_via_agent does not commit: the savepoint rollback undoes its Communication.
+		"""
+		ticket = self._silent_f()
+		now = DAY0 + timedelta(days=DAYS, hours=1)
+
+		with self._fail_once("save", when=lambda doc: doc.status == "Closed"):
+			self._scan(now)
+
+		self.assertEqual(self._counts(ticket), self._untouched())
+		self.assertEqual(self._error_logs(ticket), 1)
+
+		self._scan(now)
+
+		self.assertEqual(self._counts(ticket), self._closed())
+		self.assertEqual(self._error_logs(ticket), 1)
+
+	def test_failure_on_one_ticket_others_closed(self):
+		tickets = [self._silent_f(), self._silent_f()]
+
+		with self._fail_once("save", when=lambda doc: doc.status == "Closed" and doc.name in tickets):
+			self._scan(DAY0 + timedelta(days=DAYS, hours=1))
+
+		counts = {ticket: self._counts(ticket) for ticket in tickets}
+		failed = [ticket for ticket in tickets if self._error_logs(ticket)]
+		self.assertEqual(len(failed), 1, counts)
+		(closed,) = set(tickets) - set(failed)
+		self.assertEqual(counts[failed[0]], self._untouched())
+		self.assertEqual(counts[closed], self._closed())
+
+	def test_resolved_tickets_not_candidates(self):
+		"""U6b-fixes Sửa 15: the candidate query keeps only tickets not in the Resolved category."""
+		closed = self._silent_f()
+		frappe.db.set_value(
+			"HD Ticket", closed, {"status": "Closed", "status_category": "Resolved"}, update_modified=False
+		)
+		open_ticket = self._silent_f()
+		now = DAY0 + timedelta(days=DAYS, hours=1)
+		mine = {closed, open_ticket}
+
+		candidates = lifecycle._silent_f_candidates(now - timedelta(days=DAYS))
+		self.assertEqual([name for name in candidates if name in mine], [open_ticket])
+
+		with patch.object(lifecycle, "send_to_requester", wraps=lifecycle.send_to_requester) as send:
+			self._scan(now)
+
+		self.assertEqual(
+			[call.args[0] for call in send.call_args_list if call.args[0] in mine], [open_ticket]
+		)
+		self.assertEqual(self._counts(closed), self._untouched(status="Closed"))
+		self.assertEqual(self._counts(open_ticket), self._closed())
 
 
 class TestArchitecture(FrappeTestCase):

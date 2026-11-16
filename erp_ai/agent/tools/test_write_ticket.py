@@ -1,6 +1,9 @@
+import ast
+import dataclasses
 import itertools
 import json
 import re
+from pathlib import Path
 from unittest.mock import MagicMock, call, patch
 
 import frappe
@@ -9,7 +12,7 @@ from frappe.tests.utils import FrappeTestCase
 from frappe.utils import escape_html, get_datetime, now_datetime
 from helpdesk.test_utils import create_agent, make_ticket
 
-from erp_ai.agent import policy, site_facts
+from erp_ai.agent import ops_data, policy, site_facts
 from erp_ai.agent.classification import Classification
 from erp_ai.agent.routing import decide_route
 from erp_ai.agent.run_log import write_entry
@@ -2070,3 +2073,253 @@ class TestCollector(FrappeTestCase):
 
 		self.assertIn(self.run_id, frappe.flags.erp_ai_work_only_runs)
 		self.assertFalse(write_ticket.collecting(self.run_id))
+
+
+T169_PREFIX = "ERPAI-TEST-T169"
+BA_NOTE = (
+	f"**Mục tiêu:** {T169_PREFIX} theo dõi giờ làm của từng việc\n"
+	"**Phạm vi:** việc của phiếu đầu mục C, không đụng bảng chấm công\n"
+	"**Tính năng sẵn có:** Có, ERPNext có trường ước lượng giờ trên việc\n"
+	"**Nguồn:** erpnext/projects/doctype/task/task.json\n"
+	"**Rủi ro:** người dùng nhầm giờ ước lượng với giờ thực\n"
+	"**Câu hỏi mở:** có cần báo cáo tổng giờ theo tuần không?\n"
+	"Độ tin cậy: 80%"
+)
+LEVEL_FUNCTIONS = ("main_path_level", "category_level_cap", "effective_level")
+
+
+class TestBaNote(TicketCommentCase):
+	"""AC-62 (U4b-fixes Fix 3, w1.md:121): post_comment kind=ba_note, the five parts, once per ticket, only on a
+	category C ticket whose main-path level (from the context) is L1 or more."""
+
+	def _classify_row(self, category, ticket=None, pct=90):
+		frappe.set_user("Administrator")
+		write_entry(
+			ticket=ticket or self.ticket,
+			run_id=f"{T169_PREFIX}-classify",
+			entry_type="classify",
+			trigger="ticket_insert",
+			turn=0,
+			predicted_category=category,
+			predicted_confidence_pct=pct,
+		)
+		frappe.set_user(AGENT_USER)
+
+	def _c_ticket(self):
+		frappe.set_user("Administrator")
+		ticket = make_ticket(subject=f"{T169_PREFIX} phiếu", raised_by=CUSTOMER).name
+		self._classify_row("C", ticket)
+		return ticket
+
+	def _ctx(self, ticket=None, **fields):
+		run_id = f"{T169_PREFIX}-{frappe.generate_hash(length=10)}"
+		self.addCleanup(lambda: frappe.flags.get("erp_ai_asked_runs", set()).discard(run_id))
+		context = ToolContext(
+			ticket_name=ticket or self.ticket,
+			effective_level="L1",
+			instructor=None,
+			run_id=run_id,
+			category_mapping={},
+			agent_user=AGENT_USER,
+		)
+		return dataclasses.replace(context, **fields)
+
+	def _note(self, content=BA_NOTE, ctx=None):
+		return write_ticket.post_comment_tool({"kind": "ba_note", "content": content}, ctx or self._ctx())
+
+	def _refused(self, reason):
+		return {"ok": False, "reason": reason}
+
+	def test_full_note_posted_with_marker(self):
+		self._classify_row("C")
+		self.assertEqual(write_ticket.COMMENT_KINDS, ("de_xuat", "hoi", "ba_note"))
+		self.assertIs(write_ticket.BA_NOTE_MARKER, ops_data.BA_NOTE_MARKER)
+
+		result = self._note()
+
+		self.assertTrue(result["ok"], result)
+		self.assertEqual(self._comments(), [f"{ops_data.BA_NOTE_MARKER}\n{BA_NOTE}"])
+		self.assertEqual(frappe.db.get_value("Comment", result["comment"], "owner"), AGENT_USER)
+		with self.subTest("the model wrote the marker: posted once"):
+			ticket = self._c_ticket()
+			result = self._note(f"{ops_data.BA_NOTE_MARKER}\n{BA_NOTE}", self._ctx(ticket))
+			self.assertTrue(result["ok"], result)
+			self.assertEqual(self._comments(ticket), [f"{ops_data.BA_NOTE_MARKER}\n{BA_NOTE}"])
+		with self.subTest("the source on the feature line"):
+			ticket = self._c_ticket()
+			inline = BA_NOTE.replace(
+				"**Tính năng sẵn có:** Có, ERPNext có trường ước lượng giờ trên việc\n"
+				"**Nguồn:** erpnext/projects/doctype/task/task.json\n",
+				"**Tính năng sẵn có:** Không. Nguồn: search_source 'expected_time' trong erp_ai\n",
+			)
+			self.assertNotEqual(inline, BA_NOTE)
+			self.assertTrue(self._note(inline, self._ctx(ticket))["ok"])
+			self.assertEqual(self._comments(ticket), [f"{ops_data.BA_NOTE_MARKER}\n{inline}"])
+		with patch.object(registry, "_all_specs", lambda: write_ticket.TOOLS):
+			ticket = self._c_ticket()
+			result = execute_tool("post_comment", {"kind": "ba_note", "content": BA_NOTE}, self._ctx(ticket))
+		self.assertTrue(result["ok"], result)
+
+	def test_missing_or_empty_section_refused(self):
+		self._classify_row("C")
+		lines = BA_NOTE.split("\n")
+		missing = write_ticket.REASON_BA_NOTE_MISSING
+		cases = {
+			"no Mục tiêu": ("\n".join(lines[:0] + lines[1:]), missing.format(sections="Mục tiêu")),
+			"no Phạm vi": ("\n".join(lines[:1] + lines[2:]), missing.format(sections="Phạm vi")),
+			"no Tính năng sẵn có": (
+				"\n".join(lines[:2] + lines[4:]),
+				missing.format(sections="Tính năng sẵn có"),
+			),
+			"no Rủi ro": ("\n".join(lines[:4] + lines[5:]), missing.format(sections="Rủi ro")),
+			"no Câu hỏi mở": ("\n".join(lines[:5] + lines[6:]), missing.format(sections="Câu hỏi mở")),
+			"empty Rủi ro": (
+				BA_NOTE.replace("**Rủi ro:** người dùng nhầm giờ ước lượng với giờ thực", "**Rủi ro:**  "),
+				missing.format(sections="Rủi ro"),
+			),
+			"empty Mục tiêu and Câu hỏi mở": (
+				BA_NOTE.replace(f"{T169_PREFIX} theo dõi giờ làm của từng việc", "").replace(
+					"có cần báo cáo tổng giờ theo tuần không?\n", "\n**Ghi chú:** x\n"
+				),
+				missing.format(sections="Mục tiêu, Câu hỏi mở"),
+			),
+			"feature neither Có nor Không": (
+				BA_NOTE.replace("**Tính năng sẵn có:** Có,", "**Tính năng sẵn có:** Chưa rõ,"),
+				write_ticket.REASON_BA_NOTE_FEATURE,
+			),
+			"feature without a source": (
+				BA_NOTE.replace("**Nguồn:** erpnext/projects/doctype/task/task.json\n", ""),
+				write_ticket.REASON_BA_NOTE_FEATURE,
+			),
+			"feature with an empty source": (
+				BA_NOTE.replace("**Nguồn:** erpnext/projects/doctype/task/task.json", "**Nguồn:**"),
+				write_ticket.REASON_BA_NOTE_FEATURE,
+			),
+			"no confidence line": (
+				BA_NOTE.replace("\nĐộ tin cậy: 80%", ""),
+				write_ticket.REASON_NO_CONFIDENCE,
+			),
+		}
+		for case, (content, reason) in cases.items():
+			with self.subTest(case):
+				self.assertNotEqual(content, BA_NOTE)
+				self.assertEqual(self._note(content), self._refused(reason))
+		self.assertEqual(self._comments(), [])
+
+	def test_second_note_refused(self):
+		self._classify_row("C")
+		marker = ops_data.BA_NOTE_MARKER
+		# Rows that are no BA note of the bot: a person's note, the agent's Info row, the marker not at position 0.
+		frappe.set_user("Administrator")
+		self.assertTrue(write_ticket._post(self.ticket, f"{marker}\nngười viết")["ok"])
+		frappe.set_user(AGENT_USER)
+		frappe.get_doc("HD Ticket", self.ticket).add_comment("Info", f"{marker}\nthông tin")
+		self.assertTrue(write_ticket._post(self.ticket, f"Đề xuất của bot\n{marker}")["ok"])
+		before = self._comments()
+		filters = {
+			"reference_doctype": "HD Ticket",
+			"reference_name": self.ticket,
+			"comment_type": "Comment",
+			"owner": AGENT_USER,
+			"content": ["like", f"{marker}%"],
+		}
+
+		with patch.object(write_ticket, "locked_count", wraps=write_ticket.locked_count) as counted:
+			first = self._note()
+		self.assertTrue(first["ok"], first)
+		counted.assert_called_once_with(self.ticket, "Comment", filters)
+		second = self._note(BA_NOTE.replace("80%", "85%"), self._ctx())
+
+		self.assertEqual(second, self._refused(write_ticket.REASON_BA_NOTE_EXISTS))
+		self.assertEqual(self._comments(), [*before, f"{marker}\n{BA_NOTE}"])
+
+	def test_not_c_or_main_path_l0_refused(self):
+		not_c = self._refused(write_ticket.REASON_BA_NOTE_NOT_C)
+		with self.subTest("no classification yet"):
+			self.assertEqual(self._note(), not_c)
+		self._classify_row("A")
+		with self.subTest("category A"):
+			self.assertEqual(self._note(), not_c)
+		ticket = self._c_ticket()
+		with self.subTest("category C, main-path level L0"):
+			self.assertEqual(self._note(ctx=self._ctx(ticket, main_path_level="L0")), not_c)
+		with self.subTest("category C, level L0"):
+			self.assertEqual(self._note(ctx=self._ctx(ticket, effective_level="L0")), not_c)
+		self.assertEqual(self._comments(), [])
+		self.assertEqual(self._comments(ticket), [])
+		with self.subTest("category C at L1 to L3"):
+			for level in ("L1", "L2", "L3"):
+				ticket = self._c_ticket()
+				self.assertTrue(self._note(ctx=self._ctx(ticket, main_path_level=level))["ok"], level)
+
+	def test_gate_reads_context_level_not_settings(self):
+		# W-3: the level comes from the context the runner built; no level function runs, no level field is read.
+		self._classify_row("C")
+		guards = [
+			patch.object(policy, name, side_effect=AssertionError(f"{name} called"))
+			for name in LEVEL_FUNCTIONS
+		]
+		for guard in guards:
+			guard.start()
+			self.addCleanup(guard.stop)
+		set_agent_settings(permission_level="L3", level_cap_c="L3")
+		self.assertEqual(
+			self._note(ctx=self._ctx(main_path_level="L0")), self._refused(write_ticket.REASON_BA_NOTE_NOT_C)
+		)
+		set_agent_settings(level_cap_c="L0")
+		result = self._note(ctx=self._ctx(main_path_level="L1"))
+		self.assertTrue(result["ok"], result)
+		self.assertEqual(self._comments(), [f"{ops_data.BA_NOTE_MARKER}\n{BA_NOTE}"])
+
+	def test_below_threshold_only_question(self):
+		# AC-62 "69% → chỉ câu hỏi": below the threshold step (2) refuses the note; only the open question goes out.
+		self._classify_row("C", pct=69)
+		set_agent_settings(confidence_threshold=70)
+		ctx = self._ctx(below_threshold=True)
+
+		self.assertEqual(self._note(ctx=ctx), self._refused(write_ticket.REASON_ASK_ONLY))
+		self.assertEqual(self._comments(), [])
+		question = f"**Câu hỏi mở:** có cần báo cáo tổng giờ theo tuần không?\n{EVIDENCE}"
+		asked = write_ticket.post_comment_tool({"kind": "hoi", "content": question}, ctx)
+
+		self.assertTrue(asked["ok"], asked)
+		(posted,) = self._comments()
+		self.assertTrue(posted.startswith(question), posted)
+		self.assertNotIn(ops_data.BA_NOTE_MARKER, posted)
+
+	def test_ba_note_not_counted_as_guidance(self):
+		# w1.md:121, A3-9: in a guidance run the note is posted on its own, never held, never a guidance comment.
+		self._classify_row("C")
+		ctx = self._ctx()
+		write_ticket.open_collector(ctx.run_id)
+		self.addCleanup(write_ticket.close_collector, ctx.run_id)
+
+		result = self._note(ctx=ctx)
+
+		self.assertTrue(result["ok"], result)
+		self.assertNotIn("held", result)
+		self.assertEqual(self._comments(), [f"{ops_data.BA_NOTE_MARKER}\n{BA_NOTE}"])
+		self.assertEqual(
+			write_ticket.collected(ctx.run_id),
+			(None, {section: [] for section in write_ticket.GUIDANCE_SECTIONS}),
+		)
+		self.assertEqual(write_ticket.count_guidance(self.ticket), 0)
+
+
+class TestLevelNotRecomputed(FrappeTestCase):
+	"""W-3 (U4b-fixes Fix 3): no tool module calls a level function; the runner computes the level once."""
+
+	def test_no_level_function_called_in_tools(self):
+		tools_dir = Path(write_ticket.__file__).parent
+		files = sorted(path for path in tools_dir.glob("*.py") if not path.name.startswith("test_"))
+		self.assertIn(Path(write_ticket.__file__), files)
+		calls = []
+		for path in files:
+			for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+				if not isinstance(node, ast.Call):
+					continue
+				func = node.func
+				name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", None)
+				if name in LEVEL_FUNCTIONS:
+					calls.append(f"{path.name}:{node.lineno} {name}")
+		self.assertEqual(calls, [])

@@ -1259,7 +1259,10 @@ class TestResultIsNotAnInstruction(ResultCommentTestCase):
 		# so the zeros above come from the Info type, not from the setup.
 		frappe.set_user(INSTRUCTOR)
 		human = frappe.get_doc("HD Ticket", self.ticket).add_comment("Comment", content).name
-		self.assertEqual(len(self.agent_runs()), 1)
+		(run,) = self.agent_runs()
 		frappe.set_user("Administrator")
 		self.assertIn(human, {row["name"] for row in authority.fetch_ticket_comments(self.ticket)})
-		self.assertEqual(authority.run_instructor(self.ticket, TRIGGER_COMMENT_MENTION, human), INSTRUCTOR)
+		# CHG-003: the run is started by the copy of that comment in the ticket's conversation
+		copy = run.kwargs["message_name"]
+		self.assertEqual(frappe.db.get_value("ERP AI Message", copy, "source_comment"), human)
+		self.assertEqual(authority.run_instructor(self.ticket, TRIGGER_COMMENT_MENTION, copy), INSTRUCTOR)

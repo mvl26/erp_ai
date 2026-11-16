@@ -2525,6 +2525,12 @@ class TestAnswerInConversation(TicketCommentCase):
 		self.assertEqual(self._messages(), [])
 		self.assertEqual(self._comments(), [])
 
+	def test_blank_answer_is_a_refusal(self):
+		result = self._post("hoi", " \n\t", self._ctx())
+
+		self.assertEqual(result, {"ok": False, "reason": write_ticket.REASON_NO_CONTENT})
+		self.assertEqual(self._messages(), [])
+
 	def test_no_read_on_the_ticket_is_a_refusal(self):
 		with patch.object(Document, "has_permission", return_value=False):
 			result = self._post("hoi", "Máy in nào?", self._ctx())

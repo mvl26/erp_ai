@@ -272,7 +272,9 @@ STATUS_SCRIPT_REQUIRED = (
 	r'TEXT_BOT_LABEL = "Bot"',
 	r'TEXT_CLOSE = "Đóng"',
 	r"Bot có thể không trả lời khi đang tắt, đang ở chế độ chỉ ghi nhận, "
-	r"phiếu không dùng AI hoặc thuộc nhóm loại trừ, hoặc đã hết lượt hôm nay\.",
+	r"phiếu không dùng AI hoặc thuộc nhóm loại trừ, đã hết lượt hôm nay, "
+	r"hoặc đang trả lời tin trước của phiếu này \(khi đó hãy gửi lại sau\)\. "
+	r"Nhận định và hướng xử lý của bot hiện ở phần thông tin của phiếu phía trên\.",
 	r'TEXT_LOAD_FAILED = "Không tải được dữ liệu của khu vực\. Hãy đóng rồi mở lại\."',
 	r"\(docked \? state\.panel\.slotEl : document\.body\)\.appendChild\(el\)",
 	# T12: stale-result guard (design F1 reload).

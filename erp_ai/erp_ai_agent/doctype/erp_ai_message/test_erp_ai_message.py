@@ -46,6 +46,8 @@ class TestERPAIMessage(FrappeTestCase):
 			["section_message", "ticket", "content", "section_source", "run_id", "source_comment"],
 		)
 		self.assertEqual(fields["ticket"]["options"], "HD Ticket")
+		# every read is by ticket: the panel, each run, the weekly KPI
+		self.assertEqual(fields["ticket"].get("search_index"), 1)
 		for name, field in fields.items():
 			self.assertEqual(field.get("read_only"), 1, name)
 		for name in ("ticket", "content"):
@@ -74,8 +76,15 @@ class TestERPAIMessage(FrappeTestCase):
 		with self.assertRaises(frappe.ValidationError):
 			doc.save(ignore_permissions=True)
 
-	def test_ticket_with_messages_can_be_deleted(self):
+	def test_deleting_a_ticket_deletes_its_conversation(self):
+		# The conversation goes with its ticket, as the ticket's comments do; another ticket's stays.
 		ticket = make_ticket()
+		other = make_ticket()
 		add_message(ticket.name, "xin chào", trusted=True)
+		kept = add_message(other.name, "phiếu khác", trusted=True)
+
 		frappe.delete_doc("HD Ticket", ticket.name, ignore_permissions=True)
+
 		self.assertFalse(frappe.db.exists("HD Ticket", ticket.name))
+		self.assertEqual(frappe.db.count(MESSAGE_DOCTYPE, {"ticket": ticket.name}), 0)
+		self.assertTrue(frappe.db.exists(MESSAGE_DOCTYPE, kept))

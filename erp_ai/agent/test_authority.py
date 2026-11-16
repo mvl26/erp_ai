@@ -321,6 +321,26 @@ class TestRunInstructor(AuthorityTestBase):
 		self.assertIsNone(self._mention(other_ticket))
 		self.assertEqual(self._mention(other_ticket, ticket=self.ticket_q), INSTRUCTOR)
 
+	def _copy(self, ticket, author, comment):
+		"""The copy of comment `comment` in the ticket's conversation, made in `author`'s session."""
+		previous = frappe.session.user
+		frappe.set_user(author)
+		try:
+			with patch.object(frappe, "enqueue"):
+				return messages.add_message(ticket, "x", source_comment=comment, trusted=True)
+		finally:
+			frappe.set_user(previous)
+
+	def test_copy_of_a_comment_lends_only_the_authority_of_who_wrote_the_comment(self):
+		written = self._comment(self.ticket_p, INSTRUCTOR, "2024-01-01 10:00:00")
+		self.assertEqual(self._mention(self._copy(self.ticket_p, INSTRUCTOR, written)), INSTRUCTOR)
+
+		# Helpdesk's ticket merge re-inserts old comments in the merger's session and restores their owner
+		# afterwards: the copy is then owned by the merger, who did not write the comment
+		others = self._comment(self.ticket_p, PLAIN, "2024-01-02 10:00:00")
+		self.assertIsNone(self._mention(self._copy(self.ticket_p, INSTRUCTOR, others)))
+		self.assertIsNone(self._mention(self._copy(self.ticket_p, INSTRUCTOR, "no-such-comment")))
+
 	def test_other_trigger_uses_valid_owner_only(self):
 		plain_message = self._message(self.ticket_p, PLAIN, "2024-01-01 10:00:00")
 		instructor_message = self._message(self.ticket_p, INSTRUCTOR, "2024-01-02 10:00:00")

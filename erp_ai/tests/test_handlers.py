@@ -349,6 +349,17 @@ class TestCommentHandler(HandlerTestCase):
 		messages.add_message(excluded.name, "xem giúp", trusted=True)
 		self.assertEqual(self._jobs(), [])
 
+	def test_mention_with_no_text_left_is_skipped_and_the_comment_is_saved(self):
+		ticket = self._ticket_without_job()
+
+		# the keyword sat only inside markup: nothing is left to say once the markup is gone
+		with patch.object(handlers, "html_to_plain_text", return_value=" \n"):
+			comment = self._comment(ticket.name, f"{KEYWORD} xem giúp")
+
+		self.assertTrue(frappe.db.exists("Comment", comment.name))
+		self.assertEqual(self._messages(ticket.name), [])
+		self.assertEqual(self._jobs(), [])
+
 	def test_comment_without_keyword_no_job(self):
 		ticket = self._ticket_without_job()
 

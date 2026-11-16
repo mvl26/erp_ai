@@ -31,7 +31,7 @@
    "label": "Tuần và lúc tính"
   },
   {
-   "description": "Thứ Hai 00:00 của tuần ISO được tính. Khóa chu kỳ: mỗi tuần một dòng, tên dòng là KPI-<ngày này>. Job KPI tuần ghi dòng lúc 08:00 thứ Hai cho tuần trước.",
+   "description": "Thứ Hai 00:00 của tuần ISO được tính. Khóa chu kỳ: mỗi tuần một dòng, tên dòng là KPI-<ngày này>. Job KPI tuần chạy lúc 08:00 thứ Hai, ghi dòng cho tuần trước và bù các tuần liền trước còn thiếu dòng, tối đa 8 tuần mỗi lần chạy (kể cả tuần trước).",
    "fieldname": "week_start",
    "fieldtype": "Date",
    "in_list_view": 1,
@@ -58,19 +58,19 @@
    "label": "Sáu KPI của tuần"
   },
   {
-   "description": "KPI 1. Trung vị số phút từ lúc tạo tới phản hồi đầu tiên, trên các phiếu tạo trong tuần đã có phản hồi. Rỗng khi mẫu 0.",
+   "description": "KPI 1. Trung vị số phút từ lúc tạo tới phản hồi đầu tiên, trên các phiếu tạo trong tuần đã có phản hồi. Rỗng khi không phiếu nào tạo trong tuần có phản hồi, kể cả khi mẫu 0.",
    "fieldname": "first_response_median_min",
    "fieldtype": "Float",
    "label": "Phản hồi đầu tiên: trung vị (phút)"
   },
   {
-   "description": "KPI 1. Tỷ lệ phiếu có phản hồi đầu tiên trong 15 phút, trên mọi phiếu tạo trong tuần; phiếu chưa phản hồi tính là không đạt. Rỗng khi mẫu 0.",
+   "description": "KPI 1. Tỷ lệ phiếu có phản hồi đầu tiên trong 15 phút, trên mọi phiếu tạo trong tuần; phiếu chưa phản hồi tính là không đạt. Rỗng khi tuần không có phiếu.",
    "fieldname": "first_response_within_15_pct",
    "fieldtype": "Percent",
    "label": "Phản hồi trong 15 phút (%)"
   },
   {
-   "description": "KPI 1. Tỷ lệ phiếu có phản hồi đầu tiên trong 5 phút, trên mọi phiếu tạo trong tuần; phiếu chưa phản hồi tính là không đạt. Rỗng khi mẫu 0.",
+   "description": "KPI 1. Tỷ lệ phiếu có phản hồi đầu tiên trong 5 phút, trên mọi phiếu tạo trong tuần; phiếu chưa phản hồi tính là không đạt. Rỗng khi tuần không có phiếu.",
    "fieldname": "first_response_within_5_pct",
    "fieldtype": "Percent",
    "label": "Phản hồi trong 5 phút (%)"
@@ -143,7 +143,7 @@
   }
  ],
  "links": [],
- "modified": "2026-11-15 10:00:00.000000",
+ "modified": "2026-11-15 12:00:00.000000",
  "modified_by": "Administrator",
  "module": "ERP AI agent",
  "name": "ERP AI KPI Week",

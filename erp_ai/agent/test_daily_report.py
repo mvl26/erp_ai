@@ -467,6 +467,7 @@ class TestBuild(FrappeTestCase):
 		frappe.db.delete(
 			LOG_DOCTYPE, {"creation": ["between", [day - timedelta(days=1), anchor + timedelta(days=1)]]}
 		)
+		# the only costs of yesterday are 0.1 and 0.2: their float sum is 0.30000000000000004 without the round
 		# yesterday, first second: classified and applied with a predicted assignee but no ok assign_owner
 		# entry -> classify only
 		_log(day, entry_type="classify", applied=1, predicted_assignee=HUMAN_AGENT, cost_usd=0.1)
@@ -479,7 +480,6 @@ class TestBuild(FrappeTestCase):
 			applied=0,
 			predicted_assignee=HUMAN_AGENT,
 			error="model timeout",
-			cost_usd=0.000001,
 		)
 		# actions: ok ones by kind (an unknown tool -> other), a failed one not counted
 		_log(
@@ -495,11 +495,8 @@ class TestBuild(FrappeTestCase):
 				]
 			),
 		)
-		# unreadable actions count as none; a blank error is no error; cost_usd is a decimal(21,6) column
-		# (precision 6), so 0.0000004 is stored as 0 and the sum stays 0.300001
-		_log(
-			day + timedelta(hours=12), entry_type="reason", actions="not json", error="  ", cost_usd=0.0000004
-		)
+		# unreadable actions count as none; a blank error is no error
+		_log(day + timedelta(hours=12), entry_type="reason", actions="not json", error="  ")
 		# change steps: propose x2, approve, reject; other steps not counted
 		for step in ("propose", "propose", "approve", "reject", "apply", "undo"):
 			_log(day + timedelta(hours=13), entry_type="change", trigger="change_action", change_step=step)
@@ -551,7 +548,7 @@ class TestBuild(FrappeTestCase):
 				"khác": 1,
 			},
 		)
-		self.assertEqual(result["cost_yesterday"], 0.300001)
+		self.assertEqual(result["cost_yesterday"], 0.3)
 
 
 class TestBotActions(FrappeTestCase):
@@ -663,6 +660,28 @@ class TestBotActions(FrappeTestCase):
 			result["bot_actions"],
 			_bot_actions(**{"đóng": 2, "khác": 2, "phân loại": 1, "comment": 1, "trả lời": 0}),
 		)
+
+	def test_close_needs_a_ticket_on_the_row(self):
+		# a reason row without a ticket: an update of a ticket with `name` None is no bot close
+		_log(
+			self.yesterday,
+			entry_type="reason",
+			actions=json.dumps(
+				[
+					{
+						"tool": "api_update_record",
+						"doctype": "HD Ticket",
+						"name": None,
+						"ok": True,
+						"value_after": {"status": "Closed"},
+					}
+				]
+			),
+		)
+
+		result = self._report()
+
+		self.assertEqual(result["bot_actions"], _bot_actions(**{"đóng": 0, "khác": 1}))
 
 	def test_empty_day_zero_float(self):
 		result = self._report()

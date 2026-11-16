@@ -192,6 +192,53 @@ class TestRunForTicketCommentName(FrappeTestCase):
 		self.assertEqual(run.call_args_list[1].args, ("TKT-2", TRIGGER_TICKET_INSERT, None))
 
 
+class TestEnqueueLifecycleJob(FrappeTestCase):
+	# U6b.md:135, U6b-fixes Sửa 5 (AC-43): the sixth enqueue target, one job per ticket, the shared pending claim.
+	def setUp(self):
+		frappe.flags.pop("erp_ai_pending_job_ids", None)
+
+	def tearDown(self):
+		frappe.flags.pop("erp_ai_pending_job_ids", None)
+
+	def test_job_id_dedupe_and_target(self):
+		self.assertEqual(getattr(queue, "LIFECYCLE_JOB_TIMEOUT_S", None), 300)
+		enqueue_job = getattr(queue, "enqueue_lifecycle_job", None)
+		self.assertTrue(callable(enqueue_job), "queue.enqueue_lifecycle_job is missing")
+		with patch("frappe.enqueue") as enqueue:
+			self.assertTrue(enqueue_job("TKT-1"))
+			# Two events of one ticket in one transaction are one job; another ticket has its own.
+			self.assertFalse(enqueue_job("TKT-1"))
+			self.assertTrue(enqueue_job("TKT-2"))
+
+		self.assertEqual(enqueue.call_count, 2)
+		enqueue.assert_any_call(
+			"erp_ai.agent.lifecycle.run_task_lifecycle",
+			queue="default",
+			timeout=300,
+			enqueue_after_commit=True,
+			job_id="erp_ai_lifecycle::TKT-1",
+			deduplicate=True,
+			ticket_name="TKT-1",
+		)
+		self.assertEqual(enqueue.call_args.kwargs["job_id"], "erp_ai_lifecycle::TKT-2")
+		self.assertTrue(callable(frappe.get_attr("erp_ai.agent.lifecycle.run_task_lifecycle")))
+		# The claim is released with the transaction, so the next transaction queues again.
+		frappe.db.after_commit.run()
+		with patch("frappe.enqueue") as enqueue:
+			self.assertTrue(enqueue_job("TKT-1"))
+		enqueue.assert_called_once()
+
+	def test_rejects_bad_ticket_name(self):
+		enqueue_job = getattr(queue, "enqueue_lifecycle_job", None)
+		self.assertTrue(callable(enqueue_job), "queue.enqueue_lifecycle_job is missing")
+		for ticket_name in ("", None, 17, b"TKT-1"):
+			with self.subTest(ticket_name=ticket_name), patch("frappe.enqueue") as enqueue:
+				with self.assertRaisesRegex(ValueError, "ticket_name"):
+					enqueue_job(ticket_name)
+				enqueue.assert_not_called()
+		self.assertFalse(frappe.flags.get("erp_ai_pending_job_ids"))
+
+
 class TestEnqueueChangeJob(FrappeTestCase):
 	def test_enqueue_change_job_shape(self):
 		for action in ("apply", "undo"):

@@ -6,7 +6,7 @@ import frappe
 from frappe.tests.utils import FrappeTestCase
 from helpdesk.test_utils import make_ticket
 
-from erp_ai.constants import ROLE_INSTRUCTOR
+from erp_ai.constants import AGENT_USER, ROLE_INSTRUCTOR
 from erp_ai.test_utils import keep_agent_settings
 
 REVIEW_MONTH = "ERP AI Review Month"
@@ -20,6 +20,10 @@ MANAGER_USER = "erp-ai-review-manager@example.com"
 RIGHTS = ("read", "write", "create", "delete", "submit", "cancel", "amend", "report", "export", "import")
 # design.md:272: read and write; nobody creates or deletes (the job runs as Administrator).
 GRANTED = {"System Manager": {"read", "write"}, ROLE_INSTRUCTOR: {"read", "write"}}
+CONTROLLER_PATH = Path(__file__).resolve().parent / "erp_ai_review_month.py"
+GUARDED_HOOKS = ("before_insert", "validate", "on_trash", "before_rename")
+HOOK_ARGUMENTS = {"before_rename": ("old-name", "new-name", False)}
+REFUSAL = "Tài khoản agent không được ghi"
 LOCKED_MESSAGE = "Không được đổi danh sách phiếu của kỳ rà soát"
 
 
@@ -178,3 +182,41 @@ class TestReviewMonthAgentGuard(ReviewMonthTestCase):
 		doc.items[1].verdict = "Sai"
 		doc.save()
 		self.assertEqual(frappe.get_doc(REVIEW_MONTH, doc.name).items[1].verdict, "Sai")
+
+	def test_every_guarded_hook_refuses_agent(self):
+		doc = _new_month(_tickets(2)).insert()
+		# The ticket list is changed too: the refusal must come before the lock check.
+		doc.items.pop()
+		frappe.set_user(AGENT_USER)
+		for hook in GUARDED_HOOKS:
+			with self.subTest(hook=hook):
+				with self.assertRaisesRegex(frappe.PermissionError, REFUSAL):
+					doc.run_method(hook, *HOOK_ARGUMENTS.get(hook, ()))
+		source = CONTROLLER_PATH.read_text(encoding="utf-8")
+		self.assertEqual(source.count("refuse_agent_write(self)"), len(GUARDED_HOOKS))
+		self.assertNotIn("allow_agent_write", source)
+
+	def test_agent_insert_save_delete_refused(self):
+		doc = _new_month(_tickets(2)).insert()
+		frappe.set_user(AGENT_USER)
+		paths = {
+			"insert": lambda: _new_month(_tickets(1), month=NEXT_MONTH).insert(ignore_permissions=True),
+			"save": lambda: _set_verdict(doc.name),
+			"delete": lambda: frappe.delete_doc(REVIEW_MONTH, doc.name, ignore_permissions=True),
+		}
+		for path, write in paths.items():
+			with self.subTest(path=path):
+				frappe.db.savepoint("erp_ai_review_month_guard")
+				with self.assertRaisesRegex(frappe.PermissionError, REFUSAL):
+					write()
+				frappe.db.rollback(save_point="erp_ai_review_month_guard")
+		frappe.set_user("Administrator")
+		self.assertTrue(frappe.db.exists(REVIEW_MONTH, doc.name))
+		self.assertFalse(frappe.db.exists(REVIEW_MONTH, f"REV-{NEXT_MONTH}"))
+		self.assertEqual(frappe.get_doc(REVIEW_MONTH, doc.name).items[0].verdict, None)
+
+
+def _set_verdict(name: str) -> None:
+	doc = frappe.get_doc(REVIEW_MONTH, name)
+	doc.items[0].verdict = "Đúng"
+	doc.save(ignore_permissions=True)

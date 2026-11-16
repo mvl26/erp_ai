@@ -5,11 +5,15 @@ from pathlib import Path
 import frappe
 from frappe.tests.utils import FrappeTestCase
 
-from erp_ai.constants import ROLE_INSTRUCTOR
+from erp_ai.constants import AGENT_USER, ROLE_INSTRUCTOR
 from erp_ai.test_utils import keep_agent_settings
 
 KPI_WEEK_DOCTYPE = "ERP AI KPI Week"
 JSON_PATH = Path(__file__).resolve().parent / "erp_ai_kpi_week.json"
+CONTROLLER_PATH = Path(__file__).resolve().parent / "erp_ai_kpi_week.py"
+GUARDED_HOOKS = ("before_insert", "validate", "on_trash", "before_rename")
+HOOK_ARGUMENTS = {"before_rename": ("old-name", "new-name", False)}
+REFUSAL = "Tài khoản agent không được ghi"
 # Mondays far before any real ticket on the shared site.
 WEEK = date(2001, 1, 1)
 NEXT_WEEK = date(2001, 1, 8)
@@ -160,3 +164,33 @@ class TestKpiWeekAgentGuard(KpiWeekTestCase):
 				"owner": "Administrator",
 			},
 		)
+
+	def test_every_guarded_hook_refuses_agent(self):
+		doc = _new_week().insert()
+		frappe.set_user(AGENT_USER)
+		for hook in GUARDED_HOOKS:
+			with self.subTest(hook=hook):
+				with self.assertRaisesRegex(frappe.PermissionError, REFUSAL):
+					doc.run_method(hook, *HOOK_ARGUMENTS.get(hook, ()))
+		# One refusal per hook and no opening of the guard (INT-2: no new `allow_agent_write()`).
+		source = CONTROLLER_PATH.read_text(encoding="utf-8")
+		self.assertEqual(source.count("refuse_agent_write(self)"), len(GUARDED_HOOKS))
+		self.assertNotIn("allow_agent_write", source)
+
+	def test_agent_insert_save_delete_refused(self):
+		doc = _new_week(first_response_sample=3).insert()
+		frappe.set_user(AGENT_USER)
+		paths = {
+			"insert": lambda: _new_week(NEXT_WEEK).insert(ignore_permissions=True),
+			"save": lambda: frappe.get_doc(KPI_WEEK_DOCTYPE, doc.name).save(ignore_permissions=True),
+			"delete": lambda: frappe.delete_doc(KPI_WEEK_DOCTYPE, doc.name, ignore_permissions=True),
+		}
+		for path, write in paths.items():
+			with self.subTest(path=path):
+				frappe.db.savepoint("erp_ai_kpi_week_guard")
+				with self.assertRaisesRegex(frappe.PermissionError, REFUSAL):
+					write()
+				frappe.db.rollback(save_point="erp_ai_kpi_week_guard")
+		frappe.set_user("Administrator")
+		self.assertEqual(frappe.db.get_value(KPI_WEEK_DOCTYPE, doc.name, "first_response_sample"), 3)
+		self.assertFalse(frappe.db.exists(KPI_WEEK_DOCTYPE, {"week_start": NEXT_WEEK}))

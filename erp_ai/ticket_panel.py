@@ -10,7 +10,7 @@ from frappe.utils import cstr, format_datetime
 from helpdesk.utils import is_agent
 
 from erp_ai.agent import messages
-from erp_ai.constants import AGENT_USER, LOGGER_NAME, MESSAGE_KIND_CHAT, PANEL_MAX_MESSAGE_CHARS
+from erp_ai.constants import AGENT_USER, LOGGER_NAME, PANEL_MAX_MESSAGE_CHARS
 
 TICKET_DOCTYPE = "HD Ticket"
 # The three fields the bot classifies, with the wording its own "Đã làm" line uses for them.
@@ -91,7 +91,7 @@ def get_panel_data(ticket: str) -> dict:
 
 @frappe.whitelist(methods=["POST"])
 def send_message(ticket: str, text: str) -> dict:
-	"""Post the typed text as a chat message on the ticket, owned by the caller (B-6).
+	"""Add the typed text to the ticket's conversation with the bot, owned by the caller (B-6).
 
 	Input: ticket name; text, 1-PANEL_MAX_MESSAGE_CHARS characters after strip().
 	Output: {"message": <ERP AI Message name>}. The text is stored as typed, with no keyword and no markup.
@@ -108,6 +108,6 @@ def send_message(ticket: str, text: str) -> dict:
 	text = text.strip()
 	if len(text) > PANEL_MAX_MESSAGE_CHARS:
 		frappe.throw(_("Tin dài quá {0} ký tự.").format(PANEL_MAX_MESSAGE_CHARS), frappe.ValidationError)
-	name = messages.add_message(ticket, text, MESSAGE_KIND_CHAT, trusted=True)
+	name = messages.add_message(ticket, text, trusted=True)
 	frappe.logger(LOGGER_NAME).info(f"erp_ai panel send ticket={ticket} message={name}")
 	return {"message": name}

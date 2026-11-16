@@ -7,11 +7,9 @@
  "field_order": [
   "section_message",
   "ticket",
-  "kind",
   "content",
   "section_source",
   "run_id",
-  "proposal",
   "source_comment"
  ],
  "fields": [
@@ -27,17 +25,6 @@
    "label": "Phiếu",
    "read_only": 1,
    "options": "HD Ticket",
-   "reqd": 1,
-   "in_list_view": 1,
-   "in_standard_filter": 1
-  },
-  {
-   "description": "Hệ thống tự ghi, không sửa được. Loại tin: chat là lời người hoặc bot nói với nhau, routing là kết quả phân luồng, proposal là đề xuất chờ duyệt, result là kết quả sau khi duyệt.",
-   "fieldname": "kind",
-   "fieldtype": "Select",
-   "label": "Loại",
-   "read_only": 1,
-   "options": "chat\nrouting\nproposal\nresult",
    "reqd": 1,
    "in_list_view": 1,
    "in_standard_filter": 1
@@ -63,14 +50,6 @@
    "read_only": 1
   },
   {
-   "description": "Hệ thống tự ghi, không sửa được. Đề xuất thay đổi liên quan khi tin là đề xuất hoặc kết quả duyệt; rỗng nếu không có.",
-   "fieldname": "proposal",
-   "fieldtype": "Link",
-   "label": "Đề xuất",
-   "read_only": 1,
-   "options": "ERP AI Change Proposal"
-  },
-  {
    "description": "Hệ thống tự ghi, không sửa được. Tên comment @ai trên phiếu mà tin này được chép từ đó; rỗng với tin gửi từ ngăn trao đổi.",
    "fieldname": "source_comment",
    "fieldtype": "Data",
@@ -79,7 +58,7 @@
   }
  ],
  "links": [],
- "modified": "2026-11-16 10:00:00.000000",
+ "modified": "2026-11-16 14:00:00.000000",
  "modified_by": "Administrator",
  "module": "ERP AI agent",
  "name": "ERP AI Message",

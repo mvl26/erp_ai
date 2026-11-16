@@ -6,7 +6,6 @@ from erp_ai.agent.prompts import MAX_COMMENTS
 from erp_ai.constants import (
 	AGENT_USER,
 	MESSAGE_DOCTYPE,
-	MESSAGE_KIND_CHAT,
 	ROLE_INSTRUCTOR,
 	TITLE_WRONG_USER,
 	TRIGGER_COMMENT_MENTION,
@@ -95,8 +94,8 @@ def _assigned_by_other(author: str, ticket_name: str) -> bool:
 def run_instructor(ticket_name: str, trigger: str, message_name: str | None = None) -> str | None:
 	"""ADR-030 QĐ 6: the instructor comes only from the event that queued the run (fail-closed, never raises).
 
-	A comment run reads the author (`owner`, set by the server) of exactly that `chat` message; no other
-	message is scanned. Any other trigger falls back to the ticket owner.
+	A comment run reads the author (`owner`, set by the server) of exactly that message of the conversation; no
+	other message is scanned. Any other trigger falls back to the ticket owner.
 	"""
 	if trigger == TRIGGER_COMMENT_MENTION:
 		author = _trigger_message_author(ticket_name, message_name)
@@ -108,11 +107,7 @@ def run_instructor(ticket_name: str, trigger: str, message_name: str | None = No
 def _trigger_message_author(ticket_name: str, message_name: str | None) -> str | None:
 	if not message_name:
 		return None
-	return frappe.db.get_value(
-		MESSAGE_DOCTYPE,
-		{"name": message_name, "ticket": ticket_name, "kind": MESSAGE_KIND_CHAT},
-		"owner",
-	)
+	return frappe.db.get_value(MESSAGE_DOCTYPE, {"name": message_name, "ticket": ticket_name}, "owner")
 
 
 def label_comments(ticket_name: str, comments: list[dict]) -> list[dict]:

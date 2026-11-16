@@ -12,7 +12,6 @@ from erp_ai.constants import (
 	CLASSIFIED_BY_HUMAN,
 	LOG_DOCTYPE,
 	LOGGER_NAME,
-	MESSAGE_KIND_CHAT,
 	TRIGGER_COMMENT_MENTION,
 	TRIGGER_KB_DRAFT,
 	TRIGGER_REQUESTER_REPLY,
@@ -233,25 +232,20 @@ def comment_after_insert(doc, method=None):
 		_log_decision(ticket, TRIGGER_COMMENT_MENTION, "skipped", skip_reason)
 		return
 	# The copy is the one trigger: its after_insert (message_after_insert) queues the run.
-	messages.add_message(
-		ticket, html_to_plain_text(doc.content), MESSAGE_KIND_CHAT, source_comment=doc.name, trusted=True
-	)
+	messages.add_message(ticket, html_to_plain_text(doc.content), source_comment=doc.name, trusted=True)
 	_log_decision(ticket, TRIGGER_COMMENT_MENTION, "copied", "conditions_met")
 
 
 def message_after_insert(doc, method=None):
-	# Step 0: only a person's `chat` message starts a run; return before any DB read.
-	if doc.kind != MESSAGE_KIND_CHAT:
-		return
-
+	# Only a person's message starts a run; the bot's own reply is told by its owner, before any DB read.
 	ticket = doc.ticket
 	skip_reason = None
 	if doc.owner == AGENT_USER:
 		skip_reason = "written_by_agent"
 	elif not policy.is_enabled():
 		skip_reason = "agent_disabled"
-	elif not policy.can_send_ticket(ticket):
-		skip_reason = "not_sendable"
+	elif refusal := policy.send_refusal(ticket):
+		skip_reason = f"not_sendable:{refusal}"
 
 	if skip_reason:
 		_log_decision(ticket, TRIGGER_COMMENT_MENTION, "skipped", skip_reason)

@@ -283,17 +283,33 @@ def panel_cards(ticket: str) -> list[dict]:
 		decided_by = cstr(row.decided_by)
 		failure_reason = result_comment.masked_reason(row.failure_reason)
 		# values in the order of CARD_KEYS; not a dict literal, which the state-field rule of ADR-012 reads as a write
-		values = (
-			row.name,
-			change_text.proposal_target_text(fields),
-			_card_notes(row.name, fields),
-			row.change_status,
-			row.restart_status or None,
-			change_text.safe_person_name(frappe.utils.get_fullname(decided_by)) if decided_by else None,
-			failure_reason or None,
-			panel_decision_refusal(row.change_status) is None,
-			row.name in readable,
-		)
+		try:
+			values = (
+				row.name,
+				change_text.proposal_target_text(fields),
+				_card_notes(row.name, fields),
+				row.change_status,
+				row.restart_status or None,
+				change_text.safe_person_name(frappe.utils.get_fullname(decided_by)) if decided_by else None,
+				failure_reason or None,
+				panel_decision_refusal(row.change_status) is None,
+				row.name in readable,
+			)
+		except Exception as exc:
+			# One unreadable proposal must not break the panel (AC-11, ADR-009 QĐ 4): a reduced card that cannot be
+			# decided, because its warning says to report to an admin before approving.
+			frappe.logger("erp_ai").warning("erp_ai notes proposal=%s error=%s", row.name, type(exc).__name__)
+			values = (
+				row.name,
+				"",
+				[UNREADABLE_NOTES],
+				row.change_status,
+				row.restart_status or None,
+				None,
+				None,
+				False,
+				row.name in readable,
+			)
 		cards.append(dict(zip(CARD_KEYS, values, strict=True)))
 	return cards
 

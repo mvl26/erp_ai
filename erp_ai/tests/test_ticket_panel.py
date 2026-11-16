@@ -1212,6 +1212,31 @@ class TestPanelProposalCards(FrappeTestCase):
 		self._set(proposal.name, restart_status="Không có trạng thái này")
 		self.assertEqual(self._cards()[0]["notes"], [proposal_form.UNREADABLE_NOTES])
 
+	def test_unreadable_commands_reduce_only_that_card(self):
+		# Final review F-1: one proposal with unreadable stored commands never breaks the panel (AC-11, ADR-009 QĐ 4)
+		good = make_change_proposal(ticket=self.ticket)
+		for bad_commands in ("{", "5"):
+			with self.subTest(command_list=bad_commands):
+				bad = make_change_proposal(ticket=self.ticket)
+				self._set(bad.name, command_list=bad_commands)
+				frappe.set_user(CARD_INSTRUCTOR)
+				try:
+					result = ticket_panel.get_panel_data(self.ticket)
+				finally:
+					frappe.set_user("Administrator")
+				self.assertIn("messages", result)
+				cards = {card["name"]: card for card in result["proposals"]}
+				self.assertEqual(set(cards[bad.name]), set(proposal_form.CARD_KEYS))
+				self.assertEqual(cards[bad.name]["notes"], [proposal_form.UNREADABLE_NOTES])
+				self.assertEqual(cards[bad.name]["target"], "")
+				self.assertEqual(cards[bad.name]["status"], CHANGE_STATUS_PENDING)
+				self.assertIs(cards[bad.name]["can_decide"], False)
+				self.assertIs(cards[bad.name]["can_open"], True)
+				self.assertEqual(set(cards[good.name]), set(proposal_form.CARD_KEYS))
+				self.assertNotEqual(cards[good.name]["notes"], [proposal_form.UNREADABLE_NOTES])
+				self.assertTrue(cards[good.name]["target"])
+				self.assertIs(cards[good.name]["can_decide"], True)
+
 	def test_can_open_loads_no_proposal_document(self):
 		# CHG-008 ruling: the card never reads the forbidden fields, so no proposal document is loaded for can_open
 		for _ in range(3):

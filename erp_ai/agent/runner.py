@@ -43,13 +43,17 @@ from erp_ai.agent.tools.write_ticket import (
 	ASK_FOOTER,
 	CREATED_LABELS_FIELD,
 	FIELD_LABELS,
+	GUIDANCE_SECTIONS,
 	HINT_FIELD,
+	REASON_GUIDANCE_EXISTS,
+	REASON_NO_CONTENT,
 	ROUTE_DONE,
 	SECTION_DECIDE,
 	SECTION_DONE,
 	asked_in_run,
 	close_collector,
 	collect,
+	collected,
 	collecting,
 	count_guidance,
 	created_labels,
@@ -58,6 +62,7 @@ from erp_ai.agent.tools.write_ticket import (
 	mark_asked,
 	mark_work_only,
 	open_collector,
+	post_guidance,
 	post_notice,
 )
 from erp_ai.constants import (
@@ -169,6 +174,8 @@ USAGE_COLUMNS = ("input_tokens", "output_tokens", "cache_creation_input_tokens",
 TICKET_FIELD_SETTINGS = tuple(f"field_{key}" for key in TICKET_FIELD_LABELS)
 # A run on a ticket that already has its guidance comment says so once in the log (AC-65 (c), w1.md:68).
 GUIDANCE_EXISTS_LOG = "erp_ai guidance ticket=%s run_id=%s: đã có hướng xử lý"
+# The action entry of the run's one guidance comment (ADR-036 QĐ 8, w1.md:105).
+GUIDANCE_TOOL = "post_guidance"
 
 
 def run_for_ticket(ticket_name: str, trigger: str, comment_name: str | None = None) -> None:
@@ -652,7 +659,16 @@ def _classify(
 		_choose_mode(context, posted)
 		if not context.below_threshold:
 			status.working("set_classification")
-			_route(log_name, classification, route_decision, context, auto_assign, subject, split_text)
+			_route(
+				log_name,
+				classification,
+				route_decision,
+				context,
+				auto_assign,
+				subject,
+				split_text,
+				collect_run_id=run_id,
+			)
 	summary = {"category": classification.category, "confidence": classification.confidence, **values}
 	return True, summary, context
 
@@ -1096,6 +1112,9 @@ def _reason(
 	`notices` are the entries of notices posted before this step: they go on the first entry written (U4b.md:250).
 	A gateway error posts the run_failed notice on its own entry (U4b.md:251). `started_at` is the run's start: the
 	ask_fallback question counts only the ones posted since, so each run below the threshold asks once (AC-22).
+	The last turn of a guidance run (every exit without error: no tool wanted, no tool result, the last allowed turn)
+	posts the run's one guidance comment before its entry (ADR-036 QĐ 1, AD3-2, R5-16).
+	Returns False when the run stopped on a gateway error, True otherwise.
 	"""
 	pending = list(notices or [])
 	comments = authority.fetch_ticket_comments(ticket_name)
@@ -1167,7 +1186,7 @@ def _reason(
 				keys_tried=exc.keys_tried,
 				actions=[*pending, *([failed] if failed else [])] or None,
 			)
-			return
+			return False
 
 		# after the call, so the gateway key state it wrote survives an undo; not released: the commit of the
 		# `reason` row's `write_entry` ends it (within the turn the runner commits nothing else), and the next
@@ -1187,6 +1206,8 @@ def _reason(
 			if wants_tools and turn == max_turns:
 				stop_reason = STOP_MAX_TURNS
 			final = not wants_tools or not tool_results or turn == max_turns
+			if final and collecting(run_id):
+				_finish_guidance(context, actions)
 			# below the threshold the run asks exactly one question, the model's or this one (AC-22, Fix 9)
 			if final and context.below_threshold and not asked_in_run(run_id):
 				asked = _notice(
@@ -1221,9 +1242,57 @@ def _reason(
 			raise
 		_write_propose_rows(actions, context)
 		if not wants_tools or not tool_results:
-			return
+			return True
 		messages.append({"role": "assistant", "content": result.content})
 		messages.append({"role": "user", "content": tool_results})
+	return True
+
+
+def _finish_guidance(context, actions) -> None:
+	"""The one place the runner calls `post_guidance` (ADR-036 QĐ 1, w1.md:105): inside the last turn, after its tools
+	and before its entry, so the comment is undone with the turn (R5-16). Posted → one action entry with the section
+	counts (QĐ 8). A run in parallel posted the ticket's guidance first → one log line, and the run's collected lines
+	go out as before: one result comment without the marker, in the order of GUIDANCE_SECTIONS, one sentence per line,
+	each escaped once, no section heading (design-w1-fixes-20 Điểm 1.6, AD3-4). Nothing to say → one log line."""
+	ticket, run_id = context.ticket_name, context.run_id
+	result = post_guidance(ticket, run_id)
+	if result.get("ok"):
+		actions.append(
+			action_entry(
+				GUIDANCE_TOOL,
+				"Comment",
+				result["comment"],
+				True,
+				value_after={"counts": result["counts"]},
+				instructor=context.instructor,
+			)
+		)
+		return
+	reason = result.get("reason")
+	if reason == REASON_NO_CONTENT:
+		frappe.logger(LOGGER_NAME).info("erp_ai guidance run_id=%s skipped=no_content", run_id)
+		return
+	if reason != REASON_GUIDANCE_EXISTS:
+		actions.append(
+			action_entry(GUIDANCE_TOOL, "Comment", None, False, reason=reason, instructor=context.instructor)
+		)
+		return
+	frappe.logger(LOGGER_NAME).info(GUIDANCE_EXISTS_LOG, ticket, run_id)
+	sections = collected(run_id)[1]
+	lines = [line for section in GUIDANCE_SECTIONS for line in sections[section]]
+	if not lines:
+		return
+	posted = post_routing_comment([escape_html(line) for line in lines], context)
+	actions.append(
+		_route_action(
+			"post_routing_comment",
+			"Comment",
+			posted.get("comment"),
+			bool(posted.get("ok")),
+			posted.get("reason"),
+			instructor=context.instructor,
+		)
+	)
 
 
 def _ask_fallback_body(run_id, classification, settings) -> str:
@@ -1317,7 +1386,8 @@ def _run_tool(block, context, actions, before, after, tool_errors, skipped):
 			"content": f"Lỗi: {type(exc).__name__}",
 			"is_error": True,
 		}
-	if name in WRITE_TOOL_TARGETS:
+	# a comment held for the run's guidance comment writes nothing now: no entry (ADR-036 QĐ 8, U4b-16 (a))
+	if name in WRITE_TOOL_TARGETS and not outcome.get("held"):
 		actions.append(_action(name, context, outcome, bool(outcome.get("ok")), arguments))
 		_record_snapshot(name, outcome, len(actions), before, after)
 		if outcome.get("ok") and "after" in outcome:

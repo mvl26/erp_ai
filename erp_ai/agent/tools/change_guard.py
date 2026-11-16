@@ -104,6 +104,9 @@ CONSOLE_IMPORT = (
 CONSOLE_CALL = "script không được gọi {name}"
 CONSOLE_ATTR = "script không được dùng .{name}"
 CONSOLE_TEXT = "script không được nhắc tới {text}"
+CONSOLE_DUNDER = "script không được dùng {name}"
+DUNDER_PREFIX = "__"
+DUNDER_ALLOWED = "__name__"
 CONSOLE_IMPORT_ROOTS = ("frappe", "erpnext", "hrms", "helpdesk", "json", "datetime", "decimal", "re", "math")
 CONSOLE_FORBIDDEN_CALLS = (
 	"eval", "exec", "compile", "open", "__import__", "getattr", "setattr", "delattr",
@@ -112,6 +115,7 @@ CONSOLE_FORBIDDEN_CALLS = (
 CONSOLE_FORBIDDEN_ATTRS = (
 	"commit", "rollback", "set_user", "get_password", "get_decrypted_password", "conf",
 	"get_site_config", "environ", "system", "popen", "connect", "destroy",
+	"get_conf", "get_attr", "get_module", "import_module",
 )  # fmt: skip
 CONSOLE_FORBIDDEN_TEXT = ("erp ai", "__auth", "site_config", ".git")
 SHELL_METACHARACTERS = (";", "|", "&", "`", "$(", ">", "<", "\n")
@@ -592,20 +596,45 @@ def _import_root(node) -> list[str]:
 	return [(node.module or "").split(".")[0]]
 
 
+def _imported_names_reason(node) -> str | None:
+	"""The names a `from x import ...` brings in meet the same rules as the attributes and calls."""
+	for alias in node.names:
+		if alias.name == "*":
+			return CONSOLE_IMPORT.format(name=f"{node.module}.*")
+		if alias.name in CONSOLE_FORBIDDEN_ATTRS:
+			return CONSOLE_ATTR.format(name=alias.name)
+		if alias.name in CONSOLE_FORBIDDEN_CALLS:
+			return CONSOLE_CALL.format(name=alias.name)
+	return None
+
+
+def _is_dunder(name: str) -> bool:
+	return name.startswith(DUNDER_PREFIX) and name != DUNDER_ALLOWED
+
+
 def _tree_reason(tree) -> str | None:
 	for node in ast.walk(tree):
 		if isinstance(node, ast.Import | ast.ImportFrom):
 			for root in _import_root(node):
 				if root not in CONSOLE_IMPORT_ROOTS:
 					return CONSOLE_IMPORT.format(name=root)
+			if isinstance(node, ast.ImportFrom):
+				reason = _imported_names_reason(node)
+				if reason:
+					return reason
 		elif isinstance(node, ast.Call):
 			if isinstance(node.func, ast.Name) and node.func.id in CONSOLE_FORBIDDEN_CALLS:
 				return CONSOLE_CALL.format(name=node.func.id)
 		elif isinstance(node, ast.Attribute):
 			if node.attr in CONSOLE_FORBIDDEN_ATTRS:
 				return CONSOLE_ATTR.format(name=node.attr)
-		elif isinstance(node, ast.Name) and node.id in CONSOLE_FORBIDDEN_CALLS:
-			return CONSOLE_CALL.format(name=node.id)
+			if _is_dunder(node.attr):
+				return CONSOLE_DUNDER.format(name=node.attr)
+		elif isinstance(node, ast.Name):
+			if node.id in CONSOLE_FORBIDDEN_CALLS:
+				return CONSOLE_CALL.format(name=node.id)
+			if _is_dunder(node.id):
+				return CONSOLE_DUNDER.format(name=node.id)
 	return None
 
 

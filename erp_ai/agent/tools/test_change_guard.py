@@ -1899,6 +1899,9 @@ class TestConsoleScript(FrappeTestCase):
 		script = 'import frappe\nfor name in frappe.get_all("ToDo", pluck="name", limit=3):\n\tprint(name)\n'
 		self.assertIsNone(change_guard.check_console_script(script))
 
+	def test_name_dunder_is_allowed(self):
+		self.assertIsNone(change_guard.check_console_script("print(__name__)"))
+
 	def test_each_rule_gives_its_exact_reason(self):
 		imports = "script chỉ được import frappe, erpnext, hrms, helpdesk, json, datetime, decimal, re, math"
 		cases = (
@@ -1917,6 +1920,23 @@ class TestConsoleScript(FrappeTestCase):
 			("db = frappe.db\ndb.commit()", "script không được dùng .commit"),
 			("frappe.set_user('Administrator')", "script không được dùng .set_user"),
 			("frappe.conf.db_password", "script không được dùng .conf"),
+			# CHG-010 fix round 1: imported names, dunder access, module loaders
+			(
+				"from frappe.utils.password import get_decrypted_password\nget_decrypted_password('a', 'b')",
+				"script không được dùng .get_decrypted_password",
+			),
+			("from frappe import set_user\nset_user('Administrator')", "script không được dùng .set_user"),
+			("from frappe import conf", "script không được dùng .conf"),
+			("from frappe import *\nset_user('Administrator')", f"{imports} (gặp frappe.*)"),
+			("from frappe import eval", "script không được gọi eval"),
+			("__builtins__['eval']('1')", "script không được dùng __builtins__"),
+			("__builtins__.__import__('os')", "script không được dùng __import__"),
+			("frappe.db.__getattribute__('commit')", "script không được dùng __getattribute__"),
+			("().__class__.__base__.__subclasses__()", "script không được dùng __subclasses__"),
+			("frappe.get_conf()", "script không được dùng .get_conf"),
+			("frappe.get_attr('subprocess.run')", "script không được dùng .get_attr"),
+			("frappe.get_module('os')", "script không được dùng .get_module"),
+			("frappe.importlib.import_module('os')", "script không được dùng .import_module"),
 		)
 		for script, reason in cases:
 			with self.subTest(script=script if script is None else script[:30]):

@@ -273,7 +273,7 @@ class TestRoutingEndToEnd(RoutingTestBase):
 		self._run()
 		self.assertEqual([call["task"] for call in self.gateway.calls], ["classify", "reason"])
 
-	def test_classify_request_lists_departments_and_has_600_tokens(self):
+	def test_classify_request_lists_departments_and_has_the_classify_cap(self):
 		rules = make_routing_rules(departments={"Kế toán": {"team": ROUTE_TEAM, "head": ""}})
 		set_agent_settings(routing_rules=rules)
 		self.gateway.results = [
@@ -283,7 +283,7 @@ class TestRoutingEndToEnd(RoutingTestBase):
 		self._run()
 
 		call = self.gateway.calls[0]
-		self.assertEqual(call["max_tokens"], 600)
+		self.assertEqual(call["max_tokens"], runner.CLASSIFY_MAX_TOKENS)
 		expected = build_classify_request(
 			self.ticket.subject, self.ticket.description, departments(load_routing_config(rules))
 		)

@@ -6,7 +6,7 @@ from datetime import datetime
 
 import frappe
 from frappe.desk.form.document_follow import follow_document
-from frappe.utils import escape_html, get_fullname, getdate, now_datetime
+from frappe.utils import escape_html, get_fullname, getdate, now_datetime, strip_html
 
 from erp_ai import gateway
 from erp_ai.agent import authority, lifecycle, policy, queue, site_facts
@@ -24,6 +24,7 @@ from erp_ai.agent.prompts import (
 from erp_ai.agent.routing import decide_route, departments, load_routing_config, sla_lag
 from erp_ai.agent.run_log import ENTRY_TYPE_CHANGE, action_entry, write_entry
 from erp_ai.agent.run_status import CLASSIFY_STEP, RunStatus
+from erp_ai.agent.tools.kb_draft import ARTICLE_DOCTYPE, SOURCE_TICKET_FIELD
 from erp_ai.agent.tools.read import TOOL_RESULT_MAX_CHARS
 from erp_ai.agent.tools.registry import ToolContext, execute_tool, grant
 from erp_ai.agent.tools.route_ticket import (
@@ -82,6 +83,7 @@ from erp_ai.constants import (
 	TITLE_STATUS_FAILED,
 	TRIGGER_CHANGE_ACTION,
 	TRIGGER_COMMENT_MENTION,
+	TRIGGER_KB_DRAFT,
 	TRIGGER_REQUESTER_REPLY,
 	TRIGGER_TICKET_INSERT,
 )
@@ -111,6 +113,7 @@ WRITE_TOOL_TARGETS = {
 	"api_submit_record": (None, "name"),
 	"api_call_method": ("Method", "method"),
 	"reply_to_requester": ("Communication", "communication"),
+	"create_kb_draft": (ARTICLE_DOCTYPE, "article"),
 }
 # Generic write tools: the model names the DocType; each successful call keeps its full snapshot (AC-13).
 GENERIC_WRITE_TOOLS = tuple(name for name, (doctype, _) in WRITE_TOOL_TARGETS.items() if doctype is None)
@@ -123,7 +126,7 @@ ACTION_VALUE_KEYS = ("value_before", "value_after")
 # Tools that create a record without returning before/after: their entry carries the call arguments as `value_after`.
 # Key of the proposal status in a propose tool's entry values (the DocType field; this module never writes it).
 PROPOSAL_STATUS_KEY = "change_status"
-CREATING_TOOLS = ("post_comment", "create_task", "reply_to_requester")
+CREATING_TOOLS = ("post_comment", "create_task", "reply_to_requester", "create_kb_draft")
 PROPOSE_TOOLS = ("propose_file_change", "propose_new_file", "propose_bench_command")
 PROPOSE_STEP = "propose"
 UNPARSEABLE_ERROR = "UNPARSEABLE: không phân loại được"
@@ -240,6 +243,7 @@ def _run(ticket_name, trigger, comment_name=None, communication_name=None):
 	routing = load_routing_config(settings.routing_rules)
 
 	reply_run = trigger == TRIGGER_REQUESTER_REPLY
+	kb_run = trigger == TRIGGER_KB_DRAFT
 	# ADR-033 QĐ 2: a requester-reply run is named by its event; each row it writes records the event as handled
 	run_id = queue.requester_reply_key(ticket_name, communication_name) if reply_run else uuid.uuid4().hex
 	# (r1) the event already has a row: run again for nothing, not even a row (ADR-033 QĐ 6, B-2)
@@ -258,14 +262,20 @@ def _run(ticket_name, trigger, comment_name=None, communication_name=None):
 	if not policy.can_send_ticket(ticket_name):
 		_log_skip(ticket_name, trigger, run_id, "not_sendable")
 		return
-	# (r2)-(r4) the requester's message is read again; a skip row is not counted by runs_today
-	skip = _requester_reply_skip(ticket_name, communication_name) if reply_run else None
+	# (r2)-(r4) the requester's message is read again; the knowledge-draft run checks its ticket; a skip row is not
+	# counted by runs_today
+	skip = None
+	if reply_run:
+		skip = _requester_reply_skip(ticket_name, communication_name)
+	elif kb_run:
+		skip = _kb_draft_skip(ticket_name, settings)
 	if skip:
 		_log_skip(ticket_name, trigger, run_id, skip)
 		return
-	# (d) daily limit counted from the log (AC-15); above L0 the person is told once a day (AC-23, AC-61)
+	# (d) daily limit counted from the log (AC-15); above L0 the person is told once a day (AC-23, AC-61); the
+	# knowledge-draft run is not checked (ADR-033 QĐ 4)
 	limit = settings.max_runs_per_ticket_per_day
-	if policy.runs_today(ticket_name) >= limit:
+	if not kb_run and policy.runs_today(ticket_name) >= limit:
 		notice = None
 		if policy.effective_level(settings, over_budget=False) != LEVELS[0]:
 			notice = ("daily_limit", DAILY_LIMIT_BODY.format(limit=limit), _start_of_today())
@@ -296,7 +306,8 @@ def _run(ticket_name, trigger, comment_name=None, communication_name=None):
 		classification = None
 		posted = reclassify = False
 		if level != LEVELS[0]:
-			instructor = authority.run_instructor(ticket_name, trigger, comment_name)
+			# the knowledge-draft run has its fixed grant row: no instructor, never below the threshold, no reply
+			instructor = None if kb_run else authority.run_instructor(ticket_name, trigger, comment_name)
 			# An insert run has no classification yet: `_classify` recomputes both from its own (U1.md:261).
 			category, pct = (None, None)
 			if trigger != TRIGGER_TICKET_INSERT:
@@ -320,8 +331,9 @@ def _run(ticket_name, trigger, comment_name=None, communication_name=None):
 				one_click_approval=switches.one_click_approval,
 				over_budget=over_budget,
 				main_path_level=policy.main_path_level(settings, level, category),
-				below_threshold=_below_threshold(pct, threshold, instructor, switches.act_now),
-				reply_enabled=lifecycle.lifecycle_settings(settings).reply,
+				below_threshold=not kb_run and _below_threshold(pct, threshold, instructor, switches.act_now),
+				reply_enabled=not kb_run and lifecycle.lifecycle_settings(settings).reply,
+				kb_draft_run=kb_run,
 			)
 			# ADR-036 QĐ 7: the one count, read once; the mode is chosen once the classification is known
 			posted = count_guidance(ticket_name) > 0
@@ -534,6 +546,29 @@ def _requester_reply_skip(ticket_name, communication_name) -> str | None:
 	if lifecycle.newer_requester_message_exists(ticket_name, communication_name):
 		return "superseded"
 	return None
+
+
+def _kb_draft_skip(ticket_name, settings) -> str | None:
+	"""Why the knowledge-draft run stops after step (c), else None (U6b.md:284, ADR-033 QĐ 3), first match wins: the
+	switch is off; the ticket is not closed; it has its article; nothing to write from (A-16: no resolution details
+	and no comment of a person the ticket was given to, the bot left out; the assignees are its ToDo rows, ADR-019)."""
+	if not lifecycle.lifecycle_settings(settings).kb_draft:
+		return "kb_draft_off"
+	ticket = frappe.db.get_value(
+		"HD Ticket", ticket_name, ["status_category", "resolution_details"], as_dict=True
+	)
+	if ticket.status_category != lifecycle.RESOLVED_CATEGORY:
+		return "not_closed"
+	if frappe.db.exists(ARTICLE_DOCTYPE, {SOURCE_TICKET_FIELD: ticket_name}):
+		return "kb_exists"
+	if strip_html(ticket.resolution_details or "").strip():
+		return None
+	resolvers = {row.allocated_to for row in site_facts.ticket_assignments(ticket_name)} - {AGENT_USER, None}
+	if resolvers and frappe.db.exists(
+		"Comment", {**authority.ticket_comment_filters(ticket_name), "owner": ("in", sorted(resolvers))}
+	):
+		return None
+	return "no_resolution_content"
 
 
 def _start_of_today() -> datetime:

@@ -5930,6 +5930,8 @@ class TestKbDraftRun(GuidanceTestBase):
 				"status": "Closed",
 			}
 		).insert(ignore_permissions=True)
+		# stored as is: an insert would make the session user its owner
+		now = frappe.utils.now_datetime()
 		frappe.get_doc(
 			{
 				"doctype": "Comment",
@@ -5938,8 +5940,11 @@ class TestKbDraftRun(GuidanceTestBase):
 				"reference_name": self.ticket.name,
 				"content": content,
 				"owner": owner,
+				"modified_by": owner,
+				"creation": now,
+				"modified": now,
 			}
-		).insert(ignore_permissions=True)
+		).db_insert()
 
 	def test_no_resolution_content_skipped(self):
 		# A-16: no resolution details and no comment of a person the ticket was given to: nothing to write from

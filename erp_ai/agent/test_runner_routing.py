@@ -48,6 +48,7 @@ from erp_ai.constants import (
 	HELPDESK_AGENT_ROLE,
 	LOG_DOCTYPE,
 	LOGGER_NAME,
+	MESSAGE_DOCTYPE,
 	ROLE_AGENT,
 )
 from erp_ai.test_utils import (
@@ -203,8 +204,8 @@ class RoutingTestBase(RunnerTestBase):
 			for a in json.loads(e.actions or "[]")
 			if a["tool"] == runner.GUIDANCE_TOOL
 		]
-		self.assertEqual((posted["doctype"], posted["ok"]), ("Comment", True))
-		return frappe.db.get_value("Comment", posted["name"], "content")
+		self.assertEqual((posted["doctype"], posted["ok"]), (MESSAGE_DOCTYPE, True))
+		return frappe.db.get_value(MESSAGE_DOCTYPE, posted["name"], "content")
 
 
 class TestRoutingEndToEnd(RoutingTestBase):
@@ -374,6 +375,8 @@ class TestRoutingEndToEnd(RoutingTestBase):
 			"comment": frappe.get_all(
 				"Comment", authority.ticket_comment_filters(ticket_name), ["name", "content"]
 			),
+			# ADR-050: the bot's sentences are messages of the conversation
+			"message": frappe.get_all(MESSAGE_DOCTYPE, {"ticket": ticket_name}, ["name", "content"]),
 			"task": frappe.get_all("Task", {"ai_ticket": ticket_name}, ["*"]),
 		}
 		text = {kind: json.dumps(rows, default=str, ensure_ascii=False) for kind, rows in surface.items()}
@@ -399,7 +402,8 @@ class TestRoutingEndToEnd(RoutingTestBase):
 		(entry,) = [e for e in surface["log"] if e.entry_type == "classify"]
 		# T116 (design-w1-fixes-12 Điểm 1, loại G): a guidance run's route posts no comment of its own: the one comment is the guidance
 		self.assertNotIn("post_routing_comment", [a["tool"] for a in json.loads(entry.actions)])
-		self.assertEqual(len(surface["comment"]), 1)
+		# ADR-050: the one thing said is the guidance message; no comment
+		self.assertEqual((len(surface["comment"]), len(surface["message"])), (0, 1))
 		self.assertEqual(write_ticket.count_guidance(self.ticket.name), 1)
 		self._assert_no_key(text)
 
@@ -598,7 +602,7 @@ class TestRoutingSla(RoutingTestBase):
 		set_agent_settings(routing_rules=json.dumps(rules), auto_assign_enabled=0)
 		self._two_calls()
 		logger = MagicMock()
-		before_comments = self._comment_count()
+		before_comments = self._said_count()
 		with patch.object(frappe, "logger", return_value=logger):
 			self._run()
 
@@ -607,7 +611,7 @@ class TestRoutingSla(RoutingTestBase):
 		self.assertIn("240 phút > mong đợi 60 phút (A)", action["reason"])
 		logger.warning.assert_called_once()
 		# AC-23 (T109): the slow SLA adds no sentence; the route's own comment is the one comment
-		self.assertEqual(self._comment_count(), before_comments + 1)
+		self.assertEqual(self._said_count(), before_comments + 1)
 
 	def test_matching_sla_no_action_no_warning(self):
 		self._only_sla()
@@ -672,8 +676,8 @@ class TestRoutingSla(RoutingTestBase):
 			for a in json.loads(e.actions or "[]")
 			if a["tool"] == runner.GUIDANCE_TOOL
 		]
-		self.assertEqual((posted["doctype"], posted["ok"]), ("Comment", True))
-		return frappe.db.get_value("Comment", posted["name"], "content")
+		self.assertEqual((posted["doctype"], posted["ok"]), (MESSAGE_DOCTYPE, True))
+		return frappe.db.get_value(MESSAGE_DOCTYPE, posted["name"], "content")
 
 	def test_no_sla_one_warning_one_comment(self):
 		self._only_sla(condition=None)
@@ -681,7 +685,7 @@ class TestRoutingSla(RoutingTestBase):
 		self._configure_person(person)
 		self._two_calls()
 		logger = MagicMock()
-		before_comments = self._comment_count()
+		before_comments = self._said_count()
 		before_slas = frappe.db.count(SLA_DOCTYPE)
 		with patch.object(frappe, "logger", return_value=logger):
 			self._run()
@@ -689,7 +693,7 @@ class TestRoutingSla(RoutingTestBase):
 		self._assert_saved_with_priority()
 		self.assertEqual(frappe.db.count(SLA_DOCTYPE), before_slas)
 		logger.warning.assert_called_once()
-		self.assertEqual(self._comment_count(), before_comments + 1)
+		self.assertEqual(self._said_count(), before_comments + 1)
 		self.assertIn(NO_SLA, self._comments_posted())
 		self.assertNotIn(ASSIGN_REQUEST.split("{")[0], self._comments_posted())
 
@@ -697,13 +701,13 @@ class TestRoutingSla(RoutingTestBase):
 		self._only_sla(condition=None)
 		self._configure_person(AGENT_USER)
 		self._two_calls()
-		before_comments = self._comment_count()
+		before_comments = self._said_count()
 		before_slas = frappe.db.count(SLA_DOCTYPE)
 		self._run()
 
 		self._assert_saved_with_priority()
 		self.assertEqual(frappe.db.count(SLA_DOCTYPE), before_slas)
-		self.assertEqual(self._comment_count(), before_comments + 1)
+		self.assertEqual(self._said_count(), before_comments + 1)
 		text = self._comments_posted()
 		self.assertIn(NO_SLA, text)
 		self.assertIn(ASSIGN_REQUEST.format(reason=REASON_NO_VALID_ASSIGNEE), text)
@@ -712,13 +716,13 @@ class TestRoutingSla(RoutingTestBase):
 		self._only_sla(condition=None)
 		set_agent_settings(auto_assign_enabled=0)
 		self._two_calls()
-		before_comments = self._comment_count()
+		before_comments = self._said_count()
 		before_slas = frappe.db.count(SLA_DOCTYPE)
 		self._run()
 
 		self._assert_saved_with_priority()
 		self.assertEqual(frappe.db.count(SLA_DOCTYPE), before_slas)
-		self.assertEqual(self._comment_count(), before_comments + 1)
+		self.assertEqual(self._said_count(), before_comments + 1)
 		self.assertIn(NO_SLA, self._comments_posted())
 
 	def test_sla_without_priority_or_resolution_is_not_a_lag(self):
@@ -744,7 +748,7 @@ class TestRoutingSla(RoutingTestBase):
 				ticket_writes.append(doctype)
 			return set_value(doctype, *args, **kwargs)
 
-		before_comments = self._comment_count()
+		before_comments = self._said_count()
 		logger = MagicMock()
 		routed = []
 		real_route = runner._route
@@ -774,7 +778,7 @@ class TestRoutingSla(RoutingTestBase):
 		self.assertNotIn(self.ticket.subject, entry.error)
 		self.assertNotIn(self.ticket.subject, entry.actions)
 		self.assertEqual(frappe.db.count("ToDo", {"reference_name": self.ticket.name}), 0)
-		self.assertEqual(self._comment_count(), before_comments)
+		self.assertEqual(self._said_count(), before_comments)
 		self.assertEqual([call["task"] for call in self.gateway.calls], ["classify", "reason"])
 
 
@@ -832,8 +836,8 @@ class AssignTestBase(RoutingTestBase):
 			for a in json.loads(e.actions or "[]")
 			if a["tool"] == runner.GUIDANCE_TOOL
 		]
-		self.assertEqual((posted["doctype"], posted["ok"]), ("Comment", True))
-		return frappe.db.get_value("Comment", posted["name"], "content")
+		self.assertEqual((posted["doctype"], posted["ok"]), (MESSAGE_DOCTYPE, True))
+		return frappe.db.get_value(MESSAGE_DOCTYPE, posted["name"], "content")
 
 	def _route_args(self):
 		"""The arguments the run hands `_route`, captured without routing; the classify row is written."""
@@ -847,7 +851,7 @@ class AssignTestBase(RoutingTestBase):
 
 class TestRoutingAssign(AssignTestBase):
 	def test_assigns_configured_person_one_notification(self):
-		before_comments = self._comment_count()
+		before_comments = self._said_count()
 		self._run()
 
 		self.assertEqual(self._assigned_to(), [self.person])
@@ -858,7 +862,7 @@ class TestRoutingAssign(AssignTestBase):
 		self.assertEqual(json.loads(entry.value_after)["assign"], [self.person])
 		self.assertEqual(entry.predicted_assignee, self.person)
 		# AC-23 (T109): the one route comment says what was classified and who got the ticket
-		self.assertEqual(self._comment_count(), before_comments + 1)
+		self.assertEqual(self._said_count(), before_comments + 1)
 		self.assertIn(runner.ROUTE_ASSIGNED.format(person=get_fullname(self.person)), self._comment_text())
 		self.assertEqual(self._task_count(), 0)
 		self.assertEqual(
@@ -902,7 +906,7 @@ class TestRoutingAssign(AssignTestBase):
 
 	def test_agent_account_never_assigned_one_comment(self):
 		self._configure(self.team, AGENT_USER)
-		before_comments = self._comment_count()
+		before_comments = self._said_count()
 		with patch.object(runner, "assign_owner") as assign:
 			self._run()
 
@@ -910,13 +914,13 @@ class TestRoutingAssign(AssignTestBase):
 		self.assertEqual(self._assigned_to(), [])
 		(action,) = self._action("assign_owner")
 		self.assertEqual((action["ok"], action["reason"]), (False, "không gán tài khoản agent"))
-		self.assertEqual(self._comment_count(), before_comments + 1)
+		self.assertEqual(self._said_count(), before_comments + 1)
 		self.assertIn(ASSIGN_REQUEST.format(reason=REASON_NO_VALID_ASSIGNEE), self._comment_text())
 		self.assertFalse(self._single_entry().predicted_assignee)
 		self.assertEqual(self._task_count(), 0)
 
 	def test_failed_assign_one_comment_and_no_second_try(self):
-		before_comments = self._comment_count()
+		before_comments = self._said_count()
 		with patch.object(runner, "assign_owner", side_effect=ValueError("x")) as assign:
 			self._run()
 
@@ -924,7 +928,7 @@ class TestRoutingAssign(AssignTestBase):
 		(action,) = self._action("assign_owner")
 		self.assertEqual((action["ok"], action["reason"]), (False, "ValueError"))
 		self.assertIn("route assign_owner: ValueError", self._single_entry().error)
-		self.assertEqual(self._comment_count(), before_comments + 1)
+		self.assertEqual(self._said_count(), before_comments + 1)
 		self.assertIn(ASSIGN_REQUEST.format(reason=REASON_ASSIGN_FAILED), self._comment_text())
 		self.assertEqual(self._assigned_to(), [])
 
@@ -955,11 +959,11 @@ class TestRoutingAssign(AssignTestBase):
 
 		# T116 (design-w1-fixes-12 Điểm 1): a guidance run never calls post_routing_comment; `_route` is called directly
 		args = self._route_args()
-		before_comments = self._comment_count()
+		before_comments = self._said_count()
 		with patch.object(runner, "post_routing_comment", side_effect=write_then_raise):
 			runner._route(*args)
 
-		self.assertEqual(self._comment_count(), before_comments)
+		self.assertEqual(self._said_count(), before_comments)
 		row = self._ticket_row()
 		self.assertEqual((row.agent_group, row.priority), (self.team, "Urgent"))
 		entry = self._single_entry()
@@ -967,14 +971,14 @@ class TestRoutingAssign(AssignTestBase):
 		self.assertIn("route post_routing_comment: ValueError", entry.error)
 
 	def test_refused_assign_one_comment(self):
-		before_comments = self._comment_count()
+		before_comments = self._said_count()
 		refusal = {"ok": False, "reason": "thiếu quyền đọc phiếu"}
 		with patch.object(runner, "assign_owner", return_value=refusal):
 			self._run()
 
 		(action,) = self._action("assign_owner")
 		self.assertEqual((action["ok"], action["reason"]), (False, "thiếu quyền đọc phiếu"))
-		self.assertEqual(self._comment_count(), before_comments + 1)
+		self.assertEqual(self._said_count(), before_comments + 1)
 		self.assertIn(ASSIGN_REQUEST.format(reason=REASON_ASSIGN_FAILED), self._comment_text())
 
 	def test_comment_exception_recorded_not_raised_not_retried(self):
@@ -1026,7 +1030,7 @@ class TestRoutingNoOverride(AssignTestBase):
 	def test_existing_assignment_kept(self):
 		earlier = make_active_agent(self)
 		assign_to.add({"assign_to": [earlier], "doctype": "HD Ticket", "name": self.ticket.name})
-		before_comments = self._comment_count()
+		before_comments = self._said_count()
 		with patch.object(runner, "assign_owner") as assign:
 			self._run()
 
@@ -1036,7 +1040,7 @@ class TestRoutingNoOverride(AssignTestBase):
 		self.assertEqual((action["ok"], action["reason"]), (False, f"phiếu đã có người được gán: {earlier}"))
 		self.assertNotIn("rule", action)
 		# AC-23 (T109): one route comment; the kept assignment adds no sentence
-		self.assertEqual(self._comment_count(), before_comments + 1)
+		self.assertEqual(self._said_count(), before_comments + 1)
 		self.assertNotIn("Đã gán", self._comment_text())
 		self.assertEqual(self._task_count(), 0)
 
@@ -1044,21 +1048,21 @@ class TestRoutingNoOverride(AssignTestBase):
 		member = make_active_agent(self)
 		team = make_team(self, with_rule=True, rule_users=(member,))
 		self._configure(team, self.person)
-		before_comments = self._comment_count()
+		before_comments = self._said_count()
 		self._run()
 
 		# one ToDo in total, the rule's; the configured person got nothing and no request was posted
 		self.assertEqual(self._assigned_to(), [member])
 		self.assertEqual(self._notifications(self.person), 0)
 		# AC-23 (T109): the route's own comment, with no request in it
-		self.assertEqual(self._comment_count(), before_comments + 1)
+		self.assertEqual(self._said_count(), before_comments + 1)
 		self.assertNotIn(ASSIGN_REQUEST.split("{")[0], self._comment_text())
 		self.assertEqual(self._task_count(), 0)
 		self.assertNotIn("assign", json.loads(self._single_entry().value_after))
 
 	def test_human_classified_no_route_writes(self):
 		frappe.db.set_value("HD Ticket", self.ticket.name, "ai_classified_by", CLASSIFIED_BY_HUMAN)
-		before_comments = self._comment_count()
+		before_comments = self._said_count()
 		with (
 			patch.object(runner, "assign_owner") as assign,
 			patch.object(runner, "post_routing_comment") as post,
@@ -1068,12 +1072,12 @@ class TestRoutingNoOverride(AssignTestBase):
 		assign.assert_not_called()
 		post.assert_not_called()
 		self.assertEqual(self._assigned_to(), [])
-		self.assertEqual(self._comment_count(), before_comments)
+		self.assertEqual(self._said_count(), before_comments)
 		self.assertEqual([a["tool"] for a in json.loads(self._single_entry().actions)], ["apply_route"])
 
 	def test_switch_off_no_todo_no_task(self):
 		set_agent_settings(auto_assign_enabled=0)
-		before_comments = self._comment_count()
+		before_comments = self._said_count()
 		with patch.object(runner, "assign_owner") as assign:
 			self._run()
 
@@ -1081,7 +1085,7 @@ class TestRoutingNoOverride(AssignTestBase):
 		self.assertEqual(self._assigned_to(), [])
 		self.assertEqual(self._task_count(), 0)
 		# AC-23 (T109): the route's own comment is posted with the switch off too
-		self.assertEqual(self._comment_count(), before_comments + 1)
+		self.assertEqual(self._said_count(), before_comments + 1)
 		# T116 (design-w1-fixes-12 Điểm 1, loại G): a guidance run's route posts no comment of its own
 		self.assertEqual([a["tool"] for a in json.loads(self._single_entry().actions)], ["apply_route"])
 		# the classification is still written: the route action succeeded and the ticket holds it
@@ -1092,14 +1096,14 @@ class TestRoutingNoOverride(AssignTestBase):
 
 	def test_l0_no_todo_no_task(self):
 		set_agent_settings(permission_level="L0")
-		before_comments = self._comment_count()
+		before_comments = self._said_count()
 		with patch.object(runner, "assign_owner") as assign:
 			self._run()
 
 		assign.assert_not_called()
 		self.assertEqual(self._assigned_to(), [])
 		self.assertEqual(self._task_count(), 0)
-		self.assertEqual(self._comment_count(), before_comments)
+		self.assertEqual(self._said_count(), before_comments)
 		entry = self._single_entry()
 		self.assertFalse(entry.actions)
 		self.assertEqual(entry.predicted_assignee, self.person)
@@ -1126,7 +1130,7 @@ class TestRoutingTask(AssignTestBase):
 		return frappe.db.count("ToDo", filters)
 
 	def test_c_ticket_one_linked_task_assigned(self):
-		before_comments = self._comment_count()
+		before_comments = self._said_count()
 		before_todos = self._task_todos()
 		logger = MagicMock()
 		with patch.object(frappe, "logger", return_value=logger):
@@ -1150,7 +1154,7 @@ class TestRoutingTask(AssignTestBase):
 			["apply_route", "assign_owner", "create_routed_task"],
 		)
 		# AC-23 (T109): one route comment names the person and the Task
-		self.assertEqual(self._comment_count(), before_comments + 1)
+		self.assertEqual(self._said_count(), before_comments + 1)
 		self.assertIn(runner.ROUTE_TASK.format(task=task), self._comment_text())
 		(info,) = [c.args for c in logger.info.call_args_list if c.args[0].startswith("erp_ai route")]
 		self.assertIn("assigned=%d task=%d comment=%d", info[0])
@@ -1247,7 +1251,7 @@ class TestRoutingTask(AssignTestBase):
 		# the person only has the Agent role: no Task permission, so Frappe must share the Task, and sharing is off
 		self.assertFalse(frappe.has_permission("Task", "read", user=self.person))
 		self._disable_document_sharing()
-		before_comments = self._comment_count()
+		before_comments = self._said_count()
 		before_todos = self._task_todos()
 		self._run()
 
@@ -1262,7 +1266,7 @@ class TestRoutingTask(AssignTestBase):
 		self.assertNotIn(self.ticket.subject, entry.error)
 		self.assertNotIn(self.ticket.subject, entry.actions)
 		self.assertNotIn("task", json.loads(entry.value_after))
-		self.assertEqual(self._comment_count(), before_comments + 1)
+		self.assertEqual(self._said_count(), before_comments + 1)
 		# AC-23 (T109): the request is one sentence of the one route comment
 		self.assertIn(TASK_REQUEST.format(reason=REASON_TASK_NOT_ASSIGNED), self._comment_text())
 
@@ -1271,7 +1275,7 @@ class TestRoutingTask(AssignTestBase):
 			create_routed_task(user, subject, classification, context)
 			raise RuntimeError("deadlock found when trying to get lock")
 
-		before_comments = self._comment_count()
+		before_comments = self._said_count()
 		before_todos = self._task_todos()
 		with patch.object(runner, "create_routed_task", side_effect=write_then_raise) as create:
 			self._run()
@@ -1285,7 +1289,7 @@ class TestRoutingTask(AssignTestBase):
 		entry = self._single_entry()
 		self.assertIn("route create_routed_task: RuntimeError", entry.error)
 		self.assertNotIn("deadlock", entry.error + entry.actions)
-		self.assertEqual(self._comment_count(), before_comments + 1)
+		self.assertEqual(self._said_count(), before_comments + 1)
 		text = self._comment_text()
 		# AC-23 (T109): the request is one sentence of the one route comment
 		self.assertIn(TASK_REQUEST.format(reason=REASON_TASK_FAILED), text)
@@ -1294,7 +1298,7 @@ class TestRoutingTask(AssignTestBase):
 
 	def test_refused_task_without_exception_no_task_no_comment(self):
 		refusal = {"ok": False, "reason": "thiếu quyền tạo Task"}
-		before_comments = self._comment_count()
+		before_comments = self._said_count()
 		before_todos = self._task_todos(self.person)
 		with patch.object(runner, "create_routed_task", return_value=refusal) as create:
 			self._run()
@@ -1306,14 +1310,14 @@ class TestRoutingTask(AssignTestBase):
 		(action,) = self._action("create_routed_task")
 		self.assertEqual((action["ok"], action["reason"]), (False, "thiếu quyền tạo Task"))
 		# AC-23 (T109): the route's own comment, with no Task request in it
-		self.assertEqual(self._comment_count(), before_comments + 1)
+		self.assertEqual(self._said_count(), before_comments + 1)
 		self.assertNotIn(TASK_REQUEST.split("{")[0], self._comment_text())
 		self.assertNotIn("task", json.loads(self._single_entry().value_after))
 
 	def test_preassigned_by_human_no_task_no_comment(self):
 		earlier = make_active_agent(self)
 		assign_to.add({"assign_to": [earlier], "doctype": "HD Ticket", "name": self.ticket.name})
-		before_comments = self._comment_count()
+		before_comments = self._said_count()
 		with patch.object(runner, "create_routed_task") as create:
 			self._run()
 
@@ -1321,7 +1325,7 @@ class TestRoutingTask(AssignTestBase):
 		self.assertEqual(self._tasks(), [])
 		self.assertEqual(self._assigned_to(), [earlier])
 		# AC-23 (T109): the route's own comment is the one comment
-		self.assertEqual(self._comment_count(), before_comments + 1)
+		self.assertEqual(self._said_count(), before_comments + 1)
 		self.assertEqual(
 			[a["tool"] for a in json.loads(self._single_entry().actions)],
 			["apply_route", "assign_owner"],
@@ -1331,7 +1335,7 @@ class TestRoutingTask(AssignTestBase):
 		member = make_active_agent(self)
 		team = make_team(self, with_rule=True, rule_users=(member,))
 		_configure_c(team, self.person)
-		before_comments = self._comment_count()
+		before_comments = self._said_count()
 		with patch.object(runner, "create_routed_task") as create:
 			self._run()
 
@@ -1339,7 +1343,7 @@ class TestRoutingTask(AssignTestBase):
 		self.assertEqual(self._tasks(), [])
 		self.assertEqual(self._assigned_to(), [member])
 		# AC-23 (T109): the route's own comment is the one comment
-		self.assertEqual(self._comment_count(), before_comments + 1)
+		self.assertEqual(self._said_count(), before_comments + 1)
 		(action,) = self._action("assign_owner")
 		self.assertEqual(action["reason"], f"phiếu đã có người được gán: {member}")
 
@@ -1521,7 +1525,7 @@ class TestRoutingInjection(AssignTestBase):
 			"HD Ticket", ticket, {"subject": f"{PREFIX}{self.INJECTED}", "description": self.INJECTED}
 		)
 		frappe.get_doc("HD Ticket", ticket).new_comment(self.INJECTED)
-		comments = self._comment_count()
+		comments = self._said_count()
 		creation = frappe.db.get_value("HD Ticket", ticket, "creation")
 		dates = []
 		real_apply_route = runner.apply_route
@@ -1556,7 +1560,7 @@ class TestRoutingInjection(AssignTestBase):
 		self.assertEqual((action["name"], action["ok"]), (self.person, True))
 		self.assertEqual(self._task_count(), 0)
 		# AC-23 (T109): the route's own comment; its fixed sentences carry nothing of the ticket text
-		self.assertEqual(self._comment_count(), comments + 1)
+		self.assertEqual(self._said_count(), comments + 1)
 		self.assertNotIn(self.INJECTED, self._comment_text())
 		# no SLA date was set to "1 minute" by the text: right after the route write and at the end
 		self.assertEqual(len(dates), 1)
@@ -2155,7 +2159,7 @@ class TestRunnerHooks(RoutingTestBase):
 		self.assertEqual(entry.applied, 1)
 
 	def test_split_comment_once_in_route_comment(self):
-		before = self._comment_count()
+		before = self._said_count()
 		entry = self._run_with(CLASSIFY_SPLIT)
 
 		text = self._route_comment(entry)
@@ -2163,7 +2167,7 @@ class TestRunnerHooks(RoutingTestBase):
 		# T116 (w1.md:103): the route's sentence and the split question are in the run's guidance comment, escaped once
 		self.assertIn(runner.ROUTE_DONE.split("{")[0], text)
 		self.assertIn(f"<li>{escape_html(split)}</li>", text)
-		self.assertEqual(self._comment_count(), before + 1)
+		self.assertEqual(self._said_count(), before + 1)
 		self.assertEqual((entry.split_requested, json.loads(entry.split_requests)), (1, SPLIT_REQUESTS))
 
 		# a later run on the ticket never asks again
@@ -2172,11 +2176,8 @@ class TestRunnerHooks(RoutingTestBase):
 		(later,) = [e for e in self._entries(entry_type="classify") if e.name != entry.name]
 		self.assertEqual((later.split_requested, later.split_requests), (0, None))
 		asked = frappe.get_all(
-			"Comment",
-			{
-				**authority.ticket_comment_filters(self.ticket.name),
-				"content": ["like", f"%{escape_html(split.splitlines()[0])}%"],
-			},
+			MESSAGE_DOCTYPE,
+			{"ticket": self.ticket.name, "content": ["like", f"%{escape_html(split.splitlines()[0])}%"]},
 		)
 		self.assertEqual(len(asked), 1)
 
@@ -2247,24 +2248,23 @@ class TestRunnerHooks(RoutingTestBase):
 			self.assertIn(f"<li>{escape_html(split)}</li>", self._route_comment(entry))
 			self.assertEqual((entry.split_requested, json.loads(entry.split_requests)), (1, SPLIT_REQUESTS))
 
-		with self.subTest("lost race: the plain result comment carries the question"):
+		with self.subTest("lost race: the plain result message carries the question"):
 			self.ticket = make_ticket(subject=f"{PREFIX}split lost race")
 			ticket = self.ticket.name
 
 			def rival_first(task, kwargs):
 				if task == "reason":
-					write_ticket._post(ticket, f"{write_ticket.GUIDANCE_MARKER}\n{PREFIX}hướng của lần kia")
+					write_ticket._say(ticket, f"{write_ticket.GUIDANCE_MARKER}\n{PREFIX}hướng của lần kia")
 
 			self.gateway.on_call = rival_first
 			try:
 				entry = self._run_with(CLASSIFY_SPLIT)
 			finally:
 				self.gateway.on_call = None
-			contents = frappe.get_all(
-				"Comment", filters=authority.ticket_comment_filters(ticket), pluck="content"
-			)
+			contents = frappe.get_all(MESSAGE_DOCTYPE, filters={"ticket": ticket}, pluck="content")
 			(result,) = [text for text in contents if not text.startswith(write_ticket.GUIDANCE_MARKER)]
-			self.assertIn(escape_html(split), result)
+			# ADR-050: a plain-text message, the question as written
+			self.assertIn(split, result)
 			self.assertEqual((entry.split_requested, json.loads(entry.split_requests)), (1, SPLIT_REQUESTS))
 
 	def test_watcher_failure_rolls_back_only_watcher_unit(self):
@@ -2319,12 +2319,12 @@ class TestOneCommentPerAction(AssignTestBase):
 
 	def _route_once(self):
 		args = self._route_args()
-		before = self._comment_count()
+		before = self._said_count()
 		lines = runner._route(*args)
-		self.assertEqual(self._comment_count(), before + 1)
+		self.assertEqual(self._said_count(), before + 1)
 		(posted,) = self._action("post_routing_comment")
-		self.assertEqual((posted["doctype"], posted["ok"]), ("Comment", True))
-		return lines, frappe.db.get_value("Comment", posted["name"], "content")
+		self.assertEqual((posted["doctype"], posted["ok"]), (MESSAGE_DOCTYPE, True))
+		return lines, frappe.db.get_value(MESSAGE_DOCTYPE, posted["name"], "content")
 
 	def _fields_line(self, team):
 		return runner.ROUTE_DONE.format(fields=f"Loại {ROUTE_TYPE}, Nhóm {team}, Ưu tiên Urgent")
@@ -2377,11 +2377,11 @@ class TestOneCommentPerAction(AssignTestBase):
 		run_id = args[3].run_id
 		write_ticket.open_collector(run_id)
 		self.addCleanup(write_ticket.close_collector, run_id)
-		before = self._comment_count()
+		before = self._said_count()
 		with patch.object(runner, "assign_owner", side_effect=ValueError("x")):
 			lines = runner._route(*args, collect_run_id=run_id)
 
-		self.assertEqual(self._comment_count(), before)
+		self.assertEqual(self._said_count(), before)
 		done = self._fields_line(self.team)
 		manual = ASSIGN_REQUEST.format(reason=REASON_ASSIGN_FAILED)
 		self.assertEqual(lines, [done, manual])
@@ -2423,7 +2423,7 @@ class TestRouteOnce(AssignTestBase):
 		self.assertEqual(first.applied, 1)
 		# a person changes the priority after the route; a second run must not route the ticket again
 		frappe.db.set_value("HD Ticket", self.ticket.name, "priority", "Low")
-		comments = self._comment_count()
+		comments = self._said_count()
 		self.gateway.results = [
 			make_model_result(text=CLASSIFY_SCORED),
 			make_model_result(stop_reason="end_turn"),
@@ -2443,7 +2443,7 @@ class TestRouteOnce(AssignTestBase):
 		self.assertEqual(json.loads(second.actions), [self._skipped(self.ticket.name)])
 		self.assertEqual(frappe.db.get_value("HD Ticket", self.ticket.name, "priority"), "Low")
 		self.assertEqual(self._assigned_to(), [self.person])
-		self.assertEqual(self._comment_count(), comments)
+		self.assertEqual(self._said_count(), comments)
 		routed = [c.args for c in logger.info.call_args_list if str(c.args[0]).startswith("erp_ai route")]
 		self.assertEqual(
 			routed,
@@ -2542,7 +2542,7 @@ class TestRouteOnce(AssignTestBase):
 		with (
 			patch.object(runner, "apply_route", return_value=routed),
 			patch.object(runner, "assign_owner", side_effect=assign),
-			patch.object(runner, "post_routing_comment", return_value={"ok": True, "comment": f"{PREFIX}c"}),
+			patch.object(runner, "post_routing_comment", return_value={"ok": True, "message": f"{PREFIX}c"}),
 		):
 			yield
 

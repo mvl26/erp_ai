@@ -109,7 +109,7 @@ def assign_owner(user: str, ctx: ToolContext) -> dict:
 
 
 def post_routing_comment(lines: list[str], ctx: ToolContext) -> dict:
-	"""Post the fixed sentences as ONE comment, reusing `post_comment`."""
+	"""Say the fixed sentences as ONE message of the ticket's conversation, reusing `post_comment` (ADR-050)."""
 	return post_comment({"content": "\n".join(lines)}, ctx)
 
 

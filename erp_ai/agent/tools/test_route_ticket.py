@@ -26,7 +26,7 @@ from erp_ai.agent.tools.route_ticket import (
 	create_routed_task,
 	post_routing_comment,
 )
-from erp_ai.constants import AGENT_USER, CLASSIFIED_BY_AI, CLASSIFIED_BY_HUMAN
+from erp_ai.constants import AGENT_USER, CLASSIFIED_BY_AI, CLASSIFIED_BY_HUMAN, MESSAGE_DOCTYPE
 from erp_ai.test_utils import PREFIX, make_active_agent, make_sla, make_team, pin_agent_roles
 
 SCORE_FIELDS = ("ai_complexity", "ai_importance", "ai_score_reason")
@@ -572,16 +572,17 @@ class TestRoutingComment(RouteTicketTestCase):
 			pluck="content",
 		)
 
-	def test_lines_joined_in_one_comment(self):
+	def test_lines_joined_in_one_message(self):
+		# ADR-050: one message of the ticket's conversation, no comment
 		ticket = self._ticket()
 		lines = [ASSIGN_REQUEST.format(reason=REASON_ASSIGN_FAILED), NO_SLA]
 		pin_agent_roles(self)
 		frappe.set_user(AGENT_USER)
 		result = post_routing_comment(lines, self._ctx(ticket))
 		self.assertTrue(result["ok"], result)
-		contents = self._comments(ticket)
-		self.assertEqual(len(contents), 1)
-		self.assertEqual(frappe.utils.strip_html(contents[0]).strip(), "\n".join(lines))
+		said = frappe.get_all(MESSAGE_DOCTYPE, filters={"ticket": ticket}, pluck="content")
+		self.assertEqual(said, ["\n".join(lines)])
+		self.assertEqual(self._comments(ticket), [])
 
 	def test_fixed_sentences(self):
 		self.assertEqual(NO_SLA, "Chưa có SLA áp vào phiếu, cần System Manager cấu hình.")

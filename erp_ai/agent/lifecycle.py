@@ -234,6 +234,28 @@ def _locked_status_category(ticket_name: str) -> str | None:
 	return frappe.db.get_value(TICKET_DOCTYPE, ticket_name, "status_category", for_update=True)
 
 
+def _undo_to(savepoint: str) -> None:
+	"""Roll back to `savepoint` and drop the commit callbacks the undone work queued (as runner._undo_turn does:
+	the later commit of the bot_action row must not run them)."""
+	frappe.db.rollback(save_point=savepoint)
+	frappe.db.before_commit.reset()
+	frappe.db.after_commit.reset()
+
+
+def _closed_before(ticket_name: str) -> bool:
+	"""The ticket already has a close_silent_f entry in its action log: the scan closes a ticket once, ever."""
+	return bool(
+		frappe.db.exists(
+			LOG_DOCTYPE,
+			{
+				"entry_type": run_log.ENTRY_TYPE_BOT_ACTION,
+				"ticket": ticket_name,
+				"actions": ("like", f'%"{TOOL_CLOSE_SILENT_F}"%'),
+			},
+		)
+	)
+
+
 def _log_refusal(ticket_name: str, job: str, refusal: str) -> None:
 	frappe.logger(LOGGER_NAME).info(
 		"erp_ai lifecycle skip job=%s ticket=%s reason=%s", job, ticket_name, refusal
@@ -283,6 +305,8 @@ def run_task_lifecycle(ticket_name: str) -> None:
 	(AC-42 (c)). Steps (4)-(8) share one savepoint: any failure undoes them, goes to the Error Log and the job
 	ends normally (U6b-fixes Sửa 2).
 	"""
+	if not policy.is_enabled():
+		return
 	if not authority.enter_agent_session():
 		return
 	ls = _current_settings()
@@ -295,7 +319,7 @@ def run_task_lifecycle(ticket_name: str) -> None:
 	try:
 		_resolve_if_tasks_done(ticket_name, ls)
 	except Exception as exc:
-		frappe.db.rollback(save_point=LIFECYCLE_SAVEPOINT)
+		_undo_to(LIFECYCLE_SAVEPOINT)
 		frappe.log_error(TITLE_LIFECYCLE_FAILED, f"ticket={ticket_name} error={type(exc).__name__}")
 
 
@@ -321,23 +345,26 @@ def _silent_f_candidates(cutoff) -> list[str]:
 def _close_if_silent(ticket_name: str, ls: LifecycleSettings, cutoff) -> None:
 	"""Steps (5)-(8) of scan_silent_f_tickets inside its SILENT_CLOSE_SAVEPOINT; the bot_action row, written last,
 	is the one commit (the cycle key is the Closed status itself, U6b-fixes Sửa 2)."""
-	if _locked_status_category(ticket_name) == RESOLVED_CATEGORY:
-		return
 	refusal = status_change_refusal(ticket_name, ls)
 	if refusal:
 		_log_refusal(ticket_name, "close_silent_f", refusal)
 		return
 	if policy.latest_classification(ticket_name)[0] != CATEGORY_F:
 		return
+	if _closed_before(ticket_name):
+		return
 	since = silent_since(ticket_name)
 	if since is None or since > cutoff:
+		return
+	# the cheap checks are done: only now the row lock, held until the scan's commit after this ticket
+	if _locked_status_category(ticket_name) == RESOLVED_CATEGORY:
 		return
 	notice = NOTICE_SILENT_CLOSE.format(ticket=ticket_name, days=ls.close_silent_f_days)
 	try:
 		communication = send_to_requester(ticket_name, notice)
 	except Exception as exc:
 		# A-U6b-7: no notice, no close; the next scan tries again
-		frappe.db.rollback(save_point=SILENT_CLOSE_SAVEPOINT)
+		_undo_to(SILENT_CLOSE_SAVEPOINT)
 		reason = REASON_NOTICE_FAILED.format(error=type(exc).__name__)
 		run_log.write_bot_action(
 			trigger=run_log.TRIGGER_SCHEDULED_JOB,
@@ -385,6 +412,8 @@ def scan_silent_f_tickets(now=None) -> None:
 	(AC-42 (c)). Each ticket has its own savepoint: a failure undoes that ticket only (notice included), goes to
 	the Error Log, and the scan goes on with the next ticket.
 	"""
+	if not policy.is_enabled():
+		return
 	if not authority.enter_agent_session():
 		return
 	ls = _current_settings()
@@ -400,5 +429,8 @@ def scan_silent_f_tickets(now=None) -> None:
 		try:
 			_close_if_silent(ticket_name, ls, cutoff)
 		except Exception as exc:
-			frappe.db.rollback(save_point=SILENT_CLOSE_SAVEPOINT)
+			_undo_to(SILENT_CLOSE_SAVEPOINT)
 			frappe.log_error(TITLE_LIFECYCLE_FAILED, f"ticket={ticket_name} error={type(exc).__name__}")
+		# skipped, failed or done: release this ticket's row lock before the next one
+		if not frappe.flags.in_test:
+			frappe.db.commit()

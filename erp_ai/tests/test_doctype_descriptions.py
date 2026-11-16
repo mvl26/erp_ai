@@ -76,7 +76,13 @@ DOCTYPE_CONFIG = {
 				"chuyển tiếp",
 				"liên kết cũ",
 			),
-			"console_enabled": ("bench console", "ERP AI Instructor", "Không hoàn tác", "Tắt"),
+			"console_enabled": (
+				"bench console",
+				"ERP AI Instructor",
+				"khung Trao đổi với bot",
+				"một giao dịch",
+				"không hoàn tác được",
+			),
 			"site_environment": ("production", "site test", "không bị chặn"),
 			**{
 				f"level_cap_{category}": ("Mức quyền", "năm quyền mở rộng", "chưa biết")
@@ -577,10 +583,9 @@ CONSOLE_FIELD_SPEC = {
 	"label": "Cho phép chạy bench console (qua duyệt)",
 	"default": "0",
 	"description": "Bật thì bot được soạn script Python chạy như bench console khi không có API hay công cụ "
-	"bản ghi nào làm được việc. Mỗi script là một đề xuất Chờ duyệt; chỉ người có vai trò ERP AI Instructor "
-	"duyệt được, bằng nút Duyệt trong khung Trao đổi với bot. Script chạy một lần trong một giao dịch; "
-	"lỗi thì không lưu gì. Không hoàn tác được. Không phụ thuộc ô Cho phép sửa code và lệnh bench. "
-	"Tắt thì bot không soạn được script và script đã duyệt cũng không chạy.",
+	"bản ghi nào làm được việc. Mỗi script là một đề xuất Chờ duyệt, chỉ duyệt bằng nút Duyệt trong khung "
+	"Trao đổi với bot (vai trò ERP AI Instructor). Chạy một lần trong một giao dịch, lỗi thì không lưu gì, "
+	"không hoàn tác được. Độc lập với ô sửa code. Tắt thì script đã duyệt cũng không chạy.",
 }
 
 
@@ -655,8 +660,6 @@ class TestDoctypeDescriptions(FrappeTestCase):
 					f["fieldname"]: len(f["description"])
 					for f in visible_fields(doctype_json)
 					if len(f.get("description") or "") > MAX_DESCRIPTION_CHARS
-					# CHG-010: the console switch's description is fixed by the spec and is longer.
-					and f["fieldname"] != "console_enabled"
 				}
 				self.assertEqual(too_long, {}, f"{doctype}: mô tả dài quá {MAX_DESCRIPTION_CHARS} ký tự")
 

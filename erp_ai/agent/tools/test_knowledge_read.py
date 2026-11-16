@@ -7,7 +7,7 @@ import frappe
 from frappe.tests.utils import FrappeTestCase
 from helpdesk.test_utils import make_ticket
 
-from erp_ai.agent import knowledge
+from erp_ai.agent import knowledge, policy
 from erp_ai.agent.redact import MASK
 from erp_ai.agent.tools import knowledge_read, source
 from erp_ai.agent.tools.registry import ToolContext, _first_invalid_key
@@ -175,6 +175,19 @@ class TestSearchKnowledgeBase(KnowledgeToolCase):
 		self._article(f"<p>{word}</p>", ai_source_ticket=excluded)
 
 		self.assertEqual(self._names(word), [kept])
+
+	def test_excluded_match_does_not_shorten_the_list(self):
+		"""R17d: the excluded articles are dropped before the cut to the limit, so one excluded match among
+		limit + 1 matches still leaves `limit` allowed articles (a shorter list would reveal the excluded one)."""
+		one, two = _word(), _word()
+		self._settings(excluded_teams=EXCLUDED_TEAM, knowledge_search_limit=2)
+		excluded = make_ticket(subject="T148 phiếu loại trừ").name
+		frappe.db.set_value("HD Ticket", excluded, "agent_group", EXCLUDED_TEAM)
+		# Both words: the excluded article ranks first.
+		self._article(f"<p>{one} {two}</p>", ai_source_ticket=excluded)
+		kept = {self._article(f"<p>{one}</p>") for _index in range(2)}
+
+		self.assertEqual(set(self._names(f"{one} {two}")), kept)
 
 
 class TestSearchManuals(KnowledgeToolCase):
@@ -483,6 +496,43 @@ class TestRunReport(KnowledgeToolCase):
 					},
 				)
 				run.assert_not_called()
+
+	def test_report_on_doctype_pointing_at_tickets_refused(self):
+		"""R17b: a report whose DocType points at tickets through a (DocType, Dynamic Link) pair is refused at run
+		time: the pairs of `policy.ticket_link_columns`, listed (ToDo, Tag Link, Email Queue) or read from the live
+		meta (DocShare), and Frappe's standard "ToDo" report."""
+		self.assertNotIn("DocShare", policy.TICKET_LINK_FIELDS)
+		names = [
+			self._report(ref_doctype=doctype) for doctype in ("ToDo", "Tag Link", "Email Queue", "DocShare")
+		]
+		names.append("ToDo")
+		self._allow(*names)
+		for name in names:
+			with self.subTest(report=name):
+				with patch.object(knowledge_read.query_report, "run") as run:
+					result = self._run(name)
+				self.assertEqual(result, {"ok": False, "reason": knowledge_read.REASON_REPORT_ON_TICKET_DATA})
+				run.assert_not_called()
+
+	def test_filter_on_unreadable_record_refused(self):
+		"""R17f: Frappe's filter-permission check (a Link filter naming a record the agent may not read) gives the
+		agent-permission reason; any other validation error of the run is not mapped."""
+		name = self._report(
+			filters=[{"fieldname": "role", "label": "Role", "fieldtype": "Link", "options": "Role"}]
+		)
+		self._allow(name)
+		for ptype in ("read", "select"):
+			self.assertFalse(frappe.has_permission("Role", ptype, doc="System Manager", user=AGENT_USER))
+
+		self.assertEqual(
+			self._run(name, filters={"role": "System Manager"}),
+			{"ok": False, "reason": knowledge_read.REASON_REPORT_PERMISSION},
+		)
+		with (
+			patch.object(knowledge_read.query_report, "run", side_effect=frappe.ValidationError("T150 khác")),
+			self.assertRaises(frappe.ValidationError),
+		):
+			self._run(name)
 
 	def test_agent_permission_error_refused(self):
 		name = self._report(roles=[{"role": "System Manager"}])

@@ -2037,11 +2037,28 @@ class TestAllowedReports(FrappeTestCase):
 				self.assertEqual(self._save(name), _report_error(name, _ticket_based_reason(doctype)))
 				self.assertEqual(self._stored(), "")
 
+	def test_report_on_doctype_pointing_at_tickets_blocked(self):
+		# R17b: a DocType that points at tickets through a (DocType, Dynamic Link) pair carries ticket content: the
+		# pairs of policy.ticket_link_columns, listed (ToDo, Tag Link, Email Queue) or read from the live meta
+		# (DocShare); Frappe's standard "ToDo" report too.
+		self.assertNotIn("DocShare", policy.TICKET_LINK_FIELDS)
+		cases = [
+			(self._report(f"ERP AI Test BC trên {doctype}", ref_doctype=doctype), doctype)
+			for doctype in ("ToDo", "Tag Link", "Email Queue", "DocShare")
+		]
+		cases.append(("ToDo", "ToDo"))
+		for name, doctype in cases:
+			with self.subTest(report=name):
+				self.assertEqual(self._save(name), _report_error(name, _ticket_based_reason(doctype)))
+				self.assertEqual(self._stored(), "")
+
 	def test_safe_report_saves(self):
 		# AC-49: enabled Script and Query Reports on a DocType without ticket content save as typed; blank lines
 		# are ignored; a blank value saves.
 		query = self._report("ERP AI Test BC Query")
-		script = self._report("ERP AI Test BC Script", ref_doctype="ToDo", report_type="Script Report")
+		script = self._report(
+			"ERP AI Test BC Script", ref_doctype="HD Ticket Priority", report_type="Script Report"
+		)
 		value = f"  {query}\n\n{script}\t\n"
 		self.assertIsNone(self._save(value))
 		self.assertEqual(self._stored(), value)

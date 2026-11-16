@@ -10,7 +10,7 @@ from helpdesk.helpdesk.doctype.hd_ticket.hd_ticket import HDTicket
 from helpdesk.test_utils import make_ticket
 
 from erp_ai.agent import authority, lifecycle, policy
-from erp_ai.constants import AGENT_USER, LOG_DOCTYPE, SETTING_DOCTYPE, TRIGGER_TICKET_INSERT
+from erp_ai.constants import AGENT_USER, CATEGORIES, LOG_DOCTYPE, SETTING_DOCTYPE, TRIGGER_TICKET_INSERT
 from erp_ai.test_utils import keep_agent_settings, make_log_entry, pin_agent_roles, set_agent_settings
 
 # A real HD Ticket field erp_ai installs (Small Text), so no test creates a Custom Field (its ALTER TABLE commits).
@@ -31,6 +31,12 @@ EMAIL_REPLY_SETTINGS = {
 	"auto_update_status": 0,
 }
 DAYS = 3
+SCAN_NOW = DAY0 + timedelta(days=DAYS, hours=1)
+# The two N-2 paths: the Task job (AC-43) and the silent-F scan (AC-44), each with its own switch.
+PATH_TASK = "task"
+PATH_SILENT = "silent"
+PATH_SWITCHES = {PATH_TASK: "resolve_on_tasks_done_enabled", PATH_SILENT: "close_silent_f_enabled"}
+CASE_SAVEPOINT = "erp_ai_test_case"
 
 
 def _forbidden_imports(source: str, forbidden: tuple[str, ...]) -> list[str]:
@@ -72,6 +78,8 @@ class LifecycleTestCase(FrappeTestCase):
 		pin_agent_roles(self)
 		self.addCleanup(frappe.set_user, "Administrator")
 		frappe.set_user("Administrator")
+		# The module clock is pinned: no test depends on the real one (a test may pin another day inside).
+		self.enterContext(patch.object(lifecycle, "now_datetime", return_value=SCAN_NOW))
 		self._settings(
 			enabled=0,
 			excluded_teams="",
@@ -212,6 +220,27 @@ class LifecycleTestCase(FrappeTestCase):
 
 		return patch.object(HDTicket, method_name, method)
 
+	def _path_ticket(self, path, category="C", origin=OTHER_ORIGIN) -> str:
+		"""A ticket ready for `path`: one Completed linked Task (task), or only a bot message at DAY0 (silent)."""
+		ticket = self._ticket(category=category, origin=origin)
+		if path == PATH_TASK:
+			self._task(ticket, "Completed")
+		else:
+			self._bot_message(ticket, DAY0)
+		return ticket
+
+	def _run_path(self, path, ticket) -> None:
+		if path == PATH_TASK:
+			lifecycle.run_task_lifecycle(ticket)
+		else:
+			lifecycle.scan_silent_f_tickets(SCAN_NOW)
+		frappe.set_user("Administrator")
+
+	def _setting_rows(self) -> list:
+		return frappe.db.sql(
+			"select field, value from `tabSingles` where doctype=%s order by field", SETTING_DOCTYPE
+		)
+
 
 class TestLifecycleSettings(LifecycleTestCase):
 	def test_reads_the_seven_fields(self):
@@ -296,6 +325,141 @@ class TestStatusGuard(LifecycleTestCase):
 			"chưa cấu hình trường Nguồn phát sinh (field_origin, origin_board_value)",
 		)
 		self.assertEqual(lifecycle.TITLE_LIFECYCLE_FAILED, "ERP AI lifecycle failed")
+
+	def test_truth_table(self):
+		"""AC-42: 6 categories x {board, not board, not configured} x 2 switch states x 2 paths. Only F, not board,
+		configured, close switch on closes; only not E, not board, configured, Task switch on resolves."""
+		self._email_settings()
+		origins = {
+			"board": (BOARD_VALUE, True),
+			"not board": (OTHER_ORIGIN, True),
+			"not configured": (OTHER_ORIGIN, False),
+		}
+		for path in (PATH_TASK, PATH_SILENT):
+			for category in CATEGORIES:
+				for origin_case, (origin, configured) in origins.items():
+					for switch in (True, False):
+						with self.subTest(path=path, category=category, origin=origin_case, switch=switch):
+							frappe.db.savepoint(CASE_SAVEPOINT)
+							self._settings(
+								resolve_on_tasks_done_enabled=int(path == PATH_TASK and switch),
+								close_silent_f_enabled=int(path == PATH_SILENT and switch),
+								field_origin=ORIGIN_FIELD if configured else "",
+							)
+							ticket = self._path_ticket(path, category=category, origin=origin)
+
+							self._run_path(path, ticket)
+
+							allowed = switch and origin_case == "not board"
+							if path == PATH_TASK:
+								expected = "Resolved" if allowed and category != "E" else "Open"
+							else:
+								expected = "Closed" if allowed and category == "F" else "Open"
+							self.assertEqual(self._status(ticket), expected)
+							self.assertEqual(len(self._rows(ticket)), int(expected != "Open"))
+							frappe.db.rollback(save_point=CASE_SAVEPOINT)
+
+	def test_switches_off_no_status_change_any_job(self):
+		"""AC-42 (a): both switches off: no status change and no log row from either job, configured or not."""
+		self._email_settings()
+		tickets = {path: self._path_ticket(path, category="F") for path in (PATH_TASK, PATH_SILENT)}
+		for field_origin in (ORIGIN_FIELD, ""):
+			with self.subTest(field_origin=field_origin):
+				self._settings(field_origin=field_origin)
+				log_rows = frappe.db.count(LOG_DOCTYPE)
+
+				for path, ticket in tickets.items():
+					self._run_path(path, ticket)
+
+				self.assertEqual(frappe.db.count(LOG_DOCTYPE), log_rows)
+				for ticket in tickets.values():
+					self._assert_unchanged(ticket)
+
+	def test_origin_not_configured_one_log_per_day(self):
+		"""AC-42 (c), A-11: not configured: no path runs; one log row a day, its run_id the day key."""
+		self._email_settings()
+		self._settings(resolve_on_tasks_done_enabled=1, close_silent_f_enabled=1)
+		tickets = {path: self._path_ticket(path, category="F") for path in (PATH_TASK, PATH_SILENT)}
+		day = DAY0 + timedelta(days=10)
+		for case, fields in (
+			("field_origin empty", {"field_origin": ""}),
+			("field_origin not a field of HD Ticket", {"field_origin": "erpai_test_no_such_field"}),
+			("origin_board_value empty", {"origin_board_value": ""}),
+		):
+			with self.subTest(case=case):
+				frappe.db.savepoint(CASE_SAVEPOINT)
+				self._settings(**{"field_origin": ORIGIN_FIELD, "origin_board_value": BOARD_VALUE, **fields})
+
+				with patch.object(lifecycle, "now_datetime", return_value=day + timedelta(hours=1)):
+					lifecycle.run_task_lifecycle(tickets[PATH_TASK])
+					lifecycle.scan_silent_f_tickets()
+					lifecycle.run_task_lifecycle(tickets[PATH_TASK])
+				frappe.set_user("Administrator")
+				self.assertEqual(self._config_rows(day), 1)
+				for ticket in tickets.values():
+					self._assert_unchanged(ticket)
+
+				with patch.object(lifecycle, "now_datetime", return_value=day + timedelta(days=1)):
+					lifecycle.run_task_lifecycle(tickets[PATH_TASK])
+					lifecycle.scan_silent_f_tickets()
+				frappe.set_user("Administrator")
+				self.assertEqual(self._config_rows(day), 1)
+				self.assertEqual(self._config_rows(day + timedelta(days=1)), 1)
+				for ticket in tickets.values():
+					self._assert_unchanged(ticket)
+				frappe.db.rollback(save_point=CASE_SAVEPOINT)
+
+	def _config_rows(self, day) -> int:
+		"""The "not configured" rows of `day`, each checked whole."""
+		rows = frappe.get_all(
+			LOG_DOCTYPE,
+			filters={"run_id": f"lifecycle-config-{day.date().isoformat()}"},
+			fields=["entry_type", "trigger", "ticket", "cost_usd", "actions"],
+		)
+		for row in rows:
+			self.assertEqual(
+				(row.entry_type, row.trigger, row.ticket, row.cost_usd),
+				("bot_action", "scheduled_job", None, 0),
+			)
+			self.assertEqual(
+				json.loads(row.actions),
+				[
+					{
+						"tool": "ticket_lifecycle",
+						"doctype": None,
+						"name": None,
+						"ok": False,
+						"value_before": None,
+						"value_after": None,
+						"instructor": None,
+						"reason": lifecycle.REASON_ORIGIN_NOT_CONFIGURED,
+					}
+				],
+			)
+		return len(rows)
+
+	def test_every_status_change_has_log_and_one_comment(self):
+		"""AC-42 (d), ADR-033 Ràng buộc: each path logs one bot_action row and one comment, all by the agent."""
+		self._email_settings()
+		self._settings(resolve_on_tasks_done_enabled=1, close_silent_f_enabled=1)
+		for path, status in ((PATH_TASK, "Resolved"), (PATH_SILENT, "Closed")):
+			with self.subTest(path=path):
+				ticket = self._path_ticket(path, category="F")
+
+				self._run_path(path, ticket)
+
+				self.assertEqual(
+					frappe.db.get_value("HD Ticket", ticket, ["status", "modified_by"]), (status, AGENT_USER)
+				)
+				self.assertEqual(len(self._rows(ticket)), 1)
+				(comment,) = self._comments(ticket)
+				self.assertEqual(comment.owner, AGENT_USER)
+				sent = frappe.get_all(
+					"Communication",
+					filters={"reference_name": ticket, "sent_or_received": "Sent"},
+					pluck="owner",
+				)
+				self.assertEqual(set(sent), {AGENT_USER} if path == PATH_SILENT else set())
 
 
 class TestRequesterMessages(LifecycleTestCase):
@@ -788,7 +952,25 @@ class TestSilentClose(LifecycleTestCase):
 		self.assertEqual(self._counts(open_ticket), self._closed())
 
 
-class TestArchitecture(FrappeTestCase):
+class TestArchitecture(LifecycleTestCase):
+	def test_setting_unchanged_after_jobs(self):
+		"""ADR-033 QĐ 1: under the agent account neither job writes ERP AI Setting, whether it changes a status
+		or only logs the missing configuration."""
+		self._email_settings()
+		self._settings(resolve_on_tasks_done_enabled=1, close_silent_f_enabled=1)
+		tickets = {path: self._path_ticket(path, category="F") for path in (PATH_TASK, PATH_SILENT)}
+		for field_origin in (ORIGIN_FIELD, ""):
+			with self.subTest(field_origin=field_origin):
+				self._settings(field_origin=field_origin)
+				before = self._setting_rows()
+
+				for path, ticket in tickets.items():
+					self._run_path(path, ticket)
+
+				self.assertEqual(self._setting_rows(), before)
+				self.assertIn(("modified",), {(row[0],) for row in before})
+		self.assertEqual([self._status(ticket) for ticket in tickets.values()], ["Resolved", "Closed"])
+
 	def test_no_model_gateway_import(self):
 		"""ADR-033 QĐ 3, Ràng buộc: the lifecycle jobs never reach the model gateway."""
 		self.assertEqual(_forbidden_imports(inspect.getsource(lifecycle), GATEWAY_MODULES), [])

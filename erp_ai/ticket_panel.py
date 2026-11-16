@@ -1,9 +1,9 @@
 """Ticket-page panel (ADR-009, ADR-010, ADR-044): what the bot filled in on a ticket, the conversation with it,
-and the Duyệt / Từ chối buttons of the ticket's change proposals.
+the bot's status on the ticket, and the Duyệt / Từ chối buttons of the ticket's change proposals.
 
-The ticket's fields are read under the caller's own permissions; the conversation is read by ticket once the
-caller has passed the panel gate (ADR-010 Amendment 2). A decision passes the gate on the proposal's own ticket,
-then the panel predicate, then the form's own method (ADR-044 QĐ 5).
+The ticket's fields are read under the caller's own permissions; the conversation and the bot's status are read
+by ticket once the caller has passed the panel gate (ADR-010 Amendments 2 and 4). A decision passes the gate on
+the proposal's own ticket, then the panel predicate, then the form's own method (ADR-044 QĐ 5).
 """
 
 import frappe
@@ -12,7 +12,7 @@ from frappe.core.utils import html_to_plain_text
 from frappe.utils import cstr, format_datetime
 from helpdesk.utils import is_agent
 
-from erp_ai.agent import change_link, messages
+from erp_ai.agent import bot_status, change_link, messages
 from erp_ai.constants import AGENT_USER, LOGGER_NAME, PANEL_MAX_MESSAGE_CHARS
 from erp_ai.erp_ai_agent.doctype.erp_ai_change_proposal import erp_ai_change_proposal as proposal_form
 
@@ -100,16 +100,30 @@ def _ai_fields(ticket: str) -> list[dict]:
 
 @frappe.whitelist(methods=["POST"])
 def get_panel_data(ticket: str) -> dict:
+	"""Everything the panel shows for `ticket`, read after the panel gate; writes nothing (ADR-010 QĐ 5).
+
+	Output: exactly {"ticket", "ai_fields", "messages", "proposals", "bot_status"} (ADR-044 Amendment 1);
+	`bot_status` is `bot_status.panel_status` for the ticket and its messages: the status line and the system
+	lines anchored under the messages (CHG-009 design 3.1), never a message itself.
+	Errors: ValidationError (missing ticket); PermissionError (not an active agent, or no read on the ticket).
+	"""
 	if not isinstance(ticket, str) or not ticket.strip():
 		frappe.throw(_("Thiếu mã phiếu."), frappe.ValidationError)
 	ticket = ticket.strip()
 	_require_panel_access(ticket, method="get")
 	thread = messages.thread(ticket)
 	proposals = proposal_form.panel_cards(ticket)
+	status = bot_status.panel_status(ticket, [message["name"] for message in thread])
 	frappe.logger(LOGGER_NAME).debug(
 		f"erp_ai panel read ticket={ticket} messages={len(thread)} proposals={len(proposals)}"
 	)
-	return {"ticket": ticket, "ai_fields": _ai_fields(ticket), "messages": thread, "proposals": proposals}
+	return {
+		"ticket": ticket,
+		"ai_fields": _ai_fields(ticket),
+		"messages": thread,
+		"proposals": proposals,
+		"bot_status": status,
+	}
 
 
 @frappe.whitelist(methods=["POST"])

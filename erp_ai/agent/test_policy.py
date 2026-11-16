@@ -12,9 +12,12 @@ from frappe.utils import now_datetime
 from helpdesk.test_utils import make_ticket
 
 from erp_ai.agent import policy
+from erp_ai.agent.policy import LessonSettings
 from erp_ai.constants import (
+	AGENT_USER,
 	CORE_APPS,
 	LOG_DOCTYPE,
+	ROLE_INSTRUCTOR,
 	SETTING_DOCTYPE,
 	TRIGGER_CHANGE_ACTION,
 	TRIGGER_COMMENT_MENTION,
@@ -1596,3 +1599,85 @@ class TestExcludedQuery(FrappeTestCase):
 			patch.object(frappe.db, "get_value", side_effect=get_value),
 		):
 			self.assertTrue(policy.is_ticket_record_excluded("Comment", comment))
+
+
+def _lesson_user(email, *roles):
+	"""A user holding exactly `roles`, created inside the test transaction."""
+	for role in roles:
+		if not frappe.db.exists("Role", role):
+			frappe.get_doc({"doctype": "Role", "role_name": role}).insert(ignore_permissions=True)
+	if not frappe.db.exists("User", email):
+		user = frappe.new_doc("User")
+		user.update({"email": email, "first_name": email.split("@")[0], "send_welcome_email": 0})
+		for role in roles:
+			user.append("roles", {"role": role})
+		user.insert(ignore_permissions=True)
+	return email
+
+
+class TestLessonPolicy(FrappeTestCase):
+	def setUp(self):
+		frappe.db.rollback()
+		commit_guard = patch.object(
+			frappe.db, "commit", side_effect=AssertionError("test must not commit the transaction")
+		)
+		commit_guard.start()
+		self.addCleanup(commit_guard.stop)
+		self.addCleanup(frappe.db.rollback)
+		self.addCleanup(frappe.set_user, "Administrator")
+		keep_agent_settings(self)
+
+	def test_lesson_settings_defaults(self):
+		set_agent_settings(lessons_enabled=1, lessons_max_per_request=5, lessons_max_chars=2000)
+		self.assertEqual(
+			policy.lesson_settings(frappe.get_single("ERP AI Setting")), LessonSettings(True, 5, 2000, 500)
+		)
+
+	def test_lesson_settings_out_of_range_reads_default(self):
+		set_agent_settings(lessons_enabled=0, lessons_max_per_request=99, lessons_max_chars=5)
+		self.assertEqual(
+			policy.lesson_settings(frappe.get_single("ERP AI Setting")), LessonSettings(False, 5, 2000, 500)
+		)
+
+	def test_teach_marker_is_stripped_and_blank_is_empty(self):
+		set_agent_settings(lesson_teach_marker="  ghi nhớ: ")
+		self.assertEqual(policy.lesson_teach_marker(), "ghi nhớ:")
+		set_agent_settings(lesson_teach_marker="   ")
+		self.assertEqual(policy.lesson_teach_marker(), "")
+
+	def test_approver_is_reviewer_or_system_manager(self):
+		reviewer = _lesson_user("lesson.reviewer@example.com", "Desk User")
+		manager = _lesson_user("lesson.manager@example.com", "System Manager")
+		instructor = _lesson_user("lesson.instructor@example.com", ROLE_INSTRUCTOR)
+		set_agent_settings(
+			monthly_reviewers="\n".join([reviewer, "", "Administrator", "Guest", AGENT_USER]),
+		)
+		self.assertTrue(policy.is_lesson_approver(reviewer))
+		self.assertTrue(policy.is_lesson_approver(manager))
+		self.assertFalse(policy.is_lesson_approver(instructor))
+		for user in ("Administrator", "Guest", AGENT_USER, "", None):
+			self.assertFalse(policy.is_lesson_approver(user), user)
+
+	def test_manager_is_instructor_only(self):
+		instructor = _lesson_user("lesson.instructor@example.com", ROLE_INSTRUCTOR)
+		manager = _lesson_user("lesson.manager@example.com", "System Manager")
+		self.assertTrue(policy.can_manage_lessons(instructor))
+		self.assertFalse(policy.can_manage_lessons(manager))
+		for user in ("Administrator", "Guest", AGENT_USER, "", None):
+			self.assertFalse(policy.can_manage_lessons(user), user)
+
+	def test_limit_errors(self):
+		def errors(**caps):
+			return policy.lesson_limit_errors(frappe._dict(caps))
+
+		for value in (0, 21):
+			self.assertEqual(len(errors(lessons_max_per_request=value)), 1, value)
+		# R13: one lesson of the largest size (300 + 1000 characters) always fits under the smallest cap
+		self.assertEqual(policy.LESSONS_CHARS_RANGE, (1300, 20000))
+		for value in (1299, 20001):
+			self.assertEqual(len(errors(lessons_max_chars=value)), 1, value)
+		for per_request, chars in ((1, 1300), (20, 20000)):
+			self.assertEqual(errors(lessons_max_per_request=per_request, lessons_max_chars=chars), [])
+		self.assertEqual(errors(), [])
+		for value in ("abc", 0, True):
+			self.assertEqual(len(errors(lessons_max_chars=value)), 1, value)

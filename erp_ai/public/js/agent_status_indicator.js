@@ -8,9 +8,18 @@ function setupForm({ doc, call, router }) {
 		const TEXT_CHAT_SECTION = "Trao đổi với bot";
 		const TEXT_EMPTY_FIELD = "Chưa có";
 		const TEXT_EMPTY_THREAD = "Chưa có tin nào.";
+		// The one status sentence of the script, shown while an indicator is live (design 4.1);
+		// every other sentence comes from the server.
+		const TEXT_STATUS_RUNNING = "Đang xử lý…";
 		const TEXT_BOT_LABEL = "Bot";
 		const TEXT_BOT_GUIDANCE =
-			"Bot có thể không trả lời khi đang tắt, đang ở chế độ chỉ ghi nhận, phiếu không dùng AI hoặc thuộc nhóm loại trừ, đã hết lượt hôm nay, hoặc đang trả lời tin trước của phiếu này (khi đó hãy gửi lại sau). Nhận định và hướng xử lý của bot hiện ở phần thông tin của phiếu phía trên.";
+			'Bot có thể không trả lời khi đang tắt, đang ở chế độ chỉ ghi nhận, phiếu không dùng AI hoặc thuộc nhóm loại trừ, đã hết lượt hôm nay, hoặc đang trả lời tin trước của phiếu này (khi đó hãy gửi lại sau). Nhận định và hướng xử lý của bot là tin trong ngăn này; người có vai trò ERP AI Instructor bấm "Duyệt hướng xử lý" dưới tin đó thì bot làm theo.';
+		// ADR-050: the newest guidance of the bot gets the approve button; a click sends this fixed text (server
+		// prompts.APPROVE_GUIDANCE_TEXT) through the send box, as the person who clicked.
+		const KIND_GUIDANCE = "guidance";
+		const TEXT_APPROVE_GUIDANCE = "Duyệt hướng xử lý";
+		const APPROVE_GUIDANCE_TEXT =
+			"Duyệt hướng xử lý: bot làm ngay các bước trong hướng xử lý gần nhất, đúng phạm vi đã nêu.";
 		const TEXT_LOAD_FAILED = "Không tải được dữ liệu của khu vực. Hãy đóng rồi mở lại.";
 		const TEXT_INPUT_PLACEHOLDER =
 			"Nhập câu hỏi cho bot. Enter để gửi, Shift+Enter để xuống dòng.";
@@ -56,6 +65,10 @@ function setupForm({ doc, call, router }) {
 			el: null,
 			open: false,
 			slotEl: null,
+			statusTextEl: null,
+			botStatus: null,
+			statusExpired: false,
+			expiryTimer: null,
 			aiListEl: null,
 			threadEl: null,
 			proposalErrorEl: null,
@@ -144,8 +157,25 @@ function setupForm({ doc, call, router }) {
 			return el;
 		};
 
+		// A live indicator wins, else the server's text; past the deadline, its failed time (A-4).
+		const showBotStatus = () => {
+			const panel = state.panel;
+			if (!panel.statusTextEl) {
+				return;
+			}
+			const status = panel.botStatus;
+			let text = "";
+			if (status) {
+				const expired = panel.statusExpired && status.expired_text;
+				text = expired ? status.expired_text : status.text || "";
+			}
+			panel.statusTextEl.textContent = state.runs.size > 0 ? TEXT_STATUS_RUNNING : text;
+		};
+
 		const render = () => {
 			const el = ensureElement();
+			// The status line follows the indicator, shown or hidden (design 4.1).
+			showBotStatus();
 			if (state.runs.size === 0) {
 				setIndicatorVisible(el, false);
 				return;
@@ -218,6 +248,18 @@ function setupForm({ doc, call, router }) {
 			const aiListEl = document.createElement("div");
 			const chatTitle = document.createElement("strong");
 			chatTitle.textContent = TEXT_CHAT_SECTION;
+			// The status line, above messages and cards, holds the docked indicator (A-7).
+			const statusEl = document.createElement("div");
+			Object.assign(statusEl.style, {
+				display: "flex",
+				alignItems: "center",
+				gap: "8px",
+				flexWrap: "wrap",
+				fontWeight: "bold",
+			});
+			const statusTextEl = document.createElement("span");
+			const slotEl = document.createElement("div");
+			statusEl.append(statusTextEl, slotEl);
 			const guidanceEl = document.createElement("div");
 			guidanceEl.style.color = "#6b7280";
 			guidanceEl.textContent = TEXT_BOT_GUIDANCE;
@@ -253,22 +295,22 @@ function setupForm({ doc, call, router }) {
 				}
 			});
 			formEl.append(inputEl, sendEl);
-			const slotEl = document.createElement("div");
 			el.append(
 				header,
 				aiTitle,
 				aiListEl,
 				chatTitle,
+				statusEl,
 				guidanceEl,
 				threadEl,
 				proposalErrorEl,
 				errorEl,
-				formEl,
-				slotEl
+				formEl
 			);
 			document.body.appendChild(el);
 			panel.el = el;
 			panel.slotEl = slotEl;
+			panel.statusTextEl = statusTextEl;
 			panel.aiListEl = aiListEl;
 			panel.threadEl = threadEl;
 			panel.proposalErrorEl = proposalErrorEl;
@@ -312,7 +354,48 @@ function setupForm({ doc, call, router }) {
 			state.panel.aiListEl.replaceChildren(...nodes);
 		};
 
-		const messageRow = (message) => {
+		const clearExpiryTimer = () => {
+			const panel = state.panel;
+			clearTimeout(panel.expiryTimer);
+			panel.expiryTimer = null;
+		};
+
+		// An open call's deadline only changes the text, one timer per load (design 4.1, A-4).
+		const renderBotStatus = (data) => {
+			const panel = state.panel;
+			clearExpiryTimer();
+			panel.statusExpired = false;
+			const status = data?.bot_status;
+			panel.botStatus = status && typeof status === "object" ? status : null;
+			const ms = Number(panel.botStatus?.expires_in_s) * 1000;
+			if (ms > 0) {
+				panel.expiryTimer = setTimeout(() => {
+					try {
+						panel.statusExpired = true;
+						showBotStatus();
+					} catch (e) {
+						// A timer callback must never throw to the console (AC-10 g).
+					}
+				}, ms);
+			}
+			showBotStatus();
+		};
+
+		// A system line: a centred note between the messages, never a message (ADR-048 QĐ 7).
+		const systemLine = (line) => {
+			const row = document.createElement("div");
+			Object.assign(row.style, {
+				marginTop: "8px",
+				textAlign: "center",
+				fontSize: "12px",
+				color: line?.kind === "failed" ? "#b91c1c" : "#6b7280",
+			});
+			row.textContent = String(line?.text ?? "");
+			return row;
+		};
+
+		// One message of the thread; `approve` puts the approve button under it (the newest guidance, ADR-050).
+		const messageRow = (message, approve) => {
 			const row = document.createElement("div");
 			row.style.marginTop = "8px";
 			row.style.padding = "6px 8px";
@@ -330,6 +413,25 @@ function setupForm({ doc, call, router }) {
 			body.style.whiteSpace = "pre-wrap";
 			body.textContent = message?.text ?? "";
 			row.append(head, body);
+			if (approve) {
+				const approveEl = document.createElement("button");
+				approveEl.type = "button";
+				approveEl.style.marginTop = "6px";
+				approveEl.textContent = TEXT_APPROVE_GUIDANCE;
+				approveEl.addEventListener("click", () => {
+					try {
+						const panel = state.panel;
+						if (panel.sending || !panel.inputEl) {
+							return;
+						}
+						panel.inputEl.value = APPROVE_GUIDANCE_TEXT;
+						submit();
+					} catch (e) {
+						// A panel handler must never break the ticket page (ADR-009 decision 4).
+					}
+				});
+				row.append(approveEl);
+			}
 			return row;
 		};
 
@@ -477,16 +579,38 @@ function setupForm({ doc, call, router }) {
 
 		// Messages and cards in one thread by `created` (a card after a message of the same time). A card that
 		// fails to build leaves the messages without cards; it never fails the rest of the panel (AC-11).
+		// A system line carries no time, only the message it follows (CHG-009 D-5): it stays under that message,
+		// with no anchor first in the thread, with an unknown anchor last.
 		const renderThread = (data) => {
 			const panel = state.panel;
 			const messages = data?.messages;
 			if (!Array.isArray(messages)) {
 				throw new Error("messages is not a list");
 			}
-			const entries = messages.map((message) => ({
+			const lines = data?.bot_status?.lines;
+			// Each line goes under its message: no anchor first, an unknown anchor last.
+			const first = [];
+			const last = [];
+			const below = new Map(messages.map((message) => [message?.name, []]));
+			for (const line of Array.isArray(lines) ? lines : []) {
+				const after = line?.after_message;
+				const place =
+					after === null || after === undefined ? first : below.get(after) || last;
+				place.push(systemLine(line));
+			}
+			let newestGuidance = -1;
+			messages.forEach((message, index) => {
+				if (message?.is_bot && message?.kind === KIND_GUIDANCE) {
+					newestGuidance = index;
+				}
+			});
+			const entries = messages.map((message, index) => ({
 				created: String(message?.created ?? ""),
 				rank: 0,
-				node: messageRow(message),
+				nodes: [
+					messageRow(message, index === newestGuidance),
+					...(below.get(message?.name) || []),
+				],
 			}));
 			const proposals = data?.proposals;
 			if (Array.isArray(proposals) && proposals.length > 0) {
@@ -500,7 +624,11 @@ function setupForm({ doc, call, router }) {
 					panel.proposalErrorEl.replaceChildren();
 				}
 				cardNodes.forEach((node, i) => {
-					entries.push({ created: String(proposals[i]?.created ?? ""), rank: 1, node });
+					entries.push({
+						created: String(proposals[i]?.created ?? ""),
+						rank: 1,
+						nodes: [node],
+					});
 				});
 			} else {
 				clearProposals();
@@ -512,10 +640,14 @@ function setupForm({ doc, call, router }) {
 				const empty = document.createElement("div");
 				empty.style.marginTop = "8px";
 				empty.textContent = TEXT_EMPTY_THREAD;
-				panel.threadEl.replaceChildren(empty);
+				panel.threadEl.replaceChildren(empty, ...first, ...last);
 				return;
 			}
-			panel.threadEl.replaceChildren(...entries.map((entry) => entry.node));
+			panel.threadEl.replaceChildren(
+				...first,
+				...entries.flatMap((entry) => entry.nodes),
+				...last
+			);
 		};
 
 		const reload = () => {
@@ -540,9 +672,12 @@ function setupForm({ doc, call, router }) {
 								return;
 							}
 							renderAiFields(data);
+							renderBotStatus(data);
 							renderThread(data);
 							panel.errorEl.textContent = "";
 						} catch (e) {
+							panel.botStatus = null;
+							showBotStatus();
 							panel.aiListEl.replaceChildren();
 							clearProposals();
 							panel.threadEl.replaceChildren();
@@ -697,6 +832,12 @@ function setupForm({ doc, call, router }) {
 			closePanel();
 			panel.aiListEl?.replaceChildren();
 			panel.threadEl?.replaceChildren();
+			clearExpiryTimer();
+			panel.botStatus = null;
+			panel.statusExpired = false;
+			if (panel.statusTextEl) {
+				panel.statusTextEl.textContent = "";
+			}
 			panel.deciding = false;
 			clearProposals();
 			if (panel.inputEl) {

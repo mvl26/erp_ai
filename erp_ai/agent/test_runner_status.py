@@ -6,7 +6,7 @@ from unittest.mock import call, patch
 import frappe
 from frappe.utils import get_fullname
 
-from erp_ai.agent import answer_delay, policy, runner
+from erp_ai.agent import answer_delay, policy, run_log, runner
 from erp_ai.agent.run_status import FALLBACK_WORK_LABEL, PAYLOAD_KEYS, WORK_LABELS
 from erp_ai.agent.test_agent_runner import (
 	CLASSIFY_A,
@@ -23,6 +23,7 @@ from erp_ai.constants import (
 	JOB_TIMEOUT_S,
 	LOG_DOCTYPE,
 	LOGGER_NAME,
+	MESSAGE_DOCTYPE,
 	SETTING_DOCTYPE,
 	TITLE_RUN_FAILED,
 	TITLE_STATUS_FAILED,
@@ -79,7 +80,7 @@ class TestRunnerStatus(RunnerTestBase):
 
 		def sleeper(seconds):
 			self.sleeps.append(seconds)
-			self.at_sleep.append(([s["message"]["state"] for s in self.signals], self._comment_count()))
+			self.at_sleep.append(([s["message"]["state"] for s in self.signals], self._said_count()))
 			self.classification_at_sleep.append(self._classification())
 
 		sleep_patch = patch.object(answer_delay, "_sleep", side_effect=sleeper)
@@ -136,11 +137,11 @@ class TestRunnerStatus(RunnerTestBase):
 			tool_turn(tool_use("t1", "post_comment", kind="de_xuat", content=ANSWER)),
 			make_model_result(text="xong"),
 		)
-		comments_before = self._comment_count()
+		comments_before = self._said_count()
 
 		self._run("comment_mention")
 
-		self.assertEqual(self._comment_count(), comments_before + 1)
+		self.assertEqual(self._said_count(), comments_before + 1)
 
 		states = [signal["message"]["state"] for signal in self.signals]
 		self.assertTrue(states, "no status signal was emitted")
@@ -153,13 +154,14 @@ class TestRunnerStatus(RunnerTestBase):
 		self.assertEqual(len(self.signals[-1]["message"]), 7)
 		self.assertEqual({entry.run_id for entry in self._entries()}, {self.signals[0]["message"]["run_id"]})
 
-	def test_no_signal_when_run_skipped_at_level_l0(self):
+	def test_run_skipped_at_level_l0_sends_only_done(self):
 		set_agent_settings(permission_level="L0")
 		self._gateway()
 
 		self._run("comment_mention")
 
-		self.assertEqual(self.signals, [])
+		# ADR-008 Amendment 1 (CHG-009): the early stop wrote its skip row, so it sends one `done` and nothing else
+		self.assertEqual(self._states(), ["done"])
 
 	def _states(self):
 		return [signal["message"]["state"] for signal in self.signals]
@@ -180,7 +182,7 @@ class TestRunnerStatus(RunnerTestBase):
 		self._set_delay(4, 4)
 		self.model_seconds = 1
 		self._gateway(*self._answer_turns())
-		comments_before = self._comment_count()
+		comments_before = self._said_count()
 		real_load_mapping = runner.load_mapping
 
 		def slow_load_mapping(*args, **kwargs):
@@ -194,7 +196,7 @@ class TestRunnerStatus(RunnerTestBase):
 		# anchor = right after the start signal; 0.5 s of set-up and 1 s of model took 1.5 s of the 4 s
 		self.assertEqual(self.sleeps, [2.5])
 		self.assertEqual(self.at_sleep, [(["thinking"], comments_before)])
-		self.assertEqual(self._comment_count(), comments_before + 1)
+		self.assertEqual(self._said_count(), comments_before + 1)
 		# the "working" signal of the answer comes only after the wait
 		self.assertEqual(self._states(), ["thinking", "working", "thinking", "done"])
 		self.assertEqual(self.signals[1]["message"]["text"], "Đang làm: viết trả lời…")
@@ -210,7 +212,7 @@ class TestRunnerStatus(RunnerTestBase):
 			),
 			make_model_result(text="xong"),
 		)
-		comments_before = self._comment_count()
+		comments_before = self._said_count()
 		classification_before = self._classification()
 
 		self._run("comment_mention")
@@ -222,7 +224,7 @@ class TestRunnerStatus(RunnerTestBase):
 		# after the run both did
 		self.assertNotEqual(self._classification(), classification_before)
 		# T116 (G-8, R12b): the run's one comment is its guidance comment, holding the answer and the classification
-		self.assertEqual(self._comment_count(), comments_before + 1)
+		self.assertEqual(self._said_count(), comments_before + 1)
 		self.assertEqual(write_ticket.count_guidance(self.ticket.name), 1)
 
 	def test_indicator_stays_thinking_while_waiting(self):
@@ -239,7 +241,7 @@ class TestRunnerStatus(RunnerTestBase):
 		self.assertEqual(self._states()[:2], ["thinking", "working"])
 		self.assertEqual(self.signals[1]["message"]["text"], "Đang làm: viết trả lời…")
 
-	def test_skipped_runs_emit_nothing_and_never_wait(self):
+	def test_skipped_runs_send_only_done_and_never_wait(self):
 		self._set_delay(3, 5)
 		cases = {
 			"disabled": lambda: set_agent_settings(enabled=0),
@@ -251,16 +253,91 @@ class TestRunnerStatus(RunnerTestBase):
 			with self.subTest(name):
 				frappe.db.savepoint("erp_ai_skip_case")
 				try:
+					self.signals.clear()
 					self._gateway(*self._answer_turns())
 					arrange()
 
 					self._run("comment_mention")
 
-					self.assertEqual(self.signals, [])
+					# ADR-008 Amendment 1 (CHG-009): each of these stops wrote its skip row, so it sends one `done`
+					self.assertEqual(self._states(), ["done"])
 					self.assertEqual(self.sleeps, [])
 					self.assertEqual(self.gateway.call_count, 0)
 				finally:
 					frappe.db.rollback(save_point="erp_ai_skip_case")
+
+	def test_early_stop_one_done_after_its_skip(self):
+		# ADR-008 Amendment 1, ADR-048 QĐ 8 (CHG-009): an early stop sends exactly one `done`, empty, for the run_id of
+		# its skip row and only once that row is written; no thinking or working
+		cases = {
+			"disabled": lambda: set_agent_settings(enabled=0),
+			"not_sendable": lambda: frappe.db.set_value("HD Ticket", self.ticket.name, "ai_opt_out", 1),
+			"daily_limit": lambda: self._seed_runs(DAILY_LIMIT),
+			"level_L0": lambda: set_agent_settings(permission_level="L0"),
+		}
+		real_write_entry = runner.write_entry
+		signals_at_skip = []
+
+		def recording_write_entry(**fields):
+			if fields.get("entry_type") == "skip":
+				signals_at_skip.append(len(self.signals))
+			return real_write_entry(**fields)
+
+		for name, arrange in cases.items():
+			with self.subTest(name):
+				frappe.db.savepoint("erp_ai_stop_case")
+				try:
+					self.signals.clear()
+					signals_at_skip.clear()
+					self._gateway()
+					arrange()
+
+					with patch.object(runner, "write_entry", side_effect=recording_write_entry):
+						self._run("comment_mention")
+
+					(skip,) = self._entries(entry_type="skip")
+					self.assertEqual(signals_at_skip, [0])
+					self.assertEqual(self._states(), ["done"])
+					self.assertEqual(self.signals[0]["message"]["run_id"], skip.run_id)
+					self.assertEqual(self.signals[0]["message"]["text"], "")
+					self.assertEqual(list(self.signals[0]["message"]), list(PAYLOAD_KEYS))
+				finally:
+					frappe.db.rollback(save_point="erp_ai_stop_case")
+
+	def test_empty_text_early_stop_no_signal(self):
+		# A-4 (CHG-009), ADR-008 Amendment 1: with no indicator text an early stop sends nothing; its skip row is written
+		set_agent_settings(permission_level="L0")
+		for text in ("", "   "):
+			with self.subTest(repr(text)):
+				frappe.db.savepoint("erp_ai_empty_stop")
+				try:
+					frappe.db.set_single_value(SETTING_DOCTYPE, "thinking_text", text)
+					self._gateway()
+
+					self._run("comment_mention")
+
+					self.assertEqual([e.stop_reason for e in self._entries(entry_type="skip")], ["level_L0"])
+					self.assertEqual(self.signals, [])
+				finally:
+					frappe.db.rollback(save_point="erp_ai_empty_stop")
+
+	def test_end_row_before_done(self):
+		# ADR-048 QĐ 2, ADR-008 Amendment 1 (CHG-009): the run's end row, of its run_id, is written before its `done`,
+		# which is the last signal
+		self._gateway(*self._answer_turns())
+		real_write_entry = run_log.write_entry
+		ends_at = []
+
+		def recording_write_entry(**fields):
+			if fields.get("entry_type") == "run_event":
+				ends_at.append((fields.get("stop_reason"), fields.get("run_id"), len(self.signals)))
+			return real_write_entry(**fields)
+
+		with patch.object(run_log, "write_entry", side_effect=recording_write_entry):
+			self._run("comment_mention")
+
+		self.assertEqual(self._states()[-1], "done")
+		self.assertEqual(ends_at, [("run_done", self.signals[0]["message"]["run_id"], len(self.signals) - 1)])
 
 	def test_empty_text_no_signal_delay_still_applies(self):
 		self._set_delay(3, 5)
@@ -581,7 +658,7 @@ class TestRunnerStatus(RunnerTestBase):
 	def test_done_signal_failure_logged_to_error_log_class_only(self):
 		self._set_delay(4, 4)
 		self._gateway(*self._answer_turns())
-		comments_before = self._comment_count()
+		comments_before = self._said_count()
 
 		run_ids = []
 
@@ -594,7 +671,7 @@ class TestRunnerStatus(RunnerTestBase):
 			lines = self._run_closing("comment_mention")
 
 		# the run still answered; the lost `done` is only reported
-		self.assertEqual(self._comment_count(), comments_before + 1)
+		self.assertEqual(self._said_count(), comments_before + 1)
 		run_id = run_ids[0]
 		self.assertEqual(
 			self.log_error.call_args_list,
@@ -619,12 +696,12 @@ class TestRunnerStatus(RunnerTestBase):
 
 	def test_start_signal_failure_still_answers_and_logs_class(self):
 		self._gateway(*self._answer_turns())
-		comments_before = self._comment_count()
+		comments_before = self._said_count()
 
 		with self._fail_signals("thinking"):
 			lines = self._run_closing("comment_mention")
 
-		self.assertEqual(self._comment_count(), comments_before + 1)
+		self.assertEqual(self._said_count(), comments_before + 1)
 		reasons = self._entries(entry_type="reason")
 		self.assertEqual(reasons[0].error, "status_thinking: RuntimeError")
 		self.assertNotIn("MARKERXYZ", json.dumps([entry.error for entry in reasons]))
@@ -635,12 +712,12 @@ class TestRunnerStatus(RunnerTestBase):
 
 	def test_working_signal_failure_still_answers_and_logs_class(self):
 		self._gateway(*self._answer_turns())
-		comments_before = self._comment_count()
+		comments_before = self._said_count()
 
 		with self._fail_signals("working"):
 			self._run_closing("comment_mention")
 
-		self.assertEqual(self._comment_count(), comments_before + 1)
+		self.assertEqual(self._said_count(), comments_before + 1)
 		reasons = self._entries(entry_type="reason")
 		self.assertEqual(reasons[0].error, "status_working: RuntimeError")
 		self.assertFalse(reasons[1].error)
@@ -689,7 +766,10 @@ class TestRunnerStatus(RunnerTestBase):
 			self._run_closing("ticket_insert")
 
 		entry = self._entries(entry_type="classify")[-1]
-		self.assertEqual(entry.error, f"{runner.UNPARSEABLE_ERROR}; status_thinking: RuntimeError")
+		self.assertEqual(
+			entry.error,
+			f"{runner.UNPARSEABLE_ERROR}; stop_reason=end_turn; raw=không phải JSON; status_thinking: RuntimeError",
+		)
 		self.assertEqual(self.log_error.call_args_list, [])
 
 	def test_thinking_failure_joins_the_reason_gateway_error(self):
@@ -762,13 +842,18 @@ class TestRunnerStatus(RunnerTestBase):
 					self.assertNotIn(forbidden, text)
 
 	def _count_changes(self):
-		"""Run one mention run and return what it changed: (new Comments, new Tasks, ticket `modified` changed?)."""
-		comments, tasks = frappe.db.count("Comment"), frappe.db.count("Task")
+		"""Run one mention run and return what it changed: (new things said: Comments and conversation messages since
+		ADR-050, new Tasks, ticket `modified` changed?)."""
+
+		def said():
+			return frappe.db.count("Comment") + frappe.db.count(MESSAGE_DOCTYPE)
+
+		comments, tasks = said(), frappe.db.count("Task")
 		modified = frappe.db.get_value("HD Ticket", self.ticket.name, "modified")
 		self._gateway(*self._answer_turns())
 		self._run("comment_mention")
 		return (
-			frappe.db.count("Comment") - comments,
+			said() - comments,
 			frappe.db.count("Task") - tasks,
 			frappe.db.get_value("HD Ticket", self.ticket.name, "modified") != modified,
 		)

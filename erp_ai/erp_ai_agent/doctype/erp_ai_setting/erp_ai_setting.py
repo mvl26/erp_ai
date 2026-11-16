@@ -192,6 +192,7 @@ class ERPAISetting(Document):
 		self.check_operation_people()
 		self.check_kpi_targets()
 		self.check_prompt_overrides()
+		self.check_lesson_limits()
 		self.record_prompt_revisions()
 		self.stamp_agent_enabled_at()
 
@@ -483,6 +484,12 @@ class ERPAISetting(Document):
 		error = kpi_targets_error(self.kpi_targets)
 		if error:
 			frappe.throw(f"Mục tiêu KPI: {error}")
+
+	def check_lesson_limits(self):
+		"""FEAT-008: the lesson caps stay inside their ranges."""
+		errors = policy.lesson_limit_errors(self)
+		if errors:
+			frappe.throw("<br>".join(errors))
 
 	def check_prompt_overrides(self):
 		"""AC-38, E-10: each set override, in form order, within the length limit, then keeping its markers."""

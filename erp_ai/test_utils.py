@@ -26,6 +26,8 @@ from erp_ai.constants import (
 	CHANGE_STATUS_PENDING,
 	CORE_APPS,
 	HELPDESK_AGENT_ROLE,
+	LESSON_DOCTYPE,
+	LESSON_EVENT_DOCTYPE,
 	OPERATION_DOCTYPE,
 	PROPOSAL_DOCTYPE,
 	ROLE_AGENT,
@@ -98,10 +100,39 @@ def record_status_signals(testcase) -> list[dict]:
 	return signals
 
 
+def stub_job_states(testcase, states: dict) -> dict:
+	"""Patch the one RQ job-state read, `frappe.utils.background_jobs.get_job_status` (ADR-048 QĐ 2, STD-TEST-6).
+
+	`states` maps a job id, as the queue passes it to `frappe.enqueue`, to the status the read gives (an
+	`rq.job.JobStatus` or its string) or to an exception the read raises; any other id has no job (None).
+	The same dict is returned, so a test can change a job's state between calls. The patch is removed by
+	`addCleanup`.
+	"""
+
+	def read(job_id):
+		state = states.get(job_id)
+		if isinstance(state, BaseException):
+			raise state
+		return state
+
+	read_patch = patch("frappe.utils.background_jobs.get_job_status", side_effect=read)
+	read_patch.start()
+	testcase.addCleanup(read_patch.stop)
+	return states
+
+
 def set_agent_settings(**fields) -> None:
 	"""Set ERP AI Setting values directly in the DB (no validate), for tests."""
 	for fieldname, value in fields.items():
 		frappe.db.set_single_value(SETTING_DOCTYPE, fieldname, value)
+
+
+def clear_lesson_store() -> None:
+	"""Delete every ERP AI Lesson and ERP AI Lesson Event row inside the current transaction, so a test sees only the
+	lessons it makes, whatever the shared site holds (NFR-7). Never commits: the test's rollback brings the rows back.
+	"""
+	frappe.db.delete(LESSON_EVENT_DOCTYPE)
+	frappe.db.delete(LESSON_DOCTYPE)
 
 
 def keep_agent_settings(testcase) -> None:

@@ -7,6 +7,7 @@ from datetime import datetime
 import frappe
 from frappe.utils import get_datetime, now_datetime
 
+from erp_ai.agent import lessons
 from erp_ai.agent.changes import block
 from erp_ai.agent.changes.process_runner import CommandResult
 from erp_ai.agent.run_log import ENTRY_TYPE_CHANGE, write_entry
@@ -231,7 +232,9 @@ def approve(name, user) -> str:
 
 def reject(name, user) -> str:
 	"""`Chờ duyệt → Đã từ chối`: write `decided_by`, `decided_at` and one `reject` row. Raises as `approve`."""
-	return _decide(name, user, CHANGE_STATUS_REJECTED, "từ chối", "reject")
+	status = _decide(name, user, CHANGE_STATUS_REJECTED, "từ chối", "reject")
+	lessons.safely(lessons.record_proposal_outcome, name, "reject")
+	return status
 
 
 def request_undo(name, user) -> str:
@@ -262,6 +265,7 @@ def request_undo(name, user) -> str:
 		{"change_status": CHANGE_STATUS_UNDOING, "undo_by": user, "undo_at": now_datetime()},
 		update_modified=True,
 	)
+	lessons.safely(lessons.record_proposal_outcome, name, "undo")
 	return CHANGE_STATUS_UNDOING
 
 

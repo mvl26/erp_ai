@@ -9,7 +9,8 @@ from frappe.desk.form.document_follow import follow_document
 from frappe.utils import escape_html, get_fullname, getdate, now_datetime, strip_html
 
 from erp_ai import gateway
-from erp_ai.agent import authority, lifecycle, policy, queue, site_facts
+from erp_ai.agent import authority, lesson_read, lifecycle, policy, queue, site_facts
+from erp_ai.agent import labels as ticket_labels
 from erp_ai.agent.answer_delay import AnswerDelay
 from erp_ai.agent.authority import TITLE_WRONG_USER as TITLE_WRONG_USER  # re-export, U1.md:264
 from erp_ai.agent.classification import load_mapping, parse_classification, split_request_comment
@@ -23,8 +24,9 @@ from erp_ai.agent.prompts import (
 	build_reason_system,
 	build_routing_table,
 )
+from erp_ai.agent.redact import redact_secrets
 from erp_ai.agent.routing import decide_route, departments, load_routing_config, sla_lag
-from erp_ai.agent.run_log import ENTRY_TYPE_CHANGE, action_entry, write_entry
+from erp_ai.agent.run_log import ENTRY_TYPE_CHANGE, action_entry, record_event, write_entry
 from erp_ai.agent.run_status import CLASSIFY_STEP, RunStatus
 from erp_ai.agent.tools.kb_draft import ARTICLE_DOCTYPE, SOURCE_TICKET_FIELD
 from erp_ai.agent.tools.read import TOOL_RESULT_MAX_CHARS
@@ -38,6 +40,7 @@ from erp_ai.agent.tools.route_ticket import (
 	REASON_TASK_NOT_ASSIGNED,
 	TASK_REQUEST,
 	TaskSharingDisabled,
+	add_labels,
 	apply_route,
 	assign_owner,
 	create_routed_task,
@@ -68,21 +71,28 @@ from erp_ai.agent.tools.write_ticket import (
 	mark_work_only,
 	open_collector,
 	post_guidance,
-	post_guidance_reply,
 	post_notice,
 )
 from erp_ai.constants import (
 	AGENT_USER,
 	CLASSIFICATION_FIELDS,
 	CLASSIFIED_BY_HUMAN,
+	EVENT_RUN_DONE,
+	EVENT_RUN_FAILED,
 	JOB_SAFETY_MARGIN_S,
 	JOB_TIMEOUT_S,
 	LEVELS,
 	LOG_DOCTYPE,
+	LOG_ENTRY_RUN_EVENT,
 	LOGGER_NAME,
 	MESSAGE_DOCTYPE,
 	PROPOSAL_DOCTYPE,
 	SETTING_DOCTYPE,
+	SKIP_AGENT_DISABLED,
+	SKIP_DAILY_LIMIT,
+	SKIP_LEVEL_L0,
+	SKIP_NOT_SENDABLE,
+	TITLE_EVENT_FAILED,
 	TITLE_RUN_FAILED,
 	TITLE_STATUS_FAILED,
 	TRIGGER_CHANGE_ACTION,
@@ -92,7 +102,7 @@ from erp_ai.constants import (
 	TRIGGER_TICKET_INSERT,
 )
 
-CLASSIFY_MAX_TOKENS = 600
+CLASSIFY_MAX_TOKENS = 2048
 REASON_MAX_TOKENS = 16000
 STOP_TOOL_USE = "tool_use"
 STOP_MAX_TOKENS = "max_tokens"
@@ -142,6 +152,8 @@ CREATING_TOOLS = ("post_comment", "create_task", "reply_to_requester", "create_k
 PROPOSE_TOOLS = ("propose_file_change", "propose_new_file", "propose_bench_command")
 PROPOSE_STEP = "propose"
 UNPARSEABLE_ERROR = "UNPARSEABLE: không phân loại được"
+# The unparseable classify row's error keeps this many characters of the raw answer, masked first (BUG-004).
+CLASSIFY_RAW_HEAD_MAX_CHARS = 300
 BAD_MAPPING_ERROR = "category_mapping không hợp lệ, không có giá trị dự đoán"
 BAD_ROUTING_ERROR = "routing_rules không hợp lệ, định tuyến dùng giá trị rỗng"
 NO_SCORE_REASON = "không có điểm"
@@ -152,6 +164,9 @@ ROUTE_NO_CHANGE = "Bot đã phân loại phiếu, các trường đã đúng nê
 ROUTE_ASSIGNED = "Đã gán cho {person}."
 ROUTE_TASK = "Đã tạo Task {task}."
 ROUTE_WATCHER = "Đã thêm {person} làm người theo dõi."
+# ADR-049: the labels the route gave the ticket (Helpdesk Tags)
+LABELS_TOOL = "add_labels"
+ROUTE_LABELS = "Bot đã gắn nhãn: {labels}."
 # (u5) the D watcher (AC-27, U4b-fixes Fix 6)
 WATCHER_TOOL = "add_watcher"
 REASON_ALREADY_FOLLOWING = "đã theo dõi"
@@ -212,24 +227,32 @@ GUIDANCE_EXISTS_LOG = "erp_ai guidance ticket=%s run_id=%s: đã có hướng x�
 # The action entry of the run's one guidance comment (ADR-036 QĐ 8, w1.md:105).
 GUIDANCE_TOOL = "post_guidance"
 # The answer in the conversation of a run a message started, when the guidance comment took it (CHG-003 Amendment 3).
-GUIDANCE_REPLY_TOOL = "post_guidance_reply"
 # The split question a guidance run's route gathered, per run: (classify row, text, requests), recorded as asked only
 # once the run's one comment carrying it is posted (AC-28, C9-fix1 R20a); dropped when the run ends.
 SPLIT_HELD_FLAG = "erp_ai_split_held"
 # A requester-reply event whose key is already on a log row: one logger line, no row (ADR-033 QĐ 6, U6b-fixes Sửa 1).
 ALREADY_HANDLED_LOG = "erp_ai skip ticket=%s run_id=%s reason=already_handled"
+# FEAT-008: reading the lessons of a step failed; the step goes on without lessons (ADR-046).
+TITLE_LESSON_READ_FAILED = "erp_ai: đọc bài học lỗi"
 
 
 def run_for_ticket(
-	ticket_name: str, trigger: str, message_name: str | None = None, communication_name: str | None = None
+	ticket_name: str,
+	trigger: str,
+	message_name: str | None = None,
+	communication_name: str | None = None,
+	run_id: str | None = None,
 ) -> None:
 	"""Agent job (design 4.3). Never raises: a failed run is logged and the job ends normally.
+
+	`run_id` is the one the queue gave the job with its call_received row (ADR-048 QĐ 2, design 3.7); a job without
+	one (queued before CHG-009, or merged into a running one) gets a fresh one.
 
 	No rollback on the error path: the gateway writes key breaker state without committing, and a
 	rollback would lose the key status and the alarm that state drives (committed by `_call_model`).
 	"""
 	try:
-		_run(ticket_name, trigger, message_name, communication_name)
+		_run(ticket_name, trigger, message_name, communication_name, run_id=run_id)
 	except Exception as exc:
 		frappe.log_error(
 			TITLE_RUN_FAILED, f"ticket={ticket_name} trigger={trigger} error={type(exc).__name__}"
@@ -245,25 +268,33 @@ def _call_model(task, **kwargs):
 			frappe.db.commit()
 
 
-def _run(ticket_name, trigger, message_name=None, communication_name=None):
+def _run(ticket_name, trigger, message_name=None, communication_name=None, run_id=None):
 	# (a) the job must run as the agent account, checked before the ticket is read (AC-6)
 	if not authority.enter_agent_session():
 		return
 
-	# (b) disabled at run time: stop without a log entry
 	settings = frappe.get_single(SETTING_DOCTYPE)
-	if not settings.enabled:
-		return
-	routing = load_routing_config(settings.routing_rules)
-
 	reply_run = trigger == TRIGGER_REQUESTER_REPLY
 	kb_run = trigger == TRIGGER_KB_DRAFT
-	# ADR-033 QĐ 2: a requester-reply run is named by its event; each row it writes records the event as handled
-	run_id = queue.requester_reply_key(ticket_name, communication_name) if reply_run else uuid.uuid4().hex
-	# (r1) the event already has a row: run again for nothing, not even a row (ADR-033 QĐ 6, B-2)
-	if reply_run and frappe.db.exists(LOG_DOCTYPE, {"run_id": run_id}):
+	# ADR-033 QĐ 2: a requester-reply run is named by its event; each row it writes records the event as handled.
+	# Another run keeps the run_id of its job, the one on its call_received row (ADR-048 QĐ 2), else a fresh one.
+	if reply_run:
+		run_id = queue.requester_reply_key(ticket_name, communication_name)
+	elif not (isinstance(run_id, str) and run_id):
+		run_id = uuid.uuid4().hex
+	# (r1) the event already has a row: run again for nothing, not even a row (ADR-033 QĐ 6, B-2); before (b), so a
+	# handled event run again adds no skip row either (D-7)
+	# ADR-048 QĐ 4: only a row the run wrote counts, not the queue's call_received row that carries the key too
+	if reply_run and frappe.db.exists(
+		LOG_DOCTYPE, {"run_id": run_id, "entry_type": ("!=", LOG_ENTRY_RUN_EVENT)}
+	):
 		frappe.logger(LOGGER_NAME).info(ALREADY_HANDLED_LOG, ticket_name, run_id)
 		return
+	# (b) disabled at run time: stop on one skip row naming the switch (ADR-003 Amendment 1)
+	if not settings.enabled:
+		_stop(ticket_name, trigger, run_id, SKIP_AGENT_DISABLED, settings)
+		return
+	routing = load_routing_config(settings.routing_rules)
 	# the ask_fallback dedup counts from here: one question per run, not per ticket (AC-22, ADR-037)
 	started_at = now_datetime()
 	field_map, missing = _ticket_fields(settings)
@@ -272,9 +303,10 @@ def _run(ticket_name, trigger, message_name=None, communication_name=None):
 		frappe.logger(LOGGER_NAME).info(
 			"erp_ai ticket_fields run_id=%s missing=%s", run_id, "; ".join(missing)
 		)
-	# (c) the single send condition, re-checked at run time (NFR-4)
-	if not policy.can_send_ticket(ticket_name):
-		_log_skip(ticket_name, trigger, run_id, "not_sendable")
+	# (c) the single send condition, re-checked at run time (NFR-4); the skip row names its kind (ADR-003 Amendment 1)
+	refusal = policy.send_refusal(ticket_name)
+	if refusal:
+		_stop(ticket_name, trigger, run_id, f"{SKIP_NOT_SENDABLE}:{refusal}", settings)
 		return
 	# (r2)-(r4) the requester's message is read again; the knowledge-draft run checks its ticket; a skip row is not
 	# counted by runs_today
@@ -284,7 +316,7 @@ def _run(ticket_name, trigger, message_name=None, communication_name=None):
 	elif kb_run:
 		skip = _kb_draft_skip(ticket_name, settings)
 	if skip:
-		_log_skip(ticket_name, trigger, run_id, skip)
+		_stop(ticket_name, trigger, run_id, skip, settings)
 		return
 	# (d) daily limit counted from the log (AC-15); above L0 the person is told once a day (AC-23, AC-61); the
 	# knowledge-draft run is not checked (ADR-033 QĐ 4)
@@ -293,7 +325,7 @@ def _run(ticket_name, trigger, message_name=None, communication_name=None):
 		notice = None
 		if policy.effective_level(settings, over_budget=False) != LEVELS[0]:
 			notice = ("daily_limit", DAILY_LIMIT_BODY.format(limit=limit), _start_of_today())
-		_log_skip(ticket_name, trigger, run_id, "daily_limit", notice)
+		_stop(ticket_name, trigger, run_id, SKIP_DAILY_LIMIT, settings, notice)
 		return
 	# (e)
 	over_budget = policy.is_over_budget(settings)
@@ -305,10 +337,13 @@ def _run(ticket_name, trigger, message_name=None, communication_name=None):
 
 	# a run other than the ticket's first one needs a level above L0 (U6b.md:286)
 	if trigger != TRIGGER_TICKET_INSERT and level == LEVELS[0]:
-		_log_skip(ticket_name, trigger, run_id, "level_L0")
+		_stop(ticket_name, trigger, run_id, SKIP_LEVEL_L0, settings)
 		return
 	status = RunStatus(ticket_name, run_id, settings.get("thinking_text"))
 	delay = None
+	# past the gates the run ends on one end row (ADR-048 QĐ 2): failed on a gateway error (the time budget too) or an
+	# exception only; a step that reports its own failure (unparseable, a failing tool) still ends done (design 3.7)
+	failed = False
 	try:
 		status.start()
 		# anchor of the delay = right after the start signal (AC-3); ticket_insert never waits
@@ -387,6 +422,8 @@ def _run(ticket_name, trigger, message_name=None, communication_name=None):
 				later_messages=_later_messages(ticket_name) if reclassify else None,
 			)
 			if not proceed:
+				# only the gateway error gives no classification: an excluded ticket's run gives its own
+				failed = classified is None
 				return
 			classification = classified or classification
 			if classified is None and context is not None:
@@ -410,7 +447,7 @@ def _run(ticket_name, trigger, message_name=None, communication_name=None):
 				# post_notice's dedup read locked the ticket row: free it before the model call (D-20)
 				if not frappe.flags.in_test:
 					frappe.db.commit()
-			_reason(
+			failed = not _reason(
 				ticket_name,
 				trigger,
 				run_id,
@@ -425,9 +462,13 @@ def _run(ticket_name, trigger, message_name=None, communication_name=None):
 				notices=notices,
 				guidance_posted=posted,
 			)
+	except BaseException:
+		failed = True
+		raise
 	finally:
 		close_collector(run_id)
 		frappe.flags.get(SPLIT_HELD_FLAG, {}).pop(run_id, None)
+		_log_end(ticket_name, trigger, run_id, failed)
 		_end_status(status, delay, ticket_name, run_id, trigger)
 
 
@@ -520,13 +561,7 @@ def _end_status(status, delay, ticket_name, run_id, trigger):
 	"""
 	status.done()
 	errors = status.take_errors()
-	# Runs in a `finally`: a failing log call must never replace the run's own exception (or the normal
-	# return). There is no better place left to report a failure of the log itself, so it is dropped.
-	for piece in errors:
-		try:
-			frappe.log_error(TITLE_STATUS_FAILED, f"ticket={ticket_name} run_id={run_id} {piece}")
-		except Exception:
-			pass
+	_log_status_errors(errors, ticket_name, run_id)
 	try:
 		frappe.logger(LOGGER_NAME).info(
 			"erp_ai run_status ticket=%s run_id=%s trigger=%s signals=%d errors=%d delay_s=%.1f waited_s=%.1f",
@@ -540,6 +575,50 @@ def _end_status(status, delay, ticket_name, run_id, trigger):
 		)
 	except Exception:
 		pass
+
+
+def _log_status_errors(errors, ticket_name, run_id) -> None:
+	"""One Error Log per failed emit, its code only (NFR-4').
+
+	Runs in a `finally` or after a stop: a failing log call must never replace the run's own exception (or the
+	normal return). There is no better place left to report a failure of the log itself, so it is dropped.
+	"""
+	for piece in errors:
+		try:
+			frappe.log_error(TITLE_STATUS_FAILED, f"ticket={ticket_name} run_id={run_id} {piece}")
+		except Exception:
+			pass
+
+
+def _log_end(ticket_name, trigger, run_id, failed) -> None:
+	"""The run's one end row, `run_failed` or `run_done` (ADR-048 QĐ 2, design 3.7), committed outside tests before
+	its `done`, so the panel that reloads on that signal reads it. Never raises (ADR-048 QĐ 3, AC-11): `record_event`
+	logs its own failure; a failing commit leaves one Error Log of codes, and the run's result stands.
+	"""
+	code = EVENT_RUN_FAILED if failed else EVENT_RUN_DONE
+	record_event(ticket=ticket_name, trigger=trigger, code=code, run_id=run_id)
+	if frappe.flags.in_test:
+		return
+	try:
+		frappe.db.commit()
+	except Exception as exc:
+		# Runs in a `finally`: a failing log call must not replace the run's own exception either, so it is dropped.
+		try:
+			frappe.log_error(
+				TITLE_EVENT_FAILED,
+				f"ticket={ticket_name} trigger={trigger} code={code} error={type(exc).__name__}",
+			)
+		except Exception:
+			pass
+
+
+def _stop(ticket_name, trigger, run_id, stop_reason, settings, notice=None):
+	"""An early stop (ADR-048 QĐ 2, 8; ADR-008 Amendment 1): its one `skip` row, committed by `write_entry`, then the
+	run's one `done` (none when the indicator text is empty); a failed emit goes to the Error Log."""
+	_log_skip(ticket_name, trigger, run_id, stop_reason, notice)
+	status = RunStatus(ticket_name, run_id, settings.get("thinking_text"))
+	status.stop()
+	_log_status_errors(status.take_errors(), ticket_name, run_id)
 
 
 def _log_skip(ticket_name, trigger, run_id, stop_reason, notice=None):
@@ -619,7 +698,12 @@ def _notice(ticket_name, notice, body, since, *, trigger, instructor=None) -> di
 	if not result.get("ok"):
 		return None
 	return action_entry(
-		NOTICE_TOOL, "Comment", result["comment"], True, value_after={"notice": notice}, instructor=instructor
+		NOTICE_TOOL,
+		MESSAGE_DOCTYPE,
+		result["message"],
+		True,
+		value_after={"notice": notice},
+		instructor=instructor,
 	)
 
 
@@ -668,7 +752,7 @@ def _failure_notice(ticket_name, exc, trigger, instructor, run_id) -> dict | Non
 
 def _done_suffix(run_id) -> str:
 	"""What the run's collector holds, for its failure notice (design-w1-fixes-20 Điểm 3.1): done, pending and manual
-	lines apart, as `failure_summary` writes and escapes them; a line break before it, or "" when there is none."""
+	lines apart, as `failure_summary` writes them; a line break before it, or "" when there is none."""
 	summary = failure_summary(run_id)
 	return f"\n{summary}" if summary else ""
 
@@ -707,7 +791,8 @@ def _classify(
 	The request carries the configured ticket fields (AC-24) and, when the step runs again on a later run (ADR-037
 	QĐ 2), `later_messages`: the people's messages since the latest classification, as data. The route leaves out
 	the fields the person typed at creation, while the entry keeps the model's prediction and names the typed set
-	(AC-19, AC-21, A-U4b-2).
+	(AC-19, AC-21, A-U4b-2). The matching active lessons go in the request as data (FEAT-008, ADR-046) and every row
+	of the step names them in `lessons_used`.
 
 	Returns `(proceed, classification, context)`: `proceed` is False when the run must end here (gateway error, or
 	a classification that puts the ticket in an excluded team);
@@ -729,7 +814,16 @@ def _classify(
 	)
 	subject = ticket.subject
 	field_values = _ticket_field_values(ticket_name, field_map)
-	base = {"ticket": ticket_name, "run_id": run_id, "entry_type": "classify", "trigger": trigger, "turn": 0}
+	lessons = _lessons(settings, subject, ticket.description)
+	label_inputs = _label_inputs(ticket_name, run_id, subject, ticket.description)
+	base = {
+		"ticket": ticket_name,
+		"run_id": run_id,
+		"entry_type": "classify",
+		"trigger": trigger,
+		"turn": 0,
+		**_lessons_used(lessons),
+	}
 	status.working(CLASSIFY_STEP)
 	try:
 		result = _call_model(
@@ -740,6 +834,8 @@ def _classify(
 				departments(routing),
 				ticket_fields=field_values,
 				later_messages=later_messages,
+				lessons=lessons,
+				**label_inputs._asdict(),
 			),
 			max_tokens=CLASSIFY_MAX_TOKENS,
 			deadline=deadline,
@@ -763,10 +859,16 @@ def _classify(
 	call_fields = _call_fields(result)
 	classification = parse_classification(result.text)
 	if classification is None:
-		error = "; ".join([UNPARSEABLE_ERROR, *status.take_errors()])
+		# masked before the cut: a cut through a secret value would leave it unmasked
+		raw_head = redact_secrets(result.text)[:CLASSIFY_RAW_HEAD_MAX_CHARS]
+		unparseable = f"{UNPARSEABLE_ERROR}; stop_reason={result.stop_reason}; raw={raw_head}"
+		error = "; ".join([unparseable, *status.take_errors()])
 		write_entry(**base, **call_fields, error=error, stop_reason="unparseable")
 		_log_classify(ticket_name, run_id, False, ticket.creation)
 		return True, None, context
+	classification = dataclasses.replace(
+		classification, labels=ticket_labels.canonical(classification.labels, label_inputs.modules)
+	)
 
 	# U2 (AC-9 b, U2.md:164-172): the team the department maps to is learnt from the predicate decide_route asks
 	probe_hits = []
@@ -882,6 +984,46 @@ def _classify(
 	return True, summary, context
 
 
+def _lessons(settings, subject: str, description: str) -> list[dict]:
+	"""The active lessons that match the ticket, within the caps of the Setting (FEAT-008, ADR-046 QĐ 1); [] when
+	learning is off. Never stops the run: a failed read leaves one Error Log, secrets masked, and gives []."""
+	try:
+		caps = policy.lesson_settings(settings)
+		if not caps.enabled:
+			return []
+		return lesson_read.relevant_lessons(
+			subject,
+			description,
+			max_lessons=caps.max_lessons,
+			max_chars=caps.max_chars,
+			scan_max=caps.scan_max,
+		)
+	except Exception:
+		frappe.log_error(
+			title=TITLE_LESSON_READ_FAILED,
+			message=redact_secrets(frappe.get_traceback()) or TITLE_LESSON_READ_FAILED,
+		)
+		return []
+
+
+def _lessons_used(lessons: list[dict]) -> dict:
+	"""The usage trace of a step's rows (AC-17): `lessons_used`, the names of the lessons the step sent; none sent
+	gives no key, so the rows stay as before."""
+	return {"lessons_used": [lesson["name"] for lesson in lessons]} if lessons else {}
+
+
+def _label_inputs(ticket_name, run_id, subject, description) -> ticket_labels.LabelInputs:
+	"""The label inputs of the classify request (ADR-049); a failed read never stops the classification: no label
+	inputs then, one logger line with the exception class."""
+	try:
+		return ticket_labels.classify_inputs(ticket_name, subject, description)
+	except Exception as exc:
+		frappe.logger(LOGGER_NAME).warning(
+			"erp_ai labels ticket=%s run_id=%s error=%s", ticket_name, run_id, type(exc).__name__
+		)
+		return ticket_labels.LabelInputs()
+
+
 def _complexity(score, reason) -> dict:
 	"""The complexity (1-3) and its reason for the reasoning step; {} when there is no score (ADR-019 Amendment 1)."""
 	if score not in (1, 2, 3):
@@ -938,11 +1080,13 @@ def _route(
 		return _route_skipped(log_name, decision, context)
 	actions, lines, errors = [], [], []
 	assigned = task = watcher = commented = split = None
+	labelled = []
 	sla = None
 	frappe.db.savepoint(ROUTE_SAVEPOINT)
 	try:
 		result = _apply_route_unit(decision, classification, context, actions, errors)
 		if result:
+			labelled = _labels_unit(classification.labels, context, actions, errors)
 			sla = _check_sla(classification.category, context, actions, lines)
 			if auto_assign:
 				assigned = _assign_unit(decision, context, actions, lines, errors)
@@ -950,7 +1094,7 @@ def _route(
 				task = _task_unit(assigned, subject, classification, context, actions, lines, errors)
 			if decision.watcher:
 				watcher = _watch_unit(decision.watcher, context, actions, errors)
-			done = _route_lines(result, assigned, task, watcher)
+			done = _route_lines(result, assigned, task, watcher, labelled)
 			others = [*lines, *([split_text] if split_text else [])]
 			lines = [*done, *others]
 			if collect_run_id and collecting(collect_run_id):
@@ -960,7 +1104,7 @@ def _route(
 				commented = _comment_unit(lines, context, actions, errors)
 				if commented and split_text:
 					split = classification.requests
-		_record_route(log_name, result, decision, assigned, task, actions, errors, split)
+		_record_route(log_name, result, decision, assigned, task, actions, errors, split, labelled)
 		_log_route_summary(context, result, assigned, task, commented, sla)
 	except Exception:
 		frappe.db.rollback(save_point=ROUTE_SAVEPOINT)
@@ -1100,14 +1244,14 @@ def _task_unit(user, subject, classification, context, actions, lines, errors):
 
 
 def _comment_unit(lines, context, actions, errors):
-	"""(u4): post the gathered sentences as at most one comment. Returns True when it was posted."""
+	"""(u4): say the gathered sentences as at most one message of the conversation (ADR-050). Returns True when it was
+	said. Plain text: the panel sets text only, so nothing is escaped."""
 	if not lines:
 		return False
-	# the split question quotes the model's reading of the ticket: every line is escaped once, here, where it is posted
 	result = _run_unit(
 		"post_routing_comment",
-		lambda: post_routing_comment([escape_html(line) for line in lines], context),
-		"Comment",
+		lambda: post_routing_comment(lines, context),
+		MESSAGE_DOCTYPE,
 		None,
 		actions,
 		errors,
@@ -1116,7 +1260,7 @@ def _comment_unit(lines, context, actions, errors):
 		return False
 	actions.append(
 		_route_action(
-			"post_routing_comment", "Comment", result["comment"], True, instructor=context.instructor
+			"post_routing_comment", MESSAGE_DOCTYPE, result["message"], True, instructor=context.instructor
 		)
 	)
 	return True
@@ -1133,8 +1277,9 @@ def _collect_route_lines(run_id, done, others) -> bool:
 	return bool(done or others)
 
 
-def _route_lines(result, assigned, task, watcher) -> list[str]:
-	"""The route comment's own sentences (U4b.md:247): fields written, person given, Task created, watcher added.
+def _route_lines(result, assigned, task, watcher, labelled=()) -> list[str]:
+	"""The route comment's own sentences (U4b.md:247): fields written, labels given (ADR-049), person given, Task
+	created, watcher added.
 
 	Fixed text with names only, never the ticket's content. No field changed → the "already right" sentence.
 	"""
@@ -1144,6 +1289,8 @@ def _route_lines(result, assigned, task, watcher) -> list[str]:
 		if field in FIELD_LABELS
 	)
 	lines = [ROUTE_DONE.format(fields=fields) if fields else ROUTE_NO_CHANGE]
+	if labelled:
+		lines.append(ROUTE_LABELS.format(labels=", ".join(labelled)))
 	if assigned:
 		lines.append(ROUTE_ASSIGNED.format(person=get_fullname(assigned)))
 	if task:
@@ -1151,6 +1298,28 @@ def _route_lines(result, assigned, task, watcher) -> list[str]:
 	if watcher:
 		lines.append(ROUTE_WATCHER.format(person=get_fullname(watcher)))
 	return lines
+
+
+def _labels_unit(names, context, actions, errors) -> list[str]:
+	"""(u1b) ADR-049: the classification's labels become Helpdesk Tags of the ticket, after (u1) wrote it. Returns
+	the labels added; none to give, or all carried already → [] and no entry. An exception undoes only this unit."""
+	if not names:
+		return []
+	ticket = context.ticket_name
+	result = _run_unit(LABELS_TOOL, lambda: add_labels(names, context), "HD Ticket", ticket, actions, errors)
+	if result is None or not result["added"]:
+		return []
+	actions.append(
+		_route_action(
+			LABELS_TOOL,
+			"HD Ticket",
+			ticket,
+			True,
+			value_after={"labels": result["added"]},
+			instructor=context.instructor,
+		)
+	)
+	return result["added"]
 
 
 def _watch_unit(watcher, context, actions, errors) -> str | None:
@@ -1255,9 +1424,10 @@ def _check_sla(category, context, actions, lines):
 	return state
 
 
-def _record_route(log_name, result, decision, assigned, task, actions, errors, split=None):
+def _record_route(log_name, result, decision, assigned, task, actions, errors, split=None, labelled=None):
 	"""Update the `classify` entry once (design 3.5). `split`: the requests of the split question, given only when a
-	comment carrying it was posted; only then is the question recorded as asked (AC-28)."""
+	comment carrying it was posted; only then is the question recorded as asked (AC-28). `labelled`: the labels the
+	route added (ADR-049)."""
 	updates = {
 		"applied": 1 if result else 0,
 		"actions": json.dumps(_bounded_actions(actions), ensure_ascii=False),
@@ -1272,6 +1442,8 @@ def _record_route(log_name, result, decision, assigned, task, actions, errors, s
 			after["assign"] = [assigned]
 		if task:
 			after["task"] = task
+		if labelled:
+			after["labels"] = labelled
 		for column, value in (("value_before", before), ("value_after", after)):
 			if value:
 				updates[column] = json.dumps(value, ensure_ascii=False)
@@ -1336,7 +1508,8 @@ def _reason(
 	"""Reasoning step (design 4.3 step 8): at most `max_turns_per_run` model turns, one `reason` entry each.
 
 	The first message carries the configured ticket fields that hold a value as data (AC-24, U4b.md:249), and
-	`guidance_posted` when the ticket already has its guidance comment (ticket data, ADR-036 QĐ 7, U4b-10).
+	`guidance_posted` when the ticket already has its guidance comment (ticket data, ADR-036 QĐ 7, U4b-10), and the
+	matching active lessons as data (FEAT-008, ADR-046); every `reason` row of the run names them in `lessons_used`.
 	`notices` are the entries of notices posted before this step: they go on the first entry written (U4b.md:250).
 	A gateway error posts the run_failed notice on its own entry (U4b.md:251). `started_at` is the run's start: the
 	ask_fallback question counts only the ones posted since, so each run below the threshold asks once (AC-22).
@@ -1378,6 +1551,7 @@ def _reason(
 		console_tools=granted.console_block,
 	)
 	fields = _ticket_field_values(ticket_name, field_map or {})
+	lessons = _lessons(settings, ticket.subject, ticket.description)
 	messages = [
 		{
 			"role": "user",
@@ -1389,6 +1563,7 @@ def _reason(
 				ticket_fields=fields,
 				guidance_posted=guidance_posted,
 				conversation=conversation,
+				lessons=lessons,
 				propose_now=granted.change_block and granted.act_now_block,
 			),
 		}
@@ -1399,6 +1574,7 @@ def _reason(
 		"entry_type": "reason",
 		"trigger": trigger,
 		"instructor": context.instructor,
+		**_lessons_used(lessons),
 	}
 	max_turns = settings.max_turns_per_run
 	for turn in range(1, max_turns + 1):
@@ -1494,39 +1670,26 @@ def _reason(
 
 def _finish_guidance(context, actions) -> None:
 	"""The one place the runner calls `post_guidance` (ADR-036 QĐ 1, w1.md:105): inside the last turn, after its tools
-	and before its entry, so the comment is undone with the turn (R5-16). Posted → one action entry with the section
+	and before its entry, so the message is undone with the turn (R5-16). Posted → one action entry with the section
 	counts (QĐ 8). A run in parallel posted the ticket's guidance first → one log line, and the run's collected lines
-	go out as before: one result comment without the marker, in the order of GUIDANCE_SECTIONS, one sentence per line,
-	each escaped once, no section heading (design-w1-fixes-20 Điểm 1.6, AD3-4). Nothing to say → one log line.
-	Either comment, once posted, records the split question the route held (`_record_split`); a refusal records none.
-	Once the guidance comment is posted, a run a message started that said nothing in the conversation answers there
-	too, with its own entry (CHG-003 Amendment 3)."""
+	go out as before: one result message without the marker, in the order of GUIDANCE_SECTIONS, one sentence per
+	line, no section heading (design-w1-fixes-20 Điểm 1.6, AD3-4). Nothing to say → one log line. Either message,
+	once said, records the split question the route held (`_record_split`); a refusal records none. ADR-050: the
+	guidance is itself a message of the ticket's conversation, so no other answer follows it."""
 	ticket, run_id = context.ticket_name, context.run_id
 	result = post_guidance(ticket, run_id)
 	if result.get("ok"):
 		actions.append(
 			action_entry(
 				GUIDANCE_TOOL,
-				"Comment",
-				result["comment"],
+				MESSAGE_DOCTYPE,
+				result["message"],
 				True,
 				value_after={"counts": result["counts"]},
 				instructor=context.instructor,
 			)
 		)
-		_record_split(run_id, result["comment"])
-		reply = post_guidance_reply(context)
-		if reply is not None:
-			actions.append(
-				action_entry(
-					GUIDANCE_REPLY_TOOL,
-					MESSAGE_DOCTYPE,
-					reply.get("message"),
-					bool(reply.get("ok")),
-					reason=reply.get("reason"),
-					instructor=context.instructor,
-				)
-			)
+		_record_split(run_id, result["message"])
 		return
 	reason = result.get("reason")
 	if reason == REASON_NO_CONTENT:
@@ -1534,7 +1697,9 @@ def _finish_guidance(context, actions) -> None:
 		return
 	if reason != REASON_GUIDANCE_EXISTS:
 		actions.append(
-			action_entry(GUIDANCE_TOOL, "Comment", None, False, reason=reason, instructor=context.instructor)
+			action_entry(
+				GUIDANCE_TOOL, MESSAGE_DOCTYPE, None, False, reason=reason, instructor=context.instructor
+			)
 		)
 		return
 	frappe.logger(LOGGER_NAME).info(GUIDANCE_EXISTS_LOG, ticket, run_id)
@@ -1542,19 +1707,19 @@ def _finish_guidance(context, actions) -> None:
 	lines = [line for section in GUIDANCE_SECTIONS for line in sections[section]]
 	if not lines:
 		return
-	posted = post_routing_comment([escape_html(line) for line in lines], context)
+	posted = post_routing_comment(lines, context)
 	actions.append(
 		_route_action(
 			"post_routing_comment",
-			"Comment",
-			posted.get("comment"),
+			MESSAGE_DOCTYPE,
+			posted.get("message"),
 			bool(posted.get("ok")),
 			posted.get("reason"),
 			instructor=context.instructor,
 		)
 	)
 	if posted.get("ok"):
-		_record_split(run_id, posted["comment"])
+		_record_split(run_id, posted["message"])
 
 
 def _hold_split(run_id, log_name, split_text, classification) -> None:
@@ -1563,15 +1728,16 @@ def _hold_split(run_id, log_name, split_text, classification) -> None:
 		frappe.flags.setdefault(SPLIT_HELD_FLAG, {})[run_id] = (log_name, split_text, classification.requests)
 
 
-def _record_split(run_id, comment) -> None:
-	"""The split question the run's route held is recorded as asked on its classify row only once the run's comment
-	`comment` was posted and its text carries the question, escaped once (AC-28, R14c, C9-fix1 R20a). Inside the
-	last turn, so it is undone with that turn."""
+def _record_split(run_id, message) -> None:
+	"""The split question the run's route held is recorded as asked on its classify row only once the run's message
+	`message` was said and its text carries the question: escaped once inside the guidance, as written in a plain
+	message (AC-28, R14c, C9-fix1 R20a, ADR-050). Inside the last turn, so it is undone with that turn."""
 	held = frappe.flags.get(SPLIT_HELD_FLAG, {}).get(run_id)
 	if held is None:
 		return
 	log_name, text, requests = held
-	if escape_html(text) in (frappe.db.get_value("Comment", comment, "content") or ""):
+	content = frappe.db.get_value(MESSAGE_DOCTYPE, message, "content") or ""
+	if escape_html(text) in content or text in content:
 		frappe.db.set_value(
 			LOG_DOCTYPE,
 			log_name,

@@ -13,6 +13,7 @@ import unicodedata
 import frappe
 from frappe.utils import strip_html
 
+from erp_ai.agent.labels import parse_tags
 from erp_ai.agent.redact import redact_secrets
 from erp_ai.agent.tools import source
 
@@ -50,11 +51,23 @@ def plain_text(html) -> str:
 	return strip_html(_BLOCK_TAG.sub(" <", html or ""))
 
 
+def match_score(words: list[str], heading: str, text: str) -> tuple[int, int, set[str]] | None:
+	"""`(matched words, matched words in the heading, the matched set)` of already tokenized `words`.
+
+	`matched` is `set(words)` that are whole words of `text` (accents and case as `tokenize`); None when empty.
+	Shared by the knowledge-base, manuals and lesson rankings; each caller keeps its own sort key.
+	"""
+	matched = set(words) & text_words(text)
+	if not matched:
+		return None
+	return len(matched), len(matched & text_words(heading)), matched
+
+
 def search_kb_articles(query: str, limit: int) -> list[dict]:
 	"""Published articles the session user may read, ranked by the number of query words they contain.
 
 	Order: matched words desc, matched words in the title desc, `modified` desc. Returns `limit` rows
-	`{name, title, excerpt}`.
+	`{name, title, excerpt, labels}` (ADR-049: the article's labels).
 	"""
 	words = list(dict.fromkeys(tokenize(query)))
 	if not words:
@@ -67,7 +80,7 @@ def search_kb_articles(query: str, limit: int) -> list[dict]:
 		"HD Article",
 		filters={"status": "Published"},
 		or_filters=or_filters,
-		fields=["name", "title", "content", "modified"],
+		fields=["name", "title", "content", "modified", "_user_tags"],
 		order_by="modified desc",
 		limit_page_length=KB_SCAN_MAX,
 	)
@@ -75,13 +88,18 @@ def search_kb_articles(query: str, limit: int) -> list[dict]:
 	for row in rows:
 		# One space keeps the last title word and the first content word apart.
 		text = f"{row.title or ''} {plain_text(row.content)}"
-		matched = set(words) & text_words(text)
-		if matched:
-			in_title = len(matched & text_words(row.title))
-			ranked.append((len(matched), in_title, row.modified, row, text, matched))
+		score = match_score(words, row.title, text)
+		if score:
+			count, in_title, matched = score
+			ranked.append((count, in_title, row.modified, row, text, matched))
 	ranked.sort(key=lambda item: item[:3], reverse=True)
 	return [
-		{"name": row.name, "title": row.title, "excerpt": _excerpt(text, matched)}
+		{
+			"name": row.name,
+			"title": row.title,
+			"excerpt": _excerpt(text, matched),
+			"labels": parse_tags(row._user_tags),
+		}
 		for _score, _in_title, _modified, row, text, matched in ranked[:limit]
 	]
 
@@ -117,10 +135,10 @@ def search_manuals(
 			source._logger().warning("search_manuals skipped %s: %s", document, type(error).__name__)
 			continue
 		for line, heading, text in sections:
-			matched = set(words) & set(_words(text))
-			if matched:
-				in_heading = len(matched & set(_words(heading)))
-				ranked.append((-len(matched), -in_heading, document, line, heading, text, matched))
+			score = match_score(words, heading, text)
+			if score:
+				count, in_heading, matched = score
+				ranked.append((-count, -in_heading, document, line, heading, text, matched))
 	ranked.sort(key=lambda item: item[:4])
 	return [
 		{"document": document, "heading": heading, "line": line, "excerpt": _excerpt(text, matched)}

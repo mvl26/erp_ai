@@ -1,5 +1,6 @@
 import json
 import re
+import unicodedata
 from dataclasses import dataclass, field
 
 import frappe
@@ -18,6 +19,11 @@ URGENT_TAGS = ("[GẤP]", "[GẬP]")
 # AC-28 (design.md:409): the split question lists at most 10 requests, each cut to 200 characters.
 SPLIT_MAX_REQUESTS = 10
 SPLIT_REQUEST_MAX_CHARS = 200
+# ADR-049: the ticket's labels (`nhan`): at most 3, each one line of 2-40 characters that Frappe's comma-separated tag
+# column and the tag chips keep as typed.
+LABELS_MAX = 3
+LABEL_MIN_CHARS, LABEL_MAX_CHARS = 2, 40
+_LABEL = re.compile(r"^[\w &()+./#-]+$")
 
 # D-8: ticket_type = category name; agent_group and priority per guide 16.1-16.2.
 DEFAULT_CATEGORY_MAPPING = {
@@ -47,6 +53,7 @@ class Classification:
 	department: str | None = None
 	# None = unknown (direct builders such as set_classification); never 0 for unknown (design-w0-fixes-2.md section 1).
 	confidence_pct: int | None = None
+	labels: tuple[str, ...] = ()
 
 
 def _load_json_object(text):
@@ -75,6 +82,29 @@ def _read_scores(data):
 	if not isinstance(reason, str):
 		reason = ""
 	return complexity, importance, " ".join(reason.split()[:SCORE_REASON_MAX_WORDS])
+
+
+def clean_label(value) -> str | None:
+	"""A label as the ticket keeps it: NFC, whitespace runs one space, LABEL_MIN_CHARS..LABEL_MAX_CHARS characters of
+	_LABEL; None for anything else (ADR-049)."""
+	if not isinstance(value, str):
+		return None
+	label = " ".join(unicodedata.normalize("NFC", value).split())
+	if not LABEL_MIN_CHARS <= len(label) <= LABEL_MAX_CHARS or not _LABEL.match(label):
+		return None
+	return label
+
+
+def _read_labels(data) -> tuple[str, ...]:
+	"""The first LABELS_MAX good labels of `nhan`, a repeat (any case) left out; a bad one is dropped, not the rest."""
+	raw = data.get("nhan")
+	if not isinstance(raw, list):
+		return ()
+	labels = {}
+	for item in raw:
+		if (label := clean_label(item)) and label.casefold() not in labels:
+			labels[label.casefold()] = label
+	return tuple(labels.values())[:LABELS_MAX]
 
 
 def parse_classification(text: str) -> Classification | None:
@@ -110,6 +140,7 @@ def parse_classification(text: str) -> Classification | None:
 		score_reason=score_reason,
 		department=department if isinstance(department, str) else None,
 		confidence_pct=confidence_pct,
+		labels=_read_labels(data),
 	)
 
 

@@ -23,7 +23,9 @@ VIETNAMESE_ACCENTS = re.compile(
 DOCTYPE_CONFIG = {
 	"ERP AI Setting": {
 		"folder": "erp_ai_setting",
-		"field_count": 78,  # CHG-010: console_enabled
+		# CHG-010: console_enabled (+1); FEAT-008: lessons_enabled, lessons_max_per_request, lessons_max_chars,
+		# lesson_teach_marker (+4); base 77
+		"field_count": 82,
 		"phrases": {
 			"enabled": ("Tắt", "4 đơn giá", "từ khóa kích hoạt"),
 			# FEAT-007 spec-addendum-3.md:88 (T64): from L2 up, ERP writes go through a proposal or a `Tự làm` row.
@@ -206,8 +208,20 @@ DOCTYPE_CONFIG = {
 				)
 			},
 			"prompt_revisions": ("Hệ thống tự ghi", "Không sửa được"),
+			# FEAT-008: the lesson store switch, its two caps and the teaching marker.
+			"lessons_enabled": ("bài học", "Tắt", "bài đã lưu vẫn giữ"),
+			"lessons_max_per_request": ("từ 1 đến 20", "không lưu được", "Mặc định 5"),
+			"lessons_max_chars": ("từ 1300 đến 20000", "không lưu được", "Mặc định 2000"),
+			# The rule of a person with authority is active at once; a message of anyone else is ignored (no lesson).
+			"lesson_teach_marker": (
+				"không phân biệt hoa thường",
+				"Để trống",
+				"thẩm quyền",
+				"bài học Đang dùng",
+				"bị bỏ qua",
+			),
 		},
-		"section_count": 14,
+		"section_count": 15,
 		"read_only_fields": (
 			"spent_this_month_usd",
 			"agent_enabled_at",
@@ -231,6 +245,7 @@ DOCTYPE_CONFIG = {
 			("section_operations", "Báo cáo và vận hành", "coo_report_recipients"),
 			("section_prompts", "Ghi đè prompt", "prompt_override_classify"),
 			("section_alerts", "Cảnh báo và khóa API", "alert_recipients"),
+			("section_lessons", "Bài học của bot", "lessons_enabled"),
 		),
 	},
 	"ERP AI Credential": {
@@ -342,9 +357,59 @@ DOCTYPE_CONFIG = {
 			("section_source", "Nguồn gốc", "run_id"),
 		),
 	},
+	# FEAT-008: one lesson of the bot; every field is system-written, no role may create or edit it.
+	"ERP AI Lesson": {
+		"folder": "erp_ai_lesson",
+		"field_count": 10,
+		"phrases": {
+			"lesson_status": ("Chờ duyệt", "Đang dùng", "Đã tắt", "Bị từ chối"),
+			"situation": ("tình huống", "300 ký tự", "che khóa"),
+			"lesson_text": ("1000 ký tự", "che khóa", "bot cần nhớ"),
+			"lesson_source": ("người sửa", "phiếu đã giải quyết", "người dạy", "rà soát"),
+			"ticket": ("phiếu", "Xóa phiếu", "không bị chặn"),
+			"change_proposal": ("đề xuất", "Để trống"),
+			"author": ("tài khoản", "người"),
+			"reviewed_by": ("duyệt", "từ chối", "Để trống"),
+			"reviewed_at": ("thời điểm", "duyệt", "Để trống"),
+			"history": ("bước", "người làm", "thời điểm"),
+		},
+		"section_count": 2,
+		"read_only_fields": (
+			"lesson_status",
+			"situation",
+			"lesson_text",
+			"lesson_source",
+			"ticket",
+			"change_proposal",
+			"author",
+			"reviewed_by",
+			"reviewed_at",
+			"history",
+		),
+		"sections": (
+			("section_lesson", "Bài học", "lesson_status"),
+			("section_origin", "Nguồn và người quyết", "lesson_source"),
+		),
+	},
+	# FEAT-008: one step in the history of a lesson (child of ERP AI Lesson), system-written.
+	"ERP AI Lesson Event": {
+		"folder": "erp_ai_lesson_event",
+		"field_count": 3,
+		"phrases": {
+			"step": ("Tạo", "Cập nhật", "Duyệt", "Từ chối", "Tắt", "Bật"),
+			"actor": ("tài khoản", "bot"),
+			"happened_at": ("thời điểm", "bước"),
+		},
+		"section_count": 2,
+		"read_only_fields": ("step", "actor", "happened_at"),
+		"sections": (
+			("section_step", "Bước", "step"),
+			("section_actor", "Người và lúc", "actor"),
+		),
+	},
 	"ERP AI Log": {
 		"folder": "erp_ai_log",
-		"field_count": 43,
+		"field_count": 44,
 		"phrases": {
 			"ticket": ("HD Ticket", "mã phiếu", "lọc"),
 			"run_id": ("cùng một lần chạy", "gom"),
@@ -357,6 +422,11 @@ DOCTYPE_CONFIG = {
 				"phân loại",
 				"lập luận",
 				"bước của đề xuất",
+				# CHG-009 design 2 (ADR-048 QĐ 1): the run_event row.
+				"run_event",
+				"lời gọi bot được nhận, gộp, từ chối",
+				"lần chạy xong/lỗi",
+				"ngăn trao đổi",
 			),
 			"turn": ("Lượt 0", "lượt 1", "lập luận"),
 			"trigger": (
@@ -404,12 +474,24 @@ DOCTYPE_CONFIG = {
 				"not_sendable",
 				"daily_limit",
 				"level_L0",
+				# CHG-009 design 2 (ADR-003 Amd 1, ADR-048 QĐ 4): the skip codes with the refusal kind, and the
+				# run_event codes.
+				"not_sendable:<loại>",
+				"agent_disabled",
+				"call_received",
+				"call_merged",
+				"call_busy",
+				"run_done",
+				"run_failed",
+				"created_by_agent",
+				"prefilled",
 			),
 			"tools_called": ("tool", "trong lượt này"),
 			"actions": ("hành động", "phiếu"),
 			"value_before": ("JSON", "trước khi"),
 			"value_after": ("JSON", "sau khi"),
 			"skipped_fields": ("bỏ qua", "phân loại"),
+			"lessons_used": ("JSON", "tên", "bài học", "Hệ thống tự ghi", "không sửa được"),
 			"predicted_category": ("đầu mục", "A đến F"),
 			"predicted_confidence": ("Cao", "Trung bình", "Thấp", "ai_confidence"),
 			# FEAT-007 design-w0-fixes-2.md section 1: -1 = unknown (wins over design.md:234).
@@ -465,6 +547,7 @@ DOCTYPE_CONFIG = {
 			"value_before",
 			"value_after",
 			"skipped_fields",
+			"lessons_used",
 			"predicted_category",
 			"predicted_confidence",
 			"predicted_confidence_pct",
@@ -607,6 +690,9 @@ FORBIDDEN_PHRASES = {
 		# FEAT-007 spec-addendum-4.md AC-29 (T64): an empty catalog no longer means "no ERP writes".
 		"catalog_rules": ("bot không ghi ERP ngoài phiếu",),
 		"code_change_enabled": ("tạo và sửa bản ghi trực tiếp",),
+		# FEAT-008: a taught rule never waits for approval; resolved tickets are a batch-2 source.
+		"lesson_teach_marker": ("chờ duyệt",),
+		"lessons_enabled": ("phiếu đã giải quyết",),
 	},
 	"ERP AI Log": {
 		"instructor": ("người ra lệnh", "khi phiếu mới tạo"),

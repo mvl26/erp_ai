@@ -2853,3 +2853,26 @@ class TestSharedLineSplitter(FrappeTestCase):
 
 		self.assertIs(erp_ai_setting.filled_lines, text_lines.filled_lines)
 		self.assertFalse(hasattr(erp_ai_setting, "_filled_lines"))
+
+
+class TestLessonLimits(FrappeTestCase):
+	def setUp(self):
+		frappe.db.rollback()
+		commit_guard = patch.object(frappe.db, "commit", side_effect=AssertionError("test must not commit"))
+		commit_guard.start()
+		self.addCleanup(commit_guard.stop)
+		self.addCleanup(frappe.db.rollback)
+		self.addCleanup(frappe.set_user, "Administrator")
+		keep_agent_settings(self)
+
+	def test_lesson_caps_out_of_range_refused(self):
+		for fieldname, value in (
+			("lessons_max_per_request", 25),
+			("lessons_max_per_request", 0),
+			("lessons_max_chars", 1299),
+			("lessons_max_chars", 20001),
+		):
+			doc = frappe.get_single(SETTING_DOCTYPE)
+			doc.set(fieldname, value)
+			with self.assertRaises(frappe.ValidationError, msg=f"{fieldname}={value}"):
+				doc.save(ignore_permissions=True)

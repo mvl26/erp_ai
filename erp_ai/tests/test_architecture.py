@@ -28,12 +28,13 @@ from pathlib import Path
 from typing import ClassVar, NamedTuple
 from unittest.mock import patch
 
-from erp_ai.agent import change_link
+from erp_ai.agent import change_link, messages, prompts
 from erp_ai.constants import (
 	AGENT_STATUS_EVENT,
 	AGENT_USER,
 	CHANGE_STATUS_APPLIED,
 	CHANGE_STATUS_PENDING,
+	LESSON_STATUS_ACTIVE,
 	PANEL_METHODS,
 )
 
@@ -147,6 +148,19 @@ LAYER_RULES = (
 		"STD-DESIGN-6: policy là tầng dưới của tools, không import ngược",
 	),
 	(
+		"erp_ai.agent.bot_status",
+		(
+			"erp_ai.gateway",
+			"erp_ai.agent.runner",
+			"erp_ai.agent.queue",
+			"erp_ai.agent.run_status",
+			"erp_ai.agent.tools",
+			"erp_ai.agent.policy",
+			"erp_ai.agent.run_log",
+		),
+		"ADR-048 QĐ 6: the panel's status reader never calls the model, runs, queues or signals the agent, calls a tool, judges a gate or writes a log row",
+	),
+	(
 		CHANGE_TEXT_MODULE,
 		CHANGE_TEXT_FORBIDDEN,
 		"design 8.2/ADR-022: change_text imports only the standard library and erp_ai.constants",
@@ -215,6 +229,10 @@ POLICY_FIELDS = (
 	"level_cap_e",
 	"level_cap_f",
 	"confidence_threshold",
+	"lessons_enabled",
+	"lessons_max_per_request",
+	"lessons_max_chars",
+	"lesson_teach_marker",
 )
 SETTING_CONTROLLER_FILE = "erp_ai_agent/doctype/erp_ai_setting/erp_ai_setting.py"
 
@@ -295,7 +313,12 @@ STATUS_SCRIPT_REQUIRED = (
 	r"Bot có thể không trả lời khi đang tắt, đang ở chế độ chỉ ghi nhận, "
 	r"phiếu không dùng AI hoặc thuộc nhóm loại trừ, đã hết lượt hôm nay, "
 	r"hoặc đang trả lời tin trước của phiếu này \(khi đó hãy gửi lại sau\)\. "
-	r"Nhận định và hướng xử lý của bot hiện ở phần thông tin của phiếu phía trên\.",
+	r"Nhận định và hướng xử lý của bot là tin trong ngăn này; người có vai trò ERP AI Instructor bấm "
+	r"\"Duyệt hướng xử lý\" dưới tin đó thì bot làm theo\.",
+	# ADR-050: the approve button under the newest guidance of the bot sends the fixed approval text through submit.
+	r'TEXT_APPROVE_GUIDANCE = "Duyệt hướng xử lý";',
+	r"message\?\.is_bot && message\?\.kind === KIND_GUIDANCE",
+	r"panel\.inputEl\.value = APPROVE_GUIDANCE_TEXT;\s*submit\(\);",
 	r'TEXT_LOAD_FAILED = "Không tải được dữ liệu của khu vực\. Hãy đóng rồi mở lại\."',
 	r"\(docked \? state\.panel\.slotEl : document\.body\)\.appendChild\(el\)",
 	# T12: stale-result guard (design F1 reload).
@@ -348,10 +371,10 @@ STATUS_SCRIPT_REQUIRED = (
 	r"catch \(e\) \{\s*onSendFailed\(\);",
 	r"isComposing\) \{\s*event\.preventDefault\(\);\s*submit\(\);",
 	r'addEventListener\("click", \(\) => \{\s*try \{\s*submit\(\);',
-	r"formEl,\s*slotEl",
 	# CHG-008 T4 (design 4.3): the proposals section, between the thread and the error line, and the fixed texts.
 	# CHG-010: no separate proposals section; the cards sit in threadEl and proposalErrorEl follows it.
-	r"threadEl,\s*proposalErrorEl,\s*errorEl,\s*formEl,\s*slotEl",
+	# CHG-009 design 4.1, 8.2 (A-7): the send box closes the panel; the indicator's slot moved into the status line.
+	r"threadEl,\s*proposalErrorEl,\s*errorEl,\s*formEl\s*\)",
 	# CHG-010: console cards show the script and its result; cards are ordered with the messages by time.
 	r'TEXT_CONSOLE_SCRIPT = "Script sẽ chạy:"',
 	r'TEXT_CONSOLE_OUTPUT = "Kết quả:"',
@@ -409,6 +432,45 @@ STATUS_SCRIPT_REQUIRED = (
 	r"const onResize = \(\) => \{\s*try \{\s*if \(window\.innerWidth < NARROW_SCREEN_PX\) \{\s*closePanel\(\);",
 	r'if \(!state\.resizeBound\) \{\s*state\.resizeBound = true;\s*window\.addEventListener\("resize", onResize\);',
 	r"if \(window\.innerWidth < NARROW_SCREEN_PX\) \{\s*return \{ actions: \[\] \};",
+	# CHG-009 T5 (design 4.1, 8.2; AC-1, AC-3, A-4, A-7): one status line under the section title, above the guidance,
+	# the thread and the cards, holding the docked indicator; a live indicator wins, an open call past its deadline
+	# reads its failed time by a timer that only changes the text; the status is set before the thread that carries
+	# its system lines.
+	r'TEXT_STATUS_RUNNING = "Đang xử lý…"',
+	r"statusEl\.append\(statusTextEl, slotEl\)",
+	r"chatTitle,\s*statusEl,\s*guidanceEl,\s*threadEl",
+	r"state\.runs\.size > 0 \? TEXT_STATUS_RUNNING",
+	r"panel\.statusExpired && status\.expired_text",
+	# CHG-010: the thread (messages, system lines and cards) is drawn by renderThread, still after the status.
+	r"renderBotStatus\(data\);\s*renderThread\(data\)",
+	r"statusExpired = true;\s*showBotStatus\(\)",
+)
+# CHG-009 design 8.2: each pin above with the wiring it guards broken, as (pattern, regex to break, replacement).
+STATUS_LINE_VIOLATIONS = (
+	(r'TEXT_STATUS_RUNNING = "Đang xử lý…"', r'"Đang xử lý…"', '"Đang chạy…"'),
+	(
+		r"statusEl\.append\(statusTextEl, slotEl\)",
+		r"statusEl\.append\(statusTextEl, slotEl\)",
+		"statusEl.append(statusTextEl)",
+	),
+	(
+		r"chatTitle,\s*statusEl,\s*guidanceEl,\s*threadEl",
+		r"chatTitle,(\s*)statusEl,(\s*)guidanceEl,(\s*)threadEl",
+		r"chatTitle,\1guidanceEl,\2threadEl,\3statusEl",
+	),
+	(r"state\.runs\.size > 0 \? TEXT_STATUS_RUNNING", r"state\.runs\.size > 0 \?", "false ?"),
+	(r"panel\.statusExpired && status\.expired_text", r"panel\.statusExpired && ", ""),
+	# CHG-010: renderThread replaced renderMessages at this use site.
+	(
+		r"renderBotStatus\(data\);\s*renderThread\(data\)",
+		r"renderBotStatus\(data\);(\s*)renderThread\(data\);",
+		r"renderThread(data);\1renderBotStatus(data);",
+	),
+	(
+		r"statusExpired = true;\s*showBotStatus\(\)",
+		r"(statusExpired = true;\s*)showBotStatus\(\)",
+		r"\1reload()",
+	),
 )
 
 # ADR-009: every `call(` in the page script passes a string literal naming one of PANEL_METHODS.
@@ -1873,7 +1935,8 @@ TODO_DOCTYPE = "ToDo"
 DOC_CREATE_CALLS = ("get_doc", "new_doc")
 SHARE_BYPASS_NAMES = ("ignore_share_permission", "add_docshare")
 SHARE_BYPASS_SUFFIXES = ("assign_to._add", "frappe.share.add")
-ENTRY_TYPES_EXPECTED = ("classify", "reason", "skip", "change", "bot_action")
+# CHG-009 (ADR-048 QĐ 1): run_event added last.
+ENTRY_TYPES_EXPECTED = ("classify", "reason", "skip", "change", "bot_action", "run_event")
 
 # `_assign` is the denormalised JSON column of HD Ticket. Routing must read ToDo through site_facts instead.
 # authority.py (FEAT-002, "who may instruct the bot") predates routing and is the one reader allowed.
@@ -2113,7 +2176,7 @@ def check_no_default_people_in_agent_python(sources: dict) -> list:
 
 
 def check_entry_types_unchanged(sources: dict) -> list:
-	"""ADR-019 QĐ 7 + ADR-012 QĐ 6 + FEAT-007 U3: the log keeps its five entry types, in the code and in the DocType options."""
+	"""ADR-019 QĐ 7 + ADR-012 QĐ 6 + FEAT-007 U3 + ADR-048 QĐ 1: the log keeps its six entry types, in the code and in the DocType options."""
 	run_log, doctype = sources.get(RUN_LOG_FILE), sources.get(LOG_DOCTYPE_FILE)
 	if run_log is None:
 		return _missing(RUN_LOG_FILE)
@@ -3077,10 +3140,14 @@ def check_status_script_constants_match_server(script: str) -> list:
 		"ACTION_REJECT": change_link.ACTION_REJECT,
 		"STATUS_PENDING": CHANGE_STATUS_PENDING,
 		"STATUS_APPLIED": CHANGE_STATUS_APPLIED,
+		# ADR-050: the approval message and the kind of the bot's guidance message
+		"APPROVE_GUIDANCE_TEXT": prompts.APPROVE_GUIDANCE_TEXT,
+		"KIND_GUIDANCE": messages.KIND_GUIDANCE,
 	}
 	found = []
 	for name, value in expected.items():
-		if not re.search(rf"^\s*const {name} = \"{re.escape(value)}\";\s*$", script, re.MULTILINE):
+		# prettier may break a long one after `=` (ADR-050's approval text)
+		if not re.search(rf"^\s*const {name} =\s+\"{re.escape(value)}\";\s*$", script, re.MULTILINE):
 			found.append(f"{STATUS_SCRIPT_FILE}: const {name} is not the server value {value!r}")
 	return found
 
@@ -5623,6 +5690,17 @@ class TestArchitecture(unittest.TestCase):
 		for pattern in STATUS_SCRIPT_REQUIRED:
 			self.assertIsNotNone(re.search(pattern, script), f"missing in script: {pattern}")
 
+	def test_status_line_pins_catch_their_violation(self):
+		# CHG-009 design 8.2 (AC-1, AC-3): each status-line pin fails on the script with the wiring it guards broken
+		script = self.status_script()
+		for pattern, broken, replacement in STATUS_LINE_VIOLATIONS:
+			with self.subTest(pattern=pattern):
+				self.assertIn(pattern, STATUS_SCRIPT_REQUIRED)
+				violating = re.sub(broken, replacement, script, count=1)
+				self.assertNotEqual(violating, script)
+				self.assertIsNotNone(re.search(pattern, script))
+				self.assertIsNone(re.search(pattern, violating))
+
 	def test_status_script_calls_use_literal_panel_methods(self):
 		script = load_product_sources(suffixes=(".js",)).get(STATUS_SCRIPT_FILE)
 		self.assertIsNotNone(script, f"{STATUS_SCRIPT_FILE} is missing")
@@ -6230,9 +6308,16 @@ class TestArchitecture(unittest.TestCase):
 			("ACTION_REJECT", change_link.ACTION_REJECT),
 			("STATUS_PENDING", CHANGE_STATUS_PENDING),
 			("STATUS_APPLIED", CHANGE_STATUS_APPLIED),
+			("APPROVE_GUIDANCE_TEXT", prompts.APPROVE_GUIDANCE_TEXT),
+			("KIND_GUIDANCE", messages.KIND_GUIDANCE),
 		):
 			with self.subTest(constant=name):
-				drifted = script.replace(f'const {name} = "{value}";', f'const {name} = "{value}x";', 1)
+				drifted = re.sub(
+					rf'(const {name} =\s+"){re.escape(value)}(";)',
+					lambda match: f"{match.group(1)}{value}x{match.group(2)}",
+					script,
+					count=1,
+				)
 				self.assertNotEqual(drifted, script)
 				found = check_status_script_constants_match_server(drifted)
 				self.assertTrue(any(name in text for text in found), found)
@@ -8567,32 +8652,45 @@ class TestScannersCatchViolations(unittest.TestCase):
 		)
 
 	def test_entry_types_scanner_catches_new_type_in_code_or_doctype(self):
-		run_log = 'ENTRY_TYPES = ("classify", "reason", "skip", "change", "bot_action")\n'
+		# CHG-009 (ADR-048 QĐ 1): the compliant sample carries run_event; the five types before it are now caught.
+		run_log = 'ENTRY_TYPES = ("classify", "reason", "skip", "change", "bot_action", "run_event")\n'
 		doctype = json.dumps(
-			{"fields": [{"fieldname": "entry_type", "options": "classify\nreason\nskip\nchange\nbot_action"}]}
+			{
+				"fields": [
+					{
+						"fieldname": "entry_type",
+						"options": "classify\nreason\nskip\nchange\nbot_action\nrun_event",
+					}
+				]
+			}
 		)
 		good = {RUN_LOG_FILE: run_log, LOG_DOCTYPE_FILE: doctype}
 		self.assertEqual(check_entry_types_unchanged(good), [])
 		extra = {
 			**good,
-			RUN_LOG_FILE: 'ENTRY_TYPES = ("classify", "reason", "skip", "change", "bot_action", "route")\n',
+			RUN_LOG_FILE: 'ENTRY_TYPES = ("classify", "reason", "skip", "change", "bot_action", "run_event", "route")\n',
 		}
 		self.assertCaught(check_entry_types_unchanged(extra), "ENTRY_TYPES")
 		without_change = {**good, RUN_LOG_FILE: 'ENTRY_TYPES = ("classify", "reason", "skip", "change")\n'}
 		self.assertCaught(check_entry_types_unchanged(without_change), "ENTRY_TYPES")
+		without_run_event = {
+			**good,
+			RUN_LOG_FILE: 'ENTRY_TYPES = ("classify", "reason", "skip", "change", "bot_action")\n',
+		}
+		self.assertCaught(check_entry_types_unchanged(without_run_event), "ENTRY_TYPES")
 		options = json.dumps(
 			{
 				"fields": [
 					{
 						"fieldname": "entry_type",
-						"options": "classify\nreason\nskip\nchange\nbot_action\nroute",
+						"options": "classify\nreason\nskip\nchange\nbot_action\nrun_event\nroute",
 					}
 				]
 			}
 		)
 		self.assertCaught(check_entry_types_unchanged({**good, LOG_DOCTYPE_FILE: options}), "options")
 		old_options = json.dumps(
-			{"fields": [{"fieldname": "entry_type", "options": "classify\nreason\nskip\nchange"}]}
+			{"fields": [{"fieldname": "entry_type", "options": "classify\nreason\nskip\nchange\nbot_action"}]}
 		)
 		self.assertCaught(check_entry_types_unchanged({**good, LOG_DOCTYPE_FILE: old_options}), "options")
 		computed = {**good, RUN_LOG_FILE: "ENTRY_TYPES = tuple(x)\n"}
@@ -11979,6 +12077,871 @@ class TestTicketPolicyRules(unittest.TestCase):
 					"not a string literal",
 				),
 				"the declaration gone": ({CONSTANTS_FILE: clean[CONSTANTS_FILE]}, "missing or not a literal"),
+			},
+		)
+
+
+# ---------------------------------------------------------------------------------------------------
+# FEAT-008 lesson store and its reader (ADR-045 Ràng buộc, ADR-046 Ràng buộc, Task 10)
+# ---------------------------------------------------------------------------------------------------
+
+LESSONS_FILE = "agent/lessons.py"
+LESSON_READ_FILE = "agent/lesson_read.py"
+LESSONS_MODULE = module_name(LESSONS_FILE)
+LESSON_READ_MODULE = module_name(LESSON_READ_FILE)
+# The only places that name the lesson DocTypes: the store, the reader, their controllers, constants and hooks.
+LESSON_DOCTYPE_FILES = (CONSTANTS_FILE, LESSONS_FILE, LESSON_READ_FILE, HOOKS_FILE)
+LESSON_DOCTYPE_DIRS = ("erp_ai_agent/doctype/erp_ai_lesson/", "erp_ai_agent/doctype/erp_ai_lesson_event/")
+LESSON_DOCTYPE_CONSTANTS = ("LESSON_DOCTYPE", "LESSON_EVENT_DOCTYPE")
+LESSON_DOCTYPE_TEXT = "ERP AI Lesson"  # both DocType names start with it
+LESSON_DOCTYPE_JSONS = tuple(f"{folder}{Path(folder).name}.json" for folder in LESSON_DOCTYPE_DIRS)
+LESSON_WRITE_RIGHTS = ("create", "write", "delete", "submit", "cancel", "amend")
+LESSON_READ_FUNCTION = "relevant_lessons"
+LESSON_ACTIVE_CONSTANT = "LESSON_STATUS_ACTIVE"
+LESSON_STATUS_FIELD = "lesson_status"
+# Modules that get lessons only as values from the runner: they never import the store or the reader.
+LESSON_FREE_MODULES = ("erp_ai.agent.prompts", "erp_ai.agent.tools", "erp_ai.gateway", "erp_ai.eval")
+# Global Constraints of FEAT-008 batch 1: (scope module, forbidden modules, reason), read by check_layer_imports.
+LESSON_IMPORT_RULES = (
+	(
+		"erp_ai.agent",
+		("erp_ai.handlers", "erp_ai.tasks", "erp_ai.install", "erp_ai.eval", "erp_ai.erp_ai_agent"),
+		"ADR-045: agent core never imports handlers, the scheduler, install, eval or doctype controllers",
+	),
+	(
+		LESSONS_MODULE,
+		("erp_ai.agent.runner", "erp_ai.gateway", "erp_ai.agent.changes"),
+		"ADR-045: the lesson store never runs the agent, calls the model or reaches the change job",
+	),
+	(
+		LESSON_READ_MODULE,
+		(LESSONS_MODULE, "erp_ai.gateway"),
+		"ADR-046: the lesson reader never imports the store or calls the model",
+	),
+	*(
+		(
+			scope,
+			(LESSONS_MODULE, LESSON_READ_MODULE),
+			"ADR-046: prompts, tools, gateway and eval get lessons as values from the runner, never from the store or reader",
+		)
+		for scope in LESSON_FREE_MODULES
+	),
+)
+
+
+def _is_text(node, docstrings: set) -> bool:
+	return isinstance(node, ast.Constant) and isinstance(node.value, str) and id(node) not in docstrings
+
+
+def check_lesson_doctype_named_only_in_store(sources: dict) -> list:
+	"""ADR-045/046: a lesson DocType is named (its constant, imported or read, or a string holding its name, docstrings
+	aside) only in constants.py, the store, the reader, the two DocType folders and hooks.py."""
+	violations = []
+	for rel, source in only_python(sources).items():
+		if rel in LESSON_DOCTYPE_FILES or rel.startswith(LESSON_DOCTYPE_DIRS):
+			continue
+		tree = parse(rel, source)
+		docstrings = _docstring_ids(tree)
+		for node in ast.walk(tree):
+			if (
+				referenced_name(node) in LESSON_DOCTYPE_CONSTANTS
+				or (isinstance(node, ast.alias) and node.name in LESSON_DOCTYPE_CONSTANTS)
+				or (_is_text(node, docstrings) and LESSON_DOCTYPE_TEXT in node.value)
+			):
+				violations.append(
+					violation(
+						rel,
+						node,
+						"names a lesson DocType; only the store and its reader may (ADR-045, ADR-046)",
+					)
+				)
+	return violations
+
+
+def check_lesson_import_direction(sources: dict) -> list:
+	return check_layer_imports(sources, LESSON_IMPORT_RULES)
+
+
+def check_relevant_lessons_called_only_by_runner(sources: dict) -> list:
+	"""ADR-046: only the runner names `lesson_read.relevant_lessons` (a call, an import, a string path) besides the
+	reader that defines it, and the runner does call it."""
+	violations, runner_calls = [], 0
+	for rel, source in only_python(sources).items():
+		if rel == LESSON_READ_FILE:
+			continue
+		tree = parse(rel, source)
+		docstrings = _docstring_ids(tree)
+		for node in ast.walk(tree):
+			if rel == RUNNER_FILE:
+				runner_calls += (
+					isinstance(node, ast.Call) and referenced_name(node.func) == LESSON_READ_FUNCTION
+				)
+				continue
+			if (
+				referenced_name(node) == LESSON_READ_FUNCTION
+				or (isinstance(node, ast.alias) and node.name == LESSON_READ_FUNCTION)
+				or (_is_text(node, docstrings) and re.search(rf"\b{LESSON_READ_FUNCTION}\b", node.value))
+			):
+				violations.append(
+					violation(
+						rel, node, f"names {LESSON_READ_FUNCTION}; only {RUNNER_FILE} reads lessons (ADR-046)"
+					)
+				)
+	if RUNNER_FILE in sources and not runner_calls:
+		violations.append(f"{RUNNER_FILE}: never calls lesson_read.{LESSON_READ_FUNCTION} (ADR-046 QĐ 1)")
+	return violations
+
+
+def check_lesson_doctypes_grant_no_write(sources: dict) -> list:
+	"""ADR-045: the store is the only writer, so no permission row of a lesson DocType grants a write right."""
+	violations = []
+	for rel in LESSON_DOCTYPE_JSONS:
+		if rel not in sources:
+			violations.append(f"{rel}: file missing")
+			continue
+		for row in json.loads(sources[rel]).get("permissions") or []:
+			granted = [right for right in LESSON_WRITE_RIGHTS if row.get(right)]
+			if granted:
+				violations.append(
+					f"{rel}: role {row.get('role')} is granted {', '.join(granted)}; only the store writes (ADR-045)"
+				)
+	return violations
+
+
+def _filter_values(tree: ast.AST) -> set:
+	"""ids of the nodes given as the `lesson_status` value of a filter: `{"lesson_status": X}`, `["lesson_status", X]`
+	or `["lesson_status", "=", X]`."""
+	values = set()
+	for node in ast.walk(tree):
+		if isinstance(node, ast.Dict):
+			values |= {
+				id(value)
+				for key, value in zip(node.keys, node.values, strict=True)
+				if _is_constant(key, LESSON_STATUS_FIELD)
+			}
+		elif isinstance(node, ast.List | ast.Tuple) and len(node.elts) in (2, 3):
+			if _is_constant(node.elts[0], LESSON_STATUS_FIELD):
+				values.add(id(node.elts[-1]))
+	return values
+
+
+def check_active_status_condition_written_once(sources: dict) -> list:
+	"""ADR-046 Ràng buộc: the "đang dùng" condition is written once in the reader, as the value of its one
+	`lesson_status` filter; never twice, never outside a filter, never as the literal text."""
+	source = sources.get(LESSON_READ_FILE)
+	if source is None:
+		return [f"{LESSON_READ_FILE}: file missing"]
+	tree = parse(LESSON_READ_FILE, source)
+	docstrings = _docstring_ids(tree)
+	uses = [
+		node
+		for node in ast.walk(tree)
+		if isinstance(node, ast.Name | ast.Attribute) and referenced_name(node) == LESSON_ACTIVE_CONSTANT
+	]
+	filters = _filter_values(tree)
+	violations = [
+		violation(LESSON_READ_FILE, node, f"{LESSON_ACTIVE_CONSTANT} outside a {LESSON_STATUS_FIELD} filter")
+		for node in uses
+		if id(node) not in filters
+	]
+	if len(uses) != 1:
+		violations.append(
+			f"{LESSON_READ_FILE}: {LESSON_ACTIVE_CONSTANT} used {len(uses)} times; the condition is written once (ADR-046)"
+		)
+	violations.extend(
+		violation(LESSON_READ_FILE, node, f"the text of {LESSON_ACTIVE_CONSTANT}; filter on the constant")
+		for node in ast.walk(tree)
+		if _is_text(node, docstrings) and node.value == LESSON_STATUS_ACTIVE
+	)
+	return violations
+
+
+# Clean samples of the lesson rules: each file does what it may.
+LESSON_RULES_SAMPLE = {
+	CONSTANTS_FILE: 'LESSON_DOCTYPE = "ERP AI Lesson"\nLESSON_EVENT_DOCTYPE = "ERP AI Lesson Event"\n',
+	HOOKS_FILE: 'ignore_links_on_delete = ["ERP AI Log", "ERP AI Lesson"]\n',
+	LESSONS_FILE: (
+		"import frappe\n\nfrom erp_ai.agent import policy\nfrom erp_ai.constants import LESSON_DOCTYPE\n\n\n"
+		"def store(values):\n\treturn frappe.get_doc({'doctype': LESSON_DOCTYPE, **values}).insert()\n"
+	),
+	LESSON_READ_FILE: (
+		"import frappe\n\nfrom erp_ai.agent import knowledge, policy\n"
+		"from erp_ai.constants import LESSON_DOCTYPE, LESSON_STATUS_ACTIVE\n\n\n"
+		"def relevant_lessons(subject, description):\n"
+		"\treturn frappe.get_all(LESSON_DOCTYPE, filters={'lesson_status': LESSON_STATUS_ACTIVE})\n"
+	),
+	"erp_ai_agent/doctype/erp_ai_lesson/erp_ai_lesson.py": (
+		"from frappe.model.document import Document\n\nfrom erp_ai.agent import lessons\n\n\n"
+		"class ERPAILesson(Document):\n\tpass\n"
+	),
+	RUNNER_FILE: (
+		'"""The runner; relevant_lessons gives the ERP AI Lesson rows of a step."""\n\n'
+		"from erp_ai.agent import lesson_read, policy\nfrom erp_ai.agent.prompts import build_classify_request\n\n\n"
+		"def _lessons(settings, subject, description):\n"
+		"\treturn lesson_read.relevant_lessons(subject, description)\n"
+	),
+	"agent/prompts.py": "from erp_ai.constants import LESSON_STATUS_ACTIVE\n",
+	HANDLERS_FILE: "from erp_ai.agent import lessons\n",
+	"agent/changes/transitions.py": "from erp_ai.agent import lessons\n",
+	"erp_ai_agent/doctype/erp_ai_lesson/erp_ai_lesson.json": json.dumps(
+		{
+			"permissions": [
+				{"role": "System Manager", "read": 1, "write": 0},
+				{"role": "ERP AI Instructor", "read": 1},
+			]
+		}
+	),
+	"erp_ai_agent/doctype/erp_ai_lesson_event/erp_ai_lesson_event.json": json.dumps(
+		{"istable": 1, "permissions": []}
+	),
+}
+
+
+class TestLessonArchitecture(unittest.TestCase):
+	"""FEAT-008 Task 10: the rules of ADR-045 and ADR-046 on the product, then each one's green and red samples."""
+
+	@classmethod
+	def setUpClass(cls):
+		cls.sources = load_product_sources()
+		cls.with_json = load_product_sources(suffixes=(".py", ".json"))
+
+	def assertCaught(self, violations, *fragments):
+		self.assertGreater(len(violations), 0, "scanner missed the violation")
+		for fragment in fragments:
+			self.assertTrue(any(fragment in text for text in violations), f"{fragment!r} not in {violations}")
+
+	def assertSamples(self, check, clean: dict, cases: dict):
+		"""`check` lets `clean` through and catches each case: `{case: (sources, fragment)}`."""
+		self.assertEqual(check(clean), [], "the clean sample is flagged")
+		for case, (sources, fragment) in cases.items():
+			with self.subTest(case=case):
+				self.assertCaught(check(sources), fragment)
+
+	def test_lesson_doctype_named_only_in_store_reader_controller(self):
+		# the allowance names files and folders the product has
+		for rel in LESSON_DOCTYPE_FILES:
+			self.assertIn(rel, self.sources)
+		for folder in LESSON_DOCTYPE_DIRS:
+			self.assertTrue(any(rel.startswith(folder) for rel in self.sources), folder)
+		self.assertEqual(check_lesson_doctype_named_only_in_store(self.sources), [])
+
+		changed = TestScannersCatchViolations.changed
+		clean = LESSON_RULES_SAMPLE
+		self.assertSamples(
+			check_lesson_doctype_named_only_in_store,
+			clean,
+			{
+				"the constant imported by the runner": (
+					changed(clean, RUNNER_FILE, "from erp_ai.constants import LESSON_DOCTYPE\n"),
+					f"{RUNNER_FILE}:9: names a lesson DocType",
+				),
+				"the constant read off the module": (
+					changed(
+						clean,
+						TASKS_FILE,
+						"from erp_ai import constants\n\nX = constants.LESSON_EVENT_DOCTYPE\n",
+					),
+					f"{TASKS_FILE}:3:",
+				),
+				"the name as a string": (
+					changed(
+						clean, HANDLERS_FILE, "\n\ndef f(frappe):\n\treturn frappe.get_all('ERP AI Lesson')\n"
+					),
+					f"{HANDLERS_FILE}:5:",
+				),
+				"the table in raw SQL": (
+					changed(clean, "agent/policy.py", "Q = 'select name from `tabERP AI Lesson Event`'\n"),
+					"agent/policy.py:1:",
+				),
+			},
+		)
+
+	def test_lesson_modules_import_direction(self):
+		self.assertEqual(check_lesson_import_direction(self.sources), [])
+
+		changed = TestScannersCatchViolations.changed
+		clean = LESSON_RULES_SAMPLE
+		cases = {
+			"agent core imports handlers": (
+				"agent/policy.py",
+				"from erp_ai import handlers\n",
+				"erp_ai.handlers",
+			),
+			"agent core imports tasks": ("agent/queue.py", "import erp_ai.tasks\n", "erp_ai.tasks"),
+			"agent core imports install": (
+				"agent/policy.py",
+				"from erp_ai.install import x\n",
+				"erp_ai.install",
+			),
+			"agent core imports eval": (
+				"agent/policy.py",
+				"from erp_ai.eval import run_eval\n",
+				"erp_ai.eval",
+			),
+			"agent core imports a controller": (
+				"agent/policy.py",
+				"from erp_ai.erp_ai_agent.doctype.erp_ai_lesson import erp_ai_lesson\n",
+				"erp_ai.erp_ai_agent",
+			),
+			"the store imports the runner": (
+				LESSONS_FILE,
+				"from erp_ai.agent import runner\n",
+				"erp_ai.agent.runner",
+			),
+			"the store imports the gateway": (LESSONS_FILE, "from erp_ai import gateway\n", "erp_ai.gateway"),
+			"the store imports the change job": (
+				LESSONS_FILE,
+				"from erp_ai.agent.changes import transitions\n",
+				"erp_ai.agent.changes",
+			),
+			"the reader imports the store": (
+				LESSON_READ_FILE,
+				"from erp_ai.agent import lessons\n",
+				LESSONS_MODULE,
+			),
+			"the reader imports the gateway": (LESSON_READ_FILE, "import erp_ai.gateway\n", "erp_ai.gateway"),
+			"prompts import the reader": (
+				"agent/prompts.py",
+				"from erp_ai.agent import lesson_read\n",
+				LESSON_READ_MODULE,
+			),
+			"a tool imports the store": (
+				"agent/tools/read.py",
+				"from erp_ai.agent.lessons import _store\n",
+				LESSONS_MODULE,
+			),
+			"the gateway imports the reader": (
+				"gateway/client.py",
+				"from erp_ai.agent.lesson_read import relevant_lessons\n",
+				LESSON_READ_MODULE,
+			),
+			"eval imports the store": ("eval/run_eval.py", "from ..agent import lessons\n", LESSONS_MODULE),
+		}
+
+		def extra_line(sources, rel):
+			"""The line `changed` appends to `rel` on."""
+			return sources.get(rel, "").count("\n") + 1
+
+		self.assertSamples(
+			check_lesson_import_direction,
+			clean,
+			{
+				case: (changed(clean, rel, extra), f"{rel}:{extra_line(clean, rel)}: imports {target}")
+				for case, (rel, extra, target) in cases.items()
+			},
+		)
+
+	def test_relevant_lessons_called_only_by_runner(self):
+		self.assertEqual(check_relevant_lessons_called_only_by_runner(self.sources), [])
+
+		changed = TestScannersCatchViolations.changed
+		clean = LESSON_RULES_SAMPLE
+		self.assertSamples(
+			check_relevant_lessons_called_only_by_runner,
+			clean,
+			{
+				"a tool calls the reader": (
+					changed(
+						clean,
+						"agent/tools/read.py",
+						"from erp_ai.agent import lesson_read\n\n\ndef f(s):\n\treturn lesson_read.relevant_lessons(s, '')\n",
+					),
+					"agent/tools/read.py:5: names relevant_lessons",
+				),
+				"the handlers import it": (
+					changed(
+						clean,
+						HANDLERS_FILE,
+						"from erp_ai.agent.lesson_read import relevant_lessons as pick\n",
+					),
+					f"{HANDLERS_FILE}:2:",
+				),
+				"a string path to it": (
+					changed(
+						clean, "hooks.py", "doc_events = {'x': 'erp_ai.agent.lesson_read.relevant_lessons'}\n"
+					),
+					"hooks.py:2:",
+				),
+				"the runner never calls it": (
+					changed(clean, RUNNER_FILE, replace=("lesson_read.relevant_lessons(", "list(")),
+					f"{RUNNER_FILE}: never calls lesson_read.relevant_lessons",
+				),
+			},
+		)
+
+	def test_lesson_doctypes_grant_no_write(self):
+		self.assertEqual(check_lesson_doctypes_grant_no_write(self.with_json), [])
+
+		changed = TestScannersCatchViolations.changed
+		clean = LESSON_RULES_SAMPLE
+		lesson_json, event_json = LESSON_DOCTYPE_JSONS
+		cases = {
+			right: (
+				changed(clean, lesson_json, replace=('"write": 0', f'"write": 0, "{right}": 1')),
+				f"{lesson_json}: role System Manager is granted {right}",
+			)
+			for right in LESSON_WRITE_RIGHTS
+		}
+		cases["a row of the event table"] = (
+			changed(
+				clean,
+				event_json,
+				replace=('"permissions": []', '"permissions": [{"role": "All", "create": 1}]'),
+			),
+			f"{event_json}: role All is granted create",
+		)
+		cases["a DocType file gone"] = ({lesson_json: clean[lesson_json]}, f"{event_json}: file missing")
+		self.assertSamples(check_lesson_doctypes_grant_no_write, clean, cases)
+
+	def test_active_status_condition_written_once(self):
+		self.assertEqual(check_active_status_condition_written_once(self.sources), [])
+
+		changed = TestScannersCatchViolations.changed
+		clean = LESSON_RULES_SAMPLE
+		self.assertSamples(
+			check_active_status_condition_written_once,
+			clean,
+			{
+				"a second filter": (
+					changed(
+						clean,
+						LESSON_READ_FILE,
+						"\n\ndef more():\n\treturn frappe.get_all(LESSON_DOCTYPE, filters=[['lesson_status', '=', LESSON_STATUS_ACTIVE]])\n",
+					),
+					"used 2 times",
+				),
+				"a check after the query": (
+					changed(
+						clean,
+						LESSON_READ_FILE,
+						"\n\ndef keep(row):\n\treturn row.lesson_status == LESSON_STATUS_ACTIVE\n",
+					),
+					f"{LESSON_READ_FILE}:12: {LESSON_ACTIVE_CONSTANT} outside a {LESSON_STATUS_FIELD} filter",
+				),
+				"the literal text": (
+					changed(
+						clean,
+						LESSON_READ_FILE,
+						replace=(
+							"'lesson_status': LESSON_STATUS_ACTIVE",
+							f"'lesson_status': '{LESSON_STATUS_ACTIVE}'",
+						),
+					),
+					f"the text of {LESSON_ACTIVE_CONSTANT}",
+				),
+				"no condition at all": (
+					changed(
+						clean,
+						LESSON_READ_FILE,
+						replace=("filters={'lesson_status': LESSON_STATUS_ACTIVE}", "limit=5"),
+					),
+					"used 0 times",
+				),
+				"the reader gone": (
+					{CONSTANTS_FILE: clean[CONSTANTS_FILE]},
+					f"{LESSON_READ_FILE}: file missing",
+				),
+			},
+		)
+
+
+# ---------------------------------------------------------------------------------------------------
+# ADR-048 Ràng buộc (CHG-009 design 8.2): the RQ job-state reads live only in agent/queue.py; handlers.py and
+# agent/queue.py never commit (an event row rides the person's transaction); comment_after_insert still starts
+# with step 0
+# ---------------------------------------------------------------------------------------------------
+
+RQ_JOB_READS = ("get_job", "get_job_status", "is_job_enqueued")
+RQ_JOB_CLASS = "Job"
+RQ_JOB_FETCH = "fetch"
+RQ_JOB_READ_FILE = QUEUE_FILE
+EVENT_NO_COMMIT_FILES = (HANDLERS_FILE, QUEUE_FILE)
+COMMENT_HOOK = "comment_after_insert"
+# Step 0 tests the comment's own fields, never the database: the hook fires for every Comment of the site.
+COMMENT_STEP_ZERO_FIELD = "reference_doctype"
+
+
+def _rq_job_read(node, aliases: dict) -> str | None:
+	"""The RQ job-state read `node` names (a name, an attribute, an imported name or `Job.fetch`), else None."""
+	if isinstance(node, ast.alias):
+		name = node.name.rpartition(".")[2]
+	elif isinstance(node, ast.Attribute) and node.attr == RQ_JOB_FETCH:
+		job = resolved_name(node.value, aliases).rpartition(".")[2]
+		return f"{RQ_JOB_CLASS}.{RQ_JOB_FETCH}" if job == RQ_JOB_CLASS else None
+	else:
+		name = referenced_name(node)
+	return name if name in RQ_JOB_READS else None
+
+
+def check_rq_job_reads_only_in_queue(sources: dict) -> list:
+	"""ADR-048 Ràng buộc: `get_job`, `get_job_status`, `is_job_enqueued` and `Job.fetch` only in agent/queue.py."""
+	violations = []
+	for rel, source in only_python(sources).items():
+		if rel == RQ_JOB_READ_FILE:
+			continue
+		tree = parse(rel, source)
+		aliases = import_aliases(tree)
+		for node in ast.walk(tree):
+			read = _rq_job_read(node, aliases)
+			if read:
+				violations.append(
+					violation(
+						rel, node, f"reads the RQ job state ({read}) outside {RQ_JOB_READ_FILE} (ADR-048)"
+					)
+				)
+	return violations
+
+
+def check_no_commit_in_event_request_files(sources: dict) -> list:
+	"""ADR-048 Ràng buộc: handlers.py and agent/queue.py never call `frappe.db.commit()`."""
+	violations = []
+	for rel in EVENT_NO_COMMIT_FILES:
+		if rel not in sources:
+			violations.extend(_missing(rel))
+			continue
+		tree = parse(rel, sources[rel])
+		aliases = import_aliases(tree)
+		violations.extend(
+			violation(rel, node, f"calls {COMMIT_CALL}() (ADR-048)")
+			for node in ast.walk(tree)
+			if isinstance(node, ast.Call) and resolved_name(node.func, aliases) == COMMIT_CALL
+		)
+	return violations
+
+
+def check_comment_hook_starts_with_step_zero(sources: dict) -> list:
+	"""ADR-048 Ràng buộc: the first statement of `comment_after_insert` (after a docstring) is still step 0: an
+	`if` on the comment's own `reference_doctype`, with no call in its test and no `else`, that only returns."""
+	if HANDLERS_FILE not in sources:
+		return _missing(HANDLERS_FILE)
+	function = _module_functions(parse(HANDLERS_FILE, sources[HANDLERS_FILE])).get(COMMENT_HOOK)
+	if function is None:
+		return [f"{HANDLERS_FILE}: no function {COMMENT_HOOK} (ADR-048)"]
+	body = function.body[1:] if ast.get_docstring(function) is not None else function.body
+	first = body[0] if body else function
+	is_step_zero = (
+		isinstance(first, ast.If)
+		and COMMENT_STEP_ZERO_FIELD in {referenced_name(node) for node in ast.walk(first.test)}
+		and not any(isinstance(node, ast.Call) for node in ast.walk(first.test))
+		and not first.orelse
+		and len(first.body) == 1
+		and isinstance(first.body[0], ast.Return)
+		and first.body[0].value is None
+	)
+	if is_step_zero:
+		return []
+	return [violation(HANDLERS_FILE, first, f"the first statement of {COMMENT_HOOK} is not step 0 (ADR-048)")]
+
+
+# Clean samples of the three rules: queue.py reads the RQ job state, the comment hook writes its event row after
+# step 0 and nothing commits.
+EVENT_WRITE_SAMPLE = {
+	QUEUE_FILE: (
+		"from frappe.utils.background_jobs import get_job, get_job_status, is_job_enqueued\n"
+		"from rq.job import Job\n\n\n"
+		"def enqueue_agent_run(job_id):\n"
+		"\tjob = get_job(job_id) or Job.fetch(job_id)\n"
+		"\treturn is_job_enqueued(job_id) or get_job_status(job_id) or job\n"
+	),
+	HANDLERS_FILE: (
+		"import frappe\n\n"
+		"from erp_ai.agent import run_log\n\n\n"
+		"def comment_after_insert(doc, method=None):\n"
+		'\t"""Step 0 first: every Comment of the site reaches this hook."""\n'
+		'\tif doc.reference_doctype != "HD Ticket" or doc.comment_type != "Comment":\n'
+		"\t\treturn\n"
+		'\trun_log.record_event(ticket=doc.reference_name, trigger="comment_mention", code="agent_disabled")\n'
+	),
+	"agent/runner.py": "from rq.job import Job\n\n\ndef job_class():\n\treturn Job\n",
+}
+
+
+class TestEventWriteRules(unittest.TestCase):
+	"""CHG-009 T1: the ADR-048 rules on writing event rows, on the product, then each one's clean and violating samples."""
+
+	assertRuleSamples = TestArchitecture.assertRuleSamples
+
+	@classmethod
+	def setUpClass(cls):
+		cls.sources = load_product_sources()
+
+	def test_event_write_rules_follow_adr_048(self):
+		for rel in (QUEUE_FILE, HANDLERS_FILE):
+			self.assertIn(rel, self.sources)
+		self.assertEqual(check_rq_job_reads_only_in_queue(self.sources), [])
+		self.assertEqual(check_no_commit_in_event_request_files(self.sources), [])
+		self.assertEqual(check_comment_hook_starts_with_step_zero(self.sources), [])
+
+		changed = TestScannersCatchViolations.changed
+		clean = EVENT_WRITE_SAMPLE
+		event_call = '\trun_log.record_event(ticket=doc.reference_name, trigger="comment_mention", code="agent_disabled")\n'
+		self.assertRuleSamples(
+			check_rq_job_reads_only_in_queue,
+			clean,
+			{
+				"get_job in a handler": (
+					changed(
+						clean,
+						HANDLERS_FILE,
+						"\n\ndef busy(job_id):\n\treturn frappe.utils.background_jobs.get_job(job_id)\n",
+					),
+					f"{HANDLERS_FILE}:14: reads the RQ job state (get_job)",
+				),
+				"is_job_enqueued imported under another name": (
+					changed(
+						clean,
+						"agent/runner.py",
+						"from frappe.utils.background_jobs import is_job_enqueued as queued\n",
+					),
+					"agent/runner.py:6: reads the RQ job state (is_job_enqueued)",
+				),
+				"get_job_status through its module": (
+					changed(
+						clean,
+						"ticket_panel.py",
+						"from frappe.utils import background_jobs\n\n\n"
+						"def running(job_id):\n\treturn background_jobs.get_job_status(job_id)\n",
+					),
+					"ticket_panel.py:5: reads the RQ job state (get_job_status)",
+				),
+				"Job.fetch under another name": (
+					changed(
+						clean,
+						"agent/bot_status.py",
+						"from rq.job import Job as RQJob\n\n\ndef state(job_id):\n\treturn RQJob.fetch(job_id)\n",
+					),
+					"agent/bot_status.py:5: reads the RQ job state (Job.fetch)",
+				),
+			},
+		)
+		self.assertRuleSamples(
+			check_no_commit_in_event_request_files,
+			clean,
+			{
+				"commit in the comment hook": (
+					changed(clean, HANDLERS_FILE, "\tfrappe.db.commit()\n"),
+					f"{HANDLERS_FILE}:11: calls {COMMIT_CALL}()",
+				),
+				"commit through `from frappe import db` in the queue": (
+					changed(
+						clean, QUEUE_FILE, "\n\ndef flush():\n\tfrom frappe import db\n\n\tdb.commit()\n"
+					),
+					f"{QUEUE_FILE}:13: calls {COMMIT_CALL}()",
+				),
+				"handlers.py missing": ({QUEUE_FILE: clean[QUEUE_FILE]}, f"{HANDLERS_FILE}: file missing"),
+			},
+		)
+		step_zero = '\tif doc.reference_doctype != "HD Ticket" or doc.comment_type != "Comment":\n'
+		not_first = f"{HANDLERS_FILE}:8: the first statement of {COMMENT_HOOK} is not step 0"
+		self.assertRuleSamples(
+			check_comment_hook_starts_with_step_zero,
+			clean,
+			{
+				"event written before step 0": (
+					changed(clean, HANDLERS_FILE, replace=(step_zero, event_call + step_zero)),
+					not_first,
+				),
+				"step 0 reads the database": (
+					changed(
+						clean,
+						HANDLERS_FILE,
+						replace=(
+							'doc.comment_type != "Comment"',
+							'not frappe.db.exists("HD Ticket", doc.reference_name)',
+						),
+					),
+					not_first,
+				),
+				"step 0 writes before returning": (
+					changed(
+						clean, HANDLERS_FILE, replace=("\t\treturn\n", "\t" + event_call + "\t\treturn\n")
+					),
+					not_first,
+				),
+				"step 0 no longer tests the DocType": (
+					changed(clean, HANDLERS_FILE, replace=('doc.reference_doctype != "HD Ticket" or ', "")),
+					not_first,
+				),
+				"the hook renamed": (
+					changed(clean, HANDLERS_FILE, replace=("def comment_after_insert(", "def comment_hook(")),
+					f"{HANDLERS_FILE}: no function {COMMENT_HOOK}",
+				),
+			},
+		)
+
+
+# ---------------------------------------------------------------------------------------------------
+# ADR-048 Ràng buộc "module đọc ở QĐ 6" (CHG-009 design 3.2, 8.2): the panel's status reader writes nothing and
+# reads no cache or job state; outside tests only ticket_panel.py imports it; ticket_panel.py still never names
+# "ERP AI Log" (its import rule is the `erp_ai.agent.bot_status` entry of LAYER_RULES)
+# ---------------------------------------------------------------------------------------------------
+
+BOT_STATUS_FILE = "agent/bot_status.py"
+BOT_STATUS_MODULE = "erp_ai.agent.bot_status"
+BOT_STATUS_FORBIDDEN_NAMES = (
+	"insert",
+	"save",
+	"set_value",
+	"db_set",
+	"commit",
+	"write_entry",
+	"cache",
+	"publish_realtime",
+	"get_job",
+)
+PANEL_FORBIDDEN_LOG_TEXT = "ERP AI Log"
+
+
+def check_bot_status_reader_follows_adr_048(sources: dict) -> list:
+	"""ADR-048 Ràng buộc: the reader names no write, commit, cache, realtime publish or job read; no product file
+	but ticket_panel.py imports or names the reader; ticket_panel.py holds no "ERP AI Log" string."""
+	for rel in (BOT_STATUS_FILE, PANEL_FILE):
+		if rel not in sources:
+			return _missing(rel)
+	violations = [
+		violation(
+			BOT_STATUS_FILE, node, f"names {name}: the reader writes nothing, reads no cache or job (ADR-048)"
+		)
+		for node in ast.walk(parse(BOT_STATUS_FILE, sources[BOT_STATUS_FILE]))
+		for name in _node_names(node)
+		if name in BOT_STATUS_FORBIDDEN_NAMES
+	]
+	for rel, source in only_python(sources).items():
+		if rel in (BOT_STATUS_FILE, PANEL_FILE):
+			continue
+		tree = parse(rel, source)
+		for lineno, target in imported_modules(tree, module_name(rel), rel.endswith("__init__.py")):
+			if module_in(target, BOT_STATUS_MODULE):
+				violations.append(f"{rel}:{lineno}: imports {target}; only {PANEL_FILE} may (ADR-048)")
+		violations.extend(
+			violation(rel, node, f"names {BOT_STATUS_MODULE}; only {PANEL_FILE} may (ADR-048)")
+			for node in constant_strings(tree)
+			if BOT_STATUS_MODULE in node.value
+		)
+	violations.extend(
+		violation(
+			PANEL_FILE, node, f'names "{PANEL_FORBIDDEN_LOG_TEXT}": only the reader reads the log (ADR-048)'
+		)
+		for node in constant_strings(parse(PANEL_FILE, sources[PANEL_FILE]))
+		if PANEL_FORBIDDEN_LOG_TEXT in node.value
+	)
+	return violations
+
+
+# Clean sample: the reader reads the log through the allowed imports, the panel imports it, another module does not.
+BOT_STATUS_SAMPLE = {
+	BOT_STATUS_FILE: (
+		"import frappe\n"
+		"from frappe.utils import now_datetime\n\n"
+		"from erp_ai.constants import LOG_DOCTYPE\n\n\n"
+		"def panel_status(ticket, message_names, now=None):\n"
+		'\trows = frappe.get_all(LOG_DOCTYPE, filters={"ticket": ticket}, fields=["name"], limit=500)\n'
+		'\treturn {"lines": rows, "now": now or now_datetime()}\n'
+	),
+	PANEL_FILE: (
+		"from erp_ai.agent import bot_status\n\n\n"
+		"def get_panel_data(ticket):\n"
+		'\treturn {"bot_status": bot_status.panel_status(ticket, [])}\n'
+	),
+	"agent/messages.py": "import frappe\n\nfrom erp_ai.constants import MESSAGE_DOCTYPE\n",
+}
+# design 8.2: what the LAYER_RULES entry of the reader forbids.
+BOT_STATUS_FORBIDDEN_IMPORTS = (
+	"erp_ai.gateway",
+	"erp_ai.agent.runner",
+	"erp_ai.agent.queue",
+	"erp_ai.agent.run_status",
+	"erp_ai.agent.tools",
+	"erp_ai.agent.policy",
+	"erp_ai.agent.run_log",
+)
+
+
+class TestBotStatusReaderRules(unittest.TestCase):
+	"""CHG-009 T4: the ADR-048 rules on the panel's status reader, on the product, then the clean and violating samples."""
+
+	assertRuleSamples = TestArchitecture.assertRuleSamples
+
+	@classmethod
+	def setUpClass(cls):
+		cls.sources = load_product_sources()
+
+	def test_bot_status_reader_follows_adr_048(self):
+		self.assertIn(BOT_STATUS_FILE, self.sources)
+		self.assertEqual(check_bot_status_reader_follows_adr_048(self.sources), [])
+
+		changed = TestScannersCatchViolations.changed
+		clean = BOT_STATUS_SAMPLE
+		in_reader = {
+			"insert": 'frappe.get_doc({"doctype": LOG_DOCTYPE}).insert()',
+			"save": "doc.save()",
+			"set_value": 'frappe.db.set_value(LOG_DOCTYPE, doc, "seen", 1)',
+			"db_set": 'doc.db_set("seen", 1)',
+			"commit": "frappe.db.commit()",
+			"cache": "frappe.cache().get_value(doc)",
+			"publish_realtime": 'frappe.publish_realtime("erp_ai:agent_status", doc)',
+		}
+		cases = {
+			f"{name} in the reader": (
+				changed(clean, BOT_STATUS_FILE, f"\n\ndef touch(doc):\n\treturn {expression}\n"),
+				f"{BOT_STATUS_FILE}:13: names {name}",
+			)
+			for name, expression in in_reader.items()
+		}
+		cases |= {
+			f"{name} imported by the reader": (
+				changed(clean, BOT_STATUS_FILE, f"from {module} import {name}\n"),
+				f"{BOT_STATUS_FILE}:10: names {name}",
+			)
+			for module, name in (
+				("erp_ai.agent.run_log", "write_entry"),
+				("frappe.utils.background_jobs", "get_job"),
+			)
+		}
+		panel_only = f"imports {BOT_STATUS_MODULE}; only {PANEL_FILE} may"
+		cases |= {
+			"another module imports the reader": (
+				changed(clean, "agent/messages.py", "from erp_ai.agent import bot_status\n"),
+				f"agent/messages.py:4: {panel_only}",
+			),
+			"the runner imports it lazily and relatively": (
+				changed(clean, RUNNER_FILE, "def status(ticket):\n\tfrom . import bot_status\n"),
+				f"{RUNNER_FILE}:2: {panel_only}",
+			),
+			"a module names it by its path": (
+				changed(
+					clean,
+					"tasks.py",
+					'import frappe\n\nSTATUS = frappe.get_attr("erp_ai.agent.bot_status.panel_status")\n',
+				),
+				f"tasks.py:3: names {BOT_STATUS_MODULE}; only {PANEL_FILE} may",
+			),
+			"the panel names the log": (
+				changed(
+					clean,
+					PANEL_FILE,
+					'\n\ndef rows(ticket):\n\treturn frappe.get_all("ERP AI Log", filters={"ticket": ticket})\n',
+				),
+				f'{PANEL_FILE}:9: names "{PANEL_FORBIDDEN_LOG_TEXT}"',
+			),
+			"the panel queries the log's table": (
+				changed(clean, PANEL_FILE, 'SQL = "select name from `tabERP AI Log` where ticket=%s"\n'),
+				f'{PANEL_FILE}:6: names "{PANEL_FORBIDDEN_LOG_TEXT}"',
+			),
+			"the reader missing": ({PANEL_FILE: clean[PANEL_FILE]}, f"{BOT_STATUS_FILE}: file missing"),
+			"the panel missing": ({BOT_STATUS_FILE: clean[BOT_STATUS_FILE]}, f"{PANEL_FILE}: file missing"),
+		}
+		self.assertRuleSamples(check_bot_status_reader_follows_adr_048, clean, cases)
+
+		self.assertRuleSamples(
+			check_layer_imports,
+			clean,
+			{
+				target: (
+					changed(clean, BOT_STATUS_FILE, "from {} import {}\n".format(*target.rsplit(".", 1))),
+					f"{BOT_STATUS_FILE}:10: imports {target} (ADR-048 QĐ 6",
+				)
+				for target in BOT_STATUS_FORBIDDEN_IMPORTS
 			},
 		)
 

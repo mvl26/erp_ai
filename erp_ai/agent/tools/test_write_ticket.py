@@ -799,6 +799,28 @@ class TestCreateTaskEstimate(FrappeTestCase):
 			)
 			self.assertEqual(self._ticket_comments(), comments)
 
+	def test_done_line_hours_never_in_exponent_form(self):
+		# U8-1 (w1.md:120): the done line states the estimate as given, a whole number without ".0", never with an
+		# exponent.
+		cases = (
+			(1234567, "1234567"),
+			(2.0, "2"),
+			(1234567.5, "1234567.5"),
+			(0.25, "0.25"),
+			(0.00001, "0.00001"),
+		)
+		for index, (hours, shown) in enumerate(cases):
+			with self.subTest(hours=hours):
+				ctx = self._ctx()
+				write_ticket.open_collector(ctx.run_id)
+				self.addCleanup(write_ticket.close_collector, ctx.run_id)
+				result = self._create(ctx, f"{T167_PREFIX} việc giờ {index}", expected_hours=hours)
+				self.assertTrue(result["ok"], result)
+				self.assertEqual(
+					write_ticket.collected(ctx.run_id)[1][write_ticket.SECTION_DONE],
+					[f"Đã tạo Task {result['task']} ({shown} giờ)."],
+				)
+
 
 class TestSetClassification(FrappeTestCase):
 	def setUp(self):

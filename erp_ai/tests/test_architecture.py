@@ -358,10 +358,10 @@ STATUS_SCRIPT_REQUIRED = (
 	r"catch \(e\) \{\s*onSendFailed\(\);",
 	r"isComposing\) \{\s*event\.preventDefault\(\);\s*submit\(\);",
 	r'addEventListener\("click", \(\) => \{\s*try \{\s*submit\(\);',
-	r"formEl,\s*slotEl",
 	# CHG-008 T4 (design 4.3): the proposals section, between the thread and the error line, and the fixed texts.
+	# CHG-009 design 4.1, 8.2 (A-7): the send box closes the panel; the indicator's slot moved into the status line.
 	r"renderProposals",
-	r"threadEl,\s*proposalsTitle,\s*proposalsEl,\s*proposalErrorEl,\s*errorEl,\s*formEl,\s*slotEl",
+	r"threadEl,\s*proposalsTitle,\s*proposalsEl,\s*proposalErrorEl,\s*errorEl,\s*formEl\s*\)",
 	r'TEXT_PROPOSALS_SECTION = "Đề xuất thay đổi"',
 	r'TEXT_OPEN_PROPOSAL = "Xem nội dung thay đổi"',
 	r'OPEN_PROPOSAL_LABEL = "Mở đề xuất để Duyệt hoặc Từ chối"',
@@ -413,6 +413,43 @@ STATUS_SCRIPT_REQUIRED = (
 	r"const onResize = \(\) => \{\s*try \{\s*if \(window\.innerWidth < NARROW_SCREEN_PX\) \{\s*closePanel\(\);",
 	r'if \(!state\.resizeBound\) \{\s*state\.resizeBound = true;\s*window\.addEventListener\("resize", onResize\);',
 	r"if \(window\.innerWidth < NARROW_SCREEN_PX\) \{\s*return \{ actions: \[\] \};",
+	# CHG-009 T5 (design 4.1, 8.2; AC-1, AC-3, A-4, A-7): one status line under the section title, above the guidance,
+	# the thread and the cards, holding the docked indicator; a live indicator wins, an open call past its deadline
+	# reads its failed time by a timer that only changes the text; the status is set before the thread that carries
+	# its system lines.
+	r'TEXT_STATUS_RUNNING = "Đang xử lý…"',
+	r"statusEl\.append\(statusTextEl, slotEl\)",
+	r"chatTitle,\s*statusEl,\s*guidanceEl,\s*threadEl",
+	r"state\.runs\.size > 0 \? TEXT_STATUS_RUNNING",
+	r"panel\.statusExpired && status\.expired_text",
+	r"renderBotStatus\(data\);\s*renderMessages\(data\)",
+	r"statusExpired = true;\s*showBotStatus\(\)",
+)
+# CHG-009 design 8.2: each pin above with the wiring it guards broken, as (pattern, regex to break, replacement).
+STATUS_LINE_VIOLATIONS = (
+	(r'TEXT_STATUS_RUNNING = "Đang xử lý…"', r'"Đang xử lý…"', '"Đang chạy…"'),
+	(
+		r"statusEl\.append\(statusTextEl, slotEl\)",
+		r"statusEl\.append\(statusTextEl, slotEl\)",
+		"statusEl.append(statusTextEl)",
+	),
+	(
+		r"chatTitle,\s*statusEl,\s*guidanceEl,\s*threadEl",
+		r"chatTitle,(\s*)statusEl,(\s*)guidanceEl,(\s*)threadEl",
+		r"chatTitle,\1guidanceEl,\2threadEl,\3statusEl",
+	),
+	(r"state\.runs\.size > 0 \? TEXT_STATUS_RUNNING", r"state\.runs\.size > 0 \?", "false ?"),
+	(r"panel\.statusExpired && status\.expired_text", r"panel\.statusExpired && ", ""),
+	(
+		r"renderBotStatus\(data\);\s*renderMessages\(data\)",
+		r"renderBotStatus\(data\);(\s*)renderMessages\(data\);",
+		r"renderMessages(data);\1renderBotStatus(data);",
+	),
+	(
+		r"statusExpired = true;\s*showBotStatus\(\)",
+		r"(statusExpired = true;\s*)showBotStatus\(\)",
+		r"\1reload()",
+	),
 )
 
 # ADR-009: every `call(` in the page script passes a string literal naming one of PANEL_METHODS.
@@ -5613,6 +5650,17 @@ class TestArchitecture(unittest.TestCase):
 			self.assertIsNone(re.search(pattern, script, re.MULTILINE), f"forbidden in script: {pattern}")
 		for pattern in STATUS_SCRIPT_REQUIRED:
 			self.assertIsNotNone(re.search(pattern, script), f"missing in script: {pattern}")
+
+	def test_status_line_pins_catch_their_violation(self):
+		# CHG-009 design 8.2 (AC-1, AC-3): each status-line pin fails on the script with the wiring it guards broken
+		script = self.status_script()
+		for pattern, broken, replacement in STATUS_LINE_VIOLATIONS:
+			with self.subTest(pattern=pattern):
+				self.assertIn(pattern, STATUS_SCRIPT_REQUIRED)
+				violating = re.sub(broken, replacement, script, count=1)
+				self.assertNotEqual(violating, script)
+				self.assertIsNotNone(re.search(pattern, script))
+				self.assertIsNone(re.search(pattern, violating))
 
 	def test_status_script_calls_use_literal_panel_methods(self):
 		script = load_product_sources(suffixes=(".js",)).get(STATUS_SCRIPT_FILE)

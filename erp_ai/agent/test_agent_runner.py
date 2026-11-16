@@ -76,6 +76,7 @@ from erp_ai.test_utils import (
 	pin_agent_roles,
 	record_status_signals,
 	set_agent_settings,
+	stub_job_states,
 )
 
 PREFIX = "ERPAI-TEST-"
@@ -1278,10 +1279,12 @@ class TestRunnerReasoning(RunnerTestBase):
 		self.addCleanup(setattr, frappe.flags, "in_test", frappe.flags.in_test)
 		frappe.flags.in_test = False
 		self.gateway.results = [tool_turn(tool_use("toolu_1", "get_ticket")), make_model_result()]
+		# ADR-048 QĐ 5 (CHG-009): the run_event row made when setUp creates the ticket is not a row of this run
+		run_rows = {"ticket": self.ticket.name, "entry_type": ("!=", "run_event")}
 		with patch.object(
 			frappe.db,
 			"commit",
-			side_effect=lambda: commits.append(frappe.db.count(LOG_DOCTYPE, {"ticket": self.ticket.name})),
+			side_effect=lambda: commits.append(frappe.db.count(LOG_DOCTYPE, run_rows)),
 		):
 			self._run("comment_mention")
 
@@ -6074,6 +6077,31 @@ class TestRequesterReplyRun(RequesterReplyRunBase):
 		self.assertEqual([call["task"] for call in self.gateway.calls], ["classify", "reason"])
 		self.assertIn(answer, self.gateway.calls[0]["messages"][0]["content"])
 		self.assertEqual(self._guidance(), 1)
+
+	def test_reply_run_with_its_call_row_still_runs(self):
+		# ADR-033 QĐ 6, ADR-048 QĐ 4 (CHG-009): the queue's call_received row carries the event key, yet only a row of
+		# the run makes the event handled at (r1), so the run that row announced still runs
+		stub_job_states(self, {})
+		self._bot_message()
+		reply = self._message()
+		(job,) = self._handler_jobs(reply)
+		self.assertEqual(
+			frappe.get_all(
+				LOG_DOCTYPE, filters={"run_id": self._key(reply)}, fields=["entry_type", "stop_reason"]
+			),
+			[{"entry_type": "run_event", "stop_reason": "call_received"}],
+		)
+		logger = MagicMock()
+
+		with patch.object(frappe, "logger", return_value=logger):
+			self._run_job(job)
+
+		self.assertEqual(self.gateway.call_count, 1)
+		self.assertEqual(self._reason_run_ids(), {self._key(reply)})
+		self.assertEqual(self._skips(), [])
+		self.assertNotIn(
+			ALREADY_HANDLED_LOG, [call.args[0] for call in logger.info.call_args_list if call.args]
+		)
 
 
 RUN_FOR_TICKET = "erp_ai.agent.runner.run_for_ticket"

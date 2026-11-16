@@ -2843,3 +2843,13 @@ class TestPromptOverrides(FrappeTestCase):
 			self._save(prompt_override_category_guide="no table", prompt_override_reasoning=""),
 			_missing_error(guide_label, *guide_markers),
 		)
+
+
+class TestSharedLineSplitter(FrappeTestCase):
+	"""T124 (design-w0-fixes-6.md ruling 2): the controller splits lines with `erp_ai.agent.text_lines`."""
+
+	def test_controller_uses_text_lines_filled_lines(self):
+		from erp_ai.agent import text_lines
+
+		self.assertIs(erp_ai_setting.filled_lines, text_lines.filled_lines)
+		self.assertFalse(hasattr(erp_ai_setting, "_filled_lines"))

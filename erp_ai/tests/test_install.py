@@ -50,6 +50,14 @@ FIVE_SWITCHES = (
 # FEAT-007 AC-16: patched clocks for the enable mark filled by install.
 # FEAT-007 T60 (design "T22a"): hidden HD Ticket field and the Instructor read right on HD Article.
 CREATED_LABELS_FIELD = "ai_created_labels"
+# What a run concluded and did, stored on the ticket: fieldname → (label, fieldtype), in install order.
+RUN_INFO_FIELDS = {
+	"ai_classification_reason": ("Lý do phân loại (AI)", "Small Text"),
+	"ai_analysis": ("Nhận định (AI)", "Text Editor"),
+	"ai_done": ("Đã làm (AI)", "Small Text"),
+	"ai_pending": ("Chờ duyệt (AI)", "Small Text"),
+	"ai_manual": ("Cần người xử lý (AI)", "Small Text"),
+}
 ARTICLE = "HD Article"
 ARTICLE_STANDARD_ROLES = ("System Manager", "Agent", "HD Customer", "HD Customer Manager")
 PERM_FLAGS = (*rights, "if_owner")
@@ -130,7 +138,7 @@ class TestInstall(FrappeTestCase):
 		self.assertEqual(_counts(), before)
 		self.assertEqual(before["roles"], 2)
 		self.assertEqual(before["users"], 1)
-		self.assertEqual(before["ai_fields"], 11)
+		self.assertEqual(before["ai_fields"], 11 + len(RUN_INFO_FIELDS))
 
 	def test_ai_fields_permlevel_8_and_template_rows_agents_only(self):
 		for name in AI_FIELDS:
@@ -181,7 +189,7 @@ class TestInstall(FrappeTestCase):
 			fields=["name", "idx", "fieldname", "required", "visible_to", "editable_after_creation"],
 			order_by="idx",
 		)
-		self.assertEqual(len(rows), 10)
+		self.assertEqual(len(rows), 10 + len(RUN_INFO_FIELDS))
 		first = rows[0]
 		self.assertEqual(
 			(
@@ -194,7 +202,7 @@ class TestInstall(FrappeTestCase):
 			),
 			("erp-ai-t12-keep", 1, "priority", 1, "Everyone", 1),
 		)
-		self.assertEqual([r.idx for r in rows], [1, 2, 3, 4, 5, 6, 7, 8, 9, 10])
+		self.assertEqual([r.idx for r in rows], list(range(1, 11 + len(RUN_INFO_FIELDS))))
 		self.assertEqual(
 			[r.fieldname for r in rows[1:]],
 			[
@@ -207,6 +215,7 @@ class TestInstall(FrappeTestCase):
 				"ai_classified_by",
 				"ai_updated_at",
 				"ai_opt_out",
+				*RUN_INFO_FIELDS,
 			],
 		)
 		for row in rows[1:]:
@@ -856,6 +865,37 @@ class TestFeat007Migrate(FrappeTestCase):
 			),
 			1,
 		)
+
+	def test_run_info_fields_installed(self):
+		"""What a run concluded and did is stored on the ticket: read-only, permlevel 8, shown to agents."""
+		for name in RUN_INFO_FIELDS:
+			frappe.db.delete("Custom Field", {"dt": "HD Ticket", "fieldname": name})
+			frappe.db.delete("HD Ticket Template Field", {"parent": TEMPLATE, "fieldname": name})
+		frappe.clear_cache(doctype="HD Ticket")
+		install.ensure_setup()
+		install.after_migrate()
+		previous = CREATED_LABELS_FIELD
+		for name, (label, fieldtype) in RUN_INFO_FIELDS.items():
+			with self.subTest(field=name):
+				field = self._custom_field("HD Ticket", name)
+				self.assertIsNotNone(field)
+				self.assertEqual(
+					(field.label, field.fieldtype, field.read_only, field.permlevel, field.module),
+					(label, fieldtype, 1, 8, "ERP AI agent"),
+				)
+				self.assertEqual(field.insert_after, previous)
+				rows = frappe.get_all(
+					"HD Ticket Template Field",
+					filters={"parent": TEMPLATE, "fieldname": name},
+					fields=["visible_to", "required", "editable_after_creation"],
+				)
+				self.assertEqual(
+					[(r.visible_to, r.required, r.editable_after_creation) for r in rows], [("Agents", 0, 0)]
+				)
+			previous = name
+		# No field name may read as a stored "already has guidance" flag (ADR-036 QĐ 6).
+		for name in RUN_INFO_FIELDS:
+			self.assertFalse(any(word in name for word in ("guidance", "huong")), name)
 
 	def test_article_source_field_installed_idempotent(self):
 		"""AC-45, D-15: HD Article `ai_source_ticket` Link HD Ticket, read-only, indexed; a human edit is kept."""

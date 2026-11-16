@@ -24,17 +24,23 @@ from erp_ai.constants import (
 )
 from erp_ai.test_utils import FakeGateway, make_model_result, record_status_signals, set_agent_settings
 
-# What the panel lists about the ticket, in display order: what the bot classified, then its AI fields.
+# What the panel lists about the ticket, in display order: what the bot classified and why, how it scored
+# the ticket, what it concluded and did, then who classified and when.
 INFO_FIELD_LABELS = (
 	("ticket_type", "Loại"),
 	("agent_group", "Nhóm"),
 	("priority", "Ưu tiên"),
-	("ai_resolution_hint", "Hướng giải quyết (AI)"),
+	("ai_classification_reason", "Lý do phân loại (AI)"),
 	("ai_confidence", "Độ tin cậy (AI)"),
 	("ai_confidence_pct", "Độ tin cậy % (AI)"),
 	("ai_complexity", "Độ phức tạp (AI)"),
 	("ai_importance", "Độ quan trọng (AI)"),
 	("ai_score_reason", "Lý do chấm điểm (AI)"),
+	("ai_resolution_hint", "Hướng giải quyết (AI)"),
+	("ai_analysis", "Nhận định (AI)"),
+	("ai_done", "Đã làm (AI)"),
+	("ai_pending", "Chờ duyệt (AI)"),
+	("ai_manual", "Cần người xử lý (AI)"),
 	("ai_classified_by", "Phân loại bởi"),
 	("ai_updated_at", "AI cập nhật lúc"),
 )
@@ -127,7 +133,7 @@ class TestTicketPanelRead(FrappeTestCase):
 
 	def test_read_empty_ai_fields_are_null(self):
 		ai_items = [item for item in self._read()["ai_fields"] if item["fieldname"].startswith("ai_")]
-		self.assertEqual(len(ai_items), 8)
+		self.assertEqual(len(ai_items), 13)
 		for item in ai_items:
 			with self.subTest(field=item["fieldname"]):
 				self.assertIsNone(item["text"])
@@ -166,6 +172,30 @@ class TestTicketPanelRead(FrappeTestCase):
 		self.assertEqual(by_name["ai_complexity"], "1")
 		self.assertEqual(by_name["ai_importance"], "2")
 		self.assertEqual(by_name["ai_score_reason"], "Chỉ cần hướng dẫn thao tác có sẵn.")
+
+	def test_read_returns_what_the_run_concluded_and_did(self):
+		frappe.db.set_value(
+			"HD Ticket",
+			self.ticket.name,
+			{
+				"ai_classification_reason": "Người dùng hỏi cách dùng.",
+				"ai_analysis": "<p>**Nhận định:** hỏi cách dùng.</p><p>**Hướng xử lý:** gửi hướng dẫn.</p>",
+				"ai_done": "Bot đã phân loại phiếu: Loại Câu hỏi.\nĐã tạo Task TASK-1 (2 giờ).",
+				"ai_pending": "Đề xuất CP-1",
+				"ai_manual": "Nhờ trưởng nhóm phân công.",
+			},
+		)
+		by_name = {item["fieldname"]: item["text"] for item in self._read()["ai_fields"]}
+		self.assertEqual(by_name["ai_classification_reason"], "Người dùng hỏi cách dùng.")
+		self.assertNotIn("<p>", by_name["ai_analysis"])
+		self.assertIn("Nhận định", by_name["ai_analysis"])
+		self.assertIn("gửi hướng dẫn.", by_name["ai_analysis"])
+		self.assertEqual(
+			by_name["ai_done"].splitlines(),
+			["Bot đã phân loại phiếu: Loại Câu hỏi.", "Đã tạo Task TASK-1 (2 giờ)."],
+		)
+		self.assertEqual(by_name["ai_pending"], "Đề xuất CP-1")
+		self.assertEqual(by_name["ai_manual"], "Nhờ trưởng nhóm phân công.")
 
 	def test_read_returns_the_team_stored_on_the_ticket(self):
 		# Read as Administrator: a team the test agent is not in must not make this a permission test.

@@ -4,12 +4,14 @@ Every write runs in the session of the person who acted, never commits, and goes
 permissions bypassed after the store's own checks. Sources in a person's request call it through `safely`.
 """
 
+import re
+import unicodedata
 import uuid
 
 import frappe
 from frappe.utils import escape_html, now_datetime
 
-from erp_ai.agent import policy
+from erp_ai.agent import authority, policy
 from erp_ai.agent.knowledge import plain_text
 from erp_ai.agent.redact import redact_secrets
 from erp_ai.constants import (
@@ -25,12 +27,16 @@ from erp_ai.constants import (
 	LESSON_STATUS_REJECTED,
 	LOG_DOCTYPE,
 	SETTING_DOCTYPE,
+	TRIGGER_COMMENT_MENTION,
 )
 
 SITUATION_MAX = 300
 TEXT_MAX = 1000
 STEP_CREATE = "Tạo"
 STEP_UPDATE = "Cập nhật"
+CLASSIFICATION_FIELDS = ("ticket_type", "agent_group", "priority")
+STEP_DISABLE = "Tắt"
+STEP_REJECT = "Từ chối"
 SAVEPOINT = "erp_ai_lesson"
 TITLE_STORE_FAILED = "erp_ai: ghi bài học lỗi"
 
@@ -173,6 +179,104 @@ def _store(
 	_add_event(doc, STEP_CREATE, user, now)
 	_write(doc, insert=True)
 	return doc.name
+
+
+def _retire_correction(event_key: str) -> None:
+	"""The person put the classification back to the bot's own: their correction lesson stops being used.
+
+	It is the person's own correction, so there is no permission check; any status but active or pending is left.
+	"""
+	name = frappe.db.get_value(LESSON_DOCTYPE, {"event_key": event_key}, "name")
+	if not name:
+		return
+	user = _actor()
+	doc = frappe.get_doc(LESSON_DOCTYPE, name, for_update=True)
+	if doc.lesson_status == LESSON_STATUS_ACTIVE:
+		doc.lesson_status, step = LESSON_STATUS_DISABLED, STEP_DISABLE
+	elif doc.lesson_status == LESSON_STATUS_PENDING:
+		doc.lesson_status, step = LESSON_STATUS_REJECTED, STEP_REJECT
+	else:
+		return
+	now = now_datetime()
+	doc.update({"reviewed_by": user, "reviewed_at": now})
+	_add_event(doc, step, user, now)
+	# Only the status and the reviewer change: a link the lesson already holds (a deleted ticket) is not re-checked.
+	doc.flags.ignore_links = True
+	_write(doc)
+
+
+def record_correction(ticket: str, log_name: str) -> str | None:
+	"""A person's classification of `ticket` differs from the bot's (the classify row `log_name`): one lesson.
+
+	The same ticket keeps one lesson, updated by each later correction. When the person's values are again
+	exactly the bot's, no lesson is made and the existing one is retired. Returns the lesson name or None.
+	"""
+	user = _actor()
+	predicted = frappe.db.get_value(
+		LOG_DOCTYPE,
+		log_name,
+		[f"predicted_{field}" for field in CLASSIFICATION_FIELDS],
+	)
+	current = frappe.db.get_value(policy.TICKET_DOCTYPE, ticket, list(CLASSIFICATION_FIELDS))
+	if not predicted or not current:
+		return None
+	event_key = f"correction:{ticket}"
+	if all((before or "") == (after or "") for before, after in zip(predicted, current, strict=True)):
+		_retire_correction(event_key)
+		return None
+	t0, g0, p0 = (value or "—" for value in predicted)
+	t1, g1, p1 = (value or "—" for value in current)
+	return _store(
+		LESSON_SOURCE_CORRECTION,
+		event_key,
+		ticket=ticket,
+		updatable=True,
+		authorized=authority.is_instruction(user, ticket),
+		situation=_ticket_situation(ticket, with_description=True),
+		text=(
+			f"Bot xếp: Loại {t0}, Nhóm {g0}, Ưu tiên {p0}. Người sửa thành: Loại {t1}, Nhóm {g1}, Ưu tiên {p1}."
+		),
+	)
+
+
+def _fold(text: str) -> str:
+	return unicodedata.normalize("NFC", text or "")
+
+
+def teaching_rule(text: str) -> str | None:
+	"""The rule of a "ghi nhớ:" message, or None when the message is not one or has no rule after the marker.
+
+	The trigger keyword is dropped first (once); then the message must start with the teach marker (case and
+	Unicode form ignored, spaces before the colon ignored). A blank marker setting turns this off.
+	"""
+	marker = _fold(policy.lesson_teach_marker())
+	if not marker or not isinstance(text, str):
+		return None
+	body = _fold(text)
+	if keyword := _fold(policy.get_trigger_keyword()).strip():
+		body = re.sub(re.escape(keyword), "", body, count=1, flags=re.IGNORECASE)
+	body = body.strip()
+	words = marker.rstrip(":").split()
+	if not words:
+		return None
+	pattern = r"\s+".join(re.escape(word) for word in words) + (r"\s*:" if marker.endswith(":") else "")
+	found = re.match(pattern, body, flags=re.IGNORECASE)
+	if not found:
+		return None
+	return body[found.end() :].strip() or None
+
+
+def record_teaching_message(ticket: str, message_name: str, rule: str) -> str | None:
+	"""A "ghi nhớ:" message: a taught rule, kept only when its author has the authority to instruct the bot."""
+	authorized = authority.run_instructor(ticket, TRIGGER_COMMENT_MENTION, message_name) is not None
+	return _store(
+		LESSON_SOURCE_TEACHING,
+		f"teach:{message_name}",
+		ticket=ticket,
+		situation=_ticket_situation(ticket, with_description=False),
+		text=rule,
+		authorized=authorized,
+	)
 
 
 def transition(name: str, action: str) -> str:

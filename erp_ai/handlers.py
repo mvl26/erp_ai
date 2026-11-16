@@ -3,7 +3,7 @@ import json
 import frappe
 from frappe.core.utils import html_to_plain_text
 
-from erp_ai.agent import lifecycle, messages, policy
+from erp_ai.agent import lessons, lifecycle, messages, policy
 from erp_ai.agent.queue import enqueue_agent_run, enqueue_lifecycle_job, requester_reply_key
 from erp_ai.constants import (
 	AGENT_USER,
@@ -131,6 +131,7 @@ def _record_human_correction(doc):
 		values["human_corrected_at"] = frappe.utils.now_datetime()
 	frappe.db.set_value(LOG_DOCTYPE, log_name, values, update_modified=False)
 	_log_decision(doc.name, TRIGGER_HUMAN_CORRECTION, "recorded", "human_changed_classification")
+	lessons.safely(lessons.record_correction, doc.name, log_name)
 
 
 def _kb_draft_skip(doc) -> str | None:
@@ -246,6 +247,8 @@ def comment_after_insert(doc, method=None):
 def message_after_insert(doc, method=None):
 	# Only a person's message starts a run; the bot's own reply is told by its owner, before any DB read.
 	ticket = doc.ticket
+	if doc.owner != AGENT_USER and (rule := lessons.teaching_rule(doc.content)):
+		lessons.safely(lessons.record_teaching_message, ticket, doc.name, rule)
 	skip_reason = None
 	if doc.owner == AGENT_USER:
 		skip_reason = "written_by_agent"

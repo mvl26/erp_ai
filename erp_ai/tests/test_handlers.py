@@ -1,5 +1,6 @@
 import datetime
 import json
+import unicodedata
 from contextlib import ExitStack
 from unittest.mock import MagicMock, patch
 
@@ -1482,3 +1483,242 @@ class TestHooksWiring(FrappeTestCase):
 			),
 			("Cron", HOURLY_CRON),
 		)
+
+
+INSTRUCTOR = "erp-ai-src-instructor@example.com"
+PLAIN_USER = "erp-ai-src-plain@example.com"
+OTHER_TYPE = f"{PREFIX}OtherType"
+OTHER_TEAM = f"{PREFIX}OtherTeam"
+
+
+def _make_user(email, *roles):
+	"""A user holding exactly `roles`, created inside the test transaction."""
+	for role in roles:
+		if not frappe.db.exists("Role", role):
+			frappe.get_doc({"doctype": "Role", "role_name": role}).insert(ignore_permissions=True)
+	if not frappe.db.exists("User", email):
+		user = frappe.new_doc("User")
+		user.update({"email": email, "first_name": email.split("@")[0], "send_welcome_email": 0})
+		for role in roles:
+			user.append("roles", {"role": role})
+		user.insert(ignore_permissions=True)
+	return email
+
+
+class TestLessonSources(HandlerTestCase):
+	"""AC-5, AC-9: a person's classification fix and a "ghi nhớ:" message each make a lesson."""
+
+	def setUp(self):
+		frappe.db.rollback()
+		keep_agent_settings(self)
+		super().setUp()
+		set_agent_settings(lessons_enabled=1, lesson_teach_marker="ghi nhớ:")
+		_ensure_ticket_type(OTHER_TYPE)
+		_ensure_team(OTHER_TEAM)
+		_make_user(INSTRUCTOR, "ERP AI Instructor", "Agent")
+		_make_user(PLAIN_USER, "Agent")
+
+	def _lessons(self, **filters):
+		return frappe.get_all(
+			"ERP AI Lesson",
+			filters=filters,
+			fields=["name", "lesson_status", "lesson_source", "lesson_text", "ticket", "author"],
+		)
+
+	def _steps(self, name):
+		return [row.step for row in frappe.get_doc("ERP AI Lesson", name).history]
+
+	def _classified(self, **values):
+		ticket = self._ticket_without_job(
+			priority="Low", ticket_type=TICKET_TYPE, agent_group=OPEN_TEAM, **values
+		)
+		ticket.reload()
+		log = make_log_entry(
+			ticket=ticket.name,
+			entry_type="classify",
+			predicted_category="A",
+			predicted_ticket_type=TICKET_TYPE,
+			predicted_agent_group=OPEN_TEAM,
+			predicted_priority="Low",
+		)
+		return ticket, log
+
+	def _change(self, ticket, user="Administrator", **values):
+		frappe.set_user(user)
+		try:
+			ticket.reload()
+			ticket.update(values)
+			ticket.save(ignore_permissions=True)
+		finally:
+			frappe.set_user("Administrator")
+
+	def test_correction_of_each_field_makes_one_lesson(self):
+		cases = (
+			({"ticket_type": OTHER_TYPE}, f"Loại {TICKET_TYPE}", f"Loại {OTHER_TYPE}"),
+			({"agent_group": OTHER_TEAM}, f"Nhóm {OPEN_TEAM}", f"Nhóm {OTHER_TEAM}"),
+			({"priority": "High"}, "Ưu tiên Low", "Ưu tiên High"),
+		)
+		for changes, before, after in cases:
+			with self.subTest(changes):
+				ticket, _log = self._classified()
+				self._change(ticket, **changes)
+				rows = self._lessons(ticket=ticket.name)
+				self.assertEqual(len(rows), 1)
+				self.assertEqual(rows[0].lesson_source, "Người sửa")
+				self.assertIn(before, rows[0].lesson_text)
+				self.assertIn(after, rows[0].lesson_text)
+
+	def test_change_before_prediction_makes_none(self):
+		ticket = self._ticket_without_job(priority="Low")
+		self._change(ticket, priority="High")
+		self.assertEqual(self._lessons(), [])
+
+	def test_change_to_bot_value_makes_none(self):
+		ticket, _log = self._classified()
+		self._change(ticket, priority="Low", agent_group=OPEN_TEAM)
+		self.assertEqual(self._lessons(ticket=ticket.name), [])
+
+	def test_correction_on_excluded_ticket_makes_none(self):
+		ticket = self._ticket_without_job(priority="Low", ticket_type=TICKET_TYPE, agent_group=EXCLUDED_TEAM)
+		make_log_entry(
+			ticket=ticket.name,
+			entry_type="classify",
+			predicted_category="A",
+			predicted_ticket_type=TICKET_TYPE,
+			predicted_agent_group=EXCLUDED_TEAM,
+			predicted_priority="Low",
+		)
+		self._change(ticket, priority="High")
+		self.assertEqual(self._lessons(), [])
+
+	def test_second_correction_updates_same_lesson(self):
+		ticket, _log = self._classified()
+		self._change(ticket, priority="High")
+		self._change(ticket, priority="Urgent")
+		rows = self._lessons(ticket=ticket.name)
+		self.assertEqual(len(rows), 1)
+		self.assertIn("Ưu tiên Urgent", rows[0].lesson_text)
+		self.assertEqual(self._steps(rows[0].name), ["Tạo", "Cập nhật"])
+
+	def test_correction_by_plain_user_is_pending(self):
+		ticket, _log = self._classified()
+		self._change(ticket, user=PLAIN_USER, priority="High")
+		rows = self._lessons(ticket=ticket.name)
+		self.assertEqual([row.lesson_status for row in rows], ["Chờ duyệt"])
+		self.assertEqual(rows[0].author, PLAIN_USER)
+
+	def test_correction_by_instructor_is_active(self):
+		ticket, _log = self._classified()
+		self._change(ticket, user=INSTRUCTOR, priority="High")
+		self.assertEqual([row.lesson_status for row in self._lessons(ticket=ticket.name)], ["Đang dùng"])
+
+	def test_revert_to_prediction_retires_lesson(self):
+		for user, status, step in ((INSTRUCTOR, "Đã tắt", "Tắt"), (PLAIN_USER, "Bị từ chối", "Từ chối")):
+			with self.subTest(user):
+				ticket, _log = self._classified()
+				self._change(ticket, user=user, priority="High")
+				self._change(ticket, user=user, priority="Low")
+				rows = self._lessons(ticket=ticket.name)
+				self.assertEqual(len(rows), 1)
+				self.assertEqual(rows[0].lesson_status, status)
+				self.assertEqual(self._steps(rows[0].name), ["Tạo", step])
+				doc = frappe.get_doc("ERP AI Lesson", rows[0].name)
+				self.assertEqual(doc.reviewed_by, user)
+				self.assertTrue(doc.reviewed_at)
+
+	def test_store_failure_keeps_ticket_save(self):
+		ticket, log = self._classified()
+		with patch("erp_ai.agent.lessons._store", side_effect=RuntimeError("boom")):
+			self._change(ticket, priority="High")
+		self.assertEqual(frappe.db.get_value("HD Ticket", ticket.name, "priority"), "High")
+		corrected = frappe.db.get_value(LOG_DOCTYPE, log, "human_corrected_to")
+		self.assertEqual(json.loads(corrected)["priority"], "High")
+		self.assertEqual(self._lessons(), [])
+		self.assertEqual(frappe.log_error.call_count, 1)
+
+	def test_teaching_comment_by_instructor_makes_active_lesson(self):
+		ticket = self._ticket_without_job()
+		frappe.set_user(INSTRUCTOR)
+		with patch("erp_ai.handlers.enqueue_agent_run") as enqueue:
+			self._comment(ticket.name, f"{KEYWORD} ghi nhớ: phiếu máy in chuyển nhóm IT")
+		frappe.set_user("Administrator")
+		rows = self._lessons()
+		self.assertEqual(len(rows), 1)
+		self.assertEqual(rows[0].lesson_source, "Người dạy")
+		self.assertEqual(rows[0].lesson_status, "Đang dùng")
+		self.assertEqual(rows[0].ticket, ticket.name)
+		self.assertEqual(rows[0].lesson_text, "phiếu máy in chuyển nhóm IT")
+		self.assertEqual(enqueue.call_count, 1)
+
+	def test_comment_without_marker_makes_none(self):
+		ticket = self._ticket_without_job()
+		frappe.set_user(INSTRUCTOR)
+		self._comment(ticket.name, f"{KEYWORD} phiếu máy in nên chuyển nhóm IT")
+		frappe.set_user("Administrator")
+		self.assertEqual(self._lessons(), [])
+
+	def test_teaching_by_plain_user_makes_none(self):
+		ticket = self._ticket_without_job()
+		frappe.set_user(PLAIN_USER)
+		messages.add_message(ticket.name, "ghi nhớ: phiếu máy in chuyển nhóm IT", trusted=True)
+		frappe.set_user("Administrator")
+		self.assertEqual(self._lessons(), [])
+
+	def test_teaching_on_excluded_ticket_makes_none(self):
+		ticket = self._ticket_without_job(agent_group=EXCLUDED_TEAM)
+		frappe.set_user(INSTRUCTOR)
+		messages.add_message(ticket.name, "ghi nhớ: phiếu máy in chuyển nhóm IT", trusted=True)
+		frappe.set_user("Administrator")
+		self.assertEqual(self._lessons(), [])
+
+	def test_same_message_twice_makes_one(self):
+		ticket = self._ticket_without_job()
+		frappe.set_user(INSTRUCTOR)
+		name = messages.add_message(ticket.name, "xin chào", trusted=True)
+		from erp_ai.agent import lessons
+
+		first = lessons.record_teaching_message(ticket.name, name, "quy tắc một")
+		second = lessons.record_teaching_message(ticket.name, name, "quy tắc một")
+		frappe.set_user("Administrator")
+		self.assertTrue(first)
+		self.assertEqual(first, second)
+		self.assertEqual(len(self._lessons()), 1)
+
+	def test_marker_without_rule_makes_no_lesson(self):
+		ticket = self._ticket_without_job()
+		frappe.set_user(INSTRUCTOR)
+		self._comment(ticket.name, f"{KEYWORD} ghi nhớ:   ")
+		messages.add_message(ticket.name, "ghi nhớ:", trusted=True)
+		frappe.set_user("Administrator")
+		self.assertEqual(self._lessons(), [])
+
+	def test_marker_case_and_unicode_variants(self):
+		from erp_ai.agent import lessons
+
+		for text in (
+			"Ghi nhớ: quy tắc",
+			"GHI NHỚ : quy tắc",
+			f"{KEYWORD} ghi nhớ   : quy tắc",
+			unicodedata.normalize("NFD", "ghi nhớ: quy tắc"),
+			unicodedata.normalize("NFD", "GHI NHỚ: quy tắc"),
+		):
+			with self.subTest(text):
+				self.assertEqual(unicodedata.normalize("NFC", lessons.teaching_rule(text) or ""), "quy tắc")
+		for text in ("quy tắc ghi nhớ: x", "ghi chú: quy tắc", ""):
+			with self.subTest(text):
+				self.assertIsNone(lessons.teaching_rule(text))
+
+	def test_blank_marker_turns_teaching_off(self):
+		from erp_ai.agent import lessons
+
+		set_agent_settings(lesson_teach_marker="")
+		self.assertIsNone(lessons.teaching_rule("ghi nhớ: quy tắc"))
+
+	def test_panel_message_teaches(self):
+		ticket = self._ticket_without_job()
+		frappe.set_user(INSTRUCTOR)
+		messages.add_message(ticket.name, "ghi nhớ: phiếu máy in chuyển nhóm IT", trusted=True)
+		frappe.set_user("Administrator")
+		rows = self._lessons()
+		self.assertEqual(len(rows), 1)
+		self.assertEqual(rows[0].lesson_status, "Đang dùng")

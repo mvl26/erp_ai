@@ -55,6 +55,22 @@ def history(ticket: str, limit: int = MAX_COMMENTS) -> list[dict]:
 	]
 
 
+def typed_by_people(ticket: str, after=None, limit: int = MAX_COMMENTS) -> list[dict]:
+	"""What people typed in the conversation after `after` (None: from the start), newest first, each with its
+	`creation` and `content`. Not the bot's messages, and not the copy of an @ai comment: that comment is on the
+	ticket and is read there."""
+	filters = {"ticket": ticket, "owner": ("!=", AGENT_USER), "source_comment": ("is", "not set")}
+	if after:
+		filters["creation"] = (">", after)
+	return frappe.get_all(
+		MESSAGE_DOCTYPE,
+		filters=filters,
+		fields=["creation", "content"],
+		order_by="creation desc, name desc",
+		limit_page_length=limit,
+	)
+
+
 def thread(ticket: str) -> list[dict]:
 	"""The newest THREAD_LIMIT messages, oldest first, shaped for the panel."""
 	return [

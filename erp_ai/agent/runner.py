@@ -14,6 +14,7 @@ from erp_ai.agent.answer_delay import AnswerDelay
 from erp_ai.agent.authority import TITLE_WRONG_USER as TITLE_WRONG_USER  # re-export, U1.md:264
 from erp_ai.agent.classification import load_mapping, parse_classification, split_request_comment
 from erp_ai.agent.messages import history as conversation_history
+from erp_ai.agent.messages import typed_by_people
 from erp_ai.agent.prompts import (
 	LATER_MESSAGES_MAX,
 	TICKET_FIELD_LABELS,
@@ -420,8 +421,9 @@ def _choose_mode(context, posted: bool) -> None:
 
 def _later_messages(ticket_name) -> list[str]:
 	"""What people wrote on the ticket after its latest classify row with a result, oldest first (ADR-037 QĐ 2): the
-	requester's emails (Communication Received, research-R1 (d)) and the people's comments, each read newest first;
-	the bot's own are left out. Data of the classification request, which keeps the newest few, each cut (T106)."""
+	requester's emails (Communication Received, research-R1 (d)), the people's comments and what people typed to
+	the bot in the ticket's conversation, each read newest first; the bot's own are left out. Data of the
+	classification request, which keeps the newest few, each cut (T106)."""
 	since = frappe.get_all(
 		LOG_DOCTYPE,
 		filters={"ticket": ticket_name, "entry_type": "classify", "predicted_category": ("is", "set")},
@@ -447,7 +449,8 @@ def _later_messages(ticket_name) -> list[str]:
 		for comment in authority.fetch_ticket_comments(ticket_name)
 		if comment["author"] != AGENT_USER and (not since or comment["creation"] > since[0])
 	]
-	messages = sorted([*emails, *comments], key=lambda message: message["creation"])
+	typed = typed_by_people(ticket_name, after=since[0] if since else None, limit=LATER_MESSAGES_MAX)
+	messages = sorted([*emails, *comments, *typed], key=lambda message: message["creation"])
 	return [message["content"] for message in messages]
 
 

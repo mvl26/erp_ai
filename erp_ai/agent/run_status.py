@@ -29,6 +29,10 @@ WORK_LABELS = {
 	"set_resolution_hint": "ghi hướng giải quyết",
 	"post_comment": "viết trả lời",
 	"create_task": "tạo task",
+	"search_knowledge_base": "tìm bài CSKT",
+	"search_manuals": "tìm trong HDSD",
+	"read_error_logs": "đọc nhật ký lỗi",
+	"run_report": "xem báo cáo",
 	CLASSIFY_STEP: "phân loại phiếu",
 }
 

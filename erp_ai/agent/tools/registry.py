@@ -1,7 +1,7 @@
 import copy
 import importlib
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Literal
 
 import frappe
@@ -18,6 +18,8 @@ class GrantInputs:
 	switches: PermissionSwitches
 	over_budget: bool = False
 	below_threshold: bool = False
+	reply_enabled: bool = False
+	kb_draft_run: bool = False
 
 
 @dataclass(frozen=True)
@@ -38,6 +40,8 @@ class ToolContext:
 	over_budget: bool = False
 	main_path_level: str | None = None
 	below_threshold: bool = False
+	reply_enabled: bool = False
+	kb_draft_run: bool = False
 
 	def grant_inputs(self) -> GrantInputs:
 		switches = PermissionSwitches(
@@ -54,13 +58,24 @@ class ToolContext:
 			switches=switches,
 			over_budget=self.over_budget,
 			below_threshold=self.below_threshold,
+			reply_enabled=self.reply_enabled,
+			kb_draft_run=self.kb_draft_run,
 		)
 
 
 @dataclass(frozen=True)
 class ToolSpec:
 	name: str
-	group: Literal["read", "ticket_write", "task_write", "change_propose", "site_admin", "site_unrestricted"]
+	group: Literal[
+		"read",
+		"ticket_write",
+		"task_write",
+		"change_propose",
+		"site_admin",
+		"site_unrestricted",
+		"requester_reply",
+		"kb_draft",
+	]
 	schema: dict
 	handler: Callable[[dict, ToolContext], dict]
 
@@ -73,6 +88,7 @@ class Grant:
 	unrestricted_block: bool = False
 	act_now_block: bool = False
 	ask_only_block: bool = False
+	reply_block: bool = False
 
 	def schemas(self) -> list[dict]:
 		return [copy.deepcopy(spec.schema) for spec in self.specs]
@@ -87,44 +103,54 @@ TOOL_MODULES = (
 	"erp_ai.agent.tools.write_ticket",
 	"erp_ai.agent.tools.propose_change",
 	"erp_ai.agent.tools.site_api",
+	"erp_ai.agent.tools.knowledge_read",
+	"erp_ai.agent.tools.reply",
+	"erp_ai.agent.tools.kb_draft",
 )
 SAVEPOINT = "erp_ai_tool"
 KEY_REASON_MAX = 100  # model-supplied argument names are cut so reason stays short
 CHANGE_GROUP = "change_propose"
 SITE_ADMIN_GROUP = "site_admin"
 UNRESTRICTED_GROUP = "site_unrestricted"
-# The only ticket_write tools left below the confidence threshold (U1.md:158).
-ASK_TOOL_NAMES = frozenset({"post_comment"})
+REPLY_GROUP = "requester_reply"
+KB_DRAFT_GROUP = "kb_draft"
+# The only tools left below the confidence threshold, each while its group is granted above it (U1.md:158,
+# U6b-fixes Sửa 12).
+ASK_TOOL_NAMES = frozenset({"post_comment", "reply_to_requester"})
 
 
 def unrestricted_granted(inputs: GrantInputs) -> bool:
-	# The full-power switch: any level above L0, with an instructor, never over budget or below threshold.
+	# The full-power switch: any level above L0, with an instructor, never over budget, below threshold or in a
+	# KB-draft run.
 	return (
 		inputs.switches.unrestricted
 		and inputs.effective_level in LEVELS[1:]
 		and inputs.has_instructor
 		and not inputs.over_budget
 		and not inputs.below_threshold
+		and not inputs.kb_draft_run
 	)
 
 
-# ADR-011 QĐ 2, 6, ADR-023 QĐ 4 and ADR-030 QĐ 3: the only grant table, one row per group, checked
-# above L0: (group, Callable[[GrantInputs], bool]).
+# ADR-011 QĐ 2, 6, ADR-023 QĐ 4, ADR-030 QĐ 3 and ADR-033 QĐ 3: the only grant table, one row per group, checked
+# above L0: (group, Callable[[GrantInputs], bool]). A KB-draft run is a fixed row: `read` and `kb_draft` only.
 GRANT_TABLE = (
 	("read", lambda inputs: True),
-	("ticket_write", lambda inputs: not inputs.below_threshold),
+	("ticket_write", lambda inputs: not inputs.below_threshold and not inputs.kb_draft_run),
 	(
 		"task_write",
 		lambda inputs: inputs.has_instructor
 		and inputs.main_path_level in LEVELS[1:]
-		and not inputs.below_threshold,
+		and not inputs.below_threshold
+		and not inputs.kb_draft_run,
 	),
 	(
 		CHANGE_GROUP,
 		lambda inputs: inputs.switches.code_change
 		and inputs.effective_level == "L3"
 		and inputs.has_instructor
-		and not inputs.below_threshold,
+		and not inputs.below_threshold
+		and not inputs.kb_draft_run,
 	),
 	# Generic record tools (site_api.py): the record-tools switch, level and authority, or full power.
 	(
@@ -133,9 +159,15 @@ GRANT_TABLE = (
 			(inputs.switches.record_tools and inputs.effective_level == "L3" and inputs.has_instructor)
 			or unrestricted_granted(inputs)
 		)
-		and not inputs.below_threshold,
+		and not inputs.below_threshold
+		and not inputs.kb_draft_run,
 	),
 	(UNRESTRICTED_GROUP, unrestricted_granted),
+	(
+		REPLY_GROUP,
+		lambda inputs: inputs.reply_enabled and not inputs.kb_draft_run and not inputs.below_threshold,
+	),
+	(KB_DRAFT_GROUP, lambda inputs: inputs.kb_draft_run),
 )
 
 
@@ -152,15 +184,20 @@ def grant(inputs: GrantInputs) -> Grant:
 	if inputs.effective_level not in LEVELS or inputs.effective_level == LEVELS[0]:
 		return Grant(specs=())
 	groups = {group for group, condition in GRANT_TABLE if condition(inputs)}
-	# Below the threshold only the ask tools of ticket_write are added back (U1.md:179 step 3).
+	# Below the threshold the ask tools come back, each whose group the table grants above the threshold
+	# (U1.md:179 step 3, U6b-fixes Sửa 12).
+	ask_groups = set()
+	if inputs.below_threshold:
+		above = replace(inputs, below_threshold=False)
+		ask_groups = {group for group, condition in GRANT_TABLE if condition(above)}
 	specs = tuple(
 		spec
 		for spec in _all_specs()
-		if spec.group in groups
-		or (inputs.below_threshold and spec.group == "ticket_write" and spec.name in ASK_TOOL_NAMES)
+		if spec.group in groups or (spec.name in ASK_TOOL_NAMES and spec.group in ask_groups)
 	)
 	unrestricted_block = UNRESTRICTED_GROUP in groups
-	# U1.md:181-187: the full-power block replaces the record block; act-now needs a power group.
+	# U1.md:181-187: the full-power block replaces the record block; act-now needs a power group. The reply block
+	# goes with a granted tool of the reply group (U6b.md:159).
 	return Grant(
 		specs=specs,
 		change_block=CHANGE_GROUP in groups,
@@ -168,7 +205,8 @@ def grant(inputs: GrantInputs) -> Grant:
 		unrestricted_block=unrestricted_block,
 		act_now_block=inputs.switches.act_now
 		and bool(groups & {CHANGE_GROUP, SITE_ADMIN_GROUP, UNRESTRICTED_GROUP}),
-		ask_only_block=inputs.below_threshold,
+		ask_only_block=inputs.below_threshold and not inputs.kb_draft_run,
+		reply_block=any(spec.group == REPLY_GROUP for spec in specs),
 	)
 
 

@@ -164,13 +164,25 @@ class TestSearchKnowledgeBase(KnowledgeToolCase):
 	def test_query_without_two_letter_word_refused(self):
 		self.assertEqual(self._search("a b"), {"ok": False, "reason": EMPTY_QUERY})
 
+	def _excluded_ticket(self) -> str:
+		"""A ticket of EXCLUDED_TEAM. A real HD Team: the in-query exclusion (policy.excluded_ticket_names, R17d) only
+		knows teams that exist."""
+		self._settings(excluded_teams=EXCLUDED_TEAM)
+		if not frappe.db.exists("HD Team", EXCLUDED_TEAM):
+			# HD Team.after_insert caches its Assignment Rule in Redis, which the rollback does not undo.
+			self.addCleanup(frappe.cache.hdel, "assignment_rule_map", "HD Ticket")
+			frappe.get_doc(
+				{"doctype": "HD Team", "team_name": EXCLUDED_TEAM, "users": [{"user": "Administrator"}]}
+			).insert(ignore_permissions=True)
+		excluded = make_ticket(subject="T148 phiếu loại trừ").name
+		# db.set_value skips the link check; the team itself is created above.
+		frappe.db.set_value("HD Ticket", excluded, "agent_group", EXCLUDED_TEAM)
+		return excluded
+
 	def test_article_of_excluded_ticket_left_out(self):
 		"""NFR-1: a published article whose source ticket the agent may not take never reaches the model."""
 		word = _word()
-		self._settings(excluded_teams=EXCLUDED_TEAM)
-		excluded = make_ticket(subject="T148 phiếu loại trừ").name
-		# db.set_value skips the link check: the send predicate compares team names only.
-		frappe.db.set_value("HD Ticket", excluded, "agent_group", EXCLUDED_TEAM)
+		excluded = self._excluded_ticket()
 		kept = self._article(f"<p>{word} {_word()}</p>", ai_source_ticket=make_ticket(subject="T148").name)
 		self._article(f"<p>{word}</p>", ai_source_ticket=excluded)
 
@@ -180,9 +192,8 @@ class TestSearchKnowledgeBase(KnowledgeToolCase):
 		"""R17d: the excluded articles are dropped before the cut to the limit, so one excluded match among
 		limit + 1 matches still leaves `limit` allowed articles (a shorter list would reveal the excluded one)."""
 		one, two = _word(), _word()
-		self._settings(excluded_teams=EXCLUDED_TEAM, knowledge_search_limit=2)
-		excluded = make_ticket(subject="T148 phiếu loại trừ").name
-		frappe.db.set_value("HD Ticket", excluded, "agent_group", EXCLUDED_TEAM)
+		excluded = self._excluded_ticket()
+		self._settings(knowledge_search_limit=2)
 		# Both words: the excluded article ranks first.
 		self._article(f"<p>{one} {two}</p>", ai_source_ticket=excluded)
 		kept = {self._article(f"<p>{one}</p>") for _index in range(2)}

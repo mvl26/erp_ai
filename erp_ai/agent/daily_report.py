@@ -9,6 +9,8 @@ from datetime import datetime, time, timedelta
 
 import frappe
 from frappe.utils import escape_html, get_datetime, getdate, now_datetime
+from frappe.utils.file_lock import LockTimeoutError
+from frappe.utils.synchronization import filelock
 
 from erp_ai.agent import policy
 from erp_ai.agent.classification import load_mapping
@@ -64,6 +66,9 @@ BOT_ACTION_KINDS = (
 	OTHER_ACTION_KIND,
 )
 COST_DIGITS = 6
+LOCK_NAME = "erp_ai_daily_report"
+LOCK_TIMEOUT_S = 5
+TITLE_DAILY_REPORT_FAILED = "erp_ai: báo cáo hằng ngày lỗi"
 DEADLINE_FORMAT = "%d/%m/%Y %H:%M"
 EXCLUDED_LABEL = "(nhóm loại trừ)"
 NONE_LABEL = "Không có"
@@ -287,25 +292,48 @@ def _de_progress(
 
 def run_daily_report(now: datetime | None = None) -> None:
 	"""Build the report of the cycle `now` belongs to and queue its email once; the watermark is written here
-	only, in the same transaction as the email (design 3.6.3, ADR-033 QĐ 6)."""
-	now = get_datetime(now) if now else now_datetime()
+	only, in the same transaction as the email (design 3.6.3, ADR-033 QĐ 6).
+
+	Nothing leaves this function as an error: a busy lock, an empty recipient list, a weekend with the
+	weekend switch off and a failed send are logged and the job returns (AC-52).
+	"""
+	logger = frappe.logger(LOGGER_NAME)
+	try:
+		with filelock(LOCK_NAME, timeout=LOCK_TIMEOUT_S):
+			_run_locked(get_datetime(now) if now else now_datetime(), logger)
+	except LockTimeoutError:
+		logger.info("daily_report: lock busy")
+
+
+def _run_locked(now: datetime, logger) -> None:
 	cycle = daily_cycle(now)
 	sent_on = frappe.db.get_single_value(SETTING_DOCTYPE, "daily_report_sent_on")
 	if sent_on and getdate(sent_on) == cycle:
-		frappe.logger(LOGGER_NAME).info("erp_ai daily_report: already sent for %s", cycle)
+		logger.info("daily_report: already sent for %s", cycle)
+		return
+	if cycle.weekday() >= 5 and not frappe.db.get_single_value(SETTING_DOCTYPE, "daily_report_weekends"):
+		logger.info("daily_report: weekend, skipped")
 		return
 	recipients = list(
 		dict.fromkeys(filled_lines(frappe.db.get_single_value(SETTING_DOCTYPE, "coo_report_recipients")))
 	)
+	if not recipients:
+		logger.info("daily_report: chưa có người nhận")
+		return
 	data = build_daily_report(datetime.combine(cycle, CYCLE_START))
-	frappe.sendmail(
-		recipients=recipients,
-		subject=SUBJECT_FORMAT.format(cycle=cycle),
-		message=render_daily_report(data),
-		delayed=True,
-	)
-	frappe.db.set_single_value(SETTING_DOCTYPE, "daily_report_sent_on", cycle)
-	frappe.logger(LOGGER_NAME).info(
+	try:
+		frappe.sendmail(
+			recipients=recipients,
+			subject=SUBJECT_FORMAT.format(cycle=cycle),
+			message=render_daily_report(data),
+			delayed=True,
+		)
+		frappe.db.set_single_value(SETTING_DOCTYPE, "daily_report_sent_on", cycle)
+	except (frappe.ValidationError, frappe.OutgoingEmailError) as exc:
+		frappe.db.rollback()
+		frappe.log_error(TITLE_DAILY_REPORT_FAILED, f"send error={type(exc).__name__}")
+		return
+	logger.info(
 		"erp_ai daily_report: %s new tickets, %s past the response mark",
 		len(data["new_list"]),
 		len(data["response_overdue"]),

@@ -65,18 +65,35 @@ def _limits() -> tuple[int, tuple[str, ...], int]:
 	)
 
 
+def _allowed_articles(rows: list) -> list:
+	"""The rows, in their order, without the articles of excluded tickets (NFR-1): one get_list over
+	`policy.ticket_content_filters`, none when no ticket is excluded."""
+	filters, or_filters = policy.ticket_content_filters(ARTICLE_DOCTYPE)
+	if not rows or not (filters or or_filters):
+		return rows
+	names = [row["name"] for row in rows]
+	kept = set(
+		frappe.get_list(
+			ARTICLE_DOCTYPE,
+			filters=[["name", "in", names], *filters],
+			or_filters=or_filters,
+			pluck="name",
+			limit_page_length=len(names),
+		)
+	)
+	return [row for row in rows if row["name"] in kept]
+
+
 def search_knowledge_base(args: dict, ctx: ToolContext) -> dict:
-	"""AC-46: published articles the session user may read (`knowledge.search_kb_articles`); an article whose
-	source ticket the agent may not take is left out (NFR-1)."""
+	"""AC-46: published articles the session user may read (`knowledge.search_kb_articles`, every ranked match up
+	to its scan cap); the articles of excluded tickets are dropped before the cut to the limit (R17d), so a short
+	list never reveals an excluded match."""
 	args = args if isinstance(args, dict) else {}
 	try:
-		rows = knowledge.search_kb_articles(args.get("query"), _limits()[0])
+		rows = knowledge.search_kb_articles(args.get("query"), knowledge.KB_SCAN_MAX)
 	except frappe.ValidationError as exc:
 		return _refuse(str(exc))
-	articles = [
-		_masked(row) for row in rows if not policy.is_ticket_record_excluded(ARTICLE_DOCTYPE, row["name"])
-	]
-	return {"ok": True, "articles": articles}
+	return {"ok": True, "articles": [_masked(row) for row in _allowed_articles(rows)[: _limits()[0]]]}
 
 
 def search_manuals(args: dict, ctx: ToolContext) -> dict:
@@ -142,6 +159,17 @@ def _row(row, fieldnames: list) -> list:
 	return [_cell(value) for value in cells]
 
 
+def _on_ticket_or_app_data(ref_doctype) -> bool:
+	"""ADR-034 QĐ 3: the report's DocType carries ticket content (TICKET_CONTENT_DOCTYPES, a Link to HD Ticket),
+	points at tickets through a column of `policy.ticket_link_columns` (R17b: the listed and the live-meta
+	(DocType, Dynamic Link) pairs), or is denied to the read tools."""
+	return (
+		policy.is_ticket_content_doctype(ref_doctype)
+		or bool(policy.ticket_link_columns(ref_doctype))
+		or ref_doctype in read.denied_doctypes()
+	)
+
+
 def run_report(args: dict, ctx: ToolContext) -> dict:
 	"""AC-49: a report of `allowed_reports`, checked again here (the list can be written past the form, ADR-034
 	QĐ 3), run under the session user without a prepared report, cut to `report_row_limit` rows."""
@@ -160,8 +188,14 @@ def run_report(args: dict, ctx: ToolContext) -> dict:
 	)
 	if not report or report.disabled or report.report_type not in REPORT_TYPES:
 		return _refuse(REASON_REPORT_NOT_RUNNABLE)
-	if policy.is_ticket_content_doctype(report.ref_doctype) or report.ref_doctype in read.denied_doctypes():
+	if _on_ticket_or_app_data(report.ref_doctype):
 		return _refuse(REASON_REPORT_ON_TICKET_DATA)
+	try:
+		# R17f: Frappe's check that the session user may read the record of each Link filter, run here so that its
+		# error, and no other validation error of the run, gives the permission reason.
+		query_report.validate_filters_permissions(report_name, filters, frappe.session.user)
+	except frappe.ValidationError:
+		return _refuse(REASON_REPORT_PERMISSION)
 	try:
 		result = query_report.run(report_name, filters=filters, ignore_prepared_report=True)
 	except frappe.PermissionError:

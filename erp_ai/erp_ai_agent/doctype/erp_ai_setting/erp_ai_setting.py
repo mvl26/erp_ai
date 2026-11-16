@@ -558,7 +558,13 @@ def allowed_report_error(name) -> str | None:
 	if report.disabled:
 		return "đang tắt"
 	ref_doctype = report.ref_doctype
-	if policy.is_ticket_content_doctype(ref_doctype) or ref_doctype in read.denied_doctypes():
+	# R17b: also a DocType whose columns point at tickets (policy.ticket_link_columns: listed and live-meta
+	# (DocType, Dynamic Link) pairs), the same rule the run_report tool checks at run time.
+	if (
+		policy.is_ticket_content_doctype(ref_doctype)
+		or policy.ticket_link_columns(ref_doctype)
+		or ref_doctype in read.denied_doctypes()
+	):
 		return f"dựa trên {ref_doctype}, mang nội dung phiếu hoặc dữ liệu của app: bot không được chạy"
 	return None
 

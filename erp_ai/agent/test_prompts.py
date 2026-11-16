@@ -7,7 +7,12 @@ from frappe.tests.utils import FrappeTestCase
 from erp_ai.agent import prompts
 from erp_ai.agent.policy import PermissionSwitches
 from erp_ai.agent.tools import registry
-from erp_ai.constants import TRIGGER_COMMENT_MENTION, TRIGGER_TICKET_INSERT
+from erp_ai.constants import (
+	TRIGGER_COMMENT_MENTION,
+	TRIGGER_KB_DRAFT,
+	TRIGGER_REQUESTER_REPLY,
+	TRIGGER_TICKET_INSERT,
+)
 from erp_ai.test_utils import keep_agent_settings
 
 FLAG_NAMES = ("change_tools", "site_admin_tools", "unrestricted_tools", "act_now", "ask_only")
@@ -561,3 +566,38 @@ class TestInitialMessage(FrappeTestCase):
 		plain = prompts.build_initial_message(TICKET, COMMENTS, TRIGGER_COMMENT_MENTION, None)
 		self.assertNotIn("guidance_posted", _payload(plain)["ticket"])
 		self.assertNotIn(prompts.TASK_AFTER_GUIDANCE, plain)
+
+
+class TestTaskByTrigger(FrappeTestCase):
+	"""AC-41, AC-45 (U6b-fixes.md:91, :218; U6b.md:293): the task line of the first message follows the trigger,
+	the payload does not move."""
+
+	def setUp(self):
+		keep_agent_settings(self)
+
+	def test_requester_reply_and_kb_draft_tasks(self):
+		self.assertEqual(
+			prompts.TASK_REQUESTER_REPLY,
+			"Người tạo phiếu vừa trả lời tin của bạn, có thể bằng nhiều tin. Đọc mọi tin của người tạo sau tin gần "
+			"nhất của bạn. Trả lời người tạo bằng reply_to_requester nếu được cấp, hoặc ghi comment cho người phụ "
+			"trách.",
+		)
+		self.assertEqual(
+			prompts.TASK_KB_DRAFT,
+			"Phiếu đã đóng. Soạn đúng một bài CSKT nháp bằng create_kb_draft: vấn đề và các bước đã giải quyết, lấy "
+			"từ chi tiết giải quyết và comment của người phụ trách; không chép tên người, email, số điện thoại, mật "
+			"khẩu.",
+		)
+		tasks = {
+			TRIGGER_TICKET_INSERT: prompts.TASK_NEW_TICKET,
+			TRIGGER_COMMENT_MENTION: prompts.TASK_COMMENT,
+			TRIGGER_REQUESTER_REPLY: prompts.TASK_REQUESTER_REPLY,
+			TRIGGER_KB_DRAFT: prompts.TASK_KB_DRAFT,
+		}
+		self.assertEqual(len(set(tasks.values())), len(tasks))
+		for trigger, task in tasks.items():
+			with self.subTest(trigger=trigger):
+				message = prompts.build_initial_message(TICKET, COMMENTS, trigger, CLASSIFICATION)
+
+				self.assertEqual(_payload(message), _payload(_old_initial_message(trigger, CLASSIFICATION)))
+				self.assertEqual(message.rsplit("\n\n", 1)[1], task)

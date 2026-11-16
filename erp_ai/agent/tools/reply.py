@@ -39,9 +39,11 @@ def _refuse(reason: str) -> dict:
 
 
 def _paragraph(text: str) -> str:
-	"""One escaped, masked paragraph; masked before the line breaks become `<br>`, so a value on the line after its
-	key is still caught. Quotes stay as they are (text, not an attribute) for the masking rules to see them."""
-	return "<p>" + "<br>".join(redact_secrets(html.escape(text, quote=False)).splitlines()) + "</p>"
+	"""One masked, escaped paragraph. Masked first (R17a): escaped first, a value starting with `<` would start
+	with `&lt;`, which no masking rule reads as a value; the mask has no HTML character. Masked before the line
+	breaks become `<br>`, so a value on the line after its key is still caught. Quotes stay (text, not an
+	attribute)."""
+	return "<p>" + "<br>".join(html.escape(redact_secrets(text), quote=False).splitlines()) + "</p>"
 
 
 def _content(message: str, kind: str, sources: list) -> str:

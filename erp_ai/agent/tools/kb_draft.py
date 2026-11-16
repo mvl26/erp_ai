@@ -2,7 +2,7 @@
 
 Group `kb_draft`. The article is inserted under the session user (the agent account), without
 `ignore_permissions`; `article_guard` refuses any status other than Draft for that account. Every piece of the
-content is HTML-escaped, then masked (NFR-1, NFR-6).
+content is masked, then HTML-escaped (NFR-1, NFR-6).
 """
 
 import html
@@ -32,8 +32,9 @@ def _refuse(reason: str) -> dict:
 
 
 def _html(text) -> str:
-	"""Escaped then masked; masked before the line breaks become `<br>`, so a value on the next line is caught."""
-	return "<br>".join(redact_secrets(html.escape(str(text), quote=False)).splitlines())
+	"""Masked then escaped (R17a: escaped first, a value starting with `<` would slip past the mask); masked before
+	the line breaks become `<br>`, so a value on the next line is caught."""
+	return "<br>".join(html.escape(redact_secrets(str(text)), quote=False).splitlines())
 
 
 def _content(ticket: str, problem: str, steps: list) -> str:
@@ -57,7 +58,9 @@ def create_kb_draft(args: dict, ctx: ToolContext) -> dict:
 	refusal = read._check_ticket(ticket)
 	if refusal:
 		return refusal
-	if frappe.db.get_value("HD Ticket", ticket, "status_category") != RESOLVED_CATEGORY:
+	# R17e: the ticket row is locked (as lifecycle does) before the check for an existing article, so a second run
+	# on the ticket waits here and then sees the first run's article.
+	if frappe.db.get_value("HD Ticket", ticket, "status_category", for_update=True) != RESOLVED_CATEGORY:
 		return _refuse(REASON_NOT_CLOSED)
 	if frappe.db.exists(ARTICLE_DOCTYPE, {SOURCE_TICKET_FIELD: ticket}):
 		return _refuse(REASON_HAS_ARTICLE)

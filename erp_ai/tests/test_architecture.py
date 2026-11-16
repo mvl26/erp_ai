@@ -3000,7 +3000,8 @@ def check_panel_decision_follows_adr_044(sources: dict) -> list:
 				)
 			)
 	for call in calls:
-		if _call_leaf(call) in ("approve", "reject"):
+		# CHG-010: the panel approves through `panel_approve`, so a direct call to it is banned like `approve`
+		if _call_leaf(call) in ("approve", "panel_approve", "reject"):
 			violations.append(
 				violation(
 					PANEL_FILE,
@@ -3018,6 +3019,19 @@ def check_panel_decision_follows_adr_044(sources: dict) -> list:
 				)
 			)
 		violations.extend(_decide_gate_violations(decide, ordered[0], ordered[1]))
+		# CHG-010: the predicate must be told whether the proposal is a console one, or the console switch is skipped
+		predicate_call = ordered[2]
+		if not any(
+			keyword.arg == "console" and dotted_name(keyword.value) == "head.is_console"
+			for keyword in predicate_call.keywords
+		):
+			violations.append(
+				violation(
+					PANEL_FILE,
+					predicate_call,
+					f"{PANEL_PREDICATE_FUNCTION} is called without console=head.is_console (CHG-010)",
+				)
+			)
 	table = definitions.get(PANEL_DECISIONS_NAME)
 	if table is None:
 		violations.append(f"{PANEL_FILE}: no {PANEL_DECISIONS_NAME}")
@@ -6161,6 +6175,18 @@ class TestArchitecture(unittest.TestCase):
 			"switch read": (
 				("\trefusal = ", "\tpolicy.permission_switches(None)\n\trefusal = "),
 				"names permission_switches",
+			),
+			# CHG-010: a direct panel_approve call and a predicate without the console flag are caught
+			"direct panel_approve call": (
+				("PANEL_DECISIONS[action](name)", "proposal_form.panel_approve(name)"),
+				"panel_approve is called directly",
+			),
+			"predicate without console flag": (
+				(
+					"panel_decision_refusal(head.change_status, console=head.is_console)",
+					"panel_decision_refusal(head.change_status)",
+				),
+				"without console=head.is_console",
 			),
 			"undo in the table": (("proposal_form.reject,", "proposal_form.undo,"), "names undo"),
 			"predicate before gate": ((gate + predicate, predicate + gate), "order is not"),

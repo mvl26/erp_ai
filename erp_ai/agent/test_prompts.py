@@ -871,6 +871,58 @@ class TestLessonPrompts(FrappeTestCase):
 			)
 		)
 
+	def test_classify_lessons_follow_the_label_lines(self):
+		# FEAT-008 with ADR-049: the lesson block stays the last block of the user part, after the labels in use and
+		# the alike tickets; the system part (departments, modules) is the same with or without lessons.
+		labelled = {
+			"modules": ("Stock",),
+			"label_catalog": (("Stock", 2, "Phiếu về kho"),),
+			"similar_labels": (("Không in được phiếu xuất kho", ("Stock",)),),
+		}
+		base = prompts.build_classify_request(
+			"Tiêu đề", "Mô tả", ("IT",), later_messages=["thêm"], **labelled
+		)
+		for lessons in (None, []):
+			with self.subTest(lessons=lessons):
+				self.assertEqual(
+					prompts.build_classify_request(
+						"Tiêu đề", "Mô tả", ("IT",), later_messages=["thêm"], lessons=lessons, **labelled
+					),
+					base,
+				)
+		request = prompts.build_classify_request(
+			"Tiêu đề",
+			"Mô tả",
+			("IT",),
+			later_messages=["thêm"],
+			lessons=[RULE_LESSON, DATA_LESSON],
+			**labelled,
+		)
+		self.assertEqual(request["system"], base["system"])
+		self.assertEqual(
+			request["messages"][0]["content"],
+			base["messages"][0]["content"] + "\n\n" + prompts.lessons_text([RULE_LESSON, DATA_LESSON]),
+		)
+		self.assertIn(prompts.SIMILAR_LABELS_LABEL, base["messages"][0]["content"])
+
+	def test_reason_propose_now_hint_and_lessons_together(self):
+		# CHG-007 with FEAT-008: the hint keeps its place after the C line, the lessons task line stays last.
+		lessons_only = prompts.build_initial_message(
+			TICKET, COMMENTS, TRIGGER_COMMENT_MENTION, {"category": "C"}, lessons=[RULE_LESSON]
+		)
+		both = prompts.build_initial_message(
+			TICKET,
+			COMMENTS,
+			TRIGGER_COMMENT_MENTION,
+			{"category": "C"},
+			lessons=[RULE_LESSON],
+			propose_now=True,
+		)
+		self.assertEqual(both.count(prompts.TASK_PROPOSE_NOW), 1)
+		self.assertIn(f"\n{prompts.TASK_CATEGORY_C}\n{prompts.TASK_PROPOSE_NOW}\n", both)
+		self.assertTrue(both.endswith("\n" + prompts.TASK_LESSONS))
+		self.assertEqual(both.replace("\n" + prompts.TASK_PROPOSE_NOW, "", 1), lessons_only)
+
 	def test_reason_without_lessons_unchanged(self):
 		old = prompts.build_initial_message(TICKET, COMMENTS, TRIGGER_COMMENT_MENTION, CLASSIFICATION)
 		for lessons in (None, []):

@@ -9,7 +9,7 @@ from frappe.desk.form.document_follow import follow_document
 from frappe.utils import escape_html, get_fullname, getdate, now_datetime
 
 from erp_ai import gateway
-from erp_ai.agent import authority, policy, site_facts
+from erp_ai.agent import authority, lifecycle, policy, queue, site_facts
 from erp_ai.agent.answer_delay import AnswerDelay
 from erp_ai.agent.authority import TITLE_WRONG_USER as TITLE_WRONG_USER  # re-export, U1.md:264
 from erp_ai.agent.classification import load_mapping, parse_classification, split_request_comment
@@ -82,6 +82,7 @@ from erp_ai.constants import (
 	TITLE_STATUS_FAILED,
 	TRIGGER_CHANGE_ACTION,
 	TRIGGER_COMMENT_MENTION,
+	TRIGGER_REQUESTER_REPLY,
 	TRIGGER_TICKET_INSERT,
 )
 
@@ -181,16 +182,20 @@ GUIDANCE_TOOL = "post_guidance"
 # The split question a guidance run's route gathered, per run: (classify row, text, requests), recorded as asked only
 # once the run's one comment carrying it is posted (AC-28, C9-fix1 R20a); dropped when the run ends.
 SPLIT_HELD_FLAG = "erp_ai_split_held"
+# A requester-reply event whose key is already on a log row: one logger line, no row (ADR-033 QĐ 6, U6b-fixes Sửa 1).
+ALREADY_HANDLED_LOG = "erp_ai skip ticket=%s run_id=%s reason=already_handled"
 
 
-def run_for_ticket(ticket_name: str, trigger: str, comment_name: str | None = None) -> None:
+def run_for_ticket(
+	ticket_name: str, trigger: str, comment_name: str | None = None, communication_name: str | None = None
+) -> None:
 	"""Agent job (design 4.3). Never raises: a failed run is logged and the job ends normally.
 
 	No rollback on the error path: the gateway writes key breaker state without committing, and a
 	rollback would lose the key status and the alarm that state drives (committed by `_call_model`).
 	"""
 	try:
-		_run(ticket_name, trigger, comment_name)
+		_run(ticket_name, trigger, comment_name, communication_name)
 	except Exception as exc:
 		frappe.log_error(
 			TITLE_RUN_FAILED, f"ticket={ticket_name} trigger={trigger} error={type(exc).__name__}"
@@ -206,7 +211,7 @@ def _call_model(task, **kwargs):
 			frappe.db.commit()
 
 
-def _run(ticket_name, trigger, comment_name=None):
+def _run(ticket_name, trigger, comment_name=None, communication_name=None):
 	# (a) the job must run as the agent account, checked before the ticket is read (AC-6)
 	if not authority.enter_agent_session():
 		return
@@ -217,7 +222,13 @@ def _run(ticket_name, trigger, comment_name=None):
 		return
 	routing = load_routing_config(settings.routing_rules)
 
-	run_id = uuid.uuid4().hex
+	reply_run = trigger == TRIGGER_REQUESTER_REPLY
+	# ADR-033 QĐ 2: a requester-reply run is named by its event; each row it writes records the event as handled
+	run_id = queue.requester_reply_key(ticket_name, communication_name) if reply_run else uuid.uuid4().hex
+	# (r1) the event already has a row: run again for nothing, not even a row (ADR-033 QĐ 6, B-2)
+	if reply_run and frappe.db.exists(LOG_DOCTYPE, {"run_id": run_id}):
+		frappe.logger(LOGGER_NAME).info(ALREADY_HANDLED_LOG, ticket_name, run_id)
+		return
 	# the ask_fallback dedup counts from here: one question per run, not per ticket (AC-22, ADR-037)
 	started_at = now_datetime()
 	field_map, missing = _ticket_fields(settings)
@@ -229,6 +240,11 @@ def _run(ticket_name, trigger, comment_name=None):
 	# (c) the single send condition, re-checked at run time (NFR-4)
 	if not policy.can_send_ticket(ticket_name):
 		_log_skip(ticket_name, trigger, run_id, "not_sendable")
+		return
+	# (r2)-(r4) the requester's message is read again; a skip row is not counted by runs_today
+	skip = _requester_reply_skip(ticket_name, communication_name) if reply_run else None
+	if skip:
+		_log_skip(ticket_name, trigger, run_id, skip)
 		return
 	# (d) daily limit counted from the log (AC-15); above L0 the person is told once a day (AC-23, AC-61)
 	limit = settings.max_runs_per_ticket_per_day
@@ -246,7 +262,8 @@ def _run(ticket_name, trigger, comment_name=None):
 	auto_assign = policy.auto_assign_enabled(settings)
 	deadline = time.monotonic() + JOB_TIMEOUT_S - JOB_SAFETY_MARGIN_S
 
-	if trigger == TRIGGER_COMMENT_MENTION and level == LEVELS[0]:
+	# a run other than the ticket's first one needs a level above L0 (U6b.md:286)
+	if trigger != TRIGGER_TICKET_INSERT and level == LEVELS[0]:
 		_log_skip(ticket_name, trigger, run_id, "level_L0")
 		return
 	status = RunStatus(ticket_name, run_id, settings.get("thinking_text"))
@@ -479,6 +496,26 @@ def _log_skip(ticket_name, trigger, run_id, stop_reason, notice=None):
 		stop_reason=stop_reason,
 		actions=[entry] if entry else None,
 	)
+
+
+def _requester_reply_skip(ticket_name, communication_name) -> str | None:
+	"""Why the requester-reply run of message `communication_name` stops after step (c), else None (U6b-fixes Sửa 1).
+
+	The message is read again here: gone → `event_missing`; now on another ticket (a merge, B-3) → `event_moved`; the
+	requester wrote again after it → `superseded`, as the newer message's own job reads both.
+	"""
+	message = (
+		frappe.db.get_value("Communication", communication_name, ["name", "reference_name"], as_dict=True)
+		if communication_name
+		else None
+	)
+	if not message:
+		return "event_missing"
+	if message.reference_name != ticket_name:
+		return "event_moved"
+	if lifecycle.newer_requester_message_exists(ticket_name, communication_name):
+		return "superseded"
+	return None
 
 
 def _start_of_today() -> datetime:

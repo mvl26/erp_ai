@@ -5,6 +5,7 @@ import math
 import re
 import unicodedata
 from datetime import datetime
+from decimal import Decimal
 
 import frappe
 from frappe.utils import escape_html, now_datetime
@@ -640,6 +641,12 @@ def _valid_estimate(hours) -> bool:
 	)
 
 
+def _hours_text(hours) -> str:
+	"""The estimate of a done line as given, never with an exponent: a whole number without ".0" (w1.md:120)."""
+	value = float(hours)
+	return str(int(value)) if value.is_integer() else format(Decimal(repr(value)), "f")
+
+
 def _max_tasks_per_run() -> int:
 	return frappe.db.get_single_value(SETTING_DOCTYPE, "max_tasks_per_run") or DEFAULT_MAX_TASKS_PER_RUN
 
@@ -678,7 +685,7 @@ def create_task(args: dict, ctx: ToolContext) -> dict:
 	)
 	task.insert()
 	created[ctx.run_id] = created.get(ctx.run_id, 0) + 1
-	collect(ctx.run_id, SECTION_DONE, TASK_DONE.format(task=task.name, hours=f"{float(hours):g}"))
+	collect(ctx.run_id, SECTION_DONE, TASK_DONE.format(task=task.name, hours=_hours_text(hours)))
 	return {"ok": True, "task": task.name}
 
 

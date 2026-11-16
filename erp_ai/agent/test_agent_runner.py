@@ -4137,3 +4137,69 @@ class TestConfidenceSource(RunnerTestBase):
 		self.assertEqual(frappe.db.get_value("HD Ticket", self.ticket.name, "ai_confidence_pct"), 85)
 		self.assertEqual(self.real_latest_classification(self.ticket.name), ("A", 85))
 		self.log_error.assert_not_called()
+
+
+GUIDANCE_EXISTS_LOG = "đã có hướng xử lý"
+
+
+class TestOneGuidance(RunnerTestBase):
+	"""AC-65, ADR-036 (T115-T118, w1.md:68, :101-106, :164-198): a ticket gets the bot's guidance comment once; the run
+	chooses its mode from the one count, and a guidance run gathers its work into that one comment."""
+
+	def setUp(self):
+		super().setUp()
+		keep_agent_settings(self)
+		# every switch and limit a run here depends on is set, never read from the shared site; the stub's category A
+		# is inside CATEGORIES, so its cap is set too
+		set_agent_settings(
+			permission_level="L1",
+			level_cap_a="L1",
+			act_now_enabled=0,
+			code_change_enabled=0,
+			record_tools_enabled=0,
+			unrestricted_enabled=0,
+			monthly_budget_usd=1000,
+			max_runs_per_ticket_per_day=10,
+			confidence_threshold=policy.DEFAULT_CONFIDENCE_THRESHOLD,
+		)
+		log_error = patch.object(frappe, "log_error")
+		self.log_error = log_error.start()
+		self.addCleanup(log_error.stop)
+
+	def _guidance(self, ticket=None):
+		return write_ticket.count_guidance(ticket or self.ticket.name)
+
+	def _guidance_by_hand(self, ticket=None):
+		"""A guidance comment an earlier run posted: the agent account's, the marker on line 1."""
+		frappe.set_user(AGENT_USER)
+		try:
+			posted = write_ticket._post(
+				ticket or self.ticket.name, f"{write_ticket.GUIDANCE_MARKER}\n{PREFIX}hướng"
+			)
+		finally:
+			frappe.set_user("Administrator")
+		self.assertTrue(posted["ok"])
+		return posted["comment"]
+
+	def _guidance_log_lines(self, logger):
+		return [call.args for call in logger.info.call_args_list if GUIDANCE_EXISTS_LOG in str(call.args[0])]
+
+	def test_ai_after_guidance_no_work_no_comment_one_log_line(self):
+		# AC-65 (c), T115: the ticket already has its guidance; an @ai with nothing to do posts nothing, one log line
+		self._guidance_by_hand()
+		before = self._comment_count()
+		self.gateway.results = [make_model_result()]
+		logger = MagicMock()
+		with patch.object(frappe, "logger", return_value=logger):
+			self._run("comment_mention")
+
+		self.assertEqual(self._comment_count(), before)
+		self.assertEqual(self._guidance(), 1)
+		(line,) = self._guidance_log_lines(logger)
+		(entry,) = self._entries(entry_type="reason")
+		self.assertEqual(
+			line, ("erp_ai guidance ticket=%s run_id=%s: đã có hướng xử lý", self.ticket.name, entry.run_id)
+		)
+		# the first message tells the model the ticket has its guidance, as ticket data (ADR-036 QĐ 7, U4b-10)
+		payload = json.JSONDecoder().raw_decode(self.gateway.calls[0]["messages"][0]["content"])[0]
+		self.assertIs(payload["ticket"]["guidance_posted"], True)

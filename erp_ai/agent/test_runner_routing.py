@@ -27,6 +27,7 @@ from erp_ai.agent.test_agent_runner import (
 	tool_turn,
 	tool_use,
 )
+from erp_ai.agent.tools import write_ticket
 from erp_ai.agent.tools.registry import ToolContext
 from erp_ai.agent.tools.route_ticket import (
 	ASSIGN_REQUEST,
@@ -2137,6 +2138,35 @@ class TestOneCommentPerAction(AssignTestBase):
 		self.assertEqual(text, runner.ROUTE_NO_CHANGE)
 		(applied,) = self._action("apply_route")
 		self.assertTrue(applied["ok"])
+
+	def test_route_collect_mode_posts_nothing(self):
+		# T115 (w1.md:103, :189): in a guidance run the route's sentences go to the run's collector, raw, and the step
+		# posts no comment: what was done under "Đã làm", the request to the team lead inside the plan section
+		args = self._route_args()
+		run_id = args[3].run_id
+		write_ticket.open_collector(run_id)
+		self.addCleanup(write_ticket.close_collector, run_id)
+		before = self._comment_count()
+		with patch.object(runner, "assign_owner", side_effect=ValueError("x")):
+			lines = runner._route(*args, collect_run_id=run_id)
+
+		self.assertEqual(self._comment_count(), before)
+		done = self._fields_line(self.team)
+		manual = ASSIGN_REQUEST.format(reason=REASON_ASSIGN_FAILED)
+		self.assertEqual(lines, [done, manual])
+		analysis, sections = write_ticket.collected(run_id)
+		self.assertIsNone(analysis)
+		self.assertEqual(
+			sections,
+			{
+				write_ticket.SECTION_DONE: [done],
+				write_ticket.SECTION_PENDING: [],
+				write_ticket.SECTION_DECIDE: [manual],
+			},
+		)
+		self.assertEqual(
+			[a["tool"] for a in json.loads(self._single_entry().actions)], ["apply_route", "assign_owner"]
+		)
 
 
 ROUTE_ONCE_PERSON = "erpai-test-route.once@example.com"

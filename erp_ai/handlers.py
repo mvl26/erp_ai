@@ -3,7 +3,7 @@ import json
 import frappe
 
 from erp_ai.agent import lifecycle, policy
-from erp_ai.agent.queue import enqueue_agent_run, requester_reply_key
+from erp_ai.agent.queue import enqueue_agent_run, enqueue_lifecycle_job, requester_reply_key
 from erp_ai.constants import (
 	AGENT_USER,
 	CATEGORIES,
@@ -15,6 +15,7 @@ from erp_ai.constants import (
 	TRIGGER_REQUESTER_REPLY,
 	TRIGGER_TICKET_INSERT,
 )
+from erp_ai.install import TASK_TICKET_FIELD
 
 TICKET_DOCTYPE = "HD Ticket"
 HUMAN_COMMENT_TYPE = "Comment"
@@ -22,6 +23,8 @@ COMMUNICATION_DOCTYPE = "Communication"
 MESSAGE_COMMUNICATION_TYPE = "Communication"
 RECEIVED = "Received"
 TRIGGER_HUMAN_CORRECTION = "human_correction"
+# Log label of the Task handler (not a run trigger: the lifecycle job calls no model).
+TRIGGER_TASK_STATUS = "task_status"
 CREATED_LABELS_FIELD = "ai_created_labels"
 CREATED_LABELS_FLAG = "erp_ai_created_labels"
 
@@ -233,3 +236,17 @@ def communication_on_update(doc, method=None):
 		return
 	enqueue_agent_run(ticket, TRIGGER_REQUESTER_REPLY, communication_name=doc.name)
 	_log_decision(ticket, TRIGGER_REQUESTER_REPLY, "enqueued", "conditions_met")
+
+
+def task_on_update(doc, method=None):
+	"""AC-43 (A-11): a status change of a Task linked to a ticket queues that ticket's lifecycle job."""
+	# Fires for every Task save; return before any DB read.
+	ticket = doc.get(TASK_TICKET_FIELD)
+	if not ticket or not doc.has_value_changed("status"):
+		return
+
+	if not policy.is_enabled():
+		_log_decision(ticket, TRIGGER_TASK_STATUS, "skipped", "agent_disabled")
+		return
+	enqueue_lifecycle_job(ticket)
+	_log_decision(ticket, TRIGGER_TASK_STATUS, "enqueued", "conditions_met")

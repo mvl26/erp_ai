@@ -129,7 +129,8 @@ REASON_TASK_DUPLICATE = "phiếu đã có Task cùng tiêu đề: {task}"
 TASK_DONE = "Đã tạo Task {task} ({hours} giờ)."
 # Per-job state, like the asked runs: run_id -> the number of Tasks the run created.
 _RUN_TASKS_FLAG = "erp_ai_run_tasks"
-# The plan section ends at the next line opening a `**…:**` heading or the confidence line (Điểm 1.2 bước 2).
+# The plan section ends at the next line opening a `**…:**` heading or the confidence line (Điểm 1.2 bước 2); so does
+# each part of a BA note, the confidence line being no part's content.
 _PLAN_END = re.compile(r"^[ \t]*(?:\*\*[^*\n]+:\*\*|Độ tin cậy:)", re.M)
 
 
@@ -319,14 +320,15 @@ def opens_system_section(text: str) -> bool:
 	)
 
 
-def section_text(content: str, header: str) -> str | None:
+def section_text(content: str, header: str, end: re.Pattern = _NEXT_HEADING) -> str | None:
 	"""The text of the `**<header>:**` section (the `**` may be left out), stripped: the rest of its heading line and
-	the lines after it up to the next line opening with `**…:**`. No line opens with that heading → None."""
+	the lines after it up to the next line `end` finds, by default one opening with `**…:**`. No line opens with that
+	heading → None."""
 	heading = _heading_line(header).search(content)
 	if heading is None:
 		return None
-	end = _NEXT_HEADING.search(content, heading.end())
-	return content[heading.end() : end.start() if end else len(content)].strip()
+	stop = end.search(content, heading.end())
+	return content[heading.end() : stop.start() if stop else len(content)].strip()
 
 
 def asked_in_run(run_id: str) -> bool:
@@ -537,12 +539,12 @@ def failure_summary(run_id: str) -> str:
 
 def _feature_part(content: str) -> str:
 	"""The 'Tính năng sẵn có' part with its own `**Nguồn:**` line: from its heading to the next `**…:**` heading that
-	is not 'Nguồn'; no such heading → ""."""
+	is not 'Nguồn', or the confidence line; no such heading → ""."""
 	heading = _heading_line(BA_NOTE_FEATURE).search(content)
 	if heading is None:
 		return ""
 	source_heading = _heading_line(BA_NOTE_SOURCE)
-	for following in _NEXT_HEADING.finditer(content, heading.end()):
+	for following in _PLAN_END.finditer(content, heading.end()):
 		if not source_heading.match(content, following.start()):
 			return content[heading.end() : following.start()]
 	return content[heading.end() :]
@@ -557,12 +559,12 @@ def _ba_note_refusal(content: str, ctx: ToolContext) -> dict | None:
 		return _fail(REASON_BA_NOTE_NOT_C)
 	if refusal := _confidence_refusal(content):
 		return refusal
-	missing = [section for section in BA_NOTE_SECTIONS if not section_text(content, section)]
+	missing = [section for section in BA_NOTE_SECTIONS if not section_text(content, section, _PLAN_END)]
 	if missing:
 		return _fail(REASON_BA_NOTE_MISSING.format(sections=", ".join(missing)))
 	feature = _feature_part(content)
 	has_source = section_text(feature, BA_NOTE_SOURCE) or _INLINE_SOURCE.search(feature)
-	if not _FEATURE_ANSWER.match(section_text(content, BA_NOTE_FEATURE)) or not has_source:
+	if not _FEATURE_ANSWER.match(section_text(content, BA_NOTE_FEATURE, _PLAN_END)) or not has_source:
 		return _fail(REASON_BA_NOTE_FEATURE)
 	return None
 

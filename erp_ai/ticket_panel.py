@@ -3,7 +3,8 @@ the bot's status on the ticket, and the Duyệt / Từ chối buttons of the tic
 
 The ticket's fields are read under the caller's own permissions; the conversation and the bot's status are read
 by ticket once the caller has passed the panel gate (ADR-010 Amendments 2 and 4). A decision passes the gate on
-the proposal's own ticket, then the panel predicate, then the form's own method (ADR-044 QĐ 5).
+the proposal's own ticket, then the panel predicate, then its controller method in `PANEL_DECISIONS`
+(ADR-044 QĐ 5).
 """
 
 import frappe
@@ -37,7 +38,7 @@ AI_FIELDS = (
 )
 
 
-# ADR-044 QĐ 1 (CHG-008 design 3.2): what the panel's Duyệt / Từ chối buttons may do, each the form's own method.
+# ADR-044 QĐ 1 (CHG-008 design 3.2): what the panel's Duyệt / Từ chối buttons may do, each a controller method.
 # FEAT-007 W2 adds its action here, not a method.
 PANEL_DECISIONS = {
 	# CHG-010: the panel approves through `panel_approve`, the only path that may approve a console script.
@@ -157,7 +158,8 @@ def decide_proposal(name=None, action=None) -> dict:
 	Input: `name` of the proposal; `action`, a key of `PANEL_DECISIONS`. No ticket: the gate reads the proposal's
 	own ticket from its record. Neither has a type annotation on purpose: Frappe would refuse a wrong type with its
 	own error before the checks below, which answer it as design 3.2 says.
-	Output: {"name", "status"}, the result of the form's own `approve` / `reject`.
+	Output: {"name", "status"}, the result of the controller's `panel_approve` / `reject` (CHG-010:
+	`panel_approve` is the approval itself; the form's `approve` refuses a console proposal, else calls it).
 	Errors, checked in this order, each writing nothing: ValidationError (`action` not a key of
 	`PANEL_DECISIONS`); DoesNotExistError (no such proposal); PermissionError (the panel gate on the proposal's
 	ticket, which also refuses the agent account; then the panel predicate: role, not pending, one-click switch

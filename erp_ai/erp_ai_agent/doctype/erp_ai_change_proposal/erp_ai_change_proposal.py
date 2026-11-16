@@ -206,8 +206,10 @@ def proposal_head(name) -> frappe._dict:
 	)
 
 
-# CHG-008 design 2, 3.1: what a panel card reads and shows. No content field is ever read (diff, file text,
-# command args and output, commit message, reason, digest, created dirs), so a card cannot show one.
+# CHG-008 design 2, 3.1: what a panel card reads and shows. None of these is a content field (diff, file
+# text, command args and output, commit message, reason, digest, created dirs). CHG-010: a console card is the
+# one exception; its script and masked output tail are read apart (`CONSOLE_CARD_FIELDS`), and only for a
+# viewer who can open the proposal.
 CARD_FIELDS = (
 	"name",
 	"change_kind",

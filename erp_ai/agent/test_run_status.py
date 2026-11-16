@@ -181,3 +181,26 @@ class TestRunStatus(FrappeTestCase):
 		self.assertEqual(status.take_errors(), ["status_thinking: RuntimeError"])
 		self.assertEqual([s["message"]["state"] for s in self.signals], ["done"])
 		self.assertTrue(status.finished)
+
+	def test_stop_emits_one_done_only_before_start(self):
+		# ADR-008 Amendment 1 (CHG-009): an early stop sends exactly one empty `done` for its run_id; a run that started
+		# ends with done(), so stop() after start() sends nothing; no text, no signal
+		stopped = RunStatus("HD-TICKET-1", "run-stopped", "Đang suy nghĩ…")
+
+		stopped.stop()
+		stopped.stop()
+		stopped.done()
+
+		self.assertEqual(
+			[(s["message"]["state"], s["message"]["text"], s["message"]["run_id"]) for s in self.signals],
+			[("done", "", "run-stopped")],
+		)
+		self.assertTrue(stopped.finished)
+		started = self._status()
+		started.stop()
+		self.assertEqual(self.signals, [])
+		started.done()
+		self.assertEqual([s["message"]["state"] for s in self.signals], ["done"])
+		self.signals.clear()
+		RunStatus("HD-TICKET-1", "run-silent", "   ").stop()
+		self.assertEqual(self.signals, [])

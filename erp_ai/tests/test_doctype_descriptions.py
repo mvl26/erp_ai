@@ -413,6 +413,11 @@ DOCTYPE_CONFIG = {
 				"phân loại",
 				"lập luận",
 				"bước của đề xuất",
+				# CHG-009 design 2 (ADR-048 QĐ 1): the run_event row.
+				"run_event",
+				"lời gọi bot được nhận, gộp, từ chối",
+				"lần chạy xong/lỗi",
+				"ngăn trao đổi",
 			),
 			"turn": ("Lượt 0", "lượt 1", "lập luận"),
 			"trigger": (
@@ -460,6 +465,17 @@ DOCTYPE_CONFIG = {
 				"not_sendable",
 				"daily_limit",
 				"level_L0",
+				# CHG-009 design 2 (ADR-003 Amd 1, ADR-048 QĐ 4): the skip codes with the refusal kind, and the
+				# run_event codes.
+				"not_sendable:<loại>",
+				"agent_disabled",
+				"call_received",
+				"call_merged",
+				"call_busy",
+				"run_done",
+				"run_failed",
+				"created_by_agent",
+				"prefilled",
 			),
 			"tools_called": ("tool", "trong lượt này"),
 			"actions": ("hành động", "phiếu"),

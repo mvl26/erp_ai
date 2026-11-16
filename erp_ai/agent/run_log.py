@@ -1,3 +1,4 @@
+import contextlib
 import json
 import uuid
 
@@ -6,11 +7,26 @@ import frappe
 from erp_ai.agent import policy, redact
 from erp_ai.agent.agent_write_guard import allow_agent_write
 from erp_ai.agent.tools.site_api import SECRET_FIELDS
-from erp_ai.constants import CHANGE_STEPS, LOG_DOCTYPE, TRIGGER_CHANGE_ACTION
+from erp_ai.constants import (
+	CHANGE_STEPS,
+	EVENT_CALL_BUSY,
+	EVENT_CALL_MERGED,
+	EVENT_CALL_RECEIVED,
+	EVENT_RUN_DONE,
+	EVENT_RUN_FAILED,
+	LOG_DOCTYPE,
+	LOG_ENTRY_RUN_EVENT,
+	SKIP_AGENT_DISABLED,
+	SKIP_CREATED_BY_AGENT,
+	SKIP_NOT_SENDABLE,
+	SKIP_PREFILLED,
+	TITLE_EVENT_FAILED,
+	TRIGGER_CHANGE_ACTION,
+)
 
 ENTRY_TYPE_CHANGE = "change"
 ENTRY_TYPE_BOT_ACTION = "bot_action"
-ENTRY_TYPES = ("classify", "reason", "skip", "change", "bot_action")
+ENTRY_TYPES = ("classify", "reason", "skip", "change", "bot_action", "run_event")
 TRIGGERS = ("ticket_insert", "comment_mention", "requester_reply", "kb_draft")
 CHANGE_TRIGGERS = (TRIGGER_CHANGE_ACTION,)
 TRIGGER_SETTING_SAVE = "setting_save"
@@ -22,6 +38,30 @@ ACTION_KEYS = ("tool", "doctype", "name", "ok", "value_before", "value_after", "
 SECRET_MASK = "[đã ẩn]"
 NO_REASON = "tool không nêu lý do"
 ACTION_DOCTYPE_MAX = 80
+# CHG-009 (ADR-048 QĐ 1, 4; design 3.4): the codes a run_event row carries: the call and run events, then why a
+# call was refused, as decided (`policy.send_refusal` for the four send kinds; a missing ticket writes no row).
+EVENT_CODES = (
+	EVENT_CALL_RECEIVED,
+	EVENT_CALL_MERGED,
+	EVENT_CALL_BUSY,
+	EVENT_RUN_DONE,
+	EVENT_RUN_FAILED,
+	SKIP_AGENT_DISABLED,
+	SKIP_CREATED_BY_AGENT,
+	SKIP_PREFILLED,
+	*(
+		f"{SKIP_NOT_SENDABLE}:{refusal}"
+		for refusal in (
+			policy.REFUSAL_OPTED_OUT,
+			policy.REFUSAL_EXCLUDED_TEAM,
+			policy.REFUSAL_EXCLUDED_TITLE,
+			policy.REFUSAL_EXCLUDED_BY_CLASSIFICATION,
+		)
+	),
+)
+# Only these carry a run_id: the run the received call queued, or the run that ended.
+RUN_EVENT_CODES = (EVENT_CALL_RECEIVED, EVENT_RUN_DONE, EVENT_RUN_FAILED)
+EVENT_SAVEPOINT = "erp_ai_run_event"
 
 
 def _is_name(value) -> bool:
@@ -117,6 +157,21 @@ def _check_bot_action_fields(fields) -> None:
 		)
 
 
+def _check_run_event_fields(fields) -> None:
+	code, run_id = fields.get("stop_reason"), fields.get("run_id")
+	if code not in EVENT_CODES:
+		raise ValueError(f"stop_reason must be one of {EVENT_CODES} for a run_event row, got {code!r}")
+	if code in RUN_EVENT_CODES and not _is_name(run_id):
+		raise ValueError(f"run_id must be a non-empty name for a {code} row, got {run_id!r}")
+	if code not in RUN_EVENT_CODES and run_id not in (None, ""):
+		raise ValueError(f"run_id must be empty for a {code} row, got {run_id!r}")
+	for fieldname in ("actions", "error"):
+		if fields.get(fieldname) not in (None, ""):
+			raise ValueError(f"{fieldname} must be empty for a run_event row, got {fields.get(fieldname)!r}")
+	if fields.get("cost_usd") not in (None, 0):
+		raise ValueError(f"cost_usd must be missing or 0 for a run_event row, got {fields.get('cost_usd')!r}")
+
+
 def _check_actions(fields) -> None:
 	"""Every element of `actions` (when given as a list) is a dict holding every key of `ACTION_KEYS`."""
 	actions = fields.get("actions")
@@ -141,13 +196,18 @@ def write_entry(**fields) -> str:
 	user's permissions. `change` rows (one per proposal step) take `trigger="change_action"` plus
 	`change_step` in `CHANGE_STEPS`, `actor` and `change_proposal`, and are inserted with
 	`ignore_permissions=True` so an approver who may not create ERP AI Log still leaves the audit row.
+	`run_event` rows (ADR-048, written through `record_event`) take a `TRIGGERS` trigger, a `stop_reason` in
+	`EVENT_CODES`, a `run_id` exactly when the code is in `RUN_EVENT_CODES` (else none is stored), no
+	`actions` or `error` and cost 0; they are inserted with `ignore_permissions=True` and never committed here:
+	they ride the caller's transaction. Every other row is committed right after its insert (ADR-024).
 	Unknown fields are dropped by Frappe; a `doctype` argument is ignored. The insert alone runs inside
 	`allow_agent_write()`: the one path by which the agent account may write ERP AI Log (ADR-023 QĐ 5).
 
 	Raises:
 		ValueError: `entry_type` or `trigger` is missing or not allowed for the entry type, an `actions`
-			element is not a dict with every key of `ACTION_KEYS`, or a `change`
-			row has a missing/unknown `change_step` or a missing/blank `actor` or `change_proposal`.
+			element is not a dict with every key of `ACTION_KEYS`, a `change`
+			row has a missing/unknown `change_step` or a missing/blank `actor` or `change_proposal`, or a
+			`run_event` row breaks one of its rules above.
 		frappe.PermissionError: a non-`change` row and the session user may not create ERP AI Log.
 	"""
 	entry_type = fields.get("entry_type")
@@ -155,6 +215,7 @@ def write_entry(**fields) -> str:
 		raise ValueError(f"entry_type must be one of {ENTRY_TYPES}, got {entry_type!r}")
 	is_change = entry_type == ENTRY_TYPE_CHANGE
 	is_bot_action = entry_type == ENTRY_TYPE_BOT_ACTION
+	is_run_event = entry_type == LOG_ENTRY_RUN_EVENT
 	triggers = CHANGE_TRIGGERS if is_change else BOT_ACTION_TRIGGERS if is_bot_action else TRIGGERS
 	if fields.get("trigger") not in triggers:
 		raise ValueError(f"trigger must be one of {triggers}, got {fields.get('trigger')!r}")
@@ -163,6 +224,11 @@ def write_entry(**fields) -> str:
 	if is_bot_action:
 		_check_bot_action_fields(fields)
 		fields = {**fields, "cost_usd": 0}
+	if is_run_event:
+		_check_run_event_fields(fields)
+		# change_step "" (not None) so Frappe leaves it empty instead of its first option "propose", which the
+		# 08:00 report counts as a proposal (design 2 "còn lại trống", ADR-048 QĐ 5)
+		fields = {**fields, "cost_usd": 0, "run_id": fields.get("run_id") or None, "change_step": ""}
 	_check_actions(fields)
 	if not fields.get("site_environment"):
 		fields = {**fields, "site_environment": policy.site_environment()}
@@ -172,8 +238,8 @@ def write_entry(**fields) -> str:
 	}
 	doc = frappe.get_doc({**values, "doctype": LOG_DOCTYPE})
 	with allow_agent_write():
-		doc.insert(ignore_permissions=is_change or is_bot_action)
-	if not frappe.flags.in_test:
+		doc.insert(ignore_permissions=is_change or is_bot_action or is_run_event)
+	if not frappe.flags.in_test and not is_run_event:
 		frappe.db.commit()
 	return doc.name
 
@@ -208,3 +274,41 @@ def write_bot_action(
 	if site_environment is not None:
 		fields["site_environment"] = site_environment
 	return write_entry(**fields)
+
+
+def record_event(*, ticket, trigger, code, run_id=None) -> str | None:
+	"""Write one `run_event` row for `ticket` and return its name (ADR-048 QĐ 1, 3; design 3.4).
+
+	The row holds only codes: `trigger`, `code` (in `EVENT_CODES`) and `run_id` (only for `RUN_EVENT_CODES`).
+	It is written inside savepoint `EVENT_SAVEPOINT` of the caller's transaction and never committed here: the
+	caller's own commit keeps it. A ticket that does not exist gives None and no row. Any error undoes the
+	write back to the savepoint, leaves one Error Log `TITLE_EVENT_FAILED` holding the codes and the error class
+	only, and gives None; a failing rollback or Error Log is dropped. Never raises: the caller's work goes on.
+	"""
+	saved = False
+	try:
+		if not ticket or not frappe.db.exists(policy.TICKET_DOCTYPE, ticket):
+			return None
+		frappe.db.savepoint(EVENT_SAVEPOINT)
+		saved = True
+		name = write_entry(
+			entry_type=LOG_ENTRY_RUN_EVENT, ticket=ticket, trigger=trigger, stop_reason=code, run_id=run_id
+		)
+		frappe.db.release_savepoint(EVENT_SAVEPOINT)
+		return name
+	except Exception as exc:
+		_drop_event(saved, f"ticket={ticket} trigger={trigger} code={code} error={type(exc).__name__}")
+		return None
+
+
+def _drop_event(saved: bool, message: str) -> None:
+	"""Undo a failed event write back to its savepoint, then leave one Error Log with `message`.
+
+	A failure of either is dropped on purpose: the event row is a note for the panel, and the caller's own
+	work (a ticket, a comment, a message, a run) must still be saved (ADR-048 QĐ 3).
+	"""
+	if saved:
+		with contextlib.suppress(Exception):
+			frappe.db.rollback(save_point=EVENT_SAVEPOINT)
+	with contextlib.suppress(Exception):
+		frappe.log_error(TITLE_EVENT_FAILED, message)

@@ -148,6 +148,19 @@ LAYER_RULES = (
 		"STD-DESIGN-6: policy là tầng dưới của tools, không import ngược",
 	),
 	(
+		"erp_ai.agent.bot_status",
+		(
+			"erp_ai.gateway",
+			"erp_ai.agent.runner",
+			"erp_ai.agent.queue",
+			"erp_ai.agent.run_status",
+			"erp_ai.agent.tools",
+			"erp_ai.agent.policy",
+			"erp_ai.agent.run_log",
+		),
+		"ADR-048 QĐ 6: the panel's status reader never calls the model, runs, queues or signals the agent, calls a tool, judges a gate or writes a log row",
+	),
+	(
 		CHANGE_TEXT_MODULE,
 		CHANGE_TEXT_FORBIDDEN,
 		"design 8.2/ADR-022: change_text imports only the standard library and erp_ai.constants",
@@ -355,10 +368,10 @@ STATUS_SCRIPT_REQUIRED = (
 	r"catch \(e\) \{\s*onSendFailed\(\);",
 	r"isComposing\) \{\s*event\.preventDefault\(\);\s*submit\(\);",
 	r'addEventListener\("click", \(\) => \{\s*try \{\s*submit\(\);',
-	r"formEl,\s*slotEl",
 	# CHG-008 T4 (design 4.3): the proposals section, between the thread and the error line, and the fixed texts.
+	# CHG-009 design 4.1, 8.2 (A-7): the send box closes the panel; the indicator's slot moved into the status line.
 	r"renderProposals",
-	r"threadEl,\s*proposalsTitle,\s*proposalsEl,\s*proposalErrorEl,\s*errorEl,\s*formEl,\s*slotEl",
+	r"threadEl,\s*proposalsTitle,\s*proposalsEl,\s*proposalErrorEl,\s*errorEl,\s*formEl\s*\)",
 	r'TEXT_PROPOSALS_SECTION = "Đề xuất thay đổi"',
 	r'TEXT_OPEN_PROPOSAL = "Xem nội dung thay đổi"',
 	r'OPEN_PROPOSAL_LABEL = "Mở đề xuất để Duyệt hoặc Từ chối"',
@@ -410,6 +423,43 @@ STATUS_SCRIPT_REQUIRED = (
 	r"const onResize = \(\) => \{\s*try \{\s*if \(window\.innerWidth < NARROW_SCREEN_PX\) \{\s*closePanel\(\);",
 	r'if \(!state\.resizeBound\) \{\s*state\.resizeBound = true;\s*window\.addEventListener\("resize", onResize\);',
 	r"if \(window\.innerWidth < NARROW_SCREEN_PX\) \{\s*return \{ actions: \[\] \};",
+	# CHG-009 T5 (design 4.1, 8.2; AC-1, AC-3, A-4, A-7): one status line under the section title, above the guidance,
+	# the thread and the cards, holding the docked indicator; a live indicator wins, an open call past its deadline
+	# reads its failed time by a timer that only changes the text; the status is set before the thread that carries
+	# its system lines.
+	r'TEXT_STATUS_RUNNING = "Đang xử lý…"',
+	r"statusEl\.append\(statusTextEl, slotEl\)",
+	r"chatTitle,\s*statusEl,\s*guidanceEl,\s*threadEl",
+	r"state\.runs\.size > 0 \? TEXT_STATUS_RUNNING",
+	r"panel\.statusExpired && status\.expired_text",
+	r"renderBotStatus\(data\);\s*renderMessages\(data\)",
+	r"statusExpired = true;\s*showBotStatus\(\)",
+)
+# CHG-009 design 8.2: each pin above with the wiring it guards broken, as (pattern, regex to break, replacement).
+STATUS_LINE_VIOLATIONS = (
+	(r'TEXT_STATUS_RUNNING = "Đang xử lý…"', r'"Đang xử lý…"', '"Đang chạy…"'),
+	(
+		r"statusEl\.append\(statusTextEl, slotEl\)",
+		r"statusEl\.append\(statusTextEl, slotEl\)",
+		"statusEl.append(statusTextEl)",
+	),
+	(
+		r"chatTitle,\s*statusEl,\s*guidanceEl,\s*threadEl",
+		r"chatTitle,(\s*)statusEl,(\s*)guidanceEl,(\s*)threadEl",
+		r"chatTitle,\1guidanceEl,\2threadEl,\3statusEl",
+	),
+	(r"state\.runs\.size > 0 \? TEXT_STATUS_RUNNING", r"state\.runs\.size > 0 \?", "false ?"),
+	(r"panel\.statusExpired && status\.expired_text", r"panel\.statusExpired && ", ""),
+	(
+		r"renderBotStatus\(data\);\s*renderMessages\(data\)",
+		r"renderBotStatus\(data\);(\s*)renderMessages\(data\);",
+		r"renderMessages(data);\1renderBotStatus(data);",
+	),
+	(
+		r"statusExpired = true;\s*showBotStatus\(\)",
+		r"(statusExpired = true;\s*)showBotStatus\(\)",
+		r"\1reload()",
+	),
 )
 
 # ADR-009: every `call(` in the page script passes a string literal naming one of PANEL_METHODS.
@@ -1874,7 +1924,8 @@ TODO_DOCTYPE = "ToDo"
 DOC_CREATE_CALLS = ("get_doc", "new_doc")
 SHARE_BYPASS_NAMES = ("ignore_share_permission", "add_docshare")
 SHARE_BYPASS_SUFFIXES = ("assign_to._add", "frappe.share.add")
-ENTRY_TYPES_EXPECTED = ("classify", "reason", "skip", "change", "bot_action")
+# CHG-009 (ADR-048 QĐ 1): run_event added last.
+ENTRY_TYPES_EXPECTED = ("classify", "reason", "skip", "change", "bot_action", "run_event")
 
 # `_assign` is the denormalised JSON column of HD Ticket. Routing must read ToDo through site_facts instead.
 # authority.py (FEAT-002, "who may instruct the bot") predates routing and is the one reader allowed.
@@ -2114,7 +2165,7 @@ def check_no_default_people_in_agent_python(sources: dict) -> list:
 
 
 def check_entry_types_unchanged(sources: dict) -> list:
-	"""ADR-019 QĐ 7 + ADR-012 QĐ 6 + FEAT-007 U3: the log keeps its five entry types, in the code and in the DocType options."""
+	"""ADR-019 QĐ 7 + ADR-012 QĐ 6 + FEAT-007 U3 + ADR-048 QĐ 1: the log keeps its six entry types, in the code and in the DocType options."""
 	run_log, doctype = sources.get(RUN_LOG_FILE), sources.get(LOG_DOCTYPE_FILE)
 	if run_log is None:
 		return _missing(RUN_LOG_FILE)
@@ -5614,6 +5665,17 @@ class TestArchitecture(unittest.TestCase):
 		for pattern in STATUS_SCRIPT_REQUIRED:
 			self.assertIsNotNone(re.search(pattern, script), f"missing in script: {pattern}")
 
+	def test_status_line_pins_catch_their_violation(self):
+		# CHG-009 design 8.2 (AC-1, AC-3): each status-line pin fails on the script with the wiring it guards broken
+		script = self.status_script()
+		for pattern, broken, replacement in STATUS_LINE_VIOLATIONS:
+			with self.subTest(pattern=pattern):
+				self.assertIn(pattern, STATUS_SCRIPT_REQUIRED)
+				violating = re.sub(broken, replacement, script, count=1)
+				self.assertNotEqual(violating, script)
+				self.assertIsNotNone(re.search(pattern, script))
+				self.assertIsNone(re.search(pattern, violating))
+
 	def test_status_script_calls_use_literal_panel_methods(self):
 		script = load_product_sources(suffixes=(".js",)).get(STATUS_SCRIPT_FILE)
 		self.assertIsNotNone(script, f"{STATUS_SCRIPT_FILE} is missing")
@@ -8546,32 +8608,45 @@ class TestScannersCatchViolations(unittest.TestCase):
 		)
 
 	def test_entry_types_scanner_catches_new_type_in_code_or_doctype(self):
-		run_log = 'ENTRY_TYPES = ("classify", "reason", "skip", "change", "bot_action")\n'
+		# CHG-009 (ADR-048 QĐ 1): the compliant sample carries run_event; the five types before it are now caught.
+		run_log = 'ENTRY_TYPES = ("classify", "reason", "skip", "change", "bot_action", "run_event")\n'
 		doctype = json.dumps(
-			{"fields": [{"fieldname": "entry_type", "options": "classify\nreason\nskip\nchange\nbot_action"}]}
+			{
+				"fields": [
+					{
+						"fieldname": "entry_type",
+						"options": "classify\nreason\nskip\nchange\nbot_action\nrun_event",
+					}
+				]
+			}
 		)
 		good = {RUN_LOG_FILE: run_log, LOG_DOCTYPE_FILE: doctype}
 		self.assertEqual(check_entry_types_unchanged(good), [])
 		extra = {
 			**good,
-			RUN_LOG_FILE: 'ENTRY_TYPES = ("classify", "reason", "skip", "change", "bot_action", "route")\n',
+			RUN_LOG_FILE: 'ENTRY_TYPES = ("classify", "reason", "skip", "change", "bot_action", "run_event", "route")\n',
 		}
 		self.assertCaught(check_entry_types_unchanged(extra), "ENTRY_TYPES")
 		without_change = {**good, RUN_LOG_FILE: 'ENTRY_TYPES = ("classify", "reason", "skip", "change")\n'}
 		self.assertCaught(check_entry_types_unchanged(without_change), "ENTRY_TYPES")
+		without_run_event = {
+			**good,
+			RUN_LOG_FILE: 'ENTRY_TYPES = ("classify", "reason", "skip", "change", "bot_action")\n',
+		}
+		self.assertCaught(check_entry_types_unchanged(without_run_event), "ENTRY_TYPES")
 		options = json.dumps(
 			{
 				"fields": [
 					{
 						"fieldname": "entry_type",
-						"options": "classify\nreason\nskip\nchange\nbot_action\nroute",
+						"options": "classify\nreason\nskip\nchange\nbot_action\nrun_event\nroute",
 					}
 				]
 			}
 		)
 		self.assertCaught(check_entry_types_unchanged({**good, LOG_DOCTYPE_FILE: options}), "options")
 		old_options = json.dumps(
-			{"fields": [{"fieldname": "entry_type", "options": "classify\nreason\nskip\nchange"}]}
+			{"fields": [{"fieldname": "entry_type", "options": "classify\nreason\nskip\nchange\nbot_action"}]}
 		)
 		self.assertCaught(check_entry_types_unchanged({**good, LOG_DOCTYPE_FILE: old_options}), "options")
 		computed = {**good, RUN_LOG_FILE: "ENTRY_TYPES = tuple(x)\n"}
@@ -12422,6 +12497,407 @@ class TestLessonArchitecture(unittest.TestCase):
 					{CONSTANTS_FILE: clean[CONSTANTS_FILE]},
 					f"{LESSON_READ_FILE}: file missing",
 				),
+			},
+		)
+
+
+# ---------------------------------------------------------------------------------------------------
+# ADR-048 Ràng buộc (CHG-009 design 8.2): the RQ job-state reads live only in agent/queue.py; handlers.py and
+# agent/queue.py never commit (an event row rides the person's transaction); comment_after_insert still starts
+# with step 0
+# ---------------------------------------------------------------------------------------------------
+
+RQ_JOB_READS = ("get_job", "get_job_status", "is_job_enqueued")
+RQ_JOB_CLASS = "Job"
+RQ_JOB_FETCH = "fetch"
+RQ_JOB_READ_FILE = QUEUE_FILE
+EVENT_NO_COMMIT_FILES = (HANDLERS_FILE, QUEUE_FILE)
+COMMENT_HOOK = "comment_after_insert"
+# Step 0 tests the comment's own fields, never the database: the hook fires for every Comment of the site.
+COMMENT_STEP_ZERO_FIELD = "reference_doctype"
+
+
+def _rq_job_read(node, aliases: dict) -> str | None:
+	"""The RQ job-state read `node` names (a name, an attribute, an imported name or `Job.fetch`), else None."""
+	if isinstance(node, ast.alias):
+		name = node.name.rpartition(".")[2]
+	elif isinstance(node, ast.Attribute) and node.attr == RQ_JOB_FETCH:
+		job = resolved_name(node.value, aliases).rpartition(".")[2]
+		return f"{RQ_JOB_CLASS}.{RQ_JOB_FETCH}" if job == RQ_JOB_CLASS else None
+	else:
+		name = referenced_name(node)
+	return name if name in RQ_JOB_READS else None
+
+
+def check_rq_job_reads_only_in_queue(sources: dict) -> list:
+	"""ADR-048 Ràng buộc: `get_job`, `get_job_status`, `is_job_enqueued` and `Job.fetch` only in agent/queue.py."""
+	violations = []
+	for rel, source in only_python(sources).items():
+		if rel == RQ_JOB_READ_FILE:
+			continue
+		tree = parse(rel, source)
+		aliases = import_aliases(tree)
+		for node in ast.walk(tree):
+			read = _rq_job_read(node, aliases)
+			if read:
+				violations.append(
+					violation(
+						rel, node, f"reads the RQ job state ({read}) outside {RQ_JOB_READ_FILE} (ADR-048)"
+					)
+				)
+	return violations
+
+
+def check_no_commit_in_event_request_files(sources: dict) -> list:
+	"""ADR-048 Ràng buộc: handlers.py and agent/queue.py never call `frappe.db.commit()`."""
+	violations = []
+	for rel in EVENT_NO_COMMIT_FILES:
+		if rel not in sources:
+			violations.extend(_missing(rel))
+			continue
+		tree = parse(rel, sources[rel])
+		aliases = import_aliases(tree)
+		violations.extend(
+			violation(rel, node, f"calls {COMMIT_CALL}() (ADR-048)")
+			for node in ast.walk(tree)
+			if isinstance(node, ast.Call) and resolved_name(node.func, aliases) == COMMIT_CALL
+		)
+	return violations
+
+
+def check_comment_hook_starts_with_step_zero(sources: dict) -> list:
+	"""ADR-048 Ràng buộc: the first statement of `comment_after_insert` (after a docstring) is still step 0: an
+	`if` on the comment's own `reference_doctype`, with no call in its test and no `else`, that only returns."""
+	if HANDLERS_FILE not in sources:
+		return _missing(HANDLERS_FILE)
+	function = _module_functions(parse(HANDLERS_FILE, sources[HANDLERS_FILE])).get(COMMENT_HOOK)
+	if function is None:
+		return [f"{HANDLERS_FILE}: no function {COMMENT_HOOK} (ADR-048)"]
+	body = function.body[1:] if ast.get_docstring(function) is not None else function.body
+	first = body[0] if body else function
+	is_step_zero = (
+		isinstance(first, ast.If)
+		and COMMENT_STEP_ZERO_FIELD in {referenced_name(node) for node in ast.walk(first.test)}
+		and not any(isinstance(node, ast.Call) for node in ast.walk(first.test))
+		and not first.orelse
+		and len(first.body) == 1
+		and isinstance(first.body[0], ast.Return)
+		and first.body[0].value is None
+	)
+	if is_step_zero:
+		return []
+	return [violation(HANDLERS_FILE, first, f"the first statement of {COMMENT_HOOK} is not step 0 (ADR-048)")]
+
+
+# Clean samples of the three rules: queue.py reads the RQ job state, the comment hook writes its event row after
+# step 0 and nothing commits.
+EVENT_WRITE_SAMPLE = {
+	QUEUE_FILE: (
+		"from frappe.utils.background_jobs import get_job, get_job_status, is_job_enqueued\n"
+		"from rq.job import Job\n\n\n"
+		"def enqueue_agent_run(job_id):\n"
+		"\tjob = get_job(job_id) or Job.fetch(job_id)\n"
+		"\treturn is_job_enqueued(job_id) or get_job_status(job_id) or job\n"
+	),
+	HANDLERS_FILE: (
+		"import frappe\n\n"
+		"from erp_ai.agent import run_log\n\n\n"
+		"def comment_after_insert(doc, method=None):\n"
+		'\t"""Step 0 first: every Comment of the site reaches this hook."""\n'
+		'\tif doc.reference_doctype != "HD Ticket" or doc.comment_type != "Comment":\n'
+		"\t\treturn\n"
+		'\trun_log.record_event(ticket=doc.reference_name, trigger="comment_mention", code="agent_disabled")\n'
+	),
+	"agent/runner.py": "from rq.job import Job\n\n\ndef job_class():\n\treturn Job\n",
+}
+
+
+class TestEventWriteRules(unittest.TestCase):
+	"""CHG-009 T1: the ADR-048 rules on writing event rows, on the product, then each one's clean and violating samples."""
+
+	assertRuleSamples = TestArchitecture.assertRuleSamples
+
+	@classmethod
+	def setUpClass(cls):
+		cls.sources = load_product_sources()
+
+	def test_event_write_rules_follow_adr_048(self):
+		for rel in (QUEUE_FILE, HANDLERS_FILE):
+			self.assertIn(rel, self.sources)
+		self.assertEqual(check_rq_job_reads_only_in_queue(self.sources), [])
+		self.assertEqual(check_no_commit_in_event_request_files(self.sources), [])
+		self.assertEqual(check_comment_hook_starts_with_step_zero(self.sources), [])
+
+		changed = TestScannersCatchViolations.changed
+		clean = EVENT_WRITE_SAMPLE
+		event_call = '\trun_log.record_event(ticket=doc.reference_name, trigger="comment_mention", code="agent_disabled")\n'
+		self.assertRuleSamples(
+			check_rq_job_reads_only_in_queue,
+			clean,
+			{
+				"get_job in a handler": (
+					changed(
+						clean,
+						HANDLERS_FILE,
+						"\n\ndef busy(job_id):\n\treturn frappe.utils.background_jobs.get_job(job_id)\n",
+					),
+					f"{HANDLERS_FILE}:14: reads the RQ job state (get_job)",
+				),
+				"is_job_enqueued imported under another name": (
+					changed(
+						clean,
+						"agent/runner.py",
+						"from frappe.utils.background_jobs import is_job_enqueued as queued\n",
+					),
+					"agent/runner.py:6: reads the RQ job state (is_job_enqueued)",
+				),
+				"get_job_status through its module": (
+					changed(
+						clean,
+						"ticket_panel.py",
+						"from frappe.utils import background_jobs\n\n\n"
+						"def running(job_id):\n\treturn background_jobs.get_job_status(job_id)\n",
+					),
+					"ticket_panel.py:5: reads the RQ job state (get_job_status)",
+				),
+				"Job.fetch under another name": (
+					changed(
+						clean,
+						"agent/bot_status.py",
+						"from rq.job import Job as RQJob\n\n\ndef state(job_id):\n\treturn RQJob.fetch(job_id)\n",
+					),
+					"agent/bot_status.py:5: reads the RQ job state (Job.fetch)",
+				),
+			},
+		)
+		self.assertRuleSamples(
+			check_no_commit_in_event_request_files,
+			clean,
+			{
+				"commit in the comment hook": (
+					changed(clean, HANDLERS_FILE, "\tfrappe.db.commit()\n"),
+					f"{HANDLERS_FILE}:11: calls {COMMIT_CALL}()",
+				),
+				"commit through `from frappe import db` in the queue": (
+					changed(
+						clean, QUEUE_FILE, "\n\ndef flush():\n\tfrom frappe import db\n\n\tdb.commit()\n"
+					),
+					f"{QUEUE_FILE}:13: calls {COMMIT_CALL}()",
+				),
+				"handlers.py missing": ({QUEUE_FILE: clean[QUEUE_FILE]}, f"{HANDLERS_FILE}: file missing"),
+			},
+		)
+		step_zero = '\tif doc.reference_doctype != "HD Ticket" or doc.comment_type != "Comment":\n'
+		not_first = f"{HANDLERS_FILE}:8: the first statement of {COMMENT_HOOK} is not step 0"
+		self.assertRuleSamples(
+			check_comment_hook_starts_with_step_zero,
+			clean,
+			{
+				"event written before step 0": (
+					changed(clean, HANDLERS_FILE, replace=(step_zero, event_call + step_zero)),
+					not_first,
+				),
+				"step 0 reads the database": (
+					changed(
+						clean,
+						HANDLERS_FILE,
+						replace=(
+							'doc.comment_type != "Comment"',
+							'not frappe.db.exists("HD Ticket", doc.reference_name)',
+						),
+					),
+					not_first,
+				),
+				"step 0 writes before returning": (
+					changed(
+						clean, HANDLERS_FILE, replace=("\t\treturn\n", "\t" + event_call + "\t\treturn\n")
+					),
+					not_first,
+				),
+				"step 0 no longer tests the DocType": (
+					changed(clean, HANDLERS_FILE, replace=('doc.reference_doctype != "HD Ticket" or ', "")),
+					not_first,
+				),
+				"the hook renamed": (
+					changed(clean, HANDLERS_FILE, replace=("def comment_after_insert(", "def comment_hook(")),
+					f"{HANDLERS_FILE}: no function {COMMENT_HOOK}",
+				),
+			},
+		)
+
+
+# ---------------------------------------------------------------------------------------------------
+# ADR-048 Ràng buộc "module đọc ở QĐ 6" (CHG-009 design 3.2, 8.2): the panel's status reader writes nothing and
+# reads no cache or job state; outside tests only ticket_panel.py imports it; ticket_panel.py still never names
+# "ERP AI Log" (its import rule is the `erp_ai.agent.bot_status` entry of LAYER_RULES)
+# ---------------------------------------------------------------------------------------------------
+
+BOT_STATUS_FILE = "agent/bot_status.py"
+BOT_STATUS_MODULE = "erp_ai.agent.bot_status"
+BOT_STATUS_FORBIDDEN_NAMES = (
+	"insert",
+	"save",
+	"set_value",
+	"db_set",
+	"commit",
+	"write_entry",
+	"cache",
+	"publish_realtime",
+	"get_job",
+)
+PANEL_FORBIDDEN_LOG_TEXT = "ERP AI Log"
+
+
+def check_bot_status_reader_follows_adr_048(sources: dict) -> list:
+	"""ADR-048 Ràng buộc: the reader names no write, commit, cache, realtime publish or job read; no product file
+	but ticket_panel.py imports or names the reader; ticket_panel.py holds no "ERP AI Log" string."""
+	for rel in (BOT_STATUS_FILE, PANEL_FILE):
+		if rel not in sources:
+			return _missing(rel)
+	violations = [
+		violation(
+			BOT_STATUS_FILE, node, f"names {name}: the reader writes nothing, reads no cache or job (ADR-048)"
+		)
+		for node in ast.walk(parse(BOT_STATUS_FILE, sources[BOT_STATUS_FILE]))
+		for name in _node_names(node)
+		if name in BOT_STATUS_FORBIDDEN_NAMES
+	]
+	for rel, source in only_python(sources).items():
+		if rel in (BOT_STATUS_FILE, PANEL_FILE):
+			continue
+		tree = parse(rel, source)
+		for lineno, target in imported_modules(tree, module_name(rel), rel.endswith("__init__.py")):
+			if module_in(target, BOT_STATUS_MODULE):
+				violations.append(f"{rel}:{lineno}: imports {target}; only {PANEL_FILE} may (ADR-048)")
+		violations.extend(
+			violation(rel, node, f"names {BOT_STATUS_MODULE}; only {PANEL_FILE} may (ADR-048)")
+			for node in constant_strings(tree)
+			if BOT_STATUS_MODULE in node.value
+		)
+	violations.extend(
+		violation(
+			PANEL_FILE, node, f'names "{PANEL_FORBIDDEN_LOG_TEXT}": only the reader reads the log (ADR-048)'
+		)
+		for node in constant_strings(parse(PANEL_FILE, sources[PANEL_FILE]))
+		if PANEL_FORBIDDEN_LOG_TEXT in node.value
+	)
+	return violations
+
+
+# Clean sample: the reader reads the log through the allowed imports, the panel imports it, another module does not.
+BOT_STATUS_SAMPLE = {
+	BOT_STATUS_FILE: (
+		"import frappe\n"
+		"from frappe.utils import now_datetime\n\n"
+		"from erp_ai.constants import LOG_DOCTYPE\n\n\n"
+		"def panel_status(ticket, message_names, now=None):\n"
+		'\trows = frappe.get_all(LOG_DOCTYPE, filters={"ticket": ticket}, fields=["name"], limit=500)\n'
+		'\treturn {"lines": rows, "now": now or now_datetime()}\n'
+	),
+	PANEL_FILE: (
+		"from erp_ai.agent import bot_status\n\n\n"
+		"def get_panel_data(ticket):\n"
+		'\treturn {"bot_status": bot_status.panel_status(ticket, [])}\n'
+	),
+	"agent/messages.py": "import frappe\n\nfrom erp_ai.constants import MESSAGE_DOCTYPE\n",
+}
+# design 8.2: what the LAYER_RULES entry of the reader forbids.
+BOT_STATUS_FORBIDDEN_IMPORTS = (
+	"erp_ai.gateway",
+	"erp_ai.agent.runner",
+	"erp_ai.agent.queue",
+	"erp_ai.agent.run_status",
+	"erp_ai.agent.tools",
+	"erp_ai.agent.policy",
+	"erp_ai.agent.run_log",
+)
+
+
+class TestBotStatusReaderRules(unittest.TestCase):
+	"""CHG-009 T4: the ADR-048 rules on the panel's status reader, on the product, then the clean and violating samples."""
+
+	assertRuleSamples = TestArchitecture.assertRuleSamples
+
+	@classmethod
+	def setUpClass(cls):
+		cls.sources = load_product_sources()
+
+	def test_bot_status_reader_follows_adr_048(self):
+		self.assertIn(BOT_STATUS_FILE, self.sources)
+		self.assertEqual(check_bot_status_reader_follows_adr_048(self.sources), [])
+
+		changed = TestScannersCatchViolations.changed
+		clean = BOT_STATUS_SAMPLE
+		in_reader = {
+			"insert": 'frappe.get_doc({"doctype": LOG_DOCTYPE}).insert()',
+			"save": "doc.save()",
+			"set_value": 'frappe.db.set_value(LOG_DOCTYPE, doc, "seen", 1)',
+			"db_set": 'doc.db_set("seen", 1)',
+			"commit": "frappe.db.commit()",
+			"cache": "frappe.cache().get_value(doc)",
+			"publish_realtime": 'frappe.publish_realtime("erp_ai:agent_status", doc)',
+		}
+		cases = {
+			f"{name} in the reader": (
+				changed(clean, BOT_STATUS_FILE, f"\n\ndef touch(doc):\n\treturn {expression}\n"),
+				f"{BOT_STATUS_FILE}:13: names {name}",
+			)
+			for name, expression in in_reader.items()
+		}
+		cases |= {
+			f"{name} imported by the reader": (
+				changed(clean, BOT_STATUS_FILE, f"from {module} import {name}\n"),
+				f"{BOT_STATUS_FILE}:10: names {name}",
+			)
+			for module, name in (
+				("erp_ai.agent.run_log", "write_entry"),
+				("frappe.utils.background_jobs", "get_job"),
+			)
+		}
+		panel_only = f"imports {BOT_STATUS_MODULE}; only {PANEL_FILE} may"
+		cases |= {
+			"another module imports the reader": (
+				changed(clean, "agent/messages.py", "from erp_ai.agent import bot_status\n"),
+				f"agent/messages.py:4: {panel_only}",
+			),
+			"the runner imports it lazily and relatively": (
+				changed(clean, RUNNER_FILE, "def status(ticket):\n\tfrom . import bot_status\n"),
+				f"{RUNNER_FILE}:2: {panel_only}",
+			),
+			"a module names it by its path": (
+				changed(
+					clean,
+					"tasks.py",
+					'import frappe\n\nSTATUS = frappe.get_attr("erp_ai.agent.bot_status.panel_status")\n',
+				),
+				f"tasks.py:3: names {BOT_STATUS_MODULE}; only {PANEL_FILE} may",
+			),
+			"the panel names the log": (
+				changed(
+					clean,
+					PANEL_FILE,
+					'\n\ndef rows(ticket):\n\treturn frappe.get_all("ERP AI Log", filters={"ticket": ticket})\n',
+				),
+				f'{PANEL_FILE}:9: names "{PANEL_FORBIDDEN_LOG_TEXT}"',
+			),
+			"the panel queries the log's table": (
+				changed(clean, PANEL_FILE, 'SQL = "select name from `tabERP AI Log` where ticket=%s"\n'),
+				f'{PANEL_FILE}:6: names "{PANEL_FORBIDDEN_LOG_TEXT}"',
+			),
+			"the reader missing": ({PANEL_FILE: clean[PANEL_FILE]}, f"{BOT_STATUS_FILE}: file missing"),
+			"the panel missing": ({BOT_STATUS_FILE: clean[BOT_STATUS_FILE]}, f"{PANEL_FILE}: file missing"),
+		}
+		self.assertRuleSamples(check_bot_status_reader_follows_adr_048, clean, cases)
+
+		self.assertRuleSamples(
+			check_layer_imports,
+			clean,
+			{
+				target: (
+					changed(clean, BOT_STATUS_FILE, "from {} import {}\n".format(*target.rsplit(".", 1))),
+					f"{BOT_STATUS_FILE}:10: imports {target} (ADR-048 QĐ 6",
+				)
+				for target in BOT_STATUS_FORBIDDEN_IMPORTS
 			},
 		)
 

@@ -1,4 +1,6 @@
+import contextlib
 import hashlib
+import inspect
 import json
 from types import SimpleNamespace
 from typing import ClassVar
@@ -8,11 +10,23 @@ import frappe
 import frappe.handler
 from frappe.core.utils import html_to_plain_text
 from frappe.tests.utils import FrappeTestCase
+from frappe.utils import background_jobs
 from helpdesk.test_utils import create_agent, make_ticket, make_todo
 from helpdesk.utils import is_agent
+from rq.job import JobStatus
 
 from erp_ai import ticket_panel
-from erp_ai.agent import answer_delay, change_link, change_text, policy, runner
+from erp_ai.agent import (
+	answer_delay,
+	bot_status,
+	change_link,
+	change_text,
+	kpi,
+	messages,
+	policy,
+	run_log,
+	runner,
+)
 from erp_ai.agent.changes import apply_job, transitions
 from erp_ai.agent.policy import contains_keyword
 from erp_ai.agent.queue import PENDING_JOB_IDS_FLAG
@@ -29,6 +43,10 @@ from erp_ai.constants import (
 	CHANGE_STATUS_UNDOING,
 	CHANGE_STATUS_UNDONE,
 	CLASSIFICATION_FIELDS,
+	EVENT_CALL_BUSY,
+	EVENT_CALL_MERGED,
+	EVENT_RUN_DONE,
+	EVENT_RUN_FAILED,
 	LOG_DOCTYPE,
 	LOGGER_NAME,
 	MESSAGE_DOCTYPE,
@@ -40,9 +58,12 @@ from erp_ai.constants import (
 	RESTART_STATUS_SENT,
 	RESTART_STATUS_UNCONFIRMED,
 	ROLE_INSTRUCTOR,
+	SKIP_AGENT_DISABLED,
 	TITLE_RUN_FAILED,
+	TRIGGER_COMMENT_MENTION,
 )
 from erp_ai.erp_ai_agent.doctype.erp_ai_change_proposal import erp_ai_change_proposal as proposal_form
+from erp_ai.gateway import GatewayError
 from erp_ai.test_utils import (
 	FakeGateway,
 	GitSandbox,
@@ -52,6 +73,7 @@ from erp_ai.test_utils import (
 	make_model_result,
 	record_status_signals,
 	set_agent_settings,
+	stub_job_states,
 )
 
 # What the panel lists about the ticket, in display order: what the bot classified and why, how it scored
@@ -419,8 +441,11 @@ class TestTicketPanelReadOnly(FrappeTestCase):
 		for secret in ("zq-unique-keyword", "zq-unique-recipient", "zq-unique-thinking"):
 			with self.subTest(secret=secret):
 				self.assertNotIn(secret, result)
-		# ADR-044 (CHG-008): the read result gains `proposals`, the cards of the ticket's change proposals
-		self.assertEqual(set(json.loads(result)), {"ticket", "ai_fields", "messages", "proposals"})
+		# ADR-044 (CHG-008): the read result gains `proposals`, the cards of the ticket's change proposals; ADR-044
+		# Amendment 1 (CHG-009, ADR-048): and `bot_status`, the bot's status line and system lines
+		self.assertEqual(
+			set(json.loads(result)), {"ticket", "ai_fields", "messages", "proposals", "bot_status"}
+		)
 
 	def test_read_logs_ids_only_at_debug(self):
 		_add_message(self.ticket, f"{KEYWORD} secret body text")
@@ -477,6 +502,8 @@ class TestTicketPanelSend(FrappeTestCase):
 		frappe.set_user("Administrator")
 		create_agent(AGENT_EMAIL)
 		set_agent_settings(trigger_keyword=self.KEYWORD)
+		# CHG-009 (STD-TEST-6): a send with the bot on reads the RQ job state from this stub, never the shared Redis
+		stub_job_states(self, {})
 		self.ticket = make_ticket(subject="Panel send ticket").name
 		# The message handler (FEAT-007) is not under test here: keep it from queueing a job.
 		enqueue = patch.object(frappe, "enqueue")
@@ -656,6 +683,8 @@ class TestTicketPanelGateParity(FrappeTestCase):
 		enqueue_patch = patch.object(frappe, "enqueue")
 		self.enqueue = enqueue_patch.start()
 		self.addCleanup(enqueue_patch.stop)
+		# CHG-009 (STD-TEST-6): every branch queues with the bot on; the RQ job state comes from this stub
+		stub_job_states(self, {})
 		month_spend_patch = patch.object(policy, "month_spend_usd", return_value=0.0)
 		self.month_spend = month_spend_patch.start()
 		self.addCleanup(month_spend_patch.stop)
@@ -1149,7 +1178,8 @@ class TestPanelProposalCards(FrappeTestCase):
 		)
 		frappe.set_user(CARD_INSTRUCTOR)
 		result = ticket_panel.get_panel_data(self.ticket)
-		self.assertEqual(set(result), {"ticket", "ai_fields", "messages", "proposals"})
+		# ADR-044 Amendment 1 (CHG-009, ADR-048): the closed key set gains `bot_status`
+		self.assertEqual(set(result), {"ticket", "ai_fields", "messages", "proposals", "bot_status"})
 		self.assertEqual(len(result["proposals"]), 1)
 		self.assertEqual(set(result["proposals"][0]), set(proposal_form.CARD_KEYS))
 		text = json.dumps(result["proposals"], ensure_ascii=False)
@@ -1737,3 +1767,416 @@ class TestPanelDecision(FrappeTestCase):
 		):
 			with self.subTest(leak=leak):
 				self.assertNotIn(leak, "\n".join(lines))
+
+
+# CHG-009 design 3.1: the keys of `bot_status` and of each of its system lines.
+STATUS_KEYS = {"state", "text", "expires_in_s", "expired_text", "lines"}
+LINE_KEYS = {"kind", "text", "after_message"}
+# AC-1: the open call's form of the status line, as the spec quotes it.
+TEXT_RUNNING = "Đang xử lý…"
+# Frappe runs a job as `method(**kwargs)` with the arguments `frappe.enqueue` does not keep for itself.
+ENQUEUE_OWN_PARAMETERS = frozenset(inspect.signature(background_jobs.enqueue).parameters)
+# The reader's clock: a case pins it to the time of the row it reads, so no assertion reads the wall clock.
+STATUS_CLOCK = "erp_ai.agent.bot_status.now_datetime"
+
+
+class ZqSeedFaultError(Exception):
+	"""An error no step of a run expects, named so that its name is a seed (AC-8)."""
+
+
+class TestPanelBotStatus(FrappeTestCase):
+	"""CHG-009 AC-2, AC-6, AC-8, AC-9, AC-10, NFR-1, NFR-2 (design 3.1, 4, 5; ADR-010 Amendment 4, ADR-044
+	Amendment 1, ADR-048 QĐ 6, 7): the panel's read carries the bot's status line and system lines in `bot_status`,
+	built after the panel gate from codes only, writing nothing; a system line is never a message.
+
+	The ticket is created with the bot off (one refusal line, as ticket 43229), then the bot is on. Each message is
+	sent through the panel and each job it queued runs with the kwargs the queue gave it; the RQ job state is the
+	stub `job_states` (STD-TEST-6)."""
+
+	SAVEPOINT = "erp_ai_panel_bot_status"
+	TEXT = "Kiểm tra giúp mã nhân viên"
+
+	def setUp(self):
+		self.addCleanup(frappe.db.rollback)
+		self.addCleanup(frappe.set_user, "Administrator")
+		frappe.set_user("Administrator")
+		commit_guard = patch.object(frappe.db, "commit", side_effect=AssertionError("test must not commit"))
+		commit_guard.start()
+		self.addCleanup(commit_guard.stop)
+		log_error = patch.object(frappe, "log_error")
+		self.log_error = log_error.start()
+		self.addCleanup(log_error.stop)
+		self.job_states = stub_job_states(self, {})
+		record_status_signals(self)
+		sleep_patch = patch.object(answer_delay, "_sleep")
+		sleep_patch.start()
+		self.addCleanup(sleep_patch.stop)
+		self.gateway = FakeGateway()
+		gateway_patch = patch("erp_ai.gateway.call_model", self.gateway)
+		gateway_patch.start()
+		self.addCleanup(gateway_patch.stop)
+		enqueue_patch = patch.object(frappe, "enqueue")
+		self.enqueue = enqueue_patch.start()
+		self.addCleanup(enqueue_patch.stop)
+		month_spend_patch = patch.object(policy, "month_spend_usd", return_value=0.0)
+		month_spend_patch.start()
+		self.addCleanup(month_spend_patch.stop)
+		self.addCleanup(frappe.flags.pop, PENDING_JOB_IDS_FLAG, None)
+		create_agent(AGENT_EMAIL)
+		# every value a run depends on is set here, never read from the shared site (STD-TEST-6, STD-TEST-8)
+		set_agent_settings(
+			enabled=0,
+			trigger_keyword=KEYWORD,
+			permission_level="L1",
+			max_runs_per_ticket_per_day=5,
+			max_turns_per_run=4,
+			monthly_budget_usd=1,
+			spent_this_month_usd=0,
+			excluded_teams="",
+			excluded_title_prefixes="",
+			answer_delay_min_s=0,
+			answer_delay_max_s=0,
+			reply_enabled=0,
+			kb_draft_enabled=0,
+			auto_assign_enabled=0,
+		)
+		self.ticket = make_ticket(subject="Panel bot status ticket").name
+		# classified at full confidence: a message run reasons at once, one model call
+		write_entry(
+			ticket=self.ticket,
+			run_id="ERPAI-TEST-panel-status-classified",
+			entry_type="classify",
+			trigger="ticket_insert",
+			turn=0,
+			predicted_category="A",
+			predicted_confidence_pct=100,
+		)
+		set_agent_settings(enabled=1)
+
+	def _read(self, user=AGENT_EMAIL, ticket=None):
+		"""The panel's read as `user` (its own request); the session goes back to the one before."""
+		previous = frappe.session.user
+		frappe.set_user(user)
+		try:
+			return ticket_panel.get_panel_data(ticket or self.ticket)
+		finally:
+			frappe.set_user(previous)
+
+	def _read_at(self, now, user=AGENT_EMAIL):
+		with patch(STATUS_CLOCK, return_value=now):
+			return self._read(user)
+
+	def _send(self, text=TEXT):
+		"""One send from the panel, its own request: no job claimed by an earlier request is left."""
+		frappe.flags.pop(PENDING_JOB_IDS_FLAG, None)
+		frappe.set_user(AGENT_EMAIL)
+		try:
+			return ticket_panel.send_message(self.ticket, text)["message"]
+		finally:
+			frappe.set_user("Administrator")
+
+	def _jobs(self):
+		"""The agent jobs queued so far, each as the kwargs Frappe runs it with."""
+		return [
+			{key: value for key, value in call.kwargs.items() if key not in ENQUEUE_OWN_PARAMETERS}
+			for call in self.enqueue.call_args_list
+			if call.args and call.args[0] == RUN_ROUTE
+		]
+
+	def _run_jobs(self):
+		"""Run every queued agent job as the worker would, then forget them."""
+		jobs = self._jobs()
+		self.enqueue.reset_mock()
+		for kwargs in jobs:
+			runner.run_for_ticket(**kwargs)
+		frappe.set_user("Administrator")
+		return jobs
+
+	def _event_at(self, code):
+		"""When the ticket's one run_event row with `code` was written."""
+		(creation,) = frappe.get_all(
+			LOG_DOCTYPE,
+			filters={"ticket": self.ticket, "entry_type": "run_event", "stop_reason": code},
+			pluck="creation",
+		)
+		return creation
+
+	def _events(self, code):
+		return frappe.db.count(
+			LOG_DOCTYPE, {"ticket": self.ticket, "entry_type": "run_event", "stop_reason": code}
+		)
+
+	def _status_texts(self, status):
+		"""Every sentence of `bot_status` (not the message names its lines are anchored to)."""
+		return "\n".join(
+			[status["text"], str(status["expired_text"]), *(line["text"] for line in status["lines"])]
+		)
+
+	def _seed_every_reason(self):
+		"""One row for each reason the panel names, written as its writer writes it: a refused call by the handlers
+		(`record_event`), a stopped run by the runner (a skip row)."""
+		for code in bot_status.REASONS:
+			if code in run_log.EVENT_CODES:
+				run_log.record_event(ticket=self.ticket, trigger=TRIGGER_COMMENT_MENTION, code=code)
+			else:
+				write_entry(
+					ticket=self.ticket,
+					run_id=f"ERPAI-TEST-panel-stop-{code}",
+					entry_type="skip",
+					trigger=TRIGGER_COMMENT_MENTION,
+					turn=0,
+					stop_reason=code,
+				)
+
+	def test_status_mid_run_and_after(self):
+		# AC-2: a reload while the run works shows the open call; after the run, the time of its end row
+		seen = []
+		self.gateway.on_call = lambda task, kwargs: seen.append(self._read()["bot_status"]["text"])
+		self._send()
+		queued = self._read()["bot_status"]
+		self.assertEqual((queued["state"], queued["text"]), ("running", TEXT_RUNNING))
+		self.assertGreaterEqual(queued["expires_in_s"], 1)
+
+		self._run_jobs()
+
+		self.assertTrue(seen)
+		self.assertEqual(set(seen), {TEXT_RUNNING})
+		done_at = self._event_at(EVENT_RUN_DONE)
+		result = self._read_at(done_at)
+		status = result["bot_status"]
+		done = f"Đã xong lúc {done_at:%H:%M}"
+		self.assertEqual(
+			(status["state"], status["text"], status["expires_in_s"], status["expired_text"]),
+			("done", done, None, None),
+		)
+		self.assertEqual(
+			status["lines"][-1],
+			{"kind": "done", "text": done, "after_message": result["messages"][-1]["name"]},
+		)
+
+	def test_message_while_job_queued_or_started(self):
+		# AC-6: a message sent while the ticket's message job waits or runs gets one line right under it and no run
+		# of its own; the status line stays on the open call
+		self._send()
+		(job,) = self._jobs()
+		job_id = self.enqueue.call_args.kwargs["job_id"]
+		for job_state, kind in ((JobStatus.QUEUED, "merged"), (JobStatus.STARTED, "busy")):
+			with self.subTest(job_state=job_state):
+				self.job_states[job_id] = job_state
+				self.enqueue.reset_mock()
+
+				message = self._send()
+
+				(merged_job,) = self._jobs()
+				self.assertEqual(self.enqueue.call_args.kwargs["job_id"], job_id)
+				self.assertIsNone(merged_job["run_id"])
+				self.assertEqual(self._events("call_received"), 1)
+				status = self._read()["bot_status"]
+				self.assertEqual((status["state"], status["text"]), ("running", TEXT_RUNNING))
+				under = [line for line in status["lines"] if line["after_message"] == message]
+				self.assertEqual(
+					under, [{"kind": kind, "text": bot_status.LINE_TEXTS[kind], "after_message": message}]
+				)
+		self.assertIsNotNone(job["run_id"])
+
+	def test_failure_shows_no_detail(self):
+		# AC-8, NFR-2: a failed run reads "Lỗi lúc HH:MM" with one failed line; no error class, key, HTTP status or
+		# request id reaches the panel
+		cases = {
+			"gateway": (
+				GatewayError(
+					"server_error", status=529, credential_label="zq-seed-key", request_id="zq-seed-req"
+				),
+				contextlib.nullcontext,
+				("GatewayError", "server_error", "529"),
+			),
+			"unexpected": (
+				make_model_result(),
+				lambda: patch.object(
+					runner, "build_initial_message", side_effect=ZqSeedFaultError("zq-seed-detail")
+				),
+				("ZqSeedFaultError",),
+			),
+		}
+		for case, (result, failure, names) in cases.items():
+			with self.subTest(case=case):
+				frappe.db.savepoint(self.SAVEPOINT)
+				try:
+					self.gateway.results = [result]
+					self._send()
+					with failure():
+						self._run_jobs()
+
+					failed_at = self._event_at(EVENT_RUN_FAILED)
+					result = self._read_at(failed_at)
+					status = result["bot_status"]
+					failed = f"Lỗi lúc {failed_at:%H:%M}"
+					self.assertEqual((status["state"], status["text"]), ("failed", failed))
+					self.assertEqual(
+						[line["text"] for line in status["lines"] if line["kind"] == "failed"], [failed]
+					)
+					dumped = json.dumps(result, ensure_ascii=False)
+					texts = self._status_texts(status)
+					for leak in ("zq-seed", *names):
+						with self.subTest(leak=leak):
+							self.assertNotIn(leak, texts)
+							if leak != "529":
+								# a ticket or message name may hold these digits; only the sentences may not
+								self.assertNotIn(leak, dumped)
+				finally:
+					frappe.db.rollback(save_point=self.SAVEPOINT)
+
+	def test_denied_callers_get_no_status(self):
+		# AC-9: the status is built only after the panel gate: an HD contact who reads the ticket, Guest and an agent
+		# who cannot read it get PermissionError, and the reader is never called for them
+		_make_user(CUSTOMER_EMAIL)
+		frappe.get_doc("User", CUSTOMER_EMAIL).add_roles("HD Customer")
+		frappe.flags.pop(PENDING_JOB_IDS_FLAG, None)
+		own = make_ticket(subject="Customer own ticket", raised_by=CUSTOMER_EMAIL).name
+		self.addCleanup(frappe.clear_cache, user=NO_READ_EMAIL)
+		create_agent(NO_READ_EMAIL)
+		frappe.get_doc("User", NO_READ_EMAIL).remove_roles("Agent", "Agent Manager")
+		self._send()
+		with patch.object(bot_status, "panel_status", wraps=bot_status.panel_status) as reader:
+			for user, ticket in ((CUSTOMER_EMAIL, own), ("Guest", self.ticket), (NO_READ_EMAIL, self.ticket)):
+				with self.subTest(user=user), self.assertRaises(frappe.PermissionError):
+					self._read(user, ticket)
+			reader.assert_not_called()
+			# the same tickets have a status for an agent who may read them: there was something to leak
+			for ticket in (own, self.ticket):
+				with self.subTest(ticket=ticket):
+					self.assertEqual(self._read(ticket=ticket)["bot_status"]["text"], TEXT_RUNNING)
+		self.assertEqual(reader.call_count, 2)
+
+	def test_status_never_shows_settings_or_content(self):
+		# AC-9, NFR-2, ADR-010 Amendment 4: a reason names its kind only; no setting, odd stop reason, ticket text,
+		# message or model text reaches the status; the keys are exactly those of design 3.1
+		set_agent_settings(
+			trigger_keyword="zq-cfg-keyword",
+			excluded_title_prefixes="zq-cfg-prefix",
+			excluded_teams="zq-cfg-team",
+			max_runs_per_ticket_per_day=9173,
+			monthly_budget_usd=8642,
+			thinking_text="zq-cfg-thinking",
+		)
+		frappe.db.set_value(
+			"HD Ticket",
+			self.ticket,
+			{"subject": "zq-txt-subject", "description": "zq-txt-content"},
+			update_modified=False,
+		)
+		self.gateway.results = [make_model_result(text="zq-txt-model")]
+		self._send("zq-txt-message")
+		self._run_jobs()
+		self._seed_every_reason()
+		write_entry(
+			ticket=self.ticket,
+			run_id="ERPAI-TEST-panel-odd-stop",
+			entry_type="skip",
+			trigger=TRIGGER_COMMENT_MENTION,
+			turn=0,
+			stop_reason="zq-stop-odd",
+		)
+
+		result = self._read()
+
+		status = result["bot_status"]
+		self.assertEqual(set(result), {"ticket", "ai_fields", "messages", "proposals", "bot_status"})
+		self.assertEqual(set(status), STATUS_KEYS)
+		self.assertEqual([set(line) for line in status["lines"]], [LINE_KEYS] * len(status["lines"]))
+		# every reason is on the panel (the creation refusal too), so each was checked below
+		reasons = [line for line in status["lines"] if line["kind"] == "not_run"]
+		self.assertEqual(len(reasons), len(bot_status.REASONS) + 1)
+		# the run took the seeded model text
+		self.assertEqual(self.gateway.results, [])
+		dumped = json.dumps(result, ensure_ascii=False)
+		texts = self._status_texts(status)
+		for leak in ("zq-cfg", "zq-stop"):
+			with self.subTest(leak=leak):
+				self.assertNotIn(leak, dumped)
+		for leak in ("zq-txt", "zq-cfg", "zq-stop", "9173", "8642"):
+			with self.subTest(leak=leak):
+				self.assertNotIn(leak, texts)
+
+	def test_system_lines_are_not_messages(self):
+		# AC-10, ADR-048 QĐ 7: a system line comes from the log only: it is no message, starts no job, adds no
+		# Comment, and changes neither the next run's model input nor what counts people's or the bot's words
+		self.gateway.results = [make_model_result(text="Bot đã xem phiếu")]
+		self._send("Tin đầu của người")
+		self._run_jobs()
+		raised_by = frappe.db.get_value("HD Ticket", self.ticket, "raised_by")
+
+		def counts():
+			return {
+				"history": messages.history(self.ticket),
+				"typed": messages.typed_by_people(self.ticket),
+				"kpi3_touched": kpi._human_touched([frappe._dict(name=self.ticket, raised_by=raised_by)]),
+				"guidance": write_ticket.count_guidance(self.ticket),
+				"comments": frappe.db.count("Comment"),
+				"thread": self._read()["messages"],
+			}
+
+		before = counts()
+		for code in (EVENT_CALL_MERGED, EVENT_CALL_BUSY, SKIP_AGENT_DISABLED):
+			run_log.record_event(ticket=self.ticket, trigger=TRIGGER_COMMENT_MENTION, code=code)
+		for code in (EVENT_RUN_DONE, EVENT_RUN_FAILED):
+			run_log.record_event(
+				ticket=self.ticket, trigger=TRIGGER_COMMENT_MENTION, code=code, run_id=f"ERPAI-TEST-{code}"
+			)
+		lines = self._read()["bot_status"]["lines"]
+
+		self.assertEqual({line["kind"] for line in lines}, {"merged", "busy", "not_run", "done", "failed"})
+		self.assertEqual(counts(), before)
+		self.assertEqual(
+			[message["name"] for message in before["thread"]],
+			frappe.get_all(
+				MESSAGE_DOCTYPE,
+				filters={"ticket": self.ticket},
+				pluck="name",
+				order_by="creation asc, name asc",
+			),
+		)
+		self.enqueue.assert_not_called()
+		# the next run reads the conversation: no system line is in what it sends the model
+		self.gateway.calls.clear()
+		self._send("Tin thứ hai của người")
+		self._run_jobs()
+		self.assertGreater(self.gateway.call_count, 0)
+		model_input = json.dumps(self.gateway.calls, ensure_ascii=False, default=str)
+		self.assertIn("Tin thứ hai của người", model_input)
+		for line in lines:
+			with self.subTest(line=line["text"]):
+				self.assertNotIn(line["text"], model_input)
+
+	def test_read_with_events_writes_nothing(self):
+		# NFR-1, ADR-010 QĐ 5 (Amendment 4): a read that builds the status line, its deadline and system lines of
+		# every kind writes no SQL, changes no count, calls no model and queues nothing
+		self._send()
+		self._run_jobs()
+		self._send()
+		self.job_states[self.enqueue.call_args.kwargs["job_id"]] = JobStatus.QUEUED
+		self._send()
+		self._seed_every_reason()
+		self.enqueue.reset_mock()
+		calls = self.gateway.call_count
+
+		def counts():
+			return {
+				doctype: frappe.db.count(doctype)
+				for doctype in ("Comment", MESSAGE_DOCTYPE, LOG_DOCTYPE, "ToDo", "Task", "Error Log")
+			} | {"modified": frappe.db.get_value("HD Ticket", self.ticket, "modified")}
+
+		before = counts()
+		frappe.set_user(AGENT_EMAIL)
+		for _ in range(3):
+			writes = frappe.db.transaction_writes
+			status = ticket_panel.get_panel_data(self.ticket)["bot_status"]
+			self.assertEqual(frappe.db.transaction_writes, writes)
+		frappe.set_user("Administrator")
+
+		self.assertEqual((status["state"], status["text"]), ("running", TEXT_RUNNING))
+		self.assertGreaterEqual(status["expires_in_s"], 1)
+		self.assertEqual({line["kind"] for line in status["lines"]}, {"not_run", "done", "merged"})
+		self.assertEqual(counts(), before)
+		self.assertEqual(self.gateway.call_count, calls)
+		self.enqueue.assert_not_called()

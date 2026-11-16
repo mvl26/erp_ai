@@ -191,7 +191,8 @@ class TestOptions(FrappeTestCase):
 		meta = frappe.get_meta(LOG_DOCTYPE)
 		self.assertEqual(
 			meta.get_field("entry_type").options.split("\n"),
-			["classify", "reason", "skip", "change", "bot_action"],
+			# CHG-009 (ADR-048 QĐ 1): run_event added last.
+			["classify", "reason", "skip", "change", "bot_action", "run_event"],
 		)
 		self.assertEqual(
 			meta.get_field("trigger").options.split("\n"),

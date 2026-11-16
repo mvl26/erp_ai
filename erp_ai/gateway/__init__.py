@@ -18,7 +18,8 @@ DEFAULT_MAX_KEYS_PER_CALL = 3
 DEFAULT_REQUEST_TIMEOUT_S = 60
 MIN_REMAINING_S = 5
 # Classify answers with one short JSON object. Haiku 5.5 thinks by default and its (hidden) thinking
-# tokens count against max_tokens, so with thinking on a 600 ceiling is hit about 1 call in 4.
+# tokens count against max_tokens, the classify cap (`runner.CLASSIFY_MAX_TOKENS`, 2048); with thinking on,
+# the former 600 cap was hit about 1 call in 4.
 # Only Haiku accepts `disabled`; Sonnet, Opus and Fable answer 400 to it, so other models get no field.
 CLASSIFY_THINKING = {"type": "disabled"}
 THINKING_OFF_MODEL_PREFIX = "claude-haiku-"

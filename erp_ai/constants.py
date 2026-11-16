@@ -109,6 +109,23 @@ LESSON_SOURCE_TEACHING = "Người dạy"
 LESSON_SOURCE_OUTCOME = "Kết quả duyệt và rà soát"
 LESSON_STEPS = ("Tạo", "Cập nhật", "Duyệt", "Từ chối", "Tắt", "Bật")
 
+# CHG-009 (design 2, 3.8; ADR-048): the run_event row of ERP AI Log, its event codes, the codes of a refused call
+# or an early stop, how long a received call may wait, the Error Log title of a failed event write.
+LOG_ENTRY_RUN_EVENT = "run_event"
+EVENT_CALL_RECEIVED = "call_received"
+EVENT_CALL_MERGED = "call_merged"
+EVENT_CALL_BUSY = "call_busy"
+EVENT_RUN_DONE = "run_done"
+EVENT_RUN_FAILED = "run_failed"
+SKIP_AGENT_DISABLED = "agent_disabled"
+SKIP_CREATED_BY_AGENT = "created_by_agent"
+SKIP_PREFILLED = "prefilled"
+SKIP_DAILY_LIMIT = "daily_limit"
+SKIP_LEVEL_L0 = "level_L0"
+SKIP_NOT_SENDABLE = "not_sendable"
+BOT_CALL_EXPIRY_S = 2 * JOB_TIMEOUT_S
+TITLE_EVENT_FAILED = "erp_ai: ghi trạng thái bot lỗi"
+
 # FEAT-007 (F-1): catalog actions and modes, KPI ids, ticket-content DocTypes; one block, keep it last.
 ACTION_CREATE_USER = "Tạo tài khoản theo mẫu"
 ACTION_ADD_TEAM_MEMBER = "Thêm người vào nhóm Helpdesk"

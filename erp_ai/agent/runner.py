@@ -26,7 +26,7 @@ from erp_ai.agent.prompts import (
 )
 from erp_ai.agent.redact import redact_secrets
 from erp_ai.agent.routing import decide_route, departments, load_routing_config, sla_lag
-from erp_ai.agent.run_log import ENTRY_TYPE_CHANGE, action_entry, write_entry
+from erp_ai.agent.run_log import ENTRY_TYPE_CHANGE, action_entry, record_event, write_entry
 from erp_ai.agent.run_status import CLASSIFY_STEP, RunStatus
 from erp_ai.agent.tools.kb_draft import ARTICLE_DOCTYPE, SOURCE_TICKET_FIELD
 from erp_ai.agent.tools.read import TOOL_RESULT_MAX_CHARS
@@ -77,14 +77,22 @@ from erp_ai.constants import (
 	AGENT_USER,
 	CLASSIFICATION_FIELDS,
 	CLASSIFIED_BY_HUMAN,
+	EVENT_RUN_DONE,
+	EVENT_RUN_FAILED,
 	JOB_SAFETY_MARGIN_S,
 	JOB_TIMEOUT_S,
 	LEVELS,
 	LOG_DOCTYPE,
+	LOG_ENTRY_RUN_EVENT,
 	LOGGER_NAME,
 	MESSAGE_DOCTYPE,
 	PROPOSAL_DOCTYPE,
 	SETTING_DOCTYPE,
+	SKIP_AGENT_DISABLED,
+	SKIP_DAILY_LIMIT,
+	SKIP_LEVEL_L0,
+	SKIP_NOT_SENDABLE,
+	TITLE_EVENT_FAILED,
 	TITLE_RUN_FAILED,
 	TITLE_STATUS_FAILED,
 	TRIGGER_CHANGE_ACTION,
@@ -94,7 +102,7 @@ from erp_ai.constants import (
 	TRIGGER_TICKET_INSERT,
 )
 
-CLASSIFY_MAX_TOKENS = 600
+CLASSIFY_MAX_TOKENS = 2048
 REASON_MAX_TOKENS = 16000
 STOP_TOOL_USE = "tool_use"
 STOP_MAX_TOKENS = "max_tokens"
@@ -144,6 +152,8 @@ CREATING_TOOLS = ("post_comment", "create_task", "reply_to_requester", "create_k
 PROPOSE_TOOLS = ("propose_file_change", "propose_new_file", "propose_bench_command")
 PROPOSE_STEP = "propose"
 UNPARSEABLE_ERROR = "UNPARSEABLE: không phân loại được"
+# The unparseable classify row's error keeps this many characters of the raw answer, masked first (BUG-004).
+CLASSIFY_RAW_HEAD_MAX_CHARS = 300
 BAD_MAPPING_ERROR = "category_mapping không hợp lệ, không có giá trị dự đoán"
 BAD_ROUTING_ERROR = "routing_rules không hợp lệ, định tuyến dùng giá trị rỗng"
 NO_SCORE_REASON = "không có điểm"
@@ -227,15 +237,22 @@ TITLE_LESSON_READ_FAILED = "erp_ai: đọc bài học lỗi"
 
 
 def run_for_ticket(
-	ticket_name: str, trigger: str, message_name: str | None = None, communication_name: str | None = None
+	ticket_name: str,
+	trigger: str,
+	message_name: str | None = None,
+	communication_name: str | None = None,
+	run_id: str | None = None,
 ) -> None:
 	"""Agent job (design 4.3). Never raises: a failed run is logged and the job ends normally.
+
+	`run_id` is the one the queue gave the job with its call_received row (ADR-048 QĐ 2, design 3.7); a job without
+	one (queued before CHG-009, or merged into a running one) gets a fresh one.
 
 	No rollback on the error path: the gateway writes key breaker state without committing, and a
 	rollback would lose the key status and the alarm that state drives (committed by `_call_model`).
 	"""
 	try:
-		_run(ticket_name, trigger, message_name, communication_name)
+		_run(ticket_name, trigger, message_name, communication_name, run_id=run_id)
 	except Exception as exc:
 		frappe.log_error(
 			TITLE_RUN_FAILED, f"ticket={ticket_name} trigger={trigger} error={type(exc).__name__}"
@@ -251,25 +268,33 @@ def _call_model(task, **kwargs):
 			frappe.db.commit()
 
 
-def _run(ticket_name, trigger, message_name=None, communication_name=None):
+def _run(ticket_name, trigger, message_name=None, communication_name=None, run_id=None):
 	# (a) the job must run as the agent account, checked before the ticket is read (AC-6)
 	if not authority.enter_agent_session():
 		return
 
-	# (b) disabled at run time: stop without a log entry
 	settings = frappe.get_single(SETTING_DOCTYPE)
-	if not settings.enabled:
-		return
-	routing = load_routing_config(settings.routing_rules)
-
 	reply_run = trigger == TRIGGER_REQUESTER_REPLY
 	kb_run = trigger == TRIGGER_KB_DRAFT
-	# ADR-033 QĐ 2: a requester-reply run is named by its event; each row it writes records the event as handled
-	run_id = queue.requester_reply_key(ticket_name, communication_name) if reply_run else uuid.uuid4().hex
-	# (r1) the event already has a row: run again for nothing, not even a row (ADR-033 QĐ 6, B-2)
-	if reply_run and frappe.db.exists(LOG_DOCTYPE, {"run_id": run_id}):
+	# ADR-033 QĐ 2: a requester-reply run is named by its event; each row it writes records the event as handled.
+	# Another run keeps the run_id of its job, the one on its call_received row (ADR-048 QĐ 2), else a fresh one.
+	if reply_run:
+		run_id = queue.requester_reply_key(ticket_name, communication_name)
+	elif not (isinstance(run_id, str) and run_id):
+		run_id = uuid.uuid4().hex
+	# (r1) the event already has a row: run again for nothing, not even a row (ADR-033 QĐ 6, B-2); before (b), so a
+	# handled event run again adds no skip row either (D-7)
+	# ADR-048 QĐ 4: only a row the run wrote counts, not the queue's call_received row that carries the key too
+	if reply_run and frappe.db.exists(
+		LOG_DOCTYPE, {"run_id": run_id, "entry_type": ("!=", LOG_ENTRY_RUN_EVENT)}
+	):
 		frappe.logger(LOGGER_NAME).info(ALREADY_HANDLED_LOG, ticket_name, run_id)
 		return
+	# (b) disabled at run time: stop on one skip row naming the switch (ADR-003 Amendment 1)
+	if not settings.enabled:
+		_stop(ticket_name, trigger, run_id, SKIP_AGENT_DISABLED, settings)
+		return
+	routing = load_routing_config(settings.routing_rules)
 	# the ask_fallback dedup counts from here: one question per run, not per ticket (AC-22, ADR-037)
 	started_at = now_datetime()
 	field_map, missing = _ticket_fields(settings)
@@ -278,9 +303,10 @@ def _run(ticket_name, trigger, message_name=None, communication_name=None):
 		frappe.logger(LOGGER_NAME).info(
 			"erp_ai ticket_fields run_id=%s missing=%s", run_id, "; ".join(missing)
 		)
-	# (c) the single send condition, re-checked at run time (NFR-4)
-	if not policy.can_send_ticket(ticket_name):
-		_log_skip(ticket_name, trigger, run_id, "not_sendable")
+	# (c) the single send condition, re-checked at run time (NFR-4); the skip row names its kind (ADR-003 Amendment 1)
+	refusal = policy.send_refusal(ticket_name)
+	if refusal:
+		_stop(ticket_name, trigger, run_id, f"{SKIP_NOT_SENDABLE}:{refusal}", settings)
 		return
 	# (r2)-(r4) the requester's message is read again; the knowledge-draft run checks its ticket; a skip row is not
 	# counted by runs_today
@@ -290,7 +316,7 @@ def _run(ticket_name, trigger, message_name=None, communication_name=None):
 	elif kb_run:
 		skip = _kb_draft_skip(ticket_name, settings)
 	if skip:
-		_log_skip(ticket_name, trigger, run_id, skip)
+		_stop(ticket_name, trigger, run_id, skip, settings)
 		return
 	# (d) daily limit counted from the log (AC-15); above L0 the person is told once a day (AC-23, AC-61); the
 	# knowledge-draft run is not checked (ADR-033 QĐ 4)
@@ -299,7 +325,7 @@ def _run(ticket_name, trigger, message_name=None, communication_name=None):
 		notice = None
 		if policy.effective_level(settings, over_budget=False) != LEVELS[0]:
 			notice = ("daily_limit", DAILY_LIMIT_BODY.format(limit=limit), _start_of_today())
-		_log_skip(ticket_name, trigger, run_id, "daily_limit", notice)
+		_stop(ticket_name, trigger, run_id, SKIP_DAILY_LIMIT, settings, notice)
 		return
 	# (e)
 	over_budget = policy.is_over_budget(settings)
@@ -311,10 +337,13 @@ def _run(ticket_name, trigger, message_name=None, communication_name=None):
 
 	# a run other than the ticket's first one needs a level above L0 (U6b.md:286)
 	if trigger != TRIGGER_TICKET_INSERT and level == LEVELS[0]:
-		_log_skip(ticket_name, trigger, run_id, "level_L0")
+		_stop(ticket_name, trigger, run_id, SKIP_LEVEL_L0, settings)
 		return
 	status = RunStatus(ticket_name, run_id, settings.get("thinking_text"))
 	delay = None
+	# past the gates the run ends on one end row (ADR-048 QĐ 2): failed on a gateway error (the time budget too) or an
+	# exception only; a step that reports its own failure (unparseable, a failing tool) still ends done (design 3.7)
+	failed = False
 	try:
 		status.start()
 		# anchor of the delay = right after the start signal (AC-3); ticket_insert never waits
@@ -392,6 +421,8 @@ def _run(ticket_name, trigger, message_name=None, communication_name=None):
 				later_messages=_later_messages(ticket_name) if reclassify else None,
 			)
 			if not proceed:
+				# only the gateway error gives no classification: an excluded ticket's run gives its own
+				failed = classified is None
 				return
 			classification = classified or classification
 			if classified is None and context is not None:
@@ -415,7 +446,7 @@ def _run(ticket_name, trigger, message_name=None, communication_name=None):
 				# post_notice's dedup read locked the ticket row: free it before the model call (D-20)
 				if not frappe.flags.in_test:
 					frappe.db.commit()
-			_reason(
+			failed = not _reason(
 				ticket_name,
 				trigger,
 				run_id,
@@ -430,9 +461,13 @@ def _run(ticket_name, trigger, message_name=None, communication_name=None):
 				notices=notices,
 				guidance_posted=posted,
 			)
+	except BaseException:
+		failed = True
+		raise
 	finally:
 		close_collector(run_id)
 		frappe.flags.get(SPLIT_HELD_FLAG, {}).pop(run_id, None)
+		_log_end(ticket_name, trigger, run_id, failed)
 		_end_status(status, delay, ticket_name, run_id, trigger)
 
 
@@ -525,13 +560,7 @@ def _end_status(status, delay, ticket_name, run_id, trigger):
 	"""
 	status.done()
 	errors = status.take_errors()
-	# Runs in a `finally`: a failing log call must never replace the run's own exception (or the normal
-	# return). There is no better place left to report a failure of the log itself, so it is dropped.
-	for piece in errors:
-		try:
-			frappe.log_error(TITLE_STATUS_FAILED, f"ticket={ticket_name} run_id={run_id} {piece}")
-		except Exception:
-			pass
+	_log_status_errors(errors, ticket_name, run_id)
 	try:
 		frappe.logger(LOGGER_NAME).info(
 			"erp_ai run_status ticket=%s run_id=%s trigger=%s signals=%d errors=%d delay_s=%.1f waited_s=%.1f",
@@ -545,6 +574,50 @@ def _end_status(status, delay, ticket_name, run_id, trigger):
 		)
 	except Exception:
 		pass
+
+
+def _log_status_errors(errors, ticket_name, run_id) -> None:
+	"""One Error Log per failed emit, its code only (NFR-4').
+
+	Runs in a `finally` or after a stop: a failing log call must never replace the run's own exception (or the
+	normal return). There is no better place left to report a failure of the log itself, so it is dropped.
+	"""
+	for piece in errors:
+		try:
+			frappe.log_error(TITLE_STATUS_FAILED, f"ticket={ticket_name} run_id={run_id} {piece}")
+		except Exception:
+			pass
+
+
+def _log_end(ticket_name, trigger, run_id, failed) -> None:
+	"""The run's one end row, `run_failed` or `run_done` (ADR-048 QĐ 2, design 3.7), committed outside tests before
+	its `done`, so the panel that reloads on that signal reads it. Never raises (ADR-048 QĐ 3, AC-11): `record_event`
+	logs its own failure; a failing commit leaves one Error Log of codes, and the run's result stands.
+	"""
+	code = EVENT_RUN_FAILED if failed else EVENT_RUN_DONE
+	record_event(ticket=ticket_name, trigger=trigger, code=code, run_id=run_id)
+	if frappe.flags.in_test:
+		return
+	try:
+		frappe.db.commit()
+	except Exception as exc:
+		# Runs in a `finally`: a failing log call must not replace the run's own exception either, so it is dropped.
+		try:
+			frappe.log_error(
+				TITLE_EVENT_FAILED,
+				f"ticket={ticket_name} trigger={trigger} code={code} error={type(exc).__name__}",
+			)
+		except Exception:
+			pass
+
+
+def _stop(ticket_name, trigger, run_id, stop_reason, settings, notice=None):
+	"""An early stop (ADR-048 QĐ 2, 8; ADR-008 Amendment 1): its one `skip` row, committed by `write_entry`, then the
+	run's one `done` (none when the indicator text is empty); a failed emit goes to the Error Log."""
+	_log_skip(ticket_name, trigger, run_id, stop_reason, notice)
+	status = RunStatus(ticket_name, run_id, settings.get("thinking_text"))
+	status.stop()
+	_log_status_errors(status.take_errors(), ticket_name, run_id)
 
 
 def _log_skip(ticket_name, trigger, run_id, stop_reason, notice=None):
@@ -785,7 +858,10 @@ def _classify(
 	call_fields = _call_fields(result)
 	classification = parse_classification(result.text)
 	if classification is None:
-		error = "; ".join([UNPARSEABLE_ERROR, *status.take_errors()])
+		# masked before the cut: a cut through a secret value would leave it unmasked
+		raw_head = redact_secrets(result.text)[:CLASSIFY_RAW_HEAD_MAX_CHARS]
+		unparseable = f"{UNPARSEABLE_ERROR}; stop_reason={result.stop_reason}; raw={raw_head}"
+		error = "; ".join([unparseable, *status.take_errors()])
 		write_entry(**base, **call_fields, error=error, stop_reason="unparseable")
 		_log_classify(ticket_name, run_id, False, ticket.creation)
 		return True, None, context

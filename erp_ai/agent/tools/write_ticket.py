@@ -1,6 +1,7 @@
 import dataclasses
 import html
 import json
+import math
 import re
 import unicodedata
 from datetime import datetime
@@ -104,6 +105,12 @@ REASON_SYSTEM_SECTION = (
 # The done line of a classification written in a guidance run (U4b.md:210, :215; the runner imports them).
 ROUTE_DONE = "Bot đã phân loại phiếu: {fields}."
 FIELD_LABELS = {"ticket_type": "Loại", "agent_group": "Nhóm", "priority": "Ưu tiên"}
+# create_task (AC-63, U4b.md:157-161): an hour estimate on every Task, at most a configured number per run.
+DEFAULT_MAX_TASKS_PER_RUN = 10
+REASON_NO_ESTIMATE = "Task cần ước lượng bằng giờ, số dương"
+REASON_TASK_LIMIT = "đã tạo đủ {limit} Task trong lần chạy này"
+# Per-job state, like the asked runs: run_id -> the number of Tasks the run created.
+_RUN_TASKS_FLAG = "erp_ai_run_tasks"
 # The plan section ends at the next line opening a `**…:**` heading or the confidence line (Điểm 1.2 bước 2).
 _PLAN_END = re.compile(r"^[ \t]*(?:\*\*[^*\n]+:\*\*|Độ tin cậy:)", re.M)
 
@@ -552,11 +559,30 @@ def _task_refusal(ctx: ToolContext) -> dict | None:
 	return None
 
 
+def _valid_estimate(hours) -> bool:
+	"""A positive, finite number of hours; a bool is no number (U4b.md:174)."""
+	return (
+		isinstance(hours, int | float) and not isinstance(hours, bool) and math.isfinite(hours) and hours > 0
+	)
+
+
+def _max_tasks_per_run() -> int:
+	return frappe.db.get_single_value(SETTING_DOCTYPE, "max_tasks_per_run") or DEFAULT_MAX_TASKS_PER_RUN
+
+
 def create_task(args: dict, ctx: ToolContext) -> dict:
+	"""AC-63 (U4b.md:174): a Task of the ticket with its hour estimate, at most `max_tasks_per_run` per run."""
 	if not ctx.instructor:
 		return _fail("không có người ra lệnh")
 	if refusal := _task_refusal(ctx):
 		return refusal
+	hours = args.get("expected_hours")
+	if not _valid_estimate(hours):
+		return _fail(REASON_NO_ESTIMATE)
+	created = frappe.flags.setdefault(_RUN_TASKS_FLAG, {})
+	limit = _max_tasks_per_run()
+	if created.get(ctx.run_id, 0) >= limit:
+		return _fail(REASON_TASK_LIMIT.format(limit=limit))
 	link = _ticket_link_html(ctx.ticket_name)
 	text = escape_html(args["description"]).replace("\r\n", "\n").replace("\n", "<br>")
 	task = frappe.get_doc(
@@ -565,9 +591,11 @@ def create_task(args: dict, ctx: ToolContext) -> dict:
 			"subject": args["subject"],
 			"ai_ticket": ctx.ticket_name,
 			"description": f"{link}\n<p>{text}</p>",
+			"expected_time": float(hours),
 		}
 	)
 	task.insert()
+	created[ctx.run_id] = created.get(ctx.run_id, 0) + 1
 	return {"ok": True, "task": task.name}
 
 
@@ -636,14 +664,18 @@ TOOLS: list[ToolSpec] = [
 		group="task_write",
 		schema={
 			"name": "create_task",
-			"description": "Tạo một Task cho phiếu hiện tại; chỉ dùng khi có người ra lệnh.",
+			"description": (
+				"Tạo một Task cho phiếu hiện tại; chỉ dùng khi có người ra lệnh. "
+				"Mỗi Task một việc, có ước lượng giờ; tối đa theo cấu hình mỗi lần chạy."
+			),
 			"input_schema": {
 				"type": "object",
 				"properties": {
 					"subject": {"type": "string", "minLength": 1, "maxLength": 140},
 					"description": {"type": "string", "minLength": 1, "maxLength": 5000},
+					"expected_hours": {"type": "number", "exclusiveMinimum": 0},
 				},
-				"required": ["subject", "description"],
+				"required": ["subject", "description", "expected_hours"],
 			},
 		},
 		handler=create_task,

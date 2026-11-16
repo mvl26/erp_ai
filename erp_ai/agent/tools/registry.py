@@ -225,6 +225,7 @@ def _is_number(value) -> bool:
 JSON_TYPES = {
 	"string": lambda v: isinstance(v, str),
 	"integer": lambda v: isinstance(v, int) and not isinstance(v, bool),
+	"number": _is_number,
 	"boolean": lambda v: isinstance(v, bool),
 	"array": lambda v: isinstance(v, list),
 	"object": lambda v: isinstance(v, dict),

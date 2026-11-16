@@ -2,8 +2,8 @@ import json
 
 import frappe
 
-from erp_ai.agent import policy
-from erp_ai.agent.queue import enqueue_agent_run
+from erp_ai.agent import lifecycle, policy
+from erp_ai.agent.queue import enqueue_agent_run, requester_reply_key
 from erp_ai.constants import (
 	AGENT_USER,
 	CATEGORIES,
@@ -12,11 +12,15 @@ from erp_ai.constants import (
 	LOG_DOCTYPE,
 	LOGGER_NAME,
 	TRIGGER_COMMENT_MENTION,
+	TRIGGER_REQUESTER_REPLY,
 	TRIGGER_TICKET_INSERT,
 )
 
 TICKET_DOCTYPE = "HD Ticket"
 HUMAN_COMMENT_TYPE = "Comment"
+COMMUNICATION_DOCTYPE = "Communication"
+MESSAGE_COMMUNICATION_TYPE = "Communication"
+RECEIVED = "Received"
 TRIGGER_HUMAN_CORRECTION = "human_correction"
 CREATED_LABELS_FIELD = "ai_created_labels"
 CREATED_LABELS_FLAG = "erp_ai_created_labels"
@@ -185,3 +189,47 @@ def comment_after_insert(doc, method=None):
 		return
 	enqueue_agent_run(ticket, TRIGGER_COMMENT_MENTION, comment_name=doc.name)
 	_log_decision(ticket, TRIGGER_COMMENT_MENTION, "enqueued", "conditions_met")
+
+
+def _requester_reply_skip(doc, ticket) -> str | None:
+	"""Why a received message must not queue a requester-reply run, or None; reads only (ADR-033 QĐ 2)."""
+	if not policy.is_enabled():
+		return "agent_disabled"
+	if doc.owner == AGENT_USER:
+		return "written_by_agent"
+	if not lifecycle.is_requester_sender(
+		doc.sender, frappe.db.get_value(TICKET_DOCTYPE, ticket, "raised_by")
+	):
+		return "not_requester"
+	# B-1: the message that opened the ticket (portal or email) has no message of the bot before it.
+	if not frappe.db.exists(
+		COMMUNICATION_DOCTYPE, {**lifecycle._bot_messages(ticket), "creation": ("<", doc.creation)}
+	):
+		return "no_bot_message_before"
+	# B-2: the run of this message already wrote its rows under the event key.
+	if frappe.db.exists(LOG_DOCTYPE, {"run_id": requester_reply_key(ticket, doc.name)}):
+		return "already_handled"
+	if refusal := policy.send_refusal(ticket):
+		return f"not_sendable:{refusal}"
+	return None
+
+
+def communication_on_update(doc, method=None):
+	"""AC-41: the requester's reply after the bot's message queues one run of its own (one job per message, X-1)."""
+	# Fires for every Communication on the site; return before any DB read.
+	if (
+		doc.reference_doctype != TICKET_DOCTYPE
+		or not doc.reference_name
+		or doc.sent_or_received != RECEIVED
+		or doc.communication_type != MESSAGE_COMMUNICATION_TYPE
+	):
+		return
+
+	# B-3: read at on_update, after Helpdesk moved a reply to a merged ticket onto its merge target.
+	ticket = doc.reference_name
+	skip_reason = _requester_reply_skip(doc, ticket)
+	if skip_reason:
+		_log_decision(ticket, TRIGGER_REQUESTER_REPLY, "skipped", skip_reason)
+		return
+	enqueue_agent_run(ticket, TRIGGER_REQUESTER_REPLY, communication_name=doc.name)
+	_log_decision(ticket, TRIGGER_REQUESTER_REPLY, "enqueued", "conditions_met")

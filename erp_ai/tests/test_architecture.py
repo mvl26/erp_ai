@@ -258,6 +258,9 @@ STATUS_SCRIPT_FORBIDDEN = (
 	r"\.src =",
 	r"\.href =",
 	r"innerText =",
+	# CHG-008 T4: the panel only reads proposals; deciding goes through its own method, never the controller.
+	r"change_decision",
+	r"erp_ai_change_proposal\.",
 )
 # Regexes: the socket guard keeps setupForm (run many times) from registering listeners twice; the
 # `state.ticket = null` leave-page step keeps a left ticket's signals from showing (ADR-008 decision 6).
@@ -334,6 +337,20 @@ STATUS_SCRIPT_REQUIRED = (
 	r"isComposing\) \{\s*event\.preventDefault\(\);\s*submit\(\);",
 	r'addEventListener\("click", \(\) => \{\s*try \{\s*submit\(\);',
 	r"formEl,\s*slotEl",
+	# CHG-008 T4 (design 4.3): the proposals section, between the thread and the error line, and the fixed texts.
+	r"renderProposals",
+	r"threadEl,\s*proposalsTitle,\s*proposalsEl,\s*proposalErrorEl,\s*errorEl,\s*formEl,\s*slotEl",
+	r'TEXT_PROPOSALS_SECTION = "Đề xuất thay đổi"',
+	r'TEXT_OPEN_PROPOSAL = "Xem nội dung thay đổi"',
+	r'OPEN_PROPOSAL_LABEL = "Mở đề xuất để Duyệt hoặc Từ chối"',
+	r'TEXT_NEEDS_INSTRUCTOR = "Cần người có vai trò ERP AI Instructor duyệt\."',
+	r'TEXT_UNDO_AT_FORM = "Hoàn tác ở form"',
+	r'PROPOSAL_FORM_PREFIX = "/app/erp-ai-change-proposal/"',
+	r'window\.open\(PROPOSAL_FORM_PREFIX \+ encodeURIComponent\(name\), "_blank", "noopener"\)',
+	r"deciding: false",
+	r"decisionButtons: \[\]",
+	r"Array\.isArray\(proposals\)",
+	r"renderProposals\(data\)",
 	# T14 live updates (design F3): both listeners are named handlers registered once per socket, in the guard block.
 	r'state\.socket = socket;\s*socket\.on\(EVENT, onStatus\);\s*socket\.on\("docinfo_update", onDocinfo\);\s*socket\.on\("doc_update", onDocUpdate\);',
 	r"docinfo_update",

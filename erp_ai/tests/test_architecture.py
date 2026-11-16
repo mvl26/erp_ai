@@ -28,7 +28,14 @@ from pathlib import Path
 from typing import ClassVar, NamedTuple
 from unittest.mock import patch
 
-from erp_ai.constants import AGENT_STATUS_EVENT, AGENT_USER, PANEL_METHODS
+from erp_ai.agent import change_link
+from erp_ai.constants import (
+	AGENT_STATUS_EVENT,
+	AGENT_USER,
+	CHANGE_STATUS_APPLIED,
+	CHANGE_STATUS_PENDING,
+	PANEL_METHODS,
+)
 
 PACKAGE_ROOT = Path(__file__).resolve().parent.parent
 REPO_ROOT = PACKAGE_ROOT.parent
@@ -3038,6 +3045,21 @@ def check_agent_modules_never_reference_panel(sources: dict) -> list:
 		for needle in AGENT_PANEL_NEEDLES
 		if needle in text
 	]
+
+
+def check_status_script_constants_match_server(script: str) -> list:
+	"""CHG-008: the script's decision actions and statuses are the server's constants, not copies that can drift."""
+	expected = {
+		"ACTION_APPROVE": change_link.ACTION_APPROVE,
+		"ACTION_REJECT": change_link.ACTION_REJECT,
+		"STATUS_PENDING": CHANGE_STATUS_PENDING,
+		"STATUS_APPLIED": CHANGE_STATUS_APPLIED,
+	}
+	found = []
+	for name, value in expected.items():
+		if not re.search(rf"^\s*const {name} = \"{re.escape(value)}\";\s*$", script, re.MULTILINE):
+			found.append(f"{STATUS_SCRIPT_FILE}: const {name} is not the server value {value!r}")
+	return found
 
 
 def check_status_script_decides_once(script: str) -> list:
@@ -6156,6 +6178,22 @@ class TestArchitecture(unittest.TestCase):
 					{**scanned, "agent/messages.py": scanned["agent/messages.py"] + extra}
 				)
 				self.assertTrue(any(fragment in text for text in found), found)
+
+	def test_status_script_constants_match_the_server_values(self):
+		# CHG-008 F-2: a drifting action or status value would fail every click or show the wrong buttons
+		script = self.status_script()
+		self.assertEqual(check_status_script_constants_match_server(script), [])
+		for name, value in (
+			("ACTION_APPROVE", change_link.ACTION_APPROVE),
+			("ACTION_REJECT", change_link.ACTION_REJECT),
+			("STATUS_PENDING", CHANGE_STATUS_PENDING),
+			("STATUS_APPLIED", CHANGE_STATUS_APPLIED),
+		):
+			with self.subTest(constant=name):
+				drifted = script.replace(f'const {name} = "{value}";', f'const {name} = "{value}x";', 1)
+				self.assertNotEqual(drifted, script)
+				found = check_status_script_constants_match_server(drifted)
+				self.assertTrue(any(name in text for text in found), found)
 
 	def test_status_script_decides_by_one_post_then_one_reload(self):
 		# CHG-008 design 4.2, ADR-044 QĐ 7: one decision call, inside decide, one reload per answer, no timer

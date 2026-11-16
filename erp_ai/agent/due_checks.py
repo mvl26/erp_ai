@@ -6,6 +6,7 @@ reminder by (ticket, kind), once in the ticket's life. Nothing here calls the mo
 """
 
 import json
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 
@@ -42,6 +43,8 @@ COMMENT_DOCTYPE = "Comment"  # the record HD Ticket.new_comment makes (Document.
 NOTIFICATION_DOCTYPE = "Notification Log"
 LOCK_TIMEOUT_S = 5
 DUE_CATEGORIES = ("D", "E")
+BA_NOTE_CATEGORIES = ("C",)
+TASK_CATEGORIES = ("C", "D")
 DUE_KINDS = (KIND_DUE_SOON, KIND_OVERDUE)
 TEXT_BY_KIND = {
 	KIND_DUE_SOON: DUE_SOON_TEXT,
@@ -168,18 +171,30 @@ def _run_locked(now: datetime, logger) -> None:
 	due_field = ops_data.due_field(settings.field_due_date)
 	if not settings.field_due_date:
 		logger.info("due_checks: no due field configured, the deadline is resolution_by")
-	due_rows, capped = _candidates(DUE_CATEGORIES, reverse_map, due_field)
-	sent = sent_keys([row.name for row in due_rows])
-	reminders = [
-		reminder
-		for reminder in _due_reminders(due_rows, due_field, now, settings.due_reminder_hours)
-		if reminder.key not in sent
-	]
+	due_rows, due_capped = _candidates(DUE_CATEGORIES, reverse_map, due_field)
+	ba_note_rows, ba_note_capped = _candidates(BA_NOTE_CATEGORIES, reverse_map)
+	task_rows, task_capped = _candidates(TASK_CATEGORIES, reverse_map)
+	sent = sent_keys(sorted({row.name for row in (*due_rows, *ba_note_rows, *task_rows)}))
+	candidates = (
+		*_due_reminders(due_rows, due_field, now, settings.due_reminder_hours),
+		*_milestone_reminders(
+			ba_note_rows,
+			KIND_BA_NOTE_MISSING,
+			now,
+			settings.ba_note_due_hours,
+			ops_data.tickets_with_ba_note,
+		),
+		*_milestone_reminders(
+			task_rows, KIND_TASK_MISSING, now, settings.task_due_days * 24, ops_data.tickets_with_task
+		),
+	)
+	reminders = [reminder for reminder in candidates if reminder.key not in sent]
 	people = _people_in_charge(sorted({reminder.ticket for reminder in reminders}))
 	counts = dict.fromkeys(SUMMARY_COUNTS, 0)
 	for reminder in sorted(reminders, key=lambda reminder: (reminder.created, reminder.ticket)):
 		if counted := _remind(reminder, people.get(reminder.ticket, []), settings):
 			counts[counted] += 1
+	capped = due_capped or ba_note_capped or task_capped
 	logger.info(SUMMARY, *(counts[name] for name in SUMMARY_COUNTS), capped)
 
 
@@ -213,6 +228,16 @@ def _due_reminders(rows: list, due_field: str | None, now: datetime, hours: int)
 		if kind := due_kind(deadline, now, hours):
 			reminders.append(_Reminder(row.name, row.creation, kind, deadline))
 	return reminders
+
+
+def _milestone_reminders(
+	rows: list, kind: str, now: datetime, hours: float, reached: Callable[[list[str]], set[str]]
+) -> list[_Reminder]:
+	"""`kind` for each row `hours` or more after its creation whose milestone `reached` (one query for the batch,
+	the 08:00 report's helper) does not find."""
+	due = [row for row in rows if milestone_due(row.creation, now, hours)]
+	done = reached([row.name for row in due])
+	return [_Reminder(row.name, row.creation, kind) for row in due if row.name not in done]
 
 
 # Controller ruling R28: the people in charge are the users of the ticket's open ToDo rows (ADR-019 QĐ 5 keeps the
@@ -270,10 +295,12 @@ def _value_after(reminder: _Reminder, users: list[str]) -> dict:
 def _remind(reminder: _Reminder, users: list[str], settings) -> str | None:
 	"""One (ticket, kind): a comment on a ticket the agent may take (policy.can_send_ticket); else a coded notice to
 	each person in charge, or nothing and no key when there is none (A-U5b-6: tried again next run). Returns the
-	summary count to add one to."""
+	summary count to add one to, or None when nothing is sent."""
 	if policy.can_send_ticket(reminder.ticket):
 		_remind_on_ticket(reminder, users, settings)
 		return reminder.kind
+	if reminder.kind not in CODE_SUBJECT:
+		return None  # no BA note check on a ticket the agent may not take: only the bot writes one (A-U5b-4)
 	if not users:
 		return NO_ASSIGNEE
 	_notify_by_code(reminder, users, settings)

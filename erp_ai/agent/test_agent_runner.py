@@ -1,4 +1,5 @@
 import ast
+import contextlib
 import copy
 import inspect
 import json
@@ -12,7 +13,7 @@ from unittest.mock import MagicMock, patch
 
 import frappe
 from frappe.tests.utils import FrappeTestCase
-from frappe.utils import escape_html
+from frappe.utils import background_jobs, escape_html
 from helpdesk.test_utils import make_ticket
 
 from erp_ai import handlers, tasks
@@ -37,7 +38,7 @@ from erp_ai.agent.prompts import (
 	build_reason_system,
 	build_routing_table,
 )
-from erp_ai.agent.queue import requester_reply_key
+from erp_ai.agent.queue import PENDING_JOB_IDS_FLAG, enqueue_agent_run, requester_reply_key
 from erp_ai.agent.run_log import action_entry, write_entry
 from erp_ai.agent.tools import propose_change, registry, site_api, write_ticket
 from erp_ai.agent.tools.read import TOOL_RESULT_MAX_CHARS
@@ -59,6 +60,7 @@ from erp_ai.constants import (
 	PROPOSAL_DOCTYPE,
 	ROLE_INSTRUCTOR,
 	SETTING_DOCTYPE,
+	TITLE_EVENT_FAILED,
 	TITLE_RUN_FAILED,
 	TITLE_WRONG_USER,
 )
@@ -115,6 +117,9 @@ class RunnerTestBase(FrappeTestCase):
 		commit_guard = patch.object(frappe.db, "commit", side_effect=AssertionError("test must not commit"))
 		commit_guard.start()
 		self.addCleanup(commit_guard.stop)
+		# CHG-009 (STD-TEST-6): a handler or the queue called with the bot on reads the RQ job state from this stub
+		# (no job: every call is new), never from the shared Redis
+		stub_job_states(self, {})
 		# Create the ticket before enabling the agent so the insert handler enqueues nothing.
 		self.ticket = make_ticket(subject=f"{PREFIX}runner ticket")
 		set_agent_settings(
@@ -230,7 +235,10 @@ class TestRunner(RunnerTestBase):
 		self._run()
 
 		self.assertEqual(self.gateway.call_count, 0)
-		self.assertEqual(self._entries(), [])
+		# ADR-003 Amendment 1 (CHG-009): the stop leaves one skip row naming the switch, no longer no row
+		self.assertEqual(
+			[(e.entry_type, e.stop_reason) for e in self._entries()], [("skip", "agent_disabled")]
+		)
 
 	def test_not_sendable_at_run_time_no_model_call(self):
 		frappe.db.set_value("HD Ticket", self.ticket.name, "ai_opt_out", 1)
@@ -238,7 +246,10 @@ class TestRunner(RunnerTestBase):
 
 		self.assertEqual(self.gateway.call_count, 0)
 		entries = self._entries()
-		self.assertEqual([(e.entry_type, e.stop_reason) for e in entries], [("skip", "not_sendable")])
+		# ADR-003 Amendment 1 (CHG-009): the skip row names the kind policy.send_refusal gives
+		self.assertEqual(
+			[(e.entry_type, e.stop_reason) for e in entries], [("skip", "not_sendable:opted_out")]
+		)
 		self.assertEqual(entries[0].trigger, "ticket_insert")
 
 	def test_run_over_setting_limit_same_day_no_call(self):
@@ -261,14 +272,20 @@ class TestRunner(RunnerTestBase):
 		frappe.db.set_value("HD Ticket", self.ticket.name, "ai_opt_out", 1)
 		self._run()
 
-		self.assertEqual(self._entries(), [])
+		# ADR-003 Amendment 1 (CHG-009): the switch is checked first and its stop now leaves one skip row
+		self.assertEqual(
+			[(e.entry_type, e.stop_reason) for e in self._entries()], [("skip", "agent_disabled")]
+		)
 
 	def test_not_sendable_wins_over_daily_limit(self):
 		frappe.db.set_value("HD Ticket", self.ticket.name, "ai_opt_out", 1)
 		self._seed_runs(DAILY_LIMIT)
 		self._run()
 
-		self.assertEqual([e.stop_reason for e in self._entries(entry_type="skip")], ["not_sendable"])
+		# ADR-003 Amendment 1 (CHG-009): the skip row names the kind policy.send_refusal gives
+		self.assertEqual(
+			[e.stop_reason for e in self._entries(entry_type="skip")], ["not_sendable:opted_out"]
+		)
 
 	def test_deleted_ticket_logs_skip_without_failing(self):
 		missing = f"{PREFIX}missing-ticket"
@@ -286,7 +303,8 @@ class TestRunner(RunnerTestBase):
 		]
 		self.assertEqual(
 			[(r.entry_type, r.stop_reason, r.ticket, r.error) for r in new_rows],
-			[("skip", "not_sendable", None, f"ticket_missing {missing}")],
+			# ADR-003 Amendment 1 (CHG-009): the skip row names the kind policy.send_refusal gives
+			[("skip", "not_sendable:missing", None, f"ticket_missing {missing}")],
 		)
 		self.assertEqual(self.gateway.call_count, 0)
 
@@ -518,7 +536,11 @@ class TestRunner(RunnerTestBase):
 	def test_key_state_committed_and_not_rolled_back_when_run_fails(self):
 		events = self._simulate_key_failure_then(RuntimeError("boom"))
 
-		self.assertEqual(events, [("gateway_write",), ("commit", KEY_STATUS_BAD_KEY)])
+		# ADR-048 QĐ 2, design 3.7 (CHG-009): the run's run_failed end row is committed once more before its `done`;
+		# the key state is still committed first and nothing is rolled back
+		self.assertEqual(
+			events, [("gateway_write",), ("commit", KEY_STATUS_BAD_KEY), ("commit", KEY_STATUS_BAD_KEY)]
+		)
 
 
 L1_TYPE = f"{PREFIX}loại"
@@ -1289,8 +1311,9 @@ class TestRunnerReasoning(RunnerTestBase):
 		):
 			self._run("comment_mention")
 
-		# per turn: the gateway call commits its key state (0, 1 rows), then the entry commits itself (1, 2 rows)
-		self.assertEqual(commits, [0, 1, 1, 2])
+		# per turn: the gateway call commits its key state (0, 1 rows), then the entry commits itself (1, 2 rows);
+		# ADR-048 QĐ 2, design 3.7 (CHG-009): then the run's end row, a run_event row not counted here, is committed
+		self.assertEqual(commits, [0, 1, 1, 2, 2])
 
 	# AC-10: skipped fields of set_classification on a reason turn
 
@@ -5599,7 +5622,8 @@ class TestExcludedByClassification(RunnerTestBase):
 		self._run("comment_mention")
 		self.assertEqual(self.gateway.call_count, 1)
 		(skip,) = self._entries(entry_type="skip")
-		self.assertEqual(skip.stop_reason, "not_sendable")
+		# ADR-003 Amendment 1 (CHG-009): the skip row names the kind policy.send_refusal gives
+		self.assertEqual(skip.stop_reason, "not_sendable:excluded_by_classification")
 
 	def test_department_named_as_excluded_team(self):
 		# not in the department table, so decide_route asks nothing: the department itself names an excluded team
@@ -5696,7 +5720,8 @@ class TestExcludedByClassification(RunnerTestBase):
 		self._run("comment_mention")
 		self.assertEqual(self._tasks(), ["classify"])
 		(skip,) = self._entries(entry_type="skip")
-		self.assertEqual(skip.stop_reason, "not_sendable")
+		# ADR-003 Amendment 1 (CHG-009): the skip row names the kind policy.send_refusal gives
+		self.assertEqual(skip.stop_reason, "not_sendable:excluded_by_classification")
 
 	def test_group_set_excluded_before_reply_not_reclassified(self):
 		# U2-R1, a pin: a person puts the ticket in an excluded team after run 1; check (c) of _run already refuses
@@ -5714,7 +5739,8 @@ class TestExcludedByClassification(RunnerTestBase):
 		# run 1's calls only: one classification, its question
 		self.assertEqual(self._tasks(), ["classify", "reason"])
 		(skip,) = self._entries(entry_type="skip")
-		self.assertEqual(skip.stop_reason, "not_sendable")
+		# ADR-003 Amendment 1 (CHG-009): the skip row names the kind policy.send_refusal gives
+		self.assertEqual(skip.stop_reason, "not_sendable:excluded_team")
 
 
 class TestExcludedTitle(RunnerTestBase):
@@ -5734,7 +5760,8 @@ class TestExcludedTitle(RunnerTestBase):
 
 		self.assertEqual(self.gateway.call_count, 0)
 		(skip,) = self._entries(entry_type="skip")
-		self.assertEqual(skip.stop_reason, "not_sendable")
+		# ADR-003 Amendment 1 (CHG-009): the skip row names the kind policy.send_refusal gives
+		self.assertEqual(skip.stop_reason, "not_sendable:excluded_title")
 
 
 class TestPermissionVectorsLogged(RunnerTestBase):
@@ -6082,7 +6109,6 @@ class TestRequesterReplyRun(RequesterReplyRunBase):
 	def test_reply_run_with_its_call_row_still_runs(self):
 		# ADR-033 QĐ 6, ADR-048 QĐ 4 (CHG-009): the queue's call_received row carries the event key, yet only a row of
 		# the run makes the event handled at (r1), so the run that row announced still runs
-		stub_job_states(self, {})
 		self._bot_message()
 		reply = self._message()
 		(job,) = self._handler_jobs(reply)
@@ -6546,3 +6572,378 @@ class TestCategoryC(GuidanceTestBase):
 				line = escape_html(write_ticket.TASK_DONE.format(task=tasks[subject], hours=text))
 				self.assertEqual(done.count(line), 1)
 		self.assertEqual(len(self._task_entries()), 3)
+
+
+END_ROW_THINKING = f"{PREFIX}bot đang xem phiếu"
+EXCLUDED_TITLE_PREFIX = "[ERPAI-T3]"
+END_ROW_CASE = "erp_ai_end_row_case"
+# The parameters frappe.enqueue keeps for itself: every other keyword reaches the job as `method(**kwargs)`.
+ENQUEUE_OWN_PARAMETERS = frozenset(inspect.signature(background_jobs.enqueue).parameters)
+
+
+class TestRunEndRow(RequesterReplyRunBase):
+	"""CHG-009 AC-4, AC-5, AC-8, AC-11 (ADR-048 QĐ 2, 3; ADR-003, ADR-008, ADR-033 Amendment 1; design 3.7): a run past
+	the gates ends with exactly one run_event row, run_done or run_failed, written before its `done`; an early stop ends
+	on its skip row, whose code names the kind of stop; a bookkeeping stop writes no end row. The panel reads its line
+	from these rows (T4); this class checks the rows and the signals."""
+
+	def setUp(self):
+		super().setUp()
+		# every value a case depends on is set here, never read from the shared site (STD-TEST-6, STD-TEST-8)
+		frappe.db.set_single_value(SETTING_DOCTYPE, "thinking_text", END_ROW_THINKING)
+		set_agent_settings(excluded_teams="", excluded_title_prefixes="")
+		self.addCleanup(frappe.cache.hdel, "assignment_rule_map", "HD Ticket")
+		# (code, signals out) of every run_event row as it is written
+		self.events_at = []
+		real_write_entry = run_log.write_entry
+
+		def recording_write_entry(**fields):
+			if fields.get("entry_type") == "run_event":
+				self.events_at.append((fields.get("stop_reason"), len(self.signals)))
+			return real_write_entry(**fields)
+
+		write_patch = patch.object(run_log, "write_entry", side_effect=recording_write_entry)
+		write_patch.start()
+		self.addCleanup(write_patch.stop)
+
+	def _fresh(self, results=()):
+		"""Start a case: Administrator, the gateway's results, nothing recorded yet."""
+		frappe.set_user("Administrator")
+		self.gateway.results = list(results)
+		self.gateway.calls.clear()
+		self.signals.clear()
+		self.events_at.clear()
+		self.log_error.reset_mock()
+
+	def _row_names(self):
+		return set(frappe.get_all(LOG_DOCTYPE, filters={"ticket": self.ticket.name}, pluck="name"))
+
+	def _new_rows(self, before):
+		"""The ticket's rows not in `before`, oldest first."""
+		rows = frappe.get_all(
+			LOG_DOCTYPE,
+			filters={"ticket": self.ticket.name},
+			fields=["name", "entry_type", "stop_reason", "run_id", "creation", "tools_called"],
+			order_by="creation asc",
+		)
+		return [row for row in rows if row.name not in before]
+
+	def _ends(self, rows):
+		"""The rows the panel reads as a run's end: its run_event row or its skip row."""
+		return [row for row in rows if row.entry_type in ("run_event", "skip")]
+
+	def _states(self):
+		return [signal["message"]["state"] for signal in self.signals]
+
+	def _at_daily_limit(self):
+		set_agent_settings(max_runs_per_ticket_per_day=DAILY_LIMIT)
+		self._seed_runs(DAILY_LIMIT)
+
+	def _in_excluded_team(self, team):
+		set_agent_settings(excluded_teams=team)
+		frappe.db.set_value("HD Ticket", self.ticket.name, "agent_group", team, update_modified=False)
+
+	def _with_excluded_title(self):
+		set_agent_settings(excluded_title_prefixes=EXCLUDED_TITLE_PREFIX)
+		frappe.db.set_value(
+			"HD Ticket",
+			self.ticket.name,
+			"subject",
+			f"{EXCLUDED_TITLE_PREFIX} {PREFIX}nghỉ phép",
+			update_modified=False,
+		)
+
+	def _excluded_by_classification(self):
+		frappe.db.set_value("HD Ticket", self.ticket.name, "agent_group", None, update_modified=False)
+		write_entry(
+			ticket=self.ticket.name,
+			run_id=f"{PREFIX}excluded-run",
+			entry_type="classify",
+			trigger="ticket_insert",
+			turn=0,
+			stop_reason=policy.EXCLUDED_BY_CLASSIFICATION,
+		)
+
+	def _with_article(self):
+		set_agent_settings(kb_draft_enabled=1)
+		frappe.db.set_value(
+			"HD Ticket",
+			self.ticket.name,
+			{"status": "Resolved", "status_category": "Resolved", "resolution_details": RESOLUTION},
+			update_modified=False,
+		)
+		frappe.get_doc(
+			{
+				"doctype": "HD Article",
+				"title": f"{PREFIX}bài đã có",
+				"content": "<p>x</p>",
+				"status": "Draft",
+				"ai_source_ticket": self.ticket.name,
+			}
+		).insert(ignore_permissions=True)
+
+	def test_one_end_row_per_run_and_its_line(self):
+		# AC-4: a run that is done, one that failed and one out of runs today each end with exactly one row the panel
+		# reads as its line, the run's last row and of its own run_id; a step that only reports a failure (unparseable
+		# classification, a failing tool, the last allowed turn) still ends done (design 3.7)
+		cases = (
+			("answered", "comment_mention", [make_model_result(text=f"{PREFIX}xong")], None, "run_done"),
+			("unparseable", "ticket_insert", [make_model_result(text="không phải JSON")], None, "run_done"),
+			(
+				"tool error",
+				"comment_mention",
+				[tool_turn(tool_use("t1", "drop_all_tables"))],
+				None,
+				"run_done",
+			),
+			(
+				"max turns",
+				"comment_mention",
+				[tool_turn(tool_use("t1", "get_ticket"))],
+				lambda: set_agent_settings(max_turns_per_run=1),
+				"run_done",
+			),
+			(
+				"gateway error",
+				"comment_mention",
+				[GatewayError("server_error", status=500)],
+				None,
+				"run_failed",
+			),
+			("out of runs", "comment_mention", [], self._at_daily_limit, "daily_limit"),
+		)
+		for name, trigger, results, arrange, code in cases:
+			with self.subTest(name):
+				frappe.db.savepoint(END_ROW_CASE)
+				try:
+					self._fresh(results)
+					if arrange:
+						arrange()
+					before = self._row_names()
+
+					self._run(trigger)
+
+					rows = self._new_rows(before)
+					(end,) = self._ends(rows)
+					self.assertEqual(
+						(end.entry_type, end.stop_reason),
+						("skip" if code == "daily_limit" else "run_event", code),
+					)
+					self.assertEqual({row.run_id for row in rows}, {end.run_id})
+					self.assertEqual(end.creation, max(row.creation for row in rows))
+					self.assertEqual(self._states().count("done"), 1)
+				finally:
+					frappe.db.rollback(save_point=END_ROW_CASE)
+
+	def test_bookkeeping_stops_leave_no_line(self):
+		# AC-4, A-3: an event already handled (r1) writes nothing and sends nothing; a message gone, a message a newer
+		# one supersedes and a ticket with its article write their skip row and no end row, so the panel has no line;
+		# a skip row still gets its one `done` (ADR-008 Amendment 1)
+		handled = self._message()
+		self._reply_run(handled)
+		gone = self._message(minutes=1)
+		frappe.db.delete("Communication", gone)
+		older, _newer = self._message(minutes=2), self._message(minutes=3)
+		cases = (
+			("already_handled", lambda: self._reply_run(handled), None, []),
+			("event_missing", lambda: self._reply_run(gone), None, [("skip", "event_missing")]),
+			("superseded", lambda: self._reply_run(older), None, [("skip", "superseded")]),
+			(
+				"kb_exists",
+				lambda: runner.run_for_ticket(self.ticket.name, KB_DRAFT),
+				self._with_article,
+				[("skip", "kb_exists")],
+			),
+		)
+		for name, act, arrange, expected in cases:
+			with self.subTest(name):
+				frappe.db.savepoint(END_ROW_CASE)
+				try:
+					self._fresh()
+					if arrange:
+						arrange()
+					before = self._row_names()
+
+					act()
+
+					rows = self._new_rows(before)
+					self.assertEqual([(row.entry_type, row.stop_reason) for row in rows], expected)
+					self.assertEqual(self.events_at, [])
+					self.assertEqual(self._states(), ["done"] if expected else [])
+					self.assertEqual(self.gateway.call_count, 0)
+				finally:
+					frappe.db.rollback(save_point=END_ROW_CASE)
+
+	def test_run_stops_carry_typed_codes(self):
+		# AC-5 (a)-(g) when the run starts (ADR-003 Amendment 1): one skip row with the code of the kind, no model
+		# call, no job queued
+		team = make_team(self)
+		cases = (
+			("agent_disabled", lambda: set_agent_settings(enabled=0)),
+			("level_L0", lambda: set_agent_settings(permission_level="L0")),
+			(
+				"not_sendable:opted_out",
+				lambda: frappe.db.set_value("HD Ticket", self.ticket.name, "ai_opt_out", 1),
+			),
+			("not_sendable:excluded_team", lambda: self._in_excluded_team(team)),
+			("not_sendable:excluded_title", self._with_excluded_title),
+			("not_sendable:excluded_by_classification", self._excluded_by_classification),
+			("daily_limit", self._at_daily_limit),
+		)
+		for code, arrange in cases:
+			with self.subTest(code):
+				frappe.db.savepoint(END_ROW_CASE)
+				try:
+					self._fresh([make_model_result(text=f"{PREFIX}xong")])
+					arrange()
+					before = self._row_names()
+
+					with patch.object(frappe, "enqueue") as enqueue:
+						self._run("comment_mention")
+
+					self.assertEqual(
+						[(row.entry_type, row.stop_reason) for row in self._new_rows(before)],
+						[("skip", code)],
+					)
+					self.assertEqual(self.gateway.call_count, 0)
+					enqueue.assert_not_called()
+				finally:
+					frappe.db.rollback(save_point=END_ROW_CASE)
+
+	def test_failed_end_row_on_each_error(self):
+		# AC-8: a gateway error of the classification or of the reasoning, the time budget, an unexpected error: one
+		# run_failed row of the run, written before its `done`
+		cases = (
+			("classify gateway error", "ticket_insert", [GatewayError("server_error", status=500)], None),
+			("reason gateway error", "comment_mention", [GatewayError("server_error", status=529)], None),
+			("deadline", "comment_mention", [GatewayError("deadline")], None),
+			(
+				"unexpected error",
+				"comment_mention",
+				[make_model_result()],
+				lambda: patch.object(runner, "build_initial_message", side_effect=RuntimeError),
+			),
+		)
+		for name, trigger, results, failure in cases:
+			with self.subTest(name):
+				frappe.db.savepoint(END_ROW_CASE)
+				try:
+					self._fresh(results)
+					before = self._row_names()
+
+					with failure() if failure else contextlib.nullcontext():
+						self._run(trigger)
+
+					self.assertEqual(self.events_at, [("run_failed", len(self.signals) - 1)])
+					self.assertEqual(self._states()[-1], "done")
+					(end,) = [row for row in self._new_rows(before) if row.entry_type == "run_event"]
+					self.assertEqual(end.run_id, self.signals[-1]["message"]["run_id"])
+				finally:
+					frappe.db.rollback(save_point=END_ROW_CASE)
+
+	def test_forced_end_row_failure_changes_nothing(self):
+		# AC-11, ADR-048 QĐ 3: a failing end row leaves one Error Log and no row; the run's comment, ticket fields,
+		# Tasks, rows, model calls and signals are those of the same run whose end row is written
+		real_write_entry = run_log.write_entry
+
+		def failing_events(**fields):
+			if fields.get("entry_type") == "run_event":
+				raise RuntimeError(f"{PREFIX}end row down")
+			return real_write_entry(**fields)
+
+		fields = [field for field in TICKET_FIELDS if field not in ("modified", "ai_updated_at")]
+		outcomes, end_rows, error_titles = [], [], []
+		for forced in (False, True):
+			frappe.db.savepoint(END_ROW_CASE)
+			try:
+				self._fresh(
+					[
+						classify_at(90),
+						tool_turn(analysis_call("t1")),
+						make_model_result(text=f"{PREFIX}xong"),
+					]
+				)
+				comments = self._comment_names()
+				before = self._row_names()
+
+				with patch.object(
+					run_log, "write_entry", side_effect=failing_events if forced else real_write_entry
+				):
+					self._run()
+
+				rows = self._new_rows(before)
+				outcomes.append(
+					{
+						"comments": sorted(self._new_comments(comments).values()),
+						"fields": frappe.db.get_value("HD Ticket", self.ticket.name, fields, as_dict=True),
+						"tasks": frappe.db.count("Task", {"ai_ticket": self.ticket.name}),
+						"rows": [
+							(row.entry_type, row.stop_reason, row.tools_called)
+							for row in rows
+							if row.entry_type != "run_event"
+						],
+						"calls": self.gateway.call_count,
+						"states": self._states(),
+					}
+				)
+				end_rows.append(
+					[(row.entry_type, row.stop_reason) for row in rows if row.entry_type == "run_event"]
+				)
+				error_titles.append([invocation.args[0] for invocation in self.log_error.call_args_list])
+			finally:
+				frappe.db.rollback(save_point=END_ROW_CASE)
+
+		self.assertEqual(end_rows, [[("run_event", "run_done")], []])
+		self.assertEqual(error_titles, [[], [TITLE_EVENT_FAILED]])
+		self.assertTrue(outcomes[0]["comments"])
+		self.assertEqual(outcomes[0]["states"][-1], "done")
+		self.assertEqual(outcomes[1], outcomes[0])
+
+	def test_job_runs_with_the_kwargs_the_queue_gives(self):
+		# review-02 (T2): the queue gives every agent job its run_id and Frappe runs the job as `method(**kwargs)`; the
+		# run takes that run_id, so the call_received row, the run's rows and its end row share it (design 3.7). A job
+		# without one (queued before the deploy, or merged) gets a fresh uuid.
+		reply = self._message()
+		cases = (
+			("ticket_insert", {}, [classify_at(90), make_model_result()]),
+			(REQUESTER_REPLY, {"communication_name": reply}, [make_model_result()]),
+		)
+		for trigger, extra, results in cases:
+			with self.subTest(trigger):
+				frappe.db.savepoint(END_ROW_CASE)
+				try:
+					self._fresh(results)
+					# with the site's bot on, setUp's ticket insert already queued its job in this transaction
+					frappe.flags.pop(PENDING_JOB_IDS_FLAG, None)
+					before = self._row_names()
+					with patch.object(frappe, "enqueue") as enqueue:
+						self.assertTrue(enqueue_agent_run(self.ticket.name, trigger, **extra))
+					(job,) = [
+						call.kwargs for call in enqueue.call_args_list if call.args[0] == RUN_FOR_TICKET
+					]
+					kwargs = {key: value for key, value in job.items() if key not in ENQUEUE_OWN_PARAMETERS}
+
+					runner.run_for_ticket(**kwargs)
+
+					rows = self._new_rows(before)
+					self.assertGreater(self.gateway.call_count, 0)
+					self.assertEqual({row.run_id for row in rows}, {kwargs["run_id"]})
+					self.assertEqual(
+						sorted(row.stop_reason for row in rows if row.entry_type == "run_event"),
+						["call_received", "run_done"],
+					)
+				finally:
+					frappe.db.rollback(save_point=END_ROW_CASE)
+		for run_id in (None, ""):
+			with self.subTest(run_id=run_id):
+				frappe.db.savepoint(END_ROW_CASE)
+				try:
+					self._fresh([make_model_result()])
+					before = self._row_names()
+
+					runner.run_for_ticket(self.ticket.name, "comment_mention", run_id=run_id)
+
+					(run_id_given,) = {row.run_id for row in self._new_rows(before)}
+					self.assertRegex(run_id_given, r"^[0-9a-f]{32}$")
+				finally:
+					frappe.db.rollback(save_point=END_ROW_CASE)

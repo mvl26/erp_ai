@@ -313,7 +313,8 @@ CONSOLE_TOOLS_BLOCK = """SCRIPT BENCH CONSOLE — CHỈ KHI KHÔNG CÓ API, NGƯ
 - Script chạy một lần như bench console, trong một giao dịch: lỗi thì không lưu gì. Không gọi frappe.db.commit hay frappe.db.rollback. Không hoàn tác được.
 - Script ngắn, chỉ làm đúng việc được nhờ, và print ra những gì đã đổi để người kiểm lại.
 - Chỉ import frappe, erpnext, hrms, helpdesk, json, datetime, decimal, re, math. Không đụng cài đặt, nhật ký, đề xuất hay khóa của ERP AI, mật khẩu, khóa API, cấu hình site, file hay tiến trình.
-- Không bao giờ nói script đã chạy; chỉ nói đã tạo đề xuất và đang chờ người bấm Duyệt."""
+- Không bao giờ nói script đã chạy; chỉ nói đã tạo đề xuất và đang chờ người bấm Duyệt.
+- Với script console, nút Duyệt chỉ nằm trong khung Trao đổi với bot, không nằm trong comment."""
 
 # Appended last whenever the ticket grants a tool that changes the system (records, code proposals).
 ACT_NOW_BLOCK = """LÀM LUÔN, KHÔNG HỎI LẠI

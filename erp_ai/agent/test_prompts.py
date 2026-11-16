@@ -339,6 +339,13 @@ class TestReasonSystem(FrappeTestCase):
 			"Không bao giờ nói script đã chạy",
 		):
 			self.assertIn(anchor, block)
+		# CHG-010 final review F-8: ACT_NOW_BLOCK says the buttons sit in the tool's comment; for a script they do not,
+		# so the console block ends on that correction, read before ACT_NOW_BLOCK.
+		self.assertTrue(
+			block.endswith(
+				"\n- Với script console, nút Duyệt chỉ nằm trong khung Trao đổi với bot, không nằm trong comment."
+			)
+		)
 
 	def test_each_block_present_iff_its_flag(self):
 		blocks = dict(_flag_blocks())

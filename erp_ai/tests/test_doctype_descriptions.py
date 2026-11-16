@@ -665,10 +665,13 @@ CONSOLE_FIELD_SPEC = {
 	"fieldtype": "Check",
 	"label": "Cho phép chạy bench console (qua duyệt)",
 	"default": "0",
+	# CHG-010 final review F-9: the text says the script runs as Administrator; the first clause is shorter to
+	# stay within the 400-character cap.
 	"description": "Bật thì bot được soạn script Python chạy như bench console khi không có API hay công cụ "
-	"bản ghi nào làm được việc. Mỗi script là một đề xuất Chờ duyệt, chỉ duyệt bằng nút Duyệt trong khung "
+	"nào làm được. Mỗi script là một đề xuất Chờ duyệt, chỉ duyệt bằng nút Duyệt trong khung "
 	"Trao đổi với bot (vai trò ERP AI Instructor). Chạy một lần trong một giao dịch, lỗi thì không lưu gì, "
-	"không hoàn tác được. Độc lập với ô sửa code. Tắt thì script đã duyệt cũng không chạy.",
+	"không hoàn tác được. Độc lập với ô sửa code. Tắt thì script đã duyệt cũng không chạy. "
+	"Script chạy với quyền Administrator.",
 }
 
 

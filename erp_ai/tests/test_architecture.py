@@ -376,7 +376,8 @@ STATUS_SCRIPT_REQUIRED = (
 	# CHG-009 design 4.1, 8.2 (A-7): the send box closes the panel; the indicator's slot moved into the status line.
 	r"threadEl,\s*proposalErrorEl,\s*errorEl,\s*formEl\s*\)",
 	# CHG-010: console cards show the script and its result; cards are ordered with the messages by time.
-	r'TEXT_CONSOLE_SCRIPT = "Script sẽ chạy:"',
+	# CHG-010 final review F-9: the label says the script runs as Administrator.
+	r'TEXT_CONSOLE_SCRIPT = "Script sẽ chạy \(quyền Administrator\):"',
 	r'TEXT_CONSOLE_OUTPUT = "Kết quả:"',
 	# CHG-010 final review F-5: an empty script or output (None from the server) draws no block.
 	r"if \(card\?\.script\) \{\s*addBlock\(TEXT_CONSOLE_SCRIPT, card\.script\);",

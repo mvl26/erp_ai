@@ -28,7 +28,7 @@ function setupForm({ doc, call, router }) {
 		const TEXT_EMPTY_MESSAGE = "Hãy nhập nội dung trước khi gửi.";
 		const TEXT_TOO_LONG = "Tin dài quá 2000 ký tự.";
 		const TEXT_SEND_FAILED = "Không gửi được tin. Chữ bạn gõ vẫn còn, hãy thử lại.";
-		const TEXT_CONSOLE_SCRIPT = "Script sẽ chạy:";
+		const TEXT_CONSOLE_SCRIPT = "Script sẽ chạy (quyền Administrator):";
 		const TEXT_CONSOLE_OUTPUT = "Kết quả:";
 		const TEXT_OPEN_PROPOSAL = "Xem nội dung thay đổi";
 		const OPEN_PROPOSAL_LABEL = "Mở đề xuất để Duyệt hoặc Từ chối";

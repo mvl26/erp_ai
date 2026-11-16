@@ -28,7 +28,7 @@ from pathlib import Path
 from typing import ClassVar, NamedTuple
 from unittest.mock import patch
 
-from erp_ai.constants import AGENT_STATUS_EVENT, AGENT_USER, PANEL_METHODS
+from erp_ai.constants import AGENT_STATUS_EVENT, AGENT_USER, LESSON_STATUS_ACTIVE, PANEL_METHODS
 
 PACKAGE_ROOT = Path(__file__).resolve().parent.parent
 REPO_ROOT = PACKAGE_ROOT.parent
@@ -11416,6 +11416,470 @@ class TestTicketPolicyRules(unittest.TestCase):
 					"not a string literal",
 				),
 				"the declaration gone": ({CONSTANTS_FILE: clean[CONSTANTS_FILE]}, "missing or not a literal"),
+			},
+		)
+
+
+# ---------------------------------------------------------------------------------------------------
+# FEAT-008 lesson store and its reader (ADR-045 Ràng buộc, ADR-046 Ràng buộc, Task 10)
+# ---------------------------------------------------------------------------------------------------
+
+LESSONS_FILE = "agent/lessons.py"
+LESSON_READ_FILE = "agent/lesson_read.py"
+LESSONS_MODULE = module_name(LESSONS_FILE)
+LESSON_READ_MODULE = module_name(LESSON_READ_FILE)
+# The only places that name the lesson DocTypes: the store, the reader, their controllers, constants and hooks.
+LESSON_DOCTYPE_FILES = (CONSTANTS_FILE, LESSONS_FILE, LESSON_READ_FILE, HOOKS_FILE)
+LESSON_DOCTYPE_DIRS = ("erp_ai_agent/doctype/erp_ai_lesson/", "erp_ai_agent/doctype/erp_ai_lesson_event/")
+LESSON_DOCTYPE_CONSTANTS = ("LESSON_DOCTYPE", "LESSON_EVENT_DOCTYPE")
+LESSON_DOCTYPE_TEXT = "ERP AI Lesson"  # both DocType names start with it
+LESSON_DOCTYPE_JSONS = tuple(f"{folder}{Path(folder).name}.json" for folder in LESSON_DOCTYPE_DIRS)
+LESSON_WRITE_RIGHTS = ("create", "write", "delete", "submit", "cancel", "amend")
+LESSON_READ_FUNCTION = "relevant_lessons"
+LESSON_ACTIVE_CONSTANT = "LESSON_STATUS_ACTIVE"
+LESSON_STATUS_FIELD = "lesson_status"
+# Modules that get lessons only as values from the runner: they never import the store or the reader.
+LESSON_FREE_MODULES = ("erp_ai.agent.prompts", "erp_ai.agent.tools", "erp_ai.gateway", "erp_ai.eval")
+# Global Constraints of FEAT-008 batch 1: (scope module, forbidden modules, reason), read by check_layer_imports.
+LESSON_IMPORT_RULES = (
+	(
+		"erp_ai.agent",
+		("erp_ai.handlers", "erp_ai.tasks", "erp_ai.install", "erp_ai.eval", "erp_ai.erp_ai_agent"),
+		"ADR-045: agent core never imports handlers, the scheduler, install, eval or doctype controllers",
+	),
+	(
+		LESSONS_MODULE,
+		("erp_ai.agent.runner", "erp_ai.gateway", "erp_ai.agent.changes"),
+		"ADR-045: the lesson store never runs the agent, calls the model or reaches the change job",
+	),
+	(
+		LESSON_READ_MODULE,
+		(LESSONS_MODULE, "erp_ai.gateway"),
+		"ADR-046: the lesson reader never imports the store or calls the model",
+	),
+	*(
+		(
+			scope,
+			(LESSONS_MODULE, LESSON_READ_MODULE),
+			"ADR-046: prompts, tools, gateway and eval get lessons as values from the runner, never from the store or reader",
+		)
+		for scope in LESSON_FREE_MODULES
+	),
+)
+
+
+def _is_text(node, docstrings: set) -> bool:
+	return isinstance(node, ast.Constant) and isinstance(node.value, str) and id(node) not in docstrings
+
+
+def check_lesson_doctype_named_only_in_store(sources: dict) -> list:
+	"""ADR-045/046: a lesson DocType is named (its constant, imported or read, or a string holding its name, docstrings
+	aside) only in constants.py, the store, the reader, the two DocType folders and hooks.py."""
+	violations = []
+	for rel, source in only_python(sources).items():
+		if rel in LESSON_DOCTYPE_FILES or rel.startswith(LESSON_DOCTYPE_DIRS):
+			continue
+		tree = parse(rel, source)
+		docstrings = _docstring_ids(tree)
+		for node in ast.walk(tree):
+			if (
+				referenced_name(node) in LESSON_DOCTYPE_CONSTANTS
+				or (isinstance(node, ast.alias) and node.name in LESSON_DOCTYPE_CONSTANTS)
+				or (_is_text(node, docstrings) and LESSON_DOCTYPE_TEXT in node.value)
+			):
+				violations.append(
+					violation(
+						rel,
+						node,
+						"names a lesson DocType; only the store and its reader may (ADR-045, ADR-046)",
+					)
+				)
+	return violations
+
+
+def check_lesson_import_direction(sources: dict) -> list:
+	return check_layer_imports(sources, LESSON_IMPORT_RULES)
+
+
+def check_relevant_lessons_called_only_by_runner(sources: dict) -> list:
+	"""ADR-046: only the runner names `lesson_read.relevant_lessons` (a call, an import, a string path) besides the
+	reader that defines it, and the runner does call it."""
+	violations, runner_calls = [], 0
+	for rel, source in only_python(sources).items():
+		if rel == LESSON_READ_FILE:
+			continue
+		tree = parse(rel, source)
+		docstrings = _docstring_ids(tree)
+		for node in ast.walk(tree):
+			if rel == RUNNER_FILE:
+				runner_calls += (
+					isinstance(node, ast.Call) and referenced_name(node.func) == LESSON_READ_FUNCTION
+				)
+				continue
+			if (
+				referenced_name(node) == LESSON_READ_FUNCTION
+				or (isinstance(node, ast.alias) and node.name == LESSON_READ_FUNCTION)
+				or (_is_text(node, docstrings) and re.search(rf"\b{LESSON_READ_FUNCTION}\b", node.value))
+			):
+				violations.append(
+					violation(
+						rel, node, f"names {LESSON_READ_FUNCTION}; only {RUNNER_FILE} reads lessons (ADR-046)"
+					)
+				)
+	if RUNNER_FILE in sources and not runner_calls:
+		violations.append(f"{RUNNER_FILE}: never calls lesson_read.{LESSON_READ_FUNCTION} (ADR-046 QĐ 1)")
+	return violations
+
+
+def check_lesson_doctypes_grant_no_write(sources: dict) -> list:
+	"""ADR-045: the store is the only writer, so no permission row of a lesson DocType grants a write right."""
+	violations = []
+	for rel in LESSON_DOCTYPE_JSONS:
+		if rel not in sources:
+			violations.append(f"{rel}: file missing")
+			continue
+		for row in json.loads(sources[rel]).get("permissions") or []:
+			granted = [right for right in LESSON_WRITE_RIGHTS if row.get(right)]
+			if granted:
+				violations.append(
+					f"{rel}: role {row.get('role')} is granted {', '.join(granted)}; only the store writes (ADR-045)"
+				)
+	return violations
+
+
+def _filter_values(tree: ast.AST) -> set:
+	"""ids of the nodes given as the `lesson_status` value of a filter: `{"lesson_status": X}`, `["lesson_status", X]`
+	or `["lesson_status", "=", X]`."""
+	values = set()
+	for node in ast.walk(tree):
+		if isinstance(node, ast.Dict):
+			values |= {
+				id(value)
+				for key, value in zip(node.keys, node.values, strict=True)
+				if _is_constant(key, LESSON_STATUS_FIELD)
+			}
+		elif isinstance(node, ast.List | ast.Tuple) and len(node.elts) in (2, 3):
+			if _is_constant(node.elts[0], LESSON_STATUS_FIELD):
+				values.add(id(node.elts[-1]))
+	return values
+
+
+def check_active_status_condition_written_once(sources: dict) -> list:
+	"""ADR-046 Ràng buộc: the "đang dùng" condition is written once in the reader, as the value of its one
+	`lesson_status` filter; never twice, never outside a filter, never as the literal text."""
+	source = sources.get(LESSON_READ_FILE)
+	if source is None:
+		return [f"{LESSON_READ_FILE}: file missing"]
+	tree = parse(LESSON_READ_FILE, source)
+	docstrings = _docstring_ids(tree)
+	uses = [
+		node
+		for node in ast.walk(tree)
+		if isinstance(node, ast.Name | ast.Attribute) and referenced_name(node) == LESSON_ACTIVE_CONSTANT
+	]
+	filters = _filter_values(tree)
+	violations = [
+		violation(LESSON_READ_FILE, node, f"{LESSON_ACTIVE_CONSTANT} outside a {LESSON_STATUS_FIELD} filter")
+		for node in uses
+		if id(node) not in filters
+	]
+	if len(uses) != 1:
+		violations.append(
+			f"{LESSON_READ_FILE}: {LESSON_ACTIVE_CONSTANT} used {len(uses)} times; the condition is written once (ADR-046)"
+		)
+	violations.extend(
+		violation(LESSON_READ_FILE, node, f"the text of {LESSON_ACTIVE_CONSTANT}; filter on the constant")
+		for node in ast.walk(tree)
+		if _is_text(node, docstrings) and node.value == LESSON_STATUS_ACTIVE
+	)
+	return violations
+
+
+# Clean samples of the lesson rules: each file does what it may.
+LESSON_RULES_SAMPLE = {
+	CONSTANTS_FILE: 'LESSON_DOCTYPE = "ERP AI Lesson"\nLESSON_EVENT_DOCTYPE = "ERP AI Lesson Event"\n',
+	HOOKS_FILE: 'ignore_links_on_delete = ["ERP AI Log", "ERP AI Lesson"]\n',
+	LESSONS_FILE: (
+		"import frappe\n\nfrom erp_ai.agent import policy\nfrom erp_ai.constants import LESSON_DOCTYPE\n\n\n"
+		"def store(values):\n\treturn frappe.get_doc({'doctype': LESSON_DOCTYPE, **values}).insert()\n"
+	),
+	LESSON_READ_FILE: (
+		"import frappe\n\nfrom erp_ai.agent import knowledge, policy\n"
+		"from erp_ai.constants import LESSON_DOCTYPE, LESSON_STATUS_ACTIVE\n\n\n"
+		"def relevant_lessons(subject, description):\n"
+		"\treturn frappe.get_all(LESSON_DOCTYPE, filters={'lesson_status': LESSON_STATUS_ACTIVE})\n"
+	),
+	"erp_ai_agent/doctype/erp_ai_lesson/erp_ai_lesson.py": (
+		"from frappe.model.document import Document\n\nfrom erp_ai.agent import lessons\n\n\n"
+		"class ERPAILesson(Document):\n\tpass\n"
+	),
+	RUNNER_FILE: (
+		'"""The runner; relevant_lessons gives the ERP AI Lesson rows of a step."""\n\n'
+		"from erp_ai.agent import lesson_read, policy\nfrom erp_ai.agent.prompts import build_classify_request\n\n\n"
+		"def _lessons(settings, subject, description):\n"
+		"\treturn lesson_read.relevant_lessons(subject, description)\n"
+	),
+	"agent/prompts.py": "from erp_ai.constants import LESSON_STATUS_ACTIVE\n",
+	HANDLERS_FILE: "from erp_ai.agent import lessons\n",
+	"agent/changes/transitions.py": "from erp_ai.agent import lessons\n",
+	"erp_ai_agent/doctype/erp_ai_lesson/erp_ai_lesson.json": json.dumps(
+		{
+			"permissions": [
+				{"role": "System Manager", "read": 1, "write": 0},
+				{"role": "ERP AI Instructor", "read": 1},
+			]
+		}
+	),
+	"erp_ai_agent/doctype/erp_ai_lesson_event/erp_ai_lesson_event.json": json.dumps(
+		{"istable": 1, "permissions": []}
+	),
+}
+
+
+class TestLessonArchitecture(unittest.TestCase):
+	"""FEAT-008 Task 10: the rules of ADR-045 and ADR-046 on the product, then each one's green and red samples."""
+
+	@classmethod
+	def setUpClass(cls):
+		cls.sources = load_product_sources()
+		cls.with_json = load_product_sources(suffixes=(".py", ".json"))
+
+	def assertCaught(self, violations, *fragments):
+		self.assertGreater(len(violations), 0, "scanner missed the violation")
+		for fragment in fragments:
+			self.assertTrue(any(fragment in text for text in violations), f"{fragment!r} not in {violations}")
+
+	def assertSamples(self, check, clean: dict, cases: dict):
+		"""`check` lets `clean` through and catches each case: `{case: (sources, fragment)}`."""
+		self.assertEqual(check(clean), [], "the clean sample is flagged")
+		for case, (sources, fragment) in cases.items():
+			with self.subTest(case=case):
+				self.assertCaught(check(sources), fragment)
+
+	def test_lesson_doctype_named_only_in_store_reader_controller(self):
+		# the allowance names files and folders the product has
+		for rel in LESSON_DOCTYPE_FILES:
+			self.assertIn(rel, self.sources)
+		for folder in LESSON_DOCTYPE_DIRS:
+			self.assertTrue(any(rel.startswith(folder) for rel in self.sources), folder)
+		self.assertEqual(check_lesson_doctype_named_only_in_store(self.sources), [])
+
+		changed = TestScannersCatchViolations.changed
+		clean = LESSON_RULES_SAMPLE
+		self.assertSamples(
+			check_lesson_doctype_named_only_in_store,
+			clean,
+			{
+				"the constant imported by the runner": (
+					changed(clean, RUNNER_FILE, "from erp_ai.constants import LESSON_DOCTYPE\n"),
+					f"{RUNNER_FILE}:9: names a lesson DocType",
+				),
+				"the constant read off the module": (
+					changed(
+						clean,
+						TASKS_FILE,
+						"from erp_ai import constants\n\nX = constants.LESSON_EVENT_DOCTYPE\n",
+					),
+					f"{TASKS_FILE}:3:",
+				),
+				"the name as a string": (
+					changed(
+						clean, HANDLERS_FILE, "\n\ndef f(frappe):\n\treturn frappe.get_all('ERP AI Lesson')\n"
+					),
+					f"{HANDLERS_FILE}:5:",
+				),
+				"the table in raw SQL": (
+					changed(clean, "agent/policy.py", "Q = 'select name from `tabERP AI Lesson Event`'\n"),
+					"agent/policy.py:1:",
+				),
+			},
+		)
+
+	def test_lesson_modules_import_direction(self):
+		self.assertEqual(check_lesson_import_direction(self.sources), [])
+
+		changed = TestScannersCatchViolations.changed
+		clean = LESSON_RULES_SAMPLE
+		cases = {
+			"agent core imports handlers": (
+				"agent/policy.py",
+				"from erp_ai import handlers\n",
+				"erp_ai.handlers",
+			),
+			"agent core imports tasks": ("agent/queue.py", "import erp_ai.tasks\n", "erp_ai.tasks"),
+			"agent core imports install": (
+				"agent/policy.py",
+				"from erp_ai.install import x\n",
+				"erp_ai.install",
+			),
+			"agent core imports eval": (
+				"agent/policy.py",
+				"from erp_ai.eval import run_eval\n",
+				"erp_ai.eval",
+			),
+			"agent core imports a controller": (
+				"agent/policy.py",
+				"from erp_ai.erp_ai_agent.doctype.erp_ai_lesson import erp_ai_lesson\n",
+				"erp_ai.erp_ai_agent",
+			),
+			"the store imports the runner": (
+				LESSONS_FILE,
+				"from erp_ai.agent import runner\n",
+				"erp_ai.agent.runner",
+			),
+			"the store imports the gateway": (LESSONS_FILE, "from erp_ai import gateway\n", "erp_ai.gateway"),
+			"the store imports the change job": (
+				LESSONS_FILE,
+				"from erp_ai.agent.changes import transitions\n",
+				"erp_ai.agent.changes",
+			),
+			"the reader imports the store": (
+				LESSON_READ_FILE,
+				"from erp_ai.agent import lessons\n",
+				LESSONS_MODULE,
+			),
+			"the reader imports the gateway": (LESSON_READ_FILE, "import erp_ai.gateway\n", "erp_ai.gateway"),
+			"prompts import the reader": (
+				"agent/prompts.py",
+				"from erp_ai.agent import lesson_read\n",
+				LESSON_READ_MODULE,
+			),
+			"a tool imports the store": (
+				"agent/tools/read.py",
+				"from erp_ai.agent.lessons import _store\n",
+				LESSONS_MODULE,
+			),
+			"the gateway imports the reader": (
+				"gateway/client.py",
+				"from erp_ai.agent.lesson_read import relevant_lessons\n",
+				LESSON_READ_MODULE,
+			),
+			"eval imports the store": ("eval/run_eval.py", "from ..agent import lessons\n", LESSONS_MODULE),
+		}
+
+		def extra_line(sources, rel):
+			"""The line `changed` appends to `rel` on."""
+			return sources.get(rel, "").count("\n") + 1
+
+		self.assertSamples(
+			check_lesson_import_direction,
+			clean,
+			{
+				case: (changed(clean, rel, extra), f"{rel}:{extra_line(clean, rel)}: imports {target}")
+				for case, (rel, extra, target) in cases.items()
+			},
+		)
+
+	def test_relevant_lessons_called_only_by_runner(self):
+		self.assertEqual(check_relevant_lessons_called_only_by_runner(self.sources), [])
+
+		changed = TestScannersCatchViolations.changed
+		clean = LESSON_RULES_SAMPLE
+		self.assertSamples(
+			check_relevant_lessons_called_only_by_runner,
+			clean,
+			{
+				"a tool calls the reader": (
+					changed(
+						clean,
+						"agent/tools/read.py",
+						"from erp_ai.agent import lesson_read\n\n\ndef f(s):\n\treturn lesson_read.relevant_lessons(s, '')\n",
+					),
+					"agent/tools/read.py:5: names relevant_lessons",
+				),
+				"the handlers import it": (
+					changed(
+						clean,
+						HANDLERS_FILE,
+						"from erp_ai.agent.lesson_read import relevant_lessons as pick\n",
+					),
+					f"{HANDLERS_FILE}:2:",
+				),
+				"a string path to it": (
+					changed(
+						clean, "hooks.py", "doc_events = {'x': 'erp_ai.agent.lesson_read.relevant_lessons'}\n"
+					),
+					"hooks.py:2:",
+				),
+				"the runner never calls it": (
+					changed(clean, RUNNER_FILE, replace=("lesson_read.relevant_lessons(", "list(")),
+					f"{RUNNER_FILE}: never calls lesson_read.relevant_lessons",
+				),
+			},
+		)
+
+	def test_lesson_doctypes_grant_no_write(self):
+		self.assertEqual(check_lesson_doctypes_grant_no_write(self.with_json), [])
+
+		changed = TestScannersCatchViolations.changed
+		clean = LESSON_RULES_SAMPLE
+		lesson_json, event_json = LESSON_DOCTYPE_JSONS
+		cases = {
+			right: (
+				changed(clean, lesson_json, replace=('"write": 0', f'"write": 0, "{right}": 1')),
+				f"{lesson_json}: role System Manager is granted {right}",
+			)
+			for right in LESSON_WRITE_RIGHTS
+		}
+		cases["a row of the event table"] = (
+			changed(
+				clean,
+				event_json,
+				replace=('"permissions": []', '"permissions": [{"role": "All", "create": 1}]'),
+			),
+			f"{event_json}: role All is granted create",
+		)
+		cases["a DocType file gone"] = ({lesson_json: clean[lesson_json]}, f"{event_json}: file missing")
+		self.assertSamples(check_lesson_doctypes_grant_no_write, clean, cases)
+
+	def test_active_status_condition_written_once(self):
+		self.assertEqual(check_active_status_condition_written_once(self.sources), [])
+
+		changed = TestScannersCatchViolations.changed
+		clean = LESSON_RULES_SAMPLE
+		self.assertSamples(
+			check_active_status_condition_written_once,
+			clean,
+			{
+				"a second filter": (
+					changed(
+						clean,
+						LESSON_READ_FILE,
+						"\n\ndef more():\n\treturn frappe.get_all(LESSON_DOCTYPE, filters=[['lesson_status', '=', LESSON_STATUS_ACTIVE]])\n",
+					),
+					"used 2 times",
+				),
+				"a check after the query": (
+					changed(
+						clean,
+						LESSON_READ_FILE,
+						"\n\ndef keep(row):\n\treturn row.lesson_status == LESSON_STATUS_ACTIVE\n",
+					),
+					f"{LESSON_READ_FILE}:12: {LESSON_ACTIVE_CONSTANT} outside a {LESSON_STATUS_FIELD} filter",
+				),
+				"the literal text": (
+					changed(
+						clean,
+						LESSON_READ_FILE,
+						replace=(
+							"'lesson_status': LESSON_STATUS_ACTIVE",
+							f"'lesson_status': '{LESSON_STATUS_ACTIVE}'",
+						),
+					),
+					f"the text of {LESSON_ACTIVE_CONSTANT}",
+				),
+				"no condition at all": (
+					changed(
+						clean,
+						LESSON_READ_FILE,
+						replace=("filters={'lesson_status': LESSON_STATUS_ACTIVE}", "limit=5"),
+					),
+					"used 0 times",
+				),
+				"the reader gone": (
+					{CONSTANTS_FILE: clean[CONSTANTS_FILE]},
+					f"{LESSON_READ_FILE}: file missing",
+				),
 			},
 		)
 

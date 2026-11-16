@@ -43,8 +43,6 @@ PANEL_DECISIONS = {
 	change_link.ACTION_APPROVE: proposal_form.approve,
 	change_link.ACTION_REJECT: proposal_form.reject,
 }
-# Design 6 (Observation): a refused decision is logged by the key of its sentence, never by the sentence.
-REFUSAL_KEYS = {text: key for key, text in proposal_form.PANEL_REFUSALS.items()}
 
 
 def _log_denied(method, ticket, reason):
@@ -156,10 +154,8 @@ def decide_proposal(name=None, action=None) -> dict:
 	_require_panel_access(head.ticket, method="decide")
 	refusal = proposal_form.panel_decision_refusal(head.change_status)
 	if refusal is not None:
-		frappe.logger(LOGGER_NAME).info(
-			f"erp_ai panel decide refused proposal={name} reason={REFUSAL_KEYS.get(refusal)}"
-		)
-		frappe.throw(refusal, frappe.PermissionError)
+		frappe.logger(LOGGER_NAME).info(f"erp_ai panel decide refused proposal={name} reason={refusal}")
+		frappe.throw(_(proposal_form.PANEL_REFUSALS[refusal]), frappe.PermissionError)
 	result = PANEL_DECISIONS[action](name)
 	frappe.logger(LOGGER_NAME).info(
 		f"erp_ai panel decide proposal={name} action={action} status={result['status']}"

@@ -160,14 +160,14 @@ def panel_decision_refusal(status: str) -> str | None:
 	`policy.permission_switches` on every call and only when the first two checks pass. Not whitelisted.
 
 	Returns:
-		A value of `PANEL_REFUSALS`, or None.
+		A key of `PANEL_REFUSALS`, or None.
 	"""
 	if not has_decider_role(frappe.session.user):
-		return PANEL_REFUSALS["role"]
+		return "role"
 	if status != CHANGE_STATUS_PENDING:
-		return PANEL_REFUSALS["not_pending"]
+		return "not_pending"
 	if not policy.permission_switches(frappe.get_single(SETTING_DOCTYPE)).one_click_approval:
-		return PANEL_REFUSALS["switch_off"]
+		return "switch_off"
 	return None
 
 

@@ -1897,28 +1897,26 @@ class TestPanelDecisionRefusal(FrappeTestCase):
 						elif not switch:
 							expected = "switch_off"
 						got = self._refusal(user, status)
-						self.assertEqual(
-							got, None if expected is None else controller.PANEL_REFUSALS[expected]
-						)
+						# design 3.3 contract: the predicate returns the key of PANEL_REFUSALS, not its sentence
+						self.assertEqual(got, expected)
 
 	def test_never_authority_is_role_refusal_even_with_role_and_pending_and_switch_on(self):
 		for user in (AGENT_USER, "Administrator", "Guest"):
 			with self.subTest(user=user):
-				self.assertEqual(self._refusal(user), controller.PANEL_REFUSALS["role"])
+				# design 3.3 contract: the predicate returns the key of PANEL_REFUSALS, not its sentence
+				self.assertEqual(self._refusal(user), "role")
 
 	def test_order_role_before_not_pending_before_switch_off(self):
 		set_agent_settings(one_click_approval_enabled=0)
-		self.assertEqual(
-			self._refusal(PANEL_PLAIN, CHANGE_STATUS_APPROVED), controller.PANEL_REFUSALS["role"]
-		)
-		self.assertEqual(
-			self._refusal(PANEL_INSTRUCTOR, CHANGE_STATUS_APPROVED), controller.PANEL_REFUSALS["not_pending"]
-		)
+		# design 3.3 contract: the predicate returns the key of PANEL_REFUSALS, not its sentence
+		self.assertEqual(self._refusal(PANEL_PLAIN, CHANGE_STATUS_APPROVED), "role")
+		self.assertEqual(self._refusal(PANEL_INSTRUCTOR, CHANGE_STATUS_APPROVED), "not_pending")
 
 	def test_switch_read_again_on_every_call(self):
 		self.assertIsNone(self._refusal(PANEL_INSTRUCTOR))
 		set_agent_settings(one_click_approval_enabled=0)
-		self.assertEqual(self._refusal(PANEL_INSTRUCTOR), controller.PANEL_REFUSALS["switch_off"])
+		# design 3.3 contract: the predicate returns the key of PANEL_REFUSALS, not its sentence
+		self.assertEqual(self._refusal(PANEL_INSTRUCTOR), "switch_off")
 		set_agent_settings(one_click_approval_enabled=1)
 		self.assertIsNone(self._refusal(PANEL_INSTRUCTOR))
 

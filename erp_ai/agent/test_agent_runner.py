@@ -16,8 +16,9 @@ from frappe.utils import escape_html
 from helpdesk.test_utils import make_ticket
 
 from erp_ai import tasks
-from erp_ai.agent import answer_delay, authority, policy, run_log, runner
+from erp_ai.agent import answer_delay, authority, missed_scan, policy, run_log, runner
 from erp_ai.agent.agent_write_guard import allow_agent_write
+from erp_ai.agent.changes import apply_job, transitions
 from erp_ai.agent.classification import DEFAULT_CATEGORY_MAPPING
 from erp_ai.agent.prompts import (
 	ACT_NOW_BLOCK,
@@ -4132,6 +4133,68 @@ class TestRunNotices(RunnerTestBase):
 		self.assertNotIn("Cần ai quyết", content)
 		self.assertEqual(write_ticket.count_guidance(self.ticket.name), 0)
 
+	def test_guidance_run_fields_assign_task_proposal_one_routing_comment(self):
+		# AC-23 [changed] + 1 case (w1.md:186): the first run writes the fields, gives the ticket, makes a Task and one
+		# proposal: the route's sentences are in exactly one comment, the guidance; the proposal keeps its own (AC-33)
+		self._no_lag_sla()
+		sandbox = GitSandbox(self, apps=(SANDBOX_APP,), erp_ai_worktree=None)
+		sandbox.commit_file(SANDBOX_APP, SANDBOX_REL, SANDBOX_BEFORE)
+		person, team = make_active_agent(self), make_team(self)
+		set_agent_settings(
+			permission_level="L3",
+			level_cap_c="L3",
+			code_change_enabled=1,
+			code_change_apps=SANDBOX_APP,
+			auto_assign_enabled=1,
+			category_mapping=json.dumps({"C": {"ticket_type": "", "agent_group": team, "priority": "High"}}),
+			routing_rules=make_routing_rules(
+				assignees={cat: {"default": person, "prefixes": {}} for cat in "ABCF"}
+			),
+		)
+		make_instructor(self)
+		propose = tool_use(
+			"t_propose",
+			"propose_file_change",
+			path=f"{SANDBOX_APP}/{SANDBOX_REL}",
+			find=["x = 1"],
+			replace=["x = 2"],
+			reason="r",
+		)
+		before = set(
+			frappe.get_all(
+				"Comment", filters=authority.ticket_comment_filters(self.ticket.name), pluck="name"
+			)
+		)
+		self.gateway.results = [
+			classify_c(),
+			tool_turn(propose, analysis_call("t_analysis")),
+			make_model_result(),
+		]
+		with patch.object(authority, "run_instructor", return_value=INSTRUCTOR):
+			self._run()
+
+		(task,) = frappe.get_all("Task", filters={"ai_ticket": self.ticket.name}, pluck="name")
+		(proposal,) = frappe.get_all(PROPOSAL_DOCTYPE, filters={"ticket": self.ticket.name}, pluck="name")
+		new = frappe.get_all(
+			"Comment",
+			filters={
+				**authority.ticket_comment_filters(self.ticket.name),
+				"name": ["not in", list(before) or [""]],
+			},
+			pluck="content",
+		)
+		self.assertEqual(len(new), 2)
+		routed = escape_html(runner.ROUTE_TASK.format(task=task))
+		(guidance,) = [content for content in new if routed in content]
+		self.assertTrue(guidance.startswith(write_ticket.GUIDANCE_MARKER))
+		assigned = escape_html(runner.ROUTE_ASSIGNED.format(person=frappe.utils.get_fullname(person)))
+		self.assertEqual(len([content for content in new if assigned in content]), 1)
+		(classify,) = self._entries(entry_type="classify")
+		self.assertNotIn("post_routing_comment", [action["tool"] for action in json.loads(classify.actions)])
+		# the proposal's own comment (AC-33) is the other one
+		(own,) = [content for content in new if content != guidance]
+		self.assertIn(proposal, own)
+
 
 def classify_at(pct):
 	return make_model_result(
@@ -4362,13 +4425,35 @@ def _headings(content):
 	return [match.group(1) or match.group(2) for match in _HEADING.finditer(content)]
 
 
+_LEADING_TAGS = re.compile(r"^(?:\s*<[^>]+>)*\s*")
+RESULT_PREFIX = "kết quả đề xuất {proposal}"
+
+
+def _result_lines(ticket, proposal):
+	"""The ticket's `Info` comments whose content, past its leading HTML tags, opens with the result line prefix of
+	`proposal` (ADR-038 QĐ 3, result_comment.py; design-w1-fixes-20 Điểm 3.2)."""
+	return sum(
+		1
+		for content in _info_comments(ticket)
+		if _LEADING_TAGS.sub("", content or "").startswith(RESULT_PREFIX.format(proposal=proposal))
+	)
+
+
+def _info_comments(ticket):
+	return frappe.get_all(
+		"Comment",
+		filters={"reference_doctype": "HD Ticket", "reference_name": ticket, "comment_type": "Info"},
+		pluck="content",
+		order_by="creation asc",
+	)
+
+
 def analysis_call(block_id, content=ANALYSIS):
 	return tool_use(block_id, "post_comment", kind="de_xuat", content=content)
 
 
-class TestOneGuidance(RunnerTestBase):
-	"""AC-65, ADR-036 (T115-T118, w1.md:68, :101-106, :164-198): a ticket gets the bot's guidance comment once; the run
-	chooses its mode from the one count, and a guidance run gathers its work into that one comment."""
+class GuidanceTestBase(RunnerTestBase):
+	"""Settings and readers of the guidance runs (T115-T118): every switch a run depends on is set by the test."""
 
 	def setUp(self):
 		super().setUp()
@@ -4446,6 +4531,54 @@ class TestOneGuidance(RunnerTestBase):
 
 	def _guidance_log_lines(self, logger):
 		return [call.args for call in logger.info.call_args_list if GUIDANCE_EXISTS_LOG in str(call.args[0])]
+
+	def _proposal_run_settings(self):
+		"""L3 with the code switch on and a sandbox app: the run can make one code proposal (CHANGE_GROUP needs L3)."""
+		self.sandbox = GitSandbox(self, apps=(SANDBOX_APP,), erp_ai_worktree=None)
+		self.sandbox.commit_file(SANDBOX_APP, SANDBOX_REL, SANDBOX_BEFORE)
+		set_agent_settings(
+			permission_level="L3", level_cap_a="L3", code_change_enabled=1, code_change_apps=SANDBOX_APP
+		)
+
+	def _propose_call(self, block_id):
+		return tool_use(
+			block_id,
+			"propose_file_change",
+			path=f"{SANDBOX_APP}/{SANDBOX_REL}",
+			find=["x = 1"],
+			replace=["x = 2"],
+			reason="r",
+		)
+
+	def _proposal_of_run(self, ticket=None):
+		(proposal,) = frappe.get_all(
+			PROPOSAL_DOCTYPE, filters={"ticket": ticket or self.ticket.name}, pluck="name"
+		)
+		return frappe.get_doc(PROPOSAL_DOCTYPE, proposal)
+
+	def _guidance_run_with_proposal(self, propose=None, ticket=None):
+		"""An insert run at L3 that makes one code proposal and writes its analysis; returns the proposal doc."""
+		self.gateway.results = [
+			classify_at(90),
+			tool_turn(propose or self._propose_call("t_propose"), analysis_call("t_analysis")),
+			make_model_result(),
+		]
+		with patch.object(authority, "run_instructor", return_value=INSTRUCTOR):
+			runner.run_for_ticket(ticket or self.ticket.name, "ticket_insert")
+		return self._proposal_of_run(ticket)
+
+	def _approve_and_apply(self, proposal):
+		"""The instructor approves; the change job runs as it would (its commits are the job's own, not kept)."""
+		frappe.set_user(INSTRUCTOR)
+		transitions.approve(proposal, INSTRUCTOR)
+		with patch.object(frappe.db, "commit"):
+			apply_job.run_change(proposal, "apply")
+		frappe.set_user("Administrator")
+
+
+class TestOneGuidance(GuidanceTestBase):
+	"""AC-65, ADR-036 (T115-T118, w1.md:68, :101-106, :164-198): a ticket gets the bot's guidance comment once; the run
+	chooses its mode from the one count, and a guidance run gathers its work into that one comment."""
 
 	def test_ai_after_guidance_no_work_no_comment_one_log_line(self):
 		# AC-65 (c), T115: the ticket already has its guidance; an @ai with nothing to do posts nothing, one log line
@@ -4571,24 +4704,6 @@ class TestOneGuidance(RunnerTestBase):
 			self._tool_results(-1)["t_forged"], {"ok": False, "reason": write_ticket.REASON_MARKER}
 		)
 		self.assertEqual(self._guidance(), 1)
-
-	def _proposal_run_settings(self):
-		"""L3 with the code switch on and a sandbox app: the run can make one code proposal (CHANGE_GROUP needs L3)."""
-		self.sandbox = GitSandbox(self, apps=(SANDBOX_APP,), erp_ai_worktree=None)
-		self.sandbox.commit_file(SANDBOX_APP, SANDBOX_REL, SANDBOX_BEFORE)
-		set_agent_settings(
-			permission_level="L3", level_cap_a="L3", code_change_enabled=1, code_change_apps=SANDBOX_APP
-		)
-
-	def _propose_call(self, block_id):
-		return tool_use(
-			block_id,
-			"propose_file_change",
-			path=f"{SANDBOX_APP}/{SANDBOX_REL}",
-			find=["x = 1"],
-			replace=["x = 2"],
-			reason="r",
-		)
 
 	def test_guidance_has_analysis_plan_done_pending(self):
 		# AC-65 (a) [changed], AC-66 [changed]: marker, the model's analysis and plan, then Đã làm, Chờ duyệt; the
@@ -4770,6 +4885,64 @@ class TestOneGuidance(RunnerTestBase):
 		self.assertEqual(self._guidance(), 1)
 		self.assertIn(escape_html(ANALYSIS.splitlines()[0]), self._guidance_content())
 
+	# T118: end to end (design-w1-fixes-20 Điểm 3.2, 3.3; w1.md:167, :169)
+
+	def test_chain_4_sweep_after_success_one_guidance(self):
+		# AC-65 chain 4: the sweep after a successful run queues nothing; queued anyway (the edge), it is a work-only
+		# run: no comment, still one guidance
+		self.gateway.results = [classify_at(90), tool_turn(analysis_call("t1")), make_model_result()]
+		self._run()
+		self.assertEqual(self._guidance(), 1)
+		comments = self._comment_count()
+		set_agent_settings(agent_enabled_at=frappe.utils.add_days(frappe.utils.now_datetime(), -1))
+		queued = []
+		with patch.object(
+			missed_scan.queue, "enqueue_agent_run", side_effect=lambda *args: queued.append(args)
+		):
+			missed_scan.scan_missed_tickets(frappe.utils.add_to_date(frappe.utils.now_datetime(), minutes=10))
+
+		self.assertNotIn((self.ticket.name, "ticket_insert"), queued)
+		self.gateway.results = [classify_at(90), tool_turn(analysis_call("t2")), make_model_result()]
+		self._run()
+		self.assertEqual(self._guidance(), 1)
+		self.assertEqual(self._comment_count(), comments)
+
+	def test_chain_6_guidance_then_approve_one_guidance_one_result(self):
+		# AC-65 chain 6, AC-23 (1): the proposal waits in "Chờ duyệt"; approved, its job writes one result line
+		self._proposal_run_settings()
+		make_instructor(self)
+		proposal = self._guidance_run_with_proposal()
+		self.assertIn(escape_html(propose_change.pending_line(proposal)), self._guidance_content())
+
+		self._approve_and_apply(proposal.name)
+
+		self.assertEqual(frappe.db.get_value(PROPOSAL_DOCTYPE, proposal.name, "change_status"), "Đã áp dụng")
+		self.assertEqual(_result_lines(self.ticket.name, proposal.name), 1)
+		# no restart in the block: no notice line besides the result
+		self.assertEqual(len(_info_comments(self.ticket.name)), 1)
+		self.assertEqual(self._guidance(), 1)
+
+	def test_guidance_comment_sections_e2e_no_evidence_no_decide(self):
+		# AC-65 (a) [changed], AC-66 [changed]: the route writes the fields, auto-assign finds no valid person, one code
+		# proposal; L3, the level the code tools need (registry GRANT_TABLE)
+		self._proposal_run_settings()
+		set_agent_settings(auto_assign_enabled=1)
+		make_instructor(self)
+		proposal = self._guidance_run_with_proposal()
+
+		content = self._guidance_content()
+		self.assertEqual(_headings(content), ["Nhận định", "Hướng xử lý", "Đã làm", "Chờ duyệt"])
+		manual = escape_html(ASSIGN_REQUEST.format(reason=REASON_NO_VALID_ASSIGNEE))
+		self.assertLess(content.index("**Hướng xử lý:**"), content.index(manual))
+		self.assertLess(content.index(manual), content.index("<strong>Đã làm:</strong>"))
+		pending = content[content.index("<strong>Chờ duyệt:</strong>") :]
+		self.assertIn(write_ticket.PENDING_NOTE, pending)
+		self.assertEqual(
+			re.findall(r"<li>(.*?)</li>", pending), [escape_html(propose_change.pending_line(proposal))]
+		)
+		self.assertNotIn("Cần ai quyết", content)
+		self.assertEqual(_info_comments(self.ticket.name), [])
+
 
 class TestReclassify(RunnerTestBase):
 	"""ADR-037 QĐ 1-3, 6 (T113, AD3-1): a later run classifies again only when the ticket's latest classification is
@@ -4879,3 +5052,101 @@ class TestReclassify(RunnerTestBase):
 		self.assertEqual(policy.runs_today(self.ticket.name), runs + 1)
 		run_ids = {entry.run_id for entry in self._entries() if entry.entry_type in ("classify", "reason")}
 		self.assertEqual(len(run_ids), 2)
+
+
+C_TEAM_MAPPING_PRIORITY = "High"
+
+
+class TestDoneInGuidance(GuidanceTestBase):
+	"""AC-66 (T118, w1.md:196-198): what the run did is in "Đã làm", what waits is in "Chờ duyệt", never both; the word
+	"ok" approves nothing."""
+
+	def _route_c_to_a_person(self):
+		"""Category C goes to a fresh team; its default person gets the ticket and a Task."""
+		person = make_active_agent(self)
+		team = make_team(self)
+		set_agent_settings(
+			category_mapping=json.dumps(
+				{"C": {"ticket_type": "", "agent_group": team, "priority": C_TEAM_MAPPING_PRIORITY}}
+			),
+			routing_rules=make_routing_rules(
+				assignees={cat: {"default": person, "prefixes": {}} for cat in "ABCF"}
+			),
+			auto_assign_enabled=1,
+			level_cap_c="L1",
+		)
+		return person, team
+
+	def test_l1_ticket_only_ticket_fields_and_task(self):
+		# AC-66, AC-32 [changed]: at L1 the run writes on the ticket only; fields and the Task are in "Đã làm"
+		person, team = self._route_c_to_a_person()
+		self.gateway.results = [classify_c(), make_model_result()]
+		self._run()
+
+		(task,) = frappe.get_all("Task", filters={"ai_ticket": self.ticket.name}, pluck="name")
+		content = self._guidance_content()
+		done = content[content.index("<strong>Đã làm:</strong>") :]
+		self.assertIn(escape_html(runner.ROUTE_TASK.format(task=task)), done)
+		self.assertIn(
+			escape_html(runner.ROUTE_ASSIGNED.format(person=frappe.utils.get_fullname(person))), done
+		)
+		self.assertIn(escape_html(f"Nhóm {team}"), done)
+		self.assertEqual(frappe.db.count(PROPOSAL_DOCTYPE, {"ticket": self.ticket.name}), 0)
+		self.assertNotIn("Căn cứ", _headings(content))
+		self.assertNotIn("Chờ duyệt", _headings(content))
+
+	def test_item_not_in_both_done_and_pending(self):
+		self._proposal_run_settings()
+		make_instructor(self)
+		proposal = self._guidance_run_with_proposal()
+
+		content = self._guidance_content()
+		done = content[
+			content.index("<strong>Đã làm:</strong>") : content.index("<strong>Chờ duyệt:</strong>")
+		]
+		pending = content[content.index("<strong>Chờ duyệt:</strong>") :]
+		self.assertIn(proposal.name, pending)
+		self.assertNotIn(proposal.name, done)
+		self.assertIn(runner.ROUTE_DONE.split("{")[0], done)
+		self.assertNotIn(runner.ROUTE_DONE.split("{")[0], pending)
+
+	def test_ok_comment_does_not_approve_pending_proposal(self):
+		# AC-66, NO_OK_APPROVAL: "@ai ok" under the guidance approves nothing: the proposal waits, no change job
+		self._proposal_run_settings()
+		make_instructor(self)
+		proposal = self._guidance_run_with_proposal()
+		# the run left the session on the agent account; the comment is a person's (its author is the instructor the
+		# run is given below)
+		frappe.set_user("Administrator")
+		with patch("erp_ai.handlers.enqueue_agent_run"):
+			ok = self.ticket.new_comment("@ai ok")
+		self.gateway.results = [
+			tool_turn(
+				tool_use(
+					"t_report",
+					"post_comment",
+					kind="de_xuat",
+					content="Đã ghi nhận.\nĐộ tin cậy: 90%\n**Căn cứ:** comment của người phụ trách",
+				)
+			),
+			make_model_result(text="ok"),
+		]
+		with (
+			patch.object(authority, "run_instructor", return_value=INSTRUCTOR),
+			patch.object(frappe, "enqueue") as enqueue,
+		):
+			runner.run_for_ticket(self.ticket.name, "comment_mention", ok)
+
+		self.assertEqual(
+			frappe.db.get_value(PROPOSAL_DOCTYPE, proposal.name, "change_status"), CHANGE_STATUS_PENDING
+		)
+		self.assertEqual(enqueue.call_args_list, [])
+		self.assertEqual(self._entries(entry_type="change", change_step="approve"), [])
+		self.assertEqual(_result_lines(self.ticket.name, proposal.name), 0)
+		self.assertEqual(self._guidance(), 1)
+
+
+def classify_c():
+	return make_model_result(
+		text=json.dumps({"dau_muc": "C", "do_tin_cay": "Cao", "do_tin_cay_pct": 90, "ly_do": "x"})
+	)

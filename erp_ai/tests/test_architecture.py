@@ -10464,6 +10464,9 @@ ROUTE_WRITE_CALLS = ("_record_route", "execute_tool", "set_value", "save", "inse
 FOR_UPDATE_ALLOWED = {
 	("agent/tools/write_ticket.py", "locked_rows"),
 	("agent/changes/transitions.py", "_lock"),
+	# these two lock the ticket row by design: U6b design step (4) for lifecycle, controller ruling R17e for kb_draft
+	("agent/lifecycle.py", "_locked_status_category"),
+	("agent/tools/kb_draft.py", "create_kb_draft"),
 }
 
 

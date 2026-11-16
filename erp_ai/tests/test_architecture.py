@@ -28,7 +28,7 @@ from pathlib import Path
 from typing import ClassVar, NamedTuple
 from unittest.mock import patch
 
-from erp_ai.agent import change_link
+from erp_ai.agent import change_link, messages, prompts
 from erp_ai.constants import (
 	AGENT_STATUS_EVENT,
 	AGENT_USER,
@@ -306,7 +306,12 @@ STATUS_SCRIPT_REQUIRED = (
 	r"Bot có thể không trả lời khi đang tắt, đang ở chế độ chỉ ghi nhận, "
 	r"phiếu không dùng AI hoặc thuộc nhóm loại trừ, đã hết lượt hôm nay, "
 	r"hoặc đang trả lời tin trước của phiếu này \(khi đó hãy gửi lại sau\)\. "
-	r"Nhận định và hướng xử lý của bot hiện ở phần thông tin của phiếu phía trên\.",
+	r"Nhận định và hướng xử lý của bot là tin trong ngăn này; người có vai trò ERP AI Instructor bấm "
+	r"\"Duyệt hướng xử lý\" dưới tin đó thì bot làm theo\.",
+	# ADR-050: the approve button under the newest guidance of the bot sends the fixed approval text through submit.
+	r'TEXT_APPROVE_GUIDANCE = "Duyệt hướng xử lý";',
+	r"message\?\.is_bot && message\?\.kind === KIND_GUIDANCE",
+	r"panel\.inputEl\.value = APPROVE_GUIDANCE_TEXT;\s*submit\(\);",
 	r'TEXT_LOAD_FAILED = "Không tải được dữ liệu của khu vực\. Hãy đóng rồi mở lại\."',
 	r"\(docked \? state\.panel\.slotEl : document\.body\)\.appendChild\(el\)",
 	# T12: stale-result guard (design F1 reload).
@@ -3105,10 +3110,14 @@ def check_status_script_constants_match_server(script: str) -> list:
 		"ACTION_REJECT": change_link.ACTION_REJECT,
 		"STATUS_PENDING": CHANGE_STATUS_PENDING,
 		"STATUS_APPLIED": CHANGE_STATUS_APPLIED,
+		# ADR-050: the approval message and the kind of the bot's guidance message
+		"APPROVE_GUIDANCE_TEXT": prompts.APPROVE_GUIDANCE_TEXT,
+		"KIND_GUIDANCE": messages.KIND_GUIDANCE,
 	}
 	found = []
 	for name, value in expected.items():
-		if not re.search(rf"^\s*const {name} = \"{re.escape(value)}\";\s*$", script, re.MULTILINE):
+		# prettier may break a long one after `=` (ADR-050's approval text)
+		if not re.search(rf"^\s*const {name} =\s+\"{re.escape(value)}\";\s*$", script, re.MULTILINE):
 			found.append(f"{STATUS_SCRIPT_FILE}: const {name} is not the server value {value!r}")
 	return found
 
@@ -6250,9 +6259,16 @@ class TestArchitecture(unittest.TestCase):
 			("ACTION_REJECT", change_link.ACTION_REJECT),
 			("STATUS_PENDING", CHANGE_STATUS_PENDING),
 			("STATUS_APPLIED", CHANGE_STATUS_APPLIED),
+			("APPROVE_GUIDANCE_TEXT", prompts.APPROVE_GUIDANCE_TEXT),
+			("KIND_GUIDANCE", messages.KIND_GUIDANCE),
 		):
 			with self.subTest(constant=name):
-				drifted = script.replace(f'const {name} = "{value}";', f'const {name} = "{value}x";', 1)
+				drifted = re.sub(
+					rf'(const {name} =\s+"){re.escape(value)}(";)',
+					lambda match: f"{match.group(1)}{value}x{match.group(2)}",
+					script,
+					count=1,
+				)
 				self.assertNotEqual(drifted, script)
 				found = check_status_script_constants_match_server(drifted)
 				self.assertTrue(any(name in text for text in found), found)

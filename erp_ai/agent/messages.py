@@ -5,6 +5,9 @@ from erp_ai.agent.prompts import MAX_COMMENTS
 from erp_ai.constants import AGENT_USER, MESSAGE_DOCTYPE
 
 THREAD_LIMIT = 200
+# ADR-050: the kind of the bot's guidance message in the panel's thread (the script holds the same value); any other
+# message has kind "".
+KIND_GUIDANCE = "guidance"
 
 
 def add_message(
@@ -76,15 +79,30 @@ def forget_ticket(ticket: str) -> None:
 	frappe.db.delete(MESSAGE_DOCTYPE, {"ticket": ticket})
 
 
+def _shown(row) -> tuple[str, str]:
+	"""(kind, text) of a message for the panel: the bot's guidance is plain text of kind KIND_GUIDANCE (ADR-050); any
+	other message is shown as stored, kind ""."""
+	# Imported on call: write_ticket imports add_message from this module.
+	from erp_ai.agent.tools.write_ticket import guidance_text
+
+	if row.owner == AGENT_USER and (text := guidance_text(row.content)) is not None:
+		return KIND_GUIDANCE, text
+	return "", row.content
+
+
 def thread(ticket: str) -> list[dict]:
 	"""The newest THREAD_LIMIT messages, oldest first, shaped for the panel."""
-	return [
-		{
-			"name": row.name,
-			"author": get_fullname(row.owner),
-			"is_bot": row.owner == AGENT_USER,
-			"created_at": format_datetime(row.creation),
-			"text": row.content,
-		}
-		for row in reversed(_rows(ticket, THREAD_LIMIT))
-	]
+	shaped = []
+	for row in reversed(_rows(ticket, THREAD_LIMIT)):
+		kind, text = _shown(row)
+		shaped.append(
+			{
+				"name": row.name,
+				"author": get_fullname(row.owner),
+				"is_bot": row.owner == AGENT_USER,
+				"created_at": format_datetime(row.creation),
+				"text": text,
+				"kind": kind,
+			}
+		)
+	return shaped

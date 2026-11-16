@@ -90,13 +90,6 @@ REASON_NOTICE_SENT = "đã thông báo"
 _GUIDANCE_KEY = "erp_ai:huong-xu-ly"
 GUIDANCE_MARKER = f"<!-- {_GUIDANCE_KEY} -->"
 GUIDANCE_HEADER = "Hướng xử lý"
-ANALYSIS_HEADER = "Nhận định"
-# A run a message started whose answer the guidance comment took still answers in the conversation (CHG-003
-# Amendment 3): the finding of its analysis, then where the rest is. Plain text: the panel only sets text.
-GUIDANCE_REPLY = (
-	"Bot đã viết hướng xử lý cho phiếu: nhận định đầy đủ, việc đã làm, đề xuất chờ duyệt và việc cần người làm nằm ở "
-	'mục "Thông tin AI của phiếu" phía trên và ở comment hướng xử lý của phiếu.'
-)
 SECTION_DONE, SECTION_PENDING = "Đã làm", "Chờ duyệt"
 # Collector key of "work a person must do by hand, with the reason": shown inside the plan section, no heading of
 # its own (design-w1-fixes-20 Điểm 1.1, spec-addendum-5 AC-65 (a)).
@@ -119,7 +112,7 @@ _WORK_ONLY_FLAG = "erp_ai_work_only_runs"
 GUIDANCE_FALLBACK = (
 	"**Nhận định:** bot chưa viết được nhận định cho phiếu này.\n"
 	f"**{GUIDANCE_HEADER}:** người phụ trách làm các việc ghi ngay dưới (nếu có); việc bot đã làm và đề xuất chờ "
-	"duyệt nằm ở các mục cuối comment; cần bot làm tiếp thì nhắc @ai."
+	"duyệt nằm ở các mục cuối tin này; cần bot làm tiếp thì nhắn trong ngăn này."
 )
 # Once per comment, in the heading paragraph of the pending section (design-w1-fixes-20 Điểm 2.1); a trusted constant.
 PENDING_NOTE = (
@@ -325,9 +318,22 @@ def _post(ticket_name: str, content: str) -> dict:
 	return {"ok": True, "comment": name}
 
 
+def _say(ticket_name: str, content: str, run_id: str | None = None) -> dict:
+	"""One message of the bot in the ticket's conversation, as given, under the session user's permissions (ADR-050):
+	the system's own sentences (route, notices, guidance), never the model's text unchecked."""
+	if not frappe.get_doc(TICKET_DOCTYPE, ticket_name).has_permission("read"):
+		return _fail("thiếu quyền đọc phiếu")
+	try:
+		name = add_message(ticket_name, content, run_id=run_id)
+	except frappe.PermissionError:
+		return _fail("không được phép thêm tin vào ngăn trao đổi")
+	return {"ok": True, "message": name}
+
+
 def post_comment(args: dict, ctx: ToolContext) -> dict:
-	"""Post `args["content"]` as is, no kind check: for code callers (route_ticket); the model's text never comes here."""
-	return _post(ctx.ticket_name, args["content"])
+	"""Say `args["content"]` as is in the conversation, no kind check: for code callers (route_ticket); the model's
+	text never comes here (ADR-050)."""
+	return _say(ctx.ticket_name, args["content"], ctx.run_id)
 
 
 def _post_message(content: str, ctx: ToolContext) -> dict:
@@ -449,34 +455,61 @@ def _agent_comment_filters(ticket_name: str) -> dict:
 	}
 
 
+def _agent_message_filters(ticket_name: str) -> dict:
+	"""The messages of the ticket's conversation written by the agent account."""
+	return {"ticket": ticket_name, "owner": AGENT_USER}
+
+
 def post_notice(ticket_name: str, notice: str, body: str, since: datetime) -> dict:
-	"""Post the `notice` status comment unless the agent posted one of that kind on the ticket since `since`
-	(AC-23, NFR-3, w1.md:97). The dedup read is locked_count's (ticket lock, then a locking read); no lock of its own.
-	"""
+	"""Say the `notice` status message in the conversation unless the agent said one of that kind on the ticket since
+	`since` (AC-23, NFR-3, w1.md:97; ADR-050). The dedup read is locked_count's (ticket lock, then a locking read); no
+	lock of its own."""
 	if notice not in NOTICE_PREFIXES:
 		raise ValueError(f"notice lạ: {notice}")
 	prefix = NOTICE_PREFIXES[notice]
 	filters = {
-		**_agent_comment_filters(ticket_name),
+		**_agent_message_filters(ticket_name),
 		"creation": [">=", since],
 		"content": ["like", f"{prefix}%"],
 	}
-	if locked_count(ticket_name, "Comment", filters):
+	if locked_count(ticket_name, MESSAGE_DOCTYPE, filters):
 		return _fail(REASON_NOTICE_SENT)
-	return _post(ticket_name, f"{prefix} {body}")
+	return _say(ticket_name, f"{prefix} {body}")
 
 
 def guidance_filters(ticket_name: str) -> dict:
-	"""The agent's guidance comment of the ticket: the marker at position 0, so the model's text inside another
-	comment never counts; an `Info` row never counts (ADR-036 QĐ 3)."""
-	return {**_agent_comment_filters(ticket_name), "content": ["like", f"{GUIDANCE_MARKER}%"]}
+	"""The agent's guidance message of the ticket (ADR-050): the marker at position 0, so the model's text inside
+	another message never counts, and a person's message never does (ADR-036 QĐ 3)."""
+	return {**_agent_message_filters(ticket_name), "content": ["like", f"{GUIDANCE_MARKER}%"]}
 
 
 def count_guidance(ticket_name: str, *, lock: bool = False) -> int:
-	"""The one count of the ticket's guidance comments (ADR-036 QĐ 3): lock=True locks the ticket and reads with a lock."""
+	"""The one count of the ticket's guidance messages (ADR-036 QĐ 3): lock=True locks the ticket and reads with a lock."""
 	if lock:
-		return locked_count(ticket_name, "Comment", guidance_filters(ticket_name))
-	return frappe.db.count("Comment", guidance_filters(ticket_name))
+		return locked_count(ticket_name, MESSAGE_DOCTYPE, guidance_filters(ticket_name))
+	return frappe.db.count(MESSAGE_DOCTYPE, guidance_filters(ticket_name))
+
+
+_LIST_ITEM = re.compile(r"<\s*li\b[^>]*>", re.I)
+_PARAGRAPH = re.compile(r"<\s*p\b[^>]*>", re.I)
+
+
+def guidance_text(content: str) -> str | None:
+	"""The guidance message as the panel shows it (ADR-050): plain text without the marker, each listed line as
+	"- line", a blank line before each paragraph, entities unescaped; a message not opening with the marker → None."""
+	if not (content or "").startswith(GUIDANCE_MARKER):
+		return None
+	text = _LIST_ITEM.sub("\n- ", content[len(GUIDANCE_MARKER) :])
+	text = _PARAGRAPH.sub("\n\n", text)
+	text = html.unescape(_ANY_TAG.sub("", _BLOCK_TAG.sub("\n", text)))
+	lines = []
+	for line in (line.rstrip() for line in text.split("\n")):
+		if not line and (not lines or not lines[-1]):
+			continue
+		if line.startswith("- ") and lines and not lines[-1]:
+			lines.pop()
+		lines.append(line)
+	return "\n".join(lines).strip()
 
 
 def open_collector(run_id: str) -> None:
@@ -584,10 +617,10 @@ def _store_run_info(ticket_name: str, analysis: str | None, sections: dict[str, 
 
 
 def post_guidance(ticket_name: str, run_id: str) -> dict:
-	"""The one writer of the ticket's guidance comment (ADR-036 QĐ 1, 4); the runner calls it once, at the end of a
-	guidance run; not a tool. Counted under the ticket lock, so a ticket has at most one. Body (design-w1-fixes-20
-	Điểm 1.2): marker, the model's analysis as written (or the fallback) with the manual lines inside its plan
-	section, then the done and the pending sections; an empty section does not show."""
+	"""The one writer of the ticket's guidance, a message of its conversation since ADR-050 (ADR-036 QĐ 1, 4); the
+	runner calls it once, at the end of a guidance run; not a tool. Counted under the ticket lock, so a ticket has at
+	most one. Body (design-w1-fixes-20 Điểm 1.2): marker, the model's analysis as written (or the fallback) with the
+	manual lines inside its plan section, then the done and the pending sections; an empty section does not show."""
 	if count_guidance(ticket_name, lock=True):
 		return _fail(REASON_GUIDANCE_EXISTS)
 	analysis, sections = collected(run_id)
@@ -598,7 +631,7 @@ def post_guidance(ticket_name: str, run_id: str) -> dict:
 		if sections[section]:
 			note = f" {PENDING_NOTE}" if section == SECTION_PENDING else ""
 			parts.append(f"<p><strong>{section}:</strong>{note}</p>{_items(sections[section])}")
-	result = _post(ticket_name, "\n".join(parts))
+	result = _say(ticket_name, "\n".join(parts), run_id)
 	if not result["ok"]:
 		return result
 	return {
@@ -608,30 +641,15 @@ def post_guidance(ticket_name: str, run_id: str) -> dict:
 	}
 
 
-def post_guidance_reply(ctx: ToolContext) -> dict | None:
-	"""The answer of a run a message started when the guidance comment took it (CHG-003 Amendment 3): one message with
-	the finding of the run's held analysis, when it has one, and where the rest of the guidance is; the runner calls it
-	right after `post_guidance`. A run nothing typed started, or one that already said something in the conversation
-	→ None, nothing written."""
-	if not ctx.in_conversation or frappe.db.exists(
-		MESSAGE_DOCTYPE, {"ticket": ctx.ticket_name, "run_id": ctx.run_id}
-	):
-		return None
-	analysis = collected(ctx.run_id)[0]
-	finding = section_text(analysis, ANALYSIS_HEADER) if analysis else None
-	return _post_message(
-		f"{ANALYSIS_HEADER}: {finding}\n\n{GUIDANCE_REPLY}" if finding else GUIDANCE_REPLY, ctx
-	)
-
-
 def failure_summary(run_id: str) -> str:
 	"""What the run did before it failed, for its run_failed notice (design-w1-fixes-20 Điểm 3.1): one part per
-	non-empty section, done, pending and manual apart, each line escaped once; not collecting → ""."""
+	non-empty section, done, pending and manual apart, each line as raw text (the notice is a plain-text message of
+	the conversation, ADR-050); not collecting → ""."""
 	if not collecting(run_id):
 		return ""
 	sections = collected(run_id)[1]
 	return "\n".join(
-		prefix + "; ".join(escape_html(line) for line in sections[section])
+		prefix + "; ".join(sections[section])
 		for prefix, section in (
 			(FAILURE_DONE, SECTION_DONE),
 			(FAILURE_PENDING, SECTION_PENDING),

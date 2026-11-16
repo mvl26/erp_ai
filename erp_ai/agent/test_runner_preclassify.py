@@ -11,7 +11,7 @@ from erp_ai.agent.test_agent_runner import PREFIX, requester_message
 from erp_ai.agent.test_runner_routing import CLASSIFY_SCORED, ROUTE_TYPE, AssignTestBase
 from erp_ai.agent.tools import write_ticket
 from erp_ai.agent.tools.write_ticket import CREATED_LABELS_FIELD, REASON_HUMAN_FILLED
-from erp_ai.constants import CLASSIFICATION_FIELDS, CLASSIFIED_BY_AI, LOG_DOCTYPE
+from erp_ai.constants import CLASSIFICATION_FIELDS, CLASSIFIED_BY_AI, LOG_DOCTYPE, MESSAGE_DOCTYPE
 from erp_ai.gateway import GatewayError
 from erp_ai.test_utils import (
 	keep_agent_settings,
@@ -356,10 +356,11 @@ class TestPreclassifyFailure(PreclassifyTestBase):
 	neither counts as classified, so the next run classifies; nothing is raised out of the job."""
 
 	def _run_failed_notices(self):
+		# ADR-050: a notice is a message of the ticket's conversation
 		return frappe.get_all(
-			"Comment",
+			MESSAGE_DOCTYPE,
 			filters={
-				**runner.authority.ticket_comment_filters(self.ticket.name),
+				"ticket": self.ticket.name,
 				"content": ["like", f"{write_ticket.NOTICE_PREFIXES['run_failed']}%"],
 			},
 			pluck="name",

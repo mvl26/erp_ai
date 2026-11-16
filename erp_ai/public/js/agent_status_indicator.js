@@ -13,7 +13,13 @@ function setupForm({ doc, call, router }) {
 		const TEXT_STATUS_RUNNING = "Đang xử lý…";
 		const TEXT_BOT_LABEL = "Bot";
 		const TEXT_BOT_GUIDANCE =
-			"Bot có thể không trả lời khi đang tắt, đang ở chế độ chỉ ghi nhận, phiếu không dùng AI hoặc thuộc nhóm loại trừ, đã hết lượt hôm nay, hoặc đang trả lời tin trước của phiếu này (khi đó hãy gửi lại sau). Nhận định và hướng xử lý của bot hiện ở phần thông tin của phiếu phía trên.";
+			'Bot có thể không trả lời khi đang tắt, đang ở chế độ chỉ ghi nhận, phiếu không dùng AI hoặc thuộc nhóm loại trừ, đã hết lượt hôm nay, hoặc đang trả lời tin trước của phiếu này (khi đó hãy gửi lại sau). Nhận định và hướng xử lý của bot là tin trong ngăn này; người có vai trò ERP AI Instructor bấm "Duyệt hướng xử lý" dưới tin đó thì bot làm theo.';
+		// ADR-050: the newest guidance of the bot gets the approve button; a click sends this fixed text (server
+		// prompts.APPROVE_GUIDANCE_TEXT) through the send box, as the person who clicked.
+		const KIND_GUIDANCE = "guidance";
+		const TEXT_APPROVE_GUIDANCE = "Duyệt hướng xử lý";
+		const APPROVE_GUIDANCE_TEXT =
+			"Duyệt hướng xử lý: bot làm ngay các bước trong hướng xử lý gần nhất, đúng phạm vi đã nêu.";
 		const TEXT_LOAD_FAILED = "Không tải được dữ liệu của khu vực. Hãy đóng rồi mở lại.";
 		const TEXT_INPUT_PLACEHOLDER =
 			"Nhập câu hỏi cho bot. Enter để gửi, Shift+Enter để xuống dòng.";
@@ -422,7 +428,13 @@ function setupForm({ doc, call, router }) {
 				state.panel.threadEl.replaceChildren(empty, ...first, ...last);
 				return;
 			}
-			const nodes = messages.map((message) => {
+			let newestGuidance = -1;
+			messages.forEach((message, index) => {
+				if (message?.is_bot && message?.kind === KIND_GUIDANCE) {
+					newestGuidance = index;
+				}
+			});
+			const nodes = messages.map((message, index) => {
 				const row = document.createElement("div");
 				row.style.marginTop = "8px";
 				row.style.padding = "6px 8px";
@@ -440,6 +452,25 @@ function setupForm({ doc, call, router }) {
 				body.style.whiteSpace = "pre-wrap";
 				body.textContent = message?.text ?? "";
 				row.append(head, body);
+				if (index === newestGuidance) {
+					const approveEl = document.createElement("button");
+					approveEl.type = "button";
+					approveEl.style.marginTop = "6px";
+					approveEl.textContent = TEXT_APPROVE_GUIDANCE;
+					approveEl.addEventListener("click", () => {
+						try {
+							const panel = state.panel;
+							if (panel.sending || !panel.inputEl) {
+								return;
+							}
+							panel.inputEl.value = APPROVE_GUIDANCE_TEXT;
+							submit();
+						} catch (e) {
+							// A panel handler must never break the ticket page (ADR-009 decision 4).
+						}
+					});
+					row.append(approveEl);
+				}
 				return [row, ...(below.get(message?.name) || [])];
 			});
 			state.panel.threadEl.replaceChildren(...first, ...nodes.flat(), ...last);

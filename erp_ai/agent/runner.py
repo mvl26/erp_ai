@@ -70,7 +70,6 @@ from erp_ai.agent.tools.write_ticket import (
 	mark_work_only,
 	open_collector,
 	post_guidance,
-	post_guidance_reply,
 	post_notice,
 )
 from erp_ai.constants import (
@@ -225,7 +224,6 @@ GUIDANCE_EXISTS_LOG = "erp_ai guidance ticket=%s run_id=%s: đã có hướng x�
 # The action entry of the run's one guidance comment (ADR-036 QĐ 8, w1.md:105).
 GUIDANCE_TOOL = "post_guidance"
 # The answer in the conversation of a run a message started, when the guidance comment took it (CHG-003 Amendment 3).
-GUIDANCE_REPLY_TOOL = "post_guidance_reply"
 # The split question a guidance run's route gathered, per run: (classify row, text, requests), recorded as asked only
 # once the run's one comment carrying it is posted (AC-28, C9-fix1 R20a); dropped when the run ends.
 SPLIT_HELD_FLAG = "erp_ai_split_held"
@@ -694,7 +692,12 @@ def _notice(ticket_name, notice, body, since, *, trigger, instructor=None) -> di
 	if not result.get("ok"):
 		return None
 	return action_entry(
-		NOTICE_TOOL, "Comment", result["comment"], True, value_after={"notice": notice}, instructor=instructor
+		NOTICE_TOOL,
+		MESSAGE_DOCTYPE,
+		result["message"],
+		True,
+		value_after={"notice": notice},
+		instructor=instructor,
 	)
 
 
@@ -743,7 +746,7 @@ def _failure_notice(ticket_name, exc, trigger, instructor, run_id) -> dict | Non
 
 def _done_suffix(run_id) -> str:
 	"""What the run's collector holds, for its failure notice (design-w1-fixes-20 Điểm 3.1): done, pending and manual
-	lines apart, as `failure_summary` writes and escapes them; a line break before it, or "" when there is none."""
+	lines apart, as `failure_summary` writes them; a line break before it, or "" when there is none."""
 	summary = failure_summary(run_id)
 	return f"\n{summary}" if summary else ""
 
@@ -1194,14 +1197,14 @@ def _task_unit(user, subject, classification, context, actions, lines, errors):
 
 
 def _comment_unit(lines, context, actions, errors):
-	"""(u4): post the gathered sentences as at most one comment. Returns True when it was posted."""
+	"""(u4): say the gathered sentences as at most one message of the conversation (ADR-050). Returns True when it was
+	said. Plain text: the panel sets text only, so nothing is escaped."""
 	if not lines:
 		return False
-	# the split question quotes the model's reading of the ticket: every line is escaped once, here, where it is posted
 	result = _run_unit(
 		"post_routing_comment",
-		lambda: post_routing_comment([escape_html(line) for line in lines], context),
-		"Comment",
+		lambda: post_routing_comment(lines, context),
+		MESSAGE_DOCTYPE,
 		None,
 		actions,
 		errors,
@@ -1210,7 +1213,7 @@ def _comment_unit(lines, context, actions, errors):
 		return False
 	actions.append(
 		_route_action(
-			"post_routing_comment", "Comment", result["comment"], True, instructor=context.instructor
+			"post_routing_comment", MESSAGE_DOCTYPE, result["message"], True, instructor=context.instructor
 		)
 	)
 	return True
@@ -1615,39 +1618,26 @@ def _reason(
 
 def _finish_guidance(context, actions) -> None:
 	"""The one place the runner calls `post_guidance` (ADR-036 QĐ 1, w1.md:105): inside the last turn, after its tools
-	and before its entry, so the comment is undone with the turn (R5-16). Posted → one action entry with the section
+	and before its entry, so the message is undone with the turn (R5-16). Posted → one action entry with the section
 	counts (QĐ 8). A run in parallel posted the ticket's guidance first → one log line, and the run's collected lines
-	go out as before: one result comment without the marker, in the order of GUIDANCE_SECTIONS, one sentence per line,
-	each escaped once, no section heading (design-w1-fixes-20 Điểm 1.6, AD3-4). Nothing to say → one log line.
-	Either comment, once posted, records the split question the route held (`_record_split`); a refusal records none.
-	Once the guidance comment is posted, a run a message started that said nothing in the conversation answers there
-	too, with its own entry (CHG-003 Amendment 3)."""
+	go out as before: one result message without the marker, in the order of GUIDANCE_SECTIONS, one sentence per
+	line, no section heading (design-w1-fixes-20 Điểm 1.6, AD3-4). Nothing to say → one log line. Either message,
+	once said, records the split question the route held (`_record_split`); a refusal records none. ADR-050: the
+	guidance is itself a message of the ticket's conversation, so no other answer follows it."""
 	ticket, run_id = context.ticket_name, context.run_id
 	result = post_guidance(ticket, run_id)
 	if result.get("ok"):
 		actions.append(
 			action_entry(
 				GUIDANCE_TOOL,
-				"Comment",
-				result["comment"],
+				MESSAGE_DOCTYPE,
+				result["message"],
 				True,
 				value_after={"counts": result["counts"]},
 				instructor=context.instructor,
 			)
 		)
-		_record_split(run_id, result["comment"])
-		reply = post_guidance_reply(context)
-		if reply is not None:
-			actions.append(
-				action_entry(
-					GUIDANCE_REPLY_TOOL,
-					MESSAGE_DOCTYPE,
-					reply.get("message"),
-					bool(reply.get("ok")),
-					reason=reply.get("reason"),
-					instructor=context.instructor,
-				)
-			)
+		_record_split(run_id, result["message"])
 		return
 	reason = result.get("reason")
 	if reason == REASON_NO_CONTENT:
@@ -1655,7 +1645,9 @@ def _finish_guidance(context, actions) -> None:
 		return
 	if reason != REASON_GUIDANCE_EXISTS:
 		actions.append(
-			action_entry(GUIDANCE_TOOL, "Comment", None, False, reason=reason, instructor=context.instructor)
+			action_entry(
+				GUIDANCE_TOOL, MESSAGE_DOCTYPE, None, False, reason=reason, instructor=context.instructor
+			)
 		)
 		return
 	frappe.logger(LOGGER_NAME).info(GUIDANCE_EXISTS_LOG, ticket, run_id)
@@ -1663,19 +1655,19 @@ def _finish_guidance(context, actions) -> None:
 	lines = [line for section in GUIDANCE_SECTIONS for line in sections[section]]
 	if not lines:
 		return
-	posted = post_routing_comment([escape_html(line) for line in lines], context)
+	posted = post_routing_comment(lines, context)
 	actions.append(
 		_route_action(
 			"post_routing_comment",
-			"Comment",
-			posted.get("comment"),
+			MESSAGE_DOCTYPE,
+			posted.get("message"),
 			bool(posted.get("ok")),
 			posted.get("reason"),
 			instructor=context.instructor,
 		)
 	)
 	if posted.get("ok"):
-		_record_split(run_id, posted["comment"])
+		_record_split(run_id, posted["message"])
 
 
 def _hold_split(run_id, log_name, split_text, classification) -> None:
@@ -1684,15 +1676,16 @@ def _hold_split(run_id, log_name, split_text, classification) -> None:
 		frappe.flags.setdefault(SPLIT_HELD_FLAG, {})[run_id] = (log_name, split_text, classification.requests)
 
 
-def _record_split(run_id, comment) -> None:
-	"""The split question the run's route held is recorded as asked on its classify row only once the run's comment
-	`comment` was posted and its text carries the question, escaped once (AC-28, R14c, C9-fix1 R20a). Inside the
-	last turn, so it is undone with that turn."""
+def _record_split(run_id, message) -> None:
+	"""The split question the run's route held is recorded as asked on its classify row only once the run's message
+	`message` was said and its text carries the question: escaped once inside the guidance, as written in a plain
+	message (AC-28, R14c, C9-fix1 R20a, ADR-050). Inside the last turn, so it is undone with that turn."""
 	held = frappe.flags.get(SPLIT_HELD_FLAG, {}).get(run_id)
 	if held is None:
 		return
 	log_name, text, requests = held
-	if escape_html(text) in (frappe.db.get_value("Comment", comment, "content") or ""):
+	content = frappe.db.get_value(MESSAGE_DOCTYPE, message, "content") or ""
+	if escape_html(text) in content or text in content:
 		frappe.db.set_value(
 			LOG_DOCTYPE,
 			log_name,

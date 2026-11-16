@@ -12,11 +12,11 @@ from frappe.tests.utils import FrappeTestCase
 from frappe.utils import escape_html, get_datetime, now_datetime
 from helpdesk.test_utils import create_agent, make_ticket
 
-from erp_ai.agent import ops_data, policy, site_facts
+from erp_ai.agent import messages, ops_data, policy, site_facts
 from erp_ai.agent.classification import Classification
 from erp_ai.agent.routing import decide_route
 from erp_ai.agent.run_log import write_entry
-from erp_ai.agent.tools import registry, write_ticket
+from erp_ai.agent.tools import registry, route_ticket, write_ticket
 from erp_ai.agent.tools.registry import ToolContext, execute_tool
 from erp_ai.constants import (
 	AGENT_USER,
@@ -255,6 +255,11 @@ def _comment_count():
 	return frappe.db.count("Comment", {"reference_doctype": "HD Ticket"})
 
 
+def _said_count():
+	"""Every message of every ticket's conversation: what post_comment writes since ADR-050."""
+	return frappe.db.count(MESSAGE_DOCTYPE)
+
+
 class TestWriteTicketTools(FrappeTestCase):
 	"""set_resolution_hint, post_comment and create_task (T26). Nothing here may commit."""
 
@@ -346,30 +351,22 @@ class TestWriteTicketTools(FrappeTestCase):
 
 	# post_comment
 
-	def test_post_comment_creates_core_comment_owned_by_agent(self):
-		before = _comment_count()
-		legacy_before = frappe.db.count("HD Ticket Comment")
+	def test_post_comment_says_one_message_owned_by_the_caller(self):
+		# ADR-050: the system's sentences are a message of the ticket's conversation, not a comment
+		comments, said = _comment_count(), _said_count()
 		result = self._call(write_ticket.post_comment, T26_AGENT, {"content": "Đã nhận phiếu"})
 		self.assertTrue(result["ok"], result)
-		self.assertEqual(_comment_count(), before + 1)
-		self.assertEqual(frappe.db.count("HD Ticket Comment"), legacy_before)
-		comment = frappe.db.get_value(
-			"Comment",
-			result["comment"],
-			["comment_type", "reference_doctype", "reference_name", "owner", "content"],
-			as_dict=True,
+		self.assertEqual((_comment_count(), _said_count()), (comments, said + 1))
+		row = frappe.db.get_value(
+			MESSAGE_DOCTYPE, result["message"], ["ticket", "owner", "content"], as_dict=True
 		)
-		self.assertEqual(comment.comment_type, "Comment")
-		self.assertEqual(comment.reference_doctype, "HD Ticket")
-		self.assertEqual(comment.reference_name, self.ticket)
-		self.assertEqual(comment.owner, T26_AGENT)
-		self.assertIn("Đã nhận phiếu", comment.content)
+		self.assertEqual((row.ticket, row.owner, row.content), (self.ticket, T26_AGENT, "Đã nhận phiếu"))
 
-	def test_post_comment_without_ticket_access_returns_ok_false_no_comment(self):
-		before = _comment_count()
+	def test_post_comment_without_ticket_access_returns_ok_false_nothing_said(self):
+		before = _said_count()
 		result = self._call(write_ticket.post_comment, T26_OUTSIDER, {"content": "x"})
 		self._assert_refused(result)
-		self.assertEqual(_comment_count(), before)
+		self.assertEqual(_said_count(), before)
 
 	def test_post_comment_denied_by_ticket_read_permission_alone(self):
 		real = Document.has_permission
@@ -377,34 +374,24 @@ class TestWriteTicketTools(FrappeTestCase):
 		def deny_read(doc, permtype="read", *args, **kwargs):
 			return False if permtype == "read" else real(doc, permtype, *args, **kwargs)
 
-		before = _comment_count()
+		before = _said_count()
 		with patch.object(Document, "has_permission", deny_read):
 			result = self._call(write_ticket.post_comment, T26_AGENT, {"content": "x"})
 		self._assert_refused(result)
-		self.assertEqual(_comment_count(), before)
+		self.assertEqual(_said_count(), before)
 
-	def test_post_comment_denied_by_comment_create_permission_alone(self):
-		real = frappe.has_permission
+	def test_post_comment_refused_by_the_message_permission_returns_ok_false(self):
+		# a reader of the ticket without the right to write the conversation: the refusal is ok=false, no exception
+		real = Document.has_permission
 
-		def deny_comment_create(doctype=None, ptype="read", *args, **kwargs):
-			if doctype == "Comment" and ptype == "create":
-				return False
-			return real(doctype, ptype, *args, **kwargs)
+		def read_the_ticket(doc, permtype="read", *args, **kwargs):
+			return True if doc.doctype == "HD Ticket" else real(doc, permtype, *args, **kwargs)
 
-		before = _comment_count()
-		with patch.object(frappe, "has_permission", deny_comment_create):
-			result = self._call(write_ticket.post_comment, T26_AGENT, {"content": "x"})
+		before = _said_count()
+		with patch.object(Document, "has_permission", read_the_ticket):
+			result = self._call(write_ticket.post_comment, T26_OUTSIDER, {"content": "x"})
 		self._assert_refused(result)
-		self.assertEqual(_comment_count(), before)
-
-	def test_post_comment_refused_by_new_comment_returns_ok_false(self):
-		# new_comment itself refuses non-agents; the refusal must come back as ok=false, not an exception.
-		before = _comment_count()
-		with patch.object(Document, "has_permission", lambda doc, *args, **kwargs: True):
-			with patch.object(frappe, "has_permission", lambda *args, **kwargs: True):
-				result = self._call(write_ticket.post_comment, T26_OUTSIDER, {"content": "x"})
-		self._assert_refused(result)
-		self.assertEqual(_comment_count(), before)
+		self.assertEqual(_said_count(), before)
 
 	# create_task
 
@@ -1155,6 +1142,7 @@ class TestLockedCount(FrappeTestCase):
 		frappe.db.rollback()
 		for ticket in self.committed_tickets:
 			frappe.db.delete("Comment", {"reference_doctype": "HD Ticket", "reference_name": ticket})
+			frappe.db.delete(MESSAGE_DOCTYPE, {"ticket": ticket})
 			frappe.db.delete("HD Ticket", ticket)
 		frappe.db.commit()
 
@@ -1195,15 +1183,15 @@ class TestLockedCount(FrappeTestCase):
 		self.assertEqual(rows, [{"name": other.name, "content": f"{T99_PREFIX} khác"}])
 		self.assertEqual(count, 1)
 
-	def test_post_notice_sees_comment_committed_after_snapshot(self):
+	def test_post_notice_sees_message_committed_after_snapshot(self):
 		# AC-23, AR3-7: a notice another job committed after this transaction's snapshot still blocks a second one.
 		self.addCleanup(frappe.set_user, "Administrator")
 		since = get_datetime("2024-01-01 10:00:00")
 		with self.primary_connection():
 			ticket = self._committed_ticket()
-			filters = {"reference_doctype": "HD Ticket", "reference_name": ticket}
+			filters = {"ticket": ticket}
 			# The first plain read takes this transaction's snapshot.
-			self.assertEqual(frappe.db.count("Comment", filters), 0)
+			self.assertEqual(frappe.db.count(MESSAGE_DOCTYPE, filters), 0)
 		with self.secondary_connection():
 			# Set inside: opening the second connection (frappe.connect) makes Administrator the session user.
 			frappe.set_user(AGENT_USER)
@@ -1211,15 +1199,15 @@ class TestLockedCount(FrappeTestCase):
 			frappe.db.commit()
 		with self.primary_connection():
 			# Precondition: a plain read still sees the snapshot, so only a locking read can see the notice.
-			self.assertEqual(frappe.db.count("Comment", filters), 0)
+			self.assertEqual(frappe.db.count(MESSAGE_DOCTYPE, filters), 0)
 			with patch.object(frappe.db, "commit", side_effect=AssertionError("post_notice must not commit")):
 				result = write_ticket.post_notice(ticket, "run_failed", f"{T99_PREFIX} lần hai", since)
-			comments = write_ticket.locked_rows(ticket, "Comment", filters, fields=("name", "content"))
+			said = write_ticket.locked_rows(ticket, MESSAGE_DOCTYPE, filters, fields=("name", "content"))
 
 		self.assertTrue(posted["ok"], posted)
 		self.assertEqual(result, {"ok": False, "reason": write_ticket.REASON_NOTICE_SENT})
 		prefix = write_ticket.NOTICE_PREFIXES["run_failed"]
-		self.assertEqual(comments, [{"name": posted["comment"], "content": f"{prefix} {T99_PREFIX} lần một"}])
+		self.assertEqual(said, [{"name": posted["message"], "content": f"{prefix} {T99_PREFIX} lần một"}])
 
 
 T100_PREFIX = "ERPAI-TEST-T100"
@@ -1420,7 +1408,8 @@ class TestPostCommentKinds(TicketCommentCase):
 
 
 class TestPostNotice(TicketCommentCase):
-	"""AC-23, NFR-3: one status notice of a kind per ticket since the mark; the dedup read is locked_count's."""
+	"""AC-23, NFR-3: one status notice of a kind per ticket since the mark; the dedup read is locked_count's. ADR-050:
+	a notice is a message of the ticket's conversation."""
 
 	def test_same_notice_since_mark_posted_once(self):
 		since = get_datetime("2024-01-01 10:00:00")
@@ -1428,9 +1417,9 @@ class TestPostNotice(TicketCommentCase):
 		self.assertEqual(
 			set(write_ticket.NOTICE_PREFIXES), {"daily_limit", "over_budget", "run_failed", "ask_fallback"}
 		)
-		# A person's comment with the same text is no notice of the bot.
+		# A person's message with the same text is no notice of the bot.
 		frappe.set_user("Administrator")
-		self.assertTrue(write_ticket._post(self.ticket, f"{prefix} người viết")["ok"])
+		messages.add_message(self.ticket, f"{prefix} người viết", trusted=True)
 		frappe.set_user(AGENT_USER)
 
 		with patch.object(write_ticket, "locked_count", wraps=write_ticket.locked_count) as counted:
@@ -1438,19 +1427,22 @@ class TestPostNotice(TicketCommentCase):
 			again = write_ticket.post_notice(self.ticket, "daily_limit", "lần hai.", since)
 
 		self.assertTrue(first["ok"], first)
-		self.assertEqual(frappe.db.get_value("Comment", first["comment"], "owner"), AGENT_USER)
+		self.assertEqual(frappe.db.get_value(MESSAGE_DOCTYPE, first["message"], "owner"), AGENT_USER)
 		self.assertEqual(again, {"ok": False, "reason": write_ticket.REASON_NOTICE_SENT})
-		self.assertEqual(self._comments(), [f"{prefix} người viết", f"{prefix} đủ 5 lần hôm nay."])
-		self.assertEqual([call.args[:2] for call in counted.call_args_list], [(self.ticket, "Comment")] * 2)
+		self.assertEqual(self._said(), [f"{prefix} người viết", f"{prefix} đủ 5 lần hôm nay."])
+		self.assertEqual(
+			[call.args[:2] for call in counted.call_args_list], [(self.ticket, MESSAGE_DOCTYPE)] * 2
+		)
+		self.assertEqual(self._comments(), [])
 
 		# Another notice is its own key.
 		other = write_ticket.post_notice(self.ticket, "run_failed", "lỗi cổng.", since)
 		self.assertTrue(other["ok"], other)
-		self.assertEqual(len(self._comments()), 3)
+		self.assertEqual(len(self._said()), 3)
 
 		# A notice from before the mark does not count; from after it, it does.
 		frappe.db.set_value(
-			"Comment", first["comment"], "creation", "2024-01-01 09:00:00", update_modified=False
+			MESSAGE_DOCTYPE, first["message"], "creation", "2024-01-01 09:00:00", update_modified=False
 		)
 		earlier = get_datetime("2024-01-01 08:00:00")
 		self.assertEqual(
@@ -1458,12 +1450,12 @@ class TestPostNotice(TicketCommentCase):
 			{"ok": False, "reason": write_ticket.REASON_NOTICE_SENT},
 		)
 		self.assertTrue(write_ticket.post_notice(self.ticket, "daily_limit", "ngày mới.", since)["ok"])
-		self.assertEqual(self._comments()[-1], f"{prefix} ngày mới.")
+		self.assertEqual(self._said()[-1], f"{prefix} ngày mới.")
 
-		before = len(self._comments())
+		before = len(self._said())
 		with self.assertRaises(ValueError):
 			write_ticket.post_notice(self.ticket, "x_unknown", "x", since)
-		self.assertEqual(len(self._comments()), before)
+		self.assertEqual(len(self._said()), before)
 
 
 # The analysis a model writes to the reasoning template (design-w1-fixes-20 Điểm 1.2): no "Căn cứ" section.
@@ -1478,7 +1470,7 @@ def _headings(content: str) -> list[str]:
 
 
 class TestGuidanceWriter(TicketCommentCase):
-	"""AC-65, ADR-036 QĐ 3: the guidance comment is the agent's core Comment whose content opens with the marker."""
+	"""AC-65, ADR-036 QĐ 3: the guidance is the agent's message whose content opens with the marker (ADR-050)."""
 
 	def _run(self, analysis=None, done=(), pending=(), manual=()):
 		"""A fresh guidance collector holding `analysis` and the raw lines of each section; closed at cleanup."""
@@ -1501,8 +1493,8 @@ class TestGuidanceWriter(TicketCommentCase):
 		so the next case of a test may post again."""
 		result = write_ticket.post_guidance(self.ticket, run_id)
 		self.assertTrue(result["ok"], result)
-		content = frappe.db.get_value("Comment", result["comment"], "content")
-		frappe.db.delete("Comment", result["comment"])
+		content = frappe.db.get_value(MESSAGE_DOCTYPE, result["message"], "content")
+		frappe.db.delete(MESSAGE_DOCTYPE, result["message"])
 		return content
 
 	def _run_info(self):
@@ -1552,7 +1544,7 @@ class TestGuidanceWriter(TicketCommentCase):
 			result = write_ticket.post_guidance(self.ticket, self._run(ANALYSIS, done=["Đã làm"]))
 		self.assertTrue(result["ok"], result)
 		self.assertFalse(result["stored"])
-		self.assertEqual(len(self._comments()), 1)
+		self.assertEqual(len(self._said()), 1)
 		row = self._run_info()
 		self.assertFalse(row.ai_analysis or row.ai_done)
 
@@ -1563,61 +1555,25 @@ class TestGuidanceWriter(TicketCommentCase):
 			result = write_ticket.post_guidance(self.ticket, run_id)
 		self.assertTrue(result["ok"], result)
 		self.assertFalse(result["stored"])
-		self.assertEqual(len(self._comments()), 1)
+		self.assertEqual(len(self._said()), 1)
 		row = self._run_info()
 		self.assertFalse(row.ai_analysis or row.ai_done)
-
-	def test_count_ignores_info_other_owner_and_non_prefix(self):
-		marker = write_ticket.GUIDANCE_MARKER
-		self.assertEqual(
-			write_ticket.guidance_filters(self.ticket),
-			{
-				"reference_doctype": "HD Ticket",
-				"reference_name": self.ticket,
-				"comment_type": "Comment",
-				"owner": AGENT_USER,
-				"content": ["like", f"{marker}%"],
-			},
-		)
-		frappe.set_user("Administrator")
-		other = make_ticket(subject=f"{T100_PREFIX} phiếu khác", raised_by=CUSTOMER).name
-		# a person's comment opening with the marker
-		self.assertTrue(write_ticket._post(self.ticket, f"{marker}\nngười viết")["ok"])
-		frappe.set_user(AGENT_USER)
-		# the agent's Info row opening with the marker (ADR-035 QĐ 7)
-		frappe.get_doc("HD Ticket", self.ticket).add_comment("Info", f"{marker}\nthông tin")
-		# the agent's comment with the marker inside, not at position 0 (a proposal or BA note quoting it)
-		self.assertTrue(write_ticket._post(self.ticket, f"Đề xuất của bot\n{marker}")["ok"])
-		# another ticket's guidance
-		self.assertTrue(write_ticket._post(other, f"{marker}\n**Nhận định:** B")["ok"])
-
-		self.assertEqual(write_ticket.count_guidance(self.ticket), 0)
-		self.assertEqual(write_ticket.count_guidance(self.ticket, lock=True), 0)
-
-		self.assertTrue(write_ticket._post(self.ticket, f"{marker}\n**Nhận định:** A")["ok"])
-
-		self.assertEqual(write_ticket.count_guidance(self.ticket), 1)
-		self.assertEqual(write_ticket.count_guidance(self.ticket, lock=True), 1)
-		self.assertEqual(write_ticket.count_guidance(other), 1)
 
 	def test_count_with_lock_goes_through_locked_count(self):
 		with patch.object(write_ticket, "locked_count", return_value=7) as counted:
 			self.assertEqual(write_ticket.count_guidance(self.ticket, lock=True), 7)
-		counted.assert_called_once_with(self.ticket, "Comment", write_ticket.guidance_filters(self.ticket))
+		counted.assert_called_once_with(
+			self.ticket, MESSAGE_DOCTYPE, write_ticket.guidance_filters(self.ticket)
+		)
 
-	def test_marker_survives_save(self):
+	def test_marker_kept_byte_for_byte(self):
+		# a message is a Code field written once: the marker on line 1 stays as written (ADR-050)
 		marker = write_ticket.GUIDANCE_MARKER
-		posted = write_ticket._post(self.ticket, f"{marker}\n**Nhận định:** A\n**Hướng xử lý:** B")
+		posted = write_ticket._say(self.ticket, f"{marker}\n**Nhận định:** A\n**Hướng xử lý:** B")
 		self.assertTrue(posted["ok"], posted)
 
-		stored = frappe.db.get_value("Comment", posted["comment"], "content")
-		self.assertTrue(stored.startswith(f"{marker}\n"), stored)
-		frappe.set_user("Administrator")
-		frappe.get_doc("Comment", posted["comment"]).save()
-
-		self.assertTrue(
-			frappe.db.get_value("Comment", posted["comment"], "content").startswith(f"{marker}\n")
-		)
+		stored = frappe.db.get_value(MESSAGE_DOCTYPE, posted["message"], "content")
+		self.assertEqual(stored, f"{marker}\n**Nhận định:** A\n**Hướng xử lý:** B")
 		self.assertEqual(write_ticket.count_guidance(self.ticket), 1)
 
 	def test_writer_posts_once_second_call_refused(self):
@@ -1634,14 +1590,14 @@ class TestGuidanceWriter(TicketCommentCase):
 			first["counts"],
 			{write_ticket.SECTION_DONE: 1, write_ticket.SECTION_PENDING: 0, write_ticket.SECTION_DECIDE: 0},
 		)
-		self.assertEqual(frappe.db.get_value("Comment", first["comment"], "owner"), AGENT_USER)
+		self.assertEqual(frappe.db.get_value(MESSAGE_DOCTYPE, first["message"], "owner"), AGENT_USER)
 		self.assertEqual(again, refused)
 		self.assertEqual(same_run, refused)
-		self.assertEqual(len(self._comments()), 1)
+		self.assertEqual(len(self._said()), 1)
 		self.assertEqual(write_ticket.count_guidance(self.ticket), 1)
 		self.assertEqual(
 			counted.call_args_list,
-			[call(self.ticket, "Comment", write_ticket.guidance_filters(self.ticket))] * 3,
+			[call(self.ticket, MESSAGE_DOCTYPE, write_ticket.guidance_filters(self.ticket))] * 3,
 		)
 
 	def test_concurrent_snapshot_does_not_double_post(self):
@@ -1662,10 +1618,10 @@ class TestGuidanceWriter(TicketCommentCase):
 			doc.db_insert()
 			frappe.db.commit()
 		ticket = committed[0]
-		filters = {"reference_doctype": "HD Ticket", "reference_name": ticket}
+		filters = {"ticket": ticket}
 		with self.primary_connection():
 			# The first plain read takes this transaction's snapshot.
-			self.assertEqual(frappe.db.count("Comment", filters), 0)
+			self.assertEqual(frappe.db.count(MESSAGE_DOCTYPE, filters), 0)
 		with self.secondary_connection():
 			# Set inside: opening the second connection (frappe.connect) makes Administrator the session user.
 			frappe.set_user(AGENT_USER)
@@ -1673,13 +1629,13 @@ class TestGuidanceWriter(TicketCommentCase):
 			frappe.db.commit()
 		with self.primary_connection():
 			# Precondition: a plain read still sees the snapshot, so only a locking read can see the guidance.
-			self.assertEqual(frappe.db.count("Comment", filters), 0)
+			self.assertEqual(frappe.db.count(MESSAGE_DOCTYPE, filters), 0)
 			result = write_ticket.post_guidance(ticket, later_run)
-			comments = write_ticket.locked_rows(ticket, "Comment", filters)
+			said = write_ticket.locked_rows(ticket, MESSAGE_DOCTYPE, filters)
 
 		self.assertTrue(posted["ok"], posted)
 		self.assertEqual(result, {"ok": False, "reason": write_ticket.REASON_GUIDANCE_EXISTS})
-		self.assertEqual(comments, [{"name": posted["comment"]}])
+		self.assertEqual(said, [{"name": posted["message"]}])
 
 	def _delete_committed(self, tickets):
 		# The primary's locks go first; then the deletes run on the second connection, which committed the rows:
@@ -1689,7 +1645,7 @@ class TestGuidanceWriter(TicketCommentCase):
 			if tickets:
 				frappe.local.db = self._secondary_connection
 				for ticket in tickets:
-					frappe.db.delete("Comment", {"reference_doctype": "HD Ticket", "reference_name": ticket})
+					frappe.db.delete(MESSAGE_DOCTYPE, {"ticket": ticket})
 					frappe.db.delete("HD Ticket", {"name": ticket})
 				frappe.db.commit()
 		finally:
@@ -1697,18 +1653,16 @@ class TestGuidanceWriter(TicketCommentCase):
 			frappe.local.db = self._primary_connection
 
 	def test_deleted_guidance_allows_new_one(self):
-		# ADR-036 QĐ 6: the comment is the source of truth; once deleted, a later run posts again.
+		# ADR-036 QĐ 6: the message is the source of truth; once gone, a later run posts again.
 		first = write_ticket.post_guidance(self.ticket, self._run(ANALYSIS))
 		self.assertTrue(first["ok"], first)
-		frappe.set_user("Administrator")
-		frappe.delete_doc("Comment", first["comment"])
-		frappe.set_user(AGENT_USER)
+		frappe.db.delete(MESSAGE_DOCTYPE, first["message"])
 		self.assertEqual(write_ticket.count_guidance(self.ticket), 0)
 
 		second = write_ticket.post_guidance(self.ticket, self._run(ANALYSIS))
 
 		self.assertTrue(second["ok"], second)
-		self.assertNotEqual(second["comment"], first["comment"])
+		self.assertNotEqual(second["message"], first["message"])
 		self.assertEqual(write_ticket.count_guidance(self.ticket), 1)
 
 	def test_no_analysis_no_items_posts_nothing(self):
@@ -1719,7 +1673,7 @@ class TestGuidanceWriter(TicketCommentCase):
 					write_ticket.post_guidance(self.ticket, run_id),
 					{"ok": False, "reason": write_ticket.REASON_NO_CONTENT},
 				)
-				self.assertEqual(self._comments(), [])
+				self.assertEqual((self._comments(), self._said()), ([], []))
 		self.assertTrue(write_ticket.post_guidance(self.ticket, self._run(ANALYSIS))["ok"])
 
 	def test_no_analysis_with_done_items_uses_fallback(self):
@@ -1751,7 +1705,7 @@ class TestGuidanceWriter(TicketCommentCase):
 			self.ticket, self._run(ANALYSIS, done=["D"], pending=["P"], manual=["L"])
 		)
 		self.assertTrue(result["ok"], result)
-		content = frappe.db.get_value("Comment", result["comment"], "content")
+		content = frappe.db.get_value(MESSAGE_DOCTYPE, result["message"], "content")
 
 		self.assertEqual(
 			content,
@@ -1857,8 +1811,9 @@ class TestGuidanceWriter(TicketCommentCase):
 		self.assertNotIn(head, empty)
 		self.assertNotIn(write_ticket.PENDING_NOTE, empty)
 
-	def test_failure_summary_three_parts_escaped_once(self):
-		# design-w1-fixes-20 Điểm 3.1: done, pending and manual lines apart, each escaped once; no marker, no heading.
+	def test_failure_summary_three_parts_as_raw_text(self):
+		# design-w1-fixes-20 Điểm 3.1: done, pending and manual lines apart, as raw text (the notice is a plain-text
+		# message, ADR-050); no marker, no heading.
 		self.assertEqual(write_ticket.FAILURE_DONE, "Trước khi lỗi, bot đã làm: ")
 		self.assertEqual(write_ticket.FAILURE_PENDING, "Đề xuất đã tạo, đang chờ duyệt: ")
 		self.assertEqual(write_ticket.FAILURE_MANUAL, "Việc người phải làm tay: ")
@@ -1877,13 +1832,13 @@ class TestGuidanceWriter(TicketCommentCase):
 
 		self.assertEqual(
 			summary,
-			f"{write_ticket.FAILURE_DONE}Bot đã phân loại phiếu: Loại A.; &lt;b&gt;&amp;x\n"
+			f"{write_ticket.FAILURE_DONE}Bot đã phân loại phiếu: Loại A.; <b>&x\n"
 			f"{write_ticket.FAILURE_PENDING}Đề xuất CR-1\n"
 			f"{write_ticket.FAILURE_MANUAL}Nhờ trưởng nhóm phân công.",
 		)
 		self.assertEqual(
 			write_ticket.failure_summary(self._run(manual=["<b>&x"])),
-			f"{write_ticket.FAILURE_MANUAL}&lt;b&gt;&amp;x",
+			f"{write_ticket.FAILURE_MANUAL}<b>&x",
 		)
 		self.assertNotIn(write_ticket.GUIDANCE_MARKER, summary)
 		self.assertEqual(_headings(summary), [])
@@ -2077,7 +2032,7 @@ class TestGuidanceWriter(TicketCommentCase):
 		guidance = write_ticket.post_guidance(self.ticket, run_id)
 		self.assertTrue(guidance["ok"], guidance)
 		self.assertEqual(
-			frappe.db.get_value("Comment", guidance["comment"], "content"),
+			frappe.db.get_value(MESSAGE_DOCTYPE, guidance["message"], "content"),
 			f"{write_ticket.GUIDANCE_MARKER}\n{later}",
 		)
 
@@ -2660,59 +2615,97 @@ class TestAnswerInConversation(ConversationCase):
 		self.assertEqual(self._comments(), [])
 
 
-class TestGuidanceReply(ConversationCase):
-	"""CHG-003 Amendment 3: a run a message started whose answer was held for the guidance comment still answers in
-	the conversation, once: the analysis's finding and where the rest of the guidance is."""
+class TestBotSpeaksInConversation(ConversationCase):
+	"""ADR-050: the guidance, the route's sentences and the status notices are messages of the ticket's conversation,
+	written by the agent account; only the BA note stays a ticket comment. The panel shows the guidance as plain text."""
 
-	FINDING = "máy in của kho chưa được cấu hình."
-	ANALYSIS = f"**Nhận định:** {FINDING}\n**Hướng xử lý:** cấu hình lại máy in.\nĐộ tin cậy: 90%"
+	def _guidance_run(self, analysis, done=(), pending=(), manual=()):
+		run_id = f"{T100_PREFIX}-{frappe.generate_hash(length=10)}"
+		self.addCleanup(write_ticket.close_collector, run_id)
+		write_ticket.open_collector(run_id)
+		write_ticket.hold_analysis(run_id, analysis)
+		for section, lines in (
+			(write_ticket.SECTION_DONE, done),
+			(write_ticket.SECTION_PENDING, pending),
+			(write_ticket.SECTION_DECIDE, manual),
+		):
+			for line in lines:
+				write_ticket.collect(run_id, section, line)
+		return run_id
 
-	def _collecting(self, ctx, analysis=None):
-		write_ticket.open_collector(ctx.run_id)
-		self.addCleanup(write_ticket.close_collector, ctx.run_id)
-		if analysis is not None:
-			write_ticket.hold_analysis(ctx.run_id, analysis)
-		return ctx
+	def test_guidance_is_a_message_of_the_bot_not_a_comment(self):
+		run_id = self._guidance_run(ANALYSIS, done=["Đã làm"])
 
-	def test_held_answer_gets_one_message_with_the_finding_and_the_pointer(self):
-		ctx = self._collecting(self._ctx(), self.ANALYSIS)
+		result = write_ticket.post_guidance(self.ticket, run_id)
 
-		result = write_ticket.post_guidance_reply(ctx)
+		self.assertTrue(result["ok"], result)
+		(row,) = self._messages()
+		self.assertEqual(result["message"], row.name)
+		self.assertEqual((row.owner, row.run_id), (AGENT_USER, run_id))
+		self.assertTrue(row.content.startswith(f"{write_ticket.GUIDANCE_MARKER}\n"))
+		self.assertEqual(self._comments(), [])
+		self.assertEqual(write_ticket.count_guidance(self.ticket), 1)
+		self.assertEqual(write_ticket.count_guidance(self.ticket, lock=True), 1)
+
+	def test_only_the_bots_message_opening_with_the_marker_is_the_guidance(self):
+		marker = write_ticket.GUIDANCE_MARKER
+		self.assertEqual(
+			write_ticket.guidance_filters(self.ticket),
+			{"ticket": self.ticket, "owner": AGENT_USER, "content": ["like", f"{marker}%"]},
+		)
+		frappe.set_user("Administrator")
+		other = make_ticket(subject=f"{T100_PREFIX} phiếu khác", raised_by=CUSTOMER).name
+		# a person's message opening with the marker
+		messages.add_message(self.ticket, f"{marker}\nngười viết", trusted=True)
+		frappe.set_user(AGENT_USER)
+		# the bot's message with the marker inside, not at position 0
+		self.assertTrue(write_ticket._say(self.ticket, f"Đề xuất của bot\n{marker}")["ok"])
+		# another ticket's guidance
+		self.assertTrue(write_ticket._say(other, f"{marker}\n**Nhận định:** B")["ok"])
+
+		self.assertEqual(write_ticket.count_guidance(self.ticket), 0)
+		self.assertTrue(write_ticket._say(self.ticket, f"{marker}\n**Nhận định:** A")["ok"])
+		self.assertEqual(write_ticket.count_guidance(self.ticket), 1)
+
+	def test_route_sentences_are_one_message_as_written(self):
+		ctx = self._ctx()
+
+		result = route_ticket.post_routing_comment(["Bot đã phân loại phiếu: Loại X.", "A & <b>B</b>"], ctx)
 
 		(row,) = self._messages()
 		self.assertEqual(result, {"ok": True, "message": row.name})
 		self.assertEqual(
 			(row.owner, row.content, row.run_id),
-			(AGENT_USER, f"Nhận định: {self.FINDING}\n\n{write_ticket.GUIDANCE_REPLY}", ctx.run_id),
+			(AGENT_USER, "Bot đã phân loại phiếu: Loại X.\nA & <b>B</b>", ctx.run_id),
 		)
 		self.assertEqual(self._comments(), [])
 
-	def test_no_finding_only_the_pointer(self):
-		ctx = self._collecting(self._ctx(), "Cấu hình lại máy in.\nĐộ tin cậy: 90%")
+	def test_thread_shows_the_guidance_as_plain_text_with_its_kind(self):
+		run_id = self._guidance_run(
+			"**Nhận định:** A & B\n**Hướng xử lý:** làm C",
+			done=["Đã làm <x>"],
+			pending=["Đề xuất CP-1"],
+			manual=["Người làm D"],
+		)
+		write_ticket.post_guidance(self.ticket, run_id)
+		frappe.set_user("Administrator")
+		marked = f"{write_ticket.GUIDANCE_MARKER}\n<b>người</b>"
+		messages.add_message(self.ticket, marked, trusted=True)
+		messages.add_message(self.ticket, "tin <b>của người</b> &amp;", trusted=True)
 
-		write_ticket.post_guidance_reply(ctx)
+		guidance, forged, person = messages.thread(self.ticket)
 
-		self.assertEqual([row.content for row in self._messages()], [write_ticket.GUIDANCE_REPLY])
-
-	def test_run_not_started_by_a_message_gets_none(self):
-		ctx = self._collecting(dataclasses.replace(self._ctx(), in_conversation=False), self.ANALYSIS)
-
-		self.assertIsNone(write_ticket.post_guidance_reply(ctx))
-		self.assertEqual(self._messages(), [])
-
-	def test_run_that_already_answered_gets_none(self):
-		ctx = self._collecting(self._ctx(), self.ANALYSIS)
-		self._post("hoi", "Máy in nào?", ctx)
-
-		self.assertIsNone(write_ticket.post_guidance_reply(ctx))
-		self.assertEqual([row.content for row in self._messages()], ["Máy in nào?"])
-
-	def test_another_run_message_does_not_count(self):
-		ctx = self._collecting(self._ctx(), self.ANALYSIS)
-		self._post("hoi", "Máy in nào?", self._ctx())
-
-		self.assertTrue(write_ticket.post_guidance_reply(ctx)["ok"])
-		self.assertEqual(len(self._messages()), 2)
+		self.assertEqual(guidance["kind"], messages.KIND_GUIDANCE)
+		self.assertEqual(messages.KIND_GUIDANCE, "guidance")
+		self.assertEqual(
+			guidance["text"],
+			"**Nhận định:** A & B\n**Hướng xử lý:** làm C\n- Người làm D\n\n"
+			"Đã làm:\n- Đã làm <x>\n\n"
+			f"Chờ duyệt: {write_ticket.PENDING_NOTE}\n- Đề xuất CP-1",
+		)
+		# a person's text is shown as typed, whatever it starts with
+		self.assertEqual((forged["kind"], forged["text"]), ("", marked))
+		self.assertEqual((person["kind"], person["text"]), ("", "tin <b>của người</b> &amp;"))
 
 
 class TestLevelNotRecomputed(FrappeTestCase):

@@ -5886,3 +5886,191 @@ class TestKnowledgeActions(RequesterReplyRunBase):
 		self.assertEqual(results["t_ask"], {"ok": False, "reason": write_ticket.REASON_ONE_ASK})
 		self.assertEqual(self._sent(), [])
 		self.assertEqual(self._fallbacks(), [])
+
+
+KB_DRAFT = "kb_draft"
+RESOLUTION = f"<p>{PREFIX}đã cấu hình lại máy in của kho 2</p>"
+
+
+class TestKbDraftRun(GuidanceTestBase):
+	"""AC-45 (T164, U6b.md:284-288, ADR-033 QĐ 3, 4): the knowledge-draft run of a closed ticket has the fixed grant row,
+	is not counted by the daily limit and posts no notice."""
+
+	def setUp(self):
+		super().setUp()
+		pin_agent_roles(self)
+		# the reply switch is on: the knowledge-draft run still has no reply tool
+		set_agent_settings(kb_draft_enabled=1, reply_enabled=1)
+		self._close(self.ticket.name)
+
+	def _close(self, ticket, resolution=RESOLUTION):
+		frappe.db.set_value(
+			"HD Ticket",
+			ticket,
+			{"status": "Resolved", "status_category": "Resolved", "resolution_details": resolution},
+			update_modified=False,
+		)
+
+	def _kb_run(self, ticket=None):
+		runner.run_for_ticket(ticket or self.ticket.name, KB_DRAFT)
+
+	def _skip_reasons(self):
+		return [entry.stop_reason for entry in self._entries(entry_type="skip")]
+
+	def _by(self, owner, content):
+		"""A comment of `owner` on the ticket, and the ticket handed to `owner` (a ToDo row, ADR-019)."""
+		frappe.set_user("Administrator")
+		frappe.get_doc(
+			{
+				"doctype": "ToDo",
+				"allocated_to": owner,
+				"reference_type": "HD Ticket",
+				"reference_name": self.ticket.name,
+				"description": f"{PREFIX}giao phiếu",
+				"status": "Closed",
+			}
+		).insert(ignore_permissions=True)
+		frappe.get_doc(
+			{
+				"doctype": "Comment",
+				"comment_type": "Comment",
+				"reference_doctype": "HD Ticket",
+				"reference_name": self.ticket.name,
+				"content": content,
+				"owner": owner,
+			}
+		).insert(ignore_permissions=True)
+
+	def test_no_resolution_content_skipped(self):
+		# A-16: no resolution details and no comment of a person the ticket was given to: nothing to write from
+		self._close(self.ticket.name, resolution="<p><br></p>")
+		self._kb_run()
+		self.assertEqual(self.gateway.call_count, 0)
+		self.assertEqual(self._skip_reasons(), ["no_resolution_content"])
+
+		# the bot's own comment is not a person's, even when the ticket was handed to the bot
+		self._by(AGENT_USER, f"{PREFIX}bot ghi chú")
+		self._kb_run()
+		self.assertEqual(self.gateway.call_count, 0)
+		self.assertEqual(self._skip_reasons(), ["no_resolution_content"] * 2)
+
+		self._by(make_active_agent(self), f"{PREFIX}đã cấu hình lại máy in")
+		self._kb_run()
+		self.assertEqual(self.gateway.call_count, 1)
+		self.assertEqual(self._skip_reasons(), ["no_resolution_content"] * 2)
+
+	def test_off_open_or_drafted_ticket_skipped(self):
+		# U6b.md:284, in this order: the switch, the ticket closed, its article not yet written
+		cases = (
+			("kb_draft_off", lambda: set_agent_settings(kb_draft_enabled=0)),
+			(
+				"not_closed",
+				lambda: frappe.db.set_value(
+					"HD Ticket",
+					self.ticket.name,
+					{"status": "Open", "status_category": "Open"},
+					update_modified=False,
+				),
+			),
+			(
+				"kb_exists",
+				lambda: frappe.get_doc(
+					{
+						"doctype": "HD Article",
+						"title": f"{PREFIX}bài đã có",
+						"content": "<p>x</p>",
+						"status": "Draft",
+						"ai_source_ticket": self.ticket.name,
+					}
+				).insert(ignore_permissions=True),
+			),
+		)
+		for reason, arrange in cases:
+			with self.subTest(reason):
+				frappe.db.savepoint("erp_ai_kb_case")
+				try:
+					frappe.set_user("Administrator")
+					arrange()
+					self._kb_run()
+					self.assertEqual(self.gateway.call_count, 0)
+					self.assertEqual(self._skip_reasons(), [reason])
+				finally:
+					frappe.db.rollback(save_point="erp_ai_kb_case")
+
+	def test_level_l0_skipped(self):
+		set_agent_settings(permission_level="L0")
+		self._kb_run()
+
+		self.assertEqual(self.gateway.call_count, 0)
+		self.assertEqual(self._skip_reasons(), ["level_L0"])
+
+	def test_not_counted_in_daily_limit(self):
+		# ADR-033 QĐ 4: step (d) is not checked for kb_draft, and its rows are not counted (RUN_LIMIT_TRIGGERS)
+		set_agent_settings(max_runs_per_ticket_per_day=DAILY_LIMIT)
+		self._seed_runs(DAILY_LIMIT)
+		self.assertEqual(policy.runs_today(self.ticket.name), DAILY_LIMIT)
+
+		self._kb_run()
+
+		self.assertEqual(self.gateway.call_count, 1)
+		self.assertEqual(self._skip_reasons(), [])
+		self.assertEqual([entry.trigger for entry in self._entries(entry_type="reason")], [KB_DRAFT])
+		self.assertEqual(policy.runs_today(self.ticket.name), DAILY_LIMIT)
+
+	def test_no_notice_comments_on_kb_draft(self):
+		# U6b-fixes Sửa 9, E-2: no NOTICE_TRIGGERS cell has kb_draft, so a closed ticket hears nothing from this run
+		def agent_comments(ticket):
+			return frappe.db.count(
+				"Comment", {"reference_doctype": "HD Ticket", "reference_name": ticket, "owner": AGENT_USER}
+			)
+
+		with self.subTest("over budget, base level L3"):
+			set_agent_settings(permission_level="L3")
+			self.month_spend.return_value = 2000.0
+			self._kb_run()
+			self.assertEqual(self.gateway.call_count, 1)
+			self.assertEqual(agent_comments(self.ticket.name), 0)
+
+		with self.subTest("the model gateway fails"):
+			self.month_spend.return_value = 0.0
+			frappe.set_user("Administrator")
+			other = make_ticket(subject=f"{PREFIX}kb draft failure").name
+			self._close(other)
+			self.gateway.results = [GatewayError("server_error", status=500)]
+			self._kb_run(other)
+			self.assertEqual(agent_comments(other), 0)
+			(failed,) = frappe.get_all(
+				LOG_DOCTYPE,
+				filters={"ticket": other, "entry_type": "reason"},
+				fields=["trigger", "stop_reason", "error", "actions"],
+			)
+			self.assertEqual(
+				(failed.trigger, failed.stop_reason, failed.error, failed.actions),
+				(KB_DRAFT, runner.STOP_GATEWAY_ERROR, "server_error status=500", None),
+			)
+
+	def test_fixed_row_writes_one_article_entry(self):
+		# the context of a knowledge-draft run: no instructor, never below the threshold, the KB-draft row, no reply
+		call = tool_use(
+			"t_kb",
+			"create_kb_draft",
+			title=f"{PREFIX}máy in kho 2",
+			problem=f"{PREFIX}máy in của kho 2 không in được hóa đơn",
+			resolution_steps=[f"{PREFIX}cấu hình lại máy in"],
+		)
+		self.gateway.results = [tool_turn(call), make_model_result()]
+		self._kb_run()
+
+		names = [tool["name"] for tool in self.gateway.calls[0]["tools"]]
+		self.assertIn("create_kb_draft", names)
+		self.assertFalse({"post_comment", REPLY_TOOL, "create_task"} & set(names), names)
+		(article,) = frappe.get_all(
+			"HD Article", filters={"ai_source_ticket": self.ticket.name}, pluck="name"
+		)
+		first = self._entries(entry_type="reason")[0]
+		self.assertIsNone(first.instructor)
+		(entry,) = json.loads(first.actions)
+		self.assertEqual(
+			entry, action_entry("create_kb_draft", "HD Article", article, True, value_after=call["input"])
+		)
+		self.assertEqual(self._skip_reasons(), [])

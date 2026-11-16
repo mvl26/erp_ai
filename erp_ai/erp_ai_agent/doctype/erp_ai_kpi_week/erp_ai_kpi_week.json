@@ -76,7 +76,7 @@
    "label": "Phản hồi trong 5 phút (%)"
   },
   {
-   "description": "KPI 1. Số phiếu tạo trong tuần (mẫu của KPI 1).",
+   "description": "KPI 1. Số phiếu tạo trong tuần đã có phản hồi đầu tiên (mẫu của KPI 1, các giá trị tạo nên trung vị).",
    "fieldname": "first_response_sample",
    "fieldtype": "Int",
    "label": "Mẫu KPI 1"

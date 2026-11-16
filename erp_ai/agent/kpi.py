@@ -111,11 +111,13 @@ def _first_response(ws: datetime, we: datetime) -> dict:
 		for row in tickets
 		if row.first_responded_on
 	]
-	sample = len(tickets)
+	sample = len(minutes)  # R21a: the sample of a median is the values it is computed from
 	return {
 		"first_response_median_min": median(minutes) if minutes else None,
-		"first_response_within_15_pct": _pct(sum(m <= FAST_RESPONSE_MINUTES for m in minutes), sample),
-		"first_response_within_5_pct": _pct(sum(m <= FASTEST_RESPONSE_MINUTES for m in minutes), sample),
+		"first_response_within_15_pct": _pct(sum(m <= FAST_RESPONSE_MINUTES for m in minutes), len(tickets)),
+		"first_response_within_5_pct": _pct(
+			sum(m <= FASTEST_RESPONSE_MINUTES for m in minutes), len(tickets)
+		),
 		"first_response_sample": sample,
 	}
 

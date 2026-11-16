@@ -344,3 +344,21 @@ class TestReplyToRequester(ReplyCase):
 		self.assertNotIn("fake-reply-secret", content)
 		self.assertNotIn("fake-src", content)
 		self.assertIn(MASK, content)
+
+	def test_value_starting_with_angle_bracket_masked(self):
+		"""R17a (NFR-6): the text is masked before it is escaped, so a value that starts with `<` is still caught
+		(escaped first, it would start with `&lt;`, which no masking rule reads as a value)."""
+		ticket = self._ticket()
+
+		content = self._content(
+			self._reply(
+				ticket,
+				message="ERPAI-TEST\npassword: <fake-reply-angle>\napi_key=<fake-reply-key>",
+				sources=["token: <fake-src-angle>"],
+			)
+		)
+
+		for secret in ("fake-reply-angle", "fake-reply-key", "fake-src-angle"):
+			with self.subTest(secret=secret):
+				self.assertNotIn(secret, content)
+		self.assertEqual(content.count(MASK), 3, content)

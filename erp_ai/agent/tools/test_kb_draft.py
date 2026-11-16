@@ -1,4 +1,4 @@
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import frappe
 from frappe.tests.utils import FrappeTestCase
@@ -210,3 +210,50 @@ class TestCreateKbDraft(KbDraftCase):
 			self.assertNotIn(secret, article.content)
 		self.assertIn("&lt;script&gt;", article.content)
 		self.assertIn(MASK, article.content)
+
+	def test_value_starting_with_angle_bracket_masked(self):
+		"""R17a (NFR-6): each piece is masked before it is escaped, so a value that starts with `<` is still caught
+		(escaped first, it would start with `&lt;`, which no masking rule reads as a value)."""
+		ticket = self._ticket()
+
+		result = self._draft(
+			ticket,
+			problem="ERPAI-TEST máy in lỗi, password: <fake-kb-angle> trong cấu hình",
+			resolution_steps=["api_key=<fake-kb-step-angle>", "In lại"],
+		)
+
+		self.assertTrue(result["ok"], result)
+		content = frappe.db.get_value("HD Article", result["article"], "content")
+		for secret in ("fake-kb-angle", "fake-kb-step-angle"):
+			with self.subTest(secret=secret):
+				self.assertNotIn(secret, content)
+		self.assertEqual(content.count(MASK), 2, content)
+
+	def test_ticket_locked_before_article_check(self):
+		"""R17e: the ticket row is locked (`for_update`, as lifecycle does) before the check for an existing article,
+		so two runs on one ticket cannot both pass that check."""
+		ticket = self._ticket()
+		db = MagicMock()
+
+		with (
+			patch.object(frappe.db, "get_value", wraps=frappe.db.get_value) as get_value,
+			patch.object(frappe.db, "exists", wraps=frappe.db.exists) as exists,
+		):
+			db.attach_mock(get_value, "get_value")
+			db.attach_mock(exists, "exists")
+			self.assertTrue(self._draft(ticket)["ok"])
+
+		calls = db.mock_calls
+		check = next(
+			index
+			for index, entry in enumerate(calls)
+			if entry[0] == "exists" and entry.args[:1] == (kb_draft.ARTICLE_DOCTYPE,)
+		)
+		locks = [
+			entry
+			for entry in calls[:check]
+			if entry[0] == "get_value"
+			and entry.args[:2] == ("HD Ticket", ticket)
+			and entry.kwargs.get("for_update") is True
+		]
+		self.assertEqual(len(locks), 1, calls[:check])

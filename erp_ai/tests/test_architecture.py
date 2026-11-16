@@ -2751,6 +2751,41 @@ def _proposal_deny_violations(rel: str, tree: ast.AST) -> list:
 	return violations
 
 
+def check_propose_change_builds_no_target_itself(sources: dict) -> list:
+	"""CHG-008 design 8.2: `propose_change._comment` takes the first sentence from `change_text.proposal_target`
+	and does not choose a branch itself: no `CHANGE_KIND_CODE` and no `is_new_file` in its body."""
+	source = sources.get(PROPOSE_TOOL_FILE)
+	if source is None:
+		return _missing(PROPOSE_TOOL_FILE)
+	comment = next(
+		(
+			n
+			for n in ast.walk(parse(PROPOSE_TOOL_FILE, source))
+			if isinstance(n, ast.FunctionDef) and n.name == "_comment"
+		),
+		None,
+	)
+	if comment is None:
+		return [f"{PROPOSE_TOOL_FILE}: no function _comment"]
+	violations = []
+	if not any(
+		(dotted_name(c.func) or "").endswith("proposal_target")
+		for c in ast.walk(comment)
+		if isinstance(c, ast.Call)
+	):
+		violations.append(
+			f"{PROPOSE_TOOL_FILE}:{comment.lineno}: _comment does not call change_text.proposal_target"
+		)
+	for node in ast.walk(comment):
+		if isinstance(node, ast.Name) and node.id == "CHANGE_KIND_CODE":
+			violations.append(f"{PROPOSE_TOOL_FILE}:{node.lineno}: _comment compares CHANGE_KIND_CODE itself")
+		elif isinstance(node, ast.Constant) and node.value == "is_new_file":
+			violations.append(f"{PROPOSE_TOOL_FILE}:{node.lineno}: _comment reads is_new_file itself")
+		elif isinstance(node, ast.Attribute) and node.attr == "is_new_file":
+			violations.append(f"{PROPOSE_TOOL_FILE}:{node.lineno}: _comment reads is_new_file itself")
+	return violations
+
+
 def check_tool_never_saves_proposal(sources: dict) -> list:
 	"""ADR-011 Ràng buộc: a tool only `.insert()`s a proposal. In agent/tools/**, a module that loads or creates a
 	proposal has no `.save(`/`db_set`/`set_value` at all; any other module never passes the proposal to one; a
@@ -5719,6 +5754,20 @@ class TestArchitecture(unittest.TestCase):
 		scanned = load_product_sources(suffixes=(".py", ".json"))
 		self.assertIn(PROPOSAL_DOCTYPE_FILE, scanned)
 		self.assertEqual(check_proposal_doctype_permissions(scanned), [])
+
+	def test_propose_change_builds_no_target_itself(self):
+		# CHG-008 design 8.2: the card and the comment share one builder, so the tool must not rebuild it
+		self.assertEqual(check_propose_change_builds_no_target_itself(self.sources), [])
+		clean = self.sources[PROPOSE_TOOL_FILE]
+		no_call = check_propose_change_builds_no_target_itself(
+			{PROPOSE_TOOL_FILE: clean.replace("proposal_target(", "x(")}
+		)
+		self.assertTrue(any("does not call change_text.proposal_target" in text for text in no_call), no_call)
+		for needle in ("proposal.is_new_file", 'proposal.get("is_new_file")', "CHANGE_KIND_CODE"):
+			with self.subTest(needle=needle):
+				source = clean.replace("\tform = f", f"\t_ = {needle}\n\tform = f", 1)
+				found = check_propose_change_builds_no_target_itself({PROPOSE_TOOL_FILE: source})
+				self.assertTrue(any("itself" in text for text in found), found)
 
 	def test_tool_never_saves_proposal(self):
 		self.assertIn("proposal.insert()", self.sources[PROPOSE_TOOL_FILE])

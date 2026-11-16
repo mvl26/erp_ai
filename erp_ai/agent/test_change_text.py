@@ -9,11 +9,15 @@ from erp_ai.agent.change_text import (
 	apply_message,
 	message_text,
 	proposal_notes,
+	proposal_target,
+	proposal_target_text,
 	safe_person_name,
 	undo_message,
 )
 from erp_ai.agent.tools.change_guard import FileOp
 from erp_ai.constants import (
+	CHANGE_KIND_CODE,
+	CHANGE_KIND_COMMAND,
 	CHANGE_OP_CREATE,
 	CHANGE_OP_DELETE,
 	CHANGE_OP_EDIT,
@@ -792,3 +796,39 @@ class TestRestartLabel(FrappeTestCase):
 				with self.assertRaises(ValueError) as caught:
 					proposal_notes(code_fields(restart_status=status))
 				self.assertEqual(str(caught.exception), f"restart_status không hỗ trợ: {status!r}")
+
+
+class TestProposalTarget(FrappeTestCase):
+	"""CHG-008 design 3.4: one builder of the target sentence of a proposal, shared by the comment and the card."""
+
+	def test_block_with_operations_names_count_and_app(self):
+		fields = {"operations": [{}, {}, {}], "command_list": '[["restart"]]', "app": "erp_ai"}
+		self.assertEqual(proposal_target(fields), ("khối 3 mục trong app erp_ai", None))
+		self.assertEqual(proposal_target_text(fields), "khối 3 mục trong app erp_ai")
+
+	def test_app_carrying_a_url_is_shown_empty(self):
+		fields = {"operations": [{}, {}], "app": "https://evil.example/x"}
+		self.assertEqual(proposal_target(fields), ("khối 2 mục trong app ", None))
+		self.assertNotIn("://", proposal_target_text(fields))
+
+	def test_block_of_commands_only_counts_every_command(self):
+		fields = {"command_list": '[["migrate"], ["restart"]]', "change_kind": CHANGE_KIND_COMMAND}
+		self.assertEqual(proposal_target(fields), ("2 lệnh bench", None))
+		self.assertEqual(proposal_target_text(fields), "2 lệnh bench")
+
+	def test_code_proposal_says_create_or_edit_with_the_path(self):
+		new = {"change_kind": CHANGE_KIND_CODE, "is_new_file": 1, "file_path": 'erp_ai/<a>&"b.py'}
+		old = {**new, "is_new_file": 0}
+		self.assertEqual(proposal_target(new), ("tạo", 'erp_ai/<a>&"b.py'))
+		self.assertEqual(proposal_target(old), ("sửa", 'erp_ai/<a>&"b.py'))
+		self.assertEqual(proposal_target_text(old), 'sửa erp_ai/<a>&"b.py')
+
+	def test_command_proposal_joins_argv_with_semicolons(self):
+		# a bare `command_list` is a block of commands; only the legacy shape (no list) falls to this branch
+		self.assertEqual(
+			proposal_target({"change_kind": CHANGE_KIND_COMMAND, "command_list": None}), ("lệnh", "bench ")
+		)
+
+	def test_accepts_a_document_as_well_as_a_dict(self):
+		doc = frappe._dict(operations=[{}], app="erp_ai")
+		self.assertEqual(proposal_target(doc), ("khối 1 mục trong app erp_ai", None))

@@ -116,7 +116,8 @@ def _store(
 	"""Create the lesson of one event, or return the one already made for `event_key` (NFR-4).
 
 	With `updatable`, an existing lesson takes the new situation, text, author and recomputed status and one
-	`Cập nhật` event. Returns None (writes nothing) when learning is off, the ticket is one the bot must not
+	`Cập nhật` event; a new status clears the last decision, and the same situation, text and status write
+	nothing. Returns None (writes nothing) when learning is off, the ticket is one the bot must not
 	take (NFR-1), the source gives no lesson for this actor, or the text is empty.
 
 	Raises:
@@ -143,6 +144,11 @@ def _store(
 		if not updatable:
 			return existing
 		doc = frappe.get_doc(LESSON_DOCTYPE, existing, for_update=True)
+		stored = (doc.situation or "", doc.lesson_text or "", doc.lesson_status)
+		if stored == (situation, lesson_text, status):
+			return doc.name
+		if doc.lesson_status != status:
+			doc.update({"reviewed_by": None, "reviewed_at": None})
 		doc.update(
 			{"situation": situation, "lesson_text": lesson_text, "author": user, "lesson_status": status}
 		)
@@ -206,16 +212,21 @@ def transition(name: str, action: str) -> str:
 
 
 def safely(func, *args, **kwargs) -> str | None:
-	"""Run a store call for a source inside a person's request; never breaks that request (QĐ 5).
+	"""Run a store call for a source inside a person's request so that its failure does not fail the request (QĐ 5).
 
-	On any exception the store's writes are undone to the savepoint, one Error Log with secrets masked is
-	written, and None is returned; the person's own writes before the call stay.
+	On any exception the store's writes are undone to the savepoint, the messages it queued for the response
+	are dropped, one Error Log with secrets masked is written, and None is returned; the person's own writes
+	and messages from before the call stay. It re-raises only when the savepoint itself is gone (e.g. a
+	deadlock already rolled back the whole transaction).
 	"""
+	queued = len(frappe.local.message_log)
 	frappe.db.savepoint(SAVEPOINT)
 	try:
 		return func(*args, **kwargs)
 	except Exception:
 		frappe.db.rollback(save_point=SAVEPOINT)
+		# frappe.throw/msgprint queued these before raising; left in place they reach the person as an error dialog.
+		del frappe.local.message_log[queued:]
 		frappe.log_error(
 			title=TITLE_STORE_FAILED,
 			message=redact_secrets(frappe.get_traceback()) or TITLE_STORE_FAILED,

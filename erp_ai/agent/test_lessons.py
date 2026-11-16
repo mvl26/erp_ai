@@ -180,6 +180,36 @@ class TestLessonStore(FrappeTestCase):
 		self.assertEqual(doc.history[1].actor, PLAIN)
 		self.assertIsNotNone(doc.history[1].happened_at)
 
+	def test_update_with_same_content_is_noop(self):
+		name = self._store(INSTRUCTOR, "test:same", authorized=True, updatable=True)
+		modified = frappe.db.get_value(LESSON_DOCTYPE, name, "modified")
+		again = self._store(
+			INSTRUCTOR_MANAGER,
+			"test:same",
+			authorized=True,
+			updatable=True,
+			situation="  Máy in   không in được ",
+			text="Phiếu máy in\nchuyển nhóm IT",
+		)
+		self.assertEqual(again, name)
+		self.assertEqual(_steps(name), ["Tạo"])
+		row = frappe.db.get_value(LESSON_DOCTYPE, name, ["author", "modified"], as_dict=True)
+		self.assertEqual((row.author, row.modified), (INSTRUCTOR, modified))
+
+	def test_update_that_changes_status_clears_review(self):
+		name = self._store(PLAIN, "test:review", updatable=True)
+		self._transition(REVIEWER, name, "approve")
+		self._store(INSTRUCTOR, "test:review", authorized=True, updatable=True, text="Bài đã sửa lần một")
+		row = frappe.db.get_value(LESSON_DOCTYPE, name, ["lesson_status", "reviewed_by"], as_dict=True)
+		self.assertEqual((row.lesson_status, row.reviewed_by), (LESSON_STATUS_ACTIVE, REVIEWER))
+		self._store(PLAIN, "test:review", authorized=False, updatable=True, text="Bài đã sửa lần hai")
+		doc = frappe.get_doc(LESSON_DOCTYPE, name)
+		self.assertEqual(
+			(doc.lesson_status, doc.reviewed_by, doc.reviewed_at, doc.lesson_text),
+			(LESSON_STATUS_PENDING, None, None, "Bài đã sửa lần hai"),
+		)
+		self.assertEqual([row.step for row in doc.history], ["Tạo", "Duyệt", "Cập nhật", "Cập nhật"])
+
 	def test_learning_off_makes_nothing(self):
 		set_agent_settings(lessons_enabled=0)
 		for source in (LESSON_SOURCE_CORRECTION, LESSON_SOURCE_TEACHING, LESSON_SOURCE_OUTCOME):
@@ -357,3 +387,31 @@ class TestLessonStore(FrappeTestCase):
 		self.assertNotIn("sk-ant-api03-", error)
 		self.assertNotIn(FAKE_KEY[13:], error)
 		self.assertEqual(lessons.safely(lambda value: value, "giá trị"), "giá trị")
+
+	def test_safely_drops_the_messages_of_a_swallowed_failure(self):
+		# A message left in message_log goes back on the person's successful response as a red dialog.
+		self.addCleanup(setattr, frappe.local, "message_log", list(frappe.local.message_log))
+		frappe.msgprint("Tin của chính người dùng")
+		before = list(frappe.local.message_log)
+
+		def warn_then_throw():
+			frappe.msgprint("Cảnh báo trong kho")
+			frappe.throw("Kho bài học lỗi")
+
+		self.assertIsNone(lessons.safely(warn_then_throw))
+		self.assertEqual(frappe.local.message_log, before)
+		frappe.set_user(AGENT_USER)
+		self.assertIsNone(
+			lessons.safely(
+				lessons._store,
+				LESSON_SOURCE_CORRECTION,
+				"test:agent-message",
+				situation="Tình huống",
+				text="Bài học",
+				authorized=True,
+				ticket=self.ticket,
+			)
+		)
+		frappe.set_user("Administrator")
+		self.assertEqual(frappe.local.message_log, before)
+		self.assertEqual(_count(), 0)

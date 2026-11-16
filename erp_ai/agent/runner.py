@@ -344,8 +344,16 @@ def _run(ticket_name, trigger, message_name=None, communication_name=None):
 			# ADR-036 QĐ 7: the one count, read once; the mode is chosen once the classification is known
 			posted = count_guidance(ticket_name) > 0
 			# ADR-037 QĐ 1: a later run whose latest classification is below the threshold for this run (its
-			# instructor, its switch) runs the classification step again; decided on the data, not the trigger
-			reclassify = trigger != TRIGGER_TICKET_INSERT and category is not None and context.below_threshold
+			# instructor, its switch) runs the classification step again; decided on the data, not the trigger.
+			# CHG-005: a later run on a ticket with no classify row with a result classifies first, unless it is
+			# the knowledge-draft run or the person typed all three fields at creation (FEAT-007 AC-16, AC-21)
+			if trigger == TRIGGER_TICKET_INSERT:
+				reclassify = False
+			elif category is not None:
+				reclassify = context.below_threshold
+			else:
+				typed = created_labels(frappe.db.get_value("HD Ticket", ticket_name, CREATED_LABELS_FIELD))
+				reclassify = not kb_run and not set(CLASSIFICATION_FIELDS) <= set(typed)
 		if trigger == TRIGGER_TICKET_INSERT or reclassify:
 			proceed, classified, context = _classify(
 				ticket_name,

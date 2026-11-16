@@ -8,10 +8,12 @@ from frappe.tests.utils import FrappeTestCase
 from erp_ai.agent.changes import file_writer, process_runner
 from erp_ai.agent.changes.process_runner import (
 	ENV_ALLOWLIST,
+	OUTPUT_LINE_MAX_CHARS,
 	OUTPUT_MAX_LINES,
 	CommandResult,
 	run_bench,
 )
+from erp_ai.agent.redact import MASK, redact_secrets
 from erp_ai.agent.tools import source
 from erp_ai.constants import RESTART_LAUNCH_TIMEOUT_S, RESTART_TIMEOUT_S
 from erp_ai.test_utils import GitSandbox
@@ -696,6 +698,9 @@ class TestLaunchRestart(FrappeTestCase):
 
 CONSOLE_SCRIPT = "print(frappe.local.site)\n"
 CONSOLE_ARGV = ["bench", "--site", "miyano", "execute", "erp_ai.console_entry.run"]
+# A 44-character quoted secret that crosses the 1000-character line cut (a long one-line repr).
+DB_SECRET = "Q7wE9rT2yU4iO6pA8sD0fG1hJ3kL5zX7cV9bN2mQ4wE6"
+LONG_SECRET_LINE = "x" * 960 + f"'db_password': '{DB_SECRET}'"
 
 
 class TestRunConsole(FrappeTestCase):
@@ -707,12 +712,19 @@ class TestRunConsole(FrappeTestCase):
 		self.addCleanup(patcher.stop)
 
 	def _run(self, result, script=CONSOLE_SCRIPT, limit_s=120, elapsed_s=1.0):
+		effect = result if isinstance(result, BaseException) else None
+		value = None if effect else result
 		with (
-			patch(RUN_PATH, return_value=result) as run,
+			patch(RUN_PATH, return_value=value, side_effect=effect) as run,
 			patch(CLOCK_PATH, side_effect=[1000.0, 1000.0 + elapsed_s]),
 		):
 			outcome = process_runner.run_console(script, "miyano", limit_s)
 		return outcome, run
+
+	def assert_no_piece_of(self, secret: str, output: str):
+		"""No 8 characters in a row of `secret` are left in `output`."""
+		for start in range(len(secret) - 7):
+			self.assertNotIn(secret[start : start + 8], output)
 
 	def test_argv_stdin_and_call_shape(self):
 		outcome, run = self._run(completed(0, "42"), limit_s=123, elapsed_s=2.5)
@@ -761,6 +773,34 @@ class TestRunConsole(FrappeTestCase):
 		self.assertIs(outcome.timed_out, True)
 		outcome, _run = self._run(completed(1, "ValueError"), limit_s=120, elapsed_s=3.0)
 		self.assertEqual((outcome.exit_code, outcome.timed_out, outcome.not_found), (1, False, False))
+
+	def test_output_masked_before_the_line_cut(self):
+		self.assertEqual(len(DB_SECRET), 44)
+		self.assertLess(LONG_SECRET_LINE.index(DB_SECRET), OUTPUT_LINE_MAX_CHARS)
+		self.assertGreater(len(LONG_SECRET_LINE), OUTPUT_LINE_MAX_CHARS)
+		outcome, _run = self._run(completed(1, LONG_SECRET_LINE))
+		self.assertEqual(outcome.output, "x" * 960 + f"'db_password': '{MASK}'")
+		self.assert_no_piece_of(DB_SECRET, outcome.output)
+		# The job masks again before storing: that second pass changes nothing.
+		self.assertEqual(redact_secrets(outcome.output), outcome.output)
+
+	def test_output_masked_before_the_cut_on_the_timeout_path(self):
+		raw = (LONG_SECRET_LINE + "\n").encode("utf-8")
+		expired = subprocess.TimeoutExpired(cmd=["timeout"], timeout=150, output=raw)
+		outcome, _run = self._run(expired, elapsed_s=150.0)
+		self.assertIs(outcome.timed_out, True)
+		self.assertEqual(outcome.output, "x" * 960 + f"'db_password': '{MASK}'")
+		self.assert_no_piece_of(DB_SECRET, outcome.output)
+
+	def test_value_kept_after_its_key_line_was_dropped_is_masked(self):
+		value = "hunter2-Kv8Hs3Jd6Bf1Gc0"
+		lines = ["đầu ra", "password:", value, *(f"line {n}" for n in range(4, 402))]
+		self.assertEqual(len(lines), OUTPUT_MAX_LINES + 1)
+		outcome, _run = self._run(completed(0, "\n".join(lines)))
+		kept = outcome.output.split("\n")
+		self.assertEqual(kept[:2], ["… đã cắt 2 dòng đầu", MASK])
+		self.assertEqual(kept[-1], "line 401")
+		self.assert_no_piece_of(value, outcome.output)
 
 	def test_bad_input_never_reaches_argv(self):
 		cases = (

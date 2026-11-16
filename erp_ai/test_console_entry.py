@@ -16,6 +16,28 @@ from erp_ai.agent.tools import change_guard
 REFUSED_SCRIPT = "frappe.db.commit()\n"
 SECRET_SCRIPT = "raise ValueError('password=hunter2 sk-ant-abc123def456ghi789')\n"
 PROBE_KEY = "erp_ai_console_rollback_probe"
+# Written by hand so a changed constant cannot hide a changed sentence.
+TRANSACTION_REFUSED_TEXT = "script không được tự mở hoặc kết thúc giao dịch"
+# First keyword (after whitespace and comments) opens or ends a transaction; MySQL runs `/*! … */` text.
+TRANSACTION_STATEMENTS = (
+	"commit",
+	"  ROLLBACK",
+	"start transaction",
+	"set autocommit=1",
+	"COMMIT WORK",
+	"rollback work",
+	"begin",
+	"BEGIN WORK",
+	"/* ghi chú */ commit",
+	"-- ghi chú\ncommit",
+	"# ghi chú\ncommit",
+	"/*!50000 COMMIT */",
+	"/*M!100000 commit */",
+	"SET @@session.autocommit = 1",
+	"set session autocommit=0",
+	"set @a = 1, autocommit = 1",
+)
+VIETNAMESE_SCRIPT = '# Ghi chú tiếng Việt\nprint("Tiếng Việt")\n'
 
 
 class TestExecuteScript(FrappeTestCase):
@@ -41,14 +63,18 @@ class TestExecuteScript(FrappeTestCase):
 
 
 class TestRun(FrappeTestCase):
-	def run_entry(self, script: str):
-		"""`run()` with `script` on stdin: (the SystemExit raised or None, printed text, rollback, commit)."""
+	def run_entry(self, script: str, stdin_encoding="utf-8", on_rollback=None):
+		"""`run()` with `script` on stdin: (the SystemExit raised or None, printed text, rollback, commit).
+
+		stdin holds the UTF-8 bytes of `script`; its text layer decodes them with `stdin_encoding`.
+		"""
 		printed = io.StringIO()
 		raised = None
+		stdin = io.TextIOWrapper(io.BytesIO(script.encode("utf-8")), encoding=stdin_encoding)
 		with (
-			patch("sys.stdin", io.StringIO(script)),
+			patch("sys.stdin", stdin),
 			redirect_stdout(printed),
-			patch.object(frappe.db, "rollback") as rollback,
+			patch.object(frappe.db, "rollback", side_effect=on_rollback) as rollback,
 			patch.object(frappe.db, "commit") as commit,
 		):
 			try:
@@ -97,6 +123,71 @@ class TestRun(FrappeTestCase):
 		self.assertNotIn("hunter2", printed)
 		self.assertNotIn("sk-ant-abc123def456ghi789", printed)
 
+	def test_script_is_read_as_utf8_bytes(self):
+		# The text layer of stdin would decode another way; the script is read from its UTF-8 bytes.
+		raised, printed, _rollback, commit = self.run_entry(VIETNAMESE_SCRIPT, stdin_encoding="latin-1")
+		self.assertIsNone(raised, printed)
+		self.assertEqual(printed, "Tiếng Việt\n")
+		commit.assert_not_called()
+
+	def run_with_sql_stub(self, script: str, on_rollback=None):
+		"""`run_entry` with the connection's `sql` stubbed: no statement of the script reaches the database."""
+		with patch.object(frappe.local.db, "sql") as sql:
+			outcome = self.run_entry(script, on_rollback=on_rollback)
+		return (*outcome, sql)
+
+	def test_transaction_statements_refused_inside_a_script(self):
+		for statement in TRANSACTION_STATEMENTS:
+			with self.subTest(statement=statement):
+				raised, printed, rollback, commit, sql = self.run_with_sql_stub(
+					f"frappe.db.sql({statement!r})\n"
+				)
+				self.assert_failed(raised, rollback, commit)
+				self.assertIn(TRANSACTION_REFUSED_TEXT, printed)
+				sql.assert_not_called()
+
+	def test_transaction_refused_through_frappe_helpers_too(self):
+		# `begin` sends START TRANSACTION through `frappe.db.sql`, so the same check catches it.
+		raised, printed, rollback, commit, sql = self.run_with_sql_stub("frappe.db.begin()\n")
+		self.assert_failed(raised, rollback, commit)
+		self.assertIn(TRANSACTION_REFUSED_TEXT, printed)
+		sql.assert_not_called()
+
+	def test_savepoints_and_other_statements_pass_through(self):
+		statements = (
+			"savepoint s1",
+			"ROLLBACK TO SAVEPOINT s1",
+			"rollback to s1",
+			"rollback work to savepoint s1",
+			"release savepoint s1",
+			"select 1",
+			"update `tabToDo` set description = 'commit' where 1 = 0",
+		)
+		script = "".join(f"frappe.db.sql({statement!r})\n" for statement in statements)
+		raised, printed, rollback, commit, sql = self.run_with_sql_stub(script)
+		self.assertIsNone(raised, printed)
+		self.assertEqual([call.args[0] for call in sql.call_args_list], list(statements))
+		rollback.assert_not_called()
+		commit.assert_not_called()
+
+	def test_guard_is_gone_before_the_rollback_and_after_run(self):
+		db = frappe.local.db
+		before = db.sql
+		own_before = "sql" in vars(db)
+		for script in ("frappe.db.sql('select 1')\n", "raise ValueError('x')\n"):
+			with self.subTest(script=script):
+				self.run_entry(script)
+				self.assertEqual(db.sql, before)
+				self.assertEqual("sql" in vars(db), own_before)
+		# The rollback after a refused statement goes through the connection's own `sql` again.
+		seen = []
+		raised, _printed, _rollback, _commit, sql = self.run_with_sql_stub(
+			"frappe.db.sql('commit')\n", on_rollback=lambda: seen.append(vars(frappe.local.db).get("sql"))
+		)
+		self.assertEqual(raised.code, 1)
+		self.assertEqual(len(seen), 1)
+		self.assertIs(seen[0], sql)
+
 	def test_printed_traceback_keeps_its_last_20_lines(self):
 		raised, printed, rollback, commit = self.run_entry(
 			"raise ValueError('\\n'.join(str(n) for n in range(50)))\n"
@@ -127,6 +218,11 @@ class TestRunConsoleChild(FrappeTestCase):
 		result = self.run_child("print(6*7)")
 		self.assertEqual(result.exit_code, 0, result.output)
 		self.assertIn("42", result.output)
+
+	def test_child_reads_and_prints_vietnamese_intact(self):
+		result = self.run_child(VIETNAMESE_SCRIPT)
+		self.assertEqual(result.exit_code, 0, result.output)
+		self.assertIn("Tiếng Việt", result.output)
 
 	def test_child_error_exits_1_with_the_traceback(self):
 		result = self.run_child("raise ValueError('x')")

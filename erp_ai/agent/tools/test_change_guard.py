@@ -1937,6 +1937,8 @@ class TestConsoleScript(FrappeTestCase):
 			("frappe.get_attr('subprocess.run')", "script không được dùng .get_attr"),
 			("frappe.get_module('os')", "script không được dùng .get_module"),
 			("frappe.importlib.import_module('os')", "script không được dùng .import_module"),
+			# CHG-010 Task 5 fix round 1: sql_ddl commits the open transaction before its statement
+			("frappe.db.sql_ddl('select 1')", "script không được dùng .sql_ddl"),
 		)
 		for script, reason in cases:
 			with self.subTest(script=script if script is None else script[:30]):

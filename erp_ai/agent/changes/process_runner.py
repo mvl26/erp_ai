@@ -7,6 +7,7 @@ from dataclasses import dataclass
 
 import frappe
 
+from erp_ai.agent.redact import redact_secrets
 from erp_ai.agent.tools import source
 from erp_ai.constants import (
 	COMMAND_TIMEOUT_S,
@@ -47,10 +48,16 @@ def _minimal_env() -> dict:
 	return {name: os.environ[name] for name in ENV_ALLOWLIST if name in os.environ}
 
 
-def _cut_output(output, max_lines: int) -> str:
-	"""Keep the last max_lines - 1 lines under a `… đã cắt <n> dòng đầu` line; each line ≤ 1000 chars."""
+def _cut_output(output, max_lines: int, mask=None) -> str:
+	"""Keep the last max_lines - 1 lines under a `… đã cắt <n> dòng đầu` line; each line ≤ 1000 chars.
+
+	`mask` (CHG-010: `redact_secrets` for the console child) runs on the whole decoded text before the cut, so
+	a secret that crosses the 1000-character cut or whose key sits on a dropped line is never half kept.
+	"""
 	if isinstance(output, bytes):
 		output = output.decode("utf-8", errors="replace")
+	if mask is not None:
+		output = mask(output or "")
 	lines = [line[:OUTPUT_LINE_MAX_CHARS] for line in (output or "").splitlines()]
 	if len(lines) > max_lines:
 		dropped = len(lines) - (max_lines - 1)
@@ -83,7 +90,8 @@ def run_bench(args: list[str], limit_s: int) -> CommandResult:
 def run_console(script: str, site: str, limit_s: int) -> CommandResult:
 	"""Run an approved console script once (CHG-010): `bench --site <site> execute erp_ai.console_entry.run`
 	in the bench directory with `script` on stdin (never written to a file), killed with its process group
-	after limit_s. The child commits only when the script returns; its output is cut like `run_bench`."""
+	after limit_s. The child commits only when the script returns; its output is masked with
+	`redact_secrets`, then cut like `run_bench`."""
 	if not isinstance(script, str) or not script.strip():
 		raise ValueError("script must be non-empty text")
 	args = ["--site", site, "execute", CONSOLE_ENTRY]
@@ -96,6 +104,7 @@ def run_console(script: str, site: str, limit_s: int) -> CommandResult:
 		backstop_s=JOB_SAFETY_MARGIN_S // 2,
 		max_lines=OUTPUT_MAX_LINES,
 		input_text=script,
+		mask=redact_secrets,
 	)
 
 
@@ -201,11 +210,12 @@ def launch_restart() -> tuple[bool, str | None]:
 
 
 def _run_wrapped(
-	command, *, cwd, env, limit_s, backstop_s, max_lines, input_text: str | None = None
+	command, *, cwd, env, limit_s, backstop_s, max_lines, input_text: str | None = None, mask=None
 ) -> CommandResult:
 	"""Run `timeout -s KILL limit_s *command` in its own process group; timed out like ADR-013 QĐ 7.
 
 	`input_text` is written to the child's stdin (CHG-010: the console script); without it stdin is DEVNULL.
+	`mask` goes to `_cut_output`, on the timeout path too.
 	"""
 	# `subprocess.run` refuses `stdin=` next to `input=`, so exactly one of the two is passed.
 	feed = {"stdin": subprocess.DEVNULL} if input_text is None else {"input": input_text}
@@ -227,7 +237,7 @@ def _run_wrapped(
 	except subprocess.TimeoutExpired as expired:
 		return CommandResult(
 			exit_code=None,
-			output=_cut_output(expired.output, max_lines),
+			output=_cut_output(expired.output, max_lines, mask),
 			duration_ms=_elapsed_ms(started),
 			timed_out=True,
 			not_found=False,
@@ -239,7 +249,7 @@ def _run_wrapped(
 	elapsed_s = time.monotonic() - started
 	return CommandResult(
 		exit_code=done.returncode,
-		output=_cut_output(done.stdout, max_lines),
+		output=_cut_output(done.stdout, max_lines, mask),
 		duration_ms=int(elapsed_s * 1000),
 		timed_out=done.returncode in source.KILLED_EXIT_CODES and elapsed_s >= limit_s,
 		not_found=done.returncode == NOT_FOUND_EXIT_CODE,

@@ -115,7 +115,7 @@ CONSOLE_FORBIDDEN_CALLS = (
 CONSOLE_FORBIDDEN_ATTRS = (
 	"commit", "rollback", "set_user", "get_password", "get_decrypted_password", "conf",
 	"get_site_config", "environ", "system", "popen", "connect", "destroy",
-	"get_conf", "get_attr", "get_module", "import_module",
+	"get_conf", "get_attr", "get_module", "import_module", "sql_ddl",
 )  # fmt: skip
 CONSOLE_FORBIDDEN_TEXT = ("erp ai", "__auth", "site_config", ".git")
 SHELL_METACHARACTERS = (";", "|", "&", "`", "$(", ">", "<", "\n")

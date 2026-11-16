@@ -49,6 +49,7 @@ Phân biệt hai cặp dễ lẫn:
 - B vs C: B là cấu hình có sẵn trong ERPNext, bật/điền là xong. C là phải viết mới.
   Nếu làm được bằng Customize Form, Holiday List, Workflow, Report hay Notification
   thì đó là B.
+  Thêm trường kèm một quy tắc tự sinh giá trị làm được bằng một Server Script trong ngày vẫn là B; cần nhiều script, màn hình hay báo cáo mới là C.
 - D vs E: D thì kết quả nằm trên ERP. E thì kết quả là một văn bản hoặc một việc
   hành chính, ERP không đổi.
 
@@ -62,9 +63,14 @@ Chấm hai điểm nguyên 1, 2 hoặc 3 theo thang sau:
 
 | Điểm | Độ phức tạp | Độ quan trọng |
 |---|---|---|
-| 1 | Làm xong dưới 1 giờ làm việc, không cần đổi hệ thống: hỏi đáp, thao tác có sẵn | Ảnh hưởng một người, không chặn việc, không có hạn gần |
-| 2 | Trong 1 ngày làm việc: cấu hình có sẵn, sửa một lỗi xác định, một đợt dữ liệu nhỏ | Chặn việc của một người hoặc một bộ phận; hoặc có hạn trong 24 giờ; hoặc (đầu mục D) có Hạn hoàn thành |
-| 3 | Nhiều ngày, cần phân tích trước (BA), xây mới hoặc tích hợp | Chặn nghiệp vụ kế toán, kho hoặc bán hàng; hoặc nhiều bộ phận ngừng việc |
+| 1 | Một thao tác có sẵn hoặc một bản ghi, một cấu hình: hỏi đáp, tạo tài khoản theo mẫu, thêm ngày nghỉ, dịch một nhãn; dưới 1 giờ | Ảnh hưởng một người, không chặn việc, không có hạn gần |
+| 2 | Vài bản ghi hoặc cấu hình liên quan nhau, một đoạn logic nhỏ (một Server Script, sửa một chỗ code), sửa một lỗi xác định hoặc một đợt dữ liệu nhỏ; xong trong 1 ngày làm việc | Chặn việc của một người hoặc một bộ phận; hoặc có hạn trong 24 giờ; hoặc (đầu mục D) có Hạn hoàn thành |
+| 3 | Logic mới ở nhiều chỗ, tích hợp, màn hình hay báo cáo mới, cần phân tích trước (BA); hoặc phải chờ dữ liệu, quyết định của phòng ban khác; nhiều ngày | Chặn nghiệp vụ kế toán, kho hoặc bán hàng; hoặc nhiều bộ phận ngừng việc |
+
+Chấm độ phức tạp theo việc phải làm trên hệ thống, không theo độ dài phiếu:
+- Tự sinh mã, đánh số, tính toán hay gửi thông báo theo quy tắc riêng mà ERPNext không có sẵn thì cần Server Script hoặc code: ít nhất 2.
+- Có dữ liệu cũ phải bổ sung, hoặc phải thống nhất với phòng ban khác: thêm một mức, tối đa 3.
+- Phiếu nhiều yêu cầu: chấm theo yêu cầu khó nhất.
 
 Trả về DUY NHẤT một object JSON, không giải thích thêm:
 
@@ -200,6 +206,19 @@ KNOWLEDGE_SOURCES_BLOCK = (
 	"(search_resolved_tickets). Nêu nguồn đã dùng ngay trong nhận định hoặc hướng xử lý (tên bài CSKT, tên tài liệu "
 	"HDSD, số phiếu cũ), không có mục riêng. Tool trả 'chưa có kho HDSD' hoặc không có kết quả thì không nêu nguồn đó."
 )
+
+# ADR-019 Amendment 1 (43229): after KNOWLEDGE_SOURCES_BLOCK in every run that is not ask-only. The bot chooses the
+# open points itself and says how to approve, re-reads a record after a system error, and corrects the complexity
+# the classify step guessed once it has read the code and the data.
+OWN_DECISIONS_BLOCK = """TỰ QUYẾT VÀ ĐỘ PHỨC TẠP
+
+- Việc bạn tự làm hoặc tự chọn được thì không đẩy cho người: không viết "cần người quyết định", "nhờ … kiểm tra", "chờ … thống nhất".
+- Điểm còn mở: chọn cách hợp lý nhất theo nội dung phiếu và dữ liệu đã tra, viết "Bot chọn …, vì …", rồi làm hoặc tạo đề xuất theo cách đó. Người muốn cách khác thì nhắn lại; không chờ họ trước.
+- Phiếu dặn phải thống nhất với một người hay một bộ phận: soạn sẵn phương án cụ thể (danh sách, giá trị, thứ tự) để họ duyệt, không chỉ ghi "liên hệ …".
+- Câu cuối của "Hướng xử lý" nói rõ duyệt bằng cách nào và bot làm gì ngay sau khi được duyệt.
+- Tool báo lỗi hệ thống, không phải từ chối: đọc lại bản ghi để biết đã lưu chưa rồi mới báo; không nhờ người kiểm tra lỗi hệ thống.
+- Độ phức tạp trong khối classification (1-3) là điểm đoán lúc phân loại. Đọc code và dữ liệu xong mà việc thật khác (cần script hay sửa code, cần dữ liệu hoặc quyết định của phòng khác, hoặc ít việc hơn tưởng) thì gọi set_classification với complexity và complexity_reason mới trước khi viết comment; đầu mục sai thì sửa luôn trong cùng lời gọi.
+- Theo độ phức tạp: 1 thì làm xong trong lượt này; 2 thì làm hết phần tool làm được, phần cần duyệt thì tạo đề xuất cụ thể; 3 thì phân tích, chia Task có ước lượng, rồi làm hoặc đề xuất bước đầu tiên."""
 
 # AC-40 (U6b.md:295): appended only when the ticket grants reply_to_requester (Grant.reply_block).
 REPLY_BLOCK = (
@@ -535,6 +554,7 @@ def build_reason_system(
 		routing_table,
 		CONVENTIONS,
 		KNOWLEDGE_SOURCES_BLOCK,
+		"" if ask_only else OWN_DECISIONS_BLOCK,
 		CHANGE_TOOLS_BLOCK if change_tools else "",
 		SITE_ADMIN_TOOLS_BLOCK if site_admin_tools else "",
 		UNRESTRICTED_TOOLS_BLOCK if unrestricted_tools else "",

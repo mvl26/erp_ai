@@ -25,6 +25,7 @@ from erp_ai.constants import (
 	CONFIDENCE_VALUES,
 	LEVELS,
 	LOGGER_NAME,
+	MESSAGE_DOCTYPE,
 	SETTING_DOCTYPE,
 )
 
@@ -43,6 +44,12 @@ LINKED_DOCTYPES = {
 	"priority": "HD Ticket Priority",
 }
 REASON_MAX = 200
+# ADR-019 Amendment 1: the reasoning step corrects the complexity the classify step guessed, always with its reason.
+COMPLEXITY_FIELD = "ai_complexity"
+SCORE_REASON_FIELD = "ai_score_reason"
+COMPLEXITY_VALUES = (1, 2, 3)
+COMPLEXITY_REASON_MAX = 300
+REASON_COMPLEXITY_NO_REASON = "độ phức tạp mới cần lý do (complexity_reason)"
 # The kinds of the post_comment tool (AC-22, U4b.md:126-133); U8 appends "ba_note" (AC-62).
 COMMENT_KINDS = ("de_xuat", "hoi", "ba_note")
 CONFIDENCE_LINE = re.compile(r"Độ tin cậy:\s*(\d{1,3})\s*%")
@@ -83,6 +90,13 @@ REASON_NOTICE_SENT = "đã thông báo"
 _GUIDANCE_KEY = "erp_ai:huong-xu-ly"
 GUIDANCE_MARKER = f"<!-- {_GUIDANCE_KEY} -->"
 GUIDANCE_HEADER = "Hướng xử lý"
+ANALYSIS_HEADER = "Nhận định"
+# A run a message started whose answer the guidance comment took still answers in the conversation (CHG-003
+# Amendment 3): the finding of its analysis, then where the rest is. Plain text: the panel only sets text.
+GUIDANCE_REPLY = (
+	"Bot đã viết hướng xử lý cho phiếu: nhận định đầy đủ, việc đã làm, đề xuất chờ duyệt và việc cần người làm nằm ở "
+	'mục "Thông tin AI của phiếu" phía trên và ở comment hướng xử lý của phiếu.'
+)
 SECTION_DONE, SECTION_PENDING = "Đã làm", "Chờ duyệt"
 # Collector key of "work a person must do by hand, with the reason": shown inside the plan section, no heading of
 # its own (design-w1-fixes-20 Điểm 1.1, spec-addendum-5 AC-65 (a)).
@@ -244,13 +258,18 @@ def set_classification(args: dict, ctx: ToolContext) -> dict:
 		return _fail("thiếu quyền ghi phiếu")
 	if doc.get("ai_classified_by") == CLASSIFIED_BY_HUMAN:
 		return _fail("người đã phân loại, không ghi đè")
+	scores = _scores(args)
+	if scores is None:
+		return _fail(REASON_COMPLEXITY_NO_REASON)
 	values, skipped = _mapped_values(doc, args, ctx)
-	if not values:
+	if not values and not scores:
 		return {"ok": True, "before": {}, "after": {}, "skipped": skipped}
-	values["ai_confidence"] = args["confidence"]
-	# The tool takes no reason: a reason left by an earlier classification would describe the wrong one.
-	if doc.get(CLASSIFICATION_REASON_FIELD):
-		values[CLASSIFICATION_REASON_FIELD] = ""
+	if values:
+		values["ai_confidence"] = args["confidence"]
+		# The tool takes no classification reason: one left by an earlier classification would describe the wrong one.
+		if doc.get(CLASSIFICATION_REASON_FIELD):
+			values[CLASSIFICATION_REASON_FIELD] = ""
+	values.update(scores)
 	for field in (*values, "ai_classified_by", "ai_updated_at"):
 		if not doc.has_permlevel_access_to(field, permission_type="write"):
 			return _fail(f"thiếu quyền ghi trường {field}")
@@ -263,8 +282,20 @@ def set_classification(args: dict, ctx: ToolContext) -> dict:
 	fields = ", ".join(
 		f"{FIELD_LABELS[field]} {value}" for field, value in values.items() if field in FIELD_LABELS
 	)
-	collect(ctx.run_id, SECTION_DONE, ROUTE_DONE.format(fields=fields))
+	if fields:
+		collect(ctx.run_id, SECTION_DONE, ROUTE_DONE.format(fields=fields))
 	return {"ok": True, "before": before, "after": dict(values), "skipped": skipped}
+
+
+def _scores(args: dict) -> dict | None:
+	"""The complexity the model found while working and its reason, as ticket values; {} when it gave none; None
+	when it gave a complexity without a reason."""
+	if args.get("complexity") is None:
+		return {}
+	reason = (args.get("complexity_reason") or "").strip()
+	if not reason:
+		return None
+	return {COMPLEXITY_FIELD: args["complexity"], SCORE_REASON_FIELD: reason}
 
 
 def set_resolution_hint(args: dict, ctx: ToolContext) -> dict:
@@ -310,14 +341,6 @@ def _post_message(content: str, ctx: ToolContext) -> dict:
 	except frappe.PermissionError:
 		return _fail("không được phép thêm tin vào ngăn trao đổi")
 	return {"ok": True, "message": name}
-
-
-def _say(content: str, ctx: ToolContext) -> dict:
-	"""Post what the model says to people: in the ticket's conversation when a message there started the run (the bot
-	answers where it was asked), else as a comment on the ticket."""
-	if ctx.in_conversation:
-		return _post_message(content, ctx)
-	return _post(ctx.ticket_name, content)
 
 
 def _heading_line(header: str) -> re.Pattern:
@@ -391,7 +414,7 @@ def _ask_below_threshold(kind: str, content: str, ctx: ToolContext) -> dict:
 		return _fail(REASON_ONE_ASK)
 	if not section_text(content, EVIDENCE_HEADER):
 		return _fail(REASON_NO_EVIDENCE)
-	result = _say(f"{content}\n\n{_ask_footer(ctx.ticket_name)}", ctx)
+	result = _post_message(f"{content}\n\n{_ask_footer(ctx.ticket_name)}", ctx)
 	if result["ok"]:
 		mark_asked(ctx.run_id)
 	return result
@@ -585,6 +608,22 @@ def post_guidance(ticket_name: str, run_id: str) -> dict:
 	}
 
 
+def post_guidance_reply(ctx: ToolContext) -> dict | None:
+	"""The answer of a run a message started when the guidance comment took it (CHG-003 Amendment 3): one message with
+	the finding of the run's held analysis, when it has one, and where the rest of the guidance is; the runner calls it
+	right after `post_guidance`. A run nothing typed started, or one that already said something in the conversation
+	→ None, nothing written."""
+	if not ctx.in_conversation or frappe.db.exists(
+		MESSAGE_DOCTYPE, {"ticket": ctx.ticket_name, "run_id": ctx.run_id}
+	):
+		return None
+	analysis = collected(ctx.run_id)[0]
+	finding = section_text(analysis, ANALYSIS_HEADER) if analysis else None
+	return _post_message(
+		f"{ANALYSIS_HEADER}: {finding}\n\n{GUIDANCE_REPLY}" if finding else GUIDANCE_REPLY, ctx
+	)
+
+
 def failure_summary(run_id: str) -> str:
 	"""What the run did before it failed, for its run_failed notice (design-w1-fixes-20 Điểm 3.1): one part per
 	non-empty section, done, pending and manual apart, each line escaped once; not collecting → ""."""
@@ -651,7 +690,8 @@ def _ba_note_content(content: str) -> str:
 def post_comment_tool(args: dict, ctx: ToolContext) -> dict:
 	"""Handler of the post_comment tool (AC-22, U4b.md:171, w1.md:96): checks the steps in order, then posts; a
 	refusal posts nothing, and in a guidance run a proposal is held for post_guidance instead. A question or a
-	proposal is what the bot says to people (`_say`); the BA note is ticket information, always a comment."""
+	proposal is what the bot says to people: a message of the ticket's conversation, whatever started the run
+	(CHG-003 Amendment 3); the BA note is ticket information, always a comment."""
 	kind, content = args.get("kind"), args["content"]
 	# Step (0): the marker is the writer's alone, whatever the kind, before any other check (AC-65 (d)).
 	if _GUIDANCE_KEY in re.sub(r"\s+", "", content).lower():
@@ -679,7 +719,7 @@ def post_comment_tool(args: dict, ctx: ToolContext) -> dict:
 	if kind == "de_xuat" and (outcome := _hold_or_refuse(content, ctx)):
 		return outcome
 	# Steps (4), (5): a question above the threshold needs nothing more.
-	return _say(content, ctx)
+	return _post_message(content, ctx)
 
 
 def _ticket_link_html(name: str) -> str:
@@ -762,13 +802,17 @@ TOOLS: list[ToolSpec] = [
 			"name": "set_classification",
 			"description": (
 				"Ghi phân loại của phiếu hiện tại theo đầu mục A-F và độ tin cậy. "
-				"Loại, nhóm và mức ưu tiên lấy từ ánh xạ đầu mục, không nhận tên trường."
+				"Loại, nhóm và mức ưu tiên lấy từ ánh xạ đầu mục, không nhận tên trường. "
+				"complexity (1-3) và complexity_reason: độ phức tạp thật sau khi đã đọc code và dữ liệu, kèm lý do; "
+				"bỏ trống thì giữ điểm cũ."
 			),
 			"input_schema": {
 				"type": "object",
 				"properties": {
 					"category": {"type": "string", "enum": list(CATEGORIES)},
 					"confidence": {"type": "string", "enum": list(CONFIDENCE_VALUES)},
+					"complexity": {"type": "integer", "enum": list(COMPLEXITY_VALUES)},
+					"complexity_reason": {"type": "string", "maxLength": COMPLEXITY_REASON_MAX},
 				},
 				"required": ["category", "confidence"],
 			},
@@ -795,7 +839,8 @@ TOOLS: list[ToolSpec] = [
 		schema={
 			"name": "post_comment",
 			"description": (
-				"Đăng một comment lên phiếu hiện tại. "
+				"Nói với người trên phiếu hiện tại: câu đề xuất và câu hỏi là tin trong ngăn 'Trao đổi với bot' "
+				"của phiếu, BA note là comment của phiếu. "
 				"kind=de_xuat: nhận định và phương án, hoặc báo việc đã làm; phải có dòng 'Độ tin cậy: NN%'. "
 				"kind=hoi: câu hỏi; khi độ tin cậy dưới ngưỡng chỉ được dùng kind này, một lần, "
 				f"và vẫn phải có '**{EVIDENCE_HEADER}:**' nêu vì sao chưa chắc. "

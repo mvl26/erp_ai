@@ -9,7 +9,9 @@ import frappe
 from frappe.tests.utils import FrappeTestCase
 from helpdesk.test_utils import create_agent, make_ticket
 
+from erp_ai.agent.classification import Classification
 from erp_ai.agent.policy import PermissionSwitches
+from erp_ai.agent.routing import decide_route
 from erp_ai.agent.tools import registry, route_ticket
 from erp_ai.agent.tools.knowledge_read import KNOWLEDGE_TOOL_NAMES
 from erp_ai.agent.tools.registry import (
@@ -20,7 +22,7 @@ from erp_ai.agent.tools.registry import (
 	get_tool_schemas,
 )
 from erp_ai.agent.tools.source import GIT_SUBCOMMANDS
-from erp_ai.constants import PROPOSAL_DOCTYPE, ROLE_AGENT
+from erp_ai.constants import MESSAGE_DOCTYPE, PROPOSAL_DOCTYPE, ROLE_AGENT
 from erp_ai.test_utils import GitSandbox, keep_agent_settings
 
 REAL_ALL_SPECS = registry._all_specs
@@ -38,7 +40,8 @@ FORBIDDEN_ROUTE_PARAMETER_WORDS = (
 	"response",
 	"resolution_by",
 	"score",
-	"complexity",
+	# not "complexity": set_classification takes it because no route reads it (ADR-019 Amendment 1); the test
+	# below fails the day a complexity moves the person, the priority or the SLA
 	"importance",
 )
 ROUTE_FUNCTION_NAMES = (
@@ -289,10 +292,36 @@ class TestRegistry(FrappeTestCase):
 				for word in FORBIDDEN_ROUTE_PARAMETER_WORDS:
 					self.assertNotIn(word, key.lower(), f"{spec.name} accepts {key}")
 		classification = next(s for s in specs if s.name == "set_classification")
+		# no route parameter: the complexity and its reason are scores of the ticket, not a route (ADR-019 Amendment 1)
 		self.assertEqual(
-			classification.schema["input_schema"]["properties"].keys(), {"category", "confidence"}
+			classification.schema["input_schema"]["properties"].keys(),
+			{"category", "confidence", "complexity", "complexity_reason"},
 		)
 		self.assertEqual(classification.schema["input_schema"]["required"], ["category", "confidence"])
+
+	def test_complexity_moves_no_route(self):
+		# AC-9 with ADR-019 Amendment 1: the model may correct the complexity because the person, the priority, the
+		# team and whether a Task is needed come out the same for every complexity
+		mapping = {"A": {"ticket_type": "Loại A", "agent_group": "Nhóm A", "priority": "Medium"}}
+		config = {
+			"assignees": {"A": {"default": "a@x.com", "prefixes": {}}},
+			"importance_priority": {"1": "Low", "2": "High", "3": "Urgent"},
+		}
+		for importance in (1, 2, 3):
+			decisions = [
+				decide_route(
+					Classification("A", "Cao", complexity=complexity, importance=importance),
+					"Phiếu",
+					mapping,
+					config,
+					team_exists=lambda _team: True,
+					is_excluded_team=lambda _team: False,
+					is_active_agent=lambda _user: True,
+				)
+				for complexity in (0, 1, 2, 3)
+			]
+			with self.subTest(importance=importance):
+				self.assertEqual(decisions, [decisions[0]] * len(decisions))
 
 	def test_route_functions_not_executable_as_tools(self):
 		# AC-9: a tool call naming a route function is "not granted" and no route function runs.
@@ -709,9 +738,10 @@ class TestRealToolsRunWithoutCommit(FrappeTestCase):
 		frappe.set_user("Administrator")
 		ticket = frappe.get_doc("HD Ticket", self.ticket)
 		self.assertEqual(ticket.ticket_type, SEED_TYPE)
+		# CHG-003 Amendment 3: what the bot says to people is a message of the ticket's conversation
 		self.assertTrue(
 			frappe.db.exists(
-				"Comment", {"reference_name": self.ticket, "content": ["like", "%ERPAI-TEST-T27%"]}
+				MESSAGE_DOCTYPE, {"ticket": self.ticket, "content": ["like", "%ERPAI-TEST-T27%"]}
 			)
 		)
 		self.assertTrue(frappe.db.exists("Task", {"subject": "ERPAI-TEST-T27 việc"}))

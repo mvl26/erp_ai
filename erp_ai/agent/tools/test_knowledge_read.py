@@ -276,6 +276,16 @@ class TestSearchManuals(KnowledgeToolCase):
 class TestReadErrorLogs(KnowledgeToolCase):
 	"""AC-50 at the tool: bounded, filtered, masked; the agent account needs no extra role (ADR-034)."""
 
+	def setUp(self):
+		super().setUp()
+		# Error Log is a MyISAM table: the rollback does not undo a seeded row, so each test deletes its own.
+		self.seeded = []
+		self.addCleanup(self._delete_seeded)
+
+	def _delete_seeded(self):
+		if self.seeded:
+			frappe.db.delete("Error Log", {"name": ("in", self.seeded)})
+
 	def _error_log(self, creation, method, error="Traceback ERPAI-TEST") -> str:
 		doc = frappe.get_doc(
 			{
@@ -288,6 +298,7 @@ class TestReadErrorLogs(KnowledgeToolCase):
 			}
 		)
 		doc.db_insert()
+		self.seeded.append(doc.name)
 		return doc.name
 
 	def _read(self, **args):

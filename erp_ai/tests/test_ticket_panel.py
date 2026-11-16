@@ -81,7 +81,8 @@ WEBSITE_EMAIL = "panel.website@example.com"
 CUSTOMER_EMAIL = "panel.customer@example.com"
 KEYWORD = "@ai"
 RUN_ROUTE = "erp_ai.agent.runner.run_for_ticket"
-THREAD_KEYS = {"name", "author", "is_bot", "created_at", "text"}
+# ADR-050: "kind" marks the bot's guidance message ("guidance"), "" for any other
+THREAD_KEYS = {"name", "author", "is_bot", "created_at", "text", "kind"}
 
 
 def _make_user(email, user_type="Website User"):

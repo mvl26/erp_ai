@@ -23,6 +23,7 @@ from erp_ai.constants import (
 	JOB_TIMEOUT_S,
 	LOG_DOCTYPE,
 	LOGGER_NAME,
+	MESSAGE_DOCTYPE,
 	SETTING_DOCTYPE,
 	TITLE_RUN_FAILED,
 	TITLE_STATUS_FAILED,
@@ -79,7 +80,7 @@ class TestRunnerStatus(RunnerTestBase):
 
 		def sleeper(seconds):
 			self.sleeps.append(seconds)
-			self.at_sleep.append(([s["message"]["state"] for s in self.signals], self._comment_count()))
+			self.at_sleep.append(([s["message"]["state"] for s in self.signals], self._said_count()))
 			self.classification_at_sleep.append(self._classification())
 
 		sleep_patch = patch.object(answer_delay, "_sleep", side_effect=sleeper)
@@ -136,11 +137,11 @@ class TestRunnerStatus(RunnerTestBase):
 			tool_turn(tool_use("t1", "post_comment", kind="de_xuat", content=ANSWER)),
 			make_model_result(text="xong"),
 		)
-		comments_before = self._comment_count()
+		comments_before = self._said_count()
 
 		self._run("comment_mention")
 
-		self.assertEqual(self._comment_count(), comments_before + 1)
+		self.assertEqual(self._said_count(), comments_before + 1)
 
 		states = [signal["message"]["state"] for signal in self.signals]
 		self.assertTrue(states, "no status signal was emitted")
@@ -180,7 +181,7 @@ class TestRunnerStatus(RunnerTestBase):
 		self._set_delay(4, 4)
 		self.model_seconds = 1
 		self._gateway(*self._answer_turns())
-		comments_before = self._comment_count()
+		comments_before = self._said_count()
 		real_load_mapping = runner.load_mapping
 
 		def slow_load_mapping(*args, **kwargs):
@@ -194,7 +195,7 @@ class TestRunnerStatus(RunnerTestBase):
 		# anchor = right after the start signal; 0.5 s of set-up and 1 s of model took 1.5 s of the 4 s
 		self.assertEqual(self.sleeps, [2.5])
 		self.assertEqual(self.at_sleep, [(["thinking"], comments_before)])
-		self.assertEqual(self._comment_count(), comments_before + 1)
+		self.assertEqual(self._said_count(), comments_before + 1)
 		# the "working" signal of the answer comes only after the wait
 		self.assertEqual(self._states(), ["thinking", "working", "thinking", "done"])
 		self.assertEqual(self.signals[1]["message"]["text"], "Đang làm: viết trả lời…")
@@ -210,7 +211,7 @@ class TestRunnerStatus(RunnerTestBase):
 			),
 			make_model_result(text="xong"),
 		)
-		comments_before = self._comment_count()
+		comments_before = self._said_count()
 		classification_before = self._classification()
 
 		self._run("comment_mention")
@@ -222,7 +223,7 @@ class TestRunnerStatus(RunnerTestBase):
 		# after the run both did
 		self.assertNotEqual(self._classification(), classification_before)
 		# T116 (G-8, R12b): the run's one comment is its guidance comment, holding the answer and the classification
-		self.assertEqual(self._comment_count(), comments_before + 1)
+		self.assertEqual(self._said_count(), comments_before + 1)
 		self.assertEqual(write_ticket.count_guidance(self.ticket.name), 1)
 
 	def test_indicator_stays_thinking_while_waiting(self):
@@ -581,7 +582,7 @@ class TestRunnerStatus(RunnerTestBase):
 	def test_done_signal_failure_logged_to_error_log_class_only(self):
 		self._set_delay(4, 4)
 		self._gateway(*self._answer_turns())
-		comments_before = self._comment_count()
+		comments_before = self._said_count()
 
 		run_ids = []
 
@@ -594,7 +595,7 @@ class TestRunnerStatus(RunnerTestBase):
 			lines = self._run_closing("comment_mention")
 
 		# the run still answered; the lost `done` is only reported
-		self.assertEqual(self._comment_count(), comments_before + 1)
+		self.assertEqual(self._said_count(), comments_before + 1)
 		run_id = run_ids[0]
 		self.assertEqual(
 			self.log_error.call_args_list,
@@ -619,12 +620,12 @@ class TestRunnerStatus(RunnerTestBase):
 
 	def test_start_signal_failure_still_answers_and_logs_class(self):
 		self._gateway(*self._answer_turns())
-		comments_before = self._comment_count()
+		comments_before = self._said_count()
 
 		with self._fail_signals("thinking"):
 			lines = self._run_closing("comment_mention")
 
-		self.assertEqual(self._comment_count(), comments_before + 1)
+		self.assertEqual(self._said_count(), comments_before + 1)
 		reasons = self._entries(entry_type="reason")
 		self.assertEqual(reasons[0].error, "status_thinking: RuntimeError")
 		self.assertNotIn("MARKERXYZ", json.dumps([entry.error for entry in reasons]))
@@ -635,12 +636,12 @@ class TestRunnerStatus(RunnerTestBase):
 
 	def test_working_signal_failure_still_answers_and_logs_class(self):
 		self._gateway(*self._answer_turns())
-		comments_before = self._comment_count()
+		comments_before = self._said_count()
 
 		with self._fail_signals("working"):
 			self._run_closing("comment_mention")
 
-		self.assertEqual(self._comment_count(), comments_before + 1)
+		self.assertEqual(self._said_count(), comments_before + 1)
 		reasons = self._entries(entry_type="reason")
 		self.assertEqual(reasons[0].error, "status_working: RuntimeError")
 		self.assertFalse(reasons[1].error)
@@ -762,13 +763,18 @@ class TestRunnerStatus(RunnerTestBase):
 					self.assertNotIn(forbidden, text)
 
 	def _count_changes(self):
-		"""Run one mention run and return what it changed: (new Comments, new Tasks, ticket `modified` changed?)."""
-		comments, tasks = frappe.db.count("Comment"), frappe.db.count("Task")
+		"""Run one mention run and return what it changed: (new things said: Comments and conversation messages since
+		ADR-050, new Tasks, ticket `modified` changed?)."""
+
+		def said():
+			return frappe.db.count("Comment") + frappe.db.count(MESSAGE_DOCTYPE)
+
+		comments, tasks = said(), frappe.db.count("Task")
 		modified = frappe.db.get_value("HD Ticket", self.ticket.name, "modified")
 		self._gateway(*self._answer_turns())
 		self._run("comment_mention")
 		return (
-			frappe.db.count("Comment") - comments,
+			said() - comments,
 			frappe.db.count("Task") - tasks,
 			frappe.db.get_value("HD Ticket", self.ticket.name, "modified") != modified,
 		)

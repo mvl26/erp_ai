@@ -6736,9 +6736,10 @@ class TestRunEndRow(RequesterReplyRunBase):
 					frappe.db.rollback(save_point=END_ROW_CASE)
 
 	def test_bookkeeping_stops_leave_no_line(self):
-		# AC-4, A-3: an event already handled (r1) writes nothing and sends nothing; a message gone, a message a newer
-		# one supersedes and a ticket with its article write their skip row and no end row, so the panel has no line;
-		# a skip row still gets its one `done` (ADR-008 Amendment 1)
+		# AC-4, A-3: an event already handled (r1) writes nothing and sends nothing, even with the bot off since (r1)
+		# comes before (b) (D-7); a message gone, a message a newer one supersedes and a ticket with its article write
+		# their skip row and no end row, so the panel has no line; a skip row still gets its one `done` (ADR-008
+		# Amendment 1)
 		handled = self._message()
 		self._reply_run(handled)
 		gone = self._message(minutes=1)
@@ -6746,6 +6747,12 @@ class TestRunEndRow(RequesterReplyRunBase):
 		older, _newer = self._message(minutes=2), self._message(minutes=3)
 		cases = (
 			("already_handled", lambda: self._reply_run(handled), None, []),
+			(
+				"already_handled, bot off",
+				lambda: self._reply_run(handled),
+				lambda: set_agent_settings(enabled=0),
+				[],
+			),
 			("event_missing", lambda: self._reply_run(gone), None, [("skip", "event_missing")]),
 			("superseded", lambda: self._reply_run(older), None, [("skip", "superseded")]),
 			(

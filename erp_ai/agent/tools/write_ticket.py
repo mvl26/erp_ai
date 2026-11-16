@@ -96,6 +96,9 @@ REASON_GUIDANCE_HEADER = (
 	f"{REASON_GUIDANCE_EXISTS}: chỉ báo kết quả việc vừa làm, không viết mục '{GUIDANCE_HEADER}'"
 )
 HELD_NOTE = "đã giữ làm nhận định của comment hướng xử lý; bot đăng một lần ở cuối lần chạy"
+REASON_SYSTEM_SECTION = (
+	f"mục '{SECTION_DONE}' và '{SECTION_PENDING}' do hệ thống tự viết; bỏ dòng mở đầu bằng tiêu đề đó"
+)
 # The done line of a classification written in a guidance run (U4b.md:210, :215; the runner imports them).
 ROUTE_DONE = "Bot đã phân loại phiếu: {fields}."
 FIELD_LABELS = {"ticket_type": "Loại", "agent_group": "Nhóm", "priority": "Ưu tiên"}
@@ -259,6 +262,21 @@ def post_comment(args: dict, ctx: ToolContext) -> dict:
 def _heading_line(header: str) -> re.Pattern:
 	"""A line opening with the `<header>:` heading, the `**` around it optional (U4b.md:168)."""
 	return re.compile(rf"^[ \t]*(?:\*\*)?{re.escape(header)}:(?:\*\*)?", re.M)
+
+
+def _bold_heading_line(headers: tuple[str, ...]) -> re.Pattern:
+	"""A line opening, after any opening tags such as `<p>`, with one of `headers` in bold: `**<header>:**` or
+	`<strong><header>:</strong>`, the colon inside the bold or right after it, case and spaces ignored."""
+	names = "|".join(r"\s*".join(map(re.escape, header.split())) for header in headers)
+	bold_open, bold_close = r"(?:\*\*|<strong\b[^>]*>)", r"(?:\*\*|</strong\s*>)"
+	return re.compile(
+		rf"^[ \t]*(?:<[a-z][^>]*>\s*)*{bold_open}\s*(?:{names})\s*(?::\s*{bold_close}|{bold_close}\s*:)",
+		re.M | re.I,
+	)
+
+
+# The sections only the system writes (AC-66, AC-67): the model's text never opens one (C7-fix1 R13a).
+_SYSTEM_HEADING = _bold_heading_line((SECTION_DONE, SECTION_PENDING))
 
 
 def section_text(content: str, header: str) -> str | None:
@@ -484,6 +502,9 @@ def post_comment_tool(args: dict, ctx: ToolContext) -> dict:
 	# Step (0): the marker is the writer's alone, whatever the kind, before any other check (AC-65 (d)).
 	if _GUIDANCE_KEY in re.sub(r"\s+", "", content).lower():
 		return _fail(REASON_MARKER)
+	# Step (0b): "Đã làm" and "Chờ duyệt" are the system's, in every kind and in a held analysis (AC-66, AC-67).
+	if _SYSTEM_HEADING.search(content):
+		return _fail(REASON_SYSTEM_SECTION)
 	if kind not in COMMENT_KINDS:
 		return _fail(_REASON_BAD_KIND)
 	if ctx.below_threshold:

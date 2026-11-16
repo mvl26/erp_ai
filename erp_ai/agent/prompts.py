@@ -340,17 +340,22 @@ def ticket_text(subject: str, description: str) -> str:
 	return f"Tiêu đề: {subject or ''}\n\nNội dung:\n{_clean(description, DESCRIPTION_MAX_CHARS)}"
 
 
+def _one_line(text: str) -> str:
+	"""`text` without HTML, every whitespace run (newlines included) one space, then cut to FIELD_VALUE_MAX_CHARS."""
+	return " ".join(strip_html(text or "").split())[:FIELD_VALUE_MAX_CHARS]
+
+
 def _field_values(fields: dict[str, object]) -> dict[str, str]:
-	"""{label: value cut to FIELD_VALUE_MAX_CHARS} of the non-empty fields, in the order of TICKET_FIELD_LABELS;
-	a key outside TICKET_FIELD_LABELS → ValueError."""
+	"""{label: value on one line, cut to FIELD_VALUE_MAX_CHARS} of the non-empty fields, in the order of
+	TICKET_FIELD_LABELS, so a value never fakes a line of its own (C7-fix1 R13b); a key outside TICKET_FIELD_LABELS
+	→ ValueError."""
 	unknown = set(fields) - set(TICKET_FIELD_LABELS)
 	if unknown:
 		raise ValueError(f"trường phiếu lạ: {', '.join(sorted(unknown))}")
 	values = {}
 	for key, label in TICKET_FIELD_LABELS.items():
 		value = fields.get(key)
-		text = "" if value is None else _clean(str(value), FIELD_VALUE_MAX_CHARS)
-		if text.strip():
+		if text := ("" if value is None else _one_line(str(value))):
 			values[label] = text
 	return values
 
@@ -362,7 +367,7 @@ def ticket_fields_text(fields: dict[str, object]) -> str:
 
 def _later_text(messages: list[str]) -> str:
 	"""The LATER_MESSAGES_MAX newest messages, oldest first, each on one line cut to FIELD_VALUE_MAX_CHARS."""
-	lines = (" ".join(strip_html(message or "").split())[:FIELD_VALUE_MAX_CHARS] for message in messages)
+	lines = (_one_line(message) for message in messages)
 	return "\n".join(f"- {line}" for line in lines if line)
 
 

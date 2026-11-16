@@ -265,7 +265,18 @@ def panel_cards(ticket: str) -> list[dict]:
 	)
 	for operation in operations:
 		by_parent.setdefault(operation.parent, []).append(operation)
-	may_read = frappe.has_permission(PROPOSAL_DOCTYPE, "read")
+	# CHG-008 ruling: per-document read through one get_list that reads only `name`, so no card loads the forbidden
+	# fields (`has_permission(..., doc=name)` would load the whole document); role, user permissions and shares apply.
+	readable = set()
+	if frappe.has_permission(PROPOSAL_DOCTYPE, "read") and rows:
+		readable = set(
+			frappe.get_list(
+				PROPOSAL_DOCTYPE,
+				filters={"name": ("in", [row.name for row in rows])},
+				pluck="name",
+				limit_page_length=0,
+			)
+		)
 	cards = []
 	for row in rows:
 		fields = frappe._dict(row, operations=by_parent.get(row.name, []))
@@ -281,7 +292,7 @@ def panel_cards(ticket: str) -> list[dict]:
 			change_text.safe_person_name(frappe.utils.get_fullname(decided_by)) if decided_by else None,
 			failure_reason or None,
 			panel_decision_refusal(row.change_status) is None,
-			bool(may_read and frappe.has_permission(PROPOSAL_DOCTYPE, "read", doc=row.name)),
+			row.name in readable,
 		)
 		cards.append(dict(zip(CARD_KEYS, values, strict=True)))
 	return cards

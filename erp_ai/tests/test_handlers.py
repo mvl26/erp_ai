@@ -12,6 +12,7 @@ from erp_ai.agent.tools.registry import ToolContext
 from erp_ai.constants import AGENT_USER, LOG_DOCTYPE, LOGGER_NAME
 from erp_ai.test_utils import (
 	FakeGateway,
+	keep_agent_settings,
 	make_log_entry,
 	make_model_result,
 	record_status_signals,
@@ -367,6 +368,51 @@ class TestCommentHandler(HandlerTestCase):
 		logged = " ".join(str(arg) for call in logger.info.call_args_list for arg in call.args)
 		self.assertNotIn("SECRET", logged)
 		self.assertIn("comment_mention", logged)
+
+
+class TestExcludedTitle(HandlerTestCase):
+	"""A ticket the send predicate refuses is not queued; the logger line carries the refusal code only (AC-9 a)."""
+
+	PREFIX_LINE = "[HR]"
+
+	def setUp(self):
+		super().setUp()
+		keep_agent_settings(self)
+		set_agent_settings(excluded_title_prefixes=self.PREFIX_LINE)
+		enqueue_patch = patch.object(handlers, "enqueue_agent_run")
+		self.enqueue_agent_run = enqueue_patch.start()
+		self.addCleanup(enqueue_patch.stop)
+
+	@staticmethod
+	def _lines(logger):
+		return [str(arg) for call in logger.info.call_args_list for arg in call.args]
+
+	def test_prefixed_ticket_not_enqueued_and_logged_once(self):
+		logger = MagicMock()
+		with patch.object(frappe, "logger", return_value=logger):
+			ticket = make_ticket(subject=f"{self.PREFIX_LINE} SECRET salary", description="SECRET body")
+
+		self.assertEqual(self.enqueue_agent_run.call_count, 0)
+		lines = self._lines(logger)
+		refused = [line for line in lines if "not_sendable:excluded_title" in line]
+		self.assertEqual(len(refused), 1, lines)
+		self.assertIn(f"ticket={ticket.name}", refused[0])
+		self.assertIn("trigger=ticket_insert", refused[0])
+		self.assertNotIn("SECRET", " ".join(lines))
+
+	def test_keyword_comment_on_prefixed_ticket_logs_the_code(self):
+		ticket = make_ticket(subject=f"{self.PREFIX_LINE} SECRET salary")
+		self.enqueue_agent_run.reset_mock()
+		logger = MagicMock()
+		with patch.object(frappe, "logger", return_value=logger):
+			self._comment(ticket.name, f"{KEYWORD} SECRET question")
+
+		self.assertEqual(self.enqueue_agent_run.call_count, 0)
+		lines = self._lines(logger)
+		refused = [line for line in lines if "not_sendable:excluded_title" in line]
+		self.assertEqual(len(refused), 1, lines)
+		self.assertIn("trigger=comment_mention", refused[0])
+		self.assertNotIn("SECRET", " ".join(lines))
 
 
 class TestHumanCorrection(HandlerTestCase):

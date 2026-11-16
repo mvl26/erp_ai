@@ -1,13 +1,42 @@
 from datetime import date, datetime
+from unittest.mock import call, patch
 
 import frappe
 from frappe.tests.utils import FrappeTestCase
 
 from erp_ai.agent import ops_data
+from erp_ai.constants import AGENT_USER, LOGGER_NAME
 from erp_ai.test_utils import keep_agent_settings
 
 TYPE_A = "Sự cố & lỗi hệ thống"
 TYPE_D = "Chuẩn hóa dữ liệu & quy trình trên ERP"
+HUMAN_AGENT = "erpai-test-ops-human@example.com"
+# A real Datetime Custom Field erp_ai installs on HD Ticket, and a Date field of HD Ticket itself (Helpdesk core).
+DATETIME_DUE_FIELD = "ai_updated_at"
+DATE_DUE_FIELD = "opening_date"
+
+
+def _fake_ticket() -> str:
+	"""A ticket name no real ticket has: the helpers only match it against Comment and Task columns."""
+	return f"ERPAI-TEST-ops-{frappe.generate_hash(length=10)}"
+
+
+def _comment(ticket: str, owner: str, content: str) -> None:
+	doc = frappe.get_doc(
+		{
+			"doctype": "Comment",
+			"comment_type": "Comment",
+			"reference_doctype": "HD Ticket",
+			"reference_name": ticket,
+			"content": content,
+		}
+	)
+	doc.db_insert()
+	frappe.db.set_value("Comment", doc.name, "owner", owner, update_modified=False)
+
+
+def _task(ticket: str) -> None:
+	frappe.get_doc({"doctype": "Task", "subject": "ERPAI-TEST ops", "ai_ticket": ticket}).db_insert()
 
 
 class TestCycles(FrappeTestCase):
@@ -127,3 +156,89 @@ class TestCategoryLookup(FrappeTestCase):
 
 	def test_ba_note_marker(self):
 		self.assertEqual(ops_data.BA_NOTE_MARKER, "**BA note**")
+
+
+class TestTicketDeadline(FrappeTestCase):
+	def setUp(self):
+		keep_agent_settings(self)
+
+	def test_date_value_is_end_of_day(self):
+		resolution_by = datetime(2026, 11, 21, 17, 0)
+		end_of_day = datetime(2026, 11, 20, 23, 59, 59)
+		due_at = datetime(2026, 11, 20, 9, 30)
+		cases = (
+			# D, E: a Date due value is the end of that day (A-U5b-3); a Datetime is kept
+			("D", resolution_by, date(2026, 11, 20), end_of_day),
+			("E", resolution_by, date(2026, 11, 20), end_of_day),
+			("D", resolution_by, due_at, due_at),
+			("E", resolution_by, due_at, due_at),
+			# D, E with an empty due value: resolution_by
+			("D", resolution_by, None, resolution_by),
+			("E", resolution_by, "", resolution_by),
+			# A, B (and an unknown category): always resolution_by, whatever the due value
+			("A", resolution_by, date(2026, 11, 20), resolution_by),
+			("B", resolution_by, due_at, resolution_by),
+			(None, resolution_by, due_at, resolution_by),
+			# resolution_by read as a string is turned into a datetime; none at all -> None
+			("A", "2026-11-21 17:00:00", None, resolution_by),
+			("D", "2026-11-21 17:00:00", None, resolution_by),
+			("A", None, None, None),
+			("D", "", None, None),
+		)
+		for category, resolution, due_value, expected in cases:
+			with self.subTest(category=category, resolution_by=resolution, due_value=due_value):
+				result = ops_data.ticket_deadline(category, resolution, due_value)
+				self.assertEqual(result, expected)
+				if expected is not None:
+					self.assertIs(type(result), datetime)
+
+
+class TestMilestoneHelpers(FrappeTestCase):
+	def setUp(self):
+		keep_agent_settings(self)
+		self.addCleanup(frappe.db.rollback)
+
+	def test_ba_note_and_task_sets(self):
+		noted, human_only, plain, other = (_fake_ticket() for _ in range(4))
+		_comment(noted, AGENT_USER, f"{ops_data.BA_NOTE_MARKER}\nPhân tích nghiệp vụ")
+		# a person's comment that starts with the marker is not a BA note; the bot's comment must start with it
+		_comment(human_only, HUMAN_AGENT, f"{ops_data.BA_NOTE_MARKER}\nghi chú của người")
+		_comment(plain, AGENT_USER, f"Ghi chú: {ops_data.BA_NOTE_MARKER} chưa có")
+		# a ticket outside the asked names is never returned
+		_comment(other, AGENT_USER, f"{ops_data.BA_NOTE_MARKER}\nphiếu khác")
+		_task(noted)
+		_task(noted)
+		_task(other)
+		names = [noted, human_only, plain]
+
+		self.assertEqual(ops_data.tickets_with_ba_note([]), set())
+		self.assertEqual(ops_data.tickets_with_task([]), set())
+		self.assertEqual(ops_data.tickets_with_ba_note(names), {noted})
+		self.assertEqual(ops_data.tickets_with_task(names), {noted})
+		self.assertEqual(ops_data.tickets_with_ba_note([human_only, plain]), set())
+		self.assertEqual(ops_data.tickets_with_task([human_only, plain]), set())
+
+	def test_due_field_rejects_non_date_field(self):
+		for due_field in (None, ""):
+			with self.subTest(due_field=due_field), patch("frappe.logger") as get_logger:
+				self.assertIsNone(ops_data.due_field(due_field))
+				self.assertEqual(get_logger.return_value.warning.call_args_list, [])
+		for due_field in (DATETIME_DUE_FIELD, DATE_DUE_FIELD):
+			with self.subTest(due_field=due_field), patch("frappe.logger") as get_logger:
+				self.assertEqual(ops_data.due_field(due_field), due_field)
+				self.assertEqual(get_logger.return_value.warning.call_args_list, [])
+		# "subject" is a field of HD Ticket but not a Date/Datetime field
+		for due_field in ("erpai_test_no_such_field", "subject"):
+			with self.subTest(due_field=due_field), patch("frappe.logger") as get_logger:
+				self.assertIsNone(ops_data.due_field(due_field))
+				get_logger.assert_called_with(LOGGER_NAME)
+				self.assertEqual(
+					get_logger.return_value.warning.call_args_list,
+					[
+						call(
+							"erp_ai daily_report: due field %s is not a Date/Datetime field of HD Ticket, "
+							"using resolution_by",
+							due_field,
+						)
+					],
+				)

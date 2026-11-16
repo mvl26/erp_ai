@@ -10549,6 +10549,8 @@ FOR_UPDATE_ALLOWED = {
 	# these two lock the ticket row by design: U6b design step (4) for lifecycle, controller ruling R17e for kb_draft
 	("agent/lifecycle.py", "_locked_status_category"),
 	("agent/tools/kb_draft.py", "create_kb_draft"),
+	# locks the ticket row by design: U5b design step 6.1 for the reminder job, controller ruling R30
+	("agent/due_checks.py", "_lock_ticket"),
 }
 
 

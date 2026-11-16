@@ -1,5 +1,7 @@
+import ast
 import json
 from datetime import datetime, timedelta
+from pathlib import Path
 from unittest.mock import patch
 
 import frappe
@@ -7,9 +9,9 @@ from frappe.desk.form import assign_to
 from frappe.tests.utils import FrappeTestCase
 from helpdesk.test_utils import make_ticket
 
-from erp_ai.agent import due_checks, run_log
+from erp_ai.agent import due_checks, policy, run_log
 from erp_ai.agent.ops_data import BA_NOTE_MARKER
-from erp_ai.constants import AGENT_USER, LOG_DOCTYPE, LOGGER_NAME, SETTING_DOCTYPE
+from erp_ai.constants import AGENT_USER, LOG_DOCTYPE, LOGGER_NAME, SETTING_DOCTYPE, TITLE_RUN_FAILED
 from erp_ai.test_utils import (
 	keep_agent_settings,
 	make_active_agent,
@@ -168,6 +170,45 @@ def _sent_kinds(ticket: str) -> set[str]:
 	return {kind for _, kind, _ in due_checks.sent_keys([ticket])}
 
 
+def _effects() -> dict[str, int]:
+	"""What the reminder job writes, counted over the site: agent comments and notices on tickets, bot_action rows."""
+	return {
+		"comments": frappe.db.count("Comment", {"reference_doctype": TICKET, "owner": AGENT_USER}),
+		"notices": frappe.db.count("Notification Log", {"document_type": TICKET, "from_user": AGENT_USER}),
+		"rows": frappe.db.count(LOG_DOCTYPE, {"entry_type": "bot_action", "trigger": "scheduled_job"}),
+	}
+
+
+def _new_errors(old: set[str]) -> list[str]:
+	"""The messages of the TITLE_RUN_FAILED Error Log rows not in `old` (Error Log rows outlive a test)."""
+	rows = frappe.get_all("Error Log", filters={"method": TITLE_RUN_FAILED}, fields=["name", "error"])
+	return [row.error for row in rows if row.name not in old]
+
+
+def _error_names() -> set[str]:
+	return set(frappe.get_all("Error Log", filters={"method": TITLE_RUN_FAILED}, pluck="name"))
+
+
+SETTING_WRITE_CALLS = ("set_single_value", "save", "db_set", "db_update")
+
+
+def _setting_writes(source: str) -> list[tuple[str, int]]:
+	"""(call, line) of each setting write in `source`: `set_single_value`, a `set_value` on SETTING_DOCTYPE, and every
+	`save`/`db_set`/`db_update` (the reminder job saves no document at all)."""
+	found = []
+	for node in ast.walk(ast.parse(source)):
+		if not isinstance(node, ast.Call):
+			continue
+		name = node.func.attr if isinstance(node.func, ast.Attribute) else getattr(node.func, "id", "")
+		first = node.args[0] if node.args else None
+		on_setting = (isinstance(first, ast.Name) and first.id == "SETTING_DOCTYPE") or (
+			isinstance(first, ast.Constant) and first.value == SETTING_DOCTYPE
+		)
+		if name in SETTING_WRITE_CALLS or (name == "set_value" and on_setting):
+			found.append((name, node.lineno))
+	return found
+
+
 SEED_DOCTYPES = ("Notification Log", LOG_DOCTYPE, "Error Log", "Email Queue")
 TEXT_FIELD_TYPES = ("Data", "Small Text", "Text", "Long Text", "Text Editor", "Code", "JSON", "HTML Editor")
 
@@ -227,6 +268,22 @@ class DueChecksTestCase(FrappeTestCase):
 		"""One run of the job at `now`; the job leaves the agent session on, the test goes on as Administrator."""
 		due_checks.run_due_checks(now)
 		frappe.set_user("Administrator")
+
+	def _four_kinds(self) -> dict[str, str]:
+		"""One ticket per kind of reminder at NOW, and an excluded one reminded by a coded notice."""
+		person = make_active_agent(self)
+		team = self._excluded_team()
+		tickets = {
+			"due_soon": _ticket("D", NOW - timedelta(hours=1), **{DUE_FIELD: NOW + timedelta(hours=2)}),
+			"overdue": _ticket("E", NOW - timedelta(hours=2), resolution_by=NOW - timedelta(hours=1)),
+			"ba_note": _ticket("C", NOW - timedelta(hours=30)),
+			"task": _ticket("D", NOW - timedelta(days=4)),
+			"excluded": _ticket(
+				"D", NOW - timedelta(hours=3), agent_group=team, **{DUE_FIELD: NOW - timedelta(hours=2)}
+			),
+		}
+		_assign(tickets["excluded"], person)
+		return tickets
 
 
 class TestNames(FrappeTestCase):
@@ -646,6 +703,115 @@ class TestMilestones(DueChecksTestCase):
 		for created, hours, expected in cases:
 			with self.subTest(created=created, hours=hours):
 				self.assertIs(due_checks.milestone_due(created, NOW, hours), expected)
+
+
+class TestIdempotent(DueChecksTestCase):
+	def test_run_twice_same_now_one_effect(self):
+		tickets = self._four_kinds()
+
+		self._run(NOW)
+		first = _effects()
+		self._run(NOW)
+
+		self.assertEqual(_effects(), first)
+		kinds = {kind for _, kind, _ in due_checks.sent_keys(list(tickets.values()))}
+		self.assertEqual(kinds, {"due_soon", "overdue", "ba_note_missing", "task_missing"})
+		self.assertEqual(len(_notices(tickets["excluded"])), 1)
+
+		# two runs at once: this one read the keys of the batch before the other one wrote them; the read again
+		# under the ticket's row lock still finds them, so nothing goes out twice (U5b.md:227, step 6.1)
+		real_sent_keys = due_checks.sent_keys
+		calls = []
+
+		def batch_read_too_early(names):
+			calls.append(names)
+			return set() if len(calls) == 1 else real_sent_keys(names)
+
+		with patch.object(due_checks, "sent_keys", side_effect=batch_read_too_early):
+			self._run(NOW)
+
+		self.assertTrue(calls)
+		self.assertEqual(_effects(), first)
+
+	def test_fail_midway_then_exactly_once(self):
+		deadline = NOW + timedelta(hours=4)
+		names = [_ticket("E", NOW - timedelta(hours=3 - index), resolution_by=deadline) for index in range(3)]
+		old_errors = _error_names()
+		real_write = run_log.write_bot_action
+
+		def fail_on_second(**kwargs):
+			if kwargs["ticket"] == names[1]:
+				raise RuntimeError("ERPAI-TEST write failed")
+			return real_write(**kwargs)
+
+		with (
+			patch.object(run_log, "write_bot_action", side_effect=fail_on_second),
+			patch("frappe.logger") as get_logger,
+		):
+			self._run(NOW)
+
+		self.assertEqual([len(_agent_comments(name)) for name in names], [1, 0, 1])
+		self.assertEqual([len(due_checks.sent_keys([name])) for name in names], [1, 0, 1])
+		self.assertEqual(
+			_new_errors(old_errors), [f"due_checks ticket={names[1]} kind=due_soon error=RuntimeError"]
+		)
+		summaries = [
+			args[0][1:] for args in get_logger.return_value.info.call_args_list if args[0][0] == SUMMARY
+		]
+		self.assertEqual(summaries, [(2, 0, 0, 0, 1, 0, False)])
+
+		self._run(NOW + timedelta(minutes=15))
+
+		self.assertEqual([len(_agent_comments(name)) for name in names], [1, 1, 1])
+		self.assertEqual(
+			[due_checks.sent_keys([name]) for name in names],
+			[{(name, "due_soon", _iso(deadline))} for name in names],
+		)
+
+	def test_run_error_logged_not_raised(self):
+		# a failure before any ticket (here: reading the keys) ends the run with one Error Log, never an exception
+		_ticket("E", NOW - timedelta(hours=1), resolution_by=NOW + timedelta(hours=2))
+		old_errors = _error_names()
+
+		with patch.object(due_checks, "sent_keys", side_effect=RuntimeError("ERPAI-TEST read failed")):
+			self._run(NOW)
+
+		self.assertEqual(_new_errors(old_errors), ["due_checks error=RuntimeError"])
+
+
+class TestBoundaries(DueChecksTestCase):
+	def test_no_setting_write_in_agent_session_code(self):
+		# ADR-033 Ràng buộc 2: the job runs under the agent account and writes no setting
+		self.assertEqual(_setting_writes(Path(due_checks.__file__).read_text()), [])
+		# the check catches each form
+		for sample in (
+			"frappe.db.set_single_value(SETTING_DOCTYPE, 'x', 1)\n",
+			"frappe.db.set_value(SETTING_DOCTYPE, SETTING_DOCTYPE, 'x', 1)\n",
+			f"frappe.db.set_value({SETTING_DOCTYPE!r}, None, 'x', 1)\n",
+			"frappe.get_single(SETTING_DOCTYPE).save()\n",
+			"doc.db_set('x', 1)\n",
+		):
+			with self.subTest(sample=sample):
+				self.assertEqual(len(_setting_writes(sample)), 1)
+		self.assertEqual(_setting_writes("frappe.db.set_value('ToDo', 'T', 'status', 'Open')\n"), [])
+
+	def test_entries_built_by_action_entry(self):
+		tickets = self._four_kinds()
+
+		self._run(NOW)
+
+		for kind, ticket in tickets.items():
+			with self.subTest(kind=kind):
+				rows = _bot_rows(ticket)
+				self.assertEqual(len(rows), 1)
+				self.assertEqual(rows[0].trigger, "scheduled_job")
+				self.assertEqual(rows[0].cost_usd, 0)
+				actions = json.loads(rows[0].actions)
+				self.assertEqual(len(actions), 1)
+				self.assertEqual(list(actions[0]), list(run_log.ACTION_KEYS))
+				self.assertIs(actions[0]["ok"], True)
+				# a bot_action row is no agent run: it never counts towards the daily run limit
+				self.assertEqual(policy.runs_today(ticket, rows[0].creation), 0)
 
 
 class TestSentKeys(FrappeTestCase):

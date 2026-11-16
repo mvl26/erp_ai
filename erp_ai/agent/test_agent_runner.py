@@ -6181,3 +6181,128 @@ class TestKbDraftRun(GuidanceTestBase):
 			entry, action_entry("create_kb_draft", "HD Article", article, True, value_after=call["input"])
 		)
 		self.assertEqual(self._skip_reasons(), [])
+
+
+# T171 (AC-62, AC-63, AC-65; U8-3, w1.md:122): a category C ticket's BA note is its own comment, once; each Task the
+# guidance run creates is one action entry and one line of "Đã làm", never a comment.
+BA_NOTE_TEXT = (
+	f"**Mục tiêu:** {PREFIX}theo dõi giờ làm của từng việc\n"
+	"**Phạm vi:** việc của phiếu đầu mục C, không đụng bảng chấm công\n"
+	"**Tính năng sẵn có:** Có, ERPNext có trường ước lượng giờ trên việc\n"
+	"**Nguồn:** erpnext/projects/doctype/task/task.json\n"
+	"**Rủi ro:** người dùng nhầm giờ ước lượng với giờ thực\n"
+	"**Câu hỏi mở:** có cần báo cáo tổng giờ theo tuần không?\n"
+	"Độ tin cậy: 80%"
+)
+# (subject, expected_hours, the hours as the done line writes them)
+C_TASKS = (
+	(f"{PREFIX}thêm trường giờ ước lượng", 1, "1"),
+	(f"{PREFIX}báo cáo tổng giờ", 2.5, "2.5"),
+	(f"{PREFIX}phân quyền xem giờ", 4, "4"),
+)
+
+
+def ba_note_call(block_id):
+	return tool_use(block_id, "post_comment", kind="ba_note", content=BA_NOTE_TEXT)
+
+
+def task_calls():
+	return [
+		tool_use(f"t_task{index}", "create_task", subject=subject, description="x", expected_hours=hours)
+		for index, (subject, hours, _text) in enumerate(C_TASKS)
+	]
+
+
+class TestCategoryC(GuidanceTestBase):
+	"""AC-62, AC-63, AC-65 (T171, U4b-fixes.md:431, :436, w1.md:202): end to end on a category C ticket at L1 with an
+	instructor; `runner.py` has nothing of U8 (U4b-fixes.md:334)."""
+
+	def setUp(self):
+		super().setUp()
+		make_instructor(self)
+		set_agent_settings(level_cap_c="L1", max_tasks_per_run=10)
+		# the BA note's gate reads the ticket's latest classification: the real one, from this run's classify row
+		self.latest_classification.side_effect = self.real_latest_classification
+		instructor = patch.object(authority, "run_instructor", return_value=INSTRUCTOR)
+		instructor.start()
+		self.addCleanup(instructor.stop)
+
+	def _ba_notes(self):
+		return frappe.get_all(
+			"Comment",
+			filters={
+				**authority.ticket_comment_filters(self.ticket.name),
+				"content": ["like", f"{write_ticket.BA_NOTE_MARKER}%"],
+			},
+			pluck="content",
+		)
+
+	def _task_entries(self):
+		return [
+			action
+			for entry in self._entries(entry_type="reason")
+			for action in json.loads(entry.actions or "[]")
+			if action["tool"] == "create_task"
+		]
+
+	def _tasks_by_subject(self):
+		rows = frappe.get_all("Task", filters={"ai_ticket": self.ticket.name}, fields=["name", "subject"])
+		return {row.subject: row.name for row in rows}
+
+	def test_two_runs_one_ba_note(self):
+		self.gateway.results = [classify_c(), tool_turn(ba_note_call("t_ba1")), make_model_result()]
+		self._run()
+		self.gateway.results = [tool_turn(ba_note_call("t_ba2")), make_model_result()]
+		self._run("comment_mention")
+
+		(note,) = self._ba_notes()
+		self.assertEqual(note, f"{write_ticket.BA_NOTE_MARKER}\n{BA_NOTE_TEXT}")
+		self.assertEqual(
+			self._tool_results(-1)["t_ba2"], {"ok": False, "reason": write_ticket.REASON_BA_NOTE_EXISTS}
+		)
+		# the note is its own comment: the ticket still has one guidance comment, without the note in it
+		self.assertEqual(self._guidance(), 1)
+		self.assertNotIn(write_ticket.BA_NOTE_MARKER, self._guidance_content())
+
+	def test_each_task_one_action_entry(self):
+		calls = task_calls()
+		self.gateway.results = [classify_c(), tool_turn(*calls), make_model_result()]
+		self._run()
+
+		tasks = self._tasks_by_subject()
+		self.assertEqual(len(tasks), 3)
+		entries = self._task_entries()
+		self.assertEqual(
+			entries,
+			[
+				action_entry(
+					"create_task",
+					"Task",
+					tasks[call["input"]["subject"]],
+					True,
+					value_after=call["input"],
+					instructor=INSTRUCTOR,
+				)
+				for call in calls
+			],
+		)
+		self.assertEqual(
+			[entry["value_after"]["expected_hours"] for entry in entries],
+			[hours for _s, hours, _t in C_TASKS],
+		)
+
+	def test_tasks_in_guidance_run_listed_in_done(self):
+		before = self._comment_names()
+		self.gateway.results = [classify_c(), tool_turn(*task_calls()), make_model_result()]
+		self._run()
+
+		tasks = self._tasks_by_subject()
+		# the run's one new comment is the guidance comment: no comment per Task
+		(content,) = self._new_comments(before).values()
+		self.assertTrue(content.startswith(write_ticket.GUIDANCE_MARKER))
+		done = re.findall(r"<li>(.*?)</li>", content[content.index("<strong>Đã làm:</strong>") :])
+		for subject, _hours, text in C_TASKS:
+			with self.subTest(subject):
+				line = escape_html(write_ticket.TASK_DONE.format(task=tasks[subject], hours=text))
+				self.assertEqual(done.count(line), 1)
+		self.assertEqual(len(self._task_entries()), 3)

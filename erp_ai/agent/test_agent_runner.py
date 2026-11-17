@@ -51,6 +51,7 @@ from erp_ai.agent.prompts import (
 	build_classify_request,
 	build_reason_system,
 	build_routing_table,
+	no_instructor_text,
 )
 from erp_ai.agent.queue import PENDING_JOB_IDS_FLAG, enqueue_agent_run, requester_reply_key
 from erp_ai.agent.redact import MASK
@@ -1062,6 +1063,10 @@ class TestRunnerReasoning(RunnerTestBase):
 		self.assertIn("create_task", [tool["name"] for tool in self.gateway.calls[0]["tools"]])
 
 	def test_initial_message_carries_comments_by_full_name_and_classification(self):
+		# every power switch off, never read from the shared site: at L1 an instructor's message opens create_task only
+		set_agent_settings(
+			record_tools_enabled=0, unrestricted_enabled=0, code_change_enabled=0, console_enabled=0
+		)
 		comments = [
 			{"name": "c1", "author": "Administrator", "creation": "2026-01-01", "content": "<p>xin chào</p>"}
 		]
@@ -1088,7 +1093,8 @@ class TestRunnerReasoning(RunnerTestBase):
 			{"category": SEEDED_CLASSIFICATION[0], "confidence_pct": SEEDED_CLASSIFICATION[1]},
 		)
 		self.assertEqual(payload["ticket"]["subject"], f"{PREFIX}runner ticket")
-		self.assertTrue(content.endswith(TASK_COMMENT))
+		# BUG-010: the message has no authority, so the task names the tool an instructor's message would open
+		self.assertTrue(content.endswith(f"{TASK_COMMENT}\n{no_instructor_text(('create_task',))}"), content)
 
 	def test_initial_message_carries_the_conversation_by_full_name(self):
 		# newest first, as the message reader returns them; the model reads them oldest first

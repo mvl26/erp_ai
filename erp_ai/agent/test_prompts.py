@@ -1140,3 +1140,58 @@ class TestOwnDecisionsBlock(FrappeTestCase):
 			self.assertIn(phrase, block)
 		# a section heading of the comment stays once, in VIẾT COMMENT
 		self.assertNotIn("**", block)
+
+
+NO_INSTRUCTOR_TOOLS = ("api_update_record", "create_task")
+
+
+class TestRolesAreCurrentAndMissingAuthority(FrappeTestCase):
+	"""BUG-010 (ticket 43406): a run whose message has no authority says why it lacks tools, and the labels of older
+	messages, read with today's roles, never make the bot call its earlier work unauthorised."""
+
+	@staticmethod
+	def _message(trigger, **extra):
+		return prompts.build_initial_message(TICKET, COMMENTS, trigger, None, **extra)
+
+	def test_conversation_roles_are_todays_and_earlier_work_was_checked(self):
+		for phrase in (
+			"theo quyền hiện tại của người viết, không theo quyền lúc họ gửi",
+			"việc bot đã làm ở lượt trước đã được kiểm quyền lúc chạy",
+			"không nói việc đó làm sai quyền",
+			"không đề nghị xóa hay hoàn tác",
+		):
+			self.assertEqual(prompts.TASK_CONVERSATION.count(phrase), 1, phrase)
+
+	def test_no_instructor_line_names_the_reason_and_the_tools(self):
+		line = getattr(prompts, "no_instructor_text", lambda tools: "")(NO_INSTRUCTOR_TOOLS)
+		self.assertNotIn("\n", line)
+		for phrase in (
+			"ERP AI Instructor",
+			"người được người khác giao phiếu này",
+			"api_update_record, create_task",
+			"nói đúng lý do này",
+			"không viết là bot không có công cụ",
+		):
+			self.assertEqual(line.count(phrase), 1, phrase)
+
+	def test_comment_run_without_authority_gets_the_line_after_its_task(self):
+		line = getattr(prompts, "no_instructor_text", lambda tools: "<missing>")(NO_INSTRUCTOR_TOOLS)
+		message = self._message(TRIGGER_COMMENT_MENTION, instructor_tools=NO_INSTRUCTOR_TOOLS)
+		self.assertEqual(message.count(line), 1)
+		self.assertTrue(message.endswith(f"\n\n{prompts.TASK_COMMENT}\n{line}"), message)
+
+	def test_no_line_without_locked_tools_or_on_other_triggers(self):
+		line = getattr(prompts, "no_instructor_text", lambda tools: "<missing>")(NO_INSTRUCTOR_TOOLS)
+		self.assertIn("instructor_tools", inspect.signature(prompts.build_initial_message).parameters)
+		baseline = self._message(TRIGGER_COMMENT_MENTION)
+		self.assertEqual(self._message(TRIGGER_COMMENT_MENTION, instructor_tools=()), baseline)
+		for trigger in (
+			TRIGGER_TICKET_INSERT,
+			TRIGGER_REQUESTER_REPLY,
+			TRIGGER_CHANGE_ACTION,
+			TRIGGER_KB_DRAFT,
+		):
+			with self.subTest(trigger=trigger):
+				message = self._message(trigger, instructor_tools=NO_INSTRUCTOR_TOOLS)
+				self.assertNotIn(line, message)
+				self.assertEqual(message, self._message(trigger))

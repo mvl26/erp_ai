@@ -1513,6 +1513,16 @@ def _config_users(routing: dict) -> set[str]:
 	return {user for user in users if user}
 
 
+def _instructor_tools(inputs, granted) -> tuple[str, ...]:
+	"""BUG-010: the tools an instructor's message would have opened in this run, in grant order; () when the run has
+	an instructor or authority would open nothing (an ask-only run, the KB draft)."""
+	if inputs.has_instructor:
+		return ()
+	opened = grant(dataclasses.replace(inputs, has_instructor=True))
+	have = granted.names()
+	return tuple(spec.name for spec in opened.specs if spec.name not in have)
+
+
 def _routing_table(context) -> str:
 	"""Routing table of the reason prompt, from the config and mapping already loaded for this run."""
 	routing = context.routing_config
@@ -1565,7 +1575,8 @@ def _reason(
 		["subject", "description", "status", "priority", "ticket_type", "agent_group", "creation"],
 		as_dict=True,
 	)
-	granted = grant(context.grant_inputs())
+	inputs = context.grant_inputs()
+	granted = grant(inputs)
 	tools = granted.schemas()
 	if tools:
 		tools[-1]["cache_control"] = {"type": "ephemeral"}
@@ -1595,6 +1606,7 @@ def _reason(
 				conversation=conversation,
 				lessons=lessons,
 				propose_now=granted.change_block and granted.act_now_block,
+				instructor_tools=_instructor_tools(inputs, granted),
 			),
 		}
 	]

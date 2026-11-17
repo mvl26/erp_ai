@@ -157,7 +157,7 @@ def _permission_switch_fields() -> tuple:
 
 
 # CHG-014: the reason a tag name of the tag table is refused (the rule of erp_ai.agent.classification.clean_label).
-TAG_NAME_REASON = "tên tag phải dài 2–40 ký tự, chỉ gồm chữ, số, khoảng trắng và & ( ) + . / # -"
+TAG_NAME_REASON = "tên tag phải dài 2 đến 40 ký tự, chỉ gồm chữ, số, khoảng trắng và & ( ) + . / # -"
 EMPTY_DATETIME = datetime(1, 1, 1)  # what frappe.utils.cast returns for an empty Datetime
 
 

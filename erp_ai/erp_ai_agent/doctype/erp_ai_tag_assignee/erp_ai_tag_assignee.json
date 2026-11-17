@@ -19,7 +19,7 @@
    "label": "Tag và người phụ trách"
   },
   {
-   "description": "Tên tag do bạn đặt, ví dụ chấm công, tracecore: 2–40 ký tự, chỉ chữ, số, khoảng trắng và & ( ) + . / # -, không dấu phẩy. Không cần tạo Tag trước: bot tự tạo khi gắn lần đầu. So không phân biệt hoa thường; tag người tạo phiếu tự gắn không được tính.",
+   "description": "Tên tag do bạn đặt, ví dụ chấm công, tracecore: 2 đến 40 ký tự, chỉ chữ, số, khoảng trắng và & ( ) + . / # -, không dấu phẩy. Không cần tạo Tag trước: bot tự tạo khi gắn lần đầu. So không phân biệt hoa thường; tag người tạo phiếu tự gắn không được tính.",
    "fieldname": "tag",
    "fieldtype": "Data",
    "in_list_view": 1,

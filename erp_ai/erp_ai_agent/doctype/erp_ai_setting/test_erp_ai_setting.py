@@ -2990,7 +2990,7 @@ class TestTagAssignees(FrappeTestCase):
 			with self.subTest(tag=tag):
 				self.assertEqual(
 					self._save_rows({"tag": tag, "assignee": self.person}),
-					"Gán người theo tag dòng 1: tên tag phải dài 2–40 ký tự, chỉ gồm chữ, số, khoảng trắng và "
+					"Gán người theo tag dòng 1: tên tag phải dài 2 đến 40 ký tự, chỉ gồm chữ, số, khoảng trắng và "
 					"& ( ) + . / # -",
 				)
 

@@ -13,7 +13,7 @@ function setupForm({ doc, call, router }) {
 		const TEXT_STATUS_RUNNING = "Đang xử lý…";
 		const TEXT_BOT_LABEL = "Bot";
 		const TEXT_BOT_GUIDANCE =
-			'Bot có thể không trả lời khi đang tắt, đang ở chế độ chỉ ghi nhận, phiếu không dùng AI hoặc thuộc nhóm loại trừ, đã hết lượt hôm nay, hoặc đang trả lời tin trước của phiếu này (khi đó hãy gửi lại sau). Nhận định và hướng xử lý của bot là tin trong ngăn này; người có vai trò ERP AI Instructor bấm "Duyệt hướng xử lý" dưới tin đó thì bot làm theo.';
+			'Bot có thể không trả lời khi đang tắt, đang ở chế độ chỉ ghi nhận, phiếu không dùng AI hoặc thuộc nhóm loại trừ, đã hết lượt hôm nay, hoặc đang trả lời tin trước của phiếu này (khi đó hãy gửi lại sau). Nhận định và hướng xử lý của bot là tin trong ngăn này; người có vai trò ERP AI Instructor bấm "Duyệt hướng xử lý" dưới tin đó (nút chỉ có khi bot còn việc tự làm) thì bot làm theo.';
 		// ADR-050: the newest guidance of the bot gets the approve button; a click sends this fixed text (server
 		// prompts.APPROVE_GUIDANCE_TEXT) through the send box, as the person who clicked.
 		const KIND_GUIDANCE = "guidance";
@@ -614,7 +614,7 @@ function setupForm({ doc, call, router }) {
 				created: String(message?.created ?? ""),
 				rank: 0,
 				nodes: [
-					messageRow(message, index === newestGuidance),
+					messageRow(message, index === newestGuidance && message?.approvable),
 					...(below.get(message?.name) || []),
 				],
 			}));

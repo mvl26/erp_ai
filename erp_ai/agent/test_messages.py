@@ -89,8 +89,10 @@ class TestMessages(FrappeTestCase):
 		self.assertEqual([row["name"] for row in rows], [human, bot])
 		self.assertEqual([row["is_bot"] for row in rows], [False, True])
 		# CHG-010: each thread row also carries the raw creation time, so the panel can order cards among rows
-		# ADR-050: and its kind, "" for a message shown as stored
-		self.assertEqual(set(rows[0]), {"name", "author", "is_bot", "created_at", "created", "text", "kind"})
+		# ADR-050: and its kind, "" for a message shown as stored; CHG-016: and whether it can be approved
+		self.assertEqual(
+			set(rows[0]), {"name", "author", "is_bot", "created_at", "created", "text", "kind", "approvable"}
+		)
 		self.assertEqual(
 			[row["created"] for row in rows],
 			[str(frappe.db.get_value(MESSAGE_DOCTYPE, name, "creation")) for name in (human, bot)],

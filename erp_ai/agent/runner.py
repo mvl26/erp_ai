@@ -1607,6 +1607,8 @@ def _reason(
 				lessons=lessons,
 				propose_now=granted.change_block and granted.act_now_block,
 				instructor_tools=_instructor_tools(inputs, granted),
+				# CHG-010: on the creation run the instructor is the ticket's creator, so the ticket is the order.
+				ticket_is_order=trigger == TRIGGER_TICKET_INSERT and bool(context.instructor),
 			),
 		}
 	]

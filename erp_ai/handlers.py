@@ -4,6 +4,7 @@ import frappe
 from frappe.core.utils import html_to_plain_text
 
 from erp_ai.agent import lessons, lifecycle, messages, policy
+from erp_ai.agent.prompts import RESULT_APPROVED_TEXT
 from erp_ai.agent.queue import enqueue_agent_run, enqueue_lifecycle_job, requester_reply_key
 from erp_ai.agent.run_log import EVENT_CODES, record_event
 from erp_ai.constants import (
@@ -278,6 +279,9 @@ def message_after_insert(doc, method=None):
 	skip_reason = None
 	if doc.owner == AGENT_USER:
 		skip_reason = "written_by_agent"
+	elif (doc.content or "").strip() == RESULT_APPROVED_TEXT:
+		# CHG-017: the closing line of an approval is not a call to the bot
+		skip_reason = "result_approved"
 	elif not policy.is_enabled():
 		skip_reason = SKIP_AGENT_DISABLED
 	elif refusal := policy.send_refusal(ticket):

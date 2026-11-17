@@ -107,7 +107,18 @@ KEYWORD = "@ai"
 RUN_ROUTE = "erp_ai.agent.runner.run_for_ticket"
 # CHG-010: thread rows carry the raw creation time as `created`
 # ADR-050: "kind" marks the bot's guidance message ("guidance"), "" for any other
-THREAD_KEYS = {"name", "author", "is_bot", "created_at", "created", "text", "kind", "approvable"}
+THREAD_KEYS = {
+	"name",
+	"author",
+	"is_bot",
+	"created_at",
+	"created",
+	"text",
+	"kind",
+	"approvable",
+	"result_confirmable",
+	"result_links",
+}
 
 
 def _make_user(email, user_type="Website User"):
@@ -170,13 +181,14 @@ class TestTicketPanelRead(FrappeTestCase):
 		return ticket_panel.get_panel_data(ticket or self.ticket.name)
 
 	def test_methods_whitelisted_post_without_guest(self):
-		# ADR-044 QĐ 1 (CHG-008): the panel gains its one decision method, a third POST-only method
+		# ADR-044 QĐ 1 (CHG-008), CHG-017: the decision method and the result method, POST-only
 		self.assertEqual(
 			PANEL_METHODS,
 			(
 				"erp_ai.ticket_panel.get_panel_data",
 				"erp_ai.ticket_panel.send_message",
 				"erp_ai.ticket_panel.decide_proposal",
+				"erp_ai.ticket_panel.decide_result",
 			),
 		)
 		for method in PANEL_METHODS:

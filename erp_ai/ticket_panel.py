@@ -13,7 +13,8 @@ from frappe.core.utils import html_to_plain_text
 from frappe.utils import cstr, format_datetime
 from helpdesk.utils import is_agent
 
-from erp_ai.agent import bot_status, change_link, messages
+from erp_ai.agent import bot_status, change_link, lifecycle, messages
+from erp_ai.agent.prompts import RESULT_APPROVED_TEXT, RESULT_REJECTED_TEXT
 from erp_ai.constants import AGENT_USER, LOGGER_NAME, PANEL_MAX_MESSAGE_CHARS
 from erp_ai.erp_ai_agent.doctype.erp_ai_change_proposal import erp_ai_change_proposal as proposal_form
 
@@ -55,7 +56,7 @@ def _log_denied(method, ticket, reason):
 def _require_panel_access(ticket: str | None, *, method: str) -> None:
 	"""Shared gate of the panel methods: an active agent who can read the ticket.
 
-	`method` is the label of the caller ("get", "send" or "decide"): it names the log line, and every method but
+	`method` labels the caller ("get", "send", "decide" or "result"): it names the log line, and every method but
 	"get" also refuses the agent account. A missing ticket is a ticket nobody can read.
 	"""
 	if not is_agent():
@@ -70,6 +71,8 @@ def _require_panel_access(ticket: str | None, *, method: str) -> None:
 		frappe.throw(_("Bạn không có quyền xem khu vực này của phiếu."), frappe.PermissionError)
 	if method != "get" and frappe.session.user == AGENT_USER:
 		_log_denied(method, ticket, "agent_user")
+		if method == "result":
+			frappe.throw(_("Tài khoản agent không được duyệt kết quả."), frappe.PermissionError)
 		if method == "send":
 			frappe.throw(_("Tài khoản agent không được gửi tin từ khu vực này."), frappe.PermissionError)
 		frappe.throw(_("Tài khoản agent không được duyệt hoặc từ chối đề xuất."), frappe.PermissionError)
@@ -178,3 +181,42 @@ def decide_proposal(name=None, action=None) -> dict:
 		f"erp_ai panel decide proposal={name} action={action} status={result['status']}"
 	)
 	return result
+
+
+RESULT_ACTIONS = ("approve", "reject")
+
+
+@frappe.whitelist(methods=["POST"])
+def decide_result(ticket: str, action: str) -> dict:
+	"""CHG-017: the person's verdict on the bot's finished work, from the buttons under its guidance.
+
+	Input: ticket name; `action` "approve" (the ticket moves to Resolved through `lifecycle`, and one closing line
+	joins the conversation) or "reject" (the fixed text `RESULT_REJECTED_TEXT` joins it as the person's message,
+	which calls the bot: it asks what fell short).
+	Output: {"message": <ERP AI Message name>} and, for approve, "status".
+	Errors, each writing nothing: ValidationError (missing ticket, `action` unknown, no finished work to confirm,
+	or the ticket may not change status); PermissionError (the panel gate, the agent account, or not the ticket's
+	creator nor an ERP AI Instructor).
+	"""
+	if not isinstance(ticket, str) or not ticket.strip():
+		frappe.throw(_("Thiếu mã phiếu."), frappe.ValidationError)
+	ticket = ticket.strip()
+	if not isinstance(action, str) or action not in RESULT_ACTIONS:
+		frappe.throw(_("Hành động không hợp lệ."), frappe.ValidationError)
+	_require_panel_access(ticket, method="result")
+	if not lifecycle.result_confirmer(frappe.session.user, ticket):
+		_log_denied("result", ticket, "not_confirmer")
+		frappe.throw(
+			_("Chỉ người tạo phiếu hoặc người có vai trò ERP AI Instructor được duyệt kết quả."),
+			frappe.PermissionError,
+		)
+	if not any(message["result_confirmable"] for message in messages.thread(ticket)):
+		frappe.throw(_("Bot chưa có kết quả nào để duyệt trên phiếu này."), frappe.ValidationError)
+	if action == "reject":
+		name = messages.add_result_line(ticket, RESULT_REJECTED_TEXT)
+		frappe.logger(LOGGER_NAME).info(f"erp_ai panel result ticket={ticket} action=reject message={name}")
+		return {"message": name}
+	lifecycle.resolve_by_person(ticket, frappe.session.user)
+	name = messages.add_result_line(ticket, RESULT_APPROVED_TEXT)
+	frappe.logger(LOGGER_NAME).info(f"erp_ai panel result ticket={ticket} action=approve message={name}")
+	return {"message": name, "status": lifecycle.STATUS_RESOLVED}

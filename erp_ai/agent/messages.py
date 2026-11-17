@@ -26,6 +26,9 @@ def add_message(
 	"""
 	if not isinstance(content, str) or not content.strip():
 		raise ValueError("content must be a non-empty string")
+	# imported on call: authority reads the conversation through this module's callers
+	from erp_ai.agent import authority
+
 	doc = frappe.get_doc(
 		{
 			"doctype": MESSAGE_DOCTYPE,
@@ -33,6 +36,8 @@ def add_message(
 			"content": content,
 			"run_id": run_id,
 			"source_comment": source_comment,
+			# BUG-009: the role the author (the session user) holds as the message is sent
+			"author_role": authority.role_label(frappe.session.user, ticket),
 		}
 	)
 	doc.insert(ignore_permissions=trusted)
@@ -44,7 +49,7 @@ def _rows(ticket: str, limit: int) -> list:
 	return frappe.get_all(
 		MESSAGE_DOCTYPE,
 		filters={"ticket": ticket},
-		fields=["name", "owner", "creation", "content"],
+		fields=["name", "owner", "creation", "content", "author_role"],
 		order_by="creation desc, name desc",
 		limit_page_length=limit,
 	)
@@ -53,7 +58,13 @@ def _rows(ticket: str, limit: int) -> list:
 def history(ticket: str, limit: int = MAX_COMMENTS) -> list[dict]:
 	"""Newest first. The author is `owner` (set by the server); client-set fields are never read."""
 	return [
-		{"name": row.name, "author": row.owner, "creation": row.creation, "content": row.content}
+		{
+			"name": row.name,
+			"author": row.owner,
+			"creation": row.creation,
+			"content": row.content,
+			"role_at_send": row.author_role,
+		}
 		for row in _rows(ticket, limit)
 	]
 

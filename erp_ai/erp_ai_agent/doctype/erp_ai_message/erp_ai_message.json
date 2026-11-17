@@ -1,16 +1,17 @@
 {
  "actions": [],
+ "autoname": "hash",
  "creation": "2026-11-16 10:00:00.000000",
  "doctype": "DocType",
  "engine": "InnoDB",
- "autoname": "hash",
  "field_order": [
   "section_message",
   "ticket",
   "content",
   "section_source",
   "run_id",
-  "source_comment"
+  "source_comment",
+  "author_role"
  ],
  "fields": [
   {
@@ -22,12 +23,12 @@
    "description": "Hệ thống tự ghi, không sửa được. Phiếu hỗ trợ mà tin nhắn này thuộc về.",
    "fieldname": "ticket",
    "fieldtype": "Link",
-   "label": "Phiếu",
-   "read_only": 1,
-   "options": "HD Ticket",
-   "reqd": 1,
    "in_list_view": 1,
    "in_standard_filter": 1,
+   "label": "Phiếu",
+   "options": "HD Ticket",
+   "read_only": 1,
+   "reqd": 1,
    "search_index": 1
   },
   {
@@ -56,10 +57,18 @@
    "fieldtype": "Data",
    "label": "Comment nguồn",
    "read_only": 1
+  },
+  {
+   "description": "Hệ thống tự ghi lúc tin được gửi: chỉ thị nếu người gửi khi đó có vai trò ERP AI Instructor hoặc được người khác giao phiếu, không thì dữ liệu. Bot đọc tin cũ theo giá trị này, nên gỡ vai trò sau đó không làm đổi nhãn tin đã gửi; không sửa được.",
+   "fieldname": "author_role",
+   "fieldtype": "Select",
+   "label": "Vai trò người gửi lúc gửi",
+   "options": "\nchỉ thị\ndữ liệu",
+   "read_only": 1
   }
  ],
  "links": [],
- "modified": "2026-11-16 14:30:00.000000",
+ "modified": "2026-11-17 17:00:00.000000",
  "modified_by": "Administrator",
  "module": "ERP AI agent",
  "name": "ERP AI Message",

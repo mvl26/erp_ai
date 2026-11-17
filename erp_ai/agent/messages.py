@@ -26,9 +26,6 @@ def add_message(
 	"""
 	if not isinstance(content, str) or not content.strip():
 		raise ValueError("content must be a non-empty string")
-	# imported on call: authority reads the conversation through this module's callers
-	from erp_ai.agent import authority
-
 	doc = frappe.get_doc(
 		{
 			"doctype": MESSAGE_DOCTYPE,
@@ -36,8 +33,6 @@ def add_message(
 			"content": content,
 			"run_id": run_id,
 			"source_comment": source_comment,
-			# BUG-009: the role the author (the session user) holds as the message is sent
-			"author_role": authority.role_label(frappe.session.user, ticket),
 		}
 	)
 	doc.insert(ignore_permissions=trusted)

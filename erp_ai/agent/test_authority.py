@@ -287,6 +287,57 @@ class TestRoleAtSend(AuthorityTestBase):
 
 		self.assertEqual([(c["name"], c["role"]) for c in labelled], [(comment, "chỉ thị")])
 
+	# BUG-009 review
+	def test_a_merge_copy_lends_no_role_to_the_comment(self):
+		# Helpdesk's ticket merge inserts the copy in the merger's session: an instructor's copy of a plain user's
+		# comment must not label that comment "chỉ thị"
+		comment = self._comment(self.ticket_p, PLAIN, "2026-11-17 10:00:00")
+		self._say(self.ticket_p, INSTRUCTOR, "x", source_comment=comment)
+
+		labelled = authority.label_comments(self.ticket_p, authority.fetch_ticket_comments(self.ticket_p))
+
+		self.assertEqual([(c["name"], c["role"]) for c in labelled], [(comment, "dữ liệu")])
+
+	def test_a_role_gained_later_leaves_old_messages_data(self):
+		self._say(self.ticket_p, PLAIN, "trước")
+		frappe.get_doc("User", PLAIN).add_roles(ROLE_INSTRUCTOR)
+		self._say(self.ticket_p, PLAIN, "sau")
+
+		labelled = authority.label_comments(self.ticket_p, messages.history(self.ticket_p)[::-1])
+
+		self.assertEqual(
+			[(m["content"], m["role"]) for m in labelled], [("trước", "dữ liệu"), ("sau", "chỉ thị")]
+		)
+
+	def test_a_disabled_author_gives_no_order_any_more(self):
+		self._say(self.ticket_p, INSTRUCTOR, "Duyệt")
+		frappe.db.set_value("User", INSTRUCTOR, "enabled", 0, update_modified=False)
+
+		(labelled,) = authority.label_comments(self.ticket_p, messages.history(self.ticket_p))
+
+		self.assertEqual(labelled["role"], "dữ liệu")
+
+	def test_a_forged_role_at_insert_is_overwritten(self):
+		previous = frappe.session.user
+		frappe.set_user(PLAIN)
+		try:
+			doc = frappe.get_doc(
+				{
+					"doctype": MESSAGE_DOCTYPE,
+					"ticket": self.ticket_p,
+					"content": "x",
+					"author_role": "chỉ thị",
+				}
+			).insert(ignore_permissions=True)
+		finally:
+			frappe.set_user(previous)
+		self.assertEqual(self._stored(doc.name), "dữ liệu")
+
+	def test_the_bot_and_administrator_store_data(self):
+		for author in (AGENT_USER, "Administrator"):
+			with self.subTest(author=author):
+				self.assertEqual(self._stored(self._say(self.ticket_p, author, "x")), "dữ liệu")
+
 	def test_an_unknown_stored_value_is_judged_now(self):
 		comments = [{"author": PLAIN, "content": "a", "role_at_send": "chỉ thị nhé"}]
 		(labelled,) = authority.label_comments(self.ticket_p, comments)

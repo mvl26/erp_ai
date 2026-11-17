@@ -56,15 +56,18 @@ def fetch_ticket_comments(ticket_name: str, limit: int = MAX_COMMENTS) -> list[d
 		order_by="creation desc",
 		limit_page_length=limit,
 	)
-	# BUG-009: an @ai comment keeps the role its copy in the conversation stored when it was sent
-	stored = dict(
-		frappe.get_all(
+	# BUG-009: an @ai comment keeps the role its copy in the conversation stored when it was sent, but only a copy
+	# its own writer made: Helpdesk's ticket merge inserts copies in the merger's session (see _trigger_message_author)
+	owners = {row.name: row.owner for row in rows}
+	stored = {
+		copy.source_comment: copy.author_role
+		for copy in frappe.get_all(
 			MESSAGE_DOCTYPE,
-			filters={"ticket": ticket_name, "source_comment": ("in", [row.name for row in rows] or [""])},
-			fields=["source_comment", "author_role"],
-			as_list=True,
+			filters={"ticket": ticket_name, "source_comment": ("in", list(owners) or [""])},
+			fields=["source_comment", "owner", "author_role"],
 		)
-	)
+		if copy.owner == owners.get(copy.source_comment)
+	}
 	return [
 		{
 			"name": row.name,
@@ -149,15 +152,24 @@ def label_comments(ticket_name: str, comments: list[dict]) -> list[dict]:
 	"""Each comment with its `role`; any `role` it came with is replaced (never trusted).
 
 	BUG-009: a message read from the server with the role its author had when it was sent (`role_at_send`, written
-	at insert) keeps that role, so a role removed later does not relabel what was already said. Without one (older
-	messages, plain ticket comments) the role is the author's now, decided once per author. `role_at_send` is not
-	passed on."""
+	at insert by the ERP AI Message controller; only server-built rows carry it) keeps that role, so a role removed
+	later does not relabel what was already said, except that an author whose account is disabled now gives no order
+	any more. Without one (older messages, plain ticket comments) the role is the author's now, decided once per
+	author. `role_at_send` is not passed on."""
 	verdicts: dict[str, str] = {}
+	enabled: dict[str, bool] = {}
 	labelled = []
 	for comment in comments:
 		stored = comment.get("role_at_send")
 		if stored in (ROLE_LABEL_INSTRUCTION, ROLE_LABEL_DATA):
 			role = stored
+			author = comment["author"]
+			if role == ROLE_LABEL_INSTRUCTION:
+				if author not in enabled:
+					enabled[author] = author not in NEVER_AUTHORITY and bool(
+						frappe.db.get_value("User", author, "enabled")
+					)
+				role = role if enabled[author] else ROLE_LABEL_DATA
 		else:
 			author = comment["author"]
 			if author not in verdicts:

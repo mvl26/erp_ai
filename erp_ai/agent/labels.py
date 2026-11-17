@@ -88,6 +88,24 @@ def parse_tags(value) -> list[str]:
 	]
 
 
+def tag_choices(rules) -> tuple[tuple[str, str], ...]:
+	"""(tag, description) of the tag table in its order, each tag once without case, the description of its first
+	row (CHG-014): the list the classify step chooses the ticket's one tag from."""
+	seen, choices = set(), []
+	for rule in rules:
+		if rule.tag.casefold() not in seen:
+			seen.add(rule.tag.casefold())
+			choices.append((rule.tag, rule.description))
+	return tuple(choices)
+
+
+def chosen_tag(labels: tuple[str, ...], choices) -> tuple[str, ...]:
+	"""(the table's tag,) when the model's first label is a tag of `choices` without case, else () (CHG-014)."""
+	spelling = {tag.casefold(): tag for tag, _description in choices}
+	first = labels[0].casefold() if labels else ""
+	return (spelling[first],) if first in spelling else ()
+
+
 def agent_tags(ticket_name: str, is_active_agent) -> tuple[str, ...]:
 	"""The ticket's tags an active HD Agent other than the bot put on, in the order they were put on (CHG-011).
 

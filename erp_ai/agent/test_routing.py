@@ -1095,14 +1095,18 @@ class TestTagRules(FrappeTestCase):
 	def test_rows_read_in_order_blank_ones_left_out(self):
 		settings = frappe._dict(
 			tag_assignees=[
-				frappe._dict(tag="Accounts", assignee="hieu@x.com", category=None),
-				frappe._dict(tag="", assignee="x@x.com", category="A"),
-				frappe._dict(tag="tracecore", assignee="e2e@x.com", category="C"),
+				frappe._dict(tag="Accounts", assignee="hieu@x.com", category=None, description="Kế toán"),
+				frappe._dict(tag="", assignee="x@x.com", category="A", description="y"),
+				frappe._dict(tag="tracecore", assignee="e2e@x.com", category="C", description=None),
 			]
 		)
+		# CHG-014: each rule carries its row's description
 		self.assertEqual(
 			routing.tag_rules(settings),
-			(routing.TagRule("Accounts", "hieu@x.com", ""), routing.TagRule("tracecore", "e2e@x.com", "C")),
+			(
+				routing.TagRule("Accounts", "hieu@x.com", "", "Kế toán"),
+				routing.TagRule("tracecore", "e2e@x.com", "C", ""),
+			),
 		)
 
 	def test_setting_without_the_table_gives_no_rules(self):

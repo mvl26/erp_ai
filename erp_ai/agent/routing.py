@@ -61,12 +61,14 @@ class TagRule(NamedTuple):
 	tag: str
 	assignee: str
 	category: str
+	# CHG-014: what work the tag is for; the classify step chooses the ticket's one tag by it
+	description: str = ""
 
 
 def tag_rules(settings) -> tuple[TagRule, ...]:
 	"""The rows of `tag_assignees` in order, rows without a tag or a person left out; () when the field is absent."""
 	return tuple(
-		TagRule(row.tag, row.assignee, row.category or "")
+		TagRule(row.tag, row.assignee, row.category or "", row.get("description") or "")
 		for row in settings.get("tag_assignees") or ()
 		if row.tag and row.assignee
 	)

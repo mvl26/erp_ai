@@ -3,6 +3,7 @@ from frappe.tests.utils import FrappeTestCase
 from helpdesk.test_utils import make_ticket
 
 from erp_ai.agent import labels
+from erp_ai.agent.routing import TagRule
 from erp_ai.test_utils import keep_agent_settings, set_agent_settings
 
 PREFIX = "ERPAI-TEST-"
@@ -173,3 +174,35 @@ class TestClassifyInputs(LabelsCase):
 
 		self.assertNotIn(f"{PREFIX}Mật", [row[0] for row in inputs.label_catalog])
 		self.assertEqual([row for row in inputs.similar_labels if f"{PREFIX}Mật" in row[1]], [])
+
+
+# CHG-014 (spec 2026-11-17-one-tag-design.md, design 2 and 4): the table is the list of tags the bot gives.
+class TestTagChoices(FrappeTestCase):
+	def test_choices_in_table_order_first_description_per_tag(self):
+		rules = (
+			TagRule("chấm công", "a@x.com", "", "Bảng công, đi muộn"),
+			TagRule("tracecore", "b@x.com", "A", "Phần mềm Tracecore"),
+			TagRule("Chấm Công", "c@x.com", "D", "khác"),
+		)
+		self.assertEqual(
+			labels.tag_choices(rules),
+			(("chấm công", "Bảng công, đi muộn"), ("tracecore", "Phần mềm Tracecore")),
+		)
+
+	def test_no_rules_no_choices(self):
+		self.assertEqual(labels.tag_choices(()), ())
+
+
+class TestChosenTag(FrappeTestCase):
+	CHOICES = (("chấm công", "Bảng công"), ("tracecore", "Tracecore"))
+
+	def test_a_choice_is_kept_with_the_table_spelling(self):
+		self.assertEqual(labels.chosen_tag(("CHẤM CÔNG",), self.CHOICES), ("chấm công",))
+
+	def test_a_tag_outside_the_table_is_dropped(self):
+		self.assertEqual(labels.chosen_tag(("Stock",), self.CHOICES), ())
+		self.assertEqual(labels.chosen_tag((), self.CHOICES), ())
+		self.assertEqual(labels.chosen_tag(("tracecore",), ()), ())
+
+	def test_only_the_first_label_counts(self):
+		self.assertEqual(labels.chosen_tag(("Stock", "chấm công"), self.CHOICES), ())

@@ -96,6 +96,7 @@ REASON_NOTICE_SENT = "đã thông báo"
 _GUIDANCE_KEY = "erp_ai:huong-xu-ly"
 GUIDANCE_MARKER = f"<!-- {_GUIDANCE_KEY} -->"
 GUIDANCE_HEADER = "Hướng xử lý"
+ANALYSIS_HEADER = "Nhận định"
 SECTION_DONE, SECTION_PENDING = "Đã làm", "Chờ duyệt"
 # Collector key of "work a person must do by hand, with the reason": shown inside the plan section, no heading of
 # its own (design-w1-fixes-20 Điểm 1.1, spec-addendum-5 AC-65 (a)).
@@ -111,6 +112,7 @@ RUN_INFO_SAVEPOINT = "erp_ai_run_info"
 # Per-job state, like the asked runs: run_id -> {"analysis": str | None, <section>: [raw lines]}.
 _GUIDANCE_FLAG = "erp_ai_guidance"
 _ANALYSIS_KEY = "analysis"
+_HINT_KEY = "hint"
 # Runs on a ticket that already has its guidance comment.
 _WORK_ONLY_FLAG = "erp_ai_work_only_runs"
 # The body when the model wrote no analysis (design-w1-fixes-20 Điểm 1.3): the plan line is last, so the work left
@@ -308,6 +310,8 @@ def set_resolution_hint(args: dict, ctx: ToolContext) -> dict:
 	before = doc.get(HINT_FIELD)
 	doc.set(HINT_FIELD, args["text"])
 	doc.save()
+	if collecting(ctx.run_id):
+		hold_hint(ctx.run_id, args["text"])
 	# Frappe sanitizes Text Editor values on save: report what was stored, not the raw input.
 	return {"ok": True, "before": before, "after": doc.get(HINT_FIELD)}
 
@@ -524,6 +528,7 @@ def open_collector(run_id: str) -> None:
 	"""Start the run's guidance collector: no analysis yet, every section empty."""
 	frappe.flags.setdefault(_GUIDANCE_FLAG, {})[run_id] = {
 		_ANALYSIS_KEY: None,
+		_HINT_KEY: None,
 		**{section: [] for section in GUIDANCE_SECTIONS},
 	}
 
@@ -548,6 +553,27 @@ def hold_analysis(run_id: str, content: str) -> None:
 	"""Keep the model's analysis for the guidance comment; a later hold replaces an earlier one; no collector → nothing."""
 	if collecting(run_id):
 		frappe.flags.get(_GUIDANCE_FLAG)[run_id][_ANALYSIS_KEY] = content
+
+
+def hold_hint(run_id: str, text: str) -> None:
+	"""Keep the model's resolution hint, the guidance's analysis when no de_xuat comment was written (BUG-007); a
+	later hold replaces an earlier one; no collector → nothing."""
+	if collecting(run_id):
+		frappe.flags.get(_GUIDANCE_FLAG)[run_id][_HINT_KEY] = text
+
+
+def held_hint(run_id: str) -> str | None:
+	return frappe.flags.get(_GUIDANCE_FLAG, {}).get(run_id, {}).get(_HINT_KEY)
+
+
+def hint_analysis(text: str) -> str:
+	"""The hint as an analysis: as written when its first non-empty line opens with the `Nhận định:` heading, else
+	under that heading."""
+	text = text.strip()
+	first = next((line for line in text.splitlines() if line.strip()), "")
+	if _heading_line(ANALYSIS_HEADER).match(first):
+		return text
+	return f"**{ANALYSIS_HEADER}:** {text}"
 
 
 def collected(run_id: str) -> tuple[str | None, dict[str, list[str]]]:
@@ -638,6 +664,8 @@ def post_guidance(ticket_name: str, run_id: str) -> dict:
 	if count_guidance(ticket_name, lock=True):
 		return _fail(REASON_GUIDANCE_EXISTS)
 	analysis, sections = collected(run_id)
+	hint = held_hint(run_id)
+	analysis = analysis or (hint_analysis(hint) if hint else None)
 	if not analysis and not any(sections.values()):
 		return _fail(REASON_NO_CONTENT)
 	body = analysis or _hint_guidance(ticket_name) or GUIDANCE_FALLBACK

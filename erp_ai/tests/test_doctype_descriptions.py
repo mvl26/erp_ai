@@ -23,7 +23,9 @@ VIETNAMESE_ACCENTS = re.compile(
 DOCTYPE_CONFIG = {
 	"ERP AI Setting": {
 		"folder": "erp_ai_setting",
-		"field_count": 77,
+		# CHG-015: default_assignee (+1); CHG-011: tag_assignees (+1); CHG-010: console_enabled (+1); FEAT-008: lessons_enabled,
+		# lessons_max_per_request, lessons_max_chars, lesson_teach_marker (+4); base 77
+		"field_count": 84,
 		"phrases": {
 			"enabled": ("Tắt", "4 đơn giá", "từ khóa kích hoạt"),
 			# FEAT-007 spec-addendum-3.md:88 (T64): from L2 up, ERP writes go through a proposal or a `Tự làm` row.
@@ -76,6 +78,13 @@ DOCTYPE_CONFIG = {
 				"chuyển tiếp",
 				"liên kết cũ",
 			),
+			"console_enabled": (
+				"bench console",
+				"ERP AI Instructor",
+				"khung Trao đổi với bot",
+				"một giao dịch",
+				"không hoàn tác được",
+			),
 			"site_environment": ("production", "site test", "không bị chặn"),
 			**{
 				f"level_cap_{category}": ("Mức quyền", "năm quyền mở rộng", "chưa biết")
@@ -126,6 +135,18 @@ DOCTYPE_CONFIG = {
 				"HD Agent",
 			),
 			"routing_rules": ("đầu mục", "SLA", "phút", "bị chặn khi lưu"),
+			# CHG-011: the table of tag → person, read top-down before the routing rules (user's option b); say
+			# whose tags count and that a blank row also serves D/E.
+			"tag_assignees": (
+				"Tự gán người",
+				"đúng một tag",
+				"HD Agent gắn",
+				"từ trên xuống",
+				"D/E",
+				"Quy tắc định tuyến",
+			),
+			# CHG-015: the person a ticket no rule gives goes to.
+			"default_assignee": ("bảng Gán người theo tag", "Quy tắc định tuyến", "HD Agent", "Task C/D"),
 			"prompt_digest": ("lập luận", "phân loại"),
 			**{
 				fieldname: ("fieldname", "Để trống", "không lưu được")
@@ -199,8 +220,20 @@ DOCTYPE_CONFIG = {
 				)
 			},
 			"prompt_revisions": ("Hệ thống tự ghi", "Không sửa được"),
+			# FEAT-008: the lesson store switch, its two caps and the teaching marker.
+			"lessons_enabled": ("bài học", "Tắt", "bài đã lưu vẫn giữ"),
+			"lessons_max_per_request": ("từ 1 đến 20", "không lưu được", "Mặc định 5"),
+			"lessons_max_chars": ("từ 1300 đến 20000", "không lưu được", "Mặc định 2000"),
+			# The rule of a person with authority is active at once; a message of anyone else is ignored (no lesson).
+			"lesson_teach_marker": (
+				"không phân biệt hoa thường",
+				"Để trống",
+				"thẩm quyền",
+				"bài học Đang dùng",
+				"bị bỏ qua",
+			),
 		},
-		"section_count": 14,
+		"section_count": 15,
 		"read_only_fields": (
 			"spent_this_month_usd",
 			"agent_enabled_at",
@@ -224,6 +257,7 @@ DOCTYPE_CONFIG = {
 			("section_operations", "Báo cáo và vận hành", "coo_report_recipients"),
 			("section_prompts", "Ghi đè prompt", "prompt_override_classify"),
 			("section_alerts", "Cảnh báo và khóa API", "alert_recipients"),
+			("section_lessons", "Bài học của bot", "lessons_enabled"),
 		),
 	},
 	"ERP AI Credential": {
@@ -285,6 +319,24 @@ DOCTYPE_CONFIG = {
 		),
 	},
 	# FEAT-007 design.md:225: one account template (child of ERP AI Setting, AC-30 (1)).
+	# CHG-011: one row of the table of tag → person (child of ERP AI Setting).
+	"ERP AI Tag Assignee": {
+		"folder": "erp_ai_tag_assignee",
+		# CHG-014: + description (the tag table is the list of tags the bot gives)
+		"field_count": 4,
+		"phrases": {
+			"tag": ("bot tự tạo", "không phân biệt hoa thường", "không dấu phẩy"),
+			"description": ("đúng một tag", "dòng đầu tiên", "không nêu tên người"),
+			"assignee": ("HD Agent", "tài khoản agent", "bỏ qua"),
+			"category": ("Để trống", "mọi đầu mục", "dòng nằm trên"),
+		},
+		"section_count": 2,
+		"read_only_fields": (),
+		"sections": (
+			("section_assignee", "Tag và người phụ trách", "tag"),
+			("section_scope", "Phạm vi áp dụng", "category"),
+		),
+	},
 	"ERP AI User Template": {
 		"folder": "erp_ai_user_template",
 		"field_count": 3,
@@ -335,9 +387,59 @@ DOCTYPE_CONFIG = {
 			("section_source", "Nguồn gốc", "run_id"),
 		),
 	},
+	# FEAT-008: one lesson of the bot; every field is system-written, no role may create or edit it.
+	"ERP AI Lesson": {
+		"folder": "erp_ai_lesson",
+		"field_count": 10,
+		"phrases": {
+			"lesson_status": ("Chờ duyệt", "Đang dùng", "Đã tắt", "Bị từ chối"),
+			"situation": ("tình huống", "300 ký tự", "che khóa"),
+			"lesson_text": ("1000 ký tự", "che khóa", "bot cần nhớ"),
+			"lesson_source": ("người sửa", "phiếu đã giải quyết", "người dạy", "rà soát"),
+			"ticket": ("phiếu", "Xóa phiếu", "không bị chặn"),
+			"change_proposal": ("đề xuất", "Để trống"),
+			"author": ("tài khoản", "người"),
+			"reviewed_by": ("duyệt", "từ chối", "Để trống"),
+			"reviewed_at": ("thời điểm", "duyệt", "Để trống"),
+			"history": ("bước", "người làm", "thời điểm"),
+		},
+		"section_count": 2,
+		"read_only_fields": (
+			"lesson_status",
+			"situation",
+			"lesson_text",
+			"lesson_source",
+			"ticket",
+			"change_proposal",
+			"author",
+			"reviewed_by",
+			"reviewed_at",
+			"history",
+		),
+		"sections": (
+			("section_lesson", "Bài học", "lesson_status"),
+			("section_origin", "Nguồn và người quyết", "lesson_source"),
+		),
+	},
+	# FEAT-008: one step in the history of a lesson (child of ERP AI Lesson), system-written.
+	"ERP AI Lesson Event": {
+		"folder": "erp_ai_lesson_event",
+		"field_count": 3,
+		"phrases": {
+			"step": ("Tạo", "Cập nhật", "Duyệt", "Từ chối", "Tắt", "Bật"),
+			"actor": ("tài khoản", "bot"),
+			"happened_at": ("thời điểm", "bước"),
+		},
+		"section_count": 2,
+		"read_only_fields": ("step", "actor", "happened_at"),
+		"sections": (
+			("section_step", "Bước", "step"),
+			("section_actor", "Người và lúc", "actor"),
+		),
+	},
 	"ERP AI Log": {
 		"folder": "erp_ai_log",
-		"field_count": 43,
+		"field_count": 44,
 		"phrases": {
 			"ticket": ("HD Ticket", "mã phiếu", "lọc"),
 			"run_id": ("cùng một lần chạy", "gom"),
@@ -419,6 +521,7 @@ DOCTYPE_CONFIG = {
 			"value_before": ("JSON", "trước khi"),
 			"value_after": ("JSON", "sau khi"),
 			"skipped_fields": ("bỏ qua", "phân loại"),
+			"lessons_used": ("JSON", "tên", "bài học", "Hệ thống tự ghi", "không sửa được"),
 			"predicted_category": ("đầu mục", "A đến F"),
 			"predicted_confidence": ("Cao", "Trung bình", "Thấp", "ai_confidence"),
 			# FEAT-007 design-w0-fixes-2.md section 1: -1 = unknown (wins over design.md:234).
@@ -474,6 +577,7 @@ DOCTYPE_CONFIG = {
 			"value_before",
 			"value_after",
 			"skipped_fields",
+			"lessons_used",
 			"predicted_category",
 			"predicted_confidence",
 			"predicted_confidence_pct",
@@ -586,6 +690,20 @@ CODE_CHANGE_FIELDS = {
 	},
 }
 
+# CHG-010 Task 1: the console switch. Read from the JSON on disk (the site is not migrated for it).
+CONSOLE_FIELD_SPEC = {
+	"fieldtype": "Check",
+	"label": "Cho phép chạy bench console (qua duyệt)",
+	"default": "0",
+	# CHG-010 final review F-9: the text says the script runs as Administrator; the first clause is shorter to
+	# stay within the 400-character cap.
+	"description": "Bật thì bot được soạn script Python chạy như bench console khi không có API hay công cụ "
+	"nào làm được. Mỗi script là một đề xuất Chờ duyệt, chỉ duyệt bằng nút Duyệt trong khung "
+	"Trao đổi với bot (vai trò ERP AI Instructor). Chạy một lần trong một giao dịch, lỗi thì không lưu gì, "
+	"không hoàn tác được. Độc lập với ô sửa code. Tắt thì script đã duyệt cũng không chạy. "
+	"Script chạy với quyền Administrator.",
+}
+
 
 FEAT007_LOG_COLUMNS = {
 	"created_labels": "Small Text",
@@ -605,6 +723,9 @@ FORBIDDEN_PHRASES = {
 		# FEAT-007 spec-addendum-4.md AC-29 (T64): an empty catalog no longer means "no ERP writes".
 		"catalog_rules": ("bot không ghi ERP ngoài phiếu",),
 		"code_change_enabled": ("tạo và sửa bản ghi trực tiếp",),
+		# FEAT-008: a taught rule never waits for approval; resolved tickets are a batch-2 source.
+		"lesson_teach_marker": ("chờ duyệt",),
+		"lessons_enabled": ("phiếu đã giải quyết",),
 	},
 	"ERP AI Log": {
 		"instructor": ("người ra lệnh", "khi phiếu mới tạo"),
@@ -761,6 +882,18 @@ class TestDoctypeDescriptions(FrappeTestCase):
 						set(section), {"fieldname", "fieldtype", "label"}, f"{doctype}.{section['fieldname']}"
 					)
 
+	def test_console_switch_field_on_disk(self):
+		# CHG-010 Task 1: read from the JSON file; the site's meta is not migrated for the new field.
+		doctype_json = load_doctype(DOCTYPE_CONFIG["ERP AI Setting"])
+		by_name = {f["fieldname"]: f for f in doctype_json["fields"]}
+		field = by_name["console_enabled"]
+		self.assertEqual({key: field.get(key) for key in CONSOLE_FIELD_SPEC}, CONSOLE_FIELD_SPEC)
+		self.assertFalse(field.get("read_only"))
+		order = doctype_json["field_order"]
+		self.assertEqual(order.index("console_enabled"), order.index("code_change_enabled") + 1)
+		self.assertLess(order.index("section_permissions"), order.index("console_enabled"))
+		self.assertLess(order.index("console_enabled"), order.index("section_autonomy"))
+
 	def test_code_change_block_follows_feat006_fields(self):
 		doctype_json = load_doctype(DOCTYPE_CONFIG["ERP AI Setting"])
 		order = doctype_json["field_order"]
@@ -818,13 +951,14 @@ class TestDoctypeDescriptions(FrappeTestCase):
 		)
 		start = order.index("section_permissions")
 		self.assertEqual(
-			order[start : start + 7],
+			order[start : start + 8],  # CHG-010: console_enabled follows code_change_enabled
 			[
 				"section_permissions",
 				"unrestricted_enabled",
 				"record_tools_enabled",
 				"act_now_enabled",
 				"code_change_enabled",
+				"console_enabled",
 				"one_click_approval_enabled",
 				"site_environment",
 			],

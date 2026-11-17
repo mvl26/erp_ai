@@ -13,6 +13,7 @@ from erp_ai.constants import (
 	CHANGE_OP_CREATE,
 	CHANGE_OP_DELETE,
 	CHANGE_OP_EDIT,
+	CONSOLE_COMMAND,
 )
 
 
@@ -85,3 +86,16 @@ def commands_of(doc) -> list[list[str]]:
 	if doc.get("change_kind") != CHANGE_KIND_COMMAND or not doc.get("command_args"):
 		return []
 	return [json.loads(doc.get("command_args"))]
+
+
+def is_console(doc) -> bool:
+	"""True for a console proposal (CHG-010): a bench command whose only command is `--site <site> console`."""
+	if doc.get("change_kind") != CHANGE_KIND_COMMAND or operations_of(doc):
+		return False
+	commands = commands_of(doc)
+	return (
+		len(commands) == 1
+		and len(commands[0]) == 3
+		and commands[0][0] == "--site"
+		and commands[0][2] == CONSOLE_COMMAND
+	)

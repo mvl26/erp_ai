@@ -5,12 +5,15 @@ from dataclasses import dataclass
 
 import frappe
 from frappe import _
-from frappe.utils import add_months, get_datetime, now_datetime
+from frappe.utils import add_months, cint, get_datetime, now_datetime
 
+from erp_ai.agent.authority import NEVER_AUTHORITY
+from erp_ai.agent.text_lines import filled_lines
 from erp_ai.constants import (
 	CATEGORIES,
 	LEVELS,
 	LOG_DOCTYPE,
+	ROLE_INSTRUCTOR,
 	SETTING_DOCTYPE,
 	TICKET_CONTENT_DOCTYPES,
 	TRIGGER_COMMENT_MENTION,
@@ -340,14 +343,26 @@ def current_change_settings() -> ChangeSettings:
 RECORD_TOOLS_FIELD = "record_tools_enabled"
 ACT_NOW_FIELD = "act_now_enabled"
 ONE_CLICK_APPROVAL_FIELD = "one_click_approval_enabled"
-# The five permission switches in the spec's order (1)..(5).
+CONSOLE_FIELD = "console_enabled"
+# The permission switches in the order of the settings section (section_permissions).
+# BUG-008: console is one of them: its change is logged and it is listed in the daily privilege alarm.
 PERMISSION_SWITCH_FIELDS = (
 	UNRESTRICTED_FIELD,
 	RECORD_TOOLS_FIELD,
 	ACT_NOW_FIELD,
 	CODE_CHANGE_ENABLED_FIELD,
+	CONSOLE_FIELD,
 	ONE_CLICK_APPROVAL_FIELD,
 )
+# Field -> the PermissionSwitches attribute that reads it; consumers pair by this name, never by position.
+SWITCH_FLAGS = {
+	UNRESTRICTED_FIELD: "unrestricted",
+	RECORD_TOOLS_FIELD: "record_tools",
+	ACT_NOW_FIELD: "act_now",
+	CODE_CHANGE_ENABLED_FIELD: "code_change",
+	CONSOLE_FIELD: "console",
+	ONE_CLICK_APPROVAL_FIELD: "one_click_approval",
+}
 
 
 @dataclass(frozen=True)
@@ -357,17 +372,30 @@ class PermissionSwitches:
 	act_now: bool = False  # (3)
 	code_change: bool = False  # (4)
 	one_click_approval: bool = False  # (5)
+	console: bool = False  # CHG-010: bench console proposals, independent of code_change
 
 
 def permission_switches(settings) -> PermissionSwitches:
-	"""The only reader of the five permission switches; a missing field (before migrate) means off."""
+	"""The only reader of the permission switches; a missing field (before migrate) means off."""
 	return PermissionSwitches(
 		unrestricted=unrestricted_enabled(settings),
 		record_tools=bool(getattr(settings, RECORD_TOOLS_FIELD, 0)),
 		act_now=bool(getattr(settings, ACT_NOW_FIELD, 0)),
 		code_change=change_settings(settings).enabled,
 		one_click_approval=bool(getattr(settings, ONE_CLICK_APPROVAL_FIELD, 0)),
+		console=bool(cint(getattr(settings, CONSOLE_FIELD, 0))),  # a Single without meta gives "0"
 	)
+
+
+def console_enabled_now() -> bool:
+	"""Fresh read of the console switch from the DB (no cache), for the apply job.
+
+	Reads `tabSingles` directly: the DocType meta of a site not yet migrated does not know the field, and
+	`get_single_value` checks the meta. A missing row reads off."""
+	value = frappe.db.sql(
+		"select value from `tabSingles` where doctype=%s and field=%s", (SETTING_DOCTYPE, CONSOLE_FIELD)
+	)
+	return permission_switches(frappe._dict({CONSOLE_FIELD: value[0][0] if value else 0})).console
 
 
 SITE_ENVIRONMENT_FIELD = "site_environment"
@@ -625,3 +653,96 @@ def owning_ticket(doctype: str, name: str) -> str | None:
 def is_ticket_record_excluded(doctype: str, name: str) -> bool:
 	"""True when any ticket the record points at fails can_send_ticket."""
 	return any(not can_send_ticket(ticket) for ticket in _owning_tickets(doctype, name))
+
+
+# FEAT-008: the lesson store. The only readers of the lesson switches, caps and who may decide on a lesson.
+LESSON_SCAN_MAX = 500
+LESSONS_MAX_RANGE = (1, 20)
+# R13: the smallest cap still holds one lesson of the largest size (situation 300 + text 1000 characters).
+LESSONS_CHARS_RANGE = (1300, 20000)
+DEFAULT_LESSONS_MAX = 5
+DEFAULT_LESSONS_CHARS = 2000
+LESSONS_ENABLED_FIELD = "lessons_enabled"
+LESSONS_MAX_FIELD = "lessons_max_per_request"
+LESSONS_CHARS_FIELD = "lessons_max_chars"
+LESSON_TEACH_MARKER_FIELD = "lesson_teach_marker"
+APPROVER_ROLE = "System Manager"
+
+
+@dataclass(frozen=True)
+class LessonSettings:
+	enabled: bool
+	max_lessons: int
+	max_chars: int
+	scan_max: int
+
+
+def _in_range(value, bounds: tuple[int, int], default: int) -> int:
+	"""`value` as an int inside `bounds`; missing, garbage or out of range reads `default`."""
+	if isinstance(value, bool):
+		return default
+	try:
+		number = int(value)
+	except (TypeError, ValueError):
+		return default
+	return number if bounds[0] <= number <= bounds[1] else default
+
+
+def lesson_settings(settings) -> LessonSettings:
+	"""The lesson switch and caps of a Setting doc; a cap that is missing or out of range reads its default."""
+	return LessonSettings(
+		enabled=bool(getattr(settings, LESSONS_ENABLED_FIELD, 0)),
+		max_lessons=_in_range(
+			getattr(settings, LESSONS_MAX_FIELD, None), LESSONS_MAX_RANGE, DEFAULT_LESSONS_MAX
+		),
+		max_chars=_in_range(
+			getattr(settings, LESSONS_CHARS_FIELD, None), LESSONS_CHARS_RANGE, DEFAULT_LESSONS_CHARS
+		),
+		scan_max=LESSON_SCAN_MAX,
+	)
+
+
+def lessons_enabled() -> bool:
+	"""One value read of the lesson switch, for the sources that write lessons; missing means off."""
+	return bool(frappe.db.get_single_value(SETTING_DOCTYPE, LESSONS_ENABLED_FIELD))
+
+
+def lesson_teach_marker() -> str:
+	"""The stripped teaching marker; blank means teaching by message is off."""
+	return (frappe.db.get_single_value(SETTING_DOCTYPE, LESSON_TEACH_MARKER_FIELD) or "").strip()
+
+
+def is_lesson_approver(user: str | None) -> bool:
+	"""A-2: a listed monthly reviewer or a System Manager may approve a lesson; never the system accounts."""
+	if not user or user in NEVER_AUTHORITY:
+		return False
+	if user in filled_lines(frappe.db.get_single_value(SETTING_DOCTYPE, "monthly_reviewers")):
+		return True
+	return APPROVER_ROLE in frappe.get_roles(user)
+
+
+def can_manage_lessons(user: str | None) -> bool:
+	"""D-3: only an ERP AI Instructor may turn a lesson off or on; never the system accounts."""
+	if not user or user in NEVER_AUTHORITY:
+		return False
+	return ROLE_INSTRUCTOR in frappe.get_roles(user)
+
+
+def lesson_limit_errors(settings) -> list[str]:
+	"""One Vietnamese message per lesson cap that is set but does not read as an int inside its range.
+
+	A cap that is not set (None or "") gives no message, and the reader uses the default. A cap gives one when
+	`int()` of it fails (text), when it is a bool, or when its int is out of range, 0 included: 0 is what Frappe
+	stores for an Int field emptied on the form, so the next save of the form is refused until the cap is filled.
+	"""
+	errors = []
+	for fieldname, label, bounds in (
+		(LESSONS_MAX_FIELD, "Số bài tối đa mỗi lần gọi", LESSONS_MAX_RANGE),
+		(LESSONS_CHARS_FIELD, "Số ký tự bài học tối đa mỗi lần gọi", LESSONS_CHARS_RANGE),
+	):
+		value = getattr(settings, fieldname, None)
+		if value in (None, ""):
+			continue
+		if _in_range(value, bounds, bounds[0] - 1) == bounds[0] - 1:
+			errors.append(f"{label} phải từ {bounds[0]} đến {bounds[1]}")
+	return errors

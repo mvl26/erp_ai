@@ -9,7 +9,7 @@ from frappe.desk.form.document_follow import follow_document
 from frappe.utils import escape_html, get_fullname, getdate, now_datetime, strip_html
 
 from erp_ai import gateway
-from erp_ai.agent import authority, lifecycle, policy, queue, site_facts
+from erp_ai.agent import authority, lesson_read, lifecycle, policy, queue, site_facts
 from erp_ai.agent import labels as ticket_labels
 from erp_ai.agent.answer_delay import AnswerDelay
 from erp_ai.agent.authority import TITLE_WRONG_USER as TITLE_WRONG_USER  # re-export, U1.md:264
@@ -25,7 +25,7 @@ from erp_ai.agent.prompts import (
 	build_routing_table,
 )
 from erp_ai.agent.redact import redact_secrets
-from erp_ai.agent.routing import decide_route, departments, load_routing_config, sla_lag
+from erp_ai.agent.routing import decide_route, departments, load_routing_config, sla_lag, tag_rules
 from erp_ai.agent.run_log import ENTRY_TYPE_CHANGE, action_entry, record_event, write_entry
 from erp_ai.agent.run_status import CLASSIFY_STEP, RunStatus
 from erp_ai.agent.tools.kb_draft import ARTICLE_DOCTYPE, SOURCE_TICKET_FIELD
@@ -162,6 +162,10 @@ REASON_TASK_EXISTS = "phiếu đã có Task liên kết"
 # The route comment's own sentences (U4b.md:210-214); ROUTE_DONE and FIELD_LABELS come from write_ticket (U4b-8).
 ROUTE_NO_CHANGE = "Bot đã phân loại phiếu, các trường đã đúng nên không đổi."
 ROUTE_ASSIGNED = "Đã gán cho {person}."
+# CHG-011: the person came from the tag table of ERP AI Setting.
+ROUTE_ASSIGNED_BY_TAG = "Đã gán cho {person} (theo tag {tag})."
+# CHG-015: no rule gave a person; the Setting's default took the ticket.
+ROUTE_ASSIGNED_BY_DEFAULT = "Đã gán cho {person} (người nhận mặc định)."
 ROUTE_TASK = "Đã tạo Task {task}."
 ROUTE_WATCHER = "Đã thêm {person} làm người theo dõi."
 # ADR-049: the labels the route gave the ticket (Helpdesk Tags)
@@ -232,6 +236,8 @@ GUIDANCE_TOOL = "post_guidance"
 SPLIT_HELD_FLAG = "erp_ai_split_held"
 # A requester-reply event whose key is already on a log row: one logger line, no row (ADR-033 QĐ 6, U6b-fixes Sửa 1).
 ALREADY_HANDLED_LOG = "erp_ai skip ticket=%s run_id=%s reason=already_handled"
+# FEAT-008: reading the lessons of a step failed; the step goes on without lessons (ADR-046).
+TITLE_LESSON_READ_FAILED = "erp_ai: đọc bài học lỗi"
 
 
 def run_for_ticket(
@@ -381,6 +387,7 @@ def _run(ticket_name, trigger, message_name=None, communication_name=None, run_i
 				record_tools=switches.record_tools,
 				act_now=switches.act_now,
 				one_click_approval=switches.one_click_approval,
+				console=switches.console,
 				over_budget=over_budget,
 				main_path_level=policy.main_path_level(settings, level, category),
 				below_threshold=not kb_run and _below_threshold(pct, threshold, instructor, switches.act_now),
@@ -788,7 +795,8 @@ def _classify(
 	The request carries the configured ticket fields (AC-24) and, when the step runs again on a later run (ADR-037
 	QĐ 2), `later_messages`: the people's messages since the latest classification, as data. The route leaves out
 	the fields the person typed at creation, while the entry keeps the model's prediction and names the typed set
-	(AC-19, AC-21, A-U4b-2).
+	(AC-19, AC-21, A-U4b-2). The matching active lessons go in the request as data (FEAT-008, ADR-046) and every row
+	of the step names them in `lessons_used`.
 
 	Returns `(proceed, classification, context)`: `proceed` is False when the run must end here (gateway error, or
 	a classification that puts the ticket in an excluded team);
@@ -809,9 +817,19 @@ def _classify(
 		as_dict=True,
 	)
 	subject = ticket.subject
+	# CHG-011, CHG-014: the rows of the tag table; their tags and descriptions are the tags the model may give
+	rules = tag_rules(settings)
+	choices = ticket_labels.tag_choices(rules)
 	field_values = _ticket_field_values(ticket_name, field_map)
-	label_inputs = _label_inputs(ticket_name, run_id, subject, ticket.description)
-	base = {"ticket": ticket_name, "run_id": run_id, "entry_type": "classify", "trigger": trigger, "turn": 0}
+	lessons = _lessons(settings, subject, ticket.description)
+	base = {
+		"ticket": ticket_name,
+		"run_id": run_id,
+		"entry_type": "classify",
+		"trigger": trigger,
+		"turn": 0,
+		**_lessons_used(lessons),
+	}
 	status.working(CLASSIFY_STEP)
 	try:
 		result = _call_model(
@@ -822,7 +840,8 @@ def _classify(
 				departments(routing),
 				ticket_fields=field_values,
 				later_messages=later_messages,
-				**label_inputs._asdict(),
+				lessons=lessons,
+				tag_choices=choices,
 			),
 			max_tokens=CLASSIFY_MAX_TOKENS,
 			deadline=deadline,
@@ -853,8 +872,10 @@ def _classify(
 		write_entry(**base, **call_fields, error=error, stop_reason="unparseable")
 		_log_classify(ticket_name, run_id, False, ticket.creation)
 		return True, None, context
+	# CHG-014: one tag of the table, spelled as the table; none when an HD Agent already tagged the ticket
+	agent = ticket_labels.agent_tags(ticket_name, site_facts.is_active_agent)
 	classification = dataclasses.replace(
-		classification, labels=ticket_labels.canonical(classification.labels, label_inputs.modules)
+		classification, labels=() if agent else ticket_labels.chosen_tag(classification.labels, choices)
 	)
 
 	# U2 (AC-9 b, U2.md:164-172): the team the department maps to is learnt from the predicate decide_route asks
@@ -878,6 +899,10 @@ def _classify(
 		due_field_configured="due_date" in field_map,
 		d_watcher=settings.get("d_ticket_watcher") or "",
 		now=now_datetime(),
+		# CHG-011, CHG-014: the tags an HD Agent put on the ticket, else the one tag the bot chose
+		tags=(*agent, *classification.labels),
+		tag_rules=rules,
+		default_assignee=settings.get("default_assignee") or None,
 	)
 	# a department named like an excluded team counts too
 	excluded = bool(probe_hits) or policy.is_excluded_team(classification.department)
@@ -971,16 +996,32 @@ def _classify(
 	return True, summary, context
 
 
-def _label_inputs(ticket_name, run_id, subject, description) -> ticket_labels.LabelInputs:
-	"""The label inputs of the classify request (ADR-049); a failed read never stops the classification: no label
-	inputs then, one logger line with the exception class."""
+def _lessons(settings, subject: str, description: str) -> list[dict]:
+	"""The active lessons that match the ticket, within the caps of the Setting (FEAT-008, ADR-046 QĐ 1); [] when
+	learning is off. Never stops the run: a failed read leaves one Error Log, secrets masked, and gives []."""
 	try:
-		return ticket_labels.classify_inputs(ticket_name, subject, description)
-	except Exception as exc:
-		frappe.logger(LOGGER_NAME).warning(
-			"erp_ai labels ticket=%s run_id=%s error=%s", ticket_name, run_id, type(exc).__name__
+		caps = policy.lesson_settings(settings)
+		if not caps.enabled:
+			return []
+		return lesson_read.relevant_lessons(
+			subject,
+			description,
+			max_lessons=caps.max_lessons,
+			max_chars=caps.max_chars,
+			scan_max=caps.scan_max,
 		)
-		return ticket_labels.LabelInputs()
+	except Exception:
+		frappe.log_error(
+			title=TITLE_LESSON_READ_FAILED,
+			message=redact_secrets(frappe.get_traceback()) or TITLE_LESSON_READ_FAILED,
+		)
+		return []
+
+
+def _lessons_used(lessons: list[dict]) -> dict:
+	"""The usage trace of a step's rows (AC-17): `lessons_used`, the names of the lessons the step sent; none sent
+	gives no key, so the rows stay as before."""
+	return {"lessons_used": [lesson["name"] for lesson in lessons]} if lessons else {}
 
 
 def _complexity(score, reason) -> dict:
@@ -1053,7 +1094,9 @@ def _route(
 				task = _task_unit(assigned, subject, classification, context, actions, lines, errors)
 			if decision.watcher:
 				watcher = _watch_unit(decision.watcher, context, actions, errors)
-			done = _route_lines(result, assigned, task, watcher, labelled)
+			done = _route_lines(
+				result, assigned, task, watcher, labelled, decision.assignee_tag, decision.assignee_default
+			)
 			others = [*lines, *([split_text] if split_text else [])]
 			lines = [*done, *others]
 			if collect_run_id and collecting(collect_run_id):
@@ -1152,7 +1195,13 @@ def _assign_unit(decision, context, actions, lines, errors):
 		lines.append(ASSIGN_REQUEST.format(reason=REASON_NO_VALID_ASSIGNEE))
 		return None
 	if _run_unit("assign_owner", lambda: assign_owner(user, context), "HD Ticket", user, actions, errors):
-		actions.append(_route_action("assign_owner", "HD Ticket", user, True, instructor=context.instructor))
+		# CHG-011: a person from the tag table names the tag as the rule
+		rule = f"tag:{decision.assignee_tag}" if decision.assignee_tag else None
+		# CHG-015: the default person names itself as the rule
+		rule = "default" if decision.assignee_default else rule
+		actions.append(
+			_route_action("assign_owner", "HD Ticket", user, True, rule=rule, instructor=context.instructor)
+		)
 		return user
 	lines.append(ASSIGN_REQUEST.format(reason=REASON_ASSIGN_FAILED))
 	return None
@@ -1236,7 +1285,9 @@ def _collect_route_lines(run_id, done, others) -> bool:
 	return bool(done or others)
 
 
-def _route_lines(result, assigned, task, watcher, labelled=()) -> list[str]:
+def _route_lines(
+	result, assigned, task, watcher, labelled=(), assigned_tag=None, assigned_default=False
+) -> list[str]:
 	"""The route comment's own sentences (U4b.md:247): fields written, labels given (ADR-049), person given, Task
 	created, watcher added.
 
@@ -1250,7 +1301,11 @@ def _route_lines(result, assigned, task, watcher, labelled=()) -> list[str]:
 	lines = [ROUTE_DONE.format(fields=fields) if fields else ROUTE_NO_CHANGE]
 	if labelled:
 		lines.append(ROUTE_LABELS.format(labels=", ".join(labelled)))
-	if assigned:
+	if assigned and assigned_tag:
+		lines.append(ROUTE_ASSIGNED_BY_TAG.format(person=get_fullname(assigned), tag=assigned_tag))
+	elif assigned and assigned_default:
+		lines.append(ROUTE_ASSIGNED_BY_DEFAULT.format(person=get_fullname(assigned)))
+	elif assigned:
 		lines.append(ROUTE_ASSIGNED.format(person=get_fullname(assigned)))
 	if task:
 		lines.append(ROUTE_TASK.format(task=task))
@@ -1467,7 +1522,8 @@ def _reason(
 	"""Reasoning step (design 4.3 step 8): at most `max_turns_per_run` model turns, one `reason` entry each.
 
 	The first message carries the configured ticket fields that hold a value as data (AC-24, U4b.md:249), and
-	`guidance_posted` when the ticket already has its guidance comment (ticket data, ADR-036 QĐ 7, U4b-10).
+	`guidance_posted` when the ticket already has its guidance comment (ticket data, ADR-036 QĐ 7, U4b-10), and the
+	matching active lessons as data (FEAT-008, ADR-046); every `reason` row of the run names them in `lessons_used`.
 	`notices` are the entries of notices posted before this step: they go on the first entry written (U4b.md:250).
 	A gateway error posts the run_failed notice on its own entry (U4b.md:251). `started_at` is the run's start: the
 	ask_fallback question counts only the ones posted since, so each run below the threshold asks once (AC-22).
@@ -1506,8 +1562,10 @@ def _reason(
 		act_now=granted.act_now_block,
 		ask_only=granted.ask_only_block,
 		reply_tools=granted.reply_block,
+		console_tools=granted.console_block,
 	)
 	fields = _ticket_field_values(ticket_name, field_map or {})
+	lessons = _lessons(settings, ticket.subject, ticket.description)
 	messages = [
 		{
 			"role": "user",
@@ -1519,6 +1577,7 @@ def _reason(
 				ticket_fields=fields,
 				guidance_posted=guidance_posted,
 				conversation=conversation,
+				lessons=lessons,
 				propose_now=granted.change_block and granted.act_now_block,
 				# CHG-010: on the creation run the instructor is the ticket's creator, so the ticket is the order.
 				ticket_is_order=trigger == TRIGGER_TICKET_INSERT and bool(context.instructor),
@@ -1531,6 +1590,7 @@ def _reason(
 		"entry_type": "reason",
 		"trigger": trigger,
 		"instructor": context.instructor,
+		**_lessons_used(lessons),
 	}
 	max_turns = settings.max_turns_per_run
 	for turn in range(1, max_turns + 1):

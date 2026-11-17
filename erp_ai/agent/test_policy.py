@@ -1,3 +1,4 @@
+import dataclasses
 import os
 import shutil
 import tempfile
@@ -12,9 +13,12 @@ from frappe.utils import now_datetime
 from helpdesk.test_utils import make_ticket
 
 from erp_ai.agent import policy
+from erp_ai.agent.policy import LessonSettings
 from erp_ai.constants import (
+	AGENT_USER,
 	CORE_APPS,
 	LOG_DOCTYPE,
+	ROLE_INSTRUCTOR,
 	SETTING_DOCTYPE,
 	TRIGGER_CHANGE_ACTION,
 	TRIGGER_COMMENT_MENTION,
@@ -405,12 +409,14 @@ class TestTicketContentDoctype(FrappeTestCase):
 
 
 class TestPermissionSwitches(FrappeTestCase):
-	# U1 3.1: the five permission switches, read in one place, in the spec's order (1)..(5).
+	# U1 3.1: the permission switches, read in one place, in the order of the settings section.
+	# BUG-008: console joins them (sixth in the dataclass, fifth in the section, before one_click_approval).
 	FIELD_FLAGS = (
 		("unrestricted_enabled", "unrestricted"),
 		("record_tools_enabled", "record_tools"),
 		("act_now_enabled", "act_now"),
 		("code_change_enabled", "code_change"),
+		("console_enabled", "console"),
 		("one_click_approval_enabled", "one_click_approval"),
 	)
 
@@ -425,7 +431,7 @@ class TestPermissionSwitches(FrappeTestCase):
 
 	def test_missing_fields_read_off(self):
 		off = {flag: False for _field, flag in self.FIELD_FLAGS}
-		self.assertEqual(policy.PermissionSwitches(), policy.PermissionSwitches(*off.values()))
+		self.assertEqual(policy.PermissionSwitches(), policy.PermissionSwitches(**off))
 		# A settings object without the fields (before migrate) reads every switch off and never raises.
 		for settings in (frappe._dict(), object()):
 			with self.subTest(settings=settings):
@@ -438,6 +444,14 @@ class TestPermissionSwitches(FrappeTestCase):
 		self.assertEqual(self._flags(policy.permission_switches(frappe.get_doc(SETTING_DOCTYPE))), off)
 		with self.assertRaises(AttributeError):
 			policy.permission_switches(frappe._dict()).act_now = True
+
+	def test_switch_flags_pair_fields_by_name(self):
+		# BUG-008: tasks pairs a field with its flag through this map, never by position.
+		self.assertEqual(tuple(policy.SWITCH_FLAGS), policy.PERMISSION_SWITCH_FIELDS)
+		own = {f.name for f in dataclasses.fields(policy.PermissionSwitches)}
+		self.assertEqual(set(policy.SWITCH_FLAGS.values()), own)
+		self.assertEqual(policy.SWITCH_FLAGS[policy.CONSOLE_FIELD], "console")
+		self.assertEqual(policy.SWITCH_FLAGS[policy.ONE_CLICK_APPROVAL_FIELD], "one_click_approval")
 
 	def test_each_field_maps_to_its_flag(self):
 		self.assertEqual(
@@ -463,7 +477,7 @@ class TestPermissionSwitches(FrappeTestCase):
 				).values()
 			)
 		)
-		# Read from the stored setting: (2) and (5) on, the rest off.
+		# Read from the stored setting: record_tools and one_click_approval on, the rest off.
 		set_agent_settings(
 			unrestricted_enabled=0,
 			record_tools_enabled=1,
@@ -475,6 +489,52 @@ class TestPermissionSwitches(FrappeTestCase):
 			policy.permission_switches(frappe.get_doc(SETTING_DOCTYPE)),
 			policy.PermissionSwitches(record_tools=True, one_click_approval=True),
 		)
+
+
+class TestConsoleSwitch(FrappeTestCase):
+	# CHG-010 Task 1: the console switch, read only by policy. The site meta may not know the field (no migrate),
+	# so values are written with set_agent_settings and read from a document, never get_single_value.
+	def setUp(self):
+		self.addCleanup(frappe.db.rollback)
+		keep_agent_settings(self)
+
+	def test_console_field_name(self):
+		self.assertEqual(policy.CONSOLE_FIELD, "console_enabled")
+
+	def test_console_switch_off_when_missing(self):
+		frappe.db.delete("Singles", {"doctype": SETTING_DOCTYPE, "field": policy.CONSOLE_FIELD})
+		self.assertIs(policy.permission_switches(frappe.get_doc(SETTING_DOCTYPE)).console, False)
+		self.assertIs(policy.permission_switches(frappe._dict()).console, False)
+		self.assertIs(policy.console_enabled_now(), False)
+
+	def test_console_switch_on(self):
+		set_agent_settings(console_enabled=1)
+		self.assertIs(policy.permission_switches(frappe.get_doc(SETTING_DOCTYPE)).console, True)
+
+	def test_console_independent_of_code_change(self):
+		set_agent_settings(code_change_enabled=0, console_enabled=1)
+		switches = policy.permission_switches(frappe.get_doc(SETTING_DOCTYPE))
+		self.assertIs(switches.console, True)
+		self.assertIs(switches.code_change, False)
+		set_agent_settings(code_change_enabled=1, console_enabled=0)
+		switches = policy.permission_switches(frappe.get_doc(SETTING_DOCTYPE))
+		self.assertIs(switches.console, False)
+		self.assertIs(switches.code_change, True)
+
+	def test_console_is_the_sixth_field(self):
+		self.assertEqual(
+			policy.PermissionSwitches(True, True, True, True, True, True).console,
+			True,
+		)
+		self.assertIs(policy.PermissionSwitches().console, False)
+
+	def test_console_enabled_now_reads_fresh(self):
+		set_agent_settings(console_enabled=0)
+		self.assertIs(policy.console_enabled_now(), False)
+		set_agent_settings(console_enabled=1)
+		self.assertIs(policy.console_enabled_now(), True)
+		set_agent_settings(console_enabled=0)
+		self.assertIs(policy.console_enabled_now(), False)
 
 
 class TestBudget(FrappeTestCase):
@@ -1550,3 +1610,85 @@ class TestExcludedQuery(FrappeTestCase):
 			patch.object(frappe.db, "get_value", side_effect=get_value),
 		):
 			self.assertTrue(policy.is_ticket_record_excluded("Comment", comment))
+
+
+def _lesson_user(email, *roles):
+	"""A user holding exactly `roles`, created inside the test transaction."""
+	for role in roles:
+		if not frappe.db.exists("Role", role):
+			frappe.get_doc({"doctype": "Role", "role_name": role}).insert(ignore_permissions=True)
+	if not frappe.db.exists("User", email):
+		user = frappe.new_doc("User")
+		user.update({"email": email, "first_name": email.split("@")[0], "send_welcome_email": 0})
+		for role in roles:
+			user.append("roles", {"role": role})
+		user.insert(ignore_permissions=True)
+	return email
+
+
+class TestLessonPolicy(FrappeTestCase):
+	def setUp(self):
+		frappe.db.rollback()
+		commit_guard = patch.object(
+			frappe.db, "commit", side_effect=AssertionError("test must not commit the transaction")
+		)
+		commit_guard.start()
+		self.addCleanup(commit_guard.stop)
+		self.addCleanup(frappe.db.rollback)
+		self.addCleanup(frappe.set_user, "Administrator")
+		keep_agent_settings(self)
+
+	def test_lesson_settings_defaults(self):
+		set_agent_settings(lessons_enabled=1, lessons_max_per_request=5, lessons_max_chars=2000)
+		self.assertEqual(
+			policy.lesson_settings(frappe.get_single("ERP AI Setting")), LessonSettings(True, 5, 2000, 500)
+		)
+
+	def test_lesson_settings_out_of_range_reads_default(self):
+		set_agent_settings(lessons_enabled=0, lessons_max_per_request=99, lessons_max_chars=5)
+		self.assertEqual(
+			policy.lesson_settings(frappe.get_single("ERP AI Setting")), LessonSettings(False, 5, 2000, 500)
+		)
+
+	def test_teach_marker_is_stripped_and_blank_is_empty(self):
+		set_agent_settings(lesson_teach_marker="  ghi nhớ: ")
+		self.assertEqual(policy.lesson_teach_marker(), "ghi nhớ:")
+		set_agent_settings(lesson_teach_marker="   ")
+		self.assertEqual(policy.lesson_teach_marker(), "")
+
+	def test_approver_is_reviewer_or_system_manager(self):
+		reviewer = _lesson_user("lesson.reviewer@example.com", "Desk User")
+		manager = _lesson_user("lesson.manager@example.com", "System Manager")
+		instructor = _lesson_user("lesson.instructor@example.com", ROLE_INSTRUCTOR)
+		set_agent_settings(
+			monthly_reviewers="\n".join([reviewer, "", "Administrator", "Guest", AGENT_USER]),
+		)
+		self.assertTrue(policy.is_lesson_approver(reviewer))
+		self.assertTrue(policy.is_lesson_approver(manager))
+		self.assertFalse(policy.is_lesson_approver(instructor))
+		for user in ("Administrator", "Guest", AGENT_USER, "", None):
+			self.assertFalse(policy.is_lesson_approver(user), user)
+
+	def test_manager_is_instructor_only(self):
+		instructor = _lesson_user("lesson.instructor@example.com", ROLE_INSTRUCTOR)
+		manager = _lesson_user("lesson.manager@example.com", "System Manager")
+		self.assertTrue(policy.can_manage_lessons(instructor))
+		self.assertFalse(policy.can_manage_lessons(manager))
+		for user in ("Administrator", "Guest", AGENT_USER, "", None):
+			self.assertFalse(policy.can_manage_lessons(user), user)
+
+	def test_limit_errors(self):
+		def errors(**caps):
+			return policy.lesson_limit_errors(frappe._dict(caps))
+
+		for value in (0, 21):
+			self.assertEqual(len(errors(lessons_max_per_request=value)), 1, value)
+		# R13: one lesson of the largest size (300 + 1000 characters) always fits under the smallest cap
+		self.assertEqual(policy.LESSONS_CHARS_RANGE, (1300, 20000))
+		for value in (1299, 20001):
+			self.assertEqual(len(errors(lessons_max_chars=value)), 1, value)
+		for per_request, chars in ((1, 1300), (20, 20000)):
+			self.assertEqual(errors(lessons_max_per_request=per_request, lessons_max_chars=chars), [])
+		self.assertEqual(errors(), [])
+		for value in ("abc", 0, True):
+			self.assertEqual(len(errors(lessons_max_chars=value)), 1, value)

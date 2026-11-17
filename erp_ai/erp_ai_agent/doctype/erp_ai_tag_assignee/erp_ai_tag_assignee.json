@@ -1,0 +1,71 @@
+{
+ "actions": [],
+ "creation": "2026-11-17 10:40:00.000000",
+ "doctype": "DocType",
+ "editable_grid": 1,
+ "engine": "InnoDB",
+ "field_order": [
+  "section_assignee",
+  "tag",
+  "description",
+  "assignee",
+  "section_scope",
+  "category"
+ ],
+ "fields": [
+  {
+   "fieldname": "section_assignee",
+   "fieldtype": "Section Break",
+   "label": "Tag và người phụ trách"
+  },
+  {
+   "description": "Tên tag do bạn đặt, ví dụ chấm công, tracecore: 2 đến 40 ký tự, chỉ chữ, số, khoảng trắng và & ( ) + . / # -, không dấu phẩy. Không cần tạo Tag trước: bot tự tạo khi gắn lần đầu. So không phân biệt hoa thường; tag người tạo phiếu tự gắn không được tính.",
+   "fieldname": "tag",
+   "fieldtype": "Data",
+   "in_list_view": 1,
+   "label": "Tag",
+   "reqd": 1
+  },
+  {
+   "description": "Việc nào thuộc tag này, ví dụ: chấm công, bảng công, đi muộn, nghỉ phép. Bot đọc mô tả để chọn đúng một tag cho phiếu mới; tag có nhiều dòng thì dùng mô tả ở dòng đầu tiên. Viết về loại việc, không nêu tên người.",
+   "fieldname": "description",
+   "fieldtype": "Small Text",
+   "in_list_view": 1,
+   "label": "Mô tả",
+   "reqd": 1
+  },
+  {
+   "description": "HD Agent nhận phiếu mang tag này và Task C/D của phiếu. Không được là tài khoản agent; người không còn là HD Agent đang hoạt động thì bot bỏ qua dòng này.",
+   "fieldname": "assignee",
+   "fieldtype": "Link",
+   "in_list_view": 1,
+   "label": "Người phụ trách",
+   "options": "HD Agent",
+   "reqd": 1
+  },
+  {
+   "fieldname": "section_scope",
+   "fieldtype": "Section Break",
+   "label": "Phạm vi áp dụng"
+  },
+  {
+   "description": "Để trống thì áp cho mọi đầu mục, kể cả D/E (thắng trưởng bộ phận). Bảng đọc từ trên xuống, dòng nằm trên thắng: muốn dòng của một đầu mục thắng dòng để trống cùng tag thì đặt nó lên trên. Một tag và một đầu mục chỉ có một dòng.",
+   "fieldname": "category",
+   "fieldtype": "Select",
+   "in_list_view": 1,
+   "label": "Đầu mục",
+   "options": "\nA\nB\nC\nD\nE\nF"
+  }
+ ],
+ "istable": 1,
+ "links": [],
+ "modified": "2026-11-17 14:00:00.000000",
+ "modified_by": "Administrator",
+ "module": "ERP AI agent",
+ "name": "ERP AI Tag Assignee",
+ "owner": "Administrator",
+ "permissions": [],
+ "sort_field": "modified",
+ "sort_order": "DESC",
+ "states": []
+}

@@ -2,6 +2,11 @@ import frappe
 from frappe.custom.doctype.custom_field.custom_field import create_custom_fields
 from frappe.permissions import setup_custom_perms
 
+from erp_ai.agent.classification import (
+	CATEGORY_TYPE_DESCRIPTIONS,
+	DEFAULT_CATEGORY_MAPPING,
+	load_mapping,
+)
 from erp_ai.agent.policy import OPT_OUT_FIELD
 from erp_ai.agent.routing import DEFAULT_ROUTING_RULES
 from erp_ai.constants import (
@@ -15,6 +20,7 @@ from erp_ai.constants import (
 
 TICKET_DOCTYPE = "HD Ticket"
 TEMPLATE_NAME = "Default"
+SETUP_SAVEPOINT = "erp_ai_ensure_record"
 AI_MODULE = "ERP AI agent"
 AI_SECTION_FIELD = "ai_section"
 AI_PERMLEVEL = 8
@@ -36,18 +42,34 @@ AGENT_STATUS_SCRIPT_FLAGS = {
 
 
 def after_install():
+	"""A new site: seed the data defaults once, then do the app setup."""
+	seed_once()
 	ensure_setup()
 
 
 def after_migrate():
+	"""Every migrate: app setup only. Data defaults are never seeded here, so a value or record a human
+	cleared, changed or deleted stays that way; a later data default goes in a new patch that calls seed_once()."""
 	ensure_setup()
 
 
+def seed_once() -> None:
+	"""The data defaults: the ERP AI Setting values and the ticket types and teams of the category mapping.
+
+	Runs once: from after_install on a new site, from the CHG-013 patch on a site that already had the app.
+	Fills only what is missing and never overwrites what a human set.
+	"""
+	_ensure_default_settings()
+	_ensure_ticket_types_and_teams()
+
+
 def ensure_setup() -> None:
-	"""Create what is missing, never overwrite what a human set; except the app-owned form script (ADR-007)."""
+	"""The app setup the code depends on (roles, user, custom fields, permissions, form script); runs on every
+	migrate. It never seeds data defaults (see seed_once). Create what is missing, never overwrite what a human
+	set; except the app-owned form script (ADR-007).
+	"""
 	_ensure_roles()
 	_ensure_agent_user()
-	_ensure_default_settings()
 	_ensure_ticket_custom_fields()
 	_ensure_template_rows()
 	_ensure_task_ticket_field()
@@ -106,7 +128,10 @@ def _ensure_default_settings() -> None:
 		)
 		if not stored or stored[0][0] is None:
 			frappe.db.set_single_value(SETTING_DOCTYPE, fieldname, default)
-	# A site enabled before the upgrade gets its enable mark once (AC-16, ADR-006); absent, NULL or "" is missing.
+
+
+def _mark_agent_enabled_at() -> None:
+	"""A site enabled before the upgrade gets its enable mark once (AC-16, ADR-006); absent, NULL or "" is missing."""
 	enabled_at = frappe.db.sql(
 		"select value from `tabSingles` where doctype=%s and field='agent_enabled_at'", SETTING_DOCTYPE
 	)
@@ -115,6 +140,68 @@ def _ensure_default_settings() -> None:
 	):
 		# str(datetime) is the shape a form save stores (space, no ".000000"); a datetime goes through isoformat().
 		frappe.db.set_single_value(SETTING_DOCTYPE, "agent_enabled_at", str(frappe.utils.now_datetime()))
+
+
+def _ensure_ticket_types_and_teams() -> None:
+	"""Create the HD Ticket Types and HD Teams the category mapping names; one that exists is never touched.
+
+	A failure on one record is logged and the rest go on: it must not abort install or migrate.
+	"""
+	stored = frappe.db.get_single_value(SETTING_DOCTYPE, "category_mapping", cache=False)
+	mapping = load_mapping(stored) or DEFAULT_CATEGORY_MAPPING
+	logger = frappe.logger(LOGGER_NAME)
+	for category, entry in mapping.items():
+		type_name = entry.get("ticket_type") or ""
+		if type_name and not frappe.db.exists("HD Ticket Type", type_name):
+			_create_guarded(
+				logger, "HD Ticket Type", type_name, category, _insert_ticket_type, category, entry
+			)
+		team_name = entry.get("agent_group") or ""
+		if team_name and not frappe.db.exists("HD Team", team_name):
+			_create_guarded(logger, "HD Team", team_name, category, _insert_team, team_name)
+
+
+def _create_guarded(logger, doctype, name, category, insert, *args) -> None:
+	frappe.db.savepoint(SETUP_SAVEPOINT)
+	try:
+		insert(*args)
+	except Exception as exc:
+		frappe.db.rollback(save_point=SETUP_SAVEPOINT)
+		frappe.log_error(
+			f"ERP AI install: {doctype} not created",
+			f"{doctype} {name} (category {category}): {type(exc).__name__}",
+		)
+		logger.warning("%s %s for category %s not created", doctype, name, category)
+		return
+	logger.info("%s %s created for category %s", doctype, name, category)
+
+
+def _insert_ticket_type(category, entry) -> None:
+	type_name = entry["ticket_type"]
+	is_default = type_name == DEFAULT_CATEGORY_MAPPING.get(category, {}).get("ticket_type")
+	priority = entry.get("priority") or ""
+	frappe.get_doc(
+		{
+			"doctype": "HD Ticket Type",
+			"name": type_name,
+			"description": CATEGORY_TYPE_DESCRIPTIONS.get(category, "") if is_default else "",
+			"priority": priority if priority and frappe.db.exists("HD Ticket Priority", priority) else None,
+		}
+	).insert(ignore_permissions=True)
+
+
+def _insert_team(team_name) -> None:
+	team = frappe.get_doc({"doctype": "HD Team", "team_name": team_name})
+	# Helpdesk requires members, but who staffs a team is a human decision: it starts empty.
+	team.flags.ignore_mandatory = True
+	team.insert(ignore_permissions=True)
+	# A round-robin rule with no users raises IndexError on the first ticket routed to the team, so the rule stays
+	# off until members are added: saving the team re-syncs the rule and switches it on (HD Team.on_update).
+	frappe.db.set_value("Assignment Rule", team.assignment_rule, "disabled", 1, update_modified=False)
+	frappe.clear_document_cache("Assignment Rule", team.assignment_rule)
+	frappe.logger(LOGGER_NAME).info(
+		"HD Team %s created without members; its assignment rule is off until members are added", team_name
+	)
 
 
 def _ensure_ticket_custom_fields() -> None:

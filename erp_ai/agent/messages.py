@@ -101,6 +101,7 @@ def thread(ticket: str) -> list[dict]:
 				"author": get_fullname(row.owner),
 				"is_bot": row.owner == AGENT_USER,
 				"created_at": format_datetime(row.creation),
+				"created": str(row.creation),
 				"text": text,
 				"kind": kind,
 				# CHG-010: only a plan with steps left for the bot can be approved.

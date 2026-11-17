@@ -154,11 +154,13 @@ class TestParseClassification(FrappeTestCase):
 
 
 class TestParseLabels(FrappeTestCase):
-	"""ADR-049: `nhan` gives the ticket 1-3 short labels; a bad label is dropped, never the classification."""
+	"""ADR-049 with CHG-014: `nhan` gives the ticket at most one label; a bad label is dropped, never the
+	classification."""
 
-	def test_labels_read_in_order(self):
+	# CHG-014 (spec 2026-11-17-one-tag-design.md, design 4): one tag per ticket, the first good label
+	def test_only_the_first_good_label_kept(self):
 		result = classification.parse_classification(_text(nhan=["Stock", "Delivery Note", "In ấn"]))
-		self.assertEqual(result.labels, ("Stock", "Delivery Note", "In ấn"))
+		self.assertEqual(result.labels, ("Stock",))
 
 	def test_no_labels_is_an_empty_tuple(self):
 		self.assertEqual(classification.parse_classification(_text()).labels, ())
@@ -168,8 +170,9 @@ class TestParseLabels(FrappeTestCase):
 
 	def test_whitespace_collapses_and_nfc(self):
 		decomposed = "In ấn"  # "In ấn" typed with combining marks
-		result = classification.parse_classification(_text(nhan=["  Delivery \n Note ", decomposed]))
-		self.assertEqual(result.labels, ("Delivery Note", "In ấn"))
+		result = classification.parse_classification(_text(nhan=["  Delivery \n Note "]))
+		self.assertEqual(result.labels, ("Delivery Note",))
+		self.assertEqual(classification.parse_classification(_text(nhan=[decomposed])).labels, ("In ấn",))
 
 	def test_bad_labels_dropped(self):
 		cases = [
@@ -190,12 +193,10 @@ class TestParseLabels(FrappeTestCase):
 		label = "z" * classification.LABEL_MAX_CHARS
 		self.assertEqual(classification.parse_classification(_text(nhan=[label])).labels, (label,))
 
-	def test_duplicates_ignore_case_and_at_most_three(self):
-		result = classification.parse_classification(
-			_text(nhan=["Stock", "stock", "Delivery Note", "In ấn", "Kho"])
-		)
-		self.assertEqual(result.labels, ("Stock", "Delivery Note", "In ấn"))
-		self.assertEqual(classification.LABELS_MAX, 3)
+	def test_at_most_one_label(self):
+		result = classification.parse_classification(_text(nhan=["Stock", "stock", "Kho"]))
+		self.assertEqual(result.labels, ("Stock",))
+		self.assertEqual(classification.LABELS_MAX, 1)
 
 	def test_direct_build_has_no_labels(self):
 		self.assertEqual(classification.Classification(category="A", confidence="Cao").labels, ())

@@ -19,9 +19,9 @@ URGENT_TAGS = ("[GẤP]", "[GẬP]")
 # AC-28 (design.md:409): the split question lists at most 10 requests, each cut to 200 characters.
 SPLIT_MAX_REQUESTS = 10
 SPLIT_REQUEST_MAX_CHARS = 200
-# ADR-049: the ticket's labels (`nhan`): at most 3, each one line of 2-40 characters that Frappe's comma-separated tag
+# ADR-049 with CHG-014: the ticket's label (`nhan`): at most one, one line of 2-40 characters that Frappe's comma-separated tag
 # column and the tag chips keep as typed.
-LABELS_MAX = 3
+LABELS_MAX = 1
 LABEL_MIN_CHARS, LABEL_MAX_CHARS = 2, 40
 _LABEL = re.compile(r"^[\w &()+./#-]+$")
 
@@ -33,6 +33,16 @@ DEFAULT_CATEGORY_MAPPING = {
 	"D": {"ticket_type": "Chuẩn hóa dữ liệu & quy trình trên ERP", "agent_group": "", "priority": "Medium"},
 	"E": {"ticket_type": "Công việc nghiệp vụ ngoài IT", "agent_group": "", "priority": ""},
 	"F": {"ticket_type": "Câu hỏi, phiếu nhiễu", "agent_group": "IT", "priority": "Low"},
+}
+
+# Guide 16.1, "Dấu hiệu nhận biết" column: the description of the ticket type a fresh site gets for each category.
+CATEGORY_TYPE_DESCRIPTIONS = {
+	"A": '"lỗi", "mất", "không hiển thị", có mã chứng từ cụ thể, người dùng bị chặn việc',
+	"B": "Tạo tài khoản, phân quyền, thêm trường, cấu hình tham số/ngày nghỉ/ngôn ngữ, chặn validation",
+	"C": '"xây dựng", "tích hợp", "bot", "tự động", "dashboard"; phạm vi nhiều ngày, cần BA',
+	"D": '"bổ sung", "chuẩn hóa", "đưa lên ERP", "rà soát"; đầu vào là dữ liệu nghiệp vụ của phòng ban',
+	"E": "Việc của HCNS, Kế toán, Mua hàng; không cần thay đổi hệ thống",
+	"F": "Tiêu đề rỗng/không rõ, phiếu test, hỏi cách dùng",
 }
 
 _FENCE = re.compile(r"^```(?:json)?[ \t]*\n?(.*?)\n?```$", re.DOTALL)

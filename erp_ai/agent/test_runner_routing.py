@@ -12,7 +12,7 @@ from frappe.utils import escape_html, get_fullname
 from helpdesk.test_utils import make_ticket
 
 from erp_ai import tasks
-from erp_ai.agent import authority, labels, runner
+from erp_ai.agent import authority, labels, prompts, runner
 from erp_ai.agent.classification import Classification, parse_classification, split_request_comment
 from erp_ai.agent.prompts import build_classify_request
 from erp_ai.agent.routing import DUE_FIELD_MISSING_NOTE, RouteDecision, departments, load_routing_config
@@ -58,9 +58,11 @@ from erp_ai.test_utils import (
 	make_model_result,
 	make_routing_rules,
 	make_sla,
+	make_tag,
 	make_team,
 	pin_agent_roles,
 	set_agent_settings,
+	set_tag_assignees,
 )
 
 ROUTE_TYPE = f"{PREFIX}route-type"
@@ -93,6 +95,10 @@ CLASSIFY_SCORED = json.dumps(
 		"ly_do_diem": SCORE_REASON,
 	}
 )
+# CHG-011: a scored A classification whose one label has a row in the tag table.
+TAG_KHO = f"{PREFIX}Kho"
+TAG_KE_TOAN = f"{PREFIX}Ke toan"
+CLASSIFY_TAGGED = json.dumps({**json.loads(CLASSIFY_SCORED), "nhan": [TAG_KHO]})
 CLASSIFY_C = json.dumps(
 	{
 		"dau_muc": "C",
@@ -1859,13 +1865,27 @@ class TestConfidencePct(RoutingTestBase):
 
 LABEL_KHO = f"{PREFIX}Kho"
 LABEL_IN = f"{PREFIX}In ấn"
-CLASSIFY_LABELLED = json.dumps(
-	{"dau_muc": "A", "do_tin_cay": "Cao", "do_tin_cay_pct": 90, "ly_do": "x", "nhan": [LABEL_KHO, LABEL_IN]}
-)
+
+
+def _classify_with(*tags):
+	return json.dumps(
+		{"dau_muc": "A", "do_tin_cay": "Cao", "do_tin_cay_pct": 90, "ly_do": "x", "nhan": list(tags)}
+	)
+
+
+CLASSIFY_LABELLED = _classify_with(LABEL_KHO)
 
 
 class TestRoutingLabels(RoutingTestBase):
-	"""ADR-049: the run gives the ticket the labels of its classification, with the route, and says so."""
+	"""ADR-049 with CHG-014: the run gives the ticket the one table tag its classification chose, with the route, and
+	says so; a tag outside the table, or a ticket an HD Agent already tagged, gets none."""
+
+	def setUp(self):
+		super().setUp()
+		self.person = make_active_agent(self)
+		set_tag_assignees(
+			(LABEL_KHO, self.person, "", "Phiếu về kho"), (LABEL_IN, self.person, "", "Phiếu về in ấn")
+		)
 
 	def _labels_of(self, ticket):
 		rows = frappe.get_all(
@@ -1886,40 +1906,62 @@ class TestRoutingLabels(RoutingTestBase):
 			self._run()
 		return captured
 
-	def test_labels_added_recorded_and_said(self):
+	def _label_actions(self):
+		return [a for a in json.loads(self._single_entry().actions) if a["tool"] == runner.LABELS_TOOL]
+
+	def test_table_tag_added_recorded_and_said(self):
 		captured = self._run_labelled()
 
 		self.log_error.assert_not_called()
-		self.assertEqual(self._labels_of(self.ticket.name), sorted([LABEL_KHO, LABEL_IN]))
+		self.assertEqual(self._labels_of(self.ticket.name), [LABEL_KHO])
 		entry = self._single_entry()
 		self.assertEqual(entry.applied, 1)
-		(action,) = [a for a in json.loads(entry.actions) if a["tool"] == runner.LABELS_TOOL]
+		(action,) = self._label_actions()
 		self.assertEqual(
 			action,
 			action_entry(
-				runner.LABELS_TOOL,
-				"HD Ticket",
-				self.ticket.name,
-				True,
-				value_after={"labels": [LABEL_KHO, LABEL_IN]},
+				runner.LABELS_TOOL, "HD Ticket", self.ticket.name, True, value_after={"labels": [LABEL_KHO]}
 			),
 		)
-		self.assertEqual(json.loads(entry.value_after)["labels"], [LABEL_KHO, LABEL_IN])
+		self.assertEqual(json.loads(entry.value_after)["labels"], [LABEL_KHO])
 		(lines,) = captured
-		self.assertEqual(lines[1], runner.ROUTE_LABELS.format(labels=f"{LABEL_KHO}, {LABEL_IN}"))
-		self.assertIn(
-			runner.ROUTE_LABELS.format(labels=f"{LABEL_KHO}, {LABEL_IN}"), self._route_comment(entry)
-		)
+		self.assertEqual(lines[1], runner.ROUTE_LABELS.format(labels=LABEL_KHO))
+		self.assertIn(runner.ROUTE_LABELS.format(labels=LABEL_KHO), self._route_comment(entry))
 
-	def test_module_label_written_with_the_module_spelling(self):
-		self.label_inputs.return_value = labels.LabelInputs(modules=("Stock",))
-		text = json.dumps(
-			{"dau_muc": "A", "do_tin_cay": "Cao", "do_tin_cay_pct": 90, "ly_do": "x", "nhan": ["stock"]}
-		)
+	def test_tag_outside_the_table_is_not_added(self):
+		self._run_labelled(_classify_with("Stock"))
+		self.assertEqual(self._labels_of(self.ticket.name), [])
+		self.assertEqual(self._label_actions(), [])
 
-		self._run_labelled(text)
+	def test_table_spelling_kept(self):
+		self._run_labelled(_classify_with(LABEL_KHO.lower()))
+		self.assertEqual(self._labels_of(self.ticket.name), [LABEL_KHO])
 
-		self.assertEqual(self._labels_of(self.ticket.name), ["Stock"])
+	def test_two_answered_tags_give_one(self):
+		self._run_labelled(_classify_with(LABEL_IN, LABEL_KHO))
+		self.assertEqual(self._labels_of(self.ticket.name), [LABEL_IN])
+
+	def test_an_agent_tag_stops_the_bot_tag(self):
+		agent = make_active_agent(self)
+		frappe.set_user(agent)
+		try:
+			frappe.get_doc("HD Ticket", self.ticket.name).add_tag(LABEL_IN)
+		finally:
+			frappe.set_user("Administrator")
+
+		self._run_labelled()
+
+		self.assertEqual(self._labels_of(self.ticket.name), [LABEL_IN])
+		self.assertEqual(self._label_actions(), [])
+
+	def test_a_tag_the_ticket_carries_is_not_said_again(self):
+		# put on by Administrator (no HD Agent): it does not stop the bot's tag, which is then already there
+		frappe.get_doc("HD Ticket", self.ticket.name).add_tag(LABEL_KHO)
+
+		captured = self._run_labelled()
+
+		self.assertEqual(self._label_actions(), [])
+		self.assertFalse([line for line in captured[0] if line.startswith(runner.ROUTE_LABELS.split("{")[0])])
 
 	def test_no_labels_no_action_no_sentence(self):
 		captured = self._run_labelled(CLASSIFY_SCORED)
@@ -1930,15 +1972,6 @@ class TestRoutingLabels(RoutingTestBase):
 		(lines,) = captured
 		self.assertFalse([line for line in lines if line.startswith(runner.ROUTE_LABELS.split("{")[0])])
 
-	def test_labels_the_ticket_has_are_not_said_again(self):
-		frappe.get_doc("HD Ticket", self.ticket.name).add_tag(LABEL_KHO)
-
-		captured = self._run_labelled()
-
-		(action,) = [a for a in json.loads(self._single_entry().actions) if a["tool"] == runner.LABELS_TOOL]
-		self.assertEqual(action["value_after"], {"labels": [LABEL_IN]})
-		self.assertIn(runner.ROUTE_LABELS.format(labels=LABEL_IN), captured[0])
-
 	def test_a_failed_label_write_keeps_the_route(self):
 		with patch.object(runner, "add_labels", side_effect=frappe.ValidationError("x")):
 			self._run_labelled()
@@ -1946,7 +1979,7 @@ class TestRoutingLabels(RoutingTestBase):
 		entry = self._single_entry()
 		self.assertEqual(entry.applied, 1)
 		self.assertEqual(frappe.db.get_value("HD Ticket", self.ticket.name, "ticket_type"), ROUTE_TYPE)
-		(action,) = [a for a in json.loads(entry.actions) if a["tool"] == runner.LABELS_TOOL]
+		(action,) = self._label_actions()
 		self.assertEqual((action["ok"], action["reason"]), (False, "ValidationError"))
 		self.assertEqual(self._labels_of(self.ticket.name), [])
 		self.assertIn(f"route {runner.LABELS_TOOL}: ValidationError", entry.error)
@@ -1965,52 +1998,29 @@ class TestRoutingLabels(RoutingTestBase):
 			runner.run_for_ticket(ticket, "ticket_insert")
 			self.assertEqual(self._labels_of(ticket), [])
 
-	def test_classify_request_carries_the_label_inputs(self):
-		inputs = labels.LabelInputs(
-			modules=("HR", "Stock"),
-			label_catalog=((LABEL_KHO, 3, "Phiếu kho"),),
-			similar_labels=(("Không in được phiếu xuất", (LABEL_KHO,)),),
-		)
-		self.label_inputs.return_value = inputs
-
+	def test_classify_request_carries_the_table_tags(self):
 		self._run_labelled(CLASSIFY_SCORED)
 
-		self.label_inputs.assert_called_once_with(
-			self.ticket.name, self.ticket.subject, self.ticket.description
-		)
 		expected = build_classify_request(
 			self.ticket.subject,
 			self.ticket.description,
 			departments(load_routing_config(make_routing_rules())),
-			**inputs._asdict(),
+			tag_choices=((LABEL_KHO, "Phiếu về kho"), (LABEL_IN, "Phiếu về in ấn")),
 		)
 		call = self.gateway.calls[0]
 		self.assertEqual((call["system"], call["messages"]), (expected["system"], expected["messages"]))
 
-	def test_label_inputs_failing_never_stops_the_classification(self):
-		self.label_inputs.side_effect = frappe.QueryTimeoutError("x")
-		logger = MagicMock()
+	def test_empty_table_gives_no_tag_block(self):
+		set_tag_assignees()
+		self._run_labelled(CLASSIFY_SCORED)
 
-		with patch.object(frappe, "logger", return_value=logger):
-			self._run_labelled()
-
-		self.assertEqual(self._single_entry().applied, 1)
 		expected = build_classify_request(
 			self.ticket.subject,
 			self.ticket.description,
 			departments(load_routing_config(make_routing_rules())),
 		)
 		self.assertEqual(self.gateway.calls[0]["system"], expected["system"])
-		warnings = [c.args for c in logger.warning.call_args_list]
-		self.assertIn(
-			(
-				"erp_ai labels ticket=%s run_id=%s error=%s",
-				self.ticket.name,
-				self._single_entry().run_id,
-				"QueryTimeoutError",
-			),
-			warnings,
-		)
+		self.assertNotIn(prompts.TAGS_BLOCK, self.gateway.calls[0]["system"][0]["text"])
 
 
 CLASSIFY_B_NO_SCORE = json.dumps({"dau_muc": "B", "do_tin_cay": "Cao", "do_tin_cay_pct": 90, "ly_do": "x"})
@@ -2579,3 +2589,126 @@ class TestRouteOnce(AssignTestBase):
 			json.loads(row["actions"]),
 			[action_entry("apply_route", "HD Ticket", ticket, False, reason=runner.ROUTE_ALREADY_DONE)],
 		)
+
+
+class TestRoutingAssignByTag(AssignTestBase):
+	"""CHG-011: the table of tag → person on ERP AI Setting decides the person before the routing rules."""
+
+	def setUp(self):
+		super().setUp()
+		self.tag_person = make_active_agent(self)
+		make_tag(TAG_KHO)
+		set_tag_assignees((TAG_KHO, self.tag_person, ""))
+		self.gateway.results = [
+			make_model_result(text=CLASSIFY_TAGGED),
+			make_model_result(stop_reason="end_turn"),
+		]
+
+	def test_model_label_with_a_row_gives_the_ticket_to_its_person(self):
+		self._run()
+		self.assertEqual(self._assigned_to(), [self.tag_person])
+		(action,) = self._action("assign_owner")
+		self.assertEqual(
+			(action["name"], action["ok"], action.get("rule")), (self.tag_person, True, f"tag:{TAG_KHO}")
+		)
+		self.assertIn(
+			runner.ROUTE_ASSIGNED_BY_TAG.format(person=get_fullname(self.tag_person), tag=TAG_KHO),
+			self._comment_text(),
+		)
+		self.assertEqual(self._single_entry().predicted_assignee, self.tag_person)
+
+	def _tag_as(self, user, tag):
+		"""Put `tag` on the ticket as `user` (the Tag Link's owner), then come back to Administrator."""
+		frappe.set_user(user)
+		try:
+			frappe.get_doc("HD Ticket", self.ticket.name).add_tag(tag)
+		finally:
+			frappe.set_user("Administrator")
+
+	# CHG-011 user decision 2026-11-17 (option b): the table is read top-down, an agent's tag and the model's label
+	# alike
+	def test_tag_an_agent_put_on_the_ticket_counts(self):
+		other = make_active_agent(self)
+		make_tag(TAG_KE_TOAN)
+		set_tag_assignees((TAG_KE_TOAN, other, ""), (TAG_KHO, self.tag_person, ""))
+		self._tag_as(self.person, TAG_KE_TOAN)
+		self._run()
+		self.assertEqual(self._assigned_to(), [other])
+
+	def test_an_agent_tag_stops_the_bot_tag_in_routing(self):
+		# CHG-014: a ticket an HD Agent tagged keeps that one tag; the bot's tag neither lands nor routes
+		other = make_active_agent(self)
+		make_tag(TAG_KE_TOAN)
+		set_tag_assignees((TAG_KHO, self.tag_person, ""), (TAG_KE_TOAN, other, ""))
+		self._tag_as(self.person, TAG_KE_TOAN)
+		self._run()
+		self.assertEqual(self._assigned_to(), [other])
+
+	def test_tag_a_non_agent_put_on_the_ticket_is_not_used(self):
+		# review finding: the ticket's requester (HD Customer, raised_by) may tag their own ticket through Frappe's
+		# whitelisted add_tag, so their tag must not pick the person
+		requester = f"{PREFIX.lower()}requester-{frappe.generate_hash(length=8)}@example.com"
+		frappe.get_doc(
+			{
+				"doctype": "User",
+				"email": requester,
+				"first_name": "Requester",
+				"send_welcome_email": 0,
+				"roles": [{"role": "HD Customer"}],
+			}
+		).insert(ignore_permissions=True)
+		frappe.db.set_value("HD Ticket", self.ticket.name, "raised_by", requester, update_modified=False)
+		other = make_active_agent(self)
+		make_tag(TAG_KE_TOAN)
+		# the requester's tag has the row above: only leaving it out gives the model label's person
+		set_tag_assignees((TAG_KE_TOAN, other, ""), (TAG_KHO, self.tag_person, ""))
+		self._tag_as(requester, TAG_KE_TOAN)
+		self._run()
+		self.assertEqual(self._assigned_to(), [self.tag_person])
+
+	def test_no_row_for_the_labels_keeps_the_configured_default(self):
+		set_tag_assignees()
+		self._run()
+		self.assertEqual(self._assigned_to(), [self.person])
+		self.assertIn(runner.ROUTE_ASSIGNED.format(person=get_fullname(self.person)), self._comment_text())
+		(action,) = self._action("assign_owner")
+		self.assertFalse(action.get("rule"))
+
+	def test_ticket_already_assigned_is_left_alone(self):
+		assign_to.add({"assign_to": [self.person], "doctype": "HD Ticket", "name": self.ticket.name})
+		self._run()
+		self.assertEqual(self._assigned_to(), [self.person])
+
+	def test_table_tags_reach_the_classify_request(self):
+		# CHG-014: the tags come from the table itself, no live-tag scan to patch any more
+		self._run()
+		classify = next(call for call in self.gateway.calls if call["task"] == "classify")
+		self.assertIn(f"- {TAG_KHO}: x", classify["system"][0]["text"])
+
+
+class TestRoutingDefaultAssignee(AssignTestBase):
+	"""CHG-015: a ticket nobody owns that neither the tag table nor the routing rules can give goes to the default."""
+
+	def setUp(self):
+		super().setUp()
+		self.default_person = make_active_agent(self)
+		# no person in the routing rules and an empty tag table: only the default can take the ticket
+		set_agent_settings(routing_rules=make_routing_rules(), default_assignee=self.default_person)
+		set_tag_assignees()
+
+	def test_the_default_takes_the_ticket_and_says_so(self):
+		self._run()
+		self.assertEqual(self._assigned_to(), [self.default_person])
+		(action,) = self._action("assign_owner")
+		self.assertEqual(
+			(action["name"], action["ok"], action.get("rule")), (self.default_person, True, "default")
+		)
+		self.assertIn(
+			runner.ROUTE_ASSIGNED_BY_DEFAULT.format(person=get_fullname(self.default_person)),
+			self._comment_text(),
+		)
+
+	def test_ticket_already_assigned_keeps_its_person(self):
+		assign_to.add({"assign_to": [self.person], "doctype": "HD Ticket", "name": self.ticket.name})
+		self._run()
+		self.assertEqual(self._assigned_to(), [self.person])

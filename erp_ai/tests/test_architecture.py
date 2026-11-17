@@ -34,6 +34,7 @@ from erp_ai.constants import (
 	AGENT_USER,
 	CHANGE_STATUS_APPLIED,
 	CHANGE_STATUS_PENDING,
+	LESSON_STATUS_ACTIVE,
 	PANEL_METHODS,
 )
 
@@ -220,6 +221,7 @@ POLICY_FIELDS = (
 	"record_tools_enabled",
 	"act_now_enabled",
 	"one_click_approval_enabled",
+	"console_enabled",
 	"level_cap_a",
 	"level_cap_b",
 	"level_cap_c",
@@ -227,6 +229,10 @@ POLICY_FIELDS = (
 	"level_cap_e",
 	"level_cap_f",
 	"confidence_threshold",
+	"lessons_enabled",
+	"lessons_max_per_request",
+	"lessons_max_chars",
+	"lesson_teach_marker",
 )
 SETTING_CONTROLLER_FILE = "erp_ai_agent/doctype/erp_ai_setting/erp_ai_setting.py"
 
@@ -299,7 +305,8 @@ STATUS_SCRIPT_REQUIRED = (
 	r"if \(state\.ticket\)",
 	# T12: message thread, labels, B-8 guidance, close button, indicator moved into the panel and back.
 	r"threadEl",
-	r"renderMessages",
+	# CHG-010: one thread of messages and cards, so renderThread replaces renderMessages and renderProposals.
+	r"renderThread",
 	r'TEXT_EMPTY_THREAD = "Chưa có tin nào\."',
 	r'TEXT_BOT_LABEL = "Bot"',
 	r'TEXT_CLOSE = "Đóng"',
@@ -319,7 +326,8 @@ STATUS_SCRIPT_REQUIRED = (
 	# T12: stale-result guard (design F1 reload).
 	r"seq !== panel\.seq \|\| ticket !== state\.ticket \|\| !panel\.open",
 	# T12 use sites (the pins above match declarations; these match where each is used).
-	r"renderMessages\(data\)",
+	# CHG-010: the use site is renderThread(data) now.
+	r"renderThread\(data\)",
 	r"if \(isStale\(\)\) \{\s*return;",
 	r"dockIndicator\(true\)",
 	r"dockIndicator\(false\)",
@@ -366,10 +374,25 @@ STATUS_SCRIPT_REQUIRED = (
 	r"isComposing\) \{\s*event\.preventDefault\(\);\s*submit\(\);",
 	r'addEventListener\("click", \(\) => \{\s*try \{\s*submit\(\);',
 	# CHG-008 T4 (design 4.3): the proposals section, between the thread and the error line, and the fixed texts.
+	# CHG-010: no separate proposals section; the cards sit in threadEl and proposalErrorEl follows it.
 	# CHG-009 design 4.1, 8.2 (A-7): the send box closes the panel; the indicator's slot moved into the status line.
-	r"renderProposals",
-	r"threadEl,\s*proposalsTitle,\s*proposalsEl,\s*proposalErrorEl,\s*errorEl,\s*formEl\s*\)",
-	r'TEXT_PROPOSALS_SECTION = "Đề xuất thay đổi"',
+	r"threadEl,\s*proposalErrorEl,\s*errorEl,\s*formEl\s*\)",
+	# CHG-010: console cards show the script and its result; cards are ordered with the messages by time.
+	# CHG-010 final review F-9: the label says the script runs as Administrator.
+	r'TEXT_CONSOLE_SCRIPT = "Script sẽ chạy \(quyền Administrator\):"',
+	r'TEXT_CONSOLE_OUTPUT = "Kết quả:"',
+	# CHG-010 final review F-5: an empty script or output (None from the server) draws no block.
+	r"if \(card\?\.script\) \{\s*addBlock\(TEXT_CONSOLE_SCRIPT, card\.script\);",
+	r"if \(card\?\.output\) \{\s*addBlock\(TEXT_CONSOLE_OUTPUT, card\.output\);",
+	# CHG-010 final review F-6: a pending console card the viewer can open but not decide is held by the console
+	# switch (server PANEL_REFUSALS["console_off"]); the viewer keeps the button that only shows it.
+	r'TEXT_CONSOLE_OFF = "Chạy bench console đang tắt\."',
+	r"note\.textContent = canOpen \? TEXT_CONSOLE_OFF : TEXT_NEEDS_INSTRUCTOR;\s*row\.append\(note\);\s*"
+	r"if \(canOpen\) \{\s*row\.append\(proposalButton\(TEXT_OPEN_PROPOSAL, name\)\);",
+	r'maxHeight = "240px"',
+	r'overflow = "auto"',
+	r"\.sort\(\(a, b\) =>[^;]*\.created",
+	r"card\?\.is_console !== true",
 	r'TEXT_OPEN_PROPOSAL = "Xem nội dung thay đổi"',
 	r'OPEN_PROPOSAL_LABEL = "Mở đề xuất để Duyệt hoặc Từ chối"',
 	r'TEXT_NEEDS_INSTRUCTOR = "Cần người có vai trò ERP AI Instructor duyệt\."',
@@ -379,7 +402,6 @@ STATUS_SCRIPT_REQUIRED = (
 	r"deciding: false",
 	r"decisionButtons: \[\]",
 	r"Array\.isArray\(proposals\)",
-	r"renderProposals\(data\)",
 	# CHG-008 T5 (design 4.2, 4.3; AC-5, AC-11): Duyệt / Từ chối post once, lock both buttons while waiting, show
 	# the fixed error sentence on failure and reload the panel once in both branches.
 	r'TEXT_APPROVE = "Duyệt";',
@@ -398,8 +420,9 @@ STATUS_SCRIPT_REQUIRED = (
 	r"catch \(e\) \{\s*onDecideFailed\(\);",
 	# T6 review ruling: a card without a name has no button; a failed card render clears only the proposals.
 	r'const name = String\(card\?\.name \?\? ""\);\s*if \(!name\) \{\s*return row;',
-	r'renderMessages\(data\);\s*panel\.errorEl\.textContent = "";',
-	r"try \{\s*renderProposals\(data\);\s*\} catch \(e\) \{\s*clearProposals\(\);",
+	# CHG-010: a failed card build renders the messages without cards and clears the card error line (AC-11).
+	r'renderThread\(data\);\s*panel\.errorEl\.textContent = "";',
+	r"try \{\s*panel\.decisionButtons = \[\];\s*cardNodes = proposals\.map\(proposalCard\);\s*\} catch \(e\) \{\s*cardNodes = \[\];\s*panel\.decisionButtons = \[\];\s*panel\.proposalErrorEl\.replaceChildren\(\);",
 	# T14 live updates (design F3): both listeners are named handlers registered once per socket, in the guard block.
 	r'state\.socket = socket;\s*socket\.on\(EVENT, onStatus\);\s*socket\.on\("docinfo_update", onDocinfo\);\s*socket\.on\("doc_update", onDocUpdate\);',
 	r"docinfo_update",
@@ -429,7 +452,8 @@ STATUS_SCRIPT_REQUIRED = (
 	r"chatTitle,\s*statusEl,\s*guidanceEl,\s*threadEl",
 	r"state\.runs\.size > 0 \? TEXT_STATUS_RUNNING",
 	r"panel\.statusExpired && status\.expired_text",
-	r"renderBotStatus\(data\);\s*renderMessages\(data\)",
+	# CHG-010: the thread (messages, system lines and cards) is drawn by renderThread, still after the status.
+	r"renderBotStatus\(data\);\s*renderThread\(data\)",
 	r"statusExpired = true;\s*showBotStatus\(\)",
 )
 # CHG-009 design 8.2: each pin above with the wiring it guards broken, as (pattern, regex to break, replacement).
@@ -447,10 +471,11 @@ STATUS_LINE_VIOLATIONS = (
 	),
 	(r"state\.runs\.size > 0 \? TEXT_STATUS_RUNNING", r"state\.runs\.size > 0 \?", "false ?"),
 	(r"panel\.statusExpired && status\.expired_text", r"panel\.statusExpired && ", ""),
+	# CHG-010: renderThread replaced renderMessages at this use site.
 	(
-		r"renderBotStatus\(data\);\s*renderMessages\(data\)",
-		r"renderBotStatus\(data\);(\s*)renderMessages\(data\);",
-		r"renderMessages(data);\1renderBotStatus(data);",
+		r"renderBotStatus\(data\);\s*renderThread\(data\)",
+		r"renderBotStatus\(data\);(\s*)renderThread\(data\);",
+		r"renderThread(data);\1renderBotStatus(data);",
 	),
 	(
 		r"statusExpired = true;\s*showBotStatus\(\)",
@@ -3057,7 +3082,8 @@ def check_panel_decision_follows_adr_044(sources: dict) -> list:
 				)
 			)
 	for call in calls:
-		if _call_leaf(call) in ("approve", "reject"):
+		# CHG-010: the panel approves through `panel_approve`, so a direct call to it is banned like `approve`
+		if _call_leaf(call) in ("approve", "panel_approve", "reject"):
 			violations.append(
 				violation(
 					PANEL_FILE,
@@ -3075,6 +3101,19 @@ def check_panel_decision_follows_adr_044(sources: dict) -> list:
 				)
 			)
 		violations.extend(_decide_gate_violations(decide, ordered[0], ordered[1]))
+		# CHG-010: the predicate must be told whether the proposal is a console one, or the console switch is skipped
+		predicate_call = ordered[2]
+		if not any(
+			keyword.arg == "console" and dotted_name(keyword.value) == "head.is_console"
+			for keyword in predicate_call.keywords
+		):
+			violations.append(
+				violation(
+					PANEL_FILE,
+					predicate_call,
+					f"{PANEL_PREDICATE_FUNCTION} is called without console=head.is_console (CHG-010)",
+				)
+			)
 	table = definitions.get(PANEL_DECISIONS_NAME)
 	if table is None:
 		violations.append(f"{PANEL_FILE}: no {PANEL_DECISIONS_NAME}")
@@ -6197,10 +6236,17 @@ class TestArchitecture(unittest.TestCase):
 		self.assertEqual(check_panel_decision_follows_adr_044(self.sources), [])
 		panel = self.sources[PANEL_FILE]
 		gate = '\t_require_panel_access(head.ticket, method="decide")\n'
-		predicate = "\trefusal = proposal_form.panel_decision_refusal(head.change_status)\n"
+		# CHG-010: the predicate call now also passes the proposal's console flag
+		predicate = (
+			"\trefusal = proposal_form.panel_decision_refusal(head.change_status, console=head.is_console)\n"
+		)
 		cases = {
 			"no predicate": (
-				("proposal_form.panel_decision_refusal(head.change_status)", "None"),
+				# CHG-010: same call text with the console flag
+				(
+					"proposal_form.panel_decision_refusal(head.change_status, console=head.is_console)",
+					"None",
+				),
 				"panel_decision_refusal 0 times",
 			),
 			"browser ticket": (
@@ -6226,6 +6272,18 @@ class TestArchitecture(unittest.TestCase):
 			"switch read": (
 				("\trefusal = ", "\tpolicy.permission_switches(None)\n\trefusal = "),
 				"names permission_switches",
+			),
+			# CHG-010: a direct panel_approve call and a predicate without the console flag are caught
+			"direct panel_approve call": (
+				("PANEL_DECISIONS[action](name)", "proposal_form.panel_approve(name)"),
+				"panel_approve is called directly",
+			),
+			"predicate without console flag": (
+				(
+					"panel_decision_refusal(head.change_status, console=head.is_console)",
+					"panel_decision_refusal(head.change_status)",
+				),
+				"without console=head.is_console",
 			),
 			"undo in the table": (("proposal_form.reject,", "proposal_form.undo,"), "names undo"),
 			"predicate before gate": ((gate + predicate, predicate + gate), "order is not"),
@@ -12030,6 +12088,470 @@ class TestTicketPolicyRules(unittest.TestCase):
 					"not a string literal",
 				),
 				"the declaration gone": ({CONSTANTS_FILE: clean[CONSTANTS_FILE]}, "missing or not a literal"),
+			},
+		)
+
+
+# ---------------------------------------------------------------------------------------------------
+# FEAT-008 lesson store and its reader (ADR-045 Ràng buộc, ADR-046 Ràng buộc, Task 10)
+# ---------------------------------------------------------------------------------------------------
+
+LESSONS_FILE = "agent/lessons.py"
+LESSON_READ_FILE = "agent/lesson_read.py"
+LESSONS_MODULE = module_name(LESSONS_FILE)
+LESSON_READ_MODULE = module_name(LESSON_READ_FILE)
+# The only places that name the lesson DocTypes: the store, the reader, their controllers, constants and hooks.
+LESSON_DOCTYPE_FILES = (CONSTANTS_FILE, LESSONS_FILE, LESSON_READ_FILE, HOOKS_FILE)
+LESSON_DOCTYPE_DIRS = ("erp_ai_agent/doctype/erp_ai_lesson/", "erp_ai_agent/doctype/erp_ai_lesson_event/")
+LESSON_DOCTYPE_CONSTANTS = ("LESSON_DOCTYPE", "LESSON_EVENT_DOCTYPE")
+LESSON_DOCTYPE_TEXT = "ERP AI Lesson"  # both DocType names start with it
+LESSON_DOCTYPE_JSONS = tuple(f"{folder}{Path(folder).name}.json" for folder in LESSON_DOCTYPE_DIRS)
+LESSON_WRITE_RIGHTS = ("create", "write", "delete", "submit", "cancel", "amend")
+LESSON_READ_FUNCTION = "relevant_lessons"
+LESSON_ACTIVE_CONSTANT = "LESSON_STATUS_ACTIVE"
+LESSON_STATUS_FIELD = "lesson_status"
+# Modules that get lessons only as values from the runner: they never import the store or the reader.
+LESSON_FREE_MODULES = ("erp_ai.agent.prompts", "erp_ai.agent.tools", "erp_ai.gateway", "erp_ai.eval")
+# Global Constraints of FEAT-008 batch 1: (scope module, forbidden modules, reason), read by check_layer_imports.
+LESSON_IMPORT_RULES = (
+	(
+		"erp_ai.agent",
+		("erp_ai.handlers", "erp_ai.tasks", "erp_ai.install", "erp_ai.eval", "erp_ai.erp_ai_agent"),
+		"ADR-045: agent core never imports handlers, the scheduler, install, eval or doctype controllers",
+	),
+	(
+		LESSONS_MODULE,
+		("erp_ai.agent.runner", "erp_ai.gateway", "erp_ai.agent.changes"),
+		"ADR-045: the lesson store never runs the agent, calls the model or reaches the change job",
+	),
+	(
+		LESSON_READ_MODULE,
+		(LESSONS_MODULE, "erp_ai.gateway"),
+		"ADR-046: the lesson reader never imports the store or calls the model",
+	),
+	*(
+		(
+			scope,
+			(LESSONS_MODULE, LESSON_READ_MODULE),
+			"ADR-046: prompts, tools, gateway and eval get lessons as values from the runner, never from the store or reader",
+		)
+		for scope in LESSON_FREE_MODULES
+	),
+)
+
+
+def _is_text(node, docstrings: set) -> bool:
+	return isinstance(node, ast.Constant) and isinstance(node.value, str) and id(node) not in docstrings
+
+
+def check_lesson_doctype_named_only_in_store(sources: dict) -> list:
+	"""ADR-045/046: a lesson DocType is named (its constant, imported or read, or a string holding its name, docstrings
+	aside) only in constants.py, the store, the reader, the two DocType folders and hooks.py."""
+	violations = []
+	for rel, source in only_python(sources).items():
+		if rel in LESSON_DOCTYPE_FILES or rel.startswith(LESSON_DOCTYPE_DIRS):
+			continue
+		tree = parse(rel, source)
+		docstrings = _docstring_ids(tree)
+		for node in ast.walk(tree):
+			if (
+				referenced_name(node) in LESSON_DOCTYPE_CONSTANTS
+				or (isinstance(node, ast.alias) and node.name in LESSON_DOCTYPE_CONSTANTS)
+				or (_is_text(node, docstrings) and LESSON_DOCTYPE_TEXT in node.value)
+			):
+				violations.append(
+					violation(
+						rel,
+						node,
+						"names a lesson DocType; only the store and its reader may (ADR-045, ADR-046)",
+					)
+				)
+	return violations
+
+
+def check_lesson_import_direction(sources: dict) -> list:
+	return check_layer_imports(sources, LESSON_IMPORT_RULES)
+
+
+def check_relevant_lessons_called_only_by_runner(sources: dict) -> list:
+	"""ADR-046: only the runner names `lesson_read.relevant_lessons` (a call, an import, a string path) besides the
+	reader that defines it, and the runner does call it."""
+	violations, runner_calls = [], 0
+	for rel, source in only_python(sources).items():
+		if rel == LESSON_READ_FILE:
+			continue
+		tree = parse(rel, source)
+		docstrings = _docstring_ids(tree)
+		for node in ast.walk(tree):
+			if rel == RUNNER_FILE:
+				runner_calls += (
+					isinstance(node, ast.Call) and referenced_name(node.func) == LESSON_READ_FUNCTION
+				)
+				continue
+			if (
+				referenced_name(node) == LESSON_READ_FUNCTION
+				or (isinstance(node, ast.alias) and node.name == LESSON_READ_FUNCTION)
+				or (_is_text(node, docstrings) and re.search(rf"\b{LESSON_READ_FUNCTION}\b", node.value))
+			):
+				violations.append(
+					violation(
+						rel, node, f"names {LESSON_READ_FUNCTION}; only {RUNNER_FILE} reads lessons (ADR-046)"
+					)
+				)
+	if RUNNER_FILE in sources and not runner_calls:
+		violations.append(f"{RUNNER_FILE}: never calls lesson_read.{LESSON_READ_FUNCTION} (ADR-046 QĐ 1)")
+	return violations
+
+
+def check_lesson_doctypes_grant_no_write(sources: dict) -> list:
+	"""ADR-045: the store is the only writer, so no permission row of a lesson DocType grants a write right."""
+	violations = []
+	for rel in LESSON_DOCTYPE_JSONS:
+		if rel not in sources:
+			violations.append(f"{rel}: file missing")
+			continue
+		for row in json.loads(sources[rel]).get("permissions") or []:
+			granted = [right for right in LESSON_WRITE_RIGHTS if row.get(right)]
+			if granted:
+				violations.append(
+					f"{rel}: role {row.get('role')} is granted {', '.join(granted)}; only the store writes (ADR-045)"
+				)
+	return violations
+
+
+def _filter_values(tree: ast.AST) -> set:
+	"""ids of the nodes given as the `lesson_status` value of a filter: `{"lesson_status": X}`, `["lesson_status", X]`
+	or `["lesson_status", "=", X]`."""
+	values = set()
+	for node in ast.walk(tree):
+		if isinstance(node, ast.Dict):
+			values |= {
+				id(value)
+				for key, value in zip(node.keys, node.values, strict=True)
+				if _is_constant(key, LESSON_STATUS_FIELD)
+			}
+		elif isinstance(node, ast.List | ast.Tuple) and len(node.elts) in (2, 3):
+			if _is_constant(node.elts[0], LESSON_STATUS_FIELD):
+				values.add(id(node.elts[-1]))
+	return values
+
+
+def check_active_status_condition_written_once(sources: dict) -> list:
+	"""ADR-046 Ràng buộc: the "đang dùng" condition is written once in the reader, as the value of its one
+	`lesson_status` filter; never twice, never outside a filter, never as the literal text."""
+	source = sources.get(LESSON_READ_FILE)
+	if source is None:
+		return [f"{LESSON_READ_FILE}: file missing"]
+	tree = parse(LESSON_READ_FILE, source)
+	docstrings = _docstring_ids(tree)
+	uses = [
+		node
+		for node in ast.walk(tree)
+		if isinstance(node, ast.Name | ast.Attribute) and referenced_name(node) == LESSON_ACTIVE_CONSTANT
+	]
+	filters = _filter_values(tree)
+	violations = [
+		violation(LESSON_READ_FILE, node, f"{LESSON_ACTIVE_CONSTANT} outside a {LESSON_STATUS_FIELD} filter")
+		for node in uses
+		if id(node) not in filters
+	]
+	if len(uses) != 1:
+		violations.append(
+			f"{LESSON_READ_FILE}: {LESSON_ACTIVE_CONSTANT} used {len(uses)} times; the condition is written once (ADR-046)"
+		)
+	violations.extend(
+		violation(LESSON_READ_FILE, node, f"the text of {LESSON_ACTIVE_CONSTANT}; filter on the constant")
+		for node in ast.walk(tree)
+		if _is_text(node, docstrings) and node.value == LESSON_STATUS_ACTIVE
+	)
+	return violations
+
+
+# Clean samples of the lesson rules: each file does what it may.
+LESSON_RULES_SAMPLE = {
+	CONSTANTS_FILE: 'LESSON_DOCTYPE = "ERP AI Lesson"\nLESSON_EVENT_DOCTYPE = "ERP AI Lesson Event"\n',
+	HOOKS_FILE: 'ignore_links_on_delete = ["ERP AI Log", "ERP AI Lesson"]\n',
+	LESSONS_FILE: (
+		"import frappe\n\nfrom erp_ai.agent import policy\nfrom erp_ai.constants import LESSON_DOCTYPE\n\n\n"
+		"def store(values):\n\treturn frappe.get_doc({'doctype': LESSON_DOCTYPE, **values}).insert()\n"
+	),
+	LESSON_READ_FILE: (
+		"import frappe\n\nfrom erp_ai.agent import knowledge, policy\n"
+		"from erp_ai.constants import LESSON_DOCTYPE, LESSON_STATUS_ACTIVE\n\n\n"
+		"def relevant_lessons(subject, description):\n"
+		"\treturn frappe.get_all(LESSON_DOCTYPE, filters={'lesson_status': LESSON_STATUS_ACTIVE})\n"
+	),
+	"erp_ai_agent/doctype/erp_ai_lesson/erp_ai_lesson.py": (
+		"from frappe.model.document import Document\n\nfrom erp_ai.agent import lessons\n\n\n"
+		"class ERPAILesson(Document):\n\tpass\n"
+	),
+	RUNNER_FILE: (
+		'"""The runner; relevant_lessons gives the ERP AI Lesson rows of a step."""\n\n'
+		"from erp_ai.agent import lesson_read, policy\nfrom erp_ai.agent.prompts import build_classify_request\n\n\n"
+		"def _lessons(settings, subject, description):\n"
+		"\treturn lesson_read.relevant_lessons(subject, description)\n"
+	),
+	"agent/prompts.py": "from erp_ai.constants import LESSON_STATUS_ACTIVE\n",
+	HANDLERS_FILE: "from erp_ai.agent import lessons\n",
+	"agent/changes/transitions.py": "from erp_ai.agent import lessons\n",
+	"erp_ai_agent/doctype/erp_ai_lesson/erp_ai_lesson.json": json.dumps(
+		{
+			"permissions": [
+				{"role": "System Manager", "read": 1, "write": 0},
+				{"role": "ERP AI Instructor", "read": 1},
+			]
+		}
+	),
+	"erp_ai_agent/doctype/erp_ai_lesson_event/erp_ai_lesson_event.json": json.dumps(
+		{"istable": 1, "permissions": []}
+	),
+}
+
+
+class TestLessonArchitecture(unittest.TestCase):
+	"""FEAT-008 Task 10: the rules of ADR-045 and ADR-046 on the product, then each one's green and red samples."""
+
+	@classmethod
+	def setUpClass(cls):
+		cls.sources = load_product_sources()
+		cls.with_json = load_product_sources(suffixes=(".py", ".json"))
+
+	def assertCaught(self, violations, *fragments):
+		self.assertGreater(len(violations), 0, "scanner missed the violation")
+		for fragment in fragments:
+			self.assertTrue(any(fragment in text for text in violations), f"{fragment!r} not in {violations}")
+
+	def assertSamples(self, check, clean: dict, cases: dict):
+		"""`check` lets `clean` through and catches each case: `{case: (sources, fragment)}`."""
+		self.assertEqual(check(clean), [], "the clean sample is flagged")
+		for case, (sources, fragment) in cases.items():
+			with self.subTest(case=case):
+				self.assertCaught(check(sources), fragment)
+
+	def test_lesson_doctype_named_only_in_store_reader_controller(self):
+		# the allowance names files and folders the product has
+		for rel in LESSON_DOCTYPE_FILES:
+			self.assertIn(rel, self.sources)
+		for folder in LESSON_DOCTYPE_DIRS:
+			self.assertTrue(any(rel.startswith(folder) for rel in self.sources), folder)
+		self.assertEqual(check_lesson_doctype_named_only_in_store(self.sources), [])
+
+		changed = TestScannersCatchViolations.changed
+		clean = LESSON_RULES_SAMPLE
+		self.assertSamples(
+			check_lesson_doctype_named_only_in_store,
+			clean,
+			{
+				"the constant imported by the runner": (
+					changed(clean, RUNNER_FILE, "from erp_ai.constants import LESSON_DOCTYPE\n"),
+					f"{RUNNER_FILE}:9: names a lesson DocType",
+				),
+				"the constant read off the module": (
+					changed(
+						clean,
+						TASKS_FILE,
+						"from erp_ai import constants\n\nX = constants.LESSON_EVENT_DOCTYPE\n",
+					),
+					f"{TASKS_FILE}:3:",
+				),
+				"the name as a string": (
+					changed(
+						clean, HANDLERS_FILE, "\n\ndef f(frappe):\n\treturn frappe.get_all('ERP AI Lesson')\n"
+					),
+					f"{HANDLERS_FILE}:5:",
+				),
+				"the table in raw SQL": (
+					changed(clean, "agent/policy.py", "Q = 'select name from `tabERP AI Lesson Event`'\n"),
+					"agent/policy.py:1:",
+				),
+			},
+		)
+
+	def test_lesson_modules_import_direction(self):
+		self.assertEqual(check_lesson_import_direction(self.sources), [])
+
+		changed = TestScannersCatchViolations.changed
+		clean = LESSON_RULES_SAMPLE
+		cases = {
+			"agent core imports handlers": (
+				"agent/policy.py",
+				"from erp_ai import handlers\n",
+				"erp_ai.handlers",
+			),
+			"agent core imports tasks": ("agent/queue.py", "import erp_ai.tasks\n", "erp_ai.tasks"),
+			"agent core imports install": (
+				"agent/policy.py",
+				"from erp_ai.install import x\n",
+				"erp_ai.install",
+			),
+			"agent core imports eval": (
+				"agent/policy.py",
+				"from erp_ai.eval import run_eval\n",
+				"erp_ai.eval",
+			),
+			"agent core imports a controller": (
+				"agent/policy.py",
+				"from erp_ai.erp_ai_agent.doctype.erp_ai_lesson import erp_ai_lesson\n",
+				"erp_ai.erp_ai_agent",
+			),
+			"the store imports the runner": (
+				LESSONS_FILE,
+				"from erp_ai.agent import runner\n",
+				"erp_ai.agent.runner",
+			),
+			"the store imports the gateway": (LESSONS_FILE, "from erp_ai import gateway\n", "erp_ai.gateway"),
+			"the store imports the change job": (
+				LESSONS_FILE,
+				"from erp_ai.agent.changes import transitions\n",
+				"erp_ai.agent.changes",
+			),
+			"the reader imports the store": (
+				LESSON_READ_FILE,
+				"from erp_ai.agent import lessons\n",
+				LESSONS_MODULE,
+			),
+			"the reader imports the gateway": (LESSON_READ_FILE, "import erp_ai.gateway\n", "erp_ai.gateway"),
+			"prompts import the reader": (
+				"agent/prompts.py",
+				"from erp_ai.agent import lesson_read\n",
+				LESSON_READ_MODULE,
+			),
+			"a tool imports the store": (
+				"agent/tools/read.py",
+				"from erp_ai.agent.lessons import _store\n",
+				LESSONS_MODULE,
+			),
+			"the gateway imports the reader": (
+				"gateway/client.py",
+				"from erp_ai.agent.lesson_read import relevant_lessons\n",
+				LESSON_READ_MODULE,
+			),
+			"eval imports the store": ("eval/run_eval.py", "from ..agent import lessons\n", LESSONS_MODULE),
+		}
+
+		def extra_line(sources, rel):
+			"""The line `changed` appends to `rel` on."""
+			return sources.get(rel, "").count("\n") + 1
+
+		self.assertSamples(
+			check_lesson_import_direction,
+			clean,
+			{
+				case: (changed(clean, rel, extra), f"{rel}:{extra_line(clean, rel)}: imports {target}")
+				for case, (rel, extra, target) in cases.items()
+			},
+		)
+
+	def test_relevant_lessons_called_only_by_runner(self):
+		self.assertEqual(check_relevant_lessons_called_only_by_runner(self.sources), [])
+
+		changed = TestScannersCatchViolations.changed
+		clean = LESSON_RULES_SAMPLE
+		self.assertSamples(
+			check_relevant_lessons_called_only_by_runner,
+			clean,
+			{
+				"a tool calls the reader": (
+					changed(
+						clean,
+						"agent/tools/read.py",
+						"from erp_ai.agent import lesson_read\n\n\ndef f(s):\n\treturn lesson_read.relevant_lessons(s, '')\n",
+					),
+					"agent/tools/read.py:5: names relevant_lessons",
+				),
+				"the handlers import it": (
+					changed(
+						clean,
+						HANDLERS_FILE,
+						"from erp_ai.agent.lesson_read import relevant_lessons as pick\n",
+					),
+					f"{HANDLERS_FILE}:2:",
+				),
+				"a string path to it": (
+					changed(
+						clean, "hooks.py", "doc_events = {'x': 'erp_ai.agent.lesson_read.relevant_lessons'}\n"
+					),
+					"hooks.py:2:",
+				),
+				"the runner never calls it": (
+					changed(clean, RUNNER_FILE, replace=("lesson_read.relevant_lessons(", "list(")),
+					f"{RUNNER_FILE}: never calls lesson_read.relevant_lessons",
+				),
+			},
+		)
+
+	def test_lesson_doctypes_grant_no_write(self):
+		self.assertEqual(check_lesson_doctypes_grant_no_write(self.with_json), [])
+
+		changed = TestScannersCatchViolations.changed
+		clean = LESSON_RULES_SAMPLE
+		lesson_json, event_json = LESSON_DOCTYPE_JSONS
+		cases = {
+			right: (
+				changed(clean, lesson_json, replace=('"write": 0', f'"write": 0, "{right}": 1')),
+				f"{lesson_json}: role System Manager is granted {right}",
+			)
+			for right in LESSON_WRITE_RIGHTS
+		}
+		cases["a row of the event table"] = (
+			changed(
+				clean,
+				event_json,
+				replace=('"permissions": []', '"permissions": [{"role": "All", "create": 1}]'),
+			),
+			f"{event_json}: role All is granted create",
+		)
+		cases["a DocType file gone"] = ({lesson_json: clean[lesson_json]}, f"{event_json}: file missing")
+		self.assertSamples(check_lesson_doctypes_grant_no_write, clean, cases)
+
+	def test_active_status_condition_written_once(self):
+		self.assertEqual(check_active_status_condition_written_once(self.sources), [])
+
+		changed = TestScannersCatchViolations.changed
+		clean = LESSON_RULES_SAMPLE
+		self.assertSamples(
+			check_active_status_condition_written_once,
+			clean,
+			{
+				"a second filter": (
+					changed(
+						clean,
+						LESSON_READ_FILE,
+						"\n\ndef more():\n\treturn frappe.get_all(LESSON_DOCTYPE, filters=[['lesson_status', '=', LESSON_STATUS_ACTIVE]])\n",
+					),
+					"used 2 times",
+				),
+				"a check after the query": (
+					changed(
+						clean,
+						LESSON_READ_FILE,
+						"\n\ndef keep(row):\n\treturn row.lesson_status == LESSON_STATUS_ACTIVE\n",
+					),
+					f"{LESSON_READ_FILE}:12: {LESSON_ACTIVE_CONSTANT} outside a {LESSON_STATUS_FIELD} filter",
+				),
+				"the literal text": (
+					changed(
+						clean,
+						LESSON_READ_FILE,
+						replace=(
+							"'lesson_status': LESSON_STATUS_ACTIVE",
+							f"'lesson_status': '{LESSON_STATUS_ACTIVE}'",
+						),
+					),
+					f"the text of {LESSON_ACTIVE_CONSTANT}",
+				),
+				"no condition at all": (
+					changed(
+						clean,
+						LESSON_READ_FILE,
+						replace=("filters={'lesson_status': LESSON_STATUS_ACTIVE}", "limit=5"),
+					),
+					"used 0 times",
+				),
+				"the reader gone": (
+					{CONSTANTS_FILE: clean[CONSTANTS_FILE]},
+					f"{LESSON_READ_FILE}: file missing",
+				),
 			},
 		)
 

@@ -3,7 +3,7 @@ import json
 import frappe
 from frappe.core.utils import html_to_plain_text
 
-from erp_ai.agent import lifecycle, messages, policy
+from erp_ai.agent import lessons, lifecycle, messages, policy
 from erp_ai.agent.queue import enqueue_agent_run, enqueue_lifecycle_job, requester_reply_key
 from erp_ai.agent.run_log import EVENT_CODES, record_event
 from erp_ai.constants import (
@@ -115,10 +115,15 @@ def ticket_validate(doc, method=None):
 			_record_created_labels(doc)
 		else:
 			_freeze_created_labels(doc)
-	# The flag carries the name of the classify log row to update; stale on a re-used doc object.
+	# The flags carry the name of the classify log row to update and the fields this save changed; stale on a
+	# re-used doc object.
 	doc.flags.erp_ai_human_corrected = None
+	doc.flags.erp_ai_corrected_fields = None
 	# Runs for every ticket save: leave before any DB read unless a classification field changed.
-	if doc.is_new() or not any(doc.has_value_changed(field) for field in CLASSIFICATION_FIELDS):
+	if doc.is_new():
+		return
+	changed = [field for field in CLASSIFICATION_FIELDS if doc.has_value_changed(field)]
+	if not changed:
 		return
 
 	# The session alone tells the bot's write from a person's (AC-21).
@@ -132,13 +137,17 @@ def ticket_validate(doc, method=None):
 		_log_decision(doc.name, TRIGGER_HUMAN_CORRECTION, "recorded", "human_changed_before_prediction")
 		return
 	doc.flags.erp_ai_human_corrected = reference
+	# R9: a lesson only for what the person changed in this save, never for the fields they left as they were.
+	doc.flags.erp_ai_corrected_fields = changed
 
 
 def _record_human_correction(doc):
 	log_name = doc.flags.erp_ai_human_corrected
 	if doc.flags.in_insert or not log_name:
 		return
+	changed = doc.flags.erp_ai_corrected_fields or []
 	doc.flags.erp_ai_human_corrected = None
+	doc.flags.erp_ai_corrected_fields = None
 
 	values = {
 		"human_corrected_to": json.dumps({field: doc.get(field) for field in CLASSIFICATION_FIELDS}),
@@ -148,6 +157,7 @@ def _record_human_correction(doc):
 		values["human_corrected_at"] = frappe.utils.now_datetime()
 	frappe.db.set_value(LOG_DOCTYPE, log_name, values, update_modified=False)
 	_log_decision(doc.name, TRIGGER_HUMAN_CORRECTION, "recorded", "human_changed_classification")
+	lessons.safely(lessons.record_correction, doc.name, log_name, changed)
 
 
 def _kb_draft_skip(doc) -> str | None:
@@ -263,6 +273,8 @@ def comment_after_insert(doc, method=None):
 def message_after_insert(doc, method=None):
 	# Only a person's message starts a run; the bot's own reply is told by its owner, before any DB read.
 	ticket = doc.ticket
+	if doc.owner != AGENT_USER and (rule := lessons.teaching_rule(doc.content)):
+		lessons.safely(lessons.record_teaching_message, ticket, doc.name, rule)
 	skip_reason = None
 	if doc.owner == AGENT_USER:
 		skip_reason = "written_by_agent"
@@ -339,3 +351,48 @@ def task_on_update(doc, method=None):
 		return
 	enqueue_lifecycle_job(ticket)
 	_log_decision(ticket, TRIGGER_TASK_STATUS, "enqueued", "conditions_met")
+
+
+def todo_after_insert(doc, method=None):
+	"""AC-6: a person assigns a ticket the bot had already assigned to someone else, so that is a lesson; giving
+	it back to the bot's pick retires that lesson (I5)."""
+	# Fires for every ToDo on the site; return before any DB read.
+	ticket, new_user = doc.reference_name, doc.allocated_to
+	if doc.reference_type != policy.TICKET_DOCTYPE or not ticket or not new_user:
+		return
+	# I2: an Assignment Rule (round robin of the team) made this ToDo inside the person's request, not their choice.
+	if doc.assignment_rule:
+		return
+	if frappe.session.user == AGENT_USER:
+		return
+	bot_user = frappe.db.get_value(
+		"ToDo",
+		{
+			"reference_type": policy.TICKET_DOCTYPE,
+			"reference_name": ticket,
+			"assigned_by": AGENT_USER,
+			"name": ("!=", doc.name),
+		},
+		"allocated_to",
+		order_by="creation desc",
+	)
+	if not bot_user or _bot_pick_was_default(ticket):
+		return
+	lessons.safely(lessons.record_assignee_change, ticket, bot_user, new_user)
+
+
+def _bot_pick_was_default(ticket: str) -> bool:
+	"""CHG-015: the bot's latest applied route gave the ticket to the Setting's default person, which no rule chose; a
+	person passing it on is no lesson about the bot's pick (FEAT-008 AC-6)."""
+	rows = frappe.get_all(
+		LOG_DOCTYPE,
+		filters={"ticket": ticket, "entry_type": "classify", "applied": 1},
+		fields=["actions"],
+		order_by="creation desc",
+		limit=1,
+	)
+	actions = json.loads(rows[0].actions or "[]") if rows else []
+	return any(
+		action.get("tool") == "assign_owner" and action.get("ok") and action.get("rule") == "default"
+		for action in actions
+	)

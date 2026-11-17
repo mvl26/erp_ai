@@ -9,7 +9,7 @@ import frappe
 from frappe.tests.utils import FrappeTestCase
 from helpdesk.test_utils import make_ticket
 
-from erp_ai.agent import labels, ops_data, runner
+from erp_ai.agent import ops_data, runner
 from erp_ai.agent.classification import DEFAULT_CATEGORY_MAPPING
 from erp_ai.agent.prompts import build_classify_request
 from erp_ai.agent.routing import decide_route
@@ -18,7 +18,13 @@ from erp_ai.eval import run_eval
 from erp_ai.eval.run_eval import _predict, compute_metrics, format_report
 from erp_ai.eval.run_eval import run as run_eval_run
 from erp_ai.gateway import GatewayError
-from erp_ai.test_utils import FakeGateway, make_model_result, make_routing_rules, set_agent_settings
+from erp_ai.test_utils import (
+	FakeGateway,
+	make_model_result,
+	make_routing_rules,
+	set_agent_settings,
+	set_tag_assignees,
+)
 
 PREFIX = "ERPAI-TEST-"
 
@@ -328,11 +334,11 @@ class TestRunEvalRun(FrappeTestCase):
 		set_agent_settings(
 			category_mapping=json.dumps(DEFAULT_CATEGORY_MAPPING), routing_rules=make_routing_rules()
 		)
-		# ADR-049: the runner's label inputs are the site's live modules and tags; the offline eval has none, so the
-		# shared builder is compared without them (STD-TEST-6)
-		label_patch = patch.object(labels, "classify_inputs", return_value=labels.LabelInputs())
-		label_patch.start()
-		self.addCleanup(label_patch.stop)
+		# learning off: no lesson of the shared site reaches the runner's request (NFR-7, FEAT-008 ruling R7)
+		set_agent_settings(lessons_enabled=0)
+		# CHG-014: the runner's tag choices are the site's tag table; the offline eval has none, so the shared builder
+		# is compared with an empty table (STD-TEST-6, rolled back)
+		set_tag_assignees()
 
 	def _write(self, rows):
 		with open(self.path, "w", encoding="utf-8") as handle:
@@ -556,7 +562,13 @@ class TestRunEvalRun(FrappeTestCase):
 		runner_kwargs, eval_kwargs = runner_route.call_args.kwargs, eval_route.call_args.kwargs
 		# eval measures the model and the mapping, not the due-date exceptions or the D watcher (design-w0-fixes-2.md:157)
 		self.assertEqual(set(eval_kwargs), shared)
-		self.assertEqual(set(runner_kwargs), shared | {"due_at", "due_field_configured", "d_watcher", "now"})
+		# CHG-011, CHG-015: the runner also passes the ticket's tags, the tag table and the default person; eval measures
+		# no assignee
+		self.assertEqual(
+			set(runner_kwargs),
+			shared
+			| {"due_at", "due_field_configured", "d_watcher", "now", "tags", "tag_rules", "default_assignee"},
+		)
 		# R23a: the runner passes its probe of excluded teams (U2.md:168), eval policy.is_excluded_team itself; the
 		# same keys, that one value compared by its answers
 		same = shared - {"is_excluded_team"}

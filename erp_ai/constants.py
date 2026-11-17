@@ -7,6 +7,8 @@ SETTING_DOCTYPE = "ERP AI Setting"
 CREDENTIAL_DOCTYPE = "ERP AI Credential"
 LOG_DOCTYPE = "ERP AI Log"
 PROPOSAL_DOCTYPE = "ERP AI Change Proposal"
+# CHG-011: one row of the table of tag → person on ERP AI Setting (field tag_assignees).
+TAG_ASSIGNEE_DOCTYPE = "ERP AI Tag Assignee"
 
 LEVELS = ("L0", "L1", "L2", "L3")
 CATEGORIES = ("A", "B", "C", "D", "E", "F")
@@ -87,6 +89,8 @@ RESTART_STATUS_LAUNCH_FAILED = "Lỗi khởi chạy"
 CHANGE_MAX_FILE_OPS = 50
 CHANGE_MAX_TOTAL_BYTES = 8 * 1024 * 1024
 CHANGE_MAX_COMMANDS = 6
+CONSOLE_COMMAND = "console"
+CONSOLE_SCRIPT_MAX_CHARS = 20000
 CHANGE_FILE_MAX_BYTES = 2 * 1024 * 1024
 RESTART_WEB_STOP_S = 40
 RESTART_TIMEOUT_S = JOB_TIMEOUT_S + RESTART_WEB_STOP_S + JOB_SAFETY_MARGIN_S
@@ -95,6 +99,19 @@ RESTART_LAUNCH_TIMEOUT_S = 10
 # The conversation between people and the bot lives in this DocType, not in HD Ticket comments. What the bot
 # concluded and did on a ticket is ticket information (its fields), never a message here.
 MESSAGE_DOCTYPE = "ERP AI Message"
+
+# FEAT-008: the bot's lesson store (ERP AI Lesson and its history rows).
+LESSON_DOCTYPE = "ERP AI Lesson"
+LESSON_EVENT_DOCTYPE = "ERP AI Lesson Event"
+LESSON_STATUS_PENDING = "Chờ duyệt"
+LESSON_STATUS_ACTIVE = "Đang dùng"
+LESSON_STATUS_DISABLED = "Đã tắt"
+LESSON_STATUS_REJECTED = "Bị từ chối"
+LESSON_SOURCE_CORRECTION = "Người sửa"
+LESSON_SOURCE_RESOLVED = "Phiếu đã giải quyết"
+LESSON_SOURCE_TEACHING = "Người dạy"
+LESSON_SOURCE_OUTCOME = "Kết quả duyệt và rà soát"
+LESSON_STEPS = ("Tạo", "Cập nhật", "Duyệt", "Từ chối", "Tắt", "Bật")
 
 # CHG-009 (design 2, 3.8; ADR-048): the run_event row of ERP AI Log, its event codes, the codes of a refused call
 # or an early stop, how long a received call may wait, the Error Log title of a failed event write.

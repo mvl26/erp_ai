@@ -371,10 +371,11 @@ class TestRegistry(FrappeTestCase):
 				("below_threshold", False),
 				("reply_enabled", False),
 				("kb_draft_run", False),
+				("console", False),  # CHG-010
 				("in_conversation", False),
 			],
 		)
-		self.assertEqual(len(fields), 19)
+		self.assertEqual(len(fields), 20)  # CHG-010: + console
 
 	def test_grant_functions_take_grant_inputs_without_default(self):
 		for function in (registry.grant, get_tool_schemas):
@@ -470,7 +471,12 @@ TOOLS_BY_MODULE = {
 		"post_comment",
 		"create_task",
 	],
-	"erp_ai.agent.tools.propose_change": ["propose_file_change", "propose_new_file", "propose_bench_command"],
+	"erp_ai.agent.tools.propose_change": [
+		"propose_file_change",
+		"propose_new_file",
+		"propose_bench_command",
+		"propose_console_script",  # CHG-010
+	],
 	"erp_ai.agent.tools.site_api": [
 		"api_list_records",
 		"api_get_record",
@@ -518,7 +524,7 @@ class TestRealToolSet(FrappeTestCase):
 		for level in ("L1", "L2", "L3"):
 			self.assertEqual(self.names(level, False), granted + KNOWLEDGE_NAMES)
 			self.assertEqual(self.names(level, True), granted + TASK_WRITE_TOOL_NAMES + KNOWLEDGE_NAMES)
-		self.assertEqual(len(registry._all_specs()), 27)
+		self.assertEqual(len(registry._all_specs()), 28)  # CHG-010: + propose_console_script
 
 	def test_tool_modules_register_exactly_the_21_tools(self):
 		# Spec Amendment 2, N-3 items 18-19: 11 base + 3 propose + 4 record + 3 full-power tools; FEAT-007 T155
@@ -529,7 +535,7 @@ class TestRealToolSet(FrappeTestCase):
 			module = importlib.import_module(module_name)
 			self.assertEqual([spec.name for spec in module.TOOLS], names, module_name)
 		expected = [name for names in TOOLS_BY_MODULE.values() for name in names]
-		self.assertEqual(len(expected), 27)
+		self.assertEqual(len(expected), 28)  # CHG-010: + propose_console_script
 		self.assertEqual([spec.name for spec in registry._all_specs()], expected)
 
 	def test_switch_on_adds_site_admin_tools_only_at_l3_with_instructor(self):
@@ -550,6 +556,48 @@ class TestRealToolSet(FrappeTestCase):
 			self.assertEqual(
 				[s["name"] for s in schemas], [*names, *KNOWLEDGE_NAMES], (level, has_instructor)
 			)
+
+	def test_console_tool_granted_exactly_with_switch_l3_and_instructor(self):
+		# CHG-010: the console group follows its own switch, not code_change
+		for console, level, has_instructor in itertools.product(
+			(False, True), ("L1", "L2", "L3"), (False, True)
+		):
+			inputs = registry.GrantInputs(
+				level, level, has_instructor, PermissionSwitches(console=console, act_now=True)
+			)
+			granted = registry.grant(inputs)
+			key = (console, level, has_instructor)
+			self.assertEqual(
+				"propose_console_script" in granted.names(), console and level == "L3" and has_instructor, key
+			)
+			self.assertIs(granted.console_block, console and level == "L3" and has_instructor, key)
+			self.assertFalse(granted.change_block, key)
+			self.assertFalse(granted.names() & set(CHANGE_TOOL_NAMES), key)
+			self.assertIs(granted.act_now_block, granted.console_block, key)
+
+	def test_console_group_needs_confidence_and_no_kb_draft_run(self):
+		on = PermissionSwitches(console=True)
+		for kwargs in ({"below_threshold": True}, {"kb_draft_run": True}):
+			inputs = registry.GrantInputs("L3", "L3", True, on, **kwargs)
+			self.assertNotIn("propose_console_script", registry.grant(inputs).names(), kwargs)
+
+	def test_console_alongside_code_change_keeps_both_blocks(self):
+		inputs = registry.GrantInputs(
+			"L3", "L3", True, PermissionSwitches(console=True, code_change=True, act_now=False)
+		)
+		granted = registry.grant(inputs)
+		self.assertTrue(granted.change_block and granted.console_block)
+		self.assertFalse(granted.act_now_block)
+		self.assertTrue((set(CHANGE_TOOL_NAMES) | {"propose_console_script"}) <= granted.names())
+
+	def test_tool_context_carries_console_into_grant_inputs(self):
+		context = ToolContext(
+			ticket_name="T", effective_level="L3", instructor="x@example.com", run_id="r",
+			category_mapping={}, agent_user="a@example.com", console=True,
+		)  # fmt: skip
+		self.assertTrue(context.grant_inputs().switches.console)
+		self.assertFalse(dataclasses.replace(context, console=False).grant_inputs().switches.console)
+		self.assertIs(ToolContext.__dataclass_fields__["console"].default, False)
 
 	def test_switch_off_tool_names_match_base_for_all_levels_and_authority(self):
 		# AC-1: switch off = the exact tool names of the FEAT-006 base, written out as literals.
@@ -674,6 +722,7 @@ class TestRealToolsRunWithoutCommit(FrappeTestCase):
 			},
 			"propose_new_file": {"path": f"{SANDBOX_APP}/t27.md", "content": "x", "reason": "ERPAI-TEST-T27"},
 			"propose_bench_command": {"command": "version", "reason": "ERPAI-TEST-T27"},
+			"propose_console_script": {"script": "print(1)", "reason": "ERPAI-TEST-T27"},  # CHG-010
 			"api_list_records": {"doctype": "HD Ticket", "filters": [["name", "=", str(self.ticket)]]},
 			"api_get_record": {"doctype": "HD Ticket", "name": str(self.ticket)},
 			"api_create_record": {"doctype": "Note", "values": {"title": "ERPAI-TEST-T27 ghi chú"}},
@@ -704,6 +753,7 @@ class TestRealToolsRunWithoutCommit(FrappeTestCase):
 			change_enabled=True,
 			allowed_apps=(SANDBOX_APP,),
 			unrestricted=True,
+			console=True,  # CHG-010
 		)
 		# FEAT-007 T155: the reply tool runs with its switch on, the KB-draft tool in its fixed row (read + kb_draft
 		# only); the knowledge read tools need seeded site settings and run in test_knowledge_read, so the real
@@ -893,6 +943,7 @@ class TestGrantTable(FrappeTestCase):
 				"ticket_write",
 				"task_write",
 				"change_propose",
+				"console_propose",  # CHG-010
 				"site_admin",
 				"site_unrestricted",
 				"requester_reply",

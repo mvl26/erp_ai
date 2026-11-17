@@ -10,7 +10,7 @@ from frappe.model.document import Document
 from erp_ai import gateway
 from erp_ai.agent import policy, run_log
 from erp_ai.agent.agent_write_guard import refuse_agent_write
-from erp_ai.agent.classification import validate_mapping
+from erp_ai.agent.classification import clean_label, validate_mapping
 from erp_ai.agent.hard_bans import hard_ban_reason
 from erp_ai.agent.routing import validate_routing_config
 from erp_ai.agent.text_lines import filled_lines
@@ -156,6 +156,8 @@ def _permission_switch_fields() -> tuple:
 	return policy.PERMISSION_SWITCH_FIELDS
 
 
+# CHG-014: the reason a tag name of the tag table is refused (the rule of erp_ai.agent.classification.clean_label).
+TAG_NAME_REASON = "tên tag phải dài 2 đến 40 ký tự, chỉ gồm chữ, số, khoảng trắng và & ( ) + . / # -"
 EMPTY_DATETIME = datetime(1, 1, 1)  # what frappe.utils.cast returns for an empty Datetime
 
 
@@ -180,6 +182,8 @@ class ERPAISetting(Document):
 		self.check_labels()
 		validate_mapping(self.category_mapping)
 		self.check_routing_rules()
+		self.check_tag_assignees()
+		self.check_default_assignee()
 		policy.validate_change_apps(self, source.get_source_root())
 		self.check_limits()
 		self.check_status_settings()
@@ -192,6 +196,7 @@ class ERPAISetting(Document):
 		self.check_operation_people()
 		self.check_kpi_targets()
 		self.check_prompt_overrides()
+		self.check_lesson_limits()
 		self.record_prompt_revisions()
 		self.stamp_agent_enabled_at()
 
@@ -356,6 +361,30 @@ class ERPAISetting(Document):
 	def check_routing_rules(self):
 		validate_routing_config(self.routing_rules)
 
+	def check_tag_assignees(self):
+		"""CHG-011: refuse the first tag row that gives the bot account or repeats a (tag, category) pair."""
+		seen = {}
+		for row in self.get("tag_assignees") or []:
+			# CHG-014: the tag is typed freely and cleaned like a label the bot gives
+			label = clean_label(row.tag)
+			if label is None:
+				reason = TAG_NAME_REASON
+			elif (row.assignee or "").strip().casefold() == AGENT_USER.casefold():
+				reason = "không gán tài khoản agent"
+			else:
+				row.tag = label
+				key = (label.casefold(), row.category or "")
+				reason = f"trùng với dòng {seen[key]}" if key in seen else None
+				seen.setdefault(key, row.idx)
+			if reason:
+				frappe.throw(f"Gán người theo tag dòng {row.idx}: {reason}")
+
+	def check_default_assignee(self):
+		"""CHG-015: the person a ticket no rule gives goes to is never the bot account."""
+		person = (self.get("default_assignee") or "").strip()
+		if person and person.casefold() == AGENT_USER.casefold():
+			frappe.throw("Người nhận mặc định không được là tài khoản agent")
+
 	def check_limits(self):
 		for fieldname, (label, low, high) in INT_LIMITS.items():
 			value = self.get(fieldname) or 0
@@ -483,6 +512,12 @@ class ERPAISetting(Document):
 		error = kpi_targets_error(self.kpi_targets)
 		if error:
 			frappe.throw(f"Mục tiêu KPI: {error}")
+
+	def check_lesson_limits(self):
+		"""FEAT-008: the lesson caps stay inside their ranges."""
+		errors = policy.lesson_limit_errors(self)
+		if errors:
+			frappe.throw("<br>".join(errors))
 
 	def check_prompt_overrides(self):
 		"""AC-38, E-10: each set override, in form order, within the length limit, then keeping its markers."""

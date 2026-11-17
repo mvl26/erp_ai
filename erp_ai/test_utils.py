@@ -26,10 +26,13 @@ from erp_ai.constants import (
 	CHANGE_STATUS_PENDING,
 	CORE_APPS,
 	HELPDESK_AGENT_ROLE,
+	LESSON_DOCTYPE,
+	LESSON_EVENT_DOCTYPE,
 	OPERATION_DOCTYPE,
 	PROPOSAL_DOCTYPE,
 	ROLE_AGENT,
 	SETTING_DOCTYPE,
+	TAG_ASSIGNEE_DOCTYPE,
 )
 from erp_ai.gateway import GatewayError, ModelResult
 
@@ -123,6 +126,14 @@ def set_agent_settings(**fields) -> None:
 	"""Set ERP AI Setting values directly in the DB (no validate), for tests."""
 	for fieldname, value in fields.items():
 		frappe.db.set_single_value(SETTING_DOCTYPE, fieldname, value)
+
+
+def clear_lesson_store() -> None:
+	"""Delete every ERP AI Lesson and ERP AI Lesson Event row inside the current transaction, so a test sees only the
+	lessons it makes, whatever the shared site holds (NFR-7). Never commits: the test's rollback brings the rows back.
+	"""
+	frappe.db.delete(LESSON_EVENT_DOCTYPE)
+	frappe.db.delete(LESSON_DOCTYPE)
 
 
 def keep_agent_settings(testcase) -> None:
@@ -292,6 +303,37 @@ def pin_agent_roles(testcase) -> None:
 				}
 			).db_insert()
 	frappe.clear_cache(user=AGENT_USER)
+
+
+def make_tag(name: str, description: str = "") -> str:
+	"""Insert the Tag `name` when it is missing and return the name. Rolled back by the test."""
+	if not frappe.db.exists("Tag", name):
+		frappe.get_doc({"doctype": "Tag", "name": name, "description": description}).insert(
+			ignore_permissions=True
+		)
+	return name
+
+
+def set_tag_assignees(*rows: tuple) -> None:
+	"""Replace the `tag_assignees` rows of ERP AI Setting in the DB (no validate), for tests (CHG-011); each row is
+	(tag, person, category) or (tag, person, category, description); the description defaults to "x" (CHG-014).
+	`keep_agent_settings` puts the old rows back."""
+	frappe.db.delete(TAG_ASSIGNEE_DOCTYPE, {"parent": SETTING_DOCTYPE, "parenttype": SETTING_DOCTYPE})
+	for idx, (tag, assignee, category, *rest) in enumerate(rows, start=1):
+		frappe.get_doc(
+			{
+				"doctype": TAG_ASSIGNEE_DOCTYPE,
+				"parent": SETTING_DOCTYPE,
+				"parenttype": SETTING_DOCTYPE,
+				"parentfield": "tag_assignees",
+				"idx": idx,
+				"tag": tag,
+				"assignee": assignee,
+				"category": category,
+				"description": rest[0] if rest else "x",
+			}
+		).db_insert()
+	frappe.clear_document_cache(SETTING_DOCTYPE, SETTING_DOCTYPE)
 
 
 def make_routing_rules(**overrides) -> str:

@@ -1202,3 +1202,35 @@ class TestTagMatchNfc(FrappeTestCase):
 			(routing.TagRule("chấm công", "cc@x.com", ""),),
 		)
 		self.assertEqual((d.assignee, d.assignee_tag), ("cc@x.com", "chấm công"))
+
+
+# CHG-018 (spec 2026-11-17-bot-new-tag-design.md, design 1): a row without a person is a tag of the list that gives
+# nobody; the ticket goes on to the next row, the routing rules and the default person.
+class TestTagRowWithoutPerson(FrappeTestCase):
+	def test_row_without_a_person_is_kept(self):
+		settings = frappe._dict(
+			tag_assignees=[frappe._dict(tag="kế toán", assignee=None, category=None, description="Hóa đơn")]
+		)
+		self.assertEqual(routing.tag_rules(settings), (routing.TagRule("kế toán", "", "", "Hóa đơn"),))
+
+	# review fix I1: the description of a bot row nobody has read stays out of the classify request
+	def test_unreviewed_bot_row_gives_its_tag_without_its_description(self):
+		settings = frappe._dict(
+			tag_assignees=[
+				frappe._dict(tag="kế toán", assignee=None, category=None, description="bot", bot_added=1),
+				frappe._dict(tag="hr", assignee="a@x.com", category=None, description="Nhân sự", bot_added=0),
+			]
+		)
+		self.assertEqual(
+			routing.tag_rules(settings),
+			(routing.TagRule("kế toán", "", "", ""), routing.TagRule("hr", "a@x.com", "", "Nhân sự")),
+		)
+
+	def test_row_without_a_person_is_passed_over_with_a_note(self):
+		rules = (routing.TagRule("kế toán", "", "", "x"), routing.TagRule("kế toán", "hieu@x.com", "", "x"))
+		d = _decide_by_tags("C", ("kế toán",), rules)
+		self.assertEqual((d.assignee, d.assignee_tag), ("hieu@x.com", "kế toán"))
+		self.assertEqual(_assignee_notes(d), ["tag kế toán: chưa có người nhận"])
+		d = _decide_by_tags("C", ("kế toán",), rules[:1])
+		self.assertEqual((d.assignee, d.assignee_tag), ("c.default@x.com", None))
+		self.assertEqual(_assignee_notes(d), ["tag kế toán: chưa có người nhận"])

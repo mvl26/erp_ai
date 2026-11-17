@@ -330,14 +330,16 @@ DOCTYPE_CONFIG = {
 	# CHG-011: one row of the table of tag → person (child of ERP AI Setting).
 	"ERP AI Tag Assignee": {
 		"folder": "erp_ai_tag_assignee",
-		# CHG-014: + description (the tag table is the list of tags the bot gives)
-		"field_count": 4,
+		# CHG-014: + description (the tag table is the list of tags the bot gives); CHG-018: + bot_added
+		"field_count": 5,
 		"phrases": {
 			"tag": ("bot tự tạo", "không phân biệt hoa thường", "không dấu phẩy"),
 			# CHG-016: the bot reads the first 200 characters
 			"description": ("đúng một tag", "dòng đầu tiên", "không nêu tên người", "200 ký tự"),
-			"assignee": ("HD Agent", "tài khoản agent", "bỏ qua"),
+			"assignee": ("HD Agent", "tài khoản agent", "bỏ qua", "Để trống"),
 			"category": ("Để trống", "mọi đầu mục", "dòng nằm trên"),
+			# CHG-018: the bot's rows wait for a System Manager's review
+			"bot_added": ("chỉ đưa tên tag", "bỏ đánh dấu", "tối đa 20"),
 		},
 		"section_count": 2,
 		"read_only_fields": (),

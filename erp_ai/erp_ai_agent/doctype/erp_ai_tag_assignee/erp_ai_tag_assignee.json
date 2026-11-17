@@ -10,7 +10,8 @@
   "description",
   "assignee",
   "section_scope",
-  "category"
+  "category",
+  "bot_added"
  ],
  "fields": [
   {
@@ -27,7 +28,7 @@
    "reqd": 1
   },
   {
-   "description": "Việc nào thuộc tag này, ví dụ: chấm công, bảng công, đi muộn, nghỉ phép. Bot đọc 200 ký tự đầu của mô tả để chọn đúng một tag cho phiếu mới; tag có nhiều dòng thì dùng mô tả ở dòng đầu tiên. Viết về loại việc, không nêu tên người.",
+   "description": "Việc nào thuộc tag này, ví dụ: chấm công, bảng công, đi muộn, nghỉ phép. Bot đọc 200 ký tự đầu của mô tả để chọn đúng một tag cho phiếu mới; tag có nhiều dòng thì dùng mô tả ở dòng đầu tiên. Không tag nào hợp thì bot tự đặt tag mới và thêm dòng cuối bảng với mô tả do bot viết. Viết về loại việc, không nêu tên người.",
    "fieldname": "description",
    "fieldtype": "Small Text",
    "in_list_view": 1,
@@ -35,13 +36,12 @@
    "reqd": 1
   },
   {
-   "description": "HD Agent nhận phiếu mang tag này và Task C/D của phiếu. Không được là tài khoản agent; người không còn là HD Agent đang hoạt động thì bot bỏ qua dòng này.",
+   "description": "HD Agent nhận phiếu mang tag này và Task C/D của phiếu. Không được là tài khoản agent; người không còn là HD Agent đang hoạt động thì bot bỏ qua dòng này. Để trống: tag chưa có người nhận, phiếu đi tiếp theo routing_rules rồi Người nhận mặc định. Dòng bot tự thêm (tag mới) luôn để trống ô này.",
    "fieldname": "assignee",
    "fieldtype": "Link",
    "in_list_view": 1,
    "label": "Người phụ trách",
-   "options": "HD Agent",
-   "reqd": 1
+   "options": "HD Agent"
   },
   {
    "fieldname": "section_scope",
@@ -55,11 +55,19 @@
    "in_list_view": 1,
    "label": "Đầu mục",
    "options": "\nA\nB\nC\nD\nE\nF"
+  },
+  {
+   "default": "0",
+   "description": "Bot tự thêm dòng này khi tạo tag mới (CHG-018). Khi còn đánh dấu, bot chỉ đưa tên tag vào yêu cầu phân loại, không đưa Mô tả (Mô tả do bot viết từ nội dung phiếu). Đọc lại tên và Mô tả, sửa nếu cần, rồi bỏ đánh dấu. Bảng có tối đa 20 dòng bot tạo chưa duyệt; đủ 20 thì bot vẫn gắn tag lên phiếu nhưng không thêm dòng.",
+   "fieldname": "bot_added",
+   "fieldtype": "Check",
+   "in_list_view": 1,
+   "label": "Bot tạo, chưa duyệt"
   }
  ],
  "istable": 1,
  "links": [],
- "modified": "2026-11-17 16:00:00.000000",
+ "modified": "2026-11-17 21:00:00.000000",
  "modified_by": "Administrator",
  "module": "ERP AI agent",
  "name": "ERP AI Tag Assignee",

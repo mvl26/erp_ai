@@ -167,6 +167,10 @@ ROUTE_ASSIGNED_BY_TAG = "Đã gán cho {person} (theo tag {tag})."
 # CHG-016: why the model's answered tag was not given.
 LABEL_NOT_IN_TABLE = "tag {tag} không có trong bảng Gán người theo tag"
 LABEL_AGENT_TAGGED = "phiếu đã có tag do HD Agent gắn"
+# CHG-018: why an answered tag outside the table did not become a new tag.
+LABEL_NO_DESCRIPTION = "tag {tag} không có trong bảng Gán người theo tag và thiếu mô tả để tạo tag mới"
+LABEL_NO_NEW_TAG_NOISE = "phiếu đầu mục F không nhận tag mới"
+LABEL_BAD_NEW_TAG = "tag mới sai luật đặt tên nên không được gắn"
 # CHG-015: no rule gave a person; the Setting's default took the ticket.
 ROUTE_ASSIGNED_BY_DEFAULT = "Đã gán cho {person} (người nhận mặc định)."
 ROUTE_TASK = "Đã tạo Task {task}."
@@ -174,6 +178,9 @@ ROUTE_WATCHER = "Đã thêm {person} làm người theo dõi."
 # ADR-049: the labels the route gave the ticket (Helpdesk Tags)
 LABELS_TOOL = "add_labels"
 ROUTE_LABELS = "Bot đã gắn nhãn: {labels}."
+# CHG-018: (u1c) the new tag the bot gave goes at the end of the tag table, without a person
+TAG_ROW_TOOL = "add_tag_row"
+ROUTE_TAG_ROW_ADDED = "Đã thêm tag {tag} vào bảng Gán người theo tag (chưa có người nhận)."
 # (u5) the D watcher (AC-27, U4b-fixes Fix 6)
 WATCHER_TOOL = "add_watcher"
 REASON_ALREADY_FOLLOWING = "đã theo dõi"
@@ -845,6 +852,8 @@ def _classify(
 				later_messages=later_messages,
 				lessons=lessons,
 				tag_choices=choices,
+				# CHG-018: no tag of the table fits → the model names and describes a new one
+				new_tags=True,
 			),
 			max_tokens=CLASSIFY_MAX_TOKENS,
 			deadline=deadline,
@@ -875,19 +884,28 @@ def _classify(
 		write_entry(**base, **call_fields, error=error, stop_reason="unparseable")
 		_log_classify(ticket_name, run_id, False, ticket.creation)
 		return True, None, context
-	# CHG-014: one tag of the table, spelled as the table; none when an HD Agent already tagged the ticket
+	# CHG-014: one tag of the table, spelled as the table; none when an HD Agent already tagged the ticket.
+	# CHG-018: no tag of the table answered → the model's new tag, its description kept for the table row
 	agent = ticket_labels.agent_tags(ticket_name, site_facts.is_active_agent)
 	answered = classification.labels
+	described = classification.label_description
+	picked = () if agent else ticket_labels.chosen_tag(answered, choices)
+	made = None
+	if not agent and not picked:
+		made = ticket_labels.new_tag(answered, described, classification.category, choices)
 	classification = dataclasses.replace(
-		classification, labels=() if agent else ticket_labels.chosen_tag(answered, choices)
+		classification,
+		labels=picked or ((made[0],) if made else ()),
+		label_description=made[1] if made else "",
 	)
 	# CHG-016: an answered tag the bot does not give leaves its reason in the log
 	label_note = None
 	if answered and not classification.labels:
-		label_note = {
-			"field": "nhan",
-			"reason": LABEL_AGENT_TAGGED if agent else LABEL_NOT_IN_TABLE.format(tag=answered[0]),
-		}
+		reason = _label_reason(answered[0], agent, classification.category, described)
+		label_note = {"field": "nhan", "reason": reason}
+	elif described and not answered and not agent:
+		# a description without a usable tag: the new tag's name broke the rule and was dropped when parsed
+		label_note = {"field": "nhan", "reason": LABEL_BAD_NEW_TAG}
 
 	# U2 (AC-9 b, U2.md:164-172): the team the department maps to is learnt from the predicate decide_route asks
 	probe_hits = []
@@ -1092,7 +1110,7 @@ def _route(
 	if locked_rows(ticket, LOG_DOCTYPE, {"ticket": ticket, "entry_type": "classify", "applied": 1}):
 		return _route_skipped(log_name, decision, context)
 	actions, lines, errors = [], [], []
-	assigned = task = watcher = commented = split = None
+	assigned = task = watcher = commented = split = tag_row = None
 	labelled = []
 	sla = None
 	frappe.db.savepoint(ROUTE_SAVEPOINT)
@@ -1100,6 +1118,7 @@ def _route(
 		result = _apply_route_unit(decision, classification, context, actions, errors)
 		if result:
 			labelled = _labels_unit(classification.labels, context, actions, errors)
+			tag_row = _tag_row_unit(classification, labelled, context, actions, errors)
 			sla = _check_sla(classification.category, context, actions, lines)
 			if auto_assign:
 				assigned = _assign_unit(decision, context, actions, lines, errors)
@@ -1108,7 +1127,14 @@ def _route(
 			if decision.watcher:
 				watcher = _watch_unit(decision.watcher, context, actions, errors)
 			done = _route_lines(
-				result, assigned, task, watcher, labelled, decision.assignee_tag, decision.assignee_default
+				result,
+				assigned,
+				task,
+				watcher,
+				labelled,
+				decision.assignee_tag,
+				decision.assignee_default,
+				tag_row,
 			)
 			others = [*lines, *([split_text] if split_text else [])]
 			lines = [*done, *others]
@@ -1302,7 +1328,7 @@ def _collect_route_lines(run_id, done, others) -> bool:
 
 
 def _route_lines(
-	result, assigned, task, watcher, labelled=(), assigned_tag=None, assigned_default=False
+	result, assigned, task, watcher, labelled=(), assigned_tag=None, assigned_default=False, tag_row=None
 ) -> list[str]:
 	"""The route comment's own sentences (U4b.md:247): fields written, labels given (ADR-049), person given, Task
 	created, watcher added.
@@ -1317,6 +1343,8 @@ def _route_lines(
 	lines = [ROUTE_DONE.format(fields=fields) if fields else ROUTE_NO_CHANGE]
 	if labelled:
 		lines.append(ROUTE_LABELS.format(labels=", ".join(labelled)))
+	if tag_row:
+		lines.append(ROUTE_TAG_ROW_ADDED.format(tag=tag_row))
 	if assigned and assigned_tag:
 		lines.append(ROUTE_ASSIGNED_BY_TAG.format(person=get_fullname(assigned), tag=assigned_tag))
 	elif assigned and assigned_default:
@@ -1328,6 +1356,48 @@ def _route_lines(
 	if watcher:
 		lines.append(ROUTE_WATCHER.format(person=get_fullname(watcher)))
 	return lines
+
+
+def _label_reason(answered, agent, category, described) -> str:
+	"""Why the bot gives the ticket no tag although the model answered one (CHG-016, CHG-018); `described` is the
+	model's own description of a new tag."""
+	if agent:
+		return LABEL_AGENT_TAGGED
+	if category == ticket_labels.NO_NEW_TAG_CATEGORY:
+		return LABEL_NO_NEW_TAG_NOISE
+	if not described:
+		return LABEL_NO_DESCRIPTION.format(tag=answered)
+	return LABEL_NOT_IN_TABLE.format(tag=answered)
+
+
+def _tag_row_unit(classification, labelled, context, actions, errors) -> str | None:
+	"""(u1c) CHG-018: the new tag (u1b) just gave the ticket goes at the end of the tag table, without a person.
+	Returns the tag when a row was added; a table tag, a tag (u1b) did not add, or a row the table has → None. An
+	exception undoes only this unit; the ticket keeps its tag."""
+	if not classification.label_description or not labelled:
+		return None
+	tag = labelled[0]
+	result = _run_unit(
+		TAG_ROW_TOOL,
+		lambda: ticket_labels.add_tag_row(tag, classification.label_description),
+		SETTING_DOCTYPE,
+		SETTING_DOCTYPE,
+		actions,
+		errors,
+	)
+	if result is None or not result["added"]:
+		return None
+	actions.append(
+		_route_action(
+			TAG_ROW_TOOL,
+			SETTING_DOCTYPE,
+			SETTING_DOCTYPE,
+			True,
+			value_after={"tag": tag, "description": result["description"]},
+			instructor=context.instructor,
+		)
+	)
+	return tag
 
 
 def _labels_unit(names, context, actions, errors) -> list[str]:

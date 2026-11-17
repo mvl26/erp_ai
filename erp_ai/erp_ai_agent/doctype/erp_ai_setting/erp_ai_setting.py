@@ -10,7 +10,7 @@ from frappe.model.document import Document
 from erp_ai import gateway
 from erp_ai.agent import policy, run_log
 from erp_ai.agent.agent_write_guard import refuse_agent_write
-from erp_ai.agent.classification import validate_mapping
+from erp_ai.agent.classification import clean_label, validate_mapping
 from erp_ai.agent.hard_bans import hard_ban_reason
 from erp_ai.agent.routing import validate_routing_config
 from erp_ai.agent.text_lines import filled_lines
@@ -156,6 +156,8 @@ def _permission_switch_fields() -> tuple:
 	return policy.PERMISSION_SWITCH_FIELDS
 
 
+# CHG-014: the reason a tag name of the tag table is refused (the rule of erp_ai.agent.classification.clean_label).
+TAG_NAME_REASON = "tên tag phải dài 2–40 ký tự, chỉ gồm chữ, số, khoảng trắng và & ( ) + . / # -"
 EMPTY_DATETIME = datetime(1, 1, 1)  # what frappe.utils.cast returns for an empty Datetime
 
 
@@ -362,10 +364,15 @@ class ERPAISetting(Document):
 		"""CHG-011: refuse the first tag row that gives the bot account or repeats a (tag, category) pair."""
 		seen = {}
 		for row in self.get("tag_assignees") or []:
-			if (row.assignee or "").strip().casefold() == AGENT_USER.casefold():
+			# CHG-014: the tag is typed freely and cleaned like a label the bot gives
+			label = clean_label(row.tag)
+			if label is None:
+				reason = TAG_NAME_REASON
+			elif (row.assignee or "").strip().casefold() == AGENT_USER.casefold():
 				reason = "không gán tài khoản agent"
 			else:
-				key = ((row.tag or "").casefold(), row.category or "")
+				row.tag = label
+				key = (label.casefold(), row.category or "")
 				reason = f"trùng với dòng {seen[key]}" if key in seen else None
 				seen.setdefault(key, row.idx)
 			if reason:

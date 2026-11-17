@@ -139,11 +139,11 @@ DOCTYPE_CONFIG = {
 			# whose tags count and that a blank row also serves D/E.
 			"tag_assignees": (
 				"Tự gán người",
-				"Quy tắc định tuyến",
-				"bị chặn khi lưu",
+				"đúng một tag",
 				"HD Agent gắn",
 				"từ trên xuống",
 				"D/E",
+				"Quy tắc định tuyến",
 			),
 			"prompt_digest": ("lập luận", "phân loại"),
 			**{
@@ -320,9 +320,11 @@ DOCTYPE_CONFIG = {
 	# CHG-011: one row of the table of tag → person (child of ERP AI Setting).
 	"ERP AI Tag Assignee": {
 		"folder": "erp_ai_tag_assignee",
-		"field_count": 3,
+		# CHG-014: + description (the tag table is the list of tags the bot gives)
+		"field_count": 4,
 		"phrases": {
-			"tag": ("Mô tả", "không phân biệt hoa thường", "HD Agent gắn"),
+			"tag": ("bot tự tạo", "không phân biệt hoa thường", "không dấu phẩy"),
+			"description": ("đúng một tag", "dòng đầu tiên", "không nêu tên người"),
 			"assignee": ("HD Agent", "tài khoản agent", "bỏ qua"),
 			"category": ("Để trống", "mọi đầu mục", "dòng nằm trên"),
 		},

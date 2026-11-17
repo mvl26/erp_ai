@@ -36,6 +36,15 @@ Các câu kiểm chạy trong cửa sổ MariaDB của site: `cd /home/miyano/fr
    ```
    Mong đợi: không ít hơn số người trong bảng.
 5. **Điền `routing_rules` trên `/app/erp-ai-setting`.** Người mặc định cho từng đầu mục A, B, C và F (cả F: nếu để trống, mỗi phiếu F nhận một comment nhờ phân công); tiền tố tiêu đề nếu cần (ví dụ `"[tracecore]": "<user ID>"` ở đầu mục A); bảng `departments` cho D/E (`"<bộ phận>": {"team": "<HD Team>", "head": "<user ID trưởng bộ phận>"}`). Tạo team cho bộ phận còn thiếu (ví dụ `Tài chính Kế toán` chưa có) hoặc bỏ bộ phận đó khỏi bảng; bộ phận trỏ tới nhóm không tồn tại thì bot không ghi nhóm và nhật ký ghi lý do. Người điền phải là user có thật (lưu sẽ báo lỗi kèm đường dẫn khóa sai nếu không). Không điền tài khoản agent: bot không bao giờ gán tài khoản này. Kiểm: lưu `ERP AI Setting` không báo lỗi.
+5b. **(Tùy chọn, CHG-011) Điền bảng "Gán người theo tag"** ngay trên ô `routing_rules`. Mỗi dòng: một Tag, một HD Agent, đầu mục (để trống là mọi đầu mục). Cách bot đọc bảng:
+   - Bot xét các tag theo thứ tự: tag do HD Agent gắn trên phiếu (theo thứ tự gắn), rồi nhãn bot vừa đặt (nhãn đầu là **tên phân hệ**, ví dụ `Accounts`, `Stock`; sau đó tối đa hai nhãn chủ đề). Tag đầu tiên có dòng dùng được quyết người nhận phiếu và Task C/D. Thứ tự các dòng trong bảng **không** quyết ưu tiên.
+   - Với cùng một tag, dòng có đúng đầu mục của phiếu thắng dòng để trống. Dòng để trống áp cả cho phiếu D/E, tức thắng trưởng bộ phận trong `departments`; muốn D/E vẫn về trưởng bộ phận thì ghi đầu mục cụ thể (A, B, C, F) cho dòng.
+   - Hệ quả: khi phiếu vừa có nhãn phân hệ có dòng (ví dụ `Accounts`) vừa có nhãn chủ đề có dòng (ví dụ `tracecore`), dòng của nhãn phân hệ thắng.
+   - Tag do người tạo phiếu tự gắn không được tính (Frappe cho người tạo phiếu gắn tag lên phiếu của mình).
+   - Người trong dòng không còn là HD Agent đang hoạt động thì bot bỏ qua dòng đó, ghi lý do vào nhật ký, rồi xét tag tiếp theo; không tag nào cho được người thì dùng `routing_rules` như cũ.
+   - Mọi tag trong bảng luôn được đưa cho bot lúc phân loại, kể cả tag chưa phiếu nào mang. Viết **Mô tả** cho từng Tag (`/app/tag/<tên>`) để bot biết khi nào gắn tag đó; mô tả nói về loại việc, không nêu tên người.
+   - Comment định tuyến ghi "Đã gán cho X (theo tag Y)."; trong `ERP AI Log`, hành động `assign_owner` có `rule` là `tag:Y`.
+   - Kiểm: lưu `ERP AI Setting` không báo lỗi (dòng trùng tag và đầu mục, hoặc dòng chọn tài khoản agent, bị chặn).
 6. **Xem lại `excluded_teams`.** Site đang để rỗng, khác mặc định (`Nhân sự & Hành chính`, `Tài chính Kế toán`). Phiếu thuộc nhóm trong danh sách này không gửi lên API và bot không chọn nhóm đó. Kiểm:
    ```sql
    SELECT value FROM tabSingles WHERE doctype='ERP AI Setting' AND field='excluded_teams';

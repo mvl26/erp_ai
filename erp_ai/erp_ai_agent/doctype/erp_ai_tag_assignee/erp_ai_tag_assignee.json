@@ -18,7 +18,7 @@
    "label": "Tag và người phụ trách"
   },
   {
-   "description": "Tag của Helpdesk mà phiếu mang, do người gắn hoặc bot gắn khi phân loại. So không phân biệt hoa thường. Viết Mô tả cho Tag để bot biết khi nào gắn tag này.",
+   "description": "Tag của Helpdesk mà phiếu mang, do HD Agent gắn hoặc bot gắn khi phân loại; tag người tạo phiếu tự gắn không được tính. So không phân biệt hoa thường. Viết Mô tả cho Tag để bot biết khi nào gắn tag này.",
    "fieldname": "tag",
    "fieldtype": "Link",
    "in_list_view": 1,

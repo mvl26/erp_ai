@@ -135,8 +135,16 @@ DOCTYPE_CONFIG = {
 				"HD Agent",
 			),
 			"routing_rules": ("đầu mục", "SLA", "phút", "bị chặn khi lưu"),
-			# CHG-011: the table of tag → person, read before the routing rules.
-			"tag_assignees": ("Tự gán người", "Quy tắc định tuyến", "bị chặn khi lưu"),
+			# CHG-011: the table of tag → person, read before the routing rules; review: say whose tags count, that
+			# the module label comes first and that a blank row also serves D/E.
+			"tag_assignees": (
+				"Tự gán người",
+				"Quy tắc định tuyến",
+				"bị chặn khi lưu",
+				"HD Agent gắn",
+				"nhãn phân hệ",
+				"D/E",
+			),
 			"prompt_digest": ("lập luận", "phân loại"),
 			**{
 				fieldname: ("fieldname", "Để trống", "không lưu được")
@@ -314,7 +322,7 @@ DOCTYPE_CONFIG = {
 		"folder": "erp_ai_tag_assignee",
 		"field_count": 3,
 		"phrases": {
-			"tag": ("Mô tả", "không phân biệt hoa thường"),
+			"tag": ("Mô tả", "không phân biệt hoa thường", "HD Agent gắn"),
 			"assignee": ("HD Agent", "tài khoản agent", "bỏ qua"),
 			"category": ("Để trống", "mọi đầu mục", "thắng"),
 		},

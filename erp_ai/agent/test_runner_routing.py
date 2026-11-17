@@ -2684,3 +2684,31 @@ class TestRoutingAssignByTag(AssignTestBase):
 		self._run()
 		classify = next(call for call in self.gateway.calls if call["task"] == "classify")
 		self.assertIn(f"- {TAG_KHO}: x", classify["system"][0]["text"])
+
+
+class TestRoutingDefaultAssignee(AssignTestBase):
+	"""CHG-015: a ticket nobody owns that neither the tag table nor the routing rules can give goes to the default."""
+
+	def setUp(self):
+		super().setUp()
+		self.default_person = make_active_agent(self)
+		# no person in the routing rules and an empty tag table: only the default can take the ticket
+		set_agent_settings(routing_rules=make_routing_rules(), default_assignee=self.default_person)
+		set_tag_assignees()
+
+	def test_the_default_takes_the_ticket_and_says_so(self):
+		self._run()
+		self.assertEqual(self._assigned_to(), [self.default_person])
+		(action,) = self._action("assign_owner")
+		self.assertEqual(
+			(action["name"], action["ok"], action.get("rule")), (self.default_person, True, "default")
+		)
+		self.assertIn(
+			runner.ROUTE_ASSIGNED_BY_DEFAULT.format(person=get_fullname(self.default_person)),
+			self._comment_text(),
+		)
+
+	def test_ticket_already_assigned_keeps_its_person(self):
+		assign_to.add({"assign_to": [self.person], "doctype": "HD Ticket", "name": self.ticket.name})
+		self._run()
+		self.assertEqual(self._assigned_to(), [self.person])

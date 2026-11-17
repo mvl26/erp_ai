@@ -2093,6 +2093,26 @@ class TestAssigneeChangeSource(HandlerTestCase):
 		self.assertIn(BOT_PICK, rows[0].lesson_text)
 		self.assertIn(HUMAN_PICK, rows[0].lesson_text)
 
+	def _bot_route_row(self, ticket, rule):
+		"""The applied classify row of a run that gave the ticket to BOT_PICK under `rule`."""
+		action = {"tool": "assign_owner", "doctype": "HD Ticket", "name": BOT_PICK, "ok": True, "rule": rule}
+		make_log_entry(ticket=ticket, entry_type="classify", applied=1, actions=json.dumps([action]))
+
+	# CHG-015 review: the default person takes what no rule gives; passing it on is their job, not a fix of the bot
+	def test_reassign_after_the_default_pick_makes_none(self):
+		ticket = self._ticket_without_job()
+		self._bot_route_row(ticket.name, "default")
+		self._bot_assigns(ticket.name)
+		self._person_assigns(ticket.name, INSTRUCTOR)
+		self.assertEqual(self._lessons(), [])
+
+	def test_reassign_after_a_tag_pick_still_makes_a_lesson(self):
+		ticket = self._ticket_without_job()
+		self._bot_route_row(ticket.name, "tag:hr")
+		self._bot_assigns(ticket.name)
+		self._person_assigns(ticket.name, INSTRUCTOR)
+		self.assertEqual(len(self._lessons(ticket=ticket.name)), 1)
+
 	def test_reassign_without_bot_assignment_makes_none(self):
 		ticket = self._ticket_without_job()
 		self._person_assigns(ticket.name, INSTRUCTOR)

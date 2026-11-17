@@ -376,6 +376,23 @@ def todo_after_insert(doc, method=None):
 		"allocated_to",
 		order_by="creation desc",
 	)
-	if not bot_user:
+	if not bot_user or _bot_pick_was_default(ticket):
 		return
 	lessons.safely(lessons.record_assignee_change, ticket, bot_user, new_user)
+
+
+def _bot_pick_was_default(ticket: str) -> bool:
+	"""CHG-015: the bot's latest applied route gave the ticket to the Setting's default person, which no rule chose; a
+	person passing it on is no lesson about the bot's pick (FEAT-008 AC-6)."""
+	rows = frappe.get_all(
+		LOG_DOCTYPE,
+		filters={"ticket": ticket, "entry_type": "classify", "applied": 1},
+		fields=["actions"],
+		order_by="creation desc",
+		limit=1,
+	)
+	actions = json.loads(rows[0].actions or "[]") if rows else []
+	return any(
+		action.get("tool") == "assign_owner" and action.get("ok") and action.get("rule") == "default"
+		for action in actions
+	)

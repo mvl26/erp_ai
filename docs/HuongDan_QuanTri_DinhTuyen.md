@@ -47,6 +47,7 @@ Các câu kiểm chạy trong cửa sổ MariaDB của site: `cd /home/miyano/fr
    - Phiếu cũ đang mang nhiều tag (từ trước CHG-014) giữ nguyên.
    - Site đã điền bảng từ trước CHG-014: lần `migrate` lên CHG-014 tự điền Mô tả cho dòng còn trống, lấy từ Mô tả của bản ghi Tag, không có thì lấy chính tên tag. Nên xem lại và viết Mô tả rõ hơn; Mô tả trên bản ghi Tag không còn được dùng.
    - Kiểm: lưu `ERP AI Setting` không báo lỗi (tên tag sai luật, thiếu mô tả, dòng trùng tag và đầu mục, hoặc dòng chọn tài khoản agent bị chặn).
+5c. **(Nên làm, CHG-015) Chọn "Người nhận mặc định"** ngay dưới ô `routing_rules`: một HD Agent nhận phiếu chưa có người được giao khi bảng "Gán người theo tag" và `routing_rules` không cho được người (kể cả khi người ở đó đã nghỉ hoặc không còn là HD Agent đang hoạt động). Người này nhận luôn Task C/D; comment định tuyến ghi "Đã gán cho X (người nhận mặc định)."; trong `ERP AI Log`, `assign_owner` có `rule` là `default`. Phiếu đã có người được giao thì bot không đổi. Để trống thì như cũ: bot đăng comment nhờ trưởng nhóm phân công. Không chọn được tài khoản agent.
 6. **Xem lại `excluded_teams`.** Site đang để rỗng, khác mặc định (`Nhân sự & Hành chính`, `Tài chính Kế toán`). Phiếu thuộc nhóm trong danh sách này không gửi lên API và bot không chọn nhóm đó. Kiểm:
    ```sql
    SELECT value FROM tabSingles WHERE doctype='ERP AI Setting' AND field='excluded_teams';

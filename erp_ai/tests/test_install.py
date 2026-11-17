@@ -19,7 +19,7 @@ from erp_ai.constants import (
 	ROLE_INSTRUCTOR,
 	SETTING_DOCTYPE,
 )
-from erp_ai.test_utils import keep_agent_settings, set_agent_settings
+from erp_ai.test_utils import keep_agent_settings, make_team, set_agent_settings
 
 INSTRUCTOR_LOG_RIGHTS = ("read", "report")
 
@@ -1426,3 +1426,63 @@ class TestEnsureTicketTypesAndTeams(FrappeTestCase):
 		self.assertEqual(
 			calls.index("_ensure_ticket_types_and_teams"), calls.index("_ensure_default_settings") + 1
 		)
+
+	def test_default_name_gets_the_guide_description(self):
+		fresh, custom = self._name("A"), self._name("B")
+		self._store(
+			{
+				"A": {"ticket_type": fresh, "agent_group": "", "priority": ""},
+				"B": {"ticket_type": custom, "agent_group": "", "priority": ""},
+			}
+		)
+		default = {**DEFAULT_CATEGORY_MAPPING, "A": {**DEFAULT_CATEGORY_MAPPING["A"], "ticket_type": fresh}}
+		with patch.object(install, "DEFAULT_CATEGORY_MAPPING", default):
+			install._ensure_ticket_types_and_teams()
+		self.assertEqual(
+			frappe.db.get_value("HD Ticket Type", fresh, "description"), CATEGORY_TYPE_DESCRIPTIONS["A"]
+		)
+		self.assertFalse(frappe.db.get_value("HD Ticket Type", custom, "description"))
+
+	def test_one_failing_insert_does_not_stop_the_rest(self):
+		bad, good, team = self._name("A"), self._name("B"), self._name("T")
+		self._store(
+			{
+				"A": {"ticket_type": bad, "agent_group": team, "priority": ""},
+				"B": {"ticket_type": good, "agent_group": "", "priority": ""},
+			}
+		)
+		real = install._insert_ticket_type
+
+		def flaky(category, entry):
+			if entry["ticket_type"] == bad:
+				raise frappe.ValidationError("boom")
+			real(category, entry)
+
+		with patch.object(install, "_insert_ticket_type", side_effect=flaky):
+			install._ensure_ticket_types_and_teams()
+		self.assertFalse(frappe.db.exists("HD Ticket Type", bad))
+		self.assertTrue(frappe.db.exists("HD Ticket Type", good))
+		self.assertTrue(frappe.db.exists("HD Team", team))
+
+	def test_existing_team_is_left_as_it_is(self):
+		team = make_team(self)
+		before = frappe.db.get_value("HD Team", team, ["modified", "assignment_rule", "disabled"])
+		self._store({"A": {"ticket_type": self._name("A"), "agent_group": team, "priority": ""}})
+		install._ensure_ticket_types_and_teams()
+		self.assertEqual(
+			frappe.db.get_value("HD Team", team, ["modified", "assignment_rule", "disabled"]), before
+		)
+
+	def test_empty_team_is_inert_for_a_routed_ticket(self):
+		team = self._name("T")
+		self._store({"A": {"ticket_type": self._name("A"), "agent_group": team, "priority": ""}})
+		install._ensure_ticket_types_and_teams()
+		rule = frappe.db.get_value("HD Team", team, "assignment_rule")
+		self.assertEqual(frappe.db.get_value("Assignment Rule", rule, "disabled"), 1)
+		ticket = make_ticket(subject="CHG012 empty team", agent_group=team)
+		ticket.reload()
+		self.assertEqual(ticket.agent_group, team)
+		self.assertFalse(ticket.get_assigned_users() if hasattr(ticket, "get_assigned_users") else [])
+		ticket.status = "Replied"
+		ticket.status = "Open"
+		ticket.save(ignore_permissions=True)

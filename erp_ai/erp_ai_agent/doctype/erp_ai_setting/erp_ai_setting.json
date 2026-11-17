@@ -53,6 +53,7 @@
   "auto_assign_enabled",
   "tag_assignees",
   "routing_rules",
+  "default_assignee",
   "prompt_digest",
   "section_ticket_fields",
   "field_ticket_nature",
@@ -444,6 +445,13 @@
    "description": "Bảng người mặc định theo đầu mục, bảng bộ phận sang nhóm và trưởng bộ phận, bảng độ quan trọng sang mức ưu tiên tối thiểu, SLA mong đợi (phút). Cấu hình sai bị chặn khi lưu."
   },
   {
+   "fieldname": "default_assignee",
+   "fieldtype": "Link",
+   "label": "Người nhận mặc định",
+   "options": "HD Agent",
+   "description": "HD Agent nhận phiếu chưa có người được giao khi bảng Gán người theo tag và Quy tắc định tuyến không cho được người (kể cả khi người ở đó không còn hoạt động); nhận luôn Task C/D. Để trống thì bot nhờ trưởng nhóm phân công. Không được là tài khoản agent."
+  },
+  {
    "fieldname": "prompt_digest",
    "fieldtype": "Long Text",
    "label": "Trích yếu HDSD",
@@ -763,7 +771,7 @@
  ],
  "issingle": 1,
  "links": [],
- "modified": "2026-11-17 14:00:00.000000",
+ "modified": "2026-11-17 15:00:00.000000",
  "modified_by": "Administrator",
  "module": "ERP AI agent",
  "name": "ERP AI Setting",

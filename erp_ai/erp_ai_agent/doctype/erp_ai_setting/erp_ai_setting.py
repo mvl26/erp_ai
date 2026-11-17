@@ -183,6 +183,7 @@ class ERPAISetting(Document):
 		validate_mapping(self.category_mapping)
 		self.check_routing_rules()
 		self.check_tag_assignees()
+		self.check_default_assignee()
 		policy.validate_change_apps(self, source.get_source_root())
 		self.check_limits()
 		self.check_status_settings()
@@ -377,6 +378,12 @@ class ERPAISetting(Document):
 				seen.setdefault(key, row.idx)
 			if reason:
 				frappe.throw(f"Gán người theo tag dòng {row.idx}: {reason}")
+
+	def check_default_assignee(self):
+		"""CHG-015: the person a ticket no rule gives goes to is never the bot account."""
+		person = (self.get("default_assignee") or "").strip()
+		if person and person.casefold() == AGENT_USER.casefold():
+			frappe.throw("Người nhận mặc định không được là tài khoản agent")
 
 	def check_limits(self):
 		for fieldname, (label, low, high) in INT_LIMITS.items():

@@ -3002,3 +3002,43 @@ class TestTagAssignees(FrappeTestCase):
 		self.assertIsNone(self._save_rows({"tag": tag, "assignee": self.person, "description": "Việc thử"}))
 		(row,) = frappe.get_doc(SETTING_DOCTYPE).tag_assignees
 		self.assertEqual((row.tag, row.description), (tag, "Việc thử"))
+
+
+# CHG-015 (spec 2026-11-17-default-assignee-design.md, design 1): the person a ticket no rule gives goes to.
+class TestDefaultAssignee(FrappeTestCase):
+	def setUp(self):
+		self.addCleanup(frappe.db.rollback)
+		keep_agent_settings(self)
+		self.person = make_active_agent(self)
+
+	def _save(self, value):
+		doc = frappe.get_doc(SETTING_DOCTYPE)
+		doc.default_assignee = value
+		try:
+			doc.save()
+		except frappe.ValidationError as error:
+			return frappe.utils.strip_html(str(error))
+		return None
+
+	def test_field_shape(self):
+		setting = json.loads(SETTING_JSON.read_text(encoding="utf-8"))
+		order = setting["field_order"]
+		self.assertEqual(order.index("default_assignee"), order.index("routing_rules") + 1)
+		(field,) = [f for f in setting["fields"] if f["fieldname"] == "default_assignee"]
+		self.assertEqual(
+			(field["fieldtype"], field["options"], field["label"]),
+			("Link", "HD Agent", "Người nhận mặc định"),
+		)
+
+	def test_an_hd_agent_saves(self):
+		self.assertIsNone(self._save(self.person))
+		self.assertEqual(frappe.db.get_single_value(SETTING_DOCTYPE, "default_assignee"), self.person)
+		self.assertIsNone(self._save(None))
+
+	def test_agent_account_refused(self):
+		# the bot account is an HD Agent here, so only the setting's own check can refuse it (rolled back)
+		if not frappe.db.exists("HD Agent", AGENT_USER):
+			frappe.get_doc(
+				{"doctype": "HD Agent", "user": AGENT_USER, "agent_name": "Bot", "is_active": 1}
+			).insert(ignore_permissions=True)
+		self.assertEqual(self._save(AGENT_USER), "Người nhận mặc định không được là tài khoản agent")

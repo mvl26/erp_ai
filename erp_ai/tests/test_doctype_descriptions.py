@@ -23,9 +23,9 @@ VIETNAMESE_ACCENTS = re.compile(
 DOCTYPE_CONFIG = {
 	"ERP AI Setting": {
 		"folder": "erp_ai_setting",
-		# CHG-011: tag_assignees (+1); CHG-010: console_enabled (+1); FEAT-008: lessons_enabled,
+		# CHG-015: default_assignee (+1); CHG-011: tag_assignees (+1); CHG-010: console_enabled (+1); FEAT-008: lessons_enabled,
 		# lessons_max_per_request, lessons_max_chars, lesson_teach_marker (+4); base 77
-		"field_count": 83,
+		"field_count": 84,
 		"phrases": {
 			"enabled": ("Tắt", "4 đơn giá", "từ khóa kích hoạt"),
 			# FEAT-007 spec-addendum-3.md:88 (T64): from L2 up, ERP writes go through a proposal or a `Tự làm` row.
@@ -145,6 +145,8 @@ DOCTYPE_CONFIG = {
 				"D/E",
 				"Quy tắc định tuyến",
 			),
+			# CHG-015: the person a ticket no rule gives goes to.
+			"default_assignee": ("bảng Gán người theo tag", "Quy tắc định tuyến", "HD Agent", "Task C/D"),
 			"prompt_digest": ("lập luận", "phân loại"),
 			**{
 				fieldname: ("fieldname", "Để trống", "không lưu được")

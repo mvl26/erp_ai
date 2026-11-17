@@ -32,6 +32,7 @@ from erp_ai.constants import (
 	PROPOSAL_DOCTYPE,
 	ROLE_AGENT,
 	SETTING_DOCTYPE,
+	TAG_ASSIGNEE_DOCTYPE,
 )
 from erp_ai.gateway import GatewayError, ModelResult
 
@@ -302,6 +303,35 @@ def pin_agent_roles(testcase) -> None:
 				}
 			).db_insert()
 	frappe.clear_cache(user=AGENT_USER)
+
+
+def make_tag(name: str, description: str = "") -> str:
+	"""Insert the Tag `name` when it is missing and return the name. Rolled back by the test."""
+	if not frappe.db.exists("Tag", name):
+		frappe.get_doc({"doctype": "Tag", "name": name, "description": description}).insert(
+			ignore_permissions=True
+		)
+	return name
+
+
+def set_tag_assignees(*rows: tuple[str, str, str]) -> None:
+	"""Replace the `tag_assignees` rows of ERP AI Setting in the DB (no validate), for tests (CHG-011); each row is
+	(tag, person, category). `keep_agent_settings` puts the old rows back."""
+	frappe.db.delete(TAG_ASSIGNEE_DOCTYPE, {"parent": SETTING_DOCTYPE, "parenttype": SETTING_DOCTYPE})
+	for idx, (tag, assignee, category) in enumerate(rows, start=1):
+		frappe.get_doc(
+			{
+				"doctype": TAG_ASSIGNEE_DOCTYPE,
+				"parent": SETTING_DOCTYPE,
+				"parenttype": SETTING_DOCTYPE,
+				"parentfield": "tag_assignees",
+				"idx": idx,
+				"tag": tag,
+				"assignee": assignee,
+				"category": category,
+			}
+		).db_insert()
+	frappe.clear_document_cache(SETTING_DOCTYPE, SETTING_DOCTYPE)
 
 
 def make_routing_rules(**overrides) -> str:

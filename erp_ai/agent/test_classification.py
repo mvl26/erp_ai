@@ -201,6 +201,22 @@ class TestParseLabels(FrappeTestCase):
 	def test_direct_build_has_no_labels(self):
 		self.assertEqual(classification.Classification(category="A", confidence="Cao").labels, ())
 
+	# CHG-018 (spec 2026-11-17-bot-new-tag-design.md, design 3): the description of a new tag, one line, no HTML, cut
+	def test_new_tag_description(self):
+		result = classification.parse_classification(
+			_text(nhan=["kế toán"], mo_ta_nhan="  Hóa đơn,\n <b>công nợ</b> ")
+		)
+		self.assertEqual(result.label_description, "Hóa đơn, công nợ")
+		long = classification.parse_classification(_text(nhan=["kế toán"], mo_ta_nhan="d" * 300))
+		self.assertEqual(long.label_description, "d" * classification.LABEL_DESCRIPTION_MAX_CHARS)
+		self.assertEqual(classification.LABEL_DESCRIPTION_MAX_CHARS, 200)
+		for raw in (None, 3, ["x"], "   "):
+			with self.subTest(raw=raw):
+				parsed = classification.parse_classification(_text(nhan=["kế toán"], mo_ta_nhan=raw))
+				self.assertEqual(parsed.label_description, "")
+		self.assertEqual(classification.parse_classification(_text()).label_description, "")
+		self.assertEqual(classification.Classification(category="A", confidence="Cao").label_description, "")
+
 
 class TestConfidencePct(FrappeTestCase):
 	# AC-22 (D-14), U1.md:249-253: do_tin_cay_pct is a whole number 0..100; the label do_tin_cay stays.

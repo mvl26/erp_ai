@@ -1,10 +1,12 @@
+import hashlib
+
 import frappe
 from frappe.desk.form import assign_to
 from frappe.utils import escape_html, now_datetime
 
 from erp_ai.agent.classification import Classification
 from erp_ai.agent.labels import parse_tags
-from erp_ai.agent.routing import RouteDecision
+from erp_ai.agent.routing import RouteDecision, tag_key
 from erp_ai.agent.tools.registry import ToolContext
 from erp_ai.agent.tools.write_ticket import (
 	CLASSIFICATION_REASON_FIELD,
@@ -17,7 +19,7 @@ from erp_ai.agent.tools.write_ticket import (
 	_ticket_link_html,
 	post_comment,
 )
-from erp_ai.constants import CLASSIFIED_BY_AI, CLASSIFIED_BY_HUMAN
+from erp_ai.constants import CLASSIFIED_BY_AI, CLASSIFIED_BY_HUMAN, SETTING_DOCTYPE, TAG_ASSIGNEE_DOCTYPE
 
 # Fixed sentences for the routing comment (design 3.6). They never carry ticket content or raw configuration.
 ASSIGN_REQUEST = "Bot chưa gán được người phụ trách cho phiếu này: {reason}. Nhờ trưởng nhóm phân công."
@@ -97,6 +99,40 @@ def add_labels(labels: tuple[str, ...], ctx: ToolContext) -> dict:
 		carried.add(label.casefold())
 		added.append(label)
 	return {"ok": True, "added": added}
+
+
+TAG_TABLE_FIELD = "tag_assignees"
+
+
+def add_tag_row(tag: str, description: str, ctx: ToolContext) -> dict:
+	"""CHG-018: put a tag the bot made at the end of the tag table of ERP AI Setting, with the model's description and
+	no person, so later tickets choose it and a System Manager can give it a person. Not a model tool.
+
+	A tag the table has (NFC, without case, any category) is not added again. The row alone is written, not the
+	Setting: no check of the Setting's other fields runs and nobody's open Setting form goes stale. Its name comes
+	from the tag, so a run that read the table before another run's row was there adds no second one.
+	Returns `{"ok": True, "added": bool}`."""
+	parent = {"parent": SETTING_DOCTYPE, "parenttype": SETTING_DOCTYPE, "parentfield": TAG_TABLE_FIELD}
+	rows = frappe.get_all(TAG_ASSIGNEE_DOCTYPE, filters=parent, fields=["tag", "idx"])
+	key = tag_key(tag)
+	if any(tag_key(row.tag) == key for row in rows):
+		return {"ok": True, "added": False}
+	row = frappe.get_doc(
+		{
+			"doctype": TAG_ASSIGNEE_DOCTYPE,
+			"name": f"erp-ai-tag-{hashlib.sha1(key.encode()).hexdigest()[:12]}",
+			**parent,
+			"idx": max((row.idx or 0 for row in rows), default=0) + 1,
+			"tag": tag,
+			"description": description,
+		}
+	)
+	try:
+		row.db_insert()
+	except frappe.DuplicateEntryError:
+		return {"ok": True, "added": False}
+	frappe.clear_document_cache(SETTING_DOCTYPE, SETTING_DOCTYPE)
+	return {"ok": True, "added": True}
 
 
 def assign_owner(user: str, ctx: ToolContext) -> dict:

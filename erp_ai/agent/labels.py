@@ -1,5 +1,6 @@
 """Ticket labels (ADR-049 with CHG-014): the one Helpdesk Tag the bot gives a ticket at classification, chosen from
-the tag table of ERP AI Setting by each tag's description.
+the tag table of ERP AI Setting by each tag's description; when none fits, a new tag the model names and describes
+(CHG-018), which the route adds to the table.
 
 The labels live where Helpdesk keeps tags (`_user_tags` and `Tag Link`); the list of tags lives in the tag table
 (`routing.tag_rules`); nothing is stored here.
@@ -41,6 +42,25 @@ def chosen_tag(labels: tuple[str, ...], choices) -> tuple[str, ...]:
 	spelling = {tag_key(tag): tag for tag, _description in choices}
 	first = tag_key(labels[0]) if labels else ""
 	return (spelling[first],) if first in spelling else ()
+
+
+# CHG-018: a noise ticket (test, unclear title) makes no new tag; it may still get a tag of the table.
+NO_NEW_TAG_CATEGORY = "F"
+
+
+def new_tag(labels: tuple[str, ...], description: str, category: str, choices) -> tuple[str, str] | None:
+	"""(tag, description) when the model's first label is no tag of `choices` and comes with a description, on a
+	ticket that is not noise and for a tag Helpdesk does not give itself; else None (CHG-018)."""
+	from erp_ai.agent.routing import tag_key
+
+	if not labels or not description or category == NO_NEW_TAG_CATEGORY:
+		return None
+	first = tag_key(labels[0])
+	if first in {tag_key(tag) for tag, _description in choices}:
+		return None
+	if first in {tag_key(tag) for tag in IGNORED_LABELS}:
+		return None
+	return labels[0], description
 
 
 def agent_tags(ticket_name: str, is_active_agent) -> tuple[str, ...]:

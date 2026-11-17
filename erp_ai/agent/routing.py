@@ -74,11 +74,12 @@ def tag_key(tag) -> str:
 
 
 def tag_rules(settings) -> tuple[TagRule, ...]:
-	"""The rows of `tag_assignees` in order, rows without a tag or a person left out; () when the field is absent."""
+	"""The rows of `tag_assignees` in order, rows without a tag left out; () when the field is absent. CHG-018: a row
+	without a person is kept (assignee ""): its tag is one the bot may give, and it gives nobody."""
 	return tuple(
-		TagRule(row.tag, row.assignee, row.category or "", row.get("description") or "")
+		TagRule(row.tag, row.assignee or "", row.category or "", row.get("description") or "")
 		for row in settings.get("tag_assignees") or ()
-		if row.tag and row.assignee
+		if row.tag
 	)
 
 
@@ -225,13 +226,16 @@ def _default_assignee(person, is_active_agent, notes) -> str | None:
 
 def _tag_assignee(category, tags, rules, is_active_agent, notes) -> tuple[str, str] | None:
 	"""(person, row tag) of the first row, top-down, whose tag the ticket carries (without case) and whose category is
-	blank or the ticket's (CHG-011, the user's option b). A row naming the agent account or no active HD Agent is
-	noted and passed over; None when no row gives a person."""
+	blank or the ticket's (CHG-011, the user's option b). A row with no person (CHG-018), naming the agent account
+	or no active HD Agent is noted and passed over; None when no row gives a person."""
 	on_ticket = {tag_key(tag) for tag in tags} - {""}
 	for row in rules:
 		if tag_key(row.tag) not in on_ticket or row.category not in ("", category):
 			continue
-		if row.assignee.strip().casefold() == AGENT_USER.casefold():
+		if not row.assignee.strip():
+			# CHG-018: a tag without a person yet (one the bot made, until a System Manager gives it one)
+			notes.append({"field": "assignee", "reason": f"tag {row.tag}: chưa có người nhận"})
+		elif row.assignee.strip().casefold() == AGENT_USER.casefold():
 			notes.append({"field": "assignee", "reason": f"tag {row.tag}: không gán tài khoản agent"})
 		elif not is_active_agent(row.assignee):
 			notes.append(

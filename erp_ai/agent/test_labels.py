@@ -50,3 +50,25 @@ class TestChosenTag(FrappeTestCase):
 		self.assertEqual(
 			labels.chosen_tag((unicodedata.normalize("NFD", "CHẤM CÔNG"),), self.CHOICES), ("chấm công",)
 		)
+
+
+# CHG-018 (spec 2026-11-17-bot-new-tag-design.md, design 4): an answer outside the table with a description is a new
+# tag, except on a noise ticket (F) or for a tag Helpdesk gives itself.
+class TestNewTag(FrappeTestCase):
+	CHOICES = (("chấm công", "Bảng công"),)
+
+	def test_answer_outside_the_table_with_a_description_is_a_new_tag(self):
+		self.assertEqual(labels.new_tag(("kế toán",), "Hóa đơn", "C", self.CHOICES), ("kế toán", "Hóa đơn"))
+		self.assertEqual(labels.new_tag(("kế toán", "hr"), "Hóa đơn", "A", ()), ("kế toán", "Hóa đơn"))
+
+	def test_no_new_tag(self):
+		cases = {
+			"table tag": (("Chấm công",), "x", "C"),
+			"no description": (("kế toán",), "", "C"),
+			"category F": (("kế toán",), "x", "F"),
+			"no answer": ((), "x", "C"),
+			"Helpdesk's own tag": (("first ticket",), "x", "C"),
+		}
+		for name, (answered, description, category) in cases.items():
+			with self.subTest(name):
+				self.assertIsNone(labels.new_tag(answered, description, category, self.CHOICES))

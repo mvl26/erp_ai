@@ -1202,3 +1202,22 @@ class TestTagMatchNfc(FrappeTestCase):
 			(routing.TagRule("chấm công", "cc@x.com", ""),),
 		)
 		self.assertEqual((d.assignee, d.assignee_tag), ("cc@x.com", "chấm công"))
+
+
+# CHG-018 (spec 2026-11-17-bot-new-tag-design.md, design 1): a row without a person is a tag of the list that gives
+# nobody; the ticket goes on to the next row, the routing rules and the default person.
+class TestTagRowWithoutPerson(FrappeTestCase):
+	def test_row_without_a_person_is_kept(self):
+		settings = frappe._dict(
+			tag_assignees=[frappe._dict(tag="kế toán", assignee=None, category=None, description="Hóa đơn")]
+		)
+		self.assertEqual(routing.tag_rules(settings), (routing.TagRule("kế toán", "", "", "Hóa đơn"),))
+
+	def test_row_without_a_person_is_passed_over_with_a_note(self):
+		rules = (routing.TagRule("kế toán", "", "", "x"), routing.TagRule("kế toán", "hieu@x.com", "", "x"))
+		d = _decide_by_tags("C", ("kế toán",), rules)
+		self.assertEqual((d.assignee, d.assignee_tag), ("hieu@x.com", "kế toán"))
+		self.assertEqual(_assignee_notes(d), ["tag kế toán: chưa có người nhận"])
+		d = _decide_by_tags("C", ("kế toán",), rules[:1])
+		self.assertEqual((d.assignee, d.assignee_tag), ("c.default@x.com", None))
+		self.assertEqual(_assignee_notes(d), ["tag kế toán: chưa có người nhận"])

@@ -558,6 +558,37 @@ class TestTagsInClassifyRequest(FrappeTestCase):
 		)
 		self.assertEqual(prompts.TAG_DESCRIPTION_MAX_CHARS, 200)
 
+	# CHG-018 (spec 2026-11-17-bot-new-tag-design.md, design 2): the runner lets the model make a new tag; the block
+	# is there even before the table has a row
+	def test_new_tags_block_with_and_without_choices(self):
+		request = prompts.build_classify_request(
+			SUBJECT, DESCRIPTION, tag_choices=(("hr", "Nhân sự"),), new_tags=True
+		)
+		self.assertEqual(
+			request["system"][0]["text"],
+			f"{prompts.CLASSIFY_PROMPT}\n\n{prompts.NEW_TAGS_BLOCK}\n{prompts.TAG_LIST_LABEL}\n- hr: Nhân sự",
+		)
+		empty = prompts.build_classify_request(SUBJECT, DESCRIPTION, new_tags=True)
+		self.assertEqual(
+			empty["system"][0]["text"],
+			f"{prompts.CLASSIFY_PROMPT}\n\n{prompts.NEW_TAGS_BLOCK}\n{prompts.TAG_LIST_LABEL}\n{prompts.NO_TAGS_YET}",
+		)
+		self.assertEqual(empty["messages"], _old_classify_request(SUBJECT, DESCRIPTION)["messages"])
+
+	def test_new_tags_block_asks_for_one_tag_and_a_description(self):
+		for phrase in (
+			'"nhan"',
+			'"mo_ta_nhan"',
+			"DANH SÁCH TAG",
+			"đúng một",
+			"tag mới",
+			"y hệt",
+			"nhóm việc chung",
+			"đầu mục F",
+		):
+			with self.subTest(phrase=phrase):
+				self.assertIn(phrase, prompts.NEW_TAGS_BLOCK)
+
 
 TICKET = {
 	"subject": SUBJECT,

@@ -167,12 +167,12 @@ class TestInstall(FrappeTestCase):
 			filters={"parent": TEMPLATE, "fieldname": ("in", AI_FIELDS)},
 			fields=["fieldname", "visible_to", "required", "editable_after_creation"],
 		)
-		self.assertEqual({r.fieldname for r in rows}, set(AI_FIELDS) - {"ai_section"})
-		self.assertEqual(len(rows), 8)
-		for row in rows:
-			self.assertEqual(row.visible_to, "Agents")
-			self.assertEqual(row.required, 0)
-			self.assertEqual(row.editable_after_creation, 1 if row.fieldname == "ai_opt_out" else 0)
+		# spec changed (CHG-017): only the field a person fills gets a row; the fields the bot fills stay off the
+		# ticket form (the ERP AI panel shows them).
+		self.assertEqual(
+			[(r.fieldname, r.visible_to, r.required, r.editable_after_creation) for r in rows],
+			[("ai_opt_out", "Agents", 0, 1)],
+		)
 		frappe.clear_cache(doctype="HD Ticket")
 		meta = frappe.get_meta("HD Ticket")
 		for name in AI_FIELDS:
@@ -196,7 +196,8 @@ class TestInstall(FrappeTestCase):
 			fields=["name", "idx", "fieldname", "required", "visible_to", "editable_after_creation"],
 			order_by="idx",
 		)
-		self.assertEqual(len(rows), 10 + len(RUN_INFO_FIELDS))
+		# spec changed (CHG-017): the person's row first, then the one row of the field a person fills.
+		self.assertEqual(len(rows), 2)
 		first = rows[0]
 		self.assertEqual(
 			(
@@ -209,28 +210,41 @@ class TestInstall(FrappeTestCase):
 			),
 			("erp-ai-t12-keep", 1, "priority", 1, "Everyone", 1),
 		)
-		self.assertEqual([r.idx for r in rows], list(range(1, 11 + len(RUN_INFO_FIELDS))))
 		self.assertEqual(
-			[r.fieldname for r in rows[1:]],
-			[
-				"ai_resolution_hint",
-				"ai_confidence",
-				"ai_confidence_pct",
-				"ai_complexity",
-				"ai_importance",
+			[(r.idx, r.fieldname, r.visible_to, r.required, r.editable_after_creation) for r in rows[1:]],
+			[(2, "ai_opt_out", "Agents", 0, 1)],
+		)
+
+	def test_fields_the_bot_fills_get_no_template_row(self):
+		"""CHG-017: a field the bot fills (read-only) is never added to the ticket form; a row a person added for one
+		stays."""
+		self.assertEqual(
+			set(install.ai_filled_fields()),
+			{"ai_resolution_hint", "ai_confidence", "ai_confidence_pct", "ai_complexity", "ai_importance"}
+			| {
 				"ai_score_reason",
 				"ai_classified_by",
 				"ai_updated_at",
-				"ai_opt_out",
+				CREATED_LABELS_FIELD,
 				*RUN_INFO_FIELDS,
-			],
+			},
 		)
-		for row in rows[1:]:
-			self.assertEqual(row.visible_to, "Agents", row.fieldname)
-			self.assertEqual(row.required, 0, row.fieldname)
-			self.assertEqual(
-				row.editable_after_creation, 1 if row.fieldname == "ai_opt_out" else 0, row.fieldname
-			)
+		install.ensure_setup()
+		self.assertEqual(
+			frappe.db.count(
+				"HD Ticket Template Field",
+				{"parent": TEMPLATE, "fieldname": ("in", install.ai_filled_fields())},
+			),
+			0,
+		)
+		template = frappe.get_doc("HD Ticket Template", TEMPLATE)
+		template.append("fields", {"fieldname": "ai_confidence", "required": 0, "visible_to": "Agents"})
+		template.flags.ignore_permissions = True
+		template.save()
+		install.ensure_setup()
+		self.assertEqual(
+			frappe.db.count("HD Ticket Template Field", {"parent": TEMPLATE, "fieldname": "ai_confidence"}), 1
+		)
 
 	def test_missing_template_is_skipped_with_warning(self):
 		frappe.db.delete("HD Ticket Template", {"name": TEMPLATE})
@@ -361,9 +375,8 @@ class TestInstall(FrappeTestCase):
 			},
 			fields=["fieldname", "visible_to", "required"],
 		)
-		self.assertEqual(len(rows), 3)
-		self.assertEqual({r.fieldname for r in rows}, {"ai_complexity", "ai_importance", "ai_score_reason"})
-		self.assertEqual({(r.visible_to, r.required) for r in rows}, {("Agents", 0)})
+		# spec changed (CHG-017): the bot fills the scores, so they are not on the ticket form.
+		self.assertEqual(rows, [])
 
 	def _task_ticket_field(self):
 		return frappe.db.get_value(
@@ -875,27 +888,20 @@ class TestFeat007Migrate(FrappeTestCase):
 			),
 			"ai_confidence_pct",
 		)
-		rows = frappe.get_all(
-			"HD Ticket Template Field",
-			filters={"parent": TEMPLATE, "fieldname": "ai_confidence_pct"},
-			fields=["visible_to", "required", "editable_after_creation"],
-		)
-		self.assertEqual(
-			[(r.visible_to, r.required, r.editable_after_creation) for r in rows], [("Agents", 0, 0)]
-		)
 		install.after_migrate()
 		self.assertEqual(
 			frappe.db.count("Custom Field", {"dt": "HD Ticket", "fieldname": "ai_confidence_pct"}), 1
 		)
+		# spec changed (CHG-017): the bot fills it, so it gets no ticket-form row.
 		self.assertEqual(
 			frappe.db.count(
 				"HD Ticket Template Field", {"parent": TEMPLATE, "fieldname": "ai_confidence_pct"}
 			),
-			1,
+			0,
 		)
 
 	def test_run_info_fields_installed(self):
-		"""What a run concluded and did is stored on the ticket: read-only, permlevel 8, shown to agents."""
+		"""What a run concluded and did is stored on the ticket: read-only, permlevel 8, shown in the ERP AI panel."""
 		for name in RUN_INFO_FIELDS:
 			frappe.db.delete("Custom Field", {"dt": "HD Ticket", "fieldname": name})
 			frappe.db.delete("HD Ticket Template Field", {"parent": TEMPLATE, "fieldname": name})
@@ -912,13 +918,9 @@ class TestFeat007Migrate(FrappeTestCase):
 					(label, fieldtype, 1, 8, "ERP AI agent"),
 				)
 				self.assertEqual(field.insert_after, previous)
-				rows = frappe.get_all(
-					"HD Ticket Template Field",
-					filters={"parent": TEMPLATE, "fieldname": name},
-					fields=["visible_to", "required", "editable_after_creation"],
-				)
+				# spec changed (CHG-017): no ticket-form row for a field the bot fills.
 				self.assertEqual(
-					[(r.visible_to, r.required, r.editable_after_creation) for r in rows], [("Agents", 0, 0)]
+					frappe.db.count("HD Ticket Template Field", {"parent": TEMPLATE, "fieldname": name}), 0
 				)
 			previous = name
 		# No field name may read as a stored "already has guidance" flag (ADR-036 QĐ 6).

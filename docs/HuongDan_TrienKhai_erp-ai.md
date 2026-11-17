@@ -572,7 +572,7 @@ HD Ticket Comment dự kiến: `reference_ticket`, `content`, `commented_by`.
 
 Giao diện Helpdesk là SPA riêng, nhưng **không cần vá fork**:
 
-- **HD Ticket Template** — thêm custom field vào HD Ticket bằng Customize Form, rồi đăng ký field đó vào template bản `Default` thì giao diện Helpdesk mới hiện. Đặt `Hide from Customer` cho các trường `ai_*`.
+- **HD Ticket Template** — thêm custom field vào HD Ticket bằng Customize Form, rồi đăng ký field đó vào template bản `Default` thì giao diện Helpdesk mới hiện. Đặt `Hide from Customer` cho các trường `ai_*`. Từ CHG-017, app chỉ đăng ký vào template trường người điền (`ai_opt_out`, "Không dùng AI cho phiếu này"); các trường bot điền không nằm trên form tạo phiếu và thanh bên phiếu, xem chúng ở ngăn ERP AI.
 - **HD Form Script** (Apply To = Form) — thêm script client và **Custom Action** (nút bấm) vào trang ticket.
 
 **Cần kiểm chứng:** HD Ticket Template bị đánh dấu *deprecated* ở một số bản helpdesk mới. Xem bản đang chạy dùng cơ chế nào.

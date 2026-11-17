@@ -9,7 +9,7 @@ import frappe
 from frappe.tests.utils import FrappeTestCase
 from helpdesk.test_utils import make_ticket
 
-from erp_ai.agent import labels, ops_data, runner
+from erp_ai.agent import ops_data, runner
 from erp_ai.agent.classification import DEFAULT_CATEGORY_MAPPING
 from erp_ai.agent.prompts import build_classify_request
 from erp_ai.agent.routing import decide_route
@@ -18,7 +18,13 @@ from erp_ai.eval import run_eval
 from erp_ai.eval.run_eval import _predict, compute_metrics, format_report
 from erp_ai.eval.run_eval import run as run_eval_run
 from erp_ai.gateway import GatewayError
-from erp_ai.test_utils import FakeGateway, make_model_result, make_routing_rules, set_agent_settings
+from erp_ai.test_utils import (
+	FakeGateway,
+	make_model_result,
+	make_routing_rules,
+	set_agent_settings,
+	set_tag_assignees,
+)
 
 PREFIX = "ERPAI-TEST-"
 
@@ -330,11 +336,9 @@ class TestRunEvalRun(FrappeTestCase):
 		)
 		# learning off: no lesson of the shared site reaches the runner's request (NFR-7, FEAT-008 ruling R7)
 		set_agent_settings(lessons_enabled=0)
-		# ADR-049: the runner's label inputs are the site's live modules and tags; the offline eval has none, so the
-		# shared builder is compared without them (STD-TEST-6)
-		label_patch = patch.object(labels, "classify_inputs", return_value=labels.LabelInputs())
-		label_patch.start()
-		self.addCleanup(label_patch.stop)
+		# CHG-014: the runner's tag choices are the site's tag table; the offline eval has none, so the shared builder
+		# is compared with an empty table (STD-TEST-6, rolled back)
+		set_tag_assignees()
 
 	def _write(self, rows):
 		with open(self.path, "w", encoding="utf-8") as handle:

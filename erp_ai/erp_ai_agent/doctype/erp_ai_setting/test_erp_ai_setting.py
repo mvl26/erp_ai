@@ -2907,7 +2907,8 @@ class TestTagAssignees(FrappeTestCase):
 		doc = frappe.get_doc(SETTING_DOCTYPE)
 		doc.set("tag_assignees", [])
 		for row in rows:
-			doc.append("tag_assignees", row)
+			# CHG-014: a row needs its description; tests about other columns give a placeholder
+			doc.append("tag_assignees", {"description": "x", **row})
 		try:
 			doc.save()
 		except frappe.ValidationError as error:
@@ -2918,9 +2919,17 @@ class TestTagAssignees(FrappeTestCase):
 		child = json.loads(TAG_ASSIGNEE_JSON.read_text(encoding="utf-8"))
 		self.assertEqual(child["istable"], 1)
 		fields = {f["fieldname"]: f for f in child["fields"] if f["fieldtype"] != "Section Break"}
-		self.assertEqual(list(fields), ["tag", "assignee", "category"])
+		# CHG-014: the tag is typed freely (the bot creates the Tag) and the row says what work the tag is for
+		self.assertEqual(list(fields), ["tag", "description", "assignee", "category"])
+		self.assertEqual((fields["tag"]["fieldtype"], fields["tag"]["reqd"]), ("Data", 1))
+		self.assertNotIn("options", fields["tag"])
 		self.assertEqual(
-			(fields["tag"]["fieldtype"], fields["tag"]["options"], fields["tag"]["reqd"]), ("Link", "Tag", 1)
+			(
+				fields["description"]["fieldtype"],
+				fields["description"]["reqd"],
+				fields["description"]["label"],
+			),
+			("Small Text", 1, "Mô tả"),
 		)
 		self.assertEqual((fields["assignee"]["options"], fields["assignee"]["reqd"]), ("HD Agent", 1))
 		self.assertEqual(fields["category"]["options"], "\nA\nB\nC\nD\nE\nF")
@@ -2972,3 +2981,24 @@ class TestTagAssignees(FrappeTestCase):
 			self._save_rows({"tag": KHO_TAG, "assignee": AGENT_USER}),
 			"Gán người theo tag dòng 1: không gán tài khoản agent",
 		)
+
+	# CHG-014: the tag name is cleaned like a label and need not exist as a Tag
+	def test_tag_name_stored_clean(self):
+		self.assertIsNone(self._save_rows({"tag": "  chấm   công ", "assignee": self.person}))
+		self.assertEqual([r.tag for r in frappe.get_doc(SETTING_DOCTYPE).tag_assignees], ["chấm công"])
+
+	def test_bad_tag_name_refused(self):
+		for tag in ("a", "x,y"):
+			with self.subTest(tag=tag):
+				self.assertEqual(
+					self._save_rows({"tag": tag, "assignee": self.person}),
+					"Gán người theo tag dòng 1: tên tag phải dài 2 đến 40 ký tự, chỉ gồm chữ, số, khoảng trắng và "
+					"& ( ) + . / # -",
+				)
+
+	def test_tag_need_not_exist(self):
+		tag = "ERPAI-TEST-chưa có Tag"
+		self.assertFalse(frappe.db.exists("Tag", tag))
+		self.assertIsNone(self._save_rows({"tag": tag, "assignee": self.person, "description": "Việc thử"}))
+		(row,) = frappe.get_doc(SETTING_DOCTYPE).tag_assignees
+		self.assertEqual((row.tag, row.description), (tag, "Việc thử"))

@@ -19,9 +19,9 @@ URGENT_TAGS = ("[GẤP]", "[GẬP]")
 # AC-28 (design.md:409): the split question lists at most 10 requests, each cut to 200 characters.
 SPLIT_MAX_REQUESTS = 10
 SPLIT_REQUEST_MAX_CHARS = 200
-# ADR-049: the ticket's labels (`nhan`): at most 3, each one line of 2-40 characters that Frappe's comma-separated tag
+# ADR-049 with CHG-014: the ticket's label (`nhan`): at most one, one line of 2-40 characters that Frappe's comma-separated tag
 # column and the tag chips keep as typed.
-LABELS_MAX = 3
+LABELS_MAX = 1
 LABEL_MIN_CHARS, LABEL_MAX_CHARS = 2, 40
 _LABEL = re.compile(r"^[\w &()+./#-]+$")
 

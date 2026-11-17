@@ -36,15 +36,17 @@ Các câu kiểm chạy trong cửa sổ MariaDB của site: `cd /home/miyano/fr
    ```
    Mong đợi: không ít hơn số người trong bảng.
 5. **Điền `routing_rules` trên `/app/erp-ai-setting`.** Người mặc định cho từng đầu mục A, B, C và F (cả F: nếu để trống, mỗi phiếu F nhận một comment nhờ phân công); tiền tố tiêu đề nếu cần (ví dụ `"[tracecore]": "<user ID>"` ở đầu mục A); bảng `departments` cho D/E (`"<bộ phận>": {"team": "<HD Team>", "head": "<user ID trưởng bộ phận>"}`). Tạo team cho bộ phận còn thiếu (ví dụ `Tài chính Kế toán` chưa có) hoặc bỏ bộ phận đó khỏi bảng; bộ phận trỏ tới nhóm không tồn tại thì bot không ghi nhóm và nhật ký ghi lý do. Người điền phải là user có thật (lưu sẽ báo lỗi kèm đường dẫn khóa sai nếu không). Không điền tài khoản agent: bot không bao giờ gán tài khoản này. Kiểm: lưu `ERP AI Setting` không báo lỗi.
-5b. **(Tùy chọn, CHG-011) Điền bảng "Gán người theo tag"** ngay trên ô `routing_rules`. Mỗi dòng: một Tag, một HD Agent, đầu mục (để trống là mọi đầu mục). Cách bot đọc bảng:
-   - Bot đọc bảng **từ trên xuống**: dòng đầu tiên có tag nằm trên phiếu và có đầu mục để trống hoặc đúng đầu mục của phiếu quyết người nhận phiếu và Task C/D. Tag trên phiếu gồm tag do HD Agent gắn và nhãn bot vừa đặt (nhãn đầu là **tên phân hệ**, ví dụ `Accounts`, `Stock`; sau đó tối đa hai nhãn chủ đề); thứ tự các tag trên phiếu không quan trọng.
-   - Muốn việc chuyên biệt thắng việc chung thì đặt dòng của nó lên trên. Ví dụ đặt `tracecore` trên `Accounts`: phiếu Tracecore có chạm kế toán vẫn về người của `tracecore`.
-   - Dòng để trống đầu mục áp cả cho phiếu D/E, tức thắng trưởng bộ phận trong `departments`. Muốn dòng của một đầu mục thắng dòng để trống cùng tag thì đặt nó lên trên; muốn D/E vẫn về trưởng bộ phận thì ghi đầu mục cụ thể (A, B, C, F) cho dòng.
-   - Tag do người tạo phiếu tự gắn không được tính (Frappe cho người tạo phiếu gắn tag lên phiếu của mình).
+5b. **(Tùy chọn, CHG-011, CHG-014) Điền bảng "Gán người theo tag"** ngay trên ô `routing_rules`. Bảng này vừa là **danh sách tag** của phiếu, vừa là bảng chia việc. Mỗi dòng: **Tag** (gõ tên tự do, ví dụ `chấm công`, `tracecore`, `kế toán`, `hr`; 2 đến 40 ký tự, không dấu phẩy; không cần tạo Tag trước), **Mô tả** (việc nào thuộc tag này, ví dụ "chấm công, bảng công, đi muộn, nghỉ phép"), một HD Agent, đầu mục (để trống là mọi đầu mục). Cách bot dùng bảng:
+   - Mỗi phiếu mới nhận **đúng một tag** của bảng: lúc phân loại, bot đọc các dòng "tag: mô tả" và chọn tag có mô tả hợp nhất. Không tag nào hợp thì phiếu không có tag. Bot không đặt tag ngoài bảng và không còn gắn tên phân hệ (Accounts, Stock…) hay nhãn chủ đề.
+   - Lần đầu bot gắn một tag, Tag đó được tạo tự động.
+   - Một tag có nhiều dòng (khác đầu mục) thì bot đọc mô tả ở dòng đầu tiên của tag. Mô tả nói về loại việc, không nêu tên người.
+   - Phiếu đã có tag do HD Agent gắn thì bot không gắn tag của mình; tag do người tạo phiếu tự gắn không được tính (Frappe cho người tạo phiếu gắn tag lên phiếu của mình).
+   - Gán người: bot đọc bảng **từ trên xuống**; dòng đầu tiên có tag của phiếu và đầu mục để trống hoặc đúng đầu mục của phiếu quyết người nhận phiếu và Task C/D (cần bật `auto_assign_enabled`). Dòng để trống đầu mục áp cả cho D/E, tức thắng trưởng bộ phận; muốn dòng của một đầu mục thắng dòng để trống cùng tag thì đặt nó lên trên.
    - Người trong dòng không còn là HD Agent đang hoạt động thì bot bỏ qua dòng đó, ghi lý do vào nhật ký, rồi xét dòng tiếp theo; không dòng nào cho được người thì dùng `routing_rules` như cũ.
-   - Mọi tag trong bảng luôn được đưa cho bot lúc phân loại, kể cả tag chưa phiếu nào mang. Viết **Mô tả** cho từng Tag (`/app/tag/<tên>`) để bot biết khi nào gắn tag đó; mô tả nói về loại việc, không nêu tên người.
-   - Comment định tuyến ghi "Đã gán cho X (theo tag Y)."; trong `ERP AI Log`, hành động `assign_owner` có `rule` là `tag:Y`.
-   - Kiểm: lưu `ERP AI Setting` không báo lỗi (dòng trùng tag và đầu mục, hoặc dòng chọn tài khoản agent, bị chặn).
+   - Comment định tuyến ghi "Bot đã gắn nhãn: Y." và "Đã gán cho X (theo tag Y)."; trong `ERP AI Log`, hành động `assign_owner` có `rule` là `tag:Y`.
+   - Phiếu cũ đang mang nhiều tag (từ trước CHG-014) giữ nguyên.
+   - Site đã điền bảng từ trước CHG-014: lần `migrate` lên CHG-014 tự điền Mô tả cho dòng còn trống, lấy từ Mô tả của bản ghi Tag, không có thì lấy chính tên tag. Nên xem lại và viết Mô tả rõ hơn; Mô tả trên bản ghi Tag không còn được dùng.
+   - Kiểm: lưu `ERP AI Setting` không báo lỗi (tên tag sai luật, thiếu mô tả, dòng trùng tag và đầu mục, hoặc dòng chọn tài khoản agent bị chặn).
 6. **Xem lại `excluded_teams`.** Site đang để rỗng, khác mặc định (`Nhân sự & Hành chính`, `Tài chính Kế toán`). Phiếu thuộc nhóm trong danh sách này không gửi lên API và bot không chọn nhóm đó. Kiểm:
    ```sql
    SELECT value FROM tabSingles WHERE doctype='ERP AI Setting' AND field='excluded_teams';

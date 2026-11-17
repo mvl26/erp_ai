@@ -815,17 +815,11 @@ def _classify(
 		as_dict=True,
 	)
 	subject = ticket.subject
-	# CHG-011: the rows of the tag table; their tags always reach the label catalog
+	# CHG-011, CHG-014: the rows of the tag table; their tags and descriptions are the tags the model may give
 	rules = tag_rules(settings)
+	choices = ticket_labels.tag_choices(rules)
 	field_values = _ticket_field_values(ticket_name, field_map)
 	lessons = _lessons(settings, subject, ticket.description)
-	label_inputs = _label_inputs(
-		ticket_name,
-		run_id,
-		subject,
-		ticket.description,
-		pinned=tuple(dict.fromkeys(rule.tag for rule in rules)),
-	)
 	base = {
 		"ticket": ticket_name,
 		"run_id": run_id,
@@ -845,7 +839,7 @@ def _classify(
 				ticket_fields=field_values,
 				later_messages=later_messages,
 				lessons=lessons,
-				**label_inputs._asdict(),
+				tag_choices=choices,
 			),
 			max_tokens=CLASSIFY_MAX_TOKENS,
 			deadline=deadline,
@@ -876,8 +870,10 @@ def _classify(
 		write_entry(**base, **call_fields, error=error, stop_reason="unparseable")
 		_log_classify(ticket_name, run_id, False, ticket.creation)
 		return True, None, context
+	# CHG-014: one tag of the table, spelled as the table; none when an HD Agent already tagged the ticket
+	agent = ticket_labels.agent_tags(ticket_name, site_facts.is_active_agent)
 	classification = dataclasses.replace(
-		classification, labels=ticket_labels.canonical(classification.labels, label_inputs.modules)
+		classification, labels=() if agent else ticket_labels.chosen_tag(classification.labels, choices)
 	)
 
 	# U2 (AC-9 b, U2.md:164-172): the team the department maps to is learnt from the predicate decide_route asks
@@ -901,8 +897,8 @@ def _classify(
 		due_field_configured="due_date" in field_map,
 		d_watcher=settings.get("d_ticket_watcher") or "",
 		now=now_datetime(),
-		# CHG-011: the tags an HD Agent put on the ticket, then the model's labels
-		tags=(*ticket_labels.agent_tags(ticket_name, site_facts.is_active_agent), *classification.labels),
+		# CHG-011, CHG-014: the tags an HD Agent put on the ticket, else the one tag the bot chose
+		tags=(*agent, *classification.labels),
 		tag_rules=rules,
 	)
 	# a department named like an excluded team counts too
@@ -1023,18 +1019,6 @@ def _lessons_used(lessons: list[dict]) -> dict:
 	"""The usage trace of a step's rows (AC-17): `lessons_used`, the names of the lessons the step sent; none sent
 	gives no key, so the rows stay as before."""
 	return {"lessons_used": [lesson["name"] for lesson in lessons]} if lessons else {}
-
-
-def _label_inputs(ticket_name, run_id, subject, description, pinned=()) -> ticket_labels.LabelInputs:
-	"""The label inputs of the classify request (ADR-049); a failed read never stops the classification: no label
-	inputs then, one logger line with the exception class."""
-	try:
-		return ticket_labels.classify_inputs(ticket_name, subject, description, pinned=pinned)
-	except Exception as exc:
-		frappe.logger(LOGGER_NAME).warning(
-			"erp_ai labels ticket=%s run_id=%s error=%s", ticket_name, run_id, type(exc).__name__
-		)
-		return ticket_labels.LabelInputs()
 
 
 def _complexity(score, reason) -> dict:

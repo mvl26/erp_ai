@@ -2921,7 +2921,16 @@ class TestTagAssignees(FrappeTestCase):
 		self.assertEqual(child["istable"], 1)
 		fields = {f["fieldname"]: f for f in child["fields"] if f["fieldtype"] != "Section Break"}
 		# CHG-014: the tag is typed freely (the bot creates the Tag) and the row says what work the tag is for
-		self.assertEqual(list(fields), ["tag", "description", "assignee", "category"])
+		self.assertEqual(list(fields), ["tag", "description", "assignee", "category", "bot_added"])
+		# CHG-018 review fix I1: a row the bot added says so until a System Manager has read it
+		self.assertEqual(
+			(
+				fields["bot_added"]["fieldtype"],
+				fields["bot_added"]["label"],
+				fields["bot_added"].get("default"),
+			),
+			("Check", "Bot tạo, chưa duyệt", "0"),
+		)
 		self.assertEqual((fields["tag"]["fieldtype"], fields["tag"]["reqd"]), ("Data", 1))
 		self.assertNotIn("options", fields["tag"])
 		self.assertEqual(

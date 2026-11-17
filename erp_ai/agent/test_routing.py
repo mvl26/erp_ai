@@ -1213,6 +1213,19 @@ class TestTagRowWithoutPerson(FrappeTestCase):
 		)
 		self.assertEqual(routing.tag_rules(settings), (routing.TagRule("kế toán", "", "", "Hóa đơn"),))
 
+	# review fix I1: the description of a bot row nobody has read stays out of the classify request
+	def test_unreviewed_bot_row_gives_its_tag_without_its_description(self):
+		settings = frappe._dict(
+			tag_assignees=[
+				frappe._dict(tag="kế toán", assignee=None, category=None, description="bot", bot_added=1),
+				frappe._dict(tag="hr", assignee="a@x.com", category=None, description="Nhân sự", bot_added=0),
+			]
+		)
+		self.assertEqual(
+			routing.tag_rules(settings),
+			(routing.TagRule("kế toán", "", "", ""), routing.TagRule("hr", "a@x.com", "", "Nhân sự")),
+		)
+
 	def test_row_without_a_person_is_passed_over_with_a_note(self):
 		rules = (routing.TagRule("kế toán", "", "", "x"), routing.TagRule("kế toán", "hieu@x.com", "", "x"))
 		d = _decide_by_tags("C", ("kế toán",), rules)

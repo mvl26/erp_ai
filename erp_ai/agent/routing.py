@@ -75,9 +75,15 @@ def tag_key(tag) -> str:
 
 def tag_rules(settings) -> tuple[TagRule, ...]:
 	"""The rows of `tag_assignees` in order, rows without a tag left out; () when the field is absent. CHG-018: a row
-	without a person is kept (assignee ""): its tag is one the bot may give, and it gives nobody."""
+	without a person is kept (assignee ""): its tag is one the bot may give, and it gives nobody. The description of
+	a row the bot added and nobody has reviewed (`bot_added`) is left out: it came from a ticket's content."""
 	return tuple(
-		TagRule(row.tag, row.assignee or "", row.category or "", row.get("description") or "")
+		TagRule(
+			row.tag,
+			row.assignee or "",
+			row.category or "",
+			"" if row.get("bot_added") else row.get("description") or "",
+		)
 		for row in settings.get("tag_assignees") or ()
 		if row.tag
 	)

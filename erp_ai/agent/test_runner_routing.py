@@ -2113,7 +2113,11 @@ class TestRoutingNewTag(RoutingTestBase):
 		self.assertEqual(
 			action,
 			action_entry(
-				runner.TAG_ROW_TOOL, SETTING_DOCTYPE, SETTING_DOCTYPE, True, value_after={"tag": NEW_TAG}
+				runner.TAG_ROW_TOOL,
+				SETTING_DOCTYPE,
+				SETTING_DOCTYPE,
+				True,
+				value_after={"tag": NEW_TAG, "description": NEW_TAG_DESCRIPTION},
 			),
 		)
 		(lines,) = captured
@@ -2130,8 +2134,10 @@ class TestRoutingNewTag(RoutingTestBase):
 		self.assertEqual(self._labels_of(self.ticket.name), [NEW_TAG])
 		self.assertEqual([row.tag for row in self._rows()], [LABEL_KHO, LABEL_IN, NEW_TAG])
 		self.assertEqual(self._row_actions(), [])
+		# review fix I1: listed by name only until a System Manager has read the row
 		text = self.gateway.calls[-2]["system"][0]["text"]
-		self.assertIn(f"- {NEW_TAG}: {NEW_TAG_DESCRIPTION}", text)
+		self.assertIn(f"\n- {NEW_TAG}", text)
+		self.assertNotIn(NEW_TAG_DESCRIPTION, text)
 
 	def test_no_new_tag_without_a_description_or_on_a_noise_ticket(self):
 		cases = {
@@ -2140,6 +2146,13 @@ class TestRoutingNewTag(RoutingTestBase):
 				f"tag {NEW_TAG} không có trong bảng Gán người theo tag và thiếu mô tả để tạo tag mới",
 			),
 			"category F": (_classify_new(category="F"), "phiếu đầu mục F không nhận tag mới"),
+			# review fix M1: the reason reads the model's own description
+			"Helpdesk's own tag": (
+				_classify_new(tag="First Ticket"),
+				"tag First Ticket không có trong bảng Gán người theo tag",
+			),
+			# review fix M2: a new tag whose name breaks the rule is dropped when parsed; the log says so
+			"bad name": (_classify_new(tag="ERP: phân quyền"), "tag mới sai luật đặt tên nên không được gắn"),
 		}
 		for name, (text, reason) in cases.items():
 			with self.subTest(name):

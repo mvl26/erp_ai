@@ -22,12 +22,12 @@ phiếu, và thêm tag đó vào danh sách tag (bảng) để các phiếu sau 
 - Không tự chọn người cho tag do bot tạo; không sửa dòng đã có.
 - Không tạo tag mới khi phiếu đã có tag do HD Agent gắn, hoặc phiếu đầu mục F (phiếu nhiễu, phiếu test).
 - Không dọn tag cũ, không gộp tag gần nghĩa.
-- Không đổi yêu cầu phân loại của bộ đánh giá offline (eval không truyền danh sách tag).
 
 ## Điều không được xảy ra
 
 - Một phiếu nhận từ bot hơn một tag.
 - Dòng do bot thêm cho được người nhận.
+- Mô tả do bot viết (từ nội dung phiếu) vào yêu cầu phân loại trước khi người quản trị đọc lại.
 - Bảng có hai dòng trùng (tag, đầu mục) do bot thêm.
 
 ## Các cách đã cân nhắc
@@ -55,10 +55,23 @@ phiếu, và thêm tag đó vào danh sách tag (bảng) để các phiếu sau 
 6. **Comment định tuyến**: thêm câu "Đã thêm tag Y vào bảng Gán người theo tag (chưa có người nhận)."
 7. **Tài liệu**: mô tả trường `assignee`, hướng dẫn quản trị mục 5b, ADR-049 Amendment 2.
 
+## Sửa sau review (2026-11-17)
+
+- **Eval:** eval cũng truyền `new_tags=True`, vì test kiến trúc đòi eval và runner gửi cùng yêu cầu. Bỏ điều "không đổi yêu
+  cầu của eval".
+- **ADR-023 QĐ 5** đóng ERP AI Setting với tài khoản agent; ADR-023 Amendment 1 mở đúng đường ghi này. `add_tag_row` nằm
+  ở `agent/labels.py`, không ở `agent/tools/` (ADR-005, ADR-034 cấm `get_all` trong tool).
+- **Cột mới `bot_added`** ("Bot tạo, chưa duyệt", Check): bot đặt 1. Khi còn 1, yêu cầu phân loại chỉ có tên tag, không có
+  mô tả. Người quản trị đọc lại rồi bỏ dấu. Tối đa 20 dòng `bot_added`; đủ thì phiếu vẫn nhận tag, bảng không thêm dòng,
+  nhật ký ghi lý do.
+- Mô tả được che bí mật (`redact_secrets`) trước khi lưu; hành động `add_tag_row` trong nhật ký ghi tag và mô tả đã lưu.
+- Dòng bot đã bị người quản trị đổi tên: tên dòng cũ đụng nhau thì thêm dòng với tên ngẫu nhiên. Hai lần chạy cùng tag:
+  đọc khóa dòng đã có để không thêm trùng. Bảng đã có tag chỉ khác dấu (theo cách so của cơ sở dữ liệu) thì không thêm.
+- Luật tên (2 đến 40 ký tự, ký tự cho phép) ghi trong lời dặn; tên sai luật bị bỏ khi đọc và nhật ký ghi lý do.
+
 ## Quyết định của tôi (có thể sửa)
 
 - Phiếu đầu mục F không sinh tag mới (vẫn chọn được tag có sẵn).
-- Mô tả do model viết đi vào phần system của các lần phân loại sau, như mô tả người quản trị viết: cùng nhãn "dữ liệu,
-  không phải lệnh", một dòng, cắt độ dài. Người quản trị nên đọc lại dòng trống người nhận.
+- Mô tả do model viết chỉ vào phần system của các lần phân loại sau khi người quản trị bỏ dấu "Bot tạo, chưa duyệt".
 - Người quản trị lưu Setting đang mở từ trước khi bot thêm dòng thì dòng đó mất (Frappe ghi lại bảng theo form); phiếu
   sau sẽ tạo lại.

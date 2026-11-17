@@ -170,6 +170,7 @@ LABEL_AGENT_TAGGED = "phiếu đã có tag do HD Agent gắn"
 # CHG-018: why an answered tag outside the table did not become a new tag.
 LABEL_NO_DESCRIPTION = "tag {tag} không có trong bảng Gán người theo tag và thiếu mô tả để tạo tag mới"
 LABEL_NO_NEW_TAG_NOISE = "phiếu đầu mục F không nhận tag mới"
+LABEL_BAD_NEW_TAG = "tag mới sai luật đặt tên nên không được gắn"
 # CHG-015: no rule gave a person; the Setting's default took the ticket.
 ROUTE_ASSIGNED_BY_DEFAULT = "Đã gán cho {person} (người nhận mặc định)."
 ROUTE_TASK = "Đã tạo Task {task}."
@@ -887,12 +888,11 @@ def _classify(
 	# CHG-018: no tag of the table answered → the model's new tag, its description kept for the table row
 	agent = ticket_labels.agent_tags(ticket_name, site_facts.is_active_agent)
 	answered = classification.labels
+	described = classification.label_description
 	picked = () if agent else ticket_labels.chosen_tag(answered, choices)
 	made = None
 	if not agent and not picked:
-		made = ticket_labels.new_tag(
-			answered, classification.label_description, classification.category, choices
-		)
+		made = ticket_labels.new_tag(answered, described, classification.category, choices)
 	classification = dataclasses.replace(
 		classification,
 		labels=picked or ((made[0],) if made else ()),
@@ -901,7 +901,11 @@ def _classify(
 	# CHG-016: an answered tag the bot does not give leaves its reason in the log
 	label_note = None
 	if answered and not classification.labels:
-		label_note = {"field": "nhan", "reason": _label_reason(answered[0], agent, classification)}
+		reason = _label_reason(answered[0], agent, classification.category, described)
+		label_note = {"field": "nhan", "reason": reason}
+	elif described and not answered and not agent:
+		# a description without a usable tag: the new tag's name broke the rule and was dropped when parsed
+		label_note = {"field": "nhan", "reason": LABEL_BAD_NEW_TAG}
 
 	# U2 (AC-9 b, U2.md:164-172): the team the department maps to is learnt from the predicate decide_route asks
 	probe_hits = []
@@ -1354,13 +1358,14 @@ def _route_lines(
 	return lines
 
 
-def _label_reason(answered, agent, classification) -> str:
-	"""Why the bot gives the ticket no tag although the model answered one (CHG-016, CHG-018)."""
+def _label_reason(answered, agent, category, described) -> str:
+	"""Why the bot gives the ticket no tag although the model answered one (CHG-016, CHG-018); `described` is the
+	model's own description of a new tag."""
 	if agent:
 		return LABEL_AGENT_TAGGED
-	if classification.category == ticket_labels.NO_NEW_TAG_CATEGORY:
+	if category == ticket_labels.NO_NEW_TAG_CATEGORY:
 		return LABEL_NO_NEW_TAG_NOISE
-	if not classification.label_description:
+	if not described:
 		return LABEL_NO_DESCRIPTION.format(tag=answered)
 	return LABEL_NOT_IN_TABLE.format(tag=answered)
 
@@ -1388,7 +1393,7 @@ def _tag_row_unit(classification, labelled, context, actions, errors) -> str | N
 			SETTING_DOCTYPE,
 			SETTING_DOCTYPE,
 			True,
-			value_after={"tag": tag},
+			value_after={"tag": tag, "description": result["description"]},
 			instructor=context.instructor,
 		)
 	)

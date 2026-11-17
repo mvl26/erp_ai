@@ -585,6 +585,9 @@ class TestTagsInClassifyRequest(FrappeTestCase):
 			"y hệt",
 			"nhóm việc chung",
 			"đầu mục F",
+			# review fix M2: the name rule the code applies
+			"2 đến 40 ký tự",
+			"& ( ) + . / # -",
 		):
 			with self.subTest(phrase=phrase):
 				self.assertIn(phrase, prompts.NEW_TAGS_BLOCK)

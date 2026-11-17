@@ -164,6 +164,8 @@ ROUTE_NO_CHANGE = "Bot đã phân loại phiếu, các trường đã đúng nê
 ROUTE_ASSIGNED = "Đã gán cho {person}."
 # CHG-011: the person came from the tag table of ERP AI Setting.
 ROUTE_ASSIGNED_BY_TAG = "Đã gán cho {person} (theo tag {tag})."
+# CHG-015: no rule gave a person; the Setting's default took the ticket.
+ROUTE_ASSIGNED_BY_DEFAULT = "Đã gán cho {person} (người nhận mặc định)."
 ROUTE_TASK = "Đã tạo Task {task}."
 ROUTE_WATCHER = "Đã thêm {person} làm người theo dõi."
 # ADR-049: the labels the route gave the ticket (Helpdesk Tags)
@@ -900,6 +902,7 @@ def _classify(
 		# CHG-011, CHG-014: the tags an HD Agent put on the ticket, else the one tag the bot chose
 		tags=(*agent, *classification.labels),
 		tag_rules=rules,
+		default_assignee=settings.get("default_assignee") or None,
 	)
 	# a department named like an excluded team counts too
 	excluded = bool(probe_hits) or policy.is_excluded_team(classification.department)
@@ -1091,7 +1094,9 @@ def _route(
 				task = _task_unit(assigned, subject, classification, context, actions, lines, errors)
 			if decision.watcher:
 				watcher = _watch_unit(decision.watcher, context, actions, errors)
-			done = _route_lines(result, assigned, task, watcher, labelled, decision.assignee_tag)
+			done = _route_lines(
+				result, assigned, task, watcher, labelled, decision.assignee_tag, decision.assignee_default
+			)
 			others = [*lines, *([split_text] if split_text else [])]
 			lines = [*done, *others]
 			if collect_run_id and collecting(collect_run_id):
@@ -1192,6 +1197,8 @@ def _assign_unit(decision, context, actions, lines, errors):
 	if _run_unit("assign_owner", lambda: assign_owner(user, context), "HD Ticket", user, actions, errors):
 		# CHG-011: a person from the tag table names the tag as the rule
 		rule = f"tag:{decision.assignee_tag}" if decision.assignee_tag else None
+		# CHG-015: the default person names itself as the rule
+		rule = "default" if decision.assignee_default else rule
 		actions.append(
 			_route_action("assign_owner", "HD Ticket", user, True, rule=rule, instructor=context.instructor)
 		)
@@ -1278,7 +1285,9 @@ def _collect_route_lines(run_id, done, others) -> bool:
 	return bool(done or others)
 
 
-def _route_lines(result, assigned, task, watcher, labelled=(), assigned_tag=None) -> list[str]:
+def _route_lines(
+	result, assigned, task, watcher, labelled=(), assigned_tag=None, assigned_default=False
+) -> list[str]:
 	"""The route comment's own sentences (U4b.md:247): fields written, labels given (ADR-049), person given, Task
 	created, watcher added.
 
@@ -1294,6 +1303,8 @@ def _route_lines(result, assigned, task, watcher, labelled=(), assigned_tag=None
 		lines.append(ROUTE_LABELS.format(labels=", ".join(labelled)))
 	if assigned and assigned_tag:
 		lines.append(ROUTE_ASSIGNED_BY_TAG.format(person=get_fullname(assigned), tag=assigned_tag))
+	elif assigned and assigned_default:
+		lines.append(ROUTE_ASSIGNED_BY_DEFAULT.format(person=get_fullname(assigned)))
 	elif assigned:
 		lines.append(ROUTE_ASSIGNED.format(person=get_fullname(assigned)))
 	if task:

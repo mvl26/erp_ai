@@ -53,6 +53,8 @@ class RouteDecision:
 	watcher: str | None = None
 	# CHG-011: the tag of the table row that chose `assignee`; None when the routing rules chose it.
 	assignee_tag: str | None = None
+	# CHG-015: True when the Setting's default person took the ticket because no rule gave one.
+	assignee_default: bool = False
 
 
 class TagRule(NamedTuple):
@@ -89,6 +91,7 @@ def decide_route(
 	now: datetime | None = None,
 	tags: tuple[str, ...] = (),
 	tag_rules: tuple[TagRule, ...] = (),
+	default_assignee: str | None = None,
 ) -> RouteDecision:
 	"""Priority per R1-R5 and the due-date exceptions (AC-25); team per mapping or department;
 	assignee by category/prefix; needs_task for C/D; watcher for D (AC-27).
@@ -101,6 +104,9 @@ def decide_route(
 
 	tags, tag_rules (CHG-011): the ticket's tags and the table rows; the first usable row, top-down, whose tag the
 	ticket carries chooses the assignee before the routing rules.
+
+	default_assignee (CHG-015): the person who takes the ticket when neither the table nor the routing rules give a
+	usable one; it must be an active HD Agent other than the bot too.
 	"""
 	entry = mapping.get(classification.category) or {}
 	notes = []
@@ -113,6 +119,10 @@ def decide_route(
 		_assignee(classification, subject, config, is_active_agent, notes),
 		None,
 	)
+	assignee_default = False
+	if assignee is None and default_assignee:
+		assignee = _default_assignee(default_assignee, is_active_agent, notes)
+		assignee_default = assignee is not None
 	if classification.category in ("B", "D") and due_field_configured is False:
 		notes.append({"field": "due_at", "reason": DUE_FIELD_MISSING_NOTE})
 		due_at = None
@@ -126,6 +136,7 @@ def decide_route(
 		notes=tuple(notes),
 		watcher=watcher,
 		assignee_tag=assignee_tag,
+		assignee_default=assignee_default,
 	)
 
 
@@ -188,6 +199,22 @@ def _assignee(classification, subject, config, is_active_agent, notes) -> str | 
 		notes.append({"field": "assignee", "reason": f"{candidate} không phải HD Agent đang hoạt động"})
 		return None
 	return candidate
+
+
+def _default_assignee(person, is_active_agent, notes) -> str | None:
+	"""The Setting's default person when usable (CHG-015); None with a note when it is the bot or no active HD Agent."""
+	if person.strip().casefold() == AGENT_USER.casefold():
+		notes.append({"field": "assignee", "reason": "người nhận mặc định: không gán tài khoản agent"})
+		return None
+	if not is_active_agent(person):
+		notes.append(
+			{
+				"field": "assignee",
+				"reason": f"người nhận mặc định {person} không phải HD Agent đang hoạt động",
+			}
+		)
+		return None
+	return person
 
 
 def _tag_assignee(category, tags, rules, is_active_agent, notes) -> tuple[str, str] | None:

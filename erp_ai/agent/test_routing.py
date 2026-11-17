@@ -1111,3 +1111,62 @@ class TestTagRules(FrappeTestCase):
 
 	def test_setting_without_the_table_gives_no_rules(self):
 		self.assertEqual(routing.tag_rules(frappe._dict()), ())
+
+
+# CHG-015 (spec 2026-11-17-default-assignee-design.md, design 2): the default person takes what no rule gives.
+EMPTY_ASSIGN_CONFIG = {
+	"assignees": {cat: {"default": "", "prefixes": {}} for cat in "ABCF"},
+	"departments": {},
+}
+
+
+def _decide_default(
+	category, default="d@x.com", tags=(), rules=(), config=None, is_active_agent=None, department=None
+):
+	return routing.decide_route(
+		Classification(category=category, confidence="Cao", importance=1, department=department),
+		"Thông thường",
+		DEFAULT_CATEGORY_MAPPING,
+		EMPTY_ASSIGN_CONFIG if config is None else config,
+		team_exists=lambda team: True,
+		is_excluded_team=lambda team: False,
+		is_active_agent=is_active_agent or (lambda user: True),
+		tags=tags,
+		tag_rules=rules,
+		default_assignee=default,
+	)
+
+
+class TestDecideDefaultAssignee(FrappeTestCase):
+	def test_no_rule_gives_the_default(self):
+		for category in "ABCDEF":
+			with self.subTest(category=category):
+				d = _decide_default(category)
+				self.assertEqual((d.assignee, d.assignee_default, d.assignee_tag), ("d@x.com", True, None))
+		self.assertTrue(_decide_default("C").needs_task)
+
+	def test_a_tag_row_wins(self):
+		d = _decide_default("C", tags=("hr",), rules=(routing.TagRule("hr", "h@x.com", ""),))
+		self.assertEqual((d.assignee, d.assignee_default), ("h@x.com", False))
+
+	def test_a_routing_rules_person_wins(self):
+		d = _decide_default("B", config=ASSIGN_CONFIG)
+		self.assertEqual((d.assignee, d.assignee_default), ("b.default@x.com", False))
+
+	def test_an_inactive_routing_person_falls_to_the_default(self):
+		d = _decide_default("B", config=ASSIGN_CONFIG, is_active_agent=lambda user: user != "b.default@x.com")
+		self.assertEqual((d.assignee, d.assignee_default), ("d@x.com", True))
+		self.assertIn("b.default@x.com không phải HD Agent đang hoạt động", _assignee_notes(d))
+
+	def test_an_unusable_default_is_noted(self):
+		d = _decide_default("A", is_active_agent=lambda user: user != "d@x.com")
+		self.assertEqual((d.assignee, d.assignee_default), (None, False))
+		self.assertIn("người nhận mặc định d@x.com không phải HD Agent đang hoạt động", _assignee_notes(d))
+		d = _decide_default("A", default=AGENT_USER)
+		self.assertEqual((d.assignee, d.assignee_default), (None, False))
+		self.assertIn("người nhận mặc định: không gán tài khoản agent", _assignee_notes(d))
+
+	def test_no_default_changes_nothing(self):
+		d = _decide_default("A", default=None)
+		self.assertEqual((d.assignee, d.assignee_default), (None, False))
+		self.assertEqual(_assignee_notes(d), ["cấu hình không có người cho đầu mục A"])

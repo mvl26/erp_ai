@@ -35,6 +35,16 @@ DEFAULT_CATEGORY_MAPPING = {
 	"F": {"ticket_type": "Câu hỏi, phiếu nhiễu", "agent_group": "IT", "priority": "Low"},
 }
 
+# Guide 16.1, "Dấu hiệu nhận biết" column: the description of the ticket type a fresh site gets for each category.
+CATEGORY_TYPE_DESCRIPTIONS = {
+	"A": '"lỗi", "mất", "không hiển thị", có mã chứng từ cụ thể, người dùng bị chặn việc',
+	"B": "Tạo tài khoản, phân quyền, thêm trường, cấu hình tham số/ngày nghỉ/ngôn ngữ, chặn validation",
+	"C": '"xây dựng", "tích hợp", "bot", "tự động", "dashboard"; phạm vi nhiều ngày, cần BA',
+	"D": '"bổ sung", "chuẩn hóa", "đưa lên ERP", "rà soát"; đầu vào là dữ liệu nghiệp vụ của phòng ban',
+	"E": "Việc của HCNS, Kế toán, Mua hàng; không cần thay đổi hệ thống",
+	"F": "Tiêu đề rỗng/không rõ, phiếu test, hỏi cách dùng",
+}
+
 _FENCE = re.compile(r"^```(?:json)?[ \t]*\n?(.*?)\n?```$", re.DOTALL)
 
 

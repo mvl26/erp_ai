@@ -2,6 +2,11 @@ import frappe
 from frappe.custom.doctype.custom_field.custom_field import create_custom_fields
 from frappe.permissions import setup_custom_perms
 
+from erp_ai.agent.classification import (
+	CATEGORY_TYPE_DESCRIPTIONS,
+	DEFAULT_CATEGORY_MAPPING,
+	load_mapping,
+)
 from erp_ai.agent.policy import OPT_OUT_FIELD
 from erp_ai.agent.routing import DEFAULT_ROUTING_RULES
 from erp_ai.constants import (
@@ -48,6 +53,7 @@ def ensure_setup() -> None:
 	_ensure_roles()
 	_ensure_agent_user()
 	_ensure_default_settings()
+	_ensure_ticket_types_and_teams()
 	_ensure_ticket_custom_fields()
 	_ensure_template_rows()
 	_ensure_task_ticket_field()
@@ -115,6 +121,36 @@ def _ensure_default_settings() -> None:
 	):
 		# str(datetime) is the shape a form save stores (space, no ".000000"); a datetime goes through isoformat().
 		frappe.db.set_single_value(SETTING_DOCTYPE, "agent_enabled_at", str(frappe.utils.now_datetime()))
+
+
+def _ensure_ticket_types_and_teams() -> None:
+	"""Create the HD Ticket Types and HD Teams the category mapping names; one that exists is never touched."""
+	stored = frappe.db.get_single_value(SETTING_DOCTYPE, "category_mapping", cache=False)
+	mapping = load_mapping(stored) or DEFAULT_CATEGORY_MAPPING
+	logger = frappe.logger(LOGGER_NAME)
+	for category, entry in mapping.items():
+		type_name = entry.get("ticket_type") or ""
+		if type_name and not frappe.db.exists("HD Ticket Type", type_name):
+			is_default = type_name == DEFAULT_CATEGORY_MAPPING.get(category, {}).get("ticket_type")
+			priority = entry.get("priority") or ""
+			frappe.get_doc(
+				{
+					"doctype": "HD Ticket Type",
+					"name": type_name,
+					"description": CATEGORY_TYPE_DESCRIPTIONS.get(category, "") if is_default else "",
+					"priority": priority
+					if priority and frappe.db.exists("HD Ticket Priority", priority)
+					else None,
+				}
+			).insert(ignore_permissions=True)
+			logger.info("HD Ticket Type %s created for category %s", type_name, category)
+		team_name = entry.get("agent_group") or ""
+		if team_name and not frappe.db.exists("HD Team", team_name):
+			team = frappe.get_doc({"doctype": "HD Team", "team_name": team_name})
+			# Helpdesk requires members, but who staffs a team is a human decision: it starts empty.
+			team.flags.ignore_mandatory = True
+			team.insert(ignore_permissions=True)
+			logger.info("HD Team %s created for category %s", team_name, category)
 
 
 def _ensure_ticket_custom_fields() -> None:

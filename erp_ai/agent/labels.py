@@ -11,6 +11,7 @@ from typing import NamedTuple
 import frappe
 
 from erp_ai.agent import policy
+from erp_ai.constants import AGENT_USER
 
 TICKET_DOCTYPE = "HD Ticket"
 # The app's own module is no area of the business (read.AI_MODULE, install.AI_MODULE).
@@ -85,6 +86,30 @@ def parse_tags(value) -> list[str]:
 		for tag in (part.strip() for part in (value or "").split(","))
 		if tag and tag not in IGNORED_LABELS
 	]
+
+
+def agent_tags(ticket_name: str, is_active_agent) -> tuple[str, ...]:
+	"""The ticket's tags an active HD Agent other than the bot put on, in the order they were put on (CHG-011).
+
+	Frappe's whitelisted add_tag lets the requester tag their own ticket; only the tag of someone who could assign
+	the ticket themselves may pick its person. The Tag Link's owner is who put the tag on.
+	"""
+	rows = frappe.get_all(
+		"Tag Link",
+		filters={"document_type": TICKET_DOCTYPE, "document_name": ticket_name},
+		fields=["tag", "owner"],
+		order_by="creation, name",
+	)
+	return tuple(
+		dict.fromkeys(
+			row.tag
+			for row in rows
+			if row.tag
+			and row.tag not in IGNORED_LABELS
+			and (row.owner or "").casefold() != AGENT_USER.casefold()
+			and is_active_agent(row.owner)
+		)
+	)
 
 
 def module_labels() -> tuple[str, ...]:

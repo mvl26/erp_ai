@@ -809,7 +809,6 @@ def _classify(
 			"description",
 			"creation",
 			"ai_classified_by",
-			"_user_tags",
 			CREATED_LABELS_FIELD,
 			*CLASSIFICATION_FIELDS,
 		],
@@ -902,8 +901,8 @@ def _classify(
 		due_field_configured="due_date" in field_map,
 		d_watcher=settings.get("d_ticket_watcher") or "",
 		now=now_datetime(),
-		# CHG-011: the tags a person put on the ticket, then the model's labels
-		tags=(*ticket_labels.parse_tags(ticket.get("_user_tags")), *classification.labels),
+		# CHG-011: the tags an HD Agent put on the ticket, then the model's labels
+		tags=(*ticket_labels.agent_tags(ticket_name, site_facts.is_active_agent), *classification.labels),
 		tag_rules=rules,
 	)
 	# a department named like an excluded team counts too

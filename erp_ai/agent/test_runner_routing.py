@@ -2614,13 +2614,42 @@ class TestRoutingAssignByTag(AssignTestBase):
 		)
 		self.assertEqual(self._single_entry().predicted_assignee, self.tag_person)
 
-	def test_tag_a_person_put_on_the_ticket_comes_before_the_model_label(self):
+	def _tag_as(self, user, tag):
+		"""Put `tag` on the ticket as `user` (the Tag Link's owner), then come back to Administrator."""
+		frappe.set_user(user)
+		try:
+			frappe.get_doc("HD Ticket", self.ticket.name).add_tag(tag)
+		finally:
+			frappe.set_user("Administrator")
+
+	def test_tag_an_agent_put_on_the_ticket_comes_before_the_model_label(self):
 		other = make_active_agent(self)
 		make_tag(TAG_KE_TOAN)
 		set_tag_assignees((TAG_KHO, self.tag_person, ""), (TAG_KE_TOAN, other, ""))
-		frappe.get_doc("HD Ticket", self.ticket.name).add_tag(TAG_KE_TOAN)
+		self._tag_as(self.person, TAG_KE_TOAN)
 		self._run()
 		self.assertEqual(self._assigned_to(), [other])
+
+	def test_tag_a_non_agent_put_on_the_ticket_is_not_used(self):
+		# review finding: the ticket's requester (HD Customer, raised_by) may tag their own ticket through Frappe's
+		# whitelisted add_tag, so their tag must not pick the person
+		requester = f"{PREFIX.lower()}requester-{frappe.generate_hash(length=8)}@example.com"
+		frappe.get_doc(
+			{
+				"doctype": "User",
+				"email": requester,
+				"first_name": "Requester",
+				"send_welcome_email": 0,
+				"roles": [{"role": "HD Customer"}],
+			}
+		).insert(ignore_permissions=True)
+		frappe.db.set_value("HD Ticket", self.ticket.name, "raised_by", requester, update_modified=False)
+		other = make_active_agent(self)
+		make_tag(TAG_KE_TOAN)
+		set_tag_assignees((TAG_KHO, self.tag_person, ""), (TAG_KE_TOAN, other, ""))
+		self._tag_as(requester, TAG_KE_TOAN)
+		self._run()
+		self.assertEqual(self._assigned_to(), [self.tag_person])
 
 	def test_no_row_for_the_labels_keeps_the_configured_default(self):
 		set_tag_assignees()

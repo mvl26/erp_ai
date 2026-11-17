@@ -131,6 +131,34 @@ class TestClassifyInputs(LabelsCase):
 		self.assertLessEqual(len(self._inputs(current, "c").label_catalog), labels.CATALOG_MAX)
 		self.assertEqual(labels.CATALOG_MAX, 40)
 
+	# CHG-011: the tags of the assignee table always reach the catalog, so the model can give them.
+	def _tag(self, name, description=""):
+		if not frappe.db.exists("Tag", name):
+			frappe.get_doc({"doctype": "Tag", "name": name, "description": description}).insert(
+				ignore_permissions=True
+			)
+		return name
+
+	def test_pinned_tag_without_tickets_is_listed_with_its_description(self):
+		current = self._ticket("c")
+		pinned = self._tag(f"{PREFIX}Ghim", "Phiếu về Tracecore")
+		catalog = labels.classify_inputs(current, "c", "<p>x</p>", pinned=(pinned,)).label_catalog
+		self.assertIn((pinned, 0, "Phiếu về Tracecore"), catalog)
+
+	def test_pinned_tag_in_use_is_listed_once_with_its_count(self):
+		self._ticket("a", KHO)
+		current = self._ticket("c")
+		catalog = labels.classify_inputs(current, "c", "<p>x</p>", pinned=(KHO,)).label_catalog
+		self.assertEqual(self._ours(catalog), [(KHO, 1, "")])
+
+	def test_pinned_tags_kept_when_the_catalog_is_full(self):
+		current = self._ticket("c")
+		self._ticket("a", *[f"{PREFIX}n{index:02d}" for index in range(labels.CATALOG_MAX + 2)])
+		pinned = self._tag(f"{PREFIX}zz")
+		catalog = labels.classify_inputs(current, "c", "<p>x</p>", pinned=(pinned,)).label_catalog
+		self.assertEqual(catalog[-1], (pinned, 0, ""))
+		self.assertEqual(len(catalog), labels.CATALOG_MAX + 1)
+
 	def test_excluded_tickets_give_no_label_and_no_count(self):
 		set_agent_settings(excluded_teams=EXCLUDED_TEAM)
 		if not frappe.db.exists("HD Team", EXCLUDED_TEAM):

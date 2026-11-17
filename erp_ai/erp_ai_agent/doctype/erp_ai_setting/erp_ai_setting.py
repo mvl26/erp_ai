@@ -180,6 +180,7 @@ class ERPAISetting(Document):
 		self.check_labels()
 		validate_mapping(self.category_mapping)
 		self.check_routing_rules()
+		self.check_tag_assignees()
 		policy.validate_change_apps(self, source.get_source_root())
 		self.check_limits()
 		self.check_status_settings()
@@ -356,6 +357,19 @@ class ERPAISetting(Document):
 
 	def check_routing_rules(self):
 		validate_routing_config(self.routing_rules)
+
+	def check_tag_assignees(self):
+		"""CHG-011: refuse the first tag row that gives the bot account or repeats a (tag, category) pair."""
+		seen = {}
+		for row in self.get("tag_assignees") or []:
+			if (row.assignee or "").strip().casefold() == AGENT_USER.casefold():
+				reason = "không gán tài khoản agent"
+			else:
+				key = ((row.tag or "").casefold(), row.category or "")
+				reason = f"trùng với dòng {seen[key]}" if key in seen else None
+				seen.setdefault(key, row.idx)
+			if reason:
+				frappe.throw(f"Gán người theo tag dòng {row.idx}: {reason}")
 
 	def check_limits(self):
 		for fieldname, (label, low, high) in INT_LIMITS.items():

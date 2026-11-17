@@ -11,6 +11,7 @@ from typing import NamedTuple
 import frappe
 
 from erp_ai.agent import policy
+from erp_ai.constants import AGENT_USER
 
 TICKET_DOCTYPE = "HD Ticket"
 # The app's own module is no area of the business (read.AI_MODULE, install.AI_MODULE).
@@ -87,6 +88,30 @@ def parse_tags(value) -> list[str]:
 	]
 
 
+def agent_tags(ticket_name: str, is_active_agent) -> tuple[str, ...]:
+	"""The ticket's tags an active HD Agent other than the bot put on, in the order they were put on (CHG-011).
+
+	Frappe's whitelisted add_tag lets the requester tag their own ticket; only the tag of someone who could assign
+	the ticket themselves may pick its person. The Tag Link's owner is who put the tag on.
+	"""
+	rows = frappe.get_all(
+		"Tag Link",
+		filters={"document_type": TICKET_DOCTYPE, "document_name": ticket_name},
+		fields=["tag", "owner"],
+		order_by="creation, name",
+	)
+	return tuple(
+		dict.fromkeys(
+			row.tag
+			for row in rows
+			if row.tag
+			and row.tag not in IGNORED_LABELS
+			and (row.owner or "").casefold() != AGENT_USER.casefold()
+			and is_active_agent(row.owner)
+		)
+	)
+
+
 def module_labels() -> tuple[str, ...]:
 	"""The modules of the installed apps, the bot's own left out, sorted without case: the names a first label takes."""
 	names = frappe.get_all("Module Def", filters={"name": ["!=", AI_MODULE]}, pluck="name")
@@ -107,8 +132,13 @@ def _words(text) -> set[str]:
 	return knowledge.text_words(text) - COMMON_WORDS
 
 
-def classify_inputs(ticket_name: str, subject: str, description: str) -> LabelInputs:
+def classify_inputs(
+	ticket_name: str, subject: str, description: str, pinned: tuple[str, ...] = ()
+) -> LabelInputs:
 	"""The module list, the labels in use and the labels of alike tickets for classifying `ticket_name`.
+
+	`pinned` (CHG-011): the tags of the assignee table; each one not already among the most used follows them in the
+	catalog, never cut by CATALOG_MAX, so the model knows it even before any ticket carries it.
 
 	One scan of the LABEL_SCAN_MAX newest labelled tickets, the ticket itself and excluded tickets left out
 	(ADR-034 QĐ 1): the catalog counts them, the alike ones share SIMILAR_MIN_WORDS words or more with the ticket.
@@ -136,6 +166,11 @@ def classify_inputs(ticket_name: str, subject: str, description: str) -> LabelIn
 			ranked.append((-shared, order, row.subject or "", tuple(names)))
 	ranked.sort()
 	top = counts.most_common(CATALOG_MAX)
+	listed = {name.casefold() for name, _count in top}
+	for name in pinned:
+		if name and name.casefold() not in listed:
+			listed.add(name.casefold())
+			top.append((name, counts[name]))
 	descriptions = dict(
 		frappe.get_all(
 			"Tag",

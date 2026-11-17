@@ -58,9 +58,11 @@ from erp_ai.test_utils import (
 	make_model_result,
 	make_routing_rules,
 	make_sla,
+	make_tag,
 	make_team,
 	pin_agent_roles,
 	set_agent_settings,
+	set_tag_assignees,
 )
 
 ROUTE_TYPE = f"{PREFIX}route-type"
@@ -93,6 +95,10 @@ CLASSIFY_SCORED = json.dumps(
 		"ly_do_diem": SCORE_REASON,
 	}
 )
+# CHG-011: a scored A classification whose one label has a row in the tag table.
+TAG_KHO = f"{PREFIX}Kho"
+TAG_KE_TOAN = f"{PREFIX}Ke toan"
+CLASSIFY_TAGGED = json.dumps({**json.loads(CLASSIFY_SCORED), "nhan": [TAG_KHO]})
 CLASSIFY_C = json.dumps(
 	{
 		"dau_muc": "C",
@@ -1975,8 +1981,9 @@ class TestRoutingLabels(RoutingTestBase):
 
 		self._run_labelled(CLASSIFY_SCORED)
 
+		# CHG-011: the tags of the assignee table are passed as `pinned` (none configured here)
 		self.label_inputs.assert_called_once_with(
-			self.ticket.name, self.ticket.subject, self.ticket.description
+			self.ticket.name, self.ticket.subject, self.ticket.description, pinned=()
 		)
 		expected = build_classify_request(
 			self.ticket.subject,
@@ -2578,4 +2585,99 @@ class TestRouteOnce(AssignTestBase):
 		self.assertEqual(
 			json.loads(row["actions"]),
 			[action_entry("apply_route", "HD Ticket", ticket, False, reason=runner.ROUTE_ALREADY_DONE)],
+		)
+
+
+class TestRoutingAssignByTag(AssignTestBase):
+	"""CHG-011: the table of tag → person on ERP AI Setting decides the person before the routing rules."""
+
+	def setUp(self):
+		super().setUp()
+		self.tag_person = make_active_agent(self)
+		make_tag(TAG_KHO)
+		set_tag_assignees((TAG_KHO, self.tag_person, ""))
+		self.gateway.results = [
+			make_model_result(text=CLASSIFY_TAGGED),
+			make_model_result(stop_reason="end_turn"),
+		]
+
+	def test_model_label_with_a_row_gives_the_ticket_to_its_person(self):
+		self._run()
+		self.assertEqual(self._assigned_to(), [self.tag_person])
+		(action,) = self._action("assign_owner")
+		self.assertEqual(
+			(action["name"], action["ok"], action.get("rule")), (self.tag_person, True, f"tag:{TAG_KHO}")
+		)
+		self.assertIn(
+			runner.ROUTE_ASSIGNED_BY_TAG.format(person=get_fullname(self.tag_person), tag=TAG_KHO),
+			self._comment_text(),
+		)
+		self.assertEqual(self._single_entry().predicted_assignee, self.tag_person)
+
+	def _tag_as(self, user, tag):
+		"""Put `tag` on the ticket as `user` (the Tag Link's owner), then come back to Administrator."""
+		frappe.set_user(user)
+		try:
+			frappe.get_doc("HD Ticket", self.ticket.name).add_tag(tag)
+		finally:
+			frappe.set_user("Administrator")
+
+	# CHG-011 user decision 2026-11-17 (option b): the table is read top-down, an agent's tag and the model's label
+	# alike
+	def test_tag_an_agent_put_on_the_ticket_counts(self):
+		other = make_active_agent(self)
+		make_tag(TAG_KE_TOAN)
+		set_tag_assignees((TAG_KE_TOAN, other, ""), (TAG_KHO, self.tag_person, ""))
+		self._tag_as(self.person, TAG_KE_TOAN)
+		self._run()
+		self.assertEqual(self._assigned_to(), [other])
+
+	def test_row_above_wins_over_an_agent_tag_lower_in_the_table(self):
+		other = make_active_agent(self)
+		make_tag(TAG_KE_TOAN)
+		set_tag_assignees((TAG_KHO, self.tag_person, ""), (TAG_KE_TOAN, other, ""))
+		self._tag_as(self.person, TAG_KE_TOAN)
+		self._run()
+		self.assertEqual(self._assigned_to(), [self.tag_person])
+
+	def test_tag_a_non_agent_put_on_the_ticket_is_not_used(self):
+		# review finding: the ticket's requester (HD Customer, raised_by) may tag their own ticket through Frappe's
+		# whitelisted add_tag, so their tag must not pick the person
+		requester = f"{PREFIX.lower()}requester-{frappe.generate_hash(length=8)}@example.com"
+		frappe.get_doc(
+			{
+				"doctype": "User",
+				"email": requester,
+				"first_name": "Requester",
+				"send_welcome_email": 0,
+				"roles": [{"role": "HD Customer"}],
+			}
+		).insert(ignore_permissions=True)
+		frappe.db.set_value("HD Ticket", self.ticket.name, "raised_by", requester, update_modified=False)
+		other = make_active_agent(self)
+		make_tag(TAG_KE_TOAN)
+		# the requester's tag has the row above: only leaving it out gives the model label's person
+		set_tag_assignees((TAG_KE_TOAN, other, ""), (TAG_KHO, self.tag_person, ""))
+		self._tag_as(requester, TAG_KE_TOAN)
+		self._run()
+		self.assertEqual(self._assigned_to(), [self.tag_person])
+
+	def test_no_row_for_the_labels_keeps_the_configured_default(self):
+		set_tag_assignees()
+		self._run()
+		self.assertEqual(self._assigned_to(), [self.person])
+		self.assertIn(runner.ROUTE_ASSIGNED.format(person=get_fullname(self.person)), self._comment_text())
+		(action,) = self._action("assign_owner")
+		self.assertFalse(action.get("rule"))
+
+	def test_ticket_already_assigned_is_left_alone(self):
+		assign_to.add({"assign_to": [self.person], "doctype": "HD Ticket", "name": self.ticket.name})
+		self._run()
+		self.assertEqual(self._assigned_to(), [self.person])
+
+	def test_table_tags_reach_the_label_inputs(self):
+		# classify_inputs is patched in these tests (STD-TEST-6); test_labels covers what it does with `pinned`
+		self._run()
+		self.label_inputs.assert_called_once_with(
+			self.ticket.name, self.ticket.subject, self.ticket.description, pinned=(TAG_KHO,)
 		)

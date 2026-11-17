@@ -1,6 +1,7 @@
 import json
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
+from typing import NamedTuple
 
 import frappe
 from frappe.utils import now_datetime
@@ -50,6 +51,25 @@ class RouteDecision:
 	needs_task: bool
 	notes: tuple
 	watcher: str | None = None
+	# CHG-011: the tag of the table row that chose `assignee`; None when the routing rules chose it.
+	assignee_tag: str | None = None
+
+
+class TagRule(NamedTuple):
+	"""One row of the table of tag → person on ERP AI Setting (CHG-011); category "" serves every category."""
+
+	tag: str
+	assignee: str
+	category: str
+
+
+def tag_rules(settings) -> tuple[TagRule, ...]:
+	"""The rows of `tag_assignees` in order, rows without a tag or a person left out; () when the field is absent."""
+	return tuple(
+		TagRule(row.tag, row.assignee, row.category or "")
+		for row in settings.get("tag_assignees") or ()
+		if row.tag and row.assignee
+	)
 
 
 def decide_route(
@@ -65,6 +85,8 @@ def decide_route(
 	due_field_configured: bool | None = None,
 	d_watcher: str | None = None,
 	now: datetime | None = None,
+	tags: tuple[str, ...] = (),
+	tag_rules: tuple[TagRule, ...] = (),
 ) -> RouteDecision:
 	"""Priority per R1-R5 and the due-date exceptions (AC-25); team per mapping or department;
 	assignee by category/prefix; needs_task for C/D; watcher for D (AC-27).
@@ -74,6 +96,9 @@ def decide_route(
 
 	d_watcher: None = the caller does not say (no watcher, no note), blank = not configured
 	(D gets a note), a user = D watcher when an active HD Agent (else a note). Ignored outside D.
+
+	tags, tag_rules (CHG-011): the ticket's tags and the table rows; the first usable row, top-down, whose tag the
+	ticket carries chooses the assignee before the routing rules.
 	"""
 	entry = mapping.get(classification.category) or {}
 	notes = []
@@ -81,7 +106,11 @@ def decide_route(
 		agent_group = _department_team(classification, config, team_exists, is_excluded_team, notes)
 	else:
 		agent_group = entry.get("agent_group") or None
-	assignee = _assignee(classification, subject, config, is_active_agent, notes)
+	picked = _tag_assignee(classification.category, tags, tag_rules, is_active_agent, notes)
+	assignee, assignee_tag = picked or (
+		_assignee(classification, subject, config, is_active_agent, notes),
+		None,
+	)
 	if classification.category in ("B", "D") and due_field_configured is False:
 		notes.append({"field": "due_at", "reason": DUE_FIELD_MISSING_NOTE})
 		due_at = None
@@ -94,6 +123,7 @@ def decide_route(
 		needs_task=classification.category in ("C", "D") and assignee is not None,
 		notes=tuple(notes),
 		watcher=watcher,
+		assignee_tag=assignee_tag,
 	)
 
 
@@ -156,6 +186,28 @@ def _assignee(classification, subject, config, is_active_agent, notes) -> str | 
 		notes.append({"field": "assignee", "reason": f"{candidate} không phải HD Agent đang hoạt động"})
 		return None
 	return candidate
+
+
+def _tag_assignee(category, tags, rules, is_active_agent, notes) -> tuple[str, str] | None:
+	"""(person, row tag) of the first row, top-down, whose tag the ticket carries (without case) and whose category is
+	blank or the ticket's (CHG-011, the user's option b). A row naming the agent account or no active HD Agent is
+	noted and passed over; None when no row gives a person."""
+	on_ticket = {(tag or "").casefold() for tag in tags} - {""}
+	for row in rules:
+		if row.tag.casefold() not in on_ticket or row.category not in ("", category):
+			continue
+		if row.assignee.strip().casefold() == AGENT_USER.casefold():
+			notes.append({"field": "assignee", "reason": f"tag {row.tag}: không gán tài khoản agent"})
+		elif not is_active_agent(row.assignee):
+			notes.append(
+				{
+					"field": "assignee",
+					"reason": f"tag {row.tag}: {row.assignee} không phải HD Agent đang hoạt động",
+				}
+			)
+		else:
+			return row.assignee, row.tag
+	return None
 
 
 def _category_assignee(category, subject, config) -> str:

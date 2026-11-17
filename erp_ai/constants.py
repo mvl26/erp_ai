@@ -7,6 +7,8 @@ SETTING_DOCTYPE = "ERP AI Setting"
 CREDENTIAL_DOCTYPE = "ERP AI Credential"
 LOG_DOCTYPE = "ERP AI Log"
 PROPOSAL_DOCTYPE = "ERP AI Change Proposal"
+# CHG-011: one row of the table of tag → person on ERP AI Setting (field tag_assignees).
+TAG_ASSIGNEE_DOCTYPE = "ERP AI Tag Assignee"
 
 LEVELS = ("L0", "L1", "L2", "L3")
 CATEGORIES = ("A", "B", "C", "D", "E", "F")

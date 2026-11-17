@@ -558,7 +558,11 @@ class TestRunEvalRun(FrappeTestCase):
 		runner_kwargs, eval_kwargs = runner_route.call_args.kwargs, eval_route.call_args.kwargs
 		# eval measures the model and the mapping, not the due-date exceptions or the D watcher (design-w0-fixes-2.md:157)
 		self.assertEqual(set(eval_kwargs), shared)
-		self.assertEqual(set(runner_kwargs), shared | {"due_at", "due_field_configured", "d_watcher", "now"})
+		# CHG-011: the runner also passes the ticket's tags and the tag table; eval measures no assignee
+		self.assertEqual(
+			set(runner_kwargs),
+			shared | {"due_at", "due_field_configured", "d_watcher", "now", "tags", "tag_rules"},
+		)
 		# R23a: the runner passes its probe of excluded teams (U2.md:168), eval policy.is_excluded_team itself; the
 		# same keys, that one value compared by its answers
 		same = shared - {"is_excluded_team"}

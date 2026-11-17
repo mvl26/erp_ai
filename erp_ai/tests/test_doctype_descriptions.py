@@ -23,9 +23,9 @@ VIETNAMESE_ACCENTS = re.compile(
 DOCTYPE_CONFIG = {
 	"ERP AI Setting": {
 		"folder": "erp_ai_setting",
-		# CHG-010: console_enabled (+1); FEAT-008: lessons_enabled, lessons_max_per_request, lessons_max_chars,
-		# lesson_teach_marker (+4); base 77
-		"field_count": 82,
+		# CHG-011: tag_assignees (+1); CHG-010: console_enabled (+1); FEAT-008: lessons_enabled,
+		# lessons_max_per_request, lessons_max_chars, lesson_teach_marker (+4); base 77
+		"field_count": 83,
 		"phrases": {
 			"enabled": ("Tắt", "4 đơn giá", "từ khóa kích hoạt"),
 			# FEAT-007 spec-addendum-3.md:88 (T64): from L2 up, ERP writes go through a proposal or a `Tự làm` row.
@@ -135,6 +135,16 @@ DOCTYPE_CONFIG = {
 				"HD Agent",
 			),
 			"routing_rules": ("đầu mục", "SLA", "phút", "bị chặn khi lưu"),
+			# CHG-011: the table of tag → person, read top-down before the routing rules (user's option b); say
+			# whose tags count and that a blank row also serves D/E.
+			"tag_assignees": (
+				"Tự gán người",
+				"Quy tắc định tuyến",
+				"bị chặn khi lưu",
+				"HD Agent gắn",
+				"từ trên xuống",
+				"D/E",
+			),
 			"prompt_digest": ("lập luận", "phân loại"),
 			**{
 				fieldname: ("fieldname", "Để trống", "không lưu được")
@@ -307,6 +317,22 @@ DOCTYPE_CONFIG = {
 		),
 	},
 	# FEAT-007 design.md:225: one account template (child of ERP AI Setting, AC-30 (1)).
+	# CHG-011: one row of the table of tag → person (child of ERP AI Setting).
+	"ERP AI Tag Assignee": {
+		"folder": "erp_ai_tag_assignee",
+		"field_count": 3,
+		"phrases": {
+			"tag": ("Mô tả", "không phân biệt hoa thường", "HD Agent gắn"),
+			"assignee": ("HD Agent", "tài khoản agent", "bỏ qua"),
+			"category": ("Để trống", "mọi đầu mục", "dòng nằm trên"),
+		},
+		"section_count": 2,
+		"read_only_fields": (),
+		"sections": (
+			("section_assignee", "Tag và người phụ trách", "tag"),
+			("section_scope", "Phạm vi áp dụng", "category"),
+		),
+	},
 	"ERP AI User Template": {
 		"folder": "erp_ai_user_template",
 		"field_count": 3,

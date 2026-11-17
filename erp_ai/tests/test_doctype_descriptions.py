@@ -383,15 +383,17 @@ DOCTYPE_CONFIG = {
 	# Bot conversation moved off HD Ticket comments: one row per message, written by the one writer, never edited.
 	"ERP AI Message": {
 		"folder": "erp_ai_message",
-		"field_count": 4,
+		# BUG-009: + author_role, the role the author had when the message was sent
+		"field_count": 5,
 		"phrases": {
 			"ticket": ("phiếu",),
 			"content": ("chữ thường",),
 			"run_id": ("lần chạy",),
 			"source_comment": ("@ai",),
+			"author_role": ("chỉ thị", "dữ liệu", "lúc tin được gửi", "ERP AI Instructor"),
 		},
 		"section_count": 2,
-		"read_only_fields": ("ticket", "content", "run_id", "source_comment"),
+		"read_only_fields": ("ticket", "content", "run_id", "source_comment", "author_role"),
 		"sections": (
 			("section_message", "Tin nhắn", "ticket"),
 			("section_source", "Nguồn gốc", "run_id"),

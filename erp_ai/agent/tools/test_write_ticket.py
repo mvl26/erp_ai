@@ -2122,6 +2122,100 @@ class TestGuidanceWriter(TicketCommentCase):
 		self.assertIn("Khi phiếu đã có hướng xử lý: chỉ báo kết quả việc vừa làm.", description)
 
 
+class TestGuidanceUsesHint(TicketCommentCase):
+	"""BUG-007: with no analysis comment the guidance takes the run's resolution hint as its analysis."""
+
+	HINT = "Nhận định: X có sẵn.\n\nHướng xử lý: Dùng Server Script before_submit."
+
+	def _run(self, done=("Đã làm",), manual=()):
+		run_id = f"{T100_PREFIX}-{frappe.generate_hash(length=10)}"
+		self.addCleanup(write_ticket.close_collector, run_id)
+		write_ticket.open_collector(run_id)
+		for line in done:
+			write_ticket.collect(run_id, write_ticket.SECTION_DONE, line)
+		for line in manual:
+			write_ticket.collect(run_id, write_ticket.SECTION_DECIDE, line)
+		return run_id
+
+	def _set_hint(self, run_id, text):
+		ctx = ToolContext(
+			ticket_name=self.ticket,
+			effective_level="L1",
+			instructor=None,
+			run_id=run_id,
+			category_mapping={},
+			agent_user=AGENT_USER,
+		)
+		frappe.set_user("Administrator")
+		result = write_ticket.set_resolution_hint({"text": text}, ctx)
+		frappe.set_user(AGENT_USER)
+		self.assertTrue(result["ok"], result)
+		return result
+
+	def _body(self, run_id):
+		result = write_ticket.post_guidance(self.ticket, run_id)
+		self.assertTrue(result["ok"], result)
+		return frappe.db.get_value(MESSAGE_DOCTYPE, result["message"], "content")
+
+	def test_the_hint_is_the_analysis_when_the_bot_wrote_none(self):
+		run_id = self._run()
+		self._set_hint(run_id, self.HINT)
+		content = self._body(run_id)
+
+		self.assertIn("Nhận định: X có sẵn.", content)
+		self.assertIn("Hướng xử lý: Dùng Server Script before_submit.", content)
+		self.assertNotIn("bot chưa viết được nhận định", content)
+		self.assertEqual(frappe.db.get_value("HD Ticket", self.ticket, "ai_analysis"), self.HINT)
+
+	def test_a_held_analysis_wins_over_the_hint(self):
+		run_id = self._run()
+		write_ticket.hold_analysis(
+			run_id, "**Nhận định:** A\n**Hướng xử lý:** B\n**Căn cứ:** C\nĐộ tin cậy: 80%"
+		)
+		self._set_hint(run_id, self.HINT)
+		content = self._body(run_id)
+
+		self.assertIn("**Nhận định:** A", content)
+		self.assertIn("**Hướng xử lý:** B", content)
+		self.assertNotIn("Server Script", content)
+
+	def test_a_hint_without_heading_gets_the_analysis_heading_and_a_plan_for_manual_lines(self):
+		run_id = self._run(manual=["Nhờ phân công"])
+		self._set_hint(run_id, "Dùng Server Script before_submit.")
+		content = self._body(run_id)
+
+		self.assertTrue(
+			content.startswith(
+				f"{write_ticket.GUIDANCE_MARKER}\n**Nhận định:** Dùng Server Script before_submit."
+			),
+			content,
+		)
+		self.assertIn("<p><strong>Hướng xử lý:</strong></p><ul><li>Nhờ phân công</li></ul>", content)
+
+	def test_the_last_hint_of_a_run_is_used(self):
+		run_id = self._run()
+		self._set_hint(run_id, "Nhận định: một\nHướng xử lý: cách một")
+		self._set_hint(run_id, "Nhận định: hai\nHướng xử lý: cách hai")
+		content = self._body(run_id)
+
+		self.assertIn("cách hai", content)
+		self.assertNotIn("cách một", content)
+
+	def test_no_hint_and_no_analysis_keeps_the_fallback(self):
+		content = self._body(self._run())
+
+		self.assertIn(write_ticket.GUIDANCE_FALLBACK, content)
+
+	def test_a_run_that_is_not_collecting_holds_nothing(self):
+		run_id = f"{T100_PREFIX}-{frappe.generate_hash(length=10)}"
+		result = self._set_hint(run_id, "Khởi động lại máy in")
+
+		self.assertEqual(set(result), {"ok", "before", "after"})
+		self.assertEqual(result["after"], "Khởi động lại máy in")
+		self.assertIsNone(write_ticket.held_hint(run_id))
+		self.assertFalse(write_ticket.collecting(run_id))
+
+
 class TestCollector(FrappeTestCase):
 	"""ADR-036 QĐ 2, 6 (w1.md:62, AD3.md:126-129): the run's collector lives in frappe.flags under its run_id."""
 

@@ -102,6 +102,7 @@ from erp_ai.test_utils import (
 	pin_agent_roles,
 	record_status_signals,
 	set_agent_settings,
+	set_tag_assignees,
 	stub_job_states,
 )
 
@@ -181,11 +182,9 @@ class RunnerTestBase(FrappeTestCase):
 		latest_patch = patch.object(policy, "latest_classification", return_value=SEEDED_CLASSIFICATION)
 		self.latest_classification = latest_patch.start()
 		self.addCleanup(latest_patch.stop)
-		# The label inputs never come from the shared site's live tags and modules (STD-TEST-6, ADR-049): empty, so
-		# the classify request is the one without labels; a test that needs them sets `self.label_inputs`.
-		label_patch = patch.object(labels, "classify_inputs", return_value=labels.LabelInputs())
-		self.label_inputs = label_patch.start()
-		self.addCleanup(label_patch.stop)
+		# CHG-014 (STD-TEST-6): the tag table never comes from the shared site; empty, so the classify request is the
+		# one without tags; a test that needs tags sets them with set_tag_assignees (rolled back)
+		set_tag_assignees()
 
 	def _entries(self, **filters):
 		# ADR-048 QĐ 5 (CHG-009): a run_event row is not a run's row; only a caller asking for that type gets it.

@@ -314,11 +314,12 @@ def make_tag(name: str, description: str = "") -> str:
 	return name
 
 
-def set_tag_assignees(*rows: tuple[str, str, str]) -> None:
+def set_tag_assignees(*rows: tuple) -> None:
 	"""Replace the `tag_assignees` rows of ERP AI Setting in the DB (no validate), for tests (CHG-011); each row is
-	(tag, person, category). `keep_agent_settings` puts the old rows back."""
+	(tag, person, category) or (tag, person, category, description); the description defaults to "x" (CHG-014).
+	`keep_agent_settings` puts the old rows back."""
 	frappe.db.delete(TAG_ASSIGNEE_DOCTYPE, {"parent": SETTING_DOCTYPE, "parenttype": SETTING_DOCTYPE})
-	for idx, (tag, assignee, category) in enumerate(rows, start=1):
+	for idx, (tag, assignee, category, *rest) in enumerate(rows, start=1):
 		frappe.get_doc(
 			{
 				"doctype": TAG_ASSIGNEE_DOCTYPE,
@@ -329,6 +330,7 @@ def set_tag_assignees(*rows: tuple[str, str, str]) -> None:
 				"tag": tag,
 				"assignee": assignee,
 				"category": category,
+				"description": rest[0] if rest else "x",
 			}
 		).db_insert()
 	frappe.clear_document_cache(SETTING_DOCTYPE, SETTING_DOCTYPE)

@@ -343,15 +343,26 @@ def current_change_settings() -> ChangeSettings:
 RECORD_TOOLS_FIELD = "record_tools_enabled"
 ACT_NOW_FIELD = "act_now_enabled"
 ONE_CLICK_APPROVAL_FIELD = "one_click_approval_enabled"
-CONSOLE_FIELD = "console_enabled"  # CHG-010: not in PERMISSION_SWITCH_FIELDS (the five of the spec)
-# The five permission switches in the spec's order (1)..(5).
+CONSOLE_FIELD = "console_enabled"
+# The permission switches in the order of the settings section (section_permissions).
+# BUG-008: console is one of them: its change is logged and it is listed in the daily privilege alarm.
 PERMISSION_SWITCH_FIELDS = (
 	UNRESTRICTED_FIELD,
 	RECORD_TOOLS_FIELD,
 	ACT_NOW_FIELD,
 	CODE_CHANGE_ENABLED_FIELD,
+	CONSOLE_FIELD,
 	ONE_CLICK_APPROVAL_FIELD,
 )
+# Field -> the PermissionSwitches attribute that reads it; consumers pair by this name, never by position.
+SWITCH_FLAGS = {
+	UNRESTRICTED_FIELD: "unrestricted",
+	RECORD_TOOLS_FIELD: "record_tools",
+	ACT_NOW_FIELD: "act_now",
+	CODE_CHANGE_ENABLED_FIELD: "code_change",
+	CONSOLE_FIELD: "console",
+	ONE_CLICK_APPROVAL_FIELD: "one_click_approval",
+}
 
 
 @dataclass(frozen=True)
@@ -365,7 +376,7 @@ class PermissionSwitches:
 
 
 def permission_switches(settings) -> PermissionSwitches:
-	"""The only reader of the five permission switches; a missing field (before migrate) means off."""
+	"""The only reader of the permission switches; a missing field (before migrate) means off."""
 	return PermissionSwitches(
 		unrestricted=unrestricted_enabled(settings),
 		record_tools=bool(getattr(settings, RECORD_TOOLS_FIELD, 0)),

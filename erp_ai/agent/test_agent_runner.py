@@ -1004,7 +1004,9 @@ class TestRunnerReasoning(RunnerTestBase):
 			),
 			(7, 3, 0, 5),
 		)
-		self.assertFalse(second.tools_called or second.actions or second.value_after)
+		# BUG-007: the hint is now the analysis of the guidance, so this run posts one; the turn's only action is it
+		self.assertFalse(second.tools_called or second.value_after)
+		self.assertEqual([action["tool"] for action in json.loads(second.actions)], ["post_guidance"])
 		# the cost is the gateway's figure stored as given; the run total is the hand-added 0.0125 + 0.0075
 		self.assertAlmostEqual(first.cost_usd + second.cost_usd, 0.02, places=6)
 		self.assertEqual(first.run_id, second.run_id)

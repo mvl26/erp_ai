@@ -339,7 +339,7 @@
    "fieldname": "predicted_assignee",
    "fieldtype": "Data",
    "label": "Người phụ trách dự đoán",
-   "description": "Người phụ trách mà agent dự đoán theo Quy tắc định tuyến, ghi bằng mã người dùng. Để trống nếu cấu hình không có người hợp lệ. Hệ thống tự ghi khi agent chạy, không sửa được.",
+   "description": "Người phụ trách mà agent dự đoán theo bảng tag, Quy tắc định tuyến hoặc người nhận mặc định, ghi bằng mã người dùng. Để trống nếu cấu hình không có người hợp lệ. Hệ thống tự ghi khi agent chạy, không sửa được.",
    "read_only": 1
   },
   {
@@ -411,7 +411,7 @@
   }
  ],
  "links": [],
- "modified": "2026-11-13 12:00:00.000000",
+ "modified": "2026-11-17 16:00:00.000000",
  "modified_by": "Administrator",
  "module": "ERP AI agent",
  "name": "ERP AI Log",

@@ -321,7 +321,8 @@ class TestDecideAssignee(FrappeTestCase):
 		config = {"assignees": {"A": {"default": "d@x.com", "prefixes": {"": "any@x.com"}}}}
 		self.assertEqual(_decide_assignee("A", "bất kỳ", config=config).assignee, "d@x.com")
 
-	def test_invalid_chosen_candidate_does_not_fall_back_to_default(self):
+	# CHG-016: no fall-back to the category default; the Setting's default person (CHG-015) still applies
+	def test_invalid_chosen_candidate_does_not_fall_back_to_the_category_default(self):
 		def not_trace(user):
 			return user != "trace@x.com"
 
@@ -1032,7 +1033,7 @@ def _decide_by_tags(category, tags, rules=TAG_RULES, is_active_agent=None, depar
 		is_excluded_team=lambda team: False,
 		is_active_agent=is_active_agent or (lambda user: True),
 		tags=tags,
-		tag_rules=rules,
+		tag_table=rules,
 	)
 
 
@@ -1121,18 +1122,25 @@ EMPTY_ASSIGN_CONFIG = {
 
 
 def _decide_default(
-	category, default="d@x.com", tags=(), rules=(), config=None, is_active_agent=None, department=None
+	category,
+	default="d@x.com",
+	tags=(),
+	rules=(),
+	config=None,
+	is_active_agent=None,
+	department=None,
+	subject="Thông thường",
 ):
 	return routing.decide_route(
 		Classification(category=category, confidence="Cao", importance=1, department=department),
-		"Thông thường",
+		subject,
 		DEFAULT_CATEGORY_MAPPING,
 		EMPTY_ASSIGN_CONFIG if config is None else config,
 		team_exists=lambda team: True,
 		is_excluded_team=lambda team: False,
 		is_active_agent=is_active_agent or (lambda user: True),
 		tags=tags,
-		tag_rules=rules,
+		tag_table=rules,
 		default_assignee=default,
 	)
 
@@ -1170,3 +1178,27 @@ class TestDecideDefaultAssignee(FrappeTestCase):
 		d = _decide_default("A", default=None)
 		self.assertEqual((d.assignee, d.assignee_default), (None, False))
 		self.assertEqual(_assignee_notes(d), ["cấu hình không có người cho đầu mục A"])
+
+	# CHG-016: an unusable title-prefix person skips the category default but reaches the Setting's default
+	def test_an_inactive_prefix_person_falls_to_the_setting_default(self):
+		d = _decide_default(
+			"A",
+			config=ASSIGN_CONFIG,
+			subject="[tracecore] x",
+			is_active_agent=lambda user: user != "trace@x.com",
+		)
+		self.assertEqual((d.assignee, d.assignee_default), ("d@x.com", True))
+
+
+class TestTagMatchNfc(FrappeTestCase):
+	"""CHG-016: a tag in decomposed form (some keyboards, pasted text) matches its row."""
+
+	def test_decomposed_ticket_tag_matches(self):
+		import unicodedata
+
+		d = _decide_by_tags(
+			"C",
+			(unicodedata.normalize("NFD", "chấm công"),),
+			(routing.TagRule("chấm công", "cc@x.com", ""),),
+		)
+		self.assertEqual((d.assignee, d.assignee_tag), ("cc@x.com", "chấm công"))

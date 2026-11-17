@@ -42,3 +42,11 @@ class TestChosenTag(FrappeTestCase):
 
 	def test_only_the_first_label_counts(self):
 		self.assertEqual(labels.chosen_tag(("Stock", "chấm công"), self.CHOICES), ())
+
+	# CHG-016: a decomposed answer matches its table tag
+	def test_decomposed_answer_matches(self):
+		import unicodedata
+
+		self.assertEqual(
+			labels.chosen_tag((unicodedata.normalize("NFD", "CHẤM CÔNG"),), self.CHOICES), ("chấm công",)
+		)

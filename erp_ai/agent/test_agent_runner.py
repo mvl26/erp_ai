@@ -20,7 +20,6 @@ from erp_ai import handlers, tasks
 from erp_ai.agent import (
 	answer_delay,
 	authority,
-	labels,
 	lesson_read,
 	lessons,
 	messages,

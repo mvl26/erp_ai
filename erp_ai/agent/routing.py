@@ -1,4 +1,5 @@
 import json
+import unicodedata
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
 from typing import NamedTuple
@@ -67,6 +68,11 @@ class TagRule(NamedTuple):
 	description: str = ""
 
 
+def tag_key(tag) -> str:
+	"""A tag as two spellings of it compare: NFC, without case (CHG-016: a decomposed tag matches its row)."""
+	return unicodedata.normalize("NFC", tag or "").casefold()
+
+
 def tag_rules(settings) -> tuple[TagRule, ...]:
 	"""The rows of `tag_assignees` in order, rows without a tag or a person left out; () when the field is absent."""
 	return tuple(
@@ -90,7 +96,7 @@ def decide_route(
 	d_watcher: str | None = None,
 	now: datetime | None = None,
 	tags: tuple[str, ...] = (),
-	tag_rules: tuple[TagRule, ...] = (),
+	tag_table: tuple[TagRule, ...] = (),
 	default_assignee: str | None = None,
 ) -> RouteDecision:
 	"""Priority per R1-R5 and the due-date exceptions (AC-25); team per mapping or department;
@@ -102,7 +108,7 @@ def decide_route(
 	d_watcher: None = the caller does not say (no watcher, no note), blank = not configured
 	(D gets a note), a user = D watcher when an active HD Agent (else a note). Ignored outside D.
 
-	tags, tag_rules (CHG-011): the ticket's tags and the table rows; the first usable row, top-down, whose tag the
+	tags, tag_table (CHG-011): the ticket's tags and the table rows; the first usable row, top-down, whose tag the
 	ticket carries chooses the assignee before the routing rules.
 
 	default_assignee (CHG-015): the person who takes the ticket when neither the table nor the routing rules give a
@@ -114,7 +120,7 @@ def decide_route(
 		agent_group = _department_team(classification, config, team_exists, is_excluded_team, notes)
 	else:
 		agent_group = entry.get("agent_group") or None
-	picked = _tag_assignee(classification.category, tags, tag_rules, is_active_agent, notes)
+	picked = _tag_assignee(classification.category, tags, tag_table, is_active_agent, notes)
 	assignee, assignee_tag = picked or (
 		_assignee(classification, subject, config, is_active_agent, notes),
 		None,
@@ -221,9 +227,9 @@ def _tag_assignee(category, tags, rules, is_active_agent, notes) -> tuple[str, s
 	"""(person, row tag) of the first row, top-down, whose tag the ticket carries (without case) and whose category is
 	blank or the ticket's (CHG-011, the user's option b). A row naming the agent account or no active HD Agent is
 	noted and passed over; None when no row gives a person."""
-	on_ticket = {(tag or "").casefold() for tag in tags} - {""}
+	on_ticket = {tag_key(tag) for tag in tags} - {""}
 	for row in rules:
-		if row.tag.casefold() not in on_ticket or row.category not in ("", category):
+		if tag_key(row.tag) not in on_ticket or row.category not in ("", category):
 			continue
 		if row.assignee.strip().casefold() == AGENT_USER.casefold():
 			notes.append({"field": "assignee", "reason": f"tag {row.tag}: không gán tài khoản agent"})

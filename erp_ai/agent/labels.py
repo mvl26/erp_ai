@@ -36,8 +36,10 @@ def tag_choices(rules) -> tuple[tuple[str, str], ...]:
 
 def chosen_tag(labels: tuple[str, ...], choices) -> tuple[str, ...]:
 	"""(the table's tag,) when the model's first label is a tag of `choices` without case, else () (CHG-014)."""
-	spelling = {tag.casefold(): tag for tag, _description in choices}
-	first = labels[0].casefold() if labels else ""
+	from erp_ai.agent.routing import tag_key
+
+	spelling = {tag_key(tag): tag for tag, _description in choices}
+	first = tag_key(labels[0]) if labels else ""
 	return (spelling[first],) if first in spelling else ()
 
 

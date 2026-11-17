@@ -1932,6 +1932,11 @@ class TestRoutingLabels(RoutingTestBase):
 		self._run_labelled(_classify_with("Stock"))
 		self.assertEqual(self._labels_of(self.ticket.name), [])
 		self.assertEqual(self._label_actions(), [])
+		# CHG-016: the dropped answer leaves its reason in the log
+		self.assertIn(
+			{"field": "nhan", "reason": "tag Stock không có trong bảng Gán người theo tag"},
+			json.loads(self._single_entry().skipped_fields),
+		)
 
 	def test_table_spelling_kept(self):
 		self._run_labelled(_classify_with(LABEL_KHO.lower()))
@@ -1953,10 +1958,17 @@ class TestRoutingLabels(RoutingTestBase):
 
 		self.assertEqual(self._labels_of(self.ticket.name), [LABEL_IN])
 		self.assertEqual(self._label_actions(), [])
+		# CHG-016: the bot's answer is dropped with its reason in the log
+		self.assertIn(
+			{"field": "nhan", "reason": "phiếu đã có tag do HD Agent gắn"},
+			json.loads(self._single_entry().skipped_fields),
+		)
 
 	def test_a_tag_the_ticket_carries_is_not_said_again(self):
 		# put on by Administrator (no HD Agent): it does not stop the bot's tag, which is then already there
 		frappe.get_doc("HD Ticket", self.ticket.name).add_tag(LABEL_KHO)
+		# CHG-016: this pins the add_labels path, not the agent-tag check
+		self.assertEqual(labels.agent_tags(self.ticket.name, runner.site_facts.is_active_agent), ())
 
 		captured = self._run_labelled()
 
@@ -2712,3 +2724,15 @@ class TestRoutingDefaultAssignee(AssignTestBase):
 		assign_to.add({"assign_to": [self.person], "doctype": "HD Ticket", "name": self.ticket.name})
 		self._run()
 		self.assertEqual(self._assigned_to(), [self.person])
+
+	# CHG-016: a default that is no active HD Agent asks the team lead, with the default's own reason
+	def test_an_unusable_default_asks_the_team_lead(self):
+		set_agent_settings(default_assignee="nobody-erpai-test@example.com")
+		self._run()
+		self.assertEqual(self._assigned_to(), [])
+		(action,) = self._action("assign_owner")
+		self.assertEqual(
+			(action["ok"], action["reason"]),
+			(False, "người nhận mặc định nobody-erpai-test@example.com không phải HD Agent đang hoạt động"),
+		)
+		self.assertIn("Nhờ trưởng nhóm phân công", self._comment_text())

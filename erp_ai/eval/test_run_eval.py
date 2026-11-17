@@ -390,7 +390,8 @@ class TestRunEvalRun(FrappeTestCase):
 
 		self.assertEqual(runner_gateway.call_count, 1)
 		self.assertEqual(eval_gateway.call_count, 1)
-		expected = build_classify_request(subject, description)
+		# CHG-018: both let the model make a new tag
+		expected = build_classify_request(subject, description, new_tags=True)
 		for call in (runner_gateway.calls[0], eval_gateway.calls[0]):
 			self.assertEqual(call["system"], expected["system"])
 			self.assertEqual(call["messages"], expected["messages"])
@@ -578,7 +579,7 @@ class TestRunEvalRun(FrappeTestCase):
 		for kwargs in (eval_kwargs, runner_kwargs):
 			self.assertEqual([kwargs["is_excluded_team"](team) for team in (excluded, "IT")], [True, False])
 		self.assertEqual(eval_route.call_args.args[2], mapping)
-		expected = build_classify_request(subject, description, ("Kế toán",))
+		expected = build_classify_request(subject, description, ("Kế toán",), new_tags=True)
 		self.assertEqual(eval_gateway.calls[0]["system"], expected["system"])
 		self.assertEqual(runner_gateway.calls[0]["system"], expected["system"])
 		# importance 1 adds no priority floor, so Low/HR can only come from the seeded mapping

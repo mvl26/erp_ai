@@ -3,12 +3,14 @@ the tag table of ERP AI Setting by each tag's description; when none fits, a new
 (CHG-018), which the route adds to the table.
 
 The labels live where Helpdesk keeps tags (`_user_tags` and `Tag Link`); the list of tags lives in the tag table
-(`routing.tag_rules`); nothing is stored here.
+(`routing.tag_rules`), where `add_tag_row` puts a new tag (CHG-018).
 """
+
+import hashlib
 
 import frappe
 
-from erp_ai.constants import AGENT_USER
+from erp_ai.constants import AGENT_USER, SETTING_DOCTYPE, TAG_ASSIGNEE_DOCTYPE
 
 TICKET_DOCTYPE = "HD Ticket"
 # Helpdesk tags a requester's first ticket itself: no label of the ticket's content.
@@ -85,3 +87,40 @@ def agent_tags(ticket_name: str, is_active_agent) -> tuple[str, ...]:
 			and is_active_agent(row.owner)
 		)
 	)
+
+
+TAG_TABLE_FIELD = "tag_assignees"
+
+
+def add_tag_row(tag: str, description: str) -> dict:
+	"""CHG-018: put a tag the bot made at the end of the tag table of ERP AI Setting, with the model's description and
+	no person, so later tickets choose it and a System Manager can give it a person. A system write of the route
+	(as the run's other log and settings writes), not a model tool: outside agent/tools (ADR-005, ADR-034).
+
+	A tag the table has (NFC, without case, any category) is not added again. The row alone is written, not the
+	Setting: no check of the Setting's other fields runs and nobody's open Setting form goes stale. Its name comes
+	from the tag, so a run that read the table before another run's row was there adds no second one.
+	Returns `{"ok": True, "added": bool}`."""
+	parent = {"parent": SETTING_DOCTYPE, "parenttype": SETTING_DOCTYPE, "parentfield": TAG_TABLE_FIELD}
+	rows = frappe.get_all(TAG_ASSIGNEE_DOCTYPE, filters=parent, fields=["tag", "idx"])
+	from erp_ai.agent.routing import tag_key
+
+	key = tag_key(tag)
+	if any(tag_key(row.tag) == key for row in rows):
+		return {"ok": True, "added": False}
+	row = frappe.get_doc(
+		{
+			"doctype": TAG_ASSIGNEE_DOCTYPE,
+			"name": f"erp-ai-tag-{hashlib.sha1(key.encode()).hexdigest()[:12]}",
+			**parent,
+			"idx": max((row.idx or 0 for row in rows), default=0) + 1,
+			"tag": tag,
+			"description": description,
+		}
+	)
+	try:
+		row.db_insert()
+	except frappe.DuplicateEntryError:
+		return {"ok": True, "added": False}
+	frappe.clear_document_cache(SETTING_DOCTYPE, SETTING_DOCTYPE)
+	return {"ok": True, "added": True}

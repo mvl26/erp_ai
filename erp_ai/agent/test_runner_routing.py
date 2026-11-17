@@ -293,8 +293,12 @@ class TestRoutingEndToEnd(RoutingTestBase):
 
 		call = self.gateway.calls[0]
 		self.assertEqual(call["max_tokens"], runner.CLASSIFY_MAX_TOKENS)
+		# CHG-018: the runner's request lets the model make a new tag
 		expected = build_classify_request(
-			self.ticket.subject, self.ticket.description, departments(load_routing_config(rules))
+			self.ticket.subject,
+			self.ticket.description,
+			departments(load_routing_config(rules)),
+			new_tags=True,
 		)
 		self.assertEqual(call["system"], expected["system"])
 		self.assertIn("Kế toán", call["system"][0]["text"])
@@ -2162,7 +2166,7 @@ class TestRoutingNewTag(RoutingTestBase):
 		self.assertEqual(self._row_actions(), [])
 
 	def test_a_failed_row_write_keeps_the_tag_and_the_route(self):
-		with patch.object(runner, "add_tag_row", side_effect=frappe.ValidationError("x")):
+		with patch.object(labels, "add_tag_row", side_effect=frappe.ValidationError("x")):
 			self._run_labelled(_classify_new())
 
 		entry = self._single_entry()

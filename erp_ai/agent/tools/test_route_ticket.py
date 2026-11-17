@@ -21,28 +21,13 @@ from erp_ai.agent.tools.route_ticket import (
 	TASK_REQUEST,
 	TaskSharingDisabled,
 	add_labels,
-	add_tag_row,
 	apply_route,
 	assign_owner,
 	create_routed_task,
 	post_routing_comment,
 )
-from erp_ai.constants import (
-	AGENT_USER,
-	CLASSIFIED_BY_AI,
-	CLASSIFIED_BY_HUMAN,
-	MESSAGE_DOCTYPE,
-	SETTING_DOCTYPE,
-	TAG_ASSIGNEE_DOCTYPE,
-)
-from erp_ai.test_utils import (
-	PREFIX,
-	make_active_agent,
-	make_sla,
-	make_team,
-	pin_agent_roles,
-	set_tag_assignees,
-)
+from erp_ai.constants import AGENT_USER, CLASSIFIED_BY_AI, CLASSIFIED_BY_HUMAN, MESSAGE_DOCTYPE
+from erp_ai.test_utils import PREFIX, make_active_agent, make_sla, make_team, pin_agent_roles
 
 SCORE_FIELDS = ("ai_complexity", "ai_importance", "ai_score_reason")
 CLASSIFICATION_REASON_FIELD = "ai_classification_reason"
@@ -483,67 +468,6 @@ class TestAddLabels(RouteTicketTestCase):
 			result = self._add_as_agent(ticket, (f"{PREFIX}Kho",))
 		self.assertFalse(result["ok"])
 		self.assertEqual(self._links(ticket), [])
-
-
-class TestAddTagRow(RouteTicketTestCase):
-	"""CHG-018 (spec 2026-11-17-bot-new-tag-design.md, design 5): a tag the bot made goes at the end of the tag table,
-	with its description and no person; a tag the table has (any case) is not added again."""
-
-	TAG = f"{PREFIX}kế toán"
-
-	def _rows(self):
-		return frappe.get_all(
-			TAG_ASSIGNEE_DOCTYPE,
-			filters={
-				"parent": SETTING_DOCTYPE,
-				"parenttype": SETTING_DOCTYPE,
-				"parentfield": "tag_assignees",
-			},
-			fields=["idx", "tag", "assignee", "category", "description"],
-			order_by="idx",
-		)
-
-	def _add_as_agent(self, tag, description="Hóa đơn, công nợ"):
-		pin_agent_roles(self)
-		frappe.set_user(AGENT_USER)
-		try:
-			return add_tag_row(tag, description, self._ctx(self._ticket()))
-		finally:
-			frappe.set_user("Administrator")
-
-	def test_a_new_tag_goes_at_the_end_without_a_person(self):
-		set_tag_assignees((f"{PREFIX}hr", "a@x.com", "", "Nhân sự"))
-
-		self.assertEqual(self._add_as_agent(self.TAG), {"ok": True, "added": True})
-
-		rows = self._rows()
-		self.assertEqual([(row.idx, row.tag) for row in rows], [(1, f"{PREFIX}hr"), (2, self.TAG)])
-		self.assertEqual(
-			(rows[1].description, rows[1].assignee or "", rows[1].category or ""),
-			("Hóa đơn, công nợ", "", ""),
-		)
-		# the Setting the next run reads has the row
-		tags = [row.tag for row in frappe.get_single(SETTING_DOCTYPE).tag_assignees]
-		self.assertEqual(tags, [f"{PREFIX}hr", self.TAG])
-
-	def test_first_row_of_an_empty_table(self):
-		set_tag_assignees()
-		self.assertEqual(self._add_as_agent(self.TAG), {"ok": True, "added": True})
-		self.assertEqual([(row.idx, row.tag) for row in self._rows()], [(1, self.TAG)])
-
-	def test_a_tag_the_table_has_is_not_added_again(self):
-		set_tag_assignees((f"{PREFIX}Kế Toán", "a@x.com", "C", "x"))
-		self.assertEqual(self._add_as_agent(self.TAG), {"ok": True, "added": False})
-		self.assertEqual([row.tag for row in self._rows()], [f"{PREFIX}Kế Toán"])
-
-	def test_two_runs_adding_one_tag_give_one_row(self):
-		set_tag_assignees()
-		self._add_as_agent(self.TAG)
-		# a second run that read the table before the first row was there: the row's name comes from the tag
-		frappe.db.set_value(TAG_ASSIGNEE_DOCTYPE, {"tag": self.TAG}, "tag", f"{PREFIX}đổi tên")
-
-		self.assertEqual(self._add_as_agent(self.TAG), {"ok": True, "added": False})
-		self.assertEqual([row.tag for row in self._rows()], [f"{PREFIX}đổi tên"])
 
 
 class TestSlaFromHelpdesk(RouteTicketTestCase):

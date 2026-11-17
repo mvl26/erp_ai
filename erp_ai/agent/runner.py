@@ -41,7 +41,6 @@ from erp_ai.agent.tools.route_ticket import (
 	TASK_REQUEST,
 	TaskSharingDisabled,
 	add_labels,
-	add_tag_row,
 	apply_route,
 	assign_owner,
 	create_routed_task,
@@ -1375,7 +1374,7 @@ def _tag_row_unit(classification, labelled, context, actions, errors) -> str | N
 	tag = labelled[0]
 	result = _run_unit(
 		TAG_ROW_TOOL,
-		lambda: add_tag_row(tag, classification.label_description, context),
+		lambda: ticket_labels.add_tag_row(tag, classification.label_description),
 		SETTING_DOCTYPE,
 		SETTING_DOCTYPE,
 		actions,

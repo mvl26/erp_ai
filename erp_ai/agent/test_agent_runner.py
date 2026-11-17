@@ -366,7 +366,8 @@ class TestRunner(RunnerTestBase):
 		call = self.gateway.calls[0]
 		self.assertEqual(call["task"], "classify")
 		self.assertEqual(call["max_tokens"], 2048)
-		expected = build_classify_request(self.ticket.subject, self.ticket.description)
+		# CHG-018: the runner's request lets the model make a new tag
+		expected = build_classify_request(self.ticket.subject, self.ticket.description, new_tags=True)
 		self.assertEqual((call["system"], call["messages"]), (expected["system"], expected["messages"]))
 
 		(entry,) = self._entries()

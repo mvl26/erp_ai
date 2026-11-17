@@ -1,7 +1,10 @@
+import frappe
 from frappe.tests.utils import FrappeTestCase
 
 from erp_ai.agent import labels
 from erp_ai.agent.routing import TagRule
+from erp_ai.constants import AGENT_USER, SETTING_DOCTYPE, TAG_ASSIGNEE_DOCTYPE
+from erp_ai.test_utils import PREFIX, keep_agent_settings, pin_agent_roles, set_tag_assignees
 
 
 class TestParseTags(FrappeTestCase):
@@ -72,3 +75,69 @@ class TestNewTag(FrappeTestCase):
 		for name, (answered, description, category) in cases.items():
 			with self.subTest(name):
 				self.assertIsNone(labels.new_tag(answered, description, category, self.CHOICES))
+
+
+class TestAddTagRow(FrappeTestCase):
+	"""CHG-018 (spec 2026-11-17-bot-new-tag-design.md, design 5): a tag the bot made goes at the end of the tag table,
+	with its description and no person; a tag the table has (any case) is not added again."""
+
+	TAG = f"{PREFIX}kế toán"
+
+	def setUp(self):
+		self.addCleanup(frappe.db.rollback)
+		keep_agent_settings(self)
+		self.addCleanup(frappe.set_user, "Administrator")
+
+	def _rows(self):
+		return frappe.get_all(
+			TAG_ASSIGNEE_DOCTYPE,
+			filters={
+				"parent": SETTING_DOCTYPE,
+				"parenttype": SETTING_DOCTYPE,
+				"parentfield": "tag_assignees",
+			},
+			fields=["idx", "tag", "assignee", "category", "description"],
+			order_by="idx",
+		)
+
+	def _add_as_agent(self, tag, description="Hóa đơn, công nợ"):
+		pin_agent_roles(self)
+		frappe.set_user(AGENT_USER)
+		try:
+			return labels.add_tag_row(tag, description)
+		finally:
+			frappe.set_user("Administrator")
+
+	def test_a_new_tag_goes_at_the_end_without_a_person(self):
+		set_tag_assignees((f"{PREFIX}hr", "a@x.com", "", "Nhân sự"))
+
+		self.assertEqual(self._add_as_agent(self.TAG), {"ok": True, "added": True})
+
+		rows = self._rows()
+		self.assertEqual([(row.idx, row.tag) for row in rows], [(1, f"{PREFIX}hr"), (2, self.TAG)])
+		self.assertEqual(
+			(rows[1].description, rows[1].assignee or "", rows[1].category or ""),
+			("Hóa đơn, công nợ", "", ""),
+		)
+		# the Setting the next run reads has the row
+		tags = [row.tag for row in frappe.get_single(SETTING_DOCTYPE).tag_assignees]
+		self.assertEqual(tags, [f"{PREFIX}hr", self.TAG])
+
+	def test_first_row_of_an_empty_table(self):
+		set_tag_assignees()
+		self.assertEqual(self._add_as_agent(self.TAG), {"ok": True, "added": True})
+		self.assertEqual([(row.idx, row.tag) for row in self._rows()], [(1, self.TAG)])
+
+	def test_a_tag_the_table_has_is_not_added_again(self):
+		set_tag_assignees((f"{PREFIX}Kế Toán", "a@x.com", "C", "x"))
+		self.assertEqual(self._add_as_agent(self.TAG), {"ok": True, "added": False})
+		self.assertEqual([row.tag for row in self._rows()], [f"{PREFIX}Kế Toán"])
+
+	def test_two_runs_adding_one_tag_give_one_row(self):
+		set_tag_assignees()
+		self._add_as_agent(self.TAG)
+		# a second run that read the table before the first row was there: the row's name comes from the tag
+		frappe.db.set_value(TAG_ASSIGNEE_DOCTYPE, {"tag": self.TAG}, "tag", f"{PREFIX}đổi tên")
+
+		self.assertEqual(self._add_as_agent(self.TAG), {"ok": True, "added": False})
+		self.assertEqual([row.tag for row in self._rows()], [f"{PREFIX}đổi tên"])

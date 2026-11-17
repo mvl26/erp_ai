@@ -1520,6 +1520,8 @@ def _reason(
 				guidance_posted=guidance_posted,
 				conversation=conversation,
 				propose_now=granted.change_block and granted.act_now_block,
+				# CHG-010: on the creation run the instructor is the ticket's creator, so the ticket is the order.
+				ticket_is_order=trigger == TRIGGER_TICKET_INSERT and bool(context.instructor),
 			),
 		}
 	]

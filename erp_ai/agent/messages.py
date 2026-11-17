@@ -1,7 +1,7 @@
 import frappe
 from frappe.utils import format_datetime, get_fullname
 
-from erp_ai.agent.prompts import MAX_COMMENTS
+from erp_ai.agent.prompts import APPROVE_GUIDANCE_OFFER, MAX_COMMENTS
 from erp_ai.constants import AGENT_USER, MESSAGE_DOCTYPE
 
 THREAD_LIMIT = 200
@@ -103,6 +103,8 @@ def thread(ticket: str) -> list[dict]:
 				"created_at": format_datetime(row.creation),
 				"text": text,
 				"kind": kind,
+				# CHG-010: only a plan with steps left for the bot can be approved.
+				"approvable": kind == KIND_GUIDANCE and APPROVE_GUIDANCE_OFFER in text,
 			}
 		)
 	return shaped

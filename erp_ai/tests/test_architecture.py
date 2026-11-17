@@ -307,10 +307,12 @@ STATUS_SCRIPT_REQUIRED = (
 	r"phiếu không dùng AI hoặc thuộc nhóm loại trừ, đã hết lượt hôm nay, "
 	r"hoặc đang trả lời tin trước của phiếu này \(khi đó hãy gửi lại sau\)\. "
 	r"Nhận định và hướng xử lý của bot là tin trong ngăn này; người có vai trò ERP AI Instructor bấm "
-	r"\"Duyệt hướng xử lý\" dưới tin đó thì bot làm theo\.",
+	r"\"Duyệt hướng xử lý\" dưới tin đó \(nút chỉ có khi bot còn việc tự làm\) thì bot làm theo\.",
 	# ADR-050: the approve button under the newest guidance of the bot sends the fixed approval text through submit.
 	r'TEXT_APPROVE_GUIDANCE = "Duyệt hướng xử lý";',
 	r"message\?\.is_bot && message\?\.kind === KIND_GUIDANCE",
+	# CHG-010: the button shows only under a guidance the server marks approvable.
+	r"index === newestGuidance && message\?\.approvable",
 	r"panel\.inputEl\.value = APPROVE_GUIDANCE_TEXT;\s*submit\(\);",
 	r'TEXT_LOAD_FAILED = "Không tải được dữ liệu của khu vực\. Hãy đóng rồi mở lại\."',
 	r"\(docked \? state\.panel\.slotEl : document\.body\)\.appendChild\(el\)",

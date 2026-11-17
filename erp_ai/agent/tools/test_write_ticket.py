@@ -12,7 +12,7 @@ from frappe.tests.utils import FrappeTestCase
 from frappe.utils import escape_html, get_datetime, now_datetime
 from helpdesk.test_utils import create_agent, make_ticket
 
-from erp_ai.agent import messages, ops_data, policy, site_facts
+from erp_ai.agent import messages, ops_data, policy, prompts, site_facts
 from erp_ai.agent.classification import Classification
 from erp_ai.agent.routing import decide_route
 from erp_ai.agent.run_log import write_entry
@@ -1686,6 +1686,21 @@ class TestGuidanceWriter(TicketCommentCase):
 		)
 		self.assertEqual(_headings(content), ["Nhận định", "Hướng xử lý", "Đã làm"])
 
+	def test_no_analysis_uses_the_resolution_hint_before_the_fallback(self):
+		# CHG-010: the plan the bot wrote on the ticket stands in for a missing analysis, never "chưa viết được".
+		frappe.db.set_value("HD Ticket", self.ticket, write_ticket.HINT_FIELD, "Bot chọn làm MVP; bước đầu: X")
+
+		content = self._body(self._run(done=["D"]))
+
+		self.assertEqual(
+			content,
+			f"{write_ticket.GUIDANCE_MARKER}\n"
+			f"{write_ticket.GUIDANCE_FROM_HINT.format(hint='Bot chọn làm MVP; bước đầu: X')}"
+			f"\n<p><strong>{write_ticket.SECTION_DONE}:</strong></p><ul><li>D</li></ul>",
+		)
+		self.assertNotIn("chưa viết được", content)
+		self.assertEqual(_headings(content), ["Hướng xử lý", "Đã làm"])
+
 	def test_collected_line_html_escaped_once(self):
 		# AD3-4: a collected line is raw text; the writer escapes it exactly once, the model's analysis not at all.
 		value = "<b>&x"
@@ -2231,19 +2246,19 @@ BA_NOTE_SOURCE_PATH = "erpnext/projects/doctype/task/task.json"
 BA_NOTE_FEATURE_LINES = (
 	f"**Tính năng sẵn có:** Có, ERPNext có trường ước lượng giờ trên việc\n**Nguồn:** {BA_NOTE_SOURCE_PATH}"
 )
+# CHG-010: four parts, the plan decided by the bot; no open-questions part.
 BA_NOTE = (
 	f"**Mục tiêu:** {T169_PREFIX} theo dõi giờ làm của từng việc\n"
-	"**Phạm vi:** việc của phiếu đầu mục C, không đụng bảng chấm công\n"
 	f"{BA_NOTE_FEATURE_LINES}\n"
-	"**Rủi ro:** người dùng nhầm giờ ước lượng với giờ thực\n"
-	"**Câu hỏi mở:** có cần báo cáo tổng giờ theo tuần không?\n"
+	"**Phương án:** Bot chọn dùng trường expected_time của Task, vì ERPNext đã có\n"
+	"**Chia việc:** 1. Báo cáo tổng giờ theo tuần: 2h\n"
 	"Độ tin cậy: 80%"
 )
 LEVEL_FUNCTIONS = ("main_path_level", "category_level_cap", "effective_level")
 
 
 class TestBaNote(TicketCommentCase):
-	"""AC-62 (U4b-fixes Fix 3, w1.md:121): post_comment kind=ba_note, the five parts, once per ticket, only on a
+	"""AC-62 (U4b-fixes Fix 3, w1.md:121; CHG-010): post_comment kind=ba_note, the four parts, once per ticket, only on a
 	category C ticket whose main-path level (from the context) is L1 or more."""
 
 	def _classify_row(self, category, ticket=None, pct=90):
@@ -2309,6 +2324,11 @@ class TestBaNote(TicketCommentCase):
 			self.assertNotEqual(inline, BA_NOTE)
 			self.assertTrue(self._note(inline, self._ctx(ticket))["ok"])
 			self.assertEqual(self._comments(ticket), [f"{ops_data.BA_NOTE_MARKER}\n{inline}"])
+		with self.subTest("an optional one-line risk part"):
+			ticket = self._c_ticket()
+			risky = BA_NOTE.replace("\nĐộ tin cậy", "\n**Rủi ro:** hạn sát, chỉ kịp MVP\nĐộ tin cậy")
+			self.assertTrue(self._note(risky, self._ctx(ticket))["ok"])
+			self.assertEqual(self._comments(ticket), [f"{ops_data.BA_NOTE_MARKER}\n{risky}"])
 		with self.subTest("the feature part last, its source then the confidence line"):
 			ticket = self._c_ticket()
 			last = BA_NOTE.replace(f"{BA_NOTE_FEATURE_LINES}\n", "").replace(
@@ -2328,27 +2348,39 @@ class TestBaNote(TicketCommentCase):
 		missing = write_ticket.REASON_BA_NOTE_MISSING
 		cases = {
 			"no Mục tiêu": ("\n".join(lines[:0] + lines[1:]), missing.format(sections="Mục tiêu")),
-			"no Phạm vi": ("\n".join(lines[:1] + lines[2:]), missing.format(sections="Phạm vi")),
 			"no Tính năng sẵn có": (
-				"\n".join(lines[:2] + lines[4:]),
+				"\n".join(lines[:1] + lines[3:]),
 				missing.format(sections="Tính năng sẵn có"),
 			),
-			"no Rủi ro": ("\n".join(lines[:4] + lines[5:]), missing.format(sections="Rủi ro")),
-			"no Câu hỏi mở": ("\n".join(lines[:5] + lines[6:]), missing.format(sections="Câu hỏi mở")),
-			"empty Rủi ro": (
-				BA_NOTE.replace("**Rủi ro:** người dùng nhầm giờ ước lượng với giờ thực", "**Rủi ro:**  "),
-				missing.format(sections="Rủi ro"),
-			),
-			"empty Mục tiêu and Câu hỏi mở": (
-				BA_NOTE.replace(f"{T169_PREFIX} theo dõi giờ làm của từng việc", "").replace(
-					"có cần báo cáo tổng giờ theo tuần không?\n", "\n**Ghi chú:** x\n"
+			"no Phương án": ("\n".join(lines[:3] + lines[4:]), missing.format(sections="Phương án")),
+			"no Chia việc": ("\n".join(lines[:4] + lines[5:]), missing.format(sections="Chia việc")),
+			"empty Phương án": (
+				BA_NOTE.replace(
+					"**Phương án:** Bot chọn dùng trường expected_time của Task, vì ERPNext đã có", "**Phương án:**  "
 				),
-				missing.format(sections="Mục tiêu, Câu hỏi mở"),
+				missing.format(sections="Phương án"),
+			),
+			"empty Mục tiêu and Chia việc": (
+				BA_NOTE.replace(f"{T169_PREFIX} theo dõi giờ làm của từng việc", "").replace(
+					"1. Báo cáo tổng giờ theo tuần: 2h\n", "\n**Ghi chú:** x\n"
+				),
+				missing.format(sections="Mục tiêu, Chia việc"),
 			),
 			# A part ends at the confidence line too: that line is not the content of the part before it.
-			"empty Câu hỏi mở, the confidence line next": (
-				BA_NOTE.replace(" có cần báo cáo tổng giờ theo tuần không?", ""),
-				missing.format(sections="Câu hỏi mở"),
+			"empty Chia việc, the confidence line next": (
+				BA_NOTE.replace(" 1. Báo cáo tổng giờ theo tuần: 2h", ""),
+				missing.format(sections="Chia việc"),
+			),
+			# CHG-010: open points are chosen by the bot inside Phương án, never asked back in a part of their own.
+			"an open-questions part": (
+				BA_NOTE.replace("\nĐộ tin cậy: 80%", "\n**Câu hỏi mở:** dùng LLM nào?\nĐộ tin cậy: 80%"),
+				write_ticket.REASON_BA_NOTE_QUESTION,
+			),
+			"longer than the cap": (
+				BA_NOTE.replace(
+					"theo dõi giờ làm của từng việc", "theo dõi giờ" + " làm" * write_ticket.BA_NOTE_MAX_CHARS
+				),
+				write_ticket.REASON_BA_NOTE_TOO_LONG.format(max=write_ticket.BA_NOTE_MAX_CHARS),
 			),
 			"feature part last, empty source, the confidence line next": (
 				BA_NOTE.replace(f"{BA_NOTE_FEATURE_LINES}\n", "").replace(
@@ -2706,6 +2738,18 @@ class TestBotSpeaksInConversation(ConversationCase):
 		# a person's text is shown as typed, whatever it starts with
 		self.assertEqual((forged["kind"], forged["text"]), ("", marked))
 		self.assertEqual((person["kind"], person["text"]), ("", "tin <b>của người</b> &amp;"))
+		self.assertEqual([m["approvable"] for m in (guidance, forged, person)], [False, False, False])
+
+	def test_only_a_guidance_with_the_approve_offer_is_approvable(self):
+		"""CHG-010: the approve button is for steps left for the bot; a plan of manual work only gets none."""
+		run_id = self._guidance_run(
+			f"**Nhận định:** A\n**Hướng xử lý:** bot sửa B. {prompts.APPROVE_GUIDANCE_OFFER} bước sửa B."
+		)
+		write_ticket.post_guidance(self.ticket, run_id)
+
+		(guidance,) = messages.thread(self.ticket)
+
+		self.assertEqual((guidance["kind"], guidance["approvable"]), (messages.KIND_GUIDANCE, True))
 
 
 class TestLevelNotRecomputed(FrappeTestCase):

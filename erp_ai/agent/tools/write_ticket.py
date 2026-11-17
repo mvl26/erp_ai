@@ -8,7 +8,7 @@ from datetime import datetime
 from decimal import Decimal
 
 import frappe
-from frappe.utils import escape_html, now_datetime
+from frappe.utils import escape_html, now_datetime, strip_html
 
 from erp_ai.agent import policy, site_facts
 from erp_ai.agent.classification import CONFIDENCE_PCT_MAX, Classification
@@ -59,13 +59,19 @@ REASON_NO_CONFIDENCE = "comment đề xuất thiếu dòng 'Độ tin cậy: NN%
 REASON_NO_EVIDENCE = f"comment thiếu phần '**{EVIDENCE_HEADER}:**' có nội dung"
 REASON_ASK_ONLY = "độ tin cậy dưới ngưỡng: chỉ được đăng comment hỏi (kind = hoi)"
 REASON_ONE_ASK = "đã đăng comment hỏi trong lần chạy này"
-# The BA note (AC-62, U4b.md:152-156, U4b-fixes Fix 3): five non-empty parts, once per category C ticket, posted under
-# ops_data.BA_NOTE_MARKER (the 08:00 report finds it by that marker).
+# The BA note (AC-62, CHG-010): four non-empty parts with the plan the bot decided, no open-questions part, at most
+# BA_NOTE_MAX_CHARS; once per category C ticket, posted under ops_data.BA_NOTE_MARKER (the 08:00 report finds it by it).
 BA_NOTE_CATEGORY = "C"
-BA_NOTE_SECTIONS = ("Mục tiêu", "Phạm vi", "Tính năng sẵn có", "Rủi ro", "Câu hỏi mở")
-BA_NOTE_FEATURE = BA_NOTE_SECTIONS[2]
+BA_NOTE_SECTIONS = ("Mục tiêu", "Tính năng sẵn có", "Phương án", "Chia việc")
+BA_NOTE_FEATURE = BA_NOTE_SECTIONS[1]
 BA_NOTE_SOURCE = "Nguồn"
+BA_NOTE_QUESTION = "Câu hỏi mở"
+BA_NOTE_MAX_CHARS = 1500
 REASON_BA_NOTE_MISSING = "BA note thiếu hoặc rỗng mục: {sections}"
+REASON_BA_NOTE_QUESTION = (
+	"BA note không có mục Câu hỏi mở: điểm còn mở thì bot tự chọn, ghi 'Bot chọn …, vì …' trong Phương án"
+)
+REASON_BA_NOTE_TOO_LONG = "BA note dài quá {max} ký tự: bỏ phần nhắc lại phiếu, mỗi mục một đến ba dòng"
 REASON_BA_NOTE_FEATURE = "mục 'Tính năng sẵn có' phải bắt đầu bằng Có hoặc Không và có 'Nguồn:' không rỗng"
 REASON_BA_NOTE_EXISTS = "phiếu đã có BA note"
 REASON_BA_NOTE_NOT_C = "BA note chỉ dành cho phiếu đầu mục C ở mức L1 trở lên"
@@ -114,6 +120,8 @@ GUIDANCE_FALLBACK = (
 	f"**{GUIDANCE_HEADER}:** người phụ trách làm các việc ghi ngay dưới (nếu có); việc bot đã làm và đề xuất chờ "
 	"duyệt nằm ở các mục cuối tin này; cần bot làm tiếp thì nhắn trong ngăn này."
 )
+# CHG-010: the body when the model wrote no analysis but the ticket has the bot's resolution hint (its plan).
+GUIDANCE_FROM_HINT = f"**{GUIDANCE_HEADER}:** {{hint}}"
 # Once per comment, in the heading paragraph of the pending section (design-w1-fixes-20 Điểm 2.1); a trusted constant.
 PENDING_NOTE = (
 	'Nút "Duyệt ngay" nằm ở ngăn "Trao đổi với bot" của phiếu; đề xuất không có nút thì duyệt ở form đề xuất.'
@@ -616,6 +624,12 @@ def _store_run_info(ticket_name: str, analysis: str | None, sections: dict[str, 
 	return True
 
 
+def _hint_guidance(ticket_name: str) -> str | None:
+	"""GUIDANCE_FROM_HINT with the ticket's resolution hint as plain text; no hint → None."""
+	hint = strip_html(frappe.db.get_value(TICKET_DOCTYPE, ticket_name, HINT_FIELD) or "").strip()
+	return GUIDANCE_FROM_HINT.format(hint=hint) if hint else None
+
+
 def post_guidance(ticket_name: str, run_id: str) -> dict:
 	"""The one writer of the ticket's guidance, a message of its conversation since ADR-050 (ADR-036 QĐ 1, 4); the
 	runner calls it once, at the end of a guidance run; not a tool. Counted under the ticket lock, so a ticket has at
@@ -626,7 +640,8 @@ def post_guidance(ticket_name: str, run_id: str) -> dict:
 	analysis, sections = collected(run_id)
 	if not analysis and not any(sections.values()):
 		return _fail(REASON_NO_CONTENT)
-	parts = [GUIDANCE_MARKER, _with_manual_lines(analysis or GUIDANCE_FALLBACK, sections[SECTION_DECIDE])]
+	body = analysis or _hint_guidance(ticket_name) or GUIDANCE_FALLBACK
+	parts = [GUIDANCE_MARKER, _with_manual_lines(body, sections[SECTION_DECIDE])]
 	for section in (SECTION_DONE, SECTION_PENDING):
 		if sections[section]:
 			note = f" {PENDING_NOTE}" if section == SECTION_PENDING else ""
@@ -684,10 +699,14 @@ def _ba_note_refusal(content: str, ctx: ToolContext) -> dict | None:
 	missing = [section for section in BA_NOTE_SECTIONS if not section_text(content, section, _PLAN_END)]
 	if missing:
 		return _fail(REASON_BA_NOTE_MISSING.format(sections=", ".join(missing)))
+	if _heading_line(BA_NOTE_QUESTION).search(content):
+		return _fail(REASON_BA_NOTE_QUESTION)
 	feature = _feature_part(content)
 	has_source = section_text(feature, BA_NOTE_SOURCE) or _INLINE_SOURCE.search(feature)
 	if not _FEATURE_ANSWER.match(section_text(content, BA_NOTE_FEATURE, _PLAN_END)) or not has_source:
 		return _fail(REASON_BA_NOTE_FEATURE)
+	if len(_ba_note_content(content)) - len(BA_NOTE_MARKER) - 1 > BA_NOTE_MAX_CHARS:
+		return _fail(REASON_BA_NOTE_TOO_LONG.format(max=BA_NOTE_MAX_CHARS))
 	return None
 
 
@@ -862,9 +881,10 @@ TOOLS: list[ToolSpec] = [
 				"kind=de_xuat: nhận định và phương án, hoặc báo việc đã làm; phải có dòng 'Độ tin cậy: NN%'. "
 				"kind=hoi: câu hỏi; khi độ tin cậy dưới ngưỡng chỉ được dùng kind này, một lần, "
 				f"và vẫn phải có '**{EVIDENCE_HEADER}:**' nêu vì sao chưa chắc. "
-				"kind=ba_note: chỉ phiếu đầu mục C, một lần mỗi phiếu; đủ 5 mục **Mục tiêu:**, **Phạm vi:**, "
-				"**Tính năng sẵn có:** (Có/Không, **Nguồn:**), **Rủi ro:**, **Câu hỏi mở:** "
-				"và dòng 'Độ tin cậy: NN%'. "
+				"kind=ba_note: chỉ phiếu đầu mục C, một lần mỗi phiếu, tối đa "
+				f"{BA_NOTE_MAX_CHARS} ký tự; đủ 4 mục **Mục tiêu:**, **Tính năng sẵn có:** (Có/Không, **Nguồn:**), "
+				"**Phương án:** (bot tự chọn điểm còn mở), **Chia việc:** (việc và giờ ước lượng) "
+				"và dòng 'Độ tin cậy: NN%'; không có mục Câu hỏi mở. "
 				"Không tự liệt kê việc đã làm, đề xuất đang chờ hay việc hệ thống từ chối: "
 				"hệ thống tự thêm chúng vào comment. "
 				"Khi phiếu đã có hướng xử lý: chỉ báo kết quả việc vừa làm."

@@ -88,7 +88,7 @@ class TestMessages(FrappeTestCase):
 		rows = thread(self.ticket)
 		self.assertEqual([row["name"] for row in rows], [human, bot])
 		self.assertEqual([row["is_bot"] for row in rows], [False, True])
-		self.assertEqual(set(rows[0]), {"name", "author", "is_bot", "created_at", "text", "kind"})
+		self.assertEqual(set(rows[0]), {"name", "author", "is_bot", "created_at", "text", "kind", "approvable"})
 		self.assertEqual([row["kind"] for row in rows], ["", ""])
 		self.assertEqual(rows[0]["text"], "hỏi")
 		self.assertEqual(rows[0]["author"], frappe.utils.get_fullname(HUMAN_USER))

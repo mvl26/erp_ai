@@ -2622,13 +2622,23 @@ class TestRoutingAssignByTag(AssignTestBase):
 		finally:
 			frappe.set_user("Administrator")
 
-	def test_tag_an_agent_put_on_the_ticket_comes_before_the_model_label(self):
+	# CHG-011 user decision 2026-11-17 (option b): the table is read top-down, an agent's tag and the model's label
+	# alike
+	def test_tag_an_agent_put_on_the_ticket_counts(self):
+		other = make_active_agent(self)
+		make_tag(TAG_KE_TOAN)
+		set_tag_assignees((TAG_KE_TOAN, other, ""), (TAG_KHO, self.tag_person, ""))
+		self._tag_as(self.person, TAG_KE_TOAN)
+		self._run()
+		self.assertEqual(self._assigned_to(), [other])
+
+	def test_row_above_wins_over_an_agent_tag_lower_in_the_table(self):
 		other = make_active_agent(self)
 		make_tag(TAG_KE_TOAN)
 		set_tag_assignees((TAG_KHO, self.tag_person, ""), (TAG_KE_TOAN, other, ""))
 		self._tag_as(self.person, TAG_KE_TOAN)
 		self._run()
-		self.assertEqual(self._assigned_to(), [other])
+		self.assertEqual(self._assigned_to(), [self.tag_person])
 
 	def test_tag_a_non_agent_put_on_the_ticket_is_not_used(self):
 		# review finding: the ticket's requester (HD Customer, raised_by) may tag their own ticket through Frappe's
@@ -2646,7 +2656,8 @@ class TestRoutingAssignByTag(AssignTestBase):
 		frappe.db.set_value("HD Ticket", self.ticket.name, "raised_by", requester, update_modified=False)
 		other = make_active_agent(self)
 		make_tag(TAG_KE_TOAN)
-		set_tag_assignees((TAG_KHO, self.tag_person, ""), (TAG_KE_TOAN, other, ""))
+		# the requester's tag has the row above: only leaving it out gives the model label's person
+		set_tag_assignees((TAG_KE_TOAN, other, ""), (TAG_KHO, self.tag_person, ""))
 		self._tag_as(requester, TAG_KE_TOAN)
 		self._run()
 		self.assertEqual(self._assigned_to(), [self.tag_person])

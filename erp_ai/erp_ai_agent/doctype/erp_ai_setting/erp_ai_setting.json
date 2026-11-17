@@ -434,7 +434,7 @@
    "fieldtype": "Table",
    "label": "Gán người theo tag",
    "options": "ERP AI Tag Assignee",
-   "description": "Mỗi dòng: một tag, người phụ trách, đầu mục (để trống là mọi đầu mục, kể cả D/E). Khi Tự gán người bật, bot xét tag HD Agent gắn trên phiếu, rồi nhãn bot gắn (nhãn phân hệ trước nhãn chủ đề); tag đầu tiên có dòng quyết người nhận phiếu và Task C/D. Không tag nào khớp thì dùng Quy tắc định tuyến. Dòng trùng tag và đầu mục bị chặn khi lưu."
+   "description": "Mỗi dòng: một tag, người phụ trách, đầu mục (để trống là mọi đầu mục, kể cả D/E). Khi Tự gán người bật, bot đọc bảng từ trên xuống: dòng đầu tiên có tag trên phiếu (tag HD Agent gắn hoặc nhãn bot gắn) và đầu mục trống hoặc đúng đầu mục phiếu quyết người nhận phiếu và Task C/D. Không dòng nào khớp thì dùng Quy tắc định tuyến. Dòng trùng tag và đầu mục bị chặn khi lưu."
   },
   {
    "fieldname": "routing_rules",

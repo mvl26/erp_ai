@@ -97,8 +97,8 @@ def decide_route(
 	d_watcher: None = the caller does not say (no watcher, no note), blank = not configured
 	(D gets a note), a user = D watcher when an active HD Agent (else a note). Ignored outside D.
 
-	tags, tag_rules (CHG-011): the ticket's tags, most telling first, and the table rows; the first tag with a
-	usable row chooses the assignee before the routing rules.
+	tags, tag_rules (CHG-011): the ticket's tags and the table rows; the first usable row, top-down, whose tag the
+	ticket carries chooses the assignee before the routing rules.
 	"""
 	entry = mapping.get(classification.category) or {}
 	notes = []
@@ -189,27 +189,24 @@ def _assignee(classification, subject, config, is_active_agent, notes) -> str | 
 
 
 def _tag_assignee(category, tags, rules, is_active_agent, notes) -> tuple[str, str] | None:
-	"""(person, row tag) of the first tag with a usable row: the ticket's category row before the blank one. A row
-	naming the agent account or no active HD Agent is noted and passed over; None when no tag gives a person."""
-	seen = set()
-	for tag in tags:
-		key = (tag or "").casefold()
-		if not key or key in seen:
+	"""(person, row tag) of the first row, top-down, whose tag the ticket carries (without case) and whose category is
+	blank or the ticket's (CHG-011, the user's option b). A row naming the agent account or no active HD Agent is
+	noted and passed over; None when no row gives a person."""
+	on_ticket = {(tag or "").casefold() for tag in tags} - {""}
+	for row in rules:
+		if row.tag.casefold() not in on_ticket or row.category not in ("", category):
 			continue
-		seen.add(key)
-		rows = [row for row in rules if row.tag.casefold() == key]
-		for row in [r for r in rows if r.category == category] + [r for r in rows if not r.category]:
-			if row.assignee.strip().casefold() == AGENT_USER.casefold():
-				notes.append({"field": "assignee", "reason": f"tag {row.tag}: không gán tài khoản agent"})
-			elif not is_active_agent(row.assignee):
-				notes.append(
-					{
-						"field": "assignee",
-						"reason": f"tag {row.tag}: {row.assignee} không phải HD Agent đang hoạt động",
-					}
-				)
-			else:
-				return row.assignee, row.tag
+		if row.assignee.strip().casefold() == AGENT_USER.casefold():
+			notes.append({"field": "assignee", "reason": f"tag {row.tag}: không gán tài khoản agent"})
+		elif not is_active_agent(row.assignee):
+			notes.append(
+				{
+					"field": "assignee",
+					"reason": f"tag {row.tag}: {row.assignee} không phải HD Agent đang hoạt động",
+				}
+			)
+		else:
+			return row.assignee, row.tag
 	return None
 
 

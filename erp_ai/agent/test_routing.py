@@ -1037,17 +1037,28 @@ def _decide_by_tags(category, tags, rules=TAG_RULES, is_active_agent=None, depar
 
 
 class TestDecideAssigneeByTag(FrappeTestCase):
-	def test_first_tag_with_a_row_decides(self):
-		d = _decide_by_tags("C", ("Stock", "tracecore", "Accounts"))
+	# CHG-011 user decision 2026-11-17 (option b): the table is read top-down; the first row whose tag the ticket
+	# carries and whose category is blank or the ticket's decides, whatever order the ticket's tags come in.
+	def test_first_row_in_table_order_decides(self):
+		d = _decide_by_tags("C", ("tracecore", "Accounts"))
+		self.assertEqual((d.assignee, d.assignee_tag), ("hieu@x.com", "Accounts"))
+		rules = (routing.TagRule("tracecore", "e2e@x.com", ""), routing.TagRule("Accounts", "hieu@x.com", ""))
+		d = _decide_by_tags("C", ("Accounts", "tracecore"), rules)
 		self.assertEqual((d.assignee, d.assignee_tag), ("e2e@x.com", "tracecore"))
 
 	def test_tag_compared_without_case(self):
 		d = _decide_by_tags("C", ("ACCOUNTS",))
 		self.assertEqual((d.assignee, d.assignee_tag), ("hieu@x.com", "Accounts"))
 
-	def test_row_of_the_ticket_category_beats_blank_row(self):
-		self.assertEqual(_decide_by_tags("A", ("Accounts",)).assignee, "acc.a@x.com")
-		self.assertEqual(_decide_by_tags("C", ("Accounts",)).assignee, "hieu@x.com")
+	def test_row_order_decides_between_category_and_blank_rows(self):
+		# TAG_RULES puts the blank Accounts row above the A one: the blank row serves A too
+		self.assertEqual(_decide_by_tags("A", ("Accounts",)).assignee, "hieu@x.com")
+		rules = (
+			routing.TagRule("Accounts", "acc.a@x.com", "A"),
+			routing.TagRule("Accounts", "hieu@x.com", ""),
+		)
+		self.assertEqual(_decide_by_tags("A", ("Accounts",), rules).assignee, "acc.a@x.com")
+		self.assertEqual(_decide_by_tags("C", ("Accounts",), rules).assignee, "hieu@x.com")
 
 	def test_row_of_another_category_is_not_used(self):
 		d = _decide_by_tags("C", ("Accounts",), (routing.TagRule("Accounts", "acc.a@x.com", "A"),))
@@ -1069,9 +1080,9 @@ class TestDecideAssigneeByTag(FrappeTestCase):
 				self.assertEqual((d.assignee, d.assignee_tag), ("hieu@x.com", "Accounts"))
 
 	def test_unusable_person_is_skipped_with_a_note(self):
-		d = _decide_by_tags("C", ("tracecore", "Accounts"), is_active_agent=lambda user: user != "e2e@x.com")
-		self.assertEqual((d.assignee, d.assignee_tag), ("hieu@x.com", "Accounts"))
-		self.assertEqual(_assignee_notes(d), ["tag tracecore: e2e@x.com không phải HD Agent đang hoạt động"])
+		d = _decide_by_tags("C", ("tracecore", "Accounts"), is_active_agent=lambda user: user != "hieu@x.com")
+		self.assertEqual((d.assignee, d.assignee_tag), ("e2e@x.com", "tracecore"))
+		self.assertEqual(_assignee_notes(d), ["tag Accounts: hieu@x.com không phải HD Agent đang hoạt động"])
 		d = _decide_by_tags("C", ("tracecore",), (routing.TagRule("tracecore", AGENT_USER, ""),))
 		self.assertEqual((d.assignee, d.assignee_tag), ("c.default@x.com", None))
 		self.assertEqual(_assignee_notes(d), ["tag tracecore: không gán tài khoản agent"])

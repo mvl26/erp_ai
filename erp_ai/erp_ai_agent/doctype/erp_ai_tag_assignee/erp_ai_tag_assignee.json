@@ -41,7 +41,7 @@
    "label": "Phạm vi áp dụng"
   },
   {
-   "description": "Để trống thì áp cho mọi đầu mục. Dòng có đầu mục của phiếu thắng dòng để trống cùng tag. Một tag và một đầu mục chỉ có một dòng.",
+   "description": "Để trống thì áp cho mọi đầu mục, kể cả D/E (thắng trưởng bộ phận). Bảng đọc từ trên xuống, dòng nằm trên thắng: muốn dòng của một đầu mục thắng dòng để trống cùng tag thì đặt nó lên trên. Một tag và một đầu mục chỉ có một dòng.",
    "fieldname": "category",
    "fieldtype": "Select",
    "in_list_view": 1,

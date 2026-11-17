@@ -135,14 +135,14 @@ DOCTYPE_CONFIG = {
 				"HD Agent",
 			),
 			"routing_rules": ("đầu mục", "SLA", "phút", "bị chặn khi lưu"),
-			# CHG-011: the table of tag → person, read before the routing rules; review: say whose tags count, that
-			# the module label comes first and that a blank row also serves D/E.
+			# CHG-011: the table of tag → person, read top-down before the routing rules (user's option b); say
+			# whose tags count and that a blank row also serves D/E.
 			"tag_assignees": (
 				"Tự gán người",
 				"Quy tắc định tuyến",
 				"bị chặn khi lưu",
 				"HD Agent gắn",
-				"nhãn phân hệ",
+				"từ trên xuống",
 				"D/E",
 			),
 			"prompt_digest": ("lập luận", "phân loại"),
@@ -324,7 +324,7 @@ DOCTYPE_CONFIG = {
 		"phrases": {
 			"tag": ("Mô tả", "không phân biệt hoa thường", "HD Agent gắn"),
 			"assignee": ("HD Agent", "tài khoản agent", "bỏ qua"),
-			"category": ("Để trống", "mọi đầu mục", "thắng"),
+			"category": ("Để trống", "mọi đầu mục", "dòng nằm trên"),
 		},
 		"section_count": 2,
 		"read_only_fields": (),

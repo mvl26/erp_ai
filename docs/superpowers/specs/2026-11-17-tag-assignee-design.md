@@ -1,6 +1,6 @@
 # Gán người theo tag (CHG-011) — thiết kế ngắn
 
-Ngày: 2026-11-17. Trạng thái: chờ duyệt.
+Ngày: 2026-11-17. Trạng thái: đã duyệt 2026-11-17; Amendment 1 cùng ngày (cuối tệp).
 
 ## Ý định
 
@@ -83,3 +83,16 @@ Người dùng chọn cách 1 (2026-11-17).
 - Tên test, cách chia commit, giới hạn số tag thêm vào "Nhãn đang dùng" (tag trong bảng không bị cắt bởi giới hạn 40).
 - Theo `CLAUDE.md`: test hỏng trước; chạy test dưới khóa site `miyano`; cần `migrate` cho DocType và trường mới;
   prod cần người duyệt.
+
+## Amendment 1 (2026-11-17, sau review)
+
+Người dùng chọn phương án (b) khi review chỉ ra thứ tự cũ (tag theo thứ tự trên phiếu, nhãn phân hệ luôn trước nhãn
+chủ đề) làm phiếu Tracecore có chạm Accounts về người của dòng Accounts. Thay mục 2 của Thiết kế và hai quyết định
+đầu của "Quyết định của tôi":
+
+- Bảng đọc **từ trên xuống**: dòng đầu tiên có tag nằm trên phiếu (không phân biệt hoa thường) và có đầu mục để trống
+  hoặc đúng đầu mục của phiếu, với người dùng được, quyết người nhận. Thứ tự các tag trên phiếu không còn ý nghĩa.
+- Dòng có đầu mục cụ thể không còn tự thắng dòng để trống; người quản trị đặt nó lên trên nếu muốn nó thắng.
+- Dòng để trống vẫn áp cả cho D/E (thắng trưởng bộ phận).
+- Review cũng chỉ ra người tạo phiếu tự gắn được tag lên phiếu của mình (API `add_tag` của Frappe): chỉ tag do HD Agent
+  đang hoạt động (không phải tài khoản bot) gắn, cùng nhãn bot đặt, được tính.

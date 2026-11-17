@@ -220,6 +220,11 @@ def _ensure_ticket_custom_fields() -> None:
 	create_custom_fields({TICKET_DOCTYPE: fields}, update=True)
 
 
+def ai_filled_fields() -> list[str]:
+	"""The AI fields the bot fills: the read-only ones, in install order (CHG-017)."""
+	return [spec["fieldname"] for spec in _ai_field_specs() if spec.get("read_only")]
+
+
 def _ai_field_specs() -> list[dict]:
 	"""Single source of the AI fields; the first one is the section break."""
 	return [
@@ -337,7 +342,10 @@ def _ensure_template_rows() -> None:
 		return
 	template = frappe.get_doc("HD Ticket Template", TEMPLATE_NAME)
 	present = {row.fieldname for row in template.fields}
-	# A hidden field is server-only, so it gets no row; a row already there is a human decision and stays.
+	# Only a field a person fills gets a row: a hidden field is server-only, and a field the bot fills (read-only)
+	# stays off the ticket form, the ERP AI panel shows it (CHG-017). A row already there is a human decision and
+	# stays.
+	filled = set(ai_filled_fields())
 	missing = [
 		name
 		for name in (
@@ -345,7 +353,7 @@ def _ensure_template_rows() -> None:
 			for spec in _ai_field_specs()
 			if spec["fieldname"] != AI_SECTION_FIELD and not spec.get("hidden")
 		)
-		if name not in present
+		if name not in present and name not in filled
 	]
 	for name in missing:
 		template.append(

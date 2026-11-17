@@ -134,6 +134,8 @@ class TestInstall(FrappeTestCase):
 		frappe.db.delete("Custom Field", {"dt": "Task", "fieldname": "ai_ticket"})
 		# The app-owned form script, removed so the create path runs inside the rolled-back transaction.
 		frappe.db.delete(install.FORM_SCRIPT_DOCTYPE, {"name": install.AGENT_STATUS_SCRIPT})
+		# CHG-013: ensure_setup() no longer seeds the setting defaults (install does, once); these tests start from the seeded state.
+		install.seed_once()
 		install.ensure_setup()
 
 	def test_setup_twice_is_idempotent(self):
@@ -513,7 +515,8 @@ class TestInstall(FrappeTestCase):
 			"and field in ('routing_rules', 'auto_assign_enabled')",
 			SETTING_DOCTYPE,
 		)
-		install.ensure_setup()
+		# CHG-013: the defaults are filled by seed_once(), not by ensure_setup().
+		install.seed_once()
 		self.assertEqual(self._stored("routing_rules"), DEFAULT_ROUTING_RULES)
 		self.assertEqual(self._stored("auto_assign_enabled"), "0")
 
@@ -522,7 +525,8 @@ class TestInstall(FrappeTestCase):
 			"update `tabSingles` set value=NULL where doctype=%s and field='permission_level'",
 			SETTING_DOCTYPE,
 		)
-		install.ensure_setup()
+		# CHG-013: the defaults are filled by seed_once(), not by ensure_setup().
+		install.seed_once()
 		self.assertEqual(frappe.db.get_single_value(SETTING_DOCTYPE, "permission_level"), "L0")
 
 	def _stored(self, fieldname):
@@ -539,7 +543,8 @@ class TestInstall(FrappeTestCase):
 		frappe.db.set_single_value(SETTING_DOCTYPE, "answer_delay_min_s", 0)
 		frappe.db.set_single_value(SETTING_DOCTYPE, "answer_delay_max_s", 0)
 		frappe.db.delete("Singles", {"doctype": SETTING_DOCTYPE, "field": "trigger_keyword"})
-		install.ensure_setup()
+		# CHG-013: the defaults are filled by seed_once(), not by ensure_setup().
+		install.seed_once()
 		self.assertEqual(self._stored("thinking_text"), "Chờ chút")
 		self.assertEqual(self._stored("answer_delay_min_s"), "0")
 		self.assertEqual(self._stored("answer_delay_max_s"), "0")
@@ -732,7 +737,8 @@ class TestFeat007Migrate(FrappeTestCase):
 
 	def test_fresh_install_five_switches_off(self):
 		frappe.db.delete("Singles", {"doctype": SETTING_DOCTYPE})
-		install.ensure_setup()
+		# CHG-013: the switch defaults are seeded by seed_once() at install, not by ensure_setup().
+		install.seed_once()
 		stored = _stored_settings()
 		self.assertEqual(
 			{name: stored.get(name, "<missing>") for name in FIVE_SWITCHES}, dict.fromkeys(FIVE_SWITCHES, "0")
@@ -756,7 +762,8 @@ class TestFeat007Migrate(FrappeTestCase):
 		frappe.db.delete("Singles", {"doctype": SETTING_DOCTYPE, "field": ("in", FIVE_SWITCHES)})
 		for name in OLD_SWITCHES:
 			frappe.db.set_single_value(SETTING_DOCTYPE, name, 1)
-		install.after_migrate()
+		# CHG-013: the switch defaults are filled by seed_once() (install / the one patch), not by after_migrate().
+		install.seed_once()
 		stored = _stored_settings()
 		self.assertEqual(
 			{name: stored.get(name, "<missing>") for name in FIVE_SWITCHES},
@@ -766,15 +773,17 @@ class TestFeat007Migrate(FrappeTestCase):
 	def test_second_migrate_changes_nothing(self):
 		frappe.db.delete("Singles", {"doctype": SETTING_DOCTYPE, "field": ("in", FIVE_SWITCHES)})
 		frappe.db.set_single_value(SETTING_DOCTYPE, "code_change_enabled", 1)
-		install.after_migrate()
+		# CHG-013: the switch defaults are filled by seed_once() (install / the one patch), not by after_migrate().
+		install.seed_once()
 		first = _stored_settings()
 		self.assertLessEqual(set(FIVE_SWITCHES), set(first))
-		install.after_migrate()
+		install.seed_once()
 		self.assertEqual(_stored_settings(), first)
 
 	def _setup_at(self, now):
+		# CHG-013: the enable mark is set by _mark_agent_enabled_at() (install / the one patch), not by ensure_setup().
 		with patch("frappe.utils.now_datetime", return_value=frappe.utils.get_datetime(now)):
-			install.ensure_setup()
+			install._mark_agent_enabled_at()
 
 	def _enabled_at(self):
 		stored = _stored_settings().get("agent_enabled_at", "<missing>")
@@ -1163,6 +1172,8 @@ class TestFeat007Migrate(FrappeTestCase):
 		frappe.db.delete("Singles", {"doctype": SETTING_DOCTYPE})
 		for child in {field.options for field in frappe.get_meta(SETTING_DOCTYPE).get_table_fields()}:
 			frappe.db.delete(child, {"parent": SETTING_DOCTYPE, "parenttype": SETTING_DOCTYPE})
+		# CHG-013: the defaults come from seed_once(); ensure_setup() no longer seeds them.
+		install.seed_once()
 		install.ensure_setup()
 		install.after_migrate()
 		frappe.db.value_cache.pop(SETTING_DOCTYPE, None)
@@ -1307,7 +1318,8 @@ class TestLessonDefaults(FrappeTestCase):
 	def test_lesson_defaults_filled_on_migrate(self):
 		for fieldname in self.FIELDS:
 			frappe.db.delete("Singles", {"doctype": SETTING_DOCTYPE, "field": fieldname})
-		install.ensure_setup()
+		# CHG-013: the defaults are filled by seed_once() (install / the one patch), not by ensure_setup().
+		install.seed_once()
 		self.assertEqual(
 			[str(self._stored(fieldname)) for fieldname in self.FIELDS], ["1", "5", "2000", "ghi nhớ:"]
 		)
@@ -1412,7 +1424,8 @@ class TestEnsureTicketTypesAndTeams(FrappeTestCase):
 		self.assertTrue(frappe.db.exists("HD Ticket Type", name))
 		self.assertFalse(frappe.db.get_value("HD Ticket Type", name, "priority"))
 
-	def test_ensure_setup_runs_the_step_after_default_settings(self):
+	def test_seed_once_runs_the_step_after_default_settings(self):
+		# CHG-013: the step moved from ensure_setup() to seed_once(), the same order after the settings defaults.
 		calls = []
 		with patch.multiple(
 			install,
@@ -1422,7 +1435,7 @@ class TestEnsureTicketTypesAndTeams(FrappeTestCase):
 				if name.startswith("_ensure_")
 			},
 		):
-			install.ensure_setup()
+			install.seed_once()
 		self.assertEqual(
 			calls.index("_ensure_ticket_types_and_teams"), calls.index("_ensure_default_settings") + 1
 		)
@@ -1486,3 +1499,74 @@ class TestEnsureTicketTypesAndTeams(FrappeTestCase):
 		ticket.status = "Replied"
 		ticket.status = "Open"
 		ticket.save(ignore_permissions=True)
+
+
+class TestSeedOnce(FrappeTestCase):
+	"""CHG-013: data defaults are seeded once at install; app setup runs on every migrate."""
+
+	def setUp(self):
+		frappe.db.rollback()
+		commit_guard = patch.object(frappe.db, "commit", side_effect=AssertionError("test must not commit"))
+		commit_guard.start()
+		self.addCleanup(commit_guard.stop)
+		self.addCleanup(frappe.db.rollback)
+		self.addCleanup(frappe.set_user, "Administrator")
+		keep_agent_settings(self)
+		# ensure_setup() creates custom fields (DDL, implicit commit); the columns exist, so skip the DDL.
+		updatedb = patch.object(frappe.db, "updatedb")
+		updatedb.start()
+		self.addCleanup(updatedb.stop)
+
+	def _stored(self, fieldname):
+		return frappe.db.get_single_value(SETTING_DOCTYPE, fieldname, cache=False)
+
+	def _mapping_with_fresh_type(self):
+		type_name = f"CHG013 {frappe.generate_hash(length=6)} type"
+		set_agent_settings(
+			category_mapping=json.dumps(
+				{"A": {"ticket_type": type_name, "agent_group": "", "priority": "High"}}
+			)
+		)
+		return type_name
+
+	def test_after_install_seeds_then_sets_up(self):
+		calls = []
+		with (
+			patch.object(install, "seed_once", side_effect=lambda: calls.append("seed_once")),
+			patch.object(install, "ensure_setup", side_effect=lambda: calls.append("ensure_setup")),
+		):
+			install.after_install()
+		self.assertEqual(calls, ["seed_once", "ensure_setup"])
+
+	def test_after_migrate_sets_up_and_never_seeds(self):
+		with (
+			patch.object(install, "ensure_setup") as ensure_setup,
+			patch.object(install, "seed_once") as seed_once,
+			patch.object(install, "_ensure_default_settings") as defaults,
+			patch.object(install, "_ensure_ticket_types_and_teams") as types,
+		):
+			install.after_migrate()
+		self.assertEqual(ensure_setup.call_count, 1)
+		self.assertEqual((seed_once.call_count, defaults.call_count, types.call_count), (0, 0, 0))
+
+	def test_ensure_setup_leaves_a_cleared_mapping_cleared(self):
+		set_agent_settings(category_mapping="")
+		install.ensure_setup()
+		self.assertEqual(self._stored("category_mapping") or "", "")
+
+	def test_ensure_setup_does_not_create_a_mapped_type(self):
+		type_name = self._mapping_with_fresh_type()
+		install.ensure_setup()
+		self.assertFalse(frappe.db.exists("HD Ticket Type", type_name))
+
+	def test_seed_once_creates_a_mapped_type(self):
+		type_name = self._mapping_with_fresh_type()
+		install.seed_once()
+		self.assertTrue(frappe.db.exists("HD Ticket Type", type_name))
+
+	def test_seed_once_fills_a_missing_default_and_keeps_a_set_value(self):
+		frappe.db.delete("Singles", {"doctype": SETTING_DOCTYPE, "field": "thinking_text"})
+		set_agent_settings(answer_delay_min_s=0)
+		install.seed_once()
+		self.assertEqual(self._stored("thinking_text"), "Đang suy nghĩ…")
+		self.assertEqual(int(self._stored("answer_delay_min_s")), 0)

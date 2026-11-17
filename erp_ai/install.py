@@ -42,19 +42,34 @@ AGENT_STATUS_SCRIPT_FLAGS = {
 
 
 def after_install():
+	"""A new site: seed the data defaults once, then do the app setup."""
+	seed_once()
 	ensure_setup()
 
 
 def after_migrate():
+	"""Every migrate: app setup only. Data defaults are never seeded here, so a value or record a human
+	cleared, changed or deleted stays that way; a later data default goes in a new patch that calls seed_once()."""
 	ensure_setup()
 
 
-def ensure_setup() -> None:
-	"""Create what is missing, never overwrite what a human set; except the app-owned form script (ADR-007)."""
-	_ensure_roles()
-	_ensure_agent_user()
+def seed_once() -> None:
+	"""The data defaults: the ERP AI Setting values and the ticket types and teams of the category mapping.
+
+	Runs once: from after_install on a new site, from the CHG-013 patch on a site that already had the app.
+	Fills only what is missing and never overwrites what a human set.
+	"""
 	_ensure_default_settings()
 	_ensure_ticket_types_and_teams()
+
+
+def ensure_setup() -> None:
+	"""The app setup the code depends on (roles, user, custom fields, permissions, form script); runs on every
+	migrate. It never seeds data defaults (see seed_once). Create what is missing, never overwrite what a human
+	set; except the app-owned form script (ADR-007).
+	"""
+	_ensure_roles()
+	_ensure_agent_user()
 	_ensure_ticket_custom_fields()
 	_ensure_template_rows()
 	_ensure_task_ticket_field()
@@ -113,7 +128,10 @@ def _ensure_default_settings() -> None:
 		)
 		if not stored or stored[0][0] is None:
 			frappe.db.set_single_value(SETTING_DOCTYPE, fieldname, default)
-	# A site enabled before the upgrade gets its enable mark once (AC-16, ADR-006); absent, NULL or "" is missing.
+
+
+def _mark_agent_enabled_at() -> None:
+	"""A site enabled before the upgrade gets its enable mark once (AC-16, ADR-006); absent, NULL or "" is missing."""
 	enabled_at = frappe.db.sql(
 		"select value from `tabSingles` where doctype=%s and field='agent_enabled_at'", SETTING_DOCTYPE
 	)

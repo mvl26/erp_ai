@@ -79,6 +79,7 @@ Cảnh báo:
 
 ## 4. Giới hạn đã biết
 
+- Quay về code trước CHG-011 sau khi đã `migrate` (bảng `ERP AI Tag Assignee` đã có trên site): code cũ không import được bảng con, mọi lần đọc `ERP AI Setting` báo ImportError. Muốn quay về thì phải xóa trường `tag_assignees` khỏi meta của `ERP AI Setting` (reload DocType từ code cũ) hoặc giữ module `erp_ai_tag_assignee`.
 - Model phân loại: chỉ `claude-haiku-*` được tắt thinking ở bước phân loại. Model khác có thể bị cắt ở trần 600 token (phiếu thành "không phân loại được"). Chạy eval (`README.md`, "Bộ đánh giá offline") và đọc dòng `Classify max_tokens hits`; khác 0 là phải xem lại model.
 - Hiếm khi một lỗi xảy ra sau bước thông báo gán của Helpdesk, người nhận có thể thấy thông báo gán cho một ToDo đã bị hoàn tác. Không mất dữ liệu; nếu gặp, báo cho team kỹ thuật.
 - Eval chỉ báo số, không đặt ngưỡng cho khớp ưu tiên và khớp nhóm. Lần đo ngày 2026-11-13 chỉ có 2 phiếu gán nhãn, cùng đầu mục B, nên chưa đủ để kết luận độ đúng chung.

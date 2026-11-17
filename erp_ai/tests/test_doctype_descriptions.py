@@ -144,9 +144,18 @@ DOCTYPE_CONFIG = {
 				"từ trên xuống",
 				"D/E",
 				"Quy tắc định tuyến",
+				# CHG-016: the sentence names whose category the row must match
+				"đầu mục của phiếu",
 			),
 			# CHG-015: the person a ticket no rule gives goes to.
-			"default_assignee": ("bảng Gán người theo tag", "Quy tắc định tuyến", "HD Agent", "Task C/D"),
+			# CHG-016: and the switch it needs
+			"default_assignee": (
+				"bảng Gán người theo tag",
+				"Quy tắc định tuyến",
+				"HD Agent",
+				"Task C/D",
+				"Tự gán người",
+			),
 			"prompt_digest": ("lập luận", "phân loại"),
 			**{
 				fieldname: ("fieldname", "Để trống", "không lưu được")
@@ -318,7 +327,6 @@ DOCTYPE_CONFIG = {
 			("section_scope", "Đầu mục và chế độ", "categories"),
 		),
 	},
-	# FEAT-007 design.md:225: one account template (child of ERP AI Setting, AC-30 (1)).
 	# CHG-011: one row of the table of tag → person (child of ERP AI Setting).
 	"ERP AI Tag Assignee": {
 		"folder": "erp_ai_tag_assignee",
@@ -326,7 +334,8 @@ DOCTYPE_CONFIG = {
 		"field_count": 4,
 		"phrases": {
 			"tag": ("bot tự tạo", "không phân biệt hoa thường", "không dấu phẩy"),
-			"description": ("đúng một tag", "dòng đầu tiên", "không nêu tên người"),
+			# CHG-016: the bot reads the first 200 characters
+			"description": ("đúng một tag", "dòng đầu tiên", "không nêu tên người", "200 ký tự"),
 			"assignee": ("HD Agent", "tài khoản agent", "bỏ qua"),
 			"category": ("Để trống", "mọi đầu mục", "dòng nằm trên"),
 		},
@@ -337,6 +346,7 @@ DOCTYPE_CONFIG = {
 			("section_scope", "Phạm vi áp dụng", "category"),
 		),
 	},
+	# FEAT-007 design.md:225: one account template (child of ERP AI Setting, AC-30 (1)).
 	"ERP AI User Template": {
 		"folder": "erp_ai_user_template",
 		"field_count": 3,
@@ -532,7 +542,8 @@ DOCTYPE_CONFIG = {
 			"predicted_complexity": ("độ phức tạp", "1 đến 3", "ghi 0"),
 			"predicted_importance": ("độ quan trọng", "1 đến 3", "ghi 0"),
 			"predicted_score_reason": ("lý do", "không có điểm"),
-			"predicted_assignee": ("người phụ trách", "dự đoán"),
+			# CHG-016: CHG-011 and CHG-015 give the person too
+			"predicted_assignee": ("người phụ trách", "dự đoán", "bảng tag", "người nhận mặc định"),
 			"applied": ("đã ghi", "phiếu"),
 			"created_labels": (
 				"lúc tạo phiếu",

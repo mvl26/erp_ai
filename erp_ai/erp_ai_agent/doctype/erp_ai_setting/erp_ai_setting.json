@@ -435,7 +435,7 @@
    "fieldtype": "Table",
    "label": "Gán người theo tag",
    "options": "ERP AI Tag Assignee",
-   "description": "Mỗi dòng: một tag, mô tả, người phụ trách, đầu mục (trống là mọi đầu mục, kể cả D/E). Bot gắn cho phiếu mới đúng một tag của bảng theo mô tả; phiếu có tag do HD Agent gắn thì giữ tag đó. Tự gán người bật thì bảng đọc từ trên xuống: dòng đầu tiên có tag của phiếu và đầu mục trống hoặc đúng quyết người nhận phiếu và Task C/D; không dòng nào khớp thì dùng Quy tắc định tuyến."
+   "description": "Mỗi dòng: một tag, mô tả, người phụ trách, đầu mục (trống là mọi đầu mục, kể cả D/E). Bot gắn cho phiếu mới đúng một tag của bảng theo mô tả; phiếu có tag do HD Agent gắn thì giữ tag đó. Tự gán người bật thì bảng đọc từ trên xuống: dòng đầu tiên có tag của phiếu và đầu mục trống hoặc đúng đầu mục của phiếu quyết người nhận phiếu và Task C/D; không dòng nào khớp thì dùng Quy tắc định tuyến."
   },
   {
    "fieldname": "routing_rules",
@@ -449,7 +449,7 @@
    "fieldtype": "Link",
    "label": "Người nhận mặc định",
    "options": "HD Agent",
-   "description": "HD Agent nhận phiếu chưa có người được giao khi bảng Gán người theo tag và Quy tắc định tuyến không cho được người (kể cả khi người ở đó không còn hoạt động); nhận luôn Task C/D. Để trống thì bot nhờ trưởng nhóm phân công. Không được là tài khoản agent."
+   "description": "HD Agent nhận phiếu chưa có người được giao khi bảng Gán người theo tag và Quy tắc định tuyến không cho được người (kể cả khi người ở đó không còn hoạt động); nhận luôn Task C/D. Để trống thì bot nhờ trưởng nhóm phân công. Không được là tài khoản agent. Cần bật Tự gán người và tạo Task."
   },
   {
    "fieldname": "prompt_digest",
@@ -771,7 +771,7 @@
  ],
  "issingle": 1,
  "links": [],
- "modified": "2026-11-17 15:00:00.000000",
+ "modified": "2026-11-17 16:00:00.000000",
  "modified_by": "Administrator",
  "module": "ERP AI agent",
  "name": "ERP AI Setting",

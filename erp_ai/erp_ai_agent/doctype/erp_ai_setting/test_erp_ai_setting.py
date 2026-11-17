@@ -1,6 +1,7 @@
 import ast
 import datetime
 import json
+import unicodedata
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -2992,8 +2993,9 @@ class TestTagAssignees(FrappeTestCase):
 			with self.subTest(tag=tag):
 				self.assertEqual(
 					self._save_rows({"tag": tag, "assignee": self.person}),
+					# CHG-016: the reason names "_", which the label rule accepts
 					"Gán người theo tag dòng 1: tên tag phải dài 2 đến 40 ký tự, chỉ gồm chữ, số, khoảng trắng và "
-					"& ( ) + . / # -",
+					"_ & ( ) + . / # -",
 				)
 
 	def test_tag_need_not_exist(self):
@@ -3002,6 +3004,33 @@ class TestTagAssignees(FrappeTestCase):
 		self.assertIsNone(self._save_rows({"tag": tag, "assignee": self.person, "description": "Việc thử"}))
 		(row,) = frappe.get_doc(SETTING_DOCTYPE).tag_assignees
 		self.assertEqual((row.tag, row.description), (tag, "Việc thử"))
+
+	# CHG-016 (minor fixes of the CHG-014 review)
+	def test_helpdesk_own_tag_refused(self):
+		self.assertEqual(
+			self._save_rows({"tag": "first ticket", "assignee": self.person}),
+			"Gán người theo tag dòng 1: First Ticket là tag Helpdesk tự gắn, không dùng được",
+		)
+
+	def test_existing_tag_spelling_kept(self):
+		frappe.get_doc({"doctype": "Tag", "name": "ERPAI-TEST-HR"}).insert(ignore_permissions=True)
+		self.assertIsNone(self._save_rows({"tag": "erpai-test-hr", "assignee": self.person}))
+		self.assertEqual([r.tag for r in frappe.get_doc(SETTING_DOCTYPE).tag_assignees], ["ERPAI-TEST-HR"])
+
+	def test_decomposed_tag_stored_nfc(self):
+		self.assertIsNone(
+			self._save_rows({"tag": unicodedata.normalize("NFD", "chấm công"), "assignee": self.person})
+		)
+		self.assertEqual([r.tag for r in frappe.get_doc(SETTING_DOCTYPE).tag_assignees], ["chấm công"])
+
+	def test_duplicate_after_cleaning_refused(self):
+		self.assertEqual(
+			self._save_rows(
+				{"tag": "chấm công", "assignee": self.person},
+				{"tag": "  Chấm  Công ", "assignee": self.other},
+			),
+			"Gán người theo tag dòng 2: trùng với dòng 1",
+		)
 
 
 # CHG-015 (spec 2026-11-17-default-assignee-design.md, design 1): the person a ticket no rule gives goes to.

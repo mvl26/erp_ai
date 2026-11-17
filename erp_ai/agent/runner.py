@@ -164,6 +164,9 @@ ROUTE_NO_CHANGE = "Bot đã phân loại phiếu, các trường đã đúng nê
 ROUTE_ASSIGNED = "Đã gán cho {person}."
 # CHG-011: the person came from the tag table of ERP AI Setting.
 ROUTE_ASSIGNED_BY_TAG = "Đã gán cho {person} (theo tag {tag})."
+# CHG-016: why the model's answered tag was not given.
+LABEL_NOT_IN_TABLE = "tag {tag} không có trong bảng Gán người theo tag"
+LABEL_AGENT_TAGGED = "phiếu đã có tag do HD Agent gắn"
 # CHG-015: no rule gave a person; the Setting's default took the ticket.
 ROUTE_ASSIGNED_BY_DEFAULT = "Đã gán cho {person} (người nhận mặc định)."
 ROUTE_TASK = "Đã tạo Task {task}."
@@ -874,9 +877,17 @@ def _classify(
 		return True, None, context
 	# CHG-014: one tag of the table, spelled as the table; none when an HD Agent already tagged the ticket
 	agent = ticket_labels.agent_tags(ticket_name, site_facts.is_active_agent)
+	answered = classification.labels
 	classification = dataclasses.replace(
-		classification, labels=() if agent else ticket_labels.chosen_tag(classification.labels, choices)
+		classification, labels=() if agent else ticket_labels.chosen_tag(answered, choices)
 	)
+	# CHG-016: an answered tag the bot does not give leaves its reason in the log
+	label_note = None
+	if answered and not classification.labels:
+		label_note = {
+			"field": "nhan",
+			"reason": LABEL_AGENT_TAGGED if agent else LABEL_NOT_IN_TABLE.format(tag=answered[0]),
+		}
 
 	# U2 (AC-9 b, U2.md:164-172): the team the department maps to is learnt from the predicate decide_route asks
 	probe_hits = []
@@ -901,7 +912,7 @@ def _classify(
 		now=now_datetime(),
 		# CHG-011, CHG-014: the tags an HD Agent put on the ticket, else the one tag the bot chose
 		tags=(*agent, *classification.labels),
-		tag_rules=rules,
+		tag_table=rules,
 		default_assignee=settings.get("default_assignee") or None,
 	)
 	# a department named like an excluded team counts too
@@ -912,6 +923,8 @@ def _classify(
 	if len(typed) < len(labels):
 		frappe.logger(LOGGER_NAME).warning("erp_ai created_labels invalid ticket=%s", ticket_name)
 	route_decision = keep_human_fields(decision, labels)
+	if label_note:
+		route_decision = dataclasses.replace(route_decision, notes=(*route_decision.notes, label_note))
 	# `predicted_*` stay the model's own prediction (AC-19); the route gets the decision without the typed fields
 	values = {
 		"ticket_type": decision.ticket_type,
@@ -1188,7 +1201,10 @@ def _assign_unit(decision, context, actions, lines, errors):
 		return None
 	user = decision.assignee
 	if user is None:
-		note = next((item["reason"] for item in decision.notes if item["field"] == "assignee"), None)
+		# CHG-016: the last assignee note names the last step tried (the default person when one is set)
+		note = next(
+			(item["reason"] for item in reversed(decision.notes) if item["field"] == "assignee"), None
+		)
 		actions.append(
 			_route_action("assign_owner", "HD Ticket", ticket, False, note, instructor=context.instructor)
 		)

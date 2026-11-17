@@ -567,7 +567,7 @@ class TestRunEvalRun(FrappeTestCase):
 		self.assertEqual(
 			set(runner_kwargs),
 			shared
-			| {"due_at", "due_field_configured", "d_watcher", "now", "tags", "tag_rules", "default_assignee"},
+			| {"due_at", "due_field_configured", "d_watcher", "now", "tags", "tag_table", "default_assignee"},
 		)
 		# R23a: the runner passes its probe of excluded teams (U2.md:168), eval policy.is_excluded_team itself; the
 		# same keys, that one value compared by its answers

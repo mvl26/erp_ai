@@ -12,6 +12,7 @@ from erp_ai.agent import policy, run_log
 from erp_ai.agent.agent_write_guard import refuse_agent_write
 from erp_ai.agent.classification import clean_label, validate_mapping
 from erp_ai.agent.hard_bans import hard_ban_reason
+from erp_ai.agent.labels import IGNORED_LABELS
 from erp_ai.agent.routing import validate_routing_config
 from erp_ai.agent.text_lines import filled_lines
 from erp_ai.agent.tools import read, site_api, source
@@ -157,7 +158,7 @@ def _permission_switch_fields() -> tuple:
 
 
 # CHG-014: the reason a tag name of the tag table is refused (the rule of erp_ai.agent.classification.clean_label).
-TAG_NAME_REASON = "tên tag phải dài 2 đến 40 ký tự, chỉ gồm chữ, số, khoảng trắng và & ( ) + . / # -"
+TAG_NAME_REASON = "tên tag phải dài 2 đến 40 ký tự, chỉ gồm chữ, số, khoảng trắng và _ & ( ) + . / # -"
 EMPTY_DATETIME = datetime(1, 1, 1)  # what frappe.utils.cast returns for an empty Datetime
 
 
@@ -362,16 +363,25 @@ class ERPAISetting(Document):
 		validate_routing_config(self.routing_rules)
 
 	def check_tag_assignees(self):
-		"""CHG-011: refuse the first tag row that gives the bot account or repeats a (tag, category) pair."""
+		"""CHG-011, CHG-014, CHG-016: refuse the first tag row whose name breaks the label rule or is a tag Helpdesk
+		gives itself, that gives the bot account, or that repeats a (tag, category) pair. A good name is stored clean,
+		in the spelling of a Tag that already exists under the database's case and accent rules."""
 		seen = {}
 		for row in self.get("tag_assignees") or []:
 			# CHG-014: the tag is typed freely and cleaned like a label the bot gives
 			label = clean_label(row.tag)
+			ignored = next(
+				(tag for tag in IGNORED_LABELS if label and tag.casefold() == label.casefold()), None
+			)
 			if label is None:
 				reason = TAG_NAME_REASON
+			elif ignored:
+				reason = f"{ignored} là tag Helpdesk tự gắn, không dùng được"
 			elif (row.assignee or "").strip().casefold() == AGENT_USER.casefold():
 				reason = "không gán tài khoản agent"
 			else:
+				# CHG-016: the Tag the bot will give is the existing one when the database takes them for one name
+				label = frappe.db.get_value("Tag", label, "name") or label
 				row.tag = label
 				key = (label.casefold(), row.category or "")
 				reason = f"trùng với dòng {seen[key]}" if key in seen else None

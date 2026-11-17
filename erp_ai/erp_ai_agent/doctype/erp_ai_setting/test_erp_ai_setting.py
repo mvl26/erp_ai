@@ -917,12 +917,14 @@ class TestFeat007Limits(FrappeTestCase):
 					)
 
 
-# FEAT-007 design 2.1: the five Check fields of section_permissions (AC-4 notice, D-7).
+# FEAT-007 design 2.1: the Check fields of section_permissions (AC-4 notice, D-7).
+# BUG-008: console_enabled is the sixth, so its toggle is logged like the others (test_each_switch_on_writes_one_row).
 PERMISSION_SWITCHES = (
 	"unrestricted_enabled",
 	"record_tools_enabled",
 	"act_now_enabled",
 	"code_change_enabled",
+	"console_enabled",
 	"one_click_approval_enabled",
 )
 NOTICE_TITLE = "Đã bật quyền mở rộng"

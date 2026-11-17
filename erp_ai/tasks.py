@@ -1,4 +1,3 @@
-import dataclasses
 import json
 from collections import Counter
 from datetime import datetime, timedelta
@@ -246,17 +245,13 @@ def _enabled_keys_without_value() -> list[str]:
 
 
 def _enabled_permission_switches() -> list[str]:
-	"""Labels of the permission switches that are on, in the order (1)..(5); field names come only from policy."""
-	settings = frappe.get_single(SETTING_DOCTYPE)
-	# CHG-010: `console` is the sixth field of the switches, outside the five of the spec and of this alarm
-	switches = dataclasses.astuple(policy.permission_switches(settings))[
-		: len(policy.PERMISSION_SWITCH_FIELDS)
-	]
+	"""Labels of the permission switches that are on, in section order; each field is read by its own flag name."""
+	switches = policy.permission_switches(frappe.get_single(SETTING_DOCTYPE))
 	meta = frappe.get_meta(SETTING_DOCTYPE)
 	return [
 		meta.get_label(field)
-		for field, on in zip(policy.PERMISSION_SWITCH_FIELDS, switches, strict=True)
-		if on
+		for field in policy.PERMISSION_SWITCH_FIELDS
+		if getattr(switches, policy.SWITCH_FLAGS[field])
 	]
 
 

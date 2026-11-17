@@ -1012,3 +1012,87 @@ class TestResponseOverdue(FrappeTestCase):
 				result = routing.processing_deadline(category, resolution, due)
 				self.assertEqual(result, expected)
 				self.assertIs(type(result), type(expected))
+
+
+# CHG-011: the table of tag → person decides before the routing rules (spec 2026-11-17-tag-assignee-design.md, 2).
+TAG_RULES = (
+	routing.TagRule("Accounts", "hieu@x.com", ""),
+	routing.TagRule("tracecore", "e2e@x.com", ""),
+	routing.TagRule("Accounts", "acc.a@x.com", "A"),
+)
+
+
+def _decide_by_tags(category, tags, rules=TAG_RULES, is_active_agent=None, department=None):
+	return routing.decide_route(
+		Classification(category=category, confidence="Cao", importance=1, department=department),
+		"Thông thường",
+		DEFAULT_CATEGORY_MAPPING,
+		ASSIGN_CONFIG,
+		team_exists=lambda team: True,
+		is_excluded_team=lambda team: False,
+		is_active_agent=is_active_agent or (lambda user: True),
+		tags=tags,
+		tag_rules=rules,
+	)
+
+
+class TestDecideAssigneeByTag(FrappeTestCase):
+	def test_first_tag_with_a_row_decides(self):
+		d = _decide_by_tags("C", ("Stock", "tracecore", "Accounts"))
+		self.assertEqual((d.assignee, d.assignee_tag), ("e2e@x.com", "tracecore"))
+
+	def test_tag_compared_without_case(self):
+		d = _decide_by_tags("C", ("ACCOUNTS",))
+		self.assertEqual((d.assignee, d.assignee_tag), ("hieu@x.com", "Accounts"))
+
+	def test_row_of_the_ticket_category_beats_blank_row(self):
+		self.assertEqual(_decide_by_tags("A", ("Accounts",)).assignee, "acc.a@x.com")
+		self.assertEqual(_decide_by_tags("C", ("Accounts",)).assignee, "hieu@x.com")
+
+	def test_row_of_another_category_is_not_used(self):
+		d = _decide_by_tags("C", ("Accounts",), (routing.TagRule("Accounts", "acc.a@x.com", "A"),))
+		self.assertEqual((d.assignee, d.assignee_tag), ("c.default@x.com", None))
+
+	def test_no_matching_tag_falls_back_to_routing_rules(self):
+		d = _decide_by_tags("B", ("Stock",))
+		self.assertEqual((d.assignee, d.assignee_tag), ("b.default@x.com", None))
+		self.assertEqual(_assignee_notes(d), [])
+
+	def test_no_tags_or_no_rules_change_nothing(self):
+		self.assertEqual(_decide_by_tags("A", ()).assignee, "a.default@x.com")
+		self.assertEqual(_decide_by_tags("A", ("Accounts",), ()).assignee, "a.default@x.com")
+
+	def test_tag_row_beats_department_head_for_d_and_e(self):
+		for category in "DE":
+			with self.subTest(category=category):
+				d = _decide_by_tags(category, ("Accounts",), department="Kế toán")
+				self.assertEqual((d.assignee, d.assignee_tag), ("hieu@x.com", "Accounts"))
+
+	def test_unusable_person_is_skipped_with_a_note(self):
+		d = _decide_by_tags("C", ("tracecore", "Accounts"), is_active_agent=lambda user: user != "e2e@x.com")
+		self.assertEqual((d.assignee, d.assignee_tag), ("hieu@x.com", "Accounts"))
+		self.assertEqual(_assignee_notes(d), ["tag tracecore: e2e@x.com không phải HD Agent đang hoạt động"])
+		d = _decide_by_tags("C", ("tracecore",), (routing.TagRule("tracecore", AGENT_USER, ""),))
+		self.assertEqual((d.assignee, d.assignee_tag), ("c.default@x.com", None))
+		self.assertEqual(_assignee_notes(d), ["tag tracecore: không gán tài khoản agent"])
+
+	def test_task_follows_the_tag_person(self):
+		self.assertTrue(_decide_by_tags("C", ("tracecore",)).needs_task)
+
+
+class TestTagRules(FrappeTestCase):
+	def test_rows_read_in_order_blank_ones_left_out(self):
+		settings = frappe._dict(
+			tag_assignees=[
+				frappe._dict(tag="Accounts", assignee="hieu@x.com", category=None),
+				frappe._dict(tag="", assignee="x@x.com", category="A"),
+				frappe._dict(tag="tracecore", assignee="e2e@x.com", category="C"),
+			]
+		)
+		self.assertEqual(
+			routing.tag_rules(settings),
+			(routing.TagRule("Accounts", "hieu@x.com", ""), routing.TagRule("tracecore", "e2e@x.com", "C")),
+		)
+
+	def test_setting_without_the_table_gives_no_rules(self):
+		self.assertEqual(routing.tag_rules(frappe._dict()), ())

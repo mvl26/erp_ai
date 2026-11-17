@@ -1660,6 +1660,27 @@ class TestPermissionSwitchAlarm(FrappeTestCase):
 		)
 		self.assertEqual(tasks.PERMISSION_SWITCHES_ON_SUBJECT, SWITCH_SUBJECT)
 
+	def test_console_alone_lists_only_its_label(self):
+		# BUG-008: the console switch sits before one_click_approval; the labels pair by name, not position.
+		set_agent_settings(**{policy.CONSOLE_FIELD: 1})
+		label = frappe.get_meta(SETTING_DOCTYPE).get_label(policy.CONSOLE_FIELD)
+
+		self.assertEqual(tasks._enabled_permission_switches(), [label])
+		tasks.check_privilege_escalation(now=RUN_AT)
+
+		self.assertEqual(self._switch_alarms(), [(SWITCH_SUBJECT, f"{SWITCH_SUBJECT}: {label}")])
+		self.assertNotIn("Duyệt một lần bấm", self._switch_alarms()[0][1])
+
+	def test_all_six_switches_listed_in_section_order(self):
+		set_agent_settings(**dict.fromkeys(policy.PERMISSION_SWITCH_FIELDS, 1))
+		meta = frappe.get_meta(SETTING_DOCTYPE)
+
+		self.assertEqual(
+			tasks._enabled_permission_switches(),
+			[meta.get_label(field) for field in policy.PERMISSION_SWITCH_FIELDS],
+		)
+		self.assertEqual(len(tasks._enabled_permission_switches()), 6)
+
 	def test_switch_condition_is_the_fifth(self):
 		set_agent_settings(**{policy.ONE_CLICK_APPROVAL_FIELD: 1})
 		for name in self.OTHER_CONDITIONS:

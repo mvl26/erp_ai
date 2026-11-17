@@ -1,3 +1,4 @@
+import dataclasses
 import os
 import shutil
 import tempfile
@@ -408,12 +409,14 @@ class TestTicketContentDoctype(FrappeTestCase):
 
 
 class TestPermissionSwitches(FrappeTestCase):
-	# U1 3.1: the five permission switches, read in one place, in the spec's order (1)..(5).
+	# U1 3.1: the permission switches, read in one place, in the order of the settings section.
+	# BUG-008: console joins them (sixth in the dataclass, fifth in the section, before one_click_approval).
 	FIELD_FLAGS = (
 		("unrestricted_enabled", "unrestricted"),
 		("record_tools_enabled", "record_tools"),
 		("act_now_enabled", "act_now"),
 		("code_change_enabled", "code_change"),
+		("console_enabled", "console"),
 		("one_click_approval_enabled", "one_click_approval"),
 	)
 
@@ -428,7 +431,7 @@ class TestPermissionSwitches(FrappeTestCase):
 
 	def test_missing_fields_read_off(self):
 		off = {flag: False for _field, flag in self.FIELD_FLAGS}
-		self.assertEqual(policy.PermissionSwitches(), policy.PermissionSwitches(*off.values()))
+		self.assertEqual(policy.PermissionSwitches(), policy.PermissionSwitches(**off))
 		# A settings object without the fields (before migrate) reads every switch off and never raises.
 		for settings in (frappe._dict(), object()):
 			with self.subTest(settings=settings):
@@ -441,6 +444,14 @@ class TestPermissionSwitches(FrappeTestCase):
 		self.assertEqual(self._flags(policy.permission_switches(frappe.get_doc(SETTING_DOCTYPE))), off)
 		with self.assertRaises(AttributeError):
 			policy.permission_switches(frappe._dict()).act_now = True
+
+	def test_switch_flags_pair_fields_by_name(self):
+		# BUG-008: tasks pairs a field with its flag through this map, never by position.
+		self.assertEqual(tuple(policy.SWITCH_FLAGS), policy.PERMISSION_SWITCH_FIELDS)
+		own = {f.name for f in dataclasses.fields(policy.PermissionSwitches)}
+		self.assertEqual(set(policy.SWITCH_FLAGS.values()), own)
+		self.assertEqual(policy.SWITCH_FLAGS[policy.CONSOLE_FIELD], "console")
+		self.assertEqual(policy.SWITCH_FLAGS[policy.ONE_CLICK_APPROVAL_FIELD], "one_click_approval")
 
 	def test_each_field_maps_to_its_flag(self):
 		self.assertEqual(
@@ -466,7 +477,7 @@ class TestPermissionSwitches(FrappeTestCase):
 				).values()
 			)
 		)
-		# Read from the stored setting: (2) and (5) on, the rest off.
+		# Read from the stored setting: record_tools and one_click_approval on, the rest off.
 		set_agent_settings(
 			unrestricted_enabled=0,
 			record_tools_enabled=1,

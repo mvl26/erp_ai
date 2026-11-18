@@ -51,6 +51,7 @@ from erp_ai.agent.prompts import (
 	build_classify_request,
 	build_reason_system,
 	build_routing_table,
+	no_instructor_text,
 )
 from erp_ai.agent.queue import PENDING_JOB_IDS_FLAG, enqueue_agent_run, requester_reply_key
 from erp_ai.agent.redact import MASK
@@ -365,7 +366,8 @@ class TestRunner(RunnerTestBase):
 		call = self.gateway.calls[0]
 		self.assertEqual(call["task"], "classify")
 		self.assertEqual(call["max_tokens"], 2048)
-		expected = build_classify_request(self.ticket.subject, self.ticket.description)
+		# CHG-018: the runner's request lets the model make a new tag
+		expected = build_classify_request(self.ticket.subject, self.ticket.description, new_tags=True)
 		self.assertEqual((call["system"], call["messages"]), (expected["system"], expected["messages"]))
 
 		(entry,) = self._entries()
@@ -1062,6 +1064,10 @@ class TestRunnerReasoning(RunnerTestBase):
 		self.assertIn("create_task", [tool["name"] for tool in self.gateway.calls[0]["tools"]])
 
 	def test_initial_message_carries_comments_by_full_name_and_classification(self):
+		# every power switch off, never read from the shared site: at L1 an instructor's message opens create_task only
+		set_agent_settings(
+			record_tools_enabled=0, unrestricted_enabled=0, code_change_enabled=0, console_enabled=0
+		)
 		comments = [
 			{"name": "c1", "author": "Administrator", "creation": "2026-01-01", "content": "<p>xin chào</p>"}
 		]
@@ -1088,7 +1094,8 @@ class TestRunnerReasoning(RunnerTestBase):
 			{"category": SEEDED_CLASSIFICATION[0], "confidence_pct": SEEDED_CLASSIFICATION[1]},
 		)
 		self.assertEqual(payload["ticket"]["subject"], f"{PREFIX}runner ticket")
-		self.assertTrue(content.endswith(TASK_COMMENT))
+		# BUG-010: the message has no authority, so the task names the tool an instructor's message would open
+		self.assertTrue(content.endswith(f"{TASK_COMMENT}\n{no_instructor_text(('create_task',))}"), content)
 
 	def test_initial_message_carries_the_conversation_by_full_name(self):
 		# newest first, as the message reader returns them; the model reads them oldest first
@@ -6534,13 +6541,13 @@ class TestKbDraftRun(GuidanceTestBase):
 
 # T171 (AC-62, AC-63, AC-65; U8-3, w1.md:122): a category C ticket's BA note is its own comment, once; each Task the
 # guidance run creates is one action entry and one line of "Đã làm", never a comment.
+# spec changed (CHG-010): the four parts of the BA note, no open-questions part.
 BA_NOTE_TEXT = (
 	f"**Mục tiêu:** {PREFIX}theo dõi giờ làm của từng việc\n"
-	"**Phạm vi:** việc của phiếu đầu mục C, không đụng bảng chấm công\n"
 	"**Tính năng sẵn có:** Có, ERPNext có trường ước lượng giờ trên việc\n"
 	"**Nguồn:** erpnext/projects/doctype/task/task.json\n"
-	"**Rủi ro:** người dùng nhầm giờ ước lượng với giờ thực\n"
-	"**Câu hỏi mở:** có cần báo cáo tổng giờ theo tuần không?\n"
+	"**Phương án:** Bot chọn dùng trường expected_time của Task, vì ERPNext đã có\n"
+	"**Chia việc:** 1. Báo cáo tổng giờ theo tuần: 2h\n"
 	"Độ tin cậy: 80%"
 )
 # (subject, expected_hours, the hours as the done line writes them)

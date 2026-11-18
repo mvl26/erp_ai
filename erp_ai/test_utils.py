@@ -941,3 +941,42 @@ def make_block_proposal(operations, commands, ticket: str | None = None, **field
 	}
 	values.update(fields)
 	return frappe.get_doc(values).insert(ignore_permissions=True)
+
+
+def post_bot_guidance(ticket, *, done=("Đã sửa Item A",), pending=(), offer=False) -> str:
+	"""CHG-017: the bot's guidance message on `ticket`, written through `write_ticket.post_guidance` under the agent
+	account; `offer` ends its plan with the approve offer. Returns the message name; the session user is restored."""
+	from erp_ai.agent.prompts import APPROVE_GUIDANCE_OFFER
+	from erp_ai.agent.tools import write_ticket
+
+	run_id = f"ERPAI-TEST-T100-{frappe.generate_hash(length=10)}"
+	write_ticket.open_collector(run_id)
+	try:
+		plan = "**Hướng xử lý:** bot sửa A."
+		if offer:
+			plan += f" {APPROVE_GUIDANCE_OFFER} bước đó."
+		write_ticket.hold_analysis(run_id, f"**Nhận định:** A\n{plan}")
+		for section, lines in ((write_ticket.SECTION_DONE, done), (write_ticket.SECTION_PENDING, pending)):
+			for line in lines:
+				write_ticket.collect(run_id, section, line)
+		previous = frappe.session.user
+		frappe.set_user(AGENT_USER)
+		try:
+			return write_ticket.post_guidance(ticket, run_id)["message"]
+		finally:
+			frappe.set_user(previous)
+	finally:
+		write_ticket.close_collector(run_id)
+
+
+def set_result_confirm_ready(origin_field="ai_score_reason") -> None:
+	"""CHG-017: the settings under which a person may resolve a ticket: bot on, origin field set to a real HD Ticket
+	field (a ticket with it empty is not board-directed), no excluded team or title prefix."""
+	set_agent_settings(
+		enabled=1,
+		excluded_teams="",
+		excluded_title_prefixes="",
+		field_origin=origin_field,
+		origin_board_value="Chỉ đạo BGĐ",
+	)
+	frappe.db.value_cache.pop(SETTING_DOCTYPE, None)

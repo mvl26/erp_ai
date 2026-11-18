@@ -13,13 +13,18 @@ function setupForm({ doc, call, router }) {
 		const TEXT_STATUS_RUNNING = "Đang xử lý…";
 		const TEXT_BOT_LABEL = "Bot";
 		const TEXT_BOT_GUIDANCE =
-			'Bot có thể không trả lời khi đang tắt, đang ở chế độ chỉ ghi nhận, phiếu không dùng AI hoặc thuộc nhóm loại trừ, đã hết lượt hôm nay, hoặc đang trả lời tin trước của phiếu này (khi đó hãy gửi lại sau). Nhận định và hướng xử lý của bot là tin trong ngăn này; người có vai trò ERP AI Instructor bấm "Duyệt hướng xử lý" dưới tin đó thì bot làm theo.';
+			'Bot có thể không trả lời khi đang tắt, đang ở chế độ chỉ ghi nhận, phiếu không dùng AI hoặc thuộc nhóm loại trừ, đã hết lượt hôm nay, hoặc đang trả lời tin trước của phiếu này (khi đó hãy gửi lại sau). Nhận định và hướng xử lý của bot là tin trong ngăn này; người có vai trò ERP AI Instructor bấm "Duyệt hướng xử lý" dưới tin đó (nút chỉ có khi bot còn việc tự làm) thì bot làm theo.';
 		// ADR-050: the newest guidance of the bot gets the approve button; a click sends this fixed text (server
 		// prompts.APPROVE_GUIDANCE_TEXT) through the send box, as the person who clicked.
 		const KIND_GUIDANCE = "guidance";
 		const TEXT_APPROVE_GUIDANCE = "Duyệt hướng xử lý";
 		const APPROVE_GUIDANCE_TEXT =
 			"Duyệt hướng xử lý: bot làm ngay các bước trong hướng xử lý gần nhất, đúng phạm vi đã nêu.";
+		// CHG-017: the two buttons under a finished plan; the server (ticket_panel.decide_result) checks who may click.
+		const TEXT_RESULT_APPROVE = "Duyệt";
+		const TEXT_RESULT_REJECT = "Không duyệt";
+		const TEXT_RESULT_LINKS = "Bot đã tạo hoặc sửa (bấm để mở):";
+		const TEXT_RESULT_FAILED = "Không ghi được kết quả duyệt; hãy thử lại.";
 		const TEXT_LOAD_FAILED = "Không tải được dữ liệu của khu vực. Hãy đóng rồi mở lại.";
 		const TEXT_INPUT_PLACEHOLDER =
 			"Nhập câu hỏi cho bot. Enter để gửi, Shift+Enter để xuống dòng.";
@@ -397,7 +402,7 @@ function setupForm({ doc, call, router }) {
 		};
 
 		// One message of the thread; `approve` puts the approve button under it (the newest guidance, ADR-050).
-		const messageRow = (message, approve) => {
+		const messageRow = (message, approve, confirm) => {
 			const row = document.createElement("div");
 			row.style.marginTop = "8px";
 			row.style.padding = "6px 8px";
@@ -433,6 +438,40 @@ function setupForm({ doc, call, router }) {
 					}
 				});
 				row.append(approveEl);
+			}
+			if (confirm) {
+				// The records the bot wrote, above the buttons; the server builds each desk path (CHG-017).
+				const links = (
+					Array.isArray(message?.result_links) ? message.result_links : []
+				).filter((link) => typeof link?.url === "string" && link.url.startsWith("/app/"));
+				if (links.length > 0) {
+					const box = document.createElement("div");
+					box.style.marginTop = "6px";
+					const title = document.createElement("div");
+					title.textContent = TEXT_RESULT_LINKS;
+					box.append(title);
+					for (const link of links) {
+						const a = document.createElement("button");
+						a.type = "button";
+						a.style.display = "block";
+						a.style.color = "#2563eb";
+						a.style.textDecoration = "underline";
+						a.textContent = String(link.label ?? link.url);
+						a.addEventListener("click", () => {
+							try {
+								window.open(link.url, "_blank", "noopener");
+							} catch (e) {
+								// A panel handler must never break the ticket page (ADR-009 decision 4).
+							}
+						});
+						box.append(a);
+					}
+					row.append(box);
+				}
+				row.append(
+					resultButton(TEXT_RESULT_APPROVE, "approve"),
+					resultButton(TEXT_RESULT_REJECT, "reject")
+				);
 			}
 			return row;
 		};
@@ -614,7 +653,11 @@ function setupForm({ doc, call, router }) {
 				created: String(message?.created ?? ""),
 				rank: 0,
 				nodes: [
-					messageRow(message, index === newestGuidance),
+					messageRow(
+						message,
+						index === newestGuidance && message?.approvable,
+						index === newestGuidance && message?.result_confirmable
+					),
 					...(below.get(message?.name) || []),
 				],
 			}));
@@ -805,6 +848,45 @@ function setupForm({ doc, call, router }) {
 			} catch (e) {
 				onSendFailed();
 			}
+		};
+
+		// Duyệt / Không duyệt under a finished plan: one server call, locked while it runs (CHG-017).
+		const resultButton = (label, action) => {
+			const button = document.createElement("button");
+			button.type = "button";
+			button.style.marginTop = "6px";
+			button.style.marginRight = "6px";
+			button.textContent = label;
+			button.addEventListener("click", () => {
+				try {
+					const panel = state.panel;
+					const ticket = state.ticket;
+					if (panel.deciding || !ticket) {
+						return;
+					}
+					panel.deciding = true;
+					panel.errorEl.textContent = "";
+					const done = (failed) => {
+						try {
+							panel.deciding = false;
+							if (ticket !== state.ticket) {
+								return;
+							}
+							panel.errorEl.textContent = failed ? TEXT_RESULT_FAILED : "";
+							reload();
+						} catch (e) {
+							// A panel handler must never break the ticket page (ADR-009 decision 4).
+						}
+					};
+					state.call("erp_ai.ticket_panel.decide_result", { ticket, action }).then(
+						() => done(false),
+						() => done(true)
+					);
+				} catch (e) {
+					state.panel.deciding = false;
+				}
+			});
+			return button;
 		};
 
 		const togglePanel = () => {

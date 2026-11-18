@@ -2921,7 +2921,16 @@ class TestTagAssignees(FrappeTestCase):
 		self.assertEqual(child["istable"], 1)
 		fields = {f["fieldname"]: f for f in child["fields"] if f["fieldtype"] != "Section Break"}
 		# CHG-014: the tag is typed freely (the bot creates the Tag) and the row says what work the tag is for
-		self.assertEqual(list(fields), ["tag", "description", "assignee", "category"])
+		self.assertEqual(list(fields), ["tag", "description", "assignee", "category", "bot_added"])
+		# CHG-018 review fix I1: a row the bot added says so until a System Manager has read it
+		self.assertEqual(
+			(
+				fields["bot_added"]["fieldtype"],
+				fields["bot_added"]["label"],
+				fields["bot_added"].get("default"),
+			),
+			("Check", "Bot tạo, chưa duyệt", "0"),
+		)
 		self.assertEqual((fields["tag"]["fieldtype"], fields["tag"]["reqd"]), ("Data", 1))
 		self.assertNotIn("options", fields["tag"])
 		self.assertEqual(
@@ -2932,7 +2941,8 @@ class TestTagAssignees(FrappeTestCase):
 			),
 			("Small Text", 1, "Mô tả"),
 		)
-		self.assertEqual((fields["assignee"]["options"], fields["assignee"]["reqd"]), ("HD Agent", 1))
+		# CHG-018: a row may have no person yet (the bot adds the tags it makes that way)
+		self.assertEqual((fields["assignee"]["options"], fields["assignee"].get("reqd", 0)), ("HD Agent", 0))
 		self.assertEqual(fields["category"]["options"], "\nA\nB\nC\nD\nE\nF")
 		setting = json.loads(SETTING_JSON.read_text(encoding="utf-8"))
 		order = setting["field_order"]
@@ -2956,6 +2966,12 @@ class TestTagAssignees(FrappeTestCase):
 			[(r.tag, r.assignee, r.category or "") for r in rows],
 			[(KHO_TAG, self.person, ""), (KHO_TAG, self.other, "A")],
 		)
+
+	# CHG-018 (spec 2026-11-17-bot-new-tag-design.md, design 1): a row the bot added has no person; the setting saves
+	def test_row_without_a_person_saves(self):
+		self.assertIsNone(self._save_rows({"tag": KHO_TAG, "assignee": self.person}, {"tag": "kế toán"}))
+		rows = frappe.get_doc(SETTING_DOCTYPE).tag_assignees
+		self.assertEqual([(r.tag, r.assignee or "") for r in rows], [(KHO_TAG, self.person), ("kế toán", "")])
 
 	def test_same_tag_and_category_refused(self):
 		self.assertEqual(

@@ -8,3 +8,4 @@ erp_ai.patches.feat007_unknown_confidence_pct
 erp_ai.patches.feat007_ticket_series_past_logged_tickets
 erp_ai.patches.chg013_seed_once_for_existing_sites
 erp_ai.patches.chg014_tag_descriptions
+erp_ai.patches.chg017_ai_fields_off_ticket_form

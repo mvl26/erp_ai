@@ -572,7 +572,7 @@ HD Ticket Comment dự kiến: `reference_ticket`, `content`, `commented_by`.
 
 Giao diện Helpdesk là SPA riêng, nhưng **không cần vá fork**:
 
-- **HD Ticket Template** — thêm custom field vào HD Ticket bằng Customize Form, rồi đăng ký field đó vào template bản `Default` thì giao diện Helpdesk mới hiện. Đặt `Hide from Customer` cho các trường `ai_*`.
+- **HD Ticket Template** — thêm custom field vào HD Ticket bằng Customize Form, rồi đăng ký field đó vào template bản `Default` thì giao diện Helpdesk mới hiện. Đặt `Hide from Customer` cho các trường `ai_*`. Từ CHG-017, app chỉ đăng ký vào template trường người điền (`ai_opt_out`, "Không dùng AI cho phiếu này"); các trường bot điền không nằm trên form tạo phiếu và thanh bên phiếu, xem chúng ở ngăn ERP AI.
 - **HD Form Script** (Apply To = Form) — thêm script client và **Custom Action** (nút bấm) vào trang ticket.
 
 **Cần kiểm chứng:** HD Ticket Template bị đánh dấu *deprecated* ở một số bản helpdesk mới. Xem bản đang chạy dùng cơ chế nào.
@@ -650,7 +650,7 @@ erp_ai/
 | `enabled` | Check | **0** |
 | `muc_quyen` | Select `L0`/`L1`/`L2`/`L3` | `L0` |
 | `credentials` | Table → `ERP AI Credential` | mục 9.1 |
-| `model_classify_default` | Data | `claude-haiku-5-5` — dùng khi khóa không khai riêng |
+| `model_classify_default` | Data | `claude-opus-5-5` — dùng khi khóa không khai riêng; mọi model trừ `claude-haiku-*` chạy với effort medium ở cả hai bước (CHG-004) |
 | `model_reason_default` | Data | `claude-sonnet-5-5` |
 | `max_key_thu` | Int | 3 — số khóa thử trước khi bỏ (mục 9.1) |
 | `max_turns_per_run` | Int | 8 |

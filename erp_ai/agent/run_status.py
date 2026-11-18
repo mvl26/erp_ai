@@ -1,4 +1,4 @@
-"""Status signals of one agent run to the ticket page (design 3.2, 3.3). Only the runner imports this module.
+"""Status signals of one agent run to the ticket page (design 3.2, 3.3). Only the runner and `messages` import this module.
 
 Nothing here raises: a failed signal must never change what the run does (AC-7).
 """
@@ -7,7 +7,7 @@ import frappe
 from frappe.realtime import get_doc_room
 from frappe.utils import get_fullname
 
-from erp_ai.constants import AGENT_STATUS_EVENT, AGENT_USER, JOB_TIMEOUT_S
+from erp_ai.constants import AGENT_STATUS_EVENT, AGENT_USER, JOB_TIMEOUT_S, TITLE_STATUS_FAILED
 
 PAYLOAD_KEYS = ("ticket_id", "run_id", "agent_user", "agent_name", "state", "text", "expires_in_s")
 STATE_THINKING = "thinking"
@@ -35,6 +35,20 @@ WORK_LABELS = {
 	"run_report": "xem báo cáo",
 	CLASSIFY_STEP: "phân loại phiếu",
 }
+
+
+def announce_message(ticket_name: str) -> None:
+	"""CHG-018: tell the ticket's room that its conversation changed, with Frappe's own `doc_update` (the panel
+	script hears it and reloads the thread). Call after the commit; it never raises."""
+	try:
+		frappe.publish_realtime(
+			"doc_update",
+			{"doctype": "HD Ticket", "name": str(ticket_name)},
+			room=get_doc_room("HD Ticket", ticket_name),
+			after_commit=False,
+		)
+	except Exception:
+		frappe.log_error(TITLE_STATUS_FAILED, f"ticket={ticket_name} announce_message")
 
 
 class RunStatus:

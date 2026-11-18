@@ -558,6 +558,40 @@ class TestTagsInClassifyRequest(FrappeTestCase):
 		)
 		self.assertEqual(prompts.TAG_DESCRIPTION_MAX_CHARS, 200)
 
+	# CHG-018 (spec 2026-11-17-bot-new-tag-design.md, design 2): the runner lets the model make a new tag; the block
+	# is there even before the table has a row
+	def test_new_tags_block_with_and_without_choices(self):
+		request = prompts.build_classify_request(
+			SUBJECT, DESCRIPTION, tag_choices=(("hr", "Nhân sự"),), new_tags=True
+		)
+		self.assertEqual(
+			request["system"][0]["text"],
+			f"{prompts.CLASSIFY_PROMPT}\n\n{prompts.NEW_TAGS_BLOCK}\n{prompts.TAG_LIST_LABEL}\n- hr: Nhân sự",
+		)
+		empty = prompts.build_classify_request(SUBJECT, DESCRIPTION, new_tags=True)
+		self.assertEqual(
+			empty["system"][0]["text"],
+			f"{prompts.CLASSIFY_PROMPT}\n\n{prompts.NEW_TAGS_BLOCK}\n{prompts.TAG_LIST_LABEL}\n{prompts.NO_TAGS_YET}",
+		)
+		self.assertEqual(empty["messages"], _old_classify_request(SUBJECT, DESCRIPTION)["messages"])
+
+	def test_new_tags_block_asks_for_one_tag_and_a_description(self):
+		for phrase in (
+			'"nhan"',
+			'"mo_ta_nhan"',
+			"DANH SÁCH TAG",
+			"đúng một",
+			"tag mới",
+			"y hệt",
+			"nhóm việc chung",
+			"đầu mục F",
+			# review fix M2: the name rule the code applies
+			"2 đến 40 ký tự",
+			"& ( ) + . / # -",
+		):
+			with self.subTest(phrase=phrase):
+				self.assertIn(phrase, prompts.NEW_TAGS_BLOCK)
+
 
 TICKET = {
 	"subject": SUBJECT,
@@ -794,11 +828,13 @@ class TestCategoryC(FrappeTestCase):
 		return prompts.build_initial_message(TICKET, COMMENTS, trigger, classification, **extra)
 
 	def test_hint_only_for_c(self):
+		# spec changed (CHG-010): the four BA note parts, the cap, and Tasks created or only listed.
 		self.assertEqual(
 			prompts.TASK_CATEGORY_C,
 			"Phiếu đầu mục C: tìm tính năng sẵn có bằng search_source trước, rồi đăng BA note bằng post_comment kind "
-			"= ba_note (một lần mỗi phiếu). Nếu có tool create_task, tách việc thành các Task, mỗi Task có ước lượng "
-			"giờ.",
+			"= ba_note (một lần mỗi phiếu, tối đa 1500 ký tự) gồm Mục tiêu, Tính năng sẵn có, Phương án (bot tự chọn "
+			"mọi điểm còn mở) và Chia việc (mỗi việc có ước lượng giờ). Nếu có tool create_task, tạo luôn các Task đó; "
+			"không có thì chỉ liệt kê trong Chia việc, không viết thêm câu nhờ người tạo tay.",
 		)
 		self.assertEqual(prompts.CATEGORY_HINT_TRIGGERS, (TRIGGER_TICKET_INSERT, TRIGGER_COMMENT_MENTION))
 		for trigger in prompts.CATEGORY_HINT_TRIGGERS:
@@ -1129,7 +1165,10 @@ class TestOwnDecisionsBlock(FrappeTestCase):
 			'viết "Bot chọn …, vì …"',
 			"soạn sẵn phương án cụ thể (danh sách, giá trị, thứ tự) để họ duyệt",
 			# ADR-050: the plan is approved with one button of the panel, never by a comment
-			'Câu cuối của "Hướng xử lý": Bấm "Duyệt hướng xử lý" trong ngăn "Trao đổi với bot" thì bot làm ngay',
+			f"câu cuối là: {prompts.APPROVE_GUIDANCE_OFFER} <các bước đó>",
+			# CHG-010: no approval wording when only manual work is left
+			"Chỉ còn việc người làm tay (bot không có tool cho việc đó) thì không viết câu này và không nhắc chữ duyệt",
+			"không để chờ duyệt",
 			f'Tin "{prompts.APPROVE_GUIDANCE_TEXT}" của người ra lệnh (role "chỉ thị") là lệnh làm ngay',
 			"đúng các bước và phạm vi của Hướng xử lý gần nhất của bot",
 			"Không bảo người viết comment chỉ thị",
@@ -1140,3 +1179,119 @@ class TestOwnDecisionsBlock(FrappeTestCase):
 			self.assertIn(phrase, block)
 		# a section heading of the comment stays once, in VIẾT COMMENT
 		self.assertNotIn("**", block)
+
+
+NO_INSTRUCTOR_TOOLS = ("api_update_record", "create_task")
+
+
+class TestRolesAreCurrentAndMissingAuthority(FrappeTestCase):
+	"""BUG-010 (ticket 43406): a run whose message has no authority says why it lacks tools, and the labels of older
+	messages, read with today's roles, never make the bot call its earlier work unauthorised."""
+
+	@staticmethod
+	def _message(trigger, **extra):
+		return prompts.build_initial_message(TICKET, COMMENTS, trigger, None, **extra)
+
+	def test_conversation_roles_are_todays_and_earlier_work_was_checked(self):
+		for phrase in (
+			"theo quyền hiện tại của người viết, không theo quyền lúc họ gửi",
+			"việc bot đã làm ở lượt trước đã được kiểm quyền lúc chạy",
+			"không nói việc đó làm sai quyền",
+			"không đề nghị xóa hay hoàn tác",
+		):
+			self.assertEqual(prompts.TASK_CONVERSATION.count(phrase), 1, phrase)
+
+	def test_no_instructor_line_names_the_reason_and_the_tools(self):
+		line = getattr(prompts, "no_instructor_text", lambda tools: "")(NO_INSTRUCTOR_TOOLS)
+		self.assertNotIn("\n", line)
+		for phrase in (
+			"ERP AI Instructor",
+			"người được người khác giao phiếu này",
+			"api_update_record, create_task",
+			"nói đúng lý do này",
+			"không viết là bot không có công cụ",
+		):
+			self.assertEqual(line.count(phrase), 1, phrase)
+
+	def test_comment_run_without_authority_gets_the_line_after_its_task(self):
+		line = getattr(prompts, "no_instructor_text", lambda tools: "<missing>")(NO_INSTRUCTOR_TOOLS)
+		message = self._message(TRIGGER_COMMENT_MENTION, instructor_tools=NO_INSTRUCTOR_TOOLS)
+		self.assertEqual(message.count(line), 1)
+		self.assertTrue(message.endswith(f"\n\n{prompts.TASK_COMMENT}\n{line}"), message)
+
+	def test_no_line_without_locked_tools_or_on_other_triggers(self):
+		line = getattr(prompts, "no_instructor_text", lambda tools: "<missing>")(NO_INSTRUCTOR_TOOLS)
+		self.assertIn("instructor_tools", inspect.signature(prompts.build_initial_message).parameters)
+		baseline = self._message(TRIGGER_COMMENT_MENTION)
+		self.assertEqual(self._message(TRIGGER_COMMENT_MENTION, instructor_tools=()), baseline)
+		for trigger in (
+			TRIGGER_TICKET_INSERT,
+			TRIGGER_REQUESTER_REPLY,
+			TRIGGER_CHANGE_ACTION,
+			TRIGGER_KB_DRAFT,
+		):
+			with self.subTest(trigger=trigger):
+				message = self._message(trigger, instructor_tools=NO_INSTRUCTOR_TOOLS)
+				self.assertNotIn(line, message)
+				self.assertEqual(message, self._message(trigger))
+
+
+class TestConciseActFirst(FrappeTestCase):
+	"""CHG-010: easy work is done first and reported in a line or two, the bot always gives a decided plan, asks back
+	only for a required fact no tool can find, and keeps comments, the hint and the BA note short."""
+
+	def setUp(self):
+		keep_agent_settings(self)
+
+	def test_own_decisions_block_does_easy_work_first_and_never_asks_what_it_can_choose(self):
+		block = prompts.OWN_DECISIONS_BLOCK
+		for phrase in (
+			"Việc dễ (độ phức tạp 1, hoặc làm được bằng tool đang có): làm luôn trong lượt này rồi báo kết quả",
+			"Không hỏi lại điều bot tự chọn được",
+			"hỏi đúng một câu",
+			"Luôn đưa ra phương án cụ thể",
+			'Không viết "chưa có phương án"',
+			"tối đa khoảng 150 từ",
+			"Không có mục Rủi ro hay Câu hỏi riêng",
+		):
+			self.assertIn(phrase, block)
+		self.assertNotIn("**", block)
+
+	def test_new_ticket_task_keeps_the_hint_short(self):
+		self.assertIn("set_resolution_hint một lần", prompts.TASK_NEW_TICKET)
+		self.assertIn("tối đa 3 câu", prompts.TASK_NEW_TICKET)
+		# a BA note is no guidance: the short proposal is still posted
+		self.assertIn(
+			"post_comment kind = de_xuat ngắn (Nhận định, Hướng xử lý), kể cả khi đã đăng BA note",
+			prompts.TASK_NEW_TICKET,
+		)
+
+	def test_category_c_task_names_the_four_parts_and_the_cap(self):
+		from erp_ai.agent.tools import write_ticket
+
+		task = prompts.TASK_CATEGORY_C
+		for section in write_ticket.BA_NOTE_SECTIONS:
+			self.assertIn(section, task)
+		self.assertIn(f"tối đa {write_ticket.BA_NOTE_MAX_CHARS} ký tự", task)
+		self.assertIn("bot tự chọn mọi điểm còn mở", task)
+		self.assertNotIn("Câu hỏi mở", task)
+		self.assertIn("không viết thêm câu nhờ người tạo tay", task)
+
+	def test_ticket_of_an_instructor_is_the_order_on_the_creation_run_only(self):
+		"""CHG-010: full facts and a tool → done without approval and reported; a missing fact → one question."""
+		ticket = {"subject": "Sửa trường", "description": "Đổi X của Y thành Z"}
+		order = prompts.TASK_TICKET_IS_ORDER
+		for phrase in (
+			"làm luôn trong lượt này, không mời duyệt",
+			"liệt kê từng bản ghi",
+			"hỏi đúng một câu",
+		):
+			self.assertIn(phrase, order)
+		for trigger, is_order, expected in (
+			(prompts.TRIGGER_TICKET_INSERT, True, True),
+			(prompts.TRIGGER_TICKET_INSERT, False, False),
+			(prompts.TRIGGER_COMMENT_MENTION, True, False),
+		):
+			with self.subTest(trigger=trigger, is_order=is_order):
+				message = prompts.build_initial_message(ticket, [], trigger, None, ticket_is_order=is_order)
+				self.assertEqual(order in message, expected)

@@ -182,7 +182,10 @@ def _predict(row, routing, mapping):
 	try:
 		result = gateway.call_model(
 			"classify",
-			**build_classify_request(row.get("subject"), row.get("description"), departments(routing)),
+			# CHG-018: the runner's request lets the model make a new tag; the eval sends the same
+			**build_classify_request(
+				row.get("subject"), row.get("description"), departments(routing), new_tags=True
+			),
 			max_tokens=CLASSIFY_MAX_TOKENS,
 		)
 	except gateway.GatewayError as exc:

@@ -314,10 +314,12 @@ STATUS_SCRIPT_REQUIRED = (
 	r"phiếu không dùng AI hoặc thuộc nhóm loại trừ, đã hết lượt hôm nay, "
 	r"hoặc đang trả lời tin trước của phiếu này \(khi đó hãy gửi lại sau\)\. "
 	r"Nhận định và hướng xử lý của bot là tin trong ngăn này; người có vai trò ERP AI Instructor bấm "
-	r"\"Duyệt hướng xử lý\" dưới tin đó thì bot làm theo\.",
+	r"\"Duyệt hướng xử lý\" dưới tin đó \(nút chỉ có khi bot còn việc tự làm\) thì bot làm theo\.",
 	# ADR-050: the approve button under the newest guidance of the bot sends the fixed approval text through submit.
 	r'TEXT_APPROVE_GUIDANCE = "Duyệt hướng xử lý";',
 	r"message\?\.is_bot && message\?\.kind === KIND_GUIDANCE",
+	# CHG-010: the button shows only under a guidance the server marks approvable.
+	r"index === newestGuidance && message\?\.approvable",
 	r"panel\.inputEl\.value = APPROVE_GUIDANCE_TEXT;\s*submit\(\);",
 	r'TEXT_LOAD_FAILED = "Không tải được dữ liệu của khu vực\. Hãy đóng rồi mở lại\."',
 	r"\(docked \? state\.panel\.slotEl : document\.body\)\.appendChild\(el\)",
@@ -1374,7 +1376,8 @@ def check_run_status_imported_only_by_runner(sources: dict) -> list:
 	"""ADR-008 decision 2: tools, handlers, tasks, gateway and eval never import the status module."""
 	violations = []
 	for rel, source in only_python(sources).items():
-		if rel in (RUNNER_FILE, RUN_STATUS_FILE):
+		# CHG-018: `messages` announces a new message through `announce_message`.
+		if rel in (RUNNER_FILE, RUN_STATUS_FILE, "agent/messages.py"):
 			continue
 		tree = parse(rel, source)
 		for lineno, target in imported_modules(tree, module_name(rel), rel.endswith("__init__.py")):
@@ -5767,12 +5770,13 @@ class TestArchitecture(unittest.TestCase):
 		self.assertTrue({(PANEL_FILE, "get_panel_data"), (PANEL_FILE, "send_message")} <= found, found)
 		self.assertEqual(check_whitelisted_methods_declare_http_methods(self.sources), [])
 
-	def test_ticket_panel_has_exactly_three_whitelisted_methods(self):
-		# ADR-044 QĐ 1 (CHG-008): the panel gains one decision method; still POST only, still no guest
+	def test_ticket_panel_has_exactly_four_whitelisted_methods(self):
+		# ADR-044 QĐ 1 (CHG-008), CHG-017: the panel gains a decision method and a result method; POST only, no guest
 		self.assertEqual(
 			sorted(PANEL_METHODS),
 			[
 				"erp_ai.ticket_panel.decide_proposal",
+				"erp_ai.ticket_panel.decide_result",
 				"erp_ai.ticket_panel.get_panel_data",
 				"erp_ai.ticket_panel.send_message",
 			],
@@ -8240,6 +8244,8 @@ class TestScannersCatchViolations(unittest.TestCase):
 			"def send_message(ticket, text):\n\treturn messages.add_message(ticket, text)\n"
 			"@frappe.whitelist(methods=['POST'])\n"
 			"def decide_proposal(name, action):\n\treturn PANEL_DECISIONS[action](name)\n"
+			"@frappe.whitelist(methods=['POST'])\n"
+			"def decide_result(ticket, action):\n\treturn 1\n"
 		)
 	}
 
@@ -8249,6 +8255,7 @@ class TestScannersCatchViolations(unittest.TestCase):
 		good = (
 			'state.call("erp_ai.ticket_panel.get_panel_data", {});\n'
 			'state.call("erp_ai.ticket_panel.decide_proposal", {});\n'
+			'state.call("erp_ai.ticket_panel.decide_result", {});\n'
 			'state.call("erp_ai.ticket_panel.send_message", {});'
 		)
 		self.assertEqual(check_call_allow_list(good, allowed, self.PANEL_SOURCES), [])

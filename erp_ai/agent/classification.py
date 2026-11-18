@@ -4,6 +4,7 @@ import unicodedata
 from dataclasses import dataclass, field
 
 import frappe
+from frappe.utils import strip_html
 
 from erp_ai.constants import CATEGORIES, CLASSIFICATION_FIELDS, CONFIDENCE_VALUES
 
@@ -24,6 +25,9 @@ SPLIT_REQUEST_MAX_CHARS = 200
 LABELS_MAX = 1
 LABEL_MIN_CHARS, LABEL_MAX_CHARS = 2, 40
 _LABEL = re.compile(r"^[\w &()+./#-]+$")
+# CHG-018: the description of a new tag (`mo_ta_nhan`) goes to the tag table and to later classify requests, which
+# read this many characters of a description (prompts.TAG_DESCRIPTION_MAX_CHARS).
+LABEL_DESCRIPTION_MAX_CHARS = 200
 
 # D-8: ticket_type = category name; agent_group and priority per guide 16.1-16.2.
 DEFAULT_CATEGORY_MAPPING = {
@@ -64,6 +68,9 @@ class Classification:
 	# None = unknown (direct builders such as set_classification); never 0 for unknown (design-w0-fixes-2.md section 1).
 	confidence_pct: int | None = None
 	labels: tuple[str, ...] = ()
+	# CHG-018: the model's description of its label, for a tag outside the table; the runner keeps it only when the
+	# label becomes a new tag of the table
+	label_description: str = ""
 
 
 def _load_json_object(text):
@@ -117,6 +124,14 @@ def _read_labels(data) -> tuple[str, ...]:
 	return tuple(labels.values())[:LABELS_MAX]
 
 
+def _read_label_description(data) -> str:
+	"""`mo_ta_nhan` without HTML, on one line, cut to LABEL_DESCRIPTION_MAX_CHARS; "" when it is not text (CHG-018)."""
+	raw = data.get("mo_ta_nhan")
+	if not isinstance(raw, str):
+		return ""
+	return " ".join(strip_html(raw).split())[:LABEL_DESCRIPTION_MAX_CHARS]
+
+
 def parse_classification(text: str) -> Classification | None:
 	"""Read the model's classification reply. Never raises; None when it cannot be trusted."""
 	data = _load_json_object(text)
@@ -151,6 +166,7 @@ def parse_classification(text: str) -> Classification | None:
 		department=department if isinstance(department, str) else None,
 		confidence_pct=confidence_pct,
 		labels=_read_labels(data),
+		label_description=_read_label_description(data),
 	)
 
 

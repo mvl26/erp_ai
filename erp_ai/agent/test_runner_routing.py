@@ -50,6 +50,8 @@ from erp_ai.constants import (
 	LOGGER_NAME,
 	MESSAGE_DOCTYPE,
 	ROLE_AGENT,
+	SETTING_DOCTYPE,
+	TAG_ASSIGNEE_DOCTYPE,
 )
 from erp_ai.test_utils import (
 	add_credential,
@@ -291,8 +293,12 @@ class TestRoutingEndToEnd(RoutingTestBase):
 
 		call = self.gateway.calls[0]
 		self.assertEqual(call["max_tokens"], runner.CLASSIFY_MAX_TOKENS)
+		# CHG-018: the runner's request lets the model make a new tag
 		expected = build_classify_request(
-			self.ticket.subject, self.ticket.description, departments(load_routing_config(rules))
+			self.ticket.subject,
+			self.ticket.description,
+			departments(load_routing_config(rules)),
+			new_tags=True,
 		)
 		self.assertEqual(call["system"], expected["system"])
 		self.assertIn("Kế toán", call["system"][0]["text"])
@@ -1934,7 +1940,11 @@ class TestRoutingLabels(RoutingTestBase):
 		self.assertEqual(self._label_actions(), [])
 		# CHG-016: the dropped answer leaves its reason in the log
 		self.assertIn(
-			{"field": "nhan", "reason": "tag Stock không có trong bảng Gán người theo tag"},
+			# CHG-018: an answer outside the table without a description makes no new tag
+			{
+				"field": "nhan",
+				"reason": "tag Stock không có trong bảng Gán người theo tag và thiếu mô tả để tạo tag mới",
+			},
 			json.loads(self._single_entry().skipped_fields),
 		)
 
@@ -2018,11 +2028,13 @@ class TestRoutingLabels(RoutingTestBase):
 			self.ticket.description,
 			departments(load_routing_config(make_routing_rules())),
 			tag_choices=((LABEL_KHO, "Phiếu về kho"), (LABEL_IN, "Phiếu về in ấn")),
+			new_tags=True,
 		)
 		call = self.gateway.calls[0]
 		self.assertEqual((call["system"], call["messages"]), (expected["system"], expected["messages"]))
 
-	def test_empty_table_gives_no_tag_block(self):
+	# CHG-018: an empty table still lets the model make the first tag
+	def test_empty_table_gives_the_new_tag_block(self):
 		set_tag_assignees()
 		self._run_labelled(CLASSIFY_SCORED)
 
@@ -2030,9 +2042,165 @@ class TestRoutingLabels(RoutingTestBase):
 			self.ticket.subject,
 			self.ticket.description,
 			departments(load_routing_config(make_routing_rules())),
+			new_tags=True,
 		)
 		self.assertEqual(self.gateway.calls[0]["system"], expected["system"])
-		self.assertNotIn(prompts.TAGS_BLOCK, self.gateway.calls[0]["system"][0]["text"])
+		text = self.gateway.calls[0]["system"][0]["text"]
+		self.assertIn(prompts.NEW_TAGS_BLOCK, text)
+		self.assertTrue(text.endswith(f"{prompts.TAG_LIST_LABEL}\n{prompts.NO_TAGS_YET}"), text)
+
+
+NEW_TAG = f"{PREFIX}kế toán"
+NEW_TAG_DESCRIPTION = "Hóa đơn, công nợ, đối chiếu"
+
+
+def _classify_new(tag=NEW_TAG, description=NEW_TAG_DESCRIPTION, category="A"):
+	return json.dumps(
+		{
+			"dau_muc": category,
+			"do_tin_cay": "Cao",
+			"do_tin_cay_pct": 90,
+			"ly_do": "x",
+			"nhan": [tag],
+			"mo_ta_nhan": description,
+		}
+	)
+
+
+class TestRoutingNewTag(RoutingTestBase):
+	"""CHG-018 (spec 2026-11-17-bot-new-tag-design.md): an answer outside the table with a description is a new tag;
+	the route gives it to the ticket and puts it at the end of the tag table without a person."""
+
+	_labels_of = TestRoutingLabels._labels_of
+	_run_labelled = TestRoutingLabels._run_labelled
+
+	def setUp(self):
+		super().setUp()
+		self.person = make_active_agent(self)
+		set_tag_assignees(
+			(LABEL_KHO, self.person, "", "Phiếu về kho"), (LABEL_IN, self.person, "", "Phiếu về in ấn")
+		)
+
+	def _rows(self):
+		return frappe.get_all(
+			TAG_ASSIGNEE_DOCTYPE,
+			filters={
+				"parent": SETTING_DOCTYPE,
+				"parenttype": SETTING_DOCTYPE,
+				"parentfield": "tag_assignees",
+			},
+			fields=["idx", "tag", "assignee", "category", "description"],
+			order_by="idx",
+		)
+
+	def _row_actions(self, ticket=None):
+		(entry,) = self._entries(entry_type="classify", ticket=ticket or self.ticket.name)
+		return [a for a in json.loads(entry.actions) if a["tool"] == runner.TAG_ROW_TOOL]
+
+	def test_new_tag_given_and_added_to_the_table_without_a_person(self):
+		captured = self._run_labelled(_classify_new())
+
+		self.log_error.assert_not_called()
+		self.assertEqual(self._labels_of(self.ticket.name), [NEW_TAG])
+		rows = self._rows()
+		self.assertEqual([row.tag for row in rows], [LABEL_KHO, LABEL_IN, NEW_TAG])
+		last = rows[-1]
+		self.assertEqual(
+			(last.idx, last.description, last.assignee or "", last.category or ""),
+			(3, NEW_TAG_DESCRIPTION, "", ""),
+		)
+		(action,) = self._row_actions()
+		self.assertEqual(
+			action,
+			action_entry(
+				runner.TAG_ROW_TOOL,
+				SETTING_DOCTYPE,
+				SETTING_DOCTYPE,
+				True,
+				value_after={"tag": NEW_TAG, "description": NEW_TAG_DESCRIPTION},
+			),
+		)
+		(lines,) = captured
+		self.assertIn(runner.ROUTE_LABELS.format(labels=NEW_TAG), lines)
+		self.assertIn(runner.ROUTE_TAG_ROW_ADDED.format(tag=NEW_TAG), lines)
+		self.assertEqual(self._single_entry().applied, 1)
+
+	def test_the_next_ticket_picks_the_new_tag_from_the_table(self):
+		self._run_labelled(_classify_new())
+		self.ticket = make_ticket(subject=f"{PREFIX}runner ticket 2")
+
+		self._run_labelled(_classify_new(tag=NEW_TAG.upper(), description="khác"))
+
+		self.assertEqual(self._labels_of(self.ticket.name), [NEW_TAG])
+		self.assertEqual([row.tag for row in self._rows()], [LABEL_KHO, LABEL_IN, NEW_TAG])
+		self.assertEqual(self._row_actions(), [])
+		# review fix I1: listed by name only until a System Manager has read the row
+		text = self.gateway.calls[-2]["system"][0]["text"]
+		self.assertIn(f"\n- {NEW_TAG}", text)
+		self.assertNotIn(NEW_TAG_DESCRIPTION, text)
+
+	def test_no_new_tag_without_a_description_or_on_a_noise_ticket(self):
+		cases = {
+			"no description": (
+				_classify_new(description=""),
+				f"tag {NEW_TAG} không có trong bảng Gán người theo tag và thiếu mô tả để tạo tag mới",
+			),
+			"category F": (_classify_new(category="F"), "phiếu đầu mục F không nhận tag mới"),
+			# review fix M1: the reason reads the model's own description
+			"Helpdesk's own tag": (
+				_classify_new(tag="First Ticket"),
+				"tag First Ticket không có trong bảng Gán người theo tag",
+			),
+			# review fix M2: a new tag whose name breaks the rule is dropped when parsed; the log says so
+			"bad name": (_classify_new(tag="ERP: phân quyền"), "tag mới sai luật đặt tên nên không được gắn"),
+		}
+		for name, (text, reason) in cases.items():
+			with self.subTest(name):
+				self.ticket = make_ticket(subject=f"{PREFIX}{name}")
+				self._run_labelled(text)
+				self.assertEqual(self._labels_of(self.ticket.name), [])
+				self.assertEqual(len(self._rows()), 2)
+				self.assertIn(
+					{"field": "nhan", "reason": reason}, json.loads(self._single_entry().skipped_fields)
+				)
+
+	def test_an_agent_tag_stops_the_new_tag(self):
+		agent = make_active_agent(self)
+		frappe.set_user(agent)
+		try:
+			frappe.get_doc("HD Ticket", self.ticket.name).add_tag(LABEL_IN)
+		finally:
+			frappe.set_user("Administrator")
+
+		self._run_labelled(_classify_new())
+
+		self.assertEqual(self._labels_of(self.ticket.name), [LABEL_IN])
+		self.assertEqual(len(self._rows()), 2)
+		self.assertEqual(self._row_actions(), [])
+
+	def test_a_failed_row_write_keeps_the_tag_and_the_route(self):
+		with patch.object(labels, "add_tag_row", side_effect=frappe.ValidationError("x")):
+			self._run_labelled(_classify_new())
+
+		entry = self._single_entry()
+		self.assertEqual(entry.applied, 1)
+		self.assertEqual(self._labels_of(self.ticket.name), [NEW_TAG])
+		self.assertEqual(len(self._rows()), 2)
+		(action,) = self._row_actions()
+		self.assertEqual((action["ok"], action["reason"]), (False, "ValidationError"))
+		self.assertIn(f"route {runner.TAG_ROW_TOOL}: ValidationError", entry.error)
+
+	def test_the_new_tag_gives_no_person_the_default_does(self):
+		default = make_active_agent(self)
+		set_agent_settings(
+			auto_assign_enabled=1, routing_rules=make_routing_rules(), default_assignee=default
+		)
+
+		self._run_labelled(_classify_new())
+
+		self.assertEqual(self._labels_of(self.ticket.name), [NEW_TAG])
+		# the route's own pick (the test team's Assignment Rule gives the ticket to the bot account first)
+		self.assertEqual(self._single_entry().predicted_assignee, default)
 
 
 CLASSIFY_B_NO_SCORE = json.dumps({"dau_muc": "B", "do_tin_cay": "Cao", "do_tin_cay_pct": 90, "ly_do": "x"})

@@ -59,7 +59,7 @@
    "read_only": 1
   },
   {
-   "description": "Hệ thống tự ghi lúc tin được gửi: chỉ thị nếu người gửi khi đó có vai trò ERP AI Instructor hoặc được người khác giao phiếu, không thì dữ liệu. Bot coi tin là lệnh chỉ khi giá trị này là chỉ thị và người gửi vẫn còn quyền lúc bot đọc: mất quyền (gỡ vai trò, khóa tài khoản) thì lệnh cũ không còn làm theo. Không sửa được.",
+   "description": "Hệ thống tự ghi lúc tin được gửi: chỉ thị nếu người gửi khi đó có vai trò ERP AI Instructor hoặc được người khác giao phiếu, không thì dữ liệu. Bot coi tin là lệnh chỉ khi giá trị này là chỉ thị và người gửi vẫn còn quyền lúc bot đọc: mất quyền (gỡ vai trò, khóa tài khoản) thì lệnh cũ không còn làm theo; không sửa được.",
    "fieldname": "author_role",
    "fieldtype": "Select",
    "label": "Vai trò người gửi lúc gửi",

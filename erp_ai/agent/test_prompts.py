@@ -1194,7 +1194,9 @@ class TestRolesAreCurrentAndMissingAuthority(FrappeTestCase):
 
 	def test_conversation_roles_are_todays_and_earlier_work_was_checked(self):
 		for phrase in (
-			"theo quyền hiện tại của người viết, không theo quyền lúc họ gửi",
+			# BUG-009, the user's rule 2026-11-18: an order needs the right when sent and now
+			'Role "chỉ thị" khi người viết có quyền ra lệnh cả lúc gửi lẫn bây giờ',
+			"người đã mất quyền thì lệnh cũ của họ không còn làm theo",
 			"việc bot đã làm ở lượt trước đã được kiểm quyền lúc chạy",
 			"không nói việc đó làm sai quyền",
 			"không đề nghị xóa hay hoàn tác",

@@ -83,6 +83,9 @@ def fetch_ticket_comments(ticket_name: str, limit: int = MAX_COMMENTS) -> list[d
 def is_instruction(author: str, ticket_name: str) -> bool:
 	if not author or author in NEVER_AUTHORITY:
 		return False
+	# BUG-009: a disabled account keeps its Has Role rows; its right to order ends with the account
+	if not frappe.db.get_value("User", author, "enabled"):
+		return False
 	if ROLE_INSTRUCTOR in frappe.get_roles(author):
 		return True
 	return _assigned_by_other(author, ticket_name)
@@ -151,29 +154,18 @@ def role_label(author: str, ticket_name: str) -> str:
 def label_comments(ticket_name: str, comments: list[dict]) -> list[dict]:
 	"""Each comment with its `role`; any `role` it came with is replaced (never trusted).
 
-	BUG-009: a message read from the server with the role its author had when it was sent (`role_at_send`, written
-	at insert by the ERP AI Message controller; only server-built rows carry it) keeps that role, so a role removed
-	later does not relabel what was already said, except that an author whose account is disabled now gives no order
-	any more. Without one (older messages, plain ticket comments) the role is the author's now, decided once per
-	author. `role_at_send` is not passed on."""
+	BUG-009, the user's rule (2026-11-18, "mất quyền là ko còn thực hiện được nữa"): a comment is an order ("chỉ
+	thị") only while its author has the right now, decided once per author; an author who lost the right, or whose
+	account is disabled, orders nothing any more. A message read from the server with the role its author had when
+	it was sent (`role_at_send`, written at insert by the ERP AI Message controller; only server-built rows carry
+	it) stays data when it was sent without the right, even if the right came later. Older messages and plain ticket
+	comments carry none. `role_at_send` is not passed on."""
 	verdicts: dict[str, str] = {}
-	enabled: dict[str, bool] = {}
 	labelled = []
 	for comment in comments:
-		stored = comment.get("role_at_send")
-		if stored in (ROLE_LABEL_INSTRUCTION, ROLE_LABEL_DATA):
-			role = stored
-			author = comment["author"]
-			if role == ROLE_LABEL_INSTRUCTION:
-				if author not in enabled:
-					enabled[author] = author not in NEVER_AUTHORITY and bool(
-						frappe.db.get_value("User", author, "enabled")
-					)
-				role = role if enabled[author] else ROLE_LABEL_DATA
-		else:
-			author = comment["author"]
-			if author not in verdicts:
-				verdicts[author] = role_label(author, ticket_name)
-			role = verdicts[author]
+		author = comment["author"]
+		if author not in verdicts:
+			verdicts[author] = role_label(author, ticket_name)
+		role = ROLE_LABEL_DATA if comment.get("role_at_send") == ROLE_LABEL_DATA else verdicts[author]
 		labelled.append({**{k: v for k, v in comment.items() if k != "role_at_send"}, "role": role})
 	return labelled

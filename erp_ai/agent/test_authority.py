@@ -237,9 +237,10 @@ class TestAuthority(AuthorityTestBase):
 
 
 class TestRoleAtSend(AuthorityTestBase):
-	"""BUG-009: a message keeps the role its author had when it was sent; a role removed later does not relabel what
-	was already said (ticket 43406: an approval sent as ERP AI Instructor was later shown to the model as "dữ liệu",
-	and the bot wrongly called its own earlier work unauthorised)."""
+	"""BUG-009: a message stores the role its author had when it was sent. The user's rule (2026-11-18): "mất quyền là
+	ko còn thực hiện được nữa" — a message is an order only while its author has the right both when it was sent and
+	now; an author who lost the right (or whose account is disabled) orders nothing any more, and a message sent
+	without the right stays data when the right comes later."""
 
 	def _say(self, ticket, author, text, source_comment=None):
 		previous = frappe.session.user
@@ -257,7 +258,8 @@ class TestRoleAtSend(AuthorityTestBase):
 		note = self._say(self.ticket_p, PLAIN, "ghi chú")
 		self.assertEqual((self._stored(order), self._stored(note)), ("chỉ thị", "dữ liệu"))
 
-	def test_a_role_removed_later_keeps_the_old_label(self):
+	# the user's rule 2026-11-18: an order whose author lost the right is carried out no more
+	def test_a_role_removed_later_ends_the_old_orders(self):
 		self._say(self.ticket_p, INSTRUCTOR, "Duyệt")
 		frappe.get_doc("User", INSTRUCTOR).remove_roles(ROLE_INSTRUCTOR)
 		self._say(self.ticket_p, INSTRUCTOR, "đóng phiếu")
@@ -265,9 +267,14 @@ class TestRoleAtSend(AuthorityTestBase):
 		labelled = authority.label_comments(self.ticket_p, messages.history(self.ticket_p)[::-1])
 
 		self.assertEqual(
-			[(m["content"], m["role"]) for m in labelled], [("Duyệt", "chỉ thị"), ("đóng phiếu", "dữ liệu")]
+			[(m["content"], m["role"]) for m in labelled], [("Duyệt", "dữ liệu"), ("đóng phiếu", "dữ liệu")]
 		)
 		self.assertTrue(all("role_at_send" not in m for m in labelled))
+
+	def test_an_order_stays_an_order_while_the_right_holds(self):
+		self._say(self.ticket_p, INSTRUCTOR, "Duyệt")
+		(labelled,) = authority.label_comments(self.ticket_p, messages.history(self.ticket_p))
+		self.assertEqual(labelled["role"], "chỉ thị")
 
 	def test_a_message_without_a_stored_role_is_judged_now(self):
 		name = self._say(self.ticket_p, INSTRUCTOR, "cũ")
@@ -278,14 +285,24 @@ class TestRoleAtSend(AuthorityTestBase):
 
 		self.assertEqual(labelled["role"], "dữ liệu")
 
-	def test_an_ai_comment_keeps_the_role_of_its_copy(self):
+	def test_an_ai_comment_keeps_the_send_time_data_of_its_copy(self):
+		# the copy stored "dữ liệu": the comment stays data when its author gains the right later
+		comment = self._comment(self.ticket_p, PLAIN, "2026-11-17 10:00:00")
+		self._say(self.ticket_p, PLAIN, "x", source_comment=comment)
+		frappe.get_doc("User", PLAIN).add_roles(ROLE_INSTRUCTOR)
+
+		labelled = authority.label_comments(self.ticket_p, authority.fetch_ticket_comments(self.ticket_p))
+
+		self.assertEqual([(c["name"], c["role"]) for c in labelled], [(comment, "dữ liệu")])
+
+	def test_an_ai_comment_of_an_author_who_lost_the_right_is_data(self):
 		comment = self._comment(self.ticket_p, INSTRUCTOR, "2026-11-17 10:00:00")
 		self._say(self.ticket_p, INSTRUCTOR, "x", source_comment=comment)
 		frappe.get_doc("User", INSTRUCTOR).remove_roles(ROLE_INSTRUCTOR)
 
 		labelled = authority.label_comments(self.ticket_p, authority.fetch_ticket_comments(self.ticket_p))
 
-		self.assertEqual([(c["name"], c["role"]) for c in labelled], [(comment, "chỉ thị")])
+		self.assertEqual([(c["name"], c["role"]) for c in labelled], [(comment, "dữ liệu")])
 
 	# BUG-009 review
 	def test_a_merge_copy_lends_no_role_to_the_comment(self):
@@ -316,6 +333,17 @@ class TestRoleAtSend(AuthorityTestBase):
 		(labelled,) = authority.label_comments(self.ticket_p, messages.history(self.ticket_p))
 
 		self.assertEqual(labelled["role"], "dữ liệu")
+
+	# a disabled account keeps its Has Role rows: the right ends with the account, on every path that reads it
+	def test_a_disabled_account_has_no_right_anywhere(self):
+		frappe.db.set_value("User", INSTRUCTOR, "enabled", 0, update_modified=False)
+		self.assertIn(ROLE_INSTRUCTOR, frappe.get_roles(INSTRUCTOR))
+		self.assertFalse(authority.is_instruction(INSTRUCTOR, self.ticket_p))
+		comments = [{"author": INSTRUCTOR, "content": "đóng phiếu"}]
+		self.assertEqual(authority.label_comments(self.ticket_p, comments)[0]["role"], "dữ liệu")
+		# a run with no comment trigger falls back to the ticket owner
+		frappe.db.set_value("HD Ticket", self.ticket_p, "owner", INSTRUCTOR, update_modified=False)
+		self.assertIsNone(authority.run_instructor(self.ticket_p, TRIGGER_TICKET_INSERT))
 
 	def test_a_forged_role_at_insert_is_overwritten(self):
 		previous = frappe.session.user

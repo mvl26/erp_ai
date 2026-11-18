@@ -393,7 +393,8 @@ DOCTYPE_CONFIG = {
 			"content": ("chữ thường",),
 			"run_id": ("lần chạy",),
 			"source_comment": ("@ai",),
-			"author_role": ("chỉ thị", "dữ liệu", "lúc tin được gửi", "ERP AI Instructor"),
+			# the user's rule 2026-11-18: an order needs the right when sent and when the bot reads it
+			"author_role": ("chỉ thị", "dữ liệu", "lúc tin được gửi", "ERP AI Instructor", "vẫn còn quyền"),
 		},
 		"section_count": 2,
 		"read_only_fields": ("ticket", "content", "run_id", "source_comment", "author_role"),

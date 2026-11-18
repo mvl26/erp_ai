@@ -365,8 +365,8 @@
    "fieldname": "model_classify_default",
    "fieldtype": "Data",
    "label": "Model phân loại mặc định",
-   "default": "claude-haiku-5-5",
-   "description": "Tên model dùng để phân loại phiếu khi dòng khóa API không ghi model phân loại riêng. Nhập đúng tên model của nhà cung cấp. Chỉ model claude-haiku-* được tắt thinking ở bước phân loại; model khác có thể bị cắt ở trần token."
+   "default": "claude-opus-5-5",
+   "description": "Tên model dùng để phân loại phiếu khi dòng khóa API không ghi model phân loại riêng. Nhập đúng tên model của nhà cung cấp. Model claude-haiku-* được tắt thinking ở bước phân loại; model khác chạy với effort medium (thinking ngắn vừa) và có thể bị cắt ở trần token nếu phiếu quá dài."
   },
   {
    "fieldname": "trigger_keyword",
@@ -771,7 +771,7 @@
  ],
  "issingle": 1,
  "links": [],
- "modified": "2026-11-17 21:00:00.000000",
+ "modified": "2026-11-18 11:00:00.000000",
  "modified_by": "Administrator",
  "module": "ERP AI agent",
  "name": "ERP AI Setting",

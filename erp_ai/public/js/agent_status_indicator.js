@@ -11,6 +11,7 @@ function setupForm({ doc, call, router }) {
 		// The one status sentence of the script, shown while an indicator is live (design 4.1);
 		// every other sentence comes from the server.
 		const TEXT_STATUS_RUNNING = "Đang xử lý…";
+		const TEXT_LOADING = "Đang tải…";
 		const TEXT_BOT_LABEL = "Bot";
 		const TEXT_BOT_GUIDANCE =
 			'Bot có thể không trả lời khi đang tắt, đang ở chế độ chỉ ghi nhận, phiếu không dùng AI hoặc thuộc nhóm loại trừ, đã hết lượt hôm nay, hoặc đang trả lời tin trước của phiếu này (khi đó hãy gửi lại sau). Nhận định và hướng xử lý của bot là tin trong ngăn này; người có vai trò ERP AI Instructor bấm "Duyệt hướng xử lý" dưới tin đó (nút chỉ có khi bot còn việc tự làm) thì bot làm theo.';
@@ -56,6 +57,10 @@ function setupForm({ doc, call, router }) {
 		const PROPOSAL_FORM_PREFIX = "/app/erp-ai-change-proposal/";
 		const MAX_MESSAGE_CHARS = 2000;
 		const NARROW_SCREEN_PX = 640;
+		// The click that follows a press on the header action, after that press closed the panel from outside.
+		const OUTSIDE_CLOSE_GRACE_MS = 500;
+		// How close to the end a reader counts as "at the newest message".
+		const BOTTOM_SLACK_PX = 40;
 		const INDICATOR_FLOATING_STYLE = {
 			position: "fixed",
 			right: "24px",
@@ -68,6 +73,64 @@ function setupForm({ doc, call, router }) {
 			bottom: "",
 			zIndex: "",
 		};
+		// The panel's look, one style element inside the panel; every rule under `.erp-ai-panel`, so nothing of
+		// Helpdesk's page changes. Button colours: blue starts work, green confirms a result, red outline refuses.
+		const PANEL_CSS = [
+			".erp-ai-panel{position:fixed;right:24px;top:72px;width:420px;max-height:calc(100vh - 96px);z-index:40;overflow-y:auto;padding:0 16px;background:#fff;border:1px solid #e5e7eb;border-radius:12px;box-shadow:0 12px 32px rgba(15,23,42,.14),0 2px 6px rgba(15,23,42,.06);font-size:13px;line-height:1.5;color:#1f2937}",
+			".erp-ai-panel[hidden]{display:none}",
+			".erp-ai-panel,.erp-ai-panel *{box-sizing:border-box}",
+			// Header and send box stick to the panel's edges while the rest scrolls.
+			".erp-ai-panel .erp-ai-head{position:sticky;top:0;z-index:1;display:flex;align-items:center;justify-content:space-between;gap:8px;margin:0 -16px;padding:10px 12px 10px 16px;border-bottom:1px solid #f0f0f0;background:#fff}",
+			".erp-ai-panel .erp-ai-head-title{font-size:14px;color:#111827}",
+			".erp-ai-panel .erp-ai-section{display:block;margin:14px 0 6px;font-size:11px;letter-spacing:.05em;text-transform:uppercase;color:#6b7280}",
+			".erp-ai-panel .erp-ai-fields{padding:2px 10px 8px;border:1px solid #f0f0f0;border-radius:8px;background:#f9fafb}",
+			".erp-ai-panel .erp-ai-field{margin-top:6px}",
+			".erp-ai-panel .erp-ai-field-label{display:block;font-size:12px;color:#4b5563}",
+			".erp-ai-panel .erp-ai-pre{white-space:pre-wrap;overflow-wrap:anywhere}",
+			".erp-ai-panel .erp-ai-status{display:flex;align-items:center;gap:8px;flex-wrap:wrap;font-weight:bold}",
+			".erp-ai-panel .erp-ai-hint{margin-top:6px;padding:8px 10px;border-left:3px solid #cbd5e1;border-radius:6px;background:#f8fafc;font-size:12px;color:#64748b}",
+			".erp-ai-panel .erp-ai-thread{display:flex;flex-direction:column}",
+			".erp-ai-panel .erp-ai-msg{max-width:92%;margin-top:10px;padding:8px 10px;border-radius:10px}",
+			".erp-ai-panel .erp-ai-msg--bot{align-self:flex-start;background:#eef2ff;border:1px solid #e0e7ff;border-top-left-radius:4px}",
+			".erp-ai-panel .erp-ai-msg--user{align-self:flex-end;background:#f3f4f6;border:1px solid #e5e7eb;border-top-right-radius:4px}",
+			".erp-ai-panel .erp-ai-msg-head{display:flex;align-items:baseline;flex-wrap:wrap;gap:6px;margin-bottom:2px;font-size:12px;color:#374151}",
+			".erp-ai-panel .erp-ai-msg-time{font-size:11px;color:#9ca3af}",
+			".erp-ai-panel .erp-ai-actions{display:flex;flex-wrap:wrap;align-items:center;gap:6px;margin-top:8px}",
+			".erp-ai-panel .erp-ai-links{margin-top:8px;padding:6px 8px;border-radius:8px;background:rgba(255,255,255,.75)}",
+			".erp-ai-panel .erp-ai-links-title{font-size:12px;color:#4b5563}",
+			".erp-ai-panel .erp-ai-sys{align-self:center;margin-top:10px;text-align:center;font-size:11.5px;color:#6b7280}",
+			".erp-ai-panel .erp-ai-sys--failed{color:#b91c1c}",
+			".erp-ai-panel .erp-ai-card{margin-top:10px;padding:8px 10px;border:1px solid #e5e7eb;border-radius:10px;background:#fff;box-shadow:0 1px 2px rgba(0,0,0,.04)}",
+			".erp-ai-panel .erp-ai-card-head{display:block;margin-bottom:2px;color:#111827}",
+			".erp-ai-panel .erp-ai-card pre{margin:4px 0 0;padding:6px 8px;border:1px solid #f0f0f0;border-radius:6px;background:#f9fafb;font-size:12px}",
+			".erp-ai-panel .erp-ai-note{color:#6b7280}",
+			".erp-ai-panel .erp-ai-error{font-size:12px;color:#b91c1c}",
+			".erp-ai-panel .erp-ai-error:not(:empty){margin-top:8px}",
+			".erp-ai-panel .erp-ai-empty{margin-top:12px;text-align:center;color:#9ca3af}",
+			".erp-ai-panel .erp-ai-form{position:sticky;bottom:0;z-index:1;display:flex;align-items:flex-end;gap:8px;margin:12px -16px 0;padding:10px 12px;border-top:1px solid #f0f0f0;background:#fafafa}",
+			".erp-ai-panel .erp-ai-input{flex:1;min-height:40px;max-height:160px;padding:8px 10px;border:1px solid #d1d5db;border-radius:8px;background:#fff;font:inherit;line-height:1.4;color:inherit;resize:vertical;outline:none;transition:border-color .15s,box-shadow .15s}",
+			".erp-ai-panel .erp-ai-input:focus{border-color:#3b82f6;box-shadow:0 0 0 3px rgba(59,130,246,.18)}",
+			".erp-ai-panel .erp-ai-input:disabled{background:#f3f4f6;color:#9ca3af}",
+			".erp-ai-panel .erp-ai-btn{display:inline-flex;align-items:center;justify-content:center;height:28px;padding:0 12px;border:1px solid transparent;border-radius:8px;font:inherit;font-size:13px;font-weight:500;line-height:1;white-space:nowrap;cursor:pointer;transition:background-color .15s,border-color .15s,box-shadow .15s}",
+			".erp-ai-panel .erp-ai-btn:focus-visible{outline:none;box-shadow:0 0 0 3px rgba(59,130,246,.35)}",
+			".erp-ai-panel .erp-ai-btn:disabled{opacity:.5;cursor:not-allowed}",
+			".erp-ai-panel .erp-ai-btn--dark{background:#171717;color:#fff}",
+			".erp-ai-panel .erp-ai-btn--dark:hover:not(:disabled){background:#383838}",
+			".erp-ai-panel .erp-ai-btn--blue{background:#2563eb;color:#fff}",
+			".erp-ai-panel .erp-ai-btn--blue:hover:not(:disabled){background:#1d4ed8}",
+			".erp-ai-panel .erp-ai-btn--green{background:#16a34a;color:#fff}",
+			".erp-ai-panel .erp-ai-btn--green:hover:not(:disabled){background:#15803d}",
+			".erp-ai-panel .erp-ai-btn--danger{background:#fff;border-color:#fecaca;color:#dc2626}",
+			".erp-ai-panel .erp-ai-btn--danger:hover:not(:disabled){background:#fef2f2;border-color:#fca5a5}",
+			".erp-ai-panel .erp-ai-btn--subtle{background:#f3f4f6;color:#374151}",
+			".erp-ai-panel .erp-ai-btn--subtle:hover:not(:disabled){background:#e5e7eb}",
+			".erp-ai-panel .erp-ai-btn--ghost{background:transparent;color:#4b5563}",
+			".erp-ai-panel .erp-ai-btn--ghost:hover:not(:disabled){background:#f3f4f6}",
+			".erp-ai-panel .erp-ai-form .erp-ai-btn{height:40px;padding:0 16px}",
+			".erp-ai-panel .erp-ai-link{display:block;padding:2px 0;border:0;background:none;font:inherit;text-align:left;color:#2563eb;cursor:pointer}",
+			".erp-ai-panel .erp-ai-link:hover{text-decoration:underline}",
+		].join("\n");
+		const BUTTON_CLASS = "erp-ai-btn erp-ai-btn--";
 		const newPanelState = () => ({
 			el: null,
 			open: false,
@@ -86,6 +149,9 @@ function setupForm({ doc, call, router }) {
 			sendEl: null,
 			seq: 0,
 			sending: false,
+			loadingEl: null,
+			stickToBottom: false,
+			closedByPressAt: 0,
 		});
 		const socket =
 			document.querySelector("#app")?.__vue_app__?.config?.globalProperties?.$socket;
@@ -104,6 +170,7 @@ function setupForm({ doc, call, router }) {
 			call: null,
 			panel: newPanelState(),
 			resizeBound: false,
+			outsideBound: false,
 		});
 		state.call = call;
 		// A state object left by an older script version has no panel part.
@@ -214,33 +281,18 @@ function setupForm({ doc, call, router }) {
 				return panel.el;
 			}
 			const el = document.createElement("div");
-			Object.assign(el.style, {
-				position: "fixed",
-				right: "24px",
-				top: "72px",
-				width: "380px",
-				maxHeight: "calc(100vh - 120px)",
-				overflowY: "auto",
-				zIndex: "40",
-				padding: "12px",
-				background: "#ffffff",
-				border: "1px solid #e5e7eb",
-				borderRadius: "8px",
-				boxShadow: "0 1px 4px rgba(0, 0, 0, 0.12)",
-				fontSize: "13px",
-			});
+			el.className = "erp-ai-panel";
 			el.hidden = true;
+			const styleEl = document.createElement("style");
+			styleEl.textContent = PANEL_CSS;
 			const header = document.createElement("div");
-			Object.assign(header.style, {
-				display: "flex",
-				justifyContent: "space-between",
-				alignItems: "center",
-				marginBottom: "8px",
-			});
+			header.className = "erp-ai-head";
 			const title = document.createElement("strong");
+			title.className = "erp-ai-head-title";
 			title.textContent = TEXT_PANEL_TITLE;
 			const closeEl = document.createElement("button");
 			closeEl.type = "button";
+			closeEl.className = BUTTON_CLASS + "ghost";
 			closeEl.textContent = TEXT_CLOSE;
 			closeEl.addEventListener("click", () => {
 				try {
@@ -251,35 +303,33 @@ function setupForm({ doc, call, router }) {
 			});
 			header.append(title, closeEl);
 			const aiTitle = document.createElement("strong");
+			aiTitle.className = "erp-ai-section";
 			aiTitle.textContent = TEXT_AI_SECTION;
 			const aiListEl = document.createElement("div");
+			aiListEl.className = "erp-ai-fields";
 			const chatTitle = document.createElement("strong");
+			chatTitle.className = "erp-ai-section";
 			chatTitle.textContent = TEXT_CHAT_SECTION;
 			// The status line, above messages and cards, holds the docked indicator (A-7).
 			const statusEl = document.createElement("div");
-			Object.assign(statusEl.style, {
-				display: "flex",
-				alignItems: "center",
-				gap: "8px",
-				flexWrap: "wrap",
-				fontWeight: "bold",
-			});
+			statusEl.className = "erp-ai-status";
 			const statusTextEl = document.createElement("span");
 			const slotEl = document.createElement("div");
 			statusEl.append(statusTextEl, slotEl);
 			const guidanceEl = document.createElement("div");
-			guidanceEl.style.color = "#6b7280";
+			guidanceEl.className = "erp-ai-hint";
 			guidanceEl.textContent = TEXT_BOT_GUIDANCE;
 			const threadEl = document.createElement("div");
+			threadEl.className = "erp-ai-thread";
 			const proposalErrorEl = document.createElement("div");
-			proposalErrorEl.style.color = "#b91c1c";
+			proposalErrorEl.className = "erp-ai-error";
 			const errorEl = document.createElement("div");
-			errorEl.style.color = "#b91c1c";
+			errorEl.className = "erp-ai-error";
 			const formEl = document.createElement("div");
-			Object.assign(formEl.style, { display: "flex", gap: "8px", marginTop: "8px" });
+			formEl.className = "erp-ai-form";
 			const inputEl = document.createElement("textarea");
 			inputEl.rows = 2;
-			inputEl.style.flex = "1";
+			inputEl.className = "erp-ai-input";
 			inputEl.placeholder = TEXT_INPUT_PLACEHOLDER;
 			inputEl.addEventListener("keydown", (event) => {
 				try {
@@ -293,6 +343,7 @@ function setupForm({ doc, call, router }) {
 			});
 			const sendEl = document.createElement("button");
 			sendEl.type = "button";
+			sendEl.className = BUTTON_CLASS + "dark";
 			sendEl.textContent = TEXT_SEND;
 			sendEl.addEventListener("click", () => {
 				try {
@@ -303,6 +354,7 @@ function setupForm({ doc, call, router }) {
 			});
 			formEl.append(inputEl, sendEl);
 			el.append(
+				styleEl,
 				header,
 				aiTitle,
 				aiListEl,
@@ -349,11 +401,12 @@ function setupForm({ doc, call, router }) {
 			}
 			const nodes = fields.map((field) => {
 				const row = document.createElement("div");
-				row.style.marginTop = "8px";
+				row.className = "erp-ai-field";
 				const label = document.createElement("strong");
+				label.className = "erp-ai-field-label";
 				label.textContent = field?.label || "";
 				const body = document.createElement("div");
-				body.style.whiteSpace = "pre-wrap";
+				body.className = "erp-ai-pre";
 				body.textContent = field?.text ?? TEXT_EMPTY_FIELD;
 				row.append(label, body);
 				return row;
@@ -391,12 +444,8 @@ function setupForm({ doc, call, router }) {
 		// A system line: a centred note between the messages, never a message (ADR-048 QĐ 7).
 		const systemLine = (line) => {
 			const row = document.createElement("div");
-			Object.assign(row.style, {
-				marginTop: "8px",
-				textAlign: "center",
-				fontSize: "12px",
-				color: line?.kind === "failed" ? "#b91c1c" : "#6b7280",
-			});
+			row.className =
+				line?.kind === "failed" ? "erp-ai-sys erp-ai-sys--failed" : "erp-ai-sys";
 			row.textContent = String(line?.text ?? "");
 			return row;
 		};
@@ -404,26 +453,30 @@ function setupForm({ doc, call, router }) {
 		// One message of the thread; `approve` puts the approve button under it (the newest guidance, ADR-050).
 		const messageRow = (message, approve, confirm) => {
 			const row = document.createElement("div");
-			row.style.marginTop = "8px";
-			row.style.padding = "6px 8px";
-			row.style.borderRadius = "6px";
-			row.style.background = message?.is_bot ? "#eef2ff" : "#f9fafb";
-			const head = document.createElement("strong");
-			head.textContent = [
-				message?.is_bot ? TEXT_BOT_LABEL : "",
-				message?.author,
-				message?.created_at,
-			]
+			row.className = message?.is_bot
+				? "erp-ai-msg erp-ai-msg--bot"
+				: "erp-ai-msg erp-ai-msg--user";
+			const head = document.createElement("div");
+			head.className = "erp-ai-msg-head";
+			const who = document.createElement("strong");
+			who.textContent = [message?.is_bot ? TEXT_BOT_LABEL : "", message?.author]
 				.filter(Boolean)
 				.join(" · ");
+			const when = document.createElement("span");
+			when.className = "erp-ai-msg-time";
+			when.textContent = message?.created_at ?? "";
+			head.append(who, when);
 			const body = document.createElement("div");
-			body.style.whiteSpace = "pre-wrap";
+			body.className = "erp-ai-pre";
 			body.textContent = message?.text ?? "";
 			row.append(head, body);
+			// The buttons under a message sit in one row (CHG-017: only one of the two kinds shows).
+			const actions = document.createElement("div");
+			actions.className = "erp-ai-actions";
 			if (approve) {
 				const approveEl = document.createElement("button");
 				approveEl.type = "button";
-				approveEl.style.marginTop = "6px";
+				approveEl.className = BUTTON_CLASS + "blue";
 				approveEl.textContent = TEXT_APPROVE_GUIDANCE;
 				approveEl.addEventListener("click", () => {
 					try {
@@ -437,7 +490,7 @@ function setupForm({ doc, call, router }) {
 						// A panel handler must never break the ticket page (ADR-009 decision 4).
 					}
 				});
-				row.append(approveEl);
+				actions.append(approveEl);
 			}
 			if (confirm) {
 				// The records the bot wrote, above the buttons; the server builds each desk path (CHG-017).
@@ -446,16 +499,15 @@ function setupForm({ doc, call, router }) {
 				).filter((link) => typeof link?.url === "string" && link.url.startsWith("/app/"));
 				if (links.length > 0) {
 					const box = document.createElement("div");
-					box.style.marginTop = "6px";
+					box.className = "erp-ai-links";
 					const title = document.createElement("div");
+					title.className = "erp-ai-links-title";
 					title.textContent = TEXT_RESULT_LINKS;
 					box.append(title);
 					for (const link of links) {
 						const a = document.createElement("button");
 						a.type = "button";
-						a.style.display = "block";
-						a.style.color = "#2563eb";
-						a.style.textDecoration = "underline";
+						a.className = "erp-ai-link";
 						a.textContent = String(link.label ?? link.url);
 						a.addEventListener("click", () => {
 							try {
@@ -468,12 +520,37 @@ function setupForm({ doc, call, router }) {
 					}
 					row.append(box);
 				}
-				row.append(
+				actions.append(
 					resultButton(TEXT_RESULT_APPROVE, "approve"),
 					resultButton(TEXT_RESULT_REJECT, "reject")
 				);
 			}
+			if (actions.childElementCount > 0) {
+				row.append(actions);
+			}
 			return row;
+		};
+
+		// The first open of a ticket has nothing to show until its data comes back.
+		const loadingRow = () => {
+			const row = document.createElement("div");
+			row.className = "erp-ai-empty";
+			row.textContent = TEXT_LOADING;
+			state.panel.loadingEl = row;
+			return row;
+		};
+
+		// The panel scrolls as a whole; its bottom holds the newest message, right above the send box.
+		const isAtBottom = () => {
+			const el = state.panel.el;
+			return !!el && el.scrollHeight - el.scrollTop - el.clientHeight <= BOTTOM_SLACK_PX;
+		};
+
+		const scrollToBottom = () => {
+			const el = state.panel.el;
+			if (el) {
+				el.scrollTop = el.scrollHeight;
+			}
 		};
 
 		const clearProposals = () => {
@@ -494,6 +571,7 @@ function setupForm({ doc, call, router }) {
 		const proposalButton = (label, name) => {
 			const button = document.createElement("button");
 			button.type = "button";
+			button.className = BUTTON_CLASS + "subtle";
 			button.textContent = label;
 			button.addEventListener("click", () => {
 				try {
@@ -510,6 +588,7 @@ function setupForm({ doc, call, router }) {
 			const panel = state.panel;
 			const button = document.createElement("button");
 			button.type = "button";
+			button.className = BUTTON_CLASS + (action === ACTION_APPROVE ? "blue" : "danger");
 			button.textContent = label;
 			button.disabled = panel.deciding;
 			button.addEventListener("click", () => {
@@ -525,7 +604,7 @@ function setupForm({ doc, call, router }) {
 
 		const proposalActions = (card) => {
 			const row = document.createElement("div");
-			Object.assign(row.style, { display: "flex", gap: "8px", marginTop: "4px" });
+			row.className = "erp-ai-actions";
 			const name = String(card?.name ?? "");
 			if (!name) {
 				return row;
@@ -546,7 +625,7 @@ function setupForm({ doc, call, router }) {
 				} else {
 					// A console card its viewer can open waits for the console switch; the button only shows it.
 					const note = document.createElement("span");
-					note.style.color = "#6b7280";
+					note.className = "erp-ai-note";
 					note.textContent = canOpen ? TEXT_CONSOLE_OFF : TEXT_NEEDS_INSTRUCTOR;
 					row.append(note);
 					if (canOpen) {
@@ -566,19 +645,15 @@ function setupForm({ doc, call, router }) {
 
 		const proposalCard = (card) => {
 			const el = document.createElement("div");
-			Object.assign(el.style, {
-				marginTop: "8px",
-				padding: "6px 8px",
-				borderRadius: "6px",
-				background: "#f9fafb",
-			});
+			el.className = "erp-ai-card";
 			const head = document.createElement("strong");
+			head.className = "erp-ai-card-head";
 			head.textContent = [card?.name, card?.status].filter(Boolean).join(" · ");
 			el.append(head);
 			const addLine = (text, preWrap) => {
 				const line = document.createElement("div");
 				if (preWrap) {
-					line.style.whiteSpace = "pre-wrap";
+					line.className = "erp-ai-pre";
 				}
 				line.textContent = text;
 				el.append(line);
@@ -596,7 +671,6 @@ function setupForm({ doc, call, router }) {
 					addLine(label, false);
 					const pre = document.createElement("pre");
 					pre.style.whiteSpace = "pre-wrap";
-					pre.style.margin = "0";
 					pre.style.maxHeight = "240px";
 					pre.style.overflow = "auto";
 					pre.textContent = String(value);
@@ -687,7 +761,7 @@ function setupForm({ doc, call, router }) {
 			);
 			if (entries.length === 0) {
 				const empty = document.createElement("div");
-				empty.style.marginTop = "8px";
+				empty.className = "erp-ai-empty";
 				empty.textContent = TEXT_EMPTY_THREAD;
 				panel.threadEl.replaceChildren(empty, ...first, ...last);
 				return;
@@ -709,6 +783,7 @@ function setupForm({ doc, call, router }) {
 			const isStale = () => seq !== panel.seq || ticket !== state.ticket || !panel.open;
 			const showLoadFailed = () => {
 				if (!isStale()) {
+					panel.loadingEl?.remove();
 					panel.errorEl.textContent = TEXT_LOAD_FAILED;
 				}
 			};
@@ -720,10 +795,16 @@ function setupForm({ doc, call, router }) {
 							if (isStale()) {
 								return;
 							}
+							// Read before the new content changes the height.
+							const atBottom = panel.stickToBottom || isAtBottom();
 							renderAiFields(data);
 							renderBotStatus(data);
 							renderThread(data);
 							panel.errorEl.textContent = "";
+							if (atBottom) {
+								scrollToBottom();
+							}
+							panel.stickToBottom = false;
 						} catch (e) {
 							panel.botStatus = null;
 							showBotStatus();
@@ -854,8 +935,7 @@ function setupForm({ doc, call, router }) {
 		const resultButton = (label, action) => {
 			const button = document.createElement("button");
 			button.type = "button";
-			button.style.marginTop = "6px";
-			button.style.marginRight = "6px";
+			button.className = BUTTON_CLASS + (action === "approve" ? "green" : "danger");
 			button.textContent = label;
 			button.addEventListener("click", () => {
 				try {
@@ -896,13 +976,38 @@ function setupForm({ doc, call, router }) {
 					closePanel();
 					return;
 				}
+				// The press of this same click, outside the open panel, has just closed it: stay closed.
+				if (Date.now() - panel.closedByPressAt < OUTSIDE_CLOSE_GRACE_MS) {
+					return;
+				}
 				buildPanel();
 				panel.open = true;
 				panel.el.hidden = false;
 				dockIndicator(true);
+				if (panel.threadEl.childElementCount === 0) {
+					panel.threadEl.replaceChildren(loadingRow());
+				}
+				// Open on the newest message and the send box; the reload keeps it there once the data is in.
+				panel.stickToBottom = true;
+				scrollToBottom();
+				panel.inputEl.focus({ preventScroll: true });
 				reload();
 			} catch (e) {
 				// A panel handler must never break the ticket page (ADR-009 decision 4).
+			}
+		};
+
+		// A press outside the open panel closes it (the panel is no dialog: the page stays usable around it).
+		const onPointerDown = (event) => {
+			try {
+				const panel = state.panel;
+				if (!panel.open || !panel.el || panel.el.contains(event?.target)) {
+					return;
+				}
+				closePanel();
+				panel.closedByPressAt = Date.now();
+			} catch (e) {
+				// A page listener must never throw to the console (AC-10 g).
 			}
 		};
 
@@ -1056,6 +1161,11 @@ function setupForm({ doc, call, router }) {
 					// A router hook must never throw to the console (AC-10 g).
 				}
 			});
+		}
+		// Capture phase: the press is seen even when the page stops it on its way down.
+		if (!state.outsideBound) {
+			state.outsideBound = true;
+			document.addEventListener("pointerdown", onPointerDown, true);
 		}
 		if (!state.resizeBound) {
 			state.resizeBound = true;

@@ -455,6 +455,17 @@ STATUS_SCRIPT_REQUIRED = (
 	# CHG-010: the thread (messages, system lines and cards) is drawn by renderThread, still after the status.
 	r"renderBotStatus\(data\);\s*renderThread\(data\)",
 	r"statusExpired = true;\s*showBotStatus\(\)",
+	# Panel UX: a press outside the open panel closes it, one capture listener for the page lifetime; the click of
+	# the same press on the header action does not reopen it; the panel is opened only by that action.
+	r'if \(!state\.outsideBound\) \{\s*state\.outsideBound = true;\s*document\.addEventListener\("pointerdown", onPointerDown, true\);',
+	r"if \(!panel\.open \|\| !panel\.el \|\| panel\.el\.contains\(event\?\.target\)\) \{\s*return;\s*\}\s*closePanel\(\);\s*panel\.closedByPressAt = Date\.now\(\);",
+	r"if \(Date\.now\(\) - panel\.closedByPressAt < OUTSIDE_CLOSE_GRACE_MS\) \{\s*return;",
+	# Panel UX: the first open of a ticket shows a loading line; each open lands on the newest message and the send
+	# box; a refresh keeps a reader at the bottom there, and leaves one who scrolled up where they are.
+	r"if \(panel\.threadEl\.childElementCount === 0\) \{\s*panel\.threadEl\.replaceChildren\(loadingRow\(\)\);",
+	r"panel\.stickToBottom = true;",
+	r"const atBottom = panel\.stickToBottom \|\| isAtBottom\(\);",
+	r'panel\.errorEl\.textContent = "";\s*if \(atBottom\) \{\s*scrollToBottom\(\);',
 )
 # CHG-009 design 8.2: each pin above with the wiring it guards broken, as (pattern, regex to break, replacement).
 STATUS_LINE_VIOLATIONS = (
@@ -5701,6 +5712,19 @@ class TestArchitecture(unittest.TestCase):
 			self.assertIsNone(re.search(pattern, script, re.MULTILINE), f"forbidden in script: {pattern}")
 		for pattern in STATUS_SCRIPT_REQUIRED:
 			self.assertIsNotNone(re.search(pattern, script), f"missing in script: {pattern}")
+
+	def test_status_panel_opens_only_from_its_header_action(self):
+		# A page load (F5) never opens the panel: one `panel.open = true`, inside the action's togglePanel, and the
+		# open state is never stored (localStorage/sessionStorage are forbidden above).
+		script = self.status_script()
+		masked = mask_js(script)
+		opens = [m.start() for m in re.finditer(r"\bpanel\.open = true;", masked)]
+		self.assertEqual(len(opens), 1, "panel.open = true must appear exactly once")
+		start = masked.find("const togglePanel = () => {")
+		self.assertNotEqual(start, -1, "togglePanel is missing")
+		end = _matching_brace(masked, masked.find("{", start))
+		self.assertTrue(start < opens[0] < end, "the panel opens outside togglePanel")
+		self.assertIn("onClick: togglePanel", script)
 
 	def test_status_line_pins_catch_their_violation(self):
 		# CHG-009 design 8.2 (AC-1, AC-3): each status-line pin fails on the script with the wiring it guards broken

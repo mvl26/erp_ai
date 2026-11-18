@@ -1,4 +1,5 @@
 import ast
+import json
 import pathlib
 import time
 from unittest.mock import patch
@@ -395,12 +396,35 @@ class TestCallModel(FrappeTestCase):
 		add_credential("k1", model_classify="claude-haiku-5-5")
 		send, _ = self.run_call(ok_reply())
 		self.assertEqual(send.calls[0]["request"]["thinking"], {"type": "disabled"})
+		# CHG-004: a Haiku call keeps the request it had; effort is set on the other models only.
+		self.assertNotIn("output_config", send.calls[0]["request"])
 
 	def test_classify_request_leaves_thinking_unset_for_non_haiku(self):
 		# Sonnet/Opus/Fable reject thinking disabled with a 400, so classify must not send it (FEAT-006 rw1 R1 review).
 		add_credential("k1", model_classify="claude-sonnet-5-5")
 		send, _ = self.run_call(ok_reply())
 		self.assertNotIn("thinking", send.calls[0]["request"])
+
+	def test_opus_calls_ask_medium_effort(self):
+		"""CHG-004: Claude Opus 5.5 cannot turn thinking off; effort is its control. The user chose medium for both
+		steps, sent explicitly so a model with another default (Sonnet 5.5: high) runs at the same level."""
+		add_credential("k1", model_classify="claude-opus-5-5", model_reason="claude-opus-5-5")
+		for task in ("classify", "reason"):
+			with self.subTest(task=task):
+				send, _ = self.run_call(ok_reply(), task=task)
+				request = send.calls[0]["request"]
+				self.assertEqual(request["output_config"], {"effort": "medium"})
+				self.assertNotIn("thinking", request)
+
+	def test_default_classify_model_is_opus(self):
+		"""CHG-004: a new site classifies with Claude Opus 5.5 (the stored value of an existing site is not changed).
+		Read from the DocType JSON on disk: the site's meta changes only at migrate."""
+		path = (
+			pathlib.Path(__file__).resolve().parents[1]
+			/ "erp_ai_agent/doctype/erp_ai_setting/erp_ai_setting.json"
+		)
+		fields = {f["fieldname"]: f for f in json.loads(path.read_text(encoding="utf-8"))["fields"]}
+		self.assertEqual(fields["model_classify_default"]["default"], "claude-opus-5-5")
 
 	def test_classify_with_no_model_anywhere_raises_gateway_error_not_attribute_error(self):
 		# Both the key and the Setting default are empty: the provider answers 400, as before rw1 (FEAT-006 rw1 R4).
@@ -416,6 +440,7 @@ class TestCallModel(FrappeTestCase):
 		add_credential("k1", model_reason="reason-model")
 		send, _ = self.run_call(ok_reply(), task="reason")
 		self.assertNotIn("thinking", send.calls[0]["request"])
+		self.assertEqual(send.calls[0]["request"]["output_config"], {"effort": "medium"})
 
 	def test_invalid_task_raises_value_error(self):
 		add_credential("k1")
@@ -432,7 +457,13 @@ class TestCallModel(FrappeTestCase):
 		self.assertEqual(send.calls[0]["timeout"], 45)
 		self.assertEqual(
 			send.calls[0]["request"],
-			{**CALL, "model": "default-model", "tools": [{"name": "t"}]},
+			# spec changed (CHG-004): a model other than Haiku is asked for medium effort
+			{
+				**CALL,
+				"model": "default-model",
+				"tools": [{"name": "t"}],
+				"output_config": {"effort": "medium"},
+			},
 		)
 		self.assertEqual(result.text, "xin chào")
 		self.assertEqual(result.content, MESSAGE["content"])

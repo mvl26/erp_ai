@@ -650,7 +650,7 @@ erp_ai/
 | `enabled` | Check | **0** |
 | `muc_quyen` | Select `L0`/`L1`/`L2`/`L3` | `L0` |
 | `credentials` | Table → `ERP AI Credential` | mục 9.1 |
-| `model_classify_default` | Data | `claude-haiku-5-5` — dùng khi khóa không khai riêng |
+| `model_classify_default` | Data | `claude-opus-5-5` — dùng khi khóa không khai riêng; mọi model trừ `claude-haiku-*` chạy với effort medium ở cả hai bước (CHG-004) |
 | `model_reason_default` | Data | `claude-sonnet-5-5` |
 | `max_key_thu` | Int | 3 — số khóa thử trước khi bỏ (mục 9.1) |
 | `max_turns_per_run` | Int | 8 |

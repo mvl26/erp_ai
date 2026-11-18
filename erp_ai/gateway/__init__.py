@@ -23,6 +23,10 @@ MIN_REMAINING_S = 5
 # Only Haiku accepts `disabled`; Sonnet, Opus and Fable answer 400 to it, so other models get no field.
 CLASSIFY_THINKING = {"type": "disabled"}
 THINKING_OFF_MODEL_PREFIX = "claude-haiku-"
+# CHG-004: every model but Haiku runs at the effort the user chose, on both steps. Effort is the thinking control of
+# Claude Opus 5.5 (the default model; its own default is medium); it is sent explicitly so a model with another
+# default (Sonnet 5.5: high) runs at the same level. Haiku keeps the request it had (Haiku 4.5 rejects effort).
+MODEL_OUTPUT_CONFIG = {"effort": "medium"}
 USAGE_FIELDS = ("input_tokens", "output_tokens", "cache_creation_input_tokens", "cache_read_input_tokens")
 PRICE_FIELDS = (
 	"price_input_per_mtok",
@@ -152,8 +156,11 @@ def call_model(task, *, system, messages, max_tokens, tools=None, deadline=None)
 			row.model_reason if task == "reason" else row.model_classify or settings["model_classify_default"]
 		)
 		request = {"model": model, "max_tokens": max_tokens, "system": system, "messages": messages}
-		if task == "classify" and (model or "").startswith(THINKING_OFF_MODEL_PREFIX):
-			request["thinking"] = CLASSIFY_THINKING
+		if (model or "").startswith(THINKING_OFF_MODEL_PREFIX):
+			if task == "classify":
+				request["thinking"] = CLASSIFY_THINKING
+		else:
+			request["output_config"] = MODEL_OUTPUT_CONFIG
 		if tools:
 			request["tools"] = tools
 		last = {"credential_label": row.label}

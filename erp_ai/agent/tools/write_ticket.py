@@ -524,6 +524,12 @@ def guidance_text(content: str) -> str | None:
 	return "\n".join(lines).strip()
 
 
+def guidance_work_done(text: str) -> bool:
+	"""CHG-017: the panel text of a guidance (`guidance_text`) holds a real "Đã làm" list and no "Chờ duyệt" list."""
+	done = re.search(rf"^{re.escape(SECTION_DONE)}:.*\n- ", text, re.M)
+	return bool(done) and not re.search(rf"^{re.escape(SECTION_PENDING)}:", text, re.M)
+
+
 def open_collector(run_id: str) -> None:
 	"""Start the run's guidance collector: no analysis yet, every section empty."""
 	frappe.flags.setdefault(_GUIDANCE_FLAG, {})[run_id] = {

@@ -131,6 +131,10 @@ APPROVE_GUIDANCE_TEXT = (
 # CHG-010: the closing sentence of a plan with steps left for the bot; the panel shows the approve button only
 # under a guidance that holds it (messages.thread).
 APPROVE_GUIDANCE_OFFER = 'Bấm "Duyệt hướng xử lý" trong ngăn "Trao đổi với bot" thì bot làm ngay'
+# CHG-017: the two buttons under a finished plan. The reject click sends the first text as a message (it calls the
+# bot); the approve click writes the second as the closing line of the conversation, which calls nothing.
+RESULT_REJECTED_TEXT = "Không duyệt kết quả: bot hỏi tôi chưa đạt ở điểm nào."
+RESULT_APPROVED_TEXT = "Đã duyệt kết quả: phiếu chuyển sang Resolved."
 # In every flag combination, never overridden (w1.md:78); ADR-050 names the one message that is an order.
 NO_OK_APPROVAL = (
 	'   Chữ "ok", "duyệt" gõ trong phiếu, comment hay tin không bao giờ là duyệt một đề xuất sửa code hay lệnh'
@@ -383,6 +387,12 @@ TASK_NEW_TICKET = (
 TASK_COMMENT = (
 	'Việc cần làm: có tin mới trong ngăn "Trao đổi với bot" gọi bạn (tin cuối của khối conversation). '
 	"Trả lời bằng post_comment: câu trả lời hiện trong ngăn đó, không hiện trên timeline phiếu."
+)
+# CHG-017: replaces TASK_COMMENT when the message that called the bot is RESULT_REJECTED_TEXT.
+TASK_RESULT_REJECTED = (
+	"Người dùng bấm Không duyệt kết quả bạn đã làm (tin cuối của khối conversation). Đăng bằng post_comment đúng "
+	'một câu ngắn hỏi kết quả chưa đạt ở điểm nào, ví dụ "Kết quả chưa đạt ở điểm nào?". Không làm việc gì khác, '
+	"không gọi tool nào khác. Tin kế tiếp của người dùng là yêu cầu làm tiếp, xử lý như một tin gọi bạn bình thường."
 )
 # U6b-fixes.md:91 (one run may follow several requester messages) and U6b.md:293.
 TASK_REQUESTER_REPLY = (
@@ -757,6 +767,12 @@ def build_initial_message(
 	if fields := _field_values(ticket_fields or {}):
 		payload["ticket"]["fields"] = fields
 	task = TASK_BY_TRIGGER.get(trigger, TASK_NEW_TICKET)
+	if (
+		trigger == TRIGGER_COMMENT_MENTION
+		and conversation
+		and (conversation[-1].get("content") or "").strip() == RESULT_REJECTED_TEXT
+	):
+		task = TASK_RESULT_REJECTED
 	if instructor_tools and trigger == TRIGGER_COMMENT_MENTION:
 		task += "\n" + no_instructor_text(instructor_tools)
 	if trigger in CATEGORY_HINT_TRIGGERS and (classification or {}).get("category") == "C":

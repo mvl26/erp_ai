@@ -70,6 +70,8 @@ PANEL_METHODS = (
 	"erp_ai.ticket_panel.send_message",
 	# CHG-008 (ADR-044 QĐ 1): the panel's one decision method, for every action of `ticket_panel.PANEL_DECISIONS`.
 	"erp_ai.ticket_panel.decide_proposal",
+	# CHG-017: the Duyệt / Không duyệt buttons under the bot's finished work.
+	"erp_ai.ticket_panel.decide_result",
 )
 PANEL_MAX_MESSAGE_CHARS = 2000
 # CHG-008 design D-7: the most proposal cards the panel returns for one ticket, newest first.

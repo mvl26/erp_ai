@@ -1,6 +1,7 @@
 from unittest.mock import patch
 
 import frappe
+from frappe.realtime import get_doc_room
 from frappe.tests.utils import FrappeTestCase
 from helpdesk.test_utils import make_ticket
 
@@ -31,6 +32,18 @@ class TestMessages(FrappeTestCase):
 
 	def count(self):
 		return frappe.db.count(MESSAGE_DOCTYPE, {"ticket": self.ticket})
+
+	def test_add_message_publishes_doc_update_to_the_ticket_room(self):
+		room = get_doc_room("HD Ticket", self.ticket)
+		with patch.object(frappe, "publish_realtime") as publish:
+			add_message(self.ticket, "xin chao", trusted=True)
+			self.assertEqual([c for c in publish.call_args_list if c.kwargs.get("room") == room], [])
+			frappe.db.after_commit.run()
+		sent = [c for c in publish.call_args_list if c.kwargs.get("room") == room]
+		self.assertEqual(len(sent), 1)
+		args = sent[0].args
+		self.assertEqual(args[0], "doc_update")
+		self.assertEqual((args[1]["doctype"], args[1]["name"]), ("HD Ticket", self.ticket))
 
 	def test_trusted_insert_owned_by_session_user(self):
 		frappe.set_user(NO_ROLE_USER)
@@ -91,7 +104,19 @@ class TestMessages(FrappeTestCase):
 		# CHG-010: each thread row also carries the raw creation time, so the panel can order cards among rows
 		# ADR-050: and its kind, "" for a message shown as stored; CHG-016: and whether it can be approved
 		self.assertEqual(
-			set(rows[0]), {"name", "author", "is_bot", "created_at", "created", "text", "kind", "approvable"}
+			set(rows[0]),
+			{
+				"name",
+				"author",
+				"is_bot",
+				"created_at",
+				"created",
+				"text",
+				"kind",
+				"approvable",
+				"result_confirmable",
+				"result_links",
+			},
 		)
 		self.assertEqual(
 			[row["created"] for row in rows],

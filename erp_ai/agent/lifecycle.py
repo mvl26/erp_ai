@@ -11,7 +11,7 @@ import frappe
 from frappe.utils import extract_email_id, get_datetime, now_datetime
 
 from erp_ai.agent import authority, policy, run_log
-from erp_ai.constants import AGENT_USER, LOG_DOCTYPE, LOGGER_NAME, SETTING_DOCTYPE
+from erp_ai.constants import AGENT_USER, LOG_DOCTYPE, LOGGER_NAME, ROLE_INSTRUCTOR, SETTING_DOCTYPE
 
 STATUS_RESOLVED = "Resolved"
 STATUS_CLOSED = "Closed"
@@ -46,6 +46,8 @@ REFUSAL_ORIGIN_NOT_CONFIGURED = "origin_not_configured"
 REFUSAL_NOT_SENDABLE = "not_sendable"
 REFUSAL_BOARD_DIRECTED = "board_directed"
 REFUSAL_CATEGORY_E = "category_e"
+REFUSAL_ALREADY_DONE = "already_resolved_or_closed"
+TOOL_RESOLVE_ON_RESULT_APPROVED = "resolve_on_result_approved"
 # ERP AI Setting `close_silent_f_days` (Int 3, 1..30); anything else reads the default.
 CLOSE_SILENT_F_DAYS_DEFAULT = 3
 CLOSE_SILENT_F_DAYS_MIN = 1
@@ -106,18 +108,20 @@ def _normalize(value) -> str:
 	return str(value or "").strip().casefold()
 
 
-def status_change_refusal(ticket_name: str, ls: LifecycleSettings) -> str | None:
+def status_change_refusal(ticket_name: str, ls: LifecycleSettings, *, need_origin: bool = True) -> str | None:
 	"""The one guard of both N-2 status changes (AC-42 (b)): why the bot must not change this ticket's status, or None.
 
 	First match wins: origin not configured, not sendable (excluded ticket, A-U6b-5), board-directed origin
-	(compared after strip and casefold), latest category E.
+	(compared after strip and casefold), latest category E. `need_origin=False` (a person's click, CHG-017) lets
+	an unconfigured origin pass; the board check then cannot run.
 	"""
-	if not origin_configured(ls):
+	configured = origin_configured(ls)
+	if need_origin and not configured:
 		return REFUSAL_ORIGIN_NOT_CONFIGURED
 	if not policy.can_send_ticket(ticket_name):
 		return REFUSAL_NOT_SENDABLE
-	origin = frappe.db.get_value(TICKET_DOCTYPE, ticket_name, ls.field_origin)
-	if _normalize(origin) == _normalize(ls.origin_board_value):
+	origin = frappe.db.get_value(TICKET_DOCTYPE, ticket_name, ls.field_origin) if configured else None
+	if configured and _normalize(origin) == _normalize(ls.origin_board_value):
 		return REFUSAL_BOARD_DIRECTED
 	if policy.latest_classification(ticket_name)[0] == CATEGORY_E:
 		return REFUSAL_CATEGORY_E
@@ -296,6 +300,49 @@ def _resolve_if_tasks_done(ticket_name: str, ls: LifecycleSettings) -> None:
 			),
 		],
 	)
+
+
+def result_confirmer(user: str, ticket_name: str) -> bool:
+	"""CHG-017: who may confirm the bot's result on a ticket: its creator, or a person with the instructor role.
+	The agent account and Guest never."""
+	if not user or user in (AGENT_USER, "Guest"):
+		return False
+	if user == frappe.db.get_value(TICKET_DOCTYPE, ticket_name, "owner"):
+		return True
+	return ROLE_INSTRUCTOR in frappe.get_roles(user)
+
+
+def result_refusal(ticket_name: str) -> str | None:
+	"""CHG-017: why the person's click may not resolve this ticket, or None: already Resolved or Closed, else the
+	one guard of the bot's own status changes (`status_change_refusal`)."""
+	if frappe.db.get_value(TICKET_DOCTYPE, ticket_name, "status") in (STATUS_RESOLVED, STATUS_CLOSED):
+		return REFUSAL_ALREADY_DONE
+	return status_change_refusal(ticket_name, _current_settings(), need_origin=False)
+
+
+def resolve_by_person(ticket_name: str, person: str) -> str:
+	"""CHG-017: the ticket moves to Resolved because `person` approved the bot's result; one bot_action row names
+	them. Returns the status before. The caller has checked `result_confirmer` and `result_refusal`."""
+	doc = frappe.get_doc(TICKET_DOCTYPE, ticket_name)
+	before = doc.status
+	doc.status = STATUS_RESOLVED
+	doc.save()
+	run_log.write_bot_action(
+		trigger=run_log.TRIGGER_SCHEDULED_JOB,
+		ticket=ticket_name,
+		instructor=person,
+		actions=[
+			run_log.action_entry(
+				TOOL_RESOLVE_ON_RESULT_APPROVED,
+				TICKET_DOCTYPE,
+				ticket_name,
+				True,
+				value_before={"status": before},
+				value_after={"status": STATUS_RESOLVED},
+			)
+		],
+	)
+	return before
 
 
 def run_task_lifecycle(ticket_name: str) -> None:

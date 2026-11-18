@@ -86,7 +86,8 @@ class TestMessages(FrappeTestCase):
 			frappe.db.set_value(MESSAGE_DOCTYPE, name, "creation", f"2001-01-0{i + 1} 10:00:00")
 		rows = history(self.ticket, limit=2)
 		self.assertEqual([row["name"] for row in rows], [names[2], names[1]])
-		self.assertEqual(set(rows[0]), {"name", "author", "creation", "content"})
+		# BUG-009: plus the role the author had when the message was sent
+		self.assertEqual(set(rows[0]), {"name", "author", "creation", "content", "role_at_send"})
 		self.assertEqual(rows[0]["author"], "Administrator")
 		self.assertEqual(rows[0]["content"], "tin 2")
 

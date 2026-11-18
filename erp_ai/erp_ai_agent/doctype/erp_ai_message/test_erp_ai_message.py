@@ -15,6 +15,7 @@ FIELD_TYPES = {
 	"content": "Code",
 	"run_id": "Data",
 	"source_comment": "Data",
+	"author_role": "Select",
 }
 LAYOUT_TYPES = ("Section Break", "Column Break", "Tab Break")
 GRANTED = (
@@ -43,7 +44,16 @@ class TestERPAIMessage(FrappeTestCase):
 		self.assertEqual({name: f["fieldtype"] for name, f in fields.items()}, FIELD_TYPES)
 		self.assertEqual(
 			doctype["field_order"],
-			["section_message", "ticket", "content", "section_source", "run_id", "source_comment"],
+			# BUG-009: + author_role, the role the author had when the message was sent
+			[
+				"section_message",
+				"ticket",
+				"content",
+				"section_source",
+				"run_id",
+				"source_comment",
+				"author_role",
+			],
 		)
 		self.assertEqual(fields["ticket"]["options"], "HD Ticket")
 		# every read is by ticket: the panel, each run, the weekly KPI

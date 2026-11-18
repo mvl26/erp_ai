@@ -56,14 +56,35 @@ def fetch_ticket_comments(ticket_name: str, limit: int = MAX_COMMENTS) -> list[d
 		order_by="creation desc",
 		limit_page_length=limit,
 	)
+	# BUG-009: an @ai comment keeps the role its copy in the conversation stored when it was sent, but only a copy
+	# its own writer made: Helpdesk's ticket merge inserts copies in the merger's session (see _trigger_message_author)
+	owners = {row.name: row.owner for row in rows}
+	stored = {
+		copy.source_comment: copy.author_role
+		for copy in frappe.get_all(
+			MESSAGE_DOCTYPE,
+			filters={"ticket": ticket_name, "source_comment": ("in", list(owners) or [""])},
+			fields=["source_comment", "owner", "author_role"],
+		)
+		if copy.owner == owners.get(copy.source_comment)
+	}
 	return [
-		{"name": row.name, "author": row.owner, "creation": row.creation, "content": row.content}
+		{
+			"name": row.name,
+			"author": row.owner,
+			"creation": row.creation,
+			"content": row.content,
+			"role_at_send": stored.get(row.name),
+		}
 		for row in rows
 	]
 
 
 def is_instruction(author: str, ticket_name: str) -> bool:
 	if not author or author in NEVER_AUTHORITY:
+		return False
+	# BUG-009: a disabled account keeps its Has Role rows; its right to order ends with the account
+	if not frappe.db.get_value("User", author, "enabled"):
 		return False
 	if ROLE_INSTRUCTOR in frappe.get_roles(author):
 		return True
@@ -125,13 +146,26 @@ def _trigger_message_author(ticket_name: str, message_name: str | None) -> str |
 	return message.owner
 
 
+def role_label(author: str, ticket_name: str) -> str:
+	"""The role `author` holds on the ticket now, as the model reads it: "chỉ thị" or "dữ liệu"."""
+	return ROLE_LABEL_INSTRUCTION if is_instruction(author, ticket_name) else ROLE_LABEL_DATA
+
+
 def label_comments(ticket_name: str, comments: list[dict]) -> list[dict]:
-	verdicts: dict[str, bool] = {}
+	"""Each comment with its `role`; any `role` it came with is replaced (never trusted).
+
+	BUG-009, the user's rule (2026-11-18, "mất quyền là ko còn thực hiện được nữa"): a comment is an order ("chỉ
+	thị") only while its author has the right now, decided once per author; an author who lost the right, or whose
+	account is disabled, orders nothing any more. A message read from the server with the role its author had when
+	it was sent (`role_at_send`, written at insert by the ERP AI Message controller; only server-built rows carry
+	it) stays data when it was sent without the right, even if the right came later. Older messages and plain ticket
+	comments carry none. `role_at_send` is not passed on."""
+	verdicts: dict[str, str] = {}
 	labelled = []
 	for comment in comments:
 		author = comment["author"]
 		if author not in verdicts:
-			verdicts[author] = is_instruction(author, ticket_name)
-		role = ROLE_LABEL_INSTRUCTION if verdicts[author] else ROLE_LABEL_DATA
-		labelled.append({**comment, "role": role})
+			verdicts[author] = role_label(author, ticket_name)
+		role = ROLE_LABEL_DATA if comment.get("role_at_send") == ROLE_LABEL_DATA else verdicts[author]
+		labelled.append({**{k: v for k, v in comment.items() if k != "role_at_send"}, "role": role})
 	return labelled

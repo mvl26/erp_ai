@@ -18,6 +18,7 @@ from erp_ai.constants import (
 	TICKET_CONTENT_DOCTYPES,
 	TRIGGER_COMMENT_MENTION,
 	TRIGGER_REQUESTER_REPLY,
+	TRIGGER_SUPPORT_CHAT,
 	TRIGGER_TICKET_INSERT,
 )
 
@@ -278,7 +279,12 @@ def latest_classification(ticket_name: str) -> tuple[str | None, int | None]:
 
 
 # The triggers whose runs count toward the daily limit (ADR-033 QĐ 4).
-RUN_LIMIT_TRIGGERS = (TRIGGER_TICKET_INSERT, TRIGGER_COMMENT_MENTION, TRIGGER_REQUESTER_REPLY)
+RUN_LIMIT_TRIGGERS = (
+	TRIGGER_TICKET_INSERT,
+	TRIGGER_COMMENT_MENTION,
+	TRIGGER_REQUESTER_REPLY,
+	TRIGGER_SUPPORT_CHAT,
+)
 
 
 def runs_today(ticket_name, now=None) -> int:

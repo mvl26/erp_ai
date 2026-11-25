@@ -3,7 +3,7 @@ import json
 import frappe
 from frappe.core.utils import html_to_plain_text
 
-from erp_ai.agent import lessons, lifecycle, messages, policy
+from erp_ai.agent import lessons, lifecycle, messages, policy, reply_notice
 from erp_ai.agent.prompts import RESULT_APPROVED_TEXT
 from erp_ai.agent.queue import enqueue_agent_run, enqueue_lifecycle_job, requester_reply_key
 from erp_ai.agent.run_log import EVENT_CODES, record_event
@@ -274,6 +274,8 @@ def comment_after_insert(doc, method=None):
 def message_after_insert(doc, method=None):
 	# Only a person's message starts a run; the bot's own reply is told by its owner, before any DB read.
 	ticket = doc.ticket
+	if doc.owner == AGENT_USER:
+		reply_notice.notify(doc)
 	if doc.owner != AGENT_USER and (rule := lessons.teaching_rule(doc.content)):
 		lessons.safely(lessons.record_teaching_message, ticket, doc.name, rule)
 	skip_reason = None

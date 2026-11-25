@@ -269,3 +269,6 @@ scheduler_events = {
 # ------------
 # List of apps whose translatable strings should be excluded from this app's translations.
 # ignore_translatable_strings_from = []
+
+# Bot reply notices (constants.BOT_REPLY_NOTIFICATION_TYPE) only feed the Miyano bot badge: never an email.
+notification_skip_email_types = ["Bot Reply"]

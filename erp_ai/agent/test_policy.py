@@ -24,6 +24,7 @@ from erp_ai.constants import (
 	TRIGGER_COMMENT_MENTION,
 	TRIGGER_KB_DRAFT,
 	TRIGGER_REQUESTER_REPLY,
+	TRIGGER_SUPPORT_CHAT,
 	TRIGGER_TICKET_INSERT,
 )
 from erp_ai.test_utils import TempAppsRoot, keep_agent_settings, make_log_entry, set_agent_settings
@@ -893,7 +894,7 @@ class TestRunsToday(FrappeTestCase):
 		# U6b-fixes Sửa 3 (AC-41): the requester-reply run is counted, the KB-draft run never is.
 		self.assertEqual(
 			policy.RUN_LIMIT_TRIGGERS,
-			(TRIGGER_TICKET_INSERT, TRIGGER_COMMENT_MENTION, TRIGGER_REQUESTER_REPLY),
+			(TRIGGER_TICKET_INSERT, TRIGGER_COMMENT_MENTION, TRIGGER_REQUESTER_REPLY, TRIGGER_SUPPORT_CHAT),
 		)
 
 	def test_kb_draft_reason_row_not_counted(self):

@@ -53,4 +53,3 @@ def notify(message) -> None:
 			),
 		},
 	)
-

@@ -50,7 +50,11 @@ def answer(question: str, history: list) -> dict:
 	try:
 		result = _call_model(system=_system(found), messages=messages)
 	except gateway.GatewayError as exc:
-		_log(error=f"{exc.kind} status={exc.status}", credential_label=exc.credential_label, keys_tried=exc.keys_tried)
+		_log(
+			error=f"{exc.kind} status={exc.status}",
+			credential_label=exc.credential_label,
+			keys_tried=exc.keys_tried,
+		)
 		return _fixed(TEXT_FAILED)
 	_log(
 		model=result.model,

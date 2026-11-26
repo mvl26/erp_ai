@@ -98,7 +98,7 @@
    "fieldname": "trigger",
    "fieldtype": "Select",
    "label": "Nguồn kích hoạt",
-   "description": "Nguồn kích hoạt — ticket_insert: phiếu mới tạo; comment_mention: bình luận có từ khóa kích hoạt; requester_reply: người tạo phiếu trả lời tin của bot; kb_draft: soạn bài CSKT nháp khi đóng phiếu; change_action: bước của đề xuất thay đổi; setting_save: người lưu cấu hình đổi công tắc quyền; scheduled_job: việc theo lịch hay theo sự kiện, không qua model. Hệ thống tự ghi, không sửa được.",
+   "description": "Nguồn kích hoạt — ticket_insert: phiếu mới tạo; comment_mention: bình luận có từ khóa kích hoạt; requester_reply: người tạo phiếu trả lời bot; kb_draft: soạn bài CSKT nháp khi đóng phiếu; support_chat: chat hỗ trợ người dùng; change_action: bước của đề xuất thay đổi; setting_save: lưu cấu hình đổi quyền; scheduled_job: việc theo lịch hay sự kiện, không qua model. Hệ thống tự ghi, không sửa được.",
    "options": "ticket_insert\ncomment_mention\nrequester_reply\nkb_draft\nsupport_chat\nchange_action\nsetting_save\nscheduled_job",
    "read_only": 1
   },

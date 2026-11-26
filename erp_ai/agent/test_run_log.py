@@ -254,6 +254,7 @@ class TestRunLog(FrappeTestCase):
 				"comment_mention",
 				"requester_reply",
 				"kb_draft",
+				"support_chat",
 				"change_action",
 				"setting_save",
 				"scheduled_job",
@@ -761,7 +762,8 @@ class TestTriggers(FrappeTestCase):
 	# are TRIGGERS + CHANGE_TRIGGERS + BOT_ACTION_TRIGGERS, in that order.
 	def test_triggers_match_queue_and_json(self):
 		self.assertEqual(
-			run_log.TRIGGERS, ("ticket_insert", "comment_mention", "requester_reply", "kb_draft")
+			run_log.TRIGGERS,
+			("ticket_insert", "comment_mention", "requester_reply", "kb_draft", "support_chat"),
 		)
 		self.assertLessEqual(set(queue.VALID_TRIGGERS), set(run_log.TRIGGERS))
 		self.assertEqual(

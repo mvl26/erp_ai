@@ -29,7 +29,9 @@ class TestSupportChat(FrappeTestCase):
 		self.addCleanup(frappe.db.rollback)
 		self.addCleanup(frappe.set_user, "Administrator")
 		frappe.set_user("Administrator")
-		self.earlier_logs = frappe.get_all(LOG_DOCTYPE, filters={"trigger": TRIGGER_SUPPORT_CHAT}, pluck="name")
+		self.earlier_logs = frappe.get_all(
+			LOG_DOCTYPE, filters={"trigger": TRIGGER_SUPPORT_CHAT}, pluck="name"
+		)
 		log_error = patch.object(frappe, "log_error")
 		log_error.start()
 		self.addCleanup(log_error.stop)

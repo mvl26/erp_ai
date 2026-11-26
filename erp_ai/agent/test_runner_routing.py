@@ -42,6 +42,7 @@ from erp_ai.agent.tools.route_ticket import (
 from erp_ai.agent.tools.write_ticket import CREATED_LABELS_FIELD, REASON_HUMAN_FILLED, locked_rows
 from erp_ai.constants import (
 	AGENT_USER,
+	BOT_REPLY_NOTIFICATION_TYPE,
 	CLASSIFICATION_FIELDS,
 	CLASSIFIED_BY_HUMAN,
 	CREDENTIAL_DOCTYPE,
@@ -834,7 +835,13 @@ class AssignTestBase(RoutingTestBase):
 	def _notifications(self, user):
 		return frappe.db.count(
 			"Notification Log",
-			{"for_user": user, "document_type": "HD Ticket", "document_name": self.ticket.name},
+			{
+				"for_user": user,
+				"document_type": "HD Ticket",
+				"document_name": self.ticket.name,
+				# The bot reply notices (agent/reply_notice.py) feed the Miyano bot badge, not the assignment.
+				"type": ("!=", BOT_REPLY_NOTIFICATION_TYPE),
+			},
 		)
 
 	def _action(self, tool):

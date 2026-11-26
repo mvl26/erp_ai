@@ -107,6 +107,8 @@ from erp_ai.test_utils import (
 )
 
 PREFIX = "ERPAI-TEST-"
+# The job behind frappe's enqueue_create_notification: the bot reply notices (agent/reply_notice.py).
+NOTIFICATION_LOGS_JOB = "frappe.desk.doctype.notification_log.notification_log.make_notification_logs"
 CLASSIFY_A_PCT = 90
 CLASSIFY_A = json.dumps({"dau_muc": "A", "do_tin_cay": "Cao", "do_tin_cay_pct": CLASSIFY_A_PCT, "ly_do": "x"})
 TICKET_FIELDS = [
@@ -5576,7 +5578,8 @@ class TestDoneInGuidance(GuidanceTestBase):
 		self.assertEqual(
 			frappe.db.get_value(PROPOSAL_DOCTYPE, proposal.name, "change_status"), CHANGE_STATUS_PENDING
 		)
-		self.assertEqual(enqueue.call_args_list, [])
+		# The bot reply notices (agent/reply_notice.py) are the only jobs: no change job.
+		self.assertEqual([c for c in enqueue.call_args_list if c.args[:1] != (NOTIFICATION_LOGS_JOB,)], [])
 		self.assertEqual(self._entries(entry_type="change", change_step="approve"), [])
 		self.assertEqual(_result_lines(self.ticket.name, proposal.name), 0)
 		self.assertEqual(self._guidance(), 1)

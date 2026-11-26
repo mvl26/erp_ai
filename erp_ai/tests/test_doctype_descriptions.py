@@ -480,6 +480,7 @@ DOCTYPE_CONFIG = {
 				"comment_mention",
 				"requester_reply",
 				"kb_draft",
+				"support_chat",
 				"change_action",
 				"setting_save",
 				"scheduled_job",

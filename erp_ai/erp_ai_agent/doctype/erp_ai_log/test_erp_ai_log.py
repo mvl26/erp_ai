@@ -187,7 +187,7 @@ class TestActionsLongText(FrappeTestCase):
 
 class TestOptions(FrappeTestCase):
 	def test_entry_type_and_trigger_options(self):
-		# FEAT-007 U3 2, U6b-fixes Sửa 3: five entry types, seven triggers, in this order; run_log holds the same constants.
+		# FEAT-007 U3 2, U6b-fixes Sửa 3: six entry types, eight triggers (support_chat: the Miyano bot's support chat), in this order; run_log holds the same constants.
 		meta = frappe.get_meta(LOG_DOCTYPE)
 		self.assertEqual(
 			meta.get_field("entry_type").options.split("\n"),
@@ -201,6 +201,7 @@ class TestOptions(FrappeTestCase):
 				"comment_mention",
 				"requester_reply",
 				"kb_draft",
+				"support_chat",
 				"change_action",
 				"setting_save",
 				"scheduled_job",

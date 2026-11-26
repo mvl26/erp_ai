@@ -77,6 +77,9 @@ PANEL_METHODS = (
 	# CHG-017: the Duyệt / Không duyệt buttons under the bot's finished work.
 	"erp_ai.ticket_panel.decide_result",
 )
+# CHG-019: the page script's second whitelist, the Miyano bot's support chat (erp_ai/support_chat.py).
+SUPPORT_CHAT_METHODS = ("erp_ai.support_chat.ask",)
+SCRIPT_METHODS = PANEL_METHODS + SUPPORT_CHAT_METHODS
 PANEL_MAX_MESSAGE_CHARS = 2000
 # CHG-008 design D-7: the most proposal cards the panel returns for one ticket, newest first.
 PANEL_MAX_PROPOSALS = 200

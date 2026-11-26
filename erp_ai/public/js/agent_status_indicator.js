@@ -61,6 +61,65 @@ function setupForm({ doc, call, router }) {
 		const OUTSIDE_CLOSE_GRACE_MS = 500;
 		// How close to the end a reader counts as "at the newest message".
 		const BOTTOM_SLACK_PX = 40;
+		// CHG-019: the Miyano bot (mascot, launcher, card with the support chat); plain DOM, one per page load.
+		const SVG_NS = "http://www.w3.org/2000/svg";
+		const MASCOT_COLOR = "#12b5d8";
+		const TEXT_BOT_TITLE = "Miyano bot";
+		const TEXT_BOT_LAUNCHER = "Trò chuyện với Miyano bot";
+		const TEXT_BOT_DRAG_HINT = "Kéo để di chuyển, bấm để mở";
+		const TEXT_BOT_ASK_TITLE = "Hỏi Miyano bot";
+		const TEXT_BOT_HELLO = "Xin chào! Hãy hỏi tôi cách dùng helpdesk hoặc ERP.";
+		const TEXT_BOT_THINKING = "Miyano bot đang suy nghĩ…";
+		const TEXT_BOT_FAILED = "Miyano bot chưa trả lời được. Hãy thử lại.";
+		const TEXT_BOT_PLACEHOLDER = "Nhập câu hỏi, Enter để gửi";
+		const TEXT_BOT_NEW_TICKET = "Tạo phiếu từ cuộc trò chuyện này";
+		const TEXT_BOT_RESTART = "Cuộc trò chuyện mới";
+		const TEXT_BOT_QUESTION = "Câu hỏi";
+		const TEXT_BOT_COPIED = "Đã chép cuộc trò chuyện. Hãy dán (Ctrl+V) vào mô tả phiếu.";
+		const MAX_QUESTION_CHARS = 1000;
+		const SUBJECT_CHARS = 140;
+		const BOT_WIDTH_PX = 72;
+		const BOT_HEIGHT_PX = 58;
+		const BOT_EDGE_PX = 8;
+		const BOT_OFFSET_PX = 24;
+		const BOT_DRAG_PX = 5;
+		const BOT_CARD_WIDTH_PX = 360;
+		const BOT_CARD_HEIGHT_PX = 480;
+		const BOT_CARD_GAP_PX = 12;
+		const BOT_CSS = [
+			".miyano-bot-launcher{position:fixed;z-index:40;padding:0;border:0;background:transparent;cursor:grab;touch-action:none;user-select:none;transition:transform .15s}",
+			".miyano-bot-launcher:hover{transform:scale(1.05)}",
+			".miyano-bot-launcher:focus-visible{outline:2px solid #12b5d8;outline-offset:2px}",
+			".miyano-bot-mascot{display:block;width:100%;height:100%;filter:drop-shadow(0 2px 4px rgba(0,0,0,.25));pointer-events:none}",
+			".miyano-bot-card{position:fixed;z-index:40;display:flex;flex-direction:column;overflow:hidden;background:#fff;border:1px solid #e5e7eb;border-radius:12px;box-shadow:0 12px 32px rgba(15,23,42,.18);font-size:13px;line-height:1.5;color:#1f2937}",
+			".miyano-bot-card[hidden],.miyano-bot-card [hidden]{display:none}",
+			".miyano-bot-card,.miyano-bot-card *{box-sizing:border-box}",
+			".miyano-bot-head{display:flex;flex:none;align-items:center;gap:8px;padding:8px 12px;border-bottom:1px solid #e5e7eb}",
+			".miyano-bot-head-mascot{width:28px;height:22px;flex:none}",
+			".miyano-bot-head-title{flex:1;font-size:14px;color:#111827}",
+			".miyano-bot-ticket{flex:1;min-height:0;overflow-y:auto;padding:8px 12px}",
+			".miyano-bot-chat{display:flex;flex:1;flex-direction:column;min-height:0}",
+			".miyano-bot-chat-head{display:flex;flex:none;align-items:center;gap:8px;padding:8px 12px 0}",
+			".miyano-bot-thread{display:flex;flex:1;flex-direction:column;gap:8px;min-height:0;overflow-y:auto;padding:8px 12px}",
+			".miyano-bot-turn{padding:6px 8px;border-radius:8px;white-space:pre-wrap;overflow-wrap:anywhere}",
+			".miyano-bot-turn--user{margin-left:24px;background:#f3f4f6}",
+			".miyano-bot-turn--bot{margin-right:24px;border:1px solid #e5e7eb}",
+			".miyano-bot-muted{margin:0;color:#6b7280}",
+			".miyano-bot-error{padding:0 12px;font-size:12px;color:#b91c1c}",
+			".miyano-bot-note{padding:0 12px;font-size:12px;color:#4b5563}",
+			".miyano-bot-error:empty,.miyano-bot-note:empty{display:none}",
+			".miyano-bot-foot{display:flex;flex:none;flex-direction:column;gap:6px;padding:8px 12px;border-top:1px solid #e5e7eb}",
+			".miyano-bot-row{display:flex;align-items:flex-end;gap:8px}",
+			".miyano-bot-input{flex:1;min-width:0;padding:6px 8px;border:1px solid #d1d5db;border-radius:6px;background:#fff;font:inherit;color:inherit;resize:none;outline:none}",
+			".miyano-bot-input:focus{border-color:#12b5d8}",
+			".miyano-bot-input:disabled{background:#f3f4f6}",
+			".miyano-bot-btn{display:inline-flex;align-items:center;justify-content:center;height:28px;padding:0 12px;border:1px solid transparent;border-radius:8px;font:inherit;font-weight:500;white-space:nowrap;cursor:pointer}",
+			".miyano-bot-btn:disabled{opacity:.5;cursor:not-allowed}",
+			".miyano-bot-btn--solid{background:#171717;color:#fff}",
+			".miyano-bot-btn--subtle{background:#f3f4f6;color:#374151}",
+			".miyano-bot-btn--ghost{background:transparent;color:#4b5563}",
+			".miyano-bot-link{display:block;max-width:100%;padding:0;border:0;background:none;font:inherit;font-size:12px;text-align:left;text-decoration:underline;color:#4b5563;cursor:pointer;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}",
+		].join("\n");
 		const INDICATOR_FLOATING_STYLE = {
 			position: "fixed",
 			left: "",
@@ -79,8 +138,8 @@ function setupForm({ doc, call, router }) {
 			transform: "",
 			zIndex: "",
 		};
-		// Helpdesk's Miyano bot (window.miyanoBot) replaces the header action: the chat mounts in its card, the
-		// status line sits beside the bot. Without it the script keeps its header action and its own card.
+		// The Miyano bot of this script (state.bot.host) replaces the header action: the chat mounts in its card,
+		// the status line sits beside the bot. On a narrow screen it is not built and the header action stays.
 		const HOST_TOGGLE_EVENT = "miyano-bot:toggle";
 		const HOST_MOVE_EVENT = "miyano-bot:move";
 		const HOST_GAP_PX = 12;
@@ -97,7 +156,7 @@ function setupForm({ doc, call, router }) {
 			borderRadius: "0",
 			boxShadow: "none",
 		};
-		const host = () => window.miyanoBot || null;
+		const host = () => state.bot?.host || null;
 		// The panel's look, one style element inside the panel; every rule under `.erp-ai-panel`, so nothing of
 		// Helpdesk's page changes. Button colours: blue starts work, green confirms a result, red outline refuses.
 		const PANEL_CSS = [
@@ -178,6 +237,27 @@ function setupForm({ doc, call, router }) {
 			stickToBottom: false,
 			closedByPressAt: 0,
 		});
+		const newBotState = () => ({
+			host: null,
+			launcher: null,
+			card: null,
+			ticketWrap: null,
+			chatEl: null,
+			threadEl: null,
+			inputEl: null,
+			sendEl: null,
+			restartEl: null,
+			newTicketEl: null,
+			errorEl: null,
+			noteEl: null,
+			open: false,
+			asking: false,
+			turns: [],
+			saved: null,
+			pos: { left: 0, top: 0 },
+			drag: null,
+			resizeBound: false,
+		});
 		const socket =
 			document.querySelector("#app")?.__vue_app__?.config?.globalProperties?.$socket;
 		if (!socket || typeof socket.on !== "function" || !doc?.name) {
@@ -200,6 +280,490 @@ function setupForm({ doc, call, router }) {
 		state.call = call;
 		// A state object left by an older script version has no panel part.
 		state.panel = state.panel || newPanelState();
+		state.router = router;
+		state.bot = state.bot || newBotState();
+
+		const botButton = (variant, text, onClick) => {
+			const button = document.createElement("button");
+			button.type = "button";
+			button.className = "miyano-bot-btn miyano-bot-btn--" + variant;
+			button.textContent = text;
+			button.addEventListener("click", () => {
+				try {
+					onClick();
+				} catch (e) {
+					// A widget handler must never break the page (ADR-051 decision 4).
+				}
+			});
+			return button;
+		};
+
+		const svgPart = (name, attributes) => {
+			const part = document.createElementNS(SVG_NS, name);
+			for (const [key, value] of Object.entries(attributes)) {
+				part.setAttribute(key, value);
+			}
+			return part;
+		};
+
+		const makeMascot = (className) => {
+			const svg = document.createElementNS(SVG_NS, "svg");
+			svg.setAttribute("viewBox", "0 0 100 80");
+			svg.setAttribute("aria-hidden", "true");
+			svg.setAttribute("class", className);
+			const arms = svgPart("g", {
+				fill: "none",
+				stroke: MASCOT_COLOR,
+				"stroke-width": "5",
+				"stroke-linecap": "round",
+			});
+			arms.append(
+				svgPart("path", { d: "M28 50 L14 40" }),
+				svgPart("path", { d: "M72 50 L86 40" })
+			);
+			const body = svgPart("g", { fill: MASCOT_COLOR });
+			body.append(
+				svgPart("circle", { cx: "11", cy: "37", r: "8" }),
+				svgPart("circle", { cx: "89", cy: "37", r: "8" }),
+				svgPart("path", {
+					d: "M28 8 L50 30 L72 8 L72 74 L28 74 Z",
+					stroke: MASCOT_COLOR,
+					"stroke-width": "6",
+					"stroke-linejoin": "round",
+				})
+			);
+			svg.append(
+				arms,
+				body,
+				svgPart("ellipse", { cx: "43", cy: "45", rx: "3.2", ry: "4.2", fill: "#fff" }),
+				svgPart("ellipse", { cx: "57", cy: "45", rx: "3.2", ry: "4.2", fill: "#fff" }),
+				svgPart("path", {
+					d: "M37 53 Q50 66 63 53",
+					fill: "none",
+					stroke: "#fff",
+					"stroke-width": "4",
+					"stroke-linecap": "round",
+				})
+			);
+			return svg;
+		};
+
+		const clampBot = (value, min, max) => Math.min(Math.max(value, min), Math.max(min, max));
+
+		// A fixed box that scrolls inside: above the bot in the lower half of the window, below it otherwise.
+		const placeBotCard = () => {
+			const bot = state.bot;
+			const w = window.innerWidth;
+			const h = window.innerHeight;
+			const width = Math.min(BOT_CARD_WIDTH_PX, w - 2 * BOT_EDGE_PX);
+			const style = {
+				width: width + "px",
+				left:
+					clampBot(
+						bot.pos.left + BOT_WIDTH_PX - width,
+						BOT_EDGE_PX,
+						w - width - BOT_EDGE_PX
+					) + "px",
+				top: "",
+				bottom: "",
+			};
+			if (bot.pos.top + BOT_HEIGHT_PX / 2 > h / 2) {
+				style.bottom = h - bot.pos.top + BOT_CARD_GAP_PX + "px";
+				style.height =
+					Math.min(BOT_CARD_HEIGHT_PX, bot.pos.top - BOT_CARD_GAP_PX - BOT_EDGE_PX) + "px";
+			} else {
+				const below = bot.pos.top + BOT_HEIGHT_PX;
+				style.top = below + BOT_CARD_GAP_PX + "px";
+				style.height =
+					Math.min(BOT_CARD_HEIGHT_PX, h - below - BOT_CARD_GAP_PX - BOT_EDGE_PX) + "px";
+			}
+			Object.assign(bot.card.style, style);
+		};
+
+		// Kept in memory only: a reload puts the bot back in the corner (no storage, ADR-051 decision 3).
+		const placeBot = (wanted) => {
+			const bot = state.bot;
+			const w = window.innerWidth;
+			const h = window.innerHeight;
+			bot.pos = {
+				left: clampBot(
+					wanted?.left ?? w - BOT_WIDTH_PX - BOT_OFFSET_PX,
+					BOT_EDGE_PX,
+					w - BOT_WIDTH_PX - BOT_EDGE_PX
+				),
+				top: clampBot(
+					wanted?.top ?? h - BOT_HEIGHT_PX - BOT_OFFSET_PX,
+					BOT_EDGE_PX,
+					h - BOT_HEIGHT_PX - BOT_EDGE_PX
+				),
+			};
+			bot.launcher.style.left = bot.pos.left + "px";
+			bot.launcher.style.top = bot.pos.top + "px";
+			placeBotCard();
+			window.dispatchEvent(new CustomEvent(HOST_MOVE_EVENT));
+		};
+
+		const renderBotChat = () => {
+			const bot = state.bot;
+			const nodes = [];
+			if (bot.turns.length === 0) {
+				const hello = document.createElement("p");
+				hello.className = "miyano-bot-muted";
+				hello.textContent = TEXT_BOT_HELLO;
+				nodes.push(hello);
+			}
+			for (const turn of bot.turns) {
+				const row = document.createElement("div");
+				row.className =
+					turn.role === "user"
+						? "miyano-bot-turn miyano-bot-turn--user"
+						: "miyano-bot-turn miyano-bot-turn--bot";
+				row.textContent = turn.content;
+				for (const article of turn.articles || []) {
+					const link = document.createElement("button");
+					link.type = "button";
+					link.className = "miyano-bot-link";
+					link.textContent = article.title;
+					link.addEventListener("click", () => {
+						try {
+							state.router?.push({ name: "Article", params: { articleId: article.name } });
+						} catch (e) {
+							// A widget handler must never break the page (ADR-051 decision 4).
+						}
+					});
+					row.append(link);
+				}
+				nodes.push(row);
+			}
+			if (bot.asking) {
+				const thinking = document.createElement("p");
+				thinking.className = "miyano-bot-muted";
+				thinking.textContent = TEXT_BOT_THINKING;
+				nodes.push(thinking);
+			}
+			bot.threadEl.replaceChildren(...nodes);
+			bot.threadEl.scrollTop = bot.threadEl.scrollHeight;
+			bot.restartEl.hidden = bot.turns.length === 0;
+			bot.restartEl.disabled = bot.asking;
+			bot.newTicketEl.hidden = bot.turns.length === 0;
+			bot.inputEl.disabled = bot.asking;
+			bot.sendEl.disabled = bot.asking;
+		};
+
+		const readArticles = (articles) =>
+			(Array.isArray(articles) ? articles : [])
+				.filter((a) => typeof a?.name === "string" && typeof a?.title === "string")
+				.map((a) => ({ name: a.name, title: a.title }));
+
+		const askBot = () => {
+			const bot = state.bot;
+			const question = bot.inputEl.value.trim();
+			if (!question || bot.asking || !state.call) {
+				return;
+			}
+			const history = bot.turns.map(({ role, content }) => ({ role, content }));
+			bot.errorEl.textContent = "";
+			bot.noteEl.textContent = "";
+			bot.turns.push({ role: "user", content: question });
+			bot.inputEl.value = "";
+			bot.asking = true;
+			renderBotChat();
+			// The question stays in the box so it can be sent again.
+			const onFailed = () => {
+				try {
+					bot.asking = false;
+					bot.turns.pop();
+					bot.inputEl.value = question;
+					bot.errorEl.textContent = TEXT_BOT_FAILED;
+					renderBotChat();
+				} catch (e) {
+					// A widget handler must never break the page (ADR-051 decision 4).
+				}
+			};
+			const onAnswered = (reply) => {
+				try {
+					if (typeof reply?.answer !== "string") {
+						onFailed();
+						return;
+					}
+					bot.asking = false;
+					bot.turns.push({
+						role: "assistant",
+						content: reply.answer,
+						articles: readArticles(reply.articles),
+					});
+					renderBotChat();
+				} catch (e) {
+					onFailed();
+				}
+			};
+			try {
+				state.call("erp_ai.support_chat.ask", { question, history }).then(onAnswered, onFailed);
+			} catch (e) {
+				onFailed();
+			}
+		};
+
+		// The first question is the subject (the new-ticket page reads ?subject=); the chat goes to the clipboard.
+		const createTicketFromChat = () => {
+			const bot = state.bot;
+			const first = bot.turns.find((turn) => turn.role === "user")?.content ?? "";
+			const transcript = bot.turns
+				.map(
+					(turn) =>
+						(turn.role === "user" ? TEXT_BOT_QUESTION : TEXT_BOT_TITLE) + ": " + turn.content
+				)
+				.join("\n\n");
+			navigator.clipboard?.writeText(transcript).then(
+				() => {
+					bot.noteEl.textContent = TEXT_BOT_COPIED;
+				},
+				() => {}
+			);
+			state.router?.push({
+				name: "TicketAgentNew",
+				query: { subject: first.replace(/\s+/g, " ").slice(0, SUBJECT_CHARS) },
+			});
+		};
+
+		const setBotOpen = (value) => {
+			const bot = state.bot;
+			bot.open = value;
+			bot.card.hidden = !value;
+			bot.launcher.setAttribute("aria-expanded", String(value));
+			window.dispatchEvent(new CustomEvent(HOST_TOGGLE_EVENT, { detail: { open: value } }));
+			if (value && !state.ticket) {
+				bot.threadEl.scrollTop = bot.threadEl.scrollHeight;
+				bot.inputEl.focus({ preventScroll: true });
+			}
+		};
+
+		// On a ticket page the card holds that ticket's chat (the panel); elsewhere it holds the support chat.
+		const syncBotView = () => {
+			const bot = state.bot;
+			if (!bot.card) {
+				return;
+			}
+			bot.ticketWrap.hidden = !state.ticket;
+			bot.chatEl.hidden = Boolean(state.ticket);
+		};
+
+		const onBotPointerDown = (event) => {
+			try {
+				const bot = state.bot;
+				if (event.button !== 0) {
+					return;
+				}
+				bot.drag = {
+					id: event.pointerId,
+					startX: event.clientX,
+					startY: event.clientY,
+					dx: event.clientX - bot.pos.left,
+					dy: event.clientY - bot.pos.top,
+					moved: false,
+				};
+				bot.launcher.setPointerCapture(event.pointerId);
+			} catch (e) {
+				// A widget handler must never break the page (ADR-051 decision 4).
+			}
+		};
+
+		const onBotPointerMove = (event) => {
+			try {
+				const bot = state.bot;
+				const drag = bot.drag;
+				if (!drag || event.pointerId !== drag.id) {
+					return;
+				}
+				const far =
+					Math.abs(event.clientX - drag.startX) > BOT_DRAG_PX ||
+					Math.abs(event.clientY - drag.startY) > BOT_DRAG_PX;
+				if (!drag.moved && !far) {
+					return;
+				}
+				drag.moved = true;
+				bot.launcher.style.cursor = "grabbing";
+				placeBot({ left: event.clientX - drag.dx, top: event.clientY - drag.dy });
+			} catch (e) {
+				// A widget handler must never break the page (ADR-051 decision 4).
+			}
+		};
+
+		// A press that moved past the threshold was a drag and is remembered; one that did not opens the card.
+		const onBotPointerUp = (event) => {
+			try {
+				const bot = state.bot;
+				const drag = bot.drag;
+				if (!drag || event.pointerId !== drag.id) {
+					return;
+				}
+				bot.drag = null;
+				bot.launcher.style.cursor = "";
+				if (drag.moved) {
+					bot.saved = { ...bot.pos };
+				} else {
+					setBotOpen(!bot.open);
+				}
+			} catch (e) {
+				// A widget handler must never break the page (ADR-051 decision 4).
+			}
+		};
+
+		const onBotKeyDown = (event) => {
+			try {
+				if (event.key === "Enter" || event.key === " ") {
+					event.preventDefault();
+					setBotOpen(!state.bot.open);
+				}
+			} catch (e) {
+				// A widget handler must never break the page (ADR-051 decision 4).
+			}
+		};
+
+		const onBotResize = () => {
+			try {
+				const bot = state.bot;
+				const narrow = window.innerWidth < NARROW_SCREEN_PX;
+				bot.launcher.hidden = narrow;
+				if (narrow && bot.open) {
+					setBotOpen(false);
+				}
+				placeBot(bot.saved);
+			} catch (e) {
+				// A resize callback must never throw to the console (AC-10 g).
+			}
+		};
+
+		const buildBot = () => {
+			const bot = state.bot;
+			if (bot.card) {
+				return;
+			}
+			const root = document.createElement("div");
+			const styleEl = document.createElement("style");
+			styleEl.textContent = BOT_CSS;
+			const launcher = document.createElement("button");
+			launcher.type = "button";
+			launcher.className = "miyano-bot-launcher";
+			launcher.title = TEXT_BOT_DRAG_HINT;
+			launcher.setAttribute("aria-label", TEXT_BOT_LAUNCHER);
+			launcher.setAttribute("aria-expanded", "false");
+			Object.assign(launcher.style, {
+				width: BOT_WIDTH_PX + "px",
+				height: BOT_HEIGHT_PX + "px",
+			});
+			launcher.append(makeMascot("miyano-bot-mascot"));
+			launcher.addEventListener("pointerdown", onBotPointerDown);
+			launcher.addEventListener("pointermove", onBotPointerMove);
+			launcher.addEventListener("pointerup", onBotPointerUp);
+			launcher.addEventListener("pointercancel", () => {
+				bot.drag = null;
+			});
+			launcher.addEventListener("keydown", onBotKeyDown);
+
+			const card = document.createElement("div");
+			card.className = "miyano-bot-card";
+			card.setAttribute("role", "dialog");
+			card.setAttribute("aria-label", TEXT_BOT_TITLE);
+			card.hidden = true;
+			const head = document.createElement("div");
+			head.className = "miyano-bot-head";
+			const title = document.createElement("strong");
+			title.className = "miyano-bot-head-title";
+			title.textContent = TEXT_BOT_TITLE;
+			head.append(
+				makeMascot("miyano-bot-head-mascot"),
+				title,
+				botButton("ghost", TEXT_CLOSE, () => setBotOpen(false))
+			);
+
+			// The ticket's own chat mounts in this part (host().slot).
+			const ticketWrap = document.createElement("div");
+			ticketWrap.className = "miyano-bot-ticket";
+			const slot = document.createElement("div");
+			ticketWrap.append(slot);
+
+			const chatEl = document.createElement("div");
+			chatEl.className = "miyano-bot-chat";
+			const chatHead = document.createElement("div");
+			chatHead.className = "miyano-bot-chat-head";
+			const chatTitle = document.createElement("strong");
+			chatTitle.className = "miyano-bot-head-title";
+			chatTitle.textContent = TEXT_BOT_ASK_TITLE;
+			const restartEl = botButton("ghost", TEXT_BOT_RESTART, () => {
+				if (!bot.asking) {
+					bot.turns = [];
+					bot.errorEl.textContent = "";
+					bot.noteEl.textContent = "";
+					renderBotChat();
+				}
+			});
+			chatHead.append(chatTitle, restartEl);
+			const threadEl = document.createElement("div");
+			threadEl.className = "miyano-bot-thread";
+			threadEl.setAttribute("aria-live", "polite");
+			const errorEl = document.createElement("div");
+			errorEl.className = "miyano-bot-error";
+			errorEl.setAttribute("role", "alert");
+			const noteEl = document.createElement("div");
+			noteEl.className = "miyano-bot-note";
+			const foot = document.createElement("div");
+			foot.className = "miyano-bot-foot";
+			const newTicketEl = botButton("subtle", TEXT_BOT_NEW_TICKET, createTicketFromChat);
+			const row = document.createElement("div");
+			row.className = "miyano-bot-row";
+			const inputEl = document.createElement("textarea");
+			inputEl.rows = 2;
+			inputEl.maxLength = MAX_QUESTION_CHARS;
+			inputEl.className = "miyano-bot-input";
+			inputEl.placeholder = TEXT_BOT_PLACEHOLDER;
+			inputEl.setAttribute("aria-label", TEXT_BOT_PLACEHOLDER);
+			inputEl.addEventListener("keydown", (event) => {
+				try {
+					if (event.key === "Enter" && !event.shiftKey && !event.isComposing) {
+						event.preventDefault();
+						askBot();
+					}
+				} catch (e) {
+					// A widget handler must never break the page (ADR-051 decision 4).
+				}
+			});
+			const sendEl = botButton("solid", TEXT_SEND, askBot);
+			row.append(inputEl, sendEl);
+			foot.append(newTicketEl, row);
+			chatEl.append(chatHead, threadEl, errorEl, noteEl, foot);
+			card.append(head, ticketWrap, chatEl);
+			root.append(styleEl, launcher, card);
+			document.body.appendChild(root);
+
+			Object.assign(bot, {
+				launcher,
+				card,
+				ticketWrap,
+				chatEl,
+				threadEl,
+				inputEl,
+				sendEl,
+				restartEl,
+				newTicketEl,
+				errorEl,
+				noteEl,
+			});
+			bot.host = {
+				launcher,
+				slot,
+				isOpen: () => bot.open,
+				open: () => setBotOpen(true),
+				close: () => setBotOpen(false),
+			};
+			if (!bot.resizeBound) {
+				bot.resizeBound = true;
+				window.addEventListener("resize", onBotResize);
+			}
+			placeBot(bot.saved);
+			renderBotChat();
+			syncBotView();
+		};
 
 		// Helpdesk's `[hidden]{display:none}` loses to an inline display, so both are written together.
 		const setIndicatorVisible = (el, visible) => {
@@ -1219,10 +1783,14 @@ function setupForm({ doc, call, router }) {
 			}
 		};
 
+		if (window.innerWidth >= NARROW_SCREEN_PX) {
+			buildBot();
+		}
 		if (String(doc.name) !== state.ticket) {
 			reset();
 			state.ticket = String(doc.name);
 		}
+		syncBotView();
 		socket.emit("doc_subscribe", "HD Ticket", state.ticket);
 
 		if (state.socket !== socket) {
@@ -1252,6 +1820,7 @@ function setupForm({ doc, call, router }) {
 						// Left the viewed ticket: forget it so its signals are ignored (ADR-008 decision 6).
 						reset();
 						state.ticket = null;
+						syncBotView();
 					}
 				} catch (e) {
 					// A router hook must never throw to the console (AC-10 g).

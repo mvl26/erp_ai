@@ -36,6 +36,8 @@ from erp_ai.constants import (
 	CHANGE_STATUS_PENDING,
 	LESSON_STATUS_ACTIVE,
 	PANEL_METHODS,
+	SCRIPT_METHODS,
+	SUPPORT_CHAT_METHODS,
 )
 
 PACKAGE_ROOT = Path(__file__).resolve().parent.parent
@@ -242,6 +244,22 @@ LOG_SINK_CALLS = ("print", "frappe.log_error", "frappe.msgprint", "frappe.throw"
 LOG_SINK_METHODS = ("debug", "info", "warning", "error", "exception", "critical")
 
 STATUS_SCRIPT_FILE = "public/js/agent_status_indicator.js"
+# CHG-019: the Miyano bot widget (mascot, launcher, card with the support chat) lives in the same script.
+MIYANO_WIDGET_REQUIRED = (
+	r'TEXT_BOT_TITLE = "Miyano bot"',
+	r'TEXT_BOT_HELLO = "Xin chào! Hãy hỏi tôi cách dùng helpdesk hoặc ERP\."',
+	r'TEXT_BOT_FAILED = "Miyano bot chưa trả lời được\. Hãy thử lại\."',
+	r'TEXT_BOT_NEW_TICKET = "Tạo phiếu từ cuộc trò chuyện này"',
+	r'createElementNS\(SVG_NS, "svg"\)',
+	r"state\.bot = state\.bot \|\| newBotState\(\)",
+	r"const buildBot = \(\) => \{",
+	r'state\s*\.call\("erp_ai\.support_chat\.ask", \{ question, history \}\)',
+	r"MAX_QUESTION_CHARS = 1000",
+	r'router\??\.push\(\{\s*name: "TicketAgentNew"',
+	r"const host = \(\) => state\.bot\?\.host \|\| null",
+	r"setPointerCapture",
+	r"const syncBotView = \(\) => \{",
+)
 STATUS_INDICATOR_VISIBILITY = "setIndicatorVisible"
 STATUS_INDICATOR_FUNCTIONS = ("ensureElement", "render", "reset", "dockIndicator")
 # `el.style.display = …` or `Object.assign(el.style, …, { display: … })` on the indicator itself.
@@ -5741,7 +5759,7 @@ class TestArchitecture(unittest.TestCase):
 		script = load_product_sources(suffixes=(".js",)).get(STATUS_SCRIPT_FILE)
 		self.assertIsNotNone(script, f"{STATUS_SCRIPT_FILE} is missing")
 		self.assertGreater(len(STATUS_SCRIPT_CALL.findall(script)), 0, "no call( found in script")
-		self.assertEqual(check_status_script_calls(script, PANEL_METHODS), [])
+		self.assertEqual(check_status_script_calls(script, SCRIPT_METHODS), [])
 
 	def test_status_script_call_check_catches_variable_and_unknown_method(self):
 		allowed = ("erp_ai.ticket_panel.get_panel_data",)
@@ -5760,12 +5778,24 @@ class TestArchitecture(unittest.TestCase):
 	def test_status_script_calls_only_panel_methods(self):
 		script = self.status_script()
 		literals = {m.group(2) for m in STATUS_SCRIPT_CALL.finditer(script) if m.group(1) is not None}
-		self.assertEqual(literals, set(PANEL_METHODS))
+		self.assertEqual(literals, set(SCRIPT_METHODS))
 		self.assertEqual(
-			whitelisted_paths(self.sources) & set(PANEL_METHODS),
-			set(PANEL_METHODS),
+			whitelisted_paths(self.sources) & set(SCRIPT_METHODS),
+			set(SCRIPT_METHODS),
 		)
-		self.assertEqual(check_call_allow_list(script, PANEL_METHODS, self.sources), [])
+		self.assertEqual(check_call_allow_list(script, SCRIPT_METHODS, self.sources), [])
+
+	def test_script_methods_add_only_the_support_chat_ask(self):
+		# CHG-019: the widget's one extra method; the ticket panel's own four stay exactly as ADR-044 pins them.
+		self.assertEqual(SUPPORT_CHAT_METHODS, ("erp_ai.support_chat.ask",))
+		self.assertEqual(SCRIPT_METHODS, PANEL_METHODS + SUPPORT_CHAT_METHODS)
+
+	def test_status_script_has_the_miyano_bot_widget(self):
+		# CHG-019: the widget is plain DOM in the one script; each pattern pins a part of it at its use site.
+		script = self.status_script()
+		for pattern in MIYANO_WIDGET_REQUIRED:
+			with self.subTest(pattern=pattern):
+				self.assertIsNotNone(re.search(pattern, script), pattern)
 
 	def test_status_script_queries_only_app_root(self):
 		script = self.status_script()

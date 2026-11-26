@@ -370,7 +370,8 @@ function setupForm({ doc, call, router }) {
 			if (bot.pos.top + BOT_HEIGHT_PX / 2 > h / 2) {
 				style.bottom = h - bot.pos.top + BOT_CARD_GAP_PX + "px";
 				style.height =
-					Math.min(BOT_CARD_HEIGHT_PX, bot.pos.top - BOT_CARD_GAP_PX - BOT_EDGE_PX) + "px";
+					Math.min(BOT_CARD_HEIGHT_PX, bot.pos.top - BOT_CARD_GAP_PX - BOT_EDGE_PX) +
+					"px";
 			} else {
 				const below = bot.pos.top + BOT_HEIGHT_PX;
 				style.top = below + BOT_CARD_GAP_PX + "px";
@@ -426,7 +427,10 @@ function setupForm({ doc, call, router }) {
 					link.textContent = article.title;
 					link.addEventListener("click", () => {
 						try {
-							state.router?.push({ name: "Article", params: { articleId: article.name } });
+							state.router?.push({
+								name: "Article",
+								params: { articleId: article.name },
+							});
 						} catch (e) {
 							// A widget handler must never break the page (ADR-051 decision 4).
 						}
@@ -498,7 +502,9 @@ function setupForm({ doc, call, router }) {
 				}
 			};
 			try {
-				state.call("erp_ai.support_chat.ask", { question, history }).then(onAnswered, onFailed);
+				state
+					.call("erp_ai.support_chat.ask", { question, history })
+					.then(onAnswered, onFailed);
 			} catch (e) {
 				onFailed();
 			}
@@ -511,7 +517,9 @@ function setupForm({ doc, call, router }) {
 			const transcript = bot.turns
 				.map(
 					(turn) =>
-						(turn.role === "user" ? TEXT_BOT_QUESTION : TEXT_BOT_TITLE) + ": " + turn.content
+						(turn.role === "user" ? TEXT_BOT_QUESTION : TEXT_BOT_TITLE) +
+						": " +
+						turn.content
 				)
 				.join("\n\n");
 			navigator.clipboard?.writeText(transcript).then(

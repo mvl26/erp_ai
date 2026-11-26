@@ -22,12 +22,13 @@ from erp_ai.constants import (
 	SKIP_PREFILLED,
 	TITLE_EVENT_FAILED,
 	TRIGGER_CHANGE_ACTION,
+	TRIGGER_SUPPORT_CHAT,
 )
 
 ENTRY_TYPE_CHANGE = "change"
 ENTRY_TYPE_BOT_ACTION = "bot_action"
 ENTRY_TYPES = ("classify", "reason", "skip", "change", "bot_action", "run_event")
-TRIGGERS = ("ticket_insert", "comment_mention", "requester_reply", "kb_draft")
+TRIGGERS = ("ticket_insert", "comment_mention", "requester_reply", "kb_draft", TRIGGER_SUPPORT_CHAT)
 CHANGE_TRIGGERS = (TRIGGER_CHANGE_ACTION,)
 TRIGGER_SETTING_SAVE = "setting_save"
 TRIGGER_SCHEDULED_JOB = "scheduled_job"
@@ -216,6 +217,8 @@ def write_entry(**fields) -> str:
 	is_change = entry_type == ENTRY_TYPE_CHANGE
 	is_bot_action = entry_type == ENTRY_TYPE_BOT_ACTION
 	is_run_event = entry_type == LOG_ENTRY_RUN_EVENT
+	# Any agent may ask the support chat, few may create ERP AI Log: its row is written for them.
+	is_support = fields.get("trigger") == TRIGGER_SUPPORT_CHAT
 	triggers = CHANGE_TRIGGERS if is_change else BOT_ACTION_TRIGGERS if is_bot_action else TRIGGERS
 	if fields.get("trigger") not in triggers:
 		raise ValueError(f"trigger must be one of {triggers}, got {fields.get('trigger')!r}")
@@ -238,7 +241,7 @@ def write_entry(**fields) -> str:
 	}
 	doc = frappe.get_doc({**values, "doctype": LOG_DOCTYPE})
 	with allow_agent_write():
-		doc.insert(ignore_permissions=is_change or is_bot_action or is_run_event)
+		doc.insert(ignore_permissions=is_change or is_bot_action or is_run_event or is_support)
 	if not frappe.flags.in_test and not is_run_event:
 		frappe.db.commit()
 	return doc.name

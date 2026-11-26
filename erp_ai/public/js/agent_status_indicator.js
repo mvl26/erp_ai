@@ -63,16 +63,41 @@ function setupForm({ doc, call, router }) {
 		const BOTTOM_SLACK_PX = 40;
 		const INDICATOR_FLOATING_STYLE = {
 			position: "fixed",
+			left: "",
+			top: "",
 			right: "24px",
 			bottom: "88px",
+			transform: "",
 			zIndex: "40",
 		};
 		const INDICATOR_DOCKED_STYLE = {
 			position: "static",
+			left: "",
+			top: "",
 			right: "",
 			bottom: "",
+			transform: "",
 			zIndex: "",
 		};
+		// Helpdesk's Miyano bot (window.miyanoBot) replaces the header action: the chat mounts in its card, the
+		// status line sits beside the bot. Without it the script keeps its header action and its own card.
+		const HOST_TOGGLE_EVENT = "miyano-bot:toggle";
+		const HOST_MOVE_EVENT = "miyano-bot:move";
+		const HOST_GAP_PX = 12;
+		const HOST_PANEL_STYLE = {
+			position: "static",
+			top: "",
+			right: "",
+			width: "auto",
+			maxHeight: "",
+			overflowY: "visible",
+			padding: "8px 0 0",
+			border: "none",
+			borderTop: "1px solid #e5e7eb",
+			borderRadius: "0",
+			boxShadow: "none",
+		};
+		const host = () => window.miyanoBot || null;
 		// The panel's look, one style element inside the panel; every rule under `.erp-ai-panel`, so nothing of
 		// Helpdesk's page changes. Button colours: blue starts work, green confirms a result, red outline refuses.
 		const PANEL_CSS = [
@@ -262,6 +287,7 @@ function setupForm({ doc, call, router }) {
 			}
 			state.nameEl.textContent = latest.name || "";
 			state.textEl.textContent = latest.text || "";
+			placeIndicatorNearHost();
 			setIndicatorVisible(el, true);
 		};
 
@@ -275,9 +301,41 @@ function setupForm({ doc, call, router }) {
 			render();
 		};
 
+		// Beside the host bot: on its left in the right half of the window, else on its right.
+		const placeIndicatorNearHost = () => {
+			const bot = host()?.launcher?.getBoundingClientRect();
+			if (!bot || !state.el || state.panel.open) {
+				return;
+			}
+			const onLeft = bot.left > window.innerWidth / 2;
+			Object.assign(state.el.style, {
+				left: onLeft ? "" : bot.right + HOST_GAP_PX + "px",
+				right: onLeft ? window.innerWidth - bot.left + HOST_GAP_PX + "px" : "",
+				top: bot.top + bot.height / 2 + "px",
+				bottom: "",
+				transform: "translateY(-50%)",
+			});
+		};
+
+		// In the host bot's card the panel is plain content; alone it is its own fixed card.
+		const mountPanel = (el) => {
+			const slot = host()?.slot;
+			if (!slot) {
+				if (el.parentElement !== document.body) {
+					document.body.appendChild(el);
+				}
+				return;
+			}
+			if (el.parentElement !== slot) {
+				slot.appendChild(el);
+			}
+			Object.assign(el.style, HOST_PANEL_STYLE);
+		};
+
 		const buildPanel = () => {
 			const panel = state.panel;
 			if (panel.el) {
+				mountPanel(panel.el);
 				return panel.el;
 			}
 			const el = document.createElement("div");
@@ -296,6 +354,10 @@ function setupForm({ doc, call, router }) {
 			closeEl.textContent = TEXT_CLOSE;
 			closeEl.addEventListener("click", () => {
 				try {
+					if (host()) {
+						host().close();
+						return;
+					}
 					closePanel();
 				} catch (e) {
 					// A panel handler must never break the ticket page (ADR-009 decision 4).
@@ -355,7 +417,7 @@ function setupForm({ doc, call, router }) {
 			formEl.append(inputEl, sendEl);
 			el.append(
 				styleEl,
-				header,
+				...(host() ? [] : [header]),
 				aiTitle,
 				aiListEl,
 				chatTitle,
@@ -366,7 +428,7 @@ function setupForm({ doc, call, router }) {
 				errorEl,
 				formEl
 			);
-			document.body.appendChild(el);
+			mountPanel(el);
 			panel.el = el;
 			panel.slotEl = slotEl;
 			panel.statusTextEl = statusTextEl;
@@ -383,6 +445,9 @@ function setupForm({ doc, call, router }) {
 			const el = ensureElement();
 			Object.assign(el.style, docked ? INDICATOR_DOCKED_STYLE : INDICATOR_FLOATING_STYLE);
 			(docked ? state.panel.slotEl : document.body).appendChild(el);
+			if (!docked) {
+				placeIndicatorNearHost();
+			}
 		};
 
 		const closePanel = () => {
@@ -969,11 +1034,17 @@ function setupForm({ doc, call, router }) {
 			return button;
 		};
 
+		// A header click flips the panel; the host bot (onHostToggle) first leaves the state its card wants in hostWants.
 		const togglePanel = () => {
 			try {
 				const panel = state.panel;
-				if (panel.open) {
+				const wanted = panel.hostWants ?? !panel.open;
+				panel.hostWants = undefined;
+				if (!wanted) {
 					closePanel();
+					return;
+				}
+				if (panel.open) {
 					return;
 				}
 				// The press of this same click, outside the open panel, has just closed it: stay closed.
@@ -997,9 +1068,34 @@ function setupForm({ doc, call, router }) {
 			}
 		};
 
+		// The host bot opened or closed its card: show or take away this ticket's chat in it.
+		const onHostToggle = (event) => {
+			try {
+				if (!state.ticket || !host()) {
+					return;
+				}
+				state.panel.hostWants = Boolean(event?.detail?.open);
+				togglePanel();
+			} catch (e) {
+				// A host event must never break the ticket page (ADR-009 decision 4).
+			}
+		};
+
+		const onHostMove = () => {
+			try {
+				placeIndicatorNearHost();
+			} catch (e) {
+				// A host event must never break the ticket page (ADR-009 decision 4).
+			}
+		};
+
 		// A press outside the open panel closes it (the panel is no dialog: the page stays usable around it).
 		const onPointerDown = (event) => {
 			try {
+				// In the host bot's card, the bot's own close button and launcher close the chat.
+				if (host()) {
+					return;
+				}
 				const panel = state.panel;
 				if (!panel.open || !panel.el || panel.el.contains(event?.target)) {
 					return;
@@ -1170,6 +1266,18 @@ function setupForm({ doc, call, router }) {
 		if (!state.resizeBound) {
 			state.resizeBound = true;
 			window.addEventListener("resize", onResize);
+		}
+		if (!state.hostBound) {
+			state.hostBound = true;
+			window.addEventListener(HOST_TOGGLE_EVENT, onHostToggle);
+			window.addEventListener(HOST_MOVE_EVENT, onHostMove);
+		}
+		if (host()) {
+			// Moved to this ticket with the bot's card already open (its open state is never stored, so not on F5).
+			if (host().isOpen()) {
+				onHostToggle({ detail: { open: true } });
+			}
+			return { actions: [] };
 		}
 		if (window.innerWidth < NARROW_SCREEN_PX) {
 			return { actions: [] };

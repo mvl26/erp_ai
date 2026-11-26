@@ -40,6 +40,8 @@ TRIGGER_COMMENT_MENTION = "comment_mention"
 TRIGGER_CHANGE_ACTION = "change_action"
 TRIGGER_REQUESTER_REPLY = "requester_reply"
 TRIGGER_KB_DRAFT = "kb_draft"
+# The user-support chat of helpdesk's Miyano bot (agent/support.py): one log row per answer, never a ticket run.
+TRIGGER_SUPPORT_CHAT = "support_chat"
 
 JOB_TIMEOUT_S = 600
 ANSWER_DELAY_MAX_S = 30
@@ -160,3 +162,6 @@ KPI_IDS = (
 	"stale_over_5_days",
 )
 TICKET_CONTENT_DOCTYPES = ("HD Ticket", "Comment", "Communication", "File")
+
+# Miyano bot badge: the Notification Type of one bot message in a ticket's chat (agent/reply_notice.py).
+BOT_REPLY_NOTIFICATION_TYPE = "Bot Reply"

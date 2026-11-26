@@ -11,6 +11,7 @@ from erp_ai.agent.policy import OPT_OUT_FIELD
 from erp_ai.agent.routing import DEFAULT_ROUTING_RULES
 from erp_ai.constants import (
 	AGENT_USER,
+	BOT_REPLY_NOTIFICATION_TYPE,
 	HELPDESK_AGENT_ROLE,
 	LOGGER_NAME,
 	ROLE_AGENT,
@@ -77,6 +78,7 @@ def ensure_setup() -> None:
 	_ensure_task_permission()
 	_ensure_article_instructor_permission()
 	_ensure_agent_status_script()
+	_ensure_bot_reply_notification_type()
 
 
 def before_uninstall() -> None:
@@ -469,6 +471,15 @@ def _ensure_article_instructor_permission() -> None:
 		}
 	).insert(ignore_permissions=True)
 	frappe.clear_cache(doctype=ARTICLE_DOCTYPE)
+
+
+def _ensure_bot_reply_notification_type() -> None:
+	"""The Notification Type of the bot reply notices (agent/reply_notice.py); created once, never changed."""
+	if frappe.db.exists("Notification Type", BOT_REPLY_NOTIFICATION_TYPE):
+		return
+	frappe.get_doc(
+		{"doctype": "Notification Type", "type_name": BOT_REPLY_NOTIFICATION_TYPE, "enabled": 1}
+	).insert(ignore_permissions=True)
 
 
 def _ensure_agent_status_script() -> None:

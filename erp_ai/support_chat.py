@@ -46,6 +46,8 @@ ASSIGNMENT_NOTICE = "Assignment"
 NOTICE_TYPES = (ASSIGNMENT_NOTICE, BOT_REPLY_NOTIFICATION_TYPE)
 MAX_NOTICE_TICKETS = 10
 MAX_NOTICE_ROWS = 50
+# The list shows only what was made from the day the notices shipped; older ones stay in the bell.
+NOTICES_SINCE = "2026-11-27 00:00:00"
 
 
 def plain_text(html: str | None) -> str:
@@ -77,7 +79,7 @@ def get_notices() -> dict:
 	_require_agent()
 	rows = frappe.get_all(
 		NOTIFICATION_LOG,
-		filters=_own_notice_filters(read=0),
+		filters=_own_notice_filters(read=0, creation=(">=", NOTICES_SINCE)),
 		fields=["type", "subject", "document_name", "creation"],
 		order_by="creation desc",
 		limit_page_length=MAX_NOTICE_ROWS,
@@ -98,20 +100,33 @@ def get_notices() -> dict:
 
 
 @frappe.whitelist(methods=["POST"])
-def mark_notices_read(ticket: str, with_bot_replies: bool | int | str = False) -> None:
+def mark_notices_read(
+	ticket: str | None = None,
+	with_bot_replies: bool | int | str = False,
+	only_bot_replies: bool | int | str = False,
+) -> None:
 	"""Mark the caller's unread notices of `ticket` read: its assignments, and its bot replies only when
-	`with_bot_replies` is true (the person has the bot's chat of that ticket in front of them).
+	`with_bot_replies` is true (the person has the bot's chat of that ticket in front of them). Without a
+	ticket it marks every notice the list shows (those made since NOTICES_SINCE). With `only_bot_replies`
+	only bot replies are marked (the person opened the bot, so its replies are seen; assignments are not).
 
 	Errors: PermissionError (not an active agent).
 	"""
 	_require_agent()
 	types = [ASSIGNMENT_NOTICE]
-	if frappe.parse_json(with_bot_replies) if isinstance(with_bot_replies, str) else with_bot_replies:
+	if _truthy(with_bot_replies):
 		types.append(BOT_REPLY_NOTIFICATION_TYPE)
+	if _truthy(only_bot_replies):
+		types = [BOT_REPLY_NOTIFICATION_TYPE]
+	extra = {"document_name": str(ticket)} if ticket else {"creation": (">=", NOTICES_SINCE)}
 	names = frappe.get_all(
 		NOTIFICATION_LOG,
-		filters={**_own_notice_filters(read=0, document_name=str(ticket)), "type": ("in", types)},
+		filters={**_own_notice_filters(read=0, **extra), "type": ("in", types)},
 		pluck="name",
 	)
 	for name in names:
 		frappe.db.set_value(NOTIFICATION_LOG, name, "read", 1, update_modified=False)
+
+
+def _truthy(value) -> bool:
+	return bool(frappe.parse_json(value) if isinstance(value, str) else value)

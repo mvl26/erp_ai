@@ -94,6 +94,9 @@ function setupForm({ doc, call, router }) {
 		const MAX_BADGE = 99;
 		const TEXT_BOT_FOR_YOU = "Dành cho bạn";
 		const TEXT_BOT_NEW = "mới";
+		const TEXT_BOT_SHOW = "Xem ▾";
+		const TEXT_BOT_HIDE = "Thu gọn ▴";
+		const TEXT_BOT_READ_ALL = "Đọc hết";
 		const TEXT_BOT_ASSIGNED = "Giao cho bạn";
 		const TEXT_BOT_REPLIED = "Bot đã trả lời";
 		const TEXT_BOT_MUTE = "Tắt tiếng";
@@ -138,7 +141,11 @@ function setupForm({ doc, call, router }) {
 			".miyano-bot-badge{position:absolute;top:-4px;right:-4px;display:flex;align-items:center;justify-content:center;min-width:20px;height:20px;padding:0 4px;border-radius:999px;background:#171717;color:#fff;font-size:12px;font-weight:500;pointer-events:none}",
 			".miyano-bot-badge[hidden]{display:none}",
 			".miyano-bot-notices{flex:none;padding:8px 12px;border-bottom:1px solid #e5e7eb}",
-			".miyano-bot-notices-title{margin-bottom:4px;font-weight:500;color:#111827}",
+			".miyano-bot-notices-head{display:flex;align-items:center;gap:8px}",
+			".miyano-bot-notices-toggle{display:flex;flex:1;align-items:center;gap:8px;padding:0;border:0;background:none;font:inherit;font-weight:500;color:#111827;text-align:left;cursor:pointer}",
+			".miyano-bot-notices-toggle-label{margin-left:auto;font-weight:400;color:#6b7280}",
+			".miyano-bot-notices-readall{flex:none;padding:0;border:0;background:none;font:inherit;font-size:12px;color:#2563eb;cursor:pointer}",
+			".miyano-bot-notice-list{margin-top:4px}",
 			".miyano-bot-notice-list{display:flex;flex-direction:column;max-height:128px;overflow-y:auto}",
 			".miyano-bot-notice{display:flex;align-items:flex-start;gap:8px;width:100%;padding:6px 8px;border:0;border-radius:6px;background:none;font:inherit;text-align:left;cursor:pointer}",
 			".miyano-bot-notice:hover{background:#f3f4f6}",
@@ -280,6 +287,11 @@ function setupForm({ doc, call, router }) {
 			noteEl: null,
 			noticesEl: null,
 			noticeListEl: null,
+			noticesToggleEl: null,
+			noticesCountEl: null,
+			noticesLabelEl: null,
+			noticesReadAllEl: null,
+			noticesOpen: false,
 			badgeEl: null,
 			soundEl: null,
 			notices: { unread: null, tickets: [] },
@@ -686,7 +698,9 @@ function setupForm({ doc, call, router }) {
 
 		const renderNotices = () => {
 			const bot = state.bot;
-			const { unread, tickets } = bot.notices;
+			const { tickets } = bot.notices;
+			// The badge never counts what the list does not show, so the two cannot disagree.
+			const unread = tickets.length === 0 ? 0 : bot.notices.unread;
 			bot.badgeEl.hidden = !(unread > 0);
 			bot.badgeEl.textContent = unread > MAX_BADGE ? MAX_BADGE + "+" : String(unread);
 			bot.launcher.setAttribute(
@@ -696,6 +710,12 @@ function setupForm({ doc, call, router }) {
 					: TEXT_BOT_LAUNCHER
 			);
 			bot.noticesEl.hidden = tickets.length === 0;
+			// Folded by default: the chat keeps the card; the list opens on a press.
+			bot.noticesCountEl.textContent = unread + " " + TEXT_BOT_NEW;
+			bot.noticesLabelEl.textContent = bot.noticesOpen ? TEXT_BOT_HIDE : TEXT_BOT_SHOW;
+			bot.noticesToggleEl.setAttribute("aria-expanded", String(bot.noticesOpen));
+			bot.noticeListEl.hidden = !bot.noticesOpen;
+			bot.noticesReadAllEl.hidden = !bot.noticesOpen;
 			const rows = tickets.map((notice) => {
 				const row = document.createElement("button");
 				row.type = "button";
@@ -744,8 +764,14 @@ function setupForm({ doc, call, router }) {
 		// The unread count after the first load only ever goes up with a new notice: that is when the chime plays.
 		const refreshNotices = () => {
 			const bot = state.bot;
+			// Only the newest request counts: an older answer still on its way must not put a stale count back.
+			bot.refreshSeq = (bot.refreshSeq || 0) + 1;
+			const seq = bot.refreshSeq;
 			const onNotices = (data) => {
 				try {
+					if (seq !== bot.refreshSeq) {
+						return;
+					}
 					const tickets = (Array.isArray(data?.tickets) ? data.tickets : [])
 						.filter((notice) => typeof notice?.ticket === "string")
 						.map((notice) => ({
@@ -773,14 +799,32 @@ function setupForm({ doc, call, router }) {
 			}
 		};
 
-		const markNoticesRead = (ticket, withBotReplies) => {
+		// The Helpdesk bell reloads on the socket's `notification` event, which the server sends only for a new
+		// notice. After notices are marked read here, run its listeners (not ours) so the bell drops them at once.
+		const refreshHelpdeskBell = () => {
+			try {
+				for (const listener of state.socket?.listeners?.("notification") || []) {
+					if (listener !== onNotification) {
+						listener();
+					}
+				}
+			} catch (e) {
+				// A widget handler must never break the page (ADR-051 decision 4).
+			}
+		};
+
+		const markNoticesRead = (ticket, withBotReplies, onlyBotReplies = false) => {
 			try {
 				state
 					.call("erp_ai.support_chat.mark_notices_read", {
 						ticket,
 						with_bot_replies: withBotReplies,
+						only_bot_replies: onlyBotReplies,
 					})
-					.then(refreshNotices, () => {});
+					.then(() => {
+						refreshNotices();
+						refreshHelpdeskBell();
+					}, refreshNotices);
 			} catch (e) {
 				// A widget handler must never break the page (ADR-051 decision 4).
 			}
@@ -799,9 +843,17 @@ function setupForm({ doc, call, router }) {
 			bot.card.hidden = !value;
 			bot.launcher.setAttribute("aria-expanded", String(value));
 			window.dispatchEvent(new CustomEvent(HOST_TOGGLE_EVENT, { detail: { open: value } }));
+			if (value) {
+				// Notices read on another tab or device show up the moment the card opens.
+				refreshNotices();
+			}
 			if (value && !state.ticket) {
 				bot.threadEl.scrollTop = bot.threadEl.scrollHeight;
 				bot.inputEl.focus({ preventScroll: true });
+			}
+			if (value && !state.ticket) {
+				// Opening the bot away from a ticket counts the bot's replies as seen; assignments stay listed.
+				markNoticesRead(null, false, true);
 			}
 			readSeenNotices();
 		};
@@ -965,12 +1017,37 @@ function setupForm({ doc, call, router }) {
 			const noticesEl = document.createElement("div");
 			noticesEl.className = "miyano-bot-notices";
 			noticesEl.hidden = true;
-			const noticesTitle = document.createElement("div");
-			noticesTitle.className = "miyano-bot-notices-title";
+			const noticesHead = document.createElement("div");
+			noticesHead.className = "miyano-bot-notices-head";
+			const noticesToggleEl = document.createElement("button");
+			noticesToggleEl.type = "button";
+			noticesToggleEl.className = "miyano-bot-notices-toggle";
+			const noticesTitle = document.createElement("span");
 			noticesTitle.textContent = TEXT_BOT_FOR_YOU;
+			const noticesCountEl = document.createElement("span");
+			noticesCountEl.className = "miyano-bot-notice-count";
+			const noticesLabelEl = document.createElement("span");
+			noticesLabelEl.className = "miyano-bot-notices-toggle-label";
+			noticesToggleEl.append(noticesTitle, noticesCountEl, noticesLabelEl);
+			noticesToggleEl.addEventListener("click", () => {
+				bot.noticesOpen = !bot.noticesOpen;
+				renderNotices();
+			});
+			const noticesReadAllEl = document.createElement("button");
+			noticesReadAllEl.type = "button";
+			noticesReadAllEl.className = "miyano-bot-notices-readall";
+			noticesReadAllEl.textContent = TEXT_BOT_READ_ALL;
+			noticesReadAllEl.hidden = true;
+			noticesReadAllEl.addEventListener("click", () => {
+				bot.notices = { unread: 0, tickets: [] };
+				renderNotices();
+				markNoticesRead(null, true);
+			});
+			noticesHead.append(noticesToggleEl, noticesReadAllEl);
 			const noticeListEl = document.createElement("div");
 			noticeListEl.className = "miyano-bot-notice-list";
-			noticesEl.append(noticesTitle, noticeListEl);
+			noticeListEl.hidden = true;
+			noticesEl.append(noticesHead, noticeListEl);
 
 			// The ticket's own chat mounts in this part (host().slot).
 			const ticketWrap = document.createElement("div");
@@ -1046,6 +1123,10 @@ function setupForm({ doc, call, router }) {
 				noteEl,
 				noticesEl,
 				noticeListEl,
+				noticesToggleEl,
+				noticesCountEl,
+				noticesLabelEl,
+				noticesReadAllEl,
 				badgeEl,
 				soundEl,
 			});
@@ -1059,6 +1140,14 @@ function setupForm({ doc, call, router }) {
 			if (!bot.resizeBound) {
 				bot.resizeBound = true;
 				window.addEventListener("resize", onBotResize);
+			}
+			if (!bot.visibleBound) {
+				bot.visibleBound = true;
+				document.addEventListener("visibilitychange", () => {
+					if (document.visibilityState === "visible") {
+						refreshNotices();
+					}
+				});
 			}
 			if (!bot.audioBound) {
 				bot.audioBound = true;
@@ -2116,6 +2205,10 @@ function setupForm({ doc, call, router }) {
 		syncBotView();
 		if (state.ticket) {
 			socket.emit("doc_subscribe", "HD Ticket", state.ticket);
+		}
+		if (ticketName !== null) {
+			// Opening a ticket counts as seeing its notices.
+			readSeenNotices();
 		}
 
 		if (state.socket !== socket) {

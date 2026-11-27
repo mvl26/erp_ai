@@ -211,6 +211,36 @@ class TestSupportChatNotices(FrappeTestCase):
 		result = self._call(support_chat.get_notices)
 		self.assertEqual(result, {"unread": 0, "tickets": []})
 
+	def test_mark_read_without_a_ticket_clears_every_listed_notice_of_the_asker(self):
+		second = make_ticket(subject="Second notice ticket")
+		self._notice(ASKER, "Assignment")
+		self._notice(ASKER, "Bot Reply", ticket=second.name)
+		self._notice(OTHER_AGENT, "Assignment")
+		older = self._notice(ASKER, "Assignment", ticket=second.name)
+		frappe.db.set_value(NOTIFICATION_LOG, older, "creation", "2026-11-26 18:51:00", update_modified=False)
+		self._call(support_chat.mark_notices_read, None, True)
+		self.assertEqual(self._call(support_chat.get_notices), {"unread": 0, "tickets": []})
+		# Another person's notice and a notice from before the list's start are left as they were.
+		self.assertEqual(frappe.db.get_value(NOTIFICATION_LOG, older, "read"), 0)
+		self.assertEqual(self._call(support_chat.get_notices, user=OTHER_AGENT)["unread"], 1)
+
+	def test_mark_read_of_bot_replies_only_leaves_assignments(self):
+		second = make_ticket(subject="Second notice ticket")
+		self._notice(ASKER, "Assignment")
+		self._notice(ASKER, "Bot Reply", ticket=second.name)
+		self._call(support_chat.mark_notices_read, None, True, True)
+		result = self._call(support_chat.get_notices)
+		self.assertEqual([(row["ticket"], row["type"]) for row in result["tickets"]], [(self.ticket.name, "Assignment")])
+
+	def test_notices_made_before_the_bot_shipped_stay_out(self):
+		old = self._notice(ASKER, "Assignment")
+		frappe.db.set_value(
+			NOTIFICATION_LOG, old, "creation", "2026-11-26 18:51:00", update_modified=False
+		)
+		self.assertEqual(self._call(support_chat.get_notices), {"unread": 0, "tickets": []})
+		self._notice(ASKER, "Bot Reply")
+		self.assertEqual(self._call(support_chat.get_notices)["unread"], 1)
+
 	def test_only_agents_read_notices(self):
 		with self.assertRaises(frappe.PermissionError):
 			self._call(support_chat.get_notices, user="Guest")

@@ -42,4 +42,6 @@ def inject_bot_loader(response=None, request=None, **_) -> None:
 		head, _sep, tail = html.rpartition(BODY_END)
 		response.set_data(head + loader_tag() + BODY_END + tail)
 	except Exception as exc:
-		frappe.log_error(TITLE_LOADER_FAILED, f"path={getattr(request, 'path', '')} error={type(exc).__name__}")
+		frappe.log_error(
+			TITLE_LOADER_FAILED, f"path={getattr(request, 'path', '')} error={type(exc).__name__}"
+		)

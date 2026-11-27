@@ -412,6 +412,7 @@ class TestTicketContentDoctype(FrappeTestCase):
 class TestPermissionSwitches(FrappeTestCase):
 	# U1 3.1: the permission switches, read in one place, in the order of the settings section.
 	# BUG-008: console joins them (sixth in the dataclass, fifth in the section, before one_click_approval).
+	# 2026-11-27: the read-only Server Script switch is the seventh, after one_click_approval.
 	FIELD_FLAGS = (
 		("unrestricted_enabled", "unrestricted"),
 		("record_tools_enabled", "record_tools"),
@@ -419,6 +420,7 @@ class TestPermissionSwitches(FrappeTestCase):
 		("code_change_enabled", "code_change"),
 		("console_enabled", "console"),
 		("one_click_approval_enabled", "one_click_approval"),
+		("server_script_read_enabled", "server_script_read"),
 	)
 
 	def setUp(self):
@@ -453,6 +455,17 @@ class TestPermissionSwitches(FrappeTestCase):
 		self.assertEqual(set(policy.SWITCH_FLAGS.values()), own)
 		self.assertEqual(policy.SWITCH_FLAGS[policy.CONSOLE_FIELD], "console")
 		self.assertEqual(policy.SWITCH_FLAGS[policy.ONE_CLICK_APPROVAL_FIELD], "one_click_approval")
+		self.assertEqual(policy.SWITCH_FLAGS[policy.SERVER_SCRIPT_READ_FIELD], "server_script_read")
+
+	def test_server_script_read_switch_reads_like_a_check(self):
+		# A Single read without meta gives "0" or "1" as text: "0" must read off, as for the console switch.
+		self.assertEqual(policy.SERVER_SCRIPT_READ_FIELD, "server_script_read_enabled")
+		for value, expected in ((None, False), (0, False), ("0", False), ("", False), (1, True), ("1", True)):
+			with self.subTest(value=value):
+				settings = frappe._dict({policy.SERVER_SCRIPT_READ_FIELD: value})
+				self.assertIs(policy.permission_switches(settings).server_script_read, expected)
+		set_agent_settings(server_script_read_enabled=1)
+		self.assertIs(policy.permission_switches(frappe.get_doc(SETTING_DOCTYPE)).server_script_read, True)
 
 	def test_each_field_maps_to_its_flag(self):
 		self.assertEqual(
@@ -478,13 +491,14 @@ class TestPermissionSwitches(FrappeTestCase):
 				).values()
 			)
 		)
-		# Read from the stored setting: record_tools and one_click_approval on, the rest off.
+		# Read from the stored setting: record_tools and one_click_approval on, the rest off. Every switch is written,
+		# never left to the shared site's live value (2026-11-27: miyano had server_script_read_enabled on).
 		set_agent_settings(
-			unrestricted_enabled=0,
-			record_tools_enabled=1,
-			act_now_enabled=0,
-			code_change_enabled=0,
-			one_click_approval_enabled=1,
+			**{
+				**dict.fromkeys(policy.PERMISSION_SWITCH_FIELDS, 0),
+				"record_tools_enabled": 1,
+				"one_click_approval_enabled": 1,
+			}
 		)
 		self.assertEqual(
 			policy.permission_switches(frappe.get_doc(SETTING_DOCTYPE)),

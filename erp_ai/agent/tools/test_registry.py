@@ -28,6 +28,7 @@ from erp_ai.test_utils import GitSandbox, keep_agent_settings
 REAL_ALL_SPECS = registry._all_specs
 AGENT_EMAIL = "erpai-test-t27.agent@example.com"
 SEED_TYPE = "ERPAI-TEST-T27 Loại"
+SEED_SCRIPT = "ERPAI-TEST-T27 script"
 FORBIDDEN_ROUTE_PARAMETER_WORDS = (
 	"assign",
 	"allocat",
@@ -373,9 +374,10 @@ class TestRegistry(FrappeTestCase):
 				("kb_draft_run", False),
 				("console", False),  # CHG-010
 				("in_conversation", False),
+				("server_script_read", False),  # 2026-11-27: the read-only Server Script tools
 			],
 		)
-		self.assertEqual(len(fields), 20)  # CHG-010: + console
+		self.assertEqual(len(fields), 21)  # CHG-010: + console; 2026-11-27: + server_script_read
 
 	def test_grant_functions_take_grant_inputs_without_default(self):
 		for function in (registry.grant, get_tool_schemas):
@@ -494,6 +496,8 @@ TOOLS_BY_MODULE = {
 	],
 	"erp_ai.agent.tools.reply": ["reply_to_requester"],
 	"erp_ai.agent.tools.kb_draft": ["create_kb_draft"],
+	# 2026-11-27: read-only Server Script tools, behind their own switch
+	"erp_ai.agent.tools.script_read": ["list_server_scripts", "get_server_script"],
 }
 
 
@@ -524,7 +528,8 @@ class TestRealToolSet(FrappeTestCase):
 		for level in ("L1", "L2", "L3"):
 			self.assertEqual(self.names(level, False), granted + KNOWLEDGE_NAMES)
 			self.assertEqual(self.names(level, True), granted + TASK_WRITE_TOOL_NAMES + KNOWLEDGE_NAMES)
-		self.assertEqual(len(registry._all_specs()), 28)  # CHG-010: + propose_console_script
+		# CHG-010: + propose_console_script; 2026-11-27: + list_server_scripts, get_server_script
+		self.assertEqual(len(registry._all_specs()), 30)
 
 	def test_tool_modules_register_exactly_the_21_tools(self):
 		# Spec Amendment 2, N-3 items 18-19: 11 base + 3 propose + 4 record + 3 full-power tools; FEAT-007 T155
@@ -535,7 +540,8 @@ class TestRealToolSet(FrappeTestCase):
 			module = importlib.import_module(module_name)
 			self.assertEqual([spec.name for spec in module.TOOLS], names, module_name)
 		expected = [name for names in TOOLS_BY_MODULE.values() for name in names]
-		self.assertEqual(len(expected), 28)  # CHG-010: + propose_console_script
+		# CHG-010: + propose_console_script; 2026-11-27: + the two Server Script read tools
+		self.assertEqual(len(expected), 30)
 		self.assertEqual([spec.name for spec in registry._all_specs()], expected)
 
 	def test_switch_on_adds_site_admin_tools_only_at_l3_with_instructor(self):
@@ -688,6 +694,17 @@ class TestRealToolsRunWithoutCommit(FrappeTestCase):
 		self.assertFalse(frappe.db.exists("HD Ticket Type", SEED_TYPE))
 		frappe.get_doc({"doctype": "HD Ticket Type", "name": SEED_TYPE}).insert()
 		self.ticket = make_ticket(subject="ERPAI-TEST-T27 phiếu", raised_by=AGENT_EMAIL).name
+		# 2026-11-27: a disabled Server Script for the read-only script tools (rolled back with the test).
+		frappe.get_doc(
+			{
+				"doctype": "Server Script",
+				"name": SEED_SCRIPT,
+				"script_type": "API",
+				"api_method": "erpai_test_t27_probe",
+				"script": "frappe.response['message'] = 1",
+				"disabled": 1,
+			}
+		).insert()
 		# Every source and file tool reads the temp repos only; the file tools may edit SANDBOX_APP.
 		sandbox = GitSandbox(self, apps=("erp_ai", SANDBOX_APP), erp_ai_worktree=None)
 		sandbox.commit_file("erp_ai", "erp_ai/agent/tools/registry.py", "class ToolSpec:\n\tpass\n")
@@ -740,6 +757,9 @@ class TestRealToolsRunWithoutCommit(FrappeTestCase):
 				"problem": "ERPAI-TEST-T27 máy in kẹt giấy khi in hóa đơn",
 				"resolution_steps": ["ERPAI-TEST-T27 lấy giấy kẹt ra"],
 			},
+			# 2026-11-27
+			"list_server_scripts": {"name_contains": "ERPAI-TEST-T27"},
+			"get_server_script": {"name": SEED_SCRIPT},
 		}
 
 	def test_every_real_handler_runs_without_committing(self):
@@ -754,6 +774,7 @@ class TestRealToolsRunWithoutCommit(FrappeTestCase):
 			allowed_apps=(SANDBOX_APP,),
 			unrestricted=True,
 			console=True,  # CHG-010
+			server_script_read=True,  # 2026-11-27
 		)
 		# FEAT-007 T155: the reply tool runs with its switch on, the KB-draft tool in its fixed row (read + kb_draft
 		# only); the knowledge read tools need seeded site settings and run in test_knowledge_read, so the real
@@ -948,6 +969,7 @@ class TestGrantTable(FrappeTestCase):
 				"site_unrestricted",
 				"requester_reply",
 				"kb_draft",
+				"script_read",  # 2026-11-27
 			],
 		)
 
@@ -1043,6 +1065,8 @@ class TestGrantInputs(FrappeTestCase):
 			"act_now": {"act_now": True},
 			"change_enabled": {"code_change": True},
 			"one_click_approval": {"one_click_approval": True},
+			"console": {"console": True},
+			"server_script_read": {"server_script_read": True},  # 2026-11-27
 		}
 		for field, switches in switch_of_field.items():
 			context = dataclasses.replace(base, **{field: True})

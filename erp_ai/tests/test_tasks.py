@@ -1671,7 +1671,17 @@ class TestPermissionSwitchAlarm(FrappeTestCase):
 		self.assertEqual(self._switch_alarms(), [(SWITCH_SUBJECT, f"{SWITCH_SUBJECT}: {label}")])
 		self.assertNotIn("Duyệt một lần bấm", self._switch_alarms()[0][1])
 
-	def test_all_six_switches_listed_in_section_order(self):
+	def test_server_script_read_alone_lists_only_its_label(self):
+		# 2026-11-27: the read-only Server Script switch is a permission switch, so the daily alarm names it.
+		set_agent_settings(**{policy.SERVER_SCRIPT_READ_FIELD: 1})
+		label = frappe.get_meta(SETTING_DOCTYPE).get_label(policy.SERVER_SCRIPT_READ_FIELD)
+
+		self.assertEqual(tasks._enabled_permission_switches(), [label])
+		tasks.check_privilege_escalation(now=RUN_AT)
+
+		self.assertEqual(self._switch_alarms(), [(SWITCH_SUBJECT, f"{SWITCH_SUBJECT}: {label}")])
+
+	def test_all_seven_switches_listed_in_section_order(self):
 		set_agent_settings(**dict.fromkeys(policy.PERMISSION_SWITCH_FIELDS, 1))
 		meta = frappe.get_meta(SETTING_DOCTYPE)
 
@@ -1679,7 +1689,8 @@ class TestPermissionSwitchAlarm(FrappeTestCase):
 			tasks._enabled_permission_switches(),
 			[meta.get_label(field) for field in policy.PERMISSION_SWITCH_FIELDS],
 		)
-		self.assertEqual(len(tasks._enabled_permission_switches()), 6)
+		# 2026-11-27: + server_script_read_enabled
+		self.assertEqual(len(tasks._enabled_permission_switches()), 7)
 
 	def test_switch_condition_is_the_fifth(self):
 		set_agent_settings(**{policy.ONE_CLICK_APPROVAL_FIELD: 1})

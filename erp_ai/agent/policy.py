@@ -350,8 +350,10 @@ RECORD_TOOLS_FIELD = "record_tools_enabled"
 ACT_NOW_FIELD = "act_now_enabled"
 ONE_CLICK_APPROVAL_FIELD = "one_click_approval_enabled"
 CONSOLE_FIELD = "console_enabled"
+SERVER_SCRIPT_READ_FIELD = "server_script_read_enabled"
 # The permission switches in the order of the settings section (section_permissions).
 # BUG-008: console is one of them: its change is logged and it is listed in the daily privilege alarm.
+# 2026-11-27: so is the read-only Server Script switch, after one_click_approval.
 PERMISSION_SWITCH_FIELDS = (
 	UNRESTRICTED_FIELD,
 	RECORD_TOOLS_FIELD,
@@ -359,6 +361,7 @@ PERMISSION_SWITCH_FIELDS = (
 	CODE_CHANGE_ENABLED_FIELD,
 	CONSOLE_FIELD,
 	ONE_CLICK_APPROVAL_FIELD,
+	SERVER_SCRIPT_READ_FIELD,
 )
 # Field -> the PermissionSwitches attribute that reads it; consumers pair by this name, never by position.
 SWITCH_FLAGS = {
@@ -368,6 +371,7 @@ SWITCH_FLAGS = {
 	CODE_CHANGE_ENABLED_FIELD: "code_change",
 	CONSOLE_FIELD: "console",
 	ONE_CLICK_APPROVAL_FIELD: "one_click_approval",
+	SERVER_SCRIPT_READ_FIELD: "server_script_read",
 }
 
 
@@ -379,6 +383,7 @@ class PermissionSwitches:
 	code_change: bool = False  # (4)
 	one_click_approval: bool = False  # (5)
 	console: bool = False  # CHG-010: bench console proposals, independent of code_change
+	server_script_read: bool = False  # 2026-11-27: the read-only Server Script tools, from L1
 
 
 def permission_switches(settings) -> PermissionSwitches:
@@ -390,6 +395,7 @@ def permission_switches(settings) -> PermissionSwitches:
 		code_change=change_settings(settings).enabled,
 		one_click_approval=bool(getattr(settings, ONE_CLICK_APPROVAL_FIELD, 0)),
 		console=bool(cint(getattr(settings, CONSOLE_FIELD, 0))),  # a Single without meta gives "0"
+		server_script_read=bool(cint(getattr(settings, SERVER_SCRIPT_READ_FIELD, 0))),
 	)
 
 

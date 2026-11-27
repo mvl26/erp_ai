@@ -153,7 +153,7 @@ PROMPT_REVISION_FIELDS = (
 
 
 def _permission_switch_fields() -> tuple:
-	"""The five permission switches in form order; the one list the notice and the log row both read (D-7)."""
+	"""The permission switches in form order; the one list the notice and the log row both read (D-7)."""
 	return policy.PERMISSION_SWITCH_FIELDS
 
 

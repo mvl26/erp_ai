@@ -163,6 +163,8 @@ class RunnerTestBase(FrappeTestCase):
 			confidence_threshold=policy.DEFAULT_CONFIDENCE_THRESHOLD,
 			# learning off: no lesson of the shared site reaches a request (NFR-7); TestRunnerLessons turns it on
 			lessons_enabled=0,
+			# 2026-11-27: the Server Script read tools stay out of every offered tool list unless a test opens them
+			server_script_read_enabled=0,
 		)
 		# No status signal reaches Redis and no run sleeps for real (the delay is 0 here; a test that sets one reads `sleeps`).
 		self.signals = record_status_signals(self)
@@ -3794,6 +3796,69 @@ def logged(logger, prefix):
 	return [
 		call.args for call in logger.info.call_args_list if call.args and str(call.args[0]).startswith(prefix)
 	]
+
+
+class TestRunnerServerScriptRead(RunnerTestBase):
+	"""2026-11-27: the run's context carries server_script_read_enabled; each Server Script read is in the turn's
+	`tools_called` of ERP AI Log, and what reaches the model has the script's secrets masked."""
+
+	SCRIPT = f"{PREFIX}server script"
+	SECRET = "sk-" + "runnerSecret0123456789"
+
+	def setUp(self):
+		super().setUp()
+		set_agent_settings(permission_level="L1", server_script_read_enabled=1)
+		frappe.get_doc(
+			{
+				"doctype": "Server Script",
+				"name": self.SCRIPT,
+				"script_type": "API",
+				"api_method": "erpai_test_runner_probe",
+				"script": f'api_key = "{self.SECRET}"\nfrappe.response["message"] = 1',
+				"disabled": 1,
+			}
+		).insert()
+
+	def _offered(self, call):
+		return [tool["name"] for tool in call["tools"]]
+
+	def test_switch_on_offers_the_tools_and_logs_each_read(self):
+		self.gateway.results = [
+			tool_turn(
+				tool_use("toolu_1", "list_server_scripts", name_contains=PREFIX),
+				tool_use("toolu_2", "get_server_script", name=self.SCRIPT),
+			),
+			make_model_result(),
+		]
+		self._run("comment_mention")
+
+		self.assertLessEqual(
+			{"list_server_scripts", "get_server_script"}, set(self._offered(self.gateway.calls[0]))
+		)
+		first, _second = self._entries(entry_type="reason")
+		self.assertEqual(json.loads(first.tools_called), ["list_server_scripts", "get_server_script"])
+		results = self.gateway.calls[1]["messages"][2]["content"]
+		listed, read_back = (json.loads(block["content"]) for block in results)
+		self.assertEqual([row["name"] for row in listed["server_scripts"]], [self.SCRIPT])
+		self.assertTrue(read_back["ok"], read_back)
+		self.assertIn(MASK, read_back["server_script"]["script"])
+		self.assertNotIn(self.SECRET, json.dumps(self.gateway.calls[1]["messages"], ensure_ascii=False))
+		self.assertNotIn(self.SECRET, first.tools_called + (first.actions or ""))
+
+	def test_switch_off_offers_no_script_tool_and_refuses_the_call(self):
+		set_agent_settings(server_script_read_enabled=0)
+		self.gateway.results = [
+			tool_turn(tool_use("toolu_1", "get_server_script", name=self.SCRIPT)),
+			make_model_result(),
+		]
+		self._run("comment_mention")
+
+		self.assertFalse(
+			{"list_server_scripts", "get_server_script"} & set(self._offered(self.gateway.calls[0]))
+		)
+		result = json.loads(self.gateway.calls[1]["messages"][2]["content"][0]["content"])
+		self.assertEqual(result, {"ok": False, "reason": "tool không được cấp ở mức/thẩm quyền hiện tại"})
+		self.assertNotIn(self.SECRET, json.dumps(self.gateway.calls[1]["messages"], ensure_ascii=False))
 
 
 class TestClassifyLatency(RunnerTestBase):

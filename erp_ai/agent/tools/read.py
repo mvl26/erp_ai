@@ -3,8 +3,9 @@ from frappe.utils import get_fullname
 
 from erp_ai.agent import authority, policy, prompts, site_facts
 from erp_ai.agent.labels import parse_tags
-from erp_ai.agent.tools.registry import ToolContext, ToolSpec
-from erp_ai.constants import AGENT_USER
+from erp_ai.agent.server_script_read import SERVER_SCRIPT_DOCTYPE
+from erp_ai.agent.tools.registry import ToolContext, ToolSpec, grant
+from erp_ai.constants import AGENT_USER, SETTING_DOCTYPE
 
 AI_MODULE = "ERP AI agent"
 DENIED_DOCTYPES = frozenset(
@@ -48,6 +49,11 @@ SEARCH_RESULT_FIELDS = (
 	"resolution_details",
 )
 MAX_DOCTYPE_ECHO = 80
+# 2026-11-27: Server Script is never read by get_record; with its switch on the script_read tools read it.
+SCRIPT_READ_TOOL = "get_server_script"
+SCRIPT_TOOLS_REASON = (
+	f"Server Script đọc bằng {SCRIPT_READ_TOOL} (tìm bằng list_server_scripts), không qua get_record"
+)
 
 
 def _refuse(reason: str) -> dict:
@@ -189,6 +195,19 @@ def _password_fieldnames(doctype: str) -> set:
 	return {df.fieldname for df in frappe.get_meta(doctype).fields if df.fieldtype == "Password"}
 
 
+def _server_script_refusal(ctx: ToolContext) -> dict:
+	"""The refusal says how a Server Script is read: by its tools when this run has them, or that their switch is off."""
+	if SCRIPT_READ_TOOL in grant(ctx.grant_inputs()).names():
+		return _refuse(SCRIPT_TOOLS_REASON)
+	if ctx.server_script_read:
+		# the switch is on but this run is not given the tools (below the threshold, a KB-draft run)
+		return _refuse(f"DocType {SERVER_SCRIPT_DOCTYPE} chưa được mở")
+	label = frappe.get_meta(SETTING_DOCTYPE).get_label(policy.SERVER_SCRIPT_READ_FIELD)
+	return _refuse(
+		f'DocType {SERVER_SCRIPT_DOCTYPE} chưa được mở (công tắc "{label}" của ERP AI Setting đang tắt)'
+	)
+
+
 def get_record(args: dict, ctx: ToolContext) -> dict:
 	args = args if isinstance(args, dict) else {}
 	doctype, name = args.get("doctype"), args.get("name")
@@ -196,6 +215,8 @@ def get_record(args: dict, ctx: ToolContext) -> dict:
 		return _refuse("thiếu doctype hoặc name")
 	if doctype in denied_doctypes():
 		return _refuse(f"DocType {doctype[:MAX_DOCTYPE_ECHO]} bị cấm")
+	if doctype == SERVER_SCRIPT_DOCTYPE:
+		return _server_script_refusal(ctx)
 	if doctype not in ALLOWED_READ_DOCTYPES:
 		return _refuse(f"DocType {doctype[:MAX_DOCTYPE_ECHO]} chưa được mở")
 	if not frappe.db.exists(doctype, name):

@@ -1,3 +1,4 @@
+import dataclasses
 import uuid
 from unittest.mock import patch
 
@@ -320,6 +321,27 @@ class TestReadTools(FrappeTestCase):
 			read.ALLOWED_READ_DOCTYPES,
 			{"HD Ticket", "Comment", "HD Team", "HD Ticket Type", "HD Ticket Priority", "HD Article"},
 		)
+
+	def test_get_record_server_script_points_at_its_switch_or_tool(self):
+		# 2026-11-27: Server Script stays outside get_record; the refusal says how the bot can read it instead.
+		label = frappe.get_meta("ERP AI Setting").get_label("server_script_read_enabled")
+		off = read.get_record({"doctype": "Server Script", "name": "x"}, _ctx(self.ticket))
+		self.assertFalse(off["ok"])
+		self.assertIn("chưa được mở", off["reason"])
+		self.assertIn(label, off["reason"])
+		self.assertNotIn("get_server_script", off["reason"])
+		on_ctx = dataclasses.replace(_ctx(self.ticket), server_script_read=True)
+		on = read.get_record({"doctype": "Server Script", "name": "x"}, on_ctx)
+		self.assertFalse(on["ok"])
+		self.assertIn("get_server_script", on["reason"])
+		# switch on but the run has no script tool (below the threshold, a KB-draft run): no tool is named
+		for fields in ({"below_threshold": True}, {"kb_draft_run": True}):
+			with self.subTest(fields):
+				closed = read.get_record(
+					{"doctype": "Server Script", "name": "x"}, dataclasses.replace(on_ctx, **fields)
+				)
+				self.assertEqual(closed, {"ok": False, "reason": "DocType Server Script chưa được mở"})
+		self.assertNotIn("Server Script", read.ALLOWED_READ_DOCTYPES)
 
 	def test_get_record_returns_allowed_record(self):
 		result = read.get_record({"doctype": "HD Ticket", "name": self.ticket}, _ctx(self.ticket))

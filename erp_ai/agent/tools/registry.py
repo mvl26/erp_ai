@@ -46,6 +46,7 @@ class ToolContext:
 	# True when a message of the ticket's conversation started the run: when the guidance comment takes the run's
 	# answer, the run still answers there (CHG-003 Amendment 3).
 	in_conversation: bool = False
+	server_script_read: bool = False  # 2026-11-27: the read-only Server Script tools
 
 	def grant_inputs(self) -> GrantInputs:
 		switches = PermissionSwitches(
@@ -55,6 +56,7 @@ class ToolContext:
 			code_change=self.change_enabled,
 			one_click_approval=self.one_click_approval,
 			console=self.console,
+			server_script_read=self.server_script_read,
 		)
 		return GrantInputs(
 			effective_level=self.effective_level,
@@ -81,6 +83,7 @@ class ToolSpec:
 		"requester_reply",
 		"kb_draft",
 		"console_propose",
+		"script_read",
 	]
 	schema: dict
 	handler: Callable[[dict, ToolContext], dict]
@@ -113,6 +116,7 @@ TOOL_MODULES = (
 	"erp_ai.agent.tools.knowledge_read",
 	"erp_ai.agent.tools.reply",
 	"erp_ai.agent.tools.kb_draft",
+	"erp_ai.agent.tools.script_read",
 )
 SAVEPOINT = "erp_ai_tool"
 # MariaDB ER_SP_DOES_NOT_EXIST: a COMMIT inside a tool (Frappe's own in `updatedb` when a Custom Field is saved, a
@@ -125,6 +129,7 @@ UNRESTRICTED_GROUP = "site_unrestricted"
 REPLY_GROUP = "requester_reply"
 KB_DRAFT_GROUP = "kb_draft"
 CONSOLE_GROUP = "console_propose"
+SCRIPT_READ_GROUP = "script_read"
 # The only tools left below the confidence threshold, each while its group is granted above it (U1.md:158,
 # U6b-fixes Sửa 12).
 ASK_TOOL_NAMES = frozenset({"post_comment", "reply_to_requester"})
@@ -188,6 +193,15 @@ GRANT_TABLE = (
 		lambda inputs: inputs.reply_enabled and not inputs.kb_draft_run and not inputs.below_threshold,
 	),
 	(KB_DRAFT_GROUP, lambda inputs: inputs.kb_draft_run),
+	# 2026-11-27: read only, so like `read` it needs no instructor and stays over budget; its own switch. Not below the
+	# threshold: that run only asks one question (ASK_ONLY_BLOCK) and keeps the read group and the ask tools; never in
+	# a KB-draft run (that row is fixed).
+	(
+		SCRIPT_READ_GROUP,
+		lambda inputs: inputs.switches.server_script_read
+		and not inputs.below_threshold
+		and not inputs.kb_draft_run,
+	),
 )
 
 

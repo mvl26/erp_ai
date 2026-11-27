@@ -47,6 +47,38 @@ SELF_MANAGED_FIELDS = (
 	"spent_month_usd",
 )
 DATETIME_FIELDS = ("paused_until", "limit_reset_at", "last_success_at")
+# 2026-11-27 layout: the form has tabs and two columns. A Column or Tab Break only places fields on the screen.
+LAYOUT_BREAKS = ("Column Break", "Tab Break")
+
+
+def _form_order(fields=None):
+	"""The setting's data fields and Section Breaks in form order, Column and Tab Breaks left out.
+
+	`fields` is the meta's fields (the default) or the "fields" list of the DocType JSON."""
+	fields = frappe.get_meta(SETTING_DOCTYPE).fields if fields is None else fields
+	return [field.get("fieldname") for field in fields if field.get("fieldtype") not in LAYOUT_BREAKS]
+
+
+def _data_order(fields=None):
+	"""The setting's data fields in form order, every break left out."""
+	fields = frappe.get_meta(SETTING_DOCTYPE).fields if fields is None else fields
+	return [
+		field.get("fieldname")
+		for field in fields
+		if field.get("fieldtype") not in (*LAYOUT_BREAKS, "Section Break")
+	]
+
+
+def _section_of(fieldname, fields=None):
+	"""The Section Break `fieldname` sits under, None when no field has that name."""
+	fields = frappe.get_meta(SETTING_DOCTYPE).fields if fields is None else fields
+	section = None
+	for field in fields:
+		if field.get("fieldtype") == "Section Break":
+			section = field.get("fieldname")
+		elif field.get("fieldname") == fieldname:
+			return section
+	return None
 
 
 def _settings_with_keys(*labels):
@@ -294,11 +326,14 @@ class TestERPAISetting(FrappeTestCase):
 			with self.subTest(fieldname=fieldname):
 				self.assertEqual(meta.get_field(fieldname).fieldtype, "Int")
 				self.assertEqual(meta.get_field(fieldname).default, default)
-		order = [field.fieldname for field in meta.fields]
+		# 2026-11-27: the indicator and its two delays open the right column of section_model.
+		order = _form_order(meta.fields)
 		after = order.index("trigger_keyword")
 		self.assertEqual(
 			order[after + 1 : after + 4], ["thinking_text", "answer_delay_min_s", "answer_delay_max_s"]
 		)
+		for fieldname in ("trigger_keyword", "thinking_text", "answer_delay_min_s", "answer_delay_max_s"):
+			self.assertEqual(_section_of(fieldname, meta.fields), "section_model", fieldname)
 
 	def test_status_fields_rejections(self):
 		min_msg = "Trễ trả lời tối thiểu phải từ 0 đến 30"
@@ -403,6 +438,25 @@ class TestRoutingRules(FrappeTestCase):
 		order = [f.fieldname for f in meta.fields]
 		self.assertGreater(order.index("auto_assign_enabled"), order.index("section_routing"))
 		self.assertGreater(order.index("routing_rules"), order.index("section_routing"))
+		# 2026-11-27: the routing block is split into labelled sections that follow section_routing in its tab.
+		self.assertEqual(_section_of("auto_assign_enabled", meta.fields), "section_assignment")
+		self.assertEqual(_section_of("routing_rules", meta.fields), "section_routing_rules")
+		form = _form_order(meta.fields)
+		self.assertEqual(
+			form[form.index("section_routing") : form.index("section_ticket_fields")],
+			[
+				"section_routing",
+				"excluded_teams",
+				"excluded_title_prefixes",
+				"category_mapping",
+				"section_assignment",
+				"auto_assign_enabled",
+				"tag_assignees",
+				"section_routing_rules",
+				"routing_rules",
+				"default_assignee",
+			],
+		)
 		switch = meta.get_field("auto_assign_enabled")
 		self.assertEqual(switch.fieldtype, "Check")
 		self.assertEqual(str(switch.default), "0")
@@ -815,13 +869,14 @@ class TestFeat007Defaults(FrappeTestCase):
 
 	def test_level_caps_default(self):
 		meta = frappe.get_meta(SETTING_DOCTYPE)
-		order = [field.fieldname for field in meta.fields]
+		# 2026-11-27: caps A-C left, D-F right; the threshold and the streak follow in their own section.
+		order = _form_order(meta.fields)
 		self.assertIn("section_autonomy", order, "ERP AI Setting has no section_autonomy")
 		start = order.index("section_autonomy") + 1
 		self.assertEqual(
-			order[start : start + 8],
+			order[start : start + 10],
 			[fieldname for fieldname, _default in LEVEL_CAP_DEFAULTS]
-			+ ["confidence_threshold", "auto_approve_streak"],
+			+ ["section_confidence", "confidence_threshold", "auto_approve_streak", "section_catalog"],
 		)
 		for fieldname, default in LEVEL_CAP_DEFAULTS:
 			with self.subTest(fieldname=fieldname):
@@ -846,11 +901,36 @@ class TestFeat007Defaults(FrappeTestCase):
 		# design.md:108: section 12 follows the knowledge section; design.md:138-149: the field types; the two
 		# watermarks are read-only; design.md:189-197: the KPI targets default.
 		meta = frappe.get_meta(SETTING_DOCTYPE)
-		order = [field.fieldname for field in meta.fields]
+		# 2026-11-27: the operations block opens the tab "Báo cáo & cảnh báo", after the lessons that close the
+		# knowledge tab; its twelve fields keep their order across five labelled sections.
+		order = _form_order(meta.fields)
 		self.assertIn("section_operations", order, "ERP AI Setting has no section_operations")
 		start = order.index("section_operations")
-		self.assertEqual(order[start - 1], "report_row_limit")
-		self.assertEqual(order[start + 1 : start + 13], list(OPERATIONS_SECTION))
+		self.assertEqual(order[start - 1], "lesson_teach_marker")
+		block = order[start + 1 : start + 18]
+		self.assertEqual(
+			block,
+			[
+				"coo_report_recipients",
+				"daily_report_weekends",
+				"section_review",
+				"monthly_reviewers",
+				"review_sample_size",
+				"section_reminders",
+				"d_ticket_watcher",
+				"due_reminder_hours",
+				"ba_note_due_hours",
+				"task_due_days",
+				"max_tasks_per_run",
+				"section_kpi",
+				"kpi_targets",
+				"section_report_marks",
+				"daily_report_sent_on",
+				"budget_alert_sent_month",
+				"section_alerts",
+			],
+		)
+		self.assertEqual([name for name in block if name in OPERATIONS_SECTION], list(OPERATIONS_SECTION))
 		self.assertEqual(
 			{fieldname: meta.get_field(fieldname).fieldtype for fieldname in OPERATIONS_SECTION},
 			OPERATIONS_SECTION,
@@ -927,6 +1007,8 @@ PERMISSION_SWITCHES = (
 	"code_change_enabled",
 	"console_enabled",
 	"one_click_approval_enabled",
+	# 2026-11-27: read-only Server Script access for the bot.
+	"server_script_read_enabled",
 )
 NOTICE_TITLE = "Đã bật quyền mở rộng"
 
@@ -951,7 +1033,7 @@ class TestPermissionSwitchNotice(FrappeTestCase):
 
 	def test_each_switch_on_shows_name_consequence_environment(self):
 		meta = frappe.get_meta(SETTING_DOCTYPE)
-		for environment, fieldname in zip(("test", "production") * 3, PERMISSION_SWITCHES, strict=False):
+		for environment, fieldname in zip(("test", "production") * 4, PERMISSION_SWITCHES, strict=False):
 			with self.subTest(fieldname=fieldname):
 				self._save({name: 0 for name in PERMISSION_SWITCHES})
 				msgprint = self._save({fieldname: 1, "site_environment": environment})
@@ -1738,11 +1820,13 @@ class TestTicketFieldNames(FrappeTestCase):
 		# design.md:104-106, 127-128: one Data field per name and the board value, in this order, after routing;
 		# D-19: the excluded title prefixes sit right after excluded_teams.
 		meta = frappe.get_meta(SETTING_DOCTYPE)
-		order = [field.fieldname for field in meta.fields]
+		# 2026-11-27: two columns of four; the section closes the tab "Phiếu & định tuyến", right after the routing
+		# block (default_assignee is its last field), and the knowledge tab follows.
+		order = _form_order(meta.fields)
 		self.assertIn("section_ticket_fields", order, "ERP AI Setting has no section_ticket_fields")
 		start = order.index("section_ticket_fields")
-		self.assertEqual(order[start : start + 10], [*TICKET_FIELD_SECTION, "section_code_change"])
-		self.assertLess(order.index("prompt_digest"), start)
+		self.assertEqual(order[start : start + 10], [*TICKET_FIELD_SECTION, "section_knowledge"])
+		self.assertEqual(order[start - 1], "default_assignee")
 		for fieldname in TICKET_FIELD_SECTION[1:]:
 			with self.subTest(fieldname=fieldname):
 				self.assertEqual(meta.get_field(fieldname).fieldtype, "Data")
@@ -1891,11 +1975,18 @@ class TestManualsDir(FrappeTestCase):
 	def test_section_and_field_shape(self):
 		# design.md:107: section 11 follows the code-change block; design.md:131-137: the field types.
 		meta = frappe.get_meta(SETTING_DOCTYPE)
-		order = [field.fieldname for field in meta.fields]
+		# 2026-11-27: the knowledge block opens the tab "Trả lời & tri thức", after the ticket field names; the
+		# report list (a wide field) and its row limit go on in their own section.
+		order = _form_order(meta.fields)
 		self.assertIn("section_knowledge", order, "ERP AI Setting has no section_knowledge")
 		start = order.index("section_knowledge")
-		self.assertEqual(order[start - 1], "code_change_apps")
-		self.assertEqual(order[start + 1 : start + 10], list(KNOWLEDGE_SECTION))
+		self.assertEqual(order[start - 1], "field_serial_no")
+		block = order[start + 1 : start + 12]
+		self.assertEqual(
+			block,
+			[*list(KNOWLEDGE_SECTION)[:7], "section_reports", *list(KNOWLEDGE_SECTION)[7:], "section_digest"],
+		)
+		self.assertEqual([name for name in block if name in KNOWLEDGE_SECTION], list(KNOWLEDGE_SECTION))
 		self.assertEqual(
 			{fieldname: meta.get_field(fieldname).fieldtype for fieldname in KNOWLEDGE_SECTION},
 			KNOWLEDGE_SECTION,
@@ -2376,7 +2467,8 @@ class TestSelfManagedFeat007(FrappeTestCase):
 		field = meta.get_field("agent_enabled_at")
 		self.assertIsNotNone(field, "ERP AI Setting has no agent_enabled_at field")
 		self.assertEqual((field.fieldtype, field.read_only, field.default), ("Datetime", 1, None))
-		order = [field.fieldname for field in meta.fields]
+		# 2026-11-27: agent_enabled_at sits in the right column; a Column Break is layout only.
+		order = _form_order(meta.fields)
 		self.assertEqual(
 			order[order.index("section_activation") : order.index("section_permissions")],
 			["section_activation", "enabled", "permission_level", "agent_enabled_at"],
@@ -2553,16 +2645,16 @@ class TestPromptOverrides(FrappeTestCase):
 		# design.md:109, 150-151, 227: section 13 between the operations block and section_alerts; three Long
 		# Text overrides and the read-only history table; every column of the child DocType is read-only.
 		meta = frappe.get_meta(SETTING_DOCTYPE)
-		order = [field.fieldname for field in meta.fields]
+		# 2026-11-27: the prompts close the form, in the tab "Nâng cao" after the app list of section_code_change.
+		order = _form_order(meta.fields)
 		self.assertIn("section_prompts", order, "ERP AI Setting has no section_prompts")
 		start = order.index("section_prompts")
-		self.assertEqual(order[start - 1], "budget_alert_sent_month")
+		self.assertEqual(order[start - 2 : start], ["section_code_change", "code_change_apps"])
 		self.assertEqual(
-			order[start + 1 : start + 6],
+			order[start + 1 :],
 			[
 				*(fieldname for fieldname, *_rest in PROMPT_PARTS.values()),
 				"prompt_revisions",
-				"section_alerts",
 			],
 		)
 		for fieldname, *_rest in PROMPT_PARTS.values():
@@ -2945,9 +3037,13 @@ class TestTagAssignees(FrappeTestCase):
 		self.assertEqual((fields["assignee"]["options"], fields["assignee"].get("reqd", 0)), ("HD Agent", 0))
 		self.assertEqual(fields["category"]["options"], "\nA\nB\nC\nD\nE\nF")
 		setting = json.loads(SETTING_JSON.read_text(encoding="utf-8"))
-		order = setting["field_order"]
+		# 2026-11-27: the switch and the table share section_assignment; the routing rules open the next section.
+		order = _data_order(setting["fields"])
 		self.assertEqual(order.index("tag_assignees"), order.index("auto_assign_enabled") + 1)
 		self.assertEqual(order.index("routing_rules"), order.index("tag_assignees") + 1)
+		self.assertEqual(_section_of("auto_assign_enabled", setting["fields"]), "section_assignment")
+		self.assertEqual(_section_of("tag_assignees", setting["fields"]), "section_assignment")
+		self.assertEqual(_section_of("routing_rules", setting["fields"]), "section_routing_rules")
 		(field,) = [f for f in setting["fields"] if f["fieldname"] == "tag_assignees"]
 		self.assertEqual(
 			(field["fieldtype"], field["options"], field["label"]),

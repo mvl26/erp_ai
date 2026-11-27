@@ -23,9 +23,10 @@ VIETNAMESE_ACCENTS = re.compile(
 DOCTYPE_CONFIG = {
 	"ERP AI Setting": {
 		"folder": "erp_ai_setting",
+		# 2026-11-27 server_script_read_enabled (+1);
 		# CHG-015: default_assignee (+1); CHG-011: tag_assignees (+1); CHG-010: console_enabled (+1); FEAT-008: lessons_enabled,
 		# lessons_max_per_request, lessons_max_chars, lesson_teach_marker (+4); base 77
-		"field_count": 84,
+		"field_count": 85,
 		"phrases": {
 			"enabled": ("Tắt", "4 đơn giá", "từ khóa kích hoạt"),
 			# FEAT-007 spec-addendum-3.md:88 (T64): from L2 up, ERP writes go through a proposal or a `Tự làm` row.
@@ -78,6 +79,8 @@ DOCTYPE_CONFIG = {
 				"chuyển tiếp",
 				"liên kết cũ",
 			),
+			# 2026-11-27: the seventh permission switch, read-only access to Server Script.
+			"server_script_read_enabled": ("chỉ đọc", "không sửa", "che", "Log"),
 			"console_enabled": (
 				"bench console",
 				"ERP AI Instructor",
@@ -86,10 +89,9 @@ DOCTYPE_CONFIG = {
 				"không hoàn tác được",
 			),
 			"site_environment": ("production", "site test", "không bị chặn"),
-			**{
-				f"level_cap_{category}": ("Mức quyền", "năm quyền mở rộng", "chưa biết")
-				for category in "abcdef"
-			},
+			# 2026-11-27: the caps still never apply to the permission switches; there are seven switches now, so
+			# the phrase drops the count "năm" (FORBIDDEN_PHRASES keeps the old count out).
+			**{f"level_cap_{category}": ("Mức quyền", "quyền mở rộng", "chưa biết") for category in "abcdef"},
 			"confidence_threshold": ("từ 0 đến 100", "chỉ đăng một comment hỏi", "Làm luôn"),
 			"auto_approve_streak": ("từ 1 đến 100", "Tự làm", "đếm lại từ 0"),
 			# FEAT-007 spec-addendum-4.md AC-29 (T64): no row = proposal awaiting approval; "Đổi trường" and
@@ -243,7 +245,8 @@ DOCTYPE_CONFIG = {
 				"bị bỏ qua",
 			),
 		},
-		"section_count": 15,
+		# 2026-11-27 layout: the 15 sections keep their fieldnames; 10 new ones split the long or mixed ones.
+		"section_count": 25,
 		"read_only_fields": (
 			"spent_this_month_usd",
 			"agent_enabled_at",
@@ -252,22 +255,33 @@ DOCTYPE_CONFIG = {
 			"prompt_revisions",
 			"privilege_alert_checked_until",
 		),
+		# In form order (SETTING_LAYOUT gives the tab and the columns of each).
 		"sections": (
-			("section_activation", "Bật và mức quyền", "enabled"),
-			("section_permissions", "Năm quyền mở rộng (mặc định tắt)", "unrestricted_enabled"),
-			("section_autonomy", "Mức tự chủ theo đầu mục và độ tin cậy", "level_cap_a"),
-			("section_catalog", "Danh mục trắng", "catalog_rules"),
+			("section_activation", "Bật agent và mức quyền", "enabled"),
+			("section_permissions", "Quyền mở rộng (mặc định tắt)", "unrestricted_enabled"),
+			("section_autonomy", "Mức tối đa theo đầu mục", "level_cap_a"),
+			("section_confidence", "Ngưỡng độ tin cậy và Tự làm", "confidence_threshold"),
+			("section_catalog", "Danh mục trắng và mẫu tài khoản", "catalog_rules"),
+			("section_model", "Model, từ khóa và chỉ báo trả lời", "model_classify_default"),
+			("section_credentials", "Khóa API", "credentials"),
 			("section_limits", "Giới hạn mỗi lần chạy", "max_turns_per_run"),
 			("section_budget", "Ngân sách và đơn giá", "monthly_budget_usd"),
-			("section_model", "Model, từ khóa và chỉ báo trả lời", "model_classify_default"),
-			("section_routing", "Phân loại và nhóm loại trừ", "excluded_teams"),
-			("section_ticket_fields", "Trường sẵn có của phiếu", "field_ticket_nature"),
-			("section_code_change", "Sửa code và lệnh bench", "code_change_apps"),
+			("section_routing", "Phiếu bỏ qua và ánh xạ đầu mục", "excluded_teams"),
+			("section_assignment", "Tự gán người và bảng tag", "auto_assign_enabled"),
+			("section_routing_rules", "Quy tắc định tuyến và người nhận mặc định", "routing_rules"),
+			("section_ticket_fields", "Tên trường có sẵn trên phiếu", "field_ticket_nature"),
 			("section_knowledge", "Trả lời, đóng phiếu và tri thức", "reply_enabled"),
-			("section_operations", "Báo cáo và vận hành", "coo_report_recipients"),
-			("section_prompts", "Ghi đè prompt", "prompt_override_classify"),
-			("section_alerts", "Cảnh báo và khóa API", "alert_recipients"),
+			("section_reports", "Báo cáo bot được chạy", "allowed_reports"),
+			("section_digest", "Trích yếu HDSD", "prompt_digest"),
 			("section_lessons", "Bài học của bot", "lessons_enabled"),
+			("section_operations", "Báo cáo 08:00 hằng ngày", "coo_report_recipients"),
+			("section_review", "Rà soát tháng", "monthly_reviewers"),
+			("section_reminders", "Theo dõi và nhắc hạn", "d_ticket_watcher"),
+			("section_kpi", "Mục tiêu KPI", "kpi_targets"),
+			("section_report_marks", "Mốc gửi do hệ thống ghi", "daily_report_sent_on"),
+			("section_alerts", "Người nhận cảnh báo", "alert_recipients"),
+			("section_code_change", "App được phép sửa code", "code_change_apps"),
+			("section_prompts", "Ghi đè prompt", "prompt_override_classify"),
 		),
 	},
 	"ERP AI Credential": {
@@ -722,6 +736,169 @@ CONSOLE_FIELD_SPEC = {
 	"Script chạy với quyền Administrator.",
 }
 
+# 2026-11-27 layout (docs/superpowers/specs/2026-11-27-erp-ai-setting-layout-design.md): the form of ERP AI Setting
+# as tab -> section -> columns, every column its data fields in form order. A section of short fields has a left and
+# a right column; a section with a wide field has one.
+SETTING_LAYOUT = (
+	(
+		"tab_activation",
+		"Kích hoạt & quyền",
+		(
+			("section_activation", (("enabled", "permission_level"), ("agent_enabled_at",))),
+			(
+				"section_permissions",
+				(
+					(
+						"unrestricted_enabled",
+						"record_tools_enabled",
+						"act_now_enabled",
+						"code_change_enabled",
+					),
+					(
+						"console_enabled",
+						"one_click_approval_enabled",
+						"server_script_read_enabled",
+						"site_environment",
+					),
+				),
+			),
+		),
+	),
+	(
+		"tab_autonomy",
+		"Mức tự chủ",
+		(
+			(
+				"section_autonomy",
+				(
+					("level_cap_a", "level_cap_b", "level_cap_c"),
+					("level_cap_d", "level_cap_e", "level_cap_f"),
+				),
+			),
+			("section_confidence", (("confidence_threshold",), ("auto_approve_streak",))),
+			("section_catalog", (("catalog_rules", "user_templates"),)),
+		),
+	),
+	(
+		"tab_model",
+		"Model & chi phí",
+		(
+			(
+				"section_model",
+				(
+					("model_classify_default", "trigger_keyword"),
+					("thinking_text", "answer_delay_min_s", "answer_delay_max_s"),
+				),
+			),
+			("section_credentials", (("credentials",),)),
+			(
+				"section_limits",
+				(
+					("max_turns_per_run", "max_runs_per_ticket_per_day"),
+					("max_keys_per_call", "request_timeout_s"),
+				),
+			),
+			(
+				"section_budget",
+				(
+					("monthly_budget_usd", "spent_this_month_usd"),
+					(
+						"price_input_per_mtok",
+						"price_cache_write_per_mtok",
+						"price_cache_read_per_mtok",
+						"price_output_per_mtok",
+					),
+				),
+			),
+		),
+	),
+	(
+		"tab_routing",
+		"Phiếu & định tuyến",
+		(
+			("section_routing", (("excluded_teams", "excluded_title_prefixes", "category_mapping"),)),
+			("section_assignment", (("auto_assign_enabled", "tag_assignees"),)),
+			("section_routing_rules", (("routing_rules", "default_assignee"),)),
+			(
+				"section_ticket_fields",
+				(
+					("field_ticket_nature", "field_erp_module", "field_origin", "origin_board_value"),
+					("field_due_date", "field_project", "field_item_code", "field_serial_no"),
+				),
+			),
+		),
+	),
+	(
+		"tab_knowledge",
+		"Trả lời & tri thức",
+		(
+			(
+				"section_knowledge",
+				(
+					(
+						"reply_enabled",
+						"resolve_on_tasks_done_enabled",
+						"close_silent_f_enabled",
+						"close_silent_f_days",
+					),
+					("kb_draft_enabled", "knowledge_search_limit", "manuals_dir"),
+				),
+			),
+			("section_reports", (("allowed_reports", "report_row_limit"),)),
+			("section_digest", (("prompt_digest",),)),
+			(
+				"section_lessons",
+				(
+					("lessons_enabled",),
+					("lessons_max_per_request", "lessons_max_chars", "lesson_teach_marker"),
+				),
+			),
+		),
+	),
+	(
+		"tab_reports",
+		"Báo cáo & cảnh báo",
+		(
+			("section_operations", (("coo_report_recipients", "daily_report_weekends"),)),
+			("section_review", (("monthly_reviewers", "review_sample_size"),)),
+			(
+				"section_reminders",
+				(
+					("d_ticket_watcher", "due_reminder_hours", "ba_note_due_hours"),
+					("task_due_days", "max_tasks_per_run"),
+				),
+			),
+			("section_kpi", (("kpi_targets",),)),
+			("section_report_marks", (("daily_report_sent_on",), ("budget_alert_sent_month",))),
+			("section_alerts", (("alert_recipients", "privilege_alert_checked_until"),)),
+		),
+	),
+	(
+		"tab_advanced",
+		"Nâng cao",
+		(
+			("section_code_change", (("code_change_apps",),)),
+			(
+				"section_prompts",
+				(
+					(
+						"prompt_override_classify",
+						"prompt_override_reasoning",
+						"prompt_override_category_guide",
+						"prompt_revisions",
+					),
+				),
+			),
+		),
+	),
+)
+# Rarely changed after setup: these sections start folded.
+SETTING_COLLAPSIBLE_SECTIONS = ("section_ticket_fields", "section_code_change", "section_prompts")
+# A short field fits half the width; every other field (Table, Code, Long Text, Small Text) is wide.
+SHORT_FIELD_TYPES = ("Check", "Select", "Int", "Float", "Data", "Link", "Date", "Datetime")
+# A Small Text that holds one short phrase, not a list: it fits a column like a Data field.
+ONE_LINE_TEXT_FIELDS = ("thinking_text",)
+
 
 FEAT007_LOG_COLUMNS = {
 	"created_labels": "Small Text",
@@ -737,7 +914,18 @@ FORBIDDEN_PHRASES = {
 	# FEAT-007 design.md:162, 184: record tools moved from the code-change switch to their own switch.
 	"ERP AI Setting": {
 		# FEAT-007 spec-addendum-3.md:88 (T64): L2 no longer "has the same tools as L1".
-		"permission_level": ("ô Cho phép sửa code", "L2 có công cụ như L1"),
+		# 2026-11-27: seven permission switches now, so no text counts them as five.
+		"permission_level": ("ô Cho phép sửa code", "L2 có công cụ như L1", "năm quyền"),
+		"site_environment": ("năm quyền",),
+		**{f"level_cap_{category}": ("năm quyền",) for category in "abcdef"},
+		**{
+			fieldname: ("năm quyền",)
+			for fieldname in (
+				"prompt_override_classify",
+				"prompt_override_reasoning",
+				"prompt_override_category_guide",
+			)
+		},
 		# FEAT-007 spec-addendum-4.md AC-29 (T64): an empty catalog no longer means "no ERP writes".
 		"catalog_rules": ("bot không ghi ERP ngoài phiếu",),
 		"code_change_enabled": ("tạo và sửa bản ghi trực tiếp",),
@@ -774,6 +962,57 @@ def visible_fields(doctype_json):
 
 def section_breaks(doctype_json):
 	return [field for field in doctype_json["fields"] if field["fieldtype"] == "Section Break"]
+
+
+def form_order(doctype_json):
+	"""field_order without Column and Tab Breaks: the data fields and the Section Breaks, in form order."""
+	types = {field["fieldname"]: field["fieldtype"] for field in doctype_json["fields"]}
+	return [name for name in doctype_json["field_order"] if types[name] not in ("Column Break", "Tab Break")]
+
+
+def data_order(doctype_json):
+	"""field_order without any break: the data fields only, in form order."""
+	types = {field["fieldname"]: field["fieldtype"] for field in doctype_json["fields"]}
+	return [name for name in doctype_json["field_order"] if types[name] not in BREAK_TYPES]
+
+
+def form_tree(doctype_json):
+	"""field_order as ((tab, label, ((section, (column, ...)), ...)), ...), a column being its data fields.
+
+	Fields before the first Tab Break fall in a tab named None, fields before the first Section Break of a tab in a
+	section named None, so a form without tabs still gives a tree to compare."""
+	by_name = {field["fieldname"]: field for field in doctype_json["fields"]}
+	tabs = []
+	for name in doctype_json["field_order"]:
+		fieldtype = by_name[name]["fieldtype"]
+		if fieldtype == "Tab Break":
+			tabs.append((name, by_name[name].get("label"), []))
+			continue
+		if not tabs:
+			tabs.append((None, None, []))
+		sections = tabs[-1][2]
+		if fieldtype == "Section Break":
+			sections.append((name, [[]]))
+			continue
+		if not sections:
+			sections.append((None, [[]]))
+		columns = sections[-1][1]
+		if fieldtype == "Column Break":
+			columns.append([])
+		else:
+			columns[-1].append(name)
+	return tuple(
+		(
+			tab,
+			label,
+			tuple((section, tuple(tuple(column) for column in columns)) for section, columns in sections),
+		)
+		for tab, label, sections in tabs
+	)
+
+
+def is_short_field(field):
+	return field["fieldtype"] in SHORT_FIELD_TYPES or field["fieldname"] in ONE_LINE_TEXT_FIELDS
 
 
 class TestDoctypeDescriptions(FrappeTestCase):
@@ -893,12 +1132,83 @@ class TestDoctypeDescriptions(FrappeTestCase):
 		self.assertEqual(actual, FEAT007_LOG_COLUMNS)
 
 	def test_section_breaks_carry_only_label(self):
+		# 2026-11-27: a section of ERP AI Setting may also start folded (collapsible: 1), nothing else.
 		for doctype, _config, doctype_json in self.each_doctype():
 			with self.subTest(doctype=doctype):
 				for section in section_breaks(doctype_json):
-					self.assertEqual(
-						set(section), {"fieldname", "fieldtype", "label"}, f"{doctype}.{section['fieldname']}"
-					)
+					where = f"{doctype}.{section['fieldname']}"
+					keys = {"fieldname", "fieldtype", "label"}
+					if doctype == "ERP AI Setting" and section["fieldname"] in SETTING_COLLAPSIBLE_SECTIONS:
+						keys.add("collapsible")
+						self.assertEqual(section.get("collapsible"), 1, where)
+					self.assertEqual(set(section), keys, where)
+
+	def test_setting_tabs_sections_columns(self):
+		# 2026-11-27 layout: seven tabs by purpose, each section in its tab, each column its fields in order.
+		doctype_json = load_doctype(DOCTYPE_CONFIG["ERP AI Setting"])
+		self.assertEqual(form_tree(doctype_json), SETTING_LAYOUT)
+		self.assertEqual(
+			[field["fieldname"] for field in doctype_json["fields"]], doctype_json["field_order"]
+		)
+		# Every data field is placed exactly once; the layout names no field the DocType lacks.
+		placed = [
+			name
+			for _tab, _label, sections in SETTING_LAYOUT
+			for _section, columns in sections
+			for column in columns
+			for name in column
+		]
+		self.assertEqual(sorted(placed), sorted(data_order(doctype_json)))
+		self.assertEqual(len(placed), len(set(placed)))
+		sections = [
+			section for _tab, _label, tab_sections in SETTING_LAYOUT for section, _columns in tab_sections
+		]
+		self.assertEqual(
+			sections, [name for name, _label, _first in DOCTYPE_CONFIG["ERP AI Setting"]["sections"]]
+		)
+
+	def test_setting_short_fields_split_in_two_columns(self):
+		# A section of two or more short fields has a left and a right column, neither empty; a wide field
+		# (Table, Code, Long Text, a Small Text list) never sits in a column: its section has one column.
+		doctype_json = load_doctype(DOCTYPE_CONFIG["ERP AI Setting"])
+		by_name = {field["fieldname"]: field for field in doctype_json["fields"]}
+		for _tab, _label, sections in form_tree(doctype_json):
+			for section, columns in sections:
+				with self.subTest(section=section):
+					fields = [by_name[name] for column in columns for name in column]
+					wide = [field["fieldname"] for field in fields if not is_short_field(field)]
+					short = [field["fieldname"] for field in fields if is_short_field(field)]
+					if wide:
+						self.assertEqual(len(columns), 1, f"{section}: wide field {wide} in a column")
+						self.assertLessEqual(
+							len(short), 1, f"{section}: short fields {short} stacked by {wide}"
+						)
+					elif len(short) >= 2:
+						self.assertEqual(
+							len(columns), 2, f"{section}: short fields {short} not in two columns"
+						)
+						self.assertTrue(all(columns), f"{section}: an empty column")
+					else:
+						self.assertEqual(len(columns), 1, section)
+
+	def test_setting_tab_and_column_breaks_shape(self):
+		# A Tab Break carries a Vietnamese label and opens with a labelled section; a Column Break carries nothing.
+		# The form opens on a tab: a field before the first Tab Break would land in an extra "Details" tab.
+		doctype_json = load_doctype(DOCTYPE_CONFIG["ERP AI Setting"])
+		order = doctype_json["field_order"]
+		by_name = {field["fieldname"]: field for field in doctype_json["fields"]}
+		self.assertEqual(by_name[order[0]]["fieldtype"], "Tab Break")
+		for index, name in enumerate(order):
+			field = by_name[name]
+			with self.subTest(fieldname=name):
+				if field["fieldtype"] == "Tab Break":
+					self.assertEqual(set(field), {"fieldname", "fieldtype", "label"})
+					self.assertTrue(name.startswith("tab_"))
+					self.assertTrue(VIETNAMESE_ACCENTS.search(field["label"]))
+					self.assertEqual(by_name[order[index + 1]]["fieldtype"], "Section Break")
+				elif field["fieldtype"] == "Column Break":
+					self.assertEqual(set(field), {"fieldname", "fieldtype"})
+					self.assertTrue(name.startswith("column_break_"))
 
 	def test_console_switch_field_on_disk(self):
 		# CHG-010 Task 1: read from the JSON file; the site's meta is not migrated for the new field.
@@ -907,24 +1217,28 @@ class TestDoctypeDescriptions(FrappeTestCase):
 		field = by_name["console_enabled"]
 		self.assertEqual({key: field.get(key) for key in CONSOLE_FIELD_SPEC}, CONSOLE_FIELD_SPEC)
 		self.assertFalse(field.get("read_only"))
-		order = doctype_json["field_order"]
+		# 2026-11-27: console_enabled opens the right column of section_permissions; a Column Break is layout only.
+		order = form_order(doctype_json)
 		self.assertEqual(order.index("console_enabled"), order.index("code_change_enabled") + 1)
 		self.assertLess(order.index("section_permissions"), order.index("console_enabled"))
 		self.assertLess(order.index("console_enabled"), order.index("section_autonomy"))
 
 	def test_code_change_block_follows_feat006_fields(self):
 		doctype_json = load_doctype(DOCTYPE_CONFIG["ERP AI Setting"])
-		order = doctype_json["field_order"]
-		start = order.index("prompt_digest")
+		# 2026-11-27 layout: Column and Tab Breaks are left out; the sections are grouped in tabs by purpose, so
+		# the section order changed (SETTING_LAYOUT pins the whole tree). Each section keeps its fields and their
+		# order; the long sections are split into labelled sections that follow each other.
+		order = form_order(doctype_json)
+		start = order.index("default_assignee")
 		# FEAT-007 design.md:98, 106 (NFR-8): the switch moved to section_permissions; the block keeps the app list.
-		# design.md:104-106: section_ticket_fields (AC-24) sits between section_routing and section_code_change.
-		# design.md:107 (row 11 after row 10): section_knowledge follows the code-change block.
-		# design.md:108 (row 12 after row 11): section_operations follows section_knowledge; design.md:109-110:
-		# section_prompts (row 13) follows it, then section_alerts (row 14).
+		# design.md:104-106: section_ticket_fields (AC-24) follows the routing block (default_assignee is its last
+		# field since prompt_digest moved to the knowledge tab).
+		# design.md:107: the nine knowledge fields, then section_operations with its twelve fields (design.md:108),
+		# section_code_change and section_prompts (design.md:109) in the last tab.
 		self.assertEqual(
-			order[start : start + 41],
+			order[start:],
 			[
-				"prompt_digest",
+				"default_assignee",
 				"section_ticket_fields",
 				"field_ticket_nature",
 				"field_erp_module",
@@ -934,8 +1248,6 @@ class TestDoctypeDescriptions(FrappeTestCase):
 				"field_project",
 				"field_item_code",
 				"field_serial_no",
-				"section_code_change",
-				"code_change_apps",
 				"section_knowledge",
 				"reply_enabled",
 				"resolve_on_tasks_done_enabled",
@@ -944,32 +1256,49 @@ class TestDoctypeDescriptions(FrappeTestCase):
 				"kb_draft_enabled",
 				"knowledge_search_limit",
 				"manuals_dir",
+				"section_reports",
 				"allowed_reports",
 				"report_row_limit",
+				"section_digest",
+				"prompt_digest",
+				"section_lessons",
+				"lessons_enabled",
+				"lessons_max_per_request",
+				"lessons_max_chars",
+				"lesson_teach_marker",
 				"section_operations",
 				"coo_report_recipients",
 				"daily_report_weekends",
+				"section_review",
 				"monthly_reviewers",
 				"review_sample_size",
+				"section_reminders",
 				"d_ticket_watcher",
 				"due_reminder_hours",
 				"ba_note_due_hours",
 				"task_due_days",
 				"max_tasks_per_run",
+				"section_kpi",
 				"kpi_targets",
+				"section_report_marks",
 				"daily_report_sent_on",
 				"budget_alert_sent_month",
+				"section_alerts",
+				"alert_recipients",
+				"privilege_alert_checked_until",
+				"section_code_change",
+				"code_change_apps",
 				"section_prompts",
 				"prompt_override_classify",
 				"prompt_override_reasoning",
 				"prompt_override_category_guide",
 				"prompt_revisions",
-				"section_alerts",
 			],
 		)
 		start = order.index("section_permissions")
 		self.assertEqual(
-			order[start : start + 8],  # CHG-010: console_enabled follows code_change_enabled
+			# CHG-010: console_enabled follows code_change_enabled; 2026-11-27: server_script_read_enabled is the 7th.
+			order[start : start + 10],
 			[
 				"section_permissions",
 				"unrestricted_enabled",
@@ -978,7 +1307,10 @@ class TestDoctypeDescriptions(FrappeTestCase):
 				"code_change_enabled",
 				"console_enabled",
 				"one_click_approval_enabled",
+				"server_script_read_enabled",
 				"site_environment",
+				# 2026-11-27: the section ends here (the next tab opens with section_autonomy).
+				"section_autonomy",
 			],
 		)
 		self.assertLess(order.index("routing_rules"), order.index("section_code_change"))

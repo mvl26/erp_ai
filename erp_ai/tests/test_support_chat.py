@@ -2,8 +2,9 @@ import json
 from unittest.mock import patch
 
 import frappe
+from frappe.desk.doctype.notification_log.notification_log import enqueue_create_notification
 from frappe.tests.utils import FrappeTestCase
-from helpdesk.test_utils import create_agent, make_article
+from helpdesk.test_utils import create_agent, make_article, make_ticket
 
 from erp_ai import support_chat
 from erp_ai.agent import run_log, support
@@ -141,3 +142,96 @@ class TestSupportChat(FrappeTestCase):
 		self.assertIn(TRIGGER_SUPPORT_CHAT, run_log.TRIGGERS)
 		options = frappe.get_meta(LOG_DOCTYPE).get_field("trigger").options.split("\n")
 		self.assertIn(TRIGGER_SUPPORT_CHAT, options)
+
+
+NOTIFICATION_LOG = "Notification Log"
+OTHER_AGENT = "support-chat-other@example.com"
+
+
+class TestSupportChatNotices(FrappeTestCase):
+	"""The bot's "For you" list: the asker's own unread assignment and bot-reply notices of tickets, one row per
+	ticket, newest first; opening a ticket marks its notices read."""
+
+	def setUp(self):
+		commit_guard = patch.object(frappe.db, "commit", side_effect=AssertionError("test must not commit"))
+		commit_guard.start()
+		self.addCleanup(commit_guard.stop)
+		self.addCleanup(frappe.db.rollback)
+		self.addCleanup(frappe.set_user, "Administrator")
+		frappe.set_user("Administrator")
+		# A notice of an assignment would email its person; none leaves the test.
+		sendmail = patch.object(frappe, "sendmail")
+		sendmail.start()
+		self.addCleanup(sendmail.stop)
+		create_agent(ASKER)
+		create_agent(OTHER_AGENT)
+		self.ticket = make_ticket(subject="Notice ticket")
+
+	def _notice(self, user, kind, ticket=None, subject=None):
+		ticket = ticket or self.ticket.name
+		enqueue_create_notification(
+			[user],
+			{
+				"type": kind,
+				"document_type": "HD Ticket",
+				"document_name": ticket,
+				"from_user": "Administrator",
+				"subject": subject or f"{kind} {ticket}",
+			},
+		)
+		return frappe.get_all(
+			NOTIFICATION_LOG,
+			filters={"for_user": user, "type": kind, "document_name": ticket},
+			pluck="name",
+			order_by="creation desc",
+			limit=1,
+		)[0]
+
+	def _call(self, method, *args, user=ASKER):
+		frappe.set_user(user)
+		try:
+			return method(*args)
+		finally:
+			frappe.set_user("Administrator")
+
+	def test_notices_group_the_askers_unread_by_ticket(self):
+		self._notice(ASKER, "Assignment")
+		self._notice(ASKER, "Bot Reply")
+		self._notice(OTHER_AGENT, "Assignment")
+		result = self._call(support_chat.get_notices)
+		self.assertEqual(result["unread"], 2)
+		self.assertEqual([row["ticket"] for row in result["tickets"]], [self.ticket.name])
+		self.assertEqual(result["tickets"][0]["unread"], 2)
+		self.assertEqual(result["tickets"][0]["type"], "Bot Reply")
+
+	def test_notices_leave_out_read_and_other_kinds(self):
+		name = self._notice(ASKER, "Assignment")
+		frappe.db.set_value(NOTIFICATION_LOG, name, "read", 1)
+		self._notice(ASKER, "Mention")
+		result = self._call(support_chat.get_notices)
+		self.assertEqual(result, {"unread": 0, "tickets": []})
+
+	def test_only_agents_read_notices(self):
+		with self.assertRaises(frappe.PermissionError):
+			self._call(support_chat.get_notices, user="Guest")
+		with self.assertRaises(frappe.PermissionError):
+			self._call(support_chat.mark_notices_read, self.ticket.name, True, user="Guest")
+
+	def test_mark_read_keeps_bot_replies_unless_the_chat_was_seen(self):
+		self._notice(ASKER, "Assignment")
+		self._notice(ASKER, "Bot Reply")
+		self._call(support_chat.mark_notices_read, self.ticket.name, False)
+		self.assertEqual(self._call(support_chat.get_notices)["unread"], 1)
+		self._call(support_chat.mark_notices_read, self.ticket.name, True)
+		self.assertEqual(self._call(support_chat.get_notices)["unread"], 0)
+
+	def test_mark_read_touches_only_the_askers_notices(self):
+		self._notice(ASKER, "Assignment")
+		self._notice(OTHER_AGENT, "Assignment")
+		self._call(support_chat.mark_notices_read, self.ticket.name, True)
+		self.assertEqual(self._call(support_chat.get_notices, user=OTHER_AGENT)["unread"], 1)
+
+	def test_notice_subject_is_plain_text(self):
+		self._notice(ASKER, "Assignment", subject='<div class="ql-editor"><b>Giao</b> việc &amp; hạn</div>')
+		row = self._call(support_chat.get_notices)["tickets"][0]
+		self.assertEqual(row["subject"], "Giao việc & hạn")

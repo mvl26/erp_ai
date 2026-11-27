@@ -86,6 +86,23 @@ function setupForm({ doc, call, router }) {
 		const BOT_CARD_WIDTH_PX = 360;
 		const BOT_CARD_HEIGHT_PX = 480;
 		const BOT_CARD_GAP_PX = 12;
+		// ADR-051 decision 3: the bot's only stored values; the keys are the old Vue bot's, so a person's choices carry over.
+		const BOT_POSITION_KEY = "miyano_bot_position";
+		const BOT_SOUND_KEY = "miyano_bot_sound";
+		const BOT_CHAT_KEY = "miyano_support_chat";
+		const BOT_REPLY_TYPE = "Bot Reply";
+		const MAX_BADGE = 99;
+		const TEXT_BOT_FOR_YOU = "Dành cho bạn";
+		const TEXT_BOT_NEW = "mới";
+		const TEXT_BOT_ASSIGNED = "Giao cho bạn";
+		const TEXT_BOT_REPLIED = "Bot đã trả lời";
+		const TEXT_BOT_MUTE = "Tắt tiếng";
+		const TEXT_BOT_UNMUTE = "Bật tiếng";
+		// Two short rising sine notes (A5 then E6), quiet enough not to startle.
+		const CHIME_NOTES_HZ = [880, 1318.5];
+		const CHIME_GAP_S = 0.12;
+		const CHIME_LENGTH_S = 0.35;
+		const CHIME_VOLUME = 0.15;
 		const BOT_CSS = [
 			".miyano-bot-launcher{position:fixed;z-index:40;padding:0;border:0;background:transparent;cursor:grab;touch-action:none;user-select:none;transition:transform .15s}",
 			".miyano-bot-launcher:hover{transform:scale(1.05)}",
@@ -118,6 +135,17 @@ function setupForm({ doc, call, router }) {
 			".miyano-bot-btn--solid{background:#171717;color:#fff}",
 			".miyano-bot-btn--subtle{background:#f3f4f6;color:#374151}",
 			".miyano-bot-btn--ghost{background:transparent;color:#4b5563}",
+			".miyano-bot-badge{position:absolute;top:-4px;right:-4px;display:flex;align-items:center;justify-content:center;min-width:20px;height:20px;padding:0 4px;border-radius:999px;background:#171717;color:#fff;font-size:12px;font-weight:500;pointer-events:none}",
+			".miyano-bot-badge[hidden]{display:none}",
+			".miyano-bot-notices{flex:none;padding:8px 12px;border-bottom:1px solid #e5e7eb}",
+			".miyano-bot-notices-title{margin-bottom:4px;font-weight:500;color:#111827}",
+			".miyano-bot-notice-list{display:flex;flex-direction:column;max-height:128px;overflow-y:auto}",
+			".miyano-bot-notice{display:flex;align-items:flex-start;gap:8px;width:100%;padding:6px 8px;border:0;border-radius:6px;background:none;font:inherit;text-align:left;cursor:pointer}",
+			".miyano-bot-notice:hover{background:#f3f4f6}",
+			".miyano-bot-notice-main{flex:1;min-width:0}",
+			".miyano-bot-notice-title{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:500;color:#111827}",
+			".miyano-bot-notice-sub{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:12px;color:#6b7280}",
+			".miyano-bot-notice-count{flex:none;padding:0 6px;border-radius:999px;background:#e5e7eb;font-size:12px;font-weight:500}",
 			".miyano-bot-link{display:block;max-width:100%;padding:0;border:0;background:none;font:inherit;font-size:12px;text-align:left;text-decoration:underline;color:#4b5563;cursor:pointer;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}",
 		].join("\n");
 		const INDICATOR_FLOATING_STYLE = {
@@ -250,6 +278,13 @@ function setupForm({ doc, call, router }) {
 			newTicketEl: null,
 			errorEl: null,
 			noteEl: null,
+			noticesEl: null,
+			noticeListEl: null,
+			badgeEl: null,
+			soundEl: null,
+			notices: { unread: null, tickets: [] },
+			soundOn: true,
+			audio: null,
 			open: false,
 			asking: false,
 			turns: [],
@@ -282,6 +317,107 @@ function setupForm({ doc, call, router }) {
 		state.panel = state.panel || newPanelState();
 		state.router = router;
 		state.bot = state.bot || newBotState();
+
+		// Storage may be blocked (private window): every read falls back, every write is allowed to fail.
+		const loadPosition = () => {
+			try {
+				const saved = JSON.parse(localStorage.getItem(BOT_POSITION_KEY));
+				return Number.isFinite(saved?.left) && Number.isFinite(saved?.top) ? saved : null;
+			} catch (e) {
+				return null;
+			}
+		};
+
+		const savePosition = (position) => {
+			try {
+				localStorage.setItem(BOT_POSITION_KEY, JSON.stringify(position));
+			} catch (e) {
+				// The position then lasts until the page reloads.
+			}
+		};
+
+		const loadSound = () => {
+			try {
+				return localStorage.getItem(BOT_SOUND_KEY) !== "false";
+			} catch (e) {
+				return true;
+			}
+		};
+
+		const saveSound = (on) => {
+			try {
+				localStorage.setItem(BOT_SOUND_KEY, String(on));
+			} catch (e) {
+				// The choice then lasts until the page reloads.
+			}
+		};
+
+		const loadTurns = () => {
+			try {
+				const saved = JSON.parse(sessionStorage.getItem(BOT_CHAT_KEY));
+				return (Array.isArray(saved) ? saved : [])
+					.filter(
+						(turn) =>
+							(turn?.role === "user" || turn?.role === "assistant") &&
+							typeof turn?.content === "string"
+					)
+					.map((turn) => ({
+						role: turn.role,
+						content: turn.content,
+						articles: readArticles(turn.articles),
+					}));
+			} catch (e) {
+				return [];
+			}
+		};
+
+		const saveTurns = () => {
+			try {
+				sessionStorage.setItem(BOT_CHAT_KEY, JSON.stringify(state.bot.turns));
+			} catch (e) {
+				// The chat then lasts until the page reloads.
+			}
+		};
+
+		// Browsers keep audio suspended until the page has had a click or key press.
+		const playChime = () => {
+			try {
+				const bot = state.bot;
+				if (!bot.soundOn) {
+					return;
+				}
+				bot.audio = bot.audio || new AudioContext();
+				const audio = bot.audio;
+				if (audio.state === "suspended") {
+					audio.resume();
+				}
+				const start = audio.currentTime;
+				CHIME_NOTES_HZ.forEach((hz, i) => {
+					const at = start + i * CHIME_GAP_S;
+					const osc = audio.createOscillator();
+					const gain = audio.createGain();
+					osc.type = "sine";
+					osc.frequency.value = hz;
+					gain.gain.setValueAtTime(0, at);
+					gain.gain.linearRampToValueAtTime(CHIME_VOLUME, at + 0.01);
+					gain.gain.exponentialRampToValueAtTime(0.0001, at + CHIME_LENGTH_S);
+					osc.connect(gain).connect(audio.destination);
+					osc.start(at);
+					osc.stop(at + CHIME_LENGTH_S + 0.05);
+				});
+			} catch (e) {
+				// A sound must never break the page (ADR-051 decision 4).
+			}
+		};
+
+		const renderSound = () => {
+			const bot = state.bot;
+			const label = bot.soundOn ? TEXT_BOT_MUTE : TEXT_BOT_UNMUTE;
+			bot.soundEl.textContent = bot.soundOn ? "🔊" : "🔇";
+			bot.soundEl.title = label;
+			bot.soundEl.setAttribute("aria-label", label);
+			bot.soundEl.setAttribute("aria-pressed", String(!bot.soundOn));
+		};
 
 		const botButton = (variant, text, onClick) => {
 			const button = document.createElement("button");
@@ -469,6 +605,7 @@ function setupForm({ doc, call, router }) {
 			bot.errorEl.textContent = "";
 			bot.noteEl.textContent = "";
 			bot.turns.push({ role: "user", content: question });
+			saveTurns();
 			bot.inputEl.value = "";
 			bot.asking = true;
 			renderBotChat();
@@ -477,6 +614,7 @@ function setupForm({ doc, call, router }) {
 				try {
 					bot.asking = false;
 					bot.turns.pop();
+					saveTurns();
 					bot.inputEl.value = question;
 					bot.errorEl.textContent = TEXT_BOT_FAILED;
 					renderBotChat();
@@ -496,6 +634,7 @@ function setupForm({ doc, call, router }) {
 						content: reply.answer,
 						articles: readArticles(reply.articles),
 					});
+					saveTurns();
 					renderBotChat();
 				} catch (e) {
 					onFailed();
@@ -534,6 +673,107 @@ function setupForm({ doc, call, router }) {
 			});
 		};
 
+		const renderNotices = () => {
+			const bot = state.bot;
+			const { unread, tickets } = bot.notices;
+			bot.badgeEl.hidden = !(unread > 0);
+			bot.badgeEl.textContent = unread > MAX_BADGE ? MAX_BADGE + "+" : String(unread);
+			bot.launcher.setAttribute(
+				"aria-label",
+				unread > 0
+					? TEXT_BOT_LAUNCHER + ", " + unread + " " + TEXT_BOT_NEW
+					: TEXT_BOT_LAUNCHER
+			);
+			bot.noticesEl.hidden = tickets.length === 0;
+			const rows = tickets.map((notice) => {
+				const row = document.createElement("button");
+				row.type = "button";
+				row.className = "miyano-bot-notice";
+				const main = document.createElement("span");
+				main.className = "miyano-bot-notice-main";
+				const title = document.createElement("span");
+				title.className = "miyano-bot-notice-title";
+				title.textContent =
+					"#" +
+					notice.ticket +
+					" · " +
+					(notice.type === BOT_REPLY_TYPE ? TEXT_BOT_REPLIED : TEXT_BOT_ASSIGNED);
+				const sub = document.createElement("span");
+				sub.className = "miyano-bot-notice-sub";
+				sub.textContent = notice.creation.slice(0, 16) + " · " + notice.subject;
+				main.append(title, sub);
+				const count = document.createElement("span");
+				count.className = "miyano-bot-notice-count";
+				count.textContent = notice.unread + " " + TEXT_BOT_NEW;
+				row.append(main, count);
+				row.addEventListener("click", () => {
+					try {
+						state.router?.push({
+							name: "TicketAgent",
+							params: { ticketId: notice.ticket },
+						});
+						markNoticesRead(notice.ticket, true);
+					} catch (e) {
+						// A widget handler must never break the page (ADR-051 decision 4).
+					}
+				});
+				return row;
+			});
+			bot.noticeListEl.replaceChildren(...rows);
+		};
+
+		// The unread count after the first load only ever goes up with a new notice: that is when the chime plays.
+		const refreshNotices = () => {
+			const bot = state.bot;
+			const onNotices = (data) => {
+				try {
+					const tickets = (Array.isArray(data?.tickets) ? data.tickets : [])
+						.filter((notice) => typeof notice?.ticket === "string")
+						.map((notice) => ({
+							ticket: notice.ticket,
+							unread: Number(notice.unread) || 0,
+							type: String(notice.type ?? ""),
+							subject: String(notice.subject ?? ""),
+							creation: String(notice.creation ?? ""),
+						}));
+					const unread = Number(data?.unread) || 0;
+					const before = bot.notices.unread;
+					bot.notices = { unread, tickets };
+					renderNotices();
+					if (before !== null && unread > before) {
+						playChime();
+					}
+				} catch (e) {
+					// A widget handler must never break the page (ADR-051 decision 4).
+				}
+			};
+			try {
+				state.call("erp_ai.support_chat.get_notices", {}).then(onNotices, () => {});
+			} catch (e) {
+				// A widget handler must never break the page (ADR-051 decision 4).
+			}
+		};
+
+		const markNoticesRead = (ticket, withBotReplies) => {
+			try {
+				state
+					.call("erp_ai.support_chat.mark_notices_read", {
+						ticket,
+						with_bot_replies: withBotReplies,
+					})
+					.then(refreshNotices, () => {});
+			} catch (e) {
+				// A widget handler must never break the page (ADR-051 decision 4).
+			}
+		};
+
+		// Opening a ticket counts its assignment as seen; its bot replies count once the card shows its chat.
+		const readSeenNotices = () => {
+			if (state.ticket && state.bot.card) {
+				markNoticesRead(state.ticket, state.bot.open);
+			}
+		};
+
 		const setBotOpen = (value) => {
 			const bot = state.bot;
 			bot.open = value;
@@ -544,6 +784,7 @@ function setupForm({ doc, call, router }) {
 				bot.threadEl.scrollTop = bot.threadEl.scrollHeight;
 				bot.inputEl.focus({ preventScroll: true });
 			}
+			readSeenNotices();
 		};
 
 		// On a ticket page the card holds that ticket's chat (the panel); elsewhere it holds the support chat.
@@ -554,6 +795,7 @@ function setupForm({ doc, call, router }) {
 			}
 			bot.ticketWrap.hidden = !state.ticket;
 			bot.chatEl.hidden = Boolean(state.ticket);
+			readSeenNotices();
 		};
 
 		const onBotPointerDown = (event) => {
@@ -609,6 +851,7 @@ function setupForm({ doc, call, router }) {
 				bot.launcher.style.cursor = "";
 				if (drag.moved) {
 					bot.saved = { ...bot.pos };
+					savePosition(bot.saved);
 				} else {
 					setBotOpen(!bot.open);
 				}
@@ -660,7 +903,10 @@ function setupForm({ doc, call, router }) {
 				width: BOT_WIDTH_PX + "px",
 				height: BOT_HEIGHT_PX + "px",
 			});
-			launcher.append(makeMascot("miyano-bot-mascot"));
+			const badgeEl = document.createElement("span");
+			badgeEl.className = "miyano-bot-badge";
+			badgeEl.hidden = true;
+			launcher.append(makeMascot("miyano-bot-mascot"), badgeEl);
 			launcher.addEventListener("pointerdown", onBotPointerDown);
 			launcher.addEventListener("pointermove", onBotPointerMove);
 			launcher.addEventListener("pointerup", onBotPointerUp);
@@ -679,11 +925,28 @@ function setupForm({ doc, call, router }) {
 			const title = document.createElement("strong");
 			title.className = "miyano-bot-head-title";
 			title.textContent = TEXT_BOT_TITLE;
+			const soundEl = botButton("ghost", "", () => {
+				bot.soundOn = !bot.soundOn;
+				saveSound(bot.soundOn);
+				renderSound();
+			});
 			head.append(
 				makeMascot("miyano-bot-head-mascot"),
 				title,
+				soundEl,
 				botButton("ghost", TEXT_CLOSE, () => setBotOpen(false))
 			);
+
+			// Only unread notices are listed: a seen ticket drops out, and with none left the section hides.
+			const noticesEl = document.createElement("div");
+			noticesEl.className = "miyano-bot-notices";
+			noticesEl.hidden = true;
+			const noticesTitle = document.createElement("div");
+			noticesTitle.className = "miyano-bot-notices-title";
+			noticesTitle.textContent = TEXT_BOT_FOR_YOU;
+			const noticeListEl = document.createElement("div");
+			noticeListEl.className = "miyano-bot-notice-list";
+			noticesEl.append(noticesTitle, noticeListEl);
 
 			// The ticket's own chat mounts in this part (host().slot).
 			const ticketWrap = document.createElement("div");
@@ -701,6 +964,7 @@ function setupForm({ doc, call, router }) {
 			const restartEl = botButton("ghost", TEXT_BOT_RESTART, () => {
 				if (!bot.asking) {
 					bot.turns = [];
+					saveTurns();
 					bot.errorEl.textContent = "";
 					bot.noteEl.textContent = "";
 					renderBotChat();
@@ -740,7 +1004,7 @@ function setupForm({ doc, call, router }) {
 			row.append(inputEl, sendEl);
 			foot.append(newTicketEl, row);
 			chatEl.append(chatHead, threadEl, errorEl, noteEl, foot);
-			card.append(head, ticketWrap, chatEl);
+			card.append(head, noticesEl, ticketWrap, chatEl);
 			root.append(styleEl, launcher, card);
 			document.body.appendChild(root);
 
@@ -756,6 +1020,10 @@ function setupForm({ doc, call, router }) {
 				newTicketEl,
 				errorEl,
 				noteEl,
+				noticesEl,
+				noticeListEl,
+				badgeEl,
+				soundEl,
 			});
 			bot.host = {
 				launcher,
@@ -768,8 +1036,13 @@ function setupForm({ doc, call, router }) {
 				bot.resizeBound = true;
 				window.addEventListener("resize", onBotResize);
 			}
+			bot.saved = loadPosition();
+			bot.soundOn = loadSound();
+			bot.turns = loadTurns();
 			placeBot(bot.saved);
+			renderSound();
 			renderBotChat();
+			refreshNotices();
 			syncBotView();
 		};
 
@@ -1781,6 +2054,16 @@ function setupForm({ doc, call, router }) {
 			}
 		};
 
+		// A new Notification Log row for this person: refresh the list, and count the open ticket's as seen.
+		const onNotification = () => {
+			try {
+				refreshNotices();
+				readSeenNotices();
+			} catch (e) {
+				// A socket callback must never throw to the console (AC-10 g).
+			}
+		};
+
 		const onResize = () => {
 			try {
 				if (window.innerWidth < NARROW_SCREEN_PX) {
@@ -1806,6 +2089,7 @@ function setupForm({ doc, call, router }) {
 			socket.on(EVENT, onStatus);
 			socket.on("docinfo_update", onDocinfo);
 			socket.on("doc_update", onDocUpdate);
+			socket.on("notification", onNotification);
 			socket.on("connect", () => {
 				try {
 					// Re-join the room after a reconnect; never subscribe with no ticket open.

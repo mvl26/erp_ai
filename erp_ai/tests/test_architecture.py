@@ -259,7 +259,20 @@ MIYANO_WIDGET_REQUIRED = (
 	r"const host = \(\) => state\.bot\?\.host \|\| null",
 	r"setPointerCapture",
 	r"const syncBotView = \(\) => \{",
+	r'state\s*\.call\("erp_ai\.support_chat\.get_notices", \{\}\)',
+	r'state\s*\.call\("erp_ai\.support_chat\.mark_notices_read", \{',
+	r'socket\.on\("notification", onNotification\)',
+	r"new AudioContext\(\)",
+	r'BOT_SOUND_KEY = "miyano_bot_sound"',
+	r'BOT_POSITION_KEY = "miyano_bot_position"',
+	r'BOT_CHAT_KEY = "miyano_support_chat"',
+	r'TEXT_BOT_FOR_YOU = "Dành cho bạn"',
+	r"const refreshNotices = \(\) => \{",
+	r"const playChime = \(\) => \{",
 )
+# ADR-051 decision 3: the one use of browser storage is the bot's own three keys, each read and written by name.
+BOT_STORAGE_USE = re.compile(r"\b(?:local|session)Storage\b(?!\.(?:getItem|setItem)\(BOT_[A-Z_]+_KEY\b)")
+BOT_STORAGE_KEY = re.compile(r'const (BOT_[A-Z_]+_KEY) = "([^"]*)"')
 STATUS_INDICATOR_VISIBILITY = "setIndicatorVisible"
 STATUS_INDICATOR_FUNCTIONS = ("ensureElement", "render", "reset", "dockIndicator")
 # `el.style.display = …` or `Object.assign(el.style, …, { display: … })` on the indicator itself.
@@ -276,8 +289,6 @@ STATUS_SCRIPT_FORBIDDEN = (
 	r"eval\(",
 	r"new Function",
 	r"doc_unsubscribe",
-	r"localStorage",
-	r"sessionStorage",
 	r"document\.cookie",
 	r"fetch\(",
 	r"XMLHttpRequest",
@@ -1596,7 +1607,8 @@ PANEL_FILE = "ticket_panel.py"
 PANEL_MODULE = "erp_ai.ticket_panel"
 STATUS_SCRIPT_STATE_NAME = "__erpAiAgentStatus"
 STATUS_SCRIPT_ONCE_BLOCK = "if (state.socket !== socket) {"
-STATUS_SCRIPT_SOCKET_EVENTS = ("docinfo_update", "doc_update", "connect", "disconnect")
+# ADR-051: `notification` is Frappe's own signal for a new Notification Log row (the bot's unread badge).
+STATUS_SCRIPT_SOCKET_EVENTS = ("docinfo_update", "doc_update", "connect", "disconnect", "notification")
 STATUS_SCRIPT_QUERY_CALLS = re.compile(r"\b(querySelector(?:All)?|getElementById|getElementsBy\w+)\(")
 STATUS_SCRIPT_ALLOWED_QUERIES = {"querySelector": "#app", "getElementById": "app"}
 # ADR-010 Amendment 1 (read writes nothing, one message call: `messages.add_message`, no Comment) and Decision 8 (no agent gates in the panel).
@@ -5787,8 +5799,28 @@ class TestArchitecture(unittest.TestCase):
 
 	def test_script_methods_add_only_the_support_chat_ask(self):
 		# CHG-019: the widget's one extra method; the ticket panel's own four stay exactly as ADR-044 pins them.
-		self.assertEqual(SUPPORT_CHAT_METHODS, ("erp_ai.support_chat.ask",))
+		self.assertEqual(
+			SUPPORT_CHAT_METHODS,
+			(
+				"erp_ai.support_chat.ask",
+				"erp_ai.support_chat.get_notices",
+				"erp_ai.support_chat.mark_notices_read",
+			),
+		)
 		self.assertEqual(SCRIPT_METHODS, PANEL_METHODS + SUPPORT_CHAT_METHODS)
+
+	def test_status_script_storage_only_the_bot_keys(self):
+		# ADR-051 decision 3: no storage call except getItem/setItem of a BOT_*_KEY constant named `miyano_…`.
+		script = mask_js(self.status_script())
+		for match in BOT_STORAGE_USE.finditer(script):
+			self.fail(f"line {js_line(script, match.start())}: storage used outside the bot's keys")
+		keys = dict(BOT_STORAGE_KEY.findall(self.status_script()))
+		self.assertEqual(set(keys), {"BOT_POSITION_KEY", "BOT_SOUND_KEY", "BOT_CHAT_KEY"})
+		for name, value in keys.items():
+			self.assertTrue(value.startswith("miyano_"), f"{name} = {value!r}")
+		self.assertEqual(len(BOT_STORAGE_USE.findall("localStorage.clear()")), 1)
+		self.assertEqual(len(BOT_STORAGE_USE.findall("sessionStorage.setItem(OTHER_KEY, 1)")), 1)
+		self.assertEqual(len(BOT_STORAGE_USE.findall("localStorage.getItem(BOT_SOUND_KEY)")), 0)
 
 	def test_status_script_has_the_miyano_bot_widget(self):
 		# CHG-019: the widget is plain DOM in the one script; each pattern pins a part of it at its use site.
@@ -5812,7 +5844,7 @@ class TestArchitecture(unittest.TestCase):
 		registered = socket_on_registrations(script)
 		self.assertEqual(
 			{name for _line, inside, name in registered if inside},
-			{AGENT_STATUS_EVENT, "docinfo_update", "doc_update", "connect"},
+			{AGENT_STATUS_EVENT, "docinfo_update", "doc_update", "connect", "notification"},
 		)
 		self.assertEqual(check_socket_on_only_in_once_block(script, AGENT_STATUS_EVENT), [])
 

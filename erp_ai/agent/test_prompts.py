@@ -7,7 +7,7 @@ from frappe.tests.utils import FrappeTestCase
 
 from erp_ai.agent import prompts
 from erp_ai.agent.policy import PermissionSwitches
-from erp_ai.agent.tools import registry
+from erp_ai.agent.tools import read, registry
 from erp_ai.constants import (
 	CATEGORIES,
 	TRIGGER_CHANGE_ACTION,
@@ -295,6 +295,43 @@ class TestReasonSystem(FrappeTestCase):
 		for _name, other in _flag_blocks()[:-1]:
 			self.assertNotIn(block, other)
 			self.assertNotIn(other, block)
+
+	def test_ask_only_block_names_its_reason_and_promises_nothing(self):
+		# 2026-11-27, a prod ticket: an ask-only run read get_record's refusal of Sales Invoice as a closed permission,
+		# told the person "lượt sau đề xuất lệnh bench mới hiện ra kèm nút duyệt" and asked nothing. The block names
+		# the reason, the tools the run lacks and what the refusal means, forbids any promise on a later run, and
+		# makes the comment end with its question.
+		block = prompts.ASK_ONLY_BLOCK
+		for phrase in (
+			"Độ tin cậy phân loại của phiếu đang dưới ngưỡng",
+			"không có tool đọc bản ghi ERP (api_get_record, api_list_records)",
+			"không có tool tạo đề xuất sửa code, lệnh bench hay lệnh console",
+			"không phải thiếu quyền, đừng đề nghị cấp quyền",
+			"Không hứa gì về lần chạy sau",
+			"nút duyệt hay link duyệt",
+			"Comment phải kết thúc bằng câu hỏi đó",
+		):
+			with self.subTest(phrase=phrase):
+				self.assertIn(phrase, block)
+		# The refusal the block explains is the one get_record really gives a DocType outside its list.
+		refusal = read.get_record({"doctype": "Sales Invoice", "name": "x"}, None)["reason"]
+		self.assertIn(f'"{refusal.removeprefix("DocType Sales Invoice ")}"', block)
+		# The tools the block says the run lacks are real, granted above the threshold and withheld below it, every
+		# switch on, at L3 with an instructor.
+		named = {"api_get_record", "api_list_records"}
+		proposing = {
+			"propose_file_change",
+			"propose_new_file",
+			"propose_bench_command",
+			"propose_console_script",
+		}
+		switches = PermissionSwitches(record_tools=True, code_change=True, console=True, unrestricted=True)
+		above = registry.grant(registry.GrantInputs("L3", "L3", True, switches)).names()
+		below = registry.grant(registry.GrantInputs("L3", "L3", True, switches, below_threshold=True))
+		self.assertTrue(below.ask_only_block)
+		self.assertLessEqual(named | proposing, above)
+		self.assertFalse((named | proposing) & below.names(), below.names())
+		self.assertIn("get_record", below.names())
 
 	def test_core_follows_flags(self):
 		for flags in ALL_FLAGS:

@@ -349,12 +349,18 @@ các quy tắc dưới đây thay cho quy tắc 6:
 - Việc nằm ngoài các tool bạn có thì ghi trong "Hướng xử lý" là việc người phải làm
   tay, kèm lý do. Tool trả ok=false thì không thử đường khác."""
 
-# Appended last when the confidence is below the threshold (U1.md:229); the question itself belongs to U4b.
+# Appended last when the confidence is below the threshold (U1.md:229); the question itself belongs to U4b. It names
+# why the run only asks, what get_record's "chưa được mở" means here, and forbids promising a later run anything: the
+# next run classifies again and may stay below the threshold (2026-11-27). The footer of the ask comment gives the
+# confidence and the threshold (write_ticket.ASK_FOOTER).
 ASK_ONLY_BLOCK = """CHỈ HỎI — ĐỘ TIN CẬY DƯỚI NGƯỠNG
 
-Lần chạy này bạn chỉ có tool đọc và post_comment.
+Độ tin cậy phân loại của phiếu đang dưới ngưỡng, nên lần chạy này bạn chỉ có tool đọc và post_comment.
 Không ghi trường, không gán, không tạo Task, không làm gì trên hệ thống.
-Đăng đúng một comment hỏi điều cần biết để chắc."""
+Lần này không có tool đọc bản ghi ERP (api_get_record, api_list_records), không có tool tạo đề xuất sửa code, lệnh bench hay lệnh console.
+get_record chỉ đọc phiếu và dữ liệu Helpdesk; DocType khác, kể cả chứng từ ERP như Sales Invoice, nó trả "chưa được mở". Đó không phải thiếu quyền, đừng đề nghị cấp quyền.
+Không hứa gì về lần chạy sau: không nói lần sau sẽ có đề xuất, nút duyệt hay link duyệt. Hệ thống tự ghi độ tin cậy và ngưỡng dưới comment.
+Đăng đúng một comment hỏi điều cần biết để chắc. Comment phải kết thúc bằng câu hỏi đó."""
 
 # (forbidden sentence of the old core, sentence a block allows) — never both in one prompt (AC-6, AC-66).
 PROMPT_CONFLICT_PAIRS: tuple[tuple[str, str], ...] = (

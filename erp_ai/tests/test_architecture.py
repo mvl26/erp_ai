@@ -466,7 +466,7 @@ STATUS_SCRIPT_REQUIRED = (
 	# Reset (ticket change or leaving the page): cancel pending loads, close the panel (returns the indicator), clear texts and the input.
 	r"const panel = state\.panel;\s*panel\.seq\+\+;\s*closePanel\(\);",
 	r'if \(panel\.inputEl\) \{\s*panel\.inputEl\.value = "";\s*\}',
-	r"String\(doc\.name\) !== state\.ticket\) \{\s*reset\(\);\s*state\.ticket = String\(doc\.name\)",
+	r"ticketName !== state\.ticket\) \{\s*reset\(\);\s*state\.ticket = ticketName",
 	r"reset\(\);\s*state\.ticket = null",
 	# Narrow screen: one resize listener for the page lifetime, closing the panel under the width limit.
 	r"const onResize = \(\) => \{\s*try \{\s*if \(window\.innerWidth < NARROW_SCREEN_PX\) \{\s*closePanel\(\);",
@@ -573,6 +573,8 @@ ALL_ROOM = "all"
 FORM_SCRIPT_DOCTYPE_NAME = "HD Form Script"
 AGENT_STATUS_SCRIPT_NAME = "ERP AI Agent Status"
 # ADR-007: Helpdesk's SPA ignores these hooks; the one channel is the form script record (install.py).
+# ADR-052 adds the one exception: the after_request hook of erp_ai/page_loader.py.
+PAGE_LOADER_HOOK = "erp_ai.page_loader.inject_bot_loader"
 PAGE_INJECTION_HOOKS = (
 	"app_include_js",
 	"web_include_js",
@@ -1539,6 +1541,8 @@ def check_hooks_have_no_page_injection(sources: dict) -> list:
 				if target.id == "fixtures" and not any(FORM_SCRIPT_DOCTYPE_NAME in text for text in strings):
 					continue
 				if target.id == "website_route_rules" and not any("helpdesk" in text for text in strings):
+					continue
+				if target.id == "after_request" and strings == [PAGE_LOADER_HOOK]:
 					continue
 				violations.append(
 					violation(HOOKS_FILE, node, f"sets {target.id} (ADR-007: no page injection)")
@@ -5934,6 +5938,15 @@ class TestArchitecture(unittest.TestCase):
 		self.assertIn(HOOKS_FILE, self.sources)
 		self.assertEqual(check_hooks_have_no_page_injection(self.sources), [])
 
+	def test_page_loader_is_the_only_after_request_hook(self):
+		# ADR-052: one hook adds the loader tag; the tag's file starts the widget file of the form script.
+		self.assertIn(f'after_request = ["{PAGE_LOADER_HOOK}"]', self.sources[HOOKS_FILE])
+		loader = load_product_sources(suffixes=(".js",))["public/js/miyano_bot_loader.js"]
+		self.assertIn("js/agent_status_indicator.js", loader)
+		self.assertIn("setupForm", loader)
+		self.assertNotIn("innerHTML", loader)
+		self.assertNotIn("localStorage", loader)
+
 	def test_install_deletes_only_status_script_on_uninstall(self):
 		self.assertIn(INSTALL_FILE, self.sources)
 		self.assertEqual(check_install_deletes_only_status_script(self.sources), [])
@@ -8281,6 +8294,7 @@ class TestScannersCatchViolations(unittest.TestCase):
 			"fixtures = [{'dt': 'Custom Field'}]\n"
 			"website_route_rules = [{'from_route': '/a', 'to_route': 'b'}]\n"
 			"# app_include_js = '/assets/erp_ai/js/x.js'\n"
+			f"after_request = ['{PAGE_LOADER_HOOK}']\n"
 			"before_uninstall = 'erp_ai.install.before_uninstall'\n"
 		)
 		self.assertEqual(check_hooks_have_no_page_injection({HOOKS_FILE: hooks_ok}), [])

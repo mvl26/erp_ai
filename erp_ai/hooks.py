@@ -220,7 +220,8 @@ scheduler_events = {
 # Request Events
 # ----------------
 # before_request = ["erp_ai.utils.before_request"]
-# after_request = ["erp_ai.utils.after_request"]
+# ADR-052: adds the Miyano bot loader tag to the Helpdesk page of an agent.
+after_request = ["erp_ai.page_loader.inject_bot_loader"]
 
 # Job Events
 # ----------

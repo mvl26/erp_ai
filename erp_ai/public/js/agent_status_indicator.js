@@ -295,7 +295,9 @@ function setupForm({ doc, call, router }) {
 		});
 		const socket =
 			document.querySelector("#app")?.__vue_app__?.config?.globalProperties?.$socket;
-		if (!socket || typeof socket.on !== "function" || !doc?.name) {
+		// Without a ticket (doc is null) the page loader (ADR-052) starts only the bot, on whatever page is open.
+		const ticketName = doc?.name ? String(doc.name) : null;
+		if (!socket || typeof socket.on !== "function") {
 			return { actions: [] };
 		}
 
@@ -379,18 +381,27 @@ function setupForm({ doc, call, router }) {
 			}
 		};
 
-		// Browsers keep audio suspended until the page has had a click or key press.
+		// Browsers keep audio suspended until the page has had a click or key press, so the audio context is made
+		// and resumed on the first press (unlockAudio); a chime asked for before that stays silent.
+		const unlockAudio = () => {
+			try {
+				const bot = state.bot;
+				bot.audio = bot.audio || new AudioContext();
+				if (bot.audio.state === "suspended") {
+					bot.audio.resume();
+				}
+			} catch (e) {
+				// No audio then.
+			}
+		};
+
 		const playChime = () => {
 			try {
 				const bot = state.bot;
-				if (!bot.soundOn) {
+				if (!bot.soundOn || !bot.audio || bot.audio.state !== "running") {
 					return;
 				}
-				bot.audio = bot.audio || new AudioContext();
 				const audio = bot.audio;
-				if (audio.state === "suspended") {
-					audio.resume();
-				}
 				const start = audio.currentTime;
 				CHIME_NOTES_HZ.forEach((hz, i) => {
 					const at = start + i * CHIME_GAP_S;
@@ -708,6 +719,14 @@ function setupForm({ doc, call, router }) {
 				row.append(main, count);
 				row.addEventListener("click", () => {
 					try {
+						// Hide the row and drop the count at once; the server's answer then replaces both.
+						bot.notices = {
+							unread: Math.max(0, bot.notices.unread - notice.unread),
+							tickets: bot.notices.tickets.filter(
+								(item) => item.ticket !== notice.ticket
+							),
+						};
+						renderNotices();
 						state.router?.push({
 							name: "TicketAgent",
 							params: { ticketId: notice.ticket },
@@ -929,6 +948,11 @@ function setupForm({ doc, call, router }) {
 				bot.soundOn = !bot.soundOn;
 				saveSound(bot.soundOn);
 				renderSound();
+				unlockAudio();
+				if (bot.soundOn && bot.audio) {
+					// Switching the sound on plays the chime once, so the person hears what they turned on.
+					bot.audio.resume().then(playChime, () => {});
+				}
 			});
 			head.append(
 				makeMascot("miyano-bot-head-mascot"),
@@ -1035,6 +1059,14 @@ function setupForm({ doc, call, router }) {
 			if (!bot.resizeBound) {
 				bot.resizeBound = true;
 				window.addEventListener("resize", onBotResize);
+			}
+			if (!bot.audioBound) {
+				bot.audioBound = true;
+				document.addEventListener("pointerdown", unlockAudio, {
+					capture: true,
+					once: true,
+				});
+				document.addEventListener("keydown", unlockAudio, { capture: true, once: true });
 			}
 			bot.saved = loadPosition();
 			bot.soundOn = loadSound();
@@ -2077,12 +2109,14 @@ function setupForm({ doc, call, router }) {
 		if (window.innerWidth >= NARROW_SCREEN_PX) {
 			buildBot();
 		}
-		if (String(doc.name) !== state.ticket) {
+		if (ticketName !== null && ticketName !== state.ticket) {
 			reset();
-			state.ticket = String(doc.name);
+			state.ticket = ticketName;
 		}
 		syncBotView();
-		socket.emit("doc_subscribe", "HD Ticket", state.ticket);
+		if (state.ticket) {
+			socket.emit("doc_subscribe", "HD Ticket", state.ticket);
+		}
 
 		if (state.socket !== socket) {
 			state.socket = socket;
